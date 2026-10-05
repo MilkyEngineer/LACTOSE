@@ -5,11 +5,15 @@ on:
     - cron: "0 3 * * *"
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   # A dated nightly, so Miri breaks only when this line changes.
   MIRI_TOOLCHAIN: nightly-2026-10-04
 
+# Architecture section 20: Miri, loom, the full SOUR matrix and architecture mode run nightly.
 jobs:
   miri:
     name: miri
@@ -21,3 +25,137 @@ jobs:
       - run: rustup toolchain install $MIRI_TOOLCHAIN --profile minimal --component miri,rust-src
       - uses: Swatinem/rust-cache@v2
       - run: cargo +$MIRI_TOOLCHAIN miri test -p lactose-core --locked
+      # Architecture sections 20 and 22: `task` and `ecs` pass Miri. Uncomment each line when
+      # its crate's implementation merges.
+      # - run: cargo +$MIRI_TOOLCHAIN miri test -p lactose-task --locked
+      # - run: cargo +$MIRI_TOOLCHAIN miri test -p lactose-ecs --locked
+
+  # Architecture section 5.1: the scope latch and the sleep-and-wake protocol are modelled
+  # under loom, switched on by a Cargo feature of `lactose-task` and never by a `--cfg` flag
+  # in the environment, which would replace the x86-64 pin. Uncomment when the executor's
+  # implementation merges.
+  # loom:
+  #   name: loom
+  #   runs-on: ubuntu-latest
+  #   timeout-minutes: 60
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #     - run: rustup show active-toolchain || rustup toolchain install
+  #     - uses: Swatinem/rust-cache@v2
+  #     - run: cargo test -p lactose-task --features loom --locked
+
+  # SOUR, the determinism harness (architecture section 8.3): every mode, on every platform
+  # of architecture mode. Each platform also emits its baseline hashes, which the next job
+  # compares across platforms.
+  #
+  # Not wired yet: the Haswell-masked linux-x64 run of architecture mode. It needs the tests
+  # to run under a CPU model that hides everything newer than the x86-64-v3 baseline, and
+  # the hosted runners offer no way to do that without an emulator.
+  sour:
+    name: sour (${{ matrix.platform }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            platform: linux-x64
+          - os: windows-latest
+            platform: windows-x64
+          - os: macos-latest
+            platform: macos-arm64
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+      - name: Build the CI driver
+        run: cargo build --locked -p lactose-xtask
+      - name: Runner self-test
+        run: cargo xtask sour self-test
+      - name: Every mode
+        run: cargo xtask sour run --nightly --emit sour-hashes-${{ matrix.platform }}.tsv
+      # Uploaded whenever the run got far enough to write them, findings or not, so the
+      # comparison below sees every platform that produced a file.
+      - name: Keep the baseline hashes
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: sour-hashes-${{ matrix.platform }}
+          path: sour-hashes-${{ matrix.platform }}.tsv
+      # Hash files of every run, and the execution log of any chaos test that failed, so
+      # the failure replays exactly.
+      - name: Keep SOUR output
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sour-output-${{ matrix.platform }}
+          path: target/sour
+          if-no-files-found: ignore
+
+  # Architecture mode: the baseline hashes of every platform must be identical. It runs
+  # whatever the platform jobs concluded, and a platform that produced no file fails the
+  # step that needs it, so a platform cannot drop out of the comparison quietly.
+  sour-architecture:
+    name: sour (architecture)
+    needs: sour
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: sour-hashes-*
+          merge-multiple: true
+      - name: Build the CI driver
+        run: cargo build --locked -p lactose-xtask
+      - name: linux-x64 against windows-x64
+        if: ${{ !cancelled() }}
+        run: cargo xtask sour compare sour-hashes-linux-x64.tsv sour-hashes-windows-x64.tsv
+      - name: linux-x64 against macos-arm64
+        if: ${{ !cancelled() }}
+        run: cargo xtask sour compare sour-hashes-linux-x64.tsv sour-hashes-macos-arm64.tsv
+
+  # docs/verification.md section 1, the milestone 0 spike "io_uring on CI runners": records
+  # whether the Linux runner lets a process create a ring. It reports and never fails; the
+  # result decides whether `lactose-io` can test its io_uring backend in CI.
+  io-uring-probe:
+    name: io_uring probe
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Record io_uring availability
+        run: |
+          python3 - <<'PROBE' | tee -a "$GITHUB_STEP_SUMMARY"
+          import ctypes, errno, os, platform
+
+          print("### io_uring on this runner")
+          print()
+          print(f"- kernel: `{platform.release()}` ({platform.machine()})")
+          # 0: enabled for all; 1: only for the io_uring_group; 2: disabled for everyone.
+          for path in ("/proc/sys/kernel/io_uring_disabled", "/proc/sys/kernel/io_uring_group"):
+              try:
+                  with open(path) as file:
+                      value = file.read().strip()
+              except OSError as error:
+                  value = f"unreadable ({error.strerror})"
+              print(f"- `{path}`: {value}")
+          # io_uring_setup(entries = 4, params): system call 425 on every Linux architecture.
+          # The parameter block is 120 bytes and must be zeroed.
+          libc = ctypes.CDLL(None, use_errno=True)
+          params = ctypes.create_string_buffer(120)
+          fd = libc.syscall(425, 4, params)
+          if fd >= 0:
+              os.close(fd)
+              print("- `io_uring_setup`: succeeded, io_uring is usable here")
+          else:
+              code = ctypes.get_errno()
+              name = errno.errorcode.get(code, str(code))
+              print(f"- `io_uring_setup`: failed with {name}, io_uring is not usable here")
+          PROBE

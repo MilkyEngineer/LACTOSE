@@ -1,0 +1,97 @@
+# cargo-deny configuration (architecture sections 8.2, 8.3 and 20). CI runs `cargo deny check`.
+#
+# cargo-deny carries the workspace-wide dependency rules. Two rules of section 8.2 that it
+# cannot express are enforced by `cargo xtask boundary` instead: the dependency allowlist per
+# boundary crate (the boundary tables of crate-tiers.toml) and the ban on RUSTFLAGS and on any
+# target CPU or target feature other than the x86-64-v3 pin.
+
+[graph]
+# Every platform CI builds for, so a platform-specific dependency is checked from any machine.
+targets = [
+  "x86_64-unknown-linux-gnu",
+  "x86_64-pc-windows-msvc",
+  "aarch64-apple-darwin",
+]
+all-features = true
+
+[advisories]
+version = 2
+yanked = "deny"
+ignore = []
+
+[licenses]
+version = 2
+# LACTOSE ships as a closed-source binary that statically links its dependencies. The list is
+# therefore the permissive licences only: each allows that, asking at most for attribution in
+# the shipped notices. Nothing copyleft is on it, weak copyleft included (MPL-2.0, LGPL), so
+# such a dependency is a decision somebody makes here, not something a `cargo add` brings in.
+#
+#   MIT, Apache-2.0, BSD-2-Clause, BSD-3-Clause, ISC, Zlib, BSL-1.0: attribution only.
+#   Apache-2.0 WITH LLVM-exception: Apache-2.0 with the notice duty waived for compiled output.
+#   Unicode-3.0: the Unicode data tables in `unicode-ident`; attribution only.
+#   CC0-1.0, 0BSD: no conditions.
+allow = [
+  "MIT",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "Zlib",
+  "BSL-1.0",
+  "Unicode-3.0",
+  "CC0-1.0",
+  "0BSD",
+]
+confidence-threshold = 0.9
+# The list is a policy, not a census of today's tree, so an entry nothing uses yet is fine.
+unused-allowed-license = "allow"
+
+[licenses.private]
+# The workspace's own crates are `publish = false` and carry no licence field.
+ignore = true
+
+[bans]
+# Two versions of one crate are a warning in general. Outside the determinism boundary a
+# duplicate costs build time and binary size, not correctness, and the platform crates that
+# arrive with the windowing and graphics backends (`windows-sys` and its relatives) duplicate
+# routinely; denying them all would turn this file into a list of `skip` entries. The crates
+# for which a duplicate is a correctness bug are denied individually below.
+multiple-versions = "warn"
+wildcards = "deny"
+allow-wildcard-paths = true
+highlight = "all"
+
+deny = [
+  # Architecture section 8.2: simulation and physics share one `libm`, so two builds of the
+  # boundary cannot disagree on a transcendental.
+  { crate = "libm", deny-multiple-versions = true },
+  # Milestone 1 adds, with `lactose-physics-rapier`, every crate Rapier's math depends on
+  # (section 8.2). On today's crates.io that is: glam, glamx, wide, safe_arch, simba,
+  # nalgebra, parry and rapier themselves, num-traits. Add one line each, in this form:
+  #   { crate = "glam", deny-multiple-versions = true },
+]
+
+# Milestone 1, with `lactose-physics-rapier`: glam features that change numerics
+# (docs/verification.md section 2). Nothing depends on glam yet, so the entry is ready but
+# commented out.
+#
+# Checked against glam 0.33.12 (the line `glamx` 0.3.1 requires) and 0.34.0:
+#   scalar-math  replaces the SIMD back-end with scalar code;
+#   core-simd    replaces it with nightly portable SIMD;
+#   libm, nostd-libm  switch transcendentals between the platform library and `libm`;
+#   fast-math    0.33 only; a no-op since 0.33.8, removed in 0.34.0, banned so an older
+#                0.33 can never bring it back to life.
+# Section 8.2 accepts Rapier's determinism feature forcing scalar glam. If the pinned Rapier
+# turns `scalar-math` or `libm` on itself, drop that one name and say why here; the rule then
+# still stops any other crate from flipping the remaining ones through feature unification.
+#
+# [[bans.features]]
+# crate = "glam"
+# deny = ["fast-math", "scalar-math", "core-simd", "libm", "nostd-libm"]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

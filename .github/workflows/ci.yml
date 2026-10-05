@@ -4,14 +4,21 @@ on:
   push:
   pull_request:
 
+permissions:
+  contents: read
+
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
-  # Never set RUSTFLAGS here: it would replace the target-feature pin in .cargo/config.toml.
+  # Never set the rust flags environment variable here: it would replace the target-feature
+  # pin in .cargo/config.toml. `cargo xtask boundary` fails the build if a workflow names it.
 
+# Architecture section 20: a pull request run finishes in fifteen minutes. Every job carries
+# that as its timeout, the three jobs run in parallel, and the cheap policy checks share one
+# Linux job so they pay for one checkout, one cache restore and one build of the CI driver.
 jobs:
   check:
     name: check (${{ matrix.os }})
@@ -36,3 +43,62 @@ jobs:
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Test
         run: cargo nextest run --workspace --locked --no-tests=pass
+
+  # The rules that are facts about manifests and files: crate-tiers.toml, the boundary's
+  # static checks, the feature trees and cargo-deny. Each step runs even if an earlier one
+  # found something, so one run reports everything.
+  policy:
+    name: policy
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+      # The `cargo xtask` alias is `--locked` too, so no later step can rewrite Cargo.lock.
+      - name: Build the CI driver
+        run: cargo build --locked -p lactose-xtask
+      - name: Tier check
+        run: cargo xtask tiers
+      - name: Boundary checks
+        if: success() || failure()
+        run: cargo xtask boundary
+      - name: Feature trees
+        if: success() || failure()
+        run: cargo xtask features
+      - name: cargo-deny
+        if: success() || failure()
+        run: cargo deny --locked check
+
+  # SOUR, the determinism harness (architecture section 8.3): workers mode and one layout
+  # capacity on every pull request. The self-test proves the runner itself on stand-in
+  # simulations, which is all there is to run until a package is listed under [harness] in
+  # tools/xtask/ci-policy.toml.
+  sour:
+    name: sour
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+      - name: Build the CI driver
+        run: cargo build --locked -p lactose-xtask
+      - name: Runner self-test
+        run: cargo xtask sour self-test
+      - name: Pull-request modes
+        run: cargo xtask sour run --pr
+      # Hash files of every run, and the execution log of any chaos test that failed.
+      - name: Keep SOUR output
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sour-output
+          path: target/sour
+          if-no-files-found: ignore

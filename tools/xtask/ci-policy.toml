@@ -1,0 +1,31 @@
+# Data for the checks in tools/xtask that is not a dependency rule. Which crate may depend on
+# which, the boundary list and the boundary's dependency allowlists are all in
+# crate-tiers.toml and nowhere else.
+
+# Architecture section 21: the crates that may contain `unsafe`. Each carries SAFETY.md. Every
+# other workspace crate carries `#![forbid(unsafe_code)]` at the top of every crate root:
+# library, binaries, integration tests, benches, examples and the build script. Changing
+# this list means changing section 21 in the same commit.
+[unsafe_crates]
+crates = [
+  "lactose-task", "lactose-ecs", "lactose-io", "lactose-rhi-vulkan", "lactose-rhi-metal",
+  "lactose-rhi-dx12", "lactose-platform", "lactose-core", "lactose-cook",
+]
+
+# Crates outside [boundary] that still carry the boundary lint file, a byte-identical copy of
+# crates/core/clippy.toml. The proc-macro crates do, because the code they write is compiled
+# inside boundary crates and should be written under the same lints.
+[lint_file_carriers]
+crates = ["lactose-reflect-macros", "lactose-ecs-macros"]
+
+# Architecture section 8.3: the shipped binaries, whose boundary feature trees must be
+# identical to each other and to those of the [harness] packages. Every workspace package
+# named `lactose-app-*` must be listed here.
+[feature_roots]
+packages = []
+
+# Architecture section 8.3: the packages whose tests run under SOUR, the determinism harness.
+# Their feature trees are compared with dev-dependencies included, since a test build
+# compiles them. Once `lactose-sim` exists this list may not be empty.
+[harness]
+packages = []
