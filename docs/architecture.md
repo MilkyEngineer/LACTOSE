@@ -127,7 +127,7 @@ crates/
   predict/        F  boundary  prediction world, rollback ring, reconciliation
   nav-query/      F  boundary  navmesh queries
   physics-api/    F  boundary  bodies, colliders, joints, queries, events, snapshot and restore
-  asset-api/      F            AssetId, Handle<T> policy, loader and processor traits, version table types, streaming budget types
+  asset-api/      F            AssetId, AssetRef, asset handle policy, loader and processor traits, version table types, published-assets and catalogue store traits, streaming priority and memory budget types
   bundle/         F  boundary  region bundle format shared by cook, asset and persist: baseline rows, placement GUIDs, overlay records
   present-api/    F            presentation components (mesh, light, decal, camera rig), VFX and audio request events, UI view-model, debug-draw buffer, presentation snapshot
   net-api/        F            transport, replication, staging, interest contracts, lock-free interpolation buffer resource with batch sampling
@@ -420,7 +420,7 @@ build against the final API from the start.
 |---|---|---|---|
 | `EntityId` | one process | process-local allocator, index plus generation, `NonZeroU64` so `Option` is free | storage lookup only; never on the wire or disk |
 | `StableKey` | everywhere a reference is stored | enum: `Net(NetId)`, `Predicted(PredictionKey)`, `Placeholder(u32)` within one command buffer | `EntityRef` fields, relationships, render slots, event targets, RNG keys, ordering ties |
-| `NetId` | server and all clients, and saves | 64-bit with a tag bit. Cooked: hash of (authoring scene, authored placement GUID, child path), so clients derive it without a message and re-cooking preserves it. Runtime: one server counter, assigned at command apply and persisted in the save | the `Net` arm of `StableKey`; the persistent ID of every entity that has one. There is no separate `PersistentId` |
+| `NetId` | server and all clients, and saves | 64-bit with a tag bit. Cooked: hash of (authored scene GUID, authored placement GUID, child path of authored GUIDs), so clients derive it without a message and re-cooking preserves it. Every element is a GUID stored in the authored file, never a name, path or index, so renaming a scene or reordering siblings preserves the ID. Runtime: one server counter, assigned at command apply and persisted in the save | the `Net` arm of `StableKey`; the persistent ID of every entity that has one. There is no separate `PersistentId` |
 | `PredictionKey` | one client plus the server | (player ID, input tick, ordinal), where the ordinal is the spawning command's position in that tick's total command order restricted to the player's input-driven sources. The server records it as the entity's permanent origin key | the `Predicted` arm of `StableKey` until the server binds a `NetId`; RNG and ordering use the origin key on both machines, so binding changes nothing. A predicted spawn the server never echoes is destroyed when the processed-input acknowledgement passes its input tick |
 | `SystemKey` | build | xxh64 of the declared system name, collision-checked | command order ties, RNG stream selection |
 | `ComponentKey` | build, wire, disk | xxh64 of the declared component name, collision-checked | registry, protocol hash, save records |
@@ -763,8 +763,16 @@ and ragdoll bodies.
 
 - The cooker emits runtime formats only: cluster-ready mesh pools, block-compressed textures,
   resolved material blocks, compiled shaders, collision, region bundles.
-- Assets are versioned and immutable after publish. Inside the boundary a region sees the
-  version in its table; outside, readers see the newest.
+- Assets are versioned and immutable after publish. A version is the content hash of the
+  cooked header and bytes, so an asset ID and version name the same content on every machine
+  and after every cook; versions are unordered and a store verifies the hash on load. Inside
+  the boundary a region sees the version in its table; outside, readers see the version the
+  store's index currently publishes.
+- A region's version table is resolved outside the boundary as the closure of its asset set
+  over declared dependencies, and enters at the input sync point. Boundary worlds receive only
+  exact-version access; the catalogue (newest, resolve, publication generation) is given only
+  to code outside the boundary. Boundary code reads only asset kinds marked as simulation
+  data, whose loaders must be pure byte decoders or live in a boundary crate.
 - File IO goes through `io`, a foundation crate with a blocking-pool reference backend and
   io_uring and IOCP optimisations.
 - Regions declare asset sets: the cooked baseline's assets plus those of any migrated resident
@@ -801,8 +809,14 @@ fields in B's set, so B loads correctly without A. The baseline content hash is 
 region. Region unloading writes the same records, so unloading and saving are one code path,
 and the same records are what the server sends a client when the region becomes relevant
 (section 9.3). The record format lives in `bundle` so `cook`, `asset`, `persist` and `net`
-share it. A patched baseline keeps
-all runtime-spawned entities and drops only `SetField` records whose target no longer exists.
+share it. Each region state has
+one record set: a runtime-spawned or migrated entity is a `Spawn` or `SpawnFromBaseline`
+carrying whole components; a changed baseline row is `AddComponent` (a whole component, also
+over one the row already has), `RemoveComponent`, `SetField` and `OwnershipChange`; a destroyed
+or departed row is `Destroy` alone. Rebasing onto a patched baseline keeps every
+runtime-spawned and migrated entity, drops every record of a cooked entity that is no longer a
+row, drops `RemoveComponent` and `SetField` of a component the row no longer has, and returns
+the dropped records so `persist` can re-home an entity the patch moved to another region.
 
 ### 15.3 Save operation
 
@@ -813,6 +827,8 @@ file, sync, rename over the slot.
 ### 15.4 Container and evolution
 
 Self-describing binary container with engine version, schema hash and a per-region index.
+Baseline and overlay documents carry, for each component they hold, its schema version, element
+size and field layout (field ID, offset, size), so the binary keeps no historical layouts.
 Matching schema takes the bulk-copy-plus-remap fast path; mismatched schema decodes by field ID
 and runs migrations in version order. After load, change ticks are rebased (section 6).
 
@@ -877,7 +893,8 @@ skinning are presentation and renderer work.
 
 The policy is in section 3.
 
-- `core::Error` is the taxonomy. Subsystems return `Result`; `app` holds policy.
+- `core::Error` is the taxonomy. Subsystems return `Result`; `app` holds policy. `ErrorKind`
+  has stable `u8` codes, so a failure can be journaled as a tick-stamped event.
 - `tracing` is also the logging facade. Log targets are the codenames from section 23.
 - Tested device-lost recovery: re-upload assets, rebuild the GPU scene from region data, full
   extract.

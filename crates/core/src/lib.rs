@@ -12,6 +12,7 @@ pub mod hash;
 pub mod id;
 pub mod map;
 pub mod thread_class;
+mod typed;
 
 pub use alloc::{AllocTag, TagScope, TagStats, TaggedAlloc};
 pub use arena::Arena;
@@ -25,3 +26,8 @@ pub use id::{
 };
 pub use map::{FixedHashMap, FixedHasher};
 pub use thread_class::ThreadClass;
+
+// The path `typed_plain_data!` names `bytemuck` by, so its expansion does not depend on how
+// the calling crate spells that dependency.
+#[doc(hidden)]
+pub use bytemuck as __bytemuck;

@@ -1,0 +1,25 @@
+[package]
+name = "lactose-asset-api"
+description = "Asset identity, typed references, version tables, handles, loader and processor traits, the store trait and its conformance suite."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[features]
+# The conformance suite every store must pass, and the in-memory reference store the suite
+# is tested against. For `[dev-dependencies]` only: no normal or build dependency edge in
+# the workspace may enable it, so nothing that ships can name `ReferenceStore`.
+conformance = []
+
+[dependencies]
+bytemuck.workspace = true
+lactose-core.workspace = true
+lactose-reflect.workspace = true
+
+[dev-dependencies]
+# Turns the suite on for this crate's own tests.
+lactose-asset-api = { path = ".", features = ["conformance"] }
+
+[lints]
+workspace = true

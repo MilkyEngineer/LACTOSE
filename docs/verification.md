@@ -59,4 +59,8 @@ version in `Cargo.lock` before the milestone that depends on it.
 | Local x86-64 runs on Apple Silicon: Rosetta on macOS 14 raises an illegal-instruction fault on the x86-64-v3 baseline, so x86-64 tests and SOUR architecture mode run on CI runners and the x86 desktop, never on the Mac. Re-check after a macOS upgrade | none |
 | Windows efficiency-core steering: `ThreadClass::Background` sets thread priority only. Steering to efficiency cores on hybrid CPUs needs the power-throttling (EcoQoS) thread setting; add and measure it with the `task` benchmarks on the x86 desktop | 0 |
 | `lld-link` on Windows and mold or lld on Linux (architecture section 18) are not configured yet; they go in with the edit-to-playing measurement, once CI runners and developer machines are known to have them | 1 |
+| Assets of runtime-spawned entities are in no region's asset set (architecture section 14). Decide with `sim`: the set is the baseline's set plus the `AssetRef`s of resident entities plus a declared spawnable set, and a spawn may name only assets already in the table | 1 |
+| Enforcing that the loader of a simulation-read asset kind is a pure byte decoder or lives in a boundary crate (D99); today it is a documented obligation on `SimulationAsset` | 1 |
+| The store traits have no residency, unload or budget methods; milestone 3 streaming amends them | 3 |
+| `cargo xtask features` should fail if any normal or build edge enables `lactose-asset-api/conformance` (the reference store is for dev-dependencies only) | 1 |
 | Whether Apple cores implement FEAT_AFP. `fp::is_deterministic` checks the alternate-mode bits either way | none |

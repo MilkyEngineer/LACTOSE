@@ -117,6 +117,10 @@ transitive = [
   "bytemuck_derive", "proc-macro2", "quote", "syn", "unicode-ident",
   # windows-sys's link shim.
   "windows-link",
+  # Architecture section 3: traced from day one. `tracing` reaches boundary crates through
+  # `lactose-reflect` and `lactose-task`; it emits spans and events and computes nothing a
+  # simulation result can observe.
+  "tracing", "tracing-core", "once_cell", "pin-project-lite",
 ]
 
 [boundary_third_party.direct]

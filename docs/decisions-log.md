@@ -995,6 +995,52 @@ rationale the author supplied during the editorial pass rather than one taken fr
 - Driven by: milestone 0 reflect lane and its two adversarial reviews; verification §2.
 - Replaced: revision 3.2's field reordering and inserted padding; bare `[T; N]` fields.
 
+**D98. Asset versions are content hashes; dependencies are by ID** (§14, `lactose-asset-api`)
+- Why: a cooker-assigned counter needs a ledger and can publish different bytes under one
+  version after a clean cook or on a second machine, which a server and client would not
+  detect. A hash of the cooked header and bytes cannot, and needs no order because "newest" is
+  a fact about the store's index. Dependencies name an `AssetId`, never a version, so a
+  published version means the same thing whichever dependency version is loaded.
+- Driven by: asset-api lane review, finding 3.
+
+**D99. The asset store is two traits, and boundary code reads simulation kinds through a pinned table** (§4, §8.2, §14)
+- Why: "newest" and "resolve" depend on load timing, so they live on a catalogue trait that
+  boundary worlds never receive; exact-version access is the only store a boundary world
+  holds, which makes the rule structural instead of a lint. `resolve` returns the dependency
+  closure so a pinned table holds everything a region can reach, and a publication generation
+  counter avoids re-resolving every region every tick. Loaded assets are `Arc`-backed handles,
+  because a shared `dyn` store cannot lend borrows from a table it publishes into; boundary
+  reads borrow from a region's `PinnedTable` and touch no atomic. Loaders run outside the
+  boundary, so kinds the simulation reads are marked and their loaders constrained.
+- Driven by: milestone 0 asset-api lane and its review, findings 5, 6 and 11.
+
+**D100. `typed_plain_data!` in `lactose-core`** (§21)
+- Why: bytemuck cannot derive `Pod` for a struct with a non-`Pod` marker parameter, and
+  `asset-api` forbids `unsafe`. The macro writes the struct and the impls together and accepts
+  no attribute, so no caller can change the representation and the unsafe text stays in core.
+  A core type alias was rejected: the orphan rule would stop `asset-api` implementing the
+  `reflect` field traits for its own reference type.
+- Driven by: milestone 0 asset-api lane.
+
+**D101. Bundle documents are canonical in bytes and in meaning, self-describing, and end in their own xxh64** (§9.3, §15.2, §15.4, `lactose-bundle`)
+- Why: one trailing hash is integrity check, baseline content hash and overlay digest.
+  Allowing several record sets for one region state would make the digest depend on the code
+  path that produced it, so each state has exactly one. Carrying field layouts lets an old
+  save be decoded by field ID without the binary keeping every historical layout. Rebase
+  drops every record that is no longer valid against the patched baseline and returns them,
+  since the literal "drops only `SetField`" left records naming entities that no longer exist.
+- Driven by: asset-api lane review, findings 1, 2 and 4.
+- Replaced: revision 3.2's "drops only `SetField` records whose target no longer exists".
+
+**D102. Cooked identity hashes authored GUIDs only** (§7, `lactose-bundle`)
+- Why: hashing a name-derived scene key would orphan every save when a scene file is renamed.
+- Driven by: asset-api lane review, finding 9.
+
+**D103. Stable `u8` codes for `ErrorKind`** (§19, `lactose-core`)
+- Why: an asset failure that affects simulation is a journaled, tick-stamped event, which
+  needs an encoding that does not change when the enum gains a kind.
+- Driven by: asset-api lane review, finding 8.
+
 ## 10. Review history
 
 - **Revision 1** (`a29af04`): the design baseline.
