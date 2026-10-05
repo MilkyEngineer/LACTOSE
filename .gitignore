@@ -1,2 +1,5 @@
 /target
 .DS_Store
+
+# Agent worktrees are local scratch, never part of the repository.
+/.claude/worktrees/
