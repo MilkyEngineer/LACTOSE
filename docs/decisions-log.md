@@ -941,6 +941,42 @@ rationale the author supplied during the editorial pass rather than one taken fr
 - Driven by: foundation review, finding 6.
 - Replaced: revision 3.2's critical-path-only denominator.
 
+**D93. An assembly tier, game-to-game edges and test-support crates** (§3, §4, `crate-tiers.toml`)
+- Why: `lactose-app` assembles a runtime from backend crates, which the backend rule forbade a
+  backend crate to do; it is now the one `[assembly]` crate, may depend on foundation, backend
+  and game crates, and may be named only by leaf crates. Game crates may depend on each other
+  (`game-sim` reads `game-content`), and backend crates may not depend on game crates.
+  `[test_support]` (today `lactose-rhi-null`) lists crates any crate may dev-depend on; all
+  other dev-dependencies obey the normal rules. `[exceptions]` lifts backend-to-backend edges
+  only. A path dependency must be a workspace member.
+- Driven by: xtask lane review, findings 8 and 11.
+- Replaced: `lactose-app` in `[backend]`; "game crates may depend on foundation crates only".
+
+**D94. Proc-macro crates carry the boundary lint file** (§8.3, `tools/xtask/ci-policy.toml`)
+- Why: `lactose-reflect-macros` and `lactose-ecs-macros` are outside the boundary because they
+  compile for the host, but the code they write is compiled inside boundary crates. They carry
+  a byte-identical copy of `crates/core/clippy.toml`, and `cargo xtask boundary` checks the
+  copies and that the reference file still bans a required minimum.
+- Driven by: xtask lane review, findings 13 and 19.
+
+**D95. The boundary dependency allowlist lives in `crate-tiers.toml` and covers the whole closure** (§3, §8.2)
+- Why: §3 makes `crate-tiers.toml` the only statement of which crate may depend on which, and
+  cargo-deny cannot express an allowlist per depending crate. Every third-party crate a
+  boundary crate compiles through normal and build edges, at any depth and through any
+  workspace crate, must be allowlisted there; `cargo xtask boundary` enforces it, and
+  `deny.toml` keeps the workspace-wide rules (sources, licences, advisories, duplicate versions).
+- Driven by: xtask lane review, findings 14 and 15.
+- Replaced: revision 3.2's cargo-deny allowlist.
+
+**D96. The SOUR run configuration is a versioned environment schema, and each run records the configuration it applied** (§8.3, `tools/xtask`)
+- Why: layout and chaos are runtime options, so the runner passes one configuration per test
+  process in `LACTOSE_SOUR_*` variables. A malformed environment is an error, never a fallback
+  to production, and each test records the configuration its world and executor builders
+  report, which the runner checks against what it launched, so a mode cannot pass without
+  running. Chaos runs always write their execution log; the runner keeps the logs of runs
+  that disagreed.
+- Driven by: milestone 0 xtask lane and its review, findings 5 to 7.
+
 ## 10. Review history
 
 - **Revision 1** (`a29af04`): the design baseline.

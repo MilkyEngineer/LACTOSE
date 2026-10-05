@@ -104,11 +104,14 @@ emits `tracing` spans. Tracy is the profiler target.
 
 ## 4. Workspace layout
 
-Every crate is published as `lactose-<name>`. Tier is F (foundation, usable by anyone) or B
-(backend, usable only by `app`, `tools/*` and the exceptions in `crate-tiers.toml`).
+Every crate is published as `lactose-<name>`. Tier is F (foundation, usable by anyone), B
+(backend, usable only by assembly crates, leaf crates and the exceptions in
+`crate-tiers.toml`) or A (assembly, usable only by leaf crates).
 Codenames in brackets appear only where section 3 allows. Boundary marks crates inside the
 determinism boundary. `crate-tiers.toml` also lists leaf crates (binaries and tools, which may
-depend on anything) and game crates; a crate missing from the file fails the tier check.
+depend on anything), game crates (which may depend on foundation crates and on each other) and
+test-support crates (which any crate may name as a dev-dependency); a crate missing from the
+file fails the tier check.
 
 ```
 crates/
@@ -148,7 +151,7 @@ crates/
   nav/            B            navmesh generation
   platform/       B            [PAIL] winit window, surface, event pump, present thread
   debug-ui/       B            egui overlay, profiler view, determinism inspector
-  app/            B            library that assembles a runtime from foundation and backend crates
+  app/            A            library that assembles a runtime from foundation, backend and game crates
   app-client/     leaf         binary: app plus every client backend; registers RenderFeature providers
   app-server/     leaf         binary: app plus server backends only; CI denies rendering, presentation, platform, audio and UI crates
   app-headless/   leaf         binary: simulation only, for SOUR and tools
@@ -480,8 +483,9 @@ presentation, pose evaluation, VFX, audio, UI, asset IO timing and input samplin
 - A boundary crate may depend on a non-boundary foundation crate (`reflect`, `asset-api`,
   `input`, `present-api`) only for types and for operations that are deterministic by
   construction: no clocks, no floats computed outside `math`. `ecs` depends on `task` for
-  execution only, and every result is order-independent by construction. The `cargo-deny`
-  allowlist names the permitted edges, and the tier check forbids build scripts and proc
+  execution only, and every result is order-independent by construction. `crate-tiers.toml`
+  names the permitted edges, to workspace crates and to third-party crates at any depth,
+  `cargo xtask boundary` enforces them, and the tier check forbids build scripts and proc
   macros from depending on boundary crates, because they compile for the host without the
   pinned target features.
 - Asset availability and versions are inputs. Each region resolves its version table at the
@@ -517,8 +521,10 @@ replays exactly. The one-row capacity uses a matching small slab.
 
 Static enforcement uses stable tooling: `clippy.toml` per boundary crate with
 `disallowed-methods` and `disallowed-types` (thread-locals are banned through
-`std::thread::LocalKey`, since a local exception cannot reach an item macro); `cargo-deny` with a
-dependency allowlist for boundary crates and `multiple-versions = "deny"` for shared crates.
+`std::thread::LocalKey`, since a local exception cannot reach an item macro); the boundary
+dependency allowlist in `crate-tiers.toml`, checked by `cargo xtask boundary`; `cargo-deny` with
+`multiple-versions = "deny"` for shared crates. The two proc-macro crates carry the boundary
+`clippy.toml` as well, since the code they emit is compiled inside boundary crates.
 No custom lint crate. Miri runs on nightly as the one exception to the stable-toolchain rule.
 Because Cargo resolves features per build, CI dumps `cargo tree -e features` for the boundary
 dependencies of each shipped binary and of the SOUR test crate and requires them identical;
