@@ -13,7 +13,6 @@
 //! diff. A changed line for an existing case is a determinism break, not a refresh.
 
 use std::fmt::Write as _;
-use std::path::PathBuf;
 
 use lactose_math::render::RenderPosition;
 use lactose_math::{
@@ -35,8 +34,11 @@ enum Inputs {
     Tuple(usize),
     /// Random finite tuples of this many scalars within the render grid's range.
     Finite(usize),
-    /// Lists of varying length, with cancellation and special values.
-    List,
+    /// Every unary edge, then arbitrary 64-bit patterns, for operations that read the input
+    /// as an integer.
+    Bits,
+    /// Lists of varying length, with cancellation and special values, this many rounds.
+    List(usize),
 }
 
 struct Operation {
@@ -86,7 +88,7 @@ fn transform(v: &[Scalar]) -> Transform {
 }
 
 fn operations() -> Vec<Operation> {
-    use Inputs::{Binary, Finite, List, Ternary, Tuple, Unary};
+    use Inputs::{Binary, Bits, Finite, List, Ternary, Tuple, Unary};
     vec![
         // Scalar, one operand.
         op("sqrt", Unary, |v| vec![v[0].sqrt()]),
@@ -127,7 +129,20 @@ fn operations() -> Vec<Operation> {
         op("canonical_round_trip", Unary, |v| {
             vec![Scalar::from_canonical_bits(v[0].to_canonical_bits())]
         }),
-        op("unit_from_bits", Unary, |v| vec![Scalar::unit_from_bits(v[0].to_canonical_bits())]),
+        op("powi_extreme", Unary, |v| {
+            [-1, 31, 64, 1000, -1074, 65_535, i32::MAX, i32::MIN].map(|n| v[0].powi(n)).to_vec()
+        }),
+        // Integer and narrow-float sources. The input word is read as an integer; non-NaN
+        // patterns pass through `to_canonical_bits` unchanged.
+        op("unit_from_bits", Bits, |v| vec![Scalar::unit_from_bits(v[0].to_canonical_bits())]),
+        op("from_u64", Bits, |v| vec![Scalar::from_u64(v[0].to_canonical_bits())]),
+        op("from_i64", Bits, |v| vec![Scalar::from_i64(v[0].to_canonical_bits() as i64)]),
+        op("from_u32", Bits, |v| vec![Scalar::from_u32(v[0].to_canonical_bits() as u32)]),
+        op("from_i32", Bits, |v| vec![Scalar::from_i32(v[0].to_canonical_bits() as i32)]),
+        op("from_f32", Bits, |v| {
+            let narrow = f32::from_bits(v[0].to_canonical_bits() as u32);
+            vec![Scalar::from_f32(narrow), Scalar::from_f32(Scalar::from_f32(narrow).to_f32())]
+        }),
         op("powi", Unary, |v| {
             vec![v[0].powi(0), v[0].powi(2), v[0].powi(3), v[0].powi(-3), v[0].powi(17)]
         }),
@@ -238,6 +253,15 @@ fn operations() -> Vec<Operation> {
             Quat::from_mat3(Mat3::from_quat(quat(v).normalize())).to_array().to_vec()
         }),
         op("quat_from_mat3_raw", Tuple(9), |v| Quat::from_mat3(mat3(v)).to_array().to_vec()),
+        op("quat_canonical_sign", Tuple(4), |v| {
+            let mut out = quat(v).canonical_sign().to_array().to_vec();
+            // With leading zeros, so the later coefficients decide.
+            out.extend(Quat::new(v[0], v[1], v[2], Scalar::ZERO).canonical_sign().to_array());
+            out.extend(
+                Quat::new(-Scalar::ZERO, v[1], v[2], -Scalar::ZERO).canonical_sign().to_array(),
+            );
+            out
+        }),
         // Matrices.
         op("mat3_mul", Tuple(18), |v| (mat3(v) * mat3(&v[9..])).to_array().to_vec()),
         op("mat3_mul_vec", Tuple(12), |v| (mat3(v) * vec3(&v[9..])).to_array().to_vec()),
@@ -274,25 +298,27 @@ fn operations() -> Vec<Operation> {
             out.extend(t.transform_vector(vec3(&v[10..])).to_array());
             out
         }),
-        op("transform_mul", Tuple(20), |v| {
-            (transform(v) * transform(&v[10..])).to_array().to_vec()
+        op("transform_compose_uniform", Tuple(20), |v| {
+            let mut parent = transform(v);
+            parent.scale = Vec3::splat(parent.scale.x);
+            parent.compose_uniform(transform(&v[10..])).to_array().to_vec()
         }),
         // Reductions.
-        op("exact_sum", List, |v| {
+        op("exact_sum", List(8), |v| {
             let mut sum = ExactSum::<Scalar>::identity();
             for &item in v {
                 sum.add(item);
             }
             vec![sum.finish()]
         }),
-        op("exact_sum_vec3", List, |v| {
+        op("exact_sum_vec3", List(2), |v| {
             let mut sum = ExactSum::<Vec3>::identity();
             for item in v.as_chunks::<3>().0 {
                 sum.add(vec3(item));
             }
             sum.finish().to_array().to_vec()
         }),
-        op("min_max_reduce", List, |v| {
+        op("min_max_reduce", List(2), |v| {
             let (mut min, mut max) = (Min::<Scalar>::identity(), Max::<Scalar>::identity());
             for &item in v {
                 min.add(item);
@@ -303,11 +329,20 @@ fn operations() -> Vec<Operation> {
         // Render space. The outputs are widened exactly, so they compare as scalars.
         op("render_from_sim", Finite(3), |v| {
             let position = RenderPosition::from_sim(vec3(v));
-            let relative = position.relative_to([position.cell[0] - 3, 7, position.cell[2]]);
+            let [x, y, z] = position.cell;
+            let origins = [
+                position.cell,
+                [0; 3],
+                [x.wrapping_sub(3), 7, z],
+                [x.wrapping_add(1000), y.wrapping_sub(1000), -z],
+                [i32::MIN, i32::MAX, 1],
+            ];
             let mut out = Vec::new();
             out.extend(position.cell.map(Scalar::from_i32));
             out.extend(position.offset.map(Scalar::from_f32));
-            out.extend(relative.map(Scalar::from_f32));
+            for origin in origins {
+                out.extend(position.relative_to(origin).map(Scalar::from_f32));
+            }
             out
         }),
     ]
@@ -352,6 +387,12 @@ impl Rng {
     /// Magnitude between about a thousandth and sixteen.
     fn moderate(&mut self) -> u64 {
         self.with_exponent(-10, 3)
+    }
+
+    /// Magnitude between about a sixteenth and sixteen thousand: world coordinates, speeds
+    /// and timers.
+    fn gameplay(&mut self) -> u64 {
+        self.with_exponent(-4, 13)
     }
 
     /// Any of: moderate, widely scaled, a small multiple of one half, or any bit pattern at
@@ -453,14 +494,27 @@ fn cases(operation: &Operation) -> Vec<Vec<u64>> {
     match operation.inputs {
         Inputs::Unary => {
             cases.extend(unary_edges().into_iter().map(|edge| vec![edge]));
-            cases.extend((0..12).map(|_| vec![rng.any()]));
+            cases.extend((0..100).map(|_| vec![rng.moderate()]));
+            cases.extend((0..100).map(|_| vec![rng.gameplay()]));
+            cases.extend((0..40).map(|_| vec![rng.any()]));
+        }
+        Inputs::Bits => {
+            cases.extend(unary_edges().into_iter().map(|edge| vec![edge]));
+            cases.extend((0..96).map(|_| vec![rng.next()]));
+            // Small integers, and values one either side of a rounding boundary.
+            cases.extend((0..32).map(|_| vec![rng.below(1 << 20)]));
+            for base in [1u64 << 53, 1 << 63, u64::MAX - (1 << 10), (1 << 63) - (1 << 9)] {
+                cases.extend((0..4u64).map(|step| vec![base.wrapping_add(step * 511)]));
+            }
         }
         Inputs::Binary => {
             let edges = binary_edges();
             for &a in &edges {
                 cases.extend(edges.iter().map(|&b| vec![a, b]));
             }
-            cases.extend((0..16).map(|_| vec![rng.any(), rng.any()]));
+            cases.extend((0..100).map(|_| vec![rng.moderate(), rng.moderate()]));
+            cases.extend((0..100).map(|_| vec![rng.gameplay(), rng.gameplay()]));
+            cases.extend((0..40).map(|_| vec![rng.any(), rng.any()]));
         }
         Inputs::Ternary => {
             let edges = ternary_edges();
@@ -469,7 +523,9 @@ fn cases(operation: &Operation) -> Vec<Vec<u64>> {
                     cases.extend(edges.iter().map(|&c| vec![a, b, c]));
                 }
             }
-            cases.extend((0..16).map(|_| vec![rng.any(), rng.any(), rng.any()]));
+            cases.extend((0..60).map(|_| vec![rng.moderate(), rng.moderate(), rng.moderate()]));
+            cases.extend((0..60).map(|_| vec![rng.gameplay(), rng.gameplay(), rng.gameplay()]));
+            cases.extend((0..24).map(|_| vec![rng.any(), rng.any(), rng.any()]));
         }
         Inputs::Tuple(arity) => {
             cases.extend((0..8).map(|_| (0..arity).map(|_| rng.moderate()).collect()));
@@ -486,8 +542,9 @@ fn cases(operation: &Operation) -> Vec<Vec<u64>> {
             cases.push(vec![s(31.999999999999996).to_canonical_bits(); arity]);
             cases.push(vec![s(1e12).to_canonical_bits(); arity]);
         }
-        Inputs::List => {
-            for length in [0, 3, 6, 9, 30, 60, 120] {
+        Inputs::List(rounds) => {
+            let lengths = [0, 3, 6, 9, 30, 60, 120];
+            for length in (0..rounds).flat_map(|_| lengths) {
                 // Moderate values; widely scaled values; and values that cancel exactly.
                 cases.push((0..length).map(|_| rng.moderate()).collect());
                 cases.push((0..length).map(|_| rng.with_exponent(-1000, 1000)).collect());
@@ -527,8 +584,9 @@ fn parse_hex(field: &str) -> Vec<u64> {
     field.split(',').map(|word| u64::from_str_radix(word, 16).expect("hex word")).collect()
 }
 
-fn table_path() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/golden/vectors.txt")
+#[cfg(target_arch = "aarch64")]
+fn table_path() -> std::path::PathBuf {
+    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/golden/vectors.txt")
 }
 
 const TABLE: &str = include_str!("golden/vectors.txt");
@@ -557,7 +615,7 @@ fn table() -> Vec<Line<'static>> {
 fn golden_vectors_match() {
     let operations = operations();
     let table = table();
-    assert!(table.len() > 500, "the table is the cross-architecture proof; it must be broad");
+    assert!(table.len() > 5_000, "the table is the cross-architecture proof; it must be broad");
 
     let mut report = String::new();
     let mut mismatches = 0;
@@ -611,7 +669,9 @@ fn golden_table_is_current() {
     }
 }
 
-/// Rewrites the table from this machine's results. Run on aarch64 only, and review the diff.
+/// Rewrites the table from this machine's results; review the diff. aarch64 is the reference
+/// architecture, so the generator does not exist in a build for any other.
+#[cfg(target_arch = "aarch64")]
 #[test]
 #[ignore = "rewrites tests/golden/vectors.txt"]
 fn bless() {

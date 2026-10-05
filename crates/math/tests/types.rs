@@ -314,15 +314,89 @@ fn quaternion_agrees_with_its_matrix() {
             1e-13
         ));
 
-        // Back from the matrix: the same rotation, up to the quaternion's sign.
+        // Back from the matrix: the same rotation, with the canonical sign.
         let back = Quat::from_mat3(matrix);
-        let back = if back.dot(q) < Scalar::ZERO { -back } else { back };
-        assert!(all_close(&back.to_array(), &q.to_array(), 1e-13));
+        assert!(has_canonical_sign(back), "{back:?}");
+        assert!(all_close(&back.to_array(), &q.canonical_sign().to_array(), 1e-13));
 
         assert!(all_close(&(q * q.inverse()).to_array(), &Quat::IDENTITY.to_array(), 1e-14));
         assert!(all_close(&(q.conjugate() * (q * v)).to_array(), &v.to_array(), 1e-13));
         assert!(close(q.length(), Scalar::ONE, 1e-15));
     }
+}
+
+/// The documented rule: the first non-zero coefficient in the order w, x, y, z is positive.
+fn has_canonical_sign(q: Quat) -> bool {
+    [q.w, q.x, q.y, q.z]
+        .into_iter()
+        .find(|&coefficient| coefficient != Scalar::ZERO)
+        .is_none_or(|coefficient| coefficient > Scalar::ZERO)
+}
+
+#[test]
+fn quaternion_sign_is_canonical() {
+    let mut rng = Rng(0x0005_1691);
+    for _ in 0..10_000 {
+        let q = unit_quat(&mut rng);
+        let canonical = q.canonical_sign();
+        assert!(has_canonical_sign(canonical), "{canonical:?}");
+        assert!(canonical == q || canonical == -q);
+        assert_eq!(canonical, (-q).canonical_sign());
+        assert_eq!(canonical, canonical.canonical_sign());
+        assert!(has_canonical_sign(Quat::from_mat3(Mat3::from_quat(q))));
+    }
+
+    // Ties: half turns, where w is zero and a later coefficient decides.
+    let (zero, one) = (Scalar::ZERO, Scalar::ONE);
+    for (q, expected) in [
+        (Quat::new(-one, zero, zero, zero), Quat::new(one, zero, zero, zero)),
+        (Quat::new(zero, -one, zero, zero), Quat::new(zero, one, zero, zero)),
+        (Quat::new(zero, zero, -one, zero), Quat::new(zero, zero, one, zero)),
+        (Quat::new(zero, -one, one, zero), Quat::new(zero, one, -one, zero)),
+        (Quat::new(one, -one, -one, zero), Quat::new(one, -one, -one, zero)),
+        (Quat::new(one, one, one, -one), Quat::new(-one, -one, -one, one)),
+        (Quat::new(-one, zero, zero, -zero), Quat::new(one, zero, zero, zero)),
+        (Quat::new(zero, zero, zero, zero), Quat::new(zero, zero, zero, zero)),
+    ] {
+        assert_eq!(q.canonical_sign(), expected, "{q:?}");
+        assert!(has_canonical_sign(q.canonical_sign()));
+    }
+    // Half-turn matrices, where the conversion's w is zero or rounding noise.
+    for axis in [Vec3::X, Vec3::Y, Vec3::Z, Vec3::new(one, one, zero).normalize(), -Vec3::Z] {
+        let half_turn = Mat3::from_quat(Quat::from_axis_angle(axis, Scalar::PI));
+        assert!(has_canonical_sign(Quat::from_mat3(half_turn)), "{axis:?}");
+    }
+    assert_eq!(Quat::from_mat3(Mat3::IDENTITY), Quat::IDENTITY);
+    // A NaN in the deciding coefficient leaves the quaternion as it was.
+    let nan = Quat::new(-one, zero, zero, Scalar::NAN).canonical_sign();
+    assert_eq!(nan.x, -one);
+}
+
+#[test]
+#[cfg(debug_assertions)]
+#[should_panic(expected = "uniform parent scale")]
+fn compose_uniform_rejects_a_non_uniform_parent() {
+    let parent = Transform::new(Vec3::ZERO, Quat::IDENTITY, Vec3::new(s(2.0), s(1.0), s(1.0)));
+    let _ = parent.compose_uniform(Transform::IDENTITY);
+}
+
+#[test]
+fn extreme_magnitudes_behave_as_documented() {
+    // Squares overflow: the length is infinite and the "normalised" vector is zero.
+    let huge = Vec3::splat(s(1e200));
+    assert_eq!(huge.normalize(), Vec3::ZERO);
+    assert_eq!(huge.try_normalize(), None);
+    // Squares underflow: the length is zero.
+    let tiny = Vec3::splat(s(1e-200));
+    assert!(!tiny.normalize().is_finite());
+    assert_eq!(tiny.try_normalize(), None);
+    // Invertible, but the determinant leaves the finite range.
+    assert_eq!(Mat3::from_diagonal(Vec3::splat(s(1e-120))).inverse(), None);
+    assert_eq!(Mat3::from_diagonal(Vec3::splat(s(1e120))).inverse(), None);
+    assert_eq!((Mat4::IDENTITY * s(1e-90)).inverse(), None);
+    // The reciprocal of an overflowed positive power.
+    assert_eq!(s(2.0).powi(-1074), Scalar::ZERO);
+    assert_eq!(s(2.0).powf(s(-1074.0)).to_canonical_bits(), 1);
 }
 
 #[test]
@@ -423,10 +497,10 @@ fn transform_matches_its_matrix() {
             0.0
         ));
 
-        // Composition is exact when the parent's scale is uniform.
+        // Composition under a uniform parent scale is the matrix product.
         let parent =
             Transform::new(moderate_vec3(&mut rng), unit_quat(&mut rng), Vec3::splat(s(1.5)));
-        let composed = parent * transform;
+        let composed = parent.compose_uniform(transform);
         assert!(all_close(
             &composed.to_mat4().to_array(),
             &(parent.to_mat4() * matrix).to_array(),
@@ -440,7 +514,7 @@ fn transform_matches_its_matrix() {
     }
     let here = Vec3::new(s(1.0), s(2.0), s(3.0));
     assert_eq!(Transform::at(here).transform_point(Vec3::ZERO), here);
-    assert_eq!(Transform::IDENTITY * Transform::at(here), Transform::at(here));
+    assert_eq!(Transform::IDENTITY.compose_uniform(Transform::at(here)), Transform::at(here));
     assert_eq!(Transform::IDENTITY.to_mat4(), Mat4::IDENTITY);
 }
 

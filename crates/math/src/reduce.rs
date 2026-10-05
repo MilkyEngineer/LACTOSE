@@ -18,9 +18,12 @@ use crate::{Scalar, Vec2, Vec3, Vec4};
 /// For any multiset of items, [`finish`](Self::finish) returns the same value however the
 /// items are split between partials, in whatever order each partial receives its items, and
 /// in whatever order and shape the partials are merged. A partial that received no item is
-/// neutral in a merge. An implementation that cannot guarantee this for every input must not
-/// implement the trait.
-pub trait Reducer: Sized {
+/// neutral in a merge.
+///
+/// The trait is sealed: architecture section 5.2 has reductions use provided combinators, and
+/// a reducer that broke the contract would break determinism without failing any type check.
+/// A new reducer is added here, with a test of the contract.
+pub trait Reducer: Sized + sealed::SealedReducer {
     /// What is folded in.
     type Item;
     /// What the reduction produces.
@@ -64,6 +67,8 @@ pub trait Reducer: Sized {
 pub struct ExactSum<T: ExactSummand = Scalar> {
     lanes: T::Lanes,
 }
+
+impl<T: ExactSummand> sealed::SealedReducer for ExactSum<T> {}
 
 impl<T: ExactSummand> Reducer for ExactSum<T> {
     type Item = T;
@@ -163,17 +168,60 @@ pub struct Min<T>(Option<T>);
 #[derive(Clone, Copy, Debug)]
 pub struct Max<T>(Option<T>);
 
-macro_rules! extremum {
-    ($reducer:ident, $select:ident, [$($bounds:tt)*], $item:ty) => {
-        impl<$($bounds)*> Reducer for $reducer<$item> {
-            type Item = $item;
-            type Output = Option<$item>;
+/// A type [`Min`] and [`Max`] can reduce: [`Scalar`] and the primitive integers. Sealed.
+///
+/// These are the types for which two items that compare equal are the same value, so which
+/// of two equal items is kept cannot be observed. A type whose ordering ignores part of its
+/// value would make the result depend on the order of the items.
+pub trait Extremum: Copy + sealed::Sealed {
+    #[doc(hidden)]
+    fn lesser(self, other: Self) -> Self;
+
+    #[doc(hidden)]
+    fn greater(self, other: Self) -> Self;
+}
+
+impl Extremum for Scalar {
+    fn lesser(self, other: Self) -> Self {
+        self.min(other)
+    }
+
+    fn greater(self, other: Self) -> Self {
+        self.max(other)
+    }
+}
+
+macro_rules! integer_extremum {
+    ($($ty:ty),*) => {$(
+        impl sealed::Sealed for $ty {}
+
+        impl Extremum for $ty {
+            fn lesser(self, other: Self) -> Self {
+                Ord::min(self, other)
+            }
+
+            fn greater(self, other: Self) -> Self {
+                Ord::max(self, other)
+            }
+        }
+    )*};
+}
+
+integer_extremum!(i8, i16, i32, i64, i128, u8, u16, u32, u64, u128);
+
+macro_rules! extremum_reducer {
+    ($reducer:ident, $select:ident) => {
+        impl<T: Extremum> sealed::SealedReducer for $reducer<T> {}
+
+        impl<T: Extremum> Reducer for $reducer<T> {
+            type Item = T;
+            type Output = Option<T>;
 
             fn identity() -> Self {
                 Self(None)
             }
 
-            fn add(&mut self, item: $item) {
+            fn add(&mut self, item: T) {
                 self.0 = Some(match self.0 {
                     Some(current) => current.$select(item),
                     None => item,
@@ -186,17 +234,15 @@ macro_rules! extremum {
                 }
             }
 
-            fn finish(self) -> Option<$item> {
+            fn finish(self) -> Option<T> {
                 self.0
             }
         }
     };
 }
 
-extremum!(Min, min, [], Scalar);
-extremum!(Max, max, [], Scalar);
-extremum!(Min, min, [T: Ord + Copy], T);
-extremum!(Max, max, [T: Ord + Copy], T);
+extremum_reducer!(Min, lesser);
+extremum_reducer!(Max, greater);
 
 impl<T> Default for Min<T> {
     fn default() -> Self {
@@ -220,6 +266,8 @@ pub struct IntSum<T> {
     total: i128,
     item: PhantomData<fn(T)>,
 }
+
+impl<T: Into<i128>> sealed::SealedReducer for IntSum<T> {}
 
 impl<T: Into<i128>> Reducer for IntSum<T> {
     type Item = T;
@@ -252,6 +300,8 @@ mod sealed {
     use super::{Raw, raw};
 
     pub trait Sealed {}
+
+    pub trait SealedReducer {}
 
     const LIMB_BITS: usize = u64::BITS as usize;
     const FRACTION_BITS: usize = raw::FRACTION_BITS as usize;

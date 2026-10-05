@@ -104,14 +104,20 @@ macro_rules! componentwise {
                 (self - other).length()
             }
 
-            /// `self / self.length()`. Not finite when the length is zero or not finite; use
-            /// [`try_normalize`](Self::try_normalize) where that can happen.
+            /// `self / self.length()`, which has unit length only when the length is positive
+            /// and finite. A zero length, including one whose squares underflowed, gives NaN
+            /// or infinite components. An infinite length, including one whose squares
+            /// overflowed (components beyond about `1e154`), gives zeros for the finite
+            /// components and NaN for infinite ones. Use
+            /// [`try_normalize`](Self::try_normalize) where either can happen.
             #[must_use]
             pub fn normalize(self) -> Self {
                 self / self.length()
             }
 
-            /// `self / self.length()`, or `None` when the length is zero or not finite.
+            /// `self / self.length()`, or `None` when the computed length is zero or not
+            /// finite. That includes finite non-zero vectors whose squared components
+            /// underflow to zero or overflow to infinity.
             #[must_use]
             pub fn try_normalize(self) -> Option<Self> {
                 let length = self.length();

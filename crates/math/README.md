@@ -47,11 +47,21 @@ any build of this workspace, with no dependence on the platform math library.
 - **There is no `Sum` or `Product` for `Scalar`.** An iterator sum hides its order. Write the
   order out, or use `ExactSum` where the order is not yours to choose.
 - **Quaternions are not renormalised behind the caller's back.** Methods that need unit
-  length say so.
+  length say so. `q` and `-q` are the same rotation; `Quat::canonical_sign` picks the one
+  whose first non-zero coefficient in the order `w, x, y, z` is positive, and
+  `Quat::from_mat3` returns that one.
+- **`Transform` has no `*`.** `compose_uniform` composes under a uniform parent scale and
+  says so in its name; anything else composes as `Mat4` products, because a non-uniform
+  parent scale produces shear that a `Transform` cannot hold.
+- **Extreme magnitudes are not rescued.** `length` squares its components, so `normalize`
+  and `try_normalize` fail beyond about `1e154` and below about `1e-154`; matrix `inverse`
+  returns `None` when the determinant underflows or overflows; `powi` multiplies step by
+  step. Each method documents what it returns.
 - **Render space is a different space.** There is no `From`, `Into` or operator between
   `RenderPosition` and the simulation types, only `RenderPosition::from_sim`.
 - **`Reducer` results do not depend on order or grouping**, for any input including NaN and
-  infinities. `ExactSum` holds the exact sum of every finite value and rounds once at the end;
+  infinities. The trait is sealed, and `Min`/`Max` accept only `Scalar` and the primitive
+  integers. `ExactSum` holds the exact sum of every finite value and rounds once at the end;
   the type documents its range.
 
 ## Layout
@@ -70,6 +80,14 @@ Every type is `repr(C)` (or `repr(transparent)`), `Pod`, and padding-free: an ar
 
 `render::RenderPosition` is `cell: [i32; 3]` then `offset: [f32; 3]`, 24 bytes.
 
+## Precondition: the floating-point environment
+
+Every guarantee here assumes the calling thread rounds to nearest and has flush-to-zero and
+denormals-are-zero off (MXCSR on x86-64, FPCR on aarch64). `lactose_core::thread_class` sets
+that state when a thread enters an engine class and asserts it at the start of boundary jobs
+in debug builds (architecture section 5.1). This crate does not check it; a thread that calls
+in with another rounding mode, or with subnormals flushed, gets different bits.
+
 ## Why the results are the same everywhere
 
 - **Basic operations** (`+ - * /`, comparisons, conversions) are single IEEE 754 operations
@@ -86,18 +104,24 @@ Every type is `repr(C)` (or `repr(transparent)`), `Pod`, and padding-free: an ar
   has a `compile_error!` on x86-64 without `fma`, so the instruction is the only path that
   can be built. `libm::fma` would instead go through a function pointer chosen by CPU
   detection at run time, which is slower and gains nothing once the feature is guaranteed.
+  `Scalar::mul_add` is `#[inline(never)]`: an inlined copy would be code-generated with the
+  caller's target features, outside the reach of the guard, and a caller built without the
+  pin would get the library call. It is the only function here whose inlined result depends
+  on the caller's features; the primitive `mul_add` is banned by the boundary lint list.
 - **`floor`, `ceil`, `trunc`, `round` and `%`** are exact operations taken from `libm`, since
   the primitive `%` and, without SSE4.1, the rounding functions compile to platform library
   calls.
 - **Transcendentals** come from the `libm` crate, pinned in `Cargo.lock`: the same Rust
   source on every target, built from the basic operations above. `powi` is written out here
   as binary exponentiation.
+- **`libm` is pinned to exactly 0.2.16**, because its releases change algorithms; a bump is
+  a determinism change that regenerates the golden table and is reviewed as one.
 - **`libm` features.** The workspace enables exactly `arch`. In 0.2.16 that feature swaps
   in hardware `sqrt` (x86-64 and aarch64), `fma` (aarch64; on x86-64 by run-time detection
   of FMA or FMA4, else the software fallback) and `rint` (aarch64). All are exact or
   correctly rounded, so no path can change a bit; the golden table passes with and without
   the feature. `unstable-intrinsics`, `unstable-float` and `force-soft-floats` stay off.
-- **The golden table** (`tests/golden/vectors.txt`, about five thousand cases) records the
+- **The golden table** (`tests/golden/vectors.txt`, about eighteen thousand cases) records the
   canonical result bits of every operation as computed on aarch64. CI runs it on x86-64 Linux
   and Windows; a mismatch prints the operation, inputs and both bit patterns.
 
@@ -112,7 +136,8 @@ width narrows.
 
 ## Regenerating the golden table
 
-On aarch64 only, after adding an operation or a case:
+On aarch64 only, after adding an operation or a case (the generator is not compiled for any
+other architecture):
 
 ```
 cargo nextest run -p lactose-math --run-ignored only -E 'test(bless)'

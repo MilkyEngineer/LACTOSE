@@ -84,10 +84,31 @@ impl Quat {
     }
 
     /// The rotation a rotation matrix performs. `matrix` must be orthonormal with determinant
-    /// one. Of the two quaternions for a rotation, the one returned has the largest of its
-    /// four coefficients positive.
+    /// one. Of the two quaternions for a rotation, the one returned is the
+    /// [`canonical_sign`](Self::canonical_sign) one.
     #[must_use]
     pub fn from_mat3(matrix: Mat3) -> Self {
+        Self::from_mat3_either_sign(matrix).canonical_sign()
+    }
+
+    /// The same quaternion or its negation, whichever has its first non-zero coefficient in
+    /// the order `w, x, y, z` positive. `q` and `-q` are the same rotation, and this picks
+    /// one of the two by a rule that depends only on the values: `w > 0`, or `w == 0` and
+    /// `x > 0`, and so on. Negation is exact, so nothing is rounded. A quaternion with a NaN
+    /// in the deciding coefficient is returned unchanged.
+    ///
+    /// With `w >= 0` guaranteed, a unit quaternion can be sent as `x, y, z` alone.
+    #[must_use]
+    pub fn canonical_sign(self) -> Self {
+        let zero = Scalar::ZERO;
+        let negative = self.w < zero
+            || (self.w == zero
+                && (self.x < zero
+                    || (self.x == zero && (self.y < zero || (self.y == zero && self.z < zero)))));
+        if negative { -self } else { self }
+    }
+
+    fn from_mat3_either_sign(matrix: Mat3) -> Self {
         let Vec3 { x: m00, y: m01, z: m02 } = matrix.x_axis;
         let Vec3 { x: m10, y: m11, z: m12 } = matrix.y_axis;
         let Vec3 { x: m20, y: m21, z: m22 } = matrix.z_axis;
@@ -158,8 +179,9 @@ impl Quat {
         self.length_squared().sqrt()
     }
 
-    /// Each coefficient divided by the length. Not finite when the length is zero or not
-    /// finite.
+    /// Each coefficient divided by the length. A unit quaternion only when the length is
+    /// positive and finite: a zero length gives NaN or infinite coefficients, and an infinite
+    /// one (coefficients beyond about `1e154`) gives zeros.
     #[must_use]
     pub fn normalize(self) -> Self {
         let length = self.length();

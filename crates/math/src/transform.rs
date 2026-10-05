@@ -1,7 +1,5 @@
 //! [`Transform`]: translation, rotation and scale.
 
-use core::ops::Mul;
-
 use bytemuck::{Pod, Zeroable};
 
 use crate::{Mat4, Quat, Scalar, Vec3};
@@ -74,22 +72,31 @@ impl Transform {
     pub fn to_mat4(self) -> Mat4 {
         Mat4::from_scale_rotation_translation(self.scale, self.rotation, self.translation)
     }
-}
 
-/// Composition: `parent * child` places `child` in the space of `parent`.
-///
-/// The translation is `parent.transform_point(child.translation)`, the rotation is
-/// `parent.rotation * child.rotation` and the scale is the componentwise product. That
-/// equals the matrix product exactly in real arithmetic only when the parent's scale is
-/// uniform or the child's rotation maps axes to axes; otherwise the true composition has
-/// shear, which this type cannot hold.
-impl Mul for Transform {
-    type Output = Self;
-    fn mul(self, rhs: Self) -> Self {
+    /// Places `child` in the space of `self`, which must have a uniform scale (all three
+    /// components equal; checked in debug builds).
+    ///
+    /// The translation is `self.transform_point(child.translation)`, the rotation is
+    /// `self.rotation * child.rotation` and the scale is the componentwise product. Under a
+    /// uniform parent scale that is the transform whose matrix is
+    /// `self.to_mat4() * child.to_mat4()`.
+    ///
+    /// There is deliberately no general composition and no `*` operator: under a non-uniform
+    /// parent scale the true composition has shear, which this type cannot hold, and a
+    /// componentwise answer would be a silently wrong placement. A hierarchy with
+    /// non-uniform scale composes through [`Mat4`]: multiply the [`to_mat4`](Self::to_mat4)
+    /// matrices.
+    #[must_use]
+    pub fn compose_uniform(self, child: Self) -> Self {
+        debug_assert!(
+            self.scale.x == self.scale.y && self.scale.y == self.scale.z,
+            "compose_uniform needs a uniform parent scale, got {:?}",
+            self.scale
+        );
         Self {
-            translation: self.transform_point(rhs.translation),
-            rotation: self.rotation * rhs.rotation,
-            scale: self.scale * rhs.scale,
+            translation: self.transform_point(child.translation),
+            rotation: self.rotation * child.rotation,
+            scale: self.scale * child.scale,
         }
     }
 }

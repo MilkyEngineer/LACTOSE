@@ -275,7 +275,17 @@ impl Scalar {
     }
 
     /// `self * a + b` with a single rounding (fused multiply-add).
+    // Never inlined into another crate. An inlined copy is code-generated with the caller's
+    // target features, and a caller built without the x86-64-v3 pin (a doctest, a crate built
+    // through a wrapper) would turn it into a call to the platform `fma`. Kept out of line,
+    // the instruction is always generated here, where the `compile_error!` in `lib.rs`
+    // guarantees the `fma` feature.
+    #[inline(never)]
     #[must_use]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the sanctioned fused multiply-add: one hardware instruction under the fma guard"
+    )]
     pub fn mul_add(self, a: Self, b: Self) -> Self {
         Self(self.0.mul_add(a.0, b.0))
     }
@@ -336,8 +346,12 @@ impl Scalar {
     /// `self` raised to an integer power by binary exponentiation.
     ///
     /// The product is accumulated from the lowest exponent bit upward over repeated squares
-    /// of `self`; a negative exponent takes the reciprocal of the positive power at the end.
-    /// `powi(0)` is one for every `self`, NaN included.
+    /// of `self`, each multiplication rounded, so the error grows with the exponent and the
+    /// result is not the correctly rounded power; use [`powf`](Self::powf) where that
+    /// matters. A negative exponent computes the positive power and takes its reciprocal at
+    /// the end, so a positive power that overflows gives zero even where the true result is
+    /// a representable subnormal: `2.powi(-1074)` is zero. `powi(0)` is one for every `self`,
+    /// NaN included.
     #[must_use]
     pub const fn powi(self, exponent: i32) -> Self {
         let mut square = self.0;

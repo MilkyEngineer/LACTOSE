@@ -3,6 +3,14 @@
 //!
 //! Foundation tier, inside the determinism boundary, and the only place in the boundary
 //! where floating point is computed (architecture section 8.2). See `README.md`.
+//!
+//! # Precondition: the floating-point environment
+//!
+//! Results are bit-identical only when the calling thread rounds to nearest and has
+//! flush-to-zero and denormals-are-zero off (on aarch64: FPCR rounding mode nearest, FZ
+//! clear). `lactose_core::thread_class` sets that state for every engine thread and asserts
+//! it at the start of boundary jobs in debug builds (architecture section 5.1). This crate
+//! does not check it.
 
 #![forbid(unsafe_code)]
 
@@ -32,7 +40,7 @@ mod vec;
 pub use canonical::Canonical;
 pub use mat::{Mat3, Mat4};
 pub use quat::Quat;
-pub use reduce::{ExactSum, ExactSummand, IntSum, Max, Min, Reducer};
+pub use reduce::{ExactSum, ExactSummand, Extremum, IntSum, Max, Min, Reducer};
 pub use scalar::{Scalar, ScalarBits};
 pub use transform::Transform;
 pub use vec::{Vec2, Vec3, Vec4};

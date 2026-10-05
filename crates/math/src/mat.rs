@@ -94,7 +94,9 @@ impl Mat3 {
         self.x_axis.dot(self.y_axis.cross(self.z_axis))
     }
 
-    /// The inverse, or `None` when the [determinant](Self::determinant) is zero or not finite.
+    /// The inverse, or `None` when the computed [determinant](Self::determinant) is zero or
+    /// not finite. That is decided on the rounded determinant, so an invertible matrix of
+    /// extreme scale, whose determinant underflows to zero or overflows, also gives `None`.
     ///
     /// It is the transposed cofactor matrix with every element divided by the determinant.
     #[must_use]
@@ -272,7 +274,9 @@ impl Mat4 {
         ((m00 * c0 - m01 * c1) + m02 * c2) - m03 * c3
     }
 
-    /// The inverse, or `None` when the [determinant](Self::determinant) is zero or not finite.
+    /// The inverse, or `None` when the computed [determinant](Self::determinant) is zero or
+    /// not finite. That is decided on the rounded determinant, so an invertible matrix of
+    /// extreme scale, whose determinant underflows to zero or overflows, also gives `None`.
     ///
     /// It is the adjugate with every element divided by the determinant.
     #[must_use]
