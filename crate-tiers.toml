@@ -1,14 +1,18 @@
 # The single statement of which crate may depend on which. CI enforces it.
 # Foundation crates may be depended on by any crate.
-# Backend crates may be named only by `app`, by `tools/*`, by their own tests, and by the
-# exceptions below.
+# Backend crates may be named only by leaf crates, by their own tests, and by the exceptions below.
+# Leaf crates (binaries and tools) may depend on anything, subject to [server_denylist].
+# Game crates may depend on foundation crates only.
+# A crate missing from every section fails the tier check.
+# Build scripts and proc macros may not depend on boundary crates (they compile for the host
+# without the pinned target features).
 
 [foundation]
 crates = [
   "lactose-core", "lactose-math", "lactose-task", "lactose-ecs", "lactose-reflect",
   "lactose-sim", "lactose-anim", "lactose-predict", "lactose-nav-query",
-  "lactose-physics-api", "lactose-asset-api", "lactose-present-api", "lactose-net-api",
-  "lactose-rhi-api", "lactose-input", "lactose-io",
+  "lactose-physics-api", "lactose-asset-api", "lactose-bundle", "lactose-present-api",
+  "lactose-net-api", "lactose-rhi-api", "lactose-input", "lactose-io",
 ]
 
 [backend]
@@ -17,22 +21,39 @@ crates = [
   "lactose-rhi-vulkan", "lactose-rhi-metal", "lactose-rhi-null", "lactose-rhi-dx12",
   "lactose-render-graph", "lactose-renderer", "lactose-presentation", "lactose-terrain",
   "lactose-audio", "lactose-ui", "lactose-nav", "lactose-platform", "lactose-debug-ui",
+  "lactose-app",
 ]
+
+[leaf]
+crates = ["lactose-app-client", "lactose-app-server", "lactose-app-headless", "ricotta"]
+
+[game]
+crates = ["game-sim", "game-present", "game-ai", "game-content"]
 
 [boundary]
 # Crates inside the determinism boundary. clippy.toml and cargo-deny allowlists apply here.
 crates = [
   "lactose-core", "lactose-math", "lactose-ecs", "lactose-sim", "lactose-anim",
   "lactose-predict", "lactose-nav-query", "lactose-physics-api", "lactose-physics-rapier",
-  "game-sim", "game-ai",
+  "lactose-bundle", "game-sim", "game-ai", "game-content",
+]
+
+[server_denylist]
+# lactose-app-server may not depend on these, directly or transitively.
+crates = [
+  "lactose-render-graph", "lactose-renderer", "lactose-presentation", "lactose-platform",
+  "lactose-audio", "lactose-ui", "lactose-debug-ui", "lactose-rhi-vulkan", "lactose-rhi-metal",
+  "lactose-rhi-dx12", "lactose-rhi-null",
 ]
 
 # Edges that need no exception because the target is foundation: net -> predict,
-# presentation -> net-api (interpolation buffer), audio -> present-api (listener requests).
+# presentation -> net-api (interpolation buffer), audio -> present-api (listener requests),
+# persist -> bundle, asset -> bundle, cook -> bundle.
 
 [exceptions]
 "lactose-renderer"     = { may_depend_on = ["lactose-render-graph"], reason = "passes are the renderer's output" }
-"lactose-presentation" = { may_depend_on = ["lactose-renderer"], reason = "pose evaluation and VFX feed the renderer" }
+"lactose-presentation" = { may_depend_on = ["lactose-renderer"], reason = "pose evaluation and remote transform upload feed the renderer" }
 "lactose-debug-ui"     = { may_depend_on = ["lactose-renderer", "lactose-platform"], reason = "overlay draws through the renderer and reads window events" }
-"lactose-terrain"      = { may_depend_on = ["lactose-renderer"], reason = "clipmap passes" }
-"lactose-ui"           = { may_depend_on = ["lactose-renderer", "lactose-render-graph"], reason = "UI pass" }
+"lactose-terrain"      = { may_depend_on = ["lactose-renderer"], reason = "clipmap passes through RenderFeature" }
+"lactose-ui"           = { may_depend_on = ["lactose-renderer", "lactose-render-graph"], reason = "UI pass through RenderFeature" }
+"lactose-persist"      = { may_depend_on = ["lactose-asset"], reason = "overlay diffing needs the loaded cooked baseline" }

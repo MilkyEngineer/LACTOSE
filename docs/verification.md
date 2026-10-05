@@ -14,8 +14,10 @@ with the milestone that gates it.
 | Scalar precision | Simulation scalar precision at full map extent | 1 |
 | MoltenVK and KosmicKrisp | Indirect-draw behaviour, encode time for ten thousand draws, pipeline creation cost, memoryless attachments and local reads | 2 |
 | Extract cost | Per-dirty-row extract cost | 2 |
-| Chunk size | Whether a fixed 16 KiB chunk beats per-archetype sizing | 1 |
 | Prediction-world snapshot cost | Full-copy cost per tick, deciding whether copy-on-write is built | 1 |
+| Native Metal | Argument buffers, residency, memoryless attachments, framebuffer fetch, indirect draws; unfreezes `rhi-api` | 2 |
+| Remote transform upload | Cost per frame for 5k interpolated entities at 144 Hz | 2 |
+| Physics phase stall | Share of tick and stall imposed on render recording during overlap | 1 |
 
 ## 2. Third-party claims to re-verify on pinned versions
 
@@ -31,8 +33,24 @@ version in `Cargo.lock` before the milestone that depends on it.
 | MoltenVK multi-draw-indirect is a CPU loop. | 2 |
 | Slang's Metal target supports argument buffers, function constants and framebuffer fetch. | 2 |
 | Apple M1 lacks 64-bit atomics. | 3 |
+| glam or its fork has a feature (such as fast-math) that changes numerics on the pinned version; if so it goes on the cargo-deny denylist. | 0 |
+| `bytemuck_derive` on the pinned version: support for data-carrying enums under `NoUninit` and `CheckedBitPattern`, and whether a `PodInOption` derive exists for `NetId`. | 0 |
+| loom's current limitations (SeqCst modelled as AcqRel, no load buffering) and feasible preemption bound for the latch and sleep model. | 0 |
+| `tracing-tracy` per-span overhead, to confirm per-system and per-range spans fit the budget. | 0 |
+| Rapier's serialised snapshot is iteration-order stable enough to hash. | 1 |
+| Rapier's 64-bit build uses SIMD after its glam migration, which decides the 64-bit cost argument. | 1 |
 
-## 3. Open items
+## 3. Console assumptions to keep out of milestone 0 interfaces
+
+| Assumption | Why it will hurt | Mitigation now |
+|---|---|---|
+| Software zstd and LZ4 in `io` and the pack format | PlayStation and Xbox have hardware decompression | `io` exposes a read-with-decompress request, not a read followed by a decompress call |
+| std threads, `park`, QoS and sysctl core queries | Consoles need fixed affinity | Worker creation goes through a platform trait in `task` |
+| Writable disk for pipeline caches and crash dumps | Not guaranteed | Both paths are optional and report failure as a value |
+| Slang has no public PSSL target | PlayStation shaders | The cooker's backend list is a table, not code |
+| No allocator decision | Milestone 3 budgets need tagging from the start | Tagged `GlobalAlloc` in `core` from milestone 0 |
+
+## 4. Open items
 
 | Item | Gates milestone |
 |---|---|

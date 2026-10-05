@@ -1,6 +1,10 @@
 # LACTOSE
 
-Rust game engine. Read `docs/architecture.md` before any task. It is binding.
+Revision marker: architecture 3.2. At task start run `git show HEAD:CLAUDE.md | head -3` and
+confirm the marker matches this text; if not, read the file on disk, not this copy.
+
+Rust game engine. Read `docs/architecture.md` before any task. It is binding. `docs/decisions-log.md`
+holds the reasons; `docs/verification.md` holds what must be measured or re-checked first.
 
 ## Names
 
@@ -19,7 +23,7 @@ Never use a codename for a crate, type or function.
 | BRIE | bindless heap in `lactose-renderer` |
 | CREAM | GPU culling in `lactose-renderer` |
 | LATTE | late-latched orbit camera in `lactose-renderer` |
-| FROTH | VFX particles in `lactose-renderer` |
+| FROTH | GPU VFX in `lactose-renderer` |
 | QUARK | `lactose-physics-rapier` |
 | MILKMAN | replication and interest management in `lactose-net`, log target `milkman` |
 | SKIM | `lactose-persist`, saves |
@@ -31,19 +35,17 @@ Never use a codename for a crate, type or function.
 
 ## Rules that CI enforces
 
-- `#![forbid(unsafe_code)]` outside `task`, `ecs`, `io`, `rhi-*`, `core` and `tools/cook`.
-- `crate-tiers.toml` is the only dependency rule: foundation crates may be used by anyone,
-  backend crates only by `app`, `tools/*` and the listed exceptions. It also lists the crates
-  inside the determinism boundary.
-- Inside the boundary: no `Instant` or `SystemTime`; `core::FixedHashMap` only; no
-  `thread_local!`; floats only through `math` (no `f32::min`/`max`/`powi`/`total_cmp`/`to_bits`
-  outside it); no glam except through Rapier's pinned math in `physics-rapier`; no runtime CPU feature detection selecting different numerics; chunk,
-  row, worker and task order are never semantic keys. Every ordering and RNG key is a stable
-  key (`NetId`, `SystemKey`, `PredictionKey`), never `EntityId`.
-- x86-64 builds pin the x86-64-v3 baseline; `math` fails to compile without `fma`.
-- Every simulation test runs under SOUR in workers, repeat, layout and chaos modes and must
-  hash identically. Architecture mode compares linux-x64, windows-x64 and macos-arm64.
-- Components are `NoUninit + CheckedBitPattern` with explicit field IDs, typed reference
-  fields and a persistence policy. `EntityId` never appears in a component, on the wire or on
-  disk.
-- Panics abort. Tests run under nextest, one process per test.
+- `#![forbid(unsafe_code)]` outside the crates in architecture section 21.
+- `crate-tiers.toml` is the only dependency rule and the only boundary list. Every crate must
+  appear in it.
+- Inside the determinism boundary, the rules of architecture section 8.2 apply verbatim; this
+  file does not paraphrase them. Every reference, ordering rule and RNG key is a `StableKey`,
+  never an `EntityId`.
+- x86-64 builds pin the x86-64-v3 baseline through `.cargo/config.toml` target rustflags;
+  never set `RUSTFLAGS` in the environment.
+- Every simulation test runs under SOUR; a pull request runs workers mode and one layout
+  capacity, nightly runs the rest. Hashes must match.
+- Components use `#[component(key = "...")]`, are `NoUninit + CheckedBitPattern`, carry
+  explicit field IDs, typed reference fields and a persistence policy.
+- Panics abort in binaries. Tests run under nextest, one process per test, with no abort hook.
+- Systems use the `#[system]` macro of architecture section 6.1 and declare the worlds they run in.
