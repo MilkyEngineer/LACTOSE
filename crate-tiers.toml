@@ -1,0 +1,23 @@
+# Dependency tiers enforced by CI. Foundation crates may be depended on by any crate.
+# Backend crates may be named only by `app`, by `tools/*`, and by their own tests.
+
+[foundation]
+crates = [
+  "lactose-core", "lactose-math", "lactose-task", "lactose-ecs", "lactose-reflect",
+  "lactose-sim", "lactose-anim", "lactose-asset-api", "lactose-physics-api",
+  "lactose-net-api", "lactose-rhi-api", "lactose-input",
+]
+
+[backend]
+crates = [
+  "lactose-asset", "lactose-io", "lactose-physics-rapier", "lactose-net", "lactose-persist",
+  "lactose-rhi-vulkan", "lactose-rhi-metal", "lactose-rhi-dx12", "lactose-render-graph",
+  "lactose-renderer", "lactose-terrain", "lactose-audio", "lactose-ui", "lactose-nav",
+  "lactose-platform", "lactose-debug-ui",
+]
+
+[exceptions]
+# Backend-to-backend edges that are allowed. Each needs a reason.
+"lactose-renderer" = { may_depend_on = ["lactose-render-graph"], reason = "passes are the renderer's output" }
+"lactose-debug-ui" = { may_depend_on = ["lactose-renderer"], reason = "overlay draws through the renderer" }
+"lactose-terrain"  = { may_depend_on = ["lactose-renderer"], reason = "clipmap passes" }
