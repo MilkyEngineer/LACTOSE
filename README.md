@@ -1,6 +1,6 @@
-# engine-experiment
+# LACTOSE
 
-A from-scratch Rust game engine built around a short critical path, deterministic simulation,
+LACTOSE: Lock-free Asynchronous Chunked Task-Oriented Simulation Engine. A from-scratch Rust game engine built around a short critical path, deterministic simulation,
 and a work-stealing task system with no coordinator thread. Built by AI agent teams working
 against interface crates in parallel.
 
