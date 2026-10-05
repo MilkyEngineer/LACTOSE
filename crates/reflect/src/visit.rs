@@ -16,7 +16,9 @@ pub trait FieldVisitor {
     /// supported target is little-endian.
     fn bytes(&mut self, id: FieldId, bytes: &[u8]);
 
-    /// The simulation scalar. [`ScalarField::canonical_bits`] is what a hasher mixes.
+    /// A scalar. [`ScalarField::canonical_bits`] is what a hasher mixes, but `S` is whatever
+    /// type some crate implemented [`ScalarField`] for: a hasher that needs canonical floats
+    /// restricts `S` itself, as that trait's documentation says.
     fn scalar<S: ScalarField>(&mut self, id: FieldId, value: &S);
 
     /// A raw 32-bit float, from a presentation component. Its NaN sign and payload are not

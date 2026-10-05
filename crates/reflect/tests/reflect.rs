@@ -11,8 +11,8 @@ use lactose_core::{
 use lactose_reflect::bytemuck;
 use lactose_reflect::{
     AssetReference, Component, Field, FieldInfo, FieldKind, FieldVisitor, Padding, Persistence,
-    ReferenceVisitor, Reflect, Registry, Resource, ScalarField, Schema, StructInfo, Tracking,
-    TypeInfo, TypeRole, component, decode, resource, value,
+    ReferenceVisitor, Reflect, Registry, Resource, ScalarField, Schema, Tracking, TypeInfo,
+    TypeRole, component, decode, resource, value,
 };
 
 /// What a character is doing.
@@ -177,7 +177,7 @@ fn metadata_states_policy_version_tracking_and_role() {
 #[test]
 fn layout_comes_from_the_compiler() {
     let layout = KitchenSink::SCHEMA.layout();
-    assert_eq!(layout.name(), "KitchenSink");
+    assert_eq!(layout.name(), "test::kitchen_sink");
     assert_eq!(layout.size(), size_of::<KitchenSink>());
     assert_eq!(layout.align(), align_of::<KitchenSink>());
 
@@ -407,7 +407,7 @@ pub struct HealthImpostor;
 // the validation entry points must hold up against a description that is wrong.
 
 macro_rules! hand_written {
-    ($(#[$doc:meta])* $name:ident { $($field:ident: $ty:ty),+ }, $layout:expr) => {
+    ($(#[$doc:meta])* $name:ident { $($field:ident: $ty:ty),+ }, $key:expr, $fields:expr, $retired:expr) => {
         $(#[$doc])*
         #[derive(Clone, Copy, bytemuck::NoUninit, bytemuck::CheckedBitPattern)]
         #[repr(C)]
@@ -416,15 +416,16 @@ macro_rules! hand_written {
         }
 
         impl Reflect for $name {
-            const KEY: ComponentKey = ComponentKey::from_name(stringify!($name));
-            const SCHEMA: &'static Schema<Self> = &Schema::new(TypeInfo::new(
+            const KEY: ComponentKey = $key;
+            const SCHEMA: &'static Schema<Self> = &Schema::new(
                 stringify!($name),
                 TypeRole::Component,
                 Persistence::Persistent,
                 1,
                 Tracking { replicated: false, extracted: false },
-                $layout,
-            ));
+                $fields,
+                $retired,
+            );
 
             fn visit<V: FieldVisitor>(&self, _: &mut V) {}
 
@@ -440,58 +441,52 @@ const fn two_fields(a: u16, b: u16, b_offset: usize) -> [FieldInfo; 2] {
 hand_written!(
     /// Uses one field ID twice.
     DuplicateId { a: u32, b: u32 },
-    StructInfo::new::<DuplicateId>("DuplicateId", &two_fields(1, 1, 4), &[])
+    ComponentKey::from_name("DuplicateId"),
+    &two_fields(1, 1, 4),
+    &[]
 );
 hand_written!(
     /// Describes the second field at the wrong offset.
     WrongOffset { a: u32, b: u32 },
-    StructInfo::new::<WrongOffset>("WrongOffset", &two_fields(1, 2, 2), &[])
+    ComponentKey::from_name("WrongOffset"),
+    &two_fields(1, 2, 2),
+    &[]
 );
 hand_written!(
     /// Describes only the first field.
     MissingField { a: u32, b: u32 },
-    StructInfo::new::<MissingField>(
-        "MissingField",
-        &[FieldInfo::new::<u32>(FieldId(1), "a", 0)],
-        &[]
-    )
+    ComponentKey::from_name("MissingField"),
+    &[FieldInfo::new::<u32>(FieldId(1), "a", 0)],
+    &[]
 );
 hand_written!(
     /// Gives a live field a retired ID.
     RetiredInUse { a: u32, b: u32 },
-    StructInfo::new::<RetiredInUse>("RetiredInUse", &two_fields(1, 2, 4), &[FieldId(2)])
+    ComponentKey::from_name("RetiredInUse"),
+    &two_fields(1, 2, 4),
+    &[FieldId(2)]
 );
 hand_written!(
     /// Retires one ID twice.
     RetiredTwice { a: u32, b: u32 },
-    StructInfo::new::<RetiredTwice>("RetiredTwice", &two_fields(1, 2, 4), &[FieldId(5), FieldId(5)])
+    ComponentKey::from_name("RetiredTwice"),
+    &two_fields(1, 2, 4),
+    &[FieldId(5), FieldId(5)]
 );
 hand_written!(
-    /// Carries the layout of another type, `u32`, and describes its two flags as one integer.
+    /// Describes its two flags and its count as one integer.
     Mislabelled { on: bool, off: bool, count: u16 },
-    StructInfo::new::<u32>("Mislabelled", &[FieldInfo::new::<u32>(FieldId(1), "all", 0)], &[])
+    ComponentKey::from_name("Mislabelled"),
+    &[FieldInfo::new::<u32>(FieldId(1), "all", 0)],
+    &[]
 );
-
-/// Its key constant is not the hash of its name.
-#[derive(Clone, Copy, bytemuck::NoUninit, bytemuck::CheckedBitPattern)]
-#[repr(C)]
-pub struct WrongKey(u32);
-
-impl Reflect for WrongKey {
-    const KEY: ComponentKey = ComponentKey(7);
-    const SCHEMA: &'static Schema<Self> = &Schema::new(TypeInfo::new(
-        "test::wrong_key",
-        TypeRole::Component,
-        Persistence::Persistent,
-        1,
-        Tracking { replicated: false, extracted: false },
-        StructInfo::new::<WrongKey>("WrongKey", &[FieldInfo::new::<u32>(FieldId(1), "0", 0)], &[]),
-    ));
-
-    fn visit<V: FieldVisitor>(&self, _: &mut V) {}
-
-    fn visit_references<V: ReferenceVisitor>(&mut self, _: &mut V) {}
-}
+hand_written!(
+    /// Its key constant is not the hash of its name.
+    WrongKey { a: u32, b: u32 },
+    ComponentKey(7),
+    &two_fields(1, 2, 4),
+    &[]
+);
 
 // Field types as another crate would write them: plain data it owns, a safe `Field` impl, and
 // the trait for its kind.
@@ -813,8 +808,8 @@ fn pinned_bytemuck_derives_accept_data_carrying_enums() {
 
 #[test]
 fn validation_rests_on_the_type_and_not_on_its_description() {
-    // `Mislabelled` describes itself with another type's layout and registers, because one
-    // four-byte integer does tile its four bytes.
+    // `Mislabelled` describes its fields as one four-byte integer and registers, because
+    // that does tile its four bytes.
     let mut registry = Registry::new();
     registry.register::<Mislabelled>().unwrap();
     let info = registry.get(Mislabelled::KEY).unwrap();

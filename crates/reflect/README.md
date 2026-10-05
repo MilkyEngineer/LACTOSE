@@ -6,7 +6,7 @@ What the engine knows about every component and resource type.
 |---|---|
 | Tier | foundation |
 | Determinism boundary | outside |
-| Unsafe | none, `#![forbid(unsafe_code)]` |
+| Unsafe | none in this crate, `#![forbid(unsafe_code)]`; the attributes it re-exports expand to one `unsafe impl` per struct, whose proof is in `crates/reflect-macros/SAFETY.md` |
 
 ## What it holds
 
@@ -40,7 +40,13 @@ What the engine knows about every component and resource type.
   type held in a field.
 - `TypeInfo::validate` and `decode` are the proof that bytes are a valid value: they use the
   type's own `CheckedBitPattern` and nothing a description states. `write_field` and
-  `zero_padding` are decoding steps that follow the description; validate after them.
+  `zero_padding` are decoding steps that follow the description; validate after them. The
+  documentation of `TypeInfo::validate` states exactly what code with `unsafe` may rely on,
+  and it applies only to a description taken from `T::SCHEMA` or looked up in the registry.
+- `FieldKind::Scalar` and `FieldKind::AssetRef` mean that some crate implemented
+  `ScalarField` or `AssetReference` for the type. Both traits are safe, so the world hasher
+  chooses the scalar types it accepts by naming them and does not treat the kind as proof
+  of canonical floats.
 - This crate never hashes, copies or remaps. `lactose-sim` implements those as visitors, so
   nothing here is on a determinism path (architecture section 8.1).
 - A crate registers its types in a function it writes, `registry.register::<T>()?` per type.

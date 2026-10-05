@@ -1,15 +1,15 @@
 //! What must not compile, and what the author is told.
 //!
-//! Each file in `tests/ui` is checked as a binary of a scratch package that depends on this
-//! crate alone. A case passes when the check fails and the compiler's output contains the
-//! listed text, all of which is this crate's own wording; nothing here pins the compiler's
-//! or `bytemuck`'s. `control.rs` must compile.
+//! Each file in `tests/ui` is checked as a binary of a scratch package whose dependencies are
+//! this crate and the test-only macros of `tests/support`. A case passes when the check
+//! fails and the compiler's output contains the listed text. `control.rs` must compile.
 
 use std::path::Path;
 use std::process::Command;
-use std::{env, fs};
+use std::{env, fs, process};
 
-/// File stem, then the messages the author must see.
+/// File stem, then text the compiler's output must contain. Except where noted it is this
+/// crate's own wording.
 const CASES: &[(&str, &[&str])] = &[
     ("missing_field_id", &["field `max` has no field ID: add `#[field(id = N)]`"]),
     ("duplicate_field_id", &["field ID 1 is already used by field `current`"]),
@@ -39,37 +39,73 @@ const CASES: &[(&str, &[&str])] = &[
             "an array field is a `lactose_core::PlainArray<T, N>`, never a bare `[T; N]`",
         ],
     ),
+    // Attributes in raw spelling, which the compiler honours, get the same errors.
+    ("raw_repr", &["remove this `#[repr]`"]),
+    // The compiler has already applied a true `cfg_attr` when the attribute runs.
+    ("raw_cfg_attr", &["remove this `#[repr]`"]),
+    ("enum_raw_repr", &["the only representation of a `#[value]` enum is its width"]),
+    // An attribute below ours rewrites the type after we read it. Nothing we parsed shows
+    // it; the expansion's checks against the final type do.
+    ("rewritten_align", &["`Aligned` is not the struct its attribute read"]),
+    // The compiler's wording: the recorded field type no longer matches.
+    ("rewritten_field", &["mismatched types", "PhantomData<u8>", "PhantomData<bool>"]),
+    ("rewritten_field_deref", &["mismatched types", "PhantomData<u8>", "PhantomData<Wrapper>"]),
+    ("rewritten_enum_align", &["`Mode` is not the enum its attribute read"]),
+    ("rewritten_enum_discriminants", &["`Mode` is not the enum its attribute read"]),
+    // The compiler's wording: the match over the recorded variants is not exhaustive.
+    ("rewritten_enum_variants", &["`Mode::Added` not covered"]),
 ];
 
 #[test]
 #[cfg_attr(miri, ignore = "runs cargo")]
 fn rejected_declarations() {
     let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let project = Path::new(env!("CARGO_TARGET_TMPDIR")).join("compile_fail");
+    let repository = crate_dir.join("../..");
+    let scratch = Path::new(env!("CARGO_TARGET_TMPDIR"));
+    // Sources are per process, so two runs that share a target directory cannot overwrite
+    // each other's files. The build directory is shared: cargo locks it, and the
+    // dependencies are built once.
+    let project = scratch.join(format!("compile_fail-{}", process::id()));
+    let target = scratch.join("compile_fail-target");
     let bins = project.join("src").join("bin");
-    let _ = fs::remove_dir_all(project.join("src"));
+    let macros = project.join("rewrite-macros");
+    let _ = fs::remove_dir_all(&project);
     fs::create_dir_all(&bins).unwrap();
+    fs::create_dir_all(macros.join("src")).unwrap();
+
     // Its own workspace, so it is not a member of the engine's; the engine's lock file, so it
     // builds the same dependency versions without touching the network.
     let manifest = format!(
         "[package]\nname = \"reflect-compile-fail\"\nversion = \"0.0.0\"\nedition = \"2024\"\n\n\
-         [workspace]\n\n[dependencies]\nlactose-reflect = {{ path = '{}' }}\n",
+         [workspace]\n\n[dependencies]\nlactose-reflect = {{ path = '{}' }}\n\
+         rewrite-macros = {{ path = \"rewrite-macros\" }}\n",
         crate_dir.display()
     );
     fs::write(project.join("Cargo.toml"), manifest).unwrap();
-    fs::copy(crate_dir.join("../../Cargo.lock"), project.join("Cargo.lock")).unwrap();
+    fs::write(
+        macros.join("Cargo.toml"),
+        "[package]\nname = \"rewrite-macros\"\nversion = \"0.0.0\"\nedition = \"2024\"\n\n\
+         [lib]\nproc-macro = true\n",
+    )
+    .unwrap();
+    let support = crate_dir.join("tests").join("support");
+    fs::copy(support.join("rewrite_macros.rs"), macros.join("src").join("lib.rs")).unwrap();
+    fs::copy(repository.join("Cargo.lock"), project.join("Cargo.lock")).unwrap();
     let ui = crate_dir.join("tests").join("ui");
     for entry in fs::read_dir(&ui).unwrap() {
         let path = entry.unwrap().path();
         fs::copy(&path, bins.join(path.file_name().unwrap())).unwrap();
     }
 
-    // Run from inside the repository so `.cargo/config.toml` applies, as it does to every
-    // other build.
+    // Cargo reads `.cargo/config.toml` from the working directory upwards, which reaches the
+    // repository's only when the target directory is inside it. The file is passed
+    // explicitly so the scratch build is configured like every other build either way.
     let check = |case: &str| {
         let output = Command::new(env::var_os("CARGO").unwrap_or_else(|| "cargo".into()))
-            .args(["check", "--offline", "--color", "never", "--bin", case, "--target-dir"])
-            .arg(project.join("target"))
+            .args(["check", "--offline", "--color", "never", "--bin", case, "--config"])
+            .arg(repository.join(".cargo").join("config.toml"))
+            .arg("--target-dir")
+            .arg(&target)
             .current_dir(&project)
             .output()
             .unwrap();
@@ -89,10 +125,14 @@ fn rejected_declarations() {
         }
     }
 
-    // The author reads this crate's explanation of padding before `bytemuck`'s.
+    // The author reads this crate's explanation of padding before `bytemuck`'s. If
+    // `bytemuck` stops reporting padding, or rewords it, this fails and is revisited.
     let (_, stderr) = check("implicit_padding");
     let ours = stderr.find("has padding before field").unwrap();
-    if let Some(theirs) = stderr.find("derive(NoUninit)") {
-        assert!(ours < theirs, "the padding explanation is buried:\n{stderr}");
-    }
+    let theirs = stderr
+        .find("derive(NoUninit) was applied to a type with padding")
+        .expect("bytemuck's padding message is absent or reworded");
+    assert!(ours < theirs, "the padding explanation is buried:\n{stderr}");
+
+    let _ = fs::remove_dir_all(&project);
 }

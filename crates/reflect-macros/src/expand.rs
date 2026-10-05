@@ -6,11 +6,13 @@
 //! component key is likewise hashed there, by a `const fn` call, never here.
 //!
 //! The expansion of a struct contains one `unsafe impl`, of `CheckedBitPattern`; see
-//! [`checked_bit_pattern`] for why it is written here and why it is sound. Everything else
-//! is safe code.
+//! [`checked_bit_pattern`] and `SAFETY.md` for why it is written here and why it is sound.
+//! Everything else is safe code. Checks on attributes exist to give the author a clear
+//! error; soundness never rests on them.
 
 use proc_macro2::{Span, TokenStream};
 use quote::{ToTokens, quote, quote_spanned};
+use syn::ext::IdentExt;
 use syn::parse::{ParseStream, Parser};
 use syn::punctuated::Punctuated;
 use syn::spanned::Spanned;
@@ -94,8 +96,14 @@ fn failed(item: TokenStream, error: &Error) -> TokenStream {
     out
 }
 
+/// Whether `attribute` is `#[name]`, in plain or raw (`r#name`) spelling. The compiler
+/// treats both alike, so every check here must.
+fn is_named(attribute: &Attribute, name: &str) -> bool {
+    attribute.path().get_ident().is_some_and(|ident| ident.unraw() == name)
+}
+
 fn is_field(attribute: &Attribute) -> bool {
-    attribute.path().is_ident("field")
+    is_named(attribute, "field")
 }
 
 fn strip_field_attributes(fields: &mut Fields) {
@@ -104,7 +112,7 @@ fn strip_field_attributes(fields: &mut Fields) {
 
 /// The first `#[cfg]` or `#[cfg_attr]` among `attributes`.
 fn conditional(attributes: &[Attribute]) -> Option<&Attribute> {
-    attributes.iter().find(|a| a.path().is_ident("cfg") || a.path().is_ident("cfg_attr"))
+    attributes.iter().find(|a| is_named(a, "cfg") || is_named(a, "cfg_attr"))
 }
 
 struct Args {
@@ -262,7 +270,7 @@ fn take_fields(fields: &mut Fields, retired: &[(u16, Span)]) -> Result<Vec<Field
         // would underline only their first token.
         let span = field.ident.as_ref().map_or_else(|| field.ty.span(), Ident::span);
         let (member, name) = match &field.ident {
-            Some(ident) => (Member::Named(ident.clone()), ident.to_string()),
+            Some(ident) => (Member::Named(ident.clone()), ident.unraw().to_string()),
             None => (Member::Unnamed(Index::from(index)), index.to_string()),
         };
 
@@ -356,7 +364,7 @@ fn check_item(input: &DeriveInput, target: Target, args: &Args) -> Result<TokenS
             ),
         ));
     }
-    if let Some(attribute) = input.attrs.iter().find(|a| a.path().is_ident("cfg_attr")) {
+    if let Some(attribute) = input.attrs.iter().find(|a| is_named(a, "cfg_attr")) {
         return Err(Error::new(
             attribute.path().span(),
             format!(
@@ -369,9 +377,10 @@ fn check_item(input: &DeriveInput, target: Target, args: &Args) -> Result<TokenS
     let mut has_clone = false;
     let mut has_copy = false;
     for attribute in &input.attrs {
-        if attribute.path().is_ident("derive") {
+        if is_named(attribute, "derive") {
             attribute.parse_nested_meta(|meta| {
-                let last = meta.path.segments.last().map(|segment| segment.ident.to_string());
+                let last =
+                    meta.path.segments.last().map(|segment| segment.ident.unraw().to_string());
                 has_clone |= last.as_deref() == Some("Clone");
                 has_copy |= last.as_deref() == Some("Copy");
                 Ok(())
@@ -384,39 +393,65 @@ fn check_item(input: &DeriveInput, target: Target, args: &Args) -> Result<TokenS
     Ok(quote!(#clone #copy #krate::bytemuck::NoUninit))
 }
 
-/// The `CheckedBitPattern` impl of the struct `name`.
+/// The `CheckedBitPattern` impl of the struct `name`, and the checks that make it sound.
 ///
 /// `bytemuck`'s own derive cannot be used: for a struct it derives `AnyBitPattern` on a
 /// generated type without passing on `#[bytemuck(crate = ...)]`, so on the pinned version it
-/// compiles only in a crate that depends on `bytemuck` under that name. This is the same
-/// impl with the path fixed, the generated type kept out of the invoking crate's namespace,
-/// and no `Debug` requirement on the fields.
+/// compiles only in a crate that depends on `bytemuck` under that name.
 ///
-/// Why the `unsafe impl` is sound. `CheckedBitPattern` requires that `Bits` has the layout
-/// of `Self` and that `is_valid_bit_pattern` accepts only bit patterns valid for `Self`.
-///
-/// - The struct is `#[repr(C)]` with exactly the fields in `fields`, in order: the macro
-///   adds the `repr`, rejects any other, and rejects `#[cfg]` and `#[cfg_attr]`, so no later
-///   expansion can change the field list or the representation.
-/// - `__Bits` is `#[repr(C)]` with one field per field, in the same order, of type
-///   `<F as CheckedBitPattern>::Bits`, which has the size and alignment of `F` by `F`'s own
-///   contract. Two `repr(C)` structs whose fields agree pairwise in size and alignment have
-///   the same layout.
-/// - `__Bits` is `AnyBitPattern` by `bytemuck`'s derive, which checks every field.
-/// - A struct is valid exactly when each field is, and the check below tests every field.
-///   There is no padding to consider: the `NoUninit` derive on the struct rejects it.
+/// What this macro parsed is not evidence about the type: an attribute below it can rewrite
+/// the struct afterwards, and attributes can be spelled in ways a parser misses. The
+/// expansion therefore proves the impl against the type the compiler ends up with.
+/// `crates/reflect-macros/SAFETY.md` gives the argument; in short, the constant assertions
+/// and `__same_fields` below fail to compile unless the final type is a struct with exactly
+/// the recorded fields, of exactly the recorded types, at the offsets of `__Bits`, with the
+/// size and alignment of `__Bits`.
 fn checked_bit_pattern(name: &Ident, fields: &[FieldSpec], args: &Args) -> TokenStream {
     let Args { krate, bytemuck, .. } = args;
     let bits: Vec<Ident> = (0..fields.len())
         .map(|index| Ident::new(&format!("f{index}"), Span::call_site()))
         .collect();
     let types: Vec<&Type> = fields.iter().map(|field| &field.ty).collect();
+    let members: Vec<&Member> = fields.iter().map(|field| &field.member).collect();
+    let changed = format!(
+        "`{name}` is not the struct its attribute read: another attribute changed its \
+         representation or its fields"
+    );
     quote! {
         #[derive(::core::clone::Clone, ::core::marker::Copy, #krate::bytemuck::AnyBitPattern)]
         #[bytemuck(crate = #bytemuck)]
         #[repr(C)]
         pub struct __Bits {
             #(#bits: <#types as #krate::bytemuck::CheckedBitPattern>::Bits,)*
+        }
+
+        const _: () = ::core::assert!(
+            ::core::mem::size_of::<#name>() == ::core::mem::size_of::<__Bits>()
+                && ::core::mem::align_of::<#name>() == ::core::mem::align_of::<__Bits>(),
+            #changed
+        );
+        #(
+            const _: () = ::core::assert!(
+                ::core::mem::offset_of!(#name, #members) == ::core::mem::offset_of!(__Bits, #bits),
+                #changed
+            );
+        )*
+
+        fn __type_of<T>(_: &T) -> ::core::marker::PhantomData<T> {
+            ::core::marker::PhantomData
+        }
+
+        // Never called. It compiles only if the struct has exactly these fields (the pattern
+        // has no `..`) and each has exactly the recorded type. The field's type is inferred
+        // into `PhantomData<T>` first, with no expected type in sight, and only then compared:
+        // passing the binding where the recorded type is expected would let it coerce.
+        #[allow(dead_code, unused_variables)]
+        fn __same_fields(value: &#name) {
+            let #name { #(#members: #bits,)* } = value;
+            #(
+                let witness = __type_of(#bits);
+                let _: ::core::marker::PhantomData<#types> = witness;
+            )*
         }
 
         unsafe impl #krate::bytemuck::CheckedBitPattern for #name {
@@ -434,9 +469,9 @@ fn checked_bit_pattern(name: &Ident, fields: &[FieldSpec], args: &Args) -> Token
 }
 
 fn reject_repr(input: &DeriveInput) -> Result<()> {
-    match input.attrs.iter().find(|a| a.path().is_ident("repr")) {
+    match input.attrs.iter().find(|a| is_named(a, "repr")) {
         Some(repr) => Err(Error::new(
-            repr.span(),
+            repr.path().span(),
             "remove this `#[repr]`: the attribute lays the struct out as `#[repr(C)]`",
         )),
         None => Ok(()),
@@ -565,7 +600,6 @@ fn try_reflected(role: Role, args: TokenStream, item: TokenStream) -> Result<Tok
         Role::Resource => quote!(Resource),
     };
     let Args { krate, bytemuck, version, replicated, extracted, .. } = &args;
-    let rust_name = name.to_string();
 
     // The layout checks come first so that their message precedes the one `bytemuck`'s
     // derive gives for the same padding.
@@ -581,14 +615,15 @@ fn try_reflected(role: Role, args: TokenStream, item: TokenStream) -> Result<Tok
             #checked
 
             const __FIELDS: &[#krate::FieldInfo] = &[#field_infos];
-            const __SCHEMA: #krate::Schema<#name> = #krate::Schema::new(#krate::TypeInfo::new(
+            const __SCHEMA: #krate::Schema<#name> = #krate::Schema::new(
                 #key,
                 #krate::TypeRole::#role,
                 #krate::Persistence::#persistence,
                 #version,
                 #krate::Tracking { replicated: #replicated, extracted: #extracted },
-                #krate::StructInfo::new::<#name>(#rust_name, __FIELDS, &[#retired]),
-            ));
+                __FIELDS,
+                &[#retired],
+            );
 
             impl #krate::Reflect for #name {
                 const KEY: #krate::__private::ComponentKey =
@@ -619,7 +654,7 @@ fn try_value(args: TokenStream, item: TokenStream) -> Result<TokenStream> {
     let krate = &args.krate;
     let bytemuck = &args.bytemuck;
     let name = input.ident.clone();
-    let rust_name = name.to_string();
+    let rust_name = name.unraw().to_string();
     let mut before = TokenStream::new();
 
     let implementation = match &mut input.data {
@@ -666,15 +701,11 @@ fn try_value(args: TokenStream, item: TokenStream) -> Result<TokenStream> {
             if let Some((_, span)) = args.retired.first() {
                 return Err(Error::new(*span, "`retired` lists field IDs; an enum has none"));
             }
-            let variants = enum_variants(&input.attrs, &name, data, krate)?;
+            let info = enum_variants(&input.attrs, &name, data, krate, &rust_name)?;
             // A fieldless enum's derive names no second crate path, so it is used as it is.
             derives.extend(quote!(, #krate::bytemuck::CheckedBitPattern));
             quote! {
-                const __INFO: #krate::EnumInfo = #krate::EnumInfo {
-                    name: #rust_name,
-                    size: ::core::mem::size_of::<#name>(),
-                    variants: &[#variants],
-                };
+                #info
 
                 impl #krate::Field for #name {
                     const KIND: #krate::FieldKind = #krate::FieldKind::Enum(&__INFO);
@@ -718,32 +749,60 @@ fn try_value(args: TokenStream, item: TokenStream) -> Result<TokenStream> {
     })
 }
 
-/// Checks a `#[value]` enum and returns one `VariantInfo` expression per variant.
+/// Checks a `#[value]` enum and returns its `__INFO` constant with the checks that hold
+/// `bytemuck`'s derives to the final type.
 fn enum_variants(
     attrs: &[Attribute],
     name: &Ident,
     data: &DataEnum,
     krate: &TokenStream,
+    rust_name: &str,
 ) -> Result<TokenStream> {
-    let mut width = None;
-    for attribute in attrs.iter().filter(|a| a.path().is_ident("repr")) {
+    let mut width: Option<Ident> = None;
+    for attribute in attrs.iter().filter(|a| is_named(a, "repr")) {
         attribute.parse_nested_meta(|meta| {
-            width = meta.path.get_ident().map(Ident::to_string);
-            Ok(())
+            let ident = meta.path.get_ident().map(IdentExt::unraw);
+            match ident {
+                Some(ident)
+                    if (ident == "u8" || ident == "u16" || ident == "u32") && width.is_none() =>
+                {
+                    width = Some(ident);
+                    Ok(())
+                }
+                _ => Err(meta.error(
+                    "the only representation of a `#[value]` enum is its width: `u8`, `u16` \
+                     or `u32`, once",
+                )),
+            }
         })?;
     }
-    if !matches!(width.as_deref(), Some("u8" | "u16" | "u32")) {
+    let Some(width) = width else {
         return Err(Error::new(
             name.span(),
             "a `#[value]` enum states its width: add `#[repr(u8)]`, `#[repr(u16)]` or \
              `#[repr(u32)]` below `#[value]`",
         ));
-    }
+    };
     if data.variants.is_empty() {
         return Err(Error::new(name.span(), "a `#[value]` enum has at least one variant"));
     }
 
+    let changed = format!(
+        "`{name}` is not the enum its attribute read: another attribute changed its \
+         representation or its variants"
+    );
     let mut variants = TokenStream::new();
+    let mut arms = TokenStream::new();
+    // `bytemuck`'s derives decide validity and padding from the tokens they were given. These
+    // checks hold them to the final type: it has the width's size and alignment, exactly the
+    // recorded variants, and the recorded discriminants. See `SAFETY.md`.
+    let mut checks = quote! {
+        const _: () = ::core::assert!(
+            ::core::mem::size_of::<#name>() == ::core::mem::size_of::<#width>()
+                && ::core::mem::align_of::<#name>() == ::core::mem::align_of::<#width>(),
+            #changed
+        );
+    };
     for variant in &data.variants {
         if let Some(attribute) = conditional(&variant.attrs) {
             return Err(Error::new(
@@ -762,7 +821,7 @@ fn enum_variants(
                  the data in fields beside the enum",
             ));
         }
-        if variant.discriminant.is_none() {
+        let Some((_, discriminant)) = &variant.discriminant else {
             return Err(Error::new(
                 variant.span(),
                 format!(
@@ -771,14 +830,34 @@ fn enum_variants(
                     variant.ident, variant.ident
                 ),
             ));
-        }
+        };
         let ident = &variant.ident;
-        let variant_name = ident.to_string();
+        let variant_name = ident.unraw().to_string();
         variants.extend(quote! {
             #krate::VariantInfo { name: #variant_name, value: #name::#ident as u32 },
         });
+        arms.extend(quote!(#name::#ident => {}));
+        checks.extend(quote! {
+            const _: () = ::core::assert!(#name::#ident as #width == #discriminant, #changed);
+        });
     }
-    Ok(variants)
+    Ok(quote! {
+        #checks
+
+        // Never called. It compiles only if the enum has exactly these variants, all unit.
+        #[allow(dead_code)]
+        fn __same_variants(value: &#name) {
+            match *value {
+                #arms
+            }
+        }
+
+        const __INFO: #krate::EnumInfo = #krate::EnumInfo {
+            name: #rust_name,
+            size: ::core::mem::size_of::<#name>(),
+            variants: &[#variants],
+        };
+    })
 }
 
 #[cfg(test)]
@@ -1001,6 +1080,55 @@ mod tests {
             ),
         );
         assert!(error_of(&out).contains("`#[cfg_attr]` cannot be applied to a component"), "{out}");
+    }
+
+    #[test]
+    fn raw_spellings_of_attributes_are_recognised() {
+        let out = component(
+            quote!(key = "t::a", persistent),
+            quote!(
+                #[r#repr(align(16))]
+                struct A;
+            ),
+        );
+        assert!(error_of(&out).contains("remove this `#[repr]`"), "{out}");
+        let out = component(
+            quote!(key = "t::a", persistent),
+            quote!(
+                struct A {
+                    #[r#cfg(test)]
+                    #[r#field(id = 1)]
+                    x: u32,
+                }
+            ),
+        );
+        assert!(error_of(&out).contains("field `x` cannot be conditional"), "{out}");
+        let out = component(
+            quote!(key = "t::a", persistent),
+            quote!(
+                #[derive(r#Clone, Copy)]
+                struct A {
+                    #[r#field(id = 1)]
+                    r#type: u32,
+                }
+            ),
+        );
+        assert!(!out.contains("compile_error"), "{out}");
+        assert!(out.contains("; # [derive (:: lactose_reflect :: bytemuck :: NoUninit)]"), "{out}");
+        assert!(!out.contains("field (id"), "{out}");
+        assert!(out.contains("\"type\""), "{out}");
+        let out = value(
+            TokenStream::new(),
+            quote!(
+                #[repr(u8)]
+                #[r#repr(align(4))]
+                enum E {
+                    A = 0,
+                }
+            ),
+        )
+        .to_string();
+        assert!(error_of(&out).contains("the only representation of a `#[value]` enum"), "{out}");
     }
 
     #[test]

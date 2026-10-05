@@ -21,13 +21,17 @@ pub enum FieldKind {
     Signed,
     /// A raw `f32` or `f64`. Presentation data only; the world hasher refuses it.
     Float,
-    /// The simulation scalar itself, a [`ScalarField`]. Built by [`FieldKind::scalar`] only.
-    /// Vectors and other types made of scalars are [`FieldKind::Struct`].
+    /// A single scalar whose type implements [`ScalarField`]. Built by [`FieldKind::scalar`]
+    /// only, so the kind means "some crate implemented `ScalarField` for this type" and no
+    /// more; see that trait. Vectors and other types made of scalars are
+    /// [`FieldKind::Struct`].
     #[non_exhaustive]
     Scalar,
     /// An [`EntityRef`], remapped on load.
     EntityRef,
-    /// An [`AssetReference`], remapped on load. Built by [`FieldKind::asset_ref`] only.
+    /// A reference whose type implements [`AssetReference`], remapped on load. Built by
+    /// [`FieldKind::asset_ref`] only, so the kind means "some crate implemented
+    /// `AssetReference` for this type" and no more.
     #[non_exhaustive]
     AssetRef,
     /// A fieldless enum declared with `#[value]`.
@@ -48,13 +52,13 @@ pub enum FieldKind {
 }
 
 impl FieldKind {
-    /// The kind of the simulation scalar `S`.
+    /// The kind of a field of type `S`, a scalar.
     #[must_use]
     pub const fn scalar<S: ScalarField>() -> Self {
         Self::Scalar
     }
 
-    /// The kind of the asset reference `A`.
+    /// The kind of a field of type `A`, an asset reference.
     #[must_use]
     pub const fn asset_ref<A: AssetReference>() -> Self {
         Self::AssetRef
@@ -125,9 +129,16 @@ pub trait Field: NoUninit + CheckedBitPattern + Send + Sync + 'static {
     fn visit_references<V: ReferenceVisitor>(&mut self, id: FieldId, visitor: &mut V);
 }
 
-/// The simulation scalar: the one float type allowed inside the determinism boundary.
-/// `lactose-math` implements it; its `Field` impl reports [`FieldKind::scalar`] and calls
+/// A scalar that states its own canonical bits. `lactose-math` implements it for the
+/// simulation scalar, whose `Field` impl reports [`FieldKind::scalar`] and calls
 /// [`FieldVisitor::scalar`].
+///
+/// This is a safe trait that any crate can implement, so neither it nor
+/// [`FieldKind::Scalar`] proves that a value is the engine's scalar or that its bits are
+/// canonical. What it provides is a reviewable fact: each impl is one place where a crate
+/// claims the property below. The world hasher in `lactose-sim` therefore decides which
+/// scalar types it accepts by naming them (a bound on the `lactose-math` type, or an
+/// allowlist of impls checked in review), never by trusting the kind or this trait.
 pub trait ScalarField: Field {
     /// The value's canonical bit pattern, zero-extended: equal values give equal bits on
     /// every platform, with one pattern for all NaNs.
@@ -136,6 +147,12 @@ pub trait ScalarField: Field {
 
 /// A typed reference to an asset. `lactose-asset-api` implements it; its `Field` impl
 /// reports [`FieldKind::asset_ref`] and calls the `asset_ref` method of both visitors.
+///
+/// Like [`ScalarField`] this is a safe trait any crate can implement: the kind says that a
+/// type claims to be an asset reference, not that it is the engine's.
+///
+/// Like [`ScalarField`] this is a safe trait any crate can implement: the kind says that a
+/// type claims to be an asset reference, not that it is the engine's.
 pub trait AssetReference: Field {
     /// The raw 64-bit asset identity, or zero for the empty reference.
     fn asset_id(&self) -> u64;

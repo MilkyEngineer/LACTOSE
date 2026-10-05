@@ -6,7 +6,7 @@ The attribute macros of `lactose-reflect`: `#[component]`, `#[resource]` and `#[
 |---|---|
 | Tier | foundation |
 | Determinism boundary | outside |
-| Unsafe | none in this crate, `#![forbid(unsafe_code)]`; the expansion contains one `unsafe impl`, see below |
+| Unsafe | none in this crate, `#![forbid(unsafe_code)]`; its expansion contains one `unsafe impl`, whose proof is in `SAFETY.md` |
 
 ## Rules a caller should know
 
@@ -27,10 +27,10 @@ The attribute macros of `lactose-reflect`: `#[component]`, `#[resource]` and `#[
 For a struct the expansion implements `bytemuck::CheckedBitPattern` itself. `bytemuck`'s
 derive cannot be used: on the pinned version it derives `AnyBitPattern` on a generated type
 without passing on the crate path, so it compiles only where `bytemuck` is a direct
-dependency. The impl emitted here is the derive's, with the path fixed and the generated
-type kept out of the invoking crate's namespace. The argument for its soundness is the doc
-comment of `checked_bit_pattern` in `src/expand.rs`; it depends on the macro adding
-`#[repr(C)]` and rejecting other representations and conditional fields.
+dependency. `SAFETY.md` gives the argument for the impl. It does not rest on anything the
+macro parsed: the expansion carries constant assertions and a never-called function that
+fail to compile unless the final type has the recorded fields, types, offsets, size and
+alignment. `#[value]` enums keep `bytemuck`'s derives and get the equivalent checks.
 
 The `unsafe_code` lint does not apply to code a proc macro generates, so the expansion
 compiles in a crate with `#![forbid(unsafe_code)]`, as the `bytemuck` derives do.

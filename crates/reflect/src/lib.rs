@@ -97,8 +97,8 @@ use lactose_core::ComponentKey;
 /// Implemented by `#[component(...)]` and `#[resource(...)]`, which is the only supported way
 /// to implement it. The trait is safe, and a wrong hand-written impl cannot make
 /// [`TypeInfo::validate`] or [`decode`] accept bytes that are invalid for the type, because
-/// [`Schema<Self>`] takes size and validity from the type. It can misdescribe the fields;
-/// see [`TypeInfo::write_field`] for what that affects.
+/// [`Schema<Self>`] takes size and validity from the type. It can misdescribe the fields.
+/// [`TypeInfo::validate`] states exactly what may be relied on.
 pub trait Reflect: NoUninit + CheckedBitPattern + Send + Sync + 'static {
     /// The build, wire and disk key: xxh64 of the declared name.
     const KEY: ComponentKey;

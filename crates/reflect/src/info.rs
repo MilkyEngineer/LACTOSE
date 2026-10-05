@@ -152,8 +152,11 @@ pub struct StructInfo {
 }
 
 impl StructInfo {
-    /// The layout of `T`, whose Rust name is `name`, whose fields in declaration order are
-    /// `fields`, and whose deleted fields had the IDs in `retired`.
+    /// The layout of the nested struct `T`, whose Rust name is `name`, whose fields in
+    /// declaration order are `fields`, and whose deleted fields had the IDs in `retired`.
+    ///
+    /// A `StructInfo` describes a [`FieldKind::Struct`] for the schema dump and for access by
+    /// field ID. Validation of a registered type never consults one.
     #[must_use]
     pub const fn new<T: NoUninit + CheckedBitPattern>(
         name: &'static str,
@@ -170,7 +173,7 @@ impl StructInfo {
         }
     }
 
-    /// The struct's Rust name.
+    /// The struct's Rust name, or the declared stable name for a component or resource.
     #[must_use]
     pub const fn name(&self) -> &'static str {
         self.name
@@ -340,8 +343,8 @@ fn zero_padding_of_kind(kind: &FieldKind, bytes: &mut [u8]) {
 
 /// The description of a component or resource type.
 ///
-/// Code reaches one through [`Reflect::SCHEMA`] or the [`Registry`](crate::Registry), and in
-/// both cases it is held by a [`Schema<T>`], which is what its validation rests on.
+/// One exists only inside a [`Schema<T>`]. See [`TypeInfo::validate`] for which descriptions
+/// may be relied on, and for what.
 #[derive(Clone, Copy, Debug)]
 pub struct TypeInfo {
     name: &'static str,
@@ -354,9 +357,7 @@ pub struct TypeInfo {
 }
 
 impl TypeInfo {
-    /// Describes the type declared under the stable `name`. The key is the hash of `name`.
-    #[must_use]
-    pub const fn new(
+    const fn new(
         name: &'static str,
         role: TypeRole,
         persistence: Persistence,
@@ -464,11 +465,20 @@ impl TypeInfo {
     /// Checks that `value` is the bytes of one valid value of the described type. Non-zero
     /// padding is invalid.
     ///
-    /// `Ok` proves that `value` has the size of the type `T` whose [`Schema<T>`] holds this
-    /// description and that `T`'s own `CheckedBitPattern` accepts it. The proof rests on
-    /// that impl (normally the `bytemuck` derive) and on [`Schema::new`], which takes the
-    /// size and the check from `T`. It does not depend on the field list, on any [`Field`]
-    /// impl's kind or name, or on anything else an impl states.
+    /// # What code with `unsafe` may rely on
+    ///
+    /// Take a description from `T::SCHEMA`, or from [`Registry::get`](crate::Registry::get)
+    /// or [`Registry::get_by_type`](crate::Registry::get_by_type) for a type registered as
+    /// `T`. Then `layout().size()` and `layout().align()` are `T`'s, and `validate(b).is_ok()`
+    /// means that `b.len() == size_of::<T>()` and that `T`'s own `CheckedBitPattern` accepts
+    /// `b`. This holds because [`Schema::new`] takes all three from `T`, whatever else it is
+    /// given, and it rests on `T`'s `CheckedBitPattern` impl alone.
+    ///
+    /// Nothing else is a proof: not the field list, [`TypeInfo::write_field`] or
+    /// [`TypeInfo::zero_padding`], not the visitors, not any [`Field::KIND`] or
+    /// [`Field::NAME`], and not a description reached any other way. Safe code can build a
+    /// `Schema<U>` under any name, so a description is evidence about `T` only when it came
+    /// from `T` as above; the key inside it identifies nothing by itself.
     pub fn validate(&self, value: &[u8]) -> Result<()> {
         self.layout.check_len(value)?;
         if (self.layout.valid)(value) {
@@ -585,9 +595,9 @@ fn dump_type(kind: &FieldKind, type_name: &str, out: &mut String) {
 
 /// The [`TypeInfo`] of `T`, tied to `T` by construction.
 ///
-/// [`Reflect::SCHEMA`] has this type, and [`Schema::new`] is the only way to make one, so
-/// the size, alignment and whole-value validity check inside the description are always
-/// `T`'s own, whatever the rest of the description says. It dereferences to the
+/// [`Reflect::SCHEMA`] has this type, and [`Schema::new`] is the only way to make one or
+/// the [`TypeInfo`] inside it, so the size, alignment and whole-value validity check of the
+/// description are always `T`'s own, whatever the rest of it says. It dereferences to the
 /// [`TypeInfo`].
 #[derive(Debug)]
 pub struct Schema<T> {
@@ -596,14 +606,24 @@ pub struct Schema<T> {
 }
 
 impl<T: NoUninit + CheckedBitPattern> Schema<T> {
-    /// The schema of `T` from its description. The size, alignment and validity check of
-    /// `info`'s layout are replaced by those of `T`.
+    /// The schema of `T`, declared under the stable `name`, whose fields in declaration
+    /// order are `fields` and whose deleted fields had the IDs in `retired`. The key is the
+    /// hash of `name`; size, alignment and the validity check are `T`'s.
     #[must_use]
-    pub const fn new(mut info: TypeInfo) -> Self {
-        info.layout.size = size_of::<T>();
-        info.layout.align = align_of::<T>();
-        info.layout.valid = is_valid::<T>;
-        Self { info, owner: PhantomData }
+    pub const fn new(
+        name: &'static str,
+        role: TypeRole,
+        persistence: Persistence,
+        version: u32,
+        tracking: Tracking,
+        fields: &'static [FieldInfo],
+        retired: &'static [FieldId],
+    ) -> Self {
+        let layout = StructInfo::new::<T>(name, fields, retired);
+        Self {
+            info: TypeInfo::new(name, role, persistence, version, tracking, layout),
+            owner: PhantomData,
+        }
     }
 }
 
@@ -625,6 +645,12 @@ impl<T> Deref for Schema<T> {
 
 /// Reads one value of `T` from `bytes`, which need not be aligned. This is the validation
 /// that save load and network receive run; an invalid bit pattern is an error, never a panic.
+///
+/// It is `bytemuck`'s checked read and involves no description, so its result rests on
+/// `T`'s `CheckedBitPattern` impl alone.
+///
+/// It is `bytemuck`'s checked read and involves no description, so its result rests on
+/// `T`'s `CheckedBitPattern` impl alone.
 pub fn decode<T: Reflect>(bytes: &[u8]) -> Result<T> {
     bytemuck::checked::try_pod_read_unaligned(bytes).map_err(|_| {
         invalid(format!("{} bytes are not a valid `{}`", bytes.len(), T::SCHEMA.name()))
