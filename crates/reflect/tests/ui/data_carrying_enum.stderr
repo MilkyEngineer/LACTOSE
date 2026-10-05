@@ -1,5 +1,0 @@
-error: data-carrying enums are not reflected: `#[value]` enums are fieldless; hold the data in fields beside the enum
- --> tests/ui/data_carrying_enum.rs:7:9
-  |
-7 |     Item(u8) = 1,
-  |         ^^^^

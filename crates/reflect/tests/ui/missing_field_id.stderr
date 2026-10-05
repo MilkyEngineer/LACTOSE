@@ -1,5 +1,0 @@
-error: field `max` has no field ID: add `#[field(id = N)]` with an ID this type has never used, or `#[field(padding)]` if it is padding
- --> tests/ui/missing_field_id.rs:7:5
-  |
-7 |     max: u32,
-  |     ^^^

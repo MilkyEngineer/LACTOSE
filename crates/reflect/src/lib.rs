@@ -13,8 +13,11 @@ mod registry;
 mod visit;
 
 pub use bytemuck;
-pub use field::{EnumInfo, Field, FieldKind, Padding, PaddingField, VariantInfo, ZeroByte};
-pub use info::{FieldInfo, Persistence, StructInfo, Tracking, TypeInfo, TypeRole, decode};
+pub use field::{
+    AssetReference, EnumInfo, Field, FieldKind, Padding, PaddingField, ScalarField, VariantInfo,
+    ZeroByte,
+};
+pub use info::{FieldInfo, Persistence, Schema, StructInfo, Tracking, TypeInfo, TypeRole, decode};
 /// Declares a component: `#[component(key = "game::health", persistent)]` on a struct.
 ///
 /// Arguments, in any order:
@@ -23,15 +26,22 @@ pub use info::{FieldInfo, Persistence, StructInfo, Tracking, TypeInfo, TypeRole,
 /// - exactly one of `persistent`, `transient`, `derived`, required: the [`Persistence`].
 /// - `version = N`, default 1: the schema version, raised when a migration is written.
 /// - `replicated`, `extracted`: the [`Tracking`] flags.
+/// - `retired = [N, ...]`: the IDs of fields that have been deleted. Deleting a field moves
+///   its ID here, and no field may use a retired ID.
+/// - `crate = "path"`: where the reflect crate is found, for a crate that re-exports these
+///   attributes. The default is `::lactose_reflect`.
 ///
 /// Every field carries `#[field(id = N)]` with an ID the type has never used before, or
 /// `#[field(padding)]` if it is a [`Padding`]. Field types implement [`Field`].
 ///
-/// The attribute lays the struct out as `#[repr(C)]` in declaration order and derives
-/// `Clone`, `Copy`, `bytemuck::NoUninit` and `bytemuck::CheckedBitPattern`, so write it above
-/// any `#[derive]` and do not derive those again. A struct with implicit padding does not
-/// compile; the error names the field to move or the padding to insert. Generic types, enums
-/// and structs with their own `#[repr]` are rejected.
+/// The attribute lays the struct out as `#[repr(C)]` in declaration order and implements
+/// `Clone`, `Copy`, `bytemuck::NoUninit` and `bytemuck::CheckedBitPattern`. It must be the
+/// outermost attribute, above any `#[derive]`: a derive written above it runs first, on the
+/// struct as written, and fails on the `#[field]` attributes or collides with the impls
+/// added here. `Clone` and `Copy` may be listed in a derive below it. A struct with implicit
+/// padding does not compile; the error names the field to move or the padding to insert.
+/// Generic types, enums, structs with their own `#[repr]`, `#[cfg_attr]` on the type and
+/// `#[cfg]` on a field are rejected, since each would let two builds disagree about one key.
 ///
 /// ```
 /// use lactose_reflect::{Padding, Reflect, component};
@@ -47,7 +57,7 @@ pub use info::{FieldInfo, Persistence, StructInfo, Tracking, TypeInfo, TypeRole,
 /// }
 ///
 /// let fuse = Fuse { ticks_left: 180, lit: true, _pad: Padding::default() };
-/// assert_eq!(Fuse::INFO.layout().size(), size_of_val(&fuse));
+/// assert_eq!(Fuse::SCHEMA.layout().size(), size_of_val(&fuse));
 /// ```
 pub use lactose_reflect_macros::component;
 /// Declares a reflected resource: `#[resource(key = "game::gravity", persistent)]` on a
@@ -56,8 +66,8 @@ pub use lactose_reflect_macros::component;
 pub use lactose_reflect_macros::resource;
 /// Declares a type usable as a field: a nested struct or a fieldless enum.
 ///
-/// A struct follows the field rules of [`macro@component`]; its field IDs are its own. An
-/// enum states its width with `#[repr(u8)]`, `#[repr(u16)]` or `#[repr(u32)]` and gives
+/// A struct follows the field rules of [`macro@component`]; its field IDs are its own, and
+/// it accepts `retired = [N, ...]` and `crate = "path"`. An enum states its width with `#[repr(u8)]`, `#[repr(u16)]` or `#[repr(u32)]` and gives
 /// every variant an explicit discriminant, because both are part of the save format.
 /// Data-carrying enums are rejected.
 ///
@@ -85,13 +95,16 @@ use lactose_core::ComponentKey;
 /// A registered plain-data type: a [`Component`] or a [`Resource`].
 ///
 /// Implemented by `#[component(...)]` and `#[resource(...)]`, which is the only supported way
-/// to implement it. [`Registry::register`] re-checks everything stated here against the type.
+/// to implement it. The trait is safe, and a wrong hand-written impl cannot make
+/// [`TypeInfo::validate`] or [`decode`] accept bytes that are invalid for the type, because
+/// [`Schema<Self>`] takes size and validity from the type. It can misdescribe the fields;
+/// see [`TypeInfo::write_field`] for what that affects.
 pub trait Reflect: NoUninit + CheckedBitPattern + Send + Sync + 'static {
     /// The build, wire and disk key: xxh64 of the declared name.
     const KEY: ComponentKey;
 
     /// The description of this type the registry holds.
-    const INFO: &'static TypeInfo;
+    const SCHEMA: &'static Schema<Self>;
 
     /// Calls `visitor` for every non-padding field, in declaration order.
     fn visit<V: FieldVisitor>(&self, visitor: &mut V);

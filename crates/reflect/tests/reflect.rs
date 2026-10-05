@@ -10,9 +10,9 @@ use lactose_core::{
 };
 use lactose_reflect::bytemuck;
 use lactose_reflect::{
-    Component, Field, FieldInfo, FieldKind, FieldVisitor, Padding, Persistence, ReferenceVisitor,
-    Reflect, Registry, Resource, StructInfo, Tracking, TypeInfo, TypeRole, component, decode,
-    resource, value,
+    AssetReference, Component, Field, FieldInfo, FieldKind, FieldVisitor, Padding, Persistence,
+    ReferenceVisitor, Reflect, Registry, Resource, ScalarField, Schema, StructInfo, Tracking,
+    TypeInfo, TypeRole, component, decode, resource, value,
 };
 
 /// What a character is doing.
@@ -29,7 +29,7 @@ pub enum Stance {
 }
 
 /// One contact.
-#[value]
+#[value(retired = [4])]
 #[derive(PartialEq, Debug)]
 pub struct Hit {
     /// Who was hit.
@@ -55,7 +55,7 @@ pub struct Health(#[field(id = 1)] pub i32);
 pub struct PlayerTag;
 
 /// Everything a field may be.
-#[component(key = "test::kitchen_sink", persistent, replicated)]
+#[component(key = "test::kitchen_sink", persistent, replicated, retired = [8, 10])]
 #[derive(PartialEq, Debug)]
 pub struct KitchenSink {
     /// Sixty-four bits first: the author orders by alignment.
@@ -153,30 +153,30 @@ fn attributes_implement_the_role_traits() {
 fn key_is_the_hash_of_the_declared_name() {
     const KEY: ComponentKey = Health::KEY;
     assert_eq!(KEY, ComponentKey::from_name("test::health"));
-    assert_eq!(Health::INFO.key(), KEY);
-    assert_eq!(Health::INFO.name(), "test::health");
+    assert_eq!(Health::SCHEMA.key(), KEY);
+    assert_eq!(Health::SCHEMA.name(), "test::health");
 }
 
 #[test]
 fn metadata_states_policy_version_tracking_and_role() {
-    let health = Health::INFO;
+    let health = Health::SCHEMA;
     assert_eq!(health.role(), TypeRole::Component);
     assert_eq!(health.persistence(), Persistence::Persistent);
     assert_eq!(health.version(), 3);
     assert_eq!(health.tracking(), Tracking { replicated: true, extracted: true });
 
-    let hits = HitList::INFO;
+    let hits = HitList::SCHEMA;
     assert_eq!(hits.persistence(), Persistence::Transient);
     assert_eq!(hits.version(), 1);
     assert_eq!(hits.tracking(), Tracking::default());
 
-    assert_eq!(Gravity::INFO.role(), TypeRole::Resource);
-    assert_eq!(Gravity::INFO.tracking(), Tracking { replicated: true, extracted: false });
+    assert_eq!(Gravity::SCHEMA.role(), TypeRole::Resource);
+    assert_eq!(Gravity::SCHEMA.tracking(), Tracking { replicated: true, extracted: false });
 }
 
 #[test]
 fn layout_comes_from_the_compiler() {
-    let layout = KitchenSink::INFO.layout();
+    let layout = KitchenSink::SCHEMA.layout();
     assert_eq!(layout.name(), "KitchenSink");
     assert_eq!(layout.size(), size_of::<KitchenSink>());
     assert_eq!(layout.align(), align_of::<KitchenSink>());
@@ -202,18 +202,18 @@ fn layout_comes_from_the_compiler() {
     );
     assert!(layout.fields()[8].is_padding());
 
-    let tuple = Health::INFO.layout().fields();
+    let tuple = Health::SCHEMA.layout().fields();
     assert_eq!((tuple[0].name(), tuple[0].offset(), tuple[0].size()), ("0", 0, 4));
-    assert!(PlayerTag::INFO.layout().fields().is_empty());
-    assert_eq!(PlayerTag::INFO.layout().size(), 0);
+    assert!(PlayerTag::SCHEMA.layout().fields().is_empty());
+    assert_eq!(PlayerTag::SCHEMA.layout().size(), 0);
 }
 
 #[test]
 fn kinds_come_from_the_field_trait() {
-    let kind = |id| KitchenSink::INFO.field(FieldId(id)).unwrap().kind();
+    let kind = |id| KitchenSink::SCHEMA.field(FieldId(id)).unwrap().kind();
     assert!(matches!(kind(1), FieldKind::Unsigned));
     assert!(matches!(kind(2), FieldKind::EntityRef));
-    assert!(matches!(kind(7), FieldKind::Array { element: FieldKind::Unsigned, len: 2 }));
+    assert!(matches!(kind(7), FieldKind::Array { element: FieldKind::Unsigned, len: 2, .. }));
     assert!(matches!(kind(9), FieldKind::Float));
     assert!(matches!(kind(6), FieldKind::Bool));
     let FieldKind::Enum(stance) = kind(5) else { panic!("stance is an enum") };
@@ -221,8 +221,8 @@ fn kinds_come_from_the_field_trait() {
     let variants: Vec<_> = stance.variants.iter().map(|v| (v.name, v.value)).collect();
     assert_eq!(variants, [("Standing", 0), ("Climbing", 1), ("Swimming", 4)]);
 
-    let FieldKind::Array { element: FieldKind::Struct(hit), len: 3 } =
-        HitList::INFO.field(FieldId(1)).unwrap().kind()
+    let FieldKind::Array { element: FieldKind::Struct(hit), len: 3, .. } =
+        HitList::SCHEMA.field(FieldId(1)).unwrap().kind()
     else {
         panic!("hits is an array of structs")
     };
@@ -252,8 +252,12 @@ impl FieldVisitor for Recorder {
         self.0.push(format!("{} entity {:?}", id.0, value.get()));
     }
 
-    fn asset_ref<A: Field>(&mut self, id: FieldId, _: &A) {
-        self.0.push(format!("{} asset", id.0));
+    fn scalar<S: ScalarField>(&mut self, id: FieldId, value: &S) {
+        self.0.push(format!("{} scalar {:#x}", id.0, value.canonical_bits()));
+    }
+
+    fn asset_ref<A: AssetReference>(&mut self, id: FieldId, value: &A) {
+        self.0.push(format!("{} asset {}", id.0, value.asset_id()));
     }
 }
 
@@ -304,7 +308,12 @@ impl ReferenceVisitor for Shift {
         }
     }
 
-    fn asset_ref<A: Field>(&mut self, _: FieldId, _: &mut A) {}
+    fn asset_ref<A: AssetReference>(&mut self, id: FieldId, value: &mut A) {
+        self.1.push(id.0);
+        if value.asset_id() != 0 {
+            value.set_asset_id(value.asset_id() + self.0);
+        }
+    }
 }
 
 #[test]
@@ -367,7 +376,11 @@ fn dump_lists_every_type_and_field() {
     assert!(dump.contains(&health), "{dump}");
     assert!(dump.contains("resource test::gravity key="), "{dump}");
     assert!(dump.contains("  1 down: i64 size=8\n"), "{dump}");
-    assert!(dump.contains("  1 origin: u64 size=8\n"), "{dump}");
+    assert!(dump.contains("  1 origin: Option<NetId> size=8\n"), "{dump}");
+    assert!(dump.contains("  3 since: Tick size=4\n"), "{dump}");
+    assert!(dump.contains("  4 owner: PlayerId size=4\n"), "{dump}");
+    assert!(dump.contains("  9 fade: f32 size=4\n"), "{dump}");
+    assert!(dump.contains("  - _pad: padding size=2\n  retired 8 10\n"), "{dump}");
     assert!(dump.contains("  7 cooldowns: [u32; 2] size=8\n"), "{dump}");
     assert!(
         dump.contains(
@@ -378,8 +391,8 @@ fn dump_lists_every_type_and_field() {
     assert!(dump.contains("  - _pad: padding size=2\n"), "{dump}");
     assert!(
         dump.contains(
-            "  1 hits: [struct Hit { 1 target: entity_ref size=16, 2 amount: u16 size=2, \
-             3 blocked: bool size=1, - _pad: padding size=1 }; 3] size=60\n"
+            "  1 hits: [struct Hit { 1 target: EntityRef size=16, 2 amount: u16 size=2, \
+             3 blocked: bool size=1, - _pad: padding size=1, retired 4 }; 3] size=60\n"
         ),
         "{dump}"
     );
@@ -390,19 +403,28 @@ fn dump_lists_every_type_and_field() {
 #[component(key = "test::health", derived)]
 pub struct HealthImpostor;
 
+// Hand-written `Reflect` impls, which only tests have a reason to write: the registry and
+// the validation entry points must hold up against a description that is wrong.
+
 macro_rules! hand_written {
-    ($(#[$doc:meta])* $name:ident, $info:expr, key = $key:expr) => {
+    ($(#[$doc:meta])* $name:ident { $($field:ident: $ty:ty),+ }, $layout:expr) => {
         $(#[$doc])*
         #[derive(Clone, Copy, bytemuck::NoUninit, bytemuck::CheckedBitPattern)]
         #[repr(C)]
         pub struct $name {
-            a: u32,
-            b: u32,
+            $($field: $ty),+
         }
 
         impl Reflect for $name {
-            const KEY: ComponentKey = $key;
-            const INFO: &'static TypeInfo = &$info;
+            const KEY: ComponentKey = ComponentKey::from_name(stringify!($name));
+            const SCHEMA: &'static Schema<Self> = &Schema::new(TypeInfo::new(
+                stringify!($name),
+                TypeRole::Component,
+                Persistence::Persistent,
+                1,
+                Tracking { replicated: false, extracted: false },
+                $layout,
+            ));
 
             fn visit<V: FieldVisitor>(&self, _: &mut V) {}
 
@@ -411,54 +433,208 @@ macro_rules! hand_written {
     };
 }
 
-const fn info(name: &'static str, layout: StructInfo) -> TypeInfo {
-    TypeInfo::new(
-        name,
-        TypeRole::Component,
-        Persistence::Persistent,
-        1,
-        Tracking { replicated: false, extracted: false },
-        layout,
-    )
-}
-
 const fn two_fields(a: u16, b: u16, b_offset: usize) -> [FieldInfo; 2] {
     [FieldInfo::new::<u32>(FieldId(a), "a", 0), FieldInfo::new::<u32>(FieldId(b), "b", b_offset)]
 }
 
 hand_written!(
-    /// Its key constant is not the hash of its name.
-    WrongKey,
-    info("test::wrong_key", StructInfo::new::<WrongKey>("WrongKey", &two_fields(1, 2, 4))),
-    key = ComponentKey(7)
-);
-hand_written!(
     /// Uses one field ID twice.
-    DuplicateId,
-    info("test::duplicate_id", StructInfo::new::<DuplicateId>("DuplicateId", &two_fields(1, 1, 4))),
-    key = ComponentKey::from_name("test::duplicate_id")
+    DuplicateId { a: u32, b: u32 },
+    StructInfo::new::<DuplicateId>("DuplicateId", &two_fields(1, 1, 4), &[])
 );
 hand_written!(
     /// Describes the second field at the wrong offset.
-    WrongOffset,
-    info("test::wrong_offset", StructInfo::new::<WrongOffset>("WrongOffset", &two_fields(1, 2, 2))),
-    key = ComponentKey::from_name("test::wrong_offset")
+    WrongOffset { a: u32, b: u32 },
+    StructInfo::new::<WrongOffset>("WrongOffset", &two_fields(1, 2, 2), &[])
 );
 hand_written!(
     /// Describes only the first field.
-    MissingField,
-    info(
-        "test::missing_field",
-        StructInfo::new::<MissingField>("MissingField", &[FieldInfo::new::<u32>(FieldId(1), "a", 0)])
-    ),
-    key = ComponentKey::from_name("test::missing_field")
+    MissingField { a: u32, b: u32 },
+    StructInfo::new::<MissingField>(
+        "MissingField",
+        &[FieldInfo::new::<u32>(FieldId(1), "a", 0)],
+        &[]
+    )
 );
 hand_written!(
-    /// Describes another type's layout.
-    WrongSize,
-    info("test::wrong_size", StructInfo::new::<u32>("WrongSize", &[FieldInfo::new::<u32>(FieldId(1), "a", 0)])),
-    key = ComponentKey::from_name("test::wrong_size")
+    /// Gives a live field a retired ID.
+    RetiredInUse { a: u32, b: u32 },
+    StructInfo::new::<RetiredInUse>("RetiredInUse", &two_fields(1, 2, 4), &[FieldId(2)])
 );
+hand_written!(
+    /// Retires one ID twice.
+    RetiredTwice { a: u32, b: u32 },
+    StructInfo::new::<RetiredTwice>("RetiredTwice", &two_fields(1, 2, 4), &[FieldId(5), FieldId(5)])
+);
+hand_written!(
+    /// Carries the layout of another type, `u32`, and describes its two flags as one integer.
+    Mislabelled { on: bool, off: bool, count: u16 },
+    StructInfo::new::<u32>("Mislabelled", &[FieldInfo::new::<u32>(FieldId(1), "all", 0)], &[])
+);
+
+/// Its key constant is not the hash of its name.
+#[derive(Clone, Copy, bytemuck::NoUninit, bytemuck::CheckedBitPattern)]
+#[repr(C)]
+pub struct WrongKey(u32);
+
+impl Reflect for WrongKey {
+    const KEY: ComponentKey = ComponentKey(7);
+    const SCHEMA: &'static Schema<Self> = &Schema::new(TypeInfo::new(
+        "test::wrong_key",
+        TypeRole::Component,
+        Persistence::Persistent,
+        1,
+        Tracking { replicated: false, extracted: false },
+        StructInfo::new::<WrongKey>("WrongKey", &[FieldInfo::new::<u32>(FieldId(1), "0", 0)], &[]),
+    ));
+
+    fn visit<V: FieldVisitor>(&self, _: &mut V) {}
+
+    fn visit_references<V: ReferenceVisitor>(&mut self, _: &mut V) {}
+}
+
+// Field types as another crate would write them: plain data it owns, a safe `Field` impl, and
+// the trait for its kind.
+
+/// A stand-in for the simulation scalar of `lactose-math`.
+#[derive(Clone, Copy, PartialEq, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+#[repr(transparent)]
+pub struct Meters(pub f64);
+
+impl ScalarField for Meters {
+    fn canonical_bits(&self) -> u64 {
+        if self.0.is_nan() { 0x7ff8_0000_0000_0000 } else { self.0.to_bits() }
+    }
+}
+
+impl Field for Meters {
+    const KIND: FieldKind = FieldKind::scalar::<Self>();
+    const NAME: &'static str = "Meters";
+
+    fn visit<V: FieldVisitor>(&self, id: FieldId, visitor: &mut V) {
+        visitor.scalar(id, self);
+    }
+
+    fn visit_references<V: ReferenceVisitor>(&mut self, _: FieldId, _: &mut V) {}
+}
+
+/// A stand-in for the asset reference of `lactose-asset-api`.
+#[derive(Clone, Copy, PartialEq, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+#[repr(transparent)]
+pub struct MeshRef(pub u64);
+
+impl AssetReference for MeshRef {
+    fn asset_id(&self) -> u64 {
+        self.0
+    }
+
+    fn set_asset_id(&mut self, id: u64) {
+        self.0 = id;
+    }
+}
+
+impl Field for MeshRef {
+    const KIND: FieldKind = FieldKind::asset_ref::<Self>();
+    const NAME: &'static str = "MeshRef";
+
+    fn visit<V: FieldVisitor>(&self, id: FieldId, visitor: &mut V) {
+        visitor.asset_ref(id, self);
+    }
+
+    fn visit_references<V: ReferenceVisitor>(&mut self, id: FieldId, visitor: &mut V) {
+        visitor.asset_ref(id, self);
+    }
+}
+
+/// A vector of scalars is a struct, not a scalar.
+#[value]
+#[derive(PartialEq, Debug)]
+pub struct Offset {
+    /// East.
+    #[field(id = 1)]
+    pub x: Meters,
+    /// North.
+    #[field(id = 2)]
+    pub y: Meters,
+}
+
+/// A prop placed in the world.
+#[component(key = "test::prop", persistent)]
+#[derive(PartialEq, Debug)]
+pub struct Prop {
+    /// What it looks like.
+    #[field(id = 1)]
+    pub mesh: MeshRef,
+    /// How tall it is.
+    #[field(id = 2)]
+    pub height: Meters,
+    /// Where it sits.
+    #[field(id = 3)]
+    pub offset: Offset,
+    /// Alternative looks.
+    #[field(id = 4)]
+    pub variants: PlainArray<MeshRef, 2>,
+}
+
+/// Eight bytes that claim to be an entity reference, which is sixteen.
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+#[repr(transparent)]
+pub struct NotAnEntityRef(u64);
+
+/// Four bytes that claim to be a `bool`.
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+#[repr(transparent)]
+pub struct NotABool(u32);
+
+/// Three bytes that claim to be an integer.
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+#[repr(transparent)]
+pub struct NotAnInteger([u8; 3]);
+
+macro_rules! mislabelled_field {
+    ($ty:ident, $kind:expr) => {
+        impl Field for $ty {
+            const KIND: FieldKind = $kind;
+            const NAME: &'static str = stringify!($ty);
+
+            fn visit<V: FieldVisitor>(&self, _: FieldId, _: &mut V) {}
+
+            fn visit_references<V: ReferenceVisitor>(&mut self, _: FieldId, _: &mut V) {}
+        }
+    };
+}
+
+mislabelled_field!(NotAnEntityRef, FieldKind::EntityRef);
+mislabelled_field!(NotABool, FieldKind::Bool);
+mislabelled_field!(NotAnInteger, FieldKind::Unsigned);
+
+/// Holds a field whose kind does not fit its size.
+#[component(key = "test::wrong_entity_ref", persistent)]
+pub struct WrongEntityRef(#[field(id = 1)] NotAnEntityRef);
+
+/// Holds a field whose kind does not fit its size.
+#[component(key = "test::wrong_bool", persistent)]
+pub struct WrongBool(#[field(id = 1)] NotABool);
+
+/// Holds an array of elements whose kind does not fit their size.
+#[component(key = "test::wrong_integer", persistent)]
+pub struct WrongInteger(#[field(id = 1)] PlainArray<NotAnInteger, 2>);
+
+mod renamed {
+    pub use lactose_reflect as reflect;
+}
+
+/// Declared through a re-export of the reflect crate, as `lactose-ecs` will.
+#[component(key = "test::through_reexport", persistent, crate = "crate::renamed::reflect")]
+pub struct ThroughReexport {
+    /// A nested value declared the same way.
+    #[field(id = 1)]
+    pub inner: ReexportedValue,
+}
+
+/// A value declared through a re-export.
+#[value(crate = "crate::renamed::reflect")]
+pub struct ReexportedValue(#[field(id = 1)] pub u8);
 
 /// Zeroed every tick, but zero is not a network ID.
 #[component(key = "test::bad_transient", transient)]
@@ -477,7 +653,12 @@ fn registration_rejects_what_contradicts_the_type() {
     rejected::<DuplicateId>("field ID 1 is used by both `a` and `b`");
     rejected::<WrongOffset>("field `b` is at offset 2 but the previous field ends at 4");
     rejected::<MissingField>("fields cover 4 bytes of a 8-byte struct");
-    rejected::<WrongSize>("described as 4 bytes aligned to 4, but the type is 8 aligned to 4");
+    rejected::<RetiredInUse>("field `b` uses the retired field ID 2");
+    rejected::<RetiredTwice>("field ID 5 is retired twice");
+    // A `Field` impl whose kind cannot have the type's size.
+    rejected::<WrongEntityRef>("field `0` of type `NotAnEntityRef` is 8 bytes");
+    rejected::<WrongBool>("field `0` of type `NotABool` is 4 bytes");
+    rejected::<WrongInteger>("field `0` of type `PlainArray` is 6 bytes");
     rejected::<BadTransient>("its all-zero value is invalid");
 }
 
@@ -493,7 +674,7 @@ fn registration_rejects_a_second_type_under_a_registered_key() {
 
 #[test]
 fn field_bytes_are_read_by_id() {
-    let info = KitchenSink::INFO;
+    let info = KitchenSink::SCHEMA;
     let sink = sink();
     let bytes = bytemuck::bytes_of(&sink);
     assert_eq!(info.field_bytes(bytes, FieldId(3)).unwrap(), 9u32.to_le_bytes());
@@ -507,7 +688,7 @@ fn field_bytes_are_read_by_id() {
 
 #[test]
 fn field_writes_are_validated_and_leave_the_value_alone_on_error() {
-    let info = KitchenSink::INFO;
+    let info = KitchenSink::SCHEMA;
     let mut bytes = bytemuck::bytes_of(&sink()).to_vec();
 
     info.write_field(&mut bytes, FieldId(5), &[1]).unwrap();
@@ -533,7 +714,7 @@ fn field_writes_are_validated_and_leave_the_value_alone_on_error() {
     assert_eq!(bytes, before);
 
     // An array field is valid only if every element is.
-    let info = HitList::INFO;
+    let info = HitList::SCHEMA;
     let mut bytes = bytemuck::bytes_of(&hit_list()).to_vec();
     let mut hits = info.field_bytes(&bytes, FieldId(1)).unwrap().to_vec();
     hits[18] = 2;
@@ -548,7 +729,7 @@ fn field_writes_are_validated_and_leave_the_value_alone_on_error() {
 
 #[test]
 fn whole_values_are_validated_without_panicking() {
-    let info = KitchenSink::INFO;
+    let info = KitchenSink::SCHEMA;
     let mut bytes = bytemuck::bytes_of(&sink()).to_vec();
     info.validate(&bytes).unwrap();
     assert_eq!(decode::<KitchenSink>(&bytes).unwrap(), sink());
@@ -576,7 +757,7 @@ fn padding_is_zero_and_is_zeroed() {
     assert_eq!(size_of::<Padding<3>>(), 3);
     assert_eq!(bytemuck::bytes_of(&Padding::<3>::default()), [0; 3]);
 
-    let info = KitchenSink::INFO;
+    let info = KitchenSink::SCHEMA;
     let mut bytes = bytemuck::bytes_of(&sink()).to_vec();
     bytes[47] = 9;
     assert_eq!(info.validate(&bytes).unwrap_err().kind(), ErrorKind::InvalidData);
@@ -584,7 +765,7 @@ fn padding_is_zero_and_is_zeroed() {
     assert_eq!(decode::<KitchenSink>(&bytes).unwrap(), sink());
 
     // Padding inside a nested struct inside an array.
-    let info = HitList::INFO;
+    let info = HitList::SCHEMA;
     let clean = bytemuck::bytes_of(&hit_list()).to_vec();
     let mut bytes = clean.clone();
     for element in 0..3 {
@@ -598,14 +779,14 @@ fn padding_is_zero_and_is_zeroed() {
 
 #[test]
 fn option_net_id_is_a_field_with_zero_as_none() {
-    let info = KitchenSink::INFO;
+    let info = KitchenSink::SCHEMA;
     let mut bytes = bytemuck::bytes_of(&sink()).to_vec();
     info.write_field(&mut bytes, FieldId(1), &[0; 8]).unwrap();
     assert_eq!(decode::<KitchenSink>(&bytes).unwrap().origin, None);
     // A bare `NetId` field rejects zero.
     let bytes = [0u8; 8];
     assert!(decode::<BadTransient>(&bytes).is_err());
-    assert!(BadTransient::INFO.write_field(&mut [1u8; 8], FieldId(1), &bytes).is_err());
+    assert!(BadTransient::SCHEMA.write_field(&mut [1u8; 8], FieldId(1), &bytes).is_err());
 }
 
 /// Verification item, `docs/verification.md` section 2: on the pinned `bytemuck_derive` both
@@ -628,4 +809,146 @@ fn pinned_bytemuck_derives_accept_data_carrying_enums() {
     assert_eq!(bytemuck::checked::try_pod_read_unaligned::<Held>(&bytes), Ok(held));
     assert!(bytemuck::checked::try_pod_read_unaligned::<Held>(&[2, 0, 0, 0, 0, 0, 0, 0]).is_err());
     assert_eq!(bytemuck::checked::try_pod_read_unaligned::<Held>(&[0; 8]), Ok(Held::Nothing(0)));
+}
+
+#[test]
+fn validation_rests_on_the_type_and_not_on_its_description() {
+    // `Mislabelled` describes itself with another type's layout and registers, because one
+    // four-byte integer does tile its four bytes.
+    let mut registry = Registry::new();
+    registry.register::<Mislabelled>().unwrap();
+    let info = registry.get(Mislabelled::KEY).unwrap();
+
+    // The description says any four bytes are a valid field, so the field write goes
+    // through. The whole-value check is the type's own, and a `bool` of 2 fails it.
+    let mut bytes = [1u8, 0, 7, 0];
+    info.write_field(&mut bytes, FieldId(1), &[2, 0, 7, 0]).unwrap();
+    assert_eq!(info.validate(&bytes).unwrap_err().kind(), ErrorKind::InvalidData);
+    assert!(decode::<Mislabelled>(&bytes).is_err());
+    info.validate(&[1, 0, 7, 0]).unwrap();
+    assert_eq!((info.layout().size(), info.layout().align()), (4, 2));
+}
+
+#[test]
+fn retired_ids_are_described() {
+    let retired = |ids: &[lactose_core::FieldId]| ids.iter().map(|id| id.0).collect::<Vec<_>>();
+    assert_eq!(retired(KitchenSink::SCHEMA.layout().retired()), [8, 10]);
+    assert!(Health::SCHEMA.layout().retired().is_empty());
+    let FieldKind::Array { element: FieldKind::Struct(hit), .. } =
+        HitList::SCHEMA.field(FieldId(1)).unwrap().kind()
+    else {
+        panic!("hits is an array of structs")
+    };
+    assert_eq!(retired(hit.retired()), [4]);
+}
+
+#[test]
+fn nested_struct_fields_are_found_by_id() {
+    let FieldKind::Struct(offset) = Prop::SCHEMA.field(FieldId(3)).unwrap().kind() else {
+        panic!("offset is a struct")
+    };
+    let y = offset.field(FieldId(2)).unwrap();
+    assert_eq!((y.name(), y.offset(), y.size(), y.type_name()), ("y", 8, 8, "Meters"));
+    assert_eq!(offset.field(FieldId(3)).unwrap_err().kind(), ErrorKind::NotFound);
+}
+
+fn prop() -> Prop {
+    Prop {
+        mesh: MeshRef(40),
+        height: Meters(1.5),
+        offset: Offset { x: Meters(f64::NAN), y: Meters(-2.0) },
+        variants: PlainArray([MeshRef(0), MeshRef(41)]),
+    }
+}
+
+#[test]
+fn scalar_and_asset_fields_from_another_crate_reach_their_own_visitor_methods() {
+    let kind = |id| Prop::SCHEMA.field(FieldId(id)).unwrap().kind();
+    assert!(matches!(kind(1), FieldKind::AssetRef { .. }));
+    assert!(matches!(kind(2), FieldKind::Scalar { .. }));
+    assert!(matches!(kind(3), FieldKind::Struct(_)));
+    assert!(matches!(kind(4), FieldKind::Array { element: FieldKind::AssetRef { .. }, .. }));
+
+    let mut recorder = Recorder::default();
+    prop().visit(&mut recorder);
+    assert_eq!(
+        recorder.0,
+        [
+            "1 asset 40",
+            "2 scalar 0x3ff8000000000000",
+            "3 scalar 0x7ff8000000000000",
+            "3 scalar 0xc000000000000000",
+            "4 asset 0",
+            "4 asset 41",
+        ]
+    );
+
+    let mut prop = prop();
+    let mut shift = Shift(1000, Vec::new());
+    prop.visit_references(&mut shift);
+    assert_eq!(shift.1, [1, 4, 4]);
+    assert_eq!(prop.mesh, MeshRef(1040));
+    assert_eq!(prop.variants, PlainArray([MeshRef(0), MeshRef(1041)]));
+    assert_eq!(prop.height, Meters(1.5));
+
+    let mut registry = Registry::new();
+    registry.register::<Prop>().unwrap();
+    let dump = registry.dump();
+    assert!(dump.contains("  1 mesh: MeshRef size=8\n"), "{dump}");
+    assert!(dump.contains("  2 height: Meters size=8\n"), "{dump}");
+    assert!(
+        dump.contains(
+            "  3 offset: struct Offset { 1 x: Meters size=8, 2 y: Meters size=8 } size=16\n"
+        ),
+        "{dump}"
+    );
+    assert!(dump.contains("  4 variants: [MeshRef; 2] size=16\n"), "{dump}");
+}
+
+#[test]
+fn dump_tells_identity_types_from_the_integers_they_wrap() {
+    /// The same layout four ways.
+    #[component(key = "test::identities", persistent)]
+    struct Identities {
+        #[field(id = 1)]
+        raw: u64,
+        #[field(id = 2)]
+        id: NetId,
+        #[field(id = 3)]
+        maybe: Option<NetId>,
+        #[field(id = 4)]
+        count: u32,
+        #[field(id = 5)]
+        tick: Tick,
+        #[field(id = 6)]
+        player: PlayerId,
+        #[field(id = 7)]
+        signed: i32,
+    }
+    let mut registry = Registry::new();
+    registry.register::<Identities>().unwrap();
+    let dump = registry.dump();
+    let fields: Vec<&str> = dump.lines().skip(1).map(str::trim).collect();
+    assert_eq!(
+        fields,
+        [
+            "1 raw: u64 size=8",
+            "2 id: NetId size=8",
+            "3 maybe: Option<NetId> size=8",
+            "4 count: u32 size=4",
+            "5 tick: Tick size=4",
+            "6 player: PlayerId size=4",
+            "7 signed: i32 size=4",
+        ]
+    );
+}
+
+#[test]
+fn attributes_work_through_a_reexport_of_the_crate() {
+    is_component::<ThroughReexport>();
+    let mut registry = Registry::new();
+    registry.register::<ThroughReexport>().unwrap();
+    let mut recorder = Recorder::default();
+    ThroughReexport { inner: ReexportedValue(9) }.visit(&mut recorder);
+    assert_eq!(recorder.0, ["1 bytes [9]"]);
 }

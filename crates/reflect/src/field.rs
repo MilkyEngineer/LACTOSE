@@ -1,4 +1,4 @@
-//! The types allowed as fields, and the kind each one reports.
+//! The types allowed as fields, and the kind and type tag each one reports.
 
 use bytemuck::{CheckedBitPattern, NoUninit};
 use lactose_core::{EntityRef, FieldId, NetId, PlainArray, PlayerId, Tick};
@@ -7,6 +7,10 @@ use crate::info::StructInfo;
 use crate::visit::{FieldVisitor, ReferenceVisitor};
 
 /// What a field holds, as far as generic code needs to know.
+///
+/// A kind is a statement by the field type's [`Field`] impl. It selects nothing about
+/// validity, which always comes from the type's own `CheckedBitPattern`; registration checks
+/// it against the field's size.
 #[derive(Clone, Copy, Debug)]
 pub enum FieldKind {
     /// `bool`.
@@ -15,14 +19,16 @@ pub enum FieldKind {
     Unsigned,
     /// A signed integer. The field size gives the width.
     Signed,
-    /// A raw `f32` or `f64`. Presentation data only: inside the determinism boundary floats
-    /// are [`FieldKind::Scalar`].
+    /// A raw `f32` or `f64`. Presentation data only; the world hasher refuses it.
     Float,
-    /// The simulation scalar of `lactose-math`, or a type built from it.
+    /// The simulation scalar itself, a [`ScalarField`]. Built by [`FieldKind::scalar`] only.
+    /// Vectors and other types made of scalars are [`FieldKind::Struct`].
+    #[non_exhaustive]
     Scalar,
     /// An [`EntityRef`], remapped on load.
     EntityRef,
-    /// The asset reference of `lactose-asset-api`, remapped on load.
+    /// An [`AssetReference`], remapped on load. Built by [`FieldKind::asset_ref`] only.
+    #[non_exhaustive]
     AssetRef,
     /// A fieldless enum declared with `#[value]`.
     Enum(&'static EnumInfo),
@@ -32,11 +38,27 @@ pub enum FieldKind {
     Array {
         /// The kind of each element.
         element: &'static FieldKind,
+        /// The type tag of each element, its [`Field::NAME`].
+        element_name: &'static str,
         /// The number of elements.
         len: usize,
     },
     /// Explicit padding: always zero, never visited, hashed or saved.
     Padding,
+}
+
+impl FieldKind {
+    /// The kind of the simulation scalar `S`.
+    #[must_use]
+    pub const fn scalar<S: ScalarField>() -> Self {
+        Self::Scalar
+    }
+
+    /// The kind of the asset reference `A`.
+    #[must_use]
+    pub const fn asset_ref<A: AssetReference>() -> Self {
+        Self::AssetRef
+    }
 }
 
 /// One variant of a `#[value]` enum.
@@ -66,11 +88,22 @@ pub struct EnumInfo {
 /// for nested structs and fieldless enums. A crate that owns a plain-data type implements it
 /// by forwarding to the visitor method that matches the type's kind.
 ///
+/// This is a safe trait and an impl cannot make validation wrong: the size, alignment and
+/// validity of a field are always taken from the type's `NoUninit` and `CheckedBitPattern`
+/// impls, never from [`Field::KIND`] or [`Field::NAME`]. A wrong kind is caught at
+/// registration where the kind fixes a size, and otherwise only mislabels the schema.
+///
 /// A bare `[T; N]` is deliberately not a field: `bytemuck` treats it as plain data only when
 /// `T` accepts every bit pattern, so an array of `bool`, enums or references would fail with
 /// errors from its derives. [`PlainArray`] is the one spelling that works for every element.
 /// `usize`, `isize`, `char` and the 128-bit integers are absent too: their size, validity or
 /// alignment is not something a save format should depend on.
+///
+/// The attributes of this crate write the `CheckedBitPattern` impl of a struct themselves.
+/// A crate that instead applies `bytemuck`'s derive to a struct should know two things about
+/// it: it generates a `pub struct <Name>Bits` beside the type, so that name is taken, and it
+/// formats the `Bits` of every field, so a field type with a hand-written `CheckedBitPattern`
+/// needs a `Bits` type that is `Debug`.
 #[diagnostic::on_unimplemented(
     message = "`{Self}` cannot be a reflected field",
     note = "fields are integers up to 64 bits, `bool`, floats, `lactose_core` identity types, `EntityRef` and `#[value]` types",
@@ -80,6 +113,11 @@ pub trait Field: NoUninit + CheckedBitPattern + Send + Sync + 'static {
     /// The kind metadata reports for this type.
     const KIND: FieldKind;
 
+    /// The stable type tag the schema dump prints, such as `"u32"` or `"NetId"`. Two types
+    /// with different meanings or encodings have different tags, and a tag never changes:
+    /// replacing a field's type by one with another tag is a schema change.
+    const NAME: &'static str;
+
     /// Reports this value to `visitor` under field `id`.
     fn visit<V: FieldVisitor>(&self, id: FieldId, visitor: &mut V);
 
@@ -87,10 +125,30 @@ pub trait Field: NoUninit + CheckedBitPattern + Send + Sync + 'static {
     fn visit_references<V: ReferenceVisitor>(&mut self, id: FieldId, visitor: &mut V);
 }
 
+/// The simulation scalar: the one float type allowed inside the determinism boundary.
+/// `lactose-math` implements it; its `Field` impl reports [`FieldKind::scalar`] and calls
+/// [`FieldVisitor::scalar`].
+pub trait ScalarField: Field {
+    /// The value's canonical bit pattern, zero-extended: equal values give equal bits on
+    /// every platform, with one pattern for all NaNs.
+    fn canonical_bits(&self) -> u64;
+}
+
+/// A typed reference to an asset. `lactose-asset-api` implements it; its `Field` impl
+/// reports [`FieldKind::asset_ref`] and calls the `asset_ref` method of both visitors.
+pub trait AssetReference: Field {
+    /// The raw 64-bit asset identity, or zero for the empty reference.
+    fn asset_id(&self) -> u64;
+
+    /// Points this reference at the asset with raw identity `id`; zero empties it.
+    fn set_asset_id(&mut self, id: u64);
+}
+
 macro_rules! bytes_fields {
-    ($($kind:ident: $($ty:ty),+;)+) => {$($(
+    ($($kind:ident: $($ty:ty => $name:literal),+;)+) => {$($(
         impl Field for $ty {
             const KIND: FieldKind = FieldKind::$kind;
+            const NAME: &'static str = $name;
 
             fn visit<V: FieldVisitor>(&self, id: FieldId, visitor: &mut V) {
                 visitor.bytes(id, bytemuck::bytes_of(self));
@@ -102,13 +160,16 @@ macro_rules! bytes_fields {
 }
 
 bytes_fields! {
-    Bool: bool;
-    Unsigned: u8, u16, u32, u64, Tick, PlayerId, NetId, Option<NetId>;
-    Signed: i8, i16, i32, i64;
+    Bool: bool => "bool";
+    Unsigned:
+        u8 => "u8", u16 => "u16", u32 => "u32", u64 => "u64", Tick => "Tick",
+        PlayerId => "PlayerId", NetId => "NetId", Option<NetId> => "Option<NetId>";
+    Signed: i8 => "i8", i16 => "i16", i32 => "i32", i64 => "i64";
 }
 
 impl Field for f32 {
     const KIND: FieldKind = FieldKind::Float;
+    const NAME: &'static str = "f32";
 
     fn visit<V: FieldVisitor>(&self, id: FieldId, visitor: &mut V) {
         visitor.f32(id, *self);
@@ -119,6 +180,7 @@ impl Field for f32 {
 
 impl Field for f64 {
     const KIND: FieldKind = FieldKind::Float;
+    const NAME: &'static str = "f64";
 
     fn visit<V: FieldVisitor>(&self, id: FieldId, visitor: &mut V) {
         visitor.f64(id, *self);
@@ -129,6 +191,7 @@ impl Field for f64 {
 
 impl Field for EntityRef {
     const KIND: FieldKind = FieldKind::EntityRef;
+    const NAME: &'static str = "EntityRef";
 
     fn visit<V: FieldVisitor>(&self, id: FieldId, visitor: &mut V) {
         visitor.entity_ref(id, *self);
@@ -140,7 +203,9 @@ impl Field for EntityRef {
 }
 
 impl<T: Field, const N: usize> Field for PlainArray<T, N> {
-    const KIND: FieldKind = FieldKind::Array { element: &T::KIND, len: N };
+    const KIND: FieldKind = FieldKind::Array { element: &T::KIND, element_name: T::NAME, len: N };
+    // The dump renders an array from its kind, as `[<element>; N]`.
+    const NAME: &'static str = "PlainArray";
 
     fn visit<V: FieldVisitor>(&self, id: FieldId, visitor: &mut V) {
         for element in &self.0 {

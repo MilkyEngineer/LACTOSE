@@ -1,18 +1,22 @@
 //! Expansion of `#[component]`, `#[resource]` and `#[value]`.
 //!
-//! The expansion names `::lactose_reflect` and `::core` only, contains no `unsafe`, and does
-//! no layout arithmetic of its own: sizes and offsets are `size_of` and `offset_of!` calls
-//! the compiler evaluates in the invoking crate. The component key is likewise hashed there,
-//! by a `const fn` call, never here.
+//! The expansion names the reflect crate (`::lactose_reflect` unless `crate = "..."` says
+//! otherwise) and `::core` only, and does no layout arithmetic of its own: sizes and offsets
+//! are `size_of` and `offset_of!` calls the compiler evaluates in the invoking crate. The
+//! component key is likewise hashed there, by a `const fn` call, never here.
+//!
+//! The expansion of a struct contains one `unsafe impl`, of `CheckedBitPattern`; see
+//! [`checked_bit_pattern`] for why it is written here and why it is sound. Everything else
+//! is safe code.
 
 use proc_macro2::{Span, TokenStream};
 use quote::{ToTokens, quote, quote_spanned};
-use syn::parse::Parser;
+use syn::parse::{ParseStream, Parser};
 use syn::punctuated::Punctuated;
 use syn::spanned::Spanned;
 use syn::{
-    Attribute, Data, DataEnum, DeriveInput, Error, Expr, ExprLit, Fields, Ident, Index, Lit,
-    LitInt, LitStr, Member, Meta, Result, Token, Type,
+    Attribute, Data, DataEnum, DeriveInput, Error, Fields, Ident, Index, LitInt, LitStr, Member,
+    Path, Result, Token, Type, bracketed,
 };
 
 #[derive(Clone, Copy)]
@@ -21,18 +25,42 @@ pub(crate) enum Role {
     Resource,
 }
 
-impl Role {
+/// Which attribute is being expanded.
+#[derive(Clone, Copy)]
+enum Target {
+    Reflected(Role),
+    Value,
+}
+
+impl Target {
     fn attribute(self) -> &'static str {
         match self {
-            Self::Component => "component",
-            Self::Resource => "resource",
+            Self::Reflected(Role::Component) => "component",
+            Self::Reflected(Role::Resource) => "resource",
+            Self::Value => "value",
         }
     }
 
     fn noun(self) -> &'static str {
         match self {
-            Self::Component => "a component",
-            Self::Resource => "a reflected resource",
+            Self::Reflected(Role::Component) => "a component",
+            Self::Reflected(Role::Resource) => "a reflected resource",
+            Self::Value => "a `#[value]` type",
+        }
+    }
+
+    fn usage(self) -> String {
+        match self {
+            Self::Reflected(_) => format!(
+                "expected `#[{}(key = \"crate::name\", <policy>)]` where <policy> is \
+                 `persistent`, `transient` or `derived`, optionally followed by `version = N`, \
+                 `replicated`, `extracted`, `retired = [N, ...]`, `crate = \"path\"`",
+                self.attribute()
+            ),
+            Self::Value => {
+                "expected `#[value]`, optionally with `retired = [N, ...]` or `crate = \"path\"`"
+                    .to_owned()
+            }
         }
     }
 }
@@ -74,90 +102,141 @@ fn strip_field_attributes(fields: &mut Fields) {
     fields.iter_mut().for_each(|field| field.attrs.retain(|a| !is_field(a)));
 }
 
-struct TypeArgs {
-    key: LitStr,
-    persistence: Ident,
+/// The first `#[cfg]` or `#[cfg_attr]` among `attributes`.
+fn conditional(attributes: &[Attribute]) -> Option<&Attribute> {
+    attributes.iter().find(|a| a.path().is_ident("cfg") || a.path().is_ident("cfg_attr"))
+}
+
+struct Args {
+    /// Path of the reflect crate, as tokens and as the text `bytemuck`'s derives take.
+    krate: TokenStream,
+    bytemuck: String,
+    key: Option<LitStr>,
+    persistence: Option<Ident>,
     version: u32,
     replicated: bool,
     extracted: bool,
+    retired: Vec<(u16, Span)>,
 }
 
-fn parse_type_args(role: Role, args: TokenStream) -> Result<TypeArgs> {
-    let attribute = role.attribute();
-    let usage = format!(
-        "expected `#[{attribute}(key = \"crate::name\", <policy>)]` where <policy> is \
-         `persistent`, `transient` or `derived`, optionally followed by `version = N`, \
-         `replicated`, `extracted`"
-    );
-    let mut key = None;
-    let mut persistence: Option<Ident> = None;
-    let mut version = None;
-    let mut replicated = false;
-    let mut extracted = false;
+fn parse_args(target: Target, args: TokenStream) -> Result<Args> {
+    let reflected = matches!(target, Target::Reflected(_));
+    let parser = |input: ParseStream| -> Result<Args> {
+        let mut krate: Option<LitStr> = None;
+        let mut key = None;
+        let mut persistence: Option<Ident> = None;
+        let mut version = None;
+        let mut replicated = false;
+        let mut extracted = false;
+        let mut retired: Option<Vec<(u16, Span)>> = None;
 
-    let metas = Punctuated::<Meta, Token![,]>::parse_terminated.parse2(args)?;
-    for meta in &metas {
-        let repeated = || Error::new(meta.span(), "this argument is given twice");
-        match meta {
-            Meta::NameValue(pair) if pair.path.is_ident("key") => {
-                let Expr::Lit(ExprLit { lit: Lit::Str(name), .. }) = &pair.value else {
-                    return Err(Error::new(pair.value.span(), "the key is a string literal"));
-                };
-                if name.value().is_empty() {
-                    return Err(Error::new(name.span(), "the key cannot be empty"));
+        while !input.is_empty() {
+            let (name, span) = if input.peek(Token![crate]) {
+                ("crate".to_owned(), input.parse::<Token![crate]>()?.span)
+            } else {
+                let ident: Ident = input.parse()?;
+                (ident.to_string(), ident.span())
+            };
+            let repeated = || Error::new(span, format!("`{name}` is given twice"));
+            match name.as_str() {
+                "crate" => {
+                    input.parse::<Token![=]>()?;
+                    if krate.replace(input.parse()?).is_some() {
+                        return Err(repeated());
+                    }
                 }
-                if key.replace(name.clone()).is_some() {
-                    return Err(repeated());
+                "retired" => {
+                    input.parse::<Token![=]>()?;
+                    let list;
+                    bracketed!(list in input);
+                    let mut ids: Vec<(u16, Span)> = Vec::new();
+                    for literal in Punctuated::<LitInt, Token![,]>::parse_terminated(&list)? {
+                        let id = parse_field_id(&literal)?;
+                        if ids.iter().any(|(seen, _)| *seen == id) {
+                            return Err(Error::new(
+                                literal.span(),
+                                format!("field ID {id} is retired twice"),
+                            ));
+                        }
+                        ids.push((id, literal.span()));
+                    }
+                    if retired.replace(ids).is_some() {
+                        return Err(repeated());
+                    }
                 }
-            }
-            Meta::NameValue(pair) if pair.path.is_ident("version") => {
-                let Expr::Lit(ExprLit { lit: Lit::Int(number), .. }) = &pair.value else {
-                    return Err(Error::new(pair.value.span(), "the version is an integer"));
-                };
-                if version.replace(number.base10_parse::<u32>()?).is_some() {
-                    return Err(repeated());
+                "key" if reflected => {
+                    input.parse::<Token![=]>()?;
+                    let literal: LitStr = input.parse()?;
+                    if literal.value().is_empty() {
+                        return Err(Error::new(literal.span(), "the key cannot be empty"));
+                    }
+                    if key.replace(literal).is_some() {
+                        return Err(repeated());
+                    }
                 }
-            }
-            Meta::Path(path) if path.is_ident("replicated") => {
-                if std::mem::replace(&mut replicated, true) {
-                    return Err(repeated());
+                "version" if reflected => {
+                    input.parse::<Token![=]>()?;
+                    let number = input.parse::<LitInt>()?.base10_parse::<u32>()?;
+                    if version.replace(number).is_some() {
+                        return Err(repeated());
+                    }
                 }
-            }
-            Meta::Path(path) if path.is_ident("extracted") => {
-                if std::mem::replace(&mut extracted, true) {
-                    return Err(repeated());
+                "replicated" if reflected => {
+                    if std::mem::replace(&mut replicated, true) {
+                        return Err(repeated());
+                    }
                 }
-            }
-            Meta::Path(path)
-                if path.is_ident("persistent")
-                    || path.is_ident("transient")
-                    || path.is_ident("derived") =>
-            {
-                if persistence.is_some() {
+                "extracted" if reflected => {
+                    if std::mem::replace(&mut extracted, true) {
+                        return Err(repeated());
+                    }
+                }
+                "persistent" | "transient" | "derived" if reflected => {
+                    if persistence.replace(Ident::new(&name, span)).is_some() {
+                        return Err(Error::new(
+                            span,
+                            "a type has one persistence policy: `persistent`, `transient` or \
+                             `derived`",
+                        ));
+                    }
+                }
+                _ => {
                     return Err(Error::new(
-                        path.span(),
-                        "a type has one persistence policy: `persistent`, `transient` or `derived`",
+                        span,
+                        format!("unknown argument `{name}`; {}", target.usage()),
                     ));
                 }
-                persistence = path.get_ident().cloned();
             }
-            _ => return Err(Error::new(meta.span(), format!("unknown argument; {usage}"))),
+            if !input.is_empty() {
+                input.parse::<Token![,]>()?;
+            }
         }
-    }
 
-    let key = key.ok_or_else(|| {
-        Error::new(Span::call_site(), format!("missing `key = \"...\"`; {usage}"))
-    })?;
-    let persistence = persistence.ok_or_else(|| {
-        Error::new(
-            Span::call_site(),
-            format!(
-                "missing persistence policy: add `persistent`, `transient` or `derived` to \
-                 `#[{attribute}(...)]`"
+        let (krate, bytemuck) = match krate {
+            Some(literal) => (
+                literal.parse::<Path>()?.into_token_stream(),
+                format!("{}::bytemuck", literal.value()),
             ),
-        )
-    })?;
-    Ok(TypeArgs { key, persistence, version: version.unwrap_or(1), replicated, extracted })
+            None => (quote!(::lactose_reflect), "::lactose_reflect::bytemuck".to_owned()),
+        };
+        Ok(Args {
+            krate,
+            bytemuck,
+            key,
+            persistence,
+            version: version.unwrap_or(1),
+            replicated,
+            extracted,
+            retired: retired.unwrap_or_default(),
+        })
+    };
+    parser.parse2(args)
+}
+
+fn parse_field_id(literal: &LitInt) -> Result<u16> {
+    literal
+        .base10_parse::<u16>()
+        .map_err(|_| Error::new(literal.span(), "a field ID is an integer from 0 to 65535"))
 }
 
 struct FieldSpec {
@@ -170,7 +249,7 @@ struct FieldSpec {
 }
 
 /// Reads and removes the `#[field(...)]` attribute of every field.
-fn take_fields(fields: &mut Fields) -> Result<Vec<FieldSpec>> {
+fn take_fields(fields: &mut Fields, retired: &[(u16, Span)]) -> Result<Vec<FieldSpec>> {
     let mut specs: Vec<FieldSpec> = Vec::new();
     let mut errors: Option<Error> = None;
     let mut fail = |error: Error| match &mut errors {
@@ -187,16 +266,23 @@ fn take_fields(fields: &mut Fields) -> Result<Vec<FieldSpec>> {
             None => (Member::Unnamed(Index::from(index)), index.to_string()),
         };
 
+        if let Some(attribute) = conditional(&field.attrs) {
+            fail(Error::new(
+                attribute.path().span(),
+                format!(
+                    "field `{name}` cannot be conditional: a `#[cfg]` would give builds \
+                     different layouts and schemas under one key"
+                ),
+            ));
+        }
+
         let mut id = None;
         let mut padding = false;
         let mut malformed = false;
         for attribute in field.attrs.iter().filter(|a| is_field(a)) {
             let parsed = attribute.parse_nested_meta(|meta| {
                 if meta.path.is_ident("id") {
-                    let number: LitInt = meta.value()?.parse()?;
-                    let parsed = number.base10_parse::<u16>().map_err(|_| {
-                        Error::new(number.span(), "a field ID is an integer from 0 to 65535")
-                    })?;
+                    let parsed = parse_field_id(&meta.value()?.parse()?)?;
                     if id.replace(parsed).is_some() {
                         return Err(meta.error("a field has one ID"));
                     }
@@ -236,6 +322,15 @@ fn take_fields(fields: &mut Fields) -> Result<Vec<FieldSpec>> {
                         format!("field ID {id} is already used by field `{}`", first.name),
                     ));
                 }
+                if retired.iter().any(|(retired, _)| *retired == id) {
+                    fail(Error::new(
+                        span,
+                        format!(
+                            "field `{name}` uses the retired field ID {id}: a retired ID is \
+                             never given to another field"
+                        ),
+                    ));
+                }
             }
             (None, true) => {}
         }
@@ -250,13 +345,24 @@ fn take_fields(fields: &mut Fields) -> Result<Vec<FieldSpec>> {
 
 /// Rejects what no reflected type may have, and returns what the macro must add to the
 /// derive list.
-fn check_item(input: &DeriveInput, what: &str) -> Result<TokenStream> {
+fn check_item(input: &DeriveInput, target: Target, args: &Args) -> Result<TokenStream> {
     if !input.generics.params.is_empty() || input.generics.where_clause.is_some() {
         return Err(Error::new(
             input.generics.span(),
             format!(
-                "{what} cannot be generic: its key and layout must be one fixed thing \
-                 (architecture section 6); declare one type per instantiation"
+                "{} cannot be generic: its key and layout must be one fixed thing \
+                 (architecture section 6); declare one type per instantiation",
+                target.noun()
+            ),
+        ));
+    }
+    if let Some(attribute) = input.attrs.iter().find(|a| a.path().is_ident("cfg_attr")) {
+        return Err(Error::new(
+            attribute.path().span(),
+            format!(
+                "`#[cfg_attr]` cannot be applied to {}: its attributes must be the same in \
+                 every build",
+                target.noun()
             ),
         ));
     }
@@ -272,13 +378,59 @@ fn check_item(input: &DeriveInput, what: &str) -> Result<TokenStream> {
             })?;
         }
     }
+    let krate = &args.krate;
     let clone = (!has_clone).then(|| quote!(::core::clone::Clone,));
     let copy = (!has_copy).then(|| quote!(::core::marker::Copy,));
-    Ok(quote! {
-        #clone #copy
-        ::lactose_reflect::bytemuck::NoUninit,
-        ::lactose_reflect::bytemuck::CheckedBitPattern
-    })
+    Ok(quote!(#clone #copy #krate::bytemuck::NoUninit))
+}
+
+/// The `CheckedBitPattern` impl of the struct `name`.
+///
+/// `bytemuck`'s own derive cannot be used: for a struct it derives `AnyBitPattern` on a
+/// generated type without passing on `#[bytemuck(crate = ...)]`, so on the pinned version it
+/// compiles only in a crate that depends on `bytemuck` under that name. This is the same
+/// impl with the path fixed, the generated type kept out of the invoking crate's namespace,
+/// and no `Debug` requirement on the fields.
+///
+/// Why the `unsafe impl` is sound. `CheckedBitPattern` requires that `Bits` has the layout
+/// of `Self` and that `is_valid_bit_pattern` accepts only bit patterns valid for `Self`.
+///
+/// - The struct is `#[repr(C)]` with exactly the fields in `fields`, in order: the macro
+///   adds the `repr`, rejects any other, and rejects `#[cfg]` and `#[cfg_attr]`, so no later
+///   expansion can change the field list or the representation.
+/// - `__Bits` is `#[repr(C)]` with one field per field, in the same order, of type
+///   `<F as CheckedBitPattern>::Bits`, which has the size and alignment of `F` by `F`'s own
+///   contract. Two `repr(C)` structs whose fields agree pairwise in size and alignment have
+///   the same layout.
+/// - `__Bits` is `AnyBitPattern` by `bytemuck`'s derive, which checks every field.
+/// - A struct is valid exactly when each field is, and the check below tests every field.
+///   There is no padding to consider: the `NoUninit` derive on the struct rejects it.
+fn checked_bit_pattern(name: &Ident, fields: &[FieldSpec], args: &Args) -> TokenStream {
+    let Args { krate, bytemuck, .. } = args;
+    let bits: Vec<Ident> = (0..fields.len())
+        .map(|index| Ident::new(&format!("f{index}"), Span::call_site()))
+        .collect();
+    let types: Vec<&Type> = fields.iter().map(|field| &field.ty).collect();
+    quote! {
+        #[derive(::core::clone::Clone, ::core::marker::Copy, #krate::bytemuck::AnyBitPattern)]
+        #[bytemuck(crate = #bytemuck)]
+        #[repr(C)]
+        pub struct __Bits {
+            #(#bits: <#types as #krate::bytemuck::CheckedBitPattern>::Bits,)*
+        }
+
+        unsafe impl #krate::bytemuck::CheckedBitPattern for #name {
+            type Bits = __Bits;
+
+            #[inline]
+            #[allow(unused_variables)]
+            fn is_valid_bit_pattern(bits: &__Bits) -> bool {
+                true #(&& <#types as #krate::bytemuck::CheckedBitPattern>::is_valid_bit_pattern(
+                    &{ bits.#bits }
+                ))*
+            }
+        }
+    }
 }
 
 fn reject_repr(input: &DeriveInput) -> Result<()> {
@@ -297,6 +449,8 @@ struct StructParts {
     layout_checks: TokenStream,
     /// One `FieldInfo` expression per field, comma-terminated.
     field_infos: TokenStream,
+    /// One `FieldId` expression per retired ID, comma-terminated.
+    retired: TokenStream,
     /// Statements of a `visit` body.
     visits: TokenStream,
     /// Statements of a `visit_references` body.
@@ -306,10 +460,12 @@ struct StructParts {
 /// With `own_ids` each visit reports the field's own ID, as a component does. Without it
 /// each visit reports the `id` parameter in scope, the ID of the field that holds a
 /// `#[value]` struct.
-fn struct_parts(name: &Ident, fields: &[FieldSpec], own_ids: bool) -> StructParts {
+fn struct_parts(name: &Ident, fields: &[FieldSpec], args: &Args, own_ids: bool) -> StructParts {
+    let krate = &args.krate;
     let mut parts = StructParts {
         layout_checks: TokenStream::new(),
         field_infos: TokenStream::new(),
+        retired: TokenStream::new(),
         visits: TokenStream::new(),
         reference_visits: TokenStream::new(),
     };
@@ -333,20 +489,20 @@ fn struct_parts(name: &Ident, fields: &[FieldSpec], own_ids: bool) -> StructPart
         let type_span = ty.span();
         match id {
             Some(id) => {
-                let field_id = quote!(::lactose_reflect::__private::FieldId(#id));
+                let field_id = quote!(#krate::__private::FieldId(#id));
                 parts.field_infos.extend(quote_spanned! {type_span=>
-                    ::lactose_reflect::FieldInfo::new::<#ty>(#field_id, #field_name, #offset),
+                    #krate::FieldInfo::new::<#ty>(#field_id, #field_name, #offset),
                 });
                 let reported = if own_ids { field_id } else { quote!(id) };
                 parts.visits.extend(quote! {
-                    ::lactose_reflect::Field::visit(&self.#member, #reported, visitor);
+                    #krate::Field::visit(&self.#member, #reported, visitor);
                 });
                 parts.reference_visits.extend(quote! {
-                    ::lactose_reflect::Field::visit_references(&mut self.#member, #reported, visitor);
+                    #krate::Field::visit_references(&mut self.#member, #reported, visitor);
                 });
             }
             None => parts.field_infos.extend(quote_spanned! {type_span=>
-                ::lactose_reflect::FieldInfo::padding::<#ty>(#field_name, #offset),
+                #krate::FieldInfo::padding::<#ty>(#field_name, #offset),
             }),
         }
     }
@@ -358,121 +514,147 @@ fn struct_parts(name: &Ident, fields: &[FieldSpec], own_ids: bool) -> StructPart
             const _: () = ::core::assert!(::core::mem::size_of::<#name>() == #previous_end, #message);
         });
     }
+    for (id, _) in &args.retired {
+        parts.retired.extend(quote!(#krate::__private::FieldId(#id),));
+    }
     parts
 }
 
 fn try_reflected(role: Role, args: TokenStream, item: TokenStream) -> Result<TokenStream> {
+    let target = Target::Reflected(role);
     let mut input: DeriveInput = syn::parse2(item)?;
-    let args = parse_type_args(role, args)?;
-    let derives = check_item(&input, role.noun())?;
+    let args = parse_args(target, args)?;
+    let derives = check_item(&input, target, &args)?;
     let name = input.ident.clone();
 
     reject_repr(&input)?;
     let Data::Struct(data) = &mut input.data else {
         return Err(Error::new(
             name.span(),
-            format!("{} is a struct; mark an enum `#[value]` and hold it in a field", role.noun()),
+            format!(
+                "{} is a struct; mark an enum `#[value]` and hold it in a field",
+                target.noun()
+            ),
         ));
     };
-    let fields = take_fields(&mut data.fields)?;
-    let StructParts { layout_checks, field_infos, visits, reference_visits } =
-        struct_parts(&name, &fields, true);
+    let key = args.key.as_ref().ok_or_else(|| {
+        Error::new(Span::call_site(), format!("missing `key = \"...\"`; {}", target.usage()))
+    })?;
+    let persistence = args.persistence.as_ref().ok_or_else(|| {
+        Error::new(
+            Span::call_site(),
+            format!(
+                "missing persistence policy: add `persistent`, `transient` or `derived` to \
+                 `#[{}(...)]`",
+                target.attribute()
+            ),
+        )
+    })?;
+    let fields = take_fields(&mut data.fields, &args.retired)?;
+    let StructParts { layout_checks, field_infos, retired, visits, reference_visits } =
+        struct_parts(&name, &fields, &args, true);
+    let checked = checked_bit_pattern(&name, &fields, &args);
 
-    let TypeArgs { key, persistence, version, replicated, extracted } = args;
     let persistence = match persistence.to_string().as_str() {
         "persistent" => quote!(Persistent),
         "transient" => quote!(Transient),
         _ => quote!(Derived),
     };
-    let (role, marker) = match role {
-        Role::Component => (quote!(Component), quote!(Component)),
-        Role::Resource => (quote!(Resource), quote!(Resource)),
+    let role = match role {
+        Role::Component => quote!(Component),
+        Role::Resource => quote!(Resource),
     };
+    let Args { krate, bytemuck, version, replicated, extracted, .. } = &args;
     let rust_name = name.to_string();
 
+    // The layout checks come first so that their message precedes the one `bytemuck`'s
+    // derive gives for the same padding.
     Ok(quote! {
+        #layout_checks
+
         #[derive(#derives)]
-        #[bytemuck(crate = "::lactose_reflect::bytemuck")]
+        #[bytemuck(crate = #bytemuck)]
         #[repr(C)]
         #input
 
         const _: () = {
-            #layout_checks
+            #checked
 
-            const FIELDS: &[::lactose_reflect::FieldInfo] = &[#field_infos];
-            const INFO: ::lactose_reflect::TypeInfo = ::lactose_reflect::TypeInfo::new(
+            const __FIELDS: &[#krate::FieldInfo] = &[#field_infos];
+            const __SCHEMA: #krate::Schema<#name> = #krate::Schema::new(#krate::TypeInfo::new(
                 #key,
-                ::lactose_reflect::TypeRole::#role,
-                ::lactose_reflect::Persistence::#persistence,
+                #krate::TypeRole::#role,
+                #krate::Persistence::#persistence,
                 #version,
-                ::lactose_reflect::Tracking { replicated: #replicated, extracted: #extracted },
-                ::lactose_reflect::StructInfo::new::<#name>(#rust_name, FIELDS),
-            );
+                #krate::Tracking { replicated: #replicated, extracted: #extracted },
+                #krate::StructInfo::new::<#name>(#rust_name, __FIELDS, &[#retired]),
+            ));
 
-            impl ::lactose_reflect::Reflect for #name {
-                const KEY: ::lactose_reflect::__private::ComponentKey =
-                    ::lactose_reflect::__private::ComponentKey::from_name(#key);
-                const INFO: &'static ::lactose_reflect::TypeInfo = &INFO;
+            impl #krate::Reflect for #name {
+                const KEY: #krate::__private::ComponentKey =
+                    #krate::__private::ComponentKey::from_name(#key);
+                const SCHEMA: &'static #krate::Schema<Self> = &__SCHEMA;
 
                 #[allow(unused_variables)]
-                fn visit<V: ::lactose_reflect::FieldVisitor>(&self, visitor: &mut V) {
+                fn visit<V: #krate::FieldVisitor>(&self, visitor: &mut V) {
                     #visits
                 }
 
                 #[allow(unused_variables)]
-                fn visit_references<V: ::lactose_reflect::ReferenceVisitor>(
-                    &mut self,
-                    visitor: &mut V,
-                ) {
+                fn visit_references<V: #krate::ReferenceVisitor>(&mut self, visitor: &mut V) {
                     #reference_visits
                 }
             }
 
-            impl ::lactose_reflect::#marker for #name {}
+            impl #krate::#role for #name {}
         };
     })
 }
 
 fn try_value(args: TokenStream, item: TokenStream) -> Result<TokenStream> {
-    if !args.is_empty() {
-        return Err(Error::new(args.span(), "`#[value]` takes no arguments"));
-    }
+    let target = Target::Value;
     let mut input: DeriveInput = syn::parse2(item)?;
-    let derives = check_item(&input, "a `#[value]` type")?;
+    let args = parse_args(target, args)?;
+    let mut derives = check_item(&input, target, &args)?;
+    let krate = &args.krate;
+    let bytemuck = &args.bytemuck;
     let name = input.ident.clone();
     let rust_name = name.to_string();
+    let mut before = TokenStream::new();
 
     let implementation = match &mut input.data {
         Data::Struct(data) => {
-            let fields = take_fields(&mut data.fields)?;
+            let fields = take_fields(&mut data.fields, &args.retired)?;
             reject_repr(&input)?;
-            let StructParts { layout_checks, field_infos, visits, reference_visits } =
-                struct_parts(&name, &fields, false);
+            let StructParts { layout_checks, field_infos, retired, visits, reference_visits } =
+                struct_parts(&name, &fields, &args, false);
+            before = layout_checks;
             input.attrs.push(syn::parse_quote!(#[repr(C)]));
+            let checked = checked_bit_pattern(&name, &fields, &args);
             quote! {
-                #layout_checks
+                #checked
 
-                const FIELDS: &[::lactose_reflect::FieldInfo] = &[#field_infos];
-                const LAYOUT: ::lactose_reflect::StructInfo =
-                    ::lactose_reflect::StructInfo::new::<#name>(#rust_name, FIELDS);
+                const __FIELDS: &[#krate::FieldInfo] = &[#field_infos];
+                const __LAYOUT: #krate::StructInfo =
+                    #krate::StructInfo::new::<#name>(#rust_name, __FIELDS, &[#retired]);
 
-                impl ::lactose_reflect::Field for #name {
-                    const KIND: ::lactose_reflect::FieldKind =
-                        ::lactose_reflect::FieldKind::Struct(&LAYOUT);
+                impl #krate::Field for #name {
+                    const KIND: #krate::FieldKind = #krate::FieldKind::Struct(&__LAYOUT);
+                    const NAME: &'static str = #rust_name;
 
                     #[allow(unused_variables)]
-                    fn visit<V: ::lactose_reflect::FieldVisitor>(
+                    fn visit<V: #krate::FieldVisitor>(
                         &self,
-                        id: ::lactose_reflect::__private::FieldId,
+                        id: #krate::__private::FieldId,
                         visitor: &mut V,
                     ) {
                         #visits
                     }
 
                     #[allow(unused_variables)]
-                    fn visit_references<V: ::lactose_reflect::ReferenceVisitor>(
+                    fn visit_references<V: #krate::ReferenceVisitor>(
                         &mut self,
-                        id: ::lactose_reflect::__private::FieldId,
+                        id: #krate::__private::FieldId,
                         visitor: &mut V,
                     ) {
                         #reference_visits
@@ -481,29 +663,34 @@ fn try_value(args: TokenStream, item: TokenStream) -> Result<TokenStream> {
             }
         }
         Data::Enum(data) => {
-            let variants = enum_variants(&input.attrs, &name, data)?;
+            if let Some((_, span)) = args.retired.first() {
+                return Err(Error::new(*span, "`retired` lists field IDs; an enum has none"));
+            }
+            let variants = enum_variants(&input.attrs, &name, data, krate)?;
+            // A fieldless enum's derive names no second crate path, so it is used as it is.
+            derives.extend(quote!(, #krate::bytemuck::CheckedBitPattern));
             quote! {
-                const INFO: ::lactose_reflect::EnumInfo = ::lactose_reflect::EnumInfo {
+                const __INFO: #krate::EnumInfo = #krate::EnumInfo {
                     name: #rust_name,
                     size: ::core::mem::size_of::<#name>(),
                     variants: &[#variants],
                 };
 
-                impl ::lactose_reflect::Field for #name {
-                    const KIND: ::lactose_reflect::FieldKind =
-                        ::lactose_reflect::FieldKind::Enum(&INFO);
+                impl #krate::Field for #name {
+                    const KIND: #krate::FieldKind = #krate::FieldKind::Enum(&__INFO);
+                    const NAME: &'static str = #rust_name;
 
-                    fn visit<V: ::lactose_reflect::FieldVisitor>(
+                    fn visit<V: #krate::FieldVisitor>(
                         &self,
-                        id: ::lactose_reflect::__private::FieldId,
+                        id: #krate::__private::FieldId,
                         visitor: &mut V,
                     ) {
-                        visitor.bytes(id, ::lactose_reflect::bytemuck::bytes_of(self));
+                        #krate::FieldVisitor::bytes(visitor, id, #krate::bytemuck::bytes_of(self));
                     }
 
-                    fn visit_references<V: ::lactose_reflect::ReferenceVisitor>(
+                    fn visit_references<V: #krate::ReferenceVisitor>(
                         &mut self,
-                        _: ::lactose_reflect::__private::FieldId,
+                        _: #krate::__private::FieldId,
                         _: &mut V,
                     ) {
                     }
@@ -519,8 +706,10 @@ fn try_value(args: TokenStream, item: TokenStream) -> Result<TokenStream> {
     };
 
     Ok(quote! {
+        #before
+
         #[derive(#derives)]
-        #[bytemuck(crate = "::lactose_reflect::bytemuck")]
+        #[bytemuck(crate = #bytemuck)]
         #input
 
         const _: () = {
@@ -530,7 +719,12 @@ fn try_value(args: TokenStream, item: TokenStream) -> Result<TokenStream> {
 }
 
 /// Checks a `#[value]` enum and returns one `VariantInfo` expression per variant.
-fn enum_variants(attrs: &[Attribute], name: &Ident, data: &DataEnum) -> Result<TokenStream> {
+fn enum_variants(
+    attrs: &[Attribute],
+    name: &Ident,
+    data: &DataEnum,
+    krate: &TokenStream,
+) -> Result<TokenStream> {
     let mut width = None;
     for attribute in attrs.iter().filter(|a| a.path().is_ident("repr")) {
         attribute.parse_nested_meta(|meta| {
@@ -551,6 +745,16 @@ fn enum_variants(attrs: &[Attribute], name: &Ident, data: &DataEnum) -> Result<T
 
     let mut variants = TokenStream::new();
     for variant in &data.variants {
+        if let Some(attribute) = conditional(&variant.attrs) {
+            return Err(Error::new(
+                attribute.path().span(),
+                format!(
+                    "variant `{}` cannot be conditional: a `#[cfg]` would give builds different \
+                     schemas",
+                    variant.ident
+                ),
+            ));
+        }
         if !matches!(variant.fields, Fields::Unit) {
             return Err(Error::new(
                 variant.fields.span(),
@@ -571,7 +775,7 @@ fn enum_variants(attrs: &[Attribute], name: &Ident, data: &DataEnum) -> Result<T
         let ident = &variant.ident;
         let variant_name = ident.to_string();
         variants.extend(quote! {
-            ::lactose_reflect::VariantInfo { name: #variant_name, value: #name::#ident as u32 },
+            #krate::VariantInfo { name: #variant_name, value: #name::#ident as u32 },
         });
     }
     Ok(variants)
@@ -590,11 +794,28 @@ mod tests {
         &expansion[start..]
     }
 
-    #[test]
-    fn expansion_names_only_the_reflect_crate_and_core() {
-        let expansions = [
+    /// The idents that follow a path-root `::` in `expansion`.
+    fn path_roots(expansion: &str) -> Vec<&str> {
+        let tokens: Vec<&str> = expansion.split_whitespace().collect();
+        let mut roots = Vec::new();
+        for (index, token) in tokens.iter().enumerate() {
+            // A path root is `::` that does not follow a path segment or `>`.
+            let after_segment = index > 0
+                && tokens[index - 1]
+                    .chars()
+                    .last()
+                    .is_some_and(|c| c.is_alphanumeric() || c == '_' || c == '>');
+            if *token == "::" && !after_segment {
+                roots.push(tokens[index + 1]);
+            }
+        }
+        roots
+    }
+
+    fn sample_expansions(extra: TokenStream) -> [String; 4] {
+        [
             component(
-                quote!(key = "t::a", persistent, version = 2, replicated),
+                quote!(key = "t::a", persistent, version = 2, replicated, retired = [9], #extra),
                 quote!(
                     struct A {
                         #[field(id = 1)]
@@ -606,14 +827,14 @@ mod tests {
             ),
             reflected(
                 Role::Resource,
-                quote!(key = "t::r", transient),
+                quote!(key = "t::r", transient, #extra),
                 quote!(
                     struct R(#[field(id = 1)] u64);
                 ),
             )
             .to_string(),
             value(
-                TokenStream::new(),
+                quote!(retired = [2], #extra),
                 quote!(
                     struct V {
                         #[field(id = 1)]
@@ -623,7 +844,7 @@ mod tests {
             )
             .to_string(),
             value(
-                TokenStream::new(),
+                extra,
                 quote!(
                     #[repr(u8)]
                     enum E {
@@ -632,30 +853,47 @@ mod tests {
                 ),
             )
             .to_string(),
-        ];
-        for expansion in expansions {
+        ]
+    }
+
+    #[test]
+    fn expansion_names_only_the_reflect_crate_and_core() {
+        for expansion in sample_expansions(TokenStream::new()) {
             assert!(!expansion.contains("compile_error"), "{expansion}");
-            assert!(!expansion.contains("unsafe"), "{expansion}");
-            let tokens: Vec<&str> = expansion.split_whitespace().collect();
-            let mut roots = 0;
-            for (index, token) in tokens.iter().enumerate() {
-                // A path root is `::` that does not follow a path segment or `>`.
-                let after_segment = index > 0
-                    && tokens[index - 1]
-                        .chars()
-                        .last()
-                        .is_some_and(|c| c.is_alphanumeric() || c == '_' || c == '>');
-                if *token == "::" && !after_segment {
-                    roots += 1;
-                    let root = tokens[index + 1];
-                    assert!(
-                        matches!(root, "lactose_reflect" | "core"),
-                        "`::{root}` in {expansion}"
-                    );
-                }
+            let roots = path_roots(&expansion);
+            assert!(roots.contains(&"lactose_reflect"));
+            for root in roots {
+                assert!(matches!(root, "lactose_reflect" | "core"), "`::{root}` in {expansion}");
             }
-            assert!(roots > 0);
             assert!(expansion.contains("\"::lactose_reflect::bytemuck\""));
+        }
+    }
+
+    #[test]
+    fn the_only_unsafe_in_an_expansion_is_the_checked_bit_pattern_impl_of_a_struct() {
+        let [component, resource, value_struct, value_enum] = sample_expansions(TokenStream::new());
+        for expansion in [component, resource, value_struct] {
+            assert_eq!(expansion.matches("unsafe").count(), 1, "{expansion}");
+            assert!(
+                expansion.contains(
+                    "unsafe impl :: lactose_reflect :: bytemuck :: CheckedBitPattern for"
+                ),
+                "{expansion}"
+            );
+        }
+        assert!(!value_enum.contains("unsafe"), "{value_enum}");
+    }
+
+    #[test]
+    fn crate_argument_replaces_every_reflect_path() {
+        for expansion in sample_expansions(quote!(crate = "::lactose_ecs::reflect")) {
+            assert!(!expansion.contains("compile_error"), "{expansion}");
+            // The padding advice names `lactose_reflect::Padding` in prose; no path does.
+            assert!(!expansion.contains(":: lactose_reflect"), "{expansion}");
+            for root in path_roots(&expansion) {
+                assert!(matches!(root, "lactose_ecs" | "core"), "`::{root}` in {expansion}");
+            }
+            assert!(expansion.contains("\"::lactose_ecs::reflect::bytemuck\""));
         }
     }
 
@@ -686,6 +924,83 @@ mod tests {
             ),
         );
         assert!(error_of(&out).contains("field ID 3 is already used by field `x`"), "{out}");
+    }
+
+    #[test]
+    fn retired_ids_cannot_be_reused_or_repeated() {
+        let item = quote!(
+            struct A {
+                #[field(id = 3)]
+                x: u32,
+            }
+        );
+        let out = component(quote!(key = "t::a", persistent, retired = [1, 3]), item.clone());
+        assert!(error_of(&out).contains("field `x` uses the retired field ID 3"), "{out}");
+        let out = value(quote!(retired = [3]), item.clone()).to_string();
+        assert!(error_of(&out).contains("field `x` uses the retired field ID 3"), "{out}");
+        let out = component(quote!(key = "t::a", persistent, retired = [1, 1]), item);
+        assert!(error_of(&out).contains("field ID 1 is retired twice"), "{out}");
+        let out = value(
+            quote!(retired = [1]),
+            quote!(
+                #[repr(u8)]
+                enum E {
+                    A = 0,
+                }
+            ),
+        )
+        .to_string();
+        assert!(error_of(&out).contains("an enum has none"), "{out}");
+    }
+
+    #[test]
+    fn conditional_fields_variants_and_attributes_are_rejected() {
+        let out = component(
+            quote!(key = "t::a", persistent),
+            quote!(
+                struct A {
+                    #[field(id = 1)]
+                    x: u32,
+                    #[cfg(feature = "big")]
+                    #[field(id = 2)]
+                    y: u32,
+                }
+            ),
+        );
+        assert!(error_of(&out).contains("field `y` cannot be conditional"), "{out}");
+        let out = value(
+            TokenStream::new(),
+            quote!(
+                struct V(
+                    #[cfg_attr(test, allow(dead_code))]
+                    #[field(id = 1)]
+                    u32,
+                );
+            ),
+        )
+        .to_string();
+        assert!(error_of(&out).contains("field `0` cannot be conditional"), "{out}");
+        let out = value(
+            TokenStream::new(),
+            quote!(
+                #[repr(u8)]
+                enum E {
+                    A = 0,
+                    #[cfg(test)]
+                    B = 1,
+                }
+            ),
+        )
+        .to_string();
+        assert!(error_of(&out).contains("variant `B` cannot be conditional"), "{out}");
+        let out = component(
+            quote!(key = "t::a", persistent),
+            quote!(
+                #[cfg_attr(all(), repr(align(8)))]
+                struct A;
+            ),
+        );
+        assert!(error_of(&out).contains("`#[cfg_attr]` cannot be applied to a component"), "{out}");
     }
 
     #[test]
@@ -736,6 +1051,25 @@ mod tests {
             ),
         );
         assert!(error_of(&out).contains("the key cannot be empty"), "{out}");
+    }
+
+    #[test]
+    fn unknown_arguments_are_rejected_per_attribute() {
+        let out = component(
+            quote!(key = "t::a", persistent, saved),
+            quote!(
+                struct A;
+            ),
+        );
+        assert!(error_of(&out).contains("unknown argument `saved`"), "{out}");
+        let out = value(
+            quote!(persistent),
+            quote!(
+                struct A;
+            ),
+        )
+        .to_string();
+        assert!(error_of(&out).contains("unknown argument `persistent`"), "{out}");
     }
 
     #[test]
@@ -826,7 +1160,16 @@ mod tests {
                 struct A;
             ),
         );
-        assert_eq!(out.matches("Clone").count(), 1, "{out}");
-        assert_eq!(out.matches("Copy").count(), 1, "{out}");
+        let added = "# [derive (:: lactose_reflect :: bytemuck :: NoUninit)]";
+        assert!(out.starts_with(added), "{out}");
+        let out = component(
+            quote!(key = "t::a", persistent),
+            quote!(
+                struct A;
+            ),
+        );
+        let added = "# [derive (:: core :: clone :: Clone , :: core :: marker :: Copy , \
+                     :: lactose_reflect :: bytemuck :: NoUninit)]";
+        assert!(out.starts_with(added), "{out}");
     }
 }

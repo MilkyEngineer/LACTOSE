@@ -38,6 +38,8 @@ comments rely on. The crate's tests run under Miri.
 - `PlainArray<T, N>` and `PlainArrayBits<T, N>` are `repr(transparent)` over `[T; N]` and
   `[T::Bits; N]`. An array has no padding of its own, so each is plain data exactly when its
   element is, and the array is valid exactly when every element is.
+- That `PlainArrayBits<T, N>` has the layout of `PlainArray<T, N>` relies on `T::Bits` having
+  the size and alignment of `T`, which is `T`'s own `CheckedBitPattern` contract.
 
 ## `thread_class::fp`
 

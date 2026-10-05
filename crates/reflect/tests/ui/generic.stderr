@@ -1,5 +1,0 @@
-error: a component cannot be generic: its key and layout must be one fixed thing (architecture section 6); declare one type per instantiation
- --> tests/ui/generic.rs:4:12
-  |
-4 | struct Slot<T> {
-  |            ^

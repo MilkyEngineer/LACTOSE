@@ -36,13 +36,17 @@ impl Registry {
 
     /// Registers `T`. Registering the same type again is a no-op.
     ///
-    /// The description is checked against the type instead of trusted: it fails if another
-    /// type holds the same key (two names with one hash, or one name declared twice), if a
-    /// field ID is missing or repeated, if the fields do not tile the type exactly, if the
-    /// description's key, size or alignment contradict `T`, or if a transient type is not
+    /// It fails if another type holds the same key (two names with one hash, or one name
+    /// declared twice), if `T::KEY` is not the hash of the described name, if the described
+    /// fields do not tile `T`'s size exactly, if a field ID is missing, repeated or retired,
+    /// if a field's size is one its kind does not allow, or if a transient type is not
     /// valid when zeroed.
+    ///
+    /// Those checks catch an inconsistent description. They cannot tell whether a
+    /// hand-written description names the right type for each field, so what may be relied
+    /// on afterwards is [`TypeInfo::validate`], whose proof does not use the field list.
     pub fn register<T: Reflect>(&mut self) -> Result<()> {
-        let info = T::INFO;
+        let info = T::SCHEMA.info();
         let name = info.name();
         let type_id = TypeId::of::<T>();
         let invalid = |message: String| Err(Error::new(ErrorKind::InvalidData, message));
@@ -66,15 +70,6 @@ impl Registry {
             return invalid(format!("`{name}`: the type's key is not the hash of its name"));
         }
         let layout = info.layout();
-        if layout.size() != size_of::<T>() || layout.align() != align_of::<T>() {
-            return invalid(format!(
-                "`{name}`: described as {} bytes aligned to {}, but the type is {} aligned to {}",
-                layout.size(),
-                layout.align(),
-                size_of::<T>(),
-                align_of::<T>()
-            ));
-        }
         layout.check()?;
         if info.persistence() == Persistence::Transient
             && info.validate(&vec![0; layout.size()]).is_err()
@@ -135,8 +130,13 @@ impl Registry {
 
     /// The schema as text, in [`Registry::iter`] order: one line per type with its role,
     /// name, key, version, policy and size, then one indented line per field with its ID
-    /// (`-` for padding), name, kind and size. The text is a function of the registered
-    /// types alone, so two builds can be compared by diffing it.
+    /// (`-` for padding), name, type tag and size, then a `retired` line listing the IDs of
+    /// deleted fields in ascending order. Arrays, nested structs and enums are written out
+    /// structurally, down to the tags, IDs and discriminants inside them.
+    ///
+    /// The text is a function of the registered types alone, so two revisions can be
+    /// compared by diffing it. The rule "every ID in the old dump is either still present
+    /// with the same type tag or listed as retired" is decidable from two dumps.
     #[must_use]
     pub fn dump(&self) -> String {
         let mut out = String::new();

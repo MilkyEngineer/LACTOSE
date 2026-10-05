@@ -5,9 +5,11 @@
 //! `offset_of!` in the macro expansion. Nothing is computed by macro arithmetic.
 
 use core::fmt::Write;
+use core::marker::PhantomData;
+use core::ops::Deref;
 
 use bytemuck::{CheckedBitPattern, NoUninit};
-use lactose_core::{ComponentKey, Error, ErrorKind, FieldId, Result};
+use lactose_core::{ComponentKey, EntityRef, Error, ErrorKind, FieldId, Result};
 
 use crate::Reflect;
 use crate::field::{Field, FieldKind, PaddingField};
@@ -55,6 +57,7 @@ fn invalid(message: String) -> Error {
 pub struct FieldInfo {
     id: Option<FieldId>,
     name: &'static str,
+    type_name: &'static str,
     offset: usize,
     size: usize,
     kind: FieldKind,
@@ -68,6 +71,7 @@ impl FieldInfo {
         Self {
             id: Some(id),
             name,
+            type_name: T::NAME,
             offset,
             size: size_of::<T>(),
             kind: T::KIND,
@@ -81,6 +85,7 @@ impl FieldInfo {
         Self {
             id: None,
             name,
+            type_name: "padding",
             offset,
             size: size_of::<P>(),
             kind: FieldKind::Padding,
@@ -98,6 +103,12 @@ impl FieldInfo {
     #[must_use]
     pub const fn name(&self) -> &'static str {
         self.name
+    }
+
+    /// The stable tag of the field's type, its [`Field::NAME`].
+    #[must_use]
+    pub const fn type_name(&self) -> &'static str {
+        self.type_name
     }
 
     /// Byte offset within the struct.
@@ -136,18 +147,27 @@ pub struct StructInfo {
     size: usize,
     align: usize,
     fields: &'static [FieldInfo],
+    retired: &'static [FieldId],
     valid: fn(&[u8]) -> bool,
 }
 
 impl StructInfo {
-    /// The layout of `T`, whose Rust name is `name` and whose fields, in declaration order,
-    /// are `fields`.
+    /// The layout of `T`, whose Rust name is `name`, whose fields in declaration order are
+    /// `fields`, and whose deleted fields had the IDs in `retired`.
     #[must_use]
     pub const fn new<T: NoUninit + CheckedBitPattern>(
         name: &'static str,
         fields: &'static [FieldInfo],
+        retired: &'static [FieldId],
     ) -> Self {
-        Self { name, size: size_of::<T>(), align: align_of::<T>(), fields, valid: is_valid::<T> }
+        Self {
+            name,
+            size: size_of::<T>(),
+            align: align_of::<T>(),
+            fields,
+            retired,
+            valid: is_valid::<T>,
+        }
     }
 
     /// The struct's Rust name.
@@ -174,9 +194,22 @@ impl StructInfo {
         self.fields
     }
 
+    /// The IDs of fields this struct once had. They are never given to a new field.
+    #[must_use]
+    pub const fn retired(&self) -> &'static [FieldId] {
+        self.retired
+    }
+
+    /// The field declared with `id`.
+    pub fn field(&self, id: FieldId) -> Result<&'static FieldInfo> {
+        self.fields.iter().find(|field| field.id == Some(id)).ok_or_else(|| {
+            Error::new(ErrorKind::NotFound, format!("`{}` has no field ID {}", self.name, id.0))
+        })
+    }
+
     /// Checks that the description is self-consistent: fields tile the struct exactly, every
-    /// non-padding field has an ID and no ID repeats, and nested layouts agree with the
-    /// sizes of the fields that hold them.
+    /// non-padding field has an ID, no ID repeats or is retired, every field has a size its
+    /// kind allows, and nested layouts pass the same checks.
     pub(crate) fn check(&self) -> Result<()> {
         let name = self.name;
         let mut end = 0;
@@ -209,14 +242,18 @@ impl StructInfo {
                             id.0, first.name, field.name
                         )));
                     }
+                    if self.retired.contains(&id) {
+                        return Err(invalid(format!(
+                            "`{name}`: field `{}` uses the retired field ID {}",
+                            field.name, id.0
+                        )));
+                    }
                 }
             }
-            if let Some(expected) = kind_size(&field.kind)
-                && expected != field.size
-            {
+            if !kind_fits(&field.kind, field.size) {
                 return Err(invalid(format!(
-                    "`{name}`: field `{}` is {} bytes but its kind describes {expected}",
-                    field.name, field.size
+                    "`{name}`: field `{}` of type `{}` is {} bytes, which its kind does not allow",
+                    field.name, field.type_name, field.size
                 )));
             }
             check_nested(&field.kind)?;
@@ -233,13 +270,12 @@ impl StructInfo {
                 self.size, self.align
             )));
         }
+        for (index, id) in self.retired.iter().enumerate() {
+            if self.retired[..index].contains(id) {
+                return Err(invalid(format!("`{name}`: field ID {} is retired twice", id.0)));
+            }
+        }
         Ok(())
-    }
-
-    fn field(&self, id: FieldId) -> Result<&'static FieldInfo> {
-        self.fields.iter().find(|field| field.id == Some(id)).ok_or_else(|| {
-            Error::new(ErrorKind::NotFound, format!("`{}` has no field ID {}", self.name, id.0))
-        })
     }
 
     fn check_len(&self, value: &[u8]) -> Result<()> {
@@ -251,14 +287,22 @@ impl StructInfo {
     }
 }
 
-/// The size a kind implies, where the kind alone determines it.
-fn kind_size(kind: &FieldKind) -> Option<usize> {
+/// Whether a field of `size` bytes can hold `kind`.
+fn kind_fits(kind: &FieldKind, size: usize) -> bool {
     match kind {
-        FieldKind::Bool => Some(1),
-        FieldKind::Enum(info) => Some(info.size),
-        FieldKind::Struct(info) => Some(info.size),
-        FieldKind::Array { element, len } => kind_size(element)?.checked_mul(*len),
-        _ => None,
+        FieldKind::Bool => size == 1,
+        FieldKind::Unsigned | FieldKind::Signed => matches!(size, 1 | 2 | 4 | 8),
+        FieldKind::Float | FieldKind::Scalar => matches!(size, 4 | 8),
+        FieldKind::EntityRef => size == size_of::<EntityRef>(),
+        // The raw identity of `AssetReference` is 64 bits.
+        FieldKind::AssetRef => size == 8,
+        FieldKind::Enum(info) => size == info.size && matches!(size, 1 | 2 | 4),
+        FieldKind::Struct(info) => size == info.size,
+        FieldKind::Array { element, len, .. } => match size.checked_div(*len) {
+            Some(element_size) => size == element_size * len && kind_fits(element, element_size),
+            None => size == 0,
+        },
+        FieldKind::Padding => true,
     }
 }
 
@@ -282,7 +326,7 @@ fn zero_padding_of_kind(kind: &FieldKind, bytes: &mut [u8]) {
     match kind {
         FieldKind::Padding => bytes.fill(0),
         FieldKind::Struct(info) => zero_padding(info.fields, bytes),
-        FieldKind::Array { element, len } => {
+        FieldKind::Array { element, len, .. } => {
             let element_size = bytes.len().checked_div(*len).unwrap_or(0);
             if element_size > 0 {
                 for bytes in bytes.chunks_exact_mut(element_size) {
@@ -295,6 +339,9 @@ fn zero_padding_of_kind(kind: &FieldKind, bytes: &mut [u8]) {
 }
 
 /// The description of a component or resource type.
+///
+/// Code reaches one through [`Reflect::SCHEMA`] or the [`Registry`](crate::Registry), and in
+/// both cases it is held by a [`Schema<T>`], which is what its validation rests on.
 #[derive(Clone, Copy, Debug)]
 pub struct TypeInfo {
     name: &'static str,
@@ -383,11 +430,12 @@ impl TypeInfo {
     }
 
     /// Overwrites field `id` within `value` with `bytes`, after checking that `bytes` is a
-    /// valid value of the field's type. `value` is unchanged on error.
+    /// valid value of the field type the description names. `value` is unchanged on error.
     ///
-    /// A struct is valid exactly when each of its fields is, so writing valid fields into a
-    /// valid value keeps it valid, and a decoder that starts from arbitrary bytes finishes
-    /// with [`TypeInfo::validate`].
+    /// This is a decoding step, not a proof. The check itself is the field type's own
+    /// `CheckedBitPattern`, but which type sits at which offset is a statement of the
+    /// `Reflect` impl, which only the attribute macros are known to get right. A decoder
+    /// finishes with [`TypeInfo::validate`], and only that result may be relied on.
     pub fn write_field(&self, value: &mut [u8], id: FieldId, bytes: &[u8]) -> Result<()> {
         self.layout.check_len(value)?;
         let field = self.layout.field(id)?;
@@ -413,8 +461,14 @@ impl TypeInfo {
         Ok(())
     }
 
-    /// Checks that `value` is the bytes of one valid value of this type. Non-zero padding is
-    /// invalid.
+    /// Checks that `value` is the bytes of one valid value of the described type. Non-zero
+    /// padding is invalid.
+    ///
+    /// `Ok` proves that `value` has the size of the type `T` whose [`Schema<T>`] holds this
+    /// description and that `T`'s own `CheckedBitPattern` accepts it. The proof rests on
+    /// that impl (normally the `bytemuck` derive) and on [`Schema::new`], which takes the
+    /// size and the check from `T`. It does not depend on the field list, on any [`Field`]
+    /// impl's kind or name, or on anything else an impl states.
     pub fn validate(&self, value: &[u8]) -> Result<()> {
         self.layout.check_len(value)?;
         if (self.layout.valid)(value) {
@@ -425,6 +479,9 @@ impl TypeInfo {
     }
 
     /// Zeroes every padding byte of `value`, including padding inside nested structs.
+    ///
+    /// Where the padding lies is read from the description, so this proves nothing about
+    /// `value`; run [`TypeInfo::validate`] afterwards.
     pub fn zero_padding(&self, value: &mut [u8]) -> Result<()> {
         self.layout.check_len(value)?;
         zero_padding(self.layout.fields, value);
@@ -435,7 +492,7 @@ impl TypeInfo {
         invalid(format!("field `{}` of `{}` lies outside the value", field.name, self.name))
     }
 
-    /// Appends this type's schema to `out`, one line for the type and one per field.
+    /// Appends this type's schema to `out`; see [`Registry::dump`](crate::Registry::dump).
     pub(crate) fn dump(&self, out: &mut String) {
         let role = match self.role {
             TypeRole::Component => "component",
@@ -463,6 +520,11 @@ impl TypeInfo {
             dump_field(field, out);
             out.push('\n');
         }
+        if !self.layout.retired.is_empty() {
+            out.push_str("  ");
+            dump_retired(self.layout.retired, out);
+            out.push('\n');
+        }
     }
 }
 
@@ -474,47 +536,97 @@ fn dump_field(field: &FieldInfo, out: &mut String) {
         None => out.push_str("- "),
     }
     let _ = write!(out, "{}: ", field.name);
-    dump_kind(&field.kind, field.size, out);
+    dump_type(&field.kind, field.type_name, out);
     let _ = write!(out, " size={}", field.size);
 }
 
-fn dump_kind(kind: &FieldKind, size: usize, out: &mut String) {
-    let _ = match kind {
-        FieldKind::Bool => write!(out, "bool"),
-        FieldKind::Unsigned => write!(out, "u{}", size * 8),
-        FieldKind::Signed => write!(out, "i{}", size * 8),
-        FieldKind::Float => write!(out, "f{}", size * 8),
-        FieldKind::Scalar => write!(out, "scalar{}", size * 8),
-        FieldKind::EntityRef => write!(out, "entity_ref"),
-        FieldKind::AssetRef => write!(out, "asset_ref"),
-        FieldKind::Padding => write!(out, "padding"),
+fn dump_retired(retired: &[FieldId], out: &mut String) {
+    out.push_str("retired");
+    let mut ids: Vec<u16> = retired.iter().map(|id| id.0).collect();
+    ids.sort_unstable();
+    for id in ids {
+        let _ = write!(out, " {id}");
+    }
+}
+
+/// Composite types are written out structurally; every other type is its tag.
+fn dump_type(kind: &FieldKind, type_name: &str, out: &mut String) {
+    match kind {
         FieldKind::Enum(info) => {
             let _ = write!(out, "enum {} {{", info.name);
             for (index, variant) in info.variants.iter().enumerate() {
                 let separator = if index == 0 { " " } else { ", " };
                 let _ = write!(out, "{separator}{} = {}", variant.name, variant.value);
             }
-            write!(out, " }}")
+            out.push_str(" }");
         }
         FieldKind::Struct(info) => {
             let _ = write!(out, "struct {} {{", info.name);
-            for (index, field) in info.fields.iter().enumerate() {
-                out.push_str(if index == 0 { " " } else { ", " });
+            let mut separator = " ";
+            for field in info.fields {
+                out.push_str(separator);
                 dump_field(field, out);
+                separator = ", ";
             }
-            write!(out, " }}")
+            if !info.retired.is_empty() {
+                out.push_str(separator);
+                dump_retired(info.retired, out);
+            }
+            out.push_str(" }");
         }
-        FieldKind::Array { element, len } => {
+        FieldKind::Array { element, element_name, len } => {
             out.push('[');
-            dump_kind(element, size.checked_div(*len).unwrap_or(0), out);
-            write!(out, "; {len}]")
+            dump_type(element, element_name, out);
+            let _ = write!(out, "; {len}]");
         }
-    };
+        _ => out.push_str(type_name),
+    }
+}
+
+/// The [`TypeInfo`] of `T`, tied to `T` by construction.
+///
+/// [`Reflect::SCHEMA`] has this type, and [`Schema::new`] is the only way to make one, so
+/// the size, alignment and whole-value validity check inside the description are always
+/// `T`'s own, whatever the rest of the description says. It dereferences to the
+/// [`TypeInfo`].
+#[derive(Debug)]
+pub struct Schema<T> {
+    info: TypeInfo,
+    owner: PhantomData<fn() -> T>,
+}
+
+impl<T: NoUninit + CheckedBitPattern> Schema<T> {
+    /// The schema of `T` from its description. The size, alignment and validity check of
+    /// `info`'s layout are replaced by those of `T`.
+    #[must_use]
+    pub const fn new(mut info: TypeInfo) -> Self {
+        info.layout.size = size_of::<T>();
+        info.layout.align = align_of::<T>();
+        info.layout.valid = is_valid::<T>;
+        Self { info, owner: PhantomData }
+    }
+}
+
+impl<T> Schema<T> {
+    /// The description, as the registry stores it.
+    #[must_use]
+    pub const fn info(&'static self) -> &'static TypeInfo {
+        &self.info
+    }
+}
+
+impl<T> Deref for Schema<T> {
+    type Target = TypeInfo;
+
+    fn deref(&self) -> &TypeInfo {
+        &self.info
+    }
 }
 
 /// Reads one value of `T` from `bytes`, which need not be aligned. This is the validation
 /// that save load and network receive run; an invalid bit pattern is an error, never a panic.
 pub fn decode<T: Reflect>(bytes: &[u8]) -> Result<T> {
-    bytemuck::checked::try_pod_read_unaligned(bytes)
-        .map_err(|_| invalid(format!("{} bytes are not a valid `{}`", bytes.len(), T::INFO.name())))
+    bytemuck::checked::try_pod_read_unaligned(bytes).map_err(|_| {
+        invalid(format!("{} bytes are not a valid `{}`", bytes.len(), T::SCHEMA.name()))
+    })
 }

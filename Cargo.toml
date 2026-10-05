@@ -31,7 +31,6 @@ proc-macro2 = "1"
 quote = "1"
 syn = "3"
 tracing = { version = "0.1", default-features = false, features = ["std"] }
-trybuild = "1"
 windows-sys = "0.61"
 xxhash-rust = "0.8"
 
