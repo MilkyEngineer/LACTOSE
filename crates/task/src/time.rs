@@ -7,6 +7,8 @@ use std::collections::BTreeMap;
 use std::sync::{Mutex, Weak};
 use std::time::{Duration, Instant};
 
+use lactose_core::{Error, ErrorKind, Result};
+
 use crate::lock;
 use crate::pool::Shared;
 
@@ -125,21 +127,23 @@ impl Timers {
         !state.pending.is_empty()
     }
 
-    /// Drops every pending timer without waking it.
-    pub(crate) fn clear(&self) {
+    /// Wakes every pending timer early. Called at shutdown, after the flag is set, so
+    /// each [`Sleep`] that is polled again resolves to `Cancelled`.
+    pub(crate) fn cancel_all(&self) {
         let pending = {
             let mut state = lock(&self.state);
             let pending = core::mem::take(&mut state.pending);
             self.publish_earliest(&state);
             pending
         };
-        drop(pending);
+        for waker in pending.into_values() {
+            waker.wake();
+        }
     }
 }
 
-/// Resolves at a deadline. See [`crate::Executor::sleep_until`].
-///
-/// If the executor is shut down first, this never resolves.
+/// Resolves at a deadline, or to an error of kind `Cancelled` if the executor shuts down
+/// first. See [`crate::Executor::sleep_until`].
 #[must_use = "futures do nothing unless awaited"]
 pub struct Sleep {
     shared: Weak<Shared>,
@@ -155,21 +159,36 @@ impl Sleep {
 }
 
 impl Future for Sleep {
-    type Output = ();
+    type Output = Result<()>;
 
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
-        let Some(shared) = self.shared.upgrade() else { return Poll::Pending };
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<()>> {
+        let cancelled = || {
+            Poll::Ready(Err(Error::new(
+                ErrorKind::Cancelled,
+                "the executor shut down before the deadline",
+            )))
+        };
+        let Some(shared) = self.shared.upgrade() else { return cancelled() };
         let deadline = self.deadline;
+        if shared.is_shut_down() {
+            return cancelled();
+        }
         if Instant::now() >= deadline {
             if let Some(id) = self.id.take() {
                 shared.timers.remove(deadline, id);
             }
-            return Poll::Ready(());
+            return Poll::Ready(Ok(()));
         }
+        let rearm = shared.timers.register(deadline, &mut self.id, cx.waker());
         if shared.is_shut_down() {
-            return Poll::Pending;
+            // Registered first, checked second: either shutdown's sweep wakes this timer,
+            // or this sees the flag.
+            if let Some(id) = self.id.take() {
+                shared.timers.remove(deadline, id);
+            }
+            return cancelled();
         }
-        match shared.timers.register(deadline, &mut self.id, cx.waker()) {
+        match rearm {
             Rearm::Nobody => {}
             Rearm::Keeper(worker) => shared.frame().wake(worker),
             Rearm::AnySleeper => shared.frame().notify_one(),

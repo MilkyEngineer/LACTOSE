@@ -36,7 +36,7 @@ fn every_unit_runs_exactly_once_and_finalize_follows_them() {
     };
     let mut graph = graph(vec![node], &[]);
     for run in 1..=3 {
-        graph = executor.block_on(executor.run_graph(graph));
+        graph = executor.block_on(executor.run_graph(graph)).unwrap();
         assert_eq!(finalized.load(Ordering::Relaxed), run);
         assert!(hits.iter().all(|hit| hit.swap(0, Ordering::Relaxed) == 1));
     }
@@ -62,7 +62,7 @@ fn finalize_runs_exactly_once_for_a_node_without_units() {
         vec![node("first", 1), node("empty", 0), node("also empty", 0), node("last", 1)],
         &[(0, 1), (1, 2), (2, 3)],
     );
-    executor.block_on(executor.run_graph(chain));
+    executor.block_on(executor.run_graph(chain)).unwrap();
     assert_eq!(
         *order.lock().unwrap(),
         [
@@ -77,7 +77,7 @@ fn finalize_runs_exactly_once_for_a_node_without_units() {
 
     // A graph that is nothing but an empty node still completes.
     order.lock().unwrap().clear();
-    executor.block_on(executor.run_graph(graph(vec![node("only", 0)], &[])));
+    executor.block_on(executor.run_graph(graph(vec![node("only", 0)], &[]))).unwrap();
     assert_eq!(*order.lock().unwrap(), [("only", "finalize")]);
     executor.shutdown();
 }
@@ -130,7 +130,7 @@ fn dependents_are_released_only_after_every_dependency_finalized() {
     }
     let mut graph = graph(nodes, &edges);
     for _ in 0..rounds {
-        graph = executor.block_on(executor.run_graph(graph));
+        graph = executor.block_on(executor.run_graph(graph)).unwrap();
         assert!(finalized.iter().all(|done| done.swap(false, Ordering::AcqRel)));
     }
     executor.shutdown();
@@ -154,7 +154,7 @@ fn units_is_read_at_release_and_may_depend_on_earlier_nodes() {
             })
             .build()
     };
-    executor.block_on(executor.run_graph(graph(vec![producer, consumer], &[(0, 1)])));
+    executor.block_on(executor.run_graph(graph(vec![producer, consumer], &[(0, 1)]))).unwrap();
     assert_eq!(consumed.load(Ordering::Relaxed), 7);
     executor.shutdown();
 }
@@ -162,7 +162,8 @@ fn units_is_read_at_release_and_may_depend_on_earlier_nodes() {
 #[test]
 fn an_empty_graph_resolves_and_a_dropped_run_still_finishes() {
     let executor = executor(2, 1);
-    let empty = executor.block_on(executor.run_graph(GraphBuilder::new().build().unwrap()));
+    let empty =
+        executor.block_on(executor.run_graph(GraphBuilder::new().build().unwrap())).unwrap();
     assert!(empty.is_empty());
 
     let finished = Arc::new(AtomicBool::new(false));
@@ -210,13 +211,13 @@ fn concurrent_runs_of_different_graphs_do_not_interfere() {
             let (runner, mut graph) = (executor.clone(), make(units));
             executor.spawn(lactose_task::WorkerClass::FrameCritical, async move {
                 for _ in 0..rounds {
-                    graph = runner.run_graph(graph).await;
+                    graph = runner.run_graph(graph).await.unwrap();
                 }
             })
         })
         .collect();
     for task in tasks {
-        executor.block_on(task);
+        executor.block_on(task).unwrap();
     }
     assert_eq!(total.load(Ordering::Relaxed), (5 + 17 + 33) * 3 * rounds as usize);
     executor.shutdown();
@@ -258,7 +259,7 @@ fn builder_rejects_unknown_nodes_and_cycles() {
             })
             .build()
     };
-    executor.block_on(executor.run_graph(graph(vec![node(), counted], &[(0, 1), (0, 1)])));
+    executor.block_on(executor.run_graph(graph(vec![node(), counted], &[(0, 1), (0, 1)]))).unwrap();
     assert_eq!(ran.load(Ordering::Relaxed), 1);
     executor.shutdown();
 }

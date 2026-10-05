@@ -115,7 +115,7 @@ fn steal_split_scope_and_wake_paths_hold_under_contention() {
             let mut graph = frame_graph(sized(24, 4) + index, sized(96, 7), &runs);
             executor.spawn(WorkerClass::FrameCritical, async move {
                 loop {
-                    graph = runner.run_graph(graph).await;
+                    graph = runner.run_graph(graph).await.unwrap();
                     if stop.load(Ordering::Acquire) {
                         break;
                     }
@@ -143,9 +143,9 @@ fn steal_split_scope_and_wake_paths_hold_under_contention() {
                         })
                         .collect();
                     for task in burst {
-                        task.await;
+                        task.await.unwrap();
                     }
-                    runner.sleep_until(Instant::now() + Duration::from_micros(200)).await;
+                    runner.sleep_until(Instant::now() + Duration::from_micros(200)).await.unwrap();
                     if stop.load(Ordering::Acquire) {
                         break;
                     }
@@ -166,7 +166,7 @@ fn steal_split_scope_and_wake_paths_hold_under_contention() {
     }
     stop.store(true, Ordering::Release);
     for task in loops.into_iter().chain(chatter) {
-        executor.block_on(task);
+        executor.block_on(task).unwrap();
     }
     assert!(runs.load(Ordering::Relaxed) >= u64::from(sized(3, 2)));
     assert!(pings.load(Ordering::Relaxed) > 0);

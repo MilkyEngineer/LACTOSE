@@ -54,14 +54,21 @@ impl Latch {
         self.pending().load(Ordering::Acquire) == 0
     }
 
-    /// Parks the calling thread, which must be the opener, until no work is outstanding.
+    /// Parks the calling thread, which must be the opener, until something unparks it. The
+    /// opener calls this in a loop that checks [`Latch::is_set`] first.
     ///
-    /// A park token left by an unrelated unpark only costs one more trip round the loop, and
-    /// a token set between the check and the park makes the park return at once, so no
+    /// A park token left by an unrelated unpark only costs one more trip round that loop,
+    /// and a token set between the check and the park makes the park return at once, so no
     /// wake-up is lost.
+    pub(crate) fn park(&self) {
+        park();
+    }
+
+    /// The opener's wait, reduced to what the latch contributes: check, park, repeat.
+    #[cfg(all(test, feature = "loom"))]
     pub(crate) fn wait(&self) {
         while !self.is_set() {
-            park();
+            self.park();
         }
     }
 

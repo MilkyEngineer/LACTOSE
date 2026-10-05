@@ -9,7 +9,11 @@ publish.workspace = true
 [features]
 # Switches the internal `sync` shim to loom's model-checked primitives so the scope latch and
 # the sleep-and-wake protocol can be explored exhaustively. Run the models with
-# `cargo test -p lactose-task --features loom`; never with `RUSTFLAGS="--cfg loom"`.
+# `cargo test -p lactose-task --features loom --release`; never with `RUSTFLAGS="--cfg loom"`.
+#
+# This feature is for that one command. No other crate may enable it, and nothing may be
+# built with `--all-features`: features unify across a build, so every executor in it would
+# be switched to loom primitives, which panic outside a loom model.
 loom = ["dep:loom"]
 
 [dependencies]
@@ -26,6 +30,9 @@ windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_System_
 
 [dev-dependencies]
 zstd.workspace = true
+
+[target.'cfg(unix)'.dev-dependencies]
+libc.workspace = true
 
 [[bench]]
 name = "whisk"

@@ -5,7 +5,9 @@
 mod common;
 
 use core::future::pending;
-use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use core::pin::Pin;
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use core::task::{Context, Poll, Waker};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -23,14 +25,14 @@ fn thread_name() -> String {
 fn tasks_return_their_output_and_chain() {
     let executor = executor(2, 1);
     let inner = executor.spawn(WorkerClass::Background, async { 20 });
-    let outer = executor.spawn(WorkerClass::FrameCritical, async move { inner.await + 1 });
-    assert_eq!(executor.block_on(outer), 21);
+    let outer = executor.spawn(WorkerClass::FrameCritical, async move { inner.await.unwrap() + 1 });
+    assert_eq!(executor.block_on(outer).unwrap(), 21);
     // `block_on` drives a plain future too, and tasks spawned from inside it.
     let spawner = executor.clone();
     let value = executor.block_on(async move {
         let task = spawner.spawn(WorkerClass::FrameCritical, async { "spawned inside" });
         yield_now().await;
-        task.await
+        task.await.unwrap()
     });
     assert_eq!(value, "spawned inside");
     executor.shutdown();
@@ -49,7 +51,7 @@ fn each_class_runs_on_its_own_threads() {
                 })
             })
             .collect();
-        tasks.into_iter().map(|task| executor.block_on(task)).collect::<Vec<_>>()
+        tasks.into_iter().map(|task| executor.block_on(task).unwrap()).collect::<Vec<_>>()
     };
     // The frame-critical workers are idle while the background tasks queue up, and still
     // never take one.
@@ -67,7 +69,7 @@ fn each_class_runs_on_its_own_threads() {
             .run(move |_, _| names.lock().unwrap().push(thread_name()))
             .build()
     };
-    executor.block_on(executor.run_graph(graph(vec![node], &[])));
+    executor.block_on(executor.run_graph(graph(vec![node], &[]))).unwrap();
     assert!(names.lock().unwrap().iter().all(|name| name.starts_with("whisk-frame-")));
     executor.shutdown();
 }
@@ -98,9 +100,9 @@ fn yield_now_reschedules_behind_other_ready_tasks() {
     };
     queued.store(true, Ordering::Release);
     executor.block_on(async {
-        gate.await;
-        first.await;
-        second.await;
+        gate.await.unwrap();
+        first.await.unwrap();
+        second.await.unwrap();
     });
     assert_eq!(*order.lock().unwrap(), ["first, before yield", "second", "first, after yield"]);
     executor.shutdown();
@@ -159,7 +161,7 @@ fn dropping_a_task_cancels_it_and_detaching_does_not() {
             .detach();
     }
     release.store(true, Ordering::Release);
-    executor.block_on(blocker);
+    executor.block_on(blocker).unwrap();
     wait_for(&detached_ran);
     assert!(!ran.load(Ordering::Acquire), "a task cancelled while queued must not run");
     executor.shutdown();
@@ -180,9 +182,9 @@ fn a_task_keeps_its_spawners_allocation_tag_on_every_poll() {
         })
     };
     let untagged = executor.spawn(WorkerClass::Background, async { AllocTag::current() });
-    assert!(executor.block_on(task).iter().all(|&tag| tag == AllocTag::Net));
+    assert!(executor.block_on(task).unwrap().iter().all(|&tag| tag == AllocTag::Net));
     // The tag does not leak to the next task the worker polls.
-    assert_eq!(executor.block_on(untagged), AllocTag::Untagged);
+    assert_eq!(executor.block_on(untagged).unwrap(), AllocTag::Untagged);
     executor.shutdown();
 }
 
@@ -193,10 +195,10 @@ fn sleep_until_resolves_at_its_deadline() {
 
     // From the thread inside `block_on`, with every worker asleep.
     let start = Instant::now();
-    executor.block_on(executor.sleep_until(start + delay));
+    executor.block_on(executor.sleep_until(start + delay)).unwrap();
     assert!(start.elapsed() >= delay);
     // A deadline in the past resolves at once.
-    executor.block_on(executor.sleep_until(start));
+    executor.block_on(executor.sleep_until(start)).unwrap();
 
     // From tasks, with deadlines registered out of order; a later timer does not hold an
     // earlier one back, and a dropped timer does not fire.
@@ -207,7 +209,7 @@ fn sleep_until_resolves_at_its_deadline() {
         .map(|rank| {
             let (sleeper, order) = (executor.clone(), order.clone());
             executor.spawn(WorkerClass::FrameCritical, async move {
-                sleeper.sleep_until(start + delay * rank).await;
+                sleeper.sleep_until(start + delay * rank).await.unwrap();
                 order.lock().unwrap().push(rank);
                 start.elapsed()
             })
@@ -216,13 +218,13 @@ fn sleep_until_resolves_at_its_deadline() {
     let abandoned = {
         let sleeper = executor.clone();
         executor.spawn(WorkerClass::FrameCritical, async move {
-            sleeper.sleep_until(start + Duration::from_secs(3600)).await;
+            let _ = sleeper.sleep_until(start + Duration::from_secs(3600)).await;
             unreachable!("this task is cancelled before its deadline");
         })
     };
     drop(abandoned);
     for (task, rank) in tasks.into_iter().zip([3u32, 1, 2]) {
-        assert!(executor.block_on(task) >= delay * rank);
+        assert!(executor.block_on(task).unwrap() >= delay * rank);
     }
     // Under Miri the simulated clock can pass every deadline before the first poll.
     assert!(cfg!(miri) || *order.lock().unwrap() == [1, 2, 3]);
@@ -238,12 +240,12 @@ fn timers_fire_while_every_worker_is_busy_and_then_idle() {
     let delay = Duration::from_millis(10);
     let sleeper = executor.clone();
     let timer = executor.spawn(WorkerClass::Background, async move {
-        sleeper.sleep_until(start + delay).await;
+        sleeper.sleep_until(start + delay).await.unwrap();
         start.elapsed()
     });
     let busy = Node::new("tasks::busy").run(move |_, _| common::spin_for(delay * 2)).build();
-    executor.block_on(executor.run_graph(graph(vec![busy], &[])));
-    assert!(executor.block_on(timer) >= delay);
+    executor.block_on(executor.run_graph(graph(vec![busy], &[]))).unwrap();
+    assert!(executor.block_on(timer).unwrap() >= delay);
     executor.shutdown();
 }
 
@@ -294,7 +296,7 @@ fn shutdown_with_work_outstanding_finishes_running_jobs_and_drops_the_rest() {
         let (sleeper, token) = (executor.clone(), token.clone());
         executor.spawn(WorkerClass::Background, async move {
             let _held = token;
-            sleeper.sleep_until(Instant::now() + Duration::from_secs(3600)).await;
+            let _ = sleeper.sleep_until(Instant::now() + Duration::from_secs(3600)).await;
         })
     };
     let forever = {
@@ -445,4 +447,283 @@ fn a_failed_thread_creation_fails_the_build_and_stops_the_started_workers() {
     assert_eq!(error.kind(), ErrorKind::ResourceExhausted);
     // `build` joined the two workers it had started before returning.
     assert_eq!(platform.specs.lock().unwrap().len(), 2);
+}
+
+/// Whatever was waiting on work that shutdown cut off gets an answer. Before, a thread in
+/// `block_on` on a cancelled task parked for ever.
+#[test]
+fn futures_cut_off_by_shutdown_resolve_to_cancelled() {
+    let executor = executor(1, 1);
+    let release = Arc::new(AtomicBool::new(false));
+    let running = Arc::new(AtomicBool::new(false));
+
+    // A graph run that cannot finish: its second node waits behind one that is still
+    // running when shutdown begins.
+    let first = {
+        let (release, running) = (release.clone(), running.clone());
+        Node::new("tasks::held")
+            .run(move |_, _| {
+                running.store(true, Ordering::Release);
+                wait_for(&release);
+            })
+            .build()
+    };
+    let second = Node::new("tasks::cut").build();
+    let run = executor.run_graph(graph(vec![first, second], &[(0, 1)]));
+    let task = executor.spawn(WorkerClass::Background, pending::<u32>());
+    let sleep = executor.sleep_until(Instant::now() + Duration::from_secs(3600));
+
+    // Three threads blocked on the three kinds of future, as `main` or a tool would be.
+    let waiters = {
+        let (a, b, c) = (executor.clone(), executor.clone(), executor.clone());
+        [
+            std::thread::spawn(move || a.block_on(run).err().map(|error| error.kind())),
+            std::thread::spawn(move || b.block_on(task).err().map(|error| error.kind())),
+            std::thread::spawn(move || c.block_on(sleep).err().map(|error| error.kind())),
+        ]
+    };
+    wait_for(&running);
+    let stopper = {
+        let executor = executor.clone();
+        std::thread::spawn(move || executor.shutdown())
+    };
+    // Let shutdown begin before the running job is released, so the second node is cut.
+    // Until it has begun, a trivial task completes; from then on it is cancelled at once.
+    let begun = Instant::now();
+    while executor.block_on(executor.spawn(WorkerClass::Background, async {})).is_ok() {
+        assert!(begun.elapsed() < Duration::from_secs(60), "shutdown never began");
+        std::thread::yield_now();
+    }
+    release.store(true, Ordering::Release);
+    stopper.join().unwrap();
+    for waiter in waiters {
+        assert_eq!(waiter.join().unwrap(), Some(ErrorKind::Cancelled));
+    }
+
+    // What is started after shutdown is cancelled at once, not left pending.
+    let late_run = executor.run_graph(graph(vec![Node::new("tasks::late").build()], &[]));
+    let late_run = executor.block_on(late_run).err().map(|error| error.kind());
+    assert_eq!(late_run, Some(ErrorKind::Cancelled));
+    let late_task = executor.spawn(WorkerClass::FrameCritical, async { 1 });
+    assert_eq!(executor.block_on(late_task).unwrap_err().kind(), ErrorKind::Cancelled);
+    let late_sleep = executor.sleep_until(Instant::now() + Duration::from_secs(3600));
+    assert_eq!(executor.block_on(late_sleep).unwrap_err().kind(), ErrorKind::Cancelled);
+}
+
+/// A platform that counts the threads it has running.
+struct LiveThreads {
+    live: Arc<AtomicUsize>,
+}
+
+impl Platform for LiveThreads {
+    fn topology(&self) -> CoreTopology {
+        CoreTopology { performance: 2, efficiency: 1 }
+    }
+
+    fn spawn_thread(
+        &self,
+        spec: ThreadSpec,
+        body: Box<dyn FnOnce() + Send + 'static>,
+    ) -> Result<ThreadHandle> {
+        let live = self.live.clone();
+        live.fetch_add(1, Ordering::AcqRel);
+        StdPlatform.spawn_thread(
+            spec,
+            Box::new(move || {
+                body();
+                live.fetch_sub(1, Ordering::AcqRel);
+            }),
+        )
+    }
+}
+
+#[test]
+fn dropping_the_last_handle_shuts_the_pool_down() {
+    let live = Arc::new(AtomicUsize::new(0));
+    let platform = Arc::new(LiveThreads { live: live.clone() });
+    let executor = Executor::builder().platform(platform).build().unwrap();
+    assert_eq!(live.load(Ordering::Acquire), 3);
+
+    // A suspended task that owns something, and a clone of the handle.
+    let token = Arc::new(());
+    let started = Arc::new(AtomicBool::new(false));
+    {
+        let (token, started) = (token.clone(), started.clone());
+        executor
+            .spawn(WorkerClass::Background, async move {
+                let _held = token;
+                started.store(true, Ordering::Release);
+                pending::<()>().await;
+            })
+            .detach();
+    }
+    wait_for(&started);
+    let clone = executor.clone();
+    drop(executor);
+    assert_eq!(live.load(Ordering::Acquire), 3, "a handle is still alive");
+    assert_eq!(clone.frame_worker_count(), 2);
+
+    // The last handle, dropped off the pool's threads: the workers are joined and the
+    // task's future is dropped, as `shutdown` would have done.
+    drop(clone);
+    assert_eq!(live.load(Ordering::Acquire), 0, "the workers outlived every handle");
+    assert_eq!(Arc::strong_count(&token), 1);
+}
+
+#[test]
+fn a_handle_held_by_a_task_keeps_the_pool_until_the_task_ends() {
+    let live = Arc::new(AtomicUsize::new(0));
+    let platform = Arc::new(LiveThreads { live: live.clone() });
+    let executor = Executor::builder().platform(platform).build().unwrap();
+    let release = Arc::new(AtomicBool::new(false));
+    let done = Arc::new(AtomicBool::new(false));
+    {
+        let (handle, release, done) = (executor.clone(), release.clone(), done.clone());
+        executor
+            .spawn(WorkerClass::FrameCritical, async move {
+                while !release.load(Ordering::Acquire) {
+                    yield_now().await;
+                }
+                // Still usable: the pool is alive because this task holds a handle.
+                let inner = handle.spawn(WorkerClass::Background, async { 5 });
+                assert_eq!(inner.await.unwrap(), 5);
+                done.store(true, Ordering::Release);
+                // The last handle goes here, on a worker thread, which cannot join itself:
+                // the workers are told to exit and do so on their own.
+            })
+            .detach();
+    }
+    drop(executor);
+    assert_eq!(live.load(Ordering::Acquire), 3);
+    release.store(true, Ordering::Release);
+    wait_for(&done);
+    let start = Instant::now();
+    while live.load(Ordering::Acquire) != 0 {
+        assert!(start.elapsed() < Duration::from_secs(60), "the workers never exited");
+        std::thread::yield_now();
+    }
+}
+
+/// Notes the allocation tag current when it is dropped.
+struct TagAtDrop(Arc<Mutex<Option<AllocTag>>>);
+
+impl Drop for TagAtDrop {
+    fn drop(&mut self) {
+        *self.0.lock().unwrap() = Some(AllocTag::current());
+    }
+}
+
+/// A future that parks its waker where the test can reach it and never completes.
+struct ParkWaker {
+    slot: Arc<Mutex<Option<Waker>>>,
+    _dropped: TagAtDrop,
+}
+
+impl Future for ParkWaker {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        *self.slot.lock().unwrap() = Some(cx.waker().clone());
+        Poll::Pending
+    }
+}
+
+/// A detached task nobody can wake any more is gone: its future is dropped, under the tag
+/// it was spawned with, when its last waker is.
+#[test]
+fn a_detached_task_whose_last_waker_is_dropped_is_dropped_under_its_tag() {
+    let executor = executor(1, 1);
+    let slot = Arc::new(Mutex::new(None));
+    let dropped_under = Arc::new(Mutex::new(None));
+    {
+        let _asset = AllocTag::Asset.scope();
+        let future = ParkWaker { slot: slot.clone(), _dropped: TagAtDrop(dropped_under.clone()) };
+        executor.spawn(WorkerClass::Background, future).detach();
+    }
+    let start = Instant::now();
+    let waker = loop {
+        if let Some(waker) = slot.lock().unwrap().take() {
+            break waker;
+        }
+        assert!(start.elapsed() < Duration::from_secs(60), "the task never ran");
+        std::thread::yield_now();
+    };
+    // The worker may still be on its way out of the poll, holding the task for a moment.
+    drop(waker);
+    let start = Instant::now();
+    while dropped_under.lock().unwrap().is_none() {
+        assert!(start.elapsed() < Duration::from_secs(60), "the orphaned future was kept");
+        std::thread::yield_now();
+    }
+    assert_eq!(*dropped_under.lock().unwrap(), Some(AllocTag::Asset));
+    executor.shutdown();
+}
+
+/// A future that hands its waker to another thread and completes after three polls.
+struct Ping {
+    slot: Arc<Mutex<Option<Waker>>>,
+    left: u32,
+    dropped: Arc<AtomicUsize>,
+}
+
+impl Future for Ping {
+    type Output = u32;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<u32> {
+        if self.left == 0 {
+            return Poll::Ready(7);
+        }
+        self.left -= 1;
+        *self.slot.lock().unwrap() = Some(cx.waker().clone());
+        Poll::Pending
+    }
+}
+
+impl Drop for Ping {
+    fn drop(&mut self) {
+        self.dropped.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
+/// Wakes, cancellation, detaching and completion racing from several threads: every future
+/// is dropped exactly once and nothing is polled after it is gone (Miri checks the latter).
+#[test]
+fn wake_cancel_and_complete_race() {
+    let rounds = sized(3000, 20) as usize;
+    let executor = executor(2, 2);
+    let dropped = Arc::new(AtomicUsize::new(0));
+    for round in 0..rounds {
+        let slot = Arc::new(Mutex::new(None::<Waker>));
+        let class =
+            if round % 2 == 0 { WorkerClass::Background } else { WorkerClass::FrameCritical };
+        let ping = Ping { slot: slot.clone(), left: 3, dropped: dropped.clone() };
+        let task = executor.spawn(class, ping);
+        let waker_thread = {
+            let slot = slot.clone();
+            std::thread::spawn(move || {
+                for _ in 0..6 {
+                    if let Some(waker) = slot.lock().unwrap().take() {
+                        waker.wake_by_ref();
+                        waker.wake();
+                    }
+                    std::thread::yield_now();
+                }
+            })
+        };
+        match round % 3 {
+            0 => drop(task),
+            1 => task.detach(),
+            _ => {
+                std::thread::yield_now();
+                drop(task);
+            }
+        }
+        waker_thread.join().unwrap();
+        // A stale waker, after the task may have completed or been cancelled.
+        if let Some(waker) = slot.lock().unwrap().take() {
+            waker.wake();
+        }
+    }
+    executor.shutdown();
+    assert_eq!(dropped.load(Ordering::Acquire), rounds, "every future is dropped exactly once");
 }

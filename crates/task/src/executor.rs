@@ -22,11 +22,26 @@ use crate::time::Sleep;
 
 /// A handle to the worker pools. Cheap to clone; every clone refers to the same pools.
 ///
-/// The pools run until [`Executor::shutdown`]. Dropping every handle without calling it
-/// leaves the worker threads parked for the rest of the process.
+/// The pools run until [`Executor::shutdown`], or until the last handle is dropped, which
+/// shuts them down the same way. A handle held by a task keeps the pools alive like any
+/// other.
 #[derive(Clone)]
 pub struct Executor {
+    owner: Arc<Owner>,
+}
+
+/// What the user's handles share. The workers hold the pool state itself, not this, so the
+/// count of this `Arc` is the count of user handles.
+struct Owner {
     shared: Arc<Shared>,
+}
+
+impl Drop for Owner {
+    fn drop(&mut self) {
+        // The last handle may go on a worker, when a task that held it finishes or is
+        // dropped. A worker cannot wait for itself, so there the threads are only told.
+        self.shared.shut_down(!on_worker_thread());
+    }
 }
 
 impl Executor {
@@ -52,7 +67,7 @@ impl Executor {
         F: Future + Send + 'static,
         F::Output: Send + 'static,
     {
-        task::spawn(&self.shared, class, future)
+        task::spawn(&self.owner.shared, class, future)
     }
 
     /// Runs every node of `graph` on the frame-critical workers.
@@ -65,13 +80,13 @@ impl Executor {
     /// future does not cancel the run: nodes own their data, the run finishes on its own,
     /// and the graph is then dropped.
     pub fn run_graph(&self, graph: Graph) -> GraphRun {
-        graph::start(&self.shared, graph)
+        graph::start(&self.owner.shared, graph)
     }
 
     /// The number of frame-critical workers.
     #[must_use]
     pub fn frame_worker_count(&self) -> u32 {
-        self.shared.frame().workers() as u32
+        self.owner.shared.frame().workers() as u32
     }
 
     /// One more than the largest value [`crate::JobContext::slot`] can return.
@@ -86,12 +101,12 @@ impl Executor {
     /// so a console platform controls every engine thread.
     #[must_use]
     pub fn platform(&self) -> &Arc<dyn Platform> {
-        &self.shared.platform
+        &self.owner.shared.platform
     }
 
     /// A future that resolves at `deadline`. The tick loop paces itself with this.
     pub fn sleep_until(&self, deadline: Instant) -> Sleep {
-        Sleep::new(Arc::downgrade(&self.shared), deadline)
+        Sleep::new(Arc::downgrade(&self.owner.shared), deadline)
     }
 
     /// Drives `future` to completion on the calling thread while the workers run whatever it
@@ -140,17 +155,18 @@ impl Executor {
     /// rather than draining it.
     #[must_use]
     pub fn execution_log(&self) -> Option<ExecutionLog> {
-        self.shared.chaos.as_ref().and_then(Chaos::log)
+        self.owner.shared.chaos.as_ref().and_then(Chaos::log)
     }
 
     /// Stops accepting work, lets running jobs finish, cancels unfinished tasks and joins
     /// every worker. Returns once all threads have exited.
     ///
-    /// Queued graph work is dropped, so a [`GraphRun`] in flight never resolves, and neither
-    /// does the [`Task`] of a cancelled task. Other clones of the handle stay valid and
-    /// inert: what they spawn is cancelled at once. Must not be called from a worker thread.
+    /// Queued graph work is dropped. A [`GraphRun`], [`Task`] or [`Sleep`] that was cut off
+    /// resolves to an error of kind `Cancelled`. Other clones of the handle stay valid and
+    /// inert: what they start is cancelled at once. Must not be called from a worker thread.
     pub fn shutdown(self) {
-        self.shared.shut_down();
+        debug_assert!(!on_worker_thread(), "shutdown called on a worker would wait for itself");
+        self.owner.shared.shut_down(true);
     }
 }
 
@@ -293,6 +309,6 @@ impl ExecutorBuilder {
             // A worker that is gone already cannot be told; shutdown joins it all the same.
             let _ = sender.send(shared.clone());
         }
-        Ok(Executor { shared })
+        Ok(Executor { owner: Arc::new(Owner { shared }) })
     }
 }

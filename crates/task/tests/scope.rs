@@ -57,7 +57,7 @@ fn children_borrow_from_the_openers_stack() {
             })
             .build()
     };
-    executor.block_on(executor.run_graph(graph(vec![node], &[])));
+    executor.block_on(executor.run_graph(graph(vec![node], &[]))).unwrap();
     assert_eq!(checked.load(Ordering::Relaxed), sized(8, 2));
     executor.shutdown();
 }
@@ -90,7 +90,7 @@ fn a_scope_returns_its_bodys_value_and_drops_range_closures() {
             })
             .build()
     };
-    executor.block_on(executor.run_graph(graph(vec![node], &[])));
+    executor.block_on(executor.run_graph(graph(vec![node], &[]))).unwrap();
     executor.shutdown();
     assert_eq!(Arc::strong_count(&token), 1);
 }
@@ -139,7 +139,7 @@ fn the_opener_runs_its_children_after_thieves_drain_the_deque_below_them() {
             })
             .build()
     };
-    executor.block_on(executor.run_graph(graph(vec![node], &[])));
+    executor.block_on(executor.run_graph(graph(vec![node], &[]))).unwrap();
     assert!(scope_closed.load(Ordering::Acquire));
     executor.shutdown();
 }
@@ -196,7 +196,9 @@ fn the_opener_never_runs_a_foreign_job_while_waiting() {
     };
     // Both nodes are released together, so each is on the deque while the other runs.
     let root = Node::new("scope::root").build();
-    executor.block_on(executor.run_graph(graph(vec![root, opener, unrelated], &[(0, 1), (0, 2)])));
+    executor
+        .block_on(executor.run_graph(graph(vec![root, opener, unrelated], &[(0, 1), (0, 2)])))
+        .unwrap();
     assert_eq!(ran.load(Ordering::Relaxed), units);
     assert_eq!(unrelated_ran.load(Ordering::Relaxed), units);
     executor.shutdown();
@@ -250,7 +252,7 @@ fn a_slot_is_held_by_one_running_job_or_child_at_a_time() {
             })
             .build()
     };
-    executor.block_on(executor.run_graph(graph(vec![node(), node(), node()], &[])));
+    executor.block_on(executor.run_graph(graph(vec![node(), node(), node()], &[]))).unwrap();
     assert_eq!(jobs.load(Ordering::Relaxed), 3 * sized(400, 12));
     executor.shutdown();
 }
@@ -289,7 +291,7 @@ fn job_and_child_scratch_are_separate_and_reset_between_uses() {
             assert_eq!(*ctx.scratch().alloc(7u8), 7);
         })
         .build();
-    executor.block_on(executor.run_graph(graph(vec![node], &[])));
+    executor.block_on(executor.run_graph(graph(vec![node], &[]))).unwrap();
     executor.shutdown();
 }
 
@@ -317,7 +319,7 @@ fn children_inherit_the_openers_allocation_tag() {
             .finalize(|_| assert_eq!(AllocTag::current(), AllocTag::Untagged))
             .build()
     };
-    executor.block_on(executor.run_graph(graph(vec![node], &[])));
+    executor.block_on(executor.run_graph(graph(vec![node], &[]))).unwrap();
     assert_eq!(tagged.load(Ordering::Relaxed), sized(16, 3) * sized(24, 4));
     executor.shutdown();
 }
@@ -345,7 +347,91 @@ fn finalize_may_open_a_scope() {
             })
             .build()
     };
-    executor.block_on(executor.run_graph(graph(vec![node], &[])));
+    executor.block_on(executor.run_graph(graph(vec![node], &[]))).unwrap();
     assert_eq!(merged.load(Ordering::Acquire), 10);
     executor.shutdown();
+}
+
+/// Runs `f` on a helper thread and fails the test if it does not finish in time, so a
+/// deadlock shows as a failure here and not as a test-runner timeout.
+fn must_finish(what: &str, f: impl FnOnce() + Send + 'static) {
+    let (done, wait) = std::sync::mpsc::channel();
+    let runner = std::thread::spawn(move || {
+        f();
+        let _ = done.send(());
+    });
+    let limit = Duration::from_secs(if cfg!(miri) { 600 } else { 20 });
+    assert!(wait.recv_timeout(limit).is_ok(), "{what} did not finish: the opener is stuck");
+    runner.join().unwrap();
+}
+
+/// Work submitted from inside a scope must not hide the scope's children. A graph started
+/// by the scope body, or by a child the opener runs itself, used to land on the opener's
+/// deque above children that had not run yet; the opener then met a foreign entry first,
+/// concluded none of its children were left, and parked with them underneath. With one
+/// worker nobody else could ever take them.
+#[test]
+fn work_submitted_inside_a_scope_does_not_strand_its_children() {
+    for workers in [1, 2, sized(4, 2)] {
+        let executor = executor(workers, 1);
+        let rounds = sized(200, 3);
+        let children_ran = Arc::new(AtomicU32::new(0));
+        let inner_ran = Arc::new(AtomicU32::new(0));
+        let inner_node = {
+            let inner_ran = inner_ran.clone();
+            move || {
+                let inner_ran = inner_ran.clone();
+                Node::new("scope::inner")
+                    .units(3)
+                    .run(move |range, _| {
+                        inner_ran.fetch_add(range.len() as u32, Ordering::Relaxed);
+                    })
+                    .build()
+            }
+        };
+        let opener = || {
+            let (handle, children_ran, inner_node) =
+                (executor.clone(), children_ran.clone(), inner_node.clone());
+            Node::new("scope::submits")
+                .units(2)
+                .run(move |_, ctx| {
+                    let (handle, children_ran, inner_node) = (&handle, &children_ran, &inner_node);
+                    ctx.scope(|scope| {
+                        scope.fork(move |_| {
+                            children_ran.fetch_add(1, Ordering::Relaxed);
+                        });
+                        // From the scope body: legal, and dropping the run does not
+                        // cancel it.
+                        drop(handle.run_graph(graph(vec![inner_node()], &[])));
+                        scope.fork_range(0..4, move |range, _| {
+                            // From a child, which the opener may be running itself.
+                            if range.start == 0 {
+                                drop(handle.run_graph(graph(vec![inner_node()], &[])));
+                            }
+                            children_ran.fetch_add(range.len() as u32, Ordering::Relaxed);
+                        });
+                        // A task woken from inside the scope goes to the injector too.
+                        handle.spawn(lactose_task::WorkerClass::FrameCritical, async {}).detach();
+                    });
+                })
+                .build()
+        };
+        let runner = executor.clone();
+        let mut outer = graph(vec![opener(), opener()], &[]);
+        must_finish("a scope whose body starts a graph", move || {
+            for _ in 0..rounds {
+                outer = runner.block_on(runner.run_graph(outer)).unwrap();
+            }
+        });
+        // Two openers of two units each per round, five children per scope, and two inner
+        // graphs of three units per scope.
+        assert_eq!(children_ran.load(Ordering::Relaxed), rounds * 4 * 5);
+        let expected_inner = rounds * 4 * 2 * 3;
+        let start = std::time::Instant::now();
+        while inner_ran.load(Ordering::Relaxed) != expected_inner {
+            assert!(start.elapsed() < Duration::from_secs(60), "an inner graph was lost");
+            std::thread::yield_now();
+        }
+        executor.shutdown();
+    }
 }

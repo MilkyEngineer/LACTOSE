@@ -4,12 +4,18 @@
 //! pays one branch on a local per job.
 //!
 //! A recorded log lists every graph job and scope child in the order they started, with the
-//! worker that ran each. Replay does not schedule: it holds released work in one pool and
-//! hands each worker exactly the job the log names next, in log order. That is slow and
-//! serialised on a mutex, which is fine for reproducing one failure.
+//! worker that ran each. Recording must not disturb the interleavings chaos exists to
+//! explore, so a job start costs one increment of a shared sequence counter and a push onto
+//! the recording worker's own list; the lists are merged by sequence number when the log is
+//! read. The log grows by 28 bytes per job for as long as the executor lives.
+//!
+//! Replay does not schedule: it holds released work in one pool and hands each worker
+//! exactly the job the log names next, in log order. That is slow and serialised on a
+//! mutex, which is fine for reproducing one failure.
 
 use core::ops::Range;
 use core::ptr::NonNull;
+use core::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use lactose_core::{Error, ErrorKind, Result};
@@ -193,23 +199,30 @@ pub(crate) enum Wake {
     Anyone,
 }
 
+/// The job starts one worker has noted, with their positions.
+type Journal = Mutex<Vec<(u64, LogRecord)>>;
+
 /// The executor-wide chaos state.
 pub(crate) struct Chaos {
     pub(crate) config: ChaosConfig,
     workers: u32,
+    /// The number of jobs started so far, which is the position the next one gets.
+    started: AtomicU64,
+    /// The job starts each frame-critical worker has seen, with their positions, if
+    /// recording. A worker's list is locked by that worker and by a reader of the log.
+    recorded: Option<Box<[Journal]>>,
     state: Mutex<State>,
     /// The log being replayed; empty when not replaying.
     script: Vec<LogRecord>,
     pub(crate) replaying: bool,
 }
 
+/// The replay pool.
 struct State {
-    /// The job starts so far, if recording.
-    recorded: Option<Vec<LogRecord>>,
-    /// The number of jobs started so far, which is the position the next one gets.
-    started: u64,
-    /// Released work nobody has taken yet. Replay only.
+    /// Released work nobody has taken yet.
     pool: Vec<Entry>,
+    /// Jobs handed out and not yet reported finished.
+    in_flight: u32,
     /// The next script record to hand out. At `script.len()`, replay is in free mode: the
     /// log is exhausted (or abandoned at shutdown) and any worker takes any pooled work.
     cursor: usize,
@@ -228,12 +241,9 @@ impl Chaos {
         Ok(Self {
             config,
             workers,
-            state: Mutex::new(State {
-                recorded: config.record.then(Vec::new),
-                started: 0,
-                pool: Vec::new(),
-                cursor: 0,
-            }),
+            started: AtomicU64::new(0),
+            recorded: config.record.then(|| (0..workers).map(|_| Mutex::default()).collect()),
+            state: Mutex::new(State { pool: Vec::new(), in_flight: 0, cursor: 0 }),
             script,
             replaying: replay.is_some(),
         })
@@ -243,19 +253,30 @@ impl Chaos {
         self.config.record
     }
 
-    /// Notes a job start outside replay and returns its position.
+    /// Gives a starting job its position and notes it if recording. In replay the caller
+    /// holds the pool's lock, which is what makes positions follow the script.
     pub(crate) fn record(&self, record: LogRecord) -> u64 {
-        let mut state = lock(&self.state);
-        let position = state.started;
-        state.started += 1;
-        if let Some(recorded) = &mut state.recorded {
-            recorded.push(record);
+        let position = self.started.fetch_add(1, Ordering::Relaxed);
+        if let Some(recorded) = &self.recorded {
+            lock(&recorded[record.worker as usize]).push((position, record));
         }
         position
     }
 
     pub(crate) fn log(&self) -> Option<ExecutionLog> {
-        lock(&self.state).recorded.as_ref().map(|records| encode(self.workers, records))
+        let recorded = self.recorded.as_ref()?;
+        let mut records: Vec<(u64, LogRecord)> =
+            recorded.iter().flat_map(|worker| lock(worker).clone()).collect();
+        records.sort_unstable_by_key(|&(position, _)| position);
+        // A job that has its position but has not been noted yet leaves a gap; the log
+        // ends before the first one, so it is always a prefix of the full history.
+        let complete = records
+            .iter()
+            .zip(0u64..)
+            .take_while(|((position, _), expected)| position == expected)
+            .map(|((_, record), _)| record.clone())
+            .collect::<Vec<_>>();
+        Some(encode(self.workers, &complete))
     }
 
     /// Adds released work to the replay pool.
@@ -317,13 +338,46 @@ impl Chaos {
             }
         };
         let entry = carve(&mut state.pool, at, units);
-        let position = state.started;
-        state.started += 1;
-        if let Some(recorded) = &mut state.recorded {
-            recorded.push(record);
-        }
+        state.in_flight += 1;
+        let position = self.record(record);
         let wake = self.next_wake(&state);
         (Some((entry, position)), wake)
+    }
+
+    /// Reports that a job handed out by [`Chaos::take`] has returned.
+    pub(crate) fn finished(&self) {
+        lock(&self.state).in_flight -= 1;
+    }
+
+    /// Whether the replay can no longer follow its script: work is pooled, nothing is
+    /// running that could release more, and the job the script names next is not there. A
+    /// faithful replay is never in this state for longer than it takes a worker to wake,
+    /// because in the recording an idle worker took pooled work at once. Returns the
+    /// script position it is stuck at.
+    pub(crate) fn stalled(&self) -> Option<usize> {
+        let state = lock(&self.state);
+        let next = self.script.get(state.cursor)?;
+        let stuck =
+            state.in_flight == 0 && !state.pool.is_empty() && find(&state.pool, next).is_none();
+        stuck.then_some(state.cursor)
+    }
+
+    /// What to say when [`Chaos::stalled`] has held for too long.
+    pub(crate) fn stall_report(&self) -> String {
+        let state = lock(&self.state);
+        let pooled: Vec<LogRecord> =
+            state.pool.iter().take(8).map(|entry| describe_whole(entry, 0)).collect();
+        format!(
+            "the execution log cannot be replayed by this program: record {} of {} is {:?}, \
+             but no such job is available, nothing is running that could release it, and {} \
+             other entries are waiting (first: {:?}). The log was recorded from a different \
+             program, or the program started its graph runs in a different order.",
+            state.cursor,
+            self.script.len(),
+            self.script.get(state.cursor),
+            state.pool.len(),
+            pooled,
+        )
     }
 
     /// Drops pooled graph work, which will never run. Children stay: each has an opener
@@ -382,7 +436,14 @@ fn find(pool: &[Entry], record: &LogRecord) -> Option<usize> {
 
 /// The record for taking the first unit of a pooled entry in free mode.
 fn describe(entry: &Entry, worker: u32) -> LogRecord {
-    let first = |units: &Range<u32>| units.start..units.end.min(units.start.saturating_add(1));
+    let mut record = describe_whole(entry, worker);
+    record.units.end = record.units.end.min(record.units.start.saturating_add(1));
+    record
+}
+
+/// The record that would take a pooled entry whole.
+fn describe_whole(entry: &Entry, worker: u32) -> LogRecord {
+    let first = |units: &Range<u32>| units.clone();
     match entry {
         Entry::Range { run, node, units, .. } => LogRecord {
             worker,

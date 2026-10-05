@@ -74,8 +74,12 @@ impl<'job> JobContext<'job> {
                 env: PhantomData,
                 opener_only: PhantomData,
             };
+            // From here until the wait is over, this worker's deque takes nothing but this
+            // scope's children (`Shared::submit_range`).
+            self.local.scope_open.set(true);
             let result = f(&scope);
             scope.wait(self.child_scratch);
+            self.local.scope_open.set(false);
             scope.drop_range_jobs();
             self.forked = scope.forked.get();
             result
@@ -295,52 +299,85 @@ impl<'scope> Scope<'scope, '_> {
 
     /// Runs this scope's children until none is left on this worker, then waits for the
     /// ones other workers took.
+    ///
+    /// The opener finds its children by popping: while the scope is open nothing else is
+    /// pushed onto its deque, so they are the topmost entries, and the first entry with
+    /// another tag (older work, from before the scope opened) means none is left here.
     fn wait(&self, child_scratch: &mut Arena) {
         let local = self.local;
+        let shared = &*local.shared;
+        let pool = local.pool();
         let own = NonNull::from(&self.core);
-        match local.shared.replay() {
-            None => {
-                // Children were pushed after everything else on this deque, so they come
-                // off first. The first entry with another tag means none of ours is left
-                // here: it goes back, and whatever remains of the scope is with thieves.
-                while let Some(entry) = local.deque.pop() {
-                    match entry {
-                        Entry::Child { scope, job, units } if scope == own => {
-                            run_child(local, scope, job, units, child_scratch, true);
-                        }
-                        foreign => {
-                            // It was off the deque for a moment; a worker that looked
-                            // then may have gone to sleep.
-                            local.push(foreign);
-                            break;
-                        }
+        let latch = &self.core.latch;
+
+        if let Some(replay) = shared.replay() {
+            // The log decides when this worker runs each of its children.
+            while !latch.is_set() {
+                let (taken, wake) = replay.take(local.index, Filter::Scope(own));
+                shared.replay_wake(wake);
+                match taken {
+                    Some((Entry::Child { scope, job, units }, _)) => {
+                        run_child(local, scope, job, units, child_scratch);
+                        replay.finished();
                     }
-                }
-                if spin_until(LATCH_SPIN, || self.core.latch.is_set()) {
-                    return;
+                    Some(_) => unreachable!("the filter admits only this scope's children"),
+                    None => latch.park(),
                 }
             }
-            Some(replay) => {
-                // The log decides when this worker runs each of its children.
-                while !self.core.latch.is_set() {
-                    let (taken, wake) = replay.take(local.index, Filter::Scope(own));
-                    local.shared.replay_wake(wake);
-                    match taken {
-                        Some((Entry::Child { scope, job, units }, _)) => {
-                            run_child(local, scope, job, units, child_scratch, true);
-                        }
-                        Some(_) => unreachable!("the filter admits only this scope's children"),
-                        None if self.core.latch.is_set() => {}
-                        None => std::thread::park(),
+            return;
+        }
+
+        let mut spun = false;
+        loop {
+            // A `block_in_place` may want this worker parked like any other: then its
+            // children stay on the deque for the reserved workers. `run_child` puts the
+            // rest of a range back under the same condition.
+            while !pool.over_limit() || shared.is_shut_down() {
+                match local.deque.pop() {
+                    Some(Entry::Child { scope, job, units }) if scope == own => {
+                        run_child(local, scope, job, units, child_scratch);
                     }
+                    Some(older) => {
+                        // It was off the deque for a moment; a worker that looked then
+                        // may have gone to sleep.
+                        local.push(older);
+                        break;
+                    }
+                    None => break,
                 }
+            }
+            if latch.is_set() {
                 return;
             }
+            if !core::mem::replace(&mut spun, true) && spin_until(LATCH_SPIN, || latch.is_set()) {
+                return;
+            }
+
+            // Park without the permit: a parked worker runs nothing and must not use up a
+            // `block_in_place` reservation.
+            pool.release_to_park();
+            loop {
+                if latch.is_set() {
+                    pool.retake();
+                    return;
+                }
+                // Woken by the last child, by a gate opening, or at shutdown.
+                latch.park();
+                if latch.is_set() {
+                    pool.retake();
+                    return;
+                }
+                if pool.try_acquire() {
+                    // Children may be back on this deque, or the gate may have opened.
+                    break;
+                }
+                if shared.is_shut_down() {
+                    // Nobody else will run what is left on this deque.
+                    pool.retake();
+                    break;
+                }
+            }
         }
-        let pool = local.pool();
-        let suspended = pool.suspend_permit();
-        self.core.latch.wait();
-        pool.resume_permit(suspended);
     }
 
     /// Drops the closures of this scope's range jobs. Every child has finished.
@@ -359,16 +396,14 @@ impl<'scope> Scope<'scope, '_> {
     }
 }
 
-/// Runs `units` of a scope child on this worker, then counts them down on the scope's latch.
-/// `inline` says the worker is the opener, waiting on the scope; otherwise it took the
-/// entry from a deque.
+/// Runs `units` of a scope child on this worker, which is the opener waiting on the scope or
+/// a worker that took the entry from a deque, then counts them down on the scope's latch.
 pub(crate) fn run_child(
     local: &WorkerLocal,
     scope: NonNull<ScopeCore>,
     job: NonNull<ChildHeader>,
     units: Range<u32>,
     scratch: &mut Arena,
-    inline: bool,
 ) {
     // SAFETY: the entry carrying these pointers exists, so the latch still counts `units`
     // and the opener has not returned from `JobContext::scope`: the scope and the job
@@ -417,11 +452,11 @@ pub(crate) fn run_child(
                 }
                 run(units);
             },
-            // An opener that put its own children back would only pop them again; it is
-            // mid-job and finishes its scope whatever the gate says. So does a worker that
-            // is draining its deque at shutdown.
+            // A `block_in_place` wants this worker parked: the rest goes back on the
+            // deque for the reserved workers. Not at shutdown, when every child left is run
+            // by whoever holds it.
             || {
-                let yields = !inline && local.pool().over_limit() && !shared.is_shut_down();
+                let yields = local.pool().over_limit() && !shared.is_shut_down();
                 if yields { Rest::Requeue } else { Rest::Run }
             },
         )

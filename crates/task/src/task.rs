@@ -8,7 +8,9 @@ use core::task::{Context, Poll, Waker};
 use std::sync::{Arc, Mutex, Weak};
 use std::task::Wake;
 
-use lactose_core::AllocTag;
+use lactose_core::{AllocTag, Error, ErrorKind, Result};
+
+use crate::guard::abort_on_unwind;
 
 use crate::pool::Shared;
 use crate::{WorkerClass, lock};
@@ -40,12 +42,14 @@ pub(crate) trait RawTask: Send + Sync {
 
 /// A task as its [`Task`] handle sees it.
 trait Joinable<T>: Send + Sync {
-    fn poll_output(&self, cx: &mut Context<'_>) -> Poll<T>;
+    fn poll_output(&self, cx: &mut Context<'_>) -> Poll<Result<T>>;
     fn cancel(&self);
 }
 
 struct Join<T> {
     output: Option<T>,
+    /// The future was dropped without completing; no output will come.
+    cancelled: bool,
     waker: Option<Waker>,
 }
 
@@ -83,22 +87,39 @@ where
     /// Drops the future and publishes `output`. The caller holds the `RUNNING` or
     /// `NOTIFIED` phase.
     fn finish(&self, output: Option<F::Output>) {
-        {
+        // A panic in the future's destructor is a panic in the task, whichever thread the
+        // cancellation happens to run on.
+        abort_on_unwind(|| {
             let _tag = self.tag.scope();
             // SAFETY: the caller holds the phase that grants exclusive access to `future`.
             unsafe { *self.future.get() = None };
-        }
+        });
         self.state.store(DONE, Ordering::Release);
         if let Some(shared) = self.shared.upgrade() {
             shared.forget_task(self.id);
         }
         let waker = {
             let mut join = lock(&self.join);
+            join.cancelled = output.is_none();
             join.output = output;
             join.waker.take()
         };
         if let Some(waker) = waker {
             waker.wake();
+        }
+    }
+}
+
+impl<F: Future> Drop for TaskCell<F> {
+    fn drop(&mut self) {
+        // Reached with the future still in place when a suspended task loses its last
+        // waker and its handle: nothing can ever poll it again.
+        abort_on_unwind(|| {
+            let _tag = self.tag.scope();
+            *self.future.get_mut() = None;
+        });
+        if let Some(shared) = self.shared.upgrade() {
+            shared.forget_task(self.id);
         }
     }
 }
@@ -217,10 +238,14 @@ where
     F: Future + Send + 'static,
     F::Output: Send + 'static,
 {
-    fn poll_output(&self, cx: &mut Context<'_>) -> Poll<F::Output> {
+    fn poll_output(&self, cx: &mut Context<'_>) -> Poll<Result<F::Output>> {
         let mut join = lock(&self.join);
         match join.output.take() {
-            Some(output) => Poll::Ready(output),
+            Some(output) => Poll::Ready(Ok(output)),
+            None if join.cancelled => Poll::Ready(Err(Error::new(
+                ErrorKind::Cancelled,
+                "the executor shut down before the task finished",
+            ))),
             None => {
                 join.waker = Some(cx.waker().clone());
                 Poll::Pending
@@ -249,7 +274,7 @@ where
             id: shared.register_task(cell.clone()),
             shared: Arc::downgrade(shared),
             future: UnsafeCell::new(Some(future)),
-            join: Mutex::new(Join { output: None, waker: None }),
+            join: Mutex::new(Join { output: None, cancelled: false, waker: None }),
         })
     };
     shared.submit_task(class, cell.clone());
@@ -258,8 +283,8 @@ where
 
 /// A spawned task's result. Dropping it cancels the task at its next suspension point.
 ///
-/// If the executor is shut down before the task completes, the task is cancelled and this
-/// never resolves.
+/// Resolves to the task's output, or to an error of kind `Cancelled` if the executor shut
+/// down before the task completed.
 #[must_use = "dropping a Task cancels it; call detach() to let it run unobserved"]
 pub struct Task<T> {
     inner: Option<Arc<dyn Joinable<T>>>,
@@ -281,9 +306,9 @@ impl<T> Drop for Task<T> {
 }
 
 impl<T> Future for Task<T> {
-    type Output = T;
+    type Output = Result<T>;
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<T> {
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<T>> {
         self.inner.as_ref().expect("the handle holds its task until dropped").poll_output(cx)
     }
 }

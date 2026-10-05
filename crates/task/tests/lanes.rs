@@ -71,7 +71,7 @@ fn calls_run_on_the_owning_thread_in_submission_order() {
     }
     assert_eq!(pump.drain(&mut window), 0);
     for task in tasks {
-        let replies = executor.block_on(task);
+        let replies = executor.block_on(task).unwrap();
         assert_eq!(replies, (0..per_sender).map(|sequence| 4 + sequence).collect::<Vec<_>>());
     }
     // `wake` ran once per queued call, and each sender's calls ran in its own order.

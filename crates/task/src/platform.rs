@@ -22,22 +22,131 @@ impl CoreTopology {
         Self { performance: physical_cores.saturating_sub(1).max(1), efficiency: 0 }
     }
 
+    /// Caps the counts at the hardware threads this process may actually use, which an
+    /// affinity mask or a container limit can put far below what the machine has.
+    fn limited_to(self, threads: u32) -> Self {
+        let performance = self.performance.min(threads).max(1);
+        Self { performance, efficiency: self.efficiency.min(threads - performance.min(threads)) }
+    }
+}
+
+/// Topology detection reduced to functions of what the operating system reported, so each
+/// can be tested on any host with hand-built input.
+#[allow(dead_code, reason = "each operating system uses its own part; the tests use all of it")]
+mod detect {
+    use std::collections::BTreeMap;
+
+    use super::CoreTopology;
+
     /// Classifies physical cores by a per-core rating where a higher value means a faster
-    /// core (Linux CPU capacity, the Windows efficiency class). The fastest class is the
-    /// performance cores. Ratings that are all equal carry no core-type information.
-    #[cfg_attr(
-        not(any(target_os = "linux", target_os = "android", windows)),
-        allow(dead_code, reason = "macOS reports its core classes directly")
-    )]
-    fn from_ratings(ratings: &[u32]) -> Self {
+    /// core (Linux CPU capacity, the Windows efficiency class). The slowest class is the
+    /// efficiency cores and every class above it is frame-critical, which on a three-class
+    /// part counts the middle cores with the fastest. Ratings that are all equal carry no
+    /// core-type information.
+    pub(super) fn from_ratings(ratings: &[u32]) -> CoreTopology {
         let cores = ratings.len() as u32;
-        let Some(&fastest) = ratings.iter().max() else { return Self::homogeneous(1) };
-        let performance = ratings.iter().filter(|&&rating| rating == fastest).count() as u32;
-        if performance == cores {
-            Self::homogeneous(cores)
+        let Some(&slowest) = ratings.iter().min() else { return CoreTopology::homogeneous(1) };
+        let efficiency = ratings.iter().filter(|&&rating| rating == slowest).count() as u32;
+        if efficiency == cores {
+            CoreTopology::homogeneous(cores)
         } else {
-            Self { performance, efficiency: cores - performance }
+            CoreTopology { performance: cores - efficiency, efficiency }
         }
+    }
+
+    /// The efficiency class of every physical core in a buffer filled by
+    /// `GetLogicalProcessorInformationEx(RelationProcessorCore)`.
+    ///
+    /// The buffer is a sequence of variable-length records. Each starts with an eight-byte
+    /// header, `Relationship: i32` then `Size: u32`, and a processor-core record carries
+    /// its efficiency class in the tenth byte. A core record is 48 bytes on a machine with
+    /// one processor group, shorter than the declared size of the record type, which is
+    /// sized for its largest variant; only the header and the record's own `Size` say how
+    /// far a record reaches. A record that would run past the buffer, or that claims a
+    /// size smaller than its header, ends the walk.
+    pub(super) fn windows_core_ratings(records: &[u8]) -> Vec<u32> {
+        const HEADER: usize = 8;
+        const RELATION_PROCESSOR_CORE: i32 = 0;
+        const EFFICIENCY_CLASS: usize = 9;
+
+        let mut ratings = Vec::new();
+        let mut offset = 0;
+        while let Some(header) = records.get(offset..offset + HEADER) {
+            let relationship = i32::from_ne_bytes(header[..4].try_into().expect("four bytes"));
+            let size = u32::from_ne_bytes(header[4..].try_into().expect("four bytes")) as usize;
+            let Some(record) = records.get(offset..offset.saturating_add(size)) else { break };
+            if size < HEADER {
+                break;
+            }
+            if relationship == RELATION_PROCESSOR_CORE
+                && let Some(&class) = record.get(EFFICIENCY_CLASS)
+            {
+                ratings.push(u32::from(class));
+            }
+            offset += size;
+        }
+        ratings
+    }
+
+    /// One logical CPU as Linux sysfs describes it.
+    #[derive(Clone, Copy, Debug)]
+    pub(super) struct LinuxCpu {
+        pub(super) cpu: u32,
+        /// `topology/physical_package_id`.
+        pub(super) package: u32,
+        /// `topology/core_id`.
+        pub(super) core: u32,
+        /// `cpu_capacity`, where the kernel exports it (arm64, RISC-V).
+        pub(super) capacity: Option<u32>,
+    }
+
+    /// Parses a sysfs CPU list such as `0-15,24,26-27`. Malformed parts are skipped.
+    pub(super) fn parse_cpu_list(list: &str) -> Vec<u32> {
+        let mut cpus = Vec::new();
+        for part in list.trim().split(',') {
+            let (first, last) = part.split_once('-').unwrap_or((part, part));
+            if let (Ok(first), Ok(last)) = (first.trim().parse::<u32>(), last.trim().parse()) {
+                cpus.extend(first..=last);
+            }
+        }
+        cpus
+    }
+
+    /// The topology of a Linux machine.
+    ///
+    /// Cores are rated by CPU capacity where the kernel exports it. x86 kernels do not, but
+    /// on Intel hybrid parts they register two PMUs whose CPU lists name the performance
+    /// cores (`/sys/devices/cpu_core/cpus`) and the efficiency cores
+    /// (`/sys/devices/cpu_atom/cpus`); those are used instead. With neither there is no
+    /// core-type information.
+    pub(super) fn linux_topology(
+        cpus: &[LinuxCpu],
+        performance_cpus: Option<&str>,
+        efficiency_cpus: Option<&str>,
+    ) -> Option<CoreTopology> {
+        let has_capacity = cpus.iter().any(|cpu| cpu.capacity.is_some());
+        let fast = performance_cpus.map(parse_cpu_list).unwrap_or_default();
+        let slow = efficiency_cpus.map(parse_cpu_list).unwrap_or_default();
+        let hybrid = !fast.is_empty() && !slow.is_empty();
+
+        // One rating per physical core; hardware threads of a core share it.
+        let mut cores = BTreeMap::new();
+        for cpu in cpus {
+            let rating = if has_capacity {
+                cpu.capacity.unwrap_or(0)
+            } else if hybrid {
+                u32::from(fast.contains(&cpu.cpu))
+            } else {
+                0
+            };
+            let best = cores.entry((cpu.package, cpu.core)).or_insert(0);
+            *best = rating.max(*best);
+        }
+        if cores.is_empty() {
+            return None;
+        }
+        let ratings: Vec<u32> = cores.into_values().collect();
+        Some(from_ratings(&ratings))
     }
 }
 
@@ -91,14 +200,14 @@ pub struct StdPlatform;
 
 impl Platform for StdPlatform {
     fn topology(&self) -> CoreTopology {
+        let threads = std::thread::available_parallelism().map_or(2, |count| count.get() as u32);
         // Miri has none of the queries below.
         let detected = if cfg!(miri) { None } else { os::topology() };
-        detected.unwrap_or_else(|| {
+        detected
             // No core information at all: assume two hardware threads per core.
-            let threads =
-                std::thread::available_parallelism().map_or(2, |count| count.get() as u32);
-            CoreTopology::homogeneous(threads.div_ceil(2))
-        })
+            .unwrap_or_else(|| CoreTopology::homogeneous(threads.div_ceil(2)))
+            // `available_parallelism` honours affinity masks and container limits.
+            .limited_to(threads)
     }
 
     fn spawn_thread(
@@ -169,28 +278,23 @@ mod os {
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
 mod os {
-    use std::collections::BTreeMap;
     use std::path::Path;
 
     use super::CoreTopology;
+    use super::detect::{LinuxCpu, linux_topology};
 
     fn read_u32(path: &Path) -> Option<u32> {
         std::fs::read_to_string(path).ok()?.trim().parse().ok()
     }
 
-    /// One rating per physical core: its CPU capacity, or zero where the kernel exports
-    /// none (x86 kernels without hybrid capacity scaling, most virtual machines).
     pub(super) fn topology() -> Option<CoreTopology> {
-        let mut cores = BTreeMap::new();
+        let mut cpus = Vec::new();
         for entry in std::fs::read_dir("/sys/devices/system/cpu").ok()?.flatten() {
             let name = entry.file_name();
-            let Some(name) = name.to_str() else { continue };
-            let is_cpu = name.strip_prefix("cpu").is_some_and(|rest| {
-                !rest.is_empty() && rest.bytes().all(|byte| byte.is_ascii_digit())
-            });
-            if !is_cpu {
+            let Some(cpu) = name.to_str().and_then(|name| name.strip_prefix("cpu")?.parse().ok())
+            else {
                 continue;
-            }
+            };
             let path = entry.path();
             // An offline CPU has no topology directory.
             let (Some(package), Some(core)) = (
@@ -199,16 +303,11 @@ mod os {
             ) else {
                 continue;
             };
-            let capacity = read_u32(&path.join("cpu_capacity")).unwrap_or(0);
-            // Hardware threads of one core share a capacity; keep the largest seen.
-            let rating = cores.entry((package, core)).or_insert(0);
-            *rating = capacity.max(*rating);
+            let capacity = read_u32(&path.join("cpu_capacity"));
+            cpus.push(LinuxCpu { cpu, package, core, capacity });
         }
-        if cores.is_empty() {
-            return None;
-        }
-        let ratings: Vec<u32> = cores.into_values().collect();
-        Some(CoreTopology::from_ratings(&ratings))
+        let list = |pmu: &str| std::fs::read_to_string(format!("/sys/devices/{pmu}/cpus")).ok();
+        linux_topology(&cpus, list("cpu_core").as_deref(), list("cpu_atom").as_deref())
     }
 }
 
@@ -216,13 +315,11 @@ mod os {
 mod os {
     use windows_sys::Win32::System::SystemInformation::{
         GetLogicalProcessorInformationEx, RelationProcessorCore,
-        SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX,
     };
 
     use super::CoreTopology;
+    use super::detect::{from_ratings, windows_core_ratings};
 
-    /// One rating per physical core: its efficiency class, which is higher for faster
-    /// cores on hybrid CPUs and zero everywhere on homogeneous ones.
     pub(super) fn topology() -> Option<CoreTopology> {
         let mut length = 0u32;
         // SAFETY: a null buffer with a zero length is the documented way to ask for the
@@ -237,38 +334,25 @@ mod os {
         if length == 0 {
             return None;
         }
-        // `u64` elements give the buffer the alignment the records need.
+        // `u64` elements give the buffer the alignment the system's records expect.
         let mut buffer = vec![0u64; (length as usize).div_ceil(size_of::<u64>())];
-        let base = buffer.as_mut_ptr().cast::<u8>();
-        // SAFETY: `buffer` is at least `length` bytes long and suitably aligned.
+        // SAFETY: `buffer` is at least `length` bytes long, writable, and aligned for the
+        // record type; the system writes at most `length` bytes of records into it.
         let ok = unsafe {
-            GetLogicalProcessorInformationEx(RelationProcessorCore, base.cast(), &raw mut length)
+            GetLogicalProcessorInformationEx(
+                RelationProcessorCore,
+                buffer.as_mut_ptr().cast(),
+                &raw mut length,
+            )
         };
         if ok == 0 {
             return None;
         }
-
-        let header = size_of::<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>();
-        let mut ratings = Vec::new();
-        let mut offset = 0usize;
-        while offset + header <= length as usize {
-            // SAFETY: the system wrote a sequence of records into the first `length` bytes
-            // of `buffer`, each starting where the previous one's `Size` says and each at
-            // least `header` bytes long, which the loop condition checks. `read_unaligned`
-            // asks nothing of the record's alignment.
-            let record = unsafe {
-                base.add(offset).cast::<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>().read_unaligned()
-            };
-            if record.Size == 0 {
-                break;
-            }
-            if record.Relationship == RelationProcessorCore {
-                // SAFETY: `Relationship` says the union holds a `PROCESSOR_RELATIONSHIP`.
-                ratings.push(u32::from(unsafe { record.Anonymous.Processor.EfficiencyClass }));
-            }
-            offset += record.Size as usize;
-        }
-        (!ratings.is_empty()).then(|| CoreTopology::from_ratings(&ratings))
+        // The records are walked as plain bytes; nothing is read through a record type.
+        let bytes: Vec<u8> =
+            buffer.iter().flat_map(|word| word.to_ne_bytes()).take(length as usize).collect();
+        let ratings = windows_core_ratings(&bytes);
+        (!ratings.is_empty()).then(|| from_ratings(&ratings))
     }
 }
 
@@ -285,30 +369,129 @@ mod os {
 mod tests {
     use super::*;
 
+    use super::detect::{
+        LinuxCpu, from_ratings, linux_topology, parse_cpu_list, windows_core_ratings,
+    };
+
+    fn topology(performance: u32, efficiency: u32) -> CoreTopology {
+        CoreTopology { performance, efficiency }
+    }
+
     #[test]
     fn ratings_classify_hybrid_and_homogeneous_cpus() {
         // Eight performance cores and sixteen efficiency cores.
         let mut hybrid = vec![1u32; 16];
         hybrid.extend([2; 8]);
-        assert_eq!(
-            CoreTopology::from_ratings(&hybrid),
-            CoreTopology { performance: 8, efficiency: 16 }
-        );
-        // big.LITTLE with three classes: only the fastest is frame-critical.
-        assert_eq!(
-            CoreTopology::from_ratings(&[250, 250, 250, 250, 620, 620, 620, 1024]),
-            CoreTopology { performance: 1, efficiency: 7 }
-        );
+        assert_eq!(from_ratings(&hybrid), topology(8, 16));
+        // Three classes: everything above the slowest is frame-critical.
+        assert_eq!(from_ratings(&[250, 250, 250, 250, 620, 620, 620, 1024]), topology(4, 4));
         // No core-type information: physical cores minus one, and no efficiency cores.
-        assert_eq!(
-            CoreTopology::from_ratings(&[0; 8]),
-            CoreTopology { performance: 7, efficiency: 0 }
-        );
-        assert_eq!(
-            CoreTopology::from_ratings(&[1024]),
-            CoreTopology { performance: 1, efficiency: 0 }
-        );
-        assert_eq!(CoreTopology::from_ratings(&[]), CoreTopology { performance: 1, efficiency: 0 });
+        assert_eq!(from_ratings(&[0; 8]), topology(7, 0));
+        assert_eq!(from_ratings(&[1024]), topology(1, 0));
+        assert_eq!(from_ratings(&[]), topology(1, 0));
+    }
+
+    #[test]
+    fn worker_counts_are_capped_by_the_usable_hardware_threads() {
+        // A sixteen-core host seen through a four-CPU container limit.
+        assert_eq!(topology(15, 0).limited_to(4), topology(4, 0));
+        // Hybrid, limited below the performance-core count: no room for background cores.
+        assert_eq!(topology(8, 16).limited_to(6), topology(6, 0));
+        assert_eq!(topology(8, 16).limited_to(12), topology(8, 4));
+        // Unrestricted.
+        assert_eq!(topology(4, 4).limited_to(8), topology(4, 4));
+        assert_eq!(topology(4, 4).limited_to(1), topology(1, 0));
+    }
+
+    /// One record as Windows lays it out: `Relationship`, `Size`, then the payload.
+    fn record(relationship: i32, size: u32, efficiency_class: u8) -> Vec<u8> {
+        let mut bytes = vec![0u8; size.max(8) as usize];
+        bytes[..4].copy_from_slice(&relationship.to_ne_bytes());
+        bytes[4..8].copy_from_slice(&size.to_ne_bytes());
+        if let Some(class) = bytes.get_mut(9) {
+            *class = efficiency_class;
+        }
+        bytes
+    }
+
+    #[test]
+    fn windows_records_are_walked_by_their_own_size() {
+        // A processor-core record with one group is 48 bytes.
+        let core = |class| record(0, 48, class);
+
+        // Eight identical cores: every record counts, including the last, which is shorter
+        // than the declared size of the record type.
+        let homogeneous: Vec<u8> = (0..8).flat_map(|_| core(0)).collect();
+        assert_eq!(windows_core_ratings(&homogeneous), [0; 8]);
+        assert_eq!(from_ratings(&windows_core_ratings(&homogeneous)), topology(7, 0));
+
+        // Six performance cores (class 1) and eight efficiency cores (class 0), with a
+        // longer record of another kind in between, which is skipped by its size.
+        let mut hybrid: Vec<u8> = (0..6).flat_map(|_| core(1)).collect();
+        hybrid.extend(record(3, 76, 9));
+        hybrid.extend((0..8).flat_map(|_| core(0)));
+        let ratings = windows_core_ratings(&hybrid);
+        assert_eq!(ratings.len(), 14);
+        assert_eq!(from_ratings(&ratings), topology(6, 8));
+
+        // A buffer cut off inside the last record: the whole records before it count.
+        let truncated = &homogeneous[..homogeneous.len() - 10];
+        assert_eq!(windows_core_ratings(truncated).len(), 7);
+        // Cut off inside a header.
+        assert_eq!(windows_core_ratings(&homogeneous[..48 + 5]).len(), 1);
+
+        // A zero size would never advance; the walk stops there.
+        let mut stuck = core(1);
+        stuck.extend(record(0, 0, 1));
+        stuck.extend(core(1));
+        assert_eq!(windows_core_ratings(&stuck), [1]);
+        // So does a size smaller than the header.
+        let mut short = core(1);
+        short.extend(record(0, 4, 1));
+        assert_eq!(windows_core_ratings(&short), [1]);
+        assert!(windows_core_ratings(&[]).is_empty());
+    }
+
+    #[test]
+    fn cpu_lists_parse() {
+        assert_eq!(parse_cpu_list("0-3,8,10-11\n"), [0, 1, 2, 3, 8, 10, 11]);
+        assert_eq!(parse_cpu_list("5"), [5]);
+        assert_eq!(parse_cpu_list(""), [0u32; 0]);
+        assert_eq!(parse_cpu_list("1,x,3-y,4"), [1, 4]);
+    }
+
+    /// `count` logical CPUs starting at `first`, `threads` per core.
+    fn cpus(first: u32, count: u32, threads: u32, capacity: Option<u32>) -> Vec<LinuxCpu> {
+        (first..first + count)
+            .map(|cpu| LinuxCpu { cpu, package: 0, core: cpu / threads * threads, capacity })
+            .collect()
+    }
+
+    #[test]
+    fn linux_topology_from_capacity_pmu_lists_or_neither() {
+        // arm64 big.LITTLE, three classes: 4 little, 3 big, 1 prime.
+        let mut arm = cpus(0, 4, 1, Some(250));
+        arm.extend(cpus(4, 3, 1, Some(620)));
+        arm.extend(cpus(7, 1, 1, Some(1024)));
+        assert_eq!(linux_topology(&arm, None, None), Some(topology(4, 4)));
+
+        // Intel hybrid: 8 performance cores with two threads each (CPUs 0-15), 8
+        // efficiency cores (16-23), no capacity files.
+        let mut intel = cpus(0, 16, 2, None);
+        intel.extend(cpus(16, 8, 1, None));
+        assert_eq!(linux_topology(&intel, Some("0-15\n"), Some("16-23\n")), Some(topology(8, 8)));
+        // The same machine on a kernel without the hybrid PMUs: 16 cores, no types.
+        assert_eq!(linux_topology(&intel, None, None), Some(topology(15, 0)));
+
+        // A homogeneous desktop with two threads per core, and one whose kernel exports
+        // equal capacities.
+        assert_eq!(linux_topology(&cpus(0, 16, 2, None), None, None), Some(topology(7, 0)));
+        assert_eq!(linux_topology(&cpus(0, 4, 1, Some(1024)), None, None), Some(topology(3, 0)));
+        // Two sockets: the same core id in different packages is two cores.
+        let mut sockets = cpus(0, 4, 1, None);
+        sockets.extend(cpus(0, 4, 1, None).into_iter().map(|cpu| LinuxCpu { package: 1, ..cpu }));
+        assert_eq!(linux_topology(&sockets, None, None), Some(topology(7, 0)));
+        assert_eq!(linux_topology(&[], None, None), None);
     }
 
     #[test]

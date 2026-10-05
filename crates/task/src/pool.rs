@@ -26,11 +26,15 @@ use crate::{WorkerClass, lock};
 
 /// How long a worker that found nothing keeps rescanning the queues before it parks.
 ///
-/// While a graph run is in flight the next node is usually one finalize away, and a park
-/// and unpark round trip costs more than most jobs take, so a frame-critical worker keeps
-/// looking for longer. Between runs it gives up quickly and leaves the core alone.
+/// Long enough to catch work that follows at once, short enough that a dry worker costs
+/// next to nothing. Scanning for longer while a graph run is in flight was measured (one
+/// worker at a time, 300 µs) and bought no makespan on any benchmark shape while costing
+/// up to a third more CPU on the narrow ones, so every dry worker parks after this.
 const SCAN_IDLE: Duration = Duration::from_micros(50);
-const SCAN_DURING_RUN: Duration = Duration::from_micros(300);
+
+/// How long a replay may sit with pooled work, nothing running and the log's next job
+/// unavailable before it is declared unsatisfiable.
+const REPLAY_STALL: Duration = Duration::from_secs(2);
 
 /// Under Miri time is simulated, so the scan phase is a fixed number of rounds instead.
 const MIRI_SCAN_ROUNDS: u32 = 2;
@@ -84,6 +88,23 @@ impl Entry {
         }
     }
 
+    /// Splits the upper half off a range of more than one unit.
+    fn split_upper(&mut self) -> Option<Self> {
+        let upper = match self {
+            Self::Range { units, .. } | Self::Child { units, .. } => {
+                if units.end - units.start < 2 {
+                    return None;
+                }
+                let middle = units.start + (units.end - units.start) / 2;
+                let upper = middle..units.end;
+                units.end = middle;
+                upper
+            }
+            Self::Task(_) => return None,
+        };
+        Some(self.with_units(upper))
+    }
+
     /// Gives up on an entry that will never run. A task is cancelled; graph work is dropped,
     /// which leaves its run unfinished for good. Never called on a child, whose opener
     /// would wait forever.
@@ -116,6 +137,9 @@ pub(crate) struct WorkerLocal {
     pub(crate) class: WorkerClass,
     pub(crate) index: usize,
     pub(crate) deque: Worker<Entry>,
+    /// Whether this worker's job has a scope open. While it does, the worker's deque takes
+    /// only that scope's children (see [`Shared::submit_range`]).
+    pub(crate) scope_open: Cell<bool>,
     /// Seeded perturbation, when chaos is configured.
     chaos: Option<RefCell<ChaosRng>>,
     /// Round-robin start for victim selection when chaos does not shuffle it.
@@ -219,7 +243,8 @@ impl Pool {
         self.running.load(Ordering::SeqCst) < self.allowed.load(Ordering::SeqCst)
     }
 
-    fn try_acquire(&self) -> bool {
+    /// Takes a permit if the limit allows one more.
+    pub(crate) fn try_acquire(&self) -> bool {
         self.running
             .try_update(Ordering::SeqCst, Ordering::SeqCst, |running| {
                 (running < self.allowed.load(Ordering::SeqCst)).then_some(running + 1)
@@ -229,6 +254,23 @@ impl Pool {
 
     fn release(&self) {
         self.running.fetch_sub(1, Ordering::SeqCst);
+    }
+
+    /// Gives the calling worker's permit up because it is about to park in the middle of a
+    /// job, on a scope latch. A parked worker runs nothing, so it must not count against a
+    /// `block_in_place` reservation, whether the gate closed before it parked or after.
+    pub(crate) fn release_to_park(&self) {
+        self.release();
+        if self.allowed.load(Ordering::SeqCst) != u32::MAX {
+            // Someone parked at the gate can use the permit.
+            self.notify_one();
+        }
+    }
+
+    /// Takes a permit regardless of the limit, for a worker whose scope has closed and
+    /// which goes on with the job it is in the middle of.
+    pub(crate) fn retake(&self) {
+        self.running.fetch_add(1, Ordering::SeqCst);
     }
 
     /// Gives the calling worker's permit up if a `block_in_place` has lowered the limit
@@ -249,26 +291,6 @@ impl Pool {
     pub(crate) fn over_limit(&self) -> bool {
         let allowed = self.allowed.load(Ordering::Relaxed);
         allowed != u32::MAX && self.running.load(Ordering::Relaxed) > allowed
-    }
-
-    /// Lends the calling worker's permit out while it is parked mid-job on a scope latch, so
-    /// a closed gate does not count a worker that is running nothing. Returns whether it
-    /// did, for [`Pool::resume_permit`].
-    pub(crate) fn suspend_permit(&self) -> bool {
-        let gated = self.allowed.load(Ordering::Relaxed) != u32::MAX;
-        if gated {
-            self.release();
-            self.notify_one();
-        }
-        gated
-    }
-
-    /// Takes the permit back after [`Pool::suspend_permit`]. The worker is mid-job and
-    /// continues regardless of the limit.
-    pub(crate) fn resume_permit(&self, suspended: bool) {
-        if suspended {
-            self.running.fetch_add(1, Ordering::SeqCst);
-        }
     }
 
     /// Starts a `block_in_place`: at most `reserved` workers other than the caller may hold
@@ -293,7 +315,86 @@ impl Pool {
         drop(gate);
         self.running.fetch_add(1, Ordering::SeqCst);
         self.wake_all();
+        // Openers that parked on their latch at the gate wait for a plain unpark.
+        self.threads.iter().for_each(Thread::unpark);
     }
+}
+
+/// Finishes a steal: if the stolen entry is a range of more than one unit, its upper half
+/// goes onto the thief's own deque, where other thieves find it.
+fn split_stolen(mut entry: Entry, thief: &Worker<Entry>, pool: &Pool) -> Entry {
+    if let Some(upper) = entry.split_upper() {
+        thief.push(upper);
+        pool.notify_one();
+    }
+    entry
+}
+
+/// One steal from `victim`, including the thief-side split.
+fn steal_from(victim: &Stealer<Entry>, thief: &Worker<Entry>, pool: &Pool) -> Steal<Entry> {
+    match victim.steal() {
+        Steal::Success(entry) => Steal::Success(split_stolen(entry, thief, pool)),
+        other => other,
+    }
+}
+
+/// Times `samples` steals, each from a deque another thread filled, through
+/// [`steal_from`]: the function a worker steals with. For the benchmark only.
+pub(crate) fn time_steals(
+    platform: &dyn Platform,
+    samples: usize,
+) -> lactose_core::Result<Vec<u64>> {
+    const BATCH: usize = 1024;
+    let run = graph::placeholder_run();
+    let victim = Worker::<Entry>::new_lifo();
+    let thief = Worker::<Entry>::new_lifo();
+    let stealer = victim.stealer();
+    let pool = Pool::new(
+        vec![victim.stealer(), thief.stealer()],
+        vec![std::thread::current(), std::thread::current()],
+    );
+    let (filled, wait_filled) = std::sync::mpsc::channel::<usize>();
+    let (stolen, wait_stolen) = std::sync::mpsc::channel::<Vec<u64>>();
+    let spec = crate::ThreadSpec {
+        name: "whisk-bench-thief".to_owned(),
+        class: lactose_core::ThreadClass::FrameCritical,
+        index_in_class: 1,
+    };
+    let body = Box::new(move || {
+        while let Ok(count) = wait_filled.recv() {
+            let mut nanos = Vec::with_capacity(count);
+            for _ in 0..count {
+                let start = Instant::now();
+                let entry = loop {
+                    match steal_from(&stealer, &thief, &pool) {
+                        Steal::Success(entry) => break entry,
+                        Steal::Retry => {}
+                        Steal::Empty => unreachable!("the victim holds a full batch"),
+                    }
+                };
+                nanos.push(start.elapsed().as_nanos() as u64);
+                drop(entry);
+            }
+            while thief.pop().is_some() {}
+            if stolen.send(nanos).is_err() {
+                break;
+            }
+        }
+    });
+    let thread = platform.spawn_thread(spec, body)?;
+    let mut nanos = Vec::with_capacity(samples);
+    while nanos.len() < samples {
+        let count = BATCH.min(samples - nanos.len());
+        for index in 0..count as u32 {
+            let units = index * 64..index * 64 + 64;
+            victim.push(Entry::Range { run: run.clone(), node: 0, units, root: false });
+        }
+        filled.send(count).expect("the thief is running");
+        nanos.extend(wait_stolen.recv().expect("the thief reports"));
+    }
+    drop(filled);
+    thread.join();
+    Ok(nanos)
 }
 
 /// Everything the workers of one executor share.
@@ -306,9 +407,9 @@ pub(crate) struct Shared {
     pub(crate) chaos: Option<Chaos>,
     /// Graph runs started so far; a run's ordinal identifies it in an execution log.
     runs: AtomicU64,
-    /// Graph runs that have started and not finished. Only steers how long idle workers
-    /// scan before parking.
-    runs_in_flight: AtomicU32,
+    /// Graph runs that have started and not finished, so shutdown can resolve their
+    /// futures.
+    live_runs: Mutex<HashMap<u64, Weak<RunState>>>,
     /// Every unfinished task, so shutdown can cancel the ones no queue holds.
     tasks: Mutex<HashMap<u64, Weak<dyn RawTask>>>,
     next_task: AtomicU64,
@@ -343,7 +444,7 @@ impl Shared {
             timers: Timers::new(),
             chaos,
             runs: AtomicU64::new(0),
-            runs_in_flight: AtomicU32::new(0),
+            live_runs: Mutex::new(HashMap::new()),
             tasks: Mutex::new(HashMap::new()),
             next_task: AtomicU64::new(0),
             handles: Mutex::new(handles),
@@ -366,13 +467,14 @@ impl Shared {
     }
 
     /// Notes the start of a graph run and returns its ordinal.
-    pub(crate) fn begin_run(&self) -> u64 {
-        self.runs_in_flight.fetch_add(1, Ordering::Relaxed);
-        self.runs.fetch_add(1, Ordering::Relaxed)
+    pub(crate) fn begin_run(&self, run: &Arc<RunState>) -> u64 {
+        let ordinal = self.runs.fetch_add(1, Ordering::Relaxed);
+        lock(&self.live_runs).insert(ordinal, Arc::downgrade(run));
+        ordinal
     }
 
-    pub(crate) fn end_run(&self) {
-        self.runs_in_flight.fetch_sub(1, Ordering::Relaxed);
+    pub(crate) fn end_run(&self, ordinal: u64) {
+        lock(&self.live_runs).remove(&ordinal);
     }
 
     /// The replay state, when this executor replays a log.
@@ -389,8 +491,17 @@ impl Shared {
     }
 
     /// Queues graph work: on the calling worker's deque when the caller is one of this
-    /// executor's frame-critical workers, on the injector otherwise.
-    pub(crate) fn submit_range(&self, entry: Entry) {
+    /// executor's frame-critical workers and has no scope open, on the injector otherwise.
+    ///
+    /// The scope rule is what lets an opener find its children: while its scope is open,
+    /// nothing but that scope's children is pushed onto its deque, so they are always the
+    /// topmost entries. A graph started from a scope body or from a child the opener runs
+    /// itself therefore goes to the injector.
+    ///
+    /// `keeps_one` says the caller is a worker at the end of its job that is releasing
+    /// nodes and will take one of them itself as its next entry. An entry that lands on its
+    /// own deque then wakes nobody: a sleeper woken for it would find it gone.
+    pub(crate) fn submit_range(&self, entry: Entry, keeps_one: bool) {
         if self.is_shut_down() {
             return;
         }
@@ -402,25 +513,29 @@ impl Shared {
         let entry = with_local(|local| match local {
             Some(local)
                 if core::ptr::eq(Arc::as_ptr(&local.shared), self)
-                    && local.class == WorkerClass::FrameCritical =>
+                    && local.class == WorkerClass::FrameCritical
+                    && !local.scope_open.get() =>
             {
                 local.deque.push(entry);
                 None
             }
             _ => Some(entry),
         });
+        let on_own_deque = entry.is_none();
         if let Some(entry) = entry {
             self.frame.injector.push(entry);
         }
-        self.frame.notify_one();
+        if !(keeps_one && on_own_deque) {
+            self.frame.notify_one();
+        }
         self.discard_if_shut_down();
     }
 
-    /// Closes the race between a submission and shutdown. Call after the entry is queued
-    /// and after the notification, whose fence orders the queueing before the load here:
-    /// either shutdown's own sweep comes after the entry and finds it, or this load sees
-    /// the flag and sweeps.
+    /// Closes the race between a submission and shutdown. Call after the entry is queued.
+    /// The fence orders the queueing before the load: either shutdown's own sweep comes
+    /// after the entry and finds it, or this load sees the flag and sweeps.
     fn discard_if_shut_down(&self) {
+        fence(Ordering::SeqCst);
         if self.shutdown.load(Ordering::SeqCst) {
             self.discard_queued();
         }
@@ -466,35 +581,52 @@ impl Shared {
         lock(&self.tasks).remove(&id);
     }
 
-    /// Stops the workers, cancels every unfinished task and drops queued graph work.
-    pub(crate) fn shut_down(&self) {
-        debug_assert!(!on_worker_thread(), "shutdown called on a worker would wait for itself");
+    /// Stops the workers, cancels every unfinished task, drops queued graph work and
+    /// resolves every future that was waiting on any of it to `Cancelled`.
+    ///
+    /// With `join` it returns once every thread has exited. Without, for a caller that is
+    /// itself a worker, it only tells them to exit.
+    pub(crate) fn shut_down(&self, join: bool) {
         self.shutdown.store(true, Ordering::SeqCst);
         if let Some(replay) = self.replay() {
             replay.abandon();
         }
         for pool in [&self.frame, &self.background] {
             pool.wake_all();
-            // A worker parked on a scope latch in replay is waiting for its turn, not for a
-            // sleeper bit.
+            // A worker parked on a scope latch waits for a plain unpark, not a sleeper bit.
             pool.threads.iter().for_each(Thread::unpark);
         }
-        {
+        // Once now, so nothing that waits on cancelled work has to wait for the joins,
+        // which last as long as the longest running job; and once after them, for what
+        // those jobs submitted on their way out.
+        self.cancel_everything();
+        if join {
             // Held across the joins, so a second caller also returns only once every
             // thread has exited.
             let mut handles = lock(&self.handles);
             for handle in handles.drain(..) {
                 handle.join();
             }
+            drop(handles);
+            self.cancel_everything();
         }
+    }
 
-        self.timers.clear();
+    /// Cancels queued and suspended tasks, drops queued graph work and resolves the
+    /// futures of unfinished runs and pending timers. The shutdown flag is set. Safe while
+    /// workers are still finishing their jobs: scope children are never touched.
+    fn cancel_everything(&self) {
         self.discard_queued();
         // Taken out first: cancelling a task removes it from the registry.
         let tasks = core::mem::take(&mut *lock(&self.tasks));
         for task in tasks.into_values().filter_map(|task| task.upgrade()) {
             task.cancel();
         }
+        let runs = core::mem::take(&mut *lock(&self.live_runs));
+        for run in runs.into_values().filter_map(|run| run.upgrade()) {
+            run.cancel();
+        }
+        self.timers.cancel_all();
     }
 }
 
@@ -514,15 +646,19 @@ pub(crate) fn worker_thread(seed: WorkerSeed) {
             let stream = (index as u64) << 1 | u64::from(class == WorkerClass::Background);
             RefCell::new(ChaosRng::new(chaos.config.seed, stream))
         });
-        let local = cell.get_or_init(|| WorkerLocal {
+        let local = WorkerLocal {
             shared,
             class,
             index,
             deque,
+            scope_open: Cell::new(false),
             chaos,
             next_victim: Cell::new(index + 1),
-        });
-        worker_loop(local);
+        };
+        assert!(cell.set(local).is_ok(), "a thread becomes a worker once");
+        // Read back through the cell, the way `with_local` reaches it from code running on
+        // this thread, so the loop and that code share one kind of borrow of the state.
+        worker_loop(cell.get().expect("set above"));
     });
 }
 
@@ -530,6 +666,7 @@ fn worker_loop(local: &WorkerLocal) {
     let shared = &*local.shared;
     let pool = local.pool();
     let mut arenas = Arenas::default();
+    let frame = local.class == WorkerClass::FrameCritical;
     let mut permit = false;
     // When this worker last had work, and how often it has looked since.
     let mut scanning_since = None;
@@ -540,26 +677,29 @@ fn worker_loop(local: &WorkerLocal) {
             permit = pool.try_acquire();
         } else if pool.release_if_over() {
             permit = false;
+            if !local.deque.is_empty() {
+                // What this worker holds, which may include a node it released without
+                // waking anyone because it meant to run it, is now for the others.
+                pool.notify_one();
+            }
         }
         if permit {
-            if let Some((entry, position)) = find_work(local) {
+            if let Some(found) = find_work(local) {
                 scanning_since = None;
                 scans = 0;
-                execute(local, &mut arenas, entry, position);
+                execute(local, &mut arenas, found.entry, found.position);
+                if found.replayed
+                    && let Some(replay) = shared.replay()
+                {
+                    replay.finished();
+                }
                 perturb(local, |config| config.inject_yields, 4);
                 continue;
             }
             let keep_scanning = if cfg!(miri) {
                 scans < MIRI_SCAN_ROUNDS
             } else {
-                let limit = if local.class == WorkerClass::FrameCritical
-                    && shared.runs_in_flight.load(Ordering::Relaxed) != 0
-                {
-                    SCAN_DURING_RUN
-                } else {
-                    SCAN_IDLE
-                };
-                scanning_since.get_or_insert_with(Instant::now).elapsed() < limit
+                scanning_since.get_or_insert_with(Instant::now).elapsed() < SCAN_IDLE
             };
             if keep_scanning {
                 scans += 1;
@@ -587,9 +727,10 @@ fn worker_loop(local: &WorkerLocal) {
             other => other.discard(),
         }
     }
-    if let Some(replay) = shared.replay().filter(|_| local.class == WorkerClass::FrameCritical) {
+    if let Some(replay) = shared.replay().filter(|_| frame) {
         while let (Some((entry, position)), _) = replay.take(local.index, Filter::Children) {
             execute(local, &mut arenas, entry, position);
+            replay.finished();
         }
     }
 }
@@ -604,21 +745,31 @@ fn perturb(local: &WorkerLocal, enabled: impl FnOnce(&ChaosConfig) -> bool, one_
     }
 }
 
-/// The next entry for this worker and, in replay, its position in the log.
-fn find_work(local: &WorkerLocal) -> Option<(Entry, u64)> {
+/// What [`find_work`] found.
+struct Found {
+    entry: Entry,
+    /// The entry's position in the log, in replay.
+    position: u64,
+    /// Whether the entry came from the replay pool, which wants to hear when it is done.
+    replayed: bool,
+}
+
+/// The next entry for this worker.
+fn find_work(local: &WorkerLocal) -> Option<Found> {
     let shared = &*local.shared;
     let pool = local.pool();
     let frame = local.class == WorkerClass::FrameCritical;
+    let found = |entry| Some(Found { entry, position: 0, replayed: false });
 
     if frame && let Some(replay) = shared.replay() {
         let (taken, wake) = replay.take(local.index, Filter::Any);
         shared.replay_wake(wake);
-        if taken.is_some() {
-            return taken;
+        if let Some((entry, position)) = taken {
+            return Some(Found { entry, position, replayed: true });
         }
     }
     if let Some(entry) = local.deque.pop() {
-        return Some((entry, 0));
+        return found(entry);
     }
     if frame {
         shared.timers.fire_due();
@@ -637,17 +788,22 @@ fn find_work(local: &WorkerLocal) -> Option<(Entry, u64)> {
         let sources = core::iter::once(None).chain((0..victims).map(Some));
         for source in sources {
             let stolen = match source {
-                None => pool.injector.steal(),
+                None => match pool.injector.steal() {
+                    Steal::Success(entry) => {
+                        Steal::Success(split_stolen(entry, &local.deque, pool))
+                    }
+                    other => other,
+                },
                 Some(offset) => {
                     let victim = (first + offset) % victims;
                     if victim == local.index {
                         continue;
                     }
-                    pool.stealers[victim].steal()
+                    steal_from(&pool.stealers[victim], &local.deque, pool)
                 }
             };
             match stolen {
-                Steal::Success(entry) => return Some((entry, 0)),
+                Steal::Success(entry) => return found(entry),
                 Steal::Retry => retry = true,
                 Steal::Empty => {}
             }
@@ -665,7 +821,7 @@ fn execute(local: &WorkerLocal, arenas: &mut Arenas, entry: Entry, position: u64
             graph::run_range(local, arenas, &run, node, units, root, position);
         }
         Entry::Child { scope, job, units } => {
-            job::run_child(local, scope, job, units, &mut arenas.child, false);
+            job::run_child(local, scope, job, units, &mut arenas.child);
         }
         Entry::Task(task) => task.run(false),
     });
@@ -680,12 +836,19 @@ fn idle(local: &WorkerLocal) {
     pool.sleep.announce(local.index);
     // Timers are served by whichever frame-critical worker is idle: there is no timer
     // thread. One sleeper at a time is the keeper and parks only until the next deadline.
-    let deadline = if frame {
+    let mut deadline = if frame {
         shared.timers.fire_due();
         shared.timers.keep(local.index)
     } else {
         None
     };
+    // A replay that looks stuck gets a deadline too, after which it is declared so.
+    let stalled = shared.replay().filter(|_| frame).and_then(Chaos::stalled);
+    if stalled.is_some() {
+        let limit = Instant::now() + REPLAY_STALL;
+        deadline = Some(deadline.map_or(limit, |timer| timer.min(limit)));
+    }
+    let asleep = Instant::now();
     let work =
         pool.work_visible() || frame && shared.replay().is_some_and(|r| r.ready(local.index));
     if shared.is_shut_down() || work && pool.permit_available() {
@@ -701,6 +864,15 @@ fn idle(local: &WorkerLocal) {
             // watch to another sleeper.
             pool.notify_one();
         }
+    }
+    if let (Some(replay), Some(cursor)) = (shared.replay(), stalled)
+        && asleep.elapsed() >= REPLAY_STALL
+        && replay.stalled() == Some(cursor)
+        && !shared.is_shut_down()
+    {
+        // The log names a job this program never makes available. Nothing can change
+        // that, so stop with the evidence instead of hanging until a test times out.
+        abort_on_unwind(|| panic!("{}", replay.stall_report()));
     }
 }
 

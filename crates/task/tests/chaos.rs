@@ -61,7 +61,7 @@ fn run_twice(executor: Executor) -> (Vec<(u32, u32, &'static str, u32)>, Executi
     let placement = Placement::default();
     let mut graph = workload(&placement);
     for _ in 0..2 {
-        graph = executor.block_on(executor.run_graph(graph));
+        graph = executor.block_on(executor.run_graph(graph)).unwrap();
     }
     let log = executor.execution_log().expect("recording was requested");
     executor.shutdown();
@@ -109,7 +109,7 @@ fn an_exhausted_log_hands_over_to_free_scheduling() {
     let chaos = ChaosConfig { seed: 9, force_split: true, record: true, ..ChaosConfig::default() };
     let recorder = builder().chaos(chaos).build().unwrap();
     let placement = Placement::default();
-    let graph = recorder.block_on(recorder.run_graph(workload(&placement)));
+    let graph = recorder.block_on(recorder.run_graph(workload(&placement))).unwrap();
     let log = recorder.execution_log().unwrap();
     recorder.shutdown();
     let one_run = placement.lock().unwrap().len();
@@ -121,7 +121,7 @@ fn an_exhausted_log_hands_over_to_free_scheduling() {
     let placement = Placement::default();
     let mut graph = workload(&placement);
     for _ in 0..3 {
-        graph = replaying.block_on(replaying.run_graph(graph));
+        graph = replaying.block_on(replaying.run_graph(graph)).unwrap();
     }
     assert_eq!(placement.lock().unwrap().len(), one_run * 3);
     replaying.shutdown();
@@ -155,7 +155,7 @@ fn every_chaos_option_keeps_runs_correct() {
                 })
                 .build()
         };
-        executor.block_on(executor.run_graph(graph(vec![node], &[])));
+        executor.block_on(executor.run_graph(graph(vec![node], &[]))).unwrap();
         assert!(hits.iter().all(|hit| hit.load(Ordering::Relaxed) == 1));
         assert_eq!(executor.execution_log().is_some(), chaos.record);
         executor.shutdown();
@@ -165,7 +165,7 @@ fn every_chaos_option_keeps_runs_correct() {
 #[test]
 fn without_chaos_nothing_is_recorded() {
     let executor = builder().build().unwrap();
-    executor.block_on(executor.run_graph(workload(&Placement::default())));
+    executor.block_on(executor.run_graph(workload(&Placement::default()))).unwrap();
     assert!(executor.execution_log().is_none());
     executor.shutdown();
 }
@@ -188,7 +188,7 @@ fn replay_rejects_a_log_it_cannot_follow() {
 
     let recorder =
         builder().chaos(ChaosConfig { record: true, ..ChaosConfig::default() }).build().unwrap();
-    recorder.block_on(recorder.run_graph(workload(&Placement::default())));
+    recorder.block_on(recorder.run_graph(workload(&Placement::default()))).unwrap();
     let log = recorder.execution_log().unwrap();
     recorder.shutdown();
     // A log is tied to the worker count it was recorded with.

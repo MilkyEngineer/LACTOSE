@@ -7,6 +7,8 @@ use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use core::task::{Context, Poll, Waker};
 use std::sync::{Arc, Mutex};
 
+use lactose_core::{Error, ErrorKind, Result};
+
 use crate::chaos::{JobKind, LogRecord};
 use crate::guard::abort_on_unwind;
 use crate::job::JobContext;
@@ -105,7 +107,7 @@ impl GraphBuilder {
     }
 
     /// Validates the dependencies and builds the graph.
-    pub fn build(mut self) -> Result<Graph, GraphError> {
+    pub fn build(mut self) -> core::result::Result<Graph, GraphError> {
         let count = self.nodes.len();
         for &(before, after) in &self.edges {
             for node in [before, after] {
@@ -171,7 +173,11 @@ impl GraphBuilder {
                 roots,
                 pending_nodes: AtomicU32::new(0),
                 ordinal: AtomicU64::new(0),
-                completion: Mutex::new(Completion { finished: false, waker: None }),
+                completion: Mutex::new(Completion {
+                    finished: false,
+                    cancelled: false,
+                    waker: None,
+                }),
             }),
         })
     }
@@ -214,6 +220,8 @@ struct NodeSlot {
 
 struct Completion {
     finished: bool,
+    /// The executor shut down before the run finished.
+    cancelled: bool,
     waker: Option<Waker>,
 }
 
@@ -234,6 +242,40 @@ impl RunState {
     pub(crate) fn ordinal(&self) -> u64 {
         self.ordinal.load(Ordering::Relaxed)
     }
+
+    /// Resolves the run's future to `Cancelled`. Called at shutdown, possibly while a
+    /// worker is still finishing a job of the run.
+    pub(crate) fn cancel(&self) {
+        let waker = {
+            let mut completion = lock(&self.completion);
+            completion.cancelled = true;
+            completion.waker.take()
+        };
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+    }
+}
+
+/// A run state that only exists to give benchmark entries something to point at.
+pub(crate) fn placeholder_run() -> Arc<RunState> {
+    struct Nothing;
+
+    impl GraphNode for Nothing {
+        fn name(&self) -> &'static str {
+            "bench::placeholder"
+        }
+
+        fn units(&self) -> u32 {
+            0
+        }
+
+        fn run(&self, _units: Range<u32>, _ctx: &mut JobContext<'_>) {}
+    }
+
+    let mut builder = GraphBuilder::new();
+    builder.add_node(Arc::new(Nothing));
+    builder.build().expect("one node has no cycle").state
 }
 
 /// An immutable dependency graph, built once and run every frame. A run takes the graph by
@@ -256,23 +298,31 @@ impl Graph {
     }
 }
 
-/// Resolves to the graph when its run has finished. See [`crate::Executor::run_graph`].
-///
-/// If the executor is shut down before the run finishes, this never resolves.
+/// Resolves to the graph when its run has finished, or to an error of kind `Cancelled` if
+/// the executor shut down first. See [`crate::Executor::run_graph`].
 #[must_use = "futures do nothing unless awaited"]
 pub struct GraphRun {
     graph: Option<Graph>,
 }
 
 impl Future for GraphRun {
-    type Output = Graph;
+    type Output = Result<Graph>;
 
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Graph> {
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<Graph>> {
         let graph = self.graph.as_ref().expect("a graph run is not polled after it resolved");
         let mut completion = lock(&graph.state.completion);
         if completion.finished {
             drop(completion);
-            return Poll::Ready(self.graph.take().expect("checked above"));
+            return Poll::Ready(Ok(self.graph.take().expect("checked above")));
+        }
+        if completion.cancelled {
+            drop(completion);
+            // The graph goes with the run: its counters are in an unknown state.
+            self.graph = None;
+            return Poll::Ready(Err(Error::new(
+                ErrorKind::Cancelled,
+                "the executor shut down before the graph run finished",
+            )));
         }
         completion.waker = Some(cx.waker().clone());
         Poll::Pending
@@ -288,29 +338,40 @@ pub(crate) fn start(shared: &Shared, graph: Graph) -> GraphRun {
         slot.pending_dependencies.store(slot.dependencies, Ordering::Relaxed);
     }
     state.pending_nodes.store(state.nodes.len() as u32, Ordering::Relaxed);
-    if state.nodes.is_empty() {
-        lock(&state.completion).finished = true;
+    {
+        let mut completion = lock(&state.completion);
+        completion.finished = state.nodes.is_empty();
+        completion.cancelled = false;
+        if completion.finished {
+            drop(completion);
+            return GraphRun { graph: Some(graph) };
+        }
+    }
+    state.ordinal.store(shared.begin_run(state), Ordering::Relaxed);
+    if shared.is_shut_down() {
+        // Registered first, checked second: either shutdown's sweep finds the run, or this
+        // sees the flag. Cancelling twice is harmless.
+        state.cancel();
         return GraphRun { graph: Some(graph) };
     }
-    state.ordinal.store(shared.begin_run(), Ordering::Relaxed);
-    lock(&state.completion).finished = false;
     // Submitting an entry publishes the stores above to the worker that takes it.
     // `units()` of the roots runs here, on the caller's thread, under the same rule as on a
     // worker: a run that is half released has no state to unwind to.
     abort_on_unwind(|| {
         for &root in &*state.roots {
-            release(shared, state, root);
+            release(shared, state, root, false);
         }
     });
     GraphRun { graph: Some(graph) }
 }
 
 /// Queues `node`, whose dependencies have all finalized, as one range over all its units.
-fn release(shared: &Shared, state: &Arc<RunState>, node: u32) {
+fn release(shared: &Shared, state: &Arc<RunState>, node: u32, keeps_one: bool) {
     let slot = &state.nodes[node as usize];
     let units = slot.node.units();
     slot.pending_units.store(units, Ordering::Relaxed);
-    shared.submit_range(Entry::Range { run: state.clone(), node, units: 0..units, root: true });
+    let entry = Entry::Range { run: state.clone(), node, units: 0..units, root: true };
+    shared.submit_range(entry, keeps_one);
 }
 
 /// Runs `units` of `node` on this worker and, if that completes the node, finalizes it and
@@ -384,7 +445,10 @@ pub(crate) fn run_range(
     }
     if replaying && done != 0 {
         // Finalize is a job of its own in the log, possibly on another worker.
-        shared.submit_range(Entry::Range { run: state.clone(), node, units: 0..0, root: false });
+        shared.submit_range(
+            Entry::Range { run: state.clone(), node, units: 0..0, root: false },
+            false,
+        );
         return;
     }
 
@@ -393,12 +457,15 @@ pub(crate) fn run_range(
     slot.node.finalize(&mut ctx);
     arenas.job.reset();
 
+    let mut kept_one = false;
     for &dependent in
         &state.dependents[slot.dependents.start as usize..slot.dependents.end as usize]
     {
         let pending = &state.nodes[dependent as usize].pending_dependencies;
         if pending.fetch_sub(1, Ordering::AcqRel) == 1 {
-            release(shared, state, dependent);
+            // This worker is about to look for its next entry and takes one of the nodes
+            // it releases here itself, so the first one wakes nobody.
+            release(shared, state, dependent, !core::mem::replace(&mut kept_one, true));
         }
     }
     if state.pending_nodes.fetch_sub(1, Ordering::AcqRel) == 1 {
@@ -410,7 +477,8 @@ pub(crate) fn run_range(
             completion.finished = true;
             completion.waker.take()
         };
-        shared.end_run();
+        let ordinal = state.ordinal();
+        shared.end_run(ordinal);
         if let Some(waker) = waker {
             waker.wake();
         }

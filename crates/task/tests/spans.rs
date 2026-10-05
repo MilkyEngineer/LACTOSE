@@ -46,32 +46,43 @@ impl Subscriber for Recorder {
 fn spans_are_per_node_and_per_split_range_never_per_unit() {
     let recorder = Recorder::default();
     tracing::subscriber::set_global_default(recorder.clone()).unwrap();
-
-    let executor = executor(sized(4, 2), 1);
     let units = sized(4096, 64);
-    let node = |name| Node::new(name).units(units).run(|_, _| std::thread::yield_now()).build();
     let runs = 3;
-    let mut graph = graph(vec![node("spans::wide"), node("spans::other")], &[(0, 1)]);
-    for _ in 0..runs {
-        graph = executor.block_on(executor.run_graph(graph));
-    }
-    executor.shutdown();
+    let count = |name: &str, module: &str| {
+        let spans = recorder.spans.lock().unwrap();
+        spans.iter().filter(|(span, path)| span == name && path == module).count()
+    };
 
-    let spans = recorder.spans.lock().unwrap();
-    for name in ["spans::wide", "spans::other"] {
-        let count = |module: &str| {
-            spans.iter().filter(|(span, path)| span == name && path == module).count()
-        };
-        // Exactly one span per run of the node...
-        assert_eq!(count("lactose_task::node"), runs);
-        // ...and one per range split off it, which there are far fewer of than units: a
-        // range is halved only when a worker's deque has run dry.
-        let ranges = count("lactose_task::range");
-        assert!(ranges >= 1, "{name}: the range was never split across {} workers", sized(4, 2));
-        assert!(
-            ranges < runs * units as usize / 2,
-            "{name}: {ranges} range spans for {units} units"
-        );
+    // One worker makes the count exact. The worker halves what it holds each time its
+    // deque runs dry: 4096 units leave the deque as ranges of 2048, 1024, ... 1, so a run
+    // is one node span and log2(units) range spans, however many units there are.
+    let single = executor(1, 1);
+    let node = Node::new("spans::single").units(units).build();
+    let mut graph_single = graph(vec![node], &[]);
+    for _ in 0..runs {
+        graph_single = single.block_on(single.run_graph(graph_single)).unwrap();
     }
+    single.shutdown();
+    assert_eq!(count("spans::single", "lactose_task::node"), runs);
+    assert_eq!(count("spans::single", "lactose_task::range"), runs * units.ilog2() as usize);
+
+    // With thieves the count depends on how often they come: one range span per steal or
+    // dry deque, and never more than one per unit beyond the first, which is the bound
+    // when every unit is stolen singly.
+    let workers = sized(4, 2);
+    let several = executor(workers, 1);
+    let node = |name| Node::new(name).units(units).run(|_, _| std::thread::yield_now()).build();
+    let mut graph_several = graph(vec![node("spans::wide"), node("spans::other")], &[(0, 1)]);
+    for _ in 0..runs {
+        graph_several = several.block_on(several.run_graph(graph_several)).unwrap();
+    }
+    several.shutdown();
+    for name in ["spans::wide", "spans::other"] {
+        assert_eq!(count(name, "lactose_task::node"), runs);
+        let ranges = count(name, "lactose_task::range");
+        assert!(ranges >= runs, "{name}: a range was never split across {workers} workers");
+        assert!(ranges <= runs * (units as usize - 1), "{name}: {ranges} range spans");
+    }
+    let spans = recorder.spans.lock().unwrap();
     assert!(spans.iter().all(|(name, _)| name.starts_with("spans::")), "{spans:?}");
 }

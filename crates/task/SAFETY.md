@@ -29,7 +29,13 @@ raw pointers that carry no lifetime. One invariant makes that sound:
   count-down, the `ScopeCore` in the opener's frame, the job storage in the opener's scope
   arena, and everything the closure borrowed are alive.
 
-What follows from it:
+The wait itself rests on a second invariant, which is about liveness, not memory: while a
+scope is open, the opening worker's deque receives only that scope's children
+(`Shared::submit_range` sends everything else to the injector), so the opener can find every
+child that is still on its deque by popping. Breaking it would hang the opener; it could not
+free anything early, because the first invariant holds regardless.
+
+What follows from the first:
 
 - **`unsafe impl Send for Entry`.** The raw pointers of a `Child` entry stay valid on any
   thread by the invariant. What they point to may be used from that thread because
@@ -70,14 +76,19 @@ What follows from it:
   may be on different threads) and on `F::Output: Send` (the output crosses threads through a
   mutex).
 - The future is pinned by construction: it is never moved out of the `Arc` allocation, and it
-  is dropped in place by `finish`.
+  is dropped in place, by `finish` or, for a task that lost its handle and every waker while
+  suspended, by the cell's own destructor, which has exclusive access by `&mut self`.
 
 ## Operating-system queries (`platform.rs`)
 
 - macOS: `sysctlbyname` is called with a NUL-terminated name, a pointer to a live `i32` and
   its size, and no new value.
 - Windows: `GetLogicalProcessorInformationEx` is called once with a null buffer to learn the
-  size and once with a buffer of at least that size. The records it wrote are walked by their
-  own `Size` fields within the returned length and read unaligned; the union field read is
-  the one the record's `Relationship` selects.
+  size and once with a writable buffer of at least that size, aligned for the record type.
+  That is all the unsafe there is: the buffer is then copied out as plain bytes and walked by
+  `detect::windows_core_ratings`, safe code that trusts only each record's eight-byte header
+  and bounds every read by the buffer. No record is read through its declared type, whose
+  size (that of its largest variant) is larger than a processor-core record.
 - Linux reads sysfs with safe code.
+- The benchmark (`benches/whisk.rs`) calls `getrusage` on Unix with a pointer to a zeroed
+  `rusage` and reads it only if the call succeeded.

@@ -65,7 +65,7 @@ fn measure(workers: u32, reserved: u32) -> (u32, u32) {
             })
             .build()
     };
-    executor.block_on(executor.run_graph(graph(vec![physics, others], &[])));
+    executor.block_on(executor.run_graph(graph(vec![physics, others], &[]))).unwrap();
     executor.shutdown();
     (peak.load(Ordering::Acquire), during.load(Ordering::Relaxed))
 }
@@ -112,6 +112,66 @@ fn the_pool_recovers_its_full_width_after_a_block() {
             })
             .build()
     };
-    executor.block_on(executor.run_graph(graph(vec![blocker, rendezvous], &[(0, 1)])));
+    executor.block_on(executor.run_graph(graph(vec![blocker, rendezvous], &[(0, 1)]))).unwrap();
     executor.shutdown();
+}
+
+/// An opener that is parked on its scope latch runs nothing, so it must not count as one of
+/// the reserved workers, whether it parked before the block began (as here) or after.
+/// Otherwise `block_in_place(1)` leaves nobody working for the whole physics step.
+#[test]
+fn a_parked_opener_does_not_use_up_the_reservation() {
+    let executor = executor(4, 1);
+    let started = Arc::new(AtomicBool::new(false));
+    let measuring = Arc::new(AtomicBool::new(false));
+    let during = Arc::new(AtomicU32::new(0));
+    let unit = Duration::from_micros(sized(1000, 50).into());
+
+    let opener = {
+        let (started, measuring, during) = (started.clone(), measuring.clone(), during.clone());
+        Node::new("block::opener")
+            .run(move |_, ctx| {
+                let me = ctx.slot();
+                let (started, measuring, during) = (&started, &measuring, &during);
+                ctx.scope(|scope| {
+                    scope.fork_range(0..sized(400, 40), move |_, ctx| {
+                        if ctx.slot() == me {
+                            // The opener waits until a thief has part of the range, then
+                            // races through its own share and parks.
+                            common::wait_for(started);
+                            return;
+                        }
+                        started.store(true, Ordering::Release);
+                        spin_for(unit);
+                        if measuring.load(Ordering::Acquire) {
+                            during.fetch_add(1, Ordering::Relaxed);
+                        }
+                    });
+                });
+            })
+            .build()
+    };
+    let physics = {
+        let (started, measuring) = (started.clone(), measuring.clone());
+        Node::new("block::after-park")
+            .run(move |_, ctx| {
+                common::wait_for(&started);
+                // Long enough for the opener to finish its share and park on the latch.
+                spin_for(unit * 5);
+                ctx.block_in_place(1, || {
+                    std::thread::sleep(unit * 10);
+                    measuring.store(true, Ordering::Release);
+                    std::thread::sleep(unit * 100);
+                    measuring.store(false, Ordering::Release);
+                });
+            })
+            .build()
+    };
+    executor.block_on(executor.run_graph(graph(vec![opener, physics], &[]))).unwrap();
+    executor.shutdown();
+    // Under Miri the clock is simulated and the count means nothing; the paths still run.
+    assert!(
+        cfg!(miri) || during.load(Ordering::Relaxed) > 0,
+        "nothing ran during the block: the parked opener held the one reserved permit"
+    );
 }

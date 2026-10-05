@@ -4,16 +4,23 @@
 //! default aliasing model (Stacked Borrows) rejects `crossbeam-epoch`'s intrusive list, which
 //! is a known limitation upstream tests around with other Miri settings and says nothing
 //! about this crate. The stand-in lets the plain `cargo miri test` check everything this
-//! crate does with the entries it moves through a deque, under the strict model. The real
-//! deque is exercised natively by every test and by the stress test.
+//! crate does with the entries it moves through a deque, under the strict model.
+//!
+//! The real deque runs under Miri too, with the settings it needs, when the environment
+//! variable `LACTOSE_MIRI_REAL_DEQUE` is set (`build.rs` turns it into a `cfg`):
+//!
+//! ```text
+//! LACTOSE_MIRI_REAL_DEQUE=1 MIRIFLAGS="-Zmiri-tree-borrows -Zmiri-ignore-leaks" \
+//!     cargo +nightly miri test -p lactose-task
+//! ```
 
-#[cfg(not(miri))]
+#[cfg(any(not(miri), lactose_miri_real_deque))]
 pub(crate) use crossbeam_deque::{Injector, Steal, Stealer, Worker};
 
-#[cfg(miri)]
+#[cfg(all(miri, not(lactose_miri_real_deque)))]
 pub(crate) use stand_in::{Injector, Steal, Stealer, Worker};
 
-#[cfg(miri)]
+#[cfg(all(miri, not(lactose_miri_real_deque)))]
 mod stand_in {
     use core::cell::Cell;
     use core::marker::PhantomData;
