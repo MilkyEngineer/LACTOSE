@@ -175,7 +175,7 @@ impl ChaosRng {
     }
 }
 
-/// Which pooled work a caller of [`Replay::take`] may be handed.
+/// Which pooled work a caller of [`Chaos::take`] may be handed.
 #[derive(Clone, Copy)]
 pub(crate) enum Filter {
     /// A worker between jobs.

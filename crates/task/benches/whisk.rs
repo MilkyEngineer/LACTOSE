@@ -26,7 +26,7 @@
 //!   are a millisecond apart, so every run starts with the pool parked, as a frame does.
 //!   Each shape is measured alone and with two background tasks compressing with zstd.
 //! - **Wake latency.** From just before a one-node graph is pushed to a parked pool until
-//!   its job starts.
+//!   its job starts. The push comes from a dedicated thread at frame-critical priority.
 //! - **Steal.** Two numbers. `executor` runs a node of empty units with every range forced
 //!   down to single units, so each unit is one entry created by one split and taken by one
 //!   steal or pop; wall time times workers over entries bounds a steal with its split from
@@ -46,9 +46,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crossbeam_deque::{Steal, Worker};
+use lactose_core::ThreadClass;
 use lactose_task::{
     ChaosConfig, Executor, Graph, GraphBuilder, GraphNode, JobContext, NodeId, Platform,
-    StdPlatform, WorkerClass, yield_now,
+    StdPlatform, ThreadSpec, WorkerClass, yield_now,
 };
 
 const MIN_JOB_NANOS: f64 = 10_000.0;
@@ -429,21 +430,37 @@ impl GraphNode for StampNode {
 }
 
 fn measure_wake_latency(executor: &Executor, samples: usize) -> Percentiles {
-    let epoch = Instant::now();
-    let started = Arc::new(AtomicU64::new(0));
-    let mut builder = GraphBuilder::new();
-    builder.add_node(Arc::new(StampNode { epoch, started: started.clone() }));
-    let mut graph = builder.build().expect("one node");
-    let mut latencies = Vec::with_capacity(samples);
-    for sample in 0..samples + WARM_UP_RUNS {
-        // Long enough for every worker to give up scanning and park.
-        std::thread::sleep(Duration::from_millis(2));
-        let pushed = epoch.elapsed().as_nanos() as u64;
-        graph = executor.block_on(executor.run_graph(graph));
-        if sample >= WARM_UP_RUNS {
-            latencies.push(started.load(Ordering::Acquire).saturating_sub(pushed) as f64);
+    // The push comes from a dedicated thread at frame-critical priority, created the way
+    // the engine creates its own (network, present): a push from a thread the system has
+    // demoted to an efficiency core would measure that thread, not the pool.
+    let spec = ThreadSpec {
+        name: "whisk-bench-pusher".to_owned(),
+        class: ThreadClass::Network,
+        index_in_class: 0,
+    };
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let pusher = executor.clone();
+    let body = Box::new(move || {
+        let epoch = Instant::now();
+        let started = Arc::new(AtomicU64::new(0));
+        let mut builder = GraphBuilder::new();
+        builder.add_node(Arc::new(StampNode { epoch, started: started.clone() }));
+        let mut graph = builder.build().expect("one node");
+        let mut latencies = Vec::with_capacity(samples);
+        for sample in 0..samples + WARM_UP_RUNS {
+            // Long enough for every worker to give up scanning and park.
+            std::thread::sleep(Duration::from_millis(2));
+            let pushed = epoch.elapsed().as_nanos() as u64;
+            graph = pusher.block_on(pusher.run_graph(graph));
+            if sample >= WARM_UP_RUNS {
+                latencies.push(started.load(Ordering::Acquire).saturating_sub(pushed) as f64);
+            }
         }
-    }
+        sender.send(latencies).expect("the benchmark waits for the result");
+    });
+    let thread = executor.platform().spawn_thread(spec, body).expect("the pusher thread starts");
+    let latencies = receiver.recv().expect("the pusher thread reports");
+    thread.join();
     percentiles(latencies)
 }
 
