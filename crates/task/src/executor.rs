@@ -41,12 +41,34 @@ impl Executor {
 
     /// Runs every node of `graph` on the frame-critical workers.
     ///
-    /// The returned future resolves when every node has finalized. A node is released when
-    /// all nodes it depends on have finalized; among nodes released together, lower
-    /// [`crate::NodeId`]s are pushed first, though execution order between independent nodes
-    /// is unspecified. Dropping the future does not cancel the run: nodes own their data, so
-    /// the run finishes on its own. One graph has at most one run in flight.
-    pub fn run_graph(&self, graph: Arc<Graph>) -> GraphRun {
+    /// The returned future resolves, handing the graph back, when every node has finalized.
+    /// A node is released when all nodes it depends on have finalized; execution order
+    /// between independent nodes is unspecified.
+    ///
+    /// The run owns the graph, so one graph can never have two runs in flight. Dropping the
+    /// future does not cancel the run: nodes own their data, the run finishes on its own,
+    /// and the graph is then dropped.
+    pub fn run_graph(&self, graph: Graph) -> GraphRun {
+        todo!()
+    }
+
+    /// The number of frame-critical workers.
+    #[must_use]
+    pub fn frame_worker_count(&self) -> u32 {
+        todo!()
+    }
+
+    /// One more than the largest value [`crate::JobContext::slot`] can return.
+    #[must_use]
+    pub fn slot_count(&self) -> u32 {
+        todo!()
+    }
+
+    /// The platform this executor creates threads through. Crates that own a dedicated
+    /// thread (network, present, audio) create it here, never with `std::thread` directly,
+    /// so a console platform controls every engine thread.
+    #[must_use]
+    pub fn platform(&self) -> &Arc<dyn Platform> {
         todo!()
     }
 

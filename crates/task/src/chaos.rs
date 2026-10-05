@@ -3,7 +3,8 @@
 /// Perturbs scheduling to expose ordering bugs that a four-core CI runner never hits.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct ChaosConfig {
-    /// Seeds every perturbation, so a run repeats given the same seed and worker count.
+    /// Seeds every perturbation. The seed alone does not make a run repeat, because real
+    /// threads still race; exact repetition needs a recorded [`ExecutionLog`].
     pub seed: u64,
     /// Choose steal victims and steal timing from the seed.
     pub shuffle_steals: bool,

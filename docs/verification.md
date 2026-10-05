@@ -57,3 +57,6 @@ version in `Cargo.lock` before the milestone that depends on it.
 | Player portability between hosts | 4 (decided-later table, architecture section 22.1) |
 | Multi-process server sharding: out of scope, kept possible by region ownership and command-based cross-region interaction (architecture section 9.6) | none |
 | Local x86-64 runs on Apple Silicon: Rosetta on macOS 14 raises an illegal-instruction fault on the x86-64-v3 baseline, so x86-64 tests and SOUR architecture mode run on CI runners and the x86 desktop, never on the Mac. Re-check after a macOS upgrade | none |
+| Windows efficiency-core steering: `ThreadClass::Background` sets thread priority only. Steering to efficiency cores on hybrid CPUs needs the power-throttling (EcoQoS) thread setting; add and measure it with the `task` benchmarks on the x86 desktop | 0 |
+| `lld-link` on Windows and mold or lld on Linux (architecture section 18) are not configured yet; they go in with the edit-to-playing measurement, once CI runners and developer machines are known to have them | 1 |
+| Whether Apple cores implement FEAT_AFP. `fp::is_deterministic` checks the alternate-mode bits either way | none |

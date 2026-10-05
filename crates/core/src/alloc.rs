@@ -2,7 +2,7 @@
 //!
 //! A binary installs [`TaggedAlloc`] as its `#[global_allocator]`. Code attributes its
 //! allocations by holding a [`TagScope`]; the executor carries the tag of a job or task across
-//! threads. Each allocation remembers its tag in the byte before the returned pointer, so a
+//! threads. Each allocation remembers its tag in one byte after the block, so a
 //! free on any thread, under any scope, is charged back to the right subsystem.
 //!
 //! The current tag is the one thread-local in the boundary. It is written by scopes and read
@@ -123,7 +123,7 @@ impl Drop for TagScope {
 /// A snapshot of one tag's counters.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct TagStats {
-    /// Bytes currently allocated, as requested by callers (headers excluded).
+    /// Bytes currently allocated, as requested by callers (tag bytes excluded).
     pub live_bytes: usize,
     /// Allocations currently alive.
     pub live_allocations: usize,
@@ -151,8 +151,7 @@ impl Counters {
 
 /// A [`GlobalAlloc`] wrapper that accounts live memory per [`AllocTag`].
 ///
-/// Costs one alignment's worth of header per allocation and three relaxed atomic updates per
-/// call. Hot paths allocate from arenas and chunks, not from here.
+/// Costs one byte per allocation and three relaxed atomic updates per call. Hot paths allocate from arenas and chunks, not from here.
 pub struct TaggedAlloc<A = System> {
     inner: A,
     counters: [Counters; AllocTag::COUNT],
@@ -185,13 +184,12 @@ impl<A> TaggedAlloc<A> {
         }
     }
 
-    /// Writes the tag header and returns the caller's pointer.
+    /// Records the allocation and writes its tag byte.
     ///
     /// # Safety
     ///
-    /// `base` must be null or point to an allocation of at least `align` bytes more than
-    /// `size`, aligned to `align`.
-    unsafe fn finish(&self, base: *mut u8, size: usize, align: usize) -> *mut u8 {
+    /// `base` must be null or point to an allocation of at least `size + 1` bytes.
+    unsafe fn finish(&self, base: *mut u8, size: usize) -> *mut u8 {
         if base.is_null() {
             return base;
         }
@@ -200,84 +198,81 @@ impl<A> TaggedAlloc<A> {
         counters.live_bytes.fetch_add(size, Ordering::Relaxed);
         counters.live_allocations.fetch_add(1, Ordering::Relaxed);
         counters.total_allocations.fetch_add(1, Ordering::Relaxed);
-        // SAFETY: the allocation is `align` bytes longer than the caller asked for, so
-        // `base + align` is in bounds and the byte before it is ours. `base + align` keeps
-        // the alignment of `base`.
-        unsafe {
-            let user = base.add(align);
-            user.sub(1).write(tag as u8);
-            user
-        }
+        // SAFETY: the allocation is one byte longer than the caller asked for, so the byte
+        // at `base + size` is in bounds and ours.
+        unsafe { base.add(size).write(tag as u8) };
+        base
     }
 }
 
-/// The layout actually requested from the inner allocator: `layout` plus a header of one
-/// alignment. `None` if that overflows.
-fn with_header(layout: Layout) -> Option<Layout> {
-    let size = layout.size().checked_add(layout.align())?;
-    Layout::from_size_align(size, layout.align()).ok()
+/// The layout actually requested from the inner allocator: `layout` plus one trailing tag
+/// byte. `None` if that is not a valid layout.
+fn with_tag(layout: Layout) -> Option<Layout> {
+    Layout::from_size_align(layout.size().checked_add(1)?, layout.align()).ok()
 }
 
 // SAFETY: every method forwards to the inner allocator with a layout that differs from the
-// caller's only by a header of `layout.align()` bytes placed before the returned pointer.
-// The header keeps the caller's alignment, is never exposed, and is reconstructed from the
-// same `layout` on free and realloc, so the inner allocator always sees the layout it issued.
+// caller's only by one trailing byte, which holds the tag. The returned pointer is the inner
+// allocator's own, so it keeps the requested alignment. The trailing byte is never exposed
+// and is found again from the `layout` the caller passes back, so the inner allocator always
+// sees the layout it issued.
 unsafe impl<A: GlobalAlloc> GlobalAlloc for TaggedAlloc<A> {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        let Some(full) = with_header(layout) else { return core::ptr::null_mut() };
-        // SAFETY: `full` has a non-zero size because the header is at least one byte.
+        let Some(full) = with_tag(layout) else { return core::ptr::null_mut() };
+        // SAFETY: `full` has a non-zero size because of the tag byte.
         let base = unsafe { self.inner.alloc(full) };
         // SAFETY: `base` is null or an allocation of `full`.
-        unsafe { self.finish(base, layout.size(), layout.align()) }
+        unsafe { self.finish(base, layout.size()) }
     }
 
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-        let Some(full) = with_header(layout) else { return core::ptr::null_mut() };
-        // SAFETY: `full` has a non-zero size because the header is at least one byte.
+        let Some(full) = with_tag(layout) else { return core::ptr::null_mut() };
+        // SAFETY: `full` has a non-zero size because of the tag byte.
         let base = unsafe { self.inner.alloc_zeroed(full) };
         // SAFETY: `base` is null or an allocation of `full`.
-        unsafe { self.finish(base, layout.size(), layout.align()) }
+        unsafe { self.finish(base, layout.size()) }
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        let align = layout.align();
-        // SAFETY: `ptr` came from this allocator with `layout`, so the tag byte precedes it,
-        // the inner allocation starts `align` bytes earlier, and the sum below is the size
-        // that `with_header` validated when the block was allocated.
+        // SAFETY: `ptr` came from this allocator with `layout`, so the tag byte follows the
+        // block and `size + 1` with this alignment is the layout `with_tag` validated when
+        // the block was allocated.
         unsafe {
-            let tag = AllocTag::from_byte(ptr.sub(1).read());
+            let tag = AllocTag::from_byte(ptr.add(layout.size()).read());
             let counters = &self.counters[tag as usize];
             counters.live_bytes.fetch_sub(layout.size(), Ordering::Relaxed);
             counters.live_allocations.fetch_sub(1, Ordering::Relaxed);
-            let full = Layout::from_size_align_unchecked(layout.size() + align, align);
-            self.inner.dealloc(ptr.sub(align), full);
+            let full = Layout::from_size_align_unchecked(layout.size() + 1, layout.align());
+            self.inner.dealloc(ptr, full);
         }
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        let align = layout.align();
-        let Some(new_full_size) = new_size.checked_add(align) else {
+        let Some(new_full) =
+            Layout::from_size_align(new_size, layout.align()).ok().and_then(with_tag)
+        else {
             return core::ptr::null_mut();
         };
-        // SAFETY: `ptr` came from this allocator with `layout`, so the inner allocation
-        // starts `align` bytes earlier with the header-extended layout. The caller
-        // guarantees `new_size` is a valid size for `align`; the header-extended size is
-        // checked for overflow above and the inner allocator rejects the rest. The inner
-        // realloc preserves the leading `align` bytes, which hold the tag.
+        // SAFETY: `ptr` came from this allocator with `layout`, so the tag byte follows the
+        // block and the inner allocation has the tag-extended layout. `new_full` is a valid
+        // layout, which is the inner `realloc`'s precondition on the new size. The tag is
+        // read before the inner call, because a shrinking realloc may discard it, and
+        // rewritten at the new end; on failure the old block, tag included, is untouched.
         unsafe {
-            let tag = AllocTag::from_byte(ptr.sub(1).read());
-            let full = Layout::from_size_align_unchecked(layout.size() + align, align);
-            let base = self.inner.realloc(ptr.sub(align), full, new_full_size);
+            let tag = AllocTag::from_byte(ptr.add(layout.size()).read());
+            let full = Layout::from_size_align_unchecked(layout.size() + 1, layout.align());
+            let base = self.inner.realloc(ptr, full, new_full.size());
             if base.is_null() {
                 return base;
             }
+            base.add(new_size).write(tag as u8);
             let live_bytes = &self.counters[tag as usize].live_bytes;
             if new_size >= layout.size() {
                 live_bytes.fetch_add(new_size - layout.size(), Ordering::Relaxed);
             } else {
                 live_bytes.fetch_sub(layout.size() - new_size, Ordering::Relaxed);
             }
-            base.add(align)
+            base
         }
     }
 }
@@ -376,5 +371,22 @@ mod tests {
         // SAFETY: `layout` has a non-zero size.
         assert!(unsafe { alloc.alloc(layout) }.is_null());
         assert_eq!(stats(&alloc, AllocTag::Untagged), (0, 0, 0));
+    }
+
+    #[test]
+    fn oversized_realloc_returns_null_and_keeps_the_block() {
+        let alloc = TaggedAlloc::system();
+        let layout = Layout::from_size_align(32, 8).unwrap();
+        let _scope = AllocTag::Io.scope();
+        // SAFETY: `layout` has a non-zero size; the block is freed once with its layout.
+        unsafe {
+            let ptr = alloc.alloc(layout);
+            ptr.write(42);
+            assert!(alloc.realloc(ptr, layout, isize::MAX as usize - 7).is_null());
+            assert_eq!(ptr.read(), 42);
+            assert_eq!(alloc.stats(AllocTag::Io).live_bytes, 32);
+            alloc.dealloc(ptr, layout);
+        }
+        assert_eq!(alloc.stats(AllocTag::Io).live_allocations, 0);
     }
 }

@@ -17,13 +17,12 @@ comments rely on. The crate's tests run under Miri.
 
 ## `alloc`
 
-- The inner allocator always sees the caller's layout extended by a header of
-  `layout.align()` bytes. The header sits before the returned pointer, so the returned pointer
-  keeps the requested alignment.
-- The tag is the byte immediately before the returned pointer. `dealloc` and `realloc` read
-  it and rebuild the extended layout from the same `layout` the caller passes back.
-- `realloc` forwards to the inner `realloc`, which preserves the leading bytes and therefore
-  the tag.
+- The inner allocator always sees the caller's layout extended by one trailing byte. The
+  returned pointer is the inner allocator's own, so it keeps the requested alignment.
+- The tag is the byte at `ptr + layout.size()`. `dealloc` and `realloc` read it and rebuild
+  the extended layout from the same `layout` the caller passes back.
+- `realloc` validates the new extended layout before calling the inner `realloc`, reads the
+  tag first because a shrink may discard it, and rewrites it at the new end.
 - The current-tag thread-local is const-initialised and has no destructor, so reading it
   inside the allocator cannot allocate or fail during thread teardown.
 

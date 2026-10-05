@@ -5,12 +5,12 @@
 
 use core::num::{NonZeroU32, NonZeroU64};
 
-use bytemuck::{CheckedBitPattern, NoUninit, PodInOption, ZeroableInOption};
+use bytemuck::{CheckedBitPattern, NoUninit, Pod, PodInOption, Zeroable, ZeroableInOption};
 
 use crate::hash::xxh64;
 
 /// A simulation tick index. Sixty ticks are one second of simulation time.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug, Default, NoUninit)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug, Default, Pod, Zeroable)]
 #[repr(transparent)]
 pub struct Tick(pub u32);
 
@@ -97,7 +97,7 @@ impl NetId {
 }
 
 /// Server-assigned player identity for one session.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug, NoUninit)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug, Pod, Zeroable)]
 #[repr(transparent)]
 pub struct PlayerId(pub u32);
 
@@ -145,7 +145,9 @@ impl From<PredictionKey> for StableKey {
 /// An optional [`StableKey`] in padding-free plain-data form, for component fields.
 ///
 /// The all-zero value is the empty reference. Bytes arriving from disk or the network are
-/// validated through [`CheckedBitPattern`], which accepts only canonical encodings.
+/// validated through [`CheckedBitPattern`], which accepts only canonical encodings and
+/// rejects placeholders: a placeholder means something only inside the command buffer that
+/// issued it, and command buffers copy component bytes without that check.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, NoUninit)]
 #[repr(C)]
 pub struct EntityRef {
@@ -229,7 +231,7 @@ impl From<Option<StableKey>> for EntityRef {
 
 // SAFETY: `EntityRef` is four `u32` words with no padding, so every bit pattern of
 // `[u32; 4]` is a memory-valid `EntityRef`. The check below only narrows that to the
-// canonical encodings the constructors produce.
+// canonical encodings the constructors produce, minus placeholders.
 unsafe impl CheckedBitPattern for EntityRef {
     type Bits = [u32; 4];
 
@@ -239,7 +241,7 @@ unsafe impl CheckedBitPattern for EntityRef {
             TAG_NONE => a == 0 && b == 0 && c == 0,
             TAG_NET => (a != 0 || b != 0) && c == 0,
             TAG_PREDICTED => true,
-            TAG_PLACEHOLDER => b == 0 && c == 0,
+            // TAG_PLACEHOLDER is never valid outside a command buffer.
             _ => false,
         }
     }
@@ -260,7 +262,7 @@ impl SystemKey {
 }
 
 /// Build, wire and disk key of a component type: xxh64 of its declared name.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug, NoUninit)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug, Pod, Zeroable)]
 #[repr(transparent)]
 pub struct ComponentKey(pub u64);
 
@@ -355,7 +357,8 @@ mod tests {
             let reference = EntityRef::new(key);
             assert_eq!(reference.get(), Some(key));
             let bits: [u32; 4] = bytemuck::cast(reference);
-            assert!(EntityRef::is_valid_bit_pattern(&bits));
+            let stored_outside_a_command_buffer = !matches!(key, StableKey::Placeholder(_));
+            assert_eq!(EntityRef::is_valid_bit_pattern(&bits), stored_outside_a_command_buffer);
         }
         assert_eq!(EntityRef::NONE.get(), None);
         assert_eq!(bytemuck::bytes_of(&EntityRef::NONE), &[0u8; 16]);
@@ -368,6 +371,24 @@ mod tests {
             assert!(!EntityRef::is_valid_bit_pattern(&bits), "{bits:?}");
             assert!(bytemuck::checked::try_cast::<[u32; 4], EntityRef>(bits).is_err());
         }
+    }
+
+    #[test]
+    fn id_newtypes_are_usable_as_component_fields() {
+        #[derive(Clone, Copy, NoUninit, CheckedBitPattern)]
+        #[repr(C)]
+        struct Fuse {
+            expires: Tick,
+            owner: PlayerId,
+            target: EntityRef,
+            origin: Option<NetId>,
+        }
+        let fuse =
+            Fuse { expires: Tick(9), owner: PlayerId(1), target: EntityRef::NONE, origin: None };
+        let bytes = bytemuck::bytes_of(&fuse).to_vec();
+        // A byte buffer has no alignment, as on the load and receive paths.
+        let back: Fuse = bytemuck::checked::pod_read_unaligned(&bytes);
+        assert_eq!((back.expires, back.owner), (Tick(9), PlayerId(1)));
     }
 
     #[test]

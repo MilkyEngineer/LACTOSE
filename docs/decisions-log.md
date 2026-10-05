@@ -886,13 +886,15 @@ rationale the author supplied during the editorial pass rather than one taken fr
   the SOUR mode runner, so CI logic is Rust that runs the same on every platform.
 - Driven by: milestone 0 foundation.
 
-**D88. Allocator tagging: a fixed tag per subsystem, a one-alignment header, a thread-local current tag** (§22.1, `lactose-core::alloc`)
+**D88. Allocator tagging: a fixed tag per subsystem, one trailing tag byte, a thread-local current tag** (§22.1, `lactose-core::alloc`)
 - Why: budgets need live bytes per subsystem, and a free can happen on any thread under any
-  scope. Each allocation stores its tag in the byte before the returned pointer, at the cost
-  of one alignment of header, so frees are charged back correctly without a side table. The
+  scope. Each allocation stores its tag in one byte after the block, found again from the
+  layout the caller passes back, so frees are charged back correctly without a side table
+  and page-aligned buffers waste nothing (a header before the block would cost a full
+  alignment; foundation review, finding 10). The
   current tag is a const-initialised thread-local set by `TagScope` and carried across threads
   by the executor. It is the one thread-local inside the boundary; no simulation result can
-  observe it. Counters belong to the allocator instance, so tests need no global state.
+  observe it, and §8.2 names it as the one exception. Counters belong to the allocator instance, so tests need no global state.
 - Driven by: the "allocator tagging scheme" item of §22.1, due in milestone 0.
 
 **D89. `EntityRef` is the plain-data form of an optional `StableKey`; `EntityId` has no ordering** (§7, `lactose-core::id`)
@@ -901,7 +903,8 @@ rationale the author supplied during the editorial pass rather than one taken fr
   in four `u32` words with a canonical-encoding check on load and receive, and all-zero as the
   empty reference. `EntityId` implements neither `Ord` nor `PartialOrd`, so it cannot become an
   ordering rule by accident. This removes the dependence on `bytemuck_derive` support for
-  data-carrying enums for references.
+  data-carrying enums for references. The check rejects placeholders, which mean something
+  only inside the command buffer that issued them.
 - Driven by: milestone 0 foundation; verification §2 (`bytemuck_derive` claim).
 
 **D90. The `task` surface: `'static` graph nodes, an explicit job context, typed thread lanes** (§5.1, `crates/task/README.md`)
@@ -912,7 +915,12 @@ rationale the author supplied during the editorial pass rather than one taken fr
   each job, not a free function over thread-local state, and `scope` takes `&mut self`, so
   "inside a job only" and "never nested" are compile errors rather than debug assertions. A
   lane is typed over state that never leaves its thread, so the main thread's window and the
-  present thread's surface need not be `Send`.
+  present thread's surface need not be `Send`. The foundation review tightened four points:
+  `Scope` is neither `Send` nor `Sync`, so a child cannot fork into its parent's scope from
+  another worker; a run takes its `Graph` by value and hands it back, so two runs can never
+  share counters; `JobContext::slot` gives reductions lock-free per-slot partial storage and is
+  documented as never a semantic key; and `block_in_place` with a reserved-worker count is the
+  §16 physics wait, with dedicated threads created through `Executor::platform`.
 - Driven by: milestone 0 foundation; §20 requires these signatures before the task is assigned.
 
 **D91. Thread-locals are banned through `std::thread::LocalKey`** (§8.3, boundary `clippy.toml`)
@@ -922,6 +930,16 @@ rationale the author supplied during the editorial pass rather than one taken fr
   function.
 - Driven by: milestone 0 foundation.
 - Replaced: the `disallowed-macros` entry of revision 3.2.
+
+**D92. The milestone 0 makespan threshold is measured against the scheduling lower bound** (§22, `crates/task/README.md`)
+- Why: revision 3.2 divided makespan by critical-path length. On the wide-shallow shape that
+  ratio is large for any scheduler, an ideal one included: a thousand independent jobs on
+  eight workers take at least total work divided by eight, many times the longest single
+  job. The denominator is now the larger of the duration-weighted critical path and total
+  work divided by worker count, which no scheduler can beat, so 1.0 is ideal on every shape
+  and the 1.25 and 1.5 thresholds mean the same thing on all three.
+- Driven by: foundation review, finding 6.
+- Replaced: revision 3.2's critical-path-only denominator.
 
 ## 10. Review history
 

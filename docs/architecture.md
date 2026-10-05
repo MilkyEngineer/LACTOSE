@@ -176,8 +176,8 @@ Chunk jobs decrement it. The job that reaches zero runs the system's finalize st
 reductions merge partials) and then decrements the counters of dependent systems, pushing any
 that reach zero. No worker ever blocks waiting for a system.
 
-**Fork-join inside a job only.** `task::scope(|s| s.fork(...))` with an invariant `'scope`
-lifetime, closure-only, the shape of `std::thread::scope`. Children are closures that may
+**Fork-join inside a job only.** `ctx.scope(|s| s.fork(...))` on the context each job
+receives, with an invariant `'scope` lifetime, closure-only, the shape of `std::thread::scope`. Children are closures that may
 borrow from the scope. The opener runs only jobs belonging to its own scope while waiting,
 then spins briefly, then parks on the scope's latch. It never runs unrelated system jobs and
 never runs background work while waiting. A job may open scopes in sequence but never nested. Child jobs are
@@ -470,7 +470,8 @@ presentation, pose evaluation, VFX, audio, UI, asset IO timing and input samplin
   detection selects correctly rounded paths only and is allowlisted.
 - No wall-clock time. `Instant` and `SystemTime` are banned; `Duration` as a value type is
   fine. Tick index and fixed delta only.
-- No thread-local state. No global mutable state.
+- No thread-local state. No global mutable state. The one exception is the allocation tag
+  in `core`, which the allocator alone reads and no simulation result can observe.
 - Hash maps are `core::FixedHashMap`. Iteration order is never observable.
 - Chunk index, row index, worker index and task order are never semantic keys. The API makes
   them unavailable. RNG draws are keyed by (region seed, tick, system key, stable entity key) through a
@@ -916,7 +917,7 @@ The policy is in section 3.
 | `io` | platform completion APIs |
 | `rhi-vulkan`, `rhi-metal`, `rhi-dx12` | FFI to graphics drivers (`rhi-api` and `rhi-null` are not exempt) |
 | `platform` | present-thread QoS and window handles |
-| `core` | arenas, handle tables, `unsafe impl` for generic plain-data types, the `thread_class` helper that `audio` and `physics-rapier` use instead of their own `unsafe` |
+| `core` | arenas, the tagged allocator, handle tables, `unsafe impl` for generic plain-data types, the `thread_class` helper that `audio` and `physics-rapier` use instead of their own `unsafe` |
 | `tools/cook` | FFI to Slang and compression libraries |
 
 Each carries `SAFETY.md`. Every `unsafe` block has a `// SAFETY:` comment.
@@ -925,7 +926,7 @@ Each carries `SAFETY.md`. Every `unsafe` block has a `// SAFETY:` comment.
 
 | # | Name | Delivers | Proves |
 |---|---|---|---|
-| 0 | Skeleton | Workspace, CI matrix, `core` with tagged allocator, `math`, `task`, `reflect`, `asset-api`, `bundle`, tracing, SOUR scaffold, `ecs` facade with the section 6.1 API | Makespan divided by critical-path length at most 1.25 at P50 and 1.5 at P99 on three DAG shapes (wide-shallow, deep chain, fan-in-fan-out) with log-uniform job durations from 10 µs to 1 ms, with and without two background zstd threads, on a developer M-series Mac and an x86 desktop. Wake latency under 20 µs at P99; steal under 1 µs. Latch and sleep-wake pass loom; `task` and `ecs` pass Miri. |
+| 0 | Skeleton | Workspace, CI matrix, `core` with tagged allocator, `math`, `task`, `reflect`, `asset-api`, `bundle`, tracing, SOUR scaffold, `ecs` facade with the section 6.1 API | Makespan divided by its lower bound (the larger of the duration-weighted critical path and total work divided by worker count) at most 1.25 at P50 and 1.5 at P99 on three DAG shapes (wide-shallow, deep chain, fan-in-fan-out) with log-uniform job durations from 10 µs to 1 ms, with and without two background zstd threads, on a developer M-series Mac and an x86 desktop. Wake latency under 20 µs at P99; steal under 1 µs. Latch and sleep-wake pass loom; `task` and `ecs` pass Miri. |
 | 1 | World | Sim track: `ecs`, `sim`, `physics-api` plus `physics-rapier`, `anim`, `predict`, `persist` (policy, records, container), `asset-api`, `net-api` and `input` types, headless `app`. Render track: RHI spike, `rhi-null`. Asset track: `io`, `asset`, `cook` skeleton. | 100k entities simulate a tick in at most 4 ms on 8 performance cores; SOUR passes in workers, repeat, layout and chaos modes. Physics snapshot conformance. Physics phase at most 3 ms for 2,000 awake bodies; prediction-world snapshot at most 100 µs; sim-skeleton evaluation at most 0.5 ms for 200 characters. Netcode spike over a throwaway transport: x86 server, aarch64 client, one predicted character, fifty claimed dynamic bodies; correction rate, rollback cost per tick and divergence recorded as the baseline that milestone 4's threshold is judged against. Scalar decided by the section 16 rule. Edit-to-playing at most 30 s per platform. |
 | 2 | Pixels | `platform`, `rhi-api`, `rhi-vulkan`, `render-graph`, minimal `renderer`, Slang toolchain, `present-api`, presentation snapshot and schedule | A triangle through the graph on Windows and macOS. MoltenVK, KosmicKrisp and native Metal spikes recorded, and `rhi-api` frozen or amended on their findings. Overlap with exclusive extract; extract at most 1 ms for 50k dirty rows; remote transform upload at most 1 ms for 5k entities at 144 Hz. lavapipe CI; macOS shader runner. |
 | 3 | GPU-driven | GPU scene with cell-plus-offset, cluster submission, culling, deferred tile-local lighting, streaming regions with `persist` overlay against the cooked baseline, `terrain`, pose evaluation, `rhi-metal` | 500k instances through compacted index buffers with one indexed indirect draw per pipeline, at most 2 ms GPU on RTX 3060-class and 4 ms on M1-class at 1440p, on Vulkan and Metal. Regions persist across unload and reload. Skinned characters on terrain. |

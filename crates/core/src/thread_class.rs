@@ -27,6 +27,11 @@ impl ThreadClass {
     /// The floating-point state is always set (see [`fp::set_deterministic`]). The scheduling
     /// class is best effort: an operating system that refuses it yields an error of kind
     /// `Platform`, and the thread still runs correctly at its default priority.
+    ///
+    /// Enter a class once, at thread start. On Linux the background class lowers priority
+    /// in a way an unprivileged thread cannot undo, so a later `enter` of another class
+    /// leaves it lowered. On Windows the class sets thread priority only; steering
+    /// background threads to efficiency cores is an open item in `docs/verification.md`.
     pub fn enter(self) -> Result<()> {
         fp::set_deterministic();
         os::set_scheduling(self)
@@ -106,7 +111,12 @@ pub mod fp {
         const ROUNDING: u64 = 0b11 << 22;
         const FLUSH_TO_ZERO: u64 = 1 << 24;
         const DEFAULT_NAN: u64 = 1 << 25;
-        const MUST_BE_CLEAR: u64 = TRAP_ENABLES | ROUNDING | FLUSH_TO_ZERO | DEFAULT_NAN;
+        // Alternate modes: flush inputs to zero, alternate handling and NaN element
+        // propagation (FEAT_AFP), half-precision flush to zero, alternate half-precision.
+        // They read as zero and ignore writes on cores without the feature.
+        const ALTERNATE: u64 = 0b111 | 1 << 19 | 1 << 26;
+        const MUST_BE_CLEAR: u64 =
+            TRAP_ENABLES | ROUNDING | FLUSH_TO_ZERO | DEFAULT_NAN | ALTERNATE;
 
         fn read() -> u64 {
             let value: u64;

@@ -63,6 +63,24 @@ disallowed-methods = [
   { path = "f64::powf", reason = "platform libm; use lactose_math" },
   { path = "f64::cbrt", reason = "platform libm; use lactose_math" },
   { path = "f64::hypot", reason = "platform libm; use lactose_math" },
+  { path = "f32::algebraic_add", reason = "lets the optimiser reassociate and contract" },
+  { path = "f32::algebraic_sub", reason = "lets the optimiser reassociate and contract" },
+  { path = "f32::algebraic_mul", reason = "lets the optimiser reassociate and contract" },
+  { path = "f32::algebraic_div", reason = "lets the optimiser reassociate and contract" },
+  { path = "f32::algebraic_rem", reason = "lets the optimiser reassociate and contract" },
+  { path = "f32::to_le_bytes", reason = "observes NaN sign and payload; use lactose_math canonical bits" },
+  { path = "f32::to_be_bytes", reason = "observes NaN sign and payload; use lactose_math canonical bits" },
+  { path = "f32::to_ne_bytes", reason = "observes NaN sign and payload; use lactose_math canonical bits" },
+  { path = "f32::abs_sub", reason = "platform libm; use lactose_math" },
+  { path = "f64::algebraic_add", reason = "lets the optimiser reassociate and contract" },
+  { path = "f64::algebraic_sub", reason = "lets the optimiser reassociate and contract" },
+  { path = "f64::algebraic_mul", reason = "lets the optimiser reassociate and contract" },
+  { path = "f64::algebraic_div", reason = "lets the optimiser reassociate and contract" },
+  { path = "f64::algebraic_rem", reason = "lets the optimiser reassociate and contract" },
+  { path = "f64::to_le_bytes", reason = "observes NaN sign and payload; use lactose_math canonical bits" },
+  { path = "f64::to_be_bytes", reason = "observes NaN sign and payload; use lactose_math canonical bits" },
+  { path = "f64::to_ne_bytes", reason = "observes NaN sign and payload; use lactose_math canonical bits" },
+  { path = "f64::abs_sub", reason = "platform libm; use lactose_math" },
 ]
 
 disallowed-types = [
@@ -71,6 +89,8 @@ disallowed-types = [
   { path = "std::collections::HashMap", reason = "use lactose_core::FixedHashMap" },
   { path = "std::collections::HashSet", reason = "randomly seeded; iteration order is observable" },
   { path = "std::hash::RandomState", reason = "randomly seeded" },
+  { path = "hashbrown::HashMap", reason = "use lactose_core::FixedHashMap", allow-invalid = true },
+  { path = "hashbrown::HashSet", reason = "iteration order is observable", allow-invalid = true },
   # Bans `thread_local!` through the type it declares. The `disallowed-macros` lint cannot
   # be used for it: on the pinned toolchain a local `expect` does not reach an item macro.
   { path = "std::thread::LocalKey", reason = "no thread-local state inside the boundary" },

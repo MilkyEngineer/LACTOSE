@@ -152,6 +152,14 @@ impl<K: Eq + Hash, V> FixedHashMap<K, V> {
         self.inner.remove(key)
     }
 
+    /// Keeps the entries for which `keep` returns true.
+    ///
+    /// `keep` is called in an unspecified order. It must decide from the entry alone and
+    /// must not record the order of its calls, or iteration order becomes observable.
+    pub fn retain(&mut self, mut keep: impl FnMut(&K, &mut V) -> bool) {
+        self.inner.retain(|key, value| keep(key, value));
+    }
+
     /// The value stored for `key`, inserting the result of `make` first if there is none.
     pub fn get_or_insert_with(&mut self, key: K, make: impl FnOnce() -> V) -> &mut V {
         self.inner.entry(key).or_insert_with(make)
@@ -191,6 +199,8 @@ mod tests {
         assert_eq!(map.remove("a"), Some(11));
         assert!(!map.contains_key("a"));
         assert_eq!(map.len(), 2);
+        map.retain(|_, value| *value > 5);
+        assert_eq!(map.sorted(), [(&"c", &7)]);
     }
 
     #[test]

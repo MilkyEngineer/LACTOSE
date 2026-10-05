@@ -11,8 +11,10 @@ use crate::job::JobContext;
 /// One system, pass or other unit of a [`Graph`].
 ///
 /// A node owns or shares its data (`'static`); the executor never borrows from the caller
-/// across threads. `lactose-ecs` implements this for a system bound to a world and takes
-/// responsibility there for the declared-access discipline that makes shared access sound.
+/// across threads, and a run takes no per-run argument. `lactose-ecs` implements this for a
+/// system bound to a shared world, and owns the argument that makes that sound: declared
+/// access for concurrent nodes, and running exclusive systems between graph runs, when no
+/// node is live.
 pub trait GraphNode: Send + Sync + 'static {
     /// The name used for the tracing span emitted once per run and once per stolen range.
     fn name(&self) -> &'static str;
@@ -28,7 +30,11 @@ pub trait GraphNode: Send + Sync + 'static {
 
     /// Runs exactly once per run, after every unit has been processed and every scope opened
     /// by [`GraphNode::run`] has closed, and before any dependent node is released.
-    /// Reductions merge their partial results here. Also called when `units()` is zero.
+    /// Also called when `units()` is zero.
+    ///
+    /// Reductions merge their partial results here. `run` is called a scheduling-dependent
+    /// number of times, so a node keeps one partial per [`JobContext::slot`] and merges
+    /// them with a combiner whose result does not depend on order.
     fn finalize(&self, ctx: &mut JobContext<'_>) {}
 }
 
@@ -74,7 +80,8 @@ impl GraphBuilder {
     }
 }
 
-/// An immutable dependency graph, built once and run every frame.
+/// An immutable dependency graph, built once and run every frame. A run takes the graph by
+/// value and hands it back, so runs of one graph cannot overlap.
 pub struct Graph {
     _private: (),
 }
@@ -91,25 +98,18 @@ impl Graph {
     pub fn is_empty(&self) -> bool {
         todo!()
     }
-
-    /// The longest dependency chain, in nodes. The benchmark harness divides makespan by
-    /// the summed duration along this chain.
-    #[must_use]
-    pub fn critical_path_len(&self) -> usize {
-        todo!()
-    }
 }
 
-/// Resolves when a graph run has finished. See [`crate::Executor::run_graph`].
+/// Resolves to the graph when its run has finished. See [`crate::Executor::run_graph`].
 #[must_use = "futures do nothing unless awaited"]
 pub struct GraphRun {
     _private: (),
 }
 
 impl Future for GraphRun {
-    type Output = ();
+    type Output = Graph;
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Graph> {
         todo!()
     }
 }
