@@ -26,14 +26,14 @@ version in `Cargo.lock` before the milestone that depends on it.
 
 | Claim | Gates milestone |
 |---|---|
-| `wide` and glam select fused or unfused multiply-add by target feature. | 0 |
-| `libm`'s x86 runtime detection selects only correctly rounded paths. | 0 |
+| `wide` and glam select fused or unfused multiply-add by target feature. | 0. **Done:** confirmed on wide 1.7.1 (`f32x4::mul_add`) and glam 0.34.0 (`m128_mul_add` in `sse2.rs`); the x86-64-v3 pin makes the selection constant |
+| `libm`'s x86 runtime detection selects only correctly rounded paths. | 0. **Done:** on 0.2.16 the only run-time detection chooses between FMA3, FMA4 and a soft fused multiply-add, all correctly rounded; the `arch` feature otherwise selects hardware `sqrt`, `fma` and `rint` only. Pinned to `=0.2.16` (D105) |
 | Whether Rapier, parry or its math crates call `wide::mul_add` on solver paths. | 1 |
 | Rapier: its determinism feature combines with its parallel solver with bit-identical results for any pool size; SIMD is always on; the 64-bit build has the determinism feature; its math moved to glam-based crates. Whether a single active set makes results depend on unrelated awake bodies is tested by stepping a scene with and without a distant awake body. | 1 |
 | MoltenVK multi-draw-indirect is a CPU loop. | 2 |
 | Slang's Metal target supports argument buffers, function constants and framebuffer fetch. | 2 |
 | Apple M1 lacks 64-bit atomics. | 3 |
-| glam or its fork has a feature (such as fast-math) that changes numerics on the pinned version; if so it goes on the cargo-deny denylist. | 0 |
+| glam or its fork has a feature (such as fast-math) that changes numerics on the pinned version; if so it goes on the cargo-deny denylist. | 0. **Done:** `fast-math` changes numerics on glam 0.33.0 to 0.33.7, is a no-op from 0.33.8 and gone in 0.34; `scalar-math`, `core-simd`, `libm` and `nostd-libm` select different code. A commented ban is ready in `deny.toml`; which version Rapier selects is a milestone 1 check |
 | `bytemuck_derive` on the pinned version: support for data-carrying enums under `NoUninit` and `CheckedBitPattern`, and whether a `PodInOption` derive exists for `NetId`. | 0. **Done:** 1.12.1 derives both traits for data-carrying enums with an explicit repr; it has no `PodInOption` derive, so `NetId` keeps its hand-written impls in `lactose-core`. `[T; N]` is plain data only for `T: Pod`, hence `lactose_core::PlainArray`. Its struct `CheckedBitPattern` derive needs `bytemuck` as a direct dependency and accepts `r#repr`, so `#[component]` writes and checks that impl itself (D97) |
 | loom's current limitations (SeqCst modelled as AcqRel, no load buffering) and feasible preemption bound for the latch and sleep model. | 0 |
 | `tracing-tracy` per-span overhead, to confirm per-system and per-range spans fit the budget. | 0 |
@@ -63,4 +63,7 @@ version in `Cargo.lock` before the milestone that depends on it.
 | Enforcing that the loader of a simulation-read asset kind is a pure byte decoder or lives in a boundary crate (D99); today it is a documented obligation on `SimulationAsset` | 1 |
 | The store traits have no residency, unload or budget methods; milestone 3 streaming amends them | 3 |
 | `cargo xtask features` should fail if any normal or build edge enables `lactose-asset-api/conformance` (the reference store is for dev-dependencies only) | 1 |
+| Cross-architecture agreement of `lactose-math`: the golden table was generated on aarch64; the proof is the first green CI run of `golden_vectors_match` on x86-64 Linux and Windows | 0 |
+| `cargo xtask boundary` should check that `rustdocflags` in `.cargo/config.toml` equals the rustflags pin | 1 |
+| `lactose-reflect` field impls for the `lactose-math` types (`Scalar` as `ScalarField`, vectors as structs of scalars) are added with the `ecs` facade | 0 |
 | Whether Apple cores implement FEAT_AFP. `fp::is_deterministic` checks the alternate-mode bits either way | none |

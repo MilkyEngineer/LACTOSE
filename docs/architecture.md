@@ -451,14 +451,17 @@ presentation, pose evaluation, VFX, audio, UI, asset IO timing and input samplin
   platform library by accident. Transcendentals come from the `libm` crate. `math` owns `min`, `max` and `clamp` as explicit
   compare-and-select with defined signed-zero and NaN results, because the standard library
   versions are documented as nondeterministic on signed zero. `f32::min`, `f32::max`, `clamp`, `powi`, `total_cmp`,
-  `to_bits`, `copysign` and `is_sign_negative` and their `f64` forms are banned outside
+  `to_bits`, `copysign`, `is_sign_negative`, `is_sign_positive`, `rem_euclid`, `div_euclid` and
+  `mul_add` and their `f64` forms are banned outside
   `math`, as are trait routes to the platform library such as `num_traits::Float`; NaN sign and payload are never
   observable. NaNs are canonicalised before hashing and serialisation, and producing one in a
   persistent column is a debug assertion.
 - Fused multiply-add is correctly rounded and permitted. The hazard is code that chooses fused
   or unfused by target feature, which `wide` and glam do. Therefore x86-64 targets are pinned
-  to the x86-64-v3 baseline through target-specific rustflags in `.cargo/config.toml` (never
-  the environment variable, which replaces them), `math` contains a `compile_error!` on x86-64
+  to the x86-64-v3 baseline through target-specific rustflags and rustdocflags in
+  `.cargo/config.toml` (never the environment variable, which replaces them; cargo does not
+  pass rustflags to doctests). `math`'s fused multiply-add is never inlined into a caller, so
+  it is always compiled under that pin, `math` contains a `compile_error!` on x86-64
   without the `fma` feature so a dropped pin fails the build, and `target-cpu=native` is
   denied.
 - SIMD is permitted for IEEE basic operations. Reduction order inside SIMD code is written out

@@ -1041,6 +1041,35 @@ rationale the author supplied during the editorial pass rather than one taken fr
   needs an encoding that does not change when the enum gains a kind.
 - Driven by: asset-api lane review, finding 8.
 
+**D104. `math` min, max and clamp: numeric order refined by -0 < +0, NaN absorbing** (§8.2, `lactose-math`)
+- Why: §5.2 uses `math` min and max as order-independent reductions, which needs them
+  commutative and associative on every input. A bare compare-and-select returns a different
+  operand depending on which side the NaN is on. The rule is IEEE 754-2019 minimum and
+  maximum; `clamp(x, lo, hi)` is `x.max(lo).min(hi)` and never panics.
+- Driven by: milestone 0 math lane.
+
+**D105. Canonical bits collapse every NaN and keep negative zero; `sqrt` and fused multiply-add use the hardware instruction; `libm` is pinned exactly** (§8.2, `lactose-math`)
+- Why: negative zero is observable through arithmetic, so collapsing it would let two different
+  states hash equal. `sqrt` and `mul_add` are correctly rounded, so only the route matters:
+  under the x86-64-v3 pin they compile to one instruction, whereas `libm::fma` on x86-64
+  selects through CPU detection at run time. `Scalar::mul_add` is `inline(never)`, because an
+  inlined copy is compiled with the caller's target features and a caller built without the
+  pin (a doctest, for one) would call the platform `fma`; the float `mul_add` methods are on
+  the boundary ban list for the same reason. `libm` is pinned to one exact version with only
+  its `arch` feature: its releases change transcendental algorithms, so a bump is a
+  determinism change that regenerates the golden table.
+- Driven by: milestone 0 math lane and its review, findings 1 and 7; verification §2.
+
+**D106. Float reductions use an exact superaccumulator, and reducers are sealed** (§5.2, `lactose-math::ExactSum`)
+- Why: a fixed-point `i128` must quantise inputs and saturate, and saturation is not
+  associative. A 2240-bit integer in units of the smallest subnormal holds every finite sum
+  exactly and rounds once, so the result is the correctly rounded true sum for any order and
+  grouping, at 288 bytes per partial per scalar lane. `Reducer` is sealed and `Min`/`Max`
+  accept only `Scalar` and primitive integers, because a reducer carries a determinism
+  contract (a tie-breaking `Ord` would make the result depend on order) that a game crate
+  must not be able to implement wrongly.
+- Driven by: milestone 0 math lane and its review, finding 4.
+
 ## 10. Review history
 
 - **Revision 1** (`a29af04`): the design baseline.

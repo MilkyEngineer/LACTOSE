@@ -81,6 +81,14 @@ disallowed-methods = [
   { path = "f64::to_be_bytes", reason = "observes NaN sign and payload; use lactose_math canonical bits" },
   { path = "f64::to_ne_bytes", reason = "observes NaN sign and payload; use lactose_math canonical bits" },
   { path = "f64::abs_sub", reason = "platform libm; use lactose_math" },
+  { path = "f32::is_sign_positive", reason = "observes NaN sign" },
+  { path = "f32::rem_euclid", reason = "goes through `%`, the platform fmod; use lactose_math" },
+  { path = "f32::div_euclid", reason = "goes through `%`, the platform fmod; use lactose_math" },
+  { path = "f32::mul_add", reason = "result depends on the caller's target features; use lactose_math::Scalar::mul_add" },
+  { path = "f64::is_sign_positive", reason = "observes NaN sign" },
+  { path = "f64::rem_euclid", reason = "goes through `%`, the platform fmod; use lactose_math" },
+  { path = "f64::div_euclid", reason = "goes through `%`, the platform fmod; use lactose_math" },
+  { path = "f64::mul_add", reason = "result depends on the caller's target features; use lactose_math::Scalar::mul_add" },
 ]
 
 disallowed-types = [

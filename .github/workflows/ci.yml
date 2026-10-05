@@ -46,6 +46,9 @@ jobs:
       # nextest does not run doctests; the compile_fail ones pin safety arguments.
       - name: Doctests
         run: cargo test --doc --workspace --locked
+      # Release codegen differs from debug; the golden table must hold in both.
+      - name: Math golden vectors (release)
+        run: cargo nextest run -p lactose-math --release --locked
 
   # The rules that are facts about manifests and files: crate-tiers.toml, the boundary's
   # static checks, the feature trees and cargo-deny. Each step runs even if an earlier one
