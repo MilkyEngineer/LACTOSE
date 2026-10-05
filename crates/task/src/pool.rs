@@ -501,6 +501,9 @@ impl Shared {
 /// The body of a worker thread.
 pub(crate) fn worker_thread(seed: WorkerSeed) {
     let WorkerSeed { class, index, deque, thread, shared } = seed;
+    // The platform applied the thread's class. The floating-point state is asserted here
+    // as well, so it holds under a platform that sets scheduling its own way.
+    lactose_core::thread_class::fp::set_deterministic();
     if thread.send(std::thread::current()).is_err() {
         return;
     }
@@ -690,10 +693,14 @@ fn idle(local: &WorkerLocal) {
     } else {
         pool.sleep.park(local.index, deadline);
     }
-    if frame && shared.timers.release(local.index) {
-        // Deadlines remain and this worker may be about to take a job; hand the watch to
-        // another sleeper.
-        pool.notify_one();
+    if frame {
+        // If the park timed out, this is the deadline it was for.
+        shared.timers.fire_due();
+        if shared.timers.release(local.index) {
+            // Later deadlines remain and this worker may be about to take a job; hand the
+            // watch to another sleeper.
+            pool.notify_one();
+        }
     }
 }
 
@@ -750,8 +757,8 @@ pub(crate) fn drain_range(
     done
 }
 
-/// Sleeps briefly without parking. Used where a wait is expected to be shorter than a
-/// park and unpark round trip.
+/// Spins until `done` returns `true` or `limit` has passed, and returns what `done` last
+/// said. Used where a wait is expected to be shorter than a park and unpark round trip.
 pub(crate) fn spin_until(limit: Duration, done: impl Fn() -> bool) -> bool {
     if limit.is_zero() {
         return done();
