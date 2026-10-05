@@ -1,0 +1,53 @@
+# Data for the checks in tools/xtask that crate-tiers.toml does not hold. crate-tiers.toml
+# stays the only statement of tiers and of the boundary list; this file never repeats either.
+# `cargo xtask boundary`, `cargo xtask features` and `cargo xtask sour` read it.
+
+# Architecture section 21: the crates that may contain `unsafe`. Each carries SAFETY.md. Every
+# other workspace crate carries `#![forbid(unsafe_code)]` in its crate roots. Changing this
+# list means changing section 21 in the same commit.
+[unsafe_crates]
+crates = [
+  "lactose-task", "lactose-ecs", "lactose-io", "lactose-rhi-vulkan", "lactose-rhi-metal",
+  "lactose-rhi-dx12", "lactose-platform", "lactose-core", "lactose-cook",
+]
+
+# Architecture section 8.2: the dependency allowlist of the determinism boundary. cargo-deny
+# cannot express an allowlist per depending crate, so `cargo xtask boundary` enforces this
+# table and deny.toml keeps the workspace-wide rules.
+#
+# A boundary crate may always depend on another boundary crate (subject to the tier check).
+# Its normal and build dependencies on anything else must be named here. Dev-dependencies on
+# workspace crates are left to the tier check; third-party dev-dependencies are listed under
+# `dev` so a new one is still a reviewed change.
+
+# Non-boundary foundation crates. Section 8.2 names the first four for any boundary crate
+# ("only for types and for operations that are deterministic by construction") and `task` for
+# `ecs` alone ("for execution only"). The two proc-macro crates are added under decision D87:
+# they run on the host at compile time and the code they emit lands in the invoking crate.
+[boundary_internal]
+any = [
+  "lactose-reflect", "lactose-asset-api", "lactose-input", "lactose-present-api",
+  "lactose-reflect-macros",
+]
+
+[boundary_internal.only]
+"lactose-ecs" = ["lactose-task", "lactose-ecs-macros"]
+
+# Third-party crates, per boundary crate. Adding a line here is a determinism review: the
+# crate must do no floating-point work of its own and select no code path by CPU feature
+# (`libm` is the one exception section 8.2 names).
+[boundary_third_party."lactose-core"]
+normal = ["bytemuck", "libc", "windows-sys"]
+dev = ["xxhash-rust"]
+
+[boundary_third_party."lactose-math"]
+normal = ["libm"]
+
+# Architecture section 8.3: the packages whose boundary feature trees must be identical, which
+# are the shipped binaries and the SOUR test crate. None exists yet.
+[feature_roots]
+packages = []
+
+# Architecture section 8.3: the packages whose tests run under SOUR. None exists yet.
+[sour]
+packages = []

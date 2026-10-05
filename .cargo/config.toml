@@ -5,3 +5,8 @@
 # repository; `--manifest-path` from elsewhere drops the pin.
 [target.'cfg(target_arch = "x86_64")']
 rustflags = ["-C", "target-cpu=x86-64-v3"]
+
+# `cargo xtask <check>` runs the CI driver in tools/xtask (tier check, boundary checks, feature
+# trees, the SOUR mode runner). `cargo xtask help` lists the subcommands.
+[alias]
+xtask = "run --quiet -p lactose-xtask --"
