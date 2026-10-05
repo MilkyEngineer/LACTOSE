@@ -1,4 +1,8 @@
-# Engine Architecture
+# LACTOSE Architecture
+
+LACTOSE: Lock-free Asynchronous Chunked Task-Oriented Simulation Engine.
+Its deterministic simulation core is CURD: Concurrent Unified Runtime, Deterministic.
+LACTOSE sets the CURD.
 
 Status: design baseline, pre-implementation. Every section is a decision, not a suggestion.
 Change a decision by editing this file in the same change that implements it.
@@ -66,42 +70,50 @@ behind a trait object.
 follows the determinism rules. Code outside may use wall-clock time, thread-local state and
 platform float libraries.
 
+**Things you run get names, things you import get descriptions.** Crates are named for what
+they do, prefixed `lactose-`. Codenames from the glossary (section 19) appear on binaries,
+tools, log targets, CI jobs, README titles and doc headings, never on crate names, types or
+functions. The glossary is loaded into every agent session through `CLAUDE.md`.
+
 **Everything is data.** Components are plain `#[repr(C)]` structs registered with the
 reflection registry. If it cannot be reflected it cannot be serialised, replicated, snapshotted
 or shown in a future editor, so it does not go in a component.
 
 ## 4. Workspace layout
 
+Every crate is published as `lactose-<name>`. Codenames in brackets are the public identity
+of that subsystem and appear only where section 3 allows.
+
 ```
 crates/
   core/            ids, handles, fixed-seed hashing, arenas, time types, error types
   math/            deterministic f32 math: vectors, quaternions, transforms, pure-Rust transcendentals
   task-api/        Task, Scope, Counter, spawn/await contract
-  task/            custom executor: one worker per core, work-stealing deques, main-thread lane
-  ecs/             entities, archetypes, 16 KiB chunks, change ticks, queries, scheduler, command buffers
+  task/            [WHISK] custom executor: one worker per core, work-stealing deques, main-thread lane
+  ecs/             [CASEIN] entities, archetypes, 16 KiB chunks, change ticks, queries, scheduler, command buffers
   reflect/         type registry, component registry, field metadata, serde bridge
   asset-api/       AssetId, Handle<T>, loader and processor traits, streaming budget types
-  asset/           async loading, dependency tracking, immutable publication, hot reload
+  asset/           [SILO] async loading, dependency tracking, immutable publication, hot reload
   io/              platform async file IO (io_uring on Linux, IOCP on Windows, kqueue on macOS)
   rhi-api/         device, queue, buffer, image, pipeline, bindless heap, encoder, resource states
   rhi-vulkan/      ash-based backend
   rhi-metal/       later
   rhi-dx12/        later
-  render-graph/    pass declaration, graph compile, barriers, transient aliasing, parallel record
-  renderer/        GPU scene, culling passes, visibility, shading, post, late-latch
+  render-graph/    [GOUDA] pass declaration, graph compile, barriers, transient aliasing, parallel record
+  renderer/        GPU scene [CHEDDAR], bindless heap [BRIE], culling [CREAM], late-latch [LATTE], particles [FROTH]
   physics-api/     colliders, bodies, queries, events
-  physics-rapier/  Rapier backend
+  physics-rapier/  [QUARK] Rapier backend
   net-api/         transport, replication, prediction and snapshot contracts
-  net/             delta replication, interest management, prediction region, rollback
-  sim/             deterministic world: regions, tick loop, snapshot ring, determinism hashing
-  persist/         persistence policy, stable IDs, world overlay, save container, migrations
-  platform/        winit window, input, swapchain surface, main-thread pump
+  net/             replication [MILKMAN], interest management, prediction region, rollback
+  sim/             [CURD] deterministic world: regions, tick loop, snapshot ring [COW later], determinism hashing
+  persist/         [SKIM] persistence policy, stable IDs, world overlay, save container [CARTON], migrations
+  platform/        [PAIL] winit window, input, swapchain surface, main-thread pump
   debug-ui/        egui overlay, profiler view, determinism inspector
   app/             assembles runtime: client, server, headless
 game/
   <game crates>    gameplay systems, content, built only on *-api crates plus ecs, sim, math
 tools/
-  cook/            offline asset cooker: meshes, textures, materials, scenes to runtime format
+  cook/            [RICOTTA] offline asset cooker: meshes, textures, materials, scenes to runtime format
 docs/
 ```
 
@@ -209,8 +221,9 @@ Rendering, audio, particles, animation blending, UI, asset IO timing, debug over
 
 - `sim` exposes `world_hash(region) -> u64` computing a stable hash over all chunk data and
   region resources.
-- CI runs every simulation test twice, with 1 worker and with N workers, and fails on hash
-  mismatch. It also runs each test twice with the same worker count and fails on mismatch.
+- The CI harness, named SOUR, runs every simulation test twice, with 1 worker and with N
+  workers, and fails on hash mismatch. It also runs each test twice with the same worker count
+  and fails on mismatch. A mismatch has gone sour.
 - A `determinism` lint crate denies `std::time`, `std::collections::HashMap` with the default
   hasher, `thread_local!` and `f32::sin` family inside boundary crates.
 
@@ -468,3 +481,30 @@ Tracked here until resolved in a milestone.
 - Console toolchains: no action until Rust is supported on the target platform.
 - Player profile portability between hosts: product decision, affects whether player entities
   get a separate save container.
+
+## 19. Glossary of names
+
+Codenames label subsystems on binaries, tools, log targets, CI jobs, README titles and doc
+headings. Crate names, types and functions stay descriptive.
+
+| Name | Crate or surface | Role |
+|---|---|---|
+| LACTOSE | workspace | The engine. Lock-free Asynchronous Chunked Task-Oriented Simulation Engine. |
+| CURD | `lactose-sim` | Deterministic simulation core. Concurrent Unified Runtime, Deterministic. |
+| WHISK | `lactose-task` | Work-stealing task executor. |
+| CASEIN | `lactose-ecs` | Chunked archetype storage and scheduler. |
+| COW | `lactose-sim` | Copy-on-write chunk snapshots, a later optimisation. |
+| GOUDA | `lactose-render-graph` | Render graph. Graph Of Unified Device Access. |
+| CHEDDAR | `lactose-renderer` | Persistent GPU scene. |
+| BRIE | `lactose-renderer` | Bindless resource heap. |
+| CREAM | `lactose-renderer` | GPU culling. Culling Regions Encoded As Masks. |
+| LATTE | `lactose-renderer` | Late-latched transform and eye. |
+| FROTH | `lactose-renderer` | Particles and VFX, outside the determinism boundary. |
+| QUARK | `lactose-physics-rapier` | Physics backend. |
+| MILKMAN | `lactose-net` | Delta replication. Log target `milkman`. |
+| SKIM | `lactose-persist` | Save system. Save Kit and Instance Manager. |
+| CARTON | `lactose-persist` | Save container format. |
+| SILO | `lactose-asset` | Immutable asset store and streaming. |
+| RICOTTA | `tools/cook`, binary `ricotta` | Asset cooker. Ricotta means recooked. |
+| PAIL | `lactose-platform` | Platform Abstraction and Input Layer. |
+| SOUR | CI job `sour` | Determinism regression harness. |
