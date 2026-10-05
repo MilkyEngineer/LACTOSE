@@ -15,6 +15,7 @@ The vocabulary every other crate shares.
 | `id` | `EntityId`, `NetId`, `PredictionKey`, `StableKey`, `EntityRef`, `PlayerId`, `Tick`, `SystemKey`, `ComponentKey` (architecture section 7) |
 | `hash` | `xxh64` as a `const fn`, so name-derived keys are computed at compile time |
 | `map` | `FixedHashMap`: fixed hasher, no observable iteration order |
+| `array` | `PlainArray<T, N>`: a fixed array that is plain data for any plain-data element |
 | `handle` | `Handle<T>` and `HandleTable<T>` |
 | `arena` | `Arena`, the bump allocator behind per-job scratch memory and scope job storage |
 | `alloc` | `TaggedAlloc`, `AllocTag` and `TagScope`: live memory accounted per subsystem |
