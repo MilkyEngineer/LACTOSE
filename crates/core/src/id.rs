@@ -274,6 +274,12 @@ impl ComponentKey {
     }
 }
 
+/// Explicit, never-reused ID of one field within a component or resource type. Declared with
+/// `#[field(id = N)]`; save records and schema migration address fields by it.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug, Pod, Zeroable)]
+#[repr(transparent)]
+pub struct FieldId(pub u16);
+
 #[cfg(test)]
 mod tests {
     use super::*;

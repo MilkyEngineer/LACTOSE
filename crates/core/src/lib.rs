@@ -18,7 +18,8 @@ pub use error::{Error, ErrorKind, Result};
 pub use handle::{Handle, HandleTable};
 pub use hash::xxh64;
 pub use id::{
-    ComponentKey, EntityId, EntityRef, NetId, PlayerId, PredictionKey, StableKey, SystemKey, Tick,
+    ComponentKey, EntityId, EntityRef, FieldId, NetId, PlayerId, PredictionKey, StableKey,
+    SystemKey, Tick,
 };
 pub use map::{FixedHashMap, FixedHasher};
 pub use thread_class::ThreadClass;
