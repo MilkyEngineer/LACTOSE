@@ -13,15 +13,15 @@ Never use a codename for a crate, type or function.
 | CURD | `lactose-sim`, deterministic simulation core |
 | WHISK | `lactose-task`, work-stealing executor |
 | CASEIN | `lactose-ecs`, chunked archetype storage |
-| COW | copy-on-write snapshots in `lactose-sim` |
+| COW | copy-on-write snapshots in `lactose-predict` |
 | GOUDA | `lactose-render-graph` |
 | CHEDDAR | GPU scene in `lactose-renderer` |
 | BRIE | bindless heap in `lactose-renderer` |
 | CREAM | GPU culling in `lactose-renderer` |
-| LATTE | late-latched view rotation in `lactose-renderer` |
+| LATTE | late-latched orbit camera in `lactose-renderer` |
 | FROTH | VFX particles in `lactose-renderer` |
 | QUARK | `lactose-physics-rapier` |
-| MILKMAN | replication in `lactose-net`, log target `milkman` |
+| MILKMAN | replication and interest management in `lactose-net`, log target `milkman` |
 | SKIM | `lactose-persist`, saves |
 | CARTON | save container format in `lactose-persist` |
 | SILO | `lactose-asset` |
@@ -31,13 +31,19 @@ Never use a codename for a crate, type or function.
 
 ## Rules that CI enforces
 
-- `#![forbid(unsafe_code)]` outside `task`, `ecs`, `io`, `rhi-*` and `core`.
-- Dependency tiers from `crate-tiers.toml`: foundation crates may be used by anyone, backend
-  crates only by `app`, `tools/*` and the exceptions listed there.
-- Inside the determinism boundary (section 7 of the architecture doc): no `Instant` or
-  `SystemTime`, no default-hasher `HashMap` (use `core::FixedHashMap`), no `thread_local!`,
-  no platform float functions or `mul_add`, no runtime CPU feature detection, no chunk index
-  or worker index as a semantic key. Enforced by clippy config and `cargo-deny` allowlists.
-- Every simulation test runs under SOUR in workers, repeat and layout modes and must hash
-  identically. Architecture mode compares x86-64 and aarch64.
-- Components are padding-free plain data with explicit field IDs and a persistence policy.
+- `#![forbid(unsafe_code)]` outside `task`, `ecs`, `io`, `rhi-*`, `core` and `tools/cook`.
+- `crate-tiers.toml` is the only dependency rule: foundation crates may be used by anyone,
+  backend crates only by `app`, `tools/*` and the listed exceptions. It also lists the crates
+  inside the determinism boundary.
+- Inside the boundary: no `Instant` or `SystemTime`; `core::FixedHashMap` only; no
+  `thread_local!`; floats only through `math` (no `f32::min`/`max`/`powi`/`total_cmp`/`to_bits`
+  outside it); no glam; no runtime CPU feature detection selecting different numerics; chunk,
+  row, worker and task order are never semantic keys. Every ordering and RNG key is a stable
+  key (`NetId`, `SystemKey`, `PredictionKey`), never `EntityId`.
+- x86-64 builds pin the x86-64-v3 baseline; `math` fails to compile without `fma`.
+- Every simulation test runs under SOUR in workers, repeat, layout and chaos modes and must
+  hash identically. Architecture mode compares linux-x64, windows-x64 and macos-arm64.
+- Components are `NoUninit + CheckedBitPattern` with explicit field IDs, typed reference
+  fields and a persistence policy. `EntityId` never appears in a component, on the wire or on
+  disk.
+- Panics abort. Tests run under nextest, one process per test.

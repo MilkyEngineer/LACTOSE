@@ -1,23 +1,36 @@
-# Dependency tiers enforced by CI. Foundation crates may be depended on by any crate.
-# Backend crates may be named only by `app`, by `tools/*`, and by their own tests.
+# The single statement of which crate may depend on which. CI enforces it.
+# Foundation crates may be depended on by any crate.
+# Backend crates may be named only by `app`, by `tools/*`, by their own tests, and by the
+# exceptions below.
 
 [foundation]
 crates = [
   "lactose-core", "lactose-math", "lactose-task", "lactose-ecs", "lactose-reflect",
-  "lactose-sim", "lactose-anim", "lactose-asset-api", "lactose-physics-api",
-  "lactose-net-api", "lactose-rhi-api", "lactose-input",
+  "lactose-sim", "lactose-anim", "lactose-predict", "lactose-nav-query",
+  "lactose-physics-api", "lactose-asset-api", "lactose-present-api", "lactose-net-api",
+  "lactose-rhi-api", "lactose-input", "lactose-io",
 ]
 
 [backend]
 crates = [
-  "lactose-asset", "lactose-io", "lactose-physics-rapier", "lactose-net", "lactose-persist",
-  "lactose-rhi-vulkan", "lactose-rhi-metal", "lactose-rhi-dx12", "lactose-render-graph",
-  "lactose-renderer", "lactose-terrain", "lactose-audio", "lactose-ui", "lactose-nav",
-  "lactose-platform", "lactose-debug-ui",
+  "lactose-asset", "lactose-physics-rapier", "lactose-net", "lactose-persist",
+  "lactose-rhi-vulkan", "lactose-rhi-metal", "lactose-rhi-null", "lactose-rhi-dx12",
+  "lactose-render-graph", "lactose-renderer", "lactose-presentation", "lactose-terrain",
+  "lactose-audio", "lactose-ui", "lactose-nav", "lactose-platform", "lactose-debug-ui",
+]
+
+[boundary]
+# Crates inside the determinism boundary. clippy.toml and cargo-deny allowlists apply here.
+crates = [
+  "lactose-core", "lactose-math", "lactose-ecs", "lactose-sim", "lactose-anim",
+  "lactose-predict", "lactose-nav-query", "lactose-physics-api", "lactose-physics-rapier",
+  "game-sim",
 ]
 
 [exceptions]
-# Backend-to-backend edges that are allowed. Each needs a reason.
-"lactose-renderer" = { may_depend_on = ["lactose-render-graph"], reason = "passes are the renderer's output" }
-"lactose-debug-ui" = { may_depend_on = ["lactose-renderer"], reason = "overlay draws through the renderer" }
-"lactose-terrain"  = { may_depend_on = ["lactose-renderer"], reason = "clipmap passes" }
+"lactose-renderer"     = { may_depend_on = ["lactose-render-graph"], reason = "passes are the renderer's output" }
+"lactose-presentation" = { may_depend_on = ["lactose-renderer"], reason = "pose evaluation and VFX feed the renderer" }
+"lactose-debug-ui"     = { may_depend_on = ["lactose-renderer", "lactose-platform"], reason = "overlay draws through the renderer and reads window events" }
+"lactose-terrain"      = { may_depend_on = ["lactose-renderer"], reason = "clipmap passes" }
+"lactose-ui"           = { may_depend_on = ["lactose-renderer", "lactose-render-graph"], reason = "UI pass" }
+"lactose-net"          = { may_depend_on = ["lactose-predict"], reason = "reconciliation drives the prediction world" }

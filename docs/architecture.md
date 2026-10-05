@@ -4,611 +4,727 @@ LACTOSE: Lock-free Asynchronous Chunked Task-Oriented Simulation Engine.
 Its deterministic simulation core is CURD: Concurrent Unified Runtime, Deterministic.
 LACTOSE sets the CURD.
 
-Status: design baseline, revision 2, after adversarial review. Every section is a decision, not
-a suggestion. Change a decision by editing this file in the same change that implements it.
+Status: design baseline, revision 3, after two adversarial reviews. Every section is a decision,
+not a suggestion. Change a decision by editing this file in the same change that implements it.
+Claims about third-party behaviour are listed in section 25 and re-verified against the exact
+versions pinned in `Cargo.lock` before the milestone that depends on them.
 
 ## 1. Goals
 
 In priority order. When two conflict, the earlier one wins.
 
 1. **Short critical path.** Minimise the longest dependency chain in a frame. Utilisation is a
-   consequence, never a target. A 16-core machine at 60% with clean per-core working sets beats
-   one at 95% bouncing cache lines.
-2. **Deterministic simulation across threads and architectures.** Same inputs produce the same
-   world state regardless of thread count, scheduling order, chunk layout, run, or whether the
-   host is x86-64 or aarch64. The default shipping configuration is an Apple Silicon client
-   predicting against a Linux x86-64 server, so cross-architecture determinism is a product
-   requirement, not an option.
-3. **No threading knowledge required of gameplay programmers.** They never write a lock, spawn a
-   thread, or choose execution order. They declare what data a system reads and writes.
-4. **Cache-coherent data layout.** Structure-of-arrays in fixed-size chunks everywhere the hot
-   path runs.
-5. **No coordinator thread.** The scheduler is work-stealing. The OS main thread pumps events and
-   presents frames and does nothing else.
-6. **Modular, interface-first where the interface is knowable.** Subsystems with known
-   behaviour and multiple consumers get an interface crate before an implementation. Subsystems
-   whose interface depends on a backend are built as a vertical slice first.
+   consequence, never a target.
+2. **Deterministic simulation as an engineering property.** The same build, given the same
+   inputs, produces the same world state regardless of thread count, scheduling order, chunk
+   layout, run, or host architecture (x86-64 and aarch64). This is what makes replays, the
+   determinism harness and desync debugging work. It does not by itself make client prediction
+   correction-free, because the client's prediction world differs from the server's world.
+   Section 9 defines reconciliation separately.
+3. **No threading knowledge required of gameplay programmers.** They never write a lock, spawn
+   a thread, or choose execution order. They declare what data a system reads and writes.
+4. **Cache-coherent data layout.** Structure-of-arrays in fixed-size chunks on every hot path.
+5. **No coordinator thread.** The scheduler is work-stealing. Ticking is a timer-driven root
+   task, not a thread. The OS main thread pumps events only.
+6. **Multiplayer without a fixed player cap.** Server cost is bounded by active entity count
+   and per-client cost by relevance, never by a constant.
+7. **Modular, interface-first where the interface is knowable.** Backend-driven subsystems are
+   built as a vertical slice first.
 
-Non-goals for now: an editor, mobile, web, Intel Macs, a scripting language.
+Non-goals for now: an editor, mobile, web, Intel Macs, a scripting language, multi-process
+server sharding.
 
 ## 2. Decisions
 
 | Area | Decision |
 |---|---|
 | Language | Rust, stable toolchain, workspace of crates. No Bevy. |
-| Reference game | Open-world action-adventure in the style of Breath of the Wild, 4-player networked co-op. |
+| Reference game | Open-world action-adventure in the style of Breath of the Wild, networked co-op with an arbitrary number of players. |
 | Simulation tick | 60 Hz fixed. Render uncapped with interpolation. |
-| Netcode | Dedicated server, authoritative. Deterministic sim. Local-player prediction with rollback over a bounded region. Snapshot interpolation for everything else. |
-| Determinism scope | Cross-architecture: x86-64 and aarch64 must hash identically. Tested on both in CI. |
-| World coordinates | 64-bit float positions in simulation. Camera-relative 32-bit positions produced at extract for rendering. Replication quantises relative to region origin. |
-| World simulation | Server simulates active areas around players. Clients simulate only their predicted area. |
-| Physics | Rapier, 64-bit build, behind `physics-api`. One physics world per active area. Serial per world. |
-| Graphics | Thin render hardware interface (RHI). Vulkan 1.3 backend first (Windows, Apple Silicon macOS via MoltenVK). Native Metal second. DX12 when Xbox matters. |
-| Shaders | Slang, compiled offline to SPIR-V by the cooker. Metal shader libraries produced at cook time from SPIR-V. No runtime shader compilation. |
-| Lighting | Deferred with a G-buffer in stage one. Visibility buffer when meshlets arrive in stage three. |
-| Rendering | Render graph compiled from declared pass access. GPU-driven: persistent GPU scene, compute culling, indirect draws. Zero-instance draws are the primary path, indirect-count an optimisation. |
-| Latency | Simulation N+1 overlaps render N after a serial extract phase. Late-latched view rotation only. |
-| Concurrency primitives | Blocking fork-join for chunk iteration inside a system. `'static` stackless futures for IO, GPU and asset work. No stackful fibers. No tokio. |
-| Component data | Padding-free plain data, no heap ownership. Variable-length data is child entities or fixed-capacity inline arrays. |
-| Gameplay authoring | Rust only. Iteration via state-preserving restart. Dylib hot reload later if needed. |
-| Editor | Deferred. Reflection and component registry in scope from day one. |
-| Saves | Share the serialisation core and snapshot primitive with netcode, never the replication stream. World overlay against the cooked baseline, server-owned in multiplayer, schema-versioned with explicit field IDs. |
-| Platforms | Windows and macOS (Apple Silicon) clients. Linux dedicated server. Linux, macOS and Windows CI, including an aarch64 runner. Consoles when Rust toolchains exist. |
+| Netcode | Dedicated server, authoritative. Clients send tick-stamped inputs. Local-player prediction in a separate client prediction world. Snapshot interpolation for everything else. Interest management and per-client bandwidth prioritisation from day one. |
+| Determinism scope | Same build, identical results across threads, layouts and x86-64 versus aarch64. Reconciliation is defined in quantised space. |
+| Identity | Process-local entity IDs never leave the process. Server-assigned network IDs are the stable key for every ordering and RNG rule. Persistent IDs for saves. |
+| World coordinates | Simulation scalar is a `math` type alias, 64-bit by default, decided finally by a milestone 1 precision and performance test at full map extent. GPU scene stores grid cell plus 32-bit offset. |
+| Physics | Rapier through `physics-api`, pinned exactly. One physics world per server process, one prediction world per client. Rapier's determinism and parallel features together. |
+| Graphics | Thin RHI. Vulkan 1.3 backend first (Windows, Linux CI). Native Metal backend in milestone 3 for Apple Silicon. MoltenVK and KosmicKrisp spiked in milestone 2 as interim Apple paths. DX12 when Xbox matters. A null backend for tests and the server. |
+| Shaders | Slang. The cooker emits SPIR-V for Vulkan and MSL plus metallib for Metal. Mac shaders cook on a macOS runner. Driver pipeline caches are persisted. No runtime source compilation. |
+| Lighting | Deferred with a G-buffer held in tile memory on tile-based GPUs. Visibility buffer when meshlets arrive. |
+| Draw submission | One indirect draw per pipeline over fixed-size clusters with programmable vertex pulling. Multi-draw-indirect only where a backend reports native support. |
+| Latency | Simulation N+1 overlaps render N after an exclusive extract phase. A double-buffered presentation snapshot feeds a variable-rate presentation schedule. The full orbit camera transform is late-latched. |
+| Concurrency | Systems complete by continuation counters. Fork-join only inside a system, same-scope help only. `'static` stackless futures for IO, GPU and asset work. Frame-critical workers on performance cores, background class on efficiency cores. |
+| Component data | `bytemuck::NoUninit + CheckedBitPattern`: padding-free, no heap ownership, validated only on load and receive. Variable-length data is owned child entities or fixed-capacity inline arrays. |
+| Change tracking | Per-chunk coarse tick plus a per-row change tick on tracked columns. Each consumer keeps its own last-seen tick. |
+| Error policy | Panics only for broken invariants and they abort. Everything else is `Result` up to an `app`-level policy. Tick-stamped error events inside the boundary. |
+| Gameplay authoring | Rust only, split into simulation and presentation crates. Iteration via state-preserving restart with a prescribed dev profile. |
+| Editor | Deferred. Reflection in scope from day one. |
+| Saves | Overlay of typed records against the cooked baseline. Server-owned. Explicit field IDs and migrations. |
+| Platforms | Windows and Apple Silicon macOS clients. Linux dedicated server. CI on linux-x64, windows-x64 and macos-arm64. Consoles when Rust toolchains exist. |
 
 ## 3. Principles that bind every crate
 
 **Declare access, never order.** A system declares the components and resources it reads and
 writes. The scheduler derives concurrency from declarations and ordering from a stable
-topological sort. Systems belong to system sets; ordering constraints are written between sets
-and only between individual systems when sets are insufficient. Two systems that conflict and
-have no ordering at any level are a schedule build error, not a warning.
+topological sort over declared system sets. Two conflicting systems with no ordering at any
+level are a schedule build error.
 
 **No locks on the hot path.** Per-frame work uses chunks, command buffers and atomic counters.
 A `Mutex` inside a system is a review rejection. Locks are permitted in setup, teardown, IO
 completion handling, and inside RHI backends on objects the graphics API requires to be
-externally synchronised, such as queue submission.
+externally synchronised.
 
-**Unsafe is quarantined.** `#![forbid(unsafe_code)]` in every crate except those listed in
-section 16. Those crates carry a `SAFETY.md` explaining each invariant.
+**Unsafe is quarantined.** `#![forbid(unsafe_code)]` outside the crates in section 21.
 
-**Two dependency tiers.** Foundation crates may be depended on by anything. Backend crates may
-be named only by `app` and by their own tests. The tier list lives in `crate-tiers.toml` and a
-CI job fails any dependency edge the file does not allow.
+**One dependency rule, in one file.** `crate-tiers.toml` is the only statement of which crate
+may depend on which. This document describes it; the file decides. CI enforces it.
 
-**Things you run get names, things you import get descriptions.** Crates are named for what
-they do, prefixed `lactose-`. Codenames from the glossary (section 21) appear on binaries,
-tools, log targets, CI jobs, README titles and doc headings, never on crate names, types or
-functions. The glossary is loaded into every agent session through `CLAUDE.md`.
+**The determinism boundary is a crate boundary.** A crate is inside or outside. Crates that
+would straddle it are split: `net` (outside) and `predict` (inside), `game-sim` and
+`game-present`, `nav` and `nav-query`. Section 8 lists the inside crates.
 
-**Determinism boundary is explicit.** Section 7 lists what is inside. Code inside the boundary
-follows the determinism rules. Code outside may use wall-clock time, thread-local state and
-platform float libraries.
+**Things you run get names, things you import get descriptions.** Codenames from the glossary
+(section 27) appear on binaries, tools, log targets, CI jobs, README titles and headings,
+never on crate names, types or functions.
 
-**Everything is data.** Components are padding-free plain-data structs registered with the
-reflection registry. If it cannot be reflected it cannot be serialised, replicated, snapshotted
-or shown in a future editor, so it does not go in a component.
+**Everything is data.** Components are padding-free plain data registered with the reflection
+registry. Entity and asset references in components are typed fields the registry knows about.
+
+**Errors are values.** A panic means a broken invariant and aborts the process after a crash
+dump. Recoverable conditions (missing asset, network drop, disk full, device lost) return
+`Result` and are handled by policy in `app`. Inside the boundary, failures that affect
+simulation become tick-stamped events so both server and client see the same input.
 
 **Traced from day one.** The executor, every system, every render pass and every IO request
-emits `tracing` spans. Goal 1 cannot be measured otherwise. Tracy is the profiler target.
+emits `tracing` spans. Tracy is the profiler target.
 
 ## 4. Workspace layout
 
-Every crate is published as `lactose-<name>`. Codenames in brackets are the public identity of
-that subsystem and appear only where section 3 allows. Tier is F (foundation) or B (backend).
+Every crate is published as `lactose-<name>`. Tier is F (foundation, usable by anyone) or B
+(backend, usable only by `app`, `tools/*` and the exceptions in `crate-tiers.toml`).
+Codenames in brackets appear only where section 3 allows. Boundary marks crates inside the
+determinism boundary.
 
 ```
 crates/
-  core/          F  ids, handles, fixed-seed hashing, FixedHashMap, arenas, time types, errors
-  math/          F  deterministic math: f32 and f64 vectors, quaternions, transforms; transcendentals via the libm crate
-  task/          F  [WHISK] executor: one worker per core, work-stealing deques, fork-join scope, main-thread lane
-  ecs/           F  [CASEIN] entities, archetypes, 16 KiB chunks, change tracking, queries, scheduler, command buffers
-  reflect/       F  type registry, component registry, field IDs, persistence policy, serde bridge
-  sim/           F  [CURD] deterministic world: regions, active areas, tick loop, snapshot ring, world hash
-  anim/          F  deterministic animation logic: state machines, phase, events, root motion (inside the boundary)
-  asset-api/     F  AssetId, Handle<T>, loader and processor traits, version table, streaming budget types
-  physics-api/   F  bodies, colliders, joints, queries, events, snapshot and restore
-  net-api/       F  transport, replication, prediction and snapshot contracts
-  rhi-api/       F  device, queue, buffer, image, pipeline, bindless heap, encoder, resource states
-  input/         F  action mapping, gamepad and keyboard sources, tick-stamped input samples
-  asset/         B  [SILO] async loading, dependency tracking, immutable publication, hot reload
-  io/            B  async file IO: blocking pool reference backend, io_uring and IOCP optimisations
-  physics-rapier/B  [QUARK] Rapier backend, 64-bit
-  net/           B  replication [MILKMAN], interest management, prediction area, rollback
-  persist/       B  [SKIM] persistence policy, stable IDs, world overlay, save container [CARTON], migrations
-  rhi-vulkan/    B  ash-based backend
-  rhi-metal/     B  later
-  rhi-dx12/      B  later
-  render-graph/  B  [GOUDA] pass declaration, graph compile, barriers, transient aliasing, parallel record
-  renderer/      B  GPU scene [CHEDDAR], bindless heap [BRIE], culling [CREAM], late-latch [LATTE],
-                    pose evaluation and skinning, particles [FROTH], deferred lighting
-  terrain/       B  heightfield clipmap rendering and collision export
-  audio/         B  mixer thread, event bridge from simulation
-  ui/            B  game UI and text rendering
-  nav/           B  navmesh generation and queries (deterministic query half lives in sim)
-  platform/      B  [PAIL] winit window, surface, main-thread pump
-  debug-ui/      B  egui overlay, profiler view, determinism inspector
-  app/           B  assembles runtime: client, server, headless; the only crate that names backends
+  core/           F  boundary  EntityId, NetId, PersistentId, PredictionKey, Handle<T>, FixedHashMap, arenas, Error taxonomy
+  math/           F  boundary  self-contained deterministic math, no glam; Scalar alias; compare-and-select min/max/clamp; libm transcendentals; typed render space
+  task/           F            [WHISK] executor: continuation counters, fork-join scope, worker classes, timer root, main-thread lane
+  ecs/            F  boundary  [CASEIN] entities, archetypes, chunks, per-row change ticks, queries, scheduler, command buffers
+  reflect/        F            type registry, field IDs, typed references, persistence policy, serde bridge
+  sim/            F  boundary  [CURD] regions, region modes, tick loop, time scale, world hash, snapshot API
+  anim/           F  boundary  animation state machines, phase, events, root motion, sim skeleton (sockets, hands, feet, ragdoll bodies)
+  predict/        F  boundary  prediction world, rollback ring, reconciliation
+  nav-query/      F  boundary  navmesh queries
+  physics-api/    F  boundary  bodies, colliders, joints, queries, events, snapshot and restore
+  asset-api/      F            AssetId, Handle<T> policy, loader and processor traits, version table types, streaming budget types
+  present-api/    F            presentation components (mesh, light, decal, camera rig), VFX and audio request events, UI view-model, debug-draw buffer, presentation snapshot
+  net-api/        F            transport, replication, staging, interest contracts
+  rhi-api/        F            device, queue, buffer, image, pipeline, bindless heap, encoder, resource states, memoryless attachments, local reads
+  input/          F            action mapping, gamepad and keyboard sources, tick-stamped samples with absolute camera yaw and pitch
+  io/             F            async file IO: blocking pool reference backend; io_uring and IOCP optimisations
+  asset/          B            [SILO] loading, dependency tracking, versioned publication, hot reload
+  physics-rapier/ B  boundary  [QUARK] Rapier backend
+  net/            B            [MILKMAN] transport, replication, interest management, bandwidth prioritisation, clock sync, interpolation buffer
+  persist/        B            [SKIM] world overlay, save container [CARTON], migrations
+  rhi-vulkan/     B            ash-based backend
+  rhi-metal/      B            native Metal backend, milestone 3
+  rhi-null/       B            no-op backend for tests and the server binary
+  rhi-dx12/       B            later
+  render-graph/   B            [GOUDA] pass declaration, compile, barriers, aliasing, parallel record
+  renderer/       B            GPU scene [CHEDDAR], bindless heap [BRIE], culling [CREAM], late-latch [LATTE], pose evaluation, VFX [FROTH], deferred lighting, render slot table
+  presentation/   B            per-frame presentation schedule: camera rig, UI animation, audio listener, markers
+  terrain/        B            clipmap rendering; collision export is a cook output consumed through asset-api
+  audio/          B            mixer thread, event bridge
+  ui/             B            game UI and text rendering
+  nav/            B            navmesh generation
+  platform/       B            [PAIL] winit window, surface, event pump, present thread
+  debug-ui/       B            egui overlay, profiler view, determinism inspector
+  app/            B            assembles runtime: client, server, headless
 game/
-  <game crates>     gameplay systems and content; depend on foundation crates only
+  game-sim/          boundary  gameplay simulation systems; depends on foundation boundary crates
+  game-present/                gameplay presentation; depends on present-api and foundation crates
+  game-content/                data definitions shared by both
 tools/
-  cook/             [RICOTTA] offline asset cooker: meshes, textures, materials, shaders, scenes
-docs/
+  cook/                        [RICOTTA] asset cooker: meshes, clusters, textures, materials, shaders, scenes, collision
 ```
 
-There is no `task-api`. Spawning is generic over the future or closure type and cannot sit
-behind a trait object, for the same reason `ecs` has no interface split.
+There is no `task-api`: spawning is generic and cannot sit behind a trait object. `ecs` has
+no interface split for the same reason. Backend services that `game` must reach (physics
+queries, asset lookup, presentation requests) are exposed as `dyn` resources whose traits live
+in the corresponding `-api` crate and whose instances `app` inserts at startup.
 
 ## 5. Runtime model
 
 ### 5.1 Task system
 
-Two primitives, with different rules.
+**Systems complete by continuation.** Each system in a stage has a remaining-jobs counter.
+Chunk jobs decrement it. The job that reaches zero runs the system's finalize step (where
+reductions merge partials) and then decrements the counters of dependent systems, pushing any
+that reach zero. No worker ever blocks waiting for a system.
 
-**Fork-join scope, for chunk iteration inside a system.** `Scope::fork` takes plain closures,
-not futures. Closures may borrow from the scope's stack. The worker that opens the scope
-executes scope-local work and steals other work until the join counter reaches zero, then
-returns. This is the rayon model and it is sound because the opening worker blocks until all
-children finish. Children cannot `.await`. Nesting depth is bounded: a system opens one scope
-over its chunks and chunk work opens none. The join counter is modelled under `loom`.
+**Fork-join inside a job only.** `task::scope(|s| s.fork(...))` with an invariant `'scope`
+lifetime, closure-only, the shape of `std::thread::scope`. Children are closures that may
+borrow from the scope. The opener runs only jobs belonging to its own scope while waiting,
+then spins briefly, then parks on the scope's latch. It never runs unrelated system jobs and
+never runs background work while waiting. Scope depth is one per job.
 
-**Stackless `'static` tasks, for IO, GPU, asset and network work.** A task is a Rust `Future`
-that owns its data. Waiting on a counter, an IO completion or a GPU fence is an `.await` that
-returns the worker to the pool. These tasks never block a thread and may be cancelled by drop.
+**Stackless `'static` tasks** for IO, GPU, asset and network work. A task is a `Future` that
+owns its data and may be cancelled by drop. Waiting is an `.await`.
 
-Shared properties:
+**Worker classes.**
 
-- One worker per physical core minus one. The remaining core runs the platform thread.
-- Each worker owns two deques, frame-critical and background. Workers pop their own
-  frame-critical deque first, then steal frame-critical from others, then background. Priority
-  is therefore real but coarse.
-- Idle workers spin briefly, then `std::thread::park`.
-- Chunk work is batched so a task body runs for roughly 50 to 200 microseconds. One hundred
-  thousand entities across thirty systems must not become tens of thousands of task spawns.
-- A small blocking pool exists for file IO on platforms without completion-based file APIs
-  (macOS) and in CI containers where io_uring is unavailable. It is the reference IO backend.
-- No thread-local state inside the determinism boundary. Scratch memory is handed in keyed by
-  entity range, never by chunk index or worker index.
-- A panic in any task aborts the process after writing a crash dump. There is no
-  `catch_unwind` in the executor.
+- Frame-critical workers equal the performance-core count (`hw.perflevel0.physicalcpu` on
+  macOS, physical cores minus one elsewhere) at user-interactive QoS. They run simulation,
+  extract, graph compile and record.
+- Background workers run on efficiency cores at utility QoS (two low-priority threads on
+  homogeneous CPUs). They run asset decode, compression, and long futures. Background CPU
+  work yields at 0.5 millisecond slices.
+- The platform thread pumps OS events. A dedicated present thread calls present so a blocking
+  `nextDrawable` or FIFO present never stalls the event pump or a worker.
+
+**Scheduling mechanics.**
+
+- Each worker owns a deque. Work stealing uses split-on-steal: a stolen chunk-range job is
+  split in half and the thief takes one half. There is no fixed task-duration target.
+- Idle workers spin briefly, then `std::thread::park`. The sleep and wake protocol is
+  modelled under `loom`.
+- Main-thread requests return futures. Workers never wait synchronously on the main thread.
+- The floating-point control register (MXCSR, FPCR) is set to round-to-nearest with denormals
+  enabled at worker start and asserted at the start of every boundary job in debug builds.
+
+**Panics abort, unconditionally.** An abort-on-unwind guard surrounds every job and every join
+wait. A panic hook writes a crash dump and calls `abort`. This holds in tests, which run under
+`cargo-nextest` with one process per test and timeouts, and under Miri and loom, where the
+guard is modelled. `task` exposes no blocking wait; calling one on a worker is a debug
+assertion.
+
+**The timer root.** A root task owns ticking: it wakes at tick deadlines, caps catch-up at four
+ticks per frame then slows time, and paces frames. It runs on whichever frame-critical worker
+picks it up.
 
 ### 5.2 Frame pipeline
 
 ```
-tick N        tick N+1 simulation ───────────────────────────┐
- │ extract (serial, ≤1 ms)                                    ├─ overlap
- └──────► frame N: graph compile → record → latch → submit ───┘
+tick N        tick N+1 simulation ────────────────────────────────────┐
+ │ extract (exclusive, parallel)                                       ├─ overlap
+ └──► presentation snapshot ──► presentation schedule (per frame)      │
+                            └──► graph compile → record → latch → submit ┘
 ```
 
-- Simulation runs at a fixed 60 Hz on its own cadence. Render runs as fast as the display
-  allows and interpolates in the vertex shader between previous and current transforms held
-  in the GPU scene.
-- **Extract is a serial phase** between the end of tick N and the start of tick N+1. It reads
-  dirty rows from chunks and uploads them to the GPU scene. It is on the simulation's critical
-  path and budgeted at one millisecond. The render side holds no CPU mirror of simulation data.
-- **Late-latch** writes exactly one GPU buffer, the view and projection matrices, after all CPU
-  view-dependent work (shadow cascade fitting, light binning) has finished and immediately
-  before submit. Only camera rotation is latched. Camera position is never latched because the
-  simulation resolves camera collision. GPU culling pads the frustum by the maximum per-frame
-  rotation so latched rotation cannot reveal culled geometry. Each input sample is stamped with
-  the tick and the latched yaw actually displayed, and the simulation uses that yaw for
-  movement, so the direction the player moves matches what they saw.
-- Sync points sit at schedule stage boundaries. Their count is fixed per schedule and known at
-  build time. Between sync points everything is a DAG of tasks.
+- Simulation runs at a fixed 60 Hz driven by the timer root. Render runs as fast as the display
+  allows.
+- **Extract is exclusive, not single-threaded.** Between tick N ending and tick N+1 starting,
+  a fork-join over dirty chunks (rows whose change tick is newer than extract's last-seen
+  tick, or newer than the tick before so previous transforms stay valid) writes into a
+  staging ring. A GPU scatter pass moves staging into the persistent GPU scene, so writes never
+  race frames in flight. Teleports carry a no-interpolate flag. Static cooked instances go from
+  IO to the GPU scene directly and never pass through extract. Extract also produces the
+  presentation snapshot. Its budget is measured in milestone 2, not assumed.
+- **The presentation snapshot** is double-buffered and holds transforms, camera pivot,
+  presentation components, the interpolation buffer sample, and events. It is the only
+  simulation-derived data the render side reads during the overlap.
+- **The presentation schedule** runs per render frame on the snapshot: camera rig with
+  non-authoritative boom collision, UI animation, audio listener, world-space markers, full
+  pose evaluation, VFX simulation.
+- **Late-latch** writes exactly one GPU buffer, the full orbit camera transform (pivot from the
+  snapshot interpolated to frame time, rotation from the latest input, boom length from
+  presentation collision), after all CPU view-dependent work and immediately before submit.
+  Light binning runs on the GPU in world space after the latch. Shadow cascades and GPU
+  culling are padded by a configured maximum rotation per frame, and the latched delta is
+  clamped to that pad. Each input sample carries the absolute yaw and pitch it was produced
+  with; the simulation uses those values for movement direction.
+- Sync points sit at schedule stage boundaries. Their count is fixed per schedule.
 
 ### 5.3 Scheduling
 
-- The scheduler builds a DAG per schedule at startup from declared access and set ordering. It
-  caches the DAG and rebuilds only when systems are added or removed.
-- Within a stage, independent systems run concurrently. Conflicting systems are ordered by set
-  constraints or explicit system constraints. A missing constraint between two conflicting
-  systems fails the schedule build.
-- Order among conflicting systems is resolved by a stable topological sort keyed on
-  registration order, so the result is identical across runs and thread counts.
-- Each system iterates chunks in parallel through a fork-join scope. Per-entity work is
-  independent by construction. Reductions are order-independent (integer accumulators) or sort
-  by entity ID before combining. Chunk index is never a semantic key.
-- Structural changes go into per-system command buffers and are applied at the next sync point
-  in (system order, entity ID) order.
+- The scheduler builds a DAG per schedule at startup from declared access and set ordering,
+  cached until systems change.
+- Conflicting systems are ordered by set or system constraints; a missing constraint fails the
+  build. Ties are broken by system stable key, which is a declared name hash checked for
+  collisions, never by registration order.
+- Each system iterates chunks as jobs. Per-entity work is independent by construction.
+  Reductions use provided combinators that merge in the finalize step in stable-key order or
+  with an order-independent combiner. The query API exposes no chunk, row or worker index.
+  Scratch memory is an opaque per-job arena, poisoned between uses in debug.
+- Structural changes go into command buffers applied at the next sync point in the total order
+  (system stable key, source stable key, per-invocation sequence). Spawns receive placeholder
+  IDs resolved at apply.
 
 ## 6. ECS data model
 
-- **Archetypes** group entities by exact component set. **Chunks** are 16 KiB slabs holding a
-  fixed number of rows of one archetype, with each component as a contiguous column. Row
-  capacity is derived from the archetype's row size with a minimum of one. The registry warns
-  on components over 1 KiB.
-- **Components** are `bytemuck::NoUninit + AnyBitPattern`: padding-free, no heap ownership.
-  The derive macro asserts this. Variable-length data is child entities joined by a
-  relationship (an inventory is entities with a `HeldBy` relationship) or a fixed-capacity
-  inline array. A region-owned blob arena is permitted only if profiling demands it and is
-  then part of the region snapshot.
-- **Change tracking** is two-level. Each column in each chunk carries a coarse change tick. Each
-  column also carries a per-row dirty bitmask, one bit per row, set through the `Mut<T>`
-  wrapper on actual deref-mut, never on query borrow. Replication, extract and persistence
-  read the tick as a filter and the bitmask for rows. After a rollback restore or a load, ticks
-  are rebased to current-minus-one and all rows marked dirty, forcing a full extract and a
-  full replication delta for the region.
-- **Entity IDs** are 64-bit: 32-bit index, 32-bit generation. No region bits. Region membership
-  is a component. Index space is allocated in blocks of 4096 from a block table that is itself
-  region-independent, deterministic and persistent. Each region holds its current block. Each
-  player has a reserved block range for predicted spawns that the server confirms or remaps.
-- **Regions** are the unit of streaming, snapshotting and relevance. A region owns its chunks,
-  a block cursor, an RNG stream, and an asset version table. Regions never share chunks.
-  Entities move between regions by a command-buffer operation that changes the region
-  component and moves the row. Their ID does not change.
-- **Active areas** are connected sets of loaded regions around a group of players. An active
-  area owns one physics world. Areas merge when their region sets touch and split when they
-  separate, as deterministic tick-boundary operations that move bodies in entity-ID order.
-- **Region modes**: `Simulated` (systems run), `Replicated` (no systems, replication writes
-  rows, extract reads them), `Frozen` (loaded, nothing runs).
-- **Relationships** such as parent-child are components holding entity IDs with a reverse
-  index maintained by the command-buffer apply step. The reverse index is part of the region
-  snapshot. Cross-region relationships are weak references validated at apply time.
-- **Resources** are singletons with declared access, scheduled exactly like components.
+- **Archetypes** group entities by exact component set. **Chunks** are 16 KiB slabs with one
+  contiguous column per component. Row capacity derives from row size with a minimum of one.
+  The determinism harness varies chunk capacity in tests (section 8.4).
+- **Components** are `bytemuck::NoUninit + CheckedBitPattern`: no padding, no heap ownership,
+  `bool` and enums and `Option<NetId>` allowed. Byte validation runs only on save load and
+  network receive. Explicit padding fields are zeroed by the API. Inline arrays are `[T; N]`
+  plus a length with unused slots zeroed.
+- **Change tracking.** Every column in every chunk carries a coarse change tick. Columns marked
+  tracked (replicated, extracted or both) also carry a `u32` change tick per row, set through
+  `Mut<T>` on deref-mut. Replicated columns use `set_if_neq` so rewriting an equal value does
+  not dirty the row. Whole-column slice access takes an explicit dirty-range out-parameter.
+  Each consumer (extract, each client, each save) keeps its own last-seen tick and reads rows
+  with a newer tick. After a rollback restore or load, ticks are rebased and every consumer's
+  last-seen tick reset, forcing a full pass.
+- **Regions** are the unit of streaming, relevance and persistence. A region owns its chunks,
+  an asset version table and region resources. Entities move between regions by a command that
+  moves the row; identities do not change. Entities owned by another entity (inventory items,
+  attachments) migrate with their owner.
+- **Region modes**: `Simulated`, `Replicated` (rows written only at the input sync point from
+  staged network state), `Frozen`.
+- **Relationships** are components holding `NetId` with a reverse index maintained at command
+  apply and included in snapshots. Cross-region references are weak and validated at apply.
+- **Resources** are singletons with declared access.
 - **Queries** are generic over component tuples and monomorphise.
 
-## 7. Determinism
+## 7. Identity
 
-### 7.1 Inside the boundary
+| Key | Scope | Assigned | Used for |
+|---|---|---|---|
+| `EntityId` | one process | process-local allocator, index plus generation, `NonZeroU64` so `Option` is free | storage lookup only; never on the wire or disk |
+| `NetId` | server and all clients | cooked entities derive it from their placement so clients know it without a message; runtime spawns get it from the server at command apply, so order is deterministic | every ordering rule, every RNG key, replication, render slot table, relationships |
+| `PredictionKey` | one client plus server echo | (player ID, input tick, ordinal) | a client-predicted spawn before the server confirms; the server echoes the key on the entity it spawns and the client binds that `NetId` to its predicted entity instead of remapping |
+| `PersistentId` | saves | cooked: hash of (scene, placement, child path); runtime: server persistent counter at command apply | overlay records and save references |
+| `SystemKey` | build | declared name hash, collision-checked | command order, RNG stream selection |
+| `PlayerId` | session | server-assigned on join | prediction keys, interest sets, input queues |
 
-`core`, `math`, `ecs`, `sim`, `anim`, `physics-api`, `physics-rapier`, `net` prediction and
-rollback, the deterministic half of `nav`, and every `game` simulation system. Gameplay
-particles (fire that spreads, wind that pushes) are simulation and live inside. The animation
-state, phase and event layer is inside.
+Typed reference fields (`EntityRef` holding `NetId`, `AssetRef` holding `AssetId`) are known to
+the registry and remapped on load, so the bulk-copy load path is a copy plus a remap pass.
 
-### 7.2 Outside the boundary
+## 8. Determinism
 
-Rendering, pose evaluation and skinning, VFX particles, audio, UI, asset IO timing, debug
-overlay, input sampling (its output, tick-stamped samples, is an input to the boundary).
+### 8.1 Inside the boundary
 
-### 7.3 Rules inside the boundary
+`core`, `math`, `ecs`, `sim`, `anim`, `predict`, `nav-query`, `physics-api`,
+`physics-rapier`, `game-sim`. Gameplay particles that affect simulation (spreading fire, wind
+pushing objects) live in `game-sim`.
 
-- Floating point only through `math`. Transcendentals come from the `libm` crate, which is also
-  what Rapier uses under its determinism feature, so simulation and physics agree on `sin`.
-  `f32::mul_add` and friends are banned. Mixing `f32` and `f64` happens only inside `math`.
-- SIMD is permitted for IEEE basic operations (add, sub, mul, div, sqrt, comparisons, min, max
-  with defined NaN semantics), which are bit-exact across x86-64 and aarch64. Approximate
-  reciprocals and rsqrt are banned.
-- Target features are pinned per target in `.cargo/config.toml` (x86-64-v3 baseline for x86,
-  default for aarch64). `target-cpu=native` is denied. No runtime CPU feature detection in
-  boundary crates or their dependencies.
-- No wall-clock time. `Instant` and `SystemTime` are banned. `Duration` as a value type is
-  fine. Tick index and fixed delta only.
+### 8.2 Outside the boundary
+
+Everything else, including `net` (transport, RTT, interpolation buffer), presentation, pose
+evaluation, VFX, audio, UI, asset IO timing, input sampling.
+
+### 8.3 Rules inside the boundary
+
+- Floating point only through `math`, which is self-contained and does not depend on glam.
+  Transcendentals come from the `libm` crate. `math` owns `min`, `max` and `clamp` as explicit
+  compare-and-select with defined signed-zero and NaN results, because the standard library
+  versions are documented as nondeterministic on signed zero. `powi`, `total_cmp`, `to_bits`,
+  `copysign` and `is_sign_negative` are banned outside `math`; NaN sign and payload are never
+  observable. NaNs are canonicalised before hashing and serialisation, and producing one in a
+  persistent column is a debug assertion.
+- Fused multiply-add is correctly rounded and permitted. The hazard is code that chooses fused
+  or unfused by target feature, which `wide` and glam do. Therefore x86-64 targets are pinned
+  to the x86-64-v3 baseline in `.cargo/config.toml`, `math` contains a `compile_error!` on
+  x86-64 without the `fma` feature so a dropped pin fails the build, and `target-cpu=native`
+  is denied.
+- SIMD is permitted for IEEE basic operations. Reduction order inside SIMD code is written out
+  explicitly; ISA-specific horizontal operations are banned.
+- No glam feature unification across the boundary: `math` has no glam dependency, the renderer
+  may use glam freely, and `cargo-deny` denies multiple versions of `libm` and of any crate
+  shared between boundary and non-boundary code.
+- No runtime CPU feature detection that selects numerically different paths. `libm`'s own
+  detection selects correctly rounded paths only and is allowlisted.
+- No wall-clock time. `Instant` and `SystemTime` are banned. Tick index and fixed delta only.
 - No thread-local state. No global mutable state.
-- Hash maps are `core::FixedHashMap`, a newtype over a fixed-seed hasher. Iteration order over
-  a map is never observable; sort before consuming when order matters.
-- Chunk index, worker index and task order are never semantic keys. Reductions are
-  order-independent or entity-ID-sorted. RNG draws are keyed by (region seed, tick, system ID,
-  entity ID) through a counter-based generator. Command buffers apply in (system order, entity
-  ID). Physics bodies are inserted in entity-ID order.
-- NaNs are canonicalised before hashing and before serialisation. Producing a NaN in a
-  persistent column is a debug-build assertion.
-- Asset availability and versions are inputs. Each region resolves its asset version table once
-  per tick at the sync point; the table is a region resource and part of the snapshot. Hot
-  reload is a tick-stamped event, never an atomic swap observed mid-tick.
+- Hash maps are `core::FixedHashMap`. Iteration order is never observable.
+- Chunk index, row index, worker index and task order are never semantic keys. The API makes
+  them unavailable. RNG draws are keyed by (region seed, tick, system key, `NetId`) through a
+  counter-based generator with no mutable state.
+- Asset availability and versions are inputs. Each region resolves its version table at the
+  input sync point; hot reload of simulation assets is a server-coordinated, tick-stamped
+  event.
 
-### 7.4 Enforcement
+### 8.4 Enforcement
 
 `sim` exposes `world_hash(region) -> u64` computed through reflection, field by field, over
-persistent and transient columns and region resources. Derived columns are excluded.
+persistent and transient columns and region resources, iterating entities in `NetId` order.
+Derived columns are excluded.
 
-The CI harness, named SOUR, runs every simulation test in four modes and fails on any hash
-mismatch:
+The harness, named SOUR, runs every simulation test in these modes and fails on any mismatch:
 
 | Mode | What varies | Catches |
 |---|---|---|
-| Workers | 1 worker versus N workers | scheduling-order dependence |
+| Workers | 1 worker versus N | scheduling-order dependence |
 | Repeat | same configuration twice | uninitialised memory, time, randomness |
-| Layout | shuffled insertion order, forced chunk compaction, different region load order | chunk-index dependence, the client-versus-server layout mismatch |
-| Architecture | x86-64 runner versus aarch64 runner | float library and SIMD divergence |
+| Layout | test-only chunk capacities (1, 7, 64 rows, 16 KiB), random row permutation at every sync point, reversed and shuffled chunk iteration, random batch splits; identities preserved | storage-order dependence |
+| Chaos | seeded steal order, injected yields, forced split-on-steal | ordering bugs invisible on 4-vCPU CI |
+| Architecture | linux-x64 (including a Haswell-masked run), windows-x64, macos-arm64 | float library and SIMD divergence |
 
-Layout mode gates milestone 1. Architecture mode runs nightly from milestone 1 and on every
-PR from milestone 4.
+Layout and chaos modes gate milestone 1. Architecture mode runs nightly from milestone 1 and
+on every PR from milestone 4.
 
-Static enforcement uses stable tooling only:
+Static enforcement uses stable tooling: `clippy.toml` per boundary crate with
+`disallowed-methods`, `disallowed-types` and `disallowed-macros`; `cargo-deny` with a
+dependency allowlist for boundary crates and `multiple-versions = "deny"` for shared crates.
+No custom lint crate.
 
-- `clippy.toml` in each boundary crate with `disallowed-methods` (platform float functions,
-  `mul_add`), `disallowed-types` (`Instant`, `SystemTime`, `std::collections::HashMap`),
-  `disallowed-macros` (`thread_local!`, `is_x86_feature_detected!`).
-- `cargo-deny` with an allowlist of dependencies for boundary crates. A new transitive
-  dependency fails CI until reviewed for float and feature-detection behaviour.
-- No custom lint crate. That would require nightly.
+## 9. Networking
 
-## 8. Networking
+### 9.1 Topology and scale
 
-- **Topology.** Dedicated server, authoritative. Clients send tick-stamped inputs. Server
-  simulates and replicates state. The handshake carries a protocol hash derived from the
-  registry schema hash and the `net` crate version; mismatches refuse connection.
-- **Replication.** Per client, the server tracks the last acknowledged tick. Each outgoing
-  packet carries, for entities in that client's relevance set, only rows whose dirty bit is
-  set since the acknowledged tick. Relevance is region membership plus a distance band.
-  Positions are quantised relative to region origin. Send rate 20 to 30 Hz, interpolated on
-  the client. Remote regions on the client are in `Replicated` mode.
-- **Predicted area.** The client simulates ahead one active area containing the local player
-  and anything the player can touch within the rollback window. Predicted entities collide
-  only with static geometry and other predicted entities. Every other entity is kinematic in
-  the client's physics world and driven by interpolated server state.
-- **Rollback.** The predicted area is snapshotted every tick into a ring whose length is sized
-  from measured round-trip time plus send interval, with a hard cap of 40 ticks. On server
-  correction the client restores the snapshot for the corrected tick, applies the correction
-  and re-simulates to the present. If the corrected tick is older than the ring, the client
-  requests a full area snapshot and resyncs. Copy-on-write chunks are a later optimisation
-  behind the same `snapshot(area)` API.
-- **Client gating.** Streaming leads the player by a hard distance. The server does not move a
-  player into a region the client has not acknowledged as ready; the player is held at the
-  boundary. Accepting a correction storm instead was considered and rejected.
-- **Lag compensation.** Server keeps a short history of player transforms and colliders only.
-- **Later.** Forward other players' inputs so clients predict nearby players too.
+Dedicated server, authoritative. Players join and leave freely; there is no fixed cap. Server
+cost is bounded by active entities: regions with no player within the activation radius are
+`Frozen`, which is a deterministic function of inputs. Per-client cost is bounded by the
+relevance set.
 
-## 9. Snapshot definition
+The handshake carries a protocol hash of the registry schema, a boundary build ID (the
+`Cargo.lock` entries and source hash of boundary crates), and the hash of simulation-relevant
+cooked data. Mismatches refuse connection.
 
-`snapshot(area)` captures everything the next tick reads:
+### 9.2 Data in and out of the tick
 
-1. Every chunk of every region in the area, by bulk copy.
-2. Each region's block cursor, RNG state, asset version table, and other region resources.
-3. The relationship reverse index.
-4. The physics world for the area, by Rapier's clone. This includes contact manifolds,
-   warm-start impulses and sleep state. Restoring chunks without it produces different results.
-5. Pending command buffers must be empty at a snapshot; snapshots are taken only at sync points.
+- Received packets are parsed on background workers into per-client staging queues.
+- At the input sync point, and only there, staged inputs are applied to the server tick and
+  staged state is applied to `Replicated` rows on the client. Nothing writes simulation rows
+  concurrently with systems or extract.
+- Server input policy: inputs are buffered per client with a small jitter window; a late input
+  is replaced by the previous input and the client is told.
+- Client clock sync: the client runs ahead by half the round trip plus a jitter margin and
+  adjusts its tick rate by up to three percent to track.
 
-`physics-api` exposes `snapshot` and `restore` as first-class operations with a conformance
-test: run ten ticks, snapshot at tick three, restore, re-run, hash equal at tick ten.
+### 9.3 Replication and interest
 
-The cost is not microseconds. Chunk copy is, but the physics clone is hundreds of microseconds
-to milliseconds depending on body count. Milestone 1 measures it and the predicted area is
-sized from the measurement.
+- Per client, the server tracks the last acknowledged tick, the relevance set, and a priority
+  accumulator per relevant entity. Relevance is region membership within a radius plus an
+  always-relevant set. Each packet is filled by priority (distance and staleness) up to the
+  client's bandwidth cap, from rows whose change tick is newer than the client's last-seen
+  tick. Packet loss needs no per-packet bookkeeping.
+- Positions are quantised relative to region origin. Send rate 20 to 30 Hz.
+- On the client, an interpolation buffer per remote entity holds received states and is sampled
+  by the presentation schedule about two send intervals in the past. It feeds the presentation
+  snapshot, never simulation rows. `Replicated` rows hold the latest received state for
+  simulation-side queries.
+- Late join and resync use the same path: a full relevance-set snapshot from the server.
 
-## 10. Rendering
+### 9.4 Prediction
 
-### 10.1 Render hardware interface
+- The client owns a **prediction world**, separate from its replicated world. It holds the
+  local player, entities the player has claimed (thrown objects, predicted spawns), and static
+  collision. Every other entity is a kinematic proxy driven by the latest received state.
+  Predicted entities collide only with static geometry and other predicted entities.
+- The prediction world has its own physics world, entity table and snapshot ring.
+- Snapshots copy the prediction world's mutable columns, its physics world, and its tables.
+  Ring depth is derived at runtime from the frame re-simulation budget divided by the measured
+  per-tick cost, with a configurable cap. Corrections deeper than the ring trigger a rebuild
+  from replicated state.
+- **Reconciliation** compares predicted and authoritative state per field in quantised space.
+  Corrections carry every simulation-read field at full precision. Mispredictions against
+  non-predicted entities are expected and smoothed visually. Proxies live about half a round
+  trip in the past relative to the local player; this is an accepted limitation, and predicted
+  interactions with proxies are presented tentatively until confirmed.
+- Later: forward nearby players' inputs so the prediction world includes them.
 
-Thin, explicit, modern. It abstracts what Vulkan 1.3, DX12 and Metal 3 share, verified rather
-than assumed:
+### 9.5 Lag compensation
+
+The server keeps a short history of transforms and colliders for players and for NPCs that can
+be hit, capped at 250 milliseconds, and validates hits at the tick the client saw.
+
+### 9.6 Scaling path
+
+Multi-process sharding is out of scope. Region ownership and command-based cross-region
+interaction keep it possible later. No system may hold a direct reference across regions.
+
+## 10. Snapshots
+
+Only the client prediction world is ever rolled back. Its `snapshot` captures mutable columns,
+the entity table, region resources, the relationship index and the physics world through
+`physics-api::snapshot`. Command buffers are empty at snapshot points by construction.
+
+The server never rolls back. Save snapshots copy persistent columns only (section 15).
+
+`physics-api` conformance: run ten ticks, snapshot at tick three, restore, re-run, hash equal
+at tick ten. The cost is measured in milestone 1 and the prediction world is sized from it.
+
+## 11. Time and pacing
+
+- The timer root (section 5.1) owns tick deadlines, catch-up and frame pacing.
+- Time scale is a simulation resource replicated by the server. It changes how many ticks run
+  per real second; the tick delta never changes. Pause is time scale zero, server-controlled.
+- Presentation runs on real time regardless of time scale.
+
+## 12. Rendering
+
+### 12.1 Render hardware interface
+
+Thin, explicit, modern, with every claimed common feature verified in the milestone 2 spike.
 
 - device, queues, swapchain
 - buffers with device addresses, images, samplers
-- one bindless heap for textures and buffers
-- pipelines from pre-compiled SPIR-V or Metal libraries, with specialisation
+- one bindless heap; residency calls where the backend needs them
+- pipelines from cooked SPIR-V or Metal libraries, with specialisation; driver pipeline caches
+  persisted to disk (`VkPipelineCache`, `MTLBinaryArchive`)
 - command encoders recordable on any thread
-- resource states as a backend-neutral enum; the graph emits transitions, the backend emits
-  barriers or relies on Metal's hazard tracking
+- resource states as a backend-neutral enum; backends emit barriers, and Metal backends handle
+  aliased transients and argument-buffer residency explicitly rather than relying on automatic
+  hazard tracking
+- memoryless and transient attachments, and render-pass-local reads (dynamic rendering local
+  read on Vulkan, framebuffer fetch on Metal) so the G-buffer stays in tile memory
 - timeline semaphores and fences
-- indirect draw and dispatch. Indirect-count is a reported capability. The primary culling
-  output is a fixed maximum draw count with zero-instance entries for culled draws; count
-  buffers are used when available.
+- indirect draw and dispatch; multi-draw-indirect and indirect-count are reported capabilities
+- a null backend for tests, graph unit tests and the server binary
 
-Constraints the macOS path imposes: MoltenVK compiles SPIR-V to MSL at pipeline creation and
-stalls for hundreds of milliseconds per pipeline, so the renderer keeps pipeline count small
-and creates all pipelines at load. Intel Macs are unsupported because their argument buffer
-tier cannot hold the bindless heap. MoltenVK's Vulkan 1.3 core status, buffer device address
-and descriptor indexing limits are verified in a one-day spike before `rhi-api` is written.
+Apple path: MoltenVK encodes one Metal draw per multi-draw-indirect command on the CPU, so it
+cannot carry the GPU-driven path. Milestone 2 spikes MoltenVK and KosmicKrisp and records
+indirect-draw behaviour and pipeline creation cost. Native Metal lands in milestone 3.
 
-Nothing above the RHI knows which backend is active. The RHI is the one place where a boxed
-trait object per subsystem is the right design.
+### 12.2 Shader toolchain
 
-### 10.2 Shader toolchain
+Slang. The cooker emits SPIR-V for Vulkan and MSL plus metallib for Metal, using Slang's Metal
+target directly. Mac shaders cook on a macOS runner. Bindless access is abstracted at the Slang
+level. Stage-three features that need 64-bit atomics are capability-gated because Apple M1
+lacks them.
 
-Slang is the shader language. The cooker compiles Slang to SPIR-V for Vulkan and produces
-Metal shader libraries from that SPIR-V at cook time. Bindless access is abstracted at the
-Slang level so one source serves Vulkan descriptor indexing, DX12 resource heaps and Metal
-argument buffers. There is no runtime shader compilation.
+### 12.3 Render graph
 
-### 10.3 Render graph
+- Passes declare reads and writes with usage. The graph derives order, culls unreachable
+  passes, computes transient lifetimes, aliases memory, inserts transitions and assigns queues.
+- Compile is cached by a hash of pass list, edges, resource descriptors, imported initial
+  states, view count and queue configuration. History resources use a ping-pong primitive. The
+  cache is capped.
+- Each pass records on a frame-critical worker. Submission order is graph order.
 
-- Passes declare reads and writes of named resources with usage. The graph derives order,
-  culls unreachable passes, computes transient resource lifetimes, aliases memory, inserts
-  transitions and assigns queues.
-- Compile is cached by a hash of: the pass list, edges, resource descriptors including sizes
-  and formats, imported resource initial states, view count, and queue configuration.
-  Ping-pong history resources use a dedicated primitive so alternation does not thrash the
-  cache. The cache is capped.
-- Each pass records on a worker through the task system. Submission order is the graph order.
-- Async compute is chosen by the graph when a pass has no graphics-queue dependency inside its
-  lifetime window.
+### 12.4 GPU scene and submission
 
-### 10.4 GPU-driven pipeline
+- Instances, meshes, materials, previous and current transforms live in persistent GPU buffers
+  with a GPU-side free-list allocator. Positions are stored as a 32-bit integer grid cell plus a
+  32-bit float offset; shaders subtract the camera cell so precision is preserved anywhere on
+  the map. `math` has a distinct render-space type with no implicit conversion from simulation
+  scalars. Culling bounds, light grid, decals, probes, VFX emitters, cascades, the clipmap
+  centre, markers, the audio listener and debug draw all convert through it.
+- Render slots are a renderer-owned side table keyed by `NetId`, reconciled after any restore
+  or load, never a column in simulation chunks.
+- Draw submission is one indirect draw per pipeline over fixed-size clusters with programmable
+  vertex pulling: cluster index from instance ID, fixed vertex count per cluster, degenerate
+  padding. This behaves identically on every backend. Multi-draw-indirect is used only where a
+  backend reports native support.
+- Culling is a compute pass per view: frustum padded for late-latch, distance, LOD. Skinning
+  and deformation are compute pre-passes. Transparency is sorted on the GPU per view.
+- Stage two: hierarchical-Z occlusion. Stage three: meshlets, mesh shaders and a visibility
+  buffer behind a feature flag.
 
-Stage one:
+### 12.5 Lighting and materials
 
-- **GPU scene.** Persistent buffers for instances, meshes, materials, previous and current
-  transforms. Allocated through a GPU-side free-list allocator. Uploaded by dirty row from the
-  ECS bitmask during extract.
-- **Culling.** Compute pass per view: frustum (padded for late-latch), distance, LOD selection.
-  Writes compacted instance lists and indirect draw commands.
-- **Draw.** Multi-draw indirect per pipeline. Bindless material and texture access by index.
-- **Lighting.** Deferred G-buffer with clustered lights.
-- **Skinning and deformation** as compute pre-passes writing into the same vertex pools, fed by
-  pose evaluation that runs outside the determinism boundary from the deterministic animation
-  state.
-- **Transparency** sorted on the GPU per view.
-
-Stage two: hierarchical-Z two-pass occlusion culling. Stage three: meshlets, mesh shaders and
-a visibility buffer behind a feature flag, only when content density demands it.
-
-### 10.5 Material model
+Deferred with a G-buffer kept in tile memory on tile-based GPUs through memoryless attachments
+and local reads. Clustered lights binned on the GPU in world space after the latch.
 
 Uber-shader with a material ID and a bindless parameter block. No free-form artist shaders.
-Permutation axes are fixed: alpha-tested, two-sided, skinned, vertex-deformed. The cooker
-emits every permutation. This is a hard constraint of GPU-driven batching and of MoltenVK's
-pipeline compile cost.
+Permutation axes: material (alpha-tested, two-sided, skinned, vertex-deformed) by pass type
+(G-buffer, depth-only, forward transparent, motion vectors). Pipeline budget is 96, all
+created at load.
 
-## 11. Assets and streaming
+## 13. Presentation
 
-- **Cook step.** `tools/cook` converts source assets into the runtime format: mesh pools ready
-  for the GPU scene, block-compressed textures, resolved material parameter blocks, compiled
-  shaders, scenes as region bundles. The runtime never parses a source format.
-- **Immutable after publish.** An asset is built on worker tasks and published as a new
-  version. Readers hold a `Handle<T>`. Inside the boundary, the version a region sees is the one
-  in its per-tick version table. Outside, readers see the newest.
-- **Async IO.** `io` has a blocking-pool backend as reference and universal fallback, with
-  io_uring and IOCP as optimisations. A read is a task `.await`.
-- **Streaming.** Regions declare their asset sets. A streaming budget task loads regions by
-  predicted player movement. A region enters `Simulated` mode only when its set is published.
+`present-api` is a foundation crate so `game-present` can reach presentation without naming
+a backend. It defines mesh, light, decal and camera rig components; VFX and audio request
+events; UI view-model resources; a debug-draw buffer; and the presentation snapshot type.
 
-## 12. Reflection and serialisation
+The camera rig is presentation, not simulation. Its orbit, boom and boom collision are evaluated
+per frame against static collision and are not authoritative. The input it produces carries
+absolute yaw and pitch into the simulation.
 
-- `reflect` holds a registry of every component and resource type: name, stable type ID,
-  size, alignment, fields with explicit `#[field(id = N)]` IDs, serde hooks, schema version
-  and persistence policy. Registration is by derive macro. A type without a persistence policy
-  or with a missing or duplicate field ID fails registration. CI checks that field IDs are
-  never reused after removal.
-- Scenes serialise as region bundles: for each archetype, columns written in bulk. Loading is
-  a bulk copy into chunks. Text form exists for authoring and diffing; binary for cooked
-  output.
-- Replication, snapshots, saves and the future editor all read the same registry.
+`presentation` runs the per-frame schedule on the snapshot. Pose evaluation for rendering runs
+here; the simulation uses the deterministic sim skeleton from `anim` for hit volumes, hand and
+foot placement, sockets and ragdoll bodies.
 
-## 13. Save games and persistence
+## 14. Assets and streaming
 
-Saves share the serialisation core and the snapshot primitive with netcode. They do not share
-the replication stream.
+- The cooker emits runtime formats only: cluster-ready mesh pools, block-compressed textures,
+  resolved material blocks, compiled shaders, collision, region bundles.
+- Assets are versioned and immutable after publish. Inside the boundary a region sees the
+  version in its table; outside, readers see the newest.
+- `io` is a foundation crate with a blocking-pool reference backend and io_uring and IOCP
+  optimisations.
+- Regions declare asset sets. A region enters `Simulated` only when its set is published.
+  Streaming leads the player by a hard distance; the server holds a player at a region boundary
+  until the client acknowledges readiness. A client-only asset failure is a tick-stamped event
+  that makes the client request a resync rather than diverge.
 
-### 13.1 Persistence policy
+## 15. Reflection, serialisation and persistence
+
+- `reflect` holds a registry of every component and resource type with explicit
+  `#[field(id = N)]` IDs, typed reference fields, schema version and persistence policy. Missing
+  or duplicate IDs fail registration. CI rejects ID reuse.
+
+### 15.1 Persistence policy
 
 | Policy | Meaning | Example |
 |---|---|---|
-| `persistent` | Written to saves at full precision | transform, health, inventory entities, quest flags |
-| `transient` | Not saved, default-initialised on load, but deterministic and hashed | velocity caches, animation phase |
-| `derived` | Not saved, not hashed, rebuilt by an `on_load` system | physics handles, render instance slots |
+| `persistent` | Saved at full precision | transform, health, velocity, animation phase, timers, quest flags |
+| `transient` | Written before read every tick, never saved; hashed | per-tick accumulators, contact lists |
+| `derived` | Rebuilt by `on_load`; not saved, not hashed | render slots, physics handles |
 
-### 13.2 Stable identity
+Transient is enforced by a poison test: debug builds randomise transient columns after every
+restore and load.
 
-Persistent entities carry a `PersistentId`. For cooked entities it derives from the source
-asset's GUID, so re-cooking never orphans a save. For runtime spawns it comes from a
-server-only persistent counter held in global persistent resources.
+### 15.2 World overlay
 
-### 13.3 World overlay
+The save is a set of typed records per region against the cooked baseline, each keyed by
+`PersistentId`: `Spawn`, `Destroy`, `AddComponent`, `RemoveComponent`, `SetField`,
+`OwnershipChange`. The baseline content hash is recorded per region. A patched baseline keeps
+all runtime-spawned entities and drops only `SetField` records whose target no longer exists.
 
-The save is a diff against the cooked world, kept per region. Overlay entries are
-(`PersistentId`, field ID, absolute value), with the baseline content hash recorded per region.
-Applying an overlay to a patched baseline keeps entries whose IDs still exist and drops the rest
-with a log line. Region unloading and saving are the same code path.
+### 15.3 Save operation
 
-### 13.4 Save operation
+At a sync point, copy persistent columns of every loaded region on worker tasks, serialise
+through `reflect`, diff into records, compress with zstd, write through `io` to a temporary
+file, sync, rename over the slot.
 
-1. At a sync point, snapshot every active area (section 9).
-2. On worker tasks, serialise through `reflect`, diff against the cooked baseline, compress
-   with zstd.
-3. Write through `io` to a temporary file, sync, rename over the slot.
+### 15.4 Container and evolution
 
-### 13.5 Container and schema evolution
+Self-describing binary container with engine version, schema hash and a per-region index.
+Matching schema takes the bulk-copy-plus-remap fast path; mismatched schema decodes by field ID
+and runs migrations in version order. After load, change ticks are rebased.
 
-- Self-describing binary container with engine version, registry schema hash, and a per-region
-  index.
-- Matching schema hash takes the fast path: bulk copy into chunks. Mismatched schema decodes by
-  field ID, applies registered per-type migrations in version order, then bulk-copies.
-- After load, change ticks are rebased (section 6).
+### 15.5 Enforcement
 
-### 13.6 Multiplayer
+- Test: the original performs an in-place reload at tick T; a fresh process loads the save;
+  both run K ticks and must hash identically.
+- Test: unload and reload a region; persistent columns match.
+- Test: load a save from the previous schema version through its migration.
 
-The server owns the world save. Player entities are part of it. Portability of a player between
-hosts is an open item.
+The server owns the save in multiplayer. Player portability between hosts is an open item.
 
-### 13.7 Enforcement
+## 16. Physics
 
-- Test: save at tick T, load into a fresh process, simulate K ticks in both, compare persistent
-  columns at T+K. Comparing at T alone cannot catch a component wrongly marked transient.
-- Test: unload a region, reload it, persistent columns match.
-- Test: load a save written by the previous schema version through its migration.
+Rapier, pinned to an exact version together with its math and SIMD dependencies; any bump is a
+protocol and replay break. One physics world per server process and one per client prediction
+world. Rapier's determinism feature is used together with its parallel solver; the solver's
+rayon pool is sized to the frame-critical worker count and runs during a physics phase in which
+frame-critical workers park. The physics step and snapshot cost are measured in milestone 1.
+The simulation scalar is decided there by a precision test at full map extent.
 
-### 13.8 Journal replay
+`physics-rapier` is inside the boundary. Replacement is a backend swap behind `physics-api`
+including `snapshot` and `restore`.
 
-Checkpoint plus input journal is a debug and replay tool, not the save system.
+## 17. Animation
 
-## 14. Physics
+`anim` is inside the boundary: state machines, phase, events, root motion, and a deterministic
+sim skeleton covering sockets, hands, feet, head and ragdoll bodies. Full pose evaluation and
+skinning are presentation and renderer work.
 
-Rapier, 64-bit build, through `physics-api`. Rapier's determinism feature is incompatible with
-its parallel and SIMD features, so each physics world steps as one serial task. Parallelism is
-across active areas only. The physics step is budgeted per area in milestone 1 and the
-predicted area is sized against it. `physics-rapier` is inside the determinism boundary.
-Replacement with an in-house solver is a backend swap behind the same interface, including
-`snapshot` and `restore`.
+## 18. Gameplay authoring
 
-## 15. Gameplay authoring
+- Rust only. `game-sim` depends on foundation boundary crates; `game-present` on `present-api`
+  and foundation crates. `game` is split into at least four crates from the start to bound
+  incremental build cost.
+- Dev profile: dependencies at opt-level 3, game crates at opt-level 1, line-tables-only debug
+  info, split debuginfo, mold or lld on Linux, lld-link on Windows. Registration is through
+  generated functions, not life-before-main. Edit-to-playing time is measured per platform in
+  milestone 1 and budgeted at thirty seconds.
+- Iteration is state-preserving restart through `reflect`. Dylib reload later if needed.
 
-- Rust only. Gameplay systems live in `game` crates and depend on foundation crates only.
-- Iteration loop: edit, incremental build, state-preserving restart through `reflect`. This
-  costs a link plus a reflect round-trip and drops transient state by design. Build time is
-  measured in milestone 1 and mitigated before it exceeds thirty seconds for a `game` change.
-- Animation logic (states, phases, events, root motion) is simulation code in `anim`. Pose
-  evaluation is renderer code.
-- Behaviour is data-driven where possible: state machines, ability definitions and spawn
-  tables are assets.
+## 19. Error handling
 
-## 16. Unsafe policy
+- `core::Error` is the taxonomy. Subsystems return `Result`; `app` holds policy.
+- Panics are for broken invariants only and abort.
+- Tested device-lost recovery: re-upload assets, rebuild the GPU scene from region data, full
+  extract.
+- Network drop, reconnect, disk full and corrupt save each have a defined path by milestone 4.
+
+## 20. Agent workflow
+
+- Three tracks from milestone 1: simulation (`ecs` to `sim` to physics to the netcode spike),
+  render (RHI spike to Vulkan to graph to GPU scene), assets (`io` to `asset` to `cook`). They
+  join at extract in milestone 2 and streaming in milestone 3.
+- A naive single-threaded `ecs` query and system facade ships in week one so dependent agents
+  can start.
+- Backend-driven crates (`rhi`, `physics`, `io`, `net`) are vertical slices: one task owns the
+  `-api` and the first backend. `rhi-api` stays unstable until the native Metal spike has run.
+- Interface-first only where behaviour is known and there are two or more consumers:
+  `asset-api`, `input`, `present-api`.
+- Amending an interface in the same PR as the implementation that needs it is permitted and
+  must be called out.
+- Every `-api` ships a conformance suite. RHI conformance runs under lavapipe on Linux CI and
+  on a GPU runner nightly.
+- Each crate's `README.md` states responsibility, tier, boundary status and unsafe status.
+- CI: clippy `-D warnings`, fmt, nextest, SOUR in all applicable modes, Miri nightly on `task`
+  and `ecs`, `cargo-deny`, the tier check.
+
+## 21. Unsafe policy
 
 | Crate | Why |
 |---|---|
-| `task` | work-stealing deques, fork-join scope borrows |
-| `ecs` | chunk column storage, typed views over raw memory |
+| `task` | deques, scope borrows, panic guard |
+| `ecs` | chunk column storage |
 | `io` | platform completion APIs |
 | `rhi-*` | FFI to graphics drivers |
-| `core` | arenas and handle tables |
+| `core` | arenas, handle tables, `unsafe impl` for generic plain-data types |
+| `tools/cook` | FFI to Slang and compression libraries |
 
-Each carries `SAFETY.md`. Every `unsafe` block has a `// SAFETY:` comment. `task` and `ecs`
-unit tests run under Miri in a nightly CI job. The fork-join join counter is modelled under
-`loom`.
+Each carries `SAFETY.md`. Every `unsafe` block has a `// SAFETY:` comment.
 
-## 17. Agent workflow
-
-- **Vertical slice for backend-driven crates.** `rhi`, `physics`, `io`, `net`: one task owns
-  the `-api` crate and the first backend together. The `-api` is marked unstable until the first
-  backend passes its own conformance tests, then frozen.
-- **Interface-first only where behaviour is known** and there are at least two consumers:
-  `asset-api`, `input`.
-- **Amending an interface** is permitted in the same PR as the implementation that needs it,
-  with the change called out in the PR description. Silent drift is not.
-- **Tests are the contract.** Every `-api` ships a conformance suite. Determinism tests are
-  mandatory inside the boundary. RHI conformance runs on Linux CI under lavapipe and on a
-  GPU runner nightly.
-- **One crate per task** otherwise. No speculative generality.
-- **Docs live with code.** Each crate's `README.md` states responsibility, tier, boundary
-  status and unsafe status.
-- **CI gates.** clippy with `-D warnings`, fmt, tests, SOUR in all applicable modes, Miri
-  nightly, `cargo-deny`, and the tier check against `crate-tiers.toml`.
-
-## 18. Milestones
+## 22. Milestones
 
 | # | Name | Delivers | Proves |
 |---|---|---|---|
-| 0 | Skeleton | Workspace, CI, `core`, `math`, `task`, `reflect`, tracing | Critical-path latency on a synthetic DAG matches its theoretical bound within 10%. Fork-join scope passes Miri and loom. Task spawn under 100 ns. SOUR scaffold runs. |
-| 1 | World | `ecs`, `sim`, `persist`, `physics-api`, `physics-rapier`, `anim` logic, headless `app` | 100k entities, parallel systems, SOUR passes in workers, repeat and layout modes. Physics snapshot and restore conformance. Save, load, simulate, compare. Physics step and snapshot cost measured. Build time measured. |
-| 2 | Pixels | `platform`, `rhi-api`, `rhi-vulkan`, `render-graph`, minimal `renderer`, Slang toolchain in `cook` | A triangle through the graph on Windows and macOS. MoltenVK spike results recorded. Pipelined render overlapping simulation with serial extract. lavapipe CI. |
-| 3 | GPU-driven | GPU scene, culling, indirect draws, deferred lighting, `asset-api`, `asset`, `io`, `cook`, `terrain`, pose evaluation | 500k instances culled and drawn with a handful of CPU submissions. Streaming regions with overlay persistence. Skinned characters on terrain. |
-| 4 | Network | `net-api`, `net`, client and server `app`, SOUR architecture mode on every PR | Four clients, prediction and rollback over an area, delta replication, resync path. Chaos test with injected latency and loss. x86 server, ARM client, hashes equal. |
-| 5 | Game | `game` crates, `input`, `audio`, `ui`, `nav`, `debug-ui` | A playable slice: terrain, climbing, physics objects, co-op interaction, gamepad, sound. |
+| 0 | Skeleton | Workspace, CI matrix, `core`, `math`, `task`, `reflect`, tracing, SOUR scaffold, naive `ecs` facade | Makespan divided by critical-path length at P50 and P99 on representative DAGs, on bare-metal performance-plus-efficiency and x86 machines, with and without background load. Wake and steal latency microbenchmarks. Scope and sleep-wake pass loom and Miri. |
+| 1 | World | Sim track: `ecs`, `sim`, `physics-api` plus `physics-rapier`, `anim`, `predict`, `asset-api` and `input` types, headless `app`. Render track: RHI spike, `rhi-null`. Asset track: `io`, `asset`, `cook` skeleton. | 100k entities, SOUR in workers, repeat, layout and chaos modes. Physics snapshot conformance. Netcode spike: x86 server, aarch64 client, one predicted character, fifty bodies; correction rate, rollback cost and divergence measured. Scalar precision decided. Physics, snapshot and build times measured. |
+| 2 | Pixels | `platform`, `rhi-api`, `rhi-vulkan`, `render-graph`, minimal `renderer`, Slang toolchain, `present-api`, presentation snapshot and schedule | A triangle through the graph on Windows and macOS. MoltenVK and KosmicKrisp spike recorded. Overlap with exclusive extract; extract cost per dirty row measured. lavapipe CI; macOS shader runner. |
+| 3 | GPU-driven | GPU scene with cell-plus-offset, cluster submission, culling, deferred tile-local lighting, streaming regions with overlay, `terrain`, pose evaluation, `rhi-metal` | 500k instances with one indirect draw per pipeline on Vulkan and Metal. Regions persist across unload and reload. Skinned characters on terrain. |
+| 4 | Network | `net`, interest management, bandwidth prioritisation, reconciliation, resync, late join, client and server `app`, SOUR architecture mode on every PR | Thirty-two simulated clients joining and leaving under injected latency and loss. A recorded server session replayed on aarch64 hashes equal. Solo-traversal correction rate under a stated threshold. |
+| 5 | Game | `game-sim`, `game-present`, `audio`, `ui`, `nav`, input mapping, `debug-ui` | A playable slice: terrain, climbing, physics objects, co-op interaction, gamepad, sound. |
 
-### 18.1 Decided later, by milestone
+### 22.1 Decided later, by milestone
 
 | Decision | By |
 |---|---|
-| Memory budgets per region, GPU, streaming; baseline-resident cost of overlay diffing | 3 |
+| Simulation scalar precision | 1 |
+| Build-time mitigation if over budget | 1 |
 | Crash reporting: minidumps and symbol upload | 2 |
-| Build-time mitigation strategy if over budget | 1 |
+| Memory budgets per region, GPU, streaming | 3 |
+| Apple interim path (MoltenVK or KosmicKrisp) until native Metal | 2 |
 | Audio thread model and event bridge | 5 |
-| Navigation representation and AI behaviour model | 5 |
+| Navigation and AI behaviour model | 5 |
 | UI framework and text rendering | 5 |
 | Localisation | 5 |
-| Protocol versioning beyond the handshake hash | 4 |
 | Player profile portability between hosts | 4 |
+| Network drop, reconnect, disk-full and corrupt-save paths | 4 |
 
-## 19. Open items needing a spike
+## 23. Review history
 
-- MoltenVK: Vulkan 1.3 core conformance, buffer device address, descriptor indexing limits,
-  draw-indirect-count. Before `rhi-api`.
-- Rapier: confirm on the pinned version that the determinism feature excludes parallel and
-  SIMD, and measure serial step cost. Milestone 1.
-- io_uring availability on the CI runners. Milestone 0.
-- Clippy `disallowed-methods` matching inherent primitive methods on the pinned toolchain.
-  Milestone 0.
-- Chunk size per archetype versus fixed 16 KiB. Milestone 1.
+- Revision 2 addressed the first review: unsound scoped async spawning, a contradictory
+  dependency rule, chunk-layout-dependent determinism, snapshots missing physics state, region
+  bits in entity IDs, padding in hashed bytes.
+- Revision 3 addressed the second review: process-local IDs used as cross-machine keys,
+  help-while-waiting lengthening the critical path, a single dirty bit shared by many
+  consumers, camera-relative positions rewriting the whole GPU scene, MoltenVK's CPU-side
+  multi-draw loop, and a predicted area with two writers per row; plus the float rules, the
+  save overlay, the transient policy, presentation access, the orbit camera, extract mechanics,
+  tier contradictions, network staging, time and pacing, worker classes, component trait
+  bounds, the sim skeleton, error handling, the shader toolchain, tile memory, build settings
+  and the protocol hash.
 
-## 20. Review history
+## 24. Spikes
 
-Revision 2 incorporates an adversarial review that found six blocking issues: unsound scoped
-async spawning, a self-contradicting dependency rule, chunk-layout-dependent determinism,
-snapshots that omitted physics state, region bits in entity IDs, and padding in hashed bytes.
-All are addressed above.
+- MoltenVK and KosmicKrisp: indirect-draw behaviour, encode time for ten thousand draws,
+  pipeline creation cost, memoryless attachments and local reads. Milestone 2.
+- Per-dirty-row extract cost. Milestone 2.
+- io_uring availability on CI runners. Milestone 0.
+- Clippy `disallowed-methods` on inherent primitive methods on the pinned toolchain. Milestone 0.
+- Scalar precision at full map extent. Milestone 1.
 
-## 21. Glossary of names
+## 25. Third-party claims to re-verify on pinned versions
+
+These were reported by review against upstream sources and are re-checked against the exact
+versions in `Cargo.lock` before the milestone that depends on them.
+
+- Rapier: its determinism feature combines with its parallel solver with bit-identical results
+  for any pool size; SIMD is always on; the 64-bit build has the determinism feature; its math
+  moved to glam-based crates. Whether a single active set makes results depend on unrelated
+  awake bodies is tested by stepping a scene with and without a distant awake body. Milestone 1.
+- `wide` and glam select fused or unfused multiply-add by target feature. Milestone 0.
+- `libm`'s x86 runtime detection selects only correctly rounded paths. Milestone 0.
+- MoltenVK multi-draw-indirect is a CPU loop. Milestone 2.
+- Slang's Metal target supports argument buffers, function constants and framebuffer fetch.
+  Milestone 2.
+- Apple M1 lacks 64-bit atomics. Milestone 3.
+
+## 26. Open items
+
+- Player portability between hosts.
+- Multi-process server sharding, out of scope but kept possible.
+
+## 27. Glossary of names
 
 Codenames label subsystems on binaries, tools, log targets, CI jobs, README titles and doc
 headings. Crate names, types and functions stay descriptive.
@@ -619,15 +735,15 @@ headings. Crate names, types and functions stay descriptive.
 | CURD | `lactose-sim` | Deterministic simulation core. Concurrent Unified Runtime, Deterministic. |
 | WHISK | `lactose-task` | Work-stealing task executor. |
 | CASEIN | `lactose-ecs` | Chunked archetype storage and scheduler. |
-| COW | `lactose-sim` | Copy-on-write chunk snapshots, a later optimisation. |
+| COW | `lactose-predict` | Copy-on-write snapshots, a measured optimisation. |
 | GOUDA | `lactose-render-graph` | Render graph. Graph Of Unified Device Access. |
 | CHEDDAR | `lactose-renderer` | Persistent GPU scene. |
 | BRIE | `lactose-renderer` | Bindless resource heap. |
 | CREAM | `lactose-renderer` | GPU culling. Culling Regions Encoded As Masks. |
-| LATTE | `lactose-renderer` | Late-latched view rotation. |
+| LATTE | `lactose-renderer` | Late-latched orbit camera. |
 | FROTH | `lactose-renderer` | VFX particles, outside the determinism boundary. |
 | QUARK | `lactose-physics-rapier` | Physics backend. |
-| MILKMAN | `lactose-net` | Delta replication. Log target `milkman`. |
+| MILKMAN | `lactose-net` | Replication and interest management. Log target `milkman`. |
 | SKIM | `lactose-persist` | Save system. Save Kit and Instance Manager. |
 | CARTON | `lactose-persist` | Save container format. |
 | SILO | `lactose-asset` | Immutable asset store and streaming. |
