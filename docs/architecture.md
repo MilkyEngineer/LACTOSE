@@ -40,6 +40,7 @@ Non-goals for now: an editor, mobile, web, cross-architecture determinism, a scr
 | Concurrency primitive | Stackless async tasks on a custom executor. No tokio. No stackful fibers. |
 | Gameplay authoring | Rust only. Iteration via state-preserving restart. Dylib hot reload later if needed. |
 | Editor | Deferred. Reflection and component registry in scope from day one because serialisation and replication need them. |
+| Saves | Share the serialisation core and snapshot primitive with netcode, never the replication stream. World overlay against the cooked baseline, server-owned in multiplayer, schema-versioned with migrations. |
 | Platforms now | Windows, macOS. Linux for CI. Consoles when Rust toolchains exist. |
 
 ## 3. Principles that bind every crate
@@ -54,7 +55,7 @@ A `Mutex` inside a system is a review rejection. Locks are permitted in setup, t
 IO completion handling.
 
 **Unsafe is quarantined.** `#![forbid(unsafe_code)]` in every crate except those listed in
-section 14. Those crates carry a `SAFETY.md` explaining each invariant.
+section 15. Those crates carry a `SAFETY.md` explaining each invariant.
 
 **Interface before implementation.** Each subsystem ships `<name>-api` with traits and plain
 data types, and `<name>` or `<name>-<backend>` implementing them. Callers depend on `-api`
@@ -93,6 +94,7 @@ crates/
   net-api/         transport, replication, prediction and snapshot contracts
   net/             delta replication, interest management, prediction region, rollback
   sim/             deterministic world: regions, tick loop, snapshot ring, determinism hashing
+  persist/         persistence policy, stable IDs, world overlay, save container, migrations
   platform/        winit window, input, swapchain surface, main-thread pump
   debug-ui/        egui overlay, profiler view, determinism inspector
   app/             assembles runtime: client, server, headless
@@ -300,14 +302,91 @@ batching and is decided now so the asset format can assume it.
 ## 11. Reflection and serialisation
 
 - `reflect` holds a registry of every component and resource type: name, stable ID, size,
-  alignment, fields, and serde hooks. Registration is by derive macro.
+  alignment, fields, serde hooks, schema version and persistence policy. Registration is by
+  derive macro. A type without an explicit persistence policy fails registration.
 - Scenes serialise as region bundles: for each archetype, columns written in bulk. Loading is
   a bulk copy into chunks. Text form exists for authoring and diffing; binary for cooked
   output.
 - Replication, snapshots and the future editor all read the same registry. There is one source
   of truth for what a component is.
 
-## 12. Physics
+## 12. Save games and persistence
+
+Saves share the serialisation core and the snapshot primitive with netcode. They do not share
+the replication stream, which is a bandwidth policy with the wrong baseline, the wrong
+precision and the wrong coverage for persistence.
+
+### 12.1 Persistence policy
+
+Every component and resource declares one of:
+
+| Policy | Meaning | Example |
+|---|---|---|
+| `persistent` | Written to saves at full precision | transform, health, inventory, quest flags |
+| `transient` | Dropped on save, default-initialised on load | velocity caches, animation phase |
+| `derived` | Dropped on save, rebuilt by an `on_load` system | physics handles, render instance slots |
+
+### 12.2 Stable identity
+
+Persistent entities carry a `PersistentId`, a 64-bit value assigned at cook time for placed
+entities and at spawn time for runtime ones, independent of the runtime entity ID. References
+between persistent entities serialise as `PersistentId`. Asset references serialise as
+`AssetId`.
+
+### 12.3 World overlay
+
+The save is a diff against the cooked world, kept per region.
+
+- When a region unloads, `persist` serialises its persistent columns, diffs them against the
+  cooked baseline for that region, and writes the diff into the overlay.
+- When a region loads, the cooked baseline is loaded and the overlay diff is applied before
+  the region enters simulation.
+- A save file is: the overlay for every region that has ever changed, active regions in full,
+  global persistent resources, and the player entities.
+
+Region unloading and saving are therefore the same code path, and saves stay small.
+
+### 12.4 Save operation
+
+1. At a tick boundary, snapshot every active region through the same `snapshot(region)` call
+   that rollback uses. This is a chunk copy and takes microseconds.
+2. On worker tasks, serialise the snapshot through `reflect`, diff against the cooked
+   baseline, compress with zstd.
+3. Write through `io` to a temporary file, sync, rename over the slot.
+
+The frame never stalls. The save is consistent at exactly one tick. A crash during a write
+leaves the previous slot intact.
+
+### 12.5 Container and schema evolution
+
+- Self-describing binary container with a header holding the engine version, the registry
+  schema hash, and a per-region index.
+- Matching schema hash takes the fast path: bulk copy into chunks.
+- Mismatched schema decodes field by field by name and stable field ID, applies registered
+  per-type migrations in version order, then bulk-copies.
+- Removing a persistent component or field requires a migration. CI checks that every
+  registered type's schema version increments when its fields change.
+
+### 12.6 Multiplayer
+
+The server owns the world save. Player entities are part of it. Clients hold no authoritative
+persistent state. Whether a player's character can be carried between hosts is a product
+decision tracked as an open item.
+
+### 12.7 Enforcement
+
+- Test: save at tick T, load into a fresh process, `world_hash` equals the pre-save hash for
+  every active region. Any component missing a correct policy shows up as a mismatch.
+- Test: unload a region, reload it, `world_hash` matches.
+- Test: load a save written by the previous schema version through its migration.
+
+### 12.8 Journal replay
+
+A deterministic sim can restore state from a checkpoint plus the input journal. This is kept as
+a debug and replay tool. It is not the save system, because load time grows with play time and
+any binary change invalidates the journal.
+
+## 13. Physics
 
 Rapier through `physics-api`. The API exposes bodies, colliders, joints, scene queries and
 contact events as plain data. Rapier runs inside the determinism boundary with its
@@ -315,7 +394,7 @@ deterministic feature enabled. Its internal threading is disabled; the engine's 
 drives island solving through the API where Rapier allows it. Replacement with an in-house
 solver is a backend swap.
 
-## 13. Gameplay authoring
+## 14. Gameplay authoring
 
 - Rust only. Gameplay systems live in `game` crates, depend only on `-api` crates, `ecs`,
   `sim` and `math`.
@@ -326,7 +405,7 @@ solver is a backend swap.
 - Behaviour is data-driven where possible: state machines, ability definitions and spawn
   tables are assets, not code.
 
-## 14. Unsafe policy
+## 15. Unsafe policy
 
 Crates permitted to contain `unsafe`:
 
@@ -342,7 +421,7 @@ Each carries `SAFETY.md`. Every `unsafe` block has a `// SAFETY:` comment naming
 `task` and `ecs` run under Miri in CI for their unit tests. `task` additionally runs its
 scheduler model under `loom`.
 
-## 15. Agent workflow
+## 16. Agent workflow
 
 This engine is built by AI agent teams working in parallel. The structure exists to make that
 safe.
@@ -361,23 +440,23 @@ safe.
   double-run, Miri on unsafe crates, and a dependency-direction check that fails if a crate
   depends on an implementation crate it should not.
 
-## 16. Milestones
+## 17. Milestones
 
 Each milestone ends with a runnable binary and a demo.
 
 | # | Name | Delivers | Proves |
 |---|---|---|---|
 | 0 | Skeleton | Workspace, CI, `core`, `math`, `task-api`, `task`, `reflect` | Task system saturates cores on a synthetic DAG with no coordinator. Determinism lint passes. |
-| 1 | World | `ecs`, `sim`, `physics-api`, `physics-rapier`, headless `app` | 100k entities, parallel systems, `world_hash` identical across 1 and N workers. Snapshot and restore of a region. |
+| 1 | World | `ecs`, `sim`, `persist`, `physics-api`, `physics-rapier`, headless `app` | 100k entities, parallel systems, `world_hash` identical across 1 and N workers. Snapshot and restore of a region. Save, load into a fresh process, hash equal. |
 | 2 | Pixels | `platform`, `rhi-api`, `rhi-vulkan`, `render-graph`, minimal `renderer` | A triangle through the graph on Windows and macOS. Pipelined render overlapping simulation. |
-| 3 | GPU-driven | GPU scene, culling, indirect draws, `asset-api`, `asset`, `io`, `cook` | 500k instances culled and drawn with a handful of CPU submissions. Streaming regions. |
+| 3 | GPU-driven | GPU scene, culling, indirect draws, `asset-api`, `asset`, `io`, `cook` | 500k instances culled and drawn with a handful of CPU submissions. Streaming regions with world overlay persisting across unload and reload. |
 | 4 | Network | `net-api`, `net`, client and server `app` | Four clients, prediction and rollback over a region, delta replication. Chaos test with injected latency and loss. |
 | 5 | Game | `game` crates, `debug-ui` | A playable slice: terrain, climbing, physics objects, co-op interaction. |
 
 Milestone 0 starts with `task` because every later crate depends on it and because its
 behaviour under contention is the hardest thing to retrofit.
 
-## 17. Open items
+## 18. Open items
 
 Tracked here until resolved in a milestone.
 
@@ -387,3 +466,5 @@ Tracked here until resolved in a milestone.
   milestone 1.
 - Whether chunk size should vary per archetype or stay fixed at 16 KiB: measure in milestone 1.
 - Console toolchains: no action until Rust is supported on the target platform.
+- Player profile portability between hosts: product decision, affects whether player entities
+  get a separate save container.
