@@ -1,0 +1,14 @@
+[package]
+name = "lactose-math"
+description = "Deterministic simulation math: the Scalar newtype, vectors, quaternions, matrices, canonical bits, exact accumulators and the typed render space."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+bytemuck.workspace = true
+libm.workspace = true
+
+[lints]
+workspace = true

@@ -25,7 +25,10 @@ lactose-bundle = { path = "crates/bundle" }
 bytemuck = { version = "1.25", features = ["derive"] }
 crossbeam-deque = "0.8"
 libc = "0.2"
-libm = "0.2"
+# Features named explicitly so an upstream change of defaults cannot alter the set. `arch` only
+# swaps in hardware sqrt, fused multiply-add and rint, each exact or correctly rounded; the
+# `unstable*` and `force-soft-floats` features must stay off (crates/math/README.md).
+libm = { version = "0.2", default-features = false, features = ["arch"] }
 loom = "0.7"
 tracing = { version = "0.1", default-features = false, features = ["std"] }
 windows-sys = "0.61"
