@@ -24,8 +24,11 @@ crates = [
 crates = [
   "lactose-core", "lactose-math", "lactose-ecs", "lactose-sim", "lactose-anim",
   "lactose-predict", "lactose-nav-query", "lactose-physics-api", "lactose-physics-rapier",
-  "game-sim",
+  "game-sim", "game-ai",
 ]
+
+# Edges that need no exception because the target is foundation: net -> predict,
+# presentation -> net-api (interpolation buffer), audio -> present-api (listener requests).
 
 [exceptions]
 "lactose-renderer"     = { may_depend_on = ["lactose-render-graph"], reason = "passes are the renderer's output" }
@@ -33,4 +36,3 @@ crates = [
 "lactose-debug-ui"     = { may_depend_on = ["lactose-renderer", "lactose-platform"], reason = "overlay draws through the renderer and reads window events" }
 "lactose-terrain"      = { may_depend_on = ["lactose-renderer"], reason = "clipmap passes" }
 "lactose-ui"           = { may_depend_on = ["lactose-renderer", "lactose-render-graph"], reason = "UI pass" }
-"lactose-net"          = { may_depend_on = ["lactose-predict"], reason = "reconciliation drives the prediction world" }

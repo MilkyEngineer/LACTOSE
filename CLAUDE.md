@@ -37,7 +37,7 @@ Never use a codename for a crate, type or function.
   inside the determinism boundary.
 - Inside the boundary: no `Instant` or `SystemTime`; `core::FixedHashMap` only; no
   `thread_local!`; floats only through `math` (no `f32::min`/`max`/`powi`/`total_cmp`/`to_bits`
-  outside it); no glam; no runtime CPU feature detection selecting different numerics; chunk,
+  outside it); no glam except through Rapier's pinned math in `physics-rapier`; no runtime CPU feature detection selecting different numerics; chunk,
   row, worker and task order are never semantic keys. Every ordering and RNG key is a stable
   key (`NetId`, `SystemKey`, `PredictionKey`), never `EntityId`.
 - x86-64 builds pin the x86-64-v3 baseline; `math` fails to compile without `fma`.
