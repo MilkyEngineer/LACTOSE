@@ -1,0 +1,5 @@
+error: field ID 1 is already used by field `current`
+ --> tests/ui/duplicate_field_id.rs:8:5
+  |
+8 |     max: u32,
+  |     ^^^

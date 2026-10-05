@@ -1,0 +1,19 @@
+[package]
+name = "lactose-reflect"
+description = "Reflection metadata for components and resources: field IDs, typed references, persistence policy, the type registry."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+bytemuck.workspace = true
+lactose-core.workspace = true
+lactose-reflect-macros.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+trybuild.workspace = true
+
+[lints]
+workspace = true
