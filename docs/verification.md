@@ -15,7 +15,7 @@ with the milestone that gates it.
 | MoltenVK and KosmicKrisp | Indirect-draw behaviour, encode time for ten thousand draws, pipeline creation cost, memoryless attachments and local reads | 2 |
 | Extract cost | Per-dirty-row extract cost | 2 |
 | Prediction-world snapshot cost | Full-copy cost per tick, deciding whether copy-on-write is built | 1 |
-| Native Metal | Argument buffers, residency, memoryless attachments, framebuffer fetch, indirect draws; unfreezes `rhi-api` | 2 |
+| Native Metal | Argument buffers, residency, memoryless attachments, framebuffer fetch, indirect draws; `rhi-api` is frozen or amended on its findings | 2 |
 | Remote transform upload | Cost per frame for 5k interpolated entities at 144 Hz | 2 |
 | Physics phase stall | Share of tick and stall imposed on render recording during overlap | 1 |
 

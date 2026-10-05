@@ -25,7 +25,7 @@ crates = [
 ]
 
 [leaf]
-crates = ["lactose-app-client", "lactose-app-server", "lactose-app-headless", "ricotta"]
+crates = ["lactose-app-client", "lactose-app-server", "lactose-app-headless", "lactose-cook"]
 
 [game]
 crates = ["game-sim", "game-present", "game-ai", "game-content"]
