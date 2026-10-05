@@ -1070,6 +1070,57 @@ rationale the author supplied during the editorial pass rather than one taken fr
   must not be able to implement wrongly.
 - Driven by: milestone 0 math lane and its review, finding 4.
 
+**D107. Executor futures resolve to `Result`, and resolution means quiescent** (§5.1, `lactose-task`)
+- Why: a future that never resolves after shutdown hangs its waiter, so `GraphRun`, `Task` and
+  `Sleep` resolve to `Cancelled`. `lactose-ecs` frees or reuses world state when a run
+  resolves, so a run that resolved while one of its units was still executing would race it:
+  a run counts its executing jobs, a job registers and reads the closing flag in one atomic
+  step, and the run resolves only at zero. A unit already past its shutdown check may still
+  start; it finishes before the resolution. A job cannot wait for its own run.
+- Driven by: milestone 0 task lane, first review (hang after shutdown) and second review,
+  finding 2.
+
+**D108. Scope-open routing replaces the deque watermark** (§5.1, `lactose-task`)
+- Why: a watermark cannot stop work pushed to an opener's deque after the scope opened (a
+  released dependent, a woken task) from sitting above it, where the opener would run it or
+  strand it while parked. Entries carry their scope's tag and anything that is not a child of
+  the open scope goes to the frame injector. A parked opener gives up its run permit, so it
+  does not consume a `block_in_place` reservation; an opener with children on its deque
+  announces itself before parking and a freed permit unparks it.
+- Driven by: milestone 0 task lane, first review (scope-wait deadlock, reservation consumed by
+  a parked opener) and second review, finding 1.
+
+**D109. Wake policy: park after 50 µs, keep one, wake one per extra entry** (§5.1, `lactose-task`)
+- Why: measured on an M1. A longer spin or an extended rescan before parking bought no wake
+  latency and cost idle CPU; a releasing worker that keeps one entry and wakes nobody for it
+  saves a wake-up per fan-out. A 3 ms lingering spinner reached a P99 of 14.7 µs but burned
+  99% of a core and was not adopted. Wake latency at tick start is bounded below by the
+  operating system's park and unpark (verification, section 4).
+- Driven by: milestone 0 task lane benchmarks.
+
+**D110. The sleep protocol uses `fence(SeqCst)`** (§5.1, `lactose-task::sleep`)
+- Why: the protocol is a store-then-load on both sides (announce then re-check; push then read
+  sleepers), which needs a total order. loom 0.7.2 models `SeqCst` loads and stores as
+  `AcqRel`, so a version written with `SeqCst` accesses could not be checked; with explicit
+  fences loom explores the orderings that matter and the models fail when a fence is removed.
+- Driven by: milestone 0 task lane; verification section 2, loom limits.
+
+**D111. Worker counts: classes above the slowest are frame-critical, capped by usable hardware threads** (§5.1, `lactose-task::Platform`)
+- Why: a three-class CPU has no single "performance" class, and a process confined by affinity
+  or a container must not start a worker per physical core. `Platform::hardware_threads`
+  carries the limit (default `None`: take the topology as given), so the builder never
+  overrides a console platform's fixed topology. One thread is left for the platform thread.
+- Driven by: milestone 0 task lane, first review (Windows topology) and second review,
+  finding 6.
+
+**D112. Shutdown joins unless called on one of the executor's own workers; the execution log is read, not taken** (§5.1, `lactose-task::Executor`)
+- Why: a worker cannot join itself, so there shutdown does everything else and the workers
+  exit on their own; D107 makes resolution, not the join, the point of quiescence. A worker of
+  a different executor joins normally. `execution_log` replaced `take_execution_log` because
+  SOUR writes the log of every chaos run (D96) and a failing test must still be able to read
+  it afterwards.
+- Driven by: milestone 0 task lane, second review, finding 7.
+
 ## 10. Review history
 
 - **Revision 1** (`a29af04`): the design baseline.

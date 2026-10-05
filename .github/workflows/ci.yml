@@ -78,6 +78,15 @@ jobs:
       - name: cargo-deny
         if: success() || failure()
         run: cargo deny --locked check
+      # Features unify across a build, so one crate enabling `lactose-task/loom` would switch
+      # every executor to loom primitives, which panic outside a model. Only the root manifest
+      # (the version) and `crates/task` may name loom.
+      - name: Nothing enables the loom feature
+        if: success() || failure()
+        run: |
+          if grep -rn --include=Cargo.toml loom crates tools | grep -v '^crates/task/'; then
+            echo "only crates/task may name loom"; exit 1
+          fi
 
   # SOUR, the determinism harness (architecture section 8.3): workers mode and one layout
   # capacity on every pull request. The self-test proves the runner itself on stand-in

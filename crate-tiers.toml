@@ -121,6 +121,10 @@ transitive = [
   # `lactose-reflect` and `lactose-task`; it emits spans and events and computes nothing a
   # simulation result can observe.
   "tracing", "tracing-core", "once_cell", "pin-project-lite",
+  # An optional dependency of `tracing-core` that only the all-features resolution selects
+  # (through `lactose-task/loom`); it is compiled only under `--cfg tracing_unstable`, which
+  # no build of this workspace sets.
+  "valuable",
 ]
 
 [boundary_third_party.direct]

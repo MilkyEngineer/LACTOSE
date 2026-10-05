@@ -184,9 +184,23 @@ receives, with an invariant `'scope` lifetime, closure-only, the shape of `std::
 borrow from the scope. The opener runs only jobs belonging to its own scope while waiting,
 then spins briefly, then parks on the scope's latch. It never runs unrelated system jobs and
 never runs background work while waiting. A job may open scopes in sequence but never nested. Child jobs are
-allocated from a per-worker bump arena reset when the scope closes. The opener records a deque
-watermark at scope open and pops only jobs above it, so it never runs older unrelated work.
-The physics step is the one sanctioned blocking wait on a worker (section 16).
+allocated from a per-worker bump arena reset when the scope closes. Every deque entry carries
+the tag of the scope that forked it, and while a worker has a scope open, work pushed to it that
+is not a child of that scope is routed to the frame injector, so the opener's deque holds only
+its own children and it never runs older or unrelated work.
+The physics step is the one sanctioned blocking wait on a worker (section 16):
+`block_in_place` lowers the number of run permits by its reservation, a worker holds a permit
+while it takes jobs, an opener parked on its latch holds none, and a permit that comes free
+while the count is lowered reaches both idle workers and openers waiting beside their own
+children.
+
+**Resolution means quiescent.** `GraphRun`, `Task` and `Sleep` resolve to a `Result`, and the
+error `Cancelled` means the executor shut down first. A graph run resolves, with the graph or
+with `Cancelled`, only when no unit, scope child or finalize of that run is executing or can
+start, and their writes happen before the resolution; this holds when the last handle is
+dropped on a worker and nothing is joined. After `Cancelled` the run is torn and the graph is
+not returned. A cancelled task's future has been dropped. Shutting an executor down joins its
+workers unless it is called on one of them.
 
 **Stackless `'static` tasks** for IO, GPU, asset and network work. A task is a `Future` that
 owns its data and may be cancelled by drop. Waiting is an `.await`.
@@ -196,7 +210,10 @@ owns its data and may be cancelled by drop. Waiting is an `.await`.
 - Frame-critical workers equal the performance-core count on every platform:
   `hw.perflevel0.physicalcpu` on macOS, the hybrid core-type query on Windows, CPU capacity
   from sysfs on Linux, and physical cores minus one only where no core-type information
-  exists. They run at user-interactive QoS. They run simulation,
+  exists. With more than two core classes, every class above the slowest is frame-critical.
+  Counts are capped by the hardware threads the process may use (affinity, container limits):
+  frame-critical workers at that number minus one, background workers at what remains, each at
+  least one. They run at user-interactive QoS. They run simulation,
   extract, graph compile and record.
 - Background workers run on efficiency cores at utility QoS (two low-priority threads on
   homogeneous CPUs). They run asset decode, compression, and long futures. Background CPU
@@ -209,8 +226,10 @@ owns its data and may be cancelled by drop. Waiting is an `.await`.
 - Each worker owns a `crossbeam-deque`. Work stealing uses thief-side split-on-steal: a
   stolen chunk-range job is split in half and the thief pushes one half to its own deque.
   There is no fixed task-duration target.
-- Idle workers spin briefly, then `std::thread::park`. Only the latch and the sleep-and-wake
-  protocol are modelled under `loom`; the deque is a vetted dependency. aarch64 stress tests
+- Idle workers spin for 50 microseconds, then `std::thread::park`. A worker that releases
+  several entries keeps one for itself and wakes one sleeper for each of the others. The
+  latch, the permit gate, the sleep-and-wake protocol and run quiescence are modelled under
+  `loom`, through the shipped functions; the deque is a vetted dependency. aarch64 stress tests
   cover weak-memory behaviour loom does not model.
 - `tracing` spans are emitted per system and per stolen range, never per chunk job. Finer
   levels compile out.
