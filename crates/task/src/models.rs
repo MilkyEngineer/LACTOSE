@@ -456,3 +456,143 @@ fn a_run_resolves_only_when_no_job_of_it_is_executing() {
         assert!(!jobs.close(), "closing twice must not report quiet again");
     });
 }
+
+/// The pool as an idle worker's release sees it: `idle_one` really claims a sleeper.
+struct PoolWake {
+    sleep: Arc<Sleep>,
+    threads: Vec<Thread>,
+}
+
+impl Wake for PoolWake {
+    fn idle_one(&self) {
+        if let Some(worker) = self.sleep.notify_one() {
+            self.threads[worker].unpark();
+        }
+    }
+
+    fn unpark(&self, worker: usize) {
+        self.threads[worker].unpark();
+    }
+}
+
+/// Two idle workers under a closed gate that reserves one permit, and one entry that is
+/// queued while they are going to sleep. A worker that scans and finds nothing gives its
+/// permit up without waking the other (`Gate::release_idle`), then sleeps through
+/// `gate::idle_park`. Whatever the interleaving, the entry is taken: by the releasing
+/// worker's own re-check if it was queued before, by the pusher's wake-up if after.
+#[test]
+fn an_idle_release_wakes_nobody_and_loses_no_work() {
+    /// The worker loop reduced to its permit and sleep steps. Returns when the entry has
+    /// been taken, by this worker or the other.
+    fn work(
+        gate: &Gate,
+        sleep: &Sleep,
+        queue: &AtomicUsize,
+        taken: &AtomicBool,
+        me: usize,
+        wake: &PoolWake,
+        mut permit: bool,
+    ) {
+        while !taken.load(Ordering::SeqCst) {
+            if !permit {
+                permit = gate.try_acquire();
+            }
+            if permit {
+                let take = |entries: usize| entries.checked_sub(1);
+                if queue.fetch_update(Ordering::AcqRel, Ordering::Acquire, take).is_ok() {
+                    // Stands for shutdown: lets the other worker's model thread end.
+                    taken.store(true, Ordering::SeqCst);
+                    sleep.notify_all(|worker| wake.unpark(worker));
+                    break;
+                }
+                gate.release_idle(wake);
+                permit = false;
+            }
+            gate::idle_park(gate, sleep, me, || {
+                let seen = if taken.load(Ordering::SeqCst) {
+                    gate::Look::Stop
+                } else if queue.load(Ordering::Acquire) != 0 {
+                    gate::Look::Work
+                } else {
+                    gate::Look::Nothing
+                };
+                (seen, None)
+            });
+        }
+    }
+
+    // Four preemptions: this model takes 24 s at four and close to three minutes at five.
+    bounded(THREE_THREAD_BOUND - 1, || {
+        let gate = Arc::new(gate_with(2, 1, Some(1)));
+        let sleep = Arc::new(Sleep::new(2));
+        let queue = Arc::new(AtomicUsize::new(0));
+        let taken = Arc::new(AtomicBool::new(false));
+        let ended = Arc::new(AtomicUsize::new(0));
+        let first = thread::current();
+
+        let other = {
+            let (gate, sleep, queue, taken, ended, first) = (
+                gate.clone(),
+                sleep.clone(),
+                queue.clone(),
+                taken.clone(),
+                ended.clone(),
+                first.clone(),
+            );
+            thread::spawn(move || {
+                let wake =
+                    PoolWake { sleep: sleep.clone(), threads: vec![first, thread::current()] };
+                work(&gate, &sleep, &queue, &taken, 1, &wake, false);
+                ended.fetch_add(1, Ordering::SeqCst);
+            })
+        };
+        let threads = vec![first, other.thread().clone()];
+        let pusher = {
+            let (sleep, queue, ended, threads) =
+                (sleep.clone(), queue.clone(), ended.clone(), threads.clone());
+            thread::spawn(move || {
+                push_one_entry(&sleep, &queue, &threads, false);
+                ended.fetch_add(1, Ordering::SeqCst);
+            })
+        };
+        let wake = PoolWake { sleep: sleep.clone(), threads };
+        // This worker starts with the one permit the gate allows.
+        work(&gate, &sleep, &queue, &taken, 0, &wake, true);
+        assert_eq!(queue.load(Ordering::Acquire), 0);
+        // loom cannot have a thread unparked while it is blocked in `join`.
+        while ended.load(Ordering::SeqCst) != 2 {
+            thread::yield_now();
+        }
+        other.join().unwrap();
+        pusher.join().unwrap();
+    });
+}
+
+/// During shutdown an opener whose remaining child is running on another worker has
+/// nothing to do but wait for it. It parks; it does not go round its loop giving its permit
+/// up and taking it back until the child is done, which in this model would never end.
+#[test]
+fn shutdown_parks_an_opener_with_nothing_on_its_deque() {
+    loom::model(|| {
+        let gate = gate_with(1, 1, None);
+        let shutdown = AtomicBool::new(true);
+        let latch = Arc::new(Latch::new());
+        let opener = thread::current();
+
+        latch.add(1);
+        let thief = {
+            let (latch, opener) = (latch.clone(), opener.clone());
+            thread::spawn(move || {
+                if latch.count_down(1) {
+                    opener.unpark();
+                }
+            })
+        };
+        let mut waiting =
+            ModelOpener { gate: &gate, latch: &latch, children: 0, shutdown: &shutdown };
+        gate::wait_for_children(&latch, &gate, 0, &Workers(vec![opener]), &mut waiting);
+        assert!(latch.is_set());
+        latch.retire();
+        thief.join().unwrap();
+    });
+}

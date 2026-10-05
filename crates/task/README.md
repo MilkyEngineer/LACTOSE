@@ -119,9 +119,10 @@ and list what changed, because `lactose-ecs` is written against this surface.
   homogeneous CPUs. A frame-critical worker never runs background work. An executor has at
   least one worker of each class. With the default platform the counts are capped by the
   hardware threads the process may use (`std::thread::available_parallelism`, which honours
-  affinity masks and container limits): frame-critical workers at one fewer, leaving a
-  thread for the platform thread, and background workers at what those leave, so the two
-  together never exceed the hardware threads except to keep one of each. A custom `Platform`
+  affinity masks and container limits): workers never exceed the usable hardware threads;
+  frame-critical workers stop one short and background workers take what remains, so the
+  platform thread shares a hardware thread with low-priority background workers. The
+  minimum of one worker of each class is the only exception. A custom `Platform`
   opts into the same cap by returning `Some` from `hardware_threads`.
 - Each worker owns a `crossbeam-deque`. Idle workers spin briefly, then `std::thread::park`:
   about 50 µs of rescanning.
@@ -235,8 +236,8 @@ Correctness:
   feature on this crate that switches an internal `sync` shim, and run with
   `cargo test -p lactose-task --features loom --release`. Never use loom's documented
   `RUSTFLAGS="--cfg loom"`: the environment variable replaces the x86-64 target pin.
-  Eight models are explored exhaustively. The two with three threads are bounded at five
-  preemptions (`LOOM_MAX_PREEMPTIONS` overrides the bound).
+  Nine models are explored exhaustively. The three with three threads are bounded at five
+  preemptions, the idle-release one at four (`LOOM_MAX_PREEMPTIONS` overrides the bounds).
 - **The `loom` feature is for that one command.** No other crate may enable it and nothing
   may be built with `--all-features`: features unify across a build, so every executor in it
   would run on loom primitives, which panic outside a loom model.

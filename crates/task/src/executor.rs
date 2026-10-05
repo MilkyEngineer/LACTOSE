@@ -92,6 +92,11 @@ impl Executor {
         self.owner.shared.frame().workers() as u32
     }
 
+    /// The number of background workers. For the benchmark's report.
+    pub(crate) fn background_worker_count(&self) -> u32 {
+        self.owner.shared.pool(WorkerClass::Background).workers() as u32
+    }
+
     /// One more than the largest value [`crate::JobContext::slot`] can return.
     #[must_use]
     pub fn slot_count(&self) -> u32 {

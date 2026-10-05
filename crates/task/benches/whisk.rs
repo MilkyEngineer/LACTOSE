@@ -701,7 +701,7 @@ fn main() {
 
     let executor = Executor::builder().build().expect("executor starts");
     let frame_workers = executor.frame_worker_count();
-    let background_workers = if topology.efficiency == 0 { 2 } else { topology.efficiency };
+    let background_workers = lactose_task::bench_support::background_workers(&executor);
     eprintln!(
         "whisk bench: {cpu}, {} performance + {} efficiency cores, {frame_workers} frame-critical \
          workers, commit {commit}, load average {load_before}",

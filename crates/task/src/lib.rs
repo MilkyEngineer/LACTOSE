@@ -53,6 +53,12 @@ pub mod bench_support {
     /// thread filled with range entries, through the function a worker steals with:
     /// the steal itself, halving the range, pushing the upper half onto the thief's own
     /// deque and checking for sleepers. Each figure includes one pair of clock readings.
+    /// How many background workers `executor` runs.
+    #[must_use]
+    pub fn background_workers(executor: &crate::Executor) -> u32 {
+        executor.background_worker_count()
+    }
+
     pub fn time_steals(
         platform: &dyn crate::Platform,
         samples: usize,

@@ -12,6 +12,8 @@
 
 use crate::latch::Latch;
 use crate::sleep::Sleep;
+use std::time::Instant;
+
 use crate::sync::{AtomicUsize, Mutex, Ordering};
 
 /// No limit: the gate is open.
@@ -97,6 +99,26 @@ impl Gate {
         self.openers.notify_all(|worker| wake.unpark(worker));
     }
 
+    /// Gives up the permit of a worker that has just scanned every queue, found nothing
+    /// and is about to sleep through [`idle_park`]. Unlike [`Gate::release`] this wakes no
+    /// idle worker, which would only take the permit, scan, find nothing and pass it on:
+    /// under a closed gate with nothing to do, the pool would hand one busy core round for
+    /// as long as the gate stayed closed.
+    ///
+    /// No wake-up is lost by that. A sleeping worker needs waking only when there is work
+    /// and a permit for it. Work that was queued before this release is seen by the
+    /// releasing worker itself: its next step is `idle_park`, whose re-check runs after
+    /// the permit is free, finds the work and a permit, and keeps the worker awake. Work
+    /// that is queued after that re-check is announced by whoever queues it, to a sleeper
+    /// that now finds the permit free. Openers waiting at the gate are told, because their
+    /// children are work this worker may not have been able to see as its own.
+    pub(crate) fn release_idle(&self, wake: &impl Wake) {
+        self.running.fetch_sub(1, Ordering::SeqCst);
+        if self.closed() {
+            self.openers.notify_all(|worker| wake.unpark(worker));
+        }
+    }
+
     /// Whether more permits are out than the limit allows, so that some worker has to stop
     /// taking units.
     pub(crate) fn over_limit(&self) -> bool {
@@ -154,6 +176,44 @@ impl Gate {
     }
 }
 
+/// What a worker that is about to sleep found when it looked round one last time.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Look {
+    /// A reason to stay awake whatever the gate says: the executor is shutting down.
+    Stop,
+    /// There is work some worker with a permit could take.
+    Work,
+    /// Nothing.
+    Nothing,
+}
+
+/// Puts an idle worker, which holds no permit, to sleep: announce, look again, park.
+///
+/// `look` runs after the announcement, which is what makes it a re-check: work queued
+/// before it is seen, work queued after it finds the announcement. It also returns the
+/// deadline to wake at, if the worker keeps a timer. Seeing work is a reason to stay awake
+/// only if a permit can be had; a worker held at the gate sleeps beside work, and the gate
+/// wakes it when it opens.
+pub(crate) fn idle_park(
+    gate: &Gate,
+    sleep: &Sleep,
+    worker: usize,
+    look: impl FnOnce() -> (Look, Option<Instant>),
+) {
+    sleep.announce(worker);
+    let (seen, deadline) = look();
+    let stay_awake = match seen {
+        Look::Stop => true,
+        Look::Work => gate.permit_available(),
+        Look::Nothing => false,
+    };
+    if stay_awake {
+        sleep.cancel(worker);
+    } else {
+        sleep.park(worker, deadline);
+    }
+}
+
 /// What the opener's wait needs from the worker it runs on.
 pub(crate) trait Opener {
     /// Runs this scope's children from the worker's own deque for as long as the gate lets
@@ -203,7 +263,11 @@ pub(crate) fn wait_for_children(
             // before it starts; whichever of them happens later comes with an unpark.
             let proceed = if latch.is_set() {
                 Some(false)
-            } else if opener.shutting_down() {
+            } else if children_here && opener.shutting_down() {
+                // Nobody else will run what is on this deque, and the gate no longer
+                // applies. With nothing on the deque shutdown is no reason to stay up:
+                // the children are with workers that run them before they exit, and the
+                // last one's count-down unparks this worker.
                 gate.retake();
                 Some(true)
             } else if children_here && gate.try_acquire() {
@@ -227,8 +291,12 @@ pub(crate) fn wait_for_children(
                 gate.retake();
                 return;
             }
-            // Woken with the scope unfinished: by a gate opening, a freed permit or
-            // shutdown. With a permit, go and look at the deque again.
+            // Woken with the scope unfinished: by a gate opening, a freed permit, shutdown
+            // or a stale token. Only children on this deque are a reason to go round
+            // again; without any, park until the last child's count-down.
+            if !children_here {
+                continue;
+            }
             if opener.shutting_down() {
                 gate.retake();
                 break;

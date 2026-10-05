@@ -15,7 +15,7 @@ use crate::deque::{Injector, Steal, Stealer, Worker};
 use lactose_core::Arena;
 
 use crate::chaos::{Chaos, ChaosConfig, ChaosRng, Filter, Wake};
-use crate::gate::{self, Gate, Opener};
+use crate::gate::{self, Gate, Look, Opener};
 use crate::graph::{self, RunState};
 use crate::guard::abort_on_unwind;
 use crate::job::{self, ChildHeader, ScopeCore};
@@ -245,10 +245,6 @@ impl Pool {
 
     fn work_visible(&self) -> bool {
         !self.injector.is_empty() || self.stealers.iter().any(|stealer| !stealer.is_empty())
-    }
-
-    fn permit_available(&self) -> bool {
-        self.gate.permit_available()
     }
 
     fn try_acquire(&self) -> bool {
@@ -692,7 +688,8 @@ fn worker_loop(local: &WorkerLocal) {
                 }
                 continue;
             }
-            pool.release();
+            // Found nothing: no idle worker is woken for this permit (`Gate::release_idle`).
+            pool.gate.release_idle(pool);
             permit = false;
         }
         scanning_since = None;
@@ -817,31 +814,37 @@ fn idle(local: &WorkerLocal) {
     let pool = local.pool();
     let frame = local.class == WorkerClass::FrameCritical;
 
-    pool.sleep.announce(local.index);
-    // Timers are served by whichever frame-critical worker is idle: there is no timer
-    // thread. One sleeper at a time is the keeper and parks only until the next deadline.
-    let mut deadline = if frame {
-        shared.timers.fire_due();
-        shared.timers.keep(local.index)
-    } else {
-        None
-    };
-    // A replay that looks stuck gets a deadline too, after which it is declared so.
     let runs_started = || shared.runs.load(Ordering::SeqCst);
-    let stalled =
-        shared.replay().filter(|_| frame).and_then(|replay| replay.stalled(runs_started()));
-    if stalled.is_some() {
-        let limit = Instant::now() + REPLAY_STALL;
-        deadline = Some(deadline.map_or(limit, |timer| timer.min(limit)));
-    }
+    let mut stalled = None;
     let asleep = Instant::now();
-    let work =
-        pool.work_visible() || frame && shared.replay().is_some_and(|r| r.ready(local.index));
-    if shared.is_shut_down() || work && pool.permit_available() {
-        pool.sleep.cancel(local.index);
-    } else {
-        pool.sleep.park(local.index, deadline);
-    }
+    gate::idle_park(&pool.gate, &pool.sleep, local.index, || {
+        // Timers are served by whichever frame-critical worker is idle: there is no timer
+        // thread. One sleeper at a time is the keeper and parks only until the next
+        // deadline.
+        let mut deadline = if frame {
+            shared.timers.fire_due();
+            shared.timers.keep(local.index)
+        } else {
+            None
+        };
+        // A replay that looks stuck gets a deadline too, after which it is declared so.
+        stalled =
+            shared.replay().filter(|_| frame).and_then(|replay| replay.stalled(runs_started()));
+        if stalled.is_some() {
+            let limit = Instant::now() + REPLAY_STALL;
+            deadline = Some(deadline.map_or(limit, |timer| timer.min(limit)));
+        }
+        let work = pool.work_visible()
+            || frame && shared.replay().is_some_and(|replay| replay.ready(local.index));
+        let seen = if shared.is_shut_down() {
+            Look::Stop
+        } else if work {
+            Look::Work
+        } else {
+            Look::Nothing
+        };
+        (seen, deadline)
+    });
     if frame {
         // If the park timed out, this is the deadline it was for.
         shared.timers.fire_due();

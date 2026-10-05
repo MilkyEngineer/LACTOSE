@@ -23,8 +23,8 @@ impl CoreTopology {
     }
 
     /// Caps the counts at the hardware threads this process may actually use, which an
-    /// affinity mask or a container limit can put far below what the machine has. One
-    /// thread is left for the platform thread, so performance cores are at most one fewer.
+    /// affinity mask or a container limit can put far below what the machine has.
+    /// Performance cores stop one short of them and efficiency cores take what remains.
     fn limited_to(self, threads: u32) -> Self {
         let performance = default_frame_workers(self, Some(threads));
         Self { performance, efficiency: self.efficiency.min(threads.saturating_sub(performance)) }
@@ -32,8 +32,13 @@ impl CoreTopology {
 }
 
 /// The default number of frame-critical workers: the performance cores, but at most one
-/// fewer than the hardware threads the process may use, so the platform thread has
-/// somewhere to run, and at least one.
+/// fewer than the hardware threads the process may use, and at least one.
+///
+/// Together with [`default_background_workers`] the rule is: workers never exceed the usable
+/// hardware threads; frame-critical workers stop one short and background workers take what
+/// remains, so the platform thread shares a hardware thread with low-priority background
+/// workers and never with a frame-critical one. The minimum of one worker of each class is
+/// the only exception.
 pub(crate) fn default_frame_workers(topology: CoreTopology, threads: Option<u32>) -> u32 {
     let cap = threads.map_or(u32::MAX, |threads| threads.saturating_sub(1));
     topology.performance.min(cap).max(1)
@@ -41,7 +46,7 @@ pub(crate) fn default_frame_workers(topology: CoreTopology, threads: Option<u32>
 
 /// The default number of background workers beside `frame` frame-critical ones: the
 /// efficiency cores, or two on a homogeneous CPU, but no more than the hardware threads the
-/// frame-critical workers leave, and at least one.
+/// frame-critical workers leave, and at least one. See [`default_frame_workers`].
 pub(crate) fn default_background_workers(
     topology: CoreTopology,
     threads: Option<u32>,
