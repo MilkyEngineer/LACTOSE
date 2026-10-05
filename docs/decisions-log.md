@@ -878,6 +878,51 @@ rationale the author supplied during the editorial pass rather than one taken fr
 - Why: interfaces written in milestone 0 would otherwise hard-code desktop assumptions (R3-30).
 - Driven by: R3-30.
 
+**D87. Proc-macro crates and an `xtask` leaf crate in the tier file** (§4, `crate-tiers.toml`)
+- Why: the tier check fails any crate missing from the file, and the `#[component]` and
+  `#[system]` macros need crates of their own. `lactose-reflect-macros` and `lactose-ecs-macros`
+  are foundation crates outside the boundary, since they compile for the host. `lactose-xtask`
+  is the leaf crate that carries the tier check, the boundary lint and feature-tree checks and
+  the SOUR mode runner, so CI logic is Rust that runs the same on every platform.
+- Driven by: milestone 0 foundation.
+
+**D88. Allocator tagging: a fixed tag per subsystem, a one-alignment header, a thread-local current tag** (§22.1, `lactose-core::alloc`)
+- Why: budgets need live bytes per subsystem, and a free can happen on any thread under any
+  scope. Each allocation stores its tag in the byte before the returned pointer, at the cost
+  of one alignment of header, so frees are charged back correctly without a side table. The
+  current tag is a const-initialised thread-local set by `TagScope` and carried across threads
+  by the executor. It is the one thread-local inside the boundary; no simulation result can
+  observe it. Counters belong to the allocator instance, so tests need no global state.
+- Driven by: the "allocator tagging scheme" item of §22.1, due in milestone 0.
+
+**D89. `EntityRef` is the plain-data form of an optional `StableKey`; `EntityId` has no ordering** (§7, `lactose-core::id`)
+- Why: components must be padding-free plain data, and a Rust enum with payloads of different
+  sizes is not. `StableKey` stays the ergonomic enum; `EntityRef` encodes `Option<StableKey>`
+  in four `u32` words with a canonical-encoding check on load and receive, and all-zero as the
+  empty reference. `EntityId` implements neither `Ord` nor `PartialOrd`, so it cannot become an
+  ordering rule by accident. This removes the dependence on `bytemuck_derive` support for
+  data-carrying enums for references.
+- Driven by: milestone 0 foundation; verification §2 (`bytemuck_derive` claim).
+
+**D90. The `task` surface: `'static` graph nodes, an explicit job context, typed thread lanes** (§5.1, `crates/task/README.md`)
+- Why: three choices keep the executor's public API free of `unsafe` obligations for callers.
+  Graph nodes are `Arc<dyn GraphNode>` and own or share their data, so dropping a `GraphRun`
+  future can never leave jobs borrowing freed memory; `ecs` carries the declared-access
+  argument that makes its nodes sound. Fork-join is reached through a `JobContext` passed to
+  each job, not a free function over thread-local state, and `scope` takes `&mut self`, so
+  "inside a job only" and "never nested" are compile errors rather than debug assertions. A
+  lane is typed over state that never leaves its thread, so the main thread's window and the
+  present thread's surface need not be `Send`.
+- Driven by: milestone 0 foundation; §20 requires these signatures before the task is assigned.
+
+**D91. Thread-locals are banned through `std::thread::LocalKey`** (§8.3, boundary `clippy.toml`)
+- Why: on the pinned toolchain a local `#[expect(clippy::disallowed_macros)]` does not reach
+  `thread_local!`, so the one sanctioned exception (D88) could only have been made crate-wide.
+  Banning the type the macro declares gives the same coverage with an exception scoped to one
+  function.
+- Driven by: milestone 0 foundation.
+- Replaced: the `disallowed-macros` entry of revision 3.2.
+
 ## 10. Review history
 
 - **Revision 1** (`a29af04`): the design baseline.

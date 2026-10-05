@@ -10,7 +10,7 @@ with the milestone that gates it.
 | Spike | What it records | Gates milestone |
 |---|---|---|
 | io_uring on CI runners | Whether io_uring is available on the CI runners | 0 |
-| Clippy on primitive methods | Whether `disallowed-methods` matches inherent primitive methods on the pinned toolchain | 0 |
+| Clippy on primitive methods | Whether `disallowed-methods` matches inherent primitive methods on the pinned toolchain |0. **Done:** on 1.99.0 it matches both `a.min(b)` and `f32::max(a, b)` forms, and `f64::sin`, `to_bits`, `powi` and `clamp` |
 | Scalar precision | Simulation scalar precision at full map extent | 1 |
 | MoltenVK and KosmicKrisp | Indirect-draw behaviour, encode time for ten thousand draws, pipeline creation cost, memoryless attachments and local reads | 2 |
 | Extract cost | Per-dirty-row extract cost | 2 |
@@ -56,3 +56,4 @@ version in `Cargo.lock` before the milestone that depends on it.
 |---|---|
 | Player portability between hosts | 4 (decided-later table, architecture section 22.1) |
 | Multi-process server sharding: out of scope, kept possible by region ownership and command-based cross-region interaction (architecture section 9.6) | none |
+| Local x86-64 runs on Apple Silicon: Rosetta on macOS 14 raises an illegal-instruction fault on the x86-64-v3 baseline, so x86-64 tests and SOUR architecture mode run on CI runners and the x86 desktop, never on the Mac. Re-check after a macOS upgrade | none |

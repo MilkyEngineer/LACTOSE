@@ -1,0 +1,22 @@
+[package]
+name = "lactose-core"
+description = "Identity keys, handles, deterministic maps, arenas, the tagged allocator, the error taxonomy and thread classes."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+bytemuck.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_System_Threading"] }
+
+[dev-dependencies]
+xxhash-rust = { workspace = true, features = ["xxh64"] }
+
+[lints]
+workspace = true

@@ -116,7 +116,9 @@ crates/
   math/           F  boundary  self-contained deterministic math, no glam; Scalar newtype; compare-and-select min/max/clamp; libm transcendentals; exact accumulators; typed render space
   task/           F            [WHISK] executor: continuation counters, fork-join scope, worker classes, timer root, main-thread lane
   ecs/            F  boundary  [CASEIN] entities, archetypes, chunks, per-row change ticks, structural change log, queries, scheduler, command buffers, system macro
+  ecs-macros/     F            proc macros: `#[system]`, `#[finalize]`
   reflect/        F            type registry, field IDs, typed references, persistence policy, serde bridge
+  reflect-macros/ F            proc macros: `#[component]`, field IDs, reflection metadata, per-type visitors
   sim/            F  boundary  [CURD] regions, region modes, tick loop, time scale, world hash (monomorphised per-type hashers), snapshot API
   anim/           F  boundary  animation state machines, phase, events, root motion, sim skeleton (sockets, hands, feet, head, ragdoll bodies)
   predict/        F  boundary  prediction world, rollback ring, reconciliation
@@ -157,6 +159,7 @@ game/
   game-content/      boundary  data definitions shared by all three; inside the boundary because game-sim reads it
 tools/
   cook/              leaf      [RICOTTA] asset cooker: meshes, clusters, textures, materials, shaders, scenes, collision
+  xtask/             leaf      CI driver: tier check, boundary lint and feature-tree checks, SOUR mode runner
 ```
 
 There is no `task-api`: spawning is generic and cannot sit behind a trait object. `ecs` has
@@ -512,7 +515,8 @@ neither reaches a dependency's build. Chaos runs record the job execution log so
 replays exactly. The one-row capacity uses a matching small slab.
 
 Static enforcement uses stable tooling: `clippy.toml` per boundary crate with
-`disallowed-methods`, `disallowed-types` and `disallowed-macros`; `cargo-deny` with a
+`disallowed-methods` and `disallowed-types` (thread-locals are banned through
+`std::thread::LocalKey`, since a local exception cannot reach an item macro); `cargo-deny` with a
 dependency allowlist for boundary crates and `multiple-versions = "deny"` for shared crates.
 No custom lint crate. Miri runs on nightly as the one exception to the stable-toolchain rule.
 Because Cargo resolves features per build, CI dumps `cargo tree -e features` for the boundary

@@ -1,0 +1,47 @@
+# Unsafe in lactose-core
+
+Every `unsafe` block carries a `// SAFETY:` comment. This file states the invariants those
+comments rely on. The crate's tests run under Miri.
+
+## `arena`
+
+- A chunk is allocated with `std::alloc::alloc` and referred to only through the raw pointer
+  kept in its `Chunk`. No reference to a whole chunk is ever formed, so handing out a new
+  allocation never invalidates an earlier one.
+- `used` never exceeds the last chunk's size, and an allocation is carved from
+  `[start, end)` with `end <= size`.
+- Returned borrows are tied to `&self`. `reset` and `drop` take `&mut self`, so no borrow
+  survives them.
+- `Arena` is `Send` and not `Sync`: it owns its memory outright and its bookkeeping is
+  unsynchronised.
+
+## `alloc`
+
+- The inner allocator always sees the caller's layout extended by a header of
+  `layout.align()` bytes. The header sits before the returned pointer, so the returned pointer
+  keeps the requested alignment.
+- The tag is the byte immediately before the returned pointer. `dealloc` and `realloc` read
+  it and rebuild the extended layout from the same `layout` the caller passes back.
+- `realloc` forwards to the inner `realloc`, which preserves the leading bytes and therefore
+  the tag.
+- The current-tag thread-local is const-initialised and has no destructor, so reading it
+  inside the allocator cannot allocate or fail during thread teardown.
+
+## `id`
+
+- `NetId` is `repr(transparent)` over `NonZeroU64`, which is what the `ZeroableInOption` and
+  `PodInOption` impls assert.
+- `EntityRef` is four `u32` words. Every bit pattern is memory-valid; `CheckedBitPattern`
+  only narrows to canonical encodings, and `EntityRef::get` treats anything else as empty.
+
+## `thread_class::fp`
+
+- The inline assembly reads or writes MXCSR (x86-64) or FPCR (aarch64) and nothing else.
+- `set_deterministic` only ever moves the register towards the IEEE default state that Rust
+  assumes. The one function that leaves that state is test-only, and its test restores the
+  default before running any floating-point code.
+
+## `thread_class::os`
+
+- Each call (`pthread_set_qos_class_self_np`, `setpriority`, `SetThreadPriority`) takes plain
+  values and affects only the calling thread.

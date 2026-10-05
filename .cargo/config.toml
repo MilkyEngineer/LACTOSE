@@ -1,0 +1,5 @@
+# Architecture section 8.2: every x86-64 build is pinned to the x86-64-v3 baseline so fused
+# multiply-add is always available and no crate selects fused or unfused by target feature.
+# Never set the RUSTFLAGS environment variable: it replaces these flags instead of adding to them.
+[target.'cfg(target_arch = "x86_64")']
+rustflags = ["-C", "target-cpu=x86-64-v3"]
