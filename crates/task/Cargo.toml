@@ -6,8 +6,30 @@ edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 
+[features]
+# Switches the internal `sync` shim to loom's model-checked primitives so the scope latch and
+# the sleep-and-wake protocol can be explored exhaustively. Run the models with
+# `cargo test -p lactose-task --features loom`; never with `RUSTFLAGS="--cfg loom"`.
+loom = ["dep:loom"]
+
 [dependencies]
+crossbeam-deque.workspace = true
 lactose-core.workspace = true
+loom = { workspace = true, optional = true }
+tracing.workspace = true
+
+[target.'cfg(target_vendor = "apple")'.dependencies]
+libc.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_System_SystemInformation"] }
+
+[dev-dependencies]
+zstd.workspace = true
+
+[[bench]]
+name = "whisk"
+harness = false
 
 [lints]
 workspace = true

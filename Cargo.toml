@@ -30,6 +30,7 @@ loom = "0.7"
 tracing = { version = "0.1", default-features = false, features = ["std"] }
 windows-sys = "0.61"
 xxhash-rust = "0.8"
+zstd = { version = "0.13", default-features = false }
 
 [workspace.lints.rust]
 missing_docs = "warn"
