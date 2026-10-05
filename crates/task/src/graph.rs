@@ -13,6 +13,7 @@ use crate::chaos::{JobKind, LogRecord};
 use crate::guard::abort_on_unwind;
 use crate::job::JobContext;
 use crate::pool::{Arenas, Entry, Rest, Shared, WorkerLocal, drain_range};
+use crate::quiesce::{Entry as Entered, Quiesce};
 use crate::span::{NodeSpans, spans_for};
 use crate::{WorkerClass, lock};
 
@@ -173,9 +174,10 @@ impl GraphBuilder {
                 roots,
                 pending_nodes: AtomicU32::new(0),
                 ordinal: AtomicU64::new(0),
+                jobs: Quiesce::new(),
                 completion: Mutex::new(Completion {
                     finished: false,
-                    cancelled: false,
+                    resolved: false,
                     waker: None,
                 }),
             }),
@@ -219,9 +221,11 @@ struct NodeSlot {
 }
 
 struct Completion {
+    /// Every node has finalized.
     finished: bool,
-    /// The executor shut down before the run finished.
-    cancelled: bool,
+    /// The run is quiet and its future may resolve: to the graph if `finished`, to
+    /// `Cancelled` otherwise.
+    resolved: bool,
     waker: Option<Waker>,
 }
 
@@ -234,6 +238,8 @@ pub(crate) struct RunState {
     /// Nodes that have not finalized in the current run.
     pending_nodes: AtomicU32,
     ordinal: AtomicU64,
+    /// Holds the future back while any job of the run is executing.
+    jobs: Quiesce,
     completion: Mutex<Completion>,
 }
 
@@ -243,16 +249,56 @@ impl RunState {
         self.ordinal.load(Ordering::Relaxed)
     }
 
-    /// Resolves the run's future to `Cancelled`. Called at shutdown, possibly while a
-    /// worker is still finishing a job of the run.
-    pub(crate) fn cancel(&self) {
+    /// Asks for the run to end early. No job of the run starts from now on; the future
+    /// resolves to `Cancelled` once the jobs that are executing have returned, which is
+    /// now if there are none. Called at shutdown.
+    pub(crate) fn cancel(&self, shared: &Shared) {
+        if self.jobs.close() {
+            self.resolve(shared);
+        }
+    }
+
+    /// Lets the run's future resolve. The run is quiet: it is closing and no job of it is
+    /// executing, so none ever will again. Harmless to call twice.
+    fn resolve(&self, shared: &Shared) {
+        // Before the future can resolve and the graph be run again under a new ordinal.
+        shared.end_run(self.ordinal());
         let waker = {
             let mut completion = lock(&self.completion);
-            completion.cancelled = true;
+            completion.resolved = true;
             completion.waker.take()
         };
         if let Some(waker) = waker {
             waker.wake();
+        }
+    }
+
+    /// Registers a job of the run. `None` means the run is closing and the job must not
+    /// run.
+    fn enter<'run>(&'run self, shared: &'run Shared) -> Option<JobOfRun<'run>> {
+        match self.jobs.enter() {
+            Entered::Entered => Some(JobOfRun { state: self, shared }),
+            Entered::Refused { quiet } => {
+                if quiet {
+                    self.resolve(shared);
+                }
+                None
+            }
+        }
+    }
+}
+
+/// A job's registration with its run. While one exists the run's future cannot resolve;
+/// dropping the last one of a closing run resolves it.
+struct JobOfRun<'run> {
+    state: &'run RunState,
+    shared: &'run Shared,
+}
+
+impl Drop for JobOfRun<'_> {
+    fn drop(&mut self) {
+        if self.state.jobs.exit() {
+            self.state.resolve(self.shared);
         }
     }
 }
@@ -300,6 +346,15 @@ impl Graph {
 
 /// Resolves to the graph when its run has finished, or to an error of kind `Cancelled` if
 /// the executor shut down first. See [`crate::Executor::run_graph`].
+///
+/// Either way, when it resolves no unit, scope child or finalize of the run is executing or
+/// ever will, and everything they wrote happens before the resolution. After `Cancelled`
+/// the run is torn: some nodes finalized, some ran in part, their dependents never ran; the
+/// graph is not handed back.
+///
+/// A job of the run cannot wait for its own run: the run is not quiet while that job
+/// executes. (Jobs are synchronous and `block_on` on a worker is a debug assertion, so
+/// this takes deliberate effort.)
 #[must_use = "futures do nothing unless awaited"]
 pub struct GraphRun {
     graph: Option<Graph>,
@@ -311,18 +366,19 @@ impl Future for GraphRun {
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<Graph>> {
         let graph = self.graph.as_ref().expect("a graph run is not polled after it resolved");
         let mut completion = lock(&graph.state.completion);
-        if completion.finished {
+        if completion.resolved {
+            let finished = completion.finished;
             drop(completion);
-            return Poll::Ready(Ok(self.graph.take().expect("checked above")));
-        }
-        if completion.cancelled {
-            drop(completion);
-            // The graph goes with the run: its counters are in an unknown state.
-            self.graph = None;
-            return Poll::Ready(Err(Error::new(
-                ErrorKind::Cancelled,
-                "the executor shut down before the graph run finished",
-            )));
+            let graph = self.graph.take().expect("checked above");
+            return Poll::Ready(if finished {
+                Ok(graph)
+            } else {
+                // The graph goes with the run: its counters are in an unknown state.
+                Err(Error::new(
+                    ErrorKind::Cancelled,
+                    "the executor shut down before the graph run finished",
+                ))
+            });
         }
         completion.waker = Some(cx.waker().clone());
         Poll::Pending
@@ -332,16 +388,17 @@ impl Future for GraphRun {
 /// Starts a run of `graph` on `shared`.
 pub(crate) fn start(shared: &Shared, graph: Graph) -> GraphRun {
     let state = &graph.state;
-    // The previous run, if any, has resolved, and a run resolves only after the last access
-    // any worker makes to these counters (`finish` is that access).
+    // The previous run, if any, has resolved, and a run resolves only when no job of it
+    // is executing, so nothing else is touching these counters.
     for slot in &*state.nodes {
         slot.pending_dependencies.store(slot.dependencies, Ordering::Relaxed);
     }
     state.pending_nodes.store(state.nodes.len() as u32, Ordering::Relaxed);
+    state.jobs.reset();
     {
         let mut completion = lock(&state.completion);
         completion.finished = state.nodes.is_empty();
-        completion.cancelled = false;
+        completion.resolved = completion.finished;
         if completion.finished {
             drop(completion);
             return GraphRun { graph: Some(graph) };
@@ -351,17 +408,20 @@ pub(crate) fn start(shared: &Shared, graph: Graph) -> GraphRun {
     if shared.is_shut_down() {
         // Registered first, checked second: either shutdown's sweep finds the run, or this
         // sees the flag. Cancelling twice is harmless.
-        state.cancel();
-        return GraphRun { graph: Some(graph) };
+        state.cancel(shared);
     }
-    // Submitting an entry publishes the stores above to the worker that takes it.
-    // `units()` of the roots runs here, on the caller's thread, under the same rule as on a
-    // worker: a run that is half released has no state to unwind to.
-    abort_on_unwind(|| {
-        for &root in &*state.roots {
-            release(shared, state, root, false);
-        }
-    });
+    // Releasing the roots calls their `units()` here, on the caller's thread. That is a
+    // job of the run like any other: registered, so the run cannot be declared quiet in
+    // the middle of it, and under the abort guard, because a run that is half released has
+    // no state to unwind to. Submitting an entry publishes the stores above to the worker
+    // that takes it.
+    if let Some(_job) = state.enter(shared) {
+        abort_on_unwind(|| {
+            for &root in &*state.roots {
+                release(shared, state, root, false);
+            }
+        });
+    }
     GraphRun { graph: Some(graph) }
 }
 
@@ -387,6 +447,9 @@ pub(crate) fn run_range(
 ) {
     debug_assert_eq!(local.class, WorkerClass::FrameCritical, "graph work on a background worker");
     let shared = &*local.shared;
+    // Registered before anything of the run is touched; refused if the run was cancelled,
+    // in which case this entry is simply dropped.
+    let Some(_job) = state.enter(shared) else { return };
     let slot = &state.nodes[node as usize];
     let span = if root { slot.spans.node() } else { slot.spans.range() };
     let _entered = span.enter();
@@ -426,8 +489,8 @@ pub(crate) fn run_range(
                 arenas.job.reset();
             },
             || {
-                if shared.is_shut_down() {
-                    // Queued graph work is dropped at shutdown; this run cannot finish.
+                if shared.is_shut_down() || state.jobs.closing() {
+                    // The run is being cancelled: no further unit starts.
                     Rest::Abandon
                 } else if local.pool().over_limit() {
                     Rest::Requeue
@@ -452,6 +515,10 @@ pub(crate) fn run_range(
         return;
     }
 
+    if shared.is_shut_down() || state.jobs.closing() {
+        // Cancelled, or about to be, while the last units ran: no finalize starts either.
+        return;
+    }
     let position = record(JobKind::Finalize, 0..0);
     let mut ctx = JobContext::new(local, arenas, position);
     slot.node.finalize(&mut ctx);
@@ -469,18 +536,11 @@ pub(crate) fn run_range(
         }
     }
     if state.pending_nodes.fetch_sub(1, Ordering::AcqRel) == 1 {
-        // The run's last access to its counters. Marking it finished and taking the waker
-        // happen under one lock, so the future cannot resolve, and the graph cannot be run
-        // again, while this worker is still in here.
-        let waker = {
-            let mut completion = lock(&state.completion);
-            completion.finished = true;
-            completion.waker.take()
-        };
-        let ordinal = state.ordinal();
-        shared.end_run(ordinal);
-        if let Some(waker) = waker {
-            waker.wake();
-        }
+        // Every node has finalized. The future resolves when the run is quiet, which is
+        // when this job and any other still on its way out of this function have left; the
+        // graph cannot be handed back, or run again, before that.
+        lock(&state.completion).finished = true;
+        let quiet = state.jobs.close();
+        debug_assert!(!quiet, "the finishing job is still registered");
     }
 }

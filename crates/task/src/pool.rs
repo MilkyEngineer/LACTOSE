@@ -4,7 +4,7 @@
 use core::cell::{Cell, OnceCell, RefCell};
 use core::ops::Range;
 use core::ptr::NonNull;
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering, fence};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering, fence};
 use std::collections::HashMap;
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex, Weak};
@@ -15,9 +15,11 @@ use crate::deque::{Injector, Steal, Stealer, Worker};
 use lactose_core::Arena;
 
 use crate::chaos::{Chaos, ChaosConfig, ChaosRng, Filter, Wake};
+use crate::gate::{self, Gate, Opener};
 use crate::graph::{self, RunState};
 use crate::guard::abort_on_unwind;
 use crate::job::{self, ChildHeader, ScopeCore};
+use crate::latch::Latch;
 use crate::platform::{Platform, ThreadHandle};
 use crate::sleep::Sleep;
 use crate::task::RawTask;
@@ -166,6 +168,11 @@ pub(crate) fn on_worker_thread() -> bool {
     with_local(|local| local.is_some())
 }
 
+/// Whether the calling thread is one of `shared`'s own workers, which cannot join them.
+pub(crate) fn on_worker_of(shared: &Shared) -> bool {
+    with_local(|local| local.is_some_and(|local| core::ptr::eq(Arc::as_ptr(&local.shared), shared)))
+}
+
 impl WorkerLocal {
     pub(crate) fn pool(&self) -> &Pool {
         self.shared.pool(self.class)
@@ -188,24 +195,19 @@ pub(crate) struct Pool {
     stealers: Box<[Stealer<Entry>]>,
     threads: Box<[Thread]>,
     sleep: Sleep,
-    /// Workers currently holding a permit to take jobs. A sleeping worker holds none.
-    running: AtomicU32,
-    /// The most permits that may be out. `u32::MAX` except while a `block_in_place` runs.
-    allowed: AtomicU32,
-    /// The reservations of the `block_in_place` calls in progress.
-    gate: Mutex<Vec<u32>>,
+    /// Run permits and the `block_in_place` gate.
+    gate: Gate,
 }
 
 impl Pool {
     fn new(stealers: Vec<Stealer<Entry>>, threads: Vec<Thread>) -> Self {
+        let workers = stealers.len();
         Self {
             injector: Injector::new(),
-            sleep: Sleep::new(stealers.len()),
+            sleep: Sleep::new(workers),
             stealers: stealers.into(),
             threads: threads.into(),
-            running: AtomicU32::new(0),
-            allowed: AtomicU32::new(u32::MAX),
-            gate: Mutex::new(Vec::new()),
+            gate: Gate::new(workers),
         }
     }
 
@@ -215,7 +217,13 @@ impl Pool {
 
     /// Wakes one sleeping worker, if any. Call after making work visible.
     pub(crate) fn notify_one(&self) {
-        if let Some(worker) = self.sleep.notify_one() {
+        self.announce_entry(false);
+    }
+
+    /// Wakes one sleeping worker for an entry that was just queued, unless the caller
+    /// `kept` it (see [`Sleep::announce_entry`]).
+    fn announce_entry(&self, kept: bool) {
+        if let Some(worker) = self.sleep.announce_entry(kept) {
             self.threads[worker].unpark();
         }
     }
@@ -240,83 +248,55 @@ impl Pool {
     }
 
     fn permit_available(&self) -> bool {
-        self.running.load(Ordering::SeqCst) < self.allowed.load(Ordering::SeqCst)
+        self.gate.permit_available()
     }
 
-    /// Takes a permit if the limit allows one more.
-    pub(crate) fn try_acquire(&self) -> bool {
-        self.running
-            .try_update(Ordering::SeqCst, Ordering::SeqCst, |running| {
-                (running < self.allowed.load(Ordering::SeqCst)).then_some(running + 1)
-            })
-            .is_ok()
+    fn try_acquire(&self) -> bool {
+        self.gate.try_acquire()
     }
 
     fn release(&self) {
-        self.running.fetch_sub(1, Ordering::SeqCst);
+        self.gate.release(self);
     }
 
-    /// Gives the calling worker's permit up because it is about to park in the middle of a
-    /// job, on a scope latch. A parked worker runs nothing, so it must not count against a
-    /// `block_in_place` reservation, whether the gate closed before it parked or after.
-    pub(crate) fn release_to_park(&self) {
-        self.release();
-        if self.allowed.load(Ordering::SeqCst) != u32::MAX {
-            // Someone parked at the gate can use the permit.
-            self.notify_one();
-        }
-    }
-
-    /// Takes a permit regardless of the limit, for a worker whose scope has closed and
-    /// which goes on with the job it is in the middle of.
-    pub(crate) fn retake(&self) {
-        self.running.fetch_add(1, Ordering::SeqCst);
-    }
-
-    /// Gives the calling worker's permit up if a `block_in_place` has lowered the limit
-    /// below the number of permits out. Returns whether it did.
     fn release_if_over(&self) -> bool {
-        let allowed = self.allowed.load(Ordering::Relaxed);
-        allowed != u32::MAX
-            && self
-                .running
-                .try_update(Ordering::SeqCst, Ordering::SeqCst, |running| {
-                    (running > allowed).then(|| running - 1)
-                })
-                .is_ok()
+        self.gate.release_if_over()
     }
 
     /// Whether a `block_in_place` has lowered the limit below the number of permits out,
     /// so that some worker has to stop taking units.
     pub(crate) fn over_limit(&self) -> bool {
-        let allowed = self.allowed.load(Ordering::Relaxed);
-        allowed != u32::MAX && self.running.load(Ordering::Relaxed) > allowed
+        self.gate.over_limit()
     }
 
     /// Starts a `block_in_place`: at most `reserved` workers other than the caller may hold
-    /// permits. Workers over the limit give theirs up at their next job boundary.
+    /// permits. Workers over the limit give theirs up at their next unit boundary.
     pub(crate) fn close_gate(&self, reserved: u32) {
-        let mut gate = lock(&self.gate);
-        gate.push(reserved);
-        let allowed = gate.iter().copied().min().unwrap_or(u32::MAX);
-        self.allowed.store(allowed, Ordering::SeqCst);
-        drop(gate);
-        // The caller blocks and stops counting.
-        self.release();
+        self.gate.close(reserved as usize, self);
     }
 
     /// Ends a `block_in_place` started with the same `reserved`.
     pub(crate) fn open_gate(&self, reserved: u32) {
-        let mut gate = lock(&self.gate);
-        let at = gate.iter().position(|&held| held == reserved).expect("gate was closed");
-        gate.swap_remove(at);
-        let allowed = gate.iter().copied().min().unwrap_or(u32::MAX);
-        self.allowed.store(allowed, Ordering::SeqCst);
-        drop(gate);
-        self.running.fetch_add(1, Ordering::SeqCst);
+        self.gate.open(reserved as usize, self);
         self.wake_all();
-        // Openers that parked on their latch at the gate wait for a plain unpark.
+        // Openers that parked on their latch with nothing on their deque announced
+        // nothing; they find out by a plain unpark.
         self.threads.iter().for_each(Thread::unpark);
+    }
+
+    /// The wait of a scope's opener on this pool. See [`gate::wait_for_children`].
+    pub(crate) fn wait_for_children(&self, latch: &Latch, worker: usize, opener: &mut impl Opener) {
+        gate::wait_for_children(latch, &self.gate, worker, self, opener);
+    }
+}
+
+impl gate::Wake for Pool {
+    fn idle_one(&self) {
+        self.notify_one();
+    }
+
+    fn unpark(&self, worker: usize) {
+        self.threads[worker].unpark();
     }
 }
 
@@ -473,6 +453,12 @@ impl Shared {
         ordinal
     }
 
+    /// How many graph runs are registered as unfinished.
+    #[cfg(all(test, not(feature = "loom")))]
+    pub(crate) fn live_run_count(&self) -> usize {
+        lock(&self.live_runs).len()
+    }
+
     pub(crate) fn end_run(&self, ordinal: u64) {
         lock(&self.live_runs).remove(&ordinal);
     }
@@ -525,9 +511,7 @@ impl Shared {
         if let Some(entry) = entry {
             self.frame.injector.push(entry);
         }
-        if !(keeps_one && on_own_deque) {
-            self.frame.notify_one();
-        }
+        self.frame.announce_entry(keeps_one && on_own_deque);
         self.discard_if_shut_down();
     }
 
@@ -624,7 +608,7 @@ impl Shared {
         }
         let runs = core::mem::take(&mut *lock(&self.live_runs));
         for run in runs.into_values().filter_map(|run| run.upgrade()) {
-            run.cancel();
+            run.cancel(self);
         }
         self.timers.cancel_all();
     }
@@ -843,7 +827,9 @@ fn idle(local: &WorkerLocal) {
         None
     };
     // A replay that looks stuck gets a deadline too, after which it is declared so.
-    let stalled = shared.replay().filter(|_| frame).and_then(Chaos::stalled);
+    let runs_started = || shared.runs.load(Ordering::SeqCst);
+    let stalled =
+        shared.replay().filter(|_| frame).and_then(|replay| replay.stalled(runs_started()));
     if stalled.is_some() {
         let limit = Instant::now() + REPLAY_STALL;
         deadline = Some(deadline.map_or(limit, |timer| timer.min(limit)));
@@ -867,7 +853,7 @@ fn idle(local: &WorkerLocal) {
     }
     if let (Some(replay), Some(cursor)) = (shared.replay(), stalled)
         && asleep.elapsed() >= REPLAY_STALL
-        && replay.stalled() == Some(cursor)
+        && replay.stalled(runs_started()) == Some(cursor)
         && !shared.is_shut_down()
     {
         // The log names a job this program never makes available. Nothing can change

@@ -23,11 +23,33 @@ impl CoreTopology {
     }
 
     /// Caps the counts at the hardware threads this process may actually use, which an
-    /// affinity mask or a container limit can put far below what the machine has.
+    /// affinity mask or a container limit can put far below what the machine has. One
+    /// thread is left for the platform thread, so performance cores are at most one fewer.
     fn limited_to(self, threads: u32) -> Self {
-        let performance = self.performance.min(threads).max(1);
-        Self { performance, efficiency: self.efficiency.min(threads - performance.min(threads)) }
+        let performance = default_frame_workers(self, Some(threads));
+        Self { performance, efficiency: self.efficiency.min(threads.saturating_sub(performance)) }
     }
+}
+
+/// The default number of frame-critical workers: the performance cores, but at most one
+/// fewer than the hardware threads the process may use, so the platform thread has
+/// somewhere to run, and at least one.
+pub(crate) fn default_frame_workers(topology: CoreTopology, threads: Option<u32>) -> u32 {
+    let cap = threads.map_or(u32::MAX, |threads| threads.saturating_sub(1));
+    topology.performance.min(cap).max(1)
+}
+
+/// The default number of background workers beside `frame` frame-critical ones: the
+/// efficiency cores, or two on a homogeneous CPU, but no more than the hardware threads the
+/// frame-critical workers leave, and at least one.
+pub(crate) fn default_background_workers(
+    topology: CoreTopology,
+    threads: Option<u32>,
+    frame: u32,
+) -> u32 {
+    let wanted = if topology.efficiency == 0 { 2 } else { topology.efficiency };
+    let cap = threads.map_or(u32::MAX, |threads| threads.saturating_sub(frame));
+    wanted.min(cap).max(1)
 }
 
 /// Topology detection reduced to functions of what the operating system reported, so each
@@ -185,6 +207,13 @@ pub trait Platform: Send + Sync + 'static {
     /// The cores available to the engine.
     fn topology(&self) -> CoreTopology;
 
+    /// The hardware threads the process may run on, if the default worker counts should be
+    /// capped by them: frame-critical workers at one fewer, background workers at what
+    /// those leave. `None`, the default, means [`Platform::topology`] is taken as it is.
+    fn hardware_threads(&self) -> Option<u32> {
+        None
+    }
+
     /// Starts a thread that runs `body` after applying `spec.class`.
     fn spawn_thread(
         &self,
@@ -208,6 +237,11 @@ impl Platform for StdPlatform {
             .unwrap_or_else(|| CoreTopology::homogeneous(threads.div_ceil(2)))
             // `available_parallelism` honours affinity masks and container limits.
             .limited_to(threads)
+    }
+
+    fn hardware_threads(&self) -> Option<u32> {
+        // Honours affinity masks and container limits.
+        Some(std::thread::available_parallelism().map_or(2, |count| count.get() as u32))
     }
 
     fn spawn_thread(
@@ -393,14 +427,43 @@ mod tests {
 
     #[test]
     fn worker_counts_are_capped_by_the_usable_hardware_threads() {
-        // A sixteen-core host seen through a four-CPU container limit.
-        assert_eq!(topology(15, 0).limited_to(4), topology(4, 0));
-        // Hybrid, limited below the performance-core count: no room for background cores.
-        assert_eq!(topology(8, 16).limited_to(6), topology(6, 0));
-        assert_eq!(topology(8, 16).limited_to(12), topology(8, 4));
-        // Unrestricted.
-        assert_eq!(topology(4, 4).limited_to(8), topology(4, 4));
-        assert_eq!(topology(4, 4).limited_to(1), topology(1, 0));
+        // (hardware threads, detected topology) -> (frame-critical, background) workers.
+        let counts = |threads: u32, detected: CoreTopology| {
+            let limited = detected.limited_to(threads);
+            let frame = default_frame_workers(limited, Some(threads));
+            (frame, default_background_workers(limited, Some(threads), frame))
+        };
+        // Homogeneous, one hardware thread per core: all cores but one are frame-critical,
+        // and the two low-priority background threads shrink to what is left.
+        let homogeneous = CoreTopology::homogeneous;
+        assert_eq!(counts(1, homogeneous(1)), (1, 1));
+        assert_eq!(counts(2, homogeneous(2)), (1, 1));
+        assert_eq!(counts(4, homogeneous(4)), (3, 1));
+        assert_eq!(counts(8, homogeneous(8)), (7, 1));
+        // Homogeneous with two hardware threads per core: room for both background threads.
+        assert_eq!(counts(8, homogeneous(4)), (3, 2));
+        assert_eq!(counts(16, homogeneous(8)), (7, 2));
+        // Hybrid, half and half.
+        assert_eq!(counts(2, topology(1, 1)), (1, 1));
+        assert_eq!(counts(4, topology(2, 2)), (2, 2));
+        assert_eq!(counts(8, topology(4, 4)), (4, 4));
+        // A big machine seen through a small affinity mask or container limit: never more
+        // workers than hardware threads, except for the minimum of one of each class.
+        assert_eq!(counts(4, homogeneous(16)), (3, 1));
+        assert_eq!(counts(4, topology(8, 16)), (3, 1));
+        assert_eq!(counts(8, topology(8, 16)), (7, 1));
+        assert_eq!(counts(12, topology(8, 16)), (8, 4));
+        assert_eq!(counts(1, topology(8, 16)), (1, 1));
+        for threads in [1, 2, 4, 8] {
+            for detected in [homogeneous(threads), topology(threads.div_ceil(2), threads / 2)] {
+                let (frame, background) = counts(threads, detected);
+                assert!(frame + background <= threads.max(2), "{threads}: {detected:?}");
+            }
+        }
+        // A platform that reports no thread count is taken at its word.
+        assert_eq!(default_frame_workers(topology(8, 16), None), 8);
+        assert_eq!(default_background_workers(topology(8, 0), None, 8), 2);
+        assert_eq!(default_background_workers(topology(8, 16), None, 8), 16);
     }
 
     /// One record as Windows lays it out: `Relationship`, `Size`, then the payload.

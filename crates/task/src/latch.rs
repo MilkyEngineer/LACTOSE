@@ -64,14 +64,6 @@ impl Latch {
         park();
     }
 
-    /// The opener's wait, reduced to what the latch contributes: check, park, repeat.
-    #[cfg(all(test, feature = "loom"))]
-    pub(crate) fn wait(&self) {
-        while !self.is_set() {
-            self.park();
-        }
-    }
-
     /// Ends the modelled stack frame.
     #[cfg(all(test, feature = "loom"))]
     pub(crate) fn retire(&self) {

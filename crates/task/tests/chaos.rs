@@ -194,3 +194,38 @@ fn replay_rejects_a_log_it_cannot_follow() {
     // A log is tied to the worker count it was recorded with.
     assert_eq!(kind(log, WORKERS + 1), Some(ErrorKind::InvalidData));
 }
+
+/// A replay waits for the program. Here the program starts its second graph run later than
+/// it did when the log was recorded, by more than the time after which a replay with
+/// nothing to do is declared stuck. The log's next record is of a run that has not been
+/// started yet, which is not a stall, and the replay must sit it out.
+#[test]
+#[cfg_attr(miri, ignore = "sleeps for seconds, which Miri simulates slowly beside busy threads")]
+fn a_replay_waits_for_a_run_the_program_has_not_started_yet() {
+    let first = || {
+        let slow = Node::new("chaos::slow")
+            .run(|_, _| common::spin_for(std::time::Duration::from_millis(sized(20, 1).into())))
+            .build();
+        graph(vec![slow, Node::new("chaos::after").build()], &[(0, 1)])
+    };
+    let second = || graph(vec![Node::new("chaos::late").build()], &[]);
+    let program = |executor: &Executor, gap: std::time::Duration| {
+        let first = executor.run_graph(first());
+        std::thread::sleep(gap);
+        let second = executor.run_graph(second());
+        executor.block_on(first).unwrap();
+        executor.block_on(second).unwrap();
+    };
+
+    let recorder =
+        builder().chaos(ChaosConfig { record: true, ..ChaosConfig::default() }).build().unwrap();
+    program(&recorder, std::time::Duration::from_millis(1));
+    let log = recorder.execution_log().unwrap();
+    recorder.shutdown();
+
+    // The same program with a slow main thread. The first run is long finished and the
+    // workers have been idle for longer than the stall limit when the second run starts.
+    let replaying = builder().replay(log).build().unwrap();
+    program(&replaying, std::time::Duration::from_millis(2600));
+    replaying.shutdown();
+}

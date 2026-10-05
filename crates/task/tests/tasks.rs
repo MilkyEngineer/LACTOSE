@@ -727,3 +727,198 @@ fn wake_cancel_and_complete_race() {
     executor.shutdown();
     assert_eq!(dropped.load(Ordering::Acquire), rounds, "every future is dropped exactly once");
 }
+
+/// A node whose one unit is inside a scope, with a child still running, when its run is
+/// cancelled. Returns the node, the flag it sets on entry, the flag that lets its child
+/// finish, the flag it sets when the unit has returned from the scope, and its finalize
+/// count.
+#[allow(clippy::type_complexity, reason = "a one-off bundle of test flags")]
+fn node_caught_mid_scope() -> (
+    Arc<dyn lactose_task::GraphNode>,
+    Arc<AtomicBool>,
+    Arc<AtomicBool>,
+    Arc<AtomicBool>,
+    Arc<AtomicU32>,
+) {
+    let running = Arc::new(AtomicBool::new(false));
+    let release = Arc::new(AtomicBool::new(false));
+    let returned = Arc::new(AtomicBool::new(false));
+    let finalized = Arc::new(AtomicU32::new(0));
+    let node = {
+        let (running, release, returned, finalized) =
+            (running.clone(), release.clone(), returned.clone(), finalized.clone());
+        Node::new("tasks::mid-scope")
+            .run(move |_, ctx| {
+                let (running, release) = (&running, &release);
+                ctx.scope(|scope| {
+                    scope.fork(move |_| {
+                        running.store(true, Ordering::Release);
+                        wait_for(release);
+                    });
+                });
+                returned.store(true, Ordering::Release);
+            })
+            .finalize(move |_| {
+                finalized.fetch_add(1, Ordering::AcqRel);
+            })
+            .build()
+    };
+    (node, running, release, returned, finalized)
+}
+
+/// `Cancelled` means quiet. A run that is cancelled while one of its jobs is inside a scope
+/// does not resolve until that job, children included, has returned; and nothing of the run
+/// starts afterwards, not even the finalize of the node that was caught.
+#[test]
+fn a_cancelled_run_resolves_only_when_its_jobs_have_returned() {
+    let executor = executor(2, 1);
+    let (node, running, release, returned, finalized) = node_caught_mid_scope();
+    let never = Arc::new(AtomicU32::new(0));
+    let dependent = {
+        let never = never.clone();
+        Node::new("tasks::after-cancel")
+            .run(move |_, _| {
+                never.fetch_add(1, Ordering::AcqRel);
+            })
+            .build()
+    };
+    let run = executor.run_graph(graph(vec![node, dependent], &[(0, 1)]));
+    wait_for(&running);
+
+    let resolved = Arc::new(AtomicBool::new(false));
+    let waiter = {
+        let (handle, resolved, returned) = (executor.clone(), resolved.clone(), returned.clone());
+        std::thread::spawn(move || {
+            let result = handle.block_on(run);
+            // Read at the moment of resolution: the job must be out of its scope by now.
+            let quiet = returned.load(Ordering::Acquire);
+            resolved.store(true, Ordering::Release);
+            (result.err().map(|error| error.kind()), quiet)
+        })
+    };
+    let stopper = {
+        let handle = executor.clone();
+        std::thread::spawn(move || handle.shutdown())
+    };
+    // Shutdown has begun once a new task is refused. The run must still be unresolved
+    // then, however long the machine takes: its job has not been let go.
+    let begun = Instant::now();
+    while executor.block_on(executor.spawn(WorkerClass::Background, async {})).is_ok() {
+        assert!(begun.elapsed() < Duration::from_secs(60), "shutdown never began");
+        std::thread::yield_now();
+    }
+    for _ in 0..sized(200, 5) {
+        assert!(!resolved.load(Ordering::Acquire), "resolved while a job was in its scope");
+        std::thread::yield_now();
+    }
+    release.store(true, Ordering::Release);
+    let (kind, quiet) = waiter.join().unwrap();
+    stopper.join().unwrap();
+    assert_eq!(kind, Some(ErrorKind::Cancelled));
+    assert!(quiet, "the run resolved before its job had returned");
+    assert_eq!(finalized.load(Ordering::Acquire), 0, "a finalize started after cancellation");
+    assert_eq!(never.load(Ordering::Acquire), 0, "a dependent ran after cancellation");
+}
+
+/// The same when nobody joins: the last handle is dropped on one of the executor's own
+/// workers, which only tells the others to stop.
+#[test]
+fn a_run_cancelled_from_a_worker_is_quiet_when_it_resolves() {
+    let executor = executor(2, 1);
+    let (node, running, release, returned, finalized) = node_caught_mid_scope();
+    let mut run = core::pin::pin!(executor.run_graph(graph(vec![node], &[])));
+    wait_for(&running);
+
+    // The only handle moves into a task, which drops it on a background worker.
+    let dropped = Arc::new(AtomicBool::new(false));
+    let go = Arc::new(AtomicBool::new(false));
+    {
+        let (dropped, go) = (dropped.clone(), go.clone());
+        let spawner = executor.clone();
+        spawner
+            .spawn(WorkerClass::Background, async move {
+                while !go.load(Ordering::Acquire) {
+                    yield_now().await;
+                }
+                drop(executor);
+                dropped.store(true, Ordering::Release);
+            })
+            .detach();
+    }
+    // Only now, with the test's own handle gone, is the task's handle the last one.
+    go.store(true, Ordering::Release);
+    let mut context = Context::from_waker(Waker::noop());
+    // Until the task has dropped the last handle the run is simply pending; after that it
+    // is cancelled but its job is still in its scope, so it stays pending.
+    while !dropped.load(Ordering::Acquire) {
+        assert!(run.as_mut().poll(&mut context).is_pending());
+        std::thread::yield_now();
+    }
+    for _ in 0..sized(200, 5) {
+        assert!(run.as_mut().poll(&mut context).is_pending(), "resolved over a running job");
+        std::thread::yield_now();
+    }
+    release.store(true, Ordering::Release);
+    let start = Instant::now();
+    let result = loop {
+        if let Poll::Ready(result) = run.as_mut().poll(&mut context) {
+            break (result.err().map(|error| error.kind()), returned.load(Ordering::Acquire));
+        }
+        assert!(start.elapsed() < Duration::from_secs(60), "the run never resolved");
+        std::thread::yield_now();
+    };
+    assert_eq!(result, (Some(ErrorKind::Cancelled), true));
+    assert_eq!(finalized.load(Ordering::Acquire), 0);
+}
+
+/// Dropping an executor's last handle on a worker of a different executor is an ordinary
+/// drop: the threads are joined. Only a worker of the executor itself cannot wait for it.
+#[test]
+fn another_executors_worker_joins_the_pool_it_drops() {
+    let live = Arc::new(AtomicUsize::new(0));
+    let platform = Arc::new(LiveThreads { live: live.clone() });
+    let inner = Executor::builder().platform(platform).build().unwrap();
+    assert_eq!(live.load(Ordering::Acquire), 3);
+    let outer = executor(1, 1);
+
+    let live_after_drop = {
+        let live = live.clone();
+        outer.block_on(outer.spawn(WorkerClass::FrameCritical, async move {
+            assert_eq!(inner.frame_worker_count(), 2);
+            drop(inner);
+            // Joined: nothing of the inner pool is running by the time the drop returns.
+            live.load(Ordering::Acquire)
+        }))
+    };
+    assert_eq!(live_after_drop.unwrap(), 0);
+    outer.shutdown();
+}
+
+/// `shutdown` called on one of the executor's own workers cannot join the thread it is on.
+/// It does the rest and returns; the workers exit by themselves.
+#[test]
+fn shutdown_on_an_own_worker_returns_without_joining_itself() {
+    let live = Arc::new(AtomicUsize::new(0));
+    let platform = Arc::new(LiveThreads { live: live.clone() });
+    let executor = Executor::builder().platform(platform).build().unwrap();
+    let returned = Arc::new(AtomicBool::new(false));
+    let pending_task = executor.spawn(WorkerClass::Background, pending::<()>());
+    {
+        let (handle, returned) = (executor.clone(), returned.clone());
+        executor
+            .spawn(WorkerClass::FrameCritical, async move {
+                handle.shutdown();
+                returned.store(true, Ordering::Release);
+            })
+            .detach();
+    }
+    wait_for(&returned);
+    // Everything else about shutdown happened: waiting futures are answered...
+    assert_eq!(executor.block_on(pending_task).unwrap_err().kind(), ErrorKind::Cancelled);
+    // ...and the threads go away on their own.
+    let start = Instant::now();
+    while live.load(Ordering::Acquire) != 0 {
+        assert!(start.elapsed() < Duration::from_secs(60), "the workers never exited");
+        std::thread::yield_now();
+    }
+}

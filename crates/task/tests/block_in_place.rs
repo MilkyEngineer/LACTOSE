@@ -175,3 +175,78 @@ fn a_parked_opener_does_not_use_up_the_reservation() {
         "nothing ran during the block: the parked opener held the one reserved permit"
     );
 }
+
+/// The second review's case: every frame-critical worker other than the blocked one is
+/// inside a scope, running its own children, when `block_in_place(1)` begins. Both openers
+/// are over the limit and both give way. One of them must end up with the reserved permit
+/// and keep running children; before the fix both parked on their latches beside their own
+/// deques and nothing ran until the block ended.
+#[test]
+fn a_reservation_is_used_when_every_other_worker_is_an_opener() {
+    let executor = executor(3, 1);
+    let started = Arc::new(AtomicU32::new(0));
+    let blocked = Arc::new(AtomicBool::new(false));
+    let unblocked = Arc::new(AtomicBool::new(false));
+    let during = Arc::new(AtomicU32::new(0));
+    // What the block waits for: this many child units finished while it is in place. It
+    // cannot be reached unless a reserved worker runs children during the block, so a
+    // regression shows as the bounded wait below running out, on any machine.
+    let wanted = sized(200, 4);
+    let children = sized(40_000, 400);
+
+    let all_started = {
+        let started = started.clone();
+        move || {
+            started.fetch_add(1, Ordering::AcqRel);
+            while started.load(Ordering::Acquire) < 3 {
+                core::hint::spin_loop();
+            }
+        }
+    };
+    let physics = {
+        let (all_started, blocked, unblocked, during) =
+            (all_started.clone(), blocked.clone(), unblocked.clone(), during.clone());
+        Node::new("block::all-openers")
+            .run(move |_, ctx| {
+                all_started();
+                let progressed = ctx.block_in_place(1, || {
+                    blocked.store(true, Ordering::Release);
+                    let begun = std::time::Instant::now();
+                    while during.load(Ordering::Acquire) < wanted
+                        && begun.elapsed() < Duration::from_secs(if cfg!(miri) { 600 } else { 20 })
+                    {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    during.load(Ordering::Acquire) >= wanted
+                });
+                unblocked.store(true, Ordering::Release);
+                assert!(progressed, "no child ran during the block with one worker reserved");
+            })
+            .build()
+    };
+    let opener = |name| {
+        let (all_started, blocked, unblocked, during) =
+            (all_started.clone(), blocked.clone(), unblocked.clone(), during.clone());
+        Node::new(name)
+            .run(move |_, ctx| {
+                all_started();
+                let (blocked, unblocked, during) = (&blocked, &unblocked, &during);
+                ctx.scope(|scope| {
+                    scope.fork_range(0..children, move |range, _| {
+                        for _ in range {
+                            spin_for(Duration::from_micros(10));
+                            let counted = blocked.load(Ordering::Acquire)
+                                && !unblocked.load(Ordering::Acquire);
+                            if counted {
+                                during.fetch_add(1, Ordering::AcqRel);
+                            }
+                        }
+                    });
+                });
+            })
+            .build()
+    };
+    let nodes = vec![physics, opener("block::opener-a"), opener("block::opener-b")];
+    executor.block_on(executor.run_graph(graph(nodes, &[]))).unwrap();
+    executor.shutdown();
+}

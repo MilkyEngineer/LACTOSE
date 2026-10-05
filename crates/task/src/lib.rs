@@ -18,6 +18,7 @@
 mod chaos;
 mod deque;
 mod executor;
+mod gate;
 mod graph;
 mod guard;
 mod job;
@@ -27,6 +28,7 @@ mod latch;
 mod models;
 mod platform;
 mod pool;
+mod quiesce;
 mod sleep;
 mod span;
 mod sync;

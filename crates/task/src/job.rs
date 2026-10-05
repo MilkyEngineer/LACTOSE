@@ -11,6 +11,7 @@ use core::ptr::NonNull;
 use lactose_core::{AllocTag, Arena};
 
 use crate::chaos::{Filter, JobKind, LogRecord};
+use crate::gate::Opener;
 use crate::guard::abort_on_unwind;
 use crate::latch::Latch;
 use crate::pool::{Arenas, Entry, LATCH_SPIN, Rest, WorkerLocal, drain_range, spin_until};
@@ -327,57 +328,47 @@ impl<'scope> Scope<'scope, '_> {
             return;
         }
 
-        let mut spun = false;
-        loop {
-            // A `block_in_place` may want this worker parked like any other: then its
-            // children stay on the deque for the reserved workers. `run_child` puts the
-            // rest of a range back under the same condition.
-            while !pool.over_limit() || shared.is_shut_down() {
-                match local.deque.pop() {
-                    Some(Entry::Child { scope, job, units }) if scope == own => {
-                        run_child(local, scope, job, units, child_scratch);
+        /// The opener's side of [`gate::wait_for_children`].
+        struct Children<'a> {
+            local: &'a WorkerLocal,
+            own: NonNull<ScopeCore>,
+            scratch: &'a mut Arena,
+        }
+
+        impl Opener for Children<'_> {
+            fn run_children(&mut self) -> bool {
+                let (local, pool) = (self.local, self.local.pool());
+                // A `block_in_place` may want this worker parked like any other: then its
+                // children stay on the deque for the reserved workers. `run_child` puts
+                // the rest of a range back under the same condition.
+                while !pool.over_limit() || self.shutting_down() {
+                    match local.deque.pop() {
+                        Some(Entry::Child { scope, job, units }) if scope == self.own => {
+                            run_child(local, scope, job, units, self.scratch);
+                        }
+                        Some(older) => {
+                            // It was off the deque for a moment; a worker that looked
+                            // then may have gone to sleep.
+                            local.push(older);
+                            return false;
+                        }
+                        None => return false,
                     }
-                    Some(older) => {
-                        // It was off the deque for a moment; a worker that looked then
-                        // may have gone to sleep.
-                        local.push(older);
-                        break;
-                    }
-                    None => break,
                 }
-            }
-            if latch.is_set() {
-                return;
-            }
-            if !core::mem::replace(&mut spun, true) && spin_until(LATCH_SPIN, || latch.is_set()) {
-                return;
+                !local.deque.is_empty()
             }
 
-            // Park without the permit: a parked worker runs nothing and must not use up a
-            // `block_in_place` reservation.
-            pool.release_to_park();
-            loop {
-                if latch.is_set() {
-                    pool.retake();
-                    return;
-                }
-                // Woken by the last child, by a gate opening, or at shutdown.
-                latch.park();
-                if latch.is_set() {
-                    pool.retake();
-                    return;
-                }
-                if pool.try_acquire() {
-                    // Children may be back on this deque, or the gate may have opened.
-                    break;
-                }
-                if shared.is_shut_down() {
-                    // Nobody else will run what is left on this deque.
-                    pool.retake();
-                    break;
-                }
+            fn shutting_down(&self) -> bool {
+                self.local.shared.is_shut_down()
+            }
+
+            fn spin(&mut self, latch: &Latch) -> bool {
+                spin_until(LATCH_SPIN, || latch.is_set())
             }
         }
+
+        let mut children = Children { local, own, scratch: child_scratch };
+        pool.wait_for_children(latch, local.index, &mut children);
     }
 
     /// Drops the closures of this scope's range jobs. Every child has finished.

@@ -354,11 +354,20 @@ impl Chaos {
     /// faithful replay is never in this state for longer than it takes a worker to wake,
     /// because in the recording an idle worker took pooled work at once. Returns the
     /// script position it is stuck at.
-    pub(crate) fn stalled(&self) -> Option<usize> {
+    ///
+    /// `runs_started` is how many graph runs the program has started. A record of a run it
+    /// has not started yet is not stuck, however long that takes: the replay is waiting
+    /// for the program, which may be slow for reasons of its own. Only graph records can
+    /// be in that position. A child record's key is the job that forked it, which is
+    /// earlier in the script and so has started; tasks and timers are not recorded at all.
+    pub(crate) fn stalled(&self, runs_started: u64) -> Option<usize> {
         let state = lock(&self.state);
         let next = self.script.get(state.cursor)?;
-        let stuck =
-            state.in_flight == 0 && !state.pool.is_empty() && find(&state.pool, next).is_none();
+        let awaits_program = next.kind != JobKind::Child && next.key >= runs_started;
+        let stuck = !awaits_program
+            && state.in_flight == 0
+            && !state.pool.is_empty()
+            && find(&state.pool, next).is_none();
         stuck.then_some(state.cursor)
     }
 

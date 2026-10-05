@@ -16,7 +16,8 @@ use crate::WorkerClass;
 use crate::chaos::{Chaos, ChaosConfig, ExecutionLog};
 use crate::graph::{self, Graph, GraphRun};
 use crate::platform::{Platform, StdPlatform, ThreadHandle, ThreadSpec};
-use crate::pool::{Shared, WorkerSeed, on_worker_thread, worker_thread};
+use crate::platform::{default_background_workers, default_frame_workers};
+use crate::pool::{Shared, WorkerSeed, on_worker_of, on_worker_thread, worker_thread};
 use crate::task::{self, Task};
 use crate::time::Sleep;
 
@@ -38,9 +39,11 @@ struct Owner {
 
 impl Drop for Owner {
     fn drop(&mut self) {
-        // The last handle may go on a worker, when a task that held it finishes or is
-        // dropped. A worker cannot wait for itself, so there the threads are only told.
-        self.shared.shut_down(!on_worker_thread());
+        // The last handle may go on one of this executor's own workers, when a task that
+        // held it finishes or is dropped. A worker cannot wait for itself, so there the
+        // threads are only told. Anywhere else, another executor's worker included, the
+        // threads are joined.
+        self.shared.shut_down(!on_worker_of(&self.shared));
     }
 }
 
@@ -163,10 +166,14 @@ impl Executor {
     ///
     /// Queued graph work is dropped. A [`GraphRun`], [`Task`] or [`Sleep`] that was cut off
     /// resolves to an error of kind `Cancelled`. Other clones of the handle stay valid and
-    /// inert: what they start is cancelled at once. Must not be called from a worker thread.
+    /// inert: what they start is cancelled at once.
+    ///
+    /// Called on one of this executor's own workers, from a task or a job, it cannot wait
+    /// for the thread it is on: it does everything else and returns without joining, and
+    /// the workers exit on their own once their running jobs return.
     pub fn shutdown(self) {
-        debug_assert!(!on_worker_thread(), "shutdown called on a worker would wait for itself");
-        self.owner.shared.shut_down(true);
+        let shared = &self.owner.shared;
+        shared.shut_down(!on_worker_of(shared));
     }
 }
 
@@ -237,8 +244,11 @@ impl ExecutorBuilder {
             (Some(frame), Some(background)) => (frame, background),
             (frame, background) => {
                 let topology = platform.topology();
-                let efficiency = if topology.efficiency == 0 { 2 } else { topology.efficiency };
-                (frame.unwrap_or(topology.performance), background.unwrap_or(efficiency))
+                let threads = platform.hardware_threads();
+                let frame = frame.unwrap_or_else(|| default_frame_workers(topology, threads));
+                let background = background
+                    .unwrap_or_else(|| default_background_workers(topology, threads, frame));
+                (frame, background)
             }
         };
         if frame == 0 || background == 0 {
@@ -310,5 +320,54 @@ impl ExecutorBuilder {
             let _ = sender.send(shared.clone());
         }
         Ok(Executor { owner: Arc::new(Owner { shared }) })
+    }
+}
+
+#[cfg(all(test, not(feature = "loom")))]
+mod tests {
+    use core::ops::Range;
+    use core::pin::pin;
+    use core::task::{Context, Poll, Waker};
+    use std::sync::Arc;
+
+    use crate::{Executor, GraphBuilder, GraphNode, JobContext};
+
+    struct Nothing;
+
+    impl GraphNode for Nothing {
+        fn name(&self) -> &'static str {
+            "executor::tests::nothing"
+        }
+
+        fn units(&self) -> u32 {
+            1
+        }
+
+        fn run(&self, _units: Range<u32>, _ctx: &mut JobContext<'_>) {}
+    }
+
+    /// A graph that is run again the instant its run resolves. The finishing worker used
+    /// to unregister the run after the future could resolve, by an ordinal it read late:
+    /// it then removed the new run and left the old one registered for ever.
+    #[test]
+    fn a_run_is_unregistered_before_its_graph_can_run_again() {
+        let executor = Executor::builder().frame_workers(2).background_workers(1).build().unwrap();
+        let mut builder = GraphBuilder::new();
+        builder.add_node(Arc::new(Nothing));
+        let mut graph = builder.build().unwrap();
+        let mut context = Context::from_waker(Waker::noop());
+        for _ in 0..if cfg!(miri) { 50 } else { 50_000 } {
+            let mut run = pin!(executor.run_graph(graph));
+            // Polled in a tight loop, so the new run starts as early as it possibly can.
+            graph = loop {
+                if let Poll::Ready(result) = run.as_mut().poll(&mut context) {
+                    break result.unwrap();
+                }
+                core::hint::spin_loop();
+            };
+            // The run that just resolved is gone from the registry, and no other is live.
+            assert_eq!(executor.owner.shared.live_run_count(), 0);
+        }
+        executor.shutdown();
     }
 }

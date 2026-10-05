@@ -29,7 +29,25 @@ and list what changed, because `lactose-ecs` is written against this surface.
 | `ChaosConfig`, `ExecutionLog`, `Executor::execution_log` | Seeded schedule perturbation and exact replay for SOUR |
 
 `GraphRun`, `Task` and `Sleep` resolve to a `lactose_core::Result`. The error is of kind
-`Cancelled` and means the executor shut down first.
+`Cancelled` and means the executor shut down first. What each resolution guarantees:
+
+- **`GraphRun`.** When it resolves, with `Ok` or with `Cancelled`, no unit, scope child or
+  `finalize` of that run is executing or ever will, and everything they wrote happens before
+  the resolution. With `Ok` every node has finalized and the graph is handed back. After
+  `Cancelled` the run is torn: some nodes finalized, some ran in part, their dependents never
+  ran, and the graph is not handed back. A job looks for shutdown before each unit and before
+  `finalize`, so once shutdown has begun none of those starts, except one that was already
+  past its check; jobs already running finish, including the scopes they have open, and the
+  run resolves when the last of them has returned. This holds however the
+  executor is shut down, including when the last handle is dropped on a worker and nothing
+  is joined.
+- A job of a run cannot wait for its own run, which is not quiet while that job executes.
+  Jobs are synchronous and `block_on` on a worker is a debug assertion, so it cannot happen
+  by accident; done deliberately in a release build, it waits for ever.
+- **`Task`.** When it resolves to `Cancelled` the task's future has been dropped: its body is
+  not running and will not run again. A task that is being polled when shutdown begins
+  finishes that poll first.
+- **`Sleep`.** Resolves to `Cancelled` as soon as shutdown begins. It guards nothing.
 
 `lactose_task::bench_support` is hidden and exists for `benches/whisk.rs` alone.
 
@@ -99,8 +117,12 @@ and list what changed, because `lactose-ecs` is written against this surface.
 - Frame-critical workers equal the performance-core count and run at user-interactive QoS.
   Background workers run on efficiency cores at utility QoS, or as two low-priority threads on
   homogeneous CPUs. A frame-critical worker never runs background work. An executor has at
-  least one worker of each class. Both counts are capped by the hardware threads the process
-  may use (`std::thread::available_parallelism`).
+  least one worker of each class. With the default platform the counts are capped by the
+  hardware threads the process may use (`std::thread::available_parallelism`, which honours
+  affinity masks and container limits): frame-critical workers at one fewer, leaving a
+  thread for the platform thread, and background workers at what those leave, so the two
+  together never exceed the hardware threads except to keep one of each. A custom `Platform`
+  opts into the same cap by returning `Some` from `hardware_threads`.
 - Each worker owns a `crossbeam-deque`. Idle workers spin briefly, then `std::thread::park`:
   about 50 µs of rescanning.
 - Every worker thread is created through the `Platform`, which applies its
@@ -118,7 +140,9 @@ and list what changed, because `lactose-ecs` is written against this surface.
   stay parked. A worker that is mid-job when the block starts finishes the unit it is on, puts
   the rest of its range back for the reserved workers, and parks; an opener running its own
   children does the same. A worker parked on a scope latch holds no permit, so it never uses
-  up a reservation.
+  up a reservation; and an opener that gave way to the gate with children still on its own
+  deque is woken when a permit comes free, so a reservation is used even when every other
+  worker is inside a scope.
 - Dedicated threads owned by other crates (network, present, audio) are created through
   `Executor::platform`, never `std::thread` directly.
 - There is no timer thread. Frame-critical workers fire due timers when they look for work,
@@ -127,6 +151,8 @@ and list what changed, because `lactose-ecs` is written against this surface.
   queued graph work and cancels every unfinished task. A `GraphRun`, `Task` or `Sleep` that
   was cut off resolves to `Cancelled`, at once, without waiting for the running jobs.
   Dropping the last `Executor` handle does the same; a handle held by a task counts.
+  Either joins every worker thread, except on one of the executor's own workers, which
+  cannot wait for itself: there the workers are told to stop and exit on their own.
 - A detached task that is suspended with no waker left anywhere is dropped.
 
 **Tracing**
@@ -156,7 +182,9 @@ and list what changed, because `lactose-ecs` is written against this surface.
   the frame-critical worker count the log was recorded with and a program that starts the
   same graph runs in the same order. Tasks are not recorded.
 - A log the program cannot follow aborts the process with a diagnostic, two seconds after the
-  replay has work waiting, nothing running, and the job the log names next not among it.
+  replay has work waiting, nothing running, and the job the log names next not among it. A
+  log whose next job belongs to a graph run the program has not started yet is not stuck:
+  replay waits for the program, however slow.
 
 ## Proof for milestone 0
 
@@ -199,13 +227,16 @@ inside the executor, on the function a worker steals with.
 
 Correctness:
 
-- The scope latch and the sleep-and-wake protocol are modelled under `loom` (`src/models.rs`).
+- The scope latch and the sleep-and-wake protocol are modelled under `loom` (`src/models.rs`),
+  and with them what is built on them: the opener's wait with its permit and the
+  `block_in_place` gate (`src/gate.rs`), the wake that is skipped for a kept entry, and the
+  quiescence of a cancelled run (`src/quiesce.rs`). The models call the shipped functions.
   The deque is a vetted dependency and is not modelled. loom is enabled by a `loom` Cargo
   feature on this crate that switches an internal `sync` shim, and run with
   `cargo test -p lactose-task --features loom --release`. Never use loom's documented
   `RUSTFLAGS="--cfg loom"`: the environment variable replaces the x86-64 target pin.
-  Four models are explored exhaustively. The fifth, two sleepers and a pusher, is bounded at
-  five preemptions (`LOOM_MAX_PREEMPTIONS` overrides the bound).
+  Eight models are explored exhaustively. The two with three threads are bounded at five
+  preemptions (`LOOM_MAX_PREEMPTIONS` overrides the bound).
 - **The `loom` feature is for that one command.** No other crate may enable it and nothing
   may be built with `--all-features`: features unify across a build, so every executor in it
   would run on loom primitives, which panic outside a loom model.

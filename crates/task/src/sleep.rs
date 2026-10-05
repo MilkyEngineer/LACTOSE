@@ -101,6 +101,15 @@ impl Sleep {
         None
     }
 
+    /// What a worker does after it queued an entry: claim a sleeper for it, unless the
+    /// worker `kept` the entry for itself. A worker at the end of its job that releases
+    /// several entries onto its own deque takes one of them as its next job; a sleeper woken
+    /// for that one would find it gone. The caller unparks the returned worker.
+    #[must_use]
+    pub(crate) fn announce_entry(&self, kept: bool) -> Option<usize> {
+        if kept { None } else { self.notify_one() }
+    }
+
     /// Claims `worker` if it is asleep. The caller changed something that worker waits for
     /// before the call, and unparks it if this returns `true`.
     #[must_use]
