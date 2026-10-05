@@ -33,6 +33,14 @@ comments rely on. The crate's tests run under Miri.
 - `EntityRef` is four `u32` words. Every bit pattern is memory-valid; `CheckedBitPattern`
   only narrows to canonical encodings, and `EntityRef::get` treats anything else as empty.
 
+## `array`
+
+- `PlainArray<T, N>` and `PlainArrayBits<T, N>` are `repr(transparent)` over `[T; N]` and
+  `[T::Bits; N]`. An array has no padding of its own, so each is plain data exactly when its
+  element is, and the array is valid exactly when every element is.
+- That `PlainArrayBits<T, N>` has the layout of `PlainArray<T, N>` relies on `T::Bits` having
+  the size and alignment of `T`, which is `T`'s own `CheckedBitPattern` contract.
+
 ## `thread_class::fp`
 
 - The inline assembly reads or writes MXCSR (x86-64) or FPCR (aarch64) and nothing else.

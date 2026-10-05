@@ -977,6 +977,24 @@ rationale the author supplied during the editorial pass rather than one taken fr
   that disagreed.
 - Driven by: milestone 0 xtask lane and its review, findings 5 to 7.
 
+**D97. Components are laid out by the author and checked by the compiler; arrays are `PlainArray`; the attribute writes `CheckedBitPattern` itself** (§6, §21, `lactose-reflect`)
+- Why: a proc macro cannot evaluate alignment and hidden padding fields break struct literals,
+  so `#[component]` emits per-field `offset_of!` assertions and `Padding<N>` has zero as its
+  only value. bytemuck 1.25.2 treats `[T; N]` as plain data only for `T: Pod`, so
+  `lactose-core::PlainArray` carries the `unsafe impl`s. `bytemuck_derive` 1.12.1 does not
+  forward its crate path to the nested `AnyBitPattern` derive, so its struct derive compiles
+  only where `bytemuck` is a direct dependency; the attribute writes the impl instead. Because
+  an attribute below ours, or a raw-identifier spelling such as `r#repr`, can change the type
+  after the macro read it, the expansion asserts size, alignment, every field offset, the
+  exact field list and the exact field types against the final type, and enums get the
+  equivalent checks. `Reflect` stays a safe trait: `Schema<T>` takes size, alignment and
+  validity from `T`, so `validate` is a proof for `T::SCHEMA` and registry lookups and nothing
+  else is. Field types carry a stable type tag and structs a retired-ID list, so a schema dump
+  diff can reject field-ID reuse. Data-carrying enums are supported by the pinned bytemuck
+  but not reflected: nothing in milestones 0 or 1 needs them.
+- Driven by: milestone 0 reflect lane and its two adversarial reviews; verification §2.
+- Replaced: revision 3.2's field reordering and inserted padding; bare `[T; N]` fields.
+
 ## 10. Review history
 
 - **Revision 1** (`a29af04`): the design baseline.

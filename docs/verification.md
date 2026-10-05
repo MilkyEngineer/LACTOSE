@@ -34,7 +34,7 @@ version in `Cargo.lock` before the milestone that depends on it.
 | Slang's Metal target supports argument buffers, function constants and framebuffer fetch. | 2 |
 | Apple M1 lacks 64-bit atomics. | 3 |
 | glam or its fork has a feature (such as fast-math) that changes numerics on the pinned version; if so it goes on the cargo-deny denylist. | 0 |
-| `bytemuck_derive` on the pinned version: support for data-carrying enums under `NoUninit` and `CheckedBitPattern`, and whether a `PodInOption` derive exists for `NetId`. | 0 |
+| `bytemuck_derive` on the pinned version: support for data-carrying enums under `NoUninit` and `CheckedBitPattern`, and whether a `PodInOption` derive exists for `NetId`. | 0. **Done:** 1.12.1 derives both traits for data-carrying enums with an explicit repr; it has no `PodInOption` derive, so `NetId` keeps its hand-written impls in `lactose-core`. `[T; N]` is plain data only for `T: Pod`, hence `lactose_core::PlainArray`. Its struct `CheckedBitPattern` derive needs `bytemuck` as a direct dependency and accepts `r#repr`, so `#[component]` writes and checks that impl itself (D97) |
 | loom's current limitations (SeqCst modelled as AcqRel, no load buffering) and feasible preemption bound for the latch and sleep model. | 0 |
 | `tracing-tracy` per-span overhead, to confirm per-system and per-range spans fit the budget. | 0 |
 | Rapier's serialised snapshot is iteration-order stable enough to hash. | 1 |

@@ -5,6 +5,7 @@
 
 pub mod alloc;
 pub mod arena;
+pub mod array;
 pub mod error;
 pub mod handle;
 pub mod hash;
@@ -14,6 +15,7 @@ pub mod thread_class;
 
 pub use alloc::{AllocTag, TagScope, TagStats, TaggedAlloc};
 pub use arena::Arena;
+pub use array::PlainArray;
 pub use error::{Error, ErrorKind, Result};
 pub use handle::{Handle, HandleTable};
 pub use hash::xxh64;
