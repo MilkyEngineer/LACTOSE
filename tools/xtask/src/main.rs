@@ -3,6 +3,9 @@
 //! Findings go to standard output, one `path: message` line each, and nothing else does, so
 //! the output can be fed to a problem matcher. Progress and summaries go to standard error.
 //! The exit status is 0 for no findings, 1 for findings and 2 when a check could not run.
+//!
+//! Every cargo command this binary runs is `--locked`, as is the `cargo xtask` alias itself:
+//! a check never rewrites `Cargo.lock`, and fails if it is out of date.
 
 #![forbid(unsafe_code)]
 
@@ -12,9 +15,9 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 
+use lactose_xtask::harness::{self, Dirs, Selection, stand_in};
 use lactose_xtask::policy::Policy;
 use lactose_xtask::repo::Files;
-use lactose_xtask::sour::{self, Dirs, Selection, stand_in};
 use lactose_xtask::tiers::TierFile;
 use lactose_xtask::workspace::{Workspace, load_metadata};
 use lactose_xtask::{Finding, POLICY_FILE, TIER_FILE, boundary, features, tiers};
@@ -23,17 +26,19 @@ const USAGE: &str = "\
 cargo xtask <command>
 
   tiers                      check every crate dependency against crate-tiers.toml
-  boundary                   check boundary lint files, unsafe policy, READMEs, the boundary
-                             dependency allowlist and the x86-64-v3 pin
-  features [--package <p>]…  require identical boundary feature trees across the shipped
-                             binaries and the SOUR test crate (or across the named packages)
+  boundary                   check the boundary lint files and everything that could switch
+                             them off, the unsafe policy, READMEs, the boundary dependency
+                             allowlist and the x86-64-v3 pin
+  features [--package <p>]…  require identical boundary feature trees, per CI platform, across
+                             the shipped binaries and the harness packages (or across the
+                             named packages)
   sour matrix                print the SOUR mode matrix
   sour run <selection> [--emit <file>]
                              run simulation tests under SOUR and compare world hashes;
                              <selection> is --pr, --nightly or --mode <name>…;
                              --emit writes the baseline hashes for `sour compare`
   sour compare <ref> <file>  compare two emitted hash files (architecture mode)
-  sour self-test             prove the SOUR runner on its stand-in simulation
+  sour self-test             prove the SOUR runner on its stand-in simulations
   help                       print this text
 
 Findings are printed as `path: message`. Exit status: 0 clean, 1 findings, 2 could not run.";
@@ -41,7 +46,11 @@ Findings are printed as `path: message`. Exit status: 0 clean, 1 findings, 2 cou
 /// The package that holds the stand-in tests of `sour self-test`: this one.
 const STAND_IN_PACKAGE: &str = env!("CARGO_PKG_NAME");
 /// The integration test target that holds them.
-const STAND_IN_TARGET: &str = "sour_stand_in";
+const STAND_IN_TARGET: &str = "harness_stand_in";
+/// The target directory of the self-test's nested build, inside the workspace's own. The
+/// nested build compiles this package again, and must not write over the binary that is
+/// running it (Windows refuses, and elsewhere it races).
+const SELF_TEST_TARGET_DIR: &str = "xtask-self-test";
 
 /// What a command produced: findings, or the reason it could not run.
 type Checked = Result<Vec<Finding>, String>;
@@ -75,7 +84,7 @@ impl Context {
         })
     }
 
-    fn sour_dirs(&self) -> Dirs {
+    fn harness_dirs(&self) -> Dirs {
         Dirs { root: self.root.clone(), out: self.target_dir.join("sour") }
     }
 
@@ -104,6 +113,21 @@ impl Context {
             Err(format!("`cargo nextest run` ended with {status}"))
         }
     }
+
+    /// The finding for a simulation that no harness package covers, and whether the harness
+    /// has nothing to run. With nothing to run and nothing to report, says so.
+    fn harness_coverage(&self) -> (Vec<Finding>, bool) {
+        let packages = &self.policy.harness_packages;
+        let findings = harness::unlisted_simulation(&self.workspace, packages);
+        if packages.is_empty() && findings.is_empty() {
+            eprintln!(
+                "sour: no harness packages are listed under [harness] in {POLICY_FILE} (no \
+                 simulation exists yet), so there is nothing to run or compare; \
+                 `cargo xtask sour self-test` proves the runner"
+            );
+        }
+        (findings, packages.is_empty())
+    }
 }
 
 fn read(path: &str) -> Result<String, String> {
@@ -125,9 +149,9 @@ fn main() -> ExitCode {
             print_matrix();
             return ExitCode::SUCCESS;
         }
-        ["sour", "run", ref rest @ ..] => ("sour", sour_run(rest)),
-        ["sour", "compare", reference, file] => ("sour", sour_compare(reference, file)),
-        ["sour", "self-test"] => ("sour", sour_self_test()),
+        ["sour", "run", ref rest @ ..] => ("sour", harness_run(rest)),
+        ["sour", "compare", reference, file] => ("sour", harness_compare(reference, file)),
+        ["sour", "self-test"] => ("sour", harness_self_test()),
         _ => ("xtask", Err(format!("unrecognised arguments `{}`\n\n{USAGE}", args.join(" ")))),
     };
     match checked {
@@ -162,45 +186,63 @@ fn check_boundary() -> Checked {
 
 fn check_features(args: &[&str]) -> Checked {
     let context = Context::load()?;
-    let mut roots: Vec<String> = Vec::new();
+    let mut named: Vec<String> = Vec::new();
     let mut rest = args;
     while let [first, ..] = rest {
         let ["--package", package, tail @ ..] = rest else {
             return Err(format!("unexpected `{first}`; expected `--package <name>`"));
         };
-        roots.push((*package).to_owned());
+        named.push((*package).to_owned());
         rest = tail;
     }
+    let policy = &context.policy;
+    let mut findings = Vec::new();
+    let roots = if named.is_empty() {
+        // The shipped binaries and the harness packages, each once.
+        findings.extend(features::unlisted_binaries(&context.workspace, &policy.feature_roots));
+        let mut roots = policy.feature_roots.clone();
+        let fresh = |p: &&String| !policy.feature_roots.contains(p);
+        roots.extend(policy.harness_packages.iter().filter(fresh).cloned());
+        roots
+    } else {
+        named
+    };
     if roots.is_empty() {
-        roots.clone_from(&context.policy.feature_roots);
+        if findings.is_empty() {
+            eprintln!(
+                "features: no packages are listed under [feature_roots] or [harness] in \
+                 {POLICY_FILE} (no shipped binary or harness package exists yet), so there is \
+                 nothing to compare"
+            );
+        }
+        return Ok(findings);
     }
-    if roots.is_empty() {
+    for triple in features::TRIPLES {
+        let mut trees = Vec::new();
+        for root in &roots {
+            let package = context
+                .workspace
+                .package(root)
+                .ok_or_else(|| format!("`{root}` is not a workspace package"))?;
+            // A harness package is built as tests, which compiles its dev-dependencies.
+            let dev = policy.harness_packages.contains(root);
+            let dump = features::dump(&context.cargo, &context.root, root, triple, dev)?;
+            let tree = features::boundary_tree(&dump, &|name| context.tiers.in_boundary(name))?;
+            trees.push((package.manifest(), tree));
+        }
+        let packages = trees.first().map_or(0, |(_, tree)| tree.len());
         eprintln!(
-            "features: [feature_roots] in {POLICY_FILE} lists no packages yet (no shipped binary \
-             or SOUR test crate exists), so there is nothing to compare"
+            "features: {triple}: compared {} roots; the first has {packages} package(s) in its \
+             boundary tree",
+            roots.len()
         );
-        return Ok(Vec::new());
+        findings.extend(features::compare(triple, &trees));
     }
-    let mut trees = Vec::new();
-    for root in &roots {
-        let package = context
-            .workspace
-            .package(root)
-            .ok_or_else(|| format!("`{root}` is not a workspace package"))?;
-        let dump = features::dump(&context.cargo, &context.root, root)?;
-        let tree = features::boundary_tree(&dump, &|name| context.tiers.in_boundary(name))?;
-        trees.push((package.manifest(), tree));
-    }
-    let packages = trees.first().map_or(0, |(_, tree)| tree.len());
-    eprintln!(
-        "features: compared {} roots; the first has {packages} package(s) in its boundary tree",
-        roots.len()
-    );
-    Ok(features::compare(&trees))
+    Ok(findings)
 }
 
 fn print_matrix() {
-    for mode in sour::matrix() {
+    for mode in harness::matrix() {
         println!("{}: {}", mode.name, mode.varies);
         for variant in &mode.variants {
             let vars: Vec<String> = variant
@@ -216,7 +258,7 @@ fn print_matrix() {
     }
 }
 
-fn sour_run(args: &[&str]) -> Checked {
+fn harness_run(args: &[&str]) -> Checked {
     let mut selection: Option<Selection> = None;
     let mut emit: Option<&str> = None;
     let mut rest = args;
@@ -257,52 +299,62 @@ fn sour_run(args: &[&str]) -> Checked {
         Some(file) => Some(std::path::absolute(file).map_err(|e| format!("{file}: {e}"))?),
         None => None,
     };
-    let matrix = sour::matrix();
-    let plans = sour::plan(&matrix, &selection)?;
+    let matrix = harness::matrix();
+    let plans = harness::plan(&matrix, &selection)?;
 
     let context = Context::load()?;
-    let packages = &context.policy.sour_packages;
-    let outcome = if packages.is_empty() {
-        eprintln!(
-            "sour: [sour] in {POLICY_FILE} lists no packages yet (no simulation exists), so \
-             there is nothing to run; `cargo xtask sour self-test` proves the runner"
-        );
-        sour::Outcome::default()
-    } else {
+    let (mut findings, nothing_to_run) = context.harness_coverage();
+    let mut baseline = harness::Hashes::new();
+    if !nothing_to_run {
+        let packages = &context.policy.harness_packages;
         let mut launch = |vars: &[(&'static str, String)]| context.nextest(packages, &[], vars);
-        let outcome = sour::run(&plans, &context.sour_dirs(), &mut launch);
+        let outcome = harness::run(&plans, &context.harness_dirs(), &mut launch);
         eprintln!("sour: {} mode(s), {} test run(s)", plans.len(), outcome.launches);
-        outcome
-    };
-    if let Some(file) = emit {
-        let hashes = outcome.baseline.clone().unwrap_or_default();
-        fs::write(&file, sour::emit(&hashes)).map_err(|e| format!("{}: {e}", file.display()))?;
-        eprintln!("sour: wrote {} baseline hash(es) to {}", hashes.len(), file.display());
+        findings.extend(outcome.findings);
+        baseline = outcome.baseline.unwrap_or_default();
     }
-    Ok(outcome.findings)
-}
-
-fn sour_compare(reference: &str, file: &str) -> Checked {
-    let (findings, records) =
-        sour::compare_files(reference, &read(reference)?, file, &read(file)?)?;
-    eprintln!("sour: compared {file} against {records} record(s) of {reference}");
+    if let Some(file) = emit {
+        fs::write(&file, harness::emit(&baseline))
+            .map_err(|e| format!("{}: {e}", file.display()))?;
+        eprintln!("sour: wrote {} baseline hash(es) to {}", baseline.len(), file.display());
+    }
     Ok(findings)
 }
 
-fn sour_self_test() -> Checked {
+fn harness_compare(reference: &str, file: &str) -> Checked {
+    // Read before the context moves the working directory. A platform whose file is
+    // missing fails here, whatever the files would have held.
+    let (reference_text, text) = (read(reference)?, read(file)?);
+    let context = Context::load()?;
+    let (mut findings, nothing_to_run) = context.harness_coverage();
+    if nothing_to_run {
+        // The files are still required to be hash files.
+        harness::compare_files(reference, &reference_text, file, &text)?;
+        return Ok(findings);
+    }
+    findings.extend(harness::compare_files(reference, &reference_text, file, &text)?);
+    eprintln!("sour: compared {file} against {reference}");
+    Ok(findings)
+}
+
+fn harness_self_test() -> Checked {
     let context = Context::load()?;
     let packages = [STAND_IN_PACKAGE.to_owned()];
+    let target_dir = context.target_dir.join(SELF_TEST_TARGET_DIR);
+    let target_dir = target_dir.to_string_lossy();
+    let mut launches = 0;
     let mut launch = |test: &str, vars: &[(&'static str, String)]| {
-        debug_assert!(test == stand_in::SOUND_TEST || test == stand_in::FLAWED_TEST);
+        launches += 1;
         let filter = format!("test(={test})");
-        context.nextest(&packages, &["--test", STAND_IN_TARGET, "-E", &filter], vars)
+        let extra = ["--target-dir", &*target_dir, "--test", STAND_IN_TARGET, "-E", &filter];
+        context.nextest(&packages, &extra, vars)
     };
-    let findings = sour::self_test(&context.sour_dirs(), &mut launch);
+    let findings = harness::self_test(&context.harness_dirs(), &mut launch);
     if findings.is_empty() {
         eprintln!(
-            "sour: the runner passed the sound stand-in in the pull-request modes and reported \
-             the order-dependent one at tick {}",
-            stand_in::FLAW_STARTS_AT
+            "sour: over {launches} nextest runs the runner passed the sound stand-in in every \
+             mode and reported each of the {} flawed ones in the mode that exists to catch it",
+            stand_in::STAND_INS.len() - 1
         );
     }
     Ok(findings)

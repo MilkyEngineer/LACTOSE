@@ -1,11 +1,24 @@
-# The single statement of which crate may depend on which. CI enforces it.
-# Foundation crates may be depended on by any crate.
-# Backend crates may be named only by leaf crates, by their own tests, and by the exceptions below.
-# Leaf crates (binaries and tools) may depend on anything, subject to [server_denylist].
-# Game crates may depend on foundation crates only.
-# A crate missing from every section fails the tier check.
+# The single statement of which crate may depend on which. CI enforces it (`cargo xtask tiers`
+# and `cargo xtask boundary`).
+#
+# Every crate is in exactly one of [foundation], [backend], [assembly], [leaf] and [game]; a
+# crate missing from all of them fails the tier check. Dev-dependencies obey the same rules as
+# normal and build dependencies, with the two concessions named below.
+#
+# Foundation crates may be depended on by any crate, and depend on foundation crates only.
+# Backend crates may be named only by assembly crates, by leaf crates and by [exceptions].
+#   They may not depend on game, assembly or leaf crates.
+# Assembly crates put a runtime together: they may depend on foundation, backend and game
+#   crates. Only leaf crates may depend on an assembly crate.
+# Leaf crates (binaries and tools) may depend on anything, subject to [server_denylist]. Only
+#   leaf crates may depend on a leaf crate.
+# Game crates may depend on foundation crates and on other game crates.
+# Dev-dependency concessions: a crate may dev-depend on itself, and any crate may dev-depend
+#   on a [test_support] crate.
 # Build scripts and proc macros may not depend on boundary crates (they compile for the host
 # without the pinned target features).
+# Every dependency that is a path dependency must be a workspace member, and a dependency
+# whose name appears in this file is held to these rules wherever it comes from.
 
 [foundation]
 crates = [
@@ -24,8 +37,10 @@ crates = [
   "lactose-rhi-vulkan", "lactose-rhi-metal", "lactose-rhi-null", "lactose-rhi-dx12",
   "lactose-render-graph", "lactose-renderer", "lactose-presentation", "lactose-terrain",
   "lactose-audio", "lactose-ui", "lactose-nav", "lactose-platform", "lactose-debug-ui",
-  "lactose-app",
 ]
+
+[assembly]
+crates = ["lactose-app"]
 
 [leaf]
 crates = [
@@ -36,8 +51,13 @@ crates = [
 [game]
 crates = ["game-sim", "game-present", "game-ai", "game-content"]
 
+[test_support]
+# Crates any crate may name as a dev-dependency, whatever its tier. Each is also in a tier
+# section, whose rules govern its normal and build edges.
+crates = ["lactose-rhi-null"]
+
 [boundary]
-# Crates inside the determinism boundary. clippy.toml and cargo-deny allowlists apply here.
+# Crates inside the determinism boundary. clippy.toml and the allowlists below apply here.
 crates = [
   "lactose-core", "lactose-math", "lactose-ecs", "lactose-sim", "lactose-anim",
   "lactose-predict", "lactose-nav-query", "lactose-physics-api", "lactose-physics-rapier",
@@ -56,6 +76,8 @@ crates = [
 # presentation -> net-api (interpolation buffer), audio -> present-api (listener requests),
 # persist -> bundle, asset -> bundle, cook -> bundle.
 
+# Backend-to-backend edges only: both the crate named and the crates it may depend on are
+# backend crates.
 [exceptions]
 "lactose-renderer"     = { may_depend_on = ["lactose-render-graph"], reason = "passes are the renderer's output" }
 "lactose-presentation" = { may_depend_on = ["lactose-renderer"], reason = "pose evaluation and remote transform upload feed the renderer" }
@@ -63,3 +85,40 @@ crates = [
 "lactose-terrain"      = { may_depend_on = ["lactose-renderer"], reason = "clipmap passes through RenderFeature" }
 "lactose-ui"           = { may_depend_on = ["lactose-renderer", "lactose-render-graph"], reason = "UI pass through RenderFeature" }
 "lactose-persist"      = { may_depend_on = ["lactose-asset"], reason = "overlay diffing needs the loaded cooked baseline" }
+
+# The dependency allowlist of the determinism boundary (architecture section 8.2), enforced by
+# `cargo xtask boundary`. A boundary crate may always depend on another boundary crate, subject
+# to the tier rules above. Its normal and build dependencies on anything else must be named
+# here. Dev-dependencies on workspace crates are left to the tier rules.
+
+# Non-boundary foundation crates a boundary crate may depend on. Section 8.2 names the first
+# four for any boundary crate ("only for types and for operations that are deterministic by
+# construction") and `task` for `ecs` alone ("for execution only"). The two proc-macro crates
+# run on the host at compile time and the code they emit lands in the invoking crate.
+[boundary_internal]
+any = [
+  "lactose-reflect", "lactose-asset-api", "lactose-input", "lactose-present-api",
+  "lactose-reflect-macros",
+]
+
+[boundary_internal.only]
+"lactose-ecs" = ["lactose-task", "lactose-ecs-macros"]
+
+# Third-party crates. `direct` says which of them each boundary crate may name: `normal` as a
+# normal, build or dev dependency, `dev` as a dev-dependency only. Every third-party crate that
+# a boundary crate ends up compiling through normal and build edges, at any depth and through
+# any workspace crate, must be on some crate's `normal` list or on `transitive`.
+#
+# Adding a name is a determinism review: the crate must do no floating-point work of its own
+# and select no code path by CPU feature (`libm` is the one exception section 8.2 names).
+[boundary_third_party]
+transitive = [
+  # bytemuck's derive macros and what they are built from; host code.
+  "bytemuck_derive", "proc-macro2", "quote", "syn", "unicode-ident",
+  # windows-sys's link shim.
+  "windows-link",
+]
+
+[boundary_third_party.direct]
+"lactose-core" = { normal = ["bytemuck", "libc", "windows-sys"], dev = ["xxhash-rust"] }
+"lactose-math" = { normal = ["bytemuck", "libm"] }

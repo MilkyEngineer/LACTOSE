@@ -2,7 +2,8 @@
 #
 # cargo-deny carries the workspace-wide dependency rules. Two rules of section 8.2 that it
 # cannot express are enforced by `cargo xtask boundary` instead: the dependency allowlist per
-# boundary crate (tools/xtask/ci-policy.toml) and the ban on RUSTFLAGS and target-cpu=native.
+# boundary crate (the boundary tables of crate-tiers.toml) and the ban on RUSTFLAGS and on any
+# target CPU or target feature other than the x86-64-v3 pin.
 
 [graph]
 # Every platform CI builds for, so a platform-specific dependency is checked from any machine.

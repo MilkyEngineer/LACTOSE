@@ -1,18 +1,15 @@
-//! `tools/xtask/ci-policy.toml`: the data the checks hold beyond `crate-tiers.toml`.
+//! `tools/xtask/ci-policy.toml`: the data the checks hold that is not a dependency rule.
 //!
 //! The file's own comments say what each table means and which architecture section it
 //! transcribes.
-
-use std::collections::BTreeMap;
 
 use serde::Deserialize;
 
 use crate::POLICY_FILE;
 
-/// A list of crate or package names.
 #[derive(Deserialize, Clone, PartialEq, Eq, Debug, Default)]
 #[serde(deny_unknown_fields)]
-struct Names {
+struct Crates {
     crates: Vec<String>,
 }
 
@@ -22,38 +19,13 @@ struct Packages {
     packages: Vec<String>,
 }
 
-/// The non-boundary workspace crates a boundary crate may depend on.
-#[derive(Deserialize, Clone, PartialEq, Eq, Debug, Default)]
-#[serde(deny_unknown_fields)]
-pub struct InternalAllowlist {
-    /// Permitted for every boundary crate.
-    pub any: Vec<String>,
-    /// Permitted for the named boundary crate alone.
-    #[serde(default)]
-    pub only: BTreeMap<String, Vec<String>>,
-}
-
-/// The third-party crates one boundary crate may depend on.
-#[derive(Deserialize, Clone, PartialEq, Eq, Debug, Default)]
-#[serde(deny_unknown_fields)]
-pub struct ThirdPartyAllowlist {
-    /// Permitted as a normal, build or dev dependency.
-    #[serde(default)]
-    pub normal: Vec<String>,
-    /// Permitted as a dev-dependency only.
-    #[serde(default)]
-    pub dev: Vec<String>,
-}
-
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawPolicy {
-    unsafe_crates: Names,
-    boundary_internal: InternalAllowlist,
-    #[serde(default)]
-    boundary_third_party: BTreeMap<String, ThirdPartyAllowlist>,
+    unsafe_crates: Crates,
+    lint_file_carriers: Crates,
     feature_roots: Packages,
-    sour: Packages,
+    harness: Packages,
 }
 
 /// The parsed policy file.
@@ -61,14 +33,12 @@ struct RawPolicy {
 pub struct Policy {
     /// The crates that may contain `unsafe` (architecture section 21).
     pub unsafe_crates: Vec<String>,
-    /// The boundary allowlist for workspace crates (architecture section 8.2).
-    pub boundary_internal: InternalAllowlist,
-    /// The boundary allowlist for third-party crates, keyed by boundary crate.
-    pub boundary_third_party: BTreeMap<String, ThirdPartyAllowlist>,
-    /// The packages whose boundary feature trees must match (architecture section 8.3).
+    /// The crates outside the boundary that carry the boundary lint file.
+    pub lint_file_carriers: Vec<String>,
+    /// The shipped binaries, whose boundary feature trees must match (section 8.3).
     pub feature_roots: Vec<String>,
-    /// The packages whose tests run under SOUR.
-    pub sour_packages: Vec<String>,
+    /// The packages whose tests run under the determinism harness.
+    pub harness_packages: Vec<String>,
 }
 
 impl Policy {
@@ -80,10 +50,9 @@ impl Policy {
         let raw: RawPolicy = toml::from_str(text).map_err(|e| format!("{POLICY_FILE}: {e}"))?;
         Ok(Self {
             unsafe_crates: raw.unsafe_crates.crates,
-            boundary_internal: raw.boundary_internal,
-            boundary_third_party: raw.boundary_third_party,
+            lint_file_carriers: raw.lint_file_carriers.crates,
             feature_roots: raw.feature_roots.packages,
-            sour_packages: raw.sour.packages,
+            harness_packages: raw.harness.packages,
         })
     }
 }
@@ -97,8 +66,7 @@ mod tests {
         let policy = Policy::parse(include_str!("../ci-policy.toml")).unwrap();
         // Architecture section 21 lists nine crates.
         assert_eq!(policy.unsafe_crates.len(), 9);
-        assert!(policy.boundary_internal.only["lactose-ecs"].contains(&"lactose-task".to_owned()));
-        assert_eq!(policy.boundary_third_party["lactose-math"].normal, ["libm"]);
+        assert_eq!(policy.lint_file_carriers, ["lactose-reflect-macros", "lactose-ecs-macros"]);
     }
 
     #[test]

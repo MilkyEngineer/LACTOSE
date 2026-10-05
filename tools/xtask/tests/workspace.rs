@@ -63,7 +63,7 @@ fn the_feature_check_passes_with_no_roots_and_reads_real_trees() {
 }
 
 #[test]
-fn the_sour_matrix_prints_every_mode() {
+fn the_mode_matrix_prints_every_mode() {
     let output = xtask(&["sour", "matrix"]);
     assert!(output.status.success(), "{}", text(&output));
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -80,4 +80,28 @@ fn a_bad_command_line_is_a_usage_error() {
         assert_eq!(xtask(args).status.code(), Some(2), "{args:?}");
     }
     assert!(xtask(&["help"]).status.success());
+}
+
+fn repository_file(path: &str) -> String {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    std::fs::read_to_string(root.join(path)).expect(path)
+}
+
+#[test]
+fn every_cargo_command_ci_runs_is_locked() {
+    // Review item 20. `cargo fmt` reads no lock file; `cargo xtask` is locked by its alias.
+    let alias = repository_file(".cargo/config.toml");
+    assert!(alias.contains("xtask = \"run --quiet --locked -p lactose-xtask --\""), "{alias}");
+    for workflow in [".github/workflows/ci.yml", ".github/workflows/nightly.yml"] {
+        let text = repository_file(workflow);
+        assert!(text.contains("\npermissions:\n  contents: read\n"), "{workflow}");
+        let commands = text
+            .lines()
+            .map(|line| line.trim().trim_start_matches("# ").trim_start_matches("- "))
+            .filter_map(|line| line.strip_prefix("run: cargo "));
+        for command in commands {
+            let exempt = command.starts_with("fmt ") || command.starts_with("xtask ");
+            assert!(exempt || command.contains("--locked"), "{workflow}: cargo {command}");
+        }
+    }
 }

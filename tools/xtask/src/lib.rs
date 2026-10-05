@@ -11,9 +11,10 @@
 
 pub mod boundary;
 pub mod features;
+pub mod harness;
 pub mod policy;
 pub mod repo;
-pub mod sour;
+mod rust_source;
 pub mod tiers;
 pub mod workspace;
 
@@ -41,8 +42,8 @@ impl fmt::Display for Finding {
     }
 }
 
-/// The repository-relative path of the tier file.
+/// The repository-relative path of the tier file, which holds every dependency rule.
 pub const TIER_FILE: &str = "crate-tiers.toml";
 
-/// The repository-relative path of the data the checks in this crate hold beyond the tier file.
+/// The repository-relative path of the data the checks hold that is not a dependency rule.
 pub const POLICY_FILE: &str = "tools/xtask/ci-policy.toml";

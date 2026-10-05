@@ -5,6 +5,9 @@ on:
     - cron: "0 3 * * *"
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   # A dated nightly, so Miri breaks only when this line changes.
@@ -75,7 +78,10 @@ jobs:
         run: cargo xtask sour self-test
       - name: Every mode
         run: cargo xtask sour run --nightly --emit sour-hashes-${{ matrix.platform }}.tsv
+      # Uploaded whenever the run got far enough to write them, findings or not, so the
+      # comparison below sees every platform that produced a file.
       - name: Keep the baseline hashes
+        if: ${{ !cancelled() }}
         uses: actions/upload-artifact@v4
         with:
           name: sour-hashes-${{ matrix.platform }}
@@ -90,9 +96,13 @@ jobs:
           path: target/sour
           if-no-files-found: ignore
 
+  # Architecture mode: the baseline hashes of every platform must be identical. It runs
+  # whatever the platform jobs concluded, and a platform that produced no file fails the
+  # step that needs it, so a platform cannot drop out of the comparison quietly.
   sour-architecture:
     name: sour (architecture)
     needs: sour
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -106,9 +116,10 @@ jobs:
       - name: Build the CI driver
         run: cargo build --locked -p lactose-xtask
       - name: linux-x64 against windows-x64
+        if: ${{ !cancelled() }}
         run: cargo xtask sour compare sour-hashes-linux-x64.tsv sour-hashes-windows-x64.tsv
       - name: linux-x64 against macos-arm64
-        if: success() || failure()
+        if: ${{ !cancelled() }}
         run: cargo xtask sour compare sour-hashes-linux-x64.tsv sour-hashes-macos-arm64.tsv
 
   # docs/verification.md section 1, the milestone 0 spike "io_uring on CI runners": records
