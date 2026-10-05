@@ -1,0 +1,15 @@
+[package]
+name = "lactose-bundle"
+description = "Region bundle format: cooked identity, baseline rows, overlay records and their canonical encoding."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+# Types only (architecture section 8.2): `AssetId` and `AssetSet`.
+lactose-asset-api.workspace = true
+lactose-core.workspace = true
+
+[lints]
+workspace = true

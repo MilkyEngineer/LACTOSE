@@ -20,6 +20,7 @@ The vocabulary every other crate shares.
 | `alloc` | `TaggedAlloc`, `AllocTag` and `TagScope`: live memory accounted per subsystem |
 | `error` | `Error`, `ErrorKind` and `Result` (architecture section 19) |
 | `thread_class` | `ThreadClass::enter` and `fp`: scheduling class and floating-point state for any thread |
+| `typed_plain_data!` | declares a plain-data newtype with a compile-time-only type parameter, so a crate that forbids `unsafe` can define a typed reference field such as `AssetRef<T>` |
 
 ## Rules a caller should know
 

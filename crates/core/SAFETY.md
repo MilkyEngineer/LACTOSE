@@ -33,6 +33,18 @@ comments rely on. The crate's tests run under Miri.
 - `EntityRef` is four `u32` words. Every bit pattern is memory-valid; `CheckedBitPattern`
   only narrows to canonical encodings, and `EntityRef::get` treats anything else as empty.
 
+## `typed_plain_data!`
+
+- The macro expands to `unsafe impl`s of `Zeroable` and `Pod` in the calling crate, which may
+  forbid `unsafe` itself; this file and the comments in `typed.rs` are their justification.
+- The macro writes the struct as well as the impls: `repr(transparent)` over the named inner
+  type plus a `PhantomData<fn() -> T>`. A caller cannot add a field, change the
+  representation or supply the impls for a struct of its own, so the layout argument holds
+  for every expansion.
+- The impls are bounded on the inner type being `Zeroable` and `Pod`. The marker is zero-sized
+  with alignment one and owns no `T`, so the struct has the inner type's size, alignment and
+  bit validity for every `T: 'static`.
+
 ## `thread_class::fp`
 
 - The inline assembly reads or writes MXCSR (x86-64) or FPCR (aarch64) and nothing else.
