@@ -6,8 +6,8 @@ use std::sync::Arc;
 
 use lactose_core::ErrorKind;
 
-use crate::id::{Asset, AssetId, AssetKind, AssetRef};
-use crate::store::{AssetFailure, AssetStore, Readiness};
+use crate::id::{Asset, AssetId, AssetKind, AssetRef, SimulationAsset};
+use crate::store::{AssetFailure, PublishedAssets, Readiness};
 use crate::version::{AssetVersion, VersionTable};
 
 /// A loaded asset: shared ownership of one published `(AssetId, AssetVersion)`.
@@ -55,12 +55,12 @@ impl<T> Deref for AssetHandle<T> {
 
 impl<T> core::fmt::Debug for AssetHandle<T> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(f, "AssetHandle({:#018x} v{})", self.id.to_bits(), self.version.0)
+        write!(f, "AssetHandle({:#018x} at {:#018x})", self.id.to_bits(), self.version.to_bits())
     }
 }
 
 /// An [`AssetHandle`] whose asset type is known only at run time. This is what crosses the
-/// `dyn` [`AssetStore`]; it keeps its version alive exactly as the typed handle does.
+/// `dyn` store traits; it keeps its version alive exactly as the typed handle does.
 #[derive(Clone)]
 pub struct UntypedHandle {
     id: AssetId,
@@ -111,7 +111,7 @@ impl UntypedHandle {
 
 impl core::fmt::Debug for UntypedHandle {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(f, "UntypedHandle({:#018x} v{})", self.id.to_bits(), self.version.0)
+        write!(f, "UntypedHandle({:#018x} at {:#018x})", self.id.to_bits(), self.version.to_bits())
     }
 }
 
@@ -125,6 +125,9 @@ fn wrong_kind(id: AssetId, version: AssetVersion) -> AssetFailure {
 /// lookup borrows from the table, names no version, touches no store and no atomic, and
 /// keeps giving the same answer whatever is published meanwhile. A region owns one as a
 /// region resource and replaces it only at the input sync point.
+///
+/// The table holds every asset the region declares, which keeps them all alive, but only
+/// a [`SimulationAsset`] can be read out of it.
 #[derive(Clone, Debug)]
 pub struct PinnedTable {
     table: VersionTable,
@@ -137,7 +140,7 @@ impl PinnedTable {
     ///
     /// The answer is `Failed` with the failure of the lowest failed [`AssetId`], otherwise
     /// `Pending` if any entry is not published yet, otherwise `Ready`.
-    pub fn pin(store: &dyn AssetStore, table: &VersionTable) -> Readiness<Self> {
+    pub fn pin(store: &dyn PublishedAssets, table: &VersionTable) -> Readiness<Self> {
         let mut assets = Vec::with_capacity(table.len());
         let mut pending = false;
         for (id, version) in table.iter() {
@@ -165,7 +168,7 @@ impl PinnedTable {
     /// Fails with `ErrorKind::NotFound` if the reference is empty or names an asset outside
     /// the table (the region's asset set does not declare it), and with
     /// `ErrorKind::InvalidData` if the asset is not of kind `T`.
-    pub fn get<T: Asset>(&self, reference: AssetRef<T>) -> Result<&T, AssetFailure> {
+    pub fn get<T: SimulationAsset>(&self, reference: AssetRef<T>) -> Result<&T, AssetFailure> {
         let id = reference.id();
         match self.assets.binary_search_by_key(&id, UntypedHandle::id) {
             Ok(index) => self.assets[index].downcast_ref(),
@@ -195,19 +198,17 @@ mod tests {
     #[test]
     fn untyped_handle_downcasts_only_to_its_kind() {
         let id = AssetId::from_bits(5);
-        let untyped = UntypedHandle::new(id, AssetVersion(2), Text("hello".into()));
-        assert_eq!(
-            (untyped.id(), untyped.version(), untyped.kind()),
-            (id, AssetVersion(2), Text::KIND)
-        );
+        let version = AssetVersion::from_bits(2).unwrap();
+        let untyped = UntypedHandle::new(id, version, Text("hello".into()));
+        assert_eq!((untyped.id(), untyped.version(), untyped.kind()), (id, version, Text::KIND));
         let typed = untyped.clone().downcast::<Text>().unwrap();
         assert_eq!(typed.0, "hello");
-        assert_eq!((typed.id(), typed.version()), (id, AssetVersion(2)));
+        assert_eq!((typed.id(), typed.version()), (id, version));
         assert_eq!(typed.clone().0, "hello");
         let failure = untyped.downcast::<Other>().unwrap_err();
         assert_eq!(
             failure,
-            AssetFailure { id, version: Some(AssetVersion(2)), kind: ErrorKind::InvalidData }
+            AssetFailure { id, version: Some(version), kind: ErrorKind::InvalidData }
         );
     }
 

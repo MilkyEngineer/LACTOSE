@@ -7,8 +7,9 @@ rust-version.workspace = true
 publish.workspace = true
 
 [features]
-# The conformance suite every `AssetStore` must pass, and the in-memory reference store the
-# suite is tested against. A backend enables it from its dev-dependencies only.
+# The conformance suite every store must pass, and the in-memory reference store the suite
+# is tested against. For `[dev-dependencies]` only: no normal or build dependency edge in
+# the workspace may enable it, so nothing that ships can name `ReferenceStore`.
 conformance = []
 
 [dependencies]

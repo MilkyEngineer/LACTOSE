@@ -1,12 +1,12 @@
 //! The byte-level rules both documents share.
 //!
 //! A document is a 4-byte magic, a `u16` format version, a zero `u16`, the body, and the
-//! xxh64 of every preceding byte. All integers are little-endian and every length is a
+//! xxh64 of every preceding byte. All integers are little-endian and every count is a
 //! `u32`. Nothing depends on the host's layout, word size or byte order.
 
 use lactose_core::{ComponentKey, Error, ErrorKind, NetId, Result, xxh64};
 
-use crate::MAX_COMPONENT_BYTES;
+use crate::MAX_DOCUMENT_BYTES;
 
 /// The format version this build writes and reads, for both documents.
 const FORMAT_VERSION: u16 = 1;
@@ -15,6 +15,10 @@ const TRAILER_LEN: usize = 8;
 
 pub(crate) fn invalid(message: &'static str) -> Error {
     Error::new(ErrorKind::InvalidData, message)
+}
+
+fn too_large() -> Error {
+    Error::new(ErrorKind::ResourceExhausted, "document is larger than MAX_DOCUMENT_BYTES")
 }
 
 /// Fails unless `items` is strictly ascending, which also means free of duplicates.
@@ -33,20 +37,15 @@ pub(crate) fn strictly_ascending<T: Ord>(
     Ok(())
 }
 
-pub(crate) fn check_component_len(len: usize) -> Result<()> {
-    if len > MAX_COMPONENT_BYTES as usize {
-        return Err(invalid("component data is larger than MAX_COMPONENT_BYTES"));
-    }
-    Ok(())
-}
-
 pub(crate) struct Writer {
     bytes: Vec<u8>,
+    /// A count did not fit a `u32`; the document is over the size limit by far.
+    overflowed: bool,
 }
 
 impl Writer {
     pub(crate) fn new(magic: [u8; 4]) -> Self {
-        let mut writer = Self { bytes: Vec::new() };
+        let mut writer = Self { bytes: Vec::new(), overflowed: false };
         writer.bytes(&magic);
         writer.u16(FORMAT_VERSION);
         writer.u16(0);
@@ -73,35 +72,39 @@ impl Writer {
         self.bytes.extend_from_slice(bytes);
     }
 
-    /// Writes a count or a length.
-    ///
-    /// # Panics
-    ///
-    /// Panics if it does not fit a `u32`. Component data is capped far below that, so only
-    /// a document of more than four thousand million rows or records gets here.
-    pub(crate) fn len(&mut self, len: usize) {
-        self.u32(u32::try_from(len).expect("a bundle document holds at most u32::MAX items"));
+    /// Writes a count.
+    pub(crate) fn count(&mut self, count: usize) {
+        self.overflowed |= u32::try_from(count).is_err();
+        self.u32(count as u32);
     }
 
-    /// Seals the document with its hash and returns the bytes with that hash.
-    pub(crate) fn finish(mut self) -> (Vec<u8>, u64) {
+    /// Seals the document with its hash and returns the bytes with that hash. Fails with
+    /// `ErrorKind::ResourceExhausted` if the document is larger than
+    /// [`MAX_DOCUMENT_BYTES`], which no decoder would accept.
+    pub(crate) fn finish(mut self) -> Result<(Vec<u8>, u64)> {
+        if self.overflowed || self.bytes.len() + TRAILER_LEN > MAX_DOCUMENT_BYTES {
+            return Err(too_large());
+        }
         let hash = xxh64(&self.bytes, 0);
         self.u64(hash);
-        (self.bytes, hash)
+        Ok((self.bytes, hash))
     }
 }
 
 /// A cursor over the body of an untrusted document. Every read is bounds-checked, and
 /// [`Reader::count`] refuses a count the remaining bytes cannot hold, so nothing is
-/// allocated or looped over on the word of a length field alone.
+/// allocated or looped over on the word of a count alone.
 pub(crate) struct Reader<'a> {
     rest: &'a [u8],
 }
 
 impl<'a> Reader<'a> {
-    /// Checks the magic, the format version and the trailing hash, and returns a reader
-    /// over the body.
-    pub(crate) fn open(bytes: &'a [u8], magic: [u8; 4]) -> Result<Self> {
+    /// Checks the size limit, the magic, the format version and the trailing hash, and
+    /// returns a reader over the body together with that hash.
+    pub(crate) fn open(bytes: &'a [u8], magic: [u8; 4]) -> Result<(Self, u64)> {
+        if bytes.len() > MAX_DOCUMENT_BYTES {
+            return Err(too_large());
+        }
         if bytes.len() < HEADER_LEN + TRAILER_LEN {
             return Err(invalid("document is shorter than its header and hash"));
         }
@@ -120,11 +123,11 @@ impl<'a> Reader<'a> {
         if header.u16()? != 0 {
             return Err(invalid("reserved header bytes are not zero"));
         }
-        let recorded = u64::from_le_bytes(trailer.try_into().expect("split off eight bytes"));
-        if recorded != xxh64(sealed, 0) {
+        let hash = u64::from_le_bytes(trailer.try_into().expect("split off eight bytes"));
+        if hash != xxh64(sealed, 0) {
             return Err(invalid("document hash does not match its contents"));
         }
-        Ok(Self { rest: &sealed[HEADER_LEN..] })
+        Ok((Self { rest: &sealed[HEADER_LEN..] }, hash))
     }
 
     pub(crate) fn take(&mut self, len: usize) -> Result<&'a [u8]> {
@@ -171,13 +174,6 @@ impl<'a> Reader<'a> {
             Some(len) if len <= self.rest.len() => Ok(count),
             _ => Err(invalid("a count exceeds the bytes that follow it")),
         }
-    }
-
-    /// Reads a component data length and the data.
-    pub(crate) fn component_bytes(&mut self) -> Result<&'a [u8]> {
-        let len = self.u32()? as usize;
-        check_component_len(len)?;
-        self.take(len)
     }
 
     pub(crate) fn finish(self) -> Result<()> {

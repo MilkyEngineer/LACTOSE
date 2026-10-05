@@ -2,7 +2,7 @@
 //! [`Processor`] on the cook side, [`Loader`] on the runtime side, and the cooked record
 //! that travels between them.
 
-use lactose_core::{Error, ErrorKind, Result};
+use lactose_core::{Error, ErrorKind, Result, xxh64};
 
 use crate::handle::UntypedHandle;
 use crate::id::{Asset, AssetId, AssetKind};
@@ -53,6 +53,27 @@ impl CookedHeader {
     pub fn dependencies(&self) -> &[AssetId] {
         &self.dependencies
     }
+
+    /// The [`AssetVersion`] of this header together with the decompressed cooked `bytes`.
+    ///
+    /// It is the xxh64, seed zero, of the following, all little-endian: the kind as `u64`,
+    /// the format version as `u32`, the dependency count as `u32`, each dependency as
+    /// `u64` in ascending order, and the xxh64, seed zero, of `bytes` as `u64`. A result
+    /// of zero is replaced by one. Hashing the bytes separately means the payload is never
+    /// copied to be hashed.
+    #[must_use]
+    pub fn version_of(&self, bytes: &[u8]) -> AssetVersion {
+        let mut hashed = Vec::with_capacity(24 + 8 * self.dependencies.len());
+        hashed.extend_from_slice(&self.kind.0.to_le_bytes());
+        hashed.extend_from_slice(&self.format_version.to_le_bytes());
+        let count = u32::try_from(self.dependencies.len()).expect("fewer than 2^32 dependencies");
+        hashed.extend_from_slice(&count.to_le_bytes());
+        for dependency in &self.dependencies {
+            hashed.extend_from_slice(&dependency.to_bits().to_le_bytes());
+        }
+        hashed.extend_from_slice(&xxh64(bytes, 0).to_le_bytes());
+        AssetVersion::from_hash(xxh64(&hashed, 0))
+    }
 }
 
 /// The output of a [`Processor`]: cooked bytes and their header.
@@ -70,13 +91,18 @@ impl CookedAsset {
     pub fn new<T: Asset>(bytes: Vec<u8>, dependencies: impl IntoIterator<Item = AssetId>) -> Self {
         Self { header: CookedHeader::new(T::KIND, T::FORMAT_VERSION, dependencies), bytes }
     }
+
+    /// The version this content is published under: [`CookedHeader::version_of`].
+    #[must_use]
+    pub fn version(&self) -> AssetVersion {
+        self.header.version_of(&self.bytes)
+    }
 }
 
 /// Turns source data into cooked bytes. The cook-side counterpart of [`Loader`].
 ///
 /// A processor is a pure function of its input: the same source yields the same
-/// [`CookedAsset`] on every host, which is what lets the cooker assign an
-/// [`AssetVersion`] by comparing outputs.
+/// [`CookedAsset`], and so the same [`AssetVersion`], on every host and in every cook.
 pub trait Processor: Send + Sync + 'static {
     /// The asset kind this processor cooks.
     type Asset: Asset;
@@ -102,6 +128,9 @@ pub trait Processor: Send + Sync + 'static {
 ///
 /// `bytes` are always decompressed: the store asks `io` for a read-with-decompress, so no
 /// loader names a compression format (`docs/verification.md` section 3).
+///
+/// The loader of a [`SimulationAsset`](crate::SimulationAsset) carries a further
+/// obligation, stated on that trait.
 pub trait Loader: Send + Sync + 'static {
     /// The asset kind this loader produces.
     type Asset: Asset;
@@ -141,11 +170,13 @@ impl ErasedLoader {
         self.kind
     }
 
-    /// Loads the cooked bytes of `(id, version)`.
+    /// Verifies and loads the cooked bytes a store read for `(id, version)`.
     ///
-    /// Fails with `ErrorKind::InvalidData` if `header` is of another kind, with
-    /// `ErrorKind::VersionMismatch` if it is of another cooked format, and otherwise with
-    /// whatever the loader returns. The handle is not visible to readers until the store
+    /// Fails with `ErrorKind::InvalidData` if `header` and `bytes` do not hash to
+    /// `version` or if `header` is of another kind, with `ErrorKind::VersionMismatch` if
+    /// it is of another cooked format, and otherwise with whatever the loader returns. A
+    /// store that loads through this method therefore never publishes content under a
+    /// version it does not have. The handle is not visible to readers until the store
     /// publishes it.
     pub fn load(
         &self,
@@ -154,6 +185,12 @@ impl ErasedLoader {
         header: &CookedHeader,
         bytes: &[u8],
     ) -> Result<UntypedHandle> {
+        if header.version_of(bytes) != version {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                "cooked content does not hash to its version",
+            ));
+        }
         if header.kind != self.kind {
             return Err(Error::new(ErrorKind::InvalidData, "cooked asset is of another kind"));
         }
@@ -187,7 +224,7 @@ mod tests {
     struct Text(String, usize);
 
     impl Asset for Text {
-        const KIND: AssetKind = AssetKind::from_name("test.text");
+        const KIND: AssetKind = AssetKind(0x0102_0304_0506_0708);
         const FORMAT_VERSION: u32 = 3;
     }
 
@@ -214,7 +251,6 @@ mod tests {
     }
 
     const ID: AssetId = AssetId::from_bits(1);
-    const VERSION: AssetVersion = AssetVersion(1);
 
     #[test]
     fn header_normalises_dependencies() {
@@ -224,26 +260,65 @@ mod tests {
         assert_eq!((header.kind(), header.format_version()), (Text::KIND, 3));
     }
 
+    /// Golden value and the documented byte layout. If this changes, every published
+    /// version, every version table and every journal that names one has changed.
+    #[test]
+    fn version_is_the_documented_hash() {
+        let id = AssetId::from_bits;
+        let cooked = CookedAsset::new::<Text>(b"hello".to_vec(), [id(9), id(2)]);
+        let mut hashed = vec![8, 7, 6, 5, 4, 3, 2, 1, 3, 0, 0, 0, 2, 0, 0, 0];
+        hashed.extend_from_slice(&[2, 0, 0, 0, 0, 0, 0, 0, 9, 0, 0, 0, 0, 0, 0, 0]);
+        hashed.extend_from_slice(&xxh64(b"hello", 0).to_le_bytes());
+        assert_eq!(cooked.version().to_bits(), xxh64(&hashed, 0));
+        assert_eq!(cooked.version().to_bits(), 0x646f_63d0_bee7_f0f6);
+        assert_eq!(cooked.version(), cooked.header.version_of(&cooked.bytes));
+    }
+
+    #[test]
+    fn version_follows_every_part_of_the_content() {
+        let id = AssetId::from_bits;
+        let version = |kind, format, dependencies: &[AssetId], bytes: &[u8]| {
+            CookedHeader::new(kind, format, dependencies.iter().copied()).version_of(bytes)
+        };
+        let base = version(Text::KIND, 3, &[id(2)], b"hello");
+        assert_eq!(base, version(Text::KIND, 3, &[id(2), id(2)], b"hello"));
+        assert_ne!(base, version(AssetKind(1), 3, &[id(2)], b"hello"));
+        assert_ne!(base, version(Text::KIND, 4, &[id(2)], b"hello"));
+        assert_ne!(base, version(Text::KIND, 3, &[id(3)], b"hello"));
+        assert_ne!(base, version(Text::KIND, 3, &[], b"hello"));
+        assert_ne!(base, version(Text::KIND, 3, &[id(2)], b"hellp"));
+    }
+
     #[test]
     fn processor_output_loads_through_the_erased_loader() {
         let cooked = UpperCase.process(b"hello").unwrap();
+        let version = cooked.version();
         let loader = ErasedLoader::new(TextLoader);
         assert_eq!(loader.kind(), Text::KIND);
-        let handle = loader.load(ID, VERSION, &cooked.header, &cooked.bytes).unwrap();
-        assert_eq!((handle.id(), handle.version(), handle.kind()), (ID, VERSION, Text::KIND));
+        let handle = loader.load(ID, version, &cooked.header, &cooked.bytes).unwrap();
+        assert_eq!((handle.id(), handle.version(), handle.kind()), (ID, version, Text::KIND));
         assert_eq!(*handle.downcast::<Text>().unwrap(), Text("HELLO".into(), 1));
     }
 
     #[test]
-    fn erased_loader_rejects_other_kinds_formats_and_bad_bytes() {
+    fn erased_loader_rejects_other_content_kinds_formats_and_bad_bytes() {
         let loader = ErasedLoader::new(TextLoader);
-        let kind_of =
-            |header, bytes: &[u8]| loader.load(ID, VERSION, &header, bytes).unwrap_err().kind();
+        let kind_of = |header: CookedHeader, bytes: &[u8]| {
+            loader.load(ID, header.version_of(bytes), &header, bytes).unwrap_err().kind()
+        };
         let other_kind = CookedHeader::new(AssetKind::from_name("test.other"), 3, []);
         assert_eq!(kind_of(other_kind, b"x"), ErrorKind::InvalidData);
         let other_format = CookedHeader::new(Text::KIND, 2, []);
         assert_eq!(kind_of(other_format, b"x"), ErrorKind::VersionMismatch);
         let good = CookedHeader::new(Text::KIND, 3, []);
-        assert_eq!(kind_of(good, &[0xFF]), ErrorKind::InvalidData);
+        assert_eq!(kind_of(good.clone(), &[0xFF]), ErrorKind::InvalidData);
+
+        let version = good.version_of(b"x");
+        assert!(loader.load(ID, version, &good, b"x").is_ok());
+        let altered_bytes = loader.load(ID, version, &good, b"y").unwrap_err();
+        assert_eq!(altered_bytes.kind(), ErrorKind::InvalidData);
+        let altered_header = CookedHeader::new(Text::KIND, 3, [ID]);
+        let altered = loader.load(ID, version, &altered_header, b"x").unwrap_err();
+        assert_eq!(altered.kind(), ErrorKind::InvalidData);
     }
 }

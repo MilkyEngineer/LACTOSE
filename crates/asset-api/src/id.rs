@@ -78,6 +78,21 @@ pub trait Asset: Send + Sync + Sized + 'static {
     const FORMAT_VERSION: u32;
 }
 
+/// An asset kind the simulation reads: collision, navigation data, state machines, ability
+/// and spawn tables.
+///
+/// Only these kinds can be read through a [`PinnedTable`](crate::PinnedTable), which is
+/// the one route by which code inside the determinism boundary reads an asset.
+///
+/// Implementing this is a promise about the kind's [`Loader`](crate::Loader). What it
+/// returns is simulation input on every machine, but loaders run outside the boundary, on
+/// background workers. The loader must therefore be a pure decoder of its bytes: the same
+/// bytes give a bit-identical asset on every host, with no float computed outside
+/// `lactose-math`, no clock, no randomness and no dependence on thread or load order. A
+/// loader that needs more than that lives in a boundary crate and obeys architecture
+/// section 8.2 like the rest of it.
+pub trait SimulationAsset: Asset {}
+
 lactose_core::typed_plain_data! {
     /// A component field that refers to an asset of kind `T`, or to nothing.
     ///

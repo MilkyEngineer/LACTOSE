@@ -1,20 +1,51 @@
 //! Asset versions, the per-region version table and the per-region asset set.
 
+use core::num::NonZeroU64;
 use std::collections::{BTreeMap, BTreeSet};
-
-use bytemuck::{Pod, Zeroable};
 
 use crate::id::AssetId;
 
-/// One published version of an asset.
+/// One published version of an asset: a hash of its cooked form.
 ///
-/// The cooker assigns versions, per asset and strictly increasing: a re-cook that changes
-/// an asset's cooked bytes or dependency list publishes the next version. Every machine
-/// that reads the same cooked data therefore agrees on what `(AssetId, AssetVersion)`
-/// names, and a published version never changes.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug, Pod, Zeroable)]
-#[repr(transparent)]
-pub struct AssetVersion(pub u32);
+/// The value is computed by [`CookedHeader::version_of`](crate::CookedHeader::version_of)
+/// from the cooked header and bytes, so `(AssetId, AssetVersion)` names the same content on
+/// every machine and after every cook, and two cooks can never publish different content
+/// under one version. Versions are identities and have no order: which version of an asset
+/// is the current one is a fact about a store's pack index, never about the number.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct AssetVersion(NonZeroU64);
+
+impl AssetVersion {
+    /// The version for a content hash. Zero is reserved for "no version" in plain data,
+    /// so a hash of zero becomes one.
+    pub(crate) const fn from_hash(hash: u64) -> Self {
+        match NonZeroU64::new(hash) {
+            Some(bits) => Self(bits),
+            None => Self(NonZeroU64::MIN),
+        }
+    }
+
+    /// Rebuilds a version from its wire or disk form. Zero is not a version.
+    #[must_use]
+    pub const fn from_bits(bits: u64) -> Option<Self> {
+        match NonZeroU64::new(bits) {
+            Some(bits) => Some(Self(bits)),
+            None => None,
+        }
+    }
+
+    /// The wire and disk form, never zero.
+    #[must_use]
+    pub const fn to_bits(self) -> u64 {
+        self.0.get()
+    }
+}
+
+impl core::fmt::Debug for AssetVersion {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "AssetVersion({:#018x})", self.0)
+    }
+}
 
 /// The versions one region sees: a map from asset to published version.
 ///
@@ -84,8 +115,9 @@ impl FromIterator<(AssetId, AssetVersion)> for VersionTable {
 /// The assets a region declares: those of its cooked baseline plus those of any migrated
 /// resident entity (architecture section 14).
 ///
-/// The cooker closes a baseline's set over declared dependencies, so a set names everything
-/// its region can reach. Iteration is in ascending [`AssetId`] order.
+/// A set need not list dependencies:
+/// [`AssetCatalog::resolve`](crate::AssetCatalog::resolve) closes over them. Iteration is
+/// in ascending [`AssetId`] order.
 #[derive(Clone, PartialEq, Eq, Hash, Debug, Default)]
 pub struct AssetSet {
     ids: BTreeSet<AssetId>,
@@ -161,6 +193,10 @@ mod tests {
         AssetId::from_bits(bits)
     }
 
+    fn version(bits: u64) -> AssetVersion {
+        AssetVersion::from_bits(bits).unwrap()
+    }
+
     fn hash_of(value: &impl Hash) -> u64 {
         let mut hasher = FixedHasher::default();
         value.hash(&mut hasher);
@@ -168,10 +204,18 @@ mod tests {
     }
 
     #[test]
+    fn version_reserves_zero() {
+        assert_eq!(AssetVersion::from_bits(0), None);
+        assert_eq!(version(7).to_bits(), 7);
+        assert_eq!(AssetVersion::from_hash(0).to_bits(), 1);
+        assert_eq!(AssetVersion::from_hash(9), version(9));
+        assert_eq!(size_of::<Option<AssetVersion>>(), size_of::<u64>());
+    }
+
+    #[test]
     fn table_is_independent_of_insertion_order() {
-        let forward: VersionTable = (1..200).map(|i| (id(i), AssetVersion(i as u32))).collect();
-        let backward: VersionTable =
-            (1..200).rev().map(|i| (id(i), AssetVersion(i as u32))).collect();
+        let forward: VersionTable = (1..200).map(|i| (id(i), version(i))).collect();
+        let backward: VersionTable = (1..200).rev().map(|i| (id(i), version(i))).collect();
         assert_eq!(forward, backward);
         assert_eq!(hash_of(&forward), hash_of(&backward));
         assert!(forward.iter().map(|(id, _)| id).is_sorted());
@@ -182,20 +226,20 @@ mod tests {
     fn table_set_get_remove() {
         let mut table = VersionTable::new();
         assert!(table.is_empty());
-        assert_eq!(table.set(id(3), AssetVersion(1)), None);
-        assert_eq!(table.set(id(3), AssetVersion(2)), Some(AssetVersion(1)));
-        assert_eq!(table.get(id(3)), Some(AssetVersion(2)));
+        assert_eq!(table.set(id(3), version(1)), None);
+        assert_eq!(table.set(id(3), version(2)), Some(version(1)));
+        assert_eq!(table.get(id(3)), Some(version(2)));
         assert_eq!(table.get(id(4)), None);
-        let other: VersionTable = [(id(3), AssetVersion(1))].into_iter().collect();
+        let other: VersionTable = [(id(3), version(1))].into_iter().collect();
         assert_ne!(table, other);
-        assert_eq!(table.remove(id(3)), Some(AssetVersion(2)));
+        assert_eq!(table.remove(id(3)), Some(version(2)));
         assert_eq!(table.len(), 0);
     }
 
     #[test]
     fn none_is_never_stored() {
         let mut table = VersionTable::new();
-        assert_eq!(table.set(AssetId::NONE, AssetVersion(1)), None);
+        assert_eq!(table.set(AssetId::NONE, version(1)), None);
         assert!(table.is_empty());
         let mut set = AssetSet::new();
         assert!(!set.insert(AssetId::NONE));

@@ -21,10 +21,55 @@
 /// let slot: Slot<Mesh> = bytemuck::cast(7u32);
 /// assert_eq!(bytemuck::bytes_of(&slot), &7u32.to_ne_bytes());
 /// ```
+///
+/// # What the macro refuses
+///
+/// The safety argument rests on the caller being unable to change the struct. Only doc
+/// comments are accepted in front of it, so no `repr`, directly or through `cfg_attr`, can
+/// reach it:
+///
+/// ```compile_fail
+/// lactose_core::typed_plain_data! {
+///     #[repr(C)]
+///     pub struct Slot<T>(u32);
+/// }
+/// ```
+///
+/// ```compile_fail
+/// lactose_core::typed_plain_data! {
+///     #[cfg_attr(all(), repr(align(64)))]
+///     pub struct Slot<T>(u8);
+/// }
+/// ```
+///
+/// There is exactly one inner field:
+///
+/// ```compile_fail
+/// lactose_core::typed_plain_data! {
+///     pub struct Slot<T>(u32, u8);
+/// }
+/// ```
+///
+/// An inner type that is not `Pod` is rejected where the struct is declared:
+///
+/// ```compile_fail
+/// lactose_core::typed_plain_data! {
+///     pub struct Name<T>(String);
+/// }
+/// ```
+///
+/// The parameter is a marker and cannot be the inner type, because the struct is `Copy`
+/// for every parameter:
+///
+/// ```compile_fail
+/// lactose_core::typed_plain_data! {
+///     pub struct Wrapper<T>(T);
+/// }
+/// ```
 #[macro_export]
 macro_rules! typed_plain_data {
-    ($(#[$meta:meta])* $vis:vis struct $name:ident<$param:ident>($inner:ty);) => {
-        $(#[$meta])*
+    ($(#[doc = $doc:expr])* $vis:vis struct $name:ident<$param:ident>($inner:ty);) => {
+        $(#[doc = $doc])*
         #[repr(transparent)]
         $vis struct $name<$param> {
             value: $inner,
