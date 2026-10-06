@@ -15,6 +15,11 @@
 //! | `WHISK_BENCH_MACHINE` | Machine name used in the file name | derived from the CPU name |
 //! | `WHISK_BENCH_OUT` | Output directory | `docs/results` |
 //!
+//! On macOS the benchmark puts its own process in the foreground-application task role,
+//! which a game on screen has, so user-interactive threads run at the priority they would
+//! there (47 rather than 31). Each phase prints how long it took against what its samples
+//! add up to; a phase that takes more than twice that is flagged.
+//!
 //! What is measured:
 //!
 //! - **Makespan ratio.** Three graph shapes of single-job nodes whose durations are drawn
@@ -34,6 +39,10 @@
 //!   The process's CPU time per run is reported next to the work a run draws. The
 //!   difference is what the executor burns around the jobs, mostly idle workers scanning
 //!   before they park.
+//! - **Timer wake.** From a tick deadline until the frame-critical task that slept until it
+//!   resumes, the way the timer root ticks: `sleep_until` one deadline after another, with
+//!   the pool otherwise idle, at a 2 ms period and at 60 Hz. The 60 Hz P99 is a pass
+//!   criterion of its own.
 //! - **Wake latency.** From just before a one-node graph is pushed to a parked pool until
 //!   its job starts. The push comes from a dedicated thread at frame-critical priority. The
 //!   CPU the process uses during this phase, in which it does nothing but wake up five
@@ -75,6 +84,8 @@ const STEAL_SAMPLES: usize = 400_000;
 const RATIO_P50_LIMIT: f64 = 1.25;
 const RATIO_P99_LIMIT: f64 = 1.5;
 const WAKE_P99_LIMIT_NANOS: f64 = 20_000.0;
+const TIMER_P99_LIMIT_NANOS: f64 = 20_000.0;
+const TICK: Duration = Duration::from_micros(16_667);
 const STEAL_LIMIT_NANOS: f64 = 1_000.0;
 
 /// splitmix64: reproducible draws without a dependency.
@@ -301,6 +312,9 @@ struct Percentiles {
     max: f64,
     mean: f64,
     samples: usize,
+    /// Samples over a millisecond: for a wake or a timer, a machine that was away rather
+    /// than a scheduler that was slow. Counted so a bad maximum can be read.
+    over_a_millisecond: usize,
 }
 
 fn percentiles(mut samples: Vec<f64>) -> Percentiles {
@@ -315,6 +329,7 @@ fn percentiles(mut samples: Vec<f64>) -> Percentiles {
         max: at(1.0),
         mean: samples.iter().sum::<f64>() / samples.len() as f64,
         samples: samples.len(),
+        over_a_millisecond: samples.iter().filter(|&&sample| sample > 1e6).count(),
     }
 }
 
@@ -555,6 +570,122 @@ fn measure_wake_latency(executor: &Executor, samples: usize) -> WakeResult {
     WakeResult { latency: percentiles(latencies), cpu_per_second }
 }
 
+/// From a tick deadline until the frame-critical task that slept until it resumes, the way
+/// the timer root ticks: `sleep_until` one deadline after another, `period` apart, with the
+/// pool otherwise idle. A deadline that has already passed when the task resumes (the
+/// machine was away) is replaced by one half a period off, so the phase cannot fall behind.
+fn measure_timer_latency(executor: &Executor, samples: usize, period: Duration) -> WakeResult {
+    let ticker = executor.clone();
+    let task = executor.spawn(WorkerClass::FrameCritical, async move {
+        let mut latencies = Vec::with_capacity(samples);
+        let mut measured_from = None;
+        let mut deadline = Instant::now() + period;
+        for sample in 0..samples + WARM_UP_RUNS {
+            if sample == WARM_UP_RUNS {
+                measured_from = Some((Instant::now(), process_cpu_seconds()));
+            }
+            ticker.sleep_until(deadline).await.expect("the executor is running");
+            let late = deadline.elapsed();
+            if sample >= WARM_UP_RUNS {
+                latencies.push(late.as_nanos() as f64);
+            }
+            deadline = (deadline + period).max(Instant::now() + period / 2);
+        }
+        let (wall, cpu) = measured_from.expect("the loop ran");
+        let cpu = cpu.zip(process_cpu_seconds()).map(|(start, end)| end - start);
+        (latencies, cpu.map(|cpu| cpu / wall.elapsed().as_secs_f64()))
+    });
+    let (latencies, cpu_per_second) = executor.block_on(task).expect("the executor is running");
+    WakeResult { latency: percentiles(latencies), cpu_per_second }
+}
+
+/// Runs one phase and prints how long it took. `expected`, given the result, is what the
+/// phase's samples add up to; a phase that took more than twice that is flagged, since it
+/// means the executor spent most of the time doing nothing, as a lost wake-up would.
+fn phase<R>(
+    name: &str,
+    run: impl FnOnce() -> R,
+    expected: impl FnOnce(&R) -> Option<Duration>,
+) -> R {
+    let start = Instant::now();
+    let result = run();
+    let took = start.elapsed();
+    match expected(&result) {
+        Some(expected) => {
+            let ratio = took.as_secs_f64() / expected.as_secs_f64().max(1e-9);
+            let flag = if ratio > 2.0 { "  <-- more than twice the expected time" } else { "" };
+            eprintln!(
+                "phase {name}: {took:.2?} (samples add up to {expected:.2?}, {ratio:.2}x){flag}"
+            );
+        }
+        None => eprintln!("phase {name}: {took:.2?}"),
+    }
+    result
+}
+
+/// Puts the process in the task role of a frontmost application on macOS and returns the
+/// role it ends up in, as the system reports it, for the record.
+#[cfg(target_os = "macos")]
+#[allow(
+    deprecated,
+    reason = "libc deprecates mach_task_self in favour of a crate this benchmark does not need"
+)]
+fn foreground_task_role() -> String {
+    // <mach/task_policy.h>: `task_category_policy` is one `integer_t`, the role.
+    const TASK_CATEGORY_POLICY: u32 = 1;
+    const TASK_FOREGROUND_APPLICATION: i32 = 1;
+    unsafe extern "C" {
+        fn task_policy_set(
+            task: libc::mach_port_t,
+            flavor: u32,
+            policy: *const i32,
+            count: u32,
+        ) -> libc::kern_return_t;
+        fn task_policy_get(
+            task: libc::mach_port_t,
+            flavor: u32,
+            policy: *mut i32,
+            count: *mut u32,
+            get_default: *mut u32,
+        ) -> libc::kern_return_t;
+    }
+    let role = TASK_FOREGROUND_APPLICATION;
+    // SAFETY: the calls take the process's own task port, a pointer to one live `i32`
+    // with the count that says so, and write only through the out-pointers given.
+    unsafe {
+        let task = libc::mach_task_self();
+        let set = task_policy_set(task, TASK_CATEGORY_POLICY, &raw const role, 1);
+        let mut current = -1i32;
+        let mut count = 1u32;
+        let mut get_default = 0u32;
+        let got = task_policy_get(
+            task,
+            TASK_CATEGORY_POLICY,
+            &raw mut current,
+            &raw mut count,
+            &raw mut get_default,
+        );
+        let name = match current {
+            0 => "TASK_UNSPECIFIED",
+            1 => "TASK_FOREGROUND_APPLICATION",
+            2 => "TASK_BACKGROUND_APPLICATION",
+            3 => "TASK_CONTROL_APPLICATION",
+            4 => "TASK_GRAPHICS_SERVER",
+            5 => "TASK_THROTTLE_APPLICATION",
+            6 => "TASK_NONUI_APPLICATION",
+            7 => "TASK_DEFAULT_APPLICATION",
+            8 => "TASK_DARWINBG_APPLICATION",
+            _ => "unknown",
+        };
+        format!("{name} (set returned {set}, get returned {got})")
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn foreground_task_role() -> String {
+    "not applicable".to_owned()
+}
+
 /// A node of empty units, for timing the scheduling around them.
 struct EmptyNode {
     units: u32,
@@ -698,13 +829,14 @@ fn main() {
     let commit = commit();
     let topology = StdPlatform.topology();
     let load_before = load_average().unwrap_or_else(|| "unknown".to_owned());
+    let task_role = foreground_task_role();
 
     let executor = Executor::builder().build().expect("executor starts");
     let frame_workers = executor.frame_worker_count();
     let background_workers = lactose_task::bench_support::background_workers(&executor);
     eprintln!(
         "whisk bench: {cpu}, {} performance + {} efficiency cores, {frame_workers} frame-critical \
-         workers, commit {commit}, load average {load_before}",
+         workers, commit {commit}, load average {load_before}, task role {task_role}",
         topology.performance, topology.efficiency
     );
 
@@ -716,7 +848,16 @@ fn main() {
     let mut makespans = Vec::new();
     for shape in &shapes {
         for background_load in [false, true] {
-            let result = measure_makespan(&executor, shape, rate, runs, background_load);
+            let name = format!("{} {}", shape.name, if background_load { "zstd" } else { "quiet" });
+            let result = phase(
+                &name,
+                || measure_makespan(&executor, shape, rate, runs, background_load),
+                |result| {
+                    let per_run =
+                        Duration::from_micros(result.mean_makespan_micros as u64) + RUN_GAP;
+                    Some(per_run * (runs + WARM_UP_RUNS) as u32)
+                },
+            );
             eprintln!(
                 "{:<15} {:<8} p50 {:.3} p99 {:.3} max {:.3} | greedy {:.3}/{:.3} longest-first \
                  {:.3}/{:.3} | cpu {} us, work {:.0} us per run",
@@ -735,7 +876,11 @@ fn main() {
             makespans.push(result);
         }
     }
-    let wake = measure_wake_latency(&executor, WAKE_SAMPLES);
+    let wake = phase(
+        "wake latency",
+        || measure_wake_latency(&executor, WAKE_SAMPLES),
+        |_| Some(WAKE_GAP * (WAKE_SAMPLES + WARM_UP_RUNS) as u32),
+    );
     eprintln!(
         "wake latency: p50 {:.0} ns, p99 {:.0} ns, max {:.0} ns over {} pushes; process CPU {} \
          per second while doing so",
@@ -745,13 +890,44 @@ fn main() {
         wake.latency.samples,
         optional(wake.cpu_per_second, 4),
     );
+    let timer_periods = [WAKE_GAP, TICK];
+    let timers: Vec<WakeResult> = timer_periods
+        .iter()
+        .map(|&period| {
+            let name = format!("timer wake every {period:.3?}");
+            let timer = phase(
+                &name,
+                || measure_timer_latency(&executor, WAKE_SAMPLES, period),
+                |_| Some(period * (WAKE_SAMPLES + WARM_UP_RUNS) as u32),
+            );
+            eprintln!(
+                "timer wake every {period:.3?}: p50 {:.0} ns, p99 {:.0} ns, max {:.0} ns over {} \
+                 deadlines, {} of them over a millisecond; process CPU {} per second",
+                timer.latency.p50,
+                timer.latency.p99,
+                timer.latency.max,
+                timer.latency.samples,
+                timer.latency.over_a_millisecond,
+                optional(timer.cpu_per_second, 4),
+            );
+            timer
+        })
+        .collect();
+    let timer_at_tick = &timers[1];
     executor.shutdown();
 
-    let steal_samples = lactose_task::bench_support::time_steals(&StdPlatform, STEAL_SAMPLES)
-        .expect("the thief thread starts");
+    let steal_samples = phase(
+        "steal",
+        || {
+            lactose_task::bench_support::time_steals(&StdPlatform, STEAL_SAMPLES)
+                .expect("the thief thread starts")
+        },
+        |_| None,
+    );
     let steal = percentiles(steal_samples.into_iter().map(|nanos| nanos as f64).collect());
     let clock_pair = clock_pair_nanos();
-    let forced_split = measure_forced_split(topology.performance);
+    let forced_split =
+        phase("forced split", || measure_forced_split(topology.performance), |_| None);
     eprintln!(
         "steal: p50 {:.0} ns, p99 {:.0} ns, max {:.0} ns over {} steals (each includes one \
          clock pair, {clock_pair:.0} ns); forced split {forced_split:.0} worker-ns per entry",
@@ -763,6 +939,7 @@ fn main() {
         .iter()
         .all(|result| result.ratio.p50 <= RATIO_P50_LIMIT && result.ratio.p99 <= RATIO_P99_LIMIT);
     let wake_pass = wake.latency.p99 < WAKE_P99_LIMIT_NANOS;
+    let timer_pass = timer_at_tick.latency.p99 < TIMER_P99_LIMIT_NANOS;
     let steal_pass = steal.p99 < STEAL_LIMIT_NANOS;
 
     let mut json = String::new();
@@ -774,6 +951,7 @@ fn main() {
     let _ = writeln!(json, "  \"arch\": \"{}\",", std::env::consts::ARCH);
     let _ = writeln!(json, "  \"date\": \"{date}\",");
     let _ = writeln!(json, "  \"commit\": \"{commit}\",");
+    let _ = writeln!(json, "  \"task_role\": \"{task_role}\",");
     let _ = writeln!(
         json,
         "  \"load_average\": {{ \"before\": \"{load_before}\", \"after\": \"{load_after}\" }},"
@@ -836,16 +1014,36 @@ fn main() {
          \"mean\": {:.1}, \"clock_pair\": {clock_pair:.1} }},",
         steal.samples, steal.p50, steal.p99, steal.max, steal.mean
     );
+    let _ = writeln!(json, "  \"timer_wake_ns\": [");
+    for (index, (period, timer)) in timer_periods.iter().zip(&timers).enumerate() {
+        let _ = writeln!(
+            json,
+            "    {{ \"period_us\": {:.1}, \"samples\": {}, \"p50\": {:.0}, \"p99\": {:.0}, \
+             \"max\": {:.0}, \"mean\": {:.0}, \"over_a_millisecond\": {}, \
+             \"process_cpu_per_second\": {} }}{}",
+            period.as_secs_f64() * 1e6,
+            timer.latency.samples,
+            timer.latency.p50,
+            timer.latency.p99,
+            timer.latency.max,
+            timer.latency.mean,
+            timer.latency.over_a_millisecond,
+            optional(timer.cpu_per_second, 5),
+            if index + 1 == timers.len() { "" } else { "," }
+        );
+    }
+    let _ = writeln!(json, "  ],");
     let _ = writeln!(json, "  \"forced_split_worker_ns_per_entry\": {forced_split:.1},");
     let _ = writeln!(
         json,
         "  \"thresholds\": {{ \"ratio_p50\": {RATIO_P50_LIMIT}, \"ratio_p99\": {RATIO_P99_LIMIT}, \
-         \"wake_p99_ns\": {WAKE_P99_LIMIT_NANOS}, \"steal_p99_ns\": {STEAL_LIMIT_NANOS} }},"
+         \"wake_p99_ns\": {WAKE_P99_LIMIT_NANOS}, \"timer_wake_at_tick_p99_ns\": \
+         {TIMER_P99_LIMIT_NANOS}, \"steal_p99_ns\": {STEAL_LIMIT_NANOS} }},"
     );
     let _ = writeln!(
         json,
         "  \"pass\": {{ \"makespan_ratio\": {ratio_pass}, \"wake_latency\": {wake_pass}, \
-         \"steal\": {steal_pass} }}"
+         \"timer_wake\": {timer_pass}, \"steal\": {steal_pass} }}"
     );
     let _ = writeln!(json, "}}");
 
@@ -871,6 +1069,7 @@ fn main() {
     );
     let _ = writeln!(summary, "| Commit | `{commit}` |");
     let _ = writeln!(summary, "| Load average | {load_before} before, {load_after} after |");
+    let _ = writeln!(summary, "| Task role | {task_role} |");
     let _ = writeln!(
         summary,
         "| Calibration | {rate:.4} kernel iterations per ns; serial check {calibration_check:.3} \
@@ -936,6 +1135,31 @@ fn main() {
         wake.latency.max / 1e3,
         optional(wake.cpu_per_second, 4),
     );
+    let _ = writeln!(summary, "\n## Timer wake ({})\n", verdict(timer_pass));
+    let _ = writeln!(
+        summary,
+        "From a deadline until the frame-critical task sleeping until it resumes, as the timer \
+         root ticks, with the pool otherwise idle. The 60 Hz P99 must be under {:.0} µs.\n",
+        TIMER_P99_LIMIT_NANOS / 1e3
+    );
+    let _ = writeln!(
+        summary,
+        "| Period | Deadlines | P50 | P99 | Max | Over 1 ms | Process CPU per second |"
+    );
+    let _ = writeln!(summary, "|---|---|---|---|---|---|---|");
+    for (period, timer) in timer_periods.iter().zip(&timers) {
+        let _ = writeln!(
+            summary,
+            "| {:.3} ms | {} | {:.1} µs | {:.1} µs | {:.1} µs | {} | {} s |",
+            period.as_secs_f64() * 1e3,
+            timer.latency.samples,
+            timer.latency.p50 / 1e3,
+            timer.latency.p99 / 1e3,
+            timer.latency.max / 1e3,
+            timer.latency.over_a_millisecond,
+            optional(timer.cpu_per_second, 4),
+        );
+    }
     let _ = writeln!(summary, "\n## Steal ({})\n", verdict(steal_pass));
     let _ = writeln!(
         summary,
