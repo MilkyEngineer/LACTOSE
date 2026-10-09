@@ -971,9 +971,12 @@ The policy is in section 3.
   on a GPU runner nightly.
 - Each crate's `README.md` states responsibility, tier, boundary status and unsafe status.
 - Agents: `.claude/agents/` defines the standard set. `lane` implements one crate or fix
-  round in its own worktree against a brief; `reviewer` reads every lane, fix round and
-  interface design adversarially before it merges. The coordinator writes the briefs and the interfaces, merges serially, and keeps
-  this document, the decisions log and the verification list. A long command that needs no
+  round in its own worktree against a brief; `architect` writes a crate's facade (final
+  signatures, `todo!()` bodies, the README as the contract, proposed decision text) the
+  same way, at the highest effort, for a crate other crates will be written against;
+  `reviewer` reads every lane, fix round and interface design adversarially before it
+  merges. The coordinator writes the briefs, merges serially, and keeps this document, the
+  decisions log and the verification list. A long command that needs no
   interpretation is run by the coordinator in the background, not by an agent.
 - CI: clippy `-D warnings`, fmt, nextest, SOUR in all applicable modes, Miri nightly on `task`
   and `ecs`, `cargo-deny`, the tier check.
