@@ -15,11 +15,15 @@ The schedule hands a kernel `&mut` rows and resources on the strength of the des
 access table: two systems that conflict on a target are ordered, and within a system each
 parameter names a different component. A table that understates what the kernel touches
 would let two kernels alias one row from safe code. So `SystemDescriptor::new` is `unsafe`,
-with the obligation that the table describes exactly what the kernel touches, and the
-`#[system]` expansion, which derives the table from the parameter types, is its one caller.
-The `unsafe` call lands in the invoking crate; the `unsafe_code` lint does not apply to code
-another crate's macro generates, so that crate keeps `#![forbid(unsafe_code)]` (section 21,
-as for `#[component]`).
+with the obligation that the kernel's table and the finalize's table describe exactly what
+each entry point touches, and the `#[system]` expansion, which derives both from the
+parameter types, is its one caller. The `unsafe` block is spanned at the call site, never at
+a user token: the `unsafe_code` lint exempts code another crate's macro generates only under
+a macro span, so the invoking crate keeps `#![forbid(unsafe_code)]` (section 21, as for
+`#[component]`). The `#[finalize]` pairing is by name, so the hidden entry points through
+which a finalize fetches its parameters are themselves `unsafe fn` with the obligation that
+the parameter is in the running descriptor's finalize table; safe code cannot supply a
+`__finalize_f` that fetches what the table does not declare.
 
 ## Chunk columns
 
@@ -45,10 +49,13 @@ a column's bytes to `T`.
 that the executor runs on other threads through `'static` graph nodes.
 
 - The run owns the world for its duration (an `Arc` the nodes share, or storage moved into
-  the run) and the future hands it back only after the run has resolved. A future that is
-  dropped or forgotten mid-tick therefore leaks the world: no borrow outlives the jobs.
+  the run) and the future hands it back only after the run has resolved. A future dropped
+  mid-tick drops the world when the run's jobs have finished, and a forgotten one leaks it:
+  either way no borrow outlives the jobs.
 - The jobs' accesses are disjoint by the access-table argument above, and `World: Sync`
-  covers the shared reads.
+  covers the shared reads. An exclusive system runs as the only live node of its run (one
+  run per sync point, its exclusive systems chained), which is how it holds `&mut World`
+  inside a graph node.
 - When the run resolves, with `Ok` or with `Cancelled`, no unit, scope child or finalize of
   that run is executing or ever will (`crates/task/README.md`, "Resolution"); on `Cancelled`
   the world is torn and is not handed back.

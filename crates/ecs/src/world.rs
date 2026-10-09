@@ -251,7 +251,9 @@ impl World {
     /// `Predicted` key that no live entity has; a placeholder is an error. Replication and
     /// prediction spawn this way with the server's key; a kernel spawns through
     /// [`Commands::spawn`](crate::Commands::spawn), which assigns the key. A `Predicted`
-    /// key gives the entity [`PredictedOrigin`](crate::PredictedOrigin).
+    /// key gives the entity [`PredictedOrigin`](crate::PredictedOrigin). Storage holds
+    /// origin keys: a bound `Net` key inside a reference field of `bundle` is rewritten to
+    /// the target's origin key here, as at command apply and [`insert`](Self::insert).
     pub fn spawn<B: Bundle>(&mut self, key: StableKey, region: RegionId, bundle: B) -> Result<()> {
         todo!()
     }
@@ -343,7 +345,8 @@ impl World {
         todo!()
     }
 
-    /// A query over every entity matching `Q`. Panics if `Q` names a component twice.
+    /// A query over every entity matching `Q`. Panics if `Q` breaks the alias rule of
+    /// [`QueryItems`], or names a `Mut` on a component [`get_mut`](Self::get_mut) rejects.
     #[must_use]
     pub fn query<Q: QueryItems>(&mut self) -> Query<'_, Q> {
         todo!()
@@ -504,7 +507,8 @@ impl World {
         todo!()
     }
 
-    /// Every chunk's column of `T`, for bulk writes that record what they changed.
+    /// Every chunk's column of `T`, for bulk writes that record what they changed. Panics
+    /// for a component [`get_mut`](Self::get_mut) rejects.
     #[must_use]
     pub fn columns_mut<T: Component>(&mut self) -> ColumnsMut<'_, T> {
         todo!()
@@ -548,25 +552,40 @@ impl World {
         todo!()
     }
 
-    /// Replaces the rollback state with `snapshot`, taken from this world. The tick returns
-    /// to the snapshot's, change stamps are rebased, the structural log is cleared and a
+    /// Replaces the rollback state with `snapshot`, taken from this world: the tick returns
+    /// to the snapshot's, every column comes back with its change stamps exactly as
+    /// snapshotted (so a re-simulated tick's `Changed` filters see what the first run saw),
+    /// the set of loaded regions is the snapshot's, the structural log is cleared and a
     /// new epoch starts, so every consumer does a full pass. The alias table and the
-    /// presentation-event log are kept. Fails if the snapshot is from another world.
+    /// delivered presentation-event keys are kept; emissions after the snapshot that were
+    /// never taken are dropped. Fails if the snapshot is from another world.
     pub fn restore(&mut self, snapshot: &WorldSnapshot) -> Result<()> {
+        todo!()
+    }
+
+    /// Tells the world the oldest tick a restore can return to, so it can prune the
+    /// delivered presentation-event keys below it and the aliases of entities despawned
+    /// before it. `lactose-predict` calls it with the ring's oldest tick; the server, which
+    /// never rolls back, with the current tick.
+    pub fn set_rollback_horizon(&mut self, oldest: Tick) {
         todo!()
     }
 
     // ---- Bulk copy ----
 
-    /// Loads `region`, which must be empty: spawns the cooked rows of `baseline` except
-    /// those `overlay` destroys, a copy per archetype column plus a remap pass over
-    /// reference fields; then applies `overlay`'s records in record order, restores every
-    /// predicted origin key and alias from [`PredictedOrigin`](crate::PredictedOrigin), and
-    /// inserts the overlay's region resources. A `Destroy` record never touches a live
-    /// entity of another region: a cooked entity that moved is a row there, not here. Every
-    /// component schema must match the registry's; a mismatch is an error of kind
-    /// `VersionMismatch`, and `lactose-persist` migrates the document first. Rows are
-    /// stamped at the current tick and logged as spawned; no epoch starts.
+    /// Loads rows into `region`, which exists ([`create_region`](Self::create_region) with
+    /// the saved seed) and is empty: spawns the cooked rows of `baseline` except those
+    /// `overlay` destroys, a copy per archetype column plus a remap pass over reference
+    /// fields; then applies `overlay`'s records in record order and restores every
+    /// predicted origin key and alias from [`PredictedOrigin`](crate::PredictedOrigin).
+    /// Reference fields keep the origin keys they were exported with. A `Destroy` record
+    /// never touches a live entity of another region: a cooked entity that moved is a row
+    /// there, not here. Region resources are not in an overlay; the caller inserts them
+    /// with [`insert_region_resource_erased`](Self::insert_region_resource_erased) from the
+    /// save or the relevance message. Every component schema must match the registry's; a
+    /// mismatch is an error of kind `VersionMismatch`, and `lactose-persist` migrates the
+    /// document first. Rows are stamped at the current point and logged as spawned; no
+    /// epoch starts.
     pub fn load_region(
         &mut self,
         region: RegionId,
@@ -577,9 +596,10 @@ impl World {
     }
 
     /// Copies the state of `region` out: every persistent component of every entity in
-    /// ascending `NetId` order, with the owner beside each row, plus the seed and the
-    /// persistent region resources. An entity without a bound `NetId` is an error: the
-    /// server binds every entity before a save, and a client never exports.
+    /// ascending `NetId` order, reference fields as stored, with the owner beside each row,
+    /// plus the seed and the persistent region resources. An entity without a bound `NetId`
+    /// is an error: the server binds every entity before a save, and a client never
+    /// exports.
     pub fn export_region(&self, region: RegionId) -> Result<RegionRows> {
         todo!()
     }

@@ -51,8 +51,11 @@ pub(crate) mod sealed {
 ///   inside, the world does not hold them.
 ///
 /// A system that runs more than once per tick (per-entity, per-region) may not write a world
-/// resource or take [`Job`], and a system that is not per-entity may not take
-/// [`StableKeyOf`]; the schedule rejects each ([`ScheduleError`](crate::ScheduleError)).
+/// resource or take [`Job`]; a system that is not per-entity may not take [`StableKeyOf`];
+/// an exclusive system or a finalize function may not take [`Ctx`] or [`RegionRes`]; and
+/// within one system two data parameters (`&T`, [`Mut<T>`], `Option<&T>`, `Option<Mut<T>>`)
+/// may not name one component, nor may [`Without<T>`] stand beside any parameter on `T`.
+/// The schedule rejects each ([`ScheduleError`](crate::ScheduleError)).
 pub trait SystemParam: sealed::Sealed + Sized {
     /// What this parameter reads or writes.
     const ACCESS: Access;
@@ -112,7 +115,8 @@ impl<T: ?Sized + 'static> SystemParam for ResMut<'_, T> {
 
 /// A resource of the current region, read. Region resources are written through
 /// [`World::region_resource_mut`] at a sync point, never from a kernel, because the
-/// kernels of one region run on many workers.
+/// kernels of one region run on many workers. An invocation in a region that lacks `T` is
+/// skipped.
 pub struct RegionRes<'w, T: Resource> {
     value: &'w T,
 }
@@ -219,8 +223,17 @@ impl<T: Component> SystemParam for Without<T> {
 /// rows whose change stamp is after `S`'s position in the previous tick and before it in
 /// this one, whether the write came from a system ordered before `S`, a command applied at
 /// a sync point or direct access between ticks. Each change is seen exactly once by each
-/// reader. `T` must be a tracked column (replicated or extracted), since only those carry
-/// a stamp per row; the schedule rejects the filter on any other.
+/// reader; `S`'s own `Mut<T>` writes are not seen by its own filter. `T` must be a tracked
+/// column (replicated or extracted), since only those carry a stamp per row; the schedule
+/// rejects the filter on any other. It combines with one data parameter on `T` (`&T` to
+/// read the changed value, `Mut<T>` to clamp it).
+///
+/// Across a rollback the filter reflects the world's own change history: a restore puts
+/// every stamp back as snapshotted, so a re-simulated tick sees what the first run of that
+/// tick saw, and a correction `lactose-predict` writes afterwards leaves the stamps alone
+/// ([`ColumnMut::write`](crate::ColumnMut::write) without recording the row). A system whose
+/// effect must predict exactly does not gate on `Changed`, since the server's change
+/// history is not replicated.
 pub struct Changed<T: Component>(PhantomData<fn() -> T>);
 
 impl<T: Component> sealed::Sealed for Changed<T> {}
@@ -318,6 +331,9 @@ impl SystemParam for StableKeyOf {
 /// that runs once per tick, an exclusive system or a finalize function.
 ///
 /// `World` is `Sync` and every column view is `Send`, so a scope child may borrow them.
+/// Children key what they produce by `StableKey` and combine it order-independently; the
+/// worker index (`JobContext::slot`, `ChildContext::slot`) is never a key, and the boundary
+/// lint file bans both methods outside this crate (architecture section 8.2).
 pub struct Job<'w, 'j> {
     context: &'w mut JobContext<'j>,
 }

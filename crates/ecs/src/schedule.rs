@@ -43,10 +43,12 @@ impl ScheduleBuilder {
 
     /// Declares the next stage, named for tracing, holding `sets`. A sync point precedes
     /// every stage: the command buffers of the previous stage apply there, then the stage's
-    /// exclusive systems run in their order, then its other systems. In a tick the first
-    /// stage's sync point is the input sync point, where transient columns are zeroed,
-    /// events, channels and input ticks are cleared, and inputs, staged network state and
-    /// asset version tables are applied by the exclusive systems placed there.
+    /// exclusive systems run in their order, then its other systems; a closing sync point
+    /// after the last stage applies its buffers and runs no systems, so a run has one more
+    /// sync point than stages and ends with every buffer empty. In a tick the first stage's
+    /// sync point is the input sync point, where transient columns are zeroed, events,
+    /// channels and input ticks are cleared, and inputs, staged network state and asset
+    /// version tables are applied by the exclusive systems placed there.
     pub fn stage(&mut self, name: &'static str, sets: &'static [&'static SystemSet]) -> &mut Self {
         todo!()
     }
@@ -63,9 +65,10 @@ impl ScheduleBuilder {
     ///   [`ScheduleError::UnknownSet`], [`ScheduleError::UnknownSystem`]: structure.
     /// - [`ScheduleError::ExclusiveWithEntityAccess`],
     ///   [`ScheduleError::EntityParamInWorldSystem`],
-    ///   [`ScheduleError::RegionParamInExclusive`],
+    ///   [`ScheduleError::RegionParamInWorldSystem`],
     ///   [`ScheduleError::ResourceWriteInKernel`], [`ScheduleError::JobInKernel`],
-    ///   [`ScheduleError::AliasedParameter`]: a parameter list that cannot run.
+    ///   [`ScheduleError::AliasedParameter`]: a parameter list that cannot run. The
+    ///   per-kind rules apply to the kernel's table and the finalize's table separately.
     /// - [`ScheduleError::Cycle`]: among sets or declared edges within a stage, or an edge
     ///   to a later stage.
     /// - [`ScheduleError::UnorderedConflict`]: two systems of one stage touch one target
@@ -74,11 +77,10 @@ impl ScheduleBuilder {
     /// - [`ScheduleError::EventsBeforeEmitter`]: a reader of an event type not ordered
     ///   after every emitter of it.
     ///
-    /// What needs the world's registry is checked at the first [`Schedule::run_tick`] or
-    /// [`Schedule::run_pass`], since a schedule is built without a world:
-    /// [`ScheduleError::UnregisteredComponent`], [`ScheduleError::ChangedOnUntracked`],
-    /// [`ScheduleError::WritesMaintainedComponent`],
-    /// [`ScheduleError::TransientBeforeWriter`].
+    /// What needs a world is checked by [`Schedule::prepare`], since a schedule is built
+    /// without one: [`ScheduleError::UnregisteredComponent`],
+    /// [`ScheduleError::ChangedOnUntracked`], [`ScheduleError::WritesMaintainedComponent`],
+    /// [`ScheduleError::TransientBeforeWriter`], [`ScheduleError::MissingResource`].
     pub fn build(self) -> core::result::Result<Schedule, ScheduleError> {
         todo!()
     }
@@ -107,9 +109,19 @@ impl Schedule {
         self.kind
     }
 
-    /// How many stages, and so how many sync points, the schedule has.
+    /// How many stages the schedule has; a run has one more sync point than that.
     #[must_use]
     pub fn stage_count(&self) -> usize {
+        todo!()
+    }
+
+    /// Checks the schedule against `world`: its kind, its registry (every component the
+    /// tables name is registered, `Changed` columns are tracked, `Mut` never names a
+    /// maintained component, every transient reader follows a writer) and its resources
+    /// (every resource a system names is held). [`run_tick`](Self::run_tick) and
+    /// [`run_pass`](Self::run_pass) run it first and fail the same way, but they cannot hand
+    /// the world back on failure, so a caller checks here before it starts the loop.
+    pub fn prepare(&mut self, world: &World) -> core::result::Result<(), ScheduleError> {
         todo!()
     }
 
@@ -124,16 +136,17 @@ impl Schedule {
     /// every reduction merged through its [`Reducer`](lactose_math::Reducer).
     ///
     /// The world is taken by value and handed back when the tick resolves, because the run
-    /// shares it with jobs on other workers: a future that is dropped or forgotten mid-tick
-    /// then leaks the world rather than leaving a borrow the jobs still write through. The
-    /// future is `Send`, so a `'static` task owning the world and the schedule can drive it
-    /// from the timer root; when it resolves nothing of the tick is executing.
+    /// shares it with jobs on other workers: a future dropped mid-tick drops the world when
+    /// the run's jobs have finished, and a forgotten one leaks it, but neither leaves a
+    /// borrow the jobs still write through. The future is `Send`, so a `'static` task
+    /// owning the world and the schedule can drive it from the timer root; when it resolves
+    /// nothing of the tick is executing.
     ///
-    /// Errors: kind `Cancelled` if the executor shuts down first (the world is then torn
-    /// and not handed back); kind `NotFound` for a resource a system names that the world
-    /// does not hold, or a schedule check that needs the registry (the message names the
-    /// [`ScheduleError`]), reported before anything runs with the world handed back
-    /// untouched; kind `InvalidData` if the world's kind is not the schedule's.
+    /// Errors, on none of which the world is handed back: kind `Cancelled` if the executor
+    /// shuts down first (the world is torn); kind `InvalidData` carrying a
+    /// [`ScheduleError`] message if [`prepare`](Self::prepare) fails, reported before
+    /// anything runs. A caller that wants to keep the world on a `prepare` failure calls
+    /// `prepare` first.
     #[allow(clippy::manual_async_fn, reason = "the `Send` bound is the contract")]
     pub fn run_tick<'a>(
         &'a mut self,
@@ -200,8 +213,9 @@ pub enum ScheduleError {
         /// The system.
         system: &'static str,
     },
-    /// An exclusive system takes [`Ctx`](crate::Ctx) or [`RegionRes`](crate::RegionRes).
-    RegionParamInExclusive {
+    /// An exclusive system or a finalize function takes [`Ctx`](crate::Ctx) or
+    /// [`RegionRes`](crate::RegionRes).
+    RegionParamInWorldSystem {
         /// The system.
         system: &'static str,
     },
@@ -217,7 +231,9 @@ pub enum ScheduleError {
         /// The system.
         system: &'static str,
     },
-    /// Two parameters of one system name the same component.
+    /// Two data parameters (`&T`, `Mut<T>`, `Option<&T>`, `Option<Mut<T>>`) of one system
+    /// name the same component, or `Without<T>` stands beside any parameter on `T`.
+    /// `Changed<T>` and `With<T>` beside one data parameter on `T` are fine.
     AliasedParameter {
         /// The system.
         system: &'static str,
@@ -275,6 +291,13 @@ pub enum ScheduleError {
         reader: &'static str,
         /// The column.
         component: ComponentKey,
+    },
+    /// A system names a resource the world does not hold.
+    MissingResource {
+        /// The system.
+        system: &'static str,
+        /// The resource's name.
+        resource: &'static str,
     },
 }
 

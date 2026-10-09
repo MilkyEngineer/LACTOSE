@@ -19,8 +19,9 @@ pub trait Event: Copy + Send + Sync + 'static {
 /// Emits events of type `E`.
 ///
 /// Events emitted in a tick are visible to every system ordered after the emitter in the
-/// same tick, in order of (emitting system, source origin key, sequence), and are cleared
-/// at the next input sync point. The schedule requires every reader of `E` to be ordered
+/// same tick, in order of (emitting system, source, sequence) with sources ordered as
+/// commands are (the once-per-tick invocation, per-region invocations by `RegionId`, entity
+/// sources by origin key), and are cleared at the next input sync point. The schedule requires every reader of `E` to be ordered
 /// after every emitter of `E`, so what a reader sees never depends on scheduling. A
 /// placeholder target is a debug assertion: the entity does not exist until the buffer
 /// applies.
@@ -130,7 +131,8 @@ pub struct PresentEvents<'w> {
 }
 
 impl PresentEvents<'_> {
-    /// Emits `event` for `origin` at the current tick.
+    /// Emits `event` for `origin`, the entity the event is about, at the current tick. A
+    /// per-region or once-per-tick system names the entity itself.
     pub fn emit<P: PresentEvent>(&mut self, origin: StableKey, event: P) {
         todo!()
     }

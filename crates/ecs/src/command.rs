@@ -47,11 +47,11 @@ tuple_bundles! {
 
 /// The command buffer of one system invocation.
 ///
-/// Commands apply at the sync point that ends the stage, in the stage's execution order,
-/// then by (source origin key, sequence within the invocation) inside a system; a
-/// per-region invocation sorts by its region before the entity sources, and a once-per-tick
-/// invocation before those. The order is therefore the same on every build, platform,
-/// worker count and layout.
+/// Commands apply at the sync point that ends the stage, or at the closing sync point of
+/// the tick for the last stage, in the stage's execution order, then by (source, sequence
+/// within the invocation) inside a system, where sources order as: the once-per-tick
+/// invocation, then per-region invocations by `RegionId`, then entity sources by origin
+/// key. The order is therefore the same on every build, platform, worker count and layout.
 ///
 /// A placeholder returned by [`spawn`](Self::spawn) or [`spawn_in`](Self::spawn_in) is
 /// valid in this buffer only: in later commands of the same invocation, in component values
@@ -78,11 +78,14 @@ impl Commands<'_> {
     ///
     /// At apply the entity receives its origin key. It is `Predicted` when the source entity
     /// has [`ClaimedBy`](crate::ClaimedBy), the player has an input tick this tick and the
-    /// system's worlds include `prediction`: the player, that input tick and the spawn's
-    /// ordinal among the player's predicted spawns this tick, in command order; the entity
-    /// inherits the claim and carries [`PredictedOrigin`](crate::PredictedOrigin), and on
-    /// the server a runtime `NetId` is allocated and bound to it as well (architecture
-    /// section 7). Otherwise, on the server, the key is a runtime `NetId`; in a client or
+    /// system's worlds include both `server` and `prediction`: the player, that input tick
+    /// and an ordinal that is the low 32 bits of xxh64 over (source origin key, system key,
+    /// spawn index within the invocation), so no spawn the other machine cannot reproduce
+    /// shifts it; the entity inherits the claim and carries
+    /// [`PredictedOrigin`](crate::PredictedOrigin), and on the server a runtime `NetId` is
+    /// allocated and bound to it as well (architecture section 7). A `Predicted` key that
+    /// is already live is a collision: the spawn is then not predicted. Otherwise, on the
+    /// server, the key is a runtime `NetId` and no claim passes on; in a client or
     /// prediction world the spawn is dropped.
     pub fn spawn<B: Bundle>(&mut self, bundle: B) -> StableKey {
         todo!()

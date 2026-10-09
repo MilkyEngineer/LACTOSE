@@ -104,15 +104,16 @@ pub struct PlayerId(pub u32);
 /// Key of a spawn the server has not confirmed yet, and the permanent origin key of that
 /// entity on both machines afterwards.
 ///
-/// `ordinal` is the spawning command's position in that tick's total command order,
-/// restricted to the player's input-driven sources.
+/// `ordinal` identifies the spawning invocation: a hash of the source entity's origin key,
+/// the system key and the spawn's index within the invocation (architecture section 7), so
+/// no spawn the other machine cannot reproduce shifts it.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
 pub struct PredictionKey {
     /// The player whose input produced the spawn.
     pub player: PlayerId,
     /// The input tick that produced the spawn.
     pub input_tick: Tick,
-    /// Position among that player's input-driven spawns in the tick.
+    /// The hash of the spawning invocation.
     pub ordinal: u32,
 }
 

@@ -89,6 +89,11 @@ disallowed-methods = [
   { path = "f64::rem_euclid", reason = "goes through `%`, the platform fmod; use lactose_math" },
   { path = "f64::div_euclid", reason = "goes through `%`, the platform fmod; use lactose_math" },
   { path = "f64::mul_add", reason = "result depends on the caller's target features; use lactose_math::Scalar::mul_add" },
+  # Architecture section 8.2: the worker index is never a semantic key. `lactose-ecs` keeps
+  # per-slot partials and opts out at those call sites, item by item, like `lactose-math` does
+  # for the float methods.
+  { path = "lactose_task::JobContext::slot", reason = "the worker index is not a semantic key; key by StableKey", allow-invalid = true },
+  { path = "lactose_task::ChildContext::slot", reason = "the worker index is not a semantic key; key by StableKey", allow-invalid = true },
 ]
 
 disallowed-types = [

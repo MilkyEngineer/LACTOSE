@@ -352,11 +352,12 @@ tick N        tick N+1 simulation ───────────────�
   reading system last ran, each change seen exactly once by each reader, which needs a
   per-row stamp and so is allowed on tracked columns only. Replicated columns use
   `set_if_neq` so rewriting an equal value does not dirty the row. Because each row's tick is its own word, chunk jobs may split at any row without a shared
-  write; no atomics are involved. Whole-column slice access takes an explicit dirty-range
-  out-parameter.
-  Extract keeps a last-seen tick. Replication keeps a per-client, per-entity acked tick
-  (section 9.3). After a rollback restore or a load, ticks are rebased and every consumer's
-  state reset, forcing a full pass.
+  write; no atomics are involved. Whole-column slice access records the rows it changed in
+  an explicit row set.
+  Extract keeps a last-seen mark. Replication keeps a per-client, per-entity acked tick
+  (section 9.3). After a rollback restore or a whole-world load, stored change stamps are
+  rebased (a restore puts them back as snapshotted) and every consumer's state is reset,
+  forcing a full pass; a region load stamps its rows at the current tick instead.
 - **Regions** are the unit of streaming, relevance and persistence. Region membership is a
   component; chunks belong to archetypes, not regions, so scattered players do not fragment
   storage into mostly-empty chunks. Region operations (unload, save, relevance) are filtered
@@ -381,7 +382,9 @@ tick N        tick N+1 simulation ───────────────�
 This is the surface every agent writes against. Access is declared by parameter types; the
 `#[system]` macro emits an explicit access table at compile time, so there is no runtime
 introspection. A system body is a kernel that the scheduler runs once per entity across chunk
-jobs; multi-phase logic is several systems. Exclusive systems take the whole world.
+jobs, or once per simulated region if it has no component parameter but a region context,
+or once per tick if it has neither; multi-phase logic is several systems. Exclusive systems
+take the whole world.
 
 ```rust
 // Per-entity kernel. `worlds` selects where it runs; the world injects its own filter, so a
@@ -406,7 +409,7 @@ fn throw_bomb(ctx: Ctx, cmd: Commands, key: StableKeyOf, held: &HeldItem, input:
         let bomb = cmd.spawn((Transform::at(..), Bomb { fuse: 180 }));   // StableKey::Placeholder
         cmd.set(*key, HeldItem { kind: ItemKind::None });
         cmd.set(bomb, ThrownBy { thrower: EntityRef::new(*key) });
-        let spread = ctx.rng(bomb).next_scalar();  // keyed by (region seed, tick, system, this entity's origin key, the placeholder's sequence)
+        let spread = ctx.rng(bomb).next_scalar();  // keyed by (region seed, tick, system, this entity's origin key, the placeholder's spawn index)
         cmd.physics().apply_impulse(bomb, input.aim * spread);
     }
 }
@@ -422,8 +425,8 @@ fn apply_damage(events: Events<Damage>, key: StableKeyOf, hp: Mut<Health>) {
     for d in events.for_target(*key) { hp.0 -= d.amount; }   // events are indexed by target key
 }
 
-// Presentation event. Keyed by (origin key, tick, kind) so rollback re-emission deduplicates
-// and events from mispredicted ticks are cancelled.
+// Presentation event. Keyed by (origin key, tick, kind, sequence) so rollback re-emission
+// deduplicates and events from mispredicted ticks are cancelled.
 #[system(name = "game_sim::footsteps", worlds = [server, prediction])]
 fn footsteps(present: PresentEvents, key: StableKeyOf, anim: &AnimState) {
     if anim.phase_crossed(0.5) { present.emit(*key, AudioRequest::Footstep); }
@@ -450,7 +453,7 @@ contract and D114 records the choices this section left open.
 | `EntityId` | one process | process-local allocator, index plus generation, `NonZeroU64` so `Option` is free | storage lookup only; never on the wire or disk |
 | `StableKey` | everywhere a reference is stored | enum: `Net(NetId)`, `Predicted(PredictionKey)`, `Placeholder(u32)` within one command buffer | `EntityRef` fields, relationships, render slots, event targets, RNG keys, ordering ties |
 | `NetId` | server and all clients, and saves | 64-bit with a tag bit. Cooked: hash of (authored scene GUID, authored placement GUID, child path of authored GUIDs), so clients derive it without a message and re-cooking preserves it. Every element is a GUID stored in the authored file, never a name, path or index, so renaming a scene or reordering siblings preserves the ID. Runtime: one server counter, assigned at command apply and persisted in the save | the `Net` arm of `StableKey`; the persistent ID of every entity that has one. There is no separate `PersistentId` |
-| `PredictionKey` | one client plus the server | (player ID, input tick, ordinal), where the input tick is the slot the player's input is applied for this tick and the ordinal is the spawn's position in that tick's total command order among the spawns commanded from entities the player has claimed by systems that run in the prediction world. The server records it as the entity's permanent origin key, persisted as a component so a save or a region overlay carries it | the `Predicted` arm of `StableKey` until the server binds a `NetId`; RNG and ordering use the origin key on both machines, so binding changes nothing. A predicted spawn the server never echoes is destroyed when the processed-input acknowledgement passes its input tick |
+| `PredictionKey` | one client plus the server | (player ID, input tick, ordinal), where the input tick is the slot the player's input is applied for this tick and the ordinal is a hash of the spawning invocation (the source entity's origin key, the system key, the spawn's index within the invocation), for a spawn commanded from an entity the player has claimed by a system that runs in both the server and the prediction world; a hash of the invocation rather than a position in the command order, so a spawn the other machine cannot reproduce shifts nothing. The server records it as the entity's permanent origin key, persisted as a component so a save or a region overlay carries it, and stored references hold origin keys so a load changes no bytes | the `Predicted` arm of `StableKey` until the server binds a `NetId`; RNG and ordering use the origin key on both machines, so binding changes nothing. A predicted spawn the server never echoes is destroyed when the processed-input acknowledgement passes its input tick |
 | `SystemKey` | build | xxh64 of the declared system name, collision-checked | command order ties, RNG stream selection |
 | `ComponentKey` | build, wire, disk | xxh64 of the declared component name, collision-checked | registry, protocol hash, save records |
 | `PlayerId` | session | server-assigned on join | prediction keys, interest sets, input queues |
@@ -614,8 +617,9 @@ capacity model.
 - Entities are addressed on the wire by short per-connection handles, not by 64-bit keys.
   Positions are quantised relative to region origin. Send rate 20 to 30 Hz.
 - When a region becomes relevant to a client, the server sends that region's overlay (or a
-  digest the client verifies against its cached copy) and the client applies it to the cooked
-  baseline before any static instance is uploaded to the GPU. The overlay is a region-scoped
+  digest the client verifies against its cached copy) with the region's seed and persistent
+  region resources beside it, and the client applies it to the cooked baseline before any
+  static instance is uploaded to the GPU. The overlay is a region-scoped
   document, distinct from the row replication stream.
 - On the client, `net` owns an interpolation buffer per remote entity holding received states.
   The presentation schedule samples it each frame, about two send intervals in the past,
@@ -636,8 +640,8 @@ capacity model.
   predicted-only filter; game code never writes it. The local player exists in both client
   worlds, and the prediction world's copy shadows the replicated one for extract and the
   render slot table.
-- Presentation events emitted during re-simulation deduplicate by (origin key, tick, kind),
-  and events from ticks that were mispredicted are cancelled.
+- Presentation events emitted during re-simulation deduplicate by (origin key, tick, kind,
+  sequence), and events from ticks that were mispredicted are cancelled.
 - Ring depth is derived at runtime from the frame re-simulation budget divided by the measured
   per-tick cost, with a configurable cap. Corrections deeper than the ring trigger a rebuild
   from replicated state. Section 10 defines what a snapshot holds.
@@ -843,7 +847,7 @@ The save is a set of typed records per region against the cooked baseline, each 
 `SetField`, `OwnershipChange` (a change of owning entity). A cooked entity that moves from
 region A to region B becomes `Destroy` in A's set and `SpawnFromBaseline` with its current
 fields in B's set, so B loads correctly without A. The baseline content hash is recorded per
-region. Region unloading writes the same records, so unloading and saving are one code path,
+region, and the region's seed and persistent region resources are saved beside its records. Region unloading writes the same records, so unloading and saving are one code path,
 and the same records are what the server sends a client when the region becomes relevant
 (section 9.3). The record format lives in `bundle` so `cook`, `asset`, `persist` and `net`
 share it. Each region state has
@@ -979,7 +983,7 @@ The policy is in section 3.
 | Crate | Why |
 |---|---|
 | `task` | deques, scope borrows, panic guard |
-| `ecs` | chunk column storage |
+| `ecs` | chunk column storage; the `#[system]` expansion's call of `unsafe SystemDescriptor::new`, which lands in the invoking crate like the `#[component]` impl and whose proof is in `crates/ecs/SAFETY.md` |
 | `io` | platform completion APIs |
 | `rhi-vulkan`, `rhi-metal`, `rhi-dx12` | FFI to graphics drivers (`rhi-api` and `rhi-null` are not exempt) |
 | `platform` | present-thread QoS and window handles |

@@ -13,15 +13,18 @@ use crate::region::RegionId;
 /// and given back to [`World::changed_since`](crate::World::changed_since) and
 /// [`World::is_current`](crate::World::is_current).
 ///
-/// A mark records the tick and the world's epoch. A restore, a whole-world load or a
-/// change-stamp rebase starts a new epoch, so a mark from before it is stale: the methods
-/// that take one then return `None` or `false`, and the consumer does a full pass and
-/// takes a fresh mark. A region load does not start an epoch: its rows are stamped at the
-/// current tick and logged as spawned, so consumers pick them up incrementally.
+/// A mark records the world's epoch and a point in the tick's stamp order: between ticks it
+/// is after every position of the tick, so a direct write made after the mark, or a write
+/// in a later `run_pass`, is newer than it. A restore, a whole-world load or a change-stamp
+/// rebase starts a new epoch, so a mark from before it is stale: the methods that take one
+/// then return `None` or `false`, and the consumer does a full pass and takes a fresh mark.
+/// A region load does not start an epoch: its rows are stamped at the current tick and
+/// logged as spawned, so consumers pick them up incrementally.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct ChangeMark {
     epoch: u32,
     tick: Tick,
+    position: u32,
 }
 
 impl ChangeMark {
@@ -33,8 +36,8 @@ impl ChangeMark {
 }
 
 /// Rows of component `T` changed since a mark: those whose change stamp is newer than the
-/// mark's tick. `T` is a tracked column (replicated or extracted). Storage order, which is
-/// not a semantic key: the consumer keys what it produces by the row's key.
+/// mark. `T` is a tracked column (replicated or extracted). Storage order, which is not a
+/// semantic key: the consumer keys what it produces by the row's key.
 pub struct ChangedRows<'w, T: Component> {
     _world: PhantomData<&'w T>,
 }
@@ -122,10 +125,11 @@ impl<T: Component> ColumnMut<'_, T> {
         todo!()
     }
 
-    /// Writes through `f`, which receives the rows' keys and values and must record every
-    /// row it changed; those rows are marked changed at the current tick when `f` returns.
-    /// A row written and not recorded keeps its old stamp, which replication and extract
-    /// then miss.
+    /// Writes through `f`, which receives the rows' keys and values and records every row
+    /// it changed; those rows are stamped at the current point when `f` returns. A row
+    /// written and not recorded keeps its old stamp, which replication and extract then
+    /// miss; that is how `lactose-predict` writes a correction after a restore without
+    /// inventing a change.
     pub fn write(self, f: impl FnOnce(&[StableKey], &mut [T], &mut DirtyRows)) {
         todo!()
     }

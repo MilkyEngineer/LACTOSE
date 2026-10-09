@@ -89,9 +89,10 @@ pub struct OwnedBy {
 /// claimed (architecture section 9.4). Two uses:
 ///
 /// - A spawn commanded from an entity with this component, by a system whose worlds include
-///   `prediction`, receives a [`StableKey::Predicted`](lactose_core::StableKey::Predicted)
-///   origin key formed from this player, the player's input tick this tick and the spawn's
-///   ordinal among that player's predicted spawns this tick; the spawned entity inherits
+///   both `server` and `prediction`, receives a
+///   [`StableKey::Predicted`](lactose_core::StableKey::Predicted) origin key formed from
+///   this player, the player's input tick this tick and an ordinal hashed from the
+///   invocation ([`Commands::spawn`](crate::Commands::spawn)); the spawned entity inherits
 ///   the claim. The server and the client therefore derive the same key.
 /// - The prediction world runs its per-entity systems only over rows that have it; game
 ///   code never writes that filter.
@@ -120,7 +121,8 @@ pub struct PredictedOrigin {
     /// The player's input tick at the spawn.
     #[field(id = 2)]
     pub input_tick: Tick,
-    /// The spawn's ordinal among the player's predicted spawns in that tick.
+    /// The spawn's ordinal: the low 32 bits of xxh64 over (source origin key, system key,
+    /// spawn index within the invocation).
     #[field(id = 3)]
     pub ordinal: u32,
 }

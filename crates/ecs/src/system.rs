@@ -55,8 +55,9 @@ impl SystemSet {
 ///
 /// The function itself stays callable as written, with every parameter binding made
 /// mutable. The access table is the [`SystemParam::ACCESS`](crate::SystemParam::ACCESS) of
-/// each parameter in declaration order, followed by those of the finalize function's
-/// parameters for a reduction.
+/// each parameter in declaration order; a reduction's finalize function has a table of its
+/// own, since the per-kind rules differ between the kernel and the finalize, and conflicts
+/// use their union.
 pub struct SystemDescriptor {
     name: &'static str,
     key: SystemKey,
@@ -64,6 +65,7 @@ pub struct SystemDescriptor {
     set: Option<&'static SystemSet>,
     after: &'static [&'static SystemDescriptor],
     access: &'static [Access],
+    finalize_access: &'static [Access],
     exclusive: bool,
     reduce: Option<&'static str>,
     kernel: Kernel,
@@ -75,11 +77,11 @@ impl SystemDescriptor {
     ///
     /// # Safety
     ///
-    /// `access` must describe exactly what `kernel` touches: every component, resource,
-    /// event and channel it reads or writes, with the right kind. The schedule orders
-    /// systems by this table, and the storage hands out `&mut` rows on the strength of it
-    /// (`SAFETY.md`). The `#[system]` expansion derives the table from the parameter types
-    /// and is the one sound caller.
+    /// `access` must describe exactly what `kernel.run` touches and `finalize_access` what
+    /// `kernel.finalize` touches: every component, resource, event and channel each reads
+    /// or writes, with the right kind. The schedule orders systems by these tables, and the
+    /// storage hands out `&mut` rows on the strength of them (`SAFETY.md`). The `#[system]`
+    /// expansion derives both from the parameter types and is the one sound caller.
     #[doc(hidden)]
     #[must_use]
     #[allow(clippy::too_many_arguments, reason = "positional on purpose: see above")]
@@ -89,6 +91,7 @@ impl SystemDescriptor {
         set: Option<&'static SystemSet>,
         after: &'static [&'static SystemDescriptor],
         access: &'static [Access],
+        finalize_access: &'static [Access],
         exclusive: bool,
         reduce: Option<&'static str>,
         kernel: Kernel,
@@ -100,6 +103,7 @@ impl SystemDescriptor {
             set,
             after,
             access,
+            finalize_access,
             exclusive,
             reduce,
             kernel,
@@ -137,10 +141,16 @@ impl SystemDescriptor {
         self.after
     }
 
-    /// The access table.
+    /// The kernel's access table.
     #[must_use]
     pub const fn access(&self) -> &'static [Access] {
         self.access
+    }
+
+    /// The finalize function's access table; empty without a reduction.
+    #[must_use]
+    pub const fn finalize_access(&self) -> &'static [Access] {
+        self.finalize_access
     }
 
     /// Whether the system takes the whole world and runs alone at a sync point.

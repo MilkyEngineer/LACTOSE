@@ -7,9 +7,9 @@ use lactose_math::Scalar;
 /// a counter the stream holds; no state is shared and no draw depends on which worker runs
 /// it or on any other stream.
 ///
-/// A placeholder key from the same invocation is keyed through the invoking entity's origin
-/// key and the placeholder's sequence number, which is the same on every machine that runs
-/// the same command.
+/// Every stream mixes the invoking entity's origin key, and a placeholder from the same
+/// invocation is keyed by its spawn index, which is the same on every machine that runs the
+/// same invocation.
 #[derive(Clone, Debug)]
 pub struct Rng {
     key: [u64; 4],

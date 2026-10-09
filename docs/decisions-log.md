@@ -1152,12 +1152,13 @@ rationale the author supplied during the editorial pass rather than one taken fr
     the prediction world's filter, since a claimed entity is exactly a predicted one.
   - *A placeholder is an RNG key.* `ctx.rng(bomb)` in the example keys a draw by an entity
     whose origin key is assigned only at apply; the draw is keyed by the invoking entity's
-    origin key and the placeholder's sequence number instead, which both machines agree on.
+    origin key and the placeholder's spawn index instead, which both machines agree on.
   - *Stages are declared on the builder; sets are statics with `after` lists; exclusive
     systems run at the sync point that begins their stage; a system without a component
-    parameter runs once per tick.* The sync-point count is then fixed per schedule as
-    section 5.2 requires, and a shared registration function serves every world kind because
-    `add` skips a system whose worlds exclude the builder's kind.
+    parameter runs once per tick* (refined by the review: once per region if it has a
+    `Ctx`). The sync-point count is then fixed per schedule as section 5.2 requires, and a
+    shared registration function serves every world kind because `add` skips a system whose
+    worlds exclude the builder's kind.
   - *`World::spawn` takes the key; only `Commands::spawn` assigns one.* Replication and
     prediction insert entities under the server's key; a hidden policy in the direct method
     would be a second key source.
@@ -1176,7 +1177,8 @@ rationale the author supplied during the editorial pass rather than one taken fr
   - *`Schedule::run_tick` is an `async fn` taking `&mut World` and `&Executor`.* The timer
     root is a task on a worker, where `block_on` is a debug assertion; the implementation
     lends the world to the run's graph nodes on the strength of the `GraphRun` resolution
-    guarantee (`crates/ecs/SAFETY.md`).
+    guarantee (`crates/ecs/SAFETY.md`). Superseded by the review: the world is taken by
+    value (below).
   - *Bundles are tuples only.* A blanket `impl Bundle for T: Component` is rejected by
     coherence beside tuple impls, because `Component` is a foreign trait.
   - *`StableKeyOf` dereferences to `StableKey`;* `*key` where a plain key is needed. The
@@ -1212,7 +1214,31 @@ rationale the author supplied during the editorial pass rather than one taken fr
   `unsafe`, since the schedule's soundness rests on the table it takes. Deferred as additive
   attribute flags: the overload ladder's decimation (§9.7) and `ordered` or per-region
   reductions (§5.2).
-- Driven by: milestone 0, the ECS facade and its design review (2026-10-10).
+- What the second review round changed (0 blocking, 7 serious, 10 minor; `a0b2ac4` was the
+  facade between the rounds): the descriptor carries the finalize function's access table
+  separately, since a flat table could not tell a finalize's `ResMut` from the kernel's; the
+  predicted ordinal is a hash of the spawning invocation (source origin key, system key,
+  spawn index) rather than a position in the command order, because one spawn the client
+  cannot reproduce shifted every later key of the player, and only systems that run in both
+  the server and the prediction world produce predicted keys; the boundary lint file bans
+  `JobContext::slot` and `ChildContext::slot`, since `Job` would otherwise hand game code
+  the worker index; the alias rule is two data parameters on one component or `Without`
+  beside any, so `Changed<T>` beside `&T` is allowed; a restore puts change stamps back
+  verbatim and a correction written without recording leaves them alone, so a re-simulated
+  tick's `Changed` filters see what the first run saw; stored references hold origin keys
+  and exports write them as stored, so a reference to a predicted entity round-trips and
+  the hash is unchanged by a load; a region's seed and persistent resources travel beside
+  the overlay, since `Overlay` cannot carry them, and `load_region` loads into a region the
+  caller created; `Schedule::prepare` runs the world-dependent checks by reference, as
+  `run_tick` cannot hand the world back on an error; a closing sync point applies the last
+  stage's buffers so a snapshot point never has a pending buffer; a `ChangeMark` is a point
+  in the stamp order so a direct write after it is newer than it; `World::query` and
+  `columns_mut` refuse the components `get_mut` refuses; `set_rollback_horizon` tells the
+  world what it may prune; events order as commands do; `worlds` omitted means
+  `[server, prediction]`; `QueryItems` is sealed; the `unsafe` block of the expansion is
+  spanned at the call site and the finalize's hidden fetches are `unsafe fn`; section 21
+  names the expansion.
+- Driven by: milestone 0, the ECS facade and its two design-review rounds (2026-10-10).
 
 **D115. The boundary check resolves features as a workspace build does** (§8.3, `tools/xtask`)
 - Why: `cargo xtask boundary` computed each boundary crate's third-party closure from a

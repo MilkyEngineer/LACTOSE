@@ -6,7 +6,7 @@ use core::marker::PhantomData;
 use lactose_core::StableKey;
 use lactose_reflect::Component;
 
-use crate::param::{Changed, Mut, SystemParam, With, Without};
+use crate::param::{Changed, Mut, SystemParam, With, Without, sealed};
 
 /// A per-entity parameter type that may appear in a query tuple: `&T`, [`Mut<T>`],
 /// `Option<&T>`, `Option<Mut<T>>`, [`With<T>`], [`Without<T>`] and [`Changed<T>`]. Closed,
@@ -44,9 +44,12 @@ impl<T: Component> QueryItem for Changed<T> {
     type Item<'a> = Changed<T>;
 }
 
-/// One [`QueryItem`] or a tuple of up to eight, each on a different component; a bare
-/// `&T` and `(&T,)` both work.
-pub trait QueryItems {
+/// One [`QueryItem`] or a tuple of up to eight; a bare `&T` and `(&T,)` both work. Closed,
+/// like [`SystemParam`]. The alias rule of a kernel applies: two data items on one
+/// component, or `Without<T>` beside any item on `T`, is a panic at
+/// [`World::query`](crate::World::query); `Changed<T>` and `With<T>` combine with one data
+/// item on `T`.
+pub trait QueryItems: sealed::Sealed {
     /// The items with the query's borrow.
     type Item<'a>;
 }
@@ -57,6 +60,8 @@ impl<Q: QueryItem> QueryItems for Q {
 
 macro_rules! tuple_query_items {
     ($(($($name:ident),+);)+) => {$(
+        impl<$($name: QueryItem),+> sealed::Sealed for ($($name,)+) {}
+
         impl<$($name: QueryItem),+> QueryItems for ($($name,)+) {
             type Item<'a> = ($($name::Item<'a>,)+);
         }

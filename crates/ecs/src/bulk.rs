@@ -5,9 +5,11 @@ use lactose_bundle::ComponentData;
 use lactose_core::NetId;
 
 /// Every persistent component of one entity, as [`World::export_region`](crate::World::export_region)
-/// copies it out. `EntityRef` fields hold `Net` keys: a reference to a predicted entity is
-/// written as its bound `NetId`. Bytes are copied as laid out in memory and not
-/// canonicalised; `lactose-persist` canonicalises scalars when it serialises through
+/// copies it out. `EntityRef` fields are written as stored, which is the target's origin
+/// key: a reference to a predicted entity stays `Predicted` and resolves after a load
+/// through the target's [`PredictedOrigin`](crate::PredictedOrigin), so the bytes, and the
+/// hash over them, are the same before and after. Bytes are copied as laid out in memory
+/// and not canonicalised; `lactose-persist` canonicalises scalars when it serialises through
 /// `lactose-reflect`, and a NaN in a persistent column is a debug assertion before that
 /// (architecture section 8.2).
 #[derive(Clone, PartialEq, Eq, Debug)]

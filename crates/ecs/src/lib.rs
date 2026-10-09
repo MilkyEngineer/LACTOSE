@@ -61,8 +61,8 @@ pub use event::{
     PresentEventKey, PresentEvents, PresentKind,
 };
 /// Declares a reduction's finishing step: `#[finalize(system_fn)]` on a function whose first
-/// parameter is the reducer's output and whose other parameters are resource, command and
-/// event parameters. See the crate `README.md` for what the attribute emits.
+/// parameter is the reducer's output and whose other parameters are those a once-per-tick
+/// system may take. See the crate `README.md` for what the attribute emits.
 pub use lactose_ecs_macros::finalize;
 /// Declares a system: `#[system(name = "crate::name", worlds = [server, prediction], ...)]`
 /// on a function whose parameters are [`SystemParam`] types. See the crate `README.md` for
@@ -96,6 +96,7 @@ const _: () = {
     send::<ColumnMut<'_, InRegion>>();
     send::<Schedule>();
     send::<WorldSnapshot>();
+    send_sync::<SystemDescriptor>();
 };
 
 /// Items the `#[system]` and `#[finalize]` expansions name. Not part of the interface: the
