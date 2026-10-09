@@ -69,7 +69,7 @@ pub struct ScheduleBuilder {
 
 struct StageSpec {
     name: &'static str,
-    sets: &'static [&'static SystemSet],
+    sets: Vec<&'static SystemSet>,
     systems: Vec<&'static SystemDescriptor>,
 }
 
@@ -94,8 +94,8 @@ impl ScheduleBuilder {
     /// sync point is the input sync point, where transient columns are zeroed, events,
     /// channels and input ticks are cleared, and inputs, staged network state and asset
     /// version tables are applied by the exclusive systems placed there.
-    pub fn stage(&mut self, name: &'static str, sets: &'static [&'static SystemSet]) -> &mut Self {
-        self.stages.push(StageSpec { name, sets, systems: Vec::new() });
+    pub fn stage(&mut self, name: &'static str, sets: &[&'static SystemSet]) -> &mut Self {
+        self.stages.push(StageSpec { name, sets: sets.to_vec(), systems: Vec::new() });
         self
     }
 
@@ -391,7 +391,7 @@ fn order_stage(
     }
 
     // Sets: their order within the stage, transitively.
-    let sets: Vec<&'static SystemSet> = spec.sets.to_vec();
+    let sets: Vec<&'static SystemSet> = spec.sets.clone();
     let set_index: BTreeMap<&'static str, usize> =
         sets.iter().enumerate().map(|(index, set)| (set.name(), index)).collect();
     let mut set_preds: Vec<BTreeSet<usize>> = vec![BTreeSet::new(); sets.len()];

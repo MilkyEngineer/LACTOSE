@@ -94,7 +94,7 @@ impl World {
                 Command::Set(key, mut component) => {
                     match resolve(&self.storage.entities, &self.aliases, &placeholders, key) {
                         Some(key) => {
-                            self.resolve_references(&mut component, &placeholders, None);
+                            self.resolve_references(&mut component, Some(&placeholders), None);
                             if let Err(error) = self.write_component(key, component, stamp) {
                                 tracing::debug!(target: "casein", ?key, %error, "a set dropped");
                             }
@@ -209,7 +209,7 @@ impl World {
         };
         placeholders[index as usize] = Some(key);
         for component in &mut components {
-            self.resolve_references(component, placeholders, Some(key));
+            self.resolve_references(component, Some(placeholders), Some(key));
         }
         if let Err(error) = self.spawn_entity(key, region, components, stamp) {
             placeholders[index as usize] = None;

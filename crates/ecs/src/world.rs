@@ -15,7 +15,7 @@ use lactose_core::{
     PredictionKey, Result, StableKey, SystemKey, Tick,
 };
 use lactose_reflect::{
-    Component, FieldKind, Persistence, Reflect, Registry, Resource, TypeInfo, TypeRole,
+    Component, FieldKind, Reflect, Registry, Resource, TypeInfo, TypeRole,
 };
 
 use crate::bulk::RegionRows;
@@ -24,7 +24,7 @@ use crate::change::{
     ErasedColumns, LogCursor, Stamp, StructuralChange, StructuralLog,
 };
 use crate::command::{
-    Bundle, ChannelEntry, ChannelStore, CommandChannel, ErasedComponent, erase_bundle,
+    Bundle, ChannelEntry, ChannelStore, CommandChannel, ErasedComponent, Payload, erase_bundle,
     is_worlds_own,
 };
 use crate::event::{EventStore, PresentEventBatch, PresentLog};
@@ -546,7 +546,7 @@ impl World {
             return Err(invalid("`InRegion` and `PredictedOrigin` are written by the world only"));
         }
         for component in &mut components {
-            self.resolve_references(component, &[], Some(key));
+            self.resolve_references(component, None, Some(key));
         }
         let stamp = self.bump();
         self.spawn_entity(key, region, components, stamp)
@@ -566,7 +566,7 @@ impl World {
         assert!(!is_worlds_own(T::KEY), "`{}` is written by the world only", T::SCHEMA.name());
         let origin = self.origin(key).ok_or_else(|| not_found("no such entity"))?;
         let mut component = ErasedComponent::of(value);
-        self.resolve_references(&mut component, &[], None);
+        self.resolve_references(&mut component, None, None);
         let stamp = self.bump();
         self.write_component(origin, component, stamp)
     }
@@ -1240,29 +1240,29 @@ impl World {
         order
     }
 
-    /// Rewrites the references of `component` to origin keys: a placeholder through
-    /// `placeholders`, a bound `Net` key to the predicted origin, and a reference to an
-    /// entity that does not exist (other than `spawning`) to the empty reference.
+    /// Rewrites the references of `component` to origin keys: a bound `Net` key to the
+    /// predicted origin. At command apply (`placeholders` given) a placeholder resolves
+    /// through the buffer's spawns and a reference to an entity that does not exist, other
+    /// than `spawning`, is written empty (architecture section 6, "validated at apply"); a
+    /// direct write keeps it, as replication and a load do, since the target may arrive
+    /// later, and a placeholder there names nothing and is written empty.
     pub(crate) fn resolve_references(
         &self,
         component: &mut ErasedComponent,
-        placeholders: &[Option<StableKey>],
+        placeholders: Option<&[Option<StableKey>]>,
         spawning: Option<StableKey>,
     ) {
-        let Some(remap) = component.remap else { return };
-        remap(&mut component.bytes, &mut |reference: &mut EntityRef| {
+        let Payload::Typed(value) = &mut component.payload else { return };
+        let live = |key: StableKey| Some(key) == spawning || self.storage.entities.contains_key(&key);
+        value.remap(&mut |reference: &mut EntityRef| {
             let Some(key) = reference.get() else { return };
-            let resolved = match key {
-                StableKey::Placeholder(index) => {
-                    placeholders.get(index as usize).copied().flatten().filter(|&key| {
-                        Some(key) == spawning || self.storage.entities.contains_key(&key)
-                    })
+            let resolved = match (key, placeholders) {
+                (StableKey::Placeholder(index), Some(placeholders)) => {
+                    placeholders.get(index as usize).copied().flatten().filter(|&key| live(key))
                 }
-                key => {
-                    let key = self.canonical(key);
-                    (Some(key) == spawning || self.storage.entities.contains_key(&key))
-                        .then_some(key)
-                }
+                (StableKey::Placeholder(_), None) => None,
+                (key, Some(_)) => Some(self.canonical(key)).filter(|&key| live(key)),
+                (key, None) => Some(self.canonical(key)),
             };
             if resolved.is_none() {
                 tracing::debug!(target: "casein", ?key, "a reference to a missing entity is written empty");
@@ -1325,10 +1325,10 @@ impl World {
             let info = self.registry.get(component.key()).ok_or_else(|| {
                 not_found(format!("`{}` is not registered", component.info.name()))
             })?;
-            info.validate(&component.bytes)?;
+            info.validate(component.bytes())?;
             values.push(RowValue {
                 info,
-                bytes: component.bytes.clone(),
+                bytes: component.bytes().to_vec(),
                 stamp,
                 column_tick: stamp,
             });
@@ -1357,17 +1357,17 @@ impl World {
             .registry
             .get(component.key())
             .ok_or_else(|| not_found(format!("`{}` is not registered", component.info.name())))?;
-        info.validate(&component.bytes)?;
+        info.validate(component.bytes())?;
         let loc = self.storage.loc(key).ok_or_else(|| not_found("no such entity"))?;
         if let Some(old) = self.storage.component(loc, info.key()) {
             let old = old.to_vec();
             self.index_references(key, info, &old, false);
-            self.storage.write(loc, info.key(), &component.bytes, stamp);
+            self.storage.write(loc, info.key(), component.bytes(), stamp);
         } else {
             let (_, mut values) = self.storage.take(key).expect("the entity is live");
             values.push(RowValue {
                 info,
-                bytes: component.bytes.clone(),
+                bytes: component.bytes().to_vec(),
                 stamp,
                 column_tick: stamp,
             });
@@ -1377,7 +1377,7 @@ impl World {
             self.storage.push(archetype, key, &values);
             self.log.push(self.tick, StructuralChange::Added { key, component: info.key() });
         }
-        self.index_references(key, info, &component.bytes, true);
+        self.index_references(key, info, component.bytes(), true);
         Ok(())
     }
 

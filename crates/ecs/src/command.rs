@@ -63,46 +63,66 @@ pub(crate) fn erase_bundle<B: Bundle>(bundle: B) -> Vec<ErasedComponent> {
     out.components
 }
 
-/// Rewrites every `EntityRef` of a component value held as bytes.
-pub(crate) type RemapFn = fn(&mut [u8], &mut dyn FnMut(&mut EntityRef));
+/// A component value kept typed until apply, because its references may still be
+/// placeholders, which no stored value may hold: its bytes are not a valid value of the
+/// type until they are resolved.
+pub(crate) trait TypedComponent: Send + Sync {
+    /// Calls `f` on every `EntityRef` of the value, through `visit_references`.
+    fn remap(&mut self, f: &mut dyn FnMut(&mut EntityRef));
 
-/// One component value in transit, its type known only by its description.
+    fn bytes(&self) -> &[u8];
+}
+
+impl<T: Component> TypedComponent for T {
+    fn remap(&mut self, f: &mut dyn FnMut(&mut EntityRef)) {
+        struct Visitor<'a>(&'a mut dyn FnMut(&mut EntityRef));
+
+        impl ReferenceVisitor for Visitor<'_> {
+            fn entity_ref(&mut self, _: FieldId, value: &mut EntityRef) {
+                (self.0)(value);
+            }
+
+            fn asset_ref<A: AssetReference>(&mut self, _: FieldId, _: &mut A) {}
+        }
+
+        self.visit_references(&mut Visitor(f));
+    }
+
+    fn bytes(&self) -> &[u8] {
+        bytemuck::bytes_of(self)
+    }
+}
+
+/// What a component value in transit holds.
+pub(crate) enum Payload {
+    /// A value from a bundle or a command, whose references are resolved at apply.
+    Typed(Box<dyn TypedComponent>),
+    /// Bytes from a document, references kept as stored.
+    Bytes(Vec<u8>),
+}
+
+/// One component value in transit, its type known by its description.
 pub(crate) struct ErasedComponent {
     pub(crate) info: &'static TypeInfo,
-    pub(crate) bytes: Vec<u8>,
-    /// The typed reference rewrite, through `visit_references`; `None` for bytes loaded
-    /// from a document, whose references are kept as stored.
-    pub(crate) remap: Option<RemapFn>,
+    pub(crate) payload: Payload,
 }
 
 impl ErasedComponent {
     pub(crate) fn of<T: Component>(value: T) -> Self {
-        Self {
-            info: T::SCHEMA.info(),
-            bytes: bytemuck::bytes_of(&value).to_vec(),
-            remap: Some(remap_references::<T>),
-        }
+        Self { info: T::SCHEMA.info(), payload: Payload::Typed(Box::new(value)) }
     }
 
     pub(crate) fn key(&self) -> ComponentKey {
         self.info.key()
     }
-}
 
-fn remap_references<T: Component>(bytes: &mut [u8], f: &mut dyn FnMut(&mut EntityRef)) {
-    struct Visitor<'a>(&'a mut dyn FnMut(&mut EntityRef));
-
-    impl ReferenceVisitor for Visitor<'_> {
-        fn entity_ref(&mut self, _: FieldId, value: &mut EntityRef) {
-            (self.0)(value);
+    /// The value's bytes; validate them before they are stored.
+    pub(crate) fn bytes(&self) -> &[u8] {
+        match &self.payload {
+            Payload::Typed(value) => value.bytes(),
+            Payload::Bytes(bytes) => bytes,
         }
-
-        fn asset_ref<A: AssetReference>(&mut self, _: FieldId, _: &mut A) {}
     }
-
-    let mut value: T = bytemuck::checked::pod_read_unaligned(bytes);
-    value.visit_references(&mut Visitor(f));
-    bytes.copy_from_slice(bytemuck::bytes_of(&value));
 }
 
 /// Whether `T` is one of the two components only the world writes.

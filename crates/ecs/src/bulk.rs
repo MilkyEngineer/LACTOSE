@@ -9,7 +9,7 @@ use lactose_core::{
 };
 use lactose_reflect::{Persistence, Reflect, TypeInfo, TypeRole};
 
-use crate::command::ErasedComponent;
+use crate::command::{ErasedComponent, Payload};
 use crate::region::{InRegion, OwnedBy, PredictedOrigin, RegionId};
 use crate::storage::typed;
 use crate::world::World;
@@ -222,8 +222,7 @@ pub(crate) fn load_region(
             .into_iter()
             .map(|(component, bytes)| ErasedComponent {
                 info: world.registry.get(component).expect("checked above"),
-                bytes,
-                remap: None,
+                payload: Payload::Bytes(bytes),
             })
             .collect();
         world.spawn_entity(keys[&id], region, components, stamp)?;
