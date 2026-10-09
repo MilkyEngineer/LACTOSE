@@ -220,10 +220,19 @@ impl<'w, Q: QueryItems> Query<'w, Q> {
             .access
             .iter()
             .map(|&(kind, component)| {
+                // Filters on the component of a data item take no view.
+                let data = matches!(
+                    kind,
+                    AccessKind::Read
+                        | AccessKind::Write
+                        | AccessKind::OptionalRead
+                        | AccessKind::OptionalWrite
+                );
                 let view = archetype
                     .columns
                     .binary_search_by_key(&component, |c| c.key)
                     .ok()
+                    .filter(|_| data)
                     .and_then(|index| views[index].take());
                 match (kind, view) {
                     (AccessKind::Read | AccessKind::OptionalRead, Some(view)) => {

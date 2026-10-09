@@ -584,8 +584,17 @@ fn run_per_entity(
         let arch = &mut storage.archetypes[archetype];
         let columns = &arch.columns;
         let column_of = |key| columns.binary_search_by_key(&key, |c| c.key).ok();
-        let params: Vec<Option<usize>> =
-            table.iter().map(|access| component(access).and_then(column_of)).collect();
+        // The column each data parameter is handed; filters on the same component take none.
+        let params: Vec<Option<usize>> = table
+            .iter()
+            .map(|access| match access.kind() {
+                AccessKind::Read
+                | AccessKind::Write
+                | AccessKind::OptionalRead
+                | AccessKind::OptionalWrite => component(access).and_then(column_of),
+                _ => None,
+            })
+            .collect();
         let region_column = column_of(InRegion::KEY).expect("every row has a region");
         let claim_column = column_of(ClaimedBy::KEY);
         let changed_columns: Vec<usize> =
