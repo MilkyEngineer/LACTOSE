@@ -46,7 +46,9 @@ fn run(layout: LayoutConfig) -> Outcome {
         match id % 4 {
             0 => world.spawn(net(id), region, (Counter(0), mass)).unwrap(),
             1 => world.spawn(net(id), region, (Counter(0), mass, pos(1, 2), vel(0, 1))).unwrap(),
-            2 => world.spawn(net(id), region, (Counter(id), AnimState { phase: id as u32 })).unwrap(),
+            2 => {
+                world.spawn(net(id), region, (Counter(id), AnimState { phase: id as u32 })).unwrap()
+            }
             _ => world.spawn(net(id), region, (Counter(0), Health(50), mass)).unwrap(),
         }
         world.allocate_net_id().unwrap();
@@ -71,7 +73,8 @@ fn run(layout: LayoutConfig) -> Outcome {
         let batch = world.take_present_events();
         presented.extend(batch.emitted.iter().map(|e| (e.key.origin, e.key.tick.0)));
     }
-    let exports = [REGION, OTHER_REGION].map(|region| world.export_region(region).unwrap()).to_vec();
+    let exports =
+        [REGION, OTHER_REGION].map(|region| world.export_region(region).unwrap()).to_vec();
     let mut cursor = world.structural_log().cursor_at_start();
     let log = world.structural_log().since(&mut cursor).unwrap().copied().collect();
     (exports, log, world.resource::<TotalMass>().unwrap().0, presented)
@@ -86,7 +89,11 @@ fn every_layout_gives_the_same_bytes_and_the_same_log() {
         let outcome = run(layout);
         assert_eq!(outcome.0, reference.0, "exports under {layout:?}");
         assert_eq!(outcome.1, reference.1, "structural log under {layout:?}");
-        assert_eq!(outcome.2.to_canonical_bits(), reference.2.to_canonical_bits(), "reduction under {layout:?}");
+        assert_eq!(
+            outcome.2.to_canonical_bits(),
+            reference.2.to_canonical_bits(),
+            "reduction under {layout:?}"
+        );
         assert_eq!(outcome.3, reference.3, "presentation under {layout:?}");
     }
 }

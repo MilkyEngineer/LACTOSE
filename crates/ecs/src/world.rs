@@ -14,9 +14,7 @@ use lactose_core::{
     ComponentKey, EntityRef, Error, ErrorKind, FieldId, FixedHashMap, NetId, PlayerId,
     PredictionKey, Result, StableKey, SystemKey, Tick,
 };
-use lactose_reflect::{
-    Component, FieldKind, Reflect, Registry, Resource, TypeInfo, TypeRole,
-};
+use lactose_reflect::{Component, FieldKind, Reflect, Registry, Resource, TypeInfo, TypeRole};
 
 use crate::bulk::RegionRows;
 use crate::change::{
@@ -262,11 +260,14 @@ pub(crate) struct Aliases {
     pub(crate) by_net: BTreeMap<NetId, PredictionKey>,
 }
 
+/// Copies a reflected resource's `Box<T>` into a snapshot.
+pub(crate) type CloneFn = fn(&(dyn Any + Send + Sync)) -> Box<dyn Any + Send + Sync>;
+
 /// A world resource: the `Box<T>` of a reflected resource or a service, held as `Any`.
 pub(crate) struct ResourceEntry {
     pub(crate) value: Box<dyn Any + Send + Sync>,
     /// How to copy a reflected resource into a snapshot; `None` for a service.
-    pub(crate) clone: Option<fn(&(dyn Any + Send + Sync)) -> Box<dyn Any + Send + Sync>>,
+    pub(crate) clone: Option<CloneFn>,
     pub(crate) size: usize,
 }
 
@@ -1253,7 +1254,8 @@ impl World {
         spawning: Option<StableKey>,
     ) {
         let Payload::Typed(value) = &mut component.payload else { return };
-        let live = |key: StableKey| Some(key) == spawning || self.storage.entities.contains_key(&key);
+        let live =
+            |key: StableKey| Some(key) == spawning || self.storage.entities.contains_key(&key);
         value.remap(&mut |reference: &mut EntityRef| {
             let Some(key) = reference.get() else { return };
             let resolved = match (key, placeholders) {

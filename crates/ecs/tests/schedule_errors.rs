@@ -7,8 +7,8 @@ mod common;
 use common::*;
 use lactose_core::ErrorKind;
 use lactose_ecs::{
-    AccessTarget, Changed, Commands, Ctx, Events, EventWriter, Job, LayoutConfig, Mut, OwnedBy, Res,
-    ResMut, Schedule, ScheduleError, StableKeyOf, SystemDescriptor, SystemSet, Without, World,
+    AccessTarget, Changed, Commands, Ctx, EventWriter, Events, Job, LayoutConfig, Mut, OwnedBy,
+    Res, ResMut, Schedule, ScheduleError, StableKeyOf, SystemDescriptor, SystemSet, Without, World,
     WorldKind, system,
 };
 use lactose_reflect::{Reflect, component};
@@ -135,7 +135,10 @@ fn structural_errors() {
     let mut builder = Schedule::builder(WorldKind::Server);
     builder.add(&PLAIN);
     builder.stage("late", &[]);
-    assert_eq!(builder.build().map(|_| ()).unwrap_err(), ScheduleError::NoStage { system: "test::plain" });
+    assert_eq!(
+        builder.build().map(|_| ()).unwrap_err(),
+        ScheduleError::NoStage { system: "test::plain" }
+    );
     // A system whose worlds exclude the kind is skipped, so it cannot be an orphan.
     let mut builder = Schedule::builder(WorldKind::Client);
     builder.add(&PLAIN);
@@ -143,11 +146,7 @@ fn structural_errors() {
 
     assert_eq!(
         build_error(&[&DUP_A, &DUP_B]),
-        ScheduleError::DuplicateKey {
-            first: "test::dup",
-            second: "test::dup",
-            key: DUP_A.key(),
-        }
+        ScheduleError::DuplicateKey { first: "test::dup", second: "test::dup", key: DUP_A.key() }
     );
     assert_eq!(
         build_error(&[&IN_ELSEWHERE]),
@@ -162,7 +161,10 @@ fn structural_errors() {
 #[test]
 fn parameter_errors() {
     let cases: [(&'static SystemDescriptor, ScheduleError); 10] = [
-        (&EXCLUSIVE_ENTITY, ScheduleError::ExclusiveWithEntityAccess { system: "test::exclusive_entity" }),
+        (
+            &EXCLUSIVE_ENTITY,
+            ScheduleError::ExclusiveWithEntityAccess { system: "test::exclusive_entity" },
+        ),
         (&KEY_ALONE, ScheduleError::EntityParamInWorldSystem { system: "test::key_alone" }),
         (&EXCLUSIVE_CTX, ScheduleError::RegionParamInWorldSystem { system: "test::exclusive_ctx" }),
         (
@@ -173,10 +175,16 @@ fn parameter_errors() {
             },
         ),
         (&ENTITY_JOB, ScheduleError::JobInKernel { system: "test::entity_job" }),
-        (&ALIASED, ScheduleError::AliasedParameter { system: "test::aliased", component: Counter::KEY }),
+        (
+            &ALIASED,
+            ScheduleError::AliasedParameter { system: "test::aliased", component: Counter::KEY },
+        ),
         (
             &WITHOUT_BESIDE,
-            ScheduleError::AliasedParameter { system: "test::without_beside", component: Counter::KEY },
+            ScheduleError::AliasedParameter {
+                system: "test::without_beside",
+                component: Counter::KEY,
+            },
         ),
         (
             &TWO_COMMANDS,
@@ -247,7 +255,10 @@ fn errors_that_need_a_world() {
     let world = world(WorldKind::Prediction, LayoutConfig::default());
     assert_eq!(
         build(&[&PLAIN]).unwrap().prepare(&world),
-        Err(ScheduleError::WrongWorld { schedule: WorldKind::Server, world: WorldKind::Prediction })
+        Err(ScheduleError::WrongWorld {
+            schedule: WorldKind::Server,
+            world: WorldKind::Prediction
+        })
     );
     assert_eq!(
         prepare_error(&[&UNREGISTERED_READER]),
@@ -258,11 +269,17 @@ fn errors_that_need_a_world() {
     );
     assert_eq!(
         prepare_error(&[&CHANGED_UNTRACKED]),
-        ScheduleError::ChangedOnUntracked { system: "test::changed_untracked", component: Velocity::KEY }
+        ScheduleError::ChangedOnUntracked {
+            system: "test::changed_untracked",
+            component: Velocity::KEY
+        }
     );
     assert_eq!(
         prepare_error(&[&WRITES_OWNER]),
-        ScheduleError::WritesMaintainedComponent { system: "test::writes_owner", component: OwnedBy::KEY }
+        ScheduleError::WritesMaintainedComponent {
+            system: "test::writes_owner",
+            component: OwnedBy::KEY
+        }
     );
     assert_eq!(
         prepare_error(&[&WRITES_REFERENCE]),
@@ -273,7 +290,10 @@ fn errors_that_need_a_world() {
     );
     assert_eq!(
         prepare_error(&[&READS_SCRATCH]),
-        ScheduleError::TransientBeforeWriter { reader: "test::reads_scratch", component: Scratch::KEY }
+        ScheduleError::TransientBeforeWriter {
+            reader: "test::reads_scratch",
+            component: Scratch::KEY
+        }
     );
     let world = self::world(WorldKind::Server, LayoutConfig::default());
     build(&[&WRITES_SCRATCH, &READS_SCRATCH_AFTER]).unwrap().prepare(&world).unwrap();

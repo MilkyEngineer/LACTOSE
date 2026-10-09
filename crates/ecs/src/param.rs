@@ -416,8 +416,7 @@ impl<'r, 'j, T: ?Sized + 'static> Fetch<'r, 'j> for ResMut<'r, T> {
 
 /// The value inside the `Box<T>` a world resource is held as.
 pub(crate) fn resource_ref<T: ?Sized + 'static>(value: &(dyn core::any::Any + Send + Sync)) -> &T {
-    let value: &Box<T> = value.downcast_ref().expect("resources hold `Box<T>`");
-    value
+    value.downcast_ref::<Box<T>>().map(AsRef::as_ref).expect("resources hold `Box<T>`")
 }
 
 impl<'r, 'j, T: Resource> Fetch<'r, 'j> for RegionRes<'r, T> {

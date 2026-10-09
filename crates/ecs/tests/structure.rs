@@ -59,8 +59,14 @@ fn direct_methods_change_structure_and_log_it() {
     let tick = t(5);
     let log = [
         StructuralChange::Spawned { key: owner, region: REGION },
-        StructuralChange::Added { key: owner, component: <Health as lactose_reflect::Reflect>::KEY },
-        StructuralChange::Removed { key: owner, component: <Velocity as lactose_reflect::Reflect>::KEY },
+        StructuralChange::Added {
+            key: owner,
+            component: <Health as lactose_reflect::Reflect>::KEY,
+        },
+        StructuralChange::Removed {
+            key: owner,
+            component: <Velocity as lactose_reflect::Reflect>::KEY,
+        },
         StructuralChange::Spawned { key: item, region: REGION },
         StructuralChange::Moved { key: owner, from: REGION, to: OTHER_REGION },
         StructuralChange::Moved { key: item, from: REGION, to: OTHER_REGION },
@@ -182,7 +188,10 @@ fn commands_that_cannot_apply_are_dropped_and_dangling_references_emptied() {
 fn spawn_rejects_placeholders_unloaded_regions_and_the_worlds_components() {
     let mut world = world(WorldKind::Server, LayoutConfig::default());
     let err = |result: lactose_core::Result<()>| result.unwrap_err().kind();
-    assert_eq!(err(world.spawn(StableKey::Placeholder(0), REGION, (pos(0, 0),))), ErrorKind::InvalidData);
+    assert_eq!(
+        err(world.spawn(StableKey::Placeholder(0), REGION, (pos(0, 0),))),
+        ErrorKind::InvalidData
+    );
     assert_eq!(err(world.spawn(net(1), OTHER_REGION, (pos(0, 0),))), ErrorKind::NotFound);
     let in_region = lactose_ecs::InRegion { region: REGION };
     assert_eq!(err(world.spawn(net(1), REGION, (in_region,))), ErrorKind::InvalidData);

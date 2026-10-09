@@ -72,7 +72,7 @@ fn run_events(layout: LayoutConfig) -> Vec<Vec<(StableKey, i32)>> {
     let mut ticks = Vec::new();
     for _ in 0..2 {
         world = tick(&mut schedule, world, &executor);
-        ticks.push(std::mem::take(&mut *world.service_mut::<Seen>().unwrap().lock().unwrap()));
+        ticks.push(std::mem::take(&mut *world.service_mut::<Seen>().unwrap().get_mut().unwrap()));
     }
     ticks
 }
@@ -148,7 +148,7 @@ fn channel_entries_reach_later_stages_with_keys_resolved_and_clear_at_the_input_
     let mut schedule = builder.build().unwrap();
 
     world = tick(&mut schedule, world, &executor);
-    let seen = std::mem::take(&mut *world.service_mut::<Seen>().unwrap().lock().unwrap());
+    let seen = std::mem::take(&mut *world.service_mut::<Seen>().unwrap().get_mut().unwrap());
     // The writing stage saw nothing; the next stage saw the entry with its key resolved.
     assert_eq!(seen, [(net(3), 1)]);
     world = tick(&mut schedule, world, &executor);

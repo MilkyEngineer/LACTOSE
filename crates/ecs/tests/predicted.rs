@@ -78,7 +78,10 @@ fn both_machines_derive_the_same_keys_and_a_server_only_spawn_shifts_nothing() {
     assert_ne!(first.ordinal, second.ordinal, "the spawn index is part of the ordinal");
     for world in [&server, &client] {
         let origin = world.get::<PredictedOrigin>(client_bombs[0].1).unwrap();
-        assert_eq!((origin.player, origin.input_tick, origin.ordinal), (PLAYER, t(1), first.ordinal));
+        assert_eq!(
+            (origin.player, origin.input_tick, origin.ordinal),
+            (PLAYER, t(1), first.ordinal)
+        );
         assert_eq!(world.get::<ClaimedBy>(client_bombs[1].1).unwrap().player, PLAYER);
         let reference = world.get::<ThrownBy>(client_bombs[1].1).unwrap().thrower;
         assert_eq!(reference, EntityRef::new(client_bombs[0].1), "the placeholder resolved");
@@ -98,7 +101,10 @@ fn a_spawn_without_an_input_tick_is_not_predicted() {
     let server = tick(&mut builder.build().unwrap(), thrower(WorldKind::Server), &executor);
     let bombs = bombs(&server);
     assert!(bombs.iter().all(|(_, key)| matches!(key, StableKey::Net(_))), "{bombs:?}");
-    assert!(bombs.iter().all(|&(_, key)| server.get::<ClaimedBy>(key).is_none()), "no claim passes on");
+    assert!(
+        bombs.iter().all(|&(_, key)| server.get::<ClaimedBy>(key).is_none()),
+        "no claim passes on"
+    );
 
     let mut builder = Schedule::builder(WorldKind::Prediction);
     builder.stage("spawn", &[]).add(&DEBRIS).add(&DOUBLE_SPAWN);
@@ -109,7 +115,8 @@ fn a_spawn_without_an_input_tick_is_not_predicted() {
 #[test]
 fn a_collision_falls_back_to_a_net_id() {
     let executor = executor();
-    let taken = bombs(&tick(&mut schedule(WorldKind::Server), thrower(WorldKind::Server), &executor))[0].1;
+    let taken =
+        bombs(&tick(&mut schedule(WorldKind::Server), thrower(WorldKind::Server), &executor))[0].1;
 
     let mut server = thrower(WorldKind::Server);
     server.spawn(taken, REGION, (pos(9, 9),)).unwrap();
@@ -145,7 +152,9 @@ fn binds_alias_the_net_key_to_the_origin_key() {
     assert_eq!(world.bind(other_key, id).unwrap_err().kind(), ErrorKind::InvalidData);
 
     // A reference written through the Net key is stored as the origin key.
-    world.spawn(net(9), REGION, (ThrownBy { thrower: EntityRef::new(StableKey::Net(id)) },)).unwrap();
+    world
+        .spawn(net(9), REGION, (ThrownBy { thrower: EntityRef::new(StableKey::Net(id)) },))
+        .unwrap();
     let stored = world.get::<ThrownBy>(net(9)).unwrap().thrower;
     assert_eq!(stored, EntityRef::new(StableKey::Predicted(key)));
     assert_eq!(world.referrers(StableKey::Net(id)).count(), 1);
@@ -177,7 +186,11 @@ fn a_predicted_origin_and_a_reference_to_it_survive_a_save_byte_for_byte() {
 
     let mut loaded = lactose_ecs::WorldBuilder::new(WorldKind::Server, registry).build().unwrap();
     loaded
-        .create_region(RegionConfig { id: REGION, seed: exported.seed, mode: RegionMode::Simulated })
+        .create_region(RegionConfig {
+            id: REGION,
+            seed: exported.seed,
+            mode: RegionMode::Simulated,
+        })
         .unwrap();
     loaded.load_region(REGION, &baseline, Some(&overlay)).unwrap();
     assert!(loaded.contains(first), "the entity is stored under its origin key again");

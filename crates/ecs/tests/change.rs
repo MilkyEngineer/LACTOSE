@@ -39,7 +39,12 @@ fn nudge(how: &Counter, position: Mut<Position>) {
 }
 
 #[system(name = "test::watch_after", worlds = [server], after = nudge)]
-fn watch_after(_changed: Changed<Position>, _position: &Position, key: StableKeyOf, seen: Res<Seen>) {
+fn watch_after(
+    _changed: Changed<Position>,
+    _position: &Position,
+    key: StableKeyOf,
+    seen: Res<Seen>,
+) {
     seen.lock().unwrap().push(("after", *key));
 }
 
@@ -53,7 +58,7 @@ fn by_command(cmd: Commands, tick: &Health) {
 }
 
 fn seen(world: &mut World) -> Vec<(&'static str, StableKey)> {
-    let mut seen = std::mem::take(&mut *world.service_mut::<Seen>().unwrap().lock().unwrap());
+    let mut seen = std::mem::take(&mut *world.service_mut::<Seen>().unwrap().get_mut().unwrap());
     seen.sort();
     seen
 }
@@ -129,7 +134,7 @@ fn mut_marks_on_mutable_dereference_only() {
     // A read through `Mut` is not a change.
     let position = world.get_mut::<Position>(net(1)).unwrap();
     assert_eq!(position.x, Scalar::ZERO);
-    drop(position);
+    let _ = position;
     assert_eq!(world.changed_since::<Position>(mark).unwrap().count(), 0);
 
     // An equal value through `set_if_neq` is not a change; a different one is.
@@ -162,7 +167,9 @@ fn changed_since_on_an_untracked_column_panics() {
 
 #[test]
 fn column_writes_stamp_exactly_the_rows_they_record() {
-    for layout in [LayoutConfig::default(), LayoutConfig { chunk_rows: Some(1), ..LayoutConfig::default() }] {
+    for layout in
+        [LayoutConfig::default(), LayoutConfig { chunk_rows: Some(1), ..LayoutConfig::default() }]
+    {
         let mut world = world(WorldKind::Server, layout);
         for id in 1..=4 {
             world.spawn(net(id), REGION, (pos(0, 0), vel(0, 0))).unwrap();
@@ -220,7 +227,8 @@ fn bump(counter: Mut<Counter>) {
 #[test]
 fn a_writing_system_raises_the_column_tick_of_every_chunk_it_runs_over() {
     let executor = executor();
-    let mut world = world(WorldKind::Server, LayoutConfig { chunk_rows: Some(2), ..LayoutConfig::default() });
+    let mut world =
+        world(WorldKind::Server, LayoutConfig { chunk_rows: Some(2), ..LayoutConfig::default() });
     for id in 1..=5 {
         world.spawn(net(id), REGION, (Counter(0),)).unwrap();
     }
@@ -232,6 +240,8 @@ fn a_writing_system_raises_the_column_tick_of_every_chunk_it_runs_over() {
     let columns: Vec<_> = world.columns::<Counter>().collect();
     assert_eq!(columns.len(), 3, "five rows in chunks of two");
     assert!(columns.iter().all(|column| column.column_tick() == t(41)));
-    assert!(columns.iter().all(|column| column.row_ticks().unwrap().iter().all(|&tick| tick == t(41))));
+    assert!(
+        columns.iter().all(|column| column.row_ticks().unwrap().iter().all(|&tick| tick == t(41)))
+    );
     assert_eq!(world.get::<Counter>(net(5)), Some(&Counter(1)));
 }

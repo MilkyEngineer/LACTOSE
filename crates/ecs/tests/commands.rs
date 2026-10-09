@@ -29,7 +29,10 @@ fn record(cmd: &mut Commands, key: StableKey, system: u32) {
     let StableKey::Net(source) = key else { panic!("server keys") };
     for seq in 0..3 {
         cmd.spawn((Origin { source: source.to_bits(), system, seq },));
-        cmd.set(net(TARGET), Counter(u64::from(system) << 32 | source.to_bits() << 8 | u64::from(seq)));
+        cmd.set(
+            net(TARGET),
+            Counter(u64::from(system) << 32 | source.to_bits() << 8 | u64::from(seq)),
+        );
     }
 }
 
@@ -86,7 +89,11 @@ fn commands_apply_in_execution_then_source_then_sequence_order() {
     assert_eq!(applied, sorted, "spawns applied out of order");
     let last = sorted.last().unwrap();
     let last_system = if exec(0) == last.0 { 0u64 } else { 1 };
-    assert_eq!(target, Counter(last_system << 32 | last.1 << 8 | u64::from(last.2)), "the last set wins");
+    assert_eq!(
+        target,
+        Counter(last_system << 32 | last.1 << 8 | u64::from(last.2)),
+        "the last set wins"
+    );
 }
 
 #[test]

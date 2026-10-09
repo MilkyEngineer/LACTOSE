@@ -62,7 +62,7 @@ fn dropped(what: &str, key: StableKey) {
 impl World {
     /// Applies `pending` in execution order, then by source, each buffer in sequence.
     pub(crate) fn apply(&mut self, mut pending: Vec<Pending>, stamp: Stamp) {
-        pending.sort_by(|a, b| (a.order, a.source).cmp(&(b.order, b.source)));
+        pending.sort_by_key(|pending| (pending.order, pending.source));
         for buffer in pending {
             self.apply_buffer(buffer, stamp);
         }

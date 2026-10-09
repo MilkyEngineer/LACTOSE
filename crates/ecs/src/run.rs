@@ -191,7 +191,7 @@ enum Handle<'r> {
     Used,
 }
 
-fn downgrade<'r, T: ?Sized>(value: &'r mut T) -> &'r T {
+fn downgrade<T: ?Sized>(value: &mut T) -> &T {
     value
 }
 

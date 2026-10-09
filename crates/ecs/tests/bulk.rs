@@ -47,7 +47,10 @@ fn baseline(registry: &Registry) -> Baseline {
     let thrown_by_c1 = ThrownBy { thrower: EntityRef::new(StableKey::Net(cooked(C1))) };
     let rows = [
         BaselineRow { id: cooked(C1), components: vec![data(pos(1, 1)), data(Health(10))] },
-        BaselineRow { id: cooked(C2), components: vec![data(pos(2, 2)), data(Mass(lactose_math::Scalar::ONE))] },
+        BaselineRow {
+            id: cooked(C2),
+            components: vec![data(pos(2, 2)), data(Mass(lactose_math::Scalar::ONE))],
+        },
         BaselineRow { id: cooked(C3), components: vec![data(pos(3, 3)), data(owned_by_c1)] },
         BaselineRow { id: cooked(C4), components: vec![data(pos(4, 4)), data(thrown_by_c1)] },
     ];
@@ -181,8 +184,14 @@ fn an_overlay_with_every_record_loads_and_diffs_back_to_itself() {
         assert!(!world.contains(StableKey::Net(cooked(C2))), "destroyed");
         assert_eq!(world.get::<Health>(c1), None, "removed");
         assert_eq!(world.get::<Counter>(c1), Some(&Counter(5)), "added");
-        assert_eq!(world.get::<Position>(c1), Some(&Position { x: lactose_math::Scalar::from_i32(42), ..pos(1, 1) }));
-        assert_eq!(world.owned_by(StableKey::Net(runtime(R1))).collect::<Vec<_>>(), [StableKey::Net(cooked(C3)), r2]);
+        assert_eq!(
+            world.get::<Position>(c1),
+            Some(&Position { x: lactose_math::Scalar::from_i32(42), ..pos(1, 1) })
+        );
+        assert_eq!(
+            world.owned_by(StableKey::Net(runtime(R1))).collect::<Vec<_>>(),
+            [StableKey::Net(cooked(C3)), r2]
+        );
         assert_eq!(world.origin(StableKey::Net(runtime(R2))), Some(r2));
         assert_eq!(world.referrers(c1).count(), 1, "the baseline's reference is indexed");
         assert_eq!(world.region(REGION).unwrap().entity_count, 6);
@@ -229,7 +238,8 @@ fn region_resources_travel_beside_the_rows() {
     }
     assert_eq!(loaded.region_resource::<Weather>(REGION), Some(&Weather(9)));
     assert_eq!(loaded.export_region(REGION).unwrap(), exported);
-    let erased: Vec<ComponentKey> = loaded.region_resources_erased(REGION).map(|(key, _)| key).collect();
+    let erased: Vec<ComponentKey> =
+        loaded.region_resources_erased(REGION).map(|(key, _)| key).collect();
     assert_eq!(erased, [Weather::KEY]);
     let invalid = ComponentData { component: Weather::KEY, bytes: vec![1, 2] };
     assert_eq!(
@@ -244,8 +254,14 @@ fn a_load_checks_the_region_and_the_schemas() {
     let baseline = baseline(&registry);
     let mut world = fresh(registry.clone(), LayoutConfig::default(), 1);
     world.load_region(REGION, &baseline, None).unwrap();
-    assert_eq!(world.load_region(REGION, &baseline, None).unwrap_err().kind(), ErrorKind::InvalidData);
-    assert_eq!(world.load_region(OTHER_REGION, &baseline, None).unwrap_err().kind(), ErrorKind::NotFound);
+    assert_eq!(
+        world.load_region(REGION, &baseline, None).unwrap_err().kind(),
+        ErrorKind::InvalidData
+    );
+    assert_eq!(
+        world.load_region(OTHER_REGION, &baseline, None).unwrap_err().kind(),
+        ErrorKind::NotFound
+    );
 
     // A document written under another schema version must be migrated first.
     let old = schemas(&registry)

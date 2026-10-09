@@ -8,10 +8,10 @@ use std::sync::Arc;
 
 use lactose_core::{EntityRef, PlainArray, PlayerId, StableKey, Tick};
 use lactose_ecs::{
-    Channel, ChunkOrder, ClaimedBy, CommandChannel, Commands, Ctx, Event, EventWriter, Events, InRegion,
-    LayoutConfig, Mut, OwnedBy, PredictedOrigin, PresentEvent, PresentEvents, PresentKind,
-    RegionConfig, RegionId, RegionMode, Res, ResMut, Schedule, StableKeyOf, SystemSet, World,
-    WorldBuilder, WorldKind, finalize, system,
+    Channel, ChunkOrder, ClaimedBy, CommandChannel, Commands, Ctx, Event, EventWriter, Events,
+    InRegion, LayoutConfig, Mut, OwnedBy, PredictedOrigin, PresentEvent, PresentEvents,
+    PresentKind, RegionConfig, RegionId, RegionMode, Res, ResMut, Schedule, StableKeyOf, SystemSet,
+    World, WorldBuilder, WorldKind, finalize, system,
 };
 use lactose_math::{ExactSum, Scalar, Vec2};
 use lactose_reflect::{Padding, Registry, component, resource, value};
@@ -356,7 +356,11 @@ pub fn populate(world: &mut World) {
                 Mass(Scalar::from_i32(3)),
                 Health(100),
                 HeldItem { kind: ItemKind::Bomb },
-                PlayerInput { aim: Vec2::new(Scalar::from_i32(4), Scalar::TWO), throw: true, _pad: pad() },
+                PlayerInput {
+                    aim: Vec2::new(Scalar::from_i32(4), Scalar::TWO),
+                    throw: true,
+                    _pad: pad(),
+                },
                 HitList { hits: PlainArray([hit(npc, 10), none]), len: 1 },
                 AnimState { phase: 7 },
             ),
@@ -492,11 +496,7 @@ pub fn layouts() -> Vec<LayoutConfig> {
             }
         }
     }
-    if cfg!(miri) {
-        layouts.into_iter().step_by(7).collect()
-    } else {
-        layouts
-    }
+    if cfg!(miri) { layouts.into_iter().step_by(7).collect() } else { layouts }
 }
 
 /// A `NetId` key.

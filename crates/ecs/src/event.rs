@@ -280,7 +280,7 @@ impl PresentLog {
     /// already delivered are dropped, and delivered keys of the tick that were not emitted
     /// again are cancelled.
     pub(crate) fn end_tick(&mut self, tick: Tick, mut emissions: Vec<PendingEmission>) {
-        emissions.sort_by(|a, b| a.order.cmp(&b.order));
+        emissions.sort_by_key(|emission| emission.order);
         let mut counts: BTreeMap<(StableKey, PresentKind), u32> = BTreeMap::new();
         let mut keys = BTreeSet::new();
         let delivered = self.delivered.remove(&tick).unwrap_or_default();

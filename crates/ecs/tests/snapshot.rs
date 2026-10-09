@@ -81,10 +81,11 @@ fn run(world: World, schedule: &mut Schedule, ticks: u32) -> (World, Run) {
     for _ in 0..ticks {
         world = tick(schedule, world, &executor);
         let batch = world.take_present_events();
-        run.emitted.extend(batch.emitted.iter().map(|e| (e.key, e.get::<AudioRequest>().unwrap().sound)));
+        run.emitted
+            .extend(batch.emitted.iter().map(|e| (e.key, e.get::<AudioRequest>().unwrap().sound)));
         run.cancelled.extend(batch.cancelled);
     }
-    let mut changed = std::mem::take(&mut *world.service_mut::<Seen>().unwrap().lock().unwrap());
+    let mut changed = std::mem::take(&mut *world.service_mut::<Seen>().unwrap().get_mut().unwrap());
     changed.sort();
     run.changed = changed;
     (world, run)
@@ -145,7 +146,11 @@ fn a_restore_and_a_re_run_reproduce_the_first_run() {
     let mut delivered: Vec<PresentEventKey> = first.emitted.iter().map(|(key, _)| *key).collect();
     delivered.sort_by_key(|key| (key.tick, key.seq));
     assert_eq!(cancelled, delivered);
-    assert_eq!(third.emitted.len(), 8, "the ticks that did not chirp before: four, six, eight, ten");
+    assert_eq!(
+        third.emitted.len(),
+        8,
+        "the ticks that did not chirp before: four, six, eight, ten"
+    );
     assert!(third.emitted.iter().all(|(key, _)| !delivered.contains(key)));
     // Within a tick the sequence orders an origin's events of one kind.
     let sounds: Vec<u32> = third.emitted.iter().map(|&(_, sound)| sound).collect();

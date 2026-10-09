@@ -25,6 +25,10 @@ impl Field for Scalar {
 }
 
 impl ScalarField for Scalar {
+    #[allow(
+        clippy::useless_conversion,
+        reason = "the bits are 32 wide when the scalar is, and zero-extend then"
+    )]
     fn canonical_bits(&self) -> u64 {
         self.to_canonical_bits().into()
     }
@@ -131,11 +135,10 @@ mod tests {
         transform.visit(FieldId(7), &mut leaves);
         assert_eq!(leaves.0.len(), 10);
         assert!(leaves.0.iter().all(|&(id, _)| id == 7));
-        assert_eq!(
-            leaves.0[0].1,
-            u64::from(Scalar::from_canonical_bits(nan.to_canonical_bits()).to_canonical_bits())
-        );
-        assert_eq!(leaves.0[1].1, u64::from(Scalar::ONE.to_canonical_bits()));
+        // Every NaN reports the one canonical pattern.
+        let other_nan = -nan;
+        assert_eq!(leaves.0[0].1, other_nan.canonical_bits());
+        assert_eq!(leaves.0[1].1, Scalar::ONE.canonical_bits());
     }
 
     #[test]

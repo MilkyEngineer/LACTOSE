@@ -795,23 +795,16 @@ impl Schedule {
         self.run(world, executor, false)
     }
 
-    fn run<'a>(
-        &'a mut self,
-        world: World,
-        executor: &'a Executor,
-        tick: bool,
-    ) -> impl Future<Output = Result<World>> + Send + 'a {
-        async move {
-            self.prepare(&world).map_err(|error| {
-                Error::new(ErrorKind::InvalidData, error.to_string()).with_source(error)
-            })?;
-            let marks = core::mem::replace(&mut self.pass_marks, vec![None; self.plan.order.len()]);
-            let state = RunState::new(world, self.plan.clone(), tick, marks);
-            let state = run(executor, state).await?;
-            let (world, marks) = state.into_parts();
-            self.pass_marks = marks;
-            Ok(world)
-        }
+    async fn run(&mut self, world: World, executor: &Executor, tick: bool) -> Result<World> {
+        self.prepare(&world).map_err(|error| {
+            Error::new(ErrorKind::InvalidData, error.to_string()).with_source(error)
+        })?;
+        let marks = core::mem::replace(&mut self.pass_marks, vec![None; self.plan.order.len()]);
+        let state = RunState::new(world, self.plan.clone(), tick, marks);
+        let state = run(executor, state).await?;
+        let (world, marks) = state.into_parts();
+        self.pass_marks = marks;
+        Ok(world)
     }
 }
 
