@@ -21,7 +21,9 @@ pub trait Event: Copy + Send + Sync + 'static {
 /// Events emitted in a tick are visible to every system ordered after the emitter in the
 /// same tick, in order of (emitting system, source origin key, sequence), and are cleared
 /// at the next input sync point. The schedule requires every reader of `E` to be ordered
-/// after every emitter of `E`, so what a reader sees never depends on scheduling.
+/// after every emitter of `E`, so what a reader sees never depends on scheduling. A
+/// placeholder target is a debug assertion: the entity does not exist until the buffer
+/// applies.
 pub struct EventWriter<'w, E: Event> {
     _buffer: PhantomData<&'w mut ()>,
     _event: PhantomData<fn() -> E>,
@@ -115,11 +117,14 @@ pub trait PresentEvent: NoUninit + CheckedBitPattern + Copy + Send + Sync + 'sta
 
 /// Emits presentation events.
 ///
-/// Each emission is keyed by (origin key, tick, kind). The world keeps the keys it has
-/// delivered: a re-emission with a delivered key, as a rollback re-simulation produces, is
-/// not delivered again, and a delivered key that a re-simulation of its tick does not
-/// re-emit is reported as cancelled in the next
-/// [`PresentEventBatch`](crate::PresentEventBatch).
+/// Each emission is keyed by (origin key, tick, kind, sequence), the sequence being the
+/// ordinal of this (origin, kind) among the tick's emissions. The world keeps the keys it
+/// has delivered, across [`restore`](crate::World::restore), pruned below the oldest tick a
+/// restore can reach: a re-emission with a delivered key, as a rollback re-simulation
+/// produces, is not delivered again, and a delivered key whose tick is re-simulated without
+/// re-emitting it is reported as cancelled in the next
+/// [`PresentEventBatch`](crate::PresentEventBatch). A placeholder origin is a debug
+/// assertion.
 pub struct PresentEvents<'w> {
     _buffer: PhantomData<&'w mut ()>,
 }
@@ -146,6 +151,8 @@ pub struct PresentEventKey {
     pub tick: Tick,
     /// Its kind.
     pub kind: PresentKind,
+    /// Its ordinal among the emissions with the same origin and kind in the tick.
+    pub seq: u32,
 }
 
 /// One delivered presentation event.

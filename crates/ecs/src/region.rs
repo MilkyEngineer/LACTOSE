@@ -2,7 +2,7 @@
 //! the components the world itself maintains on every entity.
 
 use bytemuck::{Pod, Zeroable};
-use lactose_core::{EntityRef, FieldId, PlayerId};
+use lactose_core::{EntityRef, FieldId, PlayerId, Tick};
 use lactose_reflect::{Field, FieldKind, FieldVisitor, ReferenceVisitor, component};
 
 /// A region's identity. Stable across processes, the wire and saves: the cooker derives it
@@ -25,12 +25,13 @@ impl Field for RegionId {
 /// What a region's rows do each tick (architecture section 6).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum RegionMode {
-    /// Per-entity kernels run over its rows and commands may change them.
+    /// Per-entity and per-region systems run over it and commands may change its rows.
     Simulated,
     /// Rows are written only at the input sync point, from staged network state, through
-    /// `&mut World`. No kernel runs over them.
+    /// `&mut World`. No per-entity or per-region system runs over it.
     Replicated,
-    /// Rows are read-only until the mode changes. No kernel runs over them.
+    /// Rows are read-only until the mode changes. No per-entity or per-region system runs
+    /// over it.
     Frozen,
 }
 
@@ -61,8 +62,9 @@ pub struct RegionInfo {
 
 /// Region membership. Every entity has it; the world writes it at spawn, at
 /// [`Commands::move_to_region`](crate::Commands::move_to_region) and at
-/// [`World::move_to_region`](crate::World::move_to_region), and a system may read it. It is
-/// not saved: a region's record set implies it.
+/// [`World::move_to_region`](crate::World::move_to_region), and a system may read it. Not
+/// saved: a region's record set implies it. Maintained: the schedule rejects `Mut` on it and
+/// the direct methods reject inserting or removing it.
 #[component(key = "ecs::in_region", derived)]
 pub struct InRegion {
     /// The region the entity resides in.
@@ -71,9 +73,11 @@ pub struct InRegion {
 }
 
 /// The owning entity (architecture section 6): an owned entity migrates with its owner
-/// between regions, and an [`OwnershipChange`](lactose_bundle::Record::OwnershipChange)
-/// record carries the change in a save. Written through commands or `&mut World` like any
-/// relationship, so the reverse index stays consistent.
+/// between regions and is despawned with it, and an
+/// [`OwnershipChange`](lactose_bundle::Record::OwnershipChange) record carries the change
+/// in a save. Written through [`Commands::set`](crate::Commands::set),
+/// [`Commands::remove`](crate::Commands::remove) or the direct methods, never through
+/// `Mut`, so the reverse index stays consistent.
 #[component(key = "ecs::owned_by", persistent)]
 pub struct OwnedBy {
     /// The owner, or the empty reference.
@@ -84,19 +88,39 @@ pub struct OwnedBy {
 /// The player whose input drives the entity: the player's own entity and everything it has
 /// claimed (architecture section 9.4). Two uses:
 ///
-/// - A spawn commanded from an entity with this component receives a
-///   [`StableKey::Predicted`](lactose_core::StableKey::Predicted) origin key, formed from
-///   this player, the player's current input tick and the command's ordinal among the
-///   player's spawns this tick; the spawned entity inherits the component. The server and
-///   the client therefore derive the same key.
-/// - The prediction world runs its kernels only over rows that have it; game code never
-///   writes that filter.
+/// - A spawn commanded from an entity with this component, by a system whose worlds include
+///   `prediction`, receives a [`StableKey::Predicted`](lactose_core::StableKey::Predicted)
+///   origin key formed from this player, the player's input tick this tick and the spawn's
+///   ordinal among that player's predicted spawns this tick; the spawned entity inherits
+///   the claim. The server and the client therefore derive the same key.
+/// - The prediction world runs its per-entity systems only over rows that have it; game
+///   code never writes that filter.
 ///
 /// Session state: not saved, not hashed, not replicated. `net` and `predict` write it on
-/// join; the input tick comes from [`World::set_input_tick`](crate::World::set_input_tick).
+/// join through [`World::insert`](crate::World::insert) or
+/// [`Commands::set`](crate::Commands::set) and release it with the matching `remove`; the
+/// schedule rejects `Mut` on it. The input tick comes from
+/// [`World::set_input_tick`](crate::World::set_input_tick) every tick.
 #[component(key = "ecs::claimed_by", derived)]
 pub struct ClaimedBy {
     /// The player.
     #[field(id = 1)]
     pub player: PlayerId,
+}
+
+/// The `Predicted` origin key of an entity the server bound a `NetId` to, so the origin key
+/// survives a save and the region overlay a client receives (architecture sections 7 and
+/// 15.5): RNG streams and command order use it on every machine. Written by the world when
+/// it applies a predicted spawn and when it loads a row that carries it; never by a caller.
+#[component(key = "ecs::predicted_origin", persistent)]
+pub struct PredictedOrigin {
+    /// The player whose input drove the spawn.
+    #[field(id = 1)]
+    pub player: PlayerId,
+    /// The player's input tick at the spawn.
+    #[field(id = 2)]
+    pub input_tick: Tick,
+    /// The spawn's ordinal among the player's predicted spawns in that tick.
+    #[field(id = 3)]
+    pub ordinal: u32,
 }

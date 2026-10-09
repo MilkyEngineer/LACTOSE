@@ -10,12 +10,15 @@ use lactose_reflect::Component;
 use crate::region::RegionId;
 
 /// A point in a world's change history, taken with [`World::mark`](crate::World::mark)
-/// and given back to [`World::changed_since`](crate::World::changed_since).
+/// and given back to [`World::changed_since`](crate::World::changed_since) and
+/// [`World::is_current`](crate::World::is_current).
 ///
-/// A mark records the tick and the world's epoch. A restore or a load rebases ticks and
-/// starts a new epoch, so a mark from before it is stale: the methods that take one then
-/// return `None`, and the consumer does a full pass and takes a fresh mark.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+/// A mark records the tick and the world's epoch. A restore, a whole-world load or a
+/// change-stamp rebase starts a new epoch, so a mark from before it is stale: the methods
+/// that take one then return `None` or `false`, and the consumer does a full pass and
+/// takes a fresh mark. A region load does not start an epoch: its rows are stamped at the
+/// current tick and logged as spawned, so consumers pick them up incrementally.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct ChangeMark {
     epoch: u32,
     tick: Tick,
@@ -29,9 +32,9 @@ impl ChangeMark {
     }
 }
 
-/// Rows of component `T` changed since a mark: those whose change tick is newer than the
-/// mark's tick. Exact per row on a tracked column (replicated or extracted), per chunk
-/// otherwise. Storage order, which is not a semantic key.
+/// Rows of component `T` changed since a mark: those whose change stamp is newer than the
+/// mark's tick. `T` is a tracked column (replicated or extracted). Storage order, which is
+/// not a semantic key: the consumer keys what it produces by the row's key.
 pub struct ChangedRows<'w, T: Component> {
     _world: PhantomData<&'w T>,
 }
@@ -70,15 +73,16 @@ impl<T: Component> ColumnRef<'_, T> {
         todo!()
     }
 
-    /// The change tick of each row on a tracked column, or `None` on an untracked one, whose
-    /// rows share [`column_tick`](Self::column_tick).
+    /// The tick each row last changed at, on a tracked column; `None` on an untracked one,
+    /// whose rows share [`column_tick`](Self::column_tick).
     #[must_use]
     pub fn row_ticks(&self) -> Option<&[Tick]> {
         todo!()
     }
 
     /// The chunk's coarse change tick for this column: the last tick a writing system was
-    /// dispatched over the chunk.
+    /// dispatched over the chunk. A consumer skips a chunk whose column tick is not newer
+    /// than its mark.
     #[must_use]
     pub fn column_tick(&self) -> Tick {
         todo!()
@@ -118,11 +122,11 @@ impl<T: Component> ColumnMut<'_, T> {
         todo!()
     }
 
-    /// Writes through `f`, which receives the values and must record every row it changed
-    /// in the dirty range; those rows are marked changed at the current tick when `f`
-    /// returns. A row written and not recorded keeps its old tick, which replication and
-    /// extract then miss.
-    pub fn write(self, f: impl FnOnce(&mut [T], &mut DirtyRange)) {
+    /// Writes through `f`, which receives the rows' keys and values and must record every
+    /// row it changed; those rows are marked changed at the current tick when `f` returns.
+    /// A row written and not recorded keeps its old stamp, which replication and extract
+    /// then miss.
+    pub fn write(self, f: impl FnOnce(&[StableKey], &mut [T], &mut DirtyRows)) {
         todo!()
     }
 }
@@ -140,20 +144,21 @@ impl<'w, T: Component> Iterator for ColumnsMut<'w, T> {
     }
 }
 
-/// The rows a whole-column write changed, as one range of row indices within the chunk.
-/// Starts empty.
+/// The rows a whole-column write changed, as a set of row indices within the chunk's
+/// slice. Starts empty. The indices are positions in the slice handed to the write and
+/// mean nothing outside it.
 #[derive(Clone, Debug, Default)]
-pub struct DirtyRange {
-    range: Option<Range<usize>>,
+pub struct DirtyRows {
+    bits: Vec<u64>,
 }
 
-impl DirtyRange {
-    /// Widens the range to include row `index`.
+impl DirtyRows {
+    /// Marks row `index`.
     pub fn mark(&mut self, index: usize) {
         todo!()
     }
 
-    /// Widens the range to include `rows`.
+    /// Marks every row in `rows`.
     pub fn mark_range(&mut self, rows: Range<usize>) {
         todo!()
     }
@@ -163,10 +168,15 @@ impl DirtyRange {
         todo!()
     }
 
-    /// The marked rows, or `None` if nothing was marked.
+    /// Whether `index` is marked.
     #[must_use]
-    pub fn get(&self) -> Option<Range<usize>> {
-        self.range.clone()
+    pub fn contains(&self, index: usize) -> bool {
+        todo!()
+    }
+
+    /// The marked rows, ascending.
+    pub fn iter(&self) -> impl Iterator<Item = usize> + '_ {
+        (0..self.bits.len() * 64).filter(|&index| self.contains(index))
     }
 }
 
@@ -208,7 +218,7 @@ impl ErasedColumn<'_> {
         todo!()
     }
 
-    /// The change tick of each row on a tracked column, or `None`.
+    /// The tick each row last changed at, on a tracked column; `None` otherwise.
     #[must_use]
     pub fn row_ticks(&self) -> Option<&[Tick]> {
         todo!()
@@ -290,8 +300,9 @@ pub struct LogEntry {
 /// [`StructuralLog::cursor`] and advanced by [`StructuralLog::since`].
 ///
 /// Like a [`ChangeMark`], a cursor carries the world's epoch and is stale after a restore
-/// or a load.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+/// or a whole-world load. Cursors order by epoch, then position, so the owner of several
+/// consumers trims at their minimum.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct LogCursor {
     epoch: u32,
     index: u64,
@@ -301,8 +312,8 @@ pub struct LogCursor {
 /// moves, each with its tick, read per consumer (architecture section 6).
 ///
 /// Entries accumulate until [`World::trim_structural_log`](crate::World::trim_structural_log)
-/// drops those every consumer has passed. A restore or a load clears the log and starts a
-/// new epoch.
+/// drops those every consumer has passed. A restore or a whole-world load clears the log
+/// and starts a new epoch.
 pub struct StructuralLog {
     _private: (),
 }

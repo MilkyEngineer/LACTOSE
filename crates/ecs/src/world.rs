@@ -7,9 +7,9 @@ use core::num::NonZeroU64;
 use std::sync::Arc;
 
 use lactose_asset_api::PinnedTable;
-use lactose_bundle::{Baseline, Overlay};
+use lactose_bundle::{Baseline, ComponentData, Overlay};
 use lactose_core::{
-    ComponentKey, FieldId, NetId, PlayerId, PredictionKey, Result, StableKey, Tick,
+    ComponentKey, FieldId, NetId, PlayerId, PredictionKey, Result, StableKey, SystemKey, Tick,
 };
 use lactose_reflect::{Component, Registry, Resource};
 
@@ -22,6 +22,7 @@ use crate::event::PresentEventBatch;
 use crate::param::Mut;
 use crate::query::{Query, QueryItems};
 use crate::region::{RegionConfig, RegionId, RegionInfo, RegionMode};
+use crate::rng::Rng;
 use crate::snapshot::WorldSnapshot;
 
 /// Which world this is. A system declares the kinds it runs in, and the world applies its
@@ -109,6 +110,7 @@ pub struct WorldBuilder {
     kind: WorldKind,
     registry: Arc<Registry>,
     layout: LayoutConfig,
+    tick: Tick,
     next_net_id: NonZeroU64,
 }
 
@@ -126,6 +128,14 @@ impl WorldBuilder {
         self
     }
 
+    /// The tick the world starts at: the server's tick on a client, the saved tick on a
+    /// load. The default is zero.
+    #[must_use]
+    pub fn tick(mut self, tick: Tick) -> Self {
+        self.tick = tick;
+        self
+    }
+
     /// The counter the next runtime `NetId` is allocated from, restored from a save
     /// (architecture section 7). The default starts a fresh server.
     #[must_use]
@@ -136,8 +146,8 @@ impl WorldBuilder {
 
     /// Builds the world. Fails if the registry lacks the components the world itself
     /// maintains ([`InRegion`](crate::InRegion), [`OwnedBy`](crate::OwnedBy),
-    /// [`ClaimedBy`](crate::ClaimedBy)) or if a chunk capacity cannot hold a registered
-    /// component.
+    /// [`ClaimedBy`](crate::ClaimedBy), [`PredictedOrigin`](crate::PredictedOrigin)) or if a
+    /// chunk capacity cannot hold a registered component.
     pub fn build(self) -> Result<World> {
         todo!()
     }
@@ -145,10 +155,13 @@ impl WorldBuilder {
 
 /// Entities, components, resources and regions, with their change state.
 ///
-/// A `World` is owned by the tick loop that runs its [`Schedule`](crate::Schedule). Between
-/// stages the methods here give exclusive code direct access; during a stage the kernels
-/// see it through their parameters. Every method that takes a [`StableKey`] accepts the
-/// origin key or, for a predicted entity the server has bound, its `Net` key.
+/// A `World` is owned by the tick loop that runs its [`Schedule`](crate::Schedule), which
+/// takes it by value for a tick and hands it back. Between ticks the methods here give
+/// exclusive code direct access; during a stage the kernels see it through their
+/// parameters. Every method that takes a [`StableKey`] accepts the origin key or, for a
+/// predicted entity the server has bound, its `Net` key.
+///
+/// `World` is `Send` and `Sync`: a scope child of a [`Job`](crate::Job) may borrow it.
 pub struct World {
     _private: (),
 }
@@ -172,17 +185,30 @@ impl World {
         todo!()
     }
 
-    /// The current tick: the tick being run, or the last one run between ticks. Ticks are
-    /// rebased every 2^30 ticks and at a restore or a load, which also starts a new epoch
-    /// for every [`ChangeMark`] and [`LogCursor`].
+    /// The absolute simulation tick: the tick being run, or the last one run between ticks.
+    /// It is never rebased; RNG keys and tick-valued fields use it. Stored change stamps
+    /// are rebased every 2^30 ticks and at a restore or a whole-world load, which starts a
+    /// new epoch for every [`ChangeMark`] and [`LogCursor`].
     #[must_use]
     pub fn tick(&self) -> Tick {
+        todo!()
+    }
+
+    /// Sets the tick between ticks: a client re-syncing to the server's clock, a server
+    /// after a load. Starts a new epoch.
+    pub fn set_tick(&mut self, tick: Tick) -> Result<()> {
         todo!()
     }
 
     /// A mark at the current tick and epoch.
     #[must_use]
     pub fn mark(&self) -> ChangeMark {
+        todo!()
+    }
+
+    /// Whether `mark` is of the current epoch, so change stamps compare against its tick.
+    #[must_use]
+    pub fn is_current(&self, mark: ChangeMark) -> bool {
         todo!()
     }
 
@@ -214,7 +240,8 @@ impl World {
     }
 
     /// Component `T` of `key` for writing, marking the row changed on a mutable
-    /// dereference, like the kernel parameter.
+    /// dereference, like the kernel parameter. Panics for a component the world maintains
+    /// or one with an `EntityRef` field; those go through [`insert`](Self::insert).
     #[must_use]
     pub fn get_mut<T: Component>(&mut self, key: StableKey) -> Option<Mut<'_, T>> {
         todo!()
@@ -223,7 +250,8 @@ impl World {
     /// Spawns an entity with `key` in `region`, immediately. `key` is a `Net` or
     /// `Predicted` key that no live entity has; a placeholder is an error. Replication and
     /// prediction spawn this way with the server's key; a kernel spawns through
-    /// [`Commands::spawn`](crate::Commands::spawn), which assigns the key.
+    /// [`Commands::spawn`](crate::Commands::spawn), which assigns the key. A `Predicted`
+    /// key gives the entity [`PredictedOrigin`](crate::PredictedOrigin).
     pub fn spawn<B: Bundle>(&mut self, key: StableKey, region: RegionId, bundle: B) -> Result<()> {
         todo!()
     }
@@ -233,12 +261,15 @@ impl World {
         todo!()
     }
 
-    /// Writes the whole component `value` to `key`, adding it if absent, immediately.
+    /// Writes the whole component `value` to `key`, adding it if absent, immediately, and
+    /// updates the relationship index. Panics for [`InRegion`](crate::InRegion) and
+    /// [`PredictedOrigin`](crate::PredictedOrigin), which are the world's.
     pub fn insert<T: Component>(&mut self, key: StableKey, value: T) -> Result<()> {
         todo!()
     }
 
     /// Removes component `T` from `key`, immediately, returning it; `None` if absent.
+    /// Panics for the two components [`insert`](Self::insert) rejects.
     pub fn remove<T: Component>(&mut self, key: StableKey) -> Result<Option<T>> {
         todo!()
     }
@@ -261,7 +292,10 @@ impl World {
 
     /// Records that the server bound `net` to the predicted entity `predicted`
     /// (architecture section 7). Both keys then name the entity; its origin key stays
-    /// `predicted`. The alias table is part of a snapshot.
+    /// `predicted`. The alias table survives [`restore`](Self::restore), and a bind for a
+    /// key with no live entity is kept and applies when the entity is spawned, so a bind
+    /// received after a snapshot is not lost to the rollback. Fails if `predicted` or `net`
+    /// is already bound to something else.
     pub fn bind(&mut self, predicted: PredictionKey, net: NetId) -> Result<()> {
         todo!()
     }
@@ -272,36 +306,55 @@ impl World {
         todo!()
     }
 
-    /// The current input tick of `player`, which a spawn commanded from an entity the
-    /// player has claimed puts in its `Predicted` key. Set at the input sync point by the
-    /// system that applies the player's input, on the server and on the client alike.
+    /// Sets the input tick of `player` for this tick: the tick slot the input being applied
+    /// is for, also when the server substitutes a previous input for a lost one. A spawn
+    /// commanded from an entity the player has claimed puts it in its `Predicted` key.
+    /// Called from an exclusive system at the input sync point, on the server and on the
+    /// client alike; the sync point clears every player's input tick first, so a claimed
+    /// source whose player has none this tick spawns unpredicted and passes no claim on.
     pub fn set_input_tick(&mut self, player: PlayerId, input_tick: Tick) {
         todo!()
     }
 
-    /// The entities residing in `region`, in ascending key order.
+    /// The input tick of `player` this tick, if set.
+    #[must_use]
+    pub fn input_tick(&self, player: PlayerId) -> Option<Tick> {
+        todo!()
+    }
+
+    /// The entities residing in `region`, in ascending origin-key order.
     #[must_use]
     pub fn entities_in(&self, region: RegionId) -> Entities<'_> {
         todo!()
     }
 
-    /// The entities whose components refer to `target` through an `EntityRef` field: the
-    /// reverse index of relationships (architecture section 6), maintained at command
-    /// apply and by the direct methods here, included in snapshots. Storage order.
+    /// The entities whose components refer to `target` through an `EntityRef` field, in
+    /// ascending origin-key order: the reverse index of relationships (architecture section
+    /// 6), maintained at command apply and by the direct methods here, included in
+    /// snapshots.
     #[must_use]
     pub fn referrers(&self, target: StableKey) -> Referrers<'_> {
         todo!()
     }
 
-    /// The entities `owner` owns, in ascending key order.
+    /// The entities `owner` owns, in ascending origin-key order.
     #[must_use]
     pub fn owned_by(&self, owner: StableKey) -> Entities<'_> {
         todo!()
     }
 
-    /// A query over every entity matching `Q`.
+    /// A query over every entity matching `Q`. Panics if `Q` names a component twice.
     #[must_use]
     pub fn query<Q: QueryItems>(&mut self) -> Query<'_, Q> {
+        todo!()
+    }
+
+    /// The RNG stream for `key` in `region` on behalf of `system`, as
+    /// [`Ctx::rng`](crate::Ctx::rng) gives a per-region system: keyed by the region seed,
+    /// the tick, `system` and `key`. `None` if the region is not loaded. For exclusive
+    /// systems and tests.
+    #[must_use]
+    pub fn rng(&self, region: RegionId, system: SystemKey, key: StableKey) -> Option<Rng> {
         todo!()
     }
 
@@ -330,8 +383,8 @@ impl World {
     }
 
     /// Inserts a service resource: a `dyn` trait object from an `-api` crate that `app`
-    /// provides (architecture section 4), read by systems as `Res<dyn Trait>`. Not
-    /// reflected, hashed, saved or snapshotted.
+    /// provides (architecture section 4), read by systems as `Res<dyn Trait>` with exactly
+    /// this `T`. Not reflected, hashed, saved or snapshotted.
     #[allow(clippy::boxed_local, reason = "facade: the body is todo!()")]
     pub fn insert_service<T: ?Sized + Send + Sync + 'static>(
         &mut self,
@@ -359,8 +412,8 @@ impl World {
         todo!()
     }
 
-    /// Despawns every entity of `region` and forgets it. Export first to keep its state
-    /// ([`export_region`](Self::export_region)).
+    /// Despawns every entity of `region`, drops its resources and forgets it. Export first
+    /// to keep its state ([`export_region`](Self::export_region)).
     pub fn unload_region(&mut self, region: RegionId) -> Result<()> {
         todo!()
     }
@@ -383,12 +436,21 @@ impl World {
     }
 
     /// Inserts a resource of `region`, returning the previous value. Region resources are
-    /// hashed with the region, saved with it and part of a snapshot.
+    /// hashed with the region, exported with it if persistent, and part of a snapshot.
     pub fn insert_region_resource<T: Resource>(
         &mut self,
         region: RegionId,
         value: T,
     ) -> Result<Option<T>> {
+        todo!()
+    }
+
+    /// Inserts a resource of `region` from its bytes, validated against the registry.
+    pub fn insert_region_resource_erased(
+        &mut self,
+        region: RegionId,
+        value: ComponentData,
+    ) -> Result<()> {
         todo!()
     }
 
@@ -401,6 +463,13 @@ impl World {
     /// A resource of `region`, for writing.
     #[must_use]
     pub fn region_resource_mut<T: Resource>(&mut self, region: RegionId) -> Option<&mut T> {
+        todo!()
+    }
+
+    /// Every resource of `region` as bytes, in ascending key order, for the world hash and
+    /// the export.
+    #[must_use]
+    pub fn region_resources_erased(&self, region: RegionId) -> ErasedResources<'_> {
         todo!()
     }
 
@@ -422,7 +491,8 @@ impl World {
 
     // ---- Change tracking ----
 
-    /// The rows of `T` changed since `mark`, or `None` if the mark is stale.
+    /// The rows of `T` changed since `mark`, or `None` if the mark is stale. Panics if `T`
+    /// is not a tracked column (replicated or extracted).
     #[must_use]
     pub fn changed_since<T: Component>(&self, mark: ChangeMark) -> Option<ChangedRows<'_, T>> {
         todo!()
@@ -434,7 +504,7 @@ impl World {
         todo!()
     }
 
-    /// Every chunk's column of `T`, for bulk writes with an explicit dirty range.
+    /// Every chunk's column of `T`, for bulk writes that record what they changed.
     #[must_use]
     pub fn columns_mut<T: Component>(&mut self) -> ColumnsMut<'_, T> {
         todo!()
@@ -452,14 +522,14 @@ impl World {
         todo!()
     }
 
-    /// Drops log entries before `cursor`, which every consumer has passed.
+    /// Drops log entries before `cursor`, the minimum over every consumer's cursor.
     pub fn trim_structural_log(&mut self, cursor: LogCursor) {
         todo!()
     }
 
     // ---- Buffers consumed at sync points ----
 
-    /// Takes the entries of channel `C` written this tick, in command order.
+    /// Takes the entries of channel `C` written this tick, in command order, keys resolved.
     pub fn take_channel<C: CommandChannel>(&mut self) -> Vec<ChannelEntry<C>> {
         todo!()
     }
@@ -478,33 +548,38 @@ impl World {
         todo!()
     }
 
-    /// Replaces the rollback state with `snapshot`, taken from this world. Ticks are
-    /// rebased to the snapshot's tick, the structural log is cleared and a new epoch starts,
-    /// so every consumer does a full pass. Fails if the snapshot is from another world.
+    /// Replaces the rollback state with `snapshot`, taken from this world. The tick returns
+    /// to the snapshot's, change stamps are rebased, the structural log is cleared and a
+    /// new epoch starts, so every consumer does a full pass. The alias table and the
+    /// presentation-event log are kept. Fails if the snapshot is from another world.
     pub fn restore(&mut self, snapshot: &WorldSnapshot) -> Result<()> {
         todo!()
     }
 
     // ---- Bulk copy ----
 
-    /// Spawns the cooked rows of `baseline` into `region`, which must be empty: a copy per
-    /// archetype column plus a remap pass over reference fields. Every component schema
-    /// must match the registry's; a mismatch is an error of kind `VersionMismatch`, and
-    /// `lactose-persist` migrates the document first.
-    pub fn import_baseline(&mut self, region: RegionId, baseline: &Baseline) -> Result<()> {
+    /// Loads `region`, which must be empty: spawns the cooked rows of `baseline` except
+    /// those `overlay` destroys, a copy per archetype column plus a remap pass over
+    /// reference fields; then applies `overlay`'s records in record order, restores every
+    /// predicted origin key and alias from [`PredictedOrigin`](crate::PredictedOrigin), and
+    /// inserts the overlay's region resources. A `Destroy` record never touches a live
+    /// entity of another region: a cooked entity that moved is a row there, not here. Every
+    /// component schema must match the registry's; a mismatch is an error of kind
+    /// `VersionMismatch`, and `lactose-persist` migrates the document first. Rows are
+    /// stamped at the current tick and logged as spawned; no epoch starts.
+    pub fn load_region(
+        &mut self,
+        region: RegionId,
+        baseline: &Baseline,
+        overlay: Option<&Overlay>,
+    ) -> Result<()> {
         todo!()
     }
 
-    /// Applies `overlay`'s records to `region` over its baseline rows, in record order,
-    /// with the same schema rule as [`import_baseline`](Self::import_baseline). Change
-    /// ticks of the written rows are rebased and a new epoch starts.
-    pub fn apply_overlay(&mut self, region: RegionId, overlay: &Overlay) -> Result<()> {
-        todo!()
-    }
-
-    /// Copies every persistent component of every entity of `region` out, in ascending
-    /// `NetId` order. An entity without a bound `NetId` is an error: the server binds every
-    /// entity before a save and a client never exports.
+    /// Copies the state of `region` out: every persistent component of every entity in
+    /// ascending `NetId` order, with the owner beside each row, plus the seed and the
+    /// persistent region resources. An entity without a bound `NetId` is an error: the
+    /// server binds every entity before a save, and a client never exports.
     pub fn export_region(&self, region: RegionId) -> Result<RegionRows> {
         todo!()
     }
@@ -554,6 +629,19 @@ pub struct Referrers<'w> {
 
 impl Iterator for Referrers<'_> {
     type Item = Referrer;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        todo!()
+    }
+}
+
+/// Iterates resources as bytes, in ascending key order.
+pub struct ErasedResources<'w> {
+    _world: PhantomData<&'w ()>,
+}
+
+impl<'w> Iterator for ErasedResources<'w> {
+    type Item = (ComponentKey, &'w [u8]);
 
     fn next(&mut self) -> Option<Self::Item> {
         todo!()

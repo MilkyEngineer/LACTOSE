@@ -1185,7 +1185,34 @@ rationale the author supplied during the editorial pass rather than one taken fr
   - *`RegionRes<T>` is read-only in kernels.* The kernels of one region run on many workers;
     region resources are written through `World::region_resource_mut` at a sync point or by
     a reduction's finalize through a world resource.
-- Driven by: milestone 0, the ECS facade.
+- What the design review changed (9 blocking, 16 serious, 9 minor findings; `aa3f05d` was
+  the facade before it): `run_tick` takes the world by value and hands it back, because a
+  dropped or forgotten future would otherwise leave jobs writing through a dead borrow, and
+  `run_pass` runs a schedule between ticks for extract and the gather; a `Job` parameter
+  gives once-per-tick, exclusive and finalize code the executor's job context, so parallel
+  exclusive passes and the physics step's `block_in_place` can be written without `unsafe`
+  outside `ecs`; a system with no component parameter but a `Ctx` runs once per `Simulated`
+  region, which gives it a region, a seed and a spawn target; `ResMut` and `Job` are
+  rejected in anything that runs more than once per tick, two parameters on one component
+  are rejected, and so is `Mut` on a world-maintained or reference-bearing component; the
+  tick is settable and never rebased, stamps are; a predicted origin key is persisted as
+  `PredictedOrigin` so it survives a save and a region overlay; the predicted-key rule gained
+  the input-tick-slot rule, the clearing of input ticks at the sync point and the
+  `prediction`-worlds condition, and `World::spawn` gives a `Predicted` key its origin
+  component; channels resolve placeholders through `CommandChannel::remap`; `Changed<T>` is
+  exact through a (tick, position) stamp and allowed on tracked columns only, since a
+  chunk-tick fallback made it layout-dependent; the alias table and the delivered
+  presentation-event keys survive `restore`, the present-event key gained a sequence, and
+  the snapshot covers every column and resource; `Query::for_each` and `referrers` are in
+  key order so exclusive code that spawns per match is layout-independent; marks and cursors
+  are ordered and `is_current` tests a mark; a region load no longer starts an epoch;
+  `load_region` takes baseline and overlay together so a reloaded region does not collide
+  with a cooked entity that moved out of it; exports carry the seed and region resources;
+  `ColumnMut::write` passes the keys and records a row set; `SystemDescriptor::new` is
+  `unsafe`, since the schedule's soundness rests on the table it takes. Deferred as additive
+  attribute flags: the overload ladder's decimation (§9.7) and `ordered` or per-region
+  reductions (§5.2).
+- Driven by: milestone 0, the ECS facade and its design review (2026-10-10).
 
 **D115. The boundary check resolves features as a workspace build does** (§8.3, `tools/xtask`)
 - Why: `cargo xtask boundary` computed each boundary crate's third-party closure from a

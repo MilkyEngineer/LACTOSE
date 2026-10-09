@@ -20,7 +20,8 @@
 //! - A system is a plain function under `#[system]`, which declares its access through its
 //!   parameter types ([`Res`], [`Mut`], `&T`, [`Ctx`], [`Commands`], [`Events`], ...) and
 //!   emits a [`SystemDescriptor`] static.
-//! - [`Schedule`] orders descriptors into stages separated by sync points and runs a tick.
+//! - [`Schedule`] orders descriptors into stages separated by sync points and runs a tick,
+//!   or a pass between ticks for extract and the replication gather.
 //! - Change state is read per consumer: [`World::changed_since`] by column,
 //!   [`World::structural_log`] for spawns, despawns and moves.
 //! - [`World::snapshot`] and [`World::restore`] serve the prediction world; the bulk-copy
@@ -49,7 +50,7 @@ mod world;
 pub use access::{Access, AccessKind, AccessTarget};
 pub use bulk::{ExportedRow, RegionRows};
 pub use change::{
-    ChangeMark, ChangedRows, ColumnMut, ColumnRef, Columns, ColumnsMut, DirtyRange, ErasedColumn,
+    ChangeMark, ChangedRows, ColumnMut, ColumnRef, Columns, ColumnsMut, DirtyRows, ErasedColumn,
     ErasedColumns, LogCursor, LogEntries, LogEntry, StructuralChange, StructuralLog,
 };
 pub use command::{
@@ -68,17 +69,33 @@ pub use lactose_ecs_macros::finalize;
 /// the arguments and what the attribute emits.
 pub use lactose_ecs_macros::system;
 pub use param::{
-    Changed, Ctx, Mut, RegionRes, Res, ResMut, StableKeyOf, SystemParam, With, Without,
+    Changed, Ctx, Job, Mut, RegionRes, Res, ResMut, StableKeyOf, SystemParam, With, Without,
 };
 pub use query::{Query, QueryItem, QueryItems};
-pub use region::{ClaimedBy, InRegion, OwnedBy, RegionConfig, RegionId, RegionInfo, RegionMode};
+pub use region::{
+    ClaimedBy, InRegion, OwnedBy, PredictedOrigin, RegionConfig, RegionId, RegionInfo, RegionMode,
+};
 pub use rng::Rng;
 pub use schedule::{Schedule, ScheduleBuilder, ScheduleError};
 pub use snapshot::WorldSnapshot;
 pub use system::{SystemDescriptor, SystemSet};
 pub use world::{
-    ChunkOrder, Entities, LayoutConfig, Referrer, Referrers, Regions, World, WorldBuilder,
-    WorldKind, WorldSet,
+    ChunkOrder, Entities, ErasedResources, LayoutConfig, Referrer, Referrers, Regions, World,
+    WorldBuilder, WorldKind, WorldSet,
+};
+
+/// The thread-safety the contract promises, pinned so the implementation cannot lose it
+/// without a compile error: a scope child borrows the world and its column views, and the
+/// timer root task owns the world and the schedule.
+const _: () = {
+    const fn send_sync<T: Send + Sync>() {}
+    const fn send<T: Send>() {}
+    send_sync::<World>();
+    send_sync::<ColumnRef<'_, InRegion>>();
+    send_sync::<ErasedColumn<'_>>();
+    send::<ColumnMut<'_, InRegion>>();
+    send::<Schedule>();
+    send::<WorldSnapshot>();
 };
 
 /// Items the `#[system]` and `#[finalize]` expansions name. Not part of the interface: the

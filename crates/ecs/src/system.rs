@@ -72,10 +72,18 @@ pub struct SystemDescriptor {
 impl SystemDescriptor {
     /// Builds a descriptor. Called by the `#[system]` expansion only; the arguments are
     /// positional so a change here is a change of the macro in the same commit.
+    ///
+    /// # Safety
+    ///
+    /// `access` must describe exactly what `kernel` touches: every component, resource,
+    /// event and channel it reads or writes, with the right kind. The schedule orders
+    /// systems by this table, and the storage hands out `&mut` rows on the strength of it
+    /// (`SAFETY.md`). The `#[system]` expansion derives the table from the parameter types
+    /// and is the one sound caller.
     #[doc(hidden)]
     #[must_use]
     #[allow(clippy::too_many_arguments, reason = "positional on purpose: see above")]
-    pub const fn new(
+    pub const unsafe fn new(
         name: &'static str,
         worlds: WorldSet,
         set: Option<&'static SystemSet>,
@@ -165,7 +173,8 @@ impl core::fmt::Debug for SystemDescriptor {
 #[doc(hidden)]
 #[derive(Clone, Copy)]
 pub struct Kernel {
-    /// Runs the system over one invocation: one entity, or the once-per-tick call.
+    /// Runs the system over one invocation: one entity, one region, or the once-per-tick
+    /// call.
     pub run: fn(&mut Invocation<'_>),
     /// Runs the finalize function of a reduction, or does nothing.
     pub finalize: fn(&mut Invocation<'_>),

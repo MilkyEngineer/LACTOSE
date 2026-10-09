@@ -347,8 +347,9 @@ tick N        tick N+1 simulation ───────────────�
   per-world structural change log records spawns, despawns, component additions and removals
   and region moves with their tick, consumed per consumer like row ticks, so replication can
   emit tombstones and the renderer can free slots. `Changed<T>` filters mean changed since the
-  previous tick. Replicated columns use `set_if_neq` so rewriting an equal value does
-  not dirty the row. Because each row's tick is its own word, chunk jobs may split at any row without a shared
+  reading system last ran, each change seen exactly once by each reader, which needs a
+  per-row stamp and so is allowed on tracked columns only. Replicated columns use
+  `set_if_neq` so rewriting an equal value does not dirty the row. Because each row's tick is its own word, chunk jobs may split at any row without a shared
   write; no atomics are involved. Whole-column slice access takes an explicit dirty-range
   out-parameter.
   Extract keeps a last-seen tick. Replication keeps a per-client, per-entity acked tick
@@ -447,14 +448,16 @@ contract and D114 records the choices this section left open.
 | `EntityId` | one process | process-local allocator, index plus generation, `NonZeroU64` so `Option` is free | storage lookup only; never on the wire or disk |
 | `StableKey` | everywhere a reference is stored | enum: `Net(NetId)`, `Predicted(PredictionKey)`, `Placeholder(u32)` within one command buffer | `EntityRef` fields, relationships, render slots, event targets, RNG keys, ordering ties |
 | `NetId` | server and all clients, and saves | 64-bit with a tag bit. Cooked: hash of (authored scene GUID, authored placement GUID, child path of authored GUIDs), so clients derive it without a message and re-cooking preserves it. Every element is a GUID stored in the authored file, never a name, path or index, so renaming a scene or reordering siblings preserves the ID. Runtime: one server counter, assigned at command apply and persisted in the save | the `Net` arm of `StableKey`; the persistent ID of every entity that has one. There is no separate `PersistentId` |
-| `PredictionKey` | one client plus the server | (player ID, input tick, ordinal), where the ordinal is the spawning command's position in that tick's total command order restricted to the player's input-driven sources. The server records it as the entity's permanent origin key | the `Predicted` arm of `StableKey` until the server binds a `NetId`; RNG and ordering use the origin key on both machines, so binding changes nothing. A predicted spawn the server never echoes is destroyed when the processed-input acknowledgement passes its input tick |
+| `PredictionKey` | one client plus the server | (player ID, input tick, ordinal), where the input tick is the slot the player's input is applied for this tick and the ordinal is the spawn's position in that tick's total command order among the spawns commanded from entities the player has claimed by systems that run in the prediction world. The server records it as the entity's permanent origin key, persisted as a component so a save or a region overlay carries it | the `Predicted` arm of `StableKey` until the server binds a `NetId`; RNG and ordering use the origin key on both machines, so binding changes nothing. A predicted spawn the server never echoes is destroyed when the processed-input acknowledgement passes its input tick |
 | `SystemKey` | build | xxh64 of the declared system name, collision-checked | command order ties, RNG stream selection |
 | `ComponentKey` | build, wire, disk | xxh64 of the declared component name, collision-checked | registry, protocol hash, save records |
 | `PlayerId` | session | server-assigned on join | prediction keys, interest sets, input queues |
 
 Typed reference fields (`EntityRef` holding `StableKey`, `AssetRef` holding `AssetId`) are
 known to the registry and remapped on load, so the bulk-copy load path is a copy plus a remap
-pass. The prediction world's snapshot includes its prediction-to-network alias table.
+pass. The prediction world keeps its prediction-to-network alias table across a rollback
+restore, since a bind is a fact from the server, and a bind for an entity the restore removed
+applies again when re-simulation respawns it.
 
 ## 8. Determinism
 
@@ -674,10 +677,13 @@ interaction keep it possible later. No system may hold a direct reference across
 
 ## 10. Snapshots
 
-Only the client prediction world is ever rolled back. Its `snapshot` captures mutable columns,
-the entity table, the prediction-to-network alias table, proxy history, the presentation event
-log used for deduplication, region resources, the relationship index and the physics world
-through `physics-api::snapshot`. Command buffers are empty at snapshot points by construction.
+Only the client prediction world is ever rolled back. Its `snapshot` captures every column,
+the entity table, world and region resources, region modes, seeds and asset tables, the
+input-tick table, the relationship index, proxy history and the physics world through
+`physics-api::snapshot`. Two things stay with the world across a restore because a rollback
+must not undo them: the prediction-to-network alias table (section 7) and the log of
+delivered presentation events, which is what lets re-emission deduplicate and a missing
+re-emission cancel. Command buffers are empty at snapshot points by construction.
 
 The server never rolls back. Save snapshots copy persistent columns only (section 15.3).
 

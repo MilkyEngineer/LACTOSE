@@ -44,7 +44,8 @@ impl<T: Component> QueryItem for Changed<T> {
     type Item<'a> = Changed<T>;
 }
 
-/// One [`QueryItem`] or a tuple of up to eight, each on a different component.
+/// One [`QueryItem`] or a tuple of up to eight, each on a different component; a bare
+/// `&T` and `(&T,)` both work.
 pub trait QueryItems {
     /// The items with the query's borrow.
     type Item<'a>;
@@ -63,6 +64,7 @@ macro_rules! tuple_query_items {
 }
 
 tuple_query_items! {
+    (A);
     (A, B);
     (A, B, C);
     (A, B, C, D);
@@ -76,16 +78,16 @@ tuple_query_items! {
 /// mode, with no world filter: this is the whole-world view that
 /// [`World::query`](crate::World::query) gives exclusive code, not the kernel's.
 ///
-/// Iteration is in storage order, which is not a semantic key: code whose result depends
-/// on it is wrong, and SOUR's layout mode catches it. Code that needs an order sorts by
-/// key.
+/// Iteration is in ascending origin-key order, so exclusive code that spawns, allocates or
+/// emits per match does so in the same order under every layout.
 pub struct Query<'w, Q: QueryItems> {
     _world: PhantomData<&'w mut ()>,
     _items: PhantomData<fn() -> Q>,
 }
 
 impl<Q: QueryItems> Query<'_, Q> {
-    /// Calls `f` once per matching entity with its origin key and items.
+    /// Calls `f` once per matching entity with its origin key and items, in ascending key
+    /// order.
     pub fn for_each(&mut self, f: impl FnMut(StableKey, Q::Item<'_>)) {
         todo!()
     }

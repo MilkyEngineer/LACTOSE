@@ -54,7 +54,7 @@ pub enum AccessKind {
     With,
     /// Requires the component's absence: [`Without`](crate::Without).
     Without,
-    /// Requires a change since the previous tick, which reads the row tick:
+    /// Requires a change since the system last ran, which reads the row's change stamp:
     /// [`Changed`](crate::Changed).
     Changed,
     /// Reads the events of a type: [`Events`](crate::Events). The reader must be ordered
@@ -66,10 +66,15 @@ pub enum AccessKind {
     Commands,
     /// Emits presentation events: [`PresentEvents`](crate::PresentEvents).
     PresentEvents,
-    /// Per-entity context and the origin key: [`Ctx`](crate::Ctx),
-    /// [`StableKeyOf`](crate::StableKeyOf). Allowed only in a system with a component
-    /// parameter.
+    /// The entity's origin key: [`StableKeyOf`](crate::StableKeyOf). Only in a system with
+    /// a component parameter.
     Entity,
+    /// The region's context: [`Ctx`](crate::Ctx). In a system with a component parameter,
+    /// or in one without, which then runs once per `Simulated` region.
+    Region,
+    /// The executor's job context: [`Job`](crate::Job). Only in a system that runs once per
+    /// tick, an exclusive system or a finalize function.
+    Job,
     /// The whole world: `&mut World` in an exclusive system.
     World,
 }

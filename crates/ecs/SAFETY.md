@@ -3,10 +3,23 @@
 Every `unsafe` block carries a `// SAFETY:` comment. This file states the invariants those
 comments rely on. The crate's tests run under Miri.
 
-The facade contains no `unsafe`. Architecture section 21 admits it here for one reason, chunk
-column storage, and the implementation that replaces the facade's bodies is expected to need
-it in two places. Each is written up below as the invariant the implementation must state and
-keep; a change that needs a third place amends this file in the same commit.
+The facade contains one `unsafe fn` and no `unsafe` block. Architecture section 21 admits
+`unsafe` here for one reason, chunk column storage, and the implementation that replaces the
+facade's bodies is expected to need it in two places. Each is written up below as the
+invariant the implementation must state and keep; a change that needs a third place amends
+this file in the same commit.
+
+## The access table (`SystemDescriptor::new`)
+
+The schedule hands a kernel `&mut` rows and resources on the strength of the descriptor's
+access table: two systems that conflict on a target are ordered, and within a system each
+parameter names a different component. A table that understates what the kernel touches
+would let two kernels alias one row from safe code. So `SystemDescriptor::new` is `unsafe`,
+with the obligation that the table describes exactly what the kernel touches, and the
+`#[system]` expansion, which derives the table from the parameter types, is its one caller.
+The `unsafe` call lands in the invoking crate; the `unsafe_code` lint does not apply to code
+another crate's macro generates, so that crate keeps `#![forbid(unsafe_code)]` (section 21,
+as for `#[component]`).
 
 ## Chunk columns
 
@@ -21,15 +34,21 @@ a column's bytes to `T`.
   archetype's layout is fixed for its life.
 - Row count never exceeds capacity; a row beyond the live count is never handed out.
 - Two kernels never hold `&mut` to one row: within a stage the schedule orders every pair of
-  systems that conflict on a column, and within a system each chunk job owns disjoint rows.
+  systems that conflict on a column, within a system the schedule rejects two parameters on
+  one component, and within a system each chunk job owns disjoint rows.
+- `Ctx` holds `&World` beside live `Mut` rows of the same world, so the implementation keeps
+  column storage behind `UnsafeCell` and never forms a `&` to a row a `Mut` covers.
 
-## Lending the world to a graph run
+## Sharing the world with a graph run
 
-`Schedule::run_tick` lends `&World` or `&mut World` to chunk jobs that the executor runs on
-other threads through `'static` graph nodes.
+`Schedule::run_tick` and `run_pass` take the `World` by value and share it with chunk jobs
+that the executor runs on other threads through `'static` graph nodes.
 
-- The borrow is sound because of the `GraphRun` contract in `crates/task/README.md`: when a
-  run resolves, with `Ok` or with `Cancelled`, no unit, scope child or finalize of that run is
-  executing or ever will. `run_tick` does not return while a run of this tick is unresolved.
-- The nodes hold a raw pointer that is dereferenced only inside `run` and `finalize` of that
-  run, never stored elsewhere and never after the run resolves.
+- The run owns the world for its duration (an `Arc` the nodes share, or storage moved into
+  the run) and the future hands it back only after the run has resolved. A future that is
+  dropped or forgotten mid-tick therefore leaks the world: no borrow outlives the jobs.
+- The jobs' accesses are disjoint by the access-table argument above, and `World: Sync`
+  covers the shared reads.
+- When the run resolves, with `Ok` or with `Cancelled`, no unit, scope child or finalize of
+  that run is executing or ever will (`crates/task/README.md`, "Resolution"); on `Cancelled`
+  the world is torn and is not handed back.

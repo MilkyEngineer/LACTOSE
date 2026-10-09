@@ -7,6 +7,7 @@ use core::ops::{Deref, DerefMut};
 use lactose_asset_api::PinnedTable;
 use lactose_core::{StableKey, Tick};
 use lactose_reflect::{Component, Resource};
+use lactose_task::JobContext;
 
 use crate::access::{
     Access, AccessKind, component_target, no_target, region_resource_target, resource_target,
@@ -24,22 +25,34 @@ pub(crate) mod sealed {
 /// The set is closed: it is exactly the parameter types this crate exports, and
 /// [`ACCESS`](Self::ACCESS) is what the `#[system]` expansion records for each. The kinds:
 ///
-/// | Parameter | Scope | Access |
+/// | Parameter | Allowed in | Access |
 /// |---|---|---|
-/// | `&T`, [`Mut<T>`], `Option<&T>`, `Option<Mut<T>>` | per entity | the component |
-/// | [`With<T>`], [`Without<T>`], [`Changed<T>`] | per entity | a filter on the component |
-/// | [`Ctx`], [`StableKeyOf`] | per entity | none |
-/// | [`Res<T>`], [`ResMut<T>`], [`RegionRes<T>`] | any | the resource |
-/// | [`Commands`](crate::Commands), [`EventWriter<E>`](crate::EventWriter), [`PresentEvents`](crate::PresentEvents) | any | output buffers |
-/// | [`Events<E>`](crate::Events), [`Channel<C>`](crate::Channel) | any | input buffers |
+/// | `&T`, [`Mut<T>`], `Option<&T>`, `Option<Mut<T>>` | per-entity | the component |
+/// | [`With<T>`], [`Without<T>`], [`Changed<T>`] | per-entity | a filter on the component |
+/// | [`StableKeyOf`] | per-entity | none |
+/// | [`Ctx`], [`RegionRes<T>`] | per-entity, per-region | the region |
+/// | [`Res<T>`] | every kind | the resource, read |
+/// | [`ResMut<T>`] | once per tick, exclusive, finalize | the resource, written |
+/// | [`Commands`](crate::Commands), [`EventWriter<E>`](crate::EventWriter), [`PresentEvents`](crate::PresentEvents) | every kind | output buffers |
+/// | [`Events<E>`](crate::Events), [`Channel<C>`](crate::Channel) | every kind | input buffers |
+/// | [`Job`] | once per tick, exclusive, finalize | the executor's job context |
 /// | `&mut World` | exclusive | everything |
 ///
-/// A system with at least one component parameter is a per-entity kernel: it runs once per
-/// entity that has every required component, lacks every excluded one, resides in a
-/// `Simulated` region and passes the world's own filter. A system with none runs once per
-/// tick and may not take a per-entity parameter. An exclusive system takes `&mut World`
-/// first and otherwise only resource, command and event parameters, which are taken out of
-/// the world for the call: inside, the world does not hold them.
+/// What a system is, from its parameters:
+///
+/// - **Per-entity**: it has a component parameter. It runs once per entity that has every
+///   required component, lacks every excluded one, passes every `Changed` filter, resides in
+///   a `Simulated` region and passes the world's own filter.
+/// - **Per-region**: it has no component parameter but a [`Ctx`] or [`RegionRes`]. It runs
+///   once per `Simulated` region, each run independent of the others.
+/// - **Once per tick**: it has neither. It runs as one job.
+/// - **Exclusive**: declared `exclusive`, it takes `&mut World` first and otherwise only
+///   resource, buffer and [`Job`] parameters, which are taken out of the world for the call:
+///   inside, the world does not hold them.
+///
+/// A system that runs more than once per tick (per-entity, per-region) may not write a world
+/// resource or take [`Job`], and a system that is not per-entity may not take
+/// [`StableKeyOf`]; the schedule rejects each ([`ScheduleError`](crate::ScheduleError)).
 pub trait SystemParam: sealed::Sealed + Sized {
     /// What this parameter reads or writes.
     const ACCESS: Access;
@@ -47,6 +60,11 @@ pub trait SystemParam: sealed::Sealed + Sized {
 
 /// A world resource, read. `T` is a reflected [`Resource`] or the `dyn` trait type of a
 /// service resource that `app` inserted (architecture section 4).
+///
+/// A service trait has `Send + Sync` supertraits and is inserted and read as the same
+/// `dyn Trait`, since `dyn Trait` and `dyn Trait + Send + Sync` have different `TypeId`s.
+/// A resource a system names that the world does not hold fails `run_tick` before anything
+/// runs, with an error of kind `NotFound`.
 pub struct Res<'w, T: ?Sized + 'static> {
     value: &'w T,
 }
@@ -65,8 +83,9 @@ impl<T: ?Sized + 'static> SystemParam for Res<'_, T> {
     const ACCESS: Access = Access::new(AccessKind::Read, resource_target::<T>);
 }
 
-/// A world resource, written. Two systems that write or read and write the same resource
-/// must be ordered.
+/// A world resource, written. Only in a system that runs once per tick, an exclusive
+/// system or a finalize function, because a kernel runs on many workers; two systems that
+/// write, or read and write, the same resource must be ordered.
 pub struct ResMut<'w, T: ?Sized + 'static> {
     value: &'w mut T,
 }
@@ -91,9 +110,9 @@ impl<T: ?Sized + 'static> SystemParam for ResMut<'_, T> {
     const ACCESS: Access = Access::new(AccessKind::Write, resource_target::<T>);
 }
 
-/// A resource of the entity's region, read. Region resources are written through
-/// [`World::region_resource_mut`] at a sync point, never from a kernel, because the kernels
-/// of one region run on many workers.
+/// A resource of the current region, read. Region resources are written through
+/// [`World::region_resource_mut`] at a sync point, never from a kernel, because the
+/// kernels of one region run on many workers.
 pub struct RegionRes<'w, T: Resource> {
     value: &'w T,
 }
@@ -120,14 +139,20 @@ impl<T: Component> SystemParam for &T {
 
 /// A component of the entity, written.
 ///
-/// A mutable dereference marks the row changed at the current tick (architecture section
-/// 6): on a tracked column it sets the row's tick, and on every column it is covered by the
-/// chunk's column tick, which the dispatch of a writing system sets. Reading through `Deref`
-/// marks nothing.
+/// A mutable dereference marks the row changed (architecture section 6): on a tracked
+/// column it sets the row's change stamp to the current tick and this system's position,
+/// and on every column it is covered by the chunk's column tick, which the dispatch of a
+/// writing system sets. Reading through `Deref` marks nothing.
+///
+/// Not for a component the world maintains ([`InRegion`](crate::InRegion),
+/// [`OwnedBy`](crate::OwnedBy), [`ClaimedBy`](crate::ClaimedBy),
+/// [`PredictedOrigin`](crate::PredictedOrigin)) nor for one with an `EntityRef` field, whose
+/// reverse index is kept at command apply: those are written through
+/// [`Commands::set`](crate::Commands::set), and the schedule rejects `Mut` on them.
 pub struct Mut<'w, T: Component> {
     value: &'w mut T,
-    row_tick: Option<&'w mut Tick>,
-    now: Tick,
+    stamp: Option<&'w mut u64>,
+    now: u64,
 }
 
 impl<T: Component> Mut<'_, T> {
@@ -190,11 +215,12 @@ impl<T: Component> SystemParam for Without<T> {
     const ACCESS: Access = Access::new(AccessKind::Without, component_target::<T>);
 }
 
-/// Restricts the kernel to entities whose `T` changed since the previous tick: rows whose
-/// change tick is the previous tick or the current one. A change earlier in the current
-/// tick is seen only by a system ordered after the writer, and the schedule requires that
-/// order, since the filter reads what the writer writes. On an untracked column the row
-/// tick is the chunk's column tick, so the filter is exact per chunk, not per row.
+/// Restricts the kernel of system `S` to entities whose `T` changed since `S` last ran:
+/// rows whose change stamp is after `S`'s position in the previous tick and before it in
+/// this one, whether the write came from a system ordered before `S`, a command applied at
+/// a sync point or direct access between ticks. Each change is seen exactly once by each
+/// reader. `T` must be a tracked column (replicated or extracted), since only those carry
+/// a stamp per row; the schedule rejects the filter on any other.
 pub struct Changed<T: Component>(PhantomData<fn() -> T>);
 
 impl<T: Component> sealed::Sealed for Changed<T> {}
@@ -203,39 +229,42 @@ impl<T: Component> SystemParam for Changed<T> {
     const ACCESS: Access = Access::new(AccessKind::Changed, component_target::<T>);
 }
 
-/// The per-entity context: the tick, the entity's region, its RNG streams and its region's
-/// assets.
+/// The region's context: the tick, the region, its RNG streams and its assets. In a
+/// per-entity system the region is the entity's; in a system without a component parameter
+/// it makes the system run once per `Simulated` region.
 pub struct Ctx<'w> {
     world: &'w World,
     region: RegionId,
-    key: StableKey,
+    invoker: Option<StableKey>,
     system: lactose_core::SystemKey,
     tick: Tick,
 }
 
 impl Ctx<'_> {
-    /// The current tick.
+    /// The absolute simulation tick.
     #[must_use]
     pub fn tick(&self) -> Tick {
         self.tick
     }
 
-    /// The region the entity resides in.
+    /// The region.
     #[must_use]
     pub fn region(&self) -> RegionId {
         self.region
     }
 
-    /// The RNG stream for `key`: keyed by the region seed, the tick, this system and `key`
-    /// (architecture section 8.2). `key` is usually the entity's own origin key or a
-    /// placeholder from this invocation's commands; any stable key is accepted.
+    /// The RNG stream for `key`: keyed by the region seed, the tick, this system, the
+    /// invoking entity's origin key (none in a per-region system) and `key` (architecture
+    /// section 8.2). `key` is usually the entity's own origin key or a placeholder from this
+    /// invocation's spawns, which is keyed by its spawn index; any stable key is accepted.
+    /// Two calls with one key give the same stream: draw from one `Rng`.
     #[must_use]
     pub fn rng(&self, key: StableKey) -> Rng {
         todo!()
     }
 
-    /// The exact-version assets of the entity's region (architecture section 14), or `None`
-    /// until a table has entered at an input sync point.
+    /// The exact-version assets of the region (architecture section 14), or `None` until a
+    /// table has entered at an input sync point.
     #[must_use]
     pub fn assets(&self) -> Option<&PinnedTable> {
         todo!()
@@ -245,7 +274,7 @@ impl Ctx<'_> {
 impl sealed::Sealed for Ctx<'_> {}
 
 impl SystemParam for Ctx<'_> {
-    const ACCESS: Access = Access::new(AccessKind::Entity, no_target);
+    const ACCESS: Access = Access::new(AccessKind::Region, no_target);
 }
 
 /// The entity's origin key: its `NetId`, or the `PredictionKey` of a predicted spawn,
@@ -280,6 +309,30 @@ impl sealed::Sealed for StableKeyOf {}
 
 impl SystemParam for StableKeyOf {
     const ACCESS: Access = Access::new(AccessKind::Entity, no_target);
+}
+
+/// The executor's job context of the job the system runs as: fork-join over `&World`
+/// through [`JobContext::scope`] (the parallel exclusive passes of architecture sections
+/// 5.3, 8.3, 9.3 and 15.3, and a finalize that sorts or forks), the per-job scratch arena,
+/// and [`JobContext::block_in_place`] for the physics step (section 16). Only in a system
+/// that runs once per tick, an exclusive system or a finalize function.
+///
+/// `World` is `Sync` and every column view is `Send`, so a scope child may borrow them.
+pub struct Job<'w, 'j> {
+    context: &'w mut JobContext<'j>,
+}
+
+impl<'j> Job<'_, 'j> {
+    /// The job context.
+    pub fn context(&mut self) -> &mut JobContext<'j> {
+        self.context
+    }
+}
+
+impl sealed::Sealed for Job<'_, '_> {}
+
+impl SystemParam for Job<'_, '_> {
+    const ACCESS: Access = Access::new(AccessKind::Job, no_target);
 }
 
 impl sealed::Sealed for &mut World {}
