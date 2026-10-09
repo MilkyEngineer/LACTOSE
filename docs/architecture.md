@@ -226,7 +226,10 @@ owns its data and may be cancelled by drop. Waiting is an `.await`.
 - Each worker owns a `crossbeam-deque`. Work stealing uses thief-side split-on-steal: a
   stolen chunk-range job is split in half and the thief pushes one half to its own deque.
   There is no fixed task-duration target.
-- Idle workers spin for 50 microseconds, then `std::thread::park`. A worker that releases
+- Idle workers spin for 50 microseconds, then `std::thread::park`. The worker keeping the
+  timers steps its timed park (0.6 of the time left, repeated) and spins the last 50
+  microseconds, because macOS lengthens a timed wait by a leeway proportional to the timeout
+  (D113). A worker that releases
   several entries keeps one for itself and wakes one sleeper for each of the others. The
   latch, the permit gate, the sleep-and-wake protocol and run quiescence are modelled under
   `loom`, through the shipped functions; the deque is a vetted dependency. aarch64 stress tests
@@ -953,9 +956,9 @@ The policy is in section 3.
 - Each crate's `README.md` states responsibility, tier, boundary status and unsafe status.
 - Agents: `.claude/agents/` defines the standard set. `lane` implements one crate or fix
   round in its own worktree against a brief; `reviewer` reads every lane, fix round and
-  interface design adversarially before it merges; `runner` runs long commands and reports
-  verbatim. The coordinator writes the briefs and the interfaces, merges serially, and keeps
-  this document, the decisions log and the verification list.
+  interface design adversarially before it merges. The coordinator writes the briefs and the interfaces, merges serially, and keeps
+  this document, the decisions log and the verification list. A long command that needs no
+  interpretation is run by the coordinator in the background, not by an agent.
 - CI: clippy `-D warnings`, fmt, nextest, SOUR in all applicable modes, Miri nightly on `task`
   and `ecs`, `cargo-deny`, the tier check.
 
