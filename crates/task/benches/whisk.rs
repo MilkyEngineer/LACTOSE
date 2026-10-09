@@ -5,7 +5,9 @@
 //! ```
 //!
 //! That one command measures everything and writes `docs/results/whisk-<machine>-<date>.json`
-//! and a `.md` summary next to it. Run it on a quiet machine; the numbers are wall-clock.
+//! and a `.md` summary next to it. Run it on a quiet machine; the numbers are wall-clock. On a
+//! Mac, run it under `caffeinate -i -s` on AC power: a sleep freezes the run, and `Instant`
+//! does not count the time asleep.
 //!
 //! Environment:
 //!

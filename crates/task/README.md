@@ -203,6 +203,12 @@ machine, with one command:
 cargo bench -p lactose-task --bench whisk
 ```
 
+On a Mac, keep the machine awake for the whole run, on AC power with
+`caffeinate -i -s cargo bench -p lactose-task --bench whisk`. A Mac left alone sleeps and
+wakes in the dark about every quarter of an hour, and that freezes the run. `Instant` does not
+count the time asleep, so neither the phase timings nor the latencies show the stall for what
+it is.
+
 | Measure | Threshold |
 |---|---|
 | Makespan divided by its lower bound | at most 1.25 at P50 and 1.5 at P99 |

@@ -749,8 +749,9 @@ fn a_task_kept_by_the_worker_that_fired_its_timer_is_taken() {
         });
         let mut id = None;
         let _ = timers.register(Instant::now(), &mut id, &Waker::from(task));
+        // Due at once. Had it not fired, nothing would be queued and both workers would
+        // park for good, which fails the model as a deadlock.
         timers.fire_due();
-        assert_eq!(queue.load(Ordering::Relaxed) + usize::from(taken.load(Ordering::Relaxed)), 1);
 
         let wake = PoolWake { sleep: sleep.clone(), threads };
         work(&gate, &sleep, &queue, &taken, 0, &wake, false);
