@@ -1,18 +1,19 @@
 //! Timers and tick pacing for the timer root (architecture sections 5.1 and 11).
 
 use core::pin::Pin;
-use core::sync::atomic::{AtomicU64, Ordering};
 use core::task::{Context, Poll, Waker};
 use std::collections::BTreeMap;
-use std::sync::{Mutex, Weak};
+use std::sync::Weak;
 use std::time::{Duration, Instant};
 
 use lactose_core::{Error, ErrorKind, Result};
 
-use crate::lock;
 use crate::pool::Shared;
+use crate::sync::{AtomicU64, Mutex, MutexGuard, Ordering};
 
 /// The executor's pending timers.
+///
+/// Modelled under loom (`models.rs`, the keeper hand-off), so the state goes through `sync`.
 ///
 /// There is no timer thread. Frame-critical workers fire due timers whenever they look for
 /// work, and while all of them could be asleep one sleeper, the keeper, parks only until the
@@ -50,6 +51,10 @@ impl Timers {
         }
     }
 
+    fn lock(&self) -> MutexGuard<'_, TimerState> {
+        self.state.lock().unwrap_or_else(|poison| poison.into_inner())
+    }
+
     fn publish_earliest(&self, state: &TimerState) {
         let earliest = state.pending.keys().next().map_or(u64::MAX, |(deadline, _)| {
             let nanos = deadline.saturating_duration_since(self.epoch).as_nanos();
@@ -60,8 +65,8 @@ impl Timers {
     }
 
     /// Adds or re-arms the timer `id` (allocated on first use) with `waker`.
-    fn register(&self, deadline: Instant, id: &mut Option<u64>, waker: &Waker) -> Rearm {
-        let mut state = lock(&self.state);
+    pub(crate) fn register(&self, deadline: Instant, id: &mut Option<u64>, waker: &Waker) -> Rearm {
+        let mut state = self.lock();
         let id = *id.get_or_insert_with(|| {
             state.next_id += 1;
             state.next_id
@@ -77,7 +82,7 @@ impl Timers {
     }
 
     fn remove(&self, deadline: Instant, id: u64) {
-        let mut state = lock(&self.state);
+        let mut state = self.lock();
         state.pending.remove(&(deadline, id));
         self.publish_earliest(&state);
     }
@@ -89,7 +94,7 @@ impl Timers {
             return;
         }
         let due = {
-            let mut state = lock(&self.state);
+            let mut state = self.lock();
             let later = state.pending.split_off(&(Instant::now(), u64::MAX));
             let due = core::mem::replace(&mut state.pending, later);
             self.publish_earliest(&state);
@@ -107,7 +112,7 @@ impl Timers {
     /// Registration and this run under the same lock, so either the registration sees this
     /// keeper and wakes it, or the keeper sees the registered deadline.
     pub(crate) fn keep(&self, worker: usize) -> Option<Instant> {
-        let mut state = lock(&self.state);
+        let mut state = self.lock();
         if state.keeper.is_some() {
             return None;
         }
@@ -119,7 +124,7 @@ impl Timers {
     /// Ends `worker`'s turn as keeper, if it was. Returns whether it was and deadlines
     /// remain, in which case another sleeper has to take over.
     pub(crate) fn release(&self, worker: usize) -> bool {
-        let mut state = lock(&self.state);
+        let mut state = self.lock();
         if state.keeper != Some(worker) {
             return false;
         }
@@ -131,7 +136,7 @@ impl Timers {
     /// each [`Sleep`] that is polled again resolves to `Cancelled`.
     pub(crate) fn cancel_all(&self) {
         let pending = {
-            let mut state = lock(&self.state);
+            let mut state = self.lock();
             let pending = core::mem::take(&mut state.pending);
             self.publish_earliest(&state);
             pending

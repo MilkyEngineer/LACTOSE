@@ -20,11 +20,27 @@
 //! token that arrives late, or that belongs to an earlier wake-up, costs one more trip round
 //! a loop and nothing else.
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::sync::{AtomicU64, Ordering, fence, park, park_timeout};
 
 const BITS: usize = u64::BITS as usize;
+
+/// How much of the time left before a deadline one timed park asks for.
+///
+/// macOS coalesces timed waits: a `park_timeout` returns late by a leeway proportional to
+/// the timeout, about a quarter of it at user-interactive priority and half at default. A
+/// keeper that asked for the whole 16.7 ms to the next tick woke milliseconds late. Asking
+/// for 0.6 of what is left keeps every return before the deadline even at half leeway, and
+/// the remaining steps shrink geometrically: three to five parks per tick. Under loom and
+/// Miri there is no real clock, so one park as before.
+const TIMER_STEP: f64 = if cfg!(any(feature = "loom", miri)) { 1.0 } else { 0.6 };
+
+/// How close to a deadline a timed park stops parking and spins instead, re-checking its
+/// bit. About 11 µs of spinning per tick at 60 Hz, which is what puts the wake within a
+/// few microseconds of the deadline.
+const TIMER_SPIN: Duration =
+    Duration::from_micros(if cfg!(any(feature = "loom", miri)) { 0 } else { 50 });
 
 /// The sleep state of one worker pool.
 pub(crate) struct Sleep {
@@ -61,6 +77,12 @@ impl Sleep {
 
     /// Parks `worker`, which must have announced, until a waker claims it or `deadline`
     /// passes. Returns `false` only on a timeout that no waker raced.
+    ///
+    /// A timed park is a loop of shorter ones, each for [`TIMER_STEP`] of the time left,
+    /// with a spin over the last [`TIMER_SPIN`]. Every return from a park, early or on time,
+    /// goes through the same check of the bit and the clock, so a claim is never missed and
+    /// the deadline is never passed by more than the clock's resolution. Nothing about the
+    /// protocol depends on how many parks the wait takes.
     pub(crate) fn park(&self, worker: usize, deadline: Option<Instant>) -> bool {
         let (word, bit) = self.slot(worker);
         while word.load(Ordering::SeqCst) & bit != 0 {
@@ -71,7 +93,12 @@ impl Sleep {
                     if now >= deadline {
                         return word.fetch_and(!bit, Ordering::SeqCst) & bit == 0;
                     }
-                    park_timeout(deadline - now);
+                    let left = deadline - now;
+                    if left <= TIMER_SPIN {
+                        core::hint::spin_loop();
+                    } else {
+                        park_timeout(left.mul_f64(TIMER_STEP));
+                    }
                 }
             }
         }

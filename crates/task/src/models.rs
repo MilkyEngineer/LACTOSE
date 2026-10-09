@@ -596,3 +596,91 @@ fn shutdown_parks_an_opener_with_nothing_on_its_deque() {
         thief.join().unwrap();
     });
 }
+
+/// The keeper hand-off: one worker parks as the timer keeper, watching a deadline, while
+/// another thread registers an earlier one. The registration must reach the keeper, which
+/// gives the watch up and takes it again for the earlier deadline. The wait is the shipped
+/// idle sequence (`gate::idle_park` over `Timers::keep` and `Timers::release`) with the
+/// stepped timed park; under loom a step is a plain park, so the keeper can only be woken
+/// by the hand-off itself, and a lost hand-off is a deadlock here.
+#[test]
+fn an_earlier_timer_reaches_the_parked_keeper() {
+    use core::task::Waker;
+    use std::time::{Duration, Instant};
+
+    use crate::time::{Rearm, Timers};
+
+    loom::model(|| {
+        let gate = Arc::new(Gate::new(1));
+        let sleep = Arc::new(Sleep::new(1));
+        let timers = Arc::new(Timers::new());
+        // Far enough that neither is due during the model.
+        let later = Instant::now() + Duration::from_secs(3600);
+        let earlier = later - Duration::from_secs(60);
+        let mut later_id = None;
+        let first = timers.register(later, &mut later_id, Waker::noop());
+        assert!(matches!(first, Rearm::AnySleeper));
+        // What the keeper last parked for: 2 the later deadline, 1 the earlier, 0 none.
+        let watching = Arc::new(AtomicUsize::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        let keeper = thread::current();
+
+        let registrar = {
+            let (sleep, timers, watching, stop, keeper) =
+                (sleep.clone(), timers.clone(), watching.clone(), stop.clone(), keeper.clone());
+            thread::spawn(move || {
+                // Once the keeper watches the later deadline, register the earlier one.
+                while watching.load(Ordering::SeqCst) != 2 {
+                    thread::yield_now();
+                }
+                let mut earlier_id = None;
+                match timers.register(earlier, &mut earlier_id, Waker::noop()) {
+                    Rearm::Keeper(worker) => {
+                        if sleep.notify(worker) {
+                            keeper.unpark();
+                        }
+                    }
+                    Rearm::AnySleeper => {
+                        if let Some(worker) = sleep.notify_one() {
+                            assert_eq!(worker, 0);
+                            keeper.unpark();
+                        }
+                    }
+                    Rearm::Nobody => unreachable!("the earlier deadline is new"),
+                }
+                // The keeper must come to watch the earlier deadline on its own.
+                while watching.load(Ordering::SeqCst) != 1 {
+                    thread::yield_now();
+                }
+                stop.store(true, Ordering::SeqCst);
+                sleep.notify_all(|_| keeper.unpark());
+            })
+        };
+
+        // The idle loop of a frame-critical worker with no work, reduced to its timer duty.
+        while !stop.load(Ordering::SeqCst) {
+            gate::idle_park(&gate, &sleep, 0, || {
+                if stop.load(Ordering::SeqCst) {
+                    return (gate::Look::Stop, None);
+                }
+                timers.fire_due();
+                let deadline = timers.keep(0);
+                let watched = match deadline {
+                    Some(deadline) if deadline == earlier => 1,
+                    Some(_) => 2,
+                    None => 0,
+                };
+                watching.store(watched, Ordering::SeqCst);
+                (gate::Look::Nothing, deadline)
+            });
+            timers.fire_due();
+            if timers.release(0) {
+                // Deadlines remain: hand the watch to another sleeper, of which this model
+                // has none, so the loop takes it again.
+                let _nobody = sleep.notify_one();
+            }
+        }
+        registrar.join().unwrap();
+        assert_eq!(watching.load(Ordering::SeqCst), 1);
+    });
+}
