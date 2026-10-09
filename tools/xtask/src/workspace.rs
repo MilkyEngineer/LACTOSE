@@ -86,7 +86,8 @@ pub struct ResolvedPackage {
     pub name: String,
     /// True for a workspace member.
     pub member: bool,
-    /// The package IDs of its normal and build dependencies, with every feature enabled.
+    /// The package IDs of its normal and build dependencies, under the workspace's own
+    /// feature resolution.
     pub deps: Vec<String>,
 }
 
@@ -328,15 +329,21 @@ pub fn parse_metadata(json: &str) -> Result<Metadata, String> {
     })
 }
 
-/// Runs `cargo metadata` in `dir`, with every feature enabled so optional dependencies are in
-/// the resolved graph, and parses the result.
+/// Runs `cargo metadata` in `dir` and parses the result.
+///
+/// Features are resolved as a build of the workspace resolves them: the union of what every
+/// member asks of its dependencies, which is what the shipped binaries compile once they
+/// exist. `--all-features` is deliberately not passed. It would select features that only a
+/// test job enables (`lactose-task/loom` brings `loom`, `tracing-subscriber` and their trees
+/// into every boundary crate that depends on `task`), and the third-party closure of a
+/// boundary crate would then name crates no boundary build compiles.
 ///
 /// # Errors
 /// If cargo cannot be run, fails (it does if `Cargo.lock` is out of date), or prints
 /// something [`parse_metadata`] rejects.
 pub fn load_metadata(cargo: &str, dir: &Path) -> Result<Metadata, String> {
     let output = Command::new(cargo)
-        .args(["metadata", "--format-version", "1", "--all-features", "--locked"])
+        .args(["metadata", "--format-version", "1", "--locked"])
         .current_dir(dir)
         .output()
         .map_err(|e| format!("cannot run `{cargo} metadata`: {e}"))?;

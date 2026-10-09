@@ -121,12 +121,14 @@ transitive = [
   # `lactose-reflect` and `lactose-task`; it emits spans and events and computes nothing a
   # simulation result can observe.
   "tracing", "tracing-core", "once_cell", "pin-project-lite",
-  # An optional dependency of `tracing-core` that only the all-features resolution selects
-  # (through `lactose-task/loom`); it is compiled only under `--cfg tracing_unstable`, which
-  # no build of this workspace sets.
-  "valuable",
+  # The executor's deques, reached by `lactose-ecs` through `lactose-task` (architecture
+  # section 8.2: execution only). Lock-free queues and epoch reclamation: no floating-point
+  # work and no numeric path selected by CPU feature; what they decide is which worker runs
+  # a job, which the ECS makes order-independent by construction.
+  "crossbeam-deque", "crossbeam-epoch", "crossbeam-utils",
 ]
 
 [boundary_third_party.direct]
 "lactose-core" = { normal = ["bytemuck", "libc", "windows-sys"], dev = ["xxhash-rust"] }
 "lactose-math" = { normal = ["bytemuck", "libm"] }
+"lactose-ecs" = { normal = ["bytemuck"] }

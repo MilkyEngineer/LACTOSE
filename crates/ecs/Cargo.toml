@@ -1,0 +1,24 @@
+[package]
+name = "lactose-ecs"
+description = "Entities, archetypes, chunks, change ticks, the structural log, queries, the schedule, command buffers and the system macro."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+bytemuck.workspace = true
+# Row records for bulk copy (architecture section 15.2).
+lactose-bundle.workspace = true
+lactose-core.workspace = true
+lactose-ecs-macros.workspace = true
+lactose-math.workspace = true
+# Metadata only (architecture section 8.1): the registry, visitors and policies.
+lactose-reflect.workspace = true
+# Execution only (architecture section 8.2): every result is order-independent.
+lactose-task.workspace = true
+# Types only: the exact-version asset table a region holds.
+lactose-asset-api.workspace = true
+
+[lints]
+workspace = true

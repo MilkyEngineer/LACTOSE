@@ -118,11 +118,11 @@ crates/
   core/           F  boundary  EntityId, StableKey (NetId, PredictionKey, Placeholder), Handle<T>, FixedHashMap, arenas, tagged GlobalAlloc, Error taxonomy, thread_class helper
   math/           F  boundary  self-contained deterministic math, no glam; Scalar newtype; compare-and-select min/max/clamp; libm transcendentals; exact accumulators; typed render space
   task/           F            [WHISK] executor: continuation counters, fork-join scope, worker classes, timer root, main-thread lane
-  ecs/            F  boundary  [CASEIN] entities, archetypes, chunks, per-row change ticks, structural change log, queries, scheduler, command buffers, system macro
+  ecs/            F  boundary  [CASEIN] entities, archetypes, chunks, per-row change ticks, structural change log, queries, scheduler, command buffers, regions and region modes as storage, world snapshot, bulk row copy, system macro
   ecs-macros/     F            proc macros: `#[system]`, `#[finalize]`
   reflect/        F            type registry, field IDs, typed references, persistence policy, serde bridge
   reflect-macros/ F            proc macros: `#[component]`, field IDs, reflection metadata, per-type visitors
-  sim/            F  boundary  [CURD] regions, region modes, tick loop, time scale, world hash (monomorphised per-type hashers), snapshot API
+  sim/            F  boundary  [CURD] region lifecycle (activation, streaming, unload policy), input sync point orchestration, tick loop, time scale, world hash (monomorphised per-type hashers)
   anim/           F  boundary  animation state machines, phase, events, root motion, sim skeleton (sockets, hands, feet, head, ragdoll bodies)
   predict/        F  boundary  prediction world, rollback ring, reconciliation
   nav-query/      F  boundary  navmesh queries
@@ -383,7 +383,7 @@ jobs; multi-phase logic is several systems. Exclusive systems take the whole wor
 ```rust
 // Per-entity kernel. `worlds` selects where it runs; the world injects its own filter, so a
 // prediction-world run sees only predicted entities and game code never writes that filter.
-#[system(name = "game_sim::apply_gravity", worlds = [server, prediction], in_set = Movement)]
+#[system(name = "game_sim::apply_gravity", worlds = [server, prediction], in_set = MOVEMENT)]
 fn apply_gravity(dt: Res<TickDelta>, g: Res<Gravity>, vel: Mut<Velocity>, mass: &Mass) {
     vel.y -= g.0 * dt.0;                  // deref-mut through Mut<T> sets the row tick
 }
@@ -395,33 +395,35 @@ fn total_mass(mass: &Mass) -> Scalar { mass.0 }
 #[finalize(total_mass)]
 fn store_total(sum: Scalar, out: ResMut<TotalMass>) { out.0 = sum; }
 
-// Spawn that references the spawned entity in the same command buffer.
+// Spawn that references the spawned entity in the same command buffer. `HeldItem` holds a
+// `#[value]` enum, since enums are fieldless types held in a field (section 6).
 #[system(name = "game_sim::throw_bomb", worlds = [server, prediction])]
 fn throw_bomb(ctx: Ctx, cmd: Commands, key: StableKeyOf, held: &HeldItem, input: &PlayerInput) {
     if input.throw {
         let bomb = cmd.spawn((Transform::at(..), Bomb { fuse: 180 }));   // StableKey::Placeholder
-        cmd.set(key, HeldItem::None);
-        cmd.set(bomb, ThrownBy(key));
-        let spread = ctx.rng(bomb).next_scalar();  // keyed by (region seed, tick, system, bomb's origin key)
+        cmd.set(*key, HeldItem { kind: ItemKind::None });
+        cmd.set(bomb, ThrownBy { thrower: EntityRef::new(*key) });
+        let spread = ctx.rng(bomb).next_scalar();  // keyed by (region seed, tick, system, this entity's origin key, the placeholder's sequence)
         cmd.physics().apply_impulse(bomb, input.aim * spread);
     }
 }
 
-// Cross-entity effect: never a direct write to another row. Emit, and a later system consumes.
+// Cross-entity effect: never a direct write to another row. Emit through a typed writer, so
+// the schedule orders every reader after every emitter, and a later system consumes.
 #[system(name = "game_sim::sword_hit", worlds = [server, prediction])]
-fn sword_hit(cmd: Commands, hits: &HitList, key: StableKeyOf) {
-    for h in hits.iter() { cmd.event(Damage { target: h.key, source: key, amount: h.amount }); }
+fn sword_hit(damage: EventWriter<Damage>, hits: &HitList, key: StableKeyOf) {
+    for h in hits.iter() { damage.emit(Damage { target: h.key, source: *key, amount: h.amount }); }
 }
 #[system(name = "game_sim::apply_damage", worlds = [server, prediction], after = sword_hit)]
 fn apply_damage(events: Events<Damage>, key: StableKeyOf, hp: Mut<Health>) {
-    for d in events.for_target(key) { hp.0 -= d.amount; }   // events are indexed by target key
+    for d in events.for_target(*key) { hp.0 -= d.amount; }   // events are indexed by target key
 }
 
 // Presentation event. Keyed by (origin key, tick, kind) so rollback re-emission deduplicates
 // and events from mispredicted ticks are cancelled.
 #[system(name = "game_sim::footsteps", worlds = [server, prediction])]
 fn footsteps(present: PresentEvents, key: StableKeyOf, anim: &AnimState) {
-    if anim.phase_crossed(0.5) { present.emit(key, AudioRequest::Footstep); }
+    if anim.phase_crossed(0.5) { present.emit(*key, AudioRequest::Footstep); }
 }
 
 // Exclusive system: runs alone at a sync point with the whole world.
@@ -431,10 +433,12 @@ fn apply_region_load(world: &mut World, loaded: ResMut<LoadedBundles>) { /* bulk
 
 Physics writes go through the physics command buffer and apply in the physics stage. Relationship
 fields are written through commands so the reverse index stays consistent. `StableKeyOf` yields
-the entity's origin key; no row, chunk or worker index exists in the API. The week-one facade
-exposes exactly this surface over a naive single-threaded implementation, including regions,
-change ticks, the structural log, snapshots, bulk copy and command buffers, so dependent agents
-build against the final API from the start.
+the entity's origin key; no row, chunk or worker index exists in the API. The macro makes every
+parameter binding mutable, and `#[finalize]` finds its system by name in the same module. The
+week-one facade exposes exactly this surface over a naive single-threaded implementation,
+including regions, change ticks, the structural log, snapshots, bulk copy and command buffers,
+so dependent agents build against the final API from the start; `crates/ecs/README.md` is its
+contract and D114 records the choices this section left open.
 
 ## 7. Identity
 

@@ -173,6 +173,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "lactose-ecs"
+version = "0.0.0"
+dependencies = [
+ "bytemuck",
+ "lactose-asset-api",
+ "lactose-bundle",
+ "lactose-core",
+ "lactose-ecs-macros",
+ "lactose-math",
+ "lactose-reflect",
+ "lactose-task",
+]
+
+[[package]]
+name = "lactose-ecs-macros"
+version = "0.0.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+]
+
+[[package]]
 name = "lactose-math"
 version = "0.0.0"
 dependencies = [

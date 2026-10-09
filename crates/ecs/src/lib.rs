@@ -1,0 +1,90 @@
+//! Entities, archetypes, chunks, change ticks, the structural log, queries, the schedule,
+//! command buffers and the `#[system]` macro: the surface every simulation crate writes
+//! against (architecture sections 6 and 6.1).
+//!
+//! Foundation tier, inside the determinism boundary. This crate depends on `lactose-task` for
+//! execution only, and on `lactose-reflect`, `lactose-asset-api` and `lactose-bundle` for
+//! types and metadata (architecture section 8.2). `README.md` is the contract: it states what
+//! the signatures cannot, and what a caller may rely on.
+//!
+//! # Status
+//!
+//! This is the facade: every signature is final, every body is `todo!()`. The naive
+//! single-threaded implementation replaces the bodies without changing a public signature,
+//! and removes the two crate-level `allow`s below with the last `todo!()`.
+//!
+//! # Where to start
+//!
+//! - [`World`] holds entities, components, resources, regions and their change state;
+//!   [`WorldBuilder`] makes one for a [`WorldKind`].
+//! - A system is a plain function under `#[system]`, which declares its access through its
+//!   parameter types ([`Res`], [`Mut`], `&T`, [`Ctx`], [`Commands`], [`Events`], ...) and
+//!   emits a [`SystemDescriptor`] static.
+//! - [`Schedule`] orders descriptors into stages separated by sync points and runs a tick.
+//! - Change state is read per consumer: [`World::changed_since`] by column,
+//!   [`World::structural_log`] for spawns, despawns and moves.
+//! - [`World::snapshot`] and [`World::restore`] serve the prediction world; the bulk-copy
+//!   methods move region rows to and from `lactose_bundle` documents.
+
+#![allow(
+    dead_code,
+    unused_variables,
+    reason = "facade: bodies are todo!() until the implementation lane replaces them"
+)]
+
+mod access;
+mod bulk;
+mod change;
+mod command;
+mod event;
+mod param;
+mod query;
+mod region;
+mod rng;
+mod schedule;
+mod snapshot;
+mod system;
+mod world;
+
+pub use access::{Access, AccessKind, AccessTarget};
+pub use bulk::{ExportedRow, RegionRows};
+pub use change::{
+    ChangeMark, ChangedRows, ColumnMut, ColumnRef, Columns, ColumnsMut, DirtyRange, ErasedColumn,
+    ErasedColumns, LogCursor, LogEntries, LogEntry, StructuralChange, StructuralLog,
+};
+pub use command::{
+    Bundle, Channel, ChannelEntries, ChannelEntry, ChannelWriter, CommandChannel, Commands,
+};
+pub use event::{
+    Event, EventIter, EventWriter, Events, PresentEmission, PresentEvent, PresentEventBatch,
+    PresentEventKey, PresentEvents, PresentKind,
+};
+/// Declares a reduction's finishing step: `#[finalize(system_fn)]` on a function whose first
+/// parameter is the reducer's output and whose other parameters are resource, command and
+/// event parameters. See the crate `README.md` for what the attribute emits.
+pub use lactose_ecs_macros::finalize;
+/// Declares a system: `#[system(name = "crate::name", worlds = [server, prediction], ...)]`
+/// on a function whose parameters are [`SystemParam`] types. See the crate `README.md` for
+/// the arguments and what the attribute emits.
+pub use lactose_ecs_macros::system;
+pub use param::{
+    Changed, Ctx, Mut, RegionRes, Res, ResMut, StableKeyOf, SystemParam, With, Without,
+};
+pub use query::{Query, QueryItem, QueryItems};
+pub use region::{ClaimedBy, InRegion, OwnedBy, RegionConfig, RegionId, RegionInfo, RegionMode};
+pub use rng::Rng;
+pub use schedule::{Schedule, ScheduleBuilder, ScheduleError};
+pub use snapshot::WorldSnapshot;
+pub use system::{SystemDescriptor, SystemSet};
+pub use world::{
+    ChunkOrder, Entities, LayoutConfig, Referrer, Referrers, Regions, World, WorldBuilder,
+    WorldKind, WorldSet,
+};
+
+/// Items the `#[system]` and `#[finalize]` expansions name. Not part of the interface: the
+/// implementation may reshape them together with the macros, in one change.
+#[doc(hidden)]
+pub mod __private {
+    pub use crate::system::{Invocation, Kernel};
+    pub use lactose_core::SystemKey;
+}

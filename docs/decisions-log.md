@@ -1134,6 +1134,72 @@ rationale the author supplied during the editorial pass rather than one taken fr
   single `park_timeout` to a deadline is never acceptable in the keeper.
 - Driven by: milestone 0 wake-latency spike; owner decision 2026-10-10.
 
+**D114. The ECS facade: what section 6.1 left open** (§6, §6.1, `lactose-ecs`)
+- Why: the facade is written before its implementation so every dependent crate builds
+  against the final surface; each choice below is one the section's prose or example did not
+  settle, and each is in `crates/ecs/README.md` as a contract.
+  - *Events are emitted through a typed `EventWriter<E>` parameter, not `cmd.event(..)`.*
+    The schedule must know every emitter of `E` to order every `Events<E>` reader after them,
+    or a reader's view would depend on scheduling; a method call on `Commands` is invisible
+    to the `#[system]` macro, and an attribute listing the emitted types would be a second
+    declaration that can disagree with the body. The 6.1 example changes accordingly.
+  - *Predicted keys come from `ClaimedBy` and `World::set_input_tick`.* A spawn commanded
+    from an entity the player has claimed gets `Predicted(player, input tick, ordinal)` with
+    the ordinal counted among that player's spawns in the tick's command order, and the
+    spawned entity inherits the claim, so a bomb's shrapnel is predicted as the bomb was. The
+    same rule on the server and the client gives the same key without a message; the input
+    tick is the one fact the netcode supplies, at the input sync point. `ClaimedBy` doubles as
+    the prediction world's filter, since a claimed entity is exactly a predicted one.
+  - *A placeholder is an RNG key.* `ctx.rng(bomb)` in the example keys a draw by an entity
+    whose origin key is assigned only at apply; the draw is keyed by the invoking entity's
+    origin key and the placeholder's sequence number instead, which both machines agree on.
+  - *Stages are declared on the builder; sets are statics with `after` lists; exclusive
+    systems run at the sync point that begins their stage; a system without a component
+    parameter runs once per tick.* The sync-point count is then fixed per schedule as
+    section 5.2 requires, and a shared registration function serves every world kind because
+    `add` skips a system whose worlds exclude the builder's kind.
+  - *`World::spawn` takes the key; only `Commands::spawn` assigns one.* Replication and
+    prediction insert entities under the server's key; a hidden policy in the direct method
+    would be a second key source.
+  - *Regions, the snapshot and bulk row copy are the ECS's; the world hash and the overlay
+    diff are `sim`'s and `persist`'s.* Kernels must skip rows in `Replicated` and `Frozen`
+    regions and the prediction filter is a storage property, so region mode lives with
+    storage; what needs the registry and the baseline (hashing with per-type hashers, diffing
+    into records) stays where section 8.1 put it, over `World::columns_erased` and
+    `World::export_region`.
+  - *Service resources are `Res<dyn Trait>` through `World::insert_service`,* unreflected
+    and outside hashing, saving and snapshots, so an `-api` crate's trait object needs no
+    registry entry.
+  - *Change consumers hold a `ChangeMark` or `LogCursor` carrying the world's epoch; a stale
+    one yields `None`.* A restore or load must force a full pass (§6), and a value the
+    consumer cannot mistake for progress is the way to force it.
+  - *`Schedule::run_tick` is an `async fn` taking `&mut World` and `&Executor`.* The timer
+    root is a task on a worker, where `block_on` is a debug assertion; the implementation
+    lends the world to the run's graph nodes on the strength of the `GraphRun` resolution
+    guarantee (`crates/ecs/SAFETY.md`).
+  - *Bundles are tuples only.* A blanket `impl Bundle for T: Component` is rejected by
+    coherence beside tuple impls, because `Component` is a foreign trait.
+  - *`StableKeyOf` dereferences to `StableKey`;* `*key` where a plain key is needed. The
+    macro makes every parameter binding mutable so the example's `vel.y -= ..` and
+    `cmd.spawn(..)` compile as written.
+  - *`RegionRes<T>` is read-only in kernels.* The kernels of one region run on many workers;
+    region resources are written through `World::region_resource_mut` at a sync point or by
+    a reduction's finalize through a world resource.
+- Driven by: milestone 0, the ECS facade.
+
+**D115. The boundary check resolves features as a workspace build does** (§8.3, `tools/xtask`)
+- Why: `cargo xtask boundary` computed each boundary crate's third-party closure from a
+  `cargo metadata --all-features` graph. With `lactose-ecs` depending on `lactose-task` that
+  resolution selected `lactose-task/loom`, a feature only the loom CI job enables, and
+  reported 28 crates (`loom`, `tracing-subscriber`, `cc`, ...) that no boundary build
+  compiles; `valuable` had already been allowlisted as the same artefact. The metadata is now
+  resolved without `--all-features`: the union of what every member asks of its dependencies,
+  which is what the shipped binaries compile once they exist and what `cargo xtask features`
+  compares. The declared-edge checks (tiers, direct allowlists) read manifests and are
+  unaffected. `crossbeam-deque`, `crossbeam-epoch` and `crossbeam-utils` are the real
+  additions to the closure and are allowlisted with their review.
+- Driven by: milestone 0, the ECS facade.
+
 ## 10. Review history
 
 - **Revision 1** (`a29af04`): the design baseline.
