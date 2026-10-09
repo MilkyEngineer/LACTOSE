@@ -3,8 +3,8 @@
 //!
 //! Run with `cargo test -p lactose-task --features loom --release`. Every model calls the
 //! functions the executor ships: `gate::wait_for_children` is the opener's wait,
-//! `Sleep::announce_entry` is what a worker does after queueing work, `Quiesce` is what
-//! holds a run's future back. What a model supplies is only what loom does not model: a
+//! `Sleep::announce_entry` is what a worker does after queueing work, `Timers::fire_due`
+//! is how a deadline reaches its task, `Quiesce` is what holds a run's future back. What a model supplies is only what loom does not model: a
 //! deque is a counter, a worker is a loom thread, and a scope's children are a number.
 //!
 //! A lost wake-up shows as a deadlock, which loom reports. The models are exhaustive
@@ -475,6 +475,45 @@ impl Wake for PoolWake {
     }
 }
 
+/// The worker loop reduced to its permit and sleep steps, over a deque that is a count of
+/// entries. Returns when the one entry has been taken, by this worker or another.
+fn work(
+    gate: &Gate,
+    sleep: &Sleep,
+    queue: &AtomicUsize,
+    taken: &AtomicBool,
+    me: usize,
+    wake: &PoolWake,
+    mut permit: bool,
+) {
+    while !taken.load(Ordering::SeqCst) {
+        if !permit {
+            permit = gate.try_acquire();
+        }
+        if permit {
+            let take = |entries: usize| entries.checked_sub(1);
+            if queue.fetch_update(Ordering::AcqRel, Ordering::Acquire, take).is_ok() {
+                // Stands for shutdown: lets the other worker's model thread end.
+                taken.store(true, Ordering::SeqCst);
+                sleep.notify_all(|worker| wake.unpark(worker));
+                break;
+            }
+            gate.release_idle(wake);
+            permit = false;
+        }
+        gate::idle_park(gate, sleep, me, || {
+            let seen = if taken.load(Ordering::SeqCst) {
+                gate::Look::Stop
+            } else if queue.load(Ordering::Acquire) != 0 {
+                gate::Look::Work
+            } else {
+                gate::Look::Nothing
+            };
+            (seen, None)
+        });
+    }
+}
+
 /// Two idle workers under a closed gate that reserves one permit, and one entry that is
 /// queued while they are going to sleep. A worker that scans and finds nothing gives its
 /// permit up without waking the other (`Gate::release_idle`), then sleeps through
@@ -482,45 +521,6 @@ impl Wake for PoolWake {
 /// worker's own re-check if it was queued before, by the pusher's wake-up if after.
 #[test]
 fn an_idle_release_wakes_nobody_and_loses_no_work() {
-    /// The worker loop reduced to its permit and sleep steps. Returns when the entry has
-    /// been taken, by this worker or the other.
-    fn work(
-        gate: &Gate,
-        sleep: &Sleep,
-        queue: &AtomicUsize,
-        taken: &AtomicBool,
-        me: usize,
-        wake: &PoolWake,
-        mut permit: bool,
-    ) {
-        while !taken.load(Ordering::SeqCst) {
-            if !permit {
-                permit = gate.try_acquire();
-            }
-            if permit {
-                let take = |entries: usize| entries.checked_sub(1);
-                if queue.fetch_update(Ordering::AcqRel, Ordering::Acquire, take).is_ok() {
-                    // Stands for shutdown: lets the other worker's model thread end.
-                    taken.store(true, Ordering::SeqCst);
-                    sleep.notify_all(|worker| wake.unpark(worker));
-                    break;
-                }
-                gate.release_idle(wake);
-                permit = false;
-            }
-            gate::idle_park(gate, sleep, me, || {
-                let seen = if taken.load(Ordering::SeqCst) {
-                    gate::Look::Stop
-                } else if queue.load(Ordering::Acquire) != 0 {
-                    gate::Look::Work
-                } else {
-                    gate::Look::Nothing
-                };
-                (seen, None)
-            });
-        }
-    }
-
     // Four preemptions: this model takes 24 s at four and close to three minutes at five.
     bounded(THREE_THREAD_BOUND - 1, || {
         let gate = Arc::new(gate_with(2, 1, Some(1)));
@@ -682,5 +682,83 @@ fn an_earlier_timer_reaches_the_parked_keeper() {
         }
         registrar.join().unwrap();
         assert_eq!(watching.load(Ordering::SeqCst), 1);
+    });
+}
+
+/// A task woken by a timer the way `Shared::submit_task` queues one that the worker firing
+/// the timer keeps: it lands on that worker's deque and wakes nobody.
+struct KeptTask {
+    sleep: Arc<Sleep>,
+    queue: Arc<AtomicUsize>,
+    threads: Vec<Thread>,
+}
+
+impl std::task::Wake for KeptTask {
+    fn wake(self: std::sync::Arc<Self>) {
+        push_one_entry(&self.sleep, &self.queue, &self.threads, true);
+    }
+}
+
+/// The timer hand-over at its least favourable. A worker comes out of its park as the
+/// keeper and fires the due timer (`Timers::fire_due`); the woken task is kept for it, so
+/// nobody is woken (`Sleep::announce_entry`). But a `block_in_place(1)` has closed the
+/// gate, and the one permit is with a second worker that scanned and found nothing. The
+/// keeper goes on as the worker loop does after its park, taking a permit or sleeping
+/// through `gate::idle_park`, and the second worker gives its permit up through
+/// `Gate::release_idle`, which wakes nobody either. The task must be taken all the same:
+/// by the keeper if its re-check sees the free permit, by the second worker if its
+/// re-check sees the task. Parking both beside it is a deadlock here.
+#[test]
+fn a_task_kept_by_the_worker_that_fired_its_timer_is_taken() {
+    use core::task::Waker;
+    use std::time::Instant;
+
+    use crate::time::Timers;
+
+    loom::model(|| {
+        let gate = Arc::new(gate_with(2, 1, Some(1)));
+        let sleep = Arc::new(Sleep::new(2));
+        let queue = Arc::new(AtomicUsize::new(0));
+        let taken = Arc::new(AtomicBool::new(false));
+        let ended = Arc::new(AtomicBool::new(false));
+        let keeper = thread::current();
+
+        let other = {
+            let (gate, sleep, queue, taken, ended, keeper) = (
+                gate.clone(),
+                sleep.clone(),
+                queue.clone(),
+                taken.clone(),
+                ended.clone(),
+                keeper.clone(),
+            );
+            thread::spawn(move || {
+                let wake =
+                    PoolWake { sleep: sleep.clone(), threads: vec![keeper, thread::current()] };
+                // Holds the permit the gate allows.
+                work(&gate, &sleep, &queue, &taken, 1, &wake, true);
+                ended.store(true, Ordering::SeqCst);
+            })
+        };
+        let threads = vec![keeper, other.thread().clone()];
+        let timers = Timers::new();
+        let task = std::sync::Arc::new(KeptTask {
+            sleep: sleep.clone(),
+            queue: queue.clone(),
+            threads: threads.clone(),
+        });
+        let mut id = None;
+        let _ = timers.register(Instant::now(), &mut id, &Waker::from(task));
+        timers.fire_due();
+        assert_eq!(queue.load(Ordering::Relaxed) + usize::from(taken.load(Ordering::Relaxed)), 1);
+
+        let wake = PoolWake { sleep: sleep.clone(), threads };
+        work(&gate, &sleep, &queue, &taken, 0, &wake, false);
+        assert_eq!(queue.load(Ordering::Acquire), 0);
+        // loom cannot have a thread unparked while it is blocked in `join`.
+        while !ended.load(Ordering::SeqCst) {
+            thread::yield_now();
+        }
+        other.join().unwrap();
     });
 }

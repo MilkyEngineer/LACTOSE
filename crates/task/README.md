@@ -147,7 +147,13 @@ and list what changed, because `lactose-ecs` is written against this surface.
 - Dedicated threads owned by other crates (network, present, audio) are created through
   `Executor::platform`, never `std::thread` directly.
 - There is no timer thread. Frame-critical workers fire due timers when they look for work,
-  and one sleeping worker at a time parks only until the earliest deadline.
+  and one sleeping worker at a time, the keeper, parks only until the earliest deadline.
+  A worker that fires timers on its way to its next job takes the first frame-critical task
+  they wake as that job, ahead of tasks already queued, and wakes nobody for it; every other
+  task they wake is queued behind the others and wakes a sleeper. So a tick deadline resumes
+  the timer root on the keeper, which is awake for it, and never on a sleeper leaving deep
+  idle. A worker that finds a timer due just as it lies down to sleep queues the task with a
+  wake-up like any other.
 - `shutdown` lets running jobs finish, including the scope children they wait for, drops
   queued graph work and cancels every unfinished task. A `GraphRun`, `Task` or `Sleep` that
   was cut off resolves to `Cancelled`, at once, without waiting for the running jobs.
@@ -231,13 +237,14 @@ Correctness:
 
 - The scope latch and the sleep-and-wake protocol are modelled under `loom` (`src/models.rs`),
   and with them what is built on them: the opener's wait with its permit and the
-  `block_in_place` gate (`src/gate.rs`), the wake that is skipped for a kept entry, and the
+  `block_in_place` gate (`src/gate.rs`), the wake that is skipped for a kept entry, the
+  timer keeper's hand-off, the task kept by the worker that fires its timer, and the
   quiescence of a cancelled run (`src/quiesce.rs`). The models call the shipped functions.
   The deque is a vetted dependency and is not modelled. loom is enabled by a `loom` Cargo
   feature on this crate that switches an internal `sync` shim, and run with
   `cargo test -p lactose-task --features loom --release`. Never use loom's documented
   `RUSTFLAGS="--cfg loom"`: the environment variable replaces the x86-64 target pin.
-  Nine models are explored exhaustively. The three with three threads are bounded at five
+  Eleven models are explored exhaustively. The three with three threads are bounded at five
   preemptions, the idle-release one at four (`LOOM_MAX_PREEMPTIONS` overrides the bounds).
 - **The `loom` feature is for that one command.** No other crate may enable it and nothing
   may be built with `--all-features`: features unify across a build, so every executor in it

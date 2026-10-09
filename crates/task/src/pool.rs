@@ -142,6 +142,9 @@ pub(crate) struct WorkerLocal {
     /// Whether this worker's job has a scope open. While it does, the worker's deque takes
     /// only that scope's children (see [`Shared::submit_range`]).
     pub(crate) scope_open: Cell<bool>,
+    /// Set while this worker fires due timers ([`fire_timers`]) and none of the tasks they
+    /// wake has been kept yet.
+    keep_woken_task: Cell<bool>,
     /// Seeded perturbation, when chaos is configured.
     chaos: Option<RefCell<ChaosRng>>,
     /// Round-robin start for victim selection when chaos does not shuffle it.
@@ -539,16 +542,46 @@ impl Shared {
         }
     }
 
-    /// Queues a ready task behind the other ready tasks of its class.
+    /// Queues a ready task behind the other ready tasks of its class and wakes a sleeper for
+    /// it. The exception is the first frame-critical task woken by the timers a worker fires
+    /// on its way to its next job ([`fire_timers`]): it goes onto that worker's own deque,
+    /// to be its next job, and wakes nobody.
     pub(crate) fn submit_task(&self, class: WorkerClass, task: Arc<dyn RawTask>) {
         if self.is_shut_down() {
             task.run(true);
             return;
         }
         let pool = self.pool(class);
-        pool.injector.push(Entry::Task(task));
-        pool.notify_one();
+        let entry = Entry::Task(task);
+        let entry = match class {
+            WorkerClass::FrameCritical => self.keep_woken_task(entry),
+            WorkerClass::Background => Some(entry),
+        };
+        let kept = entry.is_none();
+        if let Some(entry) = entry {
+            pool.injector.push(entry);
+        }
+        pool.announce_entry(kept);
         self.discard_if_shut_down();
+    }
+
+    /// Pushes a frame-critical task onto the calling worker's own deque if that worker is
+    /// firing timers and has not kept a task yet; otherwise hands it back. A worker with a
+    /// scope open never keeps one, since its deque takes nothing but that scope's children;
+    /// no timer is fired inside a scope, so that is a guard, not a path.
+    fn keep_woken_task(&self, entry: Entry) -> Option<Entry> {
+        with_local(|local| match local {
+            Some(local)
+                if core::ptr::eq(Arc::as_ptr(&local.shared), self)
+                    && local.class == WorkerClass::FrameCritical
+                    && !local.scope_open.get()
+                    && local.keep_woken_task.replace(false) =>
+            {
+                local.deque.push(entry);
+                None
+            }
+            _ => Some(entry),
+        })
     }
 
     pub(crate) fn register_task(&self, task: Weak<dyn RawTask>) -> u64 {
@@ -632,6 +665,7 @@ pub(crate) fn worker_thread(seed: WorkerSeed) {
             index,
             deque,
             scope_open: Cell::new(false),
+            keep_woken_task: Cell::new(false),
             chaos,
             next_victim: Cell::new(index + 1),
         };
@@ -752,8 +786,11 @@ fn find_work(local: &WorkerLocal) -> Option<Found> {
     if let Some(entry) = local.deque.pop() {
         return found(entry);
     }
-    if frame {
-        shared.timers.fire_due();
+    if frame
+        && fire_timers(local)
+        && let Some(entry) = local.deque.pop()
+    {
+        return found(entry);
     }
     perturb(local, |config| config.shuffle_steals, 8);
 
@@ -808,6 +845,21 @@ fn execute(local: &WorkerLocal, arenas: &mut Arenas, entry: Entry, position: u64
     });
 }
 
+/// Fires the due timers on a frame-critical worker's way to its next job. Returns whether
+/// the worker kept one of the tasks they woke on its own deque.
+///
+/// The worker is awake, so it runs the first frame-critical task the timers wake itself and
+/// wakes nobody for it, as a worker that releases nodes keeps one: a sleeper woken for the
+/// task would leave deep idle to find it gone, and waking it would delay the task. Every
+/// other task they wake is queued with a wake-up of its own ([`Shared::submit_task`]). A
+/// worker that holds no permit keeps the task all the same: it is visible on its deque,
+/// and the worker's own re-check before it sleeps sees it (`gate::idle_park`).
+fn fire_timers(local: &WorkerLocal) -> bool {
+    local.keep_woken_task.set(true);
+    local.shared.timers.fire_due();
+    !local.keep_woken_task.replace(false)
+}
+
 /// Parks the worker until there is something for it to do. The worker holds no permit.
 fn idle(local: &WorkerLocal) {
     let shared = &*local.shared;
@@ -822,6 +874,9 @@ fn idle(local: &WorkerLocal) {
         // thread. One sleeper at a time is the keeper and parks only until the next
         // deadline.
         let mut deadline = if frame {
+            // Not `fire_timers`: this worker has announced itself, and nothing would order
+            // a kept task's push before the permit check below, which a worker giving its
+            // permit up relies on. A task woken here is queued with a wake-up.
             shared.timers.fire_due();
             shared.timers.keep(local.index)
         } else {
@@ -846,8 +901,9 @@ fn idle(local: &WorkerLocal) {
         (seen, deadline)
     });
     if frame {
-        // If the park timed out, this is the deadline it was for.
-        shared.timers.fire_due();
+        // If the park timed out, this is the deadline it was for, and the task it wakes is
+        // this worker's next job.
+        fire_timers(local);
         if shared.timers.release(local.index) {
             // Later deadlines remain and this worker may be about to take a job; hand the
             // watch to another sleeper.
