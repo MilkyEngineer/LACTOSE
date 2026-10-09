@@ -700,8 +700,9 @@ impl std::task::Wake for KeptTask {
 }
 
 /// The timer hand-over at its least favourable. A worker comes out of its park as the
-/// keeper and fires the due timer (`Timers::fire_due`); the woken task is kept for it, so
-/// nobody is woken (`Sleep::announce_entry`). But a `block_in_place(1)` has closed the
+/// keeper and fires the due timer (`Timers::fire_due`); nothing else is queued, so the
+/// woken task is kept for it and nobody is woken (`Sleep::announce_entry`). But a
+/// `block_in_place(1)` has closed the
 /// gate, and the one permit is with a second worker that scanned and found nothing. The
 /// keeper goes on as the worker loop does after its park, taking a permit or sleeping
 /// through `gate::idle_park`, and the second worker gives its permit up through

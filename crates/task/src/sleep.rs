@@ -146,6 +146,12 @@ impl Sleep {
         word.load(Ordering::SeqCst) & bit != 0 && word.fetch_and(!bit, Ordering::SeqCst) & bit != 0
     }
 
+    /// How many workers are announced: asleep, or about to be, and not yet claimed.
+    #[cfg(all(test, not(feature = "loom")))]
+    pub(crate) fn announced(&self) -> u32 {
+        self.words.iter().map(|word| word.load(Ordering::SeqCst).count_ones()).sum()
+    }
+
     /// Claims every sleeping worker and passes each to `unpark`.
     pub(crate) fn notify_all(&self, mut unpark: impl FnMut(usize)) {
         fence(Ordering::SeqCst);

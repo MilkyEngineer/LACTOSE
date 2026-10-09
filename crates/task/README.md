@@ -148,15 +148,21 @@ and list what changed, because `lactose-ecs` is written against this surface.
   `Executor::platform`, never `std::thread` directly.
 - There is no timer thread. Frame-critical workers fire due timers when they look for work,
   and one sleeping worker at a time, the keeper, parks only until the earliest deadline.
-  A worker that fires timers on its way to its next job takes the first frame-critical task
-  they wake as that job, ahead of tasks already queued, and wakes nobody for it; every other
-  task they wake is queued behind the others and wakes a sleeper. So a tick deadline resumes
-  the timer root on the keeper, which is awake for it, and never on a sleeper leaving deep
-  idle. A worker that finds a timer due just as it lies down to sleep queues the task with a
+  When nothing waits in the frame-critical queue, a worker that fires timers on its way to
+  its next job puts the first frame-critical task they wake on its own deque and wakes nobody
+  for it, so the task resumes on the worker that is already awake rather than on a sleeper
+  woken for it. Every other task they wake, and every one of them while work is queued, goes
+  behind the queued work and wakes a sleeper: a timer never puts a task ahead of work that
+  was waiting. The kept task stays visible on the deque; under a closed `block_in_place`
+  gate a firing worker without a permit parks beside it, and a worker that holds one takes
+  it. A worker that finds a timer due just as it lies down to sleep queues the task with a
   wake-up like any other.
 - `shutdown` lets running jobs finish, including the scope children they wait for, drops
-  queued graph work and cancels every unfinished task. A `GraphRun`, `Task` or `Sleep` that
-  was cut off resolves to `Cancelled`, at once, without waiting for the running jobs.
+  queued graph work and cancels every unfinished task. Each `GraphRun`, `Task` or `Sleep`
+  that was cut off resolves to `Cancelled` as soon as its guarantee above allows, without
+  waiting for the joins: a `Sleep` at once, a `Task` once its future has been dropped, which
+  for a task being polled is when that poll returns, and a `GraphRun` once the jobs of it
+  that were already running have returned.
   Dropping the last `Executor` handle does the same; a handle held by a task counts.
   Either joins every worker thread, except on one of the executor's own workers, which
   cannot wait for itself: there the workers are told to stop and exit on their own.

@@ -18,8 +18,8 @@ use crate::sync::{AtomicU64, Mutex, MutexGuard, Ordering};
 /// There is no timer thread. Frame-critical workers fire due timers whenever they look for
 /// work, and while all of them could be asleep one sleeper, the keeper, parks only until the
 /// earliest deadline. A timer therefore fires as soon as a worker is free to notice it,
-/// which is also the earliest the task it wakes could run, and that worker runs the task
-/// itself (`pool::fire_timers`).
+/// which is also the earliest the task it wakes could run. With nothing else queued, that
+/// worker runs the task itself (`pool::fire_timers`).
 pub(crate) struct Timers {
     state: Mutex<TimerState>,
     /// The earliest deadline in nanoseconds since `epoch`, or `u64::MAX` when there is
@@ -96,10 +96,11 @@ impl Timers {
     /// 3 µs at the median and 21 µs at P99.
     pub(crate) fn fire_due(&self) {
         let earliest = self.earliest.load(Ordering::Relaxed);
+        if earliest == u64::MAX {
+            return;
+        }
         let now = Instant::now();
-        if earliest == u64::MAX
-            || now.saturating_duration_since(self.epoch).as_nanos() < u128::from(earliest)
-        {
+        if now.saturating_duration_since(self.epoch).as_nanos() < u128::from(earliest) {
             return;
         }
         loop {

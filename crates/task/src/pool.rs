@@ -218,6 +218,13 @@ impl Pool {
         self.stealers.len()
     }
 
+    /// How many of this pool's workers are asleep in the idle protocol, or about to be,
+    /// and not yet claimed by a wake-up.
+    #[cfg(all(test, not(feature = "loom")))]
+    pub(crate) fn sleepers(&self) -> u32 {
+        self.sleep.announced()
+    }
+
     /// Wakes one sleeping worker, if any. Call after making work visible.
     pub(crate) fn notify_one(&self) {
         self.announce_entry(false);
@@ -544,8 +551,8 @@ impl Shared {
 
     /// Queues a ready task behind the other ready tasks of its class and wakes a sleeper for
     /// it. The exception is the first frame-critical task woken by the timers a worker fires
-    /// on its way to its next job ([`fire_timers`]): it goes onto that worker's own deque,
-    /// to be its next job, and wakes nobody.
+    /// on its way to its next job ([`fire_timers`]) while nothing waits in the frame-critical
+    /// queue: it goes onto that worker's own deque, to be its next job, and wakes nobody.
     pub(crate) fn submit_task(&self, class: WorkerClass, task: Arc<dyn RawTask>) {
         if self.is_shut_down() {
             task.run(true);
@@ -566,15 +573,22 @@ impl Shared {
     }
 
     /// Pushes a frame-critical task onto the calling worker's own deque if that worker is
-    /// firing timers and has not kept a task yet; otherwise hands it back. A worker with a
-    /// scope open never keeps one, since its deque takes nothing but that scope's children;
-    /// no timer is fired inside a scope, so that is a guard, not a path.
+    /// firing timers, has not kept a task yet and finds the frame-critical queue empty;
+    /// otherwise hands it back.
+    ///
+    /// The empty queue is what keeps the hand-over from cutting in. A worker that was woken
+    /// for a queued task, and then fires a timer, would otherwise run the timer's task first
+    /// while the queued task's wake-up was spent; and a task whose timer is due again
+    /// whenever its poll returns would be kept on every pass and starve the queue. A worker
+    /// with a scope open never keeps one, since its deque takes nothing but that scope's
+    /// children; no timer is fired inside a scope, so that is a guard, not a path.
     fn keep_woken_task(&self, entry: Entry) -> Option<Entry> {
         with_local(|local| match local {
             Some(local)
                 if core::ptr::eq(Arc::as_ptr(&local.shared), self)
                     && local.class == WorkerClass::FrameCritical
                     && !local.scope_open.get()
+                    && self.frame.injector.is_empty()
                     && local.keep_woken_task.replace(false) =>
             {
                 local.deque.push(entry);
@@ -848,12 +862,13 @@ fn execute(local: &WorkerLocal, arenas: &mut Arenas, entry: Entry, position: u64
 /// Fires the due timers on a frame-critical worker's way to its next job. Returns whether
 /// the worker kept one of the tasks they woke on its own deque.
 ///
-/// The worker is awake, so it runs the first frame-critical task the timers wake itself and
-/// wakes nobody for it, as a worker that releases nodes keeps one: a sleeper woken for the
-/// task would leave deep idle to find it gone, and waking it would delay the task. Every
-/// other task they wake is queued with a wake-up of its own ([`Shared::submit_task`]). A
-/// worker that holds no permit keeps the task all the same: it is visible on its deque,
-/// and the worker's own re-check before it sleeps sees it (`gate::idle_park`).
+/// The worker is awake, so when nothing waits in the frame-critical queue it runs the first
+/// frame-critical task the timers wake itself and wakes nobody for it, as a worker that
+/// releases nodes keeps one: a sleeper woken for the task would leave deep idle to find it
+/// gone, and waking it would delay the task. Every other task they wake is queued with a
+/// wake-up of its own ([`Shared::submit_task`]). A worker that holds no permit keeps the
+/// task all the same: it is visible on its deque, and the worker's own re-check before it
+/// sleeps sees it (`gate::idle_park`).
 fn fire_timers(local: &WorkerLocal) -> bool {
     local.keep_woken_task.set(true);
     local.shared.timers.fire_due();
