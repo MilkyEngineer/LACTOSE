@@ -1121,6 +1121,19 @@ rationale the author supplied during the editorial pass rather than one taken fr
   it afterwards.
 - Driven by: milestone 0 task lane, second review, finding 7.
 
+**D113. Two wake-latency criteria: tick start under 20 µs, push from an idle pool under 35 µs** (§22, `lactose-task`)
+- Why: the wake-latency spike (`docs/results/spike-wake-apple-m1-2026-10-06.md`) showed that
+  on an idle M1 every wake primitive, QoS class and real-time policy lands at P99 24 to 29 µs,
+  because the cost is the cores leaving deep idle, not the scheduler; only a thread waking
+  every 150 µs or less removes it, at 1.3 to 1.9% of a core and an unmeasured power cost. A
+  known deadline is different: the timer keeper can step its timed park and spin the last
+  50 µs, so the latency that decides tick timing can meet 20 µs. The push criterion is set
+  at what the operating system gives, and no warm sleeper or heartbeat is adopted; a
+  pre-warm in the lead-up to a tick deadline may return as a builder option once power can
+  be measured. macOS lengthens every timed wait by a leeway proportional to the timeout, so a
+  single `park_timeout` to a deadline is never acceptable in the keeper.
+- Driven by: milestone 0 wake-latency spike; owner decision 2026-10-10.
+
 ## 10. Review history
 
 - **Revision 1** (`a29af04`): the design baseline.
