@@ -375,4 +375,62 @@ mod tests {
         }
         executor.shutdown();
     }
+
+    /// With nothing queued, the worker that fires a timer runs the task it wakes and wakes
+    /// no sleeper for it. Every frame-critical worker, the keeper among them, is asleep
+    /// shortly before the deadline; when the task resumes, every worker but the one running
+    /// it must still be asleep and unclaimed. A task queued with a wake-up would have had a
+    /// sleeper claimed for it, which cannot be back asleep by the task's first instruction.
+    /// An attempt in which some worker was still awake shortly before the deadline proves
+    /// nothing and is repeated with a longer lead.
+    #[test]
+    #[cfg_attr(miri, ignore = "needs every worker parked ahead of a real deadline")]
+    fn a_timer_task_runs_on_the_worker_that_fires_it_and_wakes_nobody() {
+        use core::sync::atomic::{AtomicBool, Ordering};
+        use std::time::{Duration, Instant};
+
+        use crate::WorkerClass;
+
+        const WORKERS: u32 = 3;
+        let executor =
+            Executor::builder().frame_workers(WORKERS).background_workers(1).build().unwrap();
+        let shared = executor.owner.shared.clone();
+        for lead in [20, 100, 500, 2000].map(Duration::from_millis) {
+            let deadline = Instant::now() + lead;
+            let registered = Arc::new(AtomicBool::new(false));
+            let task = {
+                let (sleeper, shared, registered) =
+                    (executor.clone(), shared.clone(), registered.clone());
+                executor.spawn(WorkerClass::FrameCritical, async move {
+                    let mut sleep = pin!(sleeper.sleep_until(deadline));
+                    core::future::poll_fn(|cx| {
+                        let poll = sleep.as_mut().poll(cx);
+                        if poll.is_pending() {
+                            registered.store(true, Ordering::SeqCst);
+                        }
+                        poll
+                    })
+                    .await
+                    .unwrap();
+                    shared.frame().sleepers()
+                })
+            };
+            while Instant::now() + lead / 4 < deadline {
+                std::thread::sleep(Duration::from_micros(200));
+            }
+            // Between this look and the resumption nothing claims a sleeper but a wake-up
+            // for the task itself: nothing else is queued, and the keeper's own timeout
+            // clears only its own bit.
+            let all_asleep = registered.load(Ordering::SeqCst)
+                && shared.frame().sleepers() == WORKERS
+                && Instant::now() < deadline;
+            let asleep_at_resumption = executor.block_on(task).unwrap();
+            if all_asleep {
+                assert_eq!(asleep_at_resumption, WORKERS - 1, "a sleeper was woken for the task");
+                executor.shutdown();
+                return;
+            }
+        }
+        panic!("some worker was still awake shortly before every deadline");
+    }
 }

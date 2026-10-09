@@ -147,10 +147,22 @@ and list what changed, because `lactose-ecs` is written against this surface.
 - Dedicated threads owned by other crates (network, present, audio) are created through
   `Executor::platform`, never `std::thread` directly.
 - There is no timer thread. Frame-critical workers fire due timers when they look for work,
-  and one sleeping worker at a time parks only until the earliest deadline.
+  and one sleeping worker at a time, the keeper, parks only until the earliest deadline.
+  When nothing waits in the frame-critical queue, a worker that fires timers on its way to
+  its next job puts the first frame-critical task they wake on its own deque and wakes nobody
+  for it, so the task resumes on the worker that is already awake rather than on a sleeper
+  woken for it. Every other task they wake, and every one of them while work is queued, goes
+  behind the queued work and wakes a sleeper: a timer never puts a task ahead of work that
+  was waiting. The kept task stays visible on the deque; under a closed `block_in_place`
+  gate a firing worker without a permit parks beside it, and a worker that holds one takes
+  it. A worker that finds a timer due just as it lies down to sleep queues the task with a
+  wake-up like any other.
 - `shutdown` lets running jobs finish, including the scope children they wait for, drops
-  queued graph work and cancels every unfinished task. A `GraphRun`, `Task` or `Sleep` that
-  was cut off resolves to `Cancelled`, at once, without waiting for the running jobs.
+  queued graph work and cancels every unfinished task. Each `GraphRun`, `Task` or `Sleep`
+  that was cut off resolves to `Cancelled` as soon as its guarantee above allows, without
+  waiting for the joins: a `Sleep` at once, a `Task` once its future has been dropped, which
+  for a task being polled is when that poll returns, and a `GraphRun` once the jobs of it
+  that were already running have returned.
   Dropping the last `Executor` handle does the same; a handle held by a task counts.
   Either joins every worker thread, except on one of the executor's own workers, which
   cannot wait for itself: there the workers are told to stop and exit on their own.
@@ -197,6 +209,12 @@ machine, with one command:
 cargo bench -p lactose-task --bench whisk
 ```
 
+On a Mac, keep the machine awake for the whole run, on AC power with
+`caffeinate -i -s cargo bench -p lactose-task --bench whisk`. A Mac left alone sleeps and
+wakes in the dark about every quarter of an hour, and that freezes the run. `Instant` does not
+count the time asleep, so neither the phase timings nor the latencies show the stall for what
+it is.
+
 | Measure | Threshold |
 |---|---|
 | Makespan divided by its lower bound | at most 1.25 at P50 and 1.5 at P99 |
@@ -231,13 +249,14 @@ Correctness:
 
 - The scope latch and the sleep-and-wake protocol are modelled under `loom` (`src/models.rs`),
   and with them what is built on them: the opener's wait with its permit and the
-  `block_in_place` gate (`src/gate.rs`), the wake that is skipped for a kept entry, and the
+  `block_in_place` gate (`src/gate.rs`), the wake that is skipped for a kept entry, the
+  timer keeper's hand-off, the task kept by the worker that fires its timer, and the
   quiescence of a cancelled run (`src/quiesce.rs`). The models call the shipped functions.
   The deque is a vetted dependency and is not modelled. loom is enabled by a `loom` Cargo
   feature on this crate that switches an internal `sync` shim, and run with
   `cargo test -p lactose-task --features loom --release`. Never use loom's documented
   `RUSTFLAGS="--cfg loom"`: the environment variable replaces the x86-64 target pin.
-  Nine models are explored exhaustively. The three with three threads are bounded at five
+  Eleven models are explored exhaustively. The three with three threads are bounded at five
   preemptions, the idle-release one at four (`LOOM_MAX_PREEMPTIONS` overrides the bounds).
 - **The `loom` feature is for that one command.** No other crate may enable it and nothing
   may be built with `--all-features`: features unify across a build, so every executor in it

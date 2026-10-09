@@ -249,6 +249,147 @@ fn timers_fire_while_every_worker_is_busy_and_then_idle() {
     executor.shutdown();
 }
 
+/// The worker that fires a timer keeps the task it wakes as its own next job only while
+/// nothing waits in the queue. Here three tasks were queued before the timers fired, so
+/// both timer tasks queue behind them, in deadline order: a timer never lets a task cut in
+/// ahead of work that was waiting, whose wake-up may already have been spent on the very
+/// worker that fires it. (With nothing queued, the in-crate test
+/// `a_timer_task_runs_on_the_worker_that_fires_it_and_wakes_nobody` covers the keep.)
+///
+/// One frame-critical worker makes the order exact. The only timing is that the deadline
+/// falls after the timers are registered and the busy task has started; an attempt where
+/// it does not proves nothing and is repeated with a longer margin.
+#[test]
+fn a_task_woken_by_a_timer_never_runs_ahead_of_queued_tasks() {
+    let executor = executor(1, 1);
+    for margin in [20, 200, 2000].map(Duration::from_millis) {
+        if let Some(order) = order_after_timers_fire(&executor, margin) {
+            assert_eq!(order, ["queued 0", "queued 1", "queued 2", "first timer", "second timer"]);
+            executor.shutdown();
+            return;
+        }
+    }
+    // Under Miri the simulated clock can pass the deadline before the tasks are polled.
+    if !cfg!(miri) {
+        panic!("every attempt saw the deadline pass before the busy task started");
+    }
+    executor.shutdown();
+}
+
+/// From one task, so they are queued together behind it: two timer tasks with the same
+/// deadline, then a busy task that queues three more and spins past that deadline. Returns
+/// the order the five ran in, or `None` if the deadline came before both timers were
+/// registered and the busy task had started.
+fn order_after_timers_fire(executor: &Executor, margin: Duration) -> Option<Vec<String>> {
+    let order = Arc::new(Mutex::new(Vec::new()));
+    let registered = Arc::new(AtomicUsize::new(0));
+    let spawner = executor.clone();
+    let log = order.clone();
+    let setup = executor.spawn(WorkerClass::FrameCritical, async move {
+        let deadline = Instant::now() + margin;
+        let timers = ["first timer", "second timer"].map(|name| {
+            let (sleep, log, registered) =
+                (spawner.sleep_until(deadline), log.clone(), registered.clone());
+            spawner.spawn(WorkerClass::FrameCritical, async move {
+                let mut sleep = core::pin::pin!(sleep);
+                let mut counted = false;
+                core::future::poll_fn(|cx| {
+                    let poll = sleep.as_mut().poll(cx);
+                    if poll.is_pending() && !core::mem::replace(&mut counted, true) {
+                        registered.fetch_add(1, Ordering::SeqCst);
+                    }
+                    poll
+                })
+                .await
+                .unwrap();
+                log.lock().unwrap().push(name.to_owned());
+            })
+        });
+        let queuer = spawner.clone();
+        let busy = spawner.spawn(WorkerClass::FrameCritical, async move {
+            let started_in_time = Instant::now() < deadline;
+            let queued: Vec<_> = (0..3)
+                .map(|index| {
+                    let log = log.clone();
+                    queuer.spawn(WorkerClass::FrameCritical, async move {
+                        log.lock().unwrap().push(format!("queued {index}"));
+                    })
+                })
+                .collect();
+            while Instant::now() < deadline {
+                core::hint::spin_loop();
+            }
+            (started_in_time && registered.load(Ordering::SeqCst) == 2, queued)
+        });
+        (timers, busy)
+    });
+    let (timers, busy) = executor.block_on(setup).unwrap();
+    let (valid, queued) = executor.block_on(busy).unwrap();
+    for task in timers.into_iter().chain(queued) {
+        executor.block_on(task).unwrap();
+    }
+    valid.then(|| order.lock().unwrap().clone())
+}
+
+/// A task whose every poll registers a short timer and works past it before returning (a
+/// short sleep raced against work, in a loop) finds its timer due each time its worker next
+/// looks for work. That must not keep it ahead of the queue on every pass: with one
+/// frame-critical worker, a task spawned meanwhile runs before the loop's next iteration
+/// ends, not when the loop does.
+///
+/// Counted in iterations, not time. The loop stops once the other task has run, or gives up
+/// a hundred iterations after it was queued.
+#[test]
+#[cfg_attr(miri, ignore = "a timer has to fall due during each poll, on the real clock")]
+fn a_task_whose_timer_is_always_due_does_not_starve_the_queue() {
+    let executor = executor(1, 1);
+    let started = Arc::new(AtomicBool::new(false));
+    let queued = Arc::new(AtomicBool::new(false));
+    let ran = Arc::new(AtomicBool::new(false));
+    let looper = {
+        let (sleeper, started, queued, ran) =
+            (executor.clone(), started.clone(), queued.clone(), ran.clone());
+        executor.spawn(WorkerClass::FrameCritical, async move {
+            started.store(true, Ordering::SeqCst);
+            // Iterations that began after the other task was queued and gave the worker
+            // back; one whose deadline had passed before its first poll never suspends.
+            let mut after = 0u32;
+            let mut iterations = 0u32;
+            while !ran.load(Ordering::SeqCst) && after <= 100 && iterations < 1_000_000 {
+                iterations += 1;
+                let seen = queued.load(Ordering::SeqCst);
+                let deadline = Instant::now() + Duration::from_micros(20);
+                let mut sleep = core::pin::pin!(sleeper.sleep_until(deadline));
+                let mut suspended = false;
+                core::future::poll_fn(|cx| {
+                    let poll = sleep.as_mut().poll(cx);
+                    if poll.is_pending() {
+                        suspended = true;
+                        common::spin_for(Duration::from_micros(30));
+                    }
+                    poll
+                })
+                .await
+                .unwrap();
+                after += u32::from(seen && suspended);
+            }
+            after
+        })
+    };
+    wait_for(&started);
+    let other = {
+        let ran = ran.clone();
+        executor.spawn(WorkerClass::FrameCritical, async move { ran.store(true, Ordering::SeqCst) })
+    };
+    queued.store(true, Ordering::SeqCst);
+    let after = executor.block_on(looper).unwrap();
+    executor.block_on(other).unwrap();
+    // The first iteration that sees the task queued suspends into a firing that finds it
+    // there, so the task runs before the loop resumes.
+    assert!(after <= 1, "the queued task waited {after} iterations of the loop");
+    executor.shutdown();
+}
+
 #[test]
 fn shutdown_with_work_outstanding_finishes_running_jobs_and_drops_the_rest() {
     let executor = executor(sized(3, 2), 1);

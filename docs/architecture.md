@@ -230,7 +230,9 @@ owns its data and may be cancelled by drop. Waiting is an `.await`.
   timers steps its timed park (0.6 of the time left, repeated) and spins the last 50
   microseconds, because macOS lengthens a timed wait by a leeway proportional to the timeout
   (D113). A worker that releases
-  several entries keeps one for itself and wakes one sleeper for each of the others. The
+  several entries keeps one for itself and wakes one sleeper for each of the others, and a
+  worker that fires timers on its way to its next job keeps the first task they wake in the
+  same way, but only while nothing waits in the frame-critical queue (D116). The
   latch, the permit gate, the sleep-and-wake protocol and run quiescence are modelled under
   `loom`, through the shipped functions; the deque is a vetted dependency. aarch64 stress tests
   cover weak-memory behaviour loom does not model.

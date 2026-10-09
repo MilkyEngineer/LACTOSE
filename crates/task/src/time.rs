@@ -18,7 +18,8 @@ use crate::sync::{AtomicU64, Mutex, MutexGuard, Ordering};
 /// There is no timer thread. Frame-critical workers fire due timers whenever they look for
 /// work, and while all of them could be asleep one sleeper, the keeper, parks only until the
 /// earliest deadline. A timer therefore fires as soon as a worker is free to notice it,
-/// which is also the earliest the task it wakes could run.
+/// which is also the earliest the task it wakes could run. With nothing else queued, that
+/// worker runs the task itself (`pool::fire_timers`).
 pub(crate) struct Timers {
     state: Mutex<TimerState>,
     /// The earliest deadline in nanoseconds since `epoch`, or `u64::MAX` when there is
@@ -87,22 +88,34 @@ impl Timers {
         self.publish_earliest(&state);
     }
 
-    /// Wakes every timer whose deadline has passed.
+    /// Wakes every timer whose deadline had passed when it was called.
+    ///
+    /// The timers are taken out one at a time, which allocates nothing. This runs between a
+    /// tick deadline and the task that waits for it: splitting the due timers off as a map
+    /// of their own allocated a node and freed another on every tick, which on an M1 cost
+    /// 3 µs at the median and 21 µs at P99.
     pub(crate) fn fire_due(&self) {
         let earliest = self.earliest.load(Ordering::Relaxed);
-        if earliest == u64::MAX || self.epoch.elapsed().as_nanos() < u128::from(earliest) {
+        if earliest == u64::MAX {
             return;
         }
-        let due = {
-            let mut state = self.lock();
-            let later = state.pending.split_off(&(Instant::now(), u64::MAX));
-            let due = core::mem::replace(&mut state.pending, later);
-            self.publish_earliest(&state);
-            due
-        };
-        // Outside the lock: a waker queues a task, or does whatever a foreign waker does.
-        for waker in due.into_values() {
-            waker.wake();
+        let now = Instant::now();
+        if now.saturating_duration_since(self.epoch).as_nanos() < u128::from(earliest) {
+            return;
+        }
+        loop {
+            let waker = {
+                let mut state = self.lock();
+                let due = state.pending.first_entry().filter(|timer| timer.key().0 <= now);
+                let waker = due.map(|timer| timer.remove());
+                self.publish_earliest(&state);
+                waker
+            };
+            // Outside the lock: a waker queues a task, or does whatever a foreign waker does.
+            match waker {
+                Some(waker) => waker.wake(),
+                None => return,
+            }
         }
     }
 

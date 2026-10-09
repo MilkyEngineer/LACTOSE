@@ -1227,6 +1227,26 @@ rationale the author supplied during the editorial pass rather than one taken fr
   additions to the closure and are allowlisted with their review.
 - Driven by: milestone 0, the ECS facade.
 
+**D116. Keep the first timer-woken task only when the injector is empty** (§5.1, `lactose-task`)
+- Why: measured on the M1 at 60 Hz, the keeper that fires a tick deadline already resumed
+  the timer root in 4,947 of 5,000 deadlines; the cost lay on its own path. It unparked a
+  sleeper that found the task gone (P50 3.6 µs, P99 12.9 µs), and it split the due timers
+  into a new map, allocating on every tick (P50 2.9 µs, P99 21 µs). A worker that fires
+  timers on its way to its next job now keeps the first frame-critical task they wake on its
+  own deque and wakes nobody for it, as D109 keeps a released node, and due timers are taken
+  out one at a time. It keeps only while the frame-critical injector is empty: the review of
+  the first version showed that otherwise a worker woken for a queued task spends that
+  task's wake-up on the timer's task (P99 2 ms for the queued task), and a task whose timer
+  is due whenever its poll returns is kept on every pass and starves the queue, which on a
+  one-worker topology (D111) is the whole frame pool. A worker already announced as about
+  to sleep keeps nothing, because nothing orders its push before its permit check; a loom
+  variant that does keep deadlocks. In interleaved A/B runs tick start went from P50 about
+  12 µs and P99 41 to 44 µs to P50 3 to 5 µs and P99 23 to 30 µs, and process CPU at 60 Hz
+  from 0.0147 to 0.0103 s/s. The 20 µs criterion is not yet shown on this machine, which
+  alternates between a state where the fixed keeper measures P99 under 6 µs and one where
+  it measures 22 to 25 µs (`docs/verification.md`).
+- Driven by: the D113 tick-start criterion; the keeper fix round and its review.
+
 ## 10. Review history
 
 - **Revision 1** (`a29af04`): the design baseline.

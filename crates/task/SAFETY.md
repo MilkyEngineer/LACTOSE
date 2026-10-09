@@ -31,7 +31,9 @@ raw pointers that carry no lifetime. One invariant makes that sound:
 
 The wait itself rests on a second invariant, which is about liveness, not memory: while a
 scope is open, the opening worker's deque receives only that scope's children
-(`Shared::submit_range` sends everything else to the injector), so the opener can find every
+(`Shared::submit_range` sends everything else to the injector, and `Shared::keep_woken_task`,
+which puts a task woken by a timer on the firing worker's own deque, refuses while the worker's
+`scope_open` is set, so that task goes to the injector too), so the opener can find every
 child that is still on its deque by popping. Breaking it would hang the opener; it could not
 free anything early, because the first invariant holds regardless.
 
