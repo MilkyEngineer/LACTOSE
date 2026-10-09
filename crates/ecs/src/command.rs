@@ -1,14 +1,16 @@
 //! Command buffers: structural changes recorded by a kernel and applied at the next sync
 //! point (architecture section 5.2), and typed channels for other crates' commands.
 
+use core::any::{Any, TypeId};
 use core::marker::PhantomData;
 
-use lactose_core::StableKey;
-use lactose_reflect::Component;
+use lactose_core::{ComponentKey, EntityRef, FieldId, FixedHashMap, StableKey};
+use lactose_reflect::{AssetReference, Component, ReferenceVisitor, Reflect, TypeInfo};
 
 use crate::access::{Access, AccessKind, channel_target, no_target};
 use crate::param::{SystemParam, sealed};
-use crate::region::RegionId;
+use crate::region::{InRegion, PredictedOrigin, RegionId};
+use crate::system::{Fetch, Invocation, Slot, mismatch};
 
 /// A set of components spawned together: a tuple of one to eight [`Component`]s, each of
 /// a different type. One component is spelled `(Bomb { fuse: 180 },)`.
@@ -21,14 +23,23 @@ pub trait Bundle: Send + 'static {
 /// Where a bundle's components go. Not part of the interface.
 #[doc(hidden)]
 pub struct BundleOut {
-    _private: (),
+    pub(crate) components: Vec<ErasedComponent>,
+}
+
+impl BundleOut {
+    /// Appends `value`.
+    pub fn push<T: Component>(&mut self, value: T) {
+        self.components.push(ErasedComponent::of(value));
+    }
 }
 
 macro_rules! tuple_bundles {
     ($(($($name:ident),+);)+) => {$(
         impl<$($name: Component),+> Bundle for ($($name,)+) {
+            #[allow(non_snake_case, reason = "the bindings are named after the type parameters")]
             fn write_into(self, out: &mut BundleOut) {
-                todo!()
+                let ($($name,)+) = self;
+                $(out.push($name);)+
             }
         }
     )+};
@@ -43,6 +54,124 @@ tuple_bundles! {
     (A, B, C, D, E, F);
     (A, B, C, D, E, F, G);
     (A, B, C, D, E, F, G, H);
+}
+
+/// The components of a bundle, without their types.
+pub(crate) fn erase_bundle<B: Bundle>(bundle: B) -> Vec<ErasedComponent> {
+    let mut out = BundleOut { components: Vec::new() };
+    bundle.write_into(&mut out);
+    out.components
+}
+
+/// Rewrites every `EntityRef` of a component value held as bytes.
+pub(crate) type RemapFn = fn(&mut [u8], &mut dyn FnMut(&mut EntityRef));
+
+/// One component value in transit, its type known only by its description.
+pub(crate) struct ErasedComponent {
+    pub(crate) info: &'static TypeInfo,
+    pub(crate) bytes: Vec<u8>,
+    /// The typed reference rewrite, through `visit_references`; `None` for bytes loaded
+    /// from a document, whose references are kept as stored.
+    pub(crate) remap: Option<RemapFn>,
+}
+
+impl ErasedComponent {
+    pub(crate) fn of<T: Component>(value: T) -> Self {
+        Self {
+            info: T::SCHEMA.info(),
+            bytes: bytemuck::bytes_of(&value).to_vec(),
+            remap: Some(remap_references::<T>),
+        }
+    }
+
+    pub(crate) fn key(&self) -> ComponentKey {
+        self.info.key()
+    }
+}
+
+fn remap_references<T: Component>(bytes: &mut [u8], f: &mut dyn FnMut(&mut EntityRef)) {
+    struct Visitor<'a>(&'a mut dyn FnMut(&mut EntityRef));
+
+    impl ReferenceVisitor for Visitor<'_> {
+        fn entity_ref(&mut self, _: FieldId, value: &mut EntityRef) {
+            (self.0)(value);
+        }
+
+        fn asset_ref<A: AssetReference>(&mut self, _: FieldId, _: &mut A) {}
+    }
+
+    let mut value: T = bytemuck::checked::pod_read_unaligned(bytes);
+    value.visit_references(&mut Visitor(f));
+    bytes.copy_from_slice(bytemuck::bytes_of(&value));
+}
+
+/// Whether `T` is one of the two components only the world writes.
+pub(crate) fn is_worlds_own(key: ComponentKey) -> bool {
+    key == InRegion::KEY || key == PredictedOrigin::KEY
+}
+
+/// One recorded command.
+pub(crate) enum Command {
+    Spawn { index: u32, region: Option<RegionId>, components: Vec<ErasedComponent> },
+    Despawn(StableKey),
+    Set(StableKey, ErasedComponent),
+    Remove(StableKey, ComponentKey),
+    Move(StableKey, RegionId),
+    Channel(ChannelCommand),
+}
+
+/// A channel entry in a command buffer, with the typed operations its apply needs.
+pub(crate) struct ChannelCommand {
+    pub(crate) entry: Box<dyn Any + Send + Sync>,
+    pub(crate) append: AppendFn,
+}
+
+/// Remaps an entry's keys and appends it to its channel's store.
+pub(crate) type AppendFn = fn(
+    &mut ChannelStore,
+    Box<dyn Any + Send + Sync>,
+    Option<StableKey>,
+    &mut dyn FnMut(&mut StableKey),
+);
+
+/// Every channel's applied entries, as a `Vec<ChannelEntry<C>>` per channel type.
+pub(crate) type ChannelStore = FixedHashMap<TypeId, Box<dyn Any + Send + Sync>>;
+
+fn append_entry<C: CommandChannel>(
+    store: &mut ChannelStore,
+    entry: Box<dyn Any + Send + Sync>,
+    source: Option<StableKey>,
+    remap: &mut dyn FnMut(&mut StableKey),
+) {
+    let mut entry = *entry.downcast::<C::Entry>().expect("an entry of this channel");
+    C::remap(&mut entry, remap);
+    store
+        .get_or_insert_with(TypeId::of::<C>(), || Box::new(Vec::<ChannelEntry<C>>::new()))
+        .downcast_mut::<Vec<ChannelEntry<C>>>()
+        .expect("the entries of this channel")
+        .push(ChannelEntry { source, entry });
+}
+
+/// The commands of one invocation, in the order they were recorded.
+#[derive(Default)]
+pub(crate) struct CommandBuffer {
+    pub(crate) commands: Vec<Command>,
+    pub(crate) spawns: u32,
+    /// The region a plain `spawn` goes to: the entity's or the per-region invocation's.
+    pub(crate) region: Option<RegionId>,
+}
+
+impl CommandBuffer {
+    pub(crate) fn new(region: Option<RegionId>) -> Self {
+        Self { commands: Vec::new(), spawns: 0, region }
+    }
+
+    fn spawn(&mut self, region: Option<RegionId>, components: Vec<ErasedComponent>) -> StableKey {
+        let index = self.spawns;
+        self.spawns += 1;
+        self.commands.push(Command::Spawn { index, region, components });
+        StableKey::Placeholder(index)
+    }
 }
 
 /// The command buffer of one system invocation.
@@ -68,7 +197,7 @@ tuple_bundles! {
 /// "validated at apply"); a spawn with no region, or one that would need a `NetId` in a
 /// client or prediction world, is dropped. Every drop is logged at target `casein`.
 pub struct Commands<'w> {
-    _buffer: PhantomData<&'w mut ()>,
+    buffer: &'w mut CommandBuffer,
 }
 
 impl Commands<'_> {
@@ -88,46 +217,52 @@ impl Commands<'_> {
     /// server, the key is a runtime `NetId` and no claim passes on; in a client or
     /// prediction world the spawn is dropped.
     pub fn spawn<B: Bundle>(&mut self, bundle: B) -> StableKey {
-        todo!()
+        let region = self.buffer.region;
+        self.buffer.spawn(region, erase_bundle(bundle))
     }
 
     /// Spawns an entity in `region`, which must be loaded at apply, with the key rule of
     /// [`spawn`](Self::spawn).
     pub fn spawn_in<B: Bundle>(&mut self, region: RegionId, bundle: B) -> StableKey {
-        todo!()
+        self.buffer.spawn(Some(region), erase_bundle(bundle))
     }
 
     /// Despawns `key` at apply, and with it every entity it owns.
     pub fn despawn(&mut self, key: StableKey) {
-        todo!()
+        self.buffer.commands.push(Command::Despawn(key));
     }
 
     /// Writes the whole component `value` to `key` at apply, adding the component if the
     /// entity lacks it. The row is marked changed. This is how a relationship field or
     /// [`ClaimedBy`](crate::ClaimedBy) is written, never through [`Mut`](crate::Mut), so the
     /// indexes stay consistent. [`InRegion`](crate::InRegion) and
-    /// [`PredictedOrigin`](crate::PredictedOrigin) are the world's and cannot be set.
+    /// [`PredictedOrigin`](crate::PredictedOrigin) are the world's and cannot be set: that
+    /// is a panic here.
     pub fn set<T: Component>(&mut self, key: StableKey, value: T) {
-        todo!()
+        assert!(!is_worlds_own(T::KEY), "`{}` is written by the world only", T::SCHEMA.name());
+        self.buffer.commands.push(Command::Set(key, ErasedComponent::of(value)));
     }
 
     /// Removes component `T` from `key` at apply, if present. Removing
-    /// [`ClaimedBy`](crate::ClaimedBy) releases the claim.
+    /// [`ClaimedBy`](crate::ClaimedBy) releases the claim. [`InRegion`](crate::InRegion)
+    /// and [`PredictedOrigin`](crate::PredictedOrigin) cannot be removed: that is a panic
+    /// here.
     pub fn remove<T: Component>(&mut self, key: StableKey) {
-        todo!()
+        assert!(!is_worlds_own(T::KEY), "`{}` is written by the world only", T::SCHEMA.name());
+        self.buffer.commands.push(Command::Remove(key, T::KEY));
     }
 
     /// Moves `key` and the entities it owns to `region` at apply. Identities do not change.
     /// A later command in the same apply may move an owned entity elsewhere again. A move
     /// into a `Frozen` region freezes the entity with it (architecture section 9.7).
     pub fn move_to_region(&mut self, key: StableKey, region: RegionId) {
-        todo!()
+        self.buffer.commands.push(Command::Move(key, region));
     }
 
     /// The writer for channel `C`, for another crate's commands. `lactose-physics-api`
     /// wraps this in an extension trait so a kernel writes `cmd.physics().apply_impulse(..)`.
     pub fn channel<C: CommandChannel>(&mut self) -> ChannelWriter<'_, C> {
-        todo!()
+        ChannelWriter { buffer: self.buffer, _channel: PhantomData }
     }
 }
 
@@ -135,6 +270,15 @@ impl sealed::Sealed for Commands<'_> {}
 
 impl SystemParam for Commands<'_> {
     const ACCESS: Access = Access::new(AccessKind::Commands, no_target);
+}
+
+impl<'r, 'j> Fetch<'r, 'j> for Commands<'r> {
+    fn fetch(invocation: &mut Invocation<'r, 'j>, index: usize) -> Self {
+        match invocation.take(index) {
+            Slot::Commands(buffer) => Self { buffer },
+            _ => mismatch(index),
+        }
+    }
 }
 
 /// A typed command channel another crate declares: a marker type naming its entry type and
@@ -156,14 +300,17 @@ pub trait CommandChannel: 'static {
 
 /// Appends entries to a channel on behalf of one invocation.
 pub struct ChannelWriter<'a, C: CommandChannel> {
-    _buffer: PhantomData<&'a mut ()>,
+    buffer: &'a mut CommandBuffer,
     _channel: PhantomData<fn() -> C>,
 }
 
 impl<C: CommandChannel> ChannelWriter<'_, C> {
     /// Records `entry` with this invocation's source and the next sequence number.
     pub fn push(&mut self, entry: C::Entry) {
-        todo!()
+        self.buffer.commands.push(Command::Channel(ChannelCommand {
+            entry: Box::new(entry),
+            append: append_entry::<C>,
+        }));
     }
 }
 
@@ -199,21 +346,20 @@ where
 
 /// The entries of channel `C` written in earlier stages of this tick, read by a system.
 pub struct Channel<'w, C: CommandChannel> {
-    _buffer: PhantomData<&'w ()>,
-    _channel: PhantomData<fn() -> C>,
+    entries: &'w [ChannelEntry<C>],
 }
 
 impl<C: CommandChannel> Channel<'_, C> {
     /// The entries in command order.
     #[must_use]
     pub fn iter(&self) -> ChannelEntries<'_, C> {
-        todo!()
+        ChannelEntries { entries: self.entries.iter() }
     }
 
     /// How many entries there are.
     #[must_use]
     pub fn len(&self) -> usize {
-        todo!()
+        self.entries.len()
     }
 
     /// Whether there are no entries.
@@ -229,16 +375,31 @@ impl<C: CommandChannel> SystemParam for Channel<'_, C> {
     const ACCESS: Access = Access::new(AccessKind::Read, channel_target::<C>);
 }
 
+impl<'r, 'j, C: CommandChannel> Fetch<'r, 'j> for Channel<'r, C> {
+    fn fetch(invocation: &mut Invocation<'r, 'j>, index: usize) -> Self {
+        match invocation.take(index) {
+            Slot::Channel(store) => Self {
+                entries: store.map_or(&[], |store| {
+                    store
+                        .downcast_ref::<Vec<ChannelEntry<C>>>()
+                        .expect("the entries of this channel")
+                        .as_slice()
+                }),
+            },
+            _ => mismatch(index),
+        }
+    }
+}
+
 /// Iterates a channel's entries in command order.
 pub struct ChannelEntries<'a, C: CommandChannel> {
-    _buffer: PhantomData<&'a ()>,
-    _channel: PhantomData<fn() -> C>,
+    entries: core::slice::Iter<'a, ChannelEntry<C>>,
 }
 
 impl<'a, C: CommandChannel> Iterator for ChannelEntries<'a, C> {
     type Item = &'a ChannelEntry<C>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        todo!()
+        self.entries.next()
     }
 }

@@ -9,9 +9,9 @@
 //!
 //! # Status
 //!
-//! This is the facade: every signature is final, every body is `todo!()`. The naive
-//! single-threaded implementation replaces the bodies without changing a public signature,
-//! and removes the two crate-level `allow`s below with the last `todo!()`.
+//! The naive implementation: storage, change tracking, commands, events, snapshots and
+//! bulk copy are complete, and a schedule run executes every system in order on one
+//! worker. Milestone 1 rewrites the hot paths to fork over chunks.
 //!
 //! # Where to start
 //!
@@ -27,13 +27,8 @@
 //! - [`World::snapshot`] and [`World::restore`] serve the prediction world; the bulk-copy
 //!   methods move region rows to and from `lactose_bundle` documents.
 
-#![allow(
-    dead_code,
-    unused_variables,
-    reason = "facade: bodies are todo!() until the implementation lane replaces them"
-)]
-
 mod access;
+mod apply;
 mod bulk;
 mod change;
 mod command;
@@ -42,8 +37,10 @@ mod param;
 mod query;
 mod region;
 mod rng;
+mod run;
 mod schedule;
 mod snapshot;
+mod storage;
 mod system;
 mod world;
 
@@ -103,6 +100,8 @@ const _: () = {
 /// implementation may reshape them together with the macros, in one change.
 #[doc(hidden)]
 pub mod __private {
-    pub use crate::system::{Invocation, Kernel};
+    pub use crate::system::{
+        Fetch, Finalize, Invocation, Kernel, ReducerOps, fetch, finish, reduce,
+    };
     pub use lactose_core::SystemKey;
 }

@@ -2,28 +2,52 @@
 //! (architecture section 6), and the direct access that exclusive systems and engine
 //! passes use between stages.
 
+use core::any::{Any, TypeId};
 use core::marker::PhantomData;
 use core::num::NonZeroU64;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Arc;
 
 use lactose_asset_api::PinnedTable;
 use lactose_bundle::{Baseline, ComponentData, Overlay};
 use lactose_core::{
-    ComponentKey, FieldId, NetId, PlayerId, PredictionKey, Result, StableKey, SystemKey, Tick,
+    ComponentKey, EntityRef, Error, ErrorKind, FieldId, FixedHashMap, NetId, PlayerId,
+    PredictionKey, Result, StableKey, SystemKey, Tick,
 };
-use lactose_reflect::{Component, Registry, Resource};
+use lactose_reflect::{
+    Component, FieldKind, Persistence, Reflect, Registry, Resource, TypeInfo, TypeRole,
+};
 
 use crate::bulk::RegionRows;
 use crate::change::{
-    ChangeMark, ChangedRows, Columns, ColumnsMut, ErasedColumns, LogCursor, StructuralLog,
+    ChangeMark, ChangedRows, ColumnMut, ColumnRef, Columns, ColumnsMut, ErasedColumn,
+    ErasedColumns, LogCursor, Stamp, StructuralChange, StructuralLog,
 };
-use crate::command::{Bundle, ChannelEntry, CommandChannel};
-use crate::event::PresentEventBatch;
-use crate::param::Mut;
+use crate::command::{
+    Bundle, ChannelEntry, ChannelStore, CommandChannel, ErasedComponent, erase_bundle,
+    is_worlds_own,
+};
+use crate::event::{EventStore, PresentEventBatch, PresentLog};
+use crate::param::{Mut, resource_ref};
 use crate::query::{Query, QueryItems};
-use crate::region::{RegionConfig, RegionId, RegionInfo, RegionMode};
-use crate::rng::Rng;
+use crate::region::{
+    ClaimedBy, InRegion, OwnedBy, PredictedOrigin, RegionConfig, RegionId, RegionInfo, RegionMode,
+};
+use crate::rng::{LayoutRng, Rng};
 use crate::snapshot::WorldSnapshot;
+use crate::storage::{
+    AlignedBytes, Loc, MAX_ALIGN, RowValue, Storage, typed, typed_mut, typed_slice,
+};
+
+/// The first position between ticks: after every position a tick's slots use.
+pub(crate) const BETWEEN: u32 = 1 << 31;
+
+/// The positions one slot of a tick spans: its base, then the direct writes made in it.
+pub(crate) const SLOT_WIDTH: u32 = 1 << 16;
+
+/// Change stamps are clamped forward, and a new epoch starts, every this many ticks
+/// (architecture section 6).
+const REBASE_TICKS: u32 = 1 << 30;
 
 /// Which world this is. A system declares the kinds it runs in, and the world applies its
 /// own filter to every kernel (architecture section 9.4), so game code never writes one.
@@ -32,7 +56,8 @@ pub enum WorldKind {
     /// The authoritative world. Spawns receive runtime `NetId`s.
     Server,
     /// A client's replicated world: rows hold received state, written at the input sync
-    /// point. It runs no per-entity kernel (architecture section 5.3).
+    /// point. It runs only the systems that name `client`, which simulation systems do
+    /// not (architecture section 5.3).
     Client,
     /// A client's prediction world: kernels run only over rows that have
     /// [`ClaimedBy`](crate::ClaimedBy), spawns receive `Predicted` keys, and it is the one
@@ -53,7 +78,7 @@ impl WorldSet {
     pub const CLIENT: Self = Self(2);
     /// The client's prediction world.
     pub const PREDICTION: Self = Self(4);
-    /// Every world, which is what a system without `worlds` declares.
+    /// Every world. A system without `worlds` declares `[server, prediction]`, not this.
     pub const ALL: Self = Self(7);
 
     /// Both sets.
@@ -105,6 +130,21 @@ pub struct LayoutConfig {
     pub split_batches: bool,
 }
 
+impl LayoutConfig {
+    /// `items` reordered as chunk jobs are issued; `salt` varies the shuffle per call site.
+    pub(crate) fn order<T>(&self, items: Vec<T>, salt: (u64, u64)) -> Vec<T> {
+        match self.chunk_order {
+            ChunkOrder::Natural => items,
+            ChunkOrder::Reversed => items.into_iter().rev().collect(),
+            ChunkOrder::Shuffled => {
+                let order = LayoutRng::new(self.seed, salt.0, salt.1).permutation(items.len());
+                let mut slots: Vec<Option<T>> = items.into_iter().map(Some).collect();
+                order.into_iter().map(|index| slots[index].take().expect("a permutation")).collect()
+            }
+        }
+    }
+}
+
 /// Builds a [`World`].
 pub struct WorldBuilder {
     kind: WorldKind,
@@ -118,7 +158,13 @@ impl WorldBuilder {
     /// A world of `kind` whose components and resources are the types in `registry`.
     #[must_use]
     pub fn new(kind: WorldKind, registry: Arc<Registry>) -> Self {
-        todo!()
+        Self {
+            kind,
+            registry,
+            layout: LayoutConfig::default(),
+            tick: Tick(0),
+            next_net_id: NonZeroU64::MIN,
+        }
     }
 
     /// The storage layout; the default is production.
@@ -147,10 +193,188 @@ impl WorldBuilder {
     /// Builds the world. Fails if the registry lacks the components the world itself
     /// maintains ([`InRegion`](crate::InRegion), [`OwnedBy`](crate::OwnedBy),
     /// [`ClaimedBy`](crate::ClaimedBy), [`PredictedOrigin`](crate::PredictedOrigin)) or if a
-    /// chunk capacity cannot hold a registered component.
+    /// chunk capacity cannot hold a registered component: a capacity of zero rows, a
+    /// component larger than a 16 KiB chunk or aligned to more than eight bytes.
     pub fn build(self) -> Result<World> {
-        todo!()
+        let registry = &self.registry;
+        if !(registry.contains::<InRegion>()
+            && registry.contains::<OwnedBy>()
+            && registry.contains::<ClaimedBy>()
+            && registry.contains::<PredictedOrigin>())
+        {
+            return Err(Error::new(
+                ErrorKind::NotFound,
+                "the registry lacks a component the world maintains: register `InRegion`, \
+                 `OwnedBy`, `ClaimedBy` and `PredictedOrigin`",
+            ));
+        }
+        if self.layout.chunk_rows == Some(0) {
+            return Err(Error::new(ErrorKind::InvalidData, "a chunk holds at least one row"));
+        }
+        for info in registry.iter().filter(|info| info.role() == TypeRole::Component) {
+            let layout = info.layout();
+            if layout.size() > lactose_bundle::MAX_COMPONENT_BYTES as usize
+                || layout.align() > MAX_ALIGN
+            {
+                return Err(Error::new(
+                    ErrorKind::InvalidData,
+                    format!(
+                        "`{}` ({} bytes, aligned to {}) does not fit a chunk: components are at \
+                         most 16 KiB and aligned to at most {MAX_ALIGN} bytes",
+                        info.name(),
+                        layout.size(),
+                        layout.align()
+                    ),
+                ));
+            }
+        }
+        Ok(World {
+            identity: Arc::new(()),
+            kind: self.kind,
+            storage: Storage::new(self.layout.chunk_rows),
+            registry: self.registry,
+            layout: self.layout,
+            tick: self.tick,
+            epoch: 0,
+            point: BETWEEN,
+            point_cap: u32::MAX,
+            in_run: false,
+            next_net_id: self.next_net_id,
+            resources: FixedHashMap::new(),
+            regions: BTreeMap::new(),
+            aliases: Aliases::default(),
+            input_ticks: BTreeMap::new(),
+            log: StructuralLog::new(0),
+            references: References::default(),
+            events: EventStore::new(),
+            channels: ChannelStore::new(),
+            present: PresentLog::default(),
+            despawned_predicted: BTreeMap::new(),
+            sync_points: 0,
+        })
     }
+}
+
+/// The prediction-to-network alias table (architecture section 7).
+#[derive(Clone, Default)]
+pub(crate) struct Aliases {
+    pub(crate) by_predicted: BTreeMap<PredictionKey, NetId>,
+    pub(crate) by_net: BTreeMap<NetId, PredictionKey>,
+}
+
+/// A world resource: the `Box<T>` of a reflected resource or a service, held as `Any`.
+pub(crate) struct ResourceEntry {
+    pub(crate) value: Box<dyn Any + Send + Sync>,
+    /// How to copy a reflected resource into a snapshot; `None` for a service.
+    pub(crate) clone: Option<fn(&(dyn Any + Send + Sync)) -> Box<dyn Any + Send + Sync>>,
+    pub(crate) size: usize,
+}
+
+fn clone_resource<T: Resource>(value: &(dyn Any + Send + Sync)) -> Box<dyn Any + Send + Sync> {
+    let value: &T = resource_ref(value);
+    Box::new(Box::new(*value))
+}
+
+/// A loaded region.
+#[derive(Clone)]
+pub(crate) struct RegionState {
+    pub(crate) seed: u64,
+    pub(crate) mode: RegionMode,
+    pub(crate) resources: BTreeMap<ComponentKey, RegionResource>,
+    pub(crate) assets: Option<PinnedTable>,
+}
+
+/// A region resource as bytes, aligned for its type.
+#[derive(Clone)]
+pub(crate) struct RegionResource {
+    pub(crate) info: &'static TypeInfo,
+    pub(crate) bytes: AlignedBytes,
+}
+
+/// The reverse index of relationships: who refers to whom through which field.
+#[derive(Clone, Default)]
+pub(crate) struct References {
+    pub(crate) by_target: BTreeMap<StableKey, BTreeSet<(StableKey, ComponentKey, FieldId)>>,
+}
+
+/// Every `EntityRef` in a value of `info`, with the ID of the top-level field holding it.
+/// Read from the description, which locates the fields; the bytes have been validated.
+pub(crate) fn entity_refs(info: &TypeInfo, bytes: &[u8]) -> Vec<(FieldId, StableKey)> {
+    fn walk(kind: &FieldKind, id: FieldId, bytes: &[u8], out: &mut Vec<(FieldId, StableKey)>) {
+        match kind {
+            FieldKind::EntityRef => {
+                let reference: Option<EntityRef> =
+                    bytemuck::checked::try_pod_read_unaligned(bytes).ok();
+                if let Some(key) = reference.and_then(EntityRef::get) {
+                    out.push((id, key));
+                }
+            }
+            FieldKind::Struct(info) => {
+                for field in info.fields() {
+                    let range = field.offset()..field.offset() + field.size();
+                    if let Some(bytes) = bytes.get(range) {
+                        walk(&field.kind(), id, bytes, out);
+                    }
+                }
+            }
+            FieldKind::Array { element, len, .. } => {
+                if let Some(size) = bytes.len().checked_div(*len).filter(|&size| size > 0) {
+                    for element_bytes in bytes.chunks_exact(size) {
+                        walk(element, id, element_bytes, out);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    for field in info.layout().fields() {
+        if let Some(id) = field.id() {
+            let range = field.offset()..field.offset() + field.size();
+            if let Some(bytes) = bytes.get(range) {
+                walk(&field.kind(), id, bytes, &mut out);
+            }
+        }
+    }
+    out
+}
+
+/// Whether a value of `info` holds an `EntityRef` anywhere.
+pub(crate) fn has_entity_ref(info: &TypeInfo) -> bool {
+    fn walk(kind: &FieldKind) -> bool {
+        match kind {
+            FieldKind::EntityRef => true,
+            FieldKind::Struct(info) => info.fields().iter().any(|field| walk(&field.kind())),
+            FieldKind::Array { element, .. } => walk(element),
+            _ => false,
+        }
+    }
+    info.layout().fields().iter().any(|field| walk(&field.kind()))
+}
+
+/// Whether `Mut`, `World::get_mut` and `columns_mut` refuse the component: the world
+/// maintains it, or it holds a reference whose reverse index is kept at apply.
+pub(crate) fn refuses_mut(info: &TypeInfo) -> bool {
+    let key = info.key();
+    key == InRegion::KEY
+        || key == OwnedBy::KEY
+        || key == ClaimedBy::KEY
+        || key == PredictedOrigin::KEY
+        || has_entity_ref(info)
+}
+
+/// Whether a column is tracked: replicated or extracted.
+pub(crate) fn is_tracked(info: &TypeInfo) -> bool {
+    let tracking = info.tracking();
+    tracking.replicated || tracking.extracted
+}
+
+fn not_found(message: impl Into<std::borrow::Cow<'static, str>>) -> Error {
+    Error::new(ErrorKind::NotFound, message)
+}
+
+fn invalid(message: impl Into<std::borrow::Cow<'static, str>>) -> Error {
+    Error::new(ErrorKind::InvalidData, message)
 }
 
 /// Entities, components, resources and regions, with their change state.
@@ -163,26 +387,54 @@ impl WorldBuilder {
 ///
 /// `World` is `Send` and `Sync`: a scope child of a [`Job`](crate::Job) may borrow it.
 pub struct World {
-    _private: (),
+    /// Ties a snapshot to the world it was taken from; compared by address only.
+    pub(crate) identity: Arc<()>,
+    pub(crate) kind: WorldKind,
+    pub(crate) registry: Arc<Registry>,
+    pub(crate) layout: LayoutConfig,
+    pub(crate) tick: Tick,
+    pub(crate) epoch: u32,
+    /// The current position in the tick's stamp order.
+    pub(crate) point: u32,
+    /// The last position a direct write in the current slot may take.
+    pub(crate) point_cap: u32,
+    /// Whether a schedule run holds the world.
+    pub(crate) in_run: bool,
+    pub(crate) next_net_id: NonZeroU64,
+    pub(crate) storage: Storage,
+    pub(crate) resources: FixedHashMap<TypeId, ResourceEntry>,
+    pub(crate) regions: BTreeMap<RegionId, RegionState>,
+    pub(crate) aliases: Aliases,
+    pub(crate) input_ticks: BTreeMap<PlayerId, Tick>,
+    pub(crate) log: StructuralLog,
+    pub(crate) references: References,
+    pub(crate) events: EventStore,
+    pub(crate) channels: ChannelStore,
+    pub(crate) present: PresentLog,
+    /// Predicted entities despawned, with the tick, so their aliases can be pruned once no
+    /// restore can bring them back.
+    pub(crate) despawned_predicted: BTreeMap<PredictionKey, Tick>,
+    /// Sync points run, salting SOUR's row permutation.
+    pub(crate) sync_points: u64,
 }
 
 impl World {
     /// The kind.
     #[must_use]
     pub fn kind(&self) -> WorldKind {
-        todo!()
+        self.kind
     }
 
     /// The registry the world was built with.
     #[must_use]
     pub fn registry(&self) -> &Registry {
-        todo!()
+        &self.registry
     }
 
     /// The layout applied, for a SOUR run to record.
     #[must_use]
     pub fn layout(&self) -> &LayoutConfig {
-        todo!()
+        &self.layout
     }
 
     /// The absolute simulation tick: the tick being run, or the last one run between ticks.
@@ -191,25 +443,32 @@ impl World {
     /// new epoch for every [`ChangeMark`] and [`LogCursor`].
     #[must_use]
     pub fn tick(&self) -> Tick {
-        todo!()
+        self.tick
     }
 
     /// Sets the tick between ticks: a client re-syncing to the server's clock, a server
-    /// after a load. Starts a new epoch.
+    /// after a load. Starts a new epoch. Fails during a schedule run.
     pub fn set_tick(&mut self, tick: Tick) -> Result<()> {
-        todo!()
+        if self.in_run {
+            return Err(invalid("the tick is set between ticks, not during a run"));
+        }
+        self.tick = tick;
+        self.point = BETWEEN;
+        self.point_cap = u32::MAX;
+        self.new_epoch();
+        Ok(())
     }
 
     /// A mark at the current tick and epoch.
     #[must_use]
     pub fn mark(&self) -> ChangeMark {
-        todo!()
+        ChangeMark::new(self.epoch, Stamp::new(self.tick, self.point))
     }
 
     /// Whether `mark` is of the current epoch, so change stamps compare against its tick.
     #[must_use]
     pub fn is_current(&self, mark: ChangeMark) -> bool {
-        todo!()
+        mark.epoch() == self.epoch
     }
 
     // ---- Entities ----
@@ -217,26 +476,36 @@ impl World {
     /// Whether `key` names a live entity.
     #[must_use]
     pub fn contains(&self, key: StableKey) -> bool {
-        todo!()
+        self.origin(key).is_some()
     }
 
     /// The origin key of `key`'s entity: `key` itself, or the `Predicted` key behind a
     /// bound `Net` key. `None` if the entity does not exist.
     #[must_use]
     pub fn origin(&self, key: StableKey) -> Option<StableKey> {
-        todo!()
+        let live = |key: StableKey| self.storage.entities.contains_key(&key).then_some(key);
+        match key {
+            StableKey::Placeholder(_) => None,
+            StableKey::Predicted(_) => live(key),
+            StableKey::Net(net) => live(key).or_else(|| {
+                let predicted = self.aliases.by_net.get(&net)?;
+                live(StableKey::Predicted(*predicted))
+            }),
+        }
     }
 
     /// The region `key` resides in.
     #[must_use]
     pub fn region_of(&self, key: StableKey) -> Option<RegionId> {
-        todo!()
+        let loc = self.storage.loc(self.origin(key)?)?;
+        Some(self.region_at(loc))
     }
 
     /// Component `T` of `key`, or `None` if the entity does not exist or lacks it.
     #[must_use]
     pub fn get<T: Component>(&self, key: StableKey) -> Option<&T> {
-        todo!()
+        let loc = self.storage.loc(self.origin(key)?)?;
+        self.storage.component(loc, T::KEY).map(typed)
     }
 
     /// Component `T` of `key` for writing, marking the row changed on a mutable
@@ -244,7 +513,20 @@ impl World {
     /// or one with an `EntityRef` field; those go through [`insert`](Self::insert).
     #[must_use]
     pub fn get_mut<T: Component>(&mut self, key: StableKey) -> Option<Mut<'_, T>> {
-        todo!()
+        assert!(
+            !refuses_mut(T::SCHEMA.info()),
+            "`{}` is maintained by the world or holds a reference: write it with `insert`",
+            T::SCHEMA.name()
+        );
+        let loc = self.storage.loc(self.origin(key)?)?;
+        let index = self.storage.archetypes[loc.archetype as usize].column_index(T::KEY)?;
+        let now = self.bump();
+        let archetype = &mut self.storage.archetypes[loc.archetype as usize];
+        let chunk = &mut archetype.chunks[loc.chunk as usize];
+        let tick = &mut chunk.column_ticks[index];
+        *tick = (*tick).max(now);
+        let row = chunk.row_view(&archetype.columns, index, loc.row as usize);
+        Some(Mut::new(row, now))
     }
 
     /// Spawns an entity with `key` in `region`, immediately. `key` is a `Net` or
@@ -255,41 +537,74 @@ impl World {
     /// origin keys: a bound `Net` key inside a reference field of `bundle` is rewritten to
     /// the target's origin key here, as at command apply and [`insert`](Self::insert).
     pub fn spawn<B: Bundle>(&mut self, key: StableKey, region: RegionId, bundle: B) -> Result<()> {
-        todo!()
+        if matches!(key, StableKey::Placeholder(_)) {
+            return Err(invalid("a placeholder names an entity only inside its command buffer"));
+        }
+        let key = self.canonical(key);
+        let mut components = erase_bundle(bundle);
+        if components.iter().any(|component| is_worlds_own(component.key())) {
+            return Err(invalid("`InRegion` and `PredictedOrigin` are written by the world only"));
+        }
+        for component in &mut components {
+            self.resolve_references(component, &[], Some(key));
+        }
+        let stamp = self.bump();
+        self.spawn_entity(key, region, components, stamp)
     }
 
     /// Despawns `key` and the entities it owns, immediately.
     pub fn despawn(&mut self, key: StableKey) -> Result<()> {
-        todo!()
+        let origin = self.origin(key).ok_or_else(|| not_found("no such entity"))?;
+        self.despawn_tree(origin);
+        Ok(())
     }
 
     /// Writes the whole component `value` to `key`, adding it if absent, immediately, and
     /// updates the relationship index. Panics for [`InRegion`](crate::InRegion) and
     /// [`PredictedOrigin`](crate::PredictedOrigin), which are the world's.
     pub fn insert<T: Component>(&mut self, key: StableKey, value: T) -> Result<()> {
-        todo!()
+        assert!(!is_worlds_own(T::KEY), "`{}` is written by the world only", T::SCHEMA.name());
+        let origin = self.origin(key).ok_or_else(|| not_found("no such entity"))?;
+        let mut component = ErasedComponent::of(value);
+        self.resolve_references(&mut component, &[], None);
+        let stamp = self.bump();
+        self.write_component(origin, component, stamp)
     }
 
     /// Removes component `T` from `key`, immediately, returning it; `None` if absent.
     /// Panics for the two components [`insert`](Self::insert) rejects.
     pub fn remove<T: Component>(&mut self, key: StableKey) -> Result<Option<T>> {
-        todo!()
+        assert!(!is_worlds_own(T::KEY), "`{}` is written by the world only", T::SCHEMA.name());
+        let origin = self.origin(key).ok_or_else(|| not_found("no such entity"))?;
+        Ok(self
+            .remove_component(origin, T::KEY)
+            .map(|bytes| bytemuck::checked::pod_read_unaligned(&bytes)))
     }
 
     /// Moves `key` and the entities it owns to `region`, immediately.
     pub fn move_to_region(&mut self, key: StableKey, region: RegionId) -> Result<()> {
-        todo!()
+        let origin = self.origin(key).ok_or_else(|| not_found("no such entity"))?;
+        if !self.regions.contains_key(&region) {
+            return Err(not_found("the region is not loaded"));
+        }
+        let stamp = self.bump();
+        self.move_tree(origin, region, stamp);
+        Ok(())
     }
 
     /// Allocates the next runtime `NetId` from the server counter.
     pub fn allocate_net_id(&mut self) -> Result<NetId> {
-        todo!()
+        let id = NetId::runtime(self.next_net_id).ok_or_else(|| {
+            Error::new(ErrorKind::ResourceExhausted, "the runtime NetId counter is exhausted")
+        })?;
+        self.next_net_id = self.next_net_id.saturating_add(1);
+        Ok(id)
     }
 
     /// The counter the next runtime `NetId` would be allocated from, for the save.
     #[must_use]
     pub fn next_net_id(&self) -> NonZeroU64 {
-        todo!()
+        self.next_net_id
     }
 
     /// Records that the server bound `net` to the predicted entity `predicted`
@@ -299,13 +614,22 @@ impl World {
     /// received after a snapshot is not lost to the rollback. Fails if `predicted` or `net`
     /// is already bound to something else.
     pub fn bind(&mut self, predicted: PredictionKey, net: NetId) -> Result<()> {
-        todo!()
+        let bound_net = self.aliases.by_predicted.get(&predicted);
+        let bound_predicted = self.aliases.by_net.get(&net);
+        if bound_net.is_some_and(|&bound| bound != net)
+            || bound_predicted.is_some_and(|&bound| bound != predicted)
+        {
+            return Err(invalid("one of the two keys is already bound to another"));
+        }
+        self.aliases.by_predicted.insert(predicted, net);
+        self.aliases.by_net.insert(net, predicted);
+        Ok(())
     }
 
     /// The `NetId` bound to `predicted`, if any.
     #[must_use]
     pub fn alias(&self, predicted: PredictionKey) -> Option<NetId> {
-        todo!()
+        self.aliases.by_predicted.get(&predicted).copied()
     }
 
     /// Sets the input tick of `player` for this tick: the tick slot the input being applied
@@ -315,19 +639,26 @@ impl World {
     /// client alike; the sync point clears every player's input tick first, so a claimed
     /// source whose player has none this tick spawns unpredicted and passes no claim on.
     pub fn set_input_tick(&mut self, player: PlayerId, input_tick: Tick) {
-        todo!()
+        self.input_ticks.insert(player, input_tick);
     }
 
     /// The input tick of `player` this tick, if set.
     #[must_use]
     pub fn input_tick(&self, player: PlayerId) -> Option<Tick> {
-        todo!()
+        self.input_ticks.get(&player).copied()
     }
 
     /// The entities residing in `region`, in ascending origin-key order.
     #[must_use]
     pub fn entities_in(&self, region: RegionId) -> Entities<'_> {
-        todo!()
+        let keys: Vec<StableKey> = self
+            .storage
+            .entities
+            .iter()
+            .filter(|&(_, &loc)| self.region_at(loc) == region)
+            .map(|(&key, _)| key)
+            .collect();
+        Entities { keys: keys.into_iter(), _world: PhantomData }
     }
 
     /// The entities whose components refer to `target` through an `EntityRef` field, in
@@ -336,20 +667,29 @@ impl World {
     /// snapshots.
     #[must_use]
     pub fn referrers(&self, target: StableKey) -> Referrers<'_> {
-        todo!()
+        let target = self.canonical(target);
+        let referrers: Vec<Referrer> = self
+            .references
+            .by_target
+            .get(&target)
+            .into_iter()
+            .flatten()
+            .map(|&(source, component, field)| Referrer { source, component, field })
+            .collect();
+        Referrers { referrers: referrers.into_iter(), _world: PhantomData }
     }
 
     /// The entities `owner` owns, in ascending origin-key order.
     #[must_use]
     pub fn owned_by(&self, owner: StableKey) -> Entities<'_> {
-        todo!()
+        Entities { keys: self.owned(self.canonical(owner)).into_iter(), _world: PhantomData }
     }
 
     /// A query over every entity matching `Q`. Panics if `Q` breaks the alias rule of
     /// [`QueryItems`], or names a `Mut` on a component [`get_mut`](Self::get_mut) rejects.
     #[must_use]
     pub fn query<Q: QueryItems>(&mut self) -> Query<'_, Q> {
-        todo!()
+        Query::new(self)
     }
 
     /// The RNG stream for `key` in `region` on behalf of `system`, as
@@ -358,94 +698,148 @@ impl World {
     /// systems and tests.
     #[must_use]
     pub fn rng(&self, region: RegionId, system: SystemKey, key: StableKey) -> Option<Rng> {
-        todo!()
+        let state = self.regions.get(&region)?;
+        Some(Rng::keyed(state.seed, self.tick, system, None, key))
     }
 
     // ---- Resources ----
 
     /// Inserts a reflected resource, returning the previous value.
     pub fn insert_resource<T: Resource>(&mut self, value: T) -> Option<T> {
-        todo!()
+        let entry = ResourceEntry {
+            value: Box::new(Box::new(value)),
+            clone: Some(clone_resource::<T>),
+            size: size_of::<T>(),
+        };
+        let previous = self.resources.insert(TypeId::of::<T>(), entry)?;
+        previous.value.downcast::<Box<T>>().ok().map(|value| **value)
     }
 
     /// A reflected resource.
     #[must_use]
     pub fn resource<T: Resource>(&self) -> Option<&T> {
-        todo!()
+        self.resources.get(&TypeId::of::<T>()).map(|entry| resource_ref(&*entry.value))
     }
 
     /// A reflected resource, for writing.
     #[must_use]
     pub fn resource_mut<T: Resource>(&mut self) -> Option<&mut T> {
-        todo!()
+        let entry = self.resources.get_mut(&TypeId::of::<T>())?;
+        let value: &mut Box<T> = entry.value.downcast_mut().expect("resources hold `Box<T>`");
+        Some(value)
     }
 
     /// Removes a reflected resource.
     pub fn remove_resource<T: Resource>(&mut self) -> Option<T> {
-        todo!()
+        let entry = self.resources.remove(&TypeId::of::<T>())?;
+        entry.value.downcast::<Box<T>>().ok().map(|value| **value)
     }
 
     /// Inserts a service resource: a `dyn` trait object from an `-api` crate that `app`
     /// provides (architecture section 4), read by systems as `Res<dyn Trait>` with exactly
     /// this `T`. Not reflected, hashed, saved or snapshotted.
-    #[allow(clippy::boxed_local, reason = "facade: the body is todo!()")]
     pub fn insert_service<T: ?Sized + Send + Sync + 'static>(
         &mut self,
         value: Box<T>,
     ) -> Option<Box<T>> {
-        todo!()
+        let entry = ResourceEntry { value: Box::new(value), clone: None, size: 0 };
+        let previous = self.resources.insert(TypeId::of::<T>(), entry)?;
+        previous.value.downcast::<Box<T>>().ok().map(|value| *value)
     }
 
     /// A service resource.
     #[must_use]
     pub fn service<T: ?Sized + 'static>(&self) -> Option<&T> {
-        todo!()
+        self.resources.get(&TypeId::of::<T>()).map(|entry| resource_ref(&*entry.value))
     }
 
     /// A service resource, for writing.
     #[must_use]
     pub fn service_mut<T: ?Sized + 'static>(&mut self) -> Option<&mut T> {
-        todo!()
+        let entry = self.resources.get_mut(&TypeId::of::<T>())?;
+        let value: &mut Box<T> = entry.value.downcast_mut().expect("resources hold `Box<T>`");
+        Some(&mut **value)
     }
 
     // ---- Regions ----
 
     /// Creates an empty region. Fails if the region exists.
     pub fn create_region(&mut self, config: RegionConfig) -> Result<()> {
-        todo!()
+        if self.regions.contains_key(&config.id) {
+            return Err(invalid("the region exists"));
+        }
+        self.regions.insert(
+            config.id,
+            RegionState {
+                seed: config.seed,
+                mode: config.mode,
+                resources: BTreeMap::new(),
+                assets: None,
+            },
+        );
+        Ok(())
     }
 
     /// Despawns every entity of `region`, drops its resources and forgets it. Export first
     /// to keep its state ([`export_region`](Self::export_region)).
     pub fn unload_region(&mut self, region: RegionId) -> Result<()> {
-        todo!()
+        if !self.regions.contains_key(&region) {
+            return Err(not_found("the region is not loaded"));
+        }
+        for key in self.entities_in(region).collect::<Vec<_>>() {
+            self.despawn_one(key);
+        }
+        self.regions.remove(&region);
+        Ok(())
     }
 
     /// What is known about `region`.
     #[must_use]
     pub fn region(&self, region: RegionId) -> Option<RegionInfo> {
-        todo!()
+        let state = self.regions.get(&region)?;
+        let entity_count =
+            self.storage.entities.values().filter(|&&loc| self.region_at(loc) == region).count();
+        Some(RegionInfo {
+            id: region,
+            seed: state.seed,
+            mode: state.mode,
+            entity_count: entity_count as u32,
+        })
     }
 
     /// The loaded regions, in ascending ID order.
     #[must_use]
     pub fn regions(&self) -> Regions<'_> {
-        todo!()
+        let ids: Vec<RegionId> = self.regions.keys().copied().collect();
+        Regions { ids: ids.into_iter(), _world: PhantomData }
     }
 
     /// Changes a region's mode (architecture section 6).
     pub fn set_region_mode(&mut self, region: RegionId, mode: RegionMode) -> Result<()> {
-        todo!()
+        let state = self.regions.get_mut(&region).ok_or_else(|| not_found("no such region"))?;
+        state.mode = mode;
+        Ok(())
     }
 
     /// Inserts a resource of `region`, returning the previous value. Region resources are
     /// hashed with the region, exported with it if persistent, and part of a snapshot.
+    /// Fails if the region is not loaded or `T` is not registered.
     pub fn insert_region_resource<T: Resource>(
         &mut self,
         region: RegionId,
         value: T,
     ) -> Result<Option<T>> {
-        todo!()
+        let info = self
+            .registry
+            .get_by_type(TypeId::of::<T>())
+            .ok_or_else(|| not_found(format!("`{}` is not registered", T::SCHEMA.name())))?;
+        let state = self.regions.get_mut(&region).ok_or_else(|| not_found("no such region"))?;
+        let resource =
+            RegionResource { info, bytes: AlignedBytes::from_bytes(bytemuck::bytes_of(&value)) };
+        Ok(state
+            .resources
+            .insert(T::KEY, resource)
+            .map(|previous| *typed::<T>(previous.bytes.as_bytes())))
     }
 
     /// Inserts a resource of `region` from its bytes, validated against the registry.
@@ -454,26 +848,48 @@ impl World {
         region: RegionId,
         value: ComponentData,
     ) -> Result<()> {
-        todo!()
+        let info = self
+            .registry
+            .get(value.component)
+            .ok_or_else(|| not_found("the resource is not registered"))?;
+        if info.role() != TypeRole::Resource {
+            return Err(invalid(format!("`{}` is not a resource", info.name())));
+        }
+        info.validate(&value.bytes)?;
+        let state = self.regions.get_mut(&region).ok_or_else(|| not_found("no such region"))?;
+        state.resources.insert(
+            value.component,
+            RegionResource { info, bytes: AlignedBytes::from_bytes(&value.bytes) },
+        );
+        Ok(())
     }
 
     /// A resource of `region`.
     #[must_use]
     pub fn region_resource<T: Resource>(&self, region: RegionId) -> Option<&T> {
-        todo!()
+        let resource = self.regions.get(&region)?.resources.get(&T::KEY)?;
+        Some(typed(resource.bytes.as_bytes()))
     }
 
     /// A resource of `region`, for writing.
     #[must_use]
     pub fn region_resource_mut<T: Resource>(&mut self, region: RegionId) -> Option<&mut T> {
-        todo!()
+        let resource = self.regions.get_mut(&region)?.resources.get_mut(&T::KEY)?;
+        Some(typed_mut(resource.bytes.as_bytes_mut()))
     }
 
     /// Every resource of `region` as bytes, in ascending key order, for the world hash and
     /// the export.
     #[must_use]
     pub fn region_resources_erased(&self, region: RegionId) -> ErasedResources<'_> {
-        todo!()
+        let resources: Vec<(ComponentKey, &[u8])> = self
+            .regions
+            .get(&region)
+            .into_iter()
+            .flat_map(|state| state.resources.iter())
+            .map(|(&key, resource)| (key, resource.bytes.as_bytes()))
+            .collect();
+        ErasedResources { resources: resources.into_iter() }
     }
 
     /// Gives `region` its exact-version assets, resolved outside the boundary and applied
@@ -483,13 +899,14 @@ impl World {
         region: RegionId,
         assets: PinnedTable,
     ) -> Result<Option<PinnedTable>> {
-        todo!()
+        let state = self.regions.get_mut(&region).ok_or_else(|| not_found("no such region"))?;
+        Ok(state.assets.replace(assets))
     }
 
     /// The exact-version assets of `region`, if a table has been set.
     #[must_use]
     pub fn region_assets(&self, region: RegionId) -> Option<&PinnedTable> {
-        todo!()
+        self.regions.get(&region)?.assets.as_ref()
     }
 
     // ---- Change tracking ----
@@ -498,50 +915,139 @@ impl World {
     /// is not a tracked column (replicated or extracted).
     #[must_use]
     pub fn changed_since<T: Component>(&self, mark: ChangeMark) -> Option<ChangedRows<'_, T>> {
-        todo!()
+        assert!(
+            is_tracked(T::SCHEMA.info()),
+            "`{}` is not tracked: only replicated or extracted columns carry row stamps",
+            T::SCHEMA.name()
+        );
+        if !self.is_current(mark) {
+            return None;
+        }
+        let since = mark.stamp();
+        let mut rows = Vec::new();
+        for (archetype, index) in self.archetypes_with(T::KEY) {
+            let columns = &self.storage.archetypes[archetype].columns;
+            for chunk in &self.storage.archetypes[archetype].chunks {
+                let stamps = chunk.stamps[index].as_ref().expect("a tracked column");
+                let values = typed_slice::<T>(chunk.column(&columns[index]), chunk.len());
+                for (row, value) in values.iter().enumerate() {
+                    if stamps.get(row) > since {
+                        rows.push((chunk.keys[row], value));
+                    }
+                }
+            }
+        }
+        Some(ChangedRows { rows: rows.into_iter() })
     }
 
     /// Every chunk's column of `T`, for passes that fork over chunks.
     #[must_use]
     pub fn columns<T: Component>(&self) -> Columns<'_, T> {
-        todo!()
+        let mut columns = Vec::new();
+        for (archetype, index) in self.archetypes_with(T::KEY) {
+            let arch = &self.storage.archetypes[archetype];
+            let region_index = arch.column_index(InRegion::KEY).expect("every row has a region");
+            for chunk in &arch.chunks {
+                columns.push(ColumnRef {
+                    keys: &chunk.keys,
+                    regions: typed_slice(chunk.column(&arch.columns[region_index]), chunk.len()),
+                    values: typed_slice(chunk.column(&arch.columns[index]), chunk.len()),
+                    row_ticks: chunk.stamps[index].as_ref().map(|s| &s.ticks[..chunk.len()]),
+                    column_tick: chunk.column_ticks[index].tick,
+                });
+            }
+        }
+        let columns = self.layout.order(columns, (self.tick.0.into(), T::KEY.0));
+        Columns { columns: columns.into_iter() }
     }
 
     /// Every chunk's column of `T`, for bulk writes that record what they changed. Panics
     /// for a component [`get_mut`](Self::get_mut) rejects.
     #[must_use]
     pub fn columns_mut<T: Component>(&mut self) -> ColumnsMut<'_, T> {
-        todo!()
+        assert!(
+            !refuses_mut(T::SCHEMA.info()),
+            "`{}` is maintained by the world or holds a reference: write it with `insert`",
+            T::SCHEMA.name()
+        );
+        let now = self.bump();
+        let order_salt = (self.tick.0.into(), T::KEY.0);
+        let mut columns = Vec::new();
+        for arch in &mut self.storage.archetypes {
+            let (Some(index), Some(region_index)) =
+                (arch.column_index(T::KEY), arch.column_index(InRegion::KEY))
+            else {
+                continue;
+            };
+            for chunk in &mut arch.chunks {
+                let len = chunk.len();
+                let views = chunk.split(&arch.columns);
+                let keys = views.keys;
+                let mut views: Vec<Option<_>> = views.columns.into_iter().map(Some).collect();
+                let region = views[region_index].take().expect("one view per column");
+                let regions = typed_slice::<RegionId>(region.bytes, len).to_vec();
+                let view = views[index].take().expect("one view per column");
+                columns.push(ColumnMut {
+                    keys,
+                    regions,
+                    values: crate::storage::typed_slice_mut(view.bytes, len),
+                    stamps: view.stamps,
+                    column_tick: view.column_tick,
+                    now,
+                });
+            }
+        }
+        let columns = self.layout.order(columns, order_salt);
+        ColumnsMut { columns: columns.into_iter() }
     }
 
     /// Every chunk's column of `component`, as bytes.
     #[must_use]
     pub fn columns_erased(&self, component: ComponentKey) -> ErasedColumns<'_> {
-        todo!()
+        let mut columns = Vec::new();
+        for (archetype, index) in self.archetypes_with(component) {
+            let arch = &self.storage.archetypes[archetype];
+            let region_index = arch.column_index(InRegion::KEY).expect("every row has a region");
+            for chunk in &arch.chunks {
+                columns.push(ErasedColumn {
+                    component,
+                    element_size: arch.columns[index].size,
+                    keys: &chunk.keys,
+                    regions: typed_slice(chunk.column(&arch.columns[region_index]), chunk.len()),
+                    bytes: chunk.column(&arch.columns[index]),
+                    row_ticks: chunk.stamps[index].as_ref().map(|s| &s.ticks[..chunk.len()]),
+                    column_tick: chunk.column_ticks[index].tick,
+                });
+            }
+        }
+        let columns = self.layout.order(columns, (self.tick.0.into(), component.0));
+        ErasedColumns { columns: columns.into_iter() }
     }
 
     /// The structural change log.
     #[must_use]
     pub fn structural_log(&self) -> &StructuralLog {
-        todo!()
+        &self.log
     }
 
     /// Drops log entries before `cursor`, the minimum over every consumer's cursor.
     pub fn trim_structural_log(&mut self, cursor: LogCursor) {
-        todo!()
+        self.log.trim(cursor);
     }
 
     // ---- Buffers consumed at sync points ----
 
     /// Takes the entries of channel `C` written this tick, in command order, keys resolved.
     pub fn take_channel<C: CommandChannel>(&mut self) -> Vec<ChannelEntry<C>> {
-        todo!()
+        self.channels.remove(&TypeId::of::<C>()).map_or_else(Vec::new, |entries| {
+            *entries.downcast::<Vec<ChannelEntry<C>>>().expect("the entries of this channel")
+        })
     }
 
     /// Takes the presentation events delivered since the last call, and the cancellations
     /// (architecture section 9.4).
     pub fn take_present_events(&mut self) -> PresentEventBatch {
-        todo!()
+        self.present.take()
     }
 
     // ---- Snapshots ----
@@ -549,7 +1055,8 @@ impl World {
     /// Copies the rollback state (architecture section 10). Taken between ticks only.
     #[must_use]
     pub fn snapshot(&self) -> WorldSnapshot {
-        todo!()
+        debug_assert!(!self.in_run, "a snapshot is taken between ticks");
+        WorldSnapshot::take(self)
     }
 
     /// Replaces the rollback state with `snapshot`, taken from this world: the tick returns
@@ -558,9 +1065,13 @@ impl World {
     /// the set of loaded regions is the snapshot's, the structural log is cleared and a
     /// new epoch starts, so every consumer does a full pass. The alias table and the
     /// delivered presentation-event keys are kept; emissions after the snapshot that were
-    /// never taken are dropped. Fails if the snapshot is from another world.
+    /// never taken are dropped. Fails if the snapshot is from another world, or during a
+    /// schedule run.
     pub fn restore(&mut self, snapshot: &WorldSnapshot) -> Result<()> {
-        todo!()
+        if self.in_run {
+            return Err(invalid("a restore happens between ticks, not during a run"));
+        }
+        snapshot.restore_into(self)
     }
 
     /// Tells the world the oldest tick a restore can return to, so it can prune the
@@ -568,7 +1079,21 @@ impl World {
     /// before it. `lactose-predict` calls it with the ring's oldest tick; the server, which
     /// never rolls back, with the current tick.
     pub fn set_rollback_horizon(&mut self, oldest: Tick) {
-        todo!()
+        self.present.prune(oldest);
+        let gone: Vec<PredictionKey> = self
+            .despawned_predicted
+            .iter()
+            .filter(|&(_, &tick)| tick < oldest)
+            .map(|(&key, _)| key)
+            .collect();
+        for key in gone {
+            self.despawned_predicted.remove(&key);
+            if !self.storage.entities.contains_key(&StableKey::Predicted(key))
+                && let Some(net) = self.aliases.by_predicted.remove(&key)
+            {
+                self.aliases.by_net.remove(&net);
+            }
+        }
     }
 
     // ---- Bulk copy ----
@@ -592,7 +1117,7 @@ impl World {
         baseline: &Baseline,
         overlay: Option<&Overlay>,
     ) -> Result<()> {
-        todo!()
+        crate::bulk::load_region(self, region, baseline, overlay)
     }
 
     /// Copies the state of `region` out: every persistent component of every entity in
@@ -601,12 +1126,317 @@ impl World {
     /// is an error: the server binds every entity before a save, and a client never
     /// exports.
     pub fn export_region(&self, region: RegionId) -> Result<RegionRows> {
-        todo!()
+        crate::bulk::export_region(self, region)
+    }
+}
+
+// The world's own operations, shared by the direct methods, command apply and bulk copy.
+impl World {
+    /// The next direct-write stamp: a position after every one used so far in this slot.
+    pub(crate) fn bump(&mut self) -> Stamp {
+        self.point = self.point.saturating_add(1).min(self.point_cap);
+        Stamp::new(self.tick, self.point)
+    }
+
+    /// Starts a new epoch: every mark and cursor goes stale, and the log is emptied.
+    pub(crate) fn new_epoch(&mut self) {
+        self.epoch = self.epoch.wrapping_add(1);
+        self.log.reset(self.epoch);
+    }
+
+    /// Advances the tick for a run, clamping stamps forward at every 2^30 ticks.
+    pub(crate) fn advance_tick(&mut self) {
+        self.tick = Tick(self.tick.0.wrapping_add(1));
+        self.point = 0;
+        self.point_cap = 0;
+        if self.tick.0.is_multiple_of(REBASE_TICKS) && self.tick.0 != 0 {
+            let floor = Stamp::new(Tick(self.tick.0 - REBASE_TICKS), 0);
+            for arch in &mut self.storage.archetypes {
+                for chunk in &mut arch.chunks {
+                    for tick in &mut chunk.column_ticks {
+                        *tick = (*tick).max(floor);
+                    }
+                    for stamps in chunk.stamps.iter_mut().flatten() {
+                        for (tick, position) in stamps.ticks.iter_mut().zip(&mut stamps.positions) {
+                            if Stamp::new(*tick, *position) < floor {
+                                (*tick, *position) = (floor.tick, floor.position);
+                            }
+                        }
+                    }
+                }
+            }
+            self.new_epoch();
+        }
+    }
+
+    /// The key that names `key`'s entity in storage, whether or not it is live: the
+    /// `Predicted` key behind a bound `Net` key whose own entity does not exist.
+    pub(crate) fn canonical(&self, key: StableKey) -> StableKey {
+        if let StableKey::Net(net) = key
+            && !self.storage.entities.contains_key(&key)
+            && let Some(&predicted) = self.aliases.by_net.get(&net)
+        {
+            return StableKey::Predicted(predicted);
+        }
+        key
+    }
+
+    /// The `Net` key that also names the predicted entity `origin`, if bound.
+    pub(crate) fn net_alias(&self, origin: StableKey) -> Option<StableKey> {
+        match origin {
+            StableKey::Predicted(predicted) => {
+                self.aliases.by_predicted.get(&predicted).map(|&net| StableKey::Net(net))
+            }
+            _ => None,
+        }
+    }
+
+    pub(crate) fn region_at(&self, loc: Loc) -> RegionId {
+        let bytes = self.storage.component(loc, InRegion::KEY).expect("every row has a region");
+        typed::<InRegion>(bytes).region
+    }
+
+    /// Every archetype that has `component`, with the column's index.
+    pub(crate) fn archetypes_with(&self, component: ComponentKey) -> Vec<(usize, usize)> {
+        self.storage
+            .archetypes
+            .iter()
+            .enumerate()
+            .filter_map(|(archetype, arch)| Some((archetype, arch.column_index(component)?)))
+            .collect()
+    }
+
+    /// The live entities `owner` owns, ascending.
+    pub(crate) fn owned(&self, owner: StableKey) -> Vec<StableKey> {
+        let mut owned: Vec<StableKey> = self
+            .references
+            .by_target
+            .get(&owner)
+            .into_iter()
+            .flatten()
+            .filter(|&&(source, component, _)| {
+                component == OwnedBy::KEY && self.storage.entities.contains_key(&source)
+            })
+            .map(|&(source, _, _)| source)
+            .collect();
+        owned.dedup();
+        owned
+    }
+
+    /// `root` and every entity it owns, directly or through owned entities, each once:
+    /// `root` first, then breadth first in ascending key order.
+    fn ownership_tree(&self, root: StableKey) -> Vec<StableKey> {
+        let mut seen = BTreeSet::from([root]);
+        let mut order = vec![root];
+        let mut queue = VecDeque::from([root]);
+        while let Some(owner) = queue.pop_front() {
+            for owned in self.owned(owner) {
+                if seen.insert(owned) {
+                    order.push(owned);
+                    queue.push_back(owned);
+                }
+            }
+        }
+        order
+    }
+
+    /// Rewrites the references of `component` to origin keys: a placeholder through
+    /// `placeholders`, a bound `Net` key to the predicted origin, and a reference to an
+    /// entity that does not exist (other than `spawning`) to the empty reference.
+    pub(crate) fn resolve_references(
+        &self,
+        component: &mut ErasedComponent,
+        placeholders: &[Option<StableKey>],
+        spawning: Option<StableKey>,
+    ) {
+        let Some(remap) = component.remap else { return };
+        remap(&mut component.bytes, &mut |reference: &mut EntityRef| {
+            let Some(key) = reference.get() else { return };
+            let resolved = match key {
+                StableKey::Placeholder(index) => {
+                    placeholders.get(index as usize).copied().flatten().filter(|&key| {
+                        Some(key) == spawning || self.storage.entities.contains_key(&key)
+                    })
+                }
+                key => {
+                    let key = self.canonical(key);
+                    (Some(key) == spawning || self.storage.entities.contains_key(&key))
+                        .then_some(key)
+                }
+            };
+            if resolved.is_none() {
+                tracing::debug!(target: "casein", ?key, "a reference to a missing entity is written empty");
+            }
+            *reference = EntityRef::from(resolved);
+        });
+    }
+
+    fn index_references(&mut self, source: StableKey, info: &TypeInfo, bytes: &[u8], add: bool) {
+        for (field, target) in entity_refs(info, bytes) {
+            let entry = (source, info.key(), field);
+            if add {
+                self.references.by_target.entry(target).or_default().insert(entry);
+            } else if let Some(set) = self.references.by_target.get_mut(&target) {
+                set.remove(&entry);
+                if set.is_empty() {
+                    self.references.by_target.remove(&target);
+                }
+            }
+        }
+    }
+
+    /// Spawns `key` in `region` with `components`, whose references are already resolved.
+    /// Adds `InRegion`, and `PredictedOrigin` for a `Predicted` key that lacks it.
+    pub(crate) fn spawn_entity(
+        &mut self,
+        key: StableKey,
+        region: RegionId,
+        mut components: Vec<ErasedComponent>,
+        stamp: Stamp,
+    ) -> Result<()> {
+        if !self.regions.contains_key(&region) {
+            return Err(not_found("the region is not loaded"));
+        }
+        match key {
+            StableKey::Placeholder(_) => {
+                return Err(invalid("a placeholder names an entity only inside its buffer"));
+            }
+            key if self.storage.entities.contains_key(&key) => {
+                return Err(invalid(format!("{key:?} is already live")));
+            }
+            _ => {}
+        }
+        components.push(ErasedComponent::of(InRegion { region }));
+        if let StableKey::Predicted(predicted) = key
+            && !components.iter().any(|component| component.key() == PredictedOrigin::KEY)
+        {
+            components.push(ErasedComponent::of(PredictedOrigin {
+                player: predicted.player,
+                input_tick: predicted.input_tick,
+                ordinal: predicted.ordinal,
+            }));
+        }
+        components.sort_by_key(ErasedComponent::key);
+        let mut values = Vec::with_capacity(components.len());
+        for (index, component) in components.iter().enumerate() {
+            if index > 0 && components[index - 1].key() == component.key() {
+                return Err(invalid(format!("`{}` is in the bundle twice", component.info.name())));
+            }
+            let info = self.registry.get(component.key()).ok_or_else(|| {
+                not_found(format!("`{}` is not registered", component.info.name()))
+            })?;
+            info.validate(&component.bytes)?;
+            values.push(RowValue {
+                info,
+                bytes: component.bytes.clone(),
+                stamp,
+                column_tick: stamp,
+            });
+        }
+        let infos: Vec<&'static TypeInfo> = values.iter().map(|value| value.info).collect();
+        let archetype = self.storage.archetype(&infos);
+        self.storage.push(archetype, key, &values);
+        for value in &values {
+            self.index_references(key, value.info, &value.bytes, true);
+        }
+        self.log.push(self.tick, StructuralChange::Spawned { key, region });
+        if let StableKey::Predicted(predicted) = key {
+            self.despawned_predicted.remove(&predicted);
+        }
+        Ok(())
+    }
+
+    /// Writes a whole component of the live entity `key`, adding it if absent.
+    pub(crate) fn write_component(
+        &mut self,
+        key: StableKey,
+        component: ErasedComponent,
+        stamp: Stamp,
+    ) -> Result<()> {
+        let info = self
+            .registry
+            .get(component.key())
+            .ok_or_else(|| not_found(format!("`{}` is not registered", component.info.name())))?;
+        info.validate(&component.bytes)?;
+        let loc = self.storage.loc(key).ok_or_else(|| not_found("no such entity"))?;
+        if let Some(old) = self.storage.component(loc, info.key()) {
+            let old = old.to_vec();
+            self.index_references(key, info, &old, false);
+            self.storage.write(loc, info.key(), &component.bytes, stamp);
+        } else {
+            let (_, mut values) = self.storage.take(key).expect("the entity is live");
+            values.push(RowValue {
+                info,
+                bytes: component.bytes.clone(),
+                stamp,
+                column_tick: stamp,
+            });
+            values.sort_by_key(|value| value.info.key());
+            let infos: Vec<&'static TypeInfo> = values.iter().map(|value| value.info).collect();
+            let archetype = self.storage.archetype(&infos);
+            self.storage.push(archetype, key, &values);
+            self.log.push(self.tick, StructuralChange::Added { key, component: info.key() });
+        }
+        self.index_references(key, info, &component.bytes, true);
+        Ok(())
+    }
+
+    /// Removes a component of the live entity `key`, returning its bytes if it had it.
+    pub(crate) fn remove_component(
+        &mut self,
+        key: StableKey,
+        component: ComponentKey,
+    ) -> Option<Vec<u8>> {
+        let loc = self.storage.loc(key)?;
+        self.storage.component(loc, component)?;
+        let (_, mut values) = self.storage.take(key).expect("the entity is live");
+        let index = values.iter().position(|value| value.info.key() == component)?;
+        let removed = values.remove(index);
+        let infos: Vec<&'static TypeInfo> = values.iter().map(|value| value.info).collect();
+        let archetype = self.storage.archetype(&infos);
+        self.storage.push(archetype, key, &values);
+        self.index_references(key, removed.info, &removed.bytes, false);
+        self.log.push(self.tick, StructuralChange::Removed { key, component });
+        Some(removed.bytes)
+    }
+
+    /// Despawns the live entity `root` and everything it owns.
+    pub(crate) fn despawn_tree(&mut self, root: StableKey) {
+        for key in self.ownership_tree(root) {
+            self.despawn_one(key);
+        }
+    }
+
+    fn despawn_one(&mut self, key: StableKey) {
+        let Some(loc) = self.storage.loc(key) else { return };
+        let region = self.region_at(loc);
+        let (_, values) = self.storage.take(key).expect("the entity is live");
+        for value in &values {
+            self.index_references(key, value.info, &value.bytes, false);
+        }
+        self.log.push(self.tick, StructuralChange::Despawned { key, region });
+        if let StableKey::Predicted(predicted) = key {
+            self.despawned_predicted.insert(predicted, self.tick);
+        }
+    }
+
+    /// Moves the live entity `root` and everything it owns to the loaded `region`.
+    pub(crate) fn move_tree(&mut self, root: StableKey, region: RegionId, stamp: Stamp) {
+        for key in self.ownership_tree(root) {
+            let loc = self.storage.loc(key).expect("the tree holds live entities");
+            let from = self.region_at(loc);
+            if from != region {
+                let bytes = bytemuck::bytes_of(&InRegion { region }).to_vec();
+                self.storage.write(loc, InRegion::KEY, &bytes, stamp);
+                self.log.push(self.tick, StructuralChange::Moved { key, from, to: region });
+            }
+        }
     }
 }
 
 /// Iterates entities by origin key.
 pub struct Entities<'w> {
+    keys: std::vec::IntoIter<StableKey>,
     _world: PhantomData<&'w ()>,
 }
 
@@ -614,12 +1444,13 @@ impl Iterator for Entities<'_> {
     type Item = StableKey;
 
     fn next(&mut self) -> Option<Self::Item> {
-        todo!()
+        self.keys.next()
     }
 }
 
 /// Iterates loaded regions.
 pub struct Regions<'w> {
+    ids: std::vec::IntoIter<RegionId>,
     _world: PhantomData<&'w ()>,
 }
 
@@ -627,7 +1458,7 @@ impl Iterator for Regions<'_> {
     type Item = RegionId;
 
     fn next(&mut self) -> Option<Self::Item> {
-        todo!()
+        self.ids.next()
     }
 }
 
@@ -644,6 +1475,7 @@ pub struct Referrer {
 
 /// Iterates the references to one entity.
 pub struct Referrers<'w> {
+    referrers: std::vec::IntoIter<Referrer>,
     _world: PhantomData<&'w ()>,
 }
 
@@ -651,19 +1483,19 @@ impl Iterator for Referrers<'_> {
     type Item = Referrer;
 
     fn next(&mut self) -> Option<Self::Item> {
-        todo!()
+        self.referrers.next()
     }
 }
 
 /// Iterates resources as bytes, in ascending key order.
 pub struct ErasedResources<'w> {
-    _world: PhantomData<&'w ()>,
+    resources: std::vec::IntoIter<(ComponentKey, &'w [u8])>,
 }
 
 impl<'w> Iterator for ErasedResources<'w> {
     type Item = (ComponentKey, &'w [u8]);
 
     fn next(&mut self) -> Option<Self::Item> {
-        todo!()
+        self.resources.next()
     }
 }

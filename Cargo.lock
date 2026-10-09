@@ -184,6 +184,7 @@ dependencies = [
  "lactose-math",
  "lactose-reflect",
  "lactose-task",
+ "tracing",
 ]
 
 [[package]]
@@ -200,6 +201,8 @@ name = "lactose-math"
 version = "0.0.0"
 dependencies = [
  "bytemuck",
+ "lactose-core",
+ "lactose-reflect",
  "libm",
 ]
 

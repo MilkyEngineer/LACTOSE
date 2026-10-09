@@ -17,6 +17,8 @@ lactose-math.workspace = true
 lactose-reflect.workspace = true
 # Execution only (architecture section 8.2): every result is order-independent.
 lactose-task.workspace = true
+# Dropped commands and spans at target `casein` (architecture sections 3 and 19).
+tracing.workspace = true
 # Types only: the exact-version asset table a region holds.
 lactose-asset-api.workspace = true
 
