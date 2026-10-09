@@ -391,7 +391,7 @@ pub const OTHER_REGION: RegionId = RegionId(20);
 pub const PLAYER: PlayerId = PlayerId(3);
 
 /// Every type above, and the world's own.
-pub fn registry() -> Arc<Registry> {
+pub fn base_registry() -> Registry {
     let mut registry = Registry::new();
     registry.register::<InRegion>().unwrap();
     registry.register::<OwnedBy>().unwrap();
@@ -415,13 +415,46 @@ pub fn registry() -> Arc<Registry> {
     registry.register::<ImpulseCount>().unwrap();
     registry.register::<Weather>().unwrap();
     registry.register::<RegionScratch>().unwrap();
-    Arc::new(registry)
+    registry
+}
+
+/// The document schema of every component of `registry`, as `lactose-persist` writes it.
+pub fn schemas(registry: &Registry) -> Vec<lactose_bundle::ComponentSchema> {
+    registry
+        .iter()
+        .map(|info| {
+            let fields = info.layout().fields().iter().filter_map(|field| {
+                Some(lactose_bundle::FieldLayout {
+                    id: field.id()?,
+                    offset: field.offset() as u32,
+                    size: field.size() as u32,
+                })
+            });
+            lactose_bundle::ComponentSchema::new(
+                info.key(),
+                info.version(),
+                info.layout().size() as u32,
+                fields,
+            )
+            .unwrap()
+        })
+        .collect()
+}
+
+/// The registry of every type above.
+pub fn registry() -> Arc<Registry> {
+    Arc::new(base_registry())
 }
 
 /// A world of `kind` with `layout`, one simulated region and the resources the systems
 /// above read.
 pub fn world(kind: WorldKind, layout: LayoutConfig) -> World {
-    let mut world = WorldBuilder::new(kind, registry()).layout(layout).build().unwrap();
+    world_with(kind, layout, registry())
+}
+
+/// [`world`] with another registry.
+pub fn world_with(kind: WorldKind, layout: LayoutConfig, registry: Arc<Registry>) -> World {
+    let mut world = WorldBuilder::new(kind, registry).layout(layout).build().unwrap();
     world
         .create_region(RegionConfig { id: REGION, seed: 0x5EED, mode: RegionMode::Simulated })
         .unwrap();
