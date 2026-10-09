@@ -83,7 +83,11 @@ const STEAL_SAMPLES: usize = 400_000;
 /// Thresholds from `crates/task/README.md`.
 const RATIO_P50_LIMIT: f64 = 1.25;
 const RATIO_P99_LIMIT: f64 = 1.5;
-const WAKE_P99_LIMIT_NANOS: f64 = 20_000.0;
+/// A push from an idle pool. The floor on macOS is not the executor but the cores leaving
+/// their deep idle state, which a spike measured at 24 to 29 µs P99 with every wait
+/// primitive; 35 µs leaves room for the executor's own part. The start of a tick, below,
+/// keeps 20 µs: the keeper is awake and spinning when the deadline comes.
+const WAKE_P99_LIMIT_NANOS: f64 = 35_000.0;
 const TIMER_P99_LIMIT_NANOS: f64 = 20_000.0;
 const TICK: Duration = Duration::from_micros(16_667);
 const STEAL_LIMIT_NANOS: f64 = 1_000.0;
