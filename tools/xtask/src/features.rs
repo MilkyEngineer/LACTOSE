@@ -23,7 +23,9 @@
 //! a test build compiles them and they take part in feature resolution.
 //!
 //! Two readings keep the comparison to what compiles differently. A `default` feature whose
-//! every feature is on anyway is dropped from the list before comparing ([`fold_defaults`]).
+//! every feature is on anyway is dropped from the list before comparing ([`fold_defaults`]),
+//! which holds only while no boundary package reads `default` itself; [`default_readers`]
+//! checks that.
 //! Between harness trees, a host package both hold at a common version is compared at the
 //! versions both hold, so a proc macro's own `syn` 2 beside the workspace's `syn` 3 is not a
 //! split; a target package is compared at all its versions.
@@ -165,9 +167,14 @@ pub fn boundary_tree(
 }
 
 /// Drops `default` from every feature list that already holds each feature `default` turns
-/// on, so `[default, std]` and `[std]` compare equal when `default = ["std"]`: the feature
-/// adds nothing to that build. A `default` that turns on a dependency (`dep:` or `/`), or a
-/// package with no entry in `defaults`, is kept.
+/// on, so `[default, std]` and `[std]` compare equal when `default = ["std"]` (or
+/// `default = []`): the feature adds nothing to that build. A `default` that turns on a
+/// dependency (`dep:` or `/`), or a package with no entry in `defaults`, is kept.
+///
+/// That holds only if the package's code never tests `default` itself, through
+/// `cfg(feature = "default")` or a build script's `CARGO_FEATURE_DEFAULT`: then the
+/// feature changes the build whatever it turns on. `cargo xtask features` fails on any
+/// boundary package whose sources do ([`default_readers`]).
 #[must_use]
 pub fn fold_defaults(tree: BoundaryTree, defaults: &BTreeMap<String, Vec<String>>) -> BoundaryTree {
     tree.into_iter()
@@ -197,6 +204,69 @@ pub fn fold_defaults(tree: BoundaryTree, defaults: &BTreeMap<String, Vec<String>
             ((package, built), folded)
         })
         .collect()
+}
+
+/// The packages among `packages` (`name vX.Y.Z`) whose Rust sources test their `default`
+/// feature, as a `feature = "default"` cfg (any spacing) or the `CARGO_FEATURE_DEFAULT`
+/// variable, one finding per file: [`fold_defaults`] would hide a difference those
+/// packages compile. `dirs` holds each package's directory; every `.rs` file below it is
+/// read, build output and version control aside. A package without a directory is
+/// skipped. A file under `root` is reported relative to it, any other by its full path.
+///
+/// # Errors
+/// If a directory or a file cannot be read.
+pub fn default_readers(
+    root: &Path,
+    packages: &BTreeSet<String>,
+    dirs: &BTreeMap<String, String>,
+) -> Result<Vec<Finding>, String> {
+    let mut findings = Vec::new();
+    for package in packages {
+        let Some(dir) = dirs.get(package) else { continue };
+        let mut files = Vec::new();
+        rust_files(Path::new(dir), &mut files)?;
+        for file in files {
+            let text = std::fs::read(&file).map_err(|e| format!("{}: {e}", file.display()))?;
+            if reads_default(&String::from_utf8_lossy(&text)) {
+                let path = file.strip_prefix(root).unwrap_or(&file);
+                findings.push(Finding::new(
+                    path.to_string_lossy().replace('\\', "/"),
+                    format!(
+                        "`{package}` is in the determinism boundary and tests its own `default` \
+                         feature, so folding `default` (architecture section 8.3) could hide \
+                         a difference in what it compiles"
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(findings)
+}
+
+/// Whether Rust source `text` tests the `default` feature.
+fn reads_default(text: &str) -> bool {
+    let squeezed: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+    squeezed.contains("feature=\"default\"") || squeezed.contains("CARGO_FEATURE_DEFAULT")
+}
+
+/// Every `.rs` file below `dir`, sorted, outside `target` and `.git`.
+fn rust_files(dir: &Path, files: &mut Vec<std::path::PathBuf>) -> Result<(), String> {
+    let mut entries = std::fs::read_dir(dir)
+        .map_err(|e| format!("{}: {e}", dir.display()))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("{}: {e}", dir.display()))?;
+    entries.sort_by_key(std::fs::DirEntry::file_name);
+    for entry in entries {
+        let path = entry.path();
+        let kind = entry.file_type().map_err(|e| format!("{}: {e}", path.display()))?;
+        let name = entry.file_name();
+        if kind.is_dir() && name != "target" && name != ".git" {
+            rust_files(&path, files)?;
+        } else if kind.is_file() && path.extension().is_some_and(|e| e == "rs") {
+            files.push(path);
+        }
+    }
+    Ok(())
 }
 
 /// One root of the comparison: the path to report against (the root package's manifest),
@@ -485,6 +555,44 @@ lactose-physics-api v0.0.0 (/ws/crates/physics-api)|
             let fold = |root: Root| Root { tree: fold_defaults(root.tree, &defaults), ..root };
             assert_eq!(compare("t", &harness(SIM, &physics).map(fold)).len(), 1);
         }
+    }
+
+    #[test]
+    fn a_boundary_package_that_tests_its_default_feature_is_reported() {
+        for (text, reads) in [
+            ("#[cfg(feature = \"default\")]\nfn f() {}", true),
+            ("#[cfg(all(feature=\"default\", unix))]", true),
+            ("#[cfg(feature =\n    \"default\")]", true),
+            ("let on = std::env::var_os(\"CARGO_FEATURE_DEFAULT\");", true),
+            ("#[cfg(feature = \"std\")]\n// the default build", false),
+        ] {
+            assert_eq!(reads_default(text), reads, "{text}");
+        }
+        let root =
+            std::env::temp_dir().join(format!("lactose-xtask-defaults-{}", std::process::id()));
+        let write = |relative: &str, text: &str| {
+            let path = root.join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        };
+        write("reads/src/lib.rs", "pub fn f() {}");
+        write("reads/build.rs", "fn main() { let _ = option_env!(\"CARGO_FEATURE_DEFAULT\"); }");
+        write("reads/target/debug/out.rs", "#[cfg(feature = \"default\")]");
+        write("clean/src/lib.rs", "#[cfg(feature = \"std\")] pub fn f() {}");
+        let dir = |name: &str| root.join(name).to_string_lossy().into_owned();
+        let dirs = BTreeMap::from([
+            ("reads v1.0.0".to_owned(), dir("reads")),
+            ("clean v1.0.0".to_owned(), dir("clean")),
+        ]);
+        let packages: BTreeSet<String> =
+            ["reads v1.0.0", "clean v1.0.0", "elsewhere v1.0.0"].map(str::to_owned).into();
+        let findings = default_readers(&root, &packages, &dirs);
+        std::fs::remove_dir_all(&root).unwrap();
+        let findings = findings.unwrap();
+        // The build script only: output under `target` is not a source.
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        assert_eq!(findings[0].path, "reads/build.rs");
+        assert!(findings[0].message.contains("`reads v1.0.0`"));
     }
 
     #[test]

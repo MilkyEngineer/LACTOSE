@@ -40,7 +40,7 @@ fn load() -> String {
 #[test]
 fn snapshot_size_and_time_for_fifty_bodies_beside_fixed_colliders() {
     println!("{}", load());
-    for statics in [0_u64, 100, 1_000] {
+    for statics in [0_u64, 10, 25, 50, 75, 100, 1_000] {
         let mut b = backend(1);
         create(&mut *b, key(1), None, Some(floor()), Transform::IDENTITY);
         for i in 0..50 {

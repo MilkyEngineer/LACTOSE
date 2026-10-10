@@ -102,6 +102,8 @@ pub struct Workspace {
     /// What the `default` feature of each package in the metadata turns on, keyed as
     /// `cargo tree` prints the package (`name vX.Y.Z`); absent for a package without one.
     pub defaults: BTreeMap<String, Vec<String>>,
+    /// The directory holding each package's manifest, keyed as `defaults` is.
+    pub dirs: BTreeMap<String, String>,
 }
 
 impl Workspace {
@@ -381,10 +383,18 @@ pub fn parse_metadata(json: &str) -> Result<Metadata, String> {
         .filter_map(|p| Some((format!("{} v{}", p.name, p.version), p.features.get("default")?)))
         .map(|(package, default)| (package, default.clone()))
         .collect();
+    let dirs = raw
+        .packages
+        .iter()
+        .map(|p| {
+            let dir = p.manifest_path.strip_suffix("Cargo.toml").unwrap_or(&p.manifest_path);
+            (format!("{} v{}", p.name, p.version), dir.trim_end_matches(['/', '\\']).to_owned())
+        })
+        .collect();
     Ok(Metadata {
         root: raw.workspace_root,
         target_dir: raw.target_directory,
-        workspace: Workspace { packages, resolved, defaults },
+        workspace: Workspace { packages, resolved, defaults, dirs },
     })
 }
 
@@ -490,7 +500,12 @@ pub(crate) mod fixture {
                 ResolvedPackage { name: name.to_owned(), member: false, deps },
             );
         }
-        Workspace { packages, resolved, defaults: std::collections::BTreeMap::new() }
+        Workspace {
+            packages,
+            resolved,
+            defaults: std::collections::BTreeMap::new(),
+            dirs: std::collections::BTreeMap::new(),
+        }
     }
 
     pub(crate) fn workspace(packages: Vec<Package>) -> Workspace {

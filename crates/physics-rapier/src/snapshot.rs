@@ -189,12 +189,34 @@ pub(crate) fn write(backend: &Rapier, out: &mut Vec<u8>) -> Result<()> {
         multibody_joints: &world.multibody_joints,
         soft_bodies: &world.soft_bodies,
     };
-    let bytes =
-        postcard::to_allocvec(&image).map_err(|_| invalid("the physics world did not encode"))?;
-    out.reserve(TAG.len() + bytes.len());
+    let start = out.len();
     out.extend_from_slice(TAG);
-    out.extend_from_slice(&bytes);
+    if postcard::serialize_with_flavor(&image, Append(out)).is_err() {
+        out.truncate(start);
+        return Err(invalid("the physics world did not encode"));
+    }
     Ok(())
+}
+
+/// A postcard output that appends to the caller's vector, so the bytes are written once.
+struct Append<'a>(&'a mut Vec<u8>);
+
+impl postcard::ser_flavors::Flavor for Append<'_> {
+    type Output = ();
+
+    fn try_extend(&mut self, data: &[u8]) -> postcard::Result<()> {
+        self.0.extend_from_slice(data);
+        Ok(())
+    }
+
+    fn try_push(&mut self, data: u8) -> postcard::Result<()> {
+        self.0.push(data);
+        Ok(())
+    }
+
+    fn finalize(self) -> postcard::Result<()> {
+        Ok(())
+    }
 }
 
 /// The world and bookkeeping `bytes` hold, checked against each other, with a fresh
