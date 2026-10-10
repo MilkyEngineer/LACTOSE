@@ -713,12 +713,8 @@ impl Schedule {
             return Err(ScheduleError::WrongWorld { schedule: plan.kind, world: world.kind() });
         }
         let identity = Arc::downgrade(&world.identity);
-        match &self.world {
-            Some(served) if !Weak::ptr_eq(served, &identity) => {
-                return Err(ScheduleError::WrongWorld { schedule: plan.kind, world: world.kind() });
-            }
-            Some(_) => {}
-            None => self.world = Some(identity),
+        if self.world.as_ref().is_some_and(|served| !Weak::ptr_eq(served, &identity)) {
+            return Err(ScheduleError::WrongWorld { schedule: plan.kind, world: world.kind() });
         }
         let registry = world.registry();
         let components = |index: usize| {
@@ -769,11 +765,19 @@ impl Schedule {
                 {
                     continue;
                 }
-                // A declared writer has `Mut` on the column or declares it in `writes`.
+                // A declared writer has `Mut` on the column, or declares it in `writes`: an
+                // exclusive system writes it at its own sync point, before the stage's other
+                // systems; any other system's commands apply at the next sync point, so they
+                // are visible from the next stage only.
                 let written_before = (0..plan.order.len()).any(|writer| {
                     plan.before(writer, reader)
-                        && components(writer)
-                            .any(|(kind, key)| key == component && writes_column(kind))
+                        && components(writer).any(|(kind, key)| {
+                            key == component
+                                && (is_write(kind)
+                                    || (kind == AccessKind::Writes
+                                        && (plan.stage_of[writer] < plan.stage_of[reader]
+                                            || plan.kinds[writer] == SystemKind::Exclusive)))
+                        })
                 });
                 if !written_before {
                     return Err(ScheduleError::TransientBeforeWriter {
@@ -795,6 +799,8 @@ impl Schedule {
                 }
             }
         }
+        // Tied only once every check has passed, so a failed prepare ties nothing.
+        self.world.get_or_insert(identity);
         Ok(())
     }
 
@@ -1003,8 +1009,10 @@ pub enum ScheduleError {
         component: ComponentKey,
     },
     /// A reader of a transient column is not ordered after a declared writer of it in the
-    /// tick: a system with `Mut` on the column, or one that names it in `writes = [..]`
-    /// because it writes it through `Commands` or `&mut World`.
+    /// tick: a system with `Mut` on the column; an exclusive system that names it in
+    /// `writes = [..]`, in the reader's stage or an earlier one; or any other system that
+    /// names it in `writes = [..]`, in an earlier stage, since its commands apply at the
+    /// sync point after the reader ran.
     TransientBeforeWriter {
         /// The reader.
         reader: &'static str,
@@ -1094,6 +1102,10 @@ impl fmt::Display for ScheduleError {
             Self::EventsBeforeEmitter { reader, emitter, event } => write!(
                 f,
                 "`{reader}` reads `{event}` but is not ordered after its emitter `{emitter}`"
+            ),
+            Self::WrongWorld { schedule, world } if schedule == world => write!(
+                f,
+                "the schedule serves another world of the same kind; a schedule serves one world"
             ),
             Self::WrongWorld { schedule, world } => {
                 write!(f, "the schedule is for a {schedule:?} world, not a {world:?} world")

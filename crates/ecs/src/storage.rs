@@ -314,17 +314,18 @@ impl Archetype {
         self.column_index(key).is_some()
     }
 
-    fn new_chunk(&self) -> Chunk {
+    fn new_chunk(&self, clock: Tick) -> Chunk {
         Chunk {
             slab: AlignedBytes::zeroed(self.slab_bytes),
             keys: Vec::with_capacity(self.capacity),
-            column_ticks: vec![Stamp::ZERO; self.columns.len()],
+            // Replaced by the first row's ticks before anything reads them.
+            column_ticks: vec![Stamp::new(clock, 0); self.columns.len()],
             stamps: self
                 .columns
                 .iter()
                 .map(|column| {
                     column.tracked.then(|| RowStamps {
-                        ticks: vec![Tick(0); self.capacity],
+                        ticks: vec![clock; self.capacity],
                         positions: vec![0; self.capacity],
                     })
                 })
@@ -346,7 +347,8 @@ pub(crate) struct Loc {
 pub(crate) struct RowValue {
     pub(crate) info: &'static TypeInfo,
     pub(crate) bytes: Vec<u8>,
-    /// The row's stamp on a tracked column.
+    /// The row's stamp on a tracked column; on an untracked one, the column tick it came
+    /// with, which nothing reads as a row stamp.
     pub(crate) stamp: Stamp,
     /// The column tick of the chunk the value comes from, so a move never hides an
     /// untracked change from a consumer that skips chunks by their column tick.
@@ -432,7 +434,7 @@ impl Storage {
         let arch = &mut self.archetypes[archetype as usize];
         debug_assert_eq!(arch.columns.len(), values.len());
         if arch.chunks.last().is_none_or(|chunk| chunk.len() == arch.capacity) {
-            let chunk = arch.new_chunk();
+            let chunk = arch.new_chunk(clock);
             arch.chunks.push(chunk);
         }
         let chunk_index = arch.chunks.len() - 1;
@@ -442,11 +444,17 @@ impl Storage {
         for (index, (column, value)) in arch.columns.iter().zip(values).enumerate() {
             debug_assert_eq!(column.key, value.info.key());
             chunk.row_mut(column, row).copy_from_slice(&value.bytes);
-            if let Some(stamps) = &mut chunk.stamps[index] {
+            // A row stamp exists on a tracked column only; the column tick covers both. The
+            // first row of a new chunk sets the column tick outright: there is nothing older
+            // to keep.
+            let incoming = if let Some(stamps) = &mut chunk.stamps[index] {
                 stamps.set(row, value.stamp);
-            }
+                value.column_tick.later(value.stamp, clock)
+            } else {
+                value.column_tick
+            };
             let tick = &mut chunk.column_ticks[index];
-            *tick = tick.later(value.column_tick, clock).later(value.stamp, clock);
+            *tick = if row == 0 { incoming } else { tick.later(incoming, clock) };
         }
         let loc = Loc { archetype, chunk: chunk_index as u32, row: row as u32 };
         self.entities.insert(key, loc);
@@ -466,7 +474,9 @@ impl Storage {
             .map(|(index, column)| RowValue {
                 info: column.info,
                 bytes: chunk.row(column, row).to_vec(),
-                stamp: chunk.stamps[index].as_ref().map_or(Stamp::ZERO, |s| s.get(row)),
+                stamp: chunk.stamps[index]
+                    .as_ref()
+                    .map_or(chunk.column_ticks[index], |s| s.get(row)),
                 column_tick: chunk.column_ticks[index],
             })
             .collect();
@@ -566,7 +576,9 @@ impl Chunk {
                 .map(|(index, column)| RowValue {
                     info: column.info,
                     bytes: self.row(column, row).to_vec(),
-                    stamp: self.stamps[index].as_ref().map_or(Stamp::ZERO, |s| s.get(row)),
+                    stamp: self.stamps[index]
+                        .as_ref()
+                        .map_or(self.column_ticks[index], |s| s.get(row)),
                     column_tick: self.column_ticks[index],
                 })
                 .collect(),

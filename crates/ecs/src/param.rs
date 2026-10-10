@@ -124,7 +124,7 @@ impl<T: ?Sized + 'static> SystemParam for ResMut<'_, T> {
 }
 
 /// A resource of the current region, read. Region resources are written through
-/// [`World::region_resource_mut`] at a sync point, never from a kernel, because the
+/// [`World::update_region_resource`] at a sync point, never from a kernel, because the
 /// kernels of one region run on many workers. An invocation in a region that lacks `T` is
 /// skipped.
 pub struct RegionRes<'w, T: Resource> {

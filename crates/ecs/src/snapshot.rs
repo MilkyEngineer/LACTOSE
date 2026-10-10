@@ -75,6 +75,23 @@ impl WorldSnapshot {
                 "the snapshot was taken from another world",
             ));
         }
+        // Predicted entities live now and absent from the snapshot: the restore despawns
+        // them, as of the snapshot's tick, so the rollback horizon prunes their aliases.
+        let gone: Vec<PredictionKey> = world
+            .storage
+            .entities
+            .keys()
+            .filter_map(|key| match key {
+                StableKey::Predicted(predicted) => Some(*predicted),
+                _ => None,
+            })
+            .filter(|&predicted| {
+                !self.storage.entities.contains_key(&StableKey::Predicted(predicted))
+            })
+            .collect();
+        for predicted in gone {
+            world.despawned_predicted.insert(predicted, self.tick);
+        }
         world.tick = self.tick;
         world.point = self.point;
         world.point_cap = u32::MAX;
@@ -97,7 +114,9 @@ impl WorldSnapshot {
             .aliases
             .by_net
             .iter()
-            .filter(|&(net, _)| world.references.by_target.contains_key(&StableKey::Net(*net)))
+            // A `Net` entity the restore revived keeps the references that name it; the
+            // revival is undone by `lactose-predict`, which despawns it again.
+            .filter(|&(net, _)| !world.storage.entities.contains_key(&StableKey::Net(*net)))
             .map(|(&net, &predicted)| (net, predicted))
             .collect();
         for (net, predicted) in rebinds {

@@ -36,9 +36,11 @@ pub struct ExportedRow {
     /// rewritten every tick and not saved, but their presence is the entity's archetype,
     /// which the systems that run over it and the world hash depend on (architecture
     /// section 15.5). `lactose-persist` encodes presence as it sees fit, for instance as
-    /// the component with zeroed bytes in the entity's records, ignores non-persistent
-    /// components when it diffs against the baseline, and `load_region` stores any
-    /// transient component a document carries as zeroed, whatever its bytes.
+    /// the component with zeroed bytes in the entity's records, diffs that presence
+    /// against the baseline and ignores the transient values, and `load_region` stores any
+    /// transient component a document carries as zeroed, whatever its bytes. So after a
+    /// reload a transient value differs from a twin's that never reloaded until the next
+    /// input sync point zeroes both.
     pub transient: Vec<ComponentKey>,
 }
 
@@ -54,6 +56,10 @@ pub struct RegionRows {
     pub seed: u64,
     /// The region's reflected resources, persistent ones only.
     pub resources: Vec<ComponentData>,
+    /// The keys of the region's transient resources, ascending: not saved, but present and
+    /// hashed, so a load restores them zeroed through
+    /// [`World::insert_region_resource_zeroed`](crate::World::insert_region_resource_zeroed).
+    pub transient_resources: Vec<ComponentKey>,
     /// The rows.
     pub rows: Vec<ExportedRow>,
 }
@@ -298,5 +304,11 @@ pub(crate) fn export_region(world: &World, region: RegionId) -> Result<RegionRow
             bytes: resource.bytes.as_bytes().to_vec(),
         })
         .collect();
-    Ok(RegionRows { seed: state.seed, resources, rows })
+    let transient_resources = state
+        .resources
+        .iter()
+        .filter(|(_, resource)| resource.info.persistence() == Persistence::Transient)
+        .map(|(&component, _)| component)
+        .collect();
+    Ok(RegionRows { seed: state.seed, resources, transient_resources, rows })
 }

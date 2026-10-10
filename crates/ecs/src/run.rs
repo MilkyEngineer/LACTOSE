@@ -102,6 +102,13 @@ fn enter_slot(world: &mut World, tick: bool, slot: &mut u32) -> Stamp {
     Stamp::new(world.tick, world.point)
 }
 
+/// Where a pass's window opens the first time it runs in an epoch: at the oldest point
+/// the order relative to `now` has, 2^31 ticks back. Every stored stamp is younger (the
+/// clamp of `World::advance_tick`), so the window holds every row.
+fn first_pass_window(now: Tick) -> Stamp {
+    Stamp::new(Tick(now.0.wrapping_add(1 << 31)), 0)
+}
+
 fn execute(state: &mut RunState, ctx: &mut JobContext<'_>) {
     let RunState { world, plan, tick, pass_marks } = state;
     let tick = *tick;
@@ -124,15 +131,13 @@ fn execute(state: &mut RunState, ctx: &mut JobContext<'_>) {
         for index in stage.systems.clone() {
             let now = enter_slot(world, tick, &mut slot);
             // The window opens at this system's position one tick back, across the wrap; a
-            // pass's, where it last ran, or else before every stored stamp, which are all
-            // younger than 2^30 ticks.
+            // pass's, where it last ran in this epoch, or else before every stored stamp.
             let since = if tick {
                 Stamp::new(Tick(now.tick.0.wrapping_sub(1)), now.position)
             } else {
-                pass_marks[index].filter(|&(epoch, _)| epoch == world.epoch).map_or(
-                    Stamp::new(Tick(now.tick.0.wrapping_sub(crate::world::REBASE_TICKS + 1)), 0),
-                    |(_, stamp)| stamp,
-                )
+                pass_marks[index]
+                    .filter(|&(epoch, _)| epoch == world.epoch)
+                    .map_or(first_pass_window(now.tick), |(_, stamp)| stamp)
             };
             run_system(world, plan, index, (since, now), ctx, &mut pending, &mut emissions);
             if !tick {
@@ -707,5 +712,27 @@ fn run_per_entity(
             }
         }
         partials.extend(partial);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A pass's first window holds a stamp of any age the clamp allows: up to 2^30 at a
+    /// rebase point, and up to 2^31 - 1 just before the next one, across the wrap.
+    #[test]
+    fn a_first_pass_window_holds_every_stamp_the_clamp_allows() {
+        for now in [1000, (1 << 31) + 3, u32::MAX, 5] {
+            let now = Tick(now);
+            for age in [0, 1, 1 << 30, (1 << 30) + 2, (1 << 31) - 1] {
+                let stamp = Stamp::new(Tick(now.0.wrapping_sub(age)), 0);
+                assert!(
+                    stamp.after(first_pass_window(now), now),
+                    "a stamp {age} ticks old at tick {} is outside the window",
+                    now.0
+                );
+            }
+        }
     }
 }

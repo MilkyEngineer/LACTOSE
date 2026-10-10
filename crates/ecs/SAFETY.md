@@ -18,7 +18,10 @@ understates what the kernel touches would let the parallel implementation of mil
 hand two kernels `&mut` to one row from safe code. So `SystemDescriptor::new` is `unsafe`,
 with the obligation that the kernel's table and the finalize's table describe exactly what
 each entry point fetches, and the `#[system]` expansion, which derives both from the
-parameter types, is its one caller.
+parameter types and the `writes` list, is its one caller. A `writes` entry fetches nothing:
+it declares a write the system makes through commands or `&mut World`, outside every
+kernel, and only adds an ordering constraint, so it can make a table overstate what the
+kernel touches but never understate it.
 
 The `#[finalize]` pairing is by name: `#[finalize(f)]` emits `__finalize_f`, a
 `Finalize<O>` holding the finalize function's table and its entry point, and the

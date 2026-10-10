@@ -94,7 +94,8 @@ impl SystemDescriptor {
     /// `kernel.finalize` touches: every component, resource, event and channel each reads
     /// or writes, with the right kind. The schedule orders systems by these tables, and the
     /// storage hands out `&mut` rows on the strength of them (`SAFETY.md`). The `#[system]`
-    /// expansion derives both from the parameter types and is the one sound caller.
+    /// expansion derives both from the parameter types and the `writes` list and is the
+    /// one sound caller.
     #[doc(hidden)]
     #[must_use]
     #[allow(clippy::too_many_arguments, reason = "positional on purpose: see above")]

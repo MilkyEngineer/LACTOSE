@@ -14,7 +14,9 @@ use lactose_core::{
     ComponentKey, EntityRef, Error, ErrorKind, FieldId, FixedHashMap, NetId, PlayerId,
     PredictionKey, Result, StableKey, SystemKey, Tick,
 };
-use lactose_reflect::{Component, FieldKind, Reflect, Registry, Resource, TypeInfo, TypeRole};
+use lactose_reflect::{
+    Component, FieldKind, Persistence, Reflect, Registry, Resource, TypeInfo, TypeRole,
+};
 
 use crate::bulk::RegionRows;
 use crate::change::{
@@ -484,8 +486,17 @@ impl World {
     }
 
     /// Sets the tick between ticks: a client re-syncing to the server's clock, a server
-    /// after a load. Starts a new epoch, and brings every change stamp after the new tick
-    /// back to it, so a mark taken now sees only later writes. Fails during a schedule run.
+    /// after a load. Starts a new epoch, and moves every change stamp onto the new clock by
+    /// its age on the old one, so a mark taken now sees only later writes:
+    ///
+    /// - Forward (by less than 2^31 ticks), a stamp of the old tick, which a `Changed`
+    ///   reader may not have seen yet, moves to the new tick's current point; every older
+    ///   stamp moves to before the new tick.
+    /// - Back by `k` ticks (a move of 2^31 ticks or more is read as back), a stamp younger
+    ///   than `k + 1` ticks, which would lie in the future, moves to the new tick's current
+    ///   point; every older stamp keeps its tick.
+    ///
+    /// A `Changed` reader sees a moved stamp once more at most. Fails during a schedule run.
     pub fn set_tick(&mut self, tick: Tick) -> Result<()> {
         if self.in_run {
             return Err(invalid("the tick is set between ticks, not during a run"));
@@ -679,7 +690,8 @@ impl World {
     /// key with no live entity is kept and applies when the entity is spawned, so a bind
     /// received after a snapshot is not lost to the rollback. A reference stored as `net`
     /// before the bind, such as an owner loaded from another region's save, is rewritten
-    /// to `predicted`, so stored bytes are origin keys whatever the order of loads. Fails if
+    /// to `predicted`, in rows and region resources alike, so stored bytes are origin keys
+    /// whatever the order of loads and inserts. Fails if
     /// `predicted` or `net` is already bound to something else, or if `net` names a live
     /// entity of its own, whose references a bind would redirect.
     pub fn bind(&mut self, predicted: PredictionKey, net: NetId) -> Result<()> {
@@ -941,21 +953,64 @@ impl World {
         Ok(())
     }
 
-    /// A resource of `region`, or `None` if it holds bytes that are not a valid `T`, which
-    /// only a write through [`region_resource_mut`](Self::region_resource_mut) can leave.
+    /// A resource of `region`. Region resources are written through
+    /// [`insert_region_resource`](Self::insert_region_resource) and
+    /// [`update_region_resource`](Self::update_region_resource), which store only valid
+    /// values.
     #[must_use]
     pub fn region_resource<T: Resource>(&self, region: RegionId) -> Option<&T> {
         let resource = self.regions.get(&region)?.resources.get(&T::KEY)?;
         bytemuck::checked::try_from_bytes(resource.bytes.as_bytes()).ok()
     }
 
-    /// A resource of `region`, for writing, or `None` if its bytes are not a valid `T`. A
-    /// reference written through it is stored as written; write a bound `Net` key through
-    /// [`insert_region_resource`](Self::insert_region_resource) to store its origin key.
-    #[must_use]
-    pub fn region_resource_mut<T: Resource>(&mut self, region: RegionId) -> Option<&mut T> {
-        let resource = self.regions.get_mut(&region)?.resources.get_mut(&T::KEY)?;
-        bytemuck::checked::try_from_bytes_mut(resource.bytes.as_bytes_mut()).ok()
+    /// Updates the resource `T` of `region` through `f`, which receives a copy of it. The
+    /// result is validated and a bound `Net` key in its reference fields is stored as the
+    /// origin key, as [`insert_region_resource`](Self::insert_region_resource) does; it
+    /// replaces the stored value only if it is valid to store. Fails with `NotFound` if the
+    /// region is not loaded or lacks `T`, and with `InvalidData`, keeping the old value, if
+    /// the result is not valid (a placeholder in a reference field).
+    pub fn update_region_resource<T: Resource>(
+        &mut self,
+        region: RegionId,
+        f: impl FnOnce(&mut T),
+    ) -> Result<()> {
+        let state = self.regions.get(&region).ok_or_else(|| not_found("no such region"))?;
+        let resource = state
+            .resources
+            .get(&T::KEY)
+            .ok_or_else(|| not_found(format!("the region has no `{}`", T::SCHEMA.name())))?;
+        let info = resource.info;
+        let mut value: T = bytemuck::checked::try_pod_read_unaligned(resource.bytes.as_bytes())
+            .map_err(|_| invalid("the stored resource is not a valid value"))?;
+        f(&mut value);
+        let bytes = self.canonical_resource(info, bytemuck::bytes_of(&value))?;
+        let state = self.regions.get_mut(&region).expect("checked above");
+        state.resources.get_mut(&T::KEY).expect("checked above").bytes = bytes;
+        Ok(())
+    }
+
+    /// Inserts the transient resource `resource` of `region`, zeroed, as the input sync point
+    /// leaves it: how a load restores the presence of a transient region resource, which an
+    /// export lists in [`RegionRows::transient_resources`](crate::RegionRows::transient_resources)
+    /// and never saves. Fails if the region is not loaded, or `resource` is not a registered
+    /// transient resource.
+    pub fn insert_region_resource_zeroed(
+        &mut self,
+        region: RegionId,
+        resource: ComponentKey,
+    ) -> Result<()> {
+        let info = self
+            .registry
+            .get(resource)
+            .ok_or_else(|| not_found("the resource is not registered"))?;
+        if info.role() != TypeRole::Resource || info.persistence() != Persistence::Transient {
+            return Err(invalid(format!("`{}` is not a transient resource", info.name())));
+        }
+        let state = self.regions.get_mut(&region).ok_or_else(|| not_found("no such region"))?;
+        // Registration checked that the all-zero value of a transient type is valid.
+        let bytes = AlignedBytes::zeroed(info.layout().size());
+        state.resources.insert(resource, RegionResource { info, bytes });
+        Ok(())
     }
 
     /// Every resource of `region` as bytes, in ascending key order, for the world hash and
@@ -1127,7 +1182,7 @@ impl World {
     /// Takes the presentation events delivered since the last call, and the cancellations
     /// (architecture section 9.4).
     pub fn take_present_events(&mut self) -> PresentEventBatch {
-        self.present.take()
+        self.present.take(self.tick)
     }
 
     // ---- Snapshots ----
@@ -1145,8 +1200,13 @@ impl World {
     /// the set of loaded regions is the snapshot's, the structural log is cleared and a
     /// new epoch starts, so every consumer does a full pass. The alias table and the
     /// delivered presentation-event keys are kept; emissions after the snapshot that were
-    /// never taken are dropped. Fails if the snapshot is from another world, or during a
-    /// schedule run.
+    /// never taken are dropped. A reference the snapshot holds under a `Net` key bound since
+    /// goes back to the origin key, as the bind left it, unless the restore revives a `Net`
+    /// entity of that key, despawned after the snapshot and bound before the restore: its
+    /// references stay on it, and `lactose-predict` despawns it again. A predicted entity
+    /// live before and absent after is recorded as despawned at the snapshot's tick, for
+    /// [`set_rollback_horizon`](Self::set_rollback_horizon). Fails if the snapshot is from
+    /// another world, or during a schedule run.
     pub fn restore(&mut self, snapshot: &WorldSnapshot) -> Result<()> {
         if self.in_run {
             return Err(invalid("a restore happens between ticks, not during a run"));
@@ -1187,7 +1247,8 @@ impl World {
     /// never touches a live entity of another region: a cooked entity that moved is a row
     /// there, not here. Region resources are not in an overlay; the caller inserts them
     /// with [`insert_region_resource_erased`](Self::insert_region_resource_erased) from the
-    /// save or the relevance message. Every component schema must match the registry's; a
+    /// save or the relevance message, and the transient ones the export listed with
+    /// [`insert_region_resource_zeroed`](Self::insert_region_resource_zeroed). Every component schema must match the registry's; a
     /// mismatch is an error of kind `VersionMismatch`, and `lactose-persist` migrates the
     /// document first. Rows are stamped at the current point and logged as spawned; no
     /// epoch starts.
@@ -1231,7 +1292,8 @@ impl World {
         self.point = 0;
         self.point_cap = 0;
         // Every 2^30 ticks, stamps older than 2^30 ticks come forward to that age, so every
-        // stored stamp stays within 2^30 ticks of now and orders correctly across the wrap.
+        // stored stamp stays less than 2^31 ticks older than now and orders correctly
+        // across the wrap.
         if self.tick.0.is_multiple_of(REBASE_TICKS) {
             let now = self.tick;
             let floor = Stamp::new(Tick(now.0.wrapping_sub(REBASE_TICKS)), 0);
@@ -1379,6 +1441,17 @@ impl World {
     /// owner loaded from another region's save. The bytes then match every other machine's;
     /// no row is stamped, since nothing about the entity changed.
     pub(crate) fn rekey_references(&mut self, from: StableKey, to: StableKey) {
+        // Region resources are not indexed: every one with a reference field is visited, so
+        // its bytes do not depend on whether it was inserted before or after the bind.
+        for state in self.regions.values_mut() {
+            for resource in state.resources.values_mut() {
+                if has_entity_ref(resource.info) {
+                    let mut bytes = resource.bytes.as_bytes().to_vec();
+                    rewrite_refs(resource.info, &mut bytes, from, to);
+                    resource.bytes = AlignedBytes::from_bytes(&bytes);
+                }
+            }
+        }
         let Some(entries) = self.references.by_target.remove(&from) else { return };
         let mut rows: Vec<(StableKey, ComponentKey)> =
             entries.iter().map(|&(source, component, _)| (source, component)).collect();

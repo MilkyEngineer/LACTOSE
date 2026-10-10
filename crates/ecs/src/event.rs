@@ -251,7 +251,7 @@ impl PresentEmission {
 #[derive(Clone, Debug, Default)]
 pub struct PresentEventBatch {
     /// Events delivered for the first time, in order of (tick, emitting system, origin
-    /// key, sequence).
+    /// key, sequence), ticks ordered by their age at the take, so across the `u32` wrap.
     pub emitted: Vec<PresentEmission>,
     /// Keys delivered earlier whose tick was re-simulated without re-emitting them.
     pub cancelled: Vec<PresentEventKey>,
@@ -343,12 +343,13 @@ impl PresentLog {
         }
     }
 
-    pub(crate) fn take(&mut self) -> PresentEventBatch {
+    /// The batch, its emissions in (tick, emitting system, origin, sequence) order with
+    /// ticks ordered relative to `now`, across the wrap.
+    pub(crate) fn take(&mut self, now: Tick) -> PresentEventBatch {
         let mut emitted = core::mem::take(&mut self.emitted);
-        emitted.sort_by(|a, b| {
-            let key =
-                |e: &PresentEmission| (e.key.tick, e.order, e.key.origin, e.key.seq, e.key.kind);
-            key(a).cmp(&key(b))
+        emitted.sort_by_key(|e| {
+            let tick = e.key.tick.0.wrapping_sub(now.0).wrapping_add(1 << 31);
+            (tick, e.order, e.key.origin, e.key.seq, e.key.kind)
         });
         for emission in &emitted {
             let PresentEventKey { origin, tick, kind, seq } = emission.key;

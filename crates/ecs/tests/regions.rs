@@ -99,8 +99,20 @@ fn region_resources_are_validated_and_hold_origin_keys() {
     let stored = world.region_resource::<Boss>(REGION).unwrap().target;
     assert_eq!(stored, EntityRef::new(StableKey::Predicted(predicted)), "stored as the origin key");
 
-    // A write through the mutable view that leaves an invalid value reads back as none.
-    world.region_resource_mut::<Boss>(REGION).unwrap().target = placeholder.target;
-    assert!(world.region_resource::<Boss>(REGION).is_none());
-    assert!(world.region_resource_mut::<Boss>(REGION).is_none());
+    // An update that leaves an invalid value is refused and keeps the old one.
+    let error = world
+        .update_region_resource::<Boss>(REGION, |boss| boss.target = placeholder.target)
+        .unwrap_err();
+    assert_eq!(error.kind(), lactose_core::ErrorKind::InvalidData);
+    assert_eq!(world.region_resource::<Boss>(REGION).unwrap().target, stored);
+
+    // A valid update naming the bound `Net` key is stored under the origin key.
+    world
+        .update_region_resource::<Boss>(REGION, |boss| {
+            boss.target = EntityRef::new(StableKey::Net(id))
+        })
+        .unwrap();
+    assert_eq!(world.region_resource::<Boss>(REGION).unwrap().target, stored);
+    let error = world.update_region_resource::<Boss>(RegionId(77), |_| {}).unwrap_err();
+    assert_eq!(error.kind(), lactose_core::ErrorKind::NotFound);
 }

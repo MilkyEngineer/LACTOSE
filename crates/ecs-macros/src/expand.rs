@@ -2,10 +2,10 @@
 //!
 //! The expansion names `::lactose_ecs` and `::core` only and computes no key: the system
 //! key is hashed in the invoking crate by `SystemDescriptor::new`, a `const fn`. Each
-//! attribute writes one access table, from the parameter types, and the entry point that
-//! fetches the same parameters in the same order; the `unsafe` blocks that hand both to
-//! `lactose-ecs` are spanned at the call site, so the invoking crate keeps
-//! `#![forbid(unsafe_code)]` (`crates/ecs/SAFETY.md`).
+//! attribute writes one access table, from the parameter types and `#[system]`'s `writes`
+//! list, and the entry point that fetches the same parameters in the same order; the
+//! `unsafe` blocks that hand both to `lactose-ecs` are spanned at the call site, so the
+//! invoking crate keeps `#![forbid(unsafe_code)]` (`crates/ecs/SAFETY.md`).
 
 use proc_macro2::{Span, TokenStream};
 use quote::{format_ident, quote, quote_spanned};

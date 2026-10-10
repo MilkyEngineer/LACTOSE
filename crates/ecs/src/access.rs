@@ -40,6 +40,7 @@ impl Access {
 /// How a parameter touches its target. Two systems conflict when one writes a target the
 /// other reads or writes; the schedule requires an order between them.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[non_exhaustive]
 pub enum AccessKind {
     /// Reads every row or the resource: `&T`, [`Res`](crate::Res),
     /// [`RegionRes`](crate::RegionRes), [`Channel`](crate::Channel).
@@ -80,12 +81,15 @@ pub enum AccessKind {
     /// Writes a column outside the parameter list, through `Commands::set` or, in an
     /// exclusive system, through `&mut World`: what `#[system(writes = [T, ..])]` declares.
     /// No parameter carries it, so nothing is fetched for it. The schedule counts it as a
-    /// write of the column, for ordering conflicts and as a writer of a transient column.
+    /// write of the column, for ordering conflicts (with readers and `Mut`, not with another
+    /// `Writes` of the column) and as a writer of a transient column: an exclusive system's
+    /// from its own stage, any other's from the next. It is trusted, never checked.
     Writes,
 }
 
 /// What a parameter touches.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[non_exhaustive]
 pub enum AccessTarget {
     /// A component column, by its stable key.
     Component(ComponentKey),

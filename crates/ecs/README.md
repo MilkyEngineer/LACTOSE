@@ -80,10 +80,15 @@ Arguments, in any order:
   parameter list, through `Commands::set` or, in an exclusive system, through
   `&mut World`. Each adds an `AccessKind::Writes` entry for `T` to the table, after the
   parameters' entries; nothing is fetched for it. The schedule counts it as a write of the
-  column: it conflicts with readers and writers of `T` in the stage, and it is a declared
-  writer of a transient `T`. This is how a transient column written at the input sync
-  point, or a transient reference column (which `Mut` cannot write), gets a declared
-  writer. An undeclared write is not seen by the schedule.
+  column: it conflicts with `Mut`, `&T` and `Changed<T>` of `T` in the stage, but not with
+  another `writes` declaration of `T`, since commands apply in execution order; and it is a
+  declared writer of a transient `T`. On an exclusive system it declares the `&mut World`
+  writes the system makes at its stage's sync point, which that stage's systems see; on
+  any other system the writes land at the next sync point and are visible from the next
+  stage. This is how a transient column written at the input sync point, or a transient
+  reference column (which `Mut` cannot write), gets a declared writer. A declaration is
+  trusted and never checked: an undeclared write is not seen by the schedule, and a
+  declared write the system never performs is accepted.
 
 What it emits, and what the function keeps:
 
@@ -96,7 +101,8 @@ What it emits, and what the function keeps:
   exclusive flag, the reducer's type name (`stringify!`, since `type_name` is not const)
   and the hidden entry points, through the `unsafe` constructor `SystemDescriptor::new`.
   The expansion is the one sound caller: the tables it writes are derived from the parameter
-  types, which is what makes the schedule's ordering sound (`SAFETY.md`). The `unsafe` block
+  types and the `writes` list, which is what makes the schedule's ordering sound
+  (`SAFETY.md`). The `unsafe` block
   is spanned at the call site, never at a user token, so it lands in the invoking crate
   under the external-macro exemption and that crate may keep `#![forbid(unsafe_code)]`
   (architecture section 21, as for `#[component]`).
@@ -223,9 +229,12 @@ What a system is, from its parameters (`SystemParam` has the table):
   them. Emissions wait until `take_present_events`, so a world that never takes them, a
   dedicated server, grows the queue; the server's tick loop takes and drops them.
 - Every reader of a transient column must be ordered after a declared writer of it in the
-  tick (`TransientBeforeWriter`): a system with `Mut` on the column, or one that names it
-  in `writes = [..]`. An exclusive system that writes the column at the input sync point
-  declares it; one that declares nothing is no writer of anything.
+  tick (`TransientBeforeWriter`): a system with `Mut` on the column; an exclusive system
+  that names it in `writes = [..]`, in the reader's stage or an earlier one; or any other
+  system that names it in `writes = [..]`, in an earlier stage, since its commands apply
+  at the sync point after the reader's stage started. An exclusive system that writes the
+  column at the input sync point declares it; one that declares nothing is no writer of
+  anything.
 
 **Schedule**
 
@@ -301,8 +310,9 @@ What a system is, from its parameters (`SystemParam` has the table):
   as spawned.
 - The tick is a `u32` that wraps. Every 2^30 ticks (tick zero included) stamps older than
   2^30 ticks are clamped forward to that age and an epoch starts, so every stored stamp is
-  within 2^30 ticks of now, and stamps are compared relative to the current tick; the
-  `Changed` windows and `changed_since` hold across the wrap.
+  less than 2^31 ticks older than now, and stamps are compared relative to the current
+  tick; the `Changed` windows, `changed_since` and a pass's first window in an epoch (which
+  opens 2^31 ticks back) hold across the wrap.
 - `set_tick` moves stamps onto the new clock by their age on the old one. Forward, a stamp
   of the old tick, possibly not yet seen by a reader, moves to the new point and anything
   older to before the new tick; back by `k` ticks, a stamp younger than `k` ticks moves to
@@ -322,7 +332,8 @@ What a system is, from its parameters (`SystemParam` has the table):
   not points: a write made after a mark in the mark's own tick shows the mark's tick, so a
   consumer that needs the exact point uses `changed_since`.
 - At the input sync point a transient column's rows are zeroed, and a tracked row whose
-  bytes were not already zero is stamped there.
+  bytes were not already zero is stamped there; every region's transient resources are
+  zeroed too.
 - `World::columns` yields one slice per chunk with the rows' keys and regions, for passes
   that fork over chunks (extract, replication gather, the world hash). Results keyed by
   anything but `StableKey` are wrong, and SOUR's layout mode catches them. `Query::for_each`
@@ -337,12 +348,16 @@ What a system is, from its parameters (`SystemParam` has the table):
   the snapshot's tick, puts stamps back verbatim, clears the structural log and starts a
   new epoch; the alias table and the delivered presentation-event keys are kept, untaken
   emissions after the snapshot are dropped, and a bind for an entity the restore removed
-  applies when the entity is re-spawned. A reference the snapshot holds under a `Net` key
-  bound since goes back to the origin key at the restore, as the bind left it, in storage
-  and in the reverse index. `World::set_rollback_horizon` is how the world learns what it
-  may prune: the ring's oldest tick from `lactose-predict`, the current tick on the
-  server. `World::bind` refuses a `NetId` that names a live entity of its own, whose
-  references the bind would redirect.
+  applies when the entity is re-spawned; one that is never re-spawned is recorded as
+  despawned at the snapshot's tick, so the horizon prunes its alias. A reference the
+  snapshot holds under a `Net` key bound since, in a row or a region resource, goes back to
+  the origin key at the restore, as the bind left it, in storage and in the reverse index;
+  unless the restore revives a `Net` entity of that key (it was live at the snapshot and
+  despawned before the bind), whose references stay on it. That revived entity is stale
+  server state, and `lactose-predict` despawns it again before it re-simulates.
+  `World::set_rollback_horizon` is how the world learns what it may prune: the ring's
+  oldest tick from `lactose-predict`, the current tick on the server. `World::bind` refuses
+  a `NetId` that names a live entity of its own, whose references the bind would redirect.
 - `load_region` takes the baseline and the overlay together into a region the caller
   created with the saved seed, skips baseline rows the overlay destroys (a cooked entity
   that moved is a live row elsewhere), restores predicted origins and aliases from
@@ -356,14 +371,20 @@ What a system is, from its parameters (`SystemParam` has the table):
 - A transient component is not saved, but its presence is part of the entity's archetype,
   which its systems and the world hash depend on: `ExportedRow::transient` lists the keys
   of the row's transient components, `lactose-persist` encodes their presence as it sees
-  fit (for instance the component with zeroed bytes in the entity's records) and ignores
-  non-persistent components when it diffs against the baseline, and `load_region` stores a
-  transient component a document carries as zeroed, whatever its bytes.
-- Region resources are validated when inserted, typed or erased (a placeholder in a
-  reference field is refused), and a bound `Net` key in their reference fields is stored as
-  the origin key. References in resources are not in the reverse index and may dangle.
-  `region_resource` and `region_resource_mut` return `None` for bytes that are not a valid
-  value, which only a write through `region_resource_mut` can leave.
+  fit (for instance the component with zeroed bytes in the entity's records), diffs that
+  presence against the baseline and ignores the transient values, and `load_region` stores
+  a transient component a document carries as zeroed, whatever its bytes. Transient region
+  resources likewise: `RegionRows::transient_resources` lists them, and the loader puts
+  each back with `insert_region_resource_zeroed`. Transient values therefore differ from a
+  twin that never reloaded at the reload point, until the next input sync point zeroes
+  both.
+- Region resources are validated when inserted, typed or erased, and when updated through
+  `update_region_resource`, which runs a closure on a copy and stores the result only if it
+  is valid (a placeholder in a reference field is refused with `InvalidData` and the old
+  value kept). A bound `Net` key in their reference fields is stored as the origin key, and
+  `bind` and `restore` rewrite their references as they do rows', so the stored bytes do not
+  depend on the order of an insert and a bind. References in resources are not in the
+  reverse index and may dangle.
 
 **Not in this crate yet**
 
@@ -393,4 +414,6 @@ repeat, layout and chaos modes.
 | `pass.rs`, `query.rs`, `regions.rs` | `run_pass` with a fork over columns; whole-world queries in key order; region modes and per-region systems |
 | `binds.rs`, `wrap.rs`, `reload.rs` | Binds across a restore and onto live keys; `Changed` across the `u32` wrap, the 2^30 clamp and `set_tick`; transient presence through an unload and reload |
 | `regressions.rs` | The findings of the pre-review: transient references in the index, pass events across a rollback, owner keys in either load order, exports after an unload, `set_tick` stamps, transient writers, double rollbacks, failed loads, resources removed mid-run |
+| `regressions_two.rs` | The findings of the second review: new chunks' column ticks above 2^31, presentation batches across the wrap, `writes` visibility by stage, a restore that revives a bound `Net` entity, `update_region_resource`, transient region resources through a reload, schedule ties, resource references through bind and restore, aliases a restore orphans |
+| `wrap_program.rs` | One program with marks, cursors, `Changed` readers, a pass, column and row ticks, presentation events and a rollback, run across the 2^30 rebase, 2^31 and the `u32` wrap, equal to a run far from any boundary |
 | `compile_fail.rs` | What `#[system]` and `#[finalize]` reject, and what they accept under `#![forbid(unsafe_code)]` |

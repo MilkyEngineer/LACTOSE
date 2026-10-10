@@ -260,6 +260,14 @@ impl World {
         for (key, info, bytes) in zeroed_references {
             self.index_references(key, info, &bytes, false);
         }
+        // Transient region resources are zeroed with the columns.
+        for state in self.regions.values_mut() {
+            for resource in state.resources.values_mut() {
+                if resource.info.persistence() == Persistence::Transient {
+                    resource.bytes.as_bytes_mut().fill(0);
+                }
+            }
+        }
     }
 
     /// Permutes every chunk's rows if SOUR's layout mode asks for it; counts the sync point.

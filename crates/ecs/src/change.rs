@@ -20,16 +20,14 @@ pub(crate) struct Stamp {
 }
 
 impl Stamp {
-    pub(crate) const ZERO: Self = Self { tick: Tick(0), position: 0 };
-
     pub(crate) const fn new(tick: Tick, position: u32) -> Self {
         Self { tick, position }
     }
 
     /// The stamp's place in the stamp order as seen from tick `now`. Ticks are a `u32`
-    /// that wraps; every stored stamp is within 2^30 ticks of now (the clamp of
-    /// `World::advance_tick`), so comparing ticks relative to now orders them across the
-    /// wrap.
+    /// that wraps; every stored stamp is less than 2^31 ticks older than now (the clamp
+    /// of `World::advance_tick` leaves it at most 2^30 old, and the next clamp comes 2^30
+    /// ticks later), so comparing ticks relative to now orders them across the wrap.
     pub(crate) const fn seen_from(self, now: Tick) -> (u32, u32) {
         (self.tick.0.wrapping_sub(now.0).wrapping_add(1 << 31), self.position)
     }
