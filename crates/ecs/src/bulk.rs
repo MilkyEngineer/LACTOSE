@@ -32,6 +32,14 @@ pub struct ExportedRow {
     /// exactly as the component is laid out in memory. [`PredictedOrigin`](crate::PredictedOrigin)
     /// is among them when the entity has one.
     pub components: Vec<ComponentData>,
+    /// The transient components the entity has, in ascending key order: their values are
+    /// rewritten every tick and not saved, but their presence is the entity's archetype,
+    /// which the systems that run over it and the world hash depend on (architecture
+    /// section 15.5). `lactose-persist` encodes presence as it sees fit, for instance as
+    /// the component with zeroed bytes in the entity's records, ignores non-persistent
+    /// components when it diffs against the baseline, and `load_region` stores any
+    /// transient component a document carries as zeroed, whatever its bytes.
+    pub transient: Vec<ComponentKey>,
 }
 
 /// The state of one region, as [`World::export_region`](crate::World::export_region)
@@ -166,11 +174,16 @@ pub(crate) fn load_region(
         }
     }
 
-    // Every value is validated before anything binds or spawns, so a document with one bad
-    // row changes nothing.
-    for row in rows.values() {
-        for (&component, bytes) in &row.components {
-            world.registry.get(component).expect("checked above").validate(bytes)?;
+    // A transient component in a document stands for its presence: it loads zeroed, as
+    // the input sync point leaves it. Then every value is validated before anything binds
+    // or spawns, so a document with one bad row changes nothing.
+    for row in rows.values_mut() {
+        for (&component, bytes) in &mut row.components {
+            let info = world.registry.get(component).expect("checked above");
+            if info.persistence() == Persistence::Transient {
+                bytes.fill(0);
+            }
+            info.validate(bytes)?;
         }
     }
 
@@ -260,6 +273,7 @@ pub(crate) fn export_region(world: &World, region: RegionId) -> Result<RegionRow
         let chunk = &archetype.chunks[loc.chunk as usize];
         let mut owner = None;
         let mut components = Vec::new();
+        let mut transient = Vec::new();
         for column in &archetype.columns {
             let bytes = chunk.row(column, loc.row as usize);
             if column.key == OwnedBy::KEY {
@@ -268,9 +282,11 @@ pub(crate) fn export_region(world: &World, region: RegionId) -> Result<RegionRow
                 }
             } else if column.info.persistence() == Persistence::Persistent {
                 components.push(ComponentData { component: column.key, bytes: bytes.to_vec() });
+            } else if column.info.persistence() == Persistence::Transient {
+                transient.push(column.key);
             }
         }
-        rows.push(ExportedRow { id: net_id(world, key)?, owner, components });
+        rows.push(ExportedRow { id: net_id(world, key)?, owner, components, transient });
     }
     rows.sort_by_key(|row| row.id);
     let resources = state

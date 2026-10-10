@@ -110,6 +110,8 @@ struct Filter {
     access: Vec<(AccessKind, ComponentKey)>,
     /// The window a `Changed` item passes: after the previous tick's point, up to now.
     changed_after: Stamp,
+    /// The tick stamps are ordered from.
+    now: lactose_core::Tick,
 }
 
 impl Filter {
@@ -154,13 +156,10 @@ impl Filter {
                 assert!(info.is_some_and(is_tracked), "`Changed` needs a tracked column");
             }
         }
-        // One tick back from now; at tick zero there is no earlier tick, and every stamp is
-        // after the start of history.
-        let changed_after = match now.tick.0.checked_sub(1) {
-            Some(previous) => Stamp::new(lactose_core::Tick(previous), now.position),
-            None => Stamp::ZERO,
-        };
-        Self { access, changed_after }
+        // One tick back from now, across the wrap.
+        let changed_after =
+            Stamp::new(lactose_core::Tick(now.tick.0.wrapping_sub(1)), now.position);
+        Self { access, changed_after, now: now.tick }
     }
 
     /// Whether the entity `key` matches, by its archetype and its row stamps.
@@ -172,9 +171,9 @@ impl Filter {
             AccessKind::Read | AccessKind::Write | AccessKind::With => archetype.has(component),
             AccessKind::Without => !archetype.has(component),
             AccessKind::Changed => archetype.column_index(component).is_some_and(|index| {
-                chunk.stamps[index]
-                    .as_ref()
-                    .is_some_and(|stamps| stamps.get(loc.row as usize) > self.changed_after)
+                chunk.stamps[index].as_ref().is_some_and(|stamps| {
+                    stamps.get(loc.row as usize).after(self.changed_after, self.now)
+                })
             }),
             _ => true,
         })
@@ -214,7 +213,7 @@ impl<'w, Q: QueryItems> Query<'w, Q> {
                     archetype.columns.binary_search_by_key(&component, |c| c.key).ok()
             {
                 let tick = &mut chunk.column_ticks[index];
-                *tick = (*tick).max(self.now);
+                *tick = self.now;
             }
         }
         let mut views: Vec<Option<_>> =

@@ -5,7 +5,7 @@ use core::num::NonZeroU64;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use lactose_core::{Error, ErrorKind, PlayerId, Result, Tick};
+use lactose_core::{Error, ErrorKind, NetId, PlayerId, PredictionKey, Result, StableKey, Tick};
 
 use crate::region::RegionId;
 use crate::storage::Storage;
@@ -91,6 +91,18 @@ impl WorldSnapshot {
         world.regions = self.regions.clone();
         world.input_ticks = self.input_ticks.clone();
         world.references = self.references.clone();
+        // Binds survive a restore, so a reference the snapshot stored under a `Net` key that
+        // has been bound since goes back to the origin key, as the bind left it.
+        let rebinds: Vec<(NetId, PredictionKey)> = world
+            .aliases
+            .by_net
+            .iter()
+            .filter(|&(net, _)| world.references.by_target.contains_key(&StableKey::Net(*net)))
+            .map(|(&net, &predicted)| (net, predicted))
+            .collect();
+        for (net, predicted) in rebinds {
+            world.rekey_references(StableKey::Net(net), StableKey::Predicted(predicted));
+        }
         world.events.clear();
         world.channels.clear();
         world.present.rewind(self.tick);

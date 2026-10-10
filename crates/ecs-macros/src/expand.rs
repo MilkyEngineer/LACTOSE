@@ -19,7 +19,8 @@ use syn::{
 
 const USAGE: &str = "expected `#[system(name = \"crate::name\", ...)]` with, in any order, \
                      `worlds = [server, client, prediction]`, `in_set = PATH`, \
-                     `after = f` or `after = [f, g]`, `reduce = R` and `exclusive`";
+                     `after = f` or `after = [f, g]`, `writes = [T, ..]`, `reduce = R` and \
+                     `exclusive`";
 
 /// The errors, then the function as written, so its uses elsewhere add nothing.
 fn failed(item: TokenStream, error: &Error) -> TokenStream {
@@ -33,6 +34,7 @@ struct SystemArgs {
     worlds: Option<Vec<Ident>>,
     in_set: Option<Path>,
     after: Vec<Path>,
+    writes: Vec<Type>,
     reduce: Option<Type>,
     exclusive: bool,
 }
@@ -44,6 +46,7 @@ fn parse_system_args(args: TokenStream) -> Result<SystemArgs> {
             worlds: None,
             in_set: None,
             after: Vec::new(),
+            writes: Vec::new(),
             reduce: None,
             exclusive: false,
         };
@@ -100,6 +103,14 @@ fn parse_system_args(args: TokenStream) -> Result<SystemArgs> {
                     } else {
                         parsed.after = vec![input.parse()?];
                     }
+                }
+                "writes" => {
+                    input.parse::<Token![=]>()?;
+                    let list;
+                    bracketed!(list in input);
+                    parsed.writes = Punctuated::<Type, Token![,]>::parse_terminated(&list)?
+                        .into_iter()
+                        .collect();
                 }
                 "reduce" => {
                     input.parse::<Token![=]>()?;
@@ -187,12 +198,16 @@ fn check_signature(function: &ItemFn) -> Result<()> {
 }
 
 /// The access table: one `SystemParam::ACCESS` per parameter, each spanned at its type so
-/// a type that is not a parameter is reported there.
-fn access_table(types: &[Type]) -> TokenStream {
+/// a type that is not a parameter is reported there, then one `Writes` entry per column of
+/// `writes`, after every parameter so the fetch indices stay the parameters'.
+fn access_table(types: &[Type], writes: &[Type]) -> TokenStream {
     let entries = types
         .iter()
         .map(|ty| quote_spanned!(ty.span()=> <#ty as ::lactose_ecs::SystemParam>::ACCESS));
-    quote!(&[#(#entries),*])
+    let writes = writes
+        .iter()
+        .map(|ty| quote_spanned!(ty.span()=> ::lactose_ecs::__private::writes::<#ty>()));
+    quote!(&[#(#entries,)* #(#writes),*])
 }
 
 /// The call of `function` with every parameter fetched in order.
@@ -271,7 +286,7 @@ fn try_system(args: TokenStream, item: TokenStream) -> Result<TokenStream> {
     };
     let after = args.after.iter().map(descriptor_path);
     let after_count = args.after.len();
-    let access = access_table(&types);
+    let access = access_table(&types, &args.writes);
     let invoke = call(&ident, &types);
     let exclusive = args.exclusive;
     let finalize_name = format_ident!("__finalize_{}", ident.unraw());
@@ -370,15 +385,24 @@ fn try_finalize(args: TokenStream, item: TokenStream) -> Result<TokenStream> {
         return Err(Error::new(ty.span(), "a finalize function cannot take `&mut World`"));
     }
     let params = &types[1..];
-    let access = access_table(params);
+    let access = access_table(params, &[]);
     let ident = function.sig.ident.clone();
     let fetches = (0..params.len())
         .map(|index| quote!(::lactose_ecs::__private::fetch(__invocation, #index)));
     let name = format_ident!("__finalize_{}", system.unraw());
+    let descriptor = descriptor_ident(&system);
+    let stray = format!(
+        "`#[finalize({})]` names a system that is not a reduction: add `reduce = R` to it",
+        system.unraw()
+    );
     let vis = &function.vis;
     function.attrs.push(syn::parse_quote!(#[allow(unused_mut)]));
     Ok(quote! {
         #function
+
+        // The system the finalize names exists and is a reduction; otherwise nothing would
+        // ever run this function.
+        const _: () = ::core::assert!(#descriptor.reduce().is_some(), #stray);
 
         #[doc(hidden)]
         #[allow(non_upper_case_globals)]

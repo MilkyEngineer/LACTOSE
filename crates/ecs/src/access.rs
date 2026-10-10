@@ -77,6 +77,11 @@ pub enum AccessKind {
     Job,
     /// The whole world: `&mut World` in an exclusive system.
     World,
+    /// Writes a column outside the parameter list, through `Commands::set` or, in an
+    /// exclusive system, through `&mut World`: what `#[system(writes = [T, ..])]` declares.
+    /// No parameter carries it, so nothing is fetched for it. The schedule counts it as a
+    /// write of the column, for ordering conflicts and as a writer of a transient column.
+    Writes,
 }
 
 /// What a parameter touches.
@@ -107,6 +112,8 @@ pub enum AccessTarget {
         /// `core::any::type_name` of the channel, for diagnostics only.
         name: &'static str,
     },
+    /// The whole world, which two exclusive systems both hold: what they conflict on.
+    World,
     /// No target beyond the kind itself.
     None,
 }
@@ -114,6 +121,14 @@ pub enum AccessTarget {
 /// The target function of a component parameter.
 pub(crate) fn component_target<T: lactose_reflect::Component>() -> AccessTarget {
     AccessTarget::Component(T::KEY)
+}
+
+/// The entry `writes = [T]` adds to a system's table. Not part of the interface: the
+/// `#[system]` expansion names it.
+#[doc(hidden)]
+#[must_use]
+pub const fn writes<T: lactose_reflect::Component>() -> Access {
+    Access::new(AccessKind::Writes, component_target::<T>)
 }
 
 /// The target function of a resource parameter; `T` may be a `dyn` trait type.

@@ -25,6 +25,29 @@ impl Stamp {
     pub(crate) const fn new(tick: Tick, position: u32) -> Self {
         Self { tick, position }
     }
+
+    /// The stamp's place in the stamp order as seen from tick `now`. Ticks are a `u32`
+    /// that wraps; every stored stamp is within 2^30 ticks of now (the clamp of
+    /// `World::advance_tick`), so comparing ticks relative to now orders them across the
+    /// wrap.
+    pub(crate) const fn seen_from(self, now: Tick) -> (u32, u32) {
+        (self.tick.0.wrapping_sub(now.0).wrapping_add(1 << 31), self.position)
+    }
+
+    /// Whether this stamp is after `other`, seen from tick `now`.
+    pub(crate) fn after(self, other: Self, now: Tick) -> bool {
+        self.seen_from(now) > other.seen_from(now)
+    }
+
+    /// The later of the two stamps, seen from tick `now`.
+    pub(crate) fn later(self, other: Self, now: Tick) -> Self {
+        if other.after(self, now) { other } else { self }
+    }
+}
+
+/// Whether tick `tick` is before tick `than`, across the wrap.
+pub(crate) const fn tick_before(tick: Tick, than: Tick) -> bool {
+    tick.0.wrapping_sub(than.0) >= 1 << 31
 }
 
 /// A point in a world's change history, taken with [`World::mark`](crate::World::mark)
@@ -185,7 +208,8 @@ impl<T: Component> ColumnMut<'_, T> {
             any = dirty.iter().any(|row| row < self.keys.len());
         }
         if any {
-            *self.column_tick = (*self.column_tick).max(self.now);
+            // Every write is stamped at the newest point, so it replaces the column tick.
+            *self.column_tick = self.now;
         }
     }
 }

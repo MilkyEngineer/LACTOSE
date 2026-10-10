@@ -123,12 +123,16 @@ fn execute(state: &mut RunState, ctx: &mut JobContext<'_>) {
         let _span = tracing::trace_span!(target: "casein", "stage", name = stage.name).entered();
         for index in stage.systems.clone() {
             let now = enter_slot(world, tick, &mut slot);
+            // The window opens at this system's position one tick back, across the wrap; a
+            // pass's, where it last ran, or else before every stored stamp, which are all
+            // younger than 2^30 ticks.
             let since = if tick {
-                Stamp::new(Tick(now.tick.0.saturating_sub(1)), now.position)
+                Stamp::new(Tick(now.tick.0.wrapping_sub(1)), now.position)
             } else {
-                pass_marks[index]
-                    .filter(|&(epoch, _)| epoch == world.epoch)
-                    .map_or(Stamp::ZERO, |(_, stamp)| stamp)
+                pass_marks[index].filter(|&(epoch, _)| epoch == world.epoch).map_or(
+                    Stamp::new(Tick(now.tick.0.wrapping_sub(crate::world::REBASE_TICKS + 1)), 0),
+                    |(_, stamp)| stamp,
+                )
             };
             run_system(world, plan, index, (since, now), ctx, &mut pending, &mut emissions);
             if !tick {
@@ -281,6 +285,8 @@ impl<'r, 'j> Env<'r, 'j> {
                 Slot::Present(self.present[index].take().expect("one sink per parameter"))
             }
             (AccessKind::Job, _) => Slot::Job(self.job.take().expect("one `Job` per system")),
+            // A `writes` declaration: no parameter fetches it.
+            (AccessKind::Writes, _) => Slot::Unit,
             (AccessKind::World, _) => {
                 Slot::World(self.world.take().expect("an exclusive system's one `&mut World`"))
             }
@@ -616,7 +622,7 @@ fn run_per_entity(
         // The dispatch of a writing system marks every chunk it is issued over.
         for column in written.iter().filter_map(|&key| column_of(key)) {
             let column_tick = &mut chunk.column_ticks[column];
-            *column_tick = (*column_tick).max(now);
+            *column_tick = now;
         }
         let len = chunk.len();
         let mut views = chunk.split(columns);
@@ -632,7 +638,9 @@ fn run_per_entity(
                 continue;
             };
             let in_window = changed_columns.iter().all(|&column| {
-                piece(column).stamp().is_some_and(|stamp| since < stamp && stamp < now)
+                piece(column)
+                    .stamp()
+                    .is_some_and(|stamp| stamp.after(since, now.tick) && now.after(stamp, now.tick))
             });
             let lacks_resource = table.iter().any(|access| match access.target() {
                 AccessTarget::RegionResource(key) => !state.resources.contains_key(&key),

@@ -100,6 +100,7 @@ const _: () = {
 /// implementation may reshape them together with the macros, in one change.
 #[doc(hidden)]
 pub mod __private {
+    pub use crate::access::writes;
     pub use crate::system::{
         Fetch, Finalize, Invocation, Kernel, ReducerOps, fetch, finish, reduce,
     };

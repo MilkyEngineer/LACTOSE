@@ -19,7 +19,7 @@ use lactose_reflect::{Component, FieldKind, Reflect, Registry, Resource, TypeInf
 use crate::bulk::RegionRows;
 use crate::change::{
     ChangeMark, ChangedRows, ColumnMut, ColumnRef, Columns, ColumnsMut, ErasedColumn,
-    ErasedColumns, LogCursor, Stamp, StructuralChange, StructuralLog,
+    ErasedColumns, LogCursor, Stamp, StructuralChange, StructuralLog, tick_before,
 };
 use crate::command::{
     Bundle, ChannelEntry, ChannelStore, CommandChannel, ErasedComponent, Payload, erase_bundle,
@@ -33,9 +33,7 @@ use crate::region::{
 };
 use crate::rng::{LayoutRng, Rng};
 use crate::snapshot::WorldSnapshot;
-use crate::storage::{
-    AlignedBytes, Loc, MAX_ALIGN, RowValue, Storage, typed, typed_mut, typed_slice,
-};
+use crate::storage::{AlignedBytes, Loc, MAX_ALIGN, RowValue, Storage, typed, typed_slice};
 
 /// The first position between ticks: after every position a tick's slots use.
 pub(crate) const BETWEEN: u32 = 1 << 31;
@@ -45,7 +43,7 @@ pub(crate) const SLOT_WIDTH: u32 = 1 << 16;
 
 /// Change stamps are clamped forward, and a new epoch starts, every this many ticks
 /// (architecture section 6).
-const REBASE_TICKS: u32 = 1 << 30;
+pub(crate) const REBASE_TICKS: u32 = 1 << 30;
 
 /// Which world this is. A system declares the kinds it runs in, and the world applies its
 /// own filter to every kernel (architecture section 9.4), so game code never writes one.
@@ -229,7 +227,7 @@ impl WorldBuilder {
         Ok(World {
             identity: Arc::new(()),
             kind: self.kind,
-            storage: Storage::new(self.layout.chunk_rows),
+            storage: Storage::with_clock(self.layout.chunk_rows, self.tick),
             registry: self.registry,
             layout: self.layout,
             tick: self.tick,
@@ -492,13 +490,30 @@ impl World {
         if self.in_run {
             return Err(invalid("the tick is set between ticks, not during a run"));
         }
+        let old = self.tick;
         self.tick = tick;
+        self.storage.clock = tick;
         self.point = BETWEEN;
         self.point_cap = u32::MAX;
-        // Stamps after the new point would read as changes to every later mark until the
-        // clock passed them; they come back to it, as the new epoch forces a full pass anyway.
+        // Stamps are moved onto the new clock, by their age on the old one. Forward, what
+        // was stamped in the old tick may still be pending for a reader and moves to the new
+        // point; anything older was seen by every reader and moves to before the new tick.
+        // Back by `k` ticks, what is younger than `k` ticks would be in the future and moves
+        // to the new point; the rest keeps its tick. A new epoch starts either way.
         let ceiling = Stamp::new(tick, BETWEEN);
-        self.clamp_stamps(|stamp| stamp.min(ceiling));
+        let seen = Stamp::new(Tick(tick.0.wrapping_sub(1)), 0);
+        let forward = tick.0.wrapping_sub(old.0);
+        let back = old.0.wrapping_sub(tick.0);
+        self.clamp_stamps(|stamp| {
+            let age = old.0.wrapping_sub(stamp.tick.0);
+            if forward != 0 && forward < 1 << 31 {
+                if age == 0 { ceiling } else { seen }
+            } else if age <= back {
+                ceiling
+            } else {
+                stamp
+            }
+        });
         self.new_epoch();
         Ok(())
     }
@@ -568,7 +583,7 @@ impl World {
         let archetype = &mut self.storage.archetypes[loc.archetype as usize];
         let chunk = &mut archetype.chunks[loc.chunk as usize];
         let tick = &mut chunk.column_ticks[index];
-        *tick = (*tick).max(now);
+        *tick = now;
         let row = chunk.row_view(&archetype.columns, index, loc.row as usize);
         Some(Mut::new(row, now))
     }
@@ -665,7 +680,8 @@ impl World {
     /// received after a snapshot is not lost to the rollback. A reference stored as `net`
     /// before the bind, such as an owner loaded from another region's save, is rewritten
     /// to `predicted`, so stored bytes are origin keys whatever the order of loads. Fails if
-    /// `predicted` or `net` is already bound to something else.
+    /// `predicted` or `net` is already bound to something else, or if `net` names a live
+    /// entity of its own, whose references a bind would redirect.
     pub fn bind(&mut self, predicted: PredictionKey, net: NetId) -> Result<()> {
         let bound_net = self.aliases.by_predicted.get(&predicted);
         let bound_predicted = self.aliases.by_net.get(&net);
@@ -673,6 +689,9 @@ impl World {
             || bound_predicted.is_some_and(|&bound| bound != predicted)
         {
             return Err(invalid("one of the two keys is already bound to another"));
+        }
+        if self.storage.entities.contains_key(&StableKey::Net(net)) {
+            return Err(invalid("the NetId names a live entity of its own"));
         }
         self.aliases.by_predicted.insert(predicted, net);
         self.aliases.by_net.insert(net, predicted);
@@ -882,7 +901,10 @@ impl World {
 
     /// Inserts a resource of `region`, returning the previous value. Region resources are
     /// hashed with the region, exported with it if persistent, and part of a snapshot.
-    /// Fails if the region is not loaded or `T` is not registered.
+    /// Fails if the region is not loaded, `T` is not registered or the value is not valid
+    /// to store (a placeholder in a reference field). A bound `Net` key in a reference
+    /// field is stored as the origin key; references in resources are not in the reverse
+    /// index and may dangle.
     pub fn insert_region_resource<T: Resource>(
         &mut self,
         region: RegionId,
@@ -892,13 +914,12 @@ impl World {
             .registry
             .get_by_type(TypeId::of::<T>())
             .ok_or_else(|| not_found(format!("`{}` is not registered", T::SCHEMA.name())))?;
+        let bytes = self.canonical_resource(info, bytemuck::bytes_of(&value))?;
         let state = self.regions.get_mut(&region).ok_or_else(|| not_found("no such region"))?;
-        let resource =
-            RegionResource { info, bytes: AlignedBytes::from_bytes(bytemuck::bytes_of(&value)) };
-        Ok(state
-            .resources
-            .insert(T::KEY, resource)
-            .map(|previous| *typed::<T>(previous.bytes.as_bytes())))
+        let resource = RegionResource { info, bytes };
+        Ok(state.resources.insert(T::KEY, resource).and_then(|previous| {
+            bytemuck::checked::try_pod_read_unaligned(previous.bytes.as_bytes()).ok()
+        }))
     }
 
     /// Inserts a resource of `region` from its bytes, validated against the registry.
@@ -914,27 +935,27 @@ impl World {
         if info.role() != TypeRole::Resource {
             return Err(invalid(format!("`{}` is not a resource", info.name())));
         }
-        info.validate(&value.bytes)?;
+        let bytes = self.canonical_resource(info, &value.bytes)?;
         let state = self.regions.get_mut(&region).ok_or_else(|| not_found("no such region"))?;
-        state.resources.insert(
-            value.component,
-            RegionResource { info, bytes: AlignedBytes::from_bytes(&value.bytes) },
-        );
+        state.resources.insert(value.component, RegionResource { info, bytes });
         Ok(())
     }
 
-    /// A resource of `region`.
+    /// A resource of `region`, or `None` if it holds bytes that are not a valid `T`, which
+    /// only a write through [`region_resource_mut`](Self::region_resource_mut) can leave.
     #[must_use]
     pub fn region_resource<T: Resource>(&self, region: RegionId) -> Option<&T> {
         let resource = self.regions.get(&region)?.resources.get(&T::KEY)?;
-        Some(typed(resource.bytes.as_bytes()))
+        bytemuck::checked::try_from_bytes(resource.bytes.as_bytes()).ok()
     }
 
-    /// A resource of `region`, for writing.
+    /// A resource of `region`, for writing, or `None` if its bytes are not a valid `T`. A
+    /// reference written through it is stored as written; write a bound `Net` key through
+    /// [`insert_region_resource`](Self::insert_region_resource) to store its origin key.
     #[must_use]
     pub fn region_resource_mut<T: Resource>(&mut self, region: RegionId) -> Option<&mut T> {
         let resource = self.regions.get_mut(&region)?.resources.get_mut(&T::KEY)?;
-        Some(typed_mut(resource.bytes.as_bytes_mut()))
+        bytemuck::checked::try_from_bytes_mut(resource.bytes.as_bytes_mut()).ok()
     }
 
     /// Every resource of `region` as bytes, in ascending key order, for the world hash and
@@ -990,7 +1011,7 @@ impl World {
                 let stamps = chunk.stamps[index].as_ref().expect("a tracked column");
                 let values = typed_slice::<T>(chunk.column(&columns[index]), chunk.len());
                 for (row, value) in values.iter().enumerate() {
-                    if stamps.get(row) > since {
+                    if stamps.get(row).after(since, self.tick) {
                         rows.push((chunk.keys[row], value));
                     }
                 }
@@ -1142,7 +1163,7 @@ impl World {
         let gone: Vec<PredictionKey> = self
             .despawned_predicted
             .iter()
-            .filter(|&(_, &tick)| tick < oldest)
+            .filter(|&(_, &tick)| tick_before(tick, oldest))
             .map(|(&key, _)| key)
             .collect();
         for key in gone {
@@ -1206,11 +1227,15 @@ impl World {
     /// Advances the tick for a run, clamping stamps forward at every 2^30 ticks.
     pub(crate) fn advance_tick(&mut self) {
         self.tick = Tick(self.tick.0.wrapping_add(1));
+        self.storage.clock = self.tick;
         self.point = 0;
         self.point_cap = 0;
-        if self.tick.0.is_multiple_of(REBASE_TICKS) && self.tick.0 != 0 {
-            let floor = Stamp::new(Tick(self.tick.0 - REBASE_TICKS), 0);
-            self.clamp_stamps(|stamp| stamp.max(floor));
+        // Every 2^30 ticks, stamps older than 2^30 ticks come forward to that age, so every
+        // stored stamp stays within 2^30 ticks of now and orders correctly across the wrap.
+        if self.tick.0.is_multiple_of(REBASE_TICKS) {
+            let now = self.tick;
+            let floor = Stamp::new(Tick(now.0.wrapping_sub(REBASE_TICKS)), 0);
+            self.clamp_stamps(|stamp| stamp.later(floor, now));
             self.new_epoch();
         }
     }
@@ -1335,11 +1360,25 @@ impl World {
         });
     }
 
+    /// A region resource's bytes, validated, with every bound `Net` key in its reference
+    /// fields rewritten to the origin key.
+    fn canonical_resource(&self, info: &'static TypeInfo, bytes: &[u8]) -> Result<AlignedBytes> {
+        info.validate(bytes)?;
+        let mut bytes = bytes.to_vec();
+        for (_, key) in entity_refs(info, &bytes.clone()) {
+            let origin = self.canonical(key);
+            if origin != key {
+                rewrite_refs(info, &mut bytes, key, origin);
+            }
+        }
+        Ok(AlignedBytes::from_bytes(&bytes))
+    }
+
     /// Rewrites every stored reference to `from` into `to`, the same entity under its origin
     /// key: a `Net` key written before the bind that makes it an alias, for instance an
     /// owner loaded from another region's save. The bytes then match every other machine's;
     /// no row is stamped, since nothing about the entity changed.
-    fn rekey_references(&mut self, from: StableKey, to: StableKey) {
+    pub(crate) fn rekey_references(&mut self, from: StableKey, to: StableKey) {
         let Some(entries) = self.references.by_target.remove(&from) else { return };
         let mut rows: Vec<(StableKey, ComponentKey)> =
             entries.iter().map(|&(source, component, _)| (source, component)).collect();

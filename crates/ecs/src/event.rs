@@ -9,6 +9,7 @@ use bytemuck::{CheckedBitPattern, NoUninit};
 use lactose_core::{FixedHashMap, StableKey, Tick};
 
 use crate::access::{Access, AccessKind, events_target, no_target};
+use crate::change::tick_before;
 use crate::param::{SystemParam, sealed};
 use crate::system::{Fetch, Invocation, Slot, mismatch};
 
@@ -358,13 +359,13 @@ impl PresentLog {
 
     /// Drops the emissions after `tick` that were never taken: a restore to `tick`.
     pub(crate) fn rewind(&mut self, tick: Tick) {
-        self.emitted.retain(|emission| emission.key.tick <= tick);
+        self.emitted.retain(|emission| !tick_before(tick, emission.key.tick));
         self.counts.clear();
         self.counted = None;
     }
 
     /// Forgets delivered keys below `oldest`, which no restore can reach.
     pub(crate) fn prune(&mut self, oldest: Tick) {
-        self.delivered = self.delivered.split_off(&oldest);
+        self.delivered.retain(|&tick, _| !tick_before(tick, oldest));
     }
 }

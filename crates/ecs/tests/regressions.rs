@@ -227,11 +227,23 @@ fn p5_after_set_tick_backwards_a_change_is_reported_once() {
     );
 }
 
-// ---- P6: a transient column written only by an exclusive input system ----
+// ---- P6 and S1 of the review: transient writers are declared, never assumed ----
 
-#[system(name = "probe::apply_inputs", worlds = [server, prediction], exclusive)]
+/// An input system that writes the transient column and declares it.
+#[system(
+    name = "probe::apply_inputs",
+    worlds = [server, prediction],
+    exclusive,
+    writes = [TickInput]
+)]
 fn apply_inputs(world: &mut World) {
     let _ = world.insert(net(1), TickInput(3));
+}
+
+/// An input system that declares nothing: it is no transient writer.
+#[system(name = "probe::unrelated_input", worlds = [server, prediction], exclusive)]
+fn unrelated_input(world: &mut World) {
+    let _ = world.tick();
 }
 
 #[system(name = "probe::read_tick_input", worlds = [server, prediction])]
@@ -239,19 +251,40 @@ fn read_tick_input(input: &TickInput, _hp: &Health) {
     let _ = input.0;
 }
 
-#[test]
-fn p6_a_transient_written_at_the_input_sync_point_can_be_read() {
+fn prepare_input(
+    input: &'static lactose_ecs::SystemDescriptor,
+) -> Result<(), lactose_ecs::ScheduleError> {
     let mut builder = Schedule::builder(WorldKind::Server);
-    builder.stage("input", &[]).add(&APPLY_INPUTS);
+    builder.stage("input", &[]).add(input);
     builder.stage("sim", &[]).add(&READ_TICK_INPUT);
     let mut schedule = builder.build().unwrap();
     let world = world_with(WorldKind::Server, LayoutConfig::default(), probe_registry());
-    let prepared = schedule.prepare(&world);
-    assert!(prepared.is_ok(), "{prepared:?}");
+    schedule.prepare(&world)
 }
 
-#[system(name = "probe::aim", worlds = [server, prediction])]
+#[test]
+fn p6_a_transient_written_at_the_input_sync_point_by_a_declared_writer_can_be_read() {
+    assert_eq!(prepare_input(&APPLY_INPUTS), Ok(()));
+}
+
+#[test]
+fn s1_an_exclusive_system_that_declares_nothing_is_no_transient_writer() {
+    assert!(matches!(
+        prepare_input(&UNRELATED_INPUT),
+        Err(lactose_ecs::ScheduleError::TransientBeforeWriter {
+            reader: "probe::read_tick_input",
+            ..
+        })
+    ));
+}
+
+#[system(name = "probe::aim", worlds = [server, prediction], writes = [TargetThisTick])]
 fn aim(cmd: lactose_ecs::Commands, key: lactose_ecs::StableKeyOf, _hp: &Health) {
+    cmd.set(*key, TargetThisTick { target: EntityRef::new(*key) });
+}
+
+#[system(name = "probe::aim_undeclared", worlds = [server, prediction])]
+fn aim_undeclared(cmd: lactose_ecs::Commands, key: lactose_ecs::StableKeyOf, _hp: &Health) {
     cmd.set(*key, TargetThisTick { target: EntityRef::new(*key) });
 }
 
@@ -260,18 +293,21 @@ fn read_target(target: &TargetThisTick) {
     let _ = target.target.get();
 }
 
-/// A known gap, pinned so a change to it is deliberate: a write through commands is not a
-/// declared write, so a transient column written only that way has no reader. An exclusive
-/// system ordered before the reader is a declared writer (`p6`).
+/// A transient reference column, which `Mut` cannot write, is written through commands
+/// and declared with `writes`; without the declaration its reader is refused.
 #[test]
-fn p6b_a_transient_written_only_by_commands_still_needs_a_declared_writer() {
-    let mut builder = Schedule::builder(WorldKind::Server);
-    builder.stage("aim", &[]).add(&AIM);
-    builder.stage("read", &[]).add(&READ_TARGET);
-    let mut schedule = builder.build().unwrap();
-    let world = world_with(WorldKind::Server, LayoutConfig::default(), probe_registry());
+fn p6b_a_transient_written_through_commands_is_read_when_declared() {
+    let prepare = |writer: &'static lactose_ecs::SystemDescriptor| {
+        let mut builder = Schedule::builder(WorldKind::Server);
+        builder.stage("aim", &[]).add(writer);
+        builder.stage("read", &[]).add(&READ_TARGET);
+        let mut schedule = builder.build().unwrap();
+        let world = world_with(WorldKind::Server, LayoutConfig::default(), probe_registry());
+        schedule.prepare(&world)
+    };
+    assert_eq!(prepare(&AIM), Ok(()));
     assert!(matches!(
-        schedule.prepare(&world),
+        prepare(&AIM_UNDECLARED),
         Err(lactose_ecs::ScheduleError::TransientBeforeWriter { reader: "probe::read_target", .. })
     ));
 }

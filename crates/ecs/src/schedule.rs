@@ -5,7 +5,7 @@ use core::fmt;
 use core::future::Future;
 use core::ops::Range;
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use lactose_core::{ComponentKey, Error, ErrorKind, Result, StableKey, SystemKey};
 use lactose_reflect::Persistence;
@@ -42,7 +42,11 @@ impl SystemKind {
         let access = system.access();
         if system.is_exclusive() {
             Self::Exclusive
-        } else if access.iter().any(|a| matches!(a.target(), AccessTarget::Component(_))) {
+        } else if access.iter().any(|a| {
+            // A `writes` entry declares a column written through commands; it does not make
+            // the system run per entity.
+            a.kind() != AccessKind::Writes && matches!(a.target(), AccessTarget::Component(_))
+        }) {
             Self::PerEntity
         } else if access.iter().any(|a| {
             a.kind() == AccessKind::Region || matches!(a.target(), AccessTarget::RegionResource(_))
@@ -115,8 +119,9 @@ impl ScheduleBuilder {
 
     /// Resolves the order and checks it. The errors, in the order they are checked:
     ///
-    /// - [`ScheduleError::NoStage`], [`ScheduleError::DuplicateKey`],
-    ///   [`ScheduleError::UnknownSet`], [`ScheduleError::UnknownSystem`]: structure.
+    /// - [`ScheduleError::NoStage`], [`ScheduleError::SetInTwoStages`],
+    ///   [`ScheduleError::DuplicateKey`], [`ScheduleError::UnknownSet`],
+    ///   [`ScheduleError::UnknownSystem`]: structure.
     /// - [`ScheduleError::ExclusiveWithEntityAccess`],
     ///   [`ScheduleError::EntityParamInWorldSystem`],
     ///   [`ScheduleError::RegionParamInWorldSystem`],
@@ -140,6 +145,21 @@ impl ScheduleBuilder {
     pub fn build(self) -> core::result::Result<Schedule, ScheduleError> {
         if let Some(system) = self.orphan {
             return Err(ScheduleError::NoStage { system });
+        }
+        let mut declared: BTreeMap<&'static str, (usize, &'static str)> = BTreeMap::new();
+        for (stage, spec) in self.stages.iter().enumerate() {
+            for set in &spec.sets {
+                if let Some(&(first_stage, first)) = declared.get(set.name())
+                    && first_stage != stage
+                {
+                    return Err(ScheduleError::SetInTwoStages {
+                        set: set.name(),
+                        first,
+                        second: spec.name,
+                    });
+                }
+                declared.insert(set.name(), (stage, spec.name));
+            }
         }
         let mut seen: BTreeMap<SystemKey, &'static str> = BTreeMap::new();
         let mut stage_of: BTreeMap<SystemKey, usize> = BTreeMap::new();
@@ -220,7 +240,12 @@ impl ScheduleBuilder {
             "a schedule has fewer than 32 766 systems and stages"
         );
         let systems = plan.order.len();
-        Ok(Schedule { kind: self.kind, plan: Arc::new(plan), pass_marks: vec![None; systems] })
+        Ok(Schedule {
+            kind: self.kind,
+            plan: Arc::new(plan),
+            pass_marks: vec![None; systems],
+            world: None,
+        })
     }
 }
 
@@ -235,6 +260,11 @@ fn is_write(kind: AccessKind) -> bool {
     matches!(kind, AccessKind::Write | AccessKind::OptionalWrite)
 }
 
+/// Whether `kind` writes a column: a `Mut` parameter or a `writes` declaration.
+fn writes_column(kind: AccessKind) -> bool {
+    is_write(kind) || kind == AccessKind::Writes
+}
+
 /// The per-kind rules of one table: the kernel's (`finalize` false) or the finalize's.
 fn check_table(
     system: &'static SystemDescriptor,
@@ -245,8 +275,10 @@ fn check_table(
     let name = system.name();
     let targets: Vec<(AccessKind, AccessTarget)> =
         table.iter().map(|access| (access.kind(), access.target())).collect();
-    let component =
-        |(_, target): &(AccessKind, AccessTarget)| matches!(target, AccessTarget::Component(_));
+    // A component parameter or filter; a `writes` entry is neither.
+    let component = |(kind, target): &(AccessKind, AccessTarget)| {
+        *kind != AccessKind::Writes && matches!(target, AccessTarget::Component(_))
+    };
     let region = |(kind, target): &(AccessKind, AccessTarget)| {
         *kind == AccessKind::Region || matches!(target, AccessTarget::RegionResource(_))
     };
@@ -261,10 +293,7 @@ fn check_table(
             return Err(ScheduleError::RegionParamInWorldSystem { system: name });
         }
         if targets.iter().any(component) {
-            return Err(ScheduleError::InvalidParameter {
-                system: name,
-                parameter: "a component parameter in a finalize function",
-            });
+            return Err(ScheduleError::InvalidParameter { system: name, parameter: "component" });
         }
         if has(AccessKind::World) {
             return Err(ScheduleError::InvalidParameter { system: name, parameter: "&mut World" });
@@ -283,7 +312,7 @@ fn check_table(
                 if has(AccessKind::World) {
                     return Err(ScheduleError::InvalidParameter {
                         system: name,
-                        parameter: "&mut World outside an exclusive system",
+                        parameter: "&mut World",
                     });
                 }
                 if kind != SystemKind::PerEntity && has(AccessKind::Entity) {
@@ -563,7 +592,7 @@ impl Plan {
                     }
                     let exclusive = SystemKind::Exclusive;
                     if self.kinds[first] == exclusive && self.kinds[second] == exclusive {
-                        return Err(self.conflict(first, second, AccessTarget::None));
+                        return Err(self.conflict(first, second, AccessTarget::World));
                     }
                     for a in self.tables(first) {
                         for b in self.tables(second) {
@@ -620,8 +649,10 @@ fn conflict(a: Access, b: Access) -> Option<AccessTarget> {
     }
     let touches = |kind: AccessKind| is_data(kind) || kind == AccessKind::Changed;
     match target {
-        AccessTarget::Component(_) => ((is_write(a.kind()) && touches(b.kind()))
-            || (is_write(b.kind()) && touches(a.kind())))
+        // A declared write through commands counts like a `Mut`; two declarations of one
+        // column do not conflict, since commands apply in execution order.
+        AccessTarget::Component(_) => ((writes_column(a.kind()) && touches(b.kind()))
+            || (writes_column(b.kind()) && touches(a.kind())))
         .then_some(target),
         AccessTarget::Resource { .. } => {
             (is_write(a.kind()) || is_write(b.kind())).then_some(target)
@@ -635,12 +666,18 @@ fn conflict(a: Access, b: Access) -> Option<AccessTarget> {
 /// The execution order within a stage is the topological order of its DAG with ties broken
 /// by [`SystemDescriptor::key`], never by registration order or layout, so it is identical
 /// on every build and platform. A `Schedule` is `Send`, so the timer root task may own it.
+///
+/// A schedule serves one world: the first [`prepare`](Self::prepare), or the first run,
+/// ties it to that world, and another world is refused with
+/// [`ScheduleError::WrongWorld`], since a pass's `Changed` windows are kept per schedule.
 pub struct Schedule {
     kind: WorldKind,
     plan: Arc<Plan>,
     /// Where each system's `Changed` window starts in a pass: the epoch and point it last
     /// ran at in one.
     pass_marks: Vec<Option<(u32, Stamp)>>,
+    /// The world the schedule serves, once it has met one; compared by address only.
+    world: Option<Weak<()>>,
 }
 
 impl Schedule {
@@ -670,9 +707,18 @@ impl Schedule {
     /// [`run_pass`](Self::run_pass) run it first and fail the same way, but they cannot hand
     /// the world back on failure, so a caller checks here before it starts the loop.
     pub fn prepare(&mut self, world: &World) -> core::result::Result<(), ScheduleError> {
-        let plan = &*self.plan;
+        let plan = self.plan.clone();
+        let plan = &*plan;
         if world.kind() != plan.kind {
             return Err(ScheduleError::WrongWorld { schedule: plan.kind, world: world.kind() });
+        }
+        let identity = Arc::downgrade(&world.identity);
+        match &self.world {
+            Some(served) if !Weak::ptr_eq(served, &identity) => {
+                return Err(ScheduleError::WrongWorld { schedule: plan.kind, world: world.kind() });
+            }
+            Some(_) => {}
+            None => self.world = Some(identity),
         }
         let registry = world.registry();
         let components = |index: usize| {
@@ -723,13 +769,11 @@ impl Schedule {
                 {
                     continue;
                 }
-                // A declared writer is a `Mut` on the column, or an exclusive system, which
-                // may write anything: inputs are applied that way at the input sync point.
+                // A declared writer has `Mut` on the column or declares it in `writes`.
                 let written_before = (0..plan.order.len()).any(|writer| {
                     plan.before(writer, reader)
-                        && (plan.kinds[writer] == SystemKind::Exclusive
-                            || components(writer)
-                                .any(|(kind, key)| key == component && is_write(kind)))
+                        && components(writer)
+                            .any(|(kind, key)| key == component && writes_column(kind))
                 });
                 if !written_before {
                     return Err(ScheduleError::TransientBeforeWriter {
@@ -814,6 +858,7 @@ impl Schedule {
 
 /// Why a schedule did not build, or cannot run against a world.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ScheduleError {
     /// A system was added before any stage was declared.
     NoStage {
@@ -835,6 +880,15 @@ pub enum ScheduleError {
         system: &'static str,
         /// The set.
         set: &'static str,
+    },
+    /// One set is declared in two stages; a set belongs to one.
+    SetInTwoStages {
+        /// The set.
+        set: &'static str,
+        /// The first stage that declares it.
+        first: &'static str,
+        /// The second.
+        second: &'static str,
     },
     /// A system's `after` edge names a system whose worlds include this kind but which was
     /// not added. An edge to a system whose worlds exclude this kind is ignored.
@@ -889,7 +943,9 @@ pub enum ScheduleError {
     InvalidParameter {
         /// The system.
         system: &'static str,
-        /// The parameter, or the resource's name.
+        /// The parameter's type: `Commands`, `Job`, `&mut World`, the resource's type name,
+        /// or `component` for a component parameter of a finalize, whose type the table
+        /// does not record.
         parameter: &'static str,
     },
     /// Sets or edges form a cycle, or an edge points at a later stage.
@@ -915,7 +971,9 @@ pub enum ScheduleError {
         /// The event type's name.
         event: &'static str,
     },
-    /// The world is not of the kind the schedule was built for.
+    /// The world is not of the kind the schedule was built for, or is not the world the
+    /// schedule first prepared or ran with, which it serves alone (the two kinds are then
+    /// equal).
     WrongWorld {
         /// The schedule's kind.
         schedule: WorldKind,
@@ -944,9 +1002,9 @@ pub enum ScheduleError {
         /// The component.
         component: ComponentKey,
     },
-    /// A reader of a transient column is not ordered after a writer of it in the tick: a
-    /// system with `Mut` on the column, or an exclusive system, which may write anything.
-    /// A write through `Commands` is not a declared write.
+    /// A reader of a transient column is not ordered after a declared writer of it in the
+    /// tick: a system with `Mut` on the column, or one that names it in `writes = [..]`
+    /// because it writes it through `Commands` or `&mut World`.
     TransientBeforeWriter {
         /// The reader.
         reader: &'static str,
@@ -975,6 +1033,12 @@ impl fmt::Display for ScheduleError {
             ),
             Self::UnknownSet { system, set } => {
                 write!(f, "`{system}` is in set `{set}`, which is not in its stage")
+            }
+            Self::SetInTwoStages { set, first, second } => {
+                write!(
+                    f,
+                    "set `{set}` is declared in stages `{first}` and `{second}`; a set belongs to one"
+                )
             }
             Self::UnknownSystem { system, after } => {
                 write!(f, "`{system}` is ordered after `{after}`, which was not added")
@@ -1014,11 +1078,19 @@ impl fmt::Display for ScheduleError {
                 }
                 Ok(())
             }
-            Self::UnorderedConflict { first, second, target } => write!(
-                f,
-                "`{first}` and `{second}` conflict on {target:?} and nothing orders them; \
-                 add an `after` edge or a set order"
-            ),
+            Self::UnorderedConflict { first, second, target } => {
+                let target = match target {
+                    AccessTarget::World => "the world".to_owned(),
+                    AccessTarget::Component(key) => format!("component {:#018x}", key.0),
+                    AccessTarget::Resource { name, .. } => format!("resource `{name}`"),
+                    other => format!("{other:?}"),
+                };
+                write!(
+                    f,
+                    "`{first}` and `{second}` conflict on {target} and nothing orders them; \
+                     add an `after` edge or a set order"
+                )
+            }
             Self::EventsBeforeEmitter { reader, emitter, event } => write!(
                 f,
                 "`{reader}` reads `{event}` but is not ordered after its emitter `{emitter}`"

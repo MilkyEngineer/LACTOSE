@@ -28,6 +28,8 @@ fn dup_b(_health: &Health) {}
 
 static ELSEWHERE: SystemSet = SystemSet::new("test::elsewhere");
 
+static FIRST_ALONE: SystemSet = SystemSet::new("test::first_alone");
+
 #[system(name = "test::in_elsewhere", in_set = ELSEWHERE)]
 fn in_elsewhere(_counter: &Counter) {}
 
@@ -236,10 +238,21 @@ fn order_errors() {
     let ScheduleError::UnorderedConflict { target, .. } = conflict else { panic!("{conflict:?}") };
     assert_eq!(target, AccessTarget::Component(Counter::KEY));
     assert!(build(&[&WRITE_A, &WRITE_B_ORDERED]).is_ok(), "an edge orders the pair");
+    let exclusive = build_error(&[&EXCLUSIVE_A, &EXCLUSIVE_B]);
     assert!(matches!(
-        build_error(&[&EXCLUSIVE_A, &EXCLUSIVE_B]),
-        ScheduleError::UnorderedConflict { target: AccessTarget::None, .. }
+        exclusive,
+        ScheduleError::UnorderedConflict { target: AccessTarget::World, .. }
     ));
+    assert!(exclusive.to_string().contains("conflict on the world"), "{exclusive}");
+
+    // A set belongs to one stage.
+    let mut builder = Schedule::builder(WorldKind::Server);
+    builder.stage("one", &[&FIRST_ALONE]);
+    builder.stage("two", &[&FIRST_ALONE]);
+    assert_eq!(
+        builder.build().map(|_| ()).unwrap_err(),
+        ScheduleError::SetInTwoStages { set: "test::first_alone", first: "one", second: "two" }
+    );
     assert_eq!(
         build_error(&[&EMITTER, &READER]),
         ScheduleError::EventsBeforeEmitter {

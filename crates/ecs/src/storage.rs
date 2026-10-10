@@ -363,15 +363,19 @@ pub(crate) struct Storage {
     by_components: BTreeMap<Vec<ComponentKey>, u32>,
     pub(crate) entities: StableKeyMap,
     chunk_rows: Option<u32>,
+    /// The world's tick, from which stamps are ordered across the `u32` wrap when a moved
+    /// row's stamps meet a chunk's.
+    pub(crate) clock: Tick,
 }
 
 impl Storage {
-    pub(crate) fn new(chunk_rows: Option<u32>) -> Self {
+    pub(crate) fn with_clock(chunk_rows: Option<u32>, clock: Tick) -> Self {
         Self {
             archetypes: Vec::new(),
             by_components: BTreeMap::new(),
             entities: BTreeMap::new(),
             chunk_rows,
+            clock,
         }
     }
 
@@ -424,6 +428,7 @@ impl Storage {
     /// Appends a row for `key` to `archetype`. `values` holds exactly the archetype's
     /// components, ascending by key.
     pub(crate) fn push(&mut self, archetype: u32, key: StableKey, values: &[RowValue]) -> Loc {
+        let clock = self.clock;
         let arch = &mut self.archetypes[archetype as usize];
         debug_assert_eq!(arch.columns.len(), values.len());
         if arch.chunks.last().is_none_or(|chunk| chunk.len() == arch.capacity) {
@@ -441,7 +446,7 @@ impl Storage {
                 stamps.set(row, value.stamp);
             }
             let tick = &mut chunk.column_ticks[index];
-            *tick = (*tick).max(value.column_tick).max(value.stamp);
+            *tick = tick.later(value.column_tick, clock).later(value.stamp, clock);
         }
         let loc = Loc { archetype, chunk: chunk_index as u32, row: row as u32 };
         self.entities.insert(key, loc);
@@ -470,7 +475,8 @@ impl Storage {
         let last_chunk = arch.chunks.len() - 1;
         let last_row = arch.chunks[last_chunk].len() - 1;
         if (loc.chunk as usize, row) != (last_chunk, last_row) {
-            let moved = copy_row(arch, (last_chunk, last_row), (loc.chunk as usize, row));
+            let moved =
+                copy_row(arch, (last_chunk, last_row), (loc.chunk as usize, row), self.clock);
             self.entities.insert(moved, loc);
         }
         let arch = &mut self.archetypes[loc.archetype as usize];
@@ -519,12 +525,18 @@ pub(crate) fn mark(chunk: &mut Chunk, index: usize, row: usize, stamp: Stamp) {
         stamps.set(row, stamp);
     }
     let tick = &mut chunk.column_ticks[index];
-    *tick = (*tick).max(stamp);
+    // A write is stamped at the newest point there is.
+    *tick = stamp;
 }
 
 /// Copies the row at `from` over the row at `to` within one archetype and returns the key
 /// of the row copied. The destination chunk's column ticks rise to the source's.
-fn copy_row(arch: &mut Archetype, from: (usize, usize), to: (usize, usize)) -> StableKey {
+fn copy_row(
+    arch: &mut Archetype,
+    from: (usize, usize),
+    to: (usize, usize),
+    clock: Tick,
+) -> StableKey {
     let source = arch.chunks[from.0].clone_row(&arch.columns, from.1);
     let chunk = &mut arch.chunks[to.0];
     for (index, column) in arch.columns.iter().enumerate() {
@@ -533,7 +545,7 @@ fn copy_row(arch: &mut Archetype, from: (usize, usize), to: (usize, usize)) -> S
             stamps.set(to.1, source.values[index].stamp);
         }
         let tick = &mut chunk.column_ticks[index];
-        *tick = (*tick).max(source.values[index].column_tick);
+        *tick = tick.later(source.values[index].column_tick, clock);
     }
     chunk.keys[to.1] = source.key;
     source.key
