@@ -1,9 +1,9 @@
 //! What the snapshot and the step cost, printed and never asserted (`docs/verification.md`:
 //! the 100 µs physics snapshot budget for a prediction world, the 3 ms physics phase): the
-//! snapshot's size and the time to write and to restore it for 50 bodies beside 0, 100 and
-//! 1,000 fixed colliders, and the step of 2,000 awake bodies on one and four solver
-//! threads. Each time is the median of its repetitions; the machine's load is printed with
-//! them. Run it alone on an idle machine for numbers that mean anything.
+//! snapshot's size and the time to write and to restore it for 50 bodies beside 0 to 1,000
+//! fixed colliders, and the step of 2,000 awake bodies on one and four solver threads. Each
+//! time is the median of its repetitions; the machine's load is printed with them. Run it
+//! alone, with `--release`, on an idle machine for numbers that mean anything.
 
 #![forbid(unsafe_code)]
 

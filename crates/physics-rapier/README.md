@@ -151,10 +151,23 @@ order.
   `wide` SIMD lanes can return zeros of different sign on x86-64 and AArch64. No patch under
   fifty lines closes it, so the cross-architecture property stays unproven until SOUR's
   architecture mode runs on CI (`docs/verification.md`).
-- **Snapshot cost** (`tests/cost.rs`, printed, not asserted). For 50 bodies: about 65 kB,
-  written in about 80 µs and restored in about 110 µs, so restore misses the 100 µs budget.
-  Each fixed collider adds about 1.2 kB, 1.4 µs to write and 1.9 µs to restore; Rapier's
-  own encoding of its sets is most of the bytes.
+- **Snapshot cost** (`tests/cost.rs` with `--release`, printed, not asserted; Apple M1,
+  load average about 5). Fifty dynamic bodies beside fixed colliders:
+
+  | Fixed colliders | Bytes | Write | Restore |
+  |---|---|---|---|
+  | 0 | 64,860 | 32 µs | 45 µs |
+  | 25 | 95,597 | 47 µs | 66 µs |
+  | 50 | 125,972 | 61 µs | 83 µs |
+  | 75 | 156,347 | 76 µs | 100 µs |
+  | 100 | 187,846 | 92 µs | 127 µs |
+  | 1,000 | 1,299,298 | 654 µs | 1,225 µs |
+
+  Restore reaches the 100 µs budget at about 75 fixed colliders beside 50 bodies; write stays
+  under it to about 100. Each fixed collider adds about 1.2 kB, 0.6 µs to write and 1.0 to
+  1.2 µs to restore. Of its bytes about 700 are the fixed Rapier body a collider without a
+  `RigidBody` is attached to; attaching every such collider to one shared fixed body would
+  save them. Rapier's own encoding of its sets is most of the bytes.
 - A snapshot that decodes and passes the check but whose Rapier state is otherwise
   inconsistent (bytes not written by this backend) can make a later Rapier call panic.
 - `MultibodyJointSet::insert` and `insert_kinematic`, and `Multibody::inverse_kinematics` and
