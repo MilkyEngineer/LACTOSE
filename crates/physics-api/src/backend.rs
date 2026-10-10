@@ -109,7 +109,10 @@ impl StepOutput {
 /// # Validation
 ///
 /// The backend validates every value it is given (finite scalars, unit quaternions,
-/// positive extents and radii, a mass that is zero or positive). An invalid value is
+/// positive extents and radii, a mass that is zero or positive, a joint's `limit_min` no
+/// greater than its `limit_max` when it is limited, a non-zero axis on a revolute or
+/// prismatic joint; a fixed or spherical joint's axis is unused and may be zero). An
+/// invalid value is
 /// logged at target `physics` and the call does nothing; `create_body` and `create_joint`
 /// return `InvalidData`, and the sync retries the row when it changes. A backend therefore
 /// never aborts the process on a row's bytes.

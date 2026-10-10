@@ -9,7 +9,7 @@
 use lactose_core::{NetId, PlayerId, PredictionKey, StableKey, Tick};
 use lactose_math::{Quat, Scalar, Vec3};
 use lactose_physics_api::{
-    Collider, Joint, RigidBody, Shape, ShapeKind, Transform, Velocity, locked_axes,
+    Collider, Joint, JointKind, RigidBody, Shape, ShapeKind, Transform, Velocity, locked_axes,
 };
 use rapier3d_f64::geometry::SharedShape;
 use rapier3d_f64::math::{Pose, Rotation, Vector};
@@ -210,10 +210,15 @@ pub(crate) fn valid_joint(joint: &Joint) -> bool {
         || (joint.limit_min.is_finite()
             && joint.limit_max.is_finite()
             && joint.limit_min <= joint.limit_max);
+    // A fixed or spherical joint never reads its axis, so a zero one is no error there.
+    let axis = match joint.kind {
+        JointKind::Fixed | JointKind::Spherical => true,
+        JointKind::Revolute | JointKind::Prismatic => joint.axis.try_normalize().is_some(),
+    };
     joint.anchor_a.is_finite()
         && joint.anchor_b.is_finite()
         && joint.axis.is_finite()
-        && joint.axis.try_normalize().is_some()
+        && axis
         && limits
 }
 

@@ -31,8 +31,12 @@ use crate::convert::{
 };
 use crate::query;
 
-/// The log target of everything this crate logs.
-pub(crate) const TARGET: &str = "quark";
+/// The log target the `PhysicsBackend` contract names: refused values, unknown keys and
+/// dropped commands.
+const CONTRACT_TARGET: &str = "physics";
+
+/// The log target of what only this backend logs.
+pub(crate) const BACKEND_TARGET: &str = "quark";
 
 /// The seeds of the handle values: a handle is a hash of the key, so it does not depend on
 /// the order bodies were created in.
@@ -74,27 +78,27 @@ struct Moved {
 impl PhysicsBackend for Rapier {
     fn create_body(&mut self, key: StableKey, desc: &BodyDesc<'_>) -> Result<BodyHandle> {
         if self.book.bodies.contains_key(&Key(key)) {
-            tracing::warn!(target: TARGET, ?key, "create_body for a key the backend holds");
+            tracing::warn!(target: CONTRACT_TARGET, ?key, "create_body for a key the backend holds");
             return Err(invalid("create_body for a key the backend already holds"));
         }
         if desc.body.is_none() && desc.collider.is_none() {
             return Err(invalid("a body needs a RigidBody, a Collider or both"));
         }
         if !valid_transform(desc.transform) {
-            tracing::warn!(target: TARGET, ?key, "refused body: not a valid transform");
+            tracing::warn!(target: CONTRACT_TARGET, ?key, "refused body: not a valid transform");
             return Err(invalid("not a valid transform"));
         }
         if desc.body.is_some_and(|body| !valid_body(&body)) {
-            tracing::warn!(target: TARGET, ?key, "refused body: not a valid RigidBody");
+            tracing::warn!(target: CONTRACT_TARGET, ?key, "refused body: not a valid RigidBody");
             return Err(invalid("not a valid RigidBody"));
         }
         if desc.collider.is_some_and(|collider| !valid_collider(collider)) {
-            tracing::warn!(target: TARGET, ?key, "refused body: not a valid Collider");
+            tracing::warn!(target: CONTRACT_TARGET, ?key, "refused body: not a valid Collider");
             return Err(invalid("not a valid Collider"));
         }
         let velocity = desc.velocity.copied().filter(valid_velocity);
         if desc.velocity.is_some() && velocity.is_none() {
-            tracing::warn!(target: TARGET, ?key, "refused body: not a valid Velocity");
+            tracing::warn!(target: CONTRACT_TARGET, ?key, "refused body: not a valid Velocity");
             return Err(invalid("not a valid Velocity"));
         }
         let entry = BodyEntry {
@@ -116,7 +120,7 @@ impl PhysicsBackend for Rapier {
 
     fn remove_body(&mut self, key: StableKey) {
         let Some(entry) = self.book.bodies.remove(&Key(key)) else {
-            tracing::debug!(target: TARGET, ?key, "remove_body for a key the backend does not hold");
+            tracing::debug!(target: CONTRACT_TARGET, ?key, "remove_body for a key the backend does not hold");
             return;
         };
         self.book.dirty.remove(&Key(key));
@@ -136,7 +140,7 @@ impl PhysicsBackend for Rapier {
 
     fn set_body(&mut self, key: StableKey, body: Option<&RigidBody>) {
         if body.is_some_and(|body| !valid_body(body)) {
-            tracing::warn!(target: TARGET, ?key, "ignored set_body: not a valid RigidBody");
+            tracing::warn!(target: CONTRACT_TARGET, ?key, "ignored set_body: not a valid RigidBody");
             return;
         }
         if let Some(entry) = self.wanted(key) {
@@ -151,7 +155,7 @@ impl PhysicsBackend for Rapier {
 
     fn set_collider(&mut self, key: StableKey, collider: Option<&Collider>) {
         if collider.is_some_and(|collider| !valid_collider(collider)) {
-            tracing::warn!(target: TARGET, ?key, "ignored set_collider: not a valid Collider");
+            tracing::warn!(target: CONTRACT_TARGET, ?key, "ignored set_collider: not a valid Collider");
             return;
         }
         if let Some(entry) = self.wanted(key) {
@@ -166,7 +170,7 @@ impl PhysicsBackend for Rapier {
 
     fn set_transform(&mut self, key: StableKey, transform: &Transform) {
         if !valid_transform(transform) {
-            tracing::warn!(target: TARGET, ?key, "ignored set_transform: not a valid transform");
+            tracing::warn!(target: CONTRACT_TARGET, ?key, "ignored set_transform: not a valid transform");
             return;
         }
         if let Some(entry) = self.wanted(key) {
@@ -177,7 +181,7 @@ impl PhysicsBackend for Rapier {
 
     fn set_velocity(&mut self, key: StableKey, velocity: &Velocity) {
         if !valid_velocity(velocity) {
-            tracing::warn!(target: TARGET, ?key, "ignored set_velocity: not a valid Velocity");
+            tracing::warn!(target: CONTRACT_TARGET, ?key, "ignored set_velocity: not a valid Velocity");
             return;
         }
         if let Some(entry) = self.wanted(key) {
@@ -204,20 +208,20 @@ impl PhysicsBackend for Rapier {
         body_b: StableKey,
     ) -> Result<JointHandle> {
         if self.book.joints.contains_key(&Key(key)) {
-            tracing::warn!(target: TARGET, ?key, "create_joint for a key the backend holds");
+            tracing::warn!(target: CONTRACT_TARGET, ?key, "create_joint for a key the backend holds");
             return Err(invalid("create_joint for a key the backend already holds"));
         }
         if body_a == body_b {
-            tracing::warn!(target: TARGET, ?key, "refused joint: both ends are one body");
+            tracing::warn!(target: CONTRACT_TARGET, ?key, "refused joint: both ends are one body");
             return Err(invalid("a joint between a body and itself"));
         }
         if !valid_joint(joint) {
-            tracing::warn!(target: TARGET, ?key, "refused joint: not a valid Joint");
+            tracing::warn!(target: CONTRACT_TARGET, ?key, "refused joint: not a valid Joint");
             return Err(invalid("not a valid Joint"));
         }
         for end in [body_a, body_b] {
             if !self.book.bodies.contains_key(&Key(end)) {
-                tracing::warn!(target: TARGET, ?key, body = ?end, "refused joint: no such body");
+                tracing::warn!(target: CONTRACT_TARGET, ?key, body = ?end, "refused joint: no such body");
                 return Err(Error::new(ErrorKind::NotFound, "a joint's body is not held"));
             }
         }
@@ -236,7 +240,7 @@ impl PhysicsBackend for Rapier {
 
     fn remove_joint(&mut self, key: StableKey) {
         let Some(entry) = self.book.joints.remove(&Key(key)) else {
-            tracing::debug!(target: TARGET, ?key, "remove_joint for a key the backend does not hold");
+            tracing::debug!(target: CONTRACT_TARGET, ?key, "remove_joint for a key the backend does not hold");
             return;
         };
         if let Some(handle) = entry.handle {
@@ -248,7 +252,7 @@ impl PhysicsBackend for Rapier {
         // A step of zero length returns before the solver joins its deferred broad-phase
         // work, which would leave the tree out of the world.
         if !input.dt.is_finite() || input.dt <= Scalar::ZERO || !input.gravity.is_finite() {
-            tracing::warn!(target: TARGET, tick = input.tick.0, "skipped step: not a valid dt or gravity");
+            tracing::warn!(target: CONTRACT_TARGET, tick = input.tick.0, "skipped step: not a valid dt or gravity");
             return;
         }
         let mut moved = Moved::default();
@@ -360,7 +364,7 @@ impl Rapier {
     fn wanted(&mut self, key: StableKey) -> Option<&mut BodyEntry> {
         let entry = self.book.bodies.get_mut(&Key(key));
         if entry.is_none() {
-            tracing::debug!(target: TARGET, ?key, "a call for a key the backend does not hold");
+            tracing::debug!(target: CONTRACT_TARGET, ?key, "a call for a key the backend does not hold");
         }
         entry
     }
@@ -393,7 +397,7 @@ impl Rapier {
             }
             let end = |end: Key| self.book.bodies.get(&end).and_then(|entry| entry.live);
             let (Some(a), Some(b)) = (end(joint.body_a), end(joint.body_b)) else {
-                tracing::warn!(target: TARGET, key = ?key.0, "a joint whose bodies are not in the solver");
+                tracing::warn!(target: BACKEND_TARGET, key = ?key.0, "a joint whose bodies are not in the solver");
                 continue;
             };
             let data = generic_joint(&joint.joint.0, key_code(key.0));
@@ -435,6 +439,7 @@ impl Rapier {
             let built = build_collider(code, &collider, wanted.mass_plan());
             self.world.insert_collider(built, Some(body))
         });
+        self.recompute_mass(body);
         entry.live = Some(Live { held: None, body, collider });
     }
 
@@ -593,7 +598,20 @@ impl Rapier {
         {
             body.wake_up(true);
         }
+        if wake {
+            self.recompute_mass(handle);
+        }
         entry.live = Some(Live { held: None, body: handle, collider });
+    }
+
+    /// Brings the body's mass properties to its colliders and additional mass now. Rapier
+    /// otherwise does it in the step's user-change pass, after the tick's commands, so an
+    /// impulse in the tick of a creation or a mass change would see the old mass.
+    fn recompute_mass(&mut self, handle: rapier3d_f64::dynamics::RigidBodyHandle) {
+        let PhysicsWorld { bodies, colliders, .. } = &mut self.world;
+        if let Some(body) = bodies.get_mut(handle) {
+            body.recompute_mass_properties_from_colliders(colliders);
+        }
     }
 
     /// Applies the tick's commands in order. Returns the bodies given a force or torque,
@@ -609,7 +627,7 @@ impl Rapier {
             let Some((live, wanted)) =
                 self.book.bodies.get(&key).and_then(|entry| Some((entry.live?, entry.wanted)))
             else {
-                tracing::debug!(target: TARGET, key = ?key.0, "dropped command: no such body");
+                tracing::debug!(target: CONTRACT_TARGET, key = ?key.0, "dropped command: no such body");
                 continue;
             };
             // Every test before the mutable access, which marks the body modified. After the
@@ -617,7 +635,7 @@ impl Rapier {
             let honoured = match *command {
                 PhysicsCommand::Teleport { transform, .. } => valid_transform(&transform),
                 _ if wanted.body_type() != RigidBodyType::Dynamic => {
-                    tracing::debug!(target: TARGET, key = ?key.0, "dropped command: the body is not dynamic");
+                    tracing::debug!(target: CONTRACT_TARGET, key = ?key.0, "dropped command: the body is not dynamic");
                     continue;
                 }
                 PhysicsCommand::ApplyImpulseAt { impulse, point, .. } => {
@@ -629,7 +647,7 @@ impl Rapier {
                 | PhysicsCommand::ApplyTorque { torque: v, .. } => v.is_finite(),
             };
             if !honoured {
-                tracing::warn!(target: TARGET, key = ?key.0, "dropped command: not a valid value");
+                tracing::warn!(target: CONTRACT_TARGET, key = ?key.0, "dropped command: not a valid value");
                 continue;
             }
             let Some(body) = self.world.bodies.get_mut(live.body) else { continue };
@@ -882,7 +900,9 @@ fn reconcile_body(
 /// axes of a spherical one.
 fn generic_joint(joint: &Joint, code: u128) -> GenericJoint {
     let (a, b) = (vector(joint.anchor_a), vector(joint.anchor_b));
-    let axis = vector(joint.axis.normalize());
+    // Only the kinds that read the axis normalise it: `valid_joint` lets a zero one through
+    // for the others.
+    let axis = || vector(joint.axis.normalize());
     let limits = [joint.limit_min.to_f64(), joint.limit_max.to_f64()];
     let mut data: GenericJoint = match joint.kind {
         JointKind::Fixed => FixedJointBuilder::new().local_anchor1(a).local_anchor2(b).into(),
@@ -896,14 +916,14 @@ fn generic_joint(joint: &Joint, code: u128) -> GenericJoint {
             builder.into()
         }
         JointKind::Revolute => {
-            let mut builder = RevoluteJointBuilder::new(axis).local_anchor1(a).local_anchor2(b);
+            let mut builder = RevoluteJointBuilder::new(axis()).local_anchor1(a).local_anchor2(b);
             if joint.limited {
                 builder = builder.limits(limits);
             }
             builder.into()
         }
         JointKind::Prismatic => {
-            let mut builder = PrismaticJointBuilder::new(axis).local_anchor1(a).local_anchor2(b);
+            let mut builder = PrismaticJointBuilder::new(axis()).local_anchor1(a).local_anchor2(b);
             if joint.limited {
                 builder = builder.limits(limits);
             }

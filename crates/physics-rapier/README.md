@@ -20,9 +20,13 @@ what they leave to the backend. Decision D119 is the design.
 
 `backend(pool: rayon::ThreadPool) -> Box<dyn PhysicsBackend>`. `app` builds the pool; each
 of its threads enters `ThreadClass::PhysicsSolver` before the backend is returned (a refused
-scheduling class is logged at target `quark` and the thread runs at its default priority).
+scheduling class is logged and the thread runs at its default priority).
 Rapier's parallel work runs on that pool and nowhere else. The pool's size changes no output:
 `tests/determinism.rs` and `tests/conformance.rs` compare one, two and four threads.
+
+What the contract says is logged (refused values, unknown keys, dropped commands) goes to
+target `physics`; what only this backend logs (a refused scheduling class, a joint whose
+bodies are not in the solver) goes to target `quark`.
 
 ## Calls are recorded, the step applies them
 
@@ -37,8 +41,8 @@ the same scene in different orders, with noise, and compares the bytes).
   canonical bits, so `0.0` and `-0.0` differ.
 - A value that fails validation (a non-finite scalar, a rotation that is not unit, a
   negative mass, damping, density, friction, restitution or threshold, a non-positive shape
-  extent, an unknown locked-axis bit, a zero joint axis, limits out of order, a joint between
-  a body and itself) returns `InvalidData` from a creating call and is logged and dropped by
+  extent, an unknown locked-axis bit, a zero axis on a revolute or prismatic joint, limits
+  out of order, a joint between a body and itself) returns `InvalidData` from a creating call and is logged and dropped by
   a setting call; the bookkeeping is unchanged either way.
 - Every honoured write and command wakes the body. A kinematic body ignores velocity
   writes; a dynamic body in a frozen region keeps the velocity it was given for when it

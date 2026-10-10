@@ -91,6 +91,39 @@ fn an_impulse_moves_a_floating_body_along_it_and_mass_comes_from_the_body_or_the
     }
 }
 
+/// Review S1: the tick's commands run after the rows are applied, so an impulse in the
+/// tick a body is created or its mass changes sees the mass the rows give, with or without
+/// a collider.
+#[test]
+fn an_impulse_in_the_tick_of_a_creation_or_a_mass_change_sees_the_new_mass() {
+    let push = PhysicsCommand::ApplyImpulse { body: key(10), impulse: v(4.0, 0.0, 0.0) };
+    let dv = |out: &StepOutput| state(out, key(10)).unwrap().velocity.linear.x;
+    let close = |got: Scalar, want: f64| (got - s(want)).abs() < s(1e-9);
+    let weighing = |mass: f64| {
+        let mut body = floating();
+        body.mass = s(mass);
+        body
+    };
+    // Created without a collider and pushed in the same tick: a mass of zero is one.
+    for (mass, expected) in [(2.0, 2.0), (0.0, 4.0)] {
+        let mut b = backend(1);
+        create(&mut *b, key(10), Some(weighing(mass)), None, at(0.0, 5.0, 0.0));
+        let got = dv(&step(&mut *b, 1, &[push]));
+        assert!(close(got, expected), "mass {mass}, no collider: {got:?}");
+    }
+    // The mass doubled and pushed in the same tick: half the change a mass of two gives.
+    for collider in [None, Some(ball())] {
+        let mut b = backend(1);
+        create(&mut *b, key(10), Some(weighing(2.0)), collider, at(0.0, 5.0, 0.0));
+        step(&mut *b, 1, &[]);
+        let before = dv(&step(&mut *b, 2, &[push]));
+        assert!(close(before, 2.0), "mass 2, collider {}: {before:?}", collider.is_some());
+        b.set_body(key(10), Some(&weighing(4.0)));
+        let after = dv(&step(&mut *b, 3, &[push]));
+        assert!(close(after - before, 1.0), "mass 4, collider {}: {after:?}", collider.is_some());
+    }
+}
+
 #[test]
 fn a_force_lasts_one_step_and_a_push_on_a_body_that_is_not_dynamic_is_dropped() {
     let mut b = backend(1);
@@ -296,6 +329,42 @@ fn joints_wait_for_nothing_and_hold_their_bodies_together() {
     b.remove_body(c);
     b.remove_joint(joint);
     step(&mut *b, 30, &[]);
+}
+
+/// Review M2: the axis is checked only where the joint reads it; the limits are checked in
+/// order whatever the kind.
+#[test]
+fn a_joint_axis_is_checked_only_where_it_is_read_and_limits_must_be_in_order() {
+    let mut b = backend(1);
+    let (a, c) = (key(1), key(2));
+    create(&mut *b, a, Some(floating()), Some(ball()), at(0.0, 0.0, 0.0));
+    create(&mut *b, c, Some(floating()), Some(ball()), at(2.0, 0.0, 0.0));
+    let made = |b: &mut dyn PhysicsBackend, joint: u64, kind: JointKind, axis: Vec3| {
+        let row = Joint::new(kind, a, c).with_axis(axis);
+        b.create_joint(key(joint), &row, a, c).map(|_| ()).map_err(|error| error.kind())
+    };
+    let mut joint = 10;
+    for kind in [JointKind::Fixed, JointKind::Spherical] {
+        joint += 1;
+        assert_eq!(made(&mut *b, joint, kind, Vec3::ZERO), Ok(()), "{kind:?}");
+    }
+    for kind in [JointKind::Revolute, JointKind::Prismatic] {
+        joint += 1;
+        assert_eq!(made(&mut *b, joint, kind, Vec3::ZERO), Err(ErrorKind::InvalidData), "{kind:?}");
+        assert_eq!(made(&mut *b, joint, kind, Vec3::Y), Ok(()), "{kind:?}");
+    }
+    for kind in [JointKind::Fixed, JointKind::Spherical, JointKind::Revolute, JointKind::Prismatic]
+    {
+        joint += 1;
+        let reversed = Joint::new(kind, a, c).with_limits(s(0.5), s(-0.5));
+        let refused = b.create_joint(key(joint), &reversed, a, c).unwrap_err();
+        assert_eq!(refused.kind(), ErrorKind::InvalidData, "{kind:?}");
+    }
+    let mut out = step(&mut *b, 1, &[]);
+    for tick in 2..10 {
+        out = step(&mut *b, tick, &[]);
+    }
+    assert!(state(&out, a).is_some());
 }
 
 #[test]

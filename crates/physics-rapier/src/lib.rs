@@ -33,7 +33,7 @@ pub fn backend(pool: rayon::ThreadPool) -> Box<dyn PhysicsBackend> {
     pool.broadcast(|context| {
         if let Err(error) = ThreadClass::PhysicsSolver.enter() {
             tracing::warn!(
-                target: backend::TARGET,
+                target: backend::BACKEND_TARGET,
                 thread = context.index(),
                 %error,
                 "a solver thread runs without its scheduling class",

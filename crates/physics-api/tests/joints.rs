@@ -1,7 +1,8 @@
 //! Joints (`README.md`, "Joints"): a joint row spawned before its bodies waits and is
 //! created when they exist; a body's removal removes it and it waits again; an emptied
 //! reference parks it until its row changes; a change of its value recreates it; the
-//! handle row is present exactly while it is in the solver.
+//! handle row is present exactly while it is in the solver; a joint the backend refuses
+//! waits for its row to change.
 
 #![forbid(unsafe_code)]
 
@@ -106,6 +107,28 @@ fn a_joint_waits_for_its_bodies_and_follows_them() {
     // the joint with it): in log order, the same on every machine, and nothing waits.
     h = h.run(2);
     assert_eq!(sync_calls(&h.take()), []);
+}
+
+/// Limits out of order are an invalid value (`PhysicsBackend`, "Validation"): the backend
+/// refuses the joint, which has no handle until its row changes to a valid one.
+#[test]
+fn a_joint_with_limits_out_of_order_is_refused_until_its_row_changes() {
+    let mut h = Harness::new(WorldKind::Server);
+    h.spawn_body(key(CONTROLLER), at(0, -9, 0));
+    h.spawn_body(key(A), at(0, 0, 0));
+    h.spawn_body(key(B), at(1, 0, 0));
+    h.spawn(key(J), (joint().with_limits(Scalar::ONE, -Scalar::ONE),));
+    h = h.run(1);
+    assert_eq!(created(&h.take()), [key(J)]);
+    assert!(!has_handle(&h));
+    // Not retried while the row stays as it is.
+    h = h.run(1);
+    assert_eq!(created(&h.take()), []);
+    let ordered = joint().with_limits(-Scalar::ONE, Scalar::ONE);
+    h.script().at(3, When::Simulation, key(CONTROLLER), Action::SetJoint(key(J), ordered));
+    h = h.run(1);
+    assert_eq!(created(&h.take()), [key(J)]);
+    assert!(has_handle(&h));
 }
 
 #[test]

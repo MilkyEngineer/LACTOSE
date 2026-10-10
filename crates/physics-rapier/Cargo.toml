@@ -21,7 +21,8 @@ rapier3d-f64.workspace = true
 # The solver pool `app` builds and hands to `backend`.
 rayon.workspace = true
 serde.workspace = true
-# Refused values, dropped commands and unknown keys at target `quark`.
+# Refused values, dropped commands and unknown keys at target `physics`, as the contract
+# names; what only this backend logs at target `quark`.
 tracing.workspace = true
 
 [dev-dependencies]
