@@ -21,6 +21,9 @@ green. Assume this work has defects of that kind and go looking for them.
 - Environment: `. "$HOME/.cargo/env"` before cargo; never set `RUSTFLAGS`; run cargo from
   inside the copy. Any command over two minutes runs with `run_in_background`; never sit in a
   foreground command.
+- Build in one target directory for every review you do, `CARGO_TARGET_DIR` set to the
+  `target-review` directory under the scratchpad, so a later round does not rebuild the
+  workspace; keep one scratch copy per review and refresh it to each new commit.
 - The author's suites are assumed green; do not re-prove them. Write new probes that try to
   break the stated contracts, and run them in loops on this loaded machine (check `uptime`).
   A reproducible failure is worth more than any amount of inspection.
@@ -30,6 +33,9 @@ green. Assume this work has defects of that kind and go looking for them.
   around, a contract the documentation does not state, a type that lets a caller do the wrong
   thing, an architecture sentence the code quietly contradicts.
 - Do not pad. A finding you cannot trigger and cannot argue from the code is not a finding.
+- You are the first review of a crate or design; later rounds go to `reviewer-diff` with your
+  report as their checklist. Write it so that a reader with only the diff can re-check each
+  finding: file and lines, the trigger, the probe's path.
 
 ## Report (the final message)
 

@@ -42,6 +42,9 @@ report). This file says what an interface lane delivers instead of an implementa
   need, and name what you deferred and why.
 - Compile-only proof: the crate passes fmt, clippy with `-D warnings`, `cargo xtask tiers`
   and `cargo xtask boundary`, and its doctests. There is nothing to run.
-- Your work goes to the reviewer twice before it merges; the first draft of the ECS facade,
-  written with full context, still drew nine blocking findings. Write for that review:
-  state every contract, and say in the report what you are least sure of.
+- Your work goes to the reviewer before it merges: one full review, then a diff review of
+  each fix round. The first draft of the ECS facade, written with full context, still drew
+  nine blocking findings. Write for that review: state every contract, and say in the
+  report what you are least sure of.
+- Your commit messages end with `Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>`
+  and the `Claude-Session:` line your brief gives you.

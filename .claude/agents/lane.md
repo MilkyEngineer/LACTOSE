@@ -84,13 +84,18 @@ into your report:
 
 - `cargo fmt --all --check`
 - `cargo clippy --workspace --all-targets -- -D warnings`
+- `cargo xtask tiers`, `cargo xtask boundary` and `cargo xtask features` (`cargo xtask` is
+  `--locked`: after a manifest change regenerate `Cargo.lock` with `cargo metadata`)
 - `cargo nextest run --workspace --no-tests=pass`
+- `cargo xtask sour run --pr` when a crate inside the determinism boundary or under
+  `[harness]` changed
 - `cargo +nightly miri test -p <crate>` for every crate of yours that contains `unsafe`
 - any extra proof your brief names, run after your final change, not before it
 
-Then commit on your worktree branch (several commits are fine; include `Cargo.lock`), ending
-each commit message with the attribution lines your brief gives you. Git identity is already
-configured.
+Then commit on your worktree branch (several commits are fine; include `Cargo.lock`). End
+each commit message with `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>` and the
+`Claude-Session:` line your brief gives you, unless the brief gives other lines. Git identity
+is already configured.
 
 ## Your report (the final message)
 
@@ -107,5 +112,8 @@ Plain text, in this order:
    failed, was skipped, or could not be verified here, and why.
 6. Results of any `docs/verification.md` items your brief assigns, with the evidence.
 7. Known gaps and what the next consumer of your crate must know.
+8. The text block for the merge: the proposed `docs/decisions-log.md` entry or addendum,
+   every proposed sentence for a document or crate outside yours, and the measured numbers
+   with their load averages, as one block the coordinator's doc script can take verbatim.
 
 Report faithfully. A stated gap is fine; an unstated one is found by the reviewer.
