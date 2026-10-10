@@ -612,19 +612,80 @@ impl World {
     /// origin keys: a bound `Net` key inside a reference field of `bundle` is rewritten to
     /// the target's origin key here, as at command apply and [`insert`](Self::insert).
     pub fn spawn<B: Bundle>(&mut self, key: StableKey, region: RegionId, bundle: B) -> Result<()> {
-        if matches!(key, StableKey::Placeholder(_)) {
-            return Err(invalid("a placeholder names an entity only inside its command buffer"));
-        }
-        let key = self.canonical(key);
-        let mut components = erase_bundle(bundle);
+        let components = erase_bundle(bundle);
         if components.iter().any(|component| is_worlds_own(component.key())) {
             return Err(invalid("`InRegion` and `PredictedOrigin` are written by the world only"));
         }
-        for component in &mut components {
-            self.resolve_references(component, None, Some(key));
+        self.spawn_direct(key, region, components)
+    }
+
+    /// The bytes of `component` of `key` as stored (reference fields hold origin keys), or
+    /// `None` if the entity does not exist or lacks the component.
+    #[must_use]
+    pub fn get_erased(&self, key: StableKey, component: ComponentKey) -> Option<&[u8]> {
+        let loc = self.storage.loc(self.origin(key)?)?;
+        self.storage.component(loc, component)
+    }
+
+    /// Writes `data` whole to `key`, immediately, from its bytes: what a consumer that works
+    /// from the registry (`lactose-predict`'s corrections, `net`'s upserts) writes instead of
+    /// [`insert`](Self::insert). Checked in this order, nothing changing on an error:
+    /// `NotFound` if `data.component` is not registered, as `insert` reports it;
+    /// `InvalidData` if it is a resource, [`InRegion`](crate::InRegion) or
+    /// [`PredictedOrigin`](crate::PredictedOrigin), or `data.bytes` is not the registry's
+    /// element size; then the padding is zeroed and the bytes validated through
+    /// `TypeInfo::validate` (`InvalidData`, which refuses a placeholder in a reference
+    /// field); `NotFound` if the entity does not exist. A bound `Net` key in a reference
+    /// field is stored as the origin key, as `insert` stores it.
+    ///
+    /// Adds the component if the row lacks it, an archetype change the structural log
+    /// records, and otherwise writes it only if the stored bytes differ. A write stamps the
+    /// row as `insert` does, and keeps the reverse index and the claim index current for a
+    /// relationship component ([`OwnedBy`](crate::OwnedBy), [`ClaimedBy`](crate::ClaimedBy),
+    /// any with an `EntityRef` field); equal bytes change nothing, so no `Changed` reader
+    /// sees them. Returns whether it wrote.
+    pub fn insert_erased(&mut self, key: StableKey, data: &ComponentData) -> Result<bool> {
+        let component = self.erased_value(data)?;
+        let origin = self.origin(key).ok_or_else(|| not_found("no such entity"))?;
+        if self.get_erased(origin, component.key()) == Some(component.bytes()) {
+            return Ok(false);
         }
         let stamp = self.bump();
-        self.spawn_entity(key, region, components, stamp)
+        self.write_component(origin, component, stamp)?;
+        Ok(true)
+    }
+
+    /// Removes `component` from `key`, immediately, as [`remove`](Self::remove) does:
+    /// `Ok(false)` if the row lacks it; `NotFound` if the component is not registered or the
+    /// entity does not exist; `InvalidData` for a resource, [`InRegion`](crate::InRegion)
+    /// or [`PredictedOrigin`](crate::PredictedOrigin). The removal is logged, and the
+    /// reverse index and the claim index are updated.
+    pub fn remove_erased(&mut self, key: StableKey, component: ComponentKey) -> Result<bool> {
+        let info = self.component_info(component)?;
+        if is_worlds_own(info.key()) {
+            return Err(invalid(format!("`{}` is written by the world only", info.name())));
+        }
+        let origin = self.origin(key).ok_or_else(|| not_found("no such entity"))?;
+        Ok(self.remove_component(origin, component).is_some())
+    }
+
+    /// Spawns `key` in `region` with `components`, immediately, from their bytes: what
+    /// [`spawn`](Self::spawn) does for a consumer that works from the registry. Every entry
+    /// is checked as [`insert_erased`](Self::insert_erased) checks it, and two entries for
+    /// one component are `InvalidData`; the key rules are `spawn`'s (a `Net` or `Predicted`
+    /// key that no live entity has, `InvalidData` otherwise or for a placeholder; a
+    /// `Predicted` key gives [`PredictedOrigin`](crate::PredictedOrigin)), and `NotFound` if
+    /// the region is not loaded. Everything is checked before anything changes, so a
+    /// refused spawn changes nothing.
+    pub fn spawn_erased(
+        &mut self,
+        key: StableKey,
+        region: RegionId,
+        components: &[ComponentData],
+    ) -> Result<()> {
+        let components =
+            components.iter().map(|data| self.erased_value(data)).collect::<Result<Vec<_>>>()?;
+        self.spawn_direct(key, region, components)
     }
 
     /// Despawns `key` and the entities it owns, immediately.
@@ -1465,18 +1526,71 @@ impl World {
         });
     }
 
-    /// A region resource's bytes, validated, with every bound `Net` key in its reference
-    /// fields rewritten to the origin key.
-    fn canonical_resource(&self, info: &'static TypeInfo, bytes: &[u8]) -> Result<AlignedBytes> {
-        info.validate(bytes)?;
-        let mut bytes = bytes.to_vec();
-        for (_, key) in entity_refs(info, &bytes.clone()) {
+    /// A value of `info` to store directly, validated, with every bound `Net` key in its
+    /// reference fields rewritten to the origin key. A placeholder fails validation: it is
+    /// not a valid reference outside a command buffer.
+    fn canonical_bytes(&self, info: &TypeInfo, mut bytes: Vec<u8>) -> Result<Vec<u8>> {
+        info.validate(&bytes)?;
+        for (_, key) in entity_refs(info, &bytes) {
             let origin = self.canonical(key);
             if origin != key {
                 rewrite_refs(info, &mut bytes, key, origin);
             }
         }
-        Ok(AlignedBytes::from_bytes(&bytes))
+        Ok(bytes)
+    }
+
+    /// A region resource's bytes, as [`canonical_bytes`](Self::canonical_bytes) gives them.
+    fn canonical_resource(&self, info: &'static TypeInfo, bytes: &[u8]) -> Result<AlignedBytes> {
+        Ok(AlignedBytes::from_bytes(&self.canonical_bytes(info, bytes.to_vec())?))
+    }
+
+    /// The description of the registered component `component`: `NotFound` if it is not
+    /// registered, `InvalidData` if it is a resource.
+    fn component_info(&self, component: ComponentKey) -> Result<&'static TypeInfo> {
+        let info = self.registry.get(component).ok_or_else(|| {
+            not_found(format!("component {:#018x} is not registered", component.0))
+        })?;
+        if info.role() != TypeRole::Component {
+            return Err(invalid(format!("`{}` is not a component", info.name())));
+        }
+        Ok(info)
+    }
+
+    /// `data` as a component value for a direct write, through the checks
+    /// [`insert_erased`](Self::insert_erased) states, in its order, before the entity's.
+    fn erased_value(&self, data: &ComponentData) -> Result<ErasedComponent> {
+        let info = self.component_info(data.component)?;
+        if is_worlds_own(info.key()) {
+            return Err(invalid(format!("`{}` is written by the world only", info.name())));
+        }
+        let mut bytes = data.bytes.clone();
+        // The length is checked here, so a short value is `InvalidData` before validation.
+        info.zero_padding(&mut bytes)?;
+        let bytes = self.canonical_bytes(info, bytes)?;
+        Ok(ErasedComponent { info, payload: Payload::Bytes(bytes) })
+    }
+
+    /// The direct spawn behind [`spawn`](Self::spawn) and [`spawn_erased`](Self::spawn_erased):
+    /// the key rules, references resolved for a direct write, every check before the stamp,
+    /// so a refused spawn changes nothing.
+    fn spawn_direct(
+        &mut self,
+        key: StableKey,
+        region: RegionId,
+        mut components: Vec<ErasedComponent>,
+    ) -> Result<()> {
+        if matches!(key, StableKey::Placeholder(_)) {
+            return Err(invalid("a placeholder names an entity only inside its command buffer"));
+        }
+        let key = self.canonical(key);
+        for component in &mut components {
+            self.resolve_references(component, None, Some(key));
+        }
+        let row = self.spawn_row(key, region, components)?;
+        let stamp = self.bump();
+        self.push_spawned(key, region, row, stamp);
+        Ok(())
     }
 
     /// Rewrites every stored reference to `from` into `to`, the same entity under its origin
@@ -1558,9 +1672,23 @@ impl World {
         &mut self,
         key: StableKey,
         region: RegionId,
-        mut components: Vec<ErasedComponent>,
+        components: Vec<ErasedComponent>,
         stamp: Stamp,
     ) -> Result<()> {
+        let row = self.spawn_row(key, region, components)?;
+        self.push_spawned(key, region, row, stamp);
+        Ok(())
+    }
+
+    /// The row [`spawn_entity`](Self::spawn_entity) would push, every check made and
+    /// nothing changed: the components with `InRegion`, and `PredictedOrigin` for a
+    /// `Predicted` key that lacks it, ascending by key and validated.
+    fn spawn_row(
+        &self,
+        key: StableKey,
+        region: RegionId,
+        mut components: Vec<ErasedComponent>,
+    ) -> Result<Vec<(&'static TypeInfo, Vec<u8>)>> {
         if !self.regions.contains_key(&region) {
             return Err(not_found("the region is not loaded"));
         }
@@ -1584,7 +1712,7 @@ impl World {
             }));
         }
         components.sort_by_key(ErasedComponent::key);
-        let mut values = Vec::with_capacity(components.len());
+        let mut row = Vec::with_capacity(components.len());
         for (index, component) in components.iter().enumerate() {
             if index > 0 && components[index - 1].key() == component.key() {
                 return Err(invalid(format!("`{}` is in the bundle twice", component.info.name())));
@@ -1593,13 +1721,24 @@ impl World {
                 not_found(format!("`{}` is not registered", component.info.name()))
             })?;
             info.validate(component.bytes())?;
-            values.push(RowValue {
-                info,
-                bytes: component.bytes().to_vec(),
-                stamp,
-                column_tick: stamp,
-            });
+            row.push((info, component.bytes().to_vec()));
         }
+        Ok(row)
+    }
+
+    /// Pushes a row [`spawn_row`](Self::spawn_row) checked, stamped at `stamp`, and indexes
+    /// and logs it.
+    fn push_spawned(
+        &mut self,
+        key: StableKey,
+        region: RegionId,
+        row: Vec<(&'static TypeInfo, Vec<u8>)>,
+        stamp: Stamp,
+    ) {
+        let values: Vec<RowValue> = row
+            .into_iter()
+            .map(|(info, bytes)| RowValue { info, bytes, stamp, column_tick: stamp })
+            .collect();
         let infos: Vec<&'static TypeInfo> = values.iter().map(|value| value.info).collect();
         let archetype = self.storage.archetype(&infos);
         self.storage.push(archetype, key, &values);
@@ -1611,7 +1750,6 @@ impl World {
         if let StableKey::Predicted(predicted) = key {
             self.despawned_predicted.remove(&predicted);
         }
-        Ok(())
     }
 
     /// Writes a whole component of the live entity `key`, adding it if absent.
