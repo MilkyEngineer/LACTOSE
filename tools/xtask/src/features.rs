@@ -172,7 +172,8 @@ pub fn boundary_tree(
 /// dependency (`dep:` or `/`), or a package with no entry in `defaults`, is kept.
 ///
 /// That holds only if the package's code never tests `default` itself, through
-/// `cfg(feature = "default")` or a build script's `CARGO_FEATURE_DEFAULT`: then the
+/// `cfg(feature = "default")` or a build script's `CARGO_FEATURE_DEFAULT` or
+/// `CARGO_CFG_FEATURE`: then the
 /// feature changes the build whatever it turns on. `cargo xtask features` fails on any
 /// boundary package whose sources do ([`default_readers`]).
 #[must_use]
@@ -207,11 +208,13 @@ pub fn fold_defaults(tree: BoundaryTree, defaults: &BTreeMap<String, Vec<String>
 }
 
 /// The packages among `packages` (`name vX.Y.Z`) whose Rust sources test their `default`
-/// feature, as a `feature = "default"` cfg (any spacing) or the `CARGO_FEATURE_DEFAULT`
-/// variable, one finding per file: [`fold_defaults`] would hide a difference those
+/// feature, as a `feature = "default"` cfg (any spacing), the `CARGO_FEATURE_DEFAULT`
+/// variable or the `CARGO_CFG_FEATURE` list a build script is given (which names `default`
+/// whenever it is on), one finding per file: [`fold_defaults`] would hide a difference those
 /// packages compile. `dirs` holds each package's directory; every `.rs` file below it is
-/// read, build output and version control aside. A package without a directory is
-/// skipped. A file under `root` is reported relative to it, any other by its full path.
+/// read except under the package's own top-level `target` directory and any `.git`. A
+/// package without a directory is skipped. A file under `root` is reported relative to it,
+/// any other by its full path.
 ///
 /// # Errors
 /// If a directory or a file cannot be read.
@@ -224,7 +227,8 @@ pub fn default_readers(
     for package in packages {
         let Some(dir) = dirs.get(package) else { continue };
         let mut files = Vec::new();
-        rust_files(Path::new(dir), &mut files)?;
+        let dir = Path::new(dir);
+        rust_files(dir, &dir.join("target"), &mut files)?;
         for file in files {
             let text = std::fs::read(&file).map_err(|e| format!("{}: {e}", file.display()))?;
             if reads_default(&String::from_utf8_lossy(&text)) {
@@ -246,11 +250,18 @@ pub fn default_readers(
 /// Whether Rust source `text` tests the `default` feature.
 fn reads_default(text: &str) -> bool {
     let squeezed: String = text.chars().filter(|c| !c.is_whitespace()).collect();
-    squeezed.contains("feature=\"default\"") || squeezed.contains("CARGO_FEATURE_DEFAULT")
+    ["feature=\"default\"", "CARGO_FEATURE_DEFAULT", "CARGO_CFG_FEATURE"]
+        .iter()
+        .any(|pattern| squeezed.contains(pattern))
 }
 
-/// Every `.rs` file below `dir`, sorted, outside `target` and `.git`.
-fn rust_files(dir: &Path, files: &mut Vec<std::path::PathBuf>) -> Result<(), String> {
+/// Every `.rs` file below `dir`, sorted, outside the build output `output` and any `.git`. A
+/// `target` directory elsewhere is a source directory like any other.
+fn rust_files(
+    dir: &Path,
+    output: &Path,
+    files: &mut Vec<std::path::PathBuf>,
+) -> Result<(), String> {
     let mut entries = std::fs::read_dir(dir)
         .map_err(|e| format!("{}: {e}", dir.display()))?
         .collect::<Result<Vec<_>, _>>()
@@ -260,8 +271,8 @@ fn rust_files(dir: &Path, files: &mut Vec<std::path::PathBuf>) -> Result<(), Str
         let path = entry.path();
         let kind = entry.file_type().map_err(|e| format!("{}: {e}", path.display()))?;
         let name = entry.file_name();
-        if kind.is_dir() && name != "target" && name != ".git" {
-            rust_files(&path, files)?;
+        if kind.is_dir() && path != output && name != ".git" {
+            rust_files(&path, output, files)?;
         } else if kind.is_file() && path.extension().is_some_and(|e| e == "rs") {
             files.push(path);
         }
@@ -564,6 +575,7 @@ lactose-physics-api v0.0.0 (/ws/crates/physics-api)|
             ("#[cfg(all(feature=\"default\", unix))]", true),
             ("#[cfg(feature =\n    \"default\")]", true),
             ("let on = std::env::var_os(\"CARGO_FEATURE_DEFAULT\");", true),
+            ("let all = std::env::var(\"CARGO_CFG_FEATURE\");", true),
             ("#[cfg(feature = \"std\")]\n// the default build", false),
         ] {
             assert_eq!(reads_default(text), reads, "{text}");
@@ -578,6 +590,7 @@ lactose-physics-api v0.0.0 (/ws/crates/physics-api)|
         write("reads/src/lib.rs", "pub fn f() {}");
         write("reads/build.rs", "fn main() { let _ = option_env!(\"CARGO_FEATURE_DEFAULT\"); }");
         write("reads/target/debug/out.rs", "#[cfg(feature = \"default\")]");
+        write("reads/src/target/mod.rs", "#[cfg(feature = \"default\")] pub fn g() {}");
         write("clean/src/lib.rs", "#[cfg(feature = \"std\")] pub fn f() {}");
         let dir = |name: &str| root.join(name).to_string_lossy().into_owned();
         let dirs = BTreeMap::from([
@@ -589,10 +602,11 @@ lactose-physics-api v0.0.0 (/ws/crates/physics-api)|
         let findings = default_readers(&root, &packages, &dirs);
         std::fs::remove_dir_all(&root).unwrap();
         let findings = findings.unwrap();
-        // The build script only: output under `target` is not a source.
-        assert_eq!(findings.len(), 1, "{findings:?}");
-        assert_eq!(findings[0].path, "reads/build.rs");
-        assert!(findings[0].message.contains("`reads v1.0.0`"));
+        // The build script and the nested `target` module, in path order: output under the
+        // package's top-level `target` is not a source, a `target` directory below it is.
+        let paths: Vec<&str> = findings.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(paths, ["reads/build.rs", "reads/src/target/mod.rs"], "{findings:?}");
+        assert!(findings.iter().all(|f| f.message.contains("`reads v1.0.0`")));
     }
 
     #[test]
