@@ -480,7 +480,8 @@ fn check_kind(name: &str, kind: FieldKind, tag: &str) -> Result<()> {
         Err(Error::new(
             ErrorKind::Unsupported,
             format!(
-                "`{name}` is hashed but holds {what}; make it `derived` or use `lactose_math::Scalar`"
+                "`{name}` is hashed but holds {what}; make it `derived` or use \
+                 `lactose_math::Scalar`"
             ),
         ))
     };

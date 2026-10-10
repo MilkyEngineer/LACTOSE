@@ -239,13 +239,12 @@ impl SimulationBuilder {
         world.insert_resource(CurrentTick::new(self.tick));
         world.insert_resource(TimeScale::REAL_TIME);
         world.insert_resource(policy);
-        world.insert_service::<dyn InputApplier>(self.inputs.unwrap_or_else(|| Box::new(NoInputs)));
-        world.insert_service::<dyn SessionApplier>(
-            self.sessions.unwrap_or_else(|| Box::new(NoSessions)),
-        );
-        world.insert_service::<dyn StagedState>(
-            self.staged.unwrap_or_else(|| Box::new(NothingStaged)),
-        );
+        let inputs = self.inputs.unwrap_or_else(|| Box::new(NoInputs));
+        let sessions = self.sessions.unwrap_or_else(|| Box::new(NoSessions));
+        let staged = self.staged.unwrap_or_else(|| Box::new(NothingStaged));
+        world.insert_service::<dyn InputApplier>(inputs);
+        world.insert_service::<dyn SessionApplier>(sessions);
+        world.insert_service::<dyn StagedState>(staged);
         world.insert_service(Box::new(LifecycleSlot(RegionLifecycle::new(self.control))));
         world.insert_service(Box::new(TickInputSlot(None)));
         world.insert_service(Box::new(SaveSlot(None)));
@@ -256,7 +255,11 @@ impl SimulationBuilder {
         for (key, present) in probes {
             if present(&world) {
                 let name = world.registry().get(key).map_or("?", |info| info.name());
-                tracing::warn!(target: "curd", resource = name, "a world resource that is not `derived`: refused");
+                tracing::warn!(
+                    target: "curd",
+                    resource = name,
+                    "a world resource that is not `derived`: refused"
+                );
                 return Err(Error::new(
                     ErrorKind::InvalidData,
                     format!(
@@ -429,7 +432,8 @@ impl Simulation {
 
     #[expect(
         clippy::result_large_err,
-        reason = "the future's output the facade fixed: a run hands back the simulation by value, once per tick"
+        reason = "the future's output the facade fixed: a run hands back the simulation by \
+                  value, once per tick"
     )]
     async fn run_step(
         mut self,
@@ -478,7 +482,8 @@ impl Simulation {
 
     #[expect(
         clippy::result_large_err,
-        reason = "the future's output the facade fixed: a run hands back the simulation by value, once per tick"
+        reason = "the future's output the facade fixed: a run hands back the simulation by \
+                  value, once per tick"
     )]
     async fn run_passes_inner(
         mut self,
@@ -510,7 +515,8 @@ impl Simulation {
 
     #[expect(
         clippy::result_large_err,
-        reason = "the future's output the facade fixed: a run hands back the simulation by value, once per tick"
+        reason = "the future's output the facade fixed: a run hands back the simulation by \
+                  value, once per tick"
     )]
     async fn run_save(
         mut self,

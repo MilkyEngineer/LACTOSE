@@ -194,7 +194,11 @@ pub(crate) struct NoInputs;
 
 impl InputApplier for NoInputs {
     fn apply(&mut self, _: &mut World, player: PlayerId, _: &PlayerSample) -> Result<()> {
-        tracing::debug!(target: "curd", player = player.0, "no input applier: the input is dropped");
+        tracing::debug!(
+            target: "curd",
+            player = player.0,
+            "no input applier: the input is dropped"
+        );
         Ok(())
     }
 }

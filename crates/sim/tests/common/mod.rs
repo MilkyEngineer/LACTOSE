@@ -498,7 +498,12 @@ impl StagedState for Staged {
 pub static OBSERVERS: SystemSet = SystemSet::new("test::observers").after(&[&sets::INPUT]);
 
 /// Records the region modes once `sim`'s systems have run.
-#[system(name = "test::observe", worlds = [server, client, prediction], exclusive, in_set = OBSERVERS)]
+#[system(
+    name = "test::observe",
+    worlds = [server, client, prediction],
+    exclusive,
+    in_set = OBSERVERS
+)]
 pub fn observe(world: &mut World, log: Res<Log>) {
     let tick = world.tick();
     log.push(Call::After { tick, modes: modes(world) });
