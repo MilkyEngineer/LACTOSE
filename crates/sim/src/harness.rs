@@ -15,11 +15,14 @@
 //! production configuration and records nothing, so the same test runs under plain
 //! `cargo nextest run`.
 
-use lactose_core::{Result, Tick};
-use lactose_ecs::{Executor, LayoutConfig};
+use lactose_core::{Error, ErrorKind, Result, Tick};
+use lactose_ecs::{ChunkOrder, Executor, LayoutConfig};
 
 use crate::input::TickInput;
 use crate::simulation::Simulation;
+
+/// The ECS's one slab size: the production chunk capacity.
+const SLAB_BYTES: u32 = 16 * 1024;
 
 /// A chunk capacity as the runner names it (`protocol::Capacity`, plus production).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -46,7 +49,19 @@ pub enum ChunkCapacity {
 /// honour, so a test under a capacity the runner sent and the storage cannot apply fails
 /// rather than running something else.
 pub fn layout_mode(capacity: ChunkCapacity, seed: u64) -> Result<LayoutConfig> {
-    todo!()
+    let (chunk_rows, chunk_order) = match capacity {
+        ChunkCapacity::Production => return Ok(LayoutConfig::default()),
+        ChunkCapacity::Rows(7) => (Some(7), ChunkOrder::Reversed),
+        ChunkCapacity::Rows(rows) => (Some(rows), ChunkOrder::Shuffled),
+        ChunkCapacity::Bytes(SLAB_BYTES) => (None, ChunkOrder::Reversed),
+        ChunkCapacity::Bytes(bytes) => {
+            return Err(Error::new(
+                ErrorKind::Unsupported,
+                format!("the ECS has one slab size, {SLAB_BYTES} bytes, not {bytes}"),
+            ));
+        }
+    };
+    Ok(LayoutConfig { chunk_rows, seed, permute_rows: true, chunk_order, split_batches: true })
 }
 
 /// Steps `simulation` once per frame of `inputs` on `executor`, calling `record` with the
@@ -61,5 +76,10 @@ pub fn run_recorded(
     inputs: impl IntoIterator<Item = TickInput>,
     record: &mut dyn FnMut(Tick, u64) -> Result<()>,
 ) -> Result<Simulation> {
-    todo!()
+    let mut simulation = simulation;
+    for input in inputs {
+        simulation = executor.block_on(simulation.step(executor, input))?;
+        record(simulation.tick(), simulation.hash()?)?;
+    }
+    Ok(simulation)
 }

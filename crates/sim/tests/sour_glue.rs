@@ -75,8 +75,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let applied = RunConfig {
         workers: config.workers.map(|_| NonZeroU32::new(executor.frame_worker_count()).unwrap()),
         layout: applied_layout(simulation.world().layout()),
-        // Not reported by the executor: the test's own value (docs/verification.md).
-        chaos_seed: config.chaos_seed,
+        chaos_seed: executor.chaos_config().map(|chaos| chaos.seed),
     };
     let mut recorder = session.recorder(NAME, &applied)?;
     let frames = (0..10).map(|_| TickInput::default());

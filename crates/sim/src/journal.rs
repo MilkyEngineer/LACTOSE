@@ -93,6 +93,36 @@ impl JournalFrame {
     /// The record of `input`, applied for `tick`.
     #[must_use]
     pub fn record(tick: Tick, input: &TickInput) -> Self {
-        todo!()
+        let loaded = input
+            .loaded
+            .iter()
+            .map(|(&region, bundle)| {
+                let load = JournalLoad {
+                    seed: bundle.seed,
+                    mode: bundle.mode,
+                    baseline_hash: bundle.baseline.content_hash(),
+                    overlay: bundle.overlay.clone(),
+                    resources: bundle.resources.clone(),
+                    transient_resources: bundle.transient_resources.clone(),
+                    assets: bundle.assets.as_ref().map(|table| table.table().clone()),
+                };
+                (region, load)
+            })
+            .collect();
+        Self {
+            tick,
+            time_scale: input.time_scale,
+            failures: input.failures.clone(),
+            unloaded: input.unloaded.clone(),
+            loaded,
+            assets: input
+                .assets
+                .iter()
+                .map(|(&region, table)| (region, table.table().clone()))
+                .collect(),
+            modes: input.modes.clone(),
+            sessions: input.sessions.clone(),
+            inputs: input.inputs.clone(),
+        }
     }
 }

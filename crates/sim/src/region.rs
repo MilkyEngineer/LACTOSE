@@ -3,12 +3,15 @@
 //! regions that are always simulated, and an unload that writes the same records as a
 //! save.
 
+use core::ops::Bound;
 use std::collections::{BTreeMap, BTreeSet};
 
 use lactose_asset_api::AssetFailure;
-use lactose_core::{Error, PlayerId, Result, Tick};
-use lactose_ecs::{RegionId, RegionRows};
-use lactose_reflect::{component, resource};
+use lactose_core::{Error, ErrorKind, PlayerId, Result, Tick};
+use lactose_ecs::{RegionConfig, RegionId, RegionMode, RegionRows, World, WorldKind};
+use lactose_reflect::{Persistence, Registry, TypeRole, component, resource};
+
+use crate::input::{RegionBundle, SessionApplier, SessionEvent, TickInput};
 
 /// A region's place on the world grid, in regions. The radii of [`RegionPolicy`] are
 /// distances between cells.
@@ -25,7 +28,9 @@ impl RegionCell {
     /// (Chebyshev), so a radius of one covers the eight neighbours. Exact in integers.
     #[must_use]
     pub const fn distance(self, other: Self) -> u32 {
-        todo!()
+        let dx = self.x.abs_diff(other.x);
+        let dy = self.y.abs_diff(other.y);
+        if dx > dy { dx } else { dy }
     }
 }
 
@@ -49,19 +54,27 @@ impl RegionAtlas {
     /// Places `region` at `cell`. Fails with `InvalidData` if the region or the cell is
     /// already in the atlas.
     pub fn insert(&mut self, region: RegionId, cell: RegionCell) -> Result<()> {
-        todo!()
+        if self.cells.contains_key(&region) {
+            return Err(Error::new(ErrorKind::InvalidData, "the region is in the atlas already"));
+        }
+        if self.regions.contains_key(&cell) {
+            return Err(Error::new(ErrorKind::InvalidData, "another region is at that cell"));
+        }
+        self.cells.insert(region, cell);
+        self.regions.insert(cell, region);
+        Ok(())
     }
 
     /// The cell of `region`, if the atlas has it.
     #[must_use]
     pub fn cell(&self, region: RegionId) -> Option<RegionCell> {
-        todo!()
+        self.cells.get(&region).copied()
     }
 
     /// The region at `cell`, if any.
     #[must_use]
     pub fn region_at(&self, cell: RegionCell) -> Option<RegionId> {
-        todo!()
+        self.regions.get(&cell).copied()
     }
 
     /// How many regions the atlas holds.
@@ -80,7 +93,7 @@ impl RegionAtlas {
     /// `centre`'s own region included if it exists, in ascending `RegionId` order.
     #[must_use]
     pub fn within(&self, centre: RegionCell, radius: u32) -> Within<'_> {
-        todo!()
+        Within { atlas: self, centre, radius, last: None }
     }
 }
 
@@ -97,7 +110,16 @@ impl Iterator for Within<'_> {
     type Item = RegionId;
 
     fn next(&mut self) -> Option<Self::Item> {
-        todo!()
+        // Each call resumes the walk after the region yielded last, so a whole iteration
+        // visits every region of the atlas once.
+        let mut rest = match self.last {
+            None => self.atlas.cells.range(..),
+            Some(last) => self.atlas.cells.range((Bound::Excluded(last), Bound::Unbounded)),
+        };
+        let found = rest.find(|(_, cell)| cell.distance(self.centre) <= self.radius);
+        let (&region, _) = found?;
+        self.last = Some(region);
+        Some(region)
     }
 }
 
@@ -179,7 +201,9 @@ pub enum RegionControl {
 }
 
 /// What the lifecycle asks of the side outside the boundary, taken with
-/// [`RegionLifecycle::take_requests`]. Under [`RegionControl::Anchored`] only.
+/// [`RegionLifecycle::take_requests`]. `Load` and `Cancel` under
+/// [`RegionControl::Anchored`] only; `Release` after every unload of a `Server` world,
+/// under either control.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub enum RegionRequest {
     /// Load this region: fetch its baseline and overlay, resolve its asset set, and answer
@@ -301,40 +325,429 @@ impl RegionLifecycle {
     /// Whether a load of `region` has been requested and neither answered nor cancelled.
     #[must_use]
     pub fn is_requested(&self, region: RegionId) -> bool {
-        todo!()
+        self.requested.contains(&region)
     }
 
     /// The region a `Join` for `player` waits for, if one is held.
     #[must_use]
     pub fn held_join(&self, player: PlayerId) -> Option<RegionId> {
-        todo!()
+        self.held_joins.get(&player).copied()
     }
 
     /// The requests issued since the last take, in the order they were issued.
     pub fn take_requests(&mut self) -> Vec<RegionRequest> {
-        todo!()
+        core::mem::take(&mut self.requests)
     }
 
     /// The regions exported and unloaded since the last take, in the order they were
     /// unloaded: what `lactose-persist` writes as the regions' records. Always empty on a
     /// world that is not `Server`, whose unloads do not export.
     pub fn take_exports(&mut self) -> Vec<RegionExport> {
-        todo!()
+        core::mem::take(&mut self.exports)
     }
 
     /// The bundles refused since the last take.
     pub fn take_load_failures(&mut self) -> Vec<LoadFailure> {
-        todo!()
+        core::mem::take(&mut self.load_failures)
     }
 
     /// The session events refused since the last take.
     pub fn take_session_failures(&mut self) -> Vec<SessionFailure> {
-        todo!()
+        core::mem::take(&mut self.session_failures)
     }
 
     /// The asset failures stamped since the last take, in tick order and, within a tick,
     /// in the order the frame carried them.
     pub fn take_asset_failures(&mut self) -> Vec<AssetFailureEvent> {
-        todo!()
+        core::mem::take(&mut self.asset_failures)
     }
+
+    // ---- The input sync point (README, "Regions") ----
+
+    /// `sim::apply_frame_regions`: the frame's failures, unloads, bundles, tables and
+    /// modes, in that order, taken out of `frame`.
+    pub(crate) fn apply_frame(
+        &mut self,
+        world: &mut World,
+        policy: &RegionPolicy,
+        frame: &mut TickInput,
+    ) {
+        let tick = world.tick();
+        for failure in core::mem::take(&mut frame.failures) {
+            self.asset_failures.push(AssetFailureEvent { tick, failure });
+        }
+        let directed = matches!(self.control, RegionControl::Directed);
+
+        let unloaded = core::mem::take(&mut frame.unloaded);
+        if directed {
+            for region in unloaded {
+                if is_loaded(world, region) {
+                    self.unload(world, region);
+                } else {
+                    tracing::debug!(
+                        target: "curd",
+                        region = region.0,
+                        "unload of a region that is not loaded: ignored"
+                    );
+                }
+            }
+        } else if !unloaded.is_empty() {
+            tracing::debug!(
+                target: "curd",
+                count = unloaded.len(),
+                "the frame's unloads are ignored under `Anchored`"
+            );
+        }
+
+        // This frame's joins count as anchors in the bundle check, so a join and its
+        // region's bundle in one frame load and apply together.
+        let joins: Vec<RegionId> = frame
+            .sessions
+            .values()
+            .filter_map(|event| match *event {
+                SessionEvent::Join { region } => Some(region),
+                SessionEvent::Leave => None,
+            })
+            .collect();
+        let anchors = match &self.control {
+            RegionControl::Anchored { atlas, .. } => self.anchor_cells(world, atlas, &joins),
+            RegionControl::Directed => BTreeSet::new(),
+        };
+        let release = Radii::clamped(policy).release;
+        for (region, bundle) in core::mem::take(&mut frame.loaded) {
+            if let Err(error) = self.load(world, &anchors, release, region, &bundle) {
+                tracing::warn!(target: "curd", region = region.0, %error, "region bundle refused");
+                self.load_failures.push(LoadFailure { tick, region, error });
+            }
+        }
+
+        for (region, table) in core::mem::take(&mut frame.assets) {
+            if world.set_region_assets(region, table).is_err() {
+                tracing::debug!(
+                    target: "curd",
+                    region = region.0,
+                    "asset table for a region that is not loaded: dropped"
+                );
+            }
+        }
+
+        let modes = core::mem::take(&mut frame.modes);
+        if directed {
+            for (region, mode) in modes {
+                if world.set_region_mode(region, mode).is_err() {
+                    tracing::debug!(
+                        target: "curd",
+                        region = region.0,
+                        "mode for a region that is not loaded: ignored"
+                    );
+                }
+            }
+        } else if !modes.is_empty() {
+            tracing::debug!(
+                target: "curd",
+                count = modes.len(),
+                "the frame's modes are ignored under `Anchored`"
+            );
+        }
+    }
+
+    /// Loads one bundle, or refuses it having changed nothing.
+    fn load(
+        &mut self,
+        world: &mut World,
+        anchors: &BTreeSet<RegionCell>,
+        release: u32,
+        region: RegionId,
+        bundle: &RegionBundle,
+    ) -> Result<()> {
+        if is_loaded(world, region) {
+            return Err(Error::new(ErrorKind::InvalidData, "the region is loaded already"));
+        }
+        let mode = match &self.control {
+            RegionControl::Directed => bundle.mode,
+            RegionControl::Anchored { atlas, pinned } => {
+                let cell = atlas.cell(region).ok_or_else(|| {
+                    Error::new(ErrorKind::NotFound, "the region is not in the atlas")
+                })?;
+                let wanted = pinned.contains(&region)
+                    || self.requested.contains(&region)
+                    || anchors.iter().any(|anchor| anchor.distance(cell) <= release);
+                if !wanted {
+                    return Err(Error::new(
+                        ErrorKind::InvalidData,
+                        "not wanted: neither pinned, nor requested, nor within the release radius \
+                         of an anchor",
+                    ));
+                }
+                if bundle.mode != RegionMode::Frozen {
+                    tracing::debug!(
+                        target: "curd",
+                        region = region.0,
+                        "a bundle's mode is ignored under `Anchored`"
+                    );
+                }
+                RegionMode::Frozen
+            }
+        };
+        if let Some(overlay) = &bundle.overlay {
+            overlay.check_against(&bundle.baseline)?;
+        }
+        check_resources(world.registry(), bundle)?;
+
+        world.create_region(RegionConfig { id: region, seed: bundle.seed, mode })?;
+        let filled =
+            world.load_region(region, &bundle.baseline, bundle.overlay.as_deref()).and_then(|()| {
+                // Validated above, so none of these fails; if one did, the region goes.
+                for resource in &bundle.resources {
+                    world.insert_region_resource_erased(region, resource.clone())?;
+                }
+                for &resource in &bundle.transient_resources {
+                    world.insert_region_resource_zeroed(region, resource)?;
+                }
+                if let Some(table) = &bundle.assets {
+                    world.set_region_assets(region, table.clone())?;
+                }
+                Ok(())
+            });
+        if let Err(error) = filled {
+            // `load_region` validates before it mutates, so the region is still empty and
+            // removing it leaves no row and no log entry.
+            let _ = world.unload_region(region);
+            return Err(error);
+        }
+        self.requested.remove(&region);
+        Ok(())
+    }
+
+    /// `sim::apply_sessions` on a `Server` world: each held join whose region is now
+    /// loaded and each of the frame's sessions, in ascending `PlayerId` order.
+    pub(crate) fn apply_sessions(
+        &mut self,
+        world: &mut World,
+        applier: &mut dyn SessionApplier,
+        sessions: BTreeMap<PlayerId, SessionEvent>,
+    ) {
+        let tick = world.tick();
+        let mut due: BTreeMap<PlayerId, SessionEvent> = self
+            .held_joins
+            .iter()
+            .filter(|&(_, &region)| is_loaded(world, region))
+            .map(|(&player, &region)| (player, SessionEvent::Join { region }))
+            .collect();
+        for (player, event) in sessions {
+            match event {
+                SessionEvent::Join { region } => {
+                    if let RegionControl::Anchored { atlas, .. } = &self.control
+                        && atlas.cell(region).is_none()
+                    {
+                        tracing::warn!(
+                            target: "curd",
+                            player = player.0,
+                            region = region.0,
+                            "join for a region the atlas lacks: refused"
+                        );
+                        let error =
+                            Error::new(ErrorKind::NotFound, "the region is not in the atlas");
+                        self.session_failures.push(SessionFailure { tick, player, error });
+                        continue;
+                    }
+                    // A newer join replaces a held one.
+                    if is_loaded(world, region) {
+                        self.held_joins.remove(&player);
+                        due.insert(player, event);
+                    } else {
+                        self.held_joins.insert(player, region);
+                        due.remove(&player);
+                    }
+                }
+                SessionEvent::Leave => {
+                    if self.held_joins.remove(&player).is_some() {
+                        // The join never reached the world: cancelling it is the whole leave.
+                        due.remove(&player);
+                    } else {
+                        due.insert(player, event);
+                    }
+                }
+            }
+        }
+        for (player, event) in due {
+            if matches!(event, SessionEvent::Join { .. }) {
+                self.held_joins.remove(&player);
+            }
+            if let Err(error) = applier.apply(world, player, event) {
+                tracing::warn!(
+                    target: "curd",
+                    player = player.0,
+                    ?event,
+                    %error,
+                    "session applier failed: the event is skipped"
+                );
+            }
+        }
+    }
+
+    /// `sim::apply_region_policy`: under `Anchored`, unloads, cancels, requests and modes;
+    /// under `Directed`, nothing.
+    pub(crate) fn apply_policy(&mut self, world: &mut World, policy: &RegionPolicy) {
+        let RegionControl::Anchored { atlas, pinned } = &self.control else {
+            return;
+        };
+        let radii = Radii::clamped(policy);
+        let anchors = self.anchor_cells(world, atlas, &[]);
+        let within = |radius: u32| {
+            let mut set = pinned.clone();
+            for &cell in &anchors {
+                set.extend(atlas.within(cell, radius));
+            }
+            set
+        };
+        let (active, wanted, kept) =
+            (within(radii.activation), within(radii.streaming), within(radii.release));
+
+        let loaded: Vec<RegionId> = world.regions().collect();
+        for &region in loaded.iter().filter(|region| !kept.contains(region)) {
+            self.unload(world, region);
+        }
+        let cancelled: Vec<RegionId> =
+            self.requested.iter().copied().filter(|region| !kept.contains(region)).collect();
+        for region in cancelled {
+            self.requested.remove(&region);
+            self.requests.push(RegionRequest::Cancel { region });
+        }
+        for region in wanted {
+            if !is_loaded(world, region) && self.requested.insert(region) {
+                self.requests.push(RegionRequest::Load { region });
+            }
+        }
+        for region in world.regions().collect::<Vec<_>>() {
+            let simulated = active.contains(&region) && world.region_assets(region).is_some();
+            let mode = if simulated { RegionMode::Simulated } else { RegionMode::Frozen };
+            world.set_region_mode(region, mode).expect("the region is loaded");
+        }
+    }
+
+    /// The cells of every anchor: the regions of the rows with [`StreamingAnchor`], of the
+    /// held joins and of `joins`, whatever their mode.
+    fn anchor_cells(
+        &self,
+        world: &World,
+        atlas: &RegionAtlas,
+        joins: &[RegionId],
+    ) -> BTreeSet<RegionCell> {
+        let mut regions: BTreeSet<RegionId> = BTreeSet::new();
+        for column in world.columns::<StreamingAnchor>() {
+            regions.extend(column.regions());
+        }
+        regions.extend(self.held_joins.values());
+        regions.extend(joins);
+        regions.into_iter().filter_map(|region| atlas.cell(region)).collect()
+    }
+
+    /// Unloads `region`: on a `Server` world it is exported first and released after.
+    fn unload(&mut self, world: &mut World, region: RegionId) {
+        let server = world.kind() == WorldKind::Server;
+        if server {
+            match world.export_region(region) {
+                Ok(rows) => self.exports.push(RegionExport { region, rows }),
+                Err(error) => {
+                    // Every server row is bound at apply, so this is a broken invariant;
+                    // the region stays loaded rather than losing its state.
+                    tracing::error!(
+                        target: "curd",
+                        region = region.0,
+                        %error,
+                        "region export failed: the region stays loaded"
+                    );
+                    return;
+                }
+            }
+        }
+        world.unload_region(region).expect("the region is loaded");
+        if server {
+            self.requests.push(RegionRequest::Release { region });
+        }
+    }
+}
+
+/// The policy's radii as the lifecycle uses them: clamped so that `release >= streaming >
+/// activation` holds whatever the overload ladder wrote.
+struct Radii {
+    activation: u32,
+    streaming: u32,
+    release: u32,
+}
+
+impl Radii {
+    fn clamped(policy: &RegionPolicy) -> Self {
+        let streaming = policy.streaming_radius;
+        let mut activation = policy.activation_radius;
+        let mut release = policy.release_radius;
+        let ceiling = streaming.saturating_sub(1);
+        if activation > ceiling {
+            tracing::debug!(
+                target: "curd",
+                activation,
+                streaming,
+                "activation radius clamped below the streaming radius"
+            );
+            activation = ceiling;
+        }
+        if release < streaming {
+            tracing::debug!(
+                target: "curd",
+                release,
+                streaming,
+                "release radius clamped up to the streaming radius"
+            );
+            release = streaming;
+        }
+        Self { activation, streaming, release }
+    }
+}
+
+/// Whether `region` is loaded.
+fn is_loaded(world: &World, region: RegionId) -> bool {
+    world.regions().any(|loaded| loaded == region)
+}
+
+/// Checks a bundle's region resources against the registry before anything is created.
+fn check_resources(registry: &Registry, bundle: &RegionBundle) -> Result<()> {
+    let invalid = |message: String| Err(Error::new(ErrorKind::InvalidData, message));
+    let mut seen = BTreeSet::new();
+    for data in &bundle.resources {
+        let key = data.component;
+        let Some(info) = registry.get(key).filter(|info| {
+            info.role() == TypeRole::Resource && info.persistence() == Persistence::Persistent
+        }) else {
+            return invalid(format!(
+                "resource {:#018x} is not a registered persistent resource",
+                key.0
+            ));
+        };
+        if data.bytes.len() != info.layout().size() {
+            return Err(Error::new(
+                ErrorKind::VersionMismatch,
+                format!("the bundle's `{}` is not the registry's size", info.name()),
+            ));
+        }
+        info.validate(&data.bytes)?;
+        if !seen.insert(key) {
+            return invalid(format!("the bundle carries `{}` twice", info.name()));
+        }
+    }
+    for &key in &bundle.transient_resources {
+        let transient = registry.get(key).is_some_and(|info| {
+            info.role() == TypeRole::Resource && info.persistence() == Persistence::Transient
+        });
+        if !transient {
+            return invalid(format!(
+                "resource {:#018x} is not a registered transient resource",
+                key.0
+            ));
+        }
+        if !seen.insert(key) {
+            return invalid(format!("the bundle carries resource {:#018x} twice", key.0));
+        }
+    }
+    Ok(())
 }

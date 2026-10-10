@@ -10,10 +10,11 @@ point what enters the boundary.
 | Determinism boundary | inside |
 | Unsafe | none, `#![forbid(unsafe_code)]` |
 
-**Status: facade.** Every public signature is final and every body that decides anything is
-`todo!()`; nothing here runs. This file is the contract the implementation lane meets, and
-every sentence under "Behaviour the signatures cannot express" is one a dependent crate may
-rely on. Architecture sections 4, 5.1, 6, 8.2, 8.3, 9.1, 9.2, 9.3, 9.7, 11, 14, 15.2, 15.3
+**Status: implemented.** Every behaviour below runs and is tested (the table at the end
+names the tests), and the simulation tests record their hashes under SOUR. Nothing is
+optimised: the world hash is sequential outside the crate's own pass, and the ECS run is
+the naive one. Every sentence under "Behaviour the signatures cannot express" is one a
+dependent crate may rely on. Architecture sections 4, 5.1, 6, 8.2, 8.3, 9.1, 9.2, 9.3, 9.7, 11, 14, 15.2, 15.3
 and 15.5 are the design; where this file and the architecture disagree, the architecture
 wins and this file is wrong. Decision D118 records the choices those sections left open
 and what the two design reviews changed. `crates/ecs/README.md` is the storage contract
@@ -247,9 +248,12 @@ error, and this crate's edges already order its own. Two crates that both add ex
 systems to one pass, or after `sets::INPUT`, do not name each other: `app` orders their
 sets through `Registration::order(before, after)`, which adds the edge to the schedule
 that declares the sets (the tick schedule across any of its stages, or the one pass that
-holds both); a set no schedule declares is `ScheduleError::UnknownOrderedSet`, an edge
-against the stage order a `Cycle`, both at `build`. An error from any hook is logged at
-target `curd` and that entry is skipped; the tick runs.
+holds both); a set no schedule declares, or two sets declared in different schedules, is
+`ScheduleError::UnknownOrderedSet`, an edge against the stage order a `Cycle`, both at
+`build`. A pass none of whose systems runs in the world's kind does not exist in that
+world, and an edge between two of its sets orders nothing there, so one ordering function
+serves every kind. An error from any hook is logged at target `curd` and that entry is
+skipped; the tick runs.
 
 A `TickInput` is applied field by field in the order its fields are declared, each map in
 ascending key order. Every keyed field is a map, so a frame cannot hold two entries for one
@@ -270,7 +274,9 @@ sync point at which its region is loaded, which may be later than its frame: unt
 the lifecycle holds it and its region counts as the player's position for activation. A
 `Join` for a region the atlas lacks, under `Anchored`, is refused and reported as a
 `SessionFailure` of kind `NotFound` (`take_session_failures`), neither held nor applied. A
-`Leave` is applied at once, and a `Leave` for a held `Join` cancels it. Held joins are
+`Leave` is applied at once, and a `Leave` for a held `Join` cancels it and is all of the
+leave: the join never reached the world, so the applier is not called. A newer `Join`
+replaces a held one. Held joins are
 journaled, since they came through a frame, and not snapshotted, which is fine on the
 server, the only kind that honours them.
 
@@ -392,7 +398,11 @@ then `World::unload_region`, then a `RegionRequest::Release`. On a world that is
   state: a save carries no players, held joins or requests, so on a load every player
   joins again. On a world that is not `Server` the run resolves at once to `Unsupported`
   with the simulation inside: a client never exports, and single-player runs a `Server`
-  world in-process with a local client.
+  world in-process with a local client. An export that fails (a row without a bound
+  `NetId`, which only a direct `world_mut()` spawn can leave on a server) fails the run with
+  that error and the simulation inside, unchanged, since an export reads and writes
+  nothing. An unload that cannot export keeps the region loaded and logs the error rather
+  than lose its state.
 - A load is `SimulationBuilder::tick(saved.tick).next_net_id(saved.next_net_id)` and then,
   for each saved region, a `RegionBundle` in a frame, under `Directed` or when the policy
   wants it. A cooked region's persistent region resources come from the caller in
@@ -501,16 +511,18 @@ for bit:
   so the `#[expect]`s below live in one place. The `applied` line reports the worker count
   from `Executor::frame_worker_count`, the layout from `World::layout` (`chunk_rows:
   Some(n)` as `rows:n:seed`, `None` with permutation as `bytes:16384:seed`, the default as
-  `production`), and the chaos seed the test built with, because the executor does not
-  report it; `docs/verification.md` carries that gap until `lactose-task` reports it.
+  `production`), and the chaos seed from `Executor::chaos_config`, so all three are what
+  the builders report rather than what the session asked for. `tests/sour.rs` is the glue
+  as the recording tests use it.
 - Every simulation test of this crate and of the game crates records this way; the package
   with such tests is listed under `[harness]` in `tools/xtask/ci-policy.toml`. Until
   `lactose-app-headless` exists, whose test target is the SOUR test crate of section 8.3,
   that package is `lactose-sim`.
 - The boundary lint file bans, on the re-exported `Executor`, what a boundary crate must
   not do with it: `frame_worker_count` and `slot_count` (worker identity), `spawn`,
-  `run_graph` and `platform` (arbitrary work and threads), `sleep_until` (a clock) and
-  `execution_log` (scheduling history). What a boundary crate can do with it is run a
+  `run_graph` and `platform` (arbitrary work and threads), `sleep_until` (a clock),
+  `execution_log` (scheduling history) and `chaos_config` (scheduling configuration). What
+  a boundary crate can do with it is run a
   schedule, block on a future, and build or shut down an executor. The glue and the
   timer-root sketch opt out item by item with `#[expect]`, since they are `app`'s and the
   test's code, outside the step. The physics backend's solver pool, which section 16 sizes
@@ -551,17 +563,21 @@ milestone 1 tooling's; this crate names the shape so `app` and the tools agree.
 
 ## Proof for milestone 1
 
-Nothing runs yet. The implementation lane replaces every `todo!()` and proves, under SOUR
-in workers, repeat, layout and chaos modes:
+The tests in `tests/`, each a nextest test that asserts on counts, orders and hashes and
+never on timing. `tests/sour.rs` records under SOUR, which runs the package in workers,
+repeat, layout and chaos modes; `tests/common/mod.rs` is a small game written as a game
+crate writes it, the hooks `app`, `input` and `net` write, and a driver that answers the
+lifecycle as `app` and `persist` would.
 
 | What | How |
 |---|---|
-| A step is a function of its frames | Two simulations stepped with equal frames hash equal every tick; a frame assembled in any order is one input |
-| The sync point order | Test hooks record the calls: regions, then sessions, then inputs, then staged state, then the policy; players ascend, regions ascend; a held `Join` is applied the sync point its region loads; a `Join` and its region's bundle in one frame load and apply in that frame |
-| The hash encoding | Golden hashes for a small registry, pinned; layout mode and worker count change nothing; a derived column and a world resource change nothing; a transient value, a region resource, the seed, the mode, the table and a marker component's presence each change it |
-| The digest | `digest(..).hash() == world_hash(..)`; one field changed gives one difference; a marker component on one side gives a row difference; `decode(encode(d)) == d` |
-| Activation | A join, then an anchor moving, loads and simulates the regions within the radii, freezes the ring, keeps the release ring, cancels and unloads outside it; a pinned region is simulated with no anchor; the exports equal a save of those regions |
-| Save and load | `save_point`, a new simulation from it through frames with every player joining again, `K` ticks each: equal hashes (architecture section 15.5, first two tests) |
-| Orders | Two crates' exclusive systems in one pass fail to build unordered and build in the order `Registration::order` gives |
-| Refusals | A bundle against another baseline, a second bundle for a loaded region, an unwanted bundle, a bad resource, a table for an unloaded region, a frame's `modes` under `Anchored`, a `Join` for a region outside the atlas, a non-`derived` world resource at build: each refused as stated, nothing changed, the tick runs, the failure is reported |
-| Runs | A removed resource fails the next run with the simulation inside the error; `save_point` on a prediction world likewise; the log is trimmed to the retention and a lagging consumer sees `None` |
+| A step is a function of its frames | `layout.rs`: two simulations stepped with equal frames hash equal every tick; `sync_point.rs`: a frame assembled in reversed order is one input |
+| The sync point order | `sync_point.rs`: test hooks record the calls: regions, then sessions, then inputs, then staged state, then the policy; players ascend, regions ascend; a frame's fields apply in declaration order; a held `Join` is applied the sync point its region loads; a `Join` and its region's bundle in one frame load and apply in that frame |
+| The hash encoding | `hash.rs`: golden hashes for a small registry, pinned and checked against a reimplementation over another xxh64; layout mode and registration order change nothing (`layout.rs`: nor worker count); a derived column and a world resource change nothing; a transient value, a region resource, the seed, the mode, the table and a marker component's presence each change it; the registration refusals |
+| The digest | `hash.rs`: `digest(..).hash() == world_hash(..)`; one field changed gives one difference; a marker component on one side gives a row difference; `decode(encode(d)) == d`, and nothing else decodes |
+| Activation | `regions.rs`, `sync_point.rs`: a join, then an anchor moving, loads and simulates the regions within the radii, freezes the ring, keeps the release ring, cancels and unloads outside it, with hysteresis on a border; a pinned region is simulated with no anchor; a late table; the clamps; the exports equal a save of those regions |
+| Save and load | `persist.rs`: `save_point`, a new simulation from it through frames with every player joining again, an in-place reload and an untouched twin, `K` ticks each: equal hashes; an unload and reload keeps every persistent column; a journal replayed by a small driver reproduces the hashes |
+| Orders | `runs.rs`: two crates' exclusive systems in one pass and after `sets::INPUT` fail to build unordered and run in the order `Registration::order` gives; the edges the schedules refuse |
+| Refusals | `refusals.rs`, `runs.rs`, `sync_point.rs`: a bundle against another baseline, a second bundle for a loaded region, an unwanted bundle, a bad resource, a document schema the registry disagrees with, a table for an unloaded region, a frame's `modes` and `unloaded` under `Anchored`, a `Join` for a region outside the atlas, a non-`derived` world resource at build: each refused as stated, nothing changed, the tick runs, the failure is reported |
+| Runs | `runs.rs`: a removed resource fails the next run with the simulation inside the error, and `run_passes` prepares both passes first; `save_point` off the server likewise; `Cancelled` hands nothing back; the log is trimmed to the retention and a lagging consumer sees `None`; the server drains presentation events |
+| SOUR | `sour.rs`: the program of `tests/common` for 300 ticks, built from the session and recording `(tick, hash)` after every step |
