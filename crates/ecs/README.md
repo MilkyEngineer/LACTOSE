@@ -419,16 +419,20 @@ What a system is, from its parameters (`SystemParam` has the table):
   `insert`, `remove` and `spawn` with the component named by its `ComponentKey`, and share
   their validation and index maintenance: typed and erased writes of the same values
   leave the same columns, row stamps, column ticks, structural log, reverse index and claim
-  index, except that `insert` stamps a write of equal bytes and `insert_erased` does not.
-  Each takes either key of a bound entity. `get_erased` returns the bytes as stored
+  index, and a refused write of either changes nothing, not even the point. They differ in
+  two ways. `insert` stamps a write of equal bytes and `insert_erased` does not. A
+  placeholder in a reference field is stored by `insert` and `spawn` as the empty
+  reference, as a direct write resolves any reference outside a command buffer, and
+  refused by the erased writes with `InvalidData` ("placeholder reference in `<field>`"),
+  since erased bytes come from the wire or a recorded slot, where a placeholder is never
+  valid. Each takes either key of a bound entity. `get_erased` returns the bytes as stored
   (reference fields hold origin keys), `None` if the entity or the component is absent.
 - `ComponentData::bytes` must be the registry's element size for its component
   (`InvalidData` otherwise). The bytes are copied, padding zeroed (`TypeInfo::zero_padding`),
-  validated through `TypeInfo::validate` (`InvalidData`, a placeholder in a reference field
-  among the refusals) and a bound `Net` key in a reference field rewritten to the origin
-  key, as `insert` does. An unregistered component is `NotFound`, a registered resource and
-  `InRegion` or `PredictedOrigin` are `InvalidData`, and a missing entity is `NotFound`; a
-  refused call changes nothing, not even the point.
+  validated through `TypeInfo::validate` (`InvalidData`) and a bound `Net` key in a
+  reference field rewritten to the origin key, as `insert` does. An unregistered component
+  is `NotFound`, a registered resource and `InRegion` or `PredictedOrigin` are
+  `InvalidData`, and a missing entity is `NotFound`.
 - `insert_erased` adds the component if the row lacks it (an archetype change the
   structural log records, the row stamped) and otherwise writes it only if the bytes
   differ, so an equal write stamps nothing and a `Changed` reader does not see it. It
@@ -469,6 +473,6 @@ repeat, layout and chaos modes.
 | `regressions.rs` | The findings of the pre-review: transient references in the index, pass events across a rollback, owner keys in either load order, exports after an unload, `set_tick` stamps, transient writers, double rollbacks, failed loads, resources removed mid-run |
 | `regressions_two.rs` | The findings of the second review: new chunks' column ticks above 2^31, presentation batches across the wrap, `writes` visibility by stage, a restore that revives a bound `Net` entity, `update_region_resource`, transient region resources through a reload, schedule ties, resource references through bind and restore, aliases a restore orphans |
 | `wrap_program.rs` | One program with marks, cursors, `Changed` readers, a pass, column and row ticks, presentation events and a rollback, run across the 2^30 rebase, 2^31 and the `u32` wrap, equal to a run far from any boundary |
-| `erased_rows.rs` | Typed and erased writes of the same values leave identical columns, row and column ticks, `changed_since` sets, structural logs, reverse and claim indices under every layout, `Net` references rewritten and `OwnedBy` and `ClaimedBy` among them; an equal `insert_erased` unseen by a `Changed` reader; every refusal with its kind and nothing changed; padding zeroed; `get_erased` through a restore and a snapshot round trip |
+| `erased_rows.rs` | Typed and erased writes of the same values leave identical columns, row and column ticks, `changed_since` sets, structural logs, reverse and claim indices under every layout, `Net` references rewritten and `OwnedBy` and `ClaimedBy` among them; an equal `insert_erased` unseen by a `Changed` reader; every refusal with its kind and nothing changed, a refused typed `insert` included; a placeholder refused by name, and stored empty by a typed write; padding zeroed; `get_erased` through a restore and a snapshot round trip |
 | `claims.rs` | The claim index behind `World::claimed`: current after every direct method, command, predicted spawn, ownership despawn, unload and restore, in key order under every layout |
 | `compile_fail.rs` | What `#[system]` and `#[finalize]` reject, and what they accept under `#![forbid(unsafe_code)]` |

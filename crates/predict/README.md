@@ -514,10 +514,9 @@ README.md`, "The applier")
   not shipped and are not listed: `physics-api`'s conformance scene has an exclusive
   `input_tick` system, and a test of this crate that builds that scene does not run the
   check. A system whose `worlds` exclude the prediction world is not judged.
-- It runs at the prediction world's build: `app` hands it to the builder as the check
-  function D122 proposes (`SimulationBuilder::check`, run after the registration functions
-  and before the schedules prepare, so a refused system is a build error with that
-  error); until that exists, the spike and a test call it on their descriptor lists. It
+- It runs at the prediction world's build: `app` hands it to the builder through
+  `SimulationBuilder::check`, which runs it after the registration functions and before
+  the schedules prepare, so a refused system is a build error with that error. It
   cannot live in `lactose-ecs`'s schedule (the ECS has no persistence policy to read) or
   in `xtask` (the rule needs the parameter types resolved).
 - Not judged: resources. A world resource is `derived` by `sim`'s build rule. A region
@@ -542,16 +541,15 @@ README.md`, "The applier")
 ## Not in this crate yet
 
 - The implementation lane starts only when what it is written against runs: in
-  `lactose-ecs`, `World::get_erased` (the record), `World::insert_erased` (corrections,
+  `lactose-net-api`, `StagedInbox::{push, pop_through, due}`; in `lactose-input`,
+  `PlayerInput::{substitute, after_substitute}`, `player_entity` and `PlayerInputApplier`.
+  `lactose-ecs`'s `World::get_erased` (the record), `World::insert_erased` (corrections,
   upserts), `World::remove_erased` (removals) and `World::spawn_erased` (proxies and
-  corrected spawns), with the signatures D122 gives so an ECS lane writes them without
-  another design round; in `lactose-net-api`, `StagedInbox::{push, pop_through, due}`; in
-  `lactose-input`, `PlayerInput::{substitute, after_substitute}`, `player_entity` and
-  `PlayerInputApplier`. Nothing here is written against a typed fallback.
-- `SimulationBuilder::check`, in `lactose-sim`, so the build check runs at build; proposed
-  in D122. `JoinAccepted::entity`, in `lactose-net-host`, so `app` learns the player's
-  entity from the server rather than from the game; proposed there too, with the control
-  message that carries a changed entity at milestone 4.
+  corrected spawns), and `lactose-sim`'s `SimulationBuilder::check`, run. Nothing here is
+  written against a typed fallback.
+- `JoinAccepted::entity`, in `lactose-net-host`, so `app` learns the player's entity from
+  the server rather than from the game; proposed in D122, with the control message that
+  carries a changed entity at milestone 4.
 - `TickPacer::poll` without its `resimulation_ticks` parameter, in `lactose-task`;
   proposed in D122. Until then `app` passes zero.
 - Forwarding nearby players' inputs into the prediction world (section 9.4, "later"): the

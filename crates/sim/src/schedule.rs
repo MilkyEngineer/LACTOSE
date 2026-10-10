@@ -143,8 +143,8 @@ impl Registration {
     pub(crate) fn new(kind: WorldKind) -> Self {
         Self {
             kind,
-            stages: Default::default(),
-            passes: Default::default(),
+            stages: [const { StageBuilder::new() }; 4],
+            passes: [const { StageBuilder::new() }; 2],
             orders: Vec::new(),
             handed: Vec::new(),
         }
@@ -313,13 +313,50 @@ enum Declared {
 }
 
 /// The sets and systems a registration function adds to one stage.
-#[derive(Default)]
+///
+/// Only a [`Registration`] makes one, so a registration function adds through the builders
+/// it is handed and cannot replace or move one, which the order of the systems a
+/// [`SimulationBuilder::check`](crate::SimulationBuilder::check) is handed relies on:
+///
+/// ```compile_fail
+/// fn register(registration: &mut lactose_sim::Registration) {
+///     *registration.stage(lactose_sim::Stage::Simulation) = lactose_sim::StageBuilder::default();
+/// }
+/// ```
+///
+/// ```compile_fail
+/// fn register(registration: &mut lactose_sim::Registration) {
+///     let moved = std::mem::take(registration.stage(lactose_sim::Stage::Simulation));
+///     *registration.pass(lactose_sim::Pass::Extract) = moved;
+/// }
+/// ```
+///
+/// ```compile_fail
+/// fn register(registration: &mut lactose_sim::Registration) {
+///     let mut moved = lactose_sim::StageBuilder::new();
+///     std::mem::swap(registration.stage(lactose_sim::Stage::Simulation), &mut moved);
+///     std::mem::swap(registration.pass(lactose_sim::Pass::Extract), &mut moved);
+/// }
+/// ```
+///
+/// ```compile_fail
+/// fn register(registration: &mut lactose_sim::Registration) {
+///     std::mem::swap(
+///         registration.stage(lactose_sim::Stage::Simulation),
+///         registration.pass(lactose_sim::Pass::Extract),
+///     );
+/// }
+/// ```
 pub struct StageBuilder {
     sets: Vec<&'static SystemSet>,
     systems: Vec<&'static SystemDescriptor>,
 }
 
 impl StageBuilder {
+    const fn new() -> Self {
+        Self { sets: Vec::new(), systems: Vec::new() }
+    }
+
     /// Declares `sets` in this stage, after any declared before. A set belongs to one stage;
     /// declaring it in two is [`ScheduleError::SetInTwoStages`] at build.
     pub fn sets(&mut self, sets: &[&'static SystemSet]) -> &mut Self {

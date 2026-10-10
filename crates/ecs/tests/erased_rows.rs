@@ -15,7 +15,11 @@ use lactose_ecs::{
     ChangeMark, Changed, ClaimedBy, InRegion, LayoutConfig, LogEntry, Mut, OwnedBy,
     PredictedOrigin, Referrer, RegionId, Schedule, World, WorldKind, system,
 };
-use lactose_reflect::{Component, Reflect, Resource, TypeRole};
+use lactose_reflect::{Component, Reflect, Resource, TypeRole, component};
+
+/// A component no registry of these tests holds.
+#[component(key = "test::unregistered", persistent)]
+struct Unregistered(#[field(id = 1)] u32);
 
 /// `value` as the bytes a consumer working from the registry holds.
 fn data<T: Component>(value: T) -> ComponentData {
@@ -432,6 +436,40 @@ fn every_refusal_has_its_kind_and_changes_nothing() {
         assert_eq!(world.spawn_erased(key, region, &components).unwrap_err().kind(), kind);
         assert_eq!(state(&world, &marks), before, "{key:?} {components:?}");
     }
+}
+
+/// Where the typed and erased writes part (review round 1, MINOR-3): a placeholder in a
+/// reference field, which a typed write stores empty and an erased one refuses by name; and
+/// a refused typed insert, which now leaves the point as a refused erased one does.
+#[test]
+fn a_placeholder_is_refused_by_name_and_a_refused_typed_insert_changes_nothing() {
+    let mut world = refusal_world();
+    let marks = [world.mark()];
+    let before = state(&world, &marks);
+    let placeholder = ThrownBy { thrower: to(StableKey::Placeholder(7)) };
+    let expected = "placeholder reference in `thrower` of `";
+
+    let error = world.insert_erased(net(1), &data(placeholder)).unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::InvalidData);
+    assert!(error.to_string().contains(expected), "{error}");
+    let components = [data(pos(0, 0)), data(placeholder)];
+    let error = world.spawn_erased(net(3), REGION, &components).unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::InvalidData);
+    assert!(error.to_string().contains(expected), "{error}");
+    assert_eq!(state(&world, &marks), before);
+
+    // A typed insert of an unregistered component, or of anything to a missing entity, is
+    // refused before the point moves.
+    let error = world.insert(net(1), Unregistered(1)).unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::NotFound);
+    assert_eq!(world.mark(), marks[0]);
+    assert_eq!(state(&world, &marks), before);
+    assert_eq!(world.insert(net(9), Health(1)).unwrap_err().kind(), ErrorKind::NotFound);
+    assert_eq!(state(&world, &marks), before);
+
+    // A typed write resolves a placeholder outside its buffer to the empty reference.
+    world.insert(net(1), placeholder).unwrap();
+    assert_eq!(world.get::<ThrownBy>(net(1)), Some(&ThrownBy { thrower: EntityRef::NONE }));
 }
 
 #[test]

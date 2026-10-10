@@ -68,7 +68,7 @@ fn app_build(
 
 /// `lactose-net`'s `StagedState` on a client, written here with typed writes for the
 /// sketch's two components; milestone 4 writes every registered replicated type through
-/// the erased write the README proposes.
+/// `World::insert_erased`, `remove_erased` and `spawn_erased`.
 struct ClientHook;
 
 fn find<T: Reflect>(components: &[ComponentData]) -> Option<T> {
@@ -132,7 +132,8 @@ fn apply_spawn(
     Ok(())
 }
 
-/// One removal: per registered type until `World::remove_erased` exists; absent is fine.
+/// One removal, typed by hand as the sketch is (`World::remove_erased` in milestone 4);
+/// absent is fine.
 fn apply_removed(world: &mut World, key: StableKey, component: ComponentKey) -> Result<()> {
     if component == Position::KEY {
         world.remove::<Position>(key)?;

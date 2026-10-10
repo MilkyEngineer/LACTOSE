@@ -341,6 +341,40 @@ pub(crate) fn entity_refs(info: &TypeInfo, bytes: &[u8]) -> Vec<(FieldId, Stable
     out
 }
 
+/// The name of the top-level field of a value of `info` that holds a placeholder reference,
+/// if one does. The bytes are not validated, since a placeholder is not a valid `EntityRef`:
+/// a reference is a placeholder when it equals the encoding `EntityRef::new` gives one, for
+/// an index taken from any of its words, so nothing else is ever reported as one.
+fn placeholder_field(info: &TypeInfo, bytes: &[u8]) -> Option<&'static str> {
+    fn holds(kind: &FieldKind, bytes: &[u8]) -> bool {
+        match kind {
+            FieldKind::EntityRef => {
+                let Ok(words) = bytemuck::try_pod_read_unaligned::<[u32; 4]>(bytes) else {
+                    return false;
+                };
+                words.into_iter().any(|index| {
+                    bytes == bytemuck::bytes_of(&EntityRef::new(StableKey::Placeholder(index)))
+                })
+            }
+            FieldKind::Struct(info) => info.fields().iter().any(|field| {
+                let range = field.offset()..field.offset() + field.size();
+                bytes.get(range).is_some_and(|bytes| holds(&field.kind(), bytes))
+            }),
+            FieldKind::Array { element, len, .. } => bytes
+                .len()
+                .checked_div(*len)
+                .filter(|&size| size > 0)
+                .is_some_and(|size| bytes.chunks_exact(size).any(|bytes| holds(element, bytes))),
+            _ => false,
+        }
+    }
+    info.layout().fields().iter().find_map(|field| {
+        let range = field.offset()..field.offset() + field.size();
+        let bytes = bytes.get(range)?;
+        holds(&field.kind(), bytes).then(|| field.name())
+    })
+}
+
 /// Rewrites every `EntityRef` naming `from` in a value of `info` to name `to`, located by
 /// the description; the caller stores bytes it has validated.
 fn rewrite_refs(info: &TypeInfo, bytes: &mut [u8], from: StableKey, to: StableKey) {
@@ -633,10 +667,12 @@ impl World {
     /// `NotFound` if `data.component` is not registered, as `insert` reports it;
     /// `InvalidData` if it is a resource, [`InRegion`](crate::InRegion) or
     /// [`PredictedOrigin`](crate::PredictedOrigin), or `data.bytes` is not the registry's
-    /// element size; then the padding is zeroed and the bytes validated through
-    /// `TypeInfo::validate` (`InvalidData`, which refuses a placeholder in a reference
-    /// field); `NotFound` if the entity does not exist. A bound `Net` key in a reference
-    /// field is stored as the origin key, as `insert` stores it.
+    /// element size; then the padding is zeroed, a placeholder in a reference field refused
+    /// by name (`InvalidData`; `insert` would store the empty reference, but erased bytes
+    /// come from the wire or a recorded slot, where a placeholder is never valid) and the
+    /// bytes validated through `TypeInfo::validate` (`InvalidData`); `NotFound` if the
+    /// entity does not exist. A bound `Net` key in a reference field is stored as the
+    /// origin key, as `insert` stores it.
     ///
     /// Adds the component if the row lacks it, an archetype change the structural log
     /// records, and otherwise writes it only if the stored bytes differ. A write stamps the
@@ -697,12 +733,14 @@ impl World {
 
     /// Writes the whole component `value` to `key`, adding it if absent, immediately, and
     /// updates the relationship index. Panics for [`InRegion`](crate::InRegion) and
-    /// [`PredictedOrigin`](crate::PredictedOrigin), which are the world's.
+    /// [`PredictedOrigin`](crate::PredictedOrigin), which are the world's. `NotFound` for a
+    /// missing entity or an unregistered component; a refused insert changes nothing.
     pub fn insert<T: Component>(&mut self, key: StableKey, value: T) -> Result<()> {
         assert!(!is_worlds_own(T::KEY), "`{}` is written by the world only", T::SCHEMA.name());
         let origin = self.origin(key).ok_or_else(|| not_found("no such entity"))?;
         let mut component = ErasedComponent::of(value);
         self.resolve_references(&mut component, None, None);
+        self.checked_info(&component)?;
         let stamp = self.bump();
         self.write_component(origin, component, stamp)
     }
@@ -1530,6 +1568,13 @@ impl World {
     /// reference fields rewritten to the origin key. A placeholder fails validation: it is
     /// not a valid reference outside a command buffer.
     fn canonical_bytes(&self, info: &TypeInfo, mut bytes: Vec<u8>) -> Result<Vec<u8>> {
+        if let Some(field) = placeholder_field(info, &bytes) {
+            return Err(invalid(format!(
+                "placeholder reference in `{field}` of `{}`: a placeholder names an entity only \
+                 inside its command buffer",
+                info.name()
+            )));
+        }
         info.validate(&bytes)?;
         for (_, key) in entity_refs(info, &bytes) {
             let origin = self.canonical(key);
@@ -1759,11 +1804,7 @@ impl World {
         component: ErasedComponent,
         stamp: Stamp,
     ) -> Result<()> {
-        let info = self
-            .registry
-            .get(component.key())
-            .ok_or_else(|| not_found(format!("`{}` is not registered", component.info.name())))?;
-        info.validate(component.bytes())?;
+        let info = self.checked_info(&component)?;
         let loc = self.storage.loc(key).ok_or_else(|| not_found("no such entity"))?;
         if let Some(old) = self.storage.component(loc, info.key()) {
             let old = old.to_vec();
@@ -1787,6 +1828,17 @@ impl World {
         self.index_references(key, info, component.bytes(), true);
         self.index_claim(key, info, component.bytes(), true);
         Ok(())
+    }
+
+    /// The registry's description of `component`, whose bytes it validates: `NotFound` if it
+    /// is not registered, `InvalidData` if the bytes are not a valid value.
+    fn checked_info(&self, component: &ErasedComponent) -> Result<&'static TypeInfo> {
+        let info = self
+            .registry
+            .get(component.key())
+            .ok_or_else(|| not_found(format!("`{}` is not registered", component.info.name())))?;
+        info.validate(component.bytes())?;
+        Ok(info)
     }
 
     /// Removes a component of the live entity `key`, returning its bytes if it had it.
