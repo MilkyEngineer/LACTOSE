@@ -10,15 +10,17 @@ carry the rules each agent follows.
 | Agent | Model, effort | Works in | Does |
 |---|---|---|---|
 | coordinator | Opus, high | the main checkout | Writes briefs, decides each finding, allocates decision numbers, applies document text, pushes, watches CI |
+| `planner` | Fable, xhigh | its own worktree | Plans across crates and milestones: a milestone plan, a proposal, the decision that settles one, an architecture revision |
 | `architect` | Fable, xhigh | its own worktree | Writes a crate's facade: final signatures, `todo!()` bodies, the README as the contract, the decision text |
 | `lane` | Opus, high | its own worktree | Implements a crate, a feature or a fix round against a brief |
 | `reviewer` | Opus, xhigh | a scratch copy | The first adversarial review of a crate or design; probes, never edits the tree under review |
 | `reviewer-diff` | Opus, high | a scratch copy | Review round 2 and later: the fix round's diff against the previous report, on a budget |
 | `merger` | Opus, high | the main checkout | Runs the merge protocol from a brief and commits; never pushes |
 
-Fable is reserved for interface invention, where a design error costs every crate written
-against it; everything else runs on Opus. The coordinator's model is set in
-`.claude/settings.json`.
+Fable is reserved for design whose errors cost every crate written against it: a crate's
+interface (the architect) and the plans and decisions above crates (the planner); everything
+else runs on Opus. The author of a design and its first reviewer run on different models. The
+coordinator's model is set in `.claude/settings.json`.
 
 ## 2. The flow per crate
 
@@ -40,6 +42,18 @@ An implementation, of a facade or of a crate with no facade:
 Every fix round so far has introduced a defect the next review caught, so an implementation
 merges only after a clean round; a facade merges after its last fix because its bodies are
 `todo!()` and its implementation will be reviewed in full.
+
+Plans and proposals:
+
+1. `planner` writes the milestone plan, proposal or decision from a brief, as a document.
+2. `reviewer` attacks it; the same `planner` answers the findings.
+3. The owner approves it, or sends it back.
+4. The coordinator commits it, with the decision entry and the amendments it carries.
+
+A planner runs at each milestone transition, when a proposal's gating spike reports, and for
+any architecture change larger than a merge's amendments. A review finding that is a design
+choice rather than a defect goes back to the design's author: the architect for a facade,
+the planner when it crosses crates; the coordinator decides defects, not designs.
 
 ## 3. The coordinator
 
