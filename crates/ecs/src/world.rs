@@ -1249,10 +1249,10 @@ impl World {
     /// there, not here. Region resources are not in an overlay; the caller inserts them
     /// with [`insert_region_resource_erased`](Self::insert_region_resource_erased) from the
     /// save or the relevance message, and the transient ones the export listed with
-    /// [`insert_region_resource_zeroed`](Self::insert_region_resource_zeroed). Every component schema must match the registry's; a
-    /// mismatch is an error of kind `VersionMismatch`, and `lactose-persist` migrates the
-    /// document first. Rows are stamped at the current point and logged as spawned; no
-    /// epoch starts.
+    /// [`insert_region_resource_zeroed`](Self::insert_region_resource_zeroed). Every
+    /// component schema must match the registry's; a mismatch is an error of kind
+    /// `VersionMismatch`, and `lactose-persist` migrates the document first. Rows are
+    /// stamped at the current point and logged as spawned; no epoch starts.
     pub fn load_region(
         &mut self,
         region: RegionId,
