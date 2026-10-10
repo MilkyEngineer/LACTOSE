@@ -14,9 +14,11 @@ use crate::world::{References, RegionState, ResourceEntry, World};
 /// A copy of a world's rollback state at one tick: every column, derived ones included;
 /// the entity table; every reflected world resource and region resource; the regions'
 /// modes, seeds and asset tables; the input-tick table; and the relationship index. Not
-/// service resources, the physics world, proxy history or command buffers: services are
-/// not state, physics has its own snapshot, proxy history is kept by `lactose-predict`, and
-/// command buffers are empty at a snapshot point by construction.
+/// service resources, the physics world, proxy history, command buffers or channels:
+/// services are not state, physics has its own snapshot, proxy history is kept by
+/// `lactose-predict`, command buffers are empty at a snapshot point by construction, and a
+/// channel that is not cleared at the input sync point is its consumer's to snapshot
+/// (`World::channel`); a restore drops what every channel holds.
 ///
 /// Two things a rollback must not undo stay with the world across a
 /// [`restore`](crate::World::restore): the prediction-to-network alias table, since a bind
@@ -123,6 +125,9 @@ impl WorldSnapshot {
             world.rekey_references(StableKey::Net(net), StableKey::Predicted(predicted));
         }
         world.events.clear();
+        // Every channel, the ones that are not cleared at the input sync point included: a
+        // restore returns to the snapshot's point, and what such a channel held there is the
+        // consumer's to have snapshotted (`World::channel`).
         world.channels.clear();
         world.present.rewind(self.tick);
         world.new_epoch();

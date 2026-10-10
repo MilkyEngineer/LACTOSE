@@ -1,5 +1,6 @@
-//! The components that describe a body, its collider and its joints, and the two the step
-//! writes back (architecture sections 4, 15.1 and 16).
+//! The components that describe a body, its collider and its joints, the two the write-back
+//! writes, and the marks this crate keeps on a body's row (architecture sections 4, 15.1
+//! and 16).
 //!
 //! Every component is laid out as its scalars first, then a tail whose size is a multiple
 //! of eight bytes, so the layout holds whichever width the milestone 1 precision test picks
@@ -16,14 +17,16 @@ const fn pad<const N: usize>() -> Padding<N> {
 
 /// The placement of an entity in the simulation: where it is and how it is turned. No
 /// scale: a scale is authoring or presentation data, and a collider's size is in its
-/// [`Shape`].
+/// [`Shape`]. The simulation's transform component for every entity, body or not; a crate
+/// that needs it and no physics depends on this crate for the type, which pulls no backend.
 ///
-/// The step writes it back for every body it moved, through `Commands::set` at the sync
-/// point that begins `Stage::Post`. A write made to it elsewhere (through `Mut` in a kernel
-/// or `Commands::set` from any system) is honoured by the sync at the next physics sync
-/// point: a dynamic or fixed body is placed there without a sweep, a kinematic body sweeps
-/// to it during the step. Extracted, so presentation interpolates between two of them, and
-/// replicated.
+/// The write-back writes it at the sync point that begins `Stage::Post` for every body the
+/// step moved. A write made to it elsewhere (through `Mut` in a kernel, or `Commands::set`
+/// from any system, in `Stage::Input`, `Stage::Simulation` or `Stage::Post`) is honoured by
+/// the sync at the next physics sync point: a dynamic or fixed body is placed there without
+/// a sweep, a kinematic body sweeps to it during the step. In `Stage::Physics` nothing but
+/// the write-back may write a body's transform: the write-back overwrites it. Extracted, so
+/// presentation interpolates between two of them, and replicated.
 #[component(key = "physics::transform", persistent, replicated, extracted)]
 #[derive(PartialEq, Debug)]
 pub struct Transform {
@@ -67,11 +70,12 @@ impl Transform {
 /// How a body moves: its linear velocity in units per second and its angular velocity as
 /// an axis scaled by radians per second, both in world space.
 ///
-/// Written back by the step for every body it moved, beside [`Transform`]; a write made to
-/// it elsewhere is honoured at the next physics sync point, so the section 6.1
+/// Written by the write-back for every body the step moved, beside [`Transform`]; a write
+/// made to it elsewhere is honoured at the next physics sync point, so the section 6.1
 /// `apply_gravity` kernel works on a body (set the body's `gravity_scale` to zero then, or
-/// the solver adds its own). A dynamic or kinematic body without this component gains one
-/// at the first write-back.
+/// the solver adds its own). A write to a kinematic body's velocity is ignored by the
+/// solver, which derives a kinematic body's velocity from where it sweeps. A dynamic or
+/// kinematic body without this component gains one at the first write-back.
 #[component(key = "physics::velocity", persistent, replicated)]
 #[derive(PartialEq, Debug)]
 pub struct Velocity {
@@ -87,6 +91,16 @@ impl Velocity {
     /// At rest.
     pub const ZERO: Self = Self { linear: Vec3::ZERO, angular: Vec3::ZERO };
 }
+
+/// Set on a body's row by the write-back in a tick whose step placed the body without a
+/// sweep (a `Teleport` command, or a [`Transform`] row write on a dynamic or fixed body),
+/// and zeroed by the ECS at the next input sync point: the no-interpolate flag extract and
+/// replication read (architecture section 5.3). The sync adds it to a row when the row
+/// becomes a body and removes it when the row stops being one. Transient, tracked, so a
+/// `Changed<Teleported>` reader or extract sees it set and sees it cleared.
+#[component(key = "physics::teleported", transient, replicated, extracted)]
+#[derive(PartialEq, Eq, Debug, Default)]
+pub struct Teleported(#[field(id = 1)] pub bool);
 
 /// What the solver does with a body.
 #[value]
@@ -131,7 +145,10 @@ pub mod locked_axes {
 ///
 /// Read when the body is created and whenever the row changes afterwards (the sync compares
 /// against its mark at every physics sync point), so a kernel may switch a ragdoll's bones
-/// from `Kinematic` to `Dynamic` by writing `body_type` through `Mut<RigidBody>`.
+/// from `Kinematic` to `Dynamic` by writing `body_type` through `Mut<RigidBody>`. In a
+/// `Prediction` world a row with this component and no `ClaimedBy` is a proxy: a kinematic
+/// body whatever `body_type` says, moved along its per-tick history by `lactose-predict`'s
+/// writes to its [`Transform`] row.
 #[component(key = "physics::rigid_body", persistent, replicated)]
 #[derive(PartialEq, Debug)]
 pub struct RigidBody {
@@ -154,7 +171,7 @@ pub struct RigidBody {
     #[field(id = 6)]
     pub locked_axes: u8,
     /// Whether the solver may put the body to sleep when it comes to rest. A sleeping body
-    /// is not written back until it wakes.
+    /// is not written back until it wakes; every row write and command on it wakes it.
     #[field(id = 7)]
     pub can_sleep: bool,
     #[field(padding)]
@@ -286,7 +303,8 @@ impl CollisionGroups {
 /// is not in this crate yet (`README.md`).
 ///
 /// Read when the collider is created and whenever the row changes afterwards, like
-/// [`RigidBody`].
+/// [`RigidBody`]. A collider's shape is not in a physics snapshot: the backend rebuilds it
+/// from this row at a restore.
 #[component(key = "physics::collider", persistent, replicated)]
 #[derive(PartialEq, Debug)]
 pub struct Collider {
@@ -309,20 +327,37 @@ pub struct Collider {
     /// Mass per unit volume, which gives the body's mass when [`RigidBody::mass`] is zero.
     #[field(id = 6)]
     pub density: Scalar,
-    /// Who it touches.
+    /// The normal impulse per step above which a contact of this collider is reported as
+    /// [`ContactPhase::Impact`](crate::ContactPhase::Impact) to this entity, when
+    /// [`events`](Self::events) is set; Rapier's per-collider contact force threshold.
     #[field(id = 7)]
+    pub impact_threshold: Scalar,
+    /// Who it touches.
+    #[field(id = 8)]
     pub groups: CollisionGroups,
     /// A sensor detects what enters it and reports [`TriggerEvent`](crate::TriggerEvent)s,
     /// but pushes nothing and is pushed by nothing.
-    #[field(id = 8)]
+    #[field(id = 9)]
     pub sensor: bool,
+    /// Whether the pairs this collider is in report events: contact events and impacts
+    /// for a solid collider, trigger events for a sensor. A pair reports if either of its
+    /// colliders has it (Rapier's `ActiveEvents::COLLISION_EVENTS`, and
+    /// `CONTACT_FORCE_EVENTS` for impacts). [`new`](Self::new) sets it false;
+    /// [`sensor`](Self::sensor) sets it true.
+    #[field(id = 10)]
+    pub events: bool,
+    /// An identifier game and presentation code give a surface (footstep sounds, decals,
+    /// damage rules); the backend ignores it.
+    #[field(id = 11)]
+    pub material: u16,
     #[field(padding)]
-    _pad: Padding<7>,
+    _pad: Padding<4>,
 }
 
 impl Collider {
     /// `shape` at the entity's origin, unrotated, with friction one half, no restitution,
-    /// unit density, in every group, not a sensor.
+    /// unit density, no impact threshold, in every group, not a sensor, reporting no
+    /// events, material zero.
     #[must_use]
     pub const fn new(shape: Shape) -> Self {
         Self {
@@ -332,8 +367,11 @@ impl Collider {
             friction: Scalar::HALF,
             restitution: Scalar::ZERO,
             density: Scalar::ONE,
+            impact_threshold: Scalar::ZERO,
             groups: CollisionGroups::ALL,
             sensor: false,
+            events: false,
+            material: 0,
             _pad: pad(),
         }
     }
@@ -345,10 +383,19 @@ impl Collider {
         self
     }
 
-    /// The same collider as a sensor.
+    /// The same collider as a sensor that reports trigger events.
     #[must_use]
     pub const fn sensor(mut self) -> Self {
         self.sensor = true;
+        self.events = true;
+        self
+    }
+
+    /// The same collider reporting contact events, and impacts above `impact_threshold`.
+    #[must_use]
+    pub const fn with_events(mut self, impact_threshold: Scalar) -> Self {
+        self.events = true;
+        self.impact_threshold = impact_threshold;
         self
     }
 
@@ -356,6 +403,13 @@ impl Collider {
     #[must_use]
     pub const fn with_groups(mut self, groups: CollisionGroups) -> Self {
         self.groups = groups;
+        self
+    }
+
+    /// The same collider with `material`.
+    #[must_use]
+    pub const fn with_material(mut self, material: u16) -> Self {
+        self.material = material;
         self
     }
 }
@@ -382,11 +436,13 @@ pub enum JointKind {
 /// by one of its bodies (`OwnedBy`) so it migrates and despawns with that body.
 ///
 /// A joint whose bodies are not both live bodies at a physics sync point waits, and is
-/// created at the first sync point at which they are; one whose reference becomes empty
-/// (a body despawned, so its [`EntityRef`] was emptied at apply) is removed from the solver
-/// and waits again. A joint between a frozen body and a simulated one is a joint to a fixed
-/// body. The reference fields are written through `Commands::set` or the direct methods
-/// only, like every relationship.
+/// retried at every sync point until they are; one whose reference is empty (a body
+/// despawned, so its [`EntityRef`] was emptied at apply) is removed from the solver and not
+/// retried until the `Joint` row changes. A joint between a frozen body and a simulated
+/// one is a joint to a fixed body. The reference fields are written through `Commands::set`
+/// or the direct methods only, like every relationship. A limited joint evaluates
+/// transcendentals in the backend: `README.md`, "The backend's obligations", says what the
+/// backend lane must show before `limited` is relied on across architectures.
 #[component(key = "physics::joint", persistent, replicated)]
 #[derive(PartialEq, Debug)]
 pub struct Joint {
@@ -470,9 +526,10 @@ impl Joint {
 /// The backend's handle of the body the sync created for this row: present exactly while
 /// the row is a body in the solver (`README.md`, "Bodies"). Rebuilt on load and never
 /// saved, hashed or replicated (architecture section 15.1); in a prediction-world snapshot
-/// like every column, beside the physics snapshot its value refers into. Opaque to game
-/// code, which keys everything by `StableKey`; `Option<&BodyHandle>` in a kernel tells
-/// whether the entity is a live body.
+/// like every column, but nothing trusts the column: the sync and `restore` work from the
+/// bookkeeping [`Physics`](crate::Physics) carries, and a forged, removed or edited handle
+/// row changes nothing but what `Option<&BodyHandle>` tells a kernel. Opaque to game code,
+/// which keys everything by `StableKey`; the constructor and accessors are the backend's.
 #[component(key = "physics::body_handle", derived)]
 #[derive(PartialEq, Eq, Hash, Debug)]
 pub struct BodyHandle {
@@ -483,19 +540,23 @@ pub struct BodyHandle {
 }
 
 impl BodyHandle {
-    /// A handle from the backend's index and generation.
+    /// A handle from the backend's index and generation. The backend's; not part of the
+    /// interface game code writes against.
+    #[doc(hidden)]
     #[must_use]
     pub const fn new(index: u32, generation: u32) -> Self {
         Self { index, generation }
     }
 
-    /// The backend's index.
+    /// The backend's index. The backend's.
+    #[doc(hidden)]
     #[must_use]
     pub const fn index(self) -> u32 {
         self.index
     }
 
-    /// The backend's generation of the index.
+    /// The backend's generation of the index. The backend's.
+    #[doc(hidden)]
     #[must_use]
     pub const fn generation(self) -> u32 {
         self.generation
@@ -503,8 +564,8 @@ impl BodyHandle {
 }
 
 /// The backend's handle of the joint the sync created for this [`Joint`] row: present
-/// exactly while the joint is in the solver, which is while both its bodies are. Derived,
-/// like [`BodyHandle`].
+/// exactly while the joint is in the solver, which is while both its bodies are. Derived
+/// and untrusted, like [`BodyHandle`].
 #[component(key = "physics::joint_handle", derived)]
 #[derive(PartialEq, Eq, Hash, Debug)]
 pub struct JointHandle {
@@ -515,19 +576,22 @@ pub struct JointHandle {
 }
 
 impl JointHandle {
-    /// A handle from the backend's index and generation.
+    /// A handle from the backend's index and generation. The backend's.
+    #[doc(hidden)]
     #[must_use]
     pub const fn new(index: u32, generation: u32) -> Self {
         Self { index, generation }
     }
 
-    /// The backend's index.
+    /// The backend's index. The backend's.
+    #[doc(hidden)]
     #[must_use]
     pub const fn index(self) -> u32 {
         self.index
     }
 
-    /// The backend's generation of the index.
+    /// The backend's generation of the index. The backend's.
+    #[doc(hidden)]
     #[must_use]
     pub const fn generation(self) -> u32 {
         self.generation

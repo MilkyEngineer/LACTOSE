@@ -217,11 +217,12 @@ impl World {
         }
     }
 
-    /// The input sync point: events, channels and input ticks cleared, transient columns
-    /// zeroed (architecture section 6).
+    /// The input sync point: events, the channels that clear here and input ticks cleared,
+    /// transient columns zeroed (architecture section 6).
     pub(crate) fn input_sync(&mut self, stamp: Stamp) {
         self.events.clear();
-        self.channels.clear();
+        // A channel that opted out keeps its entries until its consumer takes them.
+        self.channels.retain(|_, stored| !stored.clear_at_input);
         self.input_ticks.clear();
         // The references a zeroed value held leave the reverse index with it.
         let mut zeroed_references = Vec::new();

@@ -7,16 +7,20 @@ use lactose_math::Vec3;
 
 use crate::components::Transform;
 
-/// The channel: the marker type a `Channel<PhysicsCommands>` parameter and
-/// `World::take_channel` name. Entries are [`PhysicsCommand`]s.
+/// The channel: the marker type `World::take_channel` and `World::channel` name. Entries
+/// are [`PhysicsCommand`]s.
 ///
-/// Entries recorded in `Stage::Input` or `Stage::Simulation` reach the step of the same
-/// tick. Entries recorded in `Stage::Physics` or `Stage::Post` do not: the step has run or
-/// is running, and the input sync point clears every channel before the next one.
+/// Not cleared at the input sync point (`CLEAR_AT_INPUT = false`): the sync takes every
+/// entry at the physics sync point, so an entry recorded in `Stage::Input` or
+/// `Stage::Simulation` reaches the step of the same tick and one recorded in
+/// `Stage::Physics` or `Stage::Post` reaches the next tick's, in command order. A restore
+/// drops what the channel holds; [`snapshot`](crate::snapshot) carries the untaken entries.
 pub struct PhysicsCommands;
 
 impl CommandChannel for PhysicsCommands {
     type Entry = PhysicsCommand;
+
+    const CLEAR_AT_INPUT: bool = false;
 
     fn remap(entry: &mut PhysicsCommand, f: &mut dyn FnMut(&mut StableKey)) {
         f(entry.body_mut());

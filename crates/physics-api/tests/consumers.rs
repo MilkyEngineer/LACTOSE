@@ -1,23 +1,25 @@
 //! Compile-only consumer sketches against the facade: what a game crate, `anim`, a backend
 //! crate, `app` and `predict` write, type-checked and never run (every deciding body of
 //! the crate is `todo!()`). They pin the surface the README promises: a change that breaks
-//! one is a signature change to list.
+//! one is a signature change to list. The registrations of sections 1 and 2 build under
+//! the real `ScheduleBuilder` (the round-1 review's probe E).
 
 #![forbid(unsafe_code)]
 #![allow(dead_code, unused_variables, missing_docs)]
 
 use lactose_core::{NetId, PlayerId, Result, StableKey, Tick};
 use lactose_ecs::{
-    ClaimedBy, Commands, Events, Executor, Mut, OwnedBy, Res, StableKeyOf, SystemSet, World,
-    WorldKind, system,
+    ClaimedBy, Commands, Events, Executor, LayoutConfig, Mut, OwnedBy, Res, StableKeyOf, SystemSet,
+    World, WorldKind, system,
 };
 use lactose_math::{Scalar, Vec3};
 use lactose_physics_api::conformance::snapshot_restore;
 use lactose_physics_api::{
     BodyDesc, BodyHandle, BodyType, Collider, ContactEvent, ContactPhase, Joint, JointHandle,
-    JointKind, Physics, PhysicsBackend, PhysicsConfig, PhysicsExt, QueryFilter, Ray, RayHit,
-    RigidBody, Shape, ShapeHit, StepInput, StepOutput, Transform, TriggerEvent, Velocity,
-    locked_axes, register_systems, register_types, restore, sets, setup, snapshot,
+    JointKind, Physics, PhysicsBackend, PhysicsCommand, PhysicsConfig, PhysicsExt, QueryFilter,
+    Ray, RayHit, RigidBody, Shape, ShapeHit, StepInput, StepOutput, Teleported, Transform,
+    TriggerEvent, Velocity, corrected, locked_axes, register_systems, register_types, restore,
+    sets, setup, snapshot,
 };
 use lactose_reflect::component;
 use lactose_sim::{
@@ -30,6 +32,13 @@ use lactose_sim::{
 pub struct Bomb(#[field(id = 1)] pub u32);
 
 pub static MOVEMENT: SystemSet = SystemSet::new("sketch::movement");
+/// A once-per-tick writer of body rows, ordered against the kernels that write them.
+pub static RESPAWN_SET: SystemSet = SystemSet::new("sketch::respawn_set").after(&[&MOVEMENT]);
+/// `Stage::Physics` after the step: this tick's `Physics` and events, last tick's rows.
+pub static AFTER_STEP: SystemSet = SystemSet::new("sketch::after_step").after(&[&sets::STEP]);
+/// `Stage::Post` after the write-back: this tick's rows.
+pub static AFTER_WRITE_BACK: SystemSet =
+    SystemSet::new("sketch::after_write_back").after(&[&sets::WRITE_BACK]);
 
 /// The section 6.1 example on a body: a direct `Velocity` write the sync honours, and an
 /// impulse on a spawn's placeholder resolved at apply.
@@ -40,7 +49,7 @@ fn throw(dt: Res<TickDelta>, cmd: Commands, key: StableKeyOf, vel: Mut<Velocity>
         Transform::at(Vec3::Y),
         Velocity::ZERO,
         RigidBody::dynamic(),
-        Collider::new(Shape::sphere(Scalar::HALF)),
+        Collider::new(Shape::sphere(Scalar::HALF)).with_events(Scalar::ONE).with_material(3),
         Bomb(0),
     ));
     cmd.physics().apply_impulse(thrown, Vec3::new(Scalar::ONE, Scalar::TWO, Scalar::ZERO));
@@ -71,39 +80,49 @@ fn ground_check(
     physics.overlap(&Shape::sphere(Scalar::TWO), pos, &QueryFilter::default(), &mut nearby);
 }
 
-/// Contacts are read in `Stage::Post`, indexed by target.
-#[system(name = "sketch::impact_damage", worlds = [server, prediction])]
+/// Contact-driven game code in `Stage::Post`: damage on an impact, and a command recorded
+/// here, which the next tick's step applies (the channel is not cleared at the input sync
+/// point).
+#[system(name = "sketch::impact_damage", worlds = [server, prediction], in_set = AFTER_WRITE_BACK)]
 fn impact_damage(
+    cmd: Commands,
     contacts: Events<ContactEvent>,
     triggers: Events<TriggerEvent>,
     key: StableKeyOf,
+    pos: &Transform,
+    teleported: Option<&Teleported>,
     bomb: &Bomb,
 ) {
     for contact in contacts.for_target(*key) {
-        if contact.phase == ContactPhase::Started && contact.impulse > Scalar::ONE {
+        if contact.phase == ContactPhase::Impact && contact.impulse > Scalar::ONE {
             let _ = (contact.other, contact.point, contact.normal);
+            cmd.physics().apply_impulse(contact.other, contact.normal * Scalar::TWO);
         }
     }
     for trigger in triggers.for_target(*key) {
         let _ = (trigger.other, trigger.phase);
     }
+    let no_interpolate = teleported.is_some_and(|flag| flag.0);
 }
 
 /// A once-per-tick system with no `Mut`: a row write through `Commands::set`, declared,
-/// which the sync treats like any other row write.
-#[system(name = "sketch::respawn", worlds = [server], writes = [Transform, Velocity])]
+/// which the sync treats like any other row write; its set is ordered after the kernels
+/// that write the same columns.
+#[system(name = "sketch::respawn", worlds = [server], in_set = RESPAWN_SET, writes = [Transform, Velocity])]
 fn respawn(cmd: Commands) {
     let key = StableKey::Net(NetId::cooked(1));
     cmd.set(key, Transform::at(Vec3::ZERO));
     cmd.set(key, Velocity::ZERO);
 }
 
-/// A reader of the stepped state placed in `Stage::Physics` itself: its set is after the
-/// step's, or the schedule fails to build.
-pub static AFTER_STEP: SystemSet = SystemSet::new("sketch::after_step").after(&[&sets::STEP]);
+/// A `Stage::Physics` system after the step: this tick's queries and events, and no row
+/// of a body, which it would read a tick late and could not write.
+#[system(name = "sketch::probe_physics", worlds = [server], in_set = AFTER_STEP)]
+fn probe_physics(physics: Res<Physics>, contacts: Events<ContactEvent>, bomb: &Bomb) {}
 
-#[system(name = "sketch::settle", worlds = [server], in_set = AFTER_STEP)]
-fn settle(physics: Res<Physics>, pos: &Transform) {}
+/// A reader of the stepped rows: `Stage::Post`, after the write-back.
+#[system(name = "sketch::settle", worlds = [server], in_set = AFTER_WRITE_BACK)]
+fn settle(physics: Res<Physics>, pos: &Transform, vel: &Velocity) {}
 
 pub fn register_types_game(types: &mut TypeTable) -> Result<()> {
     types.register::<Bomb>()?;
@@ -111,10 +130,14 @@ pub fn register_types_game(types: &mut TypeTable) -> Result<()> {
 }
 
 pub fn register_systems_game(registration: &mut Registration) {
-    registration.stage(Stage::Simulation).sets(&[&MOVEMENT]).add(&THROW).add(&GROUND_CHECK);
-    registration.stage(Stage::Physics).sets(&[&AFTER_STEP]).add(&SETTLE);
-    registration.stage(Stage::Post).add(&IMPACT_DAMAGE);
-    registration.stage(Stage::Simulation).add(&RESPAWN);
+    registration
+        .stage(Stage::Simulation)
+        .sets(&[&MOVEMENT, &RESPAWN_SET])
+        .add(&THROW)
+        .add(&GROUND_CHECK)
+        .add(&RESPAWN);
+    registration.stage(Stage::Physics).sets(&[&AFTER_STEP]).add(&PROBE_PHYSICS);
+    registration.stage(Stage::Post).sets(&[&AFTER_WRITE_BACK]).add(&IMPACT_DAMAGE).add(&SETTLE);
 }
 
 // ---- 2. anim: a ragdoll as owned bone rows and joint rows ----
@@ -154,8 +177,8 @@ fn ragdoll(body: Mut<RigidBody>, bone: &Bone) {
     }
 }
 
-/// Sockets read the stepped bone transforms in `Stage::Post`.
-#[system(name = "sketch::sockets", worlds = [server, prediction])]
+/// Sockets read the stepped bone transforms in `Stage::Post`, after the write-back.
+#[system(name = "sketch::sockets", worlds = [server, prediction], in_set = AFTER_WRITE_BACK)]
 fn sockets(pos: &Transform, bone: &Bone, handle: Option<&BodyHandle>, joint: Option<&JointHandle>) {
     let socket = pos.transform_point(Vec3::X);
 }
@@ -173,6 +196,7 @@ impl PhysicsBackend for Fake {
     fn create_body(&mut self, key: StableKey, desc: &BodyDesc<'_>) -> Result<BodyHandle> {
         let _: Option<BodyType> = desc.body.map(|body| body.body_type);
         let _: &Transform = desc.transform;
+        let kinematic = desc.proxy || desc.frozen;
         Ok(BodyHandle::new(0, 1))
     }
 
@@ -200,11 +224,12 @@ impl PhysicsBackend for Fake {
 
     fn remove_joint(&mut self, key: StableKey) {}
 
-    fn clear(&mut self) {}
-
     fn step(&mut self, input: &StepInput<'_>, output: &mut StepOutput) {
-        for entry in input.commands.iter() {
-            let _ = (entry.source, entry.entry.body());
+        for command in input.commands {
+            let _: StableKey = command.body();
+            if let PhysicsCommand::Teleport { body, transform } = command {
+                let _ = (body, transform);
+            }
         }
         let _ = (input.tick, input.dt, input.gravity);
         output.bodies.clear();
@@ -248,6 +273,21 @@ fn backend_with_pool() -> Box<dyn PhysicsBackend> {
     Box::new(Fake)
 }
 
+/// A backend's own unit test of `step`: no world, no schedule, a plain slice of commands.
+fn step_without_a_world(backend: &mut dyn PhysicsBackend) {
+    let commands =
+        [PhysicsCommand::ApplyImpulse { body: StableKey::Net(NetId::cooked(2)), impulse: Vec3::Y }];
+    let input = StepInput {
+        tick: Tick(1),
+        dt: Scalar::ONE / Scalar::from_u32(60),
+        gravity: PhysicsConfig::EARTH_GRAVITY,
+        commands: &commands,
+    };
+    let mut output = StepOutput::default();
+    backend.step(&input, &mut output);
+    let _ = output.bodies.iter().filter(|state| state.teleported).count();
+}
+
 // ---- 4. app: the setup closure and the registration functions ----
 
 fn app_build(kind: WorldKind) -> Result<Simulation> {
@@ -263,23 +303,28 @@ fn app_build(kind: WorldKind) -> Result<Simulation> {
         .build()
 }
 
-// ---- 5. predict: snapshot beside the world's, restore after it ----
+// ---- 5. predict: snapshot beside the world's, restore after it, corrections named ----
 
-fn rollback(simulation: &mut Simulation) -> Result<()> {
+fn rollback(simulation: &mut Simulation, corrected_bodies: &[StableKey]) -> Result<()> {
     let world_snapshot = simulation.world().snapshot();
     let physics_snapshot = snapshot(simulation.world())?;
     let _ = (physics_snapshot.tick(), physics_snapshot.size_in_bytes(), physics_snapshot.hash());
     simulation.world_mut().restore(&world_snapshot)?;
-    restore(simulation.world_mut(), &physics_snapshot)
+    restore(simulation.world_mut(), &physics_snapshot)?;
+    // Corrections are written through `ColumnMut::write` without recording; the sync is
+    // told which rows.
+    corrected(simulation.world_mut(), corrected_bodies)
 }
 
-// ---- 6. A backend's test: the conformance run, twice, equal ----
+// ---- 6. A backend's test: the conformance run, per pool size and layout, equal ----
 
 fn conformance(executor: &Executor) -> Result<()> {
-    let one = snapshot_restore(executor, backend_with_pool(), PhysicsConfig::default())?;
-    let many = snapshot_restore(executor, backend_with_pool(), PhysicsConfig::default())?;
+    let layout = LayoutConfig::default();
+    let one = snapshot_restore(executor, backend_with_pool(), PhysicsConfig::default(), layout)?;
+    let many = snapshot_restore(executor, backend_with_pool(), PhysicsConfig::default(), layout)?;
     assert_eq!(one, many);
     let _: Vec<(Tick, u64)> = one.first;
+    let _: (u64, u64) = one.physics_hash;
     Ok(())
 }
 
@@ -304,9 +349,15 @@ fn direct_scene(world: &mut World, region: lactose_ecs::RegionId) -> Result<()> 
         (
             Transform::at(Vec3::Y * Scalar::from_i32(3)),
             RigidBody::dynamic(),
-            Collider::new(Shape::sphere(Scalar::ONE)),
+            Collider::new(Shape::sphere(Scalar::ONE)).with_events(Scalar::ZERO),
             ClaimedBy { player: PlayerId(1) },
         ),
+    )?;
+    // A proxy: a body row without a claim, kinematic in a prediction world.
+    world.spawn(
+        StableKey::Net(NetId::cooked(3)),
+        region,
+        (Transform::IDENTITY, RigidBody::dynamic(), Collider::new(Shape::cuboid(Vec3::ONE))),
     )?;
     let _ = TickInput::default();
     Ok(())
