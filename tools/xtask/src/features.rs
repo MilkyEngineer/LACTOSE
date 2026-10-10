@@ -222,7 +222,9 @@ pub fn dump(
     let output = Command::new(cargo)
         .args(["tree", "--locked", "--package", package])
         .args(["--edges", edges, "--target", triple])
-        .args(["--format", "{p}|{f}"])
+        // Never coloured: CI sets `CARGO_TERM_COLOR=always`, and a colour code is not a tree
+        // character.
+        .args(["--format", "{p}|{f}", "--color", "never"])
         .current_dir(dir)
         .output()
         .map_err(|e| format!("cannot run `{cargo} tree`: {e}"))?;

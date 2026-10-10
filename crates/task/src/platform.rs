@@ -278,7 +278,7 @@ mod os {
     use super::CoreTopology;
 
     /// Reads an integer sysctl.
-    fn sysctl(name: &core::ffi::CStr) -> Option<u32> {
+    pub(super) fn sysctl(name: &core::ffi::CStr) -> Option<u32> {
         let mut value: i32 = 0;
         let mut size = size_of::<i32>();
         // SAFETY: `name` is NUL-terminated, `value` is a live `i32` and `size` holds its
@@ -567,8 +567,12 @@ mod tests {
     fn detected_topology_is_usable() {
         let topology = StdPlatform.topology();
         assert!(topology.performance >= 1);
+        // Apple Silicon has efficiency cores, but a virtual machine (the GitHub runner) may
+        // present one performance level; the assertion follows what the kernel reports.
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-        assert!(topology.efficiency >= 1, "Apple Silicon has efficiency cores");
+        if super::os::sysctl(c"hw.nperflevels").is_some_and(|levels| levels >= 2) {
+            assert!(topology.efficiency >= 1, "two performance levels but no efficiency core");
+        }
     }
 
     #[test]

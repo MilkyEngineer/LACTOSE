@@ -84,7 +84,8 @@ fn a_bad_command_line_is_a_usage_error() {
 
 fn repository_file(path: &str) -> String {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
-    std::fs::read_to_string(root.join(path)).expect(path)
+    // A Windows checkout may carry carriage returns; the checks below are on lines.
+    std::fs::read_to_string(root.join(path)).expect(path).replace("\r\n", "\n")
 }
 
 #[test]
