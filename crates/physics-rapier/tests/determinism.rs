@@ -1,11 +1,12 @@
-//! The step and the snapshot bytes are functions of the row history, not of the pool or of
-//! the order of the calls between two steps: a pile stepped on one, two and four solver
-//! threads, and built in different orders with writes, removals and re-creations between
-//! two steps that end at the same rows, reports the same bodies and events every tick and
-//! writes the same bytes. What it reports does not change when an unrelated scene is awake
-//! far away, whatever its keys. It does change when that scene was stepped once and removed
-//! and bodies are created later: Rapier's arena slots and free lists order the solver's
-//! work, and those follow every body the world ever held.
+//! The step and the snapshot bytes are functions of the row history (every create, remove,
+//! write and command, in order), not of the pool or of the order of the calls between two
+//! steps: a pile stepped on one, two and four solver threads, and built in different orders
+//! with writes, removals and re-creations between two steps that end at the same rows,
+//! reports the same bodies and events every tick and writes the same bytes. They are not
+//! functions of a body's own rows: what the pile reports depends on every body the world
+//! holds or held, far-away awake bodies that touch only each other included, and on bodies
+//! stepped once and removed. Bit equality holds only between worlds whose row histories are
+//! identical.
 
 #![forbid(unsafe_code)]
 
@@ -91,9 +92,12 @@ fn the_pile_is_the_same_whatever_order_built_it() {
 /// The first key of the distant scene; every key of the pile is below it.
 const DISTANT: u64 = 5_000;
 
+/// How long the far scenes run beside the pile: long enough for them to reach it.
+const LONG: u32 = 400;
+
 /// What the pile's own keys see: its bodies and the events between them.
 fn own(seen: Seen) -> Seen {
-    let near = |k: lactose_core::StableKey| k < key(DISTANT);
+    let near = |k: StableKey| k < key(DISTANT);
     Seen {
         bodies: seen.bodies.into_iter().filter(|state| near(state.key)).collect(),
         contacts: seen.contacts.into_iter().filter(|c| near(c.target) && near(c.other)).collect(),
@@ -101,11 +105,22 @@ fn own(seen: Seen) -> Seen {
     }
 }
 
-/// `docs/verification.md`: whether Rapier's single active set makes results depend on
-/// unrelated awake bodies. A second pile of balls falling onto its own floor a kilometre
-/// away, awake and colliding through the whole run, changes nothing the pile reports.
+/// The first tick whose reports differ, counting from one.
+fn first_difference(a: &[Seen], b: &[Seen]) -> Option<u32> {
+    let index = a.iter().zip(b).position(|(a, b)| a != b);
+    index.map(|i| u32::try_from(i).unwrap() + 1)
+}
+
+/// `docs/verification.md` and review N1: Rapier's shared structures make a body's results
+/// depend on unrelated awake bodies. A second pile of balls falling onto its own floor a
+/// kilometre away, colliding only with itself and never touched by a call after it is
+/// created, changes what the pile reports; so do far balls teleported onto their floors
+/// every 25 ticks, keyed above or below the pile. This test records the dependence; the
+/// ticks in the comments were observed, not asserted.
 #[test]
-fn distant_awake_bodies_change_nothing_the_pile_reports() {
+fn distant_awake_bodies_change_what_the_pile_reports() {
+    let above: Vec<u64> = (DISTANT..DISTANT + 7).collect();
+    let below = [2, 3, 4, 6, 7, 8, 9];
     for threads in [1, 4] {
         let mut alone = backend(threads);
         Pile::new(BODIES).create(&mut *alone, 0);
@@ -123,13 +138,25 @@ fn distant_awake_bodies_change_nothing_the_pile_reports() {
             );
         }
         Pile::new(BODIES).create(&mut *beside, 0);
-        let (alone, beside) = (run(&mut *alone, 1, TICKS), run(&mut *beside, 1, TICKS));
+        let (alone, beside) = (run(&mut *alone, 1, LONG), run(&mut *beside, 1, LONG));
         assert!(
-            beside.iter().all(|seen| seen.bodies.iter().any(|state| state.key >= key(DISTANT))),
-            "the distant pile stays awake"
+            beside[..TICKS as usize]
+                .iter()
+                .all(|seen| seen.bodies.iter().any(|state| state.key >= key(DISTANT))),
+            "the distant pile is awake"
         );
-        for (tick, (a, b)) in alone.into_iter().zip(beside).enumerate() {
-            assert_eq!(a, own(b), "{threads} threads, tick {}", tick + 1);
+        let beside: Vec<Seen> = beside.into_iter().map(own).collect();
+        // Observed: first differs at tick 238 on one and four threads.
+        let differs = first_difference(&alone, &beside);
+        assert!(differs.is_some(), "{threads} threads: the distant pile changed nothing");
+
+        let alone = history(threads, &[], Far::Kept, LONG);
+        for far in [&above[..], &below[..]] {
+            // Observed: first differs at tick 274, above and below, on one and
+            // four threads.
+            let teleported = history(threads, far, Far::Teleported, LONG);
+            let differs = first_difference(&alone, &teleported);
+            assert!(differs.is_some(), "{threads} threads, {far:?}: teleporting changed nothing");
         }
     }
 }
@@ -138,28 +165,48 @@ fn distant_awake_bodies_change_nothing_the_pile_reports() {
 /// arenas' free lists offer.
 const LATE: u32 = 40;
 
-/// The pile on `threads` threads with an unrelated scene of `far` keys a kilometre away
-/// (fixed colliders and dynamic balls in turn), created with it and, with `removed`,
-/// removed after that tick; ten balls join the pile at [`LATE`]. Each tick's report
-/// without the far scene.
-fn history(threads: usize, far: &[u64], removed: Option<u32>) -> Vec<Seen> {
+/// What [`history`] does with its far scene after creating it.
+#[derive(Clone, Copy)]
+enum Far {
+    /// Nothing.
+    Kept,
+    /// Removes it after the tick.
+    Removed(u32),
+    /// Every 25 ticks, places its balls one to three units above the floors.
+    Teleported,
+}
+
+/// The pile on `threads` threads for `ticks` ticks, with an unrelated scene of `far` keys a
+/// kilometre away (fixed colliders and dynamic balls in turn) created with it and treated
+/// as `what` says; ten balls join the pile at [`LATE`]. Each tick's report without the far
+/// scene.
+fn history(threads: usize, far: &[u64], what: Far, ticks: u32) -> Vec<Seen> {
+    let x = |i: usize| 1_000.0 + 3.0 * f64::from(u32::try_from(i).unwrap());
     let mut b = backend(threads);
     for (i, &n) in far.iter().enumerate() {
-        let x = 1_000.0 + 3.0 * f64::from(u32::try_from(i).unwrap());
         if i % 2 == 0 {
-            create(&mut *b, key(n), None, Some(floor()), at(x, 0.0, 500.0));
+            create(&mut *b, key(n), None, Some(floor()), at(x(i), 0.0, 500.0));
         } else {
-            create(&mut *b, key(n), Some(RigidBody::dynamic()), Some(ball()), at(x, 3.0, 500.0));
+            create(&mut *b, key(n), Some(RigidBody::dynamic()), Some(ball()), at(x(i), 3.0, 500.0));
         }
     }
     Pile::new(BODIES).create(&mut *b, 0);
     let near = |k: StableKey| !far.iter().any(|&n| key(n) == k);
-    (1..=TICKS)
+    (1..=ticks)
         .map(|tick| {
-            if removed.is_some_and(|after| tick == after + 1) {
-                for &n in far {
-                    b.remove_body(key(n));
+            match what {
+                Far::Removed(after) if tick == after + 1 => {
+                    for &n in far {
+                        b.remove_body(key(n));
+                    }
                 }
+                Far::Teleported if tick % 25 == 0 => {
+                    for (i, &n) in far.iter().enumerate().filter(|(i, _)| i % 2 == 1) {
+                        let up = 1.0 + f64::from((tick / 25 + u32::try_from(i).unwrap()) % 3);
+                        b.set_transform(key(n), &at(x(i), up, 500.0));
+                    }
+                }
+                _ => {}
             }
             if tick == LATE {
                 for n in 0..10_u32 {
@@ -187,29 +234,22 @@ fn history(threads: usize, far: &[u64], removed: Option<u32>) -> Vec<Seen> {
         .collect()
 }
 
-/// Review S2, `docs/verification.md`: results depend on the arenas' history, which a set
-/// of rows does not fix. Unrelated bodies that stay change nothing whatever their keys:
-/// they take slots in key order with the pile's, and the pile's own slots keep their
-/// order. Stepped once and removed, they leave free slots that the late balls take ahead
-/// of where they would be, and the pile is equal up to then and differs after. This test
-/// records the dependence: a backend whose arenas are canonical turns its last two cases
-/// into equalities.
+/// Review S2, `docs/verification.md`: results depend on the arenas' history. Unrelated
+/// bodies stepped once and removed leave free slots that the late balls take ahead of
+/// where they would be: the pile is equal up to then and differs after. The control keeps
+/// the same scene, which within these 120 ticks happens not to reach the pile (over longer
+/// runs it does: `distant_awake_bodies_change_what_the_pile_reports`).
 #[test]
 fn what_the_pile_reports_depends_on_the_arena_history() {
     let above: Vec<u64> = (DISTANT..DISTANT + 7).collect();
     let below = [2, 3, 4, 6, 7, 8, 9];
     assert!(below.iter().all(|&n| n < FIRST && n != FLOOR && n != PADDLE));
     for threads in [1, 4] {
-        let alone = history(threads, &[], None);
-        let first_difference = |far: &[u64], removed: Option<u32>| {
-            let other = history(threads, far, removed);
-            let tick = alone.iter().zip(&other).position(|(a, b)| a != b);
-            tick.map(|i| u32::try_from(i).unwrap() + 1)
-        };
-        assert_eq!(first_difference(&above, None), None, "{threads} threads, above, kept");
-        assert_eq!(first_difference(&below, None), None, "{threads} threads, below, kept");
+        let alone = history(threads, &[], Far::Kept, TICKS);
+        let kept = history(threads, &above, Far::Kept, TICKS);
+        assert_eq!(first_difference(&alone, &kept), None, "{threads} threads, the control");
         for far in [&above[..], &below[..]] {
-            let removed = first_difference(far, Some(1));
+            let removed = first_difference(&alone, &history(threads, far, Far::Removed(1), TICKS));
             assert!(
                 removed.is_some_and(|tick| tick >= LATE),
                 "{threads} threads, {far:?} removed: {removed:?}"

@@ -36,11 +36,12 @@ created or changed, joints waiting for a handle), then the step's commands in th
 input holds them, then steps. Rapier's arenas, islands and broad-phase tree are therefore
 independent of the order of the calls between two steps (`tests/determinism.rs` builds the
 same scene in different orders, with noise, and compares the bytes), but they are a function
-of the row history, not of the rows alone: an arena keeps its free list, and a body created
-after a removal takes a freed slot, which changes the order of the solver's work. Unrelated
-bodies that stay, whatever their keys, change nothing; unrelated bodies stepped once and
-removed change the results of bodies created afterwards (`tests/determinism.rs`). Two
-worlds holding different body sets or histories are not bit-equal for the bodies they share.
+of the row history (every create, remove, write and command, in order), not of the rows
+alone. A body's results depend on every body the world holds or held: far-away awake bodies
+that touch only each other change them, and so do bodies stepped once and removed, whose
+freed arena slots later bodies take (`tests/determinism.rs` records both). Bit equality
+holds only between worlds whose row histories are identical; two worlds holding different
+body sets or histories are not bit-equal for the bodies they share.
 
 - A call with a value equal to the one recorded does nothing. Equality is bitwise on the
   canonical bits, so `0.0` and `-0.0` differ.
