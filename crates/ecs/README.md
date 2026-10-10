@@ -33,6 +33,7 @@ and list what changed, because `sim`, `predict`, `physics-api`, `net`, `persist`
 | `Event`, `EventWriter`, `Events` | Cross-entity effects within a tick, indexed by target |
 | `PresentEvent`, `PresentEvents`, `PresentEventBatch` | Requests to presentation, keyed by (origin, tick, kind, sequence) for rollback |
 | `Schedule`, `ScheduleBuilder`, `ScheduleError` | Stages separated by sync points; a deterministic order; `run_tick` and `run_pass` |
+| `Executor` | Re-exported from `lactose-task`: what `run_tick` and `run_pass` take, so a boundary crate that drives a schedule (`sim`, `predict`) names it without a `task` edge |
 | `RegionId`, `RegionMode`, `RegionConfig`, `InRegion`, `OwnedBy`, `ClaimedBy`, `PredictedOrigin` | Regions and the components the world maintains |
 | `Rng` | The counter-based generator, from `Ctx::rng` and `World::rng` |
 | `ChangeMark`, `World::changed_since`, `World::is_current`, `World::columns`, `ColumnMut`, `DirtyRows`, `StructuralLog`, `LogCursor` | Change state read per consumer; whole-column access that records what it changed |
