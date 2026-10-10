@@ -208,6 +208,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "lactose-input-host"
+version = "0.0.0"
+dependencies = [
+ "lactose-core",
+ "lactose-input",
+ "lactose-sim",
+]
+
+[[package]]
 name = "lactose-math"
 version = "0.0.0"
 dependencies = [

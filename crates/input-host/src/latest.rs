@@ -2,7 +2,7 @@
 //! from the latest input"): a place the input task publishes every frame and the latch
 //! reads immediately before submit, outside the boundary and outside the tick.
 //!
-//! Host-only. Milestone 2's presentation crate reads it; nothing here is simulation input.
+//! Milestone 2's presentation crate reads it; nothing here is simulation input.
 
 use core::sync::atomic::AtomicU32;
 
@@ -10,10 +10,14 @@ use crate::raw::RawSample;
 
 /// The most recently published [`RawSample`], shared between the thread that samples
 /// devices and the frame-critical worker that latches the camera. `publish` and `read`
-/// never block each other and never lock: the implementation is a sequence-locked copy
-/// (the shape `net-api`'s interpolation buffer uses), so a reader that observes a torn
-/// write retries, and a publisher is never delayed by readers. One publisher is the
-/// expected use; with several, the last to finish wins.
+/// never lock and never block a reader: the slot is a sequence-locked copy of the sample's
+/// five words (the shape `net-api`'s interpolation buffer uses). `publish` takes the
+/// sequence by compare-exchange from even to odd, writes the words, and releases it to the
+/// next even value, so a publisher may wait for another publisher but never for a reader,
+/// and two concurrent publishers cannot interleave their words. `read` loads the sequence
+/// with `Acquire`, the words `Relaxed`, then `fence(Acquire)` and reloads the sequence; it
+/// retries while the sequence was odd or changed, so it returns a sample some `publish`
+/// wrote, never a mix of two. With several publishers the last to finish wins.
 pub struct LatestSample {
     sequence: AtomicU32,
     words: [AtomicU32; 5],

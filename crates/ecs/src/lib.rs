@@ -82,8 +82,8 @@ pub use schedule::{Schedule, ScheduleBuilder, ScheduleError};
 pub use snapshot::WorldSnapshot;
 pub use system::{SystemDescriptor, SystemSet};
 pub use world::{
-    ChunkOrder, Entities, ErasedResources, LayoutConfig, Referrer, Referrers, Regions, World,
-    WorldBuilder, WorldKind, WorldSet,
+    ChunkOrder, Claimed, Entities, ErasedResources, LayoutConfig, Referrer, Referrers, Regions,
+    World, WorldBuilder, WorldKind, WorldSet,
 };
 
 /// The thread-safety the contract promises, pinned so the implementation cannot lose it

@@ -2,10 +2,9 @@
 //! samples, which the client keeps and packs into every input packet and the server fills
 //! from every packet it receives, so a single lost packet costs nothing.
 //!
-//! What boundary code may use, though no boundary crate needs it at milestone 1: integers
-//! and ticks only. Substitution of a sample still missing after redundancy is
-//! [`PlayerInput::substitute`], a pure function; the jitter window and when to give up on
-//! a tick are `net`'s (milestone 4).
+//! Integers and ticks only. Substitution of a sample still missing after redundancy is
+//! [`PlayerInput::substitute`], a pure function; the jitter window, when a tick counts as
+//! lost and a deeper server-side buffer are `net`'s (milestone 4).
 
 use lactose_core::Tick;
 
@@ -18,12 +17,14 @@ pub const REDUNDANT_SAMPLES: usize = 8;
 
 /// The samples of the [`CAPACITY`](Self::CAPACITY) ticks up to and including the newest
 /// inserted, one slot per tick, a slot possibly empty: on the client every slot is filled
-/// in tick order; on the server a packet's window is inserted entry by entry, in any
-/// order, and a slot stays empty for a tick no packet delivered.
+/// in tick order through [`insert`](Self::insert); on the server a packet's window is
+/// inserted entry by entry, in any order, through [`insert_bounded`](Self::insert_bounded)
+/// so that an entry off the wire cannot move the window away from the ticks still to be
+/// applied, and a slot stays empty for a tick no packet delivered.
 ///
-/// Ticks are compared by wrapping difference (`tick.0.wrapping_sub(newest.0) as i32`), so
+/// Ticks are compared by wrapping difference (`tick.0.wrapping_sub(other.0) as i32`), so
 /// the window is correct across the `u32` wrap as long as no two ticks in play are more
-/// than 2^31 apart.
+/// than 2^31 apart, the ECS's own rule.
 #[derive(Clone, Debug)]
 pub struct SampleHistory {
     slots: [Option<PlayerInput>; REDUNDANT_SAMPLES],
@@ -44,8 +45,19 @@ impl SampleHistory {
     /// newer than the newest held moves the window forward to it, dropping the slots that
     /// fall out; a tick inside the window fills its slot if empty and is ignored (returning
     /// `false`) if the slot holds a sample already, so the first delivery of a tick wins;
-    /// a tick older than the window is ignored.
+    /// a tick older than the window is ignored. The client's path, one call per tick.
     pub fn insert(&mut self, tick: Tick, input: PlayerInput) -> bool {
+        todo!()
+    }
+
+    /// [`insert`](Self::insert) restricted to the ticks the server can still apply: `tick`
+    /// is stored only if it lies in `(consumed, consumed + CAPACITY]` by wrapping
+    /// difference, where `consumed` is the last tick applied for the player; otherwise
+    /// `false` and nothing changes. The server's path for every entry of every packet: a
+    /// forged or stale tick can neither move the window away from the ticks still to come
+    /// nor resurrect one already applied. `net` keeps the consumed tick, and may keep a
+    /// buffer of its own depth in front of this one.
+    pub fn insert_bounded(&mut self, consumed: Tick, tick: Tick, input: PlayerInput) -> bool {
         todo!()
     }
 

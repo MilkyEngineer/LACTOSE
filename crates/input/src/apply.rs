@@ -2,9 +2,9 @@
 //! `InputApplier` the input sync point calls, the writer declaration that gives the
 //! transient column a declared writer, and the registration pair `app` calls.
 //!
-//! What boundary code may use. Deterministic by construction: the applier decodes integers,
-//! resolves the player's entity through a query in key order and writes through the world;
-//! no float, no clock, no allocation beyond the ECS's own.
+//! Deterministic by construction: the applier decodes integers, resolves the player's
+//! entity through the world's claim index in key order and writes through the world; no
+//! float, no clock, no allocation beyond the ECS's own.
 
 use lactose_core::{PlayerId, Result, StableKey};
 use lactose_ecs::{World, system};
@@ -24,16 +24,18 @@ pub mod sets {
         SystemSet::new("input::apply").after(&[&lactose_sim::sets::INPUT]);
 }
 
-/// The player's own entity: the row that carries [`ClaimedBy`](lactose_ecs::ClaimedBy) for
-/// `player` and [`StreamingAnchor`](lactose_sim::StreamingAnchor), which the session
-/// applier writes on the server and `lactose-predict` writes on the local player in the
-/// prediction world; never a side table (`crates/sim/README.md`, "The input sync point").
-/// Found through `World::query::<(&ClaimedBy, &StreamingAnchor)>`, which yields in
-/// ascending key order, so with two such rows (a game's bug) the lesser key is the answer
-/// on every machine. `None` when the player has no such row. The one definition of "the
-/// player's entity", for every applier and for `net` and `predict`.
+/// The player's own entity: the first key of [`World::claimed`]`(player)`, which yields
+/// the rows with [`ClaimedBy`](lactose_ecs::ClaimedBy) for `player` in ascending origin-key
+/// order from the world's claim index, whose row also carries
+/// [`StreamingAnchor`](lactose_sim::StreamingAnchor) by [`World::get`]. The session
+/// applier writes the anchor on the server and `lactose-predict` writes it on the local
+/// player in the prediction world; never a side table (`crates/sim/README.md`, "The input
+/// sync point"), which a rollback would leave stale. With two such rows (a game's bug) the
+/// lesser key is the answer on every machine. Costs the player's claims, allocates
+/// nothing and takes `&World`. `None` when the player has no such row. The one definition
+/// of "the player's entity", for every applier and for `net` and `predict`.
 #[must_use]
-pub fn player_entity(world: &mut World, player: PlayerId) -> Option<StableKey> {
+pub fn player_entity(world: &World, player: PlayerId) -> Option<StableKey> {
     todo!()
 }
 
@@ -42,15 +44,17 @@ pub fn player_entity(world: &mut World, player: PlayerId) -> Option<StableKey> {
 /// the prediction world and a replay alike.
 ///
 /// For each entry of the frame, after `sim` has set the input tick: decodes
-/// `sample.sample` with [`PlayerInput::from_sample_bytes`], resolves the entity with
-/// [`player_entity`] and writes the value with [`World::insert`], which adds the component
-/// to a row that lacks it (an archetype change the structural log records, once per
-/// player) and overwrites it otherwise. Because the column is transient, a row keeps the
+/// `sample.sample` with [`PlayerInput::from_sample_bytes`] (`InvalidData` drops the
+/// entry); resolves the entity with [`player_entity`], and returns `Ok(())` without
+/// writing when there is none, since a player whose `Join` is held while its region
+/// streams in has samples before it has a row and that is not an error worth a log line
+/// per tick; then writes the value with [`World::insert`], which adds the component to a
+/// row that lacks it (an archetype change the structural log records, once per player)
+/// and overwrites it otherwise. Because the column is transient, a row keeps the
 /// component across ticks and reads as [`PlayerInput::IDLE`] on a tick without a sample.
 /// `sample.substituted` and `sample.input_tick` are not read: the first is the journal's
-/// and the second was applied by `sim`. Fails with `InvalidData` for a malformed sample and
-/// `NotFound` for a player without an entity; `sim` logs the error and drops that entry,
-/// and the tick runs.
+/// and the second was applied by `sim`. An error is logged by `sim` and that entry is
+/// dropped; the tick runs.
 #[derive(Debug, Default)]
 pub struct PlayerInputApplier {
     _private: (),

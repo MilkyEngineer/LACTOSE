@@ -1,8 +1,8 @@
 //! Compile-only consumer sketches against the facade: what a game kernel, `app`,
-//! `lactose-predict`, `net`, a session applier, presentation and a milestone 5 source
-//! write, type-checked and never run (every deciding body of the crate is `todo!()`). They
-//! pin the surface the README promises: a change that breaks one is a signature change to
-//! list.
+//! `lactose-predict`, `net` and a session applier write, type-checked and never run (every
+//! deciding body of the crate is `todo!()`). They pin the surface the README promises: a
+//! change that breaks one is a signature change to list. The host side (sources, the
+//! quantiser, the latest sample) is sketched in `lactose-input-host`.
 
 #![forbid(unsafe_code)]
 #![allow(dead_code, unused_variables, missing_docs)]
@@ -11,14 +11,11 @@ use lactose_core::{PlayerId, Result, StableKey, Tick};
 use lactose_ecs::{
     ClaimedBy, Commands, Ctx, Mut, RegionId, StableKeyOf, SystemSet, World, WorldKind, system,
 };
-use lactose_input::latest::LatestSample;
-use lactose_input::raw::RawSample;
-use lactose_input::sources::Source;
 use lactose_input::{
     AXIS_SCALE, Action, Actions, Axis2, Pitch, PlayerInput, PlayerInputApplier, REDUNDANT_SAMPLES,
     SAMPLE_SIZE, SampleHistory, UNITS_PER_TURN, Yaw, player_entity, sets,
 };
-use lactose_math::{Scalar, Vec3};
+use lactose_math::{Quat, Scalar, Vec3};
 use lactose_reflect::component;
 use lactose_sim::{
     InputApplier, PlayerSample, Registration, SessionApplier, SessionEvent, Simulation,
@@ -34,6 +31,12 @@ pub struct Velocity(#[field(id = 1)] pub Vec3);
 pub struct Bomb {
     #[field(id = 1)]
     pub fuse: u32,
+}
+
+#[component(key = "sketch::bow", persistent)]
+pub struct Bow {
+    #[field(id = 1)]
+    pub drawn_ticks: u32,
 }
 
 /// `throw_bomb` as the architecture section 6.1 example reads with this crate's names:
@@ -56,10 +59,22 @@ fn movement(input: &PlayerInput, vel: Mut<Velocity>) {
         if input.held.contains(Action::Sprint) { Scalar::from_i32(8) } else { Scalar::from_i32(4) };
     let planar = input.world_movement();
     let yaw: Scalar = input.yaw.radians();
+    let facing: Quat = input.yaw.rotation();
     let pitch: Scalar = input.pitch.radians();
     let stick = input.movement.to_vec2();
     let generic_bit_of_the_game = input.held.contains_bit(Action::NAMED + 2);
     vel.0 = planar * speed;
+}
+
+/// A hold-and-release action: draw while held, loose on the release edge.
+#[system(name = "sketch::bow", worlds = [server, prediction])]
+fn bow(input: &PlayerInput, bow: Mut<Bow>) {
+    if input.held.contains(Action::Interact) {
+        bow.drawn_ticks += 1;
+    }
+    if input.released.contains(Action::Interact) {
+        bow.drawn_ticks = 0;
+    }
 }
 
 /// Another crate's sync-point set, ordered after this crate's writer declaration.
@@ -69,7 +84,7 @@ pub static SKETCH_SYNC: SystemSet = SystemSet::new("sketch::sync").after(&[&sets
 fn sync_hook(world: &mut World) {}
 
 pub fn register_game(registration: &mut Registration) {
-    registration.stage(Stage::Simulation).add(&THROW_BOMB).add(&MOVEMENT);
+    registration.stage(Stage::Simulation).add(&THROW_BOMB).add(&MOVEMENT).add(&BOW);
     registration.stage(Stage::Input).sets(&[&SKETCH_SYNC]).add(&SYNC_HOOK);
 }
 
@@ -80,6 +95,7 @@ fn app_build(kind: WorldKind) -> Result<Simulation> {
     lactose_input::register_types(&mut types)?;
     types.register::<Velocity>()?;
     types.register::<Bomb>()?;
+    types.register::<Bow>()?;
     SimulationBuilder::new(kind, types)
         .systems(lactose_input::register_systems)
         .systems(register_game)
@@ -91,70 +107,80 @@ fn app_build(kind: WorldKind) -> Result<Simulation> {
         .build()
 }
 
-// ---- 3. The client and `lactose-predict`: quantise, round-trip, frame entry ----
+// ---- 3. `lactose-predict` and a test: a sample into a frame, and the round trip ----
 
-fn client_tick(
-    raw: &RawSample,
-    previous: &PlayerInput,
-    tick: Tick,
-    history: &mut SampleHistory,
-) -> Result<TickInput> {
-    let input: PlayerInput = raw.quantise(previous.held);
+fn predict_frame(input: &PlayerInput, tick: Tick, local: PlayerId) -> Result<TickInput> {
     input.validate()?;
-    let stored = history.insert(tick, input);
     let bytes: [u8; SAMPLE_SIZE] = input.to_sample_bytes();
     let back: PlayerInput = PlayerInput::from_sample_bytes(&bytes)?;
-    assert_eq!(back, input);
+    assert_eq!(back, *input);
     let mut frame = TickInput::default();
-    frame.inputs.insert(PlayerId(1), input.to_player_sample(tick));
+    frame.inputs.insert(local, input.to_player_sample(tick));
     Ok(frame)
 }
 
-/// A test's or `lactose-predict`'s sample, built field by field.
+/// A test's sample, built field by field.
 fn literal_sample() -> PlayerInput {
     PlayerInput {
         movement: Axis2 { x: 0, y: AXIS_SCALE },
         yaw: Yaw((UNITS_PER_TURN / 4) as u16),
         pitch: Pitch(-Pitch::LIMIT / 2),
-        held: Actions::EMPTY.with(Action::Sprint),
+        held: Actions::EMPTY.with(Action::Sprint).with(Action::Jump),
         pressed: Actions::from_bits(1 << Action::Jump.bit()),
+        released: Actions::EMPTY.with(Action::Throw),
     }
 }
 
-// ---- 4. `net`: pack the window, merge a received window, substitute ----
+// ---- 4. `net`: pack the window, merge a received window, substitute and repair ----
 
 fn pack(history: &SampleHistory) -> Vec<(Tick, [u8; SAMPLE_SIZE])> {
     history.iter().map(|(tick, input)| (tick, input.to_sample_bytes())).collect()
 }
 
-fn receive(history: &mut SampleHistory, window: &[(Tick, [u8; SAMPLE_SIZE])]) -> Result<()> {
+/// The server's receive path: every entry validated, a failure treated as lost, every
+/// accepted entry bounded by the last tick applied.
+fn receive(history: &mut SampleHistory, consumed: Tick, window: &[(Tick, [u8; SAMPLE_SIZE])]) {
     for (tick, bytes) in window {
-        let input = PlayerInput::from_sample_bytes(bytes)?;
-        history.insert(*tick, input);
+        if let Ok(input) = PlayerInput::from_sample_bytes(bytes) {
+            history.insert_bounded(consumed, *tick, input);
+        }
     }
-    Ok(())
 }
 
-/// The server's frame entry for one player at `tick`: the delivered sample, or the
-/// previous one continued, journaled as substituted.
-fn server_entry(
-    history: &SampleHistory,
-    last_applied: &mut PlayerInput,
-    tick: Tick,
-) -> PlayerSample {
-    match history.get(tick) {
+/// The server's per-player state between ticks.
+struct PlayerQueue {
+    history: SampleHistory,
+    last_applied: PlayerInput,
+    consumed: Tick,
+    substituting: bool,
+}
+
+/// The server's frame entry for one player at `tick`: the delivered sample, with the edges
+/// a substitution swallowed restored on the first one after it, or the previous one
+/// continued, journaled as substituted.
+fn server_entry(queue: &mut PlayerQueue, tick: Tick) -> PlayerSample {
+    let entry = match queue.history.get(tick) {
         Some(input) => {
-            *last_applied = *input;
+            let input = if queue.substituting {
+                input.after_substitute(&queue.last_applied)
+            } else {
+                *input
+            };
+            queue.substituting = false;
+            queue.last_applied = input;
             input.to_player_sample(tick)
         }
         None => {
-            let substitute = last_applied.substitute();
-            *last_applied = substitute;
+            let substitute = queue.last_applied.substitute();
+            queue.substituting = true;
+            queue.last_applied = substitute;
             let mut entry = substitute.to_player_sample(tick);
             entry.substituted = true;
             entry
         }
-    }
+    };
+    queue.consumed = tick;
+    entry
 }
 
 fn newest_and_count(history: &SampleHistory) -> (Option<Tick>, usize) {
@@ -179,6 +205,7 @@ impl SessionApplier for Sessions {
                     region,
                     (
                         Velocity(Vec3::ZERO),
+                        Bow { drawn_ticks: 0 },
                         PlayerInput::IDLE,
                         ClaimedBy { player },
                         StreamingAnchor { priority: 0 },
@@ -208,40 +235,15 @@ fn replace_applier(simulation: &mut Simulation) {
         .insert_service::<dyn InputApplier>(Box::new(Logging(PlayerInputApplier::default())));
 }
 
-// ---- 6. Presentation: the latest raw sample for the late-latched camera ----
-
-static LATEST: LatestSample = LatestSample::new();
-
-fn input_task_frame(raw: RawSample) {
-    LATEST.publish(raw);
+/// The lookup takes a shared world: `net` and `predict` call it between ticks too.
+fn lookup(world: &World, player: PlayerId) -> Option<StableKey> {
+    player_entity(world, player)
 }
 
-fn latch() -> (f32, f32) {
-    let sample = LATEST.read();
-    (sample.yaw, sample.pitch)
-}
-
-// ---- 7. A milestone 5 source ----
-
-struct Gamepad;
-
-impl Source for Gamepad {
-    fn poll(&mut self, raw: &mut RawSample) {
-        raw.movement_x = 0.0;
-        raw.held = raw.held.with(Action::Jump);
-    }
-}
-
-fn poll_all(sources: &mut [Box<dyn Source>], raw: &mut RawSample) {
-    for source in sources {
-        source.poll(raw);
-    }
-}
-
-// ---- 8. What the wire and the journal rely on, pinned at compile time ----
+// ---- 6. What the wire and the journal rely on, pinned at compile time ----
 
 const _: () = {
-    assert!(SAMPLE_SIZE == 16);
+    assert!(SAMPLE_SIZE == 20);
     assert!(REDUNDANT_SAMPLES == 8);
     assert!(Pitch::LIMIT == 16384);
     assert!(AXIS_SCALE == 32767);

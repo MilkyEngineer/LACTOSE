@@ -2,18 +2,17 @@
 //! simulation kernel reads, the integer encodings every value crosses the boundary in, and
 //! the byte image the wire carries and the journal stores.
 //!
-//! What boundary code may use. Deterministic by construction: every stored value is an
-//! integer, and every `Scalar` or vector derived from one is computed through
-//! `lactose_math` in the order the documentation states, so one sample gives the same bits
-//! on every target. No float enters from the host side: quantisation is
-//! [`RawSample::quantise`](crate::raw::RawSample::quantise), outside the boundary.
+//! Every stored value is an integer, and every `Scalar`, vector or rotation derived from
+//! one is computed through `lactose_math` in the order the documentation states, so one
+//! sample gives the same bits on every target. No float enters from the host side:
+//! quantisation is `lactose-input-host`'s, outside the boundary.
 
 use lactose_core::{Result, Tick};
-use lactose_math::{Scalar, Vec2, Vec3};
+use lactose_math::{Quat, Scalar, Vec2, Vec3};
 use lactose_reflect::{component, value};
 use lactose_sim::PlayerSample;
 
-/// The size in bytes of a sample's image: the size of [`PlayerInput`], sixteen.
+/// The size in bytes of a sample's image: the size of [`PlayerInput`], twenty.
 pub const SAMPLE_SIZE: usize = size_of::<PlayerInput>();
 
 /// The unit of [`Yaw`] and [`Pitch`]: one turn is this many units, so a unit is 1/65536 of
@@ -25,9 +24,10 @@ pub const UNITS_PER_TURN: u32 = 1 << 16;
 pub const AXIS_SCALE: i16 = i16::MAX;
 
 /// A movement vector quantised to sixteen bits per axis, `x` to the player's right and `y`
-/// forward, each in `[-AXIS_SCALE, AXIS_SCALE]`; the quantiser limits the raw vector to the
-/// unit disc, so a decoded vector exceeds unit length only by rounding (at most one unit per
-/// axis). `i16::MIN` is accepted and decodes to just below minus one.
+/// forward, each in `[-AXIS_SCALE, AXIS_SCALE]`. A valid sample's vector lies within the
+/// disc `x² + y² <= AXIS_SCALE² + 2·AXIS_SCALE`, the unit disc plus the quantiser's
+/// rounding ([`PlayerInput::validate`]), so a decoded vector exceeds unit length only by
+/// rounding; `i16::MIN` is invalid in either component.
 #[value]
 #[derive(PartialEq, Eq, Hash, Debug, Default)]
 pub struct Axis2 {
@@ -72,6 +72,15 @@ impl Yaw {
     /// division by a power of two is exact and the product rounds once.
     #[must_use]
     pub fn radians(self) -> Scalar {
+        todo!()
+    }
+
+    /// The yaw as a rotation about `+Y`: `Quat::from_rotation_y(self.radians())`, which
+    /// turns `-Vec3::Z` into the horizontal part of [`PlayerInput::aim`] (within rounding;
+    /// `aim` is the stated formula, not this product). What a facing kernel or the sim
+    /// skeleton composes with.
+    #[must_use]
+    pub fn rotation(self) -> Quat {
         todo!()
     }
 }
@@ -202,8 +211,21 @@ impl Actions {
         }
     }
 
-    /// The actions of `self` that are not in `other`: how the quantiser derives the
-    /// `pressed` edges, `held.without(previous_held)`.
+    /// The actions in either set: how the sources' held sets combine.
+    #[must_use]
+    pub const fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+
+    /// The actions in both sets.
+    #[must_use]
+    pub const fn intersection(self, other: Self) -> Self {
+        Self(self.0 & other.0)
+    }
+
+    /// The actions of `self` that are not in `other`: how the quantiser derives the edges,
+    /// `held.without(previous_held)` for `pressed` and `previous_held.without(held)` for
+    /// `released`.
     #[must_use]
     pub const fn without(self, other: Self) -> Self {
         Self(self.0 & !other.0)
@@ -216,7 +238,7 @@ impl Actions {
 /// sample the frame carries. A player without a sample this tick reads as
 /// [`IDLE`](Self::IDLE), which is also `Default`.
 ///
-/// Sixteen bytes, no padding, every field an integer; the layout is the byte image
+/// Twenty bytes, no padding, every field an integer; the layout is the byte image
 /// ([`to_sample_bytes`](Self::to_sample_bytes)). A kernel takes `&PlayerInput` and reads
 /// the fields, or the derived directions [`aim`](Self::aim) and
 /// [`world_movement`](Self::world_movement), which are computed from the integers through
@@ -251,35 +273,52 @@ pub struct PlayerInput {
     pub held: Actions,
     /// The actions that became held since the previous sample: the edges, computed by the
     /// quantiser on the client and carried in the sample, so the server keeps no button
-    /// history. A substitute for a lost sample carries none ([`substitute`](Self::substitute)).
+    /// history. A subset of `held`. A substitute for a lost sample carries none
+    /// ([`substitute`](Self::substitute)).
     #[field(id = 5)]
     pub pressed: Actions,
+    /// The actions that stopped being held since the previous sample, computed and carried
+    /// like `pressed`; disjoint from `held`. For a bow drawn and loosed, a charged attack, a
+    /// hold-to-aim throw. A substitute carries none.
+    #[field(id = 6)]
+    pub released: Actions,
 }
 
 impl PlayerInput {
-    /// No movement, facing `-Z`, level, nothing held or pressed: the all-zero value the ECS
-    /// leaves in the column when no sample is written, and `Default`.
+    /// No movement, facing `-Z`, level, nothing held, pressed or released: the all-zero
+    /// value the ECS leaves in the column when no sample is written, and `Default`.
     pub const IDLE: Self = Self {
         movement: Axis2::ZERO,
         yaw: Yaw::ZERO,
         pitch: Pitch::ZERO,
         held: Actions::EMPTY,
         pressed: Actions::EMPTY,
+        released: Actions::EMPTY,
     };
 
-    /// Checks the one range the layout cannot: the pitch is within
-    /// [`Pitch::LIMIT`]. Fails with `InvalidData`. Every other field accepts every bit
-    /// pattern of its width.
+    /// Checks the invariants the layout cannot, each one a kernel is told it may rely on;
+    /// fails with `InvalidData` on the first that does not hold:
+    ///
+    /// - the pitch is within [`Pitch::LIMIT`];
+    /// - neither movement component is `i16::MIN`, and in 64-bit integers
+    ///   `x² + y² <= AXIS_SCALE² + 2·AXIS_SCALE`, a bound the quantiser's half-unit rounding
+    ///   of a vector in the unit disc never exceeds;
+    /// - `pressed.without(held).is_empty()`: an edge names a held action;
+    /// - `released.intersection(held).is_empty()`: a release names an action not held.
+    ///
+    /// Every other field accepts every bit pattern of its width. The quantiser's output
+    /// always passes; a forged image that does not is refused before it reaches a row.
     pub fn validate(&self) -> Result<()> {
         todo!()
     }
 
-    /// The byte image: the sixteen memory bytes of the value, which on every supported
+    /// The byte image: the twenty memory bytes of the value, which on every supported
     /// target is each field little-endian at its `repr(C)` offset (`movement.x` at 0,
-    /// `movement.y` at 2, `yaw` at 4, `pitch` at 6, `held` at 8, `pressed` at 12). This is
-    /// what [`PlayerSample::sample`] holds, the journal stores verbatim and the wire
-    /// carries; its version is the component's schema version, which the protocol hash of
-    /// architecture section 9.1 covers, so no version byte is in the image.
+    /// `movement.y` at 2, `yaw` at 4, `pitch` at 6, `held` at 8, `pressed` at 12,
+    /// `released` at 16). This is what [`PlayerSample::sample`] holds, the journal stores
+    /// verbatim and the wire carries; its version is the component's schema version, which
+    /// the protocol hash of architecture section 9.1 covers as a boundary component type,
+    /// so no version byte is in the image.
     #[must_use]
     pub fn to_sample_bytes(&self) -> [u8; SAMPLE_SIZE] {
         todo!()
@@ -287,9 +326,10 @@ impl PlayerInput {
 
     /// The value whose image `bytes` is: exactly [`SAMPLE_SIZE`] bytes, read through the
     /// component's `CheckedBitPattern` ([`lactose_reflect::decode`]) and then
-    /// [`validate`](Self::validate)d. Fails with `InvalidData` otherwise, so an applier
-    /// drops a malformed sample and the tick runs, and `net` can refuse one before it
-    /// reaches a frame.
+    /// [`validate`](Self::validate)d. Fails with `InvalidData` otherwise. `net` must run it
+    /// on every received sample and treat a failure as a lost sample (substitute), so that
+    /// a malformed image never reaches a frame; the applier runs it again and drops what
+    /// fails, and the tick runs.
     pub fn from_sample_bytes(bytes: &[u8]) -> Result<Self> {
         todo!()
     }
@@ -305,13 +345,26 @@ impl PlayerInput {
     }
 
     /// The sample the server applies for a tick whose sample is still missing after
-    /// redundancy (architecture section 9.2): this sample, the previous one applied,
-    /// continued, with `pressed` cleared, so a held action stays held and no edge repeats.
-    /// A player with no previous sample gets [`IDLE`](Self::IDLE), which `substitute` of
-    /// `IDLE` is. A pure function of its input; `net` sets `substituted` on the frame
-    /// entry so the journal records the substitution.
+    /// redundancy (architecture section 9.2, "replaced by the previous input", refined):
+    /// this sample, the previous one applied, continued, with `pressed` and `released`
+    /// cleared, so a held action stays held and no edge repeats. `IDLE.substitute()` is
+    /// `IDLE`, the substitute for a player with no previous sample. A pure function; `net`
+    /// sets `substituted` on the frame entry so the journal records the substitution.
     #[must_use]
     pub fn substitute(&self) -> Self {
+        todo!()
+    }
+
+    /// This sample, the first one delivered after one or more substitutes, with the edges
+    /// the gap swallowed restored against `applied`, the last substitute applied:
+    /// `pressed` gains `held.without(applied.held)` and `released` gains
+    /// `applied.held.without(held)`. The client computed this sample's edges against its
+    /// own previous sample, which was lost, so a press whose first sample was lost would
+    /// otherwise never fire for the whole hold. The result passes
+    /// [`validate`](Self::validate) when `self` does. `net` applies it once, to the first
+    /// delivered sample after a substitute, and the journal records the applied bytes.
+    #[must_use]
+    pub fn after_substitute(&self, applied: &PlayerInput) -> Self {
         todo!()
     }
 
@@ -329,8 +382,9 @@ impl PlayerInput {
     /// along the yaw's forward `(-sin_y, 0, -cos_y)` and `movement.x` along its right
     /// `(cos_y, 0, -sin_y)`, computed as `(m.x * cos_y - m.y * sin_y, 0,
     /// -(m.x * sin_y + m.y * cos_y))` from `m = movement.to_vec2()`, each operation in
-    /// that order. Its length is at most one up to rounding. What a movement kernel reads
-    /// (architecture section 5.3: the sample's yaw gives the movement direction).
+    /// that order. For a valid sample its length is at most one up to rounding. What a
+    /// movement kernel reads (architecture section 5.3: the sample's yaw gives the
+    /// movement direction).
     #[must_use]
     pub fn world_movement(&self) -> Vec3 {
         todo!()
