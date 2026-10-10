@@ -1,0 +1,23 @@
+[package]
+name = "lactose-physics-api"
+description = "The physics interface: body, collider and joint components, the physics command channel, contact events, queries over the stepped state, the backend trait, snapshot and restore."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+lactose-core.workspace = true
+# The world, the `#[system]` macro, channels, events, the structural log and the change
+# marks the sync reads (architecture sections 6 and 6.1).
+lactose-ecs.workspace = true
+# Every quantity is a `Scalar`, `Vec3` or `Quat` (architecture section 8.2).
+lactose-math.workspace = true
+# The `#[component]` and `#[value]` attributes; metadata only (architecture section 8.1).
+lactose-reflect.workspace = true
+# `Stage::Physics`, `Registration`, `TypeTable` and `TickDelta`: where the two systems are
+# placed and what the step reads; `SimulationBuilder` for the conformance run.
+lactose-sim.workspace = true
+
+[lints]
+workspace = true
