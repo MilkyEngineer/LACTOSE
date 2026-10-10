@@ -66,15 +66,20 @@ deny = [
   # Architecture section 8.2: simulation and physics share one `libm`, so two builds of the
   # boundary cannot disagree on a transcendental.
   { crate = "libm", deny-multiple-versions = true },
-  # Milestone 1 adds, with `lactose-physics-rapier`, every crate Rapier's math depends on
-  # (section 8.2). On today's crates.io that is: glam, glamx, wide, safe_arch, simba,
-  # nalgebra, parry and rapier themselves, num-traits. Add one line each, in this form:
-  #   { crate = "glam", deny-multiple-versions = true },
+  # Every crate Rapier's math depends on (section 8.2, D119): two builds of any of them in
+  # one binary could put two numerics into one simulation.
+  { crate = "glam", deny-multiple-versions = true },
+  { crate = "glamx", deny-multiple-versions = true },
+  { crate = "wide", deny-multiple-versions = true },
+  { crate = "safe_arch", deny-multiple-versions = true },
+  { crate = "simba", deny-multiple-versions = true },
+  { crate = "nalgebra", deny-multiple-versions = true },
+  { crate = "parry3d-f64", deny-multiple-versions = true },
+  { crate = "rapier3d-f64", deny-multiple-versions = true },
+  { crate = "num-traits", deny-multiple-versions = true },
 ]
 
-# Milestone 1, with `lactose-physics-rapier`: glam features that change numerics
-# (docs/verification.md section 2). Nothing depends on glam yet, so the entry is ready but
-# commented out.
+# glam features that change numerics (docs/verification.md section 2).
 #
 # Checked against glam 0.33.12 (the line `glamx` 0.3.1 requires) and 0.34.0:
 #   scalar-math  replaces the SIMD back-end with scalar code;
@@ -82,13 +87,12 @@ deny = [
 #   libm, nostd-libm  switch transcendentals between the platform library and `libm`;
 #   fast-math    0.33 only; a no-op since 0.33.8, removed in 0.34.0, banned so an older
 #                0.33 can never bring it back to life.
-# Section 8.2 accepts Rapier's determinism feature forcing scalar glam. If the pinned Rapier
-# turns `scalar-math` or `libm` on itself, drop that one name and say why here; the rule then
-# still stops any other crate from flipping the remaining ones through feature unification.
-#
-# [[bans.features]]
-# crate = "glam"
-# deny = ["fast-math", "scalar-math", "core-simd", "libm", "nostd-libm"]
+# Rapier 0.36.0's `enhanced-determinism` turns `scalar-math`, `libm` and `nostd-libm` on
+# itself (through parry3d-f64 and glamx), which section 8.2 accepts, so those three are not
+# denied; the rule still stops any crate from turning on the remaining two.
+[[bans.features]]
+crate = "glam"
+deny = ["fast-math", "core-simd"]
 
 [sources]
 unknown-registry = "deny"

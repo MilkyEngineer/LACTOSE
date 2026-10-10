@@ -229,6 +229,7 @@ fn check_features(args: &[&str]) -> Checked {
             let dev = policy.harness_packages.contains(root);
             let dump = features::dump(&context.cargo, &context.root, root, triple, dev)?;
             let tree = features::boundary_tree(&dump, &|name| context.tiers.in_boundary(name))?;
+            let tree = features::fold_defaults(tree, &context.workspace.defaults);
             // A shipped binary is compared in full; a harness package that is not one, on
             // the packages it shares with each other root.
             let full = !dev || policy.feature_roots.contains(root);
