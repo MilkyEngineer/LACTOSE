@@ -5,6 +5,8 @@ confirm the marker matches this text; if not, read the file on disk, not this co
 
 Rust game engine. Read `docs/architecture.md` before any task. It is binding. `docs/decisions-log.md`
 holds the reasons; `docs/verification.md` holds what must be measured or re-checked first.
+The work is done by agents under the process in `docs/agents.md`; their definitions are in
+`.claude/agents/`.
 
 ## Names
 
