@@ -139,7 +139,7 @@ fn execute(state: &mut RunState, ctx: &mut JobContext<'_>) {
     let stamp = enter_slot(world, tick, &mut slot);
     world.apply(pending, stamp);
     world.permute_rows();
-    world.end_present(emissions);
+    world.end_present(emissions, !tick);
     if tick {
         world.point = BETWEEN;
     }

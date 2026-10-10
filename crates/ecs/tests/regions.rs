@@ -51,7 +51,11 @@ fn only_simulated_regions_run_and_a_missing_region_resource_skips_one() {
     world = tick(&mut schedule, world, &executor);
     let reports = std::mem::take(world.service_mut::<Reports>().unwrap().get_mut().unwrap());
     let expected_draw = world.rng(REGION, WEATHER_REPORT.key(), net(1)).unwrap().next_u64();
-    assert_eq!(reports, [(REGION, 1, expected_draw)], "one region simulated and holding the resource");
+    assert_eq!(
+        reports,
+        [(REGION, 1, expected_draw)],
+        "one region simulated and holding the resource"
+    );
     assert_eq!(world.get::<Counter>(net(1)), Some(&Counter(1)));
     assert_eq!(world.get::<Counter>(net(2)), Some(&Counter(0)), "frozen rows are not run");
     let spawned: Vec<_> = world.entities_in(REGION).collect();

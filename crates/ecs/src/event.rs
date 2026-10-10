@@ -273,20 +273,33 @@ pub(crate) struct PresentLog {
     emitted: Vec<PresentEmission>,
     cancelled: Vec<PresentEventKey>,
     delivered: BTreeMap<Tick, BTreeSet<KeyParts>>,
+    /// The emissions per (origin, kind) of tick `counted` so far, so a pass after the tick
+    /// continues its sequence.
+    counts: BTreeMap<(StableKey, PresentKind), u32>,
+    counted: Option<Tick>,
 }
 
 impl PresentLog {
-    /// Records the emissions of tick `tick`, whose origins are already origin keys: those
-    /// already delivered are dropped, and delivered keys of the tick that were not emitted
-    /// again are cancelled.
-    pub(crate) fn end_tick(&mut self, tick: Tick, mut emissions: Vec<PendingEmission>) {
+    /// Records the emissions of a run at `tick`, whose origins are already origin keys:
+    /// those already delivered are dropped. A tick's run numbers each (origin, kind) from
+    /// zero and cancels the delivered keys of its tick that it did not emit again, which
+    /// only a re-simulated tick can leave; a pass between ticks continues the tick's
+    /// numbering and cancels nothing.
+    pub(crate) fn end_run(&mut self, tick: Tick, mut emissions: Vec<PendingEmission>, pass: bool) {
         emissions.sort_by_key(|emission| emission.order);
-        let mut counts: BTreeMap<(StableKey, PresentKind), u32> = BTreeMap::new();
+        if !pass || self.counted != Some(tick) {
+            self.counts.clear();
+        }
+        self.counted = Some(tick);
+        let delivered = if pass {
+            self.delivered.get(&tick).cloned().unwrap_or_default()
+        } else {
+            self.delivered.remove(&tick).unwrap_or_default()
+        };
         let mut keys = BTreeSet::new();
-        let delivered = self.delivered.remove(&tick).unwrap_or_default();
         for emission in emissions {
             let PresentRecord { origin, kind, bytes } = emission.record;
-            let count = counts.entry((origin, kind)).or_insert(0);
+            let count = self.counts.entry((origin, kind)).or_insert(0);
             let seq = *count;
             *count += 1;
             keys.insert((origin, kind, seq));
@@ -294,6 +307,9 @@ impl PresentLog {
                 let key = PresentEventKey { origin, tick, kind, seq };
                 self.emitted.push(PresentEmission { key, bytes, order: emission.order.0 });
             }
+        }
+        if pass {
+            return;
         }
         let mut kept = BTreeSet::new();
         for parts in delivered {
@@ -326,6 +342,8 @@ impl PresentLog {
     /// Drops the emissions after `tick` that were never taken: a restore to `tick`.
     pub(crate) fn rewind(&mut self, tick: Tick) {
         self.emitted.retain(|emission| emission.key.tick <= tick);
+        self.counts.clear();
+        self.counted = None;
     }
 
     /// Forgets delivered keys below `oldest`, which no restore can reach.

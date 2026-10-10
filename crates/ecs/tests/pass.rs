@@ -36,7 +36,12 @@ fn extract(world: &mut World, job: Job, gathered: Res<Gathered>) {
 
 /// A per-entity system in a pass: sees the changes since the pass last ran.
 #[system(name = "test::gather_changed", worlds = [server])]
-fn gather_changed(_changed: Changed<Position>, position: &Position, key: StableKeyOf, gathered: Res<Gathered>) {
+fn gather_changed(
+    _changed: Changed<Position>,
+    position: &Position,
+    key: StableKeyOf,
+    gathered: Res<Gathered>,
+) {
     gathered.lock().unwrap().push((*key, -position.x.to_i64()));
 }
 
@@ -60,7 +65,8 @@ fn gathered(world: &mut World) -> Vec<(StableKey, i64)> {
 #[test]
 fn a_pass_forks_over_columns_and_advances_nothing() {
     let executor = executor();
-    let mut world = world(WorldKind::Server, LayoutConfig { chunk_rows: Some(2), ..LayoutConfig::default() });
+    let mut world =
+        world(WorldKind::Server, LayoutConfig { chunk_rows: Some(2), ..LayoutConfig::default() });
     for id in 1..=5 {
         world.spawn(net(id), REGION, (pos(id as i32, 0), Counter(0))).unwrap();
     }
@@ -99,4 +105,35 @@ fn a_pass_forks_over_columns_and_advances_nothing() {
     expected.push((net(1000), 5));
     expected.sort();
     assert_eq!(gathered(&mut world), expected);
+}
+
+#[system(name = "test::beep", worlds = [server])]
+fn beep(present: lactose_ecs::PresentEvents, key: StableKeyOf, _counter: &Counter) {
+    present.emit(*key, AudioRequest { sound: 7 });
+}
+
+/// A pass is not a re-simulation: it cancels nothing the tick delivered, and what it emits
+/// continues the tick's sequence.
+#[test]
+fn a_pass_neither_cancels_nor_repeats_the_ticks_presentation_events() {
+    let executor = executor();
+    let mut world = world(WorldKind::Server, LayoutConfig::default());
+    world.spawn(net(1), REGION, (Counter(0),)).unwrap();
+    let mut ticks = Schedule::builder(WorldKind::Server);
+    ticks.stage("beep", &[]).add(&BEEP);
+    let mut ticks = ticks.build().unwrap();
+    let mut quiet = Schedule::builder(WorldKind::Server);
+    quiet.stage("nothing", &[]);
+    let mut quiet = quiet.build().unwrap();
+
+    world = tick(&mut ticks, world, &executor);
+    let first = world.take_present_events();
+    assert_eq!(first.emitted.len(), 1);
+    world = executor.block_on(quiet.run_pass(world, &executor)).unwrap();
+    assert!(world.take_present_events().cancelled.is_empty());
+    world = executor.block_on(ticks.run_pass(world, &executor)).unwrap();
+    let pass = world.take_present_events();
+    assert_eq!(pass.emitted.len(), 1);
+    assert_eq!((pass.emitted[0].key.tick, pass.emitted[0].key.seq), (t(1), 1));
+    assert!(pass.cancelled.is_empty());
 }

@@ -260,11 +260,15 @@ impl World {
     }
 
     /// Records the emissions of the run's tick, with origins as origin keys.
-    pub(crate) fn end_present(&mut self, mut emissions: Vec<crate::event::PendingEmission>) {
+    pub(crate) fn end_present(
+        &mut self,
+        mut emissions: Vec<crate::event::PendingEmission>,
+        pass: bool,
+    ) {
         for emission in &mut emissions {
             emission.record.origin = self.canonical(emission.record.origin);
         }
-        self.present.end_tick(self.tick, emissions);
+        self.present.end_run(self.tick, emissions, pass);
     }
 
     /// The `Net` alias table, for events normalised to origin keys.
