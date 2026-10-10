@@ -114,6 +114,10 @@ disallowed-methods = [
   { path = "rapier3d_f64::dynamics::Multibody::inverse_kinematics", reason = "reaches matrixmultiply, whose kernels are chosen by CPU feature", allow-invalid = true },
   { path = "rapier3d_f64::dynamics::Multibody::inverse_kinematics_delta", reason = "reaches matrixmultiply, whose kernels are chosen by CPU feature", allow-invalid = true },
   { path = "rapier3d_f64::dynamics::Multibody::inverse_kinematics_delta_with_jacobian", reason = "reaches matrixmultiply, whose kernels are chosen by CPU feature", allow-invalid = true },
+  # A multibody's mass assembly reaches it too above five degrees of freedom, so no boundary
+  # crate inserts a multibody joint.
+  { path = "rapier3d_f64::dynamics::MultibodyJointSet::insert", reason = "multibody mass assembly reaches matrixmultiply, whose kernels are chosen by CPU feature", allow-invalid = true },
+  { path = "rapier3d_f64::dynamics::MultibodyJointSet::insert_kinematic", reason = "multibody mass assembly reaches matrixmultiply, whose kernels are chosen by CPU feature", allow-invalid = true },
 ]
 
 disallowed-types = [

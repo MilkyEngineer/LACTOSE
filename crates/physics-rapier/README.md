@@ -157,5 +157,7 @@ order.
   own encoding of its sets is most of the bytes.
 - A snapshot that decodes and passes the check but whose Rapier state is otherwise
   inconsistent (bytes not written by this backend) can make a later Rapier call panic.
-- `Multibody::inverse_kinematics` and its two delta variants are banned in every boundary
-  `clippy.toml`: they reach `matrixmultiply`, whose kernels are chosen by CPU feature.
+- `MultibodyJointSet::insert` and `insert_kinematic`, and `Multibody::inverse_kinematics` and
+  its two delta variants, are banned in every boundary `clippy.toml`: a multibody's mass
+  assembly above five degrees of freedom and inverse kinematics reach `matrixmultiply`, whose
+  kernels are chosen by CPU feature. The backend uses impulse joints only.

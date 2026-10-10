@@ -158,9 +158,11 @@ transitive = [
   # postcard's framing helper; byte shuffling only.
   "cobs",
   # The second exception beside `libm` (D119): its GEMM kernels are selected by CPU feature
-  # at run time, but nalgebra reaches it only for products above its small-dimension cutoff,
-  # which no step path forms; the one caller that does, `Multibody::inverse_kinematics`, is
-  # banned in every boundary clippy.toml.
+  # at run time. nalgebra hands it products above its small-dimension cutoff, which two
+  # Rapier paths form: a multibody's mass assembly above five degrees of freedom, and
+  # `Multibody::inverse_kinematics`. Both are unreachable from the backend, which inserts no
+  # multibody joint; every boundary clippy.toml bans `MultibodyJointSet::insert` and
+  # `insert_kinematic` and the three inverse-kinematics methods.
   "matrixmultiply",
 ]
 
