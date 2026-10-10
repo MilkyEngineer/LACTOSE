@@ -75,6 +75,33 @@ fn write_a(_counter: Mut<Counter>) {}
 #[system(name = "test::write_b")]
 fn write_b(_counter: Mut<Counter>) {}
 
+/// Writes `Counter` through commands, declared.
+#[system(name = "test::sets_counter", writes = [Counter])]
+fn sets_counter(cmd: Commands) {
+    cmd.set(net(1), Counter(1));
+}
+
+/// Reads `Counter`; no edge to `sets_counter`.
+#[system(name = "test::reads_counter")]
+fn reads_counter(_counter: &Counter) {}
+
+#[test]
+fn a_declared_write_is_a_write_for_conflicts() {
+    let conflict = build_error(&[&SETS_COUNTER, &READS_COUNTER]);
+    assert!(
+        matches!(conflict, ScheduleError::UnorderedConflict { target: AccessTarget::Component(key), .. } if key == Counter::KEY),
+        "{conflict:?}"
+    );
+    // A `writes` entry fetches nothing and does not make the system run per entity: it
+    // runs once per tick, and its command applies.
+    let executor = executor();
+    let mut world = world(WorldKind::Server, LayoutConfig::default());
+    world.spawn(net(1), REGION, (Counter(0),)).unwrap();
+    let mut schedule = build(&[&SETS_COUNTER]).unwrap();
+    let world = tick(&mut schedule, world, &executor);
+    assert_eq!(world.get::<Counter>(net(1)), Some(&Counter(1)));
+}
+
 #[system(name = "test::write_b_ordered", after = write_a)]
 fn write_b_ordered(_counter: Mut<Counter>) {}
 

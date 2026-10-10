@@ -449,6 +449,15 @@ mod tests {
     }
 
     #[test]
+    fn writes_follow_the_parameters_in_the_table() {
+        let expansion = expand("name = \"t::f\", writes = [A, m::B]", "fn f(c: Commands) {}");
+        let parameter = expansion.find("SystemParam > :: ACCESS").expect("the parameter entry");
+        let first = expansion.find("writes :: < A >").expect("a `writes` entry for A");
+        assert!(parameter < first, "{expansion}");
+        assert!(expansion.contains("writes :: < m :: B >"), "{expansion}");
+    }
+
+    #[test]
     fn the_only_unsafe_is_the_descriptor_constructor_call() {
         let expansion = expand("name = \"t::f\"", "fn f(a: &A) {}");
         assert_eq!(expansion.matches("unsafe").count(), 1, "{expansion}");
@@ -488,5 +497,6 @@ mod tests {
         assert!(expansion.contains("const __finalize_total_mass"), "{expansion}");
         assert!(expansion.contains("Finalize < Scalar >"), "{expansion}");
         assert!(expansion.contains("fetch (__invocation , 0usize)"), "{expansion}");
+        assert!(expansion.contains("TOTAL_MASS . reduce () . is_some ()"), "{expansion}");
     }
 }

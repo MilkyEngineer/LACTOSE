@@ -24,7 +24,11 @@ attribute accepts and emits, and lists the hidden items the expansion names.
   the offending tokens. Errors only the compiler can see are trait bounds and name lookups
   in the expansion: a parameter type that is not a `SystemParam` is reported at the type
   as "`T` is not a system parameter", a missing finalize as "cannot find value
-  `__finalize_f`".
+  `__finalize_f`", a type in `writes` that is not a component as the unmet `Component`
+  bound at that type.
+- Arguments, as `crates/ecs/README.md` specifies them: `name`, `worlds`, `in_set`, `after`,
+  `writes = [T, ..]` (components the system writes through `Commands::set` or
+  `&mut World`, declared for the schedule), `reduce` and `exclusive`.
 
 ## What the expansion is
 
@@ -32,7 +36,8 @@ For `#[system(..)] fn f(p0: T0, p1: T1)`:
 
 - `f` itself, with every identifier binding made `mut` and `#[allow(unused_mut)]` added.
 - `pub static F: ::lactose_ecs::SystemDescriptor`, documented, whose initializer holds the
-  access table `[<T0 as SystemParam>::ACCESS, ..]` (each entry spanned at its type), a
+  access table `[<T0 as SystemParam>::ACCESS, .., writes::<W0>(), ..]` (each entry spanned
+  at its type; one `writes` entry per type of `writes = [W0, ..]`, after the parameters), a
   static of the `after` descriptors, the entry point
   `fn __run(invocation) { f(fetch(invocation, 0), fetch(invocation, 1)) }`, for a reduction
   `reduce::<R>(invocation, f(..))` and an entry point that finishes the reducer and calls
@@ -41,7 +46,11 @@ For `#[system(..)] fn f(p0: T0, p1: T1)`:
 For `#[finalize(f)] fn g(out: O, p1: T1)`: `g` itself, as above, and
 `const __finalize_f: Finalize<O>` with `g`'s visibility, holding the table of `p1..` and an
 entry point that calls `g(out, fetch(invocation, 0), ..)`, built by one
-`unsafe { Finalize::new(..) }` spanned at the call site.
+`unsafe { Finalize::new(..) }` spanned at the call site; and
+`const _: () = assert!(F.reduce().is_some(), ..)`, so a finalize that names a missing
+system ("cannot find value `F`") or one that is not a reduction ("`#[finalize(f)]` names a
+system that is not a reduction") does not compile.
 
 `crates/ecs/tests/compile_fail.rs` checks every error above and that a crate with
-`#![forbid(unsafe_code)]` and `#![deny(warnings)]` compiles every kind of system.
+`#![forbid(unsafe_code)]` and `#![deny(warnings)]` compiles every kind of system and the
+systems of architecture section 6.1 as written.

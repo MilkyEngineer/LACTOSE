@@ -51,6 +51,7 @@ change with them. Their shape today:
 | `Fetch<'r, 'j>`, `fetch(invocation, index)` | How each parameter type is made from its prepared value; implemented for exactly the `SystemParam` types |
 | `reduce::<R>(invocation, item)`, `finish::<R>(invocation)` | A kernel's item into the partial; the merged total out for the finalize |
 | `Finalize<O>` | What `#[finalize(f)]` emits as `const __finalize_f`: the finalize's access table and its entry point, built by an `unsafe` constructor |
+| `writes::<T>()` | The `AccessKind::Writes` entry `writes = [T]` adds to a table |
 | `BundleOut::push`, `QueryItem::fetch_item`, `QueryItems::{access, fetch_items}` | A bundle's components without their types; a query row's items |
 
 ## The `#[system]` attribute
@@ -75,6 +76,14 @@ Arguments, in any order:
 - `reduce = R`: the function returns `R::Item` for an `R: lactose_math::Reducer`, and a
   `#[finalize(f)]` function in the same module takes `R::Output` first.
 - `exclusive`: the function's first parameter is `&mut World`.
+- `writes = [T, ..]`, on every kind of system: components the system writes outside its
+  parameter list, through `Commands::set` or, in an exclusive system, through
+  `&mut World`. Each adds an `AccessKind::Writes` entry for `T` to the table, after the
+  parameters' entries; nothing is fetched for it. The schedule counts it as a write of the
+  column: it conflicts with readers and writers of `T` in the stage, and it is a declared
+  writer of a transient `T`. This is how a transient column written at the input sync
+  point, or a transient reference column (which `Mut` cannot write), gets a declared
+  writer. An undeclared write is not seen by the schedule.
 
 What it emits, and what the function keeps:
 
@@ -82,7 +91,8 @@ What it emits, and what the function keeps:
   `vel.y -= ..` through `Mut` and `cmd.spawn(..)` through `Commands` compile as written.
 - `pub static F: SystemDescriptor` named after the function in upper snake case, holding the
   name, the worlds, the set, the `after` edges, the kernel's access table (the `ACCESS` of
-  every parameter in declaration order), the finalize function's access table, the
+  every parameter in declaration order, then the `writes` entries), the finalize
+  function's access table, the
   exclusive flag, the reducer's type name (`stringify!`, since `type_name` is not const)
   and the hidden entry points, through the `unsafe` constructor `SystemDescriptor::new`.
   The expansion is the one sound caller: the tables it writes are derived from the parameter
@@ -94,7 +104,10 @@ What it emits, and what the function keeps:
   names by convention, `const __finalize_f: Finalize<R::Output>` with the function's
   visibility, so the two attributes meet without seeing each other. A missing finalize for
   a reduction is the compile error "cannot find value `__finalize_f`"; a first parameter
-  that is not `R::Output` is "mismatched types" at the attribute.
+  that is not `R::Output` is "mismatched types" at the attribute. The `#[finalize(f)]`
+  expansion also asserts, in a constant, that `F` exists and is a reduction, so a finalize
+  that names a missing system or one without `reduce` is a compile error rather than a
+  function nothing runs.
 - `tests/compile_fail.rs` checks every error the macro reports and that a crate with
   `#![forbid(unsafe_code)]` and `#![deny(warnings)]` compiles every kind of system.
 
@@ -210,9 +223,9 @@ What a system is, from its parameters (`SystemParam` has the table):
   them. Emissions wait until `take_present_events`, so a world that never takes them, a
   dedicated server, grows the queue; the server's tick loop takes and drops them.
 - Every reader of a transient column must be ordered after a declared writer of it in the
-  tick (`TransientBeforeWriter`): a system with `Mut` on the column, or an exclusive
-  system, which may write anything, so inputs applied at the input sync point count. A
-  write through `Commands` does not.
+  tick (`TransientBeforeWriter`): a system with `Mut` on the column, or one that names it
+  in `writes = [..]`. An exclusive system that writes the column at the input sync point
+  declares it; one that declares nothing is no writer of anything.
 
 **Schedule**
 
@@ -230,7 +243,9 @@ What a system is, from its parameters (`SystemParam` has the table):
   ordered by sets or `after` edges; otherwise the build fails. Non-conflicting systems run
   in parallel. The execution order is the topological order with ties by `SystemKey`.
   `ScheduleBuilder::stage` takes the stage's sets as any slice, so `&[&MOVEMENT]` works in
-  a function; the sets themselves are statics.
+  a function; the sets themselves are statics, and a set belongs to one stage
+  (`ScheduleError::SetInTwoStages`). Two unordered exclusive systems conflict on
+  `AccessTarget::World`.
 - `Changed<T>` in system S passes rows whose change stamp is after S's position in the
   previous tick and before it in this one: each change is seen exactly once by each reader,
   whether it came from a system ordered before S, a command at a sync point or direct
@@ -284,6 +299,18 @@ What a system is, from its parameters (`SystemParam` has the table):
   a new epoch, after which a stale mark or cursor yields `None` and the consumer does a
   full pass. A region load does not: its rows are stamped at the current point and logged
   as spawned.
+- The tick is a `u32` that wraps. Every 2^30 ticks (tick zero included) stamps older than
+  2^30 ticks are clamped forward to that age and an epoch starts, so every stored stamp is
+  within 2^30 ticks of now, and stamps are compared relative to the current tick; the
+  `Changed` windows and `changed_since` hold across the wrap.
+- `set_tick` moves stamps onto the new clock by their age on the old one. Forward, a stamp
+  of the old tick, possibly not yet seen by a reader, moves to the new point and anything
+  older to before the new tick; back by `k` ticks, a stamp younger than `k` ticks moves to
+  the new point and the rest keeps its tick. A mark taken after `set_tick` sees only later
+  writes, and each `Changed` reader sees a moved stamp once more at most.
+- A `Schedule` serves one world: the first `prepare` or run ties it to that world, and
+  another world is `ScheduleError::WrongWorld`, since a pass keeps each system's `Changed`
+  window in the schedule.
 - Every column in every chunk has a coarse tick, set at dispatch for every chunk a writing
   system touches. Tracked columns (replicated or extracted) have a stamp per row, set by
   `Mut` on mutable dereference, by `Commands::set`, `World::insert` and `World::get_mut`,
@@ -310,9 +337,12 @@ What a system is, from its parameters (`SystemParam` has the table):
   the snapshot's tick, puts stamps back verbatim, clears the structural log and starts a
   new epoch; the alias table and the delivered presentation-event keys are kept, untaken
   emissions after the snapshot are dropped, and a bind for an entity the restore removed
-  applies when the entity is re-spawned. `World::set_rollback_horizon` is how the world
-  learns what it may prune: the ring's oldest tick from `lactose-predict`, the current tick
-  on the server.
+  applies when the entity is re-spawned. A reference the snapshot holds under a `Net` key
+  bound since goes back to the origin key at the restore, as the bind left it, in storage
+  and in the reverse index. `World::set_rollback_horizon` is how the world learns what it
+  may prune: the ring's oldest tick from `lactose-predict`, the current tick on the
+  server. `World::bind` refuses a `NetId` that names a live entity of its own, whose
+  references the bind would redirect.
 - `load_region` takes the baseline and the overlay together into a region the caller
   created with the saved seed, skips baseline rows the overlay destroys (a cooked entity
   that moved is a live row elsewhere), restores predicted origins and aliases from
@@ -323,6 +353,17 @@ What a system is, from its parameters (`SystemParam` has the table):
   ascending `NetId` order, the owner beside each row, the seed and the persistent region
   resources; diffing against the baseline into an `Overlay` is `lactose-persist`'s, and the
   world hash is `lactose-sim`'s, over `columns_erased` and `region_resources_erased`.
+- A transient component is not saved, but its presence is part of the entity's archetype,
+  which its systems and the world hash depend on: `ExportedRow::transient` lists the keys
+  of the row's transient components, `lactose-persist` encodes their presence as it sees
+  fit (for instance the component with zeroed bytes in the entity's records) and ignores
+  non-persistent components when it diffs against the baseline, and `load_region` stores a
+  transient component a document carries as zeroed, whatever its bytes.
+- Region resources are validated when inserted, typed or erased (a placeholder in a
+  reference field is refused), and a bound `Net` key in their reference fields is stored as
+  the origin key. References in resources are not in the reverse index and may dangle.
+  `region_resource` and `region_resource_mut` return `None` for bytes that are not a valid
+  value, which only a write through `region_resource_mut` can leave.
 
 **Not in this crate yet**
 
@@ -350,5 +391,6 @@ repeat, layout and chaos modes.
 | `bulk.rs` | A baseline and an overlay with every record kind, diffed back to the same overlay under every layout; region resources; schema mismatches |
 | `layout.rs` | One program under every layout: identical exports, structural logs, reductions and presentation events |
 | `pass.rs`, `query.rs`, `regions.rs` | `run_pass` with a fork over columns; whole-world queries in key order; region modes and per-region systems |
+| `binds.rs`, `wrap.rs`, `reload.rs` | Binds across a restore and onto live keys; `Changed` across the `u32` wrap, the 2^30 clamp and `set_tick`; transient presence through an unload and reload |
 | `regressions.rs` | The findings of the pre-review: transient references in the index, pass events across a rollback, owner keys in either load order, exports after an unload, `set_tick` stamps, transient writers, double rollbacks, failed loads, resources removed mid-run |
 | `compile_fail.rs` | What `#[system]` and `#[finalize]` reject, and what they accept under `#![forbid(unsafe_code)]` |
