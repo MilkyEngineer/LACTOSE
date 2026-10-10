@@ -142,8 +142,10 @@ order.
   `wide` SIMD lanes can return zeros of different sign on x86-64 and AArch64. No patch under
   fifty lines closes it, so the cross-architecture property stays unproven until SOUR's
   architecture mode runs on CI (`docs/verification.md`).
-- **Snapshot cost.** The 100 µs snapshot budget is not met for 50 bodies; Rapier's own
-  rigid-body set encoding dominates.
+- **Snapshot cost** (`tests/cost.rs`, printed, not asserted). For 50 bodies: about 65 kB,
+  written in about 80 µs and restored in about 110 µs, so restore misses the 100 µs budget.
+  Each fixed collider adds about 1.2 kB, 1.4 µs to write and 1.9 µs to restore; Rapier's
+  own encoding of its sets is most of the bytes.
 - A snapshot that decodes and passes the check but whose Rapier state is otherwise
   inconsistent (bytes not written by this backend) can make a later Rapier call panic.
 - `Multibody::inverse_kinematics` and its two delta variants are banned in every boundary
