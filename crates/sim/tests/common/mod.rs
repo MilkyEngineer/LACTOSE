@@ -108,8 +108,9 @@ pub struct Walker {
     pub y: i32,
 }
 
-/// The quantised input `lactose-input` would define: derived, written by the applier.
-#[component(key = "game::input", derived)]
+/// The quantised input `lactose-input` would define: transient, zeroed at the input sync
+/// point and written by the applier, with [`input_writer`] its declared writer.
+#[component(key = "game::input", transient)]
 #[derive(PartialEq, Debug)]
 pub struct InputSample {
     #[field(id = 1)]
@@ -353,7 +354,22 @@ pub fn register_systems(registration: &mut Registration) {
         .add(&AGE)
         .add(&SPAWN_NPCS);
     registration.stage(Stage::Post).add(&WEATHER);
+    registration.stage(Stage::Input).sets(&[&SAMPLES]).add(&INPUT_WRITER);
 }
+
+/// The input crate's set at the sync point, after `sim`'s.
+pub static SAMPLES: SystemSet = SystemSet::new("game::samples").after(&[&sets::INPUT]);
+
+/// The declared writer of [`InputSample`]: the applier writes it inside `sim`'s systems,
+/// and this tells the schedule so, for the readers.
+#[system(
+    name = "game::input_writer",
+    worlds = [server, prediction],
+    exclusive,
+    in_set = SAMPLES,
+    writes = [InputSample]
+)]
+pub fn input_writer(_world: &mut World) {}
 
 /// The game's type table.
 pub fn types() -> TypeTable {
@@ -512,6 +528,7 @@ pub fn observe(world: &mut World, log: Res<Log>) {
 /// Adds [`OBSERVERS`] and its system to the input stage.
 pub fn register_observer(registration: &mut Registration) {
     registration.stage(Stage::Input).sets(&[&OBSERVERS]).add(&OBSERVE);
+    registration.order(&SAMPLES, &OBSERVERS);
 }
 
 // ---- Frames ----
@@ -737,6 +754,12 @@ impl Driver {
         }
         let failures = lifecycle.take_load_failures();
         assert!(failures.is_empty(), "the driver's bundles load: {failures:?}");
+    }
+
+    /// The regions owed a bundle in the next frame, for a test that takes the lifecycle's
+    /// requests itself.
+    pub fn pending_mut(&mut self) -> &mut BTreeSet<RegionId> {
+        &mut self.pending
     }
 
     /// The bundles and tables for the next frame, added to `frame`.

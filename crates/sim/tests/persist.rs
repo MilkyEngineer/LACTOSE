@@ -15,7 +15,7 @@ use common::*;
 use lactose_asset_api::PinnedTable;
 use lactose_bundle::Baseline;
 use lactose_core::{PlayerId, Tick};
-use lactose_ecs::{Executor, RegionId, RegionMode, WorldKind};
+use lactose_ecs::{ClaimedBy, Executor, RegionConfig, RegionId, RegionMode, WorldKind};
 use lactose_sim::journal::{Journal, JournalFrame, JournalLoad};
 use lactose_sim::{RegionBundle, SavePoint, SessionEvent, Simulation, TickInput};
 
@@ -63,10 +63,14 @@ fn bundles(
         .collect()
 }
 
-/// Every player joins again, in the region its row is in.
+/// Every joined player joins again, in the region its row is in; a row the game kept for
+/// a player who left stays unclaimed.
 fn joins(simulation: &mut Simulation) -> BTreeMap<PlayerId, SessionEvent> {
     let mut rows = Vec::new();
-    simulation.world_mut().query::<&Player>().for_each(|key, player| rows.push((key, player.id)));
+    simulation
+        .world_mut()
+        .query::<(&Player, &ClaimedBy)>()
+        .for_each(|key, (player, _)| rows.push((key, player.id)));
     rows.into_iter()
         .map(|(key, player)| {
             let region = simulation.world().region_of(key).unwrap();
@@ -77,12 +81,23 @@ fn joins(simulation: &mut Simulation) -> BTreeMap<PlayerId, SessionEvent> {
 
 #[test]
 fn a_fresh_load_an_in_place_reload_and_an_untouched_twin_hash_equal() {
-    const T: u32 = 60;
+    reload_at(60, 2);
+}
+
+/// Player 2 left at tick 150 and the game kept its row: the window in which a sample left
+/// on the row would drive it from state no save holds.
+#[test]
+fn a_reload_while_a_left_players_row_is_kept_hashes_equal() {
+    reload_at(160, 1);
+}
+
+/// The 15.5 tests with the save taken at tick `at`, when `players` are joined.
+fn reload_at(at: u32, players: usize) {
     const K: u32 = 90;
     let executor = executor();
-    let original = directed_world(&executor, T);
+    let original = directed_world(&executor, at);
     let (mut original, save) = save_of(&executor, original);
-    assert_eq!(save.tick, Tick(T));
+    assert_eq!(save.tick, Tick(at));
     assert_eq!(
         save.regions.iter().map(|export| export.region).collect::<Vec<_>>(),
         neighbourhood()
@@ -92,18 +107,18 @@ fn a_fresh_load_an_in_place_reload_and_an_untouched_twin_hash_equal() {
         .map(|region| (region, original.world().region_assets(region).unwrap().clone()))
         .collect();
     let rejoin = joins(&mut original);
-    assert_eq!(rejoin.len(), 2);
+    assert_eq!(rejoin.len(), players);
 
     // The fresh simulation: built from the save point, loaded through the frame.
     let fresh_load =
         game(WorldKind::Server).tick(save.tick).next_net_id(save.next_net_id).build().unwrap();
-    let mut first = script(T + 1);
+    let mut first = script(at + 1);
     first.loaded = bundles(&save, &tables);
     first.sessions.extend(rejoin.clone());
     let mut fresh_load = step(&executor, fresh_load, first);
 
     // The in-place reload: every region unloaded and loaded again in one frame.
-    let mut reload_frame = script(T + 1);
+    let mut reload_frame = script(at + 1);
     reload_frame.unloaded = neighbourhood().into_iter().collect();
     reload_frame.loaded = bundles(&save, &tables);
     reload_frame.sessions.extend(rejoin);
@@ -113,10 +128,10 @@ fn a_fresh_load_an_in_place_reload_and_an_untouched_twin_hash_equal() {
     assert!(save.regions.iter().map(|export| export.rows.rows.len()).sum::<usize>() > 2 * 9);
 
     // The twin ran the same program and never reloaded.
-    let mut twin = directed_world(&executor, T + 1);
+    let mut twin = directed_world(&executor, at + 1);
 
-    for tick in T + 1..=T + K {
-        if tick > T + 1 {
+    for tick in at + 1..=at + K {
+        if tick > at + 1 {
             original = step(&executor, original, script(tick));
             fresh_load = step(&executor, fresh_load, script(tick));
             twin = step(&executor, twin, script(tick));
@@ -125,7 +140,7 @@ fn a_fresh_load_an_in_place_reload_and_an_untouched_twin_hash_equal() {
         assert_eq!(fresh_load.hash().unwrap(), hash, "fresh load at tick {tick}");
         assert_eq!(twin.hash().unwrap(), hash, "untouched twin at tick {tick}");
     }
-    assert_eq!(original.tick(), Tick(T + K));
+    assert_eq!(original.tick(), Tick(at + K));
 }
 
 #[test]
@@ -247,4 +262,142 @@ fn a_journal_replayed_by_a_small_driver_reproduces_the_hashes() {
         hashes.push(replay.hash().unwrap());
     }
     assert_eq!(hashes, recorded);
+}
+
+/// What one step left in the lifecycle besides its requests, as a replay must reproduce it.
+fn outputs(simulation: &mut Simulation) -> String {
+    let lifecycle = simulation.lifecycle_mut();
+    let exports: Vec<RegionId> = lifecycle.take_exports().iter().map(|e| e.region).collect();
+    let failures = lifecycle.take_load_failures().len();
+    format!("exports {exports:?} load failures {failures}")
+}
+
+/// Records the program with a checkpoint after tick `at`, the session state a save does
+/// not carry, then `after` frames; returns the journal, the hashes and the outputs.
+fn record_from(executor: &Executor, at: u32, after: u32) -> (Journal, Vec<u64>, Vec<String>) {
+    let mut simulation = program(Default::default());
+    let mut driver = Driver::default();
+    for tick in 1..=at {
+        let frame = program_frame(tick, &mut driver);
+        simulation = step(executor, simulation, frame);
+        driver.observe(&mut simulation);
+    }
+    let (mut simulation, checkpoint) = save_of(executor, simulation);
+    let world = simulation.world();
+    let mut tables = BTreeMap::new();
+    let mut modes = BTreeMap::new();
+    for region in world.regions() {
+        if let Some(table) = world.region_assets(region) {
+            tables.insert(region, table.table().clone());
+        }
+        modes.insert(region, world.region(region).unwrap().mode);
+    }
+    let mut players = BTreeMap::new();
+    let mut held_joins = BTreeMap::new();
+    for player in [PlayerId(1), PlayerId(2)] {
+        if let Some(key) = player_entity(simulation.world_mut(), player) {
+            players.insert(player, key);
+        }
+        if let Some(region) = simulation.lifecycle().held_join(player) {
+            held_joins.insert(player, region);
+        }
+    }
+    let requested = atlas()
+        .within(cell_of(region_at(2, 2)), 100)
+        .filter(|&region| simulation.lifecycle().is_requested(region))
+        .collect();
+    let mut journal =
+        Journal { checkpoint, tables, modes, players, held_joins, requested, frames: Vec::new() };
+    let mut hashes = Vec::new();
+    let mut seen = Vec::new();
+    for tick in at + 1..=at + after {
+        let frame = program_frame(tick, &mut driver);
+        journal.frames.push(JournalFrame::record(Tick(tick), &frame));
+        simulation = step(executor, simulation, frame);
+        // The driver answers what the run asked, as `observe` would.
+        let requests = simulation.lifecycle_mut().take_requests();
+        for request in &requests {
+            match *request {
+                lactose_sim::RegionRequest::Load { region } => {
+                    driver.pending_mut().insert(region);
+                }
+                lactose_sim::RegionRequest::Cancel { region } => {
+                    driver.pending_mut().remove(&region);
+                }
+                lactose_sim::RegionRequest::Release { .. } => {}
+            }
+        }
+        let rest = outputs(&mut simulation);
+        seen.push(format!("{tick}: {requests:?} {rest}"));
+        hashes.push(simulation.hash().unwrap());
+    }
+    (journal, hashes, seen)
+}
+
+/// The replay driver: restores what the journal holds before its first step (the
+/// regions, an unjournaled edit the tool makes; the players' claims; the held joins and
+/// requested regions through `restore_session_state`), then steps the journal's frames.
+fn replay_from(executor: &Executor, journal: &Journal) -> (Vec<u64>, Vec<String>) {
+    let save = &journal.checkpoint;
+    let mut simulation = game(WorldKind::Server)
+        .regions(anchored(true))
+        .tick(save.tick)
+        .next_net_id(save.next_net_id)
+        .build()
+        .unwrap();
+    let pin = |table: &lactose_asset_api::VersionTable| {
+        let entries: Vec<(u64, u64)> =
+            table.iter().map(|(id, version)| (id.to_bits(), version.to_bits())).collect();
+        common::table(&entries)
+    };
+    for export in &save.regions {
+        let bundle = reload(export, baseline(export.region), types().registry());
+        let world = simulation.world_mut();
+        let mode = journal.modes[&export.region];
+        world
+            .create_region(RegionConfig { id: export.region, seed: export.rows.seed, mode })
+            .unwrap();
+        world.load_region(export.region, &bundle.baseline, bundle.overlay.as_deref()).unwrap();
+        for resource in &bundle.resources {
+            world.insert_region_resource_erased(export.region, resource.clone()).unwrap();
+        }
+        for &resource in &bundle.transient_resources {
+            world.insert_region_resource_zeroed(export.region, resource).unwrap();
+        }
+        if let Some(table) = journal.tables.get(&export.region) {
+            world.set_region_assets(export.region, pin(table)).unwrap();
+        }
+    }
+    for (&player, &key) in &journal.players {
+        let world = simulation.world_mut();
+        world.insert(key, ClaimedBy { player }).unwrap();
+        world.insert(key, lactose_sim::StreamingAnchor { priority: 0 }).unwrap();
+    }
+    simulation
+        .lifecycle_mut()
+        .restore_session_state(journal.held_joins.clone(), journal.requested.clone());
+    let baselines = baselines();
+    let mut hashes = Vec::new();
+    let mut seen = Vec::new();
+    for frame in &journal.frames {
+        simulation = step(executor, simulation, replayed(frame, &baselines));
+        let requests = simulation.lifecycle_mut().take_requests();
+        let rest = outputs(&mut simulation);
+        seen.push(format!("{}: {requests:?} {rest}", frame.tick.0));
+        hashes.push(simulation.hash().unwrap());
+    }
+    (hashes, seen)
+}
+
+#[test]
+fn a_journal_from_a_mid_run_checkpoint_replays_with_its_session_state() {
+    let executor = executor();
+    // Inside the held-join window, around the leave at 150 and the join again at 170.
+    for at in [1_u32, 2, 3, 60, 149, 150, 151, 169, 170, 171, 200] {
+        let (journal, recorded, original) = record_from(&executor, at, 60);
+        let (hashes, replayed) = replay_from(&executor, &journal);
+        let first = hashes.iter().zip(&recorded).position(|(a, b)| a != b);
+        assert_eq!(first, None, "checkpoint {at}: first differing step");
+        assert_eq!(replayed, original, "checkpoint {at}: lifecycle outputs");
+    }
 }

@@ -3,7 +3,7 @@
 //! regions that are always simulated, and an unload that writes the same records as a
 //! save.
 
-use core::ops::Bound;
+use core::marker::PhantomData;
 use std::collections::{BTreeMap, BTreeSet};
 
 use lactose_asset_api::AssetFailure;
@@ -91,35 +91,46 @@ impl RegionAtlas {
 
     /// The regions within `radius` of `centre` ([`RegionCell::distance`] at most `radius`),
     /// `centre`'s own region included if it exists, in ascending `RegionId` order.
+    ///
+    /// Costs O(m log n) for an atlas of n regions, where m is the smaller of n and the
+    /// (2r + 1)² cells within radius r: those cells are looked up when there are fewer of
+    /// them than regions, and the atlas is scanned otherwise. The regions are collected
+    /// when this is called.
     #[must_use]
     pub fn within(&self, centre: RegionCell, radius: u32) -> Within<'_> {
-        Within { atlas: self, centre, radius, last: None }
+        let mut regions = Vec::new();
+        let side = u64::from(radius) * 2 + 1;
+        if side.saturating_mul(side) < self.cells.len() as u64 {
+            let r = i64::from(radius);
+            for y in i64::from(centre.y) - r..=i64::from(centre.y) + r {
+                for x in i64::from(centre.x) - r..=i64::from(centre.x) + r {
+                    if let (Ok(x), Ok(y)) = (i32::try_from(x), i32::try_from(y))
+                        && let Some(region) = self.region_at(RegionCell { x, y })
+                    {
+                        regions.push(region);
+                    }
+                }
+            }
+            regions.sort_unstable();
+        } else {
+            let near = self.cells.iter().filter(|(_, cell)| cell.distance(centre) <= radius);
+            regions.extend(near.map(|(&region, _)| region));
+        }
+        Within { regions: regions.into_iter(), atlas: PhantomData }
     }
 }
 
 /// Iterates the regions within a radius of a cell, ascending by `RegionId`.
 pub struct Within<'a> {
-    atlas: &'a RegionAtlas,
-    centre: RegionCell,
-    radius: u32,
-    /// The region yielded last, so the walk resumes after it.
-    last: Option<RegionId>,
+    regions: std::vec::IntoIter<RegionId>,
+    atlas: PhantomData<&'a RegionAtlas>,
 }
 
 impl Iterator for Within<'_> {
     type Item = RegionId;
 
     fn next(&mut self) -> Option<Self::Item> {
-        // Each call resumes the walk after the region yielded last, so a whole iteration
-        // visits every region of the atlas once.
-        let mut rest = match self.last {
-            None => self.atlas.cells.range(..),
-            Some(last) => self.atlas.cells.range((Bound::Excluded(last), Bound::Unbounded)),
-        };
-        let found = rest.find(|(_, cell)| cell.distance(self.centre) <= self.radius);
-        let (&region, _) = found?;
-        self.last = Some(region);
-        Some(region)
+        self.regions.next()
     }
 }
 
@@ -130,8 +141,9 @@ impl Iterator for Within<'_> {
 /// [`RegionControl::Anchored`] only; not saved, not hashed.
 ///
 /// `release_radius >= streaming_radius > activation_radius` is required at build. At run
-/// time the lifecycle clamps what it reads, logging the clamp: the activation radius to
-/// `streaming_radius - 1` and the release radius up to `streaming_radius`, so that an
+/// time the lifecycle clamps what it reads, logging the clamp: the streaming radius up to
+/// one, the activation radius to `streaming_radius - 1` and the release radius up to
+/// `streaming_radius`, so that an
 /// active region is always loaded, an entity in a `Simulated` region can only ever cross
 /// into a loaded one (which freezes it with the region, section 9.7), and nothing that was
 /// just requested is released.
@@ -220,6 +232,8 @@ pub enum RegionRequest {
         region: RegionId,
     },
     /// This region was exported and unloaded; its bundle and pinned table may be released.
+    /// Not issued for a region the same frame unloads and loads again, which is replaced
+    /// rather than released.
     Release {
         /// The region.
         region: RegionId,
@@ -334,6 +348,22 @@ impl RegionLifecycle {
         self.held_joins.get(&player).copied()
     }
 
+    /// Replaces the held joins and the requested regions with those a journal recorded at
+    /// its checkpoint ([`Journal::held_joins`](crate::journal::Journal::held_joins) and
+    /// [`Journal::requested`](crate::journal::Journal::requested)): what a replay driver
+    /// calls through [`Simulation::lifecycle_mut`](crate::Simulation::lifecycle_mut) before
+    /// its first step, since a save carries no session state. Nothing is issued for them:
+    /// the requests were issued in the recorded run. Like a write through `world_mut`, it
+    /// is not journaled.
+    pub fn restore_session_state(
+        &mut self,
+        held_joins: BTreeMap<PlayerId, RegionId>,
+        requested: BTreeSet<RegionId>,
+    ) {
+        self.held_joins = held_joins;
+        self.requested = requested;
+    }
+
     /// The requests issued since the last take, in the order they were issued.
     pub fn take_requests(&mut self) -> Vec<RegionRequest> {
         core::mem::take(&mut self.requests)
@@ -379,10 +409,15 @@ impl RegionLifecycle {
         let directed = matches!(self.control, RegionControl::Directed);
 
         let unloaded = core::mem::take(&mut frame.unloaded);
+        // A region this frame unloads and loads again is replaced, not released: the
+        // `Release` its unload issued is withdrawn once the bundle loads.
+        let first_request = self.requests.len();
+        let mut replaced = BTreeSet::new();
         if directed {
             for region in unloaded {
                 if is_loaded(world, region) {
                     self.unload(world, region);
+                    replaced.insert(region);
                 } else {
                     tracing::debug!(
                         target: "curd",
@@ -419,6 +454,19 @@ impl RegionLifecycle {
                 tracing::warn!(target: "curd", region = region.0, %error, "region bundle refused");
                 self.load_failures.push(LoadFailure { tick, region, error });
             }
+        }
+        replaced.retain(|&region| is_loaded(world, region));
+        if !replaced.is_empty() {
+            let mut index = 0;
+            self.requests.retain(|request| {
+                let release = match *request {
+                    RegionRequest::Release { region } => replaced.contains(&region),
+                    RegionRequest::Load { .. } | RegionRequest::Cancel { .. } => false,
+                };
+                let withdrawn = index >= first_request && release;
+                index += 1;
+                !withdrawn
+            });
         }
 
         for (region, table) in core::mem::take(&mut frame.assets) {
@@ -528,10 +576,12 @@ impl RegionLifecycle {
         sessions: BTreeMap<PlayerId, SessionEvent>,
     ) {
         let tick = world.tick();
+        // Sessions load nothing, so the loaded set holds until the appliers run.
+        let loaded: BTreeSet<RegionId> = world.regions().collect();
         let mut due: BTreeMap<PlayerId, SessionEvent> = self
             .held_joins
             .iter()
-            .filter(|&(_, &region)| is_loaded(world, region))
+            .filter(|&(_, region)| loaded.contains(region))
             .map(|(&player, &region)| (player, SessionEvent::Join { region }))
             .collect();
         for (player, event) in sessions {
@@ -552,7 +602,7 @@ impl RegionLifecycle {
                         continue;
                     }
                     // A newer join replaces a held one.
-                    if is_loaded(world, region) {
+                    if loaded.contains(&region) {
                         self.held_joins.remove(&player);
                         due.insert(player, event);
                     } else {
@@ -608,6 +658,7 @@ impl RegionLifecycle {
         for &region in loaded.iter().filter(|region| !kept.contains(region)) {
             self.unload(world, region);
         }
+        let loaded: BTreeSet<RegionId> = world.regions().collect();
         let cancelled: Vec<RegionId> =
             self.requested.iter().copied().filter(|region| !kept.contains(region)).collect();
         for region in cancelled {
@@ -615,11 +666,11 @@ impl RegionLifecycle {
             self.requests.push(RegionRequest::Cancel { region });
         }
         for region in wanted {
-            if !is_loaded(world, region) && self.requested.insert(region) {
+            if !loaded.contains(&region) && self.requested.insert(region) {
                 self.requests.push(RegionRequest::Load { region });
             }
         }
-        for region in world.regions().collect::<Vec<_>>() {
+        for region in loaded {
             let simulated = active.contains(&region) && world.region_assets(region).is_some();
             let mode = if simulated { RegionMode::Simulated } else { RegionMode::Frozen };
             world.set_region_mode(region, mode).expect("the region is loaded");
@@ -679,7 +730,11 @@ struct Radii {
 
 impl Radii {
     fn clamped(policy: &RegionPolicy) -> Self {
-        let streaming = policy.streaming_radius;
+        let mut streaming = policy.streaming_radius;
+        if streaming == 0 {
+            tracing::debug!(target: "curd", "streaming radius clamped up to one");
+            streaming = 1;
+        }
         let mut activation = policy.activation_radius;
         let mut release = policy.release_radius;
         let ceiling = streaming.saturating_sub(1);

@@ -475,7 +475,9 @@ impl Simulation {
     /// worlds, so what was edited between ticks is still extracted and replicated and the
     /// prediction world's local player is extracted every frame; a gather therefore covers
     /// every tick since the last frame, up to the catch-up cap. `lactose-predict`'s
-    /// re-simulation calls [`step`](Self::step) alone. Fails as a step does.
+    /// re-simulation calls [`step`](Self::step) alone. Fails as a step does; `Gather` is
+    /// prepared again once `Extract` has run, and if that fails the simulation comes back
+    /// with `Extract`'s work done and `Gather`'s not.
     pub fn run_passes(self, executor: &Executor) -> PassRun<'_> {
         PassRun { run: Box::pin(self.run_passes_inner(executor)) }
     }
@@ -496,7 +498,13 @@ impl Simulation {
             return Err(RunError::kept(schedule_error(error), self));
         }
         let Self { mut world, mut core } = self;
-        for pass in core.passes.iter_mut().flatten() {
+        for index in 0..core.passes.len() {
+            let Some(pass) = core.passes[index].as_mut() else { continue };
+            // `Extract` may have removed what `Gather` names; checked again here, `run_pass`
+            // would fail the same way with the world inside it.
+            if let Err(error) = pass.prepare(&world) {
+                return Err(RunError::kept(schedule_error(error), core.join(world)));
+            }
             world = pass.run_pass(world, executor).await.map_err(RunError::lost)?;
         }
         Ok(core.join(world))
@@ -552,9 +560,11 @@ fn slot(world: &mut World) -> &mut TickInputSlot {
     world.service_mut::<TickInputSlot>().expect("the builder inserts the frame slot")
 }
 
-/// How a run fails: the error, and the simulation when nothing ran. `Some` when the kind
-/// check or [`Schedule::prepare`] failed before the run started, so the caller keeps its
-/// world; `None` after `Cancelled`, when the executor shut down during the run and the
+/// How a run fails: the error, and the simulation when the world survived. `Some` when the
+/// kind check or [`Schedule::prepare`] failed before the run started, so the caller keeps
+/// its world; when the `Gather` pass no longer prepares after `Extract` ran (the simulation
+/// then holds what `Extract` did); and when a save point's export failed, which changes
+/// nothing. `None` after `Cancelled`, when the executor shut down during the run and the
 /// world dropped with it. The frame a step was given is not handed back either way.
 /// Converts into [`Error`], so `?` into a `lactose_core::Result` drops the simulation as a
 /// plain error would.

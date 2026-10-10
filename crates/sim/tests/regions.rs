@@ -278,3 +278,117 @@ fn with_no_anchor_and_no_pinned_region_everything_unloads() {
     let player = data(Player { id: PlayerId(1) });
     assert!(export.rows.rows.iter().any(|row| row.components.contains(&player)));
 }
+
+#[test]
+fn a_streaming_radius_of_zero_is_clamped_to_one() {
+    let executor = executor();
+    let simulation = game(WorldKind::Server).regions(anchored(false)).build().unwrap();
+    let mut driver = Driver::default();
+    let centre = region_at(2, 2);
+    let mut simulation = drive(&executor, &mut driver, simulation, join(1, centre));
+    simulation = drive(&executor, &mut driver, simulation, TickInput::default());
+    let zero = RegionPolicy { activation_radius: 0, streaming_radius: 0, release_radius: 0 };
+    simulation.world_mut().insert_resource(zero);
+    for _ in 0..3 {
+        simulation = drive(&executor, &mut driver, simulation, TickInput::default());
+    }
+    let clamped = RegionPolicy { activation_radius: 0, streaming_radius: 1, release_radius: 1 };
+    check(&simulation, centre, &clamped);
+    assert_eq!(loaded(&simulation).len(), ring(centre, 1).len(), "the ring stays loaded");
+}
+
+#[test]
+fn a_region_replaced_in_one_frame_is_not_released() {
+    let executor = executor();
+    let region = region_at(1, 1);
+    let mut frame = TickInput::default();
+    frame.loaded.insert(region, fresh(region));
+    let mut simulation = step(&executor, game(WorldKind::Server).build().unwrap(), frame);
+    // Unloaded and loaded again in one frame: exported, replaced, not released.
+    let mut resync = TickInput::default();
+    resync.unloaded.insert(region);
+    resync.loaded.insert(region, fresh(region));
+    simulation = step(&executor, simulation, resync);
+    assert!(simulation.lifecycle_mut().take_requests().is_empty());
+    assert_eq!(simulation.lifecycle_mut().take_exports().len(), 1);
+    assert!(loaded(&simulation).contains_key(&region));
+    // A refused reload leaves the unload a release.
+    let mut refused = TickInput::default();
+    refused.unloaded.insert(region);
+    let mut bad = fresh(region);
+    bad.transient_resources.push(<Weather as lactose_reflect::Reflect>::KEY);
+    refused.loaded.insert(region, bad);
+    simulation = step(&executor, simulation, refused);
+    assert_eq!(simulation.lifecycle_mut().take_requests(), [RegionRequest::Release { region }]);
+    assert!(!loaded(&simulation).contains_key(&region));
+}
+
+/// A square atlas of `side` × `side` regions.
+fn square(side: i32) -> lactose_sim::RegionAtlas {
+    let mut atlas = lactose_sim::RegionAtlas::new();
+    for y in 0..side {
+        for x in 0..side {
+            let region = RegionId(1 + (y * side + x) as u64);
+            atlas.insert(region, lactose_sim::RegionCell { x, y }).unwrap();
+        }
+    }
+    atlas
+}
+
+#[test]
+fn within_walks_the_cells_or_scans_and_agrees_with_the_definition() {
+    let atlas = square(40);
+    let brute = |centre: lactose_sim::RegionCell, radius: u32| -> Vec<RegionId> {
+        (0..40 * 40_u64)
+            .map(|n| RegionId(1 + n))
+            .filter(|&region| atlas.cell(region).unwrap().distance(centre) <= radius)
+            .collect()
+    };
+    let cells = [(0, 0), (39, 39), (20, 7), (-3, 5), (45, 45), (i32::MIN, i32::MAX)];
+    for (x, y) in cells {
+        for radius in [0, 1, 2, 5, 19, 20, 40, u32::MAX] {
+            let centre = lactose_sim::RegionCell { x, y };
+            let within: Vec<RegionId> = atlas.within(centre, radius).collect();
+            assert_eq!(within, brute(centre, radius), "({x}, {y}) radius {radius}");
+        }
+    }
+}
+
+#[test]
+fn the_policy_on_a_large_atlas_requests_the_union_of_the_rings() {
+    // 65,536 regions and 64 held joins whose regions never load: each is an anchor every
+    // step, and the policy's work follows the rings, not the atlas.
+    let executor = executor();
+    let side = 256;
+    let atlas = square(side);
+    let control =
+        lactose_sim::RegionControl::Anchored { atlas: atlas.clone(), pinned: BTreeSet::new() };
+    let simulation = lactose_sim::SimulationBuilder::new(WorldKind::Server, types())
+        .regions(control)
+        .build()
+        .unwrap();
+    let mut frame = TickInput::default();
+    let mut expected = BTreeSet::new();
+    for p in 0..64_i32 {
+        let (x, y) = ((p * 7) % side, (p * 13) % side);
+        let region = RegionId(1 + (y * side + x) as u64);
+        frame.sessions.insert(PlayerId(p as u32 + 1), SessionEvent::Join { region });
+        for dy in -2..=2 {
+            for dx in -2..=2 {
+                let (cx, cy) = (x + dx, y + dy);
+                if (0..side).contains(&cx) && (0..side).contains(&cy) {
+                    expected.insert(RegionId(1 + (cy * side + cx) as u64));
+                }
+            }
+        }
+    }
+    let mut simulation = step(&executor, simulation, frame);
+    let requests = simulation.lifecycle_mut().take_requests();
+    assert_eq!(loads(&requests), expected);
+    assert_eq!(requests.len(), expected.len(), "each region requested once");
+    for _ in 0..5 {
+        simulation = step(&executor, simulation, TickInput::default());
+        assert!(simulation.lifecycle_mut().take_requests().is_empty());
+    }
+    assert!(expected.iter().all(|&region| simulation.lifecycle().is_requested(region)));
+}

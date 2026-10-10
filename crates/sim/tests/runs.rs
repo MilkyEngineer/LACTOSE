@@ -175,6 +175,36 @@ fn passes_run_extract_then_gather_between_ticks_in_the_order_app_gives() {
     assert_eq!(names, ["extract"]);
 }
 
+static REMOVER: SystemSet = SystemSet::new("test::remover");
+
+/// An extract that removes what the gather names.
+#[system(name = "test::remove_gravity", worlds = [server], exclusive, in_set = REMOVER)]
+fn remove_gravity(world: &mut World) {
+    world.remove_resource::<Gravity>();
+}
+
+#[test]
+fn a_gather_that_no_longer_prepares_after_extract_hands_the_simulation_back() {
+    let seen = Passes::default();
+    let service = seen.clone();
+    let builder = game(WorldKind::Server)
+        .setup(move |world| {
+            world.insert_service(Box::new(service));
+            Ok(())
+        })
+        .systems(|registration| {
+            registration.pass(Pass::Extract).sets(&[&REMOVER]).add(&REMOVE_GRAVITY);
+            registration.pass(Pass::Gather).sets(&[&GATHER_B_SET]).add(&GATHER_B);
+        });
+    let (executor, simulation) = directed(builder);
+    let failure = executor.block_on(simulation.run_passes(&executor)).err().unwrap();
+    assert_eq!(failure.error.kind(), ErrorKind::InvalidData);
+    let simulation = failure.simulation.expect("the world survived the failed gather");
+    assert!(simulation.world().resource::<Gravity>().is_none(), "extract ran");
+    assert!(seen.0.lock().unwrap().is_empty(), "gather did not");
+    assert_eq!(simulation.tick(), Tick(1));
+}
+
 #[test]
 fn both_passes_are_prepared_before_either_runs() {
     let seen = Passes::default();
@@ -221,6 +251,10 @@ fn two_crates(seen: &Passes) -> SimulationBuilder {
         })
         .systems(crate_a)
         .systems(crate_b)
+        // The game's input writer is a third crate's set after `sets::INPUT`.
+        .systems(|registration| {
+            registration.order(&SAMPLES, &CRATE_A).order(&SAMPLES, &CRATE_B);
+        })
 }
 
 fn schedule_error(error: &lactose_core::Error) -> ScheduleError {
@@ -257,6 +291,8 @@ fn app_orders_two_crates_sets_after_sets_input() {
     assert!(matches!(refuse(&NOWHERE, &CRATE_A), ScheduleError::UnknownOrderedSet { .. }));
     // Against the stage order: `Post` before `Input`.
     assert!(matches!(refuse(&LATE, &CRATE_A), ScheduleError::Cycle { .. }));
+    // Nothing goes before `sim`'s six systems at the input sync point.
+    assert!(matches!(refuse(&CRATE_A, &sets::INPUT), ScheduleError::Cycle { .. }));
     // Two sets in different schedules.
     let builder = two_crates(&Passes::default()).systems(passes).systems(|registration| {
         registration

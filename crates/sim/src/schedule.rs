@@ -151,8 +151,8 @@ impl Registration {
     /// pass that holds both. How `app` orders the sets of two crates that do not name each
     /// other and both add an exclusive system to one pass, or to `Stage::Input` after
     /// [`sets::INPUT`]. A set no schedule declares, or two sets in different schedules, is
-    /// [`ScheduleError::UnknownOrderedSet`] at build; an edge against the stage order is a
-    /// [`ScheduleError::Cycle`].
+    /// [`ScheduleError::UnknownOrderedSet`] at build; an edge against the stage order, or
+    /// one that puts anything before [`sets::INPUT`], is a [`ScheduleError::Cycle`].
     pub fn order(&mut self, before: &'static SystemSet, after: &'static SystemSet) -> &mut Self {
         self.orders.push((before, after));
         self
@@ -197,6 +197,10 @@ impl Registration {
         }
 
         for &(before, after) in &self.orders {
+            // `sim`'s systems open the input sync point: nothing is ordered before them.
+            if after.name() == sets::INPUT.name() {
+                return Err(ScheduleError::Cycle { members: vec![before.name(), after.name()] });
+            }
             let unknown = |set: &'static SystemSet| ScheduleError::UnknownOrderedSet {
                 set: set.name(),
                 before: before.name(),

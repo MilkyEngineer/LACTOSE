@@ -118,7 +118,7 @@ fn app_build(kind: WorldKind) -> Result<Simulation> {
 
 // ---- 2. An InputApplier over a #[component] with CheckedBitPattern ----
 
-#[component(key = "sketch::input_sample", derived)]
+#[component(key = "sketch::input_sample", transient)]
 pub struct InputSample {
     #[field(id = 1)]
     pub buttons: u32,
