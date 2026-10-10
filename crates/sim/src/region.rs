@@ -1,16 +1,16 @@
 //! Region lifecycle (architecture sections 6, 9.7 and 14): activation by anchor position
-//! within a radius measured in regions, streaming ahead of it, and an unload that writes the
-//! same records as a save.
+//! within a radius measured in regions, streaming ahead of it, release behind it, and an
+//! unload that writes the same records as a save.
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use lactose_asset_api::{AssetFailure, PinnedTable};
-use lactose_core::{Error, Result, Tick};
+use lactose_asset_api::AssetFailure;
+use lactose_core::{Error, PlayerId, Result, Tick};
 use lactose_ecs::{RegionId, RegionRows};
 use lactose_reflect::{component, resource};
 
-/// A region's place on the world grid, in regions. The activation and streaming radii of
-/// [`RegionPolicy`] are distances between cells.
+/// A region's place on the world grid, in regions. The radii of [`RegionPolicy`] are
+/// distances between cells.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct RegionCell {
     /// Column.
@@ -100,31 +100,45 @@ impl Iterator for Within<'_> {
     }
 }
 
-/// The deployment parameters of activation and streaming (architecture sections 9.7 and
-/// 14), a world resource the server's `app` inserts and the overload ladder adjusts: the
-/// ladder's first rung shrinks `activation_radius`, and the ladder itself, with its
-/// hysteresis, is `app`'s. Read by the lifecycle under [`RegionControl::Anchored`] only;
-/// not saved, not hashed.
+/// The deployment parameters of activation, streaming and release (architecture sections
+/// 9.7 and 14), a world resource the server's `app` inserts and the overload ladder
+/// adjusts: the ladder's first rung shrinks `activation_radius`, and the ladder itself,
+/// with its hysteresis, is `app`'s. Read by the lifecycle under
+/// [`RegionControl::Anchored`] only; not saved, not hashed.
+///
+/// `release_radius >= streaming_radius > activation_radius` is required at build. At run
+/// time the lifecycle clamps what it reads, logging the clamp: the activation radius to
+/// `streaming_radius - 1` and the release radius up to `streaming_radius`, so that an
+/// active region is always loaded, an entity in a `Simulated` region can only ever cross
+/// into a loaded one (which freezes it with the region, section 9.7), and nothing that was
+/// just requested is released.
 #[resource(key = "sim::region_policy", derived)]
 #[derive(PartialEq, Eq, Debug)]
 pub struct RegionPolicy {
-    /// A region within this many regions of any [`StreamingAnchor`] is `Simulated` once its
-    /// bundle is loaded and its asset table has entered.
+    /// A region within this many regions of an anchor is `Simulated` once its bundle is
+    /// loaded and its asset table has entered.
     #[field(id = 1)]
     pub activation_radius: u32,
-    /// A region within this many regions of any anchor is loaded (`Frozen` until it also
-    /// activates); outside it, a loaded region is exported and unloaded. Must exceed
-    /// `activation_radius`, so that an entity in a simulated region can only ever cross into
-    /// a loaded one, which freezes it at the boundary as section 9.7 requires.
+    /// A region within this many regions of an anchor is requested and, once loaded, kept
+    /// `Frozen` until it also activates. Streaming leads the anchor by
+    /// `streaming_radius - activation_radius` regions.
     #[field(id = 2)]
     pub streaming_radius: u32,
+    /// A loaded region stays loaded while within this many regions of an anchor; outside
+    /// it, it is exported and unloaded, and a request for it is cancelled. The gap to the
+    /// streaming radius is the hysteresis that keeps an anchor jittering on a border from
+    /// loading and unloading the ring every tick.
+    #[field(id = 3)]
+    pub release_radius: u32,
 }
 
-/// Marks an entity whose position activates regions: a player's own entity (written by
-/// `net` or `app` on join beside [`ClaimedBy`](lactose_ecs::ClaimedBy), removed on leave),
-/// or a spectator. The region an anchor resides in is its position for the policy; a
-/// claimed object the player threw is not an anchor, so a thrown bomb activates nothing.
-/// Session state like `ClaimedBy`: not saved, not hashed, not replicated.
+/// Marks an entity whose position activates regions: a player's own entity, which the
+/// [`SessionApplier`](crate::SessionApplier) spawns with it beside
+/// [`ClaimedBy`](lactose_ecs::ClaimedBy) and despawns on leave, or a spectator the game
+/// spawns. The region an anchor resides in is its position for the policy; a claimed
+/// object the player threw is not an anchor, so a thrown bomb activates nothing. Session
+/// state like `ClaimedBy`: not saved, not hashed, not replicated. A pending `Join` whose
+/// region is not loaded yet counts as an anchor at its region until it is applied.
 #[component(key = "sim::streaming_anchor", derived)]
 #[derive(PartialEq, Eq, Debug)]
 pub struct StreamingAnchor {
@@ -137,28 +151,35 @@ pub struct StreamingAnchor {
 /// Who decides which regions are loaded and in which mode.
 #[derive(Clone, Debug)]
 pub enum RegionControl {
-    /// The server's policy (architecture section 9.7): the lifecycle reads the anchors and
-    /// [`RegionPolicy`] at every input sync point, requests loads within the streaming
-    /// radius, unloads outside it, and sets every loaded region `Simulated` or `Frozen`.
-    /// The frame's `unloaded` and `modes` are ignored; a bundle's `mode` is ignored. Only a
-    /// `Server` world may use it, and the atlas must not be empty.
+    /// The server's policy (architecture section 9.7): at every input sync point, last
+    /// among `sim`'s systems, the lifecycle reads the anchors and [`RegionPolicy`],
+    /// requests loads within the streaming radius, cancels requests and unloads outside the
+    /// release radius, and sets every loaded region `Simulated` or `Frozen`. A bundle for a
+    /// region that is neither requested nor within the release radius of an anchor is
+    /// refused. The frame's `unloaded` and `modes` are ignored, and so is a bundle's
+    /// `mode`. Only a `Server` world may use it, and the atlas must not be empty.
     Anchored(RegionAtlas),
-    /// The frame decides: bundles load in the mode they carry, `unloaded` exports and
-    /// unloads, `modes` applies. What a client or prediction world uses, since the server
-    /// tells a client what is relevant, and what a test or the headless app uses to hold a
-    /// region `Simulated` without anchors. The default.
+    /// The frame decides: bundles load in the mode they carry, `unloaded` unloads, `modes`
+    /// applies, nothing is requested. What a client or prediction world uses, since the
+    /// server tells a client what is relevant, and what a test or the headless app uses to
+    /// hold a region `Simulated` without anchors. The default.
     Directed,
 }
 
 /// What the lifecycle asks of the side outside the boundary, taken with
-/// [`RegionLifecycle::take_requests`].
+/// [`RegionLifecycle::take_requests`]. Under [`RegionControl::Anchored`] only.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub enum RegionRequest {
-    /// Load this region: fetch its baseline and overlay and resolve its asset set, and answer
-    /// through [`TickInput::loaded`](crate::TickInput::loaded) and
-    /// [`TickInput::assets`](crate::TickInput::assets). Issued once; a region stays requested
-    /// until its bundle arrives.
+    /// Load this region: fetch its baseline and overlay, resolve its asset set, and answer
+    /// through [`TickInput::loaded`](crate::TickInput::loaded). Issued once; a region stays
+    /// requested until its bundle loads or the request is cancelled.
     Load {
+        /// The region.
+        region: RegionId,
+    },
+    /// The region left the release radius before its bundle arrived: the request is
+    /// withdrawn, and a bundle that still arrives is refused.
+    Cancel {
         /// The region.
         region: RegionId,
     },
@@ -171,9 +192,10 @@ pub enum RegionRequest {
 
 /// A region's state as an unload or a save copied it out: the rows and resources of
 /// [`World::export_region`](lactose_ecs::World::export_region). `lactose-persist` diffs the
-/// rows against the baseline into the overlay of architecture section 15.2; the same value
-/// is what the server sends a client on relevance. An unload and a save produce it through
-/// the one path, so the records are the same.
+/// rows against the baseline into the overlay of architecture section 15.2, and that
+/// overlay is what the server sends a client on relevance: the server's `app` runs
+/// `persist`'s diff on the export and `net` sends the result. An unload and a save produce
+/// the export through the one path, so the records are the same.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct RegionExport {
     /// The region.
@@ -182,17 +204,20 @@ pub struct RegionExport {
     pub rows: RegionRows,
 }
 
-/// A bundle the sync point could not load, with the error, so `lactose-persist` can migrate
-/// or `app` can retry. The region stays requested.
+/// A bundle the sync point refused, with the error, so `lactose-persist` can migrate or
+/// `app` can retry. Nothing was loaded; under `Anchored` a requested region stays
+/// requested.
 #[derive(Debug)]
 pub struct LoadFailure {
     /// The tick whose sync point refused the bundle.
     pub tick: Tick,
     /// The region.
     pub region: RegionId,
-    /// Why: `VersionMismatch` for an overlay against another baseline or a component schema
-    /// the registry disagrees with, `InvalidData` for a bundle that does not fit, `NotFound`
-    /// for a region the atlas lacks under `Anchored`.
+    /// Why: `VersionMismatch` for an overlay against another baseline or a component or
+    /// resource schema the registry disagrees with; `InvalidData` for a bundle that does
+    /// not fit, a region that is loaded already, or, under `Anchored`, a region that is
+    /// neither requested nor within the release radius ("not wanted"); `NotFound` for a
+    /// region the atlas lacks under `Anchored`.
     pub error: Error,
 }
 
@@ -207,15 +232,19 @@ pub struct AssetFailureEvent {
 }
 
 /// The region lifecycle's state beside the world: the control mode, what has been
-/// requested, tables waiting for their bundle, and the outputs of the last sync points.
-/// Held as a service resource of the world, reached through
-/// [`Simulation::lifecycle`](crate::Simulation::lifecycle). Not snapshotted: a rollback
-/// does not undo a load or a request.
+/// requested, joins waiting for their region, and the outputs of the last sync points.
+/// Reached through [`Simulation::lifecycle`](crate::Simulation::lifecycle); no system can
+/// name it.
+///
+/// Everything here but the failures is server-only session state, which the server never
+/// rolls back: it is not in a snapshot, and architecture section 10's list of what a
+/// restore keeps is unchanged. A prediction world's lifecycle holds failures alone.
 #[derive(Debug)]
 pub struct RegionLifecycle {
     control: RegionControl,
     requested: BTreeSet<RegionId>,
-    pending_assets: BTreeMap<RegionId, PinnedTable>,
+    /// Joins whose region is not loaded yet, by player.
+    held_joins: BTreeMap<PlayerId, RegionId>,
     requests: Vec<RegionRequest>,
     exports: Vec<RegionExport>,
     load_failures: Vec<LoadFailure>,
@@ -227,7 +256,7 @@ impl RegionLifecycle {
         Self {
             control,
             requested: BTreeSet::new(),
-            pending_assets: BTreeMap::new(),
+            held_joins: BTreeMap::new(),
             requests: Vec::new(),
             exports: Vec::new(),
             load_failures: Vec::new(),
@@ -241,15 +270,15 @@ impl RegionLifecycle {
         &self.control
     }
 
-    /// Whether a load of `region` has been requested and not yet answered.
+    /// Whether a load of `region` has been requested and neither answered nor cancelled.
     #[must_use]
     pub fn is_requested(&self, region: RegionId) -> bool {
         todo!()
     }
 
-    /// Whether a table for `region` waits for the region's bundle.
+    /// The region a `Join` for `player` waits for, if one is held.
     #[must_use]
-    pub fn has_pending_assets(&self, region: RegionId) -> bool {
+    pub fn held_join(&self, player: PlayerId) -> Option<RegionId> {
         todo!()
     }
 
@@ -259,7 +288,8 @@ impl RegionLifecycle {
     }
 
     /// The regions exported and unloaded since the last take, in the order they were
-    /// unloaded: what `lactose-persist` writes as the regions' records.
+    /// unloaded: what `lactose-persist` writes as the regions' records. Always empty on a
+    /// world that is not `Server`, whose unloads do not export.
     pub fn take_exports(&mut self) -> Vec<RegionExport> {
         todo!()
     }
@@ -269,7 +299,8 @@ impl RegionLifecycle {
         todo!()
     }
 
-    /// The asset failures stamped since the last take, in tick order.
+    /// The asset failures stamped since the last take, in tick order and, within a tick,
+    /// in the order the frame carried them.
     pub fn take_asset_failures(&mut self) -> Vec<AssetFailureEvent> {
         todo!()
     }

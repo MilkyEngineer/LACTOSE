@@ -10,13 +10,19 @@ use lactose_ecs::{Job, RegionId, RegionMode, World};
 use lactose_reflect::{Reflect, Registry};
 
 /// Hashes one value of one registered type: the row's origin key (`None` for a region
-/// resource) and the value's bytes as laid out in memory, to the row hash of the README's
-/// encoding. Monomorphised per type by [`TypeTable::register`], which is how the typed
+/// resource), the value's bytes as laid out in memory, and a scratch buffer for the
+/// field streams so a row allocates nothing, to the row hash of the README's encoding.
+/// Monomorphised per type by [`TypeTable::register`], which is how the typed
 /// `Reflect::visit` entry point survives the erased registry.
-type ValueHasher = fn(Option<StableKey>, &[u8]) -> u64;
+type ValueHasher = fn(Option<StableKey>, &[u8], &mut Vec<u8>) -> u64;
 
 /// Appends one value's (field, field hash) pairs in field order, for [`RegionDigest`].
-type ValueDigester = fn(&[u8], &mut Vec<(FieldId, u64)>);
+type ValueDigester = fn(&[u8], &mut Vec<u8>, &mut Vec<(FieldId, u64)>);
+
+/// Whether a registered resource type is present in a world: the probe
+/// [`SimulationBuilder::build`](crate::SimulationBuilder::build) runs for every resource
+/// type whose policy is not `derived`, to refuse it.
+pub(crate) type ResourcePresent = fn(&World) -> bool;
 
 /// The per-type hashers of every hashed type, keyed by component key. Built by a
 /// [`TypeTable`], owned by the [`Simulation`](crate::Simulation), shared by every chunk
@@ -37,8 +43,9 @@ impl Hashers {
     /// The world hash of `region` (architecture section 8.3): every persistent and transient
     /// column and region resource, each row as (origin key, component key, field ID,
     /// canonical value), folded through an order-independent combiner, so the result is the
-    /// same under every chunk layout and worker count. Derived columns and resources are
-    /// excluded. The README states the encoding bit for bit.
+    /// same under every chunk layout and worker count; with the region's seed, mode and
+    /// asset table. Derived columns and resources are excluded. The README states the
+    /// encoding bit for bit.
     ///
     /// Fails with `NotFound` if the region is not loaded, and with `Unsupported` if a hashed
     /// column of the world is of a type this table does not cover, which cannot happen for
@@ -50,8 +57,8 @@ impl Hashers {
     /// [`world_hash`](Self::world_hash) as chunk jobs: forks over
     /// [`World::columns_erased`](lactose_ecs::World::columns_erased) inside `job`'s scope,
     /// one child per chunk, and folds the children's sums. Bit-identical to the sequential
-    /// form by construction. For an exclusive pass system that hashes at a sync point.
-    pub fn world_hash_forked(
+    /// form by construction. For this crate's own pass systems.
+    pub(crate) fn world_hash_forked(
         &self,
         job: &mut Job<'_, '_>,
         world: &World,
@@ -60,8 +67,8 @@ impl Hashers {
         todo!()
     }
 
-    /// The field-level digest of `region`: the hash of every hashed field of every row and
-    /// resource, keyed by (origin key, component key, field ID), with the seed, mode and
+    /// The field-level digest of `region`: every hashed row and resource with the hash of
+    /// each of its fields, keyed by (origin key, component key), with the seed, mode and
     /// asset table beside them. [`RegionDigest::hash`] is exactly
     /// [`world_hash`](Self::world_hash) of the same state, so a digest taken on a mismatch
     /// explains the hash it stands for. Fails as `world_hash` does.
@@ -79,22 +86,29 @@ impl Hashers {
 ///
 /// ```
 /// use lactose_core::Result;
-/// use lactose_reflect::component;
+/// use lactose_reflect::{component, resource};
 /// use lactose_sim::TypeTable;
 ///
 /// #[component(key = "game::health", persistent, replicated)]
 /// pub struct Health(#[field(id = 1)] pub i32);
 ///
+/// /// Configuration: a world resource, so `derived` (the README says why).
+/// #[resource(key = "game::gravity", derived)]
+/// pub struct Gravity(#[field(id = 1)] pub lactose_math::Scalar);
+///
 /// /// Every type of this crate. `app` calls it, and the function it generates for the whole
 /// /// game calls each crate's.
 /// pub fn register_types(types: &mut TypeTable) -> Result<()> {
 ///     types.register::<Health>()?;
+///     types.register::<Gravity>()?;
 ///     Ok(())
 /// }
 /// ```
 pub struct TypeTable {
     registry: Registry,
     hashers: Hashers,
+    /// One probe per registered resource type whose policy is not `derived`.
+    probes: Vec<(ComponentKey, ResourcePresent)>,
 }
 
 impl TypeTable {
@@ -133,8 +147,8 @@ impl TypeTable {
         &self.hashers
     }
 
-    pub(crate) fn into_parts(self) -> (Registry, Hashers) {
-        (self.registry, self.hashers)
+    pub(crate) fn into_parts(self) -> (Registry, Hashers, Vec<(ComponentKey, ResourcePresent)>) {
+        (self.registry, self.hashers, self.probes)
     }
 }
 
@@ -144,19 +158,24 @@ impl Default for TypeTable {
     }
 }
 
+/// What a digest keys a row by: the origin key, or `None` for a region resource, and the
+/// component or resource.
+type RowKey = (Option<StableKey>, ComponentKey);
+
 /// The field-level view of one region's hashed state, from [`Hashers::digest`]: what a
 /// SOUR mismatch is explained with (architecture section 8.3). Two digests of one region
 /// taken on two machines are compared with [`diff`](Self::diff) after one travels as
 /// [`encode`](Self::encode) bytes. Keyed by origin key, so it is the same under every
-/// layout and the diff names entities, components and fields, never rows.
+/// layout and the diff names entities, components and fields, never rows of storage.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct RegionDigest {
     region: RegionId,
     seed: u64,
     mode: RegionMode,
     assets: Option<VersionTable>,
-    /// `None` keys are region resources.
-    fields: BTreeMap<FieldKey, u64>,
+    /// Every hashed row and resource, with its field hashes in field order; an empty list
+    /// is a row whose type has no field with an ID, present all the same.
+    rows: BTreeMap<RowKey, Vec<(FieldId, u64)>>,
 }
 
 impl RegionDigest {
@@ -184,11 +203,11 @@ impl RegionDigest {
         self.assets.as_ref()
     }
 
-    /// The hash of every hashed field, by (origin key, component key, field ID); a `None`
-    /// key is a region resource. Ascending.
+    /// Every hashed row and resource, ascending by (origin key, component key), each with
+    /// its field hashes in field order; a `None` key is a region resource.
     #[must_use]
-    pub fn fields(&self) -> DigestFields<'_> {
-        DigestFields { fields: self.fields.iter() }
+    pub fn rows(&self) -> DigestRows<'_> {
+        DigestRows { rows: self.rows.iter() }
     }
 
     /// The world hash this digest stands for: equal to [`Hashers::world_hash`] of the state
@@ -198,9 +217,9 @@ impl RegionDigest {
         todo!()
     }
 
-    /// Every field whose hash differs between the two digests, or exists on one side only,
-    /// ascending by key. The seed, mode and asset table are compared by the caller through
-    /// their accessors.
+    /// Every difference between the two digests, ascending by key: a row present on one
+    /// side only (`field: None`), or a field whose hash differs or exists on one side only.
+    /// The seed, mode and asset table are compared by the caller through their accessors.
     #[must_use]
     pub fn diff<'a>(&'a self, other: &'a Self) -> Differences<'a> {
         todo!()
@@ -220,44 +239,44 @@ impl RegionDigest {
     }
 }
 
-/// One field that differs between two digests.
+/// Iterates a digest's rows, ascending by key.
+pub struct DigestRows<'a> {
+    rows: btree_map::Iter<'a, RowKey, Vec<(FieldId, u64)>>,
+}
+
+impl<'a> Iterator for DigestRows<'a> {
+    type Item = (Option<StableKey>, ComponentKey, &'a [(FieldId, u64)]);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.rows.next().map(|(&(key, component), fields)| (key, component, fields.as_slice()))
+    }
+}
+
+/// One difference between two digests.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct FieldDifference {
     /// The row's origin key, or `None` for a region resource.
     pub key: Option<StableKey>,
     /// The component or resource.
     pub component: ComponentKey,
-    /// The field.
-    pub field: FieldId,
-    /// The hash on the left side, or `None` if the row or field is absent there.
+    /// The field, or `None` when the whole row is present on one side only.
+    pub field: Option<FieldId>,
+    /// The hash on the left side, or `None` if the row or field is absent there. For a
+    /// whole-row difference, `Some(0)` stands for presence.
     pub left: Option<u64>,
     /// The hash on the right side, or `None` if absent there.
     pub right: Option<u64>,
 }
 
-/// What a digest keys a field hash by.
-type FieldKey = (Option<StableKey>, ComponentKey, FieldId);
-
-/// Iterates a digest's field hashes, ascending by key.
-pub struct DigestFields<'a> {
-    fields: btree_map::Iter<'a, FieldKey, u64>,
-}
-
-impl Iterator for DigestFields<'_> {
-    type Item = (Option<StableKey>, ComponentKey, FieldId, u64);
-
-    fn next(&mut self) -> Option<Self::Item> {
-        self.fields.next().map(|(&(key, component, field), &hash)| (key, component, field, hash))
-    }
-}
-
-/// A cursor over one digest's fields.
-type FieldCursor<'a> = core::iter::Peekable<btree_map::Iter<'a, FieldKey, u64>>;
+/// A cursor over one digest's rows.
+type RowCursor<'a> = core::iter::Peekable<btree_map::Iter<'a, RowKey, Vec<(FieldId, u64)>>>;
 
 /// Iterates the differences between two digests, ascending by key.
 pub struct Differences<'a> {
-    left: FieldCursor<'a>,
-    right: FieldCursor<'a>,
+    left: RowCursor<'a>,
+    right: RowCursor<'a>,
+    /// The differences of the row being compared, not yet yielded.
+    pending: std::vec::IntoIter<FieldDifference>,
 }
 
 impl Iterator for Differences<'_> {

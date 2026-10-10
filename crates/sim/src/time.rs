@@ -1,5 +1,5 @@
 //! Time as the simulation sees it (architecture section 11): a fixed delta, the tick being
-//! simulated, and a time scale that changes how many ticks run per real second.
+//! simulated, and the time scale the server decides, mirrored into the world as an input.
 
 use lactose_core::Tick;
 use lactose_math::Scalar;
@@ -33,26 +33,39 @@ impl TickDelta {
 }
 
 /// The tick being simulated, for systems that cannot take [`Ctx`](lactose_ecs::Ctx): a
-/// once-per-tick system, an exclusive system or a finalize. Written by
-/// [`systems::begin_tick`](crate::systems) at the input sync point from
-/// [`World::tick`](lactose_ecs::World::tick), which stays the source of truth; between
-/// ticks the two agree. Not saved and not hashed.
+/// once-per-tick system, an exclusive system or a finalize. Written by the input sync point
+/// from [`World::tick`](lactose_ecs::World::tick), which stays the source of truth, and
+/// readable only through [`get`](Self::get), so nothing can desynchronise the two; between
+/// ticks they agree. Not saved and not hashed.
 #[resource(key = "sim::current_tick", derived)]
 #[derive(PartialEq, Eq, Debug)]
-pub struct CurrentTick(#[field(id = 1)] pub Tick);
+pub struct CurrentTick(#[field(id = 1)] Tick);
+
+impl CurrentTick {
+    pub(crate) const fn new(tick: Tick) -> Self {
+        Self(tick)
+    }
+
+    /// The tick.
+    #[must_use]
+    pub const fn get(self) -> Tick {
+        self.0
+    }
+}
 
 /// How many ticks run per real second, in thousandths of real time (architecture section
 /// 11): `1000` is real time, `0` is paused, `2000` runs sixty ticks in half a second. The
 /// tick delta never changes with it.
 ///
-/// A simulation resource the server controls and replicates: game code on the server
-/// writes it (`ResMut<TimeScale>` in a once-per-tick or exclusive system, or
-/// [`World::resource_mut`](lactose_ecs::World::resource_mut) between ticks), `net` carries
-/// it to clients, and the timer root in `app` reads it between ticks and hands
-/// `thousandths / 1000` to `TickPacer::set_time_scale`. Presentation runs on real time
-/// regardless. An integer, so the wire, the hash and the pacer agree exactly; the
-/// conversion to the pacer's float happens outside the boundary. Not saved; part of a
-/// prediction-world snapshot like every reflected resource.
+/// The scale is `app`'s decision on the server, and it reaches the world as an input:
+/// [`TickInput::time_scale`](crate::TickInput::time_scale), which the sync point writes
+/// here, so the value is journaled and `lactose-predict`'s ring carries it. The world's
+/// copy is a mirror: `app`'s timer root keeps its own value for `TickPacer::set_time_scale`
+/// (on the server its decision, on a client the latest value `net` received), never reads
+/// it back from the world, and no game system reads it either, since a paused world runs
+/// no system that could unpause it and the scale is not simulation state. `replicated` so
+/// that `net` carries it to clients; derived; in a prediction-world snapshot like every
+/// reflected resource. Presentation runs on real time regardless.
 #[resource(key = "sim::time_scale", derived, replicated)]
 #[derive(PartialEq, Eq, Debug)]
 pub struct TimeScale {

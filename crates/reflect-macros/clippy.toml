@@ -94,6 +94,18 @@ disallowed-methods = [
   # for the float methods.
   { path = "lactose_task::JobContext::slot", reason = "the worker index is not a semantic key; key by StableKey", allow-invalid = true },
   { path = "lactose_task::ChildContext::slot", reason = "the worker index is not a semantic key; key by StableKey", allow-invalid = true },
+  # Architecture section 8.2: `lactose_ecs` re-exports the executor so that a boundary crate
+  # can drive a schedule, and the re-export reaches every boundary crate. What one may do
+  # with it is run a schedule. The worker count, spawning or running arbitrary work, thread
+  # creation, a deadline and the scheduling history are banned; `lactose-ecs` opts out at its
+  # one `run_graph` call site, item by item, like `lactose-math` does for the float methods.
+  { path = "lactose_task::Executor::frame_worker_count", reason = "the worker count is not a semantic key; key by StableKey", allow-invalid = true },
+  { path = "lactose_task::Executor::slot_count", reason = "the worker count is not a semantic key; key by StableKey", allow-invalid = true },
+  { path = "lactose_task::Executor::spawn", reason = "a boundary crate runs schedules, not arbitrary tasks", allow-invalid = true },
+  { path = "lactose_task::Executor::run_graph", reason = "a boundary crate runs schedules through lactose_ecs::Schedule, not graphs", allow-invalid = true },
+  { path = "lactose_task::Executor::platform", reason = "a boundary crate creates no thread", allow-invalid = true },
+  { path = "lactose_task::Executor::sleep_until", reason = "no wall-clock time inside the boundary", allow-invalid = true },
+  { path = "lactose_task::Executor::execution_log", reason = "scheduling history is not simulation input", allow-invalid = true },
 ]
 
 disallowed-types = [

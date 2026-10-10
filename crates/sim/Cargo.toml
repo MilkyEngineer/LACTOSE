@@ -21,5 +21,11 @@ lactose-math.workspace = true
 # hasher implements.
 lactose-reflect.workspace = true
 
+[dev-dependencies]
+# The compile-only consumer sketches in `tests/` build an executor the way `app` and a SOUR
+# test do (`ChaosConfig`, `TickPacer`); a dev-dependency, so the boundary allowlist is
+# untouched and the library names nothing of `task`.
+lactose-task.workspace = true
+
 [lints]
 workspace = true

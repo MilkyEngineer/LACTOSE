@@ -75,6 +75,11 @@ impl GraphNode for RunNode {
 
 /// Runs `state` as one job on `executor` and hands it back, or fails with `Cancelled` if
 /// the executor shut down first; the state, and the world in it, then drops with the node.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "execution only (architecture section 8.2): the one place a schedule becomes a \
+              graph run; every result is order-independent by construction"
+)]
 pub(crate) async fn run(executor: &Executor, state: RunState) -> Result<RunState> {
     let name = if state.tick { "casein::tick" } else { "casein::pass" };
     let node = Arc::new(RunNode { name, state: Mutex::new(Some(state)) });

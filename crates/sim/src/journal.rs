@@ -4,67 +4,79 @@
 //! the reader and the replay driver to the milestone 1 tooling.
 //!
 //! A frame records what [`TickInput`] carried, in a form that travels: a table as its
-//! `VersionTable` (a replay pins it again from a store), a bundle by its identity (the
-//! replay fetches the baseline by its content hash and the overlay from the checkpoint's
-//! records), samples and failures verbatim.
+//! `VersionTable` (a replay pins it again from a store), a bundle by the baseline's content
+//! hash with the overlay, resources and transient keys it carried (the replay fetches the
+//! baseline by its hash), samples, sessions and failures verbatim. The journal also records
+//! the tables and modes in force at the checkpoint, which the checkpoint's rows do not
+//! carry, so every region the replay runs can be rebuilt.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 use lactose_asset_api::{AssetFailure, VersionTable};
-use lactose_core::Tick;
+use lactose_bundle::{ComponentData, Overlay};
+use lactose_core::{ComponentKey, PlayerId, Tick};
 use lactose_ecs::{RegionId, RegionMode};
 
-use crate::input::{PlayerInput, RegionModeChange, TickInput};
+use crate::input::{PlayerSample, SessionEvent, TickInput};
 use crate::simulation::SavePoint;
+use crate::time::TimeScale;
 
-/// A checkpoint and every frame after it.
+/// A checkpoint, what was in force at it, and every frame after it.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Journal {
     /// The state the journal starts from, at its tick.
     pub checkpoint: SavePoint,
+    /// The asset table of every region loaded at the checkpoint that had one.
+    pub tables: BTreeMap<RegionId, VersionTable>,
+    /// The mode of every region loaded at the checkpoint.
+    pub modes: BTreeMap<RegionId, RegionMode>,
     /// One frame per tick after the checkpoint, ascending.
     pub frames: Vec<JournalFrame>,
 }
 
-/// What one tick's [`TickInput`] carried, as recorded.
+/// What one tick's [`TickInput`] carried, as recorded; the fields mirror it.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct JournalFrame {
     /// The tick the input was applied for.
     pub tick: Tick,
-    /// The players' inputs, verbatim.
-    pub inputs: Vec<PlayerInput>,
-    /// The tables that entered, by region.
-    pub assets: Vec<JournalAssets>,
-    /// The bundles that loaded, by identity.
-    pub loaded: Vec<JournalLoad>,
-    /// The regions unloaded through the frame.
-    pub unloaded: Vec<RegionId>,
-    /// The mode changes through the frame.
-    pub modes: Vec<RegionModeChange>,
+    /// The time scale from this tick on, if the frame set it.
+    pub time_scale: Option<TimeScale>,
     /// The asset failures, verbatim.
     pub failures: Vec<AssetFailure>,
+    /// The bundles that loaded, by region.
+    pub loaded: BTreeMap<RegionId, JournalLoad>,
+    /// The tables that entered, by region: the publish events of architecture section 9.3
+    /// as journaled.
+    pub assets: BTreeMap<RegionId, VersionTable>,
+    /// The regions unloaded through the frame.
+    pub unloaded: BTreeSet<RegionId>,
+    /// The mode changes through the frame.
+    pub modes: BTreeMap<RegionId, RegionMode>,
+    /// The sessions, verbatim.
+    pub sessions: BTreeMap<PlayerId, SessionEvent>,
+    /// The players' inputs, verbatim.
+    pub inputs: BTreeMap<PlayerId, PlayerSample>,
 }
 
-/// A table that entered: the publish event of architecture section 9.3 as journaled.
+/// A bundle that loaded: everything it carried but the baseline, which the replay fetches
+/// by its content hash.
 #[derive(Clone, PartialEq, Eq, Debug)]
-pub struct JournalAssets {
-    /// The region.
-    pub region: RegionId,
-    /// Every asset with its version.
-    pub table: VersionTable,
-}
-
-/// A bundle that loaded, by identity rather than content.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct JournalLoad {
-    /// The region.
-    pub region: RegionId,
     /// The seed the region was created with.
     pub seed: u64,
     /// The mode the bundle carried.
     pub mode: RegionMode,
     /// The baseline's content hash (`Baseline::content_hash`).
     pub baseline_hash: u64,
-    /// The overlay's digest (`Overlay::digest`), or `None` for a cooked-state load.
-    pub overlay_digest: Option<u64>,
+    /// The overlay, or `None` for a cooked-state load.
+    pub overlay: Option<Arc<Overlay>>,
+    /// The persistent region resources the bundle carried.
+    pub resources: Vec<ComponentData>,
+    /// The transient region resources, by key.
+    pub transient_resources: Vec<ComponentKey>,
+    /// The table the bundle carried, as a `VersionTable`.
+    pub assets: Option<VersionTable>,
 }
 
 impl JournalFrame {

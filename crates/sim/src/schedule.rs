@@ -2,27 +2,28 @@
 //! function adds to them without owning the stage list (architecture sections 5.2, 5.3,
 //! 6.1, 9.3 and 15.3).
 
-use lactose_ecs::{
-    Schedule, ScheduleBuilder, ScheduleError, SystemDescriptor, SystemSet, WorldKind,
-};
+use lactose_ecs::{Schedule, ScheduleError, SystemDescriptor, SystemSet, WorldKind};
 
 /// The four stages of the tick schedule, in execution order. Every world kind has all four;
 /// a stage with no systems of the world's kind runs its sync point and nothing else, so the
 /// sync-point count is the same in every world (architecture section 5.2).
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub enum Stage {
-    /// The input sync point. Opens with `sim`'s exclusive systems in [`sets::INPUT`]
-    /// ([`systems`](crate::systems)), which apply the frame; a crate that must act at the
-    /// sync point after them adds its exclusive system here, ordered after them. Nothing
-    /// else belongs in it.
+    /// The input sync point. Opens with `sim`'s exclusive systems in [`sets::INPUT`], which
+    /// apply the frame; a crate that must act at the sync point after them adds its
+    /// exclusive system here in a set declared `.after(&[&sets::INPUT])`. Nothing else
+    /// belongs in it.
     Input,
     /// Gameplay: the sets of `game-sim`, `game-ai` and `anim`. Physics writes recorded here
-    /// through the physics command channel apply in the next stage.
+    /// through the physics command channel are what the step reads in the next stage.
     Simulation,
-    /// The physics step (architecture section 16): `physics-api`'s exclusive system that
-    /// takes the channel at the stage's sync point, steps, and writes bodies back, declaring
-    /// what it writes. Systems that do not depend on physics may be placed here to overlap
-    /// the step; everything that reads its results goes in `Post`.
+    /// The physics step (architecture section 16): `physics-api`'s once-per-tick system
+    /// that takes [`Job`](lactose_ecs::Job), reads the channel the simulation stage wrote,
+    /// steps the solver through `block_in_place`, and writes bodies back through
+    /// [`Commands`](lactose_ecs::Commands), which apply at the sync point that begins
+    /// `Post`. It is not exclusive, so systems that do not depend on physics may be placed
+    /// here and run alongside it on the reserved workers; everything that reads the stepped
+    /// state goes in `Post`.
     Physics,
     /// After physics: whatever reads the stepped state in the same tick, such as the sim
     /// skeleton, contact-driven damage and presentation events.
@@ -45,11 +46,11 @@ impl Stage {
     }
 }
 
-/// The passes [`Simulation::step`](crate::Simulation::step) runs between ticks, after the
-/// tick's closing sync point and before the next tick, in this order. Each is a
-/// [`Schedule`] run with [`Schedule::run_pass`]: the tick does not advance and nothing is
-/// cleared, and its systems are exclusive ones that take [`Job`](lactose_ecs::Job) and fork
-/// over the world's columns. A pass with no stages is skipped.
+/// The passes [`Simulation::run_passes`](crate::Simulation::run_passes) runs between ticks,
+/// in this order. Each is a [`Schedule`] of one stage, named by [`name`](Self::name), run
+/// with [`Schedule::run_pass`]: the tick does not advance and nothing is cleared, and its
+/// systems are exclusive ones that take [`Job`](lactose_ecs::Job) and fork over the world's
+/// columns. A pass to which no system of the world's kind was added is skipped.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub enum Pass {
     /// Extract (architecture section 5.3): `presentation` copies dirty rows into the staging
@@ -65,7 +66,7 @@ impl Pass {
     /// Every pass, in the order they run.
     pub const ALL: [Self; 2] = [Self::Extract, Self::Gather];
 
-    /// The pass's name, for tracing.
+    /// The pass's name, which is also its one stage's name, for tracing.
     #[must_use]
     pub const fn name(self) -> &'static str {
         match self {
@@ -80,19 +81,21 @@ pub mod sets {
     use lactose_ecs::SystemSet;
 
     /// The set of `sim`'s own input sync point systems, placed first in
-    /// [`Stage::Input`](super::Stage::Input). A set that must run at the sync point after
-    /// the frame has been applied declares `.after(&[&INPUT])`.
+    /// [`Stage::Input`](super::Stage::Input): the one thing a consumer names to order
+    /// itself at the sync point. A set that must run after the frame has been applied, the
+    /// sessions and inputs written and the region policy decided declares
+    /// `.after(&[&INPUT])`; nothing can be ordered before it.
     pub static INPUT: SystemSet = SystemSet::new("sim::input");
 }
 
 /// What a registration function adds to: the systems and sets of each [`Stage`] of the tick
-/// schedule, and the stages of each [`Pass`]. One function serves every world kind, since
-/// the builder skips a system whose `worlds` exclude [`kind`](Self::kind); a function that
-/// must differ by kind reads it.
+/// schedule, and the one stage of each [`Pass`]. One function serves every world kind,
+/// since [`StageBuilder::add`] skips a system whose `worlds` exclude [`kind`](Self::kind);
+/// a function that must differ by kind reads it.
 ///
 /// ```
 /// use lactose_ecs::SystemSet;
-/// use lactose_sim::{Registration, Stage};
+/// use lactose_sim::{Pass, Registration, Stage};
 ///
 /// pub static MOVEMENT: SystemSet = SystemSet::new("game_sim::movement");
 /// pub static COMBAT: SystemSet = SystemSet::new("game_sim::combat").after(&[&MOVEMENT]);
@@ -101,21 +104,18 @@ pub mod sets {
 /// pub fn register_systems(registration: &mut Registration) {
 ///     registration.stage(Stage::Simulation).sets(&[&MOVEMENT, &COMBAT]);
 ///     // .add(&APPLY_GRAVITY).add(&SWORD_HIT) ...
+///     // registration.pass(Pass::Gather).add(&GATHER);   // what `net` writes
 /// }
 /// ```
 pub struct Registration {
     kind: WorldKind,
     stages: [StageBuilder; 4],
-    passes: [ScheduleBuilder; 2],
+    passes: [StageBuilder; 2],
 }
 
 impl Registration {
     pub(crate) fn new(kind: WorldKind) -> Self {
-        Self {
-            kind,
-            stages: Default::default(),
-            passes: [ScheduleBuilder::new(kind), ScheduleBuilder::new(kind)],
-        }
+        Self { kind, stages: Default::default(), passes: Default::default() }
     }
 
     /// The kind of world being registered for.
@@ -129,14 +129,16 @@ impl Registration {
         &mut self.stages[stage as usize]
     }
 
-    /// The builder of one pass: an ordinary [`ScheduleBuilder`] for this kind, whose stages
-    /// the caller declares. The replication gather declares its stages and systems here.
-    pub fn pass(&mut self, pass: Pass) -> &mut ScheduleBuilder {
+    /// The builder of one pass's single stage. Every crate adds to the same stage, so what
+    /// one crate registers never lands in another's stage and registration order decides
+    /// nothing: the stage's execution order is the topological order of its sets and edges
+    /// with ties by system key, as in every stage.
+    pub fn pass(&mut self, pass: Pass) -> &mut StageBuilder {
         &mut self.passes[pass as usize]
     }
 
-    /// Builds the tick schedule, with `sim`'s own sets and systems placed first in the
-    /// `Input` stage, and each pass schedule; a pass with no stages builds to `None`.
+    /// Builds the tick schedule, with `sim`'s own set and systems placed first in the
+    /// `Input` stage, and each pass schedule; a pass with no system builds to `None`.
     pub(crate) fn build(
         self,
     ) -> core::result::Result<(Schedule, [Option<Schedule>; 2]), ScheduleError> {
@@ -159,7 +161,7 @@ impl StageBuilder {
     }
 
     /// Adds `system` to this stage, or skips it if its worlds exclude the registration's
-    /// kind, as [`ScheduleBuilder::add`] does.
+    /// kind, as [`ScheduleBuilder::add`](lactose_ecs::ScheduleBuilder::add) does.
     pub fn add(&mut self, system: &'static SystemDescriptor) -> &mut Self {
         todo!()
     }
