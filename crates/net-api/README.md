@@ -148,7 +148,11 @@ which `build`'s `derived` check does not see.
   local player (binds) and spawns of a live key, whose `slot` says whether the local
   player now has the entity claimed (`None`: start predicting it) or released it (`Some`:
   stop), `moves`, `removed`, the rows (`exact: false` into the proxies' per-tick history,
-  `exact: true` into the reconciliation record), `acked_input` and `substituted`.
+  `exact: true` into the reconciliation record), `acked_input` and `substituted`. The
+  prediction world's hook also applies spawns of unclaimed entities, moves, removals and
+  tombstones as the replicated world's does, without `RemoteSlot`, so the prediction world
+  holds every relevant entity as a proxy; a claimed entity's spawn, rows, move, removal and
+  tombstone are reconciliation facts it never writes directly (D122).
   `TimeScale` is a replicated world resource, and resources are not gathered: the
   server's `app` puts its own value in the frame.
 - What the replicated world's hook does, in this order and nothing else, for each frame

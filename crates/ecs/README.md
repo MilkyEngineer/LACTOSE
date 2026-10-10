@@ -274,7 +274,9 @@ What a system is, from its parameters (`SystemParam` has the table):
   position) on tracked columns only, so `Changed` on an untracked column is rejected and
   `changed_since` on one panics. A restore puts stamps back verbatim and a correction
   written through `ColumnMut::write` without recording leaves them alone, so a
-  re-simulated tick sees the client's own change history, which is not the server's. In a
+  re-simulated tick sees the client's own change history, which is not the server's.
+  `lactose-predict` writes its corrections stamped (D122), so a re-simulated tick's `Changed`
+  readers see a correction once; the unrecorded write stays for a consumer that wants it. In a
   `run_pass`, which has no previous tick to measure from, `Changed<T>` passes what changed
   since the same schedule's previous pass of the epoch; in `World::query`, what changed
   after the current point of the previous tick (everything at tick zero).
@@ -415,6 +417,46 @@ What a system is, from its parameters (`SystemParam` has the table):
 - The overload ladder's decimation of non-player systems in the outer activation ring
   (architecture section 9.7) and `ordered` or per-region reductions (section 5.2) are
   additive attribute flags, added when milestone 1 or 4 needs them (`docs/verification.md`).
+- Erased row access by key (D121, D122), the precondition of `lactose-predict`'s
+  implementation and what `net`'s generic hook is written against:
+
+  ```rust
+  impl World {
+      /// The bytes of `component` of `key` as stored (reference fields hold origin keys),
+      /// or `None` if the entity or the component is absent.
+      pub fn get_erased(&self, key: StableKey, component: ComponentKey) -> Option<&[u8]>;
+
+      /// Writes `data` whole to `key`: `data.bytes` must be the registry's element size for
+      /// `data.component` (`NotFound` for an unregistered component, as `insert` reports
+      /// it, `InvalidData` for a wrong length), validated through `TypeInfo::validate`
+      /// after `zero_padding` (`InvalidData`), a bound `Net` key in a reference field
+      /// rewritten to the origin key as `insert` does and a placeholder refused; `InRegion`
+      /// and `PredictedOrigin` refused with `InvalidData`; `NotFound` for a missing entity.
+      /// Adds the component if the row lacks it (an archetype change the structural log
+      /// records, the row stamped) and otherwise writes it only if the bytes differ,
+      /// stamping the row then; a relationship component (`OwnedBy`, `ClaimedBy`, any with
+      /// an `EntityRef` field) keeps the reverse index and the claim index current as
+      /// `insert` does. Returns whether it wrote.
+      pub fn insert_erased(&mut self, key: StableKey, data: &ComponentData) -> Result<bool>;
+
+      /// Removes `component` from `key`: `Ok(false)` if the row lacks it, `NotFound` for a
+      /// missing entity or an unregistered component, `InvalidData` for `InRegion` or
+      /// `PredictedOrigin`; the reverse index and the claim index updated as `remove` does.
+      pub fn remove_erased(&mut self, key: StableKey, component: ComponentKey) -> Result<bool>;
+
+      /// Spawns `key` in `region` with `components`, each validated as `insert_erased`
+      /// validates before anything changes (two entries for one component, or `InRegion` or
+      /// `PredictedOrigin` among them, are `InvalidData`), under the key rules of `spawn`
+      /// (a `Net` or `Predicted` key no live entity has; a `Predicted` key gives
+      /// `PredictedOrigin`; a placeholder is an error); a refused spawn changes nothing.
+      pub fn spawn_erased(
+          &mut self,
+          key: StableKey,
+          region: RegionId,
+          components: &[ComponentData],
+      ) -> Result<()>;
+  }
+  ```
 
 ## Proof for milestone 0
 

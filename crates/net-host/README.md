@@ -294,6 +294,12 @@ reshape.
 
 ## Not in this crate yet
 
+- `JoinAccepted::entity: StableKey` (D122): the player's own entity, as the session applier
+  spawned or re-claimed it, read by the server's `app` with `player_entity` between runs
+  after the join applied; what `lactose-predict`'s `LocalPlayer::entity` takes. And a
+  milestone 4 control message, `PlayerEntity { entity: StableKey }`, sent when the server
+  names another entity for the player (a re-join after a load), which `app` passes to
+  `Predictor::set_local` between runs.
 - The packer itself: filling each packet by priority up to `SendBudget`, delta coding,
   the byte encoding of every type here and of the staged frame's records, the jitter
   window and the per-client input queue of `lactose_input::SampleHistory` windows, the

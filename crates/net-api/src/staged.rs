@@ -48,9 +48,9 @@ pub struct StagedFrame {
     /// `app` copies it into `TickInput::time_scale` and into its pacer.
     pub time_scale: Option<TimeScale>,
     /// The processed-input acknowledgement for the receiving player: the newest input
-    /// tick the server has applied. `lactose-predict` confirms its ring up to it and
-    /// destroys a predicted spawn the server never echoed once this passes the spawn's
-    /// input tick (architecture section 7).
+    /// tick the server has applied. `lactose-predict` despawns a predicted spawn of the
+    /// receiving player the server never echoed once this is after the spawn's input tick
+    /// (architecture section 7); it confirms frames by their tick, not by this.
     pub acked_input: Option<Tick>,
     /// The input ticks of the receiving player for which the server substituted the
     /// previous input (architecture section 9.2): the client is told, so that

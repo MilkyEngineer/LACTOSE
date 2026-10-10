@@ -74,7 +74,7 @@ constructors and accessors are `#[doc(hidden)]`: the backend's, not game code's.
 | | The determinism obligations, and what is not yet shown | "The backend's obligations" below, and the `PhysicsBackend` docs |
 | | The conformance test | `conformance::snapshot_restore`, called from the backend's test crate with each pool size and each layout |
 | `predict` | `snapshot` and `restore` beside `WorldSnapshot`, with the same identity rule, sized for the budget | `snapshot(world)` after `World::snapshot`, `restore(world, &snap)` after `World::restore`; `PhysicsSnapshot::size_in_bytes` ("Snapshot and restore" below) |
-| | Re-simulation identical to the first run; corrections pushed to the solver | The snapshot carries the sync's pending work; `corrected(world, &keys)` after `restore` names the rows written without recording |
+| | Re-simulation identical to the first run; corrections pushed to the solver | The snapshot carries the sync's pending work; `corrected(world, &keys)` after `restore` names the rows a correction wrote (stamped, under D122) |
 | `anim` | Ragdoll bodies and sockets: a named place and the types | Bone rows with `RigidBody::kinematic()` and a capsule `Collider` owned by the character, `Joint` rows owned by a bone, `Mut<RigidBody>` to go limp, `&Transform` in `Stage::Post` for sockets; `tests/consumers.rs`, section 2. Limited joints wait on the backend's verification item |
 | `sim` and SOUR | The systems placed, readers after them, a setup function for the pool | `register_systems` places `sets::SYNC` and `sets::STEP` in `Stage::Physics` and `sets::WRITE_BACK` first in `Stage::Post`; `setup` is the setup function; `Res<TickDelta>` is the step's delta |
 | | Determinism as a contract on the backend; the conformance shape; the place for snapshot hashing | `PhysicsBackend` docs and "The backend's obligations"; `conformance::snapshot_restore` with its `LayoutConfig`; `PhysicsSnapshot::hash` and `ConformanceReport::physics_hash` |
@@ -356,9 +356,11 @@ gather compare it with the last tick they covered, and zero means never.
   snapshot from another resource or a world whose tick is not the snapshot's: restore the
   world first. On any failure nothing changes and the next sync diffs every row
   ("Bodies").
-- `corrected(world, &keys)`: `lactose-predict` writes a correction through
-  `ColumnMut::write` without recording, so that `Changed<T>` does not see it, and the sync
-  cannot either; it names the corrected body rows after `restore` and before the next step,
+- `corrected(world, &keys)`: `lactose-predict` writes a correction stamped (D122, which
+  supersedes D119's unrecorded write for that crate: a `Changed<T>` reader sees a
+  correction once, as it would a server change) and names the corrected body rows after
+  `restore` and before the next step. The call remains the contract whether or not the
+  writer stamps: the pending set, not the ECS's marks, is what the backend is promised,
   and the next sync reads their five columns as changed: `set_body` and `set_collider` with
   the rows' values, and `set_transform` and `set_velocity` where the row differs from what
   the last write-back wrote, so the backend, which compares, takes what differs from its

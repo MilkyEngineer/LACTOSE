@@ -266,6 +266,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "lactose-predict"
+version = "0.0.0"
+dependencies = [
+ "lactose-core",
+ "lactose-ecs",
+ "lactose-input",
+ "lactose-net-api",
+ "lactose-physics-api",
+ "lactose-reflect",
+ "lactose-sim",
+ "lactose-task",
+]
+
+[[package]]
 name = "lactose-reflect"
 version = "0.0.0"
 dependencies = [

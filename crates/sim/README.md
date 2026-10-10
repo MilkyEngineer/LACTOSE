@@ -154,7 +154,7 @@ kind reads `Registration::kind`.
 let period = Duration::from_secs(1) / TICK_RATE_HZ;
 let mut pacer = TickPacer::new(Instant::now(), period, 4);
 loop {
-    let budget = pacer.poll(Instant::now(), resimulated_this_frame);
+    let budget = pacer.poll(Instant::now(), 0); // re-simulation does not share the cap (D122)
     for _ in 0..budget.ticks {
         simulation = simulation.step(&executor, next_frame()).await?;
     }
@@ -249,6 +249,9 @@ and ordered among themselves by `after` edges. Their order is fixed in every wor
    an applier (the builder's default) every input is dropped and logged, after its input
    tick is set.
 5. `sim::apply_staged_state`: `StagedState::apply(world, tick)`. The default does nothing.
+   A `Prediction` world's `dyn StagedState` is replaced after build by
+   `lactose_predict::Predictor::new`, which owns the simulation from then on and reinstalls
+   the hook at `resync` (D122).
 6. `sim::apply_region_policy`: under `Anchored`, the policy ("Regions" below); under
    `Directed`, nothing. Last, so it sees the sessions' spawns.
 
@@ -595,6 +598,13 @@ another build.
   digests across machines; the types are here.
 - Per-anchor streaming priority (`StreamingAnchor::priority` is zero) and streaming
   budgets, milestone 3.
+- `SimulationBuilder::check(f: impl FnOnce(&Registry, &[&'static SystemDescriptor]) ->
+  Result<()> + Send + 'static)` (D122): a check run at `build` after every registration
+  function and before the schedules prepare, over the world's registry and every
+  descriptor added for the builder's kind, in registration order; its error fails the
+  build. `app` hands `lactose_predict::check_prediction_reads` to the prediction world's
+  builder. The six exclusive systems of the input sync point are listed by name in
+  `lactose_predict::EXCLUSIVE_SYSTEMS`; renaming one changes that list in the same commit.
 
 ## Proof for milestone 1
 

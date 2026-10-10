@@ -258,7 +258,10 @@ exit status. Tests run under `cargo-nextest` with one process per test and timeo
 exposes no general blocking wait; calling one on a worker is a debug assertion.
 
 **The timer root.** A root task owns ticking: it wakes at tick deadlines, caps catch-up at four
-ticks per frame including re-simulation ticks, and paces frames. Beyond the cap a client
+ticks per frame and paces frames; a rollback's re-simulation ticks are bounded by the prediction
+ring's depth, which the client sizes to its frame re-simulation budget (section 9.4), run beside
+the capped catch-up ticks and, while that depth fits the budget, cost the client no lead (D122).
+Beyond the cap a client
 re-syncs its clock (section 11) and a server climbs the overload ladder (section 9.7); neither
 slows time. It runs on whichever frame-critical worker
 picks it up. Section 11 covers time scale and pause.
@@ -705,7 +708,8 @@ capacity model.
   not corrected, so a corrected dynamic object converges over a few ticks rather than exactly. Mispredictions against
   non-predicted entities are expected and smoothed visually. Proxies live about half a round
   trip in the past relative to the local player; this is an accepted limitation, and predicted
-  interactions with proxies are presented tentatively until confirmed.
+  interactions with proxies are presented tentatively until confirmed. Corrections are written
+  stamped, so a `Changed` reader in a re-simulated tick sees them once (D122).
 - Later: forward nearby players' inputs so the prediction world includes them.
 
 ### 9.5 Lag compensation
@@ -763,8 +767,10 @@ at tick ten. The cost is measured in milestone 1 and the prediction world is siz
   The scale enters the simulation as a journaled input of the tick; game systems do not
   read it.
 - Presentation runs on real time regardless of time scale.
-- Catch-up ticks and re-simulation ticks share the per-frame cap. A client that cannot catch
-  up re-syncs its clock; a server that cannot keep up climbs the overload ladder.
+- Catch-up ticks are capped per frame; re-simulation ticks are bounded by the prediction ring's
+  depth, sized to the frame's re-simulation budget, and do not count against the cap (D122). A
+  client that cannot catch up re-syncs its clock; a server that cannot keep up climbs the
+  overload ladder.
 
 ## 12. Rendering
 

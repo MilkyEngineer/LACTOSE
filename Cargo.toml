@@ -21,6 +21,7 @@ lactose-asset-api = { path = "crates/asset-api" }
 lactose-bundle = { path = "crates/bundle" }
 lactose-sim = { path = "crates/sim" }
 lactose-physics-api = { path = "crates/physics-api" }
+lactose-predict = { path = "crates/predict" }
 lactose-input = { path = "crates/input" }
 lactose-input-host = { path = "crates/input-host" }
 lactose-net-api = { path = "crates/net-api" }
