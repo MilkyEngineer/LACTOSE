@@ -12,10 +12,11 @@ and the snapshot and restore the prediction world rolls back with. `lactose-phys
 | Determinism boundary | inside |
 | Unsafe | none, `#![forbid(unsafe_code)]` |
 
-**Status: facade.** Every public signature is final and every body that decides anything is
-`todo!()`; nothing here runs. This file is the contract the implementation lane and the
-backend lane meet, and every sentence under "Behaviour the signatures cannot express" is one
-a dependent crate may rely on. Architecture sections 4, 5.3, 6.1, 8.2, 8.3, 9.4, 9.7, 10,
+**Status: implemented** against the naive ECS and proven against a test backend
+(`tests/common/fake.rs`, which is also the backend lane's model of what the trait asks);
+the surface is frozen once `lactose-physics-rapier` passes the conformance run. This file is
+the contract the backend lane and the consumers meet, and every sentence under "Behaviour
+the signatures cannot express" is one a dependent crate may rely on. Architecture sections 4, 5.3, 6.1, 8.2, 8.3, 9.4, 9.7, 10,
 15.1, 16 and 17 are the design; where this file and the architecture disagree, the
 architecture wins and this file is wrong. Decision D119 records the choices those sections
 left open and what the two design reviews changed. `crates/ecs/README.md` and
@@ -26,8 +27,8 @@ and setup functions holds here unchanged.
 Amending a signature is allowed in the change that needs it. Say so in the change
 description and list what changed, because `physics-rapier`, `predict`, `anim`,
 `present-api`, `net` and the game crates are written against this surface.
-`tests/consumers.rs` is a compile-only sketch of what each of them writes: a change that
-breaks it is a signature change to list.
+`tests/consumers.rs` is a sketch of what each of them writes, type-checked, with `app`'s
+build run for every world kind: a change that breaks it is a signature change to list.
 
 ## Surface
 
@@ -308,12 +309,16 @@ gather compare it with the last tick they covered, and zero means never.
 - A `Joint` is a row. It is created in the solver at the first physics sync point at which
   the row exists and both `body_a` and `body_b` name rows that are bodies; until then it
   waits, and the sync retries the waiting joints at every sync point in ascending key
-  order. A joint whose reference is empty (a body despawned, so the `EntityRef` was emptied
-  at apply) is removed from the solver and not retried until its `Joint` row changes. Its
-  `JointHandle` row is written when it is created and removed when it leaves the solver:
-  when its row is despawned or loses `Joint`, when either body stops being a body (the
-  backend removes the joints of a removed body; the joint then waits again), or when the
-  `Joint` value changes, which removes and recreates it.
+  order. A joint whose reference is empty (written empty at apply because it named a
+  missing entity) is removed from the solver and not retried until its `Joint` row changes.
+  The ECS empties no reference when an entity is despawned, so a joint whose body was
+  despawned keeps naming that key and waits like any joint whose body is not a body, until
+  a body of that key exists again (a region reload, a re-simulation); a joint is usually
+  owned by one of its bodies and goes with it. Its `JointHandle` row is written when it is
+  created and removed when it leaves the solver: when its row is despawned or loses
+  `Joint`, when either body stops being a body (the backend removes the joints of a
+  removed body; the joint then waits again), or when the `Joint` value changes, which
+  removes and recreates it; a write of an equal value changes nothing.
 - A joint between a frozen body and a simulated one is a joint to a fixed body. A joint
   whose bodies are in two regions is allowed within one process (architecture section 9.6
   keeps cross-region references weak, and this one is validated at every sync).
@@ -330,11 +335,12 @@ gather compare it with the last tick they covered, and zero means never.
   serialisation; `restore` rebuilds shapes from those values while deserialising, with no
   change flag, wake or mass update; there is no `set_collider` replay and no
   fixed-collider reconciliation. This crate's part is its bookkeeping and the sync's
-  pending work: which rows are bodies and joints with their handles, the waiting joints,
-  the region modes, the aliases, `written`, the structural log entries after the sync's
-  cursor in order, the keys changed since its mark across the five columns, and the
-  channel's entries not yet taken (`World::channel`); or, when the cursor or mark is
-  stale, that a full diff is due. `snapshot` records this crate's bookkeeping and what the
+  pending work: which rows are bodies with their handles and which of them are frozen,
+  which rows are joints with the value and the bodies each was created from, the waiting
+  joints, the region modes, the aliases, `written`, the structural log entries after the
+  sync's cursor in order, the keys changed since its mark across the five columns with the
+  columns each changed in, and the channel's entries not yet taken (`World::channel`); or,
+  when the cursor or mark is stale, that a full diff is due. `snapshot` records this crate's bookkeeping and what the
   next sync would see; `restore` puts them back, and the next sync processes the pending
   log entries before the log since the restore, and the union of pending and newly changed
   keys in key order, so a re-simulated tick's sync makes exactly the backend calls the
@@ -348,8 +354,10 @@ gather compare it with the last tick they covered, and zero means never.
 - `corrected(world, &keys)`: `lactose-predict` writes a correction through
   `ColumnMut::write` without recording, so that `Changed<T>` does not see it, and the sync
   cannot either; it names the corrected body rows after `restore` and before the next step,
-  and the next sync reads their five columns as changed and pushes what differs from the
-  solver. A correction written to a non-body is ignored. Rapier's internal solver state is
+  and the next sync reads their five columns as changed: `set_body` and `set_collider` with
+  the rows' values, and `set_transform` and `set_velocity` where the row differs from what
+  the last write-back wrote, so the backend, which compares, takes what differs from its
+  state and ignores the rest. A correction written to a non-body is ignored. Rapier's internal solver state is
   not corrected (architecture section 9.4), so a corrected dynamic body converges over a
   few ticks.
 - `PhysicsSnapshot::size_in_bytes` is the backend's part, what milestone 1 measures
@@ -428,23 +436,28 @@ docs restate them per method)
 
 ## Proof for milestone 1
 
-Nothing runs yet. The implementation lane replaces every `todo!()` and proves, under SOUR
-in workers, repeat, layout and chaos modes, against a backend (the backend lane's Rapier,
-or a test backend that integrates velocities and reports every body). The scenes named
-"probe" are the design reviews' probes in their rewritten (round 2) form, which ran against
-the real ECS with stand-ins for the three systems; the lane turns each into a test of the
-real systems.
+The tests in `tests/`, each a nextest test over the real three systems and the test
+backend of `tests/common/fake.rs` (which records every call, integrates velocities,
+reports every moved body and snapshots its state as bytes), asserting on calls, counts,
+orders, bytes and hashes and never on timing. The scenes named "probe" are the design
+reviews' probes in their rewritten (round 2) form. `tests/sour.rs` records under SOUR,
+which runs the package in workers, repeat, layout and chaos modes once it is listed under
+`[harness]` in `tools/xtask/ci-policy.toml`; the feature-tree check refuses two harness
+packages whose boundary trees differ in membership, which this package's and
+`lactose-sim`'s must, so the listing waits on that check. What waits on the backend lane: the conformance run with
+Rapier, and the size and time of Rapier's snapshot bytes.
 
 | What | How |
 |---|---|
-| Bodies follow rows | Spawn, `cmd.set` of `RigidBody` and `Collider`, their removal, despawn, region move, region load and unload: `create_body`, `set_body`, `set_collider`, `remove_body` and `set_frozen` in the stated order, handles present exactly meanwhile; the same under every layout |
-| The prediction rule | In a `Prediction` world a `RigidBody` row without `ClaimedBy` is created with an effective kinematic body and a claimed one with the row's type; `ClaimedBy` added or removed on a body row is `set_body` with the effective body; a `Collider` row is a fixed collider in every kind |
-| Row writes | A `Mut<Velocity>` write and an impulse in one tick: the backend sees `set_velocity` then the command; a `Transform` write to a kinematic body is `set_transform`; the step's own write-back is never pushed back (probe F: the sync saw 2,000 changed rows and pushed none); a write in `Stage::Post` after the write-back is pushed next tick |
-| Commands | Order equals command order under every layout, across the tick boundary for a command recorded in `Stage::Post` or in `Stage::Physics` after the step (probe B); a command for a non-body is dropped and logged |
-| Events | Emitted sorted whatever order the backend reports; `Impact` above the threshold to a target with `events`, never to one without; `Started` and `Stopped` to both sides when either has `events`; a reader in `Stage::Post` sees each once; readers before the step fail to build |
-| Queries | `cast_ray` ties go to the lowest key; `overlap` ascending; a `Stage::Physics` reader of `Physics` without an edge after `sets::STEP` fails to build; an unordered `Stage::Post` reader of `Transform` builds and reads this tick's rows (probe S1); another crate's exclusive `Stage::Post` system fails to build until `app` orders it (probe S2) |
-| Joints | A joint spawned before its bodies waits and is created when they exist; a body's removal removes it and it waits again; an emptied reference parks it until the row changes; a `Joint` value change recreates it |
-| Snapshot and restore | `conformance::snapshot_restore` with the test backend under the production layout and SOUR's; probe B's scene (a `Stage::Post` move, spawn, despawn and impulse and a `Stage::Physics` command at the snapshot tick, with an input tick set every tick): the re-simulated syncs make the same backend calls as the first run and the rows are equal; probe B without an input tick: a predicted spawn is dropped, so the scene sets one; a correction named through `corrected` is pushed (probe C); a restore of the world alone diffs without clearing and keeps running; the 2^30 rebase diffs without clearing (probe D); a snapshot from another resource is refused |
-| The write-back | Only rows whose bytes changed are stamped; `Teleported` holds the teleport tick after two further ticks in one frame (probe T); a reported key despawned at the Post sync point is skipped; the per-key cost for 2,000 moved bodies among 100k rows (probe F: 0.43 ms, against 3.2 ms for a `columns_mut` walk and 1.6 ms for `Commands::set`) re-measured on the milestone 1 ECS against the 3 ms physics phase |
-| The scalar | The size assertions in `lib.rs`, and the schema dump of every component contains no `f32` or `f64` |
-| The snapshot size | `PhysicsSnapshot::size_in_bytes` and `snapshot` time for 50 claimed bodies plus N statics, against the 100 µs budget; the result decides how many statics a prediction world may hold |
+| Bodies follow rows | `bodies.rs`: spawn, `cmd.set` of `RigidBody` and `Collider`, their removal, despawn, a move into a frozen region, a thaw, unload and load reach the backend as `create_body`, `set_body`, `set_collider`, `remove_body`, `set_frozen` and `set_velocity` in the stated order, handle rows present exactly meanwhile; the same calls under every `layout_mode` capacity, three seeds, one and four workers and two pool sizes; a refused body is retried when its row changes; a row without a `Transform` is skipped; a mode change freezes and thaws every body of the region once |
+| The prediction rule | `bodies.rs`: a proxy is created kinematic, a claimed row with its type, a `Collider` row fixed; a claim and a release are `set_body` with the effective body; a proxy's body change is handed kinematic; a server world hands the row's type |
+| Row writes | `rows.rs`: a `Mut<Velocity>` write and an impulse in one tick are `set_velocity`, then the step with the command; a `Transform` write sweeps a kinematic body and places a dynamic one; the write-back is never pushed back (probe F with 200 bodies here, 2,000 in `cost.rs`); a `Stage::Post` write is pushed at the next tick, a sleeping body's write to its last pose included; a body without `Velocity` gains one |
+| Commands | `commands.rs`: command order (execution order, source key, sequence; the physics stage's and the post stage's commands ahead of the next tick's own) under three capacities, two seeds and one and four workers; a command for a non-body or a missing key is dropped, one for a fixed collider reaches the backend; a dropped spawn's command is dropped (probe B without an input tick); a bound predicted body is named by its `Net` key from the physics sync point on, in commands, `is_body` and `QueryFilter::exclude` |
+| Events | `events.rs`: the emission order per tick whatever order the backend reports in (two pool sizes); `Impact` in every touching step above the threshold to the target with `events`, never to one without; `Started` and `Stopped` to both sides; triggers to both sides; each seen once by a `Stage::Post` reader; readers in `Stage::Physics` without the edge and in `Stage::Simulation` fail to build |
+| Queries | `queries.rs`: `cast_ray` ties to the lowest key, groups, sensors and exclusion; `cast_shape`; `overlap` appended ascending, each key once, whatever the backend's order; a `Stage::Physics` reader of `Physics` needs the edge after `sets::STEP`; an unordered `Stage::Post` reader of `Transform` reads this tick's rows (probe S1); another exclusive `Stage::Post` system builds only once `Registration::order` orders it (probe S2) |
+| Joints | `joints.rs`: a joint waits for both bodies; a body's removal removes it and it waits, then a fixed collider takes it; a value change recreates it and an equal write does not; an emptied reference parks it until its row changes; a despawned body leaves it waiting for that key |
+| Snapshot and restore | `snapshot.rs`: `conformance::snapshot_restore` with the test backend under two pool sizes, the production layout and SOUR's, one and four workers, every report equal, the resumed run's backend calls equal to the first run's, and the scene's pending work, velocity write, command, limp bone, freeze and thaw each seen in them; probe B: the re-simulated syncs make the first run's calls and the rows are equal; probe C: a correction is pushed only when named through `corrected`; the predict loop with spawns, despawns, moves, commands, a claim and a release, re-run equal apart from the corrected key's two equal-value pushes; a world restored alone is diffed without clearing and keeps running; the 2^30 rebase diffs without clearing (probe D); a snapshot taken before the first sync restores into a full diff; another resource's snapshot and another tick's are refused and change nothing; `NotFound` without `Physics`; a second `setup` is refused |
+| The write-back | `rows.rs`: only rows whose bytes changed are stamped; `Teleported` holds the teleport's tick across two further ticks (probe T); a key despawned at the post sync point is skipped; `cost.rs`: 100k entities with 2,000 moved bodies, the write-back stamping exactly the moved rows and the sync pushing none, the microseconds of both printed |
+| The scalar | The size assertions in `lib.rs`; `types.rs`: no component's layout holds a raw float, every hashed one registers with the world hasher, the handles are `derived` |
+| SOUR | `sour.rs`: a server scene and a prediction scene with a rollback, 150 ticks each, the re-simulated ticks recorded again (the runner requires them equal); and the rolled-back scene ending with the straight run's hashes |
+| The snapshot size | `cost.rs` prints `size_in_bytes` and `snapshot` time for 50 claimed bodies plus 0 to 10,000 statics; the test backend's bytes say nothing of Rapier's, which the backend lane measures against the 100 µs budget |

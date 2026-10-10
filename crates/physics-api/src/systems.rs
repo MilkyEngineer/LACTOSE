@@ -74,7 +74,7 @@ pub fn register_systems(registration: &mut Registration) {
     writes = [BodyHandle, JointHandle]
 )]
 pub(crate) fn sync_bodies(world: &mut World, physics: ResMut<Physics>) {
-    todo!()
+    physics.sync(world);
 }
 
 /// The step: hands the backend the commands the sync took and the delta inside
@@ -89,7 +89,7 @@ pub(crate) fn step_world(
     contacts: EventWriter<ContactEvent>,
     triggers: EventWriter<TriggerEvent>,
 ) {
-    todo!()
+    physics.step(&mut job, dt.0, &mut contacts, &mut triggers);
 }
 
 /// The write-back: at the sync point that begins `Stage::Post`, writes the `Transform`
@@ -107,5 +107,5 @@ pub(crate) fn step_world(
     writes = [Transform, Velocity, Teleported]
 )]
 pub(crate) fn write_back_rows(world: &mut World, physics: ResMut<Physics>) {
-    todo!()
+    physics.write_back(world);
 }

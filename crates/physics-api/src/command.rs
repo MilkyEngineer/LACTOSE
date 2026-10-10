@@ -98,7 +98,7 @@ impl PhysicsCommand {
         }
     }
 
-    fn body_mut(&mut self) -> &mut StableKey {
+    pub(crate) fn body_mut(&mut self) -> &mut StableKey {
         match self {
             Self::ApplyImpulse { body, .. }
             | Self::ApplyImpulseAt { body, .. }

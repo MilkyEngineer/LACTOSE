@@ -18,6 +18,14 @@ lactose-reflect.workspace = true
 # `Stage::Physics`, `Registration`, `TypeTable` and `TickDelta`: where the two systems are
 # placed and what the step reads; `SimulationBuilder` for the conformance run.
 lactose-sim.workspace = true
+# Refusals and dropped commands at target `physics` (architecture sections 3 and 19).
+tracing.workspace = true
+
+[dev-dependencies]
+# The SOUR test builds its executor the way a SOUR test does (`ChaosConfig`); a
+# dev-dependency, so the boundary allowlist is untouched and the library names nothing of
+# `task` (as in `lactose-sim`).
+lactose-task.workspace = true
 
 [lints]
 workspace = true
