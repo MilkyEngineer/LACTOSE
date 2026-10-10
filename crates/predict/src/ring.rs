@@ -19,14 +19,14 @@ use lactose_sim::TickInput;
 /// being the present tick of the world. A slot older than the depth is dropped when a
 /// newer one is taken, and the oldest slot's tick is the world's rollback horizon
 /// (`World::set_rollback_horizon`): a frame for a tick before it cannot be reconciled and
-/// is a resync. After a rebuild (a full frame) the ring starts again at the slot of the
-/// tick that applied it.
+/// is a resync, unless it is from before the ring's restart. After a rebuild (a full
+/// frame) or a `resync` the ring starts again at one slot, [`rebuilt_at`](Self::rebuilt_at).
 pub struct Ring {
     slots: VecDeque<Slot>,
     depth: u32,
-    /// The tick whose step applied the last full frame, if any slot of that rebuild is
-    /// still held: a frame for an earlier tick is from before the rebuild, and its claimed
-    /// facts are skipped rather than reconciled.
+    /// The tick the ring last restarted at, while that slot is still held: a frame for an
+    /// earlier tick is from before the restart, and its facts and substitutions are
+    /// skipped rather than reconciled.
     rebuilt_at: Option<Tick>,
 }
 
@@ -56,13 +56,15 @@ impl Ring {
         self.slots.front().map(|slot| slot.tick)
     }
 
-    /// The newest slot's tick: the present.
+    /// The newest slot's tick: the present, between runs.
     #[must_use]
     pub fn newest(&self) -> Option<Tick> {
         self.slots.back().map(|slot| slot.tick)
     }
 
-    /// The tick whose step applied the last full frame, while the ring still holds it.
+    /// The tick the ring last restarted at (the step that applied a full frame, or a
+    /// `resync`), while the ring still holds that slot; `None` once it has been dropped or
+    /// if the ring never restarted.
     #[must_use]
     pub fn rebuilt_at(&self) -> Option<Tick> {
         self.rebuilt_at
@@ -89,7 +91,8 @@ pub struct SlotBytes {
     /// The world snapshot's bytes (`WorldSnapshot::size_in_bytes`).
     pub world: usize,
     /// The physics snapshot's bytes (`PhysicsSnapshot::size_in_bytes`): the backend's
-    /// whole world, the part that decides how many statics a prediction world may hold.
+    /// whole world, the part that decides how many statics a prediction world may hold;
+    /// zero for a slot taken without one.
     pub physics: usize,
     /// The record's bytes: every replicated component of every claimed entity, as copied
     /// after the tick, plus the frames held for replay.
@@ -104,20 +107,21 @@ struct Slot {
     /// resources, the regions, the input-tick table, the relationship index.
     world: WorldSnapshot,
     /// The physics world after the tick and the sync's pending work, if the world has
-    /// physics.
+    /// physics and the snapshot succeeded; `None` otherwise, and a restore to this slot
+    /// restores the world alone.
     physics: Option<PhysicsSnapshot>,
     /// The frame that produced the tick, as `app` handed it to the step: the local
-    /// player's sample (replaced when the server reports a substitution), the region
-    /// bundles and tables, the time scale. Its `failures` are stripped when it is
-    /// re-simulated, since the first application stamped them.
+    /// player's sample (replaced when the server reports a substitution or the repair
+    /// after one), the region bundles and tables, the time scale. Its `failures` are
+    /// stripped when it is re-simulated, since the first application stamped them.
     input: TickInput,
     /// The staged frames the hook popped in the step for this tick, oldest first: the
     /// proxies' per-tick history (section 10), the binds, the spawns of proxies, the moves,
     /// removals and tombstones, replayed by the hook when the tick is re-simulated.
     frames: Vec<Arc<StagedFrame>>,
     /// Every entity the local player had claimed after the tick, with its region and the
-    /// bytes of each of its replicated components, which a frame's exact rows for this
-    /// tick are compared against.
+    /// bytes of each of its replicated components (`World::get_erased` per entity and
+    /// type), which a frame's exact rows for this tick are compared against.
     record: BTreeMap<StableKey, EntityRecord>,
 }
 

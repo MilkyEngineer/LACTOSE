@@ -4,14 +4,13 @@
 //! log lines: `app` measures time around the call and divides by what is reported here.
 
 use lactose_core::{StableKey, Tick};
-use lactose_math::Scalar;
 
 /// What one [`Predictor::reconcile`](crate::Predictor::reconcile) did.
 #[derive(Clone, Debug, Default)]
 pub struct Reconciled {
     /// The newest server tick reconciled by this call, or `None` when no frame was popped
     /// since the last call. Every slot at or before it has been compared with the server's
-    /// facts for it, matched or corrected.
+    /// facts for it, matched or corrected, or skipped as from before the ring's restart.
     pub confirmed: Option<Tick>,
     /// How many frames were reconciled.
     pub frames: u32,
@@ -19,9 +18,9 @@ pub struct Reconciled {
     /// entities it touched and by how much.
     pub corrections: Vec<Correction>,
     /// How many ticks were re-simulated: from the oldest correction's tick to the present,
-    /// once. Zero without a correction. `app` passes it to the next `TickPacer::poll` as
-    /// the re-simulation ticks committed for the frame, and divides the time it measured
-    /// around the call by it for the rollback cost per tick.
+    /// once. Zero without a correction. `app` divides the time it measured around the
+    /// call by it for the rollback cost per tick. Bounded by the ring depth, which `app`
+    /// sized from its budget; it does not count against the catch-up cap (D122).
     pub resimulated: u32,
     /// Why the prediction world must resync, if it must: `app` then calls
     /// [`Predictor::resync`](crate::Predictor::resync) and requests a full frame from the
@@ -65,26 +64,25 @@ pub enum CorrectionCause {
     Repaired,
 }
 
-/// How far a prediction was from the server's state at one tick.
-#[derive(Clone, Copy, Debug, Default)]
+/// How far a prediction was from the server's state at one tick: counts, since a
+/// magnitude across fields of different units means nothing, and this crate computes no
+/// float.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
 pub struct Divergence {
     /// How many entities differed: in a field, a component's presence, their presence,
     /// their region or their claim.
     pub entities: u32,
     /// How many fields differed, over every compared component of every entity.
     pub fields: u32,
-    /// The largest absolute difference over the scalar leaves of the fields that
-    /// differed, computed through `lactose_math`; `None` when no scalar leaf differed. The
-    /// one float this crate computes: a statistic, never simulation state.
-    pub max_scalar_error: Option<Scalar>,
 }
 
 /// Why the prediction world cannot reconcile and must be rebuilt from replicated state
 /// (architecture section 9.4: "corrections deeper than the ring trigger a rebuild").
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum ResyncReason {
-    /// A frame for a tick before the ring's oldest slot arrived: the server's
-    /// confirmation lags further behind the present than the ring is deep.
+    /// A frame for a tick before the ring's oldest slot arrived, and not from before the
+    /// ring's restart: the server's confirmation lags further behind the present than the
+    /// ring is deep.
     TooOld {
         /// The frame's tick.
         frame: Tick,
@@ -107,13 +105,13 @@ pub enum ResyncReason {
 /// records as the baseline milestone 4's threshold is judged against (architecture
 /// section 22). Monotonic; `app` differences two readings for a rate and divides the
 /// times it measures outside the boundary by the tick counts here.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
 pub struct PredictionStats {
     /// Ticks predicted: one per [`Predictor::step`](crate::Predictor::step).
     pub ticks_predicted: u64,
     /// Ticks re-simulated by corrections.
     pub ticks_resimulated: u64,
-    /// Frames reconciled.
+    /// Frames reconciled, skipped ones included.
     pub frames_reconciled: u64,
     /// Corrections made: the correction rate is this over `frames_reconciled`, or over
     /// the time `app` measured.
@@ -128,8 +126,9 @@ pub struct PredictionStats {
     pub unechoed_spawns: u64,
     /// Resyncs reported.
     pub resyncs: u64,
+    /// Slots taken without their physics part, because the physics snapshot failed after
+    /// the step ran; a rollback to one restores the world alone.
+    pub slots_without_physics: u64,
     /// The deepest correction, in ticks re-simulated for it.
     pub deepest_correction: u32,
-    /// The largest [`Divergence::max_scalar_error`] over every correction.
-    pub largest_scalar_error: Option<Scalar>,
 }

@@ -12,12 +12,11 @@ use std::sync::mpsc::Receiver;
 use lactose_core::{NetId, PlayerId, Result, StableKey, Tick};
 use lactose_ecs::{Executor, Mut, Res, SystemDescriptor, World, WorldKind, system};
 use lactose_input::{PlayerInput, PlayerInputApplier};
-use lactose_math::Scalar;
 use lactose_net_api::{StagedFrame, StagedInbox};
-use lactose_physics_api::{Transform, Velocity};
+use lactose_physics_api::{PhysicsBackend, PhysicsConfig, Transform, Velocity};
 use lactose_predict::{
-    Correction, DEFAULT_DEPTH, LocalPlayer, PredictError, PredictionStats, Predictor, Reconciled,
-    ResyncReason, SlotBytes, check_prediction_reads,
+    Correction, DEFAULT_DEPTH, EXCLUSIVE_SETS, LocalPlayer, PredictError, PredictionStats,
+    Predictor, Reconciled, ResyncReason, SlotBytes, check_prediction_reads,
 };
 use lactose_reflect::{Registry, component};
 use lactose_sim::{
@@ -53,32 +52,59 @@ fn write_diary(diary: Mut<Diary>) {
     diary.0 += 1;
 }
 
+/// Exclusive and in no engine set: the check refuses it for the prediction world, since
+/// `&mut World` shows no table.
+#[system(name = "sketch::sweep", worlds = [server, prediction], exclusive)]
+fn sweep(world: &mut World) {}
+
 pub fn register_types(types: &mut TypeTable) -> Result<()> {
     types.register::<Health>()?;
     types.register::<Diary>()?;
     lactose_input::register_types(types)?;
+    lactose_net_api::register_types(types)?;
     lactose_physics_api::register_types(types)
 }
 
 pub fn register_systems(registration: &mut Registration) {
     registration.stage(Stage::Simulation).add(&FALL).add(&REMINISCE).add(&WRITE_DIARY);
+    registration.stage(Stage::Post).add(&SWEEP);
 }
 
 /// The check over a list of descriptors, as a test or the spike calls it; the one `app`
 /// hands the prediction world's builder is the same function.
 fn check(registry: &Registry) -> Result<()> {
-    let systems: [&'static SystemDescriptor; 3] = [&FALL, &REMINISCE, &WRITE_DIARY];
+    let systems: [&'static SystemDescriptor; 4] = [&FALL, &REMINISCE, &WRITE_DIARY, &SWEEP];
+    let _physics_sync_is_allowed =
+        EXCLUSIVE_SETS.iter().any(|set| set.name() == lactose_physics_api::sets::SYNC.name());
     check_prediction_reads(registry, &systems)
 }
 
 // ---- 2. `app` on a client: build the prediction world beside the replicated one ----
 
-fn build_prediction(player: PlayerId, start: Tick, entity: StableKey) -> Result<Predictor> {
+/// The backend crate's constructor, with the pool `app` built outside the boundary.
+fn backend_with_pool() -> Box<dyn PhysicsBackend> {
+    unimplemented!()
+}
+
+/// Built at the join tick plus the clock sync's lead, with every crate's registration:
+/// `lactose_net_api::setup` for the inbox the hook pops, `lactose_physics_api::setup` for
+/// the physics the ring snapshots.
+fn build_prediction(
+    player: PlayerId,
+    join_tick: Tick,
+    lead: u32,
+    entity: StableKey,
+) -> Result<Predictor> {
     let mut types = TypeTable::new();
     register_types(&mut types)?;
+    let backend = backend_with_pool();
+    let config = PhysicsConfig { reserved_workers: 2, ..PhysicsConfig::default() };
     let simulation = SimulationBuilder::new(WorldKind::Prediction, types)
-        .tick(start)
+        .tick(Tick(join_tick.0 + lead))
+        .setup(lactose_net_api::setup)
+        .setup(move |world| lactose_physics_api::setup(world, backend, config))
         .systems(lactose_input::register_systems)
+        .systems(lactose_net_api::register_systems)
         .systems(lactose_physics_api::register_systems)
         .systems(register_systems)
         .inputs(Box::new(PlayerInputApplier::new()))
@@ -93,10 +119,20 @@ struct Client {
     executor: Executor,
     predictor: Option<Predictor>,
     from_net: Receiver<Arc<StagedFrame>>,
-    /// The re-simulation ticks the last `reconcile` reported, for the next `poll`.
-    resimulated: u32,
     /// The lead the prediction world runs ahead of the server by, from clock sync.
     lead: u32,
+    /// What the last `reconcile` reported, for the spike's cost per tick.
+    resimulated: u32,
+}
+
+/// What a frame leaves `app` to do next.
+enum Next {
+    /// Carry on.
+    Running,
+    /// The predictor was handed back: resync it to `target`, request a full frame.
+    Resync(Tick),
+    /// The world is torn.
+    Torn(lactose_core::Error),
 }
 
 /// One sample per new tick: the quantiser runs once per tick, outside the boundary.
@@ -114,15 +150,16 @@ fn fold_due(input: &mut TickInput, inbox: &StagedInbox, next: Tick) {
     }
 }
 
-/// The order of one frame: push, fold, poll with the re-simulation ticks of the previous
-/// frame, step the new ticks (the first step's hook pops every due frame), reconcile what
-/// the hook popped, run the passes, take the presentation events.
+/// The order of one frame: push, fold, poll (zero re-simulation ticks: the cap is for
+/// catch-up, D122), step the new ticks (the first step's hook pops every due frame),
+/// reconcile what the hook popped, run the passes, take the presentation events. Every
+/// run that hands the predictor back is matched, never `?`ed, so the world is kept.
 #[expect(
     clippy::disallowed_types,
     reason = "the timer root is `app`'s, outside the boundary; this sketch pins that it \
               compiles against `step`, `reconcile` and `passes`"
 )]
-async fn frame(client: &mut Client, pacer: &mut TickPacer) -> Result<()> {
+async fn frame(client: &mut Client, pacer: &mut TickPacer) -> Next {
     use std::time::Instant;
     let local = client.predictor.as_ref().expect("built").local();
     let mut predictor = client.predictor.take().expect("built");
@@ -134,7 +171,7 @@ async fn frame(client: &mut Client, pacer: &mut TickPacer) -> Result<()> {
         let _ = inbox.push(frame);
     }
 
-    let budget = pacer.poll(Instant::now(), client.resimulated);
+    let budget = pacer.poll(Instant::now(), 0);
     for i in 0..budget.ticks {
         let next = Tick(predictor.tick().0 + 1);
         let mut input = TickInput::default();
@@ -146,15 +183,24 @@ async fn frame(client: &mut Client, pacer: &mut TickPacer) -> Result<()> {
         predictor = match predictor.step(&client.executor, input).await {
             Ok(predictor) => predictor,
             Err(PredictError { error, predictor: Some(kept) }) => {
+                let target = Tick(kept.tick().0);
                 client.predictor = Some(kept);
-                return Err(error);
+                return Next::Resync(target);
             }
-            Err(failure) => return Err(failure.into()),
+            Err(PredictError { error, predictor: None }) => return Next::Torn(error),
         };
     }
 
     let started = Instant::now();
-    let (predictor, reconciled) = predictor.reconcile(&client.executor).await?;
+    let (predictor, reconciled) = match predictor.reconcile(&client.executor).await {
+        Ok(done) => done,
+        Err(PredictError { error, predictor: Some(kept) }) => {
+            let target = Tick(kept.tick().0);
+            client.predictor = Some(kept);
+            return Next::Resync(target);
+        }
+        Err(PredictError { error, predictor: None }) => return Next::Torn(error),
+    };
     let rollback_cost_per_tick = if reconciled.resimulated == 0 {
         None
     } else {
@@ -162,25 +208,51 @@ async fn frame(client: &mut Client, pacer: &mut TickPacer) -> Result<()> {
     };
     client.resimulated = reconciled.resimulated;
 
-    let mut predictor = predictor.passes(&client.executor).await?;
+    let mut predictor = match predictor.passes(&client.executor).await {
+        Ok(predictor) => predictor,
+        Err(PredictError { error, predictor: Some(kept) }) => {
+            client.predictor = Some(kept);
+            return Next::Running;
+        }
+        Err(PredictError { error, predictor: None }) => return Next::Torn(error),
+    };
     let events = predictor.simulation_mut().world_mut().take_present_events();
-    let _ = (events, rollback_cost_per_tick);
+    let failures = predictor.simulation_mut().lifecycle_mut().take_asset_failures();
+    let _ = (events, failures, rollback_cost_per_tick);
     presentation_hears(&reconciled);
 
-    if let Some(reason) = reconciled.resync {
-        let target = match reason {
-            ResyncReason::TooOld { .. } => Tick(predictor.tick().0),
-            ResyncReason::Behind { server, .. } => Tick(server.0 + client.lead),
-        };
-        pacer.resync(Instant::now());
-        predictor.resync(target)?;
-        // then: a `ResyncRequest` to the server, whose full frame rebuilds the world.
-    }
+    let next = match reconciled.resync {
+        Some(ResyncReason::TooOld { .. }) => Next::Resync(Tick(predictor.tick().0)),
+        Some(ResyncReason::Behind { server, .. }) => Next::Resync(Tick(server.0 + client.lead)),
+        None => Next::Running,
+    };
     if budget.behind {
+        // Catch-up alone owed more than the cap: the clock, never the world.
         pacer.resync(Instant::now());
     }
     client.predictor = Some(predictor);
-    Ok(())
+    next
+}
+
+/// What `app` does with `Next::Resync`: the world to `target`, the pacer's clock, then a
+/// `ResyncRequest` to the server, whose full frame rebuilds the world.
+#[expect(
+    clippy::disallowed_types,
+    reason = "the timer root is `app`'s, outside the boundary; this sketch pins that it \
+              compiles against `resync`"
+)]
+fn resync(client: &mut Client, pacer: &mut TickPacer, target: Tick) -> Result<()> {
+    use std::time::Instant;
+    pacer.resync(Instant::now());
+    client.predictor.as_mut().expect("kept").resync(target)
+}
+
+/// The server named another entity for the player (a re-join after a load): between
+/// runs, before the full frame that follows.
+fn player_entity_changed(client: &mut Client, entity: StableKey) -> Result<()> {
+    let predictor = client.predictor.as_mut().expect("kept");
+    let player = predictor.local().player;
+    predictor.set_local(LocalPlayer { player, entity })
 }
 
 // ---- 4. Presentation (milestone 2): what it hears of a correction ----
@@ -188,18 +260,17 @@ async fn frame(client: &mut Client, pacer: &mut TickPacer) -> Result<()> {
 fn presentation_hears(reconciled: &Reconciled) {
     for Correction { tick, depth, cause, entities, divergence } in &reconciled.corrections {
         let _smooth_these: &[StableKey] = entities;
-        let _ = (tick, depth, cause, divergence.max_scalar_error);
+        let _ = (tick, depth, cause, divergence.entities, divergence.fields);
     }
 }
 
 // ---- 5. The spike: the values it records, and the ring's weight ----
 
-fn spike_record(predictor: &Predictor, seconds: f64) -> (f64, f64, Option<Scalar>, SlotBytes) {
-    let PredictionStats { corrections, frames_reconciled, largest_scalar_error, .. } =
-        predictor.stats();
+fn spike_record(predictor: &Predictor, seconds: f64) -> (f64, f64, SlotBytes) {
+    let PredictionStats { corrections, frames_reconciled, .. } = predictor.stats();
     let per_minute = corrections as f64 / seconds * 60.0;
     let per_frame = corrections as f64 / frames_reconciled.max(1) as f64;
-    (per_minute, per_frame, largest_scalar_error, predictor.ring().bytes())
+    (per_minute, per_frame, predictor.ring().bytes())
 }
 
 /// Ring depth from the budget `app` measured: the frame re-simulation budget divided by

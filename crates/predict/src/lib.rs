@@ -4,15 +4,15 @@
 //! with what was predicted and re-simulates from the first difference.
 //!
 //! Foundation tier, inside the determinism boundary (architecture section 8.1): every key
-//! is a `StableKey`, nothing here reads a clock, and the one float computed is a
-//! divergence statistic through `lactose_math`. The `README.md` is the contract: it states
-//! what the signatures cannot, and what a caller may rely on.
+//! is a `StableKey`, and nothing here reads a clock or computes a float. The `README.md`
+//! is the contract: it states what the signatures cannot, and what a caller may rely on.
 //!
 //! # Status
 //!
 //! A facade: every public signature is final and every body that decides anything is
 //! `todo!()`. The implementation lane replaces the bodies behind this surface and removes
-//! the crate-level `allow` with the last `todo!()`.
+//! the crate-level `allow` with the last `todo!()`, once the erased row access it is
+//! written against exists in `lactose-ecs` (the README, "Not in this crate yet").
 //!
 //! # Where to start
 //!
@@ -28,41 +28,58 @@
 //! - [`Reconciled`], [`Correction`], [`Divergence`] and [`PredictionStats`] are the values
 //!   the milestone 1 spike records; nothing here is a log line.
 //! - [`check_prediction_reads`] is the build check of D121: a prediction-world system may
-//!   name only components the server corrects.
+//!   name only components the server corrects, and an exclusive one must be in
+//!   [`EXCLUSIVE_SETS`].
 //!
 //! ```no_run
 //! use lactose_core::{NetId, PlayerId, StableKey, Tick};
 //! use lactose_ecs::{Executor, WorldKind};
-//! use lactose_predict::{DEFAULT_DEPTH, LocalPlayer, Predictor};
+//! use lactose_predict::{DEFAULT_DEPTH, LocalPlayer, PredictError, Predictor};
 //! use lactose_sim::{PlayerSample, SimulationBuilder, TickInput, TypeTable};
 //!
 //! # fn local_sample(tick: Tick) -> PlayerSample { unimplemented!() }
 //! # fn main() -> lactose_core::Result<()> {
 //! // What the client's `app` does once, after `JoinAccepted` names the player, the tick
-//! // and the player's entity.
+//! // and the player's entity: the world built at the join tick plus the lead it runs
+//! // ahead by, with every crate's registration, `lactose_net_api::setup` for the inbox
+//! // among them.
 //! let executor = Executor::builder().build()?;
+//! let (join_tick, lead) = (Tick(100), 6);
 //! let mut types = TypeTable::new();
 //! lactose_input::register_types(&mut types)?;
+//! lactose_net_api::register_types(&mut types)?;
 //! // ... every other crate's `register_types`, `setup` and `register_systems` ...
 //! let simulation = SimulationBuilder::new(WorldKind::Prediction, types)
-//!     .tick(Tick(100))
+//!     .tick(Tick(join_tick.0 + lead))
+//!     .setup(lactose_net_api::setup)
 //!     .systems(lactose_input::register_systems)
+//!     .systems(lactose_net_api::register_systems)
 //!     .inputs(Box::new(lactose_input::PlayerInputApplier::new()))
 //!     .build()?;
 //! let entity = StableKey::Net(NetId::from_bits(7).expect("non-zero"));
 //! let local = LocalPlayer { player: PlayerId(1), entity };
-//! let mut predictor = Predictor::new(simulation, local, DEFAULT_DEPTH)?;
+//! let predictor = Predictor::new(simulation, local, DEFAULT_DEPTH)?;
 //!
 //! // One frame of the timer root with one new tick due: the frames `app` pushed into the
 //! // inbox are popped by this step's hook; the step runs ahead with the local sample;
 //! // `reconcile` compares what the hook popped and rolls back if it must; the passes
-//! // extract for presentation. `app` measures `reconcile`'s time outside the boundary.
+//! // extract for presentation. Every run hands the predictor back on a failure its world
+//! // survived, so `app` matches rather than `?`. `app` measures `reconcile`'s time
+//! // outside the boundary.
 //! let next = Tick(predictor.tick().0 + 1);
 //! let mut input = TickInput::default();
 //! input.inputs.insert(local.player, local_sample(next));
-//! predictor = executor.block_on(predictor.step(&executor, input))?;
+//! let predictor = match executor.block_on(predictor.step(&executor, input)) {
+//!     Ok(predictor) => predictor,
+//!     Err(PredictError { error, predictor: Some(kept) }) => {
+//!         // keep `kept`, resync it, report `error`
+//!         # let _ = error;
+//!         kept
+//!     }
+//!     Err(torn) => return Err(torn.into()),
+//! };
 //! let (predictor, reconciled) = executor.block_on(predictor.reconcile(&executor))?;
-//! let resimulated = reconciled.resimulated; // into the next `TickPacer::poll`
+//! let resimulated = reconciled.resimulated; // the rollback cost's divisor
 //! let mut predictor = executor.block_on(predictor.passes(&executor))?;
 //! let events = predictor.simulation_mut().world_mut().take_present_events();
 //! # let _ = (resimulated, events);
@@ -83,7 +100,7 @@ mod predictor;
 mod reconcile;
 mod ring;
 
-pub use check::{check_prediction_reads, prediction_may_name};
+pub use check::{EXCLUSIVE_SETS, check_prediction_reads, prediction_may_name};
 pub use hook::PredictionHook;
 pub use predictor::{
     DEFAULT_DEPTH, LocalPlayer, PassesRun, PredictError, Predictor, ReconcileRun, StepRun,
@@ -97,7 +114,8 @@ pub use ring::{Ring, SlotBytes};
 /// it without a compile error: the predictor is owned by the timer root, a `'static` task,
 /// and its runs are driven there; the hook is what `sim` takes as its staged-state service;
 /// the ring travels with the predictor; the outcomes and the statistics are plain values
-/// a frame hands across threads; and the default depth is a ring, not a slot.
+/// a frame hands across threads; the default depth is a ring, not a slot; and the
+/// exclusive allowlist names the engine's four sets.
 const _: () = {
     use lactose_sim::StagedState;
 
@@ -122,4 +140,5 @@ const _: () = {
     staged_state::<PredictionHook>();
 
     assert!(DEFAULT_DEPTH >= 2, "a ring holds the present and at least one tick to return to");
+    assert!(EXCLUSIVE_SETS.len() == 4, "the engine's exclusive prediction-world sets");
 };

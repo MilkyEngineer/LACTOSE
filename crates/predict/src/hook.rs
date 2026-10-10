@@ -19,16 +19,17 @@ use crate::predictor::LocalPlayer;
 ///
 /// In a predicted tick it pops every frame due at the tick from the world's `StagedInbox`
 /// (`pop_through(tick)`); in a re-simulated tick it applies the frames the ring's slot
-/// holds for the tick instead and pops nothing. For each frame, oldest first, it applies
+/// holds for the tick instead and pops nothing. It writes the tick it ran at into the
+/// record, which is how a step knows it ran. For each frame, oldest first, it applies
 /// what the README states under "The hook": binds, the spawns of proxies as upserts, the
 /// proxies' rows as this tick's position, moves, removals and tombstones; a full frame
 /// whole, as a rebuild. It writes nothing of a claimed entity that a delta frame carries:
 /// those are facts for the reconciliation, which it records with the tick it popped the
-/// frame at. It writes `ClaimedBy` for the local player on every entity a frame marks
-/// claimed and `StreamingAnchor` beside it on the player's own entity, and despawns a
-/// predicted spawn of the local player that the server never echoed once the frame's
-/// acknowledgement is past its input tick. An entry that fails is logged and skipped, as
-/// the replicated world's hook does; the tick runs.
+/// frame at. Before and after the frames it keeps `ClaimedBy` for the local player and
+/// `StreamingAnchor` on the player's own entity while it is live, and the anchor on no
+/// other entity; and it despawns a predicted spawn of the local player that the server
+/// never echoed once a frame's acknowledgement is past its input tick. An entry that fails
+/// is logged and skipped, as the replicated world's hook does; the tick runs.
 pub struct PredictionHook {
     local: LocalPlayer,
 }
@@ -51,6 +52,12 @@ impl StagedState for PredictionHook {
 /// the predictor leaves for the hook: a service resource of the prediction world under
 /// this type, inserted by `Predictor::new`. Not state: not snapshotted, not hashed.
 pub(crate) struct PredictionRecord {
+    /// The player and entity the hook keeps the claim and the anchor on; replaced by
+    /// `Predictor::set_local`.
+    local: LocalPlayer,
+    /// The tick the hook last ran at, or `None` before its first run: a step whose tick
+    /// is not here resolves to an error, since the hook was replaced.
+    ran_at: Option<Tick>,
     /// Every frame the hook popped since the last reconcile, in the order it popped them,
     /// each with the tick it was popped at.
     popped: Vec<Popped>,

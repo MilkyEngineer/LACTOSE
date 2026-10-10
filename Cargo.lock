@@ -272,7 +272,6 @@ dependencies = [
  "lactose-core",
  "lactose-ecs",
  "lactose-input",
- "lactose-math",
  "lactose-net-api",
  "lactose-physics-api",
  "lactose-reflect",
