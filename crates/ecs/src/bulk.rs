@@ -20,8 +20,7 @@ use crate::world::World;
 /// through the target's [`PredictedOrigin`](crate::PredictedOrigin), so the bytes, and the
 /// hash over them, are the same before and after. Bytes are copied as laid out in memory
 /// and not canonicalised; `lactose-persist` canonicalises scalars when it serialises through
-/// `lactose-reflect`, and a NaN in a persistent column is a debug assertion before that
-/// (architecture section 8.2).
+/// `lactose-reflect` (architecture section 8.2).
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct ExportedRow {
     /// The entity's `NetId`.
@@ -164,6 +163,14 @@ pub(crate) fn load_region(
             Record::OwnershipChange { id, owner } => {
                 rows.entry(*id).or_default().owner = Some(*owner)
             }
+        }
+    }
+
+    // Every value is validated before anything binds or spawns, so a document with one bad
+    // row changes nothing.
+    for row in rows.values() {
+        for (&component, bytes) in &row.components {
+            world.registry.get(component).expect("checked above").validate(bytes)?;
         }
     }
 

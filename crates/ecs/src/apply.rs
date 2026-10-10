@@ -11,7 +11,7 @@ use crate::region::{ClaimedBy, RegionId};
 use crate::rng::{LayoutRng, key_bytes};
 use crate::schedule::Source;
 use crate::storage::{StableKeyMap, mark};
-use crate::world::{Aliases, World, WorldKind};
+use crate::world::{Aliases, World, WorldKind, has_entity_ref};
 
 /// The command buffer of one invocation, waiting for its sync point.
 pub(crate) struct Pending {
@@ -223,6 +223,8 @@ impl World {
         self.events.clear();
         self.channels.clear();
         self.input_ticks.clear();
+        // The references a zeroed value held leave the reverse index with it.
+        let mut zeroed_references = Vec::new();
         for arch in &mut self.storage.archetypes {
             let transient: Vec<usize> = arch
                 .columns
@@ -241,12 +243,22 @@ impl World {
                         let start = column.offset + column.size * row;
                         let bytes = &mut chunk.slab.as_bytes_mut()[start..start + column.size];
                         if bytes.iter().any(|&byte| byte != 0) {
+                            if has_entity_ref(column.info) {
+                                zeroed_references.push((
+                                    chunk.keys[row],
+                                    column.info,
+                                    bytes.to_vec(),
+                                ));
+                            }
                             bytes.fill(0);
                             mark(chunk, index, row, stamp);
                         }
                     }
                 }
             }
+        }
+        for (key, info, bytes) in zeroed_references {
+            self.index_references(key, info, &bytes, false);
         }
     }
 

@@ -134,7 +134,7 @@ fn a_pass_neither_cancels_nor_repeats_the_ticks_presentation_events() {
     world = executor.block_on(ticks.run_pass(world, &executor)).unwrap();
     let pass = world.take_present_events();
     assert_eq!(pass.emitted.len(), 1);
-    assert_eq!((pass.emitted[0].key.tick, pass.emitted[0].key.seq), (t(1), 1));
+    assert_eq!((pass.emitted[0].key.tick, pass.emitted[0].key.seq), (t(1), 1 << 31));
     assert!(pass.cancelled.is_empty());
 }
 

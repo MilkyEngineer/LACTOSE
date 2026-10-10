@@ -5,8 +5,8 @@ comments rely on. The crate's tests run under Miri.
 
 Architecture section 21 admits `unsafe` here for chunk column storage and for the
 `#[system]` expansion's call of `unsafe SystemDescriptor::new`. The naive implementation
-needs only the second: storage is safe code, and the crate holds two `unsafe fn` and one
-`unsafe` block, all on the path from an access table to the code that fetches by it. A
+needs only the second: storage is safe code, and the crate holds three `unsafe fn`
+(`SystemDescriptor::new`, `Finalize::new`, `Finalize::call`) and one `unsafe` block, all on the path from an access table to the code that fetches by it. A
 change that adds a place amends this file in the same commit.
 
 ## The access tables (`SystemDescriptor::new`, `Finalize::new`, `Finalize::call`)

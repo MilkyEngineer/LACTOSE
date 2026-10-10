@@ -118,8 +118,9 @@ impl<T: Component> ColumnRef<'_, T> {
     }
 
     /// The chunk's coarse change tick for this column: the last tick a writing system was
-    /// dispatched over the chunk. A consumer skips a chunk whose column tick is not newer
-    /// than its mark.
+    /// dispatched over the chunk, or any write reached it. A consumer skips a chunk whose
+    /// column tick is older than its mark's tick; a write in the mark's own tick, before or
+    /// after the mark, shows that tick, so only `changed_since` tells them apart.
     #[must_use]
     pub fn column_tick(&self) -> Tick {
         self.column_tick

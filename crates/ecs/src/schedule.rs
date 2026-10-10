@@ -723,9 +723,13 @@ impl Schedule {
                 {
                     continue;
                 }
+                // A declared writer is a `Mut` on the column, or an exclusive system, which
+                // may write anything: inputs are applied that way at the input sync point.
                 let written_before = (0..plan.order.len()).any(|writer| {
                     plan.before(writer, reader)
-                        && components(writer).any(|(kind, key)| key == component && is_write(kind))
+                        && (plan.kinds[writer] == SystemKind::Exclusive
+                            || components(writer)
+                                .any(|(kind, key)| key == component && is_write(kind)))
                 });
                 if !written_before {
                     return Err(ScheduleError::TransientBeforeWriter {
@@ -940,7 +944,9 @@ pub enum ScheduleError {
         /// The component.
         component: ComponentKey,
     },
-    /// A reader of a transient column is not ordered after a writer of it in the tick.
+    /// A reader of a transient column is not ordered after a writer of it in the tick: a
+    /// system with `Mut` on the column, or an exclusive system, which may write anything.
+    /// A write through `Commands` is not a declared write.
     TransientBeforeWriter {
         /// The reader.
         reader: &'static str,

@@ -204,7 +204,15 @@ What a system is, from its parameters (`SystemParam` has the table):
 - Presentation events are keyed by (origin key, tick, kind, sequence). The world keeps the
   keys it has delivered, across `restore`, pruned below the oldest tick a restore can reach:
   a re-emission with a delivered key is not delivered again, and a delivered key whose tick
-  is re-simulated without re-emitting it is reported as cancelled.
+  is re-simulated without re-emitting it is reported as cancelled; one cancelled and
+  emitted again before presentation takes either is neither. A `run_pass` numbers its
+  emissions from 2^31 within the tick, so a re-simulated tick neither shifts nor cancels
+  them. Emissions wait until `take_present_events`, so a world that never takes them, a
+  dedicated server, grows the queue; the server's tick loop takes and drops them.
+- Every reader of a transient column must be ordered after a declared writer of it in the
+  tick (`TransientBeforeWriter`): a system with `Mut` on the column, or an exclusive
+  system, which may write anything, so inputs applied at the input sync point count. A
+  write through `Commands` does not.
 
 **Schedule**
 
@@ -256,7 +264,11 @@ What a system is, from its parameters (`SystemParam` has the table):
 - Per-entity and per-region systems run only over `Simulated` regions. `Replicated` and
   `Frozen` rows are reachable through `&mut World` at a sync point. A region's mode, seed,
   resources and exact-version asset table are the world's state; its entity set is a
-  filtered scan.
+  filtered scan. Commands and direct writes still apply to `Replicated` and `Frozen` rows.
+- `unload_region` despawns the region's rows and logs them as despawned, but an unload is
+  not a death: the aliases of its predicted entities stay, so what they own elsewhere still
+  exports and a reload finds them. `allocate_net_id` passes over a runtime `NetId` that a
+  live entity or a bind already holds, such as one spawned directly with its key.
 - `InRegion` and `PredictedOrigin` are the world's: read-only through every path.
   `ClaimedBy` is written by `net` and `predict` on join and removed to release the claim.
   `OwnedBy` is a relationship. `ClaimedBy` and `InRegion` are not saved; `OwnedBy` and
@@ -337,5 +349,6 @@ repeat, layout and chaos modes.
 | `snapshot.rs` | Ten ticks, a snapshot at three, a restore and a re-run equal in every column, row tick and `Changed` set; presentation events deduplicated and cancelled; stale cursors; binds kept; pruning |
 | `bulk.rs` | A baseline and an overlay with every record kind, diffed back to the same overlay under every layout; region resources; schema mismatches |
 | `layout.rs` | One program under every layout: identical exports, structural logs, reductions and presentation events |
-| `pass.rs`, `query.rs` | `run_pass` with a fork over columns; whole-world queries in key order |
+| `pass.rs`, `query.rs`, `regions.rs` | `run_pass` with a fork over columns; whole-world queries in key order; region modes and per-region systems |
+| `regressions.rs` | The findings of the pre-review: transient references in the index, pass events across a rollback, owner keys in either load order, exports after an unload, `set_tick` stamps, transient writers, double rollbacks, failed loads, resources removed mid-run |
 | `compile_fail.rs` | What `#[system]` and `#[finalize]` reject, and what they accept under `#![forbid(unsafe_code)]` |

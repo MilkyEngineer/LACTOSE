@@ -307,7 +307,8 @@ impl<'r, 'j> Fetch<'r, 'j> for Commands<'r> {
 /// Entries written through [`Commands::channel`] in one stage are readable through
 /// [`Channel`] in every later stage of the same tick, and through
 /// [`World::take_channel`](crate::World::take_channel) at a sync point, in command order,
-/// with every placeholder resolved. The input sync point clears every channel.
+/// with every placeholder resolved whose spawn applied; one whose spawn was dropped stays a
+/// placeholder, which names nothing. The input sync point clears every channel.
 pub trait CommandChannel: 'static {
     /// One command.
     type Entry: Send + Sync + 'static;

@@ -74,7 +74,10 @@ pub trait SystemParam: sealed::Sealed + Sized {
 /// A service trait has `Send + Sync` supertraits and is inserted and read as the same
 /// `dyn Trait`, since `dyn Trait` and `dyn Trait + Send + Sync` have different `TypeId`s.
 /// A resource a system names that the world does not hold fails `run_tick` before anything
-/// runs, with an error of kind `NotFound`.
+/// runs, with an error of kind `InvalidData` carrying
+/// [`ScheduleError::MissingResource`](crate::ScheduleError::MissingResource); one an
+/// exclusive system removes during the run
+/// skips the systems that name it, logged at target `casein`.
 pub struct Res<'w, T: ?Sized + 'static> {
     value: &'w T,
 }
@@ -303,8 +306,10 @@ impl Ctx<'_> {
     /// The RNG stream for `key`: keyed by the region seed, the tick, this system, the
     /// invoking entity's origin key (none in a per-region system) and `key` (architecture
     /// section 8.2). `key` is usually the entity's own origin key or a placeholder from this
-    /// invocation's spawns, which is keyed by its spawn index; any stable key is accepted.
-    /// Two calls with one key give the same stream: draw from one `Rng`.
+    /// invocation's spawns, which is keyed by its spawn index; any stable key is accepted,
+    /// as given: a bound `Net` key and the origin key of one entity are different streams,
+    /// so pass the origin key (`StableKeyOf` yields it). Two calls with one key give the
+    /// same stream: draw from one `Rng`.
     #[must_use]
     pub fn rng(&self, key: StableKey) -> Rng {
         Rng::keyed(self.seed, self.tick, self.system, self.invoker, key)

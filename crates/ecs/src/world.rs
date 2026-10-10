@@ -340,6 +340,44 @@ pub(crate) fn entity_refs(info: &TypeInfo, bytes: &[u8]) -> Vec<(FieldId, Stable
     out
 }
 
+/// Rewrites every `EntityRef` naming `from` in a value of `info` to name `to`, located by
+/// the description; the caller stores bytes it has validated.
+fn rewrite_refs(info: &TypeInfo, bytes: &mut [u8], from: StableKey, to: StableKey) {
+    fn walk(kind: &FieldKind, bytes: &mut [u8], from: StableKey, to: StableKey) {
+        match kind {
+            FieldKind::EntityRef => {
+                let reference: Option<EntityRef> =
+                    bytemuck::checked::try_pod_read_unaligned(bytes).ok();
+                if reference.and_then(EntityRef::get) == Some(from) {
+                    bytes.copy_from_slice(bytemuck::bytes_of(&EntityRef::new(to)));
+                }
+            }
+            FieldKind::Struct(info) => {
+                for field in info.fields() {
+                    let range = field.offset()..field.offset() + field.size();
+                    if let Some(bytes) = bytes.get_mut(range) {
+                        walk(&field.kind(), bytes, from, to);
+                    }
+                }
+            }
+            FieldKind::Array { element, len, .. } => {
+                if let Some(size) = bytes.len().checked_div(*len).filter(|&size| size > 0) {
+                    for element_bytes in bytes.chunks_exact_mut(size) {
+                        walk(element, element_bytes, from, to);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    for field in info.layout().fields() {
+        let range = field.offset()..field.offset() + field.size();
+        if let Some(bytes) = bytes.get_mut(range) {
+            walk(&field.kind(), bytes, from, to);
+        }
+    }
+}
+
 /// Whether a value of `info` holds an `EntityRef` anywhere.
 pub(crate) fn has_entity_ref(info: &TypeInfo) -> bool {
     fn walk(kind: &FieldKind) -> bool {
@@ -448,7 +486,8 @@ impl World {
     }
 
     /// Sets the tick between ticks: a client re-syncing to the server's clock, a server
-    /// after a load. Starts a new epoch. Fails during a schedule run.
+    /// after a load. Starts a new epoch, and brings every change stamp after the new tick
+    /// back to it, so a mark taken now sees only later writes. Fails during a schedule run.
     pub fn set_tick(&mut self, tick: Tick) -> Result<()> {
         if self.in_run {
             return Err(invalid("the tick is set between ticks, not during a run"));
@@ -456,6 +495,10 @@ impl World {
         self.tick = tick;
         self.point = BETWEEN;
         self.point_cap = u32::MAX;
+        // Stamps after the new point would read as changes to every later mark until the
+        // clock passed them; they come back to it, as the new epoch forces a full pass anyway.
+        let ceiling = Stamp::new(tick, BETWEEN);
+        self.clamp_stamps(|stamp| stamp.min(ceiling));
         self.new_epoch();
         Ok(())
     }
@@ -619,8 +662,10 @@ impl World {
     /// (architecture section 7). Both keys then name the entity; its origin key stays
     /// `predicted`. The alias table survives [`restore`](Self::restore), and a bind for a
     /// key with no live entity is kept and applies when the entity is spawned, so a bind
-    /// received after a snapshot is not lost to the rollback. Fails if `predicted` or `net`
-    /// is already bound to something else.
+    /// received after a snapshot is not lost to the rollback. A reference stored as `net`
+    /// before the bind, such as an owner loaded from another region's save, is rewritten
+    /// to `predicted`, so stored bytes are origin keys whatever the order of loads. Fails if
+    /// `predicted` or `net` is already bound to something else.
     pub fn bind(&mut self, predicted: PredictionKey, net: NetId) -> Result<()> {
         let bound_net = self.aliases.by_predicted.get(&predicted);
         let bound_predicted = self.aliases.by_net.get(&net);
@@ -631,6 +676,7 @@ impl World {
         }
         self.aliases.by_predicted.insert(predicted, net);
         self.aliases.by_net.insert(net, predicted);
+        self.rekey_references(StableKey::Net(net), StableKey::Predicted(predicted));
         Ok(())
     }
 
@@ -796,6 +842,11 @@ impl World {
         }
         for key in self.entities_in(region).collect::<Vec<_>>() {
             self.despawn_one(key);
+            // An unloaded entity is not gone: its alias stays for the export of what it
+            // owns elsewhere and for the region's reload.
+            if let StableKey::Predicted(predicted) = key {
+                self.despawned_predicted.remove(&predicted);
+            }
         }
         self.regions.remove(&region);
         Ok(())
@@ -1159,21 +1210,25 @@ impl World {
         self.point_cap = 0;
         if self.tick.0.is_multiple_of(REBASE_TICKS) && self.tick.0 != 0 {
             let floor = Stamp::new(Tick(self.tick.0 - REBASE_TICKS), 0);
-            for arch in &mut self.storage.archetypes {
-                for chunk in &mut arch.chunks {
-                    for tick in &mut chunk.column_ticks {
-                        *tick = (*tick).max(floor);
-                    }
-                    for stamps in chunk.stamps.iter_mut().flatten() {
-                        for (tick, position) in stamps.ticks.iter_mut().zip(&mut stamps.positions) {
-                            if Stamp::new(*tick, *position) < floor {
-                                (*tick, *position) = (floor.tick, floor.position);
-                            }
-                        }
+            self.clamp_stamps(|stamp| stamp.max(floor));
+            self.new_epoch();
+        }
+    }
+
+    /// Maps every row stamp and column tick through `clamp`.
+    fn clamp_stamps(&mut self, clamp: impl Fn(Stamp) -> Stamp) {
+        for arch in &mut self.storage.archetypes {
+            for chunk in &mut arch.chunks {
+                for tick in &mut chunk.column_ticks {
+                    *tick = clamp(*tick);
+                }
+                for stamps in chunk.stamps.iter_mut().flatten() {
+                    for (tick, position) in stamps.ticks.iter_mut().zip(&mut stamps.positions) {
+                        let stamp = clamp(Stamp::new(*tick, *position));
+                        (*tick, *position) = (stamp.tick, stamp.position);
                     }
                 }
             }
-            self.new_epoch();
         }
     }
 
@@ -1280,7 +1335,35 @@ impl World {
         });
     }
 
-    fn index_references(&mut self, source: StableKey, info: &TypeInfo, bytes: &[u8], add: bool) {
+    /// Rewrites every stored reference to `from` into `to`, the same entity under its origin
+    /// key: a `Net` key written before the bind that makes it an alias, for instance an
+    /// owner loaded from another region's save. The bytes then match every other machine's;
+    /// no row is stamped, since nothing about the entity changed.
+    fn rekey_references(&mut self, from: StableKey, to: StableKey) {
+        let Some(entries) = self.references.by_target.remove(&from) else { return };
+        let mut rows: Vec<(StableKey, ComponentKey)> =
+            entries.iter().map(|&(source, component, _)| (source, component)).collect();
+        rows.dedup();
+        for (source, component) in rows {
+            let (Some(loc), Some(info)) = (self.storage.loc(source), self.registry.get(component))
+            else {
+                continue;
+            };
+            let Some(bytes) = self.storage.component(loc, component) else { continue };
+            let mut bytes = bytes.to_vec();
+            rewrite_refs(info, &mut bytes, from, to);
+            self.storage.overwrite(loc, component, &bytes);
+        }
+        self.references.by_target.entry(to).or_default().extend(entries);
+    }
+
+    pub(crate) fn index_references(
+        &mut self,
+        source: StableKey,
+        info: &TypeInfo,
+        bytes: &[u8],
+        add: bool,
+    ) {
         for (field, target) in entity_refs(info, bytes) {
             let entry = (source, info.key(), field);
             if add {

@@ -397,6 +397,17 @@ impl Storage {
         mark(chunk, index, loc.row as usize, stamp);
     }
 
+    /// Overwrites component `component` of the entity at `loc` without stamping it: a
+    /// rewrite that changes no value, only how a reference is spelled.
+    pub(crate) fn overwrite(&mut self, loc: Loc, component: ComponentKey, bytes: &[u8]) {
+        let archetype = &mut self.archetypes[loc.archetype as usize];
+        let index = archetype.column_index(component).expect("the entity has the component");
+        let column = archetype.columns[index];
+        archetype.chunks[loc.chunk as usize]
+            .row_mut(&column, loc.row as usize)
+            .copy_from_slice(bytes);
+    }
+
     /// The archetype of the exact component set `infos`, ascending by key.
     pub(crate) fn archetype(&mut self, infos: &[&'static TypeInfo]) -> u32 {
         let keys: Vec<ComponentKey> = infos.iter().map(|info| info.key()).collect();

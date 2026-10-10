@@ -323,10 +323,22 @@ fn run_system(
     let _span = tracing::trace_span!(target: "casein", "system", name = system.name()).entered();
     // The system's resources leave the world for its run, so an exclusive system's world
     // does not hold them and one parameter can write a resource while others read others.
-    let mut taken: Vec<(TypeId, ResourceEntry)> = resource_ids(system)
-        .into_iter()
-        .filter_map(|id| Some((id, world.resources.remove(&id)?)))
-        .collect();
+    let wanted = resource_ids(system);
+    let mut taken: Vec<(TypeId, ResourceEntry)> =
+        wanted.iter().filter_map(|&id| Some((id, world.resources.remove(&id)?))).collect();
+    if taken.len() != wanted.len() {
+        // `prepare` found every resource; an exclusive system earlier in the run removed
+        // one. The system cannot run, and the rest of the run goes on.
+        tracing::error!(
+            target: "casein",
+            system = system.name(),
+            "a resource the system names was removed during the run; the system is skipped"
+        );
+        for (id, entry) in taken {
+            world.resources.insert(id, entry);
+        }
+        return;
+    }
     let mut outputs = Vec::new();
     let mut partials: Vec<Box<dyn Any>> = Vec::new();
     match plan.kinds[index] {
@@ -362,7 +374,8 @@ fn run_system(
         outputs.push(output);
     }
     for (id, entry) in taken {
-        world.resources.insert(id, entry);
+        // An exclusive system that inserted one of its own resources anew keeps that value.
+        world.resources.get_or_insert_with(id, || entry);
     }
 
     outputs.sort_by_key(|output| (output.source, output.finalize));

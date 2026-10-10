@@ -266,6 +266,10 @@ pub(crate) struct PendingEmission {
 
 type KeyParts = (StableKey, PresentKind, u32);
 
+/// The first sequence number of a pass's emissions: a pass between ticks numbers its
+/// events apart from the tick's, so neither shifts the other across a rollback.
+pub(crate) const PASS_SEQ: u32 = 1 << 31;
+
 /// The presentation-event state a world keeps: emissions not yet taken, and the keys taken,
 /// which survive a restore (architecture section 10).
 #[derive(Default)]
@@ -273,9 +277,9 @@ pub(crate) struct PresentLog {
     emitted: Vec<PresentEmission>,
     cancelled: Vec<PresentEventKey>,
     delivered: BTreeMap<Tick, BTreeSet<KeyParts>>,
-    /// The emissions per (origin, kind) of tick `counted` so far, so a pass after the tick
-    /// continues its sequence.
-    counts: BTreeMap<(StableKey, PresentKind), u32>,
+    /// The next sequence per (origin, kind, run is a pass) at tick `counted`, so a later
+    /// pass at the same tick continues the passes' sequence.
+    counts: BTreeMap<(StableKey, PresentKind, bool), u32>,
     counted: Option<Tick>,
 }
 
@@ -283,15 +287,16 @@ impl PresentLog {
     /// Records the emissions of a run at `tick`, whose origins are already origin keys:
     /// those already delivered are dropped. A tick's run numbers each (origin, kind) from
     /// zero and cancels the delivered keys of its tick that it did not emit again, which
-    /// only a re-simulated tick can leave; a pass between ticks continues the tick's
-    /// numbering and cancels nothing.
+    /// only a re-simulated tick can leave. A pass between ticks numbers from
+    /// [`PASS_SEQ`], continuing within the tick, and its keys are never cancelled by a
+    /// re-simulation of the tick, which does not run passes.
     pub(crate) fn end_run(&mut self, tick: Tick, mut emissions: Vec<PendingEmission>, pass: bool) {
         emissions.sort_by_key(|emission| emission.order);
         if !pass || self.counted != Some(tick) {
             self.counts.clear();
         }
         self.counted = Some(tick);
-        let delivered = if pass {
+        let mut delivered = if pass {
             self.delivered.get(&tick).cloned().unwrap_or_default()
         } else {
             self.delivered.remove(&tick).unwrap_or_default()
@@ -299,24 +304,36 @@ impl PresentLog {
         let mut keys = BTreeSet::new();
         for emission in emissions {
             let PresentRecord { origin, kind, bytes } = emission.record;
-            let count = self.counts.entry((origin, kind)).or_insert(0);
+            let base = if pass { PASS_SEQ } else { 0 };
+            let count = self.counts.entry((origin, kind, pass)).or_insert(base);
             let seq = *count;
             *count += 1;
             keys.insert((origin, kind, seq));
-            if !delivered.contains(&(origin, kind, seq)) {
-                let key = PresentEventKey { origin, tick, kind, seq };
-                self.emitted.push(PresentEmission { key, bytes, order: emission.order.0 });
+            let key = PresentEventKey { origin, tick, kind, seq };
+            if delivered.contains(&(origin, kind, seq)) {
+                continue;
             }
+            // Cancelled by an earlier rollback and emitted again before presentation took
+            // either: it was never stopped, so it is neither cancelled nor delivered again.
+            if let Some(index) = self.cancelled.iter().position(|cancelled| *cancelled == key) {
+                self.cancelled.remove(index);
+                delivered.insert((origin, kind, seq));
+                continue;
+            }
+            self.emitted.push(PresentEmission { key, bytes, order: emission.order.0 });
         }
         if pass {
+            if !delivered.is_empty() {
+                self.delivered.insert(tick, delivered);
+            }
             return;
         }
         let mut kept = BTreeSet::new();
         for parts in delivered {
-            if keys.contains(&parts) {
+            let (origin, kind, seq) = parts;
+            if seq >= PASS_SEQ || keys.contains(&parts) {
                 kept.insert(parts);
             } else {
-                let (origin, kind, seq) = parts;
                 self.cancelled.push(PresentEventKey { origin, tick, kind, seq });
             }
         }
