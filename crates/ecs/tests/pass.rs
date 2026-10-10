@@ -137,3 +137,23 @@ fn a_pass_neither_cancels_nor_repeats_the_ticks_presentation_events() {
     assert_eq!((pass.emitted[0].key.tick, pass.emitted[0].key.seq), (t(1), 1));
     assert!(pass.cancelled.is_empty());
 }
+
+/// Records whether the world still held the resource the system took.
+#[system(name = "test::holds_gravity", worlds = [server], exclusive)]
+fn holds_gravity(world: &mut World, gravity: Res<Gravity>, seen: Res<Gathered>) {
+    let held = world.resource::<Gravity>().is_some();
+    seen.lock().unwrap().push((net(1000), i64::from(held) * 10 + gravity.0.to_i64()));
+}
+
+#[test]
+fn an_exclusive_systems_resources_leave_the_world_for_its_call() {
+    let executor = executor();
+    let mut world = world(WorldKind::Server, LayoutConfig::default());
+    world.insert_service::<Gathered>(Box::new(Mutex::new(Vec::new())));
+    let mut builder = Schedule::builder(WorldKind::Server);
+    builder.stage("only", &[]).add(&HOLDS_GRAVITY);
+    let mut schedule = builder.build().unwrap();
+    world = tick(&mut schedule, world, &executor);
+    assert_eq!(gathered(&mut world), [(net(1000), 2)], "not held inside; gravity is two");
+    assert!(world.resource::<Gravity>().is_some(), "and back afterwards");
+}

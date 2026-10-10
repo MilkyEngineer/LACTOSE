@@ -56,6 +56,39 @@ fn mut_items_stamp_on_write_and_changed_items_filter() {
     assert_eq!(world.query::<(Changed<Position>, &Position)>().count(), 3);
 }
 
+/// A tag: a component with no fields, so its column has no bytes.
+#[lactose_reflect::component(key = "test::tag", persistent, replicated)]
+#[derive(PartialEq, Debug)]
+pub struct Tag {}
+
+#[test]
+fn a_zero_sized_component_is_stored_queried_tracked_and_exported() {
+    let mut registry = base_registry();
+    registry.register::<Tag>().unwrap();
+    let mut world =
+        world_with(WorldKind::Server, LayoutConfig::default(), std::sync::Arc::new(registry));
+    world.spawn(net(1), REGION, (Tag {}, Counter(1))).unwrap();
+    world.spawn(net(2), REGION, (Counter(2),)).unwrap();
+    let mark = world.mark();
+    world.insert(net(2), Tag {}).unwrap();
+    assert_eq!(world.get::<Tag>(net(1)), Some(&Tag {}));
+    assert_eq!(world.query::<(&Tag, &Counter)>().count(), 2);
+    let changed: Vec<StableKey> =
+        world.changed_since::<Tag>(mark).unwrap().map(|(key, _)| key).collect();
+    assert_eq!(changed, [net(2)]);
+    let column_rows: usize = world.columns::<Tag>().map(|column| column.values().len()).sum();
+    assert_eq!(column_rows, 2);
+    let exported = world.export_region(REGION).unwrap();
+    let tag = <Tag as lactose_reflect::Reflect>::KEY;
+    assert!(
+        exported
+            .rows
+            .iter()
+            .all(|row| row.components.iter().any(|c| c.component == tag && c.bytes.is_empty()))
+    );
+    assert_eq!(world.remove::<Tag>(net(1)).unwrap(), Some(Tag {}));
+}
+
 #[test]
 #[should_panic(expected = "aliases")]
 fn two_data_items_on_one_component_panic() {

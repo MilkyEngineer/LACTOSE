@@ -267,3 +267,33 @@ fn every_two_to_the_thirty_ticks_the_stamps_are_clamped_and_an_epoch_starts() {
     assert!(world.structural_log().since(&mut cursor).is_none());
     assert_eq!(world.columns::<Counter>().next().unwrap().row_ticks().unwrap(), [t(rebase)]);
 }
+
+/// Writes the transient column, as a declared writer must before any reader.
+#[system(name = "test::fill_scratch", worlds = [server])]
+fn fill_scratch(scratch: Mut<Scratch>) {
+    scratch.0 += 5;
+}
+
+/// Reads the transient column at the input sync point, where it has just been zeroed.
+#[system(name = "test::peek_scratch", worlds = [server], exclusive)]
+fn peek_scratch(world: &mut World, seen: Res<Mutex<Vec<u32>>>) {
+    seen.lock().unwrap().push(world.get::<Scratch>(net(1)).unwrap().0);
+}
+
+#[test]
+fn transient_columns_are_zeroed_at_the_input_sync_point() {
+    let executor = executor();
+    let mut world = world(WorldKind::Server, LayoutConfig::default());
+    world.spawn(net(1), REGION, (Scratch(9),)).unwrap();
+    world.insert_service::<Mutex<Vec<u32>>>(Box::new(Mutex::new(Vec::new())));
+    let mut builder = Schedule::builder(WorldKind::Server);
+    builder.stage("input", &[]).add(&PEEK_SCRATCH);
+    builder.stage("fill", &[]).add(&FILL_SCRATCH);
+    let mut schedule = builder.build().unwrap();
+    for _ in 0..3 {
+        world = tick(&mut schedule, world, &executor);
+        assert_eq!(world.get::<Scratch>(net(1)), Some(&Scratch(5)), "written once per tick");
+    }
+    let seen = std::mem::take(world.service_mut::<Mutex<Vec<u32>>>().unwrap().get_mut().unwrap());
+    assert_eq!(seen, [0, 0, 0], "zeroed before the input sync point's exclusive systems");
+}
