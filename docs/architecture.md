@@ -1036,14 +1036,17 @@ The policy is in section 3.
 - Every `-api` ships a conformance suite. RHI conformance runs under lavapipe on Linux CI and
   on a GPU runner nightly.
 - Each crate's `README.md` states responsibility, tier, boundary status and unsafe status.
-- Agents: `.claude/agents/` defines the standard set. `lane` implements one crate or fix
-  round in its own worktree against a brief; `architect` writes a crate's facade (final
-  signatures, `todo!()` bodies, the README as the contract, proposed decision text) the
-  same way, at the highest effort, for a crate other crates will be written against;
-  `reviewer` reads every lane, fix round and interface design adversarially before it
-  merges. The coordinator writes the briefs, merges serially, and keeps this document, the
-  decisions log and the verification list. A long command that needs no
-  interpretation is run by the coordinator in the background, not by an agent.
+- Agents: `.claude/agents/` defines the standard set and `docs/agents.md` the process. `lane`
+  implements one crate or fix round in its own worktree against a brief; `architect` writes a
+  crate's facade (final signatures, `todo!()` bodies, the README as the contract, proposed
+  decision text) the same way, at the highest effort, for a crate other crates will be
+  written against; `planner` writes milestone plans, proposals and the decisions that settle
+  them; `reviewer` reads every lane, interface design and plan adversarially before it
+  merges, and `reviewer-diff` reads each later fix round against the previous review;
+  `merger` runs a merge and its gates from a brief and commits it. The coordinator writes the
+  briefs, decides the findings, pushes, and keeps this document, the decisions log and the
+  verification list; a long command that needs no interpretation runs in the background,
+  never in a foreground agent turn.
 - CI: clippy `-D warnings`, fmt, nextest, SOUR in all applicable modes, Miri nightly on `task`
   and `ecs`, `cargo-deny`, the tier check.
 
