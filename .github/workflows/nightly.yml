@@ -33,8 +33,7 @@ jobs:
         env:
           LACTOSE_MIRI_REAL_DEQUE: "1"
           MIRIFLAGS: -Zmiri-tree-borrows -Zmiri-ignore-leaks
-      # Uncomment when the crate's implementation merges.
-      # - run: cargo +$MIRI_TOOLCHAIN miri test -p lactose-ecs --locked
+      - run: cargo +$MIRI_TOOLCHAIN miri test -p lactose-ecs --locked
 
   # Architecture section 5.1: the scope latch and the sleep-and-wake protocol are modelled
   # under loom, switched on by a Cargo feature of `lactose-task` and never by a `--cfg` flag

@@ -131,4 +131,4 @@ transitive = [
 [boundary_third_party.direct]
 "lactose-core" = { normal = ["bytemuck", "libc", "windows-sys"], dev = ["xxhash-rust"] }
 "lactose-math" = { normal = ["bytemuck", "libm"] }
-"lactose-ecs" = { normal = ["bytemuck"] }
+"lactose-ecs" = { normal = ["bytemuck", "tracing"] }
