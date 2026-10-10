@@ -261,6 +261,8 @@ dependencies = [
  "lactose-math",
  "lactose-reflect",
  "lactose-sim",
+ "lactose-task",
+ "tracing",
 ]
 
 [[package]]

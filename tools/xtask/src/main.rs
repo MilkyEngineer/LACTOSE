@@ -29,9 +29,10 @@ cargo xtask <command>
   boundary                   check the boundary lint files and everything that could switch
                              them off, the unsafe policy, READMEs, the boundary dependency
                              allowlist and the x86-64-v3 pin
-  features [--package <p>]…  require identical boundary feature trees, per CI platform, across
+  features [--package <p>]…  require agreeing boundary feature trees, per CI platform, across
                              the shipped binaries and the harness packages (or across the
-                             named packages)
+                             named packages): identical across shipped binaries, the same
+                             features for every package a harness package shares with them
   sour matrix                print the SOUR mode matrix
   sour run <selection> [--emit <file>]
                              run simulation tests under SOUR and compare world hashes;
@@ -228,9 +229,12 @@ fn check_features(args: &[&str]) -> Checked {
             let dev = policy.harness_packages.contains(root);
             let dump = features::dump(&context.cargo, &context.root, root, triple, dev)?;
             let tree = features::boundary_tree(&dump, &|name| context.tiers.in_boundary(name))?;
-            trees.push((package.manifest(), tree));
+            // A shipped binary is compared in full; a harness package that is not one, on
+            // the packages it shares with each other root.
+            let full = !dev || policy.feature_roots.contains(root);
+            trees.push(features::Root { path: package.manifest(), tree, full });
         }
-        let packages = trees.first().map_or(0, |(_, tree)| tree.len());
+        let packages = trees.first().map_or(0, |root| root.tree.len());
         eprintln!(
             "features: {triple}: compared {} roots; the first has {packages} package(s) in its \
              boundary tree",

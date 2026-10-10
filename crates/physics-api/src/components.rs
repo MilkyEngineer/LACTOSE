@@ -24,9 +24,10 @@ const fn pad<const N: usize>() -> Padding<N> {
 /// step moved. A write made to it elsewhere (through `Mut` in a kernel, or `Commands::set`
 /// from any system, in `Stage::Input`, `Stage::Simulation` or `Stage::Post`) is honoured by
 /// the sync at the next physics sync point: a dynamic or fixed body is placed there without
-/// a sweep, a kinematic body sweeps to it during the step. In `Stage::Physics` nothing but
-/// the write-back may write a body's transform: the write-back overwrites it. Extracted, so
-/// presentation interpolates between two of them, and replicated.
+/// a sweep, a kinematic body sweeps to it during the step. In `Stage::Physics` it is never
+/// written: the write-back overwrites a write to a body the step reports, and the next sync
+/// pushes one to a body it does not. Extracted, so presentation interpolates between two
+/// of them, and replicated.
 #[component(key = "physics::transform", persistent, replicated, extracted)]
 #[derive(PartialEq, Debug)]
 pub struct Transform {

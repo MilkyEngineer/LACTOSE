@@ -28,9 +28,10 @@ pub mod sets {
     /// on the conflict with the step's `ResMut<Physics>`: there `Res<Physics>` and the
     /// events are this tick's, but the `Transform` and `Velocity` rows are the previous
     /// tick's, since the write-back lands at the sync point that begins `Stage::Post`;
-    /// nothing but the write-back writes a body's `Transform` or `Velocity` in
-    /// `Stage::Physics`, since the write-back overwrites it. Readers of the stepped rows
-    /// go in `Stage::Post`. A system that touches neither `Physics` nor the events runs
+    /// a write there to a body the step reports is overwritten by the write-back, and one
+    /// to a body it does not report is pushed at the next sync, so a body's rows are never
+    /// written in `Stage::Physics`. Readers of the stepped rows go in `Stage::Post`. A
+    /// system that touches neither `Physics` nor the events runs
     /// alongside the step on the reserved workers.
     pub static STEP: SystemSet = SystemSet::new("physics_api::step").after(&[&SYNC]);
 
@@ -74,7 +75,7 @@ pub fn register_systems(registration: &mut Registration) {
     writes = [BodyHandle, JointHandle]
 )]
 pub(crate) fn sync_bodies(world: &mut World, physics: ResMut<Physics>) {
-    todo!()
+    physics.sync(world);
 }
 
 /// The step: hands the backend the commands the sync took and the delta inside
@@ -89,7 +90,7 @@ pub(crate) fn step_world(
     contacts: EventWriter<ContactEvent>,
     triggers: EventWriter<TriggerEvent>,
 ) {
-    todo!()
+    physics.step(&mut job, dt.0, &mut contacts, &mut triggers);
 }
 
 /// The write-back: at the sync point that begins `Stage::Post`, writes the `Transform`
@@ -107,5 +108,5 @@ pub(crate) fn step_world(
     writes = [Transform, Velocity, Teleported]
 )]
 pub(crate) fn write_back_rows(world: &mut World, physics: ResMut<Physics>) {
-    todo!()
+    physics.write_back(world);
 }

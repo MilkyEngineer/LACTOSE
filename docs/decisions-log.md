@@ -1657,7 +1657,52 @@ rationale the author supplied during the editorial pass rather than one taken fr
     `Multibody::inverse_kinematics` banned in the boundary lint file); `deny.toml` denies
     multiple versions of the math crates and glam's `fast-math` and `core-simd` features, since
     `enhanced-determinism` itself enables `scalar-math`, `libm` and `nostd-libm`.
-- Driven by: milestone 1, the `physics-api` facade brief and its two design reviews
+- Implementation (the lane and its fix rounds; the first review found 1 serious and 5 minor, the
+  second 2 minor, the third nothing):
+  - The sync reads the structural log in order against the rows as they are, then the keys
+    changed in the five columns in key order, carrying for each pending key the columns it
+    changed in, so a re-simulated tick's sync repeats the first run's calls.
+  - It keeps the frozen bodies and each joint's value and bodies, reads region modes through the
+    new `World::region_mode` (a lookup, not an entity count), and drops commands naming no body
+    before the step.
+  - Keys named through `corrected` get `set_body` and `set_collider` with the rows' values, and
+    `set_transform` or `set_velocity` only where the row differs from what the last write-back
+    wrote; the backend's own equality check filters the rest.
+  - A joint whose body was despawned keeps its reference, because the ECS empties none on a
+    despawn, and waits for that key.
+  - `lactose-sim` now seeds its log-cursor ring with the log's end at build; it used to trim the
+    first step's entries at the end of that step, which made tick 2's physics sync a full diff.
+  - The feature-tree check compares a harness package that is no shipped binary on the packages
+    it shares with each root before it, by name, requiring the same version and features, and
+    keeps the full comparison for shipped binaries, since two harness packages always differ by
+    themselves and their dev-dependencies (section 8.3 amended); `lactose-physics-api` is listed
+    under `[harness]`.
+  - Predicted-origin bodies with no alias yet are kept in a set carried with the sync state and
+    only those are looked up at a sync point; a bind is permanent, so a bound body's alias stays
+    until the body is removed and the cost no longer grows with the bound bodies (50,000 resting
+    bodies: 1.34 ms with bound predicted keys against 1.28 ms with `Net` keys, from 7.69 ms when
+    the first implementation rebuilt the alias map from every predicted body each tick, caught
+    by the review); a body or event the backend reports twice is ordered by value after its key,
+    so the copy kept does not depend on the backend's order.
+  - A `Stage::Physics` write to a body the step reports is overwritten by the write-back, and
+    one to a body it does not report is pushed at the next sync, so game code writes a body's
+    rows there never.
+  - After a rollback, a bind made after the restore point resolves from the first re-simulated
+    physics sync point on, since the world keeps binds across a restore (D114).
+  - SOUR's prediction scene carries the conformance scene's pending work at the rollback tick
+    and records the physics bookkeeping as well as the rows: a claimed test row holds
+    `Physics::body_count` and whether the body despawned on the rollback tick is still a body,
+    rewritten every tick in `Stage::Post`. A restore that drops any part of the carried work, a
+    lost structural-log removal included, therefore changes a recorded hash even where the test
+    backend moves no row; all six restore mutations the reviews wrote fail `cargo xtask sour run
+    --pr` on its own.
+  - `lactose-physics-api` may depend on `tracing`.
+  - Measured at 100k entities with 2,000 moved bodies (release build, load average about 3.5):
+    sync 0.96 ms, write-back 0.42 ms; the two column scans (`changed_since` over `Transform` and
+    `Collider`, about 0.75 ms together) wait on the chunk-skipping item in the verification
+    list.
+- Driven by: milestone 1, the `physics-api` facade brief, its two design reviews and the
+  implementation's reviews
   (2026-10-10).
 
 **D120. The `input` facade: what sections 4, 5.3, 6.1, 8.2 and 9.2 left open** (§3, §4, §5.3,

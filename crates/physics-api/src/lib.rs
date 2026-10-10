@@ -9,9 +9,8 @@
 //!
 //! # Status
 //!
-//! A facade: every public signature is final and every body that decides anything is
-//! `todo!()`. The implementation lane replaces the bodies behind this surface and removes
-//! the crate-level `allow` with the last `todo!()`.
+//! Implemented against the naive ECS and tested against a test backend (`tests/common`);
+//! the surface is frozen once `lactose-physics-rapier` passes [`conformance`].
 //!
 //! # Where to start
 //!
@@ -49,12 +48,6 @@
 //! ```
 
 #![forbid(unsafe_code)]
-#![allow(
-    dead_code,
-    unused_variables,
-    reason = "facade: every body is `todo!()` until the implementation lane replaces it, and \
-              the fields and parameters it will use are declared now"
-)]
 
 mod backend;
 mod command;
@@ -63,6 +56,7 @@ pub mod conformance;
 mod event;
 mod query;
 mod service;
+mod sync;
 mod systems;
 
 pub use backend::{BodyDesc, BodyState, PhysicsBackend, StepInput, StepOutput};

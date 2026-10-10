@@ -599,9 +599,11 @@ dependency allowlist in `crate-tiers.toml`, checked by `cargo xtask boundary`; `
 `clippy.toml` as well, since the code they emit is compiled inside boundary crates.
 No custom lint crate. Miri runs on nightly as the one exception to the stable-toolchain rule.
 Because Cargo resolves features per build, CI dumps `cargo tree -e features` for the boundary
-dependencies of each shipped binary and of the SOUR test crate and requires them identical;
-the SOUR test crate's dependency set mirrors the server binary; and the resolved feature set
-is part of the boundary build ID.
+dependencies of each shipped binary, the SOUR test crate among them, and requires them
+identical; every other package whose tests run under SOUR must compile each boundary package
+it shares with them at the same version and with the same features; the SOUR test crate's
+dependency set mirrors the server binary; and the resolved feature set is part of the boundary
+build ID.
 
 ## 9. Networking
 

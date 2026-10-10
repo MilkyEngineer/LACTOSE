@@ -194,7 +194,8 @@ schedule is built and prepared at `build`, so a `ScheduleError` is a build error
    exclusive system placed there, then the stages' systems. The tick advances by one.
 3. Trims the structural change log of the entries older than the builder's
    `log_retention` (120 ticks by default): the step keeps a ring of one
-   `StructuralLog::cursor` per step and trims to the oldest with
+   `StructuralLog::cursor` per step, seeded with the log's end at `build` so the first
+   steps' entries are kept like every later step's, and trims to the oldest with
    `World::trim_structural_log`, which ignores a cursor made stale by a restore, a load or
    the stamp rebase, so those heal on their own. A consumer whose `LogCursor` has fallen
    further behind gets `None` from `StructuralLog::since` and does a full pass; no consumer

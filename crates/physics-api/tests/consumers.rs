@@ -1,8 +1,8 @@
-//! Compile-only consumer sketches against the facade: what a game crate, `anim`, a backend
-//! crate, `app` and `predict` write, type-checked and never run (every deciding body of
-//! the crate is `todo!()`). They pin the surface the README promises: a change that breaks
-//! one is a signature change to list. The registrations of sections 1 and 2 build under
-//! the real `ScheduleBuilder` (the round-1 review's probe E).
+//! Consumer sketches against the surface: what a game crate, `anim`, a backend crate, `app`
+//! and `predict` write, type-checked, and `app`'s build run for each world kind so the
+//! registrations of sections 1 and 2 are shown to build under the real schedule (the
+//! round-1 review's probe E). They pin the surface the README promises: a change that
+//! breaks one is a signature change to list.
 
 #![forbid(unsafe_code)]
 #![allow(dead_code, unused_variables, missing_docs)]
@@ -300,6 +300,35 @@ fn app_build(kind: WorldKind) -> Result<Simulation> {
         .systems(register_systems_game)
         .systems(register_systems_anim)
         .build()
+}
+
+/// Sections 1 and 2 each build beside this crate's systems in every world kind. Together
+/// they do not: `sketch::spawn_ragdoll` reads `Transform` in `Stage::Simulation` and
+/// `sketch::respawn` declares writing it, with no set to order them by, so `app_build`
+/// above fails until `anim` puts its systems in a set `app` can order.
+#[test]
+fn the_sketches_build_in_every_world_kind() {
+    let build = |kind: WorldKind, game: bool| {
+        let mut types = TypeTable::new();
+        register_types_game(&mut types)?;
+        types.register::<Bone>()?;
+        let backend = backend_with_pool();
+        let builder = SimulationBuilder::new(kind, types)
+            .setup(move |world| setup(world, backend, PhysicsConfig::default()))
+            .systems(register_systems);
+        if game {
+            builder.systems(register_systems_game).build()
+        } else {
+            builder.systems(register_systems_anim).build()
+        }
+    };
+    for kind in [WorldKind::Server, WorldKind::Prediction, WorldKind::Client] {
+        for game in [true, false] {
+            if let Err(error) = build(kind, game) {
+                panic!("{kind:?}, {}: {error}", if game { "section 1" } else { "section 2" });
+            }
+        }
+    }
 }
 
 // ---- 5. predict: snapshot beside the world's, restore after it, corrections named ----

@@ -400,10 +400,12 @@ fn the_log_is_trimmed_to_the_retention_and_a_lagging_consumer_sees_none() {
         // One structural change per tick.
         simulation.world_mut().spawn(net(n), region, (Health(1),)).unwrap();
         simulation = step(&executor, simulation, TickInput::default());
-        // The ring is full once it holds the end of `RETENTION + 1` steps.
-        if n > u64::from(RETENTION) {
-            assert_eq!(retained(&simulation), RETENTION as usize, "after step {n}");
-        }
+        // The ring is full once it holds the end of `RETENTION + 1` steps; before that,
+        // nothing is trimmed, the first step's entries included (the ring starts with the
+        // log's end at build: it once started empty and trimmed the first step's entries at
+        // its end, so a consumer whose cursor stood inside tick 1 found it stale).
+        let expected = n.min(u64::from(RETENTION)) as usize;
+        assert_eq!(retained(&simulation), expected, "after step {n}");
         if n == 10 {
             lagging = Some(simulation.world().structural_log().cursor());
         }
