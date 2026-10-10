@@ -243,7 +243,7 @@ impl Pass<'_> {
         let modes: BTreeMap<RegionId, RegionMode> = self
             .world
             .regions()
-            .filter_map(|region| Some((region, self.world.region(region)?.mode)))
+            .filter_map(|region| Some((region, self.world.region_mode(region)?)))
             .collect();
         let changed: BTreeSet<RegionId> = modes
             .iter()

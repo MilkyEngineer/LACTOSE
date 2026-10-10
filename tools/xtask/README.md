@@ -17,7 +17,7 @@ it is out of date.
 |---|---|
 | `tiers` | `crate-tiers.toml` against the workspace (architecture section 3) |
 | `boundary` | the file facts of the determinism boundary and the unsafe policy (sections 8.2, 8.3, 20, 21) |
-| `features` | identical boundary feature trees across shipped binaries and harness packages (section 8.3) |
+| `features` | identical boundary feature trees across shipped binaries, and the same features for every package two roots share where one is a harness package (section 8.3) |
 | `sour run`, `sour compare`, `sour self-test`, `sour matrix` | SOUR, the determinism harness (section 8.3) |
 
 Findings are printed to standard output as `path: message`, one per line, and nothing else
@@ -78,9 +78,13 @@ not seen.
 For each root package and each platform CI builds for, `cargo tree --target <triple>` gives
 the resolved features of every package. The check keeps the boundary crates and everything
 below them, tells packages compiled for the host (build-dependencies, proc macros and what
-they pull in) from packages compiled for the target, and requires the result to be the same
-for every root. The roots are `[feature_roots]` and `[harness]`; a harness package's tree
-includes its dev-dependencies. `--package <name>` (repeatable) compares the named packages
+they pull in) from packages compiled for the target, and requires the results to agree.
+The roots are `[feature_roots]` and `[harness]`; a harness package's tree includes its
+dev-dependencies. The shipped binaries' trees must be identical: the same packages with the
+same features. A harness package that is not a shipped binary is compared with every other
+root on the packages both trees hold, each of which must have the same features; it may
+hold packages another root lacks (itself, its own dev-dependencies) and lack packages
+another holds, since two harness packages always differ that way. `--package <name>` (repeatable) compares the named packages
 instead. A workspace package named `lactose-app-*` that is not in `[feature_roots]` is a
 finding.
 

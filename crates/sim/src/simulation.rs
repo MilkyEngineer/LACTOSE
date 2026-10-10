@@ -285,6 +285,9 @@ impl SimulationBuilder {
         }
         save.prepare(&world).map_err(schedule_error)?;
 
+        // The ring starts with the log's end at build, so the first steps keep their entries
+        // like every later one: trimmed only once `log_retention` steps have passed them.
+        let built = world.structural_log().cursor();
         Ok(Simulation {
             world,
             core: Core {
@@ -294,7 +297,7 @@ impl SimulationBuilder {
                 save,
                 hashers,
                 log_retention: self.log_retention,
-                log_cursors: VecDeque::new(),
+                log_cursors: VecDeque::from([built]),
             },
         })
     }
@@ -330,8 +333,8 @@ struct Core {
     save: Schedule,
     hashers: Hashers,
     log_retention: u32,
-    /// The structural log's end after each of the last `log_retention + 1` steps, oldest
-    /// first: the log is trimmed to the oldest.
+    /// The structural log's end at build and after each step, the last `log_retention + 1`
+    /// of them, oldest first: the log is trimmed to the oldest.
     log_cursors: VecDeque<LogCursor>,
 }
 

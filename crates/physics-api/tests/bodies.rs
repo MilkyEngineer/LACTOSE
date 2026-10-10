@@ -159,12 +159,10 @@ fn a_prediction_world_hands_the_effective_body() {
     let proxy = key(1);
     let claimed = key(2);
     let scenery = key(3);
-    // Rows with a `Velocity`, so the first write-back adds none: `lactose-sim` trims the
-    // structural log to the end of the first step, so a log entry after the sync's cursor
-    // in tick 1 makes the second sync a full diff (reported as a finding on `lactose-sim`).
-    h.spawn(proxy, (at(0, 0, 0), Velocity::ZERO, RigidBody::dynamic(), sphere()));
+    // No `Velocity` on the claimed row: the first write-back adds one.
+    h.spawn(proxy, (at(0, 0, 0), RigidBody::dynamic(), sphere()));
     let claim = ClaimedBy { player: PLAYER };
-    h.spawn(claimed, (at(3, 0, 0), Velocity::ZERO, RigidBody::dynamic(), sphere(), claim));
+    h.spawn(claimed, (at(3, 0, 0), RigidBody::dynamic(), sphere(), claim));
     h.spawn(scenery, (at(6, 0, 0), sphere()));
     h = h.run(1);
     let calls = sync_calls(&h.take());
@@ -266,4 +264,25 @@ fn a_region_mode_change_freezes_and_thaws_every_body_of_the_region() {
     // A mode change made between ticks reaches the sync of the next tick once.
     h = h.run(1);
     assert_eq!(sync_calls(&h.take()), []);
+}
+
+/// The log entries a tick-1 post stage makes after the sync's cursor (a spawn, the
+/// write-back's added `Velocity`) are read by the tick-2 sync, which is incremental:
+/// `lactose-sim` once trimmed the log to the end of its first step, which made the second
+/// sync a full diff that pushed every body.
+#[test]
+fn the_second_sync_reads_what_the_first_tick_logged_after_it() {
+    let mut h = Harness::new(WorldKind::Server);
+    let source = key(1);
+    h.spawn(source, (at(0, 0, 0), RigidBody::dynamic(), sphere()));
+    h.spawn(key(2), (at(5, 0, 0), sphere()));
+    h.script().at(1, When::Post, source, Action::Spawn(at(0, 9, 0)));
+    h = h.run(1);
+    h.take();
+    assert!(h.world().get::<Velocity>(source).is_some(), "the write-back added one");
+    h = h.run(1);
+    let calls = sync_calls(&h.take());
+    assert_eq!(calls.len(), 1, "{calls:?}");
+    assert!(matches!(calls[0], Call::CreateBody { .. }));
+    assert!(![Some(source), Some(key(2))].contains(&calls[0].key()), "the spawned body");
 }

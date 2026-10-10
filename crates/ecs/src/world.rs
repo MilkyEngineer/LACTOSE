@@ -897,6 +897,14 @@ impl World {
         })
     }
 
+    /// The mode of `region`, or `None` if it is not loaded. Unlike
+    /// [`region`](Self::region), which counts the region's entities, it costs a lookup: what
+    /// a consumer that reads every region's mode at every sync point calls.
+    #[must_use]
+    pub fn region_mode(&self, region: RegionId) -> Option<RegionMode> {
+        self.regions.get(&region).map(|state| state.mode)
+    }
+
     /// The loaded regions, in ascending ID order.
     #[must_use]
     pub fn regions(&self) -> Regions<'_> {

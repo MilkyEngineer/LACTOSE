@@ -441,10 +441,8 @@ backend of `tests/common/fake.rs` (which records every call, integrates velociti
 reports every moved body and snapshots its state as bytes), asserting on calls, counts,
 orders, bytes and hashes and never on timing. The scenes named "probe" are the design
 reviews' probes in their rewritten (round 2) form. `tests/sour.rs` records under SOUR,
-which runs the package in workers, repeat, layout and chaos modes once it is listed under
-`[harness]` in `tools/xtask/ci-policy.toml`; the feature-tree check refuses two harness
-packages whose boundary trees differ in membership, which this package's and
-`lactose-sim`'s must, so the listing waits on that check. What waits on the backend lane: the conformance run with
+which runs the package in workers, repeat, layout and chaos modes (`[harness]` in
+`tools/xtask/ci-policy.toml`). What waits on the backend lane: the conformance run with
 Rapier, and the size and time of Rapier's snapshot bytes.
 
 | What | How |

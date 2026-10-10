@@ -39,6 +39,7 @@ and list what changed, because `sim`, `predict`, `physics-api`, `net`, `persist`
 | `ChangeMark`, `World::changed_since`, `World::is_current`, `World::columns`, `ColumnMut`, `DirtyRows`, `StructuralLog`, `LogCursor` | Change state read per consumer; whole-column access that records what it changed |
 | `Query`, `QueryItems` | Whole-world iteration for exclusive code and tests, in key order |
 | `WorldSnapshot` | The prediction world's rollback state |
+| `World::region_mode` | A loaded region's mode in one lookup, for a consumer that reads every region's mode at every sync point (`World::region` counts the region's entities) |
 | `World::load_region`, `World::export_region`, `RegionRows` | Bulk copy of region rows and resources to and from `lactose_bundle` documents |
 
 The hidden `__private` module and the hidden items of `SystemDescriptor`, `Bundle`,

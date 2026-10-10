@@ -70,6 +70,22 @@ fn only_simulated_regions_run_and_a_missing_region_resource_skips_one() {
     assert_eq!(world.region(FROZEN).unwrap().mode, RegionMode::Simulated);
 }
 
+#[test]
+fn region_mode_is_the_mode_region_reports() {
+    let mut world = world(WorldKind::Server, LayoutConfig::default());
+    world.create_region(RegionConfig { id: FROZEN, seed: 1, mode: RegionMode::Frozen }).unwrap();
+    world.spawn(net(1), FROZEN, (Counter(0),)).unwrap();
+    for region in [REGION, FROZEN] {
+        assert_eq!(world.region_mode(region), world.region(region).map(|info| info.mode));
+    }
+    assert_eq!(world.region_mode(FROZEN), Some(RegionMode::Frozen));
+    world.set_region_mode(FROZEN, RegionMode::Replicated).unwrap();
+    assert_eq!(world.region_mode(FROZEN), Some(RegionMode::Replicated));
+    world.unload_region(FROZEN).unwrap();
+    assert_eq!(world.region_mode(FROZEN), None, "an unloaded region has no mode");
+    assert_eq!(world.region_mode(RegionId(999)), None);
+}
+
 /// A region resource with a reference (review of the implementation, M5).
 #[lactose_reflect::resource(key = "test::boss", persistent)]
 #[derive(Debug)]

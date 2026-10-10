@@ -142,9 +142,7 @@ fn only_rows_whose_bytes_changed_are_stamped() {
 
 #[test]
 fn a_body_without_velocity_gains_one_at_its_first_write_back() {
-    // Spawned after the first tick: `lactose-sim` trims the log to the end of the first
-    // step, so the first write-back's additions would make the second sync a full diff.
-    let mut h = Harness::new(WorldKind::Server).run(1);
+    let mut h = Harness::new(WorldKind::Server);
     let body = key(1);
     h.spawn(body, (at(0, 0, 0), RigidBody::dynamic(), sphere()));
     h = h.run(1);
