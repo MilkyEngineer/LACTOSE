@@ -118,6 +118,7 @@ fn an_exhausted_log_hands_over_to_free_scheduling() {
     // Replay one recorded run, then keep going past the end of the log.
     let replaying = builder().replay(log).build().unwrap();
     assert!(replaying.execution_log().is_none(), "replay alone does not record");
+    assert_eq!(replaying.chaos_config(), Some(ChaosConfig::default()));
     let placement = Placement::default();
     let mut graph = workload(&placement);
     for _ in 0..3 {
@@ -158,6 +159,7 @@ fn every_chaos_option_keeps_runs_correct() {
         executor.block_on(executor.run_graph(graph(vec![node], &[]))).unwrap();
         assert!(hits.iter().all(|hit| hit.load(Ordering::Relaxed) == 1));
         assert_eq!(executor.execution_log().is_some(), chaos.record);
+        assert_eq!(executor.chaos_config(), Some(chaos), "the executor reports what it runs");
         executor.shutdown();
     }
 }
@@ -167,6 +169,7 @@ fn without_chaos_nothing_is_recorded() {
     let executor = builder().build().unwrap();
     executor.block_on(executor.run_graph(workload(&Placement::default()))).unwrap();
     assert!(executor.execution_log().is_none());
+    assert_eq!(executor.chaos_config(), None);
     executor.shutdown();
 }
 
