@@ -1,0 +1,35 @@
+[package]
+name = "lactose-physics-rapier"
+description = "The physics backend over Rapier: bodies, colliders and joints keyed by StableKey, the step, contact events, queries, and the whole-world snapshot with shapes carried as values."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+# The plain-data byte images of the rows the bookkeeping keeps, in the snapshot.
+bytemuck.workspace = true
+lactose-core.workspace = true
+lactose-math.workspace = true
+# The trait this crate implements and the row types it is told about.
+lactose-physics-api.workspace = true
+# The snapshot byte format (README.md, "The snapshot bytes").
+postcard.workspace = true
+# The solver, patched (vendor/README.md). `parry3d-f64`, `glamx` and `nalgebra` are named
+# through its re-exports.
+rapier3d-f64.workspace = true
+# The solver pool `app` builds and hands to `backend`.
+rayon.workspace = true
+serde.workspace = true
+# Refused values, dropped commands and unknown keys at target `quark`.
+tracing.workspace = true
+
+[dev-dependencies]
+lactose-ecs.workspace = true
+lactose-reflect.workspace = true
+lactose-sim.workspace = true
+# The SOUR test builds its executor the way a SOUR test does (`ChaosConfig`).
+lactose-task.workspace = true
+
+[lints]
+workspace = true
