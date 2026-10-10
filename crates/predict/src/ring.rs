@@ -108,7 +108,9 @@ struct Slot {
     world: WorldSnapshot,
     /// The physics world after the tick and the sync's pending work, if the world has
     /// physics and the snapshot succeeded; `None` otherwise, and a restore to this slot
-    /// restores the world alone.
+    /// restores the world alone. A slot taken again right after a restore from it (a
+    /// correction's re-take) keeps `None` when it had none: the physics was not restored
+    /// to this tick, and a snapshot then would hold a later tick's solver state.
     physics: Option<PhysicsSnapshot>,
     /// The frame that produced the tick, as `app` handed it to the step: the local
     /// player's sample (replaced when the server reports a substitution or the repair

@@ -9,13 +9,13 @@
 use std::sync::Arc;
 use std::sync::mpsc::Receiver;
 
-use lactose_core::{NetId, PlayerId, Result, StableKey, Tick};
+use lactose_core::{NetId, PlayerId, Result, StableKey, SystemKey, Tick};
 use lactose_ecs::{Executor, Mut, Res, SystemDescriptor, World, WorldKind, system};
 use lactose_input::{PlayerInput, PlayerInputApplier};
 use lactose_net_api::{StagedFrame, StagedInbox};
 use lactose_physics_api::{PhysicsBackend, PhysicsConfig, Transform, Velocity};
 use lactose_predict::{
-    Correction, DEFAULT_DEPTH, EXCLUSIVE_SETS, LocalPlayer, PredictError, PredictionStats,
+    Correction, DEFAULT_DEPTH, EXCLUSIVE_SYSTEMS, LocalPlayer, PredictError, PredictionStats,
     Predictor, Reconciled, ResyncReason, SlotBytes, check_prediction_reads,
 };
 use lactose_reflect::{Registry, component};
@@ -75,7 +75,7 @@ pub fn register_systems(registration: &mut Registration) {
 fn check(registry: &Registry) -> Result<()> {
     let systems: [&'static SystemDescriptor; 4] = [&FALL, &REMINISCE, &WRITE_DIARY, &SWEEP];
     let _physics_sync_is_allowed =
-        EXCLUSIVE_SETS.iter().any(|set| set.name() == lactose_physics_api::sets::SYNC.name());
+        EXCLUSIVE_SYSTEMS.contains(&SystemKey::from_name("physics_api::sync"));
     check_prediction_reads(registry, &systems)
 }
 

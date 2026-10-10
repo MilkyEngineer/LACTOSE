@@ -20,10 +20,11 @@ use lactose_sim::{Simulation, TickInput};
 use crate::reconcile::{PredictionStats, Reconciled};
 use crate::ring::Ring;
 
-/// The ring depth a predictor starts with: sixty ticks, one second at the tick rate, which
-/// covers a 100 ms round trip's lead plus the redundancy window several times over. `app`
-/// replaces it with the frame re-simulation budget divided by the per-tick cost it
-/// measures, under its own cap ([`Predictor::set_depth`]).
+/// The ring depth a predictor starts with: sixty ticks, one second at the tick rate, a
+/// placeholder and not a sized value. `app` replaces it with the frame re-simulation
+/// budget divided by the per-tick cost it measures, under its own cap
+/// ([`Predictor::set_depth`]), before it relies on a correction costing no lead: a
+/// rollback to the oldest slot of an unsized ring may overrun the frame (D122).
 pub const DEFAULT_DEPTH: u32 = 60;
 
 /// Who the prediction world predicts for: the player the server assigned on join
@@ -57,10 +58,12 @@ pub struct Predictor {
     /// every slot carries a physics snapshot and every restore restores it, and a step
     /// after the presence changed is refused.
     physics: bool,
-    /// The last region each entity the local player has claimed was seen in, for the
-    /// entities some slot's record still holds or a popped frame still names: where a
-    /// correction re-spawns an entity the prediction world despawned too early. Pruned to
-    /// those keys after every ring change, so it is bounded by the ring's claimed entities.
+    /// The region each entity the local player has claimed was last seen in, from the
+    /// first fact or record that named it until the server's tombstone or release fact
+    /// for it is reconciled; never dropped for the ring's age, so an entity the
+    /// prediction world despawned too early is re-spawned by its next fact however long
+    /// the server left it unchanged. Bounded by the server's live claims for the player.
+    /// Kept across `resync`.
     known: BTreeMap<StableKey, RegionId>,
 }
 
@@ -69,14 +72,15 @@ impl Predictor {
     /// between runs (`InvalidData` otherwise) holding a `lactose_net_api::StagedInbox`
     /// (`NotFound` otherwise); on either refusal the simulation is dropped with the error,
     /// as a wrong build would be. Replaces whatever `dyn StagedState` service the world
-    /// holds with a [`PredictionHook`](crate::PredictionHook) for `local`, inserts the
-    /// record the hook fills beside it, takes the ring's first slot at the simulation's
-    /// current tick (the join tick plus the lead `app` built it at, before any step), and
-    /// tells the world its rollback horizon. `depth` is the ring depth, at least two
-    /// (`InvalidData` otherwise). If the world holds a `lactose_physics_api::Physics`
-    /// resource, every slot from now on carries a physics snapshot taken right after the
-    /// world's and every restore restores it; a world without one rolls back its rows
-    /// alone; a later change of that presence makes [`step`](Self::step) refuse.
+    /// holds with a [`PredictionHook`](crate::PredictionHook), inserts the record the
+    /// hook fills beside it, which holds `local` (the one copy), takes the ring's first
+    /// slot at the simulation's current tick (the join tick plus the lead `app` built it
+    /// at, before any step), and tells the world its rollback horizon. `depth` is the
+    /// ring depth, at least two (`InvalidData` otherwise). If the world holds a
+    /// `lactose_physics_api::Physics` resource, every slot from now on carries a physics
+    /// snapshot taken right after the world's and every restore restores it; a world
+    /// without one rolls back its rows alone; a later change of that presence makes
+    /// [`step`](Self::step) refuse.
     pub fn new(simulation: Simulation, local: LocalPlayer, depth: u32) -> Result<Self> {
         todo!()
     }
@@ -114,7 +118,8 @@ impl Predictor {
     /// lifecycle's asset failures. A write to simulation state here is an unjournaled
     /// edit the ring does not hold and a rollback undoes (`crates/sim/README.md`); a
     /// `dyn StagedState` inserted over the hook is caught by the next
-    /// [`step`](Self::step), which refuses when the hook did not run.
+    /// [`step`](Self::step), which refuses when the hook did not run, and repaired by
+    /// [`resync`](Self::resync), which reinstalls it.
     pub fn simulation_mut(&mut self) -> &mut Simulation {
         &mut self.simulation
     }
@@ -145,7 +150,10 @@ impl Predictor {
     /// Re-synchronises the prediction world to `tick`, between runs: `World::set_tick`,
     /// the ring emptied and a fresh first slot taken at `tick` with
     /// [`Ring::rebuilt_at`] set to it, the horizon moved there, the record cleared and the
-    /// known regions kept. What `app` calls when [`Reconciled::resync`] is `Some`, with
+    /// hook reinstalled over whatever `dyn StagedState` the world holds (the repair for
+    /// one inserted over it), and the known regions kept, since only the server's
+    /// tombstone or release facts drop them. What `app` calls when
+    /// [`Reconciled::resync`] is `Some`, with
     /// the tick it wants the world at (the server's tick plus the lead it runs ahead by);
     /// the frames still queued in the inbox are then from before the restart and are
     /// skipped rather than `TooOld`, so one resync is one resync. The full frame `app`
@@ -172,7 +180,7 @@ impl Predictor {
     /// handed back if the hook did not run in it (a `dyn StagedState` inserted over it)
     /// or the world's `Physics` presence is not what it was at
     /// [`new`](Self::new); the ring is consistent, and nothing is reconciled until `app`
-    /// repairs its world.
+    /// calls [`resync`](Self::resync), which reinstalls the hook.
     ///
     /// The future is `Send` and is driven by the task that owns the predictor. It resolves
     /// to a [`PredictError`] with the predictor inside when the step failed before anything

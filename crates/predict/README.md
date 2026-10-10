@@ -43,7 +43,7 @@ breaks one is a signature change to list.
 | `PredictionHook` | The `StagedState` hook `Predictor::new` installs: the frames applied inside the tick, the proxies moved along their history, the claimed entities' facts recorded |
 | `Reconciled`, `Correction`, `CorrectionCause`, `Divergence`, `ResyncReason` | What one reconciliation did: the ticks confirmed, every correction with its depth, cause, entities and divergence, the ticks re-simulated, and whether the world must resync |
 | `PredictionStats` | The monotonic counters the milestone 1 spike records: ticks predicted and re-simulated, frames, corrections, mismatched fields and entities, substitutions, unechoed spawns, resyncs, slots without physics, the deepest correction |
-| `check_prediction_reads`, `prediction_may_name`, `EXCLUSIVE_SETS` | The build check of D121: a prediction-world system may name only replicated, transient or derived components, and an exclusive one must be in a named engine set |
+| `check_prediction_reads`, `prediction_may_name`, `EXCLUSIVE_SYSTEMS` | The build check of D121: a prediction-world system may name only replicated, transient or derived components, and an exclusive one must be one of the engine's, by system key |
 
 Hidden plumbing: none. The record the hook fills and the predictor reads is a
 crate-private service resource of the prediction world; the ring's slot is a private type,
@@ -126,9 +126,10 @@ step and rebuilds the world there ("Reconciliation" below).
   `StagedInbox` (`lactose_net_api::setup` inserted it); any other kind is `InvalidData`
   and a missing inbox `NotFound`, and the simulation is dropped with the error, as a
   wrong build would be. It replaces whatever `dyn StagedState` service the world holds
-  (a builder's `staged_state` included) with a [`PredictionHook`] for `local`, inserts
-  the record the hook fills, takes the ring's first slot at the simulation's current
-  tick, and calls `World::set_rollback_horizon` with it. If the world holds a `Physics`
+  (a builder's `staged_state` included) with a [`PredictionHook`], inserts the record
+  the hook fills, which holds `local` (the one copy; the hook holds nothing), takes the
+  ring's first slot at the simulation's current tick, and calls
+  `World::set_rollback_horizon` with it. If the world holds a `Physics`
   resource then, every slot carries a physics snapshot and every restore restores it; a
   world without one rolls back its rows alone. Whether the world holds `Physics` is fixed
   at `new`: a `step` after it changed resolves to `InvalidData` with the predictor handed
@@ -150,7 +151,8 @@ step and rebuilds the world there ("Reconciliation" below).
 - The hook must run in every step: it writes the tick it ran at into the record, and a
   `step` whose tick the hook did not write resolves to `InvalidData` with the predictor
   handed back, the slot taken, so a `dyn StagedState` inserted over the hook through
-  `simulation_mut()` is caught at the next step rather than reconciling nothing forever.
+  `simulation_mut()` is caught at the next step rather than reconciling nothing forever;
+  `resync` reinstalls the hook, and is the repair.
 - Between runs `app` does, through `simulation_mut()`, exactly what it does to the
   replicated world: pushes frames into the `StagedInbox`, reads `World::regions` for the
   fold, takes the presentation events and the lifecycle's asset failures. Any other write
@@ -188,9 +190,11 @@ step and rebuilds the world there ("Reconciliation" below).
   entities, never a scan of the world's chunks.
 - The ring keeps the newest `depth` slots and drops the oldest when a newer one is taken;
   `depth` is at least two (the present and one tick to return to; `InvalidData`
-  otherwise), `DEFAULT_DEPTH` is sixty, and `set_depth` applies at once. `app` derives
-  the depth from the frame re-simulation budget divided by the per-tick cost it measured,
-  under its own cap (section 9.4): a rollback to the oldest slot then fits the budget.
+  otherwise), `DEFAULT_DEPTH` is sixty, a placeholder and not a sized value, and
+  `set_depth` applies at once. `app` derives the depth from the frame re-simulation
+  budget divided by the per-tick cost it measured, under its own cap (section 9.4): a
+  rollback to the oldest slot then fits the budget, which is the condition under which
+  a correction costs no lead ("Inputs and re-simulation" below).
 - The oldest slot's tick is the horizon: after every step, correction, `set_depth` and
   `resync` the predictor calls `World::set_rollback_horizon` with it, so the ECS prunes the
   delivered presentation-event keys and the aliases of despawned predicted entities below
@@ -203,7 +207,10 @@ step and rebuilds the world there ("Reconciliation" below).
   physics part, logged and counted (`PredictionStats::slots_without_physics`); a rollback
   to such a slot restores the world alone, and the physics then diffs every row against
   its bookkeeping and converges rather than matches (`crates/physics-api/README.md`,
-  "Snapshot and restore").
+  "Snapshot and restore"). A slot taken again right after a restore from it (a
+  correction's re-take of slot *k*, "Reconciliation" below) keeps `None` when it had
+  none: the physics was not restored to that tick, and a snapshot taken then would hold
+  the present's solver state under an older tick.
 - `Ring::bytes()` and `slot_bytes(tick)` report the world snapshot's, the physics
   snapshot's and the record's bytes. The milestone 1 measurement of the snapshot cost per
   tick, which decides whether copy-on-write snapshots are built, is the implementation
@@ -293,14 +300,18 @@ sync point"; `crates/net-api/README.md`, "The staged frame")
 
 **Reconciliation** (architecture section 9.4)
 
-- `reconcile` takes the frames the hook popped since the last call, oldest first. For a
-  frame of server tick *T* popped at prediction tick *a* (never before *T*: the hook pops
-  frames due at or before its tick), the rules apply in this order:
-  1. A full frame drops every slot before *a* and sets `Ring::rebuilt_at` to *a*; *T* is
-     confirmed; nothing is compared; its `substituted` is ignored.
-  2. While `Ring::rebuilt_at` is `Some(r)`, a frame with *T* before *r* is from before the
-     ring's restart: its facts are skipped (the hook applied its structural content), a
-     substitution or repair at a tick at or before *r* is skipped likewise, and *T* is
+- `reconcile` takes the frames the hook popped since the last call, oldest first. A call
+  first finds the newest full frame it popped; every frame popped before it is from
+  before the restart (rule 2) whatever its tick, and contributes no correction point,
+  substitution or `TooOld`. For a frame of server tick *T* popped at prediction tick *a*
+  (never before *T*: the hook pops frames due at or before its tick), the rules apply in
+  this order:
+  1. The call's newest full frame drops every slot before *a* and sets `Ring::rebuilt_at`
+     to *a*; *T* is confirmed; nothing is compared; its `substituted` is ignored.
+  2. A frame popped before the call's newest full frame, or, while `Ring::rebuilt_at` is
+     `Some(r)`, a frame with *T* before *r*, is from before the ring's restart: its facts
+     are skipped (the hook applied its structural content), its substitutions are skipped
+     likewise, as is any substitution or repair at a tick at or before *r*, and *T* is
      confirmed. Such frames are after the full frame's tick and before the restart; they
      are not older than the ring in any sense that matters.
   3. Otherwise a frame with *T* before `Ring::oldest()` is `ResyncReason::TooOld { frame:
@@ -314,9 +325,15 @@ sync point"; `crates/net-api/README.md`, "The staged frame")
   move (this region); a removal (this component is absent); a tombstone (the entity is
   gone). A fact is compared at slot *T* and nowhere else. A fact about an entity absent
   from slot *T*'s record is a mismatch (the entity is spawned there) if its region (the
-  spawn's or move's, else the last region the ring's records held it in) is loaded in
-  slot *T*, and is skipped and logged otherwise: the region loads at the tick the frame
-  was popped at, and the entity arrives whole with the first frame at or after it.
+  spawn's or move's, else the region the predictor last knew it in) is loaded in slot
+  *T*, and is skipped and logged otherwise: the region loads at the tick the frame was
+  popped at, and the entity arrives whole with the first frame at or after it. The
+  predictor knows the region of every entity the local player has claimed, from the
+  first fact or record that named it until the server's tombstone or release fact for it
+  is reconciled; an entry is never dropped for the ring's age, so an entity the
+  prediction world despawned too early is re-spawned by its next fact however long the
+  server left it unchanged, and `resync` keeps the entries. The map is bounded by the
+  server's live claims for the player.
 - A fact matches when the record of slot *T* agrees: the entity present with `ClaimedBy`
   (absent, for a tombstone; present and unclaimed, for a release), in that region, with
   that component present (absent, for a removal) and equal field by field. Fields are
@@ -340,9 +357,11 @@ sync point"; `crates/net-api/README.md`, "The staged frame")
   `PlayerInput::after_substitute` with slot *u* − 1's sample as replaced, and *u* − 1 is a
   correction point with cause `Repaired`; a frame spans every tick since the previous
   frame, so *u* is found by the tick, never by the frame. A substitution or repair at a
-  tick at or before `Ring::rebuilt_at` is skipped, as the frame's facts are; otherwise one
-  whose *t* − 1 is before the horizon is `TooOld`. The client's own redundancy window is
-  `net`'s and is not touched.
+  tick at or before `Ring::rebuilt_at` is skipped, as the frame's facts are, and a
+  repair whose *u* − 1 substitution was skipped (by that rule, or because its frame was
+  popped before the call's newest full frame) is skipped too; otherwise one whose *t* − 1
+  is before the horizon is `TooOld`. The client's own redundancy window is `net`'s and is
+  not touched.
 - The rollback. The correction point *k* is the oldest tick over the call's frames at
   which a fact does not match or a sample was replaced. Then, in this order:
   1. `World::restore` of slot *k*, then `physics_api::restore` of its physics snapshot at
@@ -366,7 +385,9 @@ sync point"; `crates/net-api/README.md`, "The staged frame")
      the written rows' five columns; with stamped writes the sync's fresh mark after
      `restore` would see the rows anyway, and the backend ignores an equal value.
   4. Slot *k* is taken again, so it holds the corrected state and a later rollback to *k*
-     restores it without re-correcting.
+     restores it without re-correcting. Its physics part is taken again too, unless slot
+     *k* had none: then it stays `None`, since step 1 did not restore the physics and a
+     snapshot now would hold the present's solver state under *k*.
   5. Every tick *j* from *k* + 1 to the present is re-simulated: `Simulation::step` with
      slot *j*'s `TickInput`, its `failures` stripped (the first application stamped them)
      and its sample as replaced, the hook replaying slot *j*'s frames; slot *j* taken
@@ -386,8 +407,10 @@ sync point"; `crates/net-api/README.md`, "The staged frame")
   world ahead (section 9.2); this is the backstop.
 - `Predictor::resync(tick)`: `World::set_tick(tick)` (between runs; it fails during a run
   as `set_tick` does), the ring emptied and a fresh first slot taken at `tick` with
-  `Ring::rebuilt_at` set to `tick`, the horizon set there, the record cleared, the known
-  regions kept, `resyncs` counted. The frames still queued in the inbox (the ones that
+  `Ring::rebuilt_at` set to `tick`, the horizon set there, the record cleared, the hook
+  reinstalled over whatever `dyn StagedState` the world holds, the known regions kept
+  (only a tombstone or release fact drops one), `resyncs` counted. The frames still
+  queued in the inbox (the ones that
   made a `Behind`) are then from before the restart and are skipped, not `TooOld`, so one
   resync is one resync. `app` then requests a full frame, which rebuilds the world through
   the inbox and the `TickInput` as any full frame does; until it arrives the world predicts
@@ -432,15 +455,19 @@ README.md`, "The applier")
   `reconcile`, and the ring never replays them.
 - A rollback's re-simulation runs to the present in the `reconcile` that detects it,
   always: a world left at an older tick would be extracted and presented there. Its length
-  is bounded by the ring depth, which `app` sized from its frame re-simulation budget, and
-  it does not count against the catch-up cap of sections 5.1 and 11 (D122 amends them):
-  a correction never costs the client ticks of lead. Sharing the cap would, since a
-  correction's depth is about a round trip plus margin, more than the cap at 100 ms, and
-  the convergence storm above corrects on consecutive frames; the lead would decay to a
-  world resync faster than clock sync's three percent could restore it. `app` therefore
-  passes zero to `TickPacer::poll` until `lactose-task` drops the parameter (proposed in
-  D122), and `TickBudget::behind` keeps its meaning: catch-up alone owed more than the
-  cap, a clock resync (`TickPacer::resync`), never a world resync.
+  is bounded by the ring depth, and it does not count against the catch-up cap of
+  sections 5.1 and 11 (D122 amends them): a correction costs the client no ticks of lead
+  while the depth times the per-tick cost `app` measured fits the frame's re-simulation
+  budget, which is what `set_depth` is for. `DEFAULT_DEPTH` is a placeholder, not a sized
+  value: with a depth `app` has not sized, a rollback to the oldest slot can overrun the
+  frame, and the ticks the pacer then finds due are catch-up under the cap. Sharing the
+  cap would cost lead on every correction, since a correction's depth is about a round
+  trip plus margin, more than the cap at 100 ms, and the convergence storm above corrects
+  on consecutive frames; the lead would decay to a world resync faster than clock sync's
+  three percent could restore it. `app` therefore passes zero to `TickPacer::poll` until
+  `lactose-task` drops the parameter (proposed in D122), and `TickBudget::behind` keeps
+  its meaning: catch-up alone owed more than the cap, a clock resync
+  (`TickPacer::resync`), never a world resync.
 
 **Presentation** (architecture sections 5.3, 9.4 and 10)
 
@@ -474,12 +501,19 @@ README.md`, "The applier")
   `Without<T>`, `Changed<T>`, `writes = [T]`), and fails with `InvalidData` naming the
   first system and component that break it, or a component the registry lacks. An
   exclusive system reads anything through `&mut World`, which no table shows, so one whose
-  `worlds` include the prediction world must be in one of `EXCLUSIVE_SETS` (`sim`'s
-  `sets::INPUT`, `input`'s `sets::APPLY`, `physics-api`'s `sets::SYNC` and
-  `sets::WRITE_BACK`, the engine's exclusive systems that run there) or it is refused by
-  name; an engine crate that adds one extends the list in the same change, and a game
-  crate never runs an exclusive system in the prediction world. A system whose `worlds`
-  exclude the prediction world is not judged.
+  `worlds` include the prediction world must have its `SystemDescriptor::key` in
+  `EXCLUSIVE_SYSTEMS` or it is refused by name. The list is the engine's exclusive
+  systems that run there, each reviewed for what it reads: `sim::begin_tick`,
+  `sim::apply_frame_regions`, `sim::apply_sessions`, `sim::apply_inputs`,
+  `sim::apply_staged_state` and `sim::apply_region_policy` (`crates/sim/README.md`, "The
+  input sync point"), `input::player_input_writer`, `physics_api::sync` and
+  `physics_api::write_back`. A key is the xxh64 of the declared name, which the schedule
+  rejects a collision of, so a look-alike system in a listed set passes nothing; an
+  engine crate that adds or renames one changes the list in the same commit, and a game
+  crate never runs an exclusive system in the prediction world. Test-support scenes are
+  not shipped and are not listed: `physics-api`'s conformance scene has an exclusive
+  `input_tick` system, and a test of this crate that builds that scene does not run the
+  check. A system whose `worlds` exclude the prediction world is not judged.
 - It runs at the prediction world's build: `app` hands it to the builder as the check
   function D122 proposes (`SimulationBuilder::check`, run after the registration functions
   and before the schedules prepare, so a refused system is a build error with that
@@ -541,10 +575,10 @@ Nothing runs yet. The implementation lane replaces every `todo!()` and proves:
 | The ring | Under SOUR's layout mode: a prediction world stepped `n` ticks, rolled back to each slot and re-simulated with the ring's inputs, hashes equal at every tick to the straight run; the slot's record equals the claimed entities' rows read back; `oldest` and `newest` track the depth; `set_depth` drops and moves the horizon; a frame older than the ring is `TooOld` and nothing changed; a slot taken without physics restores the world alone and is counted |
 | The comparison | Golden cases over a small registry: equal bytes match; each field kind differing is one field; a scalar leaf's NaN with another payload matches, negative zero does not; a missing component, entity, region or claim is a mismatch with no field; a wrong row length is skipped; a fact is compared at slot `T` only, and one whose region slot `T` lacks is skipped |
 | Corrections | A claimed body whose frame differs is corrected at its tick, stamped, and the re-simulated ticks hash equal to a run that had the server's rows from that tick on; a `Changed`-driven derived cache follows the correction; `corrected` received exactly the written keys (the physics test backend records calls); a despawned-too-early entity is re-spawned in its last known region; two frames with facts at two ticks correct once at the older and once at the newer with the right depths; facts are written in frame order under every layout |
-| Substitution | A substituted tick replaces the sample and re-simulates from the tick before; the repair of the first unsubstituted tick after it is found by tick when the frame spans several ticks; both counted; a substitution at or before the restart is skipped and one before the horizon is `TooOld`; the re-simulated world equals a run that had the substitute from the start |
+| Substitution | A substituted tick replaces the sample and re-simulates from the tick before; the repair of the first unsubstituted tick after it is found by tick when the frame spans several ticks; both counted; a substitution at or before the restart is skipped, as is one in a frame popped before the call's newest full frame and the repair that depended on either, and one before the horizon is `TooOld`; the re-simulated world equals a run that had the substitute from the start |
 | The hook | Frames applied in the stated order: proxies spawned, moved, removed, tombstoned; a proxy's `Transform` written for the tick and swept by the sync; a full frame rebuilds, resets the ring, inserts the anchor, and the first frame at or after the rebuild tick corrects once; a claimed entity's spawn, rows and tombstone are not written; an unechoed predicted spawn is despawned at the frame after its input tick and not at that tick's frame; the local entity carries its claim and anchor after every path and `set_local` moves them; `player_entity` resolves; a hook replaced through `simulation_mut` fails the next step with the predictor kept |
-| Resync | A frame left in the inbox after the steps with a tick after the present is `Behind`, one at or before it is not; `resync` empties the ring, sets the tick, the horizon and `rebuilt_at`, the queued frames are skipped rather than `TooOld`, and the next full frame rebuilds |
+| Resync | A frame left in the inbox after the steps with a tick after the present is `Behind`, one at or before it is not; `resync` empties the ring, sets the tick, the horizon and `rebuilt_at`, reinstalls the hook over one inserted through `simulation_mut`, keeps the known regions, the queued frames are skipped rather than `TooOld`, and the next full frame rebuilds |
 | Presentation | A rollback over a tick that emitted an event: the re-emission is not delivered again, an event not re-emitted is cancelled, both in the batch `app` takes after `reconcile`; extract's pass after a rollback is full |
-| The check | A kernel naming a persistent unreplicated component in a `[server, prediction]` system is refused with its names; the same system `[server]` only passes; transient and derived pass; the finalize's table is judged; an exclusive prediction-world system outside `EXCLUSIVE_SETS` is refused and `physics_api::sync` passes |
+| The check | A kernel naming a persistent unreplicated component in a `[server, prediction]` system is refused with its names; the same system `[server]` only passes; transient and derived pass; the finalize's table is judged; an exclusive prediction-world system outside `EXCLUSIVE_SYSTEMS` is refused, one in a listed set under an unlisted name is refused, and `physics_api::sync` passes by key |
 | Cost | `tests/cost.rs`: bytes and microseconds of `World::snapshot` and `physics_api::snapshot` for fifty claimed bodies plus 0 to 10,000 statics with the test backend, printed, against the 100 µs budget; the record's bytes beside them, read through `get_erased` |
 | SOUR | A prediction scene with substitutions and corrections at several ticks, 150 ticks, the re-simulated ticks recorded again and equal, ending with the hashes of the straight run given the same facts |

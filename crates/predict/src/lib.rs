@@ -28,8 +28,8 @@
 //! - [`Reconciled`], [`Correction`], [`Divergence`] and [`PredictionStats`] are the values
 //!   the milestone 1 spike records; nothing here is a log line.
 //! - [`check_prediction_reads`] is the build check of D121: a prediction-world system may
-//!   name only components the server corrects, and an exclusive one must be in
-//!   [`EXCLUSIVE_SETS`].
+//!   name only components the server corrects, and an exclusive one must be one of
+//!   [`EXCLUSIVE_SYSTEMS`].
 //!
 //! ```no_run
 //! use lactose_core::{NetId, PlayerId, StableKey, Tick};
@@ -100,7 +100,7 @@ mod predictor;
 mod reconcile;
 mod ring;
 
-pub use check::{EXCLUSIVE_SETS, check_prediction_reads, prediction_may_name};
+pub use check::{EXCLUSIVE_SYSTEMS, check_prediction_reads, prediction_may_name};
 pub use hook::PredictionHook;
 pub use predictor::{
     DEFAULT_DEPTH, LocalPlayer, PassesRun, PredictError, Predictor, ReconcileRun, StepRun,
@@ -114,8 +114,7 @@ pub use ring::{Ring, SlotBytes};
 /// it without a compile error: the predictor is owned by the timer root, a `'static` task,
 /// and its runs are driven there; the hook is what `sim` takes as its staged-state service;
 /// the ring travels with the predictor; the outcomes and the statistics are plain values
-/// a frame hands across threads; the default depth is a ring, not a slot; and the
-/// exclusive allowlist names the engine's four sets.
+/// a frame hands across threads; and the default depth is a ring, not a slot.
 const _: () = {
     use lactose_sim::StagedState;
 
@@ -140,5 +139,4 @@ const _: () = {
     staged_state::<PredictionHook>();
 
     assert!(DEFAULT_DEPTH >= 2, "a ring holds the present and at least one tick to return to");
-    assert!(EXCLUSIVE_SETS.len() == 4, "the engine's exclusive prediction-world sets");
 };
