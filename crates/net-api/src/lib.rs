@@ -43,10 +43,17 @@
 //!
 //! // Between runs on a client: a frame from the network thread into the world's inbox,
 //! // and its region changes into the step's `TickInput` only if the inbox accepted it.
-//! let frame = std::sync::Arc::new(StagedFrame::new(simulation.tick()));
+//! // The next step advances the world to `tick() + 1` and its hook pops the frames due
+//! // at that tick, so that is the tick `app` asks `due` for.
+//! let next = lactose_core::Tick(simulation.tick().0 + 1);
+//! let frame = std::sync::Arc::new(StagedFrame::new(next));
 //! let inbox = simulation.world_mut().service_mut::<StagedInbox>().expect("setup inserted it");
 //! let accepted = inbox.push(frame);
 //! assert!(accepted);
+//! for due in inbox.due(next) {
+//!     // fold `due.time_scale` and `due.regions` into the step's `TickInput`
+//!     # let _ = due;
+//! }
 //!
 //! // Between runs on the server: the gathered frame out, to the packer.
 //! let gathered = simulation.world_mut().service_mut::<GatherState>().expect("setup").take();

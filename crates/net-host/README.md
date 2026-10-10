@@ -150,12 +150,28 @@ reshape.
   `EntityHandle::CAPACITY` (65536) assigned; `insert` takes the handle's generation for the
   slot, is a no-op for the same (handle, key) again, and fails with `InvalidData` if the
   slot holds another live key, if the slot's generation is newer than the handle's (a
-  spawn reordered after the tombstone that released it), or if the key has a different
-  handle already; `release(handle)` returns the key and advances the slot's generation
-  (wrapping from `u16::MAX` to one), so the released handle never names the slot's next
-  entity; `clear` forgets every assignment and every generation, what the client does
-  before it mirrors a full frame; `key_of` and `release` give `None` for a stale or
-  unassigned handle. `iter` is in ascending key order.
+  spawn reordered after the tombstone that released it; the comparison is wrapping, since
+  generations wrap from `u16::MAX` to one, so "newer" is `slot.wrapping_sub(handle)` in
+  `1..=32767`), or if the key has a different handle already; `release(handle)` returns
+  the key and advances the slot's generation (wrapping from `u16::MAX` to one), so the
+  released handle never names the slot's next entity; `clear` forgets every assignment
+  and every generation, what the client does when it stages a full frame and only then;
+  `key_of` and `release` give `None` for a stale or unassigned handle. `iter` is in
+  ascending key order.
+- The receiver's rules, which keep the mirror equal to the server's table and the inbox's
+  newest-ever-accepted rule true by construction: the receiver stages a server packet
+  only if its header tick is after the newest frame it has staged; any other packet (a
+  late one, a reordered one, a duplicate) it drops whole and does not acknowledge, so the
+  server resends what the packet carried, and no tombstone is applied before its spawn,
+  no row before the row it would replace. From a `ResyncRequest` or `JoinAccepted` until
+  the full frame is staged, it stages nothing and drops every packet whose tick is not
+  after the full frame's (the full frame travels on the reliable channel, and deltas sent
+  after it overtake it), and it clears its handle mirror and its interpolation slots when
+  it stages that frame, not when it asks. On a resync the server clears that client's
+  `ConnectionHandles` and re-enters every relevant entity, so the full frame's spawns
+  carry fresh handles and no handle from before the resync names anything after it.
+  Hence the frames the receiver hands `app` ascend strictly by tick and the full frame is
+  the next frame after the request, and `StagedInbox::push` never refuses one.
 - `PacketSequence` wraps at sixteen bits; `after` is the wrapping difference being
   positive and below 32768, so two sequences in play are less than that apart. `AckField
   { latest, bits }` acknowledges `latest` and, for bit `n` set, `latest - (n + 1)`, a
@@ -186,10 +202,15 @@ reshape.
   frame from distance and staleness (the weights are `net`'s) and resets when the entity
   is sent, so an entity starved by the cap rises until it goes.
 - The packer keeps a mirror of every replicated row of every relevant region, built from
-  the first (full) `StagingFrame` and every later one: rows replace, `Despawned` removes,
-  `Moved` re-homes. Whole sends when an entity enters, resends of lost rows that have not
-  changed since, and the every-field updates of claimed entities all read the mirror; a
-  delta frame holds only changed rows and is never enough on its own.
+  the first (full) `StagingFrame` and every later one: rows replace, `Despawned` removes
+  the entity's rows, `Removed` of a replicated component drops that row, `Moved`
+  re-homes; a full frame replaces the mirror outright, since it carries no structural
+  entries and an entity despawned in the gap would otherwise stay and be resent as a
+  spawn on the resync. Whole sends when an entity enters, resends of lost rows that have
+  not changed since, and the every-field updates of claimed entities all read the mirror;
+  a delta frame holds only changed rows and is never enough on its own. A `Removed` entry
+  becomes `StagedFrame::removed` for every client to whom the entity is relevant, and a
+  `Despawned` entry the tombstone.
 - `regions` is the client's relevant region set under `RelevancePolicy` (region membership
   within `radius` regions of the player's, plus the `always` set); a region entering is
   sent as a `RegionRelevance` and every entity residing in it enters; a region leaving is
@@ -256,16 +277,20 @@ reshape.
   estimator is `net`'s; how the value reaches the timer root is `app`'s.
 - Control messages (`JoinAccepted`, `RegionRelevance`, the time scale, `ClientReady`,
   `OverlayRequest`, `ResyncRequest`) travel on a reliable ordered channel `lactose-net`
-  builds over the transport's datagrams at milestone 4; an overlay exceeds one datagram,
-  so that channel fragments. `JoinAccepted { player, tick }` is the first message after
-  the handshake and before the full frame of the late join: the client builds its worlds
-  at `tick`, so the full frame for `tick` is due at their first sync point, and `player`
-  is what the prediction world's hook and the input packets name. `ClientReady { region,
-  tick }` is the readiness acknowledgement. `OverlayRequest { region }` follows a digest
-  the client cannot match, and is answered with the same `RegionRelevance`, `Full`.
-  `ResyncRequest { tick, reason }` asks for a full frame, for an `AssetFailure` (the
-  tick-stamped event of section 14, from `RegionLifecycle::take_asset_failures`),
-  `BehindCatchUp` (section 11) or `Divergence`. Their encoding is `net`'s.
+  builds over the transport's datagrams at milestone 4; an overlay and a full frame
+  exceed one datagram, so that channel fragments. `JoinAccepted { player, tick }` is the
+  first message after the handshake and before the full frame of the late join: the
+  client builds its worlds at `tick`, so the full frame for `tick` is due at their first
+  sync point, and `player` is what the prediction world's hook and the input packets
+  name. `ClientReady { region, tick }` is the readiness acknowledgement. `OverlayRequest
+  { region }` follows a digest the client cannot match, and is answered with the same
+  `RegionRelevance`, `Full`. `ResyncRequest { tick, reason }` asks for a full frame, for
+  an `AssetFailure` (the tick-stamped event of section 14, from
+  `RegionLifecycle::take_asset_failures`), `BehindCatchUp` (section 11) or `Divergence`.
+  The sequencing of a join or a resync is the receiver rule above: nothing staged from
+  the message until the full frame, every packet not after the full frame's tick dropped,
+  the mirror and slots cleared at the full frame, the server's handle table for the
+  client cleared and refilled. Their encoding is `net`'s.
 
 ## Not in this crate yet
 
@@ -288,7 +313,7 @@ Nothing runs yet. The implementation lane replaces every `todo!()` and proves:
 |---|---|
 | Quantisation | `quantise(dequantise(q)) == q` for positions over a sweep under the 64-bit scalar; saturation at the `i32` and `i16` limits; NaN to zero; `q` and `-q` quantise alike; a rotation stable after one trip; the zero and NaN quaternions to all-zero and back to `IDENTITY`; golden bits of `dequantise` for a small table, equal on x86-64 and aarch64 under SOUR's architecture mode |
 | The handshake | Golden `ProtocolHash` for a small registry, pinned; adding a replicated or persistent type, raising a version, changing a field's ID, offset, size, tag or kind each change it; adding a derived unreplicated type does not; the constants block changes it; `check` reports the first difference in field order; `from_bytes(to_bytes(h)) == h` |
-| Handles and packets | A released slot is reused with the next generation and the old handle is stale; 65536 assignments then `ResourceExhausted`; a client mirror driven by `insert` and `release` equals the server's table after spawns and tombstones delivered in any order, with a reordered stale spawn refused; `clear` then a full frame's inserts; `after` and `covers` across the wrap; the ring evicts the oldest when full, `acknowledge` takes exactly one record, `expire` takes exactly the older ones |
-| Interest | `enter` sends whole until an acknowledgement; a claimed entity is whole in every packet; `acknowledge` advances exactly the carried entities and clears exactly the acknowledged `in_flight`; an expired packet re-queues its entities; an acknowledged tombstone releases the handle; the mirror after a sequence of frames equals the server's replicated rows |
+| Handles and packets | A released slot is reused with the next generation and the old handle is stale, across the generation wrap; 65536 assignments then `ResourceExhausted`; a client mirror driven by the receiver rules (`insert` and `release` for staged packets, late and reordered packets dropped whole) equals the server's table after spawns and tombstones delivered in any order, a tombstone overtaking its spawn included, with the reordered spawn dropped and resent; `clear` at the full frame then its inserts, with a pre-resync handle naming nothing; a full frame overtaken by later deltas is staged first and the deltas dropped and resent; `after` and `covers` across the wrap; the ring evicts the oldest when full, `acknowledge` takes exactly one record, `expire` takes exactly the older ones |
+| Interest | `enter` sends whole until an acknowledgement; a claimed entity is whole in every packet; `acknowledge` advances exactly the carried entities and clears exactly the acknowledged `in_flight`; an expired packet re-queues its entities; an acknowledged tombstone releases the handle; a resync clears and refills the client's handles; the mirror after a sequence of frames equals the server's replicated rows, a removed component gone, and a full frame replaces it with an entity despawned in the gap gone |
 | The interpolation buffer | A loom model or a stress test with a checksum word: under one writer and several readers every sample is a state that was pushed, never a mix, with the stated orderings; `sample` cases: bracketed, held newest, held oldest, held on either side of a teleport by `teleported`, missing after release and under a stale generation; a push older than the ring is dropped and an equal tick replaces; out-of-order pushes give the same ring; `sample_batch` equals `sample` per slot and allocates nothing (a counting allocator in the test) |
 | The transport | The loopback sketch under the trait's contract: event order per connection, the size limit, `NotFound` after `disconnect`, `rtt` zero |

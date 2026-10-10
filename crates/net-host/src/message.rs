@@ -16,8 +16,11 @@ use lactose_sim::AssetFailureEvent;
 /// tick the client's worlds start at. The first message after the handshake, before the
 /// full frame that is the late join: the client builds its replicated world at `tick`
 /// (`SimulationBuilder::tick`), or `set_tick`s one it has, so that the full frame for
-/// `tick` is due at its first sync point. Further fields (the player's region, the
-/// server's send rate) are milestone 4's.
+/// `tick` is due at its first sync point. From this message until the full frame for
+/// `tick` is staged the receiver stages nothing and drops every packet whose tick is not
+/// after `tick` (the full frame travels on the reliable channel and deltas sent after it
+/// overtake it), and it clears its handle mirror and slots when it stages that frame.
+/// Further fields (the player's region, the server's send rate) are milestone 4's.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct JoinAccepted {
     /// The player, as the server assigned it; what the prediction world's hook and the
@@ -61,7 +64,10 @@ pub enum ResyncReason {
 
 /// A request for a full relevance-set snapshot (a
 /// [`StagedFrame`](lactose_net_api::StagedFrame) with `full` set), the one path late join
-/// and resync share (architecture section 9.3).
+/// and resync share (architecture section 9.3). From the request until the full frame is
+/// staged the receiver stages nothing and drops every packet whose tick is not after the
+/// full frame's; the server, on receiving it, clears the client's `ConnectionHandles` and
+/// re-enters every relevant entity, so the full frame's spawns carry fresh handles.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct ResyncRequest {
     /// The client's tick when it asked.

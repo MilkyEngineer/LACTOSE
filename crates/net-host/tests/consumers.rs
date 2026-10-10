@@ -58,7 +58,8 @@ pub struct Teleported(#[field(id = 1)] pub Tick);
 // ---- 1. The packer: a mirror built from the gather's frames, packed per client ----
 
 /// Every replicated row of every relevant region, as the server last gathered it: rows
-/// replace, `Despawned` removes, `Moved` re-homes.
+/// replace, `Despawned` removes the entity's rows, `Removed` drops that row, `Moved`
+/// re-homes; a full frame replaces the mirror outright.
 #[derive(Default)]
 struct Mirror {
     rows: BTreeMap<(StableKey, ComponentKey), (RegionId, Tick, Vec<u8>)>,
@@ -66,6 +67,9 @@ struct Mirror {
 
 impl Mirror {
     fn absorb(&mut self, frame: &StagingFrame) {
+        if frame.full {
+            self.rows.clear();
+        }
         for row in frame.rows() {
             self.rows.insert((row.key, row.component), (row.region, row.tick, row.bytes.to_vec()));
         }
@@ -73,6 +77,9 @@ impl Mirror {
             match entry.change {
                 lactose_ecs::StructuralChange::Despawned { key, .. } => {
                     self.rows.retain(|(k, _), _| *k != key);
+                }
+                lactose_ecs::StructuralChange::Removed { key, component } => {
+                    self.rows.remove(&(key, component));
                 }
                 lactose_ecs::StructuralChange::Moved { key, to, .. } => {
                     for ((k, _), (region, _, _)) in self.rows.iter_mut() {
@@ -138,8 +145,13 @@ fn pack_one(
         }
     }
     for entry in frame.structural() {
-        if let lactose_ecs::StructuralChange::Despawned { key, .. } = entry.change {
-            client.leave(key, entry.tick);
+        match entry.change {
+            lactose_ecs::StructuralChange::Despawned { key, .. } => client.leave(key, entry.tick),
+            lactose_ecs::StructuralChange::Removed { key, component } => {
+                // On the wire as a removal, into `StagedFrame::removed` at the receiver.
+                let _removal_on_the_wire = client.entities.get(&key).map(|e| (e.handle, component));
+            }
+            _ => {}
         }
     }
     let _evicted = client.packets.record(record.clone());
@@ -155,6 +167,19 @@ fn client_joins(player: PlayerId, connection: ConnectionId) -> ClientInterest {
     ClientInterest::new(player, connection, SendBudget::default())
 }
 
+/// The server on a `ResyncRequest`: the client's handles cleared and every relevant
+/// entity re-entered, so the full frame's spawns carry fresh handles.
+fn on_resync_request(client: &mut ClientInterest, mirror: &Mirror) -> Result<()> {
+    let relevant: Vec<StableKey> = client.entities.keys().copied().collect();
+    client.entities.clear();
+    client.handles.clear();
+    for key in relevant {
+        client.enter(key)?;
+    }
+    let _full_frame_from = &mirror.rows;
+    Ok(())
+}
+
 // ---- 2. The client's network thread: wire values into a staged frame and the
 // interpolation buffer, with the server's handles mirrored ----
 
@@ -162,8 +187,21 @@ struct ClientReceiver {
     handles: ConnectionHandles,
     slots: BTreeMap<StableKey, InterpolationSlot>,
     newest: BTreeMap<(StableKey, ComponentKey), Tick>,
+    /// The tick of the newest frame staged: a packet is staged only if its tick is after.
+    staged: Option<Tick>,
+    /// Set from a `ResyncRequest` or `JoinAccepted` until the full frame for that tick is
+    /// staged: nothing else is staged meanwhile.
+    awaiting_full: Option<Tick>,
     writer: InterpolationWriter,
     to_app: Sender<Arc<StagedFrame>>,
+}
+
+/// What the receiver does with one server packet, by the rules of the README.
+enum Admission {
+    /// Stage it: its tick is after the newest frame staged.
+    Stage,
+    /// Drop it whole and do not acknowledge it, so the server resends what it carried.
+    Drop,
 }
 
 impl ClientReceiver {
@@ -173,20 +211,68 @@ impl ClientReceiver {
             handles: ConnectionHandles::new(),
             slots: BTreeMap::new(),
             newest: BTreeMap::new(),
+            staged: None,
+            awaiting_full: None,
             writer,
             to_app,
         };
         (receiver, reader)
     }
 
-    /// Before a full frame: the mirror and the slots start over.
+    /// A `JoinAccepted` or a `ResyncRequest` sent: from now until the full frame for
+    /// `tick` nothing is staged, and every packet not after `tick` is dropped.
+    fn expect_full(&mut self, tick: Tick) {
+        self.awaiting_full = Some(tick);
+    }
+
+    /// The gate every server packet passes first: a delta packet is staged only if its
+    /// header tick is after the newest frame staged and no full frame is awaited; a full
+    /// frame only if it is the awaited one.
+    fn admit(&self, header: &TickHeader, full: bool) -> Admission {
+        let after_newest = self.staged.is_none_or(|newest| header.tick > newest);
+        match (self.awaiting_full, full) {
+            (Some(awaited), true) if header.tick == awaited => Admission::Stage,
+            (Some(_), _) => Admission::Drop,
+            (None, true) => Admission::Drop,
+            (None, false) if after_newest => Admission::Stage,
+            (None, false) => Admission::Drop,
+        }
+    }
+
+    /// A delta packet admitted: the frame it is staged into.
+    fn begin_delta(&mut self, header: &TickHeader) -> StagedFrame {
+        self.staged = Some(header.tick);
+        StagedFrame::new(header.tick)
+    }
+
+    /// The awaited full frame, admitted: the mirror and the slots start over now, not
+    /// when the request was sent, since packets from before it were still being staged.
     fn begin_full(&mut self, tick: Tick) -> Result<StagedFrame> {
+        debug_assert_eq!(self.awaiting_full, Some(tick));
+        self.awaiting_full = None;
+        self.staged = Some(tick);
         self.handles.clear();
         for (_, slot) in std::mem::take(&mut self.slots) {
             self.writer.release(slot)?;
         }
         self.newest.clear();
         Ok(StagedFrame::resync(tick))
+    }
+
+    /// A component the server removed from a live entity.
+    fn removed(
+        &mut self,
+        frame: &mut StagedFrame,
+        handle: EntityHandle,
+        component: ComponentKey,
+    ) -> Result<()> {
+        let key = self
+            .handles
+            .key_of(handle)
+            .ok_or_else(|| Error::new(ErrorKind::NotFound, "a stale handle"))?;
+        self.newest.remove(&(key, component));
+        frame.removed.insert((key, component));
+        Ok(())
     }
 
     fn spawn(

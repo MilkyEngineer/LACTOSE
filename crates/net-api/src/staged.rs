@@ -40,8 +40,9 @@ pub struct StagedFrame {
     /// and `time_scale` and `acked_input` are `Some`. `app` puts every loaded region in
     /// `TickInput::unloaded` of the same step, so each relevant region reloads from its
     /// message in that step (the sim applies unloads before loads); the hook applies the
-    /// spawns as upserts and despawns nothing. The network thread clears its handle mirror
-    /// and its interpolation slots before it stages a full frame.
+    /// spawns as upserts and despawns nothing. From a resync request or the join until it
+    /// stages the full frame the network thread stages nothing, and it clears its handle
+    /// mirror and its interpolation slots when it stages that frame, not before.
     pub full: bool,
     /// The server's time scale from this tick on, if it changed or the frame is full:
     /// `app` copies it into `TickInput::time_scale` and into its pacer.
@@ -71,8 +72,15 @@ pub struct StagedFrame {
     /// entities follow their owner, so a later entry for one of them is a no-op. An entity
     /// moving into a region the client does not have leaves with a tombstone instead.
     pub moves: BTreeMap<StableKey, RegionId>,
+    /// Replicated components the server removed from live entities, by (origin key,
+    /// component key): from the gather's `Removed` entries. The hook applies them after
+    /// the moves and before the rows, through `World::remove` (per registered type until
+    /// the erased remove the README proposes); a row for the same pair in the same frame
+    /// then re-adds the component with the newer value. Never names a tombstoned key.
+    pub removed: BTreeSet<(StableKey, ComponentKey)>,
     /// Entities the server destroyed, by origin key: the tombstones of architecture
-    /// section 9.3. A frame never names a key here and in `spawns` or among its rows.
+    /// section 9.3. A frame never names a key here and in `spawns`, in `removed` or among
+    /// its rows.
     pub despawns: BTreeMap<StableKey, Tombstone>,
     rows: BTreeMap<(StableKey, ComponentKey), RowSlot>,
     bytes: Vec<u8>,
@@ -100,6 +108,7 @@ impl StagedFrame {
             regions: BTreeMap::new(),
             spawns: BTreeMap::new(),
             moves: BTreeMap::new(),
+            removed: BTreeSet::new(),
             despawns: BTreeMap::new(),
             rows: BTreeMap::new(),
             bytes: Vec::new(),
@@ -164,6 +173,7 @@ impl StagedFrame {
             && self.regions.is_empty()
             && self.spawns.is_empty()
             && self.moves.is_empty()
+            && self.removed.is_empty()
             && self.despawns.is_empty()
             && self.rows.is_empty()
     }
@@ -226,7 +236,8 @@ pub struct StagedSpawn {
     /// thread, which the hook writes as [`RemoteSlot`]; `None` for an entity the
     /// receiving player has claimed, which the prediction world presents. A change of
     /// claim is sent as a spawn of the live entity with the slot set or `None`, and the
-    /// hook sets or removes `RemoteSlot` accordingly.
+    /// hook sets or removes `RemoteSlot` accordingly; `lactose-predict` reads the same
+    /// spawn to start predicting the entity (`None`, claimed) or stop (`Some`, released).
     pub slot: Option<InterpolationSlot>,
     /// Every replicated component of the entity, in ascending key order, exact or
     /// dequantised as the rows are.
@@ -255,6 +266,12 @@ pub struct Tombstone {
 /// between runs from the network thread's output, and the world's `StagedState` hook
 /// drains inside the tick with [`pop_through`](Self::pop_through). No lock and no clock:
 /// the two sides never run at once, since `app` owns the simulation between runs.
+///
+/// Which tick is which: the step for `tick` advances the world to `tick` and then runs
+/// the hook with it; before that step, `Simulation::tick` is `tick - 1`. So `app`, between
+/// runs, folds [`due`](Self::due) of the tick the next step will run, `Tick
+/// (simulation.tick().0 + 1)`, never of `simulation.tick()`, which leaves out every frame
+/// that arrived in time.
 #[derive(Clone, Debug, Default)]
 pub struct StagedInbox {
     frames: VecDeque<Arc<StagedFrame>>,
@@ -273,7 +290,10 @@ impl StagedInbox {
     /// not after the newest tick the inbox ever accepted, queued or popped, is refused and
     /// `false` returned, so no row can go back in time across frames. `app` pushes first
     /// and folds the frame's time scale and region changes into the `TickInput` only on
-    /// acceptance ([`due`](Self::due)).
+    /// acceptance ([`due`](Self::due)). Under the receiver rules of `lactose-net-host`
+    /// (a packet is staged only if its tick is after the newest frame staged, and nothing
+    /// is staged between a resync request or the join and its full frame) every frame the
+    /// network thread hands over is accepted; a refusal is a defect in the receiver.
     #[must_use = "a refused frame's region changes and time scale must not enter the TickInput"]
     pub fn push(&mut self, frame: Arc<StagedFrame>) -> bool {
         todo!()
@@ -281,8 +301,9 @@ impl StagedInbox {
 
     /// The oldest queued frame whose tick is not after `tick`, removed from the inbox; or
     /// `None` when the oldest frame is for a later tick or nothing is queued. The hook
-    /// calls it until `None` at the sync point of the step for `tick`, so a frame delayed
-    /// by loss applies at the first sync point after it arrives.
+    /// calls it until `None` at the sync point of the step for `tick`, with the `tick` the
+    /// hook received (the one the step advanced the world to), so a frame delayed by loss
+    /// applies at the first sync point after it arrives.
     pub fn pop_through(&mut self, tick: Tick) -> Option<Arc<StagedFrame>> {
         todo!()
     }
@@ -290,7 +311,9 @@ impl StagedInbox {
     /// The queued frames whose tick is not after `tick`, oldest first, without removing
     /// them: exactly the frames [`pop_through`](Self::pop_through) will hand the hook in
     /// the step for `tick`, so `app` folds their time scale and region changes into that
-    /// step's `TickInput` before the step (`Simulation::tick` is `tick`).
+    /// step's `TickInput` before the step. The step for `tick` advances the world to
+    /// `tick`; before it, `Simulation::tick` is `tick - 1`, so the call between runs is
+    /// `due(Tick(simulation.tick().0 + 1))`.
     #[must_use]
     pub fn due(&self, tick: Tick) -> DueFrames<'_> {
         todo!()

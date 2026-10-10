@@ -75,13 +75,22 @@ impl ConnectionHandles {
     /// server's table. The slot takes `handle`'s generation. Recording the same (handle,
     /// key) again is a no-op; it fails with `InvalidData` if the slot holds another live
     /// key, if the slot's generation is newer than `handle`'s (a spawn reordered after the
-    /// tombstone that released it), or if `key` has a different handle already.
+    /// tombstone that released it), or if `key` has a different handle already. "Newer"
+    /// is the wrapping comparison, since generations wrap from `u16::MAX` to one: the
+    /// slot's generation is newer than `handle`'s when `slot.wrapping_sub(handle)` is
+    /// between one and 32767. The receiver rules of the README make the reorder case
+    /// unreachable (a packet is staged only if its tick is after the newest frame staged),
+    /// so the error is a defect, not a path.
     pub fn insert(&mut self, handle: EntityHandle, key: StableKey) -> Result<()> {
         todo!()
     }
 
-    /// Forgets every assignment and every generation: what the client does before it
-    /// mirrors a full frame, whose spawns carry fresh handles.
+    /// Forgets every assignment and every generation: what the client does when it stages
+    /// a full frame, whose spawns carry fresh handles, and only then. From the resync
+    /// request or the join until that frame the receiver stages nothing and drops every
+    /// packet whose tick is not after the full frame's, so no handle from before the
+    /// resync is looked up after the clear. On a resync the server clears the client's
+    /// table the same way and re-enters every relevant entity.
     pub fn clear(&mut self) {
         todo!()
     }
