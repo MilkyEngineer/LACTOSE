@@ -19,27 +19,26 @@ pub mod sets {
 
     /// The sync: the exclusive system at the physics sync point that creates, removes and
     /// updates the backend's bodies and joints from the rows and takes the tick's
-    /// commands. Nothing can be ordered before it in the stage, as for any exclusive
-    /// system; a `Stage::Physics` system that reads `BodyHandle`, `JointHandle` or
-    /// `Teleported` is ordered after it, which a set after [`STEP`] already is.
+    /// commands. An exclusive system runs at the stage's sync point before every other
+    /// system of the stage, so nothing orders itself against it.
     pub static SYNC: SystemSet = SystemSet::new("physics_api::sync");
 
-    /// The step. A `Stage::Physics` system that reads `Physics` must be in a set declared
-    /// `.after(&[&STEP])`: there `Res<Physics>` and the contact and trigger events are this
-    /// tick's, but the `Transform` and `Velocity` rows are the previous tick's, since the
-    /// write-back lands at the sync point that begins `Stage::Post`; nothing but the
-    /// write-back writes a body's `Transform` or `Velocity` in `Stage::Physics`, since the
-    /// write-back overwrites it. Readers of the stepped rows go in `Stage::Post`, after
-    /// [`WRITE_BACK`]. A system that touches none of `Physics`, `Transform`, `Velocity`,
-    /// `Teleported` and the handles runs alongside the step on the reserved workers.
+    /// The step. A `Stage::Physics` system that reads `Physics` or the contact and trigger
+    /// events must be in a set declared `.after(&[&STEP])`, or the schedule fails to build
+    /// on the conflict with the step's `ResMut<Physics>`: there `Res<Physics>` and the
+    /// events are this tick's, but the `Transform` and `Velocity` rows are the previous
+    /// tick's, since the write-back lands at the sync point that begins `Stage::Post`;
+    /// nothing but the write-back writes a body's `Transform` or `Velocity` in
+    /// `Stage::Physics`, since the write-back overwrites it. Readers of the stepped rows
+    /// go in `Stage::Post`. A system that touches neither `Physics` nor the events runs
+    /// alongside the step on the reserved workers.
     pub static STEP: SystemSet = SystemSet::new("physics_api::step").after(&[&SYNC]);
 
     /// The write-back: the exclusive system placed first in `Stage::Post`, at its sync
-    /// point, which writes every moved body's `Transform`, `Velocity` and `Teleported`. A
-    /// `Stage::Post` system that reads or writes `Transform`, `Velocity` or `Teleported`
-    /// is in a set declared `.after(&[&WRITE_BACK])`, or the schedule fails to build on
-    /// the conflict; `app` orders any other exclusive `Stage::Post` system against it with
-    /// `Registration::order`.
+    /// point, which writes every moved body's `Transform` and `Velocity` and the tick into
+    /// `Teleported` for a body placed without a sweep. Every other system of `Stage::Post`
+    /// runs after it without an edge, as after any exclusive system; `app` orders any other
+    /// exclusive `Stage::Post` system against it with `Registration::order`.
     pub static WRITE_BACK: SystemSet = SystemSet::new("physics_api::write_back");
 }
 
@@ -65,14 +64,14 @@ pub fn register_systems(registration: &mut Registration) {
 /// `Collider`, `Transform`, `Velocity` and `Joint` changed since the mark, in ascending key
 /// order, skipping a `Transform` or `Velocity` equal to what the last write-back wrote;
 /// the waiting joints; then `World::take_channel::<PhysicsCommands>()` appended after the
-/// pending commands. The handles and `Teleported` of what was created are written into
-/// the rows, and a fresh cursor and mark are taken.
+/// pending commands. The handles of what was created are written into the rows, and a
+/// fresh cursor and mark are taken.
 #[system(
     name = "physics_api::sync",
     worlds = [server, prediction],
     exclusive,
     in_set = sets::SYNC,
-    writes = [BodyHandle, JointHandle, Teleported]
+    writes = [BodyHandle, JointHandle]
 )]
 pub(crate) fn sync_bodies(world: &mut World, physics: ResMut<Physics>) {
     todo!()
@@ -95,10 +94,11 @@ pub(crate) fn step_world(
 
 /// The write-back: at the sync point that begins `Stage::Post`, writes the `Transform`
 /// and `Velocity` the step reported for every moved body, in ascending key order, through
-/// `World::get_mut` and `Mut::set_if_neq`, so only a row whose bytes changed is stamped,
-/// and sets `Teleported` on the rows the step placed without a sweep; adds a missing
-/// `Velocity` through `World::insert`. What it wrote replaces the record the next sync
-/// compares row writes against.
+/// `World::get_mut` and `Mut::set_if_neq`, so only a row whose bytes changed is stamped;
+/// adds a missing `Velocity` through `World::insert`; writes the tick into `Teleported`
+/// for a body the step placed without a sweep, adding the component where the row lacks
+/// it; skips a reported key whose row a command despawned at this sync point. What it
+/// wrote replaces the record the next sync compares row writes against.
 #[system(
     name = "physics_api::write_back",
     worlds = [server, prediction],

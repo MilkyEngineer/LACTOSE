@@ -6,7 +6,7 @@
 //! of eight bytes, so the layout holds whichever width the milestone 1 precision test picks
 //! for [`Scalar`] without a padding change; `lib.rs` asserts the sizes for both widths.
 
-use lactose_core::{EntityRef, PlainArray, StableKey};
+use lactose_core::{EntityRef, PlainArray, StableKey, Tick};
 use lactose_math::{Quat, Scalar, Vec3};
 use lactose_reflect::{Padding, ZeroByte, component, value};
 
@@ -92,15 +92,17 @@ impl Velocity {
     pub const ZERO: Self = Self { linear: Vec3::ZERO, angular: Vec3::ZERO };
 }
 
-/// Set on a body's row by the write-back in a tick whose step placed the body without a
-/// sweep (a `Teleport` command, or a [`Transform`] row write on a dynamic or fixed body),
-/// and zeroed by the ECS at the next input sync point: the no-interpolate flag extract and
-/// replication read (architecture section 5.3). The sync adds it to a row when the row
-/// becomes a body and removes it when the row stops being one. Transient, tracked, so a
-/// `Changed<Teleported>` reader or extract sees it set and sees it cleared.
-#[component(key = "physics::teleported", transient, replicated, extracted)]
+/// The last tick at which the body was placed without a sweep (a `Teleport` command, or a
+/// [`Transform`] row write on a dynamic or fixed body): the no-interpolate flag extract
+/// and replication read (architecture section 5.3), each comparing it with the last tick
+/// it covered, so a teleport is not lost when a frame runs several ticks (catch-up,
+/// re-simulation, a gather over several ticks). [`Tick`] zero means never. Written by the
+/// write-back on a teleport only, through `set_if_neq` where the row has the component and
+/// `World::insert` where it does not; a row without it was never teleported. Persistent,
+/// so a saved tick is in the past after a load and flags nothing.
+#[component(key = "physics::teleported", persistent, replicated, extracted)]
 #[derive(PartialEq, Eq, Debug, Default)]
-pub struct Teleported(#[field(id = 1)] pub bool);
+pub struct Teleported(#[field(id = 1)] pub Tick);
 
 /// What the solver does with a body.
 #[value]
@@ -146,9 +148,11 @@ pub mod locked_axes {
 /// Read when the body is created and whenever the row changes afterwards (the sync compares
 /// against its mark at every physics sync point), so a kernel may switch a ragdoll's bones
 /// from `Kinematic` to `Dynamic` by writing `body_type` through `Mut<RigidBody>`. In a
-/// `Prediction` world a row with this component and no `ClaimedBy` is a proxy: a kinematic
-/// body whatever `body_type` says, moved along its per-tick history by `lactose-predict`'s
-/// writes to its [`Transform`] row.
+/// `Prediction` world a row with this component and no `ClaimedBy` is a proxy: the sync
+/// hands the backend a copy with `body_type = Kinematic`, and treats `ClaimedBy` added to
+/// or removed from the row as a change of this component, so a claim makes the body the
+/// row's type and a release makes it kinematic again; it is moved along its per-tick
+/// history by `lactose-predict`'s writes to its [`Transform`] row.
 #[component(key = "physics::rigid_body", persistent, replicated)]
 #[derive(PartialEq, Debug)]
 pub struct RigidBody {
@@ -228,7 +232,8 @@ pub enum ShapeKind {
 
 /// A collision primitive, in the local space of the collider that holds it or of the query
 /// that casts it. The cooked collision meshes of static scenery are not here yet
-/// (`README.md`, "Not in this crate yet").
+/// (`README.md`, "Not in this crate yet"). A physics snapshot carries this value for every
+/// collider in place of the backend's shape serialisation.
 #[value]
 #[derive(PartialEq, Debug)]
 pub struct Shape {
@@ -299,12 +304,12 @@ impl CollisionGroups {
 
 /// The one collision shape of an entity, placed relative to its [`Transform`]. With a
 /// [`RigidBody`] it is the body's collider; alone it is a fixed collider, which is what the
-/// cooked static scenery of a region is. One collider per entity: a body that needs several
-/// is not in this crate yet (`README.md`).
+/// cooked static scenery of a region is, in every world kind. One collider per entity: a
+/// body that needs several is not in this crate yet (`README.md`).
 ///
 /// Read when the collider is created and whenever the row changes afterwards, like
-/// [`RigidBody`]. A collider's shape is not in a physics snapshot: the backend rebuilds it
-/// from this row at a restore.
+/// [`RigidBody`]. Field IDs are never renumbered: `impact_threshold`, `events` and
+/// `material` took the next free IDs when they were added.
 #[component(key = "physics::collider", persistent, replicated)]
 #[derive(PartialEq, Debug)]
 pub struct Collider {
@@ -327,23 +332,24 @@ pub struct Collider {
     /// Mass per unit volume, which gives the body's mass when [`RigidBody::mass`] is zero.
     #[field(id = 6)]
     pub density: Scalar,
-    /// The normal impulse per step above which a contact of this collider is reported as
-    /// [`ContactPhase::Impact`](crate::ContactPhase::Impact) to this entity, when
-    /// [`events`](Self::events) is set; Rapier's per-collider contact force threshold.
-    #[field(id = 7)]
+    /// The normal impulse per step above which a contact is reported to this entity as
+    /// [`ContactPhase::Impact`](crate::ContactPhase::Impact), when [`events`](Self::events)
+    /// is set on this collider. Rapier's threshold is a force over the pair's minimum; the
+    /// backend converts.
+    #[field(id = 9)]
     pub impact_threshold: Scalar,
     /// Who it touches.
-    #[field(id = 8)]
+    #[field(id = 7)]
     pub groups: CollisionGroups,
     /// A sensor detects what enters it and reports [`TriggerEvent`](crate::TriggerEvent)s,
     /// but pushes nothing and is pushed by nothing.
-    #[field(id = 9)]
+    #[field(id = 8)]
     pub sensor: bool,
-    /// Whether the pairs this collider is in report events: contact events and impacts
-    /// for a solid collider, trigger events for a sensor. A pair reports if either of its
-    /// colliders has it (Rapier's `ActiveEvents::COLLISION_EVENTS`, and
-    /// `CONTACT_FORCE_EVENTS` for impacts). [`new`](Self::new) sets it false;
-    /// [`sensor`](Self::sensor) sets it true.
+    /// Whether this collider's pairs report events. `Started` and `Stopped` go to both
+    /// sides of a pair if either collider has it (Rapier's
+    /// `ActiveEvents::COLLISION_EVENTS`); `Impact` goes to a target only if the target's own
+    /// collider has it (`CONTACT_FORCE_EVENTS`); trigger events likewise for a sensor.
+    /// [`new`](Self::new) sets it false; [`sensor`](Self::sensor) sets it true.
     #[field(id = 10)]
     pub events: bool,
     /// An identifier game and presentation code give a surface (footstep sounds, decals,
@@ -442,7 +448,7 @@ pub enum JointKind {
 /// one is a joint to a fixed body. The reference fields are written through `Commands::set`
 /// or the direct methods only, like every relationship. A limited joint evaluates
 /// transcendentals in the backend: `README.md`, "The backend's obligations", says what the
-/// backend lane must show before `limited` is relied on across architectures.
+/// backend lane must close before `limited` is relied on.
 #[component(key = "physics::joint", persistent, replicated)]
 #[derive(PartialEq, Debug)]
 pub struct Joint {

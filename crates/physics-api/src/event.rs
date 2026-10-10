@@ -15,20 +15,24 @@ pub enum ContactPhase {
     Started,
     /// The normal impulse the solver applied to the pair during this tick's step exceeded
     /// [`Collider::impact_threshold`](crate::Collider::impact_threshold) of the target's
-    /// collider: an impact, or a sustained crush. Emitted in every such step, whether or
-    /// not the pair started or stopped in it. Rapier's `ContactForceEvent`.
+    /// own collider, which has [`events`](crate::Collider::events) set: an impact, or a
+    /// sustained crush. Emitted in every such step, whether or not the pair started or
+    /// stopped in it, and never to a target whose collider has no `events`. Rapier's
+    /// `ContactForceEvent`, whose force threshold the backend converts.
     Impact,
     /// The pair stopped touching during this tick's step.
     Stopped,
 }
 
 /// Two solid colliders started touching, stopped touching, or pressed harder than the
-/// target's impact threshold. Emitted for a pair only if at least one of its colliders
-/// has [`Collider::events`](crate::Collider::events) set, twice per pair, once for each
-/// body as `target`, so `Events<ContactEvent>::for_target(key)` finds every contact of
-/// `key`'s entity. The step emits a tick's events in ascending (`target`, `other`,
-/// `phase`) order, whatever order the backend reported them in; at most one event per
-/// (`target`, `other`, `phase`) per tick.
+/// target's impact threshold. `Started` and `Stopped` are emitted to both sides of a pair
+/// if either of its colliders has [`Collider::events`](crate::Collider::events) set;
+/// `Impact` is emitted to a target only if the target's own collider has it. Twice per
+/// pair for the first two, once for each body as `target`, so
+/// `Events<ContactEvent>::for_target(key)` finds every contact of `key`'s entity. The step
+/// emits a tick's events in ascending (`target`, `other`, `phase`) order, whatever order
+/// the backend reported them in; at most one event per (`target`, `other`, `phase`) per
+/// tick.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct ContactEvent {
     /// The entity the event is for.

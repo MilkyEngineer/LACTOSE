@@ -46,14 +46,6 @@ impl Default for PhysicsConfig {
     }
 }
 
-/// What the sync knows about one row that is in the solver.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-struct BodyEntry {
-    handle: BodyHandle,
-    /// A fixed collider of a `Collider`-only row: outside the rolled-back state.
-    fixed: bool,
-}
-
 /// This crate's bookkeeping and the sync's pending work: the one map between rows and the
 /// solver, and what the next sync would see. A [`PhysicsSnapshot`] carries a copy beside
 /// the backend's bytes and [`restore`] puts it back, so that a re-simulated tick's sync
@@ -61,8 +53,9 @@ struct BodyEntry {
 /// never consulted.
 #[derive(Clone, Default)]
 struct SyncState {
-    /// The rows that are bodies or fixed colliders in the solver, by origin key.
-    bodies: BTreeMap<StableKey, BodyEntry>,
+    /// The rows that are bodies or fixed colliders in the solver, by origin key, with the
+    /// handle the backend gave each.
+    bodies: BTreeMap<StableKey, BodyHandle>,
     /// The `Net` key the server bound to each predicted body, so a command or filter may
     /// name the body by either key; refreshed at every physics sync point.
     aliases: BTreeMap<NetId, StableKey>,
@@ -101,7 +94,9 @@ struct SyncState {
 /// `Stage::Simulation` reads the previous step's state, in `Stage::Post` this tick's, and
 /// in `Stage::Physics` it must be ordered after [`sets::STEP`](crate::sets::STEP) or the
 /// schedule fails to build. Kernels on every worker read it at once, so it is `Sync` and
-/// its queries take `&self`.
+/// its queries take `&self`. A world whose systems record `cmd.physics()` and that holds
+/// no `Physics` grows the channel without bound, since nothing takes it: `app` and tests
+/// insert one or record nothing.
 pub struct Physics {
     backend: Box<dyn PhysicsBackend>,
     config: PhysicsConfig,
@@ -227,16 +222,17 @@ pub fn setup(
 /// The physics world at one tick, taken beside a `WorldSnapshot` of the same world at the
 /// same point and restored beside it (architecture section 10).
 ///
-/// Two parts. The backend's bytes: the rolled-back solver state, every body that is not a
-/// fixed collider of a `Collider`-only row and every joint, with the key-to-handle map and
-/// without shapes, which [`restore`] has the backend rebuild from the `Collider` rows. And
-/// this crate's bookkeeping with the sync's pending work: which rows are bodies and joints
-/// and their handles, the waiting joints, the region modes, the aliases, what the last
-/// write-back wrote, the structural log entries after the sync's cursor in order, the keys
-/// changed since its mark across the five columns, and the channel's entries not yet taken
-/// (`World::channel`), so that after [`restore`] a re-simulated tick's sync makes exactly
-/// the backend calls the first run's did. The size is what milestone 1 measures against
-/// the prediction-world budget, for the claimed bodies plus the statics.
+/// Two parts. The backend's bytes: its whole world, every body, fixed collider and joint
+/// with its solver state and the key-to-handle map, with each collider's [`Shape`] value
+/// in place of the backend's shape serialisation. And this crate's bookkeeping with the
+/// sync's pending work: which rows are bodies and joints and their handles, the waiting
+/// joints, the region modes, the aliases, what the last write-back wrote, the structural
+/// log entries after the sync's cursor in order, the keys changed since its mark across
+/// the five columns, and the channel's entries not yet taken (`World::channel`), so that
+/// after [`restore`] a re-simulated tick's sync makes exactly the backend calls the first
+/// run's did. The size is what milestone 1 measures against the prediction-world budget,
+/// for the claimed bodies plus the statics, which decides how many statics a prediction
+/// world may hold.
 pub struct PhysicsSnapshot {
     identity: Arc<()>,
     tick: Tick,
@@ -279,17 +275,14 @@ pub fn snapshot(world: &World) -> Result<PhysicsSnapshot> {
 
 /// Replaces the physics world of `world`'s [`Physics`] resource with `snapshot`, after
 /// `World::restore` of the matching world snapshot: the world's tick must equal
-/// [`PhysicsSnapshot::tick`] and the snapshot must come from this resource. In order: the
-/// backend's [`restore`](PhysicsBackend::restore) of the bytes; then the fixed colliders
-/// of `Collider`-only rows, which the bytes do not carry, are made to match the carried
-/// bookkeeping (one the backend holds and the snapshot does not is removed, one the
-/// snapshot holds and the backend does not is created from the restored rows, its handle
-/// refreshed); then every carried body gets its shape back through
-/// [`set_collider`](PhysicsBackend::set_collider) from its `Collider` row; then the
-/// carried bookkeeping and pending work replace this crate's, and a fresh cursor and mark
-/// are taken from the restored world. The next sync processes the pending log entries
-/// before the log since the restore, the union of the pending keys and the newly changed
-/// keys in key order, and the pending commands before what it takes.
+/// [`PhysicsSnapshot::tick`] and the snapshot must come from this resource. The backend's
+/// [`restore`](PhysicsBackend::restore) of the bytes rebuilds its whole world, shapes
+/// included, with no change flag, wake or mass update; nothing is replayed through
+/// `set_collider` and no fixed collider is reconciled. Then the carried bookkeeping and
+/// pending work replace this crate's, and a fresh cursor and mark are taken from the
+/// restored world. The next sync processes the pending log entries before the log since
+/// the restore, the union of the pending keys and the newly changed keys in key order, and
+/// the pending commands before what it takes.
 ///
 /// Fails with `NotFound` if the world holds no [`Physics`], with `InvalidData` if the
 /// snapshot is from another resource or the world's tick differs (restore the world

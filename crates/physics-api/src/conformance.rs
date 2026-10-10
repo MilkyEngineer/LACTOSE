@@ -36,8 +36,7 @@ pub const SNAPSHOT_TICK: u32 = 3;
 pub const BODIES: u32 = 64;
 
 /// What [`snapshot_restore`] records. Two reports from backends that differ only in their
-/// pool's thread count, or from two layouts, are equal; two from different architectures
-/// are equal within what `docs/verification.md` has shown.
+/// pool's thread count, from two layouts, or from two architectures are equal.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct ConformanceReport {
     /// `Simulation::hash` after each of the [`TICKS`] ticks of the first run.
@@ -65,11 +64,15 @@ pub struct ConformanceReport {
 /// one in a stack that topples, with an impulse each recorded through the channel on the
 /// first tick; two bones as kinematic bodies and a limited spherical `Joint` row between
 /// them, driven by `Transform` writes from a kernel; and a proxy, a `RigidBody` row
-/// without a claim. At tick [`SNAPSHOT_TICK`] a `Stage::Post` system spawns a body,
-/// despawns one, and writes a `Transform` through `cmd.set`, so the snapshot point holds
-/// pending log entries, pending keys and a pending command. After the restore a kernel
-/// writes a `Velocity` through `Mut`, records a command, switches a bone to dynamic
-/// through `Mut<RigidBody>`, and the region is frozen for one tick and thawed. Every step
+/// without a claim. An exclusive `Stage::Input` system after `sim`'s `sets::INPUT` calls
+/// `World::set_input_tick(player one, tick)` every tick, and the `Stage::Post` spawn at
+/// tick [`SNAPSHOT_TICK`] comes from a kernel on a claimed body, so the spawn is predicted
+/// rather than dropped; the same `Stage::Post` system despawns a body and writes a
+/// `Transform` through `cmd.set`, so the snapshot point holds pending log entries, pending
+/// keys and a pending command. After the restore a kernel writes a `Velocity` through
+/// `Mut`, records a command, switches a bone to dynamic through `Mut<RigidBody>`, and the
+/// region is frozen for one tick and thawed; every write, command, freeze and thaw
+/// described as after the restore happens at the same ticks in the first run. Every step
 /// takes `TickInput::default()` (the mode changes go through `world_mut`, tests only).
 /// After tick [`SNAPSHOT_TICK`] a `World::snapshot` and a [`snapshot`](crate::snapshot) are
 /// taken; after tick [`TICKS`] both are restored and the run continues to [`TICKS`] again.

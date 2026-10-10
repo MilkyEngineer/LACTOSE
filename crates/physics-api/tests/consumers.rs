@@ -36,9 +36,6 @@ pub static MOVEMENT: SystemSet = SystemSet::new("sketch::movement");
 pub static RESPAWN_SET: SystemSet = SystemSet::new("sketch::respawn_set").after(&[&MOVEMENT]);
 /// `Stage::Physics` after the step: this tick's `Physics` and events, last tick's rows.
 pub static AFTER_STEP: SystemSet = SystemSet::new("sketch::after_step").after(&[&sets::STEP]);
-/// `Stage::Post` after the write-back: this tick's rows.
-pub static AFTER_WRITE_BACK: SystemSet =
-    SystemSet::new("sketch::after_write_back").after(&[&sets::WRITE_BACK]);
 
 /// The section 6.1 example on a body: a direct `Velocity` write the sync honours, and an
 /// impulse on a spawn's placeholder resolved at apply.
@@ -80,10 +77,10 @@ fn ground_check(
     physics.overlap(&Shape::sphere(Scalar::TWO), pos, &QueryFilter::default(), &mut nearby);
 }
 
-/// Contact-driven game code in `Stage::Post`: damage on an impact, and a command recorded
-/// here, which the next tick's step applies (the channel is not cleared at the input sync
-/// point).
-#[system(name = "sketch::impact_damage", worlds = [server, prediction], in_set = AFTER_WRITE_BACK)]
+/// Contact-driven game code in `Stage::Post`, which needs no edge after the write-back (an
+/// exclusive system runs first at the stage's sync point): damage on an impact, and a
+/// command recorded here, which the next tick's step applies.
+#[system(name = "sketch::impact_damage", worlds = [server, prediction])]
 fn impact_damage(
     cmd: Commands,
     contacts: Events<ContactEvent>,
@@ -102,7 +99,8 @@ fn impact_damage(
     for trigger in triggers.for_target(*key) {
         let _ = (trigger.other, trigger.phase);
     }
-    let no_interpolate = teleported.is_some_and(|flag| flag.0);
+    // Extract compares the tick with the last one it covered; zero means never.
+    let teleported_at: Tick = teleported.map_or(Tick(0), |flag| flag.0);
 }
 
 /// A once-per-tick system with no `Mut`: a row write through `Commands::set`, declared,
@@ -120,8 +118,8 @@ fn respawn(cmd: Commands) {
 #[system(name = "sketch::probe_physics", worlds = [server], in_set = AFTER_STEP)]
 fn probe_physics(physics: Res<Physics>, contacts: Events<ContactEvent>, bomb: &Bomb) {}
 
-/// A reader of the stepped rows: `Stage::Post`, after the write-back.
-#[system(name = "sketch::settle", worlds = [server], in_set = AFTER_WRITE_BACK)]
+/// A reader of the stepped rows: `Stage::Post`, no edge needed.
+#[system(name = "sketch::settle", worlds = [server])]
 fn settle(physics: Res<Physics>, pos: &Transform, vel: &Velocity) {}
 
 pub fn register_types_game(types: &mut TypeTable) -> Result<()> {
@@ -137,7 +135,7 @@ pub fn register_systems_game(registration: &mut Registration) {
         .add(&GROUND_CHECK)
         .add(&RESPAWN);
     registration.stage(Stage::Physics).sets(&[&AFTER_STEP]).add(&PROBE_PHYSICS);
-    registration.stage(Stage::Post).sets(&[&AFTER_WRITE_BACK]).add(&IMPACT_DAMAGE).add(&SETTLE);
+    registration.stage(Stage::Post).add(&IMPACT_DAMAGE).add(&SETTLE);
 }
 
 // ---- 2. anim: a ragdoll as owned bone rows and joint rows ----
@@ -177,8 +175,8 @@ fn ragdoll(body: Mut<RigidBody>, bone: &Bone) {
     }
 }
 
-/// Sockets read the stepped bone transforms in `Stage::Post`, after the write-back.
-#[system(name = "sketch::sockets", worlds = [server, prediction], in_set = AFTER_WRITE_BACK)]
+/// Sockets read the stepped bone transforms in `Stage::Post`.
+#[system(name = "sketch::sockets", worlds = [server, prediction])]
 fn sockets(pos: &Transform, bone: &Bone, handle: Option<&BodyHandle>, joint: Option<&JointHandle>) {
     let socket = pos.transform_point(Vec3::X);
 }
@@ -194,9 +192,10 @@ struct Fake;
 
 impl PhysicsBackend for Fake {
     fn create_body(&mut self, key: StableKey, desc: &BodyDesc<'_>) -> Result<BodyHandle> {
+        // The effective body: already kinematic for a prediction-world proxy.
         let _: Option<BodyType> = desc.body.map(|body| body.body_type);
         let _: &Transform = desc.transform;
-        let kinematic = desc.proxy || desc.frozen;
+        let fixed = desc.frozen || desc.body.is_none();
         Ok(BodyHandle::new(0, 1))
     }
 
@@ -353,7 +352,8 @@ fn direct_scene(world: &mut World, region: lactose_ecs::RegionId) -> Result<()> 
             ClaimedBy { player: PlayerId(1) },
         ),
     )?;
-    // A proxy: a body row without a claim, kinematic in a prediction world.
+    // A proxy: a body row without a claim, handed to the backend as kinematic in a
+    // prediction world.
     world.spawn(
         StableKey::Net(NetId::cooked(3)),
         region,

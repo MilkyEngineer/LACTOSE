@@ -119,7 +119,7 @@ const _: () = {
     const S: usize = Scalar::BYTES;
     assert!(size_of::<Transform>() == 7 * S);
     assert!(size_of::<Velocity>() == 6 * S);
-    assert!(size_of::<Teleported>() == 1);
+    assert!(size_of::<Teleported>() == 4);
     assert!(size_of::<RigidBody>() == 4 * S + 8);
     assert!(size_of::<Shape>() == 4 * S + 8);
     assert!(size_of::<CollisionGroups>() == 8);

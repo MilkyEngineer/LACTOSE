@@ -17,8 +17,12 @@ use crate::query::{QueryFilter, Ray, RayHit, ShapeHit};
 /// that physics sync point. At least one of `body` and `collider` is `Some`.
 #[derive(Clone, Copy, Debug)]
 pub struct BodyDesc<'a> {
-    /// The body, or `None` for a fixed collider.
-    pub body: Option<&'a RigidBody>,
+    /// The effective body, or `None` for a fixed collider. The row's `RigidBody` as the
+    /// backend is to treat it: in a `Prediction` world a row without `ClaimedBy` is a proxy
+    /// (architecture section 9.4), and the sync hands it with `body_type = Kinematic`
+    /// whatever the row says, here and in every later `set_body`; the backend holds no
+    /// world-kind rule.
+    pub body: Option<RigidBody>,
     /// The collider, or `None` for a body with no collider.
     pub collider: Option<&'a Collider>,
     /// Where it is.
@@ -28,12 +32,6 @@ pub struct BodyDesc<'a> {
     /// Whether its region is not `Simulated`, which makes it a fixed collider until
     /// [`PhysicsBackend::set_frozen`] says otherwise (architecture section 9.7).
     pub frozen: bool,
-    /// A proxy of the prediction world (architecture section 9.4): created kinematic
-    /// whatever `body.body_type` says, now and after every later
-    /// [`set_body`](PhysicsBackend::set_body), and moved by the sync's `set_transform`
-    /// calls along the per-tick history `lactose-predict` writes into its rows. It pushes
-    /// predicted bodies and is pushed by nothing.
-    pub proxy: bool,
 }
 
 /// What one step is given.
@@ -60,8 +58,8 @@ pub struct BodyState {
     /// How it moves after the step.
     pub velocity: Velocity,
     /// Whether the body was placed without a sweep during this step (a `Teleport` command,
-    /// or a `set_transform` on a dynamic or fixed body before it): the write-back sets
-    /// [`Teleported`](crate::Teleported) on the row, the no-interpolate flag of
+    /// or a `set_transform` on a dynamic or fixed body before it): the write-back writes
+    /// the tick into [`Teleported`](crate::Teleported), the no-interpolate flag of
     /// architecture section 5.3.
     pub teleported: bool,
 }
@@ -75,9 +73,10 @@ pub struct StepOutput {
     /// nothing sleeping or fixed. Any order, each key at most once; the write-back sorts by
     /// key before it writes.
     pub bodies: Vec<BodyState>,
-    /// Every contact that started, stopped or exceeded the target's impact threshold, for
-    /// pairs with events enabled, once per (`target`, `other`, `phase`) at most. Any order;
-    /// the step system sorts before it emits.
+    /// Every contact that started or stopped, for pairs with events enabled on either
+    /// side, and every impact for a target with events enabled on its own side, once per
+    /// (`target`, `other`, `phase`) at most. Any order; the step system sorts before it
+    /// emits.
     pub contacts: Vec<ContactEvent>,
     /// Every sensor overlap that started or stopped, for pairs with events enabled, once
     /// per (`target`, `other`, `phase`) at most. Any order.
@@ -122,16 +121,17 @@ impl StepOutput {
 /// body, bump the solver's active-set epoch or rebuild its graph (Rapier's `get_mut`
 /// does; compare first). A differing value wakes the body.
 ///
-/// # Determinism (architecture section 8.2)
+/// # Determinism (architecture sections 1, 2 and 8.2)
 ///
 /// The backend is inside the determinism boundary. For one sequence of calls with equal
 /// arguments it produces equal [`StepOutput`]s (as sets: the order of each list is free),
 /// equal query answers and equal [`snapshot`](Self::snapshot) bytes under any thread count
-/// of its solver pool and whatever ran before on those threads, on one architecture.
-/// Across x86-64 and aarch64 the same holds within what `docs/verification.md` has shown
-/// for the pinned version: SOUR's architecture mode proves it, and the known gaps are in
-/// `README.md`, "The backend's obligations". It reads no clock, no thread or worker
-/// identity and no thread-local state; its pool's threads enter
+/// of its solver pool and whatever ran before on those threads, and identical on x86-64
+/// and aarch64: the obligation is section 2's. The verification items name the two known
+/// gaps of the pinned Rapier (platform-libm `sin_cos` on limited joints, the sign of zero
+/// in SIMD min/max), which the backend lane closes before SOUR's architecture mode gates;
+/// until then the property is unproven, not excused. It reads no clock, no thread or
+/// worker identity and no thread-local state; its pool's threads enter
 /// `lactose_core::ThreadClass::PhysicsSolver` at start, which sets their floating-point
 /// state; solver threads number the frame worker count minus the reservation, at least
 /// one. Every number it computes goes through its pinned math crates, and what reaches a
@@ -146,13 +146,14 @@ pub trait PhysicsBackend: Send + Sync + 'static {
     /// those joints' handles and keeps the joints waiting.
     fn remove_body(&mut self, key: StableKey);
 
-    /// Replaces the body's [`RigidBody`]: `Some` with the row's new value (a type change
-    /// included, except for a proxy, which stays kinematic), `None` when the row lost the
-    /// component and the entity is a fixed collider now. The handle stays.
+    /// Replaces the body's effective [`RigidBody`]: `Some` with the new value (a type
+    /// change included: a ragdoll going limp, or a prediction-world row claimed or
+    /// released, which the sync hands as kinematic while unclaimed and as the row's type
+    /// while claimed), `None` when the row lost the component and the entity is a fixed
+    /// collider now. The handle stays.
     fn set_body(&mut self, key: StableKey, body: Option<&RigidBody>);
 
     /// Replaces the body's [`Collider`] likewise; `None` when the row lost the component.
-    /// Also how a shape comes back after [`restore`](Self::restore), which carries none.
     fn set_collider(&mut self, key: StableKey, collider: Option<&Collider>);
 
     /// A [`Transform`] row write: places a dynamic or fixed body there with no sweep (the
@@ -191,24 +192,20 @@ pub trait PhysicsBackend: Send + Sync + 'static {
     /// executor's workers beyond the reservation are parked meanwhile.
     fn step(&mut self, input: &StepInput<'_>, output: &mut StepOutput);
 
-    /// Appends the rolled-back physics state to `out`: every body that is not a fixed
-    /// collider of a `Collider`-only row, with its pose, velocity, type, mass, flags,
-    /// sleep and solver state; every joint with its solver state; and the key-to-handle
-    /// map; so that [`restore`](Self::restore) of the bytes rebuilds a world that steps on
-    /// identically once the sync has given every body its shape again. Shapes are not in
-    /// the bytes (the backend rebuilds them from the `Collider` rows through
-    /// [`set_collider`](Self::set_collider), which this crate calls after a restore for
-    /// every body it carries), and fixed colliders of `Collider`-only rows are outside the
-    /// rolled-back state. The bytes are a function of the state; whether they are stable
-    /// enough to hash across equal states reached by different operation orders is a
-    /// milestone 1 verification item, not a contract.
+    /// Appends the physics world to `out`. The bytes are the backend's whole world, with
+    /// each collider's [`Shape`] value (an asset reference once meshes exist) in place of
+    /// the backend's shape serialisation: every body, fixed collider and joint with its
+    /// solver state, and the key-to-handle map, so that [`restore`](Self::restore) of the
+    /// bytes rebuilds a world that steps on identically. The bytes are a function of the
+    /// state; whether they are stable enough to hash across equal states reached by
+    /// different operation orders is a milestone 1 verification item, not a contract.
     fn snapshot(&self, out: &mut Vec<u8>) -> Result<()>;
 
-    /// Replaces the rolled-back state with one taken by [`snapshot`](Self::snapshot) of
-    /// this backend type: every body and joint the bytes hold comes back without its
-    /// shape, every body and joint not in the bytes goes, and the fixed colliders of
-    /// `Collider`-only rows are kept as they are (this crate removes and creates them to
-    /// match the rows). `InvalidData` leaves the world unchanged.
+    /// Replaces the whole physics world with one taken by [`snapshot`](Self::snapshot) of
+    /// this backend type, rebuilding each collider's shape from the carried [`Shape`]
+    /// value while deserialising, with no change flag, wake or mass update: nothing of
+    /// this crate replays `set_collider` afterwards, and nothing reconciles fixed
+    /// colliders. `InvalidData` leaves the world unchanged.
     fn restore(&mut self, bytes: &[u8]) -> Result<()>;
 
     /// The first hit along `ray` among the colliders `filter` admits, with the lowest
