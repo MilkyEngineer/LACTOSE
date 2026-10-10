@@ -131,7 +131,11 @@ impl SimulationBuilder {
     /// a restore, a load or the stamp rebase, so those heal on their own. A consumer whose
     /// [`LogCursor`](lactose_ecs::LogCursor) has fallen further behind gets `None` from
     /// [`StructuralLog::since`](lactose_ecs::StructuralLog::since) and does a full pass, as
-    /// the ECS already allows. No consumer trims the log itself.
+    /// the ECS already allows. No consumer trims the log itself. `ticks` must be at least the
+    /// timer root's catch-up cap (`TickPacer`'s, `app`'s choice): a consumer that reads the log
+    /// once per frame, such as the replication gather, otherwise finds its cursor stale after
+    /// every catch-up frame and does a full pass each time. Not checked here, since the cap is
+    /// `app`'s.
     #[must_use]
     pub fn log_retention(mut self, ticks: u32) -> Self {
         self.log_retention = ticks;

@@ -18,6 +18,7 @@ What the engine knows about every component and resource type.
 | `FieldVisitor`, `ReferenceVisitor` | statically dispatched visitors: one reads every field by kind, one rewrites references in place |
 | `Schema<T>`, `TypeInfo`, `StructInfo`, `FieldInfo`, `EnumInfo` | descriptions built by the compiler: name, key, policy, version, tracking, retired IDs, and each field's ID, name, type tag, offset, size and kind |
 | `TypeInfo::field_bytes`, `write_field`, `validate`, `zero_padding`, `decode` | access to a value's bytes by field ID, with validation that returns an error |
+| `TypeInfo::write_schema` | the type's schema in one canonical byte encoding, what a protocol hash covers; the documentation states it byte for byte and `tests/schema_bytes.rs` pins a golden encoding |
 | `Registry` | explicit registration, lookup by key and by Rust type, sorted iteration, a text dump of the schema |
 | `Padding<N>` | explicit padding whose only value is zero |
 

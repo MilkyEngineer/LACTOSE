@@ -197,7 +197,9 @@ pub trait SessionApplier: Send + Sync + 'static {
 /// components through [`World::insert`], tracked columns through
 /// [`World::columns_mut`](lactose_ecs::World::columns_mut) or
 /// [`Mut::set_if_neq`](lactose_ecs::Mut::set_if_neq) so an equal value does not dirty the
-/// row, despawns from tombstones. An error is logged at target `curd`; the tick runs.
+/// row, moves between regions through [`World::move_to_region`], removes a component the
+/// server removed through [`World::remove`], despawns from tombstones. An error is logged at
+/// target `curd`; the tick runs.
 pub trait StagedState: Send + Sync + 'static {
     /// Writes what was staged for `tick`.
     fn apply(&mut self, world: &mut World, tick: Tick) -> Result<()>;

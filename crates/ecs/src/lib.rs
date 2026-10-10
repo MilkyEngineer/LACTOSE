@@ -47,8 +47,8 @@ mod world;
 pub use access::{Access, AccessKind, AccessTarget};
 pub use bulk::{ExportedRow, RegionRows};
 pub use change::{
-    ChangeMark, ChangedRows, ColumnMut, ColumnRef, Columns, ColumnsMut, DirtyRows, ErasedColumn,
-    ErasedColumns, LogCursor, LogEntries, LogEntry, StructuralChange, StructuralLog,
+    ChangeMark, ChangedIndices, ChangedRows, ColumnMut, ColumnRef, Columns, ColumnsMut, DirtyRows,
+    ErasedColumn, ErasedColumns, LogCursor, LogEntries, LogEntry, StructuralChange, StructuralLog,
 };
 pub use command::{
     Bundle, Channel, ChannelEntries, ChannelEntry, ChannelWriter, CommandChannel, Commands,

@@ -1768,6 +1768,141 @@ rationale the author supplied during the editorial pass rather than one taken fr
   wrapped yaw; the `released` field; `Ok(())` for a player without an entity.
 - Driven by: milestone 1, the `input` facade brief and its first design review (2026-10-10).
 
+**D121. The `net-api` facade and the `net-host` split: what sections 4, 5.3, 8.1, 8.2, 9.1, 9.2,
+9.3, 9.4 and 14 left open** (§4, §5.3, §6, §8.1, §8.2, §9.1, §9.2, §9.3, §9.4, §9.5, §10, §11,
+§14, §15.2, `lactose-net-api`, `lactose-net-host`, `lactose-ecs`, `lactose-reflect`,
+`lactose-sim`)
+- Why: the facade is written before `lactose-net` so that the milestone 1 netcode spike, `app`,
+  `predict`, presentation and `persist` build against the final surface; each choice below is
+  one the sections did not settle, and each is a contract in `crates/net-api/README.md` or
+  `crates/net-host/README.md`.
+  - *Two crates at the boundary, as `input`.* `lactose-net-api`, inside: the staged frame and
+    its inbox, the gather and its frame, the relevance message, the `RemoteSlot` component and
+    lag compensation's place, under the boundary lints and the build ID. `lactose-net-host`,
+    outside and absent from `[boundary_internal]`: quantisation, the handshake, the transport,
+    packets and handles, per-client interest, the interpolation buffer, clock sync and the
+    control messages. What crosses into the simulation is the staged frame, which the network
+    thread builds from what the host crate decodes. Rules out a module-split lint (a
+    `disallowed-types` entry fires only in type position; a struct literal or an inferred result
+    slips) and a host crate a boundary crate could name.
+  - *One staged frame per server tick, shared by `Arc`, through an inbox in the world; a frame's
+    control fields enter the `TickInput` of the step whose hook pops it.* The network thread
+    builds a `StagedFrame` per server tick; `app` pushes it into each client world's
+    `StagedInbox` between runs (the call is `#[must_use]`; the inbox refuses a frame not after
+    the newest tick it ever accepted, so no row goes back in time across frames, and under the
+    receiver rules below it never has to) and folds `due(t)` for `t` the tick the next step will
+    run (`Simulation::tick` + 1, the tick the hook receives, since the step advances the world
+    before the sync point) into that step's `TickInput`: the time scale (the last `Some`), and
+    region changes per region in frame order with the later winning, except that `Irrelevant`
+    then `Relevant` is an unload plus a load; a full frame first discards the step's earlier
+    region changes, then unloads every loaded region, so the step loads exactly what the full
+    frame names. The client's worlds are built at, or `set_tick` to, the tick `JoinAccepted`
+    names. Every keyed field is a map; rows live in one arena and reading allocates nothing.
+    Rules out a channel inside the world (an mpsc `Receiver` is `!Sync`; a `Mutex<Receiver>`
+    takes no lock through `get_mut`, but it still puts a channel in a world and lets the hook
+    see a frame before `app` has folded its region changes), folding every pending frame into
+    one step (which lost unloads), and folding `due(Simulation::tick())` (which lost every frame
+    that arrived in time).
+  - *A staged spawn is an upsert when its key is live; the hook despawns nothing; a change of
+    claim is a spawn.* A region becoming relevant loads its rows by bundle and the stream spawns
+    them; a full frame spawns entities the client holds; a claim change must reach the
+    interpolation slot. So a spawn of a live key writes each component whole (so an equal value
+    does not dirty the row) and sets or removes `RemoteSlot`; a full frame reloads every region
+    through the `TickInput`; the network thread clears its handle mirror and slots before a full
+    frame. Rules out a spawn that refuses a live key and a hook that despawns what a frame omits
+    (it would remove cooked rows with no replicated component).
+  - *Moves and component removals are frame fields.* `StagedFrame::moves` from the gather's
+    `Moved` entries, applied after the spawns and before the rows through
+    `World::move_to_region`; `StagedFrame::removed` from the `Removed` entries of replicated
+    components, applied after the moves and before the rows (a row of the same frame re-adds the
+    component), through `World::remove` per registered type until the ECS's `remove_erased`; the
+    wire names the region each quantised position is relative to; an entity moving out of the
+    client's set leaves with a tombstone. Rules out learning a move from `InRegion` (derived and
+    world-owned) or from a row (a move changes none), and a client that keeps a removed
+    component's last value forever.
+  - *Rows are whole images keyed by origin key; precision is a flag, not a second path.* The
+    network thread dequantises before staging; `exact` marks the full-precision rows of claimed
+    entities (the reconciliation record) against the dequantised rows of proxies; the resync and
+    late-join message is a `StagedFrame` with `full`. Rules out per-field deltas and separate
+    reconciliation and snapshot types.
+  - *The gather decides full or incremental first, then selects by stamp through the ECS's
+    erased `changed_since`.* `net::gather` is an exclusive `Pass::Gather` system taking `Job`
+    and `ResMut<GatherState>`; it first decides from `World::is_current(mark)` and
+    `StructuralLog::since` on a copy of the cursor; only an incremental gather skips chunks by
+    column tick before any fork, forks over the rest with `fork_range`, selects rows with
+    `ErasedColumn::changed_since(mark)` exactly as a typed consumer would, appends the
+    structural log since its cursor, sorts by (region, key, component), and merges into the
+    frame `app` has not taken; a full pass takes every row of every replicated column with no
+    chunk skipped, replaces the packer's mirror, voids every client's acked ticks and is
+    followed by a resync, never a resend from the frame alone; `app` takes the frame between
+    runs. `SimulationBuilder::log_retention` must be at least the catch-up cap, or every gather
+    after a catch-up frame is full; `build` cannot check it. Rules out a tick comparison (which
+    re-sent every row of the last tick), a strict-after one (which lost direct writes), and
+    detecting staleness inside the scan (which set `full` on a frame that had skipped chunks).
+  - *The packer keeps a mirror; a claimed entity is whole in every packet that carries it.* A
+    delta frame holds only changed rows, and whole sends, resends and section 9.4's every-field
+    updates need the rest, so the packer keeps every replicated row of every relevant region,
+    built from the first full frame and every later one: rows replace, `Despawned` removes the
+    entity, `Removed` drops the row, `Moved` re-homes, and a full frame replaces the mirror (it
+    carries no structural entries, so an entity despawned in the gap would otherwise be resent
+    as a spawn). Rules out amending 9.4.
+  - *Handles are assigned on the server and mirrored on the client under the receiver's rules.*
+    A sixteen-bit index and generation (the generation comparison wrapping); every spawn carries
+    its handle, the client records it with `insert`, releases on the tombstone, and clears when
+    it stages a full frame; a ring of 64 packets and an acknowledgement window of 32. The
+    receiver stages a server packet only if its tick is after the newest frame it staged and
+    drops any other whole, unacknowledged, so the server resends it; from a resync request or
+    the join until the full frame it stages nothing, drops every packet not after the full
+    frame's tick, and clears its mirror and slots only then; the server clears the client's
+    handles on a resync and re-enters every relevant entity. With these, the inbox's
+    newest-ever-accepted rule holds by construction. Rules out a client that assigns, which
+    drifts under release timing and reordering, and a full frame on the reliable channel
+    overtaken by later deltas and refused.
+  - *Interpolation slots travel through the staged spawn and `RemoteSlot`; the sampler takes
+    slots; the sequence lock is atomics only with stated orderings; the teleport is a tick.* The
+    writer stores the odd sequence, a release fence, the words, the even sequence with release;
+    a reader loads the sequence with acquire, the words, an acquire fence, the sequence again (a
+    relaxed first load tore on aarch64, acquire did not); `ReceivedState::teleported` is the
+    `Teleported` value so a teleport is told under any arrival order, and the sampler holds on
+    either side of it. Rules out a key-to-slot directory and a boolean teleport computed at
+    arrival.
+  - *The protocol hash covers replicated and hashed types plus the protocol constants; its
+    per-type encoding is `lactose-reflect`'s `TypeInfo::write_schema`; a type registered on one
+    side only is derived and unreplicated, or the handshake refuses.* Section 9.1's "boundary
+    component types" is not knowable from the registry; what must agree is what crosses the wire
+    and what a desync digest compares. Rules out hashing the dump string and a covered set that
+    a presentation type on one side would break.
+  - *The transport sees connections as events; quantisation goes through `lactose_math` with its
+    limits stated; control messages travel on a reliable ordered channel `net` builds over the
+    datagrams.* `JoinAccepted` carries the player and the start tick; `OverlayRequest` follows a
+    digest mismatch; the readiness hold moves simulation state and enters the server tick as a
+    journaled input at milestone 4 (`SessionEvent::Ready { region }` or a `TickInput` field),
+    `ClientInterest::ready` being the network's copy only.
+  - *`app` moves `net`'s data in and out of the world between runs.* `StagedInbox` and
+    `GatherState` are service resources and not world state.
+  - Named and deferred: an erased row write and removal in the ECS (`World::insert_erased`,
+    `World::remove_erased`, `World::spawn_erased`), which the upsert, the removal and milestone
+    4's generic hook are written against; the packer and every byte encoding; the clock-sync
+    estimator; the lag history's shape; the region-origin table; a `lactose-predict` build check
+    that prediction-world systems read only replicated or derived components.
+- What the first design review changed (2 blocking, 7 serious, 9 minor; `2b54eed` was the facade
+  before it): the split into `net-api` and `net-host`; the upsert and the full-frame reload
+  instead of a despawn step; `StagedFrame::moves`; `ErasedColumn::changed_since` in the ECS and
+  the gather by stamp; `ConnectionHandles::{insert, clear}`; `StagedInbox::due`, the fold rule,
+  the start tick and `#[must_use]`; the newest-ever-accepted rule; the packer's mirror and whole
+  claimed entities; the exact sequence-lock orderings; the skip-then-`fork_range` strategy with
+  its numbers; the retention rule; the quantisation caveats; `teleported: Tick`; the readiness
+  hold as a journaled input; `JoinAccepted`, `OverlayRequest` and the reliable channel; the
+  one-sided-registration rule and `TypeInfo::write_schema`; the `Mutex::get_mut` and resync
+  corrections.
+- What the second design review changed (1 blocking, 2 serious, 3 minor, three of them
+  introduced by the first fix; `f398b98` was the facade before it): the fold tick, which had
+  dropped every frame that arrived in time; the receiver rules and the resync sequencing;
+  `StagedFrame::removed`; the full frame's fold; the gather's decision first and the mirror
+  replaced; claims as spawns of a live key; failed entries logged and skipped; the wrapping
+  generation.
+- Driven by: milestone 1, the `net-api` facade brief and its two design reviews (2026-10-10).
+
 ## 10. Review history
 
 - **Revision 1** (`a29af04`): the design baseline.

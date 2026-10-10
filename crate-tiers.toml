@@ -25,7 +25,8 @@ crates = [
   "lactose-core", "lactose-math", "lactose-task", "lactose-ecs", "lactose-reflect",
   "lactose-sim", "lactose-anim", "lactose-predict", "lactose-nav-query",
   "lactose-physics-api", "lactose-asset-api", "lactose-bundle", "lactose-present-api",
-  "lactose-net-api", "lactose-rhi-api", "lactose-input", "lactose-input-host", "lactose-io",
+  "lactose-net-api", "lactose-net-host", "lactose-rhi-api", "lactose-input",
+  "lactose-input-host", "lactose-io",
   # Proc-macro crates. They compile for the host, so they are outside the boundary and may
   # not depend on a boundary crate; the code they emit lands in the crate that invokes them.
   "lactose-reflect-macros", "lactose-ecs-macros",
@@ -61,7 +62,7 @@ crates = ["lactose-rhi-null"]
 crates = [
   "lactose-core", "lactose-math", "lactose-ecs", "lactose-sim", "lactose-anim",
   "lactose-predict", "lactose-nav-query", "lactose-physics-api", "lactose-physics-rapier",
-  "lactose-bundle", "lactose-input", "game-sim", "game-ai", "game-content",
+  "lactose-bundle", "lactose-input", "lactose-net-api", "game-sim", "game-ai", "game-content",
 ]
 
 [server_denylist]
@@ -98,6 +99,10 @@ crates = [
 # `lactose-input-host` (raw samples, the quantiser, device sources) is deliberately absent:
 # the host side of input is floats and devices, and `lactose-input`, the sample and its
 # applier, is in [boundary] itself.
+# `lactose-net-host` (quantisation, the handshake, the transport, packets, interest, the
+# interpolation buffer, clock sync) is deliberately absent: the host side of networking is
+# floats, clocks and sockets, and `lactose-net-api`, the staged frame and the gather, is in
+# [boundary] itself.
 [boundary_internal]
 any = [
   "lactose-reflect", "lactose-asset-api", "lactose-present-api",

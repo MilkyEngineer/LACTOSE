@@ -67,10 +67,10 @@ pub enum Pass {
     /// Extract (architecture section 5.3): `presentation` copies dirty rows into the staging
     /// ring and writes the presentation snapshot. Milestone 2 fills it.
     Extract,
-    /// The replication gather (architecture section 9.3): `net` copies rows whose tick
-    /// advanced and the structural log into its staging buffer, keyed by its `ChangeMark`
-    /// and `LogCursor`; one gather covers every tick since the last frame, up to the
-    /// catch-up cap. Milestone 4 fills it.
+    /// The replication gather (architecture section 9.3): `net-api`'s `net::gather` system,
+    /// placed by `lactose_net_api::register_systems`, copies the rows changed since its
+    /// `ChangeMark` and the structural log since its `LogCursor` into `GatherState`'s frame;
+    /// one gather covers every tick since the last frame, up to the catch-up cap.
     Gather,
 }
 

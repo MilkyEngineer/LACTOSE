@@ -71,7 +71,7 @@ slot, the lifecycle slot, the save slot). No consumer can name a system or the l
 | | Add sets to the simulation stage without owning the stage list | `Registration::stage(Stage::Simulation).sets(..).add(..)`; the stages are `Input`, `Simulation`, `Physics`, `Post` |
 | `physics-api`, `anim` | A place for the sync, the step and the write-back, and for what reads them; the solver pool | `Stage::Physics` for the exclusive sync at its sync point and the once-per-tick step with `Job`; `Stage::Post`, whose sync point runs the exclusive write-back first, for readers of stepped rows; `Stage::Simulation` for the sim skeleton's state machines; a setup function hands in the backend's service with the pool `app` built outside the boundary |
 | `input` | How a per-tick batch of inputs reaches the sync point; where the typed write happens | `TickInput::inputs` as `PlayerSample` bytes by player; `InputApplier` beside the component's definition |
-| `net` | Apply staged state at the sync point; the gather as a pass; spawn with the server's key and bind; sessions | `StagedState` on a client; `Registration::pass(Pass::Gather)`; `&mut World` inside the hook; `TickInput::sessions` on the server |
+| `net-api`, `net` | Apply staged state at the sync point; the gather as a pass; spawn with the server's key and bind; sessions | `StagedState` on a client; `net-api`'s `net::gather` system, placed by `lactose_net_api::register_systems`, copies the rows changed since its `ChangeMark` and the structural log since its `LogCursor` into `GatherState`'s frame; `&mut World` inside the hook; `TickInput::sessions` on the server |
 | `predict` | The deterministic step to re-run; snapshot, restore, horizon; the proxy update at the sync point | `step` with the ring's `TickInput`s; `world_mut()` between runs; `StagedState` in the prediction world; `StreamingAnchor` on the local player's entity; `app` runs `run_passes` on the prediction world too |
 | `persist` | Save at a sync point into records; load through the one path an unload uses | `save_point` → `SavePoint { tick, next_net_id, regions }`; `SimulationBuilder::{tick, next_net_id}` plus `TickInput::loaded`; `RegionLifecycle::take_exports` on unload |
 | Region lifecycle | Policy inputs and outputs as data, testable without `net` or `asset` | Inputs: `StreamingAnchor` rows, joins, `RegionPolicy`, `RegionAtlas`, pinned regions, `TickInput::{loaded, assets}`; outputs: `RegionLifecycle::{take_requests, take_exports, take_load_failures, take_session_failures, take_asset_failures}` and the modes on the world |
@@ -198,7 +198,11 @@ schedule is built and prepared at `build`, so a `ScheduleError` is a build error
    `World::trim_structural_log`, which ignores a cursor made stale by a restore, a load or
    the stamp rebase, so those heal on their own. A consumer whose `LogCursor` has fallen
    further behind gets `None` from `StructuralLog::since` and does a full pass; no consumer
-   trims the log itself.
+   trims the log itself. The retention must be at least the timer root's catch-up cap: a frame
+   that runs several ticks trims before its passes run, so a consumer that reads the log once
+   per frame (`net-api`'s replication gather) finds its cursor stale at every gather after a
+   catch-up frame if the retention is below the cap. `build` cannot check it, since the cap is
+   `app`'s.
 4. On a `Server` world, takes and drops the presentation events, so the queue does not
    grow (architecture section 9.4) whatever drives the steps; every other kind leaves them
    for `predict` or presentation.
@@ -222,7 +226,9 @@ extract never runs against a discarded tick.
 - A world has no region until a bundle loads. A region created directly through
   `world_mut()` is an unjournaled edit: tests only, never in `app`. Everything written
   through `world_mut()` is unjournaled; `app` changes the `RegionPolicy` there and nothing
-  else of the world's state.
+  else of the world's state, and moves `net`'s frames through
+  `lactose_net_api::{StagedInbox, GatherState}`, which are service resources and not world
+  state.
 
 **The input sync point** (architecture sections 6, 9.1, 9.2 and 14)
 
@@ -300,9 +306,10 @@ server, the prediction world and a replay.
 
 What `StagedState::apply` may do: on a client, everything received, through `World::spawn`
 with the server's key, `World::bind`, `World::insert`, `World::columns_mut` or
-`Mut::set_if_neq` so that an equal value does not dirty a row, and `World::despawn` for a
-tombstone; in the prediction world, the proxies' positions for the tick from their
-per-tick history. On the server it is the default and does nothing.
+`Mut::set_if_neq` so that an equal value does not dirty a row, `World::move_to_region` for an
+entity the server moved between regions, `World::remove` for a component the server removed,
+and `World::despawn` for a tombstone; in the prediction world, the proxies' positions for the
+tick from their per-tick history. On the server it is the default and does nothing.
 
 **Regions** (architecture sections 6, 9.7 and 14)
 

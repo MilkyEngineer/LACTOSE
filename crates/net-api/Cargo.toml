@@ -1,0 +1,26 @@
+[package]
+name = "lactose-net-api"
+description = "Network contracts inside the determinism boundary: the staged frame a client applies at the input sync point, the frame the replication gather fills, the relevance message, the remote slot component."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+# Types only (architecture section 8.2): the version table a relevance message carries.
+lactose-asset-api.workspace = true
+# The overlay a relevance message carries, and the component bytes a spawn carries.
+lactose-bundle.workspace = true
+lactose-core.workspace = true
+# The world the hooks write and the gather reads, `ChangeMark`, `LogCursor`, the structural
+# log's entries, and the `#[system]` attribute for the gather.
+lactose-ecs.workspace = true
+# Metadata only (architecture section 8.1): `#[component]`, `#[value]`, and the registry the
+# gather walks.
+lactose-reflect.workspace = true
+# `StagedState`, `RegionBundle`, `RegionExport`, `Pass::Gather`, `TimeScale` and the
+# registration surface.
+lactose-sim.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,30 @@
+[package]
+name = "lactose-net-host"
+description = "The host side of networking: quantisation, the handshake, the transport trait, packets and handles, per-client interest, the interpolation buffer, clock sync, control messages."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+# `Pod` for the wire-shaped plain data: handles, quantised values, the handshake.
+bytemuck.workspace = true
+lactose-core.workspace = true
+# `RegionId`, named by interest state and control messages; types only.
+lactose-ecs.workspace = true
+# The vectors and quaternions the quantiser converts and the interpolation buffer holds.
+lactose-math.workspace = true
+# The interpolation slot the buffer is addressed by, and the staged frame the receiver
+# builds; the one boundary crate of networking.
+lactose-net-api.workspace = true
+# The registry and `TypeInfo::write_schema`, which the protocol hash covers.
+lactose-reflect.workspace = true
+# `AssetFailureEvent`, the tick-stamped failure a resync request names; types only.
+lactose-sim.workspace = true
+
+[dev-dependencies]
+# The compile-only sketches build staged frames with component bytes.
+lactose-bundle.workspace = true
+
+[lints]
+workspace = true
