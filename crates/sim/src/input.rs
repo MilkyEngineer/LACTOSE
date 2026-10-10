@@ -20,7 +20,8 @@ use crate::time::TimeScale;
 /// `lactose-predict`'s ring keeps one per tick for re-simulation. Every keyed field is a
 /// map, so a frame cannot hold two entries for one key and the way a frame was assembled
 /// (by `app` from `net`, `input` and `asset`; by a test directly) decides nothing. A frame
-/// is empty by default: `TickInput::default()` is a tick with nothing new.
+/// is empty by default: `TickInput::default()` is a tick with nothing new. A frame is not
+/// handed back by a failed run: a caller that retries keeps a clone.
 #[derive(Clone, Debug, Default)]
 pub struct TickInput {
     /// The time scale from this tick on, or `None` to leave the world's mirror as it is.
@@ -31,6 +32,11 @@ pub struct TickInput {
     /// it in the [`RegionLifecycle`](crate::RegionLifecycle) for `app` and `net` to take.
     /// Events, not state: nothing in the world depends on their order.
     pub failures: Vec<AssetFailure>,
+    /// Regions to unload now, applied before this frame's bundles so that a resync which
+    /// replaces a region takes one frame. Honoured under
+    /// [`RegionControl::Directed`](crate::RegionControl::Directed); under `Anchored` the
+    /// policy decides and these are dropped and logged.
+    pub unloaded: BTreeSet<RegionId>,
     /// Region bundles that have arrived, from the asset store or a save, by region.
     pub loaded: BTreeMap<RegionId, RegionBundle>,
     /// Asset version tables resolved and pinned outside the boundary, by region: the
@@ -38,10 +44,6 @@ pub struct TickInput {
     /// in. A table for a region that is not loaded after this frame's bundles is dropped
     /// and logged; a bundle carries its first table in [`RegionBundle::assets`].
     pub assets: BTreeMap<RegionId, PinnedTable>,
-    /// Regions to unload now. Honoured under
-    /// [`RegionControl::Directed`](crate::RegionControl::Directed); under `Anchored` the
-    /// policy decides and these are dropped and logged.
-    pub unloaded: BTreeSet<RegionId>,
     /// Mode changes, by region. Honoured under `Directed`; dropped and logged under
     /// `Anchored`.
     pub modes: BTreeMap<RegionId, RegionMode>,
@@ -116,14 +118,16 @@ pub struct RegionBundle {
 }
 
 /// A player joining or leaving the session (architecture section 9.1): the server's input,
-/// keyed by the player in [`TickInput::sessions`].
+/// keyed by the player in [`TickInput::sessions`]. A save carries no session state, so on
+/// a load every player joins again.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum SessionEvent {
     /// The player joins, in `region`. The sync point hands it to the [`SessionApplier`] at
     /// the first sync point at which `region` is loaded, which may be later than this
-    /// frame's; meanwhile the region counts as the player's position for activation.
+    /// frame's; meanwhile the region counts as the player's position for activation, from
+    /// this frame's bundle check on. A region the atlas lacks is refused and reported.
     Join {
-        /// The region the player's entity is spawned in.
+        /// The region the player's entity is spawned or re-claimed in.
         region: RegionId,
     },
     /// The player leaves. Applied at once; a `Leave` for a `Join` not yet applied cancels
@@ -141,13 +145,14 @@ pub enum SessionEvent {
 /// order, after [`World::set_input_tick`] has recorded the slot. The implementation decodes
 /// `sample.sample` with the component's own validation, resolves the player's entity from
 /// world state (the row with [`ClaimedBy`](lactose_ecs::ClaimedBy) for the player that also
-/// carries [`StreamingAnchor`](crate::StreamingAnchor), which the [`SessionApplier`]
-/// spawned; never a side table, which no frame could keep current) and writes the value
-/// through [`World::insert`] or [`World::get_mut`](lactose_ecs::World::get_mut). An error
-/// is logged at target `curd` and the input is dropped; the tick runs. The component is
-/// `derived`, or its crate adds an exclusive system of its own in a set after
-/// [`sets::INPUT`](crate::sets::INPUT) that declares `writes = [Sample]`, so transient
-/// readers have a writer.
+/// carries [`StreamingAnchor`](crate::StreamingAnchor), which the [`SessionApplier`] wrote on
+/// the server and `lactose-predict` writes on the local player's entity in the prediction
+/// world, where it has no policy effect; never a side table, which no frame could keep
+/// current) and writes the value through [`World::insert`] or
+/// [`World::get_mut`](lactose_ecs::World::get_mut). An error is logged at target `curd`
+/// and the input is dropped; the tick runs. The component is `derived`, or its crate adds
+/// an exclusive system of its own in a set after [`sets::INPUT`](crate::sets::INPUT) that
+/// declares `writes = [Sample]`, so transient readers have a writer.
 ///
 /// The same implementation serves the server (samples from `net`), the prediction world
 /// (the local player's own sample) and a replay (samples from the journal).
@@ -156,19 +161,22 @@ pub trait InputApplier: Send + Sync + 'static {
     fn apply(&mut self, world: &mut World, player: PlayerId, sample: &PlayerSample) -> Result<()>;
 }
 
-/// Spawns and despawns players' entities on the server: the typed half of session
-/// application, implemented by `app` or the game (the entity's components are the
-/// game's) and inserted by
-/// [`SimulationBuilder::sessions`](crate::SimulationBuilder::sessions) as the service
+/// Applies players' joins and leaves on the server: the typed half of session application,
+/// implemented by `app` or the game (the entity's components are the game's) and inserted
+/// by [`SimulationBuilder::sessions`](crate::SimulationBuilder::sessions) as the service
 /// resource `dyn SessionApplier`.
 ///
 /// The sync point calls it once per [`SessionEvent`] it applies, in ascending `PlayerId`
-/// order. For a `Join` the implementation spawns the player's entity in the event's
-/// region, with [`ClaimedBy`](lactose_ecs::ClaimedBy) for the player and
-/// [`StreamingAnchor`](crate::StreamingAnchor), through [`World::spawn`] with a key from
-/// [`World::allocate_net_id`](lactose_ecs::World::allocate_net_id). For a `Leave` it
-/// despawns that entity, or removes the claim and the anchor, resolving it from world
-/// state as the [`InputApplier`] does. An error is logged at target `curd`; the tick runs.
+/// order. For a `Join` the implementation spawns the player's entity in the event's region
+/// through [`World::spawn`] with a key from
+/// [`World::allocate_net_id`](lactose_ecs::World::allocate_net_id), or re-claims the entity
+/// the game keeps for the player across saves (found by a persistent component of the
+/// game's, such as a saved player identity), in either case adding
+/// [`ClaimedBy`](lactose_ecs::ClaimedBy) for the player and
+/// [`StreamingAnchor`](crate::StreamingAnchor). For a `Leave` it despawns that entity, or
+/// removes the claim and the anchor and leaves the game's row for the next join, resolving
+/// it from world state as the [`InputApplier`] does. An error is logged at target `curd`;
+/// the tick runs.
 pub trait SessionApplier: Send + Sync + 'static {
     /// Applies `event` for `player`.
     fn apply(&mut self, world: &mut World, player: PlayerId, event: SessionEvent) -> Result<()>;

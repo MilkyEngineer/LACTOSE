@@ -7,15 +7,17 @@
 //! `VersionTable` (a replay pins it again from a store), a bundle by the baseline's content
 //! hash with the overlay, resources and transient keys it carried (the replay fetches the
 //! baseline by its hash), samples, sessions and failures verbatim. The journal also records
-//! the tables and modes in force at the checkpoint, which the checkpoint's rows do not
-//! carry, so every region the replay runs can be rebuilt.
+//! what a save does not: the tables and modes in force at the checkpoint, and the session
+//! state (the joined players' entities, the held joins and the requested regions), which
+//! the replay driver restores before its first step, so every region and every player the
+//! replay runs can be rebuilt.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use lactose_asset_api::{AssetFailure, VersionTable};
 use lactose_bundle::{ComponentData, Overlay};
-use lactose_core::{ComponentKey, PlayerId, Tick};
+use lactose_core::{ComponentKey, PlayerId, StableKey, Tick};
 use lactose_ecs::{RegionId, RegionMode};
 
 use crate::input::{PlayerSample, SessionEvent, TickInput};
@@ -31,11 +33,19 @@ pub struct Journal {
     pub tables: BTreeMap<RegionId, VersionTable>,
     /// The mode of every region loaded at the checkpoint.
     pub modes: BTreeMap<RegionId, RegionMode>,
+    /// Every joined player's claimed, anchored entity at the checkpoint: the replay driver
+    /// re-claims each before its first step, as a `Join` would.
+    pub players: BTreeMap<PlayerId, StableKey>,
+    /// The joins held for a region not loaded at the checkpoint.
+    pub held_joins: BTreeMap<PlayerId, RegionId>,
+    /// The regions requested and not yet loaded at the checkpoint.
+    pub requested: BTreeSet<RegionId>,
     /// One frame per tick after the checkpoint, ascending.
     pub frames: Vec<JournalFrame>,
 }
 
-/// What one tick's [`TickInput`] carried, as recorded; the fields mirror it.
+/// What one tick's [`TickInput`] carried, as recorded; the fields mirror it, in its
+/// application order.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct JournalFrame {
     /// The tick the input was applied for.
@@ -44,13 +54,13 @@ pub struct JournalFrame {
     pub time_scale: Option<TimeScale>,
     /// The asset failures, verbatim.
     pub failures: Vec<AssetFailure>,
+    /// The regions unloaded through the frame.
+    pub unloaded: BTreeSet<RegionId>,
     /// The bundles that loaded, by region.
     pub loaded: BTreeMap<RegionId, JournalLoad>,
     /// The tables that entered, by region: the publish events of architecture section 9.3
     /// as journaled.
     pub assets: BTreeMap<RegionId, VersionTable>,
-    /// The regions unloaded through the frame.
-    pub unloaded: BTreeSet<RegionId>,
     /// The mode changes through the frame.
     pub modes: BTreeMap<RegionId, RegionMode>,
     /// The sessions, verbatim.

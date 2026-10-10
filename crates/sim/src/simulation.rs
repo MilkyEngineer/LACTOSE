@@ -82,8 +82,9 @@ impl SimulationBuilder {
         self
     }
 
-    /// Who decides loads and modes. `Anchored` on a world that is not `Server`, or with an
-    /// empty atlas, fails [`build`](Self::build) with `InvalidData`.
+    /// Who decides loads and modes. `Anchored` on a world that is not `Server`, with an
+    /// empty atlas, or with a pinned region the atlas lacks, fails [`build`](Self::build)
+    /// with `InvalidData`.
     #[must_use]
     pub fn regions(mut self, control: RegionControl) -> Self {
         self.control = control;
@@ -100,7 +101,10 @@ impl SimulationBuilder {
     }
 
     /// How many ticks of the structural change log a step keeps. At the end of every step
-    /// the entries older than that are trimmed; a consumer whose
+    /// the entries older than that are trimmed: the step keeps a ring of one
+    /// [`StructuralLog::cursor`](lactose_ecs::StructuralLog::cursor) per step and trims to
+    /// the oldest with [`World::trim_structural_log`], which ignores a cursor made stale by
+    /// a restore, a load or the stamp rebase, so those heal on their own. A consumer whose
     /// [`LogCursor`](lactose_ecs::LogCursor) has fallen further behind gets `None` from
     /// [`StructuralLog::since`](lactose_ecs::StructuralLog::since) and does a full pass, as
     /// the ECS already allows. No consumer trims the log itself.
@@ -114,12 +118,14 @@ impl SimulationBuilder {
     /// crate's own resources and services are inserted and before any registration
     /// function runs, with the world to insert into. One per crate that contributes
     /// resources or services: configuration resources (`Res<Gravity>`), the physics
-    /// backend's service, `net`'s gather state, the presentation staging ring. Every
-    /// resource and service a registered system names is inserted by a setup function;
-    /// `build` fails with `InvalidData` carrying
+    /// backend's service with the solver pool `app` built outside the boundary, `net`'s
+    /// gather state, the presentation staging ring. Every resource and service a
+    /// registered system names is inserted by a setup function; `build` fails with
+    /// `InvalidData` carrying
     /// [`ScheduleError::MissingResource`](lactose_ecs::ScheduleError::MissingResource)
     /// otherwise. A world resource inserted here is configuration or session state and
-    /// so `derived`; `build` refuses any other policy (the README says why).
+    /// so `derived`; `build` refuses any other policy among the resource types the
+    /// [`TypeTable`] knows (the README says why and what the check does not cover).
     #[must_use]
     pub fn setup(mut self, f: impl FnOnce(&mut World) -> Result<()> + Send + 'static) -> Self {
         self.setups.push(Box::new(f));
@@ -129,7 +135,8 @@ impl SimulationBuilder {
     /// Adds a registration function: it is called once at [`build`](Self::build), after
     /// every setup function and those registration functions added before it, with a
     /// [`Registration`] for this kind. One per crate that contributes systems (`game-sim`,
-    /// `physics-rapier`, `anim`, `net`, `presentation`).
+    /// `physics-rapier`, `anim`, `net`, `presentation`), and one of `app`'s own for the
+    /// [`Registration::order`] edges between other crates' sets.
     #[must_use]
     pub fn systems(mut self, register: impl FnOnce(&mut Registration) + Send + 'static) -> Self {
         self.registrations.push(Box::new(register));
@@ -145,9 +152,9 @@ impl SimulationBuilder {
         self
     }
 
-    /// The hook that spawns and despawns players' entities, inserted as the service
-    /// resource `dyn SessionApplier`. Without one, a frame's sessions are dropped and
-    /// logged.
+    /// The hook that spawns, re-claims and despawns players' entities, inserted as the
+    /// service resource `dyn SessionApplier`. Without one, a frame's sessions are dropped
+    /// and logged.
     #[must_use]
     pub fn sessions(mut self, applier: Box<dyn SessionApplier>) -> Self {
         self.sessions = Some(applier);
@@ -167,11 +174,11 @@ impl SimulationBuilder {
     /// [`CurrentTick`](crate::CurrentTick), [`TimeScale`](crate::TimeScale) at
     /// `REAL_TIME`, [`RegionPolicy`]) and services (the three hooks, the lifecycle, the
     /// frame and save slots); runs every setup function in order, then checks that no world
-    /// resource whose policy is not `derived` is present; runs every registration function
-    /// in order; builds the tick schedule, the pass schedules and the save pass; and
-    /// prepares each against the world, so that a schedule error surfaces here as
-    /// `InvalidData` carrying the [`ScheduleError`](lactose_ecs::ScheduleError), never in a
-    /// step.
+    /// resource of a registered type whose policy is not `derived` is present; runs every
+    /// registration function in order; builds the tick schedule, the pass schedules and
+    /// the save pass with the orders their sets belong to; and prepares each against the
+    /// world, so that a schedule error surfaces here as `InvalidData` carrying the
+    /// [`ScheduleError`](lactose_ecs::ScheduleError), never in a run.
     ///
     /// Fails with `InvalidData` as the setters say, as a setup function does, as
     /// [`WorldBuilder::build`](lactose_ecs::WorldBuilder::build) does, for a non-`derived`
@@ -182,7 +189,7 @@ impl SimulationBuilder {
 }
 
 /// A world with its tick schedule, its pass schedules, its hashers and its region lifecycle:
-/// what the timer root owns and steps.
+/// what the timer root owns and runs.
 ///
 /// Between runs the world is reachable for direct access: a snapshot, a restore, a
 /// resource, a query. Every run ([`step`](Self::step), [`run_passes`](Self::run_passes),
@@ -267,26 +274,31 @@ impl Simulation {
     }
 
     /// Runs one tick with `input` applied at its input sync point, trims the structural log
-    /// to the retention, and hands the simulation back at the next tick. Nothing else: the
-    /// passes are [`run_passes`](Self::run_passes). The README states what the sync point
-    /// does and in what order; the signature states that a step takes no clock and nothing
-    /// but `input`.
+    /// to the retention, on a `Server` world takes and drops the presentation events so the
+    /// queue does not grow (every other kind leaves them for `predict` or presentation),
+    /// and hands the simulation back at the next tick. Nothing else: the passes are
+    /// [`run_passes`](Self::run_passes). The README states what the sync point does and in
+    /// what order; the signature states that a step takes no clock and nothing but `input`,
+    /// which is consumed: a caller that may retry keeps a clone.
     ///
     /// The future is `Send` and is driven by the `'static` task that owns the simulation.
-    /// It resolves to a [`RunError`] with the simulation inside if a schedule no longer
-    /// prepares against the world (`InvalidData`), checked before anything runs; and with
-    /// `None` after `Cancelled`, when the executor shut down mid-run and the world is torn.
+    /// It resolves to a [`RunError`] with the simulation inside if the tick schedule no
+    /// longer prepares against the world (`InvalidData`), checked before anything runs; and
+    /// with `None` after `Cancelled`, when the executor shut down mid-run and the world is
+    /// torn.
     pub fn step(self, executor: &Executor, input: TickInput) -> Step<'_> {
         todo!()
     }
 
     /// Runs the passes of this frame: [`Pass::Extract`](crate::Pass::Extract) then
     /// [`Pass::Gather`](crate::Pass::Gather), each with [`Schedule::run_pass`] and only if
-    /// a system was registered for it, then on a `Server` world takes and drops the
-    /// presentation events so the queue does not grow (every other kind leaves them for
-    /// `predict` or presentation). The timer root calls it once per frame after the frame's
-    /// ticks, paused or not, so what was edited between ticks is still extracted and
-    /// replicated; `lactose-predict`'s re-simulation never calls it. Fails as a step does.
+    /// a system was registered for it, both prepared before either runs so that a failure
+    /// before anything ran hands the simulation back. The timer root calls it once per
+    /// frame after the frame's ticks, paused or not, on the server and on both client
+    /// worlds, so what was edited between ticks is still extracted and replicated and the
+    /// prediction world's local player is extracted every frame; a gather therefore covers
+    /// every tick since the last frame, up to the catch-up cap. `lactose-predict`'s
+    /// re-simulation calls [`step`](Self::step) alone. Fails as a step does.
     pub fn run_passes(self, executor: &Executor) -> PassRun<'_> {
         todo!()
     }
@@ -306,8 +318,9 @@ impl Simulation {
 /// How a run fails: the error, and the simulation when nothing ran. `Some` when the kind
 /// check or [`Schedule::prepare`] failed before the run started, so the caller keeps its
 /// world; `None` after `Cancelled`, when the executor shut down during the run and the
-/// world dropped with it. Converts into [`Error`], so `?` into a `lactose_core::Result`
-/// drops the simulation as a plain error would.
+/// world dropped with it. The frame a step was given is not handed back either way.
+/// Converts into [`Error`], so `?` into a `lactose_core::Result` drops the simulation as a
+/// plain error would.
 pub struct RunError {
     /// What failed.
     pub error: Error,
@@ -387,7 +400,8 @@ impl Future for SavePointRun<'_> {
 /// regions' overlays, and what it hands back to [`SimulationBuilder::tick`],
 /// [`SimulationBuilder::next_net_id`] and, region by region through
 /// [`TickInput::loaded`](crate::TickInput::loaded), on a load. World resources are not in
-/// it: they are configuration or session state, never saved.
+/// it: they are configuration or session state, never saved. Nor is session state: a save
+/// carries no players, held joins or requests, so on a load every player joins again.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct SavePoint {
     /// The tick the copy was taken at.

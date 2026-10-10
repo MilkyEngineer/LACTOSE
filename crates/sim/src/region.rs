@@ -1,6 +1,7 @@
 //! Region lifecycle (architecture sections 6, 9.7 and 14): activation by anchor position
-//! within a radius measured in regions, streaming ahead of it, release behind it, and an
-//! unload that writes the same records as a save.
+//! within a radius measured in regions, streaming ahead of it, release behind it, pinned
+//! regions that are always simulated, and an unload that writes the same records as a
+//! save.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -133,12 +134,14 @@ pub struct RegionPolicy {
 }
 
 /// Marks an entity whose position activates regions: a player's own entity, which the
-/// [`SessionApplier`](crate::SessionApplier) spawns with it beside
-/// [`ClaimedBy`](lactose_ecs::ClaimedBy) and despawns on leave, or a spectator the game
-/// spawns. The region an anchor resides in is its position for the policy; a claimed
-/// object the player threw is not an anchor, so a thrown bomb activates nothing. Session
-/// state like `ClaimedBy`: not saved, not hashed, not replicated. A pending `Join` whose
-/// region is not loaded yet counts as an anchor at its region until it is applied.
+/// [`SessionApplier`](crate::SessionApplier) writes on join beside
+/// [`ClaimedBy`](lactose_ecs::ClaimedBy) and removes or despawns on leave, or a spectator
+/// the game spawns. The region an anchor resides in is its position for the policy; a
+/// claimed object the player threw is not an anchor, so a thrown bomb activates nothing.
+/// Session state like `ClaimedBy`: not saved, not hashed, not replicated. A `Join` whose
+/// region is not loaded yet counts as an anchor at its region until it is applied. In the
+/// prediction world `lactose-predict` writes it on the local player's entity so the
+/// appliers' lookup resolves; under `Directed` it has no policy effect.
 #[component(key = "sim::streaming_anchor", derived)]
 #[derive(PartialEq, Eq, Debug)]
 pub struct StreamingAnchor {
@@ -154,11 +157,20 @@ pub enum RegionControl {
     /// The server's policy (architecture section 9.7): at every input sync point, last
     /// among `sim`'s systems, the lifecycle reads the anchors and [`RegionPolicy`],
     /// requests loads within the streaming radius, cancels requests and unloads outside the
-    /// release radius, and sets every loaded region `Simulated` or `Frozen`. A bundle for a
-    /// region that is neither requested nor within the release radius of an anchor is
-    /// refused. The frame's `unloaded` and `modes` are ignored, and so is a bundle's
-    /// `mode`. Only a `Server` world may use it, and the atlas must not be empty.
-    Anchored(RegionAtlas),
+    /// release radius, and sets every loaded region `Simulated` or `Frozen`. `pinned`
+    /// regions are always wanted and never released: requested at the first sync point,
+    /// `Simulated` once loaded with a table, whatever the anchors; world-global persistent
+    /// state is a region resource of a pinned region. A bundle for a region that is
+    /// neither requested nor within the release radius of an anchor is refused. The
+    /// frame's `unloaded` and `modes` are ignored, and so is a bundle's `mode`. Only a
+    /// `Server` world may use it, the atlas must not be empty, and every pinned region must
+    /// be in the atlas.
+    Anchored {
+        /// Where every region sits.
+        atlas: RegionAtlas,
+        /// The regions that are always wanted.
+        pinned: BTreeSet<RegionId>,
+    },
     /// The frame decides: bundles load in the mode they carry, `unloaded` unloads, `modes`
     /// applies, nothing is requested. What a client or prediction world uses, since the
     /// server tells a client what is relevant, and what a test or the headless app uses to
@@ -221,6 +233,18 @@ pub struct LoadFailure {
     pub error: Error,
 }
 
+/// A session event the sync point refused: a `Join` for a region the atlas lacks
+/// (`NotFound`), which is neither held nor applied.
+#[derive(Debug)]
+pub struct SessionFailure {
+    /// The tick whose sync point refused the event.
+    pub tick: Tick,
+    /// The player.
+    pub player: PlayerId,
+    /// Why.
+    pub error: Error,
+}
+
 /// An asset failure stamped with the tick it entered: the tick-stamped event of
 /// architecture section 14, which a client turns into a resync request.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -238,7 +262,9 @@ pub struct AssetFailureEvent {
 ///
 /// Everything here but the failures is server-only session state, which the server never
 /// rolls back: it is not in a snapshot, and architecture section 10's list of what a
-/// restore keeps is unchanged. A prediction world's lifecycle holds failures alone.
+/// restore keeps is unchanged. A journal records it with its checkpoint
+/// ([`journal::Journal`](crate::journal::Journal)), since a save does not. A prediction
+/// world's lifecycle holds failures alone.
 #[derive(Debug)]
 pub struct RegionLifecycle {
     control: RegionControl,
@@ -248,6 +274,7 @@ pub struct RegionLifecycle {
     requests: Vec<RegionRequest>,
     exports: Vec<RegionExport>,
     load_failures: Vec<LoadFailure>,
+    session_failures: Vec<SessionFailure>,
     asset_failures: Vec<AssetFailureEvent>,
 }
 
@@ -260,6 +287,7 @@ impl RegionLifecycle {
             requests: Vec::new(),
             exports: Vec::new(),
             load_failures: Vec::new(),
+            session_failures: Vec::new(),
             asset_failures: Vec::new(),
         }
     }
@@ -296,6 +324,11 @@ impl RegionLifecycle {
 
     /// The bundles refused since the last take.
     pub fn take_load_failures(&mut self) -> Vec<LoadFailure> {
+        todo!()
+    }
+
+    /// The session events refused since the last take.
+    pub fn take_session_failures(&mut self) -> Vec<SessionFailure> {
         todo!()
     }
 

@@ -33,10 +33,11 @@ impl TickDelta {
 }
 
 /// The tick being simulated, for systems that cannot take [`Ctx`](lactose_ecs::Ctx): a
-/// once-per-tick system, an exclusive system or a finalize. Written by the input sync point
-/// from [`World::tick`](lactose_ecs::World::tick), which stays the source of truth, and
-/// readable only through [`get`](Self::get), so nothing can desynchronise the two; between
-/// ticks they agree. Not saved and not hashed.
+/// once-per-tick system, an exclusive system or a finalize. The input sync point rewrites
+/// it every tick from [`World::tick`](lactose_ecs::World::tick), which stays the source of
+/// truth, and it is read through [`get`](Self::get); a write (a decoded value, or
+/// `world_mut`) is a bug the type cannot prevent, bounded to one tick. Between runs it
+/// equals `Simulation::tick`. Not saved and not hashed.
 #[resource(key = "sim::current_tick", derived)]
 #[derive(PartialEq, Eq, Debug)]
 pub struct CurrentTick(#[field(id = 1)] Tick);
@@ -64,8 +65,11 @@ impl CurrentTick {
 /// (on the server its decision, on a client the latest value `net` received), never reads
 /// it back from the world, and no game system reads it either, since a paused world runs
 /// no system that could unpause it and the scale is not simulation state. `replicated` so
-/// that `net` carries it to clients; derived; in a prediction-world snapshot like every
-/// reflected resource. Presentation runs on real time regardless.
+/// that `net` carries it to clients, which means a pause is entered by running one tick
+/// whose frame carries `Some(PAUSED)` before the server's pacer goes to zero, and left by
+/// setting the pacer first and putting `Some(scale)` in the next frame. Derived; in a
+/// prediction-world snapshot like every reflected resource. Presentation runs on real time
+/// regardless.
 #[resource(key = "sim::time_scale", derived, replicated)]
 #[derive(PartialEq, Eq, Debug)]
 pub struct TimeScale {

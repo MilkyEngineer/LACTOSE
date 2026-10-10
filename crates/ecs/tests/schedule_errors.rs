@@ -187,6 +187,73 @@ fn structural_errors() {
     );
 }
 
+static ORDER_A: SystemSet = SystemSet::new("test::order_a");
+static ORDER_B: SystemSet = SystemSet::new("test::order_b");
+
+#[system(name = "test::ordered_a", exclusive, in_set = ORDER_A)]
+fn ordered_a(_world: &mut World) {}
+
+#[system(name = "test::ordered_b", exclusive, in_set = ORDER_B)]
+fn ordered_b(_world: &mut World) {}
+
+/// An edge the assembler adds between two sets that do not name each other orders their
+/// systems, in either direction; across stages it must agree with the stage order; a set no
+/// stage declares is an error.
+#[test]
+fn an_assembler_orders_sets_that_do_not_name_each_other() {
+    let names = |schedule: &Schedule| -> Vec<&'static str> {
+        schedule.order().iter().map(|system| system.name()).collect()
+    };
+    let unordered = {
+        let mut builder = Schedule::builder(WorldKind::Server);
+        builder.stage("only", &[&ORDER_A, &ORDER_B]).add(&ORDERED_A).add(&ORDERED_B);
+        builder.build().map(|_| ()).unwrap_err()
+    };
+    assert!(matches!(unordered, ScheduleError::UnorderedConflict { .. }), "{unordered:?}");
+
+    let mut builder = Schedule::builder(WorldKind::Server);
+    builder.stage("only", &[&ORDER_A, &ORDER_B]).add(&ORDERED_A).add(&ORDERED_B);
+    builder.order(&ORDER_A, &ORDER_B);
+    assert_eq!(names(&builder.build().unwrap()), ["test::ordered_a", "test::ordered_b"]);
+
+    let mut builder = Schedule::builder(WorldKind::Server);
+    builder.stage("only", &[&ORDER_A, &ORDER_B]).add(&ORDERED_A).add(&ORDERED_B);
+    builder.order(&ORDER_B, &ORDER_A);
+    assert_eq!(names(&builder.build().unwrap()), ["test::ordered_b", "test::ordered_a"]);
+
+    let mut builder = Schedule::builder(WorldKind::Server);
+    builder.stage("only", &[&ORDER_A, &ORDER_B]).add(&ORDERED_A).add(&ORDERED_B);
+    builder.order(&ORDER_A, &ORDER_B).order(&ORDER_B, &ORDER_A);
+    assert!(matches!(builder.build().map(|_| ()).unwrap_err(), ScheduleError::Cycle { .. }));
+
+    // Across stages: agreeing with the stage order is accepted, disagreeing is a cycle.
+    let mut builder = Schedule::builder(WorldKind::Server);
+    builder.stage("first", &[&ORDER_A]).add(&ORDERED_A);
+    builder.stage("second", &[&ORDER_B]).add(&ORDERED_B);
+    builder.order(&ORDER_A, &ORDER_B);
+    assert_eq!(names(&builder.build().unwrap()), ["test::ordered_a", "test::ordered_b"]);
+    let mut builder = Schedule::builder(WorldKind::Server);
+    builder.stage("first", &[&ORDER_A]).add(&ORDERED_A);
+    builder.stage("second", &[&ORDER_B]).add(&ORDERED_B);
+    builder.order(&ORDER_B, &ORDER_A);
+    assert_eq!(
+        builder.build().map(|_| ()).unwrap_err(),
+        ScheduleError::Cycle { members: vec!["test::order_b", "test::order_a"] }
+    );
+
+    let mut builder = Schedule::builder(WorldKind::Server);
+    builder.stage("only", &[&ORDER_A]).add(&ORDERED_A);
+    builder.order(&ELSEWHERE, &ORDER_A);
+    assert_eq!(
+        builder.build().map(|_| ()).unwrap_err(),
+        ScheduleError::UnknownOrderedSet {
+            set: "test::elsewhere",
+            before: "test::elsewhere",
+            after: "test::order_a"
+        }
+    );
+}
+
 #[test]
 fn parameter_errors() {
     let cases: [(&'static SystemDescriptor, ScheduleError); 10] = [

@@ -68,7 +68,7 @@ pub use input::{
 };
 pub use region::{
     AssetFailureEvent, LoadFailure, RegionAtlas, RegionCell, RegionControl, RegionExport,
-    RegionLifecycle, RegionPolicy, RegionRequest, StreamingAnchor, Within,
+    RegionLifecycle, RegionPolicy, RegionRequest, SessionFailure, StreamingAnchor, Within,
 };
 pub use schedule::{Pass, Registration, Stage, StageBuilder, sets};
 pub use simulation::{

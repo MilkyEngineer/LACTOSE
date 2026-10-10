@@ -32,7 +32,7 @@ and list what changed, because `sim`, `predict`, `physics-api`, `net`, `persist`
 | `Commands`, `Bundle`, `CommandChannel`, `ChannelWriter`, `Channel` | Structural commands applied at the next sync point; typed channels for other crates' commands |
 | `Event`, `EventWriter`, `Events` | Cross-entity effects within a tick, indexed by target |
 | `PresentEvent`, `PresentEvents`, `PresentEventBatch` | Requests to presentation, keyed by (origin, tick, kind, sequence) for rollback |
-| `Schedule`, `ScheduleBuilder`, `ScheduleError` | Stages separated by sync points; a deterministic order; `run_tick` and `run_pass` |
+| `Schedule`, `ScheduleBuilder`, `ScheduleError` | Stages separated by sync points; a deterministic order; `run_tick` and `run_pass`; `ScheduleBuilder::order`, an edge between two sets added by the assembler |
 | `Executor` | Re-exported from `lactose-task`: what `run_tick` and `run_pass` take, so a boundary crate that drives a schedule (`sim`, `predict`) names it without a `task` edge |
 | `RegionId`, `RegionMode`, `RegionConfig`, `InRegion`, `OwnedBy`, `ClaimedBy`, `PredictedOrigin` | Regions and the components the world maintains |
 | `Rng` | The counter-based generator, from `Ctx::rng` and `World::rng` |
@@ -255,7 +255,11 @@ What a system is, from its parameters (`SystemParam` has the table):
   `ScheduleBuilder::stage` takes the stage's sets as any slice, so `&[&MOVEMENT]` works in
   a function; the sets themselves are statics, and a set belongs to one stage
   (`ScheduleError::SetInTwoStages`). Two unordered exclusive systems conflict on
-  `AccessTarget::World`.
+  `AccessTarget::World`. `ScheduleBuilder::order(before, after)` adds an edge between two
+  sets from outside them, so the assembler can order the sets of two crates that do not
+  name each other; both sets must be declared in some stage
+  (`ScheduleError::UnknownOrderedSet`), and an edge across stages is accepted when it
+  agrees with the stage order and is a `ScheduleError::Cycle` otherwise.
 - `Changed<T>` in system S passes rows whose change stamp is after S's position in the
   previous tick and before it in this one: each change is seen exactly once by each reader,
   whether it came from a system ordered before S, a command at a sync point or direct

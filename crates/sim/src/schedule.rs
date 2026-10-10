@@ -11,15 +11,16 @@ use lactose_ecs::{Schedule, ScheduleError, SystemDescriptor, SystemSet, WorldKin
 pub enum Stage {
     /// The input sync point. Opens with `sim`'s exclusive systems in [`sets::INPUT`], which
     /// apply the frame; a crate that must act at the sync point after them adds its
-    /// exclusive system here in a set declared `.after(&[&sets::INPUT])`. Nothing else
-    /// belongs in it.
+    /// exclusive system here in a set declared `.after(&[&sets::INPUT])`, and `app` orders
+    /// two such crates' sets with [`Registration::order`]. Nothing else belongs in it.
     Input,
     /// Gameplay: the sets of `game-sim`, `game-ai` and `anim`. Physics writes recorded here
     /// through the physics command channel are what the step reads in the next stage.
     Simulation,
     /// The physics step (architecture section 16): `physics-api`'s once-per-tick system
     /// that takes [`Job`](lactose_ecs::Job), reads the channel the simulation stage wrote,
-    /// steps the solver through `block_in_place`, and writes bodies back through
+    /// steps the solver through `block_in_place` on a pool `app` built outside the boundary
+    /// and handed in through a setup function, and writes bodies back through
     /// [`Commands`](lactose_ecs::Commands), which apply at the sync point that begins
     /// `Post`. It is not exclusive, so systems that do not depend on physics may be placed
     /// here and run alongside it on the reserved workers; everything that reads the stepped
@@ -57,8 +58,9 @@ pub enum Pass {
     /// ring and writes the presentation snapshot. Milestone 2 fills it.
     Extract,
     /// The replication gather (architecture section 9.3): `net` copies rows whose tick
-    /// advanced and the structural log into its per-tick staging buffer, keyed by its
-    /// `ChangeMark` and `LogCursor`. Milestone 4 fills it.
+    /// advanced and the structural log into its staging buffer, keyed by its `ChangeMark`
+    /// and `LogCursor`; one gather covers every tick since the last frame, up to the
+    /// catch-up cap. Milestone 4 fills it.
     Gather,
 }
 
@@ -89,9 +91,10 @@ pub mod sets {
 }
 
 /// What a registration function adds to: the systems and sets of each [`Stage`] of the tick
-/// schedule, and the one stage of each [`Pass`]. One function serves every world kind,
-/// since [`StageBuilder::add`] skips a system whose `worlds` exclude [`kind`](Self::kind);
-/// a function that must differ by kind reads it.
+/// schedule, the one stage of each [`Pass`], and the edges between sets of different crates
+/// that `app` adds. One function serves every world kind, since [`StageBuilder::add`] skips
+/// a system whose `worlds` exclude [`kind`](Self::kind); a function that must differ by
+/// kind reads it.
 ///
 /// ```
 /// use lactose_ecs::SystemSet;
@@ -111,11 +114,12 @@ pub struct Registration {
     kind: WorldKind,
     stages: [StageBuilder; 4],
     passes: [StageBuilder; 2],
+    orders: Vec<(&'static SystemSet, &'static SystemSet)>,
 }
 
 impl Registration {
     pub(crate) fn new(kind: WorldKind) -> Self {
-        Self { kind, stages: Default::default(), passes: Default::default() }
+        Self { kind, stages: Default::default(), passes: Default::default(), orders: Vec::new() }
     }
 
     /// The kind of world being registered for.
@@ -137,8 +141,22 @@ impl Registration {
         &mut self.passes[pass as usize]
     }
 
+    /// Orders every system of `before` before every system of `after`, through
+    /// [`ScheduleBuilder::order`](lactose_ecs::ScheduleBuilder::order) of the schedule that
+    /// declares `before`: the tick schedule, whichever stages hold the two sets, or the
+    /// pass that holds both. How `app` orders the sets of two crates that do not name each
+    /// other and both add an exclusive system to one pass, or to `Stage::Input` after
+    /// [`sets::INPUT`]. A set no schedule declares, or two sets in different schedules, is
+    /// [`ScheduleError::UnknownOrderedSet`] at build; an edge against the stage order is a
+    /// [`ScheduleError::Cycle`].
+    pub fn order(&mut self, before: &'static SystemSet, after: &'static SystemSet) -> &mut Self {
+        self.orders.push((before, after));
+        self
+    }
+
     /// Builds the tick schedule, with `sim`'s own set and systems placed first in the
-    /// `Input` stage, and each pass schedule; a pass with no system builds to `None`.
+    /// `Input` stage, and each pass schedule, each with the orders whose sets it declares;
+    /// a pass with no system builds to `None`.
     pub(crate) fn build(
         self,
     ) -> core::result::Result<(Schedule, [Option<Schedule>; 2]), ScheduleError> {

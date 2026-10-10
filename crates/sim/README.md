@@ -16,8 +16,8 @@ every sentence under "Behaviour the signatures cannot express" is one a dependen
 rely on. Architecture sections 4, 5.1, 6, 8.2, 8.3, 9.1, 9.2, 9.3, 9.7, 11, 14, 15.2, 15.3
 and 15.5 are the design; where this file and the architecture disagree, the architecture
 wins and this file is wrong. Decision D118 records the choices those sections left open
-and what the design review changed. `crates/ecs/README.md` is the storage contract this
-crate builds on and never restates: what it says about the input sync point, regions,
+and what the two design reviews changed. `crates/ecs/README.md` is the storage contract
+this crate builds on and never restates: what it says about the input sync point, regions,
 snapshots, exports and change tracking holds here unchanged.
 
 Amending a signature is allowed in the change that needs it. Say so in the change description
@@ -36,13 +36,13 @@ breaks one is a signature change to list.
 | `Simulation::run_passes`, `PassRun` | A frame's passes between ticks |
 | `Simulation::save_point`, `SavePointRun`, `SavePoint` | The save copy of every loaded region at a sync point |
 | `RunError` | How a run fails: the error, and the simulation when nothing ran |
-| `Stage`, `Pass`, `Registration`, `StageBuilder`, `sets::INPUT` | The four stages of the tick schedule, the two passes, how a registration function adds to them, and the one set a consumer orders itself after at the sync point |
+| `Stage`, `Pass`, `Registration`, `StageBuilder`, `sets::INPUT` | The four stages of the tick schedule, the two passes, how a registration function adds to them and how `app` orders other crates' sets, and the one set a consumer orders itself after at the sync point |
 | `PlayerSample`, `InputApplier` | A player's quantised input for a tick, and the hook that writes the typed component |
-| `SessionEvent`, `SessionApplier` | A player joining or leaving, and the hook that spawns or despawns the player's entity |
+| `SessionEvent`, `SessionApplier` | A player joining or leaving, and the hook that spawns, re-claims or despawns the player's entity |
 | `StagedState` | The hook `net` and `predict` fill at the sync point |
 | `RegionBundle` | What a frame carries for a region that loads |
-| `RegionControl`, `RegionAtlas`, `RegionCell`, `Within`, `RegionPolicy`, `StreamingAnchor` | Activation, streaming and release: the server's policy and its inputs |
-| `RegionLifecycle`, `RegionRequest`, `RegionExport`, `LoadFailure`, `AssetFailureEvent` | The lifecycle's state and outputs |
+| `RegionControl`, `RegionAtlas`, `RegionCell`, `Within`, `RegionPolicy`, `StreamingAnchor` | Activation, streaming, release and pinned regions: the server's policy and its inputs |
+| `RegionLifecycle`, `RegionRequest`, `RegionExport`, `LoadFailure`, `SessionFailure`, `AssetFailureEvent` | The lifecycle's state and outputs |
 | `Hashers`, `Simulation::world_hash`, `Simulation::hash` | The world hash of architecture section 8.3 |
 | `RegionDigest`, `DigestRows`, `Differences`, `FieldDifference` | The field-level diff produced on a mismatch |
 | `TickDelta`, `CurrentTick`, `TimeScale`, `TICK_RATE_HZ` | Time as the simulation sees it |
@@ -60,20 +60,20 @@ slot, the lifecycle slot, the save slot). No consumer can name a system or the l
 
 | Consumer | Needs | Where |
 |---|---|---|
-| `app` (headless, milestone 1) | Build from a registry, a kind, SOUR's layout and chaos, an executor, setup functions and registration functions | `TypeTable`; `SimulationBuilder::{new, layout, setup, systems, inputs, sessions, staged_state, regions, policy, log_retention, build}`; chaos is the executor builder's |
+| `app` (headless, milestone 1) | Build from a registry, a kind, SOUR's layout and chaos, an executor, setup functions and registration functions; order other crates' sets | `TypeTable`; `SimulationBuilder::{new, layout, setup, systems, inputs, sessions, staged_state, regions, policy, log_retention, build}`; `Registration::order` from a registration function of `app`'s own; chaos is the executor builder's |
 | | A `'static` task owning the world and schedules, paced by `TickPacer`, driving `Schedule::run_tick` | `Simulation` is `Send` and owns both; `step` drives `run_tick`, `run_passes` the passes; the task, every clock and the time scale it paces by are `app`'s ("The timer root" below) |
 | | The overload ladder's inputs surfaced, not decided | `TickBudget::behind` from the pacer; `RegionPolicy::activation_radius` is the rung the ladder turns; decimation and join refusal are not here |
 | | Pause and time scale as a replicated resource | `TickInput::time_scale`, mirrored into `TimeScale` (replicated) by the sync point |
 | | Players joining and leaving as journaled inputs | `TickInput::sessions`, `SessionApplier` |
 | Game crates | `TickDelta`, the tick | `Res<TickDelta>`, `Res<CurrentTick>` (or `Ctx::tick`); the time scale is not theirs to read |
-| | Configuration resources | A setup function inserts them, `derived` |
+| | Configuration resources; world-global persistent state | A setup function inserts configuration, `derived`; world-global persistent state is a region resource of a pinned region |
 | | Add sets to the simulation stage without owning the stage list | `Registration::stage(Stage::Simulation).sets(..).add(..)`; the stages are `Input`, `Simulation`, `Physics`, `Post` |
-| `physics-api`, `anim` | A place for the step and for what reads it | `Stage::Physics` for the once-per-tick step with `Job`; `Stage::Post` for readers; `Stage::Simulation` for the sim skeleton's state machines; a setup function for the backend's service |
+| `physics-api`, `anim` | A place for the step and for what reads it; the solver pool | `Stage::Physics` for the once-per-tick step with `Job`; `Stage::Post` for readers; `Stage::Simulation` for the sim skeleton's state machines; a setup function hands in the backend's service with the pool `app` built outside the boundary |
 | `input` | How a per-tick batch of inputs reaches the sync point; where the typed write happens | `TickInput::inputs` as `PlayerSample` bytes by player; `InputApplier` beside the component's definition |
 | `net` | Apply staged state at the sync point; the gather as a pass; spawn with the server's key and bind; sessions | `StagedState` on a client; `Registration::pass(Pass::Gather)`; `&mut World` inside the hook; `TickInput::sessions` on the server |
-| `predict` | The deterministic step to re-run; snapshot, restore, horizon; the proxy update at the sync point | `step` with the ring's `TickInput`s; `world_mut()` between runs; `StagedState` in the prediction world; never `run_passes` |
+| `predict` | The deterministic step to re-run; snapshot, restore, horizon; the proxy update at the sync point | `step` with the ring's `TickInput`s; `world_mut()` between runs; `StagedState` in the prediction world; `StreamingAnchor` on the local player's entity; `app` runs `run_passes` on the prediction world too |
 | `persist` | Save at a sync point into records; load through the one path an unload uses | `save_point` → `SavePoint { tick, next_net_id, regions }`; `SimulationBuilder::{tick, next_net_id}` plus `TickInput::loaded`; `RegionLifecycle::take_exports` on unload |
-| Region lifecycle | Policy inputs and outputs as data, testable without `net` or `asset` | Inputs: `StreamingAnchor` rows, held joins, `RegionPolicy`, `RegionAtlas`, `TickInput::{loaded, assets}`; outputs: `RegionLifecycle::{take_requests, take_exports, take_load_failures, take_asset_failures}` and the modes on the world |
+| Region lifecycle | Policy inputs and outputs as data, testable without `net` or `asset` | Inputs: `StreamingAnchor` rows, joins, `RegionPolicy`, `RegionAtlas`, pinned regions, `TickInput::{loaded, assets}`; outputs: `RegionLifecycle::{take_requests, take_exports, take_load_failures, take_session_failures, take_asset_failures}` and the modes on the world |
 | The world hash | `world_hash(region) -> u64`, per-type hashers from the erased registry, a diff on mismatch | `Simulation::world_hash`, `Hashers` filled by `TypeTable::register`, `RegionDigest::diff` |
 | SOUR | Build from the session, run ticks, record a hash per tick, write the chaos log | `harness::layout_mode`, `harness::run_recorded`, `Simulation::hash`; the glue is `tests/sour_glue.rs` |
 | Journal replay | A place for the types | `journal` |
@@ -112,10 +112,11 @@ pub fn register_systems(registration: &mut Registration) {
 
 `app` calls every crate's `register_types` on one `TypeTable`, hands it to
 `SimulationBuilder::new`, and adds every crate's `setup` with `SimulationBuilder::setup`
-and `register_systems` with `SimulationBuilder::systems`. A system whose `worlds` exclude
-the builder's kind is skipped by `StageBuilder::add`, so one set of functions serves the
-server, the client and the prediction world; a function that must differ by kind reads
-`Registration::kind`.
+and `register_systems` with `SimulationBuilder::systems`, then one registration function of
+its own for the `Registration::order` edges between crates' sets. A system whose `worlds`
+exclude the builder's kind is skipped by `StageBuilder::add`, so one set of functions
+serves the server, the client and the prediction world; a function that must differ by
+kind reads `Registration::kind`.
 
 ## Behaviour the signatures cannot express
 
@@ -131,12 +132,15 @@ server, the client and the prediction world; a function that must differ by kind
   the latest value `net` received), never read back from the world, and no game system
   reads it, since a paused world runs no system that could unpause it and the scale is not
   simulation state. The resource is `replicated` so that `net` carries it to clients, and
-  `derived`. `TimeScale::{REAL_TIME, PAUSED}` are the two values the pacer cares about:
-  `app` gives it `f64::from(thousandths) / 1000.0`, outside the boundary; `sim` computes
-  no float from it.
-- `CurrentTick` is written by `sim::begin_tick` from `World::tick` at every input sync
-  point and read through `CurrentTick::get` only, so nothing can desynchronise the two;
-  between runs it equals `Simulation::tick`. `World::tick` is the source of truth.
+  `derived`. Because clients learn the scale from the world's mirror, a pause is entered
+  by running one tick whose frame carries `time_scale: Some(PAUSED)` and then setting the
+  server's pacer to zero, and left by setting the pacer first and putting `Some(scale)` in
+  the next frame. `app` gives the pacer `f64::from(thousandths) / 1000.0`, outside the
+  boundary; `sim` computes no float from it.
+- `CurrentTick` is rewritten by `sim::begin_tick` from `World::tick` at every input sync
+  point and read through `CurrentTick::get`; a write (a decoded value, or `world_mut`) is a
+  bug the type cannot prevent, bounded to one tick. Between runs it equals
+  `Simulation::tick`; `World::tick` is the source of truth.
 - Nothing in this crate reads a clock. A step takes ticks, not time: the timer root owns
   `Instant`, `TickPacer` and the catch-up cap; `step` and `run_passes` are the deterministic
   bodies it calls.
@@ -165,13 +169,14 @@ Every run takes the simulation by value and hands it back when it resolves, as
 `Schedule::run_tick` does with the world, because the run shares the world with jobs on
 other workers. A run that fails before anything ran hands the simulation back inside the
 `RunError` (`simulation: Some`): the kind check of `save_point`, and `Schedule::prepare`,
-which every run performs first and which a resource or service removed through
-`world_mut()` or by a hook can fail. After `Cancelled`, the executor having shut down
-mid-run, the world is torn and `simulation` is `None`. `RunError` converts into
-`lactose_core::Error`, so `?` into a plain `Result` drops the simulation as a plain error
-would; a caller that wants to keep it matches. Every schedule is built and prepared at
-`build`, so a `ScheduleError` is a build error of kind `InvalidData` carrying it, never a
-run error, unless the world was changed since.
+which every run performs first (and `run_passes` for both passes before either runs) and
+which a resource or service removed through `world_mut()` or by a hook can fail. After
+`Cancelled`, the executor having shut down mid-run, the world is torn and `simulation` is
+`None`. A `RunError` never hands back the `TickInput`: a caller that retries keeps a clone
+of the frame. `RunError` converts into `lactose_core::Error`, so `?` into a plain `Result`
+drops the simulation as a plain error would; a caller that wants to keep it matches. Every
+schedule is built and prepared at `build`, so a `ScheduleError` is a build error of kind
+`InvalidData` carrying it, never a run error, unless the world was changed since.
 
 `Simulation::step(executor, input)` does the following, in this order, and nothing else:
 
@@ -183,19 +188,26 @@ run error, unless the world was changed since.
    systems of `Stage::Input` run, this crate's six first (below), then every other
    exclusive system placed there, then the stages' systems. The tick advances by one.
 3. Trims the structural change log of the entries older than the builder's
-   `log_retention` (120 ticks by default). A consumer whose `LogCursor` has fallen further
-   behind gets `None` from `StructuralLog::since` and does a full pass; no consumer trims
-   the log itself.
-4. Resolves with the simulation at the new tick.
+   `log_retention` (120 ticks by default): the step keeps a ring of one
+   `StructuralLog::cursor` per step and trims to the oldest with
+   `World::trim_structural_log`, which ignores a cursor made stale by a restore, a load or
+   the stamp rebase, so those heal on their own. A consumer whose `LogCursor` has fallen
+   further behind gets `None` from `StructuralLog::since` and does a full pass; no consumer
+   trims the log itself.
+4. On a `Server` world, takes and drops the presentation events, so the queue does not
+   grow (architecture section 9.4) whatever drives the steps; every other kind leaves them
+   for `predict` or presentation.
+5. Resolves with the simulation at the new tick.
 
-`Simulation::run_passes(executor)` runs `Pass::Extract` then `Pass::Gather`, each with
-`Schedule::run_pass` and only if a system was registered for it (the tick does not advance
-and nothing is cleared), then on a `Server` world takes and drops the presentation events
-so the queue does not grow (architecture section 9.4; every other kind leaves them for
-`predict` or presentation). The timer root calls it once per frame after the frame's ticks,
-paused or not, so what was edited between ticks is still extracted and replicated.
-`lactose-predict`'s re-simulation calls `step` alone, so extract never runs against a
-discarded tick.
+`Simulation::run_passes(executor)` prepares the `Pass::Extract` and `Pass::Gather`
+schedules, then runs each with `Schedule::run_pass`, in that order and only if a system
+was registered for it (the tick does not advance and nothing is cleared). The timer root
+calls it once per frame after the frame's ticks, paused or not, on the server and on both
+client worlds: what was edited between ticks is still extracted and replicated, and the
+prediction world's local player is extracted every frame (section 9.4). A gather therefore
+covers every tick since the last frame, up to the catch-up cap, and `net`'s staging buffer
+is per frame rather than per tick. `lactose-predict`'s re-simulation calls `step` alone, so
+extract never runs against a discarded tick.
 
 - The futures are `Send`; they are driven by the task that owns the simulation. A future
   dropped mid-run drops the simulation when the run's jobs finish.
@@ -214,8 +226,8 @@ and ordered among themselves by `after` edges. Their order is fixed in every wor
 
 1. `sim::begin_tick`: `CurrentTick` takes the world's tick; `TimeScale` takes the frame's
    `time_scale` when it is `Some`.
-2. `sim::apply_frame_regions`: the frame's `failures`, `loaded`, `assets` and, under
-   `Directed`, `unloaded` and `modes`. "Regions" below gives the rules.
+2. `sim::apply_frame_regions`: the frame's `failures`, then under `Directed` its `unloaded`,
+   then `loaded`, `assets` and, under `Directed`, `modes`. "Regions" below gives the rules.
 3. `sim::apply_sessions`: on a `Server` world, each held `Join` whose region is now loaded
    and each entry of `TickInput::sessions`, in ascending `PlayerId` order, through
    `SessionApplier::apply`; on any other kind the frame's sessions are dropped and logged,
@@ -231,7 +243,12 @@ and ordered among themselves by `after` edges. Their order is fixed in every wor
 A crate that must act at the sync point after all of that places an exclusive system in
 `Stage::Input` in a set declared `.after(&[&lactose_sim::sets::INPUT])`. Nothing can be
 ordered before `sets::INPUT`: two unordered exclusive systems in one stage are a schedule
-error, and this crate's edges already order its own. An error from any hook is logged at
+error, and this crate's edges already order its own. Two crates that both add exclusive
+systems to one pass, or after `sets::INPUT`, do not name each other: `app` orders their
+sets through `Registration::order(before, after)`, which adds the edge to the schedule
+that declares the sets (the tick schedule across any of its stages, or the one pass that
+holds both); a set no schedule declares is `ScheduleError::UnknownOrderedSet`, an edge
+against the stage order a `Cycle`, both at `build`. An error from any hook is logged at
 target `curd` and that entry is skipped; the tick runs.
 
 A `TickInput` is applied field by field in the order its fields are declared, each map in
@@ -242,23 +259,30 @@ ring's frames again, in order, and a replay passes the journal's.
 
 What `SessionApplier::apply` must do, on the server: for `Join { region }`, spawn the
 player's entity in `region` through `World::spawn` with a key from
-`World::allocate_net_id`, with `ClaimedBy { player }` and `StreamingAnchor` among the
-game's components; for `Leave`, despawn that entity (or remove the claim and the anchor),
-resolving it from world state: the row with `ClaimedBy` for the player that also carries
-`StreamingAnchor`, never a side table. A `Join` is applied at the first sync point at which
-its region is loaded, which may be later than its frame: until then the lifecycle holds it
-and its region counts as the player's position for activation. A `Leave` is applied at
-once, and a `Leave` for a held `Join` cancels it. Held joins are journaled, since they came
-through a frame, and not snapshotted, which is fine on the server, the only kind that
-honours them.
+`World::allocate_net_id`, or re-claim the entity the game keeps for the player across saves
+(found by a persistent component of the game's, such as a saved player identity), in
+either case adding `ClaimedBy { player }` and `StreamingAnchor` among the game's
+components; for `Leave`, despawn that entity, or remove the claim and the anchor and leave
+the game's row for the next join, resolving it from world state: the row with `ClaimedBy`
+for the player that also carries `StreamingAnchor`, never a side table. A save carries no
+session state, so on a load every player joins again. A `Join` is applied at the first
+sync point at which its region is loaded, which may be later than its frame: until then
+the lifecycle holds it and its region counts as the player's position for activation. A
+`Join` for a region the atlas lacks, under `Anchored`, is refused and reported as a
+`SessionFailure` of kind `NotFound` (`take_session_failures`), neither held nor applied. A
+`Leave` is applied at once, and a `Leave` for a held `Join` cancels it. Held joins are
+journaled, since they came through a frame, and not snapshotted, which is fine on the
+server, the only kind that honours them.
 
 What `InputApplier::apply` must do, beside the component `lactose-input` defines: decode
 `sample.sample` with the component's `CheckedBitPattern`, resolve the player's entity from
 world state as the session applier does, and write the value with `World::insert` or
-`World::get_mut`. The component is `derived`, or the applier's crate adds an exclusive
-system of its own in a set after `sets::INPUT` that declares `writes = [Sample]`, so that
-readers of a transient sample have a declared writer. The same applier serves the server,
-the prediction world and a replay.
+`World::get_mut`. In the prediction world that lookup resolves because `lactose-predict`
+writes `StreamingAnchor` on the local player's entity beside its claim, where under
+`Directed` it has no policy effect. The component is `derived`, or the applier's crate
+adds an exclusive system of its own in a set after `sets::INPUT` that declares
+`writes = [Sample]`, so that readers of a transient sample have a declared writer. The
+same applier serves the server, the prediction world and a replay.
 
 What `StagedState::apply` may do: on a client, everything received, through `World::spawn`
 with the server's key, `World::bind`, `World::insert`, `World::columns_mut` or
@@ -273,31 +297,34 @@ per-tick history. On the server it is the default and does nothing.
 1. Each `TickInput::failures` entry becomes an `AssetFailureEvent { tick, failure }` in the
    lifecycle, in frame order, for `app` and `net` to take: the tick-stamped event of
    section 14. The lifecycle does nothing else with it; policy is outside.
-2. Each `TickInput::loaded` bundle, ascending by region. It is refused with a `LoadFailure`,
+2. Under `RegionControl::Directed`, each `unloaded` region, ascending, is unloaded as
+   described below if loaded, else logged; before this frame's bundles, so a resync that
+   replaces a region takes one frame. Under `Anchored` the list is ignored and logged.
+3. Each `TickInput::loaded` bundle, ascending by region. It is refused with a `LoadFailure`,
    and nothing changes, if the region is loaded already (`InvalidData`); under `Anchored`,
-   if the region is absent from the atlas (`NotFound`) or neither requested nor within the
-   release radius of an anchor (`InvalidData`, "not wanted"); if the overlay was made
-   against another baseline (`VersionMismatch`, `Overlay::check_against`); or if a resource
-   is not a registered persistent resource whose bytes validate, or a transient key is not a
-   registered transient resource (`VersionMismatch` for a schema the registry disagrees
-   with, `InvalidData` otherwise). Everything is checked before `World::create_region`, and
+   if the region is absent from the atlas (`NotFound`) or neither pinned, nor requested,
+   nor within the release radius of an anchor, this frame's `Join` regions counted as
+   anchors (`InvalidData`, "not wanted"); if the overlay was made against another baseline
+   (`VersionMismatch`, `Overlay::check_against`); or if a resource is not a registered
+   persistent resource whose bytes validate, or a transient key is not a registered
+   transient resource (`VersionMismatch` for a schema the registry disagrees with,
+   `InvalidData` otherwise). Everything is checked before `World::create_region`, and
    `World::load_region` validates before it mutates, so a refused bundle leaves no row, no
    log entry and no bind. Accepted, it is `create_region` with the bundle's seed and, under
    `Directed`, its mode (under `Anchored`, `Frozen`); `load_region(baseline, overlay)`;
    `insert_region_resource_erased` for each resource, `insert_region_resource_zeroed` for
    each transient key, and `set_region_assets` for the bundle's table if it has one. Under
    `Anchored` the region is then no longer requested.
-3. Each `TickInput::assets` table, ascending by region: `World::set_region_assets` if the
-   region is loaded after step 2, replacing the one it has (a hot reload, tick-stamped by
+4. Each `TickInput::assets` table, ascending by region: `World::set_region_assets` if the
+   region is loaded after step 3, replacing the one it has (a hot reload, tick-stamped by
    the frame; the mode does not change for it); otherwise dropped and logged. Nothing
    waits for a region: a bundle brings its first table in `RegionBundle::assets`.
-4. Under `RegionControl::Directed`: each `unloaded` region, ascending, is unloaded as
-   described below if loaded, else logged; then each `modes` entry, ascending, is applied
-   with `World::set_region_mode` if the region is loaded, else logged. Under `Anchored`
-   both lists are ignored and logged, and so is a bundle's `mode`.
+5. Under `Directed`, each `modes` entry, ascending, is applied with `World::set_region_mode`
+   if the region is loaded, else logged. Under `Anchored` the list is ignored and logged,
+   and so is a bundle's `mode`.
 
 `sim::apply_region_policy` does nothing under `Directed`. Under
-`RegionControl::Anchored(atlas)`:
+`RegionControl::Anchored { atlas, pinned }`:
 
 - The radii are read from the `RegionPolicy` resource and clamped: the activation radius to
   at most `streaming_radius - 1`, the release radius to at least `streaming_radius`, each
@@ -308,27 +335,32 @@ per-tick history. On the server it is the default and does nothing.
   region's mode, plus the region of every held `Join`. The active set is every region of
   the atlas within the activation radius of an anchor's cell, the wanted set every region
   within the streaming radius, the kept set every region within the release radius, each
-  by `RegionCell::distance` (the larger axis distance) through `RegionAtlas::within`.
+  by `RegionCell::distance` (the larger axis distance) through `RegionAtlas::within`; every
+  pinned region is in all three sets, whatever the anchors.
 - Each loaded region not in the kept set, ascending, is unloaded (below). Each requested
   region not in the kept set, ascending, is no longer requested and gets a
   `RegionRequest::Cancel`; a bundle for it that still arrives is refused. Each wanted
   region not loaded and not requested, ascending, gets a `RegionRequest::Load` and is
-  requested until its bundle loads or the request is cancelled.
+  requested until its bundle loads or the request is cancelled; so every pinned region is
+  requested at the first sync point and never released.
 - Each loaded region, ascending, is set `Simulated` if it is in the active set and
   `World::region_assets` is `Some`, else `Frozen`. So a region enters `Simulated` only
   when its bundle is loaded and its asset table has entered, and leaves it at the sync
-  point after its last anchor moves out of the activation radius. The gap between the
-  streaming and release radii is the lifecycle's hysteresis: an anchor jittering on a
-  border loads and unloads nothing. The overload ladder's own hysteresis is `app`'s, on
-  `activation_radius`.
+  point after its last anchor moves out of the activation radius; a pinned region is
+  `Simulated` as soon as its table has entered. The gap between the streaming and release
+  radii is the lifecycle's hysteresis: an anchor jittering on a border loads and unloads
+  nothing. The overload ladder's own hysteresis is `app`'s, on `activation_radius`.
+- World-global persistent state, which belongs to no player's surroundings (a world-wide
+  quest flag, an economy), is a region resource of a pinned region: hashed and saved with
+  it, and simulated whenever the server runs.
 - Because the streaming radius exceeds the activation radius, an entity in a `Simulated`
   region can only cross into a loaded region, where the ECS freezes it with the region
   (section 9.7). A command that names an unloaded region is dropped and logged by the ECS
   (D117); a teleport or respawn into an unloaded region is a two-phase operation the game
   performs ("Not in this crate yet").
-- With no anchor and no held join, every loaded region is unloaded and nothing is
-  requested, so a server loads its first region only once a player joins: the headless
-  app and tests use `Directed`, or a `Join`.
+- With no anchor, no held join and no pinned region, every loaded region is unloaded and
+  nothing is requested, so a server loads its first region only once a player joins: the
+  headless app and tests use `Directed`, a `Join`, or a pinned region.
 
 An unload, under either control: on a `Server` world, `World::export_region` into a
 `RegionExport` (every row is bound at apply on the server, so the export cannot fail),
@@ -337,9 +369,9 @@ then `World::unload_region`, then a `RegionRequest::Release`. On a world that is
 
 - The lifecycle's own state (what is requested, held joins, its outputs) is server-only
   session state, which the server never rolls back; it is not in a snapshot, and
-  architecture section 10's list of what a restore keeps is unchanged. A prediction world
-  under `Directed` rebuilds what it loaded from the ring's frames; its lifecycle holds
-  failures alone.
+  architecture section 10's list of what a restore keeps is unchanged. A journal records
+  it with its checkpoint, since a save does not. A prediction world under `Directed`
+  rebuilds what it loaded from the ring's frames; its lifecycle holds failures alone.
 - An unload's `RegionExport` is what a save of that region would hold: rows in ascending
   `NetId` order, reference fields as stored, the seed and the persistent resources, with the
   transient components and resources listed by key. `lactose-persist` diffs it against the
@@ -356,9 +388,11 @@ then `World::unload_region`, then a `RegionRequest::Release`. On a world that is
   loaded region over `World::export_region` and collects the results in ascending
   `RegionId` order into `SavePoint { tick, next_net_id, regions }`; the simulation comes
   back unchanged with it, the tick does not advance. It is the same export an unload makes.
-  World resources are not in it ("The world hash" below says why). On a world that is not
-  `Server` the run resolves at once to `Unsupported` with the simulation inside: a client
-  never exports, and single-player runs a `Server` world in-process with a local client.
+  World resources are not in it ("The world hash" below says why), and neither is session
+  state: a save carries no players, held joins or requests, so on a load every player
+  joins again. On a world that is not `Server` the run resolves at once to `Unsupported`
+  with the simulation inside: a client never exports, and single-player runs a `Server`
+  world in-process with a local client.
 - A load is `SimulationBuilder::tick(saved.tick).next_net_id(saved.next_net_id)` and then,
   for each saved region, a `RegionBundle` in a frame, under `Directed` or when the policy
   wants it. A cooked region's persistent region resources come from the caller in
@@ -374,10 +408,13 @@ and transient region resource, and the region's seed, mode and asset table; deri
 and resources are excluded, and so is everything outside the region (world resources, the
 structural log, change stamps, the entity table). World resources are therefore neither
 hashed nor saved: simulation state that is hashed or saved is a component or a region
-resource, and a world resource is configuration or session state. `build` enforces it by
-refusing, with `InvalidData`, any world resource present after the setup functions whose
-policy is not `derived`, probing every resource type the `TypeTable` registered. The 6.1
-example's `Gravity` and `TotalMass` are therefore `derived`.
+resource, world-global persistent state a resource of a pinned region, and a world
+resource is configuration or session state. `build` enforces it by refusing, with
+`InvalidData`, any world resource present after the setup functions whose policy is not
+`derived`, probing every resource type the `TypeTable` registered; the check runs at build
+and covers the types the table knows, so a resource of an unregistered type, or one
+inserted after build by a hook or an exclusive system, is the inserting crate's bug. The
+6.1 example's `Gravity` and `TotalMass` are therefore `derived`.
 
 The hash is a pure function of that state: identical under every chunk layout, worker
 count, archetype history and registration order, on x86-64 and aarch64. The encoding, bit
@@ -438,26 +475,32 @@ for bit:
 **SOUR** (architecture section 8.3; `tools/xtask/src/harness/protocol.rs`)
 
 - `harness::layout_mode(capacity, seed)` is the layout mode: `permute_rows` and
-  `split_batches` on, the seed, and `ChunkOrder::Reversed` when the seed's low bit is set
-  and `ChunkOrder::Shuffled` otherwise, so the matrix's seeds cover both orders;
-  `ChunkCapacity::Rows(n)` sets `chunk_rows`, `Bytes(16384)` is the production capacity
+  `split_batches` on, drawn from the seed, and the chunk iteration order chosen by the
+  capacity so that the matrix covers both orders whatever seeds the runner hands out
+  (today one fixed seed per variant): `ChunkOrder::Reversed` for `ChunkCapacity::Rows(7)`
+  and `Bytes`, `ChunkOrder::Shuffled` by the seed for every other `Rows(n)`, so `Rows(1)`
+  and `Rows(64)`. `Rows(n)` sets `chunk_rows`, `Bytes(16384)` is the production capacity
   under the same perturbations, `Production` is `LayoutConfig::default()` whatever the
-  seed. Any other byte capacity is `Unsupported`, since the ECS has one slab size: a test
-  under a capacity the storage cannot apply fails rather than running something else.
-  Chaos mode is the executor builder's `ChaosConfig` with `shuffle_steals`,
-  `inject_yields`, `force_split` and `record` on and the seed; that type is
-  `lactose-task`'s, so the test's glue builds it.
+  seed, since the runner's production variant means the builder's defaults. Any other byte
+  capacity is `Unsupported`, since the ECS has one slab size: a test under a capacity the
+  storage cannot apply fails rather than running something else. Chaos mode is the
+  executor builder's `ChaosConfig` with `shuffle_steals`, `inject_yields`, `force_split`
+  and `record` on and the seed; that type is `lactose-task`'s, so the test's glue builds
+  it.
 - `harness::run_recorded` steps once per frame, records `(tick, Simulation::hash())` after
-  every step, runs no pass, and hands the simulation back; it uses `Executor::block_on`, so
-  it is called from the test's main thread.
+  every step, runs no pass (a `Server` world's presentation events are drained by the step
+  itself), and hands the simulation back; it uses `Executor::block_on`, so it is called
+  from the test's main thread.
 - The glue between the runner's `Session` and this crate is `tests/sour_glue.rs`, compiled
   against the real protocol module and the real executor builder. Until the protocol
   module moves into a foundation crate outside the boundary, a test crate includes it with
   `#[path = "../../../tools/xtask/src/harness/protocol.rs"] mod protocol;` (its unit tests
   come along and run there too) and lists `lactose-task` under `[dev-dependencies]`, which
-  the boundary allowlist permits. The `applied` line reports the worker count from
-  `Executor::frame_worker_count`, the layout from `World::layout` (`chunk_rows: Some(n)` as
-  `rows:n:seed`, `None` with permutation as `bytes:16384:seed`, the default as
+  the boundary allowlist permits; once it moves, the glue lives in one test-support crate
+  outside the boundary, `lactose-sour`, that every simulation test crate dev-depends on,
+  so the `#[expect]`s below live in one place. The `applied` line reports the worker count
+  from `Executor::frame_worker_count`, the layout from `World::layout` (`chunk_rows:
+  Some(n)` as `rows:n:seed`, `None` with permutation as `bytes:16384:seed`, the default as
   `production`), and the chaos seed the test built with, because the executor does not
   report it; `docs/verification.md` carries that gap until `lactose-task` reports it.
 - Every simulation test of this crate and of the game crates records this way; the package
@@ -467,19 +510,24 @@ for bit:
 - The boundary lint file bans, on the re-exported `Executor`, what a boundary crate must
   not do with it: `frame_worker_count` and `slot_count` (worker identity), `spawn`,
   `run_graph` and `platform` (arbitrary work and threads), `sleep_until` (a clock) and
-  `execution_log` (scheduling history). `block_on` and `builder` stay, as the driver of
-  tests and tools. The glue and the timer-root sketch opt out item by item with
-  `#[expect]`, since they are `app`'s and the test's code, outside the step.
+  `execution_log` (scheduling history). What a boundary crate can do with it is run a
+  schedule, block on a future, and build or shut down an executor. The glue and the
+  timer-root sketch opt out item by item with `#[expect]`, since they are `app`'s and the
+  test's code, outside the step. The physics backend's solver pool, which section 16 sizes
+  by the worker count, is built by `app` outside the boundary and handed to the backend
+  through a setup function.
 
 **Journal replay** (architecture section 15.5)
 
-`journal::Journal` is a `SavePoint`, the asset tables and modes in force at the checkpoint,
+`journal::Journal` is a `SavePoint`, what a save does not carry (the asset tables and modes
+in force at the checkpoint, every joined player's claimed and anchored entity, the held
+joins and the requested regions, which the replay driver restores before its first step),
 and one `JournalFrame` per tick after it; `JournalFrame::record(tick, &input)` is the
-frame's record, mirroring `TickInput` field for field, with tables as `VersionTable`s and
-bundles as `JournalLoad` (the baseline by content hash, with the overlay, resources,
-transient keys and table the bundle carried), so every region the replay runs can be
-rebuilt. Writing, reading and replaying it is the milestone 1 tooling's; this crate names
-the shape so `app` and the tools agree.
+frame's record, mirroring `TickInput` field for field in its application order, with
+tables as `VersionTable`s and bundles as `JournalLoad` (the baseline by content hash, with
+the overlay, resources, transient keys and table the bundle carried), so every region and
+every player the replay runs can be rebuilt. Writing, reading and replaying it is the
+milestone 1 tooling's; this crate names the shape so `app` and the tools agree.
 
 ## Not in this crate yet
 
@@ -487,11 +535,11 @@ the shape so `app` and the tools agree.
   `RegionPolicy::activation_radius`; decimation by tick parity is an ECS attribute flag
   when first needed (`docs/verification.md`); join refusal is `net`'s.
 - A teleport or respawn into an unloaded region: a two-phase operation the game performs,
-  loading ahead (a spawned anchor, or a held `Join`, brings the region in) and moving once
-  it is loaded; a move commanded before that is dropped and logged by the ECS (D117).
-  Proposed `docs/verification.md` item: "Teleport and respawn across the streaming ring are
-  two-phase in the game; decide with `game-sim` whether `sim` needs a frame-level request
-  for a region a game system wants ahead of any anchor (milestone 3)".
+  loading ahead (a spawned anchor, a held `Join` or a pinned region brings the region in)
+  and moving once it is loaded; a move commanded before that is dropped and logged by the
+  ECS (D117). Proposed `docs/verification.md` item: "Teleport and respawn across the
+  streaming ring are two-phase in the game; decide with `game-sim` whether `sim` needs a
+  frame-level request for a region a game system wants ahead of any anchor (milestone 3)".
 - Section 14's hold of a player at a region boundary until the client acknowledges
   readiness: `net`'s at milestone 4, with no field here.
 - Hashing `physics-api::snapshot` bytes (architecture section 8.3), added once Rapier's
@@ -509,10 +557,11 @@ in workers, repeat, layout and chaos modes:
 | What | How |
 |---|---|
 | A step is a function of its frames | Two simulations stepped with equal frames hash equal every tick; a frame assembled in any order is one input |
-| The sync point order | Test hooks record the calls: regions, then sessions, then inputs, then staged state, then the policy; players ascend, regions ascend; a held `Join` is applied the sync point its region loads |
+| The sync point order | Test hooks record the calls: regions, then sessions, then inputs, then staged state, then the policy; players ascend, regions ascend; a held `Join` is applied the sync point its region loads; a `Join` and its region's bundle in one frame load and apply in that frame |
 | The hash encoding | Golden hashes for a small registry, pinned; layout mode and worker count change nothing; a derived column and a world resource change nothing; a transient value, a region resource, the seed, the mode, the table and a marker component's presence each change it |
 | The digest | `digest(..).hash() == world_hash(..)`; one field changed gives one difference; a marker component on one side gives a row difference; `decode(encode(d)) == d` |
-| Activation | A join, then an anchor moving, loads and simulates the regions within the radii, freezes the ring, keeps the release ring, cancels and unloads outside it; the exports equal a save of those regions |
-| Save and load | `save_point`, a new simulation from it through frames, `K` ticks each: equal hashes (architecture section 15.5, first two tests) |
-| Refusals | A bundle against another baseline, a second bundle for a loaded region, an unwanted bundle, a bad resource, a table for an unloaded region, a frame's `modes` under `Anchored`, a non-`derived` world resource at build: each refused as stated, nothing changed, the tick runs, the failure is reported |
-| Runs | A removed resource fails the next run with the simulation inside the error; `save_point` on a prediction world likewise |
+| Activation | A join, then an anchor moving, loads and simulates the regions within the radii, freezes the ring, keeps the release ring, cancels and unloads outside it; a pinned region is simulated with no anchor; the exports equal a save of those regions |
+| Save and load | `save_point`, a new simulation from it through frames with every player joining again, `K` ticks each: equal hashes (architecture section 15.5, first two tests) |
+| Orders | Two crates' exclusive systems in one pass fail to build unordered and build in the order `Registration::order` gives |
+| Refusals | A bundle against another baseline, a second bundle for a loaded region, an unwanted bundle, a bad resource, a table for an unloaded region, a frame's `modes` under `Anchored`, a `Join` for a region outside the atlas, a non-`derived` world resource at build: each refused as stated, nothing changed, the tick runs, the failure is reported |
+| Runs | A removed resource fails the next run with the simulation inside the error; `save_point` on a prediction world likewise; the log is trimmed to the retention and a lagging consumer sees `None` |

@@ -216,6 +216,22 @@ pub fn register_net(registration: &mut Registration) {
     registration.pass(Pass::Gather).add(&GATHER);
 }
 
+/// Another crate's exclusive system at the sync point, in a set of its own.
+pub static ALSO_AFTER_FRAME: SystemSet =
+    SystemSet::new("sketch::also_after_frame").after(&[&sets::INPUT]);
+
+#[system(name = "sketch::other_sync_point", worlds = [server], exclusive, in_set = ALSO_AFTER_FRAME)]
+fn other_sync_point(world: &mut World) {}
+
+pub fn register_other(registration: &mut Registration) {
+    registration.stage(Stage::Input).sets(&[&ALSO_AFTER_FRAME]).add(&OTHER_SYNC_POINT);
+}
+
+/// What `app` adds: the edge between two crates' sets that do not name each other.
+pub fn order_crates(registration: &mut Registration) {
+    registration.order(&AFTER_FRAME, &ALSO_AFTER_FRAME);
+}
+
 // ---- 6. The timer root sketch against TickPacer's real signatures ----
 
 /// `app`'s task: the one place a clock is read and the executor's timers are used.

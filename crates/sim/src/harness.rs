@@ -4,7 +4,8 @@
 //! outside the boundary that tests depend on; this module is the deterministic side, in
 //! terms of the world and executor types alone, so the glue between the two is a few lines
 //! in each test crate's common module (the README shows them, and `tests/sour_glue.rs`
-//! compiles them).
+//! compiles them) until one test-support crate outside the boundary, `lactose-sour`, holds
+//! the glue once the protocol module moves.
 //!
 //! A test, in order: reads its session; builds the executor with the session's worker
 //! count and, under a chaos seed, a `ChaosConfig` with every perturbation and recording on;
@@ -34,10 +35,12 @@ pub enum ChunkCapacity {
 }
 
 /// SOUR's layout mode (architecture section 8.3) for one capacity and seed: rows permuted
-/// at every sync point, chunk iteration reversed when the seed's low bit is set and
-/// shuffled by the seed otherwise, batches split at random, identities preserved.
-/// `Production` is `LayoutConfig::default()` whatever the seed. A no-op for results: a
-/// simulation under any of these hashes as one under the default.
+/// at every sync point and batches split at random from the seed, identities preserved,
+/// and the chunk iteration order chosen by the capacity so that the matrix covers both
+/// orders whatever seeds the runner hands out: `ChunkOrder::Reversed` for `Rows(7)` and
+/// `Bytes`, `ChunkOrder::Shuffled` by the seed for every other `Rows(n)`. `Production` is
+/// `LayoutConfig::default()` whatever the seed. A no-op for results: a simulation under any
+/// of these hashes as one under the default.
 ///
 /// Fails with `Unsupported` for a byte capacity other than 16 KiB, which the ECS cannot
 /// honour, so a test under a capacity the runner sent and the storage cannot apply fails
@@ -48,9 +51,10 @@ pub fn layout_mode(capacity: ChunkCapacity, seed: u64) -> Result<LayoutConfig> {
 
 /// Steps `simulation` once per frame of `inputs` on `executor`, calling `record` with the
 /// tick and [`Simulation::hash`] after every step, and hands the simulation back. Runs no
-/// pass. Drives each step with [`Executor::block_on`], so it is called from a test's main
-/// thread, never from a worker. An error from a step, a hash or `record` ends the run with
-/// it; the simulation is then gone.
+/// pass; a `Server` world's presentation events are drained by the step itself. Drives
+/// each step with [`Executor::block_on`], so it is called from a test's main thread, never
+/// from a worker. An error from a step, a hash or `record` ends the run with it; the
+/// simulation is then gone.
 pub fn run_recorded(
     executor: &Executor,
     simulation: Simulation,
