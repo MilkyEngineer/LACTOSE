@@ -28,7 +28,8 @@ impl TickDelta {
     /// Panics if `rate` is zero.
     #[must_use]
     pub fn of_rate(rate: u32) -> Self {
-        todo!()
+        assert!(rate != 0, "a simulation runs at least one tick per second");
+        Self(Scalar::ONE / Scalar::from_u32(rate))
     }
 }
 

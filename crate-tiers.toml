@@ -132,3 +132,4 @@ transitive = [
 "lactose-core" = { normal = ["bytemuck", "libc", "windows-sys"], dev = ["xxhash-rust"] }
 "lactose-math" = { normal = ["bytemuck", "libm"] }
 "lactose-ecs" = { normal = ["bytemuck", "tracing"] }
+"lactose-sim" = { normal = ["tracing"], dev = ["xxhash-rust"] }

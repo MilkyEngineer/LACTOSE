@@ -150,9 +150,11 @@ pub enum SessionEvent {
 /// world, where it has no policy effect; never a side table, which no frame could keep
 /// current) and writes the value through [`World::insert`] or
 /// [`World::get_mut`](lactose_ecs::World::get_mut). An error is logged at target `curd`
-/// and the input is dropped; the tick runs. The component is `derived`, or its crate adds
-/// an exclusive system of its own in a set after [`sets::INPUT`](crate::sets::INPUT) that
-/// declares `writes = [Sample]`, so transient readers have a writer.
+/// and the input is dropped; the tick runs. The component is `transient`, zeroed at the
+/// input sync point before the applier writes it, and its crate adds an exclusive system
+/// of its own in a set after [`sets::INPUT`](crate::sets::INPUT) that declares
+/// `writes = [Sample]`, so its readers have a writer. Never `derived`: a stale sample would
+/// drive the simulation from state no save, journal or hash holds.
 ///
 /// The same implementation serves the server (samples from `net`), the prediction world
 /// (the local player's own sample) and a replay (samples from the journal).

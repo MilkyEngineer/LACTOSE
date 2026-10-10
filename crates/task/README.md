@@ -26,7 +26,7 @@ and list what changed, because `lactose-ecs` is written against this surface.
 | `Executor::spawn`, `Task`, `yield_now` | `'static` stackless tasks |
 | `Executor::sleep_until`, `Sleep`, `TickPacer`, `TickBudget` | Timers and tick pacing for the timer root |
 | `lane`, `Lane`, `LanePump`, `LaneCall` | Calls onto one particular thread, returned as futures |
-| `ChaosConfig`, `ExecutionLog`, `Executor::execution_log` | Seeded schedule perturbation and exact replay for SOUR |
+| `ChaosConfig`, `ExecutionLog`, `Executor::execution_log`, `Executor::chaos_config` | Seeded schedule perturbation and exact replay for SOUR, and the configuration a run reports it applied |
 
 `GraphRun`, `Task` and `Sleep` resolve to a `lactose_core::Result`. The error is of kind
 `Cancelled` and means the executor shut down first. What each resolution guarantees:

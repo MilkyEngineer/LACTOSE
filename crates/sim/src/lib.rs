@@ -8,9 +8,9 @@
 //!
 //! # Status
 //!
-//! A facade: every public signature is final and every body that decides anything is
-//! `todo!()`. The implementation lane replaces the bodies behind this surface and removes
-//! the crate-level `allow` with the last `todo!()`.
+//! Implemented: every behaviour the README states runs and is tested, and the simulation
+//! tests of `tests/` record their hashes under SOUR. Nothing is optimised; the world hash
+//! is sequential outside the crate's own pass.
 //!
 //! # Where to start
 //!
@@ -45,12 +45,6 @@
 //! ```
 
 #![forbid(unsafe_code)]
-#![allow(
-    dead_code,
-    unused_variables,
-    reason = "facade: every body is `todo!()` until the implementation lane replaces it, and \
-              the fields and parameters it will use are declared now"
-)]
 
 pub mod harness;
 mod hash;

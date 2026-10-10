@@ -6,14 +6,24 @@ use core::future::Future;
 use core::num::NonZeroU64;
 use core::pin::Pin;
 use core::task::{Context, Poll};
+use std::collections::VecDeque;
+use std::sync::Arc;
 
-use lactose_core::{Error, Result, Tick};
-use lactose_ecs::{Executor, LayoutConfig, RegionId, Schedule, World, WorldKind};
+use lactose_core::{Error, ErrorKind, Result, Tick, xxh64};
+use lactose_ecs::{
+    Executor, LayoutConfig, LogCursor, RegionId, Schedule, ScheduleError, World, WorldBuilder,
+    WorldKind,
+};
 
 use crate::hash::{Hashers, RegionDigest, TypeTable};
 use crate::input::{InputApplier, SessionApplier, StagedState, TickInput};
 use crate::region::{RegionControl, RegionExport, RegionLifecycle, RegionPolicy};
 use crate::schedule::Registration;
+use crate::systems::{NoInputs, NoSessions, NothingStaged, SAVE_COPY};
+use crate::time::{CurrentTick, TICK_RATE_HZ, TickDelta, TimeScale};
+
+/// The save pass's one stage.
+const SAVE_STAGE: &str = "sim::save";
 
 /// A setup function, boxed.
 type Setup = Box<dyn FnOnce(&mut World) -> Result<()> + Send>;
@@ -55,7 +65,21 @@ impl SimulationBuilder {
     /// A simulation of `kind` over the types of `types`.
     #[must_use]
     pub fn new(kind: WorldKind, types: TypeTable) -> Self {
-        todo!()
+        Self {
+            kind,
+            types,
+            layout: LayoutConfig::default(),
+            tick: Tick(0),
+            next_net_id: NonZeroU64::MIN,
+            control: RegionControl::Directed,
+            policy: RegionPolicy { activation_radius: 1, streaming_radius: 2, release_radius: 3 },
+            log_retention: Self::DEFAULT_LOG_RETENTION,
+            setups: Vec::new(),
+            registrations: Vec::new(),
+            inputs: None,
+            sessions: None,
+            staged: None,
+        }
     }
 
     /// The storage layout: SOUR's layout mode ([`harness::layout_mode`](crate::harness::layout_mode))
@@ -184,8 +208,101 @@ impl SimulationBuilder {
     /// [`WorldBuilder::build`](lactose_ecs::WorldBuilder::build) does, for a non-`derived`
     /// world resource, and for a schedule that does not build or prepare.
     pub fn build(self) -> Result<Simulation> {
-        todo!()
+        let invalid = |message: &'static str| Err(Error::new(ErrorKind::InvalidData, message));
+        let policy = self.policy;
+        if !(policy.release_radius >= policy.streaming_radius
+            && policy.streaming_radius > policy.activation_radius)
+        {
+            return invalid(
+                "the policy needs release_radius >= streaming_radius > activation_radius",
+            );
+        }
+        if let RegionControl::Anchored { atlas, pinned } = &self.control {
+            if self.kind != WorldKind::Server {
+                return invalid("only a `Server` world is `Anchored`");
+            }
+            if atlas.is_empty() {
+                return invalid("an `Anchored` world needs a non-empty atlas");
+            }
+            if pinned.iter().any(|&region| atlas.cell(region).is_none()) {
+                return invalid("a pinned region is not in the atlas");
+            }
+        }
+
+        let (registry, hashers, probes) = self.types.into_parts();
+        let mut world = WorldBuilder::new(self.kind, Arc::new(registry))
+            .layout(self.layout)
+            .tick(self.tick)
+            .next_net_id(self.next_net_id)
+            .build()?;
+        world.insert_resource(TickDelta::of_rate(TICK_RATE_HZ));
+        world.insert_resource(CurrentTick::new(self.tick));
+        world.insert_resource(TimeScale::REAL_TIME);
+        world.insert_resource(policy);
+        let inputs = self.inputs.unwrap_or_else(|| Box::new(NoInputs));
+        let sessions = self.sessions.unwrap_or_else(|| Box::new(NoSessions));
+        let staged = self.staged.unwrap_or_else(|| Box::new(NothingStaged));
+        world.insert_service::<dyn InputApplier>(inputs);
+        world.insert_service::<dyn SessionApplier>(sessions);
+        world.insert_service::<dyn StagedState>(staged);
+        world.insert_service(Box::new(LifecycleSlot(RegionLifecycle::new(self.control))));
+        world.insert_service(Box::new(TickInputSlot(None)));
+        world.insert_service(Box::new(SaveSlot(None)));
+
+        for setup in self.setups {
+            setup(&mut world)?;
+        }
+        for (key, present) in probes {
+            if present(&world) {
+                let name = world.registry().get(key).map_or("?", |info| info.name());
+                tracing::warn!(
+                    target: "curd",
+                    resource = name,
+                    "a world resource that is not `derived`: refused"
+                );
+                return Err(Error::new(
+                    ErrorKind::InvalidData,
+                    format!(
+                        "the world resource `{name}` is not `derived`: world resources are \
+                         neither hashed nor saved, so simulation state is a component or a \
+                         region resource"
+                    ),
+                ));
+            }
+        }
+
+        let mut registration = Registration::new(self.kind);
+        for register in self.registrations {
+            register(&mut registration);
+        }
+        let (mut tick_schedule, mut passes) = registration.build().map_err(schedule_error)?;
+        let mut save = Schedule::builder(self.kind);
+        save.stage(SAVE_STAGE, &[]).add(&SAVE_COPY);
+        let mut save = save.build().map_err(schedule_error)?;
+        tick_schedule.prepare(&world).map_err(schedule_error)?;
+        for pass in passes.iter_mut().flatten() {
+            pass.prepare(&world).map_err(schedule_error)?;
+        }
+        save.prepare(&world).map_err(schedule_error)?;
+
+        Ok(Simulation {
+            world,
+            core: Core {
+                kind: self.kind,
+                tick_schedule,
+                passes,
+                save,
+                hashers,
+                log_retention: self.log_retention,
+                log_cursors: VecDeque::new(),
+            },
+        })
     }
+}
+
+/// A schedule error as the error a build or a run reports: `InvalidData` carrying it.
+fn schedule_error(error: ScheduleError) -> Error {
+    Error::new(ErrorKind::InvalidData, error.to_string()).with_source(error)
 }
 
 /// A world with its tick schedule, its pass schedules, its hashers and its region lifecycle:
@@ -198,8 +315,14 @@ impl SimulationBuilder {
 /// world with jobs on other workers; what fails before anything ran hands it back inside
 /// the [`RunError`].
 pub struct Simulation {
-    kind: WorldKind,
     world: World,
+    /// Everything but the world, which a run moves out and back.
+    core: Core,
+}
+
+/// A simulation without its world.
+struct Core {
+    kind: WorldKind,
     tick_schedule: Schedule,
     /// Indexed by [`Pass`](crate::Pass); `None` for a pass with no system.
     passes: [Option<Schedule>; 2],
@@ -207,13 +330,23 @@ pub struct Simulation {
     save: Schedule,
     hashers: Hashers,
     log_retention: u32,
+    /// The structural log's end after each of the last `log_retention + 1` steps, oldest
+    /// first: the log is trimmed to the oldest.
+    log_cursors: VecDeque<LogCursor>,
+}
+
+impl Core {
+    /// Puts `world` back.
+    fn join(self, world: World) -> Simulation {
+        Simulation { world, core: self }
+    }
 }
 
 impl Simulation {
     /// The kind of world.
     #[must_use]
     pub fn kind(&self) -> WorldKind {
-        self.kind
+        self.core.kind
     }
 
     /// The current tick: the last tick run, or the start tick before the first step.
@@ -241,36 +374,43 @@ impl Simulation {
     /// The per-type hashers of this simulation's types.
     #[must_use]
     pub fn hashers(&self) -> &Hashers {
-        &self.hashers
+        &self.core.hashers
     }
 
     /// The world hash of `region` (architecture section 8.3): [`Hashers::world_hash`] over
     /// this world.
     pub fn world_hash(&self, region: RegionId) -> Result<u64> {
-        todo!()
+        self.core.hashers.world_hash(&self.world, region)
     }
 
     /// The hash of the whole simulation at this tick, what a SOUR test records: the tick
     /// and every loaded region's [`world_hash`](Self::world_hash) in ascending `RegionId`
     /// order, combined as the README states. A world with no region hashes its tick alone.
     pub fn hash(&self) -> Result<u64> {
-        todo!()
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&self.world.tick().0.to_le_bytes());
+        for region in self.world.regions() {
+            bytes.extend_from_slice(&region.0.to_le_bytes());
+            bytes.extend_from_slice(&self.world_hash(region)?.to_le_bytes());
+        }
+        Ok(xxh64(&bytes, 0))
     }
 
     /// The field-level digest of `region`: [`Hashers::digest`] over this world.
     pub fn digest(&self, region: RegionId) -> Result<RegionDigest> {
-        todo!()
+        self.core.hashers.digest(&self.world, region)
     }
 
     /// The region lifecycle: its requests, exports and failures.
     #[must_use]
     pub fn lifecycle(&self) -> &RegionLifecycle {
-        todo!()
+        // The slot's type is private to this crate, so nothing else can remove it.
+        &self.world.service::<LifecycleSlot>().expect("the builder inserts the lifecycle").0
     }
 
     /// The region lifecycle, to take its outputs.
     pub fn lifecycle_mut(&mut self) -> &mut RegionLifecycle {
-        todo!()
+        &mut self.world.service_mut::<LifecycleSlot>().expect("the builder inserts the lifecycle").0
     }
 
     /// Runs one tick with `input` applied at its input sync point, trims the structural log
@@ -287,7 +427,44 @@ impl Simulation {
     /// with `None` after `Cancelled`, when the executor shut down mid-run and the world is
     /// torn.
     pub fn step(self, executor: &Executor, input: TickInput) -> Step<'_> {
-        todo!()
+        Step { run: Box::pin(self.run_step(executor, input)) }
+    }
+
+    #[expect(
+        clippy::result_large_err,
+        reason = "the future's output the facade fixed: a run hands back the simulation by \
+                  value, once per tick"
+    )]
+    async fn run_step(
+        mut self,
+        executor: &Executor,
+        input: TickInput,
+    ) -> core::result::Result<Self, RunError> {
+        if let Err(error) = self.core.tick_schedule.prepare(&self.world) {
+            return Err(RunError::kept(schedule_error(error), self));
+        }
+        if matches!(self.core.kind, WorldKind::Server | WorldKind::Client) {
+            let tick = self.world.tick();
+            self.world.set_rollback_horizon(tick);
+        }
+        slot(&mut self.world).0 = Some(input);
+        let Self { world, mut core } = self;
+        let mut world =
+            core.tick_schedule.run_tick(world, executor).await.map_err(RunError::lost)?;
+        slot(&mut world).0 = None;
+
+        let retention = usize::try_from(core.log_retention).unwrap_or(usize::MAX);
+        core.log_cursors.push_back(world.structural_log().cursor());
+        while core.log_cursors.len() > retention.saturating_add(1) {
+            core.log_cursors.pop_front();
+        }
+        if let Some(&oldest) = core.log_cursors.front() {
+            world.trim_structural_log(oldest);
+        }
+        if core.kind == WorldKind::Server {
+            drop(world.take_present_events());
+        }
+        Ok(core.join(world))
     }
 
     /// Runs the passes of this frame: [`Pass::Extract`](crate::Pass::Extract) then
@@ -298,9 +475,39 @@ impl Simulation {
     /// worlds, so what was edited between ticks is still extracted and replicated and the
     /// prediction world's local player is extracted every frame; a gather therefore covers
     /// every tick since the last frame, up to the catch-up cap. `lactose-predict`'s
-    /// re-simulation calls [`step`](Self::step) alone. Fails as a step does.
+    /// re-simulation calls [`step`](Self::step) alone. Fails as a step does; `Gather` is
+    /// prepared again once `Extract` has run, and if that fails the simulation comes back
+    /// with `Extract`'s work done and `Gather`'s not.
     pub fn run_passes(self, executor: &Executor) -> PassRun<'_> {
-        todo!()
+        PassRun { run: Box::pin(self.run_passes_inner(executor)) }
+    }
+
+    #[expect(
+        clippy::result_large_err,
+        reason = "the future's output the facade fixed: a run hands back the simulation by \
+                  value, once per tick"
+    )]
+    async fn run_passes_inner(
+        mut self,
+        executor: &Executor,
+    ) -> core::result::Result<Self, RunError> {
+        let world = &self.world;
+        let prepared =
+            self.core.passes.iter_mut().flatten().try_for_each(|pass| pass.prepare(world));
+        if let Err(error) = prepared {
+            return Err(RunError::kept(schedule_error(error), self));
+        }
+        let Self { mut world, mut core } = self;
+        for index in 0..core.passes.len() {
+            let Some(pass) = core.passes[index].as_mut() else { continue };
+            // `Extract` may have removed what `Gather` names; checked again here, `run_pass`
+            // would fail the same way with the world inside it.
+            if let Err(error) = pass.prepare(&world) {
+                return Err(RunError::kept(schedule_error(error), core.join(world)));
+            }
+            world = pass.run_pass(world, executor).await.map_err(RunError::lost)?;
+        }
+        Ok(core.join(world))
     }
 
     /// Copies every loaded region out at this sync point (architecture section 15.3): the
@@ -311,13 +518,53 @@ impl Simulation {
     /// exports, and single-player runs a `Server` world in-process with a local client.
     /// Otherwise fails as a step does.
     pub fn save_point(self, executor: &Executor) -> SavePointRun<'_> {
-        todo!()
+        SavePointRun { run: Box::pin(self.run_save(executor)) }
+    }
+
+    #[expect(
+        clippy::result_large_err,
+        reason = "the future's output the facade fixed: a run hands back the simulation by \
+                  value, once per tick"
+    )]
+    async fn run_save(
+        mut self,
+        executor: &Executor,
+    ) -> core::result::Result<(Self, SavePoint), RunError> {
+        if self.core.kind != WorldKind::Server {
+            let error =
+                Error::new(ErrorKind::Unsupported, "only a `Server` world exports a save point");
+            return Err(RunError::kept(error, self));
+        }
+        if let Err(error) = self.core.save.prepare(&self.world) {
+            return Err(RunError::kept(schedule_error(error), self));
+        }
+        let Self { world, mut core } = self;
+        let mut world = core.save.run_pass(world, executor).await.map_err(RunError::lost)?;
+        let copied = world
+            .service_mut::<SaveSlot>()
+            .expect("the builder inserts the save slot")
+            .0
+            .take()
+            .expect("the save pass ran `sim::save_copy`");
+        let simulation = core.join(world);
+        match copied {
+            Ok(save) => Ok((simulation, save)),
+            // An export reads and changes nothing, so the simulation is as it was.
+            Err(error) => Err(RunError::kept(error, simulation)),
+        }
     }
 }
 
-/// How a run fails: the error, and the simulation when nothing ran. `Some` when the kind
-/// check or [`Schedule::prepare`] failed before the run started, so the caller keeps its
-/// world; `None` after `Cancelled`, when the executor shut down during the run and the
+/// The frame slot of a world the builder made.
+fn slot(world: &mut World) -> &mut TickInputSlot {
+    world.service_mut::<TickInputSlot>().expect("the builder inserts the frame slot")
+}
+
+/// How a run fails: the error, and the simulation when the world survived. `Some` when the
+/// kind check or [`Schedule::prepare`] failed before the run started, so the caller keeps
+/// its world; when the `Gather` pass no longer prepares after `Extract` ran (the simulation
+/// then holds what `Extract` did); and when a save point's export failed, which changes
+/// nothing. `None` after `Cancelled`, when the executor shut down during the run and the
 /// world dropped with it. The frame a step was given is not handed back either way.
 /// Converts into [`Error`], so `?` into a `lactose_core::Result` drops the simulation as a
 /// plain error would.
@@ -351,6 +598,18 @@ impl From<RunError> for Error {
     }
 }
 
+impl RunError {
+    /// A failure before anything ran: the simulation goes back.
+    fn kept(error: Error, simulation: Simulation) -> Self {
+        Self { error, simulation: Some(simulation) }
+    }
+
+    /// A failure of the run itself, after which the world is gone.
+    fn lost(error: Error) -> Self {
+        Self { error, simulation: None }
+    }
+}
+
 /// One tick in flight: resolves to the simulation at the next tick. See
 /// [`Simulation::step`].
 #[must_use = "futures do nothing unless awaited"]
@@ -361,8 +620,8 @@ pub struct Step<'a> {
 impl Future for Step<'_> {
     type Output = core::result::Result<Simulation, RunError>;
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        todo!()
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        self.run.as_mut().poll(cx)
     }
 }
 
@@ -376,8 +635,8 @@ pub struct PassRun<'a> {
 impl Future for PassRun<'_> {
     type Output = core::result::Result<Simulation, RunError>;
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        todo!()
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        self.run.as_mut().poll(cx)
     }
 }
 
@@ -391,8 +650,8 @@ pub struct SavePointRun<'a> {
 impl Future for SavePointRun<'_> {
     type Output = core::result::Result<(Simulation, SavePoint), RunError>;
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        todo!()
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        self.run.as_mut().poll(cx)
     }
 }
 
@@ -422,4 +681,4 @@ pub(crate) struct TickInputSlot(pub(crate) Option<TickInput>);
 pub(crate) struct LifecycleSlot(pub(crate) RegionLifecycle);
 
 /// Where `sim::save_copy` leaves the copy. Plumbing: the implementation may reshape it.
-pub(crate) struct SaveSlot(pub(crate) Option<SavePoint>);
+pub(crate) struct SaveSlot(pub(crate) Option<Result<SavePoint>>);

@@ -236,6 +236,8 @@ dependencies = [
  "lactose-math",
  "lactose-reflect",
  "lactose-task",
+ "tracing",
+ "xxhash-rust",
 ]
 
 [[package]]

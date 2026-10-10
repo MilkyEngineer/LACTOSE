@@ -20,12 +20,17 @@ lactose-math.workspace = true
 # Metadata only (architecture section 8.1): the registry, and the field visitors the world
 # hasher implements.
 lactose-reflect.workspace = true
+# Refusals at target `curd` (architecture sections 3 and 19).
+tracing.workspace = true
 
 [dev-dependencies]
-# The compile-only consumer sketches in `tests/` build an executor the way `app` and a SOUR
-# test do (`ChaosConfig`, `TickPacer`); a dev-dependency, so the boundary allowlist is
+# The consumer sketches and the SOUR tests in `tests/` build an executor the way `app` and a
+# SOUR test do (`ChaosConfig`, `TickPacer`); a dev-dependency, so the boundary allowlist is
 # untouched and the library names nothing of `task`.
 lactose-task.workspace = true
+# An xxh64 written by someone else, so the golden hash test reimplements the encoding
+# without calling this crate's.
+xxhash-rust = { workspace = true, features = ["xxh64"] }
 
 [lints]
 workspace = true

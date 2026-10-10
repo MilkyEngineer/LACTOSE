@@ -2,7 +2,11 @@
 //! function adds to them without owning the stage list (architecture sections 5.2, 5.3,
 //! 6.1, 9.3 and 15.3).
 
-use lactose_ecs::{Schedule, ScheduleError, SystemDescriptor, SystemSet, WorldKind};
+use lactose_ecs::{
+    Schedule, ScheduleBuilder, ScheduleError, SystemDescriptor, SystemSet, WorldKind,
+};
+
+use crate::systems::INPUT_SYSTEMS;
 
 /// The four stages of the tick schedule, in execution order. Every world kind has all four;
 /// a stage with no systems of the world's kind runs its sync point and nothing else, so the
@@ -147,8 +151,8 @@ impl Registration {
     /// pass that holds both. How `app` orders the sets of two crates that do not name each
     /// other and both add an exclusive system to one pass, or to `Stage::Input` after
     /// [`sets::INPUT`]. A set no schedule declares, or two sets in different schedules, is
-    /// [`ScheduleError::UnknownOrderedSet`] at build; an edge against the stage order is a
-    /// [`ScheduleError::Cycle`].
+    /// [`ScheduleError::UnknownOrderedSet`] at build; an edge against the stage order, or
+    /// one that puts anything before [`sets::INPUT`], is a [`ScheduleError::Cycle`].
     pub fn order(&mut self, before: &'static SystemSet, after: &'static SystemSet) -> &mut Self {
         self.orders.push((before, after));
         self
@@ -160,8 +164,102 @@ impl Registration {
     pub(crate) fn build(
         self,
     ) -> core::result::Result<(Schedule, [Option<Schedule>; 2]), ScheduleError> {
-        todo!()
+        let kind = self.kind;
+        let mut tick = Schedule::builder(kind);
+        for stage in Stage::ALL {
+            let spec = &self.stages[stage as usize];
+            if stage == Stage::Input {
+                let mut sets = vec![&sets::INPUT];
+                sets.extend(&spec.sets);
+                tick.stage(stage.name(), &sets);
+                for system in INPUT_SYSTEMS {
+                    tick.add(system);
+                }
+            } else {
+                tick.stage(stage.name(), &spec.sets);
+            }
+            for system in &spec.systems {
+                tick.add(system);
+            }
+        }
+        // A pass none of whose systems runs in this kind of world does not exist in it.
+        let mut passes: [Option<ScheduleBuilder>; 2] = [None, None];
+        for pass in Pass::ALL {
+            let spec = &self.passes[pass as usize];
+            if spec.systems.iter().any(|system| system.worlds().contains(kind)) {
+                let mut builder = Schedule::builder(kind);
+                builder.stage(pass.name(), &spec.sets);
+                for system in &spec.systems {
+                    builder.add(system);
+                }
+                passes[pass as usize] = Some(builder);
+            }
+        }
+
+        for &(before, after) in &self.orders {
+            // `sim`'s systems open the input sync point: nothing is ordered before them.
+            if after.name() == sets::INPUT.name() {
+                return Err(ScheduleError::Cycle { members: vec![before.name(), after.name()] });
+            }
+            let unknown = |set: &'static SystemSet| ScheduleError::UnknownOrderedSet {
+                set: set.name(),
+                before: before.name(),
+                after: after.name(),
+            };
+            let target = match (self.declaring(before), self.declaring(after)) {
+                (Some(first), Some(second)) if first != second => return Err(unknown(after)),
+                (Some(target), _) | (None, Some(target)) => target,
+                // The tick schedule reports both sets as unknown.
+                (None, None) => Declared::Tick,
+            };
+            match target {
+                Declared::Tick => {
+                    tick.order(before, after);
+                }
+                Declared::Pass(pass) => match &mut passes[pass as usize] {
+                    Some(builder) => {
+                        builder.order(before, after);
+                    }
+                    // Both sets are this absent pass's, so the edge orders nothing here.
+                    None if self.declaring(before) == self.declaring(after) => {}
+                    None => {
+                        let missing = if self.declaring(before).is_none() { before } else { after };
+                        return Err(unknown(missing));
+                    }
+                },
+            }
+        }
+
+        let tick = tick.build()?;
+        let [extract, gather] = passes;
+        Ok((
+            tick,
+            [
+                extract.map(ScheduleBuilder::build).transpose()?,
+                gather.map(ScheduleBuilder::build).transpose()?,
+            ],
+        ))
     }
+
+    /// The schedule that declares `set`, if any: the tick schedule (whichever stage), or
+    /// one pass.
+    fn declaring(&self, set: &'static SystemSet) -> Option<Declared> {
+        let declares = |spec: &StageBuilder| spec.sets.iter().any(|s| s.name() == set.name());
+        if set.name() == sets::INPUT.name() || self.stages.iter().any(declares) {
+            return Some(Declared::Tick);
+        }
+        Pass::ALL
+            .into_iter()
+            .find(|&pass| declares(&self.passes[pass as usize]))
+            .map(Declared::Pass)
+    }
+}
+
+/// Which schedule declares a set.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Declared {
+    Tick,
+    Pass(Pass),
 }
 
 /// The sets and systems a registration function adds to one stage.
@@ -175,12 +273,15 @@ impl StageBuilder {
     /// Declares `sets` in this stage, after any declared before. A set belongs to one stage;
     /// declaring it in two is [`ScheduleError::SetInTwoStages`] at build.
     pub fn sets(&mut self, sets: &[&'static SystemSet]) -> &mut Self {
-        todo!()
+        self.sets.extend_from_slice(sets);
+        self
     }
 
     /// Adds `system` to this stage, or skips it if its worlds exclude the registration's
     /// kind, as [`ScheduleBuilder::add`](lactose_ecs::ScheduleBuilder::add) does.
     pub fn add(&mut self, system: &'static SystemDescriptor) -> &mut Self {
-        todo!()
+        // The schedule builder skips it if its worlds exclude the kind.
+        self.systems.push(system);
+        self
     }
 }

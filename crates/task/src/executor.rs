@@ -166,6 +166,15 @@ impl Executor {
         self.owner.shared.chaos.as_ref().and_then(Chaos::log)
     }
 
+    /// The chaos configuration scheduling runs under, or `None` when scheduling is free:
+    /// what [`ExecutorBuilder::chaos`] was given, or the default configuration under a
+    /// [`ExecutorBuilder::replay`] built without one. What the determinism harness reports
+    /// it ran with.
+    #[must_use]
+    pub fn chaos_config(&self) -> Option<ChaosConfig> {
+        self.owner.shared.chaos.as_ref().map(|chaos| chaos.config)
+    }
+
     /// Stops accepting work, lets running jobs finish, cancels unfinished tasks and joins
     /// every worker. Returns once all threads have exited.
     ///

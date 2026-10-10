@@ -1472,7 +1472,32 @@ rationale the author supplied during the editorial pass rather than one taken fr
   the assembler orders two crates' sets; pinned regions as the home of world-global persistent
   state; a frame's joins counted in its bundle check and a join outside the atlas reported;
   unloads before loads; the chunk order by capacity; the server's presentation drain in `step`.
-- Driven by: milestone 1, the `sim` facade brief and its two design reviews (2026-10-10).
+- Implementation (the lane and its fix rounds; one review round found 2 serious and 5 minor, the
+  next found two minor items, a test gap and a precondition, applied before the merge):
+  - A `Leave` cancels a held `Join` without reaching the applier, and a newer `Join` replaces a
+    held one.
+  - An edge between two sets of a pass absent from the kind is ignored; an edge before
+    `sets::INPUT` is a `Cycle`.
+  - An unload that cannot export keeps the region.
+  - `Release` follows every server unload under either control, except a region the same frame
+    loads again.
+  - The world hash checks coverage through the world's registry.
+  - `Executor::chaos_config` reports the chaos seed and is banned in the boundary lint file.
+  - The policy's cost follows the rings: `RegionAtlas::within` walks the cells within the radius
+    when that is fewer than the atlas's regions, and the loaded set is read once per sync point
+    (the first implementation was O(anchors × atlas), caught by the review).
+  - The input component is `transient` with an exclusive writer, never `derived`, since a stale
+    sample would drive the simulation from unsaved, unhashed state (the facade's README had
+    allowed `derived`; the review's mid-run journal replay diverged on it).
+  - `run_passes` prepares `Gather` again after `Extract` and hands the simulation back on
+    failure; an export failure in `save_point` also hands it back.
+  - `RegionLifecycle::restore_session_state` is how a replay driver restores the held joins and
+    requested regions a journal records.
+  - The streaming radius is clamped to at least one.
+  - A prediction world's asset failures are `predict`'s to take, and `predict` strips them from
+    re-simulated frames.
+- Driven by: milestone 1, the `sim` facade brief, its two design reviews and the
+  implementation's reviews (2026-10-10).
 
 ## 10. Review history
 
