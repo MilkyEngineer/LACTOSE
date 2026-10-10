@@ -69,6 +69,8 @@ pub struct ScheduleBuilder {
     stages: Vec<StageSpec>,
     /// The first system added before any stage.
     orphan: Option<&'static str>,
+    /// Edges between sets added by [`order`](Self::order), as (before, after).
+    orders: Vec<(&'static SystemSet, &'static SystemSet)>,
 }
 
 struct StageSpec {
@@ -81,7 +83,7 @@ impl ScheduleBuilder {
     /// Starts a schedule for `kind`.
     #[must_use]
     pub fn new(kind: WorldKind) -> Self {
-        Self { kind, stages: Vec::new(), orphan: None }
+        Self { kind, stages: Vec::new(), orphan: None, orders: Vec::new() }
     }
 
     /// The kind this schedule is for.
@@ -117,11 +119,23 @@ impl ScheduleBuilder {
         self
     }
 
+    /// Orders every system of `before` before every system of `after`, like
+    /// [`SystemSet::after`] but added by whoever assembles the schedule rather than declared
+    /// on the set, so that the sets of two crates that do not name each other can be ordered
+    /// (two exclusive systems in one stage must be). Both sets must be declared in some
+    /// stage of this schedule, or the build fails with
+    /// [`ScheduleError::UnknownOrderedSet`]; an edge between sets of two stages is accepted
+    /// when it agrees with the stage order and is a [`ScheduleError::Cycle`] otherwise.
+    pub fn order(&mut self, before: &'static SystemSet, after: &'static SystemSet) -> &mut Self {
+        self.orders.push((before, after));
+        self
+    }
+
     /// Resolves the order and checks it. The errors, in the order they are checked:
     ///
     /// - [`ScheduleError::NoStage`], [`ScheduleError::SetInTwoStages`],
-    ///   [`ScheduleError::DuplicateKey`], [`ScheduleError::UnknownSet`],
-    ///   [`ScheduleError::UnknownSystem`]: structure.
+    ///   [`ScheduleError::UnknownOrderedSet`], [`ScheduleError::DuplicateKey`],
+    ///   [`ScheduleError::UnknownSet`], [`ScheduleError::UnknownSystem`]: structure.
     /// - [`ScheduleError::ExclusiveWithEntityAccess`],
     ///   [`ScheduleError::EntityParamInWorldSystem`],
     ///   [`ScheduleError::RegionParamInWorldSystem`],
@@ -159,6 +173,29 @@ impl ScheduleBuilder {
                     });
                 }
                 declared.insert(set.name(), (stage, spec.name));
+            }
+        }
+        // Edges between sets: one list per stage for the edges within it; an edge across
+        // stages that agrees with the stage order needs nothing, and one that disagrees
+        // is a cycle, like a system edge to a later stage.
+        let mut set_orders: Vec<Vec<(&'static str, &'static str)>> =
+            vec![Vec::new(); self.stages.len()];
+        for &(before, after) in &self.orders {
+            let stage_of_set = |set: &'static SystemSet| {
+                declared.get(set.name()).map(|&(stage, _)| stage).ok_or_else(|| {
+                    ScheduleError::UnknownOrderedSet {
+                        set: set.name(),
+                        before: before.name(),
+                        after: after.name(),
+                    }
+                })
+            };
+            let (first, second) = (stage_of_set(before)?, stage_of_set(after)?);
+            if first > second {
+                return Err(ScheduleError::Cycle { members: vec![before.name(), after.name()] });
+            }
+            if first == second {
+                set_orders[first].push((before.name(), after.name()));
             }
         }
         let mut seen: BTreeMap<SystemKey, &'static str> = BTreeMap::new();
@@ -217,7 +254,7 @@ impl ScheduleBuilder {
         let mut stages = Vec::new();
         let mut ancestors: Vec<BTreeSet<usize>> = Vec::new();
         for (stage, spec) in self.stages.iter().enumerate() {
-            let staged = order_stage(stage, spec, &stage_of, &set_stage)?;
+            let staged = order_stage(stage, spec, &stage_of, &set_stage, &set_orders[stage])?;
             let start = order.len();
             for set in staged.ancestors {
                 ancestors.push(set.into_iter().map(|local| start + local).collect());
@@ -396,6 +433,7 @@ fn order_stage(
     spec: &StageSpec,
     stage_of: &BTreeMap<SystemKey, usize>,
     set_stage: &BTreeMap<&'static str, usize>,
+    set_orders: &[(&'static str, &'static str)],
 ) -> core::result::Result<StagedSystems, ScheduleError> {
     let systems = &spec.systems;
     let index_of: BTreeMap<SystemKey, usize> =
@@ -436,6 +474,11 @@ fn order_stage(
                 _ => {}
             }
         }
+    }
+    // Edges the assembler added between sets of this stage: both sets are declared here,
+    // checked by `build`.
+    for &(before, after) in set_orders {
+        set_preds[set_index[after]].insert(set_index[before]);
     }
     let set_order = topological(&set_preds, |index| sets[index].name()).map_err(|cycle| {
         ScheduleError::Cycle {
@@ -887,6 +930,15 @@ pub enum ScheduleError {
         /// The set.
         set: &'static str,
     },
+    /// An edge added with [`ScheduleBuilder::order`] names a set that no stage declares.
+    UnknownOrderedSet {
+        /// The set no stage declares.
+        set: &'static str,
+        /// The edge's first set.
+        before: &'static str,
+        /// The edge's second set.
+        after: &'static str,
+    },
     /// One set is declared in two stages; a set belongs to one.
     SetInTwoStages {
         /// The set.
@@ -1042,6 +1094,10 @@ impl fmt::Display for ScheduleError {
             Self::UnknownSet { system, set } => {
                 write!(f, "`{system}` is in set `{set}`, which is not in its stage")
             }
+            Self::UnknownOrderedSet { set, before, after } => write!(
+                f,
+                "`{before}` is ordered before `{after}`, but `{set}` is declared in no stage"
+            ),
             Self::SetInTwoStages { set, first, second } => {
                 write!(
                     f,

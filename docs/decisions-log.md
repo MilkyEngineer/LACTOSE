@@ -1327,6 +1327,153 @@ rationale the author supplied during the editorial pass rather than one taken fr
     asserts at compile time that its system exists and is a reduction.
 - Driven by: milestone 0, the ECS implementation lane and its reviews (2026-10-10).
 
+**D118. The `sim` facade: what sections 4, 6, 8.2, 8.3, 9.1, 9.7, 11, 14 and 15 left open** (§4,
+§5.2, §6, §6.1, §8.2, §8.3, §9.1, §9.7, §10, §11, §14, §15.3, §16, `lactose-sim`, `lactose-ecs`)
+- Why: the facade is written before its implementation so `app`, `predict`, `net`, `persist`,
+  `physics-api`, `anim`, `input` and the game crates build against the final surface; each
+  choice below is one the sections did not settle, and each is a contract in
+  `crates/sim/README.md`.
+  - *The timer root lives in `app`; `sim` provides clockless runs.* Section 11 gives the root
+    tick deadlines, catch-up and pacing, and `task` gives it `TickPacer`; a boundary crate may
+    read no clock. `Simulation::step` runs one tick from one frame, trims the structural log to
+    a retention (a ring of one log cursor per step, trimmed to the oldest; a consumer further
+    behind does a full pass) and, on the server, drains the presentation events;
+    `Simulation::run_passes` runs a frame's passes (extract, then the gather) once per frame,
+    paused or not, on the server and on both client worlds, so edits between ticks are still
+    extracted and replicated, the prediction world's local player is extracted every frame, and
+    a gather covers every tick since the last frame; re-simulation calls `step` alone, so
+    extract never runs against a discarded tick. Every run takes the simulation by value and
+    hands it back, as `Schedule::run_tick` does with the world; a run that fails before anything
+    ran (the kind check, `prepare`, which `run_passes` performs for both passes first) hands it
+    back inside `RunError`, never the frame. Rules out a `sim`-owned loop with injected clocks,
+    and passes inside the step.
+  - *One `TickInput` per tick is the unit of everything that enters the boundary*: the time
+    scale, asset failures, directed unloads, region bundles (each with its first asset table),
+    asset tables, directed mode changes, sessions and players' inputs, applied in that order.
+    Every keyed field is a map, so a frame cannot hold two entries for one key and assembly
+    order decides nothing. The journal is the sequence of frames and `predict`'s ring stores one
+    per tick. Rules out any between-tick call that changes simulation state (`world_mut` is
+    unjournaled: tests only, and `app`'s `RegionPolicy`).
+  - *Sessions are server inputs.* `TickInput::sessions` carries `Join { region }` and `Leave`
+    per player; a `SessionApplier` the game or `app` implements spawns the player's entity, or
+    re-claims the one the game keeps for the player across saves (found by a persistent
+    component of the game's), adding `ClaimedBy` and `StreamingAnchor`, or despawns it,
+    resolving it from world state and never from a side table. A `Join` whose region is not
+    loaded is held as an anchor position until the region loads, counting from its own frame's
+    bundle check, so the join itself brings its region in; a `Join` for a region the atlas lacks
+    is refused and reported; a `Leave` cancels a held join. A save carries no session state, so
+    on a load every player joins again; a journal records the joined players, held joins and
+    requested regions at its checkpoint. Clients learn of players through staged state. Rules
+    out a player table in `sim` and unjournaled `ClaimedBy`/anchor writes.
+  - *Players' inputs are bytes plus a typed hook.* `PlayerSample::sample` is the input
+    component's plain-data bytes, journaled verbatim; `InputApplier` (beside the component in
+    `lactose-input`) decodes and writes them after `sim` has called `World::set_input_tick` with
+    the slot being filled. Chosen because the ECS has no erased row write and `sim` must not
+    define the input component.
+  - *Staged network state and the proxy update are one hook*, `StagedState`, filled by `net`
+    (client) or `predict` (prediction world); the server's default does nothing. In the
+    prediction world `predict` also writes `StreamingAnchor` on the local player's entity so the
+    appliers' lookup resolves; under `Directed` it has no policy effect.
+  - *The three hooks are `dyn` service resources taken as `ResMut<dyn Trait>` by exclusive
+    systems*, because input ticks and transient columns are cleared inside `run_tick` at the
+    sync point, so nothing applied between ticks survives. The sync point's systems are private
+    and `sets::INPUT` is the only thing a consumer orders itself after; the lifecycle is held
+    under a type no system can name.
+  - *Setup functions insert what systems name.* `SimulationBuilder::setup` runs after `sim`'s
+    own inserts and before any registration function and the prepares, one per crate, so `build`
+    can prepare every schedule and a missing resource is a build error. World resources are
+    configuration or session state and must be `derived`: `build` refuses any other policy among
+    the resource types the `TypeTable` knows, since world resources are neither hashed nor
+    saved; simulation state that is hashed or saved is a component or a region resource, and
+    world-global persistent state is a resource of a pinned region. The 6.1 example's `Gravity`
+    and `TotalMass` are therefore `derived`. The physics backend's solver pool, which section 16
+    sizes by the worker count, is built by `app` outside the boundary and handed to the backend
+    through a setup function.
+  - *Time scale enters through the frame.* `TickInput::time_scale` is `app`'s decision on the
+    server, mirrored into the `derived, replicated` `TimeScale` resource by the sync point so it
+    is journaled and replicated; the pacer's scale is `app`'s own copy (on a client, `net`'s
+    latest value) and no game system reads the resource, so a paused world can be unpaused. A
+    pause is entered by one tick whose frame carries `PAUSED` and then the pacer, and left by
+    the pacer first and the next frame. Rules out `Res<TimeScale>` in game code and an
+    unjournaled `world_mut` write.
+  - *Four fixed stages*: `Input` (the sync point: `sim`'s six exclusive systems first,
+    consumers' exclusive systems after `sets::INPUT`), `Simulation`, `Physics` (the
+    once-per-tick step with `Job`, writing back through `Commands`), `Post`; the same count in
+    every world kind. Sets are declared per stage through `Registration::stage(..).sets(..)`, so
+    `game-sim` adds sets without owning the stage list. Two crates that both add exclusive
+    systems to one pass, or after `sets::INPUT`, do not name each other: `app` orders their sets
+    with `Registration::order`, through the new `ScheduleBuilder::order` of `lactose-ecs`, an
+    edge between two sets added by the assembler, which must agree with the stage order.
+  - *Two passes, one fixed stage each*: `Extract` then `Gather`, filled through
+    `Registration::pass(..)`, skipped when no system of the kind was added; the save copy is a
+    third, internal pass run on demand by `save_point`, one child per region over
+    `World::export_region`, server only (single-player runs a `Server` world in-process).
+  - *Region control is `Anchored` on the server and `Directed` elsewhere.* Anchored: the regions
+    of rows with `StreamingAnchor` and of held joins are the positions; `RegionAtlas` gives
+    cells; Chebyshev distance; three radii in `RegionPolicy`, `release >= streaming >
+    activation` enforced at build and clamped at run time: within activation → `Simulated` once
+    loaded with a table, within streaming → requested and kept `Frozen`, outside release →
+    unloaded and a pending request cancelled (`RegionRequest::Cancel`); the gap between
+    streaming and release is the hysteresis. Pinned regions are always wanted and never
+    released, so world-global persistent state has a home that is simulated whenever the server
+    runs. A bundle for a region neither pinned, nor requested, nor within the release radius is
+    refused. The policy runs last at the sync point so it sees the sessions' spawns. Directed:
+    the frame says what unloads, loads and which mode; the client's, the prediction world's and
+    the test's mode. No table waits for a region (a bundle brings its first), so nothing about
+    regions lives outside the world and the frames; the lifecycle's remaining state is
+    server-only session state that the server never rolls back, section 10's list is unchanged,
+    and the journal records it at its checkpoint. Rules out a player-positions input and an
+    unjournaled region load.
+  - *Unload and save are one path*: both produce `RegionExport { region, rows: RegionRows }` on
+    the server (every row is bound at apply, so the export cannot fail); off the server an
+    unload does not export. `persist` diffs the export into the overlay, which is also what the
+    server sends on relevance. A refused bundle changes nothing: resources, transient keys and
+    the overlay are validated before `create_region`.
+  - *The hash is two-level and additive*: field hash (xxh64 seeded by field ID over the field's
+    stream, possibly empty, for every top-level ID'd field), row hash (seeded by component key
+    over the key bytes and the field hashes; a type with no ID'd field hashes its key alone, so
+    presence counts), column sum by wrapping addition (no sort), region hash over seed, mode,
+    asset table, columns ascending by key and resources ascending by key; `Simulation::hash`
+    over the tick and the regions. The digest is keyed by row with its field hashes and
+    reproduces the region hash exactly, so a mismatch is explained field by field, a marker
+    component included.
+  - *The typed entry point survives the erased registry through `TypeTable`*: one
+    `register::<T>()` per type does `Registry::register` and, for persistent and transient
+    types, monomorphises `T::visit` under the hashing visitor; raw floats are refused at
+    registration by layout kind and the scalar is trusted by its `Field::NAME` tag at
+    registration and by `TypeId` in the visitor. A game crate writes three functions:
+    `register_types`, `setup`, `register_systems`.
+  - *Time*: `TickDelta` is `1 / 60` through `lactose_math`, derived, never changed;
+    `CurrentTick` is a derived resource mirroring `World::tick`, rewritten every tick and read
+    through `get`; a write is a bug the type cannot prevent, bounded to one tick.
+  - *SOUR*: `harness::layout_mode(ChunkCapacity, seed)` is the layout-mode policy (permute and
+    split from the seed; the chunk order by capacity, reversed for seven rows and the 16 KiB
+    slab and shuffled otherwise, so the matrix covers both orders under the runner's fixed
+    seeds; `Bytes` other than 16 KiB is `Unsupported` rather than silently the slab); chaos mode
+    is every `ChaosConfig` flag plus `record`, built by the test's glue; `run_recorded` records
+    `(tick, hash)` after every step; test crates include the protocol module by `#[path]` and
+    dev-depend on `lactose-task` until the protocol module moves, after which one test-support
+    crate outside the boundary, `lactose-sour`, holds the glue; `[harness]` lists `lactose-sim`
+    until `lactose-app-headless` exists.
+  - *`lactose-ecs` re-exports `Executor`*, which reaches every boundary crate; the boundary lint
+    file bans what a boundary crate must not do with it (`frame_worker_count`, `slot_count`,
+    `spawn`, `run_graph`, `platform`, `sleep_until`, `execution_log`), so what a boundary crate
+    can do with it is run a schedule, block on a future, and build or shut down an executor;
+    `ecs` opts out at its one `run_graph` call.
+- What the two design reviews changed (round 1: 2 blocking, 11 serious, 13 minor; round 2: 0
+  blocking, 3 serious, 8 minor; `edc7eec` was the facade before them and `6845b2f` between
+  them): setup functions; sessions as inputs with a held join as an anchor position and the
+  policy last; maps for every keyed frame field; a bundle's first table and no pending tables;
+  no export off the server; the release radius and `Cancel`; the row-keyed digest; world
+  resources must be `derived`; time scale through the frame; `run_passes` apart from `step`;
+  `RunError` with the simulation; log retention; a journal that can rebuild a region and, with
+  its checkpoint, the session state a save does not carry; the executor bans; private systems
+  and lifecycle; one stage per pass, with `ScheduleBuilder::order` and `Registration::order` so
+  the assembler orders two crates' sets; pinned regions as the home of world-global persistent
+  state; a frame's joins counted in its bundle check and a join outside the atlas reported;
+  unloads before loads; the chunk order by capacity; the server's presentation drain in `step`.
+- Driven by: milestone 1, the `sim` facade brief and its two design reviews (2026-10-10).
+
 ## 10. Review history
 
 - **Revision 1** (`a29af04`): the design baseline.

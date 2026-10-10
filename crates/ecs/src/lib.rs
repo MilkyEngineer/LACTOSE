@@ -65,6 +65,11 @@ pub use lactose_ecs_macros::finalize;
 /// on a function whose parameters are [`SystemParam`] types. See the crate `README.md` for
 /// the arguments and what the attribute emits.
 pub use lactose_ecs_macros::system;
+/// The executor a schedule runs on, re-exported so that a boundary crate which drives a
+/// schedule (`lactose-sim`, `lactose-predict`) can name what [`Schedule::run_tick`] takes
+/// without a dependency edge on `lactose-task`, which architecture section 8.2 grants to
+/// this crate alone, for execution only.
+pub use lactose_task::Executor;
 pub use param::{
     Changed, Ctx, Job, Mut, RegionRes, Res, ResMut, StableKeyOf, SystemParam, With, Without,
 };

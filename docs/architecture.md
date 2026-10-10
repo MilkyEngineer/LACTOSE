@@ -122,7 +122,7 @@ crates/
   ecs-macros/     F            proc macros: `#[system]`, `#[finalize]`
   reflect/        F            type registry, field IDs, typed references, persistence policy, serde bridge
   reflect-macros/ F            proc macros: `#[component]`, field IDs, reflection metadata, per-type visitors
-  sim/            F  boundary  [CURD] region lifecycle (activation, streaming, unload policy), input sync point orchestration, tick loop, time scale, world hash (monomorphised per-type hashers)
+  sim/            F  boundary  [CURD] region lifecycle (activation, streaming, unload policy), input sync point orchestration, the tick step and the frame's passes (the loop is the timer root's, in `app`), time scale, world hash (monomorphised per-type hashers)
   anim/           F  boundary  animation state machines, phase, events, root motion, sim skeleton (sockets, hands, feet, head, ragdoll bodies)
   predict/        F  boundary  prediction world, rollback ring, reconciliation
   nav-query/      F  boundary  navmesh queries
@@ -264,7 +264,9 @@ picks it up. Section 11 covers time scale and pause.
 - The scheduler builds a DAG per schedule at startup from declared access and set ordering,
   cached until systems change.
 - Conflicting systems are ordered by set or system constraints; a missing constraint fails the
-  build. Ties are broken by system stable key, the xxh64 hash of the declared system name,
+  build. The assembly crate may add an edge between two sets that do not name each other
+  (`ScheduleBuilder::order`), so the exclusive systems of two backend crates can share a stage.
+  Ties are broken by system stable key, the xxh64 hash of the declared system name,
   checked for collisions, never by registration order. The resulting order is the stage's
   execution order and is identical on every build and platform.
 - Each system iterates chunks as jobs. Per-entity work is independent by construction. A chunk
@@ -367,8 +369,8 @@ tick N        tick N+1 simulation ───────────────�
   attachments) migrate with their owner.
 - **Region modes**: `Simulated`, `Replicated` (rows written only at the input sync point from
   staged network state), `Frozen`. The input sync point is the first sync point of a tick,
-  before any stage runs; it is where inputs, staged network state and asset version tables
-  are applied.
+  before any stage runs; it is where the time scale, asset version tables, region bundles and
+  mode changes, sessions, inputs and staged network state are applied.
 - **Relationships** are components holding `StableKey` with a reverse index maintained at
   command apply and included in snapshots. Cross-region references are weak and validated at apply.
 - **Resources** are singletons with declared access.
@@ -400,6 +402,9 @@ fn apply_gravity(dt: Res<TickDelta>, g: Res<Gravity>, vel: Mut<Velocity>, mass: 
 fn total_mass(mass: &Mass) -> Scalar { mass.0 }
 #[finalize(total_mass)]
 fn store_total(sum: Scalar, out: ResMut<TotalMass>) { out.0 = sum; }
+// `TotalMass`, like `Gravity`, is a world resource and so `derived`: a world resource is
+// configuration or session state, never hashed or saved (section 8.3); state that belongs to
+// no region is a resource of a pinned region.
 
 // Spawn that references the spawned entity in the same command buffer. `HeldItem` holds a
 // `#[value]` enum, since enums are fieldless types held in a field (section 6).
@@ -524,7 +529,11 @@ presentation, pose evaluation, VFX, audio, UI, asset IO timing and input samplin
 - A boundary crate may depend on a non-boundary foundation crate (`reflect`, `asset-api`,
   `input`, `present-api`) only for types and for operations that are deterministic by
   construction: no clocks, no floats computed outside `math`. `ecs` depends on `task` for
-  execution only, and every result is order-independent by construction. `crate-tiers.toml`
+  execution only and re-exports `Executor`, which every boundary crate can then name; the
+  boundary lint file bans the executor's worker counts, arbitrary work, thread creation,
+  deadlines and scheduling history, so what a boundary crate can do with it is run a
+  schedule, block on a future, and build or shut down an executor. Every result is
+  order-independent by construction. `crate-tiers.toml`
   names the permitted edges, to workspace crates and to third-party crates at any depth,
   `cargo xtask boundary` enforces them, and the tier check forbids build scripts and proc
   macros from depending on boundary crates, because they compile for the host without the
@@ -535,11 +544,14 @@ presentation, pose evaluation, VFX, audio, UI, asset IO timing and input samplin
 
 ### 8.3 Enforcement
 
-`sim` exposes `world_hash(region) -> u64`: each chunk job hashes (stable key, component key,
-field ID, canonical value) per entity with a monomorphised per-type hasher, and the results
-fold through an order-independent combiner, so no sort is needed and the hash is identical
-under any layout. It covers persistent and transient columns and region resources; derived
-columns are excluded. It runs at sync points, and a field-level diff is produced only on
+`sim` exposes `Simulation::world_hash(region) -> Result<u64>`: each row hashes as (stable
+key, component key, field ID, canonical value) through a monomorphised per-type hasher,
+chunk jobs when forked, and the row hashes fold by addition, so no sort is needed and the
+hash is identical under any layout. It covers persistent and transient columns and region
+resources, and the region's seed, mode and asset version table; derived columns and
+resources are excluded, and world resources are neither hashed nor saved: a world resource
+is configuration or session state and must be `derived`, and world-global persistent state
+is a resource of a pinned region. It runs at sync points, and a field-level diff is produced only on
 mismatch. Hashing `physics-api::snapshot` bytes is added once Rapier's serialisation is shown
 to be order-stable.
 
@@ -672,7 +684,10 @@ interaction keep it possible later. No system may hold a direct reference across
 - **Activation.** A region is `Simulated` when any player is within the activation radius,
   measured in regions. Cost per player is the regions they activate times per-region cost;
   co-located players share. Because chunks belong to archetypes, scattered players add rows,
-  not mostly-empty chunks.
+  not mostly-empty chunks. A deployment may pin regions, which are always simulated whatever
+  the players' positions; world-global persistent state lives in their resources. A loaded
+  region is released only outside a release radius larger than the streaming radius, so a
+  player on a border does not thrash the ring.
 - **Overload ladder**, climbed when the tick exceeds budget and descended with hysteresis:
   shrink the activation radius; decimate non-player systems in the outer activation ring to
   alternate ticks, selected by tick parity so it stays deterministic; refuse new joins. Server
@@ -704,6 +719,8 @@ at tick ten. The cost is measured in milestone 1 and the prediction world is siz
 - The timer root (section 5.1) owns tick deadlines, catch-up and frame pacing.
 - Time scale is a simulation resource replicated by the server. It changes how many ticks run
   per real second; the tick delta never changes. Pause is time scale zero, server-controlled.
+  The scale enters the simulation as a journaled input of the tick; game systems do not
+  read it.
 - Presentation runs on real time regardless of time scale.
 - Catch-up ticks and re-simulation ticks share the per-frame cap. A client that cannot catch
   up re-syncs its clock; a server that cannot keep up climbs the overload ladder.
@@ -866,7 +883,8 @@ the dropped records so `persist` can re-home an entity the patch moved to anothe
 
 At a sync point, copy persistent columns of every loaded region on worker tasks, serialise
 through `reflect`, diff into records, compress with zstd, write through `io` to a temporary
-file, sync, rename over the slot.
+file, sync, rename over the slot. World resources and session state (claims, anchors, pending
+joins) are not saved; on a load every player joins again.
 
 ### 15.4 Container and evolution
 
@@ -900,7 +918,8 @@ world. Rapier's determinism feature is used together with its parallel solver. T
 sanctioned blocking wait in `task`: a physics stage job calls into the solver's rayon pool,
 which is sized to the performance-core count minus the workers reserved for render recording
 and non-physics systems, and whose threads get QoS and floating-point state through the
-`thread_class` helper. The physics stage is a barrier for systems that depend on physics only;
+`thread_class` helper. The pool is built by `app` outside the boundary and handed to the backend
+through a setup function. The physics stage is a barrier for systems that depend on physics only;
 independent systems run alongside on the reserved workers. Bodies in `Frozen` regions are fixed
 colliders. Milestone 1 measures the physics phase's share of the tick and the stall it imposes
 on render recording during the overlap.

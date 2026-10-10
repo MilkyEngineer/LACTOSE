@@ -226,6 +226,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "lactose-sim"
+version = "0.0.0"
+dependencies = [
+ "lactose-asset-api",
+ "lactose-bundle",
+ "lactose-core",
+ "lactose-ecs",
+ "lactose-math",
+ "lactose-reflect",
+ "lactose-task",
+]
+
+[[package]]
 name = "lactose-task"
 version = "0.0.0"
 dependencies = [
