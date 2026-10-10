@@ -1,13 +1,52 @@
 //! Change tracking read per consumer: column change ticks, the structural change log and
 //! whole-column access for engine passes (architecture section 6).
 
-use core::marker::PhantomData;
 use core::ops::Range;
 
 use lactose_core::{ComponentKey, StableKey, Tick};
 use lactose_reflect::Component;
 
 use crate::region::RegionId;
+
+/// A point in a world's stamp order: a tick and a position within it.
+///
+/// Within a tick, every sync point and every system has a fixed position in execution
+/// order, so a system's writes carry the same stamp under every layout; direct writes made
+/// inside a slot or between ticks take the next position after the last one used.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Default)]
+pub(crate) struct Stamp {
+    pub(crate) tick: Tick,
+    pub(crate) position: u32,
+}
+
+impl Stamp {
+    pub(crate) const fn new(tick: Tick, position: u32) -> Self {
+        Self { tick, position }
+    }
+
+    /// The stamp's place in the stamp order as seen from tick `now`. Ticks are a `u32`
+    /// that wraps; every stored stamp is less than 2^31 ticks older than now (the clamp
+    /// of `World::advance_tick` leaves it at most 2^30 old, and the next clamp comes 2^30
+    /// ticks later), so comparing ticks relative to now orders them across the wrap.
+    pub(crate) const fn seen_from(self, now: Tick) -> (u32, u32) {
+        (self.tick.0.wrapping_sub(now.0).wrapping_add(1 << 31), self.position)
+    }
+
+    /// Whether this stamp is after `other`, seen from tick `now`.
+    pub(crate) fn after(self, other: Self, now: Tick) -> bool {
+        self.seen_from(now) > other.seen_from(now)
+    }
+
+    /// The later of the two stamps, seen from tick `now`.
+    pub(crate) fn later(self, other: Self, now: Tick) -> Self {
+        if other.after(self, now) { other } else { self }
+    }
+}
+
+/// Whether tick `tick` is before tick `than`, across the wrap.
+pub(crate) const fn tick_before(tick: Tick, than: Tick) -> bool {
+    tick.0.wrapping_sub(than.0) >= 1 << 31
+}
 
 /// A point in a world's change history, taken with [`World::mark`](crate::World::mark)
 /// and given back to [`World::changed_since`](crate::World::changed_since) and
@@ -28,6 +67,18 @@ pub struct ChangeMark {
 }
 
 impl ChangeMark {
+    pub(crate) const fn new(epoch: u32, stamp: Stamp) -> Self {
+        Self { epoch, tick: stamp.tick, position: stamp.position }
+    }
+
+    pub(crate) const fn epoch(&self) -> u32 {
+        self.epoch
+    }
+
+    pub(crate) const fn stamp(&self) -> Stamp {
+        Stamp::new(self.tick, self.position)
+    }
+
     /// The tick the mark was taken at.
     #[must_use]
     pub const fn tick(&self) -> Tick {
@@ -39,14 +90,14 @@ impl ChangeMark {
 /// mark. `T` is a tracked column (replicated or extracted). Storage order, which is not a
 /// semantic key: the consumer keys what it produces by the row's key.
 pub struct ChangedRows<'w, T: Component> {
-    _world: PhantomData<&'w T>,
+    pub(crate) rows: std::vec::IntoIter<(StableKey, &'w T)>,
 }
 
 impl<'w, T: Component> Iterator for ChangedRows<'w, T> {
     type Item = (StableKey, &'w T);
 
     fn next(&mut self) -> Option<Self::Item> {
-        todo!()
+        self.rows.next()
     }
 }
 
@@ -54,54 +105,59 @@ impl<'w, T: Component> Iterator for ChangedRows<'w, T> {
 /// for extract, replication gather and hashing, which fork over chunks; the rows are
 /// identified by key, never by index.
 pub struct ColumnRef<'w, T: Component> {
-    _world: PhantomData<&'w T>,
+    pub(crate) keys: &'w [StableKey],
+    pub(crate) regions: &'w [RegionId],
+    pub(crate) values: &'w [T],
+    pub(crate) row_ticks: Option<&'w [Tick]>,
+    pub(crate) column_tick: Tick,
 }
 
 impl<T: Component> ColumnRef<'_, T> {
     /// The origin key of each row.
     #[must_use]
     pub fn keys(&self) -> &[StableKey] {
-        todo!()
+        self.keys
     }
 
     /// The region of each row.
     #[must_use]
     pub fn regions(&self) -> &[RegionId] {
-        todo!()
+        self.regions
     }
 
     /// The values, one per row.
     #[must_use]
     pub fn values(&self) -> &[T] {
-        todo!()
+        self.values
     }
 
     /// The tick each row last changed at, on a tracked column; `None` on an untracked one,
     /// whose rows share [`column_tick`](Self::column_tick).
     #[must_use]
     pub fn row_ticks(&self) -> Option<&[Tick]> {
-        todo!()
+        self.row_ticks
     }
 
     /// The chunk's coarse change tick for this column: the last tick a writing system was
-    /// dispatched over the chunk. A consumer skips a chunk whose column tick is not newer
-    /// than its mark.
+    /// dispatched over the chunk, or any write reached it. A consumer skips a chunk whose
+    /// column tick is older than its mark's tick; a write in the mark's own tick, before or
+    /// after the mark, shows that tick, so only `changed_since` tells them apart.
     #[must_use]
     pub fn column_tick(&self) -> Tick {
-        todo!()
+        self.column_tick
     }
 }
 
 /// Iterates the chunks holding a column of `T`.
 pub struct Columns<'w, T: Component> {
-    _world: PhantomData<&'w T>,
+    pub(crate) columns: std::vec::IntoIter<ColumnRef<'w, T>>,
 }
 
 impl<'w, T: Component> Iterator for Columns<'w, T> {
     type Item = ColumnRef<'w, T>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        todo!()
+        self.columns.next()
     }
 }
 
@@ -109,20 +165,25 @@ impl<'w, T: Component> Iterator for Columns<'w, T> {
 /// (architecture section 6). Yielded by [`World::columns_mut`](crate::World::columns_mut)
 /// for bulk writes at a sync point.
 pub struct ColumnMut<'w, T: Component> {
-    _world: PhantomData<&'w mut T>,
+    pub(crate) keys: &'w [StableKey],
+    pub(crate) regions: Vec<RegionId>,
+    pub(crate) values: &'w mut [T],
+    pub(crate) stamps: Option<(&'w mut [Tick], &'w mut [u32])>,
+    pub(crate) column_tick: &'w mut Stamp,
+    pub(crate) now: Stamp,
 }
 
 impl<T: Component> ColumnMut<'_, T> {
     /// The origin key of each row.
     #[must_use]
     pub fn keys(&self) -> &[StableKey] {
-        todo!()
+        self.keys
     }
 
     /// The region of each row.
     #[must_use]
     pub fn regions(&self) -> &[RegionId] {
-        todo!()
+        &self.regions
     }
 
     /// Writes through `f`, which receives the rows' keys and values and records every row
@@ -131,20 +192,36 @@ impl<T: Component> ColumnMut<'_, T> {
     /// miss; that is how `lactose-predict` writes a correction after a restore without
     /// inventing a change.
     pub fn write(self, f: impl FnOnce(&[StableKey], &mut [T], &mut DirtyRows)) {
-        todo!()
+        let mut dirty = DirtyRows { bits: Vec::new(), rows: self.keys.len() };
+        f(self.keys, self.values, &mut dirty);
+        let mut any = false;
+        if let Some((ticks, positions)) = self.stamps {
+            let rows = ticks.len();
+            for row in dirty.iter().take_while(|&row| row < rows) {
+                ticks[row] = self.now.tick;
+                positions[row] = self.now.position;
+                any = true;
+            }
+        } else {
+            any = dirty.iter().any(|row| row < self.keys.len());
+        }
+        if any {
+            // Every write is stamped at the newest point, so it replaces the column tick.
+            *self.column_tick = self.now;
+        }
     }
 }
 
 /// Iterates the chunks holding a column of `T`, for writing.
 pub struct ColumnsMut<'w, T: Component> {
-    _world: PhantomData<&'w mut T>,
+    pub(crate) columns: std::vec::IntoIter<ColumnMut<'w, T>>,
 }
 
 impl<'w, T: Component> Iterator for ColumnsMut<'w, T> {
     type Item = ColumnMut<'w, T>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        todo!()
+        self.columns.next()
     }
 }
 
@@ -154,28 +231,37 @@ impl<'w, T: Component> Iterator for ColumnsMut<'w, T> {
 #[derive(Clone, Debug, Default)]
 pub struct DirtyRows {
     bits: Vec<u64>,
+    /// The length of the slice the set belongs to; zero for a set made with `default`.
+    rows: usize,
 }
 
 impl DirtyRows {
     /// Marks row `index`.
     pub fn mark(&mut self, index: usize) {
-        todo!()
+        let word = index / 64;
+        if self.bits.len() <= word {
+            self.bits.resize(word + 1, 0);
+        }
+        self.bits[word] |= 1 << (index % 64);
     }
 
     /// Marks every row in `rows`.
     pub fn mark_range(&mut self, rows: Range<usize>) {
-        todo!()
+        for index in rows {
+            self.mark(index);
+        }
     }
 
-    /// Marks every row.
+    /// Marks every row of the slice the write was handed. A set made with `default`
+    /// belongs to no slice, and this marks nothing in it.
     pub fn mark_all(&mut self) {
-        todo!()
+        self.mark_range(0..self.rows);
     }
 
     /// Whether `index` is marked.
     #[must_use]
     pub fn contains(&self, index: usize) -> bool {
-        todo!()
+        self.bits.get(index / 64).is_some_and(|word| word & (1 << (index % 64)) != 0)
     }
 
     /// The marked rows, ascending.
@@ -188,63 +274,69 @@ impl DirtyRows {
 /// [`World::columns_erased`](crate::World::columns_erased) for passes that work from the
 /// registry rather than a type: the world hasher and bulk export.
 pub struct ErasedColumn<'w> {
-    _world: PhantomData<&'w ()>,
+    pub(crate) component: ComponentKey,
+    pub(crate) element_size: usize,
+    pub(crate) keys: &'w [StableKey],
+    pub(crate) regions: &'w [RegionId],
+    pub(crate) bytes: &'w [u8],
+    pub(crate) row_ticks: Option<&'w [Tick]>,
+    pub(crate) column_tick: Tick,
 }
 
 impl ErasedColumn<'_> {
     /// The component.
     #[must_use]
     pub fn component(&self) -> ComponentKey {
-        todo!()
+        self.component
     }
 
     /// The size of one value in bytes.
     #[must_use]
     pub fn element_size(&self) -> usize {
-        todo!()
+        self.element_size
     }
 
     /// The origin key of each row.
     #[must_use]
     pub fn keys(&self) -> &[StableKey] {
-        todo!()
+        self.keys
     }
 
     /// The region of each row.
     #[must_use]
     pub fn regions(&self) -> &[RegionId] {
-        todo!()
+        self.regions
     }
 
     /// The values, `element_size` bytes per row, laid out as the component is in memory.
     #[must_use]
     pub fn bytes(&self) -> &[u8] {
-        todo!()
+        self.bytes
     }
 
     /// The tick each row last changed at, on a tracked column; `None` otherwise.
     #[must_use]
     pub fn row_ticks(&self) -> Option<&[Tick]> {
-        todo!()
+        self.row_ticks
     }
 
     /// The chunk's coarse change tick for this column.
     #[must_use]
     pub fn column_tick(&self) -> Tick {
-        todo!()
+        self.column_tick
     }
 }
 
 /// Iterates the chunks holding a column, as bytes.
 pub struct ErasedColumns<'w> {
-    _world: PhantomData<&'w ()>,
+    pub(crate) columns: std::vec::IntoIter<ErasedColumn<'w>>,
 }
 
 impl<'w> Iterator for ErasedColumns<'w> {
     type Item = ErasedColumn<'w>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        todo!()
+        self.columns.next()
     }
 }
 
@@ -319,21 +411,49 @@ pub struct LogCursor {
 /// drops those every consumer has passed. A restore or a whole-world load clears the log
 /// and starts a new epoch.
 pub struct StructuralLog {
-    _private: (),
+    epoch: u32,
+    /// The absolute index of `entries[0]`.
+    base: u64,
+    entries: Vec<LogEntry>,
 }
 
 impl StructuralLog {
+    pub(crate) fn new(epoch: u32) -> Self {
+        Self { epoch, base: 0, entries: Vec::new() }
+    }
+
+    pub(crate) fn push(&mut self, tick: Tick, change: StructuralChange) {
+        self.entries.push(LogEntry { tick, change });
+    }
+
+    /// Empties the log and moves it to `epoch`.
+    pub(crate) fn reset(&mut self, epoch: u32) {
+        self.epoch = epoch;
+        self.base = 0;
+        self.entries.clear();
+    }
+
+    pub(crate) fn trim(&mut self, cursor: LogCursor) {
+        if cursor.epoch != self.epoch || cursor.index <= self.base {
+            return;
+        }
+        let end = self.base + self.entries.len() as u64;
+        let drop = (cursor.index.min(end) - self.base) as usize;
+        self.entries.drain(..drop);
+        self.base += drop as u64;
+    }
+
     /// A cursor at the end of the log: a consumer that starts here sees only later
     /// changes.
     #[must_use]
     pub fn cursor(&self) -> LogCursor {
-        todo!()
+        LogCursor { epoch: self.epoch, index: self.base + self.entries.len() as u64 }
     }
 
     /// A cursor at the start of the retained log.
     #[must_use]
     pub fn cursor_at_start(&self) -> LogCursor {
-        todo!()
+        LogCursor { epoch: self.epoch, index: self.base }
     }
 
     /// The entries after `cursor`, in order, and `cursor` advanced past them; or `None` if
@@ -341,19 +461,25 @@ impl StructuralLog {
     /// does a full pass and takes [`cursor`](Self::cursor).
     #[must_use]
     pub fn since(&self, cursor: &mut LogCursor) -> Option<LogEntries<'_>> {
-        todo!()
+        let end = self.base + self.entries.len() as u64;
+        if cursor.epoch != self.epoch || cursor.index < self.base || cursor.index > end {
+            return None;
+        }
+        let start = (cursor.index - self.base) as usize;
+        cursor.index = end;
+        Some(LogEntries { entries: self.entries[start..].iter() })
     }
 }
 
 /// Iterates log entries in order.
 pub struct LogEntries<'a> {
-    _log: PhantomData<&'a ()>,
+    entries: core::slice::Iter<'a, LogEntry>,
 }
 
 impl<'a> Iterator for LogEntries<'a> {
     type Item = &'a LogEntry;
 
     fn next(&mut self) -> Option<Self::Item> {
-        todo!()
+        self.entries.next()
     }
 }

@@ -440,7 +440,10 @@ fn apply_region_load(world: &mut World, loaded: ResMut<LoadedBundles>) { /* bulk
 Physics writes go through the physics command buffer and apply in the physics stage. Relationship
 fields are written through commands so the reverse index stays consistent. `StableKeyOf` yields
 the entity's origin key; no row, chunk or worker index exists in the API. The macro makes every
-parameter binding mutable, and `#[finalize]` finds its system by name in the same module. The
+parameter binding mutable, `#[finalize]` finds its system by name in the same module, and
+`writes = [T, ..]` declares the columns a system writes outside its parameter list (through
+commands, or through the world in an exclusive system), which is how a transient column
+written at the input sync point gets its declared writer. The
 week-one facade exposes exactly this surface over a naive single-threaded implementation,
 including regions, change ticks, the structural log, snapshots, bulk copy and command buffers,
 so dependent agents build against the final API from the start; `crates/ecs/README.md` is its

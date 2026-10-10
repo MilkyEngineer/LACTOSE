@@ -5,15 +5,18 @@ use core::marker::PhantomData;
 use core::ops::{Deref, DerefMut};
 
 use lactose_asset_api::PinnedTable;
-use lactose_core::{StableKey, Tick};
+use lactose_core::{StableKey, SystemKey, Tick};
 use lactose_reflect::{Component, Resource};
 use lactose_task::JobContext;
 
 use crate::access::{
     Access, AccessKind, component_target, no_target, region_resource_target, resource_target,
 };
+use crate::change::Stamp;
 use crate::region::RegionId;
 use crate::rng::Rng;
+use crate::storage::{RowView, typed, typed_mut};
+use crate::system::{Fetch, Invocation, Slot, mismatch};
 use crate::world::World;
 
 pub(crate) mod sealed {
@@ -56,6 +59,10 @@ pub(crate) mod sealed {
 /// within one system two data parameters (`&T`, [`Mut<T>`], `Option<&T>`, `Option<Mut<T>>`)
 /// may not name one component, nor may [`Without<T>`] stand beside any parameter on `T`.
 /// The schedule rejects each ([`ScheduleError`](crate::ScheduleError)).
+#[diagnostic::on_unimplemented(
+    message = "`{Self}` is not a system parameter",
+    note = "a system takes `&T`, `Mut<T>`, `Option<&T>`, `Option<Mut<T>>`, `With<T>`, `Without<T>` or `Changed<T>` of a component `T`, `Res`, `ResMut`, `RegionRes`, `Ctx`, `StableKeyOf`, `Job`, `Commands`, `EventWriter`, `Events`, `PresentEvents`, `Channel`, or `&mut World` when exclusive"
+)]
 pub trait SystemParam: sealed::Sealed + Sized {
     /// What this parameter reads or writes.
     const ACCESS: Access;
@@ -67,7 +74,10 @@ pub trait SystemParam: sealed::Sealed + Sized {
 /// A service trait has `Send + Sync` supertraits and is inserted and read as the same
 /// `dyn Trait`, since `dyn Trait` and `dyn Trait + Send + Sync` have different `TypeId`s.
 /// A resource a system names that the world does not hold fails `run_tick` before anything
-/// runs, with an error of kind `NotFound`.
+/// runs, with an error of kind `InvalidData` carrying
+/// [`ScheduleError::MissingResource`](crate::ScheduleError::MissingResource); one an
+/// exclusive system removes during the run
+/// skips the systems that name it, logged at target `casein`.
 pub struct Res<'w, T: ?Sized + 'static> {
     value: &'w T,
 }
@@ -114,7 +124,7 @@ impl<T: ?Sized + 'static> SystemParam for ResMut<'_, T> {
 }
 
 /// A resource of the current region, read. Region resources are written through
-/// [`World::region_resource_mut`] at a sync point, never from a kernel, because the
+/// [`World::update_region_resource`] at a sync point, never from a kernel, because the
 /// kernels of one region run on many workers. An invocation in a region that lacks `T` is
 /// skipped.
 pub struct RegionRes<'w, T: Resource> {
@@ -155,17 +165,26 @@ impl<T: Component> SystemParam for &T {
 /// [`Commands::set`](crate::Commands::set), and the schedule rejects `Mut` on them.
 pub struct Mut<'w, T: Component> {
     value: &'w mut T,
-    stamp: Option<&'w mut u64>,
-    now: u64,
+    /// The row's stamp on a tracked column.
+    stamp: Option<(&'w mut Tick, &'w mut u32)>,
+    now: Stamp,
 }
 
-impl<T: Component> Mut<'_, T> {
+impl<'w, T: Component> Mut<'w, T> {
+    pub(crate) fn new(row: RowView<'w>, now: Stamp) -> Self {
+        Self { value: typed_mut(row.bytes), stamp: row.stamps, now }
+    }
+
     /// Writes `value` only if it differs from the current value, so rewriting an equal
     /// value does not dirty the row; returns whether it wrote. Equality is byte equality,
     /// which is exact for a reflected component: it has no implicit padding and its
     /// explicit padding is always zero. Replicated columns are written this way.
     pub fn set_if_neq(&mut self, value: T) -> bool {
-        todo!()
+        if bytemuck::bytes_of(&*self.value) == bytemuck::bytes_of(&value) {
+            return false;
+        }
+        **self = value;
+        true
     }
 }
 
@@ -179,7 +198,11 @@ impl<T: Component> Deref for Mut<'_, T> {
 
 impl<T: Component> DerefMut for Mut<'_, T> {
     fn deref_mut(&mut self) -> &mut T {
-        todo!()
+        if let Some((tick, position)) = &mut self.stamp {
+            **tick = self.now.tick;
+            **position = self.now.position;
+        }
+        self.value
     }
 }
 
@@ -246,11 +269,25 @@ impl<T: Component> SystemParam for Changed<T> {
 /// per-entity system the region is the entity's; in a system without a component parameter
 /// it makes the system run once per `Simulated` region.
 pub struct Ctx<'w> {
-    world: &'w World,
+    seed: u64,
     region: RegionId,
     invoker: Option<StableKey>,
-    system: lactose_core::SystemKey,
+    system: SystemKey,
     tick: Tick,
+    assets: Option<&'w PinnedTable>,
+}
+
+impl<'w> Ctx<'w> {
+    pub(crate) fn new(
+        seed: u64,
+        region: RegionId,
+        invoker: Option<StableKey>,
+        system: SystemKey,
+        tick: Tick,
+        assets: Option<&'w PinnedTable>,
+    ) -> Self {
+        Self { seed, region, invoker, system, tick, assets }
+    }
 }
 
 impl Ctx<'_> {
@@ -269,18 +306,20 @@ impl Ctx<'_> {
     /// The RNG stream for `key`: keyed by the region seed, the tick, this system, the
     /// invoking entity's origin key (none in a per-region system) and `key` (architecture
     /// section 8.2). `key` is usually the entity's own origin key or a placeholder from this
-    /// invocation's spawns, which is keyed by its spawn index; any stable key is accepted.
-    /// Two calls with one key give the same stream: draw from one `Rng`.
+    /// invocation's spawns, which is keyed by its spawn index; any stable key is accepted,
+    /// as given: a bound `Net` key and the origin key of one entity are different streams,
+    /// so pass the origin key (`StableKeyOf` yields it). Two calls with one key give the
+    /// same stream: draw from one `Rng`.
     #[must_use]
     pub fn rng(&self, key: StableKey) -> Rng {
-        todo!()
+        Rng::keyed(self.seed, self.tick, self.system, self.invoker, key)
     }
 
     /// The exact-version assets of the region (architecture section 14), or `None` until a
     /// table has entered at an input sync point.
     #[must_use]
     pub fn assets(&self) -> Option<&PinnedTable> {
-        todo!()
+        self.assets
     }
 }
 
@@ -355,4 +394,130 @@ impl sealed::Sealed for &mut World {}
 
 impl SystemParam for &mut World {
     const ACCESS: Access = Access::new(AccessKind::World, no_target);
+}
+
+// How each parameter is made from the slot the schedule prepared for it.
+
+impl<'r, 'j, T: ?Sized + 'static> Fetch<'r, 'j> for Res<'r, T> {
+    fn fetch(invocation: &mut Invocation<'r, 'j>, index: usize) -> Self {
+        match invocation.take(index) {
+            Slot::Resource(value) => Self { value: resource_ref(value) },
+            _ => mismatch(index),
+        }
+    }
+}
+
+impl<'r, 'j, T: ?Sized + 'static> Fetch<'r, 'j> for ResMut<'r, T> {
+    fn fetch(invocation: &mut Invocation<'r, 'j>, index: usize) -> Self {
+        match invocation.take(index) {
+            Slot::ResourceMut(value) => {
+                let value: &mut Box<T> = value.downcast_mut().expect("resources hold `Box<T>`");
+                Self { value: &mut **value }
+            }
+            _ => mismatch(index),
+        }
+    }
+}
+
+/// The value inside the `Box<T>` a world resource is held as.
+pub(crate) fn resource_ref<T: ?Sized + 'static>(value: &(dyn core::any::Any + Send + Sync)) -> &T {
+    value.downcast_ref::<Box<T>>().map(AsRef::as_ref).expect("resources hold `Box<T>`")
+}
+
+impl<'r, 'j, T: Resource> Fetch<'r, 'j> for RegionRes<'r, T> {
+    fn fetch(invocation: &mut Invocation<'r, 'j>, index: usize) -> Self {
+        match invocation.take(index) {
+            Slot::Read(bytes) => Self { value: typed(bytes) },
+            _ => mismatch(index),
+        }
+    }
+}
+
+impl<'r, 'j, T: Component> Fetch<'r, 'j> for &'r T {
+    fn fetch(invocation: &mut Invocation<'r, 'j>, index: usize) -> Self {
+        match invocation.take(index) {
+            Slot::Read(bytes) => typed(bytes),
+            _ => mismatch(index),
+        }
+    }
+}
+
+impl<'r, 'j, T: Component> Fetch<'r, 'j> for Mut<'r, T> {
+    fn fetch(invocation: &mut Invocation<'r, 'j>, index: usize) -> Self {
+        match invocation.take(index) {
+            Slot::Write(row, now) => Mut::new(row, now),
+            _ => mismatch(index),
+        }
+    }
+}
+
+impl<'r, 'j, T: Component> Fetch<'r, 'j> for Option<&'r T> {
+    fn fetch(invocation: &mut Invocation<'r, 'j>, index: usize) -> Self {
+        match invocation.take(index) {
+            Slot::Read(bytes) => Some(typed(bytes)),
+            Slot::Absent => None,
+            _ => mismatch(index),
+        }
+    }
+}
+
+impl<'r, 'j, T: Component> Fetch<'r, 'j> for Option<Mut<'r, T>> {
+    fn fetch(invocation: &mut Invocation<'r, 'j>, index: usize) -> Self {
+        match invocation.take(index) {
+            Slot::Write(row, now) => Some(Mut::new(row, now)),
+            Slot::Absent => None,
+            _ => mismatch(index),
+        }
+    }
+}
+
+macro_rules! filter_fetch {
+    ($($filter:ident),+) => {$(
+        impl<'r, 'j, T: Component> Fetch<'r, 'j> for $filter<T> {
+            fn fetch(invocation: &mut Invocation<'r, 'j>, index: usize) -> Self {
+                match invocation.take(index) {
+                    Slot::Unit => Self(PhantomData),
+                    _ => mismatch(index),
+                }
+            }
+        }
+    )+};
+}
+
+filter_fetch!(With, Without, Changed);
+
+impl<'r, 'j> Fetch<'r, 'j> for Ctx<'r> {
+    fn fetch(invocation: &mut Invocation<'r, 'j>, index: usize) -> Self {
+        match invocation.take(index) {
+            Slot::Ctx(ctx) => ctx,
+            _ => mismatch(index),
+        }
+    }
+}
+
+impl<'r, 'j> Fetch<'r, 'j> for StableKeyOf {
+    fn fetch(invocation: &mut Invocation<'r, 'j>, index: usize) -> Self {
+        match invocation.take(index) {
+            Slot::Key(key) => Self(key),
+            _ => mismatch(index),
+        }
+    }
+}
+
+impl<'r, 'j> Fetch<'r, 'j> for Job<'r, 'j> {
+    fn fetch(invocation: &mut Invocation<'r, 'j>, index: usize) -> Self {
+        match invocation.take(index) {
+            Slot::Job(context) => Self { context },
+            _ => mismatch(index),
+        }
+    }
+}
+
+impl<'r, 'j> Fetch<'r, 'j> for &'r mut World {
+    fn fetch(invocation: &mut Invocation<'r, 'j>, index: usize) -> Self {
+        match invocation.take(index) {
+            Slot::World(world) => world,
+            _ => mismatch(index),
+        }
+    }
 }

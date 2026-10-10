@@ -30,8 +30,9 @@ pub enum RegionMode {
     /// Rows are written only at the input sync point, from staged network state, through
     /// `&mut World`. No per-entity or per-region system runs over it.
     Replicated,
-    /// Rows are read-only until the mode changes. No per-entity or per-region system runs
-    /// over it.
+    /// No per-entity or per-region system runs over it until the mode changes. Commands and
+    /// direct writes still apply to its rows: a move into a frozen region is how an entity
+    /// freezes at its boundary (architecture section 9.7).
     Frozen,
 }
 

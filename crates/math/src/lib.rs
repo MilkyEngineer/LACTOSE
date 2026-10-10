@@ -32,6 +32,7 @@ mod mat;
 mod quat;
 mod raw;
 mod reduce;
+mod reflect;
 pub mod render;
 mod scalar;
 mod transform;

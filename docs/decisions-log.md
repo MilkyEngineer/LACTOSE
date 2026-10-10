@@ -1185,7 +1185,7 @@ rationale the author supplied during the editorial pass rather than one taken fr
     macro makes every parameter binding mutable so the example's `vel.y -= ..` and
     `cmd.spawn(..)` compile as written.
   - *`RegionRes<T>` is read-only in kernels.* The kernels of one region run on many workers;
-    region resources are written through `World::region_resource_mut` at a sync point or by
+    region resources are written through `World::update_region_resource` at a sync point or by
     a reduction's finalize through a world resource.
 - What the design review changed (9 blocking, 16 serious, 9 minor findings; `aa3f05d` was
   the facade before it): `run_tick` takes the world by value and hands it back, because a
@@ -1272,6 +1272,60 @@ rationale the author supplied during the editorial pass rather than one taken fr
   alternates between a state where the fixed keeper measures P99 under 6 µs and one where
   it measures 22 to 25 µs (`docs/verification.md`).
 - Driven by: the D113 tick-start criterion; the keeper fix round and its review.
+
+**D117. The naive ECS implementation: what the facade left to it** (§6, `lactose-ecs`)
+- Why: the implementation lane met the facade's contract and had to settle what it did not
+  say; three review rounds (1 blocking, 3 serious, 8 minor; then 2 blocking, 5 serious, 5
+  minor, two of them regressions of the first fix round; then a verification round) shaped
+  the answers. Each is a contract a consumer may rely on.
+  - *Run model.* A run is one graph node; the world moves in and out through an uncontended
+    mutex. `Job` needs a `JobContext`, which only a graph job provides.
+  - *Storage is safe code.* `Ctx` holds no `&World`; values that may hold placeholders stay
+    typed until apply. The crate's `unsafe` is `SystemDescriptor::new` and the hidden
+    finalize plumbing.
+  - *Claim timing.* Whether a spawn's source has `ClaimedBy` is read when its kernel runs.
+  - *Ordinal bytes.* The predicted ordinal hashes the source key (tag byte, then words), the
+    system key (u64) and the spawn index (u32), little-endian, xxh64 seed 0.
+  - *References and binds.* Direct `spawn` and `insert` keep references to entities not yet
+    live; only command apply empties them. `bind` rewrites stored references from the Net
+    key to the origin key, in rows and in region resources, and refuses a Net key that names
+    a live entity. A restore does the same rewrite for binds made after its snapshot, except
+    for a Net entity the restore revives, which keeps its references and which
+    `lactose-predict` despawns again. A predicted entity a restore removes is recorded as
+    despawned at the snapshot tick, so the rollback horizon prunes its alias.
+  - *NetIds and unloads.* `allocate_net_id` skips ids already in use; `unload_region` keeps
+    aliases.
+  - *Transient writers: `writes = [T, ..]`.* A transient column's declared writers are
+    `Mut` on it or a `writes` declaration, which also declares writes through `Commands` or
+    `&mut World` for conflicts (against readers and `Mut`, not against another declaration).
+    On an exclusive system the writes land at its sync point and satisfy readers ordered
+    after it in that stage; on any other system they land at the next sync point and satisfy
+    readers from the next stage on. A declaration is trusted, never checked; an exclusive
+    system declares nothing implicitly. The first fix round had counted every exclusive
+    system as a writer of every column, which let any input system defeat the check.
+  - *Transient presence.* It travels with exports: `ExportedRow::transient` for components,
+    `RegionRows::transient_resources` for region resources; `persist` encodes presence and
+    ignores values; `load_region` stores a transient component zeroed and the loader
+    re-inserts transient resources with `insert_region_resource_zeroed`; the input sync
+    point zeroes transient columns and transient region resources.
+  - *Region resource writes.* Only through `update_region_resource`, which runs a closure on
+    a copy, validates and canonicalises the result and keeps the old value on `InvalidData`;
+    no `&mut` to stored bytes is handed out, so stored bytes are always a valid value.
+    `region_resource_mut` of the facade is removed.
+  - *Stamps across the wrap.* Stamps are compared relative to the current tick, valid
+    because every 2^30 ticks (tick 0 included) older stamps are clamped to 2^30 ticks old,
+    so every stored stamp is less than 2^31 ticks old; a pass's first window in an epoch
+    opens 2^31 ticks back; `set_tick` moves stamps onto the new clock by their age; a new
+    chunk's column ticks are its first row's, and no zero sentinel is stored (the sentinel
+    the first fix round kept won the relative comparison above tick 2^31).
+  - *Presentation events.* A batch orders ticks by their age at the take; a pass numbers its
+    emissions from 2^31; a cancelled key re-emitted before it is taken is neither cancelled
+    nor delivered again.
+  - *Schedules.* A `Schedule` serves one world, tied by its first successful `prepare`; a
+    set belongs to one stage; a resource removed mid-run skips the systems that name it,
+    logged; `Changed` in `World::query` means after this point one tick back; a finalize
+    asserts at compile time that its system exists and is a reduction.
+- Driven by: milestone 0, the ECS implementation lane and its reviews (2026-10-10).
 
 ## 10. Review history
 

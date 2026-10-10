@@ -8,6 +8,11 @@ publish.workspace = true
 
 [dependencies]
 bytemuck.workspace = true
+# `FieldId`, for the field impls in `src/reflect.rs`.
+lactose-core.workspace = true
+# Metadata only (architecture section 8.2): the field impls that let components hold the
+# math types.
+lactose-reflect.workspace = true
 libm.workspace = true
 
 [lints]

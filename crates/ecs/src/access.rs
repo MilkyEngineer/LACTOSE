@@ -40,6 +40,7 @@ impl Access {
 /// How a parameter touches its target. Two systems conflict when one writes a target the
 /// other reads or writes; the schedule requires an order between them.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[non_exhaustive]
 pub enum AccessKind {
     /// Reads every row or the resource: `&T`, [`Res`](crate::Res),
     /// [`RegionRes`](crate::RegionRes), [`Channel`](crate::Channel).
@@ -77,10 +78,18 @@ pub enum AccessKind {
     Job,
     /// The whole world: `&mut World` in an exclusive system.
     World,
+    /// Writes a column outside the parameter list, through `Commands::set` or, in an
+    /// exclusive system, through `&mut World`: what `#[system(writes = [T, ..])]` declares.
+    /// No parameter carries it, so nothing is fetched for it. The schedule counts it as a
+    /// write of the column, for ordering conflicts (with readers and `Mut`, not with another
+    /// `Writes` of the column) and as a writer of a transient column: an exclusive system's
+    /// from its own stage, any other's from the next. It is trusted, never checked.
+    Writes,
 }
 
 /// What a parameter touches.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[non_exhaustive]
 pub enum AccessTarget {
     /// A component column, by its stable key.
     Component(ComponentKey),
@@ -107,6 +116,8 @@ pub enum AccessTarget {
         /// `core::any::type_name` of the channel, for diagnostics only.
         name: &'static str,
     },
+    /// The whole world, which two exclusive systems both hold: what they conflict on.
+    World,
     /// No target beyond the kind itself.
     None,
 }
@@ -114,6 +125,14 @@ pub enum AccessTarget {
 /// The target function of a component parameter.
 pub(crate) fn component_target<T: lactose_reflect::Component>() -> AccessTarget {
     AccessTarget::Component(T::KEY)
+}
+
+/// The entry `writes = [T]` adds to a system's table. Not part of the interface: the
+/// `#[system]` expansion names it.
+#[doc(hidden)]
+#[must_use]
+pub const fn writes<T: lactose_reflect::Component>() -> Access {
+    Access::new(AccessKind::Writes, component_target::<T>)
 }
 
 /// The target function of a resource parameter; `T` may be a `dyn` trait type.
