@@ -69,3 +69,38 @@ fn only_simulated_regions_run_and_a_missing_region_resource_skips_one() {
     assert_eq!(world.get::<Counter>(net(2)), Some(&Counter(1)));
     assert_eq!(world.region(FROZEN).unwrap().mode, RegionMode::Simulated);
 }
+
+/// A region resource with a reference (review of the implementation, M5).
+#[lactose_reflect::resource(key = "test::boss", persistent)]
+#[derive(Debug)]
+pub struct Boss {
+    /// Whom the region's boss hunts.
+    #[field(id = 1)]
+    pub target: lactose_core::EntityRef,
+}
+
+#[test]
+fn region_resources_are_validated_and_hold_origin_keys() {
+    use lactose_core::{EntityRef, NetId, PredictionKey, StableKey};
+    let mut registry = base_registry();
+    registry.register::<Boss>().unwrap();
+    let registry = std::sync::Arc::new(registry);
+    let mut world = world_with(WorldKind::Prediction, LayoutConfig::default(), registry);
+    let placeholder = Boss { target: EntityRef::new(StableKey::Placeholder(1)) };
+    let error = world.insert_region_resource(REGION, placeholder).unwrap_err();
+    assert_eq!(error.kind(), lactose_core::ErrorKind::InvalidData);
+    assert!(world.region_resource::<Boss>(REGION).is_none());
+
+    let predicted = PredictionKey { player: PLAYER, input_tick: t(2), ordinal: 5 };
+    let id = NetId::from_bits(40).unwrap();
+    world.bind(predicted, id).unwrap();
+    let boss = Boss { target: EntityRef::new(StableKey::Net(id)) };
+    world.insert_region_resource(REGION, boss).unwrap();
+    let stored = world.region_resource::<Boss>(REGION).unwrap().target;
+    assert_eq!(stored, EntityRef::new(StableKey::Predicted(predicted)), "stored as the origin key");
+
+    // A write through the mutable view that leaves an invalid value reads back as none.
+    world.region_resource_mut::<Boss>(REGION).unwrap().target = placeholder.target;
+    assert!(world.region_resource::<Boss>(REGION).is_none());
+    assert!(world.region_resource_mut::<Boss>(REGION).is_none());
+}

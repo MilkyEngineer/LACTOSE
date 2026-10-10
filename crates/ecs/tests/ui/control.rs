@@ -25,7 +25,7 @@ fn per_entity(key: StableKeyOf, mass: Mut<Mass>, cmd: Commands) {
     cmd.despawn(*key);
 }
 
-#[system(name = "ui::per_region", after = [per_entity])]
+#[system(name = "ui::per_region", after = [per_entity], writes = [Mass])]
 fn per_region(ctx: Ctx, cmd: Commands) {
     cmd.spawn((Mass(Scalar::from_u32(ctx.tick().0)),));
 }

@@ -2,14 +2,18 @@
 //!
 //! Each file in `tests/ui` is checked as a binary of a scratch package whose dependencies
 //! are this crate and the crates a game crate names beside it. A case passes when the check
-//! fails and the compiler's output contains the listed text. `control.rs` must compile, in
-//! a crate that forbids `unsafe` and denies warnings.
+//! fails and the compiler's output contains the listed text. The controls, `control.rs` and
+//! `section_6_1.rs` (the systems of architecture section 6.1 as written), must compile in a
+//! crate that forbids `unsafe` and denies warnings.
 
 #![forbid(unsafe_code)]
 
 use std::path::Path;
 use std::process::Command;
 use std::{env, fs, process};
+
+/// The cases that must compile.
+const CONTROLS: &[&str] = &["control", "section_6_1"];
 
 /// File stem, then text the compiler's output must contain. Except where noted it is this
 /// crate's own wording.
@@ -28,6 +32,26 @@ const CASES: &[(&str, &[&str])] = &[
     ("return_without_reduce", &["a system returns nothing unless it is a reduction"]),
     ("not_a_parameter", &["`u32` is not a system parameter"]),
     ("generic", &["a system cannot be generic"]),
+    (
+        "stray_finalize",
+        &[
+            "`#[finalize(not_a_reduction)]` names a system that is not a reduction",
+            // The compiler's wording: the system the finalize names does not exist.
+            "cannot find value `NOTHING_HERE` in this scope",
+        ],
+    ),
+    (
+        "stray_finalize_private",
+        &[
+            "`#[finalize(not_a_reduction)]` names a system that is not a reduction",
+            "cannot find value `NOTHING_HERE` in this scope",
+        ],
+    ),
+    // The compiler's wording: `writes` names components only.
+    (
+        "writes_not_a_component",
+        &["the trait bound `u32: lactose_reflect::Component` is not satisfied", "writes = [u32]"],
+    ),
     // The compiler's wording: the pairing is by name, and the finalize is not there.
     ("missing_finalize", &["cannot find value `__finalize_total` in this scope"]),
     // The compiler's wording: the finalize's first parameter is not the reducer's output.
@@ -56,10 +80,13 @@ fn rejected_systems() {
     let manifest = format!(
         "[package]\nname = \"ecs-compile-fail\"\nversion = \"0.0.0\"\nedition = \"2024\"\n\n\
          [workspace]\n\n[dependencies]\nlactose-ecs = {{ path = '{}' }}\n\
-         lactose-math = {{ path = '{}' }}\nlactose-reflect = {{ path = '{}' }}\n",
+         lactose-math = {{ path = '{}' }}\nlactose-reflect = {{ path = '{}' }}\n\
+         lactose-core = {{ path = '{}' }}\n\
+         bytemuck = {{ version = \"1\", features = [\"derive\"] }}\n",
         path("ecs"),
         path("math"),
         path("reflect"),
+        path("core"),
     );
     fs::write(project.join("Cargo.toml"), manifest).unwrap();
     fs::copy(repository.join("Cargo.lock"), project.join("Cargo.lock")).unwrap();
@@ -84,10 +111,12 @@ fn rejected_systems() {
         (output.status.success(), String::from_utf8_lossy(&output.stderr).into_owned())
     };
 
-    let (compiled, stderr) = check("control");
-    assert!(compiled, "the control case must compile:\n{stderr}");
+    for control in CONTROLS {
+        let (compiled, stderr) = check(control);
+        assert!(compiled, "the control `{control}` must compile:\n{stderr}");
+    }
 
-    let listed = CASES.len() + 1;
+    let listed = CASES.len() + CONTROLS.len();
     assert_eq!(fs::read_dir(&ui).unwrap().count(), listed, "every file in tests/ui is a case");
     for (case, messages) in CASES {
         let (compiled, stderr) = check(case);

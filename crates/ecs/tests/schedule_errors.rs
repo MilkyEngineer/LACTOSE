@@ -348,3 +348,21 @@ fn run_tick_fails_on_prepare_and_on_shutdown() {
     let error = executor.block_on(schedule.run_tick(world, &executor)).map(|_| ()).unwrap_err();
     assert_eq!(error.kind(), ErrorKind::Cancelled);
 }
+
+/// A schedule serves one world (review of the implementation, M4): its pass windows are
+/// kept per schedule, so a second world would lose changes to the first world's marks.
+#[test]
+fn a_schedule_serves_the_one_world_it_first_ran_with() {
+    let executor = executor();
+    let mut pass = build(&[&PLAIN]).unwrap();
+    let first = world(WorldKind::Server, LayoutConfig::default());
+    let second = world(WorldKind::Server, LayoutConfig::default());
+    let first = executor.block_on(pass.run_pass(first, &executor)).unwrap();
+    assert_eq!(
+        pass.prepare(&second),
+        Err(ScheduleError::WrongWorld { schedule: WorldKind::Server, world: WorldKind::Server })
+    );
+    let error = executor.block_on(pass.run_pass(second, &executor)).map(|_| ()).unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::InvalidData);
+    assert!(pass.prepare(&first).is_ok(), "the first world is still served");
+}
