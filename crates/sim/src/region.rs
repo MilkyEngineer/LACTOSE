@@ -355,6 +355,10 @@ impl RegionLifecycle {
     /// its first step, since a save carries no session state. Nothing is issued for them:
     /// the requests were issued in the recorded run. Like a write through `world_mut`, it
     /// is not journaled.
+    ///
+    /// Called once, before the first step, with the state a journal recorded; state that
+    /// contradicts the world (a requested region that is loaded, a held join outside the
+    /// atlas) is not checked.
     pub fn restore_session_state(
         &mut self,
         held_joins: BTreeMap<PlayerId, RegionId>,

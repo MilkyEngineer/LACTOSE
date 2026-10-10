@@ -273,10 +273,17 @@ fn outputs(simulation: &mut Simulation) -> String {
 }
 
 /// Records the program with a checkpoint after tick `at`, the session state a save does
-/// not carry, then `after` frames; returns the journal, the hashes and the outputs.
-fn record_from(executor: &Executor, at: u32, after: u32) -> (Journal, Vec<u64>, Vec<String>) {
+/// not carry, then `after` frames, with bundles arriving `delay` frames late; returns the
+/// journal, the hashes and the outputs.
+fn record_from(
+    executor: &Executor,
+    at: u32,
+    after: u32,
+    delay: u32,
+) -> (Journal, Vec<u64>, Vec<String>) {
     let mut simulation = program(Default::default());
     let mut driver = Driver::default();
+    driver.delay = delay;
     for tick in 1..=at {
         let frame = program_frame(tick, &mut driver);
         simulation = step(executor, simulation, frame);
@@ -316,16 +323,8 @@ fn record_from(executor: &Executor, at: u32, after: u32) -> (Journal, Vec<u64>, 
         simulation = step(executor, simulation, frame);
         // The driver answers what the run asked, as `observe` would.
         let requests = simulation.lifecycle_mut().take_requests();
-        for request in &requests {
-            match *request {
-                lactose_sim::RegionRequest::Load { region } => {
-                    driver.pending_mut().insert(region);
-                }
-                lactose_sim::RegionRequest::Cancel { region } => {
-                    driver.pending_mut().remove(&region);
-                }
-                lactose_sim::RegionRequest::Release { .. } => {}
-            }
+        for &request in &requests {
+            driver.answer(request);
         }
         let rest = outputs(&mut simulation);
         seen.push(format!("{tick}: {requests:?} {rest}"));
@@ -392,12 +391,16 @@ fn replay_from(executor: &Executor, journal: &Journal) -> (Vec<u64>, Vec<String>
 #[test]
 fn a_journal_from_a_mid_run_checkpoint_replays_with_its_session_state() {
     let executor = executor();
-    // Inside the held-join window, around the leave at 150 and the join again at 170.
-    for at in [1_u32, 2, 3, 60, 149, 150, 151, 169, 170, 171, 200] {
-        let (journal, recorded, original) = record_from(&executor, at, 60);
-        let (hashes, replayed) = replay_from(&executor, &journal);
-        let first = hashes.iter().zip(&recorded).position(|(a, b)| a != b);
-        assert_eq!(first, None, "checkpoint {at}: first differing step");
-        assert_eq!(replayed, original, "checkpoint {at}: lifecycle outputs");
+    // Inside the held-join window, around the leave at 150 and the join again at 170. With
+    // a slow store, regions are still requested at the checkpoint, so a replay that did
+    // not restore them would request them again.
+    for delay in [0, 4] {
+        for at in [1_u32, 2, 3, 60, 149, 150, 151, 169, 170, 171, 200] {
+            let (journal, recorded, original) = record_from(&executor, at, 60, delay);
+            let (hashes, replayed) = replay_from(&executor, &journal);
+            let first = hashes.iter().zip(&recorded).position(|(a, b)| a != b);
+            assert_eq!(first, None, "delay {delay}, checkpoint {at}: first differing step");
+            assert_eq!(replayed, original, "delay {delay}, checkpoint {at}: lifecycle outputs");
+        }
     }
 }

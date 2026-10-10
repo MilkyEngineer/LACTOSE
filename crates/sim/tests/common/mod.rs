@@ -725,7 +725,11 @@ fn components(row: &lactose_ecs::ExportedRow, registry: &Registry) -> Vec<Compon
 /// fresh; a cancelled request is dropped; every export is stored.
 #[derive(Default)]
 pub struct Driver {
-    pending: BTreeSet<RegionId>,
+    /// Regions owed a bundle, with the frames they have waited.
+    pending: BTreeMap<RegionId, u32>,
+    /// How many frames a bundle arrives after the frame that would answer at once: a slow
+    /// store.
+    pub delay: u32,
     pub stored: BTreeMap<RegionId, RegionExport>,
     pub requests: Vec<RegionRequest>,
     /// Regions whose table is withheld from the bundle and sent in a later frame.
@@ -737,29 +741,30 @@ impl Driver {
     /// Takes the lifecycle's outputs after a step.
     pub fn observe(&mut self, simulation: &mut Simulation) {
         let lifecycle = simulation.lifecycle_mut();
-        for request in lifecycle.take_requests() {
-            match request {
-                RegionRequest::Load { region } => {
-                    self.pending.insert(region);
-                }
-                RegionRequest::Cancel { region } => {
-                    self.pending.remove(&region);
-                }
-                RegionRequest::Release { .. } => {}
-            }
-            self.requests.push(request);
-        }
-        for export in lifecycle.take_exports() {
-            self.stored.insert(export.region, export);
-        }
+        let requests = lifecycle.take_requests();
+        let exports = lifecycle.take_exports();
         let failures = lifecycle.take_load_failures();
         assert!(failures.is_empty(), "the driver's bundles load: {failures:?}");
+        for request in requests {
+            self.answer(request);
+            self.requests.push(request);
+        }
+        for export in exports {
+            self.stored.insert(export.region, export);
+        }
     }
 
-    /// The regions owed a bundle in the next frame, for a test that takes the lifecycle's
-    /// requests itself.
-    pub fn pending_mut(&mut self) -> &mut BTreeSet<RegionId> {
-        &mut self.pending
+    /// Takes one request, for a test that takes the lifecycle's requests itself.
+    pub fn answer(&mut self, request: RegionRequest) {
+        match request {
+            RegionRequest::Load { region } => {
+                self.pending.insert(region, 0);
+            }
+            RegionRequest::Cancel { region } => {
+                self.pending.remove(&region);
+            }
+            RegionRequest::Release { .. } => {}
+        }
     }
 
     /// The bundles and tables for the next frame, added to `frame`.
@@ -767,7 +772,16 @@ impl Driver {
         for region in core::mem::take(&mut self.owed_tables) {
             frame.assets.insert(region, table(&[(region.0, 2)]));
         }
-        for region in core::mem::take(&mut self.pending) {
+        let mut due = Vec::new();
+        for (&region, waited) in &mut self.pending {
+            if *waited >= self.delay {
+                due.push(region);
+            } else {
+                *waited += 1;
+            }
+        }
+        for region in due {
+            self.pending.remove(&region);
             let mut bundle = match self.stored.remove(&region) {
                 Some(export) => {
                     let mut bundle = reload(&export, baseline(region), types().registry());

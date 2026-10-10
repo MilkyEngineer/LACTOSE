@@ -556,7 +556,9 @@ the overlay, resources, transient keys and table the bundle carried), so every r
 every player the replay runs can be rebuilt. Before its first step the replay driver
 loads the checkpoint's regions with their tables and modes, re-claims the players'
 entities, and hands the held joins and requested regions to
-`RegionLifecycle::restore_session_state` through `Simulation::lifecycle_mut`. Writing,
+`RegionLifecycle::restore_session_state` through `Simulation::lifecycle_mut`, called once,
+before the first step, with the state a journal recorded; state that contradicts the world
+(a requested region that is loaded, a held join outside the atlas) is not checked. Writing,
 reading and replaying a journal is the milestone 1 tooling's; this crate names the shape
 and the restore so `app` and the tools agree, and `tests/persist.rs` replays one from
 checkpoints across a run.
