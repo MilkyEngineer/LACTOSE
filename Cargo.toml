@@ -21,6 +21,7 @@ lactose-asset-api = { path = "crates/asset-api" }
 lactose-bundle = { path = "crates/bundle" }
 lactose-sim = { path = "crates/sim" }
 lactose-physics-api = { path = "crates/physics-api" }
+lactose-input = { path = "crates/input" }
 
 # Third-party crates. Cargo.lock pins the exact versions; docs/verification.md lists the
 # claims that are re-checked against those versions.
