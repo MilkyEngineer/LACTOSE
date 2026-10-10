@@ -36,7 +36,7 @@ and list what changed, because `sim`, `predict`, `physics-api`, `net`, `persist`
 | `Executor` | Re-exported from `lactose-task`: what `run_tick` and `run_pass` take, so a boundary crate that drives a schedule (`sim`, `predict`) names it without a `task` edge |
 | `RegionId`, `RegionMode`, `RegionConfig`, `InRegion`, `OwnedBy`, `ClaimedBy`, `PredictedOrigin` | Regions and the components the world maintains |
 | `Rng` | The counter-based generator, from `Ctx::rng` and `World::rng` |
-| `ChangeMark`, `World::changed_since`, `World::is_current`, `World::columns`, `ColumnMut`, `DirtyRows`, `StructuralLog`, `LogCursor` | Change state read per consumer; whole-column access that records what it changed |
+| `ChangeMark`, `World::changed_since`, `World::is_current`, `World::columns`, `ColumnMut`, `DirtyRows`, `ErasedColumn::changed_since`, `ChangedIndices`, `StructuralLog`, `LogCursor` | Change state read per consumer, typed or from the registry; whole-column access that records what it changed |
 | `Query`, `QueryItems` | Whole-world iteration for exclusive code and tests, in key order |
 | `WorldSnapshot` | The prediction world's rollback state |
 | `World::load_region`, `World::export_region`, `RegionRows` | Bulk copy of region rows and resources to and from `lactose_bundle` documents |
@@ -340,7 +340,10 @@ What a system is, from its parameters (`SystemParam` has the table):
   and raises the destination chunk's column tick to the source's, so a consumer that skips
   chunks by column tick misses nothing. `ColumnRef::column_tick` and `row_ticks` are ticks,
   not points: a write made after a mark in the mark's own tick shows the mark's tick, so a
-  consumer that needs the exact point uses `changed_since`.
+  consumer that needs the exact point uses `changed_since`: `World::changed_since` for a
+  typed column, or `ErasedColumn::changed_since` on each column of `columns_erased` for a
+  pass that works from the registry (the replication gather), which select the same rows
+  under every layout, by stamp and never by tick.
 - At the input sync point a transient column's rows are zeroed, and a tracked row whose
   bytes were not already zero is stamped there; every region's transient resources are
   zeroed too.
@@ -419,6 +422,7 @@ repeat, layout and chaos modes.
 | `events.rs` | Event order and clearing, `EventsBeforeEmitter`, channels across stages |
 | `schedule_errors.rs` | Every `ScheduleError` variant; `run_tick` failing on `prepare` and on shutdown |
 | `change.rs` | `Mut` and `set_if_neq` stamps, fresh and stale marks, `Changed<T>` seen once per reader, `ColumnMut::write` with and without dirty rows, column ticks, the 2^30 rebase |
+| `erased.rs` | `ErasedColumn::changed_since` selects the rows `World::changed_since` selects, under every layout, for writes inside a tick and between ticks, with a fresh and a stale mark |
 | `snapshot.rs` | Ten ticks, a snapshot at three, a restore and a re-run equal in every column, row tick and `Changed` set; presentation events deduplicated and cancelled; stale cursors; binds kept; pruning |
 | `bulk.rs` | A baseline and an overlay with every record kind, diffed back to the same overlay under every layout; region resources; schema mismatches |
 | `layout.rs` | One program under every layout: identical exports, structural logs, reductions and presentation events |

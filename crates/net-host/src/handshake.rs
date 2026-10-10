@@ -14,16 +14,17 @@ pub const PROTOCOL_VERSION: u32 = 1;
 
 /// The hash over the types that cross the wire or are compared on a desync, and the
 /// protocol constants (architecture section 9.1). The README states the covered set and
-/// the encoding bit for bit; two registries hash equal exactly when every covered type
-/// has the same key, version, policy, tracking and layout.
+/// the constants block; `TypeInfo::write_schema` is the per-type encoding. Two registries
+/// hash equal exactly when every covered type has the same key, version, policy, tracking
+/// and layout, and the same set of covered types.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default, Pod, Zeroable)]
 #[repr(transparent)]
 pub struct ProtocolHash(pub u64);
 
 impl ProtocolHash {
-    /// The hash of `registry`: xxh64, seed zero, over the protocol constants and the
-    /// canonical encoding of every type [`covers`](Self::covers) accepts, in ascending
-    /// component key order.
+    /// The hash of `registry`: xxh64, seed zero, over the protocol constants and then
+    /// `TypeInfo::write_schema` of every type [`covers`](Self::covers) accepts, in
+    /// ascending component key order.
     #[must_use]
     pub fn of(registry: &Registry) -> Self {
         todo!()
@@ -31,8 +32,10 @@ impl ProtocolHash {
 
     /// Whether `info` is covered: its tracking is `replicated`, or its persistence is
     /// `Persistent` or `Transient` (a hashed type, which a desync digest compares). A
-    /// `derived` type that is not replicated is not, whatever crate declares it:
-    /// presentation types differ between client and server by design.
+    /// `derived` type that is not replicated is not, whatever crate declares it. The rule
+    /// a crate registering on one side only must obey: a type registered on one side only
+    /// (a presentation type the server does not register) is `derived` and unreplicated,
+    /// or the handshake refuses every connection.
     #[must_use]
     pub fn covers(info: &TypeInfo) -> bool {
         todo!()

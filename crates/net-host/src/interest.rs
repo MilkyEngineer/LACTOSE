@@ -53,8 +53,10 @@ pub struct EntityInterest {
     /// Its send priority.
     pub priority: Priority,
     /// The newest tick of its state the client has acknowledged, or `None` until the
-    /// first acknowledgement: the entity is then sent whole, every replicated component,
-    /// until one is acknowledged.
+    /// first acknowledgement: the entity is then sent whole, every replicated component
+    /// from the packer's mirror, until one is acknowledged, and by the rows changed since
+    /// `acked` afterwards. An entity the receiving player has claimed is sent whole in
+    /// every packet that carries it (architecture section 9.4), whatever `acked` says.
     pub acked: Option<Tick>,
     /// The packet its newest state went out in and is not yet acknowledged, if any; a
     /// loss of that packet clears it so the entity is sent again.
@@ -90,7 +92,7 @@ pub struct ClientInterest {
     /// The cap.
     pub budget: SendBudget,
     /// The regions relevant to the client now; a region entering is sent as a
-    /// [`RegionRelevance`](crate::relevance::RegionRelevance), one leaving as
+    /// [`RegionRelevance`](lactose_net_api::RegionRelevance), one leaving as
     /// `RegionChange::Irrelevant`.
     pub regions: BTreeSet<RegionId>,
     /// The regions the client has acknowledged as ready (architecture section 14); the

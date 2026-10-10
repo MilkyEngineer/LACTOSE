@@ -11,16 +11,16 @@ use std::sync::Arc;
 
 use lactose_core::{Result, Tick};
 use lactose_math::{Quat, Vec3};
-
-use crate::staged::InterpolationSlot;
+use lactose_net_api::InterpolationSlot;
 
 /// How many received states one slot keeps: the newest eight by tick, about 270
 /// milliseconds at a 30 Hz send rate, so the sampling point two send intervals back has
 /// a state on either side under jitter.
 pub const STATES_PER_SLOT: usize = 8;
 
-/// The words one state occupies: the tick and flags packed in one, then three for the
-/// position and four for the rotation, each scalar as its canonical bits widened to 64.
+/// The words one state occupies: the tick and the teleport tick packed in one, then three
+/// for the position and four for the rotation, each scalar as its canonical bits widened
+/// to 64.
 const STATE_WORDS: usize = 8;
 
 /// One received state of one remote entity, in world space: the network thread
@@ -29,10 +29,12 @@ const STATE_WORDS: usize = 8;
 pub struct ReceivedState {
     /// The server tick the state is from.
     pub tick: Tick,
-    /// The no-interpolate flag of architecture section 5.3: the entity teleported into
-    /// this state, so the sampler holds the previous state until this tick and never
-    /// blends across it.
-    pub teleport: bool,
+    /// The no-interpolate flag of architecture section 5.3 as D119 defines it: the
+    /// `Teleported` value of the entity's row, the last tick it was placed without a
+    /// sweep, zero for never. A tick rather than a flag, so a teleport is told from its
+    /// states whatever order they arrive in: the sampler never blends across it ("The
+    /// sampler" in the README).
+    pub teleported: Tick,
     /// The position, in world metres.
     pub position: Vec3,
     /// The rotation, a unit quaternion.
@@ -57,7 +59,7 @@ pub enum SampleStatus {
     Interpolated,
     /// The newest state, because the presentation time is at or past it (the entity's
     /// updates are late), or the oldest, because the time is before every state kept, or
-    /// the state before a teleport while the time is before the teleport's tick.
+    /// one of the two states around a teleport, since nothing blends across one.
     Held,
     /// The slot holds no state, or it was released and perhaps reused: the caller keeps
     /// whatever it showed last.
@@ -82,10 +84,14 @@ impl RemoteSample {
 }
 
 /// One slot: a sequence lock over a ring of states, every word an atomic so the lock
-/// needs no `unsafe`. The writer makes `sequence` odd, stores, then makes it even; a
-/// reader loads the sequence, the words and the sequence again and retries when the two
-/// differ or the first was odd. `generation` is the slot's current allocation, zero when
-/// free.
+/// needs no `unsafe`. The writer stores the odd sequence (`Relaxed`), issues
+/// `fence(Release)`, stores the words (`Relaxed`), and stores the even sequence with
+/// `Release`; a reader loads the sequence with `Acquire`, loads the words with `Relaxed`,
+/// issues `fence(Acquire)`, and reloads the sequence, retrying when the first load was
+/// odd or the two differ. A first load left `Relaxed` admits torn reads on aarch64 (the
+/// review measured them); `Acquire` admits none. `generation` and `count` are words read
+/// inside that window; `generation` is the slot's current allocation, zero when free, and
+/// `allocate` and `release` bump the sequence as `push` does.
 struct Slot {
     sequence: AtomicU32,
     generation: AtomicU32,
@@ -200,9 +206,10 @@ impl InterpolationReader {
     /// `at` (position by `Vec3::lerp`, rotation by `Quat::nlerp`, the parameter being
     /// `at`'s distance from the earlier state over the two states' tick distance);
     /// `Held` at the newest state when `at` is not before it, at the oldest when `at` is
-    /// before every kept state, or at the state before a teleport while `at` is before
-    /// the teleport's tick; `Missing` when the slot holds nothing or `slot` is stale. A
-    /// torn read is retried; the call never blocks and never locks.
+    /// before every kept state, and around a teleport: with `later.teleported` in
+    /// `(earlier.tick, later.tick]`, at `earlier` while `at` is before `later.teleported`
+    /// and at `later` from then on; `Missing` when the slot holds nothing or `slot` is
+    /// stale. A torn read is retried; the call never blocks and never locks.
     #[must_use]
     pub fn sample(&self, slot: InterpolationSlot, at: PresentationTime) -> RemoteSample {
         todo!()

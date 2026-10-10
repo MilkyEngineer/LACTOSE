@@ -44,9 +44,12 @@ struct HandleSlot {
     key: Option<StableKey>,
 }
 
-/// The handles one connection has assigned, kept identically by the server (which assigns
-/// them) and the client (which learns them from spawns and tombstones). At most
-/// [`EntityHandle::CAPACITY`] at once; the relevance cap keeps it far below.
+/// The handles one connection has assigned, kept identically by the server, which
+/// [`assign`](Self::assign)s, and the client, which mirrors with [`insert`](Self::insert)
+/// from the handle every spawn on the wire carries and [`release`](Self::release) from
+/// tombstones, and never assigns (the two ends release at different times and packets
+/// reorder, so an assigning mirror would drift). At most [`EntityHandle::CAPACITY`] at
+/// once; the relevance cap keeps it far below.
 #[derive(Clone, Debug, Default)]
 pub struct ConnectionHandles {
     slots: Vec<HandleSlot>,
@@ -63,8 +66,23 @@ impl ConnectionHandles {
 
     /// The handle of `key`, assigning one if it has none: the most recently released
     /// slot, else the next never-used slot, with the slot's current generation. Fails with
-    /// `ResourceExhausted` when every slot is assigned.
+    /// `ResourceExhausted` when every slot is assigned. The server's side.
     pub fn assign(&mut self, key: StableKey) -> Result<EntityHandle> {
+        todo!()
+    }
+
+    /// Records that the peer assigned `handle` to `key`: the client's mirror of the
+    /// server's table. The slot takes `handle`'s generation. Recording the same (handle,
+    /// key) again is a no-op; it fails with `InvalidData` if the slot holds another live
+    /// key, if the slot's generation is newer than `handle`'s (a spawn reordered after the
+    /// tombstone that released it), or if `key` has a different handle already.
+    pub fn insert(&mut self, handle: EntityHandle, key: StableKey) -> Result<()> {
+        todo!()
+    }
+
+    /// Forgets every assignment and every generation: what the client does before it
+    /// mirrors a full frame, whose spawns carry fresh handles.
+    pub fn clear(&mut self) {
         todo!()
     }
 

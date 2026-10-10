@@ -22,6 +22,7 @@ lactose-bundle = { path = "crates/bundle" }
 lactose-sim = { path = "crates/sim" }
 lactose-physics-api = { path = "crates/physics-api" }
 lactose-net-api = { path = "crates/net-api" }
+lactose-net-host = { path = "crates/net-host" }
 
 # Third-party crates. Cargo.lock pins the exact versions; docs/verification.md lists the
 # claims that are re-checked against those versions.

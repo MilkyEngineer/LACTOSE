@@ -29,14 +29,19 @@ use crate::relevance::RegionChange;
 /// `app` through an `Arc`, each reading the fields that are its own.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct StagedFrame {
-    /// The server tick the frame is for: no row in it is from a later tick, and it is the
-    /// tick of the replicated world's step that applies it.
+    /// The server tick the frame is for: no row in it is from a later tick. The hook
+    /// applies it at the first sync point of its world whose tick is not before this
+    /// ([`StagedInbox::pop_through`]), and `app` folds its time scale and region changes
+    /// into the `TickInput` of that same step ([`StagedInbox::due`]).
     pub tick: Tick,
     /// Whether this frame is a full relevance-set snapshot, the one message late join and
     /// resync share (architecture section 9.3): then `regions` names every relevant region
-    /// (`app` unloads every other loaded region in the same `TickInput`) and `spawns`
-    /// names every relevant entity with every replicated component, and the hook despawns
-    /// every entity the frame does not spawn before it applies the spawns.
+    /// as `Relevant`, `spawns` names every relevant entity with every replicated component,
+    /// and `time_scale` and `acked_input` are `Some`. `app` puts every loaded region in
+    /// `TickInput::unloaded` of the same step, so each relevant region reloads from its
+    /// message in that step (the sim applies unloads before loads); the hook applies the
+    /// spawns as upserts and despawns nothing. The network thread clears its handle mirror
+    /// and its interpolation slots before it stages a full frame.
     pub full: bool,
     /// The server's time scale from this tick on, if it changed or the frame is full:
     /// `app` copies it into `TickInput::time_scale` and into its pacer.
@@ -54,9 +59,18 @@ pub struct StagedFrame {
     /// `app` turns these into `TickInput::{loaded, unloaded, assets}` under `Directed`
     /// control; the hook does not read them.
     pub regions: BTreeMap<RegionId, RegionChange>,
-    /// Entities the client sees for the first time, by the server's `NetId`, each with
-    /// every replicated component.
+    /// Entities the client sees, by the server's `NetId`, each with every replicated
+    /// component: seen for the first time, or again (a full frame, a change of claim, or a
+    /// region becoming relevant whose rows the bundle already loaded). The hook upserts: a
+    /// key already live has each component written whole and its [`RemoteSlot`] set or
+    /// removed; a key that is not live is spawned and bound.
     pub spawns: BTreeMap<NetId, StagedSpawn>,
+    /// Entities that moved between regions, by origin key, with the region they reside in
+    /// now: from the gather's `Moved` entries (architecture section 6). The hook applies
+    /// them after the spawns and before the rows, through `World::move_to_region`; owned
+    /// entities follow their owner, so a later entry for one of them is a no-op. An entity
+    /// moving into a region the client does not have leaves with a tombstone instead.
+    pub moves: BTreeMap<StableKey, RegionId>,
     /// Entities the server destroyed, by origin key: the tombstones of architecture
     /// section 9.3. A frame never names a key here and in `spawns` or among its rows.
     pub despawns: BTreeMap<StableKey, Tombstone>,
@@ -85,6 +99,7 @@ impl StagedFrame {
             substituted: BTreeSet::new(),
             regions: BTreeMap::new(),
             spawns: BTreeMap::new(),
+            moves: BTreeMap::new(),
             despawns: BTreeMap::new(),
             rows: BTreeMap::new(),
             bytes: Vec::new(),
@@ -148,6 +163,7 @@ impl StagedFrame {
             && self.substituted.is_empty()
             && self.regions.is_empty()
             && self.spawns.is_empty()
+            && self.moves.is_empty()
             && self.despawns.is_empty()
             && self.rows.is_empty()
     }
@@ -194,8 +210,8 @@ impl<'a> Iterator for StagedRows<'a> {
     }
 }
 
-/// An entity the client sees for the first time, keyed by its `NetId` in
-/// [`StagedFrame::spawns`].
+/// An entity the client sees, keyed by its `NetId` in [`StagedFrame::spawns`]: a spawn
+/// if the key is not live in the client's world, an upsert if it is.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct StagedSpawn {
     /// The entity's `Predicted` origin key, if its origin was a predicted spawn
@@ -204,11 +220,13 @@ pub struct StagedSpawn {
     /// this is the bind `lactose-predict` waits for.
     pub origin: Option<PredictionKey>,
     /// The region the entity resides in, which the client has loaded or loads in the same
-    /// frame.
+    /// step.
     pub region: RegionId,
     /// The entity's slot in the client's interpolation buffer, allocated by the network
     /// thread, which the hook writes as [`RemoteSlot`]; `None` for an entity the
-    /// receiving player has claimed, which the prediction world presents.
+    /// receiving player has claimed, which the prediction world presents. A change of
+    /// claim is sent as a spawn of the live entity with the slot set or `None`, and the
+    /// hook sets or removes `RemoteSlot` accordingly.
     pub slot: Option<InterpolationSlot>,
     /// Every replicated component of the entity, in ascending key order, exact or
     /// dequantised as the rows are.
@@ -240,6 +258,8 @@ pub struct Tombstone {
 #[derive(Clone, Debug, Default)]
 pub struct StagedInbox {
     frames: VecDeque<Arc<StagedFrame>>,
+    /// The newest tick ever accepted, queued or already popped.
+    accepted: Option<Tick>,
 }
 
 impl StagedInbox {
@@ -249,24 +269,37 @@ impl StagedInbox {
         Self::default()
     }
 
-    /// Queues `frame`. Frames are queued in ascending tick order: a frame whose tick is
-    /// not after the newest held is refused and `false` returned.
+    /// Queues `frame`. Frames are accepted in ascending tick order: a frame whose tick is
+    /// not after the newest tick the inbox ever accepted, queued or popped, is refused and
+    /// `false` returned, so no row can go back in time across frames. `app` pushes first
+    /// and folds the frame's time scale and region changes into the `TickInput` only on
+    /// acceptance ([`due`](Self::due)).
+    #[must_use = "a refused frame's region changes and time scale must not enter the TickInput"]
     pub fn push(&mut self, frame: Arc<StagedFrame>) -> bool {
         todo!()
     }
 
     /// The oldest queued frame whose tick is not after `tick`, removed from the inbox; or
     /// `None` when the oldest frame is for a later tick or nothing is queued. The hook
-    /// calls it until `None`, so a frame delayed by loss applies at the first sync point
-    /// after it arrives.
+    /// calls it until `None` at the sync point of the step for `tick`, so a frame delayed
+    /// by loss applies at the first sync point after it arrives.
     pub fn pop_through(&mut self, tick: Tick) -> Option<Arc<StagedFrame>> {
         todo!()
     }
 
-    /// The tick of the newest queued frame.
+    /// The queued frames whose tick is not after `tick`, oldest first, without removing
+    /// them: exactly the frames [`pop_through`](Self::pop_through) will hand the hook in
+    /// the step for `tick`, so `app` folds their time scale and region changes into that
+    /// step's `TickInput` before the step (`Simulation::tick` is `tick`).
     #[must_use]
-    pub fn newest_tick(&self) -> Option<Tick> {
-        self.frames.back().map(|frame| frame.tick)
+    pub fn due(&self, tick: Tick) -> DueFrames<'_> {
+        todo!()
+    }
+
+    /// The newest tick ever accepted, queued or already popped.
+    #[must_use]
+    pub fn accepted_tick(&self) -> Option<Tick> {
+        self.accepted
     }
 
     /// How many frames are queued.
@@ -282,10 +315,23 @@ impl StagedInbox {
     }
 }
 
-/// An entity's slot in the client's interpolation buffer
-/// ([`InterpolationBuffer`](crate::interpolation::InterpolationBuffer)): an index and the
-/// generation the slot was allocated at, so a slot reused for another entity reads as
-/// missing under the old value.
+/// Iterates the queued frames due at a tick, oldest first.
+pub struct DueFrames<'a> {
+    frames: std::collections::vec_deque::Iter<'a, Arc<StagedFrame>>,
+    through: Tick,
+}
+
+impl<'a> Iterator for DueFrames<'a> {
+    type Item = &'a Arc<StagedFrame>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        todo!()
+    }
+}
+
+/// An entity's slot in the client's interpolation buffer (`lactose-net-host`'s
+/// `InterpolationBuffer`): an index and the generation the slot was allocated at, so a
+/// slot reused for another entity reads as missing under the old value.
 #[value]
 #[derive(PartialEq, Eq, Hash, Debug)]
 pub struct InterpolationSlot {
@@ -298,10 +344,12 @@ pub struct InterpolationSlot {
 }
 
 /// The interpolation slot of a remote entity in a client's replicated world, written by
-/// the `StagedState` hook from [`StagedSpawn::slot`] when the entity is spawned, read by
-/// extract so the presentation schedule knows which slot to sample for the entity's render
-/// slot (architecture section 5.3), and removed with the row. Client-only, `derived` and
-/// `extracted`; never on the server, never replicated, never written by game code.
+/// the `StagedState` hook from [`StagedSpawn::slot`] when the entity is spawned or
+/// upserted, removed by the hook when a spawn carries `None` (the receiving player
+/// claimed the entity), read by extract so the presentation schedule knows which slot to
+/// sample for the entity's render slot (architecture section 5.3), and gone with the row.
+/// Client-only, `derived` and `extracted`; never on the server, never replicated, never
+/// written by game code.
 #[component(key = "net::remote_slot", derived, extracted)]
 #[derive(PartialEq, Eq, Debug)]
 pub struct RemoteSlot {

@@ -210,12 +210,24 @@ dependencies = [
 name = "lactose-net-api"
 version = "0.0.0"
 dependencies = [
- "bytemuck",
  "lactose-asset-api",
  "lactose-bundle",
  "lactose-core",
  "lactose-ecs",
+ "lactose-reflect",
+ "lactose-sim",
+]
+
+[[package]]
+name = "lactose-net-host"
+version = "0.0.0"
+dependencies = [
+ "bytemuck",
+ "lactose-bundle",
+ "lactose-core",
+ "lactose-ecs",
  "lactose-math",
+ "lactose-net-api",
  "lactose-reflect",
  "lactose-sim",
 ]

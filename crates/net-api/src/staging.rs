@@ -183,17 +183,20 @@ impl GatherState {
         Self { mark: None, cursor: None, frame: StagingFrame::new(Tick(0)) }
     }
 
-    /// One gather over `world`, forking one child per chunk inside `job`'s scope: for
-    /// every registered component whose tracking is `replicated`, in ascending key order,
-    /// every chunk of `World::columns_erased` whose column tick is not before the mark's
-    /// tick, and in it every row whose row tick is not before the mark's tick, is pushed
-    /// into the frame with its region, key and bytes; then the structural log since the
-    /// cursor is appended, the frame is finished, and a fresh mark and cursor are taken.
-    /// With no mark, a stale mark (`World::is_current` false) or a stale cursor
-    /// (`StructuralLog::since` returning `None`), the frame is a full pass instead. The
-    /// frame is merged into whatever `app` has not taken, so a frame not taken loses
-    /// nothing. Keyed by `StableKey` throughout: the result is the same under every chunk
-    /// layout and worker count.
+    /// One gather over `world`: for every registered type whose tracking is `replicated`
+    /// and whose role is `Component`, in ascending key order, every chunk of
+    /// `World::columns_erased` whose column tick is not before the mark's tick is kept
+    /// (the skip is by tick, before any fork, and costs nothing per row); the kept chunks
+    /// are forked over inside `job`'s scope with `fork_range`; in each, the rows
+    /// `ErasedColumn::changed_since(mark)` selects, by stamp and exactly as the typed
+    /// `World::changed_since` would, are pushed into the frame with their region, key,
+    /// row tick and bytes; then the structural log since the cursor is appended, the frame
+    /// is finished, and a fresh mark and cursor are taken. With no mark, a stale mark
+    /// (`changed_since` returning `None`) or a stale cursor (`StructuralLog::since`
+    /// returning `None`), the frame is a full pass instead. The frame is merged into
+    /// whatever `app` has not taken, so a frame not taken loses nothing. Keyed by
+    /// `StableKey` throughout: the result is the same under every chunk layout and worker
+    /// count, and a gather with nothing changed since the last is empty.
     pub fn gather(&mut self, world: &World, job: &mut Job<'_, '_>) -> Result<()> {
         todo!()
     }

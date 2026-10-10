@@ -7,6 +7,7 @@ use lactose_core::{ComponentKey, StableKey, Tick};
 use lactose_reflect::Component;
 
 use crate::region::RegionId;
+use crate::storage::RowStamps;
 
 /// A point in a world's stamp order: a tick and a position within it.
 ///
@@ -272,15 +273,19 @@ impl DirtyRows {
 
 /// One chunk's column of any component, as bytes. Yielded by
 /// [`World::columns_erased`](crate::World::columns_erased) for passes that work from the
-/// registry rather than a type: the world hasher and bulk export.
+/// registry rather than a type: the world hasher, bulk export and the replication gather.
 pub struct ErasedColumn<'w> {
     pub(crate) component: ComponentKey,
     pub(crate) element_size: usize,
     pub(crate) keys: &'w [StableKey],
     pub(crate) regions: &'w [RegionId],
     pub(crate) bytes: &'w [u8],
-    pub(crate) row_ticks: Option<&'w [Tick]>,
+    /// The row stamps, on a tracked column.
+    pub(crate) stamps: Option<&'w RowStamps>,
     pub(crate) column_tick: Tick,
+    /// The world's epoch and tick, which a mark is judged against.
+    pub(crate) epoch: u32,
+    pub(crate) now: Tick,
 }
 
 impl ErasedColumn<'_> {
@@ -317,13 +322,64 @@ impl ErasedColumn<'_> {
     /// The tick each row last changed at, on a tracked column; `None` otherwise.
     #[must_use]
     pub fn row_ticks(&self) -> Option<&[Tick]> {
-        self.row_ticks
+        self.stamps.map(|stamps| &stamps.ticks[..self.keys.len()])
     }
 
     /// The chunk's coarse change tick for this column.
     #[must_use]
     pub fn column_tick(&self) -> Tick {
         self.column_tick
+    }
+
+    /// The rows changed since `mark`, as ascending indices into [`keys`](Self::keys),
+    /// [`regions`](Self::regions) and [`bytes`](Self::bytes): those whose change stamp is
+    /// after the mark's point, exactly the rows [`World::changed_since`](crate::World::changed_since)
+    /// selects for the typed column, so a pass that works from the registry (the
+    /// replication gather) sees what a typed consumer sees. `None` if the mark is stale, as
+    /// the typed form returns. Panics if the column is not tracked, as the typed form does.
+    #[must_use]
+    pub fn changed_since(&self, mark: ChangeMark) -> Option<ChangedIndices<'_>> {
+        let Some(stamps) = self.stamps else {
+            panic!(
+                "component {:#018x} is not tracked: only replicated or extracted columns carry \
+                 row stamps",
+                self.component.0
+            );
+        };
+        if mark.epoch() != self.epoch {
+            return None;
+        }
+        Some(ChangedIndices {
+            stamps,
+            len: self.keys.len(),
+            since: mark.stamp(),
+            now: self.now,
+            next: 0,
+        })
+    }
+}
+
+/// Iterates the indices of the rows of an [`ErasedColumn`] changed since a mark, ascending.
+pub struct ChangedIndices<'w> {
+    stamps: &'w RowStamps,
+    len: usize,
+    since: Stamp,
+    now: Tick,
+    next: usize,
+}
+
+impl Iterator for ChangedIndices<'_> {
+    type Item = usize;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        while self.next < self.len {
+            let row = self.next;
+            self.next += 1;
+            if self.stamps.get(row).after(self.since, self.now) {
+                return Some(row);
+            }
+        }
+        None
     }
 }
 

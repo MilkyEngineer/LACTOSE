@@ -498,6 +498,38 @@ impl TypeInfo {
         Ok(())
     }
 
+    /// Appends this type's schema in its canonical byte encoding to `out`: what a protocol
+    /// hash covers (architecture section 9.1), so that two builds agree on a type exactly
+    /// when every byte agrees. In order, every integer little-endian: the key as `u64`, the
+    /// version as `u32`, the role as `u8` (0 component, 1 resource), the persistence as `u8`
+    /// (0 persistent, 1 transient, 2 derived), the tracking as `u8` (bit 0 replicated, bit 1
+    /// extracted), then the layout: its size as `u32`, its alignment as `u32`, the count of
+    /// non-padding fields as `u32`, and each non-padding field in declaration order as its
+    /// ID as `u16`, its offset as `u32`, its size as `u32`, its type tag ([`Field::NAME`])
+    /// as a `u32` length and the UTF-8 bytes, and its kind as a tag byte (0 `Bool`, 1
+    /// `Unsigned`, 2 `Signed`, 3 `Float`, 4 `Scalar`, 5 `EntityRef`, 6 `AssetRef`, 7
+    /// `Enum`, 8 `Struct`, 9 `Array`) followed, for an enum, by its size as `u8`, its
+    /// variant count as `u32` and each variant's value as `u32` in declaration order; for a
+    /// struct, by the nested layout in the same form; for an array, by its length as `u32`,
+    /// the element's type tag and the element's kind in the same form. Names of types,
+    /// fields and variants and the retired IDs are not encoded; the type tag is the one name
+    /// included, since it tells `u32` from `RegionId`.
+    pub fn write_schema(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&self.key.0.to_le_bytes());
+        out.extend_from_slice(&self.version.to_le_bytes());
+        out.push(match self.role {
+            TypeRole::Component => 0,
+            TypeRole::Resource => 1,
+        });
+        out.push(match self.persistence {
+            Persistence::Persistent => 0,
+            Persistence::Transient => 1,
+            Persistence::Derived => 2,
+        });
+        out.push(u8::from(self.tracking.replicated) | (u8::from(self.tracking.extracted) << 1));
+        write_layout(&self.layout, out);
+    }
+
     fn out_of_bounds(&self, field: &FieldInfo) -> Error {
         invalid(format!("field `{}` of `{}` lies outside the value", field.name, self.name))
     }
@@ -535,6 +567,59 @@ impl TypeInfo {
             dump_retired(self.layout.retired, out);
             out.push('\n');
         }
+    }
+}
+
+/// The layout part of [`TypeInfo::write_schema`], shared with nested structs.
+fn write_layout(layout: &StructInfo, out: &mut Vec<u8>) {
+    out.extend_from_slice(&(layout.size as u32).to_le_bytes());
+    out.extend_from_slice(&(layout.align as u32).to_le_bytes());
+    let fields = layout.fields.iter().filter(|field| !field.is_padding());
+    out.extend_from_slice(&(fields.clone().count() as u32).to_le_bytes());
+    for field in fields {
+        let id = field.id.expect("a non-padding field has an ID");
+        out.extend_from_slice(&id.0.to_le_bytes());
+        out.extend_from_slice(&(field.offset as u32).to_le_bytes());
+        out.extend_from_slice(&(field.size as u32).to_le_bytes());
+        write_tag(field.type_name, out);
+        write_kind(&field.kind, out);
+    }
+}
+
+fn write_tag(tag: &str, out: &mut Vec<u8>) {
+    out.extend_from_slice(&(tag.len() as u32).to_le_bytes());
+    out.extend_from_slice(tag.as_bytes());
+}
+
+fn write_kind(kind: &FieldKind, out: &mut Vec<u8>) {
+    match kind {
+        FieldKind::Bool => out.push(0),
+        FieldKind::Unsigned => out.push(1),
+        FieldKind::Signed => out.push(2),
+        FieldKind::Float => out.push(3),
+        FieldKind::Scalar => out.push(4),
+        FieldKind::EntityRef => out.push(5),
+        FieldKind::AssetRef => out.push(6),
+        FieldKind::Enum(info) => {
+            out.push(7);
+            out.push(info.size as u8);
+            out.extend_from_slice(&(info.variants.len() as u32).to_le_bytes());
+            for variant in info.variants {
+                out.extend_from_slice(&variant.value.to_le_bytes());
+            }
+        }
+        FieldKind::Struct(info) => {
+            out.push(8);
+            write_layout(info, out);
+        }
+        FieldKind::Array { element, element_name, len } => {
+            out.push(9);
+            out.extend_from_slice(&(*len as u32).to_le_bytes());
+            write_tag(element_name, out);
+            write_kind(element, out);
+        }
+        // A non-padding field never reports padding; the tag keeps the encoding total.
+        FieldKind::Padding => out.push(10),
     }
 }
 

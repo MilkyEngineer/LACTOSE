@@ -1150,8 +1150,10 @@ impl World {
                     keys: &chunk.keys,
                     regions: typed_slice(chunk.column(&arch.columns[region_index]), chunk.len()),
                     bytes: chunk.column(&arch.columns[index]),
-                    row_ticks: chunk.stamps[index].as_ref().map(|s| &s.ticks[..chunk.len()]),
+                    stamps: chunk.stamps[index].as_ref(),
                     column_tick: chunk.column_ticks[index].tick,
+                    epoch: self.epoch,
+                    now: self.tick,
                 });
             }
         }
