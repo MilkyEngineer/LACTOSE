@@ -69,8 +69,10 @@ runs the script and then every gate:
 - `cargo xtask tiers`, `cargo xtask boundary`, `cargo xtask features`;
 - `cargo nextest run --workspace --no-tests=pass`, `cargo test --doc --workspace`;
 - `cargo deny check`, `cargo xtask sour run --pr`;
-- the cross-target clippy runs for `cfg`-gated code, Miri for `lactose-ecs` or `lactose-core`
-  changes, and the loom models for `lactose-task` changes.
+- the cross-target clippy runs (Linux and Windows) over the crates the branch changes, named
+  with `-p` rather than `--workspace`, since a workspace run builds C dev-dependencies that
+  need a cross C toolchain; Miri for `lactose-ecs` or `lactose-core` changes, and the loom
+  models for `lactose-task` changes.
 
 A failing gate stops the merge uncommitted; the coordinator decides who fixes it.
 

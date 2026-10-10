@@ -49,9 +49,11 @@ only branch anything is pushed to. You never push and never open a pull request.
    `cargo fmt --all --check`; `cargo clippy --workspace --all-targets -- -D warnings`;
    `cargo xtask tiers`; `cargo xtask boundary`; `cargo xtask features`;
    `cargo nextest run --workspace --no-tests=pass`; `cargo test --doc --workspace`;
-   `cargo deny check`; `cargo xtask sour run --pr`; then, when the brief says the branch
-   touches `cfg`-gated code, `cargo clippy --workspace --all-targets --target
-   x86_64-unknown-linux-gnu -- -D warnings` and the same for `x86_64-pc-windows-msvc`; when
+   `cargo deny check`; `cargo xtask sour run --pr`; then the cross-target lints over the
+   crates the brief names, `cargo clippy -p <crate> ... --all-targets --target
+   x86_64-unknown-linux-gnu -- -D warnings` and the same for `x86_64-pc-windows-msvc`, never
+   with `--workspace` (this Mac has no Linux C cross-compiler, and `lactose-task`'s `zstd`
+   dev-dependency builds C, so a workspace run fails for a reason no branch causes); when
    it touches `lactose-ecs` or `lactose-core`, `cargo +nightly miri test -p <crate>` (about
    twelve minutes for the ECS); when it touches `lactose-task`,
    `cargo test -p lactose-task --features loom --release`.
