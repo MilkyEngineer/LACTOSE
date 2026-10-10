@@ -1,0 +1,36 @@
+[package]
+name = "lactose-predict"
+description = "The client's prediction world: the ring of per-tick snapshots it rolls back through, the hook that applies what the server staged, and the reconciliation that compares the server's exact rows with what was predicted and re-simulates from the first difference."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+lactose-core.workspace = true
+# The world the hook writes and the ring snapshots, `WorldSnapshot`, `ClaimedBy`, the
+# executor a run takes, and `SystemDescriptor` for the build check.
+lactose-ecs.workspace = true
+# The local player's recorded samples: a server substitution replaces one in the ring
+# through `PlayerInput::substitute` and repairs the next through `after_substitute`.
+lactose-input.workspace = true
+# A divergence's largest scalar error is computed through `Scalar` (architecture section
+# 8.2); nothing else here is a float.
+lactose-math.workspace = true
+# The staged frame the hook applies and the inbox it pops from; a ring slot keeps the
+# frames applied at its tick, which is the proxies' per-tick history.
+lactose-net-api.workspace = true
+# The physics snapshot beside the world's in every slot, and `corrected` after a restore.
+lactose-physics-api.workspace = true
+# Metadata only (architecture section 8.2): the registry and the schema a comparison and
+# the build check read.
+lactose-reflect.workspace = true
+# The simulation this crate owns and steps, `TickInput`, the `StagedState` hook.
+lactose-sim.workspace = true
+
+[dev-dependencies]
+# `TickPacer`, for the timer-root sketch in `tests/consumers.rs`; the sketch is `app`'s.
+lactose-task.workspace = true
+
+[lints]
+workspace = true
