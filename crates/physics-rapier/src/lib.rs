@@ -7,8 +7,9 @@
 //!
 //! Every call records into a bookkeeping keyed by `StableKey`, and the next step applies it
 //! to the solver in ascending key order before it steps, so the solver's state, and with it
-//! every step and snapshot byte, depends on the rows alone and not on the order the calls
-//! came in.
+//! every step and snapshot byte, does not depend on the order of the calls between two
+//! steps. It does depend on the row history: Rapier's arenas keep the slots and free lists
+//! of every body the world held, and a body created after a removal takes a freed slot.
 
 #![forbid(unsafe_code)]
 

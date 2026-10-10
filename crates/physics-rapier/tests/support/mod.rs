@@ -4,7 +4,7 @@
 #![allow(dead_code, reason = "each test file uses part of the shared module")]
 
 use lactose_core::{NetId, StableKey, Tick};
-use lactose_math::{Scalar, Vec3};
+use lactose_math::{Canonical, Scalar, Vec3};
 use lactose_physics_api::{
     BodyDesc, BodyState, Collider, ContactEvent, Joint, JointKind, PhysicsBackend, PhysicsCommand,
     RigidBody, Shape, StepInput, StepOutput, Transform, TriggerEvent, Velocity,
@@ -217,12 +217,46 @@ impl Pile {
     }
 }
 
-/// A step's report in comparable form, bodies sorted by key.
-#[derive(PartialEq, Debug)]
+/// A step's report in comparable form, bodies sorted by key. Equal when every scalar has
+/// the same canonical bits: `0.0` and `-0.0` differ, and a NaN equals a NaN.
+#[derive(Debug)]
 pub struct Seen {
     pub bodies: Vec<BodyState>,
     pub contacts: Vec<ContactEvent>,
     pub triggers: Vec<TriggerEvent>,
+}
+
+/// One body's or one contact's identity, then its scalars' canonical bytes.
+type Bits<K> = Vec<(K, Vec<u8>)>;
+
+/// A contact's identity.
+type ContactKey = (StableKey, StableKey, lactose_physics_api::ContactPhase);
+
+impl Seen {
+    fn bits(&self) -> (Bits<(StableKey, bool)>, Bits<ContactKey>, &[TriggerEvent]) {
+        let bodies = self.bodies.iter().map(|state| {
+            let Transform { translation, rotation } = state.transform;
+            let Velocity { linear, angular } = state.velocity;
+            let mut bytes = translation.to_canonical_bytes().as_ref().to_vec();
+            bytes.extend_from_slice(rotation.to_canonical_bytes().as_ref());
+            bytes.extend_from_slice(linear.to_canonical_bytes().as_ref());
+            bytes.extend_from_slice(angular.to_canonical_bytes().as_ref());
+            ((state.key, state.teleported), bytes)
+        });
+        let contacts = self.contacts.iter().map(|event| {
+            let mut bytes = event.point.to_canonical_bytes().as_ref().to_vec();
+            bytes.extend_from_slice(event.normal.to_canonical_bytes().as_ref());
+            bytes.extend_from_slice(event.impulse.to_canonical_bytes().as_ref());
+            ((event.target, event.other, event.phase), bytes)
+        });
+        (bodies.collect(), contacts.collect(), &self.triggers)
+    }
+}
+
+impl PartialEq for Seen {
+    fn eq(&self, other: &Self) -> bool {
+        self.bits() == other.bits()
+    }
 }
 
 impl From<&StepOutput> for Seen {

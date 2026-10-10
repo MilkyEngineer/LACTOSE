@@ -1,13 +1,17 @@
-//! The step and the snapshot bytes are functions of the rows, not of the pool or of what
-//! ran before: a pile stepped on one, two and four solver threads, and built in different
-//! orders with writes, removals and re-creations that end at the same rows, reports the
-//! same bodies and events every tick and writes the same bytes; and what it reports does
-//! not change when an unrelated scene is awake far away.
+//! The step and the snapshot bytes are functions of the row history, not of the pool or of
+//! the order of the calls between two steps: a pile stepped on one, two and four solver
+//! threads, and built in different orders with writes, removals and re-creations between
+//! two steps that end at the same rows, reports the same bodies and events every tick and
+//! writes the same bytes. What it reports does not change when an unrelated scene is awake
+//! far away, whatever its keys. It does change when that scene was stepped once and removed
+//! and bodies are created later: Rapier's arena slots and free lists order the solver's
+//! work, and those follow every body the world ever held.
 
 #![forbid(unsafe_code)]
 
 mod support;
 
+use lactose_core::StableKey;
 use lactose_physics_api::{Joint, JointKind, PhysicsBackend, RigidBody, Velocity};
 use support::*;
 
@@ -126,6 +130,90 @@ fn distant_awake_bodies_change_nothing_the_pile_reports() {
         );
         for (tick, (a, b)) in alone.into_iter().zip(beside).enumerate() {
             assert_eq!(a, own(b), "{threads} threads, tick {}", tick + 1);
+        }
+    }
+}
+
+/// The tick [`history`] drops ten balls into the pile, which take whatever slots the
+/// arenas' free lists offer.
+const LATE: u32 = 40;
+
+/// The pile on `threads` threads with an unrelated scene of `far` keys a kilometre away
+/// (fixed colliders and dynamic balls in turn), created with it and, with `removed`,
+/// removed after that tick; ten balls join the pile at [`LATE`]. Each tick's report
+/// without the far scene.
+fn history(threads: usize, far: &[u64], removed: Option<u32>) -> Vec<Seen> {
+    let mut b = backend(threads);
+    for (i, &n) in far.iter().enumerate() {
+        let x = 1_000.0 + 3.0 * f64::from(u32::try_from(i).unwrap());
+        if i % 2 == 0 {
+            create(&mut *b, key(n), None, Some(floor()), at(x, 0.0, 500.0));
+        } else {
+            create(&mut *b, key(n), Some(RigidBody::dynamic()), Some(ball()), at(x, 3.0, 500.0));
+        }
+    }
+    Pile::new(BODIES).create(&mut *b, 0);
+    let near = |k: StableKey| !far.iter().any(|&n| key(n) == k);
+    (1..=TICKS)
+        .map(|tick| {
+            if removed.is_some_and(|after| tick == after + 1) {
+                for &n in far {
+                    b.remove_body(key(n));
+                }
+            }
+            if tick == LATE {
+                for n in 0..10_u32 {
+                    let (x, y) = (-2.0 + 0.4 * f64::from(n), 6.0 + f64::from(n));
+                    let body = Some(RigidBody::dynamic());
+                    create(&mut *b, key(400 + u64::from(n)), body, Some(ball()), at(x, y, 0.3));
+                }
+            }
+            let commands = Pile::drive(&mut *b, tick);
+            let seen = Seen::from(&step(&mut *b, tick, &commands));
+            Seen {
+                bodies: seen.bodies.into_iter().filter(|state| near(state.key)).collect(),
+                contacts: seen
+                    .contacts
+                    .into_iter()
+                    .filter(|c| near(c.target) && near(c.other))
+                    .collect(),
+                triggers: seen
+                    .triggers
+                    .into_iter()
+                    .filter(|t| near(t.target) && near(t.other))
+                    .collect(),
+            }
+        })
+        .collect()
+}
+
+/// Review S2, `docs/verification.md`: results depend on the arenas' history, which a set
+/// of rows does not fix. Unrelated bodies that stay change nothing whatever their keys:
+/// they take slots in key order with the pile's, and the pile's own slots keep their
+/// order. Stepped once and removed, they leave free slots that the late balls take ahead
+/// of where they would be, and the pile is equal up to then and differs after. This test
+/// records the dependence: a backend whose arenas are canonical turns its last two cases
+/// into equalities.
+#[test]
+fn what_the_pile_reports_depends_on_the_arena_history() {
+    let above: Vec<u64> = (DISTANT..DISTANT + 7).collect();
+    let below = [2, 3, 4, 6, 7, 8, 9];
+    assert!(below.iter().all(|&n| n < FIRST && n != FLOOR && n != PADDLE));
+    for threads in [1, 4] {
+        let alone = history(threads, &[], None);
+        let first_difference = |far: &[u64], removed: Option<u32>| {
+            let other = history(threads, far, removed);
+            let tick = alone.iter().zip(&other).position(|(a, b)| a != b);
+            tick.map(|i| u32::try_from(i).unwrap() + 1)
+        };
+        assert_eq!(first_difference(&above, None), None, "{threads} threads, above, kept");
+        assert_eq!(first_difference(&below, None), None, "{threads} threads, below, kept");
+        for far in [&above[..], &below[..]] {
+            let removed = first_difference(far, Some(1));
+            assert!(
+                removed.is_some_and(|tick| tick >= LATE),
+                "{threads} threads, {far:?} removed: {removed:?}"
+            );
         }
     }
 }

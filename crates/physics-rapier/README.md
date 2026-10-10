@@ -33,9 +33,14 @@ bodies are not in the solver) goes to target `quark`.
 Every trait call between steps changes only a bookkeeping keyed by `StableKey`. The step
 first applies it to Rapier in ascending key order (removed joints, removed bodies, bodies
 created or changed, joints waiting for a handle), then the step's commands in the order the
-input holds them, then steps. Rapier's arenas, islands and broad-phase tree are therefore a
-function of the rows and not of the order the calls came in (`tests/determinism.rs` builds
-the same scene in different orders, with noise, and compares the bytes).
+input holds them, then steps. Rapier's arenas, islands and broad-phase tree are therefore
+independent of the order of the calls between two steps (`tests/determinism.rs` builds the
+same scene in different orders, with noise, and compares the bytes), but they are a function
+of the row history, not of the rows alone: an arena keeps its free list, and a body created
+after a removal takes a freed slot, which changes the order of the solver's work. Unrelated
+bodies that stay, whatever their keys, change nothing; unrelated bodies stepped once and
+removed change the results of bodies created afterwards (`tests/determinism.rs`). Two
+worlds holding different body sets or histories are not bit-equal for the bodies they share.
 
 - A call with a value equal to the one recorded does nothing. Equality is bitwise on the
   canonical bits, so `0.0` and `-0.0` differ.
