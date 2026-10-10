@@ -220,7 +220,12 @@ What a system is, from its parameters (`SystemParam` has the table):
   scheduling. Events are not in a snapshot: a snapshot point is between ticks.
 - Channel entries written in stage *k* are readable through `Channel<C>` in stages after
   *k* and through `World::take_channel` at a sync point, keys resolved; the input sync point
-  clears them.
+  clears them, unless the channel declares `CommandChannel::CLEAR_AT_INPUT = false`, in
+  which case its entries stay until taken, so entries written in the last stage of a tick
+  are readable in the next tick's stages (`lactose-physics-api`'s channel, taken at the
+  physics sync point). `World::channel` reads a channel between ticks without taking it.
+  Channels are not in a snapshot and a restore drops what every channel holds, so the
+  consumer of a non-clearing channel snapshots what it has not taken.
 - Presentation events are keyed by (origin key, tick, kind, sequence). The world keeps the
   keys it has delivered, across `restore`, pruned below the oldest tick a restore can reach:
   a re-emission with a delivered key is not delivered again, and a delivered key whose tick

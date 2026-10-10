@@ -1,0 +1,364 @@
+//! Compile-only consumer sketches against the facade: what a game crate, `anim`, a backend
+//! crate, `app` and `predict` write, type-checked and never run (every deciding body of
+//! the crate is `todo!()`). They pin the surface the README promises: a change that breaks
+//! one is a signature change to list. The registrations of sections 1 and 2 build under
+//! the real `ScheduleBuilder` (the round-1 review's probe E).
+
+#![forbid(unsafe_code)]
+#![allow(dead_code, unused_variables, missing_docs)]
+
+use lactose_core::{NetId, PlayerId, Result, StableKey, Tick};
+use lactose_ecs::{
+    ClaimedBy, Commands, Events, Executor, LayoutConfig, Mut, OwnedBy, Res, StableKeyOf, SystemSet,
+    World, WorldKind, system,
+};
+use lactose_math::{Scalar, Vec3};
+use lactose_physics_api::conformance::snapshot_restore;
+use lactose_physics_api::{
+    BodyDesc, BodyHandle, BodyType, Collider, ContactEvent, ContactPhase, Joint, JointHandle,
+    JointKind, Physics, PhysicsBackend, PhysicsCommand, PhysicsConfig, PhysicsExt, QueryFilter,
+    Ray, RayHit, RigidBody, Shape, ShapeHit, StepInput, StepOutput, Teleported, Transform,
+    TriggerEvent, Velocity, corrected, locked_axes, register_systems, register_types, restore,
+    sets, setup, snapshot,
+};
+use lactose_reflect::component;
+use lactose_sim::{
+    Registration, Simulation, SimulationBuilder, Stage, TickDelta, TickInput, TypeTable,
+};
+
+// ---- 1. A game crate: bodies as rows, impulses through the channel, queries anywhere ----
+
+#[component(key = "sketch::bomb", persistent)]
+pub struct Bomb(#[field(id = 1)] pub u32);
+
+pub static MOVEMENT: SystemSet = SystemSet::new("sketch::movement");
+/// A once-per-tick writer of body rows, ordered against the kernels that write them.
+pub static RESPAWN_SET: SystemSet = SystemSet::new("sketch::respawn_set").after(&[&MOVEMENT]);
+/// `Stage::Physics` after the step: this tick's `Physics` and events, last tick's rows.
+pub static AFTER_STEP: SystemSet = SystemSet::new("sketch::after_step").after(&[&sets::STEP]);
+
+/// The section 6.1 example on a body: a direct `Velocity` write the sync honours, and an
+/// impulse on a spawn's placeholder resolved at apply.
+#[system(name = "sketch::throw", worlds = [server, prediction], in_set = MOVEMENT)]
+fn throw(dt: Res<TickDelta>, cmd: Commands, key: StableKeyOf, vel: Mut<Velocity>, bomb: &Bomb) {
+    vel.linear.y -= Scalar::from_f64(9.81) * dt.0;
+    let thrown = cmd.spawn((
+        Transform::at(Vec3::Y),
+        Velocity::ZERO,
+        RigidBody::dynamic(),
+        Collider::new(Shape::sphere(Scalar::HALF)).with_events(Scalar::ONE).with_material(3),
+        Bomb(0),
+    ));
+    cmd.physics().apply_impulse(thrown, Vec3::new(Scalar::ONE, Scalar::TWO, Scalar::ZERO));
+    cmd.physics().apply_torque_impulse(*key, Vec3::X);
+    cmd.physics().teleport(*key, Transform::IDENTITY);
+}
+
+/// A query from a per-entity kernel in `Stage::Simulation`: the previous step's state,
+/// read on every worker at once.
+#[system(name = "sketch::ground_check", worlds = [server, prediction], in_set = MOVEMENT)]
+fn ground_check(
+    physics: Res<Physics>,
+    key: StableKeyOf,
+    pos: &Transform,
+    body: Option<&BodyHandle>,
+) {
+    let is_body = body.is_some() && physics.is_body(*key);
+    let ray = Ray::new(pos.translation, -Vec3::Y, Scalar::TWO);
+    let hit: Option<RayHit> = physics.cast_ray(&ray, &QueryFilter::excluding(*key));
+    let swept: Option<ShapeHit> = physics.cast_shape(
+        &Shape::capsule(Scalar::ONE, Scalar::HALF),
+        pos,
+        -Vec3::Y,
+        Scalar::ONE,
+        &QueryFilter::ALL,
+    );
+    let mut nearby = Vec::new();
+    physics.overlap(&Shape::sphere(Scalar::TWO), pos, &QueryFilter::default(), &mut nearby);
+}
+
+/// Contact-driven game code in `Stage::Post`, which needs no edge after the write-back (an
+/// exclusive system runs first at the stage's sync point): damage on an impact, and a
+/// command recorded here, which the next tick's step applies.
+#[system(name = "sketch::impact_damage", worlds = [server, prediction])]
+fn impact_damage(
+    cmd: Commands,
+    contacts: Events<ContactEvent>,
+    triggers: Events<TriggerEvent>,
+    key: StableKeyOf,
+    pos: &Transform,
+    teleported: Option<&Teleported>,
+    bomb: &Bomb,
+) {
+    for contact in contacts.for_target(*key) {
+        if contact.phase == ContactPhase::Impact && contact.impulse > Scalar::ONE {
+            let _ = (contact.other, contact.point, contact.normal);
+            cmd.physics().apply_impulse(contact.other, contact.normal * Scalar::TWO);
+        }
+    }
+    for trigger in triggers.for_target(*key) {
+        let _ = (trigger.other, trigger.phase);
+    }
+    // Extract compares the tick with the last one it covered; zero means never.
+    let teleported_at: Tick = teleported.map_or(Tick(0), |flag| flag.0);
+}
+
+/// A once-per-tick system with no `Mut`: a row write through `Commands::set`, declared,
+/// which the sync treats like any other row write; its set is ordered after the kernels
+/// that write the same columns.
+#[system(name = "sketch::respawn", worlds = [server], in_set = RESPAWN_SET, writes = [Transform, Velocity])]
+fn respawn(cmd: Commands) {
+    let key = StableKey::Net(NetId::cooked(1));
+    cmd.set(key, Transform::at(Vec3::ZERO));
+    cmd.set(key, Velocity::ZERO);
+}
+
+/// A `Stage::Physics` system after the step: this tick's queries and events, and no row
+/// of a body, which it would read a tick late and could not write.
+#[system(name = "sketch::probe_physics", worlds = [server], in_set = AFTER_STEP)]
+fn probe_physics(physics: Res<Physics>, contacts: Events<ContactEvent>, bomb: &Bomb) {}
+
+/// A reader of the stepped rows: `Stage::Post`, no edge needed.
+#[system(name = "sketch::settle", worlds = [server])]
+fn settle(physics: Res<Physics>, pos: &Transform, vel: &Velocity) {}
+
+pub fn register_types_game(types: &mut TypeTable) -> Result<()> {
+    types.register::<Bomb>()?;
+    register_types(types)
+}
+
+pub fn register_systems_game(registration: &mut Registration) {
+    registration
+        .stage(Stage::Simulation)
+        .sets(&[&MOVEMENT, &RESPAWN_SET])
+        .add(&THROW)
+        .add(&GROUND_CHECK)
+        .add(&RESPAWN);
+    registration.stage(Stage::Physics).sets(&[&AFTER_STEP]).add(&PROBE_PHYSICS);
+    registration.stage(Stage::Post).add(&IMPACT_DAMAGE).add(&SETTLE);
+}
+
+// ---- 2. anim: a ragdoll as owned bone rows and joint rows ----
+
+#[component(key = "sketch::bone", persistent)]
+pub struct Bone(#[field(id = 1)] pub u8);
+
+/// Bones are kinematic while animated: a `Transform` write sweeps them. Joints are rows
+/// owned by a bone, so they despawn with the character.
+#[system(name = "sketch::spawn_ragdoll", worlds = [server, prediction])]
+fn spawn_ragdoll(cmd: Commands, key: StableKeyOf, root: &Transform, bomb: &Bomb) {
+    let bone = |index: u8| {
+        let mut body = RigidBody::kinematic();
+        body.locked_axes = locked_axes::NONE;
+        (
+            Transform::new(root.translation, root.rotation),
+            body,
+            Collider::new(Shape::capsule(Scalar::HALF, Scalar::from_f64(0.1)))
+                .with_offset(Vec3::Y * Scalar::HALF),
+            OwnedBy { owner: (*key).into() },
+            Bone(index),
+        )
+    };
+    let hip = cmd.spawn(bone(0));
+    let thigh = cmd.spawn(bone(1));
+    let joint = Joint::new(JointKind::Spherical, hip, thigh)
+        .with_anchors(Vec3::ZERO, Vec3::Y)
+        .with_limits(-Scalar::ONE, Scalar::ONE);
+    cmd.spawn((joint, OwnedBy { owner: hip.into() }));
+}
+
+/// Going limp: the bones become dynamic through a row write the sync picks up.
+#[system(name = "sketch::ragdoll", worlds = [server, prediction])]
+fn ragdoll(body: Mut<RigidBody>, bone: &Bone) {
+    if body.body_type != BodyType::Dynamic {
+        body.body_type = BodyType::Dynamic;
+    }
+}
+
+/// Sockets read the stepped bone transforms in `Stage::Post`.
+#[system(name = "sketch::sockets", worlds = [server, prediction])]
+fn sockets(pos: &Transform, bone: &Bone, handle: Option<&BodyHandle>, joint: Option<&JointHandle>) {
+    let socket = pos.transform_point(Vec3::X);
+}
+
+pub fn register_systems_anim(registration: &mut Registration) {
+    registration.stage(Stage::Simulation).add(&SPAWN_RAGDOLL).add(&RAGDOLL);
+    registration.stage(Stage::Post).add(&SOCKETS);
+}
+
+// ---- 3. A backend crate: the trait, with the pool it was built with ----
+
+struct Fake;
+
+impl PhysicsBackend for Fake {
+    fn create_body(&mut self, key: StableKey, desc: &BodyDesc<'_>) -> Result<BodyHandle> {
+        // The effective body: already kinematic for a prediction-world proxy.
+        let _: Option<BodyType> = desc.body.map(|body| body.body_type);
+        let _: &Transform = desc.transform;
+        let fixed = desc.frozen || desc.body.is_none();
+        Ok(BodyHandle::new(0, 1))
+    }
+
+    fn remove_body(&mut self, key: StableKey) {}
+
+    fn set_body(&mut self, key: StableKey, body: Option<&RigidBody>) {}
+
+    fn set_collider(&mut self, key: StableKey, collider: Option<&Collider>) {}
+
+    fn set_transform(&mut self, key: StableKey, transform: &Transform) {}
+
+    fn set_velocity(&mut self, key: StableKey, velocity: &Velocity) {}
+
+    fn set_frozen(&mut self, key: StableKey, frozen: bool) {}
+
+    fn create_joint(
+        &mut self,
+        key: StableKey,
+        joint: &Joint,
+        body_a: StableKey,
+        body_b: StableKey,
+    ) -> Result<JointHandle> {
+        Ok(JointHandle::new(0, 1))
+    }
+
+    fn remove_joint(&mut self, key: StableKey) {}
+
+    fn step(&mut self, input: &StepInput<'_>, output: &mut StepOutput) {
+        for command in input.commands {
+            let _: StableKey = command.body();
+            if let PhysicsCommand::Teleport { body, transform } = command {
+                let _ = (body, transform);
+            }
+        }
+        let _ = (input.tick, input.dt, input.gravity);
+        output.bodies.clear();
+    }
+
+    fn snapshot(&self, out: &mut Vec<u8>) -> Result<()> {
+        Ok(())
+    }
+
+    fn restore(&mut self, bytes: &[u8]) -> Result<()> {
+        Ok(())
+    }
+
+    fn cast_ray(&self, ray: &Ray, filter: &QueryFilter) -> Option<RayHit> {
+        None
+    }
+
+    fn cast_shape(
+        &self,
+        shape: &Shape,
+        pose: &Transform,
+        direction: Vec3,
+        max_distance: Scalar,
+        filter: &QueryFilter,
+    ) -> Option<ShapeHit> {
+        None
+    }
+
+    fn overlap(
+        &self,
+        shape: &Shape,
+        pose: &Transform,
+        filter: &QueryFilter,
+        hits: &mut Vec<StableKey>,
+    ) {
+    }
+}
+
+/// What the backend crate exports: a constructor taking the pool `app` built.
+fn backend_with_pool() -> Box<dyn PhysicsBackend> {
+    Box::new(Fake)
+}
+
+/// A backend's own unit test of `step`: no world, no schedule, a plain slice of commands.
+fn step_without_a_world(backend: &mut dyn PhysicsBackend) {
+    let commands =
+        [PhysicsCommand::ApplyImpulse { body: StableKey::Net(NetId::cooked(2)), impulse: Vec3::Y }];
+    let input = StepInput {
+        tick: Tick(1),
+        dt: Scalar::ONE / Scalar::from_u32(60),
+        gravity: PhysicsConfig::EARTH_GRAVITY,
+        commands: &commands,
+    };
+    let mut output = StepOutput::default();
+    backend.step(&input, &mut output);
+    let _ = output.bodies.iter().filter(|state| state.teleported).count();
+}
+
+// ---- 4. app: the setup closure and the registration functions ----
+
+fn app_build(kind: WorldKind) -> Result<Simulation> {
+    let mut types = TypeTable::new();
+    register_types_game(&mut types)?;
+    let backend = backend_with_pool();
+    let config = PhysicsConfig { reserved_workers: 2, ..PhysicsConfig::default() };
+    SimulationBuilder::new(kind, types)
+        .setup(move |world| setup(world, backend, config))
+        .systems(register_systems)
+        .systems(register_systems_game)
+        .systems(register_systems_anim)
+        .build()
+}
+
+// ---- 5. predict: snapshot beside the world's, restore after it, corrections named ----
+
+fn rollback(simulation: &mut Simulation, corrected_bodies: &[StableKey]) -> Result<()> {
+    let world_snapshot = simulation.world().snapshot();
+    let physics_snapshot = snapshot(simulation.world())?;
+    let _ = (physics_snapshot.tick(), physics_snapshot.size_in_bytes(), physics_snapshot.hash());
+    simulation.world_mut().restore(&world_snapshot)?;
+    restore(simulation.world_mut(), &physics_snapshot)?;
+    // Corrections are written through `ColumnMut::write` without recording; the sync is
+    // told which rows.
+    corrected(simulation.world_mut(), corrected_bodies)
+}
+
+// ---- 6. A backend's test: the conformance run, per pool size and layout, equal ----
+
+fn conformance(executor: &Executor) -> Result<()> {
+    let layout = LayoutConfig::default();
+    let one = snapshot_restore(executor, backend_with_pool(), PhysicsConfig::default(), layout)?;
+    let many = snapshot_restore(executor, backend_with_pool(), PhysicsConfig::default(), layout)?;
+    assert_eq!(one, many);
+    let _: Vec<(Tick, u64)> = one.first;
+    let _: (u64, u64) = one.physics_hash;
+    Ok(())
+}
+
+// ---- 7. The conformance scene's direct spawns, as the function performs them ----
+
+fn direct_scene(world: &mut World, region: lactose_ecs::RegionId) -> Result<()> {
+    world.spawn(
+        StableKey::Net(NetId::cooked(1)),
+        region,
+        (
+            Transform::IDENTITY,
+            Collider::new(Shape::cuboid(Vec3::new(
+                Scalar::from_i32(50),
+                Scalar::ONE,
+                Scalar::from_i32(50),
+            ))),
+        ),
+    )?;
+    world.spawn(
+        StableKey::Net(NetId::cooked(2)),
+        region,
+        (
+            Transform::at(Vec3::Y * Scalar::from_i32(3)),
+            RigidBody::dynamic(),
+            Collider::new(Shape::sphere(Scalar::ONE)).with_events(Scalar::ZERO),
+            ClaimedBy { player: PlayerId(1) },
+        ),
+    )?;
+    // A proxy: a body row without a claim, handed to the backend as kinematic in a
+    // prediction world.
+    world.spawn(
+        StableKey::Net(NetId::cooked(3)),
+        region,
+        (Transform::IDENTITY, RigidBody::dynamic(), Collider::new(Shape::cuboid(Vec3::ONE))),
+    )?;
+    let _ = TickInput::default();
+    Ok(())
+}

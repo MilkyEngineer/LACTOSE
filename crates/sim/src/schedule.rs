@@ -21,17 +21,23 @@ pub enum Stage {
     /// Gameplay: the sets of `game-sim`, `game-ai` and `anim`. Physics writes recorded here
     /// through the physics command channel are what the step reads in the next stage.
     Simulation,
-    /// The physics step (architecture section 16): `physics-api`'s once-per-tick system
-    /// that takes [`Job`](lactose_ecs::Job), reads the channel the simulation stage wrote,
-    /// steps the solver through `block_in_place` on a pool `app` built outside the boundary
-    /// and handed in through a setup function, and writes bodies back through
-    /// [`Commands`](lactose_ecs::Commands), which apply at the sync point that begins
-    /// `Post`. It is not exclusive, so systems that do not depend on physics may be placed
-    /// here and run alongside it on the reserved workers; everything that reads the stepped
-    /// state goes in `Post`.
+    /// The physics stage (architecture section 16): `physics-api`'s exclusive sync at this
+    /// stage's sync point, which makes the solver's bodies follow the rows and takes the
+    /// physics command channel, and its once-per-tick step, which takes
+    /// [`Job`](lactose_ecs::Job), steps the solver through `block_in_place` on a pool `app`
+    /// built outside the boundary and handed in through a setup function, and emits the
+    /// contact events. The step is not exclusive, so systems that do not depend on physics
+    /// may be placed here and run alongside it on the reserved workers; a system here that
+    /// reads the physics resource or the events is ordered after `physics_api::sets::STEP`,
+    /// where it sees this tick's queries and events but the previous tick's body rows;
+    /// everything that reads the stepped rows goes in `Post`.
     Physics,
-    /// After physics: whatever reads the stepped state in the same tick, such as the sim
-    /// skeleton, contact-driven damage and presentation events.
+    /// After physics: `physics-api`'s exclusive write-back runs at this stage's sync point,
+    /// before every other system here, writing every moved body's transform and velocity;
+    /// then whatever reads the stepped state in the same tick, such as the sim skeleton,
+    /// contact-driven damage and presentation events. `app` orders any other exclusive
+    /// system placed here against `physics_api::sets::WRITE_BACK` with
+    /// [`Registration::order`].
     Post,
 }
 

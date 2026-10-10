@@ -286,7 +286,7 @@ impl<'r, 'j> Env<'r, 'j> {
                 Slot::EmitEvents(self.emit[index].take().expect("one sink per parameter"))
             }
             (AccessKind::Read, AccessTarget::Channel { type_id, .. }) => {
-                Slot::Channel(self.channels.get(&type_id).map(|entries| &**entries))
+                Slot::Channel(self.channels.get(&type_id).map(|stored| &*stored.entries))
             }
             (AccessKind::Commands, _) => {
                 Slot::Commands(self.commands.take().expect("one `Commands` per system"))

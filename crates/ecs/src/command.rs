@@ -154,8 +154,16 @@ pub(crate) type AppendFn = fn(
     &mut dyn FnMut(&mut StableKey),
 );
 
-/// Every channel's applied entries, as a `Vec<ChannelEntry<C>>` per channel type.
-pub(crate) type ChannelStore = FixedHashMap<TypeId, Box<dyn Any + Send + Sync>>;
+/// One channel's applied entries: a `Vec<ChannelEntry<C>>`, with what the channel declared
+/// about clearing, since the type is erased here.
+pub(crate) struct StoredChannel {
+    pub(crate) entries: Box<dyn Any + Send + Sync>,
+    /// [`CommandChannel::CLEAR_AT_INPUT`] of the channel.
+    pub(crate) clear_at_input: bool,
+}
+
+/// Every channel's applied entries, per channel type.
+pub(crate) type ChannelStore = FixedHashMap<TypeId, StoredChannel>;
 
 fn append_entry<C: CommandChannel>(
     store: &mut ChannelStore,
@@ -166,7 +174,11 @@ fn append_entry<C: CommandChannel>(
     let mut entry = *entry.downcast::<C::Entry>().expect("an entry of this channel");
     C::remap(&mut entry, remap);
     store
-        .get_or_insert_with(TypeId::of::<C>(), || Box::new(Vec::<ChannelEntry<C>>::new()))
+        .get_or_insert_with(TypeId::of::<C>(), || StoredChannel {
+            entries: Box::new(Vec::<ChannelEntry<C>>::new()),
+            clear_at_input: C::CLEAR_AT_INPUT,
+        })
+        .entries
         .downcast_mut::<Vec<ChannelEntry<C>>>()
         .expect("the entries of this channel")
         .push(ChannelEntry { source, entry });
@@ -308,10 +320,21 @@ impl<'r, 'j> Fetch<'r, 'j> for Commands<'r> {
 /// [`Channel`] in every later stage of the same tick, and through
 /// [`World::take_channel`](crate::World::take_channel) at a sync point, in command order,
 /// with every placeholder resolved whose spawn applied; one whose spawn was dropped stays a
-/// placeholder, which names nothing. The input sync point clears every channel.
+/// placeholder, which names nothing. The input sync point clears every channel whose
+/// [`CLEAR_AT_INPUT`](Self::CLEAR_AT_INPUT) is true; the entries of one that opts out stay
+/// until taken, so entries written in the last stage of a tick are readable in the next
+/// tick's stages, and [`World::channel`](crate::World::channel) reads them between ticks.
 pub trait CommandChannel: 'static {
     /// One command.
     type Entry: Send + Sync + 'static;
+
+    /// Whether the input sync point clears the channel. `false` for a channel whose consumer
+    /// takes it at a sync point of its own (`lactose-physics-api`'s, taken at the physics
+    /// sync point, so a command recorded after the step applies next tick): its entries
+    /// accumulate until [`World::take_channel`](crate::World::take_channel), are not in a
+    /// [`WorldSnapshot`](crate::WorldSnapshot), and are dropped by a restore, so the consumer
+    /// snapshots what it has not taken.
+    const CLEAR_AT_INPUT: bool = true;
 
     /// Calls `f` on every entity key the entry holds, so the world can resolve placeholders
     /// at apply. An entry that holds a key and does not report it keeps a placeholder, which

@@ -11,8 +11,8 @@ use std::sync::Mutex;
 use common::*;
 use lactose_core::StableKey;
 use lactose_ecs::{
-    Channel, Commands, Ctx, EventWriter, Events, LayoutConfig, Res, Schedule, ScheduleError,
-    StableKeyOf, WorldKind, system,
+    Channel, CommandChannel, Commands, Ctx, EventWriter, Events, LayoutConfig, Res, Schedule,
+    ScheduleError, StableKeyOf, WorldKind, system,
 };
 use lactose_math::{Scalar, Vec2};
 
@@ -159,4 +159,93 @@ fn read_impulses_later(impulses: Channel<Physics>, seen: Res<Seen>) {
     for impulse in impulses.iter() {
         seen.push((impulse.entry.body, impulse.source.map_or(0, |_| 1)));
     }
+}
+
+/// A channel that is not cleared at the input sync point: `lactose-physics-api`'s, whose
+/// consumer takes it at the physics sync point, so a command recorded after the step
+/// applies next tick.
+pub struct Deferred;
+
+impl CommandChannel for Deferred {
+    type Entry = Impulse;
+
+    const CLEAR_AT_INPUT: bool = false;
+
+    fn remap(entry: &mut Impulse, f: &mut dyn FnMut(&mut StableKey)) {
+        f(&mut entry.body);
+    }
+}
+
+/// Writes one entry to each channel in the last stage of tick 1.
+#[system(name = "test::push_late", worlds = [server])]
+fn push_late(ctx: Ctx, cmd: Commands, _counter: &Counter) {
+    if ctx.tick().0 == 1 {
+        cmd.channel::<Deferred>().push(Impulse { body: net(5), impulse: Vec2::ZERO });
+        cmd.apply_impulse(net(5), Vec2::ZERO);
+    }
+}
+
+/// Reads both channels in the first stage: 1 for the deferred one, 2 for the clearing one.
+#[system(name = "test::read_both_early", worlds = [server])]
+fn read_both_early(deferred: Channel<Deferred>, cleared: Channel<Physics>, seen: Res<Seen>) {
+    let mut seen = seen.lock().unwrap();
+    for entry in deferred.iter() {
+        seen.push((entry.entry.body, 1));
+    }
+    for entry in cleared.iter() {
+        seen.push((entry.entry.body, 2));
+    }
+}
+
+fn late_writer_schedule() -> Schedule {
+    let mut builder = Schedule::builder(WorldKind::Server);
+    builder.stage("read", &[]).add(&READ_BOTH_EARLY);
+    builder.stage("write", &[]).add(&PUSH_LATE);
+    builder.build().unwrap()
+}
+
+#[test]
+fn a_channel_that_opts_out_of_clearing_keeps_its_entries_until_taken() {
+    let executor = executor();
+    let mut world = world(WorldKind::Server, LayoutConfig::default());
+    world.spawn(net(5), REGION, (Counter(0),)).unwrap();
+    world.insert_service::<Seen>(Box::new(Mutex::new(Vec::new())));
+    let mut schedule = late_writer_schedule();
+
+    // Tick 1 writes in the last stage, after the reader ran.
+    world = tick(&mut schedule, world, &executor);
+    assert!(world.service_mut::<Seen>().unwrap().get_mut().unwrap().is_empty());
+    // Between ticks both channels hold the entry, readable without taking.
+    assert_eq!(world.channel::<Deferred>().len(), 1);
+    assert_eq!(world.channel::<Deferred>()[0].entry.body, net(5));
+    assert_eq!(world.channel::<Physics>().len(), 1);
+
+    // Tick 2's input sync point clears the clearing channel alone.
+    world = tick(&mut schedule, world, &executor);
+    let seen = std::mem::take(&mut *world.service_mut::<Seen>().unwrap().get_mut().unwrap());
+    assert_eq!(seen, [(net(5), 1)]);
+    assert_eq!(world.channel::<Deferred>().len(), 1, "nothing took it");
+    assert!(world.channel::<Physics>().is_empty());
+}
+
+#[test]
+fn a_taken_deferred_channel_is_empty_and_a_restore_drops_it() {
+    let executor = executor();
+    let mut world = world(WorldKind::Server, LayoutConfig::default());
+    world.spawn(net(5), REGION, (Counter(0),)).unwrap();
+    world.insert_service::<Seen>(Box::new(Mutex::new(Vec::new())));
+    let mut schedule = late_writer_schedule();
+    world = tick(&mut schedule, world, &executor);
+
+    // Not in the snapshot: a restore returns to the point and drops what the channel held.
+    let snapshot = world.snapshot();
+    let taken = world.take_channel::<Deferred>();
+    assert_eq!(taken.len(), 1);
+    assert_eq!(taken[0].entry.body, net(5));
+    assert!(world.channel::<Deferred>().is_empty());
+    world = tick(&mut schedule, world, &executor);
+    assert!(world.service_mut::<Seen>().unwrap().get_mut().unwrap().is_empty(), "taken");
+
+    world.restore(&snapshot).unwrap();
+    assert!(world.channel::<Deferred>().is_empty(), "a restore drops every channel");
 }

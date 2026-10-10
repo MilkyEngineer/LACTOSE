@@ -69,7 +69,7 @@ slot, the lifecycle slot, the save slot). No consumer can name a system or the l
 | Game crates | `TickDelta`, the tick | `Res<TickDelta>`, `Res<CurrentTick>` (or `Ctx::tick`); the time scale is not theirs to read |
 | | Configuration resources; world-global persistent state | A setup function inserts configuration, `derived`; world-global persistent state is a region resource of a pinned region |
 | | Add sets to the simulation stage without owning the stage list | `Registration::stage(Stage::Simulation).sets(..).add(..)`; the stages are `Input`, `Simulation`, `Physics`, `Post` |
-| `physics-api`, `anim` | A place for the step and for what reads it; the solver pool | `Stage::Physics` for the once-per-tick step with `Job`; `Stage::Post` for readers; `Stage::Simulation` for the sim skeleton's state machines; a setup function hands in the backend's service with the pool `app` built outside the boundary |
+| `physics-api`, `anim` | A place for the sync, the step and the write-back, and for what reads them; the solver pool | `Stage::Physics` for the exclusive sync at its sync point and the once-per-tick step with `Job`; `Stage::Post`, whose sync point runs the exclusive write-back first, for readers of stepped rows; `Stage::Simulation` for the sim skeleton's state machines; a setup function hands in the backend's service with the pool `app` built outside the boundary |
 | `input` | How a per-tick batch of inputs reaches the sync point; where the typed write happens | `TickInput::inputs` as `PlayerSample` bytes by player; `InputApplier` beside the component's definition |
 | `net` | Apply staged state at the sync point; the gather as a pass; spawn with the server's key and bind; sessions | `StagedState` on a client; `Registration::pass(Pass::Gather)`; `&mut World` inside the hook; `TickInput::sessions` on the server |
 | `predict` | The deterministic step to re-run; snapshot, restore, horizon; the proxy update at the sync point | `step` with the ring's `TickInput`s; `world_mut()` between runs; `StagedState` in the prediction world; `StreamingAnchor` on the local player's entity; `app` runs `run_passes` on the prediction world too |
@@ -100,7 +100,8 @@ pub fn register_types(types: &mut TypeTable) -> Result<()> {
 
 /// Every resource and service a system of this crate names; world resources are `derived`.
 pub fn setup(world: &mut World) -> Result<()> {
-    // world.insert_resource(Gravity(..)); world.insert_service::<dyn PhysicsQuery>(..);
+    // world.insert_resource(Gravity(..)); (the physics resource is `app`'s:
+    // `lactose_physics_api::setup` in `app`'s setup closure)
     Ok(())
 }
 
@@ -548,7 +549,9 @@ for bit:
 
 `journal::Journal` is a `SavePoint`, what a save does not carry (the asset tables and modes
 in force at the checkpoint, every joined player's claimed and anchored entity, the held
-joins and the requested regions, which the replay driver restores before its first step),
+joins and the requested regions, which the replay driver restores before its first step;
+the untaken `PhysicsCommands`, `World::channel`, are dropped at a checkpoint, as solver state
+is),
 and one `JournalFrame` per tick after it; `JournalFrame::record(tick, &input)` is the
 frame's record, mirroring `TickInput` field for field in its application order, with
 tables as `VersionTable`s and bundles as `JournalLoad` (the baseline by content hash, with

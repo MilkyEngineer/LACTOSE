@@ -126,7 +126,7 @@ crates/
   anim/           F  boundary  animation state machines, phase, events, root motion, sim skeleton (sockets, hands, feet, head, ragdoll bodies)
   predict/        F  boundary  prediction world, rollback ring, reconciliation
   nav-query/      F  boundary  navmesh queries
-  physics-api/    F  boundary  bodies, colliders, joints, queries, events, snapshot and restore
+  physics-api/    F  boundary  the simulation `Transform`, `Velocity` and `Teleported` components, bodies, colliders, joints, queries, events, snapshot and restore
   asset-api/      F            AssetId, AssetRef, asset handle policy, loader and processor traits, version table types, published-assets and catalogue store traits, streaming priority and memory budget types
   bundle/         F  boundary  region bundle format shared by cook, asset and persist: baseline rows, placement GUIDs, overlay records
   present-api/    F            presentation components (mesh, light, decal, camera rig), VFX and audio request events, UI view-model, debug-draw buffer, presentation snapshot
@@ -167,8 +167,10 @@ tools/
 
 There is no `task-api`: spawning is generic and cannot sit behind a trait object. `ecs` has
 no interface split for the same reason. Backend services that `game` must reach (physics
-queries, asset lookup, presentation requests) are exposed as `dyn` resources whose traits live
-in the corresponding `-api` crate and whose instances `app` inserts at startup.
+queries, asset lookup, presentation requests) are exposed as resources whose types live in the
+corresponding `-api` crate and whose instances `app` inserts at startup: a `dyn` trait, or a
+concrete type the `-api` crate wraps around one where the schedule must see the step and the
+queries as one target (`physics_api::Physics`).
 
 ## 5. Runtime model
 
@@ -442,7 +444,11 @@ fn footsteps(present: PresentEvents, key: StableKeyOf, anim: &AnimState) {
 fn apply_region_load(world: &mut World, loaded: ResMut<LoadedBundles>) { /* bulk copy rows */ }
 ```
 
-Physics writes go through the physics command buffer and apply in the physics stage. Relationship
+Physics writes go through the physics command buffer (impulses, forces, teleports) or through
+the body's own `Transform`, `Velocity`, `RigidBody` and `Collider` components, and both apply in
+the physics stage: its sync point pushes the rows' changes into the solver and takes the commands
+recorded since the previous step, then the step applies them; the step's results reach the rows
+at the sync point that begins the post stage. Relationship
 fields are written through commands so the reverse index stays consistent. `StableKeyOf` yields
 the entity's origin key; no row, chunk or worker index exists in the API. The macro makes every
 parameter binding mutable, `#[finalize]` finds its system by name in the same module, and
@@ -648,9 +654,13 @@ capacity model.
 - The client owns a **prediction world**, separate from its replicated world, with its own
   physics world, entity table and snapshot ring. It holds the local player, entities the player
   has claimed (thrown objects, predicted spawns), and the immutable static collision asset.
-  Every other entity is a kinematic proxy driven by received state; during re-simulation,
-  proxies follow their per-tick history kept in the snapshot ring rather than teleporting.
-  Predicted entities collide only with static geometry and other predicted entities.
+  In the prediction world a proxy with a `RigidBody` is a kinematic body moved along its
+  per-tick history kept in the snapshot ring rather than teleporting, whatever its declared
+  type, and becomes its declared type when the player claims it; a `Collider`-only row is a
+  fixed collider in every world, so a replicated entity that moves carries a `RigidBody`.
+  Predicted entities collide with static geometry, other predicted entities and proxies, are
+  pushed by proxies and never push them, and a predicted interaction with a proxy is
+  presented tentatively until confirmed.
 - Systems declare the worlds they run in (section 6.1). The prediction world injects a
   predicted-only filter; game code never writes it. The local player exists in both client
   worlds, and the prediction world's copy shadows the replicated one for extract and the
@@ -704,7 +714,9 @@ interaction keep it possible later. No system may hold a direct reference across
 Only the client prediction world is ever rolled back. Its `snapshot` captures every column,
 the entity table, world and region resources, region modes, seeds and asset tables, the
 input-tick table, the relationship index, proxy history and the physics world through
-`physics-api::snapshot`. Two things stay with the world across a restore because a rollback
+`physics-api::snapshot`, which carries the backend's whole world with each collider's shape
+value and the physics sync's pending work, so that the sync of a re-simulated tick makes the
+calls the first run's did. Two things stay with the world across a restore because a rollback
 must not undo them: the prediction-to-network alias table (section 7) and the log of
 delivered presentation events, which is what lets re-emission deduplicate and a missing
 re-emission cancel. Command buffers are empty at snapshot points by construction.
@@ -918,8 +930,10 @@ world. Rapier's determinism feature is used together with its parallel solver. T
 sanctioned blocking wait in `task`: a physics stage job calls into the solver's rayon pool,
 which is sized to the performance-core count minus the workers reserved for render recording
 and non-physics systems, and whose threads get QoS and floating-point state through the
-`thread_class` helper. The pool is built by `app` outside the boundary and handed to the backend
-through a setup function. The physics stage is a barrier for systems that depend on physics only;
+`thread_class` helper. The pool is built by `app` outside the boundary, sized to the frame worker
+count minus the reservation and at least one thread, and handed to the backend's constructor; the
+backend is handed to `physics-api::setup` through a `SimulationBuilder::setup` closure, and the
+step blocks on it inside `block_in_place` with that reservation. The physics stage is a barrier for systems that depend on physics only;
 independent systems run alongside on the reserved workers. Bodies in `Frozen` regions are fixed
 colliders. Milestone 1 measures the physics phase's share of the tick and the stall it imposes
 on render recording during the overlap.

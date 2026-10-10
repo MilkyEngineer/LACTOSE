@@ -1499,6 +1499,167 @@ rationale the author supplied during the editorial pass rather than one taken fr
 - Driven by: milestone 1, the `sim` facade brief, its two design reviews and the
   implementation's reviews (2026-10-10).
 
+**D119. The `physics-api` facade: what sections 4, 6.1, 9.4, 9.7, 10, 15.1 and 16 left open**
+(§4, §5.3, §6.1, §8.2, §8.3, §9.4, §9.7, §10, §15.1, §16, §17, `lactose-physics-api`,
+`lactose-ecs`)
+- Why: the facade is written before the backend so `physics-rapier`, `predict`, `anim`,
+  `present-api`, `net` and the game crates build against the final surface; each choice below is
+  one the sections did not settle, and each is a contract in `crates/physics-api/README.md`.
+  - *A body is a row, and the sync makes the solver follow rows.* A row is a body while it has
+    `Transform` and a `RigidBody` or a `Collider`; a `Collider` alone is a fixed collider in
+    every world (cooked static scenery), so a replicated entity that moves carries a
+    `RigidBody`. An exclusive system at the physics sync point replays the structural log
+    through a cursor and the changed rows of `RigidBody`, `Collider`, `Transform`, `Velocity`
+    and `Joint` through a change mark, and tells the backend `create_body`, `remove_body`,
+    `set_body`, `set_collider`, `set_transform`, `set_velocity`, `set_frozen`; it keeps the one
+    map between rows and the solver, which the derived `BodyHandle` and `JointHandle` columns
+    mirror and nothing trusts. A stale cursor or mark means a full diff of every row against
+    that map, never a cleared solver, so sleep and warm starts survive the 2^30 stamp rebase and
+    a world restore without a physics restore wherever the rows agree. Rules out the backend
+    reading the world, bodies created by channel commands, a body table outside rows, and
+    `clear`.
+  - *Row writes are physics input; the channel carries what a row cannot hold.* A
+    `Mut<Velocity>` or `Mut<Transform>` write in a kernel, or a `Commands::set` of them from
+    `Stage::Input`, `Stage::Simulation` or `Stage::Post`, is honoured at the next physics sync
+    point (a dynamic or fixed body is placed with no sweep, a kinematic body sweeps during the
+    step); the write-back's own writes are recognised by value against the record of the last
+    write-back, which every write-back replaces, and skipped. `cmd.physics()` carries impulses,
+    forces and `teleport` only. The section 6.1 `apply_gravity` kernel therefore works on a
+    body. In `Stage::Physics` nothing but the write-back writes a body's `Transform` or
+    `Velocity`, and a reader there after the step sees this tick's queries and events but the
+    previous tick's rows; readers of stepped rows go in `Stage::Post`. Rules out `set_velocity`,
+    `move_kinematic` and `set_body_type` commands, and leaves one stated hazard instead of a
+    silent one.
+  - *Three systems, not one.* The exclusive sync at the physics sync point; the once-per-tick
+    step beside whatever else runs in `Stage::Physics`, which calls the backend inside
+    `Job::block_in_place` with the reservation `app` chose; and an exclusive write-back first in
+    `Stage::Post`, writing every moved body's `Transform` and `Velocity` per key through
+    `get_mut` and `set_if_neq`, so only rows whose bytes changed are stamped and the cost is in
+    the moved bodies (0.43 ms per tick for 2,000 moved bodies among 100k rows on the naive ECS,
+    against 3.2 ms for a `columns_mut` walk and 1.6 ms for `Commands::set`). Every other
+    `Stage::Post` system runs after it with no edge, as after any exclusive system; `app` orders
+    other exclusive `Stage::Post` systems against it. Rules out an exclusive step (nothing could
+    run alongside), a step that reads columns (a once-per-tick system cannot), and a write-back
+    through `Commands::set`.
+  - *The physics channel is not cleared at the input sync point.*
+    `CommandChannel::CLEAR_AT_INPUT` (default true) is false for `PhysicsCommands`; the sync
+    takes the channel at every physics sync point, so a command recorded in `Stage::Input` or
+    `Stage::Simulation` applies at this tick's step and one recorded in `Stage::Physics` or
+    `Stage::Post` (contact-driven impulses, portal teleports) at the next, in command order.
+    `World::channel` reads a channel between ticks without taking it, so the consumer of such a
+    channel can snapshot what it has not taken; a restore drops every channel. Untaken commands
+    are not in a save or a journal, dropped on load and replay as solver state is; a world that
+    records them without a `Physics` resource grows the channel, so `app` inserts one wherever
+    such systems run. Rules out a game-side carrier component for contact-driven commands.
+  - *Joints are rows.* A `Joint` component with `EntityRef` bodies, spawned owned by one body,
+    saved, replicated and snapshotted with the row, created in the solver when both bodies are
+    bodies and waiting otherwise; a joint with an emptied reference is removed and not retried
+    until its row changes. Rules out joint identities minted by the channel, which no save or
+    snapshot would carry.
+  - *One `Physics` resource rather than `dyn PhysicsQuery` beside `dyn PhysicsBackend`.* The
+    concrete `Physics` wraps the `Box<dyn PhysicsBackend>`; queries take `&self` through
+    `Res<Physics>`, the three systems take `ResMut<Physics>`, so the schedule sees every
+    conflict (a `Stage::Physics` reader of `Physics` or the events is in a set after
+    `sets::STEP`, or the build fails). Rules out two resources aliasing one solver and a lock on
+    the hot path.
+  - *The blocking wait is this crate's; the pool is the backend's.* The backend never touches
+    the executor; `app` builds the pool outside the boundary with frame worker count minus the
+    reservation threads, at least one, hands it to the backend crate's constructor, and the
+    backend to `physics_api::setup` from a `SimulationBuilder::setup` closure.
+    `StepInput::commands` is a plain slice, so a backend's own test steps without a world. Rules
+    out a `Job` or an ECS parameter type in the trait and any `lactose-task` edge from the
+    backend.
+  - *`Transform` and `Velocity` are defined here*, translation plus rotation and no scale, as
+    the simulation's transform components for every entity; a crate that needs a transform and
+    no physics depends on this crate for the types, which pull no backend. `Teleported` holds
+    the last tick a body was placed without a sweep, section 5.3's no-interpolate flag as a tick
+    rather than a per-tick mark, so a frame that runs several ticks before its passes loses no
+    teleport; extract and the gather compare it with the last tick they covered.
+  - *Prediction world: a `RigidBody` row without `ClaimedBy` is a proxy, handed to the backend
+    as the effective body with `body_type = Kinematic`; `ClaimedBy` added to or removed from a
+    body row is a change of its `RigidBody`, kinematic while unclaimed, the row's type while
+    claimed; the backend holds no world-kind rule.* A proxy is moved along its per-tick history
+    by `lactose-predict`'s writes to its `Transform` row; predicted entities collide with static
+    geometry, other predicted entities and proxies, are pushed by proxies and never push them.
+    Rules out proxies absent from the physics world and a proxy status fixed at creation.
+  - *Frozen is per body, derived from region modes by the sync*: a body in a region whose mode
+    is not `Simulated` is a fixed collider at its last pose; back in `Simulated`,
+    `set_frozen(false)` then the row's velocity.
+  - *A physics snapshot is the backend's whole world plus the sync's pending work.* The bytes
+    are the backend's whole world, with each collider's `Shape` value (an asset reference once
+    meshes exist) in place of the backend's shape serialisation; `restore` rebuilds shapes from
+    those values while deserialising, with no change flag, wake or mass update; there is no
+    `set_collider` replay and no fixed-collider reconciliation. The crate's part carries the
+    bookkeeping and what the next sync would see: the log since the cursor, the keys changed
+    since the mark, the channel's untaken commands, or that a full diff is due; `restore` puts
+    it back after `World::restore`, so a re-simulated tick's sync makes exactly the backend
+    calls the first run's did. `corrected(world, keys)` names the rows `predict` wrote without
+    recording. The "50 claimed bodies plus N statics" measurement decides how many statics a
+    prediction world may hold. Rules out rebuilding from the handle columns, a fresh cursor and
+    mark at restore, bodies-only bytes spliced into a solver whose arena, BVH and contact graph
+    hold the statics too, and shapes replayed through setters that disturb the solver.
+  - *Events are sorted by this crate; `Impact` is the damage phase.* `Started` and `Stopped` go
+    to both sides of a pair if either collider has `events`; `Impact`, in every step whose
+    normal impulse exceeds the target's `impact_threshold`, goes to a target only if the
+    target's own collider has `events`; a tick's events are emitted in ascending (target, other,
+    phase) order whatever the backend's order; `Started` may be speculative, so damage reads
+    `Impact`. Queries are pure functions of the backend state with ties to the lowest key and
+    `overlap` in key order.
+  - *The backend's determinism obligation.* Equal outputs, answers and bytes under any pool size
+    and whatever ran before, with every `set_*` a no-op on an equal value and every value
+    validated. The obligation is section 2's, identical on x86-64 and aarch64; the verification
+    items name the two known gaps of the pinned Rapier (platform-libm `sin_cos` on limited
+    joints, the sign of zero in SIMD min/max), which the backend lane closes before SOUR's
+    architecture mode gates; until then the property is unproven, not excused.
+  - *Every component is its scalars then an eight-byte-multiple tail*, sizes asserted for both
+    scalar widths; a field added later takes the next free ID and never renumbers another;
+    switching the scalar changes `lactose-math`, the `Scalar64` tag and the backend's crate
+    names only.
+  - *The conformance run is a function of this crate* (`conformance::snapshot_restore`, with a
+    `LayoutConfig`) that a backend's test calls once per pool size and layout and compares; its
+    scene sets an input tick every tick, spawns from a claimed kernel, carries pending work of
+    every kind across the snapshot, repeats every post-restore event in the first run at the
+    same ticks, and reports the physics bytes' hash until the order-stability item decides.
+  - Named and deferred: cooked collision meshes (`ShapeKind::Mesh` with an
+    `AssetRef<CollisionMesh>`, a schema bump; the snapshot then carries the reference), compound
+    colliders, CCD, lag-compensation history, hashing the snapshot bytes, per-region body counts
+    and contacts of a body.
+- What the first design review changed (1 blocking, 10 serious, 8 minor; `50ee157` was the
+  facade before it): the snapshot carries the bookkeeping and the pending work instead of a
+  fresh mark and cursor; `corrected`; proxies as kinematic bodies; the exclusive write-back and
+  the step without `Commands`; `StepInput::commands` as a slice; the layout parameter, the
+  richer scene and the physics hash in the conformance run; `Impact` and the impact threshold;
+  `CLEAR_AT_INPUT` and `World::channel` in the ECS; the five-column scan; the `written`
+  semantics; hidden handle accessors; the full diff instead of `clear`; the sketch's set order;
+  `Teleported`; the validation contract; `Collider::events` and `material`; the solver-thread
+  invariant.
+- What the second design review changed (0 blocking, 3 serious, 8 minor; `a263cd7` was the
+  facade between the rounds): the effective body by value in place of a proxy flag, with a claim
+  or release as a `RigidBody` change; whole-world bytes with `Shape` values in place of
+  bodies-only bytes with a `set_collider` replay and fixed-collider reconciliation; `Teleported`
+  as a persistent tick in place of a transient flag; `Impact` only to targets with `events`; no
+  edge for `Stage::Post` readers; the input tick and the claimed spawn in the conformance scene;
+  the §9.4 text; section 2's cross-architecture obligation stated as unproven rather than
+  scoped; the save, journal and no-`Physics` sentences for the channel; `Collider` IDs kept; the
+  despawned-key skip in the write-back.
+  - Backend dependencies, proposed for the backend lane (the closure resolved for rapier3d
+    0.36.0 with `enhanced-determinism`, `parallel` and `serde-serialize`): direct
+    `rapier3d-f64`, `parry3d-f64`, `nalgebra`, `glamx`, `glam`, `simba`, `wide`, `num-traits`,
+    `rayon`, `serde` and a byte format (`postcard` or `bincode`, shown to be a fixed function of
+    the value); transitive `approx`, `arrayvec`, `bitflags`, `byteorder`, `downcast-rs`,
+    `either`, `ena`, `equivalent`, `foldhash`, `hash32`, `hashbrown`, `heapless`, `indexmap`,
+    `log`, `matrixmultiply`, `nalgebra-macros`, `num-complex`, `num-derive`, `num-integer`,
+    `num-rational`, `ordered-float`, `profiling`, `profiling-procmacros`, `rawpointer`,
+    `rayon-core`, `rstar`, `serde_arrays`, `serde_core`, `serde_derive`, `slab`, `smallvec`,
+    `stable_deref_trait`, `static_assertions`, `thiserror`, `thiserror-impl`, `typenum` and the
+    host-only `autocfg`; `matrixmultiply` is the explicit second exception beside `libm`
+    (kernels selected by CPU feature, unreachable from the step, with
+    `Multibody::inverse_kinematics` banned in the boundary lint file); `deny.toml` denies
+    multiple versions of the math crates and glam's `fast-math` and `core-simd` features, since
+    `enhanced-determinism` itself enables `scalar-math`, `libm` and `nostd-libm`.
+- Driven by: milestone 1, the `physics-api` facade brief and its two design reviews
+  (2026-10-10).
+
 ## 10. Review history
 
 - **Revision 1** (`a29af04`): the design baseline.
