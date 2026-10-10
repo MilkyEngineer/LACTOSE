@@ -167,9 +167,10 @@ impl Physics {
 
     /// Whether `key` names a row that is a body or fixed collider in the solver, by its
     /// origin key or, for a bound predicted entity, a `Net` key the sync has seen bound (one
-    /// bound at this tick's input sync point resolves from the physics sync point on). True
-    /// from the physics sync point after the row became one until the sync point after it
-    /// stopped.
+    /// bound at this tick's input sync point resolves from the physics sync point on; after a
+    /// rollback, one bound after the restore point resolves from the first re-simulated
+    /// physics sync point on, since the world keeps binds across a restore). True from the
+    /// physics sync point after the row became one until the sync point after it stopped.
     #[must_use]
     pub fn is_body(&self, key: StableKey) -> bool {
         self.sync.bodies.contains_key(&self.resolve(key))

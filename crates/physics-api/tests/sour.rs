@@ -126,6 +126,7 @@ const BONE_B: u64 = 3;
 const JOINT: u64 = 4;
 const PROXY: u64 = 5;
 const DRIFTER: u64 = 11;
+const BOOKKEEPING: u64 = 12;
 
 fn sphere_key(index: u64) -> StableKey {
     key(100 + index)
@@ -166,8 +167,14 @@ fn scene(kind: WorldKind, layout: LayoutConfig) -> Harness {
             (at(30, 3, 0), Velocity::ZERO, RigidBody::dynamic(), sphere(), claim),
         )
         .unwrap();
+    // The sync's bookkeeping in the hash: every tick's body count and whether the sphere
+    // the rollback tick despawns is still a body, so a lost removal shows as a ghost body
+    // although the test backend, with no collision response, never moves a row for it.
+    // Claimed, so the prediction world runs the kernel over it.
+    h.spawn(key(BOOKKEEPING), (Bookkeeping::default(), claim));
     h.script().input_ticks = true;
     let script = h.script();
+    script.watched.push(sphere_key(7));
     for tick in 1..=TICKS {
         let index = u64::from(tick) % SPHERES;
         let source = sphere_key(index);
@@ -301,6 +308,12 @@ fn the_rolled_back_scene_ends_where_the_straight_one_does() {
                 simulation.world_mut().set_region_mode(OTHER_REGION, mode).unwrap();
             }
             hashes.push(simulation.hash().unwrap());
+            if tick == ROLLBACK_TICK {
+                // The bookkeeping row is written, so the hashes see it: the sphere the
+                // rollback tick despawns is a body until the next sync.
+                let book = simulation.world().get::<Bookkeeping>(key(BOOKKEEPING)).unwrap();
+                assert_eq!((book.watched, book.bodies > 40), (1, true), "{book:?}");
+            }
             if rollback && tick == ROLLBACK_TICK {
                 saved =
                     Some((simulation.world().snapshot(), snapshot(simulation.world()).unwrap()));
@@ -320,6 +333,8 @@ fn the_rolled_back_scene_ends_where_the_straight_one_does() {
                 assert_eq!(simulation.hash().unwrap(), hashes[tick as usize - 1], "tick {tick}");
             }
         }
+        let book = simulation.world().get::<Bookkeeping>(key(BOOKKEEPING)).unwrap();
+        assert_eq!(book.watched, 0, "{book:?}");
         hashes
     };
     assert_eq!(run(true), run(false));

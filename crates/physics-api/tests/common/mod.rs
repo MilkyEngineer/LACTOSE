@@ -19,6 +19,7 @@ use lactose_physics_api::{
     PhysicsExt, RigidBody, Shape, Teleported, Transform, TriggerEvent, Velocity, register_systems,
     register_types, sets, setup,
 };
+use lactose_reflect::component;
 use lactose_sim::{
     CurrentTick, Registration, Simulation, SimulationBuilder, Stage, TickInput, TypeTable,
 };
@@ -111,6 +112,8 @@ pub struct Script {
     /// Whether player one gets an input tick every tick, so a spawn from a claimed entity
     /// is predicted.
     pub input_ticks: bool,
+    /// The keys whose `Physics::is_body` the [`Bookkeeping`] row counts.
+    pub watched: Vec<StableKey>,
 }
 
 impl Script {
@@ -134,6 +137,20 @@ impl Script {
             .collect::<Vec<_>>()
             .into_iter()
     }
+}
+
+/// What `Physics` reports, written every tick in `Stage::Post` onto the rows that carry
+/// one, so the world's hash sees the sync's bookkeeping and not only the rows it moves: a
+/// body the sync lost or kept too long changes the hash even if it never moves a row.
+#[component(key = "test::bookkeeping", persistent)]
+#[derive(PartialEq, Eq, Debug, Default)]
+pub struct Bookkeeping {
+    /// `Physics::body_count`.
+    #[field(id = 1)]
+    pub bodies: u32,
+    /// How many of `Script::watched` are bodies.
+    #[field(id = 2)]
+    pub watched: u32,
 }
 
 /// What the recording system in `Stage::Post` saw.
@@ -230,6 +247,15 @@ fn post_kernel(
     }
 }
 
+#[system(name = "test::bookkeeping", worlds = [server, prediction])]
+fn bookkeeping(physics: Res<Physics>, script: Res<Script>, book: Mut<Bookkeeping>) {
+    let watched = script.watched.iter().filter(|&&key| physics.is_body(key)).count();
+    *book = Bookkeeping {
+        bodies: u32::try_from(physics.body_count()).unwrap(),
+        watched: u32::try_from(watched).unwrap(),
+    };
+}
+
 #[system(name = "test::record", worlds = [server, prediction])]
 fn record(
     now: Res<CurrentTick>,
@@ -247,7 +273,7 @@ pub fn register_script(registration: &mut Registration) {
     registration.stage(Stage::Input).sets(&[&INPUT_SET]).add(&INPUT_TICK);
     registration.stage(Stage::Simulation).add(&SIMULATION_KERNEL);
     registration.stage(Stage::Physics).sets(&[&AFTER_STEP_SET]).add(&AFTER_STEP);
-    registration.stage(Stage::Post).add(&POST_KERNEL).add(&RECORD);
+    registration.stage(Stage::Post).add(&POST_KERNEL).add(&BOOKKEEPING).add(&RECORD);
 }
 
 /// A simulation of one kind with the test backend behind this crate's systems and the
@@ -296,6 +322,7 @@ impl Options {
         let config = self.config;
         let mut types = TypeTable::new();
         register_types(&mut types).unwrap();
+        types.register::<Bookkeeping>().unwrap();
         let mut simulation = SimulationBuilder::new(self.kind, types)
             .layout(self.layout)
             .tick(self.tick)
