@@ -184,6 +184,89 @@ fn the_cost_scene_pushes_nothing_back_and_stamps_only_the_moved_rows() {
     );
 }
 
+/// How the bodies of the resting scene are keyed.
+#[derive(Clone, Copy, Debug)]
+enum Keys {
+    Net,
+    BoundPredicted,
+    UnboundPredicted,
+}
+
+/// The sync's median over 21 ticks with `n` resting bodies: nothing changed, nothing
+/// reported, so what is left is the sync's own per-tick work.
+fn resting(keys: Keys, n: u32) -> (Duration, Duration) {
+    let calls = CallLog::default();
+    let backend = Box::new(Fake::new(calls.clone()).without_contacts());
+    let mut types = TypeTable::new();
+    register_types(&mut types).unwrap();
+    let mut simulation = SimulationBuilder::new(WorldKind::Server, types)
+        .setup(move |world| setup(world, backend, PhysicsConfig::default()))
+        .setup(|world| {
+            world.insert_service::<Clock>(Box::new(Clock::default()));
+            Ok(())
+        })
+        .systems(register_systems)
+        .systems(register_clock)
+        .build()
+        .unwrap();
+    let world = simulation.world_mut();
+    world.create_region(RegionConfig { id: REGION, seed: 1, mode: RegionMode::Simulated }).unwrap();
+    for i in 0..n {
+        let net = NetId::from_bits(1_000_000 + u64::from(i)).unwrap();
+        let predicted = lactose_core::PredictionKey {
+            player: PLAYER,
+            input_tick: lactose_core::Tick(1),
+            ordinal: i,
+        };
+        let key = match keys {
+            Keys::Net => StableKey::Net(net),
+            Keys::BoundPredicted => {
+                world.bind(predicted, net).unwrap();
+                StableKey::Predicted(predicted)
+            }
+            Keys::UnboundPredicted => StableKey::Predicted(predicted),
+        };
+        world
+            .spawn(key, REGION, (at(i as i32, 0, 0), Velocity::ZERO, floating(), sphere()))
+            .unwrap();
+    }
+    let executor = executor(1);
+    let step = |simulation: Simulation| {
+        executor.block_on(simulation.step(&executor, TickInput::default())).unwrap()
+    };
+    for _ in 0..3 {
+        simulation = step(simulation);
+    }
+    calls.take();
+    let mut total = Vec::new();
+    for _ in 0..21 {
+        #[expect(
+            clippy::disallowed_types,
+            reason = "a measurement outside the step: printed, never asserted"
+        )]
+        let start = std::time::Instant::now();
+        simulation = step(simulation);
+        total.push(start.elapsed());
+        // At rest: the step is all the backend is told.
+        assert_eq!(calls.take().len(), 1);
+    }
+    let sync = simulation.world().service::<Clock>().unwrap().spans("sync", "synced");
+    (median(total), median(sync[3..].to_vec()))
+}
+
+/// Review of the implementation, S1 (probe C3): the sync of resting bodies keyed by bound
+/// predicted keys costs what the same bodies keyed by `Net` keys cost, since a bound body's
+/// alias is never looked up again; unbound predicted bodies are looked up every tick.
+#[test]
+fn the_sync_of_resting_bodies_by_key_kind() {
+    for n in [10_000, 50_000] {
+        for keys in [Keys::Net, Keys::BoundPredicted, Keys::UnboundPredicted] {
+            let (tick, sync) = resting(keys, n);
+            println!("RESTING {n} bodies, {keys:?} keys: tick {tick:?}, sync {sync:?}");
+        }
+    }
+}
+
 #[test]
 fn the_snapshot_of_fifty_claimed_bodies_and_n_statics() {
     for statics in [0, 100, 1_000, 10_000] {

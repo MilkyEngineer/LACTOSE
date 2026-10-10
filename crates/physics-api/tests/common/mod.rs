@@ -75,6 +75,8 @@ pub enum Action {
     Despawn(StableKey),
     /// Writes an entity's `Transform` through `Commands::set`.
     SetTransform(StableKey, Transform),
+    /// Writes an entity's `Velocity` through `Commands::set`.
+    SetVelocity(StableKey, Velocity),
     /// Writes an entity's `RigidBody` through `Commands::set`.
     SetBody(StableKey, RigidBody),
     /// Removes an entity's `RigidBody` through `Commands::remove`.
@@ -150,6 +152,7 @@ fn act(cmd: &mut Commands<'_>, action: Action) {
         }
         Action::Despawn(key) => cmd.despawn(key),
         Action::SetTransform(key, transform) => cmd.set(key, transform),
+        Action::SetVelocity(key, velocity) => cmd.set(key, velocity),
         Action::SetBody(key, body) => cmd.set(key, body),
         Action::RemoveBody(key) => cmd.remove::<RigidBody>(key),
         Action::SetCollider(key, collider) => cmd.set(key, collider),
@@ -213,7 +216,7 @@ fn after_step(cmd: Commands, now: Res<CurrentTick>, script: Res<Script>) {
 #[system(
     name = "test::post",
     worlds = [server, prediction],
-    writes = [Transform, RigidBody, Collider, Joint]
+    writes = [Transform, Velocity, RigidBody, Collider, Joint]
 )]
 fn post_kernel(
     cmd: Commands,
@@ -285,7 +288,11 @@ impl Options {
         if !self.contacts {
             fake = fake.without_contacts();
         }
-        let backend: Box<dyn PhysicsBackend> = Box::new(fake);
+        self.build_with(Box::new(fake), calls)
+    }
+
+    /// The harness around another backend, whose calls `calls` records if it records any.
+    pub fn build_with(self, backend: Box<dyn PhysicsBackend>, calls: CallLog) -> Harness {
         let config = self.config;
         let mut types = TypeTable::new();
         register_types(&mut types).unwrap();

@@ -8,15 +8,15 @@ use core::mem;
 use core::ops::{BitOr, BitOrAssign};
 use std::collections::{BTreeMap, BTreeSet};
 
-use lactose_core::{ComponentKey, PlayerId, PredictionKey, StableKey, Tick};
+use lactose_core::{ComponentKey, StableKey};
 use lactose_ecs::{
     ChangeMark, ClaimedBy, EventWriter, Job, RegionId, RegionMode, StructuralChange, World,
     WorldKind,
 };
-use lactose_math::Scalar;
+use lactose_math::{Canonical, Scalar};
 use lactose_reflect::Reflect;
 
-use crate::backend::{BodyDesc, PhysicsBackend, StepInput};
+use crate::backend::{BodyDesc, BodyState, PhysicsBackend, StepInput};
 use crate::command::{PhysicsCommand, PhysicsCommands};
 use crate::components::{
     BodyHandle, BodyType, Collider, Joint, JointHandle, RigidBody, Teleported, Transform, Velocity,
@@ -89,10 +89,6 @@ fn collect_changes(world: &World, mark: ChangeMark, rows: &mut Vec<(StableKey, C
     column::<Joint>(world, mark, Changes::JOINT, rows);
 }
 
-/// The smallest predicted key: where the predicted bodies begin in key order.
-const FIRST_PREDICTED: StableKey =
-    StableKey::Predicted(PredictionKey { player: PlayerId(0), input_tick: Tick(0), ordinal: 0 });
-
 impl Physics {
     /// The sync (`README.md`, "The tick", step 2).
     pub(crate) fn sync(&mut self, world: &mut World) {
@@ -162,8 +158,18 @@ impl Physics {
         job.context().block_in_place(config.reserved_workers, || backend.step(&input, output));
         commands.clear();
         // The emission order is a function of the step's result alone: ascending by
-        // (target, other, phase), whatever order the backend reported in.
-        output.contacts.sort_by_key(|event| (event.target, event.other, event.phase));
+        // (target, other, phase), whatever order the backend reported in. Ties, which only
+        // a backend reporting a pair twice makes, are broken by value, so the one kept
+        // does not depend on the backend's order either.
+        output.contacts.sort_by(|a, b| {
+            let pair = |event: &ContactEvent| (event.target, event.other, event.phase);
+            let value = |event: &ContactEvent| {
+                let (point, normal) =
+                    (event.point.to_canonical_bytes(), event.normal.to_canonical_bytes());
+                (point, normal, event.impulse.to_canonical_bytes())
+            };
+            pair(a).cmp(&pair(b)).then_with(|| value(a).cmp(&value(b)))
+        });
         output.triggers.sort_by_key(|event| (event.target, event.other, event.phase));
         let (contact_count, trigger_count) = (output.contacts.len(), output.triggers.len());
         output.contacts.dedup_by_key(|event| (event.target, event.other, event.phase));
@@ -186,7 +192,21 @@ impl Physics {
     pub(crate) fn write_back(&mut self, world: &mut World) {
         let tick = world.tick();
         let Physics { output, sync, .. } = self;
-        output.bodies.sort_by_key(|state| state.key);
+        // By key, and a key reported twice (a backend's broken promise) by value, so the
+        // state kept does not depend on the backend's order.
+        output.bodies.sort_by(|a, b| {
+            let value = |state: &BodyState| {
+                let (transform, velocity) = (state.transform, state.velocity);
+                (
+                    transform.translation.to_canonical_bytes(),
+                    transform.rotation.to_canonical_bytes(),
+                    velocity.linear.to_canonical_bytes(),
+                    velocity.angular.to_canonical_bytes(),
+                    state.teleported,
+                )
+            };
+            a.key.cmp(&b.key).then_with(|| value(a).cmp(&value(b)))
+        });
         sync.written.clear();
         for state in &output.bodies {
             let key = state.key;
@@ -487,6 +507,10 @@ impl Pass<'_> {
                 if frozen {
                     self.sync.frozen.insert(key);
                 }
+                if matches!(key, StableKey::Predicted(_)) {
+                    // Looked up at the end of this sync, and at every one until it is bound.
+                    self.sync.unbound.insert(key);
+                }
                 self.created.insert(key);
                 insert(self.world, key, handle);
             }
@@ -505,6 +529,18 @@ impl Pass<'_> {
         self.sync.bodies.remove(&key);
         self.sync.frozen.remove(&key);
         self.created.remove(&key);
+        if let StableKey::Predicted(predicted) = key
+            && !self.sync.unbound.remove(&key)
+        {
+            // Bound: its alias goes with it. The world keeps a bind until the rollback
+            // horizon passes the despawn, so the lookup normally finds it.
+            match self.world.alias(predicted) {
+                Some(net) if self.sync.aliases.get(&net) == Some(&key) => {
+                    self.sync.aliases.remove(&net);
+                }
+                _ => self.sync.aliases.retain(|_, &mut body| body != key),
+            }
+        }
         if self.world.get::<BodyHandle>(key).is_some()
             && let Err(error) = self.world.remove::<BodyHandle>(key)
         {
@@ -592,17 +628,21 @@ impl Pass<'_> {
         }
     }
 
-    /// The `Net` keys bound to predicted bodies, as the world knows them now.
+    /// The binds the world made since the last sync: each predicted body without a `Net`
+    /// key is looked up, and leaves the unbound set once it has one. A bind is permanent, so
+    /// a bound body is never looked up again.
     fn refresh_aliases(&mut self) {
-        let SyncState { bodies, aliases, .. } = &mut *self.sync;
-        aliases.clear();
-        for &key in bodies.range(FIRST_PREDICTED..).map(|(key, _)| key) {
-            if let StableKey::Predicted(predicted) = key
-                && let Some(net) = self.world.alias(predicted)
-            {
-                aliases.insert(net, key);
+        let SyncState { aliases, unbound, .. } = &mut *self.sync;
+        unbound.retain(|&key| {
+            let StableKey::Predicted(predicted) = key else { return false };
+            match self.world.alias(predicted) {
+                Some(net) => {
+                    aliases.insert(net, key);
+                    false
+                }
+                None => true,
             }
-        }
+        });
     }
 
     /// This tick's command list: the commands a restore carried, then the channel's, in

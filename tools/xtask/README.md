@@ -82,9 +82,10 @@ they pull in) from packages compiled for the target, and requires the results to
 The roots are `[feature_roots]` and `[harness]`; a harness package's tree includes its
 dev-dependencies. The shipped binaries' trees must be identical: the same packages with the
 same features. A harness package that is not a shipped binary is compared with every other
-root on the packages both trees hold, each of which must have the same features; it may
-hold packages another root lacks (itself, its own dev-dependencies) and lack packages
-another holds, since two harness packages always differ that way. `--package <name>` (repeatable) compares the named packages
+root on the package names both trees hold, each of which must have the same versions and
+features (a version split is a finding); it may hold packages another root lacks (itself,
+its own dev-dependencies) and lack packages another holds, since two harness packages
+always differ that way. `--package <name>` (repeatable) compares the named packages
 instead. A workspace package named `lactose-app-*` that is not in `[feature_roots]` is a
 finding.
 

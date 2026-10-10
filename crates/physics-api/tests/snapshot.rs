@@ -11,11 +11,14 @@ mod common;
 
 use common::*;
 use lactose_core::{ErrorKind, NetId, StableKey, Tick};
-use lactose_ecs::{Executor, LayoutConfig, WorldKind};
+use lactose_ecs::{
+    ClaimedBy, Executor, LayoutConfig, OwnedBy, RegionConfig, RegionMode, WorldKind,
+};
 use lactose_math::Scalar;
 use lactose_physics_api::conformance::{BODIES, SNAPSHOT_TICK, TICKS, snapshot_restore};
 use lactose_physics_api::{
-    BodyType, PhysicsCommand, PhysicsConfig, RigidBody, Transform, corrected, restore, snapshot,
+    BodyType, Joint, JointKind, PhysicsCommand, PhysicsConfig, RigidBody, Transform, Velocity,
+    corrected, restore, snapshot,
 };
 use lactose_sim::harness::{ChunkCapacity, layout_mode};
 use lactose_sim::{SimulationBuilder, TypeTable};
@@ -399,4 +402,146 @@ fn a_mismatched_snapshot_is_refused_and_changes_nothing() {
         lactose_physics_api::setup(h.world_mut(), backend, PhysicsConfig::default()).unwrap_err();
     assert_eq!(error.kind(), ErrorKind::InvalidData);
     let _ = Scalar::ZERO;
+}
+
+// ---- Re-simulation from every restore point (review of the implementation, probe I1) ----
+
+const RESIM_TICKS: u32 = 14;
+const BOUND: u64 = 500;
+
+/// Edits made between ticks, before tick `next`: the predicted body the tick-3 spawn made
+/// bound to a `Net` key (the alias table keeps it across a restore), and the second region
+/// frozen and thawed.
+fn resim_edits(h: &mut Harness, next: u32) {
+    match next {
+        6 => {
+            let spawned = rows(h.world())
+                .into_iter()
+                .find_map(|row| match row.0 {
+                    StableKey::Predicted(predicted) => Some(predicted),
+                    _ => None,
+                })
+                .expect("the tick-3 spawn");
+            h.world_mut().bind(spawned, NetId::cooked(BOUND)).unwrap();
+        }
+        7 => h.world_mut().set_region_mode(OTHER_REGION, RegionMode::Frozen).unwrap(),
+        10 => h.world_mut().set_region_mode(OTHER_REGION, RegionMode::Simulated).unwrap(),
+        _ => {}
+    }
+}
+
+fn resim_advance(mut h: Harness, to: u32) -> Harness {
+    while h.tick() < to {
+        let next = h.tick() + 1;
+        resim_edits(&mut h, next);
+        h = h.run(1);
+    }
+    h
+}
+
+/// Pending work of every kind at many ticks: post-stage spawns (one bound mid-run, one never
+/// bound), a despawn that leaves a joint waiting, `cmd.set` writes, commands from three
+/// stages (one naming the bound body by its `Net` key), a claim and a release, a kinematic
+/// body driven every tick, a body change and a region frozen and thawed.
+fn resim_scene(layout: LayoutConfig, workers: u32, threads: u32) -> Harness {
+    let mut options = Options::new(WorldKind::Prediction);
+    options.layout = layout;
+    options.workers = workers;
+    options.threads = threads;
+    let mut h = options.build();
+    let second = RegionConfig { id: OTHER_REGION, seed: 2, mode: RegionMode::Simulated };
+    h.world_mut().create_region(second).unwrap();
+    for n in 1..=6u64 {
+        h.spawn_body(key(n), at(n as i32 * 3, 0, 0));
+    }
+    let claim = ClaimedBy { player: PLAYER };
+    h.spawn(key(7), (at(0, 20, 0), Velocity::ZERO, RigidBody::dynamic(), sphere()));
+    h.spawn(key(8), (at(40, 0, 0), Velocity::ZERO, RigidBody::kinematic(), sphere(), claim));
+    let sliding = Velocity { linear: v(1, 0, 0), angular: v(0, 0, 0) };
+    let frozen_body = (at(60, 0, 0), sliding, floating(), sphere(), claim);
+    h.world_mut().spawn(key(9), OTHER_REGION, frozen_body).unwrap();
+    let joint = Joint::new(JointKind::Spherical, key(3), key(4));
+    h.spawn(key(30), (joint, OwnedBy { owner: key(3).into() }));
+    h.script().input_ticks = true;
+    let slide = Velocity { linear: v(2, 0, 0), angular: v(0, 0, 0) };
+    let bound = StableKey::Net(NetId::cooked(BOUND));
+    let s = h.script();
+    s.at(2, When::Simulation, key(1), Action::WriteVelocity(slide))
+        .at(3, When::Post, key(5), Action::Spawn(at(0, 30, 0)))
+        .at(3, When::Post, key(5), Action::Command(impulse(key(1), 3)))
+        .at(3, When::Post, key(5), Action::SetTransform(key(6), at(9, 9, 9)))
+        .at(3, When::Post, key(5), Action::Despawn(key(4)))
+        .at(4, When::AfterStep, key(1), Action::Command(impulse(key(2), 4)))
+        .at(5, When::Simulation, key(2), Action::Command(impulse(key(5), 5)))
+        .at(6, When::Post, key(5), Action::Claim(key(7)))
+        .at(7, When::Simulation, key(2), Action::Command(impulse(bound, 7)))
+        .at(8, When::Post, key(5), Action::Release(key(6)))
+        .at(9, When::Simulation, key(2), Action::WriteBody(RigidBody::kinematic()))
+        .at(11, When::Post, key(1), Action::Spawn(at(5, 30, 0)));
+    for t in 1..=RESIM_TICKS {
+        s.at(t, When::Simulation, key(8), Action::WriteTransform(at(40 + t as i32, 0, 0)));
+    }
+    h
+}
+
+/// The calls and rows of ticks `from + 1..=RESIM_TICKS`: straight, then re-simulated.
+type Run = (Vec<Call>, Vec<Row>);
+
+fn straight_and_resimulated(
+    layout: LayoutConfig,
+    workers: u32,
+    threads: u32,
+    from: u32,
+) -> (Run, Run) {
+    let mut h = resim_advance(resim_scene(layout, workers, threads), from);
+    let world_snapshot = h.world().snapshot();
+    let physics_snapshot = snapshot(h.world()).unwrap();
+    h.take();
+    h = resim_advance(h, RESIM_TICKS);
+    let straight = (h.take(), rows(h.world()));
+    h.world_mut().restore(&world_snapshot).unwrap();
+    restore(h.world_mut(), &physics_snapshot).unwrap();
+    h.take();
+    h = resim_advance(h, RESIM_TICKS);
+    (straight, (h.take(), rows(h.world())))
+}
+
+/// Probe I1 of the implementation review, with a predicted body bound mid-run beside one
+/// never bound: every restore point, layout, worker count and pool size re-simulates to the
+/// first run's calls and rows.
+#[test]
+fn a_re_simulation_from_every_restore_point_makes_the_first_runs_calls() {
+    let layouts = [
+        LayoutConfig::default(),
+        layout_mode(ChunkCapacity::Rows(1), 1).unwrap(),
+        layout_mode(ChunkCapacity::Rows(7), 0xC0FFEE).unwrap(),
+        layout_mode(ChunkCapacity::Bytes(16 * 1024), 1).unwrap(),
+    ];
+    let mut reference: Option<Vec<Call>> = None;
+    for layout in layouts {
+        for workers in [1, 4] {
+            for threads in [1, 4] {
+                for from in [2, 3, 4, 5, 6, 8, 10] {
+                    let (straight, again) =
+                        straight_and_resimulated(layout, workers, threads, from);
+                    let at = straight.0.iter().zip(&again.0).position(|(a, b)| a != b);
+                    assert!(
+                        straight == again,
+                        "{layout:?}, {workers} workers, pool {threads}, from {from}: first \
+                         difference at {at:?}"
+                    );
+                    if from == 2 {
+                        match &reference {
+                            None => reference = Some(straight.0),
+                            Some(first) => assert_eq!(first, &straight.0, "{layout:?}"),
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // The command naming the bound body by its `Net` key reached the step, by origin key.
+    let calls = reference.unwrap();
+    let step_7 = steps(&calls).into_iter().find(|(tick, _)| tick.0 == 7).unwrap().1;
+    assert!(step_7.iter().any(|command| matches!(command.body(), StableKey::Predicted(_))));
 }

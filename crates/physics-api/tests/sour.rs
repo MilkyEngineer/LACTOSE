@@ -117,12 +117,15 @@ fn protocol_error(error: protocol::ProtocolError) -> Error {
 }
 
 const TICKS: u32 = 150;
+/// The tick after which the prediction scene is snapshotted and later restored.
+const ROLLBACK_TICK: u32 = 30;
 const SPHERES: u64 = 40;
 const FLOOR: u64 = 1;
 const BONE_A: u64 = 2;
 const BONE_B: u64 = 3;
 const JOINT: u64 = 4;
 const PROXY: u64 = 5;
+const DRIFTER: u64 = 11;
 
 fn sphere_key(index: u64) -> StableKey {
     key(100 + index)
@@ -154,6 +157,8 @@ fn scene(kind: WorldKind, layout: LayoutConfig) -> Harness {
     let owner = OwnedBy { owner: lactose_core::EntityRef::new(key(BONE_A)) };
     h.spawn(key(JOINT), (joint, owner));
     h.spawn(key(PROXY), (at(-10, 3, 0), Velocity::ZERO, RigidBody::dynamic(), sphere()));
+    let drifting = Velocity { linear: v(2, 0, 0), angular: v(0, 0, 0) };
+    h.spawn(key(DRIFTER), (at(-30, 3, 0), drifting, floating(), sphere(), claim));
     h.world_mut()
         .spawn(
             key(6),
@@ -205,6 +210,21 @@ fn scene(kind: WorldKind, layout: LayoutConfig) -> Harness {
             script.at(tick, When::Post, source, Action::Claim(key(PROXY)));
         }
     }
+    // The rollback's snapshot tick holds pending work of every kind, as the conformance
+    // scene's does: a post-stage spawn, a despawn, a `cmd.set` of a transform and a command,
+    // all left for tick 31's sync and step when the snapshot is taken.
+    let source = sphere_key(5);
+    let push = PhysicsCommand::ApplyImpulse { body: sphere_key(9), impulse: v(2, 1, 0) };
+    let slower = Velocity { linear: v(1, 0, 0), angular: v(0, 0, 0) };
+    script
+        .at(ROLLBACK_TICK, When::Post, source, Action::Spawn(at(3, 15, 3)))
+        .at(ROLLBACK_TICK, When::Post, source, Action::Despawn(sphere_key(7)))
+        .at(ROLLBACK_TICK, When::Post, source, Action::SetTransform(sphere_key(8), at(-6, 12, 0)))
+        .at(ROLLBACK_TICK, When::Post, source, Action::Command(push))
+        // Slowed to the velocity it keeps to the end: equal to what the run's last
+        // write-back writes, so a restore that kept the live record of the last write-back
+        // instead of the carried one would skip this push and the drifter would diverge.
+        .at(ROLLBACK_TICK, When::Post, source, Action::SetVelocity(key(DRIFTER), slower));
     h
 }
 
@@ -233,7 +253,7 @@ fn record_scene(test: &str, kind: WorldKind) -> Result<()> {
     let mut saved = None;
     for tick in 1..=TICKS {
         simulation = step(&sour, simulation, &mut record)?;
-        if kind == WorldKind::Prediction && tick == 30 {
+        if kind == WorldKind::Prediction && tick == ROLLBACK_TICK {
             saved = Some((simulation.world().snapshot(), snapshot(simulation.world())?));
         }
     }
@@ -281,7 +301,7 @@ fn the_rolled_back_scene_ends_where_the_straight_one_does() {
                 simulation.world_mut().set_region_mode(OTHER_REGION, mode).unwrap();
             }
             hashes.push(simulation.hash().unwrap());
-            if rollback && tick == 30 {
+            if rollback && tick == ROLLBACK_TICK {
                 saved =
                     Some((simulation.world().snapshot(), snapshot(simulation.world()).unwrap()));
             }
@@ -289,7 +309,7 @@ fn the_rolled_back_scene_ends_where_the_straight_one_does() {
         if let Some((world_snapshot, physics_snapshot)) = saved {
             simulation.world_mut().restore(&world_snapshot).unwrap();
             restore(simulation.world_mut(), &physics_snapshot).unwrap();
-            for tick in 31..=TICKS {
+            for tick in ROLLBACK_TICK + 1..=TICKS {
                 simulation =
                     executor.block_on(simulation.step(&executor, TickInput::default())).unwrap();
                 if [80, 95].contains(&(tick + 1)) {

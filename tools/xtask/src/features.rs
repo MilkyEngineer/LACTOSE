@@ -7,9 +7,9 @@
 //! depend on, and requires the result to agree across roots. Across the shipped binaries
 //! (`[feature_roots]`) it must be identical: the same packages, at the same versions, with
 //! the same features. A harness package that is not a shipped binary is held to its shared
-//! packages only: every package its tree has in common with another root's must be compiled
-//! with the same features, but its tree may hold packages another lacks and lack packages
-//! another holds. Two harness packages always differ by membership (each holds itself and
+//! packages only: every package name its tree has in common with another root's must be at
+//! the same versions with the same features (a version split is a difference), but its tree
+//! may hold packages another lacks and lack packages another holds. Two harness packages always differ by membership (each holds itself and
 //! its own dev-dependencies, which no other tree reaches), and a feature difference in a
 //! package both compile is what would make them disagree on a simulation result.
 //!
@@ -190,8 +190,11 @@ pub fn compare(triple: &str, roots: &[Root]) -> Vec<Finding> {
     findings
 }
 
-/// The packages whose feature lists differ between `root` and `reference`: every package
-/// of either tree when `membership` is compared, else those both trees hold.
+/// The packages that differ between `root` and `reference`. With `membership`, every
+/// package of either tree, by name and version, and its feature lists. Without, every
+/// package name both trees hold, compared by its versions and their feature lists together,
+/// so a version split between two harness trees is a difference rather than two packages
+/// each tree lacks.
 fn differences(
     triple: &str,
     root: &Root,
@@ -199,6 +202,10 @@ fn differences(
     membership: bool,
     findings: &mut Vec<Finding>,
 ) {
+    if !membership {
+        shared_differences(triple, root, reference, findings);
+        return;
+    }
     let describe = |features: Option<&BTreeSet<String>>| match features {
         Some(lists) => lists.iter().cloned().collect::<Vec<_>>().join(" and "),
         None => "absent".to_owned(),
@@ -207,8 +214,7 @@ fn differences(
         reference.tree.keys().chain(root.tree.keys()).collect();
     for key in packages {
         let (here, there) = (root.tree.get(key), reference.tree.get(key));
-        let compared = membership || (here.is_some() && there.is_some());
-        if compared && here != there {
+        if here != there {
             let (package, built) = key;
             let role = if *built == Built::Host { "host" } else { "target" };
             findings.push(Finding::new(
@@ -218,6 +224,42 @@ fn differences(
                      for {}; every build must compile the boundary identically",
                     describe(here),
                     describe(there),
+                    reference.path
+                ),
+            ));
+        }
+    }
+}
+
+/// A tree by package name: (name, what it is built for) to its versions, each with its
+/// feature lists, as `v1.2.3 [a, b]`.
+fn by_name(tree: &BoundaryTree) -> BTreeMap<(&str, Built), BTreeSet<String>> {
+    let mut names: BTreeMap<(&str, Built), BTreeSet<String>> = BTreeMap::new();
+    for ((package, built), lists) in tree {
+        let (name, version) = package.split_once(' ').unwrap_or((package, ""));
+        let entry = names.entry((name, *built)).or_default();
+        entry.extend(lists.iter().map(|features| format!("{version} {features}")));
+    }
+    names
+}
+
+/// The package names both trees hold whose versions or feature lists differ.
+fn shared_differences(triple: &str, root: &Root, reference: &Root, findings: &mut Vec<Finding>) {
+    let (here, there) = (by_name(&root.tree), by_name(&reference.tree));
+    for (key, ours) in &here {
+        let Some(theirs) = there.get(key) else { continue };
+        if ours != theirs {
+            let (name, built) = key;
+            let role = if *built == Built::Host { "host" } else { "target" };
+            let describe =
+                |set: &BTreeSet<String>| set.iter().cloned().collect::<Vec<_>>().join(" and ");
+            findings.push(Finding::new(
+                &root.path,
+                format!(
+                    "on {triple}, boundary dependency `{name}` ({role}) is {} here but {} for {}; \
+                     every build must compile the boundary identically",
+                    describe(ours),
+                    describe(theirs),
                     reference.path
                 ),
             ));
@@ -377,9 +419,9 @@ lactose-physics-api v0.0.0 (/ws/crates/physics-api)|
             compare("t", &harness(SIM, &physics)).iter().map(ToString::to_string).collect();
         assert_eq!(
             found,
-            ["crates/physics-api/Cargo.toml: on t, boundary dependency `libm v0.2.16` (target) \
-                 is [arch, unstable] here but [arch] for crates/sim/Cargo.toml; every build must \
-                 compile the boundary identically"]
+            ["crates/physics-api/Cargo.toml: on t, boundary dependency `libm` (target) is \
+                 v0.2.16 [arch, unstable] here but v0.2.16 [arch] for crates/sim/Cargo.toml; \
+                 every build must compile the boundary identically"]
         );
         // And against a shipped binary as well as another harness package.
         let mut roots: Vec<Root> = harness(SIM, &physics).into_iter().collect();
@@ -391,6 +433,28 @@ lactose-physics-api v0.0.0 (/ws/crates/physics-api)|
         let found = compare("t", &roots);
         assert_eq!(found.len(), 2, "{found:?}");
         assert!(found.iter().all(|finding| finding.to_string().contains("[arch, unstable] here")));
+    }
+
+    /// Review of the implementation, M4: a shared package at two versions is one package
+    /// compiled differently, not two packages each tree lacks.
+    #[test]
+    fn a_version_split_between_a_harness_package_and_another_root_is_reported() {
+        let physics = PHYSICS.replace("libm v0.2.16|arch", "libm v0.2.17|arch");
+        let found: Vec<String> =
+            compare("t", &harness(SIM, &physics)).iter().map(ToString::to_string).collect();
+        assert_eq!(
+            found,
+            ["crates/physics-api/Cargo.toml: on t, boundary dependency `libm` (target) is \
+                 v0.2.17 [arch] here but v0.2.16 [arch] for crates/sim/Cargo.toml; every build \
+                 must compile the boundary identically"]
+        );
+        let server = Root {
+            path: "crates/app-server/Cargo.toml".to_owned(),
+            tree: boundary_tree(SIM, &boundary_three).unwrap(),
+            full: true,
+        };
+        let [_, harness] = harness(SIM, &physics);
+        assert_eq!(compare("t", &[server, harness]).len(), 1);
     }
 
     #[test]

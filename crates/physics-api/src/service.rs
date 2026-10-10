@@ -71,8 +71,12 @@ pub(crate) struct SyncState {
     /// the sync last looked at them.
     pub(crate) frozen: BTreeSet<StableKey>,
     /// The `Net` key the server bound to each predicted body, so a command or filter may
-    /// name the body by either key; refreshed at every physics sync point.
+    /// name the body by either key. A bind is permanent, so an entry stays until its body
+    /// is removed.
     pub(crate) aliases: BTreeMap<NetId, StableKey>,
+    /// The predicted bodies with no bind yet: the only ones each physics sync point looks
+    /// up, so the sync's cost does not grow with the predicted bodies already bound.
+    pub(crate) unbound: BTreeSet<StableKey>,
     /// The joint rows in the solver, by origin key.
     pub(crate) joints: BTreeMap<StableKey, JointEntry>,
     /// Joint rows whose bodies are both named and not both in the solver, retried at
@@ -274,13 +278,13 @@ pub fn setup(
 /// with its solver state and the key-to-handle map, with each collider's [`Shape`] value
 /// in place of the backend's shape serialisation. And this crate's bookkeeping with the
 /// sync's pending work: which rows are bodies and joints and their handles, the waiting
-/// joints, the region modes, the aliases, what the last write-back wrote, the structural
-/// log entries after the sync's cursor in order, the keys changed since its mark across
-/// the five columns, and the channel's entries not yet taken (`World::channel`), so that
-/// after [`restore`] a re-simulated tick's sync makes exactly the backend calls the first
-/// run's did. The size is what milestone 1 measures against the prediction-world budget,
-/// for the claimed bodies plus the statics, which decides how many statics a prediction
-/// world may hold.
+/// joints, the region modes, the aliases and the unbound predicted bodies, what the last
+/// write-back wrote, the structural log entries after the sync's cursor in order, the keys
+/// changed since its mark across the five columns, and the channel's entries not yet taken
+/// (`World::channel`), so that after [`restore`] a re-simulated tick's sync makes exactly
+/// the backend calls the first run's did, apart from the calls [`corrected`] adds. The size
+/// is what milestone 1 measures against the prediction-world budget, for the claimed bodies
+/// plus the statics, which decides how many statics a prediction world may hold.
 pub struct PhysicsSnapshot {
     identity: Arc<()>,
     tick: Tick,
@@ -419,4 +423,134 @@ fn physics(world: &World) -> Result<&Physics> {
     world
         .service::<Physics>()
         .ok_or_else(|| Error::new(ErrorKind::NotFound, "the world holds no `Physics`"))
+}
+
+/// The bookkeeping itself, which no public surface shows: what the sync looks up at each
+/// physics sync point for the aliases of predicted bodies.
+#[cfg(test)]
+mod tests {
+    use lactose_core::{PlayerId, PredictionKey};
+    use lactose_ecs::{Executor, RegionConfig, WorldKind};
+    use lactose_sim::{Simulation, SimulationBuilder, TickInput};
+
+    use super::*;
+    use crate::backend::{BodyDesc, StepInput};
+    use crate::systems::register_systems;
+
+    /// A backend that holds nothing: only the bookkeeping is under test.
+    struct Null(u32);
+
+    impl PhysicsBackend for Null {
+        fn create_body(&mut self, _: StableKey, _: &BodyDesc<'_>) -> Result<BodyHandle> {
+            self.0 += 1;
+            Ok(BodyHandle::new(self.0, 1))
+        }
+        fn remove_body(&mut self, _: StableKey) {}
+        fn set_body(&mut self, _: StableKey, _: Option<&RigidBody>) {}
+        fn set_collider(&mut self, _: StableKey, _: Option<&Collider>) {}
+        fn set_transform(&mut self, _: StableKey, _: &Transform) {}
+        fn set_velocity(&mut self, _: StableKey, _: &Velocity) {}
+        fn set_frozen(&mut self, _: StableKey, _: bool) {}
+        fn create_joint(
+            &mut self,
+            _: StableKey,
+            _: &Joint,
+            _: StableKey,
+            _: StableKey,
+        ) -> Result<JointHandle> {
+            Ok(JointHandle::new(0, 1))
+        }
+        fn remove_joint(&mut self, _: StableKey) {}
+        fn step(&mut self, _: &StepInput<'_>, _: &mut StepOutput) {}
+        fn snapshot(&self, _: &mut Vec<u8>) -> Result<()> {
+            Ok(())
+        }
+        fn restore(&mut self, _: &[u8]) -> Result<()> {
+            Ok(())
+        }
+        fn cast_ray(&self, _: &Ray, _: &QueryFilter) -> Option<RayHit> {
+            None
+        }
+        fn cast_shape(
+            &self,
+            _: &Shape,
+            _: &Transform,
+            _: Vec3,
+            _: Scalar,
+            _: &QueryFilter,
+        ) -> Option<ShapeHit> {
+            None
+        }
+        fn overlap(&self, _: &Shape, _: &Transform, _: &QueryFilter, _: &mut Vec<StableKey>) {}
+    }
+
+    const REGION: RegionId = RegionId(1);
+
+    fn predicted(ordinal: u32) -> PredictionKey {
+        PredictionKey { player: PlayerId(1), input_tick: Tick(1), ordinal }
+    }
+
+    fn net(ordinal: u32) -> NetId {
+        NetId::from_bits(1_000 + u64::from(ordinal)).unwrap()
+    }
+
+    fn spawn(simulation: &mut Simulation, ordinal: u32) {
+        let body =
+            (Transform::IDENTITY, RigidBody::dynamic(), Collider::new(Shape::sphere(Scalar::ONE)));
+        let key = StableKey::Predicted(predicted(ordinal));
+        simulation.world_mut().spawn(key, REGION, body).unwrap();
+    }
+
+    fn bookkeeping(simulation: &Simulation) -> (usize, usize) {
+        let physics = simulation.world().service::<Physics>().unwrap();
+        (physics.sync.unbound.len(), physics.sync.aliases.len())
+    }
+
+    #[test]
+    fn a_bound_predicted_body_is_never_looked_up_again() {
+        let mut types = TypeTable::new();
+        register_types(&mut types).unwrap();
+        let mut simulation = SimulationBuilder::new(WorldKind::Server, types)
+            .setup(|world| setup(world, Box::new(Null(0)), PhysicsConfig::default()))
+            .systems(register_systems)
+            .build()
+            .unwrap();
+        let region = RegionConfig { id: REGION, seed: 1, mode: RegionMode::Simulated };
+        simulation.world_mut().create_region(region).unwrap();
+        let executor = Executor::builder().frame_workers(1).background_workers(1).build().unwrap();
+        let step = |simulation: Simulation| {
+            executor.block_on(simulation.step(&executor, TickInput::default())).unwrap()
+        };
+        // Forty predicted bodies, half of them bound before the first sync.
+        for ordinal in 0..40 {
+            spawn(&mut simulation, ordinal);
+            if ordinal % 2 == 0 {
+                simulation.world_mut().bind(predicted(ordinal), net(ordinal)).unwrap();
+            }
+        }
+        simulation = step(simulation);
+        assert_eq!(bookkeeping(&simulation), (20, 20), "only the unbound are looked up again");
+        // The rest bound between ticks: found at the next sync, and then looked up no more.
+        for ordinal in (1..40).step_by(2) {
+            simulation.world_mut().bind(predicted(ordinal), net(ordinal)).unwrap();
+        }
+        simulation = step(simulation);
+        assert_eq!(bookkeeping(&simulation), (0, 40));
+        // A snapshot carries the set, and a restore puts it back.
+        let world_snapshot = simulation.world().snapshot();
+        let taken = snapshot(simulation.world()).unwrap();
+        assert!(taken.sync.unbound.is_empty() && taken.sync.aliases.len() == 40);
+        // A removed body takes its alias with it; a new one is unbound until it is bound.
+        simulation.world_mut().despawn(StableKey::Predicted(predicted(0))).unwrap();
+        spawn(&mut simulation, 40);
+        simulation = step(simulation);
+        assert_eq!(bookkeeping(&simulation), (1, 39));
+        let physics = simulation.world().service::<Physics>().unwrap();
+        assert!(
+            !physics.is_body(StableKey::Net(net(0))) && physics.is_body(StableKey::Net(net(1)))
+        );
+        simulation.world_mut().restore(&world_snapshot).unwrap();
+        restore(simulation.world_mut(), &taken).unwrap();
+        assert_eq!(bookkeeping(&simulation), (0, 40));
+    }
 }

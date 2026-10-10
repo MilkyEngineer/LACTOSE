@@ -10,10 +10,14 @@
 mod common;
 
 use common::*;
-use lactose_core::Tick;
+use lactose_core::{Result, StableKey, Tick};
 use lactose_ecs::WorldKind;
-use lactose_math::Scalar;
-use lactose_physics_api::{BodyHandle, PhysicsCommand, RigidBody, Teleported, Transform, Velocity};
+use lactose_math::{Scalar, Vec3};
+use lactose_physics_api::{
+    BodyDesc, BodyHandle, Collider, Joint, JointHandle, PhysicsBackend, PhysicsCommand,
+    QueryFilter, Ray, RayHit, RigidBody, Shape, ShapeHit, StepInput, StepOutput, Teleported,
+    Transform, Velocity,
+};
 use lactose_sim::TickDelta;
 
 fn moving(x: i32) -> Velocity {
@@ -197,4 +201,135 @@ fn a_key_despawned_at_the_post_sync_point_is_skipped() {
     h = h.run(1);
     assert_eq!(sync_calls(&h.take()), [Call::RemoveBody(gone)]);
     assert!(h.world().get::<BodyHandle>(kept).is_some());
+}
+
+/// `README.md`, "The tick", step 3: in `Stage::Physics` a write to a body the step reports
+/// is overwritten by the write-back, and one to a body it does not report is pushed at the
+/// next sync (probe I4 of the implementation review).
+#[test]
+fn a_physics_stage_write_is_overwritten_if_the_step_reports_the_body_and_pushed_if_not() {
+    let mut h = Harness::new(WorldKind::Server);
+    let (awake, resting) = (key(1), key(2));
+    h.spawn(awake, (at(0, 0, 0), moving(1), floating(), sphere()));
+    // At rest: reported by the first step, asleep and unreported after it.
+    h.spawn_body(resting, at(10, 0, 0));
+    h = h.run(3);
+    h.script().at(4, When::AfterStep, awake, Action::SetTransform(awake, at(0, 50, 0))).at(
+        4,
+        When::AfterStep,
+        awake,
+        Action::SetTransform(resting, at(10, 50, 0)),
+    );
+    h.take();
+    h = h.run(1);
+    let reported = *h.world().get::<Transform>(awake).unwrap();
+    assert_ne!(reported, at(0, 50, 0), "the write-back overwrote it");
+    assert_eq!(*h.world().get::<Transform>(resting).unwrap(), at(10, 50, 0), "it survived");
+    h = h.run(1);
+    let pushed: Vec<Call> = sync_calls(&h.take())
+        .into_iter()
+        .filter(|call| matches!(call, Call::SetTransform(..)))
+        .collect();
+    assert_eq!(pushed, [Call::SetTransform(resting, at(10, 50, 0))]);
+}
+
+/// A backend that reports the lowest key twice, the copy displaced upwards, first or last
+/// in the list: a broken promise whose outcome must not depend on where it lands.
+struct Twice {
+    inner: Fake,
+    first: bool,
+}
+
+impl PhysicsBackend for Twice {
+    fn create_body(&mut self, key: StableKey, desc: &BodyDesc<'_>) -> Result<BodyHandle> {
+        self.inner.create_body(key, desc)
+    }
+    fn remove_body(&mut self, key: StableKey) {
+        self.inner.remove_body(key);
+    }
+    fn set_body(&mut self, key: StableKey, body: Option<&RigidBody>) {
+        self.inner.set_body(key, body);
+    }
+    fn set_collider(&mut self, key: StableKey, collider: Option<&Collider>) {
+        self.inner.set_collider(key, collider);
+    }
+    fn set_transform(&mut self, key: StableKey, transform: &Transform) {
+        self.inner.set_transform(key, transform);
+    }
+    fn set_velocity(&mut self, key: StableKey, velocity: &Velocity) {
+        self.inner.set_velocity(key, velocity);
+    }
+    fn set_frozen(&mut self, key: StableKey, frozen: bool) {
+        self.inner.set_frozen(key, frozen);
+    }
+    fn create_joint(
+        &mut self,
+        key: StableKey,
+        joint: &Joint,
+        body_a: StableKey,
+        body_b: StableKey,
+    ) -> Result<JointHandle> {
+        self.inner.create_joint(key, joint, body_a, body_b)
+    }
+    fn remove_joint(&mut self, key: StableKey) {
+        self.inner.remove_joint(key);
+    }
+    fn step(&mut self, input: &StepInput<'_>, output: &mut StepOutput) {
+        self.inner.step(input, output);
+        let Some(&lowest) = output.bodies.iter().min_by_key(|state| state.key) else { return };
+        let mut copy = lowest;
+        copy.transform.translation.y += Scalar::from_i32(100);
+        if self.first {
+            output.bodies.insert(0, copy);
+        } else {
+            output.bodies.push(copy);
+        }
+    }
+    fn snapshot(&self, out: &mut Vec<u8>) -> Result<()> {
+        self.inner.snapshot(out)
+    }
+    fn restore(&mut self, bytes: &[u8]) -> Result<()> {
+        self.inner.restore(bytes)
+    }
+    fn cast_ray(&self, ray: &Ray, filter: &QueryFilter) -> Option<RayHit> {
+        self.inner.cast_ray(ray, filter)
+    }
+    fn cast_shape(
+        &self,
+        shape: &Shape,
+        pose: &Transform,
+        direction: Vec3,
+        max_distance: Scalar,
+        filter: &QueryFilter,
+    ) -> Option<ShapeHit> {
+        self.inner.cast_shape(shape, pose, direction, max_distance, filter)
+    }
+    fn overlap(
+        &self,
+        shape: &Shape,
+        pose: &Transform,
+        filter: &QueryFilter,
+        hits: &mut Vec<StableKey>,
+    ) {
+        self.inner.overlap(shape, pose, filter, hits);
+    }
+}
+
+/// Probe I3 of the implementation review: a body reported twice is written the same way
+/// whichever copy the backend lists first.
+#[test]
+fn a_body_reported_twice_is_written_the_same_whatever_the_order() {
+    let rows_after = |first: bool| {
+        let calls = CallLog::default();
+        let backend = Box::new(Twice { inner: Fake::new(calls.clone()), first });
+        let mut h = Options::new(WorldKind::Server).build_with(backend, calls);
+        h.spawn(key(1), (at(0, 0, 0), moving(1), floating(), sphere()));
+        h.spawn(key(2), (at(5, 0, 0), moving(1), floating(), sphere()));
+        h = h.run(3);
+        rows(h.world())
+    };
+    let (copy_first, copy_last) = (rows_after(true), rows_after(false));
+    assert_eq!(copy_first, copy_last);
+    // The copy with the smaller canonical bytes is kept: here the undisplaced one.
+    assert_eq!(copy_first[0].1.translation.y, Scalar::ZERO);
 }
