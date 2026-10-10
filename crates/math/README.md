@@ -21,6 +21,7 @@ any build of this workspace, with no dependence on the platform math library.
 | `Canonical` | the one route from any of the above to bytes for hashing and serialisation, and back |
 | `Reducer`, `ExactSum`, `Min`, `Max`, `IntSum` | order-independent reductions (architecture section 5.2) |
 | `render::RenderPosition` | render space: 32-bit grid cell plus 32-bit float offset (architecture section 12.4) |
+| `lactose_reflect::Field` impls | so components hold the math types: `Scalar` is a `ScalarField` reporting its canonical bits under the tag `Scalar64` (or `Scalar32`), and `Vec2`, `Vec3`, `Vec4`, `Quat`, `Mat3`, `Mat4` and `Transform` are structs of their fields with IDs 1, 2, ... in declaration order, as `#[value]` would declare them |
 
 ## Rules a caller should know
 

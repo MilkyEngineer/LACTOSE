@@ -593,13 +593,20 @@ impl World {
         Ok(())
     }
 
-    /// Allocates the next runtime `NetId` from the server counter.
+    /// Allocates the next runtime `NetId` from the server counter, passing over any that
+    /// already names a live entity or a bind, such as one spawned directly with its key.
     pub fn allocate_net_id(&mut self) -> Result<NetId> {
-        let id = NetId::runtime(self.next_net_id).ok_or_else(|| {
-            Error::new(ErrorKind::ResourceExhausted, "the runtime NetId counter is exhausted")
-        })?;
-        self.next_net_id = self.next_net_id.saturating_add(1);
-        Ok(id)
+        loop {
+            let id = NetId::runtime(self.next_net_id).ok_or_else(|| {
+                Error::new(ErrorKind::ResourceExhausted, "the runtime NetId counter is exhausted")
+            })?;
+            self.next_net_id = self.next_net_id.saturating_add(1);
+            let used = self.storage.entities.contains_key(&StableKey::Net(id))
+                || self.aliases.by_net.contains_key(&id);
+            if !used {
+                return Ok(id);
+            }
+        }
     }
 
     /// The counter the next runtime `NetId` would be allocated from, for the save.

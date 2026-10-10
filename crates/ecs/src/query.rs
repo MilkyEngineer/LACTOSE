@@ -154,8 +154,12 @@ impl Filter {
                 assert!(info.is_some_and(is_tracked), "`Changed` needs a tracked column");
             }
         }
-        let changed_after =
-            Stamp::new(lactose_core::Tick(now.tick.0.saturating_sub(1)), now.position);
+        // One tick back from now; at tick zero there is no earlier tick, and every stamp is
+        // after the start of history.
+        let changed_after = match now.tick.0.checked_sub(1) {
+            Some(previous) => Stamp::new(lactose_core::Tick(previous), now.position),
+            None => Stamp::ZERO,
+        };
         Self { access, changed_after }
     }
 

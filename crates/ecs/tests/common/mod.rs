@@ -381,11 +381,6 @@ pub fn populate(world: &mut World) {
             ),
         )
         .unwrap();
-    if world.kind() == WorldKind::Server {
-        // The two keys above came from the server counter.
-        world.allocate_net_id().unwrap();
-        world.allocate_net_id().unwrap();
-    }
 }
 
 // ---- Helpers ----

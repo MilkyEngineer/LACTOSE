@@ -9,13 +9,14 @@ against.
 | Determinism boundary | inside |
 | Unsafe | yes, see `SAFETY.md` |
 
-**Status: facade.** Every public signature is final and every body is `todo!()`. The naive
-single-threaded implementation replaces the bodies, the `#[system]` and `#[finalize]`
-expansions and the hidden `__private` items, without changing a public signature; it removes
-the crate-level `allow(dead_code, unused_variables)` with the last `todo!()`. Architecture
-sections 5.2, 6 and 6.1 are the design; where this file and the architecture disagree, the
-architecture wins and this file is wrong. Decision D114 records the choices the sections left
-open and what the design review changed.
+**Status: naive implementation.** Every behaviour below is implemented and tested; nothing
+is fast. Storage is real (archetypes, chunks, column ticks, row stamps, SOUR's layout
+options), and a schedule run is one graph node on the executor that runs every sync point
+and every system in execution order on one worker, without forking over chunks. Milestone 1
+measures and rewrites the hot paths behind the same surface. Architecture sections 5.2, 6
+and 6.1 are the design; where this file and the architecture disagree, the architecture
+wins and this file is wrong. Decision D114 records the choices the sections left open and
+what the design review changed.
 
 Amending a signature is allowed in the change that needs it. Say so in the change description
 and list what changed, because `sim`, `predict`, `physics-api`, `net`, `persist`,
@@ -39,8 +40,18 @@ and list what changed, because `sim`, `predict`, `physics-api`, `net`, `persist`
 | `WorldSnapshot` | The prediction world's rollback state |
 | `World::load_region`, `World::export_region`, `RegionRows` | Bulk copy of region rows and resources to and from `lactose_bundle` documents |
 
-The hidden `__private` module and the hidden items of `SystemDescriptor`, `Bundle` and
-`Kernel` are the macro's and may change with it.
+The hidden `__private` module and the hidden items of `SystemDescriptor`, `Bundle`,
+`QueryItem`, `QueryItems` and `Kernel` are the macro's and the implementation's, and may
+change with them. Their shape today:
+
+| Item | What it is |
+|---|---|
+| `Kernel { run, finalize, reducer }` | The entry points: `fn(&mut Invocation)` each, and a reduction's `ReducerOps` (how to make and merge its partials without naming the reducer) |
+| `Invocation<'r, 'j>` | One value per parameter, prepared from the access table by the schedule, each taken once; and a reduction's partial or merged total |
+| `Fetch<'r, 'j>`, `fetch(invocation, index)` | How each parameter type is made from its prepared value; implemented for exactly the `SystemParam` types |
+| `reduce::<R>(invocation, item)`, `finish::<R>(invocation)` | A kernel's item into the partial; the merged total out for the finalize |
+| `Finalize<O>` | What `#[finalize(f)]` emits as `const __finalize_f`: the finalize's access table and its entry point, built by an `unsafe` constructor |
+| `BundleOut::push`, `QueryItem::fetch_item`, `QueryItems::{access, fetch_items}` | A bundle's components without their types; a query row's items |
 
 ## The `#[system]` attribute
 
@@ -80,8 +91,12 @@ What it emits, and what the function keeps:
   under the external-macro exemption and that crate may keep `#![forbid(unsafe_code)]`
   (architecture section 21, as for `#[component]`).
 - For `#[finalize(f)]` on `fn g(out: R::Output, params..)`: the hidden entry point that `F`
-  names by convention, `__finalize_f`, so the two attributes meet without seeing each other.
-  A missing finalize for a reduction is the compile error "cannot find `__finalize_f`".
+  names by convention, `const __finalize_f: Finalize<R::Output>` with the function's
+  visibility, so the two attributes meet without seeing each other. A missing finalize for
+  a reduction is the compile error "cannot find value `__finalize_f`"; a first parameter
+  that is not `R::Output` is "mismatched types" at the attribute.
+- `tests/compile_fail.rs` checks every error the macro reports and that a crate with
+  `#![forbid(unsafe_code)]` and `#![deny(warnings)]` compiles every kind of system.
 
 What a system is, from its parameters (`SystemParam` has the table):
 
@@ -110,8 +125,11 @@ What a system is, from its parameters (`SystemParam` has the table):
   parameters (`&T`, `Mut<T>`, `Option<&T>`, `Option<Mut<T>>`) on one component or
   `Without<T>` beside any parameter on `T` (`Changed<T>` and `With<T>` combine with one data
   parameter on `T`), `Mut` on a world-maintained or reference-bearing component, `Changed`
-  on an untracked column. A per-region system whose region lacks a named `RegionRes` is
-  skipped in that region.
+  on an untracked column; and (`ScheduleError::InvalidParameter`) a component parameter or
+  `&mut World` in a finalize, `&mut World` outside an exclusive system, `Commands`, `Job` or
+  `&mut World` twice, or `ResMut<T>` beside another parameter on `T`, each of which would
+  hand one parameter what another holds. A per-region system whose region lacks a named
+  `RegionRes` is skipped in that region.
 
 ## Behaviour the signatures cannot express
 
@@ -143,8 +161,16 @@ What a system is, from its parameters (`SystemParam` has the table):
   passes on; in a client or prediction world the spawn is dropped and logged. The input
   tick is the slot the input is applied for, also when the server substitutes a previous
   input for a lost one (architecture section 9.2); re-simulation re-derives the same keys
-  because the input-tick table is set every tick.
+  because the input-tick table is set every tick. Whether the source has `ClaimedBy` is
+  read when its kernel runs, not at apply, so an earlier command of the same apply cannot
+  change the key. The hashed bytes are the source's canonical key (one tag byte, 1 `Net`,
+  2 `Predicted`, 3 `Placeholder`, then its words little-endian: the `NetId`'s 64 bits, or
+  player, input tick and ordinal as 32 bits each), the system key as 64 bits and the spawn
+  index as 32 bits, little-endian, seed zero; both machines must hash these exact bytes.
 - `World::spawn` takes the key: replication and prediction spawn with the server's key.
+  The direct methods (`spawn`, `insert`) rewrite a bound `Net` key in a reference field to
+  the origin key but keep a reference to an entity that does not exist yet, as a load
+  does, since replicated entities arrive in any order; only command apply empties it.
 - `Ctx::rng(k)` is keyed by the region seed, the tick, the system, the invoking entity's
   origin key and `k`, so two entities rolling for one target draw different streams, and a
   placeholder is keyed by its spawn index.
@@ -156,9 +182,12 @@ What a system is, from its parameters (`SystemParam` has the table):
   a system, sources ordered as the once-per-tick invocation, per-region invocations by
   `RegionId`, then entity sources by origin key. Events order the same way. Commands
   against a missing entity, moves to an unloaded region and region-less spawns are dropped
-  and logged; a reference to a missing entity is written empty. `despawn` and
-  `move_to_region` take the entities the target owns with it, and a later command in the
-  same apply may move an owned entity again.
+  and logged at target `casein`, as are a spawn that names `InRegion` or `PredictedOrigin`
+  and a write that fails validation; a reference to a missing entity is written empty.
+  `despawn` and `move_to_region` take the entities the target owns with it, and a later
+  command in the same apply may move an owned entity again. `Commands::set` and
+  `Commands::remove` of `InRegion` or `PredictedOrigin` panic when recorded, as the direct
+  methods do.
 - Relationship fields (`EntityRef` fields, `OwnedBy`) and `ClaimedBy` are written through
   `Commands::set`, `Commands::remove` or the direct methods, never through `Mut`, so the
   reverse index (`World::referrers`, `World::owned_by`) stays consistent; the schedule
@@ -186,10 +215,14 @@ What a system is, from its parameters (`SystemParam` has the table):
   buffer. In a tick the first stage's sync point is the input sync point: transient columns
   are zeroed and events, channels and input ticks cleared before its exclusive systems,
   which is where `sim`, `net` and `asset` apply inputs, staged state and version tables.
-  An exclusive system runs as the only live node of its run.
+  An exclusive system runs as the only live node of its run. An exclusive system ordered
+  after a non-exclusive system of its own stage cannot run there and is a
+  `ScheduleError::Cycle`.
 - Within a stage, two systems that touch one target with at least one write must be
   ordered by sets or `after` edges; otherwise the build fails. Non-conflicting systems run
   in parallel. The execution order is the topological order with ties by `SystemKey`.
+  `ScheduleBuilder::stage` takes the stage's sets as any slice, so `&[&MOVEMENT]` works in
+  a function; the sets themselves are statics.
 - `Changed<T>` in system S passes rows whose change stamp is after S's position in the
   previous tick and before it in this one: each change is seen exactly once by each reader,
   whether it came from a system ordered before S, a command at a sync point or direct
@@ -197,7 +230,17 @@ What a system is, from its parameters (`SystemParam` has the table):
   position) on tracked columns only, so `Changed` on an untracked column is rejected and
   `changed_since` on one panics. A restore puts stamps back verbatim and a correction
   written through `ColumnMut::write` without recording leaves them alone, so a
-  re-simulated tick sees the client's own change history, which is not the server's.
+  re-simulated tick sees the client's own change history, which is not the server's. In a
+  `run_pass`, which has no previous tick to measure from, `Changed<T>` passes what changed
+  since the same schedule's previous pass of the epoch; in `World::query`, what changed
+  after the current point of the previous tick (everything at tick zero).
+- A run is one graph node on the executor, named `casein::tick` or `casein::pass`, which
+  runs every sync point and every system in execution order on one worker; the world moves
+  into the node and back out when the run resolves. If the executor has shut down first the
+  run resolves to `Cancelled` before anything ran, and the world drops with the node. The
+  layout options are honoured: chunk jobs are issued in `chunk_order`, rows are permuted
+  within their chunks at every sync point, and a reduction's partials are split into
+  batches of random size and merged.
 - `run_tick` takes the world by value and hands it back when the tick resolves; the future
   is `Send` and is driven by the timer root task, which owns the world and the schedule. On
   an error the world is not handed back (`Schedule::prepare` checks what can fail before
@@ -233,7 +276,14 @@ What a system is, from its parameters (`SystemParam` has the table):
   system touches. Tracked columns (replicated or extracted) have a stamp per row, set by
   `Mut` on mutable dereference, by `Commands::set`, `World::insert` and `World::get_mut`,
   and by `ColumnMut::write` for the rows it records as dirty. `Mut::set_if_neq` compares
-  bytes, which is exact for a reflected component, and marks nothing when equal.
+  bytes, which is exact for a reflected component, and marks nothing when equal. A move of
+  a row between chunks (compaction, an archetype change, a permutation) carries its stamp
+  and raises the destination chunk's column tick to the source's, so a consumer that skips
+  chunks by column tick misses nothing. `ColumnRef::column_tick` and `row_ticks` are ticks,
+  not points: a write made after a mark in the mark's own tick shows the mark's tick, so a
+  consumer that needs the exact point uses `changed_since`.
+- At the input sync point a transient column's rows are zeroed, and a tracked row whose
+  bytes were not already zero is stamped there.
 - `World::columns` yields one slice per chunk with the rows' keys and regions, for passes
   that fork over chunks (extract, replication gather, the world hash). Results keyed by
   anything but `StableKey` are wrong, and SOUR's layout mode catches them. `Query::for_each`
@@ -262,7 +312,7 @@ What a system is, from its parameters (`SystemParam` has the table):
   resources; diffing against the baseline into an `Overlay` is `lactose-persist`'s, and the
   world hash is `lactose-sim`'s, over `columns_erased` and `region_resources_erased`.
 
-**Not in the facade**
+**Not in this crate yet**
 
 - The overload ladder's decimation of non-player systems in the outer activation ring
   (architecture section 9.7) and `ordered` or per-region reductions (section 5.2) are
@@ -270,6 +320,22 @@ What a system is, from its parameters (`SystemParam` has the table):
 
 ## Proof for milestone 0
 
-The facade proves nothing. The implementation lane adds the tests this crate's README then
-lists; milestone 0 requires it to pass Miri, and milestone 1 requires SOUR in workers,
+The tests in `tests/`, each a nextest test that asserts on counts and orders and never on
+timing; under Miri a representative quarter of the layouts runs. Milestone 0 requires
+`cargo +nightly miri test -p lactose-ecs` to pass; milestone 1 requires SOUR in workers,
 repeat, layout and chaos modes.
+
+| File | What it proves |
+|---|---|
+| `structure.rs` | Spawn, get, insert, remove, despawn, region moves and ownership migration, directly and through commands, each in the structural log with its tick; dropped commands; emptied references |
+| `systems.rs` | The section 6.1 systems, `#[finalize]` included, for several ticks in a server and a prediction world; the prediction filter |
+| `commands.rs` | Apply order (execution order, source key, sequence), the same under every layout |
+| `predicted.rs` | Predicted keys equal on both machines, unshifted by a server-only spawn; collisions; binds and aliases; `PredictedOrigin` and a reference to the entity through export and load, byte for byte |
+| `events.rs` | Event order and clearing, `EventsBeforeEmitter`, channels across stages |
+| `schedule_errors.rs` | Every `ScheduleError` variant; `run_tick` failing on `prepare` and on shutdown |
+| `change.rs` | `Mut` and `set_if_neq` stamps, fresh and stale marks, `Changed<T>` seen once per reader, `ColumnMut::write` with and without dirty rows, column ticks, the 2^30 rebase |
+| `snapshot.rs` | Ten ticks, a snapshot at three, a restore and a re-run equal in every column, row tick and `Changed` set; presentation events deduplicated and cancelled; stale cursors; binds kept; pruning |
+| `bulk.rs` | A baseline and an overlay with every record kind, diffed back to the same overlay under every layout; region resources; schema mismatches |
+| `layout.rs` | One program under every layout: identical exports, structural logs, reductions and presentation events |
+| `pass.rs`, `query.rs` | `run_pass` with a fork over columns; whole-world queries in key order |
+| `compile_fail.rs` | What `#[system]` and `#[finalize]` reject, and what they accept under `#![forbid(unsafe_code)]` |

@@ -57,9 +57,6 @@ fn run(layout: LayoutConfig) -> (Vec<(StableKey, Origin)>, Counter, Vec<&'static
         world.spawn(net(id), REGION, (Counter(0),)).unwrap();
     }
     world.spawn(net(TARGET), REGION, (pos(0, 0),)).unwrap();
-    for _ in 0..40 {
-        world.allocate_net_id().unwrap();
-    }
     let mut schedule = Schedule::builder(WorldKind::Server);
     schedule.stage("commands", &[]).add(&ORDER_B).add(&ORDER_A);
     let mut schedule = schedule.build().unwrap();

@@ -245,3 +245,25 @@ fn a_writing_system_raises_the_column_tick_of_every_chunk_it_runs_over() {
     );
     assert_eq!(world.get::<Counter>(net(5)), Some(&Counter(1)));
 }
+
+#[test]
+fn every_two_to_the_thirty_ticks_the_stamps_are_clamped_and_an_epoch_starts() {
+    let executor = executor();
+    let mut world = world(WorldKind::Server, LayoutConfig::default());
+    world.spawn(net(1), REGION, (Counter(0),)).unwrap();
+    let rebase = 1 << 30;
+    world.set_tick(t(rebase - 2)).unwrap();
+    let mut builder = Schedule::builder(WorldKind::Server);
+    builder.stage("bump", &[]).add(&BUMP);
+    let mut schedule = builder.build().unwrap();
+
+    world = tick(&mut schedule, world, &executor);
+    let mark = world.mark();
+    let mut cursor = world.structural_log().cursor();
+    assert_eq!(world.columns::<Counter>().next().unwrap().row_ticks().unwrap(), [t(rebase - 1)]);
+    world = tick(&mut schedule, world, &executor);
+    assert_eq!(world.tick(), t(rebase), "the tick itself is never rebased");
+    assert!(!world.is_current(mark), "the rebase starts an epoch");
+    assert!(world.structural_log().since(&mut cursor).is_none());
+    assert_eq!(world.columns::<Counter>().next().unwrap().row_ticks().unwrap(), [t(rebase)]);
+}

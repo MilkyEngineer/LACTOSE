@@ -139,8 +139,6 @@ fn channel_entries_reach_later_stages_with_keys_resolved_and_clear_at_the_input_
     let executor = executor();
     let mut world = world(WorldKind::Server, LayoutConfig::default());
     world.spawn(net(5), REGION, (Counter(0),)).unwrap();
-    world.allocate_net_id().unwrap();
-    world.allocate_net_id().unwrap();
     world.insert_service::<Seen>(Box::new(Mutex::new(Vec::new())));
     let mut builder = Schedule::builder(WorldKind::Server);
     builder.stage("write", &[]).add(&PUSH_SPAWNED).add(&COUNT_IMPULSES);
@@ -150,7 +148,7 @@ fn channel_entries_reach_later_stages_with_keys_resolved_and_clear_at_the_input_
     world = tick(&mut schedule, world, &executor);
     let seen = std::mem::take(&mut *world.service_mut::<Seen>().unwrap().get_mut().unwrap());
     // The writing stage saw nothing; the next stage saw the entry with its key resolved.
-    assert_eq!(seen, [(net(3), 1)]);
+    assert_eq!(seen, [(net(1), 1)]);
     world = tick(&mut schedule, world, &executor);
     assert!(world.take_channel::<Physics>().is_empty(), "the input sync point cleared it");
 }

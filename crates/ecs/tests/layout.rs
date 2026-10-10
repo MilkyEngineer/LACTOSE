@@ -51,7 +51,6 @@ fn run(layout: LayoutConfig) -> Outcome {
             }
             _ => world.spawn(net(id), region, (Counter(0), Health(50), mass)).unwrap(),
         }
-        world.allocate_net_id().unwrap();
     }
     let mut builder = lactose_ecs::Schedule::builder(WorldKind::Server);
     builder.stage("input", &[&sets::INPUT]).add(&READ_INPUT);

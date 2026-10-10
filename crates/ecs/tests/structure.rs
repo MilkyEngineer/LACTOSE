@@ -172,7 +172,6 @@ fn commands_that_cannot_apply_are_dropped_and_dangling_references_emptied() {
     let executor = executor();
     let mut world = world(WorldKind::Server, LayoutConfig::default());
     world.spawn(net(1), REGION, (pos(0, 0),)).unwrap();
-    world.allocate_net_id().unwrap();
     let mut schedule = Schedule::builder(WorldKind::Server);
     schedule.stage("script", &[]).add(&BAD_COMMANDS);
     let mut schedule = schedule.build().unwrap();
