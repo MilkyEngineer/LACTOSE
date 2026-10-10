@@ -8,14 +8,14 @@
 use lactose_input::{Actions, PlayerInput};
 
 /// What the sources produced for one frame, before quantisation: movement in the player's
-/// frame, the camera's absolute yaw and pitch in radians, and the actions held. Floats,
-/// outside the boundary.
+/// frame, the camera's absolute yaw and pitch in radians, the actions held, and the
+/// actions held at any poll since the last tick. Floats, outside the boundary.
 ///
 /// A frame starts with [`begin_frame`](Self::begin_frame), which empties `held` and the
-/// movement and keeps the angles, which are absolute and accumulate; each source then
-/// folds its state in through [`hold`](Self::hold), [`offer_movement`](Self::offer_movement)
-/// and [`turn`](Self::turn), so sources combine instead of overwriting each other in poll
-/// order.
+/// movement and keeps the angles, which are absolute and accumulate, and `latched`, which
+/// accumulates until a tick; each source then folds its state in through
+/// [`hold`](Self::hold), [`offer_movement`](Self::offer_movement) and [`turn`](Self::turn),
+/// so sources combine instead of overwriting each other in poll order.
 #[derive(Clone, Copy, PartialEq, Debug, Default)]
 pub struct RawSample {
     /// Movement to the right, in `[-1, 1]`; a keyboard composes it from keys, a gamepad
@@ -34,22 +34,34 @@ pub struct RawSample {
     pub pitch: f32,
     /// The actions held this frame: the union of every source's.
     pub held: Actions,
+    /// The actions held at any poll since the last tick: `hold` adds to it and
+    /// [`Quantiser::next`] takes and clears it, so a tap pressed and released between two
+    /// polls still reaches a sample as one tick of held. `begin_frame` keeps it.
+    pub latched: Actions,
 }
 
 impl RawSample {
-    /// No movement, facing `-Z`, level, nothing held; also `Default`.
-    pub const IDLE: Self =
-        Self { movement_x: 0.0, movement_y: 0.0, yaw: 0.0, pitch: 0.0, held: Actions::EMPTY };
+    /// No movement, facing `-Z`, level, nothing held or latched; also `Default`.
+    pub const IDLE: Self = Self {
+        movement_x: 0.0,
+        movement_y: 0.0,
+        yaw: 0.0,
+        pitch: 0.0,
+        held: Actions::EMPTY,
+        latched: Actions::EMPTY,
+    };
 
-    /// Starts a frame: `held` becomes empty and the movement zero; `yaw` and `pitch` keep
-    /// their values, since they are absolute. The input task calls it before polling the
-    /// sources, so a key released on one source cannot be held over by a stale value.
+    /// Starts a frame: `held` becomes empty and the movement zero; `yaw`, `pitch` and
+    /// `latched` keep their values, since the angles are absolute and the latch
+    /// accumulates until a tick. The input task calls it before polling the sources, so a
+    /// key released on one source cannot be held over by a stale value.
     pub fn begin_frame(&mut self) {
         todo!()
     }
 
-    /// Adds `actions` to `held`: `held.union(actions)`. How a source reports what it holds,
-    /// so two sources holding the same action agree and neither clears the other's.
+    /// Adds `actions` to `held` and to `latched`: `held.union(actions)` and
+    /// `latched.union(actions)`. How a source reports what it holds, so two sources
+    /// holding the same action agree and neither clears the other's.
     pub fn hold(&mut self, actions: Actions) {
         todo!()
     }
@@ -87,7 +99,8 @@ impl Quantiser {
         Self { previous_held: Actions::EMPTY }
     }
 
-    /// The quantised sample for the next tick, from `raw`:
+    /// The quantised sample for the next tick, from `raw`, which it takes mutably to
+    /// consume the latch:
     ///
     /// - `movement`: the vector `(movement_x, movement_y)` scaled down to the unit disc if
     ///   longer (a NaN component counts as zero), then each component times
@@ -99,12 +112,14 @@ impl Quantiser {
     /// - `pitch`: `pitch` clamped to `[-PI/2, PI/2]`, divided by `TAU`, times
     ///   `UNITS_PER_TURN`, rounded to nearest, clamped to
     ///   [`Pitch::LIMIT`](lactose_input::Pitch::LIMIT); a NaN pitch quantises to zero;
-    /// - `held`: `raw.held`; `pressed`: `held.without(previous_held)`; `released`:
+    /// - `held`: `raw.held.union(raw.latched)`, and `raw.latched` becomes empty, so a tap
+    ///   pressed and released between two polls is one tick of held: pressed at this tick,
+    ///   released at the next; `pressed`: `held.without(previous_held)`; `released`:
     ///   `previous_held.without(held)`; then `previous_held` becomes `held`.
     ///
     /// The result always passes [`PlayerInput::validate`]. This is the one place a float
     /// becomes an integer, and the integer is what both machines simulate.
-    pub fn next(&mut self, raw: &RawSample) -> PlayerInput {
+    pub fn next(&mut self, raw: &mut RawSample) -> PlayerInput {
         todo!()
     }
 }

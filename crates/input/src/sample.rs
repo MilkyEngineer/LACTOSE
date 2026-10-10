@@ -355,14 +355,16 @@ impl PlayerInput {
         todo!()
     }
 
-    /// This sample, the first one delivered after one or more substitutes, with the edges
-    /// the gap swallowed restored against `applied`, the last substitute applied:
-    /// `pressed` gains `held.without(applied.held)` and `released` gains
-    /// `applied.held.without(held)`. The client computed this sample's edges against its
-    /// own previous sample, which was lost, so a press whose first sample was lost would
-    /// otherwise never fire for the whole hold. The result passes
-    /// [`validate`](Self::validate) when `self` does. `net` applies it once, to the first
-    /// delivered sample after a substitute, and the journal records the applied bytes.
+    /// This sample, the first one delivered after one or more substitutes, with its edges
+    /// recomputed against `applied`, the last substitute applied, replacing the ones the
+    /// client computed against its own previous sample, which was lost: `pressed =
+    /// held.without(applied.held)` and `released = applied.held.without(held)`. A press
+    /// whose first sample was lost therefore fires now, and no release or re-press of an
+    /// action that no applied sample held can fire, so every applied sample's edges match
+    /// the applied `held` sequence; what it costs is a tap, or a release and re-press,
+    /// wholly inside the gap. The result passes [`validate`](Self::validate) when `self`
+    /// does. `net` applies it once, to the first delivered sample after a substitute, and
+    /// the journal records the applied bytes.
     #[must_use]
     pub fn after_substitute(&self, applied: &PlayerInput) -> Self {
         todo!()

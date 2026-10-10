@@ -289,11 +289,16 @@ pitch for movement direction)
   the client computed the first delivered sample's edges against its own previous sample,
   which was lost, so a press whose first sample was lost would otherwise never fire for the
   whole hold. `net` applies it once, to the first delivered sample after one or more
-  substitutes, with `applied` the last substitute applied: `pressed` gains
-  `held.without(applied.held)` and `released` gains `applied.held.without(held)`. The
-  result passes `validate` when the input does, and the journal records the applied
-  bytes, so a replay needs no rule of its own. The press fires at most a few ticks late,
-  on the server and, once the correction arrives, on the client.
+  substitutes, with `applied` the last substitute applied, and it replaces the sample's
+  edges rather than adding to them: `pressed = held.without(applied.held)` and
+  `released = applied.held.without(held)`. Replacing is what keeps every applied sample's
+  edges consistent with the applied `held` sequence: a union would keep the client's own
+  edges, and so release an action no applied sample held (a hold-to-aim throw firing with
+  no aim) or re-press one the substitute already held. What it costs is a tap, or a
+  release and re-press, wholly inside the gap. The result passes `validate` when the
+  input does, and the journal records the applied bytes, so a replay needs no rule of its
+  own. The press fires at most a few ticks late, on the server and, once the correction
+  arrives, on the client.
 
 ## Not in this crate yet
 
@@ -321,4 +326,4 @@ Nothing runs yet. The implementation lane replaces every `todo!()` and proves:
 | The applier | Under SOUR: a server with a joined player, a frame with that player's sample, then a kernel taking `&PlayerInput` sees the value; a tick without a sample sees `IDLE`; a malformed sample leaves the world unchanged and the tick runs; a sample for a player without an entity is `Ok(())` and changes nothing; two claimed rows resolve to the lesser key under every layout; the lookup costs the player's claims, not the world (a world of 100k rows does not change its time); the prediction world applies the same bytes to the same bits |
 | The writer declaration | A schedule with a kernel reading `PlayerInput` in `Stage::Simulation` builds with `register_systems` and fails with `TransientBeforeWriter` without it |
 | The history | Insert eight ticks in order, then a ninth: the first is gone; a duplicate returns `false` and keeps the first; out-of-order inserts yield ascending from `iter`; a tick older than the window is ignored; `insert_bounded` refuses `consumed`, `consumed + CAPACITY + 1` and `newest + 2^30` and accepts `consumed + 1` and `consumed + CAPACITY`; across the `u32` wrap the same |
-| Substitution | `substitute` keeps `held`, movement, yaw and pitch and clears `pressed` and `released`; `IDLE.substitute() == IDLE`; `after_substitute` of a sample holding `Throw` after a substitute that did not sets `pressed` to include `Throw` and passes `validate`; of a sample that stopped holding what the substitute held sets `released`; applied to a sample already carrying the edge it changes nothing |
+| Substitution | `substitute` keeps `held`, movement, yaw and pitch and clears `pressed` and `released`; `IDLE.substitute() == IDLE`; `after_substitute` of a sample holding `Throw` after a substitute that did not sets `pressed` to exactly `Throw` and passes `validate`; of a sample that stopped holding what the substitute held sets `released` to exactly that; of a sample whose own `released` names an action the substitute never held, or whose own `pressed` names one it already held, drops that edge; over every valid (sample, substitute) pair of a small action set, the result's edges equal the differences of the two `held` sets and `validate` accepts it |

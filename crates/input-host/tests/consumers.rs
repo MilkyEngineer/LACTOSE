@@ -43,7 +43,7 @@ impl InputTask {
     /// Called once per simulation tick, also for each catch-up tick of a frame, so the
     /// edges fire once.
     fn tick(&mut self, tick: Tick, local: PlayerId) -> TickInput {
-        let input: PlayerInput = self.quantiser.next(&self.raw);
+        let input: PlayerInput = self.quantiser.next(&mut self.raw);
         debug_assert!(input.validate().is_ok());
         self.history.insert(tick, input);
         let mut frame = TickInput::default();

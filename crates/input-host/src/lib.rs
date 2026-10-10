@@ -23,7 +23,7 @@
 //!
 //! // The input task, once per tick: poll the sources into the raw sample, publish it for
 //! // the latch, quantise it, and put the sample in the frame.
-//! fn input_tick(raw: &RawSample, quantiser: &mut Quantiser, tick: Tick) -> TickInput {
+//! fn input_tick(raw: &mut RawSample, quantiser: &mut Quantiser, tick: Tick) -> TickInput {
 //!     LATEST.publish(*raw);
 //!     let input = quantiser.next(raw);
 //!     let mut frame = TickInput::default();
@@ -64,5 +64,5 @@ const _: () = {
     send_sync::<LatestSample>();
     send::<Quantiser>();
     send::<dyn Source>();
-    assert!(size_of::<RawSample>() == 20, "five 32-bit words: what the slot publishes");
+    assert!(size_of::<RawSample>() == 24, "six 32-bit words: what the slot publishes");
 };
