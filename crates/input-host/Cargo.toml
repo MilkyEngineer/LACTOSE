@@ -1,0 +1,20 @@
+[package]
+name = "lactose-input-host"
+description = "The host side of input: raw samples and the quantiser, the latest-sample slot for the late latch, the places for sources and mapping."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+# The sample the quantiser produces and the action set the sources fill; nothing else of
+# the boundary.
+lactose-input.workspace = true
+
+[dev-dependencies]
+# The compile-only sketch of `app`'s input task builds a `TickInput` the way `app` does.
+lactose-core.workspace = true
+lactose-sim.workspace = true
+
+[lints]
+workspace = true

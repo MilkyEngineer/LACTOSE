@@ -1,0 +1,23 @@
+[package]
+name = "lactose-input"
+description = "Player input: the quantised per-tick sample the simulation reads, its byte image on the wire and in the journal, the applier that writes it, the redundancy window, and the host-side places for the latest sample, sources and mapping."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+lactose-core.workspace = true
+# The world the applier writes into, `ClaimedBy`, and the `#[system]` attribute for the
+# writer declaration.
+lactose-ecs.workspace = true
+# Every scalar and vector a kernel reads from a sample is built here from integers
+# (architecture section 8.2).
+lactose-math.workspace = true
+# `#[component]`, `#[value]` and the checked decode of a sample's bytes.
+lactose-reflect.workspace = true
+# The applier hook, `PlayerSample`, `StreamingAnchor` and the registration surface.
+lactose-sim.workspace = true
+
+[lints]
+workspace = true

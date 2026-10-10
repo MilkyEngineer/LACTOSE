@@ -35,6 +35,7 @@ and list what changed, because `sim`, `predict`, `physics-api`, `net`, `persist`
 | `Schedule`, `ScheduleBuilder`, `ScheduleError` | Stages separated by sync points; a deterministic order; `run_tick` and `run_pass`; `ScheduleBuilder::order`, an edge between two sets added by the assembler |
 | `Executor` | Re-exported from `lactose-task`: what `run_tick` and `run_pass` take, so a boundary crate that drives a schedule (`sim`, `predict`) names it without a `task` edge |
 | `RegionId`, `RegionMode`, `RegionConfig`, `InRegion`, `OwnedBy`, `ClaimedBy`, `PredictedOrigin` | Regions and the components the world maintains |
+| `World::claimed`, `Claimed` | The entities one player has claimed, from an index the world keeps beside the relationship index |
 | `Rng` | The counter-based generator, from `Ctx::rng` and `World::rng` |
 | `ChangeMark`, `World::changed_since`, `World::is_current`, `World::columns`, `ColumnMut`, `DirtyRows`, `StructuralLog`, `LogCursor` | Change state read per consumer; whole-column access that records what it changed |
 | `Query`, `QueryItems` | Whole-world iteration for exclusive code and tests, in key order |
@@ -307,6 +308,14 @@ What a system is, from its parameters (`SystemParam` has the table):
   `ClaimedBy` is written by `net` and `predict` on join and removed to release the claim.
   `OwnedBy` is a relationship. `ClaimedBy` and `InRegion` are not saved; `OwnedBy` and
   `PredictedOrigin` are.
+- `World::claimed(player)` yields the entities with `ClaimedBy { player }` in ascending
+  origin-key order, from an index the world maintains wherever `ClaimedBy` enters or
+  leaves a row (a spawn, `insert`, `remove`, a despawn, a command apply, a predicted
+  spawn's inherited claim, a region load or unload) and that a snapshot carries and a
+  restore puts back. It allocates nothing and costs the player's claims, never a scan of
+  the world: it is how an input or session applier finds the player's entity
+  (`lactose-input`'s `player_entity`), since `World::query` today visits every live
+  entity (`docs/verification.md`).
 
 **Change tracking**
 
@@ -427,4 +436,5 @@ repeat, layout and chaos modes.
 | `regressions.rs` | The findings of the pre-review: transient references in the index, pass events across a rollback, owner keys in either load order, exports after an unload, `set_tick` stamps, transient writers, double rollbacks, failed loads, resources removed mid-run |
 | `regressions_two.rs` | The findings of the second review: new chunks' column ticks above 2^31, presentation batches across the wrap, `writes` visibility by stage, a restore that revives a bound `Net` entity, `update_region_resource`, transient region resources through a reload, schedule ties, resource references through bind and restore, aliases a restore orphans |
 | `wrap_program.rs` | One program with marks, cursors, `Changed` readers, a pass, column and row ticks, presentation events and a rollback, run across the 2^30 rebase, 2^31 and the `u32` wrap, equal to a run far from any boundary |
+| `claims.rs` | The claim index behind `World::claimed`: current after every direct method, command, predicted spawn, ownership despawn, unload and restore, in key order under every layout |
 | `compile_fail.rs` | What `#[system]` and `#[finalize]` reject, and what they accept under `#![forbid(unsafe_code)]` |

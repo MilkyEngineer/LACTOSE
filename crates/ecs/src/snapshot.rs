@@ -2,7 +2,7 @@
 
 use core::any::TypeId;
 use core::num::NonZeroU64;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use lactose_core::{Error, ErrorKind, NetId, PlayerId, PredictionKey, Result, StableKey, Tick};
@@ -37,6 +37,7 @@ pub struct WorldSnapshot {
     regions: BTreeMap<RegionId, RegionState>,
     input_ticks: BTreeMap<PlayerId, Tick>,
     references: References,
+    claims: BTreeMap<PlayerId, BTreeSet<StableKey>>,
 }
 
 impl WorldSnapshot {
@@ -67,6 +68,7 @@ impl WorldSnapshot {
             regions: world.regions.clone(),
             input_ticks: world.input_ticks.clone(),
             references: world.references.clone(),
+            claims: world.claims.clone(),
         }
     }
 
@@ -110,6 +112,7 @@ impl WorldSnapshot {
         world.regions = self.regions.clone();
         world.input_ticks = self.input_ticks.clone();
         world.references = self.references.clone();
+        world.claims = self.claims.clone();
         // Binds survive a restore, so a reference the snapshot stored under a `Net` key that
         // has been bound since goes back to the origin key, as the bind left it.
         let rebinds: Vec<(NetId, PredictionKey)> = world

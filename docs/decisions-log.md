@@ -1660,6 +1660,114 @@ rationale the author supplied during the editorial pass rather than one taken fr
 - Driven by: milestone 1, the `physics-api` facade brief and its two design reviews
   (2026-10-10).
 
+**D120. The `input` facade: what sections 4, 5.3, 6.1, 8.2 and 9.2 left open** (§3, §4, §5.3,
+§6.1, §8.1, §8.2, §9.1, §9.2, §15.1, `lactose-input`, `lactose-input-host`, `lactose-ecs`)
+- Why: the facade is written before its implementation so `app`, `predict`, `net`, presentation
+  and the game crates build against the final surface; each choice below is one the sections did
+  not settle, and each is a contract in `crates/input/README.md` or
+  `crates/input-host/README.md`.
+  - *Input is two crates, split at the boundary.* `lactose-input` (the sample, its byte image,
+    the applier, the redundancy window) is inside the determinism boundary: the floats a kernel
+    reads from a sample (`aim`, `world_movement`, `radians`, `to_vec2`) are computed there,
+    under the boundary lint file and the boundary build ID, with no dependency a boundary crate
+    does not already have, and `PlayerInput` is therefore a boundary component type the section
+    9.1 protocol hash covers. `lactose-input-host` (raw samples, the quantiser, the
+    latest-sample slot, sources, mapping) is outside, and no boundary crate may depend on it;
+    the one thing that crosses is the integer sample its quantiser produces. Rules out a crate
+    that straddles the boundary (§3) and a path lint to police it.
+  - *The sample is twenty bytes of integers and the sample bytes are the component bytes.*
+    `PlayerInput` (`input::player_input`, `transient`) holds a movement vector in sixteen bits
+    per axis, absolute yaw (`u16`, wrapping) and pitch (`i16`, a quarter turn each way) in
+    1/65536 of a turn, and three 32-bit action sets (`held`, `pressed`, `released`); its
+    `repr(C)` image is `PlayerSample::sample`, the journal's bytes and the wire's, with no
+    version byte, since the component's schema version is covered by the protocol hash. A
+    journal replays on the build that wrote it; the checkpoint records no schema. Rules out a
+    separate wire struct, floats in the sample, and a derived value in the image.
+  - *`validate` enforces what kernels rely on*: the pitch limit, no `i16::MIN` axis, the unit
+    disc plus the quantiser's rounding (`x² + y² <= AXIS_SCALE² + 2·AXIS_SCALE`), `pressed ⊆
+    held`, `released ∩ held = ∅`. `net` must validate every received image and treat a failure
+    as lost, so a forged image never reaches a frame. Rules out diagonal speed and an edge every
+    tick from a modified client.
+  - *`aim` is computed, never stored.* Section 6.1's `input.aim` becomes `input.aim()`: a `Vec3`
+    from the two angles through `lactose_math` (`sin_cos`, products in a stated order) at read
+    time, so a client and the server derive identical bits from identical bytes and no float the
+    client computed enters the journal. `world_movement` and `Yaw::rotation` likewise. Rules out
+    a `Vec3` field the server would have to trust or re-verify.
+  - *The world frame is right-handed, `+Y` up, yaw zero facing `-Z`, positive yaw turning left
+    (`Quat::from_rotation_y`), positive pitch up.* Every direction a kernel reads from a sample
+    comes from `aim`, `world_movement` and `Yaw::rotation`, so the convention lives in one
+    place; the camera rig uses the same one; glTF assets face `+Z`, so the cooker turns them
+    half a turn about `+Y` so a character faces `-Z` at yaw zero (RICOTTA's rule, milestone 1
+    asset track). Rules out each game crate re-deriving directions.
+  - *Edges are the client's.* `pressed = held.without(previous_held)` and `released =
+    previous_held.without(held)` are computed once by the `Quantiser`, which holds the previous
+    `held` and runs once per tick (so catch-up ticks from one frame carry no repeated edge), and
+    travel in the sample; the server and a replay keep no button history and a sample is a pure
+    value. `throw` in 6.1 becomes `input.pressed.contains(Action::Throw)`. Rules out server-side
+    edge detection and per-player state in the applier.
+  - *Named bits and generic bits share one 32-bit mask.* Bits `0..5` are `Jump`, `Throw`,
+    `Interact`, `Sprint`, `Crouch`; bits `5..32` are the game's, assigned by the milestone 5
+    action map and read by index; naming more later adds variants and changes no encoding.
+  - *The applier writes with `World::insert`* and finds the player's entity through the ECS
+    claim index: `World::claimed(player)` yields the rows with `ClaimedBy { player }` in
+    ascending origin-key order, from an index the world maintains wherever `ClaimedBy` enters or
+    leaves a row and carries in a snapshot, and `player_entity` is the first of them that
+    carries `StreamingAnchor`, so a lookup costs the player's claims and never a scan
+    (`World::query` today visits every live entity: 5.4 ms per lookup at 100k rows). Never
+    cached: a side table is what `sim` forbids and a rollback would leave it stale. A player
+    with no entity yet (a held join) is `Ok(())`, not an error. A row keeps the component across
+    ticks and reads `IDLE` on a tick without a sample.
+  - *The transient column's declared writer is an empty exclusive system*
+    `input::player_input_writer` in `sets::APPLY`, `Stage::Input`, after `sim::sets::INPUT`,
+    declaring `writes = [PlayerInput]`: the write happened inside `sim::apply_inputs`, and the
+    declaration is what lets a kernel in `Stage::Simulation` take `&PlayerInput` (confirmed on
+    the real ECS by the review: without it, `TransientBeforeWriter`).
+  - *The redundancy window is a tick-indexed window of eight samples,* `SampleHistory`, the same
+    type on both ends: the client inserts each tick (`insert`) and packs `iter()`; the server
+    inserts every packet entry through `insert_bounded(consumed, ..)`, which stores only ticks
+    in `(consumed, consumed + CAPACITY]`, so an entry off the wire can neither move the window
+    away from the ticks still to come nor resurrect an applied tick; the first delivery of a
+    tick wins; ticks compare by wrapping difference. `REDUNDANT_SAMPLES = 8` is not part of any
+    schema; `net` may amend it and may keep a deeper buffer of its own.
+  - *Substitution and its repair are pure functions.* `PlayerInput::substitute` refines §9.2's
+    "replaced by the previous input": the previous applied sample with `pressed` and `released`
+    cleared, `IDLE` for a player with none. `after_substitute(applied)` recomputes the edges of
+    the first delivered sample after a substitute against `applied`, the last substitute
+    applied, replacing the ones the client computed against its own lost sample (`pressed =
+    held.without(applied.held)`, `released = applied.held.without(held)`), so the swallowed
+    press fires and no release or re-press of an action no applied sample held can; what it
+    costs is a tap, or a release and re-press, wholly inside the gap. `net` applies it once and
+    the journal records the applied bytes. When a tick counts as lost, the jitter window and
+    telling the client are `net`'s; `net` sets `PlayerSample::substituted`.
+  - uantisation is one host-side step,* `Quantiser::next`: floats to integers with stated
+    rounding, the movement clamped to the unit disc, the pitch to its limit, the yaw wrapped
+    into a turn; a `RawSample::latched` set, which `hold` adds to and only `Quantiser::next`
+    clears, makes a tap pressed and released between two polls one tick of held, so a sub-tick
+    tap reaches a sample; the client simulates the quantised value it sends (§9.2). The raw
+    sample combines sources instead of overwriting them: `begin_frame` empties `held` and the
+    movement each frame, sources `hold` (union), `offer_movement` (the larger magnitude wins)
+    and `turn` (the yaw is wrapped into `[-PI, PI)` after every delta, so an accumulated `f32`
+    yaw never grows coarser than a sample unit).
+  - *`LatestSample` is a sequence-locked slot holding the raw sample,* published by the input
+    task and read by the late latch without locking. Publish: compare-exchange (`Acquire`) the
+    sequence from even to odd, then `fence(Release)`, then the words `Relaxed`, then store the
+    next even value (`Release`), so a publisher may wait for a publisher, never for a reader,
+    two publishers cannot interleave, and the fence orders the word writes after the sequence
+    was taken (without it a single publisher tears under the memory model). Read: load the
+    sequence `Acquire`, the words `Relaxed`, `fence(Acquire)`, reload the sequence, retry on
+    mismatch or odd. It holds the raw floats because the latch wants the freshest rotation and
+    the quantisation step is far below a frame's resolution.
+  - *Milestone 5 gets named places only:* `sources::Source::poll(&mut self, raw: &mut
+    RawSample)` and an empty `mapping` module in `lactose-input-host`; nothing touches a device
+    or a clock.
+- What the design reviews changed (round 1: 1 blocking, 2 serious, 8 minor; round 2: 3 minor, the seqlock's release fence, replaced rather than unioned edges after a substitute, and the latched tap; `36a7083` was the facade
+  before it): the crate split at the boundary and `lactose-input` inside it; the ECS claim index
+  and `player_entity(&World, ..)` over it; `validate`'s four rules and `net`'s duty to validate;
+  the CAS seqlock contract; `insert_bounded`; `after_substitute`; the `Quantiser`; the glTF
+  half-turn and `Yaw::rotation`; the raw sample's frame start and combining rules and the
+  wrapped yaw; the `released` field; `Ok(())` for a player without an entity.
+- Driven by: milestone 1, the `input` facade brief and its first design review (2026-10-10).
+
 ## 10. Review history
 
 - **Revision 1** (`a29af04`): the design baseline.

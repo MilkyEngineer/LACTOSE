@@ -564,7 +564,9 @@ before the first step, with the state a journal recorded; state that contradicts
 (a requested region that is loaded, a held join outside the atlas) is not checked. Writing,
 reading and replaying a journal is the milestone 1 tooling's; this crate names the shape
 and the restore so `app` and the tools agree, and `tests/persist.rs` replays one from
-checkpoints across a run.
+checkpoints across a run. A journal replays on the build that wrote it: the checkpoint records
+no schema, and the protocol hash of section 9.1 is the only guard against a sample image from
+another build.
 
 ## Not in this crate yet
 

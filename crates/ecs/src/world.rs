@@ -244,6 +244,7 @@ impl WorldBuilder {
             input_ticks: BTreeMap::new(),
             log: StructuralLog::new(0),
             references: References::default(),
+            claims: BTreeMap::new(),
             events: EventStore::new(),
             channels: ChannelStore::new(),
             present: PresentLog::default(),
@@ -447,6 +448,10 @@ pub struct World {
     pub(crate) input_ticks: BTreeMap<PlayerId, Tick>,
     pub(crate) log: StructuralLog,
     pub(crate) references: References,
+    /// The claim index: every entity with `ClaimedBy { player }`, by player, in ascending
+    /// origin-key order. Maintained wherever `ClaimedBy` enters or leaves a row and carried
+    /// by a snapshot, so a lookup by player costs that player's claims, never a scan.
+    pub(crate) claims: BTreeMap<PlayerId, BTreeSet<StableKey>>,
     pub(crate) events: EventStore,
     pub(crate) channels: ChannelStore,
     pub(crate) present: PresentLog,
@@ -768,6 +773,16 @@ impl World {
     #[must_use]
     pub fn owned_by(&self, owner: StableKey) -> Entities<'_> {
         Entities { keys: self.owned(self.canonical(owner)).into_iter(), _world: PhantomData }
+    }
+
+    /// The entities with [`ClaimedBy`](crate::ClaimedBy) `{ player }`, in ascending
+    /// origin-key order, from an index the world maintains wherever `ClaimedBy` enters or
+    /// leaves a row (a spawn, `insert`, `remove`, a despawn, a command, a region load or
+    /// unload) and carries in a snapshot, so the cost is the player's claims, never a scan.
+    /// Allocates nothing. How an input or session applier finds the player's entity.
+    #[must_use]
+    pub fn claimed(&self, player: PlayerId) -> Claimed<'_> {
+        Claimed { keys: self.claims.get(&player).map(BTreeSet::iter) }
     }
 
     /// A query over every entity matching `Q`. Panics if `Q` breaks the alias rule of
@@ -1507,6 +1522,26 @@ impl World {
         }
     }
 
+    /// Adds `source` to, or removes it from, the claim index if the component is
+    /// `ClaimedBy`; the bytes have been validated. Called beside [`index_references`]
+    /// wherever a component enters or leaves a row.
+    ///
+    /// [`index_references`]: Self::index_references
+    fn index_claim(&mut self, source: StableKey, info: &TypeInfo, bytes: &[u8], add: bool) {
+        if info.key() != ClaimedBy::KEY {
+            return;
+        }
+        let claim: ClaimedBy = bytemuck::checked::pod_read_unaligned(bytes);
+        if add {
+            self.claims.entry(claim.player).or_default().insert(source);
+        } else if let Some(set) = self.claims.get_mut(&claim.player) {
+            set.remove(&source);
+            if set.is_empty() {
+                self.claims.remove(&claim.player);
+            }
+        }
+    }
+
     /// Spawns `key` in `region` with `components`, whose references are already resolved.
     /// Adds `InRegion`, and `PredictedOrigin` for a `Predicted` key that lacks it.
     pub(crate) fn spawn_entity(
@@ -1560,6 +1595,7 @@ impl World {
         self.storage.push(archetype, key, &values);
         for value in &values {
             self.index_references(key, value.info, &value.bytes, true);
+            self.index_claim(key, value.info, &value.bytes, true);
         }
         self.log.push(self.tick, StructuralChange::Spawned { key, region });
         if let StableKey::Predicted(predicted) = key {
@@ -1584,6 +1620,7 @@ impl World {
         if let Some(old) = self.storage.component(loc, info.key()) {
             let old = old.to_vec();
             self.index_references(key, info, &old, false);
+            self.index_claim(key, info, &old, false);
             self.storage.write(loc, info.key(), component.bytes(), stamp);
         } else {
             let (_, mut values) = self.storage.take(key).expect("the entity is live");
@@ -1600,6 +1637,7 @@ impl World {
             self.log.push(self.tick, StructuralChange::Added { key, component: info.key() });
         }
         self.index_references(key, info, component.bytes(), true);
+        self.index_claim(key, info, component.bytes(), true);
         Ok(())
     }
 
@@ -1618,6 +1656,7 @@ impl World {
         let archetype = self.storage.archetype(&infos);
         self.storage.push(archetype, key, &values);
         self.index_references(key, removed.info, &removed.bytes, false);
+        self.index_claim(key, removed.info, &removed.bytes, false);
         self.log.push(self.tick, StructuralChange::Removed { key, component });
         Some(removed.bytes)
     }
@@ -1635,6 +1674,7 @@ impl World {
         let (_, values) = self.storage.take(key).expect("the entity is live");
         for value in &values {
             self.index_references(key, value.info, &value.bytes, false);
+            self.index_claim(key, value.info, &value.bytes, false);
         }
         self.log.push(self.tick, StructuralChange::Despawned { key, region });
         if let StableKey::Predicted(predicted) = key {
@@ -1675,6 +1715,20 @@ impl Iterator for Entities<'_> {
 
     fn next(&mut self) -> Option<Self::Item> {
         self.keys.next()
+    }
+}
+
+/// Iterates the entities one player has claimed, by origin key, from
+/// [`World::claimed`].
+pub struct Claimed<'w> {
+    keys: Option<std::collections::btree_set::Iter<'w, StableKey>>,
+}
+
+impl Iterator for Claimed<'_> {
+    type Item = StableKey;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.keys.as_mut()?.next().copied()
     }
 }
 
