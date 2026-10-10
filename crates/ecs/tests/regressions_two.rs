@@ -246,9 +246,14 @@ fn s2_a_revived_net_entity_keeps_the_references_to_it() {
     let referrers: Vec<StableKey> = world.referrers(net(77)).map(|r| r.source).collect();
     assert_eq!(referrers, [net(10)]);
     assert_eq!(world.referrers(StableKey::Predicted(pk(1))).count(), 0);
-    // `lactose-predict` despawns the stale entity; the bind is kept.
+    // `lactose-predict` despawns the stale entity; the bind is kept, and the references
+    // that named it go to the origin key, in storage and in the reverse index.
     world.despawn(net(77)).unwrap();
     assert_eq!(world.alias(pk(1)), Some(n(77)));
+    assert_eq!(thrower(&world, net(10)), Some(StableKey::Predicted(pk(1))));
+    let referrers: Vec<StableKey> =
+        world.referrers(StableKey::Predicted(pk(1))).map(|r| r.source).collect();
+    assert_eq!(referrers, [net(10)]);
 }
 
 // ---- S3: region resource updates are validated ----

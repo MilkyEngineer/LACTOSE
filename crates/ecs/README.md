@@ -354,7 +354,8 @@ What a system is, from its parameters (`SystemParam` has the table):
   the origin key at the restore, as the bind left it, in storage and in the reverse index;
   unless the restore revives a `Net` entity of that key (it was live at the snapshot and
   despawned before the bind), whose references stay on it. That revived entity is stale
-  server state, and `lactose-predict` despawns it again before it re-simulates.
+  server state, and `lactose-predict` despawns it again before it re-simulates; despawning a
+  bound `Net` entity moves the references to it to the origin key.
   `World::set_rollback_horizon` is how the world learns what it may prune: the ring's
   oldest tick from `lactose-predict`, the current tick on the server. `World::bind` refuses
   a `NetId` that names a live entity of its own, whose references the bind would redirect.

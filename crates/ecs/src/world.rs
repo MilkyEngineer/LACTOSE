@@ -1203,7 +1203,8 @@ impl World {
     /// never taken are dropped. A reference the snapshot holds under a `Net` key bound since
     /// goes back to the origin key, as the bind left it, unless the restore revives a `Net`
     /// entity of that key, despawned after the snapshot and bound before the restore: its
-    /// references stay on it, and `lactose-predict` despawns it again. A predicted entity
+    /// references stay on it until `lactose-predict` despawns it again, which moves them to
+    /// the origin key. A predicted entity
     /// live before and absent after is recorded as despawned at the snapshot's tick, for
     /// [`set_rollback_horizon`](Self::set_rollback_horizon). Fails if the snapshot is from
     /// another world, or during a schedule run.
@@ -1621,6 +1622,14 @@ impl World {
         self.log.push(self.tick, StructuralChange::Despawned { key, region });
         if let StableKey::Predicted(predicted) = key {
             self.despawned_predicted.insert(predicted, self.tick);
+        }
+        // A bound `Net` key whose own entity is gone (one a restore revived) names the
+        // predicted entity again: the references to it go to the origin key, as the bind
+        // left them.
+        if let StableKey::Net(net) = key
+            && let Some(&predicted) = self.aliases.by_net.get(&net)
+        {
+            self.rekey_references(key, StableKey::Predicted(predicted));
         }
     }
 
