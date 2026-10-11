@@ -20,6 +20,7 @@ use lactose_physics_api::Physics;
 use lactose_reflect::TypeInfo;
 use lactose_sim::{RunError, Simulation, StagedState, TickInput};
 
+use crate::compare::PredictionTolerance;
 use crate::fact::recorded;
 use crate::hook::{PredictionHook, PredictionRecord, record};
 use crate::reconcile::{PredictionStats, Reconciled};
@@ -71,19 +72,23 @@ struct State {
     /// after the presence changed is refused.
     physics: bool,
     /// The region each entity the local player has claimed was last seen in, from the
-    /// first fact or full frame that named it until the server's tombstone or release
-    /// fact for it is reconciled (never from the record, so an entity only the
-    /// prediction world believes claimed is never re-spawned); never dropped for the ring's age, so an entity the
-    /// prediction world despawned too early is re-spawned by its next fact however long
-    /// the server left it unchanged. Bounded by the server's live claims for the player.
-    /// Kept across `resync`.
+    /// first fact that named it until the server's tombstone or release fact for it is
+    /// reconciled, and replaced whole by each full frame's claimed spawns (never from the
+    /// record, so an entity only the prediction world believes claimed is never
+    /// re-spawned); never dropped for the ring's age, so an entity the prediction world
+    /// despawned too early is re-spawned by its next fact however long the server left it
+    /// unchanged. Kept across `resync` until the full frame that follows it, so an entry
+    /// whose tombstone was lost outlives the server's claim by one full frame at most.
     known: BTreeMap<StableKey, RegionId>,
     /// The input ticks after a substituted one whose own sample is repaired once a frame
     /// at or after them is reconciled; a frame spans every tick since the previous one, so
     /// a repair is found by its tick, possibly in a later call.
     awaiting: BTreeSet<Tick>,
-    /// The components the record holds: the registry's replicated persistent ones.
+    /// The components the record holds, ascending: the registry's replicated persistent
+    /// ones but `Teleported`.
     recorded: Vec<ComponentKey>,
+    /// What a dynamic body's `Transform` and `Velocity` may differ by and still agree.
+    tolerance: PredictionTolerance,
 }
 
 impl State {
@@ -218,7 +223,10 @@ impl Predictor {
                 .iter()
                 .filter(|info| recorded(info))
                 .map(TypeInfo::key)
+                .collect::<BTreeSet<_>>()
+                .into_iter()
                 .collect(),
+            tolerance: PredictionTolerance::DEFAULT,
         };
         let slot = state.take(world, TickInput::default(), Vec::new(), true);
         state.ring.push(slot);
@@ -295,16 +303,23 @@ impl Predictor {
         Ok(())
     }
 
+    /// Replaces the tolerance within which a dynamic body's `Transform` and `Velocity`
+    /// agree with the server's (D124), from the next [`reconcile`](Self::reconcile) on. A
+    /// predictor starts at [`PredictionTolerance::DEFAULT`].
+    pub fn set_tolerance(&mut self, tolerance: PredictionTolerance) {
+        self.state.tolerance = tolerance;
+    }
+
     /// Re-synchronises the prediction world to `tick`, between runs: `World::set_tick`,
     /// the ring emptied and a fresh first slot taken at `tick` with
     /// [`Ring::rebuilt_at`] set to it, the horizon moved there, the record cleared and the
     /// hook reinstalled over whatever `dyn StagedState` the world holds (the repair for
-    /// one inserted over it), and the known regions kept, since only the server's
-    /// tombstone or release facts drop them. What `app` calls when
-    /// [`Reconciled::resync`] is `Some`, with
-    /// the tick it wants the world at (the server's tick plus the lead it runs ahead by);
-    /// the frames still queued in the inbox are then from before the restart and are
-    /// skipped rather than `TooOld`, so one resync is one resync. The full frame `app`
+    /// one inserted over it), and the known regions kept until the next full frame
+    /// replaces them. What `app` calls when [`Reconciled::resync`] is `Some`, with the
+    /// tick it wants the world at (the server's tick plus the lead it runs ahead by); the
+    /// frames still queued in the inbox are then from the band before the restart, and are
+    /// reconciled at the restart's slot rather than `TooOld`, so one resync is one resync
+    /// and a tombstone, claim or release among them is not lost. The full frame `app`
     /// then requests from the server rebuilds the world through the inbox and the
     /// `TickInput` as any full frame does. A `TickBudget::behind` from the pacer is a
     /// clock resync (`TickPacer::resync`), not this. Fails during a run, as `set_tick`
@@ -331,7 +346,8 @@ impl Predictor {
     /// slot for the new tick: the world snapshot, the physics snapshot if the world has
     /// physics (a failed one leaves the slot without its physics part, logged and
     /// counted), the frames the hook popped in this step, `input` itself, and the record
-    /// of every replicated component of every entity the local player has claimed. The
+    /// of every replicated persistent component but `Teleported` of every entity the local
+    /// player has claimed. The
     /// oldest slot beyond the depth is dropped and the world's rollback horizon follows.
     /// Nothing is compared here: [`reconcile`](Self::reconcile) does that.
     ///
@@ -387,10 +403,13 @@ impl Predictor {
     }
 
     /// Reconciles every frame the hook popped since the last call, oldest first, as the
-    /// README states: full frames rebuild and restart the ring; frames from before a
-    /// restart are skipped; substituted ticks replace the ring's recorded samples and the
-    /// first unsubstituted tick after them is repaired; each frame's claimed facts are
-    /// compared against the slot of the frame's tick; from the oldest difference the
+    /// README states: full frames rebuild and restart the ring; frames popped before the
+    /// newest full frame are skipped, and the facts of frames for ticks before the restart,
+    /// exact rows aside, are compared at the restart's slot; substituted ticks replace the
+    /// ring's recorded samples and the first unsubstituted tick after them is repaired;
+    /// each other frame's claimed facts are compared against the slot of the frame's tick,
+    /// a dynamic body's `Transform` and `Velocity` within the tolerance
+    /// ([`set_tolerance`](Self::set_tolerance)); from the oldest difference the
     /// world is restored, the facts at that tick are written stamped, the physics is told
     /// what was corrected, and every later tick is re-simulated from the ring's inputs
     /// with its frames replayed, comparing again at every tick a later frame has facts

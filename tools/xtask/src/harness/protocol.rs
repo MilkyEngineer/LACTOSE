@@ -331,7 +331,8 @@ pub struct Recorder {
 }
 
 impl Recorder {
-    /// Records the world hash at `tick`.
+    /// Records the world hash at `tick`, the record's position in the test's sequence (see
+    /// [`Record::tick`]).
     ///
     /// # Errors
     /// If the record cannot be written.
@@ -354,7 +355,9 @@ impl Recorder {
 pub struct Record {
     /// The test that produced the hash.
     pub test: String,
-    /// The simulation tick the hash was taken at.
+    /// The record's position in the test's sequence (a simulation tick for a straight run;
+    /// a test whose ticks repeat, such as one that rolls back, keys its records by a
+    /// monotonic sequence of its own).
     pub tick: u32,
     /// The world hash.
     pub hash: u64,

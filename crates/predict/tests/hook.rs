@@ -193,7 +193,9 @@ fn an_unechoed_predicted_spawn_is_despawned_at_the_frame_after_its_input_tick() 
     assert!(reconciled.corrections.is_empty());
     assert_eq!(rig.p().stats().unechoed_spawns, 1);
 
-    // An echo that arrives anyway is a fact: the ball comes back as a correction.
+    // An echo that arrives anyway is a fact: the step that applies it spawns and claims
+    // the ball as the server has it (a claim is applied at once), and the slot of its tick,
+    // which lacks the ball, is corrected.
     let mut frame = StagedFrame::new(Tick(15));
     let echo = lactose_net_api::StagedSpawn {
         origin: Some(predicted),
@@ -202,7 +204,8 @@ fn an_unechoed_predicted_spawn_is_despawned_at_the_frame_after_its_input_tick() 
     frame.spawns.insert(net(40), echo);
     rig.push(frame);
     rig.step(walking(16));
-    assert!(!rig.world().contains(ball));
+    assert!(rig.world().contains(ball));
+    assert_eq!(claim(rig.world(), ball), Some(PLAYER));
     let reconciled = rig.reconcile();
     assert_eq!(summaries(&reconciled).len(), 1);
     assert_eq!(reconciled.corrections[0].cause, CorrectionCause::Mismatch);

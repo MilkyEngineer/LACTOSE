@@ -51,6 +51,12 @@ pub struct Position {
 #[derive(PartialEq, Eq, Debug, Default)]
 pub struct Health(#[field(id = 1)] pub i32);
 
+/// Replicated and transient, written by no system: the server sends it, the input sync
+/// point zeroes it.
+#[component(key = "test::aim", transient, replicated)]
+#[derive(PartialEq, Eq, Debug, Default)]
+pub struct Aim(#[field(id = 1)] pub i32);
+
 /// Derived: a cache of `Position` a prediction system maintains from `Changed<Position>`.
 #[component(key = "test::trail", derived)]
 #[derive(PartialEq, Eq, Debug, Default)]
@@ -126,6 +132,7 @@ fn extract(_changed: Changed<Position>, seen: Res<Seen>) {
 pub fn register_types(types: &mut TypeTable) -> Result<()> {
     types.register::<Position>()?;
     types.register::<Health>()?;
+    types.register::<Aim>()?;
     types.register::<Trail>()?;
     types.register::<Diary>()?;
     lactose_input::register_types(types)?;

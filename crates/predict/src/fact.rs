@@ -9,11 +9,13 @@ use std::collections::{BTreeMap, BTreeSet};
 use lactose_bundle::ComponentData;
 use lactose_core::{ComponentKey, Result, StableKey};
 use lactose_ecs::{ClaimedBy, RegionId, World};
-use lactose_reflect::{Persistence, Registry, TypeInfo, TypeRole};
+use lactose_physics_api::{BodyType, RigidBody, Teleported};
+use lactose_reflect::{Persistence, Reflect, Registry, TypeInfo, TypeRole, decode};
 use lactose_sim::StreamingAnchor;
 
-use crate::compare::{Comparison, compare};
+use crate::compare::{Comparison, PredictionTolerance, compare};
 use crate::predictor::LocalPlayer;
+use crate::reconcile::Absorbed;
 use crate::ring::{EntityRecord, Slot};
 
 /// One statement of a delta frame about an entity the server has or had claimed for the
@@ -21,8 +23,8 @@ use crate::ring::{EntityRecord, Slot};
 /// tombstones, each ascending by key) and never written by it.
 #[derive(Clone, Debug)]
 pub(crate) enum Fact {
-    /// A spawn with no interpolation slot: the entity exists, claimed, in `region`, with
-    /// these exact components.
+    /// A spawn with no interpolation slot: the entity exists, claimed, in `region`, and its
+    /// recorded components are exactly these, with these exact bytes.
     Claimed { key: StableKey, region: RegionId, components: Vec<ComponentData> },
     /// A spawn with a slot of an entity the prediction world had claimed: released, with
     /// these dequantised components.
@@ -31,14 +33,10 @@ pub(crate) enum Fact {
     Moved { key: StableKey, region: RegionId, claimed: bool },
     /// The entity lacks `component`.
     Removed { key: StableKey, component: ComponentKey, region: Option<RegionId>, claimed: bool },
-    /// The entity's `component` has these exact bytes.
-    Row {
-        key: StableKey,
-        component: ComponentKey,
-        bytes: Vec<u8>,
-        region: Option<RegionId>,
-        claimed: bool,
-    },
+    /// The frame's exact rows of the entity, together, ascending by component: its
+    /// recorded components are exactly these, with these bytes, since the server sends a
+    /// claimed entity whole in every frame that carries a row of it (D121).
+    Rows { key: StableKey, components: Vec<ComponentData>, region: Option<RegionId>, claimed: bool },
     /// The entity is gone.
     Destroyed { key: StableKey },
 }
@@ -51,7 +49,7 @@ impl Fact {
             | Self::Released { key, .. }
             | Self::Moved { key, .. }
             | Self::Removed { key, .. }
-            | Self::Row { key, .. }
+            | Self::Rows { key, .. }
             | Self::Destroyed { key } => key,
         }
     }
@@ -69,7 +67,7 @@ impl Fact {
                 (*claimed || known.contains_key(&key)).then_some(())?;
                 Some(*region)
             }
-            Self::Removed { region, claimed, .. } | Self::Row { region, claimed, .. } => {
+            Self::Removed { region, claimed, .. } | Self::Rows { region, claimed, .. } => {
                 (*claimed || known.contains_key(&key)).then_some(())?;
                 known.get(&key).copied().or(*region)
             }
@@ -90,7 +88,7 @@ impl Fact {
             Self::Claimed { key, region, .. } | Self::Moved { key, region, .. } => {
                 known.insert(*key, *region);
             }
-            Self::Removed { key, .. } | Self::Row { key, .. } => {
+            Self::Removed { key, .. } | Self::Rows { key, .. } => {
                 if let Some(region) = region {
                     known.entry(*key).or_insert(region);
                 }
@@ -107,28 +105,63 @@ pub(crate) struct Resolved {
 }
 
 /// Whether the record holds the component `info` describes: a replicated persistent
-/// component, the ones the server sends exact for a claimed entity. Derived and transient
-/// ones are not sent.
+/// component, which the server sends exact for a claimed entity, other than `Teleported`,
+/// the client's own no-interpolate flag (D124). A transient one the server may send is
+/// zeroed by the next sync point before anything reads it; a derived one it never sends.
 pub(crate) fn recorded(info: &TypeInfo) -> bool {
     info.role() == TypeRole::Component
         && info.persistence() == Persistence::Persistent
         && info.tracking().replicated
+        && info.key() != Teleported::KEY
+}
+
+/// The recorded components of `components`: what a whole-entity statement names.
+fn named(registry: &Registry, components: &[ComponentData]) -> BTreeSet<ComponentKey> {
+    components
+        .iter()
+        .map(|data| data.component)
+        .filter(|&component| registry.get(component).is_some_and(recorded))
+        .collect()
 }
 
 /// How far a slot's record is from the facts for its tick: per entity that differs, how
 /// many fields did. Empty when every fact agrees.
 pub(crate) type Mismatches = BTreeMap<StableKey, u32>;
 
-/// Compares `facts`, every fact for one tick, with `slot`, that tick's slot.
-pub(crate) fn check(facts: &[Resolved], slot: &Slot, registry: &Registry) -> Mismatches {
-    let mut mismatches = Mismatches::new();
+/// What comparing one tick's facts with its slot found.
+#[derive(Default)]
+pub(crate) struct Checked {
+    /// Every entity a fact did not agree with.
+    pub(crate) mismatches: Mismatches,
+    /// What the tolerance absorbed.
+    pub(crate) absorbed: Absorbed,
+}
+
+/// How facts are judged: the world's registry and the predictor's tolerance.
+pub(crate) struct Judge<'a> {
+    pub(crate) registry: &'a Registry,
+    pub(crate) tolerance: &'a PredictionTolerance,
+}
+
+/// Compares `facts`, every fact for one tick, with `slot`, that tick's slot; `before` is
+/// the slot of the tick before it if the ring holds one, for a body's type at *T* - 1.
+pub(crate) fn check(
+    facts: &[Resolved],
+    slot: &Slot,
+    before: Option<&Slot>,
+    judge: &Judge<'_>,
+) -> Checked {
+    let mut checked = Checked::default();
     for resolved in facts {
         let key = resolved.fact.key();
-        if let Some(fields) = mismatch(resolved, slot.record.get(&key), slot, registry) {
-            *mismatches.entry(key).or_default() += fields;
+        let entry = slot.record.get(&key);
+        let previous = before.and_then(|slot| slot.record.get(&key));
+        let found = mismatch(resolved, entry, previous, slot, judge, &mut checked.absorbed);
+        if let Some(fields) = found {
+            *checked.mismatches.entry(key).or_default() += fields;
         }
     }
-    mismatches
+    checked
 }
 
 /// How many fields of the fact differ if it does not match, `None` if it matches or is
@@ -136,8 +169,10 @@ pub(crate) fn check(facts: &[Resolved], slot: &Slot, registry: &Registry) -> Mis
 fn mismatch(
     resolved: &Resolved,
     entry: Option<&EntityRecord>,
+    previous: Option<&EntityRecord>,
     slot: &Slot,
-    registry: &Registry,
+    judge: &Judge<'_>,
+    absorbed: &mut Absorbed,
 ) -> Option<u32> {
     let absent = || {
         let loaded = resolved.region.is_some_and(|region| slot.regions.contains(&region));
@@ -154,19 +189,8 @@ fn mismatch(
     match &resolved.fact {
         Fact::Claimed { region, components, .. } => {
             let Some(entry) = entry else { return absent() };
-            let mut differs = entry.region != *region;
-            let mut fields = 0;
-            for data in components {
-                match compare_data(registry, entry, data.component, &data.bytes) {
-                    Some(Comparison::Differs { fields: n }) => {
-                        differs = true;
-                        fields += n;
-                    }
-                    Some(Comparison::Missing) => differs = true,
-                    _ => {}
-                }
-            }
-            differs.then_some(fields)
+            let found = statement(components, entry, previous, judge, absorbed);
+            if entry.region == *region { found } else { Some(found.unwrap_or(0)) }
         }
         Fact::Released { .. } | Fact::Destroyed { .. } => entry.map(|_| 0),
         Fact::Moved { region, .. } => match entry {
@@ -177,34 +201,89 @@ fn mismatch(
             Some(entry) => entry.components.contains_key(component).then_some(0),
             None => absent(),
         },
-        Fact::Row { component, bytes, .. } => {
+        // Rows of no recorded component (`Teleported` alone, a transient one) state nothing.
+        Fact::Rows { components, .. } if named(judge.registry, components).is_empty() => None,
+        Fact::Rows { components, .. } => {
             let Some(entry) = entry else { return absent() };
-            match compare_data(registry, entry, *component, bytes)? {
-                Comparison::Differs { fields } => Some(fields),
-                Comparison::Missing => Some(0),
-                _ => None,
-            }
+            statement(components, entry, previous, judge, absorbed)
         }
     }
 }
 
-/// The comparison of one component of a fact with the record, or `None` when the sender
-/// named a component the registry or the record does not hold, which is logged.
+/// How many fields of a whole-entity statement (a claimed spawn, a frame's exact rows)
+/// differ from the entity's record if it does not match: a component that differs, one
+/// the record lacks, and one the record holds that the statement does not name, the last
+/// two with no field. What the tolerance absorbed is added to `absorbed`, and agrees.
+fn statement(
+    components: &[ComponentData],
+    entry: &EntityRecord,
+    previous: Option<&EntityRecord>,
+    judge: &Judge<'_>,
+    absorbed: &mut Absorbed,
+) -> Option<u32> {
+    let tolerance = dynamic(components, entry, previous).then_some(judge.tolerance);
+    let mut differs = false;
+    let mut fields = 0;
+    for data in components {
+        match compare_data(judge.registry, entry, data, tolerance) {
+            Some(Comparison::Differs { fields: n }) => {
+                differs = true;
+                fields += n;
+            }
+            Some(Comparison::Missing) => differs = true,
+            Some(Comparison::Absorbed(within)) => absorbed.add(&within),
+            _ => {}
+        }
+    }
+    let named = named(judge.registry, components);
+    differs |= entry.components.keys().any(|component| !named.contains(component));
+    differs.then_some(fields)
+}
+
+/// Whether the entity's `RigidBody` is `Dynamic` at the compared slot (the statement's if
+/// it names one, else the record's) or at the slot before (that record's): the condition
+/// of the tolerance. The compared slot alone decides when the ring holds no slot before
+/// it, or the entity was not claimed there.
+fn dynamic(
+    components: &[ComponentData],
+    entry: &EntityRecord,
+    previous: Option<&EntityRecord>,
+) -> bool {
+    let stated = components.iter().find(|data| data.component == RigidBody::KEY);
+    let now = stated
+        .map(|data| data.bytes.as_slice())
+        .or_else(|| entry.components.get(&RigidBody::KEY).map(Vec::as_slice));
+    let before = previous.and_then(|entry| entry.components.get(&RigidBody::KEY));
+    [now, before.map(Vec::as_slice)].into_iter().flatten().any(|bytes| {
+        decode::<RigidBody>(bytes).is_ok_and(|body| body.body_type == BodyType::Dynamic)
+    })
+}
+
+/// The comparison of one component of a fact with the record, or `None` when it is not
+/// compared: a replicated component the record never holds (a transient one, `Teleported`)
+/// is skipped silently; one the registry lacks or holds as unreplicated, and bytes that are
+/// not one value, are defects of the sender, logged and skipped.
 fn compare_data(
     registry: &Registry,
     entry: &EntityRecord,
-    component: ComponentKey,
-    bytes: &[u8],
+    data: &ComponentData,
+    tolerance: Option<&PredictionTolerance>,
 ) -> Option<Comparison> {
-    let Some(info) = registry.get(component).filter(|info| recorded(info)) else {
-        tracing::warn!(
-            target: "predict",
-            component = component.0,
-            "a fact names a component that is not a registered replicated one: skipped"
-        );
+    let info = registry.get(data.component);
+    let Some(info) = info.filter(|info| recorded(info)) else {
+        let replicated = info
+            .is_some_and(|info| info.role() == TypeRole::Component && info.tracking().replicated);
+        if !replicated {
+            tracing::warn!(
+                target: "predict",
+                component = data.component.0,
+                "a fact names a component that is not a registered replicated one: skipped"
+            );
+        }
         return None;
     };
-    let comparison = compare(info, entry.components.get(&component).map(Vec::as_slice), bytes);
+    let predicted = entry.components.get(&data.component).map(Vec::as_slice);
+    let comparison = compare(info, predicted, &data.bytes, tolerance);
     if comparison == Comparison::Malformed {
         tracing::warn!(
             target: "predict",
@@ -217,25 +296,29 @@ fn compare_data(
 }
 
 /// Whether a correction writes a component after `comparison`: where the world differs
-/// from the server or lacks the component. The one place that decides which of a tick's
+/// from the server by bytes, within the tolerance or not, or lacks the component. A
+/// correction writes every fact at its tick, the absorbed ones included, since writing them
+/// is what converges a dynamic body (D124). The one place that decides which of a tick's
 /// facts a correction writes.
 fn writes(comparison: Comparison) -> bool {
-    matches!(comparison, Comparison::Differs { .. } | Comparison::Missing)
+    matches!(comparison, Comparison::Differs { .. } | Comparison::Absorbed(_) | Comparison::Missing)
 }
 
 /// Writes every fact of `facts` into `world`, which is at their tick, in their order, each
-/// write stamped: the correction of `README.md`, "Reconciliation", step 2. Returns the
-/// entities whose rows, presence, region or claim changed, in ascending order. A write the
-/// world refuses is logged and skipped.
+/// write stamped: the correction of `README.md`, "Reconciliation", step 2. `recorded` is
+/// every recorded component, ascending: what a whole-entity statement removes when it does
+/// not name it. Returns the entities whose rows, presence, region or claim changed, in
+/// ascending order. A write the world refuses is logged and skipped.
 pub(crate) fn write(
     world: &mut World,
     local: LocalPlayer,
+    recorded: &[ComponentKey],
     facts: &[Resolved],
 ) -> BTreeSet<StableKey> {
     let mut written = BTreeSet::new();
     for resolved in facts {
         let key = resolved.fact.key();
-        match write_fact(world, local, resolved) {
+        match write_fact(world, local, recorded, resolved) {
             Ok(true) => {
                 written.insert(key);
             }
@@ -248,7 +331,12 @@ pub(crate) fn write(
     written
 }
 
-fn write_fact(world: &mut World, local: LocalPlayer, resolved: &Resolved) -> Result<bool> {
+fn write_fact(
+    world: &mut World,
+    local: LocalPlayer,
+    recorded: &[ComponentKey],
+    resolved: &Resolved,
+) -> Result<bool> {
     let key = resolved.fact.key();
     let live = world.contains(key);
     match &resolved.fact {
@@ -259,9 +347,8 @@ fn write_fact(world: &mut World, local: LocalPlayer, resolved: &Resolved) -> Res
             }
             let mut changed = claim(world, local, key)?;
             changed |= move_to(world, key, *region)?;
-            for data in written_components(world, Some(key), components) {
-                changed |= world.insert_erased(key, &data)?;
-            }
+            changed |= insert(world, key, components)?;
+            changed |= strip(world, key, recorded, components)?;
             Ok(changed)
         }
         Fact::Released { components, .. } => {
@@ -273,9 +360,7 @@ fn write_fact(world: &mut World, local: LocalPlayer, resolved: &Resolved) -> Res
                 world.remove::<ClaimedBy>(key)?;
                 changed = true;
             }
-            for data in written_components(world, Some(key), components) {
-                changed |= world.insert_erased(key, &data)?;
-            }
+            changed |= insert(world, key, components)?;
             Ok(changed)
         }
         Fact::Moved { region, .. } => {
@@ -290,16 +375,17 @@ fn write_fact(world: &mut World, local: LocalPlayer, resolved: &Resolved) -> Res
             }
             Ok(claim(world, local, key)? | world.remove_erased(key, *component)?)
         }
-        Fact::Row { component, bytes, .. } => {
-            let data = [ComponentData { component: *component, bytes: bytes.clone() }];
+        Fact::Rows { components, .. } => {
+            if named(world.registry(), components).is_empty() {
+                return Ok(false);
+            }
             if !live {
-                let data = written_components(world, None, &data);
-                return respawn(world, local, key, resolved.region, &data);
+                let components = written_components(world, None, components);
+                return respawn(world, local, key, resolved.region, &components);
             }
             let mut changed = claim(world, local, key)?;
-            for data in written_components(world, Some(key), &data) {
-                changed |= world.insert_erased(key, &data)?;
-            }
+            changed |= insert(world, key, components)?;
+            changed |= strip(world, key, recorded, components)?;
             Ok(changed)
         }
         Fact::Destroyed { .. } => {
@@ -309,6 +395,34 @@ fn write_fact(world: &mut World, local: LocalPlayer, resolved: &Resolved) -> Res
             Ok(live)
         }
     }
+}
+
+/// Writes to the live `key` the components of `components` a correction writes; whether
+/// one changed.
+fn insert(world: &mut World, key: StableKey, components: &[ComponentData]) -> Result<bool> {
+    let mut changed = false;
+    for data in written_components(world, Some(key), components) {
+        changed |= world.insert_erased(key, &data)?;
+    }
+    Ok(changed)
+}
+
+/// Removes from the live `key` every component of `recorded` it has that the whole-entity
+/// statement `components` does not name; whether one was removed.
+fn strip(
+    world: &mut World,
+    key: StableKey,
+    recorded: &[ComponentKey],
+    components: &[ComponentData],
+) -> Result<bool> {
+    let named = named(world.registry(), components);
+    let mut changed = false;
+    for &component in recorded {
+        if !named.contains(&component) && world.get_erased(key, component).is_some() {
+            changed |= world.remove_erased(key, component)?;
+        }
+    }
+    Ok(changed)
 }
 
 /// The components of `components` a correction writes to `key` (`None`: to an entity it
@@ -324,7 +438,7 @@ fn written_components(
         .filter(|data| {
             registry.get(data.component).filter(|info| recorded(info)).is_some_and(|info| {
                 let stored = key.and_then(|key| world.get_erased(key, data.component));
-                writes(compare(info, stored, &data.bytes))
+                writes(compare(info, stored, &data.bytes, None))
             })
         })
         .cloned()

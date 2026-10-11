@@ -11,7 +11,7 @@ use lactose_net_api::StagedInbox;
 use lactose_sim::{RunError, Simulation};
 
 use super::{PredictError, Predictor, State, next, prev};
-use crate::fact::{self, Mismatches, Resolved};
+use crate::fact::{self, Checked, Fact, Judge, Mismatches, Resolved};
 use crate::hook::{Popped, before, record};
 use crate::reconcile::{Correction, CorrectionCause, Divergence, Reconciled, ResyncReason};
 
@@ -42,19 +42,32 @@ impl Predictor {
         };
         let mut out = Reconciled::default();
         let mut plan = state.plan(popped, present, &mut out);
+        let mut absorbed = BTreeMap::new();
+        let judge = Judge { registry: simulation.world().registry(), tolerance: &state.tolerance };
         for (&tick, facts) in &plan.facts {
-            if let Some(slot) = state.ring.slot(tick)
-                && !fact::check(facts, slot, simulation.world().registry()).is_empty()
-            {
-                plan.points.insert(tick, CorrectionCause::Mismatch);
+            if let Some(slot) = state.ring.slot(tick) {
+                let checked = fact::check(facts, slot, state.ring.slot(prev(tick)), &judge);
+                if !checked.mismatches.is_empty() {
+                    plan.points.insert(tick, CorrectionCause::Mismatch);
+                }
+                absorbed.insert(tick, checked.absorbed);
             }
         }
         let oldest = plan.points.keys().copied().reduce(|a, b| if before(b, a) { b } else { a });
+        // What a tick a rollback re-simulates absorbed is counted there, against its new slot.
+        for (&tick, within) in &absorbed {
+            if oldest.is_none_or(|from| !before(from, tick)) {
+                state.stats.absorbed.add(within);
+            }
+        }
         if let Some(from) = oldest {
             simulation =
                 match state.rollback(simulation, executor, &plan, from, present, &mut out).await {
                     Ok(simulation) => simulation,
-                    Err(failure) => return Err(state.failed(failure)),
+                    Err(failure) => {
+                        state.count(&out);
+                        return Err(state.failed(failure));
+                    }
                 };
         }
         let world = simulation.world_mut();
@@ -65,7 +78,16 @@ impl Predictor {
         {
             out.resync = Some(ResyncReason::Behind { server, present });
         }
-        let stats = &mut state.stats;
+        state.count(&out);
+        Ok((state.join(simulation), out))
+    }
+}
+
+impl State {
+    /// Adds what a reconciliation did to the counters: all of it, or, for one whose
+    /// rollback failed part way, what it did before the failure.
+    fn count(&mut self, out: &Reconciled) {
+        let stats = &mut self.stats;
         stats.frames_reconciled += u64::from(out.frames);
         for correction in &out.corrections {
             stats.corrections += 1;
@@ -73,18 +95,31 @@ impl Predictor {
             stats.mismatched_fields += u64::from(correction.divergence.fields);
             stats.deepest_correction = stats.deepest_correction.max(correction.depth);
         }
-        Ok((state.join(simulation), out))
     }
-}
 
-impl State {
+    /// The facts of one frame the reconciliation acts on, each resolved and learned in the
+    /// frame's order.
+    fn resolve(&mut self, facts: Vec<Fact>) -> Vec<Resolved> {
+        let known = &mut self.known;
+        facts
+            .into_iter()
+            .filter_map(|fact| {
+                let resolved = fact.resolve(known)?;
+                resolved.fact.learn(resolved.region, known);
+                Some(resolved)
+            })
+            .collect()
+    }
+
     /// Classifies the frames the hook popped, oldest first, by the README's four rules;
     /// replaces and repairs the ring's samples in ascending input tick; and returns the
-    /// facts to compare with the substitution points. Learns the regions of claimed
-    /// entities from every fact it keeps.
+    /// facts to compare (a band frame's, its exact rows dropped, at the restart's slot) with
+    /// the substitution points. Replaces the regions of claimed entities at a full frame
+    /// and learns them from every fact it keeps.
     fn plan(&mut self, popped: Vec<Popped>, present: Tick, out: &mut Reconciled) -> Plan {
         let mut plan = Plan::default();
         let mut replaced: Vec<(Tick, CorrectionCause)> = Vec::new();
+        let mut band: Vec<Resolved> = Vec::new();
         let newest_full = popped.iter().rposition(|popped| popped.frame.full);
         for (index, popped) in popped.into_iter().enumerate() {
             let tick = popped.frame.tick;
@@ -92,8 +127,8 @@ impl State {
                 out.frames += 1;
                 out.confirmed = Some(tick);
             };
-            // Rules 1 and 2: the newest full frame restarts the ring at the tick it was
-            // applied at; what came before it, or before the ring's restart, is skipped.
+            // Rule 1, and rule 2's first half: the newest full frame restarts the ring at
+            // the tick it was applied at and supersedes what was popped before it.
             match newest_full {
                 Some(full) if index < full => {
                     confirm(out);
@@ -103,13 +138,16 @@ impl State {
                     self.ring.rebuild_at(popped.applied_at);
                     let restart = popped.applied_at;
                     self.awaiting.retain(|&tick| before(restart, tick));
-                    for (&net, spawn) in &popped.frame.spawns {
-                        let key = spawn.key(net);
-                        match spawn.slot {
-                            None => self.known.insert(key, spawn.region),
-                            Some(_) => self.known.remove(&key),
-                        };
-                    }
+                    // A full frame states every entity the server has claimed for the
+                    // player, so it replaces the map: an entry whose tombstone was lost
+                    // (a resync's gap) goes here.
+                    self.known = popped
+                        .frame
+                        .spawns
+                        .iter()
+                        .filter(|(_, spawn)| spawn.slot.is_none())
+                        .map(|(&net, spawn)| (spawn.key(net), spawn.region))
+                        .collect();
                     for key in popped.frame.despawns.keys() {
                         self.known.remove(key);
                     }
@@ -118,8 +156,14 @@ impl State {
                 }
                 _ => {}
             }
+            // Rule 2's second half: a frame from the band between the full frame's tick and
+            // the restart has its facts but exact rows compared at the restart's slot,
+            // since its own slot is gone; the first later frame that carries an entity
+            // restates its rows, never its tombstone, move, removal, claim or release.
             let restart = self.ring.rebuilt_at();
             if restart.is_some_and(|restart| before(tick, restart)) {
+                let facts = self.resolve(popped.facts);
+                band.extend(facts.into_iter().filter(|r| !matches!(r.fact, Fact::Rows { .. })));
                 confirm(out);
                 continue;
             }
@@ -137,19 +181,18 @@ impl State {
                 .filter(|(_, cause)| *cause == CorrectionCause::Substituted)
                 .count() as u64;
             replaced.extend(frame_replaced);
-            let facts: Vec<Resolved> = popped
-                .facts
-                .into_iter()
-                .filter_map(|fact| {
-                    let resolved = fact.resolve(&self.known)?;
-                    resolved.fact.learn(resolved.region, &mut self.known);
-                    Some(resolved)
-                })
-                .collect();
+            let facts = self.resolve(popped.facts);
             if !facts.is_empty() {
-                plan.facts.insert(tick, facts);
+                plan.facts.entry(tick).or_default().extend(facts);
             }
             confirm(out);
+        }
+        // Before the facts of a frame for the restart's own tick.
+        if let Some(restart) = self.ring.rebuilt_at()
+            && !band.is_empty()
+        {
+            band.extend(plan.facts.remove(&restart).unwrap_or_default());
+            plan.facts.insert(restart, band);
         }
         let base = self.ring.oldest().unwrap_or(present);
         replaced.sort_by_key(|&(tick, _)| tick.0.wrapping_sub(base.0));
@@ -286,7 +329,8 @@ impl State {
         }
         let cause = plan.points.get(&from).copied().unwrap_or(CorrectionCause::Mismatch);
         let facts = plan.facts.get(&from).map_or(&[][..], Vec::as_slice);
-        let mismatches = self.mismatches(world, from, facts);
+        // What it absorbed was counted by the call's first comparison of the same slot.
+        let mismatches = self.check(world, from, facts).mismatches;
         out.corrections.push(self.correct(
             world,
             from,
@@ -326,7 +370,8 @@ impl State {
                 return Err(kept(error, simulation));
             }
             let facts = plan.facts.get(&tick).map_or(&[][..], Vec::as_slice);
-            let mismatches = self.mismatches(world, tick, facts);
+            let Checked { mismatches, absorbed } = self.check(world, tick, facts);
+            self.stats.absorbed.add(&absorbed);
             if !mismatches.is_empty() {
                 let cause = CorrectionCause::Mismatch;
                 out.corrections
@@ -337,10 +382,13 @@ impl State {
     }
 
     /// The facts of `tick` compared with its slot.
-    fn mismatches(&self, world: &World, tick: Tick, facts: &[Resolved]) -> Mismatches {
+    fn check(&self, world: &World, tick: Tick, facts: &[Resolved]) -> Checked {
+        let judge = Judge { registry: world.registry(), tolerance: &self.tolerance };
         match self.ring.slot(tick) {
-            Some(slot) if !facts.is_empty() => fact::check(facts, slot, world.registry()),
-            _ => Mismatches::new(),
+            Some(slot) if !facts.is_empty() => {
+                fact::check(facts, slot, self.ring.slot(prev(tick)), &judge)
+            }
+            _ => Checked::default(),
         }
     }
 
@@ -358,7 +406,8 @@ impl State {
         physics: bool,
         present: Tick,
     ) -> Correction {
-        let written: Vec<_> = fact::write(world, self.local, facts).into_iter().collect();
+        let written: Vec<_> =
+            fact::write(world, self.local, &self.recorded, facts).into_iter().collect();
         if self.physics
             && !written.is_empty()
             && let Err(error) = lactose_physics_api::corrected(world, &written)

@@ -12,6 +12,7 @@ use lactose_ecs::LayoutConfig;
 use lactose_net_api::StagedFrame;
 use lactose_predict::{CorrectionCause, Divergence};
 use lactose_reflect::Reflect;
+use lactose_sim::StagedState;
 use lactose_sim::harness::{ChunkCapacity, layout_mode};
 
 fn layouts() -> Vec<(LayoutConfig, u32)> {
@@ -116,6 +117,7 @@ fn a_correction_is_stamped_so_a_derived_cache_follows_it() {
     assert_eq!(before.x, 50);
     let mut frame = StagedFrame::new(Tick(15));
     exact(&mut frame, cart(), &at(77, 0));
+    exact(&mut frame, cart(), &Health(10));
     rig.push(frame);
     rig.step(walking(21));
     let reconciled = rig.reconcile();
@@ -141,6 +143,8 @@ fn two_frames_with_facts_correct_at_the_older_and_again_at_the_newer() {
 
         let mut first = StagedFrame::new(Tick(15));
         exact(&mut first, me(), &at(100, 0));
+        // Exact rows state the whole entity: the cart's position as predicted beside it.
+        exact(&mut first, cart(), &at(50, 0));
         exact(&mut first, cart(), &Health(3));
         rig.push(first);
         let mut second = StagedFrame::new(Tick(17));
@@ -191,6 +195,7 @@ fn an_entity_despawned_too_early_is_respawned_in_its_last_known_region() {
     rig.step_to(20, walking);
     assert!(!rig.world().contains(cart()));
     let mut frame = StagedFrame::new(Tick(16));
+    exact(&mut frame, cart(), &at(50, 0));
     exact(&mut frame, cart(), &Health(4));
     rig.push(frame);
     rig.step(walking(21));
@@ -229,7 +234,8 @@ fn a_missing_component_entity_region_or_claim_is_a_mismatch_with_no_field() {
     let mut rig = Rig::joined();
     rig.step_to(20, walking);
     let mut frame = StagedFrame::new(Tick(15));
-    // A component the player's row lacks.
+    // A component the player's row lacks, beside its position as predicted.
+    exact(&mut frame, me(), &at(4, 0));
     exact(&mut frame, me(), &Health(7));
     // An entity the slot lacks, in a loaded region.
     frame.spawns.insert(net(4), claimed(OTHER_REGION, vec![data(at(1, 1))]));
@@ -300,6 +306,7 @@ fn facts_are_written_in_frame_order_under_every_layout() {
         rig.step_to(20, walking);
         let mut frame = StagedFrame::new(Tick(15));
         frame.removed.insert((cart(), Health::KEY));
+        exact(&mut frame, cart(), &at(50, 0));
         exact(&mut frame, cart(), &Health(5));
         frame.moves.insert(cart(), OTHER_REGION);
         rig.push(frame);
@@ -311,4 +318,32 @@ fn facts_are_written_in_frame_order_under_every_layout() {
         hashes.push(rig.hash());
     }
     assert!(hashes.windows(2).all(|pair| pair[0] == pair[1]));
+}
+
+#[test]
+fn a_rollback_that_fails_part_way_counts_the_corrections_it_made() {
+    let mut rig = Rig::joined();
+    rig.step_to(20, walking);
+    let mut frame = StagedFrame::new(Tick(15));
+    exact(&mut frame, me(), &at(100, 0));
+    rig.push(frame);
+    rig.step(walking(21));
+    // A hook inserted over the predictor's: the first re-simulated tick fails after the
+    // correction at 15 was written.
+    rig.world_mut().insert_service::<dyn StagedState>(Box::new(Inert));
+    assert!(rig.try_reconcile().is_err());
+    let stats = rig.p().stats();
+    // The join's frame and this one.
+    assert_eq!((stats.corrections, stats.frames_reconciled), (1, 2));
+    assert_eq!((stats.mismatched_entities, stats.mismatched_fields), (1, 1));
+    assert_eq!(stats.deepest_correction, 6);
+}
+
+/// A hook that does nothing.
+struct Inert;
+
+impl StagedState for Inert {
+    fn apply(&mut self, _: &mut lactose_ecs::World, _: Tick) -> lactose_core::Result<()> {
+        Ok(())
+    }
 }

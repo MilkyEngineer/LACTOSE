@@ -64,9 +64,9 @@ pub enum CorrectionCause {
     Repaired,
 }
 
-/// How far a prediction was from the server's state at one tick: counts, since a
-/// magnitude across fields of different units means nothing, and this crate computes no
-/// float.
+/// How far a prediction was from the server's state at one tick: counts of what did not
+/// agree, since a magnitude across fields of different units means nothing. What the
+/// tolerance absorbed is not here: it agreed (`PredictionStats::absorbed`).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
 pub struct Divergence {
     /// How many entities differed: in a field, a component's presence, their presence,
@@ -131,4 +131,44 @@ pub struct PredictionStats {
     pub slots_without_physics: u64,
     /// The deepest correction, in ticks re-simulated for it.
     pub deepest_correction: u32,
+    /// What the tolerance absorbed over every frame compared: the milestone 1 spike's
+    /// measure from which milestone 4 re-sets
+    /// [`PredictionTolerance`](crate::PredictionTolerance)'s defaults (D124).
+    pub absorbed: Absorbed,
+}
+
+/// What the tolerance absorbed (D124): fields of a dynamic body's `Transform` or
+/// `Velocity` whose canonical bytes differed from the server's and agreed within
+/// [`PredictionTolerance`](crate::PredictionTolerance), with the largest difference of a
+/// scalar component per kind. Each frame's facts count once, at their last comparison: a
+/// tick a rollback re-simulates counts the comparison against the re-simulated slot.
+///
+/// A difference is stored as `Scalar::to_canonical_bits` widened to `u64` (the high half
+/// zero under the 32-bit scalar), so the counters stay integers and `PredictionStats` keeps
+/// its derives; `Scalar::from_canonical_bits` reads one back. Zero is no difference.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
+pub struct Absorbed {
+    /// Fields absorbed (`Transform::translation` and `rotation`, `Velocity::linear` and
+    /// `angular`), each counted once per fact that differed in it.
+    pub fields: u64,
+    /// The largest absorbed difference of a `Transform::translation` component.
+    pub translation: u64,
+    /// The largest absorbed difference of a `Transform::rotation` quaternion component.
+    pub rotation: u64,
+    /// The largest absorbed difference of a `Velocity::linear` component.
+    pub linear: u64,
+    /// The largest absorbed difference of a `Velocity::angular` component.
+    pub angular: u64,
+}
+
+impl Absorbed {
+    /// Adds `other`'s fields and keeps the larger difference of each kind; a difference is
+    /// never negative, so its bits order as its value does.
+    pub(crate) fn add(&mut self, other: &Self) {
+        self.fields += other.fields;
+        self.translation = self.translation.max(other.translation);
+        self.rotation = self.rotation.max(other.rotation);
+        self.linear = self.linear.max(other.linear);
+        self.angular = self.angular.max(other.angular);
+    }
 }

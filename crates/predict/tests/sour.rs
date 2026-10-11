@@ -129,15 +129,20 @@ const FRAMES: u32 = 17;
 const FIRST: u32 = 20;
 const EVERY: u32 = 7;
 
-/// The join frame of `join_frame`, with four claimed bodies moving along x at one unit a
-/// second and a fixed proxy body.
+/// A claimed body moving along x at one unit a second.
+fn body_velocity() -> Velocity {
+    let linear = Vec3::new(Scalar::ONE, Scalar::ZERO, Scalar::ZERO);
+    Velocity { linear, ..Velocity::ZERO }
+}
+
+/// The join frame of `join_frame`, with four claimed bodies moving along x and a fixed
+/// proxy body.
 fn scene_frame() -> StagedFrame {
     let mut frame = join_frame(JOIN);
-    let linear = Vec3::new(Scalar::ONE, Scalar::ZERO, Scalar::ZERO);
-    let moving = Velocity { linear, ..Velocity::ZERO };
     for n in BODIES {
         let x = i32::try_from(n).expect("small") * 10;
-        let parts = vec![data(transform(x)), data(moving), data(floating()), data(sphere())];
+        let parts =
+            vec![data(transform(x)), data(body_velocity()), data(floating()), data(sphere())];
         frame.spawns.insert(net(n), claimed(REGION, parts));
     }
     let parts = vec![data(transform(-20)), data(RigidBody::fixed()), data(sphere())];
@@ -202,8 +207,13 @@ fn staged(scheduled: &Scheduled) -> StagedFrame {
     let mut frame = StagedFrame::new(Tick(scheduled.tick));
     exact(&mut frame, cart(), &scheduled.cart);
     exact(&mut frame, cart(), &scheduled.health);
+    // Exact rows state the whole entity (D122): a body's transform comes with the rest
+    // of it as predicted.
     if let Some((body, x)) = scheduled.body {
         exact(&mut frame, body, &transform(x));
+        exact(&mut frame, body, &body_velocity());
+        exact(&mut frame, body, &floating());
+        exact(&mut frame, body, &sphere());
     }
     dequantised(&mut frame, proxy(), &scheduled.proxy);
     frame.substituted.extend(scheduled.substituted.map(Tick));

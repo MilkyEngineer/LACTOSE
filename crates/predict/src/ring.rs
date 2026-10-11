@@ -25,8 +25,8 @@ pub struct Ring {
     slots: VecDeque<Slot>,
     depth: u32,
     /// The tick the ring last restarted at, while that slot is still held: a frame for an
-    /// earlier tick is from before the restart, and its facts and substitutions are
-    /// skipped rather than reconciled.
+    /// earlier tick is from the band before the restart, its substitutions and exact rows
+    /// skipped and its other facts reconciled at this slot.
     rebuilt_at: Option<Tick>,
 }
 
@@ -188,8 +188,8 @@ pub struct SlotBytes {
     /// whole world, the part that decides how many statics a prediction world may hold;
     /// zero for a slot taken without one.
     pub physics: usize,
-    /// The record's bytes: every replicated component of every claimed entity, as copied
-    /// after the tick, plus the frames held for replay.
+    /// The record's bytes: every replicated persistent component of every claimed entity
+    /// (`Teleported` aside), as copied after the tick, plus the frames held for replay.
     pub record: usize,
 }
 
@@ -216,8 +216,9 @@ pub(crate) struct Slot {
     /// removals and tombstones, replayed by the hook when the tick is re-simulated.
     pub(crate) frames: Vec<Arc<StagedFrame>>,
     /// Every entity the local player had claimed after the tick, with its region and the
-    /// bytes of each of its replicated components (`World::get_erased` per entity and
-    /// type), which a frame's exact rows for this tick are compared against.
+    /// bytes of each of its replicated persistent components, `Teleported` aside
+    /// (`World::get_erased` per entity and recorded type), which a frame's exact rows for
+    /// this tick are compared against.
     pub(crate) record: BTreeMap<StableKey, EntityRecord>,
     /// The regions loaded after the tick: an entity a fact names and the record lacks is
     /// re-spawned only into one of these.

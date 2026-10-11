@@ -9,7 +9,7 @@ use std::sync::Arc;
 use lactose_bundle::ComponentData;
 use lactose_core::{Error, ErrorKind, NetId, PredictionKey, Result, StableKey, Tick};
 use lactose_ecs::{ClaimedBy, RegionId, World};
-use lactose_net_api::{StagedFrame, StagedInbox};
+use lactose_net_api::{StagedFrame, StagedInbox, StagedSpawn};
 use lactose_reflect::Reflect;
 use lactose_sim::{StagedState, StreamingAnchor};
 
@@ -28,9 +28,10 @@ use crate::predictor::LocalPlayer;
 /// pops nothing. It writes the tick it ran at into the record, which is how a step knows
 /// it ran. For each frame, oldest first, it applies what the README states under "The
 /// hook": binds, the spawns of proxies as upserts, the proxies' rows as this tick's
-/// position, moves, removals and tombstones; a full frame whole, as a rebuild. It writes
-/// nothing of a claimed entity that a delta frame carries: those are facts for the
-/// reconciliation, which it records with the tick it popped the frame at. Before and after
+/// position, moves, removals and tombstones; a full frame whole, as a rebuild. What a delta
+/// frame carries of an entity the server has or had claimed is a fact for the
+/// reconciliation, which it records with the tick it popped the frame at; of those it
+/// writes only a claim or a release, and only in a predicted tick. Before and after
 /// the frames it keeps `ClaimedBy` for the local player and `StreamingAnchor` on the
 /// player's own entity while it is live, and the anchor on no other entity; and it
 /// despawns a predicted spawn of the local player that the server never echoed once a
@@ -68,7 +69,7 @@ impl StagedState for PredictionHook {
         let mut facts = Vec::with_capacity(frames.len());
         let mut unechoed = 0;
         for frame in &frames {
-            facts.push(apply_frame(world, local, frame, &mut unechoed));
+            facts.push(apply_frame(world, local, frame, replaying, &mut unechoed));
         }
         keep_local(world, local);
         let entry = record(world)?;
@@ -164,18 +165,20 @@ fn upsert(world: &mut World, key: StableKey, region: RegionId, components: &[Com
     }
 }
 
-/// Applies one frame as the README states under "The hook", and returns its facts.
+/// Applies one frame as the README states under "The hook", and returns its facts;
+/// `replaying` in a re-simulated tick.
 fn apply_frame(
     world: &mut World,
     local: LocalPlayer,
     frame: &StagedFrame,
+    replaying: bool,
     unechoed: &mut u64,
 ) -> Vec<Fact> {
     let mut facts = Vec::new();
     if frame.full {
         rebuild(world, local, frame);
     } else {
-        apply_delta(world, local, frame, &mut facts);
+        apply_delta(world, local, frame, replaying, &mut facts);
     }
     if let Some(acked) = frame.acked_input {
         *unechoed += despawn_unechoed(world, local, acked);
@@ -241,19 +244,30 @@ fn rebuild(world: &mut World, local: LocalPlayer, frame: &StagedFrame) {
 }
 
 /// A delta frame: what concerns a proxy is written, what concerns an entity the local
-/// player has claimed is a fact. A move, removal, row or tombstone of an entity that is not
-/// live is a fact too, which the reconciliation keeps only for an entity it knows the
-/// server claimed.
-fn apply_delta(world: &mut World, local: LocalPlayer, frame: &StagedFrame, facts: &mut Vec<Fact>) {
+/// player has claimed is a fact. A claim or a release is a fact and is applied too, so that
+/// the frame's later entries and the later frames of the tick find the entity as the
+/// server has it; a re-simulated tick (`replaying`) leaves the claim as the corrections
+/// wrote it at the frame's tick, which a later fact may have changed since (a tombstone). A
+/// move, removal, row or tombstone of an entity that is not live is a fact too, which the
+/// reconciliation keeps only for an entity it knows the server claimed.
+fn apply_delta(
+    world: &mut World,
+    local: LocalPlayer,
+    frame: &StagedFrame,
+    replaying: bool,
+    facts: &mut Vec<Fact>,
+) {
     for (&net, spawn) in &frame.spawns {
         bind(world, spawn.origin, net);
         let key = spawn.key(net);
         match spawn.slot {
-            None => facts.push(Fact::Claimed {
-                key,
-                region: spawn.region,
-                components: spawn.components.clone(),
-            }),
+            None => {
+                let components = spawn.components.clone();
+                facts.push(Fact::Claimed { key, region: spawn.region, components });
+                if !replaying {
+                    claim_spawn(world, local, key, spawn);
+                }
+            }
             Some(_) if !world.contains(key) => {
                 if let Err(error) = world.spawn_erased(key, spawn.region, &spawn.components) {
                     refused("a proxy's spawn", key, &error);
@@ -261,6 +275,12 @@ fn apply_delta(world: &mut World, local: LocalPlayer, frame: &StagedFrame, facts
             }
             Some(_) if claimed_by(world, local, key) => {
                 facts.push(Fact::Released { key, components: spawn.components.clone() });
+                if !replaying {
+                    match world.remove::<ClaimedBy>(key) {
+                        Ok(_) => upsert(world, key, spawn.region, &spawn.components),
+                        Err(error) => refused("a release", key, &error),
+                    }
+                }
             }
             Some(_) => upsert(world, key, spawn.region, &spawn.components),
         }
@@ -288,13 +308,22 @@ fn apply_delta(world: &mut World, local: LocalPlayer, frame: &StagedFrame, facts
         let live = world.contains(row.key);
         let claimed = claimed_by(world, local, row.key);
         match (live, claimed, row.exact) {
-            (false, _, true) | (true, true, true) => facts.push(Fact::Row {
-                key: row.key,
-                component: row.component,
-                bytes: row.bytes.to_vec(),
-                region: world.region_of(row.key),
-                claimed,
-            }),
+            // The frame's exact rows of one entity are one fact: rows come ascending by
+            // (key, component), so they are consecutive.
+            (false, _, true) | (true, true, true) => {
+                let data = ComponentData { component: row.component, bytes: row.bytes.to_vec() };
+                match facts.last_mut() {
+                    Some(Fact::Rows { key, components, .. }) if *key == row.key => {
+                        components.push(data);
+                    }
+                    _ => facts.push(Fact::Rows {
+                        key: row.key,
+                        components: vec![data],
+                        region: world.region_of(row.key),
+                        claimed,
+                    }),
+                }
+            }
             // Its spawn was lost; the server resends it.
             (false, _, false) => {}
             // The proxy's state for this tick, a kinematic body's sweep target among it.
@@ -320,6 +349,23 @@ fn apply_delta(world: &mut World, local: LocalPlayer, frame: &StagedFrame, facts
         } else if let Err(error) = world.despawn(key) {
             refused("a tombstone", key, &error);
         }
+    }
+}
+
+/// Applies a claimed spawn's claim as a full frame does: `ClaimedBy` inserted on the live
+/// `key`, or the entity spawned with every component and claimed if it is not live. Its
+/// components are left to the correction at the frame's tick.
+fn claim_spawn(world: &mut World, local: LocalPlayer, key: StableKey, spawn: &StagedSpawn) {
+    if !world.contains(key)
+        && let Err(error) = world.spawn_erased(key, spawn.region, &spawn.components)
+    {
+        refused("a claimed spawn", key, &error);
+        return;
+    }
+    if !claimed_by(world, local, key)
+        && let Err(error) = world.insert(key, ClaimedBy { player: local.player })
+    {
+        refused("a claim", key, &error);
     }
 }
 
