@@ -43,7 +43,7 @@ implementation's to reshape.
 |---|---|---|
 | `app` (the input task) | Poll the sources once per frame into one raw sample; quantise once per tick, also for catch-up ticks, without a press firing twice; put the sample in the frame and the history | `RawSample::begin_frame`, `Source::poll`; `Quantiser::next` once per tick; `PlayerInput::to_player_sample` and `SampleHistory` from `lactose-input` |
 | Presentation (milestone 2) | The latest input's yaw and pitch for the late latch, outside the boundary and the tick, without a lock | `LatestSample::{publish, read}`, `RawSample::{yaw, pitch}` |
-| Sources (milestone 5) | A way to contribute held actions, movement and camera deltas that combines across devices | `Source::poll` with `RawSample::{hold, offer_movement, turn}`; `Actions::with_bit` and `Action::NAMED` in `lactose-input` for the map's bits |
+| Sources (milestone 5) | A way to contribute held actions, movement and camera deltas that combines across devices | `Source::poll` with `RawSample::{hold, offer_movement, turn}`; `Actions::with_bit` and `Actions::GAME_FIRST` in `lactose-input` for the map's bits |
 
 ## Behaviour the signatures cannot express
 
@@ -78,15 +78,16 @@ implementation's to reshape.
   press fires once on the client as it does on the server. A fresh quantiser's previous
   sample is idle, so every action held at the first tick is also pressed in it.
 - `Quantiser::next(&mut raw)` produces, in integers: `movement` as the raw vector scaled
-  down to the unit disc if longer (a NaN component counts as zero), each component times
-  `AXIS_SCALE`, rounded to nearest with ties away from zero, saturating to `i16`; `yaw` as
-  the raw yaw reduced into `[0, TAU)`, divided by `TAU`, times `UNITS_PER_TURN`, rounded,
-  modulo `UNITS_PER_TURN` (a non-finite yaw gives zero); `pitch` as the raw pitch clamped
-  to `[-PI/2, PI/2]`, divided by `TAU`, times `UNITS_PER_TURN`, rounded, clamped to
-  `Pitch::LIMIT` (a NaN pitch gives zero); `held` as `raw.held.union(raw.latched)`, after
-  which `raw.latched` is empty; `pressed` as `held.without(previous_held)`; `released` as
-  `previous_held.without(held)`; and then `previous_held` becomes `held`. The result
-  always passes `PlayerInput::validate`.
+  down to the unit disc if longer (a NaN component counts as zero; the length is computed
+  without overflow, as `hypot` does, so a huge finite stick quantises to unit length),
+  each component times `AXIS_SCALE`, rounded to nearest with ties away from zero,
+  saturating to `i16`; `yaw` as the raw yaw reduced into `[0, TAU)`, divided by `TAU`,
+  times `UNITS_PER_TURN`, rounded, modulo `UNITS_PER_TURN` (a non-finite yaw gives zero);
+  `pitch` as the raw pitch clamped to `[-PI/2, PI/2]`, divided by `TAU`, times
+  `UNITS_PER_TURN`, rounded, clamped to `Pitch::LIMIT` (a NaN pitch gives zero); `held`
+  as `raw.held.union(raw.latched)`, after which `raw.latched` is empty; `pressed` as
+  `held.without(previous_held)`; `released` as `previous_held.without(held)`; and then
+  `previous_held` becomes `held`. The result always passes `PlayerInput::validate`.
 - The latch is why a tick never misses a tap: a tick sees the `held` set of the last poll
   before it, so a press and release between two polls (a tap under 16.7 ms at 60 Hz, or
   under 33 ms on a 30 FPS client running two catch-up ticks per frame) would otherwise
@@ -123,8 +124,8 @@ implementation's to reshape.
   and produces nothing the simulation sees except through `Quantiser::next`. No source
   exists yet.
 - `mapping` is the named place of the action map, from device controls to `Action` bits
-  and movement axes, loaded as an asset. It is empty: the generic bits above
-  `Action::NAMED` are what a map assigns.
+  and movement axes, loaded as an asset. It is empty: the game's bits, from
+  `Actions::GAME_FIRST` up, are what a map assigns.
 
 ## Not in this crate yet
 

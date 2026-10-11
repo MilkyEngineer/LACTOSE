@@ -1750,9 +1750,11 @@ rationale the author supplied during the editorial pass rather than one taken fr
     travel in the sample; the server and a replay keep no button history and a sample is a pure
     value. `throw` in 6.1 becomes `input.pressed.contains(Action::Throw)`. Rules out server-side
     edge detection and per-player state in the applier.
-  - *Named bits and generic bits share one 32-bit mask.* Bits `0..5` are `Jump`, `Throw`,
-    `Interact`, `Sprint`, `Crouch`; bits `5..32` are the game's, assigned by the milestone 5
-    action map and read by index; naming more later adds variants and changes no encoding.
+  - *Named bits and generic bits share one 32-bit mask.* Bits `0..16` (`0..Actions::GAME_FIRST`)
+    are the engine's: `0..5` are `Jump`, `Throw`, `Interact`, `Sprint`, `Crouch`, and `5..16` are
+    reserved for actions the engine names later (`Action` is non-exhaustive). Bits `16..32` are
+    the game's, assigned by the milestone 5 action map: bit `k` is `GAME_FIRST + k`. Naming more
+    adds variants and changes no encoding (corrected by the implementation, below).
   - *The applier writes with `World::insert`* and finds the player's entity through the ECS
     claim index: `World::claimed(player)` yields the rows with `ClaimedBy { player }` in
     ascending origin-key order, from an index the world maintains wherever `ClaimedBy` enters or
@@ -1811,6 +1813,22 @@ rationale the author supplied during the editorial pass rather than one taken fr
   the CAS seqlock contract; `insert_bounded`; `after_substitute`; the `Quantiser`; the glTF
   half-turn and `Yaw::rotation`; the raw sample's frame start and combining rules and the
   wrapped yaw; the `released` field; `Ok(())` for a player without an entity.
+- Implementation (milestone 1; the first review found 3 minor, the second none): every
+  `todo!()` of `lactose-input` is replaced with no signature change; `lactose-input-host` is still
+  the facade. `SampleHistory` is a ring indexed relative to its newest slot, so it is correct
+  across the `u32` wrap for any `CAPACITY`. The README's "the lookup costs the player's claims,
+  not the world" is proved by the answer among 100,000 rows and zero allocations under the tagged
+  global allocator in the test binary; the time is measured by an ignored test and reported: 46 ns
+  per lookup at 1,000 other rows and 51 ns at 100,000 (release, Apple M1, 64 players, 2,000
+  rounds; load averages 2.80 2.31 2.44 before, 3.87 2.56 2.53 after). `World::insert` allocates
+  twice per call even when overwriting (the erased copy), so the applier costs two allocations
+  per sample; the applier itself adds none. `Actions::GAME_FIRST` (16) is a fixed constant: bits
+  below it are the engine's, named by `Action` or reserved, and the game's bit `k` is
+  `GAME_FIRST + k`, so naming more engine actions never renumbers a game's bits; the facade's
+  "bits `5..32` are the game's" contradicted "naming more adds variants and changes no encoding"
+  and is corrected above. The game has 16 bits; a bit past 31 is ignored by `with_bit` and false
+  from `contains_bit`. `lactose-input` joins `[harness]` in `tools/xtask/ci-policy.toml`, and
+  CI's release step runs its golden bits.
 - Driven by: milestone 1, the `input` facade brief and its first design review (2026-10-10).
 
 **D121. The `net-api` facade and the `net-host` split: what sections 4, 5.3, 8.1, 8.2, 9.1, 9.2,

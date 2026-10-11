@@ -1,11 +1,13 @@
-//! Compile-only consumer sketches against the facade: what a game kernel, `app`,
-//! `lactose-predict`, `net` and a session applier write, type-checked and never run (every
-//! deciding body of the crate is `todo!()`). They pin the surface the README promises: a
-//! change that breaks one is a signature change to list. The host side (sources, the
-//! quantiser, the latest sample) is sketched in `lactose-input-host`.
+//! Consumer sketches: what a game kernel, `app`, `lactose-predict`, `net` and a session
+//! applier write against this crate. Written against the facade and kept as written, they
+//! pin the surface the README promises: a change that breaks one is a signature change to
+//! list. The test at the end runs them against the implementation: every world kind built
+//! as `app` builds it, a player joined and driven through the sketched `net` path with a
+//! lost tick, and the sketched kernels run. The host side (sources, the quantiser, the
+//! latest sample) is sketched in `lactose-input-host`.
 
 #![forbid(unsafe_code)]
-#![allow(dead_code, unused_variables, missing_docs)]
+#![allow(dead_code, unused_variables, missing_docs, reason = "sketches of consumers' code")]
 
 use lactose_core::{PlayerId, Result, StableKey, Tick};
 use lactose_ecs::{
@@ -62,7 +64,7 @@ fn movement(input: &PlayerInput, vel: Mut<Velocity>) {
     let facing: Quat = input.yaw.rotation();
     let pitch: Scalar = input.pitch.radians();
     let stick = input.movement.to_vec2();
-    let generic_bit_of_the_game = input.held.contains_bit(Action::NAMED + 2);
+    let generic_bit_of_the_game = input.held.contains_bit(Actions::GAME_FIRST + 2);
     vel.0 = planar * speed;
 }
 
@@ -252,4 +254,100 @@ const _: () = {
 
 fn region_of_test() -> RegionId {
     RegionId(1)
+}
+
+// ---- 7. The sketches run against the implementation ----
+
+/// Every world kind builds as `app` builds it; on the server a player joins through the
+/// sketched session applier and is driven for a few ticks through the sketched `net` path,
+/// one tick lost, while the sketched kernels run; the lookup names the joined entity and
+/// the sketched leave despawns it.
+#[test]
+fn the_sketches_run() {
+    for kind in [WorldKind::Server, WorldKind::Prediction, WorldKind::Client] {
+        app_build(kind).unwrap();
+    }
+    let executor =
+        lactose_ecs::Executor::builder().frame_workers(2).background_workers(1).build().unwrap();
+    let mut simulation = app_build(WorldKind::Server).unwrap();
+    let region = lactose_ecs::RegionConfig {
+        id: region_of_test(),
+        seed: 3,
+        mode: lactose_ecs::RegionMode::Simulated,
+    };
+    simulation.world_mut().create_region(region).unwrap();
+    replace_applier(&mut simulation);
+    let player = PlayerId(5);
+
+    // The client's window, packed and received by the server into its own.
+    let mut client = SampleHistory::new();
+    let mut queue = PlayerQueue {
+        history: SampleHistory::new(),
+        last_applied: PlayerInput::IDLE,
+        consumed: Tick(0),
+        substituting: false,
+    };
+    let throw = Actions::EMPTY.with(Action::Throw);
+    let mut entries = Vec::new();
+    for t in 1..=6u32 {
+        // The client presses `Throw` at tick 3 and holds it; tick 3 is lost on the wire.
+        let held = if t >= 3 { throw } else { Actions::EMPTY };
+        let previous = if t >= 4 { throw } else { Actions::EMPTY };
+        let input = PlayerInput {
+            held,
+            pressed: held.without(previous),
+            released: previous.without(held),
+            ..literal_sample_without_actions()
+        };
+        let frame = predict_frame(&input, Tick(t), player).unwrap();
+        assert_eq!(frame.inputs[&player].sample, input.to_sample_bytes().to_vec());
+        client.insert(Tick(t), input);
+        let window: Vec<_> = pack(&client).into_iter().filter(|(tick, _)| tick.0 != 3).collect();
+        receive(&mut queue.history, queue.consumed, &window);
+        entries.push(server_entry(&mut queue, Tick(t)));
+    }
+    assert_eq!(newest_and_count(&client), (Some(Tick(6)), 6));
+    // Tick 3 was substituted, tick 4 repaired: its press of `Throw` fires there.
+    assert_eq!(
+        entries.iter().map(|entry| entry.substituted).collect::<Vec<_>>(),
+        [false, false, true, false, false, false]
+    );
+    let applied: Vec<PlayerInput> = entries
+        .iter()
+        .map(|entry| PlayerInput::from_sample_bytes(&entry.sample).unwrap())
+        .collect();
+    let pressed: Vec<bool> =
+        applied.iter().map(|input| input.pressed.contains(Action::Throw)).collect();
+    assert_eq!(pressed, [false, false, false, true, false, false]);
+
+    for (t, entry) in (1..=6u32).zip(entries) {
+        let mut frame = TickInput::default();
+        if t == 1 {
+            frame.sessions.insert(player, SessionEvent::Join { region: region_of_test() });
+        }
+        frame.inputs.insert(player, entry);
+        simulation = executor.block_on(simulation.step(&executor, frame)).unwrap();
+        let entity = lookup(simulation.world(), player).expect("joined");
+        assert_eq!(simulation.world().get::<PlayerInput>(entity), Some(&applied[t as usize - 1]));
+    }
+    // The bomb thrown at tick 4 exists, and the movement kernel wrote the velocity.
+    let entity = lookup(simulation.world(), player).unwrap();
+    assert_ne!(simulation.world().get::<Velocity>(entity).map(|v| v.0), Some(Vec3::ZERO));
+    assert_eq!(simulation.world_mut().query::<&Bomb>().count(), 1);
+
+    let mut frame = TickInput::default();
+    frame.sessions.insert(player, SessionEvent::Leave);
+    simulation = executor.block_on(simulation.step(&executor, frame)).unwrap();
+    assert_eq!(lookup(simulation.world(), player), None);
+    assert!(!simulation.world().contains(entity));
+}
+
+/// `literal_sample` with no action, so the test's own edges are the only ones.
+fn literal_sample_without_actions() -> PlayerInput {
+    PlayerInput {
+        held: Actions::EMPTY,
+        pressed: Actions::EMPTY,
+        released: Actions::EMPTY,
+        ..literal_sample()
+    }
 }

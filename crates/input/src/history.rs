@@ -27,7 +27,14 @@ pub const REDUNDANT_SAMPLES: usize = 8;
 /// than 2^31 apart, the ECS's own rule.
 #[derive(Clone, Debug)]
 pub struct SampleHistory {
+    /// A ring: the slot of the tick `age` ticks older than `newest` is
+    /// `(head + CAPACITY - age) % CAPACITY`, so the window moves without shifting and the
+    /// slot of a tick never depends on its absolute value, which keeps the ring correct
+    /// across the `u32` wrap whatever `CAPACITY` is.
     slots: [Option<PlayerInput>; REDUNDANT_SAMPLES],
+    /// The slot of `newest`.
+    head: usize,
+    /// The newest tick inserted; its slot is never empty.
     newest: Option<Tick>,
 }
 
@@ -38,7 +45,7 @@ impl SampleHistory {
     /// An empty history.
     #[must_use]
     pub const fn new() -> Self {
-        Self { slots: [None; REDUNDANT_SAMPLES], newest: None }
+        Self { slots: [None; REDUNDANT_SAMPLES], head: 0, newest: None }
     }
 
     /// Stores `input` as the sample of `tick` and reports whether it was stored. A tick
@@ -47,7 +54,29 @@ impl SampleHistory {
     /// `false`) if the slot holds a sample already, so the first delivery of a tick wins;
     /// a tick older than the window is ignored. The client's path, one call per tick.
     pub fn insert(&mut self, tick: Tick, input: PlayerInput) -> bool {
-        todo!()
+        let Some(newest) = self.newest else {
+            self.newest = Some(tick);
+            self.slots[self.head] = Some(input);
+            return true;
+        };
+        let ahead = difference(tick, newest);
+        if ahead > 0 {
+            let ahead = ahead.unsigned_abs() as usize;
+            for step in 1..=ahead.min(Self::CAPACITY) {
+                self.slots[(self.head + step) % Self::CAPACITY] = None;
+            }
+            self.head = (self.head + ahead % Self::CAPACITY) % Self::CAPACITY;
+            self.newest = Some(tick);
+            self.slots[self.head] = Some(input);
+            return true;
+        }
+        match self.slot(tick) {
+            Some(slot) if self.slots[slot].is_none() => {
+                self.slots[slot] = Some(input);
+                true
+            }
+            _ => false,
+        }
     }
 
     /// [`insert`](Self::insert) restricted to the ticks the server can still apply: `tick`
@@ -58,38 +87,51 @@ impl SampleHistory {
     /// nor resurrect one already applied. `net` keeps the consumed tick, and may keep a
     /// buffer of its own depth in front of this one.
     pub fn insert_bounded(&mut self, consumed: Tick, tick: Tick, input: PlayerInput) -> bool {
-        todo!()
+        let ahead = difference(tick, consumed);
+        ahead >= 1 && ahead.unsigned_abs() as usize <= Self::CAPACITY && self.insert(tick, input)
     }
 
     /// The sample of `tick`, if the window holds it.
     #[must_use]
     pub fn get(&self, tick: Tick) -> Option<&PlayerInput> {
-        todo!()
+        self.slots[self.slot(tick)?].as_ref()
     }
 
     /// The newest tick inserted and its sample.
     #[must_use]
     pub fn newest(&self) -> Option<(Tick, &PlayerInput)> {
-        todo!()
+        Some((self.newest?, self.slots[self.head].as_ref()?))
     }
 
     /// Every held sample, in ascending tick order: what the client packs into a packet.
     #[must_use]
     pub fn iter(&self) -> SampleIter<'_> {
-        todo!()
+        SampleIter { history: self, next: 0 }
     }
 
     /// How many slots hold a sample.
     #[must_use]
     pub fn len(&self) -> usize {
-        todo!()
+        self.slots.iter().filter(|slot| slot.is_some()).count()
     }
 
     /// Whether no slot holds a sample.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        todo!()
+        self.newest.is_none()
     }
+
+    /// The slot of `tick`, if the window spans it.
+    fn slot(&self, tick: Tick) -> Option<usize> {
+        let age = difference(self.newest?, tick);
+        let age = usize::try_from(age).ok().filter(|&age| age < Self::CAPACITY)?;
+        Some((self.head + Self::CAPACITY - age) % Self::CAPACITY)
+    }
+}
+
+/// How far `tick` is after `other`, by wrapping difference: negative when it is before.
+fn difference(tick: Tick, other: Tick) -> i32 {
+    tick.0.wrapping_sub(other.0) as i32
 }
 
 impl Default for SampleHistory {
@@ -103,6 +145,7 @@ impl Default for SampleHistory {
 #[derive(Clone, Debug)]
 pub struct SampleIter<'a> {
     history: &'a SampleHistory,
+    /// How many of the window's ticks, oldest first, have been visited.
     next: usize,
 }
 
@@ -110,7 +153,18 @@ impl<'a> Iterator for SampleIter<'a> {
     type Item = (Tick, &'a PlayerInput);
 
     fn next(&mut self) -> Option<Self::Item> {
-        todo!()
+        let newest = self.history.newest?;
+        while self.next < SampleHistory::CAPACITY {
+            let age = SampleHistory::CAPACITY - 1 - self.next;
+            self.next += 1;
+            let slot =
+                (self.history.head + SampleHistory::CAPACITY - age) % SampleHistory::CAPACITY;
+            if let Some(input) = &self.history.slots[slot] {
+                // `age < CAPACITY`, far below `u32::MAX`.
+                return Some((Tick(newest.0.wrapping_sub(age as u32)), input));
+            }
+        }
+        None
     }
 }
 

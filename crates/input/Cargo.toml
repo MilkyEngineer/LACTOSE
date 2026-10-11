@@ -19,5 +19,11 @@ lactose-reflect.workspace = true
 # The applier hook, `PlayerSample`, `StreamingAnchor` and the registration surface.
 lactose-sim.workspace = true
 
+[dev-dependencies]
+# The SOUR test builds its executor the way a SOUR test does (`ChaosConfig`); a
+# dev-dependency, so the boundary allowlist is untouched and the library names nothing of
+# `task` (as in `lactose-sim`).
+lactose-task.workspace = true
+
 [lints]
 workspace = true

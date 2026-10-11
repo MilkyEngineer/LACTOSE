@@ -7,7 +7,7 @@
 //! sample gives the same bits on every target. No float enters from the host side:
 //! quantisation is `lactose-input-host`'s, outside the boundary.
 
-use lactose_core::{Result, Tick};
+use lactose_core::{Error, ErrorKind, Result, Tick};
 use lactose_math::{Quat, Scalar, Vec2, Vec3};
 use lactose_reflect::{component, value};
 use lactose_sim::PlayerSample;
@@ -48,7 +48,11 @@ impl Axis2 {
     /// division per component.
     #[must_use]
     pub fn to_vec2(self) -> Vec2 {
-        todo!()
+        let scale = Scalar::from_i32(i32::from(AXIS_SCALE));
+        Vec2::new(
+            Scalar::from_i32(i32::from(self.x)) / scale,
+            Scalar::from_i32(i32::from(self.y)) / scale,
+        )
     }
 }
 
@@ -72,7 +76,7 @@ impl Yaw {
     /// division by a power of two is exact and the product rounds once.
     #[must_use]
     pub fn radians(self) -> Scalar {
-        todo!()
+        Scalar::from_u32(u32::from(self.0)) / Scalar::from_u32(UNITS_PER_TURN) * Scalar::TAU
     }
 
     /// The yaw as a rotation about `+Y`: `Quat::from_rotation_y(self.radians())`, which
@@ -81,7 +85,7 @@ impl Yaw {
     /// skeleton composes with.
     #[must_use]
     pub fn rotation(self) -> Quat {
-        todo!()
+        Quat::from_rotation_y(self.radians())
     }
 }
 
@@ -105,7 +109,7 @@ impl Pitch {
     /// Whether the pitch is within `[-LIMIT, LIMIT]`.
     #[must_use]
     pub const fn is_valid(self) -> bool {
-        todo!()
+        self.0 >= -Self::LIMIT && self.0 <= Self::LIMIT
     }
 
     /// The pitch in radians, in `[-PI/2, PI/2]` for a valid pitch:
@@ -113,16 +117,19 @@ impl Pitch {
     /// division exact and the product rounded once.
     #[must_use]
     pub fn radians(self) -> Scalar {
-        todo!()
+        Scalar::from_i32(i32::from(self.0)) / Scalar::from_u32(UNITS_PER_TURN) * Scalar::TAU
     }
 }
 
-/// A named action bit of [`Actions`]: the fixed set milestone 1 names. The discriminant is
-/// the bit. Bits from [`Action::NAMED`] up to [`Actions::BITS`] belong to the game, mapped
-/// by milestone 5's action map and read by index through [`Actions::contains_bit`]; a
-/// later milestone may name more of them, which adds variants and changes no encoding.
+/// A named action bit of [`Actions`]: the engine's actions, the set milestone 1 names. The
+/// discriminant is the bit. Every named bit is below [`Actions::GAME_FIRST`]; a later
+/// milestone may name more of the engine's bits below it, which adds variants (hence
+/// `non_exhaustive`) and moves no bit. The bits from [`Actions::GAME_FIRST`] up belong to
+/// the game, mapped by milestone 5's action map and read by index through
+/// [`Actions::contains_bit`].
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 #[repr(u8)]
+#[non_exhaustive]
 pub enum Action {
     /// Jump.
     Jump = 0,
@@ -138,6 +145,8 @@ pub enum Action {
 
 impl Action {
     /// How many low bits are named: the bits below this are the variants above, in order.
+    /// It grows when a variant is added, never past [`Actions::GAME_FIRST`]; a game's bit is
+    /// numbered from `GAME_FIRST`, never from this.
     pub const NAMED: u8 = 5;
 
     /// The bit this action occupies.
@@ -160,8 +169,13 @@ pub struct Actions(
 impl Actions {
     /// No action.
     pub const EMPTY: Self = Self(0);
-    /// The number of bits, named and generic together.
+    /// The number of bits, the engine's and the game's together.
     pub const BITS: u8 = 32;
+    /// The first of the game's bits, which never changes: the bits below it are the
+    /// engine's, named by [`Action`] or reserved for it, and the game's bit `k` is
+    /// `GAME_FIRST + k`, read with [`contains_bit`](Self::contains_bit) and set with
+    /// [`with_bit`](Self::with_bit). Part of the sample's encoding.
+    pub const GAME_FIRST: u8 = 16;
 
     /// The set with exactly the bits of `bits`.
     #[must_use]
@@ -309,7 +323,39 @@ impl PlayerInput {
     /// Every other field accepts every bit pattern of its width. The quantiser's output
     /// always passes; a forged image that does not is refused before it reaches a row.
     pub fn validate(&self) -> Result<()> {
-        todo!()
+        if !self.pitch.is_valid() {
+            return Err(invalid(format!(
+                "player input pitch {} is outside the quarter-turn limit {}",
+                self.pitch.0,
+                Pitch::LIMIT
+            )));
+        }
+        let Axis2 { x, y } = self.movement;
+        if x == i16::MIN || y == i16::MIN {
+            return Err(invalid(format!("player input movement ({x}, {y}) holds `i16::MIN`")));
+        }
+        // In 64 bits nothing overflows: each square is below 2^30.
+        let (x, y, scale) = (i64::from(x), i64::from(y), i64::from(AXIS_SCALE));
+        if x * x + y * y > scale * scale + 2 * scale {
+            return Err(invalid(format!(
+                "player input movement ({x}, {y}) lies outside the unit disc and its rounding"
+            )));
+        }
+        if !self.pressed.without(self.held).is_empty() {
+            return Err(invalid(format!(
+                "player input presses {:#x}, which it does not hold ({:#x})",
+                self.pressed.bits(),
+                self.held.bits()
+            )));
+        }
+        if !self.released.intersection(self.held).is_empty() {
+            return Err(invalid(format!(
+                "player input releases {:#x}, which it holds ({:#x})",
+                self.released.bits(),
+                self.held.bits()
+            )));
+        }
+        Ok(())
     }
 
     /// The byte image: the twenty memory bytes of the value, which on every supported
@@ -321,7 +367,9 @@ impl PlayerInput {
     /// so no version byte is in the image.
     #[must_use]
     pub fn to_sample_bytes(&self) -> [u8; SAMPLE_SIZE] {
-        todo!()
+        let mut image = [0; SAMPLE_SIZE];
+        image.copy_from_slice(lactose_reflect::bytemuck::bytes_of(self));
+        image
     }
 
     /// The value whose image `bytes` is: exactly [`SAMPLE_SIZE`] bytes, read through the
@@ -331,7 +379,15 @@ impl PlayerInput {
     /// a malformed image never reaches a frame; the applier runs it again and drops what
     /// fails, and the tick runs.
     pub fn from_sample_bytes(bytes: &[u8]) -> Result<Self> {
-        todo!()
+        if bytes.len() != SAMPLE_SIZE {
+            return Err(invalid(format!(
+                "a player input image is {SAMPLE_SIZE} bytes, not {}",
+                bytes.len()
+            )));
+        }
+        let input: Self = lactose_reflect::decode(bytes)?;
+        input.validate()?;
+        Ok(input)
     }
 
     /// The frame entry for this sample at `input_tick`: `PlayerSample { input_tick,
@@ -341,7 +397,7 @@ impl PlayerInput {
     /// [`substitute`](Self::substitute).
     #[must_use]
     pub fn to_player_sample(&self, input_tick: Tick) -> PlayerSample {
-        todo!()
+        PlayerSample { input_tick, substituted: false, sample: self.to_sample_bytes().to_vec() }
     }
 
     /// The sample the server applies for a tick whose sample is still missing after
@@ -352,7 +408,7 @@ impl PlayerInput {
     /// sets `substituted` on the frame entry so the journal records the substitution.
     #[must_use]
     pub fn substitute(&self) -> Self {
-        todo!()
+        Self { pressed: Actions::EMPTY, released: Actions::EMPTY, ..*self }
     }
 
     /// This sample, the first one delivered after one or more substitutes, with its edges
@@ -367,7 +423,11 @@ impl PlayerInput {
     /// the journal records the applied bytes.
     #[must_use]
     pub fn after_substitute(&self, applied: &PlayerInput) -> Self {
-        todo!()
+        Self {
+            pressed: self.held.without(applied.held),
+            released: applied.held.without(self.held),
+            ..*self
+        }
     }
 
     /// The unit direction the camera looks along, in the world frame of the crate
@@ -377,7 +437,9 @@ impl PlayerInput {
     /// idle sample it is `-Vec3::Z`. The `aim` of the architecture section 6.1 example.
     #[must_use]
     pub fn aim(&self) -> Vec3 {
-        todo!()
+        let (sin_y, cos_y) = self.yaw.radians().sin_cos();
+        let (sin_p, cos_p) = self.pitch.radians().sin_cos();
+        Vec3::new(-(cos_p * sin_y), sin_p, -(cos_p * cos_y))
     }
 
     /// The movement vector in the world frame, on the horizontal plane: `movement.y`
@@ -389,6 +451,43 @@ impl PlayerInput {
     /// movement direction).
     #[must_use]
     pub fn world_movement(&self) -> Vec3 {
-        todo!()
+        let m = self.movement.to_vec2();
+        let (sin_y, cos_y) = self.yaw.radians().sin_cos();
+        Vec3::new(m.x * cos_y - m.y * sin_y, Scalar::ZERO, -(m.x * sin_y + m.y * cos_y))
+    }
+}
+
+fn invalid(message: String) -> Error {
+    Error::new(ErrorKind::InvalidData, message)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every named action is one of the engine's bits, below `Actions::GAME_FIRST`, and the
+    /// named bits are exactly `0..Action::NAMED`. The match has no wildcard, so a new variant
+    /// does not compile until it is listed here and checked.
+    #[test]
+    fn every_named_action_is_below_the_games_bits() {
+        let index = |action: Action| match action {
+            Action::Jump => 0,
+            Action::Throw => 1,
+            Action::Interact => 2,
+            Action::Sprint => 3,
+            Action::Crouch => 4,
+        };
+        let all = [Action::Jump, Action::Throw, Action::Interact, Action::Sprint, Action::Crouch];
+        for (position, action) in all.into_iter().enumerate() {
+            assert_eq!(index(action), position);
+            assert_eq!(usize::from(action.bit()), position, "{action:?}");
+            assert!(action.bit() < Actions::GAME_FIRST, "{action:?}");
+        }
+        assert_eq!(all.len(), usize::from(Action::NAMED));
+        const { assert!(Action::NAMED <= Actions::GAME_FIRST) };
+        // The game's first bit is readable and writable, and distinct from every named one.
+        let game = Actions::EMPTY.with_bit(Actions::GAME_FIRST);
+        assert!(game.contains_bit(Actions::GAME_FIRST));
+        assert!(all.into_iter().all(|action| !game.contains(action)));
     }
 }
