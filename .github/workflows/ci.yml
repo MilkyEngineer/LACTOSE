@@ -19,26 +19,39 @@ env:
 # Architecture section 20: a pull request run finishes in fifteen minutes. Every job carries
 # that as its timeout, the jobs run in parallel, and the cheap policy checks share one Linux
 # job so they pay for one checkout, one cache restore and one build of the CI driver. Windows
-# clippy has a job of its own, so it runs beside the Windows test build instead of before it.
+# clippy and the Windows release tests have a job of their own, so they run beside the
+# Windows debug test build instead of before and after it.
 #
-# Where each job's budget goes, in minutes, from runs 38126112367 and 38126882535 (105 and 110
-# test binaries). rust-cache restores the dependencies; the workspace crates and the vendored
-# rapier3d-f64 are path crates, so every run compiles and links them again.
-# - check (windows-latest), 12.5 in the one whole run, then over 15, with clippy still in it:
-#   setup 0.5-1.3, clippy 0.8-1.9, the test build 7.0-9.4 (the same commit took both on two
-#   runners), the test run 0.8-1.3, doctests 0.1, the release golden vectors 0.9-1.2, cache
-#   save 0.2. Without clippy that is 9.5-13.5. The test build runs 1.4 to 2.3 times Linux's,
-#   by about as much in its early phase, which links almost nothing, as in its late one,
-#   which links the test binaries: the time is rustc's on this runner, not the linker's.
-#   lld-link (.cargo/config.toml) replaces link.exe for the part that is the linker's. The
-#   next lever is one integration-test binary per crate: lactose-ecs's 22 built as one took
-#   5.2 s instead of 14 on an M1 at -j4.
-# - clippy (windows-latest), 1.5-3.4 with a warm cache: setup 0.5-1.3, clippy 0.8-1.9.
-# - check (ubuntu-latest), 6.4-6.9: setup 0.3, clippy 0.4-1.0, the test build 3.8-4.6, the
-#   test run 0.4-0.6, the release golden vectors 0.4-0.6. It links with lld already.
-# - check (macos-latest), 2.0-2.6: the test build 1.0-1.3, clippy 0.1-0.5.
+# Where each job's budget goes, in minutes. rust-cache restores the dependencies; the
+# workspace crates and the vendored rapier3d-f64 are path crates, so every run compiles and
+# links them again, and the Windows test build grows with every crate merged.
+# - check (windows-latest). Run 38128490654 (f70c25f), with clippy and the release tests still
+#   in it, took 14.8 of its 15: setup 0.7, clippy 1.0, the test step 11.2 (its build 9.9, the
+#   run 1.2), doctests 0.1, the release golden vectors 1.3, cache save 0.4. The margin was
+#   under a minute warm, and about a minute without clippy. The job grew with each merge: 8.5,
+#   7.8, 9.2, 10.1, 11.3, 12.6, a timeout, 14.8. Without clippy and the release tests it is
+#   about 12.6, a margin of about 2.4 warm, which the next one or two crate merges use up.
+#   The test build runs 1.4 to 2.3 times Linux's, by about as much in its early phase, which
+#   links almost nothing, as in its late one, which links the test binaries: the time is
+#   rustc's on this runner, not the linker's. lld-link (.cargo/config.toml) takes the part that
+#   is the linker's. Its first run rebuilds every dependency, since the linker is part of each
+#   unit's fingerprint: an estimated 2 to 3 minutes more, which may time out; cache-on-failure
+#   saves what it built, so the run after it is warm. Due now, as its own lane: one
+#   integration-test binary per crate. lactose-ecs's 22 built as one took 5.2 s instead of 14
+#   on an M1 at -j4.
+# - windows-lint-release, an estimated 3.5 to 4 warm and 6 to 8 cold: setup 0.7 plus the cache
+#   restore and save, clippy 1.0 warm (4 to 6 cold), the release golden vectors 1.3.
+# - check (ubuntu-latest), 6.4-6.9 in runs 38126112367 and 38126882535: setup 0.3, clippy
+#   0.4-1.0, the test build 3.8-4.6, the test run 0.4-0.6, the release golden vectors 0.4-0.6.
+#   It links with lld already.
+# - check (macos-latest), 2.0-2.6 in the same runs: the test build 1.0-1.3, clippy 0.1-0.5.
 # - policy, 0.6-0.7: building the CI driver 0.25, the checks 0.1.
 # - sour, 4.2-4.8: the build of the harness packages' tests 2.9, three passes of 0.3 each.
+#
+# rust-cache keys every cache by job ID (its default add-job-id-key), so each job restores and
+# saves only its own. No job here may set `shared-key`, which drops the job ID: the Windows
+# jobs would then restore and overwrite each other's cache. cache-on-failure on check and
+# windows-lint-release saves the dependencies a timed-out cold run built.
 jobs:
   check:
     name: check (${{ matrix.os }})
@@ -53,13 +66,15 @@ jobs:
       # rust-toolchain.toml selects the toolchain; rustup installs it on first use.
       - run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest
       - name: Format
         if: matrix.os == 'ubuntu-latest'
         run: cargo fmt --all --check
-      # Windows clippy runs in the clippy-windows job, beside this job's test build.
+      # Windows clippy runs in the windows-lint-release job, beside this job's test build.
       - name: Clippy
         if: matrix.os != 'windows-latest'
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
@@ -68,25 +83,36 @@ jobs:
       # nextest does not run doctests; the compile_fail ones pin safety arguments.
       - name: Doctests
         run: cargo test --doc --workspace --locked
-      # Release codegen differs from debug; the golden table must hold in both.
+      # Release codegen differs from debug; the golden table must hold in both. Windows runs
+      # it in the windows-lint-release job.
       - name: Math golden vectors (release)
+        if: matrix.os != 'windows-latest'
         run: cargo nextest run -p lactose-math -p lactose-input --release --locked
 
-  # Clippy for Windows, where cfg-gated code (the executor's core-type query, thread classes)
-  # differs from the other two platforms. rust-cache keys each cache by job ID (its default
-  # add-job-id-key), so this job saves and restores `v0-rust-clippy-windows-...` and the test
-  # job `v0-rust-check-...`: neither restores or overwrites the other's, and each cache holds
-  # only what its own job builds.
-  clippy-windows:
-    name: clippy (windows-latest)
+  # Clippy and the release golden vectors for Windows, beside the Windows debug test build.
+  # Windows clippy matters on its own: cfg-gated code (the executor's core-type query, thread
+  # classes) differs from the other two platforms. This job's cache is
+  # `v0-rust-windows-lint-release-...` and the test job's `v0-rust-check-...`, so neither
+  # restores or overwrites the other's, and each holds only what its own job builds.
+  windows-lint-release:
+    name: clippy and release tests (windows-latest)
     runs-on: windows-latest
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      # Runs even if clippy found something, so one run reports both.
+      - name: Math golden vectors (release)
+        if: success() || failure()
+        run: cargo nextest run -p lactose-math -p lactose-input --release --locked
 
   # The rules that are facts about manifests and files: crate-tiers.toml, the boundary's
   # static checks, the feature trees and cargo-deny. Each step runs even if an earlier one
