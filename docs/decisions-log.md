@@ -2431,6 +2431,52 @@ checkpoint carries the physics snapshot** (§1, §2, §9.4, §10, §15.5, §16, 
   decision's reload rule); `crates/sim/README.md`'s "dropped at a checkpoint, as solver
   state is".
 
+**D125. Linkers in CI and dev builds, and the Windows jobs: lld-link on Windows, clippy and the
+release golden vectors beside the Windows test build** (§18, §20, `.cargo/config.toml`,
+`.github/workflows/ci.yml`)
+- Why: check (windows-latest) took 889 s of its 900 on main f70c25f (run 38128490654) and grew
+  508, 466, 552, 606, 680, 754 s, a timeout, then 889 s across successive merges, about a
+  minute per crate merged; section 20's budget is fifteen minutes per run.
+- *Windows links with lld-link.* `.cargo/config.toml` sets `linker = "rust-lld"` for
+  x86_64-pc-windows-msvc. rust-lld ships in the sysroot of the pinned x86_64-pc-windows-msvc
+  1.99.0 toolchain (`lib/rustlib/x86_64-pc-windows-msvc/bin`); rustc puts that directory on the
+  linker's PATH and drives it as lld-link (`-flavor link`) with the MSVC library paths, so the
+  runners need no install step. Only the linker is set; the x86-64-v3 pin stays the only rust
+  flags, and RUSTFLAGS is never set.
+- *Linux and macOS.* x86_64-unknown-linux-gnu needs no entry: rustc links it with its bundled
+  lld by default since 1.90. mold was not taken: lld already covers what section 18 asks, and
+  mold would need an install on every runner and developer machine. macOS keeps Apple's linker.
+- *Scope.* Section 18 asks for a fast linker in dev builds, but cargo has no per-profile linker
+  key: the setting covers every profile, build scripts, proc-macros and doctests on the target.
+  Accepted: lld-link is a production linker, and the release golden vectors link as the debug
+  tests do.
+- *Why it is not the whole fix.* The Windows test build runs 1.4 to 2.3 times Linux's, about as
+  much in the early phase, which links almost nothing (190 s of the 9m56s build in run
+  38128490654), as in the late phase, which links the test binaries (407 s); the linker's share
+  is estimated small (linking was 4.3% of the test build's core-seconds on an M1 with
+  ld-prime). The rest is rustc on the Windows runner.
+- *Clippy and the release golden vectors move beside the Windows test build.* They run in
+  windows-lint-release, "clippy and release tests (windows-latest)", and check (windows-latest)
+  skips both. With both moved the check job is estimated at about 12.6 minutes, a margin of
+  about 2.4 warm. The cost is a second Windows runner per run: its setup plus a cache restore
+  and save, about 1 to 1.5 Windows minutes on top of the 2.3 the moved steps took. rust-cache
+  keys caches by job ID, so the two Windows jobs never restore or overwrite each other's cache,
+  and no job may set `shared-key`.
+- *Cold runs and the cache.* The linker is part of every unit's fingerprint, so the first run
+  after the change rebuilds every dependency, an estimated 2 to 3 minutes more, which may hit
+  the timeout; both Windows jobs set `cache-on-failure: true`, so a run that times out late in
+  its build saves what it built. rust-cache saves only when its key missed, so a run on a new
+  key that fails or is cancelled before its build finishes leaves a partial entry that later
+  runs restore and never replace, until Cargo.lock, a manifest, `.cargo/config.toml` or the
+  toolchain changes; recovery is `gh cache list --key v0-rust-check-Windows` then `gh cache
+  delete <key>`. A push that changes the cache key is pushed alone, and nothing follows it
+  until its Windows check run completes.
+- *Next lever, due now.* The margin covers one or two more crate merges. One integration-test
+  binary per crate is the next CI lane: lactose-ecs's 22 test binaries built as one took 5.2 s
+  instead of 14 (M1, -j4, CARGO_INCREMENTAL=0).
+- Driven by: the Windows CI timeout of run 38126882535 and the CI link lane with two review
+  rounds (2026-10-11).
+
 ## 10. Review history
 
 - **Revision 1** (`a29af04`): the design baseline.
