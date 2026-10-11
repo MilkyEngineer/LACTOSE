@@ -28,4 +28,4 @@ packages = []
 # Their feature trees are compared with dev-dependencies included, since a test build
 # compiles them. Once `lactose-sim` exists this list may not be empty.
 [harness]
-packages = ["lactose-sim", "lactose-physics-api"]
+packages = ["lactose-sim", "lactose-physics-api", "lactose-net-api"]

@@ -15,13 +15,13 @@ messages) is `lactose-net-host`, outside the boundary.
 | Determinism boundary | inside |
 | Unsafe | none, `#![forbid(unsafe_code)]` |
 
-**Status: facade.** Every public signature is final and every body that decides anything is
-`todo!()`; nothing here runs. This file is the contract the implementation lane meets, and
-every sentence under "Behaviour the signatures cannot express" is one a dependent crate may
-rely on. Architecture sections 4, 5.3, 6, 7, 8.1, 8.2, 9.2, 9.3, 9.4, 9.5, 10, 11, 14 and
-15.2 are the design; where this file and the architecture disagree, the architecture wins
-and this file is wrong. Decision D121 records the choices those sections left open, for
-this crate and for `lactose-net-host` together, and what the first design review changed.
+**Status: implemented for milestone 1.** Every body runs and every sentence under "Behaviour
+the signatures cannot express" is one a dependent crate may rely on; "Proof for milestone 1"
+names the test that holds each. Architecture sections 4, 5.3, 6, 7, 8.1, 8.2, 9.2, 9.3,
+9.4, 9.5, 10, 11, 14 and 15.2 are the design; where this file and the architecture
+disagree, the architecture wins and this file is wrong. Decision D121 records the choices
+those sections left open, for this crate and for `lactose-net-host` together, and what the
+first design review changed.
 `crates/sim/README.md` is the contract the hook and the pass here meet ("The input sync
 point": `StagedState`; "Runs": `run_passes` and `Pass::Gather`; "Regions": `RegionExport`
 and the relevance overlay) and `crates/ecs/README.md` the storage contract they write
@@ -31,7 +31,7 @@ against (`ErasedColumn::changed_since`, `World::move_to_region`, `World::spawn`,
 Amending a signature is allowed in the change that needs it. Say so in the change
 description and list what changed, because `app`, `lactose-net`, `lactose-net-host`,
 `lactose-predict`, `lactose-persist` and the milestone 1 spike are written against this
-surface. `tests/consumers.rs` is a compile-only sketch of what each of them writes: a
+surface. `tests/consumers.rs` sketches what each of them writes and runs the sketches: a
 change that breaks it is a signature change to list.
 
 ## Surface
@@ -263,8 +263,12 @@ which `build`'s `derived` check does not see.
   same rule.
 - `GatherState` is the frame's owner. `gather` merges into the frame `app` has not taken
   (`StagingFrame::merge`: a newer row replaces an older one for the same (key, component),
-  structural entries append, a full frame supersedes), so a frame not taken loses nothing
-  and the frame never holds two values of one row; `take` moves it out between runs,
+  structural entries append, a full frame supersedes; and the newer frame's structure
+  applies to the older rows: a row of an entity it despawned or of a component it removed
+  goes, a row of an entity it moved is re-homed to the region the entity resides in now),
+  so a frame not taken loses nothing, the frame never holds two values of one row, and the
+  merged frame equals what one gather over both windows would have produced; a full older
+  frame stays full and keeps `structural` empty; `take` moves it out between runs,
   leaving an empty frame at the same tick, and the packer owns and drops it. Nothing else
   clears it. `app`'s between-run access is `Simulation::world_mut().service_mut::<
   GatherState>()`, an access to `net`'s output and not to the world's state (the sim README
@@ -335,12 +339,15 @@ which `build`'s `derived` check does not see.
 
 ## Proof for milestone 1
 
-Nothing runs yet. The implementation lane replaces every `todo!()` and proves:
+Every row below holds under `cargo nextest run -p lactose-net-api`; the last column names
+the test file under `tests/` that holds it (or the unit tests in `src/staging.rs`).
+`tests/consumers.rs` also runs every dependent's sketch, and `tests/sour.rs` replicates a
+scripted scene to a client under SOUR and records both worlds' hashes.
 
-| What | How |
-|---|---|
-| The gather | Under SOUR's layout mode: a world with replicated rows changed on several ticks gives the same `StagingFrame` (rows, order, bytes, structural entries) under every chunk capacity and order and with one or many workers; a second gather with nothing changed is empty; a `world_mut` write between gathers appears exactly once; a `set_tick`-driven stamp rebase or a restore makes the next frame `full` with `structural` empty; a retention below the catch-up cap makes every gather after a catch-up frame full; a frame not taken merges with the next and holds one value per row, the newer; `region(r)` equals the rows of `r` in `rows()`; a `Moved` entry is in `structural` |
-| The staged frame | `push_row` keeps the newest tick and returns `false` otherwise; `rows` ascend by (key, component); `is_empty` is exact, `removed` included; `StagedInbox::push` refuses a frame not after the newest ever accepted, also after a pop, `due` and `pop_through` agree and hand frames up to a tick oldest first; the sketch hook applied to a world leaves spawns bound, `RemoteSlot` set, a live entity upserted with its slot set or removed, moves applied once, removed components gone (and re-added by a row of the same frame), rows written and tombstoned entities gone, an equal row leaves the row's stamp alone, and a failing entry leaves the rest of the frame applied; a region loaded by its bundle and then spawned by the stream ends with `RemoteSlot` set; a full frame over a client that holds stale rows ends with the frame's values and slots |
-| The fold | Under the real sim: a frame for the tick the next step runs is folded and popped in that step (worlds built at 10, a full frame for 10, a delta for 12 loading a region and spawning into it: the region is loaded and the entity live after the step for 12); Relevant then Irrelevant in one step leaves the region unloaded; Irrelevant then Relevant unloads and loads it; a refused frame enters nothing; a full frame unloads every loaded region and reloads the relevant ones; a delta then a full frame due in one step load exactly the full frame's regions |
-| The gather's decision | A stale cursor with a current mark gives a full frame with every row, none skipped; a current cursor with a stale mark the same |
-| The relevance message | `from_export` copies the seed, resources and transient keys; `to_bundle` builds the bundle the sim loads, and refuses the wrong baseline, a digest without a cache or with another digest, and an overlay against another baseline, each as `VersionMismatch` |
+| What | How | Held by |
+|---|---|---|
+| The gather | Under SOUR's layout mode: a world with replicated rows changed on several ticks gives the same `StagingFrame` (rows, order, bytes, structural entries) under every chunk capacity and order and with one or many workers; a second gather with nothing changed is empty; a `world_mut` write between gathers appears exactly once; a `set_tick`-driven stamp rebase or a restore makes the next frame `full` with `structural` empty; a retention below the catch-up cap makes every gather after a catch-up frame full; a frame not taken merges with the next and holds one value per row, the newer; `region(r)` equals the rows of `r` in `rows()`; a `Moved` entry is in `structural` | `gather.rs` |
+| The staged frame | `push_row` keeps the newest tick and returns `false` otherwise; `rows` ascend by (key, component); `is_empty` is exact, `removed` included; `StagedInbox::push` refuses a frame not after the newest ever accepted, also after a pop, `due` and `pop_through` agree and hand frames up to a tick oldest first; the sketch hook applied to a world leaves spawns bound, `RemoteSlot` set, a live entity upserted with its slot set or removed, moves applied once, removed components gone (and re-added by a row of the same frame), rows written and tombstoned entities gone, an equal row leaves the row's stamp alone, and a failing entry leaves the rest of the frame applied; a region loaded by its bundle and then spawned by the stream ends with `RemoteSlot` set; a full frame over a client that holds stale rows ends with the frame's values and slots | `staged.rs` |
+| The fold | Under the real sim: a frame for the tick the next step runs is folded and popped in that step (worlds built at 10, a full frame for 10, a delta for 12 loading a region and spawning into it: the region is loaded and the entity live after the step for 12); Relevant then Irrelevant in one step leaves the region unloaded; Irrelevant then Relevant unloads and loads it; a refused frame enters nothing; a full frame unloads every loaded region and reloads the relevant ones; a delta then a full frame due in one step load exactly the full frame's regions | `fold.rs` |
+| The gather's decision | A stale cursor with a current mark gives a full frame with every row, none skipped; a current cursor with a stale mark the same | `gather.rs` (stale cursor), `src/staging.rs` (stale mark, which no public call reaches: every epoch change also resets the structural log) |
+| The relevance message | `from_export` copies the seed, resources and transient keys; `to_bundle` builds the bundle the sim loads, and refuses the wrong baseline, a digest without a cache or with another digest, and an overlay against another baseline, each as `VersionMismatch` | `relevance.rs` |

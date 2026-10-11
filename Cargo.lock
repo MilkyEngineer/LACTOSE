@@ -236,6 +236,7 @@ dependencies = [
  "lactose-ecs",
  "lactose-reflect",
  "lactose-sim",
+ "lactose-task",
 ]
 
 [[package]]
