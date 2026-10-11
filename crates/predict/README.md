@@ -13,10 +13,9 @@ the milestone 1 measurement says so; nothing here would change if they were.
 | Determinism boundary | inside |
 | Unsafe | none, `#![forbid(unsafe_code)]` |
 
-**Status: facade.** Every public signature is final and every body that decides anything is
-`todo!()`; nothing here runs. This file is the contract the implementation lane meets, and
-every sentence under "Behaviour the signatures cannot express" is one a dependent crate may
-rely on. Architecture sections 5.1, 5.3, 6, 6.1, 7, 9.2, 9.4, 10, 11, 16 and 22 are the
+**Status: implemented** (milestone 1). Every sentence under "Behaviour the signatures cannot
+express" is one a dependent crate may rely on, and "Proof for milestone 1" names the test
+that holds each. Architecture sections 5.1, 5.3, 6, 6.1, 7, 9.2, 9.4, 10, 11, 16 and 22 are the
 design; where this file and the architecture disagree, the architecture wins and this file
 is wrong. Decision D122 records the choices those sections left open and what the design
 review changed. `crates/ecs/README.md` (snapshots, binds, the alias table, change stamps,
@@ -55,7 +54,7 @@ computes a float, and the crate carries the boundary `clippy.toml`.
 
 | Consumer | Needs | Where |
 |---|---|---|
-| `app` (client, milestone 1 spike, then milestone 4) | One owner of the prediction world beside the replicated world, from the same registration functions, running ahead of the server from the start | `SimulationBuilder::new(WorldKind::Prediction, types)` with every crate's `register_types`, `setup` and `register_systems` (`lactose_net_api::setup` for the inbox, `lactose_physics_api::setup` for physics), `.tick(Tick(accepted.tick.0 + lead))`, then `Predictor::new(simulation, LocalPlayer { player, entity }, depth)`; "The loop `app` writes" below |
+| `app` (client, milestone 1 spike, then milestone 4) | One owner of the prediction world beside the replicated world, from the same registration functions, running ahead of the server from the start | `SimulationBuilder::new(WorldKind::Prediction, types)` with every crate's `register_types`, `setup` and `register_systems` (`lactose_net_api::setup` for the inbox, `lactose_physics_api::setup` for physics), `.tick(Tick(accepted.tick.0 + lead))` and `.check(lactose_predict::check_prediction_reads)`, then `Predictor::new(simulation, LocalPlayer { player, entity }, depth)`; "The loop `app` writes" below |
 | | Step ahead each frame with the local inputs; the frames the network thread delivered applied | `Predictor::step` with a `TickInput` carrying `inputs[local.player]` for the tick; the frames through `StagedInbox::push` on `simulation_mut().world_mut()` before the step, folded as for the replicated world; the step's hook pops them |
 | | Compare, roll back, correct, re-simulate; know what it cost | `Predictor::reconcile` after the frame's steps: `Reconciled::{confirmed, corrections, resimulated, resync}`; the time measured around the call, outside the boundary, divided by `resimulated` |
 | | The ring's depth from the budget and the measured per-tick cost; the horizon | `Predictor::set_depth`; `Ring::{depth, oldest, newest, rebuilt_at, len, bytes, slot_bytes}`; a frame older than the ring is `ResyncReason::TooOld` |
@@ -260,21 +259,26 @@ sync point"; `crates/net-api/README.md`, "The staged frame")
      claimed (the server released it), or `slot` is `None` (the server has it claimed):
      a fact for the reconciliation, recorded and not written.
   3. Each move in ascending key order: `World::move_to_region` for a live unclaimed entity
-     not already there; a fact for a claimed one.
+     not already there; a fact for a claimed one or one that is not live.
   4. Each removal in ascending (key, component) order: `World::remove_erased` of the
-     component from a live unclaimed entity; a fact for a claimed one.
+     component from a live unclaimed entity; a fact for a claimed one or one that is not
+     live.
   5. Each row in ascending (key, component) order. A dequantised row (`exact: false`) of
      a live unclaimed entity: `Transform`, `Velocity` and `Teleported` are written as the
      proxy's position for this tick, so the kinematic body sweeps there during this
      tick's step and the physics sync pushes the write like any row write
      (`crates/physics-api/README.md`, "Bodies"); any other component is written whole as
      an upsert writes it. A proxy no row names this tick keeps its row: it rests where it
-     was last put. An exact row (`exact: true`) of a claimed entity: a fact. A row of an
-     entity that is not live is skipped (its spawn was lost and the server resends it); a
-     dequantised row of a claimed entity, or an exact row of an unclaimed one, is a defect
-     of the sender, logged and skipped.
+     was last put. An exact row (`exact: true`) of a claimed entity or of one that is not
+     live: a fact. A dequantised row of an entity that is not live is skipped (its spawn
+     was lost and the server resends it); a dequantised row of a claimed entity, or an
+     exact row of a live unclaimed one, is a defect of the sender, logged and skipped.
   6. Each tombstone in ascending key order: `World::despawn` of a live unclaimed entity,
-     with what it owns; a fact for a claimed one.
+     with what it owns; a fact for a claimed one or one that is not live.
+  A move, removal or exact row of an entity that is not live is a fact so that one the
+  prediction world despawned too early is re-spawned by it; the reconciliation keeps such
+  a fact only for an entity it knows the server claimed (below) and drops the rest, the
+  rows of a proxy whose spawn was lost among them.
   7. `acked_input`, if `Some`: every live entity whose origin key is
      `Predicted { player: local, .. }` with an input tick before the acknowledgement and no
      alias is despawned now, with what it owns (architecture section 7: a predicted spawn
@@ -328,13 +332,17 @@ sync point"; `crates/net-api/README.md`, "The staged frame")
   *T*, and is skipped and logged otherwise: the region loads at the tick the frame was
   popped at, and the entity arrives whole with the first frame at or after it. The
   predictor knows the region of every entity the local player has claimed, from the
-  first fact or record that named it until the server's tombstone or release fact for it
-  is reconciled; an entry is never dropped for the ring's age, so an entity the
+  first fact that named it (a claimed spawn or move, a row or removal of an entity the
+  hook found claimed, or a full frame's claimed spawn) until the server's tombstone or
+  release fact for it is reconciled; the ring's record does not teach it, so an entity
+  only the prediction world believes claimed is never re-spawned; an entry is never dropped for the ring's age, so an entity the
   prediction world despawned too early is re-spawned by its next fact however long the
   server left it unchanged, and `resync` keeps the entries. The map is bounded by the
   server's live claims for the player.
 - A fact matches when the record of slot *T* agrees: the entity present with `ClaimedBy`
-  (absent, for a tombstone; present and unclaimed, for a release), in that region, with
+  (absent, for a tombstone; absent from the record, for a release: the record holds the
+  claimed entities alone, so a released entity present unclaimed and one absent read
+  alike, and the hook's next frames treat both as a proxy), in that region, with
   that component present (absent, for a removal) and equal field by field. Fields are
   compared over every field with an ID in the component's schema, by canonical bytes: an
   integer, `bool`, enum, identity newtype, entity reference or asset reference as its
@@ -346,6 +354,14 @@ sync point"; `crates/net-api/README.md`, "The staged frame")
   misprediction is. A row whose length is not the registry's element size for its
   component, or whose component the registry lacks, is a defect of the sender: logged,
   skipped.
+- `Teleported` is never compared and never written by a correction: a corrected
+  `Transform` reaches the backend as a placement, which the write-back reports as a
+  teleport at the client's tick while the server's flag is unchanged, so comparing it
+  would correct every correction again a frame later; an entity a correction re-spawns
+  gets every other component of its fact. Which components a comparison reads and which a
+  correction writes are each decided in one private function (`compare` in
+  `src/compare.rs`, `writes` in `src/fact.rs`), so a tolerance or a history for physics
+  rows is a change there.
 - Substitution (architecture section 9.2; `crates/input/README.md`, "Redundancy and
   substitution"), in ascending input tick, substitutions and repairs together: a
   substituted tick *t* replaces the ring's sample for *t* with the sample of slot *t* − 1
@@ -365,14 +381,15 @@ sync point"; `crates/net-api/README.md`, "The staged frame")
   which a fact does not match or a sample was replaced. Then, in this order:
   1. `World::restore` of slot *k*, then `physics_api::restore` of its physics snapshot at
      the same tick (skipped for a slot taken without one).
-  2. Every fact at *k* is written, stamped: a component's bytes through
-     `World::insert_erased`, which adds the component if the row lacks it and stamps the
-     row when the bytes differ; a missing entity through `World::spawn_erased` with every
-     component and `ClaimedBy` (`StreamingAnchor` too for the local player's entity); a
-     tombstoned one despawned; a moved one moved; a claim inserted or removed; a removed
-     component removed. Facts are written in the order the hook recorded them: frame
-     order, then spawns, moves, removals, rows and tombstones, each ascending by key;
-     never in chunk order. A stamp is right: a correction is a change of state, the
+  2. Every fact at *k* is written, stamped, `Teleported` excepted: a component's bytes
+     through `World::insert_erased`, which adds the component if the row lacks it and
+     stamps the row when the bytes differ; a missing entity through
+     `World::spawn_erased` with every component and `ClaimedBy` (`StreamingAnchor` too
+     for the local player's entity); a tombstoned one despawned; a moved one moved; a
+     claim inserted or removed; a removed component removed. A component equal to the
+     server's is written as `insert_erased` writes an equal value: not at all. Facts are
+     written in the order the hook recorded them: frame order, then spawns, moves,
+     removals, rows and tombstones, each ascending by key; never in chunk order. A stamp is right: a correction is a change of state, the
      server's, and a `Changed<T>` reader in the re-simulated ticks sees it once, as it
      would a server change, so a derived component a prediction system maintains from a
      replicated one (a cache of a position, a dead flag from health) follows the
@@ -543,14 +560,6 @@ README.md`, "The applier")
 
 ## Not in this crate yet
 
-- The implementation lane starts only when what it is written against runs: in
-  `lactose-net-api`, `StagedInbox::{push, pop_through, due, oldest_after, reset}`;
-  in `lactose-input`,
-  `PlayerInput::{substitute, after_substitute}`, `player_entity` and `PlayerInputApplier`.
-  `lactose-ecs`'s `World::get_erased` (the record), `World::insert_erased` (corrections,
-  upserts), `World::remove_erased` (removals) and `World::spawn_erased` (proxies and
-  corrected spawns), and `lactose-sim`'s `SimulationBuilder::check`, run. Nothing here is
-  written against a typed fallback.
 - `JoinAccepted::entity`, in `lactose-net-host`, so `app` learns the player's entity from
   the server rather than from the game; proposed in D122, with the control message that
   carries a changed entity at milestone 4.
@@ -568,17 +577,18 @@ README.md`, "The applier")
 
 ## Proof for milestone 1
 
-Nothing runs yet. The implementation lane replaces every `todo!()` and proves:
+Each row is held by the tests named; the comparison's golden cases are unit tests in
+`src/compare.rs`, the rest integration tests in `tests/`.
 
 | What | How |
 |---|---|
-| The ring | Under SOUR's layout mode: a prediction world stepped `n` ticks, rolled back to each slot and re-simulated with the ring's inputs, hashes equal at every tick to the straight run; the slot's record equals the claimed entities' rows read back; `oldest` and `newest` track the depth; `set_depth` drops and moves the horizon; a frame older than the ring is `TooOld` and nothing changed; a slot taken without physics restores the world alone and is counted |
-| The comparison | Golden cases over a small registry: equal bytes match; each field kind differing is one field; a scalar leaf's NaN with another payload matches, negative zero does not; a missing component, entity, region or claim is a mismatch with no field; a wrong row length is skipped; a fact is compared at slot `T` only, and one whose region slot `T` lacks is skipped |
-| Corrections | A claimed body whose frame differs is corrected at its tick, stamped, and the re-simulated ticks hash equal to a run that had the server's rows from that tick on; a `Changed`-driven derived cache follows the correction; `corrected` received exactly the written keys (the physics test backend records calls); a despawned-too-early entity is re-spawned in its last known region; two frames with facts at two ticks correct once at the older and once at the newer with the right depths; facts are written in frame order under every layout |
-| Substitution | A substituted tick replaces the sample and re-simulates from the tick before; the repair of the first unsubstituted tick after it is found by tick when the frame spans several ticks; both counted; a substitution at or before the restart is skipped, as is one in a frame popped before the call's newest full frame and the repair that depended on either, and one before the horizon is `TooOld`; the re-simulated world equals a run that had the substitute from the start |
-| The hook | Frames applied in the stated order: proxies spawned, moved, removed, tombstoned; a proxy's `Transform` written for the tick and swept by the sync; a full frame rebuilds, resets the ring, inserts the anchor, and the first frame at or after the rebuild tick corrects once; a claimed entity's spawn, rows and tombstone are not written; an unechoed predicted spawn is despawned at the frame after its input tick and not at that tick's frame; the local entity carries its claim and anchor after every path and `set_local` moves them; `player_entity` resolves; a hook replaced through `simulation_mut` fails the next step with the predictor kept |
-| Resync | A frame left in the inbox after the steps with a tick after the present is `Behind`, one at or before it is not; `resync` empties the ring, sets the tick, the horizon and `rebuilt_at`, reinstalls the hook over one inserted through `simulation_mut`, keeps the known regions, the queued frames are skipped rather than `TooOld`, and the next full frame rebuilds |
-| Presentation | A rollback over a tick that emitted an event: the re-emission is not delivered again, an event not re-emitted is cancelled, both in the batch `app` takes after `reconcile`; extract's pass after a rollback is full |
-| The check | A kernel naming a persistent unreplicated component in a `[server, prediction]` system is refused with its names; the same system `[server]` only passes; transient and derived pass; the finalize's table is judged; an exclusive prediction-world system outside `EXCLUSIVE_SYSTEMS` is refused, one in a listed set under an unlisted name is refused, and `physics_api::sync` passes by key |
-| Cost | `tests/cost.rs`: bytes and microseconds of `World::snapshot` and `physics_api::snapshot` for fifty claimed bodies plus 0 to 10,000 statics with the test backend, printed, against the 100 µs budget; the record's bytes beside them, read through `get_erased` |
-| SOUR | A prediction scene with substitutions and corrections at several ticks, 150 ticks, the re-simulated ticks recorded again and equal, ending with the hashes of the straight run given the same facts |
+| The ring (`tests/ring.rs`, `tests/resync.rs`, `tests/physics.rs`) | Under three layouts (production, one row and three rows a chunk) and one to four workers: a prediction world rolled back to each slot in turn by a substitution that changes nothing and re-simulated with the ring's inputs hashes equal to the straight run after every rollback; the slot's record equals the claimed entities' replicated rows read back through `get_erased`, plus the applied frames' payload; `oldest` and `newest` track the depth; `set_depth` drops and moves the horizon; a frame older than the ring is `TooOld` and nothing changed; a slot taken without physics restores the world alone, is counted, and keeps no physics part when taken again |
+| The comparison (`src/compare.rs`, `tests/corrections.rs`) | Golden cases over a component with a nested struct of scalars, a scalar, an array of scalars, an integer, a `bool` and padding: equal bytes match; each field kind differing is one field, wherever inside it; a scalar leaf's NaN with another payload matches, negative zero does not; padding is not compared; a wrong row length is skipped; `Teleported` is never compared. Over a world: a missing component, entity, region or claim is a mismatch with no field; a fact is compared at slot `T` only, and one whose region slot `T` lacks is skipped |
+| Corrections (`tests/corrections.rs`, `tests/physics.rs`) | A claimed entity whose frame differs is corrected at its tick, stamped, and the re-simulated ticks hash equal to a run that had the server's rows from that tick on, under three layouts; a `Changed`-driven derived cache follows the correction; the backend received pushes for the written key alone (the physics test backend records calls); a corrected `Transform` and the server's unchanged `Teleported` make no second correction; a despawned-too-early entity is re-spawned in its last known region; two frames with facts at two ticks correct once at the older and once at the newer with the right depths; facts are written in frame order under every layout |
+| Substitution (`tests/substitution.rs`) | A substituted tick replaces the sample and re-simulates from the tick before; the repair of the first unsubstituted tick after it is found by tick in a later call; both counted; a substitution at or before the restart is skipped, as is one in a frame popped before the call's newest full frame, each with the repair that depended on it, and one before the horizon is `TooOld`; two consecutive substitutions continue the replaced sample; the re-simulated world equals a run that had the substitute from the start |
+| The hook (`tests/hook.rs`, `tests/physics.rs`) | Frames applied in the stated order: proxies spawned, moved, upserted, removed, tombstoned, and replayed by a re-simulation; a proxy's `Transform` written for the tick and swept by the sync; a full frame rebuilds, resets the ring, inserts the claim and the anchor, and the first frame at or after the rebuild tick corrects once; a claimed entity's rows are not written by the hook; a defect row is skipped; an unechoed predicted spawn is despawned at the frame after its input tick and not at that tick's frame, and a late echo re-spawns it; the local entity carries its claim and anchor and `set_local` moves them; `player_entity` resolves; a hook replaced through `simulation_mut` fails the next step with the predictor kept |
+| Resync (`tests/resync.rs`) | A frame left in the inbox after the steps with a tick after the present is `Behind`, one at or before it is not; `resync` empties the ring, sets the tick, the horizon and `rebuilt_at`, reinstalls the hook over one inserted through `simulation_mut`, keeps the known regions, the queued frames are skipped rather than `TooOld`, and the next full frame rebuilds; a re-join resets the inbox beside it |
+| Presentation (`tests/presentation.rs`) | A rollback over a tick that emitted an event: the re-emission is not delivered again, an event not re-emitted is cancelled, both in the batch `app` takes after `reconcile`; extract's pass after a rollback is full |
+| The check (`tests/check.rs`) | A kernel naming a persistent unreplicated component in a `[server, prediction]` system is refused with its names, `Without<T>` too; the same system `[server]` only passes; transient and derived pass; the finalize's table is judged; an exclusive prediction-world system outside `EXCLUSIVE_SYSTEMS` is refused, one in a set named like an engine's under an unlisted name is refused, and `physics_api::sync` passes by key; the tests' prediction world, physics included, builds with the check |
+| Cost (`tests/cost.rs`) | Asserted: a slot's world and physics bytes grow with the statics, its record does not. Measured by an ignored test, run by hand in release: bytes and microseconds of `World::snapshot` and `physics_api::snapshot` for fifty claimed bodies plus 0, 1,000 and 10,000 statics with the test backend, the record's bytes, a predicted tick, and a rollback of seven ticks per re-simulated tick, against the 100 µs budget; the numbers are in D122's addendum |
+| SOUR (`tests/sour.rs`) | A prediction scene with the physics test backend, 150 ticks, seventeen frames one to five ticks late with corrections of a claimed entity and a body, proxy rows, and substitutions repaired in the same frame and the next: every step and every reconciliation recorded under a sequence number (a correction changes a predicted tick's hash, so a tick cannot key the record), equal under every mode, ending with the hash of the straight run given the same rows and samples |

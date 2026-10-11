@@ -183,3 +183,4 @@ transitive = [
   "bytemuck", "glam", "glamx", "nalgebra", "num-traits", "parry3d-f64", "postcard",
   "rapier3d-f64", "rayon", "serde", "simba", "tracing", "wide",
 ] }
+"lactose-predict" = { normal = ["tracing"] }

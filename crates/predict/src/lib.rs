@@ -7,13 +7,6 @@
 //! is a `StableKey`, and nothing here reads a clock or computes a float. The `README.md`
 //! is the contract: it states what the signatures cannot, and what a caller may rely on.
 //!
-//! # Status
-//!
-//! A facade: every public signature is final and every body that decides anything is
-//! `todo!()`. The implementation lane replaces the bodies behind this surface and removes
-//! the crate-level `allow` with the last `todo!()`, once what it is written against in
-//! other crates is implemented (the README, "Not in this crate yet").
-//!
 //! # Where to start
 //!
 //! - [`Predictor`] owns the prediction [`Simulation`](lactose_sim::Simulation) and runs it
@@ -54,6 +47,7 @@
 //!     .setup(lactose_net_api::setup)
 //!     .systems(lactose_input::register_systems)
 //!     .systems(lactose_net_api::register_systems)
+//!     .check(lactose_predict::check_prediction_reads)
 //!     .inputs(Box::new(lactose_input::PlayerInputApplier::new()))
 //!     .build()?;
 //! let entity = StableKey::Net(NetId::from_bits(7).expect("non-zero"));
@@ -87,14 +81,10 @@
 //! ```
 
 #![forbid(unsafe_code)]
-#![allow(
-    dead_code,
-    unused_variables,
-    reason = "facade: every body is `todo!()` until the implementation lane replaces it, and \
-              the fields and parameters it will use are declared now"
-)]
 
 mod check;
+mod compare;
+mod fact;
 mod hook;
 mod predictor;
 mod reconcile;

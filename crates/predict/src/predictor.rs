@@ -11,14 +11,21 @@ use core::fmt;
 use core::future::Future;
 use core::pin::Pin;
 use core::task::{Context, Poll};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
-use lactose_core::{Error, PlayerId, Result, StableKey, Tick};
-use lactose_ecs::{Executor, RegionId};
-use lactose_sim::{Simulation, TickInput};
+use lactose_core::{ComponentKey, Error, ErrorKind, PlayerId, Result, StableKey, Tick};
+use lactose_ecs::{Executor, RegionId, World, WorldKind};
+use lactose_net_api::StagedInbox;
+use lactose_physics_api::Physics;
+use lactose_reflect::TypeInfo;
+use lactose_sim::{RunError, Simulation, StagedState, TickInput};
 
+use crate::fact::recorded;
+use crate::hook::{PredictionHook, PredictionRecord, record};
 use crate::reconcile::{PredictionStats, Reconciled};
-use crate::ring::Ring;
+use crate::ring::{Ring, Slot};
+
+mod rollback;
 
 /// The ring depth a predictor starts with: sixty ticks, one second at the tick rate, a
 /// placeholder and not a sized value. `app` replaces it with the frame re-simulation
@@ -51,6 +58,11 @@ pub struct LocalPlayer {
 /// loop `app` writes around it and the order its calls keep.
 pub struct Predictor {
     simulation: Simulation,
+    state: State,
+}
+
+/// A predictor without its simulation, which a run moves out and back.
+struct State {
     local: LocalPlayer,
     ring: Ring,
     stats: PredictionStats,
@@ -59,12 +71,110 @@ pub struct Predictor {
     /// after the presence changed is refused.
     physics: bool,
     /// The region each entity the local player has claimed was last seen in, from the
-    /// first fact or record that named it until the server's tombstone or release fact
-    /// for it is reconciled; never dropped for the ring's age, so an entity the
+    /// first fact or full frame that named it until the server's tombstone or release
+    /// fact for it is reconciled (never from the record, so an entity only the
+    /// prediction world believes claimed is never re-spawned); never dropped for the ring's age, so an entity the
     /// prediction world despawned too early is re-spawned by its next fact however long
     /// the server left it unchanged. Bounded by the server's live claims for the player.
     /// Kept across `resync`.
     known: BTreeMap<StableKey, RegionId>,
+    /// The input ticks after a substituted one whose own sample is repaired once a frame
+    /// at or after them is reconciled; a frame spans every tick since the previous one, so
+    /// a repair is found by its tick, possibly in a later call.
+    awaiting: BTreeSet<Tick>,
+    /// The components the record holds: the registry's replicated persistent ones.
+    recorded: Vec<ComponentKey>,
+}
+
+impl State {
+    fn join(self, simulation: Simulation) -> Predictor {
+        Predictor { simulation, state: self }
+    }
+
+    /// The slot of `world`'s current tick, with its physics part if the world has physics
+    /// and `physics` (a correction's re-take of a slot that had none passes `false`); a
+    /// failed physics snapshot is counted.
+    fn take(
+        &mut self,
+        world: &World,
+        input: TickInput,
+        frames: Vec<FrameRef>,
+        physics: bool,
+    ) -> Slot {
+        let physics = physics && self.physics && world.service::<Physics>().is_some();
+        let slot = Slot::take(world, self.local.player, &self.recorded, physics, input, frames);
+        if physics && slot.physics.is_none() {
+            self.stats.slots_without_physics += 1;
+        }
+        slot
+    }
+
+    /// Tells the world the ring's oldest tick.
+    fn horizon(&self, world: &mut World) {
+        if let Some(oldest) = self.ring.oldest() {
+            world.set_rollback_horizon(oldest);
+        }
+    }
+
+    /// What follows every step, predicted or re-simulated: the slot of the new tick taken
+    /// with `input` and the frames the hook applied (appended, or replacing the held one
+    /// when `replace`), the horizon moved; then the refusals a step resolves to when the
+    /// hook did not run or the world's `Physics` presence changed.
+    fn finish_step(&mut self, world: &mut World, input: TickInput, replace: bool) -> Result<()> {
+        let tick = world.tick();
+        let record = record(world)?;
+        let ran = record.ran_at == Some(tick);
+        let frames = core::mem::take(&mut record.stepped);
+        self.stats.unechoed_spawns += core::mem::take(&mut record.unechoed);
+        let slot = self.take(world, input, frames, true);
+        if replace {
+            self.ring.replace(slot);
+        } else {
+            self.ring.push(slot);
+        }
+        self.horizon(world);
+        if !ran {
+            return Err(invalid(format!(
+                "the prediction hook did not run in the step for tick {}: a `dyn StagedState` \
+                 was inserted over it, and `Predictor::resync` reinstalls it",
+                tick.0
+            )));
+        }
+        if world.service::<Physics>().is_some() != self.physics {
+            return Err(invalid(
+                "the prediction world's `Physics` presence changed since `Predictor::new`, so \
+                 the ring would not restore it",
+            ));
+        }
+        Ok(())
+    }
+
+    /// A failed simulation run, with the predictor if its world survived.
+    fn failed(self, failure: RunError) -> PredictError {
+        PredictError { error: failure.error, predictor: failure.simulation.map(|s| self.join(s)) }
+    }
+}
+
+type FrameRef = std::sync::Arc<lactose_net_api::StagedFrame>;
+
+fn invalid(message: impl Into<String>) -> Error {
+    Error::new(ErrorKind::InvalidData, message.into())
+}
+
+/// Installs the hook over whatever `dyn StagedState` `world` holds, and a fresh record.
+fn install(world: &mut World, local: LocalPlayer) {
+    world.insert_service::<dyn StagedState>(Box::new(PredictionHook::new()));
+    world.insert_service::<PredictionRecord>(Box::new(PredictionRecord::new(local)));
+}
+
+/// The tick after `tick`.
+pub(crate) const fn next(tick: Tick) -> Tick {
+    Tick(tick.0.wrapping_add(1))
+}
+
+/// The tick before `tick`.
+pub(crate) const fn prev(tick: Tick) -> Tick {
+    Tick(tick.0.wrapping_sub(1))
 }
 
 impl Predictor {
@@ -81,14 +191,45 @@ impl Predictor {
     /// snapshot taken right after the world's and every restore restores it; a world
     /// without one rolls back its rows alone; a later change of that presence makes
     /// [`step`](Self::step) refuse.
-    pub fn new(simulation: Simulation, local: LocalPlayer, depth: u32) -> Result<Self> {
-        todo!()
+    pub fn new(mut simulation: Simulation, local: LocalPlayer, depth: u32) -> Result<Self> {
+        if simulation.kind() != WorldKind::Prediction {
+            return Err(invalid("a predictor owns a `WorldKind::Prediction` simulation"));
+        }
+        if depth < 2 {
+            return Err(invalid("a ring holds the present and at least one tick to return to"));
+        }
+        let world = simulation.world_mut();
+        if world.service::<StagedInbox>().is_none() {
+            return Err(Error::new(
+                ErrorKind::NotFound,
+                "the prediction world holds no `StagedInbox`: `lactose_net_api::setup` inserts it",
+            ));
+        }
+        install(world, local);
+        let mut state = State {
+            local,
+            ring: Ring::new(depth),
+            stats: PredictionStats::default(),
+            physics: world.service::<Physics>().is_some(),
+            known: BTreeMap::new(),
+            awaiting: BTreeSet::new(),
+            recorded: world
+                .registry()
+                .iter()
+                .filter(|info| recorded(info))
+                .map(TypeInfo::key)
+                .collect(),
+        };
+        let slot = state.take(world, TickInput::default(), Vec::new(), true);
+        state.ring.push(slot);
+        state.horizon(world);
+        Ok(state.join(simulation))
     }
 
     /// The player and entity this world predicts for.
     #[must_use]
     pub fn local(&self) -> LocalPlayer {
-        self.local
+        self.state.local
     }
 
     /// Replaces the player and entity between runs: from the next tick the hook keeps the
@@ -97,7 +238,9 @@ impl Predictor {
     /// re-join, since rows claimed under the old player go with the full frame's reload.
     /// Fails during a run.
     pub fn set_local(&mut self, local: LocalPlayer) -> Result<()> {
-        todo!()
+        record(self.simulation.world_mut())?.local = local;
+        self.state.local = local;
+        Ok(())
     }
 
     /// The prediction world's current tick: the newest slot's, which is the present.
@@ -127,14 +270,14 @@ impl Predictor {
     /// The rollback ring.
     #[must_use]
     pub fn ring(&self) -> &Ring {
-        &self.ring
+        &self.state.ring
     }
 
     /// The counters since the predictor was built. Monotonic: `app` differences two
     /// readings for a rate.
     #[must_use]
     pub fn stats(&self) -> PredictionStats {
-        self.stats
+        self.state.stats
     }
 
     /// Sets the ring depth, at least two (`InvalidData` otherwise, and nothing changes).
@@ -144,7 +287,12 @@ impl Predictor {
     /// oldest slot then fits the budget, which is what bounds re-simulation, since it does
     /// not count against the catch-up cap (D122).
     pub fn set_depth(&mut self, depth: u32) -> Result<()> {
-        todo!()
+        if depth < 2 {
+            return Err(invalid("a ring holds the present and at least one tick to return to"));
+        }
+        self.state.ring.set_depth(depth);
+        self.state.horizon(self.simulation.world_mut());
+        Ok(())
     }
 
     /// Re-synchronises the prediction world to `tick`, between runs: `World::set_tick`,
@@ -162,7 +310,18 @@ impl Predictor {
     /// clock resync (`TickPacer::resync`), not this. Fails during a run, as `set_tick`
     /// does.
     pub fn resync(&mut self, tick: Tick) -> Result<()> {
-        todo!()
+        let world = self.simulation.world_mut();
+        world.set_tick(tick)?;
+        install(world, self.state.local);
+        let state = &mut self.state;
+        state.ring.clear();
+        let slot = state.take(world, TickInput::default(), Vec::new(), true);
+        state.ring.push(slot);
+        state.ring.rebuild_at(tick);
+        state.horizon(world);
+        state.awaiting.clear();
+        state.stats.resyncs += 1;
+        Ok(())
     }
 
     /// Runs one tick ahead with `input`, which must carry the local player's sample in
@@ -187,7 +346,44 @@ impl Predictor {
     /// ran (`lactose_sim::RunError` with its simulation), and with `None` after
     /// `Cancelled`, when the executor shut down mid-run and the world is torn.
     pub fn step(self, executor: &Executor, input: TickInput) -> StepRun<'_> {
-        todo!()
+        StepRun { run: Box::pin(self.run_step(executor, input)) }
+    }
+
+    #[expect(
+        clippy::result_large_err,
+        reason = "the run's public output: a failure hands the predictor back by value"
+    )]
+    async fn run_step(
+        mut self,
+        executor: &Executor,
+        input: TickInput,
+    ) -> core::result::Result<Self, PredictError> {
+        let tick = next(self.tick());
+        let player = self.state.local.player;
+        if input.inputs.get(&player).map(|sample| sample.input_tick) != Some(tick) {
+            let error = invalid(format!(
+                "the step for tick {} carries no sample of the local player for that input tick",
+                tick.0
+            ));
+            return Err(PredictError { error, predictor: Some(self) });
+        }
+        match record(self.simulation.world_mut()) {
+            Ok(record) => record.replay = None,
+            Err(error) => return Err(PredictError { error, predictor: Some(self) }),
+        }
+        let kept = input.clone();
+        let Self { simulation, mut state } = self;
+        let mut simulation = match simulation.step(executor, input).await {
+            Ok(simulation) => simulation,
+            Err(failure) => return Err(state.failed(failure)),
+        };
+        state.stats.ticks_predicted += 1;
+        let finished = state.finish_step(simulation.world_mut(), kept, false);
+        let predictor = state.join(simulation);
+        match finished {
+            Ok(()) => Ok(predictor),
+            Err(error) => Err(PredictError { error, predictor: Some(predictor) }),
+        }
     }
 
     /// Reconciles every frame the hook popped since the last call, oldest first, as the
@@ -208,7 +404,7 @@ impl Predictor {
     /// frame that must be re-simulated without one of its slots (older than the ring) is
     /// not an error: it is [`Reconciled::resync`].
     pub fn reconcile(self, executor: &Executor) -> ReconcileRun<'_> {
-        todo!()
+        ReconcileRun { run: Box::pin(self.run_reconcile(executor)) }
     }
 
     /// Runs the frame's passes on the prediction world (`Simulation::run_passes`: extract,
@@ -216,7 +412,19 @@ impl Predictor {
     /// per frame after [`reconcile`](Self::reconcile), so extract never sees a tick a
     /// rollback discarded. Resolves as the simulation's run does.
     pub fn passes(self, executor: &Executor) -> PassesRun<'_> {
-        todo!()
+        PassesRun { run: Box::pin(self.run_passes(executor)) }
+    }
+
+    #[expect(
+        clippy::result_large_err,
+        reason = "the run's public output: a failure hands the predictor back by value"
+    )]
+    async fn run_passes(self, executor: &Executor) -> core::result::Result<Self, PredictError> {
+        let Self { simulation, state } = self;
+        match simulation.run_passes(executor).await {
+            Ok(simulation) => Ok(state.join(simulation)),
+            Err(failure) => Err(state.failed(failure)),
+        }
     }
 }
 

@@ -511,14 +511,17 @@ dependencies = [
 name = "lactose-predict"
 version = "0.0.0"
 dependencies = [
+ "lactose-bundle",
  "lactose-core",
  "lactose-ecs",
  "lactose-input",
+ "lactose-math",
  "lactose-net-api",
  "lactose-physics-api",
  "lactose-reflect",
  "lactose-sim",
  "lactose-task",
+ "tracing",
 ]
 
 [[package]]
