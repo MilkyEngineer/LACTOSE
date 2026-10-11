@@ -1,45 +1,37 @@
 # Vendored crates
 
-Third-party crates the workspace builds from a patched copy, through `[patch.crates-io]` in
-the root `Cargo.toml`. Each directory is the published `.crate` archive, unpacked, with only
-the change listed here applied. The directory is excluded from the workspace: none of the
-workspace's lints, formatting or tests run over it.
+Third-party crates the workspace builds from a patched copy, under the rule of architecture
+section 8.2 (D123) and checked by `cargo xtask vendor`. Each `<name>-<version>/` is the
+published archive as `cargo vendor --versioned-dirs` unpacks it, `.cargo-checksum.json`
+included, with `<name>-<version>.patch` applied; nothing else. The crate keeps its crates.io
+name in `crate-tiers.toml` and `deny.toml`, and the root `Cargo.toml` names the directory
+under `[patch.crates-io]`. The directory is excluded from the workspace: no workspace lint,
+format or test runs over it.
 
-A bump of a vendored crate replaces the directory with the new archive and re-applies the
-patch, or drops the patch when upstream has made the same change.
+To add or bump a crate: vendor the version from a scratch manifest that depends on it as the
+root `[workspace.dependencies]` entry does (`cargo vendor --versioned-dirs` into a temporary
+directory, with no `[patch]` entry), move `<name>-<version>/` here, apply the patch with
+`git apply`, mark every change with a `LACTOSE patch:` comment, point the `[patch.crates-io]`
+entry at it, regenerate `Cargo.lock`, write the section below and run `cargo xtask vendor`.
+A patch that no longer applies is rewritten and reviewed as new; a version that carries the
+change upstream drops the directory, the patch and the entry.
 
 ## rapier3d-f64 0.36.0
 
-- Upstream: crates.io `rapier3d-f64` 0.36.0, archive sha256
-  `c28c8d3fba1ae7bd3051fa8295217a695f5cac724c5be71921514fe3e14c5dd9`, git
-  `b716d375efc0201003f0cd9ef7168eee0b62c177`, path `crates/rapier3d-f64`.
+- Upstream: crates.io `rapier3d-f64` 0.36.0 (git `b716d375efc0201003f0cd9ef7168eee0b62c177`,
+  path `crates/rapier3d-f64`); the archive's sha256 is `package` in `.cargo-checksum.json`.
 - Used by: `lactose-physics-rapier`, inside the determinism boundary.
-- Why: the angular joint limit (`AngularLimitParams::new`) took the sine and cosine of the
-  limit centre with the inherent `f64::sin_cos`, the platform maths library's, on the solver
-  path of every limited joint. `enhanced-determinism` turns on `simba/libm_force`, which routes
-  `ComplexField::sin_cos` to `libm`; the inherent method ignores it. The patch calls the trait
-  method, so the value is `libm`'s on every target (architecture section 8.2).
-- Size: 4 changed lines and 2 comment lines, one file.
-
-```diff
---- a/src/dynamics/solver/joint_constraint/joint_constraint_helper.rs
-+++ b/src/dynamics/solver/joint_constraint/joint_constraint_helper.rs
-@@ -58,10 +58,12 @@
-         }
- 
-         let center = (min + max) * 0.5;
-+        // LACTOSE patch: through `ComplexField`, which `libm_force` routes to `libm`; the
-+        // inherent `f64::sin_cos` is the platform library's.
-         #[cfg(feature = "dim2")]
--        let (sin, cos) = center.sin_cos();
-+        let (sin, cos) = simba::scalar::ComplexField::sin_cos(center);
-         #[cfg(feature = "dim3")]
--        let (sin, cos) = (center * 0.5).sin_cos();
-+        let (sin, cos) = simba::scalar::ComplexField::sin_cos(center * 0.5);
- 
-         Self {
-             center: [cos, sin],
-```
+- Why: the angular joint limit (`AngularLimitParams::new`,
+  `src/dynamics/solver/joint_constraint/joint_constraint_helper.rs`) took the sine and cosine
+  of the limit centre with the inherent `f64::sin_cos`, the platform maths library's, on the
+  solver path of every limited joint. `enhanced-determinism` turns on `simba/libm_force`,
+  which routes `ComplexField::sin_cos` to `libm`; the inherent method ignores it. The patch
+  calls the trait method, so the value is `libm`'s on every target (architecture section 8.2).
+- Patch: `rapier3d-f64-0.36.0.patch`, one file, six changed lines (two removed, four added,
+  two of them the notice).
+- Upstream report: to be filed (the owner files it on dimforge/rapier; the link goes here).
+- Dropped when: a bump reaches a version whose `AngularLimitParams::new` takes the trait
+  route.
 
 Not patched: the sign of a zero returned by `max` and `min` (`f64::max` and the `wide` SIMD
 lanes differ between x86-64 and AArch64 when both operands are zeros of opposite sign). The

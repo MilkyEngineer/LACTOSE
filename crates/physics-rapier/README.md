@@ -38,7 +38,7 @@ independent of the order of the calls between two steps (`tests/determinism.rs` 
 same scene in different orders, with noise, and compares the bytes), but they are a function
 of the row history (every create, remove, write and command, in order), not of the rows
 alone. A body's results depend on every body the world holds or held: far-away awake bodies
-that touch only each other change them, and so do bodies stepped once and removed, whose
+that touch only each other can change them, and so do bodies stepped once and removed, whose
 freed arena slots later bodies take (`tests/determinism.rs` records both). Bit equality
 holds only between worlds whose row histories are identical; two worlds holding different
 body sets or histories are not bit-equal for the bodies they share.
@@ -48,8 +48,8 @@ body sets or histories are not bit-equal for the bodies they share.
 - A value that fails validation (a non-finite scalar, a rotation that is not unit, a
   negative mass, damping, density, friction, restitution or threshold, a non-positive shape
   extent, an unknown locked-axis bit, a zero axis on a revolute or prismatic joint, limits
-  out of order, a joint between a body and itself) returns `InvalidData` from a creating call and is logged and dropped by
-  a setting call; the bookkeeping is unchanged either way.
+  out of order, a joint between a body and itself) returns `InvalidData` from a creating
+  call and is logged and dropped by a setting call; the bookkeeping is unchanged either way.
 - Every honoured write and command wakes the body. A kinematic body ignores velocity
   writes; a dynamic body in a frozen region keeps the velocity it was given for when it
   thaws.

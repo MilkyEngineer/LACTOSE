@@ -1,7 +1,7 @@
 [workspace]
 resolver = "3"
 members = ["crates/*", "tools/*"]
-# Patched third-party sources (vendor/README.md); built only as `[patch.crates-io]` targets.
+# Patched third-party copies (architecture section 8.2, D123) are dependencies, not members.
 exclude = ["vendor"]
 
 [workspace.package]
@@ -69,7 +69,8 @@ windows-sys = "0.61"
 xxhash-rust = "0.8"
 zstd = { version = "0.13", default-features = false }
 
-# vendor/README.md lists each patch, its diff and the upstream archive it applies to.
+# Architecture section 8.2 (D123): each entry names a directory under vendor/ that
+# `cargo xtask vendor` proves is the published archive plus the patch beside it.
 [patch.crates-io]
 rapier3d-f64 = { path = "vendor/rapier3d-f64-0.36.0" }
 

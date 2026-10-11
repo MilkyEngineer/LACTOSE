@@ -1701,6 +1701,44 @@ rationale the author supplied during the editorial pass rather than one taken fr
     sync 0.96 ms, write-back 0.42 ms; the two column scans (`changed_since` over `Transform` and
     `Collider`, about 0.75 ms together) wait on the chunk-skipping item in the verification
     list.
+- Backend (`lactose-physics-rapier`, the lane and its three review rounds, the third clean):
+  - Mass: the backend recomputes a body's mass properties when it inserts it and when an update
+    wakes it, so a command in the same tick sees the new mass (Rapier otherwise does it after
+    the tick's commands).
+  - Logs: what the `PhysicsBackend` contract says is logged goes to target `physics`; what only
+    this backend logs (a joint whose bodies are not in the solver, a refused solver thread
+    class) goes to `quark`.
+  - Joints: the axis is checked only for revolute and prismatic joints; limits out of order are
+    refused for every kind; physics-api's validation doc and test backend state and apply the
+    same rules.
+  - History: results do not depend on the order of calls between two steps, but they are a
+    function of the row history (every create, remove, write and command, in order), not of
+    the rows alone. A body's results depend on every body the world holds or held: far-away
+    awake bodies that touch only each other can change them (a pile beside a distant 40-ball
+    pile first differs at tick 238; beside far balls teleported every 25 ticks, at tick 274,
+    keyed above or below, on 1 and 4 threads; bouncing or sleeping far balls changed nothing
+    in 400 ticks), and so do bodies stepped once and removed, whose freed arena slots later
+    bodies take. Bit equality holds only between worlds with identical row histories. Reading
+    the patched Rapier 0.36.0 points to the cause: all awake bodies are solved as one island,
+    and constraint order comes from world-wide structures (BVH traversal order, the contact
+    graph's single edge vector with swap_remove, solver-body slots in the awake island, the
+    colour buckets); not confirmed by experiment. Rebuilding Rapier's sets in key order on
+    every membership change moved the history dependence rather than removing it (a rebuild
+    discards contacts, warm-starting and islands); rebuilding every step removed it in every
+    case tried, at about 1.3 ms per step plus a cold-contact step (about 3.7 ms against
+    1.2 ms) at 2,000 bodies, but would not remove the dependence on far bodies that are
+    present, which are part of the current rows. Canonical results per island would need
+    Rapier to solve islands separately in a canonical order.
+  - Dependency policy: every boundary `clippy.toml` also bans `MultibodyJointSet::insert` and
+    `insert_kinematic` (a multibody's mass assembly above five degrees of freedom reaches
+    `matrixmultiply`). `cargo xtask features` fails if any boundary package's Rust sources
+    (outside the package's own top-level `target` directory and `.git`) test
+    `feature = "default"`, `CARGO_FEATURE_DEFAULT` or `CARGO_CFG_FEATURE`, the condition under
+    which folding a redundant `default` is sound; the pinned Cargo (1.99.0) gives build scripts
+    `CARGO_CFG_FEATURE` with `default` in the list when it is on. A text heuristic: a name
+    built at run time or a walk of `env::vars()` is not caught.
+  - `rapier3d-f64` 0.36.0 is built from `vendor/` with one six-line patch, the first case of
+    D123.
 - Driven by: milestone 1, the `physics-api` facade brief, its two design reviews and the
   implementation's reviews
   (2026-10-10).

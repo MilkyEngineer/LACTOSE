@@ -638,9 +638,9 @@ No custom lint crate. Miri runs on nightly as the one exception to the stable-to
 Because Cargo resolves features per build, CI dumps `cargo tree -e features` for the boundary
 dependencies of each shipped binary, the SOUR test crate among them, and requires them
 identical; every other package whose tests run under SOUR must compile each boundary package
-it shares with them at the same version and with the same features; the SOUR test crate's
-dependency set mirrors the server binary; and the resolved feature set is part of the boundary
-build ID.
+it shares with them at every version both compile and with the same features; the SOUR test
+crate's dependency set mirrors the server binary; and the resolved feature set is part of the
+boundary build ID.
 
 ## 9. Networking
 
@@ -996,18 +996,21 @@ The server owns the save in multiplayer. Player portability between hosts is an 
 ## 16. Physics
 
 Rapier, pinned to an exact version together with its math and SIMD dependencies; any bump is a
-protocol and replay break. One physics world per server process and one per client prediction
-world. Rapier's determinism feature is used together with its parallel solver. The step is the one
-sanctioned blocking wait in `task`: a physics stage job calls into the solver's rayon pool,
-which is sized to the performance-core count minus the workers reserved for render recording
-and non-physics systems, and whose threads get QoS and floating-point state through the
+protocol and replay break. The pinned `rapier3d-f64` is built from a patched copy under `vendor/`
+by the rule of section 8.2: the angular joint limit's `sin_cos` goes through `simba`'s
+`ComplexField`, which `libm_force` routes to `libm`, in place of the platform library's; the patch
+travels with every bump until upstream carries it. One physics world per server process and one per
+client prediction world. Rapier's determinism feature is used together with its parallel solver.
+The step is the one sanctioned blocking wait in `task`: a physics stage job calls into the solver's
+rayon pool, which is sized to the performance-core count minus the workers reserved for render
+recording and non-physics systems, and whose threads get QoS and floating-point state through the
 `thread_class` helper. The pool is built by `app` outside the boundary, sized to the frame worker
 count minus the reservation and at least one thread, and handed to the backend's constructor; the
 backend is handed to `physics-api::setup` through a `SimulationBuilder::setup` closure, and the
-step blocks on it inside `block_in_place` with that reservation. The physics stage is a barrier for systems that depend on physics only;
-independent systems run alongside on the reserved workers. Bodies in `Frozen` regions are fixed
-colliders. Milestone 1 measures the physics phase's share of the tick and the stall it imposes
-on render recording during the overlap.
+step blocks on it inside `block_in_place` with that reservation. The physics stage is a barrier for
+systems that depend on physics only; independent systems run alongside on the reserved workers.
+Bodies in `Frozen` regions are fixed colliders. Milestone 1 measures the physics phase's share of
+the tick and the stall it imposes on render recording during the overlap.
 
 The simulation scalar is decided in milestone 1 by a precision test at full map extent: 32-bit
 is adopted if positional error at the map edge stays under one millimetre over a ten-minute

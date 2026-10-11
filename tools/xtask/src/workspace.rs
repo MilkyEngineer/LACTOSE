@@ -670,9 +670,9 @@ mod tests {
     /// only by `weak?/std`.
     const OPTIONAL: &str = r#"{
       "packages": [
-        {"name": "lactose-a", "id": "a-id", "manifest_path": "/ws/crates/a/Cargo.toml",
+        {"name": "lactose-a", "version": "0.0.0", "id": "a-id", "manifest_path": "/ws/crates/a/Cargo.toml",
          "dependencies": [{"name": "lib", "kind": null, "path": null}], "targets": []},
-        {"name": "lib", "id": "lib-id", "manifest_path": "/r/lib/Cargo.toml",
+        {"name": "lib", "version": "1.0.0", "id": "lib-id", "manifest_path": "/r/lib/Cargo.toml",
          "dependencies": [
            {"name": "on", "kind": null, "path": null, "optional": true},
            {"name": "hasher", "kind": null, "path": null, "optional": true},
@@ -683,12 +683,12 @@ mod tests {
          "targets": [],
          "features": {"default": ["dep:hasher", "weak?/std", "new/std"], "on": ["dep:on"],
                       "off": ["dep:off"], "old": ["dep:old"]}},
-        {"name": "on", "id": "on-id", "manifest_path": "/r/on/Cargo.toml", "dependencies": [], "targets": []},
-        {"name": "hasher", "id": "hasher-id", "manifest_path": "/r/h/Cargo.toml", "dependencies": [], "targets": []},
-        {"name": "off", "id": "off-id", "manifest_path": "/r/off/Cargo.toml", "dependencies": [], "targets": []},
-        {"name": "weak", "id": "weak-id", "manifest_path": "/r/weak/Cargo.toml", "dependencies": [], "targets": []},
-        {"name": "glam", "id": "glam-old-id", "manifest_path": "/r/g1/Cargo.toml", "dependencies": [], "targets": []},
-        {"name": "glam", "id": "glam-new-id", "manifest_path": "/r/g2/Cargo.toml", "dependencies": [], "targets": []}
+        {"name": "on", "version": "1.0.0", "id": "on-id", "manifest_path": "/r/on/Cargo.toml", "dependencies": [], "targets": []},
+        {"name": "hasher", "version": "1.0.0", "id": "hasher-id", "manifest_path": "/r/h/Cargo.toml", "dependencies": [], "targets": []},
+        {"name": "off", "version": "1.0.0", "id": "off-id", "manifest_path": "/r/off/Cargo.toml", "dependencies": [], "targets": []},
+        {"name": "weak", "version": "1.0.0", "id": "weak-id", "manifest_path": "/r/weak/Cargo.toml", "dependencies": [], "targets": []},
+        {"name": "glam", "version": "0.29.0", "id": "glam-old-id", "manifest_path": "/r/g1/Cargo.toml", "dependencies": [], "targets": []},
+        {"name": "glam", "version": "0.30.0", "id": "glam-new-id", "manifest_path": "/r/g2/Cargo.toml", "dependencies": [], "targets": []}
       ],
       "workspace_members": ["a-id"],
       "workspace_root": "/ws",
