@@ -276,3 +276,67 @@ pub fn run(backend: &mut dyn PhysicsBackend, from: u32, to: u32) -> Vec<Seen> {
         })
         .collect()
 }
+
+// ---- A walk ----
+
+/// The walker of [`Walk`], a capsule whose rotation is locked.
+pub const WALKER: u64 = 10;
+
+/// A floor, five fixed blocks and a capsule walking among them: the scene the pool test and
+/// the step's tail measurement step. Its tree has a few leaves, so the broad phase optimises
+/// it on almost every step the capsule moves.
+pub struct Walk;
+
+impl Walk {
+    pub fn create(backend: &mut dyn PhysicsBackend) {
+        create(backend, key(FLOOR), None, Some(floor()), Transform::IDENTITY);
+        for i in 0..5_u32 {
+            let block = Collider::new(Shape::cuboid(v(0.5, 0.3 + 0.1 * f64::from(i), 0.5)));
+            create(
+                backend,
+                key(2 + u64::from(i)),
+                None,
+                Some(block),
+                at(-4.0 + 2.0 * f64::from(i), 0.3, 2.0),
+            );
+        }
+        let mut walker = RigidBody::dynamic();
+        walker.locked_axes = lactose_physics_api::locked_axes::ROTATION;
+        let capsule = Collider::new(Shape::capsule(Scalar::HALF, s(0.3)));
+        create(backend, key(WALKER), Some(walker), Some(capsule), at(-3.0, 0.81, -3.0));
+    }
+
+    /// The writes and commands of tick `tick`: the capsule walks a square at three metres a
+    /// second keeping the vertical velocity `last` it was reported with, rests for the last
+    /// sixty ticks of every 480, and jumps every 300.
+    pub fn drive(
+        backend: &mut dyn PhysicsBackend,
+        tick: u32,
+        last: Option<Velocity>,
+    ) -> Vec<PhysicsCommand> {
+        let (x, z) = match ((tick / 120) % 4, tick % 480 >= 420) {
+            (_, true) => (0.0, 0.0),
+            (0, false) => (3.0, 0.0),
+            (1, false) => (0.0, 3.0),
+            (2, false) => (-3.0, 0.0),
+            _ => (0.0, -3.0),
+        };
+        let vy = last.map_or(Scalar::ZERO, |velocity| velocity.linear.y);
+        let linear = Vec3::new(s(x), vy, s(z));
+        backend.set_velocity(key(WALKER), &Velocity { linear, angular: Vec3::ZERO });
+        if tick % 300 == 150 {
+            vec![PhysicsCommand::ApplyImpulse { body: key(WALKER), impulse: v(0.0, 3.0, 0.0) }]
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Steps `backend` through ticks `1..=ticks` under [`Walk::drive`].
+    pub fn run(backend: &mut dyn PhysicsBackend, ticks: u32) {
+        let mut last = None;
+        for tick in 1..=ticks {
+            let commands = Self::drive(backend, tick, last);
+            last = state(&step(backend, tick, &commands), key(WALKER)).map(|s| s.velocity);
+        }
+    }
+}

@@ -21,17 +21,41 @@ change upstream drops the directory, the patch and the entry.
 - Upstream: crates.io `rapier3d-f64` 0.36.0 (git `b716d375efc0201003f0cd9ef7168eee0b62c177`,
   path `crates/rapier3d-f64`); the archive's sha256 is `package` in `.cargo-checksum.json`.
 - Used by: `lactose-physics-rapier`, inside the determinism boundary.
-- Why: the angular joint limit (`AngularLimitParams::new`,
-  `src/dynamics/solver/joint_constraint/joint_constraint_helper.rs`) took the sine and cosine
-  of the limit centre with the inherent `f64::sin_cos`, the platform maths library's, on the
-  solver path of every limited joint. `enhanced-determinism` turns on `simba/libm_force`,
-  which routes `ComplexField::sin_cos` to `libm`; the inherent method ignores it. The patch
-  calls the trait method, so the value is `libm`'s on every target (architecture section 8.2).
-- Patch: `rapier3d-f64-0.36.0.patch`, one file, six changed lines (two removed, four added,
-  two of them the notice).
-- Upstream report: to be filed (the owner files it on dimforge/rapier; the link goes here).
+- Why, two defects:
+  - The angular joint limit (`AngularLimitParams::new`,
+    `src/dynamics/solver/joint_constraint/joint_constraint_helper.rs`) took the sine and cosine
+    of the limit centre with the inherent `f64::sin_cos`, the platform maths library's, on the
+    solver path of every limited joint. `enhanced-determinism` turns on `simba/libm_force`,
+    which routes `ComplexField::sin_cos` to `libm`; the inherent method ignores it. The patch
+    calls the trait method, so the value is `libm`'s on every target (architecture section
+    8.2).
+  - The broad phase's deferred tree optimisation hung the step. On a pool of more than one
+    thread `PhysicsPipeline::detect_collisions` (`src/pipeline/physics_pipeline/solve.rs`)
+    queued it with `rayon::spawn` and `join_deferred_bvh_optimize`
+    (`src/pipeline/physics_pipeline/mod.rs`) blocked the stepping thread, itself a pool
+    thread, in `mpsc::Receiver::recv` until it ran. rayon guarantees that a job a pool thread
+    queues runs only by that thread coming back for it, not that another thread wakes to steal
+    it, so the step hung when no other thread took it: once on a four-thread pool with every
+    other thread asleep (the D124 review's sample), and every time while the pool's other
+    threads are busy (`crates/physics-rapier/tests/pool.rs`); and every step waited for a
+    thread to wake. `solve.rs` holds `unsafe`, so the patch is in
+    `BroadPhaseBvh::take_deferred_optimize` (`src/geometry/broad_phase_bvh/mod.rs`): it runs
+    the pass where the pipeline takes it, on the stepping thread, and hands the pipeline
+    nothing, so the detached path is never taken. The pipeline joins the pass before every
+    use of the broad phase, and between the take and the join the tree and its workspace are
+    out of the broad phase on every path, so nothing reads them there; the pass runs the same
+    code on the same tree as the one-thread path does at the join, and every report and
+    snapshot byte of `crates/physics-rapier`'s scenes on one, two and four threads equals the
+    unpatched build's on one thread. A defect that blocks the milestone 1 physics criteria on
+    a pool of more than one thread (section 16), reviewed as a determinism review.
+- Patch: `rapier3d-f64-0.36.0.patch`, two files, sixteen changed lines: six in the joint
+  helper (two removed, four added, two of them the notice), ten in the broad phase (two
+  removed, eight added, three of them the notice).
+- Upstream report: to be filed, one issue per defect (the owner files them on dimforge/rapier;
+  the links go here).
 - Dropped when: a bump reaches a version whose `AngularLimitParams::new` takes the trait
-  route.
+  route, and whose step never blocks a pool thread on a job it queued. Each hunk drops on its
+  own.
 
 Not patched: the sign of a zero returned by `max` and `min` (`f64::max` and the `wide` SIMD
 lanes differ between x86-64 and AArch64 when both operands are zeros of opposite sign). The

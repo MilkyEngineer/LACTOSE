@@ -213,13 +213,19 @@ impl BroadPhaseBvh {
     /// if any, moving the tree out of the broad-phase. The tree MUST be handed back through
     /// [`Self::finish_deferred_optimize`] before anything else uses this broad-phase.
     pub(crate) fn take_deferred_optimize(&mut self) -> Option<DeferredBvhOptimize> {
-        self.deferred_optimize_pending.then(|| {
+        // LACTOSE patch: run the pass here, on the stepping thread, and hand nothing on, so no
+        // pool thread blocks on a detached job that only another thread can run. Nothing reads
+        // the tree before the join, so it ends as the one-thread join leaves it.
+        let mut task = self.deferred_optimize_pending.then(|| {
             self.deferred_optimize_pending = false;
             DeferredBvhOptimize {
                 tree: core::mem::replace(&mut self.tree, Bvh::new()),
                 workspace: core::mem::take(&mut self.workspace),
             }
-        })
+        })?;
+        task.run();
+        self.finish_deferred_optimize(task);
+        None
     }
 
     /// Puts back the tree extracted by [`Self::take_deferred_optimize`].

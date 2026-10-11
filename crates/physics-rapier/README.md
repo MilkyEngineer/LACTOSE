@@ -24,6 +24,18 @@ scheduling class is logged and the thread runs at its default priority).
 Rapier's parallel work runs on that pool and nowhere else. The pool's size changes no output:
 `tests/determinism.rs` and `tests/conformance.rs` compare one, two and four threads.
 
+The step needs no thread of the pool but the one running it. Rapier's parallel work is
+fork-join (`join`, scopes, parallel iterators), which the forking thread can finish alone. The
+pinned Rapier also queued the broad phase's deferred tree optimisation as a detached job and
+blocked the stepping thread, a pool thread, on its result. rayon guarantees that such a job
+runs only by the thread that queued it coming back for it, which a blocked thread never does,
+so on a pool of two or more threads a step hung when no other thread took the job, and every
+step waited for another thread to wake. The vendored copy
+runs that optimisation on the stepping thread where it was queued. A one-thread pool ran it
+later in the step, at the join, and nothing reads the tree in between, so the tree, every
+report and the snapshot bytes are unchanged (`vendor/README.md`).
+`tests/pool.rs` steps with every other thread of the pool held.
+
 What the contract says is logged (refused values, unknown keys, dropped commands) goes to
 target `physics`; what only this backend logs (a refused scheduling class, a joint whose
 bodies are not in the solver) goes to target `quark`.
@@ -178,6 +190,12 @@ order.
   1.2 µs to restore. Of its bytes about 700 are the fixed Rapier body a collider without a
   `RigidBody` is attached to; attaching every such collider to one shared fixed body would
   save them. Rapier's own encoding of its sets is most of the bytes.
+- **The step's tail** (`tests/cost.rs` with `--release`, printed, not asserted; Apple M1,
+  load averages 4 to 10). The walk scene of `tests/support` (a capsule walking a square over
+  a floor and five blocks), 100 runs of 1,800 ticks per pool size, six rounds: the median run
+  took 16 to 50 ms on one thread and 21 to 42 ms on four, about 3 µs a step more on four.
+  Runs from 400 ms, 6 of 600 on one thread and 2 of 600 on four, came in bursts with the
+  machine's load; none hung.
 - A snapshot that decodes and passes the check but whose Rapier state is otherwise
   inconsistent (bytes not written by this backend) can make a later Rapier call panic.
 - `MultibodyJointSet::insert` and `insert_kinematic`, and `Multibody::inverse_kinematics` and
