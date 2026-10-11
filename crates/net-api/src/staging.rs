@@ -8,8 +8,18 @@
 //! Boundary code may use this module: it reads the world through `columns_erased` and the
 //! structural log, keys every row by `StableKey`, and computes nothing from a float.
 
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::OnceLock;
+
 use lactose_core::{ComponentKey, Result, StableKey, Tick};
-use lactose_ecs::{ChangeMark, Job, LogCursor, LogEntry, RegionId, ResMut, World, system};
+use lactose_ecs::{
+    ChangeMark, ErasedColumn, Job, LogCursor, LogEntry, RegionId, ResMut, StructuralChange, World,
+    system,
+};
+use lactose_reflect::TypeRole;
+
+use crate::staged::after;
+use crate::staged::append;
 
 /// What one gather produced: the rows of every replicated column whose tick advanced
 /// since the previous gather, in one byte arena, grouped by region so that co-located
@@ -71,7 +81,9 @@ impl StagingFrame {
         tick: Tick,
         bytes: &[u8],
     ) {
-        todo!()
+        let (start, len) = append(&mut self.bytes, bytes);
+        self.rows.push(RowEntry { region, key, component, tick, start, len });
+        self.finished = false;
     }
 
     /// Appends a structural log entry, in log order.
@@ -83,16 +95,100 @@ impl StagingFrame {
     /// component) was pushed more than once, keeps the row with the newest tick (ties by
     /// the later push). Idempotent.
     pub fn finish(&mut self) {
-        todo!()
+        if self.finished {
+            return;
+        }
+        // A stable sort by (key, component) leaves each pair's pushes in push order, so the
+        // later of two equal ticks is met last and kept.
+        let mut order: Vec<RowEntry> = self.rows.clone();
+        order.sort_by_key(|row| (row.key, row.component));
+        let mut kept: Vec<RowEntry> = Vec::with_capacity(order.len());
+        for row in order {
+            match kept.last_mut() {
+                Some(last) if (last.key, last.component) == (row.key, row.component) => {
+                    if !after(last.tick, row.tick) {
+                        *last = row;
+                    }
+                }
+                _ => kept.push(row),
+            }
+        }
+        kept.sort_unstable_by_key(|row| (row.region, row.key, row.component));
+        // The arena is rebuilt in row order, so a finished frame's representation is a
+        // function of its rows alone and equal frames compare equal.
+        let mut bytes = Vec::with_capacity(kept.iter().map(|row| row.len as usize).sum());
+        for row in &mut kept {
+            let old = &self.bytes[row.start as usize..(row.start + row.len) as usize];
+            (row.start, row.len) = append(&mut bytes, old);
+        }
+        self.rows = kept;
+        self.bytes = bytes;
+        self.finished = true;
     }
 
     /// Folds `newer`, a later gather's frame, into this one, for a packer that fell behind
-    /// and finds two frames: a row in `newer` replaces the same (key, component) here,
-    /// `newer`'s structural entries follow this frame's, `tick` becomes `newer.tick`, and
-    /// a full `newer` makes the result full with `newer`'s rows alone. Nothing is lost, and
-    /// the result never holds two values of one row.
-    pub fn merge(&mut self, newer: Self) {
-        todo!()
+    /// and finds two frames: of two rows for one (key, component), the row with the later
+    /// tick wins, and on equal ticks `newer`'s; `newer`'s structural entries follow this
+    /// frame's, `tick` becomes `newer.tick`, and a full `newer` makes the result full with
+    /// `newer`'s rows alone. `newer`'s structural entries also apply to the rows here: a row of an entity it despawned or
+    /// of a component it removed is dropped, and a row of an entity it moved resides in the
+    /// entity's new region. A full frame here stays full and keeps no structural entry.
+    /// Nothing is lost, the result never holds two values of one row, and it is the frame
+    /// one gather over both windows produces.
+    pub fn merge(&mut self, mut newer: Self) {
+        if newer.full {
+            newer.finish();
+            *self = newer;
+            return;
+        }
+        // The rows here predate every structural entry of `newer`: a row of an entity it
+        // despawned, or of a component it removed, goes, and a row of an entity it moved
+        // resides where the entity does now, so the result is what one gather over both
+        // windows holds whichever order the packer reads structure and rows in.
+        let mut despawned = BTreeSet::new();
+        let mut removed = BTreeSet::new();
+        let mut moved = BTreeMap::new();
+        for entry in &newer.structural {
+            match entry.change {
+                StructuralChange::Despawned { key, .. } => {
+                    despawned.insert(key);
+                }
+                StructuralChange::Removed { key, component } => {
+                    removed.insert((key, component));
+                }
+                StructuralChange::Moved { key, to, .. } => {
+                    moved.insert(key, to);
+                }
+                StructuralChange::Spawned { .. } | StructuralChange::Added { .. } => {}
+            }
+        }
+        if !(despawned.is_empty() && removed.is_empty() && moved.is_empty()) {
+            self.rows.retain(|row| {
+                !despawned.contains(&row.key) && !removed.contains(&(row.key, row.component))
+            });
+            for row in &mut self.rows {
+                if let Some(&to) = moved.get(&row.key) {
+                    row.region = to;
+                }
+            }
+            self.finished = false;
+        }
+        if !self.full {
+            self.structural.append(&mut newer.structural);
+        }
+        self.tick = newer.tick;
+        self.extend_rows(&newer);
+        self.finish();
+    }
+
+    /// Appends every row of `other` after this frame's, in `other`'s order.
+    fn extend_rows(&mut self, other: &Self) {
+        if other.rows.is_empty() {
+            return;
+        }
+        let base = append(&mut self.bytes, &other.bytes).0;
+        self.rows.extend(other.rows.iter().map(|row| RowEntry { start: base + row.start, ..*row }));
+        self.finished = false;
     }
 
     /// Every row, in ascending (region, key, component) order.
@@ -106,7 +202,10 @@ impl StagingFrame {
     /// dirty list, which every client to whom the region is relevant reads.
     #[must_use]
     pub fn region(&self, region: RegionId) -> GatheredRows<'_> {
-        todo!()
+        debug_assert!(self.finished, "a frame is read after `finish`");
+        let start = self.rows.partition_point(|row| row.region < region);
+        let end = start + self.rows[start..].partition_point(|row| row.region == region);
+        GatheredRows { entries: self.rows[start..end].iter(), bytes: &self.bytes }
     }
 
     /// The structural log entries since the previous gather, in log order.
@@ -201,7 +300,54 @@ impl GatherState {
     /// Keyed by `StableKey` throughout: the result is the same under every chunk layout
     /// and worker count, and a gather with nothing changed since the last is empty.
     pub fn gather(&mut self, world: &World, job: &mut Job<'_, '_>) -> Result<()> {
-        todo!()
+        let log = world.structural_log();
+        // Decided before any row is read: a stale mark or cursor makes this a full pass.
+        let mark = self.mark.filter(|&mark| world.is_current(mark));
+        let mut cursor = self.cursor;
+        let entries = cursor.as_mut().and_then(|cursor| log.since(cursor));
+        let (mark, entries) = match (mark, entries) {
+            (Some(mark), Some(entries)) => (Some(mark), Some(entries)),
+            _ => (None, None),
+        };
+        let mut frame = StagingFrame::new(world.tick());
+        frame.full = mark.is_none();
+
+        let mut columns = Vec::new();
+        for info in world.registry().iter() {
+            if info.role() != TypeRole::Component || !info.tracking().replicated {
+                continue;
+            }
+            columns.extend(world.columns_erased(info.key()).filter(|column| {
+                mark.is_none_or(|mark| !tick_before(column.column_tick(), mark.tick()))
+            }));
+        }
+        // One cell per kept chunk, each set by the one child whose range holds it; the
+        // cells are read back in chunk order and `finish` sorts by key, so neither the
+        // order the children ran in nor the chunk layout reaches the frame.
+        let cells: Vec<OnceLock<StagingFrame>> = columns.iter().map(|_| OnceLock::new()).collect();
+        let units = u32::try_from(columns.len()).expect("fewer than 2^32 chunks");
+        job.context().scope(|scope| {
+            scope.fork_range(0..units, |range, _| {
+                for unit in range {
+                    let index = unit as usize;
+                    let partial = gather_column(&columns[index], mark);
+                    assert!(cells[index].set(partial).is_ok(), "each chunk is gathered once");
+                }
+            });
+        });
+        for cell in cells {
+            let partial = cell.into_inner().expect("every kept chunk was gathered");
+            frame.extend_rows(&partial);
+        }
+        for entry in entries.into_iter().flatten() {
+            frame.push_structural(*entry);
+        }
+        frame.finish();
+
+        self.mark = Some(world.mark());
+        self.cursor = Some(log.cursor());
+        self.frame.merge(frame);
+        Ok(())
     }
 
     /// Takes the frame gathered since the last take, leaving an empty frame at the same
@@ -230,5 +376,118 @@ impl Default for GatherState {
 /// the world.
 #[system(name = "net::gather", worlds = [server], exclusive)]
 pub(crate) fn gather(world: &mut World, job: Job, state: ResMut<GatherState>) {
-    todo!()
+    let world: &World = world;
+    state.gather(world, &mut job).expect("the gather reads a world it was given whole");
+}
+
+/// The rows of one chunk's column the gather takes: those `changed_since(mark)` selects,
+/// or every row on a full pass (`mark` `None`).
+fn gather_column(column: &ErasedColumn<'_>, mark: Option<ChangeMark>) -> StagingFrame {
+    let mut partial = StagingFrame::new(Tick(0));
+    let size = column.element_size();
+    let mut push = |row: usize| {
+        partial.push_row(
+            column.regions()[row],
+            column.keys()[row],
+            column.component(),
+            column.row_ticks().expect("a replicated column is tracked")[row],
+            &column.bytes()[row * size..][..size],
+        );
+    };
+    match mark {
+        Some(mark) => {
+            column.changed_since(mark).expect("the mark is current").for_each(&mut push);
+        }
+        None => (0..column.keys().len()).for_each(&mut push),
+    }
+    partial
+}
+
+/// Whether tick `tick` is before tick `than`, across the wrap, as the world orders change
+/// ticks.
+const fn tick_before(tick: Tick, than: Tick) -> bool {
+    tick.0.wrapping_sub(than.0) >= 1 << 31
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lactose_core::NetId;
+    use lactose_ecs::{Executor, RegionConfig, RegionMode, WorldKind};
+    use lactose_reflect::component;
+    use lactose_sim::{RegionControl, Simulation, SimulationBuilder, TickInput, TypeTable};
+
+    #[component(key = "net_api_test::value", persistent, replicated)]
+    struct Value(#[field(id = 1)] u64);
+
+    fn key(n: u64) -> StableKey {
+        StableKey::Net(NetId::cooked(n))
+    }
+
+    fn passes(executor: &Executor, simulation: Simulation) -> Simulation {
+        executor.block_on(simulation.run_passes(executor)).unwrap()
+    }
+
+    fn state(simulation: &mut Simulation) -> &mut GatherState {
+        simulation.world_mut().service_mut::<GatherState>().unwrap()
+    }
+
+    /// A server that has gathered twice, the second time incrementally, with one row
+    /// written since.
+    fn gathered() -> (Executor, Simulation) {
+        let executor = Executor::builder().frame_workers(2).background_workers(1).build().unwrap();
+        let mut types = TypeTable::new();
+        types.register::<Value>().unwrap();
+        let mut simulation = SimulationBuilder::new(WorldKind::Server, types)
+            .regions(RegionControl::Directed)
+            .setup(crate::setup)
+            .systems(crate::register_systems)
+            .build()
+            .unwrap();
+        let world = simulation.world_mut();
+        let config = RegionConfig { id: RegionId(1), seed: 1, mode: RegionMode::Simulated };
+        world.create_region(config).unwrap();
+        for n in 1..=3 {
+            world.spawn(key(n), RegionId(1), (Value(n),)).unwrap();
+        }
+        simulation = executor.block_on(simulation.step(&executor, TickInput::default())).unwrap();
+        simulation = passes(&executor, simulation);
+        assert!(state(&mut simulation).take().full);
+        simulation.world_mut().insert(key(2), Value(20)).unwrap();
+        (executor, simulation)
+    }
+
+    #[test]
+    fn a_stale_mark_with_a_current_cursor_is_a_full_pass_with_every_row() {
+        let (executor, mut simulation) = gathered();
+        // Every epoch change also resets the log, so the public operations only ever make
+        // both stale at once; the pair is set here as the decision must handle it.
+        let stale = simulation.world().mark();
+        let next = Tick(simulation.tick().0 + 1);
+        simulation.world_mut().set_tick(next).unwrap();
+        let cursor = simulation.world().structural_log().cursor();
+        assert!(!simulation.world().is_current(stale));
+        let gather = state(&mut simulation);
+        gather.mark = Some(stale);
+        gather.cursor = Some(cursor);
+        simulation = passes(&executor, simulation);
+        let frame = state(&mut simulation).take();
+        assert!(frame.full);
+        assert!(frame.structural().is_empty());
+        let rows: Vec<_> = frame.rows().map(|row| (row.key, row.bytes.to_vec())).collect();
+        let expected: Vec<_> = [(1, 1), (2, 20), (3, 3)]
+            .into_iter()
+            .map(|(n, value): (u64, u64)| (key(n), value.to_ne_bytes().to_vec()))
+            .collect();
+        assert_eq!(rows, expected);
+    }
+
+    #[test]
+    fn a_current_mark_and_cursor_gather_incrementally() {
+        let (executor, mut simulation) = gathered();
+        simulation = passes(&executor, simulation);
+        let frame = state(&mut simulation).take();
+        assert!(!frame.full);
+        assert_eq!(frame.rows().map(|row| row.key).collect::<Vec<_>>(), vec![key(2)]);
+    }
 }

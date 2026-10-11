@@ -1,7 +1,7 @@
-//! Compile-only consumer sketches against the facade: what `app`, the milestone 1 spike,
-//! `lactose-net` and `lactose-predict` write on the simulation side, type-checked and
-//! never run (every deciding body of the crate is `todo!()`). They pin the surface the
-//! README promises: a change that breaks one is a signature change to list.
+//! Consumer sketches: what `app`, the milestone 1 spike, `lactose-net` and
+//! `lactose-predict` write on the simulation side, written against the facade before the
+//! bodies existed and run here against them (section 6). They pin the surface the README
+//! promises: a change that breaks one is a signature change to list.
 
 #![forbid(unsafe_code)]
 #![allow(dead_code, unused_variables, missing_docs)]
@@ -423,4 +423,196 @@ fn hand_built_frame(tick: Tick) -> StagedFrame {
         lactose_reflect::bytemuck::bytes_of(&Position { x: 1, y: 2, z: 3 }),
     );
     frame
+}
+
+// ---- 6. The sketches, run against the bodies ----
+
+const REGION: RegionId = RegionId(1);
+
+fn executor() -> lactose_ecs::Executor {
+    lactose_ecs::Executor::builder().frame_workers(2).background_workers(1).build().unwrap()
+}
+
+fn step(executor: &lactose_ecs::Executor, simulation: Simulation, input: TickInput) -> Simulation {
+    executor.block_on(simulation.step(executor, input)).unwrap()
+}
+
+fn net(n: u64) -> lactose_core::NetId {
+    lactose_core::NetId::from_bits(n).expect("non-zero")
+}
+
+fn data<T: Reflect>(value: T) -> ComponentData {
+    ComponentData { component: T::KEY, bytes: lactose_reflect::bytemuck::bytes_of(&value).to_vec() }
+}
+
+fn with_region(mut simulation: Simulation, mode: lactose_ecs::RegionMode) -> Simulation {
+    let config = lactose_ecs::RegionConfig { id: REGION, seed: 1, mode };
+    simulation.world_mut().create_region(config).unwrap();
+    simulation
+}
+
+fn sketch_spawn(n: u64, slot: Option<u32>) -> (lactose_core::NetId, StagedSpawn) {
+    let slot = slot.map(|index| lactose_net_api::InterpolationSlot { index, generation: 1 });
+    let components = vec![data(Position { x: 1, y: 2, z: 3 }), data(Health(9))];
+    (net(n), StagedSpawn { origin: None, region: REGION, slot, components })
+}
+
+#[test]
+fn app_builds_every_kind() {
+    for kind in [WorldKind::Server, WorldKind::Client, WorldKind::Prediction] {
+        let simulation = app_build(kind, Tick(10), None).unwrap();
+        assert_eq!(simulation.tick(), Tick(10));
+        assert!(simulation.world().service::<StagedInbox>().is_some());
+        assert!(simulation.world().service::<GatherState>().is_some());
+    }
+}
+
+#[test]
+fn the_client_hook_applies_a_frame() {
+    let executor = executor();
+    let hook: Box<dyn StagedState> = Box::new(ClientHook);
+    let simulation = app_build(WorldKind::Client, Tick(10), Some(hook)).unwrap();
+    let mut simulation = with_region(simulation, lactose_ecs::RegionMode::Replicated);
+    // The hand-built frame's row names an entity the client lacks: skipped.
+    let mut frame = hand_built_frame(Tick(11));
+    let (n, spawn) = sketch_spawn(1, Some(4));
+    frame.spawns.insert(n, spawn);
+    let inbox = simulation.world_mut().service_mut::<StagedInbox>().unwrap();
+    assert!(inbox.push(Arc::new(frame)));
+    let simulation = step(&executor, simulation, TickInput::default());
+    let key = StableKey::Net(net(1));
+    assert_eq!(simulation.world().get::<Health>(key).map(|health| health.0), Some(9));
+    assert_eq!(simulation.world().get::<RemoteSlot>(key).map(|slot| slot.slot.index), Some(4));
+    assert!(!simulation.world().contains(StableKey::Net(net(7))));
+}
+
+#[test]
+fn the_prediction_hook_learns_a_claim() {
+    let executor = executor();
+    let hook = PredictionHook {
+        local: PlayerId(1),
+        history: ProxyHistory::default(),
+        confirmed_input: None,
+        claimed: std::collections::BTreeSet::new(),
+    };
+    let simulation = app_build(WorldKind::Prediction, Tick(10), Some(Box::new(hook))).unwrap();
+    let mut simulation = with_region(simulation, lactose_ecs::RegionMode::Replicated);
+    let key = StableKey::Net(net(1));
+    simulation.world_mut().spawn(key, REGION, (Position { x: 0, y: 0, z: 0 },)).unwrap();
+    let mut frame = StagedFrame::new(Tick(11));
+    let (n, spawn) = sketch_spawn(1, None);
+    frame.spawns.insert(n, spawn);
+    frame.acked_input = Some(Tick(9));
+    let inbox = simulation.world_mut().service_mut::<StagedInbox>().unwrap();
+    assert!(inbox.push(Arc::new(frame)));
+    let simulation = step(&executor, simulation, TickInput::default());
+    assert!(simulation.world().service::<StagedInbox>().unwrap().is_empty());
+}
+
+#[test]
+fn the_server_gathers_with_either_system_and_sends_the_frame() {
+    let executor = executor();
+    let mut frames = Vec::new();
+    for spike in [false, true] {
+        let mut types = TypeTable::new();
+        register_types(&mut types).unwrap();
+        let mut builder = SimulationBuilder::new(WorldKind::Server, types)
+            .regions(lactose_sim::RegionControl::Directed)
+            .setup(lactose_net_api::setup);
+        builder = if spike {
+            builder.systems(register_spike_systems)
+        } else {
+            builder.systems(lactose_net_api::register_systems)
+        };
+        let simulation = builder.build().unwrap();
+        let mut simulation = with_region(simulation, lactose_ecs::RegionMode::Simulated);
+        let key = StableKey::Net(net(1));
+        simulation.world_mut().spawn(key, REGION, (Position { x: 1, y: 2, z: 3 },)).unwrap();
+        let simulation = step(&executor, simulation, TickInput::default());
+        let mut simulation = executor.block_on(simulation.run_passes(&executor)).unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        server_between_runs(&mut simulation, &sender);
+        let frame = receiver.try_recv().unwrap();
+        assert!(frame.full);
+        assert_eq!(frame.row_count(), 1);
+        // Nothing changed: the next frame is empty and not sent.
+        let mut simulation = executor.block_on(simulation.run_passes(&executor)).unwrap();
+        server_between_runs(&mut simulation, &sender);
+        assert!(receiver.try_recv().is_err());
+        frames.push(frame);
+    }
+    assert_eq!(frames[0], frames[1]);
+}
+
+#[test]
+fn the_client_folds_what_its_hooks_pop() {
+    let executor = executor();
+    let mut types = TypeTable::new();
+    register_types(&mut types).unwrap();
+    let registry = types.registry();
+    let schemas: Vec<lactose_bundle::ComponentSchema> = registry
+        .iter()
+        .map(|info| {
+            let fields = info.layout().fields().iter().filter_map(|field| {
+                Some(lactose_bundle::FieldLayout {
+                    id: field.id()?,
+                    offset: u32::try_from(field.offset()).unwrap(),
+                    size: u32::try_from(field.size()).unwrap(),
+                })
+            });
+            let size = u32::try_from(info.layout().size()).unwrap();
+            lactose_bundle::ComponentSchema::new(info.key(), info.version(), size, fields).unwrap()
+        })
+        .collect();
+    let baseline =
+        Arc::new(Baseline::from_rows(lactose_asset_api::AssetSet::new(), schemas, []).unwrap());
+    let hash = baseline.content_hash();
+    let by_hash = |wanted: u64| (wanted == hash).then(|| Arc::clone(&baseline));
+    let no_overlay = |_: RegionId| None;
+    let no_pin = |_: &VersionTable| None;
+    let store =
+        ClientStore { baseline_by_hash: &by_hash, cached_overlay: &no_overlay, pin: &no_pin };
+
+    let hook: Box<dyn StagedState> = Box::new(ClientHook);
+    let mut replicated = app_build(WorldKind::Client, Tick(10), Some(hook)).unwrap();
+    let mut prediction = app_build(WorldKind::Prediction, Tick(10), None).unwrap();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let mut frame = StagedFrame::resync(Tick(10));
+    frame.regions.insert(
+        REGION,
+        RegionChange::Relevant(RegionRelevance {
+            region: REGION,
+            seed: 1,
+            baseline_hash: hash,
+            overlay: lactose_net_api::OverlayPayload::Cooked,
+            resources: Vec::new(),
+            transient_resources: Vec::new(),
+            assets: None,
+        }),
+    );
+    let (n, spawn) = sketch_spawn(1, Some(2));
+    frame.spawns.insert(n, spawn);
+    sender.send(Arc::new(frame)).unwrap();
+    // A stale frame the inbox refuses, so the prediction world never sees it either.
+    sender.send(Arc::new(StagedFrame::new(Tick(9)))).unwrap();
+    let input = client_between_runs(&mut replicated, &mut prediction, &receiver, &store).unwrap();
+    assert_eq!(input.loaded.keys().copied().collect::<Vec<_>>(), vec![REGION]);
+    assert_eq!(prediction.world().service::<StagedInbox>().unwrap().len(), 1);
+    let replicated = step(&executor, replicated, input);
+    assert!(replicated.world().contains(StableKey::Net(net(1))));
+
+    // The server's relevance message, digested for a client known to cache it.
+    let export = RegionExport {
+        region: REGION,
+        rows: lactose_ecs::RegionRows {
+            seed: 4,
+            resources: Vec::new(),
+            transient_resources: Vec::new(),
+            rows: Vec::new(),
+        },
+    };
+    let cooked = |_: &RegionExport, _: &Baseline| None;
+    let message = relevance_message(&export, &baseline, &cooked, None, true);
+    assert_eq!(message.overlay, lactose_net_api::OverlayPayload::Cooked);
+    assert_eq!(message.seed, 4);
 }

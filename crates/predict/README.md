@@ -404,7 +404,9 @@ sync point"; `crates/net-api/README.md`, "The staged frame")
   prediction world has fallen behind the server: `ResyncReason::Behind { server, present }`
   with the oldest such tick. A queued frame at or before the present is only waiting for
   the next step (none ran this frame) and means nothing. Clock sync keeps the prediction
-  world ahead (section 9.2); this is the backstop.
+  world ahead (section 9.2); this is the backstop. The oldest such tick is
+  `StagedInbox::oldest_after(present)`, read after the prediction world's steps, whether
+  or not a frame for the present is still queued.
 - `Predictor::resync(tick)`: `World::set_tick(tick)` (between runs; it fails during a run
   as `set_tick` does), the ring emptied and a fresh first slot taken at `tick` with
   `Ring::rebuilt_at` set to `tick`, the horizon set there, the record cleared, the hook
@@ -414,7 +416,10 @@ sync point"; `crates/net-api/README.md`, "The staged frame")
   made a `Behind`) are then from before the restart and are skipped, not `TooOld`, so one
   resync is one resync. `app` then requests a full frame, which rebuilds the world through
   the inbox and the `TickInput` as any full frame does; until it arrives the world predicts
-  from what it has.
+  from what it has. A `Behind` or `Divergence` resync keeps the inbox. A re-join (a new
+  `JoinAccepted`) also resets it: `app` drops the old session's frames not yet pushed and
+  calls `StagedInbox::reset` through `predictor.simulation_mut().world_mut()` beside the
+  resync (`lactose-net-api`).
 - The ECS asks this crate to despawn a `Net` entity a restore revives, one live at the
   snapshot and despawned before a bind to its key (`crates/ecs/README.md`, "Snapshots and
   bulk copy"). It cannot arise here: a spawn's key is `StagedSpawn::key`, the origin key,
@@ -541,7 +546,8 @@ README.md`, "The applier")
 ## Not in this crate yet
 
 - The implementation lane starts only when what it is written against runs: in
-  `lactose-net-api`, `StagedInbox::{push, pop_through, due}`; in `lactose-input`,
+  `lactose-net-api`, `StagedInbox::{push, pop_through, due, oldest_after, reset}`;
+  in `lactose-input`,
   `PlayerInput::{substitute, after_substitute}`, `player_entity` and `PlayerInputApplier`.
   `lactose-ecs`'s `World::get_erased` (the record), `World::insert_erased` (corrections,
   upserts), `World::remove_erased` (removals) and `World::spawn_erased` (proxies and

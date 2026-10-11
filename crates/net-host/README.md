@@ -171,7 +171,14 @@ reshape.
   `ConnectionHandles` and re-enters every relevant entity, so the full frame's spawns
   carry fresh handles and no handle from before the resync names anything after it.
   Hence the frames the receiver hands `app` ascend strictly by tick and the full frame is
-  the next frame after the request, and `StagedInbox::push` never refuses one.
+  the next frame after the request, and `StagedInbox::push` never refuses one. A re-join's
+  `JoinAccepted` restarts the newest staged tick: the receiver forgets it and drops what it
+  has not handed `app`, and `app` resets each client world's inbox (`StagedInbox::reset`).
+  Before it
+  stages a row with `StagedFrame::push_row`, the receiver checks the row's length against
+  the component's size in the registry and drops a packet carrying a row of another
+  length whole, as a malformed one: `push_row` refuses a length other than the row it
+  holds, and nothing else checks the first row's.
 - `PacketSequence` wraps at sixteen bits; `after` is the wrapping difference being
   positive and below 32768, so two sequences in play are less than that apart. `AckField
   { latest, bits }` acknowledges `latest` and, for bit `n` set, `latest - (n + 1)`, a

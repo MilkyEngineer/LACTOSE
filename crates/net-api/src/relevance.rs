@@ -10,8 +10,8 @@ use std::sync::Arc;
 
 use lactose_asset_api::{PinnedTable, VersionTable};
 use lactose_bundle::{Baseline, ComponentData, Overlay};
-use lactose_core::{ComponentKey, Result};
-use lactose_ecs::RegionId;
+use lactose_core::{ComponentKey, Error, ErrorKind, Result};
+use lactose_ecs::{RegionId, RegionMode};
 use lactose_sim::{RegionBundle, RegionExport};
 
 /// The region's state beyond its cooked baseline, as the message carries it.
@@ -90,15 +90,68 @@ impl RegionRelevance {
     /// `cached` copy; the resources and transient keys; `assets` pinned by the client's
     /// `app` from the table; and `RegionMode::Replicated`. Fails with `VersionMismatch` if
     /// `baseline`'s content hash is not `baseline_hash`, if a `Digest` has no cached copy
-    /// or the copy's digest differs, or if a `Full` overlay was made against another
-    /// baseline (`Overlay::check_against`).
+    /// or the copy's digest differs, or if the overlay, carried or cached, was made against
+    /// another baseline (`Overlay::check_against`).
     pub fn to_bundle(
         &self,
         baseline: Arc<Baseline>,
         cached: Option<&Arc<Overlay>>,
         assets: Option<PinnedTable>,
     ) -> Result<RegionBundle> {
-        todo!()
+        if baseline.content_hash() != self.baseline_hash {
+            return Err(Error::new(
+                ErrorKind::VersionMismatch,
+                format!(
+                    "region {}: the baseline's content hash {:#018x} is not the message's \
+                     {:#018x}",
+                    self.region.0,
+                    baseline.content_hash(),
+                    self.baseline_hash
+                ),
+            ));
+        }
+        let overlay = match &self.overlay {
+            OverlayPayload::Cooked => None,
+            OverlayPayload::Full(overlay) => Some(Arc::clone(overlay)),
+            OverlayPayload::Digest(digest) => match cached {
+                Some(cached) if cached.digest() == *digest => Some(Arc::clone(cached)),
+                Some(cached) => {
+                    return Err(Error::new(
+                        ErrorKind::VersionMismatch,
+                        format!(
+                            "region {}: the cached overlay's digest {:#018x} is not the \
+                             message's {digest:#018x}",
+                            self.region.0,
+                            cached.digest()
+                        ),
+                    ));
+                }
+                None => {
+                    return Err(Error::new(
+                        ErrorKind::VersionMismatch,
+                        format!(
+                            "region {}: the message names overlay {digest:#018x} by digest and \
+                             no copy is cached",
+                            self.region.0
+                        ),
+                    ));
+                }
+            },
+        };
+        // A cached copy is checked as a carried one is: a digest names bytes, not the
+        // baseline they were made against.
+        if let Some(overlay) = &overlay {
+            overlay.check_against(&baseline)?;
+        }
+        Ok(RegionBundle {
+            seed: self.seed,
+            mode: RegionMode::Replicated,
+            baseline,
+            overlay,
+            resources: self.resources.clone(),
+            transient_resources: self.transient_resources.clone(),
+            assets,
+        })
     }
 }
 

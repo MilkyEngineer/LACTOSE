@@ -27,7 +27,7 @@ use crate::relevance::RegionChange;
 /// the fields in. Rows live in one byte arena, so reading a frame allocates nothing. A
 /// frame is shared between the replicated world's hook, the prediction world's hook and
 /// `app` through an `Arc`, each reading the fields that are its own.
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(Clone, Debug)]
 pub struct StagedFrame {
     /// The server tick the frame is for: no row in it is from a later tick. The hook
     /// applies it at the first sync point of its world whose tick is not before this
@@ -126,7 +126,12 @@ impl StagedFrame {
     /// full-precision bytes, for an entity the receiving player has claimed) or
     /// dequantised. A row newer than the one held for `(key, component)` replaces it, an
     /// older or equal one is ignored and `false` returned, so the newest received state
-    /// wins whatever order packets arrived in.
+    /// wins whatever order packets arrived in. A row from a tick after the frame's, or of
+    /// another length than the row held, is refused the same way: a component's image has
+    /// one size, which the receiver checks against the registry before it pushes the first
+    /// row, so a held row is overwritten in place and the frame's arena never grows with
+    /// the packets that arrive.
+    #[must_use = "a refused row is not staged"]
     pub fn push_row(
         &mut self,
         key: StableKey,
@@ -135,7 +140,26 @@ impl StagedFrame {
         exact: bool,
         bytes: &[u8],
     ) -> bool {
-        todo!()
+        if after(tick, self.tick) {
+            return false;
+        }
+        match self.rows.entry((key, component)) {
+            btree_map::Entry::Occupied(mut entry) => {
+                let slot = entry.get_mut();
+                if !after(tick, slot.tick) || slot.len as usize != bytes.len() {
+                    return false;
+                }
+                slot.tick = tick;
+                slot.exact = exact;
+                let start = slot.start as usize;
+                self.bytes[start..start + bytes.len()].copy_from_slice(bytes);
+            }
+            btree_map::Entry::Vacant(entry) => {
+                let (start, len) = append(&mut self.bytes, bytes);
+                entry.insert(RowSlot { tick, exact, start, len });
+            }
+        }
+        true
     }
 
     /// The staged row of `component` for `key`, if the frame holds one.
@@ -181,6 +205,41 @@ impl StagedFrame {
     fn slice(&self, slot: &RowSlot) -> &[u8] {
         &self.bytes[slot.start as usize..(slot.start + slot.len) as usize]
     }
+}
+
+/// Equal when every field and every row (key, component, tick, precision, bytes) is: where
+/// a row's bytes lie in the arena is not part of the frame.
+impl PartialEq for StagedFrame {
+    fn eq(&self, other: &Self) -> bool {
+        self.tick == other.tick
+            && self.full == other.full
+            && self.time_scale == other.time_scale
+            && self.acked_input == other.acked_input
+            && self.substituted == other.substituted
+            && self.regions == other.regions
+            && self.spawns == other.spawns
+            && self.moves == other.moves
+            && self.removed == other.removed
+            && self.despawns == other.despawns
+            && self.rows().eq(other.rows())
+    }
+}
+
+impl Eq for StagedFrame {}
+
+/// Appends `bytes` to an arena whose offsets are `u32`, returning where they lie.
+pub(crate) fn append(arena: &mut Vec<u8>, bytes: &[u8]) -> (u32, u32) {
+    let fits = |n: usize| u32::try_from(n).expect("a frame's byte arena is limited to 4 GiB");
+    let (start, len) = (fits(arena.len()), fits(bytes.len()));
+    fits(arena.len() + bytes.len());
+    arena.extend_from_slice(bytes);
+    (start, len)
+}
+
+/// Whether tick `tick` is after tick `than`, across the wrap, as the world orders ticks:
+/// the two are taken to lie within 2^31 ticks of each other.
+pub(crate) const fn after(tick: Tick, than: Tick) -> bool {
+    tick.0 != than.0 && tick.0.wrapping_sub(than.0) < 1 << 31
 }
 
 /// One staged row: a whole component image for one entity, as received.
@@ -296,7 +355,12 @@ impl StagedInbox {
     /// network thread hands over is accepted; a refusal is a defect in the receiver.
     #[must_use = "a refused frame's region changes and time scale must not enter the TickInput"]
     pub fn push(&mut self, frame: Arc<StagedFrame>) -> bool {
-        todo!()
+        if self.accepted.is_some_and(|accepted| !after(frame.tick, accepted)) {
+            return false;
+        }
+        self.accepted = Some(frame.tick);
+        self.frames.push_back(frame);
+        true
     }
 
     /// The oldest queued frame whose tick is not after `tick`, removed from the inbox; or
@@ -305,7 +369,11 @@ impl StagedInbox {
     /// hook received (the one the step advanced the world to), so a frame delayed by loss
     /// applies at the first sync point after it arrives.
     pub fn pop_through(&mut self, tick: Tick) -> Option<Arc<StagedFrame>> {
-        todo!()
+        // Queued ticks ascend, so the oldest frame decides.
+        if after(self.frames.front()?.tick, tick) {
+            return None;
+        }
+        self.frames.pop_front()
     }
 
     /// The queued frames whose tick is not after `tick`, oldest first, without removing
@@ -316,7 +384,25 @@ impl StagedInbox {
     /// `due(Tick(simulation.tick().0 + 1))`.
     #[must_use]
     pub fn due(&self, tick: Tick) -> DueFrames<'_> {
-        todo!()
+        DueFrames { frames: self.frames.iter(), through: tick }
+    }
+
+    /// The tick of the oldest queued frame that is after `tick`: the first frame that will
+    /// not apply in the step for `tick`, or `None` when every queued frame is due by then.
+    /// `lactose-predict` asks it with the present tick to learn the server is ahead.
+    #[must_use]
+    pub fn oldest_after(&self, tick: Tick) -> Option<Tick> {
+        // Queued ticks ascend, so the frames due at `tick` are a prefix.
+        self.frames.iter().map(|frame| frame.tick).find(|&queued| after(queued, tick))
+    }
+
+    /// Empties the inbox and forgets the newest tick it accepted, so the next frame pushed
+    /// is accepted whatever its tick. A re-join that moves the world's tick with
+    /// `World::set_tick` calls it beside that call: the new session's ticks may lie before
+    /// the old session's, which [`push`](Self::push) would refuse.
+    pub fn reset(&mut self) {
+        self.frames.clear();
+        self.accepted = None;
     }
 
     /// The newest tick ever accepted, queued or already popped.
@@ -348,7 +434,13 @@ impl<'a> Iterator for DueFrames<'a> {
     type Item = &'a Arc<StagedFrame>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        todo!()
+        // Queued ticks ascend: the first frame after `through` ends the iteration, and a
+        // peek through a copy of the iterator leaves it to be seen again.
+        let frame = self.frames.clone().next()?;
+        if after(frame.tick, self.through) {
+            return None;
+        }
+        self.frames.next()
     }
 }
 

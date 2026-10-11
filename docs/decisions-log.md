@@ -2002,6 +2002,38 @@ rationale the author supplied during the editorial pass rather than one taken fr
   `StagedFrame::removed`; the full frame's fold; the gather's decision first and the mirror
   replaced; claims as spawns of a live key; failed entries logged and skipped; the wrapping
   generation.
+- Implementation of `lactose-net-api` (milestone 1; the first review found 2 serious and 4 minor,
+  the second 3 minor in documentation, applied at the merge). `StagingFrame::merge` applies the
+  newer frame's structural entries to the older pending rows: a row of an entity it despawned, or
+  of a component it removed, is dropped, and a row of an entity it moved is re-homed to the
+  entity's new region. Of two rows for one (key, component), the row with the later tick wins,
+  and on equal ticks the newer frame's. A full older frame stays full and keeps `structural`
+  empty. So a frame not taken, merged with the next, equals the frame one gather over both
+  windows produces. `finish` puts a frame in canonical order (region, key, component), with the
+  newest tick winning, and rebuilds the arena, so equality of finished frames is equality of
+  content; `StagedFrame` compares by content, not by arena layout. The gather forks over the
+  kept chunks with one `OnceLock` cell per chunk, joined in chunk order, so the frame is
+  independent of layout and worker count; it measured 0.46 ms median on 4 workers and 0.61 ms
+  on one (release, 100k entities by 20 components, 4,000 changed rows), and a full gather of
+  2M rows 190 to 215 ms. Tick order in `StagedInbox` and `push_row` wraps, matching the world's
+  tick. `StagedFrame::push_row` (`#[must_use]`) refuses a row older than or equal to the one
+  held, a row from a tick after the frame's, and a row of another length than the one held; the
+  receiver checks each row's length against the registry before it pushes it, so a held row is
+  overwritten in place and the arena never grows with the packets.
+  `StagedInbox::oldest_after(tick)` is the tick of the oldest queued frame after `tick`, the
+  first one `due(tick)` leaves out; `lactose-predict`'s `Behind` reads it. `StagedInbox::reset`
+  empties the inbox and forgets its accepted tick: a re-join, whose ticks may lie before the old
+  session's, resets the inbox of every client world it moves with `set_tick` ("built at, or
+  `set_tick` to" above), the receiver restarts its newest staged tick, and frames of the old
+  session not yet pushed are dropped, never pushed after the reset. A `Behind` or `Divergence`
+  resync does not reset. `RegionRelevance::to_bundle` checks the overlay against the baseline
+  whether it was carried (`Full`) or cached (`Digest`). The decision "current cursor, stale
+  mark" is defensive: every epoch change resets the structural log too, so the public API never
+  reaches it, and it is held by a unit test. `lactose-net-api` is listed under `[harness]` in
+  `tools/xtask/ci-policy.toml`; its SOUR test replicates a scene with cooked baseline rows, a
+  bound predicted spawn, untaken frames merged, a region unloaded and reloaded, and a claim and
+  its release, asserts that every hook path ran, and records server hash, frame digest and
+  client hash per frame.
 - Driven by: milestone 1, the `net-api` facade brief and its two design reviews (2026-10-10).
 
 **D122. The `predict` facade: what sections 5.1, 7, 9.2, 9.4, 10, 11 and 22 left open** (§5.1, §5.3,

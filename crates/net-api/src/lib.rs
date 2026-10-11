@@ -9,12 +9,6 @@
 //! `README.md` is the contract: it states what the signatures cannot, and what a caller
 //! may rely on.
 //!
-//! # Status
-//!
-//! A facade: every public signature is final and every body that decides anything is
-//! `todo!()`. The implementation lane replaces the bodies behind this surface and removes
-//! the crate-level `allow` with the last `todo!()`.
-//!
 //! # Where to start
 //!
 //! - [`StagedFrame`] is what a client received for one server tick, [`StagedInbox`] where
@@ -62,12 +56,6 @@
 //! ```
 
 #![forbid(unsafe_code)]
-#![allow(
-    dead_code,
-    unused_variables,
-    reason = "facade: every body is `todo!()` until the implementation lane replaces it, and \
-              the fields and parameters it will use are declared now"
-)]
 
 pub mod lag;
 pub mod relevance;
