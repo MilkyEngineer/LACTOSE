@@ -42,14 +42,16 @@ breaks one is a signature change to list.
 | `Ring`, `SlotBytes` | The rollback ring: its depth, its oldest tick (the horizon), its newest (the present), where it restarted, what it weighs by part |
 | `PredictionHook` | The `StagedState` hook `Predictor::new` installs: the frames applied inside the tick, the proxies moved along their history, the claimed entities' facts recorded |
 | `Reconciled`, `Correction`, `CorrectionCause`, `Divergence`, `ResyncReason` | What one reconciliation did: the ticks confirmed, every correction with its depth, cause, entities and divergence, the ticks re-simulated, and whether the world must resync |
+| `PredictionTolerance`, `Predictor::set_tolerance` | How far a dynamic body's solver-written `Transform` and `Velocity` may differ from the server's and still agree: a scalar per kind, defaults in the type, set by `app` between runs |
 | `PredictionStats` | The monotonic counters the milestone 1 spike records: ticks predicted and re-simulated, frames, corrections, mismatched fields and entities, substitutions, unechoed spawns, resyncs, slots without physics, the deepest correction |
 | `check_prediction_reads`, `prediction_may_name`, `EXCLUSIVE_SYSTEMS` | The build check of D121: a prediction-world system may name only replicated, transient or derived components, and an exclusive one must be one of the engine's, by system key |
 
 Hidden plumbing: none. The record the hook fills and the predictor reads is a
 crate-private service resource of the prediction world; the ring's slot is a private type,
 so a snapshot's representation (a full copy today, copy-on-write if measured necessary) is
-the implementation's. Everything public is keys, ticks and counts; nothing reads a clock or
-computes a float, and the crate carries the boundary `clippy.toml`.
+the implementation's. Everything public is keys, ticks, counts and the tolerance's scalars;
+nothing reads a clock, every float goes through `lactose_math`, and the crate carries the
+boundary `clippy.toml`.
 
 ## What each consumer needs, and where this surface gives it
 
@@ -341,9 +343,22 @@ sync point"; `crates/net-api/README.md`, "The staged frame")
   memory bytes (storage holds origin keys on both machines, so a reference compares as
   bytes), and a scalar leaf (`FieldKind::Scalar` with `lactose_math`'s tag, at any depth
   of a `#[value]` struct or array) by its canonical bits, so one NaN is one value and
-  negative zero is its own. Full precision, no tolerance: the same build on the same
-  bytes produces the same bits, so any difference is a different input, which is what a
-  misprediction is. A row whose length is not the registry's element size for its
+  negative zero is its own. Full precision, with one exception: a `Transform` or `Velocity`
+  whose canonical bytes differ still agrees, for an entity whose `RigidBody` is `Dynamic` at
+  slot *T* or at slot *T* - 1 (the fact's `RigidBody` if the frame carries one, else the
+  record's; *T* alone when the record has no slot *T* - 1 for the entity), when every scalar
+  leaf is within the predictor's `PredictionTolerance` for its kind (translation, rotation,
+  linear, angular), since the physics solver holds state the rows do not carry and the
+  client's solver reached its state by another path (architecture section 16, D124); a NaN
+  leaf agrees with an equal NaN and with nothing else. Every other field, the rows of
+  kinematic and fixed bodies included, agrees only by canonical bytes, since the same build
+  on the same bytes produces the same bits. `Teleported` of a claimed entity is the client's
+  own no-interpolate flag: never recorded, never compared, never written. The tolerance
+  decides whether the frame makes a correction point and nothing else: a rollback writes
+  every fact at *k*, the absorbed ones included. A field within tolerance that is not
+  bit-equal is counted in `PredictionStats::absorbed`, with the largest difference per kind
+  as canonical bits, and is not a mismatch. A row whose length is not the registry's
+  element size for its
   component, or whose component the registry lacks, is a defect of the sender: logged,
   skipped.
 - Substitution (architecture section 9.2; `crates/input/README.md`, "Redundancy and
@@ -426,10 +441,16 @@ sync point"; `crates/net-api/README.md`, "The staged frame")
   name a live `Net` entity. The replay of the frame that tombstoned the entity despawns
   it again regardless.
 - Rapier's internal solver state is not corrected (section 9.4), so a corrected dynamic
-  body converges over a few ticks rather than exactly: the frames of those ticks differ
-  again by small amounts, each a correction under the rule above. The spike's correction
-  rate counts them; whether milestone 4 adds a tolerance for dynamic bodies is decided
-  against that baseline, never silently here.
+  body's rows differ from the server's by rounding for as long as it is in contact: a body
+  on static geometry or pushing one crate by up to 7.5e-4 m and 5.3e-3 m/s, which the
+  tolerance absorbs (one correction per misprediction against 8 to 200 without it); claimed
+  bodies in contact with each other by whole outcomes, so a three-crate stack of claimed
+  crates was corrected 7 to 16 times in 200 frames after a misprediction while it moved,
+  22 to 35 times in 167 frames after a claim mid-bump, and once at rest (D124). Writing
+  every fact at *k*, the absorbed ones included, is what makes those corrections converge.
+  The spike records the corrections and the largest absorbed difference per kind, and
+  milestone 4 re-sets the defaults from them; `net`'s claim policy claims a thrown object
+  with its throw and releases it at rest.
 
 **Physics** (`crates/physics-api/README.md`, "Snapshot and restore")
 
@@ -556,7 +577,8 @@ README.md`, "The applier")
   carries a changed entity at milestone 4.
 - Forwarding nearby players' inputs into the prediction world (section 9.4, "later"): the
   same `PlayerSample` per player in the `TickInput`; nothing here changes.
-- A tolerance for dynamic bodies, decided at milestone 4 against the spike's baseline.
+- The tolerance's defaults re-set from the spike's `absorbed` figures and from the scalar
+  decision, and `net`'s release of a thrown object at rest: milestone 1 and 4.
 - Region resources corrected per tick, and `OwnedBy` replicated: `net`'s and the ECS's,
   milestone 4; until then a prediction system that reads one the server mutates is the
   game's hazard, and one that names `OwnedBy` is refused.
@@ -573,7 +595,7 @@ Nothing runs yet. The implementation lane replaces every `todo!()` and proves:
 | What | How |
 |---|---|
 | The ring | Under SOUR's layout mode: a prediction world stepped `n` ticks, rolled back to each slot and re-simulated with the ring's inputs, hashes equal at every tick to the straight run; the slot's record equals the claimed entities' rows read back; `oldest` and `newest` track the depth; `set_depth` drops and moves the horizon; a frame older than the ring is `TooOld` and nothing changed; a slot taken without physics restores the world alone and is counted |
-| The comparison | Golden cases over a small registry: equal bytes match; each field kind differing is one field; a scalar leaf's NaN with another payload matches, negative zero does not; a missing component, entity, region or claim is a mismatch with no field; a wrong row length is skipped; a fact is compared at slot `T` only, and one whose region slot `T` lacks is skipped |
+| The comparison | Golden cases over a small registry: equal bytes match; each field kind differing is one field; a scalar leaf's NaN with another payload matches, negative zero does not; a missing component, entity, region or claim is a mismatch with no field; a wrong row length is skipped; a fact is compared at slot `T` only, and one whose region slot `T` lacks is skipped; a dynamic body's `Transform` within tolerance agrees and the frame makes no correction, one past it is a mismatch, a kinematic body's agrees by bytes only, a body dynamic at *T* - 1 and kinematic at *T* takes the tolerance, one with no slot *T* - 1 is judged at *T*, a NaN leaf agrees with an equal NaN only, `Teleported` differing is not a mismatch and is not written at a correction, a rollback writes the absorbed facts too (the physics test backend records the pushes), and `absorbed` holds the largest absorbed difference per kind |
 | Corrections | A claimed body whose frame differs is corrected at its tick, stamped, and the re-simulated ticks hash equal to a run that had the server's rows from that tick on; a `Changed`-driven derived cache follows the correction; `corrected` received exactly the written keys (the physics test backend records calls); a despawned-too-early entity is re-spawned in its last known region; two frames with facts at two ticks correct once at the older and once at the newer with the right depths; facts are written in frame order under every layout |
 | Substitution | A substituted tick replaces the sample and re-simulates from the tick before; the repair of the first unsubstituted tick after it is found by tick when the frame spans several ticks; both counted; a substitution at or before the restart is skipped, as is one in a frame popped before the call's newest full frame and the repair that depended on either, and one before the horizon is `TooOld`; the re-simulated world equals a run that had the substitute from the start |
 | The hook | Frames applied in the stated order: proxies spawned, moved, removed, tombstoned; a proxy's `Transform` written for the tick and swept by the sync; a full frame rebuilds, resets the ring, inserts the anchor, and the first frame at or after the rebuild tick corrects once; a claimed entity's spawn, rows and tombstone are not written; an unechoed predicted spawn is despawned at the frame after its input tick and not at that tick's frame; the local entity carries its claim and anchor after every path and `set_local` moves them; `player_entity` resolves; a hook replaced through `simulation_mut` fails the next step with the predictor kept |

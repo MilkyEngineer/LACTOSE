@@ -22,7 +22,8 @@ In priority order. When two conflict, the earlier one wins.
    inputs, produces the same world state regardless of thread count, scheduling order, chunk
    layout, run, or host architecture (x86-64 and aarch64). This is what makes replays, the
    determinism harness and desync debugging work. It does not by itself make client prediction
-   correction-free, because the client's prediction world differs from the server's world.
+   correction-free, because the client's prediction world differs from the server's world and
+   its physics solver holds state the rows do not carry (section 16).
    Reconciliation is defined separately (section 9.4).
 3. **No threading knowledge required of gameplay programmers.** They never write a lock, spawn
    a thread, or choose execution order. They declare what data a system reads and writes.
@@ -44,8 +45,8 @@ server sharding.
 | Language | Rust, stable toolchain, workspace of crates. No Bevy. |
 | Reference game | Open-world action-adventure in the style of Breath of the Wild, networked co-op with an arbitrary number of players. |
 | Simulation tick | 60 Hz fixed. Render uncapped with interpolation. |
-| Netcode | Dedicated server, authoritative. Clients send tick-stamped inputs with redundant history and simulate the quantised value they sent. Local-player prediction in a separate client prediction world, reconciled at full precision. Snapshot interpolation for everything else. Interest management and per-client bandwidth prioritisation are part of the first networking deliverable, never a later addition. |
-| Determinism scope | Same build, identical results across threads, layouts and x86-64 versus aarch64. Reconciliation compares at full precision (section 9.4). |
+| Netcode | Dedicated server, authoritative. Clients send tick-stamped inputs with redundant history and simulate the quantised value they sent. Local-player prediction in a separate client prediction world, reconciled at full precision within a stated tolerance on the solver-written rows of a dynamic body. Snapshot interpolation for everything else. Interest management and per-client bandwidth prioritisation are part of the first networking deliverable, never a later addition. |
+| Determinism scope | Same build, identical results across threads, layouts and x86-64 versus aarch64. Reconciliation compares at full precision, with a stated tolerance on the solver-written rows of a dynamic body (section 9.4). |
 | Identity | Process-local entity IDs never leave the process. Every reference, ordering rule and RNG key uses a `StableKey`: the server-assigned network ID, or the prediction key for a spawn the server has not confirmed. The server records a predicted spawn's prediction key as its permanent origin key, so binding changes nothing semantic. Network IDs double as persistent IDs. |
 | World coordinates | Simulation scalar is a `math` newtype with no inherent float methods, 64-bit by default, decided finally by a milestone 1 precision and performance test at full map extent. Switching is a Rapier crate switch, not a one-line change. GPU scene stores grid cell plus 32-bit offset. |
 | Physics | Rapier through `physics-api`, pinned exactly. One physics world per server process, one prediction world per client. Rapier's determinism and parallel features together. |
@@ -739,8 +740,20 @@ Section 9.7 gives the capacity model.
   from replicated state. Section 10 defines what a snapshot holds.
 - **Reconciliation** compares predicted and authoritative state per field at full precision;
   the server sends every simulation-read field of predicted entities at full precision on each
-  update, since it cannot know when the client mispredicted. Rapier's internal solver state is
-  not corrected, so a corrected dynamic object converges over a few ticks rather than exactly. Mispredictions against
+  update, since it cannot know when the client mispredicted. Every field agrees by canonical
+  bytes; the `Transform` and `Velocity` the physics write-back writes on a dynamic body also
+  agree when each scalar is within a stated tolerance (`lactose-predict`'s, two millimetres,
+  two thousandths of a quaternion component, two centimetres per second and two hundredths of
+  a radian per second by default), because the solver holds state the rows do not carry
+  (section 16) and it is not corrected, so a corrected dynamic body differs from the server by
+  rounding for as long as it is in contact. The tolerance decides whether a frame makes a
+  correction; a correction writes every fact at its tick, the absorbed ones included, which is
+  what converges. `Teleported` of a claimed entity is the client's own no-interpolate flag and
+  is never compared or corrected. A replicated field a game derives from a solver-written
+  value compares by canonical bytes and is corrected when it differs, so a game keeps derived
+  replicated state integer. Claimed dynamic bodies in contact with each other are corrected
+  every few frames until they settle, so the claim policy claims a thrown object with its
+  throw and releases it at rest. Mispredictions against
   non-predicted entities are expected and smoothed visually. Proxies live about half a round
   trip in the past relative to the local player; this is an accepted limitation, and predicted
   interactions with proxies are presented tentatively until confirmed. Corrections are written
@@ -789,7 +802,8 @@ must not undo them: the prediction-to-network alias table (section 7) and the lo
 delivered presentation events, which is what lets re-emission deduplicate and a missing
 re-emission cancel. Command buffers are empty at snapshot points by construction.
 
-The server never rolls back. Save snapshots copy persistent columns only (section 15.3).
+The server never rolls back. Save snapshots copy persistent columns only (section 15.3); a
+journal checkpoint carries the physics snapshot beside them (section 15.5).
 
 `physics-api` conformance: run ten ticks, snapshot at tick three, restore, re-run, hash equal
 at tick ten. The cost is measured in milestone 1 and the prediction world is sized from it.
@@ -989,7 +1003,9 @@ and runs migrations in version order. After load, change ticks are rebased (sect
   server counter are persisted, so RNG streams and ordering survive a load.
 
 Journal replay (checkpoint plus input journal) is a debug and replay tool, not the save
-system.
+system. A checkpoint carries the physics snapshot of section 10 as bytes, since the solver
+holds state the rows do not carry (section 16) and a replay from a checkpoint without it
+hashes equal only until the first contact; a replay from a session's start needs none.
 
 The server owns the save in multiplayer. Player portability between hosts is an open item.
 
@@ -1011,6 +1027,26 @@ step blocks on it inside `block_in_place` with that reservation. The physics sta
 systems that depend on physics only; independent systems run alongside on the reserved workers.
 Bodies in `Frozen` regions are fixed colliders. Milestone 1 measures the physics phase's share of
 the tick and the stall it imposes on render recording during the overlap.
+
+The solver holds state the rows do not carry: warm-start impulses, contact manifolds and sleep
+counters. Two worlds with equal rows and different solver state diverge while bodies are in
+contact, by rounding for a body on static geometry and by whole outcomes for bodies in contact
+with each other, and a client's solver reaches such a state after a correction, a claim of a
+body in contact and a rebuild. The backend's results are also a function of the world's row
+history (D119): with one awake island and world-wide constraint order, far-away awake bodies
+and freed arena slots can change a body's bits in a large contact graph (a 150-body pile;
+nothing in scenes of a few or fifty bodies). Bit equality therefore holds between two worlds
+only when their row histories and solver states are identical, the server and its replay or a
+run and its re-simulation, never the server and a client's prediction world. The backend does
+not canonicalise per island: the pinned Rapier cannot, and no solve order carries the solver
+state across. The difference is kept out of the comparison instead (section 9.4). An empty
+solver is a fresh solver: `physics-api` keeps the bytes the backend wrote at setup; a sync
+whose structural log since its last pass, the pending entries a restore carried included,
+despawned every body the solver held removes them all, restores those bytes and creates from
+the rows by a full diff in ascending key order; a sync whose removals leave the solver empty
+restores the bytes and makes the next sync a full diff. So a world reloaded in place, in one
+frame or two, has the physics state a fresh process loading the same rows has, which is what
+section 15.5's first test needs.
 
 The simulation scalar is decided in milestone 1 by a precision test at full map extent: 32-bit
 is adopted if positional error at the map edge stays under one millimetre over a ten-minute
@@ -1120,7 +1156,7 @@ in the expansion against the final type, never by what the macro parsed;
 | # | Name | Delivers | Proves |
 |---|---|---|---|
 | 0 | Skeleton | Workspace, CI matrix, `core` with tagged allocator, `math`, `task`, `reflect`, `asset-api`, `bundle`, tracing, SOUR scaffold, `ecs` facade with the section 6.1 API | Makespan divided by its lower bound (the larger of the duration-weighted critical path and total work divided by worker count) at most 1.25 at P50 and 1.5 at P99 on three DAG shapes (wide-shallow, deep chain, fan-in-fan-out) with log-uniform job durations from 10 µs to 1 ms, with and without two background zstd threads, on a developer M-series Mac and an x86 desktop. Tick-start latency, from a tick deadline to the timer root resuming, under 20 µs at P99; wake latency from an idle pool under 35 µs at P99; steal under 1 µs. Latch and sleep-wake pass loom; `task` and `ecs` pass Miri. |
-| 1 | World | Sim track: `ecs`, `sim`, `physics-api` plus `physics-rapier`, `anim`, `predict`, `persist` (policy, records, container), `asset-api`, `net-api` and `input` types, headless `app`. Render track: RHI spike, `rhi-null`. Asset track: `io`, `asset`, `cook` skeleton. | 100k entities simulate a tick in at most 4 ms on 8 performance cores; SOUR passes in workers, repeat, layout and chaos modes. Physics snapshot conformance. Physics phase at most 3 ms for 2,000 awake bodies; prediction-world snapshot at most 100 µs; sim-skeleton evaluation at most 0.5 ms for 200 characters. Netcode spike over a throwaway transport: x86 server, aarch64 client, one predicted character, fifty claimed dynamic bodies; correction rate, rollback cost per tick and divergence recorded as the baseline that milestone 4's threshold is judged against. Scalar decided by the section 16 rule. Edit-to-playing at most 30 s per platform. |
+| 1 | World | Sim track: `ecs`, `sim`, `physics-api` plus `physics-rapier`, `anim`, `predict`, `persist` (policy, records, container), `asset-api`, `net-api` and `input` types, headless `app`. Render track: RHI spike, `rhi-null`. Asset track: `io`, `asset`, `cook` skeleton. | 100k entities simulate a tick in at most 4 ms on 8 performance cores; SOUR passes in workers, repeat, layout and chaos modes. Physics snapshot conformance. Physics phase at most 3 ms for 2,000 awake bodies; prediction-world snapshot at most 100 µs; sim-skeleton evaluation at most 0.5 ms for 200 characters. Netcode spike over a throwaway transport: x86 server, aarch64 client, one predicted character, run as a dynamic capsule and as a kinematic body, fifty claimed dynamic bodies thrown and interacting, and a claim of a body in contact; correction rate under the section 9.4 tolerance, the largest difference the tolerance absorbed per kind, rollback cost per tick and divergence recorded as the baseline that milestone 4's threshold is judged against. Scalar decided by the section 16 rule. Edit-to-playing at most 30 s per platform. |
 | 2 | Pixels | `platform`, `rhi-api`, `rhi-vulkan`, `render-graph`, minimal `renderer`, Slang toolchain, `present-api`, presentation snapshot and schedule | A triangle through the graph on Windows and macOS. MoltenVK, KosmicKrisp and native Metal spikes recorded, and `rhi-api` frozen or amended on their findings. Overlap with exclusive extract; extract at most 1 ms for 50k dirty rows; remote transform upload at most 1 ms for 5k entities at 144 Hz. lavapipe CI; macOS shader runner. |
 | 3 | GPU-driven | GPU scene with cell-plus-offset, cluster submission, culling, deferred tile-local lighting, streaming regions with `persist` overlay against the cooked baseline, `terrain`, pose evaluation, `rhi-metal` | 500k instances through compacted index buffers with one indexed indirect draw per pipeline, at most 2 ms GPU on RTX 3060-class and 4 ms on M1-class at 1440p, on Vulkan and Metal. Regions persist across unload and reload. Skinned characters on terrain. |
 | 4 | Network | `net`, interest management, bandwidth prioritisation, reconciliation, resync, late join, client and server `app`, SOUR architecture mode on every PR | Thirty-two simulated clients joining and leaving under injected latency and loss, with the server tick under 16 ms and each joining client converged within 2 s. A recorded server session replayed on aarch64 hashes equal. Solo traversal over static geometry at 100 ms round trip with 1% loss produces fewer than one correction per minute. |

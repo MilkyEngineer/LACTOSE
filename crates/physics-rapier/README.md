@@ -41,7 +41,16 @@ alone. A body's results depend on every body the world holds or held: far-away a
 that touch only each other can change them, and so do bodies stepped once and removed, whose
 freed arena slots later bodies take (`tests/determinism.rs` records both). Bit equality
 holds only between worlds whose row histories are identical; two worlds holding different
-body sets or histories are not bit-equal for the bodies they share.
+body sets or histories are not bit-equal for the bodies they share. The history dependence
+is a property of large contact graphs and of a solver that has freed its slots, not of every
+body: a dynamic capsule on static geometry, one pushing a crate, one bumping a three-crate
+stack, one pressing two crates against a wall and fifty thrown bodies interacting were
+bit-equal over 900 to 1,800 ticks with far awake bodies present, arriving mid-run and awake
+throughout; the 150-body pile first differed by 2.7 mm at tick 238 and by 346 mm at tick
+400, and every body removed and recreated on the same solver differed from a fresh solver by
+0.4 mm to 7.6 m (D124). What a prediction world meets is the solver state the rows do not
+carry (warm starts, manifolds, sleep), which `lactose-predict` compares within a tolerance;
+the backend does not canonicalise.
 
 - A call with a value equal to the one recorded does nothing. Equality is bitwise on the
   canonical bits, so `0.0` and `-0.0` differ.

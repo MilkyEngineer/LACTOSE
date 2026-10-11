@@ -184,7 +184,18 @@ system there. `app` orders any other exclusive `Stage::Post` system against
   a row that is a body and not in the map is created, a key in the map whose row is not a
   body is removed, and every row in both is pushed through `set_body`, `set_collider`,
   `set_transform` and `set_velocity`, which the backend compares and ignores when equal.
-  It never clears the solver: sleep and warm starts survive wherever the rows agree.
+  It never clears a solver whose log kept a body: sleep and warm starts survive wherever the
+  rows agree. This crate keeps the bytes the backend wrote at `setup`; a sync whose
+  structural log since its last pass, the pending entries a restore carried included,
+  despawned every body the solver held removes them all, restores those bytes and creates
+  from the rows by a full diff in ascending key order; a sync whose removals leave the solver
+  empty restores the bytes and makes the next sync a full diff.
+  So an empty solver is a fresh solver, and a world reloaded in place, in one frame (every
+  region unloaded and loaded, which the log shows as `Despawned` then `Spawned` per key) or
+  in two, has the physics state a fresh process loading the same rows has, bit for bit (D124;
+  architecture section 15.5's first test). A `Spawned` entry for a key the bookkeeping holds
+  re-inserts its handle row, so a same-frame reload of a region keeps `BodyHandle` and
+  `JointHandle` present exactly while the row is in the solver.
 - A `Velocity` is not required to be a body; a dynamic or kinematic body without one
   gains one at its first write-back, since the write-back adds the component.
 - `written`, the record the sync compares `Transform` and `Velocity` row writes against,
@@ -366,7 +377,19 @@ gather compare it with the last tick they covered, and zero means never.
   the last write-back wrote, so the backend, which compares, takes what differs from its
   state and ignores the rest. A correction written to a non-body is ignored. Rapier's
   internal solver state is not corrected (architecture section 9.4), so a corrected
-  dynamic body converges over a few ticks.
+  dynamic body's rows differ from the server's by rounding for as long as it is in contact,
+  up to 7.5e-4 m for a body on static geometry or pushing one crate and by whole outcomes
+  for bodies in contact with each other; `lactose-predict`'s tolerance decides whether to
+  roll back and its rollback writes every fact (D124). A corrected `Transform` is pushed as
+  a placement, so the re-simulated step reports the body `teleported` and the write-back
+  sets the client's `Teleported`, which `lactose-predict` therefore never compares. A
+  journal checkpoint carries this snapshot as bytes: a format version, the backend's
+  identity (its name, the Rapier version and the hash of the D123 patch set under
+  `vendor/`), the `PhysicsConfig`, the tick, the backend's bytes and the bookkeeping; a
+  fresh process restores them into a `Physics` of a world at the checkpoint's tick,
+  refusing a mismatch of any of those with `InvalidData` and rebuilding the handle rows
+  from the bookkeeping, since loaded rows carry none. The byte form and the restore are the
+  journal tooling lane's.
 - `PhysicsSnapshot::size_in_bytes` is the backend's part, what milestone 1 measures
   against the 100 µs prediction-world budget for 50 claimed bodies plus N statics; that
   measurement decides how many statics the prediction world may hold. `hash` is the named
