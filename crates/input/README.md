@@ -11,9 +11,9 @@ latest-sample slot, device sources and action mapping) is `lactose-input-host`.
 | Determinism boundary | inside |
 | Unsafe | none, `#![forbid(unsafe_code)]` |
 
-**Status: facade.** Every public signature is final and every body that decides anything is
-`todo!()`; nothing here runs. This file is the contract the implementation lane meets, and
-every sentence under "Behaviour the signatures cannot express" is one a dependent crate may
+**Status: implemented.** Every behaviour below runs and is tested (the table at the end
+names the tests), and the tests that run a simulation record their hashes under SOUR.
+Every sentence under "Behaviour the signatures cannot express" is one a dependent crate may
 rely on. Architecture sections 4, 5.3, 6.1, 8.1, 8.2, 9.2, 9.4, 15.1 and 15.5 are the
 design; where this file and the architecture disagree, the architecture wins and this file
 is wrong. Decision D120 records the choices those sections left open and what the first
@@ -24,9 +24,9 @@ index the lookup uses.
 
 Amending a signature is allowed in the change that needs it. Say so in the change
 description and list what changed, because `app`, `predict`, `net`, `lactose-input-host`
-and the game crates are written against this surface. `tests/consumers.rs` is a
-compile-only sketch of what each of them writes: a change that breaks it is a signature
-change to list.
+and the game crates are written against this surface. `tests/consumers.rs` sketches what
+each of them writes, and runs the sketches: a change that breaks it is a signature change
+to list.
 
 ## Surface
 
@@ -131,8 +131,7 @@ and `app` orders it with `Registration::order(&lactose_input::sets::APPLY, &THEI
   action map of milestone 5 and read with `contains_bit`. Naming more of them later adds
   variants to `Action` and changes no encoding. `contains_bit` and `with_bit` treat a bit
   at or above `Actions::BITS` as never set. `union`, `intersection` and `without` are the
-  set operations. These methods are the definition of the type and are final, not
-  `todo!()`.
+  set operations. These methods are the definition of the type and are final.
 - `held` is the set of actions held during the tick. `pressed` is the set that became
   held since the previous sample and `released` the set that stopped being held: the
   edges, computed once by the quantiser on the client from the previous sample's `held`
@@ -315,15 +314,29 @@ pitch for movement direction)
 
 ## Proof for milestone 1
 
-Nothing runs yet. The implementation lane replaces every `todo!()` and proves:
+The tests in `tests/`, each a nextest test that asserts on values, counts, orders, bytes
+and hashes and never on timing. `tests/common/mod.rs` is a small game written as a game
+crate writes it: a kernel in `Stage::Simulation` that records into a persistent component
+everything it derives from `&PlayerInput` (so the world hash covers the derived floats), a
+session applier that spawns and despawns through `player_entity`, a scripted client per
+player, and the frames of a server program (players joined with and without `IDLE`, a
+skipped tick, a malformed image of every kind, a held join, a stranger, a player with two
+anchored rows and a lesser unanchored one, a leave and a rejoin) and of a prediction
+program. `tests/sour.rs` records both programs under SOUR, which runs the package in
+workers, repeat, layout, chaos and (nightly) architecture modes. The review probes of the
+design rounds are ported as tests of the real code where they apply: the forgeries, the
+quantiser sweep, the world frame against `Quat`, the exhaustive repair check and the
+writer declaration.
 
 | What | How |
 |---|---|
-| The image | `from_sample_bytes(to_sample_bytes(x)) == x` for a sweep of valid samples; `to_sample_bytes(x) == bytemuck::bytes_of(&x)`; the offsets above; a 19-byte or 21-byte slice fails with `InvalidData`; `to_player_sample` carries the same bytes with `substituted: false` |
-| Validation | Each rule refused on its own: pitch `LIMIT + 1`; a movement component of `i16::MIN`; `(AXIS_SCALE, AXIS_SCALE)`; `pressed` 0b10 with `held` 0; `released` overlapping `held`; and a sweep of the quantiser's outputs, including the corners of the unit disc, all accepted |
-| Decoding | `Yaw(0)`, `Yaw(16384)`, `Yaw(32768)` and `Yaw(49152)` give `0`, `PI/2`, `PI` and `3PI/2` within one ulp; `Pitch(±LIMIT)` give `±PI/2`; `Axis2 { x: AXIS_SCALE, y: 0 }.to_vec2()` is `(1, 0)` exactly; the formulas are the stated ones, checked against them written out |
-| Directions | `IDLE.aim() == -Vec3::Z`; `Yaw(16384)` aims at `-X` and `Yaw(49152)` at `+X` within one ulp; `Pitch(LIMIT)` aims at `+Y`; `Yaw::rotation` rotates `-Z` onto the horizontal `aim` within 1e-15; `world_movement` of `(0, AXIS_SCALE)` at yaw zero is `(0, 0, -1)` and of `(AXIS_SCALE, 0)` is `(1, 0, 0)`; both have length at most one up to rounding over a sweep of valid samples; golden bits for a small table, pinned, equal on x86-64 and aarch64 under SOUR's architecture mode |
-| The applier | Under SOUR: a server with a joined player, a frame with that player's sample, then a kernel taking `&PlayerInput` sees the value; a tick without a sample sees `IDLE`; a malformed sample leaves the world unchanged and the tick runs; a sample for a player without an entity is `Ok(())` and changes nothing; two claimed rows resolve to the lesser key under every layout; the lookup costs the player's claims, not the world (a world of 100k rows does not change its time); the prediction world applies the same bytes to the same bits |
-| The writer declaration | A schedule with a kernel reading `PlayerInput` in `Stage::Simulation` builds with `register_systems` and fails with `TransientBeforeWriter` without it |
-| The history | Insert eight ticks in order, then a ninth: the first is gone; a duplicate returns `false` and keeps the first; out-of-order inserts yield ascending from `iter`; a tick older than the window is ignored; `insert_bounded` refuses `consumed`, `consumed + CAPACITY + 1` and `newest + 2^30` and accepts `consumed + 1` and `consumed + CAPACITY`; across the `u32` wrap the same |
-| Substitution | `substitute` keeps `held`, movement, yaw and pitch and clears `pressed` and `released`; `IDLE.substitute() == IDLE`; `after_substitute` of a sample holding `Throw` after a substitute that did not sets `pressed` to exactly `Throw` and passes `validate`; of a sample that stopped holding what the substitute held sets `released` to exactly that; of a sample whose own `released` names an action the substitute never held, or whose own `pressed` names one it already held, drops that edge; over every valid (sample, substitute) pair of a small action set, the result's edges equal the differences of the two `held` sets and `validate` accepts it |
+| The image | `sample.rs`: `from_sample_bytes(to_sample_bytes(x)) == x` and `to_sample_bytes(x) == bytemuck::bytes_of(&x)` over a sweep of 20,000 valid samples; each field little-endian at its offset; 0, 1, 19, 21 and 40 bytes fail with `InvalidData`; `to_player_sample` carries the same bytes with `substituted: false` |
+| Validation | `sample.rs`: each rule refused on its own, through `validate` and through `from_sample_bytes`: pitch `±(LIMIT + 1)`; a movement component of `i16::MIN`; `(AXIS_SCALE, AXIS_SCALE)`, and the disc's bound exactly (`(AXIS_SCALE, 255)` accepted, `(AXIS_SCALE, 256)` refused); `pressed` 0b10 with `held` 0; `released` overlapping `held`; every bit pattern of the other fields accepted; the sweep accepted; the quantiser as `lactose-input-host` states it, over 200,000 directions at five lengths, the diagonals, NaN and infinity, all accepted, worst `x² + y² - AXIS_SCALE²` within `2·AXIS_SCALE` |
+| Decoding | `sample.rs`: `Yaw(0)`, `Yaw(16384)`, `Yaw(32768)` and `Yaw(49152)` give `0`, `PI/2`, `PI` and `3PI/2` within one ulp; `Pitch(±LIMIT)` give `±PI/2` exactly; `Axis2 { x: AXIS_SCALE, y: 0 }.to_vec2()` is `(1, 0)` exactly; `radians`, `to_vec2`, `rotation`, `aim` and `world_movement` equal the stated formulas written out, bit for bit, over the sweep |
+| Directions | `sample.rs`: `IDLE.aim() == -Vec3::Z`; `Yaw(16384)` aims at `-X`, `Yaw(32768)` at `+Z` and `Yaw(49152)` at `+X`, and `Pitch(±LIMIT)` at `±Y`, within `Scalar::EPSILON`; `Yaw::rotation` rotates `-Z` onto the level `aim` within 1e-15; `world_movement` of `(0, AXIS_SCALE)` at yaw zero is `(0, 0, -1)` and of `(AXIS_SCALE, 0)` is `(1, 0, 0)`, at a quarter turn `-X` and `-Z`; `aim` has unit length and `world_movement` at most `1 + 1/AXIS_SCALE` up to rounding over the sweep; `aim` is the yaw quaternion times the pitch quaternion applied to `-Z`, and `world_movement` the stick along the yawed forward and right, within 1e-12 over a grid of yaw and pitch; golden bits of twelve derived values for six samples, pinned (generated on aarch64, checked on every target CI tests), and the same values hashed by `sour.rs` under the architecture mode |
+| The applier | `applier.rs`: a kernel taking `&PlayerInput` reads, bit for bit, the sample of every tick that carried one and `IDLE` on every tick without one or with a malformed image; a player spawned without the component gets it from its first sample and the kernel runs from then on; the program with its malformed images hashes equal, every tick, to the program with those entries absent; samples for a held join and for a player who never joined hash equal to their absence, and the applier returns `Ok(())` for them; called directly, every malformed image is `InvalidData` and writes nothing, and `substituted` and `input_tick` are not read; the lesser of two anchored rows is the entity, and the answer follows an anchor or claim removed; the prediction world's records equal the server's byte for byte on every tick both simulate the player; the hashes of both programs are equal under the production layout and SOUR's layout mode for `Rows(1)`, `Rows(7)`, `Rows(64)` and `Bytes(16384)` under three seeds each, on one and four workers, with the lesser key the entity throughout. `lookup.rs`, in a binary with the tagged global allocator: among 0, 1,000 and 100,000 other rows `player_entity` names the right row for 64 players and allocates nothing, and the applier allocates exactly what the same `World::insert` calls allocate; an ignored test times the lookup by hand (about 50 ns at both sizes on an M1) |
+| The writer declaration | `applier.rs`: on a server and a prediction world, the schedule with the kernel builds with `register_systems` and fails without it with `InvalidData` whose source is `TransientBeforeWriter { reader: "test::observe", component: PlayerInput::KEY }`; a client world builds with it |
+| The history | `history.rs`: eight ticks in order, then a ninth: the first is gone; a duplicate returns `false` and keeps the first; out-of-order inserts yield ascending from `iter`; a tick older than the window is ignored; a jump past the window empties it; `insert_bounded` refuses `consumed`, `consumed - 1`, `consumed + CAPACITY + 1`, `newest + 2^30` and `newest + 2^31` and accepts `consumed + 1` to `consumed + CAPACITY`; the same from four bases across the `u32` wrap; and 20,000 random inserts around a moving newest tick, across the wrap, against a model |
+| Substitution | `sample.rs`: `substitute` keeps `held`, movement, yaw and pitch and clears `pressed` and `released`; `IDLE.substitute() == IDLE`; `after_substitute` of a sample holding `Throw` after a substitute that did not sets `pressed` to exactly `Throw` and passes `validate`; of a sample that stopped holding what the substitute held sets `released` to exactly that; of a sample whose own `released` names an action the substitute never held, or whose own `pressed` names one it already held, drops that edge; over every valid (sample, applied) pair of a four-action set, the result's edges equal the differences of the two `held` sets, the rest is the sample's, and `validate` accepts it; `net`'s procedure over 20,000 ticks with a quarter lost keeps every applied sample's edges equal to the differences of the applied `held` sequence |
+| The consumers | `consumers.rs`: the sketches compile against the surface, every world kind builds as `app` builds it, and a player joined through the sketched session applier and driven through the sketched `net` path with one tick lost presses `Throw` on the repaired tick, the sketched kernels spawn the bomb and write the velocity, and the sketched leave despawns the entity |
+| SOUR | `sour.rs`: the server program for 60 ticks, and the prediction program rolled back to tick 30 and re-simulated, built from the session and recording `(tick, hash)` after every step |

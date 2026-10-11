@@ -9,12 +9,6 @@
 //! arrives from the host side. The `README.md` is the contract: it states what the
 //! signatures cannot, and what a caller may rely on.
 //!
-//! # Status
-//!
-//! A facade: every public signature is final and every body that decides anything is
-//! `todo!()`. The implementation lane replaces the bodies behind this surface and removes
-//! the crate-level `allow` with the last `todo!()`.
-//!
 //! # Where to start
 //!
 //! - [`PlayerInput`] is the component a kernel takes as `&PlayerInput`: movement, absolute
@@ -59,12 +53,6 @@
 //! ```
 
 #![forbid(unsafe_code)]
-#![allow(
-    dead_code,
-    unused_variables,
-    reason = "facade: every body is `todo!()` until the implementation lane replaces it, and \
-              the fields and parameters it will use are declared now"
-)]
 
 // The sample's byte image is its memory image, which is little-endian on every supported
 // target (x86-64 and aarch64); on any other the image would differ from what the wire and

@@ -8,7 +8,7 @@
 
 use lactose_core::{PlayerId, Result, StableKey};
 use lactose_ecs::{World, system};
-use lactose_sim::{InputApplier, PlayerSample, Registration, Stage, TypeTable};
+use lactose_sim::{InputApplier, PlayerSample, Registration, Stage, StreamingAnchor, TypeTable};
 
 use crate::sample::PlayerInput;
 
@@ -36,7 +36,7 @@ pub mod sets {
 /// of "the player's entity", for every applier and for `net` and `predict`.
 #[must_use]
 pub fn player_entity(world: &World, player: PlayerId) -> Option<StableKey> {
-    todo!()
+    world.claimed(player).find(|&key| world.get::<StreamingAnchor>(key).is_some())
 }
 
 /// The [`InputApplier`] for [`PlayerInput`]: what `app` hands to
@@ -70,7 +70,11 @@ impl PlayerInputApplier {
 
 impl InputApplier for PlayerInputApplier {
     fn apply(&mut self, world: &mut World, player: PlayerId, sample: &PlayerSample) -> Result<()> {
-        todo!()
+        let input = PlayerInput::from_sample_bytes(&sample.sample)?;
+        match player_entity(world, player) {
+            Some(key) => world.insert(key, input),
+            None => Ok(()),
+        }
     }
 }
 
