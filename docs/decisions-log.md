@@ -2105,6 +2105,96 @@ rationale the author supplied during the editorial pass rather than one taken fr
 - Driven by: milestone 1, the `predict` facade brief and its two design reviews (2026-10-10 and
   2026-10-11).
 
+**D123. A third-party crate is built from a patched copy only under `vendor/`, by one rule
+for every crate, checked by `cargo xtask vendor`** (§8.2, §8.3, §9.1, §16, §20,
+`crate-tiers.toml`, `deny.toml`, `.gitattributes`, `docs/agents.md`, `tools/xtask`)
+- Why: the Rapier backend needed one route moved from the platform library to `libm` (the
+  angular joint limit's `sin_cos` in `joint_constraint_helper.rs`, six changed lines) and no
+  document said whether a boundary crate may be patched, so the lane vendored the crate and
+  proposed a rule. Patching is admitted because the alternative, refusing `Joint::limited`,
+  drops a feature `anim`'s ragdoll needs for a six-line fix, and a git fork would move source
+  out of the repository and past `deny.toml`'s `unknown-git = "deny"`.
+  - *One mechanism, every crate.* `[patch.crates-io]` applies to every user of the crate in
+    the workspace, inside the boundary or not, so the mechanism and its check are
+    workspace-wide; admission differs: inside the boundary a patch fixes a section 8.2 route
+    and is reviewed as a determinism review, like a new allowlist name; elsewhere it fixes a
+    defect that blocks a milestone criterion; never a feature. A crate is patched at one
+    version only, and no `[patch]`, `[source]` or `paths` setting lives anywhere but the root
+    manifest, since cargo honours one in `.cargo/config.toml` silently.
+  - *Fifty changed lines, comments included; never the manifest records; a build script if
+    it must; no `unsafe`; a notice on every change.* The cap the lane brief used; it
+    separates a fix from a fork. The sign of zero in SIMD `min` and `max` (about 26 sites
+    over rapier, parry, simba and wide) is what it excludes, and that stays a verification
+    item for SOUR's architecture mode, not a patch. `Cargo.toml`, `Cargo.toml.orig`,
+    `Cargo.lock` and `.cargo_vcs_info.json` stay upstream's so the version, features,
+    dependencies and closure the allowlist review saw do not move; a build script may be
+    patched because `libm` selects its paths in `configure.rs` and cannot be refused, and
+    such a patch is reviewed as a change to what every target compiles. The `LACTOSE patch:`
+    comment is the notice Apache-2.0 section 4(b) asks of a modified file, and counting it
+    keeps the cap the diff's line count.
+  - *The record is what `cargo vendor` writes plus a patch file, and the check re-derives
+    it.* `.cargo-checksum.json` carries every upstream file's sha256 and the archive's, in
+    the format cargo itself reads; the patch is a unified diff `git apply` consumes. Offline
+    the check reverses the patch on a copy, hashes and compares; that proves the copy against
+    its record only, since a rewritten hash in the record passes it, so online the check
+    re-derives the record from the crates.io archive with `cargo vendor` from a shadow
+    manifest and requires equality. Rules out a diff quoted in prose (the lane's README), a
+    checksum in prose, and a tool that applies patches at build time (cargo has no hook; the
+    tree must exist before `cargo metadata`).
+  - *`cargo-deny` sees the name but not the advisories.* Probed on cargo-deny 0.20.2: `bans`,
+    `licenses` and `sources` match a patched crate by name and version; `advisories` skips it
+    as a path source (`smallvec` 1.6.0, RUSTSEC-2021-0003: reported from the registry, silent
+    when vendored and patched). The check runs `cargo deny check advisories` over the same
+    shadow manifest, pinned as the root `[workspace.dependencies]` entry pins it and resolved
+    against a copy of the workspace lock, and its exit status decides.
+  - *The build ID hashes the vendored files.* A patched crate's `Cargo.lock` entry has
+    neither `source` nor `checksum`, so section 9.1 hashes the vendored directory as it
+    hashes the boundary crates' sources: that names what the binary compiled whether or not
+    the check ran, where an archive checksum plus a patch would stay equal for a tampered
+    record until the online step caught it. `.gitattributes` marks `vendor/**` `-text` so a
+    Windows checkout hashes the same bytes.
+  - *A dependency, not a member.* Cargo does not make a patch path a member, but
+    `exclude = ["vendor"]` states it, so no workspace lint, format or test runs over the copy
+    and `[profile.dev.package."*"]` applies as to the registry build. Cargo caps no lints on a
+    path source, so the copy's own warnings show in a clippy run; `-D warnings` reaches the
+    selected packages only, so they fail nothing.
+  - *Reported upstream by the owner, dropped at the first bump that carries it.* A patch
+    nobody reports is a fork by instalments. Rapier's master still called the inherent
+    `sin_cos` on 2026-10-11.
+  - Rules out: a git fork; a patch over the cap; a patch to a manifest record; a vendored
+    copy with no patch; prose as the record; a per-boundary mechanism; a patch declared
+    anywhere but the root manifest.
+- What the proposal's review changed (0 blocking, 3 serious, 5 minor, 2 process): the shadow
+  manifest's `[workspace]` table, pinning and command, and cargo-deny's exit status as the
+  verdict; the online re-derivation of the record; cargo configuration files and non-member
+  path packages outside `vendor/` as findings; the one-version rule and `package` keys; the
+  determinism review in the binding text; the file list in place of "under `src/`"; the
+  notice; the row 83 replacement; the check as its own lane before Rapier; the owner files
+  the upstream report.
+- Driven by: the `physics-rapier` lane (2026-10-10), its report's proposed rule and the review
+  brief's vendored-patch item; the planner's and the reviewer's probes (2026-10-11).
+- Replaced: nothing stated; the lane brief's "prefer the patch if it is under fifty lines,
+  else refuse".
+- What the check's two reviews changed (round 1: 1 blocking, 4 serious, 4 minor; round 2:
+  2 serious, 4 minor). Cargo reads nothing the check does not: an `include` key in a cargo
+  configuration file, a cargo configuration file or `.cargo` directory committed as a
+  symbolic link, one git tracks under a directory the file walk skips, a config alias that
+  passes `--config` or `-Z`, any `--config` in a workflow or script, and a line that sets
+  `CARGO_HOME` are findings (`cargo xtask boundary` refuses the `include` key and the link
+  too). git is the authority on what a patch touches (`git apply --numstat`); a hunk git
+  places at an offset or with fuzz is refused in both directions, and the record with the
+  patch applied forward must equal the copy byte for byte. The graph is read with every
+  feature on. Nothing lives directly under `vendor/` but the copies, their patches and
+  `README.md`. An added line holds at most 200 characters and none of `unsafe`,
+  `no_mangle`, `export_name`, `link_section`, `link_name`, `naked`, `asm`, `global_asm`,
+  `naked_asm`, `include`, `include_str` or `include_bytes` as a whole identifier, with or
+  without `!`; a hunk's added lines hold no `path` attribute and no out-of-line `mod name;`.
+  A patch never touches a file that holds `unsafe`, before or after it, so no added line
+  sits inside an upstream `unsafe` block. A patch may change a build script but never
+  create one (`build.rs`, or what the manifest's `package.build` names). A token scan cannot
+  see unsafe code reached through macros the crate already has, or through a build
+  script's output; review is what covers those.
+
 ## 10. Review history
 
 - **Revision 1** (`a29af04`): the design baseline.

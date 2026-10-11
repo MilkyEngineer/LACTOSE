@@ -9,7 +9,7 @@
 use std::collections::BTreeSet;
 
 use crate::policy::Policy;
-use crate::repo::{Files, is_build_configuration, is_cargo_config};
+use crate::repo::{Files, is_build_configuration, is_cargo_config, unread_cargo_configuration};
 use crate::rust_source::attributes;
 use crate::tiers::TierFile;
 use crate::workspace::{DepKind, DepSource, Package, Workspace};
@@ -89,6 +89,7 @@ pub fn check(tiers: &TierFile, policy: &Policy, ws: &Workspace, files: &Files) -
     workspace_lints(files, &mut findings);
     build_configuration(files, &mut findings);
     cargo_configs(files, &mut findings);
+    findings.extend(unread_cargo_configuration(files));
     findings
 }
 
@@ -1048,6 +1049,21 @@ mod tests {
         let found = run(&ws, &files);
         assert_eq!(found.len(), 3, "{found:#?}");
         assert!(found[2].contains("the x86-64 pin is missing"));
+    }
+
+    #[test]
+    fn a_cargo_configuration_no_check_reads_is_refused() {
+        // D123: an include key and a linked configuration reach cargo past every check.
+        let (ws, mut files) = conforming();
+        files.insert(CARGO_CONFIG, format!("include = [\"pin.toml\"]\n{PIN}"));
+        files.insert_link("tools/cook/.cargo");
+        assert_eq!(
+            run(&ws, &files),
+            [
+                ".cargo/config.toml: has an include key; cargo reads the included files, which no check does",
+                "tools/cook/.cargo: is a symbolic link; cargo follows it, which no check does, so a cargo configuration file or directory is committed as itself",
+            ]
+        );
     }
 
     #[test]

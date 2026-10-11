@@ -560,6 +560,36 @@ presentation, pose evaluation, VFX, audio, UI, asset IO timing and input samplin
   `cargo xtask boundary` enforces them, and the tier check forbids build scripts and proc
   macros from depending on boundary crates, because they compile for the host without the
   pinned target features.
+- A third-party crate may be built from a patched copy: `[patch.crates-io]` in the root
+  `Cargo.toml` names `vendor/<name>-<version>`, the published archive as `cargo vendor`
+  unpacks it with the `.cargo-checksum.json` it writes, and the patch, a unified diff, sits
+  beside it as `vendor/<name>-<version>.patch`. No other `[patch]`, `[source]` or `paths`
+  setting exists, in a manifest or a cargo configuration file, and a crate is patched at one
+  version only. A patch fixes a defect of the pinned version: inside the boundary, a route
+  that breaks a rule of this section, such as a transcendental from the platform library;
+  anywhere, a defect that blocks a milestone criterion; never a feature, an optimisation or
+  an API change. It changes at most fifty lines, counting every line it adds or removes,
+  comments included. It never touches `Cargo.toml`, `Cargo.toml.orig`, `Cargo.lock` or
+  `.cargo_vcs_info.json`, so the crate's version, features, dependencies and closure stay
+  upstream's; it may touch a build script, since `libm` selects its paths in `configure.rs`
+  and cannot be refused, and such a patch alters what the crate compiles on every target and
+  is reviewed as that, but it never creates one; it adds no `unsafe` and no dependency, and
+  never touches a file that holds `unsafe`; no added line exceeds 200 characters or holds, as
+  a whole identifier, `no_mangle`, `export_name`, `link_section`, `link_name`, `naked`, `asm`,
+  `global_asm`, `naked_asm`, `include`, `include_str` or `include_bytes`, and no patch adds a
+  `path` attribute or an out-of-line `mod name;`; every change carries a `LACTOSE patch:`
+  comment, the notice Apache-2.0 asks of a modified file, and names none of those words.
+  Inside the boundary a patch is reviewed as a determinism review, like a new allowlist
+  name. The owner
+  reports it upstream, and `vendor/README.md` records the link, the reason and what drops it.
+  Over fifty lines is not a patch: the feature the route serves is refused, or the dependency
+  is changed, by a decision. A bump re-applies the patch or drops it once upstream carries
+  the change; a patch that no longer applies is a new patch and a new review. The copy is a
+  dependency, not a member (`exclude = ["vendor"]`): no workspace lint, format or test runs
+  over it, cargo caps none of its own warnings, the crate keeps its crates.io name on the
+  allowlist and in `deny.toml`, and `.gitattributes` keeps `vendor/**` free of line-ending
+  conversion so every host hashes the same bytes. The same mechanism and check serve a crate
+  outside the boundary, since a patch applies to every user of the crate in the workspace.
 - Asset availability and versions are inputs. Each region resolves its version table at the
   input sync point; hot reload of simulation assets is a server-coordinated, tick-stamped
   event.
@@ -598,8 +628,12 @@ Static enforcement uses stable tooling: `clippy.toml` per boundary crate with
 `disallowed-methods` and `disallowed-types` (thread-locals are banned through
 `std::thread::LocalKey`, since a local exception cannot reach an item macro); the boundary
 dependency allowlist in `crate-tiers.toml`, checked by `cargo xtask boundary`; `cargo-deny` with
-`multiple-versions = "deny"` for shared crates. The two proc-macro crates carry the boundary
-`clippy.toml` as well, since the code they emit is compiled inside boundary crates.
+`multiple-versions = "deny"` for shared crates; `cargo xtask vendor` for each crate built from
+`vendor/` (section 8.2): offline, the copy is its patch applied to its record and the patch is
+within the rule; online, the record is re-derived from the crates.io archive and the advisory
+check runs over the upstream versions, which `cargo-deny` skips behind a path source. The two
+proc-macro crates carry the boundary `clippy.toml` as well, since the code they emit is
+compiled inside boundary crates.
 No custom lint crate. Miri runs on nightly as the one exception to the stable-toolchain rule.
 Because Cargo resolves features per build, CI dumps `cargo tree -e features` for the boundary
 dependencies of each shipped binary, the SOUR test crate among them, and requires them
@@ -621,9 +655,10 @@ The handshake carries a protocol hash over the replicated types and the hashed (
 transient) types only, plus the protocol constants, each type encoded by `reflect`'s canonical
 schema bytes; a type registered on one side only is derived and unreplicated, or the handshake
 refuses (presentation types differ between client and server by design), a boundary build ID (the
-`Cargo.lock` entries, resolved feature set and source hash of boundary crates), and the hash
-of simulation-relevant cooked data. Mismatches refuse connection. Section 9.7 gives the
-capacity model.
+`Cargo.lock` entries, the resolved feature set, and the source hash of boundary crates and of
+every crate built from `vendor/`, since the lock entry of a patched crate names neither a source
+nor a checksum), and the hash of simulation-relevant cooked data. Mismatches refuse connection.
+Section 9.7 gives the capacity model.
 
 ### 9.2 Data in and out of the tick
 
@@ -1054,7 +1089,7 @@ The policy is in section 3.
   verification list; a long command that needs no interpretation runs in the background,
   never in a foreground agent turn.
 - CI: clippy `-D warnings`, fmt, nextest, SOUR in all applicable modes, Miri nightly on `task`
-  and `ecs`, `cargo-deny`, the tier check.
+  and `ecs`, `cargo-deny`, the tier check, the vendor check.
 
 ## 21. Unsafe policy
 

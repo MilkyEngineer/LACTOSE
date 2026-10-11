@@ -80,7 +80,7 @@ conflicts, restores the canonical boundary `clippy.toml` where a branch predates
 runs the script and then every gate:
 
 - `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`;
-- `cargo xtask tiers`, `cargo xtask boundary`, `cargo xtask features`;
+- `cargo xtask tiers`, `cargo xtask boundary`, `cargo xtask features`, `cargo xtask vendor`;
 - `cargo nextest run --workspace --no-tests=pass`, `cargo test --doc --workspace`;
 - `cargo deny check`, `cargo xtask sour run --pr`;
 - the cross-target clippy runs (Linux and Windows) over the crates the branch changes, named

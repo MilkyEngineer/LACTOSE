@@ -5,7 +5,9 @@
 //! The exit status is 0 for no findings, 1 for findings and 2 when a check could not run.
 //!
 //! Every cargo command this binary runs is `--locked`, as is the `cargo xtask` alias itself:
-//! a check never rewrites `Cargo.lock`, and fails if it is out of date.
+//! a check never rewrites `Cargo.lock`, and fails if it is out of date. The one exception is
+//! the online step of `vendor`, which resolves the lock of a manifest it writes under the
+//! target directory, never the workspace's.
 
 #![forbid(unsafe_code)]
 
@@ -19,7 +21,8 @@ use lactose_xtask::harness::{self, Dirs, Selection, stand_in};
 use lactose_xtask::policy::Policy;
 use lactose_xtask::repo::Files;
 use lactose_xtask::tiers::TierFile;
-use lactose_xtask::workspace::{Workspace, load_metadata};
+use lactose_xtask::vendor::{self, Repository};
+use lactose_xtask::workspace::{Workspace, cargo_metadata, load_metadata};
 use lactose_xtask::{Finding, POLICY_FILE, TIER_FILE, boundary, features, tiers};
 
 const USAGE: &str = "\
@@ -33,6 +36,10 @@ cargo xtask <command>
                              the shipped binaries and the harness packages (or across the
                              named packages): identical across shipped binaries, the same
                              features for every package a harness package shares with them
+  vendor [--offline]         prove each crate built from vendor/ is its patch applied to its
+                             record, the patch within the rule of section 8.2, the record
+                             the crates.io archive's, and the upstream versions free of
+                             advisories
   sour matrix                print the SOUR mode matrix
   sour run <selection> [--emit <file>]
                              run simulation tests under SOUR and compare world hashes;
@@ -146,6 +153,7 @@ fn main() -> ExitCode {
         ["tiers"] => ("tiers", check_tiers()),
         ["boundary"] => ("boundary", check_boundary()),
         ["features", ref rest @ ..] => ("features", check_features(rest)),
+        ["vendor", ref rest @ ..] => ("vendor", check_vendor(rest)),
         ["sour", "matrix"] => {
             print_matrix();
             return ExitCode::SUCCESS;
@@ -183,6 +191,72 @@ fn check_boundary() -> Checked {
     let context = Context::load()?;
     let files = Files::load(&context.root)?;
     Ok(boundary::check(&context.tiers, &context.policy, &context.workspace, &files))
+}
+
+fn check_vendor(args: &[&str]) -> Checked {
+    let offline = match args {
+        [] => false,
+        ["--offline"] => true,
+        _ => {
+            return Err(format!(
+                "unexpected `{}`; expected `--offline` or nothing",
+                args.join(" ")
+            ));
+        }
+    };
+    let cargo = env::var("CARGO").unwrap_or_else(|_| "cargo".to_owned());
+    // The members without the graph: cargo refuses to resolve a `[patch]` path that does not
+    // exist, which is a finding of step 2 rather than a reason not to run.
+    let layout = cargo_metadata(&cargo, Path::new("."), &["--no-deps"])?;
+    let root = PathBuf::from(&layout.root);
+    env::set_current_dir(&root).map_err(|e| format!("{}: {e}", root.display()))?;
+    let scratch = PathBuf::from(&layout.target_dir).join("vendor");
+    let members = layout.workspace.packages.iter();
+    let members = members.map(|p| p.manifest().trim_start_matches('/').to_owned()).collect();
+    let repo = Repository::load(&root, &scratch, members)?;
+    // Every feature: a second version of a patched crate behind a member's feature is still
+    // a version some build compiles.
+    let extra: &[&str] =
+        if offline { &["--all-features", "--offline"] } else { &["--all-features"] };
+    let graph = cargo_metadata(&cargo, &root, extra);
+    if repo.copies.is_empty() {
+        eprintln!("vendor: nothing is vendored");
+    }
+    let mut findings = vendor::check(&repo, graph.as_ref().ok().map(|m| &m.workspace));
+    for dir in &repo.copies {
+        findings.extend(vendor::reverse(&root, &scratch, &repo, dir)?);
+    }
+    findings.extend(vendor::prose(&repo));
+    if let Err(error) = graph {
+        if findings.is_empty() {
+            return Err(error);
+        }
+        eprintln!(
+            "vendor: the resolved graph is unavailable, so the parts of steps 2 and 4 that read \
+             it did not run: {error}"
+        );
+        return Ok(findings);
+    }
+    if repo.copies.is_empty() {
+        return Ok(findings);
+    }
+    if !findings.is_empty() {
+        eprintln!("vendor: the online step did not run, since the offline steps found something");
+        return Ok(findings);
+    }
+    let online = vendor::online(&cargo, &root, &scratch, &repo, offline)?;
+    eprintln!(
+        "vendor: {} record(s) re-derived from the crates.io archives{}",
+        online.records,
+        if offline { " in the cache" } else { "" }
+    );
+    match &online.advisories_skipped {
+        Some(why) => eprintln!(
+            "vendor: the advisory check of the upstream versions was skipped (--offline): {why}"
+        ),
+        None => eprintln!("vendor: the advisory check ran over the upstream versions"),
+    }
+    Ok(online.findings)
 }
 
 fn check_features(args: &[&str]) -> Checked {

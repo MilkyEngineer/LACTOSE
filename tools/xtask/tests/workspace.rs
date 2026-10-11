@@ -3,7 +3,10 @@
 //! These prove the plumbing: that the real `crate-tiers.toml`, policy file, `cargo metadata`
 //! and `cargo tree` output parse and reach the checks. The tier check must also come back
 //! clean. The boundary check is not required to: its findings are facts about other crates,
-//! which gate the `policy` CI job and not this crate's tests.
+//! which gate the `policy` CI job and not this crate's tests. Neither is the vendor check
+//! required to, and it is not run here beyond its command line: its verdict on the real
+//! workspace is a fact about `vendor/`, which the `policy` CI job and the merger's gate
+//! decide, and its behaviour is tested over fixtures in `tests/vendor.rs`.
 
 #![forbid(unsafe_code)]
 
@@ -74,9 +77,13 @@ fn the_mode_matrix_prints_every_mode() {
 
 #[test]
 fn a_bad_command_line_is_a_usage_error() {
-    for args in
-        [&["bogus"][..], &["sour", "run"], &["sour", "run", "--mode", "speed"], &["tiers", "extra"]]
-    {
+    for args in [
+        &["bogus"][..],
+        &["sour", "run"],
+        &["sour", "run", "--mode", "speed"],
+        &["tiers", "extra"],
+        &["vendor", "--online"],
+    ] {
         assert_eq!(xtask(args).status.code(), Some(2), "{args:?}");
     }
     assert!(xtask(&["help"]).status.success());
