@@ -148,6 +148,10 @@ and list what changed, because `lactose-ecs` is written against this surface.
   `Executor::platform`, never `std::thread` directly.
 - There is no timer thread. Frame-critical workers fire due timers when they look for work,
   and one sleeping worker at a time, the keeper, parks only until the earliest deadline.
+  A worker that fires timers wakes the due ones in deadline order, ties in the order they
+  were registered. That orders the wake-ups, not the tasks: a woken task runs as any queued
+  task does, on whichever worker takes it, and a `Sleep` first polled after its deadline
+  resolves at that poll without a timer.
   When nothing waits in the frame-critical queue, a worker that fires timers on its way to
   its next job puts the first frame-critical task they wake on its own deque and wakes nobody
   for it, so the task resumes on the worker that is already awake rather than on a sleeper

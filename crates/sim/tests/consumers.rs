@@ -250,9 +250,8 @@ async fn timer_root(
     use std::time::{Duration, Instant};
     let period = Duration::from_secs(1) / TICK_RATE_HZ;
     let mut pacer = TickPacer::new(Instant::now(), period, 4);
-    let resimulated_this_frame = 0;
     loop {
-        let budget = pacer.poll(Instant::now(), resimulated_this_frame);
+        let budget = pacer.poll(Instant::now());
         for _ in 0..budget.ticks {
             simulation = simulation.step(&executor, next_frame()).await?;
         }
