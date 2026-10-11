@@ -1,7 +1,8 @@
 //! Facts that place a claimed entity in a region its frame loads: slot *T* lacks the
 //! region and the tick the frame was popped at holds it, so the fact is compared there,
 //! and kept there for later calls, since a re-simulation of that tick never re-applies a
-//! claim change; a later fact about the entity for a tick before it follows it there.
+//! claim change; a later fact about the entity for a tick before it follows it there,
+//! unless it names a region that tick lacks and its own popped tick loads.
 
 #![forbid(unsafe_code)]
 
@@ -23,6 +24,10 @@ use lactose_sim::{RegionBundle, TickInput};
 
 /// The region the step that pops the frame for 15 loads, at 21.
 const NEW: RegionId = RegionId(3);
+/// A region a later step loads, at 22.
+const NEW2: RegionId = RegionId(4);
+/// A region no step loads: naming it is a sender defect.
+const UNLOADED: RegionId = RegionId(5);
 
 fn bundle() -> RegionBundle {
     RegionBundle {
@@ -40,11 +45,16 @@ fn bundle() -> RegionBundle {
 
 /// Steps one tick, walking, loading `NEW` in it if `load`.
 fn step(rig: &mut Rig, load: bool) {
+    step_loading(rig, if load { &[NEW] } else { &[] });
+}
+
+/// Steps one tick, walking, loading `regions` in it.
+fn step_loading(rig: &mut Rig, regions: &[RegionId]) {
     let next = Tick(rig.tick().0 + 1);
     let mut input = TickInput::default();
     input.inputs.insert(PLAYER, walking(next.0).to_player_sample(next));
-    if load {
-        input.loaded.insert(NEW, bundle());
+    for &region in regions {
+        input.loaded.insert(region, bundle());
     }
     rig.try_step_with(input).expect("the step");
 }
@@ -326,4 +336,119 @@ fn a_kept_fact_counts_what_the_tolerance_absorbed_once() {
     assert_eq!(rig.p().stats().absorbed, absorbed);
     assert_ne!(absorbed, Absorbed::default());
     assert_eq!(rig.world().get::<Transform>(key(4)), Some(&placed(1.001)));
+}
+
+#[test]
+fn a_kept_fact_folded_with_a_move_counts_no_absorbed_again() {
+    let body =
+        |x: f64| vec![data(placed(x)), data(Velocity::ZERO), data(floating()), data(sphere())];
+    let (mut rig, _) = loaded_at_21(claim_into_new(body(1.0)));
+    let mut frame = StagedFrame::new(Tick(17));
+    for data in body(1.001) {
+        assert!(frame.push_row(key(4), data.component, Tick(17), true, &data.bytes));
+    }
+    rig.push(frame);
+    step(&mut rig, false);
+    let _ = rig.reconcile();
+    let absorbed = rig.p().stats().absorbed;
+    assert_eq!(absorbed.fields, 1);
+    // A move folded into the kept statement states no transform.
+    let mut frame = StagedFrame::new(Tick(18));
+    frame.moves.insert(key(4), REGION);
+    rig.push(frame);
+    step(&mut rig, false);
+    let _ = rig.reconcile();
+    assert_eq!(idle(&mut rig, 5), 0);
+    assert_eq!(rig.p().stats().absorbed, absorbed);
+    assert_eq!(rig.world().region_of(key(4)), Some(REGION));
+}
+
+/// Claimed into `NEW` at 15, popped at 21; the frame for `first`, popped at 22, moves it
+/// into `NEW2`, which that step loads.
+fn moved_into_new2(first: StagedFrame, mover: StableKey, tick: u32) -> Rig {
+    let (mut rig, _) = loaded_at_21(first);
+    let mut frame = StagedFrame::new(Tick(tick));
+    frame.moves.insert(mover, NEW2);
+    rig.push(frame);
+    step_loading(&mut rig, &[NEW2]);
+    let _ = rig.reconcile();
+    rig
+}
+
+#[test]
+fn a_move_that_follows_a_kept_spawn_into_a_region_its_slot_lacks_is_kept_at_its_own_load() {
+    // The move for 17 follows the spawn kept at 21, which lacks `NEW2`: kept at 22.
+    let mut rig = moved_into_new2(claim_into_new(new_cart()), key(4), 17);
+    assert_eq!(live_at(&rig, key(4)), Some((NEW2, at(5, 5))));
+    assert_eq!(idle(&mut rig, 20), 0);
+    // A rollback from before both: the spawn written at 21, the move at 22.
+    rig.push(cart_off(18));
+    step(&mut rig, false);
+    let reconciled = rig.reconcile();
+    let ticks: Vec<Tick> = summaries(&reconciled).iter().map(|s| s.0).collect();
+    assert_eq!(ticks, vec![Tick(18), Tick(21), Tick(22)]);
+    assert_eq!(idle(&mut rig, 10), 0);
+    assert_eq!(live_at(&rig, key(4)), Some((NEW2, at(5, 5))));
+}
+
+#[test]
+fn the_same_move_for_a_tick_after_the_kept_one_is_compared_at_its_own_slot() {
+    let mut rig = moved_into_new2(claim_into_new(new_cart()), key(4), 22);
+    assert_eq!(live_at(&rig, key(4)), Some((NEW2, at(5, 5))));
+    assert_eq!(idle(&mut rig, 20), 0);
+}
+
+#[test]
+fn two_moves_into_regions_each_frame_loads_end_in_the_second() {
+    // The cart moved into `NEW` at 15 (popped at 21, kept), then into `NEW2` at 17.
+    let mut first = StagedFrame::new(Tick(15));
+    first.moves.insert(cart(), NEW);
+    let mut rig = moved_into_new2(first, cart(), 17);
+    assert_eq!(idle(&mut rig, 20), 0);
+    assert_eq!(rig.world().region_of(cart()), Some(NEW2));
+}
+
+#[test]
+fn a_move_into_a_region_neither_slot_holds_that_follows_a_kept_spawn_is_skipped() {
+    let (mut rig, _) = loaded_at_21(claim_into_new(new_cart()));
+    let mut frame = StagedFrame::new(Tick(17));
+    frame.moves.insert(key(4), UNLOADED);
+    rig.push(frame);
+    step(&mut rig, false);
+    let reconciled = rig.reconcile();
+    assert!(reconciled.corrections.is_empty(), "{:?}", summaries(&reconciled));
+    assert_eq!(idle(&mut rig, 20), 0);
+    assert_eq!(live_at(&rig, key(4)), Some((NEW, at(5, 5))));
+}
+
+#[test]
+fn a_move_into_a_region_neither_slot_holds_is_skipped() {
+    let mut rig = Rig::joined();
+    rig.step_to(20, walking);
+    let mut frame = StagedFrame::new(Tick(17));
+    frame.moves.insert(cart(), UNLOADED);
+    rig.push(frame);
+    step(&mut rig, false);
+    let reconciled = rig.reconcile();
+    assert!(reconciled.corrections.is_empty(), "{:?}", summaries(&reconciled));
+    assert_eq!(idle(&mut rig, 20), 0);
+    assert_eq!(rig.world().region_of(cart()), Some(REGION));
+}
+
+#[test]
+fn a_claimed_spawn_naming_a_region_neither_slot_holds_still_corrects_its_components() {
+    // The cart, claimed again for 17 in a region no step loads, with another `Health`:
+    // the components are written, the region is not.
+    let mut rig = Rig::joined();
+    rig.step_to(20, walking);
+    let mut frame = StagedFrame::new(Tick(17));
+    frame.spawns.insert(net(2), claimed(UNLOADED, vec![data(at(50, 0)), data(Health(7))]));
+    rig.push(frame);
+    step(&mut rig, false);
+    let reconciled = rig.reconcile();
+    let ticks: Vec<Tick> = summaries(&reconciled).iter().map(|s| s.0).collect();
+    assert_eq!(ticks, vec![Tick(17)]);
+    assert_eq!(idle(&mut rig, 10), 0);
+    assert_eq!(rig.world().get::<Health>(cart()), Some(&Health(7)));
+    assert_eq!(rig.world().region_of(cart()), Some(REGION));
 }

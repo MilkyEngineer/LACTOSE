@@ -85,9 +85,10 @@ struct State {
     /// a repair is found by its tick, possibly in a later call.
     awaiting: BTreeSet<Tick>,
     /// The facts compared at the tick their frame was popped at instead of their own, by
-    /// that tick: each places its entity in a region slot *T* lacked and the popped tick
-    /// loaded, and later facts about the same entity are folded in, so that each entity's
-    /// facts at a tick are one statement. Kept while the ring holds the tick, since a
+    /// that tick: each places its entity in a region the slot it would be compared at
+    /// lacked and the popped tick loaded, and later facts about the same entity for a tick
+    /// at or before it are folded in, so that each entity's facts at a tick are one
+    /// statement. Kept while the ring holds the tick, since a
     /// re-simulation of it never re-applies them (`README.md`, "Reconciliation"); cleared
     /// by a full frame and by `resync`.
     kept: BTreeMap<Tick, Vec<Resolved>>,

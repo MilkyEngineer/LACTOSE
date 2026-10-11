@@ -110,8 +110,9 @@ pub(crate) struct Resolved {
 /// `new` states replaces what it supersedes. A claimed spawn, release or tombstone replaces
 /// the entity's earlier facts; a move sets the region they name; exact rows replace a
 /// claimed spawn's components, or earlier rows and removals; a removal drops the component
-/// from a claimed spawn or rows. Whether `new` is kept, which it is not after a release or
-/// tombstone of the entity: the server sends no other fact about one it no longer claims.
+/// from a claimed spawn or rows. Whether `new` is kept, which a move, removal or exact rows
+/// after a release or tombstone of the entity are not: the server states nothing else about
+/// one it no longer claims.
 pub(crate) fn fold(kept: &mut Vec<Resolved>, new: Resolved) -> bool {
     let key = new.fact.key();
     let ours = |resolved: &Resolved| resolved.fact.key() == key;
@@ -258,11 +259,17 @@ fn mismatch(
         Fact::Claimed { region, components, .. } => {
             let Some(entry) = entry else { return absent() };
             let found = statement(components, entry, previous, judge, absorbed);
-            if entry.region == *region { found } else { Some(found.unwrap_or(0)) }
+            // A region the slot lacks is a sender defect, logged when the frame was
+            // reconciled: a correction could not place the entity there.
+            if entry.region == *region || !slot.regions.contains(region) {
+                found
+            } else {
+                Some(found.unwrap_or(0))
+            }
         }
         Fact::Released { .. } | Fact::Destroyed { .. } => entry.map(|_| 0),
         Fact::Moved { region, .. } => match entry {
-            Some(entry) => (entry.region != *region).then_some(0),
+            Some(entry) => (entry.region != *region && slot.regions.contains(region)).then_some(0),
             None => absent(),
         },
         Fact::Removed { component, .. } => match entry {
@@ -548,9 +555,15 @@ fn claim(world: &mut World, local: LocalPlayer, key: StableKey) -> Result<bool> 
     Ok(true)
 }
 
-/// Moves `key` to `region` if it resides elsewhere; whether it moved.
+/// Moves `key` to `region` if it resides elsewhere and the world holds `region`; whether it
+/// moved. A region the world lacks is logged and skipped, so the rest of a claimed spawn's
+/// statement is still written.
 fn move_to(world: &mut World, key: StableKey, region: RegionId) -> Result<bool> {
     if world.region_of(key) == Some(region) {
+        return Ok(false);
+    }
+    if world.region(region).is_none() {
+        tracing::warn!(target: "predict", ?key, ?region, "a move into a region not loaded: skipped");
         return Ok(false);
     }
     world.move_to_region(key, region)?;

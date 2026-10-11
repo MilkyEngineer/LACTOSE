@@ -5,7 +5,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use lactose_core::{Result, StableKey, Tick};
-use lactose_ecs::{Executor, World};
+use lactose_ecs::{Executor, RegionId, World};
 use lactose_input::PlayerInput;
 use lactose_net_api::StagedInbox;
 use lactose_reflect::Registry;
@@ -247,7 +247,10 @@ impl State {
             let key = resolved.fact.key();
             match self.kept_at(&resolved, tick, applied) {
                 Some(at) => {
-                    if fact::fold(self.kept.entry(at).or_default(), resolved) {
+                    // A move or removal folded into the entity's statement states no
+                    // component, so what the tolerance absorbed of it is not counted again.
+                    let states = matches!(resolved.fact, Fact::Claimed { .. } | Fact::Rows { .. });
+                    if fact::fold(self.kept.entry(at).or_default(), resolved) && states {
                         touched.insert((at, key));
                     }
                 }
@@ -258,10 +261,12 @@ impl State {
     }
 
     /// The tick a fact compared at `tick` by the rules, popped at `applied`, is kept at
-    /// instead, if any: the newest at or after `tick` holding kept facts about its entity,
-    /// which it follows; else `applied`, if the fact places the entity in a region slot
-    /// `tick` lacks and slot `applied` holds. A correction at `tick` could not place it
-    /// there, and the hook applied it at `applied`.
+    /// instead, if any. It follows the newest tick at or after `tick` holding kept facts
+    /// about its entity, and is compared there; but if it places the entity in a region the
+    /// slot it is compared at lacks and slot `applied` holds, it is kept at `applied`: a
+    /// correction at that slot could not place it there, and the hook applied it at
+    /// `applied`. A region neither slot holds is logged, a sender defect or a region a later
+    /// frame unloaded again; the comparison skips it.
     fn kept_at(&self, resolved: &Resolved, tick: Tick, applied: Tick) -> Option<Tick> {
         let key = resolved.fact.key();
         let follows = self
@@ -271,19 +276,36 @@ impl State {
             .map(|(&at, _)| at)
             .reduce(|a, b| if before(a, b) { b } else { a })
             .filter(|&at| !before(at, tick));
-        follows.or_else(|| {
-            let (slot, popped) = (self.ring.slot(tick)?, self.ring.slot(applied)?);
-            let region = match &resolved.fact {
-                Fact::Claimed { region, .. } | Fact::Moved { region, .. } => *region,
-                Fact::Removed { key, .. } | Fact::Rows { key, .. }
-                    if !slot.record.contains_key(key) =>
-                {
-                    resolved.region?
-                }
-                _ => return None,
-            };
-            (!slot.regions.contains(&region) && popped.regions.contains(&region)).then_some(applied)
-        })
+        let compared = follows.unwrap_or(tick);
+        let Some(region) = self.lacked(resolved, compared) else { return follows };
+        if self.ring.slot(applied).is_some_and(|slot| slot.regions.contains(&region)) {
+            return Some(applied);
+        }
+        tracing::warn!(
+            target: "predict",
+            ?key,
+            ?region,
+            tick = compared.0,
+            "a fact names a region neither its slot nor the popped tick holds: skipped"
+        );
+        follows
+    }
+
+    /// The region `resolved` places its entity in, if slot `tick` lacks it: a claimed
+    /// spawn's or move's region; for a removal or exact rows of an entity absent from the
+    /// slot, the region the predictor knows it in.
+    fn lacked(&self, resolved: &Resolved, tick: Tick) -> Option<RegionId> {
+        let slot = self.ring.slot(tick)?;
+        let region = match &resolved.fact {
+            Fact::Claimed { region, .. } | Fact::Moved { region, .. } => *region,
+            Fact::Removed { key, .. } | Fact::Rows { key, .. }
+                if !slot.record.contains_key(key) =>
+            {
+                resolved.region?
+            }
+            _ => return None,
+        };
+        (!slot.regions.contains(&region)).then_some(region)
     }
 
     /// The substitutions a frame reports and the repairs it makes due, by input tick,
