@@ -139,6 +139,36 @@ transitive = [
   # work and no numeric path selected by CPU feature; what they decide is which worker runs
   # a job, which the ECS makes order-independent by construction.
   "crossbeam-deque", "crossbeam-epoch", "crossbeam-utils",
+  # Rapier's closure, reached by `lactose-physics-rapier` (D119; resolved for rapier3d-f64
+  # 0.36.0 with `enhanced-determinism`, `parallel` and `serde-serialize`). Containers, hashing
+  # (under `enhanced-determinism` parry's maps are `IndexMap`s over a fixed FxHasher32;
+  # `foldhash` is parry's hasher only without that feature, and integer hashing in any case),
+  # integer and rational helpers, derive macros and serde's support:
+  # no floating-point work of their own beyond what `enhanced-determinism` routes to scalar
+  # code and `libm`, and no numeric path selected by CPU feature.
+  "approx", "arrayvec", "bitflags", "byteorder", "downcast-rs", "either", "ena", "equivalent",
+  "foldhash", "hash32", "hashbrown", "heapless", "indexmap", "log", "nalgebra-macros",
+  "num-complex", "num-derive", "num-integer", "num-rational", "ordered-float", "profiling",
+  "profiling-procmacros", "rawpointer", "rayon-core", "rstar", "serde_arrays", "serde_core",
+  "serde_derive", "slab", "smallvec", "stable_deref_trait", "static_assertions", "thiserror",
+  "thiserror-impl", "typenum",
+  # Host-only: build scripts' version probe.
+  "autocfg",
+  # `wide`'s intrinsics wrapper. It selects SIMD by `cfg(target_feature)` at compile time,
+  # which the x86-64-v3 pin and aarch64's NEON fix per architecture; `enhanced-determinism`
+  # keeps glam scalar, and `wide` reaches the step only through simba's SIMD lanes, whose
+  # lane arithmetic is IEEE add, mul and compare (the sign of zero in min and max is the open
+  # item of docs/verification.md).
+  "safe_arch",
+  # postcard's framing helper; byte shuffling only.
+  "cobs",
+  # The second exception beside `libm` (D119): its GEMM kernels are selected by CPU feature
+  # at run time. nalgebra hands it products above its small-dimension cutoff, which two
+  # Rapier paths form: a multibody's mass assembly above five degrees of freedom, and
+  # `Multibody::inverse_kinematics`. Both are unreachable from the backend, which inserts no
+  # multibody joint; every boundary clippy.toml bans `MultibodyJointSet::insert` and
+  # `insert_kinematic` and the three inverse-kinematics methods.
+  "matrixmultiply",
 ]
 
 [boundary_third_party.direct]
@@ -147,3 +177,9 @@ transitive = [
 "lactose-ecs" = { normal = ["bytemuck", "tracing"] }
 "lactose-sim" = { normal = ["tracing"], dev = ["xxhash-rust"] }
 "lactose-physics-api" = { normal = ["tracing"] }
+# D119: the solver and its math (rapier3d-f64 is the vendored, patched copy under vendor/),
+# its thread pool, and serde with postcard for the snapshot bytes.
+"lactose-physics-rapier" = { normal = [
+  "bytemuck", "glam", "glamx", "nalgebra", "num-traits", "parry3d-f64", "postcard",
+  "rapier3d-f64", "rayon", "serde", "simba", "tracing", "wide",
+] }

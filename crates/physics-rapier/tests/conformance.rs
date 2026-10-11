@@ -1,0 +1,39 @@
+//! `physics-api`'s conformance run with this backend: ten ticks, a snapshot at three, a
+//! restore and the re-run, under solver pools of one, two and four threads and two storage
+//! layouts. Every run's report is equal: the world hashes of the first and the resumed run,
+//! the snapshot's size, and the physics bytes' hashes at the end of both runs.
+
+#![forbid(unsafe_code)]
+
+use lactose_ecs::{Executor, LayoutConfig};
+use lactose_physics_api::PhysicsConfig;
+use lactose_physics_api::conformance::{SNAPSHOT_TICK, TICKS, snapshot_restore};
+use lactose_sim::harness::{ChunkCapacity, layout_mode};
+
+fn backend(threads: usize) -> Box<dyn lactose_physics_api::PhysicsBackend> {
+    let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).build().unwrap();
+    lactose_physics_rapier::backend(pool)
+}
+
+#[test]
+fn the_conformance_run_is_equal_under_every_pool_size_and_layout() {
+    let layouts = [LayoutConfig::default(), layout_mode(ChunkCapacity::Rows(7), 5).unwrap()];
+    let executor = Executor::builder().frame_workers(2).background_workers(1).build().unwrap();
+    let mut reports = Vec::new();
+    for layout in &layouts {
+        for threads in [1, 2, 4] {
+            let report =
+                snapshot_restore(&executor, backend(threads), PhysicsConfig::default(), *layout)
+                    .unwrap_or_else(|error| panic!("{threads} threads, {layout:?}: {error}"));
+            assert_eq!(report.first.len(), TICKS as usize);
+            assert_eq!(report.resumed, report.first[SNAPSHOT_TICK as usize..]);
+            // The resumed run reaches the first run's physics state byte for byte.
+            assert_eq!(report.physics_hash.0, report.physics_hash.1, "{threads} threads");
+            reports.push(report);
+        }
+    }
+    println!("snapshot at tick {SNAPSHOT_TICK}: {} bytes", reports[0].snapshot_bytes);
+    for report in &reports[1..] {
+        assert_eq!(*report, reports[0]);
+    }
+}

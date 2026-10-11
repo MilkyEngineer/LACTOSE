@@ -95,7 +95,8 @@ pub struct ResolvedPackage {
     /// True for a workspace member.
     pub member: bool,
     /// The package IDs of its normal and build dependencies, under the workspace's own
-    /// feature resolution.
+    /// feature resolution: an optional dependency none of its activated features turns on is
+    /// left out.
     pub deps: Vec<String>,
 }
 
@@ -106,6 +107,11 @@ pub struct Workspace {
     pub packages: Vec<Package>,
     /// The resolved graph, keyed by package ID. Empty when the metadata carried none.
     pub resolved: BTreeMap<String, ResolvedPackage>,
+    /// What the `default` feature of each package in the metadata turns on, keyed as
+    /// `cargo tree` prints the package (`name vX.Y.Z`); absent for a package without one.
+    pub defaults: BTreeMap<String, Vec<String>>,
+    /// The directory holding each package's manifest, keyed as `defaults` is.
+    pub dirs: BTreeMap<String, String>,
 }
 
 impl Workspace {
@@ -209,6 +215,8 @@ struct RawPackage {
     manifest_path: String,
     dependencies: Vec<RawDep>,
     targets: Vec<RawTarget>,
+    #[serde(default)]
+    features: BTreeMap<String, Vec<String>>,
 }
 
 #[derive(Deserialize)]
@@ -216,6 +224,10 @@ struct RawDep {
     name: String,
     kind: Option<String>,
     path: Option<String>,
+    #[serde(default)]
+    optional: bool,
+    #[serde(default)]
+    rename: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -233,12 +245,50 @@ struct RawResolve {
 struct RawNode {
     id: String,
     deps: Vec<RawNodeDep>,
+    #[serde(default)]
+    features: Vec<String>,
 }
 
 #[derive(Deserialize)]
 struct RawNodeDep {
+    /// The name the depending crate's code uses: the rename, or the library's name.
+    #[serde(default)]
+    name: String,
     pkg: String,
     dep_kinds: Vec<RawDepKind>,
+}
+
+/// Whether `node`'s package compiles its edge `dep` (to the package `to`) when built as a
+/// dependency.
+///
+/// The resolved graph of `cargo metadata` can hold an edge to an optional dependency that
+/// the node's own resolved features leave off (in Rapier's tree: parry's `spade`,
+/// nalgebra's older glam versions, num-rational's `num-bigint`, postcard's `embedded-io`); no
+/// build compiles it. An optional dependency is compiled when one of the package's activated
+/// features turns it on: its implicit feature, `dep:<name>`, or `<name>/<feature>` (not
+/// `<name>?/<feature>`). An edge no declaration can be matched to is kept.
+fn compiles(package: &RawPackage, node: &RawNode, dep: &RawNodeDep, to: &str) -> bool {
+    let activated: BTreeSet<&str> = node.features.iter().map(String::as_str).collect();
+    let turned_on = |key: &str| {
+        activated.contains(key)
+            || activated.iter().filter_map(|f| package.features.get(*f)).flatten().any(|value| {
+                value.strip_prefix("dep:") == Some(key)
+                    || value.split_once('/').is_some_and(|(name, _)| name == key)
+            })
+    };
+    let mut matched = package
+        .dependencies
+        .iter()
+        .filter(|d| d.kind.as_deref() != Some("dev"))
+        .filter(|d| match &d.rename {
+            Some(rename) => rename.replace('-', "_") == dep.name,
+            None => d.name == to,
+        })
+        .peekable();
+    if matched.peek().is_none() {
+        return true;
+    }
+    matched.any(|d| !d.optional || turned_on(d.rename.as_deref().unwrap_or(&d.name)))
 }
 
 #[derive(Deserialize)]
@@ -319,13 +369,16 @@ pub fn parse_metadata(json: &str) -> Result<Metadata, String> {
         raw.packages.iter().map(|p| (p.id.as_str(), p)).collect();
     let mut resolved = BTreeMap::new();
     for node in raw.resolve.iter().flat_map(|resolve| &resolve.nodes) {
-        let ships = |dep: &&RawNodeDep| {
-            dep.dep_kinds.is_empty()
-                || dep.dep_kinds.iter().any(|k| k.kind.as_deref() != Some("dev"))
-        };
         let package = by_id
             .get(node.id.as_str())
+            .copied()
             .ok_or_else(|| format!("cargo metadata output: no package `{}`", node.id))?;
+        let ships = |dep: &&RawNodeDep| {
+            let shipping_kind = dep.dep_kinds.is_empty()
+                || dep.dep_kinds.iter().any(|k| k.kind.as_deref() != Some("dev"));
+            let to = by_id.get(dep.pkg.as_str()).map_or(dep.pkg.as_str(), |p| p.name.as_str());
+            shipping_kind && compiles(package, node, dep, to)
+        };
         resolved.insert(
             node.id.clone(),
             ResolvedPackage {
@@ -339,10 +392,24 @@ pub fn parse_metadata(json: &str) -> Result<Metadata, String> {
             },
         );
     }
+    let defaults = raw
+        .packages
+        .iter()
+        .filter_map(|p| Some((format!("{} v{}", p.name, p.version), p.features.get("default")?)))
+        .map(|(package, default)| (package, default.clone()))
+        .collect();
+    let dirs = raw
+        .packages
+        .iter()
+        .map(|p| {
+            let dir = p.manifest_path.strip_suffix("Cargo.toml").unwrap_or(&p.manifest_path);
+            (format!("{} v{}", p.name, p.version), dir.trim_end_matches(['/', '\\']).to_owned())
+        })
+        .collect();
     Ok(Metadata {
         root: raw.workspace_root,
         target_dir: raw.target_directory,
-        workspace: Workspace { packages, resolved },
+        workspace: Workspace { packages, resolved, defaults, dirs },
     })
 }
 
@@ -469,7 +536,12 @@ pub(crate) mod fixture {
             }
             resolved.insert(name.to_owned(), ResolvedPackage { deps, ..registry(name, "1.0.0") });
         }
-        Workspace { packages, resolved }
+        Workspace {
+            packages,
+            resolved,
+            defaults: std::collections::BTreeMap::new(),
+            dirs: std::collections::BTreeMap::new(),
+        }
     }
 
     pub(crate) fn workspace(packages: Vec<Package>) -> Workspace {
@@ -590,6 +662,57 @@ mod tests {
         ]);
         assert_eq!(closure, expect, "xxhash-rust is a dev edge");
         assert!(ws.third_party_closure("no-such-crate").is_empty());
+    }
+
+    /// `lib` has five optional dependencies with resolved edges, and its activated features
+    /// turn on three: `on` by its implicit feature, `hasher` by `dep:`, and the renamed
+    /// `glam`-like `new` by `new/std`. `off` is turned on by no activated feature and `weak`
+    /// only by `weak?/std`.
+    const OPTIONAL: &str = r#"{
+      "packages": [
+        {"name": "lactose-a", "version": "0.0.0", "id": "a-id", "manifest_path": "/ws/crates/a/Cargo.toml",
+         "dependencies": [{"name": "lib", "kind": null, "path": null}], "targets": []},
+        {"name": "lib", "version": "1.0.0", "id": "lib-id", "manifest_path": "/r/lib/Cargo.toml",
+         "dependencies": [
+           {"name": "on", "kind": null, "path": null, "optional": true},
+           {"name": "hasher", "kind": null, "path": null, "optional": true},
+           {"name": "off", "kind": null, "path": null, "optional": true},
+           {"name": "weak", "kind": null, "path": null, "optional": true},
+           {"name": "glam", "kind": null, "path": null, "optional": true, "rename": "old"},
+           {"name": "glam", "kind": null, "path": null, "optional": true, "rename": "new"}],
+         "targets": [],
+         "features": {"default": ["dep:hasher", "weak?/std", "new/std"], "on": ["dep:on"],
+                      "off": ["dep:off"], "old": ["dep:old"]}},
+        {"name": "on", "version": "1.0.0", "id": "on-id", "manifest_path": "/r/on/Cargo.toml", "dependencies": [], "targets": []},
+        {"name": "hasher", "version": "1.0.0", "id": "hasher-id", "manifest_path": "/r/h/Cargo.toml", "dependencies": [], "targets": []},
+        {"name": "off", "version": "1.0.0", "id": "off-id", "manifest_path": "/r/off/Cargo.toml", "dependencies": [], "targets": []},
+        {"name": "weak", "version": "1.0.0", "id": "weak-id", "manifest_path": "/r/weak/Cargo.toml", "dependencies": [], "targets": []},
+        {"name": "glam", "version": "0.29.0", "id": "glam-old-id", "manifest_path": "/r/g1/Cargo.toml", "dependencies": [], "targets": []},
+        {"name": "glam", "version": "0.30.0", "id": "glam-new-id", "manifest_path": "/r/g2/Cargo.toml", "dependencies": [], "targets": []}
+      ],
+      "workspace_members": ["a-id"],
+      "workspace_root": "/ws",
+      "target_directory": "/ws/target",
+      "resolve": {"nodes": [
+        {"id": "a-id", "deps": [{"name": "lib", "pkg": "lib-id", "dep_kinds": [{"kind": null}]}]},
+        {"id": "lib-id", "features": ["default", "on"], "deps": [
+          {"name": "on", "pkg": "on-id", "dep_kinds": [{"kind": null}]},
+          {"name": "hasher", "pkg": "hasher-id", "dep_kinds": [{"kind": null}]},
+          {"name": "off", "pkg": "off-id", "dep_kinds": [{"kind": null}]},
+          {"name": "weak", "pkg": "weak-id", "dep_kinds": [{"kind": null}]},
+          {"name": "old", "pkg": "glam-old-id", "dep_kinds": [{"kind": null}]},
+          {"name": "new", "pkg": "glam-new-id", "dep_kinds": [{"kind": null}]}]},
+        {"id": "on-id", "deps": []}, {"id": "hasher-id", "deps": []}, {"id": "off-id", "deps": []},
+        {"id": "weak-id", "deps": []}, {"id": "glam-old-id", "deps": []}, {"id": "glam-new-id", "deps": []}
+      ]}
+    }"#;
+
+    #[test]
+    fn the_third_party_closure_skips_optional_edges_no_activated_feature_turns_on() {
+        let ws = parse_metadata(OPTIONAL).unwrap().workspace;
+        let closure: Vec<String> = ws.third_party_closure("lactose-a").into_keys().collect();
+        assert_eq!(closure, ["glam", "hasher", "lib", "on"]);
+        assert_eq!(ws.resolved["lib-id"].deps, ["on-id", "hasher-id", "glam-new-id"]);
     }
 
     #[test]

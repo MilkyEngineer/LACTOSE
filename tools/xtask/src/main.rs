@@ -292,6 +292,8 @@ fn check_features(args: &[&str]) -> Checked {
         }
         return Ok(findings);
     }
+    // Every boundary package any root compiles, for the check `fold_defaults` relies on.
+    let mut compiled = std::collections::BTreeSet::new();
     for triple in features::TRIPLES {
         let mut trees = Vec::new();
         for root in &roots {
@@ -303,6 +305,8 @@ fn check_features(args: &[&str]) -> Checked {
             let dev = policy.harness_packages.contains(root);
             let dump = features::dump(&context.cargo, &context.root, root, triple, dev)?;
             let tree = features::boundary_tree(&dump, &|name| context.tiers.in_boundary(name))?;
+            compiled.extend(tree.keys().map(|(package, _)| package.clone()));
+            let tree = features::fold_defaults(tree, &context.workspace.defaults);
             // A shipped binary is compared in full; a harness package that is not one, on
             // the packages it shares with each other root.
             let full = !dev || policy.feature_roots.contains(root);
@@ -316,6 +320,7 @@ fn check_features(args: &[&str]) -> Checked {
         );
         findings.extend(features::compare(triple, &trees));
     }
+    findings.extend(features::default_readers(&context.root, &compiled, &context.workspace.dirs)?);
     Ok(findings)
 }
 

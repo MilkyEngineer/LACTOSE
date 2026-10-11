@@ -1,0 +1,18 @@
+diff --git a/src/dynamics/solver/joint_constraint/joint_constraint_helper.rs b/src/dynamics/solver/joint_constraint/joint_constraint_helper.rs
+--- a/src/dynamics/solver/joint_constraint/joint_constraint_helper.rs
++++ b/src/dynamics/solver/joint_constraint/joint_constraint_helper.rs
+@@ -58,10 +58,12 @@
+         }
+
+         let center = (min + max) * 0.5;
++        // LACTOSE patch: through `ComplexField`, which `libm_force` routes to `libm`; the
++        // inherent `f64::sin_cos` is the platform library's.
+         #[cfg(feature = "dim2")]
+-        let (sin, cos) = center.sin_cos();
++        let (sin, cos) = simba::scalar::ComplexField::sin_cos(center);
+         #[cfg(feature = "dim3")]
+-        let (sin, cos) = (center * 0.5).sin_cos();
++        let (sin, cos) = simba::scalar::ComplexField::sin_cos(center * 0.5);
+
+         Self {
+             center: [cos, sin],

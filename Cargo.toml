@@ -1,6 +1,8 @@
 [workspace]
 resolver = "3"
 members = ["crates/*", "tools/*"]
+# Patched third-party copies (architecture section 8.2, D123) are dependencies, not members.
+exclude = ["vendor"]
 
 [workspace.package]
 version = "0.0.0"
@@ -21,6 +23,7 @@ lactose-asset-api = { path = "crates/asset-api" }
 lactose-bundle = { path = "crates/bundle" }
 lactose-sim = { path = "crates/sim" }
 lactose-physics-api = { path = "crates/physics-api" }
+lactose-physics-rapier = { path = "crates/physics-rapier" }
 lactose-predict = { path = "crates/predict" }
 lactose-input = { path = "crates/input" }
 lactose-input-host = { path = "crates/input-host" }
@@ -39,8 +42,23 @@ libc = "0.2"
 # and `force-soft-floats` features must stay off (crates/math/README.md).
 libm = { version = "=0.2.16", default-features = false, features = ["arch"] }
 loom = "0.7"
+# The snapshot byte format of `lactose-physics-rapier`: fixed-width little-endian floats and
+# minimal varints, so equal values give equal bytes (crates/physics-rapier/README.md).
+postcard = { version = "1.1", default-features = false, features = ["alloc"] }
 proc-macro2 = "1"
 quote = "1"
+# Pinned exactly and patched (vendor/README.md); the feature set is the D119 review and is
+# named in full so an upstream change of defaults cannot alter it.
+rapier3d-f64 = { version = "=0.36.0", default-features = false, features = [
+    "dim3",
+    "f64",
+    "std",
+    "block-solver",
+    "enhanced-determinism",
+    "parallel",
+    "serde-serialize",
+] }
+rayon = "1.12"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = { version = "0.10", default-features = false }
@@ -50,6 +68,11 @@ tracing = { version = "0.1", default-features = false, features = ["std"] }
 windows-sys = "0.61"
 xxhash-rust = "0.8"
 zstd = { version = "0.13", default-features = false }
+
+# Architecture section 8.2 (D123): each entry names a directory under vendor/ that
+# `cargo xtask vendor` proves is the published archive plus the patch beside it.
+[patch.crates-io]
+rapier3d-f64 = { path = "vendor/rapier3d-f64-0.36.0" }
 
 [workspace.lints.rust]
 missing_docs = "warn"

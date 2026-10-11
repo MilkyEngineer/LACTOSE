@@ -21,6 +21,14 @@
 //! (as a build-dependency or below a proc macro), with different features each time. The two
 //! are compared separately. A harness package's tree includes its dev-dependencies, because
 //! a test build compiles them and they take part in feature resolution.
+//!
+//! Two readings keep the comparison to what compiles differently. A `default` feature whose
+//! every feature is on anyway is dropped from the list before comparing ([`fold_defaults`]),
+//! which holds only while no boundary package reads `default` itself; [`default_readers`]
+//! checks that.
+//! Between harness trees, a host package both hold at a common version is compared at the
+//! versions both hold, so a proc macro's own `syn` 2 beside the workspace's `syn` 3 is not a
+//! split; a target package is compared at all its versions.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -158,6 +166,120 @@ pub fn boundary_tree(
     Ok(result)
 }
 
+/// Drops `default` from every feature list that already holds each feature `default` turns
+/// on, so `[default, std]` and `[std]` compare equal when `default = ["std"]` (or
+/// `default = []`): the feature adds nothing to that build. A `default` that turns on a
+/// dependency (`dep:` or `/`), or a package with no entry in `defaults`, is kept.
+///
+/// That holds only if the package's code never tests `default` itself, through
+/// `cfg(feature = "default")` or a build script's `CARGO_FEATURE_DEFAULT` or
+/// `CARGO_CFG_FEATURE`: then the
+/// feature changes the build whatever it turns on. `cargo xtask features` fails on any
+/// boundary package whose sources do ([`default_readers`]).
+#[must_use]
+pub fn fold_defaults(tree: BoundaryTree, defaults: &BTreeMap<String, Vec<String>>) -> BoundaryTree {
+    tree.into_iter()
+        .map(|((package, built), lists)| {
+            let folded = lists
+                .into_iter()
+                .map(|list| {
+                    let features: Vec<&str> = list
+                        .trim_start_matches('[')
+                        .trim_end_matches(']')
+                        .split(", ")
+                        .filter(|f| !f.is_empty())
+                        .collect();
+                    let redundant = defaults.get(&package).is_some_and(|turned_on| {
+                        turned_on
+                            .iter()
+                            .all(|f| !f.contains([':', '/']) && features.contains(&f.as_str()))
+                    });
+                    if !redundant || !features.contains(&"default") {
+                        return list;
+                    }
+                    let kept: Vec<&str> =
+                        features.into_iter().filter(|f| *f != "default").collect();
+                    format!("[{}]", kept.join(", "))
+                })
+                .collect();
+            ((package, built), folded)
+        })
+        .collect()
+}
+
+/// The packages among `packages` (`name vX.Y.Z`) whose Rust sources test their `default`
+/// feature, as a `feature = "default"` cfg (any spacing), the `CARGO_FEATURE_DEFAULT`
+/// variable or the `CARGO_CFG_FEATURE` list a build script is given (which names `default`
+/// whenever it is on), one finding per file: [`fold_defaults`] would hide a difference those
+/// packages compile. `dirs` holds each package's directory; every `.rs` file below it is
+/// read except under the package's own top-level `target` directory and any `.git`. A
+/// package without a directory is skipped. A file under `root` is reported relative to it,
+/// any other by its full path.
+///
+/// # Errors
+/// If a directory or a file cannot be read.
+pub fn default_readers(
+    root: &Path,
+    packages: &BTreeSet<String>,
+    dirs: &BTreeMap<String, String>,
+) -> Result<Vec<Finding>, String> {
+    let mut findings = Vec::new();
+    for package in packages {
+        let Some(dir) = dirs.get(package) else { continue };
+        let mut files = Vec::new();
+        let dir = Path::new(dir);
+        rust_files(dir, &dir.join("target"), &mut files)?;
+        for file in files {
+            let text = std::fs::read(&file).map_err(|e| format!("{}: {e}", file.display()))?;
+            if reads_default(&String::from_utf8_lossy(&text)) {
+                let path = file.strip_prefix(root).unwrap_or(&file);
+                findings.push(Finding::new(
+                    path.to_string_lossy().replace('\\', "/"),
+                    format!(
+                        "`{package}` is in the determinism boundary and tests its own `default` \
+                         feature, so folding `default` (architecture section 8.3) could hide \
+                         a difference in what it compiles"
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(findings)
+}
+
+/// Whether Rust source `text` tests the `default` feature.
+fn reads_default(text: &str) -> bool {
+    let squeezed: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+    ["feature=\"default\"", "CARGO_FEATURE_DEFAULT", "CARGO_CFG_FEATURE"]
+        .iter()
+        .any(|pattern| squeezed.contains(pattern))
+}
+
+/// Every `.rs` file below `dir`, sorted, outside the build output `output` and any `.git`. A
+/// `target` directory elsewhere is a source directory like any other.
+fn rust_files(
+    dir: &Path,
+    output: &Path,
+    files: &mut Vec<std::path::PathBuf>,
+) -> Result<(), String> {
+    let mut entries = std::fs::read_dir(dir)
+        .map_err(|e| format!("{}: {e}", dir.display()))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("{}: {e}", dir.display()))?;
+    entries.sort_by_key(std::fs::DirEntry::file_name);
+    for entry in entries {
+        let path = entry.path();
+        let kind = entry.file_type().map_err(|e| format!("{}: {e}", path.display()))?;
+        let name = entry.file_name();
+        if kind.is_dir() && path != output && name != ".git" {
+            rust_files(&path, output, files)?;
+        } else if kind.is_file() && path.extension().is_some_and(|e| e == "rs") {
+            files.push(path);
+        }
+    }
+    Ok(())
+}
+
 /// One root of the comparison: the path to report against (the root package's manifest),
 /// its boundary tree, and whether its membership is compared too.
 pub struct Root {
@@ -244,10 +366,27 @@ fn by_name(tree: &BoundaryTree) -> BTreeMap<(&str, Built), BTreeSet<String>> {
 }
 
 /// The package names both trees hold whose versions or feature lists differ.
+///
+/// A host package both trees hold at some common version is compared at the versions both
+/// hold: a further version of a build-time crate (`syn` 2 beside `syn` 3) belongs to a proc
+/// macro or build script only one tree has, and what that one emits is compared as the crate
+/// it is compiled into. Target packages are compared at all their versions.
 fn shared_differences(triple: &str, root: &Root, reference: &Root, findings: &mut Vec<Finding>) {
     let (here, there) = (by_name(&root.tree), by_name(&reference.tree));
+    let version =
+        |entry: &String| entry.split_once(' ').map_or(String::new(), |(v, _)| v.to_owned());
     for (key, ours) in &here {
         let Some(theirs) = there.get(key) else { continue };
+        let (mut ours, mut theirs) = (ours.clone(), theirs.clone());
+        if key.1 == Built::Host {
+            let mine: BTreeSet<String> = ours.iter().map(version).collect();
+            let common: BTreeSet<String> =
+                theirs.iter().map(version).filter(|v| mine.contains(v)).collect();
+            if !common.is_empty() {
+                ours.retain(|entry| common.contains(&version(entry)));
+                theirs.retain(|entry| common.contains(&version(entry)));
+            }
+        }
         if ours != theirs {
             let (name, built) = key;
             let role = if *built == Built::Host { "host" } else { "target" };
@@ -258,8 +397,8 @@ fn shared_differences(triple: &str, root: &Root, reference: &Root, findings: &mu
                 format!(
                     "on {triple}, boundary dependency `{name}` ({role}) is {} here but {} for {}; \
                      every build must compile the boundary identically",
-                    describe(ours),
-                    describe(theirs),
+                    describe(&ours),
+                    describe(&theirs),
                     reference.path
                 ),
             ));
@@ -410,6 +549,91 @@ lactose-physics-api v0.0.0 (/ws/crates/physics-api)|
         // As shipped binaries, the same two trees would be findings.
         let full = roots.map(|root| Root { full: true, ..root });
         assert_eq!(compare("t", &full).len(), 2);
+    }
+
+    #[test]
+    fn a_default_feature_that_adds_nothing_is_folded_before_comparing() {
+        let physics = PHYSICS.replace("libm v0.2.16|arch", "libm v0.2.16|arch,default");
+        let [sim, harnessed] = harness(SIM, &physics);
+        assert_eq!(compare("t", &[sim, harnessed]).len(), 1, "unfolded, the lists differ");
+        let defaults = BTreeMap::from([("libm v0.2.16".to_owned(), vec!["arch".to_owned()])]);
+        let fold = |root: Root| Root { tree: fold_defaults(root.tree, &defaults), ..root };
+        assert_eq!(compare("t", &harness(SIM, &physics).map(fold)), []);
+        // `default` turning on a feature the list lacks, or a dependency, is kept.
+        for turned_on in [vec!["arch".to_owned(), "unstable".to_owned()], vec!["dep:x".to_owned()]]
+        {
+            let defaults = BTreeMap::from([("libm v0.2.16".to_owned(), turned_on)]);
+            let fold = |root: Root| Root { tree: fold_defaults(root.tree, &defaults), ..root };
+            assert_eq!(compare("t", &harness(SIM, &physics).map(fold)).len(), 1);
+        }
+    }
+
+    #[test]
+    fn a_boundary_package_that_tests_its_default_feature_is_reported() {
+        for (text, reads) in [
+            ("#[cfg(feature = \"default\")]\nfn f() {}", true),
+            ("#[cfg(all(feature=\"default\", unix))]", true),
+            ("#[cfg(feature =\n    \"default\")]", true),
+            ("let on = std::env::var_os(\"CARGO_FEATURE_DEFAULT\");", true),
+            ("let all = std::env::var(\"CARGO_CFG_FEATURE\");", true),
+            ("#[cfg(feature = \"std\")]\n// the default build", false),
+        ] {
+            assert_eq!(reads_default(text), reads, "{text}");
+        }
+        let root =
+            std::env::temp_dir().join(format!("lactose-xtask-defaults-{}", std::process::id()));
+        let write = |relative: &str, text: &str| {
+            let path = root.join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        };
+        write("reads/src/lib.rs", "pub fn f() {}");
+        write("reads/build.rs", "fn main() { let _ = option_env!(\"CARGO_FEATURE_DEFAULT\"); }");
+        write("reads/target/debug/out.rs", "#[cfg(feature = \"default\")]");
+        write("reads/src/target/mod.rs", "#[cfg(feature = \"default\")] pub fn g() {}");
+        write("clean/src/lib.rs", "#[cfg(feature = \"std\")] pub fn f() {}");
+        let dir = |name: &str| root.join(name).to_string_lossy().into_owned();
+        let dirs = BTreeMap::from([
+            ("reads v1.0.0".to_owned(), dir("reads")),
+            ("clean v1.0.0".to_owned(), dir("clean")),
+        ]);
+        let packages: BTreeSet<String> =
+            ["reads v1.0.0", "clean v1.0.0", "elsewhere v1.0.0"].map(str::to_owned).into();
+        let findings = default_readers(&root, &packages, &dirs);
+        std::fs::remove_dir_all(&root).unwrap();
+        let findings = findings.unwrap();
+        // The build script and the nested `target` module, in path order: output under the
+        // package's top-level `target` is not a source, a `target` directory below it is.
+        let paths: Vec<&str> = findings.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(paths, ["reads/build.rs", "reads/src/target/mod.rs"], "{findings:?}");
+        assert!(findings.iter().all(|f| f.message.contains("`reads v1.0.0`")));
+    }
+
+    #[test]
+    fn a_further_host_version_is_compared_only_where_both_trees_hold_one() {
+        let derive = "│   └── bytemuck v1.25.2|bytemuck_derive,derive\n";
+        let with_syn = |syn: &str| {
+            PHYSICS.replacen(
+                derive,
+                &format!("{derive}│       └── bytemuck_derive v1.12.1 (proc-macro)|\n{syn}"),
+                1,
+            )
+        };
+        let three = "│           └── syn v3.0.6|full\n";
+        let both = "│           ├── syn v2.0.119|full\n│           └── syn v3.0.6|full\n";
+        let sim = with_syn(three);
+        let roots = |physics: &str| harness(&sim, physics);
+        assert_eq!(compare("t", &roots(&with_syn(both))), [], "syn 3 is shared and equal");
+        let other = both.replace("v3.0.6|full", "v3.0.6|full,visit");
+        assert_eq!(compare("t", &roots(&with_syn(&other))).len(), 1, "syn 3 differs");
+        let disjoint = "│           └── syn v2.0.119|full\n";
+        assert_eq!(compare("t", &roots(&with_syn(disjoint))).len(), 1, "no common version");
+        // A target package is compared at every version.
+        let split = PHYSICS.replace(
+            "        └── libm v0.2.16|arch\n",
+            "        ├── libm v0.2.16|arch\n        └── libm v0.2.17|arch\n",
+        );
+        assert_eq!(compare("t", &harness(SIM, &split)).len(), 1);
     }
 
     #[test]

@@ -216,6 +216,22 @@ fn valid_transform(transform: &Transform) -> bool {
     transform.translation.is_finite() && transform.rotation.is_finite() && unit
 }
 
+fn valid_joint(joint: &Joint) -> bool {
+    let limits = !joint.limited
+        || (joint.limit_min.is_finite()
+            && joint.limit_max.is_finite()
+            && joint.limit_min <= joint.limit_max);
+    let axis = match joint.kind {
+        JointKind::Fixed | JointKind::Spherical => true,
+        JointKind::Revolute | JointKind::Prismatic => joint.axis.try_normalize().is_some(),
+    };
+    joint.anchor_a.is_finite()
+        && joint.anchor_b.is_finite()
+        && joint.axis.is_finite()
+        && axis
+        && limits
+}
+
 fn valid_shape(shape: &Shape) -> bool {
     let positive = |value: Scalar| value > Scalar::ZERO && value.is_finite();
     match shape.kind {
@@ -395,7 +411,7 @@ impl PhysicsBackend for Fake {
             self.state.bodies.contains_key(&body_a) && self.state.bodies.contains_key(&body_b),
             "create_joint between bodies the backend does not hold"
         );
-        if !joint.anchor_a.is_finite() || !joint.anchor_b.is_finite() || body_a == body_b {
+        if !valid_joint(joint) || body_a == body_b {
             return Err(invalid("not a valid joint"));
         }
         let handle = self.handle();
