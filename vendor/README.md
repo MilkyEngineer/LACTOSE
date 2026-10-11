@@ -32,22 +32,24 @@ change upstream drops the directory, the patch and the entry.
   - The broad phase's deferred tree optimisation hung the step. On a pool of more than one
     thread `PhysicsPipeline::detect_collisions` (`src/pipeline/physics_pipeline/solve.rs`)
     queued it with `rayon::spawn` and `join_deferred_bvh_optimize`
-    (`src/pipeline/physics_pipeline/mod.rs`) blocked the stepping thread, itself a pool
-    thread, in `mpsc::Receiver::recv` until it ran. rayon guarantees that a job a pool thread
-    queues runs only by that thread coming back for it, not that another thread wakes to steal
-    it, so the step hung when no other thread took it: once on a four-thread pool with every
-    other thread asleep (the D124 review's sample), and every time while the pool's other
-    threads are busy (`crates/physics-rapier/tests/pool.rs`); and every step waited for a
-    thread to wake. `solve.rs` holds `unsafe`, so the patch is in
-    `BroadPhaseBvh::take_deferred_optimize` (`src/geometry/broad_phase_bvh/mod.rs`): it runs
-    the pass where the pipeline takes it, on the stepping thread, and hands the pipeline
-    nothing, so the detached path is never taken. The pipeline joins the pass before every
-    use of the broad phase, and between the take and the join the tree and its workspace are
-    out of the broad phase on every path, so nothing reads them there; the pass runs the same
-    code on the same tree as the one-thread path does at the join, and every report and
-    snapshot byte of `crates/physics-rapier`'s scenes on one, two and four threads equals the
-    unpatched build's on one thread. A defect that blocks the milestone 1 physics criteria on
-    a pool of more than one thread (section 16), reviewed as a determinism review.
+    (`src/pipeline/physics_pipeline/mod.rs`) blocked the stepping thread, itself a pool thread,
+    in `mpsc::Receiver::recv` until it ran. rayon tries to wake a thread for a job a pool
+    thread pushes to its own deque but does not guarantee it; it relies on the pushing thread
+    to pop the job, which a thread blocked in `recv` never does. The step hung with every other
+    thread asleep and the job stealable: once on a four-thread pool (the D124 review's sample),
+    in 4 of 9 unpatched runs of a five-scene probe and 4 of 12 of six two-thread walks in a row
+    (the S5 review's probes; the patched build hung in none), and every time while every
+    other thread of the pool is held (`crates/physics-rapier/tests/pool.rs`). `solve.rs` holds `unsafe`,
+    so the patch is in `BroadPhaseBvh::take_deferred_optimize`
+    (`src/geometry/broad_phase_bvh/mod.rs`): it runs the pass where the pipeline takes it, on
+    the stepping thread, and hands the pipeline nothing, so the detached path is never taken.
+    The pipeline joins the pass before every use of the broad phase, and between the take and
+    the join the tree and its workspace are out of the broad phase on every path, so nothing
+    reads them there; the pass runs the same code on the same tree as the one-thread path does
+    at the join, and every report and snapshot byte of `crates/physics-rapier`'s scenes on one,
+    two and four threads equals the unpatched build's on one thread. A defect that blocks the
+    milestone 1 physics criteria on a pool of more than one thread (section 16), reviewed as a
+    determinism review.
 - Patch: `rapier3d-f64-0.36.0.patch`, two files, sixteen changed lines: six in the joint
   helper (two removed, four added, two of them the notice), ten in the broad phase (two
   removed, eight added, three of them the notice).

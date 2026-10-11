@@ -1,8 +1,14 @@
-//! The step needs no solver thread but the one running it: with every other thread of the
-//! pool held by a job that does not return until the test releases it, a small scene still
-//! steps. Unpatched, Rapier queued the broad phase's deferred tree optimisation as a detached
-//! job and blocked the stepping thread on its result, so the step finished only when another
-//! thread came to take the job, and never when none did (`vendor/README.md`).
+//! A step never blocks a pool thread on a job only another thread can run. Unpatched, Rapier
+//! queued the broad phase's deferred tree optimisation as a detached job and blocked the
+//! stepping thread on its result, so the step finished only when another thread took the job,
+//! and hung when none did (`vendor/README.md`).
+//!
+//! The first test holds every other thread of the pool with a job that does not return until
+//! the test releases it, and steps a small scene. The scene keeps under 64 updating contact
+//! pairs: above that the narrow phase broadcasts to every thread of the pool and waits for each
+//! of them, so a larger scene would stall on the held threads by design (`README.md`). The
+//! second, ignored, holds nothing: it steps the scene on six two-thread pools in a row, the
+//! shape that hung the unpatched build without help.
 
 #![forbid(unsafe_code)]
 
@@ -13,12 +19,17 @@ use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Barrier};
 use std::time::Duration;
 
+use lactose_physics_api::{PhysicsBackend, QueryFilter, Ray, Shape};
 use support::*;
 
 /// Far beyond any step of the scene; the step either finishes or never does.
 const PATIENCE: Duration = Duration::from_secs(20);
 /// Enough steps of [`Walk`] for the broad phase to optimise its tree many times.
 const TICKS: u32 = 120;
+/// Two-thread backends the stress test steps one after another.
+const BACKENDS: usize = 6;
+/// Steps of [`Walk`] per backend in the stress test.
+const STRESS_TICKS: u32 = 900;
 
 /// Jobs that hold `count` threads of a pool, one each, until released.
 struct Held {
@@ -99,5 +110,59 @@ fn a_step_finishes_on_the_one_thread_not_held() {
             "{threads} threads, all but one held: {TICKS} steps did not finish in {PATIENCE:?}; \
              the step waits on work only another solver thread can run",
         );
+    }
+}
+
+/// Queries between steps, as a game makes them; their answers are not checked here.
+fn query(backend: &dyn PhysicsBackend) {
+    for i in 0..7 {
+        let origin = v(-3.0 + f64::from(i), 12.0, 0.3);
+        let ray = Ray { origin, direction: v(0.0, -1.0, 0.0), max_distance: s(30.0) };
+        std::hint::black_box(backend.cast_ray(&ray, &QueryFilter::ALL));
+    }
+    let mut hits = Vec::new();
+    backend.overlap(&Shape::sphere(s(2.0)), &at(0.0, 1.0, 0.0), &QueryFilter::ALL, &mut hits);
+    let sphere = Shape::sphere(s(0.3));
+    let towards = v(1.0, 0.0, 0.0);
+    std::hint::black_box(backend.cast_shape(
+        &sphere,
+        &at(-6.0, 0.5, 0.0),
+        towards,
+        s(12.0),
+        &QueryFilter::ALL,
+    ));
+}
+
+#[test]
+#[ignore = "a stress run of a rare race: cargo nextest run --run-ignored only"]
+fn walks_on_two_thread_pools_in_a_row_finish() {
+    let (done, finished) = mpsc::channel();
+    // Not joined: when a step hangs the test fails and the process ends with it.
+    std::thread::spawn(move || {
+        for _ in 0..BACKENDS {
+            let mut b = backend(2);
+            Walk::create(&mut *b);
+            let mut last = None;
+            for tick in 1..=STRESS_TICKS {
+                let commands = Walk::drive(&mut *b, tick, last);
+                let output = step(&mut *b, tick, &commands);
+                last = state(&output, key(WALKER)).map(|s| s.velocity);
+                query(&*b);
+                if tick % 20 == 0 {
+                    std::hint::black_box(snapshot(&*b));
+                }
+            }
+            done.send(()).unwrap();
+        }
+    });
+    for n in 1..=BACKENDS {
+        match finished.recv_timeout(PATIENCE) {
+            Ok(()) => {}
+            Err(RecvTimeoutError::Timeout) => panic!(
+                "backend {n} of {BACKENDS}: {STRESS_TICKS} two-thread steps did not finish in \
+                 {PATIENCE:?}"
+            ),
+            Err(RecvTimeoutError::Disconnected) => panic!("the stepping thread panicked"),
+        }
     }
 }

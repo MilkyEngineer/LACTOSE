@@ -24,17 +24,21 @@ scheduling class is logged and the thread runs at its default priority).
 Rapier's parallel work runs on that pool and nowhere else. The pool's size changes no output:
 `tests/determinism.rs` and `tests/conformance.rs` compare one, two and four threads.
 
-The step needs no thread of the pool but the one running it. Rapier's parallel work is
-fork-join (`join`, scopes, parallel iterators), which the forking thread can finish alone. The
-pinned Rapier also queued the broad phase's deferred tree optimisation as a detached job and
-blocked the stepping thread, a pool thread, on its result. rayon guarantees that such a job
-runs only by the thread that queued it coming back for it, which a blocked thread never does,
-so on a pool of two or more threads a step hung when no other thread took the job, and every
-step waited for another thread to wake. The vendored copy
-runs that optimisation on the stepping thread where it was queued. A one-thread pool ran it
-later in the step, at the join, and nothing reads the tree in between, so the tree, every
-report and the snapshot bytes are unchanged (`vendor/README.md`).
-`tests/pool.rs` steps with every other thread of the pool held.
+The step never blocks a pool thread on a job only another thread can run. It does need every
+thread of the pool free to run rayon work: the narrow phase broadcasts to all of them when more
+than 64 contact pairs update, and waits for each. The pool is therefore the backend's alone, no
+job on it blocks outside rayon, and it is not built with `use_current_thread`.
+
+The pinned Rapier queued the broad phase's deferred tree optimisation as a detached job and
+blocked the stepping thread, a pool thread, on its result. rayon tries to wake a thread for a
+job a pool thread pushes to its own deque but does not guarantee it; it relies on the pushing
+thread to pop the job, which a thread blocked on a channel never does. So on a pool of two or
+more threads a step could hang, and did, rarely, on two and four threads. The vendored
+copy runs that optimisation on the stepping thread where it was queued. A one-thread pool ran
+it later in the step, at the join, and nothing reads the tree in between, so the tree, every
+report and the snapshot bytes are unchanged (`vendor/README.md`). `tests/pool.rs` steps a small
+scene, under the broadcast threshold, with every other thread of the pool held, and holds an
+ignored stress test of the shape that hung.
 
 What the contract says is logged (refused values, unknown keys, dropped commands) goes to
 target `physics`; what only this backend logs (a refused scheduling class, a joint whose
