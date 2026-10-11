@@ -3,7 +3,10 @@
 //! These prove the plumbing: that the real `crate-tiers.toml`, policy file, `cargo metadata`
 //! and `cargo tree` output parse and reach the checks. The tier check must also come back
 //! clean. The boundary check is not required to: its findings are facts about other crates,
-//! which gate the `policy` CI job and not this crate's tests.
+//! which gate the `policy` CI job and not this crate's tests. Neither is the vendor check
+//! required to, and it is not run here beyond its command line: its verdict on the real
+//! workspace is a fact about `vendor/`, which the `policy` CI job and the merger's gate
+//! decide, and its behaviour is tested over fixtures in `tests/vendor.rs`.
 
 #![forbid(unsafe_code)]
 
@@ -60,12 +63,6 @@ fn the_feature_check_passes_with_no_roots_and_reads_real_trees() {
     let code = output.status.code();
     assert!(code == Some(0) || code == Some(FINDINGS), "{}", text(&output));
     assert!(text(&output).contains("2 roots"), "{}", text(&output));
-}
-
-#[test]
-fn the_workspace_passes_the_vendor_check() {
-    let output = xtask(&["vendor"]);
-    assert!(output.status.success(), "{}", text(&output));
 }
 
 #[test]

@@ -213,8 +213,12 @@ fn check_vendor(args: &[&str]) -> Checked {
     let scratch = PathBuf::from(&layout.target_dir).join("vendor");
     let members = layout.workspace.packages.iter();
     let members = members.map(|p| p.manifest().trim_start_matches('/').to_owned()).collect();
-    let repo = Repository::load(&root, members)?;
-    let graph = cargo_metadata(&cargo, &root, if offline { &["--offline"] } else { &[] });
+    let repo = Repository::load(&root, &scratch, members)?;
+    // Every feature: a second version of a patched crate behind a member's feature is still
+    // a version some build compiles.
+    let extra: &[&str] =
+        if offline { &["--all-features", "--offline"] } else { &["--all-features"] };
+    let graph = cargo_metadata(&cargo, &root, extra);
     if repo.copies.is_empty() {
         eprintln!("vendor: nothing is vendored");
     }

@@ -8,10 +8,11 @@
 //! the rule, and then, online, that the record is the crates.io archive's and that the
 //! upstream versions, which `cargo-deny` cannot see behind a path source, carry no advisory.
 //!
-//! [`check`] (steps 1 to 7) and [`prose`] (step 9) are pure. [`reverse`] (step 8) copies a
-//! tree under the target directory and runs `git apply` there, and [`online`] (step 10) runs
-//! `cargo vendor` and `cargo deny`; what they decide from the output is pure and tested
-//! apart from the processes.
+//! [`check`] (steps 1 to 7) and [`prose`] (step 9) are pure, over what [`Repository::load`]
+//! read, git's reading of each patch included. [`reverse`] (step 8) copies a tree under the
+//! target directory and runs `git apply` there, and [`online`] (step 10) runs `cargo vendor`
+//! and `cargo deny`; what they decide from the output is pure and tested apart from the
+//! processes.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -23,7 +24,7 @@ use sha2::{Digest, Sha256};
 use toml::{Table, Value};
 
 use crate::Finding;
-use crate::repo::{Files, is_cargo_config};
+use crate::repo::{Files, is_build_configuration, is_cargo_config, unread_cargo_configuration};
 use crate::workspace::{ResolvedPackage, Workspace};
 
 /// The root manifest, which alone may hold a `[patch]` table.
@@ -34,6 +35,26 @@ const RECORD: &str = ".cargo-checksum.json";
 const README: &str = "vendor/README.md";
 /// The changed lines a patch may hold, comments included (architecture section 8.2).
 const MAX_CHANGED_LINES: usize = 50;
+/// The characters an added line may hold (D123), so the line cap bounds the code too.
+const MAX_LINE_CHARS: usize = 200;
+/// What an added line may not hold, because each reaches unsafe code or code outside the
+/// diff without the `unsafe` token: unsafe attributes before edition 2024, assembly, and
+/// source pulled in from elsewhere. Matched as whole identifiers; a `!` is part of the
+/// token where it stands, and `#[path` is the `path` attribute.
+const REFUSED_TOKENS: [&str; 12] = [
+    "unsafe",
+    "no_mangle",
+    "export_name",
+    "link_section",
+    "link_name",
+    "global_asm",
+    "asm!",
+    "naked",
+    "include!",
+    "include_str!",
+    "include_bytes!",
+    "#[path",
+];
 /// The text an added line of every file a patch changes holds: the notice Apache-2.0
 /// section 4(b) asks of a modified file.
 const NOTICE: &str = "LACTOSE patch:";
@@ -47,47 +68,60 @@ const SHADOW_PACKAGE: &str = "vendor-upstream";
 /// What the check reads from the repository.
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
 pub struct Repository {
-    /// The root manifest, the member manifests, every cargo configuration file,
-    /// `.gitattributes`, `vendor/.gitattributes`, `vendor/README.md`, and for each copy its
-    /// `Cargo.toml`, its `.cargo-checksum.json` and the `.patch` beside it, where they exist.
+    /// The root manifest, the member manifests, every file that can decide how cargo is
+    /// invoked (cargo configuration, workflows, scripts) with the symbolic links met,
+    /// `.gitattributes`, `vendor/README.md`, and for each copy its `Cargo.toml`, its
+    /// `.cargo-checksum.json` and the `.patch` beside it, where they exist.
     pub files: Files,
     /// The member manifests other than the root's, relative to the root.
     pub members: Vec<String>,
-    /// The directories directly under `vendor/`, sorted: the copies.
+    /// Every name directly under `vendor/`, sorted.
+    pub entries: Vec<String>,
+    /// The directories among [`entries`](Self::entries): the copies.
     pub copies: Vec<String>,
+    /// For each copy with a patch, what `git apply --numstat -z` prints for it, or why git
+    /// refused it. git decides what a patch touches; the check's own reading must agree.
+    pub numstat: BTreeMap<String, Result<String, String>>,
 }
 
 impl Repository {
     /// Reads what the check needs from the repository at `root`, whose member manifests
-    /// (relative to `root`) are `members`.
+    /// (relative to `root`) are `members`, and has git read each patch in a directory under
+    /// `scratch`.
     ///
     /// # Errors
-    /// If a directory or a file that exists cannot be read.
-    pub fn load(root: &Path, members: Vec<String>) -> Result<Self, String> {
+    /// If a directory or a file that exists cannot be read, or git cannot be run.
+    pub fn load(root: &Path, scratch: &Path, members: Vec<String>) -> Result<Self, String> {
         let all = Files::load(root)?;
         let mut files = Files::default();
         let members: Vec<String> = members.into_iter().filter(|m| m != ROOT_MANIFEST).collect();
         for path in all.paths() {
-            if path == ROOT_MANIFEST || members.iter().any(|m| m == path) || is_cargo_config(path) {
+            let wanted = path == ROOT_MANIFEST || members.iter().any(|m| m == path);
+            if wanted || is_build_configuration(path) {
                 files.insert(path, all.bytes(path).unwrap_or_default());
             }
         }
-        let mut copies = Vec::new();
+        for link in all.links() {
+            files.insert_link(link);
+        }
+        let (mut entries, mut copies) = (Vec::new(), Vec::new());
         let vendor = root.join("vendor");
         if vendor.is_dir() {
-            let entries =
+            let listing =
                 fs::read_dir(&vendor).map_err(|e| format!("{}: {e}", vendor.display()))?;
-            for entry in entries {
+            for entry in listing {
                 let entry = entry.map_err(|e| format!("{}: {e}", vendor.display()))?;
+                let name = entry.file_name().to_string_lossy().into_owned();
                 // Through a symbolic link: what cargo builds is what the link names.
                 if entry.path().is_dir() {
-                    copies.push(entry.file_name().to_string_lossy().into_owned());
+                    copies.push(name.clone());
                 }
+                entries.push(name);
             }
         }
+        entries.sort();
         copies.sort();
-        let mut wanted = vec![".gitattributes".to_owned(), "vendor/.gitattributes".to_owned()];
-        wanted.push(README.to_owned());
+        let mut wanted = vec![".gitattributes".to_owned(), README.to_owned()];
         for dir in &copies {
             wanted.push(format!("vendor/{dir}/Cargo.toml"));
             wanted.push(format!("vendor/{dir}/{RECORD}"));
@@ -100,7 +134,21 @@ impl Repository {
                 Err(e) => return Err(format!("{path}: {e}")),
             }
         }
-        Ok(Self { files, members, copies })
+        let mut numstat = BTreeMap::new();
+        for dir in copies.iter().filter(|d| files.contains(&format!("vendor/{d}.patch"))) {
+            let empty = scratch.join("numstat");
+            remove(&empty)?;
+            fs::create_dir_all(&empty).map_err(|e| format!("{}: {e}", empty.display()))?;
+            let patch = root.join(format!("vendor/{dir}.patch"));
+            let output = git_apply(scratch, &empty, &["--numstat", "-z"], &patch)?;
+            let read = if output.status.success() {
+                Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+            } else {
+                Err(first_line(&output))
+            };
+            numstat.insert(dir.clone(), read);
+        }
+        Ok(Self { files, members, entries, copies, numstat })
     }
 
     fn table(&self, path: &str) -> Option<Table> {
@@ -230,7 +278,70 @@ fn patch_sources(repo: &Repository, root: &Table, findings: &mut Vec<Finding>) -
             )),
         }
     }
+    findings.extend(unread_cargo_configuration(&repo.files));
+    for config in repo.files.paths().filter(|path| is_cargo_config(path)) {
+        let Some(table) = repo.table(config) else { continue };
+        let aliases = table.get("alias").and_then(Value::as_table).into_iter().flatten();
+        for (name, value) in aliases {
+            let words: Vec<String> = match value {
+                Value::String(line) => line.split_whitespace().map(str::to_owned).collect(),
+                Value::Array(items) => {
+                    items.iter().filter_map(Value::as_str).map(str::to_owned).collect()
+                }
+                _ => Vec::new(),
+            };
+            if words.iter().any(|w| w.starts_with("--config") || w.starts_with("-Z")) {
+                findings.push(Finding::new(
+                    config,
+                    format!(
+                        "alias {name} passes --config or -Z, through which a [patch], [source] \
+                         or paths setting reaches cargo unseen"
+                    ),
+                ));
+            }
+        }
+    }
+    command_lines(repo, findings);
     entries
+}
+
+/// Step 1 for the files that can decide how cargo is invoked, line by line as `cargo xtask
+/// boundary` reads them: a `--config` naming `patch`, `source` or `paths` sets them outside
+/// every file the check reads, and `CARGO_HOME` moves the configuration cargo reads last.
+/// Only whole-line `#` comments are skipped.
+fn command_lines(repo: &Repository, findings: &mut Vec<Finding>) {
+    for path in repo.files.paths().filter(|path| is_build_configuration(path)) {
+        let text = repo.files.text(path).unwrap_or_default();
+        for (index, line) in text.lines().enumerate() {
+            if line.trim_start().starts_with('#') {
+                continue;
+            }
+            let names = ["patch", "source", "paths"].iter().any(|key| holds_token(line, key));
+            if line.contains("--config") && names {
+                findings.push(Finding::new(
+                    path,
+                    format!(
+                        "line {}: passes --config naming patch, source or paths; a patch lives \
+                         in the root Cargo.toml only",
+                        index + 1
+                    ),
+                ));
+            }
+            let sets_home = line.match_indices("CARGO_HOME").any(|(at, _)| {
+                let rest = line[at + "CARGO_HOME".len()..].trim_start_matches(['"', '\'', ' ']);
+                rest.starts_with('=') || rest.starts_with(':')
+            });
+            if sets_home {
+                findings.push(Finding::new(
+                    path,
+                    format!(
+                        "line {}: sets CARGO_HOME, whose cargo configuration no check reads",
+                        index + 1
+                    ),
+                ));
+            }
+        }
+    }
 }
 
 /// Step 2.
@@ -283,6 +394,19 @@ fn correspondence(
                 ),
             ));
         }
+    }
+    for entry in &repo.entries {
+        let copy = |dir: &str| repo.copies.iter().any(|c| c == dir);
+        if copy(entry) || entry == "README.md" {
+            continue;
+        }
+        let message = match entry.strip_suffix(".patch") {
+            Some(dir) if copy(dir) => continue,
+            Some(dir) => format!("no copy vendor/{dir} beside it"),
+            None => "neither a copy, its patch nor README.md; nothing else lives under vendor/"
+                .to_owned(),
+        };
+        findings.push(Finding::new(format!("vendor/{entry}"), message));
     }
     if graph.is_none() {
         return;
@@ -377,14 +501,6 @@ fn records(repo: &Repository, findings: &mut Vec<Finding>) {
     if !keeps_vendor_bytes(&root) {
         findings.push(Finding::new(".gitattributes", "does not mark vendor/** -text"));
     }
-    if let Some(text) = repo.files.text("vendor/.gitattributes")
-        && sets_text(&text).next().is_some()
-    {
-        findings.push(Finding::new(
-            "vendor/.gitattributes",
-            "sets the text attribute under vendor/, where only the root's vendor/** -text may",
-        ));
-    }
 }
 
 /// The lines of a `.gitattributes` file as (pattern, whether the line leaves `text` unset)
@@ -426,7 +542,9 @@ fn keeps_vendor_bytes(text: &str) -> bool {
     kept
 }
 
-/// Steps 6 and 7 for one copy.
+/// Steps 6 and 7 for one copy. git's reading of the patch decides which files it touches
+/// and how many lines it changes; the check's own reading, which finds the tokens and the
+/// notice, must agree with it file by file.
 fn patch_rule(repo: &Repository, dir: &str, findings: &mut Vec<Finding>) {
     let path = format!("vendor/{dir}.patch");
     let Some(text) = repo.files.text(&path) else {
@@ -443,32 +561,113 @@ fn patch_rule(repo: &Repository, dir: &str, findings: &mut Vec<Finding>) {
             return findings.push(Finding::new(path, format!("not a unified diff ({why})")));
         }
     };
-    let changed: usize = patch.files.iter().map(|f| f.changed).sum();
+    let stats = match repo.numstat.get(dir) {
+        Some(Ok(numstat)) => parse_numstat(numstat),
+        Some(Err(why)) => {
+            return findings.push(Finding::new(path, format!("not a patch git applies ({why})")));
+        }
+        None => return findings.push(Finding::new(path, "git has not read it")),
+    };
+    let mut theirs: BTreeMap<&str, (usize, usize)> = BTreeMap::new();
+    let mut changed = 0;
+    let mut named: BTreeSet<&str> = BTreeSet::new();
+    let mut binary: BTreeSet<&str> = BTreeSet::new();
+    for stat in &stats {
+        named.extend(stat.paths.iter().map(String::as_str));
+        let target = stat.paths.last().map_or("a file", String::as_str);
+        let (Some(added), Some(removed)) = (stat.added, stat.removed) else {
+            binary.insert(target);
+            findings.push(Finding::new(
+                &path,
+                format!("not a unified diff (git reads a binary change to {target})"),
+            ));
+            continue;
+        };
+        changed += added + removed;
+        let counts = theirs.entry(target).or_default();
+        *counts = (counts.0 + added, counts.1 + removed);
+    }
+    let mut ours: BTreeMap<&str, (usize, usize)> = BTreeMap::new();
+    for file in &patch.files {
+        named.extend(file.paths.iter().map(String::as_str));
+        let counts = ours.entry(file.name()).or_default();
+        *counts = (counts.0 + file.added, counts.1 + file.removed);
+    }
+    let files: BTreeSet<&str> = theirs.keys().chain(ours.keys()).copied().collect();
+    for file in files.into_iter().filter(|file| !binary.contains(file)) {
+        let message = match (theirs.get(file), ours.get(file)) {
+            (Some(_), None) => format!("git applies it to {file}, which the check does not read"),
+            (None, Some(_)) => {
+                format!("the check reads a change to {file}, which git does not apply")
+            }
+            (Some(git), Some(read)) if git != read => format!(
+                "git reads {file} as {} added and {} removed lines, the check as {} and {}",
+                git.0, git.1, read.0, read.1
+            ),
+            _ => continue,
+        };
+        findings.push(Finding::new(&path, message));
+    }
     if changed > MAX_CHANGED_LINES {
         findings.push(Finding::new(
             &path,
             format!("{changed} changed lines, over the fifty of architecture section 8.2"),
         ));
     }
-    let mut untouchable = BTreeSet::new();
-    for file in &patch.files {
-        for named in &file.paths {
-            let name = named.rsplit('/').next().unwrap_or(named);
-            if UNTOUCHABLE.contains(&name) {
-                untouchable.insert(named.as_str());
-            }
+    for file in named {
+        let name = file.rsplit('/').next().unwrap_or(file);
+        if UNTOUCHABLE.contains(&name) {
+            findings
+                .push(Finding::new(&path, format!("names {file}, which a patch never touches")));
         }
     }
-    for named in untouchable {
-        findings.push(Finding::new(&path, format!("names {named}, which a patch never touches")));
+    for (line, token) in patch.files.iter().flat_map(|f| &f.refused) {
+        findings.push(Finding::new(&path, format!("adds {token} at line {line}")));
     }
-    for line in patch.files.iter().flat_map(|f| &f.unsafe_lines) {
-        findings.push(Finding::new(&path, format!("adds unsafe at line {line}")));
+    for (line, chars) in patch.files.iter().flat_map(|f| &f.long) {
+        findings.push(Finding::new(
+            &path,
+            format!(
+                "line {line} adds {chars} characters, over the {MAX_LINE_CHARS} an added line may \
+                 hold"
+            ),
+        ));
     }
     for file in patch.files.iter().filter(|f| !f.notice) {
         findings
             .push(Finding::new(&path, format!("{} carries no \"{NOTICE}\" notice", file.name())));
     }
+}
+
+/// One file as `git apply --numstat -z` reports it.
+#[derive(Clone, PartialEq, Eq, Debug)]
+struct Stat {
+    /// The lines added and removed, `None` for a binary change.
+    added: Option<usize>,
+    removed: Option<usize>,
+    /// The path, or the old and the new path of a rename or copy.
+    paths: Vec<String>,
+}
+
+/// Reads `git apply --numstat -z`: `added TAB removed TAB path NUL`, or for a rename or copy
+/// `added TAB removed TAB NUL old NUL new NUL`; `-` counts a binary change.
+fn parse_numstat(text: &str) -> Vec<Stat> {
+    let mut fields = text.split('\0');
+    let mut stats = Vec::new();
+    while let Some(field) = fields.next() {
+        if field.is_empty() {
+            continue;
+        }
+        let mut parts = field.splitn(3, '\t');
+        let added = parts.next().and_then(|n| n.parse().ok());
+        let removed = parts.next().and_then(|n| n.parse().ok());
+        let paths = match parts.next() {
+            Some(path) if !path.is_empty() => vec![path.to_owned()],
+            _ => fields.by_ref().take(2).map(str::to_owned).collect(),
+        };
+        stats.push(Stat { added, removed, paths });
+    }
+    stats
 }
 
 /// A patch as `git apply` reads it, reduced to what the rule asks about.
@@ -488,10 +687,14 @@ struct PatchedFile {
     /// Whether `---` and `+++` lines introduced it.
     headed: bool,
     hunks: usize,
-    /// The lines it adds or removes.
-    changed: usize,
-    /// The patch's line numbers, from 1, of the added lines that hold the token `unsafe`.
-    unsafe_lines: Vec<usize>,
+    /// The lines it adds.
+    added: usize,
+    /// The lines it removes.
+    removed: usize,
+    /// The patch's line numbers, from 1, of added lines that hold a refused token, with it.
+    refused: Vec<(usize, &'static str)>,
+    /// The patch's line numbers of added lines over the length cap, with their length.
+    long: Vec<(usize, usize)>,
     /// Whether an added line holds the notice.
     notice: bool,
 }
@@ -572,15 +775,20 @@ impl Patch {
                         }
                         Some(b'-') if old > 0 => {
                             old -= 1;
-                            file.changed += 1;
+                            file.removed += 1;
                         }
                         Some(b'+') if new > 0 => {
                             new -= 1;
-                            file.changed += 1;
-                            if holds_token(body, "unsafe") {
-                                file.unsafe_lines.push(at + 1);
+                            file.added += 1;
+                            let added = &body[1..];
+                            for token in REFUSED_TOKENS.iter().filter(|t| refuses(added, t)) {
+                                file.refused.push((at + 1, token));
                             }
-                            file.notice |= body.contains(NOTICE);
+                            let chars = added.trim_end_matches('\r').chars().count();
+                            if chars > MAX_LINE_CHARS {
+                                file.long.push((at + 1, chars));
+                            }
+                            file.notice |= added.contains(NOTICE);
                         }
                         Some(b'\\') => {}
                         _ => return Err(Some(cut())),
@@ -597,7 +805,11 @@ impl Patch {
                 .find_map(|header| line.strip_prefix(header))
             {
                 let file = current.get_or_insert_with(PatchedFile::default);
-                file.add_path(unquote(path));
+                let path = unquote(path);
+                if line.starts_with("rename to ") || line.starts_with("copy to ") {
+                    file.target = Some(path.clone());
+                }
+                file.add_path(path);
             }
         }
         files.extend(current);
@@ -683,10 +895,30 @@ fn hunk_lengths(line: &str) -> Option<(usize, usize)> {
 
 /// Whether `token` occurs in `line` as a whole identifier.
 fn holds_token(line: &str, token: &str) -> bool {
+    identifiers(line, token).next().is_some()
+}
+
+/// The text after each occurrence of `token` in `line` as a whole identifier.
+fn identifiers<'a>(line: &'a str, token: &'a str) -> impl Iterator<Item = &'a str> {
     let word = |c: Option<char>| c.is_some_and(|c| c.is_alphanumeric() || c == '_');
-    line.match_indices(token).any(|(at, _)| {
-        !word(line[..at].chars().next_back()) && !word(line[at + token.len()..].chars().next())
+    line.match_indices(token).filter_map(move |(at, _)| {
+        let rest = &line[at + token.len()..];
+        (!word(line[..at].chars().next_back()) && !word(rest.chars().next())).then_some(rest)
     })
+}
+
+/// Whether an added line holds one of [`REFUSED_TOKENS`]: the identifier, followed by `!`
+/// for a macro, or for `#[path` a `path =` in an attribute.
+fn refuses(line: &str, token: &str) -> bool {
+    if token == "#[path" {
+        let attribute = line.contains("#[") || line.contains("#!");
+        return attribute
+            && identifiers(line, "path").any(|rest| rest.trim_start().starts_with('='));
+    }
+    match token.strip_suffix('!') {
+        Some(name) => identifiers(line, name).any(|rest| rest.trim_start().starts_with('!')),
+        None => holds_token(line, token),
+    }
 }
 
 /// What `cargo vendor` records of a package: the sha256 of every file but the record
@@ -710,8 +942,11 @@ impl Record {
 }
 
 /// Step 8: copies `vendor/<dir>` afresh to `<scratch>/<dir>`, reverses the patch there with
-/// `git apply`, and compares the sha256 of every file with the record. A copy without a
-/// patch is compared as it is; one without a record is left to step 5's finding.
+/// `git apply`, and compares the sha256 of every file with the record; then applies the
+/// patch forward to the tree that matched and requires the copy back, byte for byte. Every
+/// hunk must apply where it says: git moving one to an offset, which repeated context
+/// allows, is a finding both ways. A copy without a patch is compared as it is; one without
+/// a record is left to step 5's finding.
 ///
 /// # Errors
 /// If the copy cannot be made or hashed, or git cannot be run.
@@ -724,31 +959,85 @@ pub fn reverse(
     let Some(record) = repo.record(dir) else {
         return Ok(Vec::new());
     };
+    let original = root.join("vendor").join(dir);
     let copy = scratch.join(dir);
     remove(&copy)?;
-    copy_tree(&root.join("vendor").join(dir), &copy)?;
-    let patch = format!("vendor/{dir}.patch");
-    if repo.files.contains(&patch) {
-        // No repository above the copy is consulted (the target directory may sit inside
-        // one, or not), and no conversion: on a Windows runner `core.autocrlf` is set.
-        let output = Command::new("git")
-            .args(["-c", "core.autocrlf=false", "apply", "--reverse", "--whitespace=nowarn"])
-            .arg(root.join(&patch))
-            .current_dir(&copy)
-            .env("GIT_CEILING_DIRECTORIES", scratch)
-            .output()
-            .map_err(|e| format!("cannot run `git apply`: {e}"))?;
+    copy_tree(&original, &copy)?;
+    let path = format!("vendor/{dir}.patch");
+    let patch = root.join(&path);
+    let patched = repo.files.contains(&path);
+    if patched {
+        let output = git_apply(scratch, &copy, &["-v", "--reverse"], &patch)?;
         if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            let first = stderr.lines().map(str::trim).find(|l| !l.is_empty());
-            let first = first.unwrap_or("git gave no reason");
-            return Ok(vec![Finding::new(
-                patch,
-                format!("does not reverse-apply to vendor/{dir} ({first})"),
-            )]);
+            let why = format!("does not reverse-apply to vendor/{dir} ({})", first_line(&output));
+            return Ok(vec![Finding::new(path, why)]);
+        }
+        if let Some(line) = shifted(&output) {
+            let why =
+                format!("reverse-applies to vendor/{dir} only away from where it says ({line})");
+            return Ok(vec![Finding::new(path, why)]);
         }
     }
-    Ok(compare_record(dir, &record, &hash_tree(&copy)?))
+    let findings = compare_record(dir, &record, &hash_tree(&copy)?);
+    if !findings.is_empty() || !patched {
+        return Ok(findings);
+    }
+    let output = git_apply(scratch, &copy, &["-v"], &patch)?;
+    if !output.status.success() {
+        let why = format!("does not apply to the record of vendor/{dir} ({})", first_line(&output));
+        return Ok(vec![Finding::new(path, why)]);
+    }
+    if let Some(line) = shifted(&output) {
+        let why =
+            format!("applies to the record of vendor/{dir} only away from where it says ({line})");
+        return Ok(vec![Finding::new(path, why)]);
+    }
+    let (forward, committed) = (hash_tree(&copy)?, hash_tree(&original)?);
+    let files: BTreeSet<&String> = forward.keys().chain(committed.keys()).collect();
+    let differ = files.into_iter().filter(|file| forward.get(*file) != committed.get(*file));
+    Ok(differ
+        .map(|file| {
+            Finding::new(format!("vendor/{dir}/{file}"), "is not the record with the patch applied")
+        })
+        .collect())
+}
+
+/// Runs `git apply` with `args` on `patch` in `dir`, a directory under `scratch`. No
+/// repository above `scratch` is consulted (the target directory may sit inside one, or not),
+/// and nothing is converted: on a Windows runner `core.autocrlf` is set. git speaks
+/// English, which [`shifted`] reads.
+fn git_apply(scratch: &Path, dir: &Path, args: &[&str], patch: &Path) -> Result<Output, String> {
+    Command::new("git")
+        .args(["-c", "core.autocrlf=false", "apply", "--whitespace=nowarn"])
+        .args(args)
+        .arg(patch)
+        .current_dir(dir)
+        .env("GIT_CEILING_DIRECTORIES", scratch)
+        .env("LC_ALL", "C")
+        .env("LANGUAGE", "C")
+        .output()
+        .map_err(|e| format!("cannot run `git apply`: {e}"))
+}
+
+/// git's first error line.
+fn first_line(output: &Output) -> String {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let first = stderr.lines().map(str::trim).find(|line| !line.is_empty());
+    first.unwrap_or("git gave no reason").to_owned()
+}
+
+/// The line of `git apply -v` that reports a hunk applied away from where the patch says it
+/// is: at an offset, or with fuzz. Only git's `Hunk #` lines are read, so a file name that
+/// holds either word is not one.
+fn shifted(output: &Output) -> Option<String> {
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let moved =
+        |l: &&str| l.starts_with("Hunk #") && (l.contains("(offset ") || l.contains("fuzz"));
+    text.lines().map(str::trim).find(moved).map(str::to_owned)
 }
 
 /// The sha256 of every file under `dir`, keyed by its path relative to `dir` with `/`
@@ -1148,8 +1437,25 @@ cfg-if = { path = "vendor/cfg-if-1.0.5" }
         Repository {
             files,
             members: vec!["crates/a/Cargo.toml".to_owned()],
+            entries: vec![format!("{DIR}.patch"), DIR.to_owned(), "README.md".to_owned()],
             copies: vec![DIR.to_owned()],
+            numstat: BTreeMap::new(),
         }
+    }
+
+    /// [`check`], with git's reading of each patch the test did not set taken to be the
+    /// check's own, as it is for every patch these tests write that git reads at all. The
+    /// integration tests run git itself.
+    fn run(repo: &Repository, graph: Option<&Workspace>) -> Vec<String> {
+        let mut repo = repo.clone();
+        for dir in repo.copies.clone() {
+            let text = repo.files.text(&format!("vendor/{dir}.patch")).map(|t| t.into_owned());
+            let Some(Ok(patch)) = text.as_deref().map(Patch::parse) else { continue };
+            let numstat =
+                patch.files.iter().map(|f| format!("{}\t{}\t{}\0", f.added, f.removed, f.name()));
+            repo.numstat.entry(dir).or_insert_with(|| Ok(numstat.collect()));
+        }
+        lines(&check(&repo, graph))
     }
 
     fn path_package(name: &str, version: &str, manifest: &str) -> ResolvedPackage {
@@ -1171,7 +1477,7 @@ cfg-if = { path = "vendor/cfg-if-1.0.5" }
     }
 
     fn checked(repo: &Repository) -> Vec<String> {
-        lines(&check(repo, Some(&graph())))
+        run(repo, Some(&graph()))
     }
 
     fn with_patch(text: &str) -> Repository {
@@ -1201,7 +1507,7 @@ cfg-if = { path = "vendor/cfg-if-1.0.5" }
         files.insert(ROOT_MANIFEST, "[workspace]\n");
         let bare = Repository { files, ..Repository::default() };
         assert_eq!(
-            lines(&check(&bare, Some(&Workspace::default()))),
+            run(&bare, Some(&Workspace::default())),
             [".gitattributes: does not mark vendor/** -text"]
         );
         assert_eq!(lines(&prose(&bare)), Vec::<String>::new());
@@ -1269,7 +1575,7 @@ cfg-if = { path = "vendor/cfg-if-1.0.5" }
         let helper = path_package("helper", "0.0.0", "other/Cargo.toml");
         graph.resolved.insert("helper".to_owned(), helper);
         assert_eq!(
-            lines(&check(&repo, Some(&graph))),
+            run(&repo, Some(&graph)),
             [
                 "other/Cargo.toml: non-member path package helper 0.0.0 outside vendor/",
                 "vendor/stray-0.1.0: no [patch.crates-io] entry names it",
@@ -1282,7 +1588,7 @@ cfg-if = { path = "vendor/cfg-if-1.0.5" }
     fn step_2_names_a_copy_nothing_builds_and_a_copy_that_is_a_member() {
         let unused = Workspace::default();
         assert_eq!(
-            lines(&check(&repo(), Some(&unused))),
+            run(&repo(), Some(&unused)),
             ["vendor/cfg-if-1.0.5: no package in the resolved graph is built from it (the patch \
              is unused)"]
         );
@@ -1291,12 +1597,12 @@ cfg-if = { path = "vendor/cfg-if-1.0.5" }
             copy.member = true;
         }
         assert_eq!(
-            lines(&check(&repo(), Some(&member))),
+            run(&repo(), Some(&member)),
             ["vendor/cfg-if-1.0.5: is a workspace member; a copy is a dependency, excluded from \
              the workspace"]
         );
         // Without a graph, only what the files show.
-        assert_eq!(lines(&check(&repo(), None)), Vec::<String>::new());
+        assert_eq!(run(&repo(), None), Vec::<String>::new());
     }
 
     #[test]
@@ -1312,7 +1618,7 @@ cfg-if = { path = "vendor/cfg-if-1.0.5" }
             copy.version = "1.0.6".to_owned();
         }
         assert_eq!(
-            lines(&check(&repo, Some(&graph))),
+            run(&repo, Some(&graph)),
             [
                 "vendor/cfg-if-1.0.5: holds cfg_if 1.0.6, so it must be named vendor/cfg_if-1.0.6",
                 "Cargo.toml: [patch.crates-io] \"cfg-if\" names vendor/cfg-if-1.0.5, which holds \
@@ -1340,7 +1646,7 @@ cfg-if = { path = "vendor/cfg-if-1.0.5" }
         graph.resolved.insert("cfg-if 0.1".to_owned(), registry("cfg-if", "0.1.10"));
         let other = path_package("cfg-if", "0.1.99", "vendor/cfg-if-0.1.99/Cargo.toml");
         graph.resolved.insert("cfg-if 0.1.99".to_owned(), other);
-        let found = lines(&check(&repo(), Some(&graph)));
+        let found = run(&repo(), Some(&graph));
         for expected in [
             "vendor/cfg-if-1.0.5: cfg-if also resolves from crates.io at 0.1.10; a patch covers \
              one version",
@@ -1358,15 +1664,12 @@ cfg-if = { path = "vendor/cfg-if-1.0.5" }
         let mut repo = repo();
         repo.files.insert(format!("vendor/{DIR}/{RECORD}"), r#"{"files":{}}"#);
         repo.files.insert(".gitattributes", "*.rs text eol=lf\n");
-        repo.files.insert("vendor/.gitattributes", "*.rs text\n");
         assert_eq!(
             checked(&repo),
             [
                 "vendor/cfg-if-1.0.5/.cargo-checksum.json: missing, or without a \"files\" map and \
              a \"package\" checksum; write it with cargo vendor --versioned-dirs",
                 ".gitattributes: does not mark vendor/** -text",
-                "vendor/.gitattributes: sets the text attribute under vendor/, where only the \
-             root's vendor/** -text may",
             ]
         );
         assert_eq!(Record::parse(r#"{"files":{"a":1},"package":"x"}"#), None);
@@ -1427,7 +1730,7 @@ cfg-if = { path = "vendor/cfg-if-1.0.5" }
             "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1,2 +1,50 @@\n-old\n{body}+new\n context\n"
         );
         let parsed = Patch::parse(&patch);
-        assert_eq!(parsed.map(|p| p.files[0].changed), Ok(50));
+        assert_eq!(parsed.map(|p| (p.files[0].added, p.files[0].removed)), Ok((49, 1)));
         assert_eq!(checked(&with_patch(&patch)), Vec::<String>::new());
         let over = patch.replace("+1,50", "+1,51").replace("+new\n", "+new\n+one more\n");
         assert_eq!(
@@ -1502,6 +1805,196 @@ deleted file mode 100644
     }
 
     #[test]
+    fn step_7_refuses_every_token_that_reaches_past_the_safe_language() {
+        for (line, token) in [
+            ("#[no_mangle]", "no_mangle"),
+            ("#[export_name = \"malloc\"]", "export_name"),
+            ("#[link_section = \".init_array\"]", "link_section"),
+            ("    #[link_name = \"write\"]", "link_name"),
+            ("global_asm!(\"nop\");", "global_asm"),
+            ("core::arch::asm !(\"nop\")", "asm!"),
+            ("#[naked]", "naked"),
+            ("const X: &str = include!(\"x\");", "include!"),
+            ("include_str! (\"x\")", "include_str!"),
+            ("static B: &[u8] = include_bytes!(\"x\");", "include_bytes!"),
+            ("#[path = \"../../payload.rs\"]", "#[path"),
+            ("#![cfg_attr(x, path = \"y.rs\")]", "#[path"),
+        ] {
+            assert!(refuses(line, token), "{line}");
+            let patch = format!("{PATCH}--- a/src/x.rs\n+++ b/src/x.rs\n@@ -0,0 +1 @@\n+{line}\n");
+            let found = checked(&with_patch(&patch));
+            let expected = format!("vendor/cfg-if-1.0.5.patch: adds {token} at line 13");
+            assert!(found.contains(&expected), "{line}\n{found:#?}");
+        }
+        for (line, token) in [
+            ("// asm is not a macro call", "asm!"),
+            ("let path = include_dir;", "include!"),
+            ("let path = \"x\";", "#[path"),
+            ("fn no_mangled() {}", "no_mangle"),
+            ("#[inline] fn naked_eye() {}", "naked"),
+        ] {
+            assert!(!refuses(line, token), "{line}");
+        }
+    }
+
+    #[test]
+    fn step_7_caps_the_length_of_an_added_line() {
+        let fits = format!(
+            "{PATCH}--- a/src/x.rs\n+++ b/src/x.rs\n@@ -0,0 +1 @@\n+{}\r\n",
+            "a".repeat(200)
+        );
+        assert!(!checked(&with_patch(&fits)).iter().any(|f| f.contains("characters")));
+        let long = format!(
+            "{PATCH}--- a/src/x.rs\n+++ b/src/x.rs\n@@ -0,0 +1 @@\n+{}\n",
+            "\u{e9}".repeat(201)
+        );
+        assert!(
+            checked(&with_patch(&long)).contains(
+                &"vendor/cfg-if-1.0.5.patch: line 13 adds 201 characters, over the 200 an added \
+                  line may hold"
+                    .to_owned()
+            )
+        );
+    }
+
+    #[test]
+    fn step_7_takes_the_files_and_counts_from_git() {
+        let mut repo = repo();
+        repo.numstat
+            .insert(DIR.to_owned(), Ok("2\t1\tsrc/lib.rs\x001\t0\tCargo.toml\0".to_owned()));
+        assert_eq!(
+            checked(&repo),
+            [
+                "vendor/cfg-if-1.0.5.patch: git applies it to Cargo.toml, which the check does \
+                 not read",
+                "vendor/cfg-if-1.0.5.patch: names Cargo.toml, which a patch never touches",
+            ]
+        );
+        repo.numstat.insert(DIR.to_owned(), Ok("3\t1\tsrc/lib.rs\0".to_owned()));
+        assert_eq!(
+            checked(&repo),
+            [
+                "vendor/cfg-if-1.0.5.patch: git reads src/lib.rs as 3 added and 1 removed lines, the \
+              check as 2 and 1"
+            ]
+        );
+        repo.numstat.insert(DIR.to_owned(), Ok("-\t-\tsrc/lib.rs\0".to_owned()));
+        assert_eq!(
+            checked(&repo),
+            ["vendor/cfg-if-1.0.5.patch: not a unified diff (git reads a binary change to \
+              src/lib.rs)"]
+        );
+        repo.numstat.insert(DIR.to_owned(), Ok(String::new()));
+        assert_eq!(
+            checked(&repo),
+            ["vendor/cfg-if-1.0.5.patch: the check reads a change to src/lib.rs, which git does \
+              not apply"]
+        );
+        repo.numstat.insert(DIR.to_owned(), Err("error: corrupt patch at line 9".to_owned()));
+        assert_eq!(
+            checked(&repo),
+            ["vendor/cfg-if-1.0.5.patch: not a patch git applies (error: corrupt patch at line 9)"]
+        );
+        let counted = "60\t0\tsrc/lib.rs\0";
+        repo.numstat.insert(DIR.to_owned(), Ok(counted.to_owned()));
+        assert!(checked(&repo).contains(
+            &"vendor/cfg-if-1.0.5.patch: 60 changed lines, over the fifty of architecture section \
+              8.2"
+                .to_owned()
+        ));
+    }
+
+    #[test]
+    fn step_8_reads_a_hunk_git_moved_from_its_hunk_line_only() {
+        let output = |stderr: &str| Output {
+            status: std::process::ExitStatus::default(),
+            stdout: Vec::new(),
+            stderr: stderr.as_bytes().to_vec(),
+        };
+        let clean = "Checking patch src/fuzz (offset 1).rs...\nHunk #1 applied cleanly.\n";
+        assert_eq!(shifted(&output(clean)), None);
+        let moved = format!("{clean}Hunk #2 succeeded at 122 (offset -10 lines).\n");
+        assert_eq!(
+            shifted(&output(&moved)).as_deref(),
+            Some("Hunk #2 succeeded at 122 (offset -10 lines).")
+        );
+    }
+
+    #[test]
+    fn git_numstat_is_read_with_renames() {
+        let text = "1\t2\ta.rs\x00-\t-\tlogo.png\x000\t0\t\x00old.rs\x00new dir/new.rs\x00";
+        let stat = |added, removed, paths: &[&str]| Stat {
+            added,
+            removed,
+            paths: paths.iter().map(|p| (*p).to_owned()).collect(),
+        };
+        assert_eq!(
+            parse_numstat(text),
+            [
+                stat(Some(1), Some(2), &["a.rs"]),
+                stat(None, None, &["logo.png"]),
+                stat(Some(0), Some(0), &["old.rs", "new dir/new.rs"]),
+            ]
+        );
+    }
+
+    #[test]
+    fn step_2_refuses_anything_else_under_vendor() {
+        let mut repo = repo();
+        repo.entries
+            .extend(["payload.rs", "orphan-1.0.0.patch", ".gitattributes"].map(str::to_owned));
+        assert_eq!(
+            checked(&repo),
+            [
+                "vendor/payload.rs: neither a copy, its patch nor README.md; nothing else lives \
+                 under vendor/",
+                "vendor/orphan-1.0.0.patch: no copy vendor/orphan-1.0.0 beside it",
+                "vendor/.gitattributes: neither a copy, its patch nor README.md; nothing else \
+                 lives under vendor/",
+            ]
+        );
+    }
+
+    #[test]
+    fn step_1_refuses_what_reaches_cargo_around_the_files_it_reads() {
+        let mut repo = repo();
+        repo.files.insert(
+            ".cargo/config.toml",
+            "include = [\"tools/ship.toml\"]\n[alias]\nship = \"build --config tools/ship.toml\"\n\
+             nightly = [\"build\", \"-Zbuild-std\"]\nok = \"build --release\"\n",
+        );
+        repo.files.insert_link("tools/.cargo");
+        repo.files.insert(
+            ".github/workflows/ci.yml",
+            "# cargo --config patch.crates-io.x.path=y\n\
+             run: cargo build --config 'patch.crates-io.x.path=\"y\"'\n\
+             env:\n  CARGO_HOME: /tmp/home\n\
+             run: cargo build --config profile.release.lto=true\n",
+        );
+        repo.files
+            .insert("tools/release.sh", "export CARGO_HOME=\"$PWD/home\"\necho $CARGO_HOME\n");
+        assert_eq!(
+            checked(&repo),
+            [
+                ".cargo/config.toml: has an include key; cargo reads the included files, which no \
+                 check does",
+                "tools/.cargo: is a symbolic link; cargo follows it, which no check does, so a \
+                 cargo configuration file or directory is committed as itself",
+                ".cargo/config.toml: alias nightly passes --config or -Z, through which a \
+                 [patch], [source] or paths setting reaches cargo unseen",
+                ".cargo/config.toml: alias ship passes --config or -Z, through which a [patch], \
+                 [source] or paths setting reaches cargo unseen",
+                ".github/workflows/ci.yml: line 2: passes --config naming patch, source or paths; \
+                 a patch lives in the root Cargo.toml only",
+                ".github/workflows/ci.yml: line 4: sets CARGO_HOME, whose cargo configuration no \
+                 check reads",
+                "tools/release.sh: line 1: sets CARGO_HOME, whose cargo configuration no check \
+                 reads",
+            ]
+        );
+    }
+
+    #[test]
     fn a_patch_is_read_as_git_apply_reads_it() {
         // A removed line that begins `--` and an added one that begins `++` are hunk lines,
         // an empty line is empty context, and text between files is ignored.
@@ -1525,10 +2018,10 @@ not part of a hunk
         let parsed = Patch::parse(patch).unwrap_or_default();
         let [a, new] = &parsed.files[..] else { panic!("{parsed:?}") };
         assert_eq!(a.paths, ["src/a.rs", "src/sp ace\u{e9}.rs"]);
-        assert_eq!((a.changed, a.notice, a.hunks), (2, true, 1));
+        assert_eq!((a.added, a.removed, a.notice, a.hunks), (1, 1, true, 1));
         assert_eq!(new.paths, ["new.rs"]);
         assert_eq!(new.target.as_deref(), Some("new.rs"));
-        assert_eq!((new.changed, new.notice), (1, true));
+        assert_eq!((new.added, new.removed, new.notice), (1, 0, true));
         assert_eq!(hunk_lengths("@@ -3 +3,0 @@ fn f()"), Some((1, 0)));
         assert_eq!(hunk_lengths("@@ -3,x +3 @@"), None);
         assert_eq!(

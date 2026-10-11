@@ -2,14 +2,18 @@
 //! contents, so every check that reads files can be tested on a map built in memory.
 
 use std::borrow::Cow;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::Path;
 
-/// File contents keyed by repository-relative path with `/` separators.
+use crate::Finding;
+
+/// File contents keyed by repository-relative path with `/` separators, and the symbolic
+/// links that were not followed.
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
 pub struct Files {
     files: BTreeMap<String, Vec<u8>>,
+    links: BTreeSet<String>,
 }
 
 impl Files {
@@ -41,10 +45,20 @@ impl Files {
         self.files.keys().map(String::as_str)
     }
 
+    /// Records a symbolic link at `path`, which is not followed.
+    pub fn insert_link(&mut self, path: impl Into<String>) {
+        self.links.insert(path.into());
+    }
+
+    /// Every symbolic link met, to a file or a directory, sorted.
+    pub fn links(&self) -> impl Iterator<Item = &str> {
+        self.links.iter().map(String::as_str)
+    }
+
     /// Reads the files the checks look at from the repository at `root`.
     ///
     /// Build output, version-control metadata and nested checkouts (a directory other than
-    /// `root` that has its own `.git`) are skipped, as are symbolic links.
+    /// `root` that has its own `.git`) are skipped. Symbolic links are recorded, not followed.
     ///
     /// # Errors
     /// If a directory or a wanted file cannot be read.
@@ -67,6 +81,8 @@ fn walk(dir: &Path, prefix: &str, files: &mut Files) -> Result<(), String> {
                 continue;
             }
             walk(&entry.path(), &relative, files)?;
+        } else if kind.is_symlink() {
+            files.insert_link(relative);
         } else if kind.is_file() && wanted(&relative) {
             let contents =
                 fs::read(entry.path()).map_err(|e| format!("{}: {e}", entry.path().display()))?;
@@ -110,9 +126,64 @@ pub fn is_cargo_config(path: &str) -> bool {
     })
 }
 
+/// What cargo reads through a cargo configuration file that no check can read (architecture
+/// section 8.2, D123): an `include` key, which makes cargo load further files, and a cargo
+/// configuration file or `.cargo` directory committed as a symbolic link, which cargo follows
+/// and [`Files::load`] does not. Through either, a `[source]` replacement or a `rustflags`
+/// key would reach every build unseen, so each is refused wherever it is.
+#[must_use]
+pub fn unread_cargo_configuration(files: &Files) -> Vec<Finding> {
+    let mut findings = Vec::new();
+    for path in files.paths().filter(|path| is_cargo_config(path)) {
+        let table = files.text(path).and_then(|text| text.parse::<toml::Table>().ok());
+        if table.is_some_and(|table| table.contains_key("include")) {
+            findings.push(Finding::new(
+                path,
+                "has an include key; cargo reads the included files, which no check does",
+            ));
+        }
+    }
+    let linked = |path: &&str| is_cargo_config(path) || path.rsplit('/').next() == Some(".cargo");
+    for path in files.links().filter(linked) {
+        findings.push(Finding::new(
+            path,
+            "is a symbolic link; cargo follows it, which no check does, so a cargo \
+             configuration file or directory is committed as itself",
+        ));
+    }
+    findings
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_include_or_a_linked_configuration_is_refused() {
+        let mut files = Files::default();
+        files.insert(".cargo/config.toml", "include = [\"../tools/settings.toml\"]\n");
+        files.insert("a/.cargo/config", "[build]\njobs = 1\n");
+        files.insert("docs/include.toml", "include = 1\n");
+        files.insert_link("b/.cargo");
+        files.insert_link("c/.cargo/config");
+        files.insert_link("d/.cargo/config.toml");
+        files.insert_link("e/notes.md");
+        let found: Vec<String> =
+            unread_cargo_configuration(&files).iter().map(ToString::to_string).collect();
+        let link = "is a symbolic link; cargo follows it, which no check does, so a cargo \
+                    configuration file or directory is committed as itself";
+        assert_eq!(
+            found,
+            [
+                ".cargo/config.toml: has an include key; cargo reads the included files, which no \
+             check does"
+                    .to_owned(),
+                format!("b/.cargo: {link}"),
+                format!("c/.cargo/config: {link}"),
+                format!("d/.cargo/config.toml: {link}"),
+            ]
+        );
+    }
 
     #[test]
     fn build_configuration_is_recognised() {

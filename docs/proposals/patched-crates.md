@@ -161,7 +161,9 @@ It reads the root `Cargo.toml`, every cargo configuration file the repository ho
 (`.cargo/config.toml` and `.cargo/config` at any depth, as `cargo xtask boundary` finds
 them), `.gitattributes`, the `vendor/` listing, each copy's `Cargo.toml`,
 `.cargo-checksum.json`, the `.patch` beside it, `vendor/README.md`, and the resolved graph
-(`cargo metadata --locked`: every package with its `source`, version and manifest path). A
+(`cargo metadata --locked --all-features`: every package with its `source`, version and
+manifest path, with every feature on, since a version behind a feature is still compiled by
+whoever enables it), and `git apply --numstat -z` of each patch. A
 `[patch.crates-io]` entry's crate name is its `package` key when present, else the key. The
 findings, in order:
 
@@ -170,13 +172,25 @@ findings, in order:
    crates-io is patched`; `<member>/Cargo.toml: holds a [patch] table; only the root may`
    (cargo ignores it with a warning; here it is a finding); `<config>: sets [patch],
    [source] or paths; a patch lives in the root Cargo.toml only`.
+   Cargo must read nothing the check does not: `<config>: has an include key; cargo reads
+   the included files, which no check does`; `<path>: is a symbolic link; cargo follows it,
+   which no check does, so a cargo configuration file or directory is committed as itself`
+   (a `.cargo` directory, `.cargo/config` or `.cargo/config.toml` anywhere; `cargo xtask
+   boundary` refuses both through the same function); `<config>: alias <name> passes
+   --config or -Z, through which a [patch], [source] or paths setting reaches cargo unseen`;
+   and in each workflow, script and cargo configuration file `cargo xtask boundary` scans,
+   `<file>: line <n>: passes --config naming patch, source or paths; a patch lives in the
+   root Cargo.toml only` and `<file>: line <n>: sets CARGO_HOME, whose cargo configuration
+   no check reads`.
 2. Correspondence. Every resolved package with no `source` that is not a workspace member
    has its manifest at `vendor/<name>-<version>/Cargo.toml` and is named by a root
    `[patch.crates-io]` entry, and every directory under `vendor/` is such a package:
    `<manifest>: non-member path package <name> <version> outside vendor/`; `vendor/<dir>: no
    [patch.crates-io] entry names it`; `Cargo.toml: [patch.crates-io] "<key>" names
    vendor/<dir>, which does not exist`; `vendor/<dir>: no package in the resolved graph is
-   built from it (the patch is unused)`.
+   built from it (the patch is unused)`. Nothing else lives directly under `vendor/`:
+   `vendor/<entry>: neither a copy, its patch nor README.md; nothing else lives under
+   vendor/`; `vendor/<x>.patch: no copy vendor/<x> beside it`.
 3. Names. `vendor/<dir>: holds <name> <version>, so it must be named
    vendor/<name>-<version>`; `Cargo.toml: [patch.crates-io] "<key>" names vendor/<dir>,
    which holds <other>`.
@@ -187,21 +201,35 @@ findings, in order:
    not mark vendor/** -text`.
 6. The patch file. `vendor/<dir>.patch: missing; a copy without a patch has no reason to
    exist, use the registry`; `vendor/<dir>.patch: not a unified diff` (no `---`, `+++` and
-   `@@` lines).
-7. The rule. `vendor/<dir>.patch: <N> changed lines, over the fifty of architecture section
-   8.2` (every hunk line beginning `+` or `-`, comments included; the `---` and `+++` headers
-   are not counted); `vendor/<dir>.patch: names <path>, which a patch never touches`
-   (`Cargo.toml`, `Cargo.toml.orig`, `Cargo.lock`, `.cargo_vcs_info.json`,
-   `.cargo-checksum.json`); `vendor/<dir>.patch: adds unsafe at line <n>` (a `+` line
-   holding the token `unsafe`); `vendor/<dir>.patch: <path> carries no "LACTOSE patch:"
-   notice` (no `+` line of that file's hunks holds the text).
+   `@@` lines, or a binary change); `vendor/<dir>.patch: not a patch git applies (<git's
+   first error line>)`.
+7. The rule. git is the authority on what a patch touches: the files and the line counts
+   are `git apply --numstat -z`'s, and the check's own reading, which finds the tokens and
+   the notice, must agree with it file by file: `vendor/<dir>.patch: git applies it to
+   <path>, which the check does not read`; `vendor/<dir>.patch: the check reads a change to
+   <path>, which git does not apply`; `vendor/<dir>.patch: git reads <path> as <a> added
+   and <r> removed lines, the check as <b> and <c>`. Then `vendor/<dir>.patch: <N> changed
+   lines, over the fifty of architecture section 8.2` (every line git counts as added or
+   removed, comments included); `vendor/<dir>.patch: names <path>, which a patch never
+   touches` (`Cargo.toml`, `Cargo.toml.orig`, `Cargo.lock`, `.cargo_vcs_info.json`,
+   `.cargo-checksum.json`, by git's paths and the check's); `vendor/<dir>.patch: adds
+   <token> at line <n>` (a `+` line holding `unsafe`, `no_mangle`, `export_name`,
+   `link_section`, `link_name`, `global_asm`, `naked` as a token, `asm`, `include`,
+   `include_str` or `include_bytes` followed by `!`, or a `path =` in an attribute);
+   `vendor/<dir>.patch: line <n> adds <N> characters, over the 200 an added line may hold`;
+   `vendor/<dir>.patch: <path> carries no "LACTOSE patch:" notice` (no `+` line of that
+   file's hunks holds the text).
 8. Reverse and hash. The copy is copied afresh to `target/vendor/<dir>` and `git apply
    --reverse <patch>` runs there (git is present wherever the repository is; `patch` is not
    promised on a Windows runner). On failure: `vendor/<dir>.patch: does not reverse-apply to
-   vendor/<dir> (<git's first error line>)`. Then every file under the copy except
+   vendor/<dir> (<git's first error line>)`; a hunk git places away from where the patch
+   says, which repeated context allows: `vendor/<dir>.patch: reverse-applies to vendor/<dir>
+   only away from where it says (<git's line>)`. Then every file under the copy except
    `.cargo-checksum.json` is hashed with sha256 and compared with `files`:
    `vendor/<dir>/<file>: differs from the record`; `vendor/<dir>/<file>: is not in the
-   record`; `vendor/<dir>: the record's <file> is missing`.
+   record`; `vendor/<dir>: the record's <file> is missing`. When they match, the patch is
+   applied forward to that tree, again with no offset or fuzz, and the result must equal the
+   copy byte for byte: `vendor/<dir>/<file>: is not the record with the patch applied`.
 9. Prose. `vendor/README.md: has no section "## <name> <version>"`; `vendor/README.md:
    section "## <name> <version>" names no directory under vendor/`.
 10. Online: the record and the advisories. It writes `target/vendor/upstream/Cargo.toml`: a

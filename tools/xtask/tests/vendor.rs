@@ -6,6 +6,11 @@
 //! workspace under the target directory with its own `[workspace]` root, patches one place
 //! of `src/lib.rs`, and then tampers with one thing.
 //!
+//! Each refusal the check makes about a patch's content or its surroundings is proved here
+//! against git's and cargo's own reading of the same files, not against the check's. The
+//! check's verdict on the repository itself is not a test: the `policy` CI job and the
+//! merger's gate run `cargo xtask vendor` on it.
+//!
 //! The advisory run needs cargo-deny and its database. Where cargo-deny is not installed,
 //! `--offline` skips it and says so, and the clean case checks that it says so.
 
@@ -379,11 +384,12 @@ fn a_path_package_outside_vendor_is_a_finding() {
     ]);
 }
 
-#[test]
-fn a_crate_at_two_versions_with_one_patched_is_a_finding() {
-    // The registry cache holds one version, so the second is made: the copy claims 0.1.99,
-    // which a `0.1` requirement takes from the patch while `=<version>` takes the registry.
-    let fixture = Fixture::new("two");
+/// A workspace in which `app` takes `cfg-if` from crates.io through `dependency`, a
+/// `[dependencies]` entry naming `version`, and a second member takes it at 0.1.99 from the
+/// copy. The registry cache holds one version, so the second is made: the copy claims 0.1.99,
+/// which a `0.1` requirement takes from the patch while `=<version>` takes the registry.
+fn at_two_versions(name: &str, dependency: impl Fn(&str) -> String) -> Fixture {
+    let fixture = Fixture::new(name);
     let version = fixture.version.clone();
     let manifest = read(&fixture.copy().join("Cargo.toml"));
     let claimed = manifest.replacen(
@@ -404,8 +410,7 @@ fn a_crate_at_two_versions_with_one_patched_is_a_finding() {
     write(&ws.join("vendor/README.md"), &readme.replace(&version, "0.1.99"));
     write(
         &ws.join("app/Cargo.toml"),
-        &read(&ws.join("app/Cargo.toml"))
-            .replace("cfg-if.workspace = true", &format!("cfg-if = \"={version}\"")),
+        &read(&ws.join("app/Cargo.toml")).replace("cfg-if.workspace = true", &dependency(&version)),
     );
     let root =
         read(&ws.join("Cargo.toml")).replace("members = [\"app\"]", "members = [\"app\", \"old\"]");
@@ -417,6 +422,13 @@ fn a_crate_at_two_versions_with_one_patched_is_a_finding() {
     );
     write(&ws.join("old/src/lib.rs"), "");
     fixture.lock();
+    fixture
+}
+
+#[test]
+fn a_crate_at_two_versions_with_one_patched_is_a_finding() {
+    let fixture = at_two_versions("two", |version| format!("cfg-if = \"={version}\""));
+    let version = &fixture.version;
     fixture.findings(&[
         format!(
             "vendor/cfg-if-0.1.99: cfg-if also resolves from crates.io at {version}; a patch \
@@ -467,5 +479,193 @@ fn a_patch_without_the_notice_is_a_finding() {
     fixture.findings(&[format!(
         "vendor/{}.patch: src/lib.rs carries no \"LACTOSE patch:\" notice",
         fixture.dir()
+    )]);
+}
+
+#[test]
+fn a_second_version_behind_a_feature_nothing_enables_is_a_finding() {
+    // `cargo build --features legacy` compiles the registry crate, so the graph is read with
+    // every feature on.
+    let fixture = at_two_versions("feature", |version| {
+        format!(
+            "cfg-if = {{ version = \"={version}\", optional = true }}\n\n\
+             [features]\nlegacy = [\"dep:cfg-if\"]"
+        )
+    });
+    let version = &fixture.version;
+    fixture.findings(&[
+        format!(
+            "vendor/cfg-if-0.1.99: cfg-if also resolves from crates.io at {version}; a patch \
+             covers one version"
+        ),
+        "vendor/cfg-if-0.1.99.patch: names Cargo.toml, which a patch never touches".to_owned(),
+    ]);
+}
+
+#[test]
+fn a_hunk_that_applies_only_at_an_offset_is_a_finding() {
+    // cfg-if's `src/lib.rs` repeats a five-line window. The patch states the first place and
+    // the copy carries its lines at the second: git applies it there at an offset, in both
+    // directions, so the hash comparison alone passes a copy that is not the record with the
+    // patch applied where the reviewer reads it.
+    let fixture = Fixture::new("offset");
+    let lib = fixture.copy().join("src/lib.rs");
+    let upstream = read(&lib);
+    let lines: Vec<&str> = upstream.split_inclusive('\n').collect();
+    let window = ["        }\n", "    }\n", "\n", "    cfg_if! {\n", "        if #[cfg(foo)] {\n"];
+    let starts: Vec<usize> = (0..lines.len() - window.len())
+        .filter(|&i| window.iter().enumerate().all(|(k, w)| lines[i + k] == *w))
+        .collect();
+    let [stated, actual, ..] = starts[..] else { panic!("the window repeats: {starts:?}") };
+    let insert =
+        ["    // LACTOSE patch: the reviewed change.\n", "    const _REVIEWED: () = ();\n"];
+    let mut copy = lines.clone();
+    for (k, line) in insert.iter().enumerate() {
+        copy.insert(actual + 2 + k, line);
+    }
+    write(&lib, &copy.concat());
+    let mut patch = format!(
+        "diff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n\
+         @@ -{0},5 +{0},7 @@\n",
+        stated + 1
+    );
+    let context = |lines: &[&str]| lines.iter().map(|l| format!(" {l}")).collect::<String>();
+    patch.push_str(&context(&window[..2]));
+    patch.extend(insert.iter().map(|l| format!("+{l}")));
+    patch.push_str(&context(&window[2..]));
+    write(&fixture.ws.join(format!("vendor/{}.patch", fixture.dir())), &patch);
+    let output = fixture.vendor();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let prefix = format!(
+        "vendor/{0}.patch: reverse-applies to vendor/{0} only away from where it says (",
+        fixture.dir()
+    );
+    assert!(stdout.lines().count() == 1 && stdout.starts_with(&prefix), "{}", text(&output));
+    assert!(stdout.contains("offset"), "{}", text(&output));
+    assert_eq!(output.status.code(), Some(FINDINGS), "{}", text(&output));
+}
+
+#[test]
+fn a_header_git_reads_otherwise_is_a_finding() {
+    // GNU diff separates a timestamp from the name with a space. git strips it and patches
+    // the manifest; a reading that keeps the date sees another file. git's reading decides.
+    let fixture = Fixture::patched("stamp");
+    let manifest = fixture.copy().join("Cargo.toml");
+    let old = read(&manifest);
+    let new = format!("{old}# LACTOSE patch: a change to the manifest.\n");
+    let stamp = "2026-10-11 00:00:00.000000000 +0000";
+    let stamped = unified("Cargo.toml", &old, &new)
+        .replacen("diff --git a/Cargo.toml b/Cargo.toml\n", "", 1)
+        .replacen("--- a/Cargo.toml\n", &format!("--- a/Cargo.toml {stamp}\n"), 1)
+        .replacen("+++ b/Cargo.toml\n", &format!("+++ b/Cargo.toml {stamp}\n"), 1);
+    write(&manifest, &new);
+    let patch = fixture.ws.join(format!("vendor/{}.patch", fixture.dir()));
+    write(&patch, &(read(&patch) + &stamped));
+    let dir = fixture.dir();
+    fixture.findings(&[
+        format!("vendor/{dir}.patch: git applies it to Cargo.toml, which the check does not read"),
+        format!(
+            "vendor/{dir}.patch: the check reads a change to Cargo.toml {stamp}, which git does \
+             not apply"
+        ),
+        format!("vendor/{dir}.patch: names Cargo.toml, which a patch never touches"),
+    ]);
+}
+
+#[test]
+#[cfg(unix)]
+fn a_cargo_configuration_committed_as_a_link_is_a_finding() {
+    let fixture = Fixture::patched("link");
+    write(&fixture.ws.join("tools/settings.txt"), "[term]\nverbose = false\n");
+    fs::create_dir_all(fixture.ws.join(".cargo")).expect(".cargo/ made");
+    std::os::unix::fs::symlink("../tools/settings.txt", fixture.ws.join(".cargo/config"))
+        .expect("a link");
+    fixture.findings(&[".cargo/config: is a symbolic link; cargo follows it, which no check \
+                        does, so a cargo configuration file or directory is committed as itself"
+        .to_owned()]);
+}
+
+#[test]
+fn an_included_cargo_configuration_is_a_finding() {
+    let fixture = Fixture::patched("include");
+    write(&fixture.ws.join("tools/settings.toml"), "[term]\nverbose = false\n");
+    write(&fixture.ws.join(".cargo/config.toml"), "include = [\"../tools/settings.toml\"]\n");
+    fixture.findings(&[".cargo/config.toml: has an include key; cargo reads the included \
+                        files, which no check does"
+        .to_owned()]);
+}
+
+#[test]
+fn a_patch_source_passed_on_a_command_line_is_a_finding() {
+    let fixture = Fixture::patched("alias");
+    write(&fixture.ws.join("tools/ship.toml"), "[patch.crates-io]\n");
+    write(
+        &fixture.ws.join(".cargo/config.toml"),
+        "[alias]\nship = [\"build\", \"--config\", \"tools/ship.toml\"]\n",
+    );
+    write(
+        &fixture.ws.join(".github/workflows/ship.yml"),
+        "jobs:\n  ship:\n    steps:\n      - run: cargo build --config \
+         'patch.crates-io.cfg-if.path=\"elsewhere\"'\n",
+    );
+    write(&fixture.ws.join("tools/ship.sh"), "#!/bin/sh\nCARGO_HOME=/opt/cargo cargo build\n");
+    fixture.findings(&[
+        ".cargo/config.toml: alias ship passes --config or -Z, through which a [patch], \
+         [source] or paths setting reaches cargo unseen"
+            .to_owned(),
+        ".github/workflows/ship.yml: line 4: passes --config naming patch, source or paths; a \
+         patch lives in the root Cargo.toml only"
+            .to_owned(),
+        "tools/ship.sh: line 2: sets CARGO_HOME, whose cargo configuration no check reads"
+            .to_owned(),
+    ]);
+}
+
+#[test]
+fn a_patch_adding_code_outside_the_safe_language_is_a_finding() {
+    let fixture = Fixture::new("attributes");
+    let change = fixture.lib_with(
+        "// LACTOSE patch: no.\n#[no_mangle]\npub extern \"C\" fn one() {}\n\
+         #[export_name = \"two\"]\npub extern \"C\" fn two() {}\n\
+         #[cfg_attr(unix, link_section = \".probe\")]\npub static PROBE: u8 = 0;\n\
+         core::arch::global_asm!(\"\");\n",
+    );
+    fixture.patch(&[change]);
+    // Line 8 is the notice: four header lines, then three of context.
+    let dir = fixture.dir();
+    fixture.findings(&[
+        format!("vendor/{dir}.patch: adds no_mangle at line 9"),
+        format!("vendor/{dir}.patch: adds export_name at line 11"),
+        format!("vendor/{dir}.patch: adds link_section at line 13"),
+        format!("vendor/{dir}.patch: adds global_asm at line 15"),
+    ]);
+}
+
+#[test]
+fn a_stray_file_under_vendor_and_a_patch_including_it_are_findings() {
+    let fixture = Fixture::new("stray");
+    write(&fixture.ws.join("vendor/payload.rs"), "pub const PAYLOAD: u8 = 7;\n");
+    let change = fixture.lib_with("// LACTOSE patch: one line.\ninclude!(\"../../payload.rs\");\n");
+    fixture.patch(&[change]);
+    let dir = fixture.dir();
+    fixture.findings(&[
+        "vendor/payload.rs: neither a copy, its patch nor README.md; nothing else lives under \
+         vendor/"
+            .to_owned(),
+        format!("vendor/{dir}.patch: adds include! at line 9"),
+    ]);
+}
+
+#[test]
+fn an_added_line_over_two_hundred_characters_is_a_finding() {
+    let fixture = Fixture::new("long");
+    let body: String =
+        (0..20).map(|i| format!("pub fn f{i}(x: u64) -> u64 {{ x * {i} }} ")).collect();
+    let change = fixture.lib_with(&format!("// LACTOSE patch: one long line.\n{body}\n"));
+    fixture.patch(&[change]);
+    fixture.findings(&[format!(
+        "vendor/{}.patch: line 9 adds {} characters, over the 200 an added line may hold",
+        fixture.dir(),
+        body.chars().count()
     )]);
 }

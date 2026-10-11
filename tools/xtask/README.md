@@ -71,6 +71,9 @@ file is held to the rules wherever it is fetched from.
   no workflow, script or cargo configuration names `RUSTFLAGS` or sets a target CPU or
   target feature (`target_cpu` and `target-cpu` are the same to rustc and to this check).
   Whole-line `#` comments are skipped; a trailing comment is scanned.
+- No cargo configuration file has an `include` key, and no `.cargo` directory or cargo
+  configuration file is a symbolic link: cargo would read through either what no check
+  reads. `vendor` refuses both through the same function.
 
 The scanner reads source text. It does not expand macros, so an attribute a macro writes is
 not seen.
@@ -95,22 +98,37 @@ finding.
 
 - Every `[patch.crates-io]` entry of the root manifest names `vendor/<name>-<version>`; no
   other `[patch]` table exists, and no cargo configuration file sets `[patch]`, `[source]`
-  or `paths`. Every resolved package with no source that is not a member lives at
+  or `paths`. No cargo configuration file has an `include` key, and no `.cargo` directory or
+  cargo configuration file is a symbolic link. No config alias passes `--config` or `-Z`,
+  and no workflow, script or cargo configuration file passes `--config` naming `patch`,
+  `source` or `paths` or sets `CARGO_HOME`. Every resolved package with no source that is not a member lives at
   `vendor/<name>-<version>/` and is named by such an entry; every directory under `vendor/`
-  is such a package, holds that name and version, and the name resolves at no other version.
+  is such a package, holds that name and version, and the name resolves at no other version
+  with every feature on. Nothing else lives directly under `vendor/` but those directories,
+  their patches and `README.md`.
 - Each directory holds the `.cargo-checksum.json` that `cargo vendor --versioned-dirs`
   writes, `.gitattributes` marks `vendor/**` `-text`, and `vendor/<name>-<version>.patch`
-  beside it is a unified diff of at most fifty changed lines, comments included, that never
-  names `Cargo.toml`, `Cargo.toml.orig`, `Cargo.lock` or `.cargo_vcs_info.json`, adds no
-  `unsafe`, and marks every file it changes with a `LACTOSE patch:` comment.
+  beside it is a unified diff of at most fifty changed lines, comments included, and no
+  added line over 200 characters, that never names `Cargo.toml`, `Cargo.toml.orig`,
+  `Cargo.lock` or `.cargo_vcs_info.json`, and marks every file it changes with a `LACTOSE
+  patch:` comment. Its added lines hold none of `unsafe`, `no_mangle`, `export_name`,
+  `link_section`, `link_name`, `global_asm`, `asm!`, `naked`, `include!`, `include_str!`,
+  `include_bytes!` or a `#[path` attribute. The files and the counts are git's
+  (`git apply --numstat -z`), and the check's own reading must agree with git's file by
+  file.
 - Reversing the patch on a copy under `target/vendor/` gives exactly the files and sha256
-  hashes the record holds: nothing changed, added or missing.
+  hashes the record holds: nothing changed, added or missing. Applying it forward to that
+  tree gives the copy byte for byte. Each hunk must apply where it says, in both
+  directions: git placing one at an offset or with fuzz is a finding.
 - `vendor/README.md` has a section per directory and none for a directory that is gone.
 - Online, over a manifest under `target/vendor/upstream/` that pins each upstream version as
   the root `[workspace.dependencies]` entry does: `cargo vendor` re-derives each record and
   it must equal the committed one, and `cargo deny check advisories` reports nothing;
   `cargo-deny` skips a path source, so the workspace run cannot see these. This step
   resolves the shadow's lock without `--locked`; `--offline` passes through to both.
+
+The token scan reads the patch's added lines only. It cannot see unsafe code reached through
+a macro the crate already has, or through a build script's output; review covers those.
 
 ## SOUR
 

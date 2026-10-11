@@ -2103,10 +2103,13 @@ for every crate, checked by `cargo xtask vendor`** (§8.2, §8.3, §9.1, §16, �
     and is reviewed as a determinism review, like a new allowlist name; elsewhere it fixes a
     defect that blocks a milestone criterion; never a feature. A crate is patched at one
     version only, and no `[patch]`, `[source]` or `paths` setting lives anywhere but the root
-    manifest, since cargo honours one in `.cargo/config.toml` silently.
-  - *Fifty changed lines, comments included; never the manifest records; a build script if
-    it must; no `unsafe`; a notice on every change.* The cap the lane brief used; it
-    separates a fix from a fork. The sign of zero in SIMD `min` and `max` (about 26 sites
+    manifest, since cargo honours one in `.cargo/config.toml` silently. No cargo configuration
+    file has an `include` key and none, nor a `.cargo` directory, is a symbolic link, since
+    cargo reads through either what no check reads; `cargo xtask boundary` refuses both too.
+  - *Fifty changed lines, comments included, none over 200 characters; never the manifest
+    records; a build script if it must; no `unsafe`; a notice on every change.* The cap the
+    lane brief used; it separates a fix from a fork, and the line length keeps one line from
+    carrying what fifty may not. The sign of zero in SIMD `min` and `max` (about 26 sites
     over rapier, parry, simba and wide) is what it excludes, and that stays a verification
     item for SOUR's architecture mode, not a patch. `Cargo.toml`, `Cargo.toml.orig`,
     `Cargo.lock` and `.cargo_vcs_info.json` stay upstream's so the version, features,
@@ -2115,6 +2118,16 @@ for every crate, checked by `cargo xtask vendor`** (§8.2, §8.3, §9.1, §16, �
     such a patch is reviewed as a change to what every target compiles. The `LACTOSE patch:`
     comment is the notice Apache-2.0 section 4(b) asks of a modified file, and counting it
     keeps the cap the diff's line count.
+  - *git reads the patch; a token scan reads tokens.* The files a patch touches and its line
+    counts are `git apply --numstat`'s, and the check's own reading must agree with git's
+    file by file; a hunk git places at an offset or with fuzz is refused in both directions,
+    and the record with the patch applied forward must equal the copy byte for byte, so the
+    change the copy carries is the diff the reviewer read. Added lines may not hold
+    `unsafe`, `no_mangle`, `export_name`, `link_section`, `link_name`, `global_asm`, `asm!`,
+    `naked`, `include!`, `include_str!`, `include_bytes!` or a `#[path` attribute, and
+    nothing lives directly under `vendor/` but the copies, their patches and `README.md`. A
+    token scan cannot see unsafe code reached through macros the crate already has, or
+    through a build script's output; review is what covers those.
   - *The record is what `cargo vendor` writes plus a patch file, and the check re-derives
     it.* `.cargo-checksum.json` carries every upstream file's sha256 and the archive's, in
     the format cargo itself reads; the patch is a unified diff `git apply` consumes. Offline
