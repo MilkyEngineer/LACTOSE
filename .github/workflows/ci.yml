@@ -35,10 +35,9 @@ env:
 #   links almost nothing, as in its late one, which links the test binaries: the time is
 #   rustc's on this runner, not the linker's. lld-link (.cargo/config.toml) takes the part that
 #   is the linker's. Its first run rebuilds every dependency, since the linker is part of each
-#   unit's fingerprint: an estimated 2 to 3 minutes more, which may time out; cache-on-failure
-#   saves what it built, so the run after it is warm. Due now, as its own lane: one
-#   integration-test binary per crate. lactose-ecs's 22 built as one took 5.2 s instead of 14
-#   on an M1 at -j4.
+#   unit's fingerprint: an estimated 2 to 3 minutes more, which may time out (see the cache
+#   note below). Due now, as its own lane: one integration-test binary per crate.
+#   lactose-ecs's 22 built as one took 5.2 s instead of 14 on an M1 at -j4.
 # - windows-lint-release, an estimated 3.5 to 4 warm and 6 to 8 cold: setup 0.7 plus the cache
 #   restore and save, clippy 1.0 warm (4 to 6 cold), the release golden vectors 1.3.
 # - check (ubuntu-latest), 6.4-6.9 in runs 38126112367 and 38126882535: setup 0.3, clippy
@@ -50,8 +49,12 @@ env:
 #
 # rust-cache keys every cache by job ID (its default add-job-id-key), so each job restores and
 # saves only its own. No job here may set `shared-key`, which drops the job ID: the Windows
-# jobs would then restore and overwrite each other's cache. cache-on-failure on check and
-# windows-lint-release saves the dependencies a timed-out cold run built.
+# jobs would then restore and overwrite each other's cache. check and windows-lint-release set
+# cache-on-failure, so a cold run that times out late in its build still saves its dependencies.
+# But rust-cache saves only when its key missed, so a run on a new key that fails or is
+# cancelled before its build finishes leaves a partial entry that later runs restore and never
+# replace, until Cargo.lock, a manifest, .cargo/config.toml or the toolchain changes. Recovery:
+# `gh cache list --key v0-rust-check-Windows`, then `gh cache delete <key>`.
 jobs:
   check:
     name: check (${{ matrix.os }})
