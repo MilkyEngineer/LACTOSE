@@ -52,13 +52,14 @@ fn the_conformance_run_passes_with_the_test_backend() {
     assert_eq!(reference.physics_hash.0, reference.physics_hash.1);
 
     // The resumed run told the backend exactly what the first run did after the snapshot.
+    // The first marker is `setup`'s snapshot of the empty world, before any other call.
     let markers: Vec<usize> = calls
         .iter()
         .enumerate()
         .filter(|(_, call)| matches!(call, Call::Snapshot | Call::Restore))
         .map(|(index, _)| index)
         .collect();
-    let [taken, first_end, restored, resumed_end] = markers[..] else { panic!("{markers:?}") };
+    let [0, taken, first_end, restored, resumed_end] = markers[..] else { panic!("{markers:?}") };
     assert_eq!(calls[restored], Call::Restore);
     let first = between(&calls, taken, first_end);
     let resumed = between(&calls, restored, resumed_end);

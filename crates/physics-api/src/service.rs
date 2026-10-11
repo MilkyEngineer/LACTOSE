@@ -52,6 +52,7 @@ impl Default for PhysicsConfig {
 /// is told from a rewrite of the same one.
 #[derive(Clone, Copy)]
 pub(crate) struct JointEntry {
+    pub(crate) handle: JointHandle,
     pub(crate) joint: Joint,
     pub(crate) body_a: StableKey,
     pub(crate) body_b: StableKey,
@@ -100,9 +101,11 @@ pub(crate) struct SyncState {
     /// a snapshot found in the channel, not yet taken.
     pub(crate) pending_commands: Vec<PhysicsCommand>,
     /// Whether the next sync diffs every row against `bodies` and `joints` instead of
-    /// reading the log: set in a snapshot taken while the cursor or the mark was stale (a
-    /// world restore without a physics restore, a whole-world load, `set_tick`, the stamp
-    /// rebase). A stale cursor or mark at the sync itself has the same effect.
+    /// reading the log: set by a sync that emptied the solver, so the next one creates in
+    /// key order as a fresh process's first sync does, and in a snapshot taken while the
+    /// cursor or the mark was stale (a world restore without a physics restore, a
+    /// whole-world load, `set_tick`, the stamp rebase). A stale cursor or mark at the sync
+    /// itself has the same effect.
     pub(crate) diff_all: bool,
 }
 
@@ -142,11 +145,16 @@ pub struct Physics {
     pub(crate) commands: Vec<PhysicsCommand>,
     /// The step's lists, kept between ticks for their capacity; what the write-back writes.
     pub(crate) output: StepOutput,
+    /// The backend's bytes at [`setup`], before it held anything: what a solver the sync
+    /// empties is restored to, so that an empty solver is a fresh one (D124).
+    pub(crate) fresh: Vec<u8>,
 }
 
 impl Physics {
-    pub(crate) fn new(backend: Box<dyn PhysicsBackend>, config: PhysicsConfig) -> Self {
-        Self {
+    pub(crate) fn new(backend: Box<dyn PhysicsBackend>, config: PhysicsConfig) -> Result<Self> {
+        let mut fresh = Vec::new();
+        backend.snapshot(&mut fresh)?;
+        Ok(Self {
             backend,
             config,
             identity: Arc::new(()),
@@ -156,7 +164,8 @@ impl Physics {
             tick: Tick(0),
             commands: Vec::new(),
             output: StepOutput::default(),
-        }
+            fresh,
+        })
     }
 
     /// What `app` decided.
@@ -258,8 +267,10 @@ pub fn register_types(types: &mut TypeTable) -> Result<()> {
 /// Inserts the [`Physics`] resource holding `backend`, which `app` built with the solver
 /// pool outside the boundary, into `world`: the setup function of architecture section
 /// 16, called from a `SimulationBuilder::setup` closure beside
-/// [`register_systems`](crate::register_systems) in `SimulationBuilder::systems`. Fails
-/// with `InvalidData` if the world already holds one.
+/// [`register_systems`](crate::register_systems) in `SimulationBuilder::systems`. It
+/// keeps the backend's [`snapshot`](PhysicsBackend::snapshot) of its empty world, which
+/// the sync restores whenever it empties the solver (`README.md`, "Bodies"). Fails with
+/// `InvalidData` if the world already holds one, or as that snapshot does.
 pub fn setup(
     world: &mut World,
     backend: Box<dyn PhysicsBackend>,
@@ -268,7 +279,7 @@ pub fn setup(
     if world.service::<Physics>().is_some() {
         return Err(Error::new(ErrorKind::InvalidData, "the world already holds a `Physics`"));
     }
-    world.insert_service::<Physics>(Box::new(Physics::new(backend, config)));
+    world.insert_service::<Physics>(Box::new(Physics::new(backend, config)?));
     Ok(())
 }
 

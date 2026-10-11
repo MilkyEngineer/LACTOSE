@@ -201,6 +201,9 @@ pub trait PhysicsBackend: Send + Sync + 'static {
     /// bytes rebuilds a world that steps on identically. The bytes are a function of the
     /// state; whether they are stable enough to hash across equal states reached by
     /// different operation orders is a milestone 1 verification item, not a contract.
+    /// [`setup`](crate::setup) takes the bytes of the empty world once, and the sync
+    /// restores them whenever it has removed every body, so the empty world's bytes must
+    /// restore to a world that steps as a newly built one does.
     fn snapshot(&self, out: &mut Vec<u8>) -> Result<()>;
 
     /// Replaces the whole physics world with one taken by [`snapshot`](Self::snapshot) of

@@ -22,6 +22,10 @@ lactose-sim.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+# The reload tests load a region from its export as a save's bundle does (`World::load_region`
+# through `lactose-sim`'s frame): an empty baseline and an overlay of the rows.
+lactose-asset-api.workspace = true
+lactose-bundle.workspace = true
 # The SOUR test builds its executor the way a SOUR test does (`ChaosConfig`); a
 # dev-dependency, so the boundary allowlist is untouched and the library names nothing of
 # `task` (as in `lactose-sim`).

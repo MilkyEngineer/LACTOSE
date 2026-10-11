@@ -92,8 +92,9 @@ fn collect_changes(world: &World, mark: ChangeMark, rows: &mut Vec<(StableKey, C
 impl Physics {
     /// The sync (`README.md`, "The tick", step 2).
     pub(crate) fn sync(&mut self, world: &mut World) {
-        let Physics { backend, sync, cursor, mark, tick, commands, .. } = self;
+        let Physics { backend, sync, cursor, mark, tick, commands, fresh, .. } = self;
         *tick = world.tick();
+        let held = !sync.bodies.is_empty();
         // The log since the cursor, or nothing when a full diff is due.
         let incremental = match (*cursor, *mark) {
             (Some(mut cursor), Some(mark)) if world.is_current(mark) && !sync.diff_all => world
@@ -102,6 +103,15 @@ impl Physics {
                 .map(|entries| (entries.map(|entry| entry.change).collect::<Vec<_>>(), mark)),
             _ => None,
         };
+        // Every body the solver held despawned, the pending entries a restore carried
+        // included: the world was reloaded or rebuilt, in one frame if the rows are back.
+        // The log alone shows it, since a row unloaded and loaded again is `Despawned` then
+        // `Spawned` and the solver would otherwise keep its whole state (D124).
+        let reload = held
+            && incremental.as_ref().is_some_and(|(log, _)| {
+                let pending = sync.pending_log.iter().map(|entry| entry.change);
+                despawns_every_body(&sync.bodies, pending.chain(log.iter().copied()))
+            });
         let mut pass = Pass {
             world: &mut *world,
             sync: &mut *sync,
@@ -110,9 +120,12 @@ impl Physics {
             pushed_body: BTreeSet::new(),
             pushed_collider: BTreeSet::new(),
         };
+        if reload {
+            pass.empty(fresh);
+        }
         pass.modes();
         match incremental {
-            Some((log, mark)) => {
+            Some((log, mark)) if !reload => {
                 let pending = mem::take(&mut pass.sync.pending_log);
                 for change in pending.iter().map(|entry| entry.change).chain(log) {
                     pass.log_entry(change);
@@ -133,12 +146,19 @@ impl Physics {
                     pass.changed(key, changes);
                 }
             }
-            None => pass.full_diff(),
+            _ => pass.full_diff(),
         }
         pass.retry_waiting_joints();
         pass.refresh_aliases();
         pass.take_commands(commands);
-        sync.diff_all = false;
+        // Removals that left the solver empty (a world unloaded a frame before it is
+        // loaded): the solver is made fresh now, and the next sync creates whatever is
+        // loaded by a full diff, in key order, as a fresh process's first sync does.
+        let emptied = held && pass.sync.bodies.is_empty();
+        if emptied && !reload {
+            pass.empty(fresh);
+        }
+        sync.diff_all = emptied;
         *cursor = Some(world.structural_log().cursor());
         *mark = Some(world.mark());
     }
@@ -237,6 +257,20 @@ impl Physics {
     }
 }
 
+/// Whether `changes` despawn every key of `bodies`.
+fn despawns_every_body(
+    bodies: &BTreeMap<StableKey, BodyHandle>,
+    changes: impl Iterator<Item = StructuralChange>,
+) -> bool {
+    let despawned: BTreeSet<StableKey> = changes
+        .filter_map(|change| match change {
+            StructuralChange::Despawned { key, .. } if bodies.contains_key(&key) => Some(key),
+            _ => None,
+        })
+        .collect();
+    despawned.len() == bodies.len()
+}
+
 /// Writes a component the sync or the write-back maintains; the row exists, so a failure
 /// is a broken invariant of the world's, logged rather than raised inside a system.
 fn insert<T: lactose_reflect::Component>(world: &mut World, key: StableKey, value: T) {
@@ -291,7 +325,12 @@ impl Pass<'_> {
     /// One structural log entry, read against the rows as they are now.
     fn log_entry(&mut self, change: StructuralChange) {
         match change {
-            StructuralChange::Spawned { key, .. } | StructuralChange::Despawned { key, .. } => {
+            StructuralChange::Spawned { key, .. } => {
+                self.body(key, None);
+                self.joint(key);
+                self.handles(key);
+            }
+            StructuralChange::Despawned { key, .. } => {
                 self.body(key, None);
                 self.joint(key);
             }
@@ -352,8 +391,41 @@ impl Pass<'_> {
         }
     }
 
+    /// The handle rows of a key the bookkeeping holds, written again where its row lacks
+    /// them: a row spawned while the solver kept its body or joint (a region unloaded and
+    /// loaded in one frame) carries none, and the columns mirror the bookkeeping.
+    fn handles(&mut self, key: StableKey) {
+        if let Some(&handle) = self.sync.bodies.get(&key)
+            && self.world.get::<BodyHandle>(key) != Some(&handle)
+        {
+            insert(self.world, key, handle);
+        }
+        if let Some(&JointEntry { handle, .. }) = self.sync.joints.get(&key)
+            && self.world.get::<JointHandle>(key) != Some(&handle)
+        {
+            insert(self.world, key, handle);
+        }
+    }
+
+    /// Removes every body, which leaves every joint waiting, and restores the backend's
+    /// bytes from `setup`: the solver is then a fresh one, and nothing the sync remembers
+    /// of the old one survives (D124).
+    fn empty(&mut self, fresh: &[u8]) {
+        let keys: Vec<StableKey> = self.sync.bodies.keys().copied().collect();
+        for key in keys {
+            self.remove(key);
+        }
+        if let Err(error) = self.backend.restore(fresh) {
+            // The backend's own bytes of its empty world: refusing them breaks its
+            // obligations. The solver is empty all the same, only not fresh.
+            tracing::warn!(target: "physics", %error, "the backend refused its empty world");
+        }
+        self.sync.written.clear();
+    }
+
     /// Every row against the bookkeeping, in ascending key order, when the cursor or the
-    /// mark is stale: never a cleared solver.
+    /// mark is stale or the solver was emptied; it clears nothing itself, so sleep and warm
+    /// starts survive wherever the rows agree.
     fn full_diff(&mut self) {
         self.sync.pending_log.clear();
         self.sync.pending_keys.clear();
@@ -609,7 +681,7 @@ impl Pass<'_> {
         }
         match self.backend.create_joint(key, &joint, body_a, body_b) {
             Ok(handle) => {
-                self.sync.joints.insert(key, JointEntry { joint, body_a, body_b });
+                self.sync.joints.insert(key, JointEntry { handle, joint, body_a, body_b });
                 insert(self.world, key, handle);
             }
             Err(error) => tracing::warn!(
