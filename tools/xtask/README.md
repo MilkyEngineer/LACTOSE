@@ -99,9 +99,10 @@ finding.
 - Every `[patch.crates-io]` entry of the root manifest names `vendor/<name>-<version>`; no
   other `[patch]` table exists, and no cargo configuration file sets `[patch]`, `[source]`
   or `paths`. No cargo configuration file has an `include` key, and no `.cargo` directory or
-  cargo configuration file is a symbolic link. No config alias passes `--config` or `-Z`,
-  and no workflow, script or cargo configuration file passes `--config` naming `patch`,
-  `source` or `paths` or sets `CARGO_HOME`. Every resolved package with no source that is not a member lives at
+  cargo configuration file is a symbolic link or tracked by git beneath a directory the
+  file walk skips (`target/`, a nested checkout). No config alias passes `--config` or `-Z`,
+  no workflow or script passes `--config` at all, and none of them sets `CARGO_HOME`. Every
+  resolved package with no source that is not a member lives at
   `vendor/<name>-<version>/` and is named by such an entry; every directory under `vendor/`
   is such a package, holds that name and version, and the name resolves at no other version
   with every feature on. Nothing else lives directly under `vendor/` but those directories,
@@ -111,9 +112,13 @@ finding.
   beside it is a unified diff of at most fifty changed lines, comments included, and no
   added line over 200 characters, that never names `Cargo.toml`, `Cargo.toml.orig`,
   `Cargo.lock` or `.cargo_vcs_info.json`, and marks every file it changes with a `LACTOSE
-  patch:` comment. Its added lines hold none of `unsafe`, `no_mangle`, `export_name`,
-  `link_section`, `link_name`, `global_asm`, `asm!`, `naked`, `include!`, `include_str!`,
-  `include_bytes!` or a `#[path` attribute. The files and the counts are git's
+  patch:` comment. It never touches a file that holds `unsafe` before or after it, and
+  never creates a build script (`build.rs` or the manifest's `package.build`), though it
+  may change one. Its added lines hold none of `unsafe`, `no_mangle`, `export_name`,
+  `link_section`, `link_name`, `naked`, `asm`, `global_asm`, `naked_asm`, `include`,
+  `include_str` or `include_bytes` as a whole identifier, comments included, and each
+  hunk's added lines, read joined as written and with comments blanked, hold no `path`
+  attribute and no out-of-line `mod <name>;`. The files and the counts are git's
   (`git apply --numstat -z`), and the check's own reading must agree with git's file by
   file.
 - Reversing the patch on a copy under `target/vendor/` gives exactly the files and sha256
@@ -127,8 +132,9 @@ finding.
   `cargo-deny` skips a path source, so the workspace run cannot see these. This step
   resolves the shadow's lock without `--locked`; `--offline` passes through to both.
 
-The token scan reads the patch's added lines only. It cannot see unsafe code reached through
-a macro the crate already has, or through a build script's output; review covers those.
+The token scan reads the patch's added lines only, and a word in a comment counts, so a
+notice does not name them. It cannot see unsafe code reached through a macro the crate
+already has, or through a build script's output; review covers those.
 
 ## SOUR
 

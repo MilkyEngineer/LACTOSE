@@ -37,24 +37,33 @@ const README: &str = "vendor/README.md";
 const MAX_CHANGED_LINES: usize = 50;
 /// The characters an added line may hold (D123), so the line cap bounds the code too.
 const MAX_LINE_CHARS: usize = 200;
-/// What an added line may not hold, because each reaches unsafe code or code outside the
-/// diff without the `unsafe` token: unsafe attributes before edition 2024, assembly, and
-/// source pulled in from elsewhere. Matched as whole identifiers; a `!` is part of the
-/// token where it stands, and `#[path` is the `path` attribute.
+/// What an added line may not hold, as a whole identifier, because each reaches unsafe code
+/// or code outside the diff without the `unsafe` token: unsafe attributes before edition
+/// 2024, assembly, and source pulled in from elsewhere. A macro is refused by its name with
+/// or without the `!`, which a comment, a line break or a `use ... as` rename can separate
+/// from it. The `path` attribute and an out-of-line module span tokens and are found per
+/// hunk by [`structure`].
 const REFUSED_TOKENS: [&str; 12] = [
     "unsafe",
     "no_mangle",
     "export_name",
     "link_section",
     "link_name",
-    "global_asm",
-    "asm!",
     "naked",
-    "include!",
-    "include_str!",
-    "include_bytes!",
-    "#[path",
+    "asm",
+    "global_asm",
+    "naked_asm",
+    "include",
+    "include_str",
+    "include_bytes",
 ];
+/// The finding's name for a `path` attribute among a hunk's added lines.
+const PATH_ATTRIBUTE: &str = "a path attribute";
+/// The finding's name for an added `mod name;`, which compiles a file the patch need not
+/// show.
+const OUT_OF_LINE_MODULE: &str = "an out-of-line module";
+/// The build script cargo runs when the manifest names none.
+const BUILD_SCRIPT: &str = "build.rs";
 /// The text an added line of every file a patch changes holds: the notice Apache-2.0
 /// section 4(b) asks of a modified file.
 const NOTICE: &str = "LACTOSE patch:";
@@ -82,12 +91,15 @@ pub struct Repository {
     /// For each copy with a patch, what `git apply --numstat -z` prints for it, or why git
     /// refused it. git decides what a patch touches; the check's own reading must agree.
     pub numstat: BTreeMap<String, Result<String, String>>,
+    /// Every path git tracks (`git ls-files`), empty when `root` is not a repository's root.
+    pub tracked: Vec<String>,
 }
 
 impl Repository {
     /// Reads what the check needs from the repository at `root`, whose member manifests
-    /// (relative to `root`) are `members`, and has git read each patch in a directory under
-    /// `scratch`.
+    /// (relative to `root`) are `members`, has git read each patch in a directory under
+    /// `scratch`, reads each file a patch touches as the copy holds it, and lists what git
+    /// tracks.
     ///
     /// # Errors
     /// If a directory or a file that exists cannot be read, or git cannot be run.
@@ -103,6 +115,9 @@ impl Repository {
         }
         for link in all.links() {
             files.insert_link(link);
+        }
+        for dir in all.skipped() {
+            files.insert_skipped(dir);
         }
         let (mut entries, mut copies) = (Vec::new(), Vec::new());
         let vendor = root.join("vendor");
@@ -135,7 +150,9 @@ impl Repository {
             }
         }
         let mut numstat = BTreeMap::new();
-        for dir in copies.iter().filter(|d| files.contains(&format!("vendor/{d}.patch"))) {
+        let patched: Vec<&String> =
+            copies.iter().filter(|d| files.contains(&format!("vendor/{d}.patch"))).collect();
+        for dir in patched {
             let empty = scratch.join("numstat");
             remove(&empty)?;
             fs::create_dir_all(&empty).map_err(|e| format!("{}: {e}", empty.display()))?;
@@ -146,9 +163,21 @@ impl Repository {
             } else {
                 Err(first_line(&output))
             };
+            if let Ok(text) = &read {
+                for path in parse_numstat(text).iter().flat_map(|stat| &stat.paths) {
+                    let file = format!("vendor/{dir}/{path}");
+                    let on_disk = root.join(&file);
+                    if on_disk.is_file() {
+                        let bytes = fs::read(&on_disk)
+                            .map_err(|e| format!("{}: {e}", on_disk.display()))?;
+                        files.insert(file, bytes);
+                    }
+                }
+            }
             numstat.insert(dir.clone(), read);
         }
-        Ok(Self { files, members, entries, copies, numstat })
+        let tracked = tracked(root)?;
+        Ok(Self { files, members, entries, copies, numstat, tracked })
     }
 
     fn table(&self, path: &str) -> Option<Table> {
@@ -168,6 +197,40 @@ impl Repository {
     fn record(&self, dir: &str) -> Option<Record> {
         Record::parse(&self.files.text(&format!("vendor/{dir}/{RECORD}"))?)
     }
+
+    /// The paths, relative to the copy, of the build scripts cargo would run for it:
+    /// `build.rs`, and whatever `package.build` names.
+    fn build_scripts(&self, dir: &str) -> BTreeSet<String> {
+        let mut scripts = BTreeSet::from([BUILD_SCRIPT.to_owned()]);
+        let manifest = self.table(&format!("vendor/{dir}/Cargo.toml"));
+        let build = manifest.as_ref().and_then(|m| m.get("package")?.get("build"));
+        let named = match build {
+            Some(Value::String(path)) => vec![path.as_str()],
+            Some(Value::Array(paths)) => paths.iter().filter_map(Value::as_str).collect(),
+            _ => Vec::new(),
+        };
+        scripts.extend(named.into_iter().map(|path| path.trim_start_matches("./").to_owned()));
+        scripts
+    }
+}
+
+/// Every path git tracks in the repository whose root is `root`, or none when `root` is not
+/// one: the check is also run on fixtures that are not repositories.
+fn tracked(root: &Path) -> Result<Vec<String>, String> {
+    if !root.join(".git").exists() {
+        return Ok(Vec::new());
+    }
+    let output = Command::new("git")
+        .args(["-c", "core.quotepath=off", "ls-files", "-z"])
+        .current_dir(root)
+        .env("LC_ALL", "C")
+        .output()
+        .map_err(|e| format!("cannot run `git ls-files`: {e}"))?;
+    if !output.status.success() {
+        return Err(format!("`git ls-files` failed: {}", first_line(&output)));
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    Ok(text.split('\0').filter(|path| !path.is_empty()).map(str::to_owned).collect())
 }
 
 /// One `[patch.crates-io]` entry of the root manifest that names a directory under
@@ -279,6 +342,7 @@ fn patch_sources(repo: &Repository, root: &Table, findings: &mut Vec<Finding>) -
         }
     }
     findings.extend(unread_cargo_configuration(&repo.files));
+    findings.extend(tracked_unread(repo));
     for config in repo.files.paths().filter(|path| is_cargo_config(path)) {
         let Some(table) = repo.table(config) else { continue };
         let aliases = table.get("alias").and_then(Value::as_table).into_iter().flatten();
@@ -305,10 +369,35 @@ fn patch_sources(repo: &Repository, root: &Table, findings: &mut Vec<Finding>) -
     entries
 }
 
+/// Step 1 for a cargo configuration file or a `.cargo` directory that git tracks where the
+/// walk does not look (under `target/`, say): cargo reads it when it runs beneath, as a test
+/// fixture or a compile test does.
+fn tracked_unread(repo: &Repository) -> Vec<Finding> {
+    let skipped: Vec<&str> = repo.files.skipped().collect();
+    let mut findings = Vec::new();
+    for path in &repo.tracked {
+        let configuration = is_cargo_config(path) || path.split('/').any(|part| part == ".cargo");
+        let under = skipped
+            .iter()
+            .find(|dir| path.strip_prefix(**dir).is_some_and(|rest| rest.starts_with('/')));
+        if let (true, Some(dir)) = (configuration, under) {
+            findings.push(Finding::new(
+                path,
+                format!(
+                    "tracked under {dir}/, which no check reads; cargo reads a cargo \
+                     configuration file it runs beneath"
+                ),
+            ));
+        }
+    }
+    findings
+}
+
 /// Step 1 for the files that can decide how cargo is invoked, line by line as `cargo xtask
-/// boundary` reads them: a `--config` naming `patch`, `source` or `paths` sets them outside
-/// every file the check reads, and `CARGO_HOME` moves the configuration cargo reads last.
-/// Only whole-line `#` comments are skipped.
+/// boundary` reads them: a `--config` sets a `[patch]`, `[source]` or `paths` outside every
+/// file the check reads, by value or through a file it names, and `CARGO_HOME` moves the
+/// configuration cargo reads last. A cargo configuration file passes `--config` only in an
+/// alias, which step 1 reads as such. Only whole-line `#` comments are skipped.
 fn command_lines(repo: &Repository, findings: &mut Vec<Finding>) {
     for path in repo.files.paths().filter(|path| is_build_configuration(path)) {
         let text = repo.files.text(path).unwrap_or_default();
@@ -316,13 +405,12 @@ fn command_lines(repo: &Repository, findings: &mut Vec<Finding>) {
             if line.trim_start().starts_with('#') {
                 continue;
             }
-            let names = ["patch", "source", "paths"].iter().any(|key| holds_token(line, key));
-            if line.contains("--config") && names {
+            if line.contains("--config") && !is_cargo_config(path) {
                 findings.push(Finding::new(
                     path,
                     format!(
-                        "line {}: passes --config naming patch, source or paths; a patch lives \
-                         in the root Cargo.toml only",
+                        "line {}: passes --config, through which a [patch], [source] or paths \
+                         setting reaches cargo unseen",
                         index + 1
                     ),
                 ));
@@ -614,11 +702,39 @@ fn patch_rule(repo: &Repository, dir: &str, findings: &mut Vec<Finding>) {
             format!("{changed} changed lines, over the fifty of architecture section 8.2"),
         ));
     }
-    for file in named {
+    for file in &named {
         let name = file.rsplit('/').next().unwrap_or(file);
         if UNTOUCHABLE.contains(&name) {
             findings
                 .push(Finding::new(&path, format!("names {file}, which a patch never touches")));
+        }
+    }
+    // The file before the patch is the copy's file and the lines the patch removes.
+    let mut holds_unsafe: BTreeSet<&str> = BTreeSet::new();
+    for file in &named {
+        let text = repo.files.text(&format!("vendor/{dir}/{file}"));
+        if text.is_some_and(|text| holds_token(&text, "unsafe")) {
+            holds_unsafe.insert(file);
+        }
+    }
+    holds_unsafe.extend(patch.files.iter().filter(|f| f.removes_unsafe).map(PatchedFile::name));
+    for file in holds_unsafe {
+        findings.push(Finding::new(
+            &path,
+            format!("touches {file}, which holds unsafe; a patch never touches a file that does"),
+        ));
+    }
+    if let Some(record) = repo.record(dir) {
+        let scripts = repo.build_scripts(dir);
+        let created = stats.iter().filter_map(|stat| stat.paths.last());
+        let created: BTreeSet<&String> = created
+            .filter(|target| scripts.contains(*target) && !record.files.contains_key(*target))
+            .collect();
+        for script in created {
+            findings.push(Finding::new(
+                &path,
+                format!("creates {script}, a build script; a patch may change one, never add one"),
+            ));
         }
     }
     for (line, token) in patch.files.iter().flat_map(|f| &f.refused) {
@@ -691,12 +807,15 @@ struct PatchedFile {
     added: usize,
     /// The lines it removes.
     removed: usize,
-    /// The patch's line numbers, from 1, of added lines that hold a refused token, with it.
+    /// The patch's line numbers, from 1, of added lines that hold a refused token, with it,
+    /// in line order.
     refused: Vec<(usize, &'static str)>,
     /// The patch's line numbers of added lines over the length cap, with their length.
     long: Vec<(usize, usize)>,
     /// Whether an added line holds the notice.
     notice: bool,
+    /// Whether a removed line holds `unsafe`.
+    removes_unsafe: bool,
 }
 
 impl PatchedFile {
@@ -764,6 +883,7 @@ impl Patch {
                     .ok_or_else(|| format!("the hunk at line {number} has no file header"))?;
                 let (mut old, mut new) = hunk_lengths(line)
                     .ok_or_else(|| format!("line {number} is not a hunk header"))?;
+                let mut added_lines: Vec<(usize, &str)> = Vec::new();
                 while old > 0 || new > 0 {
                     let cut = || format!("the hunk at line {number} is cut short");
                     let body = lines.get(at).ok_or_else(cut)?;
@@ -776,12 +896,14 @@ impl Patch {
                         Some(b'-') if old > 0 => {
                             old -= 1;
                             file.removed += 1;
+                            file.removes_unsafe |= holds_token(&body[1..], "unsafe");
                         }
                         Some(b'+') if new > 0 => {
                             new -= 1;
                             file.added += 1;
                             let added = &body[1..];
-                            for token in REFUSED_TOKENS.iter().filter(|t| refuses(added, t)) {
+                            added_lines.push((at + 1, added));
+                            for token in REFUSED_TOKENS.iter().filter(|t| holds_token(added, t)) {
                                 file.refused.push((at + 1, token));
                             }
                             let chars = added.trim_end_matches('\r').chars().count();
@@ -795,6 +917,8 @@ impl Patch {
                     }
                     at += 1;
                 }
+                file.refused.extend(structure(&added_lines));
+                file.refused.sort_by_key(|(line, _)| *line);
                 file.hunks += 1;
             } else if line.starts_with("GIT binary patch")
                 || (line.starts_with("Binary files ") && line.ends_with(" differ"))
@@ -907,18 +1031,186 @@ fn identifiers<'a>(line: &'a str, token: &'a str) -> impl Iterator<Item = &'a st
     })
 }
 
-/// Whether an added line holds one of [`REFUSED_TOKENS`]: the identifier, followed by `!`
-/// for a macro, or for `#[path` a `path =` in an attribute.
-fn refuses(line: &str, token: &str) -> bool {
-    if token == "#[path" {
-        let attribute = line.contains("#[") || line.contains("#!");
-        return attribute
-            && identifiers(line, "path").any(|rest| rest.trim_start().starts_with('='));
+/// The `path` attributes and out-of-line modules among one hunk's added lines, each at the
+/// patch line where it starts. Either can span lines, so the hunk's added lines are read
+/// joined, once as written and once with comments blanked, since a comment can sit inside
+/// an attribute; a comment or a literal left open within the added lines is read as text, so
+/// one closed by a context line hides nothing. Either reading's find is refused, so a
+/// commented-out declaration is refused as well.
+fn structure(added: &[(usize, &str)]) -> Vec<(usize, &'static str)> {
+    let mut joined = String::new();
+    let mut starts = Vec::new();
+    for (_, line) in added {
+        starts.push(joined.len());
+        joined.push_str(line);
+        joined.push('\n');
     }
-    match token.strip_suffix('!') {
-        Some(name) => identifiers(line, name).any(|rest| rest.trim_start().starts_with('!')),
-        None => holds_token(line, token),
+    let line_at = |offset: usize| added[starts.partition_point(|s| *s <= offset) - 1].0;
+    let mut found = BTreeSet::new();
+    for text in [joined.clone(), blank_comments(&joined)] {
+        for at in path_attributes(&text) {
+            found.insert((line_at(at), PATH_ATTRIBUTE));
+        }
+        for at in out_of_line_modules(&text) {
+            found.insert((line_at(at), OUT_OF_LINE_MODULE));
+        }
     }
+    found.into_iter().collect()
+}
+
+/// The offsets of each `#`, optionally `!`, then `[` whose attribute holds `path =`.
+fn path_attributes(text: &str) -> Vec<usize> {
+    let bytes = text.as_bytes();
+    let skip_space = |mut at: usize| {
+        while bytes.get(at).is_some_and(u8::is_ascii_whitespace) {
+            at += 1;
+        }
+        at
+    };
+    let mut found = Vec::new();
+    for (hash, _) in text.match_indices('#') {
+        let mut at = skip_space(hash + 1);
+        if bytes.get(at) == Some(&b'!') {
+            at = skip_space(at + 1);
+        }
+        if bytes.get(at) != Some(&b'[') {
+            continue;
+        }
+        let mut depth = 0_usize;
+        let mut end = text.len();
+        for (offset, byte) in bytes.iter().enumerate().skip(at) {
+            match byte {
+                b'[' => depth += 1,
+                b']' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = offset;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let attribute = &text[at..end];
+        if identifiers(attribute, "path").any(|rest| rest.trim_start().starts_with('=')) {
+            found.push(hash);
+        }
+    }
+    found
+}
+
+/// The offsets of each `mod <name>;`.
+fn out_of_line_modules(text: &str) -> Vec<usize> {
+    let word = |c: char| c.is_alphanumeric() || c == '_' || c == '#';
+    let mut found = Vec::new();
+    for (at, _) in text.match_indices("mod") {
+        let before = text[..at].chars().next_back();
+        let rest = &text[at + 3..];
+        if before.is_some_and(|c| c.is_alphanumeric() || c == '_')
+            || !rest.starts_with(char::is_whitespace)
+        {
+            continue;
+        }
+        let rest = rest.trim_start();
+        let name = rest.len() - rest.trim_start_matches(word).len();
+        if name > 0 && rest[name..].trim_start().starts_with(';') {
+            found.push(at);
+        }
+    }
+    found
+}
+
+/// `text` with every comment that closes within it replaced by spaces, byte for byte, so
+/// offsets stay put. String, raw string and character literals are skipped over when they
+/// close within `text`; an opener that does not close is read as plain text.
+fn blank_comments(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = bytes.to_vec();
+    let mut at = 0;
+    while at < bytes.len() {
+        let rest = &bytes[at..];
+        let end = if rest.starts_with(b"//") {
+            let end = rest.iter().position(|b| *b == b'\n').map_or(bytes.len(), |n| at + n);
+            out[at..end].fill(b' ');
+            Some(end)
+        } else if rest.starts_with(b"/*") {
+            block_comment_end(bytes, at).inspect(|end| out[at..*end].fill(b' '))
+        } else if rest[0] == b'"' {
+            string_end(bytes, at + 1)
+        } else if rest[0] == b'r'
+            && !bytes[..at].last().is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'_')
+        {
+            raw_string_end(bytes, at + 1)
+        } else if rest[0] == b'\'' {
+            char_end(text, at + 1)
+        } else {
+            None
+        };
+        at = end.unwrap_or(at + 1);
+    }
+    // A comment starts and ends at ASCII bytes and is blanked whole, so the text stays UTF-8.
+    String::from_utf8(out).unwrap_or_else(|_| text.to_owned())
+}
+
+/// The offset after the `*/` that closes the block comment opening at `at`, comments
+/// nesting as Rust's do.
+fn block_comment_end(bytes: &[u8], at: usize) -> Option<usize> {
+    let mut depth = 0_usize;
+    let mut i = at;
+    while i + 1 < bytes.len() {
+        match &bytes[i..i + 2] {
+            b"/*" => {
+                depth += 1;
+                i += 2;
+            }
+            b"*/" => {
+                depth -= 1;
+                i += 2;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => i += 1,
+        }
+    }
+    None
+}
+
+/// The offset after the `"` that closes a string whose contents start at `at`.
+fn string_end(bytes: &[u8], mut at: usize) -> Option<usize> {
+    while at < bytes.len() {
+        match bytes[at] {
+            b'\\' => at += 2,
+            b'"' => return Some(at + 1),
+            _ => at += 1,
+        }
+    }
+    None
+}
+
+/// The offset after a raw string `r#*"..."#*` whose hashes start at `at`.
+fn raw_string_end(bytes: &[u8], at: usize) -> Option<usize> {
+    let hashes = bytes[at..].iter().take_while(|b| **b == b'#').count();
+    if bytes.get(at + hashes) != Some(&b'"') {
+        return None;
+    }
+    let mut close = vec![b'"'];
+    close.extend(std::iter::repeat_n(b'#', hashes));
+    let body = at + hashes + 1;
+    let found = bytes[body..].windows(close.len()).position(|w| w == close.as_slice())?;
+    Some(body + found + close.len())
+}
+
+/// The offset after a character literal whose contents start at `at`, or `None` for a
+/// lifetime or a label.
+fn char_end(text: &str, at: usize) -> Option<usize> {
+    let rest = text.get(at..)?;
+    if let Some(escaped) = rest.strip_prefix('\\') {
+        let (close, _) = escaped.char_indices().take(10).find(|(_, c)| *c == '\'')?;
+        return Some(at + 1 + close + 1);
+    }
+    let width = rest.chars().next()?.len_utf8();
+    rest[width..].starts_with('\'').then_some(at + width + 1)
 }
 
 /// What `cargo vendor` records of a package: the sha256 of every file but the record
@@ -1440,6 +1732,7 @@ cfg-if = { path = "vendor/cfg-if-1.0.5" }
             entries: vec![format!("{DIR}.patch"), DIR.to_owned(), "README.md".to_owned()],
             copies: vec![DIR.to_owned()],
             numstat: BTreeMap::new(),
+            tracked: Vec::new(),
         }
     }
 
@@ -1794,6 +2087,8 @@ deleted file mode 100644
         assert_eq!(
             checked(&with_patch(&patch)),
             [
+                "vendor/cfg-if-1.0.5.patch: touches src/other.rs, which holds unsafe; a patch \
+                 never touches a file that does",
                 "vendor/cfg-if-1.0.5.patch: adds unsafe at line 14",
                 "vendor/cfg-if-1.0.5.patch: src/other.rs carries no \"LACTOSE patch:\" notice",
             ]
@@ -1804,6 +2099,20 @@ deleted file mode 100644
         assert!(!holds_token("is_unsafe()", "unsafe"));
     }
 
+    /// The findings for a patch that adds `lines` to a new file after [`PATCH`], whose added
+    /// lines start at patch line 13.
+    fn adding(lines: &[&str]) -> Vec<String> {
+        let body: String = lines.iter().map(|line| format!("+{line}\n")).collect();
+        let patch =
+            format!("{PATCH}--- a/src/x.rs\n+++ b/src/x.rs\n@@ -0,0 +1,{} @@\n{body}", lines.len());
+        let notice = "vendor/cfg-if-1.0.5.patch: src/x.rs carries no \"LACTOSE patch:\" notice";
+        checked(&with_patch(&patch)).into_iter().filter(|f| f != notice).collect()
+    }
+
+    fn adds(what: &str, line: usize) -> String {
+        format!("vendor/cfg-if-1.0.5.patch: adds {what} at line {line}")
+    }
+
     #[test]
     fn step_7_refuses_every_token_that_reaches_past_the_safe_language() {
         for (line, token) in [
@@ -1811,30 +2120,122 @@ deleted file mode 100644
             ("#[export_name = \"malloc\"]", "export_name"),
             ("#[link_section = \".init_array\"]", "link_section"),
             ("    #[link_name = \"write\"]", "link_name"),
-            ("global_asm!(\"nop\");", "global_asm"),
-            ("core::arch::asm !(\"nop\")", "asm!"),
             ("#[naked]", "naked"),
-            ("const X: &str = include!(\"x\");", "include!"),
-            ("include_str! (\"x\")", "include_str!"),
-            ("static B: &[u8] = include_bytes!(\"x\");", "include_bytes!"),
-            ("#[path = \"../../payload.rs\"]", "#[path"),
-            ("#![cfg_attr(x, path = \"y.rs\")]", "#[path"),
+            ("core::arch::asm !(\"nop\")", "asm"),
+            ("global_asm!(\"nop\");", "global_asm"),
+            ("naked_asm!(\"ret\")", "naked_asm"),
+            ("const X: &str = include!(\"x\");", "include"),
+            ("include/**/!(\"x\");", "include"),
+            ("use core::include as inc;", "include"),
+            ("include", "include"),
+            ("include_str! (\"x\")", "include_str"),
+            ("static B: &[u8] = r#include_bytes!(\"x\");", "include_bytes"),
         ] {
-            assert!(refuses(line, token), "{line}");
-            let patch = format!("{PATCH}--- a/src/x.rs\n+++ b/src/x.rs\n@@ -0,0 +1 @@\n+{line}\n");
-            let found = checked(&with_patch(&patch));
-            let expected = format!("vendor/cfg-if-1.0.5.patch: adds {token} at line 13");
-            assert!(found.contains(&expected), "{line}\n{found:#?}");
+            assert_eq!(adding(&[line]), [adds(token, 13)], "{line}");
         }
-        for (line, token) in [
-            ("// asm is not a macro call", "asm!"),
-            ("let path = include_dir;", "include!"),
-            ("let path = \"x\";", "#[path"),
-            ("fn no_mangled() {}", "no_mangle"),
-            ("#[inline] fn naked_eye() {}", "naked"),
+        for line in ["fn no_mangled() {}", "#[inline] fn naked_eye() {}", "let includes = 1;"] {
+            assert_eq!(adding(&[line]), Vec::<String>::new(), "{line}");
+        }
+    }
+
+    #[test]
+    fn step_7_refuses_a_path_attribute_and_an_out_of_line_module_across_lines() {
+        let path = |line| adds(PATH_ATTRIBUTE, line);
+        let module = |line| adds(OUT_OF_LINE_MODULE, line);
+        assert_eq!(adding(&["#[path = \"../../payload.rs\"]"]), [path(13)]);
+        assert_eq!(adding(&["# [path = \"p.rs\"]", "mod payload;"]), [path(13), module(14)]);
+        assert_eq!(
+            adding(&["#[", "path = \"p.rs\"]", "pub(crate) mod payload ;"]),
+            [path(13), module(15)]
+        );
+        assert_eq!(adding(&["#![cfg_attr(x, path = \"y.rs\")]"]), [path(13)]);
+        assert_eq!(adding(&["#[path /* a */ = \"p.rs\"]"]), [path(13)]);
+        assert_eq!(adding(&["#[doc = \"//\"] #[path", "// =", "= \"p.rs\"]"]), [path(13)]);
+        // A comment the added lines open but a context line closes hides nothing.
+        assert_eq!(adding(&["/*", "#[path/**/= \"p.rs\"]"]), [path(14)]);
+        assert_eq!(adding(&["mod", "payload;"]), [module(13)]);
+        // Read as written too, so a commented declaration is refused with the rest.
+        assert_eq!(adding(&["// mod payload;"]), [module(13)]);
+        for clean in [
+            &["let path = \"x\";"][..],
+            &["#[cfg(feature = \"path\")]", "mod inline {}"],
+            &["let module = 1; // a mod;"],
+            &["fn f<'a>(x: &'a str) -> char { '#' }"],
         ] {
-            assert!(!refuses(line, token), "{line}");
+            assert_eq!(adding(clean), Vec::<String>::new(), "{clean:?}");
         }
+    }
+
+    #[test]
+    fn step_7_refuses_a_patch_to_a_file_that_holds_unsafe() {
+        let mut repo = repo();
+        repo.files.insert(format!("vendor/{DIR}/src/lib.rs"), "line one\n// unsafe { }\n");
+        assert_eq!(
+            checked(&repo),
+            ["vendor/cfg-if-1.0.5.patch: touches src/lib.rs, which holds unsafe; a patch never \
+              touches a file that does"]
+        );
+        let removing = PATCH.replace("-line two", "-unsafe { two }");
+        assert_eq!(
+            checked(&with_patch(&removing)),
+            ["vendor/cfg-if-1.0.5.patch: touches src/lib.rs, which holds unsafe; a patch never \
+              touches a file that does"]
+        );
+        repo.files.insert(format!("vendor/{DIR}/src/lib.rs"), "is_unsafe()\n");
+        assert_eq!(checked(&repo), Vec::<String>::new());
+    }
+
+    #[test]
+    fn step_7_refuses_a_patch_that_creates_a_build_script() {
+        let script = "diff --git a/build.rs b/build.rs\nnew file mode 100644\n--- /dev/null\n+++ \
+                      b/build.rs\n@@ -0,0 +1 @@\n+// LACTOSE patch: no.\n";
+        let created = "vendor/cfg-if-1.0.5.patch: creates build.rs, a build script; a patch may \
+                       change one, never add one";
+        assert_eq!(checked(&with_patch(&format!("{PATCH}{script}"))), [created]);
+        let mut repo = with_patch(&format!("{PATCH}{}", script.replace("build.rs", "gen/b.rs")));
+        assert_eq!(checked(&repo), Vec::<String>::new());
+        repo.files.insert(
+            format!("vendor/{DIR}/Cargo.toml"),
+            "[package]\nname = \"cfg-if\"\nversion = \"1.0.5\"\nbuild = \"./gen/b.rs\"\n",
+        );
+        assert_eq!(
+            checked(&repo),
+            ["vendor/cfg-if-1.0.5.patch: creates gen/b.rs, a build script; a patch may change \
+              one, never add one"]
+        );
+        // An existing build script, in the record, may be changed.
+        let record =
+            r#"{"files":{"Cargo.toml":"aa","src/lib.rs":"bb","build.rs":"dd"},"package":"cc"}"#;
+        let mut repo = with_patch(&format!("{PATCH}{script}"));
+        repo.files.insert(format!("vendor/{DIR}/{RECORD}"), record);
+        assert!(!checked(&repo).iter().any(|f| f.contains("build script")));
+    }
+
+    #[test]
+    fn step_1_refuses_cargo_configuration_git_tracks_where_no_check_looks() {
+        let mut repo = repo();
+        repo.files.insert_skipped("target");
+        repo.files.insert_skipped("tools/cook/target");
+        repo.tracked = [
+            "Cargo.toml",
+            ".cargo/config.toml",
+            "target/.cargo/config.toml",
+            "target/notes.txt",
+            "tools/cook/target/x/.cargo/env",
+            "targets/.cargo/config",
+        ]
+        .map(str::to_owned)
+        .to_vec();
+        let reads = "which no check reads; cargo reads a cargo configuration file it runs beneath";
+        assert_eq!(
+            checked(&repo),
+            [
+                format!("target/.cargo/config.toml: tracked under target/, {reads}"),
+                format!(
+                    "tools/cook/target/x/.cargo/env: tracked under tools/cook/target/, {reads}"
+                ),
+            ]
+        );
     }
 
     #[test]
@@ -1969,7 +2370,7 @@ deleted file mode 100644
             "# cargo --config patch.crates-io.x.path=y\n\
              run: cargo build --config 'patch.crates-io.x.path=\"y\"'\n\
              env:\n  CARGO_HOME: /tmp/home\n\
-             run: cargo build --config profile.release.lto=true\n",
+             run: cargo build --config tools/ci.toml\n",
         );
         repo.files
             .insert("tools/release.sh", "export CARGO_HOME=\"$PWD/home\"\necho $CARGO_HOME\n");
@@ -1984,10 +2385,12 @@ deleted file mode 100644
                  [patch], [source] or paths setting reaches cargo unseen",
                 ".cargo/config.toml: alias ship passes --config or -Z, through which a [patch], \
                  [source] or paths setting reaches cargo unseen",
-                ".github/workflows/ci.yml: line 2: passes --config naming patch, source or paths; \
-                 a patch lives in the root Cargo.toml only",
+                ".github/workflows/ci.yml: line 2: passes --config, through which a [patch], \
+                 [source] or paths setting reaches cargo unseen",
                 ".github/workflows/ci.yml: line 4: sets CARGO_HOME, whose cargo configuration no \
                  check reads",
+                ".github/workflows/ci.yml: line 5: passes --config, through which a [patch], \
+                 [source] or paths setting reaches cargo unseen",
                 "tools/release.sh: line 1: sets CARGO_HOME, whose cargo configuration no check \
                  reads",
             ]

@@ -8,12 +8,13 @@ use std::path::Path;
 
 use crate::Finding;
 
-/// File contents keyed by repository-relative path with `/` separators, and the symbolic
-/// links that were not followed.
+/// File contents keyed by repository-relative path with `/` separators, the symbolic links
+/// that were not followed, and the directories that were not entered.
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
 pub struct Files {
     files: BTreeMap<String, Vec<u8>>,
     links: BTreeSet<String>,
+    skipped: BTreeSet<String>,
 }
 
 impl Files {
@@ -55,10 +56,22 @@ impl Files {
         self.links.iter().map(String::as_str)
     }
 
+    /// Records a directory at `path` that was not entered.
+    pub fn insert_skipped(&mut self, path: impl Into<String>) {
+        self.skipped.insert(path.into());
+    }
+
+    /// Every directory not entered (build output, version-control metadata, nested
+    /// checkouts), sorted.
+    pub fn skipped(&self) -> impl Iterator<Item = &str> {
+        self.skipped.iter().map(String::as_str)
+    }
+
     /// Reads the files the checks look at from the repository at `root`.
     ///
     /// Build output, version-control metadata and nested checkouts (a directory other than
-    /// `root` that has its own `.git`) are skipped. Symbolic links are recorded, not followed.
+    /// `root` that has its own `.git`) are skipped and recorded. Symbolic links are recorded,
+    /// not followed.
     ///
     /// # Errors
     /// If a directory or a wanted file cannot be read.
@@ -78,6 +91,7 @@ fn walk(dir: &Path, prefix: &str, files: &mut Files) -> Result<(), String> {
         let relative = if prefix.is_empty() { name.clone() } else { format!("{prefix}/{name}") };
         if kind.is_dir() {
             if name == ".git" || name == "target" || entry.path().join(".git").exists() {
+                files.insert_skipped(relative);
                 continue;
             }
             walk(&entry.path(), &relative, files)?;

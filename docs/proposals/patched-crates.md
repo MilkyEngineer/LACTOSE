@@ -7,6 +7,7 @@ section 16 sentence, the root `Cargo.toml` comment, `vendor/README.md`, and the 
 that crate. The rule binds that merge and every crate from then on. The owner files the
 upstream report; the Rapier merge does not wait for its link (`vendor/README.md` says "to be
 filed" until then).
+Steps 1, 2, 6, 7 and 8 amended by the check's reviews; see the D123 addendum.
 
 ## Evidence
 
@@ -178,10 +179,13 @@ findings, in order:
    (a `.cargo` directory, `.cargo/config` or `.cargo/config.toml` anywhere; `cargo xtask
    boundary` refuses both through the same function); `<config>: alias <name> passes
    --config or -Z, through which a [patch], [source] or paths setting reaches cargo unseen`;
-   and in each workflow, script and cargo configuration file `cargo xtask boundary` scans,
-   `<file>: line <n>: passes --config naming patch, source or paths; a patch lives in the
-   root Cargo.toml only` and `<file>: line <n>: sets CARGO_HOME, whose cargo configuration
-   no check reads`.
+   in each workflow and script `cargo xtask boundary` scans, `<file>: line <n>: passes
+   --config, through which a [patch], [source] or paths setting reaches cargo unseen`, and
+   in those and each cargo configuration file, `<file>: line <n>: sets CARGO_HOME, whose
+   cargo configuration no check reads`; and for a cargo configuration file or a path under
+   a `.cargo` directory that git tracks (`git ls-files`) beneath a directory the file walk
+   skips, `<path>: tracked under <dir>/, which no check reads; cargo reads a cargo
+   configuration file it runs beneath`.
 2. Correspondence. Every resolved package with no `source` that is not a workspace member
    has its manifest at `vendor/<name>-<version>/Cargo.toml` and is named by a root
    `[patch.crates-io]` entry, and every directory under `vendor/` is such a package:
@@ -212,10 +216,16 @@ findings, in order:
    lines, over the fifty of architecture section 8.2` (every line git counts as added or
    removed, comments included); `vendor/<dir>.patch: names <path>, which a patch never
    touches` (`Cargo.toml`, `Cargo.toml.orig`, `Cargo.lock`, `.cargo_vcs_info.json`,
-   `.cargo-checksum.json`, by git's paths and the check's); `vendor/<dir>.patch: adds
-   <token> at line <n>` (a `+` line holding `unsafe`, `no_mangle`, `export_name`,
-   `link_section`, `link_name`, `global_asm`, `naked` as a token, `asm`, `include`,
-   `include_str` or `include_bytes` followed by `!`, or a `path =` in an attribute);
+   `.cargo-checksum.json`, by git's paths and the check's); `vendor/<dir>.patch: touches
+   <path>, which holds unsafe; a patch never touches a file that does` (the copy's file, or
+   a line the patch removes, holds the word `unsafe`); `vendor/<dir>.patch: creates <path>,
+   a build script; a patch may change one, never add one` (`build.rs` or what
+   `package.build` names, absent from the record); `vendor/<dir>.patch: adds <token> at
+   line <n>` (a `+` line holding `unsafe`, `no_mangle`, `export_name`, `link_section`,
+   `link_name`, `naked`, `asm`, `global_asm`, `naked_asm`, `include`, `include_str` or
+   `include_bytes` as a whole identifier, with or without `!`; or, reading each hunk's
+   added lines joined, as written and with comments blanked, `a path attribute` for `#`,
+   `[`, then `path =`, and `an out-of-line module` for `mod <name>;`);
    `vendor/<dir>.patch: line <n> adds <N> characters, over the 200 an added line may hold`;
    `vendor/<dir>.patch: <path> carries no "LACTOSE patch:" notice` (no `+` line of that
    file's hunks holds the text).

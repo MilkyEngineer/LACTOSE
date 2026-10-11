@@ -467,8 +467,16 @@ fn a_patch_adding_unsafe_is_a_finding() {
     let fixture = Fixture::new("unsafe");
     let change = fixture.lib_with("// LACTOSE patch: no.\npub fn f() { unsafe {} }\n");
     fixture.patch(&[change]);
-    // Line 9: four header lines, three of context, the notice, then the `unsafe`.
-    fixture.findings(&[format!("vendor/{}.patch: adds unsafe at line 9", fixture.dir())]);
+    // Line 9: four header lines, three of context, the notice, then the `unsafe`, which the
+    // file then holds.
+    let dir = fixture.dir();
+    fixture.findings(&[
+        format!(
+            "vendor/{dir}.patch: touches src/lib.rs, which holds unsafe; a patch never touches a \
+             file that does"
+        ),
+        format!("vendor/{dir}.patch: adds unsafe at line 9"),
+    ]);
 }
 
 #[test]
@@ -603,9 +611,12 @@ fn a_patch_source_passed_on_a_command_line_is_a_finding() {
         &fixture.ws.join(".cargo/config.toml"),
         "[alias]\nship = [\"build\", \"--config\", \"tools/ship.toml\"]\n",
     );
+    // A `--config` naming a file, and one continued on the next line, each set a patch the
+    // line does not name.
     write(
         &fixture.ws.join(".github/workflows/ship.yml"),
-        "jobs:\n  ship:\n    steps:\n      - run: cargo build --config \
+        "jobs:\n  ship:\n    steps:\n      - run: cargo metadata --config tools/ship.toml\n      \
+         - run: |\n          cargo check --config \\\n            \
          'patch.crates-io.cfg-if.path=\"elsewhere\"'\n",
     );
     write(&fixture.ws.join("tools/ship.sh"), "#!/bin/sh\nCARGO_HOME=/opt/cargo cargo build\n");
@@ -613,8 +624,11 @@ fn a_patch_source_passed_on_a_command_line_is_a_finding() {
         ".cargo/config.toml: alias ship passes --config or -Z, through which a [patch], \
          [source] or paths setting reaches cargo unseen"
             .to_owned(),
-        ".github/workflows/ship.yml: line 4: passes --config naming patch, source or paths; a \
-         patch lives in the root Cargo.toml only"
+        ".github/workflows/ship.yml: line 4: passes --config, through which a [patch], [source] \
+         or paths setting reaches cargo unseen"
+            .to_owned(),
+        ".github/workflows/ship.yml: line 6: passes --config, through which a [patch], [source] \
+         or paths setting reaches cargo unseen"
             .to_owned(),
         "tools/ship.sh: line 2: sets CARGO_HOME, whose cargo configuration no check reads"
             .to_owned(),
@@ -652,7 +666,7 @@ fn a_stray_file_under_vendor_and_a_patch_including_it_are_findings() {
         "vendor/payload.rs: neither a copy, its patch nor README.md; nothing else lives under \
          vendor/"
             .to_owned(),
-        format!("vendor/{dir}.patch: adds include! at line 9"),
+        format!("vendor/{dir}.patch: adds include at line 9"),
     ]);
 }
 
@@ -668,4 +682,91 @@ fn an_added_line_over_two_hundred_characters_is_a_finding() {
         fixture.dir(),
         body.chars().count()
     )]);
+}
+
+#[test]
+fn an_inclusion_the_line_scan_would_miss_is_a_finding() {
+    // Each compiles a file the patch does not show: through a comment before the `!`, a
+    // rename, a line break, a space after the `#`, and an attribute across lines.
+    let path = "\"../../../docs/payload.rs\"";
+    for (name, lines, expected) in [
+        ("comment", format!("include/**/!({path});\n"), vec![(9, "include")]),
+        ("rename", format!("use core::include as inc;\ninc!({path});\n"), vec![(9, "include")]),
+        ("split", format!("include\n!({path});\n"), vec![(9, "include")]),
+        (
+            "space",
+            format!("# [path = {path}]\nmod payload;\n"),
+            vec![(9, "a path attribute"), (10, "an out-of-line module")],
+        ),
+        (
+            "attribute",
+            format!("#[\npath = {path}]\nmod payload;\n"),
+            vec![(9, "a path attribute"), (11, "an out-of-line module")],
+        ),
+    ] {
+        let fixture = Fixture::new(&format!("inclusion-{name}"));
+        let change = fixture.lib_with(&format!("// LACTOSE patch: the change.\n{lines}"));
+        fixture.patch(&[change]);
+        let dir = fixture.dir();
+        let expected: Vec<String> = expected
+            .into_iter()
+            .map(|(line, what)| format!("vendor/{dir}.patch: adds {what} at line {line}"))
+            .collect();
+        fixture.findings(&expected);
+    }
+}
+
+#[test]
+fn a_patch_to_a_file_that_holds_unsafe_is_a_finding() {
+    // cfg-if holds no `unsafe`, so the copy's upstream file is given one and its record the
+    // new hash: the offline steps pass that edit, and the rule names the file. (The online
+    // step, which would name the record, runs only once the offline steps are clean.)
+    let fixture = Fixture::new("holds-unsafe");
+    let lib = fixture.copy().join("src/lib.rs");
+    let upstream = format!("// The word unsafe, upstream.\n{}", read(&lib));
+    write(&lib, &upstream);
+    let record_path = fixture.copy().join(".cargo-checksum.json");
+    let mut record: serde_json::Value =
+        serde_json::from_str(&read(&record_path)).expect("a record");
+    let hash: String =
+        Sha256::digest(upstream.as_bytes()).iter().map(|b| format!("{b:02x}")).collect();
+    record["files"]["src/lib.rs"] = serde_json::Value::from(hash);
+    write(&record_path, &record.to_string());
+    let change = fixture.lib_with("// LACTOSE patch: the change.\npub const PATCHED: () = ();\n");
+    fixture.patch(&[change]);
+    let dir = fixture.dir();
+    fixture.findings(&[format!(
+        "vendor/{dir}.patch: touches src/lib.rs, which holds unsafe; a patch never touches a \
+             file that does"
+    )]);
+}
+
+#[test]
+fn a_patch_that_creates_a_build_script_is_a_finding() {
+    let fixture = Fixture::new("build-script");
+    let body = ["// LACTOSE patch: a build script upstream does not have.", "fn main() {}"];
+    let mut patch = format!(
+        "diff --git a/build.rs b/build.rs\nnew file mode 100644\n--- /dev/null\n+++ b/build.rs\n\
+         @@ -0,0 +1,{} @@\n",
+        body.len()
+    );
+    patch.extend(body.iter().map(|line| format!("+{line}\n")));
+    write(&fixture.ws.join(format!("vendor/{}.patch", fixture.dir())), &patch);
+    write(&fixture.copy().join("build.rs"), &(body.join("\n") + "\n"));
+    fixture.findings(&[format!(
+        "vendor/{}.patch: creates build.rs, a build script; a patch may change one, never add one",
+        fixture.dir()
+    )]);
+}
+
+#[test]
+fn a_cargo_configuration_tracked_where_no_check_looks_is_a_finding() {
+    let fixture = Fixture::patched("tracked");
+    write(&fixture.ws.join("target/.cargo/config.toml"), "[patch.crates-io]\n");
+    for args in [&["init", "-q"][..], &["add", "-f", "target/.cargo/config.toml"]] {
+        run(Command::new("git").args(args), &fixture.ws);
+    }
+    fixture.findings(&["target/.cargo/config.toml: tracked under target/, which no check reads; \
+                        cargo reads a cargo configuration file it runs beneath"
+        .to_owned()]);
 }
