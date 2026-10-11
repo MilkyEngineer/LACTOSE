@@ -275,6 +275,10 @@ Correctness:
 - `tests/stress.rs` hammers steal, split, scope and wake paths on the host, which on aarch64
   covers weak-memory behaviour that loom does not model. It runs for two seconds;
   `WHISK_STRESS_SECONDS` sets a longer soak.
+- `tests/block_in_place.rs` proves the reservation by counting, not timing: a unit or child
+  that begins before a block holds its worker until the block is in place, and a block that
+  reserves workers lasts until the work it is owed has run. A slow or oversubscribed machine
+  makes it slower, never wrong.
 - `tests/abort.rs` re-runs itself as a subprocess and checks that a panic in a job, a
   finalize, a scope child, a scope body, a task or the drop of a cancelled task's future
   aborts the process, and that an unfollowable replay log does.
