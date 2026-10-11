@@ -1948,6 +1948,253 @@ rationale the author supplied during the editorial pass rather than one taken fr
   generation.
 - Driven by: milestone 1, the `net-api` facade brief and its two design reviews (2026-10-10).
 
+**D122. The `predict` facade: what sections 5.1, 7, 9.2, 9.4, 10, 11 and 22 left open** (§5.1, §5.3,
+§6, §7, §9.2, §9.4, §10, §11, §16, §22, `lactose-predict`, `lactose-ecs`, `lactose-sim`,
+`lactose-task`, `lactose-net-api`, `lactose-net-host`, `lactose-physics-api`)
+- Why: the facade is written before its implementation so the client's `app`, `lactose-net`,
+  presentation and the milestone 1 netcode spike build against the final surface; each choice below
+  is one the sections did not settle, and each is a contract in `crates/predict/README.md`.
+  - *`predict` owns the prediction `Simulation` and runs by value.* `Predictor::{step, reconcile,
+    passes}` take the predictor and hand it back, as the simulation's runs do, because a run shares
+    the world with jobs on other workers; a failure whose world survived (before anything ran, a
+    step whose hook did not run, a re-simulation that stopped) hands it back inside `PredictError`
+    with the ring trimmed to the world's tick, `None` after `Cancelled`. `new` refuses a world that
+    is not `Prediction` or lacks a `StagedInbox`, and fixes whether the world has `Physics`; `step`
+    refuses when that changed or when the hook did not run, which catches a `dyn StagedState`
+    inserted over it; `resync` reinstalls the hook, the repair. Rules out a `&mut self` API over an
+    `Option<Simulation>`, which could express a torn world only by poisoning, and a hook silently
+    replaced or irreparably replaced.
+  - *Frames are applied by the hook inside the tick; reconciliation runs between runs after the
+    frame's steps.* `PredictionHook`, installed by `Predictor::new`, pops the frames due at its tick
+    (section 9.2: staged state is applied at the input sync point and only there), applies every
+    structural field as the replicated world's hook does without `RemoteSlot` so the prediction
+    world holds every relevant entity as a proxy, writes each proxy's `Transform`, `Velocity` and
+    `Teleported` as that tick's position, binds every predicted origin, keeps `ClaimedBy` and
+    `StreamingAnchor` on the player's own entity (`LocalPlayer::entity`, held once in the
+    predictor's record and replaced between runs by `set_local`; the hook itself holds nothing)
+    before and after the frames, despawns a predicted spawn of the local player whose input tick the
+    acknowledgement has passed, and records the claimed entities' facts; `reconcile` reads the
+    record, never the inbox. Rules out a driver that writes rows between runs and a hook that cannot
+    be replayed.
+  - *A ring slot is the world snapshot after the tick, the physics snapshot beside it (or none,
+    counted, if it failed), the `TickInput` that produced it, the frames popped at it (the proxies'
+    per-tick history of section 10) and a record of every replicated component of every claimed
+    entity as bytes, read through `World::get_erased`.* A frame's facts are compared at the slot of
+    the frame's tick and nowhere else; a fact whose region that slot lacks is skipped, the region
+    being the fact's or the one the predictor last knew the entity in. The predictor remembers the
+    region of every entity the local player has claimed from its first fact or record until the
+    server's tombstone or release fact for it, never dropping one for the ring's age and keeping
+    them across a resync, so a claimed entity the client despawned too early is re-spawned by its
+    next fact however long the server left it unchanged; the map is bounded by the server's live
+    claims. A rollback restores the slot, writes the facts there, tells the physics what was
+    corrected, re-takes the slot (keeping no physics snapshot when the slot had none, since the
+    physics was not restored and a snapshot then would hold a later tick's solver state) and
+    re-simulates to the present from the ring's inputs with the frames replayed, comparing again at
+    every later tick a frame has facts for, in frame order. A call first finds the newest full frame
+    it popped; every frame popped before it is from before the restart whatever its tick, and
+    contributes no correction point, substitution or `TooOld`. The ring is a window of `depth`
+    slots, the oldest the horizon; a frame older than it is a resync (section 9.4) unless it is from
+    before the ring's restart. Rules out comparing against the live world, comparing at a later slot
+    (one correction per frame for a round trip), a ring that confirmation must drain, and a map of
+    known entities that the ring's age prunes.
+  - *Corrections are written stamped.* A correction is a change of state, the server's, and a
+    `Changed<T>` reader in the re-simulated ticks sees it once, so a derived component a prediction
+    system maintains from a replicated one follows the correction; written without recording it
+    never would (a cache from `Changed<Position>` stayed at the mispredicted value through thirty
+    re-simulated ticks in the review's probe), and the build check lets prediction systems read
+    derived components. This reverses, for this crate, D114's "a correction written without
+    recording leaves them alone" and supersedes, for this crate, D119's "`lactose-predict` corrected
+    the rows without recording the writes": `crates/physics-api/README.md` and the `corrected` doc
+    say so, and D119 stands as history. `ColumnMut::write` without recording stays in the ECS for
+    any other consumer. `physics_api::corrected` is still called with the written keys, the contract
+    the backend lane was given and the one the sync's pending set serves whatever the writer's
+    stamping; with stamped writes the sync's fresh mark after `restore` would see them regardless.
+  - *Re-simulation does not share the catch-up cap.* A rollback's re-simulation completes to the
+    present in the `reconcile` that detects it, bounded by the ring depth; it costs the client no
+    ticks of lead while the depth times the per-tick cost `app` measured fits the frame
+    re-simulation budget, which is what `set_depth` is for: `app` sizes the depth from that budget
+    divided by the measured cost, under its own cap. `DEFAULT_DEPTH` is 60, a placeholder and not a
+    sized value; with a depth `app` has not sized, a rollback to the oldest slot can overrun the
+    frame, and the ticks the pacer then finds due are catch-up under the cap. Sharing the cap would
+    cost lead on every correction: a correction's depth is about a round trip plus margin, more than
+    four ticks at 100 ms, the convergence storm after a dynamic-body correction corrects on
+    consecutive frames, and clock sync's three percent could not restore the lost lead (the review's
+    probe: one tick lost per frame at 60 fps for any correction of four or more ticks). Sections 5.1
+    and 11 are amended; `app` passes zero to `TickPacer::poll` until `lactose-task` drops the
+    parameter; `TickBudget::behind` keeps its meaning, catch-up alone beyond the cap, a clock resync
+    and never a world resync.
+  - *Full precision means canonical bytes per field, no tolerance.* A fact is a claimed entity's
+    presence, region, claim, a component's presence, or its bytes; fields compare over every ID'd
+    field of the schema, scalar leaves by canonical bits. The same build on the same bytes gives the
+    same bits, so a difference is a different input. Rapier's uncorrected solver state makes a
+    corrected dynamic body differ again for a few ticks; those are counted as corrections, and a
+    tolerance is a milestone 4 decision against the spike's baseline. `Divergence` is counts of
+    entities and fields; a magnitude across mixed units means nothing and this crate computes no
+    float.
+  - *A substituted tick replaces the ring's sample and re-simulates from the tick before; every
+    unsubstituted tick after a substituted one is repaired through `after_substitute` once a frame
+    at or after it is processed, found by input tick since a frame spans several ticks;
+    substitutions and repairs apply in ascending tick, are skipped at or before the ring's restart
+    or when their frame was popped before the call's newest full frame, a repair whose preceding
+    substitution was skipped is skipped too, and they are `TooOld` when the tick before them
+    precedes the horizon.*
+  - *A full frame is a rebuild and `resync` is a restart.* Both set `Ring::rebuilt_at`; while the
+    ring holds that slot, a frame for an earlier tick is from before the restart: its facts and
+    substitutions are skipped and its tick confirmed, checked before the horizon, so a resync is one
+    resync and a join is one rebuild. Of several full frames in one call only the newest restarts
+    the ring. The rebuild tick's own sample is lost and the local inputs between the full frame's
+    tick and the restart are not in the rebuilt state, so the first frame at or after the restart
+    corrects once. `resync` also reinstalls the hook and keeps the known regions. `app` builds the
+    prediction world at the join tick plus its lead.
+  - *The local player's entity is an explicit `LocalPlayer::entity`, replaced by `set_local`.*
+    `StreamingAnchor` is derived and unreplicated, and the lowest claimed key is not reliably the
+    player's (cooked ids sort above runtime ids). `JoinAccepted` should carry it, and a change at a
+    re-join is a `net` control message (below).
+  - *The build check of D121 is a pure function in `predict`, run at the prediction world's build
+    through a check function `app` hands the builder.* It refuses any component a prediction-world
+    system names, in its kernel or finalize table, that is persistent and not replicated (`OwnedBy`
+    and `PredictedOrigin` among them), and any exclusive prediction-world system whose
+    `SystemDescriptor::key` is not in `EXCLUSIVE_SYSTEMS`, the engine's exclusive systems that run
+    there by system key (`sim::begin_tick`, `sim::apply_frame_regions`, `sim::apply_sessions`,
+    `sim::apply_inputs`, `sim::apply_staged_state`, `sim::apply_region_policy`,
+    `input::player_input_writer`, `physics_api::sync`, `physics_api::write_back`), since `&mut
+    World` shows no table and a set name can be joined by any system; an engine crate that adds or
+    renames one changes the list in the same commit; test-support scenes (physics-api's conformance
+    `input_tick`) are not shipped and not listed. Resources are not judged: world resources are
+    derived by `sim`'s rule; region resources are corrected only by relevance, a `net` item.
+  - *Every cost the spike records is a value:* `Reconciled`, `Correction`, `Divergence` and
+    `PredictionStats`; `app` measures time around `reconcile` and divides.
+  - *The implementation lane starts only when what it is written against runs:* the four erased row
+    methods of `lactose-ecs` below, `lactose-net-api`'s `StagedInbox`, and `lactose-input`'s
+    `substitute`, `after_substitute`, `player_entity` and `PlayerInputApplier`. No typed fallback
+    exists.
+  - Named and deferred: `SimulationBuilder::check`, `JoinAccepted::entity`, `TickPacer::poll`
+    without its parameter, forwarded inputs, a dynamic-body tolerance, per-tick region resources and
+    a replicated `OwnedBy`, the visual blend, copy-on-write snapshots or a cap on the statics a
+    prediction world holds as rows (the review measured a full-copy `World::snapshot` at 134 to 149
+    µs and 2.43 MB with 10,000 statics as rows, over the 100 µs budget before physics).
+- What the first design review changed (1 blocking, 6 serious, 9 minor; `a89817a` was the facade
+  before it): the erased ECS precondition in place of a typed fallback; stamped corrections;
+  re-simulation outside the cap; comparison at the frame's slot only; the repair rule by input tick;
+  the restart rule before the horizon and for substitutions; `resync` as a restart; the anchor in a
+  rebuild and after the frames; `set_local` and the lead at join; the inbox precondition and the
+  hook-ran and physics-presence checks; the exclusive allowlist; the sketch's setups and hand-backs;
+  the slot without physics; the dropped scalar error. What the second review changed (2 serious, 7
+  minor; `cebd949`): the allowlist by system key in place of set names; the known regions bounded by
+  the server's facts in place of the ring's age; the newest-full-frame-first rule; the skipped
+  repair after a skipped substitution; the no-lead-cost condition and `DEFAULT_DEPTH` as a
+  placeholder; physics-api's contract text; `resync` reinstalling the hook; one copy of `local`; the
+  re-taken slot without physics.
+- Implementation of the ECS and simulation preconditions (lane ecs-erased; the first review found
+  3 minor, the second none): `World::{get_erased, insert_erased, remove_erased, spawn_erased}` in
+  `lactose-ecs` and `SimulationBuilder::check` in `lactose-sim`. The erased methods share the typed
+  paths' validation and index maintenance; a registered resource key is `InvalidData`;
+  `insert_erased` writes only when the bytes differ, so an equal write stamps nothing; a
+  placeholder in a reference field is refused by name ("placeholder reference in `<field>`"), where
+  a typed write stores the empty reference, because erased bytes come from the wire or a recorded
+  slot; a refused write, typed or erased, leaves the point unchanged (typed `insert` now checks the
+  registry before the point moves). `check` may be called more than once; checks run in the order
+  added at `build`, after the setup and registration functions and before any schedule is built or
+  prepared, each given the world's registry and every system of the builder's kind in add-call
+  order (sim's six input systems first, `sim::save_copy` last on a server); the first error fails
+  the build as returned. `StageBuilder` has no public constructor, so a registration function adds
+  only through the builders it is handed, which the order `check` sees relies on.
+  `lactose_predict::check_prediction_reads` is still `todo!()`, so the tests use local check
+  functions. Generic code (the erased writes, the reference walkers) trusts `FieldKind::EntityRef`:
+  a type that declares that kind without being an `EntityRef` is read and rewritten as one.
+- Driven by: milestone 1, the `predict` facade brief and its two design reviews (2026-10-10 and
+  2026-10-11).
+
+**D123. A third-party crate is built from a patched copy only under `vendor/`, by one rule
+for every crate, checked by `cargo xtask vendor`** (§8.2, §8.3, §9.1, §16, §20,
+`crate-tiers.toml`, `deny.toml`, `.gitattributes`, `docs/agents.md`, `tools/xtask`)
+- Why: the Rapier backend needed one route moved from the platform library to `libm` (the
+  angular joint limit's `sin_cos` in `joint_constraint_helper.rs`, six changed lines) and no
+  document said whether a boundary crate may be patched, so the lane vendored the crate and
+  proposed a rule. Patching is admitted because the alternative, refusing `Joint::limited`,
+  drops a feature `anim`'s ragdoll needs for a six-line fix, and a git fork would move source
+  out of the repository and past `deny.toml`'s `unknown-git = "deny"`.
+  - *One mechanism, every crate.* `[patch.crates-io]` applies to every user of the crate in
+    the workspace, inside the boundary or not, so the mechanism and its check are
+    workspace-wide; admission differs: inside the boundary a patch fixes a section 8.2 route
+    and is reviewed as a determinism review, like a new allowlist name; elsewhere it fixes a
+    defect that blocks a milestone criterion; never a feature. A crate is patched at one
+    version only, and no `[patch]`, `[source]` or `paths` setting lives anywhere but the root
+    manifest, since cargo honours one in `.cargo/config.toml` silently.
+  - *Fifty changed lines, comments included; never the manifest records; a build script if
+    it must; no `unsafe`; a notice on every change.* The cap the lane brief used; it
+    separates a fix from a fork. The sign of zero in SIMD `min` and `max` (about 26 sites
+    over rapier, parry, simba and wide) is what it excludes, and that stays a verification
+    item for SOUR's architecture mode, not a patch. `Cargo.toml`, `Cargo.toml.orig`,
+    `Cargo.lock` and `.cargo_vcs_info.json` stay upstream's so the version, features,
+    dependencies and closure the allowlist review saw do not move; a build script may be
+    patched because `libm` selects its paths in `configure.rs` and cannot be refused, and
+    such a patch is reviewed as a change to what every target compiles. The `LACTOSE patch:`
+    comment is the notice Apache-2.0 section 4(b) asks of a modified file, and counting it
+    keeps the cap the diff's line count.
+  - *The record is what `cargo vendor` writes plus a patch file, and the check re-derives
+    it.* `.cargo-checksum.json` carries every upstream file's sha256 and the archive's, in
+    the format cargo itself reads; the patch is a unified diff `git apply` consumes. Offline
+    the check reverses the patch on a copy, hashes and compares; that proves the copy against
+    its record only, since a rewritten hash in the record passes it, so online the check
+    re-derives the record from the crates.io archive with `cargo vendor` from a shadow
+    manifest and requires equality. Rules out a diff quoted in prose (the lane's README), a
+    checksum in prose, and a tool that applies patches at build time (cargo has no hook; the
+    tree must exist before `cargo metadata`).
+  - *`cargo-deny` sees the name but not the advisories.* Probed on cargo-deny 0.20.2: `bans`,
+    `licenses` and `sources` match a patched crate by name and version; `advisories` skips it
+    as a path source (`smallvec` 1.6.0, RUSTSEC-2021-0003: reported from the registry, silent
+    when vendored and patched). The check runs `cargo deny check advisories` over the same
+    shadow manifest, pinned as the root `[workspace.dependencies]` entry pins it and resolved
+    against a copy of the workspace lock, and its exit status decides.
+  - *The build ID hashes the vendored files.* A patched crate's `Cargo.lock` entry has
+    neither `source` nor `checksum`, so section 9.1 hashes the vendored directory as it
+    hashes the boundary crates' sources: that names what the binary compiled whether or not
+    the check ran, where an archive checksum plus a patch would stay equal for a tampered
+    record until the online step caught it. `.gitattributes` marks `vendor/**` `-text` so a
+    Windows checkout hashes the same bytes.
+  - *A dependency, not a member.* Cargo does not make a patch path a member, but
+    `exclude = ["vendor"]` states it, so no workspace lint, format or test runs over the copy
+    and `[profile.dev.package."*"]` applies as to the registry build. Cargo caps no lints on a
+    path source, so the copy's own warnings show in a clippy run; `-D warnings` reaches the
+    selected packages only, so they fail nothing.
+  - *Reported upstream by the owner, dropped at the first bump that carries it.* A patch
+    nobody reports is a fork by instalments. Rapier's master still called the inherent
+    `sin_cos` on 2026-10-11.
+  - Rules out: a git fork; a patch over the cap; a patch to a manifest record; a vendored
+    copy with no patch; prose as the record; a per-boundary mechanism; a patch declared
+    anywhere but the root manifest.
+- What the proposal's review changed (0 blocking, 3 serious, 5 minor, 2 process): the shadow
+  manifest's `[workspace]` table, pinning and command, and cargo-deny's exit status as the
+  verdict; the online re-derivation of the record; cargo configuration files and non-member
+  path packages outside `vendor/` as findings; the one-version rule and `package` keys; the
+  determinism review in the binding text; the file list in place of "under `src/`"; the
+  notice; the row 83 replacement; the check as its own lane before Rapier; the owner files
+  the upstream report.
+- Driven by: the `physics-rapier` lane (2026-10-10), its report's proposed rule and the review
+  brief's vendored-patch item; the planner's and the reviewer's probes (2026-10-11).
+- Replaced: nothing stated; the lane brief's "prefer the patch if it is under fifty lines,
+  else refuse".
+- What the check's two reviews changed (round 1: 1 blocking, 4 serious, 4 minor; round 2:
+  2 serious, 4 minor). Cargo reads nothing the check does not: an `include` key in a cargo
+  configuration file, a cargo configuration file or `.cargo` directory committed as a
+  symbolic link, one git tracks under a directory the file walk skips, a config alias that
+  passes `--config` or `-Z`, any `--config` in a workflow or script, and a line that sets
+  `CARGO_HOME` are findings (`cargo xtask boundary` refuses the `include` key and the link
+  too). git is the authority on what a patch touches (`git apply --numstat`); a hunk git
+  places at an offset or with fuzz is refused in both directions, and the record with the
+  patch applied forward must equal the copy byte for byte. The graph is read with every
+  feature on. Nothing lives directly under `vendor/` but the copies, their patches and
+  `README.md`. An added line holds at most 200 characters and none of `unsafe`,
+  `no_mangle`, `export_name`, `link_section`, `link_name`, `naked`, `asm`, `global_asm`,
+  `naked_asm`, `include`, `include_str` or `include_bytes` as a whole identifier, with or
+  without `!`; a hunk's added lines hold no `path` attribute and no out-of-line `mod name;`.
+  A patch never touches a file that holds `unsafe`, before or after it, so no added line
+  sits inside an upstream `unsafe` block. A patch may change a build script but never
+  create one (`build.rs`, or what the manifest's `package.build` names). A token scan cannot
+  see unsafe code reached through macros the crate already has, or through a build
+  script's output; review is what covers those.
+
 ## 10. Review history
 
 - **Revision 1** (`a29af04`): the design baseline.

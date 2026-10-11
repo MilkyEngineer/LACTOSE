@@ -1,5 +1,6 @@
-//! The CI driver: the tier check, the static boundary checks, the feature-tree comparison and
-//! the mode runner of the determinism harness (architecture sections 3, 8.2, 8.3 and 21).
+//! The CI driver: the tier check, the static boundary checks, the feature-tree comparison, the
+//! check of crates built from a patched copy and the mode runner of the determinism harness
+//! (architecture sections 3, 8.2, 8.3 and 21).
 //!
 //! Leaf tier, outside the determinism boundary. See `README.md`.
 //!
@@ -16,6 +17,7 @@ pub mod policy;
 pub mod repo;
 mod rust_source;
 pub mod tiers;
+pub mod vendor;
 pub mod workspace;
 
 use std::fmt;

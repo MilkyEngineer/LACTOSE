@@ -84,6 +84,14 @@ impl Package {
 pub struct ResolvedPackage {
     /// The package name.
     pub name: String,
+    /// The package version.
+    pub version: String,
+    /// The source cargo took it from (`registry+https://...` for crates.io), or `None` for a
+    /// path package: a member, or a dependency given by `path` or by a `[patch]` path.
+    pub source: Option<String>,
+    /// The package manifest: relative to the workspace root with `/` separators when it is
+    /// inside it, else absolute.
+    pub manifest: String,
     /// True for a workspace member.
     pub member: bool,
     /// The package IDs of its normal and build dependencies, under the workspace's own
@@ -201,9 +209,9 @@ struct RawMetadata {
 #[derive(Deserialize)]
 struct RawPackage {
     name: String,
-    #[serde(default)]
     version: String,
     id: String,
+    source: Option<String>,
     manifest_path: String,
     dependencies: Vec<RawDep>,
     targets: Vec<RawTarget>,
@@ -361,17 +369,24 @@ pub fn parse_metadata(json: &str) -> Result<Metadata, String> {
         raw.packages.iter().map(|p| (p.id.as_str(), p)).collect();
     let mut resolved = BTreeMap::new();
     for node in raw.resolve.iter().flat_map(|resolve| &resolve.nodes) {
-        let package = by_id.get(node.id.as_str()).copied();
+        let package = by_id
+            .get(node.id.as_str())
+            .copied()
+            .ok_or_else(|| format!("cargo metadata output: no package `{}`", node.id))?;
         let ships = |dep: &&RawNodeDep| {
             let shipping_kind = dep.dep_kinds.is_empty()
                 || dep.dep_kinds.iter().any(|k| k.kind.as_deref() != Some("dev"));
             let to = by_id.get(dep.pkg.as_str()).map_or(dep.pkg.as_str(), |p| p.name.as_str());
-            shipping_kind && package.is_none_or(|package| compiles(package, node, dep, to))
+            shipping_kind && compiles(package, node, dep, to)
         };
         resolved.insert(
             node.id.clone(),
             ResolvedPackage {
-                name: package.map_or(node.id.as_str(), |p| p.name.as_str()).to_owned(),
+                name: package.name.clone(),
+                version: package.version.clone(),
+                source: package.source.clone(),
+                manifest: relative(&raw.workspace_root, &package.manifest_path)
+                    .unwrap_or_else(|_| package.manifest_path.replace('\\', "/")),
                 member: members.contains(node.id.as_str()),
                 deps: node.deps.iter().filter(ships).map(|dep| dep.pkg.clone()).collect(),
             },
@@ -411,8 +426,19 @@ pub fn parse_metadata(json: &str) -> Result<Metadata, String> {
 /// If cargo cannot be run, fails (it does if `Cargo.lock` is out of date), or prints
 /// something [`parse_metadata`] rejects.
 pub fn load_metadata(cargo: &str, dir: &Path) -> Result<Metadata, String> {
+    cargo_metadata(cargo, dir, &[])
+}
+
+/// [`load_metadata`] with `extra` arguments for `cargo metadata`: `--no-deps` reads the
+/// members without resolving the graph, so no `[patch]` path is loaded, and `--offline`
+/// keeps cargo off the network.
+///
+/// # Errors
+/// As [`load_metadata`].
+pub fn cargo_metadata(cargo: &str, dir: &Path, extra: &[&str]) -> Result<Metadata, String> {
     let output = Command::new(cargo)
         .args(["metadata", "--format-version", "1", "--locked"])
+        .args(extra)
         .current_dir(dir)
         .output()
         .map_err(|e| format!("cannot run `{cargo} metadata`: {e}"))?;
@@ -464,6 +490,21 @@ pub(crate) mod fixture {
         }
     }
 
+    /// The source cargo reports for a crates.io package.
+    pub(crate) const CRATES_IO: &str = "registry+https://github.com/rust-lang/crates.io-index";
+
+    /// A crates.io package of the resolved graph with no dependencies.
+    pub(crate) fn registry(name: &str, version: &str) -> ResolvedPackage {
+        ResolvedPackage {
+            name: name.to_owned(),
+            version: version.to_owned(),
+            source: Some(CRATES_IO.to_owned()),
+            manifest: format!("/registry/{name}-{version}/Cargo.toml"),
+            member: false,
+            deps: Vec::new(),
+        }
+    }
+
     /// A workspace of `packages` whose resolved graph mirrors their shipping edges, extended
     /// by `third_party`: the dependencies of crates outside the workspace.
     pub(crate) fn workspace_with(
@@ -476,29 +517,24 @@ pub(crate) mod fixture {
             let deps = package.deps.iter().filter(|d| d.kind.ships()).map(|d| d.name.clone());
             resolved.insert(
                 package.name.clone(),
-                ResolvedPackage { name: package.name.clone(), member: true, deps: deps.collect() },
+                ResolvedPackage {
+                    source: None,
+                    manifest: package.manifest(),
+                    member: true,
+                    deps: deps.collect(),
+                    ..registry(&package.name, "0.0.0")
+                },
             );
             for dep in package.deps.iter().filter(|d| d.source != DepSource::Member) {
-                resolved.entry(dep.name.clone()).or_insert_with(|| ResolvedPackage {
-                    name: dep.name.clone(),
-                    member: false,
-                    deps: Vec::new(),
-                });
+                resolved.entry(dep.name.clone()).or_insert_with(|| registry(&dep.name, "1.0.0"));
             }
         }
         for &(name, deps) in third_party {
             let deps: Vec<String> = deps.iter().map(|d| (*d).to_owned()).collect();
             for dep in &deps {
-                resolved.entry(dep.clone()).or_insert_with(|| ResolvedPackage {
-                    name: dep.clone(),
-                    member: false,
-                    deps: Vec::new(),
-                });
+                resolved.entry(dep.clone()).or_insert_with(|| registry(dep, "1.0.0"));
             }
-            resolved.insert(
-                name.to_owned(),
-                ResolvedPackage { name: name.to_owned(), member: false, deps },
-            );
+            resolved.insert(name.to_owned(), ResolvedPackage { deps, ..registry(name, "1.0.0") });
         }
         Workspace {
             packages,
@@ -520,23 +556,25 @@ mod tests {
 
     const JSON: &str = r#"{
       "packages": [
-        {"name": "lactose-core", "id": "core-id", "manifest_path": "C:\\ws\\crates\\core\\Cargo.toml",
+        {"name": "lactose-core", "version": "0.0.0", "id": "core-id", "manifest_path": "C:\\ws\\crates\\core\\Cargo.toml",
          "dependencies": [
            {"name": "bytemuck", "kind": null, "path": null},
            {"name": "xxhash-rust", "kind": "dev", "path": null},
            {"name": "shim", "kind": null, "path": "C:\\elsewhere"}],
          "targets": [{"kind": ["lib"], "src_path": "C:\\ws\\crates\\core\\src\\lib.rs"},
                      {"kind": ["test"], "src_path": "C:\\ws\\crates\\core\\tests\\t.rs"}]},
-        {"name": "lactose-reflect-macros", "id": "macros-id", "manifest_path": "C:\\ws\\crates\\reflect-macros\\Cargo.toml",
+        {"name": "lactose-reflect-macros", "version": "0.0.0", "id": "macros-id", "manifest_path": "C:\\ws\\crates\\reflect-macros\\Cargo.toml",
          "dependencies": [
            {"name": "lactose-core", "kind": "build", "path": "C:\\ws\\crates\\core"}],
          "targets": [{"kind": ["proc-macro"], "src_path": "C:\\ws\\crates\\reflect-macros\\src\\lib.rs"},
                      {"kind": ["custom-build"], "src_path": "C:\\ws\\crates\\reflect-macros\\build.rs"}]},
-        {"name": "bytemuck", "id": "bytemuck-id", "manifest_path": "C:\\registry\\bytemuck\\Cargo.toml",
+        {"name": "bytemuck", "version": "1.25.2", "id": "bytemuck-id", "source": "registry+https://github.com/rust-lang/crates.io-index",
+         "manifest_path": "C:\\registry\\bytemuck\\Cargo.toml",
          "dependencies": [], "targets": []},
-        {"name": "bytemuck_derive", "id": "derive-id", "manifest_path": "C:\\registry\\derive\\Cargo.toml",
+        {"name": "bytemuck_derive", "version": "1.12.1", "id": "derive-id", "source": null,
+         "manifest_path": "C:\\ws\\vendor\\bytemuck_derive-1.12.1\\Cargo.toml",
          "dependencies": [], "targets": []},
-        {"name": "xxhash-rust", "id": "xxhash-id", "manifest_path": "C:\\registry\\xxhash\\Cargo.toml",
+        {"name": "xxhash-rust", "version": "0.8.19", "id": "xxhash-id", "manifest_path": "C:\\registry\\xxhash\\Cargo.toml",
          "dependencies": [], "targets": []}
       ],
       "workspace_members": ["core-id", "macros-id"],
@@ -575,6 +613,31 @@ mod tests {
             (DepKind::Build, DepSource::Member)
         );
         assert_eq!(macros.manifest(), "crates/reflect-macros/Cargo.toml");
+    }
+
+    #[test]
+    fn the_resolved_graph_carries_versions_sources_and_manifests() {
+        let ws = parse_metadata(JSON).unwrap().workspace;
+        let node = |id: &str| {
+            let p = &ws.resolved[id];
+            (p.name.as_str(), p.version.as_str(), p.source.as_deref(), p.manifest.as_str())
+        };
+        assert_eq!(node("core-id"), ("lactose-core", "0.0.0", None, "crates/core/Cargo.toml"));
+        // A patched copy: no source, its manifest inside the workspace.
+        assert_eq!(
+            node("derive-id"),
+            ("bytemuck_derive", "1.12.1", None, "vendor/bytemuck_derive-1.12.1/Cargo.toml")
+        );
+        // Outside the workspace the manifest stays absolute.
+        assert_eq!(
+            node("bytemuck-id"),
+            (
+                "bytemuck",
+                "1.25.2",
+                Some("registry+https://github.com/rust-lang/crates.io-index"),
+                "C:/registry/bytemuck/Cargo.toml"
+            )
+        );
     }
 
     #[test]

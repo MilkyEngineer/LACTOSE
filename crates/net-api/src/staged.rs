@@ -48,9 +48,9 @@ pub struct StagedFrame {
     /// `app` copies it into `TickInput::time_scale` and into its pacer.
     pub time_scale: Option<TimeScale>,
     /// The processed-input acknowledgement for the receiving player: the newest input
-    /// tick the server has applied. `lactose-predict` confirms its ring up to it and
-    /// destroys a predicted spawn the server never echoed once this passes the spawn's
-    /// input tick (architecture section 7).
+    /// tick the server has applied. `lactose-predict` despawns a predicted spawn of the
+    /// receiving player the server never echoed once this is after the spawn's input tick
+    /// (architecture section 7); it confirms frames by their tick, not by this.
     pub acked_input: Option<Tick>,
     /// The input ticks of the receiving player for which the server substituted the
     /// previous input (architecture section 9.2): the client is told, so that
@@ -74,9 +74,9 @@ pub struct StagedFrame {
     pub moves: BTreeMap<StableKey, RegionId>,
     /// Replicated components the server removed from live entities, by (origin key,
     /// component key): from the gather's `Removed` entries. The hook applies them after
-    /// the moves and before the rows, through `World::remove` (per registered type until
-    /// the erased remove the README proposes); a row for the same pair in the same frame
-    /// then re-adds the component with the newer value. Never names a tombstoned key.
+    /// the moves and before the rows, through `World::remove_erased`; a row for the same
+    /// pair in the same frame then re-adds the component with the newer value. Never names a
+    /// tombstoned key.
     pub removed: BTreeSet<(StableKey, ComponentKey)>,
     /// Entities the server destroyed, by origin key: the tombstones of architecture
     /// section 9.3. A frame never names a key here and in `spawns`, in `removed` or among

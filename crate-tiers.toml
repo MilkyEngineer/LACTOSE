@@ -19,6 +19,11 @@
 # without the pinned target features).
 # Every dependency that is a path dependency must be a workspace member, and a dependency
 # whose name appears in this file is held to these rules wherever it comes from.
+# A crate built from a patched copy under vendor/ (architecture section 8.2, D123) is not a
+# path dependency: it is named by its crates.io name, replaced through [patch.crates-io] in
+# the root Cargo.toml, and held to the lists below under that name; `cargo xtask vendor`
+# proves the copy is the published archive plus its patch. Patching a crate on these lists
+# is a determinism review, as adding one is.
 
 [foundation]
 crates = [

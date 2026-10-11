@@ -400,11 +400,13 @@ pub fn restore(world: &mut World, snapshot: &PhysicsSnapshot) -> Result<()> {
     Ok(())
 }
 
-/// Tells the sync that `lactose-predict` corrected the rows of `keys` without recording the
-/// writes (`ColumnMut::write` without marking, so that `Changed<T>` does not see a
-/// correction): each key joins the pending set, and the next sync reads its `Transform`,
-/// `Velocity`, `RigidBody`, `Collider` and `Joint` rows as changed and pushes what differs
-/// from the solver. Called after [`restore`], before the next step, for every body row
+/// Tells the sync that `lactose-predict` corrected the rows of `keys`: each key joins the
+/// pending set, and the next sync reads its `Transform`, `Velocity`, `RigidBody`,
+/// `Collider` and `Joint` rows as changed and pushes what differs from the solver. The
+/// correction is written stamped (D122, which supersedes D119's unrecorded write for that
+/// crate), so a `Changed<T>` reader sees it once; this call remains the contract whether
+/// or not the writer stamps, since the pending set, not the ECS's marks, is what the
+/// backend is promised. Called after [`restore`], before the next step, for every body row
 /// corrected; a key that is not a body is ignored. Fails with `NotFound` if the world holds
 /// no [`Physics`].
 pub fn corrected(world: &mut World, keys: &[StableKey]) -> Result<()> {

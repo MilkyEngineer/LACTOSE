@@ -33,6 +33,7 @@ breaks one is a signature change to list.
 |---|---|
 | `TypeTable` | Registers every component and resource type once, for the registry and for the world hash; a crate's generated registration function fills it |
 | `SimulationBuilder`, `Simulation` | A world of one `WorldKind` with what setup functions insert, its tick schedule, its pass schedules, its hashers and its region lifecycle; built once, run from the timer root |
+| `SimulationBuilder::check` | A check over the world's registry and the systems registered for its kind, run at `build` before any schedule is built; its error fails the build |
 | `Simulation::step`, `Step`, `TickInput` | One tick from one frame of input, the unit of everything that enters the boundary |
 | `Simulation::run_passes`, `PassRun` | A frame's passes between ticks |
 | `Simulation::save_point`, `SavePointRun`, `SavePoint` | The save copy of every loaded region at a sync point |
@@ -61,7 +62,7 @@ slot, the lifecycle slot, the save slot). No consumer can name a system or the l
 
 | Consumer | Needs | Where |
 |---|---|---|
-| `app` (headless, milestone 1) | Build from a registry, a kind, SOUR's layout and chaos, an executor, setup functions and registration functions; order other crates' sets | `TypeTable`; `SimulationBuilder::{new, layout, setup, systems, inputs, sessions, staged_state, regions, policy, log_retention, build}`; `Registration::order` from a registration function of `app`'s own; chaos is the executor builder's |
+| `app` (headless, milestone 1) | Build from a registry, a kind, SOUR's layout and chaos, an executor, setup functions and registration functions; order other crates' sets | `TypeTable`; `SimulationBuilder::{new, layout, setup, systems, check, inputs, sessions, staged_state, regions, policy, log_retention, build}`; `Registration::order` from a registration function of `app`'s own; chaos is the executor builder's |
 | | A `'static` task owning the world and schedules, paced by `TickPacer`, driving `Schedule::run_tick` | `Simulation` is `Send` and owns both; `step` drives `run_tick`, `run_passes` the passes; the task, every clock and the time scale it paces by are `app`'s ("The timer root" below) |
 | | The overload ladder's inputs surfaced, not decided | `TickBudget::behind` from the pacer; `RegionPolicy::activation_radius` is the rung the ladder turns; decimation and join refusal are not here |
 | | Pause and time scale as a replicated resource | `TickInput::time_scale`, mirrored into `TimeScale` (replicated) by the sync point |
@@ -154,7 +155,7 @@ kind reads `Registration::kind`.
 let period = Duration::from_secs(1) / TICK_RATE_HZ;
 let mut pacer = TickPacer::new(Instant::now(), period, 4);
 loop {
-    let budget = pacer.poll(Instant::now(), resimulated_this_frame);
+    let budget = pacer.poll(Instant::now(), 0); // re-simulation does not share the cap (D122)
     for _ in 0..budget.ticks {
         simulation = simulation.step(&executor, next_frame()).await?;
     }
@@ -182,6 +183,17 @@ of the frame. `RunError` converts into `lactose_core::Error`, so `?` into a plai
 drops the simulation as a plain error would; a caller that wants to keep it matches. Every
 schedule is built and prepared at `build`, so a `ScheduleError` is a build error of kind
 `InvalidData` carrying it, never a run error, unless the world was changed since.
+
+`SimulationBuilder::check(f)` (D122) adds a check that `build` runs after every setup and
+registration function and before any schedule is built or prepared. Each check, in the
+order added, is called once with the world's registry and every system descriptor added
+for the builder's kind, in the order added: this crate's six input systems first, then
+those of the registration functions in the order their calls added them, across stages
+and passes, then `sim::save_copy` on a server. The first error fails the build as
+returned and the later checks do not run. `app` hands
+`lactose_predict::check_prediction_reads` to the prediction world's builder. The six
+exclusive systems of the input sync point are listed by name in
+`lactose_predict::EXCLUSIVE_SYSTEMS`; renaming one changes that list in the same commit.
 
 `Simulation::step(executor, input)` does the following, in this order, and nothing else:
 
@@ -249,6 +261,9 @@ and ordered among themselves by `after` edges. Their order is fixed in every wor
    an applier (the builder's default) every input is dropped and logged, after its input
    tick is set.
 5. `sim::apply_staged_state`: `StagedState::apply(world, tick)`. The default does nothing.
+   A `Prediction` world's `dyn StagedState` is replaced after build by
+   `lactose_predict::Predictor::new`, which owns the simulation from then on and reinstalls
+   the hook at `resync` (D122).
 6. `sim::apply_region_policy`: under `Anchored`, the policy ("Regions" below); under
    `Directed`, nothing. Last, so it sees the sessions' spawns.
 
@@ -615,4 +630,5 @@ lifecycle as `app` and `persist` would.
 | Orders | `runs.rs`: two crates' exclusive systems in one pass and after `sets::INPUT` fail to build unordered and run in the order `Registration::order` gives; the edges the schedules refuse, one before `sets::INPUT` included |
 | Refusals | `refusals.rs`, `runs.rs`, `sync_point.rs`: a bundle against another baseline, a second bundle for a loaded region, an unwanted bundle, a bad resource, a document schema the registry disagrees with, a table for an unloaded region, a frame's `modes` and `unloaded` under `Anchored`, a `Join` for a region outside the atlas, a non-`derived` world resource at build: each refused as stated, nothing changed, the tick runs, the failure is reported |
 | Runs | `runs.rs`: a removed resource fails the next run with the simulation inside the error, and `run_passes` prepares both passes first and `Gather` again after `Extract`, handing the simulation back; `save_point` off the server likewise; `Cancelled` hands nothing back; the log is trimmed to the retention and a lagging consumer sees `None`; the server drains presentation events |
+| The build check | `check.rs`: one call per build after every registration function, checks in the order added, with every system of the kind in registration order on a server, a prediction and a client world; a failing check's error fails the build before the schedule prepares and stops the later checks; a passing check leaves the hashes unchanged |
 | SOUR | `sour.rs`: the program of `tests/common` for 300 ticks, built from the session and recording `(tick, hash)` after every step |

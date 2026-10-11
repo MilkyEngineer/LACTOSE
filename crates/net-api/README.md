@@ -61,7 +61,7 @@ and its source is part of the boundary build ID.
 | | The client worlds at the server's tick | `SimulationBuilder::tick(accepted.tick)` or `World::set_tick`, from `lactose-net-host`'s `JoinAccepted` |
 | `app` (server) | Register the gather and take its frame | `register_systems`, `setup`; `GatherState::take` between runs, the frame to the packer |
 | | The relevance message on a region entering a client's set | `RegionRelevance::from_export` over `RegionExport` and `persist`'s overlay; `with_digest` for a client that caches |
-| `lactose-net` (milestone 4) | The client's `StagedState` hook's input and output | `StagedInbox::pop_through`, `StagedFrame`'s fields, `RemoteSlot`; rows written and `removed` applied through the erased write and remove proposed below, or typed per registered type until then |
+| `lactose-net` (milestone 4) | The client's `StagedState` hook's input and output | `StagedInbox::pop_through`, `StagedFrame`'s fields, `RemoteSlot`; rows written and `removed` applied through `lactose-ecs`'s `World::insert_erased` and `World::remove_erased`, spawns through `World::spawn_erased` |
 | | Resync and late join as one path | `StagedFrame::resync`, `full` |
 | The milestone 1 spike | The same, typed by hand for its few components | `tests/consumers.rs`: the client hook, the prediction hook, `app` between runs on both ends, the gather |
 | `lactose-predict` | Binds for its own predicted spawns; which entities the local player has claimed, as claims and releases arrive; the proxies' per-tick history; the reconciliation record; the processed-input acknowledgement; substituted ticks; moves and removals | `StagedSpawn::origin` with the local player; `StagedSpawn::slot` on a spawn of a live key (`None`: claimed, start predicting it; `Some`: released, stop); `StagedRow` with `exact: false` by `(key, tick)`; `StagedRow` with `exact: true` for claimed entities; `StagedFrame::{acked_input, substituted, moves, removed}` |
@@ -148,22 +148,26 @@ which `build`'s `derived` check does not see.
   local player (binds) and spawns of a live key, whose `slot` says whether the local
   player now has the entity claimed (`None`: start predicting it) or released it (`Some`:
   stop), `moves`, `removed`, the rows (`exact: false` into the proxies' per-tick history,
-  `exact: true` into the reconciliation record), `acked_input` and `substituted`.
+  `exact: true` into the reconciliation record), `acked_input` and `substituted`. The
+  prediction world's hook also applies spawns of unclaimed entities, moves, removals and
+  tombstones as the replicated world's does, without `RemoteSlot`, so the prediction world
+  holds every relevant entity as a proxy; a claimed entity's spawn, rows, move, removal and
+  tombstone are reconciliation facts it never writes directly (D122).
   `TimeScale` is a replicated world resource, and resources are not gathered: the
   server's `app` puts its own value in the frame.
 - What the replicated world's hook does, in this order and nothing else, for each frame
   `pop_through` hands it: each spawn in ascending `NetId` order, as an upsert if
   `StagedSpawn::key(net)` is live (each component written whole so that an equal value
-  does not dirty the row, through `Mut::set_if_neq` or the erased write proposed below,
-  added if the row lacks it; `RemoteSlot` set to `slot` or removed when `slot` is `None`)
-  and otherwise `World::spawn` in its region with its components, then `World::bind(origin,
-  net)` if `origin` is `Some`, then `World::insert(key, RemoteSlot { slot })` if `slot` is
-  `Some`; then each move in ascending key order, `World::move_to_region(key, region)`
-  unless `World::region_of(key)` is already `region` (an owned entity moved with its owner)
-  or the key is not live; then each removal in ascending (key, component) order,
-  `World::remove` of that component (per registered type until the erased remove proposed
-  below), nothing if the entity or the component is absent; then each row in ascending
-  (key, component) order, written as an upsert writes a component (so a row for a pair
+  does not dirty the row, through `World::insert_erased`, or `Mut::set_if_neq` in a hook
+  typed by hand, added if the row lacks it; `RemoteSlot` set to `slot` or removed when
+  `slot` is `None`) and otherwise `World::spawn_erased` in its region with its components,
+  then `World::bind(origin, net)` if `origin` is `Some`, then `World::insert(key,
+  RemoteSlot { slot })` if `slot` is `Some`; then each move in ascending key order,
+  `World::move_to_region(key, region)` unless `World::region_of(key)` is already `region`
+  (an owned entity moved with its owner) or the key is not live; then each removal in
+  ascending (key, component) order, `World::remove_erased` of that component, nothing if
+  the entity or the component is absent; then each row in ascending (key, component)
+  order, written as an upsert writes a component (so a row for a pair
   removed in the same frame re-adds the component with the newer value), nothing if the
   entity does not exist (its spawn was lost and the server resends it, since nothing of
   it is acknowledged); then each tombstone in ascending key order, `World::despawn` if
@@ -317,18 +321,6 @@ which `build`'s `derived` check does not see.
 
 ## Not in this crate yet
 
-- An erased row write in `lactose-ecs`: the client's hook writes every registered
-  replicated type from bytes, and the ECS has only typed writes (`World::insert`,
-  `get_mut`, `columns_mut`), so milestone 4's hook needs either a per-type writer
-  monomorphised at registration (as `lactose-sim`'s `TypeTable` monomorphises hashers) or
-  the ECS methods proposed in D121: `World::insert_erased(key, &ComponentData) ->
-  Result<bool>`, validating through the registry and stamping only when the bytes differ,
-  `World::remove_erased(key, ComponentKey) -> Result<bool>`, the erased `World::remove`
-  (`false` when the row lacks the component), and `World::spawn_erased(key, region,
-  &[ComponentData])`, the direct form of what `load_region` already does. The upsert, the
-  removal and the move above are written against them; until they exist the hook writes
-  and removes per registered type. The spike's hook is typed by hand
-  (`tests/consumers.rs`).
 - The readiness hold (architecture section 14): holding a player at a region boundary
   moves simulation state, so readiness enters the server tick as a journaled input at
   milestone 4, a `lactose-sim` addition (`SessionEvent::Ready { region }` or a `TickInput`
