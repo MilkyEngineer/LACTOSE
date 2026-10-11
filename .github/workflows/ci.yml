@@ -19,6 +19,22 @@ env:
 # Architecture section 20: a pull request run finishes in fifteen minutes. Every job carries
 # that as its timeout, the three jobs run in parallel, and the cheap policy checks share one
 # Linux job so they pay for one checkout, one cache restore and one build of the CI driver.
+#
+# Where each job's budget goes, in minutes, from runs 38126112367 and 38126882535 (105 and 110
+# test binaries). rust-cache restores the dependencies; the workspace crates and the vendored
+# rapier3d-f64 are path crates, so every run compiles and links them again.
+# - check (windows-latest), 12.5 in the one whole run, then over 15: setup 0.5-1.3, clippy
+#   0.8-1.9, the test build 7.0-9.4 (the same commit took both on two runners), the test run
+#   0.8-1.3, doctests 0.1, the release golden vectors 0.9-1.2, cache save 0.2. The test build
+#   runs 1.4 to 2.3 times Linux's, by about as much in its early phase, which links almost
+#   nothing, as in its late one, which links the test binaries: the time is rustc's on this
+#   runner, not the linker's. lld-link (.cargo/config.toml) replaces link.exe for the part
+#   that is the linker's.
+# - check (ubuntu-latest), 6.4-6.9: setup 0.3, clippy 0.4-1.0, the test build 3.8-4.6, the
+#   test run 0.4-0.6, the release golden vectors 0.4-0.6. It links with lld already.
+# - check (macos-latest), 2.0-2.6: the test build 1.0-1.3, clippy 0.1-0.5.
+# - policy, 0.6-0.7: building the CI driver 0.25, the checks 0.1.
+# - sour, 4.2-4.8: the build of the harness packages' tests 2.9, three passes of 0.3 each.
 jobs:
   check:
     name: check (${{ matrix.os }})

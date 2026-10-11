@@ -8,6 +8,15 @@ rustflags = ["-C", "target-cpu=x86-64-v3"]
 # Cargo does not pass `rustflags` to rustdoc, so doctests need the same pin stated again.
 rustdocflags = ["-C", "target-cpu=x86-64-v3"]
 
+# Architecture section 18: lld-link on Windows. `rust-lld` ships inside the toolchain's own
+# sysroot, which rustc puts on the linker's search path, so no install step is needed; from the
+# name rustc drives it as lld-link (`-flavor link`) and still hands it the MSVC library paths it
+# finds itself. Only the linker is set here; the pin above stays the only rust flags.
+# x86_64-unknown-linux-gnu needs no entry: rustc links it with its bundled lld by default since
+# 1.90. macOS keeps Apple's linker.
+[target.x86_64-pc-windows-msvc]
+linker = "rust-lld.exe"
+
 # `cargo xtask <check>` runs the CI driver in tools/xtask (tier check, boundary checks, feature
 # trees, the SOUR mode runner). `cargo xtask help` lists the subcommands.
 [alias]
