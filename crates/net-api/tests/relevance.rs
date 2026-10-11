@@ -153,8 +153,15 @@ fn to_bundle_refuses_each_mismatch_as_version_mismatch() {
     );
     // An overlay made against another baseline, under a message naming this one.
     let foreign = overlay_against(other.content_hash(), vec![]);
-    let mislabelled = RegionRelevance { overlay: OverlayPayload::Full(foreign), ..message.clone() };
+    let mislabelled =
+        RegionRelevance { overlay: OverlayPayload::Full(Arc::clone(&foreign)), ..message.clone() };
     assert_kind(mislabelled.to_bundle(Arc::clone(&base), None, None), ErrorKind::VersionMismatch);
+    // The same overlay named by its digest, with that very copy cached: the digest matches,
+    // and the cached copy is still checked against the baseline (review r1, M1).
+    assert_kind(
+        mislabelled.with_digest().to_bundle(Arc::clone(&base), Some(&foreign), None),
+        ErrorKind::VersionMismatch,
+    );
     // And the matching cases succeed.
     assert!(message.to_bundle(Arc::clone(&base), None, None).is_ok());
     assert!(digested.to_bundle(Arc::clone(&base), Some(&overlay), None).is_ok());

@@ -41,6 +41,36 @@ fn push_row_keeps_the_newest_row_and_refuses_an_older_or_equal_one() {
 }
 
 #[test]
+fn push_row_refuses_a_row_after_the_frame_or_of_another_length_and_the_arena_never_grows() {
+    let mut frame = StagedFrame::new(Tick(20));
+    // A row from a tick after the frame's, held or not.
+    assert!(!frame.push_row(key(1), Health::KEY, Tick(21), false, bytes(&Health(1))));
+    assert_eq!(frame.row_count(), 0);
+    assert!(frame.push_row(key(1), Health::KEY, Tick(20), false, bytes(&Health(1))));
+    let mut frame = StagedFrame::new(Tick(1_000_000));
+    // One (key, component), newer ticks each time, two alternating lengths (review r1,
+    // M2): only the pushes of the held length are staged, in place. The arena is seen
+    // through the derived `Debug`, which prints it.
+    let small = [1u8; 1024];
+    let large = [2u8; 1025];
+    assert!(frame.push_row(key(1), Health::KEY, Tick(1), false, &small));
+    let held = format!("{frame:?}").len();
+    let mut staged = 0;
+    for tick in 2..2002u32 {
+        let pushed = if tick % 2 == 0 { &large[..] } else { &small[..] };
+        let accepted = frame.push_row(key(1), Health::KEY, Tick(tick), tick % 3 == 0, pushed);
+        assert_eq!(accepted, pushed.len() == small.len(), "tick {tick}");
+        staged += usize::from(accepted);
+    }
+    assert_eq!(staged, 1000);
+    assert_eq!(frame.row_count(), 1);
+    let row = frame.row(key(1), Health::KEY).expect("held");
+    assert_eq!((row.tick, row.bytes.len()), (Tick(2001), small.len()));
+    // The tick and precision fields printed may differ in width, never by a kilobyte.
+    assert!(format!("{frame:?}").len() < held + 32, "the arena grew");
+}
+
+#[test]
 fn rows_ascend_by_key_then_component_whatever_the_push_order() {
     let pushes = [
         (key(3), Position::KEY, bytes(&Position { x: 3, y: 0 }).to_vec()),
@@ -186,20 +216,62 @@ fn due_and_pop_through_agree_and_hand_frames_up_to_a_tick_oldest_first() {
 }
 
 #[test]
-fn a_frame_queued_after_the_present_is_visible_to_the_prediction_world() {
-    // `lactose-predict` reads, after its steps, whether a frame for a tick after the
-    // present waits: everything queued minus what is due at the present.
+fn oldest_after_names_the_oldest_frame_after_the_present_with_one_still_due() {
+    // `lactose-predict` after a frame in which no step ran: the frame for the present is
+    // still queued, and the one after it is what the server is ahead by (review r1, S1).
     let mut inbox = StagedInbox::new();
-    for tick in [10, 11, 14] {
+    for tick in [11, 14, 15] {
         assert!(inbox.push(frame(tick)));
     }
     let present = Tick(11);
-    while inbox.pop_through(present).is_some() {}
-    let waiting = inbox.len() - inbox.due(present).count();
-    assert_eq!(waiting, 1);
-    // The oldest such tick, through `due` over the half of the tick circle ahead.
-    let horizon = Tick(present.0.wrapping_add(i32::MAX as u32));
-    assert_eq!(inbox.due(horizon).next().map(|frame| frame.tick), Some(Tick(14)));
+    assert_eq!(inbox.oldest_after(present), Some(Tick(14)));
+    assert_eq!(inbox.oldest_after(Tick(10)), Some(Tick(11)));
+    assert_eq!(inbox.oldest_after(Tick(14)), Some(Tick(15)));
+    assert_eq!(inbox.oldest_after(Tick(15)), None);
+    // It reads and takes nothing, and agrees with `due`: the first frame `due` leaves out.
+    assert_eq!(inbox.len(), 3);
+    for present in 9..17 {
+        let due = inbox.due(Tick(present)).count();
+        assert_eq!(
+            inbox.oldest_after(Tick(present)),
+            ticks(inbox.due(Tick(u32::MAX >> 1))).get(due).map(|&tick| Tick(tick)),
+            "present {present}"
+        );
+    }
+    // Across the wrap.
+    let mut inbox = StagedInbox::new();
+    for tick in [u32::MAX - 1, u32::MAX, 0, 3] {
+        assert!(inbox.push(frame(tick)));
+    }
+    assert_eq!(inbox.oldest_after(Tick(u32::MAX)), Some(Tick(0)));
+    assert_eq!(inbox.oldest_after(Tick(0)), Some(Tick(3)));
+    assert_eq!(inbox.oldest_after(Tick(3)), None);
+    assert_eq!(StagedInbox::new().oldest_after(Tick(0)), None);
+}
+
+#[test]
+fn reset_lets_a_rejoin_through_set_tick_accept_the_new_sessions_frames() {
+    // A client that accepted frames up to 100 re-joins a server whose tick is 40 (review
+    // r1, S2): without `reset` the inbox refuses the resync and everything after it.
+    for with_reset in [false, true] {
+        let (mut client, _) = client(Tick(95));
+        for tick in 96..=100 {
+            assert!(inbox(&mut client).push(frame(tick)));
+        }
+        assert_eq!(inbox(&mut client).accepted_tick(), Some(Tick(100)));
+        client.world_mut().set_tick(Tick(40)).expect("set_tick");
+        if with_reset {
+            inbox(&mut client).reset();
+            assert!(inbox(&mut client).is_empty());
+            assert_eq!(inbox(&mut client).accepted_tick(), None);
+        }
+        let full = inbox(&mut client).push(Arc::new(StagedFrame::resync(Tick(40))));
+        let next = inbox(&mut client).push(frame(41));
+        assert_eq!((full, next), (with_reset, with_reset), "with reset: {with_reset}");
+        let queued = ticks(inbox(&mut client).due(Tick(1 << 30)));
+        let expected = if with_reset { vec![40, 41] } else { vec![96, 97, 98, 99, 100] };
+        assert_eq!(queued, expected, "with reset: {with_reset}");
+    }
 }
 
 // ---- The hook ----

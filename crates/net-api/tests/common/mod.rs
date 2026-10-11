@@ -234,9 +234,14 @@ pub type Skipped = Arc<Mutex<Vec<(&'static str, StableKey, ErrorKind)>>>;
 /// `lactose-net`'s hook as the README states it, written through the erased writes:
 /// spawns (upserts for live keys), moves, removals, rows, tombstones, in that order, each
 /// failing entry logged into `skipped` and skipped.
+/// How many times each path of the hook ran, by name: `spawn`, `upsert`, `bind`, `slot set`,
+/// `slot removed`, `move`, `remove`, `row` and `tombstone`.
+pub type Paths = Arc<Mutex<BTreeMap<&'static str, usize>>>;
+
 #[derive(Default)]
 pub struct ClientHook {
     pub skipped: Skipped,
+    pub paths: Paths,
 }
 
 impl StagedState for ClientHook {
@@ -244,55 +249,67 @@ impl StagedState for ClientHook {
         while let Some(frame) =
             world.service_mut::<StagedInbox>().expect("setup inserted it").pop_through(tick)
         {
-            apply_frame(world, &frame, &self.skipped);
+            apply_frame(world, &frame, &self.skipped, &self.paths);
         }
         Ok(())
     }
 }
 
-pub fn apply_frame(world: &mut World, frame: &StagedFrame, skipped: &Skipped) {
+pub fn apply_frame(world: &mut World, frame: &StagedFrame, skipped: &Skipped, paths: &Paths) {
     let skip = |what: &'static str, key: StableKey, error: Error| {
         skipped.lock().expect("never poisoned").push((what, key, error.kind()));
     };
+    let ran = |path: &'static str| {
+        *paths.lock().expect("never poisoned").entry(path).or_default() += 1;
+    };
     for (&net, spawn) in &frame.spawns {
         let key = spawn.key(net);
-        if let Err(error) = apply_spawn(world, key, net, spawn) {
+        if let Err(error) = apply_spawn(world, key, net, spawn, &ran) {
             skip("spawn", key, error);
         }
     }
     for (&key, &region) in &frame.moves {
-        if world.contains(key)
-            && world.region_of(key) != Some(region)
-            && let Err(error) = world.move_to_region(key, region)
-        {
-            skip("move", key, error);
+        if world.contains(key) && world.region_of(key) != Some(region) {
+            match world.move_to_region(key, region) {
+                Ok(()) => ran("move"),
+                Err(error) => skip("move", key, error),
+            }
         }
     }
     for &(key, component) in &frame.removed {
-        if world.contains(key)
-            && let Err(error) = world.remove_erased(key, component)
-        {
-            skip("remove", key, error);
+        if world.contains(key) {
+            match world.remove_erased(key, component) {
+                Ok(_) => ran("remove"),
+                Err(error) => skip("remove", key, error),
+            }
         }
     }
     for row in frame.rows() {
         if world.contains(row.key) {
             let data = ComponentData { component: row.component, bytes: row.bytes.to_vec() };
-            if let Err(error) = world.insert_erased(row.key, &data) {
-                skip("row", row.key, error);
+            match world.insert_erased(row.key, &data) {
+                Ok(_) => ran("row"),
+                Err(error) => skip("row", row.key, error),
             }
         }
     }
     for (&key, Tombstone { .. }) in &frame.despawns {
-        if world.contains(key)
-            && let Err(error) = world.despawn(key)
-        {
-            skip("tombstone", key, error);
+        if world.contains(key) {
+            match world.despawn(key) {
+                Ok(()) => ran("tombstone"),
+                Err(error) => skip("tombstone", key, error),
+            }
         }
     }
 }
 
-fn apply_spawn(world: &mut World, key: StableKey, net: NetId, spawn: &StagedSpawn) -> Result<()> {
+fn apply_spawn(
+    world: &mut World,
+    key: StableKey,
+    net: NetId,
+    spawn: &StagedSpawn,
+    ran: &dyn Fn(&'static str),
+) -> Result<()> {
     if world.contains(key) {
         for data in &spawn.components {
             world.insert_erased(key, data)?;
@@ -300,19 +317,26 @@ fn apply_spawn(world: &mut World, key: StableKey, net: NetId, spawn: &StagedSpaw
         match spawn.slot {
             Some(slot) => {
                 world.insert_erased(key, &data(RemoteSlot { slot }))?;
+                ran("slot set");
             }
             None => {
-                world.remove::<RemoteSlot>(key)?;
+                if world.remove::<RemoteSlot>(key)?.is_some() {
+                    ran("slot removed");
+                }
             }
         }
+        ran("upsert");
         return Ok(());
     }
     world.spawn_erased(key, spawn.region, &spawn.components)?;
+    ran("spawn");
     if let Some(origin) = spawn.origin {
         world.bind(origin, net)?;
+        ran("bind");
     }
     if let Some(slot) = spawn.slot {
         world.insert(key, RemoteSlot { slot })?;
+        ran("slot set");
     }
     Ok(())
 }
@@ -443,30 +467,95 @@ pub fn frame_digest(frame: &StagingFrame) -> u64 {
     xxh64(text.as_bytes(), 0)
 }
 
-// ---- The packer: gathered frames into staged frames for one client that sees all ----
+// ---- The packer: gathered frames into staged frames for one client ----
 
-/// A stand-in for `lactose-net`'s packer for one client to whom every region is relevant,
-/// at full precision: its mirror of what the client holds, built from gathered frames
-/// alone, and the slots it allocated.
+/// A stand-in for `lactose-net`'s packer for one client, at full precision: its mirror of
+/// the server's replicated state, built from gathered frames alone; the regions relevant
+/// to the client and those it was told of; the entities the client has claimed; and the
+/// slots it allocated. The client holds the mirror's entities in the regions it was told
+/// are relevant.
 pub struct Packer {
-    pub baseline: Arc<Baseline>,
+    baselines: BTreeMap<RegionId, Arc<Baseline>>,
     mirror: BTreeMap<StableKey, (RegionId, BTreeMap<ComponentKey, Vec<u8>>)>,
+    relevant: BTreeSet<RegionId>,
+    told: BTreeSet<RegionId>,
+    claimed: BTreeSet<StableKey>,
+    claim_changes: BTreeSet<StableKey>,
     next_slot: u32,
 }
 
 impl Packer {
-    pub fn new(baseline: Arc<Baseline>) -> Self {
-        Self { baseline, mirror: BTreeMap::new(), next_slot: 0 }
+    /// A packer for a client to which `relevant` are relevant, each region's state its
+    /// cooked baseline in `baselines`.
+    pub fn new(baselines: BTreeMap<RegionId, Arc<Baseline>>, relevant: &[RegionId]) -> Self {
+        Self {
+            baselines,
+            mirror: BTreeMap::new(),
+            relevant: relevant.iter().copied().collect(),
+            told: BTreeSet::new(),
+            claimed: BTreeSet::new(),
+            claim_changes: BTreeSet::new(),
+            next_slot: 0,
+        }
     }
 
-    fn spawn_of(&mut self, key: StableKey) -> (NetId, StagedSpawn) {
-        let StableKey::Net(net) = key else { panic!("the scene spawns `Net` keys") };
+    /// Makes `region` relevant or not, from the next frame packed.
+    pub fn set_relevant(&mut self, region: RegionId, relevant: bool) {
+        if relevant {
+            self.relevant.insert(region);
+        } else {
+            self.relevant.remove(&region);
+        }
+    }
+
+    /// The regions the client was told are relevant, by the last frame packed.
+    pub fn told(&self) -> &BTreeSet<RegionId> {
+        &self.told
+    }
+
+    /// The client claims `key`, or releases it, from the next frame packed.
+    pub fn set_claimed(&mut self, key: StableKey, claimed: bool) {
+        let changed = if claimed { self.claimed.insert(key) } else { self.claimed.remove(&key) };
+        if changed {
+            self.claim_changes.insert(key);
+        }
+    }
+
+    /// Whether the client has claimed `key`.
+    pub fn claimed(&self, key: StableKey) -> bool {
+        self.claimed.contains(&key)
+    }
+
+    /// The entities the client holds after a frame: the mirror's, in the regions it knows.
+    fn held(&self, regions: &BTreeSet<RegionId>) -> BTreeMap<StableKey, RegionId> {
+        self.mirror
+            .iter()
+            .filter(|(_, entity)| regions.contains(&entity.0))
+            .map(|(&key, entity)| (key, entity.0))
+            .collect()
+    }
+
+    /// The spawn of `key`: under its `NetId`, with the origin the server bound for a
+    /// predicted key, a fresh slot unless claimed, and every component the mirror holds.
+    fn spawn_of(&mut self, key: StableKey, world: &World) -> (NetId, StagedSpawn) {
+        let (net, origin) = match key {
+            StableKey::Net(net) => (net, None),
+            StableKey::Predicted(predicted) => {
+                (world.alias(predicted).expect("the server bound it"), Some(predicted))
+            }
+            StableKey::Placeholder(_) => panic!("a gathered key is never a placeholder"),
+        };
+        let slot = if self.claimed.contains(&key) {
+            None
+        } else {
+            self.next_slot += 1;
+            Some(slot(self.next_slot))
+        };
         let (region, components) = &self.mirror[&key];
-        self.next_slot += 1;
         let spawn = StagedSpawn {
-            origin: None,
+            origin,
             region: *region,
-            slot: Some(slot(self.next_slot)),
+            slot,
             components: components
                 .iter()
                 .map(|(&component, bytes)| ComponentData { component, bytes: bytes.clone() })
@@ -475,21 +564,17 @@ impl Packer {
         (net, spawn)
     }
 
-    /// The staged frame for `gathered`; `regions` are the server's regions, all relevant.
-    pub fn pack(&mut self, gathered: &StagingFrame, regions: &[RegionId]) -> StagedFrame {
-        let known: BTreeMap<StableKey, RegionId> =
-            self.mirror.iter().map(|(&key, entity)| (key, entity.0)).collect();
+    /// The staged frame for `gathered`, from the server world `world` it was gathered in.
+    pub fn pack(&mut self, gathered: &StagingFrame, world: &World) -> StagedFrame {
+        let before = self.held(&self.told);
         if gathered.full {
             self.mirror.clear();
         }
-        let mut spawned = BTreeSet::new();
-        let mut moved = BTreeSet::new();
         let mut removed = BTreeSet::new();
         for entry in gathered.structural() {
             match entry.change {
                 StructuralChange::Spawned { key, region } => {
                     self.mirror.insert(key, (region, BTreeMap::new()));
-                    spawned.insert(key);
                 }
                 StructuralChange::Despawned { key, .. } => {
                     self.mirror.remove(&key);
@@ -497,7 +582,6 @@ impl Packer {
                 StructuralChange::Moved { key, to, .. } => {
                     if let Some(entity) = self.mirror.get_mut(&key) {
                         entity.0 = to;
-                        moved.insert(key);
                     }
                 }
                 StructuralChange::Removed { key, component } => {
@@ -516,53 +600,61 @@ impl Packer {
             entity.0 = row.region;
             entity.1.insert(row.component, row.bytes.to_vec());
         }
+        let unloaded: BTreeSet<RegionId> = self.told.difference(&self.relevant).copied().collect();
+        let loaded: BTreeSet<RegionId> = self.relevant.difference(&self.told).copied().collect();
+        self.told.clone_from(&self.relevant);
+        let after = self.held(&self.told);
 
-        let mut frame = if gathered.full {
+        if gathered.full {
             let mut frame = StagedFrame::resync(gathered.tick);
-            for &region in regions {
-                frame
-                    .regions
-                    .insert(region, RegionChange::Relevant(relevance(region, &self.baseline)));
+            for &region in &self.told {
+                let message = relevance(region, &self.baselines[&region]);
+                frame.regions.insert(region, RegionChange::Relevant(message));
             }
-            let keys: Vec<StableKey> = self.mirror.keys().copied().collect();
-            for key in keys {
-                let (net, spawn) = self.spawn_of(key);
+            for &key in after.keys() {
+                let (net, spawn) = self.spawn_of(key, world);
                 frame.spawns.insert(net, spawn);
             }
             frame.time_scale = Some(lactose_sim::TimeScale::REAL_TIME);
             frame.acked_input = Some(gathered.tick);
+            self.claim_changes.clear();
             return frame;
-        } else {
-            StagedFrame::new(gathered.tick)
-        };
-        for (&key, &region) in &known {
-            if !self.mirror.contains_key(&key) {
+        }
+
+        let mut frame = StagedFrame::new(gathered.tick);
+        for &region in &unloaded {
+            frame.regions.insert(region, RegionChange::Irrelevant);
+        }
+        for &region in &loaded {
+            let message = relevance(region, &self.baselines[&region]);
+            frame.regions.insert(region, RegionChange::Relevant(message));
+        }
+        // What the client still holds when its hook runs: the step unloads first.
+        let kept: BTreeMap<StableKey, RegionId> =
+            before.into_iter().filter(|(_, region)| !unloaded.contains(region)).collect();
+        for (&key, &region) in &kept {
+            if !after.contains_key(&key) {
                 frame.despawns.insert(key, Tombstone { region, tick: gathered.tick });
             }
         }
-        let fresh: Vec<StableKey> = spawned
-            .iter()
-            .copied()
-            .filter(|key| self.mirror.contains_key(key) && !known.contains_key(key))
-            .collect();
-        for &key in &fresh {
-            let (net, spawn) = self.spawn_of(key);
-            frame.spawns.insert(net, spawn);
-        }
-        for key in moved {
-            if known.contains_key(&key)
-                && let Some(entity) = self.mirror.get(&key)
-            {
-                frame.moves.insert(key, entity.0);
+        let claim_changes = std::mem::take(&mut self.claim_changes);
+        for (&key, &region) in &after {
+            let fresh = !kept.contains_key(&key);
+            if fresh || claim_changes.contains(&key) {
+                let (net, spawn) = self.spawn_of(key, world);
+                frame.spawns.insert(net, spawn);
+            }
+            if !fresh && kept[&key] != region {
+                frame.moves.insert(key, region);
             }
         }
         for (key, component) in removed {
-            if known.contains_key(&key) && self.mirror.contains_key(&key) {
+            if kept.contains_key(&key) && after.contains_key(&key) {
                 frame.removed.insert((key, component));
             }
         }
         for row in gathered.rows() {
-            if known.contains_key(&row.key) && self.mirror.contains_key(&row.key) {
+            if kept.contains_key(&row.key) && after.contains_key(&row.key) {
                 assert!(frame.push_row(row.key, row.component, row.tick, true, row.bytes));
             }
         }

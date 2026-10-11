@@ -126,7 +126,12 @@ impl StagedFrame {
     /// full-precision bytes, for an entity the receiving player has claimed) or
     /// dequantised. A row newer than the one held for `(key, component)` replaces it, an
     /// older or equal one is ignored and `false` returned, so the newest received state
-    /// wins whatever order packets arrived in.
+    /// wins whatever order packets arrived in. A row from a tick after the frame's, or of
+    /// another length than the row held, is refused the same way: a component's image has
+    /// one size, which the receiver checks against the registry before it pushes the first
+    /// row, so a held row is overwritten in place and the frame's arena never grows with
+    /// the packets that arrive.
+    #[must_use = "a refused row is not staged"]
     pub fn push_row(
         &mut self,
         key: StableKey,
@@ -135,22 +140,19 @@ impl StagedFrame {
         exact: bool,
         bytes: &[u8],
     ) -> bool {
+        if after(tick, self.tick) {
+            return false;
+        }
         match self.rows.entry((key, component)) {
             btree_map::Entry::Occupied(mut entry) => {
                 let slot = entry.get_mut();
-                if !after(tick, slot.tick) {
+                if !after(tick, slot.tick) || slot.len as usize != bytes.len() {
                     return false;
                 }
                 slot.tick = tick;
                 slot.exact = exact;
-                if slot.len as usize == bytes.len() {
-                    // A component's image has one size, so a newer row overwrites in place
-                    // and the arena does not grow with the packets that arrive.
-                    let start = slot.start as usize;
-                    self.bytes[start..start + bytes.len()].copy_from_slice(bytes);
-                } else {
-                    (slot.start, slot.len) = append(&mut self.bytes, bytes);
-                }
+                let start = slot.start as usize;
+                self.bytes[start..start + bytes.len()].copy_from_slice(bytes);
             }
             btree_map::Entry::Vacant(entry) => {
                 let (start, len) = append(&mut self.bytes, bytes);
@@ -383,6 +385,24 @@ impl StagedInbox {
     #[must_use]
     pub fn due(&self, tick: Tick) -> DueFrames<'_> {
         DueFrames { frames: self.frames.iter(), through: tick }
+    }
+
+    /// The tick of the oldest queued frame that is after `tick`: the first frame that will
+    /// not apply in the step for `tick`, or `None` when every queued frame is due by then.
+    /// `lactose-predict` asks it with the present tick to learn the server is ahead.
+    #[must_use]
+    pub fn oldest_after(&self, tick: Tick) -> Option<Tick> {
+        // Queued ticks ascend, so the frames due at `tick` are a prefix.
+        self.frames.iter().map(|frame| frame.tick).find(|&queued| after(queued, tick))
+    }
+
+    /// Empties the inbox and forgets the newest tick it accepted, so the next frame pushed
+    /// is accepted whatever its tick. A re-join that moves the world's tick with
+    /// `World::set_tick` calls it beside that call: the new session's ticks may lie before
+    /// the old session's, which [`push`](Self::push) would refuse.
+    pub fn reset(&mut self) {
+        self.frames.clear();
+        self.accepted = None;
     }
 
     /// The newest tick ever accepted, queued or already popped.

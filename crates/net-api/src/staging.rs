@@ -127,10 +127,10 @@ impl StagingFrame {
     }
 
     /// Folds `newer`, a later gather's frame, into this one, for a packer that fell behind
-    /// and finds two frames: a row in `newer` replaces the same (key, component) here,
-    /// `newer`'s structural entries follow this frame's, `tick` becomes `newer.tick`, and
-    /// a full `newer` makes the result full with `newer`'s rows alone. `newer`'s
-    /// structural entries also apply to the rows here: a row of an entity it despawned or
+    /// and finds two frames: of two rows for one (key, component), the row with the later
+    /// tick wins, and on equal ticks `newer`'s; `newer`'s structural entries follow this
+    /// frame's, `tick` becomes `newer.tick`, and a full `newer` makes the result full with
+    /// `newer`'s rows alone. `newer`'s structural entries also apply to the rows here: a row of an entity it despawned or
     /// of a component it removed is dropped, and a row of an entity it moved resides in the
     /// entity's new region. A full frame here stays full and keeps no structural entry.
     /// Nothing is lost, the result never holds two values of one row, and it is the frame

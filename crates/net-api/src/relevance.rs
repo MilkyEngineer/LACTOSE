@@ -90,8 +90,8 @@ impl RegionRelevance {
     /// `cached` copy; the resources and transient keys; `assets` pinned by the client's
     /// `app` from the table; and `RegionMode::Replicated`. Fails with `VersionMismatch` if
     /// `baseline`'s content hash is not `baseline_hash`, if a `Digest` has no cached copy
-    /// or the copy's digest differs, or if a `Full` overlay was made against another
-    /// baseline (`Overlay::check_against`).
+    /// or the copy's digest differs, or if the overlay, carried or cached, was made against
+    /// another baseline (`Overlay::check_against`).
     pub fn to_bundle(
         &self,
         baseline: Arc<Baseline>,
@@ -112,10 +112,7 @@ impl RegionRelevance {
         }
         let overlay = match &self.overlay {
             OverlayPayload::Cooked => None,
-            OverlayPayload::Full(overlay) => {
-                overlay.check_against(&baseline)?;
-                Some(Arc::clone(overlay))
-            }
+            OverlayPayload::Full(overlay) => Some(Arc::clone(overlay)),
             OverlayPayload::Digest(digest) => match cached {
                 Some(cached) if cached.digest() == *digest => Some(Arc::clone(cached)),
                 Some(cached) => {
@@ -141,6 +138,11 @@ impl RegionRelevance {
                 }
             },
         };
+        // A cached copy is checked as a carried one is: a digest names bytes, not the
+        // baseline they were made against.
+        if let Some(overlay) = &overlay {
+            overlay.check_against(&baseline)?;
+        }
         Ok(RegionBundle {
             seed: self.seed,
             mode: RegionMode::Replicated,
