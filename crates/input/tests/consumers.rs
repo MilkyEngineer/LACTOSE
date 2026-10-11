@@ -64,7 +64,7 @@ fn movement(input: &PlayerInput, vel: Mut<Velocity>) {
     let facing: Quat = input.yaw.rotation();
     let pitch: Scalar = input.pitch.radians();
     let stick = input.movement.to_vec2();
-    let generic_bit_of_the_game = input.held.contains_bit(Action::NAMED + 2);
+    let generic_bit_of_the_game = input.held.contains_bit(Actions::GAME_FIRST + 2);
     vel.0 = planar * speed;
 }
 

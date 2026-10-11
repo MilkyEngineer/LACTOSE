@@ -108,7 +108,8 @@ const _: () = {
         "the sample is zeroed at every input sync point"
     );
     assert!(Pitch::LIMIT as u32 * 4 == UNITS_PER_TURN, "the pitch limit is a quarter turn");
-    assert!(Action::NAMED < Actions::BITS);
+    assert!(Action::NAMED <= Actions::GAME_FIRST && Actions::GAME_FIRST < Actions::BITS);
+    assert!(Actions::GAME_FIRST == 16, "the game's bits start at a fixed bit");
     assert!(Action::Crouch.bit() + 1 == Action::NAMED, "every named bit is below NAMED");
     assert!(SampleHistory::CAPACITY == REDUNDANT_SAMPLES);
 };

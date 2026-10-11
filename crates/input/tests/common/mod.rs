@@ -133,11 +133,22 @@ pub fn valid_sample(rng: &mut Rng) -> PlayerInput {
 
 /// The movement half of `Quantiser::next` as `lactose-input-host` states it, in `f32`: a
 /// NaN component counts as zero, the vector is scaled down to the unit disc if longer,
-/// then each component times `AXIS_SCALE`, rounded to nearest, ties away from zero.
+/// its length computed without overflow (here by dividing by the larger component first,
+/// as `hypot` does, which the boundary lints forbid), then each component times
+/// `AXIS_SCALE`, rounded to nearest, ties away from zero, saturating.
 pub fn quantise_movement(x: f32, y: f32) -> Axis2 {
     let (x, y) = (if x.is_nan() { 0.0 } else { x }, if y.is_nan() { 0.0 } else { y });
-    let length = (x * x + y * y).sqrt();
-    let (x, y) = if length > 1.0 { (x / length, y / length) } else { (x, y) };
+    let larger = if x.abs() > y.abs() { x.abs() } else { y.abs() };
+    // A component beyond one makes the vector longer than one: scale it down by the larger
+    // component first, so the squares cannot overflow.
+    let (x, y) = if larger > 1.0 {
+        let (x, y) = (x / larger, y / larger);
+        let length = (x * x + y * y).sqrt();
+        (x / length, y / length)
+    } else {
+        let length = (x * x + y * y).sqrt();
+        if length > 1.0 { (x / length, y / length) } else { (x, y) }
+    };
     let quantise = |c: f32| (c * f32::from(AXIS_SCALE)).round() as i16;
     Axis2 { x: quantise(x), y: quantise(y) }
 }
@@ -323,7 +334,7 @@ fn held_at(player: PlayerId, tick: u32) -> Actions {
     let mut rng = Rng::new(u64::from(player.0) << 32 | u64::from(tick / 3));
     let bits = rng.next_u32();
     let named = bits & ((1 << Action::NAMED) - 1);
-    let game = if bits & (1 << 20) != 0 { 1 << (Action::NAMED + 2) } else { 0 };
+    let game = if bits & (1 << 20) != 0 { 1 << (Actions::GAME_FIRST + 2) } else { 0 };
     Actions::from_bits(named | game)
 }
 

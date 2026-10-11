@@ -173,19 +173,27 @@ fn a_sweep_of_valid_samples_is_accepted() {
 }
 
 /// The review's sweep of the quantiser as `lactose-input-host` states it: every direction
-/// at lengths about one, beyond one and far beyond, and the disc's diagonals. All accepted,
-/// and the worst `x² + y² - AXIS_SCALE²` stays within the bound's `2·AXIS_SCALE`.
+/// at lengths about one, beyond one and far beyond (up to `f32::MAX` per component), and
+/// the disc's diagonals. All accepted, the worst `x² + y² - AXIS_SCALE²` within the bound's
+/// `2·AXIS_SCALE`, and every input at least one long quantised to unit length: within
+/// `2·AXIS_SCALE` of `AXIS_SCALE²` either way, never collapsed to zero by an overflow.
 #[test]
 fn every_output_of_the_quantiser_is_accepted() {
     const DIRECTIONS: u32 = 200_000;
     let scale = i64::from(AXIS_SCALE);
     let mut worst = i64::MIN;
     let mut count = 0u32;
-    let mut check = |movement: Axis2| {
+    let mut unit = 0u32;
+    let mut check = |movement: Axis2, at_least_one: bool| {
         let (x, y) = (i64::from(movement.x), i64::from(movement.y));
-        worst = worst.max(x * x + y * y - scale * scale);
+        let excess = x * x + y * y - scale * scale;
+        worst = worst.max(excess);
         let sample = PlayerInput { movement, ..PlayerInput::IDLE };
         assert!(!refused(&sample), "the quantiser's {movement:?}");
+        if at_least_one {
+            assert!(excess.abs() <= 2 * scale, "{movement:?} is not unit length");
+            unit += 1;
+        }
         count += 1;
     };
     for k in 0..DIRECTIONS {
@@ -193,17 +201,21 @@ fn every_output_of_the_quantiser_is_accepted() {
         let (sin, cos) = angle.sin_cos();
         let (x, y) = (cos.to_f32(), sin.to_f32());
         for length in [1.0f32, 1.5, 0.999_999_9, 1.000_000_1, 1e30] {
-            check(quantise_movement(x * length, y * length));
+            check(quantise_movement(x * length, y * length), length >= 1.0);
         }
     }
     let corner = core::f32::consts::FRAC_1_SQRT_2;
     for (x, y) in [(corner, corner), (-corner, corner), (corner, -corner), (-corner, -corner)] {
-        check(quantise_movement(x, y));
+        check(quantise_movement(x, y), false);
+    }
+    for (x, y) in [(f32::MAX, f32::MAX), (-f32::MAX, 3.0), (2e19, -2e19), (0.0, -f32::MAX)] {
+        check(quantise_movement(x, y), true);
     }
     for (x, y) in [(f32::NAN, 1.0), (1.0, f32::NAN), (f32::INFINITY, 0.0), (0.0, -1.0)] {
-        check(quantise_movement(x, y));
+        check(quantise_movement(x, y), false);
     }
-    assert_eq!(count, DIRECTIONS * 5 + 8);
+    assert_eq!(count, DIRECTIONS * 5 + 12);
+    assert_eq!(unit, DIRECTIONS * 4 + 4);
     assert!(worst <= 2 * scale, "worst {worst}");
 }
 

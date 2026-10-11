@@ -121,12 +121,15 @@ impl Pitch {
     }
 }
 
-/// A named action bit of [`Actions`]: the fixed set milestone 1 names. The discriminant is
-/// the bit. Bits from [`Action::NAMED`] up to [`Actions::BITS`] belong to the game, mapped
-/// by milestone 5's action map and read by index through [`Actions::contains_bit`]; a
-/// later milestone may name more of them, which adds variants and changes no encoding.
+/// A named action bit of [`Actions`]: the engine's actions, the set milestone 1 names. The
+/// discriminant is the bit. Every named bit is below [`Actions::GAME_FIRST`]; a later
+/// milestone may name more of the engine's bits below it, which adds variants (hence
+/// `non_exhaustive`) and moves no bit. The bits from [`Actions::GAME_FIRST`] up belong to
+/// the game, mapped by milestone 5's action map and read by index through
+/// [`Actions::contains_bit`].
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 #[repr(u8)]
+#[non_exhaustive]
 pub enum Action {
     /// Jump.
     Jump = 0,
@@ -142,6 +145,8 @@ pub enum Action {
 
 impl Action {
     /// How many low bits are named: the bits below this are the variants above, in order.
+    /// It grows when a variant is added, never past [`Actions::GAME_FIRST`]; a game's bit is
+    /// numbered from `GAME_FIRST`, never from this.
     pub const NAMED: u8 = 5;
 
     /// The bit this action occupies.
@@ -164,8 +169,13 @@ pub struct Actions(
 impl Actions {
     /// No action.
     pub const EMPTY: Self = Self(0);
-    /// The number of bits, named and generic together.
+    /// The number of bits, the engine's and the game's together.
     pub const BITS: u8 = 32;
+    /// The first of the game's bits, which never changes: the bits below it are the
+    /// engine's, named by [`Action`] or reserved for it, and the game's bit `k` is
+    /// `GAME_FIRST + k`, read with [`contains_bit`](Self::contains_bit) and set with
+    /// [`with_bit`](Self::with_bit). Part of the sample's encoding.
+    pub const GAME_FIRST: u8 = 16;
 
     /// The set with exactly the bits of `bits`.
     #[must_use]
@@ -449,4 +459,35 @@ impl PlayerInput {
 
 fn invalid(message: String) -> Error {
     Error::new(ErrorKind::InvalidData, message)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every named action is one of the engine's bits, below `Actions::GAME_FIRST`, and the
+    /// named bits are exactly `0..Action::NAMED`. The match has no wildcard, so a new variant
+    /// does not compile until it is listed here and checked.
+    #[test]
+    fn every_named_action_is_below_the_games_bits() {
+        let index = |action: Action| match action {
+            Action::Jump => 0,
+            Action::Throw => 1,
+            Action::Interact => 2,
+            Action::Sprint => 3,
+            Action::Crouch => 4,
+        };
+        let all = [Action::Jump, Action::Throw, Action::Interact, Action::Sprint, Action::Crouch];
+        for (position, action) in all.into_iter().enumerate() {
+            assert_eq!(index(action), position);
+            assert_eq!(usize::from(action.bit()), position, "{action:?}");
+            assert!(action.bit() < Actions::GAME_FIRST, "{action:?}");
+        }
+        assert_eq!(all.len(), usize::from(Action::NAMED));
+        const { assert!(Action::NAMED <= Actions::GAME_FIRST) };
+        // The game's first bit is readable and writable, and distinct from every named one.
+        let game = Actions::EMPTY.with_bit(Actions::GAME_FIRST);
+        assert!(game.contains_bit(Actions::GAME_FIRST));
+        assert!(all.into_iter().all(|action| !game.contains(action)));
+    }
 }

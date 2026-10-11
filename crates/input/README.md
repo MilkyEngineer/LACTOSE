@@ -40,7 +40,7 @@ to list.
 | `PlayerInputApplier`, `player_entity` | The `InputApplier` `app` installs, and the one definition of a player's entity |
 | `register_types`, `register_systems`, `sets::APPLY` | The registration pair `app` calls, and the set another crate's sync-point set is ordered against |
 | `SampleHistory`, `SampleIter`, `REDUNDANT_SAMPLES` | The redundancy window: the last eight ticks' samples, filled by the client, packed into every packet, filled by the server from every packet within the ticks it can still apply |
-| `UNITS_PER_TURN`, `AXIS_SCALE`, `Pitch::LIMIT`, `Action::NAMED`, `Actions::BITS` | The constants of the encodings |
+| `UNITS_PER_TURN`, `AXIS_SCALE`, `Pitch::LIMIT`, `Action::NAMED`, `Actions::BITS`, `Actions::GAME_FIRST` | The constants of the encodings |
 
 Hidden plumbing: none. The private fields of `SampleHistory`, `SampleIter` and
 `PlayerInputApplier` are the implementation's to reshape.
@@ -62,7 +62,7 @@ sample its quantiser produces.
 
 | Consumer | Needs | Where |
 |---|---|---|
-| Game crates | A component to take as `&PlayerInput` with movement, absolute yaw and pitch, the `throw` of section 6.1 and the `aim` it multiplies | `PlayerInput`; `input.pressed.contains(Action::Throw)`; `input.aim()`; `input.world_movement()` for movement; `input.held` for held actions, `input.released` for release edges; `contains_bit` for the game's own bits above `Action::NAMED` |
+| Game crates | A component to take as `&PlayerInput` with movement, absolute yaw and pitch, the `throw` of section 6.1 and the `aim` it multiplies | `PlayerInput`; `input.pressed.contains(Action::Throw)`; `input.aim()`; `input.world_movement()` for movement; `input.held` for held actions, `input.released` for release edges; `contains_bit(Actions::GAME_FIRST + k)` for the game's own bit `k` |
 | | Every value a kernel reads built from integers by `lactose_math`; a facing rotation to compose with | `Yaw::radians`, `Yaw::rotation`, `Pitch::radians`, `Axis2::to_vec2`, `aim`, `world_movement`, each with its formula below |
 | | A declared writer so a transient column may be read | `sets::APPLY` holds the exclusive writer declaration (`writes = [PlayerInput]`) in `Stage::Input` after `sim::sets::INPUT` |
 | `app` (headless, milestone 1) | Register the type and the system, install the applier, for every world kind | `register_types`, `register_systems`, `SimulationBuilder::inputs(Box::new(PlayerInputApplier::new()))`; a test builds a frame with `PlayerInput { .. }.to_player_sample(tick)` |
@@ -125,11 +125,15 @@ and `app` orders it with `Registration::order(&lactose_input::sets::APPLY, &THEI
   0.0055 degrees). `Yaw` is a `u16` and wraps: 0 and 65536 are the same facing. `Pitch` is
   an `i16`, positive looking up, valid within `[-Pitch::LIMIT, Pitch::LIMIT]` with
   `LIMIT = 16384`, a quarter turn each way; outside it the sample is invalid.
-- `Actions` is a 32-bit mask; bit `n` set means action `n` is in the set. Bits `0..5` are
-  the named actions of `Action` in declaration order: `Jump`, `Throw`, `Interact`,
-  `Sprint`, `Crouch`; `Action::NAMED` is 5. Bits `5..32` are the game's, assigned by the
-  action map of milestone 5 and read with `contains_bit`. Naming more of them later adds
-  variants to `Action` and changes no encoding. `contains_bit` and `with_bit` treat a bit
+- `Actions` is a 32-bit mask; bit `n` set means action `n` is in the set. Bits
+  `0..Actions::GAME_FIRST`, that is `0..16`, are the engine's: bits `0..5` are the named
+  actions of `Action` in declaration order, `Jump`, `Throw`, `Interact`, `Sprint`,
+  `Crouch` (`Action::NAMED` is 5), and bits `5..16` are reserved for actions the engine
+  names later, which adds variants to `Action` (it is `non_exhaustive`) and moves no bit.
+  Bits `16..32` are the game's, assigned by the action map of milestone 5: the game's bit
+  `k` is `Actions::GAME_FIRST + k`, read with `contains_bit` and set with `with_bit`.
+  `GAME_FIRST` never changes, so a game's bit keeps its number when the engine names
+  more. `contains_bit` and `with_bit` treat a bit
   at or above `Actions::BITS` as never set. `union`, `intersection` and `without` are the
   set operations. These methods are the definition of the type and are final.
 - `held` is the set of actions held during the tick. `pressed` is the set that became
@@ -182,9 +186,9 @@ pitch for movement direction)
 - Both are computed when called and never stored: the sample carries integers only, so
   the client and the server derive the same bits from the same bytes, and a derived float
   never enters the journal or the wire. `sin_cos` is `lactose_math`'s, bit-identical to
-  the two calls, on every target; the golden bits of a small table are pinned under SOUR's
-  architecture mode on linux-x64, the one place the x86-64-v3 build runs
-  (`docs/verification.md`).
+  the two calls, on every target; the golden bits of a small table are pinned by
+  `tests/sample.rs`, run in debug and in release, on aarch64 and on x86-64-v3 (linux-x64
+  and windows-x64 in CI and in SOUR's architecture mode; `docs/verification.md`).
 
 **The byte image** (architecture sections 9.1, 9.2 and 15.5)
 
@@ -331,9 +335,10 @@ writer declaration.
 | What | How |
 |---|---|
 | The image | `sample.rs`: `from_sample_bytes(to_sample_bytes(x)) == x` and `to_sample_bytes(x) == bytemuck::bytes_of(&x)` over a sweep of 20,000 valid samples; each field little-endian at its offset; 0, 1, 19, 21 and 40 bytes fail with `InvalidData`; `to_player_sample` carries the same bytes with `substituted: false` |
-| Validation | `sample.rs`: each rule refused on its own, through `validate` and through `from_sample_bytes`: pitch `±(LIMIT + 1)`; a movement component of `i16::MIN`; `(AXIS_SCALE, AXIS_SCALE)`, and the disc's bound exactly (`(AXIS_SCALE, 255)` accepted, `(AXIS_SCALE, 256)` refused); `pressed` 0b10 with `held` 0; `released` overlapping `held`; every bit pattern of the other fields accepted; the sweep accepted; the quantiser as `lactose-input-host` states it, over 200,000 directions at five lengths, the diagonals, NaN and infinity, all accepted, worst `x² + y² - AXIS_SCALE²` within `2·AXIS_SCALE` |
+| Validation | `sample.rs`: each rule refused on its own, through `validate` and through `from_sample_bytes`: pitch `±(LIMIT + 1)`; a movement component of `i16::MIN`; `(AXIS_SCALE, AXIS_SCALE)`, and the disc's bound exactly (`(AXIS_SCALE, 255)` accepted, `(AXIS_SCALE, 256)` refused); `pressed` 0b10 with `held` 0; `released` overlapping `held`; every bit pattern of the other fields accepted; the sweep accepted; the quantiser as `lactose-input-host` states it, over 200,000 directions at five lengths up to 1e30, the diagonals, `f32::MAX` components, NaN and infinity, all accepted, worst `x² + y² - AXIS_SCALE²` within `2·AXIS_SCALE`, and every input at least one long quantised to unit length (within `2·AXIS_SCALE` of `AXIS_SCALE²`) |
+| The action bits | `src/sample.rs` (unit test): every `Action` variant, listed by a wildcard-free match, has bit equal to its position, below `Actions::GAME_FIRST`, and `NAMED` counts them; the game's first bit is set and read by `with_bit` and `contains_bit` and is none of the named ones; `GAME_FIRST == 16` is a const assertion in `lib.rs` |
 | Decoding | `sample.rs`: `Yaw(0)`, `Yaw(16384)`, `Yaw(32768)` and `Yaw(49152)` give `0`, `PI/2`, `PI` and `3PI/2` within one ulp; `Pitch(±LIMIT)` give `±PI/2` exactly; `Axis2 { x: AXIS_SCALE, y: 0 }.to_vec2()` is `(1, 0)` exactly; `radians`, `to_vec2`, `rotation`, `aim` and `world_movement` equal the stated formulas written out, bit for bit, over the sweep |
-| Directions | `sample.rs`: `IDLE.aim() == -Vec3::Z`; `Yaw(16384)` aims at `-X`, `Yaw(32768)` at `+Z` and `Yaw(49152)` at `+X`, and `Pitch(±LIMIT)` at `±Y`, within `Scalar::EPSILON`; `Yaw::rotation` rotates `-Z` onto the level `aim` within 1e-15; `world_movement` of `(0, AXIS_SCALE)` at yaw zero is `(0, 0, -1)` and of `(AXIS_SCALE, 0)` is `(1, 0, 0)`, at a quarter turn `-X` and `-Z`; `aim` has unit length and `world_movement` at most `1 + 1/AXIS_SCALE` up to rounding over the sweep; `aim` is the yaw quaternion times the pitch quaternion applied to `-Z`, and `world_movement` the stick along the yawed forward and right, within 1e-12 over a grid of yaw and pitch; golden bits of twelve derived values for six samples, pinned (generated on aarch64, checked on every target CI tests), and the same values hashed by `sour.rs` under the architecture mode |
+| Directions | `sample.rs`: `IDLE.aim() == -Vec3::Z`; `Yaw(16384)` aims at `-X`, `Yaw(32768)` at `+Z` and `Yaw(49152)` at `+X`, and `Pitch(±LIMIT)` at `±Y`, within `Scalar::EPSILON`; `Yaw::rotation` rotates `-Z` onto the level `aim` within 1e-15; `world_movement` of `(0, AXIS_SCALE)` at yaw zero is `(0, 0, -1)` and of `(AXIS_SCALE, 0)` is `(1, 0, 0)`, at a quarter turn `-X` and `-Z`; `aim` has unit length and `world_movement` at most `1 + 1/AXIS_SCALE` up to rounding over the sweep; `aim` is the yaw quaternion times the pitch quaternion applied to `-Z`, and `world_movement` the stick along the yawed forward and right, within 1e-12 over a grid of yaw and pitch; golden bits of twelve derived values for six samples, pinned (generated on aarch64, checked on every target CI tests, in debug and in CI's release step), and the same values hashed by `sour.rs` under the architecture mode |
 | The applier | `applier.rs`: a kernel taking `&PlayerInput` reads, bit for bit, the sample of every tick that carried one and `IDLE` on every tick without one or with a malformed image; a player spawned without the component gets it from its first sample and the kernel runs from then on; the program with its malformed images hashes equal, every tick, to the program with those entries absent; samples for a held join and for a player who never joined hash equal to their absence, and the applier returns `Ok(())` for them; called directly, every malformed image is `InvalidData` and writes nothing, and `substituted` and `input_tick` are not read; the lesser of two anchored rows is the entity, and the answer follows an anchor or claim removed; the prediction world's records equal the server's byte for byte on every tick both simulate the player; the hashes of both programs are equal under the production layout and SOUR's layout mode for `Rows(1)`, `Rows(7)`, `Rows(64)` and `Bytes(16384)` under three seeds each, on one and four workers, with the lesser key the entity throughout. `lookup.rs`, in a binary with the tagged global allocator: among 0, 1,000 and 100,000 other rows `player_entity` names the right row for 64 players and allocates nothing, and the applier allocates exactly what the same `World::insert` calls allocate; an ignored test times the lookup by hand (about 50 ns at both sizes on an M1) |
 | The writer declaration | `applier.rs`: on a server and a prediction world, the schedule with the kernel builds with `register_systems` and fails without it with `InvalidData` whose source is `TransientBeforeWriter { reader: "test::observe", component: PlayerInput::KEY }`; a client world builds with it |
 | The history | `history.rs`: eight ticks in order, then a ninth: the first is gone; a duplicate returns `false` and keeps the first; out-of-order inserts yield ascending from `iter`; a tick older than the window is ignored; a jump past the window empties it; `insert_bounded` refuses `consumed`, `consumed - 1`, `consumed + CAPACITY + 1`, `newest + 2^30` and `newest + 2^31` and accepts `consumed + 1` to `consumed + CAPACITY`; the same from four bases across the `u32` wrap; and 20,000 random inserts around a moving newest tick, across the wrap, against a model |
