@@ -1,12 +1,13 @@
 # Proposal: physics is a function of history, and what prediction compares
 
-Status: proposal after its first design review, not applied; `docs/architecture.md`
-sections 2 and 9.4 ("at full precision") and D122's "full precision means canonical bytes
-per field, no tolerance" stand until it is decided. It is decided before the
-`lactose-predict` implementation lane's comparison is reviewed, since that lane is already
-running against D122 and the change below is local to its comparison: adopted as an
-amendment to sections 1, 2, 9.4, 10, 15.5, 16 and 22 with a numbered decision entry, or
-declined with the reason recorded in the decisions log.
+Status: proposal after two design reviews, not applied; `docs/architecture.md` sections 2
+and 9.4 ("at full precision") and D122's "full precision means canonical bytes per field, no
+tolerance" stand until it is decided. It is decided before the `lactose-predict`
+implementation lane's comparison is reviewed, since that lane is already running against
+D122 (its implementation is at 8a744fd) and the change below is local to its comparison
+module and the write set that reuses it: adopted as an amendment to sections 1, 2, 9.4, 10,
+15.5, 16 and 22 with a numbered decision entry, or declined with the reason recorded in the
+decisions log.
 
 ## The problem
 
@@ -29,13 +30,15 @@ Three questions follow, and this proposal decides each.
 ## What was measured
 
 The backend was stepped directly through `PhysicsBackend`, as its own tests do (release,
-Apple M1, one solver thread unless stated). Rows are modelled as the write-back keeps them,
-each body's last reported state carried forward, and the walk driver reads the rows,
+Apple M1, one solver thread unless stated), and, for the reload paths, through
+`physics-api`'s real sync with the Rapier backend. Rows are modelled as the write-back keeps
+them, each body's last reported state carried forward, and the walk driver reads the rows,
 corrected ones included; the first round's driver read the client's own previous step
-instead, which the review caught (its lone-capsule "bit-equal again" was that artefact).
-Differences are per scalar component, as the proposed comparison takes them. The planner's
-probes are `probe_history.rs` and `probe_d124_r2.rs` in the scratchpad, the reviewer's
-`probe_d124.rs` (p1 to p14) beside them; neither is committed.
+instead, which the first review caught (its lone-capsule "bit-equal again" was that
+artefact). Differences are per scalar component, as the proposed comparison takes them. The
+planner's probes are `probe_history.rs` and `probe_d124_r2.rs` in the scratchpad, the
+reviewer's `probe_d124.rs` (p1 to p14), `probe_d124_r2_calls.rs` and
+`probe_d124_r2_reload.rs` beside them; none is committed.
 
 **Where the difference comes from.** Three scenes, 1,800 ticks: a dynamic capsule with
 rotation locked, walked by velocity writes in two-second legs along x and z with rests,
@@ -56,8 +59,11 @@ created, stepped once and removed, their slots retaken at tick 40).
 | A kinematic capsule swept along a curve with a shape cast and a ray each tick | No, and every query answer equal |
 | The 150-body pile with two joints and a sweeping paddle of `tests/determinism.rs`, far pile before | Yes: 2.7 mm at tick 238, 12 mm at 250, 38 at 300, 96 at 350, 346 at 400 |
 | A fresh backend built from the rows at tick *t0* against the original continuing | Yes from the first tick: crate 1.5 mm, stack mid-bump 1.6 m (the top crate topples differently), stack at rest 1.9 mm (reviewer's p5; planner's r2) |
-| The backend with every body removed and recreated in key order (an in-place reload) against a fresh backend built the same way | Yes from the first tick: crate 0.4 mm, stack 0.12 m, the pile 7.6 m |
-| The backend restored to the bytes it had empty at setup, then the bodies recreated in key order, against the fresh backend | No, in every case, the pile included |
+| Through the backend alone: every body removed and recreated in key order on the same solver, against a fresh backend built the same way | Yes from the first tick: crate 0.4 mm, stack 0.12 m, the pile 7.6 m |
+| Through the backend alone: the solver restored to the bytes it had empty at setup, then the bodies recreated in key order, against the fresh backend | No, in every case, the pile included |
+| Through `physics-api`'s sync: `sim`'s in-place reload (every region unloaded and loaded in one frame, the path a client's full frame takes too) against a fresh process | Yes from the first tick, and equal to the untouched twin: the sync reads `Despawned` then `Spawned` for each key with the row present and removes nothing, so the solver keeps its whole state and the derived handle rows are lost. A floor, a pusher and a three-crate stack: 3.9e-3, 1.1e-2 and 1.0e-2 m at *t0* = 30, 60, 120; a 75-body pile with two joints across two regions: 1.24 and 1.40 m (reviewer's `probe_d124_r2_reload.rs`) |
+| Through the sync: unload in one frame and load in the next, the setup bytes restored when the solver empties | No (stack and pile) |
+| Through the sync, the trigger of item 7 below: a sync whose log despawned every body the solver held removes them, restores the setup bytes and creates from the rows by a full diff | No, on every path, scene and *t0*; handle rows present (reviewer's candidate, `candidate-fix.diff`) |
 
 So the far-body and arena dependence of D119 is real but confined to large contact graphs
 and to a solver that has freed its slots; in every scene of a few bodies it changed nothing
@@ -66,7 +72,9 @@ state the rows do not carry: warm-start impulses, contact manifolds and sleep co
 Two backends with equal rows and different solver state diverge while bodies are in
 contact, and the client's backend reaches such a state by three paths: a correction (rows
 written, solver state kept), a claim of a body in contact (a kinematic proxy made dynamic),
-and a load or rebuild (a fresh solver). None of these is cured by a canonical solver.
+and a load or rebuild (a fresh solver). None of these is cured by a canonical solver. The
+planner's first measurement of the reload bypassed the sync, which is why its trigger was
+wrong in the previous revision; the sync's own path is what the rows above record.
 
 **Corrections, at 20 Hz frames.** The client mispredicts at tick *p* (its capsule written a
 centimetre along x and 0.1 m/s faster) and from *c* = *p* + 6 compares a server frame every
@@ -74,7 +82,10 @@ three ticks for 200 frames, under three rules: D122's (any bit difference is a m
 every fact written at the rollback), the first round's (a mismatch is a leaf beyond the
 tolerance, only the mismatching components written), and the rule now proposed (a mismatch
 is a leaf beyond the tolerance, every fact at the rollback tick written, as D122 writes).
-Tolerance 2e-3 m, 2e-3 per quaternion component, 2e-2 m/s, 2e-2 rad/s.
+Tolerance 2e-3 m, 2e-3 per quaternion component, 2e-2 m/s, 2e-2 rad/s. The probe's
+correction pushes every key's rows, bit-equal ones included, which wakes bodies the shipped
+sync leaves alone (it skips a value equal to the last write-back's), and it models no
+rollback; the spike re-measures on the shipped path.
 
 | Scene | *p* | Bit-exact | Tolerance, write beyond | Tolerance, write all |
 |---|---|---|---|---|
@@ -99,6 +110,8 @@ tick, then compared at 20 Hz for 167 frames.
 | Capsule and stack, moving | 50, 60, 100, 200 | 44, 36, 32, 37 | 26, 31, 22, 35 | ticks 291, 217, 254, 306 |
 | Capsule and stack, at rest | 400 | 1 | 1 | the claim's own frame |
 
+The crate claimed at tick 50 absorbed 1.9e-3 m in the frames after its one correction.
+
 A derived replicated integer (the capsule's x floored to a centimetre or a millimetre)
 compared bit for bit beside the tolerance: under the first round's rule 72 to 83
 corrections in 298 frames, since the correction wrote the integer and not the absorbed
@@ -110,24 +123,30 @@ cold-contact step of 3.7 ms against 1.2 ms at 2,000 bodies, and left the depende
 bodies present; a rebuild on membership change moved the dependence rather than removing it
 (D119, "History"). The physics phase's budget is 3 ms at 2,000 awake bodies (section 22).
 
-One defect found by reading, independent of the tolerance: `physics-rapier` reports a body
-whose transform was written since the last step as `teleported` (`set_transform` places it
-through `set_position` and adds it to the step's `placed` set), and `physics-api`'s
-write-back then writes the tick into `Teleported`, a persistent replicated component. A
-correction writes `Transform`, `corrected` makes the sync push `set_transform`, so the
-re-simulated tick marks the client's row teleported while the server's row is unchanged; the
-next frame's exact `Teleported` fact mismatches and D122 corrects again, one frame later,
-for every corrected `Transform`. No boundary system reads `Teleported`: the write-back
-writes it, extract and the gather compare it with the last tick they covered, and
-`net-host`'s interpolation reads it outside the boundary.
+Two defects found by reading, independent of the tolerance. First: `physics-rapier` reports
+a body whose transform was written since the last step as `teleported` (`set_transform`
+places it through `set_position` and adds it to the step's `placed` set), and
+`physics-api`'s write-back then writes the tick into `Teleported`, a persistent replicated
+component. A correction writes `Transform`, `corrected` makes the sync push
+`set_transform`, so the re-simulated tick marks the client's row teleported while the
+server's row is unchanged; the next frame's exact `Teleported` fact mismatches and D122
+corrects again, one frame later, for every corrected `Transform`. No boundary system reads
+`Teleported`: the write-back writes it, extract and the gather compare it with the last
+tick they covered, and `net-host`'s interpolation reads it outside the boundary. Second,
+found by the second review: on a same-frame unload and load the sync sees `Despawned` then
+`Spawned` for a key it holds and does nothing, so every `BodyHandle` and `JointHandle` row
+is gone afterwards while the bookkeeping still holds the body, against the README's
+"present exactly while the row is in the solver"; a partial same-frame region reload loses
+them the same way.
 
-One risk found by the reviewer, not this proposal's to fix: on a four-thread solver pool the
-lone-capsule scene stepped in 20 to 39 ms at worst and 0.4 to 4.4 s per 1,800-tick run,
-against 0.05 to 1 ms and 20 to 30 ms on one thread, and once hung in Rapier's deferred
+One risk found by the first reviewer, not this proposal's to fix: on a four-thread solver
+pool the lone-capsule scene took 0.4 to 4.4 s per 1,800-tick run in most runs (26 ms in the
+best) with a worst step of 39 ms, against 19 to 30 ms per run in most runs on one thread
+(319 ms in the worst, a worst step of 14.5 ms), and once hung in Rapier's deferred
 broad-phase optimisation (a worker blocked in `join_deferred_bvh_optimize` on a
 `rayon::spawn` that never ran). The physics-rapier lane carries the D123 patch (always the
 inline path). Until it lands the prediction world's pool is one thread, which its scene
-size warrants anyway, and the spike's server pool carries a step watchdog.
+size warrants anyway, and the spike's server carries a step watchdog.
 
 ## The options
 
@@ -160,7 +179,7 @@ the re-simulation budget is spent on corrections nobody can see. Rules out the m
 criterion for dynamic bodies.
 
 **A tolerance that gates the rollback, with D122's rollback kept.** The recommendation,
-below. Costs a comparison predicate and four scalars in `lactose-predict`, nothing in the
+below. Costs a comparison outcome and four scalars in `lactose-predict`, nothing in the
 backend; one correction per misprediction for a lone body and for bodies in contact with
 statics or one crate; 7 to 35 corrections while a stack of claimed crates is moving, which
 no option above improves, since the divergence there is physical and must be corrected.
@@ -172,27 +191,35 @@ The backend keeps its history dependence and the comparison keeps it out. Concre
 1. A fact's `Transform` or `Velocity` component agrees when its canonical bytes equal the
    record's, as every component does; failing that, for a claimed entity whose `RigidBody`
    is `Dynamic` at slot *T* or at slot *T* - 1 (the fact's `RigidBody` if the frame carries
-   one, else the record's), it agrees when every scalar leaf is within `PredictionTolerance`
-   for its kind: 2e-3 m per translation component, 2e-3 per quaternion component, 2e-2 m/s
-   and 2e-2 rad/s per velocity component by default. These are 2.7 times the largest
-   absorbed difference of a body in contact with statics or one crate, 80 times a lone
-   body's, and under a pixel at five metres on a 1440p display with a 60 degree field of
-   view; a stack of moving claimed crates spans them and is corrected. Every other field,
-   kinematic and fixed bodies' rows included, agrees by canonical bytes only. A NaN leaf
-   agrees with an equal NaN and with nothing else. The defaults are set under the 64-bit
-   scalar; the milestone 1 scalar decision re-measures them, since a 32-bit scalar's
-   spacing at the map edge is of their order. The facts that would change the values: the
-   spike's largest absorbed difference within a factor of two of a default for a body on
-   static geometry, or a visible jump at a correction below it.
+   one, else the record's; *T* alone when the record has no slot *T* - 1 for the entity, its
+   first claimed slot or the slot after a resync), it agrees when every scalar leaf is
+   within `PredictionTolerance` for its kind: 2e-3 m per translation component, 2e-3 per
+   quaternion component, 2e-2 m/s and 2e-2 rad/s per velocity component by default. The
+   margins over the largest absorbed difference measured are 80 times for a lone body on
+   static geometry (2.4e-5 m), 2.7 times for a body pushing one crate (7.5e-4 m), 1.7 and
+   1.8 times for a rolled ball (1.2e-3 m, 1.1e-3 per quaternion component), 1.05 times for
+   a crate claimed mid-push (1.9e-3 m), and none for a moving stack. The defaults therefore
+   bound what is corrected rather than guarantee an absorbed residual: a residual at the
+   margin costs one correction and not a storm as long as the next frames' residual falls
+   below it, which it did in every single-contact case measured, and a storm is the
+   multi-body case of item 6 whatever the default within an order of magnitude. Every
+   other field, kinematic and fixed bodies' rows included, agrees by canonical bytes only. A
+   NaN leaf agrees with an equal NaN and with nothing else. The defaults are set under the
+   64-bit scalar and are under a pixel at five metres on a 1440p display with a 60 degree
+   field of view; the milestone 1 scalar decision re-measures them, since a 32-bit scalar's
+   spacing at the map edge is of their order, and the milestone 1 spike re-sets them: a
+   default whose single-contact absorbed maximum in the spike exceeds half of it is
+   doubled. The facts that would change the values now: a visible jump at a correction
+   below a default.
 2. The tolerance gates the rollback and nothing else. A frame makes a correction point when
    any fact does not agree; the rollback then writes every fact at *k* exactly as D122 says,
    the absorbed ones included, re-takes the slot and re-simulates. Writing the absorbed
-   facts too is what converges: the stack 7 to 16 corrections against 18 to 34, a claim
-   mid-bump 22 to 35 against 32 to 44, a derived integer 1 against 72 to 83.
-3. `Teleported` of a claimed entity is never a fact: not compared, not written by a
-   correction. It is the client's own no-interpolate flag, set by its own steps and its own
-   corrections. A proxy's `Teleported` is written by the hook as its position for the tick,
-   as before.
+   facts too is what converges: a moving stack 7 to 16 corrections against 18 to 34, a stack
+   claimed mid-bump 22 to 35 against 32 to 44, a derived integer 1 against 72 to 83.
+3. `Teleported` of a claimed entity is never a fact: not recorded, not compared, not written
+   by a correction. It is the client's own no-interpolate flag, set by its own steps and its
+   own corrections. A proxy's `Teleported` is written by the hook as its position for the
+   tick, as before.
 4. A replicated field a game derives from a solver-written value compares by canonical
    bytes like every other field and is corrected when it differs; the correction converges
    because the rollback writes every fact at *k*. A derived replicated scalar carries the
@@ -208,21 +235,30 @@ The backend keeps its history dependence and the comparison keeps it out. Concre
 6. Claimed dynamic bodies in active contact with each other are corrected every few frames
    until they settle, under any rule: the divergence there is physical (a stack claimed
    mid-bump differs by centimetres and 0.1 m/s, a stack corrected mid-bump by 1.6 m without
-   the later frames). The lever is the claim, not the solver: `net`'s claim policy at
-   milestone 4 claims a thrown object with its throw and releases it once it rests or
-   touches an unclaimed body, and never claims a body that is in contact with another
-   dynamic one. The fact that would change this: a game scene that needs a moving pile of
-   claimed bodies for more than a few seconds.
-7. An empty solver is a fresh solver: `physics-api` keeps the bytes the backend wrote at
-   `setup`, and a sync that has removed every body the solver held restores them before it
-   creates the next one. A world reloaded in place (every region unloaded and loaded again,
-   as `sim`'s in-place reload and a client's full frame do) then has the physics state a
-   fresh process loading the same rows has, bit for bit (measured: crate, stack and the
-   150-body pile, where removing and recreating on the same solver differed by 0.4 mm,
-   0.12 m and 7.6 m). Section 15.5's first test holds with physics only under this rule;
-   D119's "never clears the solver" narrows to the cases where bodies survive, the 2^30 stamp
-   rebase and a world restore without a physics restore. The facts that would change this:
-   the restore's cost on a server-sized world at load, a one-off.
+   the later frames). Measured on the three-crate stack: 7 to 16 corrections in 200 frames
+   after a misprediction while it moves and one after it settled, 22 to 35 in 167 frames
+   after a claim mid-bump and one after a claim at rest. The lever is the claim, not the
+   solver: `net`'s claim policy at milestone 4 claims a thrown object with its throw and
+   releases it once it rests or touches an unclaimed body, and never claims a body that is
+   in contact with another dynamic one. The fact that would change this: a game scene that
+   needs a moving pile of claimed bodies for more than a few seconds.
+7. An empty solver is a fresh solver. `physics-api` keeps the bytes the backend wrote at
+   `setup`. A sync whose structural log since its last pass, the pending entries a restore
+   carried included, despawned every body the solver held removes them all, restores those
+   bytes and creates from the rows by a full diff in ascending key order; a sync whose
+   removals leave the solver empty restores the bytes and makes the next sync a full diff.
+   The first is the path of `sim`'s in-place reload and of a client's full frame (every
+   region unloaded and loaded in one frame, which the sync sees as `Despawned` then
+   `Spawned` per key and today leaves untouched), the second is an unload followed by a
+   load. A world reloaded either way then has the physics state a fresh process loading the
+   same rows has, bit for bit: measured through the sync on a three-crate stack mid-bump at
+   three ticks and a 75-body pile with two joints across two regions, where the sync as it
+   is today differed from the first tick by 3.9e-3 to 1.1e-2 m and 1.24 to 1.40 m. The same
+   fix round re-inserts the `BodyHandle` or `JointHandle` row of a `Spawned` entry for a key
+   the bookkeeping holds, since a same-frame reload, whole or of one region, loses them
+   today. Section 15.5's first test holds with physics only under this rule; D119's "never
+   clears the solver" narrows to a solver whose log kept a body. The facts that would change
+   this: the full diff's cost on a server-sized reload, a one-off.
 8. The server's determinism needs nothing from SOUR: its modes vary threads, layout and
    schedule under one row history, which is where bit equality holds and what the backend's
    tests already show. The journal does need one thing: a checkpoint carries the physics
@@ -230,18 +266,27 @@ The backend keeps its history dependence and the comparison keeps it out. Concre
    contact after the checkpoint (the fresh-against-continued row above). `PhysicsSnapshot`
    today carries an `Arc<()>` identity compared by pointer
    (`crates/physics-api/src/service.rs`), fit for the ring and not for a file, and `sim`
-   cannot name `physics-api`; so `journal::Journal` gains an opaque `services` map from a
-   service's key to bytes, `physics-api` gains the byte form of its snapshot and a restore
-   of it into a fresh `Physics` of a world at the checkpoint's tick, and the replay driver
-   hands the bytes back after the regions load and before the first step. Until it exists a
-   replay is bit-exact from a session's start only. The fact that would change this: the
-   snapshot's size at the milestone 1 scale, about 1.2 kB per fixed collider today.
+   cannot name `physics-api`; so `journal::Journal` gains `services`, a map from a service
+   key to opaque bytes, where the key is the xxh64 of the service's declared name
+   (`"physics_api::Physics"`), collision-checked as a `SystemKey` is and never a `TypeId`;
+   `physics-api` gains the byte form of its snapshot, which carries a format version, the
+   backend's identity (the backend's name, the Rapier version and the hash of the D123
+   patch set under `vendor/`), the `PhysicsConfig`, the tick, the backend's bytes and the
+   bookkeeping, and a restore of it into a fresh `Physics` of a world at the checkpoint's
+   tick that refuses a mismatch of any of those with `InvalidData` and rebuilds the
+   `BodyHandle` and `JointHandle` rows from the bookkeeping, since rows loaded from a
+   checkpoint carry none; the replay driver hands the bytes back after the regions load and
+   before the first step. `sim` never reads the bytes and the journal is not hashed state.
+   Until the byte form exists a replay is bit-exact from a session's start only. The fact
+   that would change this: the snapshot's size at the milestone 1 scale, about 1.2 kB per
+   fixed collider today.
 
-Cost: the predict implementation lane absorbs items 1 to 5 as a change local to its
-comparison, about a quarter of a run and no extra review round; item 7 is a `physics-api`
-fix round, about a third of a run; item 8 is the journal tooling lane's, about half a run
-across `physics-api` and `sim`; the spike's claim-in-contact and character scenes about half
-a run; the document edits are the coordinator's.
+Cost: the predict implementation lane absorbs items 1 to 5 as a change to its comparison
+module and the write set that reuses it, about a quarter of a run and no extra review
+round; item 7 is a `physics-api` fix round, about a third of a run; item 8 is the journal
+tooling lane's, about half a run across `physics-api` and `sim`; the spike's
+claim-in-contact and character scenes about half a run; the document edits are the
+coordinator's.
 
 ## Architecture amendments (exact text)
 
@@ -304,9 +349,12 @@ server and its replay or a run and its re-simulation, never the server and a cli
 prediction world. The backend does not canonicalise per island: the pinned Rapier cannot,
 and no solve order carries the solver state across. The difference is kept out of the
 comparison instead (section 9.4). An empty solver is a fresh solver: `physics-api` keeps the
-bytes the backend wrote at setup and restores them in a sync that has removed every body
-before it creates the next, so a world reloaded in place has the physics state a fresh
-process loading the same rows has, which is what section 15.5's first test needs.
+bytes the backend wrote at setup, and a sync whose structural log since its last pass
+despawned every body the solver held removes them, restores those bytes and creates from
+the rows by a full diff in key order, while a sync whose removals leave the solver empty
+restores them and makes the next sync a full diff; so a world reloaded in place, in one
+frame or two, has the physics state a fresh process loading the same rows has, which is
+what section 15.5's first test needs.
 
 ### §22 Milestones, row 1, replace "one predicted character, fifty claimed dynamic bodies; correction rate, rollback cost per tick and divergence recorded as the baseline that milestone 4's threshold is judged against."
 
@@ -332,18 +380,19 @@ clock, every float goes through `lactose_math`, and the crate carries the bounda
 
 Full precision, with one exception: a `Transform` or `Velocity` whose canonical bytes
 differ still agrees, for an entity whose `RigidBody` is `Dynamic` at slot *T* or at slot
-*T* - 1 (the fact's `RigidBody` if the frame carries one, else the record's), when every
-scalar leaf is within the predictor's `PredictionTolerance` for its kind (translation,
-rotation, linear, angular), since the physics solver holds state the rows do not carry and
-the client's solver reached its state by another path (architecture section 16, D124); a
-NaN leaf agrees with an equal NaN and with nothing else. Every other field, the rows of
-kinematic and fixed bodies included, agrees only by canonical bytes, since the same build
-on the same bytes produces the same bits. `Teleported` of a claimed entity is the client's
-own no-interpolate flag: never recorded, never compared, never written. The tolerance
-decides whether the frame makes a correction point and nothing else: a rollback writes
-every fact at *k*, the absorbed ones included. A field within tolerance that is not
-bit-equal is counted in `PredictionStats::absorbed`, with the largest difference per kind
-as canonical bits, and is not a mismatch.
+*T* - 1 (the fact's `RigidBody` if the frame carries one, else the record's; *T* alone when
+the record has no slot *T* - 1 for the entity), when every scalar leaf is within the
+predictor's `PredictionTolerance` for its kind (translation, rotation, linear, angular),
+since the physics solver holds state the rows do not carry and the client's solver reached
+its state by another path (architecture section 16, D124); a NaN leaf agrees with an equal
+NaN and with nothing else. Every other field, the rows of kinematic and fixed bodies
+included, agrees only by canonical bytes, since the same build on the same bytes produces
+the same bits. `Teleported` of a claimed entity is the client's own no-interpolate flag:
+never recorded, never compared, never written. The tolerance decides whether the frame
+makes a correction point and nothing else: a rollback writes every fact at *k*, the
+absorbed ones included. A field within tolerance that is not bit-equal is counted in
+`PredictionStats::absorbed`, with the largest difference per kind as canonical bits, and is
+not a mismatch.
 
 ### `crates/predict/README.md`, "Reconciliation", replace the bullet "Rapier's internal solver state is not corrected (section 9.4), so a corrected dynamic body converges over a few ticks rather than exactly: the frames of those ticks differ again by small amounts, each a correction under the rule above. The spike's correction rate counts them; whether milestone 4 adds a tolerance for dynamic bodies is decided against that baseline, never silently here."
 
@@ -351,12 +400,13 @@ as canonical bits, and is not a mismatch.
   body's rows differ from the server's by rounding for as long as it is in contact: a body
   on static geometry or pushing one crate by up to 7.5e-4 m and 5.3e-3 m/s, which the
   tolerance absorbs (one correction per misprediction against 8 to 200 without it); claimed
-  bodies in contact with each other by whole outcomes, so a moving stack of claimed crates
-  is corrected 7 to 35 times while it moves and once at rest (D124). Writing every fact at
-  *k*, the absorbed ones included, is what makes those corrections converge. The spike
-  records the corrections and the largest absorbed difference per kind, and milestone 4
-  re-sets the defaults from them; `net`'s claim policy claims a thrown object with its throw
-  and releases it at rest.
+  bodies in contact with each other by whole outcomes, so a three-crate stack of claimed
+  crates was corrected 7 to 16 times in 200 frames after a misprediction while it moved,
+  22 to 35 times in 167 frames after a claim mid-bump, and once at rest (D124). Writing
+  every fact at *k*, the absorbed ones included, is what makes those corrections converge.
+  The spike records the corrections and the largest absorbed difference per kind, and
+  milestone 4 re-sets the defaults from them; `net`'s claim policy claims a thrown object
+  with its throw and releases it at rest.
 
 ### `crates/predict/README.md`, "Not in this crate yet", replace "- A tolerance for dynamic bodies, decided at milestone 4 against the spike's baseline."
 
@@ -367,18 +417,24 @@ as canonical bits, and is not a mismatch.
 
 ; a dynamic body's `Transform` within tolerance agrees and the frame makes no correction,
 one past it is a mismatch, a kinematic body's agrees by bytes only, a body dynamic at *T* - 1
-and kinematic at *T* takes the tolerance, a NaN leaf agrees with an equal NaN only,
-`Teleported` differing is not a mismatch and is not written at a correction, a rollback
-writes the absorbed facts too, and `absorbed` holds the largest absorbed difference per
-kind
+and kinematic at *T* takes the tolerance, one with no slot *T* - 1 is judged at *T*, a NaN
+leaf agrees with an equal NaN only, `Teleported` differing is not a mismatch and is not
+written at a correction, a rollback writes the absorbed facts too (the physics test backend
+records the pushes), and `absorbed` holds the largest absorbed difference per kind
 
 ### `crates/physics-api/README.md`, "Bodies", replace "It never clears the solver: sleep and warm starts survive wherever the rows agree."
 
-It never clears a solver that still holds a body: sleep and warm starts survive wherever
-the rows agree. A sync that has removed every body the solver held restores the bytes the
-backend wrote at `setup` before it creates the next one, so an empty solver is a fresh
-solver and a world reloaded in place has the physics state a fresh process loading the same
-rows has, bit for bit (D124; architecture section 15.5's first test).
+It never clears a solver whose log kept a body: sleep and warm starts survive wherever the
+rows agree. A sync whose structural log since its last pass, the pending entries a restore
+carried included, despawned every body the solver held removes them all, restores the bytes
+the backend wrote at `setup` and creates from the rows by the full diff; a sync whose
+removals leave the solver empty restores those bytes and makes the next sync a full diff.
+So an empty solver is a fresh solver, and a world reloaded in place, in one frame (every
+region unloaded and loaded, which the log shows as `Despawned` then `Spawned` per key) or in
+two, has the physics state a fresh process loading the same rows has, bit for bit (D124;
+architecture section 15.5's first test). A `Spawned` entry for a key the bookkeeping holds
+re-inserts its handle row, so a same-frame reload of a region keeps `BodyHandle` and
+`JointHandle` present exactly while the row is in the solver.
 
 ### `crates/physics-api/README.md`, "Snapshot and restore", replace "Rapier's internal solver state is not corrected (architecture section 9.4), so a corrected dynamic body converges over a few ticks."
 
@@ -389,9 +445,12 @@ bodies in contact with each other; `lactose-predict`'s tolerance decides whether
 back and its rollback writes every fact (D124). A corrected `Transform` is pushed as a
 placement, so the re-simulated step reports the body `teleported` and the write-back sets
 the client's `Teleported`, which `lactose-predict` therefore never compares. A journal
-checkpoint carries this snapshot as bytes a fresh process restores into a `Physics` of a
-world at the checkpoint's tick, without the ring's identity check; the byte form and the
-restore are the journal tooling lane's.
+checkpoint carries this snapshot as bytes: a format version, the backend's identity (its
+name, the Rapier version and the hash of the D123 patch set under `vendor/`), the
+`PhysicsConfig`, the tick, the backend's bytes and the bookkeeping; a fresh process
+restores them into a `Physics` of a world at the checkpoint's tick, refusing a mismatch of
+any of those with `InvalidData` and rebuilding the handle rows from the bookkeeping, since
+loaded rows carry none. The byte form and the restore are the journal tooling lane's.
 
 ### `crates/physics-rapier/README.md`, "Calls are recorded, the step applies them", append after "two worlds holding different body sets or histories are not bit-equal for the bodies they share."
 
@@ -407,13 +466,14 @@ compares within a tolerance; the backend does not canonicalise.
 
 ### `crates/sim/README.md`, "Journal replay", replace "the untaken `PhysicsCommands`, `World::channel`, are dropped at a checkpoint, as solver state is),"
 
-and `services`, an opaque map from a service's key to the bytes `app` took from it at the
-checkpoint, which the replay driver hands back after the regions load and before the first
-step: the physics snapshot of `lactose-physics-api` goes there, the backend's whole world
-and the sync's pending work with the untaken `PhysicsCommands`, since the solver holds
-state the rows do not carry and a replay without it hashes equal only until the first
-contact; until the byte form exists, D124, a replay is bit-exact from a session's start
-only),
+and `services`, a map from a service key (the xxh64 of the service's declared name,
+collision-checked as a system key is) to the opaque bytes `app` took from that service at
+the checkpoint, which the replay driver hands back after the regions load and before the
+first step: the physics snapshot of `lactose-physics-api` goes there, the backend's whole
+world and the sync's pending work with the untaken `PhysicsCommands`, since the solver
+holds state the rows do not carry and a replay without it hashes equal only until the first
+contact; this crate never reads the bytes and they are not hashed state; until the byte form
+exists, D124, a replay is bit-exact from a session's start only),
 
 ## Decision entry (exact text; number at merge)
 
@@ -431,11 +491,12 @@ checkpoint carries the physics snapshot** (§1, §2, §9.4, §10, §15.5, §16, 
   pile and a solver that has freed its slots were not); it is the solver state the rows do
   not carry, warm starts, manifolds and sleep, which the client's solver reaches by another
   path after a correction, a claim in contact and a rebuild. The planner's and the
-  reviewer's probes (`docs/verification.md`) bound it: after a correction a body on static
+  reviewers' probes (`docs/verification.md`) bound it: after a correction a body on static
   geometry or pushing one crate differs by up to 7.5e-4 m for as long as it is in contact,
   and bodies in contact with each other by whole outcomes; a fresh solver against the
   continued one by 1.5 mm to 1.6 m; at 20 Hz a bit-exact rule costs 8 to 200 rollbacks per
-  misprediction and the tolerance one, or 7 to 35 while a stack of claimed crates moves.
+  misprediction and the tolerance one, or 7 to 16 after a misprediction while a stack of
+  claimed crates moves and 22 to 35 after a claim mid-bump.
   - *The backend keeps its history dependence.* Canonical results per island need Rapier
     to solve islands separately in a canonical order, which the pinned version cannot and
     no fifty-line patch adds (D123), and no solve order carries solver state across a
@@ -444,11 +505,17 @@ checkpoint carries the physics snapshot** (§1, §2, §9.4, §10, §15.5, §16, 
     `physics-rapier`, a second engine and a physics world per island.
   - *A tolerance on the solver-written rows of a dynamic body gates the rollback; the
     rollback is D122's.* `Transform` and `Velocity` of a claimed entity whose `RigidBody`
-    is `Dynamic` at the compared slot or the one before agree by canonical bytes or, failing
-    that, when each scalar leaf is within `PredictionTolerance` (2e-3 m, 2e-3 per
-    quaternion component, 2e-2 m/s and 2e-2 rad/s by default, under a pixel at five metres
-    and 2.7 times the largest absorbed difference of a body on static geometry; `app` sets
-    them through `Predictor::set_tolerance`; the scalar decision re-measures them); every
+    is `Dynamic` at the compared slot or the one before (the compared slot alone when the
+    record has no earlier one) agree by canonical bytes or, failing that, when each scalar
+    leaf is within `PredictionTolerance` (2e-3 m, 2e-3 per quaternion component, 2e-2 m/s
+    and 2e-2 rad/s by default, under a pixel at five metres; `app` sets them through
+    `Predictor::set_tolerance`). The measured margins over the largest absorbed residual
+    are 80 times for a lone body, 2.7 for a body pushing one crate, 1.7 and 1.8 for a
+    rolled ball, 1.05 for a crate claimed mid-push and none for a moving stack, so the
+    defaults bound what is corrected rather than guarantee an absorbed residual; a residual
+    at the margin costs one correction, not a storm, while the next frames fall below it,
+    which every single-contact case did; the scalar decision re-measures the defaults and
+    the spike doubles one whose single-contact absorbed maximum exceeds half of it. Every
     other field, kinematic and fixed bodies' rows included, agrees by canonical bytes only,
     and a NaN leaf agrees with an equal NaN and nothing else. A frame makes a correction
     point when any fact does not agree, and the rollback then writes every fact at *k*,
@@ -476,99 +543,130 @@ checkpoint carries the physics snapshot** (§1, §2, §9.4, §10, §15.5, §16, 
     claimed bodies thrown and interacting, and a claim of a crate being pushed and of a
     stack being bumped, the case that storms.
   - *Claimed dynamic bodies in contact with each other are corrected every few frames
-    until they settle, under any rule.* A stack claimed mid-bump was corrected 22 to 35
-    times in 167 frames and once when claimed at rest; the divergence is physical, so no
-    tolerance holds it and no canonical solve would either. The lever is the claim: `net`'s
-    policy at milestone 4 claims a thrown object with its throw, releases it once it rests
-    or touches an unclaimed body, and never claims a body in contact with another dynamic
-    one.
-  - *An empty solver is a fresh solver.* Removing every body and recreating them in key
-    order on the same solver differed from a fresh solver from the first tick (a crate by
-    0.4 mm, a stack by 0.12 m, the pile by 7.6 m), so `sim`'s in-place reload and a
-    client's full-frame rebuild did not have the physics state a fresh process has and
-    section 15.5's first test did not hold with physics (D57 intended both sides equal).
-    `physics-api` keeps the bytes the backend wrote at `setup` and a sync that has removed
-    every body restores them before the next creation: measured bit-equal to the fresh
-    solver in every scene, the pile included. D119's "never clears the solver" narrows to a
-    solver that still holds a body. Rules out amending section 15.5's first test to a
-    tolerance.
+    until they settle, under any rule.* A three-crate stack was corrected 7 to 16 times in
+    200 frames after a misprediction while it moved, 22 to 35 times in 167 frames when
+    claimed mid-bump, and once when corrected or claimed at rest; the divergence is
+    physical, so no tolerance holds it and no canonical solve would either. The lever is
+    the claim: `net`'s policy at milestone 4 claims a thrown object with its throw, releases
+    it once it rests or touches an unclaimed body, and never claims a body in contact with
+    another dynamic one.
+  - *An empty solver is a fresh solver.* `sim`'s in-place reload and a client's full-frame
+    rebuild unload and load every region in one frame, which the sync sees as `Despawned`
+    then `Spawned` per key and leaves untouched, so the solver kept its whole state, the
+    reloaded world equalled the untouched twin and not a fresh process (a stack mid-bump by
+    3.9e-3 to 1.1e-2 m, a 75-body pile with joints across two regions by 1.24 to 1.40 m),
+    and section 15.5's first test did not hold with physics (D57 intended both sides equal);
+    the handle rows were lost besides. `physics-api` keeps the bytes the backend wrote at
+    `setup`; a sync whose structural log since its last pass, the pending entries a restore
+    carried included, despawned every body the solver held removes them all, restores those
+    bytes and creates from the rows by a full diff in key order, and a sync whose removals
+    leave the solver empty restores them and makes the next sync a full diff; a `Spawned`
+    entry for a key the bookkeeping holds re-inserts its handle row. Measured through the
+    sync bit-equal to the fresh process on the one-frame and the two-frame path, the stack
+    and the pile with its joints. D119's "never clears the solver" narrows to a solver whose
+    log kept a body. Rules out amending section 15.5's first test to a tolerance, and a
+    trigger on the solver being empty after a sync alone, which the one-frame path never
+    reaches.
   - *A journal checkpoint carries the physics snapshot.* A checkpoint that drops solver
     state replays equal only until the first contact, since the replay's solver is fresh
     (1.5 mm to 1.6 m against the continued one); the milestone 4 replay criterion is met
     from a checkpoint that restores the snapshot after the regions and before the first
     step, or from a session's start. `PhysicsSnapshot` carries an `Arc<()>` identity
     compared by pointer, for the ring, and `sim` cannot name `physics-api`, so
-    `journal::Journal` gains an opaque `services` map from a service's key to bytes, filled
-    and handed back by `app`, and `physics-api` gains the byte form and its restore into a
-    fresh `Physics` at the checkpoint's tick: the journal tooling lane's, sized at the
-    milestone 1 scale first.
+    `journal::Journal` gains `services`, keyed by the xxh64 of a service's declared name
+    (never a `TypeId`) to opaque bytes `app` fills and hands back, and `physics-api` gains
+    the byte form, carrying a format version, the backend's identity (name, Rapier version,
+    the D123 patch set's hash), the `PhysicsConfig`, the tick, the backend's bytes and the
+    bookkeeping, and its restore into a fresh `Physics` at the checkpoint's tick, which
+    refuses a mismatch with `InvalidData` and rebuilds the handle rows: the journal tooling
+    lane's, sized at the milestone 1 scale first. `sim` never reads the bytes and the
+    journal is not hashed state.
   - *SOUR needs nothing.* Its modes vary threads, layout and schedule under one row
     history, which is where bit equality holds and what `tests/determinism.rs` shows; the
     sign-of-zero item and the snapshot-hash item stand as they are.
-  - *Risk, not this decision's:* on a four-thread pool a small scene stepped in 20 to 39 ms
-    at worst and once hung in Rapier's deferred broad-phase optimisation; the
-    physics-rapier lane carries the D123 patch, the prediction world's pool is one thread
-    until it lands, and the spike's server carries a step watchdog.
+  - *Risk, not this decision's:* on a four-thread pool a small scene stepped in 39 ms at
+    worst and took 0.4 to 4.4 s per 1,800-tick run in most runs against 19 to 30 ms on one
+    thread (whose own worst run was 319 ms and worst step 14.5 ms), and once hung in
+    Rapier's deferred broad-phase optimisation; the physics-rapier lane carries the D123
+    patch, the prediction world's pool is one thread until it lands, and the spike's server
+    carries a step watchdog.
   - Named and deferred: the defaults re-set at milestone 1 (scalar) and 4 (spike); `net`'s
-    claim policy; the snapshot's byte form, `services` and their size; the restore cost of
-    the empty bytes on a server-sized reload.
-- Driven by: the D119 History addendum, the planner's probes and the proposal's first
-  design review, whose probes p1 to p14 supplied the claim-start, in-contact, derived-field,
-  fresh-load and far-awake measurements (2026-10-11).
+    claim policy; the snapshot's byte form, `services` and their size; the full diff's cost
+    on a server-sized reload.
+- Driven by: the D119 History addendum, the planner's probes and the proposal's two design
+  reviews, whose probes supplied the claim-start, in-contact, derived-field, fresh-load,
+  far-awake and through-the-sync reload measurements and the candidate trigger
+  (2026-10-11).
 - Replaced: section 2's and 9.4's "at full precision" without qualification; D122's "Full
   precision means canonical bytes per field, no tolerance" for the solver-written rows of a
-  dynamic body, and its "a tolerance for dynamic bodies is decided at milestone 4"; D119's
-  "never a cleared solver" for a solver that holds no body; `crates/sim/README.md`'s
-  "dropped at a checkpoint, as solver state is".
+  dynamic body, its "a tolerance for dynamic bodies is decided at milestone 4" and its
+  "this crate computes no float"; D119's "never a cleared solver" for a solver whose log
+  despawned every body it held; `crates/sim/README.md`'s "dropped at a checkpoint, as
+  solver state is".
 
 ## Verification items (exact text)
 
 ### `docs/verification.md`, section 2, the Rapier determinism claim row (**Done**), append to its second cell after "records all three"
 
-; the D124 probes (2026-10-11, the backend stepped directly, release, Apple M1) found the
-dependence confined to large contact graphs and to a solver that has freed its slots: a
-dynamic capsule on static geometry, one pushing a crate, one bumping a three-crate stack,
-one pressing two crates against a wall and fifty thrown interacting bodies were bit-equal
-over 900 to 1,800 ticks with far awake bodies present, arriving at tick 100 and awake
-throughout, a kinematic capsule's state and query answers likewise, while the 150-body pile
-differed by 2.7 mm at tick 238 and by 12, 38, 96 and 346 mm at ticks 250, 300, 350 and 400,
-and every body removed and recreated in key order on the same solver differed from a fresh
-solver by 0.4 mm (a crate), 0.12 m (a stack) and 7.6 m (the pile), which restoring the
-solver's empty setup bytes before recreating removed in every case
+; the D124 probes (2026-10-11, the backend stepped directly and through `physics-api`'s
+sync, release, Apple M1) found the dependence confined to large contact graphs and to a
+solver that has freed its slots: a dynamic capsule on static geometry, one pushing a crate,
+one bumping a three-crate stack, one pressing two crates against a wall and fifty thrown
+interacting bodies were bit-equal over 900 to 1,800 ticks with far awake bodies present,
+arriving at tick 100 and awake throughout, a kinematic capsule's state and query answers
+likewise, while the 150-body pile differed by 2.7 mm at tick 238 and by 12, 38, 96 and 346
+mm at ticks 250, 300, 350 and 400, every body removed and recreated in key order on the
+same solver differed from a fresh solver by 0.4 mm (a crate), 0.12 m (a stack) and 7.6 m
+(the pile), and a same-frame in-place reload through the sync, which removes nothing,
+equalled the untouched twin (3.9e-3 to 1.1e-2 m, a 75-body pile 1.24 to 1.40 m); restoring
+the solver's setup bytes in a sync whose log despawned every body it held, then a full
+diff, was bit-equal to the fresh process on every path
 
 ### `docs/verification.md`, section 4, add three rows
 
-| The reconciliation tolerance (D124): the milestone 1 spike's corrections per minute under the defaults for a dynamic capsule character on static geometry at 100 ms and 1% loss, the same with a kinematic character, fifty thrown claimed bodies, and a claim of a crate being pushed and of a stack being bumped; the largest absorbed difference per kind (`PredictionStats::absorbed`); and how long claimed bodies in mutual contact keep correcting after a throw. The probes' figures, at 20 Hz frames with every fact written at the rollback: a lone capsule one correction per misprediction (8 to 36 bit-exact), absorbing at most 2.4e-5 m; a capsule pushing a crate 1 to 2 (7 to 200), absorbing 7.5e-4 m and 5.3e-3 m/s; a rolled ball and a tipped crate 1 (1 to 200), absorbing 1.2e-3 m, 1.1e-3 per quaternion component and 3.4e-3 rad/s; a moving three-crate stack 1 to 16 (8 to 200), and 22 to 35 in 167 frames when claimed mid-bump, once when claimed at rest. The defaults are re-set from the scalar decision at milestone 1 and the spike's figures at milestone 4 | 1 and 4 |
-| An empty solver is a fresh solver (D124): `physics-api` restores the backend's setup bytes in a sync that removed every body before creating the next; the test is `sim`'s in-place reload and a fresh process, with physics and a scene in contact (a stack mid-bump, and the 150-body pile), hashing equal for K ticks (architecture section 15.5's first test), and the restore's cost on a 100k-entity reload | 1 |
-| The journal checkpoint's physics snapshot (D124): a byte form of `PhysicsSnapshot` a fresh process restores into a `Physics` of a world at the checkpoint's tick (today's carries an `Arc<()>` identity checked by pointer), `journal::Journal::services` to carry it, its size at the milestone 1 scale (about 1.2 kB per fixed collider, so the backend's shared fixed body for bare colliders may come first), and the replay test: a session checkpointed with contacts live, replayed from the checkpoint and from its start, hashing equal to the recording at every tick | 4 |
+| The reconciliation tolerance (D124): the milestone 1 spike's corrections per minute under the defaults for a dynamic capsule character on static geometry at 100 ms and 1% loss, the same with a kinematic character, fifty thrown claimed bodies, and a claim of a crate being pushed and of a stack being bumped; the largest absorbed difference per kind (`PredictionStats::absorbed`), and whether any single-contact maximum exceeds half a default, which doubles it; and how long claimed bodies in mutual contact keep correcting after a throw. The probes' figures, at 20 Hz frames with every fact written at the rollback: a lone capsule one correction per misprediction (8 to 36 bit-exact), absorbing at most 2.4e-5 m; a capsule pushing a crate 1 to 2 (7 to 200), absorbing 7.5e-4 m and 5.3e-3 m/s; a rolled ball and a tipped crate 1 (1 to 200), absorbing 1.2e-3 m, 1.1e-3 per quaternion component and 3.4e-3 rad/s; a crate claimed mid-push 1 to 2, absorbing 1.9e-3 m; a three-crate stack 7 to 16 after a misprediction while it moves (8 to 200) and 22 to 35 in 167 frames when claimed mid-bump, once when corrected or claimed at rest. The probes' correction pushed bit-equal rows too and modelled no rollback; the spike measures the shipped path. The defaults are re-set from the scalar decision at milestone 1 and the spike's figures at milestone 4 | 1 and 4 |
+| An empty solver is a fresh solver (D124): `physics-api` restores the backend's setup bytes and runs a full diff in a sync whose log despawned every body the solver held, restores them and marks the next sync a full diff when its removals leave the solver empty, and re-inserts the handle row of a `Spawned` entry for a key it holds. The test runs through `sim`'s in-place reload with `physics-api`'s sync and the Rapier backend, never the backend alone: every region unloaded and loaded in one frame, and in two frames, against a fresh process, equal hashes for K ticks with a three-crate stack mid-bump and a 75-body pile with two joints across two regions, `BodyHandle` and `JointHandle` rows present after each reload and after a same-frame reload of one region; and the full diff's cost on a 100k-entity reload | 1 |
+| The journal checkpoint's physics snapshot (D124): `journal::Journal::services` keyed by the xxh64 of a service's declared name; a byte form of `PhysicsSnapshot` carrying a format version, the backend's identity (name, Rapier version, the D123 patch set's hash), the `PhysicsConfig`, the tick, the backend's bytes and the bookkeeping, restored into a fresh `Physics` of a world at the checkpoint's tick with a mismatch refused and the handle rows rebuilt (today's snapshot carries an `Arc<()>` identity checked by pointer); its size at the milestone 1 scale (about 1.2 kB per fixed collider, so the backend's shared fixed body for bare colliders may come first); and the replay test: a session checkpointed with contacts live, replayed from the checkpoint and from its start, hashing equal to the recording at every tick | 4 |
 
 ## What the predict implementation lane changes, if D124 is adopted
 
-The lane is running against D122 as written, and D124 leaves the hook, the ring, the
-rollback, the re-simulation and the substitution rules as they are. The change is local to
-the comparison and its reporting:
+Against the implementation at 8a744fd. The hook, the ring, the rollback, the re-simulation
+and the substitution rules are untouched; no SOUR scene is needed; the one-thread
+prediction pool is `app`'s. The change is in `compare.rs`, in the write set of `fact.rs`
+that reuses it, and in the reporting:
 
-1. The predicate for one fact's component: canonical bytes equal, agree; else, if the
-   component is `Transform` or `Velocity` and the entity's `RigidBody` at slot *T* or
-   *T* - 1 (the fact's if the frame carries one, else the record's) has `body_type ==
-   Dynamic`, agree when every scalar leaf is within `PredictionTolerance` for its kind
-   through `lactose_math` (a NaN leaf agrees only with an equal NaN, which the bytes
-   already decided); else mismatch. The rollback's "every fact at *k* is written" stands.
-2. `Teleported` is dropped from the record and from the facts of claimed entities: not
-   read through `get_erased`, not compared, not written by a correction. The hook's writing
-   of a proxy's `Teleported` as its position for the tick stands.
-3. `PredictionTolerance { translation, rotation, linear, angular }: Scalar` with
+1. `Comparison` gains a third outcome, `Absorbed { fields }`: the canonical bytes differ,
+   the component is `Transform` or `Velocity`, the entity's `RigidBody` at slot *T* or
+   *T* - 1 has `body_type == Dynamic`, and every scalar leaf is within
+   `PredictionTolerance` for its kind through `lactose_math` (a NaN leaf agrees only with
+   an equal NaN, which the bytes already decided). `check`'s mismatch scan treats
+   `Absorbed` as agreeing, so the frame makes no correction point for it; `writes` returns
+   true for it, so a rollback writes it as it writes `Differs` and `Missing`; `absorbed`
+   counts its fields and keeps the largest difference per kind. This is the one change of
+   structure: the write set reuses `compare`, so putting the tolerance into `Agrees` would
+   have stopped writing absorbed facts, which was measured worse (the stack 18 to 34
+   corrections against 7 to 16, a claim mid-bump 32 to 44 against 22 to 35).
+2. The caller passes the entity's `RigidBody` at *T* (the fact's if the frame carries one,
+   else the record's) and at *T* - 1 (the record's, `None` when the record has no slot
+   *T* - 1 for the entity, in which case *T* alone decides); `compare(info, predicted,
+   server)` takes neither today.
+3. `Teleported` is dropped from the record: `recorded` excludes its key, so `get_erased`
+   never reads it; `compare` already returns `Ignored` for it and writes skip it.
+4. `PredictionTolerance { translation, rotation, linear, angular }: Scalar` with
    `DEFAULT` (2e-3, 2e-3, 2e-2, 2e-2) and `Predictor::set_tolerance(&mut self,
    PredictionTolerance)` between runs; `Predictor::new` keeps its signature and starts at
    the default.
-4. `PredictionStats::absorbed: Absorbed { fields: u64, translation: u64, rotation: u64,
+5. `PredictionStats::absorbed: Absorbed { fields: u64, translation: u64, rotation: u64,
    linear: u64, angular: u64 }`, the count of absorbed fields and the largest absorbed
-   difference per kind as canonical bits, so the derives stay; `Divergence` and
-   `Correction` are unchanged.
-5. The README sentences above, and the "computes no float" sentence of `reconcile.rs`'s
-   `Divergence` doc goes.
-6. Tests: the comparison's golden cases listed in the README amendment; a corrected
-   `Transform` followed by a frame with the server's unchanged `Teleported` makes no
-   correction; a frame whose only difference is within tolerance makes no correction and
+   difference per kind as canonical bits, so the derives stay; `Divergence` counts
+   mismatches only and `Correction` is unchanged.
+6. Docs: `compare.rs`'s module comment ("a tolerance for dynamic bodies ... changes this
+   module and nothing else") and its "Full precision, no tolerance"; `reconcile.rs`'s
+   `Divergence` doc ("this crate computes no float"); the README sentences above.
+7. Tests, each mandatory: the comparison's golden cases listed in the README amendment; a
+   corrected `Transform` followed by a frame with the server's unchanged `Teleported` makes
+   no correction; a frame whose only difference is within tolerance makes no correction and
    counts in `absorbed`; a frame with one leaf beyond it rolls back and writes the absorbed
-   facts too (the physics test backend records the pushes).
+   facts too, which the physics test backend's recorded pushes show; a body dynamic at
+   *T* - 1 and kinematic at *T* takes the tolerance, and one with no slot *T* - 1 is judged
+   at *T*.
