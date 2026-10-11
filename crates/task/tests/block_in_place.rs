@@ -46,13 +46,22 @@ fn measure(workers: u32, reserved: u32) -> (u32, u32) {
     let active = Arc::new(AtomicU32::new(0));
     let peak = Arc::new(AtomicU32::new(0));
     let during = Arc::new(AtomicU32::new(0));
+    // How many workers hold a unit begun before the block. Each holds at most one.
+    let held = Arc::new(AtomicU32::new(0));
 
     // Released first, so a worker takes it before any unit of the other node runs: those
-    // wait for the block and must not wait for the worker that would begin it.
+    // wait for the block and must not wait for the worker that would begin it. That rests on
+    // the graph releasing its roots in node order into the FIFO injector. With `others`
+    // taken first every worker can be holding a unit and nobody left to begin the block.
     let physics = {
-        let (blocked, unblocked, during) = (blocked.clone(), unblocked.clone(), during.clone());
+        let (held, blocked, unblocked, during) =
+            (held.clone(), blocked.clone(), unblocked.clone(), during.clone());
         Node::new("block::physics")
             .run(move |_, ctx| {
+                // The block begins with every other worker mid-range, so each has to give
+                // way inside its range and not merely be refused its next entry by a gate
+                // that closed before it took one.
+                wait_until(|| held.load(Ordering::Acquire) >= workers - 1);
                 let value = ctx.block_in_place(reserved, || {
                     blocked.store(true, Ordering::Release);
                     if reserved == 0 {
@@ -70,7 +79,8 @@ fn measure(workers: u32, reserved: u32) -> (u32, u32) {
             .build()
     };
     let others = {
-        let (blocked, unblocked, seen, active, peak, during) = (
+        let (held, blocked, unblocked, seen, active, peak, during) = (
+            held.clone(),
             blocked.clone(),
             unblocked.clone(),
             seen.clone(),
@@ -83,7 +93,17 @@ fn measure(workers: u32, reserved: u32) -> (u32, u32) {
             .run(move |_, ctx| {
                 if !blocked.load(Ordering::Acquire) {
                     // Holds the worker mid-job until the block is in place.
-                    wait_for(&blocked);
+                    held.fetch_add(1, Ordering::AcqRel);
+                    let begun = Instant::now();
+                    while !blocked.load(Ordering::Acquire) {
+                        assert!(
+                            begun.elapsed() < Duration::from_secs(60),
+                            "no block began: every worker holds a unit of the other node, which \
+                             can only happen if the physics node was not taken first (roots \
+                             released in node order into the FIFO injector)"
+                        );
+                        std::thread::yield_now();
+                    }
                     return;
                 }
                 if unblocked.load(Ordering::Acquire)
@@ -145,8 +165,8 @@ fn the_pool_recovers_its_full_width_after_a_block() {
 }
 
 /// An opener that is parked on its scope latch runs nothing, so it must not count as one of
-/// the reserved workers, whether it parked before the block began (as here, nearly always)
-/// or after. Otherwise `block_in_place(1)` leaves nobody working for the whole physics step.
+/// the reserved workers, whether it parked before the block began or after: both orders are
+/// run. Otherwise `block_in_place(1)` leaves nobody working for the whole physics step.
 ///
 /// The opener's own share is one child, which ends once a thief holds the range; then its
 /// deque is empty and it parks. The block lasts until every child that did not begin before
@@ -154,6 +174,14 @@ fn the_pool_recovers_its_full_width_after_a_block() {
 /// would leave none for them.
 #[test]
 fn a_parked_opener_does_not_use_up_the_reservation() {
+    parked_opener(false);
+    parked_opener(true);
+}
+
+/// With `after_block`, the opener's share lasts until the block is in place and a while
+/// longer, so the thieves give way first and the opener parks last, under the closed gate:
+/// the permit it gives up there must reach an idle worker.
+fn parked_opener(after_block: bool) {
     let executor = executor(4, 1);
     let physics_started = Arc::new(AtomicBool::new(false));
     let stolen = Arc::new(AtomicBool::new(false));
@@ -167,8 +195,9 @@ fn a_parked_opener_does_not_use_up_the_reservation() {
     let wanted = children - 3;
 
     let physics = {
-        let (physics_started, share_done, blocked, unblocked, during) = (
+        let (physics_started, stolen, share_done, blocked, unblocked, during) = (
             physics_started.clone(),
+            stolen.clone(),
             share_done.clone(),
             blocked.clone(),
             unblocked.clone(),
@@ -177,10 +206,13 @@ fn a_parked_opener_does_not_use_up_the_reservation() {
         Node::new("block::after-park")
             .run(move |_, ctx| {
                 physics_started.store(true, Ordering::Release);
-                wait_for(&share_done);
-                // Time for the opener to find its deque empty and park. If it is later than
-                // this, it gives its permit up inside the block instead.
-                std::thread::sleep(Duration::from_millis(sized(10, 1).into()));
+                if after_block {
+                    wait_for(&stolen);
+                } else {
+                    wait_for(&share_done);
+                    // Time for the opener to find its deque empty and park.
+                    std::thread::sleep(Duration::from_millis(sized(10, 1).into()));
+                }
                 ctx.block_in_place(1, || {
                     blocked.store(true, Ordering::Release);
                     wait_until(|| during.load(Ordering::Acquire) >= wanted);
@@ -219,6 +251,10 @@ fn a_parked_opener_does_not_use_up_the_reservation() {
                     scope.fork(move |_| {
                         wait_for(stolen);
                         share_done.store(true, Ordering::Release);
+                        if after_block {
+                            wait_for(blocked);
+                            std::thread::sleep(Duration::from_millis(sized(20, 1).into()));
+                        }
                     });
                 });
             })
@@ -229,26 +265,36 @@ fn a_parked_opener_does_not_use_up_the_reservation() {
     let ran = during.load(Ordering::Acquire);
     assert!(
         ran >= wanted,
-        "{ran} of {wanted} children ran during the block: the parked opener held the one \
-         reserved permit"
+        "{ran} of {wanted} children ran during the block, the opener parked {} it: its permit \
+         did not reach a worker that could run them",
+        if after_block { "inside" } else { "before" }
     );
 }
 
 /// The second review's case: every frame-critical worker other than the blocked one is
-/// inside a scope, running its own children, when `block_in_place(1)` begins. Both openers
-/// are over the limit and both give way. One of them must end up with the reserved permit
-/// and keep running children; before the fix both parked on their latches beside their own
-/// deques and nothing ran until the block ended.
+/// inside a scope, running its own children, when `block_in_place(1)` begins. The block
+/// waits until both openers are held inside one of their children, so both are over the
+/// limit mid-range: each finishes that child, and at most one keeps running children while
+/// the block lasts. One of them must end up with the reserved permit and keep running
+/// children; before the fix both parked on their latches beside their own deques and
+/// nothing ran until the block ended.
 #[test]
 fn a_reservation_is_used_when_every_other_worker_is_an_opener() {
     let executor = executor(3, 1);
     let started = Arc::new(AtomicU32::new(0));
+    // How many openers are inside one of their own children, held there until the block.
+    let inside = Arc::new(AtomicU32::new(0));
     let blocked = Arc::new(AtomicBool::new(false));
     let unblocked = Arc::new(AtomicBool::new(false));
     let during = Arc::new(AtomicU32::new(0));
+    let active = Arc::new(AtomicU32::new(0));
+    let peak = Arc::new(AtomicU32::new(0));
+    let seen: Arc<Vec<AtomicBool>> =
+        Arc::new((0..executor.slot_count()).map(|_| AtomicBool::new(false)).collect());
     // What the block waits for: this many child units run while it is in place. It cannot
-    // be reached unless a reserved worker runs children during the block.
-    let wanted = sized(200, 4);
+    // be reached unless a reserved worker runs children during the block. The longer the
+    // block, the surer an opener that ignores the gate is caught running beside the other.
+    let wanted = sized(400, 4);
     let children = sized(40_000, 400);
 
     let all_started = {
@@ -261,11 +307,20 @@ fn a_reservation_is_used_when_every_other_worker_is_an_opener() {
         }
     };
     let physics = {
-        let (all_started, blocked, unblocked, during) =
-            (all_started.clone(), blocked.clone(), unblocked.clone(), during.clone());
+        let (all_started, inside, blocked, unblocked, during) = (
+            all_started.clone(),
+            inside.clone(),
+            blocked.clone(),
+            unblocked.clone(),
+            during.clone(),
+        );
         Node::new("block::all-openers")
             .run(move |_, ctx| {
                 all_started();
+                // The block begins with both openers running their own children, not before
+                // they reach them: otherwise they meet a closed gate before their first child
+                // and the give-way inside a range is never exercised.
+                wait_until(|| inside.load(Ordering::Acquire) >= 2);
                 ctx.block_in_place(1, || {
                     blocked.store(true, Ordering::Release);
                     wait_until(|| during.load(Ordering::Acquire) >= wanted);
@@ -275,25 +330,44 @@ fn a_reservation_is_used_when_every_other_worker_is_an_opener() {
             .build()
     };
     let opener = |name| {
-        let (all_started, blocked, unblocked, during) =
-            (all_started.clone(), blocked.clone(), unblocked.clone(), during.clone());
+        let (all_started, inside, blocked, unblocked, during, active, peak, seen) = (
+            all_started.clone(),
+            inside.clone(),
+            blocked.clone(),
+            unblocked.clone(),
+            during.clone(),
+            active.clone(),
+            peak.clone(),
+            seen.clone(),
+        );
         Node::new(name)
             .run(move |_, ctx| {
                 all_started();
-                let (blocked, unblocked, during) = (&blocked, &unblocked, &during);
+                let (inside, blocked, unblocked, during, active, peak, seen) =
+                    (&inside, &blocked, &unblocked, &during, &active, &peak, &seen);
                 ctx.scope(|scope| {
-                    scope.fork_range(0..children, move |range, _| {
+                    scope.fork_range(0..children, move |range, child| {
                         for _ in range {
                             if !blocked.load(Ordering::Acquire) {
                                 // Holds the opener inside its children until the block
-                                // begins, so they cannot all have run before it.
+                                // begins, so they cannot all have run before it. With no
+                                // idle worker to steal, only an opener gets here, once.
+                                inside.fetch_add(1, Ordering::AcqRel);
                                 wait_for(blocked);
                                 continue;
                             }
-                            spin_for(Duration::from_micros(10));
-                            if !unblocked.load(Ordering::Acquire) {
-                                during.fetch_add(1, Ordering::AcqRel);
+                            // As in `measure`: each worker's first child after the block
+                            // may have been admitted before it, so it is not counted.
+                            if unblocked.load(Ordering::Acquire)
+                                || !seen[child.slot() as usize].swap(true, Ordering::AcqRel)
+                            {
+                                continue;
                             }
+                            let now = active.fetch_add(1, Ordering::AcqRel) + 1;
+                            peak.fetch_max(now, Ordering::AcqRel);
+                            spin_for(Duration::from_micros(50));
+                            during.fetch_add(1, Ordering::AcqRel);
+                            active.fetch_sub(1, Ordering::AcqRel);
                         }
                     });
                 });
@@ -305,4 +379,9 @@ fn a_reservation_is_used_when_every_other_worker_is_an_opener() {
     executor.shutdown();
     let ran = during.load(Ordering::Acquire);
     assert!(ran >= wanted, "{ran} of {wanted} children ran during the block with one reserved");
+    let peak = peak.load(Ordering::Acquire);
+    assert!(
+        peak <= 1,
+        "{peak} children ran at once with one worker reserved: an opener over the limit kept running its own"
+    );
 }
