@@ -20,7 +20,8 @@ use crate::ring::{EntityRecord, Slot};
 
 /// One statement of a delta frame about an entity the server has or had claimed for the
 /// local player, recorded by the hook in the frame's order (spawns, moves, removals, rows,
-/// tombstones, each ascending by key) and never written by it.
+/// tombstones, each ascending by key); of these it writes only a claim or a release, in a
+/// predicted tick.
 #[derive(Clone, Debug)]
 pub(crate) enum Fact {
     /// A spawn with no interpolation slot: the entity exists, claimed, in `region`, and its
@@ -102,6 +103,73 @@ impl Fact {
 pub(crate) struct Resolved {
     pub(crate) fact: Fact,
     pub(crate) region: Option<RegionId>,
+}
+
+/// Adds `new`, a later fact about an entity, to `kept`, the facts compared at one tick,
+/// so that each entity's facts there stay one statement a record can agree with: what
+/// `new` states replaces what it supersedes. A claimed spawn, release or tombstone replaces
+/// the entity's earlier facts; a move sets the region they name; exact rows replace a
+/// claimed spawn's components, or earlier rows and removals; a removal drops the component
+/// from a claimed spawn or rows. Whether `new` is kept, which it is not after a release or
+/// tombstone of the entity: the server sends no other fact about one it no longer claims.
+pub(crate) fn fold(kept: &mut Vec<Resolved>, new: Resolved) -> bool {
+    let key = new.fact.key();
+    let ours = |resolved: &Resolved| resolved.fact.key() == key;
+    let ended = kept.iter().any(|resolved| {
+        ours(resolved) && matches!(resolved.fact, Fact::Released { .. } | Fact::Destroyed { .. })
+    });
+    // The claimed spawn or exact rows that state the entity whole, if one is kept.
+    let whole = kept.iter().position(|resolved| {
+        ours(resolved) && matches!(resolved.fact, Fact::Claimed { .. } | Fact::Rows { .. })
+    });
+    match &new.fact {
+        Fact::Claimed { .. } | Fact::Released { .. } | Fact::Destroyed { .. } => {
+            kept.retain(|resolved| !ours(resolved));
+        }
+        _ if ended => return false,
+        Fact::Moved { region, .. } => {
+            for resolved in kept.iter_mut().filter(|resolved| ours(resolved)) {
+                resolved.region = Some(*region);
+                if let Fact::Claimed { region: stated, .. } = &mut resolved.fact {
+                    *stated = *region;
+                }
+            }
+            if whole.is_some_and(|at| matches!(kept[at].fact, Fact::Claimed { .. })) {
+                return true;
+            }
+            kept.retain(|resolved| {
+                !(ours(resolved) && matches!(resolved.fact, Fact::Moved { .. }))
+            });
+        }
+        Fact::Rows { components, .. } => {
+            if let Some(at) = whole
+                && let Fact::Claimed { components: stated, .. } = &mut kept[at].fact
+            {
+                stated.clone_from(components);
+                return true;
+            }
+            kept.retain(|resolved| {
+                !(ours(resolved)
+                    && matches!(resolved.fact, Fact::Rows { .. } | Fact::Removed { .. }))
+            });
+        }
+        Fact::Removed { component, .. } => {
+            if let Some(at) = whole {
+                if let Fact::Claimed { components, .. } | Fact::Rows { components, .. } =
+                    &mut kept[at].fact
+                {
+                    components.retain(|data| data.component != *component);
+                }
+                return true;
+            }
+            kept.retain(|resolved| {
+                !(ours(resolved)
+                    && matches!(resolved.fact, Fact::Removed { component: c, .. } if c == *component))
+            });
+        }
+    }
+    kept.push(new);
+    true
 }
 
 /// Whether the record holds the component `info` describes: a replicated persistent
@@ -427,7 +495,7 @@ fn strip(
 
 /// The components of `components` a correction writes to `key` (`None`: to an entity it
 /// spawns), by [`writes`] against what the world holds.
-fn written_components(
+pub(crate) fn written_components(
     world: &World,
     key: Option<StableKey>,
     components: &[ComponentData],

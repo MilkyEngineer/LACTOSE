@@ -13,7 +13,7 @@ use lactose_net_api::{StagedFrame, StagedInbox, StagedSpawn};
 use lactose_reflect::Reflect;
 use lactose_sim::{StagedState, StreamingAnchor};
 
-use crate::fact::Fact;
+use crate::fact::{Fact, written_components};
 use crate::predictor::LocalPlayer;
 
 /// The `StagedState` hook of the prediction world, installed by
@@ -247,7 +247,8 @@ fn rebuild(world: &mut World, local: LocalPlayer, frame: &StagedFrame) {
 /// player has claimed is a fact. A claim or a release is a fact and is applied too, so that
 /// the frame's later entries and the later frames of the tick find the entity as the
 /// server has it; a re-simulated tick (`replaying`) leaves the claim as the corrections
-/// wrote it at the frame's tick, which a later fact may have changed since (a tombstone). A
+/// wrote it at the frame's tick (or the tick it was popped at, for a fact kept there),
+/// which a later fact may have changed since (a tombstone). A
 /// move, removal, row or tombstone of an entity that is not live is a fact too, which the
 /// reconciliation keeps only for an entity it knows the server claimed.
 fn apply_delta(
@@ -353,14 +354,16 @@ fn apply_delta(
 }
 
 /// Applies a claimed spawn's claim as a full frame does: `ClaimedBy` inserted on the live
-/// `key`, or the entity spawned with every component and claimed if it is not live. Its
-/// components are left to the correction at the frame's tick.
+/// `key`, or the entity spawned claimed if it is not live, with the components a
+/// correction writes (`Teleported` and transient ones are never written to a claimed
+/// entity). Its components are otherwise left to the correction.
 fn claim_spawn(world: &mut World, local: LocalPlayer, key: StableKey, spawn: &StagedSpawn) {
-    if !world.contains(key)
-        && let Err(error) = world.spawn_erased(key, spawn.region, &spawn.components)
-    {
-        refused("a claimed spawn", key, &error);
-        return;
+    if !world.contains(key) {
+        let components = written_components(world, None, &spawn.components);
+        if let Err(error) = world.spawn_erased(key, spawn.region, &components) {
+            refused("a claimed spawn", key, &error);
+            return;
+        }
     }
     if !claimed_by(world, local, key)
         && let Err(error) = world.insert(key, ClaimedBy { player: local.player })

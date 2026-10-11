@@ -217,7 +217,8 @@ fn an_entity_despawned_too_early_is_respawned_in_its_last_known_region() {
 }
 
 #[test]
-fn a_fact_in_a_region_the_slot_lacks_is_skipped() {
+fn a_fact_in_a_region_neither_its_slot_nor_the_popped_tick_holds_is_skipped() {
+    // No step loads `UNLOADED`: the replicated world's hook refuses the same spawn.
     let mut rig = Rig::joined();
     rig.step_to(20, walking);
     let mut frame = StagedFrame::new(Tick(15));

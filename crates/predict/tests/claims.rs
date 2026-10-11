@@ -3,7 +3,8 @@
 //! ends as it does across two windows (the hook applies the claim change at once); a
 //! claimed spawn and a frame's exact rows of a claimed entity state its whole recorded
 //! component set, so a component the server's entity lacks is removed; and a transient
-//! replicated component is never reconciled.
+//! replicated component is never reconciled, nor written to a claimed entity, nor is
+//! `Teleported`.
 
 #![forbid(unsafe_code)]
 
@@ -12,6 +13,7 @@ mod common;
 use common::*;
 use lactose_core::Tick;
 use lactose_net_api::{StagedFrame, Tombstone};
+use lactose_physics_api::Teleported;
 use lactose_predict::Reconciled;
 use lactose_reflect::Reflect;
 
@@ -214,4 +216,27 @@ fn a_transient_replicated_component_is_never_reconciled() {
     let reconciled = rig.reconcile();
     assert!(reconciled.corrections.is_empty(), "{:?}", summaries(&reconciled));
     assert_eq!(rig.world().get::<Aim>(me()), None);
+}
+
+#[test]
+fn a_claimed_spawn_the_hook_applies_carries_neither_teleported_nor_a_transient_component() {
+    let mut rig = Rig::joined();
+    rig.step_to(20, walking);
+    let mut frame = StagedFrame::new(Tick(15));
+    let components = vec![data(at(5, 5)), data(Teleported(Tick(3))), data(Aim(7))];
+    frame.spawns.insert(net(4), claimed(REGION, components));
+    rig.push(frame);
+    rig.step(walking(21));
+    let world = rig.world();
+    assert_eq!(world.get::<Position>(key(4)), Some(&at(5, 5)));
+    assert_eq!(claim(world, key(4)), Some(PLAYER));
+    assert_eq!(world.get::<Teleported>(key(4)), None);
+    assert_eq!(world.get::<Aim>(key(4)), None);
+    // The correction at 15, whose slot lacks the entity, spawns it the same way.
+    let reconciled = rig.reconcile();
+    assert_eq!(summaries(&reconciled).len(), 1, "{:?}", summaries(&reconciled));
+    let world = rig.world();
+    assert_eq!(world.get::<Position>(key(4)), Some(&at(5, 5)));
+    assert_eq!(world.get::<Teleported>(key(4)), None);
+    assert_eq!(world.get::<Aim>(key(4)), None);
 }

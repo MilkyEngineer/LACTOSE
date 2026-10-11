@@ -21,7 +21,7 @@ use lactose_reflect::TypeInfo;
 use lactose_sim::{RunError, Simulation, StagedState, TickInput};
 
 use crate::compare::PredictionTolerance;
-use crate::fact::recorded;
+use crate::fact::{Resolved, recorded};
 use crate::hook::{PredictionHook, PredictionRecord, record};
 use crate::reconcile::{PredictionStats, Reconciled};
 use crate::ring::{Ring, Slot};
@@ -84,6 +84,13 @@ struct State {
     /// at or after them is reconciled; a frame spans every tick since the previous one, so
     /// a repair is found by its tick, possibly in a later call.
     awaiting: BTreeSet<Tick>,
+    /// The facts compared at the tick their frame was popped at instead of their own, by
+    /// that tick: each places its entity in a region slot *T* lacked and the popped tick
+    /// loaded, and later facts about the same entity are folded in, so that each entity's
+    /// facts at a tick are one statement. Kept while the ring holds the tick, since a
+    /// re-simulation of it never re-applies them (`README.md`, "Reconciliation"); cleared
+    /// by a full frame and by `resync`.
+    kept: BTreeMap<Tick, Vec<Resolved>>,
     /// The components the record holds, ascending: the registry's replicated persistent
     /// ones but `Teleported`.
     recorded: Vec<ComponentKey>,
@@ -218,6 +225,7 @@ impl Predictor {
             physics: world.service::<Physics>().is_some(),
             known: BTreeMap::new(),
             awaiting: BTreeSet::new(),
+            kept: BTreeMap::new(),
             recorded: world
                 .registry()
                 .iter()
@@ -335,6 +343,7 @@ impl Predictor {
         state.ring.rebuild_at(tick);
         state.horizon(world);
         state.awaiting.clear();
+        state.kept.clear();
         state.stats.resyncs += 1;
         Ok(())
     }
@@ -407,7 +416,9 @@ impl Predictor {
     /// newest full frame are skipped, and the facts of frames for ticks before the restart,
     /// exact rows aside, are compared at the restart's slot; substituted ticks replace the
     /// ring's recorded samples and the first unsubstituted tick after them is repaired;
-    /// each other frame's claimed facts are compared against the slot of the frame's tick,
+    /// each other frame's claimed facts are compared against the slot of the frame's tick
+    /// (one that places an entity in a region that slot lacks, at the slot of the tick the
+    /// frame was popped at, where it is kept for later calls),
     /// a dynamic body's `Transform` and `Velocity` within the tolerance
     /// ([`set_tolerance`](Self::set_tolerance)); from the oldest difference the
     /// world is restored, the facts at that tick are written stamped, the physics is told

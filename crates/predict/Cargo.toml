@@ -35,6 +35,8 @@ lactose-sim.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+# `AssetSet`, for the empty baseline of a region a step loads in `tests/regions.rs`.
+lactose-asset-api.workspace = true
 # `TickPacer`, for the timer-root sketch in `tests/consumers.rs`, and `ChaosConfig` for the
 # executor SOUR asks for in `tests/sour.rs`.
 lactose-task.workspace = true
