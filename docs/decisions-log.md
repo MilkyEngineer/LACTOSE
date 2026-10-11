@@ -1089,6 +1089,28 @@ rationale the author supplied during the editorial pass rather than one taken fr
   announces itself before parking and a freed permit unparks it.
 - Driven by: milestone 0 task lane, first review (scope-wait deadlock, reservation consumed by
   a parked opener) and second review, finding 1.
+- Addendum (lane task-flake2, 2026-10-11): `a_parked_opener_does_not_use_up_the_reservation`
+  failed on Windows CI (run 38126882535) with a correct pool. It asserted that a child finished
+  inside a 100 ms wall-clock window during `block_in_place(1)`, which a descheduled physics
+  thread (the thieves finish every child first) or a descheduled permit holder misses; the old
+  test with the physics thread held 600 ms fails with the CI message. The rewritten
+  `block_in_place` tests synchronise on events: a unit or child begun before the block holds
+  its worker until the block is in place; in the reservation and all-openers tests the block
+  begins only once every other worker is held mid-range or inside one of its children; and a
+  block that reserves workers lasts until the work it is owed has run, bounded at 60 s. The
+  parked-opener test runs both orders: the opener parks before the block, or parks inside it
+  after the thieves gave way, where the permit it gives up under the closed gate must reach an
+  idle worker. The all-openers test begins the block with both openers held inside one of their
+  own children and checks that at most one child admitted under the closed gate runs at once.
+  The reservation test skips each worker's first unit after the block began, the one it may
+  have been admitted to before, so `peak <= reserved` and nothing running with nothing reserved
+  hold on any schedule; it relies on roots released in node order into the FIFO injector. Each
+  of the three rewritten tests fails under a mutation of the code it covers: a parked opener
+  keeping its permit; a permit freed under the closed gate waking no idle worker, or the opener
+  releasing without telling anyone; a graph worker or an opener never giving way mid-range; a
+  gate that ignores the reservation. Not covered yet (review round 2): the recovery test is
+  caught by no listed mutation and hangs rather than fails when the gate keeps its reservation,
+  and no test checks that opening the gate wakes the workers it held.
 
 **D109. Wake policy: park after 50 µs, keep one, wake one per extra entry** (§5.1, `lactose-task`)
 - Why: measured on an M1. A longer spin or an extended rescan before parking bought no wake
