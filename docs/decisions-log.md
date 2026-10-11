@@ -1271,6 +1271,19 @@ rationale the author supplied during the editorial pass rather than one taken fr
   from 0.0147 to 0.0103 s/s. The 20 µs criterion is not yet shown on this machine, which
   alternates between a state where the fixed keeper measures P99 under 6 µs and one where
   it measures 22 to 25 µs (`docs/verification.md`).
+- Addendum (lane task-small, 2026-10-11): the wake order is stated and the order of the tasks is
+  not. A worker that fires timers wakes the ones due when it looks in deadline order, ties in
+  registration order; workers that fire at the same time interleave theirs (the review measured
+  56 to 150 global inversions per 4,000 wake-ups on four firing workers, none within one). A woken
+  task is scheduled by the rule above, and a `Sleep` first polled after its deadline resolves at
+  that poll. `sleep_until_resolves_at_its_deadline` asserted that three tasks on two workers
+  finished in deadline order and failed under load on macOS CI (run 38081901338): a task polled
+  late resolves in poll order, and a late worker that finds two timers due keeps one task and
+  queues the other for a sleeper that can run it first. The test keeps its other assertions;
+  `due_timers_wake_in_deadline_order` (one firing worker held past every deadline) and
+  `a_later_timer_does_not_hold_an_earlier_one_back` (the keeper re-arms for a new earliest
+  deadline) prove the contract without depending on scheduling, and each fails under the
+  mutation of the code it covers.
 - Driven by: the D113 tick-start criterion; the keeper fix round and its review.
 
 **D117. The naive ECS implementation: what the facade left to it** (§6, `lactose-ecs`)
@@ -2190,6 +2203,10 @@ rationale the author supplied during the editorial pass rather than one taken fr
   `lactose_predict::check_prediction_reads` is still `todo!()`, so the tests use local check
   functions. Generic code (the erased writes, the reference walkers) trusts `FieldKind::EntityRef`:
   a type that declares that kind without being an `EntityRef` is read and rewritten as one.
+- `TickPacer::poll` without its parameter (lane task-small): `poll(now)` counts catch-up alone
+  under the per-frame cap, the test `catch_up_is_capped` replaces
+  `catch_up_is_capped_and_shares_the_cap_with_resimulation`, and the timer-root sketches of
+  `lactose-sim` and `lactose-predict` call it without the zero; the deferred item is closed.
 - Driven by: milestone 1, the `predict` facade brief and its two design reviews (2026-10-10 and
   2026-10-11).
 

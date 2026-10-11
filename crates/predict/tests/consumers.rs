@@ -150,10 +150,10 @@ fn fold_due(input: &mut TickInput, inbox: &StagedInbox, next: Tick) {
     }
 }
 
-/// The order of one frame: push, fold, poll (zero re-simulation ticks: the cap is for
-/// catch-up, D122), step the new ticks (the first step's hook pops every due frame),
-/// reconcile what the hook popped, run the passes, take the presentation events. Every
-/// run that hands the predictor back is matched, never `?`ed, so the world is kept.
+/// The order of one frame: push, fold, poll (the cap is for catch-up alone, D122), step
+/// the new ticks (the first step's hook pops every due frame), reconcile what the hook
+/// popped, run the passes, take the presentation events. Every run that hands the
+/// predictor back is matched, never `?`ed, so the world is kept.
 #[expect(
     clippy::disallowed_types,
     reason = "the timer root is `app`'s, outside the boundary; this sketch pins that it \
@@ -171,7 +171,7 @@ async fn frame(client: &mut Client, pacer: &mut TickPacer) -> Next {
         let _ = inbox.push(frame);
     }
 
-    let budget = pacer.poll(Instant::now(), 0);
+    let budget = pacer.poll(Instant::now());
     for i in 0..budget.ticks {
         let next = Tick(predictor.tick().0 + 1);
         let mut input = TickInput::default();

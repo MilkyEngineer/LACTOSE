@@ -81,9 +81,8 @@ loop {
     //    enters nothing. Then the due frames' time scale and region changes folded into
     //    the first new tick's `TickInput`, exactly as for the replicated world.
     // 2. The pacer. The cap is for catch-up; re-simulation is bounded by the ring depth
-    //    and does not count against it (D122): pass zero until `TickPacer::poll` loses
-    //    its parameter.
-    let budget = pacer.poll(Instant::now(), 0);
+    //    and does not count against it (D122).
+    let budget = pacer.poll(Instant::now());
     // 3. The new ticks, each with the local player's sample for that tick.
     for i in 0..budget.ticks {
         let next = Tick(predictor.tick().0 + 1);
@@ -469,10 +468,9 @@ README.md`, "The applier")
   cap would cost lead on every correction, since a correction's depth is about a round
   trip plus margin, more than the cap at 100 ms, and the convergence storm above corrects
   on consecutive frames; the lead would decay to a world resync faster than clock sync's
-  three percent could restore it. `app` therefore passes zero to `TickPacer::poll` until
-  `lactose-task` drops the parameter (proposed in D122), and `TickBudget::behind` keeps
-  its meaning: catch-up alone owed more than the cap, a clock resync
-  (`TickPacer::resync`), never a world resync.
+  three percent could restore it. `TickPacer::poll` therefore takes no re-simulation
+  ticks, and `TickBudget::behind` keeps its meaning: catch-up alone owed more than the
+  cap, a clock resync (`TickPacer::resync`), never a world resync.
 
 **Presentation** (architecture sections 5.3, 9.4 and 10)
 
@@ -556,8 +554,6 @@ README.md`, "The applier")
 - `JoinAccepted::entity`, in `lactose-net-host`, so `app` learns the player's entity from
   the server rather than from the game; proposed in D122, with the control message that
   carries a changed entity at milestone 4.
-- `TickPacer::poll` without its `resimulation_ticks` parameter, in `lactose-task`;
-  proposed in D122. Until then `app` passes zero.
 - Forwarding nearby players' inputs into the prediction world (section 9.4, "later"): the
   same `PlayerSample` per player in the `TickInput`; nothing here changes.
 - A tolerance for dynamic bodies, decided at milestone 4 against the spike's baseline.

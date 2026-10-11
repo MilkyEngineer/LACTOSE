@@ -155,7 +155,7 @@ kind reads `Registration::kind`.
 let period = Duration::from_secs(1) / TICK_RATE_HZ;
 let mut pacer = TickPacer::new(Instant::now(), period, 4);
 loop {
-    let budget = pacer.poll(Instant::now(), 0); // re-simulation does not share the cap (D122)
+    let budget = pacer.poll(Instant::now()); // re-simulation does not share the cap (D122)
     for _ in 0..budget.ticks {
         simulation = simulation.step(&executor, next_frame()).await?;
     }

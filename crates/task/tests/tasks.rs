@@ -200,17 +200,17 @@ fn sleep_until_resolves_at_its_deadline() {
     // A deadline in the past resolves at once.
     executor.block_on(executor.sleep_until(start)).unwrap();
 
-    // From tasks, with deadlines registered out of order; a later timer does not hold an
-    // earlier one back, and a dropped timer does not fire.
-    let order = Arc::new(Mutex::new(Vec::new()));
+    // From tasks, with deadlines registered out of order: none resolves early, and a
+    // dropped timer does not fire. The order the tasks finish in is not asserted: a task
+    // first polled after its deadline resolves at that poll, and woken tasks run on either
+    // worker. `due_timers_wake_in_deadline_order` covers the order the executor keeps.
     let start = Instant::now();
     let tasks: Vec<_> = [3u32, 1, 2]
         .into_iter()
         .map(|rank| {
-            let (sleeper, order) = (executor.clone(), order.clone());
+            let sleeper = executor.clone();
             executor.spawn(WorkerClass::FrameCritical, async move {
                 sleeper.sleep_until(start + delay * rank).await.unwrap();
-                order.lock().unwrap().push(rank);
                 start.elapsed()
             })
         })
@@ -226,8 +226,113 @@ fn sleep_until_resolves_at_its_deadline() {
     for (task, rank) in tasks.into_iter().zip([3u32, 1, 2]) {
         assert!(executor.block_on(task).unwrap() >= delay * rank);
     }
-    // Under Miri the simulated clock can pass every deadline before the first poll.
-    assert!(cfg!(miri) || *order.lock().unwrap() == [1, 2, 3]);
+    executor.shutdown();
+}
+
+/// The keeper parks only until the earliest deadline, so a timer registered after a later
+/// one wakes the keeper and fires at its own deadline, not the later one's. Both timers are
+/// registered from this thread, which wakes no worker by running anything, so with the far
+/// timer an hour out, holding the near one back fails the wait.
+#[test]
+fn a_later_timer_does_not_hold_an_earlier_one_back() {
+    struct Flag(AtomicBool);
+    impl std::task::Wake for Flag {
+        fn wake(self: Arc<Self>) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
+
+    let executor = executor(2, 1);
+    let mut far = core::pin::pin!(executor.sleep_until(Instant::now() + Duration::from_secs(3600)));
+    assert!(far.as_mut().poll(&mut Context::from_waker(Waker::noop())).is_pending());
+    // Lets a worker lie down as the far timer's keeper. If none has when the near timer
+    // registers, the near one is the earliest anyway: the test proves less, never fails.
+    std::thread::sleep(Duration::from_millis(10));
+
+    let fired = Arc::new(Flag(AtomicBool::new(false)));
+    let waker = Waker::from(fired.clone());
+    let start = Instant::now();
+    let delay = Duration::from_millis(20);
+    let mut near = core::pin::pin!(executor.sleep_until(start + delay));
+    if near.as_mut().poll(&mut Context::from_waker(&waker)).is_pending() {
+        wait_for(&fired.0);
+    }
+    assert!(near.as_mut().poll(&mut Context::from_waker(&waker)).is_ready());
+    assert!(start.elapsed() >= delay);
+    executor.shutdown();
+}
+
+/// A worker that fires timers wakes the due ones in deadline order, ties in registration
+/// order. The only frame-critical worker, the only thread that fires timers here, is held
+/// in a job until every deadline has passed, so it finds them all due at once and the
+/// order of the wake-ups is the timer store's alone. The only timing is that every
+/// deadline falls after all of them are registered; an attempt where one does not proves
+/// nothing and is repeated with a longer delay.
+#[test]
+fn due_timers_wake_in_deadline_order() {
+    struct Record {
+        name: &'static str,
+        log: Arc<Mutex<Vec<&'static str>>>,
+    }
+    impl std::task::Wake for Record {
+        fn wake(self: Arc<Self>) {
+            self.log.lock().unwrap().push(self.name);
+        }
+    }
+
+    let executor = executor(1, 1);
+    for delay in [20, 200, 2000].map(Duration::from_millis) {
+        let (started, release) =
+            (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
+        let (flag, hold) = (started.clone(), release.clone());
+        let busy = Node::new("tasks::hold")
+            .run(move |_, _| {
+                flag.store(true, Ordering::Release);
+                while !hold.load(Ordering::Acquire) {
+                    core::hint::spin_loop();
+                }
+            })
+            .build();
+        let run = executor.run_graph(graph(vec![busy], &[]));
+        wait_for(&started);
+
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let start = Instant::now();
+        // Registered out of deadline order, with a tie at the earliest deadline.
+        let mut timers: Vec<_> = [("third", 3u32), ("first", 1), ("second", 2), ("tied", 1)]
+            .into_iter()
+            .map(|(name, rank)| {
+                let waker = Waker::from(Arc::new(Record { name, log: log.clone() }));
+                (Box::pin(executor.sleep_until(start + delay * rank)), waker)
+            })
+            .collect();
+        let registered = timers.iter_mut().all(|(sleep, waker)| {
+            sleep.as_mut().poll(&mut Context::from_waker(waker)).is_pending()
+        });
+        let in_time = registered && Instant::now() < start + delay;
+        if in_time {
+            std::thread::sleep((start + delay * 3).saturating_duration_since(Instant::now()));
+        }
+        release.store(true, Ordering::Release);
+        executor.block_on(run).unwrap();
+        if !in_time {
+            // A deadline passed during registration. Dropping the timers removes them.
+            drop(timers);
+            continue;
+        }
+        let limit = Instant::now() + Duration::from_secs(60);
+        while log.lock().unwrap().len() < timers.len() {
+            assert!(Instant::now() < limit, "timed out waiting for the timers to fire");
+            std::thread::yield_now();
+        }
+        assert_eq!(*log.lock().unwrap(), ["first", "tied", "second", "third"]);
+        executor.shutdown();
+        return;
+    }
+    // Under Miri the simulated clock can pass the first deadline during registration.
+    if !cfg!(miri) {
+        panic!("every attempt saw a deadline pass before the timers were registered");
+    }
     executor.shutdown();
 }
 

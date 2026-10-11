@@ -284,9 +284,9 @@ impl TickPacer {
         self.scale = if scale < MIN_TIME_SCALE { 0.0 } else { scale };
     }
 
-    /// The ticks due at `now`. `resimulation_ticks` are rollback re-simulation ticks already
-    /// committed for this frame; they share the per-frame cap with catch-up ticks.
-    pub fn poll(&mut self, now: Instant, resimulation_ticks: u32) -> TickBudget {
+    /// The ticks due at `now`, at most the per-frame cap. A rollback's re-simulation ticks do
+    /// not count against the cap; the prediction ring's depth bounds them.
+    pub fn poll(&mut self, now: Instant) -> TickBudget {
         if now < self.accounted {
             // Before the first tick.
             return TickBudget { ticks: 0, behind: false, next_deadline: self.accounted };
@@ -298,7 +298,7 @@ impl TickPacer {
         self.accounted = now;
 
         let due = u32::try_from(self.owed.as_nanos() / self.period.as_nanos()).unwrap_or(u32::MAX);
-        let ticks = due.min(self.max_ticks_per_frame.saturating_sub(resimulation_ticks));
+        let ticks = due.min(self.max_ticks_per_frame);
         self.owed -= self.period * ticks;
         let behind = ticks < due;
         let next_deadline = if behind {
@@ -332,33 +332,30 @@ mod tests {
     fn first_tick_is_due_at_start_and_then_every_period() {
         let start = Instant::now() + Duration::from_secs(1);
         let mut pacer = pacer(start);
-        let early = pacer.poll(start - PERIOD, 0);
+        let early = pacer.poll(start - PERIOD);
         assert_eq!(early, TickBudget { ticks: 0, behind: false, next_deadline: start });
-        let first = pacer.poll(start, 0);
+        let first = pacer.poll(start);
         assert_eq!(first, TickBudget { ticks: 1, behind: false, next_deadline: start + PERIOD });
-        let between = pacer.poll(start + PERIOD / 2, 0);
+        let between = pacer.poll(start + PERIOD / 2);
         assert_eq!(between, TickBudget { ticks: 0, behind: false, next_deadline: start + PERIOD });
-        let third = pacer.poll(start + PERIOD * 2, 0);
+        let third = pacer.poll(start + PERIOD * 2);
         assert_eq!(third.ticks, 2);
         assert_eq!(third.next_deadline, start + PERIOD * 3);
     }
 
     #[test]
-    fn catch_up_is_capped_and_shares_the_cap_with_resimulation() {
+    fn catch_up_is_capped() {
         let start = Instant::now();
         let mut pacer = pacer(start);
         // Eleven ticks owed: the first plus ten periods.
         let now = start + PERIOD * 10;
-        let capped = pacer.poll(now, 0);
+        let capped = pacer.poll(now);
         assert_eq!(capped, TickBudget { ticks: 4, behind: true, next_deadline: now });
-        let shared = pacer.poll(now, 3);
-        assert_eq!((shared.ticks, shared.behind), (1, true));
-        let none = pacer.poll(now, 9);
-        assert_eq!((none.ticks, none.behind), (0, true));
         // Time is never slowed: the debt stays until it is run or forgotten.
-        assert_eq!(pacer.poll(now, 0).ticks, 4);
-        let last = pacer.poll(now, 0);
-        assert_eq!(last, TickBudget { ticks: 2, behind: false, next_deadline: now + PERIOD });
+        let second = pacer.poll(now);
+        assert_eq!(second, TickBudget { ticks: 4, behind: true, next_deadline: now });
+        let last = pacer.poll(now);
+        assert_eq!(last, TickBudget { ticks: 3, behind: false, next_deadline: now + PERIOD });
     }
 
     #[test]
@@ -366,35 +363,35 @@ mod tests {
         let start = Instant::now();
         let mut pacer = pacer(start);
         let now = start + PERIOD * 100;
-        assert!(pacer.poll(now, 0).behind);
+        assert!(pacer.poll(now).behind);
         pacer.resync(now);
-        let after = pacer.poll(now, 0);
+        let after = pacer.poll(now);
         assert_eq!(after, TickBudget { ticks: 0, behind: false, next_deadline: now + PERIOD });
-        assert_eq!(pacer.poll(now + PERIOD, 0).ticks, 1);
+        assert_eq!(pacer.poll(now + PERIOD).ticks, 1);
     }
 
     #[test]
     fn time_scale_changes_the_rate_and_zero_pauses() {
         let start = Instant::now();
         let mut pacer = pacer(start);
-        assert_eq!(pacer.poll(start, 0).ticks, 1);
+        assert_eq!(pacer.poll(start).ticks, 1);
         pacer.set_time_scale(2.0);
-        let fast = pacer.poll(start + PERIOD, 0);
+        let fast = pacer.poll(start + PERIOD);
         assert_eq!(fast.ticks, 2);
         assert_eq!(fast.next_deadline, start + PERIOD + PERIOD / 2);
 
         pacer.set_time_scale(0.0);
         let paused_at = start + PERIOD * 50;
-        let paused = pacer.poll(paused_at, 0);
+        let paused = pacer.poll(paused_at);
         assert_eq!(
             paused,
             TickBudget { ticks: 0, behind: false, next_deadline: paused_at + PERIOD }
         );
 
         pacer.set_time_scale(0.5);
-        let slow = pacer.poll(paused_at + PERIOD, 0);
+        let slow = pacer.poll(paused_at + PERIOD);
         assert_eq!(slow.ticks, 0);
         assert_eq!(slow.next_deadline, paused_at + PERIOD * 2);
-        assert_eq!(pacer.poll(paused_at + PERIOD * 2, 0).ticks, 1);
+        assert_eq!(pacer.poll(paused_at + PERIOD * 2).ticks, 1);
     }
 }
