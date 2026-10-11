@@ -4,6 +4,11 @@
 # cannot express are enforced by `cargo xtask boundary` instead: the dependency allowlist per
 # boundary crate (the boundary tables of crate-tiers.toml) and the ban on RUSTFLAGS and on any
 # target CPU or target feature other than the x86-64-v3 pin.
+#
+# A crate built from a patched copy under vendor/ (architecture section 8.2, D123) keeps its
+# name and version, so [bans] and [licenses] match it as they match the registry build and
+# [sources] sees no path source. The advisories check skips a path source, so `cargo xtask
+# vendor` runs it over the upstream versions in a manifest it writes under target/.
 
 [graph]
 # Every platform CI builds for, so a platform-specific dependency is checked from any machine.

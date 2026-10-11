@@ -63,6 +63,12 @@ fn the_feature_check_passes_with_no_roots_and_reads_real_trees() {
 }
 
 #[test]
+fn the_workspace_passes_the_vendor_check() {
+    let output = xtask(&["vendor"]);
+    assert!(output.status.success(), "{}", text(&output));
+}
+
+#[test]
 fn the_mode_matrix_prints_every_mode() {
     let output = xtask(&["sour", "matrix"]);
     assert!(output.status.success(), "{}", text(&output));
@@ -74,9 +80,13 @@ fn the_mode_matrix_prints_every_mode() {
 
 #[test]
 fn a_bad_command_line_is_a_usage_error() {
-    for args in
-        [&["bogus"][..], &["sour", "run"], &["sour", "run", "--mode", "speed"], &["tiers", "extra"]]
-    {
+    for args in [
+        &["bogus"][..],
+        &["sour", "run"],
+        &["sour", "run", "--mode", "speed"],
+        &["tiers", "extra"],
+        &["vendor", "--online"],
+    ] {
         assert_eq!(xtask(args).status.code(), Some(2), "{args:?}");
     }
     assert!(xtask(&["help"]).status.success());

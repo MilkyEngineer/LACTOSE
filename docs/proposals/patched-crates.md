@@ -1,9 +1,10 @@
 # Decision: a third-party crate built from a patched copy
 
-Status: approved by the owner on 2026-10-11 as revised; numbered D123 provisionally, the
-coordinator renumbers at merge. Not yet applied: the amendments land with the `cargo xtask
-vendor` lane, merged first on main; the rule then binds the `lactose-physics-rapier` merge,
-whose branch holds the first patched crate, and every crate from then on. The owner files the
+Status: approved by the owner on 2026-10-11 as revised; D123. Applied with the `cargo xtask
+vendor` lane, merged first on main, except what belongs to the first patched crate: the
+section 16 sentence, the root `Cargo.toml` comment, `vendor/README.md`, and the row 83 and
+`sin_cos` verification rows land with the `lactose-physics-rapier` merge, whose branch holds
+that crate. The rule binds that merge and every crate from then on. The owner files the
 upstream report; the Rapier merge does not wait for its link (`vendor/README.md` says "to be
 filed" until then).
 

@@ -11,13 +11,15 @@ diagnostic is a subcommand here, so it runs the same on a laptop as on a runner.
 
 Run it as `cargo xtask <command>` from anywhere inside the repository. The alias and every
 cargo command the tool runs are `--locked`: a check never rewrites `Cargo.lock` and fails if
-it is out of date.
+it is out of date. The one exception is the online step of `vendor`, which resolves the lock
+of a manifest it writes under the target directory.
 
 | Command | Enforces |
 |---|---|
 | `tiers` | `crate-tiers.toml` against the workspace (architecture section 3) |
 | `boundary` | the file facts of the determinism boundary and the unsafe policy (sections 8.2, 8.3, 20, 21) |
 | `features` | identical boundary feature trees across shipped binaries, and the same features for every package two roots share where one is a harness package (section 8.3) |
+| `vendor` | each crate built from `vendor/` is its patch applied to its record, the patch is within the rule, the record is the crates.io archive's, and the advisory check covers the upstream versions (sections 8.2, 8.3) |
 | `sour run`, `sour compare`, `sour self-test`, `sour matrix` | SOUR, the determinism harness (section 8.3) |
 
 Findings are printed to standard output as `path: message`, one per line, and nothing else
@@ -88,6 +90,27 @@ its own dev-dependencies) and lack packages another holds, since two harness pac
 always differ that way. `--package <name>` (repeatable) compares the named packages
 instead. A workspace package named `lactose-app-*` that is not in `[feature_roots]` is a
 finding.
+
+## `vendor`
+
+- Every `[patch.crates-io]` entry of the root manifest names `vendor/<name>-<version>`; no
+  other `[patch]` table exists, and no cargo configuration file sets `[patch]`, `[source]`
+  or `paths`. Every resolved package with no source that is not a member lives at
+  `vendor/<name>-<version>/` and is named by such an entry; every directory under `vendor/`
+  is such a package, holds that name and version, and the name resolves at no other version.
+- Each directory holds the `.cargo-checksum.json` that `cargo vendor --versioned-dirs`
+  writes, `.gitattributes` marks `vendor/**` `-text`, and `vendor/<name>-<version>.patch`
+  beside it is a unified diff of at most fifty changed lines, comments included, that never
+  names `Cargo.toml`, `Cargo.toml.orig`, `Cargo.lock` or `.cargo_vcs_info.json`, adds no
+  `unsafe`, and marks every file it changes with a `LACTOSE patch:` comment.
+- Reversing the patch on a copy under `target/vendor/` gives exactly the files and sha256
+  hashes the record holds: nothing changed, added or missing.
+- `vendor/README.md` has a section per directory and none for a directory that is gone.
+- Online, over a manifest under `target/vendor/upstream/` that pins each upstream version as
+  the root `[workspace.dependencies]` entry does: `cargo vendor` re-derives each record and
+  it must equal the committed one, and `cargo deny check advisories` reports nothing;
+  `cargo-deny` skips a path source, so the workspace run cannot see these. This step
+  resolves the shadow's lock without `--locked`; `--offline` passes through to both.
 
 ## SOUR
 

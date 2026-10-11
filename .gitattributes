@@ -1,0 +1,3 @@
+# Vendored third-party sources (architecture section 8.2, D123) are hashed byte for byte by
+# `cargo xtask vendor` and by the boundary build ID: no end-of-line conversion on any host.
+vendor/** -text

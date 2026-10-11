@@ -47,7 +47,7 @@ only branch anything is pushed to. You never push and never open a pull request.
    the documents by hand. Report the failure instead.
 5. Gates, each logged with its summary line, in this order:
    `cargo fmt --all --check`; `cargo clippy --workspace --all-targets -- -D warnings`;
-   `cargo xtask tiers`; `cargo xtask boundary`; `cargo xtask features`;
+   `cargo xtask tiers`; `cargo xtask boundary`; `cargo xtask features`; `cargo xtask vendor`;
    `cargo nextest run --workspace --no-tests=pass`; `cargo test --doc --workspace`;
    `cargo deny check`; `cargo xtask sour run --pr`; then the cross-target lints over the
    crates the brief names, `cargo clippy -p <crate> ... --all-targets --target
