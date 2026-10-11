@@ -18,7 +18,7 @@ use crate::components::{
     BodyHandle, Collider, Joint, JointHandle, RigidBody, Shape, Teleported, Transform, Velocity,
 };
 use crate::query::{QueryFilter, Ray, RayHit, ShapeHit};
-use crate::sync::{Changes, changed_since};
+use crate::sync::{Changes, changed_since, log_since_pass};
 
 /// What `app` decides for the physics world, handed to [`setup`].
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -92,6 +92,7 @@ pub(crate) struct SyncState {
     pub(crate) written: Vec<(StableKey, Transform, Velocity)>,
     /// Structural log entries the sync has not processed: those a snapshot found after the
     /// cursor, carried across a restore and processed before the log since the restore.
+    /// When a full diff is due they are read only by its reload test (D124).
     pub(crate) pending_log: Vec<LogEntry>,
     /// Keys the next sync treats as changed whatever the stamps say, with the columns:
     /// those a snapshot found changed since the mark across the five columns, and those
@@ -330,8 +331,9 @@ impl PhysicsSnapshot {
 /// Copies the physics world of `world`'s [`Physics`] resource, between ticks, at the point
 /// `World::snapshot` is taken: the backend's bytes, and this crate's bookkeeping with what
 /// the next sync would see (the log since its cursor, the keys changed since its mark, the
-/// channel's untaken entries; or that a full diff is due, when the cursor or mark is
-/// stale). Fails with `NotFound` if the world holds no [`Physics`], or as the backend's
+/// channel's untaken entries; or that a full diff is due, with the log the world retains
+/// since the sync's last pass for its reload test, when the cursor or mark is stale).
+/// Fails with `NotFound` if the world holds no [`Physics`], or as the backend's
 /// [`snapshot`](PhysicsBackend::snapshot) does.
 pub fn snapshot(world: &World) -> Result<PhysicsSnapshot> {
     let physics = physics(world)?;
@@ -350,10 +352,16 @@ pub fn snapshot(world: &World) -> Result<PhysicsSnapshot> {
             changed_since(world, mark, &mut sync.pending_keys);
         }
         _ => {
-            // The next sync diffs every row, which covers whatever was pending.
+            // The next sync diffs every row, which covers whatever was pending; the log
+            // since its last pass is kept for its reload test alone, so a rollback to this
+            // point decides as the first run did.
             sync.diff_all = true;
-            sync.pending_log.clear();
             sync.pending_keys.clear();
+            if !sync.bodies.is_empty()
+                && let Some(entries) = log_since_pass(world, physics.cursor)
+            {
+                sync.pending_log.extend(entries.copied());
+            }
         }
     }
     sync.pending_commands

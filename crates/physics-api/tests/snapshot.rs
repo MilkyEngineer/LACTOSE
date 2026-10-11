@@ -15,10 +15,12 @@ use lactose_ecs::{
     ClaimedBy, Executor, LayoutConfig, OwnedBy, RegionConfig, RegionMode, WorldKind,
 };
 use lactose_math::Scalar;
-use lactose_physics_api::conformance::{BODIES, SNAPSHOT_TICK, TICKS, snapshot_restore};
+use lactose_physics_api::conformance::{
+    BODIES, SNAPSHOT_TICK, TICKS, empty_restore, snapshot_restore,
+};
 use lactose_physics_api::{
-    BodyType, Joint, JointKind, PhysicsCommand, PhysicsConfig, RigidBody, Transform, Velocity,
-    corrected, restore, snapshot,
+    BodyType, Joint, JointKind, PhysicsBackend, PhysicsCommand, PhysicsConfig, RigidBody,
+    Transform, Velocity, corrected, restore, snapshot,
 };
 use lactose_sim::harness::{ChunkCapacity, layout_mode};
 use lactose_sim::{SimulationBuilder, TypeTable};
@@ -545,4 +547,19 @@ fn a_re_simulation_from_every_restore_point_makes_the_first_runs_calls() {
     let calls = reference.unwrap();
     let step_7 = steps(&calls).into_iter().find(|(tick, _)| tick.0 == 7).unwrap().1;
     assert!(step_7.iter().any(|command| matches!(command.body(), StableKey::Predicted(_))));
+}
+
+#[test]
+fn an_emptied_test_backend_steps_as_a_new_one() {
+    let executor = Executor::builder().frame_workers(1).background_workers(1).build().unwrap();
+    let new_backend = || -> Box<dyn PhysicsBackend> { Box::new(Fake::new(CallLog::default())) };
+    let layouts = [LayoutConfig::default(), layout_mode(ChunkCapacity::Rows(7), 5).unwrap()];
+    let runs: Vec<_> = layouts
+        .iter()
+        .map(|&layout| {
+            empty_restore(&executor, &new_backend, PhysicsConfig::default(), layout).unwrap()
+        })
+        .collect();
+    assert_eq!(runs[0].len(), TICKS as usize);
+    assert_eq!(runs[0], runs[1]);
 }

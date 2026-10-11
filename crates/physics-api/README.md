@@ -48,6 +48,7 @@ build run for every world kind: a change that breaks it is a signature change to
 | `setup`, `register_types`, `register_systems`, `sets::{SYNC, STEP, WRITE_BACK}` | What `app` adds to a `SimulationBuilder`, and the three sets this crate declares |
 | `snapshot`, `restore`, `corrected`, `PhysicsSnapshot` | The physics world beside a `WorldSnapshot`, and how `predict` names what it corrected |
 | `conformance::{snapshot_restore, ConformanceReport, TICKS, SNAPSHOT_TICK, BODIES}` | The run a backend passes before this surface is frozen |
+| `conformance::empty_restore` | The run that shows a backend emptied and restored to its empty world's bytes steps as a new one does (D124) |
 
 Hidden plumbing: none. The three systems live in a private module and `sets` is the only
 way to order against them; the bookkeeping of `Physics` is private and "Snapshot and
@@ -72,7 +73,7 @@ constructors and accessors are `#[doc(hidden)]`: the backend's, not game code's.
 | | Creation and removal of bodies as rows appear and disappear | The sync's: from the structural log, keyed by origin key, with the prediction-world rule and the region modes applied ("Bodies" below); the backend is told `create_body`, `remove_body`, `set_body`, `set_frozen` and holds no world-kind rule |
 | | How a backend is registered | `app` writes the `setup` closure and `register_systems` ("The registration" below); the backend crate exports a constructor and registers no system |
 | | The determinism obligations, and what is not yet shown | "The backend's obligations" below, and the `PhysicsBackend` docs |
-| | The conformance test | `conformance::snapshot_restore`, called from the backend's test crate with each pool size and each layout |
+| | The conformance test | `conformance::snapshot_restore` and `conformance::empty_restore`, called from the backend's test crate with each pool size and each layout |
 | `predict` | `snapshot` and `restore` beside `WorldSnapshot`, with the same identity rule, sized for the budget | `snapshot(world)` after `World::snapshot`, `restore(world, &snap)` after `World::restore`; `PhysicsSnapshot::size_in_bytes` ("Snapshot and restore" below) |
 | | Re-simulation identical to the first run; corrections pushed to the solver | The snapshot carries the sync's pending work; `corrected(world, &keys)` after `restore` names the rows a correction wrote (stamped, under D122) |
 | `anim` | Ragdoll bodies and sockets: a named place and the types | Bone rows with `RigidBody::kinematic()` and a capsule `Collider` owned by the character, `Joint` rows owned by a bone, `Mut<RigidBody>` to go limp, `&Transform` in `Stage::Post` for sockets; `tests/consumers.rs`, section 2. Limited joints wait on the backend's verification item |
@@ -183,13 +184,19 @@ system there. `app` orders any other exclusive `Stage::Post` system against
   2^30 stamp rebase) the sync diffs every row, in ascending key order, against that map:
   a row that is a body and not in the map is created, a key in the map whose row is not a
   body is removed, and every row in both is pushed through `set_body`, `set_collider`,
-  `set_transform` and `set_velocity`, which the backend compares and ignores when equal.
-  It never clears a solver whose log kept a body: sleep and warm starts survive wherever the
-  rows agree. This crate keeps the bytes the backend wrote at `setup`; a sync whose
-  structural log since its last pass, the pending entries a restore carried included,
-  despawned every body the solver held removes them all, restores those bytes and creates
-  from the rows by a full diff in ascending key order; a sync whose removals leave the solver
-  empty restores the bytes and makes the next sync a full diff.
+  `set_transform` and `set_velocity`, which the backend compares and ignores when equal,
+  and its `BodyHandle` and the `JointHandle` of every joint kept are written back where the
+  row lacks them. It never clears a solver whose log kept a body: sleep and warm starts
+  survive wherever the rows agree. This crate keeps the bytes the backend wrote at `setup`;
+  a sync whose structural log since its last pass, the pending entries a restore carried
+  included, despawned every body the solver held removes them all, restores those bytes and
+  creates from the rows by a full diff in ascending key order; a sync whose removals leave
+  the solver empty restores the bytes and makes the next sync a full diff. When the cursor
+  is stale the log since the last pass is what the log retains in the epoch that began
+  after it, and a snapshot taken then carries it, so a client's full-frame rebuild after
+  `set_tick` and a rollback to a slot taken just after `set_tick` both get a fresh solver.
+  An unload made before `set_tick` lies in the earlier epoch and is not seen: the order
+  this supports is `set_tick`, then the full frame.
   So an empty solver is a fresh solver, and a world reloaded in place, in one frame (every
   region unloaded and loaded, which the log shows as `Despawned` then `Spawned` per key) or
   in two, has the physics state a fresh process loading the same rows has, bit for bit (D124;
@@ -414,6 +421,10 @@ docs restate them per method)
   `physics-rapier` meets this (every parallel site is ordered or sorted and the solver
   layout is calibrated to a constant worker count); Rapier's own tests check a tolerance,
   so bit identity across pool sizes is a design claim that SOUR's workers mode proves.
+- The bytes of its empty world, which `setup` keeps and the sync restores whenever it has
+  removed every body, restore to a world that steps as a newly built one does: no state
+  outside the bytes, such as a handle counter or an arena's free list, survives a restore
+  (`conformance::empty_restore`).
 - The obligation is section 2's, identical on x86-64 and aarch64; the verification items
   name the two known gaps of the pinned Rapier (platform-libm `sin_cos` on limited joints,
   the sign of zero in SIMD min/max), which the backend lane closes before SOUR's
@@ -488,4 +499,5 @@ Rapier, and the size and time of Rapier's snapshot bytes.
 | The write-back | `rows.rs`: only rows whose bytes changed are stamped; `Teleported` holds the teleport's tick across two further ticks (probe T); a key despawned at the post sync point is skipped; `cost.rs`: 100k entities with 2,000 moved bodies, the write-back stamping exactly the moved rows and the sync pushing none, the microseconds of both printed, and the sync of resting bodies by `Net`, bound predicted and unbound predicted keys; a body reported twice is written the same whichever copy comes first |
 | The scalar | The size assertions in `lib.rs`; `types.rs`: no component's layout holds a raw float, every hashed one registers with the world hasher, the handles are `derived` |
 | SOUR | `sour.rs`: a server scene and a prediction scene with a rollback, 150 ticks each, the re-simulated ticks recorded again (the runner requires them equal); and the rolled-back scene ending with the straight run's hashes; the rollback tick holds a post-stage spawn, a despawn, `cmd.set` writes of a transform and a velocity and a command, and a claimed row records `Physics::body_count` and whether that despawned sphere is a body every tick, so a restore that dropped any part of the carried work changes a hash, a lost removal included although the test backend never moves a row for the ghost body |
+| Reload | `reload.rs`: a same-frame reload of every region removes every body, restores the empty world and then makes a fresh process's calls; a one-region reload keeps the solver and the handle rows; a two-frame reload restores at the unload and creates in key order at the load; removals that empty the solver restore it and make the next sync a full diff; a reload across a restore sees the carried despawns; `set_tick` then the full frame makes a fresh client's calls, a one-region reload across `set_tick` keeps the solver and its handle rows, and a rollback to a slot taken after `set_tick` repeats the fresh rebuild; `snapshot.rs`: `conformance::empty_restore` with the test backend under two layouts; `lactose-physics-rapier`'s `reload.rs` and `conformance.rs`: the same with Rapier, world hashes equal to a fresh process |
 | The snapshot size | `cost.rs` prints `size_in_bytes` and `snapshot` time for 50 claimed bodies plus 0 to 10,000 statics; the test backend's bytes say nothing of Rapier's, which the backend lane measures against the 100 µs budget |

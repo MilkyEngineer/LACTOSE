@@ -33,7 +33,8 @@ use lactose_sim::{
 use crate::backend::PhysicsBackend;
 use crate::command::PhysicsExt;
 use crate::components::{
-    BodyType, Collider, Joint, JointKind, RigidBody, Shape, Transform, Velocity,
+    BodyHandle, BodyType, Collider, Joint, JointHandle, JointKind, RigidBody, Shape, Transform,
+    Velocity,
 };
 use crate::service::{PhysicsConfig, register_types, restore, setup, snapshot};
 use crate::systems::register_systems;
@@ -148,6 +149,121 @@ pub fn snapshot_restore(
         snapshot_bytes: physics_snapshot.size_in_bytes(),
         physics_hash: (first_physics.hash(), resumed_physics.hash()),
     })
+}
+
+/// The obligation [`PhysicsBackend::snapshot`] states for the bytes of the empty world,
+/// which [`setup`] keeps and the sync restores whenever it has removed every body (D124):
+/// that they restore to a world that steps as a newly built one does. In a `Server` world
+/// under `Directed` region control and the storage `layout`, a backend from `new_backend`
+/// creates and steps a floor, a leaning stack of spheres and two jointed boxes for a few
+/// ticks; every row is despawned, so the sync removes every body and restores those bytes;
+/// the scene is spawned again and run. A second backend from `new_backend`, in a world built
+/// at the tick the scene was spawned again, runs the same scene. Returns the world hashes
+/// after each tick of the scene, the two worlds' being equal, and requires the handle rows
+/// equal at the end, so a backend that keeps state outside its bytes (a handle counter, an
+/// arena's free list, a warm start) fails here rather than in a reload.
+///
+/// Fails with `InvalidData` naming the first tick whose hash differs, or the first key
+/// whose handle row does, with what building the simulation fails with, and as a step
+/// fails.
+pub fn empty_restore(
+    executor: &Executor,
+    new_backend: &dyn Fn() -> Box<dyn PhysicsBackend>,
+    config: PhysicsConfig,
+    layout: LayoutConfig,
+) -> Result<Vec<(Tick, u64)>> {
+    let build = |tick: Tick| -> Result<Simulation> {
+        let mut types = TypeTable::new();
+        register_types(&mut types)?;
+        let backend = new_backend();
+        let mut simulation = SimulationBuilder::new(WorldKind::Server, types)
+            .layout(layout)
+            .tick(tick)
+            .setup(move |world| setup(world, backend, config))
+            .systems(register_systems)
+            .build()?;
+        let region = RegionConfig { id: REGION, seed: 7, mode: RegionMode::Simulated };
+        simulation.world_mut().create_region(region)?;
+        Ok(simulation)
+    };
+    let run = |mut simulation: Simulation, ticks: u32, hashes: &mut Vec<(Tick, u64)>| {
+        for _ in 0..ticks {
+            simulation = executor.block_on(simulation.step(executor, TickInput::default()))?;
+            hashes.push((simulation.tick(), simulation.hash()?));
+        }
+        Ok::<_, Error>(simulation)
+    };
+
+    let mut used = build(Tick(0))?;
+    let keys = spawn_reload_scene(used.world_mut())?;
+    used = run(used, WARM_TICKS, &mut Vec::new())?;
+    for &key in &keys {
+        used.world_mut().despawn(key)?;
+    }
+    used = run(used, 1, &mut Vec::new())?;
+    spawn_reload_scene(used.world_mut())?;
+    let mut fresh = build(used.tick())?;
+    spawn_reload_scene(fresh.world_mut())?;
+
+    let (mut ours, mut theirs) = (Vec::new(), Vec::new());
+    let used = run(used, TICKS, &mut ours)?;
+    let fresh = run(fresh, TICKS, &mut theirs)?;
+    if let Some((&(tick, hash), &(_, fresh_hash))) =
+        ours.iter().zip(&theirs).find(|(ours, theirs)| ours != theirs)
+    {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            format!(
+                "the world hash after tick {} of the emptied backend differs from a new \
+                 backend's: {hash:#018x} against {fresh_hash:#018x}",
+                tick.0
+            ),
+        ));
+    }
+    let handles = |world: &World, key: StableKey| {
+        (world.get::<BodyHandle>(key).copied(), world.get::<JointHandle>(key).copied())
+    };
+    if let Some(&key) =
+        keys.iter().find(|&&key| handles(used.world(), key) != handles(fresh.world(), key))
+    {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            format!("the emptied backend's handle row for {key:?} differs from a new backend's"),
+        ));
+    }
+    Ok(ours)
+}
+
+/// How many ticks [`empty_restore`]'s first backend steps the scene before it is emptied.
+const WARM_TICKS: u32 = 20;
+
+/// [`empty_restore`]'s scene in `REGION`: a fixed floor, a stack of spheres resting on it
+/// and on each other, leaning so that it topples, and two boxes under a fixed joint. The
+/// keys, joint last.
+fn spawn_reload_scene(world: &mut World) -> Result<Vec<StableKey>> {
+    let floor = Shape::cuboid(Vec3::new(Scalar::from_i32(50), Scalar::ONE, Scalar::from_i32(50)));
+    let floor_at = Transform::at(Vec3::new(Scalar::ZERO, -Scalar::ONE, Scalar::ZERO));
+    world.spawn(FLOOR, REGION, (floor_at, Collider::new(floor)))?;
+    let mut keys = vec![FLOOR];
+    for index in 0..8 {
+        let lean = scalar(0.1) * Scalar::from_u32(index);
+        let height = Scalar::HALF + Scalar::from_u32(index);
+        let at = Transform::at(Vec3::new(lean, height, Scalar::ZERO));
+        let ball = Collider::new(Shape::sphere(Scalar::HALF));
+        world.spawn(sphere(index), REGION, (at, Velocity::ZERO, RigidBody::dynamic(), ball))?;
+        keys.push(sphere(index));
+    }
+    for (key, x) in [(BONE_A, 4), (BONE_B, 5)] {
+        let at = Transform::at(Vec3::new(Scalar::from_i32(x), Scalar::HALF, Scalar::ZERO));
+        let cube = Collider::new(Shape::cuboid(Vec3::ONE * scalar(0.4)));
+        world.spawn(key, REGION, (at, Velocity::ZERO, RigidBody::dynamic(), cube))?;
+        keys.push(key);
+    }
+    let joint = Joint::new(JointKind::Fixed, BONE_A, BONE_B)
+        .with_anchors(Vec3::X * Scalar::HALF, -Vec3::X * Scalar::HALF);
+    world.spawn(JOINT, REGION, (joint,))?;
+    keys.push(JOINT);
+    Ok(keys)
 }
 
 // ---- The scene ----

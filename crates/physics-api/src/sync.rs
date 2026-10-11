@@ -10,8 +10,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use lactose_core::{ComponentKey, StableKey};
 use lactose_ecs::{
-    ChangeMark, ClaimedBy, EventWriter, Job, RegionId, RegionMode, StructuralChange, World,
-    WorldKind,
+    ChangeMark, ClaimedBy, EventWriter, Job, LogCursor, LogEntries, RegionId, RegionMode,
+    StructuralChange, World, WorldKind,
 };
 use lactose_math::{Canonical, Scalar};
 use lactose_reflect::Reflect;
@@ -106,12 +106,20 @@ impl Physics {
         // Every body the solver held despawned, the pending entries a restore carried
         // included: the world was reloaded or rebuilt, in one frame if the rows are back.
         // The log alone shows it, since a row unloaded and loaded again is `Despawned` then
-        // `Spawned` and the solver would otherwise keep its whole state (D124).
-        let reload = held
-            && incremental.as_ref().is_some_and(|(log, _)| {
-                let pending = sync.pending_log.iter().map(|entry| entry.change);
-                despawns_every_body(&sync.bodies, pending.chain(log.iter().copied()))
-            });
+        // `Spawned` and the solver would otherwise keep its whole state (D124). A full diff
+        // reads the same, from the log retained since the pass (`log_since_pass`).
+        let reload = held && {
+            let pending = sync.pending_log.iter().map(|entry| entry.change);
+            match &incremental {
+                Some((log, _)) => {
+                    despawns_every_body(&sync.bodies, pending.chain(log.iter().copied()))
+                }
+                None => log_since_pass(world, *cursor).is_some_and(|entries| {
+                    let logged = entries.map(|entry| entry.change);
+                    despawns_every_body(&sync.bodies, pending.chain(logged))
+                }),
+            }
+        };
         let mut pass = Pass {
             world: &mut *world,
             sync: &mut *sync,
@@ -257,6 +265,17 @@ impl Physics {
     }
 }
 
+/// The structural log since the sync's last pass, as far as the world retains it: the
+/// entries after `cursor`; or, when the cursor is stale or trimmed past, every entry the
+/// log retains, all of which came after the pass, since a new epoch (`set_tick`, a world
+/// restore, a whole-world load, the rebase) starts with an empty log. An unload made
+/// before the epoch began is not in it. `None` before the first pass.
+pub(crate) fn log_since_pass(world: &World, cursor: Option<LogCursor>) -> Option<LogEntries<'_>> {
+    let log = world.structural_log();
+    let mut since = cursor?;
+    log.since(&mut since).or_else(|| log.since(&mut log.cursor_at_start()))
+}
+
 /// Whether `changes` despawn every key of `bodies`.
 fn despawns_every_body(
     bodies: &BTreeMap<StableKey, BodyHandle>,
@@ -393,7 +412,8 @@ impl Pass<'_> {
 
     /// The handle rows of a key the bookkeeping holds, written again where its row lacks
     /// them: a row spawned while the solver kept its body or joint (a region unloaded and
-    /// loaded in one frame) carries none, and the columns mirror the bookkeeping.
+    /// loaded in one frame, read from the log or by a full diff) carries none, and the
+    /// columns mirror the bookkeeping.
     fn handles(&mut self, key: StableKey) {
         if let Some(&handle) = self.sync.bodies.get(&key)
             && self.world.get::<BodyHandle>(key) != Some(&handle)
@@ -425,7 +445,8 @@ impl Pass<'_> {
 
     /// Every row against the bookkeeping, in ascending key order, when the cursor or the
     /// mark is stale or the solver was emptied; it clears nothing itself, so sleep and warm
-    /// starts survive wherever the rows agree.
+    /// starts survive wherever the rows agree, and writes back the handle rows of every
+    /// body and joint it keeps.
     fn full_diff(&mut self) {
         self.sync.pending_log.clear();
         self.sync.pending_keys.clear();
@@ -454,6 +475,7 @@ impl Pass<'_> {
                     if let Some(&velocity) = self.world.get::<Velocity>(key) {
                         self.backend.set_velocity(key, &velocity);
                     }
+                    self.handles(key);
                 }
                 (false, false) => {}
             }
@@ -467,6 +489,7 @@ impl Pass<'_> {
         joints.dedup();
         for key in joints {
             self.joint(key);
+            self.handles(key);
         }
     }
 

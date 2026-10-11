@@ -3,7 +3,8 @@
 //! `physics-api`'s sync, step and write-back with this backend on one solver thread, and
 //! through `lactose-sim`'s frame: every region exported at tick `t0`, then unloaded and
 //! loaded from its bundle (`World::load_region`) in one frame, or unloaded in one and
-//! loaded in the next, against a fresh process loading the same bundles at the same tick.
+//! loaded in the next, against a fresh process loading the same bundles at the same tick;
+//! and a client's re-join, `set_tick` then the full frame, against a fresh client.
 //! The world hash after every tick is equal; the twin that never reloaded is not, so the
 //! equality is the reload rule's doing; and every body and joint row has its handle row.
 //! Two scenes across two regions: a floor and a pusher beside a three-crate stack, and a
@@ -32,6 +33,8 @@ const FIRST_CRATE: u64 = 20;
 const FIRST_PILE: u64 = 10;
 const PILE: u64 = 75;
 const JOINTS: [u64; 2] = [1000, 1001];
+/// How far past `t0` a client re-joins, its tick set between runs.
+const REJOIN: u32 = 400;
 
 fn f(x: f64) -> Scalar {
     Scalar::from_f64(x)
@@ -177,6 +180,15 @@ fn reloads_equal_a_fresh_process(
     let same = same.run_with(frame(REGIONS, bundles.clone()));
     assert_eq!(handles(&same, &bodies), fresh_handles, "t0 {t0}, one frame");
     assert_eq!(hashes(same, ticks), fresh_hashes, "t0 {t0}, one frame");
+
+    // A client's re-join: `set_tick` between runs, then the full frame in the first step,
+    // against a fresh client loading the same bundles at that tick.
+    let (mut joined, _, _) = original(scene, t0);
+    joined.world_mut().set_tick(Tick(t0 + REJOIN)).unwrap();
+    let joined = joined.run_with(frame(REGIONS, bundles.clone()));
+    let client = fresh(t0 + REJOIN).run_with(frame([], bundles.clone()));
+    assert_eq!(handles(&joined, &bodies), handles(&client, &bodies), "t0 {t0}, re-join");
+    assert_eq!(hashes(joined, ticks), hashes(client, ticks), "t0 {t0}, re-join");
 
     // Unloaded in one frame and loaded in the next, against a fresh process loading at
     // that tick.

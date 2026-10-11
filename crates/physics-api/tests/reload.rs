@@ -6,6 +6,9 @@
 //! handle rows. Each region is reloaded through `lactose-sim`'s frame (`World::load_region`
 //! of its export), and the reloaded world is compared with a fresh process loading the same
 //! bundles: the calls after `setup`, the backend's bytes, the world hash and the handles.
+//! The same holds when `set_tick` made the cursor stale before the full frame (a client's
+//! re-join), where the full diff reads the log retained since the epoch began, and for a
+//! rollback to a slot taken then.
 
 #![forbid(unsafe_code)]
 
@@ -234,4 +237,92 @@ fn a_reload_across_a_restore_sees_the_despawns_the_snapshot_carried() {
     h = h.run_with(frame([], loaded));
     assert_eq!(h.calls.take(), first);
     assert!(handles(&h).0.iter().all(Option::is_some) && handles(&h).1.is_some());
+}
+
+/// The tick a client re-joins at: `set_tick` between runs starts a new epoch, so the sync's
+/// cursor is stale when the first step applies the full frame (`lactose-net-api`'s re-join,
+/// `lactose-predict`'s resync).
+const REJOIN: u32 = 40;
+
+#[test]
+fn set_tick_then_a_full_frame_makes_a_fresh_solver() {
+    let mut h = scene().run(T0);
+    let all = [REGION, OTHER_REGION];
+    let loaded = bundles(&h, &all);
+    h.world_mut().set_tick(Tick(REJOIN)).unwrap();
+    h.calls.take();
+    h = h.run_with(frame(all, loaded.clone()));
+    let calls = h.calls.take();
+
+    // A fresh client loading the same bundles at that tick.
+    let mut other = fresh(REJOIN);
+    other = other.run_with(frame([], loaded));
+    let mut expected = removed(&BODIES);
+    expected.push(Call::Restore);
+    expected.extend(other.calls.take());
+    assert_eq!(calls, expected);
+    assert!(handles(&h).0.iter().all(Option::is_some) && handles(&h).1.is_some());
+    run_equal(h, other, 20);
+}
+
+#[test]
+fn a_one_region_reload_across_set_tick_keeps_the_solver_and_writes_the_handle_rows() {
+    let mut h = scene().run(T0);
+    let before = handles(&h);
+    let loaded = bundles(&h, &[REGION]);
+    h.world_mut().set_tick(Tick(REJOIN)).unwrap();
+    h.calls.take();
+    h = h.run_with(frame([REGION], loaded));
+    let calls = h.calls.take();
+    // The full diff the stale cursor asks for keeps every body and writes the handle rows
+    // the reloaded rows lack.
+    assert!(
+        !calls.iter().any(|call| matches!(
+            call,
+            Call::CreateBody { .. }
+                | Call::RemoveBody(_)
+                | Call::CreateJoint { .. }
+                | Call::Restore
+        )),
+        "{calls:?}"
+    );
+    assert_eq!(handles(&h), before);
+    h = h.run(3);
+    assert_eq!(handles(&h), before);
+}
+
+#[test]
+fn a_rollback_to_a_slot_taken_after_set_tick_repeats_the_fresh_rebuild() {
+    // `Predictor::resync`'s slot: taken after `set_tick`, before the full frame, so the
+    // physics snapshot is taken with a stale cursor. Then the same with the regions
+    // unloaded between `set_tick` and the slot, whose despawns only the snapshot carries.
+    for unloaded_first in [false, true] {
+        let mut h = scene().run(T0);
+        let all = [REGION, OTHER_REGION];
+        let loaded = bundles(&h, &all);
+        h.world_mut().set_tick(Tick(REJOIN)).unwrap();
+        let mut unloads = all.to_vec();
+        if unloaded_first {
+            for region in unloads.drain(..) {
+                h.world_mut().unload_region(region).unwrap();
+            }
+        }
+        let world_snapshot = h.world().snapshot();
+        let physics_snapshot = snapshot(h.world()).unwrap();
+        h.calls.take();
+        h = h.run_with(frame(unloads.clone(), loaded.clone()));
+        let first = h.calls.take();
+        let mut expected = removed(&BODIES);
+        expected.push(Call::Restore);
+        assert_eq!(first[..4], expected[..], "unloaded first: {unloaded_first}");
+        let handles_first = handles(&h);
+        assert!(handles_first.0.iter().all(Option::is_some) && handles_first.1.is_some());
+
+        h.world_mut().restore(&world_snapshot).unwrap();
+        restore(h.world_mut(), &physics_snapshot).unwrap();
+        assert_eq!(h.calls.take(), [Call::Restore]);
+        h = h.run_with(frame(unloads, loaded));
+        assert_eq!(h.calls.take(), first, "unloaded first: {unloaded_first}");
+        assert_eq!(handles(&h), handles_first);
+    }
 }
