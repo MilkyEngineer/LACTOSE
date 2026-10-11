@@ -42,6 +42,7 @@ and list what changed, because `sim`, `predict`, `physics-api`, `net`, `persist`
 | `WorldSnapshot` | The prediction world's rollback state |
 | `World::region_mode` | A loaded region's mode in one lookup, for a consumer that reads every region's mode at every sync point (`World::region` counts the region's entities) |
 | `World::load_region`, `World::export_region`, `RegionRows` | Bulk copy of region rows and resources to and from `lactose_bundle` documents |
+| `World::get_erased`, `World::insert_erased`, `World::remove_erased`, `World::spawn_erased` | One entity's components by key from the registry, `lactose_bundle::ComponentData` in and stored bytes out: what `lactose-predict` and `net`'s generic hook are written against (D121, D122) |
 
 The hidden `__private` module and the hidden items of `SystemDescriptor`, `Bundle`,
 `QueryItem`, `QueryItems` and `Kernel` are the macro's and the implementation's, and may
@@ -190,7 +191,7 @@ What a system is, from its parameters (`SystemParam` has the table):
   player, input tick and ordinal as 32 bits each), the system key as 64 bits and the spawn
   index as 32 bits, little-endian, seed zero; both machines must hash these exact bytes.
 - `World::spawn` takes the key: replication and prediction spawn with the server's key.
-  The direct methods (`spawn`, `insert`) rewrite a bound `Net` key in a reference field to
+  The direct methods (`spawn`, `insert` and their erased forms) rewrite a bound `Net` key in a reference field to
   the origin key but keep a reference to an entity that does not exist yet, as a load
   does, since replicated entities arrive in any order; only command apply empties it.
 - `Ctx::rng(k)` is keyed by the region seed, the tick, the system, the invoking entity's
@@ -345,7 +346,7 @@ What a system is, from its parameters (`SystemParam` has the table):
   window in the schedule.
 - Every column in every chunk has a coarse tick, set at dispatch for every chunk a writing
   system touches. Tracked columns (replicated or extracted) have a stamp per row, set by
-  `Mut` on mutable dereference, by `Commands::set`, `World::insert` and `World::get_mut`,
+  `Mut` on mutable dereference, by `Commands::set`, `World::insert`, `World::insert_erased` and `World::get_mut`,
   and by `ColumnMut::write` for the rows it records as dirty. `Mut::set_if_neq` compares
   bytes, which is exact for a reflected component, and marks nothing when equal. A move of
   a row between chunks (compaction, an archetype change, a permutation) carries its stamp
@@ -412,51 +413,40 @@ What a system is, from its parameters (`SystemParam` has the table):
   depend on the order of an insert and a bind. References in resources are not in the
   reverse index and may dangle.
 
+**Erased row access**
+
+- `get_erased`, `insert_erased`, `remove_erased` and `spawn_erased` are the typed `get`,
+  `insert`, `remove` and `spawn` with the component named by its `ComponentKey`, and share
+  their validation and index maintenance: typed and erased writes of the same values
+  leave the same columns, row stamps, column ticks, structural log, reverse index and claim
+  index, and a refused write of either changes nothing, not even the point. They differ in
+  two ways. `insert` stamps a write of equal bytes and `insert_erased` does not. A
+  placeholder in a reference field is stored by `insert` and `spawn` as the empty
+  reference, as a direct write resolves any reference outside a command buffer, and
+  refused by the erased writes with `InvalidData` ("placeholder reference in `<field>`"),
+  since erased bytes come from the wire or a recorded slot, where a placeholder is never
+  valid. Each takes either key of a bound entity. `get_erased` returns the bytes as stored
+  (reference fields hold origin keys), `None` if the entity or the component is absent.
+- `ComponentData::bytes` must be the registry's element size for its component
+  (`InvalidData` otherwise). The bytes are copied, padding zeroed (`TypeInfo::zero_padding`),
+  validated through `TypeInfo::validate` (`InvalidData`) and a bound `Net` key in a
+  reference field rewritten to the origin key, as `insert` does. An unregistered component
+  is `NotFound`, a registered resource and `InRegion` or `PredictedOrigin` are
+  `InvalidData`, and a missing entity is `NotFound`.
+- `insert_erased` adds the component if the row lacks it (an archetype change the
+  structural log records, the row stamped) and otherwise writes it only if the bytes
+  differ, so an equal write stamps nothing and a `Changed` reader does not see it. It
+  returns whether it wrote. `remove_erased` returns `Ok(false)` if the row lacks the
+  component.
+- `spawn_erased` validates every component before anything changes (two entries for one
+  component are `InvalidData`) under the key rules of `spawn`: a `Net` or `Predicted` key no
+  live entity has, `PredictedOrigin` added for a `Predicted` key, a placeholder refused.
+
 **Not in this crate yet**
 
 - The overload ladder's decimation of non-player systems in the outer activation ring
   (architecture section 9.7) and `ordered` or per-region reductions (section 5.2) are
   additive attribute flags, added when milestone 1 or 4 needs them (`docs/verification.md`).
-- Erased row access by key (D121, D122), the precondition of `lactose-predict`'s
-  implementation and what `net`'s generic hook is written against:
-
-  ```rust
-  impl World {
-      /// The bytes of `component` of `key` as stored (reference fields hold origin keys),
-      /// or `None` if the entity or the component is absent.
-      pub fn get_erased(&self, key: StableKey, component: ComponentKey) -> Option<&[u8]>;
-
-      /// Writes `data` whole to `key`: `data.bytes` must be the registry's element size for
-      /// `data.component` (`NotFound` for an unregistered component, as `insert` reports
-      /// it, `InvalidData` for a wrong length), validated through `TypeInfo::validate`
-      /// after `zero_padding` (`InvalidData`), a bound `Net` key in a reference field
-      /// rewritten to the origin key as `insert` does and a placeholder refused; `InRegion`
-      /// and `PredictedOrigin` refused with `InvalidData`; `NotFound` for a missing entity.
-      /// Adds the component if the row lacks it (an archetype change the structural log
-      /// records, the row stamped) and otherwise writes it only if the bytes differ,
-      /// stamping the row then; a relationship component (`OwnedBy`, `ClaimedBy`, any with
-      /// an `EntityRef` field) keeps the reverse index and the claim index current as
-      /// `insert` does. Returns whether it wrote.
-      pub fn insert_erased(&mut self, key: StableKey, data: &ComponentData) -> Result<bool>;
-
-      /// Removes `component` from `key`: `Ok(false)` if the row lacks it, `NotFound` for a
-      /// missing entity or an unregistered component, `InvalidData` for `InRegion` or
-      /// `PredictedOrigin`; the reverse index and the claim index updated as `remove` does.
-      pub fn remove_erased(&mut self, key: StableKey, component: ComponentKey) -> Result<bool>;
-
-      /// Spawns `key` in `region` with `components`, each validated as `insert_erased`
-      /// validates before anything changes (two entries for one component, or `InRegion` or
-      /// `PredictedOrigin` among them, are `InvalidData`), under the key rules of `spawn`
-      /// (a `Net` or `Predicted` key no live entity has; a `Predicted` key gives
-      /// `PredictedOrigin`; a placeholder is an error); a refused spawn changes nothing.
-      pub fn spawn_erased(
-          &mut self,
-          key: StableKey,
-          region: RegionId,
-          components: &[ComponentData],
-      ) -> Result<()>;
-  }
-  ```
 
 ## Proof for milestone 0
 
@@ -483,5 +473,6 @@ repeat, layout and chaos modes.
 | `regressions.rs` | The findings of the pre-review: transient references in the index, pass events across a rollback, owner keys in either load order, exports after an unload, `set_tick` stamps, transient writers, double rollbacks, failed loads, resources removed mid-run |
 | `regressions_two.rs` | The findings of the second review: new chunks' column ticks above 2^31, presentation batches across the wrap, `writes` visibility by stage, a restore that revives a bound `Net` entity, `update_region_resource`, transient region resources through a reload, schedule ties, resource references through bind and restore, aliases a restore orphans |
 | `wrap_program.rs` | One program with marks, cursors, `Changed` readers, a pass, column and row ticks, presentation events and a rollback, run across the 2^30 rebase, 2^31 and the `u32` wrap, equal to a run far from any boundary |
+| `erased_rows.rs` | Typed and erased writes of the same values leave identical columns, row and column ticks, `changed_since` sets, structural logs, reverse and claim indices under every layout, `Net` references rewritten and `OwnedBy` and `ClaimedBy` among them; an equal `insert_erased` unseen by a `Changed` reader; every refusal with its kind and nothing changed, a refused typed `insert` included; a placeholder refused by name, and stored empty by a typed write; padding zeroed; `get_erased` through a restore and a snapshot round trip |
 | `claims.rs` | The claim index behind `World::claimed`: current after every direct method, command, predicted spawn, ownership despawn, unload and restore, in key order under every layout |
 | `compile_fail.rs` | What `#[system]` and `#[finalize]` reject, and what they accept under `#![forbid(unsafe_code)]` |

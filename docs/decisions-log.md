@@ -2085,6 +2085,23 @@ rationale the author supplied during the editorial pass rather than one taken fr
   repair after a skipped substitution; the no-lead-cost condition and `DEFAULT_DEPTH` as a
   placeholder; physics-api's contract text; `resync` reinstalling the hook; one copy of `local`; the
   re-taken slot without physics.
+- Implementation of the ECS and simulation preconditions (lane ecs-erased; the first review found
+  3 minor, the second none): `World::{get_erased, insert_erased, remove_erased, spawn_erased}` in
+  `lactose-ecs` and `SimulationBuilder::check` in `lactose-sim`. The erased methods share the typed
+  paths' validation and index maintenance; a registered resource key is `InvalidData`;
+  `insert_erased` writes only when the bytes differ, so an equal write stamps nothing; a
+  placeholder in a reference field is refused by name ("placeholder reference in `<field>`"), where
+  a typed write stores the empty reference, because erased bytes come from the wire or a recorded
+  slot; a refused write, typed or erased, leaves the point unchanged (typed `insert` now checks the
+  registry before the point moves). `check` may be called more than once; checks run in the order
+  added at `build`, after the setup and registration functions and before any schedule is built or
+  prepared, each given the world's registry and every system of the builder's kind in add-call
+  order (sim's six input systems first, `sim::save_copy` last on a server); the first error fails
+  the build as returned. `StageBuilder` has no public constructor, so a registration function adds
+  only through the builders it is handed, which the order `check` sees relies on.
+  `lactose_predict::check_prediction_reads` is still `todo!()`, so the tests use local check
+  functions. Generic code (the erased writes, the reference walkers) trusts `FieldKind::EntityRef`:
+  a type that declares that kind without being an `EntityRef` is read and rewritten as one.
 - Driven by: milestone 1, the `predict` facade brief and its two design reviews (2026-10-10 and
   2026-10-11).
 

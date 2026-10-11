@@ -11,8 +11,8 @@
 //!
 //! A facade: every public signature is final and every body that decides anything is
 //! `todo!()`. The implementation lane replaces the bodies behind this surface and removes
-//! the crate-level `allow` with the last `todo!()`, once the erased row access it is
-//! written against exists in `lactose-ecs` (the README, "Not in this crate yet").
+//! the crate-level `allow` with the last `todo!()`, once what it is written against in
+//! other crates is implemented (the README, "Not in this crate yet").
 //!
 //! # Where to start
 //!

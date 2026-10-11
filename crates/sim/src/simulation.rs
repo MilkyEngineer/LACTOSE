@@ -11,9 +11,10 @@ use std::sync::Arc;
 
 use lactose_core::{Error, ErrorKind, Result, Tick, xxh64};
 use lactose_ecs::{
-    Executor, LayoutConfig, LogCursor, RegionId, Schedule, ScheduleError, World, WorldBuilder,
-    WorldKind,
+    Executor, LayoutConfig, LogCursor, RegionId, Schedule, ScheduleError, SystemDescriptor, World,
+    WorldBuilder, WorldKind,
 };
+use lactose_reflect::Registry;
 
 use crate::hash::{Hashers, RegionDigest, TypeTable};
 use crate::input::{InputApplier, SessionApplier, StagedState, TickInput};
@@ -31,6 +32,9 @@ type Setup = Box<dyn FnOnce(&mut World) -> Result<()> + Send>;
 /// A registration function, boxed.
 type Register = Box<dyn FnOnce(&mut Registration) + Send>;
 
+/// A check function, boxed.
+type Check = Box<dyn FnOnce(&Registry, &[&'static SystemDescriptor]) -> Result<()> + Send>;
+
 /// A run that resolves to `T`, or to the error with the simulation when nothing ran.
 type Run<'a, T> = Pin<Box<dyn Future<Output = core::result::Result<T, RunError>> + Send + 'a>>;
 
@@ -39,8 +43,8 @@ type Run<'a, T> = Pin<Box<dyn Future<Output = core::result::Result<T, RunError>>
 /// Defaults: the production layout, tick zero, a fresh `NetId` counter,
 /// [`RegionControl::Directed`], a policy of activation radius 1, streaming radius 2 and
 /// release radius 3, a structural-log retention of
-/// [`DEFAULT_LOG_RETENTION`](Self::DEFAULT_LOG_RETENTION) ticks, no setup or
-/// registration function, and hooks that do nothing.
+/// [`DEFAULT_LOG_RETENTION`](Self::DEFAULT_LOG_RETENTION) ticks, no setup, registration or
+/// check function, and hooks that do nothing.
 pub struct SimulationBuilder {
     kind: WorldKind,
     types: TypeTable,
@@ -52,6 +56,7 @@ pub struct SimulationBuilder {
     log_retention: u32,
     setups: Vec<Setup>,
     registrations: Vec<Register>,
+    checks: Vec<Check>,
     inputs: Option<Box<dyn InputApplier>>,
     sessions: Option<Box<dyn SessionApplier>>,
     staged: Option<Box<dyn StagedState>>,
@@ -76,6 +81,7 @@ impl SimulationBuilder {
             log_retention: Self::DEFAULT_LOG_RETENTION,
             setups: Vec::new(),
             registrations: Vec::new(),
+            checks: Vec::new(),
             inputs: None,
             sessions: None,
             staged: None,
@@ -171,6 +177,24 @@ impl SimulationBuilder {
         self
     }
 
+    /// Adds a check function: it is called once at [`build`](Self::build), after every
+    /// registration function and before any schedule is built or prepared, with the
+    /// world's registry and every system the schedules of this kind will hold, in
+    /// registration order (`sim`'s input sync point systems first, then each system in the
+    /// order it was added to any stage or pass, then the save pass's; a system whose
+    /// `worlds` exclude the kind is not among them). Its error fails the build as it is
+    /// returned, with nothing prepared. Several run in the order added and the first error
+    /// stops the build. How `app` hands `lactose_predict::check_prediction_reads` to the
+    /// prediction world's builder, so that a refused system is a build error.
+    #[must_use]
+    pub fn check(
+        mut self,
+        f: impl FnOnce(&Registry, &[&'static SystemDescriptor]) -> Result<()> + Send + 'static,
+    ) -> Self {
+        self.checks.push(Box::new(f));
+        self
+    }
+
     /// The hook that writes players' inputs, inserted as the service resource
     /// `dyn InputApplier`. Without one, a frame's inputs are dropped and logged after
     /// their input ticks are set.
@@ -203,14 +227,16 @@ impl SimulationBuilder {
     /// `REAL_TIME`, [`RegionPolicy`]) and services (the three hooks, the lifecycle, the
     /// frame and save slots); runs every setup function in order, then checks that no world
     /// resource of a registered type whose policy is not `derived` is present; runs every
-    /// registration function in order; builds the tick schedule, the pass schedules and
+    /// registration function in order, then every check function; builds the tick
+    /// schedule, the pass schedules and
     /// the save pass with the orders their sets belong to; and prepares each against the
     /// world, so that a schedule error surfaces here as `InvalidData` carrying the
     /// [`ScheduleError`](lactose_ecs::ScheduleError), never in a run.
     ///
     /// Fails with `InvalidData` as the setters say, as a setup function does, as
     /// [`WorldBuilder::build`](lactose_ecs::WorldBuilder::build) does, for a non-`derived`
-    /// world resource, and for a schedule that does not build or prepare.
+    /// world resource, and for a schedule that does not build or prepare; and with a check
+    /// function's error.
     pub fn build(self) -> Result<Simulation> {
         let invalid = |message: &'static str| Err(Error::new(ErrorKind::InvalidData, message));
         let policy = self.policy;
@@ -278,6 +304,12 @@ impl SimulationBuilder {
         let mut registration = Registration::new(self.kind);
         for register in self.registrations {
             register(&mut registration);
+        }
+        if !self.checks.is_empty() {
+            let systems = registration.added();
+            for check in self.checks {
+                check(world.registry(), &systems)?;
+            }
         }
         let (mut tick_schedule, mut passes) = registration.build().map_err(schedule_error)?;
         let mut save = Schedule::builder(self.kind);

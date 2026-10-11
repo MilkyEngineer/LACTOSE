@@ -6,7 +6,7 @@ use lactose_ecs::{
     Schedule, ScheduleBuilder, ScheduleError, SystemDescriptor, SystemSet, WorldKind,
 };
 
-use crate::systems::INPUT_SYSTEMS;
+use crate::systems::{INPUT_SYSTEMS, SAVE_COPY};
 
 /// The four stages of the tick schedule, in execution order. Every world kind has all four;
 /// a stage with no systems of the world's kind runs its sync point and nothing else, so the
@@ -125,11 +125,29 @@ pub struct Registration {
     stages: [StageBuilder; 4],
     passes: [StageBuilder; 2],
     orders: Vec<(&'static SystemSet, &'static SystemSet)>,
+    /// Each builder [`stage`](Self::stage) or [`pass`](Self::pass) handed out, with how many
+    /// systems it held then. Every `add` goes through the borrow last handed out, so the
+    /// systems a builder gained before its next entry here were added under this one: the
+    /// entries give the order of every `add` across builders.
+    handed: Vec<(Builder, usize)>,
+}
+
+/// One of a registration's builders.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Builder {
+    Stage(Stage),
+    Pass(Pass),
 }
 
 impl Registration {
     pub(crate) fn new(kind: WorldKind) -> Self {
-        Self { kind, stages: Default::default(), passes: Default::default(), orders: Vec::new() }
+        Self {
+            kind,
+            stages: [const { StageBuilder::new() }; 4],
+            passes: [const { StageBuilder::new() }; 2],
+            orders: Vec::new(),
+            handed: Vec::new(),
+        }
     }
 
     /// The kind of world being registered for.
@@ -140,6 +158,7 @@ impl Registration {
 
     /// The builder of one stage of the tick schedule.
     pub fn stage(&mut self, stage: Stage) -> &mut StageBuilder {
+        self.handed.push((Builder::Stage(stage), self.stages[stage as usize].systems.len()));
         &mut self.stages[stage as usize]
     }
 
@@ -148,6 +167,7 @@ impl Registration {
     /// nothing: the stage's execution order is the topological order of its sets and edges
     /// with ties by system key, as in every stage.
     pub fn pass(&mut self, pass: Pass) -> &mut StageBuilder {
+        self.handed.push((Builder::Pass(pass), self.passes[pass as usize].systems.len()));
         &mut self.passes[pass as usize]
     }
 
@@ -162,6 +182,30 @@ impl Registration {
     pub fn order(&mut self, before: &'static SystemSet, after: &'static SystemSet) -> &mut Self {
         self.orders.push((before, after));
         self
+    }
+
+    /// Every system the schedules of this kind will hold, in registration order: `sim`'s
+    /// input sync point systems, which open the tick schedule, then each system in the order
+    /// it was added through [`StageBuilder::add`], whatever its stage or pass, then the save
+    /// pass's; a system whose `worlds` exclude the kind is left out. What
+    /// [`SimulationBuilder::check`](crate::SimulationBuilder::check) is handed.
+    pub(crate) fn added(&self) -> Vec<&'static SystemDescriptor> {
+        let builder = |which: Builder| match which {
+            Builder::Stage(stage) => &self.stages[stage as usize],
+            Builder::Pass(pass) => &self.passes[pass as usize],
+        };
+        let mut added: Vec<&'static SystemDescriptor> = INPUT_SYSTEMS.to_vec();
+        for (index, &(which, start)) in self.handed.iter().enumerate() {
+            let systems = &builder(which).systems;
+            let end = self.handed[index + 1..]
+                .iter()
+                .find(|&&(later, _)| later == which)
+                .map_or(systems.len(), |&(_, next)| next);
+            added.extend_from_slice(&systems[start..end]);
+        }
+        added.push(&SAVE_COPY);
+        added.retain(|system| system.worlds().contains(self.kind));
+        added
     }
 
     /// Builds the tick schedule, with `sim`'s own set and systems placed first in the
@@ -269,13 +313,50 @@ enum Declared {
 }
 
 /// The sets and systems a registration function adds to one stage.
-#[derive(Default)]
+///
+/// Only a [`Registration`] makes one, so a registration function adds through the builders
+/// it is handed and cannot replace or move one, which the order of the systems a
+/// [`SimulationBuilder::check`](crate::SimulationBuilder::check) is handed relies on:
+///
+/// ```compile_fail
+/// fn register(registration: &mut lactose_sim::Registration) {
+///     *registration.stage(lactose_sim::Stage::Simulation) = lactose_sim::StageBuilder::default();
+/// }
+/// ```
+///
+/// ```compile_fail
+/// fn register(registration: &mut lactose_sim::Registration) {
+///     let moved = std::mem::take(registration.stage(lactose_sim::Stage::Simulation));
+///     *registration.pass(lactose_sim::Pass::Extract) = moved;
+/// }
+/// ```
+///
+/// ```compile_fail
+/// fn register(registration: &mut lactose_sim::Registration) {
+///     let mut moved = lactose_sim::StageBuilder::new();
+///     std::mem::swap(registration.stage(lactose_sim::Stage::Simulation), &mut moved);
+///     std::mem::swap(registration.pass(lactose_sim::Pass::Extract), &mut moved);
+/// }
+/// ```
+///
+/// ```compile_fail
+/// fn register(registration: &mut lactose_sim::Registration) {
+///     std::mem::swap(
+///         registration.stage(lactose_sim::Stage::Simulation),
+///         registration.pass(lactose_sim::Pass::Extract),
+///     );
+/// }
+/// ```
 pub struct StageBuilder {
     sets: Vec<&'static SystemSet>,
     systems: Vec<&'static SystemDescriptor>,
 }
 
 impl StageBuilder {
+    const fn new() -> Self {
+        Self { sets: Vec::new(), systems: Vec::new() }
+    }
+
     /// Declares `sets` in this stage, after any declared before. A set belongs to one stage;
     /// declaring it in two is [`ScheduleError::SetInTwoStages`] at build.
     pub fn sets(&mut self, sets: &[&'static SystemSet]) -> &mut Self {
