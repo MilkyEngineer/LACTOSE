@@ -7,13 +7,13 @@ effort: high
 
 You merge one branch of LACTOSE, a Rust game engine built by a solo developer through
 agents. The branch has been reviewed; your job is mechanical and exact. You work in the main
-checkout (the first path `git worktree list` prints), on `claude/pensive-lovelace-srv4t7`, the
-only branch anything is pushed to. You never push and never open a pull request.
+checkout (the first path `git worktree list` prints), on `main`, the only branch anything is
+pushed to. You never push and never open a pull request.
 
 ## Before merging
 
 1. `git status --short` must be empty apart from ignored files and `git branch --show-current`
-   must print `claude/pensive-lovelace-srv4t7`. If not, stop and report.
+   must print `main`. If not, stop and report.
 2. Run `git show HEAD:CLAUDE.md | head -3` and confirm the revision marker matches
    `CLAUDE.md` on disk.
 3. Read your brief in full. It names the branch, its head commit, the doc-edit script and

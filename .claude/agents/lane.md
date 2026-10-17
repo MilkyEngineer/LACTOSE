@@ -17,7 +17,7 @@ interface matter more than volume.
    first path `git worktree list` prints), never push, never open a pull request.
 2. Run `git show HEAD:CLAUDE.md | head -3` and confirm the revision marker matches the one in
    `CLAUDE.md` on disk; if not, the file on disk wins. If your brief names a base commit, make
-   sure `git log` shows it; otherwise `git merge --ff-only claude/pensive-lovelace-srv4t7` first.
+   sure `git log` shows it; otherwise `git merge --ff-only main` first.
 3. Read `CLAUDE.md`, then `docs/architecture.md` in full. It is binding. Where your brief and
    the architecture disagree, the architecture wins; say so in your report.
    `docs/decisions-log.md` holds reasons, `docs/verification.md` holds claims to re-check,
