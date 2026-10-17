@@ -13,7 +13,7 @@ use std::sync::Arc;
 use common::*;
 use lactose_asset_api::AssetSet;
 use lactose_bundle::Baseline;
-use lactose_core::{StableKey, Tick};
+use lactose_core::{PlayerId, StableKey, Tick};
 use lactose_ecs::{RegionId, RegionMode};
 use lactose_math::{Scalar, Vec3};
 use lactose_net_api::{StagedFrame, Tombstone};
@@ -581,4 +581,80 @@ fn a_release_that_follows_facts_kept_at_two_ticks_ends_a_proxy_in_the_newer_regi
     let world = rig.world();
     assert_eq!(claim(world, key(4)), None);
     assert_eq!(world.region_of(key(4)), Some(NEW2));
+}
+
+/// Whether a key is live, who claims it, its region and its `Health`.
+type State = (bool, Option<PlayerId>, Option<RegionId>, Option<Health>);
+
+/// The `State` of `key`.
+fn state(rig: &Rig, key: StableKey) -> State {
+    let world = rig.world();
+    (
+        world.contains(key),
+        claim(world, key),
+        world.region_of(key),
+        world.get::<Health>(key).copied(),
+    )
+}
+
+#[test]
+fn a_reclaim_of_a_kept_release_into_a_region_neither_slot_holds_leaves_a_proxy() {
+    // Key 4 spawned and kept at 21 in `NEW`, released for 17, claimed again for 18 in a
+    // region no step loads: a proxy, before and after a rollback through 21.
+    let (mut rig, _) = loaded_at_21(claim_into_new(new_cart()));
+    let mut frame = StagedFrame::new(Tick(17));
+    frame.spawns.insert(net(4), remote(NEW, 2, vec![data(at(7, 5)), data(Health(4))]));
+    rig.push(frame);
+    step(&mut rig, false);
+    let _ = rig.reconcile();
+    let mut frame = StagedFrame::new(Tick(18));
+    frame.spawns.insert(net(4), claimed(UNLOADED, vec![data(at(6, 5)), data(Health(3))]));
+    rig.push(frame);
+    step(&mut rig, false);
+    let _ = rig.reconcile();
+    let proxy = (true, None, Some(NEW), Some(Health(4)));
+    assert_eq!(state(&rig, key(4)), proxy);
+    rig.push(cart_off(19));
+    step(&mut rig, false);
+    let _ = rig.reconcile();
+    assert_eq!(idle(&mut rig, 10), 0);
+    assert_eq!(state(&rig, key(4)), proxy);
+}
+
+/// The cart released for 17, then claimed again for 18 in `region` with `Health(7)`, then
+/// a rollback from 19; its state after the claim and after the rollback.
+fn reclaimed_then_rolled_back(region: RegionId) -> [State; 2] {
+    let mut rig = Rig::joined();
+    rig.step_to(20, walking);
+    let mut frame = StagedFrame::new(Tick(17));
+    frame.spawns.insert(net(2), remote(REGION, 2, vec![data(at(50, 0)), data(Health(10))]));
+    rig.push(frame);
+    step(&mut rig, false);
+    let _ = rig.reconcile();
+    let mut frame = StagedFrame::new(Tick(18));
+    frame.spawns.insert(net(2), claimed(region, vec![data(at(50, 0)), data(Health(7))]));
+    rig.push(frame);
+    step(&mut rig, false);
+    let _ = rig.reconcile();
+    let claimed = state(&rig, cart());
+    let mut frame = StagedFrame::new(Tick(19));
+    exact(&mut frame, me(), &at(1000, 0));
+    rig.push(frame);
+    step(&mut rig, false);
+    let reconciled = rig.reconcile();
+    assert_eq!(summaries(&reconciled).first().map(|s| s.0), Some(Tick(19)));
+    assert_eq!(idle(&mut rig, 10), 0);
+    [claimed, state(&rig, cart())]
+}
+
+#[test]
+fn a_reclaim_of_a_proxy_into_a_region_neither_slot_holds_is_not_applied() {
+    let proxy = (true, None, Some(REGION), Some(Health(10)));
+    assert_eq!(reclaimed_then_rolled_back(UNLOADED), [proxy, proxy]);
+}
+
+#[test]
+fn a_reclaim_of_a_proxy_into_a_loaded_region_survives_a_rollback() {
+    let claimed = (true, Some(PLAYER), Some(REGION), Some(Health(7)));
+    assert_eq!(reclaimed_then_rolled_back(REGION), [claimed, claimed]);
 }

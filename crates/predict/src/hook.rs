@@ -65,13 +65,13 @@ impl StagedState for PredictionHook {
                 core::iter::from_fn(|| inbox.pop_through(tick)).collect()
             }
         };
-        keep_local(world, local);
+        keep_local(world, local, replaying);
         let mut facts = Vec::with_capacity(frames.len());
         let mut unechoed = 0;
         for frame in &frames {
             facts.push(apply_frame(world, local, frame, replaying, &mut unechoed));
         }
-        keep_local(world, local);
+        keep_local(world, local, replaying);
         let entry = record(world)?;
         if !replaying {
             entry.unechoed += unechoed;
@@ -141,9 +141,15 @@ pub(crate) fn record(world: &mut World) -> Result<&mut PredictionRecord> {
         .ok_or_else(|| Error::new(ErrorKind::NotFound, "the prediction world holds no record"))
 }
 
-/// Logs an entry of a frame the world refused; the rest of the frame applies.
-fn refused(what: &str, key: StableKey, error: &Error) {
-    tracing::warn!(target: "predict", ?key, %error, "{what} refused: skipped");
+/// Logs an entry of a frame the world refused; the rest of the frame applies. A replay
+/// (`replaying`) logs at debug: the predicted tick that popped the frame logged it at warn,
+/// and every rollback through that tick would repeat it.
+fn refused(what: &str, key: StableKey, error: &Error, replaying: bool) {
+    if replaying {
+        tracing::debug!(target: "predict", ?key, %error, "{what} refused in a replay: skipped");
+    } else {
+        tracing::warn!(target: "predict", ?key, %error, "{what} refused: skipped");
+    }
 }
 
 fn claimed_by(world: &World, local: LocalPlayer, key: StableKey) -> bool {
@@ -152,15 +158,21 @@ fn claimed_by(world: &World, local: LocalPlayer, key: StableKey) -> bool {
 
 /// Writes every component of `components` to the live `key`, each only if its bytes
 /// differ, and moves it to `region` if it resides elsewhere: an upsert.
-fn upsert(world: &mut World, key: StableKey, region: RegionId, components: &[ComponentData]) {
+fn upsert(
+    world: &mut World,
+    key: StableKey,
+    region: RegionId,
+    components: &[ComponentData],
+    replaying: bool,
+) {
     if world.region_of(key) != Some(region)
         && let Err(error) = world.move_to_region(key, region)
     {
-        refused("an upsert's move", key, &error);
+        refused("an upsert's move", key, &error, replaying);
     }
     for data in components {
         if let Err(error) = world.insert_erased(key, data) {
-            refused("an upsert's component", key, &error);
+            refused("an upsert's component", key, &error, replaying);
         }
     }
 }
@@ -176,28 +188,28 @@ fn apply_frame(
 ) -> Vec<Fact> {
     let mut facts = Vec::new();
     if frame.full {
-        rebuild(world, local, frame);
+        rebuild(world, local, frame, replaying);
     } else {
         apply_delta(world, local, frame, replaying, &mut facts);
     }
     if let Some(acked) = frame.acked_input {
-        *unechoed += despawn_unechoed(world, local, acked);
+        *unechoed += despawn_unechoed(world, local, acked, replaying);
     }
     facts
 }
 
 /// A full frame, whole: every spawn an upsert or a spawn with its claim set or removed,
 /// then moves, removals, every row and tombstones.
-fn rebuild(world: &mut World, local: LocalPlayer, frame: &StagedFrame) {
+fn rebuild(world: &mut World, local: LocalPlayer, frame: &StagedFrame, replaying: bool) {
     for (&net, spawn) in &frame.spawns {
         let key = spawn.key(net);
         if world.contains(key) {
-            upsert(world, key, spawn.region, &spawn.components);
+            upsert(world, key, spawn.region, &spawn.components, replaying);
         } else if let Err(error) = world.spawn_erased(key, spawn.region, &spawn.components) {
-            refused("a spawn", key, &error);
+            refused("a spawn", key, &error, replaying);
             continue;
         }
-        bind(world, spawn.origin, net);
+        bind(world, spawn.origin, net, replaying);
         let result = match spawn.slot {
             None if !claimed_by(world, local, key) => {
                 world.insert(key, ClaimedBy { player: local.player })
@@ -208,7 +220,7 @@ fn rebuild(world: &mut World, local: LocalPlayer, frame: &StagedFrame) {
             _ => Ok(()),
         };
         if let Err(error) = result {
-            refused("a claim", key, &error);
+            refused("a claim", key, &error, replaying);
         }
     }
     for (&key, &region) in &frame.moves {
@@ -216,21 +228,21 @@ fn rebuild(world: &mut World, local: LocalPlayer, frame: &StagedFrame) {
             && world.region_of(key) != Some(region)
             && let Err(error) = world.move_to_region(key, region)
         {
-            refused("a move", key, &error);
+            refused("a move", key, &error, replaying);
         }
     }
     for &(key, component) in &frame.removed {
         if world.contains(key)
             && let Err(error) = world.remove_erased(key, component)
         {
-            refused("a removal", key, &error);
+            refused("a removal", key, &error, replaying);
         }
     }
     for row in frame.rows() {
         if world.contains(row.key) {
             let data = ComponentData { component: row.component, bytes: row.bytes.to_vec() };
             if let Err(error) = world.insert_erased(row.key, &data) {
-                refused("a row", row.key, &error);
+                refused("a row", row.key, &error, replaying);
             }
         }
     }
@@ -238,7 +250,7 @@ fn rebuild(world: &mut World, local: LocalPlayer, frame: &StagedFrame) {
         if world.contains(key)
             && let Err(error) = world.despawn(key)
         {
-            refused("a tombstone", key, &error);
+            refused("a tombstone", key, &error, replaying);
         }
     }
 }
@@ -259,7 +271,7 @@ fn apply_delta(
     facts: &mut Vec<Fact>,
 ) {
     for (&net, spawn) in &frame.spawns {
-        bind(world, spawn.origin, net);
+        bind(world, spawn.origin, net, replaying);
         let key = spawn.key(net);
         match spawn.slot {
             None => {
@@ -271,19 +283,19 @@ fn apply_delta(
             }
             Some(_) if !world.contains(key) => {
                 if let Err(error) = world.spawn_erased(key, spawn.region, &spawn.components) {
-                    refused("a proxy's spawn", key, &error);
+                    refused("a proxy's spawn", key, &error, replaying);
                 }
             }
             Some(_) if claimed_by(world, local, key) => {
                 facts.push(Fact::Released { key, components: spawn.components.clone() });
                 if !replaying {
                     match world.remove::<ClaimedBy>(key) {
-                        Ok(_) => upsert(world, key, spawn.region, &spawn.components),
-                        Err(error) => refused("a release", key, &error),
+                        Ok(_) => upsert(world, key, spawn.region, &spawn.components, replaying),
+                        Err(error) => refused("a release", key, &error, replaying),
                     }
                 }
             }
-            Some(_) => upsert(world, key, spawn.region, &spawn.components),
+            Some(_) => upsert(world, key, spawn.region, &spawn.components, replaying),
         }
     }
     for (&key, &region) in &frame.moves {
@@ -293,7 +305,7 @@ fn apply_delta(
         } else if world.region_of(key) != Some(region)
             && let Err(error) = world.move_to_region(key, region)
         {
-            refused("a move", key, &error);
+            refused("a move", key, &error, replaying);
         }
     }
     for &(key, component) in &frame.removed {
@@ -302,7 +314,7 @@ fn apply_delta(
             let region = world.region_of(key);
             facts.push(Fact::Removed { key, component, region, claimed });
         } else if let Err(error) = world.remove_erased(key, component) {
-            refused("a removal", key, &error);
+            refused("a removal", key, &error, replaying);
         }
     }
     for row in frame.rows() {
@@ -331,9 +343,10 @@ fn apply_delta(
             (true, false, false) => {
                 let data = ComponentData { component: row.component, bytes: row.bytes.to_vec() };
                 if let Err(error) = world.insert_erased(row.key, &data) {
-                    refused("a row", row.key, &error);
+                    refused("a row", row.key, &error, replaying);
                 }
             }
+            (true, _, _) if replaying => {}
             (true, _, _) => tracing::warn!(
                 target: "predict",
                 key = ?row.key,
@@ -348,7 +361,7 @@ fn apply_delta(
         if claimed_by(world, local, key) || !world.contains(key) {
             facts.push(Fact::Destroyed { key });
         } else if let Err(error) = world.despawn(key) {
-            refused("a tombstone", key, &error);
+            refused("a tombstone", key, &error, replaying);
         }
     }
 }
@@ -356,35 +369,41 @@ fn apply_delta(
 /// Applies a claimed spawn's claim as a full frame does: `ClaimedBy` inserted on the live
 /// `key`, or the entity spawned claimed if it is not live, with the components a
 /// correction writes (`Teleported` and transient ones are never written to a claimed
-/// entity). Its components are otherwise left to the correction.
+/// entity). Its components are otherwise left to the correction. A live key is not claimed
+/// into a region the world lacks. A predicted tick only: a replay leaves the claim to the
+/// corrections.
 fn claim_spawn(world: &mut World, local: LocalPlayer, key: StableKey, spawn: &StagedSpawn) {
     if !world.contains(key) {
         let components = written_components(world, None, &spawn.components);
         if let Err(error) = world.spawn_erased(key, spawn.region, &components) {
-            refused("a claimed spawn", key, &error);
+            refused("a claimed spawn", key, &error, false);
             return;
         }
+    } else if world.region(spawn.region).is_none() {
+        // A claim naming a region the world lacks: the comparison skips it for an entity
+        // the record lacks, so a correction never writes it; neither does the hook.
+        return;
     }
     if !claimed_by(world, local, key)
         && let Err(error) = world.insert(key, ClaimedBy { player: local.player })
     {
-        refused("a claim", key, &error);
+        refused("a claim", key, &error, false);
     }
 }
 
 /// Binds `origin` to `net` if it has no alias yet, whoever's prediction it was.
-fn bind(world: &mut World, origin: Option<PredictionKey>, net: NetId) {
+fn bind(world: &mut World, origin: Option<PredictionKey>, net: NetId, replaying: bool) {
     if let Some(origin) = origin
         && world.alias(origin).is_none()
         && let Err(error) = world.bind(origin, net)
     {
-        refused("a bind", StableKey::Predicted(origin), &error);
+        refused("a bind", StableKey::Predicted(origin), &error, replaying);
     }
 }
 
 /// Despawns every live predicted spawn of the local player whose input tick is before
 /// `acked` and that has no alias: the server never echoed it. Returns how many.
-fn despawn_unechoed(world: &mut World, local: LocalPlayer, acked: Tick) -> u64 {
+fn despawn_unechoed(world: &mut World, local: LocalPlayer, acked: Tick, replaying: bool) -> u64 {
     // A predicted spawn inherits its spawner's claim, so the claim index holds every one.
     let unechoed: Vec<StableKey> = world
         .claimed(local.player)
@@ -403,7 +422,7 @@ fn despawn_unechoed(world: &mut World, local: LocalPlayer, acked: Tick) -> u64 {
         if world.contains(key) {
             match world.despawn(key) {
                 Ok(()) => count += 1,
-                Err(error) => refused("an unechoed spawn's despawn", key, &error),
+                Err(error) => refused("an unechoed spawn's despawn", key, &error, replaying),
             }
         }
     }
@@ -413,18 +432,18 @@ fn despawn_unechoed(world: &mut World, local: LocalPlayer, acked: Tick) -> u64 {
 /// Gives the local player's own entity, if live, `ClaimedBy` and `StreamingAnchor`, and
 /// takes `StreamingAnchor` from every other entity, so `lactose_input::player_entity`
 /// resolves to it whatever path made the row live.
-fn keep_local(world: &mut World, local: LocalPlayer) {
+fn keep_local(world: &mut World, local: LocalPlayer, replaying: bool) {
     let own = world.origin(local.entity);
     if let Some(key) = own {
         if !claimed_by(world, local, key)
             && let Err(error) = world.insert(key, ClaimedBy { player: local.player })
         {
-            refused("the local entity's claim", key, &error);
+            refused("the local entity's claim", key, &error, replaying);
         }
         if world.get::<StreamingAnchor>(key).is_none()
             && let Err(error) = world.insert(key, StreamingAnchor { priority: 0 })
         {
-            refused("the local entity's anchor", key, &error);
+            refused("the local entity's anchor", key, &error, replaying);
         }
     }
     // The anchor column holds a few rows in the layout's chunk order, so the keys are
@@ -436,7 +455,7 @@ fn keep_local(world: &mut World, local: LocalPlayer) {
         .collect();
     for key in others {
         if let Err(error) = world.remove::<StreamingAnchor>(key) {
-            refused("another entity's anchor", key, &error);
+            refused("another entity's anchor", key, &error, replaying);
         }
     }
 }
