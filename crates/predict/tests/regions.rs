@@ -452,3 +452,133 @@ fn a_claimed_spawn_naming_a_region_neither_slot_holds_still_corrects_its_compone
     assert_eq!(rig.world().get::<Health>(cart()), Some(&Health(7)));
     assert_eq!(rig.world().region_of(cart()), Some(REGION));
 }
+
+/// Joined, `claim_into_new` kept at 21, then `frame` reconciled at 22, with the ticks it
+/// corrected, and the cart off at 19: a rollback through 21.
+fn kept_then_rolled_back(frame: StagedFrame, corrected: &[Tick]) -> Rig {
+    let (mut rig, _) = loaded_at_21(claim_into_new(new_cart()));
+    rig.push(frame);
+    step(&mut rig, false);
+    let reconciled = rig.reconcile();
+    let ticks: Vec<Tick> = summaries(&reconciled).iter().map(|s| s.0).collect();
+    assert_eq!(ticks, corrected);
+    rig.push(cart_off(19));
+    step(&mut rig, false);
+    let reconciled = rig.reconcile();
+    let ticks: Vec<Tick> = summaries(&reconciled).iter().map(|s| s.0).collect();
+    assert_eq!(ticks, vec![Tick(19), Tick(21)]);
+    assert_eq!(idle(&mut rig, 10), 0);
+    rig
+}
+
+#[test]
+fn a_move_into_a_region_neither_slot_holds_is_not_folded_into_the_kept_spawn() {
+    let mut frame = StagedFrame::new(Tick(17));
+    frame.moves.insert(key(4), UNLOADED);
+    let rig = kept_then_rolled_back(frame, &[]);
+    assert_eq!(live_at(&rig, key(4)), Some((NEW, at(5, 5))));
+}
+
+#[test]
+fn a_claimed_spawn_naming_a_region_neither_slot_holds_folds_its_components_alone() {
+    let mut frame = StagedFrame::new(Tick(18));
+    frame.spawns.insert(net(4), claimed(UNLOADED, vec![data(at(6, 5)), data(Health(3))]));
+    // Its components correct the kept spawn at 21; its region is skipped.
+    let rig = kept_then_rolled_back(frame, &[Tick(21)]);
+    assert_eq!(live_at(&rig, key(4)), Some((NEW, at(6, 5))));
+    assert_eq!(rig.world().get::<Health>(key(4)), Some(&Health(3)));
+}
+
+#[test]
+fn a_claimed_spawn_naming_a_region_neither_slot_holds_after_a_kept_tombstone_is_skipped() {
+    // The cart moved into `NEW` at 15 (kept at 21), destroyed at 17 (folded there), then
+    // claimed again at 18 in a region no step loads: the claim does not replace the
+    // tombstone, so a rollback from before 21 still destroys the cart there.
+    let mut rig = Rig::joined();
+    rig.step_to(20, walking);
+    let mut frame = StagedFrame::new(Tick(15));
+    frame.moves.insert(cart(), NEW);
+    rig.push(frame);
+    step(&mut rig, true);
+    let _ = rig.reconcile();
+    let mut frame = StagedFrame::new(Tick(17));
+    frame.despawns.insert(cart(), Tombstone { region: NEW, tick: Tick(17) });
+    rig.push(frame);
+    step(&mut rig, false);
+    let _ = rig.reconcile();
+    assert!(!rig.world().contains(cart()));
+    let mut frame = StagedFrame::new(Tick(18));
+    frame.spawns.insert(net(2), claimed(UNLOADED, vec![data(at(50, 0)), data(Health(10))]));
+    rig.push(frame);
+    step(&mut rig, false);
+    let _ = rig.reconcile();
+    // A rollback from 19, where the cart is live.
+    let mut frame = StagedFrame::new(Tick(19));
+    exact(&mut frame, me(), &at(1000, 0));
+    rig.push(frame);
+    step(&mut rig, false);
+    let reconciled = rig.reconcile();
+    assert_eq!(summaries(&reconciled).first().map(|s| s.0), Some(Tick(19)));
+    assert_eq!(idle(&mut rig, 10), 0);
+    assert!(!rig.world().contains(cart()));
+}
+
+#[test]
+fn a_live_entitys_move_into_a_region_neither_slot_holds_survives_a_rollback() {
+    let mut rig = Rig::joined();
+    rig.step_to(20, walking);
+    let mut frame = StagedFrame::new(Tick(17));
+    frame.moves.insert(cart(), UNLOADED);
+    rig.push(frame);
+    step(&mut rig, false);
+    let _ = rig.reconcile();
+    rig.push(cart_off(19));
+    step(&mut rig, false);
+    let _ = rig.reconcile();
+    assert_eq!(idle(&mut rig, 10), 0);
+    assert_eq!(rig.world().region_of(cart()), Some(REGION));
+}
+
+/// The spawn kept at 21 in `NEW`, its move kept at 22 in `NEW2`, then `last` for 18, which
+/// follows the newer, and a rollback from 19 through both.
+fn kept_at_two_ticks_then(last: StagedFrame) -> Rig {
+    let mut rig = moved_into_new2(claim_into_new(new_cart()), key(4), 17);
+    rig.push(last);
+    step(&mut rig, false);
+    let _ = rig.reconcile();
+    rig.push(cart_off(19));
+    step(&mut rig, false);
+    let reconciled = rig.reconcile();
+    let ticks: Vec<Tick> = summaries(&reconciled).iter().map(|s| s.0).collect();
+    assert_eq!(ticks.first(), Some(&Tick(19)));
+    assert_eq!(idle(&mut rig, 10), 0);
+    rig
+}
+
+#[test]
+fn a_tombstone_that_follows_facts_kept_at_two_ticks_ends_absent() {
+    let mut frame = StagedFrame::new(Tick(18));
+    frame.despawns.insert(key(4), Tombstone { region: NEW2, tick: Tick(18) });
+    let rig = kept_at_two_ticks_then(frame);
+    assert!(!rig.world().contains(key(4)));
+}
+
+#[test]
+fn rows_that_follow_facts_kept_at_two_ticks_end_in_the_newer_region() {
+    let mut frame = StagedFrame::new(Tick(18));
+    exact(&mut frame, key(4), &at(6, 5));
+    exact(&mut frame, key(4), &Health(3));
+    let rig = kept_at_two_ticks_then(frame);
+    assert_eq!(live_at(&rig, key(4)), Some((NEW2, at(6, 5))));
+    assert_eq!(rig.world().get::<Health>(key(4)), Some(&Health(3)));
+}
+
+#[test]
+fn a_release_that_follows_facts_kept_at_two_ticks_ends_a_proxy_in_the_newer_region() {
+    let mut frame = StagedFrame::new(Tick(18));
+    frame.spawns.insert(net(4), remote(NEW2, 2, vec![data(at(7, 5)), data(Health(4))]));
+    let rig = kept_at_two_ticks_then(frame);
+    let world = rig.world();
+    assert_eq!(claim(world, key(4)), None);
+    assert_eq!(world.region_of(key(4)), Some(NEW2));
+}

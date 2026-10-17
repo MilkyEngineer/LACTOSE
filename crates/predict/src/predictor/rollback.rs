@@ -247,6 +247,7 @@ impl State {
             let key = resolved.fact.key();
             match self.kept_at(&resolved, tick, applied) {
                 Some(at) => {
+                    let Some(resolved) = self.confined(resolved, at) else { continue };
                     // A move or removal folded into the entity's statement states no
                     // component, so what the tolerance absorbed of it is not counted again.
                     let states = matches!(resolved.fact, Fact::Claimed { .. } | Fact::Rows { .. });
@@ -265,8 +266,9 @@ impl State {
     /// about its entity, and is compared there; but if it places the entity in a region the
     /// slot it is compared at lacks and slot `applied` holds, it is kept at `applied`: a
     /// correction at that slot could not place it there, and the hook applied it at
-    /// `applied`. A region neither slot holds is logged, a sender defect or a region a later
-    /// frame unloaded again; the comparison skips it.
+    /// `applied`. A region neither slot holds is logged, a sender defect or a region made
+    /// irrelevant again; the comparison skips it, and `confined` keeps it out of the kept
+    /// facts.
     fn kept_at(&self, resolved: &Resolved, tick: Tick, applied: Tick) -> Option<Tick> {
         let key = resolved.fact.key();
         let follows = self
@@ -289,6 +291,32 @@ impl State {
             "a fact names a region neither its slot nor the popped tick holds: skipped"
         );
         follows
+    }
+
+    /// `resolved`, which follows its entity's kept facts at `at`, as it is folded there: if
+    /// it names a region slot `at` lacks (neither slot holds it, and `kept_at` logged it),
+    /// the region is skipped as the comparison skips it, so the kept statement keeps the
+    /// region it names and a rollback through `at` still places the entity. A move is
+    /// dropped; a claimed spawn takes the region the entity's kept facts there name, so its
+    /// components still fold. A kept release or tombstone names none, the entity being
+    /// absent from the record at `at`, and a claim after it is dropped, as one about an
+    /// absent entity in such a region is skipped.
+    fn confined(&self, mut resolved: Resolved, at: Tick) -> Option<Resolved> {
+        if self.lacked(&resolved, at).is_none() {
+            return Some(resolved);
+        }
+        let key = resolved.fact.key();
+        match &mut resolved.fact {
+            Fact::Moved { .. } => None,
+            Fact::Claimed { region, .. } => {
+                let kept = self.kept.get(&at)?.iter().filter(|kept| kept.fact.key() == key);
+                let kept_region = kept.map(|kept| kept.region).next()??;
+                *region = kept_region;
+                resolved.region = Some(kept_region);
+                Some(resolved)
+            }
+            _ => Some(resolved),
+        }
     }
 
     /// The region `resolved` places its entity in, if slot `tick` lacks it: a claimed

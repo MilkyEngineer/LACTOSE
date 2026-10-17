@@ -395,24 +395,34 @@ sync point"; `crates/net-api/README.md`, "The staged frame")
   slot. A fact that names a region neither the slot it is compared at nor slot *a* holds
   is skipped and logged at warn, whether or not the entity has kept facts. Every region a
   frame names is relevant to the client by that frame's own region changes at the latest,
-  and those load in the step that pops it, so this is a sender defect, or a region a
-  later frame unloaded again before either slot was taken, whose facts then take the
-  entity out of it. Its region is not compared and not written: an absent entity is not
-  spawned (the replicated world's hook refuses the same spawn, and the entity arrives
-  with the first later fact compared at a slot that holds its region), a present one is
-  not moved, and a claimed spawn's components are still compared and written. The
-  predictor knows the region of every entity the local player has claimed, from the first
-  fact that named it (a claimed spawn or move, a row or removal of an entity the hook
-  found claimed) until the server's tombstone or release fact for it is reconciled, and
-  every full frame it reconciles replaces the map with that frame's claimed spawns less
-  its tombstones, since a full frame states every entity the server has claimed for the
-  player. The ring's record does not teach it, so an entity only the prediction world
-  believes claimed is never re-spawned; an entry is never dropped for the ring's age, so
-  an entity the prediction world despawned too early is re-spawned by its next fact
-  however long the server left it unchanged. `resync` keeps the entries until the full
-  frame it requests replaces them. The map is bounded by the server's claims for the
-  player at its last full frame plus those claimed since; an entry whose tombstone or
-  release was lost lasts until the next full frame.
+  and those load in the step that pops it, so this is a sender defect, or a region made
+  irrelevant again before either slot was taken: frames popped in one step fold a
+  `Relevant` then `Irrelevant` change of a region into no load
+  (`crates/net-api/README.md`, the fold), and a band frame's region may be gone by the
+  restart. An irrelevant region's entities leave without tombstones, so no later fact
+  takes the entity out of the region it is in. Its region is not compared and not
+  written: an absent entity is not spawned (the replicated world's hook refuses the same
+  spawn, and the entity arrives with the first later fact compared at a slot that holds
+  its region), a present one is not moved and stays where it was, in both worlds, until a
+  full frame, and a claimed spawn's components are still compared and written. A fact
+  that follows kept facts is folded in without its region, so a rollback through the kept
+  slot still places the entity: a move is dropped, and a claimed spawn takes the region
+  the kept facts name, or is dropped after a kept release or tombstone, which name none
+  (the entity is absent from that slot's record). The map of known regions below learns
+  the region all the same, so an entity the prediction world despawns too early is not
+  re-spawned until a fact names a loaded region. The predictor knows the region of every
+  entity the local player has claimed, from the first fact that named it (a claimed spawn
+  or move, a row or removal of an entity the hook found claimed) until the server's
+  tombstone or release fact for it is reconciled, and every full frame it reconciles
+  replaces the map with that frame's claimed spawns less its tombstones, since a full
+  frame states every entity the server has claimed for the player. The ring's record does
+  not teach it, so an entity only the prediction world believes claimed is never
+  re-spawned; an entry is never dropped for the ring's age, so an entity the prediction
+  world despawned too early is re-spawned by its next fact however long the server left
+  it unchanged. `resync` keeps the entries until the full frame it requests replaces
+  them. The map is bounded by the server's claims for the player at its last full frame
+  plus those claimed since; an entry whose tombstone or release was lost lasts until the
+  next full frame.
 - The kept facts' known limits, accepted:
   1. An entity a kept fact spawns or moves into its region is placed at *a*, after
      step *a*: it cannot exist in a region before the region loads, so one step of its
@@ -720,7 +730,7 @@ Each row is held by the tests named; the comparison's golden cases are unit test
 | Substitution (`tests/substitution.rs`) | A substituted tick replaces the sample and re-simulates from the tick before; the repair of the first unsubstituted tick after it is found by tick in a later call; both counted; a substitution at or before the restart is skipped, as is one in a frame popped before the call's newest full frame, each with the repair that depended on it, and one before the horizon is `TooOld`; two consecutive substitutions continue the replaced sample; the re-simulated world equals a run that had the substitute from the start |
 | The hook (`tests/hook.rs`, `tests/claims.rs`, `tests/physics.rs`) | Frames applied in the stated order: proxies spawned, moved, upserted, removed, tombstoned, and replayed by a re-simulation; a proxy's `Transform` written for the tick and swept by the sync; a full frame rebuilds, resets the ring, inserts the claim and the anchor, and the first frame at or after the rebuild tick corrects once; a claimed entity's rows are not written by the hook; a defect row is skipped; an unechoed predicted spawn is despawned at the frame after its input tick and not at that tick's frame, and a late echo spawns it at once and is corrected at its tick; a claimed spawn it applies to a key that is not live carries neither `Teleported` nor a transient component; a claim followed in the same reconciliation window by a tombstone, a move or a row, and a release followed by a move or a removal, end as they do across two windows, hash for hash, and an entity released so follows the server's proxy rows; the local entity carries its claim and anchor and `set_local` moves them; `player_entity` resolves; a hook replaced through `simulation_mut` fails the next step with the predictor kept |
 | Resync (`tests/resync.rs`) | A frame left in the inbox after the steps with a tick after the present is `Behind`, one at or before it is not; `resync` empties the ring, sets the tick, the horizon and `rebuilt_at`, reinstalls the hook over one inserted through `simulation_mut`, keeps the known regions, the queued frames are band frames rather than `TooOld`, and the next full frame rebuilds; a re-join resets the inbox beside it; a full frame replaces the known regions, so an entity whose tombstone was lost is not brought back; a claimed entity's tombstone, claim, release or spawn in the band before the restart is applied by one correction at the restart, a tombstone after the band at its own tick, and a band row alone makes no correction while the first frame at or after the restart corrects once |
-| Kept facts (`tests/regions.rs`) | A region the step that pops the frame loads, which slot `T` lacks: a claimed spawn into it is live and agrees, and survives a rollback through the popped tick in the same call and in a later one, with no correction after; a claimed entity moved into it is moved there, and again by a rollback; a swap in one frame destroys the old entity and keeps the new; a later frame for a tick before the load follows the spawn, folded in: its rows correct once at the popped tick and survive a rollback, a removal, a move, a release and a tombstone end as the server has them, and none of them repeats a correction in later calls; a later move for a tick before the load into a region the kept slot lacks and its own popped tick loads is kept at that tick, so a rollback through both writes the spawn at the first and the move at the second, and two such moves of a claimed entity end in the second region, while the same move for a tick after the kept one is compared at its own slot; a band frame's spawn into such a region is kept at the tick it was popped at; what the tolerance absorbed of a kept fact is counted once however often it is compared, and a move folded into it later does not count it again |
+| Kept facts (`tests/regions.rs`) | A region the step that pops the frame loads, which slot `T` lacks: a claimed spawn into it is live and agrees, and survives a rollback through the popped tick in the same call and in a later one, with no correction after; a claimed entity moved into it is moved there, and again by a rollback; a swap in one frame destroys the old entity and keeps the new; a later frame for a tick before the load follows the spawn, folded in: its rows correct once at the popped tick and survive a rollback, a removal, a move, a release and a tombstone end as the server has them, and none of them repeats a correction in later calls; a later move for a tick before the load into a region the kept slot lacks and its own popped tick loads is kept at that tick, so a rollback through both writes the spawn at the first and the move at the second, and two such moves of a claimed entity end in the second region, while the same move for a tick after the kept one is compared at its own slot; a band frame's spawn into such a region is kept at the tick it was popped at; what the tolerance absorbed of a kept fact is counted once however often it is compared, and a move folded into it later does not count it again; a move or claimed spawn naming a region neither slot holds is folded in without its region, so a rollback through the kept slot keeps the entity where it was, with the claim's components, and a claim after a kept tombstone does not undo it; a spawn kept at one tick and its move kept at a later one, followed by a tombstone, rows or a release for a tick before both, end as the server has them after a rollback through both |
 | Presentation (`tests/presentation.rs`) | A rollback over a tick that emitted an event: the re-emission is not delivered again, an event not re-emitted is cancelled, both in the batch `app` takes after `reconcile`; extract's pass after a rollback is full |
 | The check (`tests/check.rs`) | A kernel naming a persistent unreplicated component in a `[server, prediction]` system is refused with its names, `Without<T>` too; the same system `[server]` only passes; transient and derived pass; the finalize's table is judged; an exclusive prediction-world system outside `EXCLUSIVE_SYSTEMS` is refused, one in a set named like an engine's under an unlisted name is refused, and `physics_api::sync` passes by key; the tests' prediction world, physics included, builds with the check |
 | Cost (`tests/cost.rs`) | Asserted: a slot's world and physics bytes grow with the statics, its record does not. Measured by an ignored test, run by hand in release: bytes and microseconds of `World::snapshot` and `physics_api::snapshot` for fifty claimed bodies plus 0, 1,000 and 10,000 statics with the test backend, the record's bytes, a predicted tick, and a rollback of seven ticks per re-simulated tick, against the 100 µs budget; the numbers are in D122's addendum |

@@ -563,7 +563,7 @@ fn move_to(world: &mut World, key: StableKey, region: RegionId) -> Result<bool> 
         return Ok(false);
     }
     if world.region(region).is_none() {
-        tracing::warn!(target: "predict", ?key, ?region, "a move into a region not loaded: skipped");
+        tracing::debug!(target: "predict", ?key, ?region, "a move into a region not loaded: skipped");
         return Ok(false);
     }
     world.move_to_region(key, region)?;
