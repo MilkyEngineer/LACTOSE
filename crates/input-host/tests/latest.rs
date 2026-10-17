@@ -151,7 +151,7 @@ fn stress(publishers: u32, readers: usize, count: u32) -> Vec<u64> {
 }
 
 fn publishes() -> u32 {
-    if cfg!(miri) { 50 } else { 200_000 }
+    if cfg!(miri) { 50 } else { 1_000_000 }
 }
 
 #[test]
