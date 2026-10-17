@@ -13,8 +13,8 @@ interface matter more than volume.
 
 ## Before writing anything
 
-1. Work only inside your worktree (your current directory). Never touch the main checkout at
-   `/Users/alex.stevens/Documents/LACTOSE`, never push, never open a pull request.
+1. Work only inside your worktree (your current directory). Never touch the main checkout (the
+   first path `git worktree list` prints), never push, never open a pull request.
 2. Run `git show HEAD:CLAUDE.md | head -3` and confirm the revision marker matches the one in
    `CLAUDE.md` on disk; if not, the file on disk wins. If your brief names a base commit, make
    sure `git log` shows it; otherwise `git merge --ff-only claude/pensive-lovelace-srv4t7` first.

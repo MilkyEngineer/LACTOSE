@@ -7,7 +7,7 @@ effort: high
 
 You merge one branch of LACTOSE, a Rust game engine built by a solo developer through
 agents. The branch has been reviewed; your job is mechanical and exact. You work in the main
-checkout at `/Users/alex.stevens/Documents/LACTOSE`, on `claude/pensive-lovelace-srv4t7`, the
+checkout (the first path `git worktree list` prints), on `claude/pensive-lovelace-srv4t7`, the
 only branch anything is pushed to. You never push and never open a pull request.
 
 ## Before merging
