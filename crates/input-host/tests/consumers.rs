@@ -1,6 +1,6 @@
-//! Compile-only consumer sketches against the facade: what `app`'s input task, a milestone
-//! 5 source and presentation's late latch write, type-checked and never run (every
-//! deciding body of the crate is `todo!()`).
+//! Compile-only consumer sketches against the surface: what `app`'s input task, a milestone
+//! 5 source and presentation's late latch write, type-checked and never run; the behaviour
+//! is the other tests'.
 
 #![forbid(unsafe_code)]
 #![allow(dead_code, unused_variables, missing_docs)]

@@ -5,7 +5,9 @@
 //! Floats live here and never cross into a boundary crate; the only way into the
 //! simulation is [`Quantiser::next`].
 
-use lactose_input::{Actions, PlayerInput};
+use core::f64::consts::{FRAC_PI_2, PI, TAU};
+
+use lactose_input::{AXIS_SCALE, Actions, Axis2, Pitch, PlayerInput, UNITS_PER_TURN, Yaw};
 
 /// What the sources produced for one frame, before quantisation: movement in the player's
 /// frame, the camera's absolute yaw and pitch in radians, the actions held, and the
@@ -56,28 +58,45 @@ impl RawSample {
     /// accumulates until a tick. The input task calls it before polling the sources, so a
     /// key released on one source cannot be held over by a stale value.
     pub fn begin_frame(&mut self) {
-        todo!()
+        self.held = Actions::EMPTY;
+        self.movement_x = 0.0;
+        self.movement_y = 0.0;
     }
 
     /// Adds `actions` to `held` and to `latched`: `held.union(actions)` and
     /// `latched.union(actions)`. How a source reports what it holds, so two sources
     /// holding the same action agree and neither clears the other's.
     pub fn hold(&mut self, actions: Actions) {
-        todo!()
+        self.held = self.held.union(actions);
+        self.latched = self.latched.union(actions);
     }
 
     /// Offers a movement vector: it replaces the current one only if its squared length is
     /// larger, so of a stick and the keys the larger movement wins and a centred stick does
-    /// not cancel the keys. A NaN component counts as zero.
+    /// not cancel the keys. A non-finite component (NaN or infinite) counts as zero, in the
+    /// offer and in the current movement, and is stored as zero if the offer wins.
     pub fn offer_movement(&mut self, x: f32, y: f32) {
-        todo!()
+        let (x, y) = (finite_or_zero(x), finite_or_zero(y));
+        let current =
+            squared_length(finite_or_zero(self.movement_x), finite_or_zero(self.movement_y));
+        if squared_length(x, y) > current {
+            self.movement_x = x;
+            self.movement_y = y;
+        }
     }
 
-    /// Adds a rotation delta, radians: `yaw + delta_yaw` wrapped into `[-PI, PI)`, and
-    /// `pitch + delta_pitch` clamped to `[-PI/2, PI/2]`. A non-finite delta is ignored. How
-    /// a mouse or a stick turns the camera; the camera rig may call it too.
+    /// Adds a rotation delta, radians: `yaw + delta_yaw` wrapped into `[-PI, PI)` (summed in
+    /// `f64`; a sum already in range is only rounded), and `pitch + delta_pitch` clamped to
+    /// `[-PI/2, PI/2]`. A non-finite delta is ignored, each of the two on its own. How a
+    /// mouse or a stick turns the camera; the camera rig may call it too.
     pub fn turn(&mut self, delta_yaw: f32, delta_pitch: f32) {
-        todo!()
+        if delta_yaw.is_finite() {
+            self.yaw = wrap_yaw(f64::from(self.yaw) + f64::from(delta_yaw));
+        }
+        if delta_pitch.is_finite() {
+            let limit = core::f32::consts::FRAC_PI_2;
+            self.pitch = (self.pitch + delta_pitch).clamp(-limit, limit);
+        }
     }
 }
 
@@ -103,12 +122,13 @@ impl Quantiser {
     /// consume the latch:
     ///
     /// - `movement`: the vector `(movement_x, movement_y)` scaled down to the unit disc if
-    ///   longer (a NaN component counts as zero), then each component times
-    ///   [`AXIS_SCALE`](lactose_input::AXIS_SCALE), rounded to nearest, ties away from
-    ///   zero, as an `i16` (saturating);
-    /// - `yaw`: `yaw` reduced into `[0, TAU)`, divided by `TAU`, times
+    ///   longer (a non-finite component, NaN or infinite, counts as zero), then each
+    ///   component times [`AXIS_SCALE`](lactose_input::AXIS_SCALE), rounded to nearest, ties
+    ///   away from zero, as an `i16` (saturating);
+    /// - `yaw`: `yaw` divided by `TAU`, its fraction of a turn in `[0, 1)` times
     ///   [`UNITS_PER_TURN`](lactose_input::UNITS_PER_TURN), rounded to nearest, modulo
-    ///   `UNITS_PER_TURN`; a non-finite yaw quantises to zero;
+    ///   `UNITS_PER_TURN` (the yaw reduced into `[0, TAU)` and scaled to units); a
+    ///   non-finite yaw quantises to zero;
     /// - `pitch`: `pitch` clamped to `[-PI/2, PI/2]`, divided by `TAU`, times
     ///   `UNITS_PER_TURN`, rounded to nearest, clamped to
     ///   [`Pitch::LIMIT`](lactose_input::Pitch::LIMIT); a NaN pitch quantises to zero;
@@ -117,9 +137,90 @@ impl Quantiser {
     ///   released at the next; `pressed`: `held.without(previous_held)`; `released`:
     ///   `previous_held.without(held)`; then `previous_held` becomes `held`.
     ///
-    /// The result always passes [`PlayerInput::validate`]. This is the one place a float
-    /// becomes an integer, and the integer is what both machines simulate.
+    /// Each value is computed in `f64` from the exact widening of the `f32`, with IEEE basic
+    /// operations and exact roundings only, so one raw sample gives the same integers on
+    /// every target. The result always passes [`PlayerInput::validate`]. This is the one
+    /// place a float becomes an integer, and the integer is what both machines simulate.
     pub fn next(&mut self, raw: &mut RawSample) -> PlayerInput {
-        todo!()
+        let held = raw.held.union(raw.latched);
+        raw.latched = Actions::EMPTY;
+        let pressed = held.without(self.previous_held);
+        let released = self.previous_held.without(held);
+        self.previous_held = held;
+        PlayerInput {
+            movement: quantise_movement(raw.movement_x, raw.movement_y),
+            yaw: quantise_yaw(raw.yaw),
+            pitch: quantise_pitch(raw.pitch),
+            held,
+            pressed,
+            released,
+        }
     }
+}
+
+// Every float step below is an IEEE basic operation (`+`, `-`, `*`, `/`, `sqrt`) or an exact
+// one (`floor`, `round`, a widening or saturating cast), never a library function, and Rust
+// never contracts a multiply and an add: so a raw sample quantises to the same integers on
+// every target, which is what lets the client simulate the value the server receives.
+// `f64` holds every `f32` exactly, and the square of one, so nothing here overflows.
+
+fn finite_or_zero(value: f32) -> f32 {
+    if value.is_finite() { value } else { 0.0 }
+}
+
+fn squared_length(x: f32, y: f32) -> f64 {
+    let (x, y) = (f64::from(x), f64::from(y));
+    x * x + y * y
+}
+
+/// `yaw` wrapped into `[-PI, PI)` as an `f32`, the bounds being the `f32` PI. A sum already
+/// in range is only rounded, so a zero delta never moves the yaw; NaN stays NaN.
+fn wrap_yaw(yaw: f64) -> f32 {
+    let pi = f64::from(core::f32::consts::PI);
+    let wrapped = if (-pi..pi).contains(&yaw) {
+        yaw
+    } else {
+        let turns = (yaw + PI) / TAU;
+        (turns - turns.floor()) * TAU - PI
+    };
+    let wrapped = wrapped as f32;
+    // Either branch can round up to the `f32` PI, which is the angle -PI: in range.
+    if wrapped >= core::f32::consts::PI { (f64::from(wrapped) - TAU) as f32 } else { wrapped }
+}
+
+fn quantise_movement(x: f32, y: f32) -> Axis2 {
+    let (x, y) = (finite_or_zero(x), finite_or_zero(y));
+    let squared = squared_length(x, y);
+    let (x, y) = (f64::from(x), f64::from(y));
+    let (x, y) = if squared > 1.0 {
+        let length = squared.sqrt();
+        (x / length, y / length)
+    } else {
+        (x, y)
+    };
+    // Within `[-1, 1]` up to one rounding, so the product rounds to at most `AXIS_SCALE`;
+    // the cast saturates regardless.
+    let scale = f64::from(AXIS_SCALE);
+    Axis2 { x: (x * scale).round() as i16, y: (y * scale).round() as i16 }
+}
+
+fn quantise_yaw(yaw: f32) -> Yaw {
+    if !yaw.is_finite() {
+        return Yaw::ZERO;
+    }
+    // The fraction of a turn, in `[0, 1)`: the subtraction is exact.
+    let turns = f64::from(yaw) / TAU;
+    let fraction = turns - turns.floor();
+    let units = (fraction * f64::from(UNITS_PER_TURN)).round() as u32 % UNITS_PER_TURN;
+    Yaw(units as u16)
+}
+
+fn quantise_pitch(pitch: f32) -> Pitch {
+    if pitch.is_nan() {
+        return Pitch::ZERO;
+    }
+    let radians = f64::from(pitch).clamp(-FRAC_PI_2, FRAC_PI_2);
+    let units = (radians / TAU * f64::from(UNITS_PER_TURN)).round();
+    let limit = f64::from(Pitch::LIMIT);
+    Pitch(units.clamp(-limit, limit) as i16)
 }
