@@ -9,6 +9,7 @@ version = "0.0.0"
 edition = "2024"
 rust-version = "1.99"
 publish = false
+license = "MIT"
 
 # Internal crates. A crate's tier and boundary status live in crate-tiers.toml, never here.
 [workspace.dependencies]

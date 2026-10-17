@@ -54,8 +54,9 @@ confidence-threshold = 0.9
 unused-allowed-license = "allow"
 
 [licenses.private]
-# The workspace's own crates are `publish = false` and carry no licence field.
-ignore = true
+# The workspace's own crates are `publish = false` and inherit `license = "MIT"` from the root
+# `[workspace.package]`. They are checked like any crate, so one without the field fails.
+ignore = false
 
 [bans]
 # Two versions of one crate are a warning in general. Outside the determinism boundary a
