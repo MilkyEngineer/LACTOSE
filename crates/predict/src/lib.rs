@@ -4,15 +4,9 @@
 //! with what was predicted and re-simulates from the first difference.
 //!
 //! Foundation tier, inside the determinism boundary (architecture section 8.1): every key
-//! is a `StableKey`, and nothing here reads a clock or computes a float. The `README.md`
+//! is a `StableKey`, nothing here reads a clock, and every float goes through `lactose_math`
+//! (the tolerance of D124). The `README.md`
 //! is the contract: it states what the signatures cannot, and what a caller may rely on.
-//!
-//! # Status
-//!
-//! A facade: every public signature is final and every body that decides anything is
-//! `todo!()`. The implementation lane replaces the bodies behind this surface and removes
-//! the crate-level `allow` with the last `todo!()`, once what it is written against in
-//! other crates is implemented (the README, "Not in this crate yet").
 //!
 //! # Where to start
 //!
@@ -25,8 +19,11 @@
 //!   the staged frames inside the tick, moves the proxies along their history and records
 //!   the claimed entities' exact rows for reconciliation.
 //! - [`Ring`] is the rollback ring: what one slot holds, how deep it is, what it weighs.
-//! - [`Reconciled`], [`Correction`], [`Divergence`] and [`PredictionStats`] are the values
-//!   the milestone 1 spike records; nothing here is a log line.
+//! - [`Reconciled`], [`Correction`], [`Divergence`] and [`PredictionStats`] (with
+//!   [`Absorbed`]) are the values the milestone 1 spike records; nothing here is a log line.
+//! - [`PredictionTolerance`] is how far a dynamic body's `Transform` and `Velocity` may
+//!   differ from the server's and still agree; `app` sets it with
+//!   [`Predictor::set_tolerance`].
 //! - [`check_prediction_reads`] is the build check of D121: a prediction-world system may
 //!   name only components the server corrects, and an exclusive one must be one of
 //!   [`EXCLUSIVE_SYSTEMS`].
@@ -54,6 +51,7 @@
 //!     .setup(lactose_net_api::setup)
 //!     .systems(lactose_input::register_systems)
 //!     .systems(lactose_net_api::register_systems)
+//!     .check(lactose_predict::check_prediction_reads)
 //!     .inputs(Box::new(lactose_input::PlayerInputApplier::new()))
 //!     .build()?;
 //! let entity = StableKey::Net(NetId::from_bits(7).expect("non-zero"));
@@ -87,26 +85,23 @@
 //! ```
 
 #![forbid(unsafe_code)]
-#![allow(
-    dead_code,
-    unused_variables,
-    reason = "facade: every body is `todo!()` until the implementation lane replaces it, and \
-              the fields and parameters it will use are declared now"
-)]
 
 mod check;
+mod compare;
+mod fact;
 mod hook;
 mod predictor;
 mod reconcile;
 mod ring;
 
 pub use check::{EXCLUSIVE_SYSTEMS, check_prediction_reads, prediction_may_name};
+pub use compare::PredictionTolerance;
 pub use hook::PredictionHook;
 pub use predictor::{
     DEFAULT_DEPTH, LocalPlayer, PassesRun, PredictError, Predictor, ReconcileRun, StepRun,
 };
 pub use reconcile::{
-    Correction, CorrectionCause, Divergence, PredictionStats, Reconciled, ResyncReason,
+    Absorbed, Correction, CorrectionCause, Divergence, PredictionStats, Reconciled, ResyncReason,
 };
 pub use ring::{Ring, SlotBytes};
 
@@ -134,6 +129,8 @@ const _: () = {
     send_sync::<Correction>();
     send_sync::<Divergence>();
     send_sync::<PredictionStats>();
+    send_sync::<Absorbed>();
+    send_sync::<PredictionTolerance>();
     send_sync::<ResyncReason>();
     send_sync::<SlotBytes>();
     staged_state::<PredictionHook>();

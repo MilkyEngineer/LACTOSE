@@ -1,7 +1,7 @@
-//! Compile-only consumer sketches against the facade: what the client's `app`, a game
-//! crate, presentation and the milestone 1 spike write, type-checked and never run (every
-//! deciding body of the crate is `todo!()`). They pin the surface the README promises: a
-//! change that breaks one is a signature change to list.
+//! Compile-only consumer sketches: what the client's `app`, a game crate, presentation and
+//! the milestone 1 spike write, type-checked and never run (the runs need a client's
+//! network thread and a backend). They pin the surface the README promises: a change that
+//! breaks one is a signature change to list.
 
 #![forbid(unsafe_code)]
 #![allow(dead_code, unused_variables, missing_docs)]
@@ -88,7 +88,8 @@ fn backend_with_pool() -> Box<dyn PhysicsBackend> {
 
 /// Built at the join tick plus the clock sync's lead, with every crate's registration:
 /// `lactose_net_api::setup` for the inbox the hook pops, `lactose_physics_api::setup` for
-/// the physics the ring snapshots.
+/// the physics the ring snapshots, and the build check, which refuses this sketch's
+/// `reminisce` and `sweep` with a build error, as section 1 says it must.
 fn build_prediction(
     player: PlayerId,
     join_tick: Tick,
@@ -107,6 +108,7 @@ fn build_prediction(
         .systems(lactose_net_api::register_systems)
         .systems(lactose_physics_api::register_systems)
         .systems(register_systems)
+        .check(check_prediction_reads)
         .inputs(Box::new(PlayerInputApplier::new()))
         .build()?;
     Predictor::new(simulation, LocalPlayer { player, entity }, DEFAULT_DEPTH)

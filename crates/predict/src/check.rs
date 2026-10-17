@@ -5,8 +5,8 @@
 //! exclusive system shows no table, so one that runs in the prediction world must be an
 //! engine's, named here by system key.
 
-use lactose_core::{Result, SystemKey};
-use lactose_ecs::SystemDescriptor;
+use lactose_core::{Error, ErrorKind, Result, SystemKey};
+use lactose_ecs::{AccessTarget, SystemDescriptor, WorldKind};
 use lactose_reflect::{Persistence, Registry, TypeInfo};
 
 /// The engine's exclusive systems that run in the prediction world, by system key: the
@@ -60,5 +60,35 @@ pub fn check_prediction_reads(
     registry: &Registry,
     systems: &[&'static SystemDescriptor],
 ) -> Result<()> {
-    todo!()
+    let refused = |message: String| Err(Error::new(ErrorKind::InvalidData, message));
+    for system in systems.iter().filter(|system| system.worlds().contains(WorldKind::Prediction)) {
+        if system.is_exclusive() && !EXCLUSIVE_SYSTEMS.contains(&system.key()) {
+            return refused(format!(
+                "`{}` is an exclusive system that runs in the prediction world and is not one \
+                 of the engine's (`lactose_predict::EXCLUSIVE_SYSTEMS`): its `&mut World` \
+                 can read what the server never corrects",
+                system.name()
+            ));
+        }
+        for access in system.access().iter().chain(system.finalize_access()) {
+            let AccessTarget::Component(component) = access.target() else { continue };
+            let Some(info) = registry.get(component) else {
+                return refused(format!(
+                    "`{}` names a component the registry does not know ({:#018x})",
+                    system.name(),
+                    component.0
+                ));
+            };
+            if !prediction_may_name(info) {
+                return refused(format!(
+                    "`{}` runs in the prediction world and names `{}`, a persistent component \
+                     that is not replicated: the server never sends it, so no correction \
+                     reaches what the system reads",
+                    system.name(),
+                    info.name()
+                ));
+            }
+        }
+    }
+    Ok(())
 }

@@ -2231,6 +2231,134 @@ rationale the author supplied during the editorial pass rather than one taken fr
   `lactose-sim` and `lactose-predict` call it without the zero; the deferred item is closed.
 - Driven by: milestone 1, the `predict` facade brief and its two design reviews (2026-10-10 and
   2026-10-11).
+- Addendum (lane predict, 2026-10-18): `lactose-predict` is implemented behind the facade's
+  surface, plus D124's `PredictionTolerance`, `Predictor::set_tolerance` and
+  `PredictionStats::absorbed`.
+  - Comparison: one private function, `compare` in `crates/predict/src/compare.rs`. Every field
+    with an ID is compared by canonical bytes; `Scalar`-tagged leaves at any depth compare by
+    canonical bits, with NaN folded and negative zero distinct. Full precision except a dynamic
+    body's `Transform` and `Velocity` within `PredictionTolerance` (D124).
+  - `Teleported` of a claimed entity is never recorded, never compared and never written by a
+    correction. A corrected `Transform` reaches the backend as a placement, which the
+    write-back reports as a client-side teleport while the server's flag is unchanged;
+    comparing it would correct every correction again a frame later. Proxies' `Teleported` is
+    still written by the hook from dequantised rows.
+  - What a correction writes: `writes` in `crates/predict/src/fact.rs`. A fact's component is
+    written where it differs, is absorbed, or is missing; an agreeing one is left as
+    `insert_erased` would leave an equal value, so every fact at k is written in effect, the
+    absorbed ones included.
+  - The known region map learns only from facts, never from the ring's record, so an entity
+    only the prediction world believes claimed is never re-spawned. Each full frame replaces it
+    with its claimed spawns less its tombstones; resync keeps it until that frame (review round
+    1, N3).
+  - The hook records a move, removal, exact row or tombstone of an entity that is not live as a
+    fact, which reconciliation keeps only for a claimed or known entity.
+  - A release fact matches when the key is absent from slot T's record, which holds only
+    claimed entities.
+  - *The hook applies a claim change at once.* A delta frame's claimed spawn, and its release
+    of a claimed entity, are recorded as facts and also applied in a predicted tick, as a full
+    frame applies them. A claim inserts `ClaimedBy`, or spawns the entity claimed with the
+    components a correction writes, never `Teleported` or a transient component. A claim of a
+    live unclaimed entity into a region the world lacks is not applied by the hook: if slot T
+    lacks the region too, the comparison skips the claim and the entity stays a proxy; if T
+    holds it, the correction at T writes the claim and the move, and the entity leaves with the
+    region when it unloads. A release removes `ClaimedBy` and upserts the components. The
+    frame's later entries and the step's later frames then find the entity as the server has
+    it. A re-simulated tick does not apply them again: the correction wrote the claim, at T or,
+    for a fact kept there (next bullet), at the popped tick a, and a later fact (a tombstone, a
+    move) may have changed the entity since. An entry the hook refuses is logged at warn in the
+    predicted tick that popped its frame and at debug when a re-simulation replays it, so a
+    rollback does not repeat the warning; a sender-defect row is skipped silently in a
+    re-simulation. (Review round 1, B1; review round 2, N1 and N2; review round 5, N1 and N2;
+    review round 6, N2.)
+  - *Facts kept at the tick their region loads.* A fact that places a claimed entity in a
+    region its comparison slot lacks (T, or the restart r for a band frame) while the popped
+    tick a holds it (a claimed spawn or move by its region, or a removal or exact rows of an
+    absent entity by its known region; app folds a frame's region changes into the step that
+    pops it) is compared at slot a and kept with that slot while the ring holds it. Every later
+    call compares it again, and every rollback that re-simulates a writes it, because a
+    correction at T could not place the entity and a re-simulation never re-applies a claim
+    change. A later fact about the entity, for a tick at or before its newest kept slot,
+    follows it there, unless it places the entity in a region that slot lacks and its own
+    popped tick holds; then it is kept at its own popped tick by the same rule, and the entity
+    has kept facts at two ticks. A fact that follows is folded in, so the entity's kept facts
+    stay one statement the slot can agree with: a claimed spawn, release or tombstone replaces
+    the earlier facts; a move sets their region; rows replace a spawn's components, or earlier
+    rows and removals; a removal drops a component; only a claimed spawn, release or tombstone
+    follows a release or tombstone. Kept facts come first at their tick and are dropped by a
+    full frame and by resync. What the tolerance absorbed of them counts once: a claimed spawn
+    or rows folded in later count what they state, a move or removal folded in counts nothing
+    again. A fact naming a region neither the slot it is compared at nor slot a holds is
+    skipped and logged at warn, whether or not the entity has kept facts. That is a sender
+    defect, or a region made irrelevant again before either slot was taken: frames popped in
+    one step fold a Relevant then Irrelevant change into no load, and an irrelevant region's
+    entities leave without tombstones. Its region is neither compared nor written: an absent
+    entity is not spawned, a present one is not moved and stays where it was, in both worlds,
+    until a full frame, and a claimed spawn's components are compared and written for an entity
+    the slot records; a claim of a live unclaimed entity into such a region is not applied. A
+    fact that follows kept facts is folded in without its region, so a rollback through the
+    kept slot still places the entity: a move is dropped, and a claimed spawn takes the region
+    the kept facts name, or is dropped after a kept release or tombstone. Accepted limits: the
+    entity is placed at a, after step a; a fact for a tick before a writes an older server
+    state at a; kept facts are bounded by the ring's depth times the entities kept; a kept
+    release does not re-spawn the proxy when a rollback re-simulates from before a (the proxy
+    is absent from re-simulated ticks a to a2 - 1, where a2 is the release frame's popped tick,
+    and the replay respawns it at a2). Why: before this, a claimed spawn into such a region was
+    lost by any rollback through a, a swap in one frame kept neither entity, a move into the
+    region never happened, and a spawn the server destroyed before a stayed forever (review
+    round 2, B1, present at 8a744fd and 8c50c50); without the fold, two kept facts disagreed
+    and caused a correction at a in every call; without the region test on a followed slot, a
+    second region change of a kept entity caused a correction at a in every call, growing to
+    the ring's depth (review round 3, B1), and a followed fact into a region neither slot held
+    did the same (round 3, S1); a followed fact naming such a region was folded into the kept
+    statement, so the next rollback through the kept slot lost the entity (review round 4, S1).
+  - *Band frames are reconciled at the restart slot.* A frame popped after the call's newest
+    full frame with a tick before the ring's restart has its facts resolved and learned, its
+    facts other than exact rows compared with the restart slot's record and written there as a
+    correction with cause `Mismatch`, in frame order before the facts of a frame for that tick,
+    and its exact rows dropped: the first later frame that carries the entity restates every
+    component (section 9.4), while a tombstone, move, removal, claim or release is never
+    restated, and a row written at the restart would be stale and corrected forward again.
+    Frames popped before the newest full frame stay skipped whole, band substitutions too. This
+    narrows "a fact is compared at the slot of the frame's tick and nowhere else" (review round
+    1, B2).
+  - *A claimed spawn and a delta frame's exact rows for one claimed entity are whole-entity
+    statements.* A recorded component the statement does not name is a mismatch with no field
+    and the correction removes it; `Teleported` and unrecorded components are outside the
+    statement. The row rule rests on D121's "a claimed entity is whole in every packet that
+    carries it" and the receiver staging a packet whole or not at all, named in predict's
+    README as the sentence net-host's implementation holds and net-api's frame contract should
+    carry, with the cost of a partial send stated (review round 1, S1).
+  - *A replicated transient component is admitted by design and never reconciled.* The macro,
+    the gather and the protocol hash admit `transient, replicated`; the prediction world's hook
+    writes one to a proxy; a claimed entity's is never recorded, compared or corrected, because
+    the next tick's sync point zeroes it before anything reads it and one computed against
+    proxies would mismatch at every frame; its exact rows are skipped without a log. The record
+    is every replicated persistent component of every claimed entity (review round 1, N2).
+  - A rollback that fails part way still counts in `PredictionStats` the frames and corrections
+    it made before the failure (review round 1, N5).
+  - The SOUR scene records under a sequence number (after each step and each reconcile), since
+    a correction changes the hash of an already-predicted tick; the harness protocol's
+    `Record::tick` is documented as the record's position in the test's sequence (a simulation
+    tick for a straight run). No architecture amendment.
+  - D124 in predict: `PredictionTolerance` (`DEFAULT` 2e-3 m, 2e-3 per quaternion component,
+    2e-2 m/s, 2e-2 rad/s), `Predictor::set_tolerance`, and `PredictionStats::absorbed: Absorbed
+    { fields, translation, rotation, linear, angular }`, holding the maxima as canonical bits
+    so the stats keep `Eq` and `Hash`. Each frame's facts count once in `absorbed`, at their
+    last comparison.
+  - Open, for review round 6's N3 (a sender defect only): the comparison warns on a malformed
+    or unregistered component of a kept fact in every call while the ring holds its tick, and
+    twice for any fact when popped.
+  - Measured (release, Apple M1, test backend, load averages 8.70 15.57 15.74 before and after,
+    two runs), for 50 claimed bodies:
+
+    | Statics | World snapshot | Physics snapshot | Predicted tick | Re-simulated tick |
+    |---|---|---|---|---|
+    | 0 | 87 kB, 5.3–5.5 µs | 14.6 kB, 3.3–3.5 µs | 74 µs | 78–80 µs |
+    | 1,000 | 390 kB, 28–29 µs | 306 kB, 49 µs | 193–210 µs | 221–291 µs |
+    | 10,000 | 3.06 MB, 333–380 µs | 2.92 MB, 707–723 µs | 1.6–1.8 ms | 1.8–1.9 ms |
+
+    The record is 14.4 kB in each case. A re-simulated tick costs about a predicted tick.
 
 **D123. A third-party crate is built from a patched copy only under `vendor/`, by one rule
 for every crate, checked by `cargo xtask vendor`** (§8.2, §8.3, §9.1, §16, §20,
