@@ -29,8 +29,9 @@ use lactose_physics_api::PhysicsBackend;
 /// The backend, stepping on `pool`. Each of the pool's threads enters
 /// [`ThreadClass::PhysicsSolver`] here, which sets its floating-point state; a thread the
 /// operating system refuses the scheduling class is logged and runs at its default
-/// priority. The pool is the backend's alone: Rapier's parallel work runs on it and on
-/// nothing else.
+/// priority. Rapier's parallel work runs on the pool and on nothing else, and a step can wait
+/// for every thread of it: the pool is the backend's alone, no job on it may block outside
+/// rayon, and it must not be built with `use_current_thread`.
 #[must_use]
 pub fn backend(pool: rayon::ThreadPool) -> Box<dyn PhysicsBackend> {
     pool.broadcast(|context| {

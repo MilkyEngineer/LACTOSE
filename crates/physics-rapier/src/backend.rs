@@ -249,8 +249,8 @@ impl PhysicsBackend for Rapier {
     }
 
     fn step(&mut self, input: &StepInput<'_>, output: &mut StepOutput) {
-        // Not a step: Rapier would skip a dt that is not positive after the backend had applied
-        // the step's writes, and would carry a non-finite value into every body.
+        // Not a step: for a dt that is not positive Rapier runs no dynamics but still takes the
+        // writes applied below, and a non-finite dt or gravity would reach every moving body.
         if !input.dt.is_finite() || input.dt <= Scalar::ZERO || !input.gravity.is_finite() {
             tracing::warn!(target: CONTRACT_TARGET, tick = input.tick.0, "skipped step: not a valid dt or gravity");
             return;
