@@ -1,5 +1,6 @@
-//! The step never blocks a pool thread outside rayon: each of its waits is rayon's own, which
-//! runs other work while it waits and wakes every thread it waits on. Unpatched, Rapier queued
+//! The step never waits on work that needs a pool thread to be woken outside rayon's guarantee.
+//! Its waits are rayon's own, which run other work meanwhile and wake every thread they wait
+//! on, or the staged solver's spin on a batch another thread is already running. Unpatched, Rapier queued
 //! the broad phase's deferred tree optimisation as a detached job and blocked the stepping
 //! thread on its result in a channel, so the step finished only when another thread took the
 //! job, and hung when none did (`vendor/README.md`).

@@ -39,7 +39,7 @@ change upstream drops the directory, the patch and the entry.
     thread asleep and the job stealable: once on a four-thread pool (the D124 review's sample),
     and in the S5 review's five-scene probe, in 4 of 9 unpatched runs and in 4 of 12 unpatched
     processes of its walk scene on six two-thread pools in a row, at load averages 1.4 to 16
-    (the patched build hung in none; at load 20 to 40 the probe did not hang in 9 unpatched
+    (the patched build hung in none; at load 33 to 41 the probe did not hang in 9 unpatched
     runs), and every time while every other thread of the pool is held
     (`crates/physics-rapier/tests/pool.rs`). `solve.rs` holds `unsafe`, so the patch is in
     `BroadPhaseBvh::take_deferred_optimize` (`src/geometry/broad_phase_bvh/mod.rs`): it runs

@@ -24,11 +24,12 @@ scheduling class is logged and the thread runs at its default priority).
 Rapier's parallel work runs on that pool and nowhere else. The pool's size changes no output:
 `tests/determinism.rs` and `tests/conformance.rs` compare one, two and four threads.
 
-The step never blocks a pool thread outside rayon: each of its waits is rayon's own, which runs
-other work while it waits and wakes every thread it waits on. One of them waits for every
-thread of the pool: the narrow phase broadcasts to all of them when more than 64 contact pairs
-update. So every thread must be free to run rayon work: the pool is the backend's alone, no job
-on it blocks outside rayon, and it is not built with `use_current_thread`.
+The step never waits on work that needs a pool thread to be woken outside rayon's guarantee.
+Its waits are rayon's own, which run other work meanwhile and wake every thread they wait on,
+or the staged solver's spin on a batch another thread is already running. One of rayon's waits
+is for every thread of the pool: the narrow phase broadcasts to all of them when more than 64
+contact pairs update. So every thread must be free to run rayon work: the pool is the backend's
+alone, no job on it blocks outside rayon, and it is not built with `use_current_thread`.
 
 The pinned Rapier queued the broad phase's deferred tree optimisation as a detached job and
 blocked the stepping thread, a pool thread, on its result in a channel. rayon tries to wake a
