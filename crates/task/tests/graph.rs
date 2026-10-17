@@ -7,7 +7,7 @@ mod common;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use common::{Node, executor, graph, sized};
+use common::{Node, Rendezvous, executor, graph, let_workers_sleep, sized};
 use lactose_task::{GraphBuilder, GraphError, NodeId};
 
 #[test]
@@ -262,4 +262,30 @@ fn builder_rejects_unknown_nodes_and_cycles() {
     executor.block_on(executor.run_graph(graph(vec![node(), counted], &[(0, 1), (0, 1)]))).unwrap();
     assert_eq!(ran.load(Ordering::Relaxed), 1);
     executor.shutdown();
+}
+
+/// A thief that splits what it stole wakes a sleeper for the half it leaves on its deque
+/// (`split_stolen`). A node released while every worker sleeps wakes one of them; the first
+/// unit each worker runs waits until every worker is running one, so the others can only
+/// join if each split wakes the next.
+#[test]
+fn a_nodes_units_reach_every_sleeping_worker() {
+    let workers = 3;
+    let executor = executor(workers, 1);
+    let rendezvous = Arc::new(Rendezvous::new(&executor));
+    let node = {
+        let rendezvous = rendezvous.clone();
+        Node::new("graph::wakes")
+            .units(sized(64, 8))
+            .run(move |_, ctx| rendezvous.arrive(ctx.slot()))
+            .build()
+    };
+    let_workers_sleep();
+    executor.block_on(executor.run_graph(graph(vec![node], &[]))).unwrap();
+    executor.shutdown();
+    assert!(
+        rendezvous.met(),
+        "only {} of {workers} workers ran a unit: a split woke no sleeping worker",
+        rendezvous.arrived()
+    );
 }

@@ -7,8 +7,9 @@ mod common;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::Instant;
 
-use common::{executor, sized};
+use common::{LIMIT, executor, sized};
 use lactose_core::ErrorKind;
 use lactose_task::{Lane, WorkerClass, lane};
 
@@ -63,10 +64,17 @@ fn calls_run_on_the_owning_thread_in_submission_order() {
 
     let total = (senders * per_sender) as usize;
     let mut ran = 0;
+    let begun = Instant::now();
     while ran < total {
         ran += pump.drain(&mut window);
         if ran < total {
-            std::thread::park();
+            // Only a queued call that never called `wake` lets this run out.
+            let left = LIMIT.saturating_sub(begun.elapsed());
+            assert!(
+                !left.is_zero(),
+                "{ran} of {total} calls ran: the lane stopped waking its owner"
+            );
+            std::thread::park_timeout(left);
         }
     }
     assert_eq!(pump.drain(&mut window), 0);

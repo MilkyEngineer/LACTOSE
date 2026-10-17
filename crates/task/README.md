@@ -277,8 +277,14 @@ Correctness:
   `WHISK_STRESS_SECONDS` sets a longer soak.
 - `tests/block_in_place.rs` proves the reservation by counting, not timing: a unit or child
   that begins before a block holds its worker until the block is in place, and a block that
-  reserves workers lasts until the work it is owed has run. A slow or oversubscribed machine
-  makes it slower, never wrong.
+  reserves workers lasts until the work it is owed has run. It also checks that opening the
+  gate wakes the workers it held and that the pool regains its full width after a block. A
+  slow or oversubscribed machine makes it slower, never wrong.
+- A test that waits for a wake-up, a timer, a cancellation or the end of a run it is about
+  bounds the wait (`tests/common`), so a regression it looks for fails it with a message
+  instead of hanging it. The wake-up tests (`tests/graph.rs`, `tests/scope.rs`) release work
+  while every worker sleeps and need all of them at once: a fork, and a thief's split, each
+  wake a sleeper.
 - `tests/abort.rs` re-runs itself as a subprocess and checks that a panic in a job, a
   finalize, a scope child, a scope body, a task or the drop of a cancelled task's future
   aborts the process, and that an unfollowable replay log does.

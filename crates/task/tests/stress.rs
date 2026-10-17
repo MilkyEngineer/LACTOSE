@@ -20,7 +20,7 @@ use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use common::{Node, graph, sized};
+use common::{LIMIT, Node, graph, must_finish, sized};
 use lactose_task::{Executor, Graph, WorkerClass, yield_now};
 
 fn duration() -> Duration {
@@ -165,9 +165,13 @@ fn steal_split_scope_and_wake_paths_hold_under_contention() {
         assert!(last.1.elapsed() < Duration::from_secs(30), "no graph run finished in 30 s");
     }
     stop.store(true, Ordering::Release);
-    for task in loops.into_iter().chain(chatter) {
-        executor.block_on(task).unwrap();
-    }
+    // The watchdog has stopped watching: a wake-up lost from here on would hang the joins.
+    let runner = executor.clone();
+    must_finish("the tick loops and the chatter after the stop", LIMIT, move || {
+        for task in loops.into_iter().chain(chatter) {
+            runner.block_on(task).unwrap();
+        }
+    });
     assert!(runs.load(Ordering::Relaxed) >= u64::from(sized(3, 2)));
     assert!(pings.load(Ordering::Relaxed) > 0);
     executor.shutdown();

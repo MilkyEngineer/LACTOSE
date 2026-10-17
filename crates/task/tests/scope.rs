@@ -8,7 +8,10 @@ use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use common::{Node, executor, graph, sized, spin_for, wait_for};
+use common::{
+    LIMIT, Node, Rendezvous, executor, graph, let_workers_sleep, must_finish, sized, spin_for,
+    wait_for,
+};
 use lactose_core::AllocTag;
 
 #[test]
@@ -352,19 +355,6 @@ fn finalize_may_open_a_scope() {
     executor.shutdown();
 }
 
-/// Runs `f` on a helper thread and fails the test if it does not finish in time, so a
-/// deadlock shows as a failure here and not as a test-runner timeout.
-fn must_finish(what: &str, f: impl FnOnce() + Send + 'static) {
-    let (done, wait) = std::sync::mpsc::channel();
-    let runner = std::thread::spawn(move || {
-        f();
-        let _ = done.send(());
-    });
-    let limit = Duration::from_secs(if cfg!(miri) { 600 } else { 20 });
-    assert!(wait.recv_timeout(limit).is_ok(), "{what} did not finish: the opener is stuck");
-    runner.join().unwrap();
-}
-
 /// Work submitted from inside a scope must not hide the scope's children. A graph started
 /// by the scope body, or by a child the opener runs itself, used to land on the opener's
 /// deque above children that had not run yet; the opener then met a foreign entry first,
@@ -418,7 +408,7 @@ fn work_submitted_inside_a_scope_does_not_strand_its_children() {
         };
         let runner = executor.clone();
         let mut outer = graph(vec![opener(), opener()], &[]);
-        must_finish("a scope whose body starts a graph", move || {
+        must_finish("a scope whose body starts a graph (the opener is stuck)", LIMIT, move || {
             for _ in 0..rounds {
                 outer = runner.block_on(runner.run_graph(outer)).unwrap();
             }
@@ -434,4 +424,36 @@ fn work_submitted_inside_a_scope_does_not_strand_its_children() {
         }
         executor.shutdown();
     }
+}
+
+/// Each child a scope forks wakes a sleeper for itself (`WorkerLocal::push`). A node released
+/// while every worker sleeps opens a scope of single children, which no split can spread, and
+/// the first child each worker runs waits until every worker is running one. The node wakes
+/// one sleeper, its opener; the others can only be woken by the forks.
+#[test]
+fn forked_children_reach_every_sleeping_worker() {
+    let workers = 3;
+    let executor = executor(workers, 1);
+    let rendezvous = Arc::new(Rendezvous::new(&executor));
+    let node = {
+        let rendezvous = rendezvous.clone();
+        Node::new("scope::wakes")
+            .run(move |_, ctx| {
+                let rendezvous = &rendezvous;
+                ctx.scope(|scope| {
+                    for _ in 0..workers {
+                        scope.fork(move |child| rendezvous.arrive(child.slot()));
+                    }
+                });
+            })
+            .build()
+    };
+    let_workers_sleep();
+    executor.block_on(executor.run_graph(graph(vec![node], &[]))).unwrap();
+    executor.shutdown();
+    assert!(
+        rendezvous.met(),
+        "only {} of {workers} workers ran a child: a fork woke no sleeping worker",
+        rendezvous.arrived()
+    );
 }

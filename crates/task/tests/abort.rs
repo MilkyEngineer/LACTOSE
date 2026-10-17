@@ -8,12 +8,14 @@
 
 mod common;
 
+use std::io::Read;
 use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use core::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use common::{Node, executor, graph, wait_for};
+use common::{LIMIT, Node, executor, graph, wait_for};
 use lactose_task::{ChaosConfig, Executor, WorkerClass};
 
 const CHILD_ENV: &str = "WHISK_ABORT_CASE";
@@ -32,24 +34,42 @@ fn aborts_saying(test: &str, case: &str, expected: &str) -> bool {
     if std::env::var_os(CHILD_ENV).is_some() {
         return false;
     }
-    let output = Command::new(std::env::current_exe().unwrap())
+    let mut child = Command::new(std::env::current_exe().unwrap())
         .args(["--exact", test, "--nocapture", "--test-threads", "1"])
         .env(CHILD_ENV, case)
         .stdin(Stdio::null())
-        .output()
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
         .unwrap();
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    let mut pipe = child.stderr.take().unwrap();
+    let reader = std::thread::spawn(move || {
+        let mut stderr = Vec::new();
+        let _ = pipe.read_to_end(&mut stderr);
+        stderr
+    });
+    // A panic that unwinds instead of aborting can leave the case waiting for ever on work
+    // that died with it: it fails here, and the child does not outlive the test.
+    let begun = Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if begun.elapsed() >= LIMIT {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("{case}: the process neither aborted nor exited in {LIMIT:?}");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let stderr = reader.join().unwrap();
+    let stderr = String::from_utf8_lossy(&stderr);
     assert!(stderr.contains(expected), "{case}: the case did not run:\n{stderr}");
-    assert!(!output.status.success(), "{case}: the process survived a panicking job");
+    assert!(!status.success(), "{case}: the process survived a panicking job");
     #[cfg(unix)]
     {
         use std::os::unix::process::ExitStatusExt;
-        assert_eq!(
-            output.status.signal(),
-            Some(6),
-            "{case}: expected SIGABRT, got {:?}",
-            output.status
-        );
+        assert_eq!(status.signal(), Some(6), "{case}: expected SIGABRT, got {status:?}");
     }
     false
 }
