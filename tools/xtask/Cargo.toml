@@ -1,6 +1,6 @@
 [package]
 name = "lactose-xtask"
-description = "CI driver: tier check, boundary checks, feature-tree comparison, the check of patched vendored crates and the SOUR mode runner."
+description = "CI driver: tier check, boundary checks, feature-tree comparison, the check of patched vendored crates, the SOUR mode runner and the machine-wide slot for heavy commands."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
