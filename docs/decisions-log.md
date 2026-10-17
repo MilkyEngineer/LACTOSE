@@ -2474,6 +2474,26 @@ checkpoint carries the physics snapshot** (§1, §2, §9.4, §10, §15.5, §16, 
   patched, at load 4-10, runs of 400 ms or more were 2 of 600 on four threads and 6 of 600 on
   one, and the D124 review's own binary gave 0 of 600 runs from 100 ms at load 5. They are not
   attributed.
+- Addendum (lane physics-api D124, 2026-10-18): implemented in physics-api (b5634dd, fix round
+  b07339b). `setup` keeps the backend's snapshot of its empty world and fails as that snapshot
+  fails. A sync whose log since its last pass despawns every body the solver held removes them
+  all in ascending key order, restores those bytes and runs the full diff; that log includes
+  the pending entries a restore carried, and on a stale cursor it is the log retained in the
+  epoch since the pass. A sync whose removals leave the solver empty restores the bytes and
+  sets `diff_all`. A `Spawned` entry, and the full diff, write back the handle row of a key the
+  bookkeeping holds. When the sync's cursor is stale (`set_tick`, a world restore without a
+  physics restore, a whole-world load, the 2^30 rebase), its reload test reads the log the
+  world retains in the epoch that began after its last pass, and a physics snapshot taken then
+  carries that log. So a client's re-join (`set_tick`, then the full frame) and a rollback to a
+  slot taken after `set_tick` get a fresh solver, and the full diff writes back the
+  `BodyHandle` and `JointHandle` of every body and joint it keeps. An unload made before
+  `set_tick` lies in the earlier epoch and is not seen: the supported order is `set_tick`, then
+  the full frame. A log trimmed past the cursor is read as far as it is retained. A world
+  restore or a whole-world load logs no despawns, so neither triggers the reload by itself; the
+  whole-world load must empty the solver itself when that API lands. Waiting joints are kept
+  and resolved by the full diff. `conformance::empty_restore` checks the backend obligation
+  that the empty world's bytes restore to a world that steps as a new one does. Open: commands
+  untaken at the save survive a one-frame reload (S1).
 - Replaced: section 2's and 9.4's "at full precision" without qualification; D122's "Full
   precision means canonical bytes per field, no tolerance" for the solver-written rows of a
   dynamic body, its "a tolerance for dynamic bodies is decided at milestone 4" and its

@@ -26,6 +26,10 @@ serde.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+# `physics-api`'s test support, which these tests include by path, loads regions from
+# bundles for the reload tests.
+lactose-asset-api.workspace = true
+lactose-bundle.workspace = true
 lactose-ecs.workspace = true
 lactose-reflect.workspace = true
 lactose-sim.workspace = true

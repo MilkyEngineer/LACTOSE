@@ -8,6 +8,10 @@
 
 pub mod fake;
 
+use std::sync::Arc;
+
+use lactose_asset_api::AssetSet;
+use lactose_bundle::{Baseline, ComponentSchema, FieldLayout, Overlay, Record};
 use lactose_core::{NetId, PlayerId, StableKey, Tick};
 use lactose_ecs::{
     ClaimedBy, Commands, Events, Executor, LayoutConfig, Mut, RegionConfig, RegionId, RegionMode,
@@ -21,7 +25,8 @@ use lactose_physics_api::{
 };
 use lactose_reflect::component;
 use lactose_sim::{
-    CurrentTick, Registration, Simulation, SimulationBuilder, Stage, TickInput, TypeTable,
+    CurrentTick, RegionBundle, Registration, Simulation, SimulationBuilder, Stage, TickInput,
+    TypeTable,
 };
 
 pub use fake::{Call, CallLog, Fake};
@@ -371,6 +376,14 @@ impl Harness {
         self.simulation.tick().0
     }
 
+    /// Runs one tick whose input sync point applies `input`: a frame's unloads and region
+    /// bundles, as `lactose-sim` applies them.
+    pub fn run_with(mut self, input: TickInput) -> Self {
+        self.simulation =
+            self.executor.block_on(self.simulation.step(&self.executor, input)).unwrap();
+        self
+    }
+
     /// Runs `ticks` ticks.
     pub fn run(mut self, ticks: u32) -> Self {
         for _ in 0..ticks {
@@ -422,6 +435,62 @@ pub fn rows(world: &World) -> Vec<Row> {
             )
         })
         .collect()
+}
+
+/// The bundle that loads `region` back as a save would: its export as an overlay of whole
+/// rows over an empty baseline, which `lactose-sim`'s frame hands to `World::load_region`
+/// (rows stamped at the current point and logged as spawned, no epoch). The rows' keys
+/// are cooked, so each is a `SpawnFromBaseline`.
+pub fn bundle(world: &World, region: RegionId) -> RegionBundle {
+    let export = world.export_region(region).unwrap();
+    let schemas: Vec<ComponentSchema> = world
+        .registry()
+        .iter()
+        .map(|info| {
+            let fields = info.layout().fields().iter().filter_map(|field| {
+                let (offset, size) = (field.offset(), field.size());
+                Some(FieldLayout {
+                    id: field.id()?,
+                    offset: u32::try_from(offset).unwrap(),
+                    size: u32::try_from(size).unwrap(),
+                })
+            });
+            let size = u32::try_from(info.layout().size()).unwrap();
+            ComponentSchema::new(info.key(), info.version(), size, fields).unwrap()
+        })
+        .collect();
+    let baseline = Baseline::from_rows(AssetSet::new(), schemas.clone(), []).unwrap();
+    let mut records = Vec::new();
+    for row in &export.rows {
+        assert!(row.transient.is_empty(), "the physics scenes hold no transient component");
+        records.push(Record::SpawnFromBaseline { id: row.id, components: row.components.clone() });
+        if row.owner.is_some() {
+            records.push(Record::OwnershipChange { id: row.id, owner: row.owner });
+        }
+    }
+    let overlay = Overlay::new(baseline.content_hash(), schemas, records).unwrap();
+    RegionBundle {
+        seed: export.seed,
+        mode: world.region_mode(region).unwrap(),
+        baseline: Arc::new(baseline),
+        overlay: Some(Arc::new(overlay)),
+        resources: export.resources,
+        transient_resources: export.transient_resources,
+        assets: None,
+    }
+}
+
+/// A frame that unloads `regions` and loads `bundles`: `lactose-sim`'s in-place reload
+/// when they name the same regions.
+pub fn frame(
+    regions: impl IntoIterator<Item = RegionId>,
+    bundles: impl IntoIterator<Item = (RegionId, RegionBundle)>,
+) -> TickInput {
+    TickInput {
+        unloaded: regions.into_iter().collect(),
+        loaded: bundles.into_iter().collect(),
+        ..TickInput::default()
+    }
 }
 
 /// The calls of `calls` other than steps.

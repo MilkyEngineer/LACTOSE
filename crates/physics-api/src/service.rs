@@ -18,7 +18,7 @@ use crate::components::{
     BodyHandle, Collider, Joint, JointHandle, RigidBody, Shape, Teleported, Transform, Velocity,
 };
 use crate::query::{QueryFilter, Ray, RayHit, ShapeHit};
-use crate::sync::{Changes, changed_since};
+use crate::sync::{Changes, changed_since, log_since_pass};
 
 /// What `app` decides for the physics world, handed to [`setup`].
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -52,6 +52,7 @@ impl Default for PhysicsConfig {
 /// is told from a rewrite of the same one.
 #[derive(Clone, Copy)]
 pub(crate) struct JointEntry {
+    pub(crate) handle: JointHandle,
     pub(crate) joint: Joint,
     pub(crate) body_a: StableKey,
     pub(crate) body_b: StableKey,
@@ -91,6 +92,7 @@ pub(crate) struct SyncState {
     pub(crate) written: Vec<(StableKey, Transform, Velocity)>,
     /// Structural log entries the sync has not processed: those a snapshot found after the
     /// cursor, carried across a restore and processed before the log since the restore.
+    /// When a full diff is due they are read only by its reload test (D124).
     pub(crate) pending_log: Vec<LogEntry>,
     /// Keys the next sync treats as changed whatever the stamps say, with the columns:
     /// those a snapshot found changed since the mark across the five columns, and those
@@ -100,9 +102,11 @@ pub(crate) struct SyncState {
     /// a snapshot found in the channel, not yet taken.
     pub(crate) pending_commands: Vec<PhysicsCommand>,
     /// Whether the next sync diffs every row against `bodies` and `joints` instead of
-    /// reading the log: set in a snapshot taken while the cursor or the mark was stale (a
-    /// world restore without a physics restore, a whole-world load, `set_tick`, the stamp
-    /// rebase). A stale cursor or mark at the sync itself has the same effect.
+    /// reading the log: set by a sync that emptied the solver, so the next one creates in
+    /// key order as a fresh process's first sync does, and in a snapshot taken while the
+    /// cursor or the mark was stale (a world restore without a physics restore, a
+    /// whole-world load, `set_tick`, the stamp rebase). A stale cursor or mark at the sync
+    /// itself has the same effect.
     pub(crate) diff_all: bool,
 }
 
@@ -142,11 +146,16 @@ pub struct Physics {
     pub(crate) commands: Vec<PhysicsCommand>,
     /// The step's lists, kept between ticks for their capacity; what the write-back writes.
     pub(crate) output: StepOutput,
+    /// The backend's bytes at [`setup`], before it held anything: what a solver the sync
+    /// empties is restored to, so that an empty solver is a fresh one (D124).
+    pub(crate) fresh: Vec<u8>,
 }
 
 impl Physics {
-    pub(crate) fn new(backend: Box<dyn PhysicsBackend>, config: PhysicsConfig) -> Self {
-        Self {
+    pub(crate) fn new(backend: Box<dyn PhysicsBackend>, config: PhysicsConfig) -> Result<Self> {
+        let mut fresh = Vec::new();
+        backend.snapshot(&mut fresh)?;
+        Ok(Self {
             backend,
             config,
             identity: Arc::new(()),
@@ -156,7 +165,8 @@ impl Physics {
             tick: Tick(0),
             commands: Vec::new(),
             output: StepOutput::default(),
-        }
+            fresh,
+        })
     }
 
     /// What `app` decided.
@@ -258,8 +268,10 @@ pub fn register_types(types: &mut TypeTable) -> Result<()> {
 /// Inserts the [`Physics`] resource holding `backend`, which `app` built with the solver
 /// pool outside the boundary, into `world`: the setup function of architecture section
 /// 16, called from a `SimulationBuilder::setup` closure beside
-/// [`register_systems`](crate::register_systems) in `SimulationBuilder::systems`. Fails
-/// with `InvalidData` if the world already holds one.
+/// [`register_systems`](crate::register_systems) in `SimulationBuilder::systems`. It
+/// keeps the backend's [`snapshot`](PhysicsBackend::snapshot) of its empty world, which
+/// the sync restores whenever it empties the solver (`README.md`, "Bodies"). Fails with
+/// `InvalidData` if the world already holds one, or as that snapshot does.
 pub fn setup(
     world: &mut World,
     backend: Box<dyn PhysicsBackend>,
@@ -268,7 +280,7 @@ pub fn setup(
     if world.service::<Physics>().is_some() {
         return Err(Error::new(ErrorKind::InvalidData, "the world already holds a `Physics`"));
     }
-    world.insert_service::<Physics>(Box::new(Physics::new(backend, config)));
+    world.insert_service::<Physics>(Box::new(Physics::new(backend, config)?));
     Ok(())
 }
 
@@ -319,8 +331,9 @@ impl PhysicsSnapshot {
 /// Copies the physics world of `world`'s [`Physics`] resource, between ticks, at the point
 /// `World::snapshot` is taken: the backend's bytes, and this crate's bookkeeping with what
 /// the next sync would see (the log since its cursor, the keys changed since its mark, the
-/// channel's untaken entries; or that a full diff is due, when the cursor or mark is
-/// stale). Fails with `NotFound` if the world holds no [`Physics`], or as the backend's
+/// channel's untaken entries; or that a full diff is due, with the log the world retains
+/// since the sync's last pass for its reload test, when the cursor or mark is stale).
+/// Fails with `NotFound` if the world holds no [`Physics`], or as the backend's
 /// [`snapshot`](PhysicsBackend::snapshot) does.
 pub fn snapshot(world: &World) -> Result<PhysicsSnapshot> {
     let physics = physics(world)?;
@@ -339,10 +352,16 @@ pub fn snapshot(world: &World) -> Result<PhysicsSnapshot> {
             changed_since(world, mark, &mut sync.pending_keys);
         }
         _ => {
-            // The next sync diffs every row, which covers whatever was pending.
+            // The next sync diffs every row, which covers whatever was pending; the log
+            // since its last pass is kept for its reload test alone, so a rollback to this
+            // point decides as the first run did.
             sync.diff_all = true;
-            sync.pending_log.clear();
             sync.pending_keys.clear();
+            if !sync.bodies.is_empty()
+                && let Some(entries) = log_since_pass(world, physics.cursor)
+            {
+                sync.pending_log.extend(entries.copied());
+            }
         }
     }
     sync.pending_commands
