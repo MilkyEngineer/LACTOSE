@@ -249,8 +249,8 @@ impl PhysicsBackend for Rapier {
     }
 
     fn step(&mut self, input: &StepInput<'_>, output: &mut StepOutput) {
-        // A step of zero length returns before the solver joins its deferred broad-phase
-        // work, which would leave the tree out of the world.
+        // Not a step: for a dt that is not positive Rapier runs no dynamics but still takes the
+        // writes applied below, and a non-finite dt or gravity would reach every moving body.
         if !input.dt.is_finite() || input.dt <= Scalar::ZERO || !input.gravity.is_finite() {
             tracing::warn!(target: CONTRACT_TARGET, tick = input.tick.0, "skipped step: not a valid dt or gravity");
             return;

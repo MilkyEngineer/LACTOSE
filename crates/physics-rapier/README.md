@@ -24,6 +24,24 @@ scheduling class is logged and the thread runs at its default priority).
 Rapier's parallel work runs on that pool and nowhere else. The pool's size changes no output:
 `tests/determinism.rs` and `tests/conformance.rs` compare one, two and four threads.
 
+The step never waits on work that needs a pool thread to be woken outside rayon's guarantee.
+Its waits are rayon's own, which run other work meanwhile and wake every thread they wait on,
+or the staged solver's spin on a batch another thread is already running. One of rayon's waits
+is for every thread of the pool: the narrow phase broadcasts to all of them when more than 64
+contact pairs update. So every thread must be free to run rayon work: the pool is the backend's
+alone, no job on it blocks outside rayon, and it is not built with `use_current_thread`.
+
+The pinned Rapier queued the broad phase's deferred tree optimisation as a detached job and
+blocked the stepping thread, a pool thread, on its result in a channel. rayon tries to wake a
+thread for a job a pool thread pushes to its own deque but does not guarantee it; it relies on
+the pushing thread to pop the job, which a thread blocked on a channel never does. So on a pool
+of two or more threads a step could hang, and did, in the review's probes, on two and four
+threads. The vendored copy runs that optimisation on the stepping thread where it was queued.
+A one-thread pool ran it later in the step, at the join, and nothing reads the tree in
+between, so the tree, every report and the snapshot bytes are unchanged (`vendor/README.md`).
+`tests/pool.rs` steps a small scene, under the broadcast threshold, with every other thread of
+the pool held.
+
 What the contract says is logged (refused values, unknown keys, dropped commands) goes to
 target `physics`; what only this backend logs (a refused scheduling class, a joint whose
 bodies are not in the solver) goes to target `quark`.
@@ -178,6 +196,12 @@ order.
   1.2 µs to restore. Of its bytes about 700 are the fixed Rapier body a collider without a
   `RigidBody` is attached to; attaching every such collider to one shared fixed body would
   save them. Rapier's own encoding of its sets is most of the bytes.
+- **The step's tail** (`tests/cost.rs` with `--release`, printed, not asserted; Apple M1,
+  load averages 4 to 10). The walk scene of `tests/support` (a capsule walking a square over
+  a floor and five blocks), 100 runs of 1,800 ticks per pool size, six rounds: the median run
+  took 16 to 50 ms on one thread and 21 to 42 ms on four, about 3 µs a step more on four.
+  Runs from 400 ms, 6 of 600 on one thread and 2 of 600 on four, came in bursts with the
+  machine's load; none hung.
 - A snapshot that decodes and passes the check but whose Rapier state is otherwise
   inconsistent (bytes not written by this backend) can make a later Rapier call panic.
 - `MultibodyJointSet::insert` and `insert_kinematic`, and `Multibody::inverse_kinematics` and

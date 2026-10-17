@@ -1015,7 +1015,13 @@ Rapier, pinned to an exact version together with its math and SIMD dependencies;
 protocol and replay break. The pinned `rapier3d-f64` is built from a patched copy under `vendor/`
 by the rule of section 8.2: the angular joint limit's `sin_cos` goes through `simba`'s
 `ComplexField`, which `libm_force` routes to `libm`, in place of the platform library's; the patch
-travels with every bump until upstream carries it. One physics world per server process and one per
+travels with every bump until upstream carries it.
+The vendored Rapier runs the broad phase's deferred tree optimisation on the stepping thread rather
+than as a detached job the stepping thread blocks on outside rayon. The step still uses every
+thread of the pool (the narrow phase broadcasts to all of them above 64 updating contact pairs), so
+the solver pool is the backend's alone: no job on it blocks outside rayon, and it is not built with
+`use_current_thread`.
+One physics world per server process and one per
 client prediction world. Rapier's determinism feature is used together with its parallel solver.
 The step is the one sanctioned blocking wait in `task`: a physics stage job calls into the solver's
 rayon pool, which is sized to the performance-core count minus the workers reserved for render

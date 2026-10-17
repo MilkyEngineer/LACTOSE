@@ -1,9 +1,11 @@
 //! What the snapshot and the step cost, printed and never asserted (`docs/verification.md`:
 //! the 100 µs physics snapshot budget for a prediction world, the 3 ms physics phase): the
 //! snapshot's size and the time to write and to restore it for 50 bodies beside 0 to 1,000
-//! fixed colliders, and the step of 2,000 awake bodies on one and four solver threads. Each
-//! time is the median of its repetitions; the machine's load is printed with them. Run it
-//! alone, with `--release`, on an idle machine for numbers that mean anything.
+//! fixed colliders, the step of 2,000 awake bodies on one and four solver threads, and the
+//! spread of whole runs of a small scene on one and four threads (the tail a step that waits
+//! on another pool thread would show). Each time is the median of its repetitions unless it
+//! says otherwise; the machine's load is printed with them. Run it alone, with `--release`, on
+//! an idle machine for numbers that mean anything.
 
 #![forbid(unsafe_code)]
 
@@ -103,5 +105,46 @@ fn the_step_of_two_thousand_awake_bodies_on_one_and_four_threads() {
             samples[0].as_micros()
         );
         assert!(awake >= 2_000, "every body is awake: {awake}");
+    }
+}
+
+/// Runs of [`Walk`] per pool size in the tail measurement, each on a fresh backend.
+const TAIL_RUNS: usize = 100;
+/// Ticks per run: thirty seconds at sixty hertz.
+const TAIL_TICKS: u32 = 1_800;
+
+#[test]
+fn the_tail_of_a_small_scene_on_one_and_four_threads() {
+    println!("{}", load());
+    for threads in [1, 4] {
+        let mut worst_step = Duration::ZERO;
+        let mut runs: Vec<Duration> = (0..TAIL_RUNS)
+            .map(|_| {
+                timed(|| {
+                    let mut b = backend(threads);
+                    Walk::create(&mut *b);
+                    let mut last = None;
+                    for tick in 1..=TAIL_TICKS {
+                        let commands = Walk::drive(&mut *b, tick, last);
+                        let mut output = None;
+                        worst_step =
+                            worst_step.max(timed(|| output = Some(step(&mut *b, tick, &commands))));
+                        last = output.and_then(|out| state(&out, key(WALKER))).map(|s| s.velocity);
+                    }
+                })
+            })
+            .collect();
+        runs.sort_unstable();
+        let from = |ms: u64| runs.iter().filter(|run| run.as_millis() >= u128::from(ms)).count();
+        println!(
+            "walk, {TAIL_RUNS} runs of {TAIL_TICKS} ticks, {threads} thread(s): median run {} ms, \
+             90th {} ms, worst {} ms; runs from 100 ms {}, from 400 ms {}; worst step {} µs",
+            runs[TAIL_RUNS / 2].as_millis(),
+            runs[TAIL_RUNS * 9 / 10].as_millis(),
+            runs[TAIL_RUNS - 1].as_millis(),
+            from(100),
+            from(400),
+            worst_step.as_micros(),
+        );
     }
 }

@@ -2300,6 +2300,10 @@ for every crate, checked by `cargo xtask vendor`** (§8.2, §8.3, §9.1, §16, �
   the upstream report.
 - Driven by: the `physics-rapier` lane (2026-10-10), its report's proposed rule and the review
   brief's vendored-patch item; the planner's and the reviewer's probes (2026-10-11).
+- Addendum (lane physics-rapier S5, 2026-10-18): the rapier3d-f64 patch carries a second
+  change, admitted as a defect blocking the milestone 1 physics criteria on pools above one
+  thread: the broad phase's deferred optimisation runs on the stepping thread (two files,
+  sixteen changed lines in all; D124's S5 addendum).
 - Replaced: nothing stated; the lane brief's "prefer the patch if it is under fifty lines,
   else refuse".
 - What the check's two reviews changed (round 1: 1 blocking, 4 serious, 4 minor; round 2:
@@ -2431,12 +2435,12 @@ checkpoint carries the physics snapshot** (§1, §2, §9.4, §10, §15.5, §16, 
   - *SOUR needs nothing.* Its modes vary threads, layout and schedule under one row
     history, which is where bit equality holds and what `tests/determinism.rs` shows; the
     sign-of-zero item and the snapshot-hash item stand as they are.
-  - *Risk, not this decision's:* on a four-thread pool a small scene stepped in 39 ms at
-    worst, most 1,800-tick runs took 20 to 100 ms and 41 of 300 took 0.4 to 4.4 s, against
-    19 to 30 ms on one thread (whose own worst run was 319 ms and worst step 14.5 ms), and
-    it once hung in Rapier's deferred broad-phase optimisation; the physics-rapier lane
-    carries the D123 patch, the prediction world's pool is one thread until it lands, and
-    the spike's server carries a step watchdog.
+  - *Risk, not this decision's:* on a four-thread pool a small scene stepped in 39 ms at worst,
+    most 1,800-tick runs took 20 to 100 ms and 41 of 300 took 0.4 to 4.4 s, against 19 to 30 ms
+    on one thread (whose own worst run was 319 ms and worst step 14.5 ms), and it once hung in
+    Rapier's deferred broad-phase optimisation; the D123 patch (second hunk) runs that pass on
+    the stepping thread, and `crates/physics-rapier/tests/pool.rs` steps a small scene, under
+    the narrow phase's 64-pair broadcast threshold, with every other pool thread held.
   - Named and deferred: the defaults re-set at milestone 1 (scalar) and 4 (spike); `net`'s
     claim policy; the snapshot's byte form, `services` and their size; the full diff's cost
     on a server-sized reload.
@@ -2445,6 +2449,31 @@ checkpoint carries the physics snapshot** (§1, §2, §9.4, §10, §15.5, §16, 
   far-awake and through-the-sync reload measurements and the candidate trigger; accepted by
   the owner with the defaults kept at 2e-3/2e-3/2e-2/2e-2 and the spike deciding any doubling
   (`docs/proposals/physics-history-reconciliation.md`, 2026-10-11).
+- Addendum (lane physics-rapier S5, 2026-10-18): S5 closed. The four-thread hang was Rapier's
+  deferred broad-phase optimisation. The stepping thread, a pool worker, queued it with
+  `rayon::spawn` and joined it later in the step with a blocking `mpsc::recv`, a wait outside
+  rayon. rayon tries to wake a thread for a job a pool thread pushes to its own deque but does
+  not guarantee it; it relies on the pushing thread to pop the job itself, which a thread
+  blocked in `recv` never does. The step hung with every other thread asleep and the job
+  stealable: once in the D124 review; in the S5 review's five-scene probe, in 4 of 9 unpatched
+  runs and in 4 of 12 unpatched processes of its walk scene on six two-thread pools in a row
+  (load 1.4-16; at load 33-41 the same probe did not hang in 9); and every time with every
+  other pool thread held (`crates/physics-rapier/tests/pool.rs`, which fails in 20 s
+  unpatched). A second D123 hunk runs the pass on the stepping thread. It is in
+  `BroadPhaseBvh::take_deferred_optimize`, because `solve.rs` holds `unsafe`. The patched build
+  hung in none of ten runs of the five-scene probe. Reports and snapshot bytes for thirteen
+  scenes on one, two and four threads equal the unpatched one-thread build's. The step never
+  waits on work that needs a pool thread to be woken outside rayon's guarantee. Its waits are
+  rayon's own, which run other work meanwhile and wake every thread they wait on, or the staged
+  solver's spin on a batch another thread is already running. It still uses every thread of the
+  pool, because the narrow phase broadcasts above 64 updating contact pairs. So the solver pool
+  must be the backend's alone: no job on it may block outside rayon, and it must not be built
+  with `use_current_thread`. On that condition the prediction world's pool need not stay at one
+  thread, and the spike's step watchdog is not needed for this hang. The D124 review's
+  four-thread tails (41 of 300 runs at 0.4-4.4 s) did not recur as a four-thread effect:
+  patched, at load 4-10, runs of 400 ms or more were 2 of 600 on four threads and 6 of 600 on
+  one, and the D124 review's own binary gave 0 of 600 runs from 100 ms at load 5. They are not
+  attributed.
 - Replaced: section 2's and 9.4's "at full precision" without qualification; D122's "Full
   precision means canonical bytes per field, no tolerance" for the solver-written rows of a
   dynamic body, its "a tolerance for dynamic bodies is decided at milestone 4" and its
