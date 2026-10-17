@@ -13,6 +13,7 @@ root `[workspace.dependencies]` entry does (`cargo vendor --versioned-dirs` into
 directory, with no `[patch]` entry), move `<name>-<version>/` here, apply the patch with
 `git apply`, mark every change with a `LACTOSE patch:` comment, point the `[patch.crates-io]`
 entry at it, regenerate `Cargo.lock`, write the section below and run `cargo xtask vendor`.
+If the archive carries no licence file, copy upstream's to `LICENSES/<name>-<licence>.txt`.
 A patch that no longer applies is rewritten and reviewed as new; a version that carries the
 change upstream drops the directory, the patch and the entry.
 
@@ -20,6 +21,9 @@ change upstream drops the directory, the patch and the entry.
 
 - Upstream: crates.io `rapier3d-f64` 0.36.0 (git `b716d375efc0201003f0cd9ef7168eee0b62c177`,
   path `crates/rapier3d-f64`); the archive's sha256 is `package` in `.cargo-checksum.json`.
+- Licence: Apache-2.0. The archive carries no licence file, so upstream's `LICENSE` at that commit
+  is `LICENSES/rapier3d-f64-Apache-2.0.txt` at the repository root; the patched files mark each
+  change.
 - Used by: `lactose-physics-rapier`, inside the determinism boundary.
 - Why: the angular joint limit (`AngularLimitParams::new`,
   `src/dynamics/solver/joint_constraint/joint_constraint_helper.rs`) took the sine and cosine

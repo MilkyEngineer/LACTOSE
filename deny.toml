@@ -26,10 +26,11 @@ ignore = []
 
 [licenses]
 version = 2
-# LACTOSE ships as a closed-source binary that statically links its dependencies. The list is
-# therefore the permissive licences only: each allows that, asking at most for attribution in
-# the shipped notices. Nothing copyleft is on it, weak copyleft included (MPL-2.0, LGPL), so
-# such a dependency is a decision somebody makes here, not something a `cargo add` brings in.
+# LACTOSE is MIT-licensed, but a game built on it may ship as a closed-source binary that
+# statically links its dependencies. The list is therefore the permissive licences only: each
+# allows that, asking at most for attribution in the shipped notices. Nothing copyleft is on
+# it, weak copyleft included (MPL-2.0, LGPL), so such a dependency is a decision somebody makes
+# here, not something a `cargo add` brings in.
 #
 #   MIT, Apache-2.0, BSD-2-Clause, BSD-3-Clause, ISC, Zlib, BSL-1.0: attribution only.
 #   Apache-2.0 WITH LLVM-exception: Apache-2.0 with the notice duty waived for compiled output.
