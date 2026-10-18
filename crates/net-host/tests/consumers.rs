@@ -594,7 +594,10 @@ fn the_loopback_keeps_the_transport_contract() {
     a.poll(&mut events);
     assert!(matches!(
         events.last(),
-        Some(TransportEvent::Disconnected { connection: ConnectionId(1), reason: DisconnectReason::Local })
+        Some(TransportEvent::Disconnected {
+            connection: ConnectionId(1),
+            reason: DisconnectReason::Local
+        })
     ));
     assert!(a.stats(ConnectionId(1)).is_none());
     events.clear();

@@ -24,8 +24,16 @@ lactose-reflect.workspace = true
 lactose-sim.workspace = true
 
 [dev-dependencies]
-# The compile-only sketches build staged frames with component bytes.
+# The replication model loads regions from cooked baselines through relevance messages.
+lactose-asset-api.workspace = true
+# The sketches and the replication model build staged frames with component bytes.
 lactose-bundle.workspace = true
+# The engine registry whose protocol hash is pinned: the input sample and the physics
+# components are covered types.
+lactose-input.workspace = true
+lactose-physics-api.workspace = true
+# The SOUR test builds its executor the way a SOUR test does (`ChaosConfig`).
+lactose-task.workspace = true
 
 [lints]
 workspace = true

@@ -267,8 +267,10 @@ impl ClientInterest {
         for (&key, entity) in &mut self.entities {
             let handle =
                 self.handles.assign(key).expect("no more entities than handles held before");
-            *entity =
-                EntityInterest { acked: Some(tick), ..EntityInterest::entered(handle, entity.claimed) };
+            *entity = EntityInterest {
+                acked: Some(tick),
+                ..EntityInterest::entered(handle, entity.claimed)
+            };
         }
     }
 

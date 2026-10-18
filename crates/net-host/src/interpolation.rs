@@ -390,8 +390,7 @@ impl InterpolationReader {
             return RemoteSample::MISSING;
         };
         let snapshot = held.read();
-        if slot.generation == 0 || snapshot.generation != slot.generation || snapshot.count == 0
-        {
+        if slot.generation == 0 || snapshot.generation != slot.generation || snapshot.count == 0 {
             return RemoteSample::MISSING;
         }
         let kept = &snapshot.states[..snapshot.count];
