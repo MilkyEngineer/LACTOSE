@@ -10,6 +10,7 @@ use std::collections::{BTreeMap, VecDeque, btree_map};
 
 use bytemuck::{Pod, Zeroable};
 use lactose_core::{Error, ErrorKind, Result, StableKey, Tick};
+use lactose_net_api::Tombstone;
 
 /// An entity as one connection names it on the wire: a sixteen-bit slot index and the
 /// generation the slot was assigned at, so a slot reused after release is told apart
@@ -250,8 +251,12 @@ impl PacketSequence {
 
 /// Which packets the sender of a header has received: the newest sequence, and one bit
 /// for each of the [`WINDOW`](Self::WINDOW) sequences before it, bit `n` meaning
-/// `latest - (n + 1)` was received.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
+/// `latest - (n + 1)` was received. A field always acknowledges its `latest`, so a peer
+/// that has received nothing sends none ([`TickHeader::ack`] is `None`). Since sequences
+/// wrap, the bits must come from the sequences received within the window behind
+/// `latest` alone, never from a set that remembers an earlier lap;
+/// [`received`](Self::received) builds the field that way.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct AckField {
     /// The newest sequence received.
     pub latest: PacketSequence,
@@ -272,6 +277,29 @@ impl AckField {
         let behind = self.latest.distance_after(sequence);
         behind != 0 && behind <= Self::WINDOW && self.bits & (1 << (behind - 1)) != 0
     }
+
+    /// The field of a peer whose field was `field` once `sequence` arrives. A sequence
+    /// after `latest` becomes `latest`, the bits shifting by the distance with the old
+    /// `latest` set among them; one within the window behind sets its bit; any other
+    /// (a duplicate of `latest`, or older than the window) leaves the field as it was.
+    #[must_use]
+    pub const fn received(field: Option<Self>, sequence: PacketSequence) -> Self {
+        let Some(field) = field else { return Self { latest: sequence, bits: 0 } };
+        if sequence.after(field.latest) {
+            let ahead = sequence.0.wrapping_sub(field.latest.0);
+            let bits = match ahead {
+                1..Self::WINDOW => field.bits << ahead | 1 << (ahead - 1),
+                Self::WINDOW => 1 << (ahead - 1),
+                _ => 0,
+            };
+            return Self { latest: sequence, bits };
+        }
+        let behind = field.latest.distance_after(sequence);
+        if behind != 0 && behind <= Self::WINDOW {
+            return Self { latest: field.latest, bits: field.bits | (1 << (behind - 1)) };
+        }
+        field
+    }
 }
 
 /// What every packet begins with, in both directions.
@@ -282,8 +310,9 @@ pub struct TickHeader {
     /// The sender's tick when it was built: on the server, the tick its rows are no newer
     /// than; on the client, the newest input tick it carries.
     pub tick: Tick,
-    /// What the sender has received from the peer.
-    pub ack: AckField,
+    /// What the sender has received from the peer, or `None` before it has received
+    /// anything.
+    pub ack: Option<AckField>,
 }
 
 /// What one sent packet carried, so an acknowledgement advances exactly those entities'
@@ -296,8 +325,9 @@ pub struct PacketRecord {
     pub tick: Tick,
     /// Each entity the packet carried state for, with the tick of that state.
     pub entities: Vec<(EntityHandle, Tick)>,
-    /// Each tombstone the packet carried, with the tick it names.
-    pub tombstones: Vec<(EntityHandle, Tick)>,
+    /// Each tombstone the packet carried: an acknowledgement releases the handle only if
+    /// it is the tombstone still owed.
+    pub tombstones: Vec<(EntityHandle, Tombstone)>,
 }
 
 /// The ring of the last sent packets' records for one connection (architecture section

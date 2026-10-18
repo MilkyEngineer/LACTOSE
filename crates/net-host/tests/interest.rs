@@ -10,8 +10,12 @@
 use std::num::NonZeroU64;
 
 use lactose_core::{NetId, PlayerId, StableKey, Tick};
+use lactose_ecs::RegionId;
+use lactose_net_api::{Tombstone, TombstoneCause};
 use lactose_net_host::interest::{ClientInterest, Priority, SendBudget};
-use lactose_net_host::packet::{AckField, EntityHandle, PacketRecord, PacketRing, PacketSequence};
+use lactose_net_host::packet::{
+    AckField, EntityHandle, PacketRecord, PacketRing, PacketSequence, TickHeader,
+};
 use lactose_net_host::transport::ConnectionId;
 
 fn key(n: u64) -> StableKey {
@@ -48,6 +52,14 @@ fn tombstones(client: &ClientInterest, sequence: u16, tick: u32, keys: &[u64]) -
             })
             .collect(),
     }
+}
+
+fn left(tick: u32) -> Tombstone {
+    Tombstone { region: RegionId(1), tick: Tick(tick), cause: TombstoneCause::Left }
+}
+
+fn destroyed(tick: u32) -> Tombstone {
+    Tombstone { region: RegionId(1), tick: Tick(tick), cause: TombstoneCause::Destroyed }
 }
 
 fn only(sequence: u16) -> AckField {
@@ -169,12 +181,14 @@ fn an_acknowledged_tombstone_releases_the_handle() {
     let handle = client.enter(key(1)).unwrap();
     client.enter(key(2)).unwrap();
     client.sent(carrying(&client, 0, 1, &[1]));
-    client.leave(key(1), Tick(4));
+    client.leave(key(1), destroyed(4));
     let entity = client.entities[&key(1)];
-    assert_eq!((entity.tombstone, entity.in_flight), (Some(Tick(4)), None));
-    client.leave(key(1), Tick(9));
-    assert_eq!(client.entities[&key(1)].tombstone, Some(Tick(4)), "the first tombstone stays");
-    client.leave(key(77), Tick(4));
+    assert_eq!((entity.tombstone, entity.in_flight), (Some(destroyed(4)), None));
+    client.leave(key(1), destroyed(9));
+    assert_eq!(client.entities[&key(1)].tombstone, Some(destroyed(4)), "the first one stays");
+    client.leave(key(1), left(9));
+    assert_eq!(client.entities[&key(1)].tombstone, Some(destroyed(4)), "the first one stays");
+    client.leave(key(77), destroyed(4));
     assert!(!client.entities.contains_key(&key(77)), "not relevant: ignored");
 
     // A state of the entity acknowledged after it left does not count as the tombstone.
@@ -197,12 +211,12 @@ fn an_entity_relevant_again_reenters_once_its_tombstone_is_acknowledged() {
     client.set_claimed(key(1), true);
     client.sent(carrying(&client, 0, 1, &[1]));
     client.acknowledge(only(0));
-    client.leave(key(1), Tick(3));
+    client.leave(key(1), left(3));
     assert_eq!(client.enter(key(1)).unwrap(), old, "the old handle until the tombstone");
     assert!(client.entities[&key(1)].reentering);
     client.sent(tombstones(&client, 1, 3, &[1]));
     // Leaving again while the tombstone is owed: forgotten after all.
-    client.leave(key(1), Tick(4));
+    client.leave(key(1), left(4));
     assert!(!client.entities[&key(1)].reentering);
     client.enter(key(1)).unwrap();
     client.acknowledge(only(1));
@@ -212,6 +226,46 @@ fn an_entity_relevant_again_reenters_once_its_tombstone_is_acknowledged() {
     assert_eq!(client.handles.key_of(entity.handle), Some(key(1)));
     assert_eq!((entity.acked, entity.tombstone, entity.reentering), (None, None, false));
     assert!(entity.claimed, "the claim is kept");
+}
+
+/// Review r1, S1: a field always acknowledges its `latest`, so a header built before
+/// anything was received carries none, and the first packet stays unacknowledged.
+#[test]
+fn a_header_built_before_anything_was_received_acknowledges_nothing() {
+    let header = TickHeader { sequence: PacketSequence(0), tick: Tick(1), ack: None };
+    assert_eq!(TickHeader::default().ack, None);
+    let mut client = client();
+    client.enter(key(1)).unwrap();
+    client.sent(carrying(&client, 0, 5, &[1]));
+    if let Some(ack) = header.ack {
+        client.acknowledge(ack);
+    }
+    let entity = client.entities[&key(1)];
+    assert_eq!((entity.acked, entity.in_flight), (None, Some(PacketSequence(0))));
+}
+
+/// Review r1, B2: an entity that left the client's set alive and is destroyed before
+/// the Left tombstone is acknowledged owes a Destroyed one instead, since a client whose
+/// region was loaded again keeps an entity for a Left tombstone. The acknowledgement of
+/// the packet that carried the Left one no longer releases the handle.
+#[test]
+fn a_destruction_replaces_an_owed_left_tombstone() {
+    let mut client = client();
+    let handle = client.enter(key(1)).unwrap();
+    client.sent(carrying(&client, 0, 1, &[1]));
+    client.acknowledge(only(0));
+    client.leave(key(1), left(2));
+    client.sent(tombstones(&client, 1, 2, &[1]));
+    assert!(client.entities[&key(1)].in_flight.is_some());
+    client.leave(key(1), destroyed(3));
+    let entity = client.entities[&key(1)];
+    assert_eq!((entity.tombstone, entity.in_flight), (Some(destroyed(3)), None));
+    client.acknowledge(only(1));
+    assert!(client.entities.contains_key(&key(1)), "the Left tombstone is no longer owed");
+    client.sent(tombstones(&client, 2, 3, &[1]));
+    client.acknowledge(only(2));
+    assert!(!client.entities.contains_key(&key(1)));
+    assert_eq!(client.handles.key_of(handle), None);
 }
 
 #[test]
@@ -242,8 +296,8 @@ fn a_resync_clears_and_refills_the_handles() {
     client.set_claimed(key(2), true);
     client.sent(carrying(&client, 0, 1, &[1, 2, 3, 4, 5]));
     client.acknowledge(only(0));
-    client.leave(key(3), Tick(2));
-    client.leave(key(4), Tick(2));
+    client.leave(key(3), destroyed(2));
+    client.leave(key(4), left(2));
     client.enter(key(4)).unwrap();
     client.handles.release(client.entities[&key(5)].handle);
     client.handles.assign(key(5)).unwrap();

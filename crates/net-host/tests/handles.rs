@@ -10,6 +10,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroU64;
 
 use lactose_core::{ErrorKind, NetId, PlayerId, StableKey, Tick};
+use lactose_ecs::RegionId;
+use lactose_net_api::{Tombstone, TombstoneCause};
 use lactose_net_host::interest::{ClientInterest, SendBudget};
 use lactose_net_host::packet::{
     AckField, ConnectionHandles, EntityHandle, PacketRecord, PacketRing, PacketSequence,
@@ -165,6 +167,60 @@ fn sequences_and_acknowledgements_compare_across_the_wrap() {
     assert_eq!(covered, [2, 3, 65_507, 65_535]);
 }
 
+#[test]
+fn a_field_is_built_one_arrival_at_a_time() {
+    let first = AckField::received(None, PacketSequence(65_534));
+    assert_eq!(first, AckField { latest: PacketSequence(65_534), bits: 0 });
+    // Across the wrap: 65534 is three behind 1.
+    let field = AckField::received(Some(first), PacketSequence(1));
+    assert_eq!(field, AckField { latest: PacketSequence(1), bits: 1 << 2 });
+    let field = AckField::received(Some(field), PacketSequence(0));
+    assert_eq!(field.bits, 1 | 1 << 2, "within the window behind: its bit");
+    assert_eq!(AckField::received(Some(field), PacketSequence(1)), field, "a duplicate");
+    let old = PacketSequence(1_u16.wrapping_sub(AckField::WINDOW + 1));
+    assert_eq!(AckField::received(Some(field), old), field, "older than the window");
+    // Exactly the window ahead keeps only the old latest, in the top bit.
+    let ahead = PacketSequence(1 + AckField::WINDOW);
+    assert_eq!(AckField::received(Some(field), ahead).bits, 1 << 31);
+    let beyond = PacketSequence(2 + AckField::WINDOW);
+    assert_eq!(AckField::received(Some(field), beyond).bits, 0);
+}
+
+/// Review r1, M8: a field built from a set of every sequence ever received claims, after
+/// a lap, sequences of the earlier lap. Arrivals over three laps, reordered and lossy,
+/// against the field computed from absolute packet numbers.
+#[test]
+fn a_field_built_across_laps_names_only_packets_of_this_lap() {
+    let mut rng = Rng(0x5EED);
+    let mut pending: Vec<u64> = Vec::new();
+    let mut arrived: BTreeSet<u64> = BTreeSet::new();
+    let mut field = None;
+    let mut checked = 0_u32;
+    for absolute in 0..3 * 65_536_u64 {
+        if !rng.chance(10) {
+            pending.push(absolute);
+        }
+        while pending.len() > 8 || (!pending.is_empty() && rng.chance(60)) {
+            let index = usize::try_from(rng.below(pending.len() as u64)).expect("small");
+            let arrival = pending.swap_remove(index);
+            arrived.insert(arrival);
+            let wire = PacketSequence(u16::try_from(arrival % 65_536).expect("in range"));
+            field = Some(AckField::received(field, wire));
+        }
+        if absolute % 97 != 0 {
+            continue;
+        }
+        let (Some(field), Some(&newest)) = (field, arrived.last()) else { continue };
+        assert_eq!(u64::from(field.latest.0), newest % 65_536);
+        for n in 0..u64::from(AckField::WINDOW) {
+            let expected = newest > n && arrived.contains(&(newest - n - 1));
+            assert_eq!(field.bits & 1 << n != 0, expected, "{newest} bit {n}");
+        }
+        checked += 1;
+    }
+    assert!(checked > 2_000, "{checked}");
+}
+
 fn record(sequence: u16) -> PacketRecord {
     PacketRecord {
         sequence: PacketSequence(sequence),
@@ -241,8 +297,7 @@ struct Packet {
 struct Receiver {
     mirror: ConnectionHandles,
     staged: Option<Tick>,
-    received: BTreeSet<u16>,
-    latest: Option<PacketSequence>,
+    ack: Option<AckField>,
     awaiting_full: bool,
     dropped: u32,
     unknown_tombstones: u32,
@@ -264,10 +319,7 @@ impl Receiver {
             }
         }
         self.staged = Some(packet.tick);
-        self.received.insert(packet.sequence.0);
-        if self.latest.is_none_or(|latest| packet.sequence.after(latest)) {
-            self.latest = Some(packet.sequence);
-        }
+        self.ack = Some(AckField::received(self.ack, packet.sequence));
     }
 
     fn full(&mut self, tick: Tick, spawns: &[(EntityHandle, StableKey)]) {
@@ -281,15 +333,7 @@ impl Receiver {
     }
 
     fn ack(&self) -> Option<AckField> {
-        let latest = self.latest?;
-        let mut bits = 0;
-        for n in 0..u32::from(AckField::WINDOW) {
-            let sequence = latest.0.wrapping_sub(u16::try_from(n + 1).expect("small"));
-            if self.received.contains(&sequence) {
-                bits |= 1 << n;
-            }
-        }
-        Some(AckField { latest, bits })
+        self.ack
     }
 }
 
@@ -300,9 +344,9 @@ fn pack(client: &mut ClientInterest, sequence: PacketSequence, tick: Tick) -> Pa
     let mut record = PacketRecord { sequence, tick, ..PacketRecord::default() };
     for (&key, entity) in &client.entities {
         match entity.tombstone {
-            Some(at) => {
+            Some(tombstone) => {
                 packet.tombstones.push(entity.handle);
-                record.tombstones.push((entity.handle, at));
+                record.tombstones.push((entity.handle, tombstone));
             }
             None if entity.sends_whole() => {
                 packet.spawns.push((entity.handle, key));
@@ -368,7 +412,9 @@ fn the_mirror_ends_equal_to_the_server_table_under_loss_and_reorder() {
                         interest.tombstone.is_none() || interest.reentering
                     });
                     if relevant {
-                        server.leave(entity, tick);
+                        let tombstone =
+                            Tombstone { region: RegionId(1), tick, cause: TombstoneCause::Left };
+                        server.leave(entity, tombstone);
                         stats.0 += 1;
                     } else {
                         server.enter(entity).unwrap();

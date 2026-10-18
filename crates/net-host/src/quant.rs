@@ -91,7 +91,7 @@ impl QuantisedRotation {
     /// quaternion or one with a NaN or infinite component quantises to the all-zero
     /// value; nothing else does, since the largest component of a unit quaternion is at
     /// least one half. Rotations do not round-trip exactly (see the crate README for the
-    /// measured rate), and the value is stable after one trip.
+    /// measured rates).
     #[must_use]
     pub fn quantise(rotation: Quat) -> Self {
         if !rotation.is_finite() {

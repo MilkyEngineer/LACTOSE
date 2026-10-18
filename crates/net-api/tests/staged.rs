@@ -14,7 +14,9 @@ use common::*;
 use lactose_bundle::BaselineRow;
 use lactose_core::{EntityRef, ErrorKind, NetId, PlayerId, PredictionKey, StableKey, Tick};
 use lactose_ecs::{OwnedBy, RegionConfig, RegionMode, StructuralChange};
-use lactose_net_api::{RegionChange, RemoteSlot, StagedFrame, StagedInbox, StagedSpawn, Tombstone};
+use lactose_net_api::{
+    RegionChange, RemoteSlot, StagedFrame, StagedInbox, StagedSpawn, Tombstone, TombstoneCause,
+};
 use lactose_reflect::Reflect;
 use lactose_sim::{Simulation, TickInput, TimeScale};
 
@@ -127,7 +129,10 @@ fn is_empty_is_exact() {
     frame.removed.insert((key(1), Health::KEY));
     each.push(frame);
     let mut frame = StagedFrame::new(Tick(1));
-    frame.despawns.insert(key(1), Tombstone { region: REGION, tick: Tick(1) });
+    frame.despawns.insert(
+        key(1),
+        Tombstone { region: REGION, tick: Tick(1), cause: TombstoneCause::Destroyed },
+    );
     each.push(frame);
     let mut frame = StagedFrame::new(Tick(1));
     assert!(frame.push_row(key(1), Health::KEY, Tick(1), false, bytes(&Health(1))));
@@ -441,8 +446,14 @@ fn rows_are_written_tombstones_despawn_and_an_equal_row_keeps_its_stamp() {
     assert!(frame.push_row(key(2), Health::KEY, Tick(12), false, bytes(&Health(2))));
     // A row for an entity that does not exist (its spawn was lost): nothing.
     assert!(frame.push_row(key(8), Health::KEY, Tick(12), false, bytes(&Health(8))));
-    frame.despawns.insert(key(3), Tombstone { region: OTHER_REGION, tick: Tick(12) });
-    frame.despawns.insert(key(9), Tombstone { region: OTHER_REGION, tick: Tick(12) });
+    frame.despawns.insert(
+        key(3),
+        Tombstone { region: OTHER_REGION, tick: Tick(12), cause: TombstoneCause::Destroyed },
+    );
+    frame.despawns.insert(
+        key(9),
+        Tombstone { region: OTHER_REGION, tick: Tick(12), cause: TombstoneCause::Destroyed },
+    );
     let simulation = apply(simulation, frame);
     let world = simulation.world();
     assert_eq!(world.get::<Position>(key(1)), Some(&Position { x: 4, y: 4 }));
@@ -454,6 +465,33 @@ fn rows_are_written_tombstones_despawn_and_an_equal_row_keeps_its_stamp() {
     let changed: Vec<StableKey> =
         world.changed_since::<Health>(mark).expect("current").map(|(key, _)| key).collect();
     assert_eq!(changed, vec![]);
+    assert!(skipped_of(&skipped).is_empty());
+}
+
+/// A `Left` tombstone is skipped only for an entity residing in the region it names while
+/// that region is loaded (the region's own unload or reload settles it); one of an entity
+/// residing elsewhere, and every `Destroyed` one, despawns.
+#[test]
+fn a_left_tombstone_is_skipped_only_for_an_entity_its_loaded_region_holds() {
+    let (mut simulation, skipped) = client_with_regions();
+    let world = simulation.world_mut();
+    for (n, region) in [(1, REGION), (2, REGION), (3, OTHER_REGION), (4, REGION), (5, REGION)] {
+        world.spawn(key(n), region, (Position { x: 0, y: 0 },)).expect("spawn");
+    }
+    let tombstone = |region, cause| Tombstone { region, tick: Tick(11), cause };
+    let mut frame = StagedFrame::new(Tick(11));
+    // Loaded where the server has it: skipped.
+    frame.despawns.insert(key(1), tombstone(REGION, TombstoneCause::Left));
+    // Moved on the server into a region the client does not hold.
+    frame.despawns.insert(key(2), tombstone(THIRD_REGION, TombstoneCause::Left));
+    frame.despawns.insert(key(3), tombstone(OTHER_REGION, TombstoneCause::Destroyed));
+    // In another region than the one the tombstone names (a move the client never got).
+    frame.despawns.insert(key(4), tombstone(OTHER_REGION, TombstoneCause::Left));
+    frame.despawns.insert(key(5), tombstone(REGION, TombstoneCause::Destroyed));
+    let simulation = apply(simulation, frame);
+    let world = simulation.world();
+    let live: Vec<bool> = (1..=5).map(|n| world.contains(key(n))).collect();
+    assert_eq!(live, [true, false, false, false, false]);
     assert!(skipped_of(&skipped).is_empty());
 }
 
@@ -477,7 +515,10 @@ fn a_failing_entry_is_skipped_and_the_rest_of_the_frame_applies() {
         false,
         bytes(&Position { x: 2, y: 2 })
     ));
-    frame.despawns.insert(key(1), Tombstone { region: REGION, tick: Tick(11) });
+    frame.despawns.insert(
+        key(1),
+        Tombstone { region: REGION, tick: Tick(11), cause: TombstoneCause::Destroyed },
+    );
     let simulation = apply(simulation, frame);
     let world = simulation.world();
     assert!(!world.contains(key(5)));

@@ -10,6 +10,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use lactose_core::{PlayerId, Result, StableKey, Tick};
 use lactose_ecs::RegionId;
+use lactose_net_api::{Tombstone, TombstoneCause};
 
 use crate::packet::{
     AckField, ConnectionHandles, EntityHandle, PacketRecord, PacketRing, PacketSequence,
@@ -63,9 +64,9 @@ pub struct EntityInterest {
     /// The packet its newest state went out in and is not yet acknowledged, if any; a
     /// loss of that packet clears it so the entity is sent again.
     pub in_flight: Option<PacketSequence>,
-    /// The tick the entity was destroyed at, once a tombstone is owed; cleared, and the
-    /// entity forgotten, once the tombstone is acknowledged.
-    pub tombstone: Option<Tick>,
+    /// The tombstone owed, once the entity was destroyed or left the client's set; the
+    /// entity is forgotten (or re-enters) once it is acknowledged.
+    pub tombstone: Option<Tombstone>,
     /// Whether the receiving player has claimed the entity, as
     /// [`ClientInterest::set_claimed`] last said.
     pub claimed: bool,
@@ -175,16 +176,25 @@ impl ClientInterest {
         Ok(handle)
     }
 
-    /// Owes the client a tombstone for `key`, destroyed at `tick` or leaving the client's
-    /// set at `tick`; the handle is released once the tombstone is acknowledged. Clears
-    /// `in_flight`, so the tombstone goes out with the next packet. A key that is not
-    /// relevant is ignored; one whose tombstone is already owed keeps that tombstone and
-    /// stops [`reentering`](EntityInterest::reentering).
-    pub fn leave(&mut self, key: StableKey, tick: Tick) {
+    /// Owes the client `tombstone` for `key`: the entity was destroyed, or left the
+    /// client's set alive in `tombstone.region`; the handle is released once the
+    /// tombstone is acknowledged. Clears `in_flight`, so the tombstone goes out with the
+    /// next packet. A key that is not relevant is ignored. One whose tombstone is already
+    /// owed stops [`reentering`](EntityInterest::reentering) and keeps that tombstone,
+    /// unless it owes a [`Left`](TombstoneCause::Left) one and `tombstone` is
+    /// [`Destroyed`](TombstoneCause::Destroyed), which replaces it: a client that has not
+    /// staged the first despawns the entity even where its region was loaded again.
+    pub fn leave(&mut self, key: StableKey, tombstone: Tombstone) {
         let Some(entity) = self.entities.get_mut(&key) else { return };
         entity.reentering = false;
-        if entity.tombstone.is_none() {
-            entity.tombstone = Some(tick);
+        let replaces = match entity.tombstone {
+            None => true,
+            Some(owed) => {
+                owed.cause == TombstoneCause::Left && tombstone.cause == TombstoneCause::Destroyed
+            }
+        };
+        if replaces {
+            entity.tombstone = Some(tombstone);
             entity.in_flight = None;
         }
     }
@@ -219,7 +229,8 @@ impl ClientInterest {
     /// ring. When the ring is full its oldest record is evicted and treated as lost, as
     /// an expired one is.
     pub fn sent(&mut self, record: PacketRecord) {
-        for &(handle, _) in record.entities.iter().chain(&record.tombstones) {
+        let handles = record.entities.iter().map(|&(handle, _)| handle);
+        for handle in handles.chain(record.tombstones.iter().map(|&(handle, _)| handle)) {
             if let Some(entity) =
                 self.handles.key_of(handle).and_then(|key| self.entities.get_mut(&key))
             {
@@ -288,10 +299,10 @@ impl ClientInterest {
                 entity.in_flight = None;
             }
         }
-        for &(handle, tick) in &record.tombstones {
+        for &(handle, tombstone) in &record.tombstones {
             let Some(key) = self.handles.key_of(handle) else { continue };
             let Some(entity) = self.entities.get_mut(&key) else { continue };
-            if entity.tombstone != Some(tick) {
+            if entity.tombstone != Some(tombstone) {
                 continue;
             }
             self.handles.release(handle);
@@ -305,7 +316,8 @@ impl ClientInterest {
     }
 
     fn lost(&mut self, record: &PacketRecord) {
-        for &(handle, _) in record.entities.iter().chain(&record.tombstones) {
+        let handles = record.entities.iter().map(|&(handle, _)| handle);
+        for handle in handles.chain(record.tombstones.iter().map(|&(handle, _)| handle)) {
             if let Some(entity) =
                 self.handles.key_of(handle).and_then(|key| self.entities.get_mut(&key))
                 && entity.in_flight == Some(record.sequence)

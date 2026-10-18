@@ -16,7 +16,7 @@ use lactose_bundle::Baseline;
 use lactose_core::{PlayerId, StableKey, Tick};
 use lactose_ecs::{RegionId, RegionMode};
 use lactose_math::{Scalar, Vec3};
-use lactose_net_api::{StagedFrame, Tombstone};
+use lactose_net_api::{StagedFrame, Tombstone, TombstoneCause};
 use lactose_physics_api::{Transform, Velocity};
 use lactose_predict::{Absorbed, CorrectionCause, Divergence};
 use lactose_reflect::Reflect;
@@ -198,7 +198,10 @@ fn a_claimed_entitys_move_into_a_region_its_frame_loads_is_applied() {
 #[test]
 fn a_swap_in_one_frame_destroys_the_old_entity_and_keeps_the_new() {
     let mut frame = claim_into_new(new_cart());
-    frame.despawns.insert(cart(), Tombstone { region: REGION, tick: Tick(15) });
+    frame.despawns.insert(
+        cart(),
+        Tombstone { region: REGION, tick: Tick(15), cause: TombstoneCause::Destroyed },
+    );
     let (mut rig, _) = loaded_at_21(frame);
     assert!(!rig.world().contains(cart()));
     assert_eq!(live_at(&rig, key(4)), Some((NEW, at(5, 5))));
@@ -213,7 +216,10 @@ fn a_claimed_spawn_destroyed_before_the_load_is_destroyed() {
     // The tombstone for 17, popped at 22: slot 17 lacks the entity, so it follows the
     // spawn to 21 and replaces it.
     let mut frame = StagedFrame::new(Tick(17));
-    frame.despawns.insert(key(4), Tombstone { region: NEW, tick: Tick(17) });
+    frame.despawns.insert(
+        key(4),
+        Tombstone { region: NEW, tick: Tick(17), cause: TombstoneCause::Destroyed },
+    );
     rig.push(frame);
     step(&mut rig, false);
     let reconciled = rig.reconcile();
@@ -502,7 +508,10 @@ fn a_claimed_spawn_naming_a_region_neither_slot_holds_after_a_kept_tombstone_is_
     step(&mut rig, true);
     let _ = rig.reconcile();
     let mut frame = StagedFrame::new(Tick(17));
-    frame.despawns.insert(cart(), Tombstone { region: NEW, tick: Tick(17) });
+    frame.despawns.insert(
+        cart(),
+        Tombstone { region: NEW, tick: Tick(17), cause: TombstoneCause::Destroyed },
+    );
     rig.push(frame);
     step(&mut rig, false);
     let _ = rig.reconcile();
@@ -558,7 +567,10 @@ fn kept_at_two_ticks_then(last: StagedFrame) -> Rig {
 #[test]
 fn a_tombstone_that_follows_facts_kept_at_two_ticks_ends_absent() {
     let mut frame = StagedFrame::new(Tick(18));
-    frame.despawns.insert(key(4), Tombstone { region: NEW2, tick: Tick(18) });
+    frame.despawns.insert(
+        key(4),
+        Tombstone { region: NEW2, tick: Tick(18), cause: TombstoneCause::Destroyed },
+    );
     let rig = kept_at_two_ticks_then(frame);
     assert!(!rig.world().contains(key(4)));
 }

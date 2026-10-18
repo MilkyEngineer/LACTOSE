@@ -22,7 +22,7 @@ use lactose_ecs::{
 use lactose_math::{Quat, Scalar, Vec3};
 use lactose_net_api::{
     GatherState, InterpolationSlot, OverlayPayload, RegionChange, RegionRelevance, RemoteSlot,
-    StagedFrame, StagedInbox, StagedSpawn, StagingFrame, Tombstone,
+    StagedFrame, StagedInbox, StagedSpawn, StagingFrame, Tombstone, TombstoneCause,
 };
 use lactose_net_host::InterpolationBuffer;
 use lactose_net_host::interest::{ClientInterest, SendBudget};
@@ -128,7 +128,7 @@ pub fn data<T: Reflect>(value: T) -> ComponentData {
     ComponentData { component: T::KEY, bytes: lactose_reflect::bytemuck::bytes_of(&value).to_vec() }
 }
 
-fn schemas(registry: &Registry) -> Vec<ComponentSchema> {
+pub fn schemas(registry: &Registry) -> Vec<ComponentSchema> {
     registry
         .iter()
         .map(|info| {
@@ -145,13 +145,32 @@ fn schemas(registry: &Registry) -> Vec<ComponentSchema> {
         .collect()
 }
 
-/// The cooked baseline every region shares: empty, so every entity a client holds came
-/// from a spawn.
+/// The cooked baseline every region shares unless a test cooks one: empty, so every
+/// entity a client holds in it came from a spawn.
 pub fn empty_baseline() -> Arc<Baseline> {
     Arc::new(
         Baseline::from_rows(AssetSet::new(), schemas(types().registry()), Vec::new())
             .expect("a baseline"),
     )
+}
+
+/// The cooked baseline of each region, which the server and the client both hold.
+#[derive(Clone)]
+pub struct Baselines {
+    empty: Arc<Baseline>,
+    cooked: BTreeMap<RegionId, Arc<Baseline>>,
+}
+
+impl Default for Baselines {
+    fn default() -> Self {
+        Self { empty: empty_baseline(), cooked: BTreeMap::new() }
+    }
+}
+
+impl Baselines {
+    pub fn of(&self, region: RegionId) -> &Arc<Baseline> {
+        self.cooked.get(&region).unwrap_or(&self.empty)
+    }
 }
 
 pub fn seed_of(region: RegionId) -> u64 {
@@ -282,8 +301,13 @@ fn apply_frame(world: &mut World, frame: &StagedFrame, skipped: &Skipped) {
             }
         }
     }
-    for (&key, Tombstone { .. }) in &frame.despawns {
+    for (&key, tombstone) in &frame.despawns {
+        // A Left tombstone of an entity its region holds again: the region was loaded
+        // after the entity left, or its unload is still to come; either settles it.
+        let settled = tombstone.cause == TombstoneCause::Left
+            && world.region_of(key) == Some(tombstone.region);
         if world.contains(key)
+            && !settled
             && let Err(error) = world.despawn(key)
         {
             skip("tombstone", key, error);
@@ -317,7 +341,7 @@ fn fold_frame(
     input: &mut TickInput,
     frame: &StagedFrame,
     loaded: &[RegionId],
-    baseline: &Arc<Baseline>,
+    baselines: &Baselines,
 ) -> Result<()> {
     if let Some(scale) = frame.time_scale {
         input.time_scale = Some(scale);
@@ -330,6 +354,7 @@ fn fold_frame(
     for (&region, change) in &frame.regions {
         match change {
             RegionChange::Relevant(relevance) => {
+                let baseline = baselines.of(region);
                 if relevance.baseline_hash != baseline.content_hash() {
                     return Err(Error::new(ErrorKind::NotFound, "the baseline is not stored"));
                 }
@@ -572,15 +597,13 @@ pub struct ServerModel {
     pending: BTreeMap<RegionId, u64>,
     next_message: u64,
     pub claimed: BTreeSet<StableKey>,
-    /// The region each owed tombstone names.
-    tombstone_regions: BTreeMap<StableKey, RegionId>,
     sequence: PacketSequence,
     pub joined: bool,
-    baseline: Arc<Baseline>,
+    baselines: Baselines,
 }
 
 impl ServerModel {
-    pub fn new(relevant: &[RegionId], baseline: Arc<Baseline>) -> Self {
+    pub fn new(relevant: &[RegionId], baselines: Baselines) -> Self {
         Self {
             mirror: BTreeMap::new(),
             interest: ClientInterest::new(PlayerId(1), ConnectionId(1), SendBudget::default()),
@@ -589,10 +612,9 @@ impl ServerModel {
             pending: BTreeMap::new(),
             next_message: 0,
             claimed: BTreeSet::new(),
-            tombstone_regions: BTreeMap::new(),
             sequence: PacketSequence(u16::MAX - 500),
             joined: false,
-            baseline,
+            baselines,
         }
     }
 
@@ -609,11 +631,8 @@ impl ServerModel {
         self.interest.set_claimed(key, self.claimed.contains(&key));
     }
 
-    fn leave(&mut self, key: StableKey, region: RegionId, tick: Tick) {
-        if self.interest.entities.get(&key).is_some_and(|entity| entity.tombstone.is_none()) {
-            self.tombstone_regions.insert(key, region);
-        }
-        self.interest.leave(key, tick);
+    fn leave(&mut self, key: StableKey, region: RegionId, tick: Tick, cause: TombstoneCause) {
+        self.interest.leave(key, Tombstone { region, tick, cause });
     }
 
     /// Absorbs one gathered frame into the mirror and, once the client has joined, into
@@ -634,14 +653,16 @@ impl ServerModel {
                 }
                 StructuralChange::Despawned { key, region } => {
                     self.mirror.remove(&key);
-                    self.leave(key, region, tick);
+                    self.leave(key, region, tick, TombstoneCause::Destroyed);
                 }
-                StructuralChange::Moved { key, from, to } => {
+                StructuralChange::Moved { key, to, .. } => {
                     if let Some(entity) = self.mirror.get_mut(&key) {
                         entity.region = to;
                     }
                     match (self.holds(key), self.named.contains(&to)) {
-                        (true, false) => self.leave(key, from, tick),
+                        // Named by the region it went to, which the client does not
+                        // hold it in.
+                        (true, false) => self.leave(key, to, tick, TombstoneCause::Left),
                         (false, true) => self.enter(key),
                         // An entity the client may fail to move (its old region unloading
                         // in the same step) arrives whole beside its move.
@@ -679,7 +700,7 @@ impl ServerModel {
         let change = if relevant {
             self.relevant.insert(region);
             self.pending.insert(region, id);
-            RegionChange::Relevant(relevance(region, &self.baseline))
+            RegionChange::Relevant(relevance(region, self.baselines.of(region)))
         } else {
             self.relevant.remove(&region);
             self.pending.remove(&region);
@@ -692,7 +713,7 @@ impl ServerModel {
                     .collect();
                 for key in leaving {
                     if self.holds(key) {
-                        self.leave(key, region, tick);
+                        self.leave(key, region, tick, TombstoneCause::Left);
                     }
                 }
             }
@@ -747,8 +768,10 @@ impl ServerModel {
         }
         self.interest.resync(tick);
         self.joined = true;
-        let regions =
-            self.relevant.iter().map(|&region| (region, relevance(region, &self.baseline)));
+        let regions = self
+            .relevant
+            .iter()
+            .map(|&region| (region, relevance(region, self.baselines.of(region))));
         let spawns = self
             .interest
             .entities
@@ -769,7 +792,8 @@ impl ServerModel {
     }
 
     /// The packet for `tick`: a tombstone for every entity owed one; every entity nothing
-    /// of which is acknowledged whole, as a spawn beside a move to its region; every
+    /// of which is acknowledged whole, as a spawn beside a move to its region and a removal
+    /// of every component the mirror records as removed; every
     /// claimed entity as an exact row of each of its components; every other entity as
     /// the rows changed and the components removed since its acknowledged tick.
     pub fn pack(&mut self, tick: Tick) -> Packet {
@@ -777,10 +801,9 @@ impl ServerModel {
         let mut record = PacketRecord { sequence: self.sequence, tick, ..PacketRecord::default() };
         for (&key, entity) in &self.interest.entities {
             let handle = entity.handle;
-            if let Some(at) = entity.tombstone {
-                let region = self.tombstone_regions[&key];
-                packet.tombstones.push((handle, Tombstone { region, tick: at }));
-                record.tombstones.push((handle, at));
+            if let Some(tombstone) = entity.tombstone {
+                packet.tombstones.push((handle, tombstone));
+                record.tombstones.push((handle, tombstone));
                 continue;
             }
             let mirror = &self.mirror[&key];
@@ -788,6 +811,11 @@ impl ServerModel {
                 None => {
                     packet.spawns.push(self.wire_spawn(key, handle, entity.claimed));
                     packet.moves.push((handle, mirror.region));
+                    // The client may hold a component the server removed while nothing
+                    // of the entity was acknowledged; the spawn's upsert keeps it.
+                    for &component in mirror.removed.keys() {
+                        packet.removed.push((handle, component));
+                    }
                     true
                 }
                 Some(acked) => {
@@ -850,8 +878,7 @@ pub struct ReceiverModel {
     /// Region changes that arrived and are not yet in a staged frame, in arrival order.
     pending: VecDeque<(Tick, RegionId, RegionChange)>,
     sizes: BTreeMap<ComponentKey, usize>,
-    received: BTreeSet<u16>,
-    latest: Option<PacketSequence>,
+    ack: Option<AckField>,
     /// The frames staged and not yet handed to `app`.
     pub staged: Vec<StagedFrame>,
     pub stats: ReceiverStats,
@@ -869,8 +896,7 @@ impl ReceiverModel {
             awaiting_full: true,
             pending: VecDeque::new(),
             sizes,
-            received: BTreeSet::new(),
-            latest: None,
+            ack: None,
             staged: Vec::new(),
             stats: ReceiverStats::default(),
         }
@@ -879,15 +905,7 @@ impl ReceiverModel {
     /// The acknowledgement field for the packets staged so far; `None` before the first,
     /// since a field always covers its `latest`.
     pub fn ack(&self) -> Option<AckField> {
-        let latest = self.latest?;
-        let mut bits = 0;
-        for n in 0..u32::from(AckField::WINDOW) {
-            let sequence = latest.0.wrapping_sub(u16::try_from(n + 1).expect("small"));
-            if self.received.contains(&sequence) {
-                bits |= 1 << n;
-            }
-        }
-        Some(AckField { latest, bits })
+        self.ack
     }
 
     /// A control message, in channel order; returns what to acknowledge on the reliable
@@ -1033,10 +1051,7 @@ impl ReceiverModel {
         }
         self.handles = handles;
         self.newest = Some(packet.tick);
-        self.received.insert(packet.sequence.0);
-        if self.latest.is_none_or(|latest| packet.sequence.after(latest)) {
-            self.latest = Some(packet.sequence);
-        }
+        self.ack = Some(AckField::received(self.ack, packet.sequence));
         self.staged.push(frame);
         self.stats.staged += 1;
     }
@@ -1102,7 +1117,7 @@ pub struct Replication {
     pub client: Option<Simulation>,
     pub skipped: Skipped,
     layout: LayoutConfig,
-    baseline: Arc<Baseline>,
+    baselines: Baselines,
     pub link: LinkConfig,
     rng: Rng,
     down: Leg<Packet>,
@@ -1127,15 +1142,15 @@ pub struct Replication {
 
 impl Replication {
     pub fn new(layout: LayoutConfig, entities: u64, relevant: &[RegionId], seed: u64) -> Self {
-        let baseline = empty_baseline();
+        let baselines = Baselines::default();
         Self {
             server: Some(server(layout, entities)),
-            model: ServerModel::new(relevant, Arc::clone(&baseline)),
+            model: ServerModel::new(relevant, baselines.clone()),
             receiver: ReceiverModel::new(sizes(types().registry())),
             client: None,
             skipped: Skipped::default(),
             layout,
-            baseline,
+            baselines,
             link: LinkConfig::PERFECT,
             rng: Rng::new(seed),
             down: Leg::new(),
@@ -1151,6 +1166,13 @@ impl Replication {
             whole_checks: 0,
             load_failures: 0,
         }
+    }
+
+    /// Cooks `baseline` for `region` on both ends, before the join.
+    pub fn cook(&mut self, region: RegionId, baseline: Baseline) {
+        assert!(!self.model.joined, "cooked before the join");
+        self.baselines.cooked.insert(region, Arc::new(baseline));
+        self.model.baselines = self.baselines.clone();
     }
 
     pub fn world_mut(&mut self) -> &mut World {
@@ -1299,7 +1321,7 @@ impl Replication {
             let mut input = TickInput::default();
             let inbox = client.world().service::<StagedInbox>().expect("setup");
             for frame in inbox.due(next) {
-                fold_frame(&mut input, frame, &loaded, &self.baseline).expect("the fold");
+                fold_frame(&mut input, frame, &loaded, &self.baselines).expect("the fold");
             }
             client = executor.block_on(client.step(executor, input)).expect("a client step");
             self.load_failures += client.lifecycle_mut().take_load_failures().len();

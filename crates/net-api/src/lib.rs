@@ -68,7 +68,7 @@ use lactose_sim::{Pass, Registration, TypeTable};
 pub use relevance::{OverlayPayload, RegionChange, RegionRelevance};
 pub use staged::{
     DueFrames, InterpolationSlot, RemoteSlot, StagedFrame, StagedInbox, StagedRow, StagedRows,
-    StagedSpawn, Tombstone,
+    StagedSpawn, Tombstone, TombstoneCause,
 };
 pub use staging::{GatherState, GatheredRow, GatheredRows, StagingFrame};
 

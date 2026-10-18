@@ -1,10 +1,10 @@
 //! The host side of networking (architecture section 4, `net-api`; sections 5.3, 9.1,
 //! 9.2 and 9.3): the quantised wire values, the handshake, the transport trait a
 //! loopback or UDP implementation is a page of, the packet framing and the per-connection
-//! handles, the per-client interest state the packer keeps, the lock-free interpolation
-//! buffer the presentation schedule samples, and the named places for clock sync and the
-//! control messages. The simulation side, what enters and leaves a world, is
-//! `lactose-net-api`, inside the boundary.
+//! handles, the per-client interest state the packer keeps, the interpolation buffer
+//! the presentation schedule samples through a sequence lock per slot, and the named
+//! places for clock sync and the control messages. The simulation side, what enters and
+//! leaves a world, is `lactose-net-api`, inside the boundary.
 //!
 //! Foundation tier, outside the determinism boundary, and no boundary crate may depend on
 //! it (`crate-tiers.toml`): floats, clocks and sockets live here, and the only things that

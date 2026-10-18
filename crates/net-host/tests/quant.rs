@@ -1,6 +1,6 @@
 //! The quantised wire values (README, "Quantisation"): the position round trip over a
-//! sweep, saturation, NaN, ties; the rotation's sign rule, its stability after one trip
-//! and the measured rate at which one trip moves it; the zero, NaN and infinite
+//! sweep, saturation, NaN, ties; the rotation's sign rule, the measured rate at which one
+//! trip moves a uniform rotation and the worst cases found; the zero, NaN and infinite
 //! quaternions; and the golden bits of `dequantise`, pinned so that every target that
 //! runs this file (aarch64 here, x86-64 in CI) must produce them. `sour.rs` records the
 //! same conversions under SOUR, whose architecture mode compares two machines.
@@ -102,40 +102,68 @@ fn a_rotation_and_its_negation_quantise_alike() {
     assert_eq!(QuantisedRotation::quantise(quantised.dequantise()), quantised);
 }
 
-/// The README's measured claim: one trip through `dequantise` and `quantise` moves about
-/// one value in a hundred, by one unit in at most two components (two in about one value
-/// in ten thousand), and a value that made the trip once is stable from then on.
-#[test]
-fn a_rotation_is_stable_after_one_trip() {
-    const DRAWS: u32 = 400_000;
-    let mut state = 0x9E37_79B9_7F4A_7C15;
-    let (mut moved, mut moved_two) = (0_u32, 0_u32);
-    for _ in 0..DRAWS {
-        let q = Quat::new(unit(&mut state), unit(&mut state), unit(&mut state), unit(&mut state));
-        let first = QuantisedRotation::quantise(q);
-        let second = QuantisedRotation::quantise(first.dequantise());
-        let third = QuantisedRotation::quantise(second.dequantise());
-        assert_eq!(third, second, "{q:?}");
-        let steps = [
-            second.x.abs_diff(first.x),
-            second.y.abs_diff(first.y),
-            second.z.abs_diff(first.z),
-            second.w.abs_diff(first.w),
-        ];
-        assert!(steps.iter().all(|&step| step <= 1), "{q:?}: {steps:?}");
-        match steps.iter().filter(|&&step| step != 0).count() {
-            0 => {}
-            1 => moved += 1,
-            2 => {
-                moved += 1;
-                moved_two += 1;
-            }
-            more => panic!("{q:?} moved in {more} components"),
+/// A uniformly distributed rotation: a point uniform in the unit 4-ball, by rejection
+/// from the cube, normalised.
+fn uniform_rotation(state: &mut u64) -> Quat {
+    loop {
+        let q = Quat::new(unit(state), unit(state), unit(state), unit(state));
+        let length_squared = q.length_squared();
+        if length_squared <= Scalar::ONE && length_squared > Scalar::from_f64(1e-6) {
+            return q.normalize();
         }
     }
+}
+
+/// How one trip through `dequantise` and `quantise` moved a value: the largest step of a
+/// component and how many components moved.
+fn trip(first: QuantisedRotation) -> (QuantisedRotation, u16, usize) {
+    let second = QuantisedRotation::quantise(first.dequantise());
+    let steps = [
+        second.x.abs_diff(first.x),
+        second.y.abs_diff(first.y),
+        second.z.abs_diff(first.z),
+        second.w.abs_diff(first.w),
+    ];
+    let largest = steps.iter().copied().max().expect("four");
+    (second, largest, steps.iter().filter(|&&step| step != 0).count())
+}
+
+/// The README's measured claim, over uniform rotations: one trip moves about one value in
+/// seventy, by one unit in each component that moves, and a value that made the trip once
+/// almost always stays.
+#[test]
+fn a_uniform_rotation_moves_by_one_unit_in_one_trip_at_a_measured_rate() {
+    const DRAWS: u32 = 400_000;
+    let mut state = 0x9E37_79B9_7F4A_7C15;
+    let mut moved_in = [0_u32; 5];
+    let mut unstable = 0_u32;
+    for _ in 0..DRAWS {
+        let first = QuantisedRotation::quantise(uniform_rotation(&mut state));
+        let (second, largest, moved) = trip(first);
+        assert!(largest <= 1, "{first:?} moved by {largest}");
+        moved_in[moved] += 1;
+        let (third, _, _) = trip(second);
+        unstable += u32::from(third != second);
+    }
+    let moved: u32 = moved_in[1..].iter().sum();
+    println!("{moved} of {DRAWS} moved, by components {moved_in:?}, {unstable} unstable");
     let per_ten_thousand = u64::from(moved) * 10_000 / u64::from(DRAWS);
-    assert!((50..=200).contains(&per_ten_thousand), "{moved} of {DRAWS} moved");
-    assert!(u64::from(moved_two) * 1_000 <= u64::from(DRAWS), "{moved_two} moved in two");
+    assert!((120..=190).contains(&per_ten_thousand), "{moved} of {DRAWS} moved");
+    assert_eq!(moved_in[4], 0);
+    assert!(moved_in[3] * 1_000 <= DRAWS, "{moved_in:?}");
+    assert!(unstable * 10_000 <= DRAWS, "{unstable} unstable");
+}
+
+/// The worst cases found near half-unit boundaries (review r1, M2): a value one trip moves
+/// in three components, and one that the second trip moves again before it settles.
+#[test]
+fn a_rotation_may_move_in_three_components_and_settle_only_after_two_trips() {
+    let first = rotation(-19250, -18758, -18706, 1131);
+    let (second, largest, moved) = trip(first);
+    assert_eq!((second, largest, moved), (rotation(-19251, -18759, -18707, 1131), 1, 3));
+    let (third, _, _) = trip(second);
+    assert_eq!(third, rotation(-19250, -18759, -18707, 1131));
+    assert_eq!(trip(third).0, third);
 }
 
 #[test]

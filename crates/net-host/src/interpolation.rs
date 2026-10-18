@@ -369,7 +369,10 @@ impl core::fmt::Debug for InterpolationWriter {
 
 /// The reader side, the `net-api` resource of architecture section 5.3: the presentation
 /// schedule holds one and samples every frame. Cloneable; any number of threads may
-/// sample at once, none ever blocks, and no sample allocates.
+/// sample at once without waiting on one another, and no sample allocates. A sample of a
+/// slot the writer is writing retries until the write ends: a write stores at most the
+/// slot's 64 state words and its count, but a network thread preempted inside one stalls
+/// the samples of that slot for as long as it is preempted.
 #[derive(Clone)]
 pub struct InterpolationReader {
     buffer: Arc<InterpolationBuffer>,
@@ -383,7 +386,8 @@ impl InterpolationReader {
     /// before every kept state, and around a teleport: with `later.teleported` in
     /// `(earlier.tick, later.tick]`, at `earlier` while `at` is before `later.teleported`
     /// and at `later` from then on; `Missing` when the slot holds nothing or `slot` is
-    /// stale. A torn read is retried; the call never blocks and never locks.
+    /// stale. A read that overlaps a write of the slot is retried until it does not; the
+    /// call takes no lock and allocates nothing.
     #[must_use]
     pub fn sample(&self, slot: InterpolationSlot, at: PresentationTime) -> RemoteSample {
         let Some(held) = self.buffer.slots.get(slot.index as usize) else {

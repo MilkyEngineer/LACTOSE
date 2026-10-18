@@ -7,8 +7,8 @@
 
 #![forbid(unsafe_code)]
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Barrier};
 
 use lactose_core::{ErrorKind, Tick};
 use lactose_math::{Quat, Scalar, Vec3};
@@ -240,10 +240,11 @@ fn is_pushed(sample: &RemoteSample) -> bool {
     sample.position == state.position && sample.rotation == state.rotation
 }
 
-#[test]
-fn every_sample_under_contention_is_a_pushed_state() {
+/// One writer pushing `pushes` states round four slots, reallocating one every
+/// `reallocate_every` pushes, against three readers sampling single and batched; asserts
+/// that every sample is one pushed state.
+fn every_sample_is_a_pushed_state(pushes: u64, reallocate_every: u64) {
     const SLOTS: u32 = 4;
-    const PUSHES: u64 = 400_000;
     const READERS: usize = 3;
     let (mut writer, reader) = buffer(SLOTS);
     let mut slots: Vec<InterpolationSlot> =
@@ -252,18 +253,26 @@ fn every_sample_under_contention_is_a_pushed_state() {
         Arc::new((0..SLOTS).map(|_| AtomicU64::new(u64::MAX)).collect());
     let done = Arc::new(AtomicBool::new(false));
     let checked_samples = Arc::new(AtomicU64::new(0));
+    // The writer starts once every reader runs, so a short run overlaps them too.
+    let started = Arc::new(Barrier::new(READERS + 1));
     let readers: Vec<_> = (0..READERS)
         .map(|n| {
             let reader = reader.clone();
             let published = Arc::clone(&published);
             let done = Arc::clone(&done);
             let checked_samples = Arc::clone(&checked_samples);
+            let started = Arc::clone(&started);
             std::thread::spawn(move || {
+                started.wait();
                 let (mut torn, mut interpolated) = (0_u64, 0_u64);
                 let (mut count, mut round) = (0_u64, 0_u64);
                 let mut batch = [RemoteSample::MISSING; SLOTS as usize];
                 let mut slots = vec![InterpolationSlot { index: 0, generation: 0 }; SLOTS as usize];
-                while !done.load(Ordering::Relaxed) {
+                // One round after the writer finished at the least, so every reader
+                // checks samples however late it was scheduled.
+                let mut finished = false;
+                while !finished {
+                    finished = done.load(Ordering::Acquire);
                     round += 1;
                     for (index, slot) in slots.iter_mut().enumerate() {
                         let word = published[index].load(Ordering::Acquire);
@@ -300,9 +309,10 @@ fn every_sample_under_contention_is_a_pushed_state() {
             })
         })
         .collect();
-    for counter in 0..PUSHES {
+    started.wait();
+    for counter in 0..pushes {
         let index = (counter % u64::from(SLOTS)) as usize;
-        if counter % 5_003 == 0 {
+        if counter % reallocate_every == 0 {
             // Reallocation under the readers: the old generation reads as missing.
             writer.release(slots[index]).unwrap();
             slots[index] = writer.allocate().unwrap();
@@ -310,7 +320,7 @@ fn every_sample_under_contention_is_a_pushed_state() {
         published[index].store(u64::from(slots[index].generation), Ordering::Release);
         writer.push(slots[index], checked(counter)).unwrap();
     }
-    done.store(true, Ordering::Relaxed);
+    done.store(true, Ordering::Release);
     let (mut torn, mut interpolated) = (0, 0);
     for reader in readers {
         let (t, i) = reader.join().unwrap();
@@ -319,9 +329,24 @@ fn every_sample_under_contention_is_a_pushed_state() {
     }
     let samples = checked_samples.load(Ordering::Relaxed);
     println!(
-        "{samples} samples checked, {torn} torn, {interpolated} interpolated, {PUSHES} pushes"
+        "{samples} samples checked, {torn} torn, {interpolated} interpolated, {pushes} pushes"
     );
     assert_eq!(torn, 0, "samples that are no pushed state");
     assert_eq!(interpolated, 0, "samples at the newest or before the oldest are held");
     assert!(samples > 0);
+}
+
+/// The stress on hardware, where a reordering is caught only by chance (no loom model).
+#[test]
+#[cfg_attr(miri, ignore = "the hardware variant; Miri runs the small one")]
+fn every_sample_under_contention_is_a_pushed_state() {
+    every_sample_is_a_pushed_state(400_000, 5_003);
+}
+
+/// The same at a size Miri runs, where its weak-memory emulation explores the orderings:
+/// a reader's first sequence load left `Relaxed`, or its `Acquire` fence dropped, gives
+/// torn samples here under Miri (review r1, M3) and passes on hardware.
+#[test]
+fn every_sample_under_contention_is_a_pushed_state_at_a_size_miri_runs() {
+    every_sample_is_a_pushed_state(150, 37);
 }

@@ -21,6 +21,7 @@ use lactose_math::render::RenderPosition;
 use lactose_math::{Quat, Scalar, Vec3};
 use lactose_net_api::{
     InterpolationSlot, RemoteSlot, StagedFrame, StagedSpawn, StagingFrame, Tombstone,
+    TombstoneCause,
 };
 use lactose_net_host::handshake::{BoundaryBuildId, CookedDataHash, Handshake, ProtocolHash};
 use lactose_net_host::interest::{ClientInterest, SendBudget};
@@ -30,7 +31,7 @@ use lactose_net_host::interpolation::{
 };
 use lactose_net_host::message::JoinAccepted;
 use lactose_net_host::packet::{
-    AckField, ConnectionHandles, EntityHandle, PacketRecord, PacketSequence, TickHeader,
+    ConnectionHandles, EntityHandle, PacketRecord, PacketSequence, TickHeader,
 };
 use lactose_net_host::transport::{
     ConnectionId, Datagram, DisconnectReason, LinkStats, MAX_DATAGRAM_BYTES, Transport,
@@ -115,7 +116,7 @@ fn pack_one(
 ) -> Result<PacketRecord> {
     let mut record =
         PacketRecord { sequence, tick: frame.tick, entities: Vec::new(), tombstones: Vec::new() };
-    let header = TickHeader { sequence, tick: frame.tick, ack: AckField::default() };
+    let header = TickHeader { sequence, tick: frame.tick, ack: None };
     let regions: Vec<RegionId> = client.regions.iter().copied().collect();
     for region in regions {
         let origin = region_origin(region);
@@ -150,7 +151,10 @@ fn pack_one(
     }
     for entry in frame.structural() {
         match entry.change {
-            lactose_ecs::StructuralChange::Despawned { key, .. } => client.leave(key, entry.tick),
+            lactose_ecs::StructuralChange::Despawned { key, region } => client.leave(
+                key,
+                Tombstone { region, tick: entry.tick, cause: TombstoneCause::Destroyed },
+            ),
             lactose_ecs::StructuralChange::Removed { key, component } => {
                 // On the wire as a removal, into `StagedFrame::removed` at the receiver.
                 let _removal_on_the_wire = client.entities.get(&key).map(|e| (e.handle, component));
@@ -159,10 +163,10 @@ fn pack_one(
         }
     }
     for interest in client.entities.values() {
-        if let Some(tick) = interest.tombstone
+        if let Some(tombstone) = interest.tombstone
             && interest.in_flight.is_none()
         {
-            record.tombstones.push((interest.handle, tick));
+            record.tombstones.push((interest.handle, tombstone));
         }
     }
     client.sent(record.clone());
@@ -171,7 +175,9 @@ fn pack_one(
 }
 
 fn on_ack(client: &mut ClientInterest, header: &TickHeader) {
-    client.acknowledge(header.ack);
+    if let Some(ack) = header.ack {
+        client.acknowledge(ack);
+    }
 }
 
 fn client_joins(player: PlayerId, connection: ConnectionId) -> ClientInterest {
@@ -361,8 +367,7 @@ impl ClientReceiver {
         &mut self,
         frame: &mut StagedFrame,
         handle: EntityHandle,
-        region: RegionId,
-        tick: Tick,
+        tombstone: Tombstone,
     ) -> Result<()> {
         // A tombstone for a handle the mirror does not hold: the entity left before its
         // spawn was ever staged.
@@ -370,7 +375,7 @@ impl ClientReceiver {
         if let Some(slot) = self.slots.remove(&key) {
             self.writer.release(slot)?;
         }
-        frame.despawns.insert(key, Tombstone { region, tick });
+        frame.despawns.insert(key, tombstone);
         Ok(())
     }
 
