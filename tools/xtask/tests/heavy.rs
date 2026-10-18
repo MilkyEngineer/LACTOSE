@@ -6,8 +6,12 @@
 #![forbid(unsafe_code)]
 
 use std::fs;
+use std::io::{BufRead, BufReader, Read};
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
+
+use lactose_xtask::heavy::{self, HELD_VAR};
 
 /// A temporary directory for one test's runs, removed on drop.
 struct Scratch(PathBuf);
@@ -21,9 +25,10 @@ impl Scratch {
         Self(root)
     }
 
-    /// Runs `cargo xtask heavy` with `args`, with this directory as its temporary directory.
-    fn heavy(&self, args: &[&str]) -> Output {
-        Command::new(env!("CARGO_BIN_EXE_lactose-xtask"))
+    /// `cargo xtask heavy` with `args`, with this directory as its temporary directory.
+    fn command(&self, args: &[&str]) -> Command {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_lactose-xtask"));
+        command
             .arg("heavy")
             .args(args)
             // `std::env::temp_dir` reads `TMPDIR` on Unix and `TMP`, then `TEMP`, on Windows.
@@ -31,9 +36,18 @@ impl Scratch {
             .env("TMP", &self.0)
             .env("TEMP", &self.0)
             // Set when these tests themselves run under `heavy`.
-            .env_remove("LACTOSE_HEAVY_SLOT")
-            .output()
-            .expect("the xtask binary runs")
+            .env_remove(HELD_VAR);
+        command
+    }
+
+    /// Runs `cargo xtask heavy` with `args`.
+    fn heavy(&self, args: &[&str]) -> Output {
+        self.command(args).output().expect("the xtask binary runs")
+    }
+
+    /// The slot directory the binary uses.
+    fn slots(&self) -> PathBuf {
+        self.0.join("lactose-heavy")
     }
 }
 
@@ -97,7 +111,80 @@ fn a_nested_heavy_runs_inside_its_caller_s_slot() {
     let stderr = stderr(&output);
     let lines: Vec<&str> = stderr.lines().collect();
     assert!(lines[0].starts_with("heavy: slot 0 after "), "{lines:?}");
-    assert_eq!(lines[1], "heavy: inside slot 0 already");
+    assert!(lines[1].starts_with("heavy: inside slot 0:"), "{lines:?}");
+    assert!(lines[1].ends_with(" already"), "{lines:?}");
+}
+
+const ONE: NonZeroUsize = NonZeroUsize::new(1).unwrap();
+
+/// Runs `heavy --slots 1` with `HELD_VAR` set to `value` while this process holds the one
+/// slot, and requires it to wait like any caller until the slot is let go.
+fn waits_for_the_slot(scratch: &Scratch, value: &str) {
+    let held = heavy::try_acquire(&scratch.slots(), ONE).unwrap().expect("the slot is free");
+    let mut args = vec!["--slots", "1", "--"];
+    args.extend(shell("exit 0"));
+    let mut child = scratch
+        .command(&args)
+        .env(HELD_VAR, value)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stderr = BufReader::new(child.stderr.take().unwrap());
+    let mut before = Vec::new();
+    loop {
+        let mut line = String::new();
+        // End of file here means the program ran without waiting.
+        assert_ne!(stderr.read_line(&mut line).unwrap(), 0, "{value:?}: {before:?}");
+        let waiting = line.starts_with("heavy: waiting for one of 1 slots");
+        before.push(line);
+        if waiting {
+            break;
+        }
+    }
+    assert_eq!(
+        before[0].trim_end(),
+        format!("heavy: {HELD_VAR}={value} names no slot held for it"),
+        "{before:?}"
+    );
+    let pid = std::process::id().to_string();
+    assert!(before[1].trim_end().ends_with(&format!("held by pid {pid}")), "{before:?}");
+    drop(held);
+    let mut rest = String::new();
+    stderr.read_to_string(&mut rest).unwrap();
+    assert!(child.wait().unwrap().success(), "{rest}");
+    assert!(rest.starts_with("heavy: slot 0 after "), "{rest}");
+}
+
+#[test]
+fn a_forged_held_value_waits_like_any_caller() {
+    let scratch = Scratch::new("forged");
+    for value in ["", "0", "nonsense", "0:1-2"] {
+        waits_for_the_slot(&scratch, value);
+    }
+}
+
+#[test]
+fn a_stale_held_value_waits_once_another_holder_has_the_slot() {
+    let scratch = Scratch::new("stale-held");
+    let stale = heavy::try_acquire(&scratch.slots(), ONE).unwrap().unwrap().held_value();
+    waits_for_the_slot(&scratch, &stale);
+}
+
+#[test]
+fn a_stale_held_value_whose_slot_is_free_takes_the_slot() {
+    let scratch = Scratch::new("stale-free");
+    let stale = heavy::try_acquire(&scratch.slots(), ONE).unwrap().unwrap().held_value();
+    let mut args = vec!["--slots", "1", "--"];
+    args.extend(shell("exit 0"));
+    let output = scratch.command(&args).env(HELD_VAR, &stale).output().unwrap();
+    assert!(output.status.success(), "{}", stderr(&output));
+    let text = stderr(&output);
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines[0], format!("heavy: {HELD_VAR}={stale} names no slot held for it"));
+    assert!(lines[1].starts_with("heavy: slot 0 after "), "{lines:?}");
+    let owner = fs::read_to_string(scratch.slots().join("slot-0.owner")).unwrap();
+    assert_ne!(format!("0:{}", owner.trim_end()), stale, "the new holder wrote its own token");
 }
 
 #[test]

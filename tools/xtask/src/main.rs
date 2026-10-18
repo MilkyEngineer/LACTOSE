@@ -485,16 +485,24 @@ fn heavy(args: &[&str]) -> Result<i32, String> {
         let status = command.status().map_err(|e| format!("cannot run `{program}`: {e}"))?;
         Ok(heavy::exit_code(status))
     };
+    let dir = heavy::dir();
     if let Some(held) = env::var_os(heavy::HELD_VAR) {
-        eprintln!("heavy: inside slot {} already", held.to_string_lossy());
-        return run(&mut command);
+        let inside = heavy::is_held(&dir, &held);
+        let held = held.to_string_lossy();
+        if inside {
+            eprintln!("heavy: inside slot {held} already");
+            return run(&mut command);
+        }
+        eprintln!("heavy: {}={held} names no slot held for it", heavy::HELD_VAR);
     }
     let start = Instant::now();
-    let slot = heavy::acquire(&heavy::dir(), slots, heavy::RETRY, || {
-        eprintln!("heavy: waiting for one of {slots} slots");
+    let slot = heavy::acquire(&dir, slots, heavy::RETRY, || {
+        let pids: Vec<String> =
+            heavy::holders(&dir, slots).iter().map(ToString::to_string).collect();
+        eprintln!("heavy: waiting for one of {slots} slots, held by pid {}", pids.join(", "));
     })?;
     eprintln!("heavy: slot {} after {}s", slot.index(), start.elapsed().as_secs());
-    let code = run(command.env(heavy::HELD_VAR, slot.index().to_string()));
+    let code = run(command.env(heavy::HELD_VAR, slot.held_value()));
     drop(slot);
     code
 }
