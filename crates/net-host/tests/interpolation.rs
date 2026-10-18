@@ -218,12 +218,14 @@ fn a_batch_is_the_sample_of_each_slot() {
 // ---- The sequence lock under contention ----
 
 /// The state pushed at `counter`: every word a function of the counter, so a sample made
-/// of two states' words is recognised.
+/// of two states' words is recognised. Its tick is one after the counter, so a sample at
+/// tick zero is before every kept state and is held, never interpolated, from the first
+/// push on.
 fn checked(counter: u64) -> ReceivedState {
     let c = i64::try_from(counter).expect("small");
     let word = |k: i64| Scalar::from_i64(c.wrapping_mul(k) % 1_000_003);
     ReceivedState {
-        tick: Tick(u32::try_from(counter).expect("small")),
+        tick: Tick(u32::try_from(counter + 1).expect("small")),
         teleported: Tick(0),
         position: Vec3::new(Scalar::from_i64(c), word(7), word(13)),
         rotation: Quat::new(word(17), word(19), word(23), word(29)),
@@ -257,7 +259,7 @@ fn every_sample_under_contention_is_a_pushed_state() {
             let done = Arc::clone(&done);
             let checked_samples = Arc::clone(&checked_samples);
             std::thread::spawn(move || {
-                let mut torn = 0_u64;
+                let (mut torn, mut interpolated) = (0_u64, 0_u64);
                 let mut count = 0_u64;
                 let mut batch = [RemoteSample::MISSING; SLOTS as usize];
                 let mut slots = vec![InterpolationSlot { index: 0, generation: 0 }; SLOTS as usize];
@@ -288,12 +290,12 @@ fn every_sample_under_contention_is_a_pushed_state() {
                                 torn += u64::from(!is_pushed(sample));
                             }
                             SampleStatus::Missing => {}
-                            SampleStatus::Interpolated => torn += 1,
+                            SampleStatus::Interpolated => interpolated += 1,
                         }
                     }
                 }
                 checked_samples.fetch_add(count, Ordering::Relaxed);
-                torn
+                (torn, interpolated)
             })
         })
         .collect();
@@ -308,9 +310,17 @@ fn every_sample_under_contention_is_a_pushed_state() {
         writer.push(slots[index], checked(counter)).unwrap();
     }
     done.store(true, Ordering::Relaxed);
-    let torn: u64 = readers.into_iter().map(|reader| reader.join().unwrap()).sum();
+    let (mut torn, mut interpolated) = (0, 0);
+    for reader in readers {
+        let (t, i) = reader.join().unwrap();
+        torn += t;
+        interpolated += i;
+    }
     let samples = checked_samples.load(Ordering::Relaxed);
-    println!("{samples} samples checked, {torn} torn, {PUSHES} pushes");
-    assert_eq!(torn, 0);
+    println!(
+        "{samples} samples checked, {torn} torn, {interpolated} interpolated, {PUSHES} pushes"
+    );
+    assert_eq!(torn, 0, "samples that are no pushed state");
+    assert_eq!(interpolated, 0, "samples at the newest or before the oldest are held");
     assert!(samples > 0);
 }
