@@ -1,0 +1,38 @@
+[package]
+name = "lactose-anim"
+description = "Animation inside the determinism boundary: state machines, phase, events, root motion, and the deterministic sim skeleton covering sockets, hands, feet, head and ragdoll bodies."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[dependencies]
+# The three asset kinds the simulation reads (clips, state machines, skeletons), the loader
+# trait their pure decoders implement, and the typed reference a rig holds; types only
+# (architecture section 8.2).
+lactose-asset-api.workspace = true
+lactose-core.workspace = true
+# The world, the `#[system]` macro, commands, events and `OwnedBy` for the bone rows
+# (architecture sections 6 and 6.1).
+lactose-ecs.workspace = true
+# Every quantity that is not a phase is a `Scalar`, `Vec3` or `Quat`; phase arithmetic is
+# integer (architecture section 8.2).
+lactose-math.workspace = true
+# The simulation `Transform` a pose is placed by, and the body, collider and joint
+# components a bone row carries (architecture sections 16 and 17).
+lactose-physics-api.workspace = true
+# The `#[component]` and `#[value]` attributes; metadata only (architecture section 8.1).
+lactose-reflect.workspace = true
+# `Stage`, `Registration` and `TypeTable`: where the systems are placed and how the
+# components are registered.
+lactose-sim.workspace = true
+
+[dev-dependencies]
+# The prediction world's build check (D121, D122), run over this crate's systems by the
+# consumer sketch so that every component a `[server, prediction]` system names is one the
+# server replicates or the tick rebuilds.
+lactose-predict.workspace = true
+
+[lints]
+workspace = true
