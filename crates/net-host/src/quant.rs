@@ -7,7 +7,7 @@
 //! row, so no boundary crate names these.
 
 use bytemuck::{Pod, Zeroable};
-use lactose_math::{Quat, Vec3};
+use lactose_math::{Quat, Scalar, Vec3};
 
 /// Position units per metre on the wire: a power of two, so that dequantising is an exact
 /// division and, under the 64-bit scalar, quantising a value that was dequantised gives
@@ -44,7 +44,8 @@ impl QuantisedPosition {
     /// and maps a NaN to zero.
     #[must_use]
     pub fn quantise(relative: Vec3) -> Self {
-        todo!()
+        let axis = |c: Scalar| (c * Scalar::from_i32(POSITION_UNITS_PER_METRE)).round().to_i32();
+        Self { x: axis(relative.x), y: axis(relative.y), z: axis(relative.z) }
     }
 
     /// The position back as a simulation vector relative to the region origin:
@@ -53,13 +54,14 @@ impl QuantisedPosition {
     /// `quantise(dequantise(q)) == q` for every `q` under the 64-bit scalar.
     #[must_use]
     pub fn dequantise(self) -> Vec3 {
-        todo!()
+        let axis = |q: i32| Scalar::from_i32(q) / Scalar::from_i32(POSITION_UNITS_PER_METRE);
+        Vec3::new(axis(self.x), axis(self.y), axis(self.z))
     }
 }
 
 /// A unit quaternion with each component in [`ROTATION_SCALE`]ths. Eight bytes of plain
-/// data. The sign is canonical (`Quat::canonical_sign`) before quantising, so `q` and `-q`
-/// quantise alike.
+/// data. The sign is canonical (the rule of `Quat::canonical_sign`, applied to the
+/// integers), so `q` and `-q` quantise alike.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Pod, Zeroable)]
 #[repr(C)]
 pub struct QuantisedRotation {
@@ -77,16 +79,46 @@ impl QuantisedRotation {
     /// No rotation.
     pub const IDENTITY: Self = Self { x: 0, y: 0, z: 0, w: ROTATION_SCALE };
 
-    /// Quantises `rotation`, normalised and with its sign made canonical first: each
-    /// component times [`ROTATION_SCALE`] through `Scalar::round` and `Scalar::to_i32`,
-    /// then narrowed to `i16` (the product of a unit component never exceeds it). A zero
-    /// or NaN quaternion, whose normalisation is NaN, quantises to the all-zero value;
-    /// nothing else does. Rotations do not round-trip exactly: `quantise(dequantise(q))`
-    /// differs from `q` by one unit in one component for about one percent of values,
-    /// and the value is stable after one trip.
+    /// What a quaternion that is no rotation quantises to.
+    const NOT_A_ROTATION: Self = Self { x: 0, y: 0, z: 0, w: 0 };
+
+    /// Quantises `rotation`: divided by its largest component magnitude and normalised,
+    /// each component times [`ROTATION_SCALE`] through `Scalar::round` and
+    /// `Scalar::to_i32`, clamped to `±ROTATION_SCALE`, then the sign of the four integers
+    /// made canonical by the rule of `Quat::canonical_sign`. Quantising is odd-symmetric,
+    /// so `q` and `-q` quantise alike; the sign is decided on the integers because a
+    /// component that rounds to zero would otherwise leave it to a smaller one. A zero
+    /// quaternion or one with a NaN or infinite component quantises to the all-zero
+    /// value; nothing else does, since the largest component of a unit quaternion is at
+    /// least one half. Rotations do not round-trip exactly (see the crate README for the
+    /// measured rate), and the value is stable after one trip.
     #[must_use]
     pub fn quantise(rotation: Quat) -> Self {
-        todo!()
+        if !rotation.is_finite() {
+            return Self::NOT_A_ROTATION;
+        }
+        let [x, y, z, w] = rotation.to_array();
+        let largest = x.abs().max(y.abs()).max(z.abs()).max(w.abs());
+        if largest == Scalar::ZERO {
+            return Self::NOT_A_ROTATION;
+        }
+        // Dividing by the largest magnitude first keeps the squared length in `[1, 4]`, so
+        // no finite non-zero quaternion overflows or underflows in `normalize`.
+        let scaled = Quat::new(x / largest, y / largest, z / largest, w / largest).normalize();
+        let scale = i32::from(ROTATION_SCALE);
+        let component = |c: Scalar| {
+            let q = (c * Scalar::from_i32(scale)).round().to_i32().clamp(-scale, scale);
+            i16::try_from(q).expect("clamped to the scale, which is an i16")
+        };
+        let quantised = Self {
+            x: component(scaled.x),
+            y: component(scaled.y),
+            z: component(scaled.z),
+            w: component(scaled.w),
+        };
+        let Self { x, y, z, w } = quantised;
+        let negative = w < 0 || (w == 0 && (x < 0 || (x == 0 && (y < 0 || (y == 0 && z < 0)))));
+        if negative { Self { x: -x, y: -y, z: -z, w: -w } } else { quantised }
     }
 
     /// The rotation back: each component as `Scalar::from_i32(c) /
@@ -95,7 +127,13 @@ impl QuantisedRotation {
     /// `Quat::IDENTITY`.
     #[must_use]
     pub fn dequantise(self) -> Quat {
-        todo!()
+        if self == Self::NOT_A_ROTATION {
+            return Quat::IDENTITY;
+        }
+        let scale = Scalar::from_i32(i32::from(ROTATION_SCALE));
+        let component = |c: i16| Scalar::from_i32(i32::from(c)) / scale;
+        Quat::new(component(self.x), component(self.y), component(self.z), component(self.w))
+            .normalize()
     }
 }
 

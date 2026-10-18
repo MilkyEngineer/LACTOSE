@@ -9,7 +9,7 @@
 use std::collections::{BTreeMap, VecDeque, btree_map};
 
 use bytemuck::{Pod, Zeroable};
-use lactose_core::{Result, StableKey, Tick};
+use lactose_core::{Error, ErrorKind, Result, StableKey, Tick};
 
 /// An entity as one connection names it on the wire: a sixteen-bit slot index and the
 /// generation the slot was assigned at, so a slot reused after release is told apart
@@ -38,10 +38,22 @@ impl EntityHandle {
     }
 }
 
+/// One slot of a [`ConnectionHandles`]. Generation zero marks a slot this table has never
+/// assigned or recorded, whose next generation is whatever arrives (the mirror) or one
+/// (the server).
 #[derive(Clone, Copy, Debug)]
 struct HandleSlot {
     generation: u16,
     key: Option<StableKey>,
+}
+
+impl HandleSlot {
+    const UNUSED: Self = Self { generation: 0, key: None };
+}
+
+/// The generation after `generation`, skipping zero.
+const fn next_generation(generation: u16) -> u16 {
+    if generation == u16::MAX { 1 } else { generation + 1 }
 }
 
 /// The handles one connection has assigned, kept identically by the server, which
@@ -68,7 +80,33 @@ impl ConnectionHandles {
     /// slot, else the next never-used slot, with the slot's current generation. Fails with
     /// `ResourceExhausted` when every slot is assigned. The server's side.
     pub fn assign(&mut self, key: StableKey) -> Result<EntityHandle> {
-        todo!()
+        if let Some(&handle) = self.by_key.get(&key) {
+            return Ok(handle);
+        }
+        // A slot on the free list may have been filled by `insert` since its release; a
+        // table that assigns never inserts, so this skip is for robustness only.
+        let index = loop {
+            match self.free.pop() {
+                Some(index) if self.slots[usize::from(index)].key.is_none() => break index,
+                Some(_) => {}
+                None if self.slots.len() < EntityHandle::CAPACITY => {
+                    self.slots.push(HandleSlot::UNUSED);
+                    break u16::try_from(self.slots.len() - 1).expect("below the capacity");
+                }
+                None => {
+                    return Err(Error::new(
+                        ErrorKind::ResourceExhausted,
+                        "every entity handle of the connection is assigned",
+                    ));
+                }
+            }
+        };
+        let slot = &mut self.slots[usize::from(index)];
+        slot.generation = slot.generation.max(1);
+        slot.key = Some(key);
+        let handle = EntityHandle { index, generation: slot.generation };
+        self.by_key.insert(key, handle);
+        Ok(handle)
     }
 
     /// Records that the peer assigned `handle` to `key`: the client's mirror of the
@@ -82,7 +120,35 @@ impl ConnectionHandles {
     /// unreachable (a packet is staged only if its tick is after the newest frame staged),
     /// so the error is a defect, not a path.
     pub fn insert(&mut self, handle: EntityHandle, key: StableKey) -> Result<()> {
-        todo!()
+        if handle.is_none() {
+            return Err(Error::new(ErrorKind::InvalidData, "a spawn names the empty handle"));
+        }
+        if let Some(&held) = self.by_key.get(&key) {
+            return if held == handle {
+                Ok(())
+            } else {
+                Err(Error::new(ErrorKind::InvalidData, "the key already has another handle"))
+            };
+        }
+        let index = usize::from(handle.index);
+        if self.slots.len() <= index {
+            self.slots.resize(index + 1, HandleSlot::UNUSED);
+        }
+        let slot = &mut self.slots[index];
+        if slot.key.is_some() {
+            return Err(Error::new(ErrorKind::InvalidData, "the slot holds another live key"));
+        }
+        let ahead = slot.generation.wrapping_sub(handle.generation);
+        if slot.generation != 0 && (1..=i16::MAX.unsigned_abs()).contains(&ahead) {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                "the slot's generation is newer than the spawn's handle",
+            ));
+        }
+        slot.generation = handle.generation;
+        slot.key = Some(key);
+        self.by_key.insert(key, handle);
+        Ok(())
     }
 
     /// Forgets every assignment and every generation: what the client does when it stages
@@ -92,20 +158,29 @@ impl ConnectionHandles {
     /// resync is looked up after the clear. On a resync the server clears the client's
     /// table the same way and re-enters every relevant entity.
     pub fn clear(&mut self) {
-        todo!()
+        self.slots.clear();
+        self.free.clear();
+        self.by_key.clear();
     }
 
     /// Releases `handle` and returns its key, or `None` if the handle is stale or
     /// unassigned. The slot's generation advances (wrapping from `u16::MAX` to one), so
     /// the released handle never names the slot's next entity.
     pub fn release(&mut self, handle: EntityHandle) -> Option<StableKey> {
-        todo!()
+        let key = self.key_of(handle)?;
+        let slot = &mut self.slots[usize::from(handle.index)];
+        slot.key = None;
+        slot.generation = next_generation(slot.generation);
+        self.by_key.remove(&key);
+        self.free.push(handle.index);
+        Some(key)
     }
 
     /// The key `handle` names, or `None` if the handle is stale or unassigned.
     #[must_use]
     pub fn key_of(&self, handle: EntityHandle) -> Option<StableKey> {
-        todo!()
+        let slot = self.slots.get(usize::from(handle.index))?;
+        if handle.is_none() || slot.generation != handle.generation { None } else { slot.key }
     }
 
     /// The handle of `key`, if assigned.
@@ -213,7 +288,7 @@ pub struct TickHeader {
 
 /// What one sent packet carried, so an acknowledgement advances exactly those entities'
 /// acked ticks and a loss re-queues exactly them.
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
 pub struct PacketRecord {
     /// The packet.
     pub sequence: PacketSequence,
@@ -221,6 +296,8 @@ pub struct PacketRecord {
     pub tick: Tick,
     /// Each entity the packet carried state for, with the tick of that state.
     pub entities: Vec<(EntityHandle, Tick)>,
+    /// Each tombstone the packet carried, with the tick it names.
+    pub tombstones: Vec<(EntityHandle, Tick)>,
 }
 
 /// The ring of the last sent packets' records for one connection (architecture section
@@ -245,18 +322,44 @@ impl PacketRing {
     /// Records a sent packet. When the ring is full the oldest record is evicted and
     /// returned, to be treated as lost.
     pub fn record(&mut self, record: PacketRecord) -> Option<PacketRecord> {
-        todo!()
+        if self.capacity == 0 {
+            return Some(record);
+        }
+        let evicted =
+            if self.records.len() == self.capacity { self.records.pop_front() } else { None };
+        self.records.push_back(record);
+        evicted
     }
 
     /// Takes the record of `sequence`, if the ring holds it.
     pub fn acknowledge(&mut self, sequence: PacketSequence) -> Option<PacketRecord> {
-        todo!()
+        let at = self.records.iter().position(|record| record.sequence == sequence)?;
+        self.records.remove(at)
     }
 
     /// Takes every record whose sequence is before `oldest_live`, in sequence order: the
     /// packets an acknowledgement field can no longer cover, treated as lost.
     pub fn expire(&mut self, oldest_live: PacketSequence) -> Vec<PacketRecord> {
-        todo!()
+        let mut expired = Vec::new();
+        while let Some(record) =
+            self.records.pop_front_if(|record| oldest_live.after(record.sequence))
+        {
+            expired.push(record);
+        }
+        expired
+    }
+
+    /// Takes every entry of `handle`'s state out of the held records, tombstones kept:
+    /// an acknowledgement of a packet sent before then no longer counts for the entity.
+    pub(crate) fn forget_states(&mut self, handle: EntityHandle) {
+        for record in &mut self.records {
+            record.entities.retain(|&(held, _)| held != handle);
+        }
+    }
+
+    /// Drops every record: the connection's handles start over.
+    pub(crate) fn clear(&mut self) {
+        self.records.clear();
     }
 
     /// How many records the ring holds.
