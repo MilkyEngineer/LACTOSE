@@ -8,7 +8,9 @@
 //! bundles: the calls after `setup`, the backend's bytes, the world hash and the handles.
 //! The same holds when `set_tick` made the cursor stale before the full frame (a client's
 //! re-join), where the full diff reads the log retained since the epoch began, and for a
-//! rollback to a slot taken then.
+//! rollback to a slot taken then. No command is in flight across a reload (D126): one
+//! recorded at the reload tick before the physics stage is in that tick's step in both
+//! worlds, and a post-stage reaction carried by a row lands at the same step on every path.
 
 #![forbid(unsafe_code)]
 
@@ -16,13 +18,16 @@ mod common;
 
 use common::*;
 use lactose_core::{StableKey, Tick};
-use lactose_ecs::{RegionConfig, RegionId, RegionMode, WorldKind};
+use lactose_ecs::{
+    ChannelWriter, Mut, RegionConfig, RegionId, RegionMode, Res, StableKeyOf, WorldKind, system,
+};
 use lactose_math::{Scalar, Vec3};
 use lactose_physics_api::{
-    BodyHandle, Collider, Joint, JointHandle, JointKind, RigidBody, Shape, Transform, Velocity,
-    restore, snapshot,
+    BodyHandle, Collider, Joint, JointHandle, JointKind, PhysicsCommand, PhysicsCommands,
+    PhysicsExt, RigidBody, Shape, Transform, Velocity, restore, snapshot,
 };
-use lactose_sim::RegionBundle;
+use lactose_reflect::component;
+use lactose_sim::{CurrentTick, RegionBundle, Registration, Stage, TickInput, TypeTable};
 
 /// A fixed collider and a frozen body in `OTHER_REGION`, which is `Frozen`.
 const STATIC: u64 = 1;
@@ -325,4 +330,140 @@ fn a_rollback_to_a_slot_taken_after_set_tick_repeats_the_fresh_rebuild() {
         assert_eq!(h.calls.take(), first, "unloaded first: {unloaded_first}");
         assert_eq!(handles(&h), handles_first);
     }
+}
+
+// ---- D126: no command in flight across a reload ----
+
+/// An impulse recorded in `Stage::Simulation` of the reload tick against a reloaded body
+/// is in that tick's step, in the reloaded world and in a fresh process loading the same
+/// bundles (review probe q2, without its post-step impulses, which no schedule can hold).
+#[test]
+fn a_command_recorded_at_the_reload_tick_before_the_physics_stage_is_applied() {
+    let now = PhysicsCommand::ApplyImpulse { body: key(MOVING), impulse: v(0, 0, 7) };
+    let mut h = scene();
+    h.script().at(T0 + 1, When::Simulation, key(MOVING), Action::Command(now));
+    h = h.run(T0);
+    let all = [REGION, OTHER_REGION];
+    let loaded = bundles(&h, &all);
+    h.calls.take();
+    h = h.run_with(frame(all, loaded.clone()));
+    let mut other = fresh(T0);
+    other.script().at(T0 + 1, When::Simulation, key(MOVING), Action::Command(now));
+    other = other.run_with(frame([], loaded));
+    let expected = vec![(Tick(T0 + 1), vec![now])];
+    assert_eq!(steps(&h.calls.take()), expected);
+    assert_eq!(steps(&other.calls.take()), expected);
+}
+
+/// A post-stage reaction's decision, which the next tick's simulation stage turns into a
+/// command (D126): a plain-value carrier on the reacting row, written and cleared through
+/// `Mut`, persistent so a save and a snapshot carry it, replicated as a prediction world's
+/// must be.
+#[component(key = "test::armed", persistent, replicated)]
+pub struct Armed(#[field(id = 1)] pub u32);
+
+/// The bodies of the carrier scene, both in `REGION`.
+const ARMED: u64 = 40;
+const BESIDE: u64 = 41;
+
+/// The reaction: at tick `T0`, in `Stage::Post` (a stand-in for a `ContactEvent`).
+#[system(name = "test::react", worlds = [server, prediction])]
+fn react(now: Res<CurrentTick>, row: StableKeyOf, armed: Mut<Armed>) {
+    if now.get().0 == T0 && *row == key(ARMED) {
+        armed.0 = 5;
+    }
+}
+
+/// The next tick's half: the command, from the row's own decision.
+#[system(name = "test::convert", worlds = [server, prediction])]
+fn convert(key: StableKeyOf, armed: Mut<Armed>, physics: ChannelWriter<PhysicsCommands>) {
+    if armed.0 != 0 {
+        physics.apply_impulse(*key, Vec3::Y * Scalar::from_u32(armed.0));
+        armed.0 = 0;
+    }
+}
+
+fn carrier_types(types: &mut TypeTable) -> lactose_core::Result<()> {
+    types.register::<Armed>().map(|_| ())
+}
+
+fn carrier_systems(registration: &mut Registration) {
+    registration.stage(Stage::Simulation).add(&CONVERT);
+    registration.stage(Stage::Post).add(&REACT);
+}
+
+/// A server at `tick` with the carrier's systems.
+fn carrier_harness(tick: u32) -> Harness {
+    let mut options = Options::new(WorldKind::Server);
+    options.tick = Tick(tick);
+    options.game = Some(Game { types: carrier_types, systems: carrier_systems });
+    options.build()
+}
+
+/// The carrier scene run to `T0`, its reaction decided and not yet acted on.
+fn carrier_original() -> Harness {
+    let mut h = carrier_harness(0);
+    for (n, x) in [(ARMED, 0), (BESIDE, 5)] {
+        h.spawn(key(n), (at(x, 0, 0), Velocity::ZERO, floating(), sphere(), Armed(0)));
+    }
+    h.run(T0)
+}
+
+/// The steps and the world hash after each of `ticks` ticks, the first given `first`.
+type Path = (Vec<(Tick, Vec<PhysicsCommand>)>, Vec<u64>);
+
+fn follow(mut h: Harness, first: TickInput, ticks: u32) -> (Harness, Path) {
+    h.calls.take();
+    let mut hashes = Vec::new();
+    h = h.run_with(first);
+    hashes.push(h.simulation.hash().unwrap());
+    for _ in 1..ticks {
+        h = h.run(1);
+        hashes.push(h.simulation.hash().unwrap());
+    }
+    let steps = steps(&h.calls.take());
+    (h, (steps, hashes))
+}
+
+/// Review probe q3: the carrier written in `Stage::Post` of `T0` lands at `T0 + 1`'s step
+/// on the straight path, the one-frame reload, a fresh process loading the `T0` save and a
+/// restore of a `T0` snapshot, and at `T0 + 2`'s on the two-frame reload and the fresh
+/// process loading then, with equal steps and hashes: section 15.5's first test with a
+/// deferred reaction, since no command is in flight at the save.
+#[test]
+fn a_post_stage_reaction_carried_by_a_row_lands_at_the_same_step_on_every_path() {
+    const TICKS: u32 = 20;
+    let impulse = PhysicsCommand::ApplyImpulse { body: key(ARMED), impulse: v(0, 5, 0) };
+    let h = carrier_original();
+    assert_eq!(h.world().get::<Armed>(key(ARMED)).unwrap().0, 5, "the reaction armed the row");
+    let loaded = bundles(&h, &[REGION]);
+    let (_, straight) = follow(h, TickInput::default(), TICKS);
+    assert_eq!(straight.0.first(), Some(&(Tick(T0 + 1), vec![impulse])));
+    assert!(straight.0[1..].iter().all(|(_, commands)| commands.is_empty()), "acted on once");
+
+    let (_, one_frame) = follow(carrier_original(), frame([REGION], loaded.clone()), TICKS);
+    assert_eq!(one_frame, straight, "one frame");
+    let mut fresh = carrier_harness(T0);
+    fresh.world_mut().unload_region(REGION).unwrap();
+    let (_, fresh) = follow(fresh, frame([], loaded.clone()), TICKS);
+    assert_eq!(fresh, straight, "a fresh process");
+
+    let h = carrier_original();
+    let world_snapshot = h.world().snapshot();
+    let physics_snapshot = snapshot(h.world()).unwrap();
+    let (mut h, first) = follow(h, TickInput::default(), TICKS);
+    assert_eq!(first, straight);
+    h.world_mut().restore(&world_snapshot).unwrap();
+    restore(h.world_mut(), &physics_snapshot).unwrap();
+    let (_, again) = follow(h, TickInput::default(), TICKS);
+    assert_eq!(again, straight, "a restore");
+
+    // Unloaded at `T0 + 1`, loaded at `T0 + 2`: the carrier acts there.
+    let unloaded = carrier_original().run_with(frame([REGION], []));
+    let (_, two_frames) = follow(unloaded, frame([], loaded.clone()), TICKS);
+    let mut later = carrier_harness(T0 + 1);
+    later.world_mut().unload_region(REGION).unwrap();
+    let (_, later) = follow(later, frame([], loaded), TICKS);
+    assert_eq!(two_frames, later, "two frames");
+    assert_eq!(two_frames.0.first(), Some(&(Tick(T0 + 2), vec![impulse])));
 }

@@ -14,14 +14,14 @@ use lactose_asset_api::AssetSet;
 use lactose_bundle::{Baseline, ComponentSchema, FieldLayout, Overlay, Record};
 use lactose_core::{NetId, PlayerId, StableKey, Tick};
 use lactose_ecs::{
-    ClaimedBy, Commands, Events, Executor, LayoutConfig, Mut, RegionConfig, RegionId, RegionMode,
-    Res, ResMut, StableKeyOf, SystemSet, World, WorldKind, system,
+    ChannelWriter, ClaimedBy, Commands, Events, Executor, LayoutConfig, Mut, RegionConfig,
+    RegionId, RegionMode, Res, ResMut, StableKeyOf, SystemSet, World, WorldKind, system,
 };
 use lactose_math::{Scalar, Vec3};
 use lactose_physics_api::{
-    Collider, ContactEvent, Joint, Physics, PhysicsBackend, PhysicsCommand, PhysicsConfig,
-    PhysicsExt, RigidBody, Shape, Teleported, Transform, TriggerEvent, Velocity, register_systems,
-    register_types, sets, setup,
+    Collider, ContactEvent, Joint, Physics, PhysicsBackend, PhysicsCommand, PhysicsCommands,
+    PhysicsConfig, PhysicsExt, RigidBody, Shape, Teleported, Transform, TriggerEvent, Velocity,
+    register_systems, register_types, sets, setup,
 };
 use lactose_reflect::component;
 use lactose_sim::{
@@ -165,12 +165,27 @@ pub struct Recorded {
     pub triggers: Vec<(u32, TriggerEvent)>,
 }
 
-fn act(cmd: &mut Commands<'_>, action: Action) {
+/// Carries out `action`. `physics` is the simulation kernel's writer, absent after the
+/// step, where the schedule refuses one (D126): a command scripted there panics, and a
+/// spawn there gets no impulse.
+fn act(
+    cmd: &mut Commands<'_>,
+    physics: Option<&mut ChannelWriter<'_, PhysicsCommands>>,
+    action: Action,
+) {
     match action {
-        Action::Command(command) => cmd.physics().push(command),
+        Action::Command(command) => match physics {
+            Some(physics) => physics.push(command),
+            None => panic!(
+                "a command after the step is a schedule build error: script it in \
+                 `When::Simulation`"
+            ),
+        },
         Action::Spawn(transform) => {
             let spawned = cmd.spawn((transform, Velocity::ZERO, floating(), sphere()));
-            cmd.physics().apply_impulse(spawned, Vec3::X);
+            if let Some(physics) = physics {
+                physics.apply_impulse(spawned, Vec3::X);
+            }
         }
         Action::Despawn(key) => cmd.despawn(key),
         Action::SetTransform(key, transform) => cmd.set(key, transform),
@@ -201,8 +216,10 @@ fn input_tick(world: &mut World, script: Res<Script>) {
 }
 
 #[system(name = "test::simulation", worlds = [server, prediction])]
+#[expect(clippy::too_many_arguments, reason = "the scripted kernel reaches every row column")]
 fn simulation_kernel(
     cmd: Commands,
+    physics: ChannelWriter<PhysicsCommands>,
     key: StableKeyOf,
     now: Res<CurrentTick>,
     script: Res<Script>,
@@ -223,7 +240,7 @@ fn simulation_kernel(
                     **body = rigid;
                 }
             }
-            other => act(&mut cmd, other),
+            other => act(&mut cmd, Some(&mut physics), other),
         }
     }
 }
@@ -231,7 +248,7 @@ fn simulation_kernel(
 #[system(name = "test::after_step", worlds = [server, prediction], in_set = AFTER_STEP_SET)]
 fn after_step(cmd: Commands, now: Res<CurrentTick>, script: Res<Script>) {
     for action in script.actions(now.get().0, When::AfterStep, None) {
-        act(&mut cmd, action);
+        act(&mut cmd, None, action);
     }
 }
 
@@ -248,7 +265,7 @@ fn post_kernel(
     _pos: &Transform,
 ) {
     for action in script.actions(now.get().0, When::Post, Some(*key)) {
-        act(&mut cmd, action);
+        act(&mut cmd, None, action);
     }
 }
 
@@ -289,6 +306,14 @@ pub struct Harness {
     pub calls: CallLog,
 }
 
+/// A test's own types and systems, beside the scripted ones: a carrier of a post-stage
+/// reaction and the kernels that write it and turn it into a command (D126).
+#[derive(Clone, Copy)]
+pub struct Game {
+    pub types: fn(&mut TypeTable) -> lactose_core::Result<()>,
+    pub systems: fn(&mut Registration),
+}
+
 /// How to build a [`Harness`].
 pub struct Options {
     pub kind: WorldKind,
@@ -298,6 +323,7 @@ pub struct Options {
     pub contacts: bool,
     pub config: PhysicsConfig,
     pub tick: Tick,
+    pub game: Option<Game>,
 }
 
 impl Options {
@@ -310,6 +336,7 @@ impl Options {
             contacts: true,
             config: PhysicsConfig::default(),
             tick: Tick(0),
+            game: None,
         }
     }
 
@@ -328,7 +355,10 @@ impl Options {
         let mut types = TypeTable::new();
         register_types(&mut types).unwrap();
         types.register::<Bookkeeping>().unwrap();
-        let mut simulation = SimulationBuilder::new(self.kind, types)
+        if let Some(game) = self.game {
+            (game.types)(&mut types).unwrap();
+        }
+        let mut builder = SimulationBuilder::new(self.kind, types)
             .layout(self.layout)
             .tick(self.tick)
             .setup(move |world| setup(world, backend, config))
@@ -338,9 +368,11 @@ impl Options {
                 Ok(())
             })
             .systems(register_systems)
-            .systems(register_script)
-            .build()
-            .unwrap();
+            .systems(register_script);
+        if let Some(game) = self.game {
+            builder = builder.systems(game.systems);
+        }
+        let mut simulation = builder.build().unwrap();
         let region = RegionConfig { id: REGION, seed: 1, mode: RegionMode::Simulated };
         simulation.world_mut().create_region(region).unwrap();
         Harness { simulation, executor: executor(self.workers), calls }

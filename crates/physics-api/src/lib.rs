@@ -1,8 +1,9 @@
 //! The physics interface (architecture sections 4 and 16): the components that describe a
 //! body, its collider and its joints and the two the write-back writes; the command channel
-//! a kernel writes through `cmd.physics()`; contact and trigger events; queries over the
-//! stepped state; the trait a backend implements; and the snapshot and restore the
-//! prediction world rolls back with. `lactose-physics-rapier` is the backend behind it.
+//! a kernel writes through a `ChannelWriter<PhysicsCommands>` parameter; contact and trigger
+//! events; queries over the stepped state; the trait a backend implements; and the snapshot
+//! and restore the prediction world rolls back with. `lactose-physics-rapier` is the backend
+//! behind it.
 //!
 //! Foundation tier, inside the determinism boundary. `README.md` is the contract: it
 //! states what the signatures cannot, and what a caller and a backend may rely on.
@@ -17,9 +18,10 @@
 //! - A row is a body when it has a [`Transform`] and a [`RigidBody`] or a [`Collider`];
 //!   a [`Joint`] is a row of its own. The write-back writes [`Transform`], [`Velocity`]
 //!   and [`Teleported`] at the sync point that begins `Stage::Post`.
-//! - A kernel moves a body through [`PhysicsExt::physics`] on its `Commands`, or by writing
-//!   the body's rows; it reads contacts through `Events<ContactEvent>` in `Stage::Post`
-//!   and queries through `Res<Physics>` anywhere.
+//! - A kernel moves a body through the [`PhysicsExt`] methods on a
+//!   `ChannelWriter<PhysicsCommands>` parameter in `Stage::Input` or `Stage::Simulation`,
+//!   or by writing the body's rows; it reads contacts through `Events<ContactEvent>` in
+//!   `Stage::Post` and queries through `Res<Physics>` anywhere.
 //! - A backend implements [`PhysicsBackend`]; `app` hands it to [`setup`] with the solver
 //!   pool built outside the boundary, and adds [`register_systems`] and
 //!   [`register_types`].
@@ -60,7 +62,7 @@ mod sync;
 mod systems;
 
 pub use backend::{BodyDesc, BodyState, PhysicsBackend, StepInput, StepOutput};
-pub use command::{PhysicsCommand, PhysicsCommands, PhysicsExt, PhysicsWriter};
+pub use command::{PhysicsCommand, PhysicsCommands, PhysicsExt};
 pub use components::{
     BodyHandle, BodyType, Collider, CollisionGroups, Joint, JointHandle, JointKind, RigidBody,
     Shape, ShapeKind, Teleported, Transform, Velocity, locked_axes,

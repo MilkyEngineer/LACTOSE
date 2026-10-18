@@ -127,9 +127,11 @@ impl SyncState {
 /// `Stage::Simulation` reads the previous step's state, in `Stage::Post` this tick's, and
 /// in `Stage::Physics` it must be ordered after [`sets::STEP`](crate::sets::STEP) or the
 /// schedule fails to build. Kernels on every worker read it at once, so it is `Sync` and
-/// its queries take `&self`. A world whose systems record `cmd.physics()` and that holds
-/// no `Physics` grows the channel without bound, since nothing takes it: `app` and tests
-/// insert one or record nothing.
+/// its queries take `&self`. A world that runs a system with a
+/// `ChannelWriter<PhysicsCommands>` and not the sync fails to build its schedule
+/// (`ScheduleError::ChannelWithoutConsumer`), and one that runs the sync and holds no
+/// `Physics` fails `run_tick` before anything runs: `app` and tests insert one or record
+/// nothing.
 pub struct Physics {
     pub(crate) backend: Box<dyn PhysicsBackend>,
     pub(crate) config: PhysicsConfig,

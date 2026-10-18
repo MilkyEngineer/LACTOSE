@@ -9,7 +9,8 @@
 //! equality is the reload rule's doing; and every body and joint row has its handle row.
 //! Two scenes across two regions: a floor and a pusher beside a three-crate stack, and a
 //! toppling pile of 75 bodies of three shapes with a fixed and a limited spherical joint
-//! whose bodies are in different regions.
+//! whose bodies are in different regions. And a kinematic character through a portal (D126):
+//! a `Transform` written in `Stage::Post` sweeps it, a carried `Teleport` places it.
 
 #![forbid(unsafe_code)]
 
@@ -18,13 +19,16 @@ mod common;
 
 use common::*;
 use lactose_core::{StableKey, Tick};
-use lactose_ecs::{RegionConfig, RegionId, RegionMode, WorldKind};
+use lactose_ecs::{
+    ChannelWriter, Mut, RegionConfig, RegionId, RegionMode, Res, StableKeyOf, WorldKind, system,
+};
 use lactose_math::{Quat, Scalar, Vec3};
 use lactose_physics_api::{
-    BodyHandle, Collider, Joint, JointHandle, JointKind, PhysicsBackend, RigidBody, Shape,
-    Transform, Velocity,
+    BodyHandle, Collider, Joint, JointHandle, JointKind, PhysicsBackend, PhysicsCommands,
+    PhysicsExt, RigidBody, Shape, Teleported, Transform, Velocity,
 };
-use lactose_sim::RegionBundle;
+use lactose_reflect::component;
+use lactose_sim::{CurrentTick, RegionBundle, Registration, Stage, TypeTable};
 
 const REGIONS: [RegionId; 2] = [REGION, OTHER_REGION];
 const FLOOR: u64 = 1;
@@ -209,4 +213,99 @@ fn a_stack_reloaded_in_place_equals_a_fresh_process() {
 #[test]
 fn a_pile_with_joints_reloaded_in_place_equals_a_fresh_process() {
     reloads_equal_a_fresh_process(pile, 2, 60, 120);
+}
+
+/// A character at a portal, a plain-value carrier the post stage arms (a stand-in for the
+/// contact that decides it) and the next tick's simulation stage acts on (D126).
+#[component(key = "test::portal", persistent, replicated)]
+pub struct Portal(#[field(id = 1)] pub u32);
+
+/// When the character reaches the portal, and where the portal leads: a fixed destination,
+/// as a level's cooked data would give it.
+const PORTAL_TICK: u32 = 10;
+const CHARACTER: u64 = 5;
+const CRATE: u64 = 6;
+
+fn exit() -> Transform {
+    Transform::at(Vec3::new(f(3.0), f(0.41), f(0.0)))
+}
+
+#[system(name = "test::enter_portal", worlds = [server, prediction])]
+fn enter_portal(now: Res<CurrentTick>, portal: Mut<Portal>) {
+    if now.get().0 == PORTAL_TICK {
+        portal.0 = 1;
+    }
+}
+
+/// The character's own kernel records the teleport on itself.
+#[system(name = "test::go_through", worlds = [server, prediction])]
+fn go_through(key: StableKeyOf, portal: Mut<Portal>, physics: ChannelWriter<PhysicsCommands>) {
+    if portal.0 != 0 {
+        physics.teleport(*key, exit());
+        portal.0 = 0;
+    }
+}
+
+fn portal_types(types: &mut TypeTable) -> lactose_core::Result<()> {
+    types.register::<Portal>().map(|_| ())
+}
+
+fn portal_systems(registration: &mut Registration) {
+    registration.stage(Stage::Simulation).add(&GO_THROUGH);
+    registration.stage(Stage::Post).add(&ENTER_PORTAL);
+}
+
+/// The character and the crate after `PORTAL_TICK + 3` ticks, and the crate before the
+/// character moved: through a `Transform` written in `Stage::Post`, or through the
+/// carrier.
+fn through_the_portal(carried: bool) -> (Transform, Option<Teleported>, Transform, Transform) {
+    let mut options = Options::new(WorldKind::Server);
+    options.game = Some(Game { types: portal_types, systems: portal_systems });
+    let mut h = options.build_with(rapier(), CallLog::default());
+    let other = RegionConfig { id: OTHER_REGION, seed: 2, mode: RegionMode::Simulated };
+    h.world_mut().create_region(other).unwrap();
+    floor(&mut h);
+    let at = |x: f64, y: f64| Transform::at(Vec3::new(f(x), f(y), f(0.0)));
+    let cube = || Collider::new(Shape::cuboid(Vec3::new(f(0.4), f(0.4), f(0.4))));
+    // The kinematic character, and a crate touching its +x face.
+    let (pose, kinematic) = (at(-3.0, 0.41), RigidBody::kinematic());
+    if carried {
+        h.spawn(key(CHARACTER), (pose, Velocity::ZERO, kinematic, cube(), Portal(0)));
+    } else {
+        h.spawn(key(CHARACTER), (pose, Velocity::ZERO, kinematic, cube()));
+        h.script().at(
+            PORTAL_TICK,
+            When::Post,
+            key(CHARACTER),
+            Action::SetTransform(key(CHARACTER), exit()),
+        );
+    }
+    h.spawn(key(CRATE), (at(-2.2, 0.4), Velocity::ZERO, RigidBody::dynamic(), cube()));
+    h = h.run(PORTAL_TICK);
+    let crate_before = *h.world().get::<Transform>(key(CRATE)).unwrap();
+    h = h.run(3);
+    let world = h.world();
+    (
+        *world.get::<Transform>(key(CHARACTER)).unwrap(),
+        world.get::<Teleported>(key(CHARACTER)).copied(),
+        crate_before,
+        *world.get::<Transform>(key(CRATE)).unwrap(),
+    )
+}
+
+/// Review probe s2 (D126): a kinematic body given a `Transform` through `Commands::set`
+/// in `Stage::Post` is swept to it through a crate touching its face, which is thrown;
+/// a `Teleport` recorded in the next tick's `Stage::Simulation` by the body's own kernel,
+/// from a carrier the post stage armed, places it, and the crate stays at rest.
+#[test]
+fn a_post_stage_transform_write_sweeps_where_a_carried_teleport_places() {
+    let (character, teleported, before, after) = through_the_portal(false);
+    assert_eq!(character.translation.x, exit().translation.x);
+    assert_eq!(teleported, None, "a sweep is not a teleport");
+    assert!(after.translation.x - before.translation.x > f(5.0), "thrown: {after:?}");
+
+    let (character, teleported, before, after) = through_the_portal(true);
+    assert_eq!(character.translation.x, exit().translation.x);
+    assert_eq!(teleported, Some(Teleported(Tick(PORTAL_TICK + 1))));
+    assert!((after.translation.x - before.translation.x).abs() < f(0.05), "moved: {after:?}");
 }
