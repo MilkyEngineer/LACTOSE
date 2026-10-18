@@ -75,8 +75,9 @@ pub struct RegionRecords {
     /// same order, each of its resource's size. What lets a resource of an older schema
     /// version be migrated, as an overlay's own schema table does for its records.
     pub resource_schemas: Vec<ComponentSchema>,
-    /// The keys of the transient region resources, strictly ascending: present and
-    /// hashed, never saved by value, restored zeroed.
+    /// The keys of the transient region resources, strictly ascending and disjoint from
+    /// the types of `resources`: present and hashed, never saved by value, restored
+    /// zeroed.
     pub transient_resources: Vec<ComponentKey>,
     /// The layout digest of every type the records carry bytes of, at the version they
     /// were written: exactly the components of the overlay's schema table and the types of
@@ -109,11 +110,12 @@ impl RegionRecords {
     /// Whether these records are in canonical form: `overlay` is `None` or holds a record;
     /// `baseline_hash` equals the overlay's; `resources` is strictly ascending by key with
     /// `resource_schemas` one per resource in the same order, each schema naming its
-    /// resource's type and stating its size; `transient_resources` is strictly ascending;
-    /// and `layouts` has exactly one entry per component the overlay carries bytes of and
-    /// per resource. Fails with `InvalidData` naming the first failure. Every builder,
-    /// writer and decoder of records in this crate holds this, so a caller that assembles
-    /// records by hand runs it before handing them over.
+    /// resource's type and stating its size; `transient_resources` is strictly ascending
+    /// and names no type `resources` holds; and `layouts` has exactly one entry per
+    /// component the overlay carries bytes of and per resource. Fails with `InvalidData`
+    /// naming the first failure. Every builder, writer and decoder of records in this
+    /// crate holds this, so a caller that assembles records by hand runs it before handing
+    /// them over.
     pub fn check(&self) -> Result<()> {
         todo!("check each canonical rule in order")
     }

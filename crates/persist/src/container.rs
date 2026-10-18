@@ -120,13 +120,15 @@ impl ContainerHeader {
 /// regions one at a time.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct RegionIndexEntry {
-    /// The region.
+    /// The region, as the section's content also states it.
     pub region: RegionId,
-    /// Its seed, as the section carries it.
+    /// Its seed, as the section's content also states it.
     pub seed: u64,
-    /// The content hash of the baseline its overlay was made against.
+    /// The content hash of the baseline its overlay was made against, as the section's
+    /// content also states it.
     pub baseline_hash: u64,
-    /// The overlay's digest, or `None` for a region in its cooked state.
+    /// The overlay's digest, or `None` for a region in its cooked state; what the
+    /// section's overlay must have.
     pub overlay_digest: Option<u64>,
     /// Where the section's bytes start, from the first byte of the container. Zero in an
     /// [`EncodedSection`] until [`Container::assemble`] places it.
@@ -159,19 +161,34 @@ impl ContainerIndex {
 }
 
 /// One region's section as it goes into a container: its index entry (with `offset` zero)
-/// and its compressed bytes. Made by [`RegionRecords::encode_section`] on whichever worker
-/// diffed the region, and placed by [`Container::assemble`].
+/// and its compressed bytes. Only [`RegionRecords::encode_section`] builds one, on
+/// whichever worker diffed the region, so an entry agrees with its bytes by construction
+/// and [`Container::assemble`] takes them as made.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct EncodedSection {
-    /// The entry, as [`Container::index`] will report it once the section is placed.
-    pub entry: RegionIndexEntry,
-    /// The section's bytes, `entry.compressed_bytes` long, hashing to `entry.hash`.
-    pub bytes: Vec<u8>,
+    entry: RegionIndexEntry,
+    bytes: Vec<u8>,
+}
+
+impl EncodedSection {
+    /// The entry, as [`Container::index`] will report it once the section is placed:
+    /// `offset` zero, the sizes and the hash those of [`bytes`](Self::bytes).
+    #[must_use]
+    pub fn entry(&self) -> &RegionIndexEntry {
+        &self.entry
+    }
+
+    /// The section's bytes, `entry().compressed_bytes` long, hashing to `entry().hash`.
+    #[must_use]
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
 }
 
 impl RegionRecords {
     /// These records as a section: one zstd frame, level and parameters pinned by the
-    /// implementation, carrying its content size, whose content is the overlay as
+    /// implementation, carrying its content size, whose content is the region, the seed
+    /// and the baseline hash (so a section states what its entry claims), the overlay as
     /// `Overlay::encode` behind a presence byte, the resource schema table as
     /// `lactose-bundle` writes one, the resources as key and bytes of the schema's size,
     /// the transient keys ascending, and the layout digests as key and digest ascending;
@@ -299,9 +316,12 @@ impl Container {
     /// Fails with `InvalidData` for a slice of another length or whose xxh64 is not
     /// `entry.hash` (before decompressing), for a frame that does not decompress to exactly
     /// `entry.bytes`, for content that is not the canonical encodings `lactose-bundle` and
-    /// this crate accept, or for records that fail [`RegionRecords::check`]; nothing is
-    /// allocated beyond `entry.bytes` plus `lactose-bundle`'s bound on its documents. A
-    /// failure here says nothing about any other section.
+    /// this crate accept, for content whose region, seed, baseline hash, or overlay
+    /// presence and digest differ from the entry's (an index that disagrees with its
+    /// section is never shown as the section), or for records that fail
+    /// [`RegionRecords::check`]; nothing is allocated beyond `entry.bytes` plus
+    /// `lactose-bundle`'s bound on its documents. A failure here says nothing about any
+    /// other section.
     pub fn decode_section(entry: &RegionIndexEntry, section: &[u8]) -> Result<RegionRecords> {
         todo!("check the hash, decompress to the stated size, decode the content")
     }

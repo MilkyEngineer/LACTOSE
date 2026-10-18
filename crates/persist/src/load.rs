@@ -48,15 +48,21 @@ impl<'a> Loader<'a> {
     /// carried type is at the registry's version and digest come back equal, the overlay
     /// as the same `Arc`.
     ///
-    /// A type whose persistence changed since the save: a resource the registry now says
-    /// is transient leaves `resources` and joins `transient_resources` (its value is
-    /// dropped and the region restores it zeroed); a transient key whose type the registry
-    /// now says is persistent is `VersionMismatch`, since a value is needed and none was
-    /// saved; a component is decided by `migrate`'s rule on its bytes, zeroes loading as
-    /// the value when the type became persistent. Fails as the two migrations fail, with
-    /// `NotFound` for a resource type the table does not know, and with `InvalidData` for
-    /// records that fail [`RegionRecords::check`] or for a resource that is not a saved
-    /// resource (a derived type, or a component).
+    /// A type whose persistence changed since the save takes one rule for a resource and a
+    /// component alike: now transient, the saved value is dropped and the type is restored
+    /// zeroed (a resource leaves `resources` and joins `transient_resources`; a component's
+    /// bytes are never read, `migrate_overlay`); now persistent, the type is restored
+    /// zeroed as a persistent value (a transient key leaves `transient_resources` and
+    /// joins `resources` as the all-zero value under the registry's schema and digest; a
+    /// component's zeroed bytes go through `migrate`'s persistent rule), which
+    /// [`bundle`](Self::bundle) then validates like any value, so a type whose all-zero
+    /// value is invalid refuses the region with `InvalidData`; now derived, the type is
+    /// dropped (a transient key or a resource leaves the records; a component leaves its
+    /// record), since a derived value is rebuilt on load and never comes from a document,
+    /// and the build declared it so. Fails as the two migrations fail, with `NotFound` for
+    /// a resource or transient type the table does not know, and with `InvalidData` for
+    /// records that fail [`RegionRecords::check`] or for a resource whose type is a
+    /// component.
     pub fn migrate(&self, records: &RegionRecords) -> Result<RegionRecords> {
         todo!("migrate the overlay and the resources, or return the records unchanged")
     }
@@ -70,8 +76,9 @@ impl<'a> Loader<'a> {
     /// patched, so [`RegionRecords::rebase`] first); the records are [migrated](Self::migrate);
     /// the overlay, if any, passes `Overlay::check_against(baseline)`; every value a
     /// record or a resource carries is validated against the registry
-    /// (`TypeInfo::validate`, `InvalidData`), a transient component's by presence alone,
-    /// since it is zeroed; a baseline column whose schema is not the table's is
+    /// (`TypeInfo::validate`, `InvalidData`), a resource restored zeroed by `migrate`
+    /// included and a transient component by presence alone, since it is zeroed; a
+    /// baseline column whose schema is not the table's is
     /// `VersionMismatch` here rather than at the sync point (a baseline is never migrated:
     /// the cooker of this build re-cooks it, and the records are rebased onto the result;
     /// a baseline carries no layout digest, so a same-size layout change in a cooked column

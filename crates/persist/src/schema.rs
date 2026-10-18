@@ -13,32 +13,42 @@ use lactose_reflect::{Persistence, Registry, TypeInfo, TypeRole};
 /// [`ComponentSchema`] does not see, in one number.
 ///
 /// It is the xxh64, seed zero, over the layout part of
-/// [`TypeInfo::write_schema`](lactose_reflect::TypeInfo::write_schema): the bytes that
+/// [`TypeInfo::write_schema`](lactose_reflect::TypeInfo::write_schema), the bytes that
 /// encoding appends after its first fifteen (the key, the version, the role, the
 /// persistence and the tracking bits), that is, from the layout's size on: size,
 /// alignment, the count of non-padding fields, and each field's ID, offset, size, type tag
 /// and kind, with nested layouts, enum sizes and discriminants, and array lengths and
-/// element kinds written out. The tracking bits are left out on purpose: marking a type
-/// replicated or extracted changes no saved byte.
+/// element kinds written out; with one change: a field, or an array element, of kind
+/// `Struct` or `Enum` contributes an empty type tag (a zero length and no bytes) in place
+/// of its Rust name, since its structure follows and a name is not a layout. The tracking
+/// bits are left out on purpose: marking a type replicated or extracted changes no saved
+/// byte. A primitive's tag stays, since it is what tells `u32` from `RegionId`.
 ///
 /// A `ComponentSchema` holds the key, the version, the size and each top-level field's ID,
 /// offset and size, so three kinds of change leave it equal: a reorder inside a nested
-/// `#[value]` struct, renumbered enum discriminants, and a same-size type change (`u64` to
-/// `Scalar`, `i32` to `u32`). The digest sees all three, so a save carries it beside each
-/// saved type's schema and [`Migrations::migrate`](crate::Migrations::migrate) refuses
-/// equal versions with different digests. What no digest sees is a change of meaning
-/// under an unchanged layout (a field's unit, a renamed variant with the same
-/// discriminant): only a version bump and a step carry that, and the build-time guard
-/// D129 names (a committed registry dump compared by a test) is what makes the bump
-/// hard to forget.
+/// `#[value]` struct, renumbered enum discriminants, and a same-size type change (`i32` to
+/// `u32`; `u64` to `Scalar` on a 64-bit scalar build, `u32` on a 32-bit one). The digest
+/// sees all three, so a save carries it beside each saved type's schema and
+/// [`Migrations::migrate`](crate::Migrations::migrate) refuses equal versions with
+/// different digests. Free, because no saved byte depends on them: renaming a field (its
+/// ID stays), a `#[value]` struct or enum type, or an enum variant (its discriminant is
+/// the saved value, and variant names are not in `write_schema`). What no digest sees is
+/// a change of meaning under an unchanged layout (a field's unit; one enum replaced by
+/// another with the same size and discriminants; one primitive by another of the same
+/// tag): only a version bump and a step carry that, and the build-time guard D129 names
+/// (a committed record of each saved type's version and digest, compared by a test that
+/// fails when the digest changed and the version did not) is what makes the bump hard to
+/// forget.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct LayoutDigest(pub u64);
 
 impl LayoutDigest {
-    /// The digest of `info`'s layout, as stated on the type.
+    /// The digest of `info`'s layout, as stated on the type: the implementation walks the
+    /// layout as `write_schema` does and writes the same bytes, empty tags for `Struct` and
+    /// `Enum` kinds.
     #[must_use]
     pub fn of(info: &TypeInfo) -> Self {
-        todo!("hash the layout part of `write_schema`")
+        todo!("hash the layout part of `write_schema` with empty struct and enum tags")
     }
 }
 

@@ -206,20 +206,29 @@ impl Migrations {
     /// under the overlay's schema of that component and the digest `layouts` holds for it,
     /// and the overlay rebuilt against the same baseline hash with the table's schemas. An
     /// overlay whose every carried type is at the registry's version and digest, a
-    /// transient type at the table's schema counting as such, is returned as the same
-    /// `Arc`, equal by content and by digest, so a client's cached copy still matches; a
-    /// migrated overlay is a new document with a new digest. A transient component is
-    /// taken by presence: its bytes become zeroes of the registry's size under the table's
-    /// schema, with no version or digest check and no step. `Destroy`, `RemoveComponent`
-    /// and `OwnershipChange` carry no component bytes and pass through.
+    /// transient type whose overlay schema equals the table's counting as such, is
+    /// returned as the same `Arc`, equal by content and by digest, so a client's cached
+    /// copy still matches; a migrated overlay is a new document with a new digest.
+    /// `Destroy`, `RemoveComponent` and `OwnershipChange` carry no component bytes and pass
+    /// through.
+    ///
+    /// A transient component is taken by presence, with no version or digest check and no
+    /// step: its bytes are never read. When its overlay schema equals the table's they are
+    /// kept as they are, zero or not, since `World::load_region` zeroes a transient
+    /// component whatever a document says; when the schema differs (a layout change to a
+    /// transient type) the record's component is rewritten as zeroes of the registry's size
+    /// under the table's schema, since the loader requires every schema of a document to
+    /// match the registry's. A component the registry now says is `derived` is dropped from
+    /// the record (and a `RemoveComponent` or `SetField` of it dropped whole): a derived
+    /// value is rebuilt on load and never comes from a document, and the build declared it
+    /// so.
     ///
     /// Fails as [`migrate`](Self::migrate) fails; with `NotFound` for a component the table
     /// does not know (a removed type: never dropped silently); with `InvalidData` for a
-    /// derived component, or a carried component `layouts` lacks; and with `Unsupported`
-    /// for a `SetField` record of a component whose version or digest differs, since one
-    /// field cannot be migrated without the rest of its value (this crate's diff never
-    /// writes a `SetField`, so none is in a save it wrote; one at the registry's version and
-    /// digest passes through).
+    /// carried component `layouts` lacks; and with `Unsupported` for a `SetField` record of
+    /// a component whose version or digest differs, since one field cannot be migrated
+    /// without the rest of its value (this crate's diff never writes a `SetField`, so none
+    /// is in a save it wrote; one at the registry's version and digest passes through).
     pub fn migrate_overlay(
         &self,
         overlay: &Arc<Overlay>,
