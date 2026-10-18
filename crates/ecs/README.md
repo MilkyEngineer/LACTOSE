@@ -306,9 +306,9 @@ What a system is, from its parameters (`SystemParam` has the table):
   anything runs, by reference); a future dropped mid-tick drops the world when the jobs
   finish, a forgotten one leaks it. `run_pass` runs the stages between ticks without
   advancing the tick or zeroing or clearing anything at its first sync point (its closing
-  sync point clears every channel, as every run's does), its writes stamped after every position of the
-  tick: extract, the replication gather and the save copy are schedules of exclusive
-  systems that take `Job` and fork over `World::columns`. Children of such a fork key what
+  sync point clears every channel, as every run's does), its writes stamped after every
+  position of the tick: extract, the replication gather and the save copy are schedules of
+  exclusive systems that take `Job` and fork over `World::columns`. Children of such a fork key what
   they produce by `StableKey`; the worker index is banned by the boundary lint file.
 
 **Regions**

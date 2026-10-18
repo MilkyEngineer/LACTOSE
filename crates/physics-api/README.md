@@ -331,12 +331,12 @@ gather compare it with the last tick they covered, and zero means never.
   which is what a load, a replay and a rollback need.
 - No command is untaken between ticks (D126, the first bullet), so section 15.5's first
   test holds for physics with no condition.
-- A world that runs a system with a `ChannelWriter<PhysicsCommands>` and not
-  `physics_api::sync` fails to build its schedule (`ScheduleError::ChannelWithoutConsumer`),
-  and one that runs the sync and holds no `Physics` resource fails `run_tick` before
-  anything runs (`ScheduleError::MissingResource`): `app` registers the systems and inserts
-  the resource in every world that runs such systems, and a test does the same or records
-  nothing.
+- A world that runs a system with a `ChannelWriter<PhysicsCommands>` and neither
+  `physics_api::sync` nor a later-stage reader of the channel fails to build its schedule
+  (`ScheduleError::ChannelWithoutConsumer`), and one that runs the sync and holds no
+  `Physics` resource fails `run_tick` before anything runs
+  (`ScheduleError::MissingResource`): `app` registers the systems and inserts the resource
+  in every world that runs such systems, and a test does the same or records nothing.
 - A command for a key that is not a body when the step runs is dropped and logged at
   target `physics`. An impulse or force on a kinematic, fixed or frozen body is dropped
   likewise. A `Teleport` works on every body.

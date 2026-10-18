@@ -14,7 +14,8 @@ use common::*;
 use lactose_core::{EntityRef, StableKey};
 use lactose_ecs::{
     Channel, ChannelTake, ChannelWriter, ClaimedBy, Commands, Ctx, Event, EventWriter, Events,
-    LayoutConfig, Mut, Res, Schedule, ScheduleError, StableKeyOf, World, WorldKind, system,
+    LayoutConfig, Mut, Res, Schedule, ScheduleError, StableKeyOf, World, WorldKind, finalize,
+    system,
 };
 use lactose_math::{Scalar, Vec2};
 use lactose_reflect::component;
@@ -401,4 +402,46 @@ fn a_take_yields_the_earlier_stages_entries_with_keys_resolved_once() {
         taken,
         [vec![(net(1), 1), (net(41), 1)], vec![(net(2), 1), (net(42), 1)], Vec::new()]
     );
+}
+
+/// A reduction whose finalize writes the channel: one entry naming the row count.
+#[system(name = "test::count_rows", worlds = [server], reduce = lactose_math::IntSum<u32>)]
+fn count_rows(_counter: &Counter) -> u32 {
+    1
+}
+
+#[finalize(count_rows)]
+fn push_count(sum: i128, physics: ChannelWriter<Physics>) {
+    physics.apply_impulse(net(500 + u64::try_from(sum).unwrap()), Vec2::ZERO);
+}
+
+#[system(name = "test::push_exclusive", worlds = [server], exclusive)]
+fn push_exclusive(world: &mut World, physics: ChannelWriter<Physics>) {
+    let _ = world.tick();
+    physics.apply_impulse(net(600), Vec2::ZERO);
+}
+
+#[system(name = "test::push_once", worlds = [server])]
+fn push_once(physics: ChannelWriter<Physics>) {
+    physics.apply_impulse(net(700), Vec2::ZERO);
+}
+
+#[test]
+fn a_finalize_an_exclusive_and_a_once_per_tick_writer_reach_a_later_stage() {
+    let executor = executor();
+    let mut world = world(WorldKind::Server, LayoutConfig::default());
+    for id in [5, 6, 7] {
+        world.spawn(net(id), REGION, (Counter(0),)).unwrap();
+    }
+    world.insert_service::<Seen>(Box::new(Mutex::new(Vec::new())));
+    let mut builder = Schedule::builder(WorldKind::Server);
+    builder.stage("write", &[]).add(&COUNT_ROWS).add(&PUSH_EXCLUSIVE).add(&PUSH_ONCE);
+    builder.stage("read", &[]).add(&READ_IMPULSES_LATER);
+    let mut schedule = builder.build().unwrap();
+    // Each tick's reader sees each writer's entry once, with no source: none of the three
+    // runs for an entity.
+    for _ in 0..3 {
+        world = tick(&mut schedule, world, &executor);
+        assert_eq!(take_seen(&mut world), [(net(600), 0), (net(503), 0), (net(700), 0)]);
+    }
 }

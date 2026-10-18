@@ -77,9 +77,9 @@ pub use systems::{register_systems, sets};
 /// What the contract promises at the type level, pinned so the implementation cannot lose
 /// it without a compile error: kernels on every worker read `Physics` at once; a snapshot,
 /// a command and the step's lists cross threads; the events and the channel are what the
-/// ECS requires of them; and no layout depends on the scalar's width (architecture section 16): each component is its
-/// scalars, then a tail that is a multiple of eight bytes, so the sizes below hold for a
-/// four-byte scalar as for an eight-byte one.
+/// ECS requires of them; and no layout depends on the scalar's width (architecture section
+/// 16): each component is its scalars, then a tail that is a multiple of eight bytes, so
+/// the sizes below hold for a four-byte scalar as for an eight-byte one.
 const _: () = {
     use lactose_ecs::{CommandChannel, Event};
     use lactose_math::Scalar;

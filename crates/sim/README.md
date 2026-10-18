@@ -581,8 +581,9 @@ collision-checked as a system key is) to the opaque bytes `app` took from that s
 the checkpoint, which the replay driver hands back after the regions load and before the
 first step: the physics snapshot of `lactose-physics-api` goes there, the backend's whole
 world and the sync's pending work, since the solver holds state the rows do not carry and a
-replay without it hashes equal only until the first contact; this crate never reads the bytes and they are not hashed state; until the byte form
-exists, D124, a replay is bit-exact from a session's start only),
+replay without it hashes equal only until the first contact; this crate never reads the
+bytes and they are not hashed state; until the byte form exists, D124, a replay is
+bit-exact from a session's start only),
 and one `JournalFrame` per tick after it; `JournalFrame::record(tick, &input)` is the
 frame's record, mirroring `TickInput` field for field in its application order, with
 tables as `VersionTable`s and bundles as `JournalLoad` (the baseline by content hash, with

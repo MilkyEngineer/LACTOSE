@@ -172,12 +172,38 @@ struct Output {
     /// Whether the invocation is a reduction's finalize, whose table is the finalize's.
     finalize: bool,
     commands: CommandBuffer,
-    /// One sink per parameter; only `EventWriter` parameters fill theirs.
+    /// One sink per parameter, or none when no parameter is an `EventWriter`; only
+    /// `EventWriter` parameters fill theirs.
     events: Vec<Vec<EventRecord>>,
-    /// One sink per parameter; only `PresentEvents` parameters fill theirs.
+    /// One sink per parameter, or none when no parameter is `PresentEvents`; only
+    /// `PresentEvents` parameters fill theirs.
     present: Vec<Vec<PresentRecord>>,
-    /// One sink per parameter; only `ChannelWriter` parameters fill theirs.
+    /// One sink per parameter, or none when no parameter is a `ChannelWriter`; only
+    /// `ChannelWriter` parameters fill theirs.
     channels: Vec<Vec<ChannelCommand>>,
+}
+
+/// How many sinks of each kind an invocation of one table gets: one per parameter when a
+/// parameter fills that kind, none otherwise. Counted once per table, so an invocation of
+/// a system that writes no event, presentation event or channel allocates no sink.
+#[derive(Clone, Copy)]
+struct Sinks {
+    events: usize,
+    present: usize,
+    channels: usize,
+}
+
+impl Sinks {
+    fn of(table: &[Access]) -> Self {
+        let per_parameter = |kind| {
+            if table.iter().any(|access| access.kind() == kind) { table.len() } else { 0 }
+        };
+        Self {
+            events: per_parameter(AccessKind::EmitEvents),
+            present: per_parameter(AccessKind::PresentEvents),
+            channels: per_parameter(AccessKind::WriteChannel),
+        }
+    }
 }
 
 impl Output {
@@ -185,16 +211,16 @@ impl Output {
         source: Source,
         claim: Option<PlayerId>,
         region: Option<RegionId>,
-        params: usize,
+        sinks: Sinks,
     ) -> Self {
         Self {
             source,
             claim,
             finalize: false,
             commands: CommandBuffer::new(region),
-            events: (0..params).map(|_| Vec::new()).collect(),
-            present: (0..params).map(|_| Vec::new()).collect(),
-            channels: (0..params).map(|_| Vec::new()).collect(),
+            events: (0..sinks.events).map(|_| Vec::new()).collect(),
+            present: (0..sinks.present).map(|_| Vec::new()).collect(),
+            channels: (0..sinks.channels).map(|_| Vec::new()).collect(),
         }
     }
 
@@ -203,7 +229,9 @@ impl Output {
     /// whether the output is kept, so an invocation whose only output is a channel entry
     /// keeps it.
     fn close_channels(&mut self) {
-        self.commands.close_channels(&mut self.channels);
+        if !self.channels.is_empty() {
+            self.commands.close_channels(&mut self.channels);
+        }
     }
 
     fn is_empty(&self) -> bool {
@@ -411,7 +439,7 @@ fn run_system(
             (reducer.merge)(&mut *total, &**partial);
         }
         let table = system.finalize_access();
-        let mut output = Output::new(Source::Tick, None, None, table.len());
+        let mut output = Output::new(Source::Tick, None, None, Sinks::of(table));
         output.finalize = true;
         {
             let handles = mut_handles(&mut taken);
@@ -501,7 +529,7 @@ fn run_exclusive(
         }
     }
     let table = system.access();
-    let mut output = Output::new(Source::Tick, None, None, table.len());
+    let mut output = Output::new(Source::Tick, None, None, Sinks::of(table));
     {
         let handles = mut_handles(taken);
         let mut env =
@@ -543,7 +571,7 @@ fn run_once(
     partials: &mut Vec<Box<dyn Any>>,
 ) {
     let table = system.access();
-    let mut output = Output::new(Source::Tick, None, None, table.len());
+    let mut output = Output::new(Source::Tick, None, None, Sinks::of(table));
     let mut partial = system.kernel().reducer.map(|reducer| (reducer.identity)());
     {
         let handles = mut_handles(taken);
@@ -573,6 +601,7 @@ fn run_per_region(
 ) {
     let table = system.access();
     let shared = shared_handles(taken);
+    let sinks = Sinks::of(table);
     let world = &*world;
     for (&region, state) in &world.regions {
         if state.mode != RegionMode::Simulated {
@@ -585,7 +614,7 @@ fn run_per_region(
         if lacks_resource {
             continue;
         }
-        let mut output = Output::new(Source::Region(region), None, Some(region), table.len());
+        let mut output = Output::new(Source::Region(region), None, Some(region), sinks);
         let mut partial = system.kernel().reducer.map(|reducer| (reducer.identity)());
         {
             let handles = shared.iter().map(|&(id, value)| (id, Handle::Shared(value))).collect();
@@ -632,6 +661,7 @@ fn run_per_entity(
 ) {
     let table = system.access();
     let shared = shared_handles(taken);
+    let sinks = Sinks::of(table);
     let World { storage, regions, events, channels, kind, layout, tick, .. } = world;
     let (tick, layout) = (*tick, *layout);
     let component = |access: &Access| match access.target() {
@@ -720,7 +750,7 @@ fn run_per_entity(
                 partials.extend(partial.replace((reducer.identity)()));
             }
 
-            let mut output = Output::new(Source::Entity(key), claim, Some(region), table.len());
+            let mut output = Output::new(Source::Entity(key), claim, Some(region), sinks);
             {
                 let handles =
                     shared.iter().map(|&(id, value)| (id, Handle::Shared(value))).collect();

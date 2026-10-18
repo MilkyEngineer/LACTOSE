@@ -125,10 +125,10 @@ impl SyncState {
 /// in `Stage::Physics` it must be ordered after [`sets::STEP`](crate::sets::STEP) or the
 /// schedule fails to build. Kernels on every worker read it at once, so it is `Sync` and
 /// its queries take `&self`. A world that runs a system with a
-/// `ChannelWriter<PhysicsCommands>` and not the sync fails to build its schedule
-/// (`ScheduleError::ChannelWithoutConsumer`), and one that runs the sync and holds no
-/// `Physics` fails `run_tick` before anything runs: `app` and tests insert one or record
-/// nothing.
+/// `ChannelWriter<PhysicsCommands>` and neither the sync nor a later-stage reader of the
+/// channel fails to build its schedule (`ScheduleError::ChannelWithoutConsumer`), and one
+/// that runs the sync and holds no `Physics` fails `run_tick` before anything runs: `app`
+/// and tests insert one or record nothing.
 pub struct Physics {
     pub(crate) backend: Box<dyn PhysicsBackend>,
     pub(crate) config: PhysicsConfig,
@@ -293,9 +293,10 @@ pub fn setup(
 /// joints, the region modes, the aliases and the unbound predicted bodies, what the last
 /// write-back wrote, the structural log entries after the sync's cursor in order and the
 /// keys changed since its mark across the five columns, so that after [`restore`] a
-/// re-simulated tick's sync makes exactly the backend calls the first run's did, apart from the calls [`corrected`] adds. The size
-/// is what milestone 1 measures against the prediction-world budget, for the claimed bodies
-/// plus the statics, which decides how many statics a prediction world may hold.
+/// re-simulated tick's sync makes exactly the backend calls the first run's did, apart
+/// from the calls [`corrected`] adds. The size is what milestone 1 measures against the
+/// prediction-world budget, for the claimed bodies plus the statics, which decides how
+/// many statics a prediction world may hold.
 pub struct PhysicsSnapshot {
     identity: Arc<()>,
     tick: Tick,

@@ -371,7 +371,7 @@ impl<'r, 'j, C: CommandChannel> Fetch<'r, 'j> for ChannelWriter<'r, C> {
 /// One entry of a channel, in command order, keys resolved.
 pub struct ChannelEntry<C: CommandChannel> {
     /// The origin key of the entity whose kernel invocation wrote the entry, or `None` from
-    /// a per-region, once-per-tick or exclusive system.
+    /// a per-region, once-per-tick or exclusive system or a finalize.
     pub source: Option<StableKey>,
     /// The command.
     pub entry: C::Entry,
