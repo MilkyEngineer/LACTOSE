@@ -9,7 +9,7 @@ mod common;
 
 use common::*;
 use lactose_core::{StableKey, Tick};
-use lactose_net_api::{StagedFrame, Tombstone};
+use lactose_net_api::{StagedFrame, Tombstone, TombstoneCause};
 use lactose_predict::ResyncReason;
 use lactose_sim::StagedState;
 
@@ -186,7 +186,10 @@ fn a_band_tombstone_of_a_claimed_entity_is_applied_at_the_restart() {
     let (rig, corrections) = band(
         6,
         |frame| {
-            frame.despawns.insert(cart(), Tombstone { region: REGION, tick: Tick(6) });
+            frame.despawns.insert(
+                cart(),
+                Tombstone { region: REGION, tick: Tick(6), cause: TombstoneCause::Destroyed },
+            );
         },
         |_| {},
     );
@@ -199,7 +202,10 @@ fn a_tombstone_of_a_claimed_entity_after_the_band_is_applied_at_its_tick() {
     let (rig, corrections) = band(
         12,
         |frame| {
-            frame.despawns.insert(cart(), Tombstone { region: REGION, tick: Tick(12) });
+            frame.despawns.insert(
+                cart(),
+                Tombstone { region: REGION, tick: Tick(12), cause: TombstoneCause::Destroyed },
+            );
         },
         |_| {},
     );

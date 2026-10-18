@@ -6,11 +6,11 @@
 //!
 //! Host-only: the sampler runs on the render side and the writer on the network thread.
 
-use core::sync::atomic::{AtomicU32, AtomicU64};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering, fence};
 use std::sync::Arc;
 
-use lactose_core::{Result, Tick};
-use lactose_math::{Quat, Vec3};
+use lactose_core::{Error, ErrorKind, Result, Tick};
+use lactose_math::{Quat, Scalar, ScalarBits, Vec3};
 use lactose_net_api::InterpolationSlot;
 
 /// How many received states one slot keeps: the newest eight by tick, about 270
@@ -95,10 +95,27 @@ impl RemoteSample {
 struct Slot {
     sequence: AtomicU32,
     generation: AtomicU32,
-    /// How many states the ring holds, up to [`STATES_PER_SLOT`], and which is newest.
+    /// How many states the ring holds, up to [`STATES_PER_SLOT`]: `states[..count]`,
+    /// ascending by tick, so the newest is the last.
     count: AtomicU32,
     states: [[AtomicU64; STATE_WORDS]; STATES_PER_SLOT],
 }
+
+/// A slot's contents as one consistent read: the generation, then the states held,
+/// ascending by tick, in `states[..count]`.
+#[derive(Clone, Copy)]
+struct Snapshot {
+    generation: u32,
+    count: usize,
+    states: [ReceivedState; STATES_PER_SLOT],
+}
+
+const EMPTY_STATE: ReceivedState = ReceivedState {
+    tick: Tick(0),
+    teleported: Tick(0),
+    position: Vec3::ZERO,
+    rotation: Quat::IDENTITY,
+};
 
 impl Slot {
     const fn new() -> Self {
@@ -109,6 +126,111 @@ impl Slot {
             states: [const { [const { AtomicU64::new(0) }; STATE_WORDS] }; STATES_PER_SLOT],
         }
     }
+
+    /// The writer's side of the lock: `write` stores words with `Relaxed` between the odd
+    /// and the even sequence. Only the one writer calls it, so its own loads of the
+    /// sequence need no ordering.
+    fn write(&self, write: impl FnOnce(&Self)) {
+        let sequence = self.sequence.load(Ordering::Relaxed);
+        self.sequence.store(sequence.wrapping_add(1), Ordering::Relaxed);
+        fence(Ordering::Release);
+        write(self);
+        self.sequence.store(sequence.wrapping_add(2), Ordering::Release);
+    }
+
+    /// One consistent read, retried until no write overlapped it. The writer reads its
+    /// own words through this too; it never retries there, since nothing else writes.
+    fn read(&self) -> Snapshot {
+        loop {
+            let before = self.sequence.load(Ordering::Acquire);
+            if before & 1 == 1 {
+                core::hint::spin_loop();
+                continue;
+            }
+            let generation = self.generation.load(Ordering::Relaxed);
+            // A torn count is caught by the sequence check below; the bound keeps the
+            // indexing in range meanwhile.
+            let count = (self.count.load(Ordering::Relaxed) as usize).min(STATES_PER_SLOT);
+            let mut words = [[0; STATE_WORDS]; STATES_PER_SLOT];
+            for (held, words) in self.states[..count].iter().zip(&mut words) {
+                for (word, value) in held.iter().zip(words) {
+                    *value = word.load(Ordering::Relaxed);
+                }
+            }
+            fence(Ordering::Acquire);
+            if self.sequence.load(Ordering::Relaxed) == before {
+                let mut states = [EMPTY_STATE; STATES_PER_SLOT];
+                for (state, words) in states.iter_mut().zip(&words).take(count) {
+                    *state = decode(words);
+                }
+                return Snapshot { generation, count, states };
+            }
+            core::hint::spin_loop();
+        }
+    }
+
+    /// Stores `states` as the ring, inside a write.
+    fn store_states(&self, states: &[ReceivedState]) {
+        for (held, state) in self.states.iter().zip(states) {
+            for (word, value) in held.iter().zip(encode(state)) {
+                word.store(value, Ordering::Relaxed);
+            }
+        }
+        let count = u32::try_from(states.len()).expect("at most STATES_PER_SLOT");
+        self.count.store(count, Ordering::Relaxed);
+    }
+}
+
+fn encode(state: &ReceivedState) -> [u64; STATE_WORDS] {
+    let p = state.position;
+    let r = state.rotation;
+    [
+        (u64::from(state.tick.0) << 32) | u64::from(state.teleported.0),
+        widen(p.x.to_canonical_bits()),
+        widen(p.y.to_canonical_bits()),
+        widen(p.z.to_canonical_bits()),
+        widen(r.x.to_canonical_bits()),
+        widen(r.y.to_canonical_bits()),
+        widen(r.z.to_canonical_bits()),
+        widen(r.w.to_canonical_bits()),
+    ]
+}
+
+fn decode(words: &[u64; STATE_WORDS]) -> ReceivedState {
+    let scalar = |word: u64| Scalar::from_canonical_bits(narrow(word));
+    ReceivedState {
+        tick: Tick((words[0] >> 32) as u32),
+        teleported: Tick(words[0] as u32),
+        position: Vec3::new(scalar(words[1]), scalar(words[2]), scalar(words[3])),
+        rotation: Quat::new(scalar(words[4]), scalar(words[5]), scalar(words[6]), scalar(words[7])),
+    }
+}
+
+/// A scalar's canonical bits as one word, whatever the scalar's width.
+#[allow(clippy::useless_conversion, reason = "an identity under the 64-bit scalar")]
+fn widen(bits: ScalarBits) -> u64 {
+    u64::from(bits)
+}
+
+/// The inverse of [`widen`].
+#[allow(
+    clippy::useless_conversion,
+    clippy::unnecessary_fallible_conversions,
+    reason = "an identity under the 64-bit scalar; a word `widen` wrote always fits"
+)]
+fn narrow(word: u64) -> ScalarBits {
+    ScalarBits::try_from(word).unwrap_or_default()
+}
+
+/// Whether `tick` is after `than` under the wrapping comparison the frames use.
+const fn tick_after(tick: Tick, than: Tick) -> bool {
+    let distance = tick.0.wrapping_sub(than.0);
+    distance != 0 && distance < 1 << 31
+}
+
+/// The generation after `generation`, skipping zero, which marks a free slot.
+const fn next_generation(generation: u32) -> u32 {
+    if generation == u32::MAX { 1 } else { generation + 1 }
 }
 
 /// The buffer: a fixed number of slots, each a sequence-locked ring of received states.
@@ -163,7 +285,26 @@ impl InterpolationWriter {
     /// new generation (never zero, wrapping past `u32::MAX` to one). The slot starts
     /// empty. Fails with `ResourceExhausted` when every slot is allocated.
     pub fn allocate(&mut self) -> Result<InterpolationSlot> {
-        todo!()
+        let index = match self.free.pop() {
+            Some(index) => index,
+            None if self.next_unused < self.capacity() => {
+                self.next_unused += 1;
+                self.next_unused - 1
+            }
+            None => {
+                return Err(Error::new(
+                    ErrorKind::ResourceExhausted,
+                    "every interpolation slot is allocated",
+                ));
+            }
+        };
+        let generation = next_generation(self.generations[index as usize]);
+        self.generations[index as usize] = generation;
+        self.buffer.slots[index as usize].write(|slot| {
+            slot.generation.store(generation, Ordering::Relaxed);
+            slot.count.store(0, Ordering::Relaxed);
+        });
+        Ok(InterpolationSlot { index, generation })
     }
 
     /// Pushes `state` into `slot`'s ring, which keeps the [`STATES_PER_SLOT`] newest
@@ -171,13 +312,46 @@ impl InterpolationWriter {
     /// a kept state replaces it, so arrival order does not matter. Readers never observe
     /// a half-written ring. Fails with `NotFound` if `slot` is stale or unallocated.
     pub fn push(&mut self, slot: InterpolationSlot, state: ReceivedState) -> Result<()> {
-        todo!()
+        let held = self.allocated(slot)?;
+        let snapshot = held.read();
+        let mut states = [EMPTY_STATE; STATES_PER_SLOT + 1];
+        let kept = &snapshot.states[..snapshot.count];
+        // Ascending by tick: the states before `state`, `state` (replacing an equal tick),
+        // the states after it; then the oldest dropped if there are too many.
+        let at = kept.iter().take_while(|kept| tick_after(state.tick, kept.tick)).count();
+        let replaces = kept.get(at).is_some_and(|kept| kept.tick == state.tick);
+        if !replaces && at == 0 && kept.len() == STATES_PER_SLOT {
+            return Ok(());
+        }
+        let after = if replaces { at + 1 } else { at };
+        let mut count = 0;
+        for next in kept[..at].iter().chain([&state]).chain(&kept[after..]) {
+            states[count] = *next;
+            count += 1;
+        }
+        let first = count.saturating_sub(STATES_PER_SLOT);
+        held.write(|slot| slot.store_states(&states[first..count]));
+        Ok(())
     }
 
     /// Releases `slot`: it reads as missing from now on, under this generation and the
     /// next, until reallocated. Fails with `NotFound` if `slot` is stale or unallocated.
     pub fn release(&mut self, slot: InterpolationSlot) -> Result<()> {
-        todo!()
+        let held = self.allocated(slot)?;
+        held.write(|held| {
+            held.generation.store(0, Ordering::Relaxed);
+            held.count.store(0, Ordering::Relaxed);
+        });
+        self.free.push(slot.index);
+        Ok(())
+    }
+
+    /// The slot `slot` names, if it is allocated at `slot`'s generation.
+    fn allocated(&self, slot: InterpolationSlot) -> Result<&Slot> {
+        let held = self.buffer.slots.get(slot.index as usize).filter(|held| {
+            slot.generation != 0 && held.generation.load(Ordering::Relaxed) == slot.generation
+        });
+        held.ok_or_else(|| Error::new(ErrorKind::NotFound, "a stale or unallocated slot"))
     }
 
     /// How many slots the buffer has.
@@ -195,7 +369,10 @@ impl core::fmt::Debug for InterpolationWriter {
 
 /// The reader side, the `net-api` resource of architecture section 5.3: the presentation
 /// schedule holds one and samples every frame. Cloneable; any number of threads may
-/// sample at once, none ever blocks, and no sample allocates.
+/// sample at once without waiting on one another, and no sample allocates. A sample of a
+/// slot the writer is writing retries until the write ends: a write stores at most the
+/// slot's 64 state words and its count, but a network thread preempted inside one stalls
+/// the samples of that slot for as long as it is preempted.
 #[derive(Clone)]
 pub struct InterpolationReader {
     buffer: Arc<InterpolationBuffer>,
@@ -209,10 +386,43 @@ impl InterpolationReader {
     /// before every kept state, and around a teleport: with `later.teleported` in
     /// `(earlier.tick, later.tick]`, at `earlier` while `at` is before `later.teleported`
     /// and at `later` from then on; `Missing` when the slot holds nothing or `slot` is
-    /// stale. A torn read is retried; the call never blocks and never locks.
+    /// stale. A read that overlaps a write of the slot is retried until it does not; the
+    /// call takes no lock and allocates nothing.
     #[must_use]
     pub fn sample(&self, slot: InterpolationSlot, at: PresentationTime) -> RemoteSample {
-        todo!()
+        let Some(held) = self.buffer.slots.get(slot.index as usize) else {
+            return RemoteSample::MISSING;
+        };
+        let snapshot = held.read();
+        if slot.generation == 0 || snapshot.generation != slot.generation || snapshot.count == 0 {
+            return RemoteSample::MISSING;
+        }
+        let kept = &snapshot.states[..snapshot.count];
+        // `at` is `at.tick + fraction`, the fraction below one, so against an integer tick
+        // the comparisons are those of `at.tick`.
+        let later_at = kept.iter().position(|state| tick_after(state.tick, at.tick));
+        let held_at = |state: &ReceivedState| RemoteSample {
+            status: SampleStatus::Held,
+            position: state.position,
+            rotation: state.rotation,
+        };
+        let (earlier, later) = match later_at {
+            None => return held_at(&kept[kept.len() - 1]),
+            Some(0) => return held_at(&kept[0]),
+            Some(later) => (&kept[later - 1], &kept[later]),
+        };
+        let teleport = later.teleported;
+        if tick_after(teleport, earlier.tick) && !tick_after(teleport, later.tick) {
+            return held_at(if tick_after(teleport, at.tick) { earlier } else { later });
+        }
+        let elapsed = Scalar::from_u32(at.tick.0.wrapping_sub(earlier.tick.0))
+            + Scalar::from_u32(u32::from(at.fraction)) / Scalar::from_u32(1 << 16);
+        let t = elapsed / Scalar::from_u32(later.tick.0.wrapping_sub(earlier.tick.0));
+        RemoteSample {
+            status: SampleStatus::Interpolated,
+            position: earlier.position.lerp(later.position, t),
+            rotation: earlier.rotation.nlerp(later.rotation, t),
+        }
     }
 
     /// [`sample`](Self::sample) for every slot of `slots` into `out[i]`, which must be at
@@ -223,7 +433,10 @@ impl InterpolationReader {
         at: PresentationTime,
         out: &mut [RemoteSample],
     ) {
-        todo!()
+        assert!(out.len() >= slots.len(), "the output is shorter than the slots");
+        for (sample, &slot) in out.iter_mut().zip(slots) {
+            *sample = self.sample(slot, at);
+        }
     }
 
     /// How many slots the buffer has.

@@ -37,6 +37,9 @@ jobs:
       # The latest-sample slot's atomics: Miri's weak-memory emulation checks the shipped
       # `Native` orderings, which the loom models (over their own atomics) do not.
       - run: cargo +$MIRI_TOOLCHAIN miri test -p lactose-input-host --locked
+      # The interpolation buffer's sequence lock (crates/net-host): Miri's weak-memory
+      # emulation catches the reader-side orderings the hardware stress test misses.
+      - run: cargo +$MIRI_TOOLCHAIN miri test -p lactose-net-host --test interpolation --locked
 
   # Architecture section 5.1: the scope latch and the sleep-and-wake protocol are modelled
   # under loom, as is input-host's latest-sample sequence lock (architecture section 5.3),

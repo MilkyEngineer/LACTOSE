@@ -10,8 +10,11 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use lactose_core::{PlayerId, Result, StableKey, Tick};
 use lactose_ecs::RegionId;
+use lactose_net_api::{Tombstone, TombstoneCause};
 
-use crate::packet::{AckField, ConnectionHandles, EntityHandle, PacketRing, PacketSequence};
+use crate::packet::{
+    AckField, ConnectionHandles, EntityHandle, PacketRecord, PacketRing, PacketSequence,
+};
 use crate::transport::{ConnectionId, MAX_DATAGRAM_BYTES};
 
 /// The deployment's relevance rule: region membership within a radius of the player's
@@ -61,9 +64,40 @@ pub struct EntityInterest {
     /// The packet its newest state went out in and is not yet acknowledged, if any; a
     /// loss of that packet clears it so the entity is sent again.
     pub in_flight: Option<PacketSequence>,
-    /// The tick the entity was destroyed at, once a tombstone is owed; cleared, and the
-    /// entity forgotten, once the tombstone is acknowledged.
-    pub tombstone: Option<Tick>,
+    /// The tombstone owed, once the entity was destroyed or left the client's set; the
+    /// entity is forgotten (or re-enters) once it is acknowledged.
+    pub tombstone: Option<Tombstone>,
+    /// Whether the receiving player has claimed the entity, as
+    /// [`ClientInterest::set_claimed`] last said.
+    pub claimed: bool,
+    /// Whether the entity became relevant again while its tombstone was owed: once the
+    /// tombstone is acknowledged it re-enters under a new handle instead of being
+    /// forgotten.
+    pub reentering: bool,
+}
+
+impl EntityInterest {
+    fn entered(handle: EntityHandle, claimed: bool) -> Self {
+        Self {
+            handle,
+            priority: Priority::ZERO,
+            acked: None,
+            in_flight: None,
+            tombstone: None,
+            claimed,
+            reentering: false,
+        }
+    }
+
+    /// Whether a packet that carries the entity's state carries it whole, every
+    /// replicated component from the mirror: when nothing of it is acknowledged, and in
+    /// every packet while the receiving player has it claimed. A whole send of an entity
+    /// whose state is not acknowledged travels as a spawn, which the receiver stages as an
+    /// upsert if the entity is live.
+    #[must_use]
+    pub const fn sends_whole(&self) -> bool {
+        self.claimed || self.acked.is_none()
+    }
 }
 
 /// The per-client bandwidth cap (architecture section 9.3).
@@ -124,23 +158,174 @@ impl ClientInterest {
 
     /// Makes `key` relevant: assigns a handle and an [`EntityInterest`] with nothing
     /// acknowledged, so the entity is sent whole. An entity already relevant keeps its
-    /// state. Fails as `ConnectionHandles::assign` does.
+    /// state. An entity whose tombstone is still owed is marked
+    /// [`reentering`](EntityInterest::reentering) and keeps its handle until the
+    /// tombstone is acknowledged, when it re-enters under a new one: the client releases
+    /// the old handle when it stages the tombstone, so the old handle must never name the
+    /// entity again. Returns the entity's current handle. Fails as
+    /// `ConnectionHandles::assign` does.
     pub fn enter(&mut self, key: StableKey) -> Result<EntityHandle> {
-        todo!()
+        if let Some(entity) = self.entities.get_mut(&key) {
+            if entity.tombstone.is_some() {
+                entity.reentering = true;
+            }
+            return Ok(entity.handle);
+        }
+        let handle = self.handles.assign(key)?;
+        self.entities.insert(key, EntityInterest::entered(handle, false));
+        Ok(handle)
     }
 
-    /// Owes the client a tombstone for `key`, destroyed at `tick`; the handle is released
-    /// once the tombstone is acknowledged. A key that is not relevant is ignored.
-    pub fn leave(&mut self, key: StableKey, tick: Tick) {
-        todo!()
+    /// Owes the client `tombstone` for `key`: the entity was destroyed, or left the
+    /// client's set alive in `tombstone.region`; the handle is released once the
+    /// tombstone is acknowledged. Clears `in_flight`, so the tombstone goes out with the
+    /// next packet. A key that is not relevant is ignored. One whose tombstone is already
+    /// owed stops [`reentering`](EntityInterest::reentering); `tombstone` replaces an owed
+    /// [`Left`](TombstoneCause::Left) one, so the tombstone owed names where the entity is
+    /// now (a client whose hook kept the entity for the first despawns it at the second,
+    /// which it stages under the handle the first released), and an owed
+    /// [`Destroyed`](TombstoneCause::Destroyed) one is kept.
+    pub fn leave(&mut self, key: StableKey, tombstone: Tombstone) {
+        let Some(entity) = self.entities.get_mut(&key) else { return };
+        entity.reentering = false;
+        let replaces = entity.tombstone.is_none_or(|owed| owed.cause == TombstoneCause::Left);
+        if replaces {
+            entity.tombstone = Some(tombstone);
+            entity.in_flight = None;
+        }
+    }
+
+    /// Records whether the receiving player has claimed `key`. A change is owed to the
+    /// client as a spawn of the live entity (its interpolation slot set or removed), so it
+    /// voids what was acknowledged, as [`resend_whole`](Self::resend_whole) does. A key
+    /// that is not relevant is ignored.
+    pub fn set_claimed(&mut self, key: StableKey, claimed: bool) {
+        let Some(entity) = self.entities.get_mut(&key) else { return };
+        if entity.claimed != claimed {
+            entity.claimed = claimed;
+            self.resend_whole(key);
+        }
+    }
+
+    /// Owes the client a whole send of `key`, as if nothing of it were acknowledged: what
+    /// the packer does when the entity moves between two regions the client has, so an
+    /// entity the client could not spawn arrives whole beside its move. Every record in
+    /// the ring stops counting for the entity, so an acknowledgement of a packet sent
+    /// before this call never marks it acknowledged again. A key that is not relevant is
+    /// ignored.
+    pub fn resend_whole(&mut self, key: StableKey) {
+        let Some(entity) = self.entities.get_mut(&key) else { return };
+        entity.acked = None;
+        entity.in_flight = None;
+        self.packets.forget_states(entity.handle);
+    }
+
+    /// Records a packet the packer sent: each entity and tombstone it carried has its
+    /// `in_flight` set to the packet and its priority reset, and the record enters the
+    /// ring. When the ring is full its oldest record is evicted and treated as lost, as
+    /// an expired one is.
+    pub fn sent(&mut self, record: PacketRecord) {
+        let handles = record.entities.iter().map(|&(handle, _)| handle);
+        for handle in handles.chain(record.tombstones.iter().map(|&(handle, _)| handle)) {
+            if let Some(entity) =
+                self.handles.key_of(handle).and_then(|key| self.entities.get_mut(&key))
+            {
+                entity.in_flight = Some(record.sequence);
+                entity.priority.reset();
+            }
+        }
+        if let Some(evicted) = self.packets.record(record) {
+            self.lost(&evicted);
+        }
     }
 
     /// Applies the peer's acknowledgement field: every packet it covers is taken from the
     /// ring and each entity it carried advances its `acked` to the state's tick if newer
     /// and clears `in_flight` if it names that packet; records older than the field's
     /// window are expired as lost, clearing `in_flight` so their entities are sent again;
-    /// an entity whose tombstone is acknowledged is forgotten and its handle released.
+    /// an entity whose tombstone is acknowledged is forgotten and its handle released, or
+    /// re-entered under a new handle if it is [`reentering`](EntityInterest::reentering).
     pub fn acknowledge(&mut self, ack: AckField) {
-        todo!()
+        let mut sequence = ack.latest;
+        for _ in 0..=AckField::WINDOW {
+            if ack.covers(sequence)
+                && let Some(record) = self.packets.acknowledge(sequence)
+            {
+                self.delivered(&record);
+            }
+            sequence = PacketSequence(sequence.0.wrapping_sub(1));
+        }
+        let oldest_live = PacketSequence(ack.latest.0.wrapping_sub(AckField::WINDOW));
+        for record in self.packets.expire(oldest_live) {
+            self.lost(&record);
+        }
     }
+
+    /// The server's side of a resync: the handles and the packet ring start over, every
+    /// entity whose tombstone is owed is forgotten unless it is
+    /// [`reentering`](EntityInterest::reentering), and every other entity re-enters under
+    /// a fresh handle, assigned in ascending key order, with its claim kept and `acked`
+    /// at `tick`, the tick of the full frame, which carries each of them whole on the
+    /// reliable channel. The full frame names exactly the entities left in `entities`.
+    pub fn resync(&mut self, tick: Tick) {
+        self.handles.clear();
+        self.packets.clear();
+        self.entities.retain(|_, entity| entity.tombstone.is_none() || entity.reentering);
+        for (&key, entity) in &mut self.entities {
+            let handle =
+                self.handles.assign(key).expect("no more entities than handles held before");
+            *entity = EntityInterest {
+                acked: Some(tick),
+                ..EntityInterest::entered(handle, entity.claimed)
+            };
+        }
+    }
+
+    fn delivered(&mut self, record: &PacketRecord) {
+        for &(handle, tick) in &record.entities {
+            let Some(entity) =
+                self.handles.key_of(handle).and_then(|key| self.entities.get_mut(&key))
+            else {
+                continue;
+            };
+            if entity.acked.is_none_or(|acked| tick_after(tick, acked)) {
+                entity.acked = Some(tick);
+            }
+            if entity.in_flight == Some(record.sequence) {
+                entity.in_flight = None;
+            }
+        }
+        for &(handle, tombstone) in &record.tombstones {
+            let Some(key) = self.handles.key_of(handle) else { continue };
+            let Some(entity) = self.entities.get_mut(&key) else { continue };
+            if entity.tombstone != Some(tombstone) {
+                continue;
+            }
+            self.handles.release(handle);
+            if entity.reentering {
+                let handle = self.handles.assign(key).expect("a handle was just released");
+                *entity = EntityInterest::entered(handle, entity.claimed);
+            } else {
+                self.entities.remove(&key);
+            }
+        }
+    }
+
+    fn lost(&mut self, record: &PacketRecord) {
+        let handles = record.entities.iter().map(|&(handle, _)| handle);
+        for handle in handles.chain(record.tombstones.iter().map(|&(handle, _)| handle)) {
+            if let Some(entity) =
+                self.handles.key_of(handle).and_then(|key| self.entities.get_mut(&key))
+                && entity.in_flight == Some(record.sequence)
+            {
+                entity.in_flight = None;
+            }
+        }
+    }
+}
+
+/// Whether `tick` is after `than` under the wrapping comparison the frames use.
+const fn tick_after(tick: Tick, than: Tick) -> bool {
+    let distance = tick.0.wrapping_sub(than.0);
+    distance != 0 && distance < 1 << 31
 }

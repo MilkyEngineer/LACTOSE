@@ -1,8 +1,8 @@
-//! Compile-only consumer sketches against the facade: what `lactose-net`'s packer and
-//! receiver, the presentation schedule, `app`'s join and a throwaway transport write,
-//! type-checked and never run (every deciding body of the crate is `todo!()`). They pin
-//! the surface the README promises: a change that breaks one is a signature change to
-//! list.
+//! Consumer sketches: what `lactose-net`'s packer and receiver, the presentation
+//! schedule, `app`'s join and a throwaway transport write, type-checked against the
+//! surface. They pin the surface the README promises: a change that breaks one is a
+//! signature change to list. The loopback transport is also run, at the end, against the
+//! trait's contract; the packer and receiver run as models in `replication.rs`.
 
 #![forbid(unsafe_code)]
 #![allow(dead_code, unused_variables, missing_docs, clippy::too_many_arguments)]
@@ -21,6 +21,7 @@ use lactose_math::render::RenderPosition;
 use lactose_math::{Quat, Scalar, Vec3};
 use lactose_net_api::{
     InterpolationSlot, RemoteSlot, StagedFrame, StagedSpawn, StagingFrame, Tombstone,
+    TombstoneCause,
 };
 use lactose_net_host::handshake::{BoundaryBuildId, CookedDataHash, Handshake, ProtocolHash};
 use lactose_net_host::interest::{ClientInterest, SendBudget};
@@ -30,7 +31,7 @@ use lactose_net_host::interpolation::{
 };
 use lactose_net_host::message::JoinAccepted;
 use lactose_net_host::packet::{
-    AckField, ConnectionHandles, EntityHandle, PacketRecord, PacketSequence, TickHeader,
+    ConnectionHandles, EntityHandle, PacketRecord, PacketSequence, TickHeader,
 };
 use lactose_net_host::transport::{
     ConnectionId, Datagram, DisconnectReason, LinkStats, MAX_DATAGRAM_BYTES, Transport,
@@ -113,13 +114,17 @@ fn pack_one(
     region_origin: &dyn Fn(RegionId) -> Vec3,
     sequence: PacketSequence,
 ) -> Result<PacketRecord> {
-    let mut record = PacketRecord { sequence, tick: frame.tick, entities: Vec::new() };
-    let header = TickHeader { sequence, tick: frame.tick, ack: AckField::default() };
+    let mut record =
+        PacketRecord { sequence, tick: frame.tick, entities: Vec::new(), tombstones: Vec::new() };
+    let header = TickHeader { sequence, tick: frame.tick, ack: None };
     let regions: Vec<RegionId> = client.regions.iter().copied().collect();
     for region in regions {
         let origin = region_origin(region);
         for row in frame.region(region) {
             let Some(interest) = client.entities.get_mut(&row.key) else { continue };
+            if interest.tombstone.is_some() || interest.sends_whole() {
+                continue;
+            }
             if interest.acked.is_some_and(|acked| acked == row.tick) {
                 continue;
             }
@@ -129,24 +134,27 @@ fn pack_one(
                 // The wire names the handle and the region the position is relative to.
                 let _on_the_wire = (interest.handle, region, QuantisedPosition::quantise(relative));
             }
-            interest.priority.reset();
-            interest.in_flight = Some(sequence);
             record.entities.push((interest.handle, row.tick));
         }
     }
-    // An entity entering, or a lost row: whole from the mirror, not from the frame.
+    // An entity entering, a lost row or a claimed entity: whole from the mirror, not from
+    // the frame.
     for (key, interest) in &client.entities {
-        if interest.acked.is_none() {
+        if interest.tombstone.is_none() && interest.sends_whole() {
             for ((k, component), (region, tick, bytes)) in &mirror.rows {
                 if k == key {
                     let _whole = (interest.handle, *region, *component, *tick, bytes.as_slice());
                 }
             }
+            record.entities.push((interest.handle, frame.tick));
         }
     }
     for entry in frame.structural() {
         match entry.change {
-            lactose_ecs::StructuralChange::Despawned { key, .. } => client.leave(key, entry.tick),
+            lactose_ecs::StructuralChange::Despawned { key, region } => client.leave(
+                key,
+                Tombstone { region, tick: entry.tick, cause: TombstoneCause::Destroyed },
+            ),
             lactose_ecs::StructuralChange::Removed { key, component } => {
                 // On the wire as a removal, into `StagedFrame::removed` at the receiver.
                 let _removal_on_the_wire = client.entities.get(&key).map(|e| (e.handle, component));
@@ -154,13 +162,22 @@ fn pack_one(
             _ => {}
         }
     }
-    let _evicted = client.packets.record(record.clone());
+    for interest in client.entities.values() {
+        if let Some(tombstone) = interest.tombstone
+            && interest.in_flight.is_none()
+        {
+            record.tombstones.push((interest.handle, tombstone));
+        }
+    }
+    client.sent(record.clone());
     let _ = header;
     Ok(record)
 }
 
 fn on_ack(client: &mut ClientInterest, header: &TickHeader) {
-    client.acknowledge(header.ack);
+    if let Some(ack) = header.ack {
+        client.acknowledge(ack);
+    }
 }
 
 fn client_joins(player: PlayerId, connection: ConnectionId) -> ClientInterest {
@@ -169,15 +186,9 @@ fn client_joins(player: PlayerId, connection: ConnectionId) -> ClientInterest {
 
 /// The server on a `ResyncRequest`: the client's handles cleared and every relevant
 /// entity re-entered, so the full frame's spawns carry fresh handles.
-fn on_resync_request(client: &mut ClientInterest, mirror: &Mirror) -> Result<()> {
-    let relevant: Vec<StableKey> = client.entities.keys().copied().collect();
-    client.entities.clear();
-    client.handles.clear();
-    for key in relevant {
-        client.enter(key)?;
-    }
-    let _full_frame_from = &mirror.rows;
-    Ok(())
+fn on_resync_request(client: &mut ClientInterest, mirror: &Mirror, tick: Tick) {
+    client.resync(tick);
+    let _full_frame_from = (&mirror.rows, client.entities.keys());
 }
 
 // ---- 2. The client's network thread: wire values into a staged frame and the
@@ -356,16 +367,15 @@ impl ClientReceiver {
         &mut self,
         frame: &mut StagedFrame,
         handle: EntityHandle,
-        region: RegionId,
-        tick: Tick,
+        tombstone: Tombstone,
     ) -> Result<()> {
-        let key = self.handles.release(handle).ok_or_else(|| {
-            Error::new(ErrorKind::NotFound, "a tombstone for a handle never assigned")
-        })?;
+        // A tombstone for a handle the mirror does not hold: the entity left before its
+        // spawn was ever staged.
+        let Some(key) = self.handles.release(handle) else { return Ok(()) };
         if let Some(slot) = self.slots.remove(&key) {
             self.writer.release(slot)?;
         }
-        frame.despawns.insert(key, Tombstone { region, tick });
+        frame.despawns.insert(key, tombstone);
         Ok(())
     }
 
@@ -541,4 +551,61 @@ fn constants_pinned() {
     let _ = lactose_net_host::interpolation::STATES_PER_SLOT;
     let _ = lactose_net_host::clock::MAX_RATE_ADJUST_THOUSANDTHS;
     let _ = lactose_net_host::handshake::PROTOCOL_VERSION;
+}
+
+// ---- 7. The loopback, run against the trait's contract ----
+
+#[test]
+fn the_loopback_keeps_the_transport_contract() {
+    let (mut a, mut b) = Loopback::pair();
+    let mut events = Vec::new();
+    a.poll(&mut events);
+    assert!(matches!(events.as_slice(), [TransportEvent::Connected(ConnectionId(1))]));
+    assert_eq!(a.stats(ConnectionId(1)).and_then(|stats| stats.rtt), Some(Duration::ZERO));
+    assert!(a.stats(ConnectionId(7)).is_none());
+
+    // The size limit: a payload over it fails with `InvalidData` and nothing is sent.
+    let too_big = vec![0; MAX_DATAGRAM_BYTES + 1];
+    let error = a.send(ConnectionId(1), &too_big).expect_err("over the limit");
+    assert_eq!(error.kind(), ErrorKind::InvalidData);
+    a.send(ConnectionId(1), &[1, 2, 3]).expect("an established connection");
+    a.send(ConnectionId(1), &[0; MAX_DATAGRAM_BYTES]).expect("at the limit");
+    let error = a.send(ConnectionId(9), &[1]).expect_err("an unknown connection");
+    assert_eq!(error.kind(), ErrorKind::NotFound);
+
+    // Per connection: `Connected` first, then what was received, in order.
+    events.clear();
+    b.poll(&mut events);
+    let received: Vec<(ConnectionId, usize)> = events
+        .iter()
+        .filter_map(|event| match event {
+            TransportEvent::Received(datagram) => {
+                Some((datagram.connection, datagram.payload().len()))
+            }
+            _ => None,
+        })
+        .collect();
+    assert!(matches!(events.first(), Some(TransportEvent::Connected(ConnectionId(2)))));
+    assert_eq!(received, [(ConnectionId(2), 3), (ConnectionId(2), MAX_DATAGRAM_BYTES)]);
+    assert_eq!(a.stats(ConnectionId(1)).map(|stats| stats.datagrams_sent), Some(2));
+
+    // `disconnect` makes a later poll yield `Disconnected` with `Local`, last; a send after
+    // it fails with `NotFound`; on an unknown connection it does nothing.
+    a.disconnect(ConnectionId(5));
+    a.disconnect(ConnectionId(1));
+    let error = a.send(ConnectionId(1), &[1]).expect_err("disconnected");
+    assert_eq!(error.kind(), ErrorKind::NotFound);
+    events.clear();
+    a.poll(&mut events);
+    assert!(matches!(
+        events.last(),
+        Some(TransportEvent::Disconnected {
+            connection: ConnectionId(1),
+            reason: DisconnectReason::Local
+        })
+    ));
+    assert!(a.stats(ConnectionId(1)).is_none());
+    events.clear();
+    a.poll(&mut events);
+    assert!(events.is_empty(), "nothing after `Disconnected`");
 }

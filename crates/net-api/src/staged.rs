@@ -78,8 +78,10 @@ pub struct StagedFrame {
     /// pair in the same frame then re-adds the component with the newer value. Never names a
     /// tombstoned key.
     pub removed: BTreeSet<(StableKey, ComponentKey)>,
-    /// Entities the server destroyed, by origin key: the tombstones of architecture
-    /// section 9.3. A frame never names a key here and in `spawns`, in `removed` or among
+    /// Entities that left the client's set, by origin key: the tombstones of architecture
+    /// section 9.3, each saying whether the server destroyed the entity or it left the
+    /// client's set alive (its region left it, or it moved into a region the client does
+    /// not hold). A frame never names a key here and in `spawns`, in `removed` or among
     /// its rows.
     pub despawns: BTreeMap<StableKey, Tombstone>,
     rows: BTreeMap<(StableKey, ComponentKey), RowSlot>,
@@ -312,13 +314,32 @@ impl StagedSpawn {
 }
 
 /// A tombstone (architecture section 9.3), keyed by the entity's origin key in
-/// [`StagedFrame::despawns`].
+/// [`StagedFrame::despawns`]: the entity left the client's set at `tick`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Tombstone {
-    /// The region the entity resided in.
+    /// The region the entity resided in on the server at `tick`: the one it was destroyed
+    /// in, or the one it is alive in, which the client does not hold or is losing.
     pub region: RegionId,
-    /// The server tick at which it was destroyed.
+    /// The server tick at which it left the client's set.
     pub tick: Tick,
+    /// Why it left, which decides whether the hook may skip it.
+    pub cause: TombstoneCause,
+}
+
+/// Why an entity left the client's set.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TombstoneCause {
+    /// The server destroyed the entity.
+    Destroyed,
+    /// The entity is alive on the server in [`Tombstone::region`]: that region left the
+    /// client's set at the tombstone's tick, or the entity moved there, out of the client's
+    /// set or while a tombstone of it was owed. The hook skips such a tombstone when the
+    /// client's entity resides in that region, which settles it: the region's unload is
+    /// still to come, or the server names the region and the entity enters again. A later
+    /// move or destruction of the entity replaces the tombstone the server owes, so that it
+    /// names where the server has the entity, and the client stages it under the same key
+    /// even after the hook kept the entity.
+    Left,
 }
 
 /// The frames waiting to be applied in one client world: a service resource `app` fills

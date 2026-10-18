@@ -286,7 +286,14 @@ fn a_release_a_removal_and_a_tombstone_are_facts_that_correct() {
 
     // A tombstone of a claimed entity: despawned at its tick and kept so.
     let mut frame = StagedFrame::new(Tick(18));
-    frame.despawns.insert(me(), lactose_net_api::Tombstone { region: REGION, tick: Tick(18) });
+    frame.despawns.insert(
+        me(),
+        lactose_net_api::Tombstone {
+            region: REGION,
+            tick: Tick(18),
+            cause: lactose_net_api::TombstoneCause::Destroyed,
+        },
+    );
     rig.push(frame);
     rig.step(walking(22));
     let reconciled = rig.reconcile();

@@ -19,7 +19,7 @@ use lactose_ecs::{
 };
 use lactose_net_api::{
     GatherState, InterpolationSlot, OverlayPayload, RegionChange, RegionRelevance, RemoteSlot,
-    StagedFrame, StagedInbox, StagedSpawn, StagingFrame, Tombstone,
+    StagedFrame, StagedInbox, StagedSpawn, StagingFrame, Tombstone, TombstoneCause,
 };
 use lactose_reflect::{Reflect, Registry, component};
 use lactose_sim::harness::{ChunkCapacity, layout_mode};
@@ -293,8 +293,14 @@ pub fn apply_frame(world: &mut World, frame: &StagedFrame, skipped: &Skipped, pa
             }
         }
     }
-    for (&key, Tombstone { .. }) in &frame.despawns {
-        if world.contains(key) {
+    for (&key, tombstone) in &frame.despawns {
+        // A `Left` tombstone of an entity a load of its region placed there is the
+        // region's to settle.
+        let loaded_there = tombstone.cause == TombstoneCause::Left
+            && world.region_of(key) == Some(tombstone.region);
+        if loaded_there {
+            ran("tombstone skipped");
+        } else if world.contains(key) {
             match world.despawn(key) {
                 Ok(()) => ran("tombstone"),
                 Err(error) => skip("tombstone", key, error),
@@ -634,7 +640,15 @@ impl Packer {
             before.into_iter().filter(|(_, region)| !unloaded.contains(region)).collect();
         for (&key, &region) in &kept {
             if !after.contains_key(&key) {
-                frame.despawns.insert(key, Tombstone { region, tick: gathered.tick });
+                let tombstone = match self.mirror.get(&key) {
+                    Some(&(now, _)) => {
+                        Tombstone { region: now, tick: gathered.tick, cause: TombstoneCause::Left }
+                    }
+                    None => {
+                        Tombstone { region, tick: gathered.tick, cause: TombstoneCause::Destroyed }
+                    }
+                };
+                frame.despawns.insert(key, tombstone);
             }
         }
         let claim_changes = std::mem::take(&mut self.claim_changes);

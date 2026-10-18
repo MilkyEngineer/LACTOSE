@@ -2116,6 +2116,114 @@ rationale the author supplied during the editorial pass rather than one taken fr
   bound predicted spawn, untaken frames merged, a region unloaded and reloaded, and a claim and
   its release, asserts that every hook path ran, and records server hash, frame digest and
   client hash per frame.
+- Implementation of `lactose-net-host` (milestone 1; four review rounds, 2026-10-18): Region
+  leave (lactose-predict review round 4, N1): of the two options, lactose-net-host's packer
+  sends tombstones, and the fold is unchanged. A region leaving a client's set is sent as
+  `Irrelevant` stamped at T, and every entity of the client's set residing in it leaves with a
+  tombstone at T. The tombstones release handles and interpolation slots on both ends, which
+  nothing else does. When one step folds `Relevant` then `Irrelevant` into no load, the
+  tombstone still takes out an entity the frames moved into the region. The packer names an
+  entity of a region (spawn, row or move) only once the reliable channel has delivered that
+  region's `RegionRelevance` and while the region is still relevant; a full frame's regions
+  count as delivered. The receiver merges each region change, in arrival order, into the first
+  frame it stages at or after the change's tick. When one frame would hold two changes of one
+  region, it stages a frame holding only the changes before the second and drops the packet
+  unacknowledged, so the fold sees an unload and then a load. A move between two named regions
+  is sent as the move plus a whole resend, because the step may unload the old region first. A
+  whole send is a spawn of every mirror component, a move to the entity's region, because the
+  hook's upsert does not move a live entity, and a removal of every replicated component the
+  mirror records as removed, because the upsert removes nothing and a removal not yet
+  acknowledged when a move, a claim or a loss puts the entity back on the whole path would
+  otherwise stay on the client until a full frame (review r1, B1). A claimed entity is sent as
+  exact rows of every replicated component and the removals since its acknowledged tick in
+  every packet, and the receiver checks a whole packet before it stages any of it, so a delta
+  frame holding an exact row of an entity holds every replicated component the server's entity
+  has at that tick. Re-entry while a tombstone is owed waits for the tombstone's
+  acknowledgement and takes a new handle.
+  - Tombstone causes (review r1, B2; an interface amendment of lactose-net-api under section
+    20): `Tombstone` gains `cause: TombstoneCause`, `Destroyed` or `Left`. A destruction names
+    the region the entity was destroyed in. An entity alive on the server that leaves the
+    client's set gets a `Left` tombstone naming the region it resides in: the leaving region on
+    a region leave, the region it moved into on a move into a region the packer may not name.
+    The tombstone owed follows the entity (review r2, N1 and N2; review r3, N5): a later
+    tombstone of the entity, `Left` or `Destroyed`, replaces an owed `Left` one, and an entity
+    that owes a tombstone, re-entering or not, leaves again at every move with a `Left`
+    tombstone naming the region it moved into, and enters that region if the packer names it,
+    its whole send and move following the tombstone's acknowledgement; the acknowledgement of a
+    packet carrying a replaced tombstone releases nothing. The invariant these rules keep: an
+    owed `Left` tombstone names the region the server has the entity in, at every tick. A
+    region leave names the region left, where the entity resides; a move out of the client's
+    set names the region moved into; a move of an entity owing a tombstone, held (re-entering)
+    or not, into a named region or an unnameable one, names the region moved into; a region
+    named again moves nothing, and a resync starts the interest over; a destruction replaces it
+    with a `Destroyed` tombstone. The model packer asserts the invariant every tick. The hook,
+    in the replicated and the prediction world, skips a `Left` tombstone of an entity residing
+    in the region the tombstone names, which settles the entity: that region's unload is still
+    to come, or the packer names the region and the entity enters again. Without the skip, a
+    tombstone applied after the client loaded the region again despawned the entity the load
+    placed, and the re-entry spawn restored only its replicated components, so the cooked
+    unreplicated rows were lost until a full frame. The receiver keeps the key of each handle a
+    staged `Left` tombstone released, until a spawn reuses the handle's slot or a full frame
+    clears the mirror, and stages a later tombstone under that handle other than the one it
+    staged; so an entity the hook kept for a `Left` tombstone, which the server destroys or
+    moves to a region the client does not hold before it sees that tombstone acknowledged, is
+    despawned (review r2, N1). This is a rule lactose-net's receiver keeps; the generation
+    keeps the handle unambiguous. The review proposed skipping only when the region was loaded
+    after the tombstone's tick, which needs the fold to keep a load tick per region; the rule
+    taken needs nothing new, and review r2 found that neither rule is safe without the
+    tombstone following the entity. In the case of lactose-predict review round 4, N1, the
+    entity resides in the region it came from, so the tombstone still applies.
+    `ClientInterest::leave` takes the `Tombstone` (review r1, M4).
+  - `TickHeader::ack` is `Option<AckField>`: `None` before the sender has received anything,
+    since a field always acknowledges its `latest` (review r1, S1). `AckField::received` builds
+    the field one staged packet at a time, so its bits name only packets of the current lap
+    (review r1, M8).
+  - With these rules the modelled client converges to the server's relevant regions under
+    churn, loss, reordering, duplication, region toggling, claims and resyncs, with a cooked
+    region that leaves the client's set for short spells while its entities change rows, depart
+    (destroyed, or moved to a region the packer does not name) wherever a tombstone of them
+    reaches the client, and come back, every cooked entity the server has in that region
+    keeping its unreplicated rows on the client unless its departure reached the client (the
+    lane's sweep in fix round 3 of lactose-net-host: 0 failures in 199 seeds at 20 % loss,
+    delays of 1 to 8 ticks and a lag of 6, and in 60 seeds at each of four other link settings;
+    993 departures, 376 returns, and 206 returned entities checked with their cooked rows). The
+    hook skips, as entries the world refuses, spawns and moves into a region the popping step
+    folds into no load; these are expected under region toggling and settled by the region's
+    own changes. Accepted costs: a claimed entity in a leaving region gets a `Left` tombstone,
+    and so does a claimed entity that moves into a region the packer may not name yet (an
+    object the player claimed crossing into an undelivered region, the player's entity crossing
+    faster than the region's `RegionRelevance` is delivered); lactose-predict reconciles either
+    as the entity's destruction, so the prediction world destroys it for about a round trip,
+    until the packer names the region and the claimed re-entry spawn re-creates it from its
+    replicated components (review r2, N3), and a claimed cooked entity in a region that flaps
+    loses its unreplicated rows in the prediction world until a full frame. A cooked entity
+    whose departure reached the client (a `Left` tombstone naming a region other than the one
+    the client holds it in, staged and applied) comes back, when it returns to a region the
+    packer names, by its re-entry spawn with its replicated components alone; its unreplicated
+    cooked rows return with its region's next load or a full frame. That includes an entity
+    re-entering under an owed `Left` tombstone that moves between two named regions before the
+    server sees the tombstone acknowledged, which a client holding it in the old region
+    despawns; one that moves out and back before the client stages its departure keeps them,
+    since the tombstone owed names the region it came back to (review r3, N5). Open for
+    lactose-net: a tombstone reaches the client only under a handle it holds, or one a staged
+    `Left` tombstone released. An entity a region's load placed on the client (cooked or in the
+    overlay) whose handle the client does not hold (the packer holds no record of it for that
+    client, having never held it or having forgotten it on seeing its tombstone acknowledged,
+    or the spawn under its current handle is not staged) stays on the client, if the server
+    destroys it or moves it to a region the client does not hold, until the region unloads or a
+    full frame. That includes a load whose state predates a tombstone the client staged first,
+    since a datagram stamped later can overtake the region changes on the reliable channel. In
+    the prediction world, a proxy a prediction system moved into a region the packer has not
+    named is kept by the hook for a `Left` tombstone naming that region, and stays there once
+    the server has seen the tombstone acknowledged (the replicated world, which runs no
+    systems, despawns it); the hook sees neither the replicated world nor where the server last
+    placed a proxy, so closing this needs a wider change, such as the hook recording the region
+    the frames last placed each proxy in, inside the world so that a rollback restores it
+    (review r2, N1, prediction world). A tombstone that names the key while the entity's whole
+    send is unacknowledged would close the case of a record whose handle the client lacks; the
+    rest needs the packer to know what a region's load places. A load naming a key still live
+    elsewhere on the client is refused. Rotations do not round-trip exactly; the rates are
+    measurements (verification row 91), and nothing relies on a value being stable.
 - Driven by: milestone 1, the `net-api` facade brief and its two design reviews (2026-10-10).
 
 **D122. The `predict` facade: what sections 5.1, 7, 9.2, 9.4, 10, 11 and 22 left open** (§5.1, §5.3,

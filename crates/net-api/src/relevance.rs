@@ -163,8 +163,10 @@ impl RegionRelevance {
 pub enum RegionChange {
     /// The region became relevant.
     Relevant(RegionRelevance),
-    /// The region is no longer relevant: the client unloads it, and its entities need no
-    /// tombstones.
+    /// The region is no longer relevant: the client unloads it, which despawns its
+    /// entities; the server sends a [`TombstoneCause::Left`](crate::TombstoneCause::Left)
+    /// tombstone beside it for each of the client's entities residing in it, which
+    /// releases their handles and slots.
     Irrelevant,
     /// The region's asset table was published or replaced (a hot reload, architecture
     /// section 9.3): the client pins it and puts it in `TickInput::assets`.

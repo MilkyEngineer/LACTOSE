@@ -12,7 +12,7 @@ mod common;
 
 use common::*;
 use lactose_core::Tick;
-use lactose_net_api::{StagedFrame, Tombstone};
+use lactose_net_api::{StagedFrame, Tombstone, TombstoneCause};
 use lactose_physics_api::Teleported;
 use lactose_predict::Reconciled;
 use lactose_reflect::Reflect;
@@ -74,7 +74,10 @@ fn in_one_window_as_in_two(
 #[test]
 fn a_claim_then_a_tombstone_in_one_window_leaves_the_entity_destroyed() {
     let tombstone = |frame: &mut StagedFrame| {
-        frame.despawns.insert(proxy(), Tombstone { region: REGION, tick: Tick(17) });
+        frame.despawns.insert(
+            proxy(),
+            Tombstone { region: REGION, tick: Tick(17), cause: TombstoneCause::Destroyed },
+        );
     };
     let rig = in_one_window_as_in_two(claim_frame, &tombstone, 2);
     assert!(!rig.world().contains(proxy()), "the server destroyed it at 17");

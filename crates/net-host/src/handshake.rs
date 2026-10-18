@@ -4,8 +4,12 @@
 //! Host-only: computed and checked by `app` and `lactose-net` at connection time.
 
 use bytemuck::{Pod, Zeroable};
-use lactose_core::{Error, ErrorKind};
-use lactose_reflect::{Registry, TypeInfo};
+use lactose_core::{Error, ErrorKind, xxh64};
+use lactose_reflect::{Persistence, Registry, TypeInfo};
+use lactose_sim::TICK_RATE_HZ;
+
+use crate::quant::{POSITION_UNITS_PER_METRE, ROTATION_SCALE};
+use crate::transport::MAX_DATAGRAM_BYTES;
 
 /// The version of the wire format itself: the packet framing, the quantisation constants
 /// and the message set. Part of the protocol hash, bumped by `lactose-net` when the
@@ -27,7 +31,17 @@ impl ProtocolHash {
     /// ascending component key order.
     #[must_use]
     pub fn of(registry: &Registry) -> Self {
-        todo!()
+        let mut stream = Vec::new();
+        stream.extend_from_slice(&PROTOCOL_VERSION.to_le_bytes());
+        stream.extend_from_slice(&TICK_RATE_HZ.to_le_bytes());
+        stream.extend_from_slice(&POSITION_UNITS_PER_METRE.to_le_bytes());
+        stream.extend_from_slice(&i32::from(ROTATION_SCALE).to_le_bytes());
+        let datagram = u32::try_from(MAX_DATAGRAM_BYTES).expect("the datagram limit is small");
+        stream.extend_from_slice(&datagram.to_le_bytes());
+        for info in registry.iter().filter(|info| Self::covers(info)) {
+            info.write_schema(&mut stream);
+        }
+        Self(xxh64(&stream, 0))
     }
 
     /// Whether `info` is covered: its tracking is `replicated`, or its persistence is
@@ -38,7 +52,8 @@ impl ProtocolHash {
     /// or the handshake refuses every connection.
     #[must_use]
     pub fn covers(info: &TypeInfo) -> bool {
-        todo!()
+        info.tracking().replicated
+            || matches!(info.persistence(), Persistence::Persistent | Persistence::Transient)
     }
 }
 

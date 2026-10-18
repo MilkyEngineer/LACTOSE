@@ -1,10 +1,10 @@
 //! The host side of networking (architecture section 4, `net-api`; sections 5.3, 9.1,
 //! 9.2 and 9.3): the quantised wire values, the handshake, the transport trait a
 //! loopback or UDP implementation is a page of, the packet framing and the per-connection
-//! handles, the per-client interest state the packer keeps, the lock-free interpolation
-//! buffer the presentation schedule samples, and the named places for clock sync and the
-//! control messages. The simulation side, what enters and leaves a world, is
-//! `lactose-net-api`, inside the boundary.
+//! handles, the per-client interest state the packer keeps, the interpolation buffer
+//! the presentation schedule samples through a sequence lock per slot, and the named
+//! places for clock sync and the control messages. The simulation side, what enters and
+//! leaves a world, is `lactose-net-api`, inside the boundary.
 //!
 //! Foundation tier, outside the determinism boundary, and no boundary crate may depend on
 //! it (`crate-tiers.toml`): floats, clocks and sockets live here, and the only things that
@@ -13,9 +13,8 @@
 //!
 //! # Status
 //!
-//! A facade: every public signature is final and every body that decides anything is
-//! `todo!()`. The implementation lane replaces the bodies behind this surface and removes
-//! the crate-level `allow` with the last `todo!()`.
+//! Implemented for milestone 1. The packer and the receiver that use these types are
+//! `lactose-net`'s, milestone 4; the README states the rules they keep.
 //!
 //! # Where to start
 //!
@@ -30,27 +29,32 @@
 //!   `lactose_net_api::InterpolationSlot`.
 //! - [`clock::ClockEstimate`] and [`message`] are named places.
 //!
-//! ```no_run
-//! use lactose_net_api::InterpolationSlot;
-//! use lactose_net_host::interpolation::{PresentationTime, RemoteSample};
+//! ```
+//! use lactose_core::Tick;
+//! use lactose_math::{Quat, Scalar, Vec3};
 //! use lactose_net_host::InterpolationBuffer;
+//! use lactose_net_host::interpolation::{
+//!     PresentationTime, ReceivedState, RemoteSample, SampleStatus,
+//! };
 //!
 //! // The network thread keeps the writer; the presentation schedule holds a reader and
 //! // samples every frame into its own buffer, without a lock.
-//! let (writer, reader) = InterpolationBuffer::split(4096);
-//! let slots: Vec<InterpolationSlot> = Vec::new();
-//! let mut samples = vec![RemoteSample::MISSING; slots.len()];
-//! reader.sample_batch(&slots, PresentationTime::default(), &mut samples);
-//! # let _ = writer;
+//! let (mut writer, reader) = InterpolationBuffer::split(4096);
+//! let slot = writer.allocate()?;
+//! for (tick, x) in [(10, 0), (12, 2)] {
+//!     let position = Vec3::new(Scalar::from_i32(x), Scalar::ZERO, Scalar::ZERO);
+//!     let state =
+//!         ReceivedState { tick: Tick(tick), teleported: Tick(0), position, rotation: Quat::IDENTITY };
+//!     writer.push(slot, state)?;
+//! }
+//! let mut samples = [RemoteSample::MISSING; 1];
+//! reader.sample_batch(&[slot], PresentationTime { tick: Tick(11), fraction: 0 }, &mut samples);
+//! assert_eq!(samples[0].status, SampleStatus::Interpolated);
+//! assert_eq!(samples[0].position.x, Scalar::ONE);
+//! # Ok::<(), lactose_core::Error>(())
 //! ```
 
 #![forbid(unsafe_code)]
-#![allow(
-    dead_code,
-    unused_variables,
-    reason = "facade: every body is `todo!()` until the implementation lane replaces it, and \
-              the fields and parameters it will use are declared now"
-)]
 
 pub mod clock;
 pub mod handshake;

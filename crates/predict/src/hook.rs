@@ -9,7 +9,7 @@ use std::sync::Arc;
 use lactose_bundle::ComponentData;
 use lactose_core::{Error, ErrorKind, NetId, PredictionKey, Result, StableKey, Tick};
 use lactose_ecs::{ClaimedBy, RegionId, World};
-use lactose_net_api::{StagedFrame, StagedInbox, StagedSpawn};
+use lactose_net_api::{StagedFrame, StagedInbox, StagedSpawn, Tombstone, TombstoneCause};
 use lactose_reflect::Reflect;
 use lactose_sim::{StagedState, StreamingAnchor};
 
@@ -357,13 +357,26 @@ fn apply_delta(
             ),
         }
     }
-    for &key in frame.despawns.keys() {
+    for (&key, tombstone) in &frame.despawns {
         if claimed_by(world, local, key) || !world.contains(key) {
             facts.push(Fact::Destroyed { key });
-        } else if let Err(error) = world.despawn(key) {
+        } else if !settled_by_its_region(world, key, tombstone)
+            && let Err(error) = world.despawn(key)
+        {
             refused("a tombstone", key, &error, replaying);
         }
     }
+}
+
+/// Whether a tombstone of the live `key` is its region's to settle, and skipped: a `Left`
+/// tombstone of an entity residing in the region it names (so the world has that region
+/// loaded), where the server has the entity. The region's unload is still to come, or the
+/// server names the region and the entity enters again whole; a later move or destruction
+/// comes as another tombstone of the key (`crates/net-api/README.md`, "The staged frame").
+/// A proxy the prediction world moved there is kept too, which `crates/net-host/README.md`
+/// states among what does not converge.
+fn settled_by_its_region(world: &World, key: StableKey, tombstone: &Tombstone) -> bool {
+    tombstone.cause == TombstoneCause::Left && world.region_of(key) == Some(tombstone.region)
 }
 
 /// Applies a claimed spawn's claim as a full frame does: `ClaimedBy` inserted on the live

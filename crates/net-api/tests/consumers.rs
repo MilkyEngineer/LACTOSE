@@ -16,7 +16,7 @@ use lactose_core::{ComponentKey, Error, ErrorKind, PlayerId, Result, StableKey, 
 use lactose_ecs::{Job, RegionId, ResMut, World, WorldKind, system};
 use lactose_net_api::{
     GatherState, RegionChange, RegionRelevance, RemoteSlot, StagedFrame, StagedInbox, StagedRow,
-    StagedSpawn, StagingFrame, Tombstone,
+    StagedSpawn, StagingFrame, TombstoneCause,
 };
 use lactose_reflect::{Reflect, component, decode};
 use lactose_sim::{
@@ -194,9 +194,13 @@ impl StagedState for ClientHook {
                     skip("row", row.key, &error);
                 }
             }
-            // Tombstones last; an entity already gone with its region is not an error.
-            for (&key, Tombstone { .. }) in &frame.despawns {
-                if world.contains(key)
+            // Tombstones last; an entity already gone with its region is not an error,
+            // and one a load of its region placed there is the region's to settle.
+            for (&key, tombstone) in &frame.despawns {
+                let loaded_there = tombstone.cause == TombstoneCause::Left
+                    && world.region_of(key) == Some(tombstone.region);
+                if !loaded_there
+                    && world.contains(key)
                     && let Err(error) = world.despawn(key)
                 {
                     skip("tombstone", key, &error);

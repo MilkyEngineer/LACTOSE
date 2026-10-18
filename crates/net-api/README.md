@@ -38,7 +38,7 @@ change that breaks it is a signature change to list.
 
 | Item | Purpose |
 |---|---|
-| `StagedFrame`, `StagedSpawn`, `Tombstone`, `StagedRow`, `StagedRows` | What a client received for one server tick, as the sync point applies it: spawns (or upserts) with the server's key and origin, moves, component removals, rows by (origin key, component) with their server tick and precision, tombstones, the time scale, the processed-input acknowledgement, substituted inputs and region changes |
+| `StagedFrame`, `StagedSpawn`, `Tombstone`, `TombstoneCause`, `StagedRow`, `StagedRows` | What a client received for one server tick, as the sync point applies it: spawns (or upserts) with the server's key and origin, moves, component removals, rows by (origin key, component) with their server tick and precision, tombstones, the time scale, the processed-input acknowledgement, substituted inputs and region changes |
 | `StagedInbox`, `DueFrames` | The service resource `app` fills between runs and a client world's `StagedState` hook drains inside the tick, without a lock; `due` is what `app` folds into the step's `TickInput` |
 | `RemoteSlot`, `InterpolationSlot` | The one component this crate adds to a client world: the entity's slot in `lactose-net-host`'s interpolation buffer, written by the hook from the staged spawn |
 | `StagingFrame`, `GatheredRow`, `GatheredRows` | What the replication gather produced: every replicated row changed since the last gather, grouped by region, and the structural log since the last gather |
@@ -183,7 +183,8 @@ which `build`'s `derived` check does not see.
   entity does not exist (its spawn was lost and the server resends it, since nothing of
   it is acknowledged); then each tombstone in ascending key order, `World::despawn` if
   the entity exists, nothing otherwise, since a region that became irrelevant took its
-  rows with it. The hook despawns nothing else. An entry that fails (a spawn into a region
+  rows with it, and nothing for a `TombstoneCause::Left` tombstone of an entity that
+  `World::region_of` places in the tombstone's region. The hook despawns nothing else. An entry that fails (a spawn into a region
   the world has not loaded, a move or a decode the world refuses) is logged and skipped,
   never returned as the hook's error: the frame is already popped, and the rest of it
   applies. A frame never names a key both in `spawns` and in `despawns`, never names a
@@ -199,6 +200,37 @@ which `build`'s `derived` check does not see.
   moving into a region the client does not have leaves the client's set with a tombstone,
   and one moving into a relevant region from one the client does not have arrives as a
   spawn.
+- A frame names an entity in a region only if that region is relevant to the client as of
+  that frame, at the latest by its own region changes; the client loads a frame's region
+  changes in the step that pops it. The packer names no entity of a region until the
+  reliable channel has delivered the region's `RegionRelevance`, and the receiver puts
+  each region change into the first frame it stages at or after the change's tick
+  (`crates/net-host/README.md`, "Interest and the packer" and "Handles and packets").
+- A region leaving a client's set is sent as `Irrelevant` beside a tombstone, at the tick
+  it leaves, for every entity of the client's set residing in it (D121, the decision on
+  region leave). Of the two ways to stop an entity moved into a region made relevant and
+  irrelevant again in one step from staying where it was in both client worlds until a
+  full frame (review round 4 of `lactose-predict`, N1), `lactose-net-host`'s packer sends
+  the tombstones, and the fold is unchanged: the step that folds a region's `Relevant` and
+  then `Irrelevant` into no load still applies the tombstone, which takes the entity out.
+  The tombstones also release the entities' handles and interpolation slots on both ends,
+  which nothing else does.
+- A tombstone's `cause` separates a destruction (`Destroyed`, naming the region the entity
+  was destroyed in) from an entity alive on the server that left the client's set (`Left`,
+  naming the region it resides in: the one leaving the set, the one it moved into that the
+  client may not name, or, for an entity that already owed a tombstone, any region it moved
+  into). The hook skips a `Left` tombstone when the entity resides in the region it names
+  (D121 addendum, review r1 of `lactose-net-host`, B2). The server has the entity in that
+  region, since the tombstone it owes follows the entity on every move (review r3 of
+  `lactose-net-host`, N5); so that region settles the client's copy: its unload is still to
+  come, or the server names the region and the entity enters again. A load of the region
+  after the entity left holds it with the cooked rows the stream never sends, which a
+  despawn followed by the re-entry spawn would lose. In the N1 case the entity resides in
+  the region it came from, so the tombstone still takes it out. A later tombstone of the
+  entity replaces a `Left` one the packer still owes, and the receiver stages it under the
+  key the `Left` one released (review r2 of `lactose-net-host`, N1), so an entity destroyed,
+  or moved to a region the client does not hold, before the server saw its `Left` tombstone
+  acknowledged is despawned even where the hook kept it.
 - `removed` comes from the gather's `Removed` entries of replicated components: a status
   effect ending, a body removed. Without it the client and the prediction world keep the
   component's last value forever and the packer resends it on every whole send; with it
@@ -209,6 +241,10 @@ which `build`'s `derived` check does not see.
   the network thread dequantises the wire position and adds the region origin before
   staging, so the hook writes one shape of bytes whatever the precision, and the
   prediction world's proxies and the replicated rows hold the same values.
+- A delta frame that holds an exact row of an entity holds every replicated component the
+  server's entity has at the frame's tick: the packer sends a claimed entity whole in
+  every packet that carries it and the receiver stages a packet whole or not at all, and
+  `lactose-predict` removes from a claimed entity what such a frame does not name.
 - `StagedSpawn::slot` is `None` for an entity the receiving player has claimed, which the
   prediction world presents; `Some` for every other entity, which the network thread
   allocated from its interpolation writer before staging the spawn, and whose states it
@@ -324,9 +360,9 @@ which `build`'s `derived` check does not see.
   `mode: RegionMode::Replicated`. The sim's load path then validates everything before
   `create_region`, as it does a save. The region's entities then arrive as spawns, which
   the hook applies as upserts over the rows the bundle loaded.
-- A `RegionChange::Irrelevant` becomes `TickInput::unloaded`; the region's entities need
-  no tombstones, since the unload despawns them, and the network thread releases their
-  slots and handles. `RegionChange::Assets(table)` is a table published or replaced after
+- A `RegionChange::Irrelevant` becomes `TickInput::unloaded`, which despawns the region's
+  entities; the tombstones sent beside it ("The staged frame") release their slots and
+  handles. `RegionChange::Assets(table)` is a table published or replaced after
   relevance (a hot reload, section 9.3), pinned by `app` into `TickInput::assets`.
 
 **Lag compensation** (architecture section 9.5)
@@ -361,7 +397,7 @@ that every path of the hook ran, and records both worlds' hashes.
 | What | How | Held by |
 |---|---|---|
 | The gather | Under SOUR's layout mode: a world with replicated rows changed on several ticks gives the same `StagingFrame` (rows, order, bytes, structural entries) under every chunk capacity and order and with one or many workers; a second gather with nothing changed is empty; a `world_mut` write between gathers appears exactly once; a `set_tick`-driven stamp rebase or a restore makes the next frame `full` with `structural` empty; a retention below the catch-up cap makes every gather after a catch-up frame full; a frame not taken merges with the next and holds one value per row, the newer; `region(r)` equals the rows of `r` in `rows()`; a `Moved` entry is in `structural` | `gather.rs` |
-| The staged frame | `push_row` keeps the newest tick and returns `false` otherwise, also for a row after the frame's tick or of another length, and the arena does not grow; `rows` ascend by (key, component); `is_empty` is exact, `removed` included; `StagedInbox::push` refuses a frame not after the newest ever accepted, also after a pop, `due` and `pop_through` agree and hand frames up to a tick oldest first; `oldest_after` names the first frame `due` leaves out, also with a frame for the present still queued; after `set_tick` back to an earlier tick, `reset` lets the full frame and the next one in, which are refused without it; the sketch hook applied to a world leaves spawns bound, `RemoteSlot` set, a live entity upserted with its slot set or removed, moves applied once, removed components gone (and re-added by a row of the same frame), rows written and tombstoned entities gone, an equal row leaves the row's stamp alone, and a failing entry leaves the rest of the frame applied; a region loaded by its bundle and then spawned by the stream ends with `RemoteSlot` set; a full frame over a client that holds stale rows ends with the frame's values and slots | `staged.rs` |
+| The staged frame | `push_row` keeps the newest tick and returns `false` otherwise, also for a row after the frame's tick or of another length, and the arena does not grow; `rows` ascend by (key, component); `is_empty` is exact, `removed` included; `StagedInbox::push` refuses a frame not after the newest ever accepted, also after a pop, `due` and `pop_through` agree and hand frames up to a tick oldest first; `oldest_after` names the first frame `due` leaves out, also with a frame for the present still queued; after `set_tick` back to an earlier tick, `reset` lets the full frame and the next one in, which are refused without it; the sketch hook applied to a world leaves spawns bound, `RemoteSlot` set, a live entity upserted with its slot set or removed, moves applied once, removed components gone (and re-added by a row of the same frame), rows written and tombstoned entities gone, a `Left` tombstone skipped only for an entity residing in the region it names, an equal row leaves the row's stamp alone, and a failing entry leaves the rest of the frame applied; a region loaded by its bundle and then spawned by the stream ends with `RemoteSlot` set; a full frame over a client that holds stale rows ends with the frame's values and slots | `staged.rs` |
 | The fold | Under the real sim: a frame for the tick the next step runs is folded and popped in that step (worlds built at 10, a full frame for 10, a delta for 12 loading a region and spawning into it: the region is loaded and the entity live after the step for 12); Relevant then Irrelevant in one step leaves the region unloaded; Irrelevant then Relevant unloads and loads it; a refused frame enters nothing; a full frame unloads every loaded region and reloads the relevant ones; a delta then a full frame due in one step load exactly the full frame's regions | `fold.rs` |
 | The gather's decision | A stale cursor with a current mark gives a full frame with every row, none skipped; a current cursor with a stale mark the same | `gather.rs` (stale cursor), `src/staging.rs` (stale mark, which no public call reaches: every epoch change also resets the structural log) |
 | The relevance message | `from_export` copies the seed, resources and transient keys; `to_bundle` builds the bundle the sim loads, and refuses the wrong baseline, a digest without a cache or with another digest, and an overlay against another baseline, carried or cached, each as `VersionMismatch` | `relevance.rs` |
