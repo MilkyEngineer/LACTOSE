@@ -1108,9 +1108,24 @@ rationale the author supplied during the editorial pass rather than one taken fr
   of the three rewritten tests fails under a mutation of the code it covers: a parked opener
   keeping its permit; a permit freed under the closed gate waking no idle worker, or the opener
   releasing without telling anyone; a graph worker or an opener never giving way mid-range; a
-  gate that ignores the reservation. Not covered yet (review round 2): the recovery test is
-  caught by no listed mutation and hangs rather than fails when the gate keeps its reservation,
-  and no test checks that opening the gate wakes the workers it held.
+  gate that ignores the reservation.
+- Addendum (lane task-gate-wake, 2026-10-18): review round 2's two gaps are closed. A new test
+  holds a thief at the closed gate beside the opener's single-fork children and then needs
+  every worker at once: it fails when opening the gate wakes nobody (M10). Every graph run in
+  `block_in_place.rs` is bounded, so a gate that keeps its reservation (M12) fails the
+  recovery, gate and reservation tests with a message instead of hanging them. Most other tests
+  that wait on a wake-up, a timer or shutdown are bounded the same way
+  (`tests/common::must_finish`); the plain `block_on`s that remain end at nextest's
+  slow-timeout, 5 x 60 s (`.config/nextest.toml`), which every nextest run and SOUR now use.
+  The push and steal-split wakes (`WorkerLocal::push`, `split_stolen`) had no test because no
+  work is lost without them, only parallelism; the wake-up tests in `graph.rs` and `scope.rs`
+  release work with every worker asleep and need all of them at once, and fail without either
+  wake (M11, M11b, M11c), and with a message when an injector submission wakes nobody (M13).
+  The end-of-block flag the counting tests read is ordered by SeqCst fences: a worker admitted
+  by `Gate::over_limit`'s relaxed read of the reopened gate could otherwise read it stale and
+  count a unit as running during the block (seen under Miri on the pre-fence text; the fences
+  rest on the SeqCst fence rule). Of the mutations tried only M9 (a freed permit not unparking
+  openers) survives; the openers' own re-check covers it.
 
 **D109. Wake policy: park after 50 µs, keep one, wake one per extra entry** (§5.1, `lactose-task`)
 - Why: measured on an M1. A longer spin or an extended rescan before parking bought no wake

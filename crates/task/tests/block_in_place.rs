@@ -4,27 +4,55 @@
 //! These tests synchronise on events, not durations. A unit or child that begins before a
 //! block holds its worker until the block is in place, so nothing counted can have started
 //! early, and a block that is owed work lasts until that work has run. A slow or
-//! oversubscribed machine makes them slower, never wrong: a regression shows as a bounded
-//! wait running out.
+//! oversubscribed machine makes them slower, never wrong: a regression these tests look for
+//! shows as a bounded wait running out.
 
 #![cfg(not(feature = "loom"))]
 
 mod common;
 
-use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering, fence};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use common::{Node, executor, graph, sized, spin_for, wait_for};
+use common::{LIMIT, Node, Rendezvous, executor, graph, must_finish, sized, spin_for, wait_for};
+use lactose_task::{Executor, Graph};
 
-/// Waits until `done` holds, or for a limit only a regression reaches. Miri's clock runs
-/// with the interpreter, hence its longer limit.
-fn wait_until(done: impl Fn() -> bool) {
-    let limit = Duration::from_secs(if cfg!(miri) { 600 } else { 60 });
+/// Waits until `done` holds, or for [`LIMIT`], which only a regression reaches. Returns
+/// whether it holds.
+fn wait_until(done: impl Fn() -> bool) -> bool {
     let begun = Instant::now();
-    while !done() && begun.elapsed() < limit {
+    while !done() && begun.elapsed() < LIMIT {
         std::thread::sleep(Duration::from_millis(1));
     }
+    done()
+}
+
+/// Runs `graph` on `executor` to the end. A run that outlasts every wait inside it, laid end
+/// to end, fails the test here: that is a gate that never reopened, or work it never let
+/// start, and the test would otherwise hang until the test runner's timeout. The waits
+/// inside report first.
+fn run(executor: &Executor, graph: Graph) {
+    let runner = executor.clone();
+    must_finish("the graph run (a gate that never reopened?)", LIMIT * 4, move || {
+        runner.block_on(runner.run_graph(graph)).unwrap();
+    });
+}
+
+/// Marks the end of a block for counting, before the gate opens. A worker can be admitted to
+/// a unit or child by a relaxed read of the reopened gate (`Gate::over_limit`), which orders
+/// nothing, so without the two fences that unit may still read the flag as unset and be
+/// counted as running during the block. With them, a load after the reader's fence sees a
+/// store made before the writer's fence whenever the reader saw the gate open.
+fn end_block(unblocked: &AtomicBool) {
+    unblocked.store(true, Ordering::Release);
+    fence(Ordering::SeqCst);
+}
+
+/// Whether the block had ended when the calling unit or child began. See [`end_block`].
+fn block_ended(unblocked: &AtomicBool) -> bool {
+    fence(Ordering::SeqCst);
+    unblocked.load(Ordering::Acquire)
 }
 
 /// How many units a block with workers reserved waits for: far fewer than are left to run.
@@ -61,7 +89,13 @@ fn measure(workers: u32, reserved: u32) -> (u32, u32) {
                 // The block begins with every other worker mid-range, so each has to give
                 // way inside its range and not merely be refused its next entry by a gate
                 // that closed before it took one.
-                wait_until(|| held.load(Ordering::Acquire) >= workers - 1);
+                assert!(
+                    wait_until(|| held.load(Ordering::Acquire) >= workers - 1),
+                    "only {} of {} other workers took a unit before the block: a split woke no \
+                     sleeping worker",
+                    held.load(Ordering::Acquire),
+                    workers - 1
+                );
                 let value = ctx.block_in_place(reserved, || {
                     blocked.store(true, Ordering::Release);
                     if reserved == 0 {
@@ -69,9 +103,9 @@ fn measure(workers: u32, reserved: u32) -> (u32, u32) {
                         // correct pool lets no unit start in it.
                         std::thread::sleep(Duration::from_millis(sized(20, 1).into()));
                     } else {
-                        wait_until(|| during.load(Ordering::Acquire) >= WANTED);
+                        let _ = wait_until(|| during.load(Ordering::Acquire) >= WANTED);
                     }
-                    unblocked.store(true, Ordering::Release);
+                    end_block(&unblocked);
                     "solver result"
                 });
                 assert_eq!(value, "solver result");
@@ -94,10 +128,12 @@ fn measure(workers: u32, reserved: u32) -> (u32, u32) {
                 if !blocked.load(Ordering::Acquire) {
                     // Holds the worker mid-job until the block is in place.
                     held.fetch_add(1, Ordering::AcqRel);
+                    // Twice the physics node's wait for these, which reports a block
+                    // that never began for want of workers.
                     let begun = Instant::now();
                     while !blocked.load(Ordering::Acquire) {
                         assert!(
-                            begun.elapsed() < Duration::from_secs(60),
+                            begun.elapsed() < LIMIT * 2,
                             "no block began: every worker holds a unit of the other node, which \
                              can only happen if the physics node was not taken first (roots \
                              released in node order into the FIFO injector)"
@@ -106,7 +142,7 @@ fn measure(workers: u32, reserved: u32) -> (u32, u32) {
                     }
                     return;
                 }
-                if unblocked.load(Ordering::Acquire)
+                if block_ended(&unblocked)
                     || !seen[ctx.slot() as usize].swap(true, Ordering::AcqRel)
                 {
                     return;
@@ -119,7 +155,7 @@ fn measure(workers: u32, reserved: u32) -> (u32, u32) {
             })
             .build()
     };
-    executor.block_on(executor.run_graph(graph(vec![physics, others], &[]))).unwrap();
+    run(&executor, graph(vec![physics, others], &[]));
     executor.shutdown();
     (peak.load(Ordering::Acquire), during.load(Ordering::Acquire))
 }
@@ -138,30 +174,110 @@ fn only_the_reserved_workers_take_jobs_during_a_block() {
     }
 }
 
+/// After a block the gate returns to its full width. The other workers were idle through
+/// it, with nothing queued; what follows needs every one of them at once.
 #[test]
 fn the_pool_recovers_its_full_width_after_a_block() {
     let workers = 3;
     let executor = executor(workers, 1);
+    let rendezvous = Arc::new(Rendezvous::new(&executor));
     let blocker = Node::new("block::first").run(|_, ctx| ctx.block_in_place(0, || ())).build();
-    // After the block, a node that needs every worker at once to finish: each unit waits
-    // until all of them have started.
-    let started = Arc::new(AtomicU32::new(0));
-    let rendezvous = {
-        let started = started.clone();
+    let after = {
+        let rendezvous = rendezvous.clone();
         Node::new("block::rendezvous")
             .units(workers)
-            .run(move |_, _| {
-                started.fetch_add(1, Ordering::AcqRel);
-                let begin = std::time::Instant::now();
-                while started.load(Ordering::Acquire) < workers {
-                    assert!(begin.elapsed() < Duration::from_secs(60), "a worker stayed parked");
-                    std::thread::yield_now();
-                }
+            .run(move |_, ctx| rendezvous.arrive(ctx.slot()))
+            .build()
+    };
+    run(&executor, graph(vec![blocker, after], &[(0, 1)]));
+    executor.shutdown();
+    assert!(
+        rendezvous.met(),
+        "only {} of {workers} workers took a unit after the block: a worker stayed parked",
+        rendezvous.arrived()
+    );
+}
+
+/// A worker held at the gate sleeps beside work it may not take, and the gate wakes it when
+/// it opens (`gate::idle_park`). Nothing else would: no work is queued after the block.
+///
+/// Three workers: physics, an opener whose children are single forks, so that no range
+/// split wakes anyone, and a thief. The opener and the thief are each held in a child until
+/// `block_in_place(0)` is in place; then both give way, the thief with the opener's
+/// children in sight. After the block the first child each worker runs waits for all three,
+/// and the thief can only get there if the opening woke it.
+#[test]
+fn a_worker_held_at_the_gate_rejoins_when_it_opens() {
+    let workers = 3;
+    let executor = executor(workers, 1);
+    let rendezvous = Arc::new(Rendezvous::new(&executor));
+    let physics_started = Arc::new(AtomicBool::new(false));
+    // How many workers are held in a child begun before the block, and how many have left it.
+    let inside = Arc::new(AtomicU32::new(0));
+    let left = Arc::new(AtomicU32::new(0));
+    let blocked = Arc::new(AtomicBool::new(false));
+
+    let physics = {
+        let (physics_started, inside, left, blocked) =
+            (physics_started.clone(), inside.clone(), left.clone(), blocked.clone());
+        Node::new("block::held")
+            .run(move |_, ctx| {
+                physics_started.store(true, Ordering::Release);
+                assert!(
+                    wait_until(|| inside.load(Ordering::Acquire) >= 2),
+                    "the opener and a thief were never both held in a child: a fork woke no \
+                     sleeping worker"
+                );
+                ctx.block_in_place(0, || {
+                    blocked.store(true, Ordering::Release);
+                    let _ = wait_until(|| left.load(Ordering::Acquire) >= 2);
+                    // From leaving its child to parking, a worker runs a few microseconds of
+                    // the pool's code; the pause leaves time for them on a loaded machine. A
+                    // correct pool passes however short it is; a pool that wakes nobody when
+                    // the gate opens fails only if the thief has parked by then.
+                    std::thread::sleep(Duration::from_millis(sized(20, 1).into()));
+                });
             })
             .build()
     };
-    executor.block_on(executor.run_graph(graph(vec![blocker, rendezvous], &[(0, 1)]))).unwrap();
+    let opener = {
+        let (rendezvous, physics_started) = (rendezvous.clone(), physics_started.clone());
+        Node::new("block::forks")
+            .run(move |_, ctx| {
+                // The block's worker is taken before any child exists, so no child waits for
+                // the worker that would begin it.
+                wait_for(&physics_started);
+                let (rendezvous, inside, left, blocked) = (&rendezvous, &inside, &left, &blocked);
+                ctx.scope(|scope| {
+                    for _ in 0..sized(64, 8) {
+                        scope.fork(move |child| {
+                            if blocked.load(Ordering::Acquire) {
+                                rendezvous.arrive(child.slot());
+                            } else {
+                                inside.fetch_add(1, Ordering::AcqRel);
+                                // Unbounded and sleeping: if the block never comes,
+                                // physics' wait for this one, begun first and bounded,
+                                // fails the test. A child that gave up would let the
+                                // opener take another and fake the premise.
+                                while !blocked.load(Ordering::Acquire) {
+                                    std::thread::sleep(Duration::from_millis(1));
+                                }
+                                left.fetch_add(1, Ordering::AcqRel);
+                            }
+                        });
+                    }
+                });
+            })
+            .build()
+    };
+    run(&executor, graph(vec![physics, opener], &[]));
     executor.shutdown();
+    assert!(
+        rendezvous.met(),
+        "only {} of {workers} workers ran a child after the block: one held at the gate was \
+         not woken when it opened",
+        rendezvous.arrived()
+    );
 }
 
 /// An opener that is parked on its scope latch runs nothing, so it must not count as one of
@@ -215,8 +331,8 @@ fn parked_opener(after_block: bool) {
                 }
                 ctx.block_in_place(1, || {
                     blocked.store(true, Ordering::Release);
-                    wait_until(|| during.load(Ordering::Acquire) >= wanted);
-                    unblocked.store(true, Ordering::Release);
+                    let _ = wait_until(|| during.load(Ordering::Acquire) >= wanted);
+                    end_block(&unblocked);
                 });
             })
             .build()
@@ -242,7 +358,7 @@ fn parked_opener(after_block: bool) {
                         if !blocked.load(Ordering::Acquire) {
                             stolen.store(true, Ordering::Release);
                             wait_for(blocked);
-                        } else if !unblocked.load(Ordering::Acquire) {
+                        } else if !block_ended(unblocked) {
                             during.fetch_add(1, Ordering::AcqRel);
                         }
                     });
@@ -260,7 +376,7 @@ fn parked_opener(after_block: bool) {
             })
             .build()
     };
-    executor.block_on(executor.run_graph(graph(vec![physics, opener], &[]))).unwrap();
+    run(&executor, graph(vec![physics, opener], &[]));
     executor.shutdown();
     let ran = during.load(Ordering::Acquire);
     assert!(
@@ -320,11 +436,11 @@ fn a_reservation_is_used_when_every_other_worker_is_an_opener() {
                 // The block begins with both openers running their own children, not before
                 // they reach them: otherwise they meet a closed gate before their first child
                 // and the give-way inside a range is never exercised.
-                wait_until(|| inside.load(Ordering::Acquire) >= 2);
+                let _ = wait_until(|| inside.load(Ordering::Acquire) >= 2);
                 ctx.block_in_place(1, || {
                     blocked.store(true, Ordering::Release);
-                    wait_until(|| during.load(Ordering::Acquire) >= wanted);
-                    unblocked.store(true, Ordering::Release);
+                    let _ = wait_until(|| during.load(Ordering::Acquire) >= wanted);
+                    end_block(&unblocked);
                 });
             })
             .build()
@@ -358,7 +474,7 @@ fn a_reservation_is_used_when_every_other_worker_is_an_opener() {
                             }
                             // As in `measure`: each worker's first child after the block
                             // may have been admitted before it, so it is not counted.
-                            if unblocked.load(Ordering::Acquire)
+                            if block_ended(unblocked)
                                 || !seen[child.slot() as usize].swap(true, Ordering::AcqRel)
                             {
                                 continue;
@@ -375,7 +491,7 @@ fn a_reservation_is_used_when_every_other_worker_is_an_opener() {
             .build()
     };
     let nodes = vec![physics, opener("block::opener-a"), opener("block::opener-b")];
-    executor.block_on(executor.run_graph(graph(nodes, &[]))).unwrap();
+    run(&executor, graph(nodes, &[]));
     executor.shutdown();
     let ran = during.load(Ordering::Acquire);
     assert!(ran >= wanted, "{ran} of {wanted} children ran during the block with one reserved");

@@ -1,0 +1,6 @@
+# Architecture section 5.1: tests run one process per test, with timeouts. A test that hangs is
+# reported slow every 60 s and killed after 5 periods, so it fails with its name instead of
+# running to the CI job's timeout. The longest bounded wait in the suite is lactose-task's
+# 4 x 60 s in `tests/block_in_place.rs`, which reports before the kill.
+[profile.default]
+slow-timeout = { period = "60s", terminate-after = 5 }

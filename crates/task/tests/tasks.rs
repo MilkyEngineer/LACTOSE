@@ -11,7 +11,7 @@ use core::task::{Context, Poll, Waker};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use common::{Node, executor, graph, sized, wait_for};
+use common::{LIMIT, Node, executor, graph, must_finish, sized, wait_for};
 use lactose_core::{AllocTag, ErrorKind, Result, ThreadClass};
 use lactose_task::{
     CoreTopology, Executor, Platform, StdPlatform, ThreadHandle, ThreadSpec, WorkerClass, yield_now,
@@ -193,9 +193,13 @@ fn sleep_until_resolves_at_its_deadline() {
     let executor = executor(2, 1);
     let delay = Duration::from_millis(20);
 
-    // From the thread inside `block_on`, with every worker asleep.
+    // From the thread inside `block_on`, with every worker asleep. A timer that never fires
+    // leaves `block_on` parked for ever, hence the bound.
     let start = Instant::now();
-    executor.block_on(executor.sleep_until(start + delay)).unwrap();
+    let runner = executor.clone();
+    must_finish("a timer with every worker asleep", LIMIT, move || {
+        runner.block_on(runner.sleep_until(start + delay)).unwrap();
+    });
     assert!(start.elapsed() >= delay);
     // A deadline in the past resolves at once.
     executor.block_on(executor.sleep_until(start)).unwrap();
@@ -223,8 +227,12 @@ fn sleep_until_resolves_at_its_deadline() {
         })
     };
     drop(abandoned);
-    for (task, rank) in tasks.into_iter().zip([3u32, 1, 2]) {
-        assert!(executor.block_on(task).unwrap() >= delay * rank);
+    let runner = executor.clone();
+    let woke = must_finish("tasks asleep on timers", LIMIT, move || {
+        tasks.into_iter().map(|task| runner.block_on(task).unwrap()).collect::<Vec<_>>()
+    });
+    for (woke, rank) in woke.into_iter().zip([3u32, 1, 2]) {
+        assert!(woke >= delay * rank);
     }
     executor.shutdown();
 }
@@ -350,7 +358,11 @@ fn timers_fire_while_every_worker_is_busy_and_then_idle() {
     });
     let busy = Node::new("tasks::busy").run(move |_, _| common::spin_for(delay * 2)).build();
     executor.block_on(executor.run_graph(graph(vec![busy], &[]))).unwrap();
-    assert!(executor.block_on(timer).unwrap() >= delay);
+    let runner = executor.clone();
+    let woke = must_finish("a timer due while every worker was busy", LIMIT, move || {
+        runner.block_on(timer).unwrap()
+    });
+    assert!(woke >= delay);
     executor.shutdown();
 }
 
@@ -587,7 +599,9 @@ fn shutdown_with_work_outstanding_finishes_running_jobs_and_drops_the_rest() {
     std::thread::sleep(Duration::from_millis(sized(20, 1).into()));
     assert!(!stopper.is_finished());
     release.store(true, Ordering::Release);
-    stopper.join().unwrap();
+    must_finish("shutdown once the running job could finish", LIMIT, move || {
+        stopper.join().unwrap();
+    });
 
     assert!(scope_closed.load(Ordering::Acquire), "the running job was cut short");
     assert_eq!(children.load(Ordering::Relaxed), sized(64, 6));
@@ -741,19 +755,25 @@ fn futures_cut_off_by_shutdown_resolve_to_cancelled() {
         std::thread::yield_now();
     }
     release.store(true, Ordering::Release);
-    stopper.join().unwrap();
-    for waiter in waiters {
-        assert_eq!(waiter.join().unwrap(), Some(ErrorKind::Cancelled));
-    }
+    // A future that shutdown leaves pending parks its waiter for ever, hence the bound.
+    let kinds = must_finish("shutdown and the threads blocked on its futures", LIMIT, move || {
+        stopper.join().unwrap();
+        waiters.map(|waiter| waiter.join().unwrap())
+    });
+    assert_eq!(kinds, [Some(ErrorKind::Cancelled); 3]);
 
     // What is started after shutdown is cancelled at once, not left pending.
-    let late_run = executor.run_graph(graph(vec![Node::new("tasks::late").build()], &[]));
-    let late_run = executor.block_on(late_run).err().map(|error| error.kind());
-    assert_eq!(late_run, Some(ErrorKind::Cancelled));
-    let late_task = executor.spawn(WorkerClass::FrameCritical, async { 1 });
-    assert_eq!(executor.block_on(late_task).unwrap_err().kind(), ErrorKind::Cancelled);
-    let late_sleep = executor.sleep_until(Instant::now() + Duration::from_secs(3600));
-    assert_eq!(executor.block_on(late_sleep).unwrap_err().kind(), ErrorKind::Cancelled);
+    let late = executor.clone();
+    let kinds = must_finish("futures started after shutdown", LIMIT, move || {
+        let run = late.run_graph(graph(vec![Node::new("tasks::late").build()], &[]));
+        let run = late.block_on(run).err().map(|error| error.kind());
+        let task = late.spawn(WorkerClass::FrameCritical, async { 1 });
+        let task = late.block_on(task).err().map(|error| error.kind());
+        let sleep = late.sleep_until(Instant::now() + Duration::from_secs(3600));
+        let sleep = late.block_on(sleep).err().map(|error| error.kind());
+        [run, task, sleep]
+    });
+    assert_eq!(kinds, [Some(ErrorKind::Cancelled); 3]);
 }
 
 /// A platform that counts the threads it has running.
@@ -1058,8 +1078,12 @@ fn a_cancelled_run_resolves_only_when_its_jobs_have_returned() {
         std::thread::yield_now();
     }
     release.store(true, Ordering::Release);
-    let (kind, quiet) = waiter.join().unwrap();
-    stopper.join().unwrap();
+    let (kind, quiet) =
+        must_finish("the cancelled run, once its job could return", LIMIT, move || {
+            let resolved = waiter.join().unwrap();
+            stopper.join().unwrap();
+            resolved
+        });
     assert_eq!(kind, Some(ErrorKind::Cancelled));
     assert!(quiet, "the run resolved before its job had returned");
     assert_eq!(finalized.load(Ordering::Acquire), 0, "a finalize started after cancellation");
@@ -1160,7 +1184,11 @@ fn shutdown_on_an_own_worker_returns_without_joining_itself() {
     }
     wait_for(&returned);
     // Everything else about shutdown happened: waiting futures are answered...
-    assert_eq!(executor.block_on(pending_task).unwrap_err().kind(), ErrorKind::Cancelled);
+    let runner = executor.clone();
+    let kind = must_finish("a task cut off by shutdown on a worker", LIMIT, move || {
+        runner.block_on(pending_task).unwrap_err().kind()
+    });
+    assert_eq!(kind, ErrorKind::Cancelled);
     // ...and the threads go away on their own.
     let start = Instant::now();
     while live.load(Ordering::Acquire) != 0 {
