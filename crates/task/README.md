@@ -143,7 +143,9 @@ and list what changed, because `lactose-ecs` is written against this surface.
   children does the same. A worker parked on a scope latch holds no permit, so it never uses
   up a reservation; and an opener that gave way to the gate with children still on its own
   deque is woken when a permit comes free, so a reservation is used even when every other
-  worker is inside a scope.
+  worker is inside a scope. A worker that kept its permit through the block may go on as soon
+  as the gate reopens, unordered with the closure: the closure's writes reach other nodes
+  through the graph, not through the gate.
 - Dedicated threads owned by other crates (network, present, audio) are created through
   `Executor::platform`, never `std::thread` directly.
 - There is no timer thread. Frame-critical workers fire due timers when they look for work,

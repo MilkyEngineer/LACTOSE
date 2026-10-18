@@ -7,7 +7,7 @@ mod common;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use common::{Node, Rendezvous, executor, graph, let_workers_sleep, sized};
+use common::{LIMIT, Node, Rendezvous, executor, graph, let_workers_sleep, must_finish, sized};
 use lactose_task::{GraphBuilder, GraphError, NodeId};
 
 #[test]
@@ -281,7 +281,11 @@ fn a_nodes_units_reach_every_sleeping_worker() {
             .build()
     };
     let_workers_sleep();
-    executor.block_on(executor.run_graph(graph(vec![node], &[]))).unwrap();
+    // Bounded beyond the rendezvous: a release that wakes nobody would start no unit at all.
+    let runner = executor.clone();
+    must_finish("a node released with every worker asleep", LIMIT * 2, move || {
+        runner.block_on(runner.run_graph(graph(vec![node], &[]))).unwrap();
+    });
     executor.shutdown();
     assert!(
         rendezvous.met(),
