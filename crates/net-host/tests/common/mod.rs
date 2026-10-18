@@ -633,6 +633,19 @@ impl ServerModel {
         self.interest.entities.get(&key).is_some_and(|entity| entity.tombstone.is_some())
     }
 
+    /// The invariant the owed tombstone keeps (`README.md`, "Moves"): an owed `Left`
+    /// tombstone names the region the server has the entity in.
+    fn assert_owed_tombstones_follow(&self) {
+        for (key, entity) in &self.interest.entities {
+            if let Some(owed) = entity.tombstone
+                && owed.cause == TombstoneCause::Left
+            {
+                let region = self.mirror.get(key).map(|entity| entity.region);
+                assert_eq!(region, Some(owed.region), "{key:?} owes {owed:?}, {entity:?}");
+            }
+        }
+    }
+
     fn enter(&mut self, key: StableKey) {
         self.interest.enter(key).expect("far fewer entities than handles");
         self.interest.set_claimed(key, self.claimed.contains(&key));
@@ -666,21 +679,26 @@ impl ServerModel {
                     if let Some(entity) = self.mirror.get_mut(&key) {
                         entity.region = to;
                     }
-                    match (self.holds(key), self.named.contains(&to)) {
-                        // Named by the region it went to, which the client does not
-                        // hold it in.
-                        (true, false) => self.leave(key, to, tick, TombstoneCause::Left),
-                        (false, true) => self.enter(key),
+                    let named = self.named.contains(&to);
+                    if self.owes_tombstone(key) {
+                        // The owed tombstone follows the entity on every move, held
+                        // (re-entering) or not, which the client's hook may have kept where
+                        // the owed one names (review r2, N1; review r3, N5); it enters a
+                        // named region once the tombstone is acknowledged.
+                        self.leave(key, to, tick, TombstoneCause::Left);
+                        if named {
+                            self.enter(key);
+                        }
+                    } else if self.holds(key) && named {
                         // An entity the client may fail to move (its old region unloading
                         // in the same step) arrives whole beside its move.
-                        (true, true) => self.interest.resend_whole(key),
-                        // Not held and owing a tombstone: the tombstone follows the entity,
-                        // which the client's hook may have kept where the owed one names
-                        // (review r2, N1).
-                        (false, false) if self.owes_tombstone(key) => {
-                            self.leave(key, to, tick, TombstoneCause::Left);
-                        }
-                        (false, false) => {}
+                        self.interest.resend_whole(key);
+                    } else if self.holds(key) {
+                        // Named by the region it went to, which the client does not hold
+                        // it in.
+                        self.leave(key, to, tick, TombstoneCause::Left);
+                    } else if named {
+                        self.enter(key);
                     }
                 }
                 StructuralChange::Removed { key, component } => {
@@ -1292,6 +1310,7 @@ impl Replication {
             }
         }
         self.history.insert(tick, claimed);
+        self.model.assert_owed_tombstones_follow();
         let packet = self.model.pack(tick);
         self.down.send(now, packet, &self.link, &mut self.rng);
 
@@ -1472,8 +1491,10 @@ pub fn change_interest(
 /// Cooked entities in [`CookedChurn::REGION`] for the convergence scenarios (review r2: a
 /// scenario without them never reaches a `Left` tombstone the hook skips). Their rows
 /// change; in `window` the region leaves the client's interest for short spells, and they
-/// depart, destroyed or moved to a third or fourth region, where a tombstone of them would
-/// reach the client: always while one is owed, at the window's end, and rarely else. The first
+/// depart, destroyed or moved to a third or fourth region the packer does not name, where a
+/// tombstone of them would reach the client: always while one is owed, at the window's end,
+/// and rarely else. One moved away often comes back, within a round trip or later
+/// (review r3, N6). The first
 /// departure fixes the region's relevance from then on, since the model's load places a
 /// region's cooked entities whatever the server holds (it has no overlay).
 pub struct CookedChurn {
@@ -1481,6 +1502,10 @@ pub struct CookedChurn {
     window: Range<u32>,
     pub frozen: bool,
     pub departures: u32,
+    pub returns: u32,
+    returned: BTreeSet<StableKey>,
+    /// Each key's region on the server from each tick on, `None` once destroyed.
+    history: BTreeMap<StableKey, Vec<(Tick, Option<RegionId>)>>,
 }
 
 impl CookedChurn {
@@ -1507,7 +1532,16 @@ impl CookedChurn {
             let world = replication.world_mut();
             world.spawn(key, Self::REGION, (at(n), Health(5), Mover(0))).expect("spawn");
         }
-        Self { keys, window, frozen: false, departures: 0 }
+        let history = keys.iter().map(|&key| (key, vec![(Tick(0), Some(Self::REGION))])).collect();
+        Self {
+            keys,
+            window,
+            frozen: false,
+            departures: 0,
+            returns: 0,
+            returned: BTreeSet::new(),
+            history,
+        }
     }
 
     /// The regions whose relevance stays as it is.
@@ -1534,28 +1568,80 @@ impl CookedChurn {
         // A departure while the entity owes a tombstone is the case of review r2, N1: the
         // client may have kept the entity for a Left tombstone the departure must replace.
         // Short gaps in the region's relevance make that state common; the window's last
-        // ticks make sure every entity departs.
+        // ticks make sure every entity departs. One that came back stays, mostly.
         let owes =
             replication.model.interest.entities.get(&key).is_some_and(|e| e.tombstone.is_some());
         let late = n + 30 >= self.window.end;
-        if (owes || late || rng.chance(1))
+        let forced = (owes || late) && !self.returned.contains(&key);
+        if (forced || rng.chance(1))
             && replication.server().world().region_of(key) == Some(Self::REGION)
             && Self::reaches(replication, key)
         {
+            // Into a region the packer does not name, so the client holds the entity only
+            // in this one, which keeps `assert_cooked_rows` exact.
+            let to = REGIONS[2 + usize::from(value % 3 == 2)];
+            let named = replication.model.named.contains(&to);
             let world = replication.world_mut();
-            match value % 3 {
-                0 => world.despawn(key),
-                1 => world.move_to_region(key, REGIONS[2]),
-                _ => world.move_to_region(key, REGIONS[3]),
-            }
-            .expect("a live entity departs");
+            let destroyed = value.is_multiple_of(3) || named;
+            if destroyed { world.despawn(key) } else { world.move_to_region(key, to) }
+                .expect("a live entity departs");
+            self.record(replication, key, (!destroyed).then_some(to));
             self.departures += 1;
             self.frozen = true;
+        }
+        // Back into the region, where the tombstone owed must follow it (review r3, N5).
+        let away = replication.server().world().region_of(key).is_some_and(|r| r != Self::REGION);
+        if away && replication.model.named.contains(&Self::REGION) && rng.chance(50) {
+            let world = replication.world_mut();
+            world.move_to_region(key, Self::REGION).expect("a live entity moves back");
+            self.record(replication, key, Some(Self::REGION));
+            self.returns += 1;
+            self.returned.insert(key);
         }
         let relevant = replication.model.relevant.contains(&Self::REGION);
         if !self.frozen && rng.chance(if relevant { 5 } else { 50 }) {
             replication.change(Change::Relevant(Self::REGION, !relevant));
         }
+    }
+
+    /// Records a structural change of `key`, which the next tick gathers.
+    fn record(&mut self, replication: &Replication, key: StableKey, region: Option<RegionId>) {
+        let tick = Tick(replication.server().tick().0 + 1);
+        self.history.get_mut(&key).expect("a cooked key").push((tick, region));
+    }
+
+    /// Where the server had `key` at `tick`.
+    fn region_at(&self, key: StableKey, tick: Tick) -> Option<RegionId> {
+        let history = &self.history[&key];
+        history.iter().rev().find(|&&(from, _)| from <= tick).and_then(|&(_, region)| region)
+    }
+
+    /// The rows `Replication::assert_converged` does not compare (review r3, N6): a cooked
+    /// entity the server has in the region carries the unreplicated `Mover` on the client,
+    /// which only the region's load gives it, unless its departure reached the client (it
+    /// staged a `Left` tombstone naming another region, where the server had the entity at
+    /// the tick of the packet that carried it) and the entity came back by its re-entry
+    /// spawn, with its replicated components alone. A tombstone naming a region the entity
+    /// had already left when it was sent counts against the packer. Returns how many
+    /// entities that moved away and back it checked.
+    pub fn assert_cooked_rows(&self, replication: &Replication, what: &str) -> u32 {
+        let server = replication.server().world();
+        let client = replication.client().world();
+        let mut returned = 0;
+        for &key in &self.keys {
+            let departed = replication.frames.iter().any(|frame| {
+                frame.despawns.get(&key).is_some_and(|tombstone| {
+                    tombstone.region != Self::REGION
+                        && self.region_at(key, frame.tick) == Some(tombstone.region)
+                })
+            });
+            if departed || server.region_of(key) != Some(Self::REGION) || !client.contains(key) {
+                continue;
+            }
+            assert!(client.get::<Mover>(key).is_some(), "{what}: {key:?} lost its cooked row");
+            returned += u32::from(self.returned.contains(&key));
+        }
+        returned
     }
 
     /// Whether a departure of `key` now reaches the client whatever the link does: the

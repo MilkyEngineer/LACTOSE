@@ -331,13 +331,14 @@ pub struct Tombstone {
 pub enum TombstoneCause {
     /// The server destroyed the entity.
     Destroyed,
-    /// The entity is alive on the server in [`Tombstone::region`], which left the client's
-    /// set at the tombstone's tick or which the client may not name yet. The hook skips
-    /// such a tombstone when the client's entity resides in that region, which settles it:
-    /// the region's unload is still to come, or the server names the region and the entity
-    /// enters again. A later departure of the entity replaces the tombstone the server
-    /// owes, and the client stages it under the same key even after the hook kept the
-    /// entity.
+    /// The entity is alive on the server in [`Tombstone::region`]: that region left the
+    /// client's set at the tombstone's tick, or the entity moved there, out of the client's
+    /// set or while a tombstone of it was owed. The hook skips such a tombstone when the
+    /// client's entity resides in that region, which settles it: the region's unload is
+    /// still to come, or the server names the region and the entity enters again. A later
+    /// move or destruction of the entity replaces the tombstone the server owes, so that it
+    /// names where the server has the entity, and the client stages it under the same key
+    /// even after the hook kept the entity.
     Left,
 }
 

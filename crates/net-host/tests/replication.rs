@@ -181,6 +181,7 @@ fn a_malformed_packet_changes_nothing_and_is_not_acknowledged() {
 #[test]
 fn the_client_converges_under_churn_loss_reorder_resyncs_and_claims() {
     let executor = executor(2);
+    let mut returned_in_all = 0;
     for seed in [1_u64, 2, 3] {
         let mut replication = Replication::new(LayoutConfig::default(), 40, &[R1, R2], seed);
         let mut cooked = CookedChurn::new(&mut replication, 560..690);
@@ -200,10 +201,13 @@ fn the_client_converges_under_churn_loss_reorder_resyncs_and_claims() {
         }
         calm(&mut replication, &executor, next);
         replication.assert_converged(&format!("seed {seed}"));
+        let returned = cooked.assert_cooked_rows(&replication, &format!("seed {seed}"));
+        returned_in_all += returned;
         let stats = replication.receiver.stats;
         println!(
-            "seed {seed}: {stats:?}, {} whole checks, {} departures",
-            replication.whole_checks, cooked.departures
+            "seed {seed}: {stats:?}, {} whole checks, {} departures, {} returns, {returned} \
+             returned with their cooked rows",
+            replication.whole_checks, cooked.departures, cooked.returns
         );
         assert!(cooked.departures > 0, "seed {seed}");
         assert_eq!(stats.malformed, 0, "seed {seed}");
@@ -220,6 +224,10 @@ fn the_client_converges_under_churn_loss_reorder_resyncs_and_claims() {
         };
         assert!(skipped.iter().all(region_not_loaded), "seed {seed}: {skipped:?}");
     }
+    assert!(
+        returned_in_all > 0,
+        "a cooked entity came back before its departure reached the client"
+    );
 }
 
 /// A replication of `entities`, keyed `1..`, all in `R1`, joined and settled with
@@ -635,6 +643,107 @@ fn an_entity_owing_a_tombstone_that_moves_owes_one_naming_where_it_went() {
     }
     replication.assert_converged("after the move");
     assert!(!replication.client().world().contains(cooked_key()));
+}
+
+/// Moves the cooked entity to R3, which the client does not hold, and a tick later back to
+/// R2, with every datagram lost meanwhile. The owed tombstone follows it each time.
+fn out_and_back(replication: &mut Replication, executor: &Executor) {
+    replication.link.loss = 100;
+    replication.world_mut().move_to_region(cooked_key(), R3).unwrap();
+    replication.tick(executor);
+    assert_eq!(owed(replication).map(|tombstone| tombstone.region), Some(R3));
+    replication.world_mut().move_to_region(cooked_key(), R2).unwrap();
+    replication.tick(executor);
+    assert_eq!(owed(replication).map(|tombstone| tombstone.region), Some(R2));
+    assert!(replication.model.interest.entities[&cooked_key()].reentering);
+}
+
+/// Lets the link recover and checks that the client holds the cooked entity in R2 with its
+/// unreplicated `Mover`, which only the region's load gives it.
+fn back_with_its_cooked_rows(replication: &mut Replication, executor: &Executor, what: &str) {
+    replication.link.loss = 0;
+    for _ in 0..40 {
+        replication.tick(executor);
+    }
+    replication.assert_converged(what);
+    assert_eq!(replication.client().world().region_of(cooked_key()), Some(R2), "{what}");
+    assert!(cooked_mover(replication), "{what}: the cooked row is kept");
+}
+
+/// Review r3, N5 (p8a): the entity is reentering under `Left(R2)` when it moves out to R3
+/// and back to R2 before the client stages anything. The tombstone owed names R2 again,
+/// which the client's hook skips, so the cooked row survives.
+#[test]
+fn a_reentering_entity_that_moves_out_and_back_keeps_its_cooked_rows() {
+    let (mut replication, executor) = flapped_and_named();
+    out_and_back(&mut replication, &executor);
+    back_with_its_cooked_rows(&mut replication, &executor, "p8a");
+}
+
+/// Review r3, N5 (p8b): no flap. The client holds the entity in R2 when it moves out to R3
+/// and back before the client stages anything.
+#[test]
+fn a_held_entity_that_moves_out_and_back_keeps_its_cooked_rows() {
+    let (mut replication, executor) = cooked();
+    out_and_back(&mut replication, &executor);
+    back_with_its_cooked_rows(&mut replication, &executor, "p8b");
+}
+
+/// Review r3, N5 (p8c): as p8a, after the client staged and skipped `Left(R2)`. The
+/// tombstone naming R2 again goes out under the handle the client released, which it
+/// stages, since it differs from the one it staged, and skips.
+#[test]
+fn an_entity_kept_for_its_left_tombstone_that_moves_out_and_back_keeps_its_cooked_rows() {
+    let (mut replication, executor) = flapped_and_named();
+    replication.link.loss = 0;
+    let from = replication.frames.len();
+    let staged = |replication: &Replication| {
+        frames_since(replication, from).iter().any(|frame| {
+            frame.despawns.get(&cooked_key()).is_some_and(|t| t.cause == TombstoneCause::Left)
+        })
+    };
+    for _ in 0..20 {
+        if staged(&replication) {
+            break;
+        }
+        replication.tick(&executor);
+    }
+    assert!(staged(&replication), "the Left tombstone was staged");
+    assert!(replication.client().world().contains(cooked_key()), "kept by its region");
+    out_and_back(&mut replication, &executor);
+    back_with_its_cooked_rows(&mut replication, &executor, "p8c");
+}
+
+/// Review r3, the invariant on a held move: an entity reentering under `Left(R2)` that
+/// moves into R3, which the packer names, owes a tombstone naming R3 and enters R3 once it
+/// is acknowledged. A client holding the entity in R2 despawns it at that tombstone and
+/// takes it whole from the re-entry spawn, its cooked rows lost (the cost the README
+/// states).
+#[test]
+fn a_reentering_entity_moving_into_a_named_region_owes_a_tombstone_naming_it() {
+    let (mut replication, executor) = cooked();
+    replication.change(Change::Relevant(R3, true));
+    while !replication.model.named.contains(&R3) {
+        replication.tick(&executor);
+    }
+    replication.link.loss = 100;
+    replication.change(Change::Relevant(R2, false));
+    replication.tick(&executor);
+    replication.change(Change::Relevant(R2, true));
+    while !replication.model.named.contains(&R2) {
+        replication.tick(&executor);
+    }
+    assert!(replication.model.interest.entities[&cooked_key()].reentering);
+    replication.world_mut().move_to_region(cooked_key(), R3).unwrap();
+    replication.tick(&executor);
+    assert_eq!(owed(&replication).map(|tombstone| tombstone.region), Some(R3));
+    assert!(replication.model.interest.entities[&cooked_key()].reentering);
+    replication.link.loss = 0;
+    for _ in 0..40 {
+        replication.tick(&executor);
+    }
+    replication.assert_converged("after the move");
+    assert_eq!(replication.client().world().region_of(cooked_key()), Some(R3));
 }
 
 fn wire_spawn(handle: EntityHandle, n: u64) -> WireSpawn {
