@@ -436,15 +436,22 @@ fn a_non_finite_delta_counts_as_zero() {
 }
 
 #[test]
-fn a_non_finite_current_angle_counts_as_zero() {
-    // The fields are public: the input task or the camera rig may assign anything.
-    for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+fn a_non_finite_current_angle_is_repaired_as_the_quantiser_reads_it() {
+    // The fields are public: the input task or the camera rig may assign anything. A
+    // non-finite yaw and a NaN pitch count as zero; an infinite pitch is clamped to its
+    // limit, which is the quantiser's reading of it too.
+    for (bad, repaired) in
+        [(f32::NAN, 0.0), (f32::INFINITY, FRAC_PI_2), (f32::NEG_INFINITY, -FRAC_PI_2)]
+    {
         let mut raw = RawSample { yaw: bad, pitch: bad, ..RawSample::IDLE };
         raw.turn(0.25, -0.5);
-        assert_eq!((raw.yaw, raw.pitch), (0.25, -0.5), "{bad}");
+        let turned = if bad.is_nan() { -0.5 } else { repaired };
+        assert_eq!((raw.yaw, raw.pitch), (0.25, turned), "{bad}");
         let mut raw = RawSample { yaw: bad, pitch: bad, ..RawSample::IDLE };
         raw.turn(bad, bad);
-        assert_eq!((raw.yaw, raw.pitch), (0.0, 0.0), "{bad}");
+        assert_eq!((raw.yaw, raw.pitch), (0.0, repaired), "{bad}");
+        // A turn that adds nothing leaves the quantised angles as they were.
+        assert_eq!((yaw(raw.yaw), pitch(raw.pitch)), (yaw(bad), pitch(bad)), "{bad}");
     }
 }
 

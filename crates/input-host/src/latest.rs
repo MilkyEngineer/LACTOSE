@@ -14,8 +14,9 @@ use crate::seqlock::{self, Native, WORDS};
 /// The most recently published [`RawSample`], shared between the thread that samples
 /// devices and the frame-critical worker that latches the camera. `publish` and `read`
 /// never lock; a reader waits only while a publish is in flight (six stores), which a
-/// descheduled publisher can stretch to a scheduling quantum. The slot is a sequence-locked copy of the sample's
-/// six words (the shape `net-api`'s interpolation buffer uses). `publish`: compare-exchange
+/// descheduled publisher can stretch to a scheduling quantum. The slot is a
+/// sequence-locked copy of the sample's six words (the shape `net-api`'s interpolation
+/// buffer uses). `publish`: compare-exchange
 /// (`Acquire`) the sequence from even to odd, then `fence(Release)`, then the words
 /// `Relaxed`, then store the next even value (`Release`); so a publisher may wait for
 /// another publisher but never for a reader, two concurrent publishers cannot interleave

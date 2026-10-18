@@ -27,13 +27,13 @@ pub struct RawSample {
     /// Movement forward, as `movement_x`.
     pub movement_y: f32,
     /// The absolute camera yaw in radians, kept in `[-PI, PI)` by [`turn`](Self::turn)
-    /// (which counts a non-finite yaw as zero),
-    /// so that an accumulated yaw never grows coarser than a sample unit (past 1024 rad
-    /// an `f32` is, and at 8192 rad a mouse delta vanishes). Zero faces `-Z`; positive
-    /// turns left.
+    /// (which counts a non-finite yaw as zero), so that an accumulated yaw never grows
+    /// coarser than a sample unit (past 1024 rad an `f32` is, and at 8192 rad a mouse delta
+    /// vanishes). Zero faces `-Z`; positive turns left.
     pub yaw: f32,
     /// The absolute camera pitch in radians, positive upward, kept within
-    /// `[-PI/2, PI/2]` by [`turn`](Self::turn) (which counts a non-finite pitch as zero).
+    /// `[-PI/2, PI/2]` by [`turn`](Self::turn), which counts a NaN pitch as zero and clamps
+    /// an infinite one to its limit, as the quantiser does.
     pub pitch: f32,
     /// The actions held this frame: the union of every source's.
     pub held: Actions,
@@ -88,17 +88,18 @@ impl RawSample {
 
     /// Adds a rotation delta, radians: `yaw + delta_yaw` wrapped into `[-PI, PI)` (summed in
     /// `f64`; a sum already in range is only rounded), and `pitch + delta_pitch` clamped to
-    /// `[-PI/2, PI/2]`. A non-finite delta counts as zero, each of the two on its own, and so
-    /// does a non-finite current yaw or pitch written through the public field, so both
-    /// angles are in range after any call. How a mouse or a stick turns the
-    /// camera; the camera rig may call it too.
+    /// `[-PI/2, PI/2]`. A non-finite delta counts as zero, each of the two on its own. Of the
+    /// current angles, written through the public fields, a non-finite yaw and a NaN pitch
+    /// count as zero and an infinite pitch is clamped to its limit, as the quantiser does, so
+    /// both angles are in range after any call. How a mouse or a stick turns the camera; the
+    /// camera rig may call it too.
     pub fn turn(&mut self, delta_yaw: f32, delta_pitch: f32) {
         let yaw = f64::from(finite_or_zero(self.yaw));
         let delta_yaw = f64::from(finite_or_zero(delta_yaw));
         self.yaw = wrap_yaw(yaw + delta_yaw);
         let limit = core::f32::consts::FRAC_PI_2;
-        let delta_pitch = finite_or_zero(delta_pitch);
-        self.pitch = (finite_or_zero(self.pitch) + delta_pitch).clamp(-limit, limit);
+        let pitch = if self.pitch.is_nan() { 0.0 } else { self.pitch };
+        self.pitch = (pitch + finite_or_zero(delta_pitch)).clamp(-limit, limit);
     }
 }
 
@@ -185,8 +186,9 @@ fn wrap_yaw(yaw: f64) -> f32 {
         let turns = (yaw + PI) / TAU;
         (turns - turns.floor()) * TAU - PI
     };
-    // Either branch can round up to the `f32` PI. A turn back from the `f64` sum, rounded
-    // once more, is the `f32` -PI, which is in range.
+    // Either branch can round up to the `f32` PI. Such a sum is taken a turn back from the
+    // `f64` sum and rounded once, to the `f32` -PI or the `f32` just above it, whichever is
+    // nearer: in range either way.
     let narrow = wrapped as f32;
     if narrow >= core::f32::consts::PI { (wrapped - TAU) as f32 } else { narrow }
 }

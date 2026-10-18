@@ -69,10 +69,12 @@ slot and changes nothing the crate ships.
     after every delta, so an accumulated yaw never grows coarser than a sample unit (past
     1024 rad an `f32` is, and at 8192 rad a mouse delta of 4e-4 rad vanishes), the bounds
     being the `f32` `PI`, and a sum already in range is only rounded, so a zero delta never
-    moves the yaw; a sum that rounds up to the `f32` `PI` is taken a turn back before it is
-    rounded, which gives the `f32` `-PI`; the pitch is clamped to `[-PI/2, PI/2]`; a non-finite delta counts as
-    zero, each of the two on its own, and so does a non-finite current yaw or pitch
-    assigned through the field, so both angles are in range after any `turn`. Each turn
+    moves the yaw; a sum that rounds up to the `f32` `PI` is taken a turn back from the
+    `f64` sum and rounded once, to the `f32` `-PI` or the `f32` just above it, whichever is
+    nearer; the pitch is clamped to `[-PI/2, PI/2]`; a non-finite delta counts as zero,
+    each of the two on its own. Of the current angles, assigned through the fields, a
+    non-finite yaw and a NaN pitch count as zero and an infinite pitch is clamped to its
+    limit, as the quantiser does, so both angles are in range after any `turn`. Each turn
     rounds the yaw to `f32`, so a run of turns drifts from the exact sum of its deltas by
     up to half an `f32` ulp per turn (about 0.0012 units); the client simulates the value
     it sends, so the drift is harmless to determinism.
@@ -117,26 +119,26 @@ slot and changes nothing the crate ships.
 
 **The latest sample** (architecture section 5.3)
 
-- `LatestSample` is one slot the input task publishes a `RawSample` into every frame and
-  the late latch reads immediately before submit. `publish` and `read` never lock; a
-  reader waits only while a publish is in flight (six stores), which a descheduled
-  publisher can stretch to a scheduling quantum. The slot is a sequence-locked copy of the sample's six 32-bit
-  words, as `net-api`'s interpolation buffer is. `publish`: compare-exchange (`Acquire`)
-  the sequence from even to odd, then `fence(Release)`, then the words `Relaxed`, then
-  store the next even value (`Release`); so a publisher may wait for another publisher but
-  never for a reader, two concurrent publishers cannot interleave their words, and the
-  fence orders every word write after the sequence was taken (without it a reader's
+- `LatestSample` is one slot the input task publishes a `RawSample` into every frame and the
+  late latch reads immediately before submit. `publish` and `read` never lock; a reader
+  waits only while a publish is in flight (six stores), which a descheduled publisher can
+  stretch to a scheduling quantum. The slot is a sequence-locked copy of the sample's six
+  32-bit words, as `net-api`'s interpolation buffer is. `publish`: compare-exchange
+  (`Acquire`) the sequence from even to odd, then `fence(Release)`, then the words
+  `Relaxed`, then store the next even value (`Release`); so a publisher may wait for another
+  publisher but never for a reader, two concurrent publishers cannot interleave their words,
+  and the fence orders every word write after the sequence was taken (without it a reader's
   acquire fence has nothing to synchronise with and a single publisher tears under the
   memory model, as the second review showed in loom). `read`: load the sequence `Acquire`,
-  the words `Relaxed`, `fence(Acquire)`, reload the sequence, and retry on mismatch or
-  odd; so it returns a sample some `publish` wrote and never a mix of two. `read` returns
+  the words `Relaxed`, `fence(Acquire)`, reload the sequence, and retry on mismatch or odd;
+  so it returns a sample some `publish` wrote and never a mix of two. `read` returns
   `RawSample::IDLE` before the first `publish`. The sequence is 64 bits wide, so it never
   wraps and two equal loads of it always bracket no publish. A retry spins briefly and then
   yields the thread, since the publisher it waits for may have been preempted mid-write;
   neither side takes a lock or makes a system call other than that yield. The words are the
-  fields' bits, so a NaN payload is published unchanged. With several publishers the last to finish
-  wins. It is `Send + Sync` and `const`-constructible, so it can be a static or live in a
-  presentation resource.
+  fields' bits, so a NaN payload is published unchanged. With several publishers the last to
+  finish wins. It is `Send + Sync` and `const`-constructible, so it can be a static or live
+  in a presentation resource.
 - It holds the raw sample, not the quantised one: the latch wants the freshest rotation,
   sampled after the tick's sample was taken, and the quantisation step (1/65536 turn) is
   far below what a frame shows. The simulation never reads it.
@@ -169,6 +171,6 @@ bits, counts and orders and never on timing.
 |---|---|
 | Quantisation | `quantise.rs`: every combination of 24 values per field (in range, edges, huge, subnormal, signed zeros, NaN, both infinities) passes `validate`, and every input with a finite component at least one long quantises to unit length within `2·AXIS_SCALE`; 50,000 directions at seven lengths up to 1e30 likewise; `(2, 0)`, `(0, -2)` and `(f32::MAX, 0)` quantise to `AXIS_SCALE` on their axis and the huge diagonals to the unit diagonal; `±0.5` to `±16384` (ties away from zero); yaw `x`, `x ± TAU` and `x + 4·TAU` alike, the quarter turns exact, the largest `f32` below a turn to zero; pitch `PI/2`, 1.6, 2, 100, `f32::MAX` and infinity clamp to `±LIMIT`; the edges against the previous call over a sequence of held sets, the game's bits included; a second and later call on the same raw sample carry no edges; NaN and infinite stick components count as zero, a non-finite yaw and a NaN pitch give zero; the quantised angles decode through `lactose-input` to within half a unit |
 | The latch | `quantise.rs`: a `hold` followed by a `begin_frame` with no `hold` and then `next`: held and pressed in that sample and released in the next; `next` leaves `latched` empty and `held` as it was; an action held across the tick, through a catch-up tick and later frames, is never released |
-| The raw sample | `quantise.rs`: `begin_frame` keeps the angles and the latch and clears the rest; `hold` unions into both sets; `offer_movement` keeps the larger whatever the order, a centred stick cancels nothing, an equal offer keeps the first, a huge offer compares without overflow, and a non-finite component counts as zero in the offer and in the current movement; `turn` keeps the yaw in `[-PI, PI)` over 200,000 turns of six deltas, each wrapped yaw quantising within one unit of that turn's unwrapped sum; a 4e-4 rad delta still turns after 9,000 rad; a zero turn leaves the yaw, and a sum rounding up to the `f32` `PI` becomes exactly the `f32` `-PI`; the pitch clamps; a non-finite delta counts as zero, each on its own, and a non-finite current yaw or pitch counts as zero |
+| The raw sample | `quantise.rs`: `begin_frame` keeps the angles and the latch and clears the rest; `hold` unions into both sets; `offer_movement` keeps the larger whatever the order, a centred stick cancels nothing, an equal offer keeps the first, a huge offer compares without overflow, and a non-finite component counts as zero in the offer and in the current movement; `turn` keeps the yaw in `[-PI, PI)` over 200,000 turns of six deltas, each wrapped yaw quantising within one unit of that turn's unwrapped sum; a 4e-4 rad delta still turns after 9,000 rad; a zero turn leaves the yaw; the golden seam sum (`PI.next_down() + 1.5e-7`, which rounds up to the `f32` `PI`) becomes exactly the `f32` `-PI`; the pitch clamps; a non-finite delta counts as zero, each on its own; a non-finite current yaw and a NaN current pitch count as zero, and an infinite current pitch is clamped to its limit, as the quantiser maps it |
 | Golden bits | `golden.rs`: the 20-byte images of 16 raw samples and the angles six sequences of turns leave, generated on aarch64-apple-darwin, checked on every target CI tests, in debug and release |
-| The latest sample | `latest.rs`: `IDLE` before the first `publish`, from `new`, `default` and a `static`; `read` after `publish` returns the published sample, NaN payload included, and a read does not consume; a static slot shared between threads; one and two publisher threads of 1,000,000 stamped samples against three readers, every read whole by a checksum word and, per publisher, never older than the reader's previous read, and the slot holding a last publish after the joins. `src/models.rs` (`cargo test -p lactose-input-host --features loom --release`): the shipped `publish` and `read` over loom's atomics, one publisher publishing twice and two publishers once each against a reader at preemption bound 2, every read whole and the final state whole; the same models with the publisher's `fence(Release)` removed find a torn read |
+| The latest sample | `latest.rs`: `IDLE` before the first `publish`, from `new`, `default` and a `static`; `read` after `publish` returns the published sample, NaN payload included, and a read does not consume; a static slot shared between threads; one and two publisher threads of 1,000,000 stamped samples against three readers, every read whole by a checksum word and, per publisher, never older than the reader's previous read, and the slot holding a last publish after the joins. `src/models.rs` (`cargo test -p lactose-input-host --features loom --release`): the shipped `publish` and `read` over loom's atomics, one publisher publishing twice and two publishers once each against a reader at preemption bound 2, every read whole and the final state whole, and with two publishers both publishes having taken the lock; the same models with the publisher's `fence(Release)` removed find a torn read |
