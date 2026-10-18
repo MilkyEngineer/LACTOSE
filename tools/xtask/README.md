@@ -21,10 +21,12 @@ of a manifest it writes under the target directory.
 | `features` | identical boundary feature trees across shipped binaries, and the same features for every package two roots share where one is a harness package (section 8.3) |
 | `vendor` | each crate built from `vendor/` is its patch applied to its record, the patch is within the rule, the record is the crates.io archive's, and the advisory check covers the upstream versions (sections 8.2, 8.3) |
 | `sour run`, `sour compare`, `sour self-test`, `sour matrix` | SOUR, the determinism harness (section 8.3) |
+| `heavy` | nothing: it bounds how many heavy commands run at once on one machine (below) |
 
 Findings are printed to standard output as `path: message`, one per line, and nothing else
 is printed there. The exit status is 0 for none, 1 for findings and 2 when a check could not
-run.
+run. `heavy` is not a check and is outside this contract, except that it too writes nothing
+to standard output itself.
 
 ## Where the rules live
 
@@ -186,3 +188,61 @@ The protocol module depends only on `std` and on nothing else in this crate. It 
 to move, unchanged, into a foundation crate outside the boundary that the harness test crate
 and the tests of `sim` and the game crates depend on; a leaf crate such as this one cannot
 be depended on by any of them. Until that crate exists the module lives here.
+
+## Heavy commands
+
+Several agent worktrees share one machine, each with its own target directory, so cargo's
+locks never make one wait for another. `cargo xtask heavy [--slots <n>] -- <program>
+[<arg>…]` runs the program only while it holds one of `n` machine-wide slots (default 2):
+
+```sh
+cargo xtask heavy -- cargo nextest run --workspace --no-tests=pass
+```
+
+- A slot is an exclusive lock (`File::try_lock`: `flock` on Unix, `LockFileEx` on Windows)
+  on `slot-<i>.lock` in `lactose-heavy/` under the temporary directory. The slots are tried
+  in order; while all are held, `heavy` says so once on standard error, naming the holders'
+  process IDs where their owner files can be read, and tries again every 200 ms. There is no queue: whichever caller tries first
+  after a slot frees takes it, so a script that runs wrapped commands back to back tends to
+  win the gap between them over a waiter that polls. When it takes a slot, `heavy` prints
+  `heavy: slot <i> after <n>s` to standard error and writes its token, `<pid>-<nanoseconds>`,
+  to `slot-<i>.owner`.
+- To see who holds the slots: `lsof +D "$TMPDIR/lactose-heavy"` names the processes with a
+  `slot-<i>.lock` open. A hung program holds its slot until it is stopped.
+- The program inherits the standard streams and the working directory, and `heavy` exits
+  with its status, or on Unix with 128 plus the signal that killed it. A command line
+  `heavy` cannot parse, or a program it cannot start, exits 2, the same as a program that
+  exits 2.
+- The lock belongs to the `heavy` process, not to the program, and the operating system
+  releases it when that process ends however it ends, so a killed agent never leaves a stale
+  slot. The program never inherits the lock's handle, so killing `heavy` alone releases the
+  slot while the program lives on; stop the whole process group instead.
+- The program runs with `LACTOSE_HEAVY_SLOT=<i>:<token>`. A `heavy` that finds it set, the
+  slot locked and the token in `slot-<i>.owner` runs its program at once without taking a
+  second slot, so a wrapped script may call `heavy` again without deadlocking. Any other
+  value, such as one left to a program whose `heavy` died, is reported and ignored, and
+  that `heavy` takes a slot like any caller, except in the instant after another caller
+  takes that slot and before it writes its token. A holder clears its owner file when it
+  lets the slot go, which closes that instant for a program that outlives a `heavy` that
+  ended normally; a `heavy` killed by a signal leaves its token, so on that route the
+  instant remains.
+- `--slots` is a per-machine convention, not a setting: the bound holds only while every
+  caller passes the same count. The default is what the agent definitions use; a caller
+  with a different count breaks the bound for everyone. Likewise every caller must see the
+  same temporary directory (`TMPDIR` on Unix, `TMP` or `TEMP` on Windows); on macOS it is
+  per user.
+- The directory, the file names, the default count and the variable are a protocol between
+  every worktree on the machine, each at its own commit, so none of them changes in one tree
+  alone; a change needs a cut-over the coordinator announces.
+- The files are never deleted: deleting a held lock file lets a second holder in. Taking a
+  slot refreshes the lock file's times, since macOS deletes files in the temporary directory
+  untouched for three days.
+
+Wrap: the first build of a fresh worktree or copy, even of one crate; workspace clippy and
+the cross-target clippy runs; workspace nextest and workspace doc tests; `cargo xtask sour
+run` in any mode; Miri and loom runs; and any loop of repeated test runs, `--stress-count`
+included. Run one wrapped command at a time per target directory, since cargo would run a
+second one only after the first while both hold a slot; chain several in one `sh -c`. Never
+wrap a command that waits on another. Do not wrap: `cargo fmt`, `cargo xtask tiers`,
+`boundary`, `features` and `vendor`, `cargo deny`, or a single nextest run over one crate
+whose build is done. CI never uses `heavy`: its runners are single-tenant.

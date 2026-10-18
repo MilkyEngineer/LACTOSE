@@ -3,6 +3,8 @@
 //! Findings go to standard output, one `path: message` line each, and nothing else does, so
 //! the output can be fed to a problem matcher. Progress and summaries go to standard error.
 //! The exit status is 0 for no findings, 1 for findings and 2 when a check could not run.
+//! `heavy` is not a check: it prints only progress to standard error, and exits with the
+//! status of the program it runs, or 2 when it could not run it.
 //!
 //! Every cargo command this binary runs is `--locked`, as is the `cargo xtask` alias itself:
 //! a check never rewrites `Cargo.lock`, and fails if it is out of date. The one exception is
@@ -14,10 +16,13 @@
 use std::env;
 use std::fs;
 use std::io;
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitCode, Stdio};
+use std::process::{self, Command, ExitCode, Stdio};
+use std::time::Instant;
 
 use lactose_xtask::harness::{self, Dirs, Selection, stand_in};
+use lactose_xtask::heavy;
 use lactose_xtask::policy::Policy;
 use lactose_xtask::repo::Files;
 use lactose_xtask::tiers::TierFile;
@@ -47,6 +52,10 @@ cargo xtask <command>
                              --emit writes the baseline hashes for `sour compare`
   sour compare <ref> <file>  compare two emitted hash files (architecture mode)
   sour self-test             prove the SOUR runner on its stand-in simulations
+  heavy [--slots <n>] -- <program> [<arg>…]
+                             run the program once it holds one of <n> machine-wide slots
+                             (default 2, the same for every caller on the machine), and
+                             exit with its status
   help                       print this text
 
 Findings are printed as `path: message`. Exit status: 0 clean, 1 findings, 2 could not run.";
@@ -161,6 +170,11 @@ fn main() -> ExitCode {
         ["sour", "run", ref rest @ ..] => ("sour", harness_run(rest)),
         ["sour", "compare", reference, file] => ("sour", harness_compare(reference, file)),
         ["sour", "self-test"] => ("sour", harness_self_test()),
+        ["heavy", ref rest @ ..] => match heavy(rest) {
+            // The program's own status, which on Windows may not fit an `ExitCode`.
+            Ok(code) => process::exit(code),
+            Err(message) => ("heavy", Err(message)),
+        },
         _ => ("xtask", Err(format!("unrecognised arguments `{}`\n\n{USAGE}", args.join(" ")))),
     };
     match checked {
@@ -441,4 +455,59 @@ fn harness_self_test() -> Checked {
         );
     }
     Ok(findings)
+}
+
+/// Runs `cargo xtask heavy`: the program once it holds a slot, with this process's standard
+/// streams and working directory. The slot is released when the program ends or when this
+/// process dies, whichever is first; the program is not killed with it.
+fn heavy(args: &[&str]) -> Result<i32, String> {
+    let (slots, command) = match args {
+        ["--slots", count, "--", command @ ..] => {
+            let count = count.parse::<NonZeroUsize>().map_err(|e| {
+                format!("`--slots {count}`: {e}; expected a whole number of at least 1")
+            })?;
+            (count, command)
+        }
+        ["--", command @ ..] => (heavy::DEFAULT_SLOTS, command),
+        _ => {
+            return Err(format!(
+                "unexpected `{}`; expected `[--slots <n>] -- <program> [<arg>…]`",
+                args.join(" ")
+            ));
+        }
+    };
+    let [program, args @ ..] = command else {
+        return Err("give the program to run after `--`".to_owned());
+    };
+    let mut command = Command::new(program);
+    command.args(args);
+    let run = |command: &mut Command| {
+        let status = command.status().map_err(|e| format!("cannot run `{program}`: {e}"))?;
+        Ok(heavy::exit_code(status))
+    };
+    let dir = heavy::dir();
+    if let Some(held) = env::var_os(heavy::HELD_VAR) {
+        let inside = heavy::is_held(&dir, &held);
+        let held = held.to_string_lossy();
+        if inside {
+            eprintln!("heavy: inside slot {held} already");
+            return run(&mut command);
+        }
+        eprintln!("heavy: {}={held} names no slot held for it", heavy::HELD_VAR);
+    }
+    let start = Instant::now();
+    let slot = heavy::acquire(&dir, slots, heavy::RETRY, || {
+        let pids: Vec<String> =
+            heavy::holders(&dir, slots).iter().map(ToString::to_string).collect();
+        let by = if pids.is_empty() {
+            String::new()
+        } else {
+            format!(", held by pid {}", pids.join(", "))
+        };
+        eprintln!("heavy: waiting for one of {slots} slots{by}");
+    })?;
+    eprintln!("heavy: slot {} after {}s", slot.index(), start.elapsed().as_secs());
+    let code = run(command.env(heavy::HELD_VAR, slot.held_value()));
+    drop(slot);
+    code
 }

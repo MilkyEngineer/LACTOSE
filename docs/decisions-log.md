@@ -2676,6 +2676,27 @@ release golden vectors beside the Windows test build** (§18, §20, `.cargo/conf
 - Driven by: the Windows CI timeout of run 38126882535 and the CI link lane with two review
   rounds (2026-10-11).
 
+**D127. Heavy local commands take one of a few machine-wide slots: `cargo xtask heavy`** (§20, `tools/xtask`)
+- Why: concurrent agent worktrees each build in their own target directory, so nothing bounded
+  their heavy gates; load averages reached 60 to 113 during one lane's gates, which slowed
+  every agent and made timings noise.
+- *The slot.* `heavy` takes one of N machine-wide slots (default 2): `File::try_lock` on
+  `slot-<i>.lock` in `temp_dir()/lactose-heavy`, polled every 200 ms and released by the OS
+  when xtask exits however it exits; taking a slot refreshes the lock file's times, since macOS
+  deletes temp files untouched for three days. The wrapped program inherits stdio, and its exit
+  status passes through.
+- *Nesting.* The holder writes a `<pid>-<nanos>` token to `slot-<i>.owner`, clears it when it
+  lets the slot go, and sets `LACTOSE_HEAVY_SLOT=<i>:<token>`. A nested `heavy` runs inside the
+  slot only while that slot is locked and holds that token, so a wrapped loop of wrapped
+  commands never deadlocks. A stale or forged value bypasses the bound only in the microseconds
+  between a new holder's lock and its token write, and only when the previous holder was killed
+  by a signal and so left its token; agents stop wrapped commands with TaskStop, which ends the
+  whole process group.
+- *A protocol across commits.* Every worktree runs its own commit's xtask, so the directory,
+  file names, default count and variable change only by a cut-over the coordinator announces;
+  `--slots` is a per-machine convention, and CI never uses `heavy`.
+- Driven by: the xtask heavy lane with two review rounds (2026-10-18).
+
 ## 10. Review history
 
 - **Revision 1** (`a29af04`): the design baseline.

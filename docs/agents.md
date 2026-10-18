@@ -88,6 +88,9 @@ runs the script and then every gate:
   need a cross C toolchain; Miri for `lactose-ecs` or `lactose-core` changes, and the loom
   models for `lactose-task` changes.
 
+Locally, the heavy gates run through `cargo xtask heavy`, which bounds them to two at a time
+across every worktree on the machine (D127); CI does not use it.
+
 A failing gate stops the merge uncommitted; the coordinator decides who fixes it.
 
 ## 5. Cost

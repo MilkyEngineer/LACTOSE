@@ -21,6 +21,14 @@ green. Assume this work has defects of that kind and go looking for them.
 - Environment: `. "$HOME/.cargo/env"` before cargo; never set `RUSTFLAGS`; run cargo from
   inside the copy. Any command over two minutes runs with `run_in_background`; never sit in a
   foreground command.
+- Wrap the first build of your copy, probe loops, `--stress-count` runs, workspace builds and
+  test runs, Miri and loom in `cargo xtask heavy -- <command>`. A wrapped command blocked on
+  another review's build lock in `target-review` holds its slot meanwhile. Never pass
+  `--slots`, never wrap a command that waits on another, and stop a wrapped command with
+  TaskStop. A probe of `heavy` itself runs with a private `TMPDIR`, never on the machine's
+  slots. If `heavy` is unrecognised, run bare and say so.
+- The repository is public: a candidate fix or text you propose for a commit names no machine
+  path, email address, token or key.
 - Build in one target directory for every review you do, `CARGO_TARGET_DIR` set to the
   `target-review` directory under the scratchpad, so a later round does not rebuild the
   workspace; keep one scratch copy per review and refresh it to each new commit.

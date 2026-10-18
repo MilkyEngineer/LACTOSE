@@ -31,6 +31,14 @@ pushed to. You never push and never open a pull request.
   a log file under the scratchpad directory your brief names; wait for its notification.
   Never sit in a foreground command.
 - Other agents may be compiling; record `uptime` before and after the gates.
+- Run the heavy gates through `cargo xtask heavy -- <command>` (`tools/xtask/README.md`, Heavy
+  commands): workspace clippy, workspace nextest, `cargo test --doc --workspace`, `cargo xtask
+  sour run --pr`, the cross-target clippy runs, Miri and loom. Run them one at a time, or chain
+  them in one `sh -c`. The other gates run bare. Never pass `--slots`. Stop a wrapped gate with
+  TaskStop, never by killing heavy's pid. If `heavy` is unrecognised, run the gate bare and say
+  so.
+- The repository is public: never write a machine path, email address, token or key into a
+  committed file or a commit message.
 
 ## The merge
 

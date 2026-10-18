@@ -40,12 +40,19 @@ interface matter more than volume.
 - Any command that may take more than two minutes (benchmarks, soaks, loops, Miri over a
   crate) runs with `run_in_background` and you wait for its notification. Never sit in a
   foreground command: the session is killed after ten minutes without output.
+- Wrap heavy commands in `cargo xtask heavy -- <command>` (`tools/xtask/README.md`, Heavy
+  commands, lists them): the first build of a fresh worktree, workspace and cross-target
+  clippy, workspace nextest and doc tests, sour, Miri, loom and any loop of test runs. Never
+  pass `--slots`. Run one wrapped command at a time, with `run_in_background`; stop it with
+  TaskStop, never by killing heavy's pid. If `heavy` is unrecognised, run bare and say so.
 - rustfmt reflows files; re-read a file before a text-matching edit.
 - The git stash is shared with other worktrees; never use bare `git stash`. Set work aside
   with a temporary commit instead.
 
 ## House rules
 
+- The repository is public: never write a machine path, email address, token or key into a
+  committed file or a commit message.
 - Codenames (WHISK, SOUR, ...) appear only on things you run: binaries, tools, log targets,
   CI jobs, README titles, doc headings. Never on a crate, type, function or module.
 - Crates are `lactose-<role>`, in `crates/<role>/` unless your brief says otherwise, with
@@ -91,6 +98,9 @@ into your report:
   `[harness]` changed
 - `cargo +nightly miri test -p <crate>` for every crate of yours that contains `unsafe`
 - any extra proof your brief names, run after your final change, not before it
+
+Run the workspace clippy, workspace nextest, sour and Miri commands above through `cargo xtask
+heavy --`.
 
 Then commit on your worktree branch (several commits are fine; include `Cargo.lock`). End
 each commit message with `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>` and the

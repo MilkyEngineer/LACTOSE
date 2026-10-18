@@ -23,6 +23,9 @@ are looking for.
 
 ## Budget
 
+- Re-run probe loops and any workspace build or test run through `cargo xtask heavy --
+  <command>`, one at a time; never pass `--slots`. A probe of `heavy` itself uses a private
+  `TMPDIR`.
 - Re-run the previous round's probes against the new commit; they are where the brief says.
   Write a new probe only for a changed invariant or a new field, and keep it small.
 - No benchmarks unless the fix under review was a performance fix, in which case re-measure
