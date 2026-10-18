@@ -744,6 +744,7 @@ fn a_reentering_entity_moving_into_a_named_region_owes_a_tombstone_naming_it() {
     }
     replication.assert_converged("after the move");
     assert_eq!(replication.client().world().region_of(cooked_key()), Some(R3));
+    assert!(!cooked_mover(&replication), "the stated cost: the cooked row is lost");
 }
 
 fn wire_spawn(handle: EntityHandle, n: u64) -> WireSpawn {

@@ -372,8 +372,9 @@ fn apply_delta(
 /// tombstone of an entity residing in the region it names (so the world has that region
 /// loaded), where the server has the entity. The region's unload is still to come, or the
 /// server names the region and the entity enters again whole; a later move or destruction
-/// comes as another tombstone of the key (`crates/net-api/README.md`, "The staged frame"). A proxy the prediction world moved there is kept too, which
-/// `crates/net-host/README.md` states among what does not converge.
+/// comes as another tombstone of the key (`crates/net-api/README.md`, "The staged frame").
+/// A proxy the prediction world moved there is kept too, which `crates/net-host/README.md`
+/// states among what does not converge.
 fn settled_by_its_region(world: &World, key: StableKey, tombstone: &Tombstone) -> bool {
     tombstone.cause == TombstoneCause::Left && world.region_of(key) == Some(tombstone.region)
 }
