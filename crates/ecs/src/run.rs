@@ -14,7 +14,7 @@ use lactose_task::{Executor, GraphBuilder, GraphNode, JobContext};
 use crate::access::{Access, AccessKind, AccessTarget};
 use crate::apply::Pending;
 use crate::change::Stamp;
-use crate::command::{ChannelStore, CommandBuffer};
+use crate::command::{ChannelCommand, ChannelStore, CommandBuffer};
 use crate::event::{EventRecord, EventStore, PendingEmission, PresentRecord};
 use crate::param::Ctx;
 use crate::region::{ClaimedBy, InRegion, RegionId, RegionMode};
@@ -152,6 +152,10 @@ fn execute(state: &mut RunState, ctx: &mut JobContext<'_>) {
     }
     let stamp = enter_slot(world, tick, &mut slot);
     world.apply(pending, stamp);
+    // No channel survives its run (D126): a taker's channel is already empty, and what a
+    // channel with readers alone or a skipped taker's holds goes here, so no snapshot
+    // point, save or pass between runs sees an entry.
+    world.channels.clear();
     world.permute_rows();
     world.end_present(emissions, !tick);
     if tick {
@@ -168,10 +172,38 @@ struct Output {
     /// Whether the invocation is a reduction's finalize, whose table is the finalize's.
     finalize: bool,
     commands: CommandBuffer,
-    /// One sink per parameter; only `EventWriter` parameters fill theirs.
+    /// One sink per parameter, or none when no parameter is an `EventWriter`; only
+    /// `EventWriter` parameters fill theirs.
     events: Vec<Vec<EventRecord>>,
-    /// One sink per parameter; only `PresentEvents` parameters fill theirs.
+    /// One sink per parameter, or none when no parameter is `PresentEvents`; only
+    /// `PresentEvents` parameters fill theirs.
     present: Vec<Vec<PresentRecord>>,
+    /// One sink per parameter, or none when no parameter is a `ChannelWriter`; only
+    /// `ChannelWriter` parameters fill theirs.
+    channels: Vec<Vec<ChannelCommand>>,
+}
+
+/// How many sinks of each kind an invocation of one table gets: one per parameter when a
+/// parameter fills that kind, none otherwise. Counted once per table, so an invocation of
+/// a system that writes no event, presentation event or channel allocates no sink.
+#[derive(Clone, Copy)]
+struct Sinks {
+    events: usize,
+    present: usize,
+    channels: usize,
+}
+
+impl Sinks {
+    fn of(table: &[Access]) -> Self {
+        let per_parameter = |kind| {
+            if table.iter().any(|access| access.kind() == kind) { table.len() } else { 0 }
+        };
+        Self {
+            events: per_parameter(AccessKind::EmitEvents),
+            present: per_parameter(AccessKind::PresentEvents),
+            channels: per_parameter(AccessKind::WriteChannel),
+        }
+    }
 }
 
 impl Output {
@@ -179,15 +211,26 @@ impl Output {
         source: Source,
         claim: Option<PlayerId>,
         region: Option<RegionId>,
-        params: usize,
+        sinks: Sinks,
     ) -> Self {
         Self {
             source,
             claim,
             finalize: false,
             commands: CommandBuffer::new(region),
-            events: (0..params).map(|_| Vec::new()).collect(),
-            present: (0..params).map(|_| Vec::new()).collect(),
+            events: (0..sinks.events).map(|_| Vec::new()).collect(),
+            present: (0..sinks.present).map(|_| Vec::new()).collect(),
+            channels: (0..sinks.channels).map(|_| Vec::new()).collect(),
+        }
+    }
+
+    /// Moves the invocation's channel entries into its command buffer, after its commands:
+    /// called once the kernel or the finalize has returned, before `is_empty` decides
+    /// whether the output is kept, so an invocation whose only output is a channel entry
+    /// keeps it.
+    fn close_channels(&mut self) {
+        if !self.channels.is_empty() {
+            self.commands.close_channels(&mut self.channels);
         }
     }
 
@@ -217,6 +260,10 @@ struct Env<'r, 'j> {
     commands: Option<&'r mut CommandBuffer>,
     emit: Vec<Option<&'r mut Vec<EventRecord>>>,
     present: Vec<Option<&'r mut Vec<PresentRecord>>>,
+    write_channels: Vec<Option<&'r mut Vec<ChannelCommand>>>,
+    /// The stores an exclusive system's `ChannelTake` parameters own, removed from the
+    /// world for good.
+    takes: Vec<(TypeId, Box<dyn Any + Send + Sync>)>,
     job: Option<&'r mut JobContext<'j>>,
     world: Option<&'r mut World>,
 }
@@ -230,7 +277,7 @@ impl<'r, 'j> Env<'r, 'j> {
         job: Option<&'r mut JobContext<'j>>,
         world: Option<&'r mut World>,
     ) -> Self {
-        let Output { commands, events: emit, present, .. } = output;
+        let Output { commands, events: emit, present, channels: write_channels, .. } = output;
         Self {
             resources,
             events,
@@ -238,6 +285,8 @@ impl<'r, 'j> Env<'r, 'j> {
             commands: Some(commands),
             emit: emit.iter_mut().map(Some).collect(),
             present: present.iter_mut().map(Some).collect(),
+            write_channels: write_channels.iter_mut().map(Some).collect(),
+            takes: Vec::new(),
             job,
             world,
         }
@@ -287,6 +336,14 @@ impl<'r, 'j> Env<'r, 'j> {
             }
             (AccessKind::Read, AccessTarget::Channel { type_id, .. }) => {
                 Slot::Channel(self.channels.get(&type_id).map(|stored| &*stored.entries))
+            }
+            (AccessKind::WriteChannel, _) => Slot::WriteChannel(
+                self.write_channels[index].take().expect("one sink per parameter"),
+            ),
+            (AccessKind::TakeChannel, AccessTarget::Channel { type_id, .. }) => {
+                // The schedule allows one take of a channel per system.
+                let store = self.takes.iter().position(|(id, _)| *id == type_id);
+                Slot::TakeChannel(store.map(|position| self.takes.swap_remove(position).1))
             }
             (AccessKind::Commands, _) => {
                 Slot::Commands(self.commands.take().expect("one `Commands` per system"))
@@ -344,10 +401,21 @@ fn run_system(
         wanted.iter().filter_map(|&id| Some((id, world.resources.remove(&id)?))).collect();
     if taken.len() != wanted.len() {
         // `prepare` found every resource; an exclusive system earlier in the run removed
-        // one. The system cannot run, and the rest of the run goes on.
+        // one. The system cannot run, and the rest of the run goes on; the channels it
+        // would have taken are named, since nothing else takes them.
+        let untaken: Vec<&str> = system
+            .access()
+            .iter()
+            .filter(|access| access.kind() == AccessKind::TakeChannel)
+            .filter_map(|access| match access.target() {
+                AccessTarget::Channel { name, .. } => Some(name),
+                _ => None,
+            })
+            .collect();
         tracing::error!(
             target: "casein",
             system = system.name(),
+            untaken_channels = ?untaken,
             "a resource the system names was removed during the run; the system is skipped"
         );
         for (id, entry) in taken {
@@ -371,7 +439,7 @@ fn run_system(
             (reducer.merge)(&mut *total, &**partial);
         }
         let table = system.finalize_access();
-        let mut output = Output::new(Source::Tick, None, None, table.len());
+        let mut output = Output::new(Source::Tick, None, None, Sinks::of(table));
         output.finalize = true;
         {
             let handles = mut_handles(&mut taken);
@@ -387,6 +455,7 @@ fn run_system(
             let mut invocation = Invocation::new(slots, ReducerSlot::Total(Some(total)));
             (system.kernel().finalize)(&mut invocation);
         }
+        output.close_channels();
         outputs.push(output);
     }
     for (id, entry) in taken {
@@ -434,9 +503,11 @@ fn run_exclusive(
     ctx: &mut JobContext<'_>,
     outputs: &mut Vec<Output>,
 ) {
-    // What the parameters read leaves the world too, so the world can be lent whole.
+    // What the parameters read leaves the world too, so the world can be lent whole; what
+    // they take leaves it for good.
     let mut events = EventStore::new();
     let mut channels = ChannelStore::new();
+    let mut takes = Vec::new();
     for access in system.access() {
         match (access.kind(), access.target()) {
             (AccessKind::ReadEvents, AccessTarget::Events { type_id, .. }) => {
@@ -449,19 +520,26 @@ fn run_exclusive(
                     channels.insert(type_id, entries);
                 }
             }
+            (AccessKind::TakeChannel, AccessTarget::Channel { type_id, .. }) => {
+                if let Some(stored) = world.channels.remove(&type_id) {
+                    takes.push((type_id, stored.entries));
+                }
+            }
             _ => {}
         }
     }
     let table = system.access();
-    let mut output = Output::new(Source::Tick, None, None, table.len());
+    let mut output = Output::new(Source::Tick, None, None, Sinks::of(table));
     {
         let handles = mut_handles(taken);
         let mut env =
             Env::new(handles, &events, &channels, &mut output, Some(ctx), Some(&mut *world));
+        env.takes = takes;
         let slots = table.iter().enumerate().map(|(p, access)| env.slot(p, access)).collect();
         let mut invocation = Invocation::new(slots, ReducerSlot::None);
         (system.kernel().run)(&mut invocation);
     }
+    output.close_channels();
     for (type_id, records) in events.sorted_take() {
         world.events.insert(type_id, records);
     }
@@ -493,7 +571,7 @@ fn run_once(
     partials: &mut Vec<Box<dyn Any>>,
 ) {
     let table = system.access();
-    let mut output = Output::new(Source::Tick, None, None, table.len());
+    let mut output = Output::new(Source::Tick, None, None, Sinks::of(table));
     let mut partial = system.kernel().reducer.map(|reducer| (reducer.identity)());
     {
         let handles = mut_handles(taken);
@@ -505,6 +583,7 @@ fn run_once(
         let mut invocation = Invocation::new(slots, reducer);
         (system.kernel().run)(&mut invocation);
     }
+    output.close_channels();
     partials.extend(partial);
     outputs.push(output);
 }
@@ -522,6 +601,7 @@ fn run_per_region(
 ) {
     let table = system.access();
     let shared = shared_handles(taken);
+    let sinks = Sinks::of(table);
     let world = &*world;
     for (&region, state) in &world.regions {
         if state.mode != RegionMode::Simulated {
@@ -534,7 +614,7 @@ fn run_per_region(
         if lacks_resource {
             continue;
         }
-        let mut output = Output::new(Source::Region(region), None, Some(region), table.len());
+        let mut output = Output::new(Source::Region(region), None, Some(region), sinks);
         let mut partial = system.kernel().reducer.map(|reducer| (reducer.identity)());
         {
             let handles = shared.iter().map(|&(id, value)| (id, Handle::Shared(value))).collect();
@@ -563,6 +643,7 @@ fn run_per_region(
             let mut invocation = Invocation::new(slots, reducer);
             (system.kernel().run)(&mut invocation);
         }
+        output.close_channels();
         partials.extend(partial);
         if !output.is_empty() {
             outputs.push(output);
@@ -580,6 +661,7 @@ fn run_per_entity(
 ) {
     let table = system.access();
     let shared = shared_handles(taken);
+    let sinks = Sinks::of(table);
     let World { storage, regions, events, channels, kind, layout, tick, .. } = world;
     let (tick, layout) = (*tick, *layout);
     let component = |access: &Access| match access.target() {
@@ -668,7 +750,7 @@ fn run_per_entity(
                 partials.extend(partial.replace((reducer.identity)()));
             }
 
-            let mut output = Output::new(Source::Entity(key), claim, Some(region), table.len());
+            let mut output = Output::new(Source::Entity(key), claim, Some(region), sinks);
             {
                 let handles =
                     shared.iter().map(|&(id, value)| (id, Handle::Shared(value))).collect();
@@ -712,6 +794,7 @@ fn run_per_entity(
                 let mut invocation = Invocation::new(slots, reducer);
                 (system.kernel().run)(&mut invocation);
             }
+            output.close_channels();
             if !output.is_empty() {
                 outputs.push(output);
             }

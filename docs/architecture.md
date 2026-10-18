@@ -423,13 +423,13 @@ fn store_total(sum: Scalar, out: ResMut<TotalMass>) { out.0 = sum; }
 // Spawn that references the spawned entity in the same command buffer. `HeldItem` holds a
 // `#[value]` enum, since enums are fieldless types held in a field (section 6).
 #[system(name = "game_sim::throw_bomb", worlds = [server, prediction])]
-fn throw_bomb(ctx: Ctx, cmd: Commands, key: StableKeyOf, held: &HeldItem, input: &PlayerInput) {
+fn throw_bomb(ctx: Ctx, cmd: Commands, physics: ChannelWriter<PhysicsCommands>, key: StableKeyOf, held: &HeldItem, input: &PlayerInput) {
     if input.pressed.contains(Action::Throw) {
         let bomb = cmd.spawn((Transform::at(..), Bomb { fuse: 180 }));   // StableKey::Placeholder
         cmd.set(*key, HeldItem { kind: ItemKind::None });
         cmd.set(bomb, ThrownBy { thrower: EntityRef::new(*key) });
         let spread = ctx.rng(bomb).next_scalar();  // keyed by (region seed, tick, system, this entity's origin key, the placeholder's spawn index)
-        cmd.physics().apply_impulse(bomb, input.aim() * spread);
+        physics.apply_impulse(bomb, input.aim() * spread);   // `PhysicsExt` on the writer
     }
 }
 
@@ -456,17 +456,25 @@ fn footsteps(present: PresentEvents, key: StableKeyOf, anim: &AnimState) {
 fn apply_region_load(world: &mut World, loaded: ResMut<LoadedBundles>) { /* bulk copy rows */ }
 ```
 
-Physics writes go through the physics command buffer (impulses, forces, teleports) or through
+Physics writes go through a `ChannelWriter<PhysicsCommands>` parameter (impulses, forces, teleports,
+the `PhysicsExt` methods of `lactose-physics-api` on it) or through
 the body's own `Transform`, `Velocity`, `RigidBody` and `Collider` components, and both apply in
 the physics stage: its sync point pushes the rows' changes into the solver and takes the commands
-recorded since the previous step, then the step applies them; the step's results reach the rows
-at the sync point that begins the post stage. Relationship
+recorded in the input and simulation stages of the tick, then the step applies them; the step's
+results reach the rows at the sync point that begins the post stage. A
+`ChannelWriter<PhysicsCommands>` in the physics stage or the post stage is a schedule build error,
+since the tick's closing sync point clears every channel and a command recorded after the step would
+reach no step; a reaction to this tick's step that acts next tick is a persistent component holding
+the decision, which a simulation-stage kernel of the next tick turns into the command, through an
+event when it acts on another body (D126). Relationship
 fields are written through commands so the reverse index stays consistent. `StableKeyOf` yields
 the entity's origin key; no row, chunk or worker index exists in the API. The macro makes every
 parameter binding mutable, `#[finalize]` finds its system by name in the same module, and
 `writes = [T, ..]` declares the columns a system writes outside its parameter list (through
 commands, or through the world in an exclusive system), which is how a transient column
-written at the input sync point gets its declared writer. The
+written at the input sync point gets its declared writer. `ChannelTake<C>`, in an exclusive system
+alone, takes a channel at its stage's sync point, and the schedule refuses a `ChannelWriter<C>` in
+that stage or a later one and a `Channel<C>` after the take (D126). The
 week-one facade exposes exactly this surface over a naive single-threaded implementation,
 including regions, change ticks, the structural log, snapshots, bulk copy and command buffers,
 so dependent agents build against the final API from the start; `crates/ecs/README.md` is its
@@ -795,12 +803,15 @@ interaction keep it possible later. No system may hold a direct reference across
 Only the client prediction world is ever rolled back. Its `snapshot` captures every column,
 the entity table, world and region resources, region modes, seeds and asset tables, the
 input-tick table, the relationship index, proxy history and the physics world through
-`physics-api::snapshot`, which carries the backend's whole world with each collider's shape
-value and the physics sync's pending work, so that the sync of a re-simulated tick makes the
-calls the first run's did. Two things stay with the world across a restore because a rollback
+`physics-api::snapshot`, which carries the backend's whole world with each collider's shape value
+and the structural-log entries and changed keys the physics sync has not yet consumed, so that the
+sync of a re-simulated tick makes the calls the first run's did. Two things stay with the world
+across a restore because a rollback
 must not undo them: the prediction-to-network alias table (section 7) and the log of
 delivered presentation events, which is what lets re-emission deduplicate and a missing
-re-emission cancel. Command buffers are empty at snapshot points by construction.
+re-emission cancel. Command buffers and channels are empty at snapshot points by construction: the
+closing sync point of a run clears every channel after it applies the last stage's commands, so
+nothing but rows carries simulation state across a tick boundary (D126).
 
 The server never rolls back. Save snapshots copy persistent columns only (section 15.3); a
 journal checkpoint carries the physics snapshot beside them (section 15.5).

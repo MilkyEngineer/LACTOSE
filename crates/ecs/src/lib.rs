@@ -51,7 +51,8 @@ pub use change::{
     ErasedColumn, ErasedColumns, LogCursor, LogEntries, LogEntry, StructuralChange, StructuralLog,
 };
 pub use command::{
-    Bundle, Channel, ChannelEntries, ChannelEntry, ChannelWriter, CommandChannel, Commands,
+    Bundle, Channel, ChannelEntries, ChannelEntry, ChannelTake, ChannelWriter, CommandChannel,
+    Commands,
 };
 pub use event::{
     Event, EventIter, EventWriter, Events, PresentEmission, PresentEvent, PresentEventBatch,

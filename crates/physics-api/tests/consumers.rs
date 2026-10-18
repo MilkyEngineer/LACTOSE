@@ -5,21 +5,21 @@
 //! breaks one is a signature change to list.
 
 #![forbid(unsafe_code)]
-#![allow(dead_code, unused_variables, missing_docs)]
+#![allow(dead_code, unused_variables, missing_docs, clippy::too_many_arguments)]
 
-use lactose_core::{NetId, PlayerId, Result, StableKey, Tick};
+use lactose_core::{EntityRef, NetId, PlayerId, Result, StableKey, Tick};
 use lactose_ecs::{
-    ClaimedBy, Commands, Events, Executor, LayoutConfig, Mut, OwnedBy, Res, StableKeyOf, SystemSet,
-    World, WorldKind, system,
+    ChannelWriter, ClaimedBy, Commands, Event, EventWriter, Events, Executor, LayoutConfig, Mut,
+    OwnedBy, Res, StableKeyOf, SystemSet, World, WorldKind, system,
 };
 use lactose_math::{Scalar, Vec3};
 use lactose_physics_api::conformance::snapshot_restore;
 use lactose_physics_api::{
     BodyDesc, BodyHandle, BodyType, Collider, ContactEvent, ContactPhase, Joint, JointHandle,
-    JointKind, Physics, PhysicsBackend, PhysicsCommand, PhysicsConfig, PhysicsExt, QueryFilter,
-    Ray, RayHit, RigidBody, Shape, ShapeHit, StepInput, StepOutput, Teleported, Transform,
-    TriggerEvent, Velocity, corrected, locked_axes, register_systems, register_types, restore,
-    sets, setup, snapshot,
+    JointKind, Physics, PhysicsBackend, PhysicsCommand, PhysicsCommands, PhysicsConfig, PhysicsExt,
+    QueryFilter, Ray, RayHit, RigidBody, Shape, ShapeHit, StepInput, StepOutput, Teleported,
+    Transform, TriggerEvent, Velocity, corrected, locked_axes, register_systems, register_types,
+    restore, sets, setup, snapshot,
 };
 use lactose_reflect::component;
 use lactose_sim::{
@@ -28,19 +28,66 @@ use lactose_sim::{
 
 // ---- 1. A game crate: bodies as rows, impulses through the channel, queries anywhere ----
 
-#[component(key = "sketch::bomb", persistent)]
+/// A bomb, armed (nonzero) by an impact in `Stage::Post` and set off by the next tick's
+/// simulation stage: a plain-value carrier, written through `Mut`. Replicated, since the
+/// kernels that write it run in the prediction world.
+#[component(key = "sketch::bomb", persistent, replicated)]
 pub struct Bomb(#[field(id = 1)] pub u32);
+
+/// The other body of the impact that armed a bomb, kept for the next tick: a keyed
+/// carrier, which the schedule refuses `Mut` on, so it is spawned with the bomb and
+/// written and cleared through `Commands::set` on the bomb's own row.
+#[component(key = "sketch::push_target", persistent, replicated)]
+pub struct PushTarget(#[field(id = 1)] pub EntityRef);
+
+/// A push from a bomb to the other body of its impact.
+#[derive(Clone, Copy)]
+pub struct Push {
+    pub target: StableKey,
+    pub strength: Scalar,
+}
+
+impl Event for Push {
+    fn target(&self) -> StableKey {
+        self.target
+    }
+}
+
+/// A blast reaching a body the bomb's overlap query found.
+#[derive(Clone, Copy)]
+pub struct Blast {
+    pub target: StableKey,
+    pub centre: Vec3,
+    pub strength: Scalar,
+}
+
+impl Event for Blast {
+    fn target(&self) -> StableKey {
+        self.target
+    }
+}
 
 pub static MOVEMENT: SystemSet = SystemSet::new("sketch::movement");
 /// A once-per-tick writer of body rows, ordered against the kernels that write them.
 pub static RESPAWN_SET: SystemSet = SystemSet::new("sketch::respawn_set").after(&[&MOVEMENT]);
+/// The bombs the previous tick armed, after every writer of the rows they read.
+pub static DETONATION: SystemSet = SystemSet::new("sketch::detonation").after(&[&RESPAWN_SET]);
+/// The bodies a bomb pushed, after the events reach them.
+pub static RECEIVE: SystemSet = SystemSet::new("sketch::receive").after(&[&DETONATION]);
 /// `Stage::Physics` after the step: this tick's `Physics` and events, last tick's rows.
 pub static AFTER_STEP: SystemSet = SystemSet::new("sketch::after_step").after(&[&sets::STEP]);
 
 /// The section 6.1 example on a body: a direct `Velocity` write the sync honours, and an
-/// impulse on a spawn's placeholder resolved at apply.
+/// impulse on a spawn's placeholder resolved at apply, through the channel's writer.
 #[system(name = "sketch::throw", worlds = [server, prediction], in_set = MOVEMENT)]
-fn throw(dt: Res<TickDelta>, cmd: Commands, key: StableKeyOf, vel: Mut<Velocity>, bomb: &Bomb) {
+fn throw(
+    dt: Res<TickDelta>,
+    cmd: Commands,
+    physics: ChannelWriter<PhysicsCommands>,
+    key: StableKeyOf,
+    vel: Mut<Velocity>,
+    bomb: &Bomb,
+) {
     vel.linear.y -= Scalar::from_f64(9.81) * dt.0;
     let thrown = cmd.spawn((
         Transform::at(Vec3::Y),
@@ -48,10 +95,11 @@ fn throw(dt: Res<TickDelta>, cmd: Commands, key: StableKeyOf, vel: Mut<Velocity>
         RigidBody::dynamic(),
         Collider::new(Shape::sphere(Scalar::HALF)).with_events(Scalar::ONE).with_material(3),
         Bomb(0),
+        PushTarget(EntityRef::NONE),
     ));
-    cmd.physics().apply_impulse(thrown, Vec3::new(Scalar::ONE, Scalar::TWO, Scalar::ZERO));
-    cmd.physics().apply_torque_impulse(*key, Vec3::X);
-    cmd.physics().teleport(*key, Transform::IDENTITY);
+    physics.apply_impulse(thrown, Vec3::new(Scalar::ONE, Scalar::TWO, Scalar::ZERO));
+    physics.apply_torque_impulse(*key, Vec3::X);
+    physics.teleport(*key, Transform::IDENTITY);
 }
 
 /// A query from a per-entity kernel in `Stage::Simulation`: the previous step's state,
@@ -78,9 +126,15 @@ fn ground_check(
 }
 
 /// Contact-driven game code in `Stage::Post`, which needs no edge after the write-back (an
-/// exclusive system runs first at the stage's sync point): damage on an impact, and a
-/// command recorded here, which the next tick's step applies.
-#[system(name = "sketch::impact_damage", worlds = [server, prediction])]
+/// exclusive system runs first at the stage's sync point). It records no command, since a
+/// writer of the channel after the step fails the build (D126): an impact arms the bomb's
+/// own row through `Mut` and keeps the other body's key through `Commands::set`, and the
+/// next tick's simulation stage acts on them. No solver number is stored.
+#[system(
+    name = "sketch::impact_damage",
+    worlds = [server, prediction],
+    writes = [PushTarget]
+)]
 fn impact_damage(
     cmd: Commands,
     contacts: Events<ContactEvent>,
@@ -88,12 +142,13 @@ fn impact_damage(
     key: StableKeyOf,
     pos: &Transform,
     teleported: Option<&Teleported>,
-    bomb: &Bomb,
+    bomb: Mut<Bomb>,
 ) {
     for contact in contacts.for_target(*key) {
         if contact.phase == ContactPhase::Impact && contact.impulse > Scalar::ONE {
-            let _ = (contact.other, contact.point, contact.normal);
-            cmd.physics().apply_impulse(contact.other, contact.normal * Scalar::TWO);
+            let _ = (contact.point, contact.normal);
+            bomb.0 = 1;
+            cmd.set(*key, PushTarget(EntityRef::new(contact.other)));
         }
     }
     for trigger in triggers.for_target(*key) {
@@ -101,6 +156,67 @@ fn impact_damage(
     }
     // Extract compares the tick with the last one it covered; zero means never.
     let teleported_at: Tick = teleported.map_or(Tick(0), |flag| flag.0);
+}
+
+/// The next tick's half of the relay, on an armed bomb: a `Blast` to each key the overlap
+/// query returns (the previous step's state) and a `Push` to the impact's other body, from
+/// the bomb's own row; then disarmed through `Mut` and its carrier cleared through
+/// `Commands::set`.
+#[system(
+    name = "sketch::detonate",
+    worlds = [server, prediction],
+    in_set = DETONATION,
+    writes = [PushTarget]
+)]
+fn detonate(
+    physics: Res<Physics>,
+    cmd: Commands,
+    blasts: EventWriter<Blast>,
+    pushes: EventWriter<Push>,
+    key: StableKeyOf,
+    pos: &Transform,
+    bomb: Mut<Bomb>,
+    target: &PushTarget,
+) {
+    if bomb.0 == 0 {
+        return;
+    }
+    let strength = Scalar::from_u32(4);
+    let mut found = Vec::new();
+    physics.overlap(
+        &Shape::sphere(Scalar::from_u32(3)),
+        pos,
+        &QueryFilter::excluding(*key),
+        &mut found,
+    );
+    for body in found {
+        blasts.emit(Blast { target: body, centre: pos.translation, strength });
+    }
+    if let Some(other) = target.0.get() {
+        pushes.emit(Push { target: other, strength });
+        cmd.set(*key, PushTarget(EntityRef::NONE));
+    }
+    bomb.0 = 0;
+}
+
+/// A body a bomb pushed or blasted: the impulse computed from its own row and the event,
+/// recorded through its writer in this tick's simulation stage, so the sync takes it for
+/// this tick's step. In the prediction world it runs on a claimed body alone, which is
+/// the command a client predicts.
+#[system(name = "sketch::knockback", worlds = [server, prediction], in_set = RECEIVE)]
+fn knockback(
+    physics: ChannelWriter<PhysicsCommands>,
+    pushes: Events<Push>,
+    blasts: Events<Blast>,
+    key: StableKeyOf,
+    pos: &Transform,
+) {
+    for push in pushes.for_target(*key) {
+        physics.apply_impulse(*key, Vec3::Y * push.strength);
+    }
+    for blast in blasts.for_target(*key) {
+        physics.apply_impulse(*key, (pos.translation - blast.centre) * blast.strength);
+    }
 }
 
 /// A once-per-tick system with no `Mut`: a row write through `Commands::set`, declared,
@@ -124,16 +240,19 @@ fn settle(physics: Res<Physics>, pos: &Transform, vel: &Velocity) {}
 
 pub fn register_types_game(types: &mut TypeTable) -> Result<()> {
     types.register::<Bomb>()?;
+    types.register::<PushTarget>()?;
     register_types(types)
 }
 
 pub fn register_systems_game(registration: &mut Registration) {
     registration
         .stage(Stage::Simulation)
-        .sets(&[&MOVEMENT, &RESPAWN_SET])
+        .sets(&[&MOVEMENT, &RESPAWN_SET, &DETONATION, &RECEIVE])
         .add(&THROW)
         .add(&GROUND_CHECK)
-        .add(&RESPAWN);
+        .add(&RESPAWN)
+        .add(&DETONATE)
+        .add(&KNOCKBACK);
     registration.stage(Stage::Physics).sets(&[&AFTER_STEP]).add(&PROBE_PHYSICS);
     registration.stage(Stage::Post).add(&IMPACT_DAMAGE).add(&SETTLE);
 }

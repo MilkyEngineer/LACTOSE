@@ -22,8 +22,8 @@
 
 use lactose_core::{EntityRef, Error, ErrorKind, NetId, PlayerId, Result, StableKey, Tick};
 use lactose_ecs::{
-    ClaimedBy, Commands, Executor, LayoutConfig, Mut, OwnedBy, RegionConfig, RegionId, RegionMode,
-    Res, StableKeyOf, SystemSet, World, WorldKind, system,
+    ChannelWriter, ClaimedBy, Commands, Executor, LayoutConfig, Mut, OwnedBy, RegionConfig,
+    RegionId, RegionMode, Res, StableKeyOf, SystemSet, World, WorldKind, system,
 };
 use lactose_math::{Scalar, Vec3};
 use lactose_sim::{
@@ -31,7 +31,7 @@ use lactose_sim::{
 };
 
 use crate::backend::PhysicsBackend;
-use crate::command::PhysicsExt;
+use crate::command::{PhysicsCommands, PhysicsExt};
 use crate::components::{
     BodyHandle, BodyType, Collider, Joint, JointHandle, JointKind, RigidBody, Shape, Transform,
     Velocity,
@@ -81,10 +81,11 @@ pub struct ConformanceReport {
 /// `World::set_input_tick(player one, tick)` every tick, and the `Stage::Post` spawn at
 /// tick [`SNAPSHOT_TICK`] comes from a kernel on a claimed body, so the spawn is predicted
 /// rather than dropped; the same `Stage::Post` system despawns a body and writes a
-/// `Transform` through `cmd.set`, so the snapshot point holds pending log entries, pending
-/// keys and a pending command. After the restore a kernel writes a `Velocity` through
-/// `Mut`, records a command, switches a bone to dynamic through `Mut<RigidBody>`, and the
-/// region is frozen for one tick and thawed; every write, command, freeze and thaw
+/// `Transform` through `cmd.set`, so the snapshot point holds pending log entries and
+/// pending keys, and the simulation kernel records an impulse at the tick after it, which
+/// the re-simulated tick records again. After the restore a kernel writes a `Velocity`
+/// through `Mut`, records a command, switches a bone to dynamic through `Mut<RigidBody>`,
+/// and the region is frozen for one tick and thawed; every write, command, freeze and thaw
 /// described as after the restore happens at the same ticks in the first run. Every step
 /// takes `TickInput::default()` (the mode changes go through `world_mut`, tests only).
 /// After tick [`SNAPSHOT_TICK`] a `World::snapshot` and a [`snapshot`](crate::snapshot) are
@@ -371,10 +372,11 @@ fn input_tick(world: &mut World) {
 }
 
 /// The simulation stage's kernel: the first tick's impulses, the bones driven by
-/// `Transform` writes, and the post-restore velocity write, command and limp bone.
+/// `Transform` writes, the impulse of the tick after the snapshot, recorded again when that
+/// tick is re-simulated, and the post-restore velocity write, command and limp bone.
 #[system(name = "physics_api::conformance::drive", worlds = [server, prediction])]
 fn drive(
-    cmd: Commands,
+    physics: ChannelWriter<PhysicsCommands>,
     key: StableKeyOf,
     now: Res<CurrentTick>,
     pos: Mut<Transform>,
@@ -387,7 +389,10 @@ fn drive(
     {
         let push =
             Vec3::new(Scalar::from_u32(index % 5), Scalar::ZERO, Scalar::from_u32(index % 3));
-        cmd.physics().apply_impulse(key, push);
+        physics.apply_impulse(key, push);
+    }
+    if tick == SNAPSHOT_TICK + 1 && key == sphere(0) {
+        physics.apply_impulse(sphere(3), Vec3::X);
     }
     if key == BONE_A || key == BONE_B {
         pos.translation.y = Scalar::TWO + scalar(0.1) * Scalar::from_u32(tick % 7);
@@ -396,7 +401,7 @@ fn drive(
         if let Some(vel) = vel.as_mut() {
             vel.linear.x = Scalar::from_i32(3);
         }
-        cmd.physics().apply_torque_impulse(sphere(5), Vec3::Y);
+        physics.apply_torque_impulse(sphere(5), Vec3::Y);
     }
     if tick == LIMP_TICK && key == BONE_A {
         body.body_type = BodyType::Dynamic;
@@ -404,8 +409,9 @@ fn drive(
 }
 
 /// The post stage's kernel at the snapshot tick, on a claimed body: a predicted spawn, a
-/// despawn, a `Transform` written through `cmd.set` and a command, all left for the next
-/// tick's sync and step when the snapshot is taken.
+/// despawn and a `Transform` written through `cmd.set`, all left for the next tick's sync
+/// when the snapshot is taken. It records no command: a writer of the physics channel
+/// after the step is a schedule build error (D126).
 #[system(name = "physics_api::conformance::react", worlds = [server, prediction], writes = [Transform])]
 fn react(cmd: Commands, key: StableKeyOf, now: Res<CurrentTick>, body: &RigidBody) {
     if now.get().0 != SNAPSHOT_TICK || *key != sphere(0) {
@@ -415,5 +421,4 @@ fn react(cmd: Commands, key: StableKeyOf, now: Res<CurrentTick>, body: &RigidBod
     cmd.spawn((at, Velocity::ZERO, *body, Collider::new(Shape::sphere(Scalar::HALF))));
     cmd.despawn(sphere(1));
     cmd.set(sphere(2), Transform::at(Vec3::new(Scalar::from_i32(-20), Scalar::TWO, Scalar::ZERO)));
-    cmd.physics().apply_impulse(sphere(3), Vec3::X);
 }

@@ -1,6 +1,6 @@
-//! Commands (`README.md`, "Commands" and "Keys"): the step applies every command recorded
-//! since the previous step in command order, the same under every layout, across the tick
-//! boundary for one recorded in `Stage::Post` or in `Stage::Physics` after the step; a
+//! Commands (`README.md`, "Commands" and "Keys"): the step applies the commands recorded in
+//! the tick's simulation stage in command order, the same under every layout; a writer of
+//! the channel in `Stage::Post` or in `Stage::Physics` after the step fails the build; a
 //! command for a non-body or a dropped spawn's placeholder is dropped; a bound predicted
 //! body is named by either key.
 
@@ -10,10 +10,14 @@ mod common;
 
 use common::*;
 use lactose_core::{NetId, StableKey, Tick};
-use lactose_ecs::WorldKind;
-use lactose_math::Scalar;
-use lactose_physics_api::{PhysicsCommand, QueryFilter, Ray, Transform};
+use lactose_ecs::{ChannelWriter, ScheduleError, StableKeyOf, SystemDescriptor, WorldKind, system};
+use lactose_math::{Scalar, Vec3};
+use lactose_physics_api::{
+    PhysicsCommand, PhysicsCommands, PhysicsExt, QueryFilter, Ray, Transform, register_systems,
+    register_types, setup,
+};
 use lactose_sim::harness::{ChunkCapacity, layout_mode};
+use lactose_sim::{SimulationBuilder, Stage, TypeTable};
 
 fn impulse(body: StableKey, x: i32) -> PhysicsCommand {
     PhysicsCommand::ApplyImpulse { body, impulse: v(x, 0, 0) }
@@ -33,11 +37,11 @@ fn ordered_steps(options: Options) -> Vec<(Tick, Vec<PhysicsCommand>)> {
         .at(2, When::Simulation, k3, Action::Command(impulse(k1, 3)))
         .at(2, When::Simulation, k1, Action::Command(impulse(k1, 1)))
         .at(2, When::Simulation, k1, Action::Command(impulse(k2, 2)))
-        // After the step: the next tick's.
-        .at(2, When::AfterStep, k1, Action::Command(torque))
-        // In `Stage::Post`: the next tick's, after the physics stage's.
-        .at(2, When::Post, k4, Action::Command(force))
-        .at(2, When::Post, k2, Action::Command(teleport))
+        // One of every other kind, the next tick: by source key, then in each kernel's
+        // order.
+        .at(3, When::Simulation, k4, Action::Command(force))
+        .at(3, When::Simulation, k2, Action::Command(teleport))
+        .at(3, When::Simulation, k1, Action::Command(torque))
         .at(3, When::Simulation, k2, Action::Command(impulse(k4, 4)));
     h = h.run(3);
     steps(&h.calls.all())
@@ -54,8 +58,8 @@ fn the_step_applies_commands_in_command_order_across_the_tick_boundary() {
             vec![
                 PhysicsCommand::ApplyTorqueImpulse { body: k2, torque: v(0, 1, 0) },
                 PhysicsCommand::Teleport { body: k4, transform: at(0, 9, 0) },
-                PhysicsCommand::ApplyForce { body: k3, force: v(0, 0, 1) },
                 impulse(k4, 4),
+                PhysicsCommand::ApplyForce { body: k3, force: v(0, 0, 1) },
             ],
         ),
     ];
@@ -75,6 +79,53 @@ fn the_step_applies_commands_in_command_order_across_the_tick_boundary() {
                 );
             }
         }
+    }
+}
+
+#[system(name = "test::post_writer", worlds = [server, prediction])]
+fn post_writer(key: StableKeyOf, _pos: &Transform, physics: ChannelWriter<PhysicsCommands>) {
+    physics.apply_impulse(*key, Vec3::X);
+}
+
+#[system(name = "test::after_step_writer", worlds = [server, prediction], in_set = AFTER_STEP_SET)]
+fn after_step_writer(key: StableKeyOf, _pos: &Transform, physics: ChannelWriter<PhysicsCommands>) {
+    physics.apply_impulse(*key, Vec3::X);
+}
+
+/// What building a server simulation with `writer` in `stage` beside this crate's systems
+/// fails with.
+fn build_error(stage: Stage, writer: &'static SystemDescriptor) -> ScheduleError {
+    let mut types = TypeTable::new();
+    register_types(&mut types).unwrap();
+    let backend = Box::new(Fake::new(CallLog::default()));
+    let built = SimulationBuilder::new(WorldKind::Server, types)
+        .setup(move |world| setup(world, backend, Default::default()))
+        .systems(register_systems)
+        .systems(move |registration| {
+            let builder = registration.stage(stage);
+            if stage == Stage::Physics {
+                builder.sets(&[&AFTER_STEP_SET]);
+            }
+            builder.add(writer);
+        })
+        .build();
+    let error = built.err().expect("a writer after the step fails the build");
+    let source = std::error::Error::source(&error).expect("the schedule error");
+    source.downcast_ref::<ScheduleError>().expect("a schedule error").clone()
+}
+
+/// What the earlier rounds' "a command recorded after the step reaches no step" became
+/// (D126): no schedule holds such a command.
+#[test]
+fn a_physics_writer_after_the_step_fails_the_build() {
+    for (stage, writer) in [(Stage::Post, &POST_WRITER), (Stage::Physics, &AFTER_STEP_WRITER)] {
+        let error = build_error(stage, writer);
+        let ScheduleError::ChannelAfterTaker { system, taker, channel } = error else {
+            panic!("{stage:?}: {error}");
+        };
+        assert_eq!(system, writer.name(), "{stage:?}");
+        assert_eq!(taker, "physics_api::sync", "{stage:?}");
+        assert_eq!(channel, core::any::type_name::<PhysicsCommands>(), "{stage:?}");
     }
 }
 

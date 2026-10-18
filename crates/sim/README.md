@@ -201,7 +201,8 @@ exclusive systems of the input sync point are listed by name in
    tick, since neither rolls back; the prediction world's horizon is `lactose-predict`'s.
 2. Puts `input` where the sync point systems take it, and runs the tick schedule with
    `Schedule::run_tick`. The first stage's sync point is the input sync point: the ECS
-   zeroes transient columns and clears events, channels and input ticks, then the exclusive
+   zeroes transient columns and clears events and input ticks (every channel is already
+   empty, cleared at the previous run's closing sync point, D126), then the exclusive
    systems of `Stage::Input` run, this crate's six first (below), then every other
    exclusive system placed there, then the stages' systems. The tick advances by one.
 3. Trims the structural change log of the entries older than the builder's
@@ -223,7 +224,9 @@ exclusive systems of the input sync point are listed by name in
 
 `Simulation::run_passes(executor)` prepares the `Pass::Extract` and `Pass::Gather`
 schedules, then runs each with `Schedule::run_pass`, in that order and only if a system
-was registered for it (the tick does not advance and nothing is cleared). The timer root
+was registered for it (the tick does not advance, nothing is zeroed and no event is cleared
+at its first sync point, and its closing sync point clears every channel, as every run's
+does). The timer root
 calls it once per frame after the frame's ticks, paused or not, on the server and on both
 client worlds: what was edited between ticks is still extracted and replicated, and the
 prediction world's local player is extracted every frame (section 9.4). A gather therefore
@@ -577,10 +580,10 @@ and `services`, a map from a service key (the xxh64 of the service's declared na
 collision-checked as a system key is) to the opaque bytes `app` took from that service at
 the checkpoint, which the replay driver hands back after the regions load and before the
 first step: the physics snapshot of `lactose-physics-api` goes there, the backend's whole
-world and the sync's pending work with the untaken `PhysicsCommands`, since the solver
-holds state the rows do not carry and a replay without it hashes equal only until the first
-contact; this crate never reads the bytes and they are not hashed state; until the byte form
-exists, D124, a replay is bit-exact from a session's start only),
+world and the sync's pending work, since the solver holds state the rows do not carry and a
+replay without it hashes equal only until the first contact; this crate never reads the
+bytes and they are not hashed state; until the byte form exists, D124, a replay is
+bit-exact from a session's start only),
 and one `JournalFrame` per tick after it; `JournalFrame::record(tick, &input)` is the
 frame's record, mirroring `TickInput` field for field in its application order, with
 tables as `VersionTable`s and bundles as `JournalLoad` (the baseline by content hash, with

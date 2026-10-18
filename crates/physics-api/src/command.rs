@@ -1,26 +1,24 @@
 //! The physics command channel (architecture section 6.1): what a kernel records through
-//! `cmd.physics()` and the step applies, in command order, before it steps.
+//! its `ChannelWriter<PhysicsCommands>` parameter and the step applies, in command order,
+//! before it steps.
 
 use lactose_core::StableKey;
-use lactose_ecs::{ChannelWriter, CommandChannel, Commands};
+use lactose_ecs::{ChannelWriter, CommandChannel};
 use lactose_math::Vec3;
 
 use crate::components::Transform;
 
-/// The channel: the marker type `World::take_channel` and `World::channel` name. Entries
-/// are [`PhysicsCommand`]s.
+/// The channel: the marker type a kernel's `ChannelWriter<PhysicsCommands>` writes and the
+/// sync's `ChannelTake<PhysicsCommands>` takes. Entries are [`PhysicsCommand`]s.
 ///
-/// Not cleared at the input sync point (`CLEAR_AT_INPUT = false`): the sync takes every
-/// entry at the physics sync point, so an entry recorded in `Stage::Input` or
-/// `Stage::Simulation` reaches the step of the same tick and one recorded in
-/// `Stage::Physics` or `Stage::Post` reaches the next tick's, in command order. A restore
-/// drops what the channel holds; [`snapshot`](crate::snapshot) carries the untaken entries.
+/// An ordinary channel (D126): the sync takes every entry at the physics sync point, so an
+/// entry recorded in `Stage::Input` or `Stage::Simulation` reaches the step of the same
+/// tick, in command order, and the schedule refuses the writer in `Stage::Physics` or
+/// `Stage::Post`, where an entry would land after the take.
 pub struct PhysicsCommands;
 
 impl CommandChannel for PhysicsCommands {
     type Entry = PhysicsCommand;
-
-    const CLEAR_AT_INPUT: bool = false;
 
     fn remap(entry: &mut PhysicsCommand, f: &mut dyn FnMut(&mut StableKey)) {
         f(entry.body_mut());
@@ -110,63 +108,57 @@ impl PhysicsCommand {
     }
 }
 
-/// Records physics commands on behalf of one invocation: what `cmd.physics()` returns.
-pub struct PhysicsWriter<'a> {
-    writer: ChannelWriter<'a, PhysicsCommands>,
-}
-
-impl PhysicsWriter<'_> {
-    /// Records `command`.
-    pub fn push(&mut self, command: PhysicsCommand) {
-        self.writer.push(command);
-    }
-
-    /// [`PhysicsCommand::ApplyImpulse`].
-    pub fn apply_impulse(&mut self, body: StableKey, impulse: Vec3) {
-        self.push(PhysicsCommand::ApplyImpulse { body, impulse });
-    }
-
-    /// [`PhysicsCommand::ApplyImpulseAt`].
-    pub fn apply_impulse_at(&mut self, body: StableKey, impulse: Vec3, point: Vec3) {
-        self.push(PhysicsCommand::ApplyImpulseAt { body, impulse, point });
-    }
-
-    /// [`PhysicsCommand::ApplyTorqueImpulse`].
-    pub fn apply_torque_impulse(&mut self, body: StableKey, torque: Vec3) {
-        self.push(PhysicsCommand::ApplyTorqueImpulse { body, torque });
-    }
-
-    /// [`PhysicsCommand::ApplyForce`].
-    pub fn apply_force(&mut self, body: StableKey, force: Vec3) {
-        self.push(PhysicsCommand::ApplyForce { body, force });
-    }
-
-    /// [`PhysicsCommand::ApplyTorque`].
-    pub fn apply_torque(&mut self, body: StableKey, torque: Vec3) {
-        self.push(PhysicsCommand::ApplyTorque { body, torque });
-    }
-
-    /// [`PhysicsCommand::Teleport`].
-    pub fn teleport(&mut self, body: StableKey, transform: Transform) {
-        self.push(PhysicsCommand::Teleport { body, transform });
-    }
-}
-
 mod sealed {
     pub trait Sealed {}
 }
 
-/// `cmd.physics()` on a [`Commands`] parameter (architecture section 6.1): the writer for
-/// the physics channel. Implemented for `Commands` alone.
+/// The recording methods on a kernel's `ChannelWriter<PhysicsCommands>` parameter
+/// (architecture section 6.1), each pushing one [`PhysicsCommand`]; `push` is the writer's
+/// own. Implemented for that writer alone.
 pub trait PhysicsExt: sealed::Sealed {
-    /// The physics command writer of this invocation.
-    fn physics(&mut self) -> PhysicsWriter<'_>;
+    /// [`PhysicsCommand::ApplyImpulse`].
+    fn apply_impulse(&mut self, body: StableKey, impulse: Vec3);
+
+    /// [`PhysicsCommand::ApplyImpulseAt`].
+    fn apply_impulse_at(&mut self, body: StableKey, impulse: Vec3, point: Vec3);
+
+    /// [`PhysicsCommand::ApplyTorqueImpulse`].
+    fn apply_torque_impulse(&mut self, body: StableKey, torque: Vec3);
+
+    /// [`PhysicsCommand::ApplyForce`].
+    fn apply_force(&mut self, body: StableKey, force: Vec3);
+
+    /// [`PhysicsCommand::ApplyTorque`].
+    fn apply_torque(&mut self, body: StableKey, torque: Vec3);
+
+    /// [`PhysicsCommand::Teleport`].
+    fn teleport(&mut self, body: StableKey, transform: Transform);
 }
 
-impl sealed::Sealed for Commands<'_> {}
+impl sealed::Sealed for ChannelWriter<'_, PhysicsCommands> {}
 
-impl PhysicsExt for Commands<'_> {
-    fn physics(&mut self) -> PhysicsWriter<'_> {
-        PhysicsWriter { writer: self.channel::<PhysicsCommands>() }
+impl PhysicsExt for ChannelWriter<'_, PhysicsCommands> {
+    fn apply_impulse(&mut self, body: StableKey, impulse: Vec3) {
+        self.push(PhysicsCommand::ApplyImpulse { body, impulse });
+    }
+
+    fn apply_impulse_at(&mut self, body: StableKey, impulse: Vec3, point: Vec3) {
+        self.push(PhysicsCommand::ApplyImpulseAt { body, impulse, point });
+    }
+
+    fn apply_torque_impulse(&mut self, body: StableKey, torque: Vec3) {
+        self.push(PhysicsCommand::ApplyTorqueImpulse { body, torque });
+    }
+
+    fn apply_force(&mut self, body: StableKey, force: Vec3) {
+        self.push(PhysicsCommand::ApplyForce { body, force });
+    }
+
+    fn apply_torque(&mut self, body: StableKey, torque: Vec3) {
+        self.push(PhysicsCommand::ApplyTorque { body, torque });
+    }
+
+    fn teleport(&mut self, body: StableKey, transform: Transform) {
+        self.push(PhysicsCommand::Teleport { body, transform });
     }
 }

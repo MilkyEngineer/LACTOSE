@@ -36,8 +36,9 @@ pub(crate) mod sealed {
 /// | [`Ctx`], [`RegionRes<T>`] | per-entity, per-region | the region |
 /// | [`Res<T>`] | every kind | the resource, read |
 /// | [`ResMut<T>`] | once per tick, exclusive, finalize | the resource, written |
-/// | [`Commands`](crate::Commands), [`EventWriter<E>`](crate::EventWriter), [`PresentEvents`](crate::PresentEvents) | every kind | output buffers |
+/// | [`Commands`](crate::Commands), [`EventWriter<E>`](crate::EventWriter), [`ChannelWriter<C>`](crate::ChannelWriter), [`PresentEvents`](crate::PresentEvents) | every kind | output buffers |
 /// | [`Events<E>`](crate::Events), [`Channel<C>`](crate::Channel) | every kind | input buffers |
+/// | [`ChannelTake<C>`](crate::ChannelTake) | exclusive | the channel, taken |
 /// | [`Job`] | once per tick, exclusive, finalize | the executor's job context |
 /// | `&mut World` | exclusive | everything |
 ///
@@ -50,18 +51,20 @@ pub(crate) mod sealed {
 ///   once per `Simulated` region, each run independent of the others.
 /// - **Once per tick**: it has neither. It runs as one job.
 /// - **Exclusive**: declared `exclusive`, it takes `&mut World` first and otherwise only
-///   resource, buffer and [`Job`] parameters, which are taken out of the world for the call:
-///   inside, the world does not hold them.
+///   resource, buffer, [`ChannelTake`](crate::ChannelTake) and [`Job`] parameters, which
+///   are taken out of the world for the call: inside, the world does not hold them.
 ///
 /// A system that runs more than once per tick (per-entity, per-region) may not write a world
 /// resource or take [`Job`]; a system that is not per-entity may not take [`StableKeyOf`];
 /// an exclusive system or a finalize function may not take [`Ctx`] or [`RegionRes`]; and
 /// within one system two data parameters (`&T`, [`Mut<T>`], `Option<&T>`, `Option<Mut<T>>`)
-/// may not name one component, nor may [`Without<T>`] stand beside any parameter on `T`.
-/// The schedule rejects each ([`ScheduleError`](crate::ScheduleError)).
+/// may not name one component, nor may [`Without<T>`] stand beside any parameter on `T`;
+/// [`ChannelTake<C>`](crate::ChannelTake) is an exclusive system's alone, once per channel,
+/// beside no other parameter on its channel. The schedule rejects each
+/// ([`ScheduleError`](crate::ScheduleError)).
 #[diagnostic::on_unimplemented(
     message = "`{Self}` is not a system parameter",
-    note = "a system takes `&T`, `Mut<T>`, `Option<&T>`, `Option<Mut<T>>`, `With<T>`, `Without<T>` or `Changed<T>` of a component `T`, `Res`, `ResMut`, `RegionRes`, `Ctx`, `StableKeyOf`, `Job`, `Commands`, `EventWriter`, `Events`, `PresentEvents`, `Channel`, or `&mut World` when exclusive"
+    note = "a system takes `&T`, `Mut<T>`, `Option<&T>`, `Option<Mut<T>>`, `With<T>`, `Without<T>` or `Changed<T>` of a component `T`, `Res`, `ResMut`, `RegionRes`, `Ctx`, `StableKeyOf`, `Job`, `Commands`, `EventWriter`, `Events`, `PresentEvents`, `Channel`, `ChannelWriter`, or `&mut World` and `ChannelTake` when exclusive"
 )]
 pub trait SystemParam: sealed::Sealed + Sized {
     /// What this parameter reads or writes.

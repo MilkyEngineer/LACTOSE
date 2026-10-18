@@ -192,7 +192,7 @@ fn scene(kind: WorldKind, layout: LayoutConfig) -> Harness {
         }
         if tick % 7 == 0 {
             let spin = PhysicsCommand::ApplyTorqueImpulse { body: source, torque: v(0, 1, 0) };
-            script.at(tick, When::AfterStep, source, Action::Command(spin));
+            script.at(tick + 1, When::Simulation, source, Action::Command(spin));
         }
         if tick % 11 == 0 {
             let sliding = Velocity { linear: v(0, 3, 1), angular: v(0, 0, 0) };
@@ -207,7 +207,7 @@ fn scene(kind: WorldKind, layout: LayoutConfig) -> Harness {
         }
         if tick % 19 == 0 {
             let teleport = PhysicsCommand::Teleport { body: source, transform: at(0, 25, -3) };
-            script.at(tick, When::Post, source, Action::Command(teleport));
+            script.at(tick + 1, When::Simulation, source, Action::Command(teleport));
         }
         if tick == 40 {
             script.at(tick, When::Simulation, key(BONE_A), Action::WriteBody(RigidBody::dynamic()));
@@ -220,8 +220,9 @@ fn scene(kind: WorldKind, layout: LayoutConfig) -> Harness {
         }
     }
     // The rollback's snapshot tick holds pending work of every kind, as the conformance
-    // scene's does: a post-stage spawn, a despawn, a `cmd.set` of a transform and a command,
-    // all left for tick 31's sync and step when the snapshot is taken.
+    // scene's does: a post-stage spawn, a despawn and a `cmd.set` of a transform, all left
+    // for tick 31's sync when the snapshot is taken; tick 31's simulation stage records a
+    // command, which the re-simulated tick records again.
     let source = sphere_key(5);
     let push = PhysicsCommand::ApplyImpulse { body: sphere_key(9), impulse: v(2, 1, 0) };
     let slower = Velocity { linear: v(1, 0, 0), angular: v(0, 0, 0) };
@@ -229,7 +230,7 @@ fn scene(kind: WorldKind, layout: LayoutConfig) -> Harness {
         .at(ROLLBACK_TICK, When::Post, source, Action::Spawn(at(3, 15, 3)))
         .at(ROLLBACK_TICK, When::Post, source, Action::Despawn(sphere_key(7)))
         .at(ROLLBACK_TICK, When::Post, source, Action::SetTransform(sphere_key(8), at(-6, 12, 0)))
-        .at(ROLLBACK_TICK, When::Post, source, Action::Command(push))
+        .at(ROLLBACK_TICK + 1, When::Simulation, source, Action::Command(push))
         // Slowed to the velocity it keeps to the end: equal to what the run's last
         // write-back writes, so a restore that kept the live record of the last write-back
         // instead of the carried one would skip this push and the drifter would diverge.

@@ -1,6 +1,7 @@
 //! The schedule: stages separated by sync points, each stage a DAG of systems ordered by
 //! sets, declared edges and access conflicts (architecture section 5.2).
 
+use core::any::TypeId;
 use core::fmt;
 use core::future::Future;
 use core::ops::Range;
@@ -95,11 +96,12 @@ impl ScheduleBuilder {
     /// Declares the next stage, named for tracing, holding `sets`. A sync point precedes
     /// every stage: the command buffers of the previous stage apply there, then the stage's
     /// exclusive systems run in their order, then its other systems; a closing sync point
-    /// after the last stage applies its buffers and runs no systems, so a run has one more
-    /// sync point than stages and ends with every buffer empty. In a tick the first stage's
-    /// sync point is the input sync point, where transient columns are zeroed, events,
-    /// channels and input ticks are cleared, and inputs, staged network state and asset
-    /// version tables are applied by the exclusive systems placed there.
+    /// after the last stage applies its buffers, clears every channel and runs no systems,
+    /// so a run has one more sync point than stages and ends with every buffer and channel
+    /// empty. In a tick the first stage's sync point is the input sync point, where
+    /// transient columns are zeroed, events and input ticks are cleared, and inputs, staged
+    /// network state and asset version tables are applied by the exclusive systems placed
+    /// there.
     pub fn stage(&mut self, name: &'static str, sets: &[&'static SystemSet]) -> &mut Self {
         self.stages.push(StageSpec { name, sets: sets.to_vec(), systems: Vec::new() });
         self
@@ -150,6 +152,10 @@ impl ScheduleBuilder {
     ///   systems always conflict.
     /// - [`ScheduleError::EventsBeforeEmitter`]: a reader of an event type not ordered
     ///   after every emitter of it.
+    /// - [`ScheduleError::ChannelAfterTaker`], [`ScheduleError::ChannelWithoutConsumer`]:
+    ///   a channel writer in the stage of a taker of its channel or a later one, a reader or
+    ///   a second taker placed after the taker, or a writer whose channel no later stage
+    ///   takes or reads.
     ///
     /// What needs a world is checked by [`Schedule::prepare`], since a schedule is built
     /// without one: [`ScheduleError::WrongWorld`],
@@ -271,6 +277,7 @@ impl ScheduleBuilder {
         let plan = Plan { kind: self.kind, stages, order, kinds, stage_of: stage_index, ancestors };
         plan.check_conflicts()?;
         plan.check_events()?;
+        plan.check_channels()?;
         let slots = plan.order.len() + plan.stages.len() + 1;
         assert!(
             slots < (crate::world::BETWEEN / crate::world::SLOT_WIDTH) as usize - 1,
@@ -335,6 +342,9 @@ fn check_table(
         if has(AccessKind::World) {
             return Err(ScheduleError::InvalidParameter { system: name, parameter: "&mut World" });
         }
+        if has(AccessKind::TakeChannel) {
+            return Err(ScheduleError::InvalidParameter { system: name, parameter: "ChannelTake" });
+        }
     } else {
         match kind {
             SystemKind::Exclusive => {
@@ -350,6 +360,12 @@ fn check_table(
                     return Err(ScheduleError::InvalidParameter {
                         system: name,
                         parameter: "&mut World",
+                    });
+                }
+                if has(AccessKind::TakeChannel) {
+                    return Err(ScheduleError::InvalidParameter {
+                        system: name,
+                        parameter: "ChannelTake",
                     });
                 }
                 if kind != SystemKind::PerEntity && has(AccessKind::Entity) {
@@ -393,6 +409,21 @@ fn check_table(
     ] {
         if count(wanted) > 1 {
             return Err(ScheduleError::InvalidParameter { system: name, parameter });
+        }
+    }
+    // A take beside any other parameter on its channel: a second take or a reader would
+    // find what the first removed, and a writer's entries would land after the take.
+    for (index, (access, target)) in targets.iter().enumerate() {
+        let (AccessKind::TakeChannel, AccessTarget::Channel { type_id, .. }) = (*access, *target)
+        else {
+            continue;
+        };
+        let beside = targets.iter().enumerate().any(|(other, (_, t))| {
+            other != index
+                && matches!(t, AccessTarget::Channel { type_id: id, .. } if *id == type_id)
+        });
+        if beside {
+            return Err(ScheduleError::InvalidParameter { system: name, parameter: "ChannelTake" });
         }
     }
     for (index, (access, target)) in targets.iter().enumerate() {
@@ -682,6 +713,75 @@ impl Plan {
         }
         Ok(())
     }
+
+    /// Whether system `index` has an entry of `kind` on channel `type_id`.
+    fn uses_channel(&self, index: usize, kind: AccessKind, type_id: TypeId) -> bool {
+        self.tables(index).any(|access| {
+            access.kind() == kind
+                && matches!(access.target(), AccessTarget::Channel { type_id: id, .. } if id == type_id)
+        })
+    }
+
+    /// Places every channel write and take. A writer's entries apply at the sync point
+    /// that ends its stage, so a taker in that stage or an earlier one has run before they
+    /// land: compared by stage, not by `before`, since an exclusive writer ordered before
+    /// the taker in one stage is too late as well.
+    fn check_channels(&self) -> core::result::Result<(), ScheduleError> {
+        let systems = 0..self.order.len();
+        for writer in systems.clone() {
+            for write in self.tables(writer) {
+                let (AccessKind::WriteChannel, AccessTarget::Channel { type_id, name }) =
+                    (write.kind(), write.target())
+                else {
+                    continue;
+                };
+                let stage = self.stage_of[writer];
+                if let Some(taker) = systems.clone().find(|&taker| {
+                    self.stage_of[taker] <= stage
+                        && self.uses_channel(taker, AccessKind::TakeChannel, type_id)
+                }) {
+                    return Err(ScheduleError::ChannelAfterTaker {
+                        system: self.order[writer].name(),
+                        taker: self.order[taker].name(),
+                        channel: name,
+                    });
+                }
+                let consumed = systems.clone().any(|other| {
+                    self.stage_of[other] > stage
+                        && (self.uses_channel(other, AccessKind::TakeChannel, type_id)
+                            || self.uses_channel(other, AccessKind::Read, type_id))
+                });
+                if !consumed {
+                    return Err(ScheduleError::ChannelWithoutConsumer {
+                        writer: self.order[writer].name(),
+                        channel: name,
+                    });
+                }
+            }
+        }
+        for taker in systems.clone() {
+            for take in self.tables(taker) {
+                let (AccessKind::TakeChannel, AccessTarget::Channel { type_id, name }) =
+                    (take.kind(), take.target())
+                else {
+                    continue;
+                };
+                if let Some(other) = systems.clone().find(|&other| {
+                    other != taker
+                        && self.before(taker, other)
+                        && (self.uses_channel(other, AccessKind::Read, type_id)
+                            || self.uses_channel(other, AccessKind::TakeChannel, type_id))
+                }) {
+                    return Err(ScheduleError::ChannelAfterTaker {
+                        system: self.order[other].name(),
+                        taker: self.order[taker].name(),
+                        channel: name,
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 /// The target two accesses of different systems conflict on, if any.
@@ -880,9 +980,10 @@ impl Schedule {
 
     /// Runs the stages as a pass between ticks: like [`run_tick`](Self::run_tick) but the
     /// tick does not advance and the first sync point is an ordinary one, so nothing is
-    /// zeroed or cleared. Extract (architecture section 5.3), the replication gather (9.3)
-    /// and the save copy (15.3) are schedules of exclusive systems that take [`Job`](crate::Job)
-    /// and fork over the world's columns, run this way.
+    /// zeroed and no event is cleared at the first sync point; the closing sync point
+    /// clears every channel, as every run's does. Extract (architecture section 5.3), the
+    /// replication gather (9.3) and the save copy (15.3) are schedules of exclusive systems
+    /// that take [`Job`](crate::Job) and fork over the world's columns, run this way.
     #[allow(clippy::manual_async_fn, reason = "the `Send` bound is the contract")]
     pub fn run_pass<'a>(
         &'a mut self,
@@ -994,16 +1095,18 @@ pub enum ScheduleError {
         component: ComponentKey,
     },
     /// A parameter the system cannot hold as declared, which no variant above names:
-    /// `&mut World` in a system that is not exclusive, a component parameter or
-    /// `&mut World` in a finalize function, or a second parameter that would alias the
-    /// first (`Commands`, `Job` or `&mut World` twice, or a resource written beside another
-    /// parameter on the same resource).
+    /// `&mut World` or [`ChannelTake`](crate::ChannelTake) in a system that is not
+    /// exclusive, a component parameter, `&mut World` or `ChannelTake` in a finalize
+    /// function, or a second parameter that would alias the first (`Commands`, `Job` or
+    /// `&mut World` twice, a resource written beside another parameter on the same
+    /// resource, or `ChannelTake<C>` beside another `ChannelTake<C>`,
+    /// [`Channel<C>`](crate::Channel) or [`ChannelWriter<C>`](crate::ChannelWriter)).
     InvalidParameter {
         /// The system.
         system: &'static str,
-        /// The parameter's type: `Commands`, `Job`, `&mut World`, the resource's type name,
-        /// or `component` for a component parameter of a finalize, whose type the table
-        /// does not record.
+        /// The parameter's type: `Commands`, `Job`, `&mut World`, `ChannelTake`, the
+        /// resource's type name, or `component` for a component parameter of a finalize,
+        /// whose type the table does not record.
         parameter: &'static str,
     },
     /// Sets or edges form a cycle, or an edge points at a later stage.
@@ -1028,6 +1131,27 @@ pub enum ScheduleError {
         emitter: &'static str,
         /// The event type's name.
         event: &'static str,
+    },
+    /// A system uses a channel after its taker: a [`ChannelWriter<C>`](crate::ChannelWriter)
+    /// in the stage of a [`ChannelTake<C>`](crate::ChannelTake) or a later one, whose
+    /// entries would land after the take, or a [`Channel<C>`](crate::Channel) reader or a
+    /// second taker placed after the taker (a later stage, or the taker's stage unless
+    /// exclusive and ordered before it), which would find the channel empty.
+    ChannelAfterTaker {
+        /// The writer, reader or second taker.
+        system: &'static str,
+        /// The taker.
+        taker: &'static str,
+        /// The channel type's name.
+        channel: &'static str,
+    },
+    /// A [`ChannelWriter<C>`](crate::ChannelWriter) whose channel no system of a later
+    /// stage takes or reads: its entries would reach nothing.
+    ChannelWithoutConsumer {
+        /// The writer.
+        writer: &'static str,
+        /// The channel type's name.
+        channel: &'static str,
     },
     /// The world is not of the kind the schedule was built for, or is not the world the
     /// schedule first prepared or ran with, which it serves alone (the two kinds are then
@@ -1158,6 +1282,17 @@ impl fmt::Display for ScheduleError {
             Self::EventsBeforeEmitter { reader, emitter, event } => write!(
                 f,
                 "`{reader}` reads `{event}` but is not ordered after its emitter `{emitter}`"
+            ),
+            Self::ChannelAfterTaker { system, taker, channel } => write!(
+                f,
+                "`{system}` uses channel `{channel}` after its taker `{taker}`: a writer's \
+                 entries would land after the take, and a reader or a second taker would find \
+                 it empty; place it before the taker"
+            ),
+            Self::ChannelWithoutConsumer { writer, channel } => write!(
+                f,
+                "`{writer}` writes channel `{channel}`, which no system of a later stage takes \
+                 or reads"
             ),
             Self::WrongWorld { schedule, world } if schedule == world => write!(
                 f,

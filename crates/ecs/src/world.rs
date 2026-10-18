@@ -23,10 +23,7 @@ use crate::change::{
     ChangeMark, ChangedRows, ColumnMut, ColumnRef, Columns, ColumnsMut, ErasedColumn,
     ErasedColumns, LogCursor, Stamp, StructuralChange, StructuralLog, tick_before,
 };
-use crate::command::{
-    Bundle, ChannelEntry, ChannelStore, CommandChannel, ErasedComponent, Payload, erase_bundle,
-    is_worlds_own,
-};
+use crate::command::{Bundle, ChannelStore, ErasedComponent, Payload, erase_bundle, is_worlds_own};
 use crate::event::{EventStore, PresentEventBatch, PresentLog};
 use crate::param::{Mut, resource_ref};
 use crate::query::{Query, QueryItems};
@@ -1295,30 +1292,6 @@ impl World {
     }
 
     // ---- Buffers consumed at sync points ----
-
-    /// Takes the entries of channel `C` applied and not yet taken, in command order, keys
-    /// resolved: this tick's, and for a channel that is not cleared at the input sync point
-    /// ([`CommandChannel::CLEAR_AT_INPUT`]) those of earlier ticks too.
-    pub fn take_channel<C: CommandChannel>(&mut self) -> Vec<ChannelEntry<C>> {
-        self.channels.remove(&TypeId::of::<C>()).map_or_else(Vec::new, |stored| {
-            *stored.entries.downcast::<Vec<ChannelEntry<C>>>().expect("the entries of this channel")
-        })
-    }
-
-    /// The entries of channel `C` applied and not yet taken, as
-    /// [`take_channel`](Self::take_channel) would return them, without taking: what a
-    /// consumer of a channel that is not cleared at the input sync point copies into its
-    /// own snapshot between ticks, since a restore drops them.
-    #[must_use]
-    pub fn channel<C: CommandChannel>(&self) -> &[ChannelEntry<C>] {
-        self.channels.get(&TypeId::of::<C>()).map_or(&[], |stored| {
-            stored
-                .entries
-                .downcast_ref::<Vec<ChannelEntry<C>>>()
-                .expect("the entries of this channel")
-                .as_slice()
-        })
-    }
 
     /// Takes the presentation events delivered since the last call, and the cancellations
     /// (architecture section 9.4).

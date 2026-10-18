@@ -137,15 +137,17 @@ fn probe_b(input_ticks: bool) -> Harness {
         .at(2, When::Post, spawner, Action::Spawn(at(0, 9, 0)))
         .at(2, When::Post, spawner, Action::Despawn(doomed))
         .at(2, When::Post, spawner, Action::SetTransform(moved, at(6, 9, 0)))
-        .at(2, When::Post, spawner, Action::Command(impulse(moved, 1)))
-        .at(2, When::AfterStep, spawner, Action::Command(impulse(spawner, 2)))
+        // The commands the post and physics stages recorded before D126: the next tick's
+        // simulation stage records them.
+        .at(3, When::Simulation, spawner, Action::Command(impulse(spawner, 2)))
+        .at(3, When::Simulation, spawner, Action::Command(impulse(moved, 1)))
         .at(3, When::Simulation, spawner, Action::Command(impulse(spawner, 3)));
     h
 }
 
-/// Probe B: a `Stage::Post` move, spawn, despawn and impulse and a `Stage::Physics`
-/// command at the snapshot tick, with an input tick set every tick. The re-simulated
-/// syncs make the first run's calls and the rows end equal.
+/// Probe B: a `Stage::Post` move, spawn and despawn at the snapshot tick and the next
+/// tick's commands, with an input tick set every tick. The re-simulated syncs make the
+/// first run's calls and the rows end equal.
 #[test]
 fn the_restore_carries_the_pending_work_of_the_snapshot_point() {
     let mut h = probe_b(true).run(2);
@@ -155,8 +157,7 @@ fn the_restore_carries_the_pending_work_of_the_snapshot_point() {
     h = h.run(2);
     let first = h.take();
     let first_rows = rows(h.world());
-    // What the first run's sync at tick 3 saw: the spawn, the despawn, the move, and the
-    // two commands ahead of the tick's own.
+    // What the first run's sync at tick 3 saw: the spawn, the despawn and the move.
     let syncs = sync_calls(&first);
     assert!(
         syncs
@@ -165,15 +166,8 @@ fn the_restore_carries_the_pending_work_of_the_snapshot_point() {
     );
     assert!(syncs.contains(&Call::RemoveBody(key(2))));
     assert!(syncs.contains(&Call::SetTransform(key(3), at(6, 9, 0))));
-    // The step after the snapshot point: the physics stage's command, the post stage's
-    // (the spawn's own impulse, then the moved body's), then the tick's own.
-    let commands = &steps(&first)[0].1;
-    assert_eq!(commands.len(), 4);
-    assert_eq!(
-        (commands[0], commands[2], commands[3]),
-        (impulse(key(1), 2), impulse(key(3), 1), impulse(key(1), 3))
-    );
-    assert!(matches!(commands[1].body(), StableKey::Predicted(_)));
+    // The step after the snapshot point: the tick's own commands, in the kernel's order.
+    assert_eq!(steps(&first)[0].1, [impulse(key(1), 2), impulse(key(3), 1), impulse(key(1), 3)]);
 
     h.world_mut().restore(&world_snapshot).unwrap();
     restore(h.world_mut(), &physics_snapshot).unwrap();
@@ -217,7 +211,8 @@ fn a_correction_named_through_corrected_is_pushed() {
 }
 
 /// The predict loop: snapshot at tick 3 beside `World::snapshot`, ten ticks with
-/// post-stage spawns, despawns, moves, commands and a claim transition; `World::restore`,
+/// post-stage spawns, despawns, moves and a claim transition and simulation-stage
+/// commands; `World::restore`,
 /// `restore`, `corrected`; the re-run tells the backend what the first run did and ends
 /// with the same rows.
 #[test]
@@ -240,7 +235,7 @@ fn the_predict_loop_re_simulates_exactly() {
         .at(5, When::Post, bodies[1], Action::Despawn(bodies[2]))
         .at(5, When::Post, bodies[1], Action::SetTransform(bodies[3], at(9, 9, 9)))
         .at(6, When::Simulation, bodies[1], Action::Command(impulse(bodies[4], 4)))
-        .at(6, When::AfterStep, bodies[1], Action::Command(impulse(bodies[1], 1)))
+        .at(7, When::Simulation, bodies[1], Action::Command(impulse(bodies[1], 1)))
         .at(7, When::Post, bodies[1], Action::Claim(proxy))
         .at(8, When::Post, bodies[1], Action::Release(bodies[5]))
         .at(9, When::Post, bodies[0], Action::Spawn(at(5, 30, 0)));
@@ -443,8 +438,8 @@ fn resim_advance(mut h: Harness, to: u32) -> Harness {
 }
 
 /// Pending work of every kind at many ticks: post-stage spawns (one bound mid-run, one never
-/// bound), a despawn that leaves a joint waiting, `cmd.set` writes, commands from three
-/// stages (one naming the bound body by its `Net` key), a claim and a release, a kinematic
+/// bound), a despawn that leaves a joint waiting, `cmd.set` writes, four commands
+/// (one naming the bound body by its `Net` key), a claim and a release, a kinematic
 /// body driven every tick, a body change and a region frozen and thawed.
 fn resim_scene(layout: LayoutConfig, workers: u32, threads: u32) -> Harness {
     let mut options = Options::new(WorldKind::Prediction);
@@ -471,10 +466,10 @@ fn resim_scene(layout: LayoutConfig, workers: u32, threads: u32) -> Harness {
     let s = h.script();
     s.at(2, When::Simulation, key(1), Action::WriteVelocity(slide))
         .at(3, When::Post, key(5), Action::Spawn(at(0, 30, 0)))
-        .at(3, When::Post, key(5), Action::Command(impulse(key(1), 3)))
+        .at(4, When::Simulation, key(5), Action::Command(impulse(key(1), 3)))
         .at(3, When::Post, key(5), Action::SetTransform(key(6), at(9, 9, 9)))
         .at(3, When::Post, key(5), Action::Despawn(key(4)))
-        .at(4, When::AfterStep, key(1), Action::Command(impulse(key(2), 4)))
+        .at(5, When::Simulation, key(1), Action::Command(impulse(key(2), 4)))
         .at(5, When::Simulation, key(2), Action::Command(impulse(key(5), 5)))
         .at(6, When::Post, key(5), Action::Claim(key(7)))
         .at(7, When::Simulation, key(2), Action::Command(impulse(bound, 7)))

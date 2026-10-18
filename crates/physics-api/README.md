@@ -1,10 +1,10 @@
 # lactose-physics-api
 
 The physics interface: the components that describe a body, its collider and its joints and
-the two the write-back writes; the command channel a kernel writes through `cmd.physics()`;
-contact and trigger events; queries over the stepped state; the trait a backend implements;
-and the snapshot and restore the prediction world rolls back with. `lactose-physics-rapier`
-(QUARK) is the backend behind it.
+the two the write-back writes; the command channel a kernel writes through a
+`ChannelWriter<PhysicsCommands>` parameter; contact and trigger events; queries over the
+stepped state; the trait a backend implements; and the snapshot and restore the prediction
+world rolls back with. `lactose-physics-rapier` (QUARK) is the backend behind it.
 
 | | |
 |---|---|
@@ -40,7 +40,7 @@ build run for every world kind: a change that breaks it is a signature change to
 | `Collider`, `Shape`, `ShapeKind`, `CollisionGroups` | The one collision primitive of an entity, its material, groups, event opt-in and impact threshold; alone, a fixed collider |
 | `Joint`, `JointKind` | A joint between two bodies, as a row of its own |
 | `BodyHandle`, `JointHandle` | The backend's handles, `derived` and untrusted: present exactly while the row is in the solver |
-| `PhysicsExt`, `PhysicsWriter`, `PhysicsCommands`, `PhysicsCommand` | `cmd.physics()`: impulses, forces and teleports, recorded into the channel and applied by the next step in command order |
+| `PhysicsExt`, `PhysicsCommands`, `PhysicsCommand` | The `PhysicsExt` methods on a `ChannelWriter<PhysicsCommands>` parameter: impulses, forces and teleports, recorded in `Stage::Input` or `Stage::Simulation` and applied by this tick's step in command order; the schedule refuses the parameter in `Stage::Physics` or `Stage::Post` |
 | `ContactEvent`, `TriggerEvent`, `ContactPhase` | What the step emits for `Stage::Post`, indexed by the entity each is for; `Impact` is the damage phase |
 | `Physics`, `PhysicsConfig` | The one resource: queries through `Res<Physics>` anywhere, the three systems through `ResMut<Physics>`; gravity and the worker reservation |
 | `Ray`, `QueryFilter`, `RayHit`, `ShapeHit` | The queries' arguments and answers, keyed by `StableKey`, in `Scalar`s |
@@ -61,7 +61,7 @@ constructors and accessors are `#[doc(hidden)]`: the backend's, not game code's.
 |---|---|---|
 | Game crates | A body as persistent plain data keyed by `StableKey` through the ECS: shape, mass properties, material, type, groups | `RigidBody`, `Collider` (with `Shape`, `CollisionGroups`, `material`) and `Transform` on the entity; a `Joint` on a row of its own |
 | | What the step writes back, as declared writes | `Transform`, `Velocity` and `Teleported` through the write-back at the sync point that begins `Stage::Post`, `writes = [Transform, Velocity, Teleported]`; every other `Stage::Post` system reads them after it with no edge |
-| | Impulses, forces, teleports | `cmd.physics().apply_impulse(..)` and the rest of `PhysicsWriter`, from any stage; a command recorded after the step applies at the next tick's step |
+| | Impulses, forces, teleports | `physics.apply_impulse(..)` and the rest of `PhysicsExt` on a `physics: ChannelWriter<PhysicsCommands>` parameter, in `Stage::Input` or `Stage::Simulation`; the schedule refuses the parameter in `Stage::Physics` or `Stage::Post` ("Commands" below) |
 | | Joint creation and removal | `cmd.spawn((Joint::new(..), OwnedBy { .. }))` and `cmd.despawn(joint)`: a joint is a row ("Joints" below) |
 | | Moving a body from a kernel without a command | `Mut<Transform>`, `Mut<Velocity>`, `Mut<RigidBody>`, `Mut<Collider>` in `Stage::Input`, `Stage::Simulation` or `Stage::Post`: honoured at the next physics sync point ("The tick" below); never in `Stage::Physics` |
 | | Contact and trigger events indexed by target, and a damage signal | `Events<ContactEvent>` and `Events<TriggerEvent>` in `Stage::Post`, `for_target(key)`; `ContactPhase::Impact` above `Collider::impact_threshold`, to a target whose own collider has `events` set |
@@ -80,7 +80,7 @@ constructors and accessors are `#[doc(hidden)]`: the backend's, not game code's.
 | `sim` and SOUR | The systems placed, readers after them, a setup function for the pool | `register_systems` places `sets::SYNC` and `sets::STEP` in `Stage::Physics` and `sets::WRITE_BACK` first in `Stage::Post`; `setup` is the setup function; `Res<TickDelta>` is the step's delta |
 | | Determinism as a contract on the backend; the conformance shape; the place for snapshot hashing | `PhysicsBackend` docs and "The backend's obligations"; `conformance::snapshot_restore` with its `LayoutConfig`; `PhysicsSnapshot::hash` and `ConformanceReport::physics_hash` |
 | `present-api`, `net` | The transform to extract and replicate, and the no-interpolate flag | `Transform` is `extracted` and `replicated`; `Teleported` is `persistent, extracted, replicated` and holds a tick to compare with the last one covered; `Velocity`, `RigidBody`, `Collider` and `Joint` are `replicated` |
-| `persist` | What a save carries | The components above by their policies; handles are derived; untaken physics commands are not saved ("Commands" below) |
+| `persist` | What a save carries | The components above by their policies; handles are derived; no physics command is untaken between ticks ("Commands" below) |
 | The scalar decision | Nothing here depends on the width | "The scalar" below |
 
 ## The registration app and a backend write
@@ -222,16 +222,17 @@ Three systems, `worlds = [server, prediction]`: two in `Stage::Physics` in `sets
 
 1. The sync point that begins `Stage::Physics` applies the simulation stage's commands,
    channel entries included.
-2. `physics_api::sync` (exclusive, `&mut World`, `ResMut<Physics>`, `writes = [BodyHandle,
-   JointHandle]`): region modes; then the pending log entries a restore carried and the
+2. `physics_api::sync` (exclusive, `&mut World`, `ResMut<Physics>`,
+   `ChannelTake<PhysicsCommands>`, `writes = [BodyHandle, JointHandle]`): region modes;
+   then the pending log entries a restore carried and the
    structural log since the cursor, in log order (or the full diff above when the cursor
    or mark is stale); then the union of the pending keys and the rows of `RigidBody`,
    `Collider`, `Transform`, `Velocity` and `Joint` changed since the mark, in ascending key
    order (the ECS yields them in storage order and the sync sorts), skipping a `Transform`
    or `Velocity` whose value equals what the last write-back wrote for that key; then the
-   waiting joints in ascending key order; then
-   `World::take_channel::<PhysicsCommands>()`, appended after the pending commands a
-   restore carried, as this tick's command list. The cursor and the mark are then taken.
+   waiting joints in ascending key order; then the entries of its
+   `ChannelTake<PhysicsCommands>` as this tick's command list. The cursor and the mark are
+   then taken.
 3. `physics_api::step` (once per tick, `Job`, `ResMut<Physics>`, `Res<TickDelta>`, two
    `EventWriter`s): inside `Job::block_in_place(config.reserved_workers, ..)`, the one
    sanctioned blocking wait, `PhysicsBackend::step` applies the command list in order and
@@ -262,33 +263,80 @@ So a kernel in `Stage::Simulation` may write `Velocity` through `Mut` *and* reco
 impulse: the sync sets the velocity, then the step adds the impulse, then steps. A
 `Transform` write places a dynamic or fixed body there with no sweep (the write-back then
 writes `Teleported`) and sets where a kinematic body sweeps to during the step;
-`cmd.physics().teleport` places any body there with no sweep. A write made in `Stage::Post`
+`PhysicsExt::teleport` places any body there with no sweep. A write made in `Stage::Post`
 after the write-back is seen by the next tick's sync and overrides what the step wrote; a
-command recorded in `Stage::Post` is applied by the next tick's step. `Teleported` holds a
+command cannot be recorded in `Stage::Post`: the schedule refuses the writer there
+("Commands"). `Teleported` holds a
 tick rather than a per-tick flag so that a frame which runs several ticks before its passes
 (catch-up, re-simulation, a gather over several ticks) loses no teleport: extract and the
 gather compare it with the last tick they covered, and zero means never.
 
 **Commands**
 
-- `PhysicsCommands` declares `CLEAR_AT_INPUT = false`, so its entries stay until the sync
-  takes them: a command recorded in `Stage::Input` or `Stage::Simulation` reaches this
-  tick's step, one recorded in `Stage::Physics` or `Stage::Post` the next tick's, and the
-  step applies every command recorded since the previous step, in command order (the
-  ECS's: execution order of the recording systems, then source key, then sequence, ticks
-  in order). A kernel reading `Events<ContactEvent>` in `Stage::Post` may therefore record
-  an explosion impulse or a portal teleport, and it lands one tick later.
-- Untaken commands (those recorded after the step of the last tick) are not in a
-  `SavePoint` or a `Journal`: a load and a replay drop them, as they drop the solver's
-  state. A rollback keeps them: the physics snapshot carries them ("Snapshot and
-  restore").
-- Commands untaken at the save (recorded in `Stage::Physics` or `Stage::Post` of the save
-  tick) are still applied by a one-frame in-place reload, which a fresh process loading the
-  save does not do; the two-frame reload drops them as a side effect. Section 15.5's first
-  test holds for physics only when no command is untaken at the save, until S1 is decided.
-- A world whose systems record `cmd.physics()` and that holds no `Physics` resource grows
-  the channel without bound, since nothing takes it: `app` inserts one in every world that
-  runs such systems, and a test either inserts one or records nothing.
+- A command is recorded through a `physics: ChannelWriter<PhysicsCommands>` parameter in
+  `Stage::Input` or `Stage::Simulation`, and the step applies this tick's commands in
+  command order (the ECS's: execution order of the recording systems, then source key,
+  then sequence). The sync takes the channel through a `ChannelTake<PhysicsCommands>`
+  parameter, so a schedule with the writer on a system in `Stage::Physics` or
+  `Stage::Post`, or a `Channel<PhysicsCommands>` reader after the sync, fails to build with
+  `ScheduleError::ChannelAfterTaker`, naming the system, `physics_api::sync` and the
+  channel: a command recorded there would land in the channel after the sync took it and
+  reach no step, since the ECS clears every channel at the closing sync point of every run
+  (D126). So the channel is empty between ticks, and no command is in a `SavePoint`, a
+  `Journal`, a `PhysicsSnapshot` or the world hash because none is in flight there.
+- A reaction to this tick's step that acts next tick is a row holding the decision, never
+  the solver's numbers, and acts on another body through an event. Three rules bound it: a
+  kernel reads its own row only; a game runs no exclusive system in the prediction world
+  (`lactose-predict`'s build check); and in the prediction world a kernel runs only on a
+  claimed row, so the kernel that records a predicted command runs on a claimed row, and a
+  command an unclaimed row records is the server's alone, reaching the client as a
+  correction. The shape is section 6.1's `sword_hit` and `apply_damage`, one tick later. A
+  `ContactEvent` goes to its target, so a kernel reading `Events<ContactEvent>` in
+  `Stage::Post` writes what it decided into a persistent component of its own row, in
+  integer or discrete form (a reaction kind, a count, an `armed` flag, the other body's
+  key; a transient component is zeroed at the input sync point first): a carrier of plain
+  values through `Mut`, with no command and no archetype change; a carrier that keeps a key
+  holds it in an `EntityRef` field, which the schedule refuses `Mut` on, and is written and
+  cleared through `Commands::set` on its own row, the column spawned with the body. A
+  `Stage::Simulation` kernel of the next tick emits an event keyed by each body the
+  reaction acts on, carrying its own row's values, and clears the component; that body's
+  `Stage::Simulation` kernel, ordered after the emitter, computes the command from its own
+  row and the event and records it through its writer, so it is in this tick's channel when
+  the sync takes it and lands at the step a post-stage command used to reach. The floats
+  are never stored. The component is `replicated` when those kernels run in the prediction
+  world, as `lactose-predict`'s build check requires of a persistent component, and it is
+  compared by canonical bytes, which is why it holds no solver-derived scalar: a stored
+  contact normal differs from the server's on every reaction and is corrected (D124). The
+  delayed explosion is the model: the `Impact` arms the bomb's row in `Stage::Post`; the
+  next tick's simulation kernel runs the overlap query, which returns keys, emits `Blast`
+  from its own `Transform` to each and disarms the row, and each body's kernel takes the
+  direction from its own `Transform` and records the impulse. Pushing the other body of a
+  contact, which an `Impact` reaching only a collider with `events` set usually leaves
+  without an event of its own: the carrier keeps `contact.other` in an `EntityRef` field
+  and the next tick's kernel emits to it; the pushed body carries no column. A teleport
+  decided in `Stage::Post` is a carrier too, recorded by the body that is teleported: the
+  carrier keeps the portal's key, and the next tick's kernel on that body reads the exit's
+  pose from a world resource a setup function fills from the level's cooked data, keyed by
+  each portal's cooked `NetId` (section 7), constant for the session, or from a fixed
+  destination of its own row, and records `physics.teleport` on itself (a portal spawned or
+  moved at runtime is outside the recipe and its teleport reaches the client as a
+  correction); the exit portal's kernel never records it, since the exit is no claimed row
+  and its command would be the server's alone. A `Transform` written through
+  `Commands::set` places a dynamic or fixed body and sweeps a kinematic one through
+  whatever lies between. A `Commands::set` of a carrier on another row overwrites, so two
+  reactions on one body in a tick keep one, and adds the column where it is absent. The
+  cost is a replicated column on the reacting row, written and cleared per reaction,
+  through `Mut` or through two `Commands::set`, and an event type, a kernel and an edge for
+  the relay. The intent is then saved, hashed, replicated and snapshotted with the row,
+  which is what a load, a replay and a rollback need.
+- No command is untaken between ticks (D126, the first bullet), so section 15.5's first
+  test holds for physics with no condition.
+- A world that runs a system with a `ChannelWriter<PhysicsCommands>` and neither
+  `physics_api::sync` nor a later-stage reader of the channel fails to build its schedule
+  (`ScheduleError::ChannelWithoutConsumer`), and one that runs the sync and holds no
+  `Physics` resource fails `run_tick` before anything runs
+  (`ScheduleError::MissingResource`): `app` registers the systems and inserts the resource
+  in every world that runs such systems, and a test does the same or records nothing.
 - A command for a key that is not a body when the step runs is dropped and logged at
   target `physics`. An impulse or force on a kinematic, fixed or frozen body is dropped
   likewise. A `Teleport` works on every body.
@@ -367,10 +415,10 @@ gather compare it with the last tick they covered, and zero means never.
   pending work: which rows are bodies with their handles and which of them are frozen,
   which rows are joints with the value and the bodies each was created from, the waiting
   joints, the region modes, the aliases and the predicted bodies not yet bound, `written`,
-  the structural log entries after the sync's cursor in order, the keys changed since its
-  mark across the five columns with the columns each changed in, and the channel's entries
-  not yet taken (`World::channel`); or, when the cursor or mark is stale, that a full diff
-  is due. `snapshot` records this crate's bookkeeping and what the next sync would see;
+  the structural log entries after the sync's cursor in order, and the keys changed since
+  its mark across the five columns with the columns each changed in; or, when the cursor or
+  mark is stale, that a full diff is due. No command is carried: the channel is empty
+  between ticks. `snapshot` records this crate's bookkeeping and what the next sync would see;
   `restore` puts them back, and the next sync processes the pending log entries before the
   log since the restore, and the union of pending and newly changed keys in key order, so
   a re-simulated tick's sync makes exactly the backend calls the first run's did, apart
@@ -498,13 +546,13 @@ Rapier, and the size and time of Rapier's snapshot bytes.
 | Bodies follow rows | `bodies.rs`: spawn, `cmd.set` of `RigidBody` and `Collider`, their removal, despawn, a move into a frozen region, a thaw, unload and load reach the backend as `create_body`, `set_body`, `set_collider`, `remove_body`, `set_frozen` and `set_velocity` in the stated order, handle rows present exactly meanwhile; the same calls under every `layout_mode` capacity, three seeds, one and four workers and two pool sizes; a refused body is retried when its row changes; a row without a `Transform` is skipped; a mode change freezes and thaws every body of the region once |
 | The prediction rule | `bodies.rs`: a proxy is created kinematic, a claimed row with its type, a `Collider` row fixed; a claim and a release are `set_body` with the effective body; a proxy's body change is handed kinematic; a server world hands the row's type |
 | Row writes | `rows.rs`: a `Mut<Velocity>` write and an impulse in one tick are `set_velocity`, then the step with the command; a `Transform` write sweeps a kinematic body and places a dynamic one; the write-back is never pushed back (probe F with 200 bodies here, 2,000 in `cost.rs`); a `Stage::Post` write is pushed at the next tick, a sleeping body's write to its last pose included; a body without `Velocity` gains one; a `Stage::Physics` write is overwritten for a body the step reports and pushed at the next sync for one it does not |
-| Commands | `commands.rs`: command order (execution order, source key, sequence; the physics stage's and the post stage's commands ahead of the next tick's own) under three capacities, two seeds and one and four workers; a command for a non-body or a missing key is dropped, one for a fixed collider reaches the backend; a dropped spawn's command is dropped (probe B without an input tick); a bound predicted body is named by its `Net` key from the physics sync point on, in commands, `is_body` and `QueryFilter::exclude` |
+| Commands | `commands.rs`: command order (execution order, source key, sequence) under three capacities, two seeds and one and four workers; a `ChannelWriter<PhysicsCommands>` in `Stage::Physics` after the step or in `Stage::Post` fails the build with `ChannelAfterTaker` naming the system, the sync and the channel; a command for a non-body or a missing key is dropped, one for a fixed collider reaches the backend; a dropped spawn's command is dropped (probe B without an input tick); a bound predicted body is named by its `Net` key from the physics sync point on, in commands, `is_body` and `QueryFilter::exclude` |
 | Events | `events.rs`: the emission order per tick whatever order the backend reports in (two pool sizes); `Impact` in every touching step above the threshold to the target with `events`, never to one without; `Started` and `Stopped` to both sides; triggers to both sides; each seen once by a `Stage::Post` reader; readers in `Stage::Physics` without the edge and in `Stage::Simulation` fail to build |
 | Queries | `queries.rs`: `cast_ray` ties to the lowest key, groups, sensors and exclusion; `cast_shape`; `overlap` appended ascending, each key once, whatever the backend's order; a `Stage::Physics` reader of `Physics` needs the edge after `sets::STEP`; an unordered `Stage::Post` reader of `Transform` reads this tick's rows (probe S1); another exclusive `Stage::Post` system builds only once `Registration::order` orders it (probe S2) |
 | Joints | `joints.rs`: a joint waits for both bodies; a body's removal removes it and it waits, then a fixed collider takes it; a value change recreates it and an equal write does not; an emptied reference parks it until its row changes; a despawned body leaves it waiting for that key |
 | Snapshot and restore | `snapshot.rs`: `conformance::snapshot_restore` with the test backend under two pool sizes, the production layout and SOUR's, one and four workers, every report equal, the resumed run's backend calls equal to the first run's, and the scene's pending work, velocity write, command, limp bone, freeze and thaw each seen in them; probe B: the re-simulated syncs make the first run's calls and the rows are equal; probe C: a correction is pushed only when named through `corrected`; the predict loop with spawns, despawns, moves, commands, a claim and a release, re-run equal apart from the corrected key's two equal-value pushes; a world restored alone is diffed without clearing and keeps running; the 2^30 rebase diffs without clearing (probe D); a snapshot taken before the first sync restores into a full diff; another resource's snapshot and another tick's are refused and change nothing; `NotFound` without `Physics`; a second `setup` is refused; a scene with pending work at many ticks, a predicted body bound mid-run and one never bound, re-simulated from seven restore points under four layouts, one and four workers and two pool sizes, makes the first run's calls and rows; the unbound-predicted set is carried, emptied by binds and never looked up for a bound body (`src/service.rs` unit test) |
 | The write-back | `rows.rs`: only rows whose bytes changed are stamped; `Teleported` holds the teleport's tick across two further ticks (probe T); a key despawned at the post sync point is skipped; `cost.rs`: 100k entities with 2,000 moved bodies, the write-back stamping exactly the moved rows and the sync pushing none, the microseconds of both printed, and the sync of resting bodies by `Net`, bound predicted and unbound predicted keys; a body reported twice is written the same whichever copy comes first |
 | The scalar | The size assertions in `lib.rs`; `types.rs`: no component's layout holds a raw float, every hashed one registers with the world hasher, the handles are `derived` |
-| SOUR | `sour.rs`: a server scene and a prediction scene with a rollback, 150 ticks each, the re-simulated ticks recorded again (the runner requires them equal); and the rolled-back scene ending with the straight run's hashes; the rollback tick holds a post-stage spawn, a despawn, `cmd.set` writes of a transform and a velocity and a command, and a claimed row records `Physics::body_count` and whether that despawned sphere is a body every tick, so a restore that dropped any part of the carried work changes a hash, a lost removal included although the test backend never moves a row for the ghost body |
-| Reload | `reload.rs`: a same-frame reload of every region removes every body, restores the empty world and then makes a fresh process's calls; a one-region reload keeps the solver and the handle rows; a two-frame reload restores at the unload and creates in key order at the load; removals that empty the solver restore it and make the next sync a full diff; a reload across a restore sees the carried despawns; `set_tick` then the full frame makes a fresh client's calls, a one-region reload across `set_tick` keeps the solver and its handle rows, and a rollback to a slot taken after `set_tick` repeats the fresh rebuild; `snapshot.rs`: `conformance::empty_restore` with the test backend under two layouts; `lactose-physics-rapier`'s `reload.rs` and `conformance.rs`: the same with Rapier, world hashes equal to a fresh process |
+| SOUR | `sour.rs`: a server scene and a prediction scene with a rollback, 150 ticks each, the re-simulated ticks recorded again (the runner requires them equal); and the rolled-back scene ending with the straight run's hashes; the rollback tick holds a post-stage spawn, a despawn and `cmd.set` writes of a transform and a velocity, the tick after it records a command, and a claimed row records `Physics::body_count` and whether that despawned sphere is a body every tick, so a restore that dropped any part of the carried work changes a hash, a lost removal included although the test backend never moves a row for the ghost body |
+| Reload | `reload.rs`: a same-frame reload of every region removes every body, restores the empty world and then makes a fresh process's calls; a one-region reload keeps the solver and the handle rows; a two-frame reload restores at the unload and creates in key order at the load; removals that empty the solver restore it and make the next sync a full diff; a reload across a restore sees the carried despawns; `set_tick` then the full frame makes a fresh client's calls, a one-region reload across `set_tick` keeps the solver and its handle rows, and a rollback to a slot taken after `set_tick` repeats the fresh rebuild; an impulse recorded in `Stage::Simulation` of the reload tick is in that tick's step in the reloaded world and in a fresh process (D126); a post-stage reaction carried by a persistent row and turned into an impulse by the next tick's simulation stage lands at the same step, with equal steps and world hashes, on the straight, one-frame, fresh-process, restore and two-frame paths (D126); `snapshot.rs`: `conformance::empty_restore` with the test backend under two layouts; `lactose-physics-rapier`'s `reload.rs` and `conformance.rs`: the same with Rapier, world hashes equal to a fresh process, and a kinematic body swept through a touching crate by a `Transform` written in `Stage::Post` where a carried `Teleport` places it (D126) |
 | The snapshot size | `cost.rs` prints `size_in_bytes` and `snapshot` time for 50 claimed bodies plus 0 to 10,000 statics; the test backend's bytes say nothing of Rapier's, which the backend lane measures against the 100 µs budget |

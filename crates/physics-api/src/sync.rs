@@ -10,8 +10,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use lactose_core::{ComponentKey, StableKey};
 use lactose_ecs::{
-    ChangeMark, ClaimedBy, EventWriter, Job, LogCursor, LogEntries, RegionId, RegionMode,
-    StructuralChange, World, WorldKind,
+    ChangeMark, ChannelTake, ClaimedBy, EventWriter, Job, LogCursor, LogEntries, RegionId,
+    RegionMode, StructuralChange, World, WorldKind,
 };
 use lactose_math::{Canonical, Scalar};
 use lactose_reflect::Reflect;
@@ -90,8 +90,8 @@ fn collect_changes(world: &World, mark: ChangeMark, rows: &mut Vec<(StableKey, C
 }
 
 impl Physics {
-    /// The sync (`README.md`, "The tick", step 2).
-    pub(crate) fn sync(&mut self, world: &mut World) {
+    /// The sync (`README.md`, "The tick", step 2), with the channel the run took.
+    pub(crate) fn sync(&mut self, world: &mut World, taken: ChannelTake<PhysicsCommands>) {
         let Physics { backend, sync, cursor, mark, tick, commands, fresh, .. } = self;
         *tick = world.tick();
         let held = !sync.bodies.is_empty();
@@ -158,7 +158,7 @@ impl Physics {
         }
         pass.retry_waiting_joints();
         pass.refresh_aliases();
-        pass.take_commands(commands);
+        pass.take_commands(taken, commands);
         // Removals that left the solver empty (a world unloaded a frame before it is
         // loaded): the solver is made fresh now, and the next sync creates whatever is
         // loaded by a full diff, in key order, as a fresh process's first sync does.
@@ -740,16 +740,15 @@ impl Pass<'_> {
         });
     }
 
-    /// This tick's command list: the commands a restore carried, then the channel's, in
-    /// command order, each naming its body by origin key; a command naming no body is
-    /// dropped.
-    fn take_commands(&mut self, commands: &mut Vec<PhysicsCommand>) {
+    /// This tick's command list: the taken channel's entries in command order, each naming
+    /// its body by origin key; a command naming no body is dropped.
+    fn take_commands(
+        &mut self,
+        taken: ChannelTake<PhysicsCommands>,
+        commands: &mut Vec<PhysicsCommand>,
+    ) {
         commands.clear();
-        let mut taken = mem::take(&mut self.sync.pending_commands);
-        taken.extend(
-            self.world.take_channel::<PhysicsCommands>().into_iter().map(|entry| entry.entry),
-        );
-        for mut command in taken {
+        for mut command in taken.into_entries().into_iter().map(|entry| entry.entry) {
             let key = command.body();
             let origin = match key {
                 StableKey::Placeholder(_) => None,

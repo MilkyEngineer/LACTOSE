@@ -4,8 +4,9 @@
 
 use lactose_core::{EntityRef, StableKey};
 use lactose_ecs::{
-    Commands, CommandChannel, Ctx, Event, EventWriter, Events, Mut, PresentEvent, PresentEvents,
-    PresentKind, Res, ResMut, StableKeyOf, SystemSet, World, finalize, system,
+    Channel, ChannelTake, ChannelWriter, Commands, CommandChannel, Ctx, Event, EventWriter, Events,
+    Mut, PresentEvent, PresentEvents, PresentKind, Res, ResMut, StableKeyOf, SystemSet, World,
+    finalize, system,
 };
 use lactose_math::{ExactSum, Scalar, Vec2};
 use lactose_reflect::{component, resource, value, Padding};
@@ -55,17 +56,15 @@ impl Event for Damage { fn target(&self) -> StableKey { self.target } }
 pub enum AudioRequest { Footstep = 1 }
 impl PresentEvent for AudioRequest { const KIND: PresentKind = PresentKind::from_name("g::audio"); }
 
-pub struct PhysicsChannel;
+pub struct PhysicsCommands;
 pub struct Impulse { pub body: StableKey, pub impulse: Vec2 }
-impl CommandChannel for PhysicsChannel {
+impl CommandChannel for PhysicsCommands {
     type Entry = Impulse;
     fn remap(entry: &mut Impulse, f: &mut dyn FnMut(&mut StableKey)) { f(&mut entry.body); }
 }
-pub struct PhysicsWriter<'a, 'w>(lactose_ecs::ChannelWriter<'a, PhysicsChannel>, core::marker::PhantomData<&'w ()>);
-impl PhysicsWriter<'_, '_> { pub fn apply_impulse(&mut self, body: StableKey, impulse: Vec2) { self.0.push(Impulse { body, impulse }); } }
-pub trait PhysicsExt<'w> { fn physics(&mut self) -> PhysicsWriter<'_, 'w>; }
-impl<'w> PhysicsExt<'w> for Commands<'w> {
-    fn physics(&mut self) -> PhysicsWriter<'_, 'w> { PhysicsWriter(self.channel::<PhysicsChannel>(), core::marker::PhantomData) }
+pub trait PhysicsExt { fn apply_impulse(&mut self, body: StableKey, impulse: Vec2); }
+impl PhysicsExt for ChannelWriter<'_, PhysicsCommands> {
+    fn apply_impulse(&mut self, body: StableKey, impulse: Vec2) { self.push(Impulse { body, impulse }); }
 }
 
 pub mod sets {
@@ -86,13 +85,13 @@ fn total_mass(mass: &Mass) -> Scalar { mass.0 }
 fn store_total(sum: Scalar, out: ResMut<TotalMass>) { out.0 = sum; }
 
 #[system(name = "game_sim::throw_bomb", worlds = [server, prediction])]
-fn throw_bomb(ctx: Ctx, cmd: Commands, key: StableKeyOf, held: &HeldItem, input: &PlayerInput) {
+fn throw_bomb(ctx: Ctx, cmd: Commands, physics: ChannelWriter<PhysicsCommands>, key: StableKeyOf, held: &HeldItem, input: &PlayerInput) {
     if input.throw && held.kind == ItemKind::Bomb {
         let bomb = cmd.spawn((Bomb { fuse: 180 },));
         cmd.set(*key, HeldItem { kind: ItemKind::None });
         cmd.set(bomb, ThrownBy { thrower: EntityRef::new(*key) });
         let spread = ctx.rng(bomb).next_scalar();
-        cmd.physics().apply_impulse(bomb, Vec2::new(input.aim.x * spread, input.aim.y * spread));
+        physics.apply_impulse(bomb, Vec2::new(input.aim.x * spread, input.aim.y * spread));   // `PhysicsExt` on the writer
     }
 }
 
@@ -113,6 +112,12 @@ fn footsteps(present: PresentEvents, key: StableKeyOf, anim: &AnimState) {
 #[system(name = "sim::apply_region_load", exclusive)]
 fn apply_region_load(world: &mut World, loaded: ResMut<LoadedBundles>) { let _ = (world.tick(), loaded.0); }
 
+// The physics sync's take, and a reader before it.
+#[system(name = "physics_api::sync", worlds = [server, prediction], exclusive)]
+fn sync(world: &mut World, commands: ChannelTake<PhysicsCommands>) { let _ = (world.tick(), commands.into_entries().len()); }
+#[system(name = "game_sim::count_impulses", worlds = [server])]
+fn count_impulses(impulses: Channel<PhysicsCommands>, out: ResMut<LoadedBundles>) { out.0 += impulses.len() as u32; }
+
 // After a system in another module, and a client-only system.
 mod other {
     use lactose_ecs::{Res, system};
@@ -122,6 +127,6 @@ mod other {
 
 fn main() {
     let _ = &SystemSet::new("x");
-    let all = [&APPLY_GRAVITY, &TOTAL_MASS, &THROW_BOMB, &SWORD_HIT, &APPLY_DAMAGE, &FOOTSTEPS, &APPLY_REGION_LOAD, &other::LATE];
-    assert_eq!(all.len(), 8);
+    let all = [&APPLY_GRAVITY, &TOTAL_MASS, &THROW_BOMB, &SWORD_HIT, &APPLY_DAMAGE, &FOOTSTEPS, &APPLY_REGION_LOAD, &SYNC, &COUNT_IMPULSES, &other::LATE];
+    assert_eq!(all.len(), 10);
 }

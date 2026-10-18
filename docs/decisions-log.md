@@ -1573,8 +1573,9 @@ rationale the author supplied during the editorial pass rather than one taken fr
     `Stage::Input`, `Stage::Simulation` or `Stage::Post`, is honoured at the next physics sync
     point (a dynamic or fixed body is placed with no sweep, a kinematic body sweeps during the
     step); the write-back's own writes are recognised by value against the record of the last
-    write-back, which every write-back replaces, and skipped. `cmd.physics()` carries impulses,
-    forces and `teleport` only. The section 6.1 `apply_gravity` kernel therefore works on a
+    write-back, which every write-back replaces, and skipped. `cmd.physics()`, since D126 a
+    `ChannelWriter<PhysicsCommands>` parameter, carries impulses, forces and `teleport` only.
+    The section 6.1 `apply_gravity` kernel therefore works on a
     body. In `Stage::Physics` nothing but the write-back writes a body's `Transform` or
     `Velocity`, and a reader there after the step sees this tick's queries and events but the
     previous tick's rows; readers of stepped rows go in `Stage::Post`. Rules out `set_velocity`,
@@ -2666,8 +2667,10 @@ checkpoint carries the physics snapshot** (§1, §2, §9.4, §10, §15.5, §16, 
   restore or a whole-world load logs no despawns, so neither triggers the reload by itself; the
   whole-world load must empty the solver itself when that API lands. Waiting joints are kept
   and resolved by the full diff. `conformance::empty_restore` checks the backend obligation
-  that the empty world's bytes restore to a world that steps as a new one does. Open: commands
-  untaken at the save survive a one-frame reload (S1).
+  that the empty world's bytes restore to a world that steps as a new one does. The untaken
+  commands are closed by D126: a run's closing sync point clears every channel, so none is in
+  flight at a save, a reload or a snapshot, and a writer of the channel in or after the sync's
+  stage is a schedule build error.
 - Replaced: section 2's and 9.4's "at full precision" without qualification; D122's "Full
   precision means canonical bytes per field, no tolerance" for the solver-written rows of a
   dynamic body, its "a tolerance for dynamic bodies is decided at milestone 4" and its
@@ -2721,6 +2724,157 @@ release golden vectors beside the Windows test build** (§18, §20, `.cargo/conf
   instead of 14 (M1, -j4, CARGO_INCREMENTAL=0).
 - Driven by: the Windows CI timeout of run 38126882535 and the CI link lane with two review
   rounds (2026-10-11).
+
+**D126. No channel carries entries across a tick boundary: a run's closing sync point
+clears every channel, the physics channel included; a channel is written through a
+`ChannelWriter<C>` parameter and taken through a `ChannelTake<C>` parameter of an
+exclusive system, and the schedule refuses a writer in or after its taker's stage and a
+reader after it; a reaction to the step that acts next tick is a row holding the decision,
+relayed by an event when it acts on another body** (§6.1, §10, `lactose-ecs`,
+`lactose-physics-api`, `lactose-physics-rapier`, `lactose-sim`)
+- Why: a `PhysicsCommand` recorded after the step waited in the channel for the next tick's
+  sync, since D119 made `PhysicsCommands` opt out of clearing and a `ChannelEntry` carries no
+  tick. A save copies rows and so lost it; `sim`'s one-frame in-place reload kept the world
+  and so kept it, and the D124 sync handed it to the rebuilt solver (p2, r3: the reloaded
+  world and the fresh process differ from the first step). The two-frame reload dropped it
+  only because the unload tick's step found no body. The channel's contents between ticks
+  were simulation state outside the rows: unsaved, unhashed, dropped by a restore, kept by
+  a reload, and carried by `physics-api` in its own snapshot for the one path it could. And
+  the schedule could see neither the write, an extension method on `Commands` with no
+  target, so a kernel in any stage compiled and ran with it, nor the take, a `World` method
+  any exclusive system could call.
+  - *Every channel is cleared at the closing sync point of a run; the input sync point
+    asserts them empty.* `CommandChannel::CLEAR_AT_INPUT`, `StoredChannel::clear_at_input`
+    and `World::channel` are removed. Command buffers and channels are then empty at every
+    tick boundary by construction (channels are written only inside runs; a clear at the
+    input sync point alone left post-stage entries in the store through the saves,
+    snapshots and passes between ticks, and a second clear there would hide a future write
+    path the assertion exposes), so a save, a checkpoint, a snapshot and the world hash see
+    the whole state that the next step reads, and sections 3, 10 and 15.3 have no
+    exception. Rules out tick stamps on entries (which would fix the first test of section
+    15.5 and leave the fourth conditional), an input-stage mover in `physics-api` with its
+    public set, app edge and tenth entry in `lactose_predict::EXCLUSIVE_SYSTEMS`, a `sim`
+    rule that clears channels when every region unloads (the wrong trigger: the sync
+    empties when every body it held is despawned, which a frame that keeps a body-less
+    region loaded does without unloading every region), and a channel section in the save.
+  - *A channel write and a channel take are system parameters, and the schedule places
+    them.* `ChannelWriter<C>` is a `SystemParam` with `AccessKind::WriteChannel` on the
+    channel, allowed in every kind of system and in a finalize; its entries wait in a sink
+    of the invocation, as an `EventWriter`'s do, and are appended to the invocation's buffer
+    inside the invocation's block, after its `Commands` and before the empty-output check,
+    so a spawn's placeholder resolves as before and a kernel whose only output is an entry
+    keeps it. `ChannelTake<C>` is a `SystemParam` with `AccessKind::TakeChannel`, held by an
+    exclusive system alone, fetched by `run_exclusive`'s pre-loop, which removes the store
+    from the world before lending it, and yielding the entries (`iter`, `len`, `is_empty`,
+    `into_entries`); `World::take_channel` is removed, so a take cannot be forgotten or made
+    outside a run, and is skipped only with its system, which the skip logs at `error`
+    naming the system and the channels its table takes; `check_table` refuses the parameter
+    outside an exclusive system, twice on one channel, or beside `Channel<C>` or
+    `ChannelWriter<C>` on one channel (`InvalidParameter`). `check_channels`, after
+    `check_events`, refuses a writer of `C` in the stage of a taker of `C` or a later one,
+    by stage index, since the writer's entries apply at its stage's closing sync point
+    whatever orders the two systems, and a reader or a second taker of `C` placed after the
+    taker, which would find it empty (`ScheduleError::ChannelAfterTaker { system, taker,
+    channel }`), and a writer that no later stage takes or reads
+    (`ScheduleError::ChannelWithoutConsumer { writer, channel }`). `Commands::channel` and
+    `PhysicsExt for Commands` go; `PhysicsExt` is the six recording methods on
+    `ChannelWriter<'_, PhysicsCommands>`, `PhysicsWriter` goes with no alias,
+    `physics_api::sync` takes `ChannelTake<PhysicsCommands>`, and section 6.1's `throw_bomb`
+    takes `physics: ChannelWriter<PhysicsCommands>`. A command recorded after the step is
+    then a build error in every build, as an event read before its emitter is. Rules out a
+    channel write through `Commands` from any stage, a public `World::take_channel`, and a
+    trusted declaration on either side (`channels = [C]` on the writer, `takes = [C]` on the
+    taker), which an undeclared call would compile past.
+  - *The closing sync point checks nothing.* It clears every channel after the closing
+    apply: a taker's channel is empty by construction, since the take is a fetch, and a
+    channel with readers alone holds what its readers saw. The per-run set of taken
+    channel types, the plan's taker set, the `warn`, the debug assertion and the subprocess
+    abort test of the earlier rounds go. The input sync point's debug assertion that every
+    channel is empty is the one runtime check.
+  - *`PhysicsCommands` is an ordinary channel.* The sync takes it alone; `SyncState` loses
+    `pending_commands` and `PhysicsSnapshot` carries the structural-log entries and changed
+    keys only. A world reloaded in place, in one frame or two, and a fresh process loading
+    the same rows take the same commands at every tick, which with D124's fresh solver is
+    what section 15.5's first test needs, and its fourth test is no longer broken by a lost
+    command, since nothing is in flight at the save; its remaining difference with contacts
+    is the solver's warm state, D124's tolerance, so the test is not hash equality with
+    Rapier. No test records after the step, since no schedule can, so every test runs in
+    debug and CI changes nothing.
+  - *A reaction to the step that acts next tick is a row holding the decision, never a
+    solver number, relayed by an event.* A kernel reads its own row only, a game runs no
+    exclusive system in the prediction world (D121), and a prediction-world kernel runs on
+    claimed rows alone, so the shape is section 6.1's `sword_hit` and `apply_damage` one
+    tick later, with the command recorded by a claimed row: a post-stage kernel writes a
+    persistent component of its own row in integer or discrete form (a kind, a count, an
+    `armed` flag through `Mut`; the other body's key in an `EntityRef` field through
+    `Commands::set`, since the schedule refuses `Mut` on a reference-bearing component); a
+    simulation-stage kernel of the next tick emits an event keyed by each body it acts on,
+    carrying its own row's values, and clears the component; that body's simulation kernel,
+    ordered after the emitter, computes the command from its own row and records it through
+    its writer, in this tick's channel, at the step a post-stage command reached. The
+    carrier components are `replicated` when those kernels run in the prediction world
+    (D121's check) and so compared by bytes, which a stored contact normal would fail on
+    every reaction (D124). The delayed explosion is the model: armed by the `Impact`, the
+    overlap query's keys relayed with the bomb's position, each body's direction from its
+    own row. A teleport decided after the step is a carrier too, the portal's key, recorded
+    by the teleported body's own kernel from an exit pose in a world resource a setup
+    function fills from the level's cooked data, keyed by each portal's cooked `NetId` and
+    constant for the session, or in a fixed destination of its own row (a portal spawned or
+    moved at runtime is outside the recipe, its teleport a correction on the client), never
+    by the exit's kernel, which runs on the server alone: a `Transform` write places a
+    dynamic or fixed body and sweeps a kinematic one through what lies between (s2: a
+    kinematic cube's `Commands::set` threw a touching crate 18 m; the `Teleport` command
+    left it). A command an unclaimed row records reaches the client as a correction. The
+    body acted on carries no column; a `Commands::set` of a carrier on another row
+    overwrites and is not the recipe. Reverses D119's "Rules out a game-side carrier
+    component for contact-driven commands", whose convenience cost the three properties
+    above. Rules out a predict tolerance for carrier columns. Deferred: an engine-provided
+    persistent carrier column consumed by a `physics_api` simulation-stage system, if a game
+    needs one; never a channel that survives the sync point.
+  - *The D124 lane merged first with the gap recorded; one lane follows, one branch over
+    `ecs`, `physics-api` and `physics-rapier` with a doc comment in `sim`, called out as an
+    interface amendment under section 20, in three commits that each build: the ECS
+    additions, the physics switch, the removals with the closing clear; the entry goes into
+    section 9 before D127.* The B1 fix is what `Predictor::resync` needs and an ECS surface
+    change is not a physics fix round; an ECS-only branch would leave `physics-api` on main
+    uncompilable. `ecs-macros`, `predict`, `net-api` and `input` change nothing.
+- Driven by: the D124 round-1 review's S1 (probes p2 and r3), the fix lane's analysis of
+  option (a), the planner's reading of the tree, the D126 design reviews' probes q1 to q4,
+  s1, s2, r1, r2, r3a to r3d, r4a to r4c, r5a to r5b and r6a to r6b, and the owner's
+  acceptance of option (f) with the structural check folded in
+  (`docs/proposals/untaken-commands.md`, 2026-10-18).
+- Replaced: D119's "The physics channel is not cleared at the input sync point" and its
+  "Rules out a game-side carrier component for contact-driven commands", its "the
+  channel's untaken commands" among what the physics snapshot carries, and its
+  "`cmd.physics()` carries impulses, forces and `teleport` only" as a name; §6.1's
+  `cmd.physics().apply_impulse(bomb, ..)` on a `Commands` parameter, its "physics command
+  buffer" and its "takes the commands recorded since the previous step"; §10's "the physics
+  sync's pending work" where it meant commands, and its "Command buffers are empty at
+  snapshot points by construction" without channels; the D124 addendum's "Open: commands
+  untaken at the save survive a one-frame reload (S1)"; `crates/ecs/README.md`'s
+  non-clearing channel and `World::channel` sentences, its "every buffer empty" without
+  channels, its "events, channels and input ticks cleared", its surface row without the
+  writer and take parameters and its rejects list without `ChannelTake`;
+  `crates/ecs/SAFETY.md`'s access-table paragraph without the channel parameters;
+  `crates/physics-api/README.md`'s "Commands" bullets, its `cmd.physics()` rows, "from any
+  stage", "applied by the next tick's step", "grows the channel without bound", the
+  `Commands` test row and the lane's "until S1 is decided"; `crates/sim/README.md`'s "with
+  the untaken `PhysicsCommands`" and "clears events, channels and input ticks".
+- Addendum (implementation, 2026-10-18): implemented in three commits (the ECS parameters and
+  placement check; the physics-api writer and take; the closing clear and the removals) and one
+  fix round. Two README sentences the proposal did not list were corrected because the closing
+  clear made them false: `crates/ecs/README.md`'s `run_pass` sentence and
+  `crates/sim/README.md`'s `run_passes` parenthesis, both now "nothing is zeroed and no event
+  is cleared at its first sync point, and its closing sync point clears every channel, as every
+  run's does". The first form built a channel sink per parameter on every invocation, which
+  cost every per-entity system 30 to 40 % per row (review round 1); an invocation now allocates
+  event, presentation-event and channel sinks only when its table has a parameter of that kind.
+  Per-entity dispatch of a system with none (100k rows, release, best of 7x5 ticks, three
+  interleaved rounds on an M1, load about 7 to 8): 120.9 to 121.2 ns and 6 allocations per row
+  before D126, 164.4 to 164.8 ns and 8 with the first form, 69.2 to 69.7 ns and 2 after the
+  fix; review round 2 reproduced 69.7 to 73.3 against 122.8 to 127.6. No test guards the
+  allocation count, since counting needs an allocator hook, which is unsafe code section 21
+  does not allow in `lactose-ecs`.
 
 **D127. Heavy local commands take one of a few machine-wide slots: `cargo xtask heavy`** (§20, `tools/xtask`)
 - Why: concurrent agent worktrees each build in their own target directory, so nothing bounded

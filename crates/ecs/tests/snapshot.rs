@@ -44,6 +44,8 @@ fn schedule() -> Schedule {
         .add(&ANIMATE)
         .add(&CHIRP)
         .add(&RECORD_CHANGED);
+    // The bomb's impulse needs a consumer in a later stage (D126).
+    builder.stage("physics", &[]).add(&PHYSICS);
     builder.build().unwrap()
 }
 

@@ -6,9 +6,10 @@
 //! which writes what moved into the rows. The module is private: [`register_systems`]
 //! places all three, and a consumer orders itself against them through [`sets`] alone.
 
-use lactose_ecs::{EventWriter, Job, Res, ResMut, World, system};
+use lactose_ecs::{ChannelTake, EventWriter, Job, Res, ResMut, World, system};
 use lactose_sim::{Registration, Stage, TickDelta};
 
+use crate::command::PhysicsCommands;
 use crate::components::{BodyHandle, JointHandle, Teleported, Transform, Velocity};
 use crate::event::{ContactEvent, TriggerEvent};
 use crate::service::Physics;
@@ -64,9 +65,9 @@ pub fn register_systems(registration: &mut Registration) {
 /// carried bookkeeping); the union of the pending keys and the rows of `RigidBody`,
 /// `Collider`, `Transform`, `Velocity` and `Joint` changed since the mark, in ascending key
 /// order, skipping a `Transform` or `Velocity` equal to what the last write-back wrote;
-/// the waiting joints; then `World::take_channel::<PhysicsCommands>()` appended after the
-/// pending commands. The handles of what was created are written into the rows, and a
-/// fresh cursor and mark are taken.
+/// the waiting joints; then the entries of `commands`, the channel the run took before the
+/// sync. The handles of what was created are written
+/// into the rows, and a fresh cursor and mark are taken.
 #[system(
     name = "physics_api::sync",
     worlds = [server, prediction],
@@ -74,8 +75,12 @@ pub fn register_systems(registration: &mut Registration) {
     in_set = sets::SYNC,
     writes = [BodyHandle, JointHandle]
 )]
-pub(crate) fn sync_bodies(world: &mut World, physics: ResMut<Physics>) {
-    physics.sync(world);
+pub(crate) fn sync_bodies(
+    world: &mut World,
+    physics: ResMut<Physics>,
+    commands: ChannelTake<PhysicsCommands>,
+) {
+    physics.sync(world, commands);
 }
 
 /// The step: hands the backend the commands the sync took and the delta inside

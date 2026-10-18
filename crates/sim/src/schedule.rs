@@ -59,9 +59,11 @@ impl Stage {
 
 /// The passes [`Simulation::run_passes`](crate::Simulation::run_passes) runs between ticks,
 /// in this order. Each is a [`Schedule`] of one stage, named by [`name`](Self::name), run
-/// with [`Schedule::run_pass`]: the tick does not advance and nothing is cleared, and its
-/// systems are exclusive ones that take [`Job`](lactose_ecs::Job) and fork over the world's
-/// columns. A pass to which no system of the world's kind was added is skipped.
+/// with [`Schedule::run_pass`]: the tick does not advance, nothing is zeroed and no event is
+/// cleared at its first sync point, and its closing sync point clears every channel, as
+/// every run's does; its systems are exclusive ones that take [`Job`](lactose_ecs::Job)
+/// and fork over the world's columns. A pass to which no system of the world's kind was
+/// added is skipped.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub enum Pass {
     /// Extract (architecture section 5.3): `presentation` copies dirty rows into the staging

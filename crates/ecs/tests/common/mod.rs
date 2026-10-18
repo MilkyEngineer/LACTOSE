@@ -8,10 +8,10 @@ use std::sync::Arc;
 
 use lactose_core::{EntityRef, PlainArray, PlayerId, StableKey, Tick};
 use lactose_ecs::{
-    Channel, ChunkOrder, ClaimedBy, CommandChannel, Commands, Ctx, Event, EventWriter, Events,
-    InRegion, LayoutConfig, Mut, OwnedBy, PredictedOrigin, PresentEvent, PresentEvents,
-    PresentKind, RegionConfig, RegionId, RegionMode, Res, ResMut, Schedule, StableKeyOf, SystemSet,
-    World, WorldBuilder, WorldKind, finalize, system,
+    Channel, ChannelWriter, ChunkOrder, ClaimedBy, CommandChannel, Commands, Ctx, Event,
+    EventWriter, Events, InRegion, LayoutConfig, Mut, OwnedBy, PredictedOrigin, PresentEvent,
+    PresentEvents, PresentKind, RegionConfig, RegionId, RegionMode, Res, ResMut, Schedule,
+    StableKeyOf, SystemSet, World, WorldBuilder, WorldKind, finalize, system,
 };
 use lactose_math::{ExactSum, Scalar, Vec2};
 use lactose_reflect::{Padding, Registry, component, resource, value};
@@ -221,14 +221,14 @@ impl CommandChannel for Physics {
     }
 }
 
-/// What `lactose-physics-api` adds to `Commands`.
+/// What `lactose-physics-api` adds to the writer of its channel.
 pub trait PhysicsCommands {
     fn apply_impulse(&mut self, body: StableKey, impulse: Vec2);
 }
 
-impl PhysicsCommands for Commands<'_> {
+impl PhysicsCommands for ChannelWriter<'_, Physics> {
     fn apply_impulse(&mut self, body: StableKey, impulse: Vec2) {
-        self.channel::<Physics>().push(Impulse { body, impulse });
+        self.push(Impulse { body, impulse });
     }
 }
 
@@ -267,13 +267,20 @@ pub fn store_total(sum: Scalar, out: ResMut<TotalMass>) {
 
 /// Spawn that references the spawned entity in the same command buffer.
 #[system(name = "game_sim::throw_bomb", worlds = [server, prediction])]
-pub fn throw_bomb(ctx: Ctx, cmd: Commands, key: StableKeyOf, held: &HeldItem, input: &PlayerInput) {
+pub fn throw_bomb(
+    ctx: Ctx,
+    cmd: Commands,
+    physics: ChannelWriter<Physics>,
+    key: StableKeyOf,
+    held: &HeldItem,
+    input: &PlayerInput,
+) {
     if input.throw && held.kind == ItemKind::Bomb {
         let bomb = cmd.spawn((Position { x: Scalar::ZERO, y: Scalar::ZERO }, Bomb { fuse: 180 }));
         cmd.set(*key, HeldItem { kind: ItemKind::None });
         cmd.set(bomb, ThrownBy { thrower: EntityRef::new(*key) });
         let spread = ctx.rng(bomb).next_scalar();
-        cmd.apply_impulse(bomb, Vec2::new(input.aim.x * spread, input.aim.y * spread));
+        physics.apply_impulse(bomb, Vec2::new(input.aim.x * spread, input.aim.y * spread));
     }
 }
 

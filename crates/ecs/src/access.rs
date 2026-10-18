@@ -65,6 +65,17 @@ pub enum AccessKind {
     EmitEvents,
     /// Records commands for the next sync point: [`Commands`](crate::Commands).
     Commands,
+    /// Writes entries to a channel at the next sync point:
+    /// [`ChannelWriter`](crate::ChannelWriter). It conflicts with nothing, since its entries
+    /// reach the channel at a sync point as commands do; the schedule places it before every
+    /// taker of the channel and requires a consumer in a later stage.
+    WriteChannel,
+    /// Takes a channel's entries, removing them from the world:
+    /// [`ChannelTake`](crate::ChannelTake), in an exclusive system alone. It conflicts with
+    /// nothing of its own, since an exclusive system conflicts on the world with every other
+    /// exclusive system of its stage and runs before every other system there; the schedule
+    /// places every writer, reader and other taker of the channel before it.
+    TakeChannel,
     /// Emits presentation events: [`PresentEvents`](crate::PresentEvents).
     PresentEvents,
     /// The entity's origin key: [`StableKeyOf`](crate::StableKeyOf). Only in a system with

@@ -13,7 +13,7 @@ use lactose_math::{Scalar, Vec3};
 use lactose_sim::TypeTable;
 
 use crate::backend::{PhysicsBackend, StepOutput};
-use crate::command::{PhysicsCommand, PhysicsCommands};
+use crate::command::PhysicsCommand;
 use crate::components::{
     BodyHandle, Collider, Joint, JointHandle, RigidBody, Shape, Teleported, Transform, Velocity,
 };
@@ -98,9 +98,6 @@ pub(crate) struct SyncState {
     /// those a snapshot found changed since the mark across the five columns, and those
     /// [`corrected`] names, all five.
     pub(crate) pending_keys: BTreeMap<StableKey, Changes>,
-    /// Commands the next sync hands the step before what it takes from the channel: those
-    /// a snapshot found in the channel, not yet taken.
-    pub(crate) pending_commands: Vec<PhysicsCommand>,
     /// Whether the next sync diffs every row against `bodies` and `joints` instead of
     /// reading the log: set by a sync that emptied the solver, so the next one creates in
     /// key order as a fresh process's first sync does, and in a snapshot taken while the
@@ -127,9 +124,11 @@ impl SyncState {
 /// `Stage::Simulation` reads the previous step's state, in `Stage::Post` this tick's, and
 /// in `Stage::Physics` it must be ordered after [`sets::STEP`](crate::sets::STEP) or the
 /// schedule fails to build. Kernels on every worker read it at once, so it is `Sync` and
-/// its queries take `&self`. A world whose systems record `cmd.physics()` and that holds
-/// no `Physics` grows the channel without bound, since nothing takes it: `app` and tests
-/// insert one or record nothing.
+/// its queries take `&self`. A world that runs a system with a
+/// `ChannelWriter<PhysicsCommands>` and neither the sync nor a later-stage reader of the
+/// channel fails to build its schedule (`ScheduleError::ChannelWithoutConsumer`), and one
+/// that runs the sync and holds no `Physics` fails `run_tick` before anything runs: `app`
+/// and tests insert one or record nothing.
 pub struct Physics {
     pub(crate) backend: Box<dyn PhysicsBackend>,
     pub(crate) config: PhysicsConfig,
@@ -292,12 +291,12 @@ pub fn setup(
 /// in place of the backend's shape serialisation. And this crate's bookkeeping with the
 /// sync's pending work: which rows are bodies and joints and their handles, the waiting
 /// joints, the region modes, the aliases and the unbound predicted bodies, what the last
-/// write-back wrote, the structural log entries after the sync's cursor in order, the keys
-/// changed since its mark across the five columns, and the channel's entries not yet taken
-/// (`World::channel`), so that after [`restore`] a re-simulated tick's sync makes exactly
-/// the backend calls the first run's did, apart from the calls [`corrected`] adds. The size
-/// is what milestone 1 measures against the prediction-world budget, for the claimed bodies
-/// plus the statics, which decides how many statics a prediction world may hold.
+/// write-back wrote, the structural log entries after the sync's cursor in order and the
+/// keys changed since its mark across the five columns, so that after [`restore`] a
+/// re-simulated tick's sync makes exactly the backend calls the first run's did, apart
+/// from the calls [`corrected`] adds. The size is what milestone 1 measures against the
+/// prediction-world budget, for the claimed bodies plus the statics, which decides how
+/// many statics a prediction world may hold.
 pub struct PhysicsSnapshot {
     identity: Arc<()>,
     tick: Tick,
@@ -330,8 +329,8 @@ impl PhysicsSnapshot {
 
 /// Copies the physics world of `world`'s [`Physics`] resource, between ticks, at the point
 /// `World::snapshot` is taken: the backend's bytes, and this crate's bookkeeping with what
-/// the next sync would see (the log since its cursor, the keys changed since its mark, the
-/// channel's untaken entries; or that a full diff is due, with the log the world retains
+/// the next sync would see (the log since its cursor and the keys changed since its mark;
+/// or that a full diff is due, with the log the world retains
 /// since the sync's last pass for its reload test, when the cursor or mark is stale).
 /// Fails with `NotFound` if the world holds no [`Physics`], or as the backend's
 /// [`snapshot`](PhysicsBackend::snapshot) does.
@@ -364,8 +363,6 @@ pub fn snapshot(world: &World) -> Result<PhysicsSnapshot> {
             }
         }
     }
-    sync.pending_commands
-        .extend(world.channel::<PhysicsCommands>().iter().map(|entry| entry.entry));
     Ok(PhysicsSnapshot { identity: Arc::clone(&physics.identity), tick: world.tick(), bytes, sync })
 }
 
@@ -377,8 +374,8 @@ pub fn snapshot(world: &World) -> Result<PhysicsSnapshot> {
 /// `set_collider` and no fixed collider is reconciled. Then the carried bookkeeping and
 /// pending work replace this crate's, and a fresh cursor and mark are taken from the
 /// restored world. The next sync processes the pending log entries before the log since
-/// the restore, the union of the pending keys and the newly changed keys in key order, and
-/// the pending commands before what it takes.
+/// the restore and the union of the pending keys and the newly changed keys in key order.
+/// No command is carried: the physics channel is empty between runs (D126).
 ///
 /// Fails with `NotFound` if the world holds no [`Physics`], with `InvalidData` if the
 /// snapshot is from another resource or the world's tick differs (restore the world
