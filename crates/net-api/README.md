@@ -199,6 +199,21 @@ which `build`'s `derived` check does not see.
   moving into a region the client does not have leaves the client's set with a tombstone,
   and one moving into a relevant region from one the client does not have arrives as a
   spawn.
+- A frame names an entity in a region only if that region is relevant to the client as of
+  that frame, at the latest by its own region changes; the client loads a frame's region
+  changes in the step that pops it. The packer names no entity of a region until the
+  reliable channel has delivered the region's `RegionRelevance`, and the receiver puts
+  each region change into the first frame it stages at or after the change's tick
+  (`crates/net-host/README.md`, "Interest and the packer" and "Handles and packets").
+- A region leaving a client's set is sent as `Irrelevant` beside a tombstone, at the tick
+  it leaves, for every entity of the client's set residing in it (D121, the decision on
+  region leave). Of the two ways to stop an entity moved into a region made relevant and
+  irrelevant again in one step from staying where it was in both client worlds until a
+  full frame (review round 4 of `lactose-predict`, N1), `lactose-net-host`'s packer sends
+  the tombstones, and the fold is unchanged: the step that folds a region's `Relevant` and
+  then `Irrelevant` into no load still applies the tombstone, which takes the entity out.
+  The tombstones also release the entities' handles and interpolation slots on both ends,
+  which nothing else does.
 - `removed` comes from the gather's `Removed` entries of replicated components: a status
   effect ending, a body removed. Without it the client and the prediction world keep the
   component's last value forever and the packer resends it on every whole send; with it
@@ -209,6 +224,10 @@ which `build`'s `derived` check does not see.
   the network thread dequantises the wire position and adds the region origin before
   staging, so the hook writes one shape of bytes whatever the precision, and the
   prediction world's proxies and the replicated rows hold the same values.
+- A delta frame that holds an exact row of an entity holds every replicated component the
+  server's entity has at the frame's tick: the packer sends a claimed entity whole in
+  every packet that carries it and the receiver stages a packet whole or not at all, and
+  `lactose-predict` removes from a claimed entity what such a frame does not name.
 - `StagedSpawn::slot` is `None` for an entity the receiving player has claimed, which the
   prediction world presents; `Some` for every other entity, which the network thread
   allocated from its interpolation writer before staging the spawn, and whose states it
@@ -324,9 +343,9 @@ which `build`'s `derived` check does not see.
   `mode: RegionMode::Replicated`. The sim's load path then validates everything before
   `create_region`, as it does a save. The region's entities then arrive as spawns, which
   the hook applies as upserts over the rows the bundle loaded.
-- A `RegionChange::Irrelevant` becomes `TickInput::unloaded`; the region's entities need
-  no tombstones, since the unload despawns them, and the network thread releases their
-  slots and handles. `RegionChange::Assets(table)` is a table published or replaced after
+- A `RegionChange::Irrelevant` becomes `TickInput::unloaded`, which despawns the region's
+  entities; the tombstones sent beside it ("The staged frame") release their slots and
+  handles. `RegionChange::Assets(table)` is a table published or replaced after
   relevance (a hot reload, section 9.3), pinned by `app` into `TickInput::assets`.
 
 **Lag compensation** (architecture section 9.5)
