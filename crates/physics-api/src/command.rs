@@ -20,8 +20,6 @@ pub struct PhysicsCommands;
 impl CommandChannel for PhysicsCommands {
     type Entry = PhysicsCommand;
 
-    const CLEAR_AT_INPUT: bool = false;
-
     fn remap(entry: &mut PhysicsCommand, f: &mut dyn FnMut(&mut StableKey)) {
         f(entry.body_mut());
     }

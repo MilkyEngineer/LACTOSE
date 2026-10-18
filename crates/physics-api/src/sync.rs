@@ -740,18 +740,15 @@ impl Pass<'_> {
         });
     }
 
-    /// This tick's command list: the commands a restore carried, then the taken channel's,
-    /// in command order, each naming its body by origin key; a command naming no body is
-    /// dropped.
+    /// This tick's command list: the taken channel's entries in command order, each naming
+    /// its body by origin key; a command naming no body is dropped.
     fn take_commands(
         &mut self,
         taken: ChannelTake<PhysicsCommands>,
         commands: &mut Vec<PhysicsCommand>,
     ) {
         commands.clear();
-        let mut list = mem::take(&mut self.sync.pending_commands);
-        list.extend(taken.into_entries().into_iter().map(|entry| entry.entry));
-        for mut command in list {
+        for mut command in taken.into_entries().into_iter().map(|entry| entry.entry) {
             let key = command.body();
             let origin = match key {
                 StableKey::Placeholder(_) => None,

@@ -96,11 +96,12 @@ impl ScheduleBuilder {
     /// Declares the next stage, named for tracing, holding `sets`. A sync point precedes
     /// every stage: the command buffers of the previous stage apply there, then the stage's
     /// exclusive systems run in their order, then its other systems; a closing sync point
-    /// after the last stage applies its buffers and runs no systems, so a run has one more
-    /// sync point than stages and ends with every buffer empty. In a tick the first stage's
-    /// sync point is the input sync point, where transient columns are zeroed, events,
-    /// channels and input ticks are cleared, and inputs, staged network state and asset
-    /// version tables are applied by the exclusive systems placed there.
+    /// after the last stage applies its buffers, clears every channel and runs no systems,
+    /// so a run has one more sync point than stages and ends with every buffer and channel
+    /// empty. In a tick the first stage's sync point is the input sync point, where
+    /// transient columns are zeroed, events and input ticks are cleared, and inputs, staged
+    /// network state and asset version tables are applied by the exclusive systems placed
+    /// there.
     pub fn stage(&mut self, name: &'static str, sets: &[&'static SystemSet]) -> &mut Self {
         self.stages.push(StageSpec { name, sets: sets.to_vec(), systems: Vec::new() });
         self
@@ -979,9 +980,10 @@ impl Schedule {
 
     /// Runs the stages as a pass between ticks: like [`run_tick`](Self::run_tick) but the
     /// tick does not advance and the first sync point is an ordinary one, so nothing is
-    /// zeroed or cleared. Extract (architecture section 5.3), the replication gather (9.3)
-    /// and the save copy (15.3) are schedules of exclusive systems that take [`Job`](crate::Job)
-    /// and fork over the world's columns, run this way.
+    /// zeroed and no event is cleared at the first sync point; the closing sync point
+    /// clears every channel, as every run's does. Extract (architecture section 5.3), the
+    /// replication gather (9.3) and the save copy (15.3) are schedules of exclusive systems
+    /// that take [`Job`](crate::Job) and fork over the world's columns, run this way.
     #[allow(clippy::manual_async_fn, reason = "the `Send` bound is the contract")]
     pub fn run_pass<'a>(
         &'a mut self,

@@ -40,9 +40,6 @@ fn the_example_systems_run_on_the_server() {
     assert_eq!(world.get::<ThrownBy>(bomb).unwrap().thrower, EntityRef::new(player));
     assert_eq!(world.referrers(player).map(|r| r.source).collect::<Vec<_>>(), [bomb]);
     assert_eq!(world.get::<HeldItem>(player).unwrap().kind, ItemKind::None);
-    let impulses = world.take_channel::<Physics>();
-    assert_eq!(impulses.len(), 1);
-    assert_eq!((impulses[0].source, impulses[0].entry.body), (Some(player), bomb));
     assert_eq!(world.resource::<ImpulseCount>().unwrap().0, 1, "the physics stage read it");
 
     assert_eq!(world.get::<Health>(npc), Some(&Health(90)));

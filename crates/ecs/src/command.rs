@@ -154,12 +154,9 @@ pub(crate) type AppendFn = fn(
     &mut dyn FnMut(&mut StableKey),
 );
 
-/// One channel's applied entries: a `Vec<ChannelEntry<C>>`, with what the channel declared
-/// about clearing, since the type is erased here.
+/// One channel's applied entries: a `Vec<ChannelEntry<C>>`, the type erased here.
 pub(crate) struct StoredChannel {
     pub(crate) entries: Box<dyn Any + Send + Sync>,
-    /// [`CommandChannel::CLEAR_AT_INPUT`] of the channel.
-    pub(crate) clear_at_input: bool,
 }
 
 /// Every channel's applied entries, per channel type.
@@ -176,7 +173,6 @@ fn append_entry<C: CommandChannel>(
     store
         .get_or_insert_with(TypeId::of::<C>(), || StoredChannel {
             entries: Box::new(Vec::<ChannelEntry<C>>::new()),
-            clear_at_input: C::CLEAR_AT_INPUT,
         })
         .entries
         .downcast_mut::<Vec<ChannelEntry<C>>>()
@@ -191,21 +187,17 @@ pub(crate) struct CommandBuffer {
     pub(crate) spawns: u32,
     /// The region a plain `spawn` goes to: the entity's or the per-region invocation's.
     pub(crate) region: Option<RegionId>,
-    /// The sink of every writer [`Commands::channel`] lends, appended after `commands` with
-    /// the parameter sinks. Transitional: it goes with `Commands::channel`.
-    pub(crate) channel_tail: Vec<ChannelCommand>,
 }
 
 impl CommandBuffer {
     pub(crate) fn new(region: Option<RegionId>) -> Self {
-        Self { commands: Vec::new(), spawns: 0, region, channel_tail: Vec::new() }
+        Self { commands: Vec::new(), spawns: 0, region }
     }
 
-    /// Appends the channel entries of the invocation after its commands: the tail, then
-    /// `sinks` in parameter order.
+    /// Appends the channel entries of the invocation's [`ChannelWriter`] sinks after its
+    /// commands, in parameter order.
     pub(crate) fn close_channels(&mut self, sinks: &mut [Vec<ChannelCommand>]) {
-        let tail = core::mem::take(&mut self.channel_tail);
-        let entries = tail.into_iter().chain(sinks.iter_mut().flat_map(core::mem::take));
+        let entries = sinks.iter_mut().flat_map(core::mem::take);
         self.commands.extend(entries.map(Command::Channel));
     }
 
@@ -301,14 +293,6 @@ impl Commands<'_> {
     pub fn move_to_region(&mut self, key: StableKey, region: RegionId) {
         self.buffer.commands.push(Command::Move(key, region));
     }
-
-    /// The writer for channel `C`, for another crate's commands. Its entries append after
-    /// every command of the invocation, before those of its [`ChannelWriter`] parameters.
-    /// The schedule does not see this writer; a system takes a [`ChannelWriter`] parameter
-    /// instead.
-    pub fn channel<C: CommandChannel>(&mut self) -> ChannelWriter<'_, C> {
-        ChannelWriter { sink: &mut self.buffer.channel_tail, _channel: PhantomData }
-    }
 }
 
 impl sealed::Sealed for Commands<'_> {}
@@ -329,25 +313,16 @@ impl<'r, 'j> Fetch<'r, 'j> for Commands<'r> {
 /// A typed command channel another crate declares: a marker type naming its entry type and
 /// how to rewrite the keys an entry holds.
 ///
-/// Entries written through [`Commands::channel`] in one stage are readable through
-/// [`Channel`] in every later stage of the same tick, and through
-/// [`World::take_channel`](crate::World::take_channel) at a sync point, in command order,
-/// with every placeholder resolved whose spawn applied; one whose spawn was dropped stays a
-/// placeholder, which names nothing. The input sync point clears every channel whose
-/// [`CLEAR_AT_INPUT`](Self::CLEAR_AT_INPUT) is true; the entries of one that opts out stay
-/// until taken, so entries written in the last stage of a tick are readable in the next
-/// tick's stages, and [`World::channel`](crate::World::channel) reads them between ticks.
+/// Entries written through a [`ChannelWriter<C>`] parameter in one stage apply at the
+/// sync point that ends it, in command order, with every placeholder resolved whose spawn
+/// applied; one whose spawn was dropped stays a placeholder, which names nothing. They are
+/// readable through [`Channel<C>`] in every later stage of the same run and taken through a
+/// [`ChannelTake<C>`] parameter of an exclusive system of a later stage. The closing sync
+/// point of every run clears every channel after it applies the last stage's commands, so
+/// no channel holds an entry between runs, where a snapshot point is (D126).
 pub trait CommandChannel: 'static {
     /// One command.
     type Entry: Send + Sync + 'static;
-
-    /// Whether the input sync point clears the channel. `false` for a channel whose consumer
-    /// takes it at a sync point of its own (`lactose-physics-api`'s, taken at the physics
-    /// sync point, so a command recorded after the step applies next tick): its entries
-    /// accumulate until [`World::take_channel`](crate::World::take_channel), are not in a
-    /// [`WorldSnapshot`](crate::WorldSnapshot), and are dropped by a restore, so the consumer
-    /// snapshots what it has not taken.
-    const CLEAR_AT_INPUT: bool = true;
 
     /// Calls `f` on every entity key the entry holds, so the world can resolve placeholders
     /// at apply. An entry that holds a key and does not report it keeps a placeholder, which
@@ -423,7 +398,10 @@ where
     }
 }
 
-/// The entries of channel `C` written in earlier stages of this tick, read by a system.
+/// The entries of channel `C` written in earlier stages of this run, read by a system. The
+/// schedule refuses a reader placed after a [`ChannelTake<C>`] of the channel, which would
+/// find it empty
+/// ([`ScheduleError::ChannelAfterTaker`](crate::ScheduleError::ChannelAfterTaker)).
 pub struct Channel<'w, C: CommandChannel> {
     entries: &'w [ChannelEntry<C>],
 }

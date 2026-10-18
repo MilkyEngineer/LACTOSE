@@ -1,20 +1,23 @@
 //! Events and channels: a reader ordered after the emitters sees every event in (emitting
 //! system, source, sequence) order; events clear at the next input sync point; channel
-//! entries reach later stages' readers and takers with their keys resolved.
+//! entries reach later stages' readers and takers with their keys resolved, and the closing
+//! sync point of every run clears every channel (D126), so a reaction after the physics
+//! stage reaches the next tick's through a carrier row.
 
 #![forbid(unsafe_code)]
 
 mod common;
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use common::*;
-use lactose_core::StableKey;
+use lactose_core::{EntityRef, StableKey};
 use lactose_ecs::{
-    Channel, ChannelTake, ChannelWriter, CommandChannel, Commands, Ctx, EventWriter, Events,
-    LayoutConfig, Res, Schedule, ScheduleError, StableKeyOf, World, WorldKind, system,
+    Channel, ChannelTake, ChannelWriter, ClaimedBy, Commands, Ctx, Event, EventWriter, Events,
+    LayoutConfig, Mut, Res, Schedule, ScheduleError, StableKeyOf, World, WorldKind, system,
 };
 use lactose_math::{Scalar, Vec2};
+use lactose_reflect::component;
 
 /// What the readers saw, in order. A service resource, so the test can read it back.
 type Seen = Mutex<Vec<(StableKey, i32)>>;
@@ -135,7 +138,7 @@ fn count_impulses(impulses: Channel<Physics>, seen: Res<Seen>) {
 }
 
 #[test]
-fn channel_entries_reach_later_stages_with_keys_resolved_and_clear_at_the_input_sync() {
+fn channel_entries_reach_later_stages_with_keys_resolved_and_do_not_outlive_the_tick() {
     let executor = executor();
     let mut world = world(WorldKind::Server, LayoutConfig::default());
     world.spawn(net(5), REGION, (Counter(0),)).unwrap();
@@ -150,7 +153,7 @@ fn channel_entries_reach_later_stages_with_keys_resolved_and_clear_at_the_input_
     // The writing stage saw nothing; the next stage saw the entry with its key resolved.
     assert_eq!(seen, [(net(1), 1)]);
     world = tick(&mut schedule, world, &executor);
-    assert!(world.take_channel::<Physics>().is_empty(), "the input sync point cleared it");
+    assert!(take_seen(&mut world).is_empty(), "tick 2 wrote nothing and tick 1's entry is gone");
 }
 
 #[system(name = "test::read_impulses_later", worlds = [server])]
@@ -161,93 +164,157 @@ fn read_impulses_later(impulses: Channel<Physics>, seen: Res<Seen>) {
     }
 }
 
-/// A channel that is not cleared at the input sync point: `lactose-physics-api`'s, whose
-/// consumer takes it at the physics sync point, so a command recorded after the step
-/// applies next tick.
-pub struct Deferred;
-
-impl CommandChannel for Deferred {
-    type Entry = Impulse;
-
-    const CLEAR_AT_INPUT: bool = false;
-
-    fn remap(entry: &mut Impulse, f: &mut dyn FnMut(&mut StableKey)) {
-        f(&mut entry.body);
-    }
-}
-
-/// Writes one entry to each channel in the last stage of tick 1.
-#[system(name = "test::push_late", worlds = [server])]
-fn push_late(ctx: Ctx, cmd: Commands, _counter: &Counter) {
+/// Writes one entry per row at tick 1 alone.
+#[system(name = "test::push_at_one", worlds = [server])]
+fn push_at_one(ctx: Ctx, key: StableKeyOf, physics: ChannelWriter<Physics>, _counter: &Counter) {
     if ctx.tick().0 == 1 {
-        cmd.channel::<Deferred>().push(Impulse { body: net(5), impulse: Vec2::ZERO });
-        cmd.channel::<Physics>().apply_impulse(net(5), Vec2::ZERO);
+        physics.apply_impulse(*key, Vec2::ZERO);
     }
 }
 
-/// Reads both channels in the first stage: 1 for the deferred one, 2 for the clearing one.
-#[system(name = "test::read_both_early", worlds = [server])]
-fn read_both_early(deferred: Channel<Deferred>, cleared: Channel<Physics>, seen: Res<Seen>) {
+/// A reader at or before the writer's stage: whatever it sees outlived a run.
+#[system(name = "test::observe_early", worlds = [server])]
+fn observe_early(impulses: Channel<Physics>, seen: Res<Seen>) {
     let mut seen = seen.lock().unwrap();
-    for entry in deferred.iter() {
-        seen.push((entry.entry.body, 1));
-    }
-    for entry in cleared.iter() {
-        seen.push((entry.entry.body, 2));
+    for impulse in impulses.iter() {
+        seen.push((impulse.entry.body, 10));
     }
 }
 
-fn late_writer_schedule() -> Schedule {
+fn take_seen(world: &mut World) -> Vec<(StableKey, i32)> {
+    std::mem::take(&mut *world.service_mut::<Seen>().unwrap().get_mut().unwrap())
+}
+
+#[test]
+fn the_closing_sync_point_of_every_run_clears_every_channel() {
+    let executor = executor();
+    let mut world = world(WorldKind::Server, LayoutConfig::default());
+    world.spawn(net(5), REGION, (Counter(0),)).unwrap();
+    world.insert_service::<Seen>(Box::new(Mutex::new(Vec::new())));
     let mut builder = Schedule::builder(WorldKind::Server);
-    builder.stage("read", &[]).add(&READ_BOTH_EARLY);
-    builder.stage("write", &[]).add(&PUSH_LATE);
-    builder.build().unwrap()
-}
+    builder.stage("early", &[]).add(&OBSERVE_EARLY);
+    builder.stage("write", &[]).add(&PUSH_AT_ONE).add(&COUNT_IMPULSES);
+    builder.stage("read", &[]).add(&READ_IMPULSES_LATER);
+    let mut schedule = builder.build().unwrap();
+    // A pass's first sync point clears nothing, so an entry that outlived the tick would
+    // reach this observer.
+    let mut builder = Schedule::builder(WorldKind::Server);
+    builder.stage("observe", &[]).add(&OBSERVE_EARLY);
+    let mut pass = builder.build().unwrap();
 
-#[test]
-fn a_channel_that_opts_out_of_clearing_keeps_its_entries_until_taken() {
-    let executor = executor();
-    let mut world = world(WorldKind::Server, LayoutConfig::default());
-    world.spawn(net(5), REGION, (Counter(0),)).unwrap();
-    world.insert_service::<Seen>(Box::new(Mutex::new(Vec::new())));
-    let mut schedule = late_writer_schedule();
-
-    // Tick 1 writes in the last stage, after the reader ran.
+    // The reader after the writer's stage sees the entry; the writer's stage and the one
+    // before it do not.
     world = tick(&mut schedule, world, &executor);
-    assert!(world.service_mut::<Seen>().unwrap().get_mut().unwrap().is_empty());
-    // Between ticks both channels hold the entry, readable without taking.
-    assert_eq!(world.channel::<Deferred>().len(), 1);
-    assert_eq!(world.channel::<Deferred>()[0].entry.body, net(5));
-    assert_eq!(world.channel::<Physics>().len(), 1);
+    assert_eq!(take_seen(&mut world), [(net(5), 1)]);
 
-    // Tick 2's input sync point clears the clearing channel alone.
-    world = tick(&mut schedule, world, &executor);
-    let seen = std::mem::take(&mut *world.service_mut::<Seen>().unwrap().get_mut().unwrap());
-    assert_eq!(seen, [(net(5), 1)]);
-    assert_eq!(world.channel::<Deferred>().len(), 1, "nothing took it");
-    assert!(world.channel::<Physics>().is_empty());
-}
-
-#[test]
-fn a_taken_deferred_channel_is_empty_and_a_restore_drops_it() {
-    let executor = executor();
-    let mut world = world(WorldKind::Server, LayoutConfig::default());
-    world.spawn(net(5), REGION, (Counter(0),)).unwrap();
-    world.insert_service::<Seen>(Box::new(Mutex::new(Vec::new())));
-    let mut schedule = late_writer_schedule();
-    world = tick(&mut schedule, world, &executor);
-
-    // Not in the snapshot: a restore returns to the point and drops what the channel held.
+    // Between the runs: a snapshot point.
     let snapshot = world.snapshot();
-    let taken = world.take_channel::<Deferred>();
-    assert_eq!(taken.len(), 1);
-    assert_eq!(taken[0].entry.body, net(5));
-    assert!(world.channel::<Deferred>().is_empty());
+    world = executor.block_on(pass.run_pass(world, &executor)).unwrap();
+    assert!(take_seen(&mut world).is_empty(), "the tick's closing sync point cleared it");
     world = tick(&mut schedule, world, &executor);
-    assert!(world.service_mut::<Seen>().unwrap().get_mut().unwrap().is_empty(), "taken");
+    assert!(take_seen(&mut world).is_empty(), "nothing reaches the next tick");
 
+    // The snapshot carries no channel: the restored world's next runs see nothing either.
     world.restore(&snapshot).unwrap();
-    assert!(world.channel::<Deferred>().is_empty(), "a restore drops every channel");
+    assert_eq!(world.tick().0, 1);
+    world = executor.block_on(pass.run_pass(world, &executor)).unwrap();
+    world = tick(&mut schedule, world, &executor);
+    assert!(take_seen(&mut world).is_empty(), "not in the snapshot");
+}
+
+/// A reaction carried by a row: the kind and the other body's key, persistent and
+/// replicated, so a snapshot, save and replication carry it as any other column.
+#[component(key = "test::carrier", persistent, replicated)]
+#[derive(PartialEq, Debug)]
+struct Carrier {
+    #[field(id = 1)]
+    kind: u32,
+    #[field(id = 2)]
+    other: EntityRef,
+}
+
+/// What the relay hands the other body.
+#[derive(Clone, Copy, PartialEq, Debug)]
+struct Push {
+    target: StableKey,
+    strength: u32,
+}
+
+impl Event for Push {
+    fn target(&self) -> StableKey {
+        self.target
+    }
+}
+
+/// The post-stage reaction: arms the carrier through `Commands::set` on its own row, since
+/// a carrier holding a key is not written through `Mut`.
+#[system(name = "test::react", worlds = [server, prediction])]
+fn react(key: StableKeyOf, bomb: Mut<Bomb>, cmd: Commands) {
+    if bomb.fuse == 180 {
+        bomb.fuse = 0;
+        cmd.set(*key, Carrier { kind: 7, other: EntityRef::new(net(2)) });
+    }
+}
+
+/// Next tick, before the physics stage: emits to the kept key and disarms the carrier.
+#[system(name = "test::relay", worlds = [server, prediction])]
+fn relay(key: StableKeyOf, carrier: &Carrier, push: EventWriter<Push>, cmd: Commands) {
+    if let Some(other) = carrier.other.get() {
+        push.emit(Push { target: other, strength: carrier.kind });
+        cmd.set(*key, Carrier { kind: 0, other: EntityRef::NONE });
+    }
+}
+
+/// The other body's kernel records the command on itself.
+#[system(name = "test::receive", worlds = [server, prediction], after = relay)]
+fn receive(
+    key: StableKeyOf,
+    pos: &Position,
+    pushes: Events<Push>,
+    physics: ChannelWriter<Physics>,
+) {
+    for push in pushes.for_target(*key) {
+        let strength = Scalar::from_i32(i32::try_from(push.strength).unwrap());
+        physics.apply_impulse(*key, Vec2::new(pos.x + strength, pos.y));
+    }
+}
+
+/// The carrier's row and the other body, both claimed so the prediction world runs their
+/// kernels.
+fn carrier_world(kind: WorldKind) -> World {
+    let mut registry = base_registry();
+    registry.register::<Carrier>().unwrap();
+    let mut world = world_with(kind, LayoutConfig::default(), Arc::new(registry));
+    let disarmed = Carrier { kind: 0, other: EntityRef::NONE };
+    world.spawn(net(1), REGION, (Bomb { fuse: 180 }, disarmed)).unwrap();
+    world.spawn(net(2), REGION, (Position { x: Scalar::ONE, y: Scalar::ZERO },)).unwrap();
+    for key in [net(1), net(2)] {
+        world.insert(key, ClaimedBy { player: PLAYER }).unwrap();
+    }
+    world
+}
+
+#[test]
+fn a_keyed_carrier_set_after_the_step_reaches_the_next_ticks_physics_stage() {
+    let executor = executor();
+    for kind in [WorldKind::Server, WorldKind::Prediction] {
+        let mut world = carrier_world(kind);
+        let mut builder = Schedule::builder(kind);
+        builder.stage("simulation", &[]).add(&RELAY).add(&RECEIVE);
+        builder.stage("physics", &[]).add(&PHYSICS);
+        builder.stage("post", &[]).add(&REACT);
+        let mut schedule = builder.build().unwrap();
+        let mut seen = Vec::new();
+        for _ in 0..3 {
+            world = tick(&mut schedule, world, &executor);
+            let carrier = *world.get::<Carrier>(net(1)).unwrap();
+            let count = world.resource::<ImpulseCount>().unwrap().0;
+            seen.push((count, carrier.kind, carrier.other.get()));
+        }
+        // Tick 1's post stage arms the carrier; tick 2's simulation stage relays it into
+        // that tick's channel, which tick 2's physics stage reads, and disarms it.
+        assert_eq!(seen, [(0, 7, Some(net(2))), (1, 0, None), (1, 0, None)], "{kind:?}");
+    }
 }
 
 /// A kernel whose only output is a channel entry: no command, event or presentation event.

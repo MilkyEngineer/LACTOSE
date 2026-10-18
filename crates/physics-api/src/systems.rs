@@ -66,7 +66,7 @@ pub fn register_systems(registration: &mut Registration) {
 /// `Collider`, `Transform`, `Velocity` and `Joint` changed since the mark, in ascending key
 /// order, skipping a `Transform` or `Velocity` equal to what the last write-back wrote;
 /// the waiting joints; then the entries of `commands`, the channel the run took before the
-/// sync, appended after the pending commands. The handles of what was created are written
+/// sync. The handles of what was created are written
 /// into the rows, and a fresh cursor and mark are taken.
 #[system(
     name = "physics_api::sync",

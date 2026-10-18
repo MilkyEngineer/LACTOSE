@@ -223,14 +223,23 @@ What a system is, from its parameters (`SystemParam` has the table):
   the input sync point. The schedule requires every reader of `E` to be ordered after every
   emitter of `E` (`ScheduleError::EventsBeforeEmitter`), so a reader's view never depends on
   scheduling. Events are not in a snapshot: a snapshot point is between ticks.
-- Channel entries written in stage *k* are readable through `Channel<C>` in stages after
-  *k* and through `World::take_channel` at a sync point, keys resolved; the input sync point
-  clears them, unless the channel declares `CommandChannel::CLEAR_AT_INPUT = false`, in
-  which case its entries stay until taken, so entries written in the last stage of a tick
-  are readable in the next tick's stages (`lactose-physics-api`'s channel, taken at the
-  physics sync point). `World::channel` reads a channel between ticks without taking it.
-  Channels are not in a snapshot and a restore drops what every channel holds, so the
-  consumer of a non-clearing channel snapshots what it has not taken.
+- A channel is written through a `ChannelWriter<C>` parameter, in any kind of system: its
+  entries wait in a sink of the invocation and reach the channel at the sync point that
+  ends the stage, after the invocation's commands, keys resolved. Entries written in stage
+  *k* are readable through `Channel<C>` in stages after *k* and taken through
+  `ChannelTake<C>` in an exclusive system of a later stage, whose fetch removes the store
+  before the system runs. The schedule refuses a writer of `C` in the stage of a taker of
+  `C` or a later one, since its entries would land after the take, and a `Channel<C>`
+  reader or a second taker placed after the taker (a later stage, or the taker's stage
+  unless exclusive and ordered before it), since it would find the channel empty
+  (`ScheduleError::ChannelAfterTaker`); and a writer of `C` that no later stage takes or
+  reads (`ScheduleError::ChannelWithoutConsumer`). `lactose-physics-api`'s channel is taken
+  at the physics sync point, so a writer of it is in `Stage::Input` or `Stage::Simulation`
+  and a reader of it before the sync. The closing sync point of a run clears every channel
+  after it applies the last stage's commands: a taker's channel is already empty, and a
+  channel with readers alone holds what its readers saw. Channels are therefore empty
+  between runs, where a snapshot point is, which the input sync point asserts, and are
+  not in a snapshot (D126).
 - Presentation events are keyed by (origin key, tick, kind, sequence). The world keeps the
   keys it has delivered, across `restore`, pruned below the oldest tick a restore can reach:
   a re-emission with a delivered key is not delivered again, and a delivered key whose tick
@@ -252,10 +261,11 @@ What a system is, from its parameters (`SystemParam` has the table):
 - A stage is a sync point followed by a DAG. At the sync point the previous stage's
   commands apply, then the stage's exclusive systems run in their order, then its other
   systems run as the DAG allows; a closing sync point after the last stage applies its
-  commands, so a run ends with every buffer empty and a snapshot point never has a pending
-  buffer. In a tick the first stage's sync point is the input sync point: transient columns
-  are zeroed and events, channels and input ticks cleared before its exclusive systems,
-  which is where `sim`, `net` and `asset` apply inputs, staged state and version tables.
+  commands and clears every channel, so a run ends with every buffer and channel empty and
+  a snapshot point never has a pending buffer. In a tick the first stage's sync point is
+  the input sync point: transient columns are zeroed and events and input ticks cleared
+  before its exclusive systems (every channel is already empty, which a debug assertion
+  checks), which is where `sim`, `net` and `asset` apply inputs, staged state and version tables.
   An exclusive system runs as the only live node of its run. An exclusive system ordered
   after a non-exclusive system of its own stage cannot run there and is a
   `ScheduleError::Cycle`.
@@ -295,7 +305,8 @@ What a system is, from its parameters (`SystemParam` has the table):
   an error the world is not handed back (`Schedule::prepare` checks what can fail before
   anything runs, by reference); a future dropped mid-tick drops the world when the jobs
   finish, a forgotten one leaks it. `run_pass` runs the stages between ticks without
-  advancing the tick or clearing anything, its writes stamped after every position of the
+  advancing the tick or zeroing or clearing anything at its first sync point (its closing
+  sync point clears every channel, as every run's does), its writes stamped after every position of the
   tick: extract, the replication gather and the save copy are schedules of exclusive
   systems that take `Job` and fork over `World::columns`. Children of such a fork key what
   they produce by `StableKey`; the worker index is banned by the boundary lint file.
@@ -463,7 +474,7 @@ repeat, layout and chaos modes.
 | `systems.rs` | The section 6.1 systems, `#[finalize]` included, for several ticks in a server and a prediction world; the prediction filter |
 | `commands.rs` | Apply order (execution order, source key, sequence), the same under every layout |
 | `predicted.rs` | Predicted keys equal on both machines, unshifted by a server-only spawn; collisions; binds and aliases; `PredictedOrigin` and a reference to the entity through export and load, byte for byte |
-| `events.rs` | Event order and clearing, `EventsBeforeEmitter`, channels across stages; a kernel whose only output is a channel entry; two writers in parameter order; a take that yields the earlier stages' entries once |
+| `events.rs` | Event order and clearing, `EventsBeforeEmitter`, channels across stages; a kernel whose only output is a channel entry; two writers in parameter order; a take that yields the earlier stages' entries once; the closing sync point of every run clearing every channel, seen by a pass, the next tick and a restore; a keyed carrier set after the step reaching the next tick's physics stage in a server and a prediction world |
 | `schedule_errors.rs` | Every `ScheduleError` variant, the channel placements (`ChannelAfterTaker`, `ChannelWithoutConsumer`) and the `ChannelTake` refusals among them; `run_tick` failing on `prepare` and on shutdown |
 | `channel_skip.rs` | A taker skipped for a resource removed mid-run is logged at `error`, naming the channel it did not take |
 | `change.rs` | `Mut` and `set_if_neq` stamps, fresh and stale marks, `Changed<T>` seen once per reader, `ColumnMut::write` with and without dirty rows, column ticks, the 2^30 rebase |

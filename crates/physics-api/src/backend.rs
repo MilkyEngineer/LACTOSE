@@ -43,8 +43,7 @@ pub struct StepInput<'a> {
     pub dt: Scalar,
     /// The world's gravity, from [`PhysicsConfig`](crate::PhysicsConfig).
     pub gravity: Vec3,
-    /// Every command the sync took since the previous step, in command order, keys
-    /// resolved: a plain slice, so a backend's own test steps it without a world.
+    /// Every command the sync took this tick, in command order, keys resolved: a plain slice, so a backend's own test steps it without a world.
     pub commands: &'a [PhysicsCommand],
 }
 

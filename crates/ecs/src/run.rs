@@ -152,6 +152,10 @@ fn execute(state: &mut RunState, ctx: &mut JobContext<'_>) {
     }
     let stamp = enter_slot(world, tick, &mut slot);
     world.apply(pending, stamp);
+    // No channel survives its run (D126): a taker's channel is already empty, and what a
+    // channel with readers alone or a skipped taker's holds goes here, so no snapshot
+    // point, save or pass between runs sees an entry.
+    world.channels.clear();
     world.permute_rows();
     world.end_present(emissions, !tick);
     if tick {
