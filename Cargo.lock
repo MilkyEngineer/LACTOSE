@@ -477,6 +477,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "lactose-persist"
+version = "0.0.0"
+dependencies = [
+ "bytemuck",
+ "lactose-asset-api",
+ "lactose-bundle",
+ "lactose-core",
+ "lactose-ecs",
+ "lactose-math",
+ "lactose-net-api",
+ "lactose-reflect",
+ "lactose-sim",
+]
+
+[[package]]
 name = "lactose-physics-api"
 version = "0.0.0"
 dependencies = [
