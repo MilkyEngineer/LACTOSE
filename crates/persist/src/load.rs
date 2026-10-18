@@ -41,12 +41,22 @@ impl<'a> Loader<'a> {
         self.migrations
     }
 
-    /// The same records at the registry's schemas: the overlay through
-    /// [`Migrations::migrate_overlay`] and each resource through [`Migrations::migrate`]
-    /// under the schema the save carried for it (the container keeps one per resource
-    /// type beside the records). Records whose every schema matches come back equal, the
-    /// overlay as the same `Arc`. Fails as those fail, and with `NotFound` for a resource
-    /// type the table does not know or `InvalidData` for one that is not a saved resource.
+    /// The same records at the registry's schemas, in canonical form: the overlay through
+    /// [`Migrations::migrate_overlay`] with the records' `layouts`, and each resource
+    /// through [`Migrations::migrate`] under the schema and digest the records carry for
+    /// it; `resource_schemas` and `layouts` then state the registry's. Records whose every
+    /// carried type is at the registry's version and digest come back equal, the overlay
+    /// as the same `Arc`.
+    ///
+    /// A type whose persistence changed since the save: a resource the registry now says
+    /// is transient leaves `resources` and joins `transient_resources` (its value is
+    /// dropped and the region restores it zeroed); a transient key whose type the registry
+    /// now says is persistent is `VersionMismatch`, since a value is needed and none was
+    /// saved; a component is decided by `migrate`'s rule on its bytes, zeroes loading as
+    /// the value when the type became persistent. Fails as the two migrations fail, with
+    /// `NotFound` for a resource type the table does not know, and with `InvalidData` for
+    /// records that fail [`RegionRecords::check`] or for a resource that is not a saved
+    /// resource (a derived type, or a component).
     pub fn migrate(&self, records: &RegionRecords) -> Result<RegionRecords> {
         todo!("migrate the overlay and the resources, or return the records unchanged")
     }
@@ -55,24 +65,26 @@ impl<'a> Loader<'a> {
     /// in `TickInput::loaded` for the region, for a region load, a one-frame or two-frame
     /// reload and a fresh process alike.
     ///
-    /// In order: `baseline.content_hash()` must equal `records.baseline_hash`
-    /// (`VersionMismatch` otherwise: the baseline was patched, so
-    /// [`RegionRecords::rebase`] first); the records are [migrated](Self::migrate); the
-    /// overlay, if any, passes `Overlay::check_against(baseline)`; every resource and every
-    /// component value a record carries is validated against the registry
-    /// (`TypeInfo::validate`, `InvalidData`), a transient component's bytes by presence
-    /// alone, since the loader zeroes them; a baseline column whose schema is not the
-    /// table's is `VersionMismatch` here rather than at the sync point (a baseline is
-    /// never migrated: the cooker of this build re-cooks it, and the records are rebased
-    /// onto the result). Then the bundle: `seed`, `mode`, `baseline`, the migrated overlay,
-    /// the migrated resources, the transient keys and `assets`. Nothing is loaded here;
-    /// the sync point validates again before `create_region`.
+    /// In order: `records` passes [`check`](RegionRecords::check); `baseline.content_hash()`
+    /// equals `records.baseline_hash` (`VersionMismatch` otherwise: the baseline was
+    /// patched, so [`RegionRecords::rebase`] first); the records are [migrated](Self::migrate);
+    /// the overlay, if any, passes `Overlay::check_against(baseline)`; every value a
+    /// record or a resource carries is validated against the registry
+    /// (`TypeInfo::validate`, `InvalidData`), a transient component's by presence alone,
+    /// since it is zeroed; a baseline column whose schema is not the table's is
+    /// `VersionMismatch` here rather than at the sync point (a baseline is never migrated:
+    /// the cooker of this build re-cooks it, and the records are rebased onto the result;
+    /// a baseline carries no layout digest, so a same-size layout change in a cooked column
+    /// is not seen here until `lactose-bundle` carries the digest, D129). Then the bundle:
+    /// `seed`, `mode`, `baseline`, the migrated overlay, the migrated resources, the
+    /// transient keys and `assets`. Nothing is loaded here; the sync point validates again
+    /// before `create_region`.
     ///
     /// `mode` is honoured under `RegionControl::Directed` (a client's `Replicated`, a
     /// test's choice) and ignored under `Anchored`, where the policy sets it; `assets` is
     /// the table `app` resolved and pinned for the region, or `None` if it has not, in
     /// which case the region is loaded `Frozen` until a table arrives through
-    /// `TickInput::assets`.
+    /// `TickInput::assets`. Neither is in a save (`README.md`, "Policy").
     pub fn bundle(
         &self,
         records: &RegionRecords,
@@ -80,6 +92,6 @@ impl<'a> Loader<'a> {
         mode: RegionMode,
         assets: Option<PinnedTable>,
     ) -> Result<RegionBundle> {
-        todo!("check the hash, migrate, validate, then assemble the bundle")
+        todo!("check, compare the hash, migrate, validate, then assemble the bundle")
     }
 }

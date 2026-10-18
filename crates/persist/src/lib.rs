@@ -20,13 +20,15 @@
 //! # Where to start
 //!
 //! - [`SchemaTable`] is the policy as a value: built once from a `Registry`, it says which
-//!   types a save carries, with the schema each document carries for them, and hashes to
-//!   the [`SchemaHash`] a container records.
-//! - [`diff`] is the one diff of a region's export against its baseline, shared by the
-//!   save and the relevance message; [`RegionRecords`] is a region's part of a save, the
-//!   overlay with the seed and the resources beside it.
-//! - [`Container`] holds the records of every region under a [`ContainerHeader`]; its bytes
-//!   go through `io` to the save slot and come back the same.
+//!   types a save carries, with the schema and [`LayoutDigest`] each document carries for
+//!   them, and hashes to the [`SchemaHash`] a container records.
+//! - [`diff`] is the one diff of a region's export against its baseline; [`RegionRecords`]
+//!   is a region's part of a save, the overlay with the seed, the resources and the
+//!   digests beside it, and the relevance message through
+//!   [`RegionRecords::to_relevance`].
+//! - [`Container`] holds the records of every region under a [`ContainerHeader`]; each
+//!   region is an [`EncodedSection`] made on a worker and assembled, and read back by the
+//!   index and one section at a time.
 //! - [`Migrations`] holds each crate's [`Migration`] steps; a [`Loader`] migrates a
 //!   region's records to the registry's schemas and builds the `RegionBundle` the sync
 //!   point loads.
@@ -44,14 +46,15 @@
 //! # fn main() -> lactose_core::Result<()> {
 //! # let registry = Registry::new();
 //! # let save: SavePoint = unimplemented!();
-//! // The save: one diff per region on background workers, then the container's bytes.
+//! // The save: one diff and one section per region on background workers, then assembled.
 //! let schemas = SchemaTable::from_registry(&registry)?;
-//! let mut container = Container::new(ContainerHeader::of(&save, &schemas));
+//! let header = ContainerHeader::of(&save, &schemas);
+//! let mut sections = Vec::new();
 //! for export in &save.regions {
-//!     let baseline = baseline_of(export.region);
-//!     container.insert(RegionRecords::from_export(export, &baseline, &schemas)?);
+//!     let records = RegionRecords::from_export(export, &baseline_of(export.region), &schemas)?;
+//!     sections.push(records.encode_section()?);
 //! }
-//! let bytes = container.encode()?; // `app` writes these through `io`: temp file, sync, rename
+//! let bytes = Container::assemble(&header, sections)?; // `app` writes these: temp file, sync, rename
 //!
 //! // The load: the header into the builder, one bundle per region into `TickInput::loaded`.
 //! let container = Container::decode(&bytes)?;
@@ -80,27 +83,30 @@ mod migrate;
 mod schema;
 
 pub use container::{
-    CONTAINER_FORMAT_VERSION, Container, ContainerHeader, ContainerIndex, EngineVersion,
-    MAX_CONTAINER_BYTES, MAX_SECTION_BYTES, RegionIndexEntry, Sections,
+    CONTAINER_FORMAT_VERSION, Container, ContainerHeader, ContainerIndex, EncodedSection,
+    EngineVersion, MAX_CONTAINER_BYTES, MAX_SECTION_BYTES, PREAMBLE_BYTES, RegionIndexEntry,
+    Sections,
 };
 pub use diff::{RegionRecords, diff};
 pub use load::Loader;
 pub use migrate::{FieldIds, FieldValues, MigrateFn, Migration, Migrations};
-pub use schema::{SchemaHash, SchemaTable, Schemas};
+pub use schema::{LayoutDigest, SchemaHash, SchemaTable, Schemas};
 
 /// What the contract promises at the type level, pinned so the implementation cannot lose
 /// it without a compile error: the table, the migrations and a container are built once
-/// and shared by the tasks that diff, encode and load; a region's records travel from the
-/// worker that diffed them to the one that encodes; a migration step is a plain function;
-/// and the caps nest so a section that fits its cap fits a container that fits its own and
-/// an overlay at `lactose_bundle`'s cap fits a section.
+/// and shared by the tasks that diff, encode and load; a region's records and its encoded
+/// section travel from the worker that made them to the one that assembles; a migration
+/// step is a plain function; and the caps nest so a section that fits its cap fits a
+/// container that fits its own and an overlay at `lactose_bundle`'s cap fits a section.
 const _: () = {
     const fn send_sync<T: Send + Sync>() {}
     const fn copy<T: Copy>() {}
 
     send_sync::<SchemaTable>();
     send_sync::<SchemaHash>();
+    send_sync::<LayoutDigest>();
     send_sync::<RegionRecords>();
+    send_sync::<EncodedSection>();
     send_sync::<Container>();
     send_sync::<ContainerHeader>();
     send_sync::<ContainerIndex>();
@@ -112,9 +118,12 @@ const _: () = {
     copy::<MigrateFn>();
     copy::<Migration>();
     copy::<ContainerHeader>();
+    copy::<RegionIndexEntry>();
+    copy::<LayoutDigest>();
     copy::<Loader<'_>>();
 
     assert!(CONTAINER_FORMAT_VERSION == 1);
+    assert!(PREAMBLE_BYTES == 16);
     assert!(MAX_SECTION_BYTES >= lactose_bundle::MAX_DOCUMENT_BYTES);
     assert!(MAX_CONTAINER_BYTES >= MAX_SECTION_BYTES);
 };

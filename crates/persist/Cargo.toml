@@ -10,7 +10,8 @@ license.workspace = true
 [dependencies]
 # `CheckedBitPattern` and `NoUninit` for the typed field reads and writes a migration makes.
 bytemuck.workspace = true
-# `PinnedTable`, which the bundle this crate builds carries; types only.
+# `PinnedTable` and `VersionTable`, which the bundle and the message this crate builds
+# carry; types only.
 lactose-asset-api.workspace = true
 # The record format of architecture section 15.2: baselines, overlays and their schemas.
 lactose-bundle.workspace = true
@@ -21,16 +22,14 @@ lactose-ecs.workspace = true
 # The one scalar type whose canonical bits this crate writes (architecture section 8.2);
 # no arithmetic.
 lactose-math.workspace = true
+# `RegionRelevance`, the message a region's records become on the server (architecture
+# section 9.3): built here so the save and the message share one rule; types only.
+lactose-net-api.workspace = true
 # Metadata only: the registry, each type's description and its persistence policy.
 lactose-reflect.workspace = true
 # `RegionExport` and `SavePoint`, the input of a save, and `RegionBundle`, the output of a
 # load; types only.
 lactose-sim.workspace = true
-
-[dev-dependencies]
-# The compile-only sketches build the relevance message from this crate's diff, as the
-# server's `app` does.
-lactose-net-api.workspace = true
 
 [lints]
 workspace = true

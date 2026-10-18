@@ -1,9 +1,9 @@
 //! Compile-only consumer sketches against the facade: what the server's `app` writes to
-//! save and to load, in a fresh process and in place; what it writes to build the
-//! relevance message through this crate's diff; what a game crate writes to migrate a
-//! component; and the shape of the section 15.5 tests. Type-checked and never run (every
-//! deciding body of the crate is `todo!()`). They pin the surface the README promises: a
-//! change that breaks one is a signature change to list.
+//! save and to load, in a fresh process, in place and one region at a time; what it writes
+//! to build the relevance message from a region's records; what a game crate writes to
+//! migrate a component; and the shape of the section 15.5 tests. Type-checked and never
+//! run (every deciding body of the crate is `todo!()`). They pin the surface the README
+//! promises: a change that breaks one is a signature change to list.
 
 #![forbid(unsafe_code)]
 #![allow(dead_code, unused_variables, missing_docs)]
@@ -11,15 +11,15 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use lactose_asset_api::PinnedTable;
+use lactose_asset_api::{PinnedTable, VersionTable};
 use lactose_bundle::Baseline;
 use lactose_core::{FieldId, NetId, PlayerId, Result, Tick};
 use lactose_ecs::{Executor, RegionId, RegionMode, WorldKind};
 use lactose_math::Scalar;
 use lactose_net_api::RegionRelevance;
 use lactose_persist::{
-    Container, ContainerHeader, ContainerIndex, FieldValues, Loader, Migration, Migrations,
-    RegionRecords, SchemaHash, SchemaTable, diff,
+    Container, ContainerHeader, ContainerIndex, EncodedSection, FieldValues, LayoutDigest, Loader,
+    Migration, Migrations, PREAMBLE_BYTES, RegionRecords, SchemaHash, SchemaTable, diff,
 };
 use lactose_reflect::{Reflect, Registry, component, resource};
 use lactose_sim::{
@@ -48,7 +48,8 @@ pub struct Health {
     pub max: u16,
 }
 
-/// A per-tick accumulator: present on some rows, never saved by value.
+/// A per-tick accumulator: present on some rows, never saved by value, so a change to it
+/// needs no version bump and no step.
 #[component(key = "sketch::contacts", transient)]
 pub struct Contacts(#[field(id = 1)] pub u32);
 
@@ -107,10 +108,16 @@ impl SaveContext {
     }
 }
 
+/// One region's work, as a background task runs it: the diff and the section.
+fn section_of(export: &RegionExport, context: &SaveContext) -> Result<EncodedSection> {
+    RegionRecords::from_export(export, &context.baseline(export.region), &context.schemas)?
+        .encode_section()
+}
+
 /// The save, as the timer root's task writes it: the save copy at a sync point, then one
-/// diff per region (each independent, so `app` runs them as background tasks), then the
-/// container's bytes, which `app` writes through `io` to a temporary file, syncs and
-/// renames over the slot.
+/// diff and one section per region (each independent, so `app` runs them as background
+/// tasks), then the assembled bytes, which `app` writes through `io` to a temporary file,
+/// syncs and renames over the slot.
 async fn save(
     executor: &Executor,
     simulation: Simulation,
@@ -118,31 +125,40 @@ async fn save(
 ) -> Result<(Simulation, Vec<u8>)> {
     let (simulation, save): (Simulation, SavePoint) =
         simulation.save_point(executor).await.map_err(lactose_core::Error::from)?;
-    let mut container = Container::new(ContainerHeader::of(&save, &context.schemas));
+    let header = ContainerHeader::of(&save, &context.schemas);
     // One task per region in `app`; sequential here, since the sketch is never run.
-    for export in &save.regions {
-        let records =
-            RegionRecords::from_export(export, &context.baseline(export.region), &context.schemas)?;
-        container.insert(records);
-    }
-    let bytes = container.encode()?;
+    let sections =
+        save.regions.iter().map(|export| section_of(export, context)).collect::<Result<_>>()?;
+    let bytes = Container::assemble(&header, sections)?;
     Ok((simulation, bytes))
 }
 
-/// The same diff as a region's section of a save, run by the server's `app` on the export
-/// of a region that became relevant to a client, into the message `net` sends.
-fn relevance(export: &RegionExport, context: &SaveContext) -> Result<RegionRelevance> {
-    let baseline = context.baseline(export.region);
-    let overlay = diff(&export.rows, &baseline, &context.schemas)?;
-    let overlay = if overlay.records().is_empty() { None } else { Some(Arc::new(overlay)) };
-    Ok(RegionRelevance::from_export(export, baseline.content_hash(), overlay, None))
+/// The relevance message for a region that became relevant to a client: the same records
+/// a save would hold, built by the server's `app` on the export it takes for the region,
+/// handed to `net` to send. One `Cooked` rule and one canonicalisation, both
+/// `from_export`'s.
+fn relevance(
+    export: &RegionExport,
+    assets: Option<VersionTable>,
+    context: &SaveContext,
+) -> Result<RegionRelevance> {
+    let records =
+        RegionRecords::from_export(export, &context.baseline(export.region), &context.schemas)?;
+    Ok(records.to_relevance(assets))
 }
 
-// ---- 3. The server's `app`: a load in a fresh process ----
+// ---- 3. The server's `app`: loads ----
 
-/// What a save-slot browser shows without decompressing a section.
-fn browse(bytes: &[u8]) -> Result<(Tick, usize)> {
-    let index: ContainerIndex = Container::index(bytes)?;
+/// A read of the front of the file, as `io` serves it: the preamble, then the rest of the
+/// prefix the index needs, and no section.
+fn read_index(file: &[u8]) -> Result<ContainerIndex> {
+    let len = Container::index_len(&file[..PREAMBLE_BYTES.min(file.len())])?;
+    Container::index(&file[..len.min(file.len())])
+}
+
+/// What a save-slot browser shows without reading a section.
+fn browse(file: &[u8]) -> Result<(Tick, usize)> {
+    let index = read_index(file)?;
     Ok((index.header.tick, index.regions.len()))
 }
 
@@ -192,11 +208,37 @@ fn bundles(
         .collect()
 }
 
-/// One region of a save, read alone: what a streaming load at milestone 3 does.
-fn load_one(bytes: &[u8], region: RegionId, context: &SaveContext) -> Result<RegionBundle> {
-    let records = Container::decode_region(bytes, region)?;
+/// One region of a save, read alone: the index from the front of the file, then that
+/// region's bytes at its offset, and nothing else. What a streaming load at milestone 3
+/// does per region.
+fn load_one(file: &[u8], region: RegionId, context: &SaveContext) -> Result<RegionBundle> {
+    let index = read_index(file)?;
+    let entry = index.entry(region).ok_or_else(|| {
+        lactose_core::Error::new(lactose_core::ErrorKind::NotFound, "no section for the region")
+    })?;
+    let start = usize::try_from(entry.offset).unwrap_or(usize::MAX);
+    let len = usize::try_from(entry.compressed_bytes).unwrap_or(usize::MAX);
+    let section = &file[start..start + len]; // `io` reads exactly this range
+    let records = Container::decode_section(entry, section)?;
     let loader = Loader::new(&context.schemas, &context.migrations);
     loader.bundle(&records, context.baseline(region), RegionMode::Frozen, None)
+}
+
+/// The corrupt-save path of architecture section 19, as `app` reads what it can: every
+/// section that decodes, and the regions whose sections do not, for its policy.
+fn recover(file: &[u8]) -> Result<(Vec<RegionRecords>, Vec<RegionId>)> {
+    let index = read_index(file)?;
+    let (mut readable, mut damaged) = (Vec::new(), Vec::new());
+    for entry in &index.regions {
+        let start = usize::try_from(entry.offset).unwrap_or(usize::MAX);
+        let len = usize::try_from(entry.compressed_bytes).unwrap_or(usize::MAX);
+        match file.get(start..start + len).map(|section| Container::decode_section(entry, section))
+        {
+            Some(Ok(records)) => readable.push(records),
+            _ => damaged.push(entry.region),
+        }
+    }
+    Ok((readable, damaged))
 }
 
 /// A save whose baselines were re-cooked since: each section is carried over before it
@@ -211,7 +253,7 @@ fn rebase_all(container: &mut Container, context: &SaveContext) -> Result<()> {
             let dropped = records.rebase(&patched)?;
             let _ = dropped;
         }
-        container.insert(records);
+        container.insert(records)?;
     }
     Ok(())
 }
@@ -270,9 +312,11 @@ fn reload_two_frames(
 
 /// Test 1 and 4 of section 15.5 (D57, D124): the original reloads in place at tick T, a
 /// fresh process loads the save, an untouched twin never reloads; all three run K ticks and
-/// hash equal every tick (with physics, the fresh process and the reload are bit-equal to
-/// each other through D124's fresh solver, and within D124's tolerance of the twin while
-/// bodies are in contact).
+/// hash equal every tick, under the condition D129 states (the same store, no publish
+/// between the save and the load, the mode the policy gives), since a save carries no
+/// table and no mode; with physics, the fresh process and the reload are bit-equal to each
+/// other through D124's fresh solver, and within D124's tolerance of the twin while bodies
+/// are in contact.
 fn test_reload_at(executor: &Executor, at: u32, k: u32) {
     let _ = (executor, at, k);
 }
@@ -285,14 +329,24 @@ fn test_unload_reload_keeps_columns(executor: &Executor, region: RegionId) {
 
 /// Test 3: a save written under `Health` version 1 loads on this build through
 /// `health_v1_to_v2`; a save with a version this build lacks a step for is refused with
-/// `VersionMismatch` and nothing loads.
+/// `VersionMismatch` and nothing loads; a save whose `Contacts` layout differs loads with
+/// no step, since a transient type is taken by presence.
 fn test_previous_schema_version(executor: &Executor, bytes_from_v1: &[u8]) {
     let _ = (executor, bytes_from_v1);
 }
 
+/// A layout changed without a version bump: equal document schemas, different digests,
+/// refused with `VersionMismatch` and nothing loads.
+fn test_layout_change_without_bump(old: &Registry, new: &Registry) -> bool {
+    let (old, new) = (SchemaTable::from_registry(old), SchemaTable::from_registry(new));
+    let digest = |table: Result<SchemaTable>| table.ok().and_then(|t| t.layout(Health::KEY));
+    let (a, b): (Option<LayoutDigest>, Option<LayoutDigest>) = (digest(old), digest(new));
+    a != b
+}
+
 /// The schema hash: two registries with the same saved types hash equal whatever their
-/// registration order; a derived type changes nothing; a version bump, a field or a size
-/// change each change it.
+/// registration order; a derived type or a tracking flag changes nothing; a version bump, a
+/// field, a size or a persistence change each change it.
 fn test_schema_hash(a: &Registry, b: &Registry) -> bool {
     SchemaHash::of(a) == SchemaHash::of(b)
 }

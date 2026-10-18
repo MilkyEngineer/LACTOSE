@@ -3,10 +3,10 @@
 //! order.
 //!
 //! The binary keeps no historical layouts. A document carries the schema its values were
-//! written with (version, size, field ID to offset and size), so a value is decoded into
-//! its fields by ID under that schema, each registered step rewrites the fields from one
-//! version to the next, and the result is assembled under the registry's layout by field
-//! ID and validated.
+//! written with (version, size, field ID to offset and size) and a save carries the layout
+//! digest beside it, so a value is decoded into its fields by ID under that schema, each
+//! registered step rewrites the fields from one version to the next, and the result is
+//! assembled under the registry's layout by field ID and validated.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -16,7 +16,7 @@ use lactose_bundle::{ComponentSchema, Overlay};
 use lactose_core::{ComponentKey, FieldId, Result};
 use lactose_reflect::TypeInfo;
 
-use crate::schema::SchemaTable;
+use crate::schema::{LayoutDigest, SchemaTable};
 
 /// One migration step: a function over the fields of a value at version `from` that
 /// leaves them at version `from + 1`.
@@ -44,7 +44,9 @@ pub struct Migration {
 /// them with [`set`](Self::set) or [`write`](Self::write), and drops them with
 /// [`take`](Self::take); what it leaves is what the next step, or the assembly under the
 /// registry's layout, sees. Bytes are the field's memory image, little-endian on every
-/// supported target, canonical for a scalar.
+/// supported target, canonical for a scalar. A field that holds a nested `#[value]` struct
+/// is one field here, so a step over a nested layout change reads the old nested offsets
+/// it hard-codes and writes the new value whole.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct FieldValues {
     component: ComponentKey,
@@ -157,19 +159,27 @@ impl Migrations {
         self.steps.is_empty()
     }
 
-    /// Brings `bytes`, one value of `info`'s type written under `schema`, to the
-    /// registry's layout: the bytes of a valid value of the type as `info` describes it.
+    /// Brings `bytes`, one value of `info`'s type written under `schema` with the layout
+    /// digest `layout`, to the registry's layout: the bytes of a valid value of the type
+    /// as `info` describes it.
     ///
     /// The rule, in order:
     ///
-    /// - `schema` equal to the registry's schema of the type: `bytes` unchanged (the fast
-    ///   path of architecture section 15.4; no step runs, no validation here).
+    /// - `info.persistence()` is `Transient`: the all-zero value of `info`'s size, whatever
+    ///   `schema`, `layout` and `bytes` say. A transient value is never saved (architecture
+    ///   section 15.1): a save carries its presence, the loader zeroes it, and a layout
+    ///   change to a transient type breaks no save, needs no bump and no step, and runs no
+    ///   check.
     /// - `schema.schema_version()` greater than `info.version()`: `VersionMismatch`, a
     ///   newer save than the build.
-    /// - Equal versions with different layouts: `VersionMismatch`, a layout changed
-    ///   without a version bump (the reflection macros cannot see it; this is where it is
-    ///   caught).
-    /// - Otherwise the steps for every version from `schema.schema_version()` up to
+    /// - Equal versions: `layout` equal to [`LayoutDigest::of`]`(info)` is the fast path
+    ///   (architecture section 15.4), `bytes` unchanged with no step and no validation
+    ///   here; a different digest is `VersionMismatch`, a layout changed without a version
+    ///   bump (a nested reorder, renumbered discriminants, a same-size type change: what
+    ///   the document schema cannot see, which the reflection macros cannot see either,
+    ///   so this is where it is caught, and the build-time guard D129 names is what keeps
+    ///   it from being written).
+    /// - A lower version: the steps for every version from `schema.schema_version()` up to
     ///   `info.version() - 1` must be registered (`VersionMismatch` naming the first
     ///   missing one); `bytes` is split into a [`FieldValues`] by `schema`'s fields, each
     ///   step runs in version order, and the result is assembled by the registry's layout:
@@ -177,35 +187,43 @@ impl Migrations {
     ///   which must be present and of the field's size (`VersionMismatch` otherwise,
     ///   naming the field), a field left over that the type lacks is `VersionMismatch`
     ///   naming it (a step must `take` what it retires), padding is zeroed and the whole
-    ///   value is validated (`InvalidData`).
+    ///   value is validated (`InvalidData`). The document's digest is not compared on this
+    ///   path: the step is written against the old layout, and the assembly is by ID.
     ///
     /// A step's own error fails the call as returned.
     pub fn migrate(
         &self,
         info: &TypeInfo,
         schema: &ComponentSchema,
+        layout: LayoutDigest,
         bytes: &[u8],
     ) -> Result<Vec<u8>> {
-        todo!("fast path, refusals, then split, run the steps and assemble")
+        todo!("transient to zeroes; fast path, refusals, then split, run the steps and assemble")
     }
 
     /// Brings every value `overlay` carries to the registry's schemas: each component of a
     /// `Spawn`, `SpawnFromBaseline` or `AddComponent` record through [`migrate`](Self::migrate)
-    /// under the overlay's schema of that component, and the overlay rebuilt against the
-    /// same baseline hash with the table's schemas. An overlay whose every schema already
-    /// matches is returned as the same `Arc`, equal by content and by digest, so a cached
-    /// copy a client holds still matches; a migrated overlay is a new document with a new
-    /// digest. `Destroy`, `RemoveComponent` and `OwnershipChange` carry no component bytes
-    /// and pass through.
+    /// under the overlay's schema of that component and the digest `layouts` holds for it,
+    /// and the overlay rebuilt against the same baseline hash with the table's schemas. An
+    /// overlay whose every carried type is at the registry's version and digest, a
+    /// transient type at the table's schema counting as such, is returned as the same
+    /// `Arc`, equal by content and by digest, so a client's cached copy still matches; a
+    /// migrated overlay is a new document with a new digest. A transient component is
+    /// taken by presence: its bytes become zeroes of the registry's size under the table's
+    /// schema, with no version or digest check and no step. `Destroy`, `RemoveComponent`
+    /// and `OwnershipChange` carry no component bytes and pass through.
     ///
     /// Fails as [`migrate`](Self::migrate) fails; with `NotFound` for a component the table
-    /// does not know; with `InvalidData` for a derived component; and with `Unsupported`
-    /// for a `SetField` record of a component whose schema differs, since one field cannot
-    /// be migrated without the rest of its value (this crate's diff never writes a
-    /// `SetField`, so none is in a save it wrote; one of a matching schema passes through).
+    /// does not know (a removed type: never dropped silently); with `InvalidData` for a
+    /// derived component, or a carried component `layouts` lacks; and with `Unsupported`
+    /// for a `SetField` record of a component whose version or digest differs, since one
+    /// field cannot be migrated without the rest of its value (this crate's diff never
+    /// writes a `SetField`, so none is in a save it wrote; one at the registry's version and
+    /// digest passes through).
     pub fn migrate_overlay(
         &self,
         overlay: &Arc<Overlay>,
+        layouts: &BTreeMap<ComponentKey, LayoutDigest>,
         schemas: &SchemaTable,
     ) -> Result<Arc<Overlay>> {
         todo!("migrate each carried value and rebuild the overlay, or return it unchanged")
