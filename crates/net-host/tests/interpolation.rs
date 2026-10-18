@@ -260,10 +260,11 @@ fn every_sample_under_contention_is_a_pushed_state() {
             let checked_samples = Arc::clone(&checked_samples);
             std::thread::spawn(move || {
                 let (mut torn, mut interpolated) = (0_u64, 0_u64);
-                let mut count = 0_u64;
+                let (mut count, mut round) = (0_u64, 0_u64);
                 let mut batch = [RemoteSample::MISSING; SLOTS as usize];
                 let mut slots = vec![InterpolationSlot { index: 0, generation: 0 }; SLOTS as usize];
                 while !done.load(Ordering::Relaxed) {
+                    round += 1;
                     for (index, slot) in slots.iter_mut().enumerate() {
                         let word = published[index].load(Ordering::Acquire);
                         if word != u64::MAX {
@@ -275,7 +276,7 @@ fn every_sample_under_contention_is_a_pushed_state() {
                     }
                     // Newest, oldest, and the batch path, alternately.
                     let time =
-                        if count.is_multiple_of(2) { at(u32::MAX >> 2, 0) } else { at(0, 0) };
+                        if round.is_multiple_of(2) { at(u32::MAX >> 2, 0) } else { at(0, 0) };
                     if n == 0 {
                         reader.sample_batch(&slots, time, &mut batch);
                     } else {
