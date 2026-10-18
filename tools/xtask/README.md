@@ -202,7 +202,7 @@ cargo xtask heavy -- cargo nextest run --workspace --no-tests=pass
 - A slot is an exclusive lock (`File::try_lock`: `flock` on Unix, `LockFileEx` on Windows)
   on `slot-<i>.lock` in `lactose-heavy/` under the temporary directory. The slots are tried
   in order; while all are held, `heavy` says so once on standard error, naming the holders'
-  process IDs, and tries again every 200 ms. There is no queue: whichever caller tries first
+  process IDs where their owner files can be read, and tries again every 200 ms. There is no queue: whichever caller tries first
   after a slot frees takes it, so a script that runs wrapped commands back to back tends to
   win the gap between them over a waiter that polls. When it takes a slot, `heavy` prints
   `heavy: slot <i> after <n>s` to standard error and writes its token, `<pid>-<nanoseconds>`,
@@ -221,7 +221,11 @@ cargo xtask heavy -- cargo nextest run --workspace --no-tests=pass
   slot locked and the token in `slot-<i>.owner` runs its program at once without taking a
   second slot, so a wrapped script may call `heavy` again without deadlocking. Any other
   value, such as one left to a program whose `heavy` died, is reported and ignored, and
-  that `heavy` takes a slot like any caller.
+  that `heavy` takes a slot like any caller, except in the instant after another caller
+  takes that slot and before it writes its token. A holder clears its owner file when it
+  lets the slot go, which closes that instant for a program that outlives a `heavy` that
+  ended normally; a `heavy` killed by a signal leaves its token, so on that route the
+  instant remains.
 - `--slots` is a per-machine convention, not a setting: the bound holds only while every
   caller passes the same count. The default is what the agent definitions use; a caller
   with a different count breaks the bound for everyone. Likewise every caller must see the

@@ -499,7 +499,12 @@ fn heavy(args: &[&str]) -> Result<i32, String> {
     let slot = heavy::acquire(&dir, slots, heavy::RETRY, || {
         let pids: Vec<String> =
             heavy::holders(&dir, slots).iter().map(ToString::to_string).collect();
-        eprintln!("heavy: waiting for one of {slots} slots, held by pid {}", pids.join(", "));
+        let by = if pids.is_empty() {
+            String::new()
+        } else {
+            format!(", held by pid {}", pids.join(", "))
+        };
+        eprintln!("heavy: waiting for one of {slots} slots{by}");
     })?;
     eprintln!("heavy: slot {} after {}s", slot.index(), start.elapsed().as_secs());
     let code = run(command.env(heavy::HELD_VAR, slot.held_value()));

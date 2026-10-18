@@ -157,6 +157,25 @@ fn waits_for_the_slot(scratch: &Scratch, value: &str) {
 }
 
 #[test]
+fn the_waiting_line_names_no_pid_when_no_owner_file_can_be_read() {
+    let scratch = Scratch::new("no-owner");
+    fs::create_dir_all(scratch.slots()).unwrap();
+    // A holder that has locked the slot and not yet written its token.
+    let lock = fs::File::create(scratch.slots().join("slot-0.lock")).unwrap();
+    lock.try_lock().unwrap();
+    let mut args = vec!["--slots", "1", "--"];
+    args.extend(shell("exit 0"));
+    let mut child =
+        scratch.command(&args).stdout(Stdio::null()).stderr(Stdio::piped()).spawn().unwrap();
+    let mut stderr = BufReader::new(child.stderr.take().unwrap());
+    let mut line = String::new();
+    stderr.read_line(&mut line).unwrap();
+    assert_eq!(line, "heavy: waiting for one of 1 slots\n");
+    drop(lock);
+    assert!(child.wait().unwrap().success());
+}
+
+#[test]
 fn a_forged_held_value_waits_like_any_caller() {
     let scratch = Scratch::new("forged");
     for value in ["", "0", "nonsense", "0:1-2"] {
@@ -184,7 +203,7 @@ fn a_stale_held_value_whose_slot_is_free_takes_the_slot() {
     assert_eq!(lines[0], format!("heavy: {HELD_VAR}={stale} names no slot held for it"));
     assert!(lines[1].starts_with("heavy: slot 0 after "), "{lines:?}");
     let owner = fs::read_to_string(scratch.slots().join("slot-0.owner")).unwrap();
-    assert_ne!(format!("0:{}", owner.trim_end()), stale, "the new holder wrote its own token");
+    assert_eq!(owner, "", "the new holder cleared its token when it let the slot go");
 }
 
 #[test]

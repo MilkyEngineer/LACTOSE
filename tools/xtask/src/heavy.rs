@@ -59,7 +59,17 @@ fn owner_path(dir: &Path, index: usize) -> PathBuf {
 pub struct Slot {
     index: usize,
     token: String,
+    owner: PathBuf,
     _lock: File,
+}
+
+impl Drop for Slot {
+    /// Clears the owner file before the lock goes, so a value left to a program that outlives
+    /// this `heavy` never matches while the next holder is between its lock and its write. A
+    /// holder killed by a signal runs no drop and leaves its token for that instant.
+    fn drop(&mut self) {
+        let _ = fs::write(&self.owner, "");
+    }
 }
 
 impl Slot {
@@ -108,7 +118,7 @@ pub fn try_acquire(dir: &Path, slots: NonZeroUsize) -> Result<Option<Slot>, Stri
         let token = format!("{}-{nanos}", std::process::id());
         let owner = owner_path(dir, index);
         fs::write(&owner, format!("{token}\n")).map_err(|e| format!("{}: {e}", owner.display()))?;
-        return Ok(Some(Slot { index, token, _lock: lock }));
+        return Ok(Some(Slot { index, token, owner, _lock: lock }));
     }
     Ok(None)
 }
@@ -157,7 +167,8 @@ pub fn is_held(dir: &Path, value: &OsStr) -> bool {
 }
 
 /// The process IDs that the owner files of the first `slots` slots of `dir` name, in slot
-/// order. A file names the slot's latest holder, which may have let it go since.
+/// order. A holder clears its file when it lets the slot go, but one killed by a signal
+/// leaves it, so an ID may be of a process that has gone.
 #[must_use]
 pub fn holders(dir: &Path, slots: NonZeroUsize) -> Vec<u32> {
     (0..slots.get())
@@ -354,5 +365,20 @@ mod tests {
         assert_eq!(other.index(), 0, "the check left the slot free");
         assert!(!is_held(&dir, OsStr::new(&value)));
         assert!(is_held(&dir, OsStr::new(&other.held_value())));
+    }
+
+    #[test]
+    fn a_slot_let_go_clears_its_token_before_the_next_holder_writes_one() {
+        let scratch = Scratch::new("clear");
+        let dir = scratch.slots();
+        let slot = try_acquire(&dir, ONE).unwrap().unwrap();
+        let value = slot.held_value();
+        drop(slot);
+        assert_eq!(fs::read_to_string(dir.join("slot-0.owner")).unwrap(), "");
+        assert!(holders(&dir, ONE).is_empty());
+        // A new holder between its lock and its token write.
+        let lock = OpenOptions::new().read(true).write(true).open(dir.join("slot-0.lock")).unwrap();
+        lock.try_lock().unwrap();
+        assert!(!is_held(&dir, OsStr::new(&value)));
     }
 }
