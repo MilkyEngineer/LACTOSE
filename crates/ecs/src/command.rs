@@ -191,11 +191,22 @@ pub(crate) struct CommandBuffer {
     pub(crate) spawns: u32,
     /// The region a plain `spawn` goes to: the entity's or the per-region invocation's.
     pub(crate) region: Option<RegionId>,
+    /// The sink of every writer [`Commands::channel`] lends, appended after `commands` with
+    /// the parameter sinks. Transitional: it goes with `Commands::channel`.
+    pub(crate) channel_tail: Vec<ChannelCommand>,
 }
 
 impl CommandBuffer {
     pub(crate) fn new(region: Option<RegionId>) -> Self {
-        Self { commands: Vec::new(), spawns: 0, region }
+        Self { commands: Vec::new(), spawns: 0, region, channel_tail: Vec::new() }
+    }
+
+    /// Appends the channel entries of the invocation after its commands: the tail, then
+    /// `sinks` in parameter order.
+    pub(crate) fn close_channels(&mut self, sinks: &mut [Vec<ChannelCommand>]) {
+        let tail = core::mem::take(&mut self.channel_tail);
+        let entries = tail.into_iter().chain(sinks.iter_mut().flat_map(core::mem::take));
+        self.commands.extend(entries.map(Command::Channel));
     }
 
     fn spawn(&mut self, region: Option<RegionId>, components: Vec<ErasedComponent>) -> StableKey {
@@ -291,10 +302,12 @@ impl Commands<'_> {
         self.buffer.commands.push(Command::Move(key, region));
     }
 
-    /// The writer for channel `C`, for another crate's commands. `lactose-physics-api`
-    /// wraps this in an extension trait so a kernel writes `cmd.physics().apply_impulse(..)`.
+    /// The writer for channel `C`, for another crate's commands. Its entries append after
+    /// every command of the invocation, before those of its [`ChannelWriter`] parameters.
+    /// The schedule does not see this writer; a system takes a [`ChannelWriter`] parameter
+    /// instead.
     pub fn channel<C: CommandChannel>(&mut self) -> ChannelWriter<'_, C> {
-        ChannelWriter { buffer: self.buffer, _channel: PhantomData }
+        ChannelWriter { sink: &mut self.buffer.channel_tail, _channel: PhantomData }
     }
 }
 
@@ -342,19 +355,41 @@ pub trait CommandChannel: 'static {
     fn remap(entry: &mut Self::Entry, f: &mut dyn FnMut(&mut StableKey));
 }
 
-/// Appends entries to a channel on behalf of one invocation.
+/// Writes entries to channel `C`: a system parameter of every kind of system and of a
+/// finalize, like [`EventWriter`](crate::EventWriter).
+///
+/// The entries wait in a sink of the invocation and join its command buffer after every
+/// command its [`Commands`] recorded, the sinks of two writers in parameter order, so they
+/// apply at the sync point that ends the stage, in command order, and a placeholder the
+/// invocation's spawn returned resolves. The schedule refuses a writer in the stage of a
+/// [`ChannelTake<C>`] or a later one, since its entries would land after the take
+/// ([`ScheduleError::ChannelAfterTaker`](crate::ScheduleError::ChannelAfterTaker)), and a
+/// writer whose channel no later stage takes or reads
+/// ([`ScheduleError::ChannelWithoutConsumer`](crate::ScheduleError::ChannelWithoutConsumer)).
 pub struct ChannelWriter<'a, C: CommandChannel> {
-    buffer: &'a mut CommandBuffer,
+    sink: &'a mut Vec<ChannelCommand>,
     _channel: PhantomData<fn() -> C>,
 }
 
 impl<C: CommandChannel> ChannelWriter<'_, C> {
     /// Records `entry` with this invocation's source and the next sequence number.
     pub fn push(&mut self, entry: C::Entry) {
-        self.buffer.commands.push(Command::Channel(ChannelCommand {
-            entry: Box::new(entry),
-            append: append_entry::<C>,
-        }));
+        self.sink.push(ChannelCommand { entry: Box::new(entry), append: append_entry::<C> });
+    }
+}
+
+impl<C: CommandChannel> sealed::Sealed for ChannelWriter<'_, C> {}
+
+impl<C: CommandChannel> SystemParam for ChannelWriter<'_, C> {
+    const ACCESS: Access = Access::new(AccessKind::WriteChannel, channel_target::<C>);
+}
+
+impl<'r, 'j, C: CommandChannel> Fetch<'r, 'j> for ChannelWriter<'r, C> {
+    fn fetch(invocation: &mut Invocation<'r, 'j>, index: usize) -> Self {
+        match invocation.take(index) {
+            Slot::WriteChannel(sink) => Self { sink, _channel: PhantomData },
+            _ => mismatch(index),
+        }
     }
 }
 
@@ -428,6 +463,69 @@ impl<'r, 'j, C: CommandChannel> Fetch<'r, 'j> for Channel<'r, C> {
                         .downcast_ref::<Vec<ChannelEntry<C>>>()
                         .expect("the entries of this channel")
                         .as_slice()
+                }),
+            },
+            _ => mismatch(index),
+        }
+    }
+}
+
+/// The entries of channel `C` applied in the run's earlier stages, taken: a parameter of an
+/// exclusive system alone, which owns them.
+///
+/// The run removes the channel's store from the world before the system runs, so the
+/// entries are this system's whether it reads them or not, in command order with keys
+/// resolved as [`Channel`] yields them. The schedule refuses `ChannelTake<C>` outside an
+/// exclusive system, twice on one channel, and beside [`Channel<C>`] or
+/// [`ChannelWriter<C>`] on one channel
+/// ([`ScheduleError::InvalidParameter`](crate::ScheduleError::InvalidParameter)); and a
+/// writer of `C` in the taker's stage or a later one, or a reader or a second taker placed
+/// after it ([`ScheduleError::ChannelAfterTaker`](crate::ScheduleError::ChannelAfterTaker)).
+/// The one way a take does not happen is the system being skipped, for a resource an
+/// earlier exclusive system removed; the skip is logged at `error` at target `casein`,
+/// naming the channel.
+pub struct ChannelTake<C: CommandChannel> {
+    entries: Vec<ChannelEntry<C>>,
+}
+
+impl<C: CommandChannel> ChannelTake<C> {
+    /// The entries in command order.
+    #[must_use]
+    pub fn iter(&self) -> ChannelEntries<'_, C> {
+        ChannelEntries { entries: self.entries.iter() }
+    }
+
+    /// How many entries there are.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Whether there are no entries.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// The entries in command order, owned.
+    #[must_use]
+    pub fn into_entries(self) -> Vec<ChannelEntry<C>> {
+        self.entries
+    }
+}
+
+impl<C: CommandChannel> sealed::Sealed for ChannelTake<C> {}
+
+impl<C: CommandChannel> SystemParam for ChannelTake<C> {
+    const ACCESS: Access = Access::new(AccessKind::TakeChannel, channel_target::<C>);
+}
+
+impl<'r, 'j, C: CommandChannel> Fetch<'r, 'j> for ChannelTake<C> {
+    fn fetch(invocation: &mut Invocation<'r, 'j>, index: usize) -> Self {
+        match invocation.take(index) {
+            Slot::TakeChannel(store) => Self {
+                entries: store.map_or_else(Vec::new, |store| {
+                    *store.downcast::<Vec<ChannelEntry<C>>>().expect("the entries of this channel")
                 }),
             },
             _ => mismatch(index),

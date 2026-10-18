@@ -7,10 +7,11 @@ mod common;
 use common::*;
 use lactose_core::ErrorKind;
 use lactose_ecs::{
-    AccessTarget, Changed, Commands, Ctx, EventWriter, Events, Job, LayoutConfig, Mut, OwnedBy,
-    Res, ResMut, Schedule, ScheduleError, StableKeyOf, SystemDescriptor, SystemSet, Without, World,
-    WorldKind, system,
+    AccessTarget, Changed, Channel, ChannelTake, ChannelWriter, Commands, Ctx, EventWriter, Events,
+    Job, LayoutConfig, Mut, OwnedBy, Res, ResMut, Schedule, ScheduleError, StableKeyOf,
+    SystemDescriptor, SystemSet, Without, World, WorldKind, system,
 };
+use lactose_math::Vec2;
 use lactose_reflect::{Reflect, component};
 
 /// A component no registry of these tests holds.
@@ -355,6 +356,179 @@ fn order_errors() {
             event: core::any::type_name::<Damage>(),
         }
     );
+}
+
+// ---- Channels (D126) ----
+
+/// A per-entity writer of the physics channel.
+#[system(name = "test::writes_physics")]
+fn writes_physics(_counter: &Counter, physics: ChannelWriter<Physics>) {
+    physics.apply_impulse(net(1), Vec2::ZERO);
+}
+
+/// The taker of the physics channel.
+#[system(name = "test::takes_physics", exclusive)]
+fn takes_physics(_world: &mut World, _taken: ChannelTake<Physics>) {}
+
+/// A second taker of the physics channel.
+#[system(name = "test::takes_physics_again", exclusive)]
+fn takes_physics_again(_world: &mut World, _taken: ChannelTake<Physics>) {}
+
+/// A once-per-tick reader of the physics channel.
+#[system(name = "test::reads_physics")]
+fn reads_physics(_impulses: Channel<Physics>) {}
+
+/// An exclusive reader of the physics channel ordered before the taker in its stage.
+#[system(name = "test::reads_physics_first", exclusive)]
+fn reads_physics_first(_world: &mut World, _impulses: Channel<Physics>) {}
+
+#[system(name = "test::takes_after_reader", exclusive, after = reads_physics_first)]
+fn takes_after_reader(_world: &mut World, _taken: ChannelTake<Physics>) {}
+
+/// An exclusive writer, and a taker ordered after it in its stage.
+#[system(name = "test::exclusive_writer", exclusive)]
+fn exclusive_writer(_world: &mut World, _physics: ChannelWriter<Physics>) {}
+
+#[system(name = "test::takes_after_writer", exclusive, after = exclusive_writer)]
+fn takes_after_writer(_world: &mut World, _taken: ChannelTake<Physics>) {}
+
+#[system(name = "test::entity_takes")]
+fn entity_takes(_counter: &Counter, _taken: ChannelTake<Physics>) {}
+
+#[system(name = "test::once_takes")]
+fn once_takes(_taken: ChannelTake<Physics>) {}
+
+#[system(name = "test::finalize_takes", reduce = lactose_math::IntSum<u32>)]
+fn finalize_takes(_counter: &Counter) -> u32 {
+    1
+}
+
+#[lactose_ecs::finalize(finalize_takes)]
+fn store_taking(_sum: i128, _taken: ChannelTake<Physics>) {}
+
+#[system(name = "test::takes_twice", exclusive)]
+fn takes_twice(_world: &mut World, _a: ChannelTake<Physics>, _b: ChannelTake<Physics>) {}
+
+/// Review probe r6a: a take beside a reader of the same channel, which would read what the
+/// take removed.
+#[system(name = "test::takes_and_reads", exclusive)]
+fn takes_and_reads(_world: &mut World, _read: Channel<Physics>, _taken: ChannelTake<Physics>) {}
+
+#[system(name = "test::takes_and_writes", exclusive)]
+fn takes_and_writes(
+    _world: &mut World,
+    _taken: ChannelTake<Physics>,
+    _physics: ChannelWriter<Physics>,
+) {
+}
+
+/// Builds one stage per entry, in order.
+fn staged(stages: &[&[&'static SystemDescriptor]]) -> Result<Schedule, ScheduleError> {
+    const NAMES: [&str; 4] = ["first", "second", "third", "fourth"];
+    let mut builder = Schedule::builder(WorldKind::Server);
+    for (stage, systems) in stages.iter().enumerate() {
+        builder.stage(NAMES[stage], &[]);
+        for system in *systems {
+            builder.add(system);
+        }
+    }
+    builder.build()
+}
+
+fn staged_error(stages: &[&[&'static SystemDescriptor]]) -> ScheduleError {
+    staged(stages).map(|_| ()).unwrap_err()
+}
+
+fn after_taker(system: &'static str, taker: &'static str) -> ScheduleError {
+    ScheduleError::ChannelAfterTaker { system, taker, channel: core::any::type_name::<Physics>() }
+}
+
+#[test]
+fn a_channel_take_is_an_exclusive_systems_alone_once_and_beside_nothing_on_its_channel() {
+    let refused =
+        |system: &'static str| ScheduleError::InvalidParameter { system, parameter: "ChannelTake" };
+    assert_eq!(build_error(&[&ENTITY_TAKES]), refused("test::entity_takes"));
+    assert_eq!(build_error(&[&ONCE_TAKES]), refused("test::once_takes"));
+    assert_eq!(build_error(&[&FINALIZE_TAKES]), refused("test::finalize_takes"));
+    assert_eq!(build_error(&[&TAKES_TWICE]), refused("test::takes_twice"));
+    assert_eq!(build_error(&[&TAKES_AND_READS]), refused("test::takes_and_reads"));
+    assert_eq!(build_error(&[&TAKES_AND_WRITES]), refused("test::takes_and_writes"));
+}
+
+#[test]
+fn a_writer_in_the_takers_stage_or_a_later_one_is_refused() {
+    // Review probe r6b's writer: one stage with the taker.
+    assert_eq!(
+        staged_error(&[&[&TAKES_PHYSICS, &WRITES_PHYSICS], &[&READS_PHYSICS]]),
+        after_taker("test::writes_physics", "test::takes_physics")
+    );
+    assert_eq!(
+        staged_error(&[&[&TAKES_PHYSICS], &[&WRITES_PHYSICS], &[&READS_PHYSICS]]),
+        after_taker("test::writes_physics", "test::takes_physics")
+    );
+    // Ordered before the taker, an exclusive writer's entries still apply at the sync point
+    // that ends the stage, after the take.
+    assert_eq!(
+        staged_error(&[&[&EXCLUSIVE_WRITER, &TAKES_AFTER_WRITER], &[&READS_PHYSICS]]),
+        after_taker("test::exclusive_writer", "test::takes_after_writer")
+    );
+}
+
+#[test]
+fn a_reader_or_a_second_taker_after_the_taker_is_refused() {
+    // Review probe r6b's reader: a later stage.
+    assert_eq!(
+        staged_error(&[&[&WRITES_PHYSICS], &[&TAKES_PHYSICS], &[&READS_PHYSICS]]),
+        after_taker("test::reads_physics", "test::takes_physics")
+    );
+    // The taker's stage: a system that is not exclusive runs after every exclusive one.
+    assert_eq!(
+        staged_error(&[&[&WRITES_PHYSICS], &[&TAKES_PHYSICS, &READS_PHYSICS]]),
+        after_taker("test::reads_physics", "test::takes_physics")
+    );
+    assert_eq!(
+        staged_error(&[&[&WRITES_PHYSICS], &[&TAKES_PHYSICS], &[&TAKES_PHYSICS_AGAIN]]),
+        after_taker("test::takes_physics_again", "test::takes_physics")
+    );
+    let message = after_taker("test::reads_physics", "test::takes_physics").to_string();
+    assert_eq!(
+        message,
+        format!(
+            "`test::reads_physics` uses channel `{}` after its taker `test::takes_physics`: a \
+             writer's entries would land after the take, and a reader or a second taker would \
+             find it empty; place it before the taker",
+            core::any::type_name::<Physics>()
+        )
+    );
+}
+
+#[test]
+fn a_writer_needs_a_taker_or_a_reader_in_a_later_stage() {
+    let without = ScheduleError::ChannelWithoutConsumer {
+        writer: "test::writes_physics",
+        channel: core::any::type_name::<Physics>(),
+    };
+    assert_eq!(build_error(&[&WRITES_PHYSICS]), without);
+    // A reader in the writer's stage sees earlier stages' entries alone.
+    assert_eq!(build_error(&[&WRITES_PHYSICS, &READS_PHYSICS]), without);
+    assert_eq!(staged_error(&[&[&READS_PHYSICS], &[&WRITES_PHYSICS]]), without);
+    assert_eq!(
+        without.to_string(),
+        format!(
+            "`test::writes_physics` writes channel `{}`, which no system of a later stage takes \
+             or reads",
+            core::any::type_name::<Physics>()
+        )
+    );
+}
+
+#[test]
+fn writers_and_readers_before_the_taker_build() {
+    staged(&[&[&WRITES_PHYSICS], &[&TAKES_PHYSICS]]).unwrap();
+    staged(&[&[&WRITES_PHYSICS], &[&READS_PHYSICS], &[&TAKES_PHYSICS]]).unwrap();
+    // An exclusive reader ordered before the taker in its stage reads before the take.
+    staged(&[&[&WRITES_PHYSICS], &[&READS_PHYSICS_FIRST, &TAKES_AFTER_READER]]).unwrap();
+    staged(&[&[&WRITES_PHYSICS], &[&READS_PHYSICS]]).unwrap();
 }
 
 #[test]

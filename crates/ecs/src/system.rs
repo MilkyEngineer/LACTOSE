@@ -9,7 +9,7 @@ use lactose_task::JobContext;
 
 use crate::access::Access;
 use crate::change::Stamp;
-use crate::command::CommandBuffer;
+use crate::command::{ChannelCommand, CommandBuffer};
 use crate::event::{EventRecord, PresentRecord};
 use crate::param::{Ctx, SystemParam};
 use crate::storage::RowView;
@@ -280,6 +280,10 @@ pub(crate) enum Slot<'r, 'j> {
     Present(&'r mut Vec<PresentRecord>),
     /// The `Vec<ChannelEntry<C>>` of a channel, if it has entries.
     Channel(Option<&'r (dyn Any + Send + Sync)>),
+    /// The sink of one `ChannelWriter` parameter.
+    WriteChannel(&'r mut Vec<ChannelCommand>),
+    /// The `Vec<ChannelEntry<C>>` of a channel, removed from the world, if it had entries.
+    TakeChannel(Option<Box<dyn Any + Send + Sync>>),
     Job(&'r mut JobContext<'j>),
     World(&'r mut World),
 }

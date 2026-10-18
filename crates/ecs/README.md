@@ -29,7 +29,7 @@ and list what changed, because `sim`, `predict`, `physics-api`, `net`, `persist`
 | `World`, `WorldBuilder`, `WorldKind`, `WorldSet`, `LayoutConfig`, `ChunkOrder` | The world, built for one kind with a `lactose_reflect::Registry`, a start tick and SOUR's layout options |
 | `#[system]`, `#[finalize]`, `SystemDescriptor`, `SystemSet`, `Access` | A system is a function; the attribute emits a descriptor static with its access table |
 | `Res`, `ResMut`, `RegionRes`, `&T`, `Mut`, `Option<&T>`, `Option<Mut<T>>`, `With`, `Without`, `Changed`, `Ctx`, `StableKeyOf`, `Job`, `&mut World` | System parameters, each a `SystemParam` with a constant `ACCESS` |
-| `Commands`, `Bundle`, `CommandChannel`, `ChannelWriter`, `Channel` | Structural commands applied at the next sync point; typed channels for other crates' commands |
+| `Commands`, `Bundle`, `CommandChannel`, `ChannelWriter`, `Channel`, `ChannelTake` | Structural commands applied at the next sync point; typed channels for other crates' commands, written through a `ChannelWriter<C>` parameter, read through `Channel<C>` and taken through `ChannelTake<C>` in an exclusive system |
 | `Event`, `EventWriter`, `Events` | Cross-entity effects within a tick, indexed by target |
 | `PresentEvent`, `PresentEvents`, `PresentEventBatch` | Requests to presentation, keyed by (origin, tick, kind, sequence) for rollback |
 | `Schedule`, `ScheduleBuilder`, `ScheduleError` | Stages separated by sync points; a deterministic order; `run_tick` and `run_pass`; `ScheduleBuilder::order`, an edge between two sets added by the assembler |
@@ -149,10 +149,12 @@ What a system is, from its parameters (`SystemParam` has the table):
   `Without<T>` beside any parameter on `T` (`Changed<T>` and `With<T>` combine with one data
   parameter on `T`), `Mut` on a world-maintained or reference-bearing component, `Changed`
   on an untracked column; and (`ScheduleError::InvalidParameter`) a component parameter or
-  `&mut World` in a finalize, `&mut World` outside an exclusive system, `Commands`, `Job` or
-  `&mut World` twice, or `ResMut<T>` beside another parameter on `T`, each of which would
-  hand one parameter what another holds. A per-region system whose region lacks a named
-  `RegionRes` is skipped in that region.
+  `&mut World` in a finalize, `&mut World` or `ChannelTake<C>` outside an exclusive system,
+  `Commands`, `Job`, `&mut World` or `ChannelTake<C>` of one channel twice,
+  `ChannelTake<C>` beside `Channel<C>` or `ChannelWriter<C>` on one channel, or `ResMut<T>`
+  beside another parameter on `T`, each of which would hand one parameter what another
+  holds. A per-region system whose region lacks a named `RegionRes` is skipped in that
+  region.
 
 ## Behaviour the signatures cannot express
 
@@ -461,8 +463,9 @@ repeat, layout and chaos modes.
 | `systems.rs` | The section 6.1 systems, `#[finalize]` included, for several ticks in a server and a prediction world; the prediction filter |
 | `commands.rs` | Apply order (execution order, source key, sequence), the same under every layout |
 | `predicted.rs` | Predicted keys equal on both machines, unshifted by a server-only spawn; collisions; binds and aliases; `PredictedOrigin` and a reference to the entity through export and load, byte for byte |
-| `events.rs` | Event order and clearing, `EventsBeforeEmitter`, channels across stages |
-| `schedule_errors.rs` | Every `ScheduleError` variant; `run_tick` failing on `prepare` and on shutdown |
+| `events.rs` | Event order and clearing, `EventsBeforeEmitter`, channels across stages; a kernel whose only output is a channel entry; two writers in parameter order; a take that yields the earlier stages' entries once |
+| `schedule_errors.rs` | Every `ScheduleError` variant, the channel placements (`ChannelAfterTaker`, `ChannelWithoutConsumer`) and the `ChannelTake` refusals among them; `run_tick` failing on `prepare` and on shutdown |
+| `channel_skip.rs` | A taker skipped for a resource removed mid-run is logged at `error`, naming the channel it did not take |
 | `change.rs` | `Mut` and `set_if_neq` stamps, fresh and stale marks, `Changed<T>` seen once per reader, `ColumnMut::write` with and without dirty rows, column ticks, the 2^30 rebase |
 | `erased.rs` | `ErasedColumn::changed_since` selects the rows `World::changed_since` selects, under every layout, for writes inside a tick and between ticks, with a fresh and a stale mark |
 | `snapshot.rs` | Ten ticks, a snapshot at three, a restore and a re-run equal in every column, row tick and `Changed` set; presentation events deduplicated and cancelled; stale cursors; binds kept; pruning |

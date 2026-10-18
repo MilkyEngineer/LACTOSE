@@ -21,7 +21,10 @@ each entry point fetches, and the `#[system]` expansion, which derives both from
 parameter types and the `writes` list, is its one caller. A `writes` entry fetches nothing:
 it declares a write the system makes through commands or `&mut World`, outside every
 kernel, and only adds an ordering constraint, so it can make a table overstate what the
-kernel touches but never understate it.
+kernel touches but never understate it. A `ChannelWriter` fetches a sink the run made for
+that parameter alone and appends to the invocation's buffer after the kernel, and a
+`ChannelTake` fetches the store the run removed from the world before lending it, so
+neither aliases what another parameter holds (D126).
 
 The `#[finalize]` pairing is by name: `#[finalize(f)]` emits `__finalize_f`, a
 `Finalize<O>` holding the finalize function's table and its entry point, and the

@@ -64,6 +64,8 @@ fn run(layout: LayoutConfig) -> Outcome {
         .add(&APPLY_DAMAGE)
         .add(&FOOTSTEPS)
         .add(&ANIMATE);
+    // The bomb's impulse needs a consumer in a later stage (D126).
+    builder.stage("physics", &[]).add(&PHYSICS);
     builder.stage("churn", &[]).add(&CHURN);
     let mut schedule = builder.build().unwrap();
     let mut presented = Vec::new();

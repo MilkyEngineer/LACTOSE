@@ -1,6 +1,6 @@
 //! Events and channels: a reader ordered after the emitters sees every event in (emitting
 //! system, source, sequence) order; events clear at the next input sync point; channel
-//! entries reach later stages and `take_channel` with their keys resolved.
+//! entries reach later stages' readers and takers with their keys resolved.
 
 #![forbid(unsafe_code)]
 
@@ -11,8 +11,8 @@ use std::sync::Mutex;
 use common::*;
 use lactose_core::StableKey;
 use lactose_ecs::{
-    Channel, CommandChannel, Commands, Ctx, EventWriter, Events, LayoutConfig, Res, Schedule,
-    ScheduleError, StableKeyOf, WorldKind, system,
+    Channel, ChannelTake, ChannelWriter, CommandChannel, Commands, Ctx, EventWriter, Events,
+    LayoutConfig, Res, Schedule, ScheduleError, StableKeyOf, World, WorldKind, system,
 };
 use lactose_math::{Scalar, Vec2};
 
@@ -118,10 +118,10 @@ fn a_reader_not_ordered_after_an_emitter_is_rejected() {
 
 /// Writes a physics command naming an entity spawned in the same invocation.
 #[system(name = "test::push_spawned", worlds = [server])]
-fn push_spawned(ctx: Ctx, cmd: Commands, _counter: &Counter) {
+fn push_spawned(ctx: Ctx, cmd: Commands, physics: ChannelWriter<Physics>, _counter: &Counter) {
     if ctx.tick().0 == 1 {
         let spawned = cmd.spawn((Bomb { fuse: 1 },));
-        cmd.apply_impulse(spawned, Vec2::new(Scalar::ONE, Scalar::ZERO));
+        physics.apply_impulse(spawned, Vec2::new(Scalar::ONE, Scalar::ZERO));
     }
 }
 
@@ -181,7 +181,7 @@ impl CommandChannel for Deferred {
 fn push_late(ctx: Ctx, cmd: Commands, _counter: &Counter) {
     if ctx.tick().0 == 1 {
         cmd.channel::<Deferred>().push(Impulse { body: net(5), impulse: Vec2::ZERO });
-        cmd.apply_impulse(net(5), Vec2::ZERO);
+        cmd.channel::<Physics>().apply_impulse(net(5), Vec2::ZERO);
     }
 }
 
@@ -248,4 +248,90 @@ fn a_taken_deferred_channel_is_empty_and_a_restore_drops_it() {
 
     world.restore(&snapshot).unwrap();
     assert!(world.channel::<Deferred>().is_empty(), "a restore drops every channel");
+}
+
+/// A kernel whose only output is a channel entry: no command, event or presentation event.
+#[system(name = "test::push_only", worlds = [server])]
+fn push_only(key: StableKeyOf, physics: ChannelWriter<Physics>, _counter: &Counter) {
+    physics.apply_impulse(*key, Vec2::ZERO);
+}
+
+/// A per-region kernel whose only output is a channel entry.
+#[system(name = "test::push_per_region", worlds = [server])]
+fn push_per_region(ctx: Ctx, physics: ChannelWriter<Physics>) {
+    physics.apply_impulse(net(ctx.region().0 + 100), Vec2::ZERO);
+}
+
+#[test]
+fn a_kernel_whose_only_output_is_a_channel_entry_keeps_it() {
+    let executor = executor();
+    let mut world = world(WorldKind::Server, LayoutConfig::default());
+    for id in [6, 5] {
+        world.spawn(net(id), REGION, (Counter(0),)).unwrap();
+    }
+    world.insert_service::<Seen>(Box::new(Mutex::new(Vec::new())));
+    let mut builder = Schedule::builder(WorldKind::Server);
+    builder.stage("write", &[]).add(&PUSH_ONLY).add(&PUSH_PER_REGION);
+    builder.stage("read", &[]).add(&READ_IMPULSES_LATER);
+    let mut schedule = builder.build().unwrap();
+    world = tick(&mut schedule, world, &executor);
+    let mut seen = std::mem::take(&mut *world.service_mut::<Seen>().unwrap().get_mut().unwrap());
+    seen.sort_by_key(|&(key, from_entity)| (from_entity, key));
+    let region = net(REGION.0 + 100);
+    assert_eq!(seen, [(region, 0), (net(5), 1), (net(6), 1)]);
+}
+
+/// Spawns, then writes through two writers: the second's entry first in the body, yet after
+/// the first's in command order, which is parameter order.
+#[system(name = "test::push_two_writers", worlds = [server])]
+fn push_two_writers(
+    ctx: Ctx,
+    cmd: Commands,
+    first: ChannelWriter<Physics>,
+    second: ChannelWriter<Physics>,
+    _counter: &Counter,
+) {
+    let tick = ctx.tick().0;
+    if tick <= 2 {
+        second.apply_impulse(net(40 + u64::from(tick)), Vec2::ZERO);
+        let spawned = cmd.spawn((Bomb { fuse: tick },));
+        first.apply_impulse(spawned, Vec2::ZERO);
+    }
+}
+
+/// What the taker took each tick, by entry.
+type Taken = Mutex<Vec<Vec<(StableKey, i32)>>>;
+
+#[system(name = "test::take_impulses", worlds = [server], exclusive)]
+fn take_impulses(world: &mut World, taken: ChannelTake<Physics>, log: Res<Taken>) {
+    let _ = world.tick();
+    assert_eq!(taken.len(), taken.iter().count());
+    assert_eq!(taken.is_empty(), taken.iter().next().is_none());
+    let entries = taken
+        .into_entries()
+        .into_iter()
+        .map(|entry| (entry.entry.body, i32::from(entry.source.is_some())));
+    log.lock().unwrap().push(entries.collect());
+}
+
+#[test]
+fn a_take_yields_the_earlier_stages_entries_with_keys_resolved_once() {
+    let executor = executor();
+    let mut world = world(WorldKind::Server, LayoutConfig::default());
+    world.spawn(net(5), REGION, (Counter(0),)).unwrap();
+    world.insert_service::<Taken>(Box::new(Mutex::new(Vec::new())));
+    let mut builder = Schedule::builder(WorldKind::Server);
+    builder.stage("simulation", &[]).add(&PUSH_TWO_WRITERS);
+    builder.stage("physics", &[]).add(&TAKE_IMPULSES);
+    let mut schedule = builder.build().unwrap();
+    for _ in 0..3 {
+        world = tick(&mut schedule, world, &executor);
+    }
+    let taken = std::mem::take(&mut *world.service_mut::<Taken>().unwrap().get_mut().unwrap());
+    // The spawns resolve to the server's runtime keys, 1 and 2; each tick's take holds that
+    // tick's entries alone, and the third tick wrote none.
+    assert_eq!(
+        taken,
+        [vec![(net(1), 1), (net(41), 1)], vec![(net(2), 1), (net(42), 1)], Vec::new()]
+    );
 }

@@ -5,8 +5,10 @@
 #![forbid(unsafe_code)]
 #![deny(warnings)]
 
+use lactose_core::StableKey;
 use lactose_ecs::{
-    Commands, Ctx, Job, Mut, Res, ResMut, StableKeyOf, SystemSet, World, finalize, system,
+    ChannelTake, ChannelWriter, CommandChannel, Commands, Ctx, Job, Mut, Res, ResMut, StableKeyOf,
+    SystemSet, World, finalize, system,
 };
 use lactose_math::{ExactSum, Scalar};
 use lactose_reflect::{component, resource};
@@ -18,6 +20,17 @@ pub struct Mass(#[field(id = 1)] pub Scalar);
 pub struct Total(#[field(id = 1)] pub Scalar);
 
 pub static SET: SystemSet = SystemSet::new("ui::set");
+
+/// A channel of keys.
+pub struct Pushes;
+
+impl CommandChannel for Pushes {
+    type Entry = StableKey;
+
+    fn remap(entry: &mut StableKey, f: &mut dyn FnMut(&mut StableKey)) {
+        f(entry);
+    }
+}
 
 #[system(name = "ui::per_entity", worlds = [server, client, prediction], in_set = SET)]
 fn per_entity(key: StableKeyOf, mass: Mut<Mass>, cmd: Commands) {
@@ -51,7 +64,18 @@ fn exclusive(world: &mut World, _total: Res<Total>) {
     let _ = world.tick();
 }
 
+#[system(name = "ui::push")]
+fn push(key: StableKeyOf, _mass: &Mass, pushes: ChannelWriter<Pushes>) {
+    pushes.push(*key);
+}
+
+#[system(name = "ui::take", exclusive)]
+fn take(world: &mut World, pushes: ChannelTake<Pushes>) {
+    let _ = (world.tick(), pushes.iter().count(), pushes.into_entries());
+}
+
 fn main() {
-    let names = [&PER_ENTITY, &PER_REGION, &ONCE, &SUM, &EXCLUSIVE].map(|system| system.name());
-    assert_eq!(names.len(), 5);
+    let names = [&PER_ENTITY, &PER_REGION, &ONCE, &SUM, &EXCLUSIVE, &PUSH, &TAKE]
+        .map(|system| system.name());
+    assert_eq!(names.len(), 7);
 }

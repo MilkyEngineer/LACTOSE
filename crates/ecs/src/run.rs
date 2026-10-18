@@ -14,7 +14,7 @@ use lactose_task::{Executor, GraphBuilder, GraphNode, JobContext};
 use crate::access::{Access, AccessKind, AccessTarget};
 use crate::apply::Pending;
 use crate::change::Stamp;
-use crate::command::{ChannelStore, CommandBuffer};
+use crate::command::{ChannelCommand, ChannelStore, CommandBuffer};
 use crate::event::{EventRecord, EventStore, PendingEmission, PresentRecord};
 use crate::param::Ctx;
 use crate::region::{ClaimedBy, InRegion, RegionId, RegionMode};
@@ -172,6 +172,8 @@ struct Output {
     events: Vec<Vec<EventRecord>>,
     /// One sink per parameter; only `PresentEvents` parameters fill theirs.
     present: Vec<Vec<PresentRecord>>,
+    /// One sink per parameter; only `ChannelWriter` parameters fill theirs.
+    channels: Vec<Vec<ChannelCommand>>,
 }
 
 impl Output {
@@ -188,7 +190,16 @@ impl Output {
             commands: CommandBuffer::new(region),
             events: (0..params).map(|_| Vec::new()).collect(),
             present: (0..params).map(|_| Vec::new()).collect(),
+            channels: (0..params).map(|_| Vec::new()).collect(),
         }
+    }
+
+    /// Moves the invocation's channel entries into its command buffer, after its commands:
+    /// called once the kernel or the finalize has returned, before `is_empty` decides
+    /// whether the output is kept, so an invocation whose only output is a channel entry
+    /// keeps it.
+    fn close_channels(&mut self) {
+        self.commands.close_channels(&mut self.channels);
     }
 
     fn is_empty(&self) -> bool {
@@ -217,6 +228,10 @@ struct Env<'r, 'j> {
     commands: Option<&'r mut CommandBuffer>,
     emit: Vec<Option<&'r mut Vec<EventRecord>>>,
     present: Vec<Option<&'r mut Vec<PresentRecord>>>,
+    write_channels: Vec<Option<&'r mut Vec<ChannelCommand>>>,
+    /// The stores an exclusive system's `ChannelTake` parameters own, removed from the
+    /// world for good.
+    takes: Vec<(TypeId, Box<dyn Any + Send + Sync>)>,
     job: Option<&'r mut JobContext<'j>>,
     world: Option<&'r mut World>,
 }
@@ -230,7 +245,7 @@ impl<'r, 'j> Env<'r, 'j> {
         job: Option<&'r mut JobContext<'j>>,
         world: Option<&'r mut World>,
     ) -> Self {
-        let Output { commands, events: emit, present, .. } = output;
+        let Output { commands, events: emit, present, channels: write_channels, .. } = output;
         Self {
             resources,
             events,
@@ -238,6 +253,8 @@ impl<'r, 'j> Env<'r, 'j> {
             commands: Some(commands),
             emit: emit.iter_mut().map(Some).collect(),
             present: present.iter_mut().map(Some).collect(),
+            write_channels: write_channels.iter_mut().map(Some).collect(),
+            takes: Vec::new(),
             job,
             world,
         }
@@ -287,6 +304,14 @@ impl<'r, 'j> Env<'r, 'j> {
             }
             (AccessKind::Read, AccessTarget::Channel { type_id, .. }) => {
                 Slot::Channel(self.channels.get(&type_id).map(|stored| &*stored.entries))
+            }
+            (AccessKind::WriteChannel, _) => Slot::WriteChannel(
+                self.write_channels[index].take().expect("one sink per parameter"),
+            ),
+            (AccessKind::TakeChannel, AccessTarget::Channel { type_id, .. }) => {
+                // The schedule allows one take of a channel per system.
+                let store = self.takes.iter().position(|(id, _)| *id == type_id);
+                Slot::TakeChannel(store.map(|position| self.takes.swap_remove(position).1))
             }
             (AccessKind::Commands, _) => {
                 Slot::Commands(self.commands.take().expect("one `Commands` per system"))
@@ -344,10 +369,21 @@ fn run_system(
         wanted.iter().filter_map(|&id| Some((id, world.resources.remove(&id)?))).collect();
     if taken.len() != wanted.len() {
         // `prepare` found every resource; an exclusive system earlier in the run removed
-        // one. The system cannot run, and the rest of the run goes on.
+        // one. The system cannot run, and the rest of the run goes on; the channels it
+        // would have taken are named, since nothing else takes them.
+        let untaken: Vec<&str> = system
+            .access()
+            .iter()
+            .filter(|access| access.kind() == AccessKind::TakeChannel)
+            .filter_map(|access| match access.target() {
+                AccessTarget::Channel { name, .. } => Some(name),
+                _ => None,
+            })
+            .collect();
         tracing::error!(
             target: "casein",
             system = system.name(),
+            untaken_channels = ?untaken,
             "a resource the system names was removed during the run; the system is skipped"
         );
         for (id, entry) in taken {
@@ -387,6 +423,7 @@ fn run_system(
             let mut invocation = Invocation::new(slots, ReducerSlot::Total(Some(total)));
             (system.kernel().finalize)(&mut invocation);
         }
+        output.close_channels();
         outputs.push(output);
     }
     for (id, entry) in taken {
@@ -434,9 +471,11 @@ fn run_exclusive(
     ctx: &mut JobContext<'_>,
     outputs: &mut Vec<Output>,
 ) {
-    // What the parameters read leaves the world too, so the world can be lent whole.
+    // What the parameters read leaves the world too, so the world can be lent whole; what
+    // they take leaves it for good.
     let mut events = EventStore::new();
     let mut channels = ChannelStore::new();
+    let mut takes = Vec::new();
     for access in system.access() {
         match (access.kind(), access.target()) {
             (AccessKind::ReadEvents, AccessTarget::Events { type_id, .. }) => {
@@ -449,6 +488,11 @@ fn run_exclusive(
                     channels.insert(type_id, entries);
                 }
             }
+            (AccessKind::TakeChannel, AccessTarget::Channel { type_id, .. }) => {
+                if let Some(stored) = world.channels.remove(&type_id) {
+                    takes.push((type_id, stored.entries));
+                }
+            }
             _ => {}
         }
     }
@@ -458,10 +502,12 @@ fn run_exclusive(
         let handles = mut_handles(taken);
         let mut env =
             Env::new(handles, &events, &channels, &mut output, Some(ctx), Some(&mut *world));
+        env.takes = takes;
         let slots = table.iter().enumerate().map(|(p, access)| env.slot(p, access)).collect();
         let mut invocation = Invocation::new(slots, ReducerSlot::None);
         (system.kernel().run)(&mut invocation);
     }
+    output.close_channels();
     for (type_id, records) in events.sorted_take() {
         world.events.insert(type_id, records);
     }
@@ -505,6 +551,7 @@ fn run_once(
         let mut invocation = Invocation::new(slots, reducer);
         (system.kernel().run)(&mut invocation);
     }
+    output.close_channels();
     partials.extend(partial);
     outputs.push(output);
 }
@@ -563,6 +610,7 @@ fn run_per_region(
             let mut invocation = Invocation::new(slots, reducer);
             (system.kernel().run)(&mut invocation);
         }
+        output.close_channels();
         partials.extend(partial);
         if !output.is_empty() {
             outputs.push(output);
@@ -712,6 +760,7 @@ fn run_per_entity(
                 let mut invocation = Invocation::new(slots, reducer);
                 (system.kernel().run)(&mut invocation);
             }
+            output.close_channels();
             if !output.is_empty() {
                 outputs.push(output);
             }
