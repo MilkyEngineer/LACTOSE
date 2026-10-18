@@ -436,6 +436,7 @@ dependencies = [
  "lactose-core",
  "lactose-input",
  "lactose-sim",
+ "loom",
 ]
 
 [[package]]

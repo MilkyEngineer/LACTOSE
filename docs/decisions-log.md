@@ -1902,6 +1902,37 @@ rationale the author supplied during the editorial pass rather than one taken fr
   and is corrected above. The game has 16 bits; a bit past 31 is ignored by `with_bit` and false
   from `contains_bit`. `lactose-input` joins `[harness]` in `tools/xtask/ci-policy.toml`, and
   CI's release step runs its golden bits.
+- Implementation of `lactose-input-host` (milestone 1): every `todo!()` is replaced with no
+  public signature change. The quantiser computes each value in `f64` from the exact widening
+  of the `f32`, through IEEE basic operations and exact ones (`floor`, `round`, the casts) only,
+  with no library function, so one raw sample gives the same integers on every target: the
+  length in `f64`, where no square of an `f32` overflows; the yaw as the fraction of
+  `yaw / TAU` (one rounding, in `[0, 1]`; 1.0 is taken modulo a turn) rather than an `fmod`
+  reduction. A non-finite stick component (NaN or infinite) counts as zero, per component, in
+  `offer_movement` and in the quantiser, so `(inf, 0.5)` quantises to `(0, 16384)`; the facade
+  stated NaN only. `turn` sums in `f64`, wraps against the `f32` `PI` and only rounds a sum
+  already in range; a sum that rounds up to the `f32` `PI` is taken a turn back from the `f64`
+  sum and rounded once, to the `f32` -PI or the `f32` just above it, whichever is nearer. A
+  non-finite delta counts as zero; of the current angles, assigned through the public fields,
+  a non-finite yaw and a NaN pitch count as zero and an infinite pitch is clamped to its limit,
+  as the quantiser does, so both angles are in range after any `turn`. Each turn rounds the yaw
+  to `f32`, so a run of turns drifts from the exact sum by up to half an `f32` ulp (about 0.0012
+  units) per turn, harmless to determinism because the client simulates the value it sends.
+  `LatestSample`'s sequence is 64 bits, so it never wraps; a reader waits only while a publish
+  is in flight (six stores), which a descheduled publisher can stretch to a scheduling quantum,
+  spinning and then yielding. The lock is written once over a private `Memory` trait, so the
+  loom models (feature `loom`, `cargo test -p lactose-input-host --features loom --release`) run
+  the shipped `publish` and `read` over loom's atomics: one publisher and a reader, two
+  publishers and a reader (which also asserts both publishes took the lock), preemption bound
+  2, pass; the same models without the publisher's `fence(Release)` find a torn read (kept as
+  `should_panic` models), as do the reader's acquire fence removed, the final sequence store
+  relaxed and the reader's first load relaxed (both models), and the CAS relaxed (the
+  two-publisher model); a publisher that drops its sample on contention fails the
+  two-publisher model. The hardware stress test (1,000,000 publishes per publisher, three
+  readers, a checksum word) passed 20 of 20 and does not detect the missing release fence on an
+  M1; Miri's weak-memory emulation does, on the shipped stress tests, so nightly Miri covers the
+  `Native` atomics and loom covers the protocol. `tests/golden.rs` pins the images of 16 raw
+  samples and the angles of six turn sequences, generated on aarch64.
 - Driven by: milestone 1, the `input` facade brief and its first design review (2026-10-10).
 
 **D121. The `net-api` facade and the `net-host` split: what sections 4, 5.3, 8.1, 8.2, 9.1, 9.2,

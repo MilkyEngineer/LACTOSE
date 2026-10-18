@@ -90,7 +90,7 @@ jobs:
       # it in the windows-lint-release job.
       - name: Math golden vectors (release)
         if: matrix.os != 'windows-latest'
-        run: cargo nextest run -p lactose-math -p lactose-input --release --locked
+        run: cargo nextest run -p lactose-math -p lactose-input -p lactose-input-host --release --locked
 
   # Clippy and the release golden vectors for Windows, beside the Windows debug test build.
   # Windows clippy matters on its own: cfg-gated code (the executor's core-type query, thread
@@ -115,7 +115,7 @@ jobs:
       # Runs even if clippy found something, so one run reports both.
       - name: Math golden vectors (release)
         if: success() || failure()
-        run: cargo nextest run -p lactose-math -p lactose-input --release --locked
+        run: cargo nextest run -p lactose-math -p lactose-input -p lactose-input-host --release --locked
 
   # The rules that are facts about manifests and files: crate-tiers.toml, the boundary's
   # static checks, the feature trees and cargo-deny. Each step runs even if an earlier one
@@ -150,12 +150,17 @@ jobs:
         run: cargo xtask vendor
       # Features unify across a build, so one crate enabling `lactose-task/loom` would switch
       # every executor to loom primitives, which panic outside a model. Only the root manifest
-      # (the version) and `crates/task` may name loom.
+      # (the version), `crates/task` and input-host's own optional `loom` feature and
+      # dependency may name loom; input-host's feature only builds its models and changes
+      # nothing it ships, and no other line of its manifest may mention loom.
       - name: Nothing enables the loom feature
         if: success() || failure()
         run: |
-          if grep -rn --include=Cargo.toml loom crates tools | grep -v '^crates/task/'; then
-            echo "only crates/task may name loom"; exit 1
+          if grep -rn --include=Cargo.toml loom crates tools | grep -v -e '^crates/task/' \
+               -e '^crates/input-host/Cargo.toml:[0-9]*:#' \
+               -e '^crates/input-host/Cargo.toml:[0-9]*:loom = \["dep:loom"]$' \
+               -e '^crates/input-host/Cargo.toml:[0-9]*:loom = { workspace = true, optional = true }$'; then
+            echo "only crates/task and input-host's optional loom feature may name loom"; exit 1
           fi
 
   # SOUR, the determinism harness (architecture section 8.3): workers mode and one layout

@@ -172,7 +172,7 @@ fn a_sweep_of_valid_samples_is_accepted() {
     assert_eq!(sweep().filter(refused).count(), 0);
 }
 
-/// The review's sweep of the quantiser as `lactose-input-host` states it: every direction
+/// The review's sweep of the stand-in quantiser (`common::quantise_movement`): every direction
 /// at lengths about one, beyond one and far beyond (up to `f32::MAX` per component), and
 /// the disc's diagonals. All accepted, the worst `x² + y² - AXIS_SCALE²` within the bound's
 /// `2·AXIS_SCALE`, and every input at least one long quantised to unit length: within

@@ -34,11 +34,15 @@ jobs:
           LACTOSE_MIRI_REAL_DEQUE: "1"
           MIRIFLAGS: -Zmiri-tree-borrows -Zmiri-ignore-leaks
       - run: cargo +$MIRI_TOOLCHAIN miri test -p lactose-ecs --locked
+      # The latest-sample slot's atomics: Miri's weak-memory emulation checks the shipped
+      # `Native` orderings, which the loom models (over their own atomics) do not.
+      - run: cargo +$MIRI_TOOLCHAIN miri test -p lactose-input-host --locked
 
   # Architecture section 5.1: the scope latch and the sleep-and-wake protocol are modelled
-  # under loom, switched on by a Cargo feature of `lactose-task` and never by a `--cfg` flag
-  # in the environment, which would replace the x86-64 pin. Release, because the models
-  # explore every interleaving.
+  # under loom, as is input-host's latest-sample sequence lock (architecture section 5.3),
+  # each switched on by a Cargo feature of its crate and never by a `--cfg` flag in the
+  # environment, which would replace the x86-64 pin. Release, because the models explore
+  # every interleaving.
   loom:
     name: loom
     runs-on: ubuntu-latest
@@ -48,6 +52,7 @@ jobs:
       - run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@v2
       - run: cargo test -p lactose-task --features loom --release --locked
+      - run: cargo test -p lactose-input-host --features loom --release --locked
 
   # SOUR, the determinism harness (architecture section 8.3): every mode, on every platform
   # of architecture mode. Each platform also emits its baseline hashes, which the next job

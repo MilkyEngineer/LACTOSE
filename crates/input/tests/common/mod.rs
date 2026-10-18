@@ -131,11 +131,13 @@ pub fn valid_sample(rng: &mut Rng) -> PlayerInput {
     }
 }
 
-/// The movement half of `Quantiser::next` as `lactose-input-host` states it, in `f32`: a
-/// NaN component counts as zero, the vector is scaled down to the unit disc if longer,
-/// its length computed without overflow (here by dividing by the larger component first,
-/// as `hypot` does, which the boundary lints forbid), then each component times
-/// `AXIS_SCALE`, rounded to nearest, ties away from zero, saturating.
+/// A stand-in quantiser for the `validate` tests, in `f32`; it is not `lactose-input-host`'s
+/// rule (which computes in `f64` and counts an infinite component as zero too), only a
+/// quantiser of the same shape whose outputs `validate` must accept: a NaN component counts
+/// as zero, the vector is scaled down to the unit disc if longer, its length computed
+/// without overflow (here by dividing by the larger component first, as `hypot` does, which
+/// the boundary lints forbid), then each component times `AXIS_SCALE`, rounded to nearest,
+/// ties away from zero, saturating.
 pub fn quantise_movement(x: f32, y: f32) -> Axis2 {
     let (x, y) = (if x.is_nan() { 0.0 } else { x }, if y.is_nan() { 0.0 } else { y });
     let larger = if x.abs() > y.abs() { x.abs() } else { y.abs() };
