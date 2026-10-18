@@ -156,7 +156,7 @@ fn replicate(
     let mut next = 41;
     for n in 0..TICKS {
         churn(replication.world_mut(), &mut script, &mut next);
-        change_interest(&mut replication, &mut script, next);
+        change_interest(&mut replication, &mut script, next, &[]);
         if n == RESYNC_AT {
             replication.change(Change::Resync);
         }

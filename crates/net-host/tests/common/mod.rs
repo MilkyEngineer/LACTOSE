@@ -10,10 +10,13 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::num::NonZeroU64;
+use std::ops::Range;
 use std::sync::{Arc, Mutex};
 
 use lactose_asset_api::AssetSet;
-use lactose_bundle::{Baseline, ComponentData, ComponentSchema, FieldLayout};
+use lactose_bundle::{
+    AuthoredGuid, Baseline, BaselineRow, ComponentData, ComponentSchema, FieldLayout, cooked_net_id,
+};
 use lactose_core::{ComponentKey, Error, ErrorKind, NetId, PlayerId, Result, StableKey, Tick};
 use lactose_ecs::{
     Executor, LayoutConfig, Mut, RegionConfig, RegionId, RegionMode, StructuralChange, World,
@@ -626,6 +629,10 @@ impl ServerModel {
             .is_some_and(|entity| entity.tombstone.is_none() || entity.reentering)
     }
 
+    fn owes_tombstone(&self, key: StableKey) -> bool {
+        self.interest.entities.get(&key).is_some_and(|entity| entity.tombstone.is_some())
+    }
+
     fn enter(&mut self, key: StableKey) {
         self.interest.enter(key).expect("far fewer entities than handles");
         self.interest.set_claimed(key, self.claimed.contains(&key));
@@ -667,6 +674,12 @@ impl ServerModel {
                         // An entity the client may fail to move (its old region unloading
                         // in the same step) arrives whole beside its move.
                         (true, true) => self.interest.resend_whole(key),
+                        // Not held and owing a tombstone: the tombstone follows the entity,
+                        // which the client's hook may have kept where the owed one names
+                        // (review r2, N1).
+                        (false, false) if self.owes_tombstone(key) => {
+                            self.leave(key, to, tick, TombstoneCause::Left);
+                        }
                         (false, false) => {}
                     }
                 }
@@ -870,6 +883,11 @@ pub struct ReceiverStats {
 /// `lactose-net`'s receiver for one connection on the network thread.
 pub struct ReceiverModel {
     pub handles: ConnectionHandles,
+    /// The key of each handle a staged `Left` tombstone released, with that tombstone,
+    /// until a spawn reuses the handle's slot or a full frame clears the mirror: the hook
+    /// may have kept the entity, and the server sends its next departure under the same
+    /// handle (review r2, N1).
+    released: BTreeMap<EntityHandle, (StableKey, Tombstone)>,
     pub slots: BTreeMap<StableKey, InterpolationSlot>,
     writer: InterpolationWriter,
     pub reader: InterpolationReader,
@@ -889,6 +907,7 @@ impl ReceiverModel {
         let (writer, reader) = InterpolationBuffer::split(1024);
         Self {
             handles: ConnectionHandles::new(),
+            released: BTreeMap::new(),
             slots: BTreeMap::new(),
             writer,
             reader,
@@ -900,6 +919,12 @@ impl ReceiverModel {
             staged: Vec::new(),
             stats: ReceiverStats::default(),
         }
+    }
+
+    /// The key a tombstone under `handle` would despawn: the mirror's, or the key of a handle
+    /// a staged `Left` tombstone released.
+    pub fn resolves(&self, handle: EntityHandle) -> Option<StableKey> {
+        self.handles.key_of(handle).or_else(|| self.released.get(&handle).map(|&(key, _)| key))
     }
 
     /// The acknowledgement field for the packets staged so far; `None` before the first,
@@ -920,6 +945,7 @@ impl ReceiverModel {
                 assert!(self.awaiting_full, "a full frame answers a request or a join");
                 self.awaiting_full = false;
                 self.handles.clear();
+                self.released.clear();
                 for (_, slot) in std::mem::take(&mut self.slots) {
                     self.writer.release(slot).expect("held");
                 }
@@ -1021,6 +1047,8 @@ impl ReceiverModel {
         self.pending.drain(..regions.len());
         frame.regions = regions;
         for spawn in &packet.spawns {
+            // The server reassigns a slot only once the tombstone it owed is acknowledged.
+            self.released.retain(|released, _| released.index != spawn.handle.index);
             self.stage_spawn(&mut frame, spawn);
         }
         for &(handle, region) in &packet.moves {
@@ -1039,14 +1067,24 @@ impl ReceiverModel {
             }
         }
         for &(handle, tombstone) in &packet.tombstones {
-            match handles.release(handle) {
-                Some(key) => {
-                    frame.despawns.insert(key, tombstone);
-                    if let Some(slot) = self.slots.remove(&key) {
-                        self.writer.release(slot).expect("held");
-                    }
+            let key = match (handles.release(handle), self.released.get(&handle)) {
+                (Some(key), _) => key,
+                // A later tombstone under a handle a staged Left one released; a resend
+                // of the one staged is ignored.
+                (None, Some(&(key, staged))) if staged != tombstone => key,
+                (None, _) => {
+                    self.stats.unknown_tombstones += 1;
+                    continue;
                 }
-                None => self.stats.unknown_tombstones += 1,
+            };
+            if tombstone.cause == TombstoneCause::Left {
+                self.released.insert(handle, (key, tombstone));
+            } else {
+                self.released.remove(&handle);
+            }
+            frame.despawns.insert(key, tombstone);
+            if let Some(slot) = self.slots.remove(&key) {
+                self.writer.release(slot).expect("held");
             }
         }
         self.handles = handles;
@@ -1409,18 +1447,132 @@ pub fn churn(world: &mut World, rng: &mut Rng, next: &mut u64) {
     }
 }
 
-/// Toggles the relevance of one of the regions after the first, and the claim of a random
-/// entity, now and then.
-pub fn change_interest(replication: &mut Replication, rng: &mut Rng, next: u64) {
+/// Toggles the relevance of one of the regions after the first but those `fixed`, and the
+/// claim of a random entity, now and then.
+pub fn change_interest(
+    replication: &mut Replication,
+    rng: &mut Rng,
+    next: u64,
+    fixed: &[RegionId],
+) {
     if rng.chance(4) {
         let region = REGIONS[1 + usize::try_from(rng.below(3)).expect("small")];
-        let relevant = !replication.model.relevant.contains(&region);
-        replication.change(Change::Relevant(region, relevant));
+        if !fixed.contains(&region) {
+            let relevant = !replication.model.relevant.contains(&region);
+            replication.change(Change::Relevant(region, relevant));
+        }
     }
     if rng.chance(4) {
         let target = key(1 + rng.below(next - 1));
         let claimed = !replication.model.claimed.contains(&target);
         replication.change(Change::Claimed(target, claimed));
+    }
+}
+
+/// Cooked entities in [`CookedChurn::REGION`] for the convergence scenarios (review r2: a
+/// scenario without them never reaches a `Left` tombstone the hook skips). Their rows
+/// change; in `window` the region leaves the client's interest for short spells, and they
+/// depart, destroyed or moved to a third or fourth region, where a tombstone of them would
+/// reach the client: always while one is owed, at the window's end, and rarely else. The first
+/// departure fixes the region's relevance from then on, since the model's load places a
+/// region's cooked entities whatever the server holds (it has no overlay).
+pub struct CookedChurn {
+    pub keys: Vec<StableKey>,
+    window: Range<u32>,
+    pub frozen: bool,
+    pub departures: u32,
+}
+
+impl CookedChurn {
+    pub const REGION: RegionId = REGIONS[1];
+
+    /// Cooks the region with three entities and spawns them on the server; before the join.
+    pub fn new(replication: &mut Replication, window: Range<u32>) -> Self {
+        let keys: Vec<StableKey> = (0..3_u8)
+            .map(|n| cooked_net_id(AuthoredGuid([7; 16]), AuthoredGuid([10 + n; 16]), &[]))
+            .map(StableKey::Net)
+            .collect();
+        let at = |n: usize| Position { x: i32::try_from(n).expect("small"), y: 5 };
+        let rows = keys.iter().enumerate().map(|(n, &key)| {
+            let StableKey::Net(id) = key else { unreachable!("cooked keys are net keys") };
+            BaselineRow { id, components: vec![data(at(n)), data(Health(5)), data(Mover(0))] }
+        });
+        let baseline = Baseline::from_rows(
+            AssetSet::new(),
+            schemas(types().registry()),
+            rows.collect::<Vec<_>>(),
+        );
+        replication.cook(Self::REGION, baseline.expect("a cooked baseline"));
+        for (n, &key) in keys.iter().enumerate() {
+            let world = replication.world_mut();
+            world.spawn(key, Self::REGION, (at(n), Health(5), Mover(0))).expect("spawn");
+        }
+        Self { keys, window, frozen: false, departures: 0 }
+    }
+
+    /// The regions whose relevance stays as it is.
+    pub fn fixed(&self) -> &'static [RegionId] {
+        if self.frozen { &[Self::REGION] } else { &[] }
+    }
+
+    /// One tick's churn, before the tick and before `change_interest`.
+    pub fn step(&mut self, replication: &mut Replication, rng: &mut Rng, n: u32) {
+        let key = self.keys[usize::try_from(rng.below(3)).expect("small")];
+        let value = rng.below(1000);
+        let world = replication.world_mut();
+        if rng.chance(20) && world.contains(key) {
+            match value % 3 {
+                0 => world.insert(key, Health(i32::try_from(value).expect("small"))).map(drop),
+                1 => world.insert(key, Status(u32::try_from(value).expect("small"))).map(drop),
+                _ => world.remove::<Status>(key).map(drop),
+            }
+            .expect("a live entity takes every change");
+        }
+        if !self.window.contains(&n) {
+            return;
+        }
+        // A departure while the entity owes a tombstone is the case of review r2, N1: the
+        // client may have kept the entity for a Left tombstone the departure must replace.
+        // Short gaps in the region's relevance make that state common; the window's last
+        // ticks make sure every entity departs.
+        let owes =
+            replication.model.interest.entities.get(&key).is_some_and(|e| e.tombstone.is_some());
+        let late = n + 30 >= self.window.end;
+        if (owes || late || rng.chance(1))
+            && replication.server().world().region_of(key) == Some(Self::REGION)
+            && Self::reaches(replication, key)
+        {
+            let world = replication.world_mut();
+            match value % 3 {
+                0 => world.despawn(key),
+                1 => world.move_to_region(key, REGIONS[2]),
+                _ => world.move_to_region(key, REGIONS[3]),
+            }
+            .expect("a live entity departs");
+            self.departures += 1;
+            self.frozen = true;
+        }
+        let relevant = replication.model.relevant.contains(&Self::REGION);
+        if !self.frozen && rng.chance(if relevant { 5 } else { 50 }) {
+            replication.change(Change::Relevant(Self::REGION, !relevant));
+        }
+    }
+
+    /// Whether a departure of `key` now reaches the client whatever the link does: the
+    /// packer names the region, so the region's last load is staged before anything sent
+    /// from now on; the client resolves the handle the packer holds the entity under; and
+    /// no full frame is awaited, whose loads the model takes from the cooked baseline
+    /// whatever the server holds. Otherwise it may be the gap the README states (a load
+    /// whose state predates the departure, staged after the tombstone, or a load placing a
+    /// key live elsewhere), or the model's want of an overlay.
+    fn reaches(replication: &Replication, key: StableKey) -> bool {
+        let model = &replication.model;
+        let resolves = model
+            .interest
+            .entities
+            .get(&key)
+            .is_some_and(|entity| replication.receiver.resolves(entity.handle) == Some(key));
+        model.named.contains(&Self::REGION) && resolves && !replication.receiver.awaiting_full
     }
 }
 

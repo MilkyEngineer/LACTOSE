@@ -180,19 +180,15 @@ impl ClientInterest {
     /// client's set alive in `tombstone.region`; the handle is released once the
     /// tombstone is acknowledged. Clears `in_flight`, so the tombstone goes out with the
     /// next packet. A key that is not relevant is ignored. One whose tombstone is already
-    /// owed stops [`reentering`](EntityInterest::reentering) and keeps that tombstone,
-    /// unless it owes a [`Left`](TombstoneCause::Left) one and `tombstone` is
-    /// [`Destroyed`](TombstoneCause::Destroyed), which replaces it: a client that has not
-    /// staged the first despawns the entity even where its region was loaded again.
+    /// owed stops [`reentering`](EntityInterest::reentering); `tombstone` replaces an owed
+    /// [`Left`](TombstoneCause::Left) one, so the tombstone owed names where the entity is
+    /// now (a client whose hook kept the entity for the first despawns it at the second,
+    /// which it stages under the handle the first released), and an owed
+    /// [`Destroyed`](TombstoneCause::Destroyed) one is kept.
     pub fn leave(&mut self, key: StableKey, tombstone: Tombstone) {
         let Some(entity) = self.entities.get_mut(&key) else { return };
         entity.reentering = false;
-        let replaces = match entity.tombstone {
-            None => true,
-            Some(owed) => {
-                owed.cause == TombstoneCause::Left && tombstone.cause == TombstoneCause::Destroyed
-            }
-        };
+        let replaces = entity.tombstone.is_none_or(|owed| owed.cause == TombstoneCause::Left);
         if replaces {
             entity.tombstone = Some(tombstone);
             entity.in_flight = None;

@@ -215,11 +215,17 @@ fn an_entity_relevant_again_reenters_once_its_tombstone_is_acknowledged() {
     assert_eq!(client.enter(key(1)).unwrap(), old, "the old handle until the tombstone");
     assert!(client.entities[&key(1)].reentering);
     client.sent(tombstones(&client, 1, 3, &[1]));
-    // Leaving again while the tombstone is owed: forgotten after all.
+    // Leaving again while the tombstone is owed: forgotten after all, and the later
+    // tombstone replaces the one in flight (review r2, N1), so the acknowledgement of the
+    // packet that carried the first releases nothing.
     client.leave(key(1), left(4));
     assert!(!client.entities[&key(1)].reentering);
+    assert_eq!(client.entities[&key(1)].tombstone, Some(left(4)));
     client.enter(key(1)).unwrap();
     client.acknowledge(only(1));
+    assert_eq!(client.entities[&key(1)].handle, old, "the replaced tombstone is still owed");
+    client.sent(tombstones(&client, 2, 4, &[1]));
+    client.acknowledge(only(2));
     let entity = client.entities[&key(1)];
     assert_ne!(entity.handle, old);
     assert_eq!(client.handles.key_of(old), None);
@@ -244,10 +250,10 @@ fn a_header_built_before_anything_was_received_acknowledges_nothing() {
     assert_eq!((entity.acked, entity.in_flight), (None, Some(PacketSequence(0))));
 }
 
-/// Review r1, B2: an entity that left the client's set alive and is destroyed before
-/// the Left tombstone is acknowledged owes a Destroyed one instead, since a client whose
-/// region was loaded again keeps an entity for a Left tombstone. The acknowledgement of
-/// the packet that carried the Left one no longer releases the handle.
+/// Review r1, B2, and r2, N1: an entity that left the client's set alive and is destroyed
+/// before the Left tombstone is acknowledged owes a Destroyed one instead, since a client
+/// whose region was loaded again may have kept the entity for the Left one. The
+/// acknowledgement of the packet that carried the Left one no longer releases the handle.
 #[test]
 fn a_destruction_replaces_an_owed_left_tombstone() {
     let mut client = client();

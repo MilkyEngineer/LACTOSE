@@ -203,7 +203,15 @@ reshape.
   to one an earlier frame staged is no defect, since a claimed entity is sent whole in
   every packet that carries it and an unacknowledged row is sent again. A tombstone for a
   handle the mirror does not hold (a resend of one already staged, or one for an entity
-  whose spawn never arrived) is ignored. The receiver allocates an interpolation slot for
+  whose spawn never arrived) is ignored, but for one rule: the receiver keeps the key of
+  each handle a staged `Left` tombstone released, with that tombstone, until a spawn
+  reuses the handle's slot or a full frame clears the mirror, and stages a tombstone under
+  that handle other than the one it staged for that key (one after a `Destroyed` tombstone
+  it ignores). The hook may have kept the entity for the `Left` tombstone, and the server,
+  which releases the handle only once it sees the tombstone acknowledged, sends the
+  entity's next departure under the same handle (review r2, N1); the generation keeps the
+  handle unambiguous, and a packet older than the newest staged is dropped. The receiver
+  allocates an interpolation slot for
   each spawn of an entity the player has not claimed (keeping the slot it holds for a live
   one) and releases it at the entity's tombstone or claim.
 - Region changes arrive on the reliable channel, each stamped with the server tick it
@@ -308,34 +316,59 @@ reshape.
   on both ends, which nothing else does; and when the step that pops the frames folds a
   region's `Relevant` and then `Irrelevant` into no load, the tombstone takes out an entity
   the frames moved into the region, which resides in the region it came from and would
-  otherwise stay there in both client worlds until a full frame. The hook skips a `Left`
-  tombstone of an entity residing in the region it names (`crates/net-api/README.md`, "The
-  staged frame"): that region's unload is still to come, or the client loaded the region
-  again after the entity left, and the load holds the entity with its cooked rows, which
-  the stream never sends and a despawn would lose (review r1, B2). A `Despawned` entry is
-  a `Destroyed` tombstone naming the region the entity was destroyed in, and replaces a
-  `Left` tombstone still owed, so an entity destroyed before the client acknowledged that
-  it left is despawned even where the client loaded its region again.
+  otherwise stay there in both client worlds until a full frame. A `Despawned` entry is a
+  `Destroyed` tombstone naming the region the entity was destroyed in. A later tombstone
+  of the entity replaces a `Left` one still owed, so the tombstone owed names where the
+  server has the entity, unless the entity is entering again, and the acknowledgement of a
+  packet carrying the replaced one releases nothing (review r2, N1). The hook skips a
+  `Left` tombstone of an entity residing in the region it names (`crates/net-api/README.md`,
+  "The staged frame"), which settles the entity: that region's unload is still to come, or
+  the packer names the region and the entity enters again; a load of the region after the
+  entity left holds the entity with its cooked rows, which the stream never sends and a
+  despawn would lose (review r1, B2). An entity destroyed, or moved to a region the client
+  does not hold, before the server saw its `Left` tombstone acknowledged is despawned even
+  where the hook kept it, since the receiver stages the later tombstone under the key the
+  `Left` one released.
 - Moves: an entity moving from a region the packer may name into one it may not leaves with
   a `Left` tombstone at the move's tick naming the region it moved into, so the hook, which
   finds the entity in the region it left, despawns it; one moving the other way enters; one
   moving between two such regions is sent whole beside its move (`resend_whole`), since the
   client may not hold it to move: the step that applies the move may unload the region it
-  left first.
+  left first. An entity the packer does not hold that owes a tombstone and moves into a
+  region the packer may not name leaves again with a `Left` tombstone naming that region,
+  which replaces the one owed (review r2, N1 and N2); one moving into a region the packer
+  names enters, and its whole send and move follow the tombstone's acknowledgement.
 - With these rules the client converges to the server's relevant regions under region
-  toggling, loss, reordering and resyncs (`tests/replication.rs`). Not converging, and
-  open for `lactose-net`: an entity a region's load placed on the client (a cooked or
-  overlay entity) that the server destroys, or moves to a region the client does not hold,
-  after the load's state was taken and before the packer names the region stays on the
-  client until a full frame, since the packer never held it for that client and owes no
-  tombstone; and a load naming a key still live elsewhere on the client is refused. Both
-  need the packer to know what a region's load places, which the model does not hold.
+  toggling, loss, reordering, resyncs and claims, with a cooked region that flaps while its
+  entities change and depart (`tests/replication.rs`). Not converging, and open for
+  `lactose-net`: a tombstone reaches the client only under a handle it holds, or one a
+  staged `Left` tombstone released. An entity a region's load placed on the client (a cooked
+  or overlay entity) whose handle the client does not hold (the packer holds no record of it
+  for that client, having never held it or having forgotten it on seeing its tombstone
+  acknowledged, or the spawn under its current handle is not staged: not yet sent while the
+  packer has not named the region, in flight, or lost) stays on the client, if the server
+  destroys it or moves it to a region the client does not hold, until the region unloads or
+  a full frame. That includes a load whose state predates a tombstone the client staged
+  first: region changes travel on the reliable channel, and a datagram stamped later can
+  overtake them. So does, in the prediction world, a proxy a prediction system moved into a
+  region the packer has not named, kept by the hook for a `Left` tombstone naming that
+  region, once the server has seen the tombstone acknowledged (the replicated world, which
+  runs no systems, despawns it). A load naming a key still live elsewhere on the client is
+  refused. A tombstone that names the key while the entity's whole send is unacknowledged
+  would close the case of a record whose handle the client lacks; the rest needs the packer
+  to know what a region's load places, or the prediction world's hook to know where the
+  replicated world holds the entity, and the model holds neither.
 - What this costs, accepted: a spawn or a move into a region that the step popping it folds
   into no load (its `Relevant` and `Irrelevant` together, or a full frame's unload) is
   refused with `NotFound` and skipped by the hook, which happens under region toggling and
   is harmless, since the region's own changes settle the entity; `lactose-net`'s hook logs
   it below warning. A claimed entity whose region leaves the client's set gets a tombstone,
-  which `lactose-predict` reconciles as its destruction.
+  which `lactose-predict` reconciles as its destruction (`Fact::Destroyed`). So does a
+  claimed entity that moves into a region the packer may not name yet (an object the
+  player claimed crossing into an undelivered region, the player's entity crossing faster
+  than the region's `RegionRelevance` is delivered): the prediction world destroys it for
+  about a round trip, until the packer names the region and the claimed re-entry spawn
+  re-creates it from its replicated components (review r2, N3).
 - `ready` holds the regions the client acknowledged with `ClientReady`, the network's copy;
   the hold itself moves simulation state and enters the server tick as a journaled input at
   milestone 4 (a `lactose-sim` addition, `SessionEvent::Ready { region }` or a `TickInput`
@@ -445,7 +478,7 @@ reshape.
 |---|---|
 | Quantisation | `tests/quant.rs`: `quantise(dequantise(q)) == q` for positions over a sweep under the 64-bit scalar, ties away from zero; saturation at the `i32` and `i16` limits; NaN to zero; `q` and `-q` quantise alike, a component rounding to zero included; the rate at which one trip moves a uniform rotation measured (one unit per moving component, none in four components, at most one value in a thousand in three and one in ten thousand moving again), and the worst case found near half-unit boundaries, three components moved and settling only on a second trip; the zero, NaN and infinite quaternions to all-zero and back to `IDENTITY`; golden bits of `dequantise` for a small table. `tests/sour.rs` records the quantised and dequantised wire values of every entity of a replication under SOUR, whose architecture mode compares them between x86-64 and aarch64 |
 | The handshake | `tests/handshake.rs`: the hash is xxh64 of the stated stream; golden `ProtocolHash` for the empty registry, a small one and the engine's own, pinned; adding a replicated, persistent or transient type, raising a version, changing a field's ID, offset, size, tag or kind each change it; adding a derived unreplicated type does not; the constants block changes it; `check` reports the first difference in field order and converts to `VersionMismatch`; `from_bytes(to_bytes(h)) == h` |
-| Handles and packets | `tests/handles.rs`: a released slot is reused with the next generation and the old handle is stale, across the generation wrap; 65536 assignments then `ResourceExhausted`; `insert`'s refusals; a client mirror driven by the receiver rules equals the server's table after spawns and tombstones delivered in any order under loss, delay and duplication, a tombstone overtaking its spawn included, with the reordered spawn dropped and resent; `clear` at the full frame then its inserts, with a pre-resync handle naming nothing; a full frame overtaken by later deltas is staged first and the deltas dropped and resent; `after` and `covers` across the wrap; `AckField::received` one arrival at a time, across the wrap and at the window's edge, and over three laps of reordered, lossy arrivals equal to the field computed from absolute packet numbers; the ring evicts the oldest when full, `acknowledge` takes exactly one record, `expire` takes exactly the older ones. `tests/replication.rs`: a malformed packet (a row of another length, a row of an unknown handle, a spawn component of another length) changes nothing and is not acknowledged, and a claimed entity's rows are staged all or none |
-| Interest | `tests/interest.rs`: `enter` sends whole until an acknowledgement; a claimed entity is whole in every packet; `acknowledge` advances exactly the carried entities and clears exactly the acknowledged `in_flight`; a lost, expired or evicted packet re-queues its entities; an acknowledged tombstone releases the handle and a re-entry waits for it; a `Destroyed` tombstone replaces an owed `Left` one, and the acknowledgement of the `Left` one then releases nothing; a header with no field acknowledges nothing; `resend_whole` is not undone by an older acknowledgement; a resync clears and refills the client's handles. `tests/replication.rs`: the mirror after a sequence of gathered frames equals the server's replicated rows, a removed component gone, and a full gather replaces it with an entity despawned in the gap gone; every frame holding an exact row of an entity holds every replicated component the server's entity has at the frame's tick; the client world converges to the server's relevant regions under churn, loss, reordering, duplication, resyncs and claims, with equal handle tables, a slot holding a state for every unclaimed entity and none for a claimed one, no region load refused and the hook skipping only spawns and moves refused with `NotFound`; an entity moved into a region made relevant and irrelevant again in one step leaves with the region, its `Left` tombstone applied; an entity moved out of a region that unloads in the same step arrives whole; two changes of one region due for one frame are staged in two; review r1's schedules: a removal beside a move between named regions, beside a claim, and lost before a move reaches the client (B1); a region flap over a cooked entity, staged in two frames, popped in one step and over separate steps, keeps the entity's unreplicated cooked row (B2); an entity destroyed while its `Left` tombstone is owed leaves no ghost; the model receiver acknowledges no lost packet after the sequence wraps (M8) |
+| Handles and packets | `tests/handles.rs`: a released slot is reused with the next generation and the old handle is stale, across the generation wrap; 65536 assignments then `ResourceExhausted`; `insert`'s refusals; a client mirror driven by the receiver rules equals the server's table after spawns and tombstones delivered in any order under loss, delay and duplication, a tombstone overtaking its spawn included, with the reordered spawn dropped and resent; `clear` at the full frame then its inserts, with a pre-resync handle naming nothing; a full frame overtaken by later deltas is staged first and the deltas dropped and resent; `after` and `covers` across the wrap; `AckField::received` one arrival at a time, across the wrap and at the window's edge, and over three laps of reordered, lossy arrivals equal to the field computed from absolute packet numbers; the ring evicts the oldest when full, `acknowledge` takes exactly one record, `expire` takes exactly the older ones. `tests/replication.rs`: a malformed packet (a row of another length, a row of an unknown handle, a spawn component of another length) changes nothing and is not acknowledged, and a claimed entity's rows are staged all or none; the model receiver stages a later tombstone under a handle a staged `Left` one released, ignores a resend of the staged one, and ignores the handle after a `Destroyed` tombstone, a spawn reusing its slot and a full frame |
+| Interest | `tests/interest.rs`: `enter` sends whole until an acknowledgement; a claimed entity is whole in every packet; `acknowledge` advances exactly the carried entities and clears exactly the acknowledged `in_flight`; a lost, expired or evicted packet re-queues its entities; an acknowledged tombstone releases the handle and a re-entry waits for it; a later tombstone, `Left` or `Destroyed`, replaces an owed `Left` one, and the acknowledgement of the replaced one then releases nothing; a header with no field acknowledges nothing; `resend_whole` is not undone by an older acknowledgement; a resync clears and refills the client's handles. `tests/replication.rs`: the mirror after a sequence of gathered frames equals the server's replicated rows, a removed component gone, and a full gather replaces it with an entity despawned in the gap gone; every frame holding an exact row of an entity holds every replicated component the server's entity has at the frame's tick; the client world converges to the server's relevant regions under churn, loss, reordering, duplication, resyncs and claims, with a cooked region that flaps while its entities change and depart wherever a tombstone of them reaches the client, with equal handle tables, a slot holding a state for every unclaimed entity and none for a claimed one, no region load refused and the hook skipping only spawns and moves refused with `NotFound`; an entity moved into a region made relevant and irrelevant again in one step leaves with the region, its `Left` tombstone applied; an entity moved out of a region that unloads in the same step arrives whole; two changes of one region due for one frame are staged in two; review r1's schedules: a removal beside a move between named regions, beside a claim, and lost before a move reaches the client (B1); a region flap over a cooked entity, staged in two frames, popped in one step and over separate steps, keeps the entity's unreplicated cooked row (B2); an entity destroyed while its `Left` tombstone is owed leaves no ghost; the model receiver acknowledges no lost packet after the sequence wraps (M8); review r2's schedules: an entity destroyed after the client's hook kept it for its `Left` tombstone, a reentering entity that moves on to a region the client does not hold, and an entity owing a tombstone that moves before its region is named again leave no ghost (N1, N2) |
 | The interpolation buffer | `tests/interpolation.rs`: a stress test with words derived from one counter, one writer and three readers, sampling single and batched while slots are reallocated: every sample is a state that was pushed, never a mix, with the stated orderings (no loom model), and the same at 150 pushes for Miri, whose weak-memory emulation gives torn samples there for a reader's first load left `Relaxed` and for its `Acquire` fence dropped (review r1, M3), which the hardware variant misses; `sample` cases: bracketed, held newest, held oldest, held on either side of a teleport by `teleported`, missing after release and under a stale generation; a push older than the ring is dropped and an equal tick replaces; out-of-order pushes give the same ring; `sample_batch` equals `sample` per slot. `tests/interpolation_alloc.rs`: `sample` and `sample_batch` allocate nothing, counted by the tagged global allocator |
 | The transport | `tests/consumers.rs`: the loopback sketch under the trait's contract: event order per connection, the size limit, `NotFound` after `disconnect`, `rtt` zero |

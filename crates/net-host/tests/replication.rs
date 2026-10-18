@@ -183,13 +183,16 @@ fn the_client_converges_under_churn_loss_reorder_resyncs_and_claims() {
     let executor = executor(2);
     for seed in [1_u64, 2, 3] {
         let mut replication = Replication::new(LayoutConfig::default(), 40, &[R1, R2], seed);
+        let mut cooked = CookedChurn::new(&mut replication, 560..690);
         replication.link = LinkConfig::POOR;
         replication.lag = 6;
         let mut script = Rng::new(seed * 31);
+        let mut events = Rng::new(seed * 77 + 5);
         let mut next = 41;
         for n in 0..700 {
             churn(replication.world_mut(), &mut script, &mut next);
-            change_interest(&mut replication, &mut script, next);
+            cooked.step(&mut replication, &mut events, n);
+            change_interest(&mut replication, &mut script, next, cooked.fixed());
             if n == 300 || n == 550 {
                 replication.change(Change::Resync);
             }
@@ -198,7 +201,11 @@ fn the_client_converges_under_churn_loss_reorder_resyncs_and_claims() {
         calm(&mut replication, &executor, next);
         replication.assert_converged(&format!("seed {seed}"));
         let stats = replication.receiver.stats;
-        println!("seed {seed}: {stats:?}, {} whole checks", replication.whole_checks);
+        println!(
+            "seed {seed}: {stats:?}, {} whole checks, {} departures",
+            replication.whole_checks, cooked.departures
+        );
+        assert!(cooked.departures > 0, "seed {seed}");
         assert_eq!(stats.malformed, 0, "seed {seed}");
         assert!(stats.late > 50, "seed {seed}: {stats:?}");
         assert!(stats.unknown_tombstones > 0, "seed {seed}: {stats:?}");
@@ -536,6 +543,151 @@ fn an_entity_destroyed_while_its_left_tombstone_is_owed_leaves_no_ghost() {
     }
     replication.assert_converged("after the flap and the destruction");
     assert!(!replication.client().world().contains(cooked_key()));
+}
+
+/// The cooked entity's owed tombstone on the server, if any.
+fn owed(replication: &Replication) -> Option<Tombstone> {
+    replication.model.interest.entities.get(&cooked_key()).and_then(|entity| entity.tombstone)
+}
+
+/// The flap of the first case, waited out until the packer names R2 again: the client has
+/// unloaded and reloaded R2 with the cooked entity in it, and the server owes `Left(R2)`
+/// and marks the entity reentering.
+fn flapped_and_named() -> (Replication, Executor) {
+    let (mut replication, executor) = cooked();
+    replication.link.loss = 100;
+    replication.change(Change::Relevant(R2, false));
+    replication.tick(&executor);
+    replication.change(Change::Relevant(R2, true));
+    while !replication.model.named.contains(&R2) {
+        replication.tick(&executor);
+    }
+    assert_eq!(owed(&replication).map(|tombstone| tombstone.region), Some(R2));
+    assert!(replication.model.interest.entities[&cooked_key()].reentering);
+    (replication, executor)
+}
+
+/// Review r2, N1 (p7a): the client stages the `Left` tombstone and its hook keeps the
+/// entity; the server destroys it before the acknowledgement arrives. The `Destroyed`
+/// tombstone goes out under the handle the client released, which still names the entity.
+#[test]
+fn an_entity_destroyed_after_the_client_kept_it_for_its_left_tombstone_leaves_no_ghost() {
+    let (mut replication, executor) = flapped_and_named();
+    replication.link.loss = 0;
+    let from = replication.frames.len();
+    let staged = |replication: &Replication| {
+        frames_since(replication, from).iter().any(|frame| {
+            frame.despawns.get(&cooked_key()).is_some_and(|t| t.cause == TombstoneCause::Left)
+        })
+    };
+    for _ in 0..20 {
+        if staged(&replication) {
+            break;
+        }
+        replication.tick(&executor);
+    }
+    assert!(staged(&replication), "the Left tombstone was staged");
+    assert!(replication.client().world().contains(cooked_key()), "kept by its region");
+    assert_eq!(owed(&replication).map(|tombstone| tombstone.cause), Some(TombstoneCause::Left));
+    replication.world_mut().despawn(cooked_key()).unwrap();
+    for _ in 0..30 {
+        replication.tick(&executor);
+    }
+    replication.assert_converged("after the destruction");
+    assert!(!replication.client().world().contains(cooked_key()));
+}
+
+/// Review r2, N1 (p7b): R2 is named again and the entity is reentering under the owed
+/// `Left(R2)` when it moves to R3, which the client does not hold. The `Left(R3)` tombstone
+/// replaces the owed one, so the client, which holds the entity in the reloaded R2,
+/// despawns it.
+#[test]
+fn a_reentering_entity_that_moves_on_owes_a_tombstone_naming_where_it_went() {
+    let (mut replication, executor) = flapped_and_named();
+    replication.world_mut().move_to_region(cooked_key(), R3).unwrap();
+    replication.tick(&executor);
+    assert_eq!(owed(&replication).map(|tombstone| tombstone.region), Some(R3));
+    replication.link.loss = 0;
+    for _ in 0..30 {
+        replication.tick(&executor);
+    }
+    replication.assert_converged("after the move");
+    assert!(!replication.client().world().contains(cooked_key()));
+}
+
+/// Review r2, N2 (p7c): the same move before the packer names R2 again, the entity not
+/// held and owing `Left(R2)`. The packer issues the tombstone again, naming R3.
+#[test]
+fn an_entity_owing_a_tombstone_that_moves_owes_one_naming_where_it_went() {
+    let (mut replication, executor) = cooked();
+    replication.link.loss = 100;
+    replication.change(Change::Relevant(R2, false));
+    replication.tick(&executor);
+    replication.change(Change::Relevant(R2, true));
+    replication.tick(&executor);
+    assert!(!replication.model.named.contains(&R2));
+    replication.world_mut().move_to_region(cooked_key(), R3).unwrap();
+    replication.tick(&executor);
+    assert_eq!(owed(&replication).map(|tombstone| tombstone.region), Some(R3));
+    replication.link.loss = 0;
+    for _ in 0..30 {
+        replication.tick(&executor);
+    }
+    replication.assert_converged("after the move");
+    assert!(!replication.client().world().contains(cooked_key()));
+}
+
+fn wire_spawn(handle: EntityHandle, n: u64) -> WireSpawn {
+    WireSpawn { handle, key: key(n), region: R1, claimed: false, components: Vec::new() }
+}
+
+/// Stages one packet of `spawns` and `tombstones` at `tick` and returns its despawns.
+fn despawns(
+    receiver: &mut ReceiverModel,
+    tick: u32,
+    spawns: Vec<WireSpawn>,
+    tombstones: Vec<(EntityHandle, Tombstone)>,
+) -> Vec<(StableKey, Tombstone)> {
+    let mut packet = Packet::new(PacketSequence(tick as u16), Tick(tick));
+    packet.spawns = spawns;
+    packet.tombstones = tombstones;
+    receiver.packet(&packet);
+    let frame = receiver.staged.pop().expect("staged");
+    frame.despawns.iter().map(|(&key, &tombstone)| (key, tombstone)).collect()
+}
+
+/// Review r2, N1: a handle a staged `Left` tombstone released names its key for a later
+/// tombstone; a resend of the staged one is ignored, as is any tombstone under the handle
+/// after a `Destroyed` one, a spawn reusing its slot or a full frame.
+#[test]
+fn a_handle_released_by_a_left_tombstone_names_its_key_for_a_later_tombstone() {
+    let mut receiver = ReceiverModel::new(sizes(types().registry()));
+    let (first, second) =
+        (EntityHandle { index: 0, generation: 1 }, EntityHandle { index: 1, generation: 1 });
+    let spawns = vec![wire_spawn(first, 1), wire_spawn(second, 2)];
+    receiver.control(Control::Full { tick: Tick(1), regions: Vec::new(), spawns });
+    let left = |region, tick| Tombstone { region, tick: Tick(tick), cause: TombstoneCause::Left };
+    let destroyed =
+        |tick| Tombstone { region: R3, tick: Tick(tick), cause: TombstoneCause::Destroyed };
+    let both = vec![(first, left(R2, 2)), (second, left(R2, 2))];
+    assert_eq!(despawns(&mut receiver, 2, Vec::new(), both).len(), 2);
+    let later = vec![(first, left(R2, 2)), (second, left(R3, 3))];
+    assert_eq!(despawns(&mut receiver, 3, Vec::new(), later), [(key(2), left(R3, 3))]);
+    assert_eq!(receiver.stats.unknown_tombstones, 1, "the resend");
+    // The server reassigns the first slot only once it saw the tombstone acknowledged.
+    let reused = EntityHandle { index: 0, generation: 2 };
+    let after_reuse = vec![(first, destroyed(4))];
+    assert!(despawns(&mut receiver, 4, vec![wire_spawn(reused, 3)], after_reuse).is_empty());
+    let destruction = vec![(second, destroyed(5))];
+    assert_eq!(despawns(&mut receiver, 5, Vec::new(), destruction), [(key(2), destroyed(5))]);
+    assert!(despawns(&mut receiver, 6, Vec::new(), vec![(second, destroyed(6))]).is_empty());
+    assert_eq!(receiver.stats.unknown_tombstones, 3);
+    assert_eq!(despawns(&mut receiver, 7, Vec::new(), vec![(reused, left(R2, 7))]).len(), 1);
+    receiver.request_full();
+    receiver.control(Control::Full { tick: Tick(8), regions: Vec::new(), spawns: Vec::new() });
+    receiver.staged.clear();
+    assert!(despawns(&mut receiver, 9, Vec::new(), vec![(reused, destroyed(9))]).is_empty());
+    assert_eq!(receiver.stats.unknown_tombstones, 4);
 }
 
 /// Review r1, M8: a receiver that remembers every sequence it staged acknowledges, after a

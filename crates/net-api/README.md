@@ -219,15 +219,18 @@ which `build`'s `derived` check does not see.
   entity was destroyed in) from an entity alive on the server that left the client's set
   (`Left`, naming the region it resides in: the one leaving the set, or the one it moved
   into that the client may not name). The hook skips a `Left` tombstone when the entity
-  resides in the region it names (D121 addendum, review r1 of `lactose-net-host`, B2): a
-  load of that region placed it there, and either the region's unload is still to come
-  and settles the entity, or the region was loaded again after the entity left and the
-  load holds the entity as the server had it then, cooked rows the stream never sends
-  included, which a despawn followed by the re-entry spawn would lose. In the N1 case the
-  entity resides in the region it came from, so the tombstone still takes it out. A
-  `Destroyed` tombstone replaces a `Left` one the packer still owes, so an entity
-  destroyed before the client acknowledged its `Left` tombstone is despawned even where
-  the client loaded its region again.
+  resides in the region it names (D121 addendum, review r1 of `lactose-net-host`, B2).
+  The server has the entity in that region, unless the entity is entering again, whose
+  whole send and move follow the tombstone's acknowledgement; so that region settles the
+  client's copy: its unload is still to come, or the server names the region and the
+  entity enters again. A load of the region after the entity left holds it with the
+  cooked rows the stream never sends, which a despawn followed by the re-entry spawn
+  would lose. In the N1 case the entity resides in the region it came from, so the
+  tombstone still takes it out. A later tombstone of the entity replaces a `Left` one the
+  packer still owes, and the receiver stages it under the key the `Left` one released
+  (review r2 of `lactose-net-host`, N1), so an entity destroyed, or moved to a region the
+  client does not hold, before the server saw its `Left` tombstone acknowledged is
+  despawned even where the hook kept it.
 - `removed` comes from the gather's `Removed` entries of replicated components: a status
   effect ending, a body removed. Without it the client and the prediction world keep the
   component's last value forever and the packer resends it on every whole send; with it
