@@ -26,13 +26,14 @@ pub struct RawSample {
     pub movement_x: f32,
     /// Movement forward, as `movement_x`.
     pub movement_y: f32,
-    /// The absolute camera yaw in radians, kept in `[-PI, PI)` by [`turn`](Self::turn),
+    /// The absolute camera yaw in radians, kept in `[-PI, PI)` by [`turn`](Self::turn)
+    /// (which counts a non-finite yaw as zero),
     /// so that an accumulated yaw never grows coarser than a sample unit (past 1024 rad
     /// an `f32` is, and at 8192 rad a mouse delta vanishes). Zero faces `-Z`; positive
     /// turns left.
     pub yaw: f32,
     /// The absolute camera pitch in radians, positive upward, kept within
-    /// `[-PI/2, PI/2]` by [`turn`](Self::turn).
+    /// `[-PI/2, PI/2]` by [`turn`](Self::turn) (which counts a non-finite pitch as zero).
     pub pitch: f32,
     /// The actions held this frame: the union of every source's.
     pub held: Actions,
@@ -87,16 +88,17 @@ impl RawSample {
 
     /// Adds a rotation delta, radians: `yaw + delta_yaw` wrapped into `[-PI, PI)` (summed in
     /// `f64`; a sum already in range is only rounded), and `pitch + delta_pitch` clamped to
-    /// `[-PI/2, PI/2]`. A non-finite delta is ignored, each of the two on its own. How a
-    /// mouse or a stick turns the camera; the camera rig may call it too.
+    /// `[-PI/2, PI/2]`. A non-finite delta counts as zero, each of the two on its own, and so
+    /// does a non-finite current yaw or pitch written through the public field, so both
+    /// angles are in range after any call. How a mouse or a stick turns the
+    /// camera; the camera rig may call it too.
     pub fn turn(&mut self, delta_yaw: f32, delta_pitch: f32) {
-        if delta_yaw.is_finite() {
-            self.yaw = wrap_yaw(f64::from(self.yaw) + f64::from(delta_yaw));
-        }
-        if delta_pitch.is_finite() {
-            let limit = core::f32::consts::FRAC_PI_2;
-            self.pitch = (self.pitch + delta_pitch).clamp(-limit, limit);
-        }
+        let yaw = f64::from(finite_or_zero(self.yaw));
+        let delta_yaw = f64::from(finite_or_zero(delta_yaw));
+        self.yaw = wrap_yaw(yaw + delta_yaw);
+        let limit = core::f32::consts::FRAC_PI_2;
+        let delta_pitch = finite_or_zero(delta_pitch);
+        self.pitch = (finite_or_zero(self.pitch) + delta_pitch).clamp(-limit, limit);
     }
 }
 
@@ -125,9 +127,9 @@ impl Quantiser {
     ///   longer (a non-finite component, NaN or infinite, counts as zero), then each
     ///   component times [`AXIS_SCALE`](lactose_input::AXIS_SCALE), rounded to nearest, ties
     ///   away from zero, as an `i16` (saturating);
-    /// - `yaw`: `yaw` divided by `TAU`, its fraction of a turn in `[0, 1)` times
+    /// - `yaw`: `yaw` divided by `TAU`, its fraction of a turn (one rounding, in `[0, 1]`) times
     ///   [`UNITS_PER_TURN`](lactose_input::UNITS_PER_TURN), rounded to nearest, modulo
-    ///   `UNITS_PER_TURN` (the yaw reduced into `[0, TAU)` and scaled to units); a
+    ///   `UNITS_PER_TURN` (1.0 is taken modulo a turn); a
     ///   non-finite yaw quantises to zero;
     /// - `pitch`: `pitch` clamped to `[-PI/2, PI/2]`, divided by `TAU`, times
     ///   `UNITS_PER_TURN`, rounded to nearest, clamped to
@@ -183,9 +185,10 @@ fn wrap_yaw(yaw: f64) -> f32 {
         let turns = (yaw + PI) / TAU;
         (turns - turns.floor()) * TAU - PI
     };
-    let wrapped = wrapped as f32;
-    // Either branch can round up to the `f32` PI, which is the angle -PI: in range.
-    if wrapped >= core::f32::consts::PI { (f64::from(wrapped) - TAU) as f32 } else { wrapped }
+    // Either branch can round up to the `f32` PI. A turn back from the `f64` sum, rounded
+    // once more, is the `f32` -PI, which is in range.
+    let narrow = wrapped as f32;
+    if narrow >= core::f32::consts::PI { (wrapped - TAU) as f32 } else { narrow }
 }
 
 fn quantise_movement(x: f32, y: f32) -> Axis2 {
@@ -208,7 +211,8 @@ fn quantise_yaw(yaw: f32) -> Yaw {
     if !yaw.is_finite() {
         return Yaw::ZERO;
     }
-    // The fraction of a turn, in `[0, 1)`: the subtraction is exact.
+    // The fraction of a turn: the subtraction is one rounding, in `[0, 1]`; 1.0 is taken
+    // modulo a turn.
     let turns = f64::from(yaw) / TAU;
     let fraction = turns - turns.floor();
     let units = (fraction * f64::from(UNITS_PER_TURN)).round() as u32 % UNITS_PER_TURN;

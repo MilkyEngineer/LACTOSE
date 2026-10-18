@@ -174,6 +174,8 @@ fn two_publishers<M: Memory<Sequence = AtomicU64, Word = AtomicU32>>() {
         for publisher in publishers {
             publisher.join().unwrap();
         }
+        // A publish that gave up on contention would leave the sequence at 2.
+        assert_eq!(slot.sequence.load(Ordering::SeqCst), 4, "both publishes must take the lock");
         let last = slot.read::<M>();
         assert!(last == 1 || last == 2, "after both publishes the slot holds {last}");
     });

@@ -391,10 +391,11 @@ fn a_zero_turn_never_moves_the_yaw_and_the_wrap_stays_below_pi() {
         raw.turn(0.0, 0.0);
         assert_eq!(raw.yaw, radians, "{radians}");
     }
-    // A sum just below the true PI rounds to the `f32` PI, which is above it: that is -PI.
+    // A sum just below the true PI rounds up to the `f32` PI, which is above it: a turn
+    // back from the `f64` sum lands exactly on the `f32` -PI.
     let mut raw = RawSample { yaw: PI.next_down(), ..RawSample::IDLE };
     raw.turn(1.5e-7, 0.0);
-    assert!((-PI..PI).contains(&raw.yaw), "{}", raw.yaw);
+    assert_eq!(raw.yaw, -PI);
     assert_eq!(yaw(raw.yaw), 32768);
     // A yaw assigned past PI is brought into range by the next turn.
     let mut raw = RawSample { yaw: 1e30, ..RawSample::IDLE };
@@ -419,7 +420,7 @@ fn turn_clamps_the_pitch() {
 }
 
 #[test]
-fn a_non_finite_delta_is_ignored() {
+fn a_non_finite_delta_counts_as_zero() {
     let start = RawSample { yaw: 1.0, pitch: 0.5, ..RawSample::IDLE };
     for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
         let mut raw = start;
@@ -431,6 +432,19 @@ fn a_non_finite_delta_is_ignored() {
         let mut raw = start;
         raw.turn(bad, bad);
         assert_eq!(raw, start, "{bad}");
+    }
+}
+
+#[test]
+fn a_non_finite_current_angle_counts_as_zero() {
+    // The fields are public: the input task or the camera rig may assign anything.
+    for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+        let mut raw = RawSample { yaw: bad, pitch: bad, ..RawSample::IDLE };
+        raw.turn(0.25, -0.5);
+        assert_eq!((raw.yaw, raw.pitch), (0.25, -0.5), "{bad}");
+        let mut raw = RawSample { yaw: bad, pitch: bad, ..RawSample::IDLE };
+        raw.turn(bad, bad);
+        assert_eq!((raw.yaw, raw.pitch), (0.0, 0.0), "{bad}");
     }
 }
 
