@@ -27,6 +27,9 @@
 //! - [`check_prediction_reads`] is the build check of D121: a prediction-world system may
 //!   name only components the server corrects, and an exclusive one must be one of
 //!   [`EXCLUSIVE_SYSTEMS`].
+//! - [`StagedRegion`] is the one component of this crate, registered through
+//!   [`register_types`]: where the frames last placed each proxy, which the hook's
+//!   tombstone rule reads instead of where the proxy resides.
 //!
 //! ```no_run
 //! use lactose_core::{NetId, PlayerId, StableKey, Tick};
@@ -45,6 +48,7 @@
 //! let mut types = TypeTable::new();
 //! lactose_input::register_types(&mut types)?;
 //! lactose_net_api::register_types(&mut types)?;
+//! lactose_predict::register_types(&mut types)?;
 //! // ... every other crate's `register_types`, `setup` and `register_systems` ...
 //! let simulation = SimulationBuilder::new(WorldKind::Prediction, types)
 //!     .tick(Tick(join_tick.0 + lead))
@@ -93,6 +97,7 @@ mod hook;
 mod predictor;
 mod reconcile;
 mod ring;
+mod staged_region;
 
 pub use check::{EXCLUSIVE_SYSTEMS, check_prediction_reads, prediction_may_name};
 pub use compare::PredictionTolerance;
@@ -104,18 +109,30 @@ pub use reconcile::{
     Absorbed, Correction, CorrectionCause, Divergence, PredictionStats, Reconciled, ResyncReason,
 };
 pub use ring::{Ring, SlotBytes};
+pub use staged_region::{StagedRegion, register_types};
 
 /// What the contract promises at the type level, pinned so the implementation cannot lose
 /// it without a compile error: the predictor is owned by the timer root, a `'static` task,
 /// and its runs are driven there; the hook is what `sim` takes as its staged-state service;
 /// the ring travels with the predictor; the outcomes and the statistics are plain values
-/// a frame hands across threads; and the default depth is a ring, not a slot.
+/// a frame hands across threads; the default depth is a ring, not a slot; and the region
+/// record is a component the world stores and snapshots, `derived` so it is never hashed
+/// or saved and so a prediction system may name it (D121's check).
 const _: () = {
+    use lactose_reflect::{Component, Persistence, Reflect};
     use lactose_sim::StagedState;
 
     const fn send<T: Send>() {}
     const fn send_sync<T: Send + Sync>() {}
     const fn staged_state<T: StagedState>() {}
+    const fn component<T: Component>() {}
+
+    component::<StagedRegion>();
+    send_sync::<StagedRegion>();
+    assert!(
+        matches!(StagedRegion::SCHEMA.info().persistence(), Persistence::Derived),
+        "the region record is derived: restored by a rollback, never hashed or saved"
+    );
 
     send::<Predictor>();
     send::<StepRun<'_>>();

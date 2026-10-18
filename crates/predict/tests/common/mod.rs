@@ -108,6 +108,16 @@ fn throw(cmd: Commands, input: &PlayerInput) {
     }
 }
 
+/// Kicks the ball, key 5, into [`OTHER_REGION`] on the press edge of `Interact`: a game
+/// system that moves a proxy in the prediction world, which the frames never confirm.
+/// Journaled by the sample, so a rollback replays it.
+#[system(name = "test::kick", worlds = [server, prediction])]
+fn kick(cmd: Commands, input: &PlayerInput) {
+    if input.pressed.contains(Action::Interact) {
+        cmd.move_to_region(key(5), OTHER_REGION);
+    }
+}
+
 #[system(name = "test::trail", worlds = [server, prediction])]
 fn trail(_changed: Changed<Position>, position: &Position, trail: Mut<Trail>) {
     trail.x = position.x;
@@ -137,6 +147,7 @@ pub fn register_types(types: &mut TypeTable) -> Result<()> {
     types.register::<Diary>()?;
     lactose_input::register_types(types)?;
     lactose_net_api::register_types(types)?;
+    lactose_predict::register_types(types)?;
     lactose_physics_api::register_types(types)
 }
 
@@ -147,7 +158,7 @@ pub fn types() -> TypeTable {
 }
 
 pub fn register_game(registration: &mut Registration) {
-    registration.stage(Stage::Simulation).add(&WALK).add(&THROW);
+    registration.stage(Stage::Simulation).add(&WALK).add(&THROW).add(&KICK);
     registration.stage(Stage::Post).add(&TRAIL).add(&CHIRP);
     registration.pass(Pass::Extract).add(&EXTRACT);
 }
@@ -207,6 +218,12 @@ pub fn moving(x: i16) -> PlayerInput {
 pub fn throwing() -> PlayerInput {
     let throw = Actions::EMPTY.with(Action::Throw);
     PlayerInput { held: throw, pressed: throw, ..PlayerInput::IDLE }
+}
+
+/// Standing, with `Interact` pressed: the kick of key 5 into [`OTHER_REGION`].
+pub fn kicking() -> PlayerInput {
+    let kick = Actions::EMPTY.with(Action::Interact);
+    PlayerInput { held: kick, pressed: kick, ..PlayerInput::IDLE }
 }
 
 /// Moving by `x` with `Jump` held, and pressed on this sample if `pressed`.

@@ -10,7 +10,7 @@ use lactose_core::{PlayerId, StableKey, Tick};
 use lactose_ecs::{RegionId, World};
 use lactose_input::player_entity;
 use lactose_net_api::{RemoteSlot, StagedFrame, Tombstone, TombstoneCause};
-use lactose_predict::{CorrectionCause, LocalPlayer};
+use lactose_predict::{CorrectionCause, LocalPlayer, StagedRegion};
 use lactose_reflect::Reflect;
 use lactose_sim::{StagedState, StreamingAnchor};
 
@@ -121,12 +121,10 @@ fn a_left_tombstone_of_a_proxy_its_loaded_region_holds_is_skipped() {
     assert!(rig.reconcile().corrections.is_empty());
 }
 
-/// Review r2 of `lactose-net-host`, N1: a proxy residing in the region a move-out `Left`
-/// tombstone names is kept, however it came to reside there (here the prediction world
-/// moved it, as a prediction system's `Commands::move_to_region` would, with no load); the
-/// server's next departure of the entity, which the receiver stages under the key the
-/// `Left` tombstone released, despawns it: a `Left` naming another region, or a
-/// `Destroyed`.
+/// Review r2 of `lactose-net-host`, N1: a proxy kept for a `Left` tombstone naming the
+/// region the frames placed it in is despawned by the server's next departure of the
+/// entity, which the receiver stages under the key the `Left` tombstone released: a `Left`
+/// naming another region, or a `Destroyed`.
 #[test]
 fn a_proxy_kept_for_a_left_tombstone_is_despawned_by_a_later_tombstone() {
     let mut rig = Rig::joined();
@@ -136,24 +134,140 @@ fn a_proxy_kept_for_a_left_tombstone_is_despawned_by_a_later_tombstone() {
     frame.spawns.insert(net(6), remote(REGION, 4, vec![data(at(2, 2)), data(Health(3))]));
     rig.push(frame);
     rig.step(walking(13));
-    for n in [5, 6] {
-        rig.world_mut().move_to_region(key(n), OTHER_REGION).unwrap();
-    }
     let tombstone = |region, tick, cause| Tombstone { region, tick: Tick(tick), cause };
     let mut frame = StagedFrame::new(Tick(13));
     for n in [5, 6] {
-        frame.despawns.insert(key(n), tombstone(OTHER_REGION, 13, TombstoneCause::Left));
+        frame.despawns.insert(key(n), tombstone(REGION, 13, TombstoneCause::Left));
     }
     rig.push(frame);
     rig.step(walking(14));
     assert!(rig.world().contains(key(5)) && rig.world().contains(key(6)), "kept");
     let mut frame = StagedFrame::new(Tick(14));
     frame.despawns.insert(key(5), tombstone(RegionId(3), 14, TombstoneCause::Left));
-    frame.despawns.insert(key(6), tombstone(OTHER_REGION, 14, TombstoneCause::Destroyed));
+    frame.despawns.insert(key(6), tombstone(REGION, 14, TombstoneCause::Destroyed));
     rig.push(frame);
     rig.step(walking(15));
     assert!(!rig.world().contains(key(5)), "the server has it in a region the client lacks");
     assert!(!rig.world().contains(key(6)), "destroyed");
+    assert!(rig.reconcile().corrections.is_empty());
+}
+
+/// Where the frames last placed a proxy, as its `StagedRegion` records it.
+fn placed(world: &World, key: StableKey) -> Option<RegionId> {
+    world.get::<StagedRegion>(key).map(|placed| placed.region)
+}
+
+/// The gap of D121's addendum (review r2 of `lactose-net-host`, N1, prediction world): a
+/// prediction system kicks a proxy into a region the server has not named; the server
+/// then moves the entity into that region and, unable to name it, sends a `Left`
+/// tombstone naming it, the last it sends of the entity once acknowledged. The hook finds
+/// the proxy residing in the region the tombstone names, but the frames last placed it
+/// elsewhere, so the tombstone is not the region's to settle and the proxy is despawned,
+/// as the replicated world despawns its copy; one the frames placed there is kept. A
+/// rollback through the kick and the tombstone ends the same, since the placement is a
+/// column the ring restores.
+#[test]
+fn a_proxy_a_prediction_system_moved_is_despawned_by_a_left_tombstone_naming_its_region() {
+    let mut rig = Rig::joined();
+    rig.step_to(12, walking);
+    let mut frame = StagedFrame::new(Tick(12));
+    frame.spawns.insert(net(5), remote(REGION, 3, vec![data(at(1, 1)), data(Health(2))]));
+    frame.spawns.insert(net(6), remote(OTHER_REGION, 4, vec![data(at(2, 2)), data(Health(3))]));
+    rig.push(frame);
+    rig.step(walking(13));
+    assert_eq!(placed(rig.world(), key(5)), Some(REGION));
+    assert_eq!(placed(rig.world(), key(6)), Some(OTHER_REGION));
+    // The kick's command applies in tick 14; the frames keep the placement.
+    rig.step(kicking());
+    let world = rig.world();
+    assert_eq!(world.region_of(key(5)), Some(OTHER_REGION));
+    assert_eq!(placed(world, key(5)), Some(REGION));
+    let left = |region| Tombstone { region, tick: Tick(14), cause: TombstoneCause::Left };
+    let mut frame = StagedFrame::new(Tick(14));
+    frame.despawns.insert(key(5), left(OTHER_REGION));
+    frame.despawns.insert(key(6), left(OTHER_REGION));
+    rig.push(frame);
+    rig.step(walking(15));
+    assert!(!rig.world().contains(key(5)), "the frames placed it elsewhere");
+    assert!(rig.world().contains(key(6)), "settled by its region");
+    assert!(rig.reconcile().corrections.is_empty());
+
+    // A substitution of 13 by the sample the player sent anyway rolls back to 12 and
+    // re-simulates the kick and the tombstone's frame, to the same world.
+    let mut frame = StagedFrame::new(Tick(15));
+    frame.substituted.insert(Tick(13));
+    rig.push(frame);
+    rig.step(walking(16));
+    let hash = rig.hash();
+    let reconciled = rig.reconcile();
+    assert_eq!(summaries(&reconciled)[0].0, Tick(12));
+    assert_eq!(reconciled.resimulated, 4);
+    assert_eq!(rig.hash(), hash, "the re-simulated world equals the straight run");
+    assert!(!rig.world().contains(key(5)));
+    assert_eq!(placed(rig.world(), key(6)), Some(OTHER_REGION));
+}
+
+/// A proxy no frame has placed (here spawned directly, as a region's load places its
+/// cooked rows before the server names the region) is settled by the region it resides in:
+/// a `Left` tombstone naming it is skipped, one naming another region despawns it.
+#[test]
+fn a_proxy_no_frame_placed_is_settled_by_the_region_it_resides_in() {
+    let mut rig = Rig::joined();
+    rig.step_to(12, walking);
+    let world = rig.world_mut();
+    world.spawn(key(5), REGION, (at(1, 1), Health(2))).unwrap();
+    world.spawn(key(6), REGION, (at(2, 2), Health(3))).unwrap();
+    world.move_to_region(key(5), OTHER_REGION).unwrap();
+    assert_eq!(placed(world, key(5)), None);
+    let left = |region| Tombstone { region, tick: Tick(12), cause: TombstoneCause::Left };
+    let mut frame = StagedFrame::new(Tick(12));
+    frame.despawns.insert(key(5), left(OTHER_REGION));
+    frame.despawns.insert(key(6), left(OTHER_REGION));
+    rig.push(frame);
+    rig.step(walking(13));
+    assert!(rig.world().contains(key(5)), "it resides where the tombstone names");
+    assert!(!rig.world().contains(key(6)), "it resides elsewhere");
+    assert!(rig.reconcile().corrections.is_empty());
+}
+
+/// The placement follows the frames: a proxy's spawn, upsert and move write it, and a
+/// release writes the releasing spawn's region, in the predicted tick and through the
+/// correction a rollback makes of the release.
+#[test]
+fn the_placement_follows_the_frames_spawns_moves_and_releases() {
+    let mut rig = Rig::joined();
+    rig.step_to(12, walking);
+    assert_eq!(placed(rig.world(), proxy()), Some(REGION), "the join frame's spawn");
+    assert_eq!(placed(rig.world(), cart()), None, "claimed: not the frames' to place");
+    let mut frame = StagedFrame::new(Tick(12));
+    frame.moves.insert(proxy(), OTHER_REGION);
+    // The server releases the cart into the other region.
+    frame.spawns.insert(net(2), remote(OTHER_REGION, 7, vec![data(at(50, 0)), data(Health(10))]));
+    rig.push(frame);
+    rig.step(walking(13));
+    let world = rig.world();
+    assert_eq!(world.region_of(proxy()), Some(OTHER_REGION));
+    assert_eq!(placed(world, proxy()), Some(OTHER_REGION));
+    assert_eq!(claim(world, cart()), None);
+    assert_eq!(world.region_of(cart()), Some(OTHER_REGION));
+    assert_eq!(placed(world, cart()), Some(OTHER_REGION));
+    // The release is a fact compared at 12, where the cart was claimed: the correction
+    // writes the release at 12 and the replay of 13 does not re-apply it.
+    let reconciled = rig.reconcile();
+    assert_eq!(summaries(&reconciled).len(), 1);
+    assert_eq!(reconciled.corrections[0].entities, vec![cart()]);
+    let world = rig.world();
+    assert_eq!(claim(world, cart()), None);
+    assert_eq!(world.region_of(cart()), Some(OTHER_REGION));
+    assert_eq!(placed(world, cart()), Some(OTHER_REGION));
+    assert_eq!(placed(world, proxy()), Some(OTHER_REGION));
+    // An upsert moves the proxy back and places it again.
+    let mut frame = StagedFrame::new(Tick(13));
+    frame.spawns.insert(net(3), remote(REGION, 0, vec![data(at(-47, 0))]));
+    rig.push(frame);
+    rig.step(walking(14));
+    assert_eq!(rig.world().region_of(proxy()), Some(REGION));
+    assert_eq!(placed(rig.world(), proxy()), Some(REGION));
     assert!(rig.reconcile().corrections.is_empty());
 }
 
