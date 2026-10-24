@@ -490,6 +490,7 @@ dependencies = [
  "lactose-core",
  "lactose-task",
  "tracing",
+ "zstd",
 ]
 
 [[package]]

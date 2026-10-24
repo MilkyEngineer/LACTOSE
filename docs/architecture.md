@@ -377,12 +377,19 @@ tick N        tick N+1 simulation ───────────────�
   rebased (a restore puts them back as snapshotted) and every consumer's state is reset,
   forcing a full pass; a region load stamps its rows at the current tick instead.
 - **Regions** are the unit of streaming, relevance and persistence. Region membership is a
-  component; chunks belong to archetypes, not regions, so scattered players do not fragment
-  storage into mostly-empty chunks. Region operations (unload, save, relevance) are filtered
-  scans, and the only world that is ever snapshotted whole is the separate prediction world.
-  A region owns an asset version table and region resources. Entities move between regions
-  by a command that changes the membership component; identities do not change. Entities owned by another entity (inventory items,
-  attachments) migrate with their owner.
+  component; chunks belong to archetypes, not regions, so scattered players do not fragment storage
+  into mostly-empty chunks. Region operations (unload, save, relevance) are filtered scans, and the
+  only world that is ever snapshotted whole is the separate prediction world. A region owns an asset
+  version table and region resources. Entities move between regions by a command that changes the
+  membership component; identities do not change. Ownership (`OwnedBy`) is a forest the ECS keeps
+  over the live world: an entity has at most one owner, is never its own owner and no chain of
+  owners returns to its start. A write that would close a cycle is refused; a region load, or a
+  bind, that would close one through a saved or stale edge the world could not see leaves the
+  closing reference empty and logs it, so every saved region loads and the broken edge is what the
+  next save records. Entities owned by another entity (inventory items, attachments) migrate with
+  their owner and are despawned with it; writing `OwnedBy` moves nothing, so an owned entity may
+  reside in another region than its owner, where `OwnedBy` is a weak cross-region reference like any
+  other.
 - **Region modes**: `Simulated`, `Replicated` (rows written only at the input sync point from
   staged network state), `Frozen`. The input sync point is the first sync point of a tick,
   before any stage runs; it is where the time scale, asset version tables, region bundles and
@@ -551,6 +558,23 @@ presentation, pose evaluation, VFX, audio, UI, asset IO timing and input samplin
   detection selects correctly rounded paths only and is allowlisted.
 - No wall-clock time. `Instant` and `SystemTime` are banned; `Duration` as a value type is
   fine. Tick index and fixed delta only.
+- No file system, process environment, subprocess or network access: what the simulation reads
+  enters as a tick input. The boundary lint file bans `std::fs`, `std::env`, `std::net`,
+  `std::process::Command`, standard input and what the process learns of itself (its ids, its
+  terminal, its working directory, the core count, the backtrace variables); a test that needs one
+  lifts the lint with `#[expect]` on its one item. Every crate of `[boundary_internal] any` carries
+  these bans too, and a boundary crate's tests are held to the dependency allowlist as the crate is.
+- No thread creation outside an executor. Parallel work goes through `lactose_task`'s executor, and
+  the physics step through the solver pool of section 16, which `lactose-app` builds and hands to
+  the backend. The boundary lint file bans `std::thread::spawn`, `Builder`'s and `Scope`'s spawns
+  and `std::thread::scope`, the scope those threads start in;
+  `lactose_task::Platform::spawn_thread`; rayon's and Rapier's pool builders; and the routes found
+  to start rayon's global pool: rayon's free functions, iterator sources and bridges, the traits a
+  parallel iterator of a crate's own is written with, Rapier's `clear_thread_pool`, and the public
+  functions of the pinned Rapier and parry found to run parallel work outside
+  `PhysicsPipeline::step`. The list is not provably complete (D132). `cargo xtask boundary` requires
+  each listed route. A test that needs a thread lifts the lint with `#[expect]` on its one item.
+  Every crate of `[boundary_internal] any` carries the standard library's entries.
 - No thread-local state. No global mutable state. The one exception is the allocation tag
   in `core`, which the allocator alone reads and no simulation result can observe.
 - Hash maps are `core::FixedHashMap`. Iteration order is never observable.
@@ -642,13 +666,13 @@ replays exactly. The one-row capacity uses a matching small slab.
 Static enforcement uses stable tooling: `clippy.toml` per boundary crate with
 `disallowed-methods` and `disallowed-types` (thread-locals are banned through
 `std::thread::LocalKey`, since a local exception cannot reach an item macro); the boundary
-dependency allowlist in `crate-tiers.toml`, checked by `cargo xtask boundary`; `cargo-deny` with
-`multiple-versions = "deny"` for shared crates; `cargo xtask vendor` for each crate built from
-`vendor/` (section 8.2): offline, the copy is its patch applied to its record and the patch is
-within the rule; online, the record is re-derived from the crates.io archive and the advisory
-check runs over the upstream versions, which `cargo-deny` skips behind a path source. The two
-proc-macro crates carry the boundary `clippy.toml` as well, since the code they emit is
-compiled inside boundary crates.
+dependency allowlist in `crate-tiers.toml`, checked by `cargo xtask boundary`, directly and through
+the workspace closure; `cargo-deny` with `multiple-versions = "deny"` for shared crates; `cargo
+xtask vendor` for each crate built from `vendor/` (section 8.2): offline, the copy is its patch
+applied to its record and the patch is within the rule; online, the record is re-derived from the
+crates.io archive and the advisory check runs over the upstream versions, which `cargo-deny` skips
+behind a path source. The two proc-macro crates carry the boundary `clippy.toml` as well, since the
+code they emit is compiled inside boundary crates.
 No custom lint crate. Miri runs on nightly as the one exception to the stable-toolchain rule.
 Because Cargo resolves features per build, CI dumps `cargo tree -e features` for the boundary
 dependencies of each shipped binary, the SOUR test crate among them, and requires them
@@ -1090,6 +1114,12 @@ which sets ring depth, so the test measures that loop, not only server throughpu
 
 `physics-rapier` is inside the boundary. Replacement is a backend swap behind `physics-api`
 including `snapshot` and `restore`.
+
+A backend validates every `Transform`, `Velocity`, `RigidBody`, `Shape`, `Collider`, `Joint`,
+`BodyDesc` and `PhysicsCommand` it is given by the rules `physics-api` states and exports as
+predicates, and adds no rule of its own on them; it also applies the same-body, step-input and
+query-parameter rules `physics-api` states, so every backend and every crate that authors a body
+refuses one set of values with one message (D135).
 
 ## 17. Animation
 

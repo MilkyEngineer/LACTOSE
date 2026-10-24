@@ -32,6 +32,7 @@ fn median(mut samples: Vec<Duration>) -> Duration {
 }
 
 /// The machine's load averages, as `uptime` prints them.
+#[expect(clippy::disallowed_types, reason = "a measurement test that logs the machine's load")]
 fn load() -> String {
     std::process::Command::new("uptime")
         .output()

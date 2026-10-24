@@ -1000,6 +1000,80 @@ rationale the author supplied during the editorial pass rather than one taken fr
     precedent of `physics` for `physics-api`'s contract (D119). Rules out a codename for a
     crate without one.
 - Driven by: milestone 1, the `io` facade brief and its design reviews r1 and r2 (2026-10-24).
+- Addendum (lane io-impl, 2026-10-25; fix rounds 1 to 4): `lactose-io` is implemented behind
+  the facade's surface, by the blocking backend on every platform, with no signature change.
+  - Replaces of one path are ordered by a waitlist in the queue, keyed by `Path` equality (so
+    `d/./a` and `d/a/` are `d/a`; `./d/a` is another key).
+    - A replace of a keyed path waits there. The thread that finishes or skips the one before
+      it moves it to the back of the FIFO queue, so it starts after every request first polled
+      while it waited.
+    - No pool thread waits. A cancelled request is skipped before it starts.
+    - `stop` cancels the queue and every waitlist outside the lock.
+    - `join` holds the thread list's lock across the joins, so every `shutdown` called at once
+      returns only after every thread has exited. `shutdown` is therefore never called from a
+      pool thread, which runs the wakers of the requests it completes: behind a `shutdown`
+      already joining that thread it hangs, and alone it joins the thread it runs on, which
+      panics on Unix (and so aborts a binary) and hangs on Windows.
+  - A replace renames over a final symbolic link: the path becomes a regular file and the
+    target is unchanged.
+  - Error kinds are confined per request.
+    - A system call's error maps through `From<std::io::Error>`, and any kind outside the
+      request's README list becomes `Io` with its source kept. A `NotFound` from
+      `create_dir_all` is therefore `Io`.
+    - A `read_dir` entry removed mid-listing is left out.
+  - Refused before submission:
+    - a length above `MAX_READ_BYTES` is `ResourceExhausted`, checked first;
+    - an overflowing range is `InvalidData`;
+    - an empty encoded range is `InvalidData`.
+    A zero-length `read_at` resolves empty without submitting, even on a stopped pool. A
+    refused request still has its span, with `error` recorded.
+  - The pool checks a stored range before reserving the decoded buffer: zstd's frame magic,
+    `find_frame_compressed_size == len`, and `get_frame_content_size == Some(decoded_len)`.
+  - The future decodes with a `DCtx` set to `WindowLogMax(27)`.
+    - Each `decompress_stream` call is given at most 64 KiB of output and at most 64 KiB of the
+      stored range. The input bound keeps a crafted frame of millions of empty or one-byte
+      blocks from being one long call.
+    - Output goes into progressively zero-filled spare capacity (`OutBuffer::around_pos`; the
+      uninitialised `WriteBuf` would need `unsafe`).
+    - The decode yields after 0.5 ms with a self-wake.
+    - zstd's memory-allocation code is `ResourceExhausted`; every other zstd error is
+      `InvalidData`.
+  - The temporary token is a `RandomState` hash of the process id and the first-use time,
+    truncated to 32 bits. The counter is process-wide. `create_new` tries 16 names, then gives
+    `Io`.
+  - Proof: 54 tests under nextest.
+    - The proofs that hold a pool thread, or watch a replace's steps, use `#[cfg(test)]` hooks
+      of the pool. The sync functions report each sync themselves, so a replace that skips one
+      shows a step fewer.
+    - The integration tests' allocator records the largest block asked of it. That needs one
+      `unsafe impl GlobalAlloc` in `tests/requests.rs`, argued in the crate's `SAFETY.md`; the
+      library keeps `#![forbid(unsafe_code)]`. That test binary runs under Miri only with Tree
+      Borrows, because of `core`'s tag trailer (`crates/core/SAFETY.md`).
+    - Each of these mutations fails at least one test:
+      - removing the waitlist;
+      - removing the skip of a dropped queued request;
+      - removing the output or input step bound;
+      - ignoring the sweep's token check;
+      - removing the temporary or directory sync;
+      - moving the read_file cap after the allocation;
+      - releasing a waitlisted replace to the front;
+      - joining without the lock.
+    - `StorageFull` is tested where `LACTOSE_IO_SMALL_FS` names a small file system; it was run
+      on an 8 MiB APFS disk image.
+  - zstd is a normal dependency of `lactose-io`, and so of `lactose-app`, so both build
+    zstd-sys's C code. Their cross-target clippy on the Mac uses stand-in `CC_<target>` and
+    `AR_<target>` scripts.
+  - Measured on the M1, macOS 14.7.4:
+    - At load averages 6.99 7.94 9.22: the pool's threads run at `QOS_CLASS_UTILITY`, relative
+      priority 0. `sync_all` on a directory returns `Ok` on APFS (the data volume and a disk
+      image) and on HFS+ and exFAT (fskit) disk images, and `Io::replace` into each resolves
+      `Ok`.
+    - At load averages 4.42 6.76 8.86 to 3.56 6.38 8.66, the longest decode poll, over three
+      runs:
+      - 0.75 ms for a frame of 10M empty blocks (82.8 ms before the input bound);
+      - 0.95 ms for the same frame decoding to 1 MiB;
+      - 0.84 ms for one-byte blocks (2.5 ms before);
+      - 0.61 ms for 32 MiB of level-3 text.
 
 **D131. The `app` facade: what sections 2, 5.1, 9.2, 11, 14, 15.3, 16, 18 and 19 left open** (§2, §3, §4, §5.1, §9.2, §9.3, §11, §14, §15.2, §15.3, §16, §18, §19, §22, `lactose-app`, `lactose-io`, `lactose-persist`, `lactose-predict`, `lactose-sim`, `lactose-task`)
 - Why: the facade is written before the headless binary, the milestone 1 netcode spike and the
@@ -3010,6 +3084,48 @@ rationale the author supplied during the editorial pass rather than one taken fr
   substitution at or before a resync's restart skipped, after the restart's slot left the ring
   too. The review's original q1 and q2, first reported in frame 17 after the claim's frame 14
   was reconciled, break (b) and are the shape it excludes.
+- Addendum (lane predict-repair-skip, 2026-10-24; fix rounds 1 and 2, 2026-10-24): *A
+  substitution or repair whose replacement equals the ring's sample byte for byte is no
+  correction point.* Review r2 of the repeated report noted (item 5) that such a replacement
+  cost a re-simulation, and a resync past the ring, while changing nothing. Examples are the
+  substitute of `moving(1)` with no action held, or a repair whose edges already match the
+  substitute before it. Decided: `lactose-predict` compares the replacement's sample bytes with
+  the ring's, and an equal one makes no point. Nothing is restored or re-simulated on its
+  account, and `Reconciled` reports no correction for it. Slot *t* already ran that sample, so
+  the replacement is no reason to roll back; a fact the tolerance absorbed stays absorbed, as
+  without it (a rollback from *t* − 1 would write every fact at *t* − 1, the absorbed ones
+  included, D124). A rollback from another point re-simulates the tick with its unchanged
+  sample. The tick is still acted on. A first report is counted in
+  `PredictionStats::substitutions` and kept among the substitutions acted on, so a repeat is
+  skipped. It arms the repair after it. The slot's `PlayerSample::substituted` mark is written.
+  That mark changes no tick by a rule now stated in `lactose-sim` (the `InputApplier` and
+  `PlayerSample::substituted` docs and its README): of the entry, what `apply` writes depends
+  on `sample.sample` and `sample.input_tick` alone, never on `sample.substituted`, nor on state
+  the applier keeps between calls; the mark is the journal's. A later replacement of the same
+  tick is judged by its own bytes: a re-substitution once the tick before it changed, or a
+  repair armed again. Past the ring, equality is not known: the sample of *t* − 1 left with its
+  slot and the predictor keeps none past it. The client's redundancy window (eight ticks) is
+  `net`'s and the packet record is `net-host`'s, outside the boundary. So a substitution or
+  repair whose *t* − 1 is before the horizon is `TooOld` whatever its bytes, as before, and the
+  review's s3 shape still resyncs. Rejected: remembering, beside each substitution acted on,
+  the substitute it wrote, so that a repair due after its previous slot left the ring could be
+  judged. It would decide a single tick at the horizon, the one whose oldest slot is the
+  substituted tick itself, at the cost of new state. In the ring, a repeat whose previous slot
+  is unchanged now equals what the first report wrote, so q1, q2, q4 and the repeat tests whose
+  previous slot the ring holds hold the skip by the substitutions count alone. A repeat whose
+  previous slot has left the ring fails without the skip on a `TooOld` resync. The
+  depth-above-the-window test, which pops its repeat when the ring's oldest slot is the
+  substituted tick, is the one that review r2's M16 (forgetting by the window alone) fails, on
+  a `TooOld` resync. Tests that forced a rollback with a substitution by the sample the player
+  sent anyway now change the sample's yaw alone, which no test system reads. Held by
+  tests/substitution.rs: an equal substitution and an equal repair re-simulate nothing
+  (`Reconciled::resimulated` and `PredictionStats::ticks_resimulated`), the hash is unchanged
+  and equal to a run of the server's inputs, and the substitution is counted once with its
+  repeat skipped; an equal substitution is substituted again once the tick before it changes;
+  an equal repair past the ring is `TooOld` with nothing changed; the applier writes the same
+  world for samples marked substituted as unmarked. Held by tests/physics.rs: an equal
+  substitution at the tick after an absorbed fact leaves it absorbed, nothing pushed. Also held
+  by tests/ring.rs and the two rollback tests of tests/hook.rs.
 
 **D123. A third-party crate is built from a patched copy only under `vendor/`, by one rule
 for every crate, checked by `cargo xtask vendor`** (§8.2, §8.3, §9.1, §16, §20,
@@ -3723,6 +3839,295 @@ relayed by an event when it acts on another body** (§6.1, §10, `lactose-ecs`,
   - Root motion applied tick by tick drifts by about one unit in the last place per tick
     applied (11 ulps after 60 ticks, 258 after 600, at eight-byte scalars). The README states
     this bound instead of an exact end.
+
+**D132. The boundary's workspace closure, its tests, and its bans on the outside world** (§8.2, §8.3, `crate-tiers.toml`, `tools/xtask`, every boundary crate's `clippy.toml`, `lactose-reflect`, `lactose-asset-api`)
+- Why: the io facade's review (D130, finding D2) found that `lactose-io`, added to an
+  allowlisted crate (`asset-api`), reached five boundary crates unreported, since `cargo xtask
+  boundary` judged only direct workspace edges; and a boundary crate could reach files, the
+  environment and the network through std itself, which no lint banned. The reviews of the fix
+  (round 1: S1, S2, M3 to M7; round 2: four minors) widened the bans, refused dev edges and
+  closed the scan's blind spots.
+  - *Every workspace crate a boundary crate reaches through normal and build edges, at any
+    depth, through crates outside the boundary, is a boundary crate or one
+    `[boundary_internal]` lets that crate name.* A boundary crate on the way is not passed
+    through: its own reach is judged as its own, so `task`, which `ecs` alone may name, reaches
+    every crate that depends on `ecs` without a finding, and a refused crate behind `task` is
+    `ecs`'s finding. Rules out judging direct edges only.
+  - *A boundary crate's tests are held to the same rule.* Section 8.2 says "directly or at any
+    depth", and the tests run under SOUR. A workspace dev-dependency must be one the crate may
+    compile, a `[test_support]` crate or one of `[boundary_internal] dev`, which names
+    `lactose-task` for the SOUR executor. What such a crate compiles is judged at depth against
+    the same list; a boundary crate a test names is not a test root, its reach being its own.
+    Cargo never compiles a dependency's dev-dependencies, so only the crate's own dev edges are
+    followed. Rules out leaving workspace dev edges to the tier check, which let a test read
+    files through `io` with no annotation while the same test must `#[expect]` `std::fs`.
+    Third-party crates a test compiles are still judged at the direct edge only
+    (`[boundary_third_party.direct]` `dev`).
+  - *The boundary lint file bans the std routes out.* It bans:
+    - `std::fs`: its free functions, the `Path` methods that touch the file system, `File`,
+      `OpenOptions`, `DirBuilder` and the platform extensions;
+    - `std::env`: every function;
+    - `std::net`: the socket types, the Unix sockets and `to_socket_addrs`;
+    - `std::process::Command` and standard input;
+    - what the process learns of itself: `process::id`, `parent_id`, `IsTerminal::is_terminal`,
+      the working directory behind `path::absolute`, `available_parallelism` and
+      `Backtrace::capture`.
+
+    Clippy matches items, not modules, so each route is its own entry, and `cargo xtask
+    boundary` requires a sample of them. Thread creation outside an executor is banned too (the
+    addendum below). Rules out a module-level ban, which clippy cannot express.
+  - *A crate of `[boundary_internal] any` outside the boundary (`reflect` and `asset-api`
+    today, `present-api` once it exists) carries a `clippy.toml` whose file, environment,
+    subprocess and network entries are exactly the reference's.* It compiles into every
+    boundary crate, so a `std::fs::read` in it is D2 without `io`. The check selects those
+    entries by path prefix, compares them entry by entry as parsed TOML, and a unit test holds
+    the prefixes to the reference's entries that cite section 8.2. The float and executor bans
+    are not required of it. It is held to the attribute, `[lints]` and `.clippy.toml` checks a
+    boundary crate is. Rules out a byte-identical copy, which would impose the float bans, and
+    moving the crates into `[boundary]`.
+  - *`#[expect]` on one item is the only way to lift a boundary lint, in a boundary crate, a
+    crate of `[lint_file_carriers]` or a crate of `[boundary_internal] any`.* An `allow` or
+    `warn` on an item is now a finding too, since only an expectation fails once the item no
+    longer needs it. The scan knows the lints' old names (`clippy::disallowed_method`,
+    `clippy::disallowed_type`), which clippy still honours, and ignores comments inside an
+    attribute. It reads every file a `#[path]` names (also inside `cfg_attr`), resolved against
+    the including file's directory, wherever it lives: the SOUR protocol in `tools/xtask`
+    reaches seven boundary crates' tests that way (anim, input, net-api, physics-api,
+    physics-rapier, predict, sim). A named file the scan cannot read is a finding. The
+    protocol's items expect the bans, and the `mod protocol` declarations outside the boundary
+    (in `tools/xtask`, in `net-host`'s tests and in `app`'s tests) allow the expectations left
+    unfulfilled there.
+- Addendum (lane boundary-thread-ban, 2026-10-25; fix rounds 1 and 2, 2026-10-25): *No thread
+  creation outside an executor.* A thread the executor does not run is outside its determinism
+  and chaos model wherever the code that starts it lives. The boundary lint file now bans:
+  - the standard library's routes: `thread::spawn`, `Builder::spawn`, `spawn_scoped` and
+    `spawn_unchecked`, `Scope::spawn`, and `thread::scope`, banned as the scope its threads
+    start in;
+  - `lactose_task::Platform::spawn_thread`;
+  - the pool builders (section 16: the solver pool is built outside the boundary and handed to
+    the backend): rayon's `ThreadPoolBuilder::build`, `build_global` and `build_scoped`,
+    `ThreadPool::new`, and Rapier's `configure_thread_pool`;
+  - the routes found to start rayon's global pool, which is sized by the core count:
+    - Rapier's `clear_thread_pool`;
+    - rayon's free functions (`spawn`, `spawn_fifo`, `join`, `join_context`, `scope`,
+      `scope_fifo`, `in_place_scope`, `in_place_scope_fifo`, `broadcast`, `spawn_broadcast`,
+      `current_num_threads`), its iterator sources and bridges, and the prelude traits' methods
+      that make or drive a parallel iterator;
+    - under disallowed-types, `rayon::iter::plumbing`'s `Producer`, `UnindexedProducer`,
+      `ProducerCallback`, `Consumer` and `UnindexedConsumer`, the traits a parallel iterator of
+      a crate's own is written with;
+    - the public functions of the pinned Rapier (0.36.0) and parry (0.31.1) found to run
+      parallel work outside `PhysicsPipeline::step`, the one function Rapier runs on the pool
+      it was handed: `PhysicsWorld::detect_collisions`, `CollisionPipeline::step`,
+      `BroadPhaseBvh::update`, `CCDSolver::find_first_impact` and `solve_continuous`,
+      `SoftBodySet::sync_particle_positions`, `SoftBodyBuilder::volumetric` and
+      `volumetric_with`; parry's `Bvh::refit_parallel`, `refit_without_resolve_parallel`,
+      `insert_or_update_batch_partially_parallel` and `traverse_bvtt_single_tree_parallel`,
+      `PersistentQueryDispatcher::contact_manifolds`,
+      `contact_manifolds_composite_shape_shape`, `contact_manifolds_trimesh_shape` and
+      `contact_manifolds_trimesh_shape_shapes`, and `volume_mesh`.
+
+  rayon's adaptors and consumers are left out because they need a parallel iterator. rayon's
+  own are banned at their sources, and one of a crate's own must name the consumer traits in
+  the bounds of its `drive` methods, which the lint catches. It does not catch them in an impl
+  header, a glob import or an expression path, none of which makes an iterator without those
+  bounds. `yield_now`, `yield_local` and `max_num_threads` build no registry and are left out
+  too.
+
+  The worker index and the core count are banned beside the executor's, though they start no
+  thread: rayon's `current_thread_index` (free and on `ThreadPool`) as `JobContext::slot` is
+  (the worker index is not a semantic key), and `lactose_task::Platform::topology` and
+  `hardware_threads` (the core count is not a simulation input). `cargo xtask boundary`
+  requires them by name.
+
+  The section-16 and rayon entries carry `allow-invalid`, since only `physics-rapier` and `ecs`
+  name those crates. So `cargo xtask boundary` requires every listed thread route by name
+  (`THREAD_ROUTES`), and two ties keep that list honest:
+  - a unit test holds the list to the reference's entries that say a boundary crate creates no
+    thread or cite section 16;
+  - the check holds every reference entry under `rayon::`, `rapier3d_f64::`, `parry3d_f64::` or
+    `std::thread::` to that list or to a short list of the entries there that start no thread,
+    whatever its reason says; an entry under `lactose_task::` is tied by its reason alone.
+
+  A crate of `[boundary_internal] any` carries the standard library's entries alone. Tests that
+  build the solver pool or need a thread lift the ban on their one item.
+
+  Asset-api's `conformance` feature compiles library code: the conformance suite and
+  `ReferenceStore`, whose concurrency check starts threads. It is not a test, so a new
+  `crate-tiers.toml` table, `[dev_only_features]`, holds it to dev-dependency edges. `cargo
+  xtask tiers` reports a normal or build edge that turns it on, a `[features]` value forwarding
+  to it (`name/feature` or `name?/feature`, under the dependency's rename), the crate's
+  `default` turning it on, and a listed feature the crate does not declare, and holds any
+  feature of the crate that turns it on to the same rule.
+
+  Not closed:
+  - Rapier's and parry's public functions that run parallel work outside
+    `PhysicsPipeline::step`, beyond those listed. They were found by reading the pinned
+    sources, so the list is not provably complete and a version bump needs the search again.
+  - A world stepped without a pool: one made by `new`, or after the backend's own
+    `set_thread_pool(None)`. `lactose-physics-rapier`'s `tests/global_pool.rs` holds the
+    backend at run time: a backend's life (stepped, snapshotted, restored, stepped) leaves
+    rayon's global pool unbuilt.
+  - Raw platform thread and thread-pool calls (`libc::fork`, `libc::pthread_create`, Win32
+    `QueueUserWorkItem`, and the thread-pool and timer-queue calls core's windows-sys features
+    expose). They need `unsafe`, so only `lactose-core` could reach them.
+
+  Rules out banning `ThreadPool`'s methods, which run on the handed pool, and a module-level
+  ban, which clippy cannot express.
+- Driven by: the io facade's review (D130, finding D2) and the boundary-closure reviews r1 to
+  r3 (2026-10-24).
+
+**D133. Ownership is a forest the ECS keeps over the live world; an owner in another region, or in none, is a saved state; a load breaks a cycle it would close** (§6, §15.2, `lactose-ecs`, `lactose-bundle`, `lactose-persist`)
+- Why: the persist implementation's review found three ownership states `World::insert` accepts
+  and `Overlay::new` refuses (an entity that owns itself, two that own each other, a row owned
+  by a cooked entity of its region that has moved away), so a save of the region failed for as
+  long as the state lasted and a failing unload export left `app` with no server; a quarter of
+  the reviewer's random histories reached one. The invariant every save, unload and relevance
+  message rests on is that a region's export is always an overlay and an overlay a region
+  exported always loads; it is settled by putting the ownership rules in the world, keeping the
+  format's rules a subset of them, and having the load resolve what a write cannot see.
+  - *The ownership graph of the live world is a forest, kept at every path that adds an edge or
+    merges two keys.* The chain of an entity is itself, its owner, its owner's owner, over live
+    entities, ending at the first with no owner or whose owner is not live, keys compared as
+    origin keys. A write of `OwnedBy { owner }` to `k` is refused if `k` is on `owner`'s chain
+    (`owner == k` included): `InvalidData` from `insert`, `insert_erased`, `spawn` and
+    `spawn_erased` with nothing changed, not even the point; dropped and logged at command
+    apply like a write that fails validation. A key merge that would close a cycle, the rewrite
+    of a stored `Net` reference to its predicted origin at `bind`, at `restore` for a bind made
+    since the snapshot, or at the despawn of a bound `Net` entity, writes that reference empty
+    in place instead and logs it, so `bind` never fails on ownership. One lookup per link at a
+    write, a bind or a rekey. `OwnedBy` is the attachment hierarchy (`anim`'s bones,
+    `physics-api`'s joints), so a forest is what every walker up the chain may rely on. Rules
+    out accepting cycles and guarding every walker (the ECS's own `despawn` and
+    `move_to_region` already terminate over one), a relocating `OwnedBy` write, and a `bind`
+    refused for ownership: on the server a fresh `NetId` cannot close a cycle, and on a client
+    the server has already bound.
+  - *The world sees live entities only, so a load resolves what a write could not see.* An
+    unloaded region's owner edges are in its document, not in the world, so an accepted write
+    can close a cycle through them (P in A given to X in B, X given to E in A, B unloaded, E
+    given to P); and a client holds each region's edges as of its relevance document, so two
+    honest documents can close a cycle between them with a server that was a forest at every
+    step. `load_region` therefore walks the document's rows, under the keys the load will give
+    them, and the live world together once the keys are known and before any bind or spawn, and
+    spawns without a per-row walk. A cycle among the document's own rows, through its records
+    or its baseline's `ecs::owned_by` column, is refused whole, since no honest export contains
+    one: a region's rows are all live and a forest when exported. A cycle through a live entity
+    outside the document is broken: the document row on it whose owner is a live entity outside
+    the document, the smallest such key, loads without `OwnedBy`, as an `OwnershipChange {
+    owner: None }` would load it, logged at `casein` with both keys; rows are walked in
+    ascending key order with each break applied before the next walk, so the result is a
+    function of the document and the live world under every layout. The document row's edge is
+    emptied and never a live entity's, because a region load must not write another region's
+    rows (replication, the hash and `Changed` readers would see it). The broken edge is then a
+    plain fact of the world: the row's export writes the cleared owner, so the next save,
+    unload or relevance document carries it, an in-place reload and a fresh process break the
+    same edge and hash equal (§15.5), and a reload of the export breaks nothing. Two load
+    orders of the same documents can empty different edges; each is deterministic, and the
+    order is an input (a frame's regions, ascending at the sync point), which is what §8
+    requires; no order is more right than another, since the documents together were not a
+    forest. On a client `OwnedBy` is neither replicated nor corrected (`net-api`), so its edges
+    are as fresh as each region's last document, a break there is logged and lasts until the
+    region's next document, and no engine crate reads a replicated entity's `OwnedBy` on a
+    client; a game that does needs `OwnedBy` replicated, a `net-api` change. Rules out a table
+    of unloaded entities' edges consulted at writes (it would need persistence and could not
+    see a client's stale documents), refusing a load an honest history produced, and an
+    order-independent rule that would rewrite live rows of other regions.
+  - *An owned entity need not reside in its owner's region; writing `OwnedBy` moves nothing.*
+    D12 is a rule for `move_to_region` and `despawn`, which take the tree; an entity given to
+    an owner elsewhere stays until that owner next moves, and an owner's region may unload
+    while what it owns stays loaded, as the ECS README already promised. `OwnedBy` is then a
+    weak cross-region reference like any `EntityRef`: exported as the owner's `NetId`, reloaded
+    in either region order. Section 15.2 says a departed row is `Destroy` alone, so
+    `Overlay::new` no longer refuses an owner the overlay destroys; whether an owner exists was
+    always the applier's. Rules out the bundle reading a `Destroy` as a death.
+  - *The format keeps its self-owner and cycle checks.* They are judged from the records alone,
+    refuse hostile bytes before any load, and are a subset of the world's rules, since a cycle
+    among one overlay's records is a cycle among live entities of the region. The bundle README
+    says a new ownership judgement must be one the world refuses too. Rules out a format rule
+    the world does not enforce.
+  - *The invariant is stated once, in `crates/ecs/README.md` (Regions, "Writing `OwnedBy` moves
+    nothing"): the world accepts no ownership state the format refuses, the format refuses no
+    state the world accepts, and every document an honest export made loads, a cross-region
+    cycle broken as above; so a region's export is always an overlay and an overlay a region
+    exported always loads.* `persist`'s README cites it instead of listing the checks.
+  - *As implemented:* the walk runs before a direct write's stamp, so a refusal leaves the
+    point where it was; `load_region`'s walk runs once the load keys are known (owners resolve
+    through them) and before any bind or spawn, applies its breaks to the rows it will spawn,
+    and the spawns walk nothing; a break is logged at `warn` once the load's spawns have
+    succeeded, where a dropped command logs at `debug`; a key merge empties the closing
+    reference without a stamp, as the rekey itself is unstamped; a row without
+    `PredictedOrigin` whose `Net` id is bound is refused, since an honest export of a bound
+    entity carries it; a spawn refused at apply binds nothing and uses no `NetId` (the bind
+    follows the spawn and the counter returns, predicted or not); no format version bump, since
+    accepted documents encode as before and the decoder accepts more. Proof:
+    `crates/ecs/tests/ownership.rs` under every layout, with seeded random histories (300 per
+    owner mode, spread over the layouts) in which every export is an overlay and every reload
+    and restart loads; a deep chain of 8000 owners loads within five times the time of a flat
+    document of 8000 rows, where a per-row walk takes over 200 times as long;
+    `crates/bundle/tests/format.rs`.
+- What the implementation's review changed (1 blocking, 2 serious, 4 minor; `5ed559e` was the
+  branch before it): the forest had been kept over live entities with `load_region` refusing
+  any cycle through them, which made a server's own save of a region, and a client's documents
+  of two regions, fail to load after legal histories (three commands and an unload; 74 to 160
+  of 2000 random histories); loads now break the cycle at the document row, and key merges
+  empty the closing reference, which also closed the restore gap the first text had stated; a
+  row whose `Net` id is bound is refused whole; the load's per-row walk, which made a deep
+  chain quadratic, is gone (a chain of 8000 rows loads in 18.7 ms against 17.7 ms flat, linear
+  from 1000, at load averages near 120 on an M1); a refused predicted spawn no longer keeps its
+  bind.
+- Driven by: persist implementation review r1, F1, and its probe; the ECS ownership
+  implementation's reviews r1, F1 to F7, and r2, N1 and N2 (2026-10-25).
+- Replaced: `Overlay::new`'s refusal of an owner the overlay destroys (D101's implementation);
+  the ECS's acceptance of a self-owner and a cycle, which D114 and D117 did not mention; the
+  first text's `load_region` refusal of a cross-region cycle and its refused `bind`.
+
+**D135. One set of validity rules for physics values, stated and implemented in `physics-api`** (§8.2, §16, §17, `lactose-physics-api`, `lactose-physics-rapier`, `lactose-anim`)
+- Why: the rules a body, collider, joint, transform, velocity and command must meet were held
+  in three places, each a little different: `physics-rapier`'s `convert.rs`, the test backend,
+  and `anim`'s `Skeleton::validate`, which the anim implementation review (round 2, finding D1)
+  called a copy to be replaced. The test backend checked a body's transform, shape and mass, a
+  joint's values, and `set_transform` alone, so a test written against it accepted rows Rapier
+  refuses. anim refused a NaN in a field the kind does not read; the backends did not.
+  - *The rules are stated once, in `physics-api`'s README, and implemented once as `validate`
+    on each value (`Transform`, `Velocity`, `RigidBody`, `Shape`, `Collider`, `Joint`,
+    `BodyDesc`, `PhysicsCommand`), answering `Ok` or the first field that breaks a rule as
+    `Invalid { field, rule }`.* A backend applies these and adds no rule of its own on those
+    eight types; a crate that authors a body calls them at load. Rules out a backend-specific
+    rule a loader cannot know, and a message that differs by caller.
+  - *Three rules on what those values do not hold are `physics-api`'s too, and every backend
+    applies them alike:* a joint whose two ends are one key is refused at `create_joint` first,
+    before its value is read, with the message `a joint between a body and itself`; a step
+    whose `dt` is not finite and above zero, or whose gravity is not finite, steps nothing; a
+    query with a non-finite origin, a direction that does not normalise, a non-finite or
+    negative `max_distance`, or a probe shape or pose its predicate refuses answers nothing.
+    Rapier's behaviour was the reference. Rules out a test backend that steps or answers where
+    the real one does not.
+  - *Every scalar a value holds is finite, read by its kind or not.* A NaN in a sphere's
+    `half_extents`, a cuboid's `radius` or an unlimited joint's limits is refused everywhere,
+    as anim already did. Rules out a value that is accepted until a kind change makes it read.
+  - *A revolute or prismatic axis is a direction when its squared length is a normal finite
+    number (at least `Scalar::MIN_POSITIVE`).* A subnormal square passes `try_normalize` but
+    normalises short of unit length, and the backend would build its frame about another axis.
+    Rules out an axis accepted by one test and mis-built by the solver.
+  - *The unit tolerance is `1e-6` on the squared length, strict, as one exported constant.* A
+    normalised quaternion is within a few ulps at either width; a crate normalises what it
+    composes before writing it (anim's bone rows). Rules out a per-crate tolerance.
+  - *A joint's references and a command's body are not read by a predicate.* The same-body rule
+    is on resolved keys and stays the backend's; the sync's parking and waiting rules stand.
+    Rules out a predicate that needs a world.
+  - *No rule moves.* The backend still refuses at create (`InvalidData` with the `Invalid`'s
+    message), ignores at `set_*` and drops a refused command while applying the rest; the sync
+    hands rows over unchecked. What changes is that every backend, the test backend included,
+    refuses one set with one message, and a loader can refuse first. `conformance::validity`
+    holds a backend to this on the rows it lists (every check of every predicate, two-fault
+    order rows compared by message, the three rules above, the accepted edges); a deviation on
+    a value no row holds passes it.
+  - *The error is a plain `Copy` value with a `Display` and a `From` into `InvalidData`,* not
+    an enum of fields. Its field is `Type::field`, or `PhysicsCommand::Variant::field` for a
+    command's own field. A loader prefixes context (`bone 1: `) and the text stays the
+    backend's. Rules out two error shapes for one refusal.
+- Driven by: the anim implementation review, round 2, finding D1; the brief `physics-validity`;
+  the physics-validity reviews r1 (S1, S2, M1 to M5) and r2, m1 to m4 (2026-10-25).
 
 ## 10. Review history
 

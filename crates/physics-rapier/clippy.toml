@@ -89,11 +89,13 @@ disallowed-methods = [
   { path = "f64::rem_euclid", reason = "goes through `%`, the platform fmod; use lactose_math" },
   { path = "f64::div_euclid", reason = "goes through `%`, the platform fmod; use lactose_math" },
   { path = "f64::mul_add", reason = "result depends on the caller's target features; use lactose_math::Scalar::mul_add" },
-  # Architecture section 8.2: the worker index is never a semantic key. `lactose-ecs` keeps
-  # per-slot partials and opts out at those call sites, item by item, like `lactose-math` does
-  # for the float methods.
+  # Architecture section 8.2: the worker index is never a semantic key, the executor's or the
+  # solver pool's. `lactose-ecs` keeps per-slot partials and opts out at those call sites,
+  # item by item, like `lactose-math` does for the float methods.
   { path = "lactose_task::JobContext::slot", reason = "the worker index is not a semantic key; key by StableKey", allow-invalid = true },
   { path = "lactose_task::ChildContext::slot", reason = "the worker index is not a semantic key; key by StableKey", allow-invalid = true },
+  { path = "rayon::current_thread_index", reason = "the worker index is not a semantic key; key by StableKey", allow-invalid = true },
+  { path = "rayon::ThreadPool::current_thread_index", reason = "the worker index is not a semantic key; key by StableKey", allow-invalid = true },
   # Architecture section 8.2: `lactose_ecs` re-exports the executor so that a boundary crate
   # can drive a schedule, and the re-export reaches every boundary crate. What one may do
   # with it is run a schedule. The worker count, spawning or running arbitrary work, thread
@@ -108,6 +110,9 @@ disallowed-methods = [
   { path = "lactose_task::Executor::sleep_until", reason = "no wall-clock time inside the boundary", allow-invalid = true },
   { path = "lactose_task::Executor::execution_log", reason = "scheduling history is not simulation input", allow-invalid = true },
   { path = "lactose_task::Executor::chaos_config", reason = "scheduling configuration is not simulation input", allow-invalid = true },
+  { path = "lactose_task::Platform::spawn_thread", reason = "a boundary crate creates no thread", allow-invalid = true },
+  { path = "lactose_task::Platform::topology", reason = "the core count is not a simulation input", allow-invalid = true },
+  { path = "lactose_task::Platform::hardware_threads", reason = "the core count is not a simulation input", allow-invalid = true },
   # D119: nalgebra hands products above its small-dimension cutoff to `matrixmultiply`,
   # whose kernels are selected by CPU feature at run time. The step forms none; inverse
   # kinematics does, so it is banned (paths on the pinned rapier3d-f64 0.36.0).
@@ -118,6 +123,191 @@ disallowed-methods = [
   # crate inserts a multibody joint.
   { path = "rapier3d_f64::dynamics::MultibodyJointSet::insert", reason = "multibody mass assembly reaches matrixmultiply, whose kernels are chosen by CPU feature", allow-invalid = true },
   { path = "rapier3d_f64::dynamics::MultibodyJointSet::insert_kinematic", reason = "multibody mass assembly reaches matrixmultiply, whose kernels are chosen by CPU feature", allow-invalid = true },
+  # Architecture section 8.2: file IO (`io`), the process environment, subprocesses and the
+  # network (`net-host`) are outside the boundary; what a simulation reads enters as a tick
+  # input. Clippy matches items, not modules, so each module is closed here by its free
+  # functions and the methods of `Path` that touch the file system, and under
+  # disallowed-types by its types with constructors, with the platform extensions that open
+  # the same doors. The environment includes what the process learns of itself: standard
+  # input, its ids, whether it has a terminal, the working directory behind
+  # `path::absolute`, the core count and the backtrace variables. A test that reads a file
+  # or a variable lifts the lint with `#[expect]` on its one item.
+  { path = "std::fs::canonicalize", reason = "architecture section 8.2: file IO is outside the boundary; what the simulation reads enters as a tick input" },
+  { path = "std::fs::copy", reason = "architecture section 8.2: file IO is outside the boundary; what the simulation reads enters as a tick input" },
+  { path = "std::fs::create_dir", reason = "architecture section 8.2: file IO is outside the boundary; what the simulation reads enters as a tick input" },
+  { path = "std::fs::create_dir_all", reason = "architecture section 8.2: file IO is outside the boundary; what the simulation reads enters as a tick input" },
+  { path = "std::fs::exists", reason = "architecture section 8.2: file IO is outside the boundary; what the simulation reads enters as a tick input" },
+  { path = "std::fs::hard_link", reason = "architecture section 8.2: file IO is outside the boundary; what the simulation reads enters as a tick input" },
+  { path = "std::fs::metadata", reason = "architecture section 8.2: file IO is outside the boundary; what the simulation reads enters as a tick input" },
+  { path = "std::fs::read", reason = "architecture section 8.2: file IO is outside the boundary; what the simulation reads enters as a tick input" },
+  { path = "std::fs::read_dir", reason = "architecture section 8.2: file IO is outside the boundary; what the simulation reads enters as a tick input" },
+  { path = "std::fs::read_link", reason = "architecture section 8.2: file IO is outside the boundary; what the simulation reads enters as a tick input" },
+  { path = "std::fs::read_to_string", reason = "architecture section 8.2: file IO is outside the boundary; what the simulation reads enters as a tick input" },
+  { path = "std::fs::remove_dir", reason = "architecture section 8.2: file IO is outside the boundary; what the simulation reads enters as a tick input" },
+  { path = "std::fs::remove_dir_all", reason = "architecture section 8.2: file IO is outside the boundary; what the simulation reads enters as a tick input" },
+  { path = "std::fs::remove_file", reason = "architecture section 8.2: file IO is outside the boundary; what the simulation reads enters as a tick input" },
+  { path = "std::fs::rename", reason = "architecture section 8.2: file IO is outside the boundary; what the simulation reads enters as a tick input" },
+  { path = "std::fs::set_permissions", reason = "architecture section 8.2: file IO is outside the boundary; what the simulation reads enters as a tick input" },
+  { path = "std::fs::set_times", reason = "architecture section 8.2: file IO is outside the boundary; what the simulation reads enters as a tick input" },
+  { path = "std::fs::set_times_nofollow", reason = "architecture section 8.2: file IO is outside the boundary; what the simulation reads enters as a tick input" },
+  { path = "std::fs::soft_link", reason = "architecture section 8.2: file IO is outside the boundary; what the simulation reads enters as a tick input" },
+  { path = "std::fs::symlink_metadata", reason = "architecture section 8.2: file IO is outside the boundary; what the simulation reads enters as a tick input" },
+  { path = "std::fs::write", reason = "architecture section 8.2: file IO is outside the boundary; what the simulation reads enters as a tick input" },
+  { path = "std::path::Path::canonicalize", reason = "architecture section 8.2: file IO is outside the boundary; what the simulation reads enters as a tick input" },
+  { path = "std::path::Path::exists", reason = "architecture section 8.2: file IO is outside the boundary; what the simulation reads enters as a tick input" },
+  { path = "std::path::Path::is_dir", reason = "architecture section 8.2: file IO is outside the boundary; what the simulation reads enters as a tick input" },
+  { path = "std::path::Path::is_file", reason = "architecture section 8.2: file IO is outside the boundary; what the simulation reads enters as a tick input" },
+  { path = "std::path::Path::is_symlink", reason = "architecture section 8.2: file IO is outside the boundary; what the simulation reads enters as a tick input" },
+  { path = "std::path::Path::metadata", reason = "architecture section 8.2: file IO is outside the boundary; what the simulation reads enters as a tick input" },
+  { path = "std::path::Path::read_dir", reason = "architecture section 8.2: file IO is outside the boundary; what the simulation reads enters as a tick input" },
+  { path = "std::path::Path::read_link", reason = "architecture section 8.2: file IO is outside the boundary; what the simulation reads enters as a tick input" },
+  { path = "std::path::Path::symlink_metadata", reason = "architecture section 8.2: file IO is outside the boundary; what the simulation reads enters as a tick input" },
+  { path = "std::path::Path::try_exists", reason = "architecture section 8.2: file IO is outside the boundary; what the simulation reads enters as a tick input" },
+  { path = "std::os::unix::fs::chown", reason = "architecture section 8.2: file IO is outside the boundary; what the simulation reads enters as a tick input", allow-invalid = true },
+  { path = "std::os::unix::fs::chroot", reason = "architecture section 8.2: file IO is outside the boundary; what the simulation reads enters as a tick input", allow-invalid = true },
+  { path = "std::os::unix::fs::lchown", reason = "architecture section 8.2: file IO is outside the boundary; what the simulation reads enters as a tick input", allow-invalid = true },
+  { path = "std::os::unix::fs::symlink", reason = "architecture section 8.2: file IO is outside the boundary; what the simulation reads enters as a tick input", allow-invalid = true },
+  { path = "std::os::windows::fs::symlink_dir", reason = "architecture section 8.2: file IO is outside the boundary; what the simulation reads enters as a tick input", allow-invalid = true },
+  { path = "std::os::windows::fs::symlink_file", reason = "architecture section 8.2: file IO is outside the boundary; what the simulation reads enters as a tick input", allow-invalid = true },
+  { path = "std::env::args", reason = "architecture section 8.2: the process environment is not a simulation input" },
+  { path = "std::env::args_os", reason = "architecture section 8.2: the process environment is not a simulation input" },
+  { path = "std::env::current_dir", reason = "architecture section 8.2: the process environment is not a simulation input" },
+  { path = "std::env::current_exe", reason = "architecture section 8.2: the process environment is not a simulation input" },
+  { path = "std::env::home_dir", reason = "architecture section 8.2: the process environment is not a simulation input" },
+  { path = "std::env::join_paths", reason = "architecture section 8.2: the process environment is not a simulation input" },
+  { path = "std::env::remove_var", reason = "architecture section 8.2: the process environment is not a simulation input" },
+  { path = "std::env::set_current_dir", reason = "architecture section 8.2: the process environment is not a simulation input" },
+  { path = "std::env::set_var", reason = "architecture section 8.2: the process environment is not a simulation input" },
+  { path = "std::env::split_paths", reason = "architecture section 8.2: the process environment is not a simulation input" },
+  { path = "std::env::temp_dir", reason = "architecture section 8.2: the process environment is not a simulation input" },
+  { path = "std::env::var", reason = "architecture section 8.2: the process environment is not a simulation input" },
+  { path = "std::env::var_os", reason = "architecture section 8.2: the process environment is not a simulation input" },
+  { path = "std::env::vars", reason = "architecture section 8.2: the process environment is not a simulation input" },
+  { path = "std::env::vars_os", reason = "architecture section 8.2: the process environment is not a simulation input" },
+  { path = "std::path::absolute", reason = "architecture section 8.2: the process environment is not a simulation input" },
+  { path = "std::io::stdin", reason = "architecture section 8.2: the process environment is not a simulation input" },
+  { path = "std::io::IsTerminal::is_terminal", reason = "architecture section 8.2: the process environment is not a simulation input" },
+  { path = "std::process::id", reason = "architecture section 8.2: the process environment is not a simulation input" },
+  { path = "std::os::unix::process::parent_id", reason = "architecture section 8.2: the process environment is not a simulation input", allow-invalid = true },
+  { path = "std::thread::available_parallelism", reason = "architecture section 8.2: the process environment is not a simulation input" },
+  { path = "std::backtrace::Backtrace::capture", reason = "architecture section 8.2: the process environment is not a simulation input" },
+  { path = "std::net::ToSocketAddrs::to_socket_addrs", reason = "architecture section 8.2: networking is outside the boundary; state enters through the staged frame of lactose_net_api" },
+  # Architecture sections 5.1 and 8.2: a boundary crate creates no thread outside an
+  # executor. Parallel work goes through `lactose_task`'s executor, under its determinism and
+  # chaos model, and the physics step through the solver pool of section 16. Clippy matches
+  # items, so every function that starts a thread is its own entry, `Builder`'s and `Scope`'s
+  # included, and so is `scope`, which opens the scope they start threads in. A test that
+  # needs a thread lifts the lint with `#[expect]` on its one item.
+  { path = "std::thread::spawn", reason = "architecture section 8.2: a boundary crate creates no thread; parallel work goes through lactose_task" },
+  { path = "std::thread::scope", reason = "architecture section 8.2: a boundary crate creates no thread; parallel work goes through lactose_task" },
+  { path = "std::thread::Scope::spawn", reason = "architecture section 8.2: a boundary crate creates no thread; parallel work goes through lactose_task" },
+  { path = "std::thread::Builder::spawn", reason = "architecture section 8.2: a boundary crate creates no thread; parallel work goes through lactose_task" },
+  { path = "std::thread::Builder::spawn_scoped", reason = "architecture section 8.2: a boundary crate creates no thread; parallel work goes through lactose_task" },
+  { path = "std::thread::Builder::spawn_unchecked", reason = "architecture section 8.2: a boundary crate creates no thread; parallel work goes through lactose_task" },
+  # Section 16: `lactose-app` builds the solver pool outside the boundary and hands it to the
+  # backend's constructor, so no boundary crate builds a pool, through rayon or through Rapier.
+  { path = "rayon::ThreadPoolBuilder::build", reason = "architecture section 16: the solver pool is built outside the boundary and handed to the backend", allow-invalid = true },
+  { path = "rayon::ThreadPoolBuilder::build_global", reason = "architecture section 16: the solver pool is built outside the boundary and handed to the backend", allow-invalid = true },
+  { path = "rayon::ThreadPoolBuilder::build_scoped", reason = "architecture section 16: the solver pool is built outside the boundary and handed to the backend", allow-invalid = true },
+  { path = "rayon::ThreadPool::new", reason = "architecture section 16: the solver pool is built outside the boundary and handed to the backend", allow-invalid = true },
+  { path = "rapier3d_f64::pipeline::PhysicsWorld::configure_thread_pool", reason = "architecture section 16: the solver pool is built outside the boundary and handed to the backend", allow-invalid = true },
+  { path = "rapier3d_f64::pipeline::PhysicsPipeline::configure_thread_pool", reason = "architecture section 16: the solver pool is built outside the boundary and handed to the backend", allow-invalid = true },
+  # Section 16: Rapier's parallel work runs on that pool and nowhere else. Off it, rayon
+  # starts its global pool. Banned here: rayon's free functions, iterator sources and bridges,
+  # the methods of the prelude's traits that make or drive a parallel iterator (and, under
+  # disallowed-types, the traits a parallel iterator of a crate's own is written with), Rapier's
+  # `clear_thread_pool`, and the public functions of the pinned Rapier (0.36.0) and parry
+  # (0.31.1) found to run parallel work outside `PhysicsPipeline::step`, which alone runs on
+  # the pool it was handed. The list is not provably complete: Rapier's and parry's public
+  # functions that run parallel work outside `PhysicsPipeline::step`, beyond those listed, are
+  # not banned, nor is a world stepped without a pool (one made by `new`, or after
+  # `set_thread_pool(None)`). lactose-physics-rapier's tests/global_pool.rs holds that the
+  # backend's own worlds never start the global pool.
+  { path = "rapier3d_f64::pipeline::PhysicsWorld::clear_thread_pool", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rapier3d_f64::pipeline::PhysicsPipeline::clear_thread_pool", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rapier3d_f64::pipeline::PhysicsWorld::detect_collisions", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rapier3d_f64::pipeline::CollisionPipeline::step", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rapier3d_f64::geometry::BroadPhaseBvh::update", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rapier3d_f64::dynamics::CCDSolver::find_first_impact", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rapier3d_f64::dynamics::CCDSolver::solve_continuous", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rapier3d_f64::dynamics::SoftBodySet::sync_particle_positions", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rapier3d_f64::dynamics::SoftBodyBuilder::volumetric", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rapier3d_f64::dynamics::SoftBodyBuilder::volumetric_with", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "parry3d_f64::partitioning::Bvh::refit_parallel", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "parry3d_f64::partitioning::Bvh::refit_without_resolve_parallel", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "parry3d_f64::partitioning::Bvh::insert_or_update_batch_partially_parallel", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "parry3d_f64::partitioning::Bvh::traverse_bvtt_single_tree_parallel", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "parry3d_f64::query::PersistentQueryDispatcher::contact_manifolds", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "parry3d_f64::query::details::contact_manifolds_composite_shape_shape", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "parry3d_f64::query::details::contact_manifolds_trimesh_shape", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "parry3d_f64::query::details::contact_manifolds_trimesh_shape_shapes", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "parry3d_f64::transformation::volume_mesh", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rayon::spawn", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rayon::spawn_fifo", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rayon::join", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rayon::join_context", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rayon::scope", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rayon::scope_fifo", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rayon::in_place_scope", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rayon::in_place_scope_fifo", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rayon::broadcast", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rayon::spawn_broadcast", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rayon::current_num_threads", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rayon::iter::empty", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rayon::iter::once", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rayon::iter::repeat", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rayon::iter::repeat_n", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rayon::iter::repeatn", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rayon::iter::split", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rayon::iter::walk_tree", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rayon::iter::walk_tree_prefix", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rayon::iter::walk_tree_postfix", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rayon::iter::plumbing::bridge", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rayon::iter::plumbing::bridge_producer_consumer", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rayon::iter::plumbing::bridge_unindexed", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rayon::iter::IntoParallelIterator::into_par_iter", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rayon::iter::IntoParallelRefIterator::par_iter", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rayon::iter::IntoParallelRefMutIterator::par_iter_mut", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rayon::iter::ParallelBridge::par_bridge", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rayon::iter::ParallelExtend::par_extend", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rayon::iter::FromParallelIterator::from_par_iter", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rayon::iter::ParallelDrainFull::par_drain", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rayon::iter::ParallelDrainRange::par_drain", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rayon::slice::ParallelSlice::par_split", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rayon::slice::ParallelSlice::par_split_inclusive", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rayon::slice::ParallelSlice::par_windows", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rayon::slice::ParallelSlice::par_array_windows", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rayon::slice::ParallelSlice::par_chunks", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rayon::slice::ParallelSlice::par_chunks_exact", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rayon::slice::ParallelSlice::par_rchunks", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rayon::slice::ParallelSlice::par_rchunks_exact", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rayon::slice::ParallelSlice::par_chunk_by", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rayon::slice::ParallelSliceMut::par_split_mut", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rayon::slice::ParallelSliceMut::par_split_inclusive_mut", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rayon::slice::ParallelSliceMut::par_chunks_mut", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rayon::slice::ParallelSliceMut::par_chunks_exact_mut", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rayon::slice::ParallelSliceMut::par_rchunks_mut", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rayon::slice::ParallelSliceMut::par_rchunks_exact_mut", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rayon::slice::ParallelSliceMut::par_sort", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rayon::slice::ParallelSliceMut::par_sort_by", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rayon::slice::ParallelSliceMut::par_sort_by_key", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rayon::slice::ParallelSliceMut::par_sort_by_cached_key", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rayon::slice::ParallelSliceMut::par_sort_unstable", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rayon::slice::ParallelSliceMut::par_sort_unstable_by", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rayon::slice::ParallelSliceMut::par_sort_unstable_by_key", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rayon::slice::ParallelSliceMut::par_chunk_by_mut", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rayon::str::ParallelString::par_chars", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rayon::str::ParallelString::par_char_indices", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rayon::str::ParallelString::par_bytes", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rayon::str::ParallelString::par_encode_utf16", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rayon::str::ParallelString::par_split", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rayon::str::ParallelString::par_split_inclusive", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rayon::str::ParallelString::par_split_terminator", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rayon::str::ParallelString::par_lines", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rayon::str::ParallelString::par_split_whitespace", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rayon::str::ParallelString::par_split_ascii_whitespace", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rayon::str::ParallelString::par_matches", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rayon::str::ParallelString::par_match_indices", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
 ]
 
 disallowed-types = [
@@ -131,4 +321,27 @@ disallowed-types = [
   # Bans `thread_local!` through the type it declares. The `disallowed-macros` lint cannot
   # be used for it: on the pinned toolchain a local `expect` does not reach an item macro.
   { path = "std::thread::LocalKey", reason = "no thread-local state inside the boundary" },
+  # Section 16: rayon's adaptors bridge a parallel iterator onto the current pool, the global
+  # one off the solver pool. They are not banned, being of no use without a parallel iterator:
+  # the iterators rayon makes are banned at their sources (under disallowed-methods), and one
+  # of a crate's own is written with these traits, its `drive` methods bounded by the consumer
+  # traits. This lint catches a trait in a bound or a named import, not in an impl header, a
+  # glob import or an expression path; an iterator cannot be written without the bounds.
+  { path = "rayon::iter::plumbing::Producer", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rayon::iter::plumbing::UnindexedProducer", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rayon::iter::plumbing::ProducerCallback", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rayon::iter::plumbing::Consumer", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rayon::iter::plumbing::UnindexedConsumer", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  # Architecture section 8.2: the types that open a file or a socket or start a process; the
+  # free functions are under disallowed-methods.
+  { path = "std::fs::File", reason = "architecture section 8.2: file IO is outside the boundary; what the simulation reads enters as a tick input" },
+  { path = "std::fs::OpenOptions", reason = "architecture section 8.2: file IO is outside the boundary; what the simulation reads enters as a tick input" },
+  { path = "std::fs::DirBuilder", reason = "architecture section 8.2: file IO is outside the boundary; what the simulation reads enters as a tick input" },
+  { path = "std::net::TcpListener", reason = "architecture section 8.2: networking is outside the boundary; state enters through the staged frame of lactose_net_api" },
+  { path = "std::net::TcpStream", reason = "architecture section 8.2: networking is outside the boundary; state enters through the staged frame of lactose_net_api" },
+  { path = "std::net::UdpSocket", reason = "architecture section 8.2: networking is outside the boundary; state enters through the staged frame of lactose_net_api" },
+  { path = "std::os::unix::net::UnixDatagram", reason = "architecture section 8.2: networking is outside the boundary; state enters through the staged frame of lactose_net_api", allow-invalid = true },
+  { path = "std::os::unix::net::UnixListener", reason = "architecture section 8.2: networking is outside the boundary; state enters through the staged frame of lactose_net_api", allow-invalid = true },
+  { path = "std::os::unix::net::UnixStream", reason = "architecture section 8.2: networking is outside the boundary; state enters through the staged frame of lactose_net_api", allow-invalid = true },
+  { path = "std::process::Command", reason = "architecture section 8.2: a subprocess reaches files, the environment and the network alike" },
 ]

@@ -18,8 +18,19 @@ what they leave to the backend. Decision D119 is the design.
 
 ## The one public item
 
-`backend(pool: rayon::ThreadPool) -> Box<dyn PhysicsBackend>`. `app` builds the pool; each
-of its threads enters `ThreadClass::PhysicsSolver` before the backend is returned (a refused
+`backend(pool: rayon::ThreadPool) -> Box<dyn PhysicsBackend>`. `app` builds the pool, since
+the boundary lint file bans here rayon's pool builders, Rapier's `configure_thread_pool` and
+`clear_thread_pool` (a test that builds a pool lifts the ban on its one item). Off the pool,
+rayon starts its global pool, sized by the core count, so the file also bans rayon's free
+functions, iterator sources and bridges, the traits a parallel iterator of a crate's own is
+written with, and the public functions of the pinned Rapier and parry found to run parallel
+work outside `PhysicsPipeline::step`, the one function that runs on the pool it was handed.
+The list is not provably complete: Rapier's and parry's public functions that run parallel
+work outside `PhysicsPipeline::step`, beyond those listed, are not banned, nor is stepping a
+world without a pool (one made by `PhysicsWorld::new`, or after `set_thread_pool(None)`).
+`tests/global_pool.rs` holds at run time that a backend's life never starts the global pool.
+Each
+of the pool's threads enters `ThreadClass::PhysicsSolver` before the backend is returned (a refused
 scheduling class is logged and the thread runs at its default priority).
 Rapier's parallel work runs on that pool and nowhere else. The pool's size changes no output:
 `tests/determinism.rs` and `tests/conformance.rs` compare one, two and four threads.
@@ -72,11 +83,23 @@ the backend does not canonicalise.
 
 - A call with a value equal to the one recorded does nothing. Equality is bitwise on the
   canonical bits, so `0.0` and `-0.0` differ.
-- A value that fails validation (a non-finite scalar, a rotation that is not unit, a
-  negative mass, damping, density, friction, restitution or threshold, a non-positive shape
-  extent, an unknown locked-axis bit, a zero axis on a revolute or prismatic joint, limits
-  out of order, a joint between a body and itself) returns `InvalidData` from a creating
-  call and is logged and dropped by a setting call; the bookkeeping is unchanged either way.
+- Validation is `physics-api`'s, with no rule of this crate's own on the values it is
+  given (`crates/physics-api/README.md`, "Validity"; D135): `BodyDesc::validate` at
+  `create_body`, `Joint::validate` at `create_joint`, the value's `validate` at each
+  `set_*`, `PhysicsCommand::validate` on each command, and `Shape::validate` and
+  `Transform::validate` on a restored shape. A refused value returns the `Invalid` as
+  `InvalidData`, with its message, from a creating call, is logged and ignored by a setting
+  call, and is dropped from a step, whose other commands apply; the bookkeeping is
+  unchanged either way. It applies `physics-api`'s three rules on what those values do not
+  hold: a joint between a body and itself is refused first, before its value is read, with
+  the message `a joint between a body and itself`; a step whose `dt` is not finite and
+  above zero, or whose gravity is not finite, steps nothing; a query with a non-finite
+  origin, a direction that does not normalise, a non-finite or negative `max_distance`, or
+  a probe shape or pose its predicate refuses, answers nothing. A query's direction is
+  unit by contract: this backend passes it to Rapier as given, so distances are in units
+  of its length, and a non-unit one is the caller's error. `conformance::validity`
+  holds this backend to these rules on the rows it lists, under one and four solver
+  threads.
 - Every honoured write and command wakes the body. A kinematic body ignores velocity
   writes; a dynamic body in a frozen region keeps the velocity it was given for when it
   thaws.

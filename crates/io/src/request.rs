@@ -7,13 +7,14 @@
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::task::{Context, Poll, Waker};
 
-use lactose_core::{Error, Result};
+use lactose_core::{Error, ErrorKind, Result};
 
 use crate::backend::Backend;
 use crate::file::{FileId, OpenFile};
+use crate::span;
 use crate::types::{DirEntry, Encoding, ReplaceFailed};
 
 /// One request as data, for the backend to run: what to do and the [`Completion`] to hand
@@ -63,26 +64,74 @@ impl Request {
     /// The request's span, made from its own fields by the variant's constructor in
     /// `span.rs`. Called once, by the first poll, before the request is submitted.
     pub(crate) fn span(&self) -> tracing::Span {
-        todo!("the variant's `span::*` constructor over its fields")
+        match self {
+            Self::Open { path, id, .. } => span::open(path, *id),
+            Self::Read { file, offset, len, .. } => span::read(file.id, *offset, *len, None),
+            Self::ReadEncoded { file, offset, len, encoding, .. } => {
+                span::read(file.id, *offset, *len, Some(*encoding))
+            }
+            Self::ReadFile { path, .. } => span::read_file(path),
+            Self::Replace { path, bytes, .. } => span::replace(path, bytes.len() as u64),
+            Self::ReadDir { path, .. } => span::read_dir(path),
+            Self::CreateDirAll { path, .. } => span::create_dir_all(path),
+        }
+    }
+
+    /// The span the first poll created, for the backend to enter while it runs the request;
+    /// a disabled span if there is none.
+    pub(crate) fn current_span(&self) -> tracing::Span {
+        let span = match self {
+            Self::Open { complete, .. } => complete.span.get(),
+            Self::Read { complete, .. } | Self::ReadFile { complete, .. } => complete.span.get(),
+            Self::ReadEncoded { complete, .. } => complete.span.get(),
+            Self::Replace { complete, .. } => complete.span.get(),
+            Self::ReadDir { complete, .. } => complete.span.get(),
+            Self::CreateDirAll { complete, .. } => complete.span.get(),
+        };
+        span.cloned().unwrap_or_else(tracing::Span::none)
     }
 
     /// Whether the future that made this request has been dropped, read by the backend
     /// before it starts the work so a cancelled request never runs.
     pub(crate) fn is_cancelled(&self) -> bool {
-        todo!("the variant's completion's flag")
+        match self {
+            Self::Open { complete, .. } => complete.is_cancelled(),
+            Self::Read { complete, .. } | Self::ReadFile { complete, .. } => {
+                complete.is_cancelled()
+            }
+            Self::ReadEncoded { complete, .. } => complete.is_cancelled(),
+            Self::Replace { complete, .. } => complete.is_cancelled(),
+            Self::ReadDir { complete, .. } => complete.is_cancelled(),
+            Self::CreateDirAll { complete, .. } => complete.is_cancelled(),
+        }
     }
 
     /// The path whose replaces this request is ordered with, for a replace: the backend
     /// starts it only after every replace of an equal path submitted before it has finished.
     /// `None` for every other request.
     pub(crate) fn replace_path(&self) -> Option<&Path> {
-        todo!("`Some(path)` for `Replace`")
+        match self {
+            Self::Replace { path, .. } => Some(path),
+            _ => None,
+        }
     }
 
     /// Fails the request without running it: a stopping backend completes what it still
     /// holds with `Cancelled`, a replace handing its bytes back in its [`ReplaceFailed`].
     pub(crate) fn cancel(self) {
-        todo!("complete the variant's completion with ErrorKind::Cancelled")
+        let stopped = || Error::new(ErrorKind::Cancelled, "the IO pool has stopped");
+        match self {
+            Self::Open { complete, .. } => complete.complete(Err(stopped())),
+            Self::Read { complete, .. } | Self::ReadFile { complete, .. } => {
+                complete.complete(Err(stopped()));
+            }
+            Self::ReadEncoded { complete, .. } => complete.complete(Err(stopped())),
+            Self::Replace { bytes, complete, .. } => {
+                complete.complete(Err(ReplaceFailed { error: stopped(), bytes }));
+            }
+            Self::ReadDir { complete, .. } => complete.complete(Err(stopped())),
+            Self::CreateDirAll { complete, .. } => complete.complete(Err(stopped())),
+        }
     }
 }
 
@@ -93,8 +142,10 @@ pub(crate) enum Encoded {
     /// `decoded_len` bytes, both allocated on the pool thread under `AllocTag::Io`. The
     /// future decodes the one into the other in its own poll (architecture section 5.1:
     /// asset decode is background work).
-    Stored { stored: Vec<u8>, decoded: Vec<u8> },
-    /// Bytes a backend with a hardware decoder decoded itself, whole, as the request.
+    Stored { stored: Vec<u8>, decoded: Vec<u8>, decoded_len: usize },
+    /// Bytes a backend with a hardware decoder decoded itself, whole, as the request. The
+    /// blocking pool has none.
+    #[expect(dead_code, reason = "the variant a hardware-decoding backend completes with")]
     Decoded(Vec<u8>),
 }
 
@@ -114,6 +165,11 @@ impl Failure for ReplaceFailed {
     fn error(&self) -> &Error {
         &self.error
     }
+}
+
+/// Records a failure's kind on its request's span, the one field every span carries.
+pub(crate) fn record_error(span: &tracing::Span, error: &Error) {
+    span.record("error", tracing::field::debug(error.kind()));
 }
 
 /// What a request's future and its backend share.
@@ -136,6 +192,14 @@ struct State<T, E> {
     cancelled: bool,
 }
 
+impl<T, E> Completion<T, E> {
+    /// The state. A poisoned lock is taken as it is: panics abort outside tests, and every
+    /// update under the lock is a single assignment that leaves the state consistent.
+    fn lock(&self) -> MutexGuard<'_, State<T, E>> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
 impl<T, E: Failure> Completion<T, E> {
     pub(crate) fn new() -> Arc<Self> {
         Arc::new(Self {
@@ -152,14 +216,26 @@ impl<T, E: Failure> Completion<T, E> {
     /// task inline (the executor does when it races its own shutdown), and that may drop
     /// the future and re-enter [`Pending`]'s `drop` on this same lock.
     pub(crate) fn complete(&self, result: Result<T, E>) {
-        todo!(
-            "record the span's error; under the lock store the result unless cancelled and \
-             take the waker; release the lock; then drop a discarded result and wake"
-        )
+        if let (Err(failure), Some(span)) = (&result, self.span.get()) {
+            record_error(span, failure.error());
+        }
+        let (discarded, waker) = {
+            let mut state = self.lock();
+            if state.cancelled {
+                (Some(result), None)
+            } else {
+                state.result = Some(result);
+                (None, state.waker.take())
+            }
+        };
+        drop(discarded);
+        if let Some(waker) = waker {
+            waker.wake();
+        }
     }
 
     pub(crate) fn is_cancelled(&self) -> bool {
-        todo!("read the flag under the lock")
+        self.lock().cancelled
     }
 }
 
@@ -174,9 +250,11 @@ pub(crate) struct Pending<T, E = Error> {
     request: Option<Request>,
     /// Where the backend puts the result.
     completion: Arc<Completion<T, E>>,
-    /// The backend the request goes to; `None` once submitted or for a request that
-    /// failed before it was made.
+    /// The backend the request goes to; `None` once submitted or for a request decided
+    /// before it was made.
     backend: Option<Arc<dyn Backend>>,
+    /// Whether a poll has returned the result; polling again is a broken invariant.
+    resolved: bool,
 }
 
 impl<T, E: Failure> Pending<T, E> {
@@ -186,14 +264,26 @@ impl<T, E: Failure> Pending<T, E> {
         completion: Arc<Completion<T, E>>,
         request: Request,
     ) -> Self {
-        Self { request: Some(request), completion, backend: Some(backend) }
+        Self { request: Some(request), completion, backend: Some(backend), resolved: false }
+    }
+
+    /// A request decided before it was made (a zero-length read): resolves to `result` at
+    /// the first poll, which still creates the span from `request` and records an error on
+    /// it, and submits nothing.
+    pub(crate) fn decided(
+        completion: Arc<Completion<T, E>>,
+        request: Request,
+        result: Result<T, E>,
+    ) -> Self {
+        completion.lock().result = Some(result);
+        Self { request: Some(request), completion, backend: None, resolved: false }
     }
 
     /// A request that failed before it was made (a range above the cap, an overflowing
     /// range, an empty encoded range): resolves to `error` at the first poll, which still
     /// creates the span from `request` and records `error` on it, and submits nothing.
     pub(crate) fn failed(completion: Arc<Completion<T, E>>, request: Request, error: E) -> Self {
-        todo!("store `Err(error)` in the completion; keep `request` for its span; no backend")
+        Self::decided(completion, request, Err(error))
     }
 
     /// The request's span once the first poll has created it, for an encoded read's
@@ -207,15 +297,43 @@ impl<T, E: Failure> Future for Pending<T, E> {
     type Output = Result<T, E>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<T, E>> {
-        todo!(
-            "on the first poll set the completion's span from the request and submit it; \
-             then return the result or park the waker"
-        )
+        let this = self.get_mut();
+        assert!(!this.resolved, "an IO request's future was polled after it resolved");
+        if let Some(request) = this.request.take() {
+            let span = this.completion.span.get_or_init(|| request.span());
+            match this.backend.take() {
+                Some(backend) => backend.submit(request),
+                None => {
+                    if let Some(Err(failure)) = &this.completion.lock().result {
+                        record_error(span, failure.error());
+                    }
+                    drop(request);
+                }
+            }
+        }
+        let mut state = this.completion.lock();
+        if let Some(result) = state.result.take() {
+            drop(state);
+            this.resolved = true;
+            return Poll::Ready(result);
+        }
+        match &mut state.waker {
+            Some(waker) if waker.will_wake(cx.waker()) => {}
+            slot => *slot = Some(cx.waker().clone()),
+        }
+        Poll::Pending
     }
 }
 
 impl<T, E> Drop for Pending<T, E> {
     fn drop(&mut self) {
-        todo!("mark the completion cancelled; a request never submitted is dropped here")
+        // Taken under the lock and dropped after it: a result the backend left here is freed
+        // on this thread, and the request, if never submitted, after this body.
+        let (result, waker) = {
+            let mut state = self.completion.lock();
+            state.cancelled = true;
+            (state.result.take(), state.waker.take())
+        };
+        drop((result, waker));
     }
 }

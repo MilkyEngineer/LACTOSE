@@ -25,6 +25,10 @@ comments rely on. The crate's tests run under Miri.
   tag first because a shrink may discard it, and rewrites it at the new end.
 - The current-tag thread-local is const-initialised and has no destructor, so reading it
   inside the allocator cannot allocate or fail during thread teardown.
+- A test binary that installs `TaggedAlloc` as its global allocator runs under Miri only
+  with `-Zmiri-tree-borrows`: `dealloc` and `realloc` read the tag trailer through the
+  caller's pointer, outside the range of its pointee, which Stacked Borrows forbids and Tree
+  Borrows allows.
 
 ## `id`
 

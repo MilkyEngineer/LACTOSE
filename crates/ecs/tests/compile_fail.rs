@@ -9,6 +9,7 @@
 #![forbid(unsafe_code)]
 
 use std::path::Path;
+#[expect(clippy::disallowed_types, reason = "a test that runs cargo on a scratch package")]
 use std::process::Command;
 use std::{env, fs, process};
 
@@ -60,6 +61,11 @@ const CASES: &[(&str, &[&str])] = &[
 
 #[test]
 #[cfg_attr(miri, ignore = "runs cargo")]
+#[expect(
+    clippy::disallowed_methods,
+    clippy::disallowed_types,
+    reason = "a test that writes a scratch package and finds cargo through the environment"
+)]
 fn rejected_systems() {
     let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
     let repository = crate_dir.join("../..");

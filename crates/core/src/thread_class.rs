@@ -282,6 +282,10 @@ mod tests {
 
     #[test]
     #[cfg_attr(miri, ignore = "calls operating-system scheduling APIs")]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "each class is entered on a fresh thread, as a pool outside the boundary does"
+    )]
     fn every_class_can_be_entered() {
         for class in [
             ThreadClass::FrameCritical,

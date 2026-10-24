@@ -5,7 +5,7 @@ What the engine knows about every component and resource type.
 | | |
 |---|---|
 | Tier | foundation |
-| Determinism boundary | outside |
+| Determinism boundary | outside; every boundary crate compiles it, so its `clippy.toml` carries the boundary's bans on files, the environment, subprocesses, the network and the standard library's thread creation (architecture section 8.2) |
 | Unsafe | none in this crate, `#![forbid(unsafe_code)]`; the attributes it re-exports expand to one `unsafe impl` per struct, whose proof is in `crates/reflect-macros/SAFETY.md` |
 
 ## What it holds

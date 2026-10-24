@@ -10,7 +10,8 @@ license.workspace = true
 [features]
 # The conformance suite every store must pass, and the in-memory reference store the suite
 # is tested against. For `[dev-dependencies]` only: no normal or build dependency edge in
-# the workspace may enable it, so nothing that ships can name `ReferenceStore`.
+# the workspace may enable it, so nothing that ships can name `ReferenceStore`. `cargo xtask
+# tiers` holds it there through `[dev_only_features]` in crate-tiers.toml.
 conformance = []
 
 [dependencies]

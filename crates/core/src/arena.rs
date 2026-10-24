@@ -241,6 +241,7 @@ mod tests {
     }
 
     #[test]
+    #[expect(clippy::disallowed_methods, reason = "the test moves an arena to a second thread")]
     fn arena_moves_between_threads() {
         let mut arena = Arena::new();
         arena.alloc(1u32);

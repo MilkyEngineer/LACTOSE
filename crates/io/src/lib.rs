@@ -10,14 +10,6 @@
 //! nothing it returns reaches the simulation except as bytes a loader or the save path
 //! validated.
 //!
-//! # Status
-//!
-//! A facade: every public signature is final and every body that decides anything is
-//! `todo!()`. [`IoConfig`]'s constructors, [`ReplaceFailed`]'s impls and the span helpers
-//! are real. The
-//! implementation lane replaces the bodies behind this surface and removes the
-//! crate-level `allow` with the last `todo!()`.
-//!
 //! # Where to start
 //!
 //! - [`Io`] is the pool, started once by `app` from the executor's platform with an
@@ -60,12 +52,6 @@
 //! ```
 
 #![forbid(unsafe_code)]
-#![allow(
-    dead_code,
-    unused_variables,
-    reason = "facade: every body is `todo!()` until the implementation lane replaces it, and \
-              the fields and parameters it will use are declared now"
-)]
 
 mod backend;
 mod config;
@@ -74,6 +60,8 @@ mod file;
 mod io;
 mod request;
 mod span;
+#[cfg(test)]
+mod tests;
 mod types;
 
 pub use config::IoConfig;

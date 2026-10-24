@@ -15,6 +15,8 @@
 # Game crates may depend on foundation crates and on other game crates.
 # Dev-dependency concessions: a crate may dev-depend on itself, and any crate may dev-depend
 #   on a [test_support] crate.
+# A feature listed in [dev_only_features] is turned on by dev-dependency edges alone: no normal
+#   or build edge may enable it, and no `[features]` value may forward to it.
 # Build scripts and proc macros may not depend on boundary crates (they compile for the host
 # without the pinned target features).
 # Every dependency that is a path dependency must be a workspace member, and a dependency
@@ -62,6 +64,12 @@ crates = ["game-sim", "game-present", "game-ai", "game-content"]
 # section, whose rules govern its normal and build edges.
 crates = ["lactose-rhi-null"]
 
+[dev_only_features]
+# Features that compile library code for tests, which nothing that ships may compile. Each
+# key is a crate; a feature of it that turns a listed one on is held to the same rule.
+# asset-api's `conformance` builds the store conformance suite and its `ReferenceStore`.
+"lactose-asset-api" = ["conformance"]
+
 [boundary]
 # Crates inside the determinism boundary. clippy.toml and the allowlists below apply here.
 crates = [
@@ -94,8 +102,9 @@ crates = [
 
 # The dependency allowlist of the determinism boundary (architecture section 8.2), enforced by
 # `cargo xtask boundary`. A boundary crate may always depend on another boundary crate, subject
-# to the tier rules above. Its normal and build dependencies on anything else must be named
-# here. Dev-dependencies on workspace crates are left to the tier rules.
+# to the tier rules above. Its dependencies of every kind on anything else must be named here,
+# and so must every workspace crate it reaches through them: section 8.2 says "directly or at
+# any depth", and its tests run under SOUR. A test may also name a [test_support] crate.
 
 # Non-boundary foundation crates a boundary crate may depend on. Section 8.2 names the first
 # three for any boundary crate ("only for types and for operations that are deterministic by
@@ -113,6 +122,11 @@ any = [
   "lactose-reflect", "lactose-asset-api", "lactose-present-api",
   "lactose-reflect-macros",
 ]
+
+# `dev`: what a boundary crate's tests may name and reach besides the lists above. The SOUR
+# tests build their executor from `lactose-task`, which no shipped boundary crate but
+# `lactose-ecs` names.
+dev = ["lactose-task"]
 
 [boundary_internal.only]
 "lactose-ecs" = ["lactose-task", "lactose-ecs-macros"]

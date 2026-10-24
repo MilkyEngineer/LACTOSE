@@ -642,6 +642,8 @@ impl World {
     /// key gives the entity [`PredictedOrigin`](crate::PredictedOrigin). Storage holds
     /// origin keys: a bound `Net` key inside a reference field of `bundle` is rewritten to
     /// the target's origin key here, as at command apply and [`insert`](Self::insert).
+    /// `InvalidData` for an [`OwnedBy`](crate::OwnedBy) in `bundle` that would make `key`
+    /// its own owner or close a cycle of owners; a refused spawn changes nothing.
     pub fn spawn<B: Bundle>(&mut self, key: StableKey, region: RegionId, bundle: B) -> Result<()> {
         let components = erase_bundle(bundle);
         if components.iter().any(|component| is_worlds_own(component.key())) {
@@ -668,8 +670,9 @@ impl World {
     /// by name (`InvalidData`; `insert` would store the empty reference, but erased bytes
     /// come from the wire or a recorded slot, where a placeholder is never valid) and the
     /// bytes validated through `TypeInfo::validate` (`InvalidData`); `NotFound` if the
-    /// entity does not exist. A bound `Net` key in a reference field is stored as the
-    /// origin key, as `insert` stores it.
+    /// entity does not exist; `InvalidData` for an [`OwnedBy`](crate::OwnedBy) that would
+    /// make `key` its own owner or close a cycle of owners. A bound `Net` key in a reference
+    /// field is stored as the origin key, as `insert` stores it.
     ///
     /// Adds the component if the row lacks it, an archetype change the structural log
     /// records, and otherwise writes it only if the stored bytes differ. A write stamps the
@@ -683,8 +686,9 @@ impl World {
         if self.get_erased(origin, component.key()) == Some(component.bytes()) {
             return Ok(false);
         }
+        let info = self.checked_write(origin, &component)?;
         let stamp = self.bump();
-        self.write_component(origin, component, stamp)?;
+        self.store_component(origin, info, component, stamp)?;
         Ok(true)
     }
 
@@ -707,9 +711,10 @@ impl World {
     /// is checked as [`insert_erased`](Self::insert_erased) checks it, and two entries for
     /// one component are `InvalidData`; the key rules are `spawn`'s (a `Net` or `Predicted`
     /// key that no live entity has, `InvalidData` otherwise or for a placeholder; a
-    /// `Predicted` key gives [`PredictedOrigin`](crate::PredictedOrigin)), and `NotFound` if
-    /// the region is not loaded. Everything is checked before anything changes, so a
-    /// refused spawn changes nothing.
+    /// `Predicted` key gives [`PredictedOrigin`](crate::PredictedOrigin)), `InvalidData` for
+    /// an [`OwnedBy`](crate::OwnedBy) that would make `key` its own owner or close a cycle of
+    /// owners, and `NotFound` if the region is not loaded. Everything is checked before
+    /// anything changes, so a refused spawn changes nothing.
     pub fn spawn_erased(
         &mut self,
         key: StableKey,
@@ -731,15 +736,17 @@ impl World {
     /// Writes the whole component `value` to `key`, adding it if absent, immediately, and
     /// updates the relationship index. Panics for [`InRegion`](crate::InRegion) and
     /// [`PredictedOrigin`](crate::PredictedOrigin), which are the world's. `NotFound` for a
-    /// missing entity or an unregistered component; a refused insert changes nothing.
+    /// missing entity or an unregistered component; `InvalidData` for an
+    /// [`OwnedBy`](crate::OwnedBy) that would make `key` its own owner or close a cycle of
+    /// owners. A refused insert changes nothing.
     pub fn insert<T: Component>(&mut self, key: StableKey, value: T) -> Result<()> {
         assert!(!is_worlds_own(T::KEY), "`{}` is written by the world only", T::SCHEMA.name());
         let origin = self.origin(key).ok_or_else(|| not_found("no such entity"))?;
         let mut component = ErasedComponent::of(value);
         self.resolve_references(&mut component, None, None);
-        self.checked_info(&component)?;
+        let info = self.checked_write(origin, &component)?;
         let stamp = self.bump();
-        self.write_component(origin, component, stamp)
+        self.store_component(origin, info, component, stamp)
     }
 
     /// Removes component `T` from `key`, immediately, returning it; `None` if absent.
@@ -792,9 +799,11 @@ impl World {
     /// received after a snapshot is not lost to the rollback. A reference stored as `net`
     /// before the bind, such as an owner loaded from another region's save, is rewritten
     /// to `predicted`, in rows and region resources alike, so stored bytes are origin keys
-    /// whatever the order of loads and inserts. Fails if
-    /// `predicted` or `net` is already bound to something else, or if `net` names a live
-    /// entity of its own, whose references a bind would redirect.
+    /// whatever the order of loads and inserts; a stored `Net` reference whose rewrite would
+    /// close a cycle of owners is written empty instead and logged (README, Regions,
+    /// "Ownership is a forest"), so a bind never fails on ownership. Fails if `predicted` or
+    /// `net` is already bound to something else, or if `net` names a live entity of its
+    /// own, whose references a bind would redirect.
     pub fn bind(&mut self, predicted: PredictionKey, net: NetId) -> Result<()> {
         let bound_net = self.aliases.by_predicted.get(&predicted);
         let bound_predicted = self.aliases.by_net.get(&net);
@@ -1365,8 +1374,14 @@ impl World {
     /// save or the relevance message, and the transient ones the export listed with
     /// [`insert_region_resource_zeroed`](Self::insert_region_resource_zeroed). Every
     /// component schema must match the registry's; a mismatch is an error of kind
-    /// `VersionMismatch`, and `lactose-persist` migrates the document first. Rows are
-    /// stamped at the current point and logged as spawned; no epoch starts.
+    /// `VersionMismatch`, and `lactose-persist` migrates the document first. A row without
+    /// `PredictedOrigin` whose `NetId` is bound is `InvalidData`. The owners are walked once,
+    /// before anything binds or spawns (README, Regions, "Ownership is a forest"): a
+    /// document whose rows' owners close a cycle within it, through its records or its
+    /// baseline's own `ecs::owned_by` column, is refused whole with `InvalidData`, as any
+    /// invalid row is; a cycle through live entities of other regions is broken at the
+    /// document row, which loads without `OwnedBy`, logged at `warn`. Rows are stamped at
+    /// the current point and logged as spawned; no epoch starts.
     pub fn load_region(
         &mut self,
         region: RegionId,
@@ -1488,6 +1503,63 @@ impl World {
         owned
     }
 
+    /// The owner `key`'s entity stores, as stored: `None` if the entity is not live or has
+    /// no owner.
+    pub(crate) fn stored_owner(&self, key: StableKey) -> Option<StableKey> {
+        let loc = self.storage.loc(key)?;
+        typed::<OwnedBy>(self.storage.component(loc, OwnedBy::KEY)?).owner.get()
+    }
+
+    /// The owner chain of `start` (README, Regions, "Ownership is a forest"): `start`, its
+    /// owner, its owner's owner, ..., as origin keys, ending with the first key that names
+    /// no live entity or whose entity has no owner.
+    pub(crate) fn owner_chain(&self, start: StableKey) -> impl Iterator<Item = StableKey> + '_ {
+        // Ownership is a forest, so a chain holds each live entity once at most and ends;
+        // the bound only keeps a broken invariant from hanging a walk.
+        let mut steps = self.storage.entities.len() + 1;
+        let mut next = Some(self.canonical(start));
+        core::iter::from_fn(move || {
+            steps = steps.checked_sub(1)?;
+            let at = next?;
+            next = self.stored_owner(at).map(|owner| self.canonical(owner));
+            Some(at)
+        })
+    }
+
+    /// The entity on `to`'s owner chain whose stored owner is `from`, where rewriting
+    /// `from` to `to` would close a cycle of owners. At most one: the chain returns to `to`
+    /// through it and through nothing else.
+    fn closing_owner(&self, from: StableKey, to: StableKey) -> Option<StableKey> {
+        let mut at = to;
+        for _ in 0..=self.storage.entities.len() {
+            // Compared as stored: once bound, `from` is canonically `to` itself.
+            let owner = self.stored_owner(at)?;
+            if owner == from {
+                return Some(at);
+            }
+            at = self.canonical(owner);
+        }
+        None
+    }
+
+    /// `InvalidData` if `bytes` of `component` are an [`OwnedBy`] whose owner would make
+    /// `key` its own owner or close a cycle of owners: if `key` is on the owner's chain.
+    /// The bytes have been validated.
+    fn check_owner(&self, key: StableKey, component: ComponentKey, bytes: &[u8]) -> Result<()> {
+        if component != OwnedBy::KEY {
+            return Ok(());
+        }
+        let value: OwnedBy = bytemuck::checked::pod_read_unaligned(bytes);
+        let Some(owner) = value.owner.get() else { return Ok(()) };
+        let key = self.canonical(key);
+        if self.owner_chain(owner).any(|at| at == key) {
+            return Err(invalid(format!(
+                "`OwnedBy` {owner:?} would make {key:?} its own owner or close a cycle of owners"
+            )));
+        }
+        Ok(())
+    }
+
     /// `root` and every entity it owns, directly or through owned entities, each once:
     /// `root` first, then breadth first in ascending key order.
     fn ownership_tree(&self, root: StableKey) -> Vec<StableKey> {
@@ -1606,6 +1678,7 @@ impl World {
             self.resolve_references(component, None, Some(key));
         }
         let row = self.spawn_row(key, region, components)?;
+        self.check_row_owner(key, &row)?;
         let stamp = self.bump();
         self.push_spawned(key, region, row, stamp);
         Ok(())
@@ -1614,7 +1687,11 @@ impl World {
     /// Rewrites every stored reference to `from` into `to`, the same entity under its origin
     /// key: a `Net` key written before the bind that makes it an alias, for instance an
     /// owner loaded from another region's save. The bytes then match every other machine's;
-    /// no row is stamped, since nothing about the entity changed.
+    /// no row is stamped, since nothing about the entity changed. The one `OwnedBy` whose
+    /// rewrite would close a cycle of owners is written empty in place instead, its
+    /// component kept and its reverse index entry dropped, and logged at `warn` (README,
+    /// Regions, "Ownership is a forest"): a bind, a restore or a despawn merges two keys
+    /// and never refuses to.
     pub(crate) fn rekey_references(&mut self, from: StableKey, to: StableKey) {
         // Region resources are not indexed: every one with a reference field is visited, so
         // its bytes do not depend on whether it was inserted before or after the bind.
@@ -1627,7 +1704,22 @@ impl World {
                 }
             }
         }
-        let Some(entries) = self.references.by_target.remove(&from) else { return };
+        let Some(mut entries) = self.references.by_target.remove(&from) else { return };
+        if let Some(closing) = self.closing_owner(from, to) {
+            entries
+                .retain(|&(source, component, _)| (source, component) != (closing, OwnedBy::KEY));
+            let loc = self.storage.loc(closing).expect("a chain holds live entities");
+            let empty = OwnedBy { owner: EntityRef::NONE };
+            self.storage.overwrite(loc, OwnedBy::KEY, bytemuck::bytes_of(&empty));
+            tracing::warn!(
+                target: "casein",
+                entity = ?closing,
+                owner = ?from,
+                origin = ?to,
+                "an owner reference emptied: its rewrite to the origin key would close a cycle \
+                 of owners"
+            );
+        }
         let mut rows: Vec<(StableKey, ComponentKey)> =
             entries.iter().map(|&(source, component, _)| (source, component)).collect();
         rows.dedup();
@@ -1694,13 +1786,30 @@ impl World {
         stamp: Stamp,
     ) -> Result<()> {
         let row = self.spawn_row(key, region, components)?;
+        self.check_row_owner(key, &row)?;
         self.push_spawned(key, region, row, stamp);
         Ok(())
     }
 
-    /// The row [`spawn_entity`](Self::spawn_entity) would push, every check made and
-    /// nothing changed: the components with `InRegion`, and `PredictedOrigin` for a
-    /// `Predicted` key that lacks it, ascending by key and validated.
+    /// [`spawn_entity`](Self::spawn_entity) for a region load, whose pre-pass has walked
+    /// the owners of the whole document once: no row walks its chain again, so a deep
+    /// chain loads in one pass.
+    pub(crate) fn spawn_loaded(
+        &mut self,
+        key: StableKey,
+        region: RegionId,
+        components: Vec<ErasedComponent>,
+        stamp: Stamp,
+    ) -> Result<()> {
+        let row = self.spawn_row(key, region, components)?;
+        self.push_spawned(key, region, row, stamp);
+        Ok(())
+    }
+
+    /// The row [`spawn_entity`](Self::spawn_entity) would push, every check but the
+    /// ownership rule made and nothing changed: the components with `InRegion`, and
+    /// `PredictedOrigin` for a `Predicted` key that lacks it, ascending by key and
+    /// validated.
     fn spawn_row(
         &self,
         key: StableKey,
@@ -1744,6 +1853,11 @@ impl World {
         Ok(row)
     }
 
+    /// The ownership rule over a row [`spawn_row`](Self::spawn_row) built for `key`.
+    fn check_row_owner(&self, key: StableKey, row: &[(&'static TypeInfo, Vec<u8>)]) -> Result<()> {
+        row.iter().try_for_each(|(info, bytes)| self.check_owner(key, info.key(), bytes))
+    }
+
     /// Pushes a row [`spawn_row`](Self::spawn_row) checked, stamped at `stamp`, and indexes
     /// and logs it.
     fn push_spawned(
@@ -1770,14 +1884,39 @@ impl World {
         }
     }
 
-    /// Writes a whole component of the live entity `key`, adding it if absent.
+    /// Writes a whole component of the live entity `key`, adding it if absent, through the
+    /// checks of [`checked_write`](Self::checked_write).
     pub(crate) fn write_component(
         &mut self,
         key: StableKey,
         component: ErasedComponent,
         stamp: Stamp,
     ) -> Result<()> {
-        let info = self.checked_info(&component)?;
+        let info = self.checked_write(key, &component)?;
+        self.store_component(key, info, component, stamp)
+    }
+
+    /// The registry's description of `component` to write to `key`: what
+    /// [`checked_info`](Self::checked_info) checks, and the ownership rule. Called before
+    /// the stamp is taken, so a refusal changes nothing, not even the point.
+    fn checked_write(
+        &self,
+        key: StableKey,
+        component: &ErasedComponent,
+    ) -> Result<&'static TypeInfo> {
+        let info = self.checked_info(component)?;
+        self.check_owner(key, component.key(), component.bytes())?;
+        Ok(info)
+    }
+
+    /// Stores a component [`checked_write`](Self::checked_write) accepted.
+    fn store_component(
+        &mut self,
+        key: StableKey,
+        info: &'static TypeInfo,
+        component: ErasedComponent,
+        stamp: Stamp,
+    ) -> Result<()> {
         let loc = self.storage.loc(key).ok_or_else(|| not_found("no such entity"))?;
         if let Some(old) = self.storage.component(loc, info.key()) {
             let old = old.to_vec();
@@ -1855,7 +1994,7 @@ impl World {
         }
         // A bound `Net` key whose own entity is gone (one a restore revived) names the
         // predicted entity again: the references to it go to the origin key, as the bind
-        // left them.
+        // left them, but for one that would close a cycle of owners, which is emptied.
         if let StableKey::Net(net) = key
             && let Some(&predicted) = self.aliases.by_net.get(&net)
         {

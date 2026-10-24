@@ -13,7 +13,7 @@ use lactose_asset_api::AssetRef;
 use lactose_core::{EntityRef, PlainArray, StableKey};
 use lactose_ecs::{Commands, OwnedBy};
 use lactose_math::{Quat, Scalar, Vec3};
-use lactose_physics_api::{BodyType, Joint, Transform, Velocity};
+use lactose_physics_api::{BodyType, Transform, Velocity};
 use lactose_reflect::{Padding, ZeroByte, component, value};
 
 use crate::assets::{Clip, MAX_SIM_BONES, PARAM_SLOTS, Skeleton, StateMachine};
@@ -785,13 +785,7 @@ impl Bones {
             let Some(above) = skeleton.body_above(index).and_then(|above| keys[above].get()) else {
                 continue;
             };
-            let mut row_joint = Joint::new(joint.kind, above, row)
-                .with_anchors(joint.anchor_parent, joint.anchor_bone)
-                .with_axis(joint.axis);
-            if let Some((min, max)) = joint.limits {
-                row_joint = row_joint.with_limits(min, max);
-            }
-            cmd.spawn((row_joint, OwnedBy { owner: EntityRef::new(row) }));
+            cmd.spawn((joint.row(above, row), OwnedBy { owner: EntityRef::new(row) }));
         }
         let bones = Self { keys: PlainArray(keys), count: count as u8, limp: false, _pad: pad() };
         cmd.set(owner, bones);

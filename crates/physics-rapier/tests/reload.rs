@@ -44,6 +44,10 @@ fn f(x: f64) -> Scalar {
     Scalar::from_f64(x)
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "the test builds the solver pool that lactose-app builds in a shipped binary"
+)]
 fn rapier() -> Box<dyn PhysicsBackend> {
     let pool = rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap();
     lactose_physics_rapier::backend(pool)

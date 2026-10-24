@@ -137,6 +137,10 @@ fn sphere_key(index: u64) -> StableKey {
 /// `physics-api`'s scene: a floor reporting contacts, a falling stack, two bones joined and
 /// driven, a second region frozen and thawed, and game code that pushes, teleports, writes
 /// velocities, spawns, despawns and moves through the run; stepped by Rapier.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "the test builds the solver pool that lactose-app builds in a shipped binary"
+)]
 fn scene(kind: WorldKind, layout: LayoutConfig) -> Harness {
     let mut options = Options::new(kind);
     options.layout = layout;

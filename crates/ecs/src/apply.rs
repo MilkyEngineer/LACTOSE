@@ -177,6 +177,10 @@ impl World {
             }
             !live
         });
+        // A refused spawn allocates no `NetId` and binds nothing: the counter goes back, and
+        // a predicted spawn's bind waits for the row.
+        let counter = self.next_net_id;
+        let mut bind = None;
         let key = match predicted {
             Some(predicted) => {
                 // The spawn inherits the source's claim, whatever claim its bundle named.
@@ -184,9 +188,7 @@ impl World {
                 components.push(ErasedComponent::of(ClaimedBy { player: predicted.player }));
                 if self.kind == WorldKind::Server && self.alias(predicted).is_none() {
                     match self.allocate_net_id() {
-                        Ok(net) => {
-                            self.bind(predicted, net).expect("a fresh NetId is unbound");
-                        }
+                        Ok(net) => bind = Some((predicted, net)),
                         Err(error) => {
                             tracing::debug!(target: "casein", %error, "a spawn dropped");
                             return;
@@ -213,7 +215,12 @@ impl World {
         }
         if let Err(error) = self.spawn_entity(key, region, components, stamp) {
             placeholders[index as usize] = None;
+            self.next_net_id = counter;
             tracing::debug!(target: "casein", ?key, %error, "a spawn dropped");
+            return;
+        }
+        if let Some((predicted, net)) = bind {
+            self.bind(predicted, net).expect("a fresh NetId is unbound");
         }
     }
 

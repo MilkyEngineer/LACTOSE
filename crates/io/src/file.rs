@@ -7,12 +7,12 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use lactose_core::Result;
+use lactose_core::{Error, ErrorKind, Result};
 
 use crate::backend::Backend;
 use crate::decode::Decode;
-use crate::request::{Encoded, Pending};
-use crate::types::Encoding;
+use crate::request::{Completion, Encoded, Pending, Request};
+use crate::types::{Encoding, MAX_READ_BYTES};
 
 /// The number a pool gives each file it opens, for the `file` field of its read spans.
 ///
@@ -87,7 +87,21 @@ impl File {
     /// Nothing is submitted until the future is first polled.
     #[must_use = "a read does nothing until polled"]
     pub fn read_at(&self, offset: u64, len: u64) -> ReadAt {
-        todo!("check the range, then a `Pending` of `Request::Read`; `Pending::failed` if not")
+        let completion = Completion::new();
+        let request = Request::Read {
+            file: Arc::clone(&self.inner),
+            offset,
+            len,
+            complete: Arc::clone(&completion),
+        };
+        let pending = if let Some(error) = refused(offset, len, len) {
+            Pending::failed(completion, request, error)
+        } else if len == 0 {
+            Pending::decided(completion, request, Ok(Vec::new()))
+        } else {
+            Pending::new(Arc::clone(&self.inner.backend), completion, request)
+        };
+        ReadAt { state: ReadState::Raw(pending) }
     }
 
     /// Reads the `len` stored bytes at `offset` and decodes them as `encoding`, as one
@@ -110,10 +124,40 @@ impl File {
     /// is submitted until the future is first polled.
     #[must_use = "a read does nothing until polled"]
     pub fn read_encoded_at(&self, offset: u64, len: u64, encoding: Encoding) -> ReadAt {
-        todo!(
-            "check both lengths and the range, then a `Pending` of `Request::ReadEncoded`; \
-             `Pending::failed` if not"
-        )
+        let Encoding::Zstd { decoded_len } = encoding;
+        let completion = Completion::new();
+        let request = Request::ReadEncoded {
+            file: Arc::clone(&self.inner),
+            offset,
+            len,
+            encoding,
+            complete: Arc::clone(&completion),
+        };
+        let refused = refused(offset, len, decoded_len).or_else(|| {
+            (len == 0).then(|| Error::new(ErrorKind::InvalidData, "an encoded range is empty"))
+        });
+        let pending = match refused {
+            Some(error) => Pending::failed(completion, request, error),
+            None => Pending::new(Arc::clone(&self.inner.backend), completion, request),
+        };
+        ReadAt { state: ReadState::Stored(pending) }
+    }
+}
+
+/// What a read is refused for before anything is submitted: `ResourceExhausted` for a
+/// stored or decoded length above [`MAX_READ_BYTES`], then `InvalidData` for a range whose
+/// end overflows `u64`.
+fn refused(offset: u64, len: u64, decoded_len: u64) -> Option<Error> {
+    let largest = len.max(decoded_len);
+    if largest > MAX_READ_BYTES {
+        Some(Error::new(
+            ErrorKind::ResourceExhausted,
+            format!("a read of {largest} bytes is above the {MAX_READ_BYTES} a request may ask"),
+        ))
+    } else if offset.checked_add(len).is_none() {
+        Some(Error::new(ErrorKind::InvalidData, format!("the range {offset} + {len} overflows")))
+    } else {
+        None
     }
 }
 
@@ -137,16 +181,16 @@ impl fmt::Debug for File {
 /// the read completes or the future is dropped.
 ///
 /// Polling an encoded read whose stored bytes have arrived decodes a slice of them on the
-/// polling thread, about 0.5 ms of work in steps of about 64 KiB of output, then wakes
-/// itself and returns `Pending` until the frame is done, as section 5.1's background CPU
-/// work yields.
+/// polling thread, about 0.5 ms of work in steps of at most 64 KiB of output and 64 KiB of
+/// stored input, then wakes itself and returns `Pending` until the frame is done, as
+/// section 5.1's background CPU work yields.
 #[must_use = "a read does nothing until polled"]
 pub struct ReadAt {
-    state: ReadState,
+    pub(crate) state: ReadState,
 }
 
 /// Where a read is. Hidden and changeable.
-enum ReadState {
+pub(crate) enum ReadState {
     /// A raw read, or one failed before it was made.
     Raw(Pending<Vec<u8>>),
     /// An encoded read whose stored range the pool has not yet returned.
@@ -161,10 +205,32 @@ impl Future for ReadAt {
     type Output = Result<Vec<u8>>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<Vec<u8>>> {
-        todo!(
-            "Raw: the pending's result. Stored: on `Encoded::Stored` move to `Decoding` with \
-             the pending's span and decode a first slice; `Encoded::Decoded` is the result. \
-             Decoding: `Decode::poll_slice`"
-        )
+        let this = self.get_mut();
+        let result = loop {
+            match &mut this.state {
+                ReadState::Raw(pending) => match Pin::new(pending).poll(cx) {
+                    Poll::Ready(result) => break result,
+                    Poll::Pending => return Poll::Pending,
+                },
+                ReadState::Stored(pending) => match Pin::new(&mut *pending).poll(cx) {
+                    Poll::Ready(Ok(Encoded::Stored { stored, decoded, decoded_len })) => {
+                        let span = pending.span().cloned().unwrap_or_else(tracing::Span::none);
+                        let decode = Decode::new(stored, decoded, decoded_len, span);
+                        this.state = ReadState::Decoding(decode);
+                    }
+                    Poll::Ready(Ok(Encoded::Decoded(bytes))) => break Ok(bytes),
+                    Poll::Ready(Err(error)) => break Err(error),
+                    Poll::Pending => return Poll::Pending,
+                },
+                ReadState::Decoding(decode) => match decode.poll_slice(cx) {
+                    Poll::Ready(result) => break result,
+                    Poll::Pending => return Poll::Pending,
+                },
+                ReadState::Done => panic!("a read's future was polled after it resolved"),
+            }
+        };
+        // The request's completion and span, or the decode's context and span, go here.
+        this.state = ReadState::Done;
+        Poll::Ready(result)
     }
 }

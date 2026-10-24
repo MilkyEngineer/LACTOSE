@@ -218,8 +218,10 @@ impl Overlay {
     /// - a spawned entity has an `AddComponent`, `RemoveComponent` or `SetField`;
     /// - an entity removes a component that it also adds or sets a field of, or sets a
     ///   field of a component it adds;
-    /// - an entity is its own owner, is owned by an entity this overlay destroys, or the
-    ///   ownership records form a cycle;
+    /// - an entity is its own owner, or the ownership records form a cycle among
+    ///   themselves (an owner this overlay destroys is accepted: `Destroy` says the entity
+    ///   is no longer a row here, which a departure or an unload also is; whether an owner
+    ///   exists is the applier's);
     /// - a spawn names a component twice;
     /// - a component has no schema or two, its bytes are not the size its schema states,
     ///   or a `SetField` names a field its schema lacks or has bytes of another size.
@@ -292,9 +294,10 @@ impl Overlay {
     /// - a `RemoveComponent` or `SetField` names a component its row does not have.
     ///
     /// What is left for whoever applies the overlay, because it depends on state this
-    /// crate does not see: that each owner exists, that ownership has no cycle once the
-    /// baseline's own ownership is counted, that the overlay's schemas agree with the
-    /// registry or are migrated, and every cross-region reference.
+    /// crate does not see: that each owner exists (one this overlay destroys may live in
+    /// another region), that ownership has no cycle once the baseline's own ownership and
+    /// other regions are counted, that the overlay's schemas agree with the registry or are
+    /// migrated, and every cross-region reference.
     pub fn check_against(&self, baseline: &Baseline) -> Result<()> {
         if self.baseline_hash != baseline.content_hash() {
             return Err(Error::new(
@@ -609,8 +612,8 @@ fn check_entity(entity: &[Record]) -> Result<()> {
     Ok(())
 }
 
-/// The ownership checks that need no baseline: no owner this overlay destroys, and no
-/// cycle made of ownership records alone.
+/// The ownership checks that need no baseline: no entity its own owner, and no cycle made
+/// of ownership records alone.
 fn check_ownership(records: &[Record]) -> Result<()> {
     // Ascending by entity, because the records are.
     let owned: Vec<(NetId, NetId)> = records
@@ -620,11 +623,6 @@ fn check_ownership(records: &[Record]) -> Result<()> {
             _ => None,
         })
         .collect();
-    for &(_, owner) in &owned {
-        if matches!(entity_of(records, owner), [Record::Destroy { .. }]) {
-            return Err(invalid("an entity is owned by one this overlay destroys"));
-        }
-    }
     // Follow each chain of owners. A chain that returns to an entity on itself is a cycle;
     // one that reaches an entity already cleared, or leaves the overlay, is not.
     const UNSEEN: u8 = 0;

@@ -175,6 +175,33 @@ fn a_dynamic_bodys_transform_within_the_tolerance_makes_no_correction_and_is_cou
     assert_eq!(transform_of(&rig, body(5)), transform(0));
 }
 
+/// An equal substitution at the tick after an absorbed fact: slot 16 already ran the
+/// substitute, so it is no reason to roll back, and the fact the tolerance absorbed at 15
+/// stays absorbed, as without it; a rollback from 15 would have written it.
+#[test]
+fn an_equal_substitution_after_an_absorbed_fact_leaves_it_absorbed() {
+    let (mut rig, calls) = physics_rig();
+    rig.step_to(20, walking);
+    let mut frame = StagedFrame::new(Tick(15));
+    whole(&mut frame, body(5), &placed(0.0015, 0.0), &floating());
+    rig.push(frame);
+    let mut frame = StagedFrame::new(Tick(16));
+    frame.substituted.insert(Tick(16));
+    rig.push(frame);
+    rig.step(walking(21));
+    let hash = rig.hash();
+    let _ = calls.take();
+    let reconciled = rig.reconcile();
+    assert!(reconciled.corrections.is_empty(), "{:?}", summaries(&reconciled));
+    assert_eq!(reconciled.resimulated, 0);
+    assert_eq!(pushed(&calls.take()), vec![]);
+    assert_eq!(rig.hash(), hash);
+    assert_eq!(transform_of(&rig, body(5)), transform(0));
+    assert_eq!(rig.p().stats().substitutions, 1);
+    let absorbed = Absorbed { fields: 1, translation: bits(0.0015), ..Absorbed::default() };
+    assert_eq!(rig.p().stats().absorbed, absorbed);
+}
+
 #[test]
 fn one_leaf_beyond_the_tolerance_rolls_back_and_writes_the_absorbed_facts_too() {
     let (mut rig, calls) = physics_rig();

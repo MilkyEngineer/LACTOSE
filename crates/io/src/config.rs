@@ -61,4 +61,12 @@ mod tests {
         assert_eq!(threads(8, 16), 12);
         assert_eq!(threads(u32::MAX, 1), u32::MAX / 2 + 1);
     }
+
+    #[test]
+    fn new_keeps_its_count() {
+        for count in [1, 3, 64, u32::MAX] {
+            let count = NonZero::new(count).unwrap();
+            assert_eq!(IoConfig::new(count).pool_threads, count);
+        }
+    }
 }

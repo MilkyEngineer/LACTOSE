@@ -27,7 +27,7 @@ use rayon::ThreadPool;
 use crate::book::{BodyEntry, Book, Desc, JointEntry, Key, Live, MassPlan, Plain};
 use crate::convert::{
     key_code, key_from_code, pose, rotation, same, same_pose, same_vector, shared_shape, transform,
-    valid_body, valid_collider, valid_joint, valid_transform, valid_velocity, vec3, vector,
+    vec3, vector,
 };
 use crate::query;
 
@@ -84,22 +84,11 @@ impl PhysicsBackend for Rapier {
         if desc.body.is_none() && desc.collider.is_none() {
             return Err(invalid("a body needs a RigidBody, a Collider or both"));
         }
-        if !valid_transform(desc.transform) {
-            tracing::warn!(target: CONTRACT_TARGET, ?key, "refused body: not a valid transform");
-            return Err(invalid("not a valid transform"));
-        }
-        if desc.body.is_some_and(|body| !valid_body(&body)) {
-            tracing::warn!(target: CONTRACT_TARGET, ?key, "refused body: not a valid RigidBody");
-            return Err(invalid("not a valid RigidBody"));
-        }
-        if desc.collider.is_some_and(|collider| !valid_collider(collider)) {
-            tracing::warn!(target: CONTRACT_TARGET, ?key, "refused body: not a valid Collider");
-            return Err(invalid("not a valid Collider"));
-        }
-        let velocity = desc.velocity.copied().filter(valid_velocity);
-        if desc.velocity.is_some() && velocity.is_none() {
-            tracing::warn!(target: CONTRACT_TARGET, ?key, "refused body: not a valid Velocity");
-            return Err(invalid("not a valid Velocity"));
+        // The rules are `physics-api`'s, applied here and nowhere of this crate's own
+        // (`crates/physics-api/README.md`, "Validity"; D135).
+        if let Err(invalid) = desc.validate() {
+            tracing::warn!(target: CONTRACT_TARGET, %invalid, ?key, "refused body");
+            return Err(invalid.into());
         }
         let entry = BodyEntry {
             wanted: Desc {
@@ -109,7 +98,7 @@ impl PhysicsBackend for Rapier {
             },
             live: None,
             transform: Some(Plain(*desc.transform)),
-            velocity: velocity.map(Plain),
+            velocity: desc.velocity.copied().map(Plain),
             parked: None,
         };
         self.book.bodies.insert(Key(key), entry);
@@ -139,8 +128,8 @@ impl PhysicsBackend for Rapier {
     }
 
     fn set_body(&mut self, key: StableKey, body: Option<&RigidBody>) {
-        if body.is_some_and(|body| !valid_body(body)) {
-            tracing::warn!(target: CONTRACT_TARGET, ?key, "ignored set_body: not a valid RigidBody");
+        if let Some(invalid) = body.and_then(|body| body.validate().err()) {
+            tracing::warn!(target: CONTRACT_TARGET, %invalid, ?key, "ignored set_body");
             return;
         }
         if let Some(entry) = self.wanted(key) {
@@ -154,8 +143,8 @@ impl PhysicsBackend for Rapier {
     }
 
     fn set_collider(&mut self, key: StableKey, collider: Option<&Collider>) {
-        if collider.is_some_and(|collider| !valid_collider(collider)) {
-            tracing::warn!(target: CONTRACT_TARGET, ?key, "ignored set_collider: not a valid Collider");
+        if let Some(invalid) = collider.and_then(|collider| collider.validate().err()) {
+            tracing::warn!(target: CONTRACT_TARGET, %invalid, ?key, "ignored set_collider");
             return;
         }
         if let Some(entry) = self.wanted(key) {
@@ -169,8 +158,8 @@ impl PhysicsBackend for Rapier {
     }
 
     fn set_transform(&mut self, key: StableKey, transform: &Transform) {
-        if !valid_transform(transform) {
-            tracing::warn!(target: CONTRACT_TARGET, ?key, "ignored set_transform: not a valid transform");
+        if let Err(invalid) = transform.validate() {
+            tracing::warn!(target: CONTRACT_TARGET, %invalid, ?key, "ignored set_transform");
             return;
         }
         if let Some(entry) = self.wanted(key) {
@@ -180,8 +169,8 @@ impl PhysicsBackend for Rapier {
     }
 
     fn set_velocity(&mut self, key: StableKey, velocity: &Velocity) {
-        if !valid_velocity(velocity) {
-            tracing::warn!(target: CONTRACT_TARGET, ?key, "ignored set_velocity: not a valid Velocity");
+        if let Err(invalid) = velocity.validate() {
+            tracing::warn!(target: CONTRACT_TARGET, %invalid, ?key, "ignored set_velocity");
             return;
         }
         if let Some(entry) = self.wanted(key) {
@@ -215,9 +204,9 @@ impl PhysicsBackend for Rapier {
             tracing::warn!(target: CONTRACT_TARGET, ?key, "refused joint: both ends are one body");
             return Err(invalid("a joint between a body and itself"));
         }
-        if !valid_joint(joint) {
-            tracing::warn!(target: CONTRACT_TARGET, ?key, "refused joint: not a valid Joint");
-            return Err(invalid("not a valid Joint"));
+        if let Err(invalid) = joint.validate() {
+            tracing::warn!(target: CONTRACT_TARGET, %invalid, ?key, "refused joint");
+            return Err(invalid.into());
         }
         for end in [body_a, body_b] {
             if !self.book.bodies.contains_key(&Key(end)) {
@@ -624,6 +613,10 @@ impl Rapier {
         let mut forced = Vec::new();
         for command in commands {
             let key = Key(command.body());
+            if let Err(invalid) = command.validate() {
+                tracing::warn!(target: CONTRACT_TARGET, %invalid, key = ?key.0, "dropped command");
+                continue;
+            }
             let Some((live, wanted)) =
                 self.book.bodies.get(&key).and_then(|entry| Some((entry.live?, entry.wanted)))
             else {
@@ -632,22 +625,10 @@ impl Rapier {
             };
             // Every test before the mutable access, which marks the body modified. After the
             // flush, what the solver holds is what the entry wants.
-            let honoured = match *command {
-                PhysicsCommand::Teleport { transform, .. } => valid_transform(&transform),
-                _ if wanted.body_type() != RigidBodyType::Dynamic => {
-                    tracing::debug!(target: CONTRACT_TARGET, key = ?key.0, "dropped command: the body is not dynamic");
-                    continue;
-                }
-                PhysicsCommand::ApplyImpulseAt { impulse, point, .. } => {
-                    impulse.is_finite() && point.is_finite()
-                }
-                PhysicsCommand::ApplyImpulse { impulse: v, .. }
-                | PhysicsCommand::ApplyTorqueImpulse { torque: v, .. }
-                | PhysicsCommand::ApplyForce { force: v, .. }
-                | PhysicsCommand::ApplyTorque { torque: v, .. } => v.is_finite(),
-            };
-            if !honoured {
-                tracing::warn!(target: CONTRACT_TARGET, key = ?key.0, "dropped command: not a valid value");
+            if !matches!(command, PhysicsCommand::Teleport { .. })
+                && wanted.body_type() != RigidBodyType::Dynamic
+            {
+                tracing::debug!(target: CONTRACT_TARGET, key = ?key.0, "dropped command: the body is not dynamic");
                 continue;
             }
             let Some(body) = self.world.bodies.get_mut(live.body) else { continue };
@@ -900,8 +881,8 @@ fn reconcile_body(
 /// axes of a spherical one.
 fn generic_joint(joint: &Joint, code: u128) -> GenericJoint {
     let (a, b) = (vector(joint.anchor_a), vector(joint.anchor_b));
-    // Only the kinds that read the axis normalise it: `valid_joint` lets a zero one through
-    // for the others.
+    // Only the kinds that read the axis normalise it: `Joint::validate` lets a zero one
+    // through for the others.
     let axis = || vector(joint.axis.normalize());
     let limits = [joint.limit_min.to_f64(), joint.limit_max.to_f64()];
     let mut data: GenericJoint = match joint.kind {

@@ -676,6 +676,7 @@ fn golden_table_is_current() {
 #[cfg(target_arch = "aarch64")]
 #[test]
 #[ignore = "rewrites tests/golden/vectors.txt"]
+#[expect(clippy::disallowed_methods, reason = "a test tool that writes the table file")]
 fn bless() {
     let mut text = String::new();
     for operation in operations() {
