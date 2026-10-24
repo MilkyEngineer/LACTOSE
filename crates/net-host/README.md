@@ -490,6 +490,13 @@ reshape.
   the packer and the receiver that keep the rules above, which `lactose-net`'s must keep as
   well; a server tick split over several packets, each staged as its own frame under the
   receiver's tick rule, is `lactose-net`'s to design.
+- The sender's rule for `substituted` (`crates/net-api/README.md`, "The staged frame"):
+  every packet for a tick at or after a substituted input tick of the receiving player
+  carries it until an acknowledgement covers a packet that carried it, with the owed ticks
+  kept per client and the packets that carried each recorded beside `PacketRecord`:
+  `lactose-net`, milestone 4. The receiver rules above already give what it needs: a packet
+  is acknowledged only once staged, and `AckField::covers` and the packet sequence are
+  public.
 - The interpolation of anything but a translation and a rotation (a scale, an animation
   phase): added to `ReceivedState` and the slot's words when presentation needs it.
 - The server's hold of a player at a region boundary until `ClientReady`: a journaled input

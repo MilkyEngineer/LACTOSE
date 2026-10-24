@@ -2739,6 +2739,58 @@ rationale the author supplied during the editorial pass rather than one taken fr
   and release and its correction; the release's correction holding the released entity where
   the server released it through a re-simulated unload of that region, hash for hash with a run
   that had the release in time) and `tests/check.rs` (the registry refusal).
+- Addendum (lane predict-claim-replay, 2026-10-24; fix rounds 1 and 2, 2026-10-24): *A repeated
+  substitution report is skipped, so no later rollback loses a reconciled claim change.* Review
+  r2 of the proxy region found (P1) that a rollback in a later call, to a slot before a claim
+  change an earlier call reconciled, loses the change. A re-simulated tick never re-applies a
+  claim or release (the hook, item 2), and only kept facts are written again by later
+  rollbacks. A lost claim heals at the entity's next exact rows. A lost release does not: the
+  entity stays claimed, and the server's proxy rows of it are skipped as a sender's defect
+  until a full frame. The trigger is a substitution reported again in a later frame, which
+  rolled back to its tick again. Decided: (a) `lactose-predict` skips a repeated report, with
+  no point, no count and no repair armed again. A repeat is a tick a call already acted on as
+  substituted, in an earlier frame of the same call or in an earlier call. The predictor keeps
+  those ticks in its own state, not in the ring, together with the newest restart (a full
+  frame's or `resync`'s), at or before which every substitution and repair is skipped. Each is
+  remembered while the ring holds its slot or for ten seconds of ticks after it (a private
+  constant, `10 * TICK_RATE_HZ`), whichever is longer; a full frame and `resync` forget the
+  ticks, since their restart covers them. The check runs before the horizon check, so a repeat
+  whose slots have left the ring is skipped, not `TooOld`. The window does not depend on the
+  depth, which `app` sizes by CPU (D122): the sender repeats a substitution until it sees
+  acknowledged a packet that carried it, and the client acknowledges every packet it stages, so
+  the repeats end about a round trip plus the client's send interval after the first, later
+  only while every packet from the client is lost. It costs one `Tick` per substitution in the
+  window. (b) net-api states when a substitution is reported: in the first frame accepted at or
+  after its tick (unless a full frame at or after it comes first, or the frame holds region
+  changes alone), and possibly repeated until the server sees a packet carrying it
+  acknowledged. With frames accepted in ascending tick, every correction point a later call can
+  make restores a slot at or after every claim change an earlier call reconciled: a first
+  report (every earlier frame that carries an entity fact is for a tick before it), a repair
+  (due with the first frame at or after its tick), a re-substitution (below; in the frame that
+  first reports the tick before it, whose point is older), a mismatch at a later frame's tick,
+  a band fact at the restart, and a kept fact (written again by every rollback). So (a) and (b)
+  close P1 without keeping claim facts at their slots. A sender that breaks (b) by reporting t
+  − 1 after t: the repair of t that the late report arms falls on a tick already substituted,
+  so it substitutes t again, continuing t − 1's substitute, with cause `Substituted`, and arms
+  the repair of t + 1; the world ends as the server's inputs run, and the next repeat of t is
+  skipped. Rejected: keeping every claim-changing fact at its slot and writing it at every
+  rollback; larger, and needed only if (b) cannot be promised. Recognising a repeat by (b)
+  itself (t in a frame after one at or after t); it drops a sender's late first reports, which
+  existing ring tests use to drive rollbacks. Marking the ring's sample and refusing a local
+  sample marked substituted in `step`; the ring forgets the mark when it trims, and `step`'s
+  contract stays as it was. Residual limit: a repeat later than ten seconds after its tick,
+  once its slot has left the ring, reads as a first report and is `TooOld`, a resync, never a
+  rollback. So is a repair or first report due only once its previous slot has left the ring,
+  as any frame older than the ring is. Held by tests/substitution.rs: q1, q2 and q4 under (b);
+  a repeat within and across calls counted once; a repeat past its previous tick's slot, past
+  its own slot, and past a full frame's restart slot skipped; a repeat at the default depth
+  skipped up to ten seconds of ticks after its tick and `TooOld` one tick later; a repeat at a
+  depth above the window skipped later than the window while the ring holds its slot; a
+  repaired tick first reported after a frame of region changes alone, across calls and in one
+  call; t − 1 reported after t, with and without the repair of t + 1 made in a call between; a
+  substitution at or before a resync's restart skipped, after the restart's slot left the ring
+  too. The review's original q1 and q2, first reported in frame 17 after the claim's frame 14
+  was reconciled, break (b) and are the shape it excludes.
 
 **D123. A third-party crate is built from a patched copy only under `vendor/`, by one rule
 for every crate, checked by `cargo xtask vendor`** (§8.2, §8.3, §9.1, §16, §20,

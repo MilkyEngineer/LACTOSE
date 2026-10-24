@@ -267,8 +267,24 @@ which `build`'s `derived` check does not see.
   ones; so the full frame is the next frame the inbox sees and is accepted.
   `StagedFrame::resync(tick)` is the constructor.
 - `substituted` holds the receiving player's input ticks for which the server applied the
-  previous input (section 9.2); the server's `app` knows them from `PlayerSample::
-  substituted` in the frames it built, and `lactose-predict` re-simulates from the oldest.
+  previous input (section 9.2); the server's `app` knows them from
+  `PlayerSample::substituted` in the frames it built, and `lactose-predict` re-simulates
+  from the oldest. A substituted tick *t* is in `substituted` of the first frame the inbox
+  accepts at or after *t* that does not hold region changes alone, unless a full frame is
+  accepted at or after *t* first (its rebuild supersedes the substitution), and may be
+  repeated in later frames: `lactose-net`'s sender puts *t* in every packet whose tick is at
+  or after *t* until it sees acknowledged a packet that carried it, and the receiver
+  acknowledges only a packet it staged and stages none not after the newest it staged
+  (`crates/net-host/README.md`, "Handles and packets"); a frame of region changes alone is
+  the receiver's split of two changes of one region, which drops the packet unacknowledged.
+  So with frames accepted in ascending tick, no frame of a tick at or after *t* that carries
+  a spawn, move, removal, row or tombstone is popped before the first that names *t*, unless
+  a full frame at or after *t* comes first. `lactose-predict` acts on the first report and
+  skips a repeat for at least ten seconds of ticks after *t*; a later repeat may cost a
+  resync. A first report later than such a frame would roll the prediction world back before
+  that frame's claim or release, which a re-simulated tick never re-applies and no later
+  call could restate once an earlier one had reconciled it (D122, addendum of the claim
+  replay).
 
 **The gather** (architecture sections 5.3, 6 and 9.3; `crates/sim/README.md`, "Runs")
 

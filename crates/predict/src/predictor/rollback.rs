@@ -11,7 +11,7 @@ use lactose_net_api::StagedInbox;
 use lactose_reflect::Registry;
 use lactose_sim::{RunError, Simulation};
 
-use super::{PredictError, Predictor, State, next, prev};
+use super::{PredictError, Predictor, REPEAT_WINDOW, State, next, prev};
 use crate::fact::{self, Checked, Fact, Judge, Mismatches, Resolved};
 use crate::hook::{Popped, before, record};
 use crate::reconcile::{Correction, CorrectionCause, Divergence, Reconciled, ResyncReason};
@@ -134,6 +134,7 @@ impl State {
         if let Some(oldest) = self.ring.oldest() {
             self.kept.retain(|&tick, _| !before(tick, oldest));
         }
+        self.forget_substitutions(present);
         let newest_full = popped.iter().rposition(|popped| popped.frame.full);
         for (index, popped) in popped.into_iter().enumerate() {
             let tick = popped.frame.tick;
@@ -152,6 +153,10 @@ impl State {
                     self.ring.rebuild_at(popped.applied_at);
                     let restart = popped.applied_at;
                     self.awaiting.retain(|&tick| before(restart, tick));
+                    // Every tick a call acted on is at or before the restart, so the
+                    // restart alone skips their repeats.
+                    self.substituted.clear();
+                    self.restart = Some(restart);
                     // A full frame states every entity the server has claimed for the
                     // player, so it replaces the map: an entry whose tombstone was lost
                     // (a resync's gap) goes here.
@@ -194,10 +199,6 @@ impl State {
                 out.resync = Some(ResyncReason::TooOld { frame: tick, oldest });
                 break;
             };
-            self.stats.substitutions += frame_replaced
-                .iter()
-                .filter(|(_, cause)| *cause == CorrectionCause::Substituted)
-                .count() as u64;
             replaced.extend(frame_replaced);
             let facts = self.resolve(popped.facts);
             let facts = self.keep(facts, tick, popped.applied_at, &mut touched);
@@ -337,20 +338,28 @@ impl State {
     }
 
     /// The substitutions a frame reports and the repairs it makes due, by input tick,
-    /// with the awaited repairs updated; `None` if one of them reaches before `oldest`,
-    /// which is `TooOld`, and then nothing changed.
+    /// with the awaited repairs updated and the first reports remembered and counted;
+    /// `None` if one of them reaches before `oldest`, which is `TooOld`, and then nothing
+    /// changed. A repeat, a tick a call already acted on as substituted (`substituted`,
+    /// an earlier frame of this call's included), is skipped and arms no repair: rolling
+    /// back again would re-simulate claims and releases an earlier call reconciled, which
+    /// a replay never re-applies. A due repair of such a tick, armed by a first report of
+    /// the tick before it, is a re-substitution: its substitute continues the new one, and
+    /// the repair after it is due again.
     fn substitutions(
         &mut self,
         popped: &Popped,
         present: Tick,
         oldest: Tick,
     ) -> Option<Vec<(Tick, CorrectionCause)>> {
-        let restart = self.ring.rebuilt_at();
+        let restart = self.restart;
         let skipped = |tick: Tick| restart.is_some_and(|restart| !before(restart, tick));
         let mut awaiting = self.awaiting.clone();
+        let mut first = Vec::new();
         let mut replaced = Vec::new();
         for &tick in &popped.frame.substituted {
-            if skipped(tick) {
+            // Before the horizon check: a repeat is no `TooOld`, wherever the ring stands.
+            if skipped(tick) || self.substituted.contains(&tick) {
                 continue;
             }
             if before(prev(tick), oldest) {
@@ -367,11 +376,11 @@ impl State {
             }
             awaiting.remove(&tick);
             awaiting.insert(next(tick));
+            first.push(tick);
             replaced.push((tick, CorrectionCause::Substituted));
         }
-        let due: Vec<Tick> =
-            awaiting.iter().copied().filter(|&tick| !before(popped.frame.tick, tick)).collect();
-        for tick in due {
+        let frame = popped.frame.tick;
+        while let Some(tick) = awaiting.iter().copied().find(|&tick| !before(frame, tick)) {
             awaiting.remove(&tick);
             if skipped(tick) || before(present, tick) {
                 continue;
@@ -379,10 +388,30 @@ impl State {
             if before(prev(tick), oldest) {
                 return None;
             }
-            replaced.push((tick, CorrectionCause::Repaired));
+            if self.substituted.contains(&tick) {
+                awaiting.insert(next(tick));
+                replaced.push((tick, CorrectionCause::Substituted));
+            } else {
+                replaced.push((tick, CorrectionCause::Repaired));
+            }
         }
         self.awaiting = awaiting;
+        self.stats.substitutions += first.len() as u64;
+        self.substituted.extend(first);
         Some(replaced)
+    }
+
+    /// Forgets the substitutions acted on, and the restart, that the ring no longer holds
+    /// and that are more than [`REPEAT_WINDOW`] ticks before `present`.
+    fn forget_substitutions(&mut self, present: Tick) {
+        let window = Tick(present.0.wrapping_sub(REPEAT_WINDOW));
+        let oldest = self.ring.oldest();
+        let forgotten =
+            |tick: Tick| before(tick, window) && oldest.is_none_or(|oldest| before(tick, oldest));
+        self.substituted.retain(|&tick| !forgotten(tick));
+        if self.restart.is_some_and(forgotten) {
+            self.restart = None;
+        }
     }
 
     /// Replaces the ring's sample of the local player for input tick `tick`: with the
