@@ -16,12 +16,13 @@ use lactose_asset_api::{
 use lactose_bundle::{Baseline, BaselineRow, ComponentData};
 use lactose_core::{EntityRef, NetId, PlayerId, Result, StableKey, Tick};
 use lactose_ecs::{
-    ClaimedBy, Commands, Ctx, Executor, InRegion, Mut, OwnedBy, RegionId, RegionMode, Res, ResMut,
-    StableKeyOf, SystemSet, Without, World, WorldKind, finalize, system,
+    ClaimedBy, Commands, Ctx, Executor, InRegion, Mut, OwnedBy, PredictedOrigin, RegionConfig,
+    RegionId, RegionMode, Res, ResMut, StableKeyOf, SystemSet, Without, World, WorldBuilder,
+    WorldKind, finalize, system,
 };
 use lactose_math::{ExactSum, Scalar};
 use lactose_persist::{Container, ContainerHeader, Loader, Migrations, RegionRecords, SchemaTable};
-use lactose_reflect::{Reflect, component, resource};
+use lactose_reflect::{Reflect, Registry, component, resource};
 use lactose_sim::{
     InputApplier, PlayerSample, RegionAtlas, RegionBundle, RegionCell, RegionControl, RegionExport,
     RegionRequest, Registration, SavePoint, SessionApplier, SessionEvent, Simulation,
@@ -727,4 +728,179 @@ pub fn executor() -> Executor {
 /// Steps once.
 pub fn step(executor: &Executor, simulation: Simulation, frame: TickInput) -> Simulation {
     executor.block_on(simulation.step(executor, frame)).unwrap()
+}
+
+/// The program run from tick 1 through `ticks` under the production layout, and the save
+/// copy taken there.
+pub fn saved_at(ticks: u32) -> SavePoint {
+    let executor = executor();
+    let mut driver = Driver::default();
+    let mut simulation = program(lactose_ecs::LayoutConfig::default());
+    for tick in 1..=ticks {
+        let frame = program_frame(tick, &mut driver);
+        simulation = step(&executor, simulation, frame);
+        driver.observe(&mut simulation);
+    }
+    save_of(&executor, simulation).1
+}
+
+/// The records of `region` in `save`.
+pub fn records_in(save: &SavePoint, region: RegionId) -> RegionRecords {
+    records_of(save.regions.iter().find(|export| export.region == region).unwrap())
+}
+
+// ---- A world built directly, with every change kind the diff knows ----
+
+pub const A: RegionId = region_at(0, 0);
+pub const B: RegionId = region_at(1, 0);
+
+/// The types the world itself maintains and the game's components and region resources,
+/// for a world built directly.
+pub fn registry() -> Registry {
+    let mut registry = Registry::new();
+    registry.register::<InRegion>().unwrap();
+    registry.register::<OwnedBy>().unwrap();
+    registry.register::<ClaimedBy>().unwrap();
+    registry.register::<PredictedOrigin>().unwrap();
+    registry.register::<StreamingAnchor>().unwrap();
+    registry.register::<Position>().unwrap();
+    registry.register::<Velocity>().unwrap();
+    registry.register::<Mass>().unwrap();
+    registry.register::<Health>().unwrap();
+    registry.register::<Age>().unwrap();
+    registry.register::<Follows>().unwrap();
+    registry.register::<Spawner>().unwrap();
+    registry.register::<Contacts>().unwrap();
+    registry.register::<Marker>().unwrap();
+    registry.register::<Player>().unwrap();
+    registry.register::<Walker>().unwrap();
+    registry.register::<InputSample>().unwrap();
+    registry.register::<Cache>().unwrap();
+    registry.register::<Weather>().unwrap();
+    registry.register::<Rain>().unwrap();
+    registry.register::<Score>().unwrap();
+    registry
+}
+
+/// An empty world of [`registry`]'s types.
+pub fn bare_world() -> World {
+    WorldBuilder::new(WorldKind::Server, Arc::new(registry())).build().unwrap()
+}
+
+/// Loads `bundle` into `world` as the input sync point does: the region with the saved
+/// seed, the rows, the resources and the transient resources zeroed.
+pub fn load_into(world: &mut World, region: RegionId, bundle: &RegionBundle) {
+    let config = RegionConfig { id: region, seed: bundle.seed, mode: RegionMode::Simulated };
+    world.create_region(config).unwrap();
+    world.load_region(region, &bundle.baseline, bundle.overlay.as_deref()).unwrap();
+    for data in &bundle.resources {
+        world.insert_region_resource_erased(region, data.clone()).unwrap();
+    }
+    for &key in &bundle.transient_resources {
+        world.insert_region_resource_zeroed(region, key).unwrap();
+    }
+}
+
+pub fn pos(x: i32, y: i32) -> Position {
+    Position { x: Scalar::from_i32(x), y: Scalar::from_i32(y) }
+}
+
+pub fn owned_by(id: NetId) -> OwnedBy {
+    OwnedBy { owner: EntityRef::new(StableKey::Net(id)) }
+}
+
+pub fn net(id: NetId) -> StableKey {
+    StableKey::Net(id)
+}
+
+pub fn c(region: RegionId, n: u64) -> NetId {
+    cooked(region, n)
+}
+
+/// Region A's baseline: one row per change the test makes.
+pub fn baseline_a() -> Baseline {
+    let rows = [
+        BaselineRow { id: c(A, 1), components: vec![data(pos(1, 1)), data(Health(10))] },
+        BaselineRow { id: c(A, 2), components: vec![data(pos(2, 2)), data(Mass(Scalar::ONE))] },
+        BaselineRow {
+            id: c(A, 3),
+            components: vec![
+                data(pos(3, 3)),
+                data(Mass(Scalar::ONE)),
+                data(Marker),
+                data(Velocity { x: Scalar::ZERO, y: Scalar::ZERO }),
+            ],
+        },
+        BaselineRow { id: c(A, 4), components: vec![data(pos(4, 4)), data(owned_by(c(A, 3)))] },
+        BaselineRow { id: c(A, 5), components: vec![data(pos(5, 5)), data(owned_by(c(A, 3)))] },
+        BaselineRow { id: c(A, 6), components: vec![data(pos(6, 6))] },
+        BaselineRow { id: c(A, 7), components: vec![data(pos(7, 7)), data(Contacts(9))] },
+        BaselineRow {
+            id: c(A, 8),
+            components: vec![data(pos(8, 8)), data(Contacts(9)), data(Cache(1))],
+        },
+    ];
+    Baseline::from_rows(AssetSet::new(), cooked_schemas(), rows).unwrap()
+}
+
+/// Region B's baseline: the row that moves into A.
+pub fn baseline_b() -> Baseline {
+    let rows = [BaselineRow { id: c(B, 1), components: vec![data(pos(20, 20)), data(Age(3))] }];
+    Baseline::from_rows(AssetSet::new(), cooked_schemas(), rows).unwrap()
+}
+
+/// A NaN whose bits are not the canonical NaN's.
+pub fn odd_nan() -> Scalar {
+    Scalar::from_f64(f64::from_bits(0xFFF8_0000_0000_0123))
+}
+
+pub struct Changed {
+    pub world: World,
+    pub table: SchemaTable,
+    pub spawned: NetId,
+    pub gone: NetId,
+}
+
+/// A world of A and B loaded from their baselines, then every change kind made.
+pub fn changed() -> Changed {
+    let registry = Arc::new(registry());
+    let table = SchemaTable::from_registry(&registry).unwrap();
+    let mut world = WorldBuilder::new(WorldKind::Server, registry).build().unwrap();
+    for (region, baseline) in [(A, baseline_a()), (B, baseline_b())] {
+        let config =
+            RegionConfig { id: region, seed: seed_of(region), mode: RegionMode::Simulated };
+        world.create_region(config).unwrap();
+        world.load_region(region, &baseline, None).unwrap();
+    }
+    world.insert_region_resource(A, Weather(5)).unwrap();
+    world.insert_region_resource_zeroed(A, Rain::KEY).unwrap();
+
+    // Destroyed, moved out and moved in.
+    world.despawn(net(c(A, 1))).unwrap();
+    world.move_to_region(net(c(A, 2)), B).unwrap();
+    world.move_to_region(net(c(B, 1)), A).unwrap();
+    world.insert(net(c(B, 1)), Age(4)).unwrap();
+    // A component changed, one added, one removed, one unchanged, and a NaN written.
+    world.insert(net(c(A, 3)), Mass(Scalar::from_i32(5))).unwrap();
+    world.insert(net(c(A, 3)), Health(7)).unwrap();
+    world.remove::<Marker>(net(c(A, 3))).unwrap();
+    world.insert(net(c(A, 3)), Position { x: odd_nan(), y: Scalar::from_i32(3) }).unwrap();
+    // A spawned entity, with a transient value and an owner, and one spawned then gone.
+    let spawned = world.allocate_net_id().unwrap();
+    let components = (pos(30, 30), Velocity { x: Scalar::ONE, y: Scalar::ONE }, Contacts(4));
+    world.spawn(net(spawned), A, components).unwrap();
+    world.insert(net(spawned), owned_by(c(A, 6))).unwrap();
+    let gone = world.allocate_net_id().unwrap();
+    world.spawn(net(gone), A, (pos(31, 31),)).unwrap();
+    world.despawn(net(gone)).unwrap();
+    // Owners changed, cleared and set.
+    world.insert(net(c(A, 4)), owned_by(spawned)).unwrap();
+    world.remove::<OwnedBy>(net(c(A, 5))).unwrap();
+    world.insert(net(c(A, 6)), owned_by(c(A, 3))).unwrap();
+    // Transient presence gained, lost, and kept with another value; a derived value moved.
+    world.insert(net(c(A, 6)), Contacts(2)).unwrap();
+    world.remove::<Contacts>(net(c(A, 7))).unwrap();
+    world.insert(net(c(A, 8)), Contacts(40)).unwrap();
+    world.insert(net(c(A, 8)), Cache(77)).unwrap();
+    Changed { world, table, spawned, gone }
 }

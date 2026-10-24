@@ -13,10 +13,9 @@ use std::sync::Arc;
 use common::*;
 use lactose_asset_api::AssetSet;
 use lactose_bundle::{Baseline, BaselineRow, ComponentData, Record};
-use lactose_core::{ComponentKey, EntityRef, ErrorKind, NetId, StableKey};
+use lactose_core::{ComponentKey, ErrorKind};
 use lactose_ecs::{
-    ClaimedBy, InRegion, OwnedBy, PredictedOrigin, RegionConfig, RegionId, RegionMode, RegionRows,
-    World, WorldBuilder, WorldKind,
+    OwnedBy, RegionConfig, RegionId, RegionMode, RegionRows, WorldBuilder, WorldKind,
 };
 use lactose_math::Scalar;
 use lactose_net_api::OverlayPayload;
@@ -24,133 +23,6 @@ use lactose_persist::{RegionRecords, SchemaTable, diff};
 use lactose_reflect::{Reflect, Registry};
 use lactose_sim::RegionExport;
 use lactose_sim::harness::{ChunkCapacity, layout_mode};
-
-const A: RegionId = region_at(0, 0);
-const B: RegionId = region_at(1, 0);
-
-/// The game's types and the ones the world itself maintains, for a world built directly.
-fn registry() -> Registry {
-    let mut registry = Registry::new();
-    registry.register::<InRegion>().unwrap();
-    registry.register::<OwnedBy>().unwrap();
-    registry.register::<ClaimedBy>().unwrap();
-    registry.register::<PredictedOrigin>().unwrap();
-    registry.register::<Position>().unwrap();
-    registry.register::<Velocity>().unwrap();
-    registry.register::<Mass>().unwrap();
-    registry.register::<Health>().unwrap();
-    registry.register::<Age>().unwrap();
-    registry.register::<Marker>().unwrap();
-    registry.register::<Contacts>().unwrap();
-    registry.register::<Cache>().unwrap();
-    registry.register::<Weather>().unwrap();
-    registry.register::<Rain>().unwrap();
-    registry
-}
-
-fn pos(x: i32, y: i32) -> Position {
-    Position { x: Scalar::from_i32(x), y: Scalar::from_i32(y) }
-}
-
-fn owned_by(id: NetId) -> OwnedBy {
-    OwnedBy { owner: EntityRef::new(StableKey::Net(id)) }
-}
-
-fn net(id: NetId) -> StableKey {
-    StableKey::Net(id)
-}
-
-fn c(region: RegionId, n: u64) -> NetId {
-    cooked(region, n)
-}
-
-/// Region A's baseline: one row per change the test makes.
-fn baseline_a() -> Baseline {
-    let rows = [
-        BaselineRow { id: c(A, 1), components: vec![data(pos(1, 1)), data(Health(10))] },
-        BaselineRow { id: c(A, 2), components: vec![data(pos(2, 2)), data(Mass(Scalar::ONE))] },
-        BaselineRow {
-            id: c(A, 3),
-            components: vec![
-                data(pos(3, 3)),
-                data(Mass(Scalar::ONE)),
-                data(Marker),
-                data(Velocity { x: Scalar::ZERO, y: Scalar::ZERO }),
-            ],
-        },
-        BaselineRow { id: c(A, 4), components: vec![data(pos(4, 4)), data(owned_by(c(A, 3)))] },
-        BaselineRow { id: c(A, 5), components: vec![data(pos(5, 5)), data(owned_by(c(A, 3)))] },
-        BaselineRow { id: c(A, 6), components: vec![data(pos(6, 6))] },
-        BaselineRow { id: c(A, 7), components: vec![data(pos(7, 7)), data(Contacts(9))] },
-        BaselineRow {
-            id: c(A, 8),
-            components: vec![data(pos(8, 8)), data(Contacts(9)), data(Cache(1))],
-        },
-    ];
-    Baseline::from_rows(AssetSet::new(), cooked_schemas(), rows).unwrap()
-}
-
-/// Region B's baseline: the row that moves into A.
-fn baseline_b() -> Baseline {
-    let rows = [BaselineRow { id: c(B, 1), components: vec![data(pos(20, 20)), data(Age(3))] }];
-    Baseline::from_rows(AssetSet::new(), cooked_schemas(), rows).unwrap()
-}
-
-/// A NaN whose bits are not the canonical NaN's.
-fn odd_nan() -> Scalar {
-    Scalar::from_f64(f64::from_bits(0xFFF8_0000_0000_0123))
-}
-
-struct Changed {
-    world: World,
-    table: SchemaTable,
-    spawned: NetId,
-    gone: NetId,
-}
-
-/// A world of A and B loaded from their baselines, then every change kind made.
-fn changed() -> Changed {
-    let registry = Arc::new(registry());
-    let table = SchemaTable::from_registry(&registry).unwrap();
-    let mut world = WorldBuilder::new(WorldKind::Server, registry).build().unwrap();
-    for (region, baseline) in [(A, baseline_a()), (B, baseline_b())] {
-        let config =
-            RegionConfig { id: region, seed: seed_of(region), mode: RegionMode::Simulated };
-        world.create_region(config).unwrap();
-        world.load_region(region, &baseline, None).unwrap();
-    }
-    world.insert_region_resource(A, Weather(5)).unwrap();
-    world.insert_region_resource_zeroed(A, Rain::KEY).unwrap();
-
-    // Destroyed, moved out and moved in.
-    world.despawn(net(c(A, 1))).unwrap();
-    world.move_to_region(net(c(A, 2)), B).unwrap();
-    world.move_to_region(net(c(B, 1)), A).unwrap();
-    world.insert(net(c(B, 1)), Age(4)).unwrap();
-    // A component changed, one added, one removed, one unchanged, and a NaN written.
-    world.insert(net(c(A, 3)), Mass(Scalar::from_i32(5))).unwrap();
-    world.insert(net(c(A, 3)), Health(7)).unwrap();
-    world.remove::<Marker>(net(c(A, 3))).unwrap();
-    world.insert(net(c(A, 3)), Position { x: odd_nan(), y: Scalar::from_i32(3) }).unwrap();
-    // A spawned entity, with a transient value and an owner, and one spawned then gone.
-    let spawned = world.allocate_net_id().unwrap();
-    let components = (pos(30, 30), Velocity { x: Scalar::ONE, y: Scalar::ONE }, Contacts(4));
-    world.spawn(net(spawned), A, components).unwrap();
-    world.insert(net(spawned), owned_by(c(A, 6))).unwrap();
-    let gone = world.allocate_net_id().unwrap();
-    world.spawn(net(gone), A, (pos(31, 31),)).unwrap();
-    world.despawn(net(gone)).unwrap();
-    // Owners changed, cleared and set.
-    world.insert(net(c(A, 4)), owned_by(spawned)).unwrap();
-    world.remove::<OwnedBy>(net(c(A, 5))).unwrap();
-    world.insert(net(c(A, 6)), owned_by(c(A, 3))).unwrap();
-    // Transient presence gained, lost, and kept with another value; a derived value moved.
-    world.insert(net(c(A, 6)), Contacts(2)).unwrap();
-    world.remove::<Contacts>(net(c(A, 7))).unwrap();
-    world.insert(net(c(A, 8)), Contacts(40)).unwrap();
-    world.insert(net(c(A, 8)), Cache(77)).unwrap();
-    Changed { world, table, spawned, gone }
-}
 
 fn zeroed<T: Reflect>() -> ComponentData {
     ComponentData { component: T::KEY, bytes: vec![0; size_of::<T>()] }
