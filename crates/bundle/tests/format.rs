@@ -465,7 +465,6 @@ fn overlay_construction_rejects_everything_that_is_not_canonical() {
     rejects(&[add(c1, a(1)), set_field(c1, A, 1)]);
     // Ownership.
     rejects(&[owner(c1, Some(c1))]);
-    rejects(&[destroy(c1), owner(c2, Some(c1))]);
     rejects(&[owner(c1, Some(c2)), owner(c2, Some(c1))]);
     rejects(&[owner(c1, Some(c2)), owner(c2, Some(c3)), owner(c3, Some(c1))]);
     rejects(&[
@@ -492,7 +491,8 @@ fn overlay_construction_rejects_everything_that_is_not_canonical() {
     }]);
 
     // The same component and field on different entities, different fields of one
-    // component, and long acyclic ownership chains are all fine.
+    // component, long acyclic ownership chains, and an owner this overlay destroys (a
+    // `Destroy` is a departure as much as a death) are all fine.
     let fine = [
         set_field(c1, A, 1),
         set_field(c1, A, 4),
@@ -506,8 +506,10 @@ fn overlay_construction_rejects_everything_that_is_not_canonical() {
         owner(c3, Some(cooked(99))),
         from_baseline(cooked(8), &[]),
         owner(cooked(8), Some(c3)),
+        destroy(cooked(4)),
+        owner(cooked(5), Some(cooked(4))),
     ];
-    assert_eq!(Overlay::new(0, schemas(), fine).unwrap().records().len(), 12);
+    assert_eq!(Overlay::new(0, schemas(), fine).unwrap().records().len(), 14);
 }
 
 #[test]
@@ -870,6 +872,15 @@ fn decode_rejects_well_sealed_documents_that_are_not_canonical() {
         record(6, id, join(&[quads(&[0x0A]), field.to_le_bytes().to_vec(), vec![9]]))
     };
     let owned_by = |id, owner| record(7, id, quads(&[owner]));
+    // An owner the overlay destroys decodes and re-encodes to the same bytes.
+    let departed_owner =
+        sealed(b"LOVL", &with_records(&no_table, &[destroy(c1), owned_by(c2, c1)]));
+    let decoded = Overlay::decode(&departed_owner).unwrap();
+    assert_eq!(
+        decoded.records(),
+        [Record::Destroy { id: cooked(1) }, owner(cooked(2), Some(cooked(1)))]
+    );
+    assert_eq!(decoded.encode(), departed_owner);
     let good = with_records(&a_table, &[add_a(c1), destroy(c2), set_a(c3, 1)]);
     let expected = Overlay::new(
         0,
@@ -910,9 +921,8 @@ fn decode_rejects_well_sealed_documents_that_are_not_canonical() {
         with_records(&a_table, &[record(2, c1, words(&[0])), set_a(c1, 1)]),
         with_records(&a_table, &[add_a(5)]),
         with_records(&no_table, &[owned_by(5, 0)]),
-        // Ownership: self, a destroyed owner, a cycle.
+        // Ownership: self, a cycle.
         with_records(&no_table, &[owned_by(c1, c1)]),
-        with_records(&no_table, &[destroy(c1), owned_by(c2, c1)]),
         with_records(&no_table, &[owned_by(c1, c2), owned_by(c2, c1)]),
         // Data cut short by the end of the document.
         with_records(&a_table, &[record(4, c1, quads(&[0x0A]))]),

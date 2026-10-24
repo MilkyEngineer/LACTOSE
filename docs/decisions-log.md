@@ -3977,6 +3977,110 @@ relayed by an event when it acts on another body** (§6.1, §10, `lactose-ecs`,
 - Driven by: the io facade's review (D130, finding D2) and the boundary-closure reviews r1 to
   r3 (2026-10-24).
 
+**D133. Ownership is a forest the ECS keeps over the live world; an owner in another region, or in none, is a saved state; a load breaks a cycle it would close** (§6, §15.2, `lactose-ecs`, `lactose-bundle`, `lactose-persist`)
+- Why: the persist implementation's review found three ownership states `World::insert` accepts
+  and `Overlay::new` refuses (an entity that owns itself, two that own each other, a row owned
+  by a cooked entity of its region that has moved away), so a save of the region failed for as
+  long as the state lasted and a failing unload export left `app` with no server; a quarter of
+  the reviewer's random histories reached one. The invariant every save, unload and relevance
+  message rests on is that a region's export is always an overlay and an overlay a region
+  exported always loads; it is settled by putting the ownership rules in the world, keeping the
+  format's rules a subset of them, and having the load resolve what a write cannot see.
+  - *The ownership graph of the live world is a forest, kept at every path that adds an edge or
+    merges two keys.* The chain of an entity is itself, its owner, its owner's owner, over live
+    entities, ending at the first with no owner or whose owner is not live, keys compared as
+    origin keys. A write of `OwnedBy { owner }` to `k` is refused if `k` is on `owner`'s chain
+    (`owner == k` included): `InvalidData` from `insert`, `insert_erased`, `spawn` and
+    `spawn_erased` with nothing changed, not even the point; dropped and logged at command
+    apply like a write that fails validation. A key merge that would close a cycle, the rewrite
+    of a stored `Net` reference to its predicted origin at `bind`, at `restore` for a bind made
+    since the snapshot, or at the despawn of a bound `Net` entity, writes that reference empty
+    in place instead and logs it, so `bind` never fails on ownership. One lookup per link at a
+    write, a bind or a rekey. `OwnedBy` is the attachment hierarchy (`anim`'s bones,
+    `physics-api`'s joints), so a forest is what every walker up the chain may rely on. Rules
+    out accepting cycles and guarding every walker (the ECS's own `despawn` and
+    `move_to_region` already terminate over one), a relocating `OwnedBy` write, and a `bind`
+    refused for ownership: on the server a fresh `NetId` cannot close a cycle, and on a client
+    the server has already bound.
+  - *The world sees live entities only, so a load resolves what a write could not see.* An
+    unloaded region's owner edges are in its document, not in the world, so an accepted write
+    can close a cycle through them (P in A given to X in B, X given to E in A, B unloaded, E
+    given to P); and a client holds each region's edges as of its relevance document, so two
+    honest documents can close a cycle between them with a server that was a forest at every
+    step. `load_region` therefore walks the document's rows, under the keys the load will give
+    them, and the live world together once the keys are known and before any bind or spawn, and
+    spawns without a per-row walk. A cycle among the document's own rows, through its records
+    or its baseline's `ecs::owned_by` column, is refused whole, since no honest export contains
+    one: a region's rows are all live and a forest when exported. A cycle through a live entity
+    outside the document is broken: the document row on it whose owner is a live entity outside
+    the document, the smallest such key, loads without `OwnedBy`, as an `OwnershipChange {
+    owner: None }` would load it, logged at `casein` with both keys; rows are walked in
+    ascending key order with each break applied before the next walk, so the result is a
+    function of the document and the live world under every layout. The document row's edge is
+    emptied and never a live entity's, because a region load must not write another region's
+    rows (replication, the hash and `Changed` readers would see it). The broken edge is then a
+    plain fact of the world: the row's export writes the cleared owner, so the next save,
+    unload or relevance document carries it, an in-place reload and a fresh process break the
+    same edge and hash equal (§15.5), and a reload of the export breaks nothing. Two load
+    orders of the same documents can empty different edges; each is deterministic, and the
+    order is an input (a frame's regions, ascending at the sync point), which is what §8
+    requires; no order is more right than another, since the documents together were not a
+    forest. On a client `OwnedBy` is neither replicated nor corrected (`net-api`), so its edges
+    are as fresh as each region's last document, a break there is logged and lasts until the
+    region's next document, and no engine crate reads a replicated entity's `OwnedBy` on a
+    client; a game that does needs `OwnedBy` replicated, a `net-api` change. Rules out a table
+    of unloaded entities' edges consulted at writes (it would need persistence and could not
+    see a client's stale documents), refusing a load an honest history produced, and an
+    order-independent rule that would rewrite live rows of other regions.
+  - *An owned entity need not reside in its owner's region; writing `OwnedBy` moves nothing.*
+    D12 is a rule for `move_to_region` and `despawn`, which take the tree; an entity given to
+    an owner elsewhere stays until that owner next moves, and an owner's region may unload
+    while what it owns stays loaded, as the ECS README already promised. `OwnedBy` is then a
+    weak cross-region reference like any `EntityRef`: exported as the owner's `NetId`, reloaded
+    in either region order. Section 15.2 says a departed row is `Destroy` alone, so
+    `Overlay::new` no longer refuses an owner the overlay destroys; whether an owner exists was
+    always the applier's. Rules out the bundle reading a `Destroy` as a death.
+  - *The format keeps its self-owner and cycle checks.* They are judged from the records alone,
+    refuse hostile bytes before any load, and are a subset of the world's rules, since a cycle
+    among one overlay's records is a cycle among live entities of the region. The bundle README
+    says a new ownership judgement must be one the world refuses too. Rules out a format rule
+    the world does not enforce.
+  - *The invariant is stated once, in `crates/ecs/README.md` (Regions, "Writing `OwnedBy` moves
+    nothing"): the world accepts no ownership state the format refuses, the format refuses no
+    state the world accepts, and every document an honest export made loads, a cross-region
+    cycle broken as above; so a region's export is always an overlay and an overlay a region
+    exported always loads.* `persist`'s README cites it instead of listing the checks.
+  - *As implemented:* the walk runs before a direct write's stamp, so a refusal leaves the
+    point where it was; `load_region`'s walk runs once the load keys are known (owners resolve
+    through them) and before any bind or spawn, applies its breaks to the rows it will spawn,
+    and the spawns walk nothing; a break is logged at `warn` once the load's spawns have
+    succeeded, where a dropped command logs at `debug`; a key merge empties the closing
+    reference without a stamp, as the rekey itself is unstamped; a row without
+    `PredictedOrigin` whose `Net` id is bound is refused, since an honest export of a bound
+    entity carries it; a spawn refused at apply binds nothing and uses no `NetId` (the bind
+    follows the spawn and the counter returns, predicted or not); no format version bump, since
+    accepted documents encode as before and the decoder accepts more. Proof:
+    `crates/ecs/tests/ownership.rs` under every layout, with seeded random histories (300 per
+    owner mode, spread over the layouts) in which every export is an overlay and every reload
+    and restart loads; a deep chain of 8000 owners loads within five times the time of a flat
+    document of 8000 rows, where a per-row walk takes over 200 times as long;
+    `crates/bundle/tests/format.rs`.
+- What the implementation's review changed (1 blocking, 2 serious, 4 minor; `5ed559e` was the
+  branch before it): the forest had been kept over live entities with `load_region` refusing
+  any cycle through them, which made a server's own save of a region, and a client's documents
+  of two regions, fail to load after legal histories (three commands and an unload; 74 to 160
+  of 2000 random histories); loads now break the cycle at the document row, and key merges
+  empty the closing reference, which also closed the restore gap the first text had stated; a
+  row whose `Net` id is bound is refused whole; the load's per-row walk, which made a deep
+  chain quadratic, is gone (a chain of 8000 rows loads in 18.7 ms against 17.7 ms flat, linear
+  from 1000, at load averages near 120 on an M1); a refused predicted spawn no longer keeps its
+  bind.
+- Driven by: persist implementation review r1, F1, and its probe; the ECS ownership
+  implementation's reviews r1, F1 to F7, and r2, N1 and N2 (2026-10-25).
+- Replaced: `Overlay::new`'s refusal of an owner the overlay destroys (D101's implementation);
+  the ECS's acceptance of a self-owner and a cycle, which D114 and D117 did not mention; the
+  first text's `load_region` refusal of a cross-region cycle and its refused `bind`.
+
 **D135. One set of validity rules for physics values, stated and implemented in `physics-api`** (§8.2, §16, §17, `lactose-physics-api`, `lactose-physics-rapier`, `lactose-anim`)
 - Why: the rules a body, collider, joint, transform, velocity and command must meet were held
   in three places, each a little different: `physics-rapier`'s `convert.rs`, the test backend,

@@ -12,10 +12,10 @@ use common::*;
 use lactose_bundle::ComponentData;
 use lactose_core::{ComponentKey, EntityRef, ErrorKind, NetId, PlayerId, PredictionKey, StableKey};
 use lactose_ecs::{
-    ChangeMark, Changed, ClaimedBy, InRegion, LayoutConfig, LogEntry, Mut, OwnedBy,
-    PredictedOrigin, Referrer, RegionId, Schedule, World, WorldKind, system,
+    ChangeMark, Changed, ClaimedBy, InRegion, LayoutConfig, Mut, OwnedBy, PredictedOrigin,
+    RegionId, Schedule, World, WorldKind, system,
 };
-use lactose_reflect::{Component, Reflect, Resource, TypeRole, component};
+use lactose_reflect::{Component, Reflect, Resource, component};
 
 /// A component no registry of these tests holds.
 #[component(key = "test::unregistered", persistent)]
@@ -58,88 +58,14 @@ fn to(key: StableKey) -> EntityRef {
 
 const OTHER_PLAYER: PlayerId = PlayerId(9);
 
-/// One chunk's column, as the world stores it.
-#[derive(PartialEq, Debug)]
-struct Column {
-    component: ComponentKey,
-    keys: Vec<StableKey>,
-    regions: Vec<RegionId>,
-    bytes: Vec<u8>,
-    row_ticks: Option<Vec<lactose_core::Tick>>,
-    column_tick: lactose_core::Tick,
-}
-
-/// Everything a direct write can change that a consumer can observe.
-#[derive(PartialEq, Debug)]
-struct State {
-    mark: ChangeMark,
-    columns: Vec<Column>,
-    /// For each mark, the rows of every tracked column changed since it: the stamps'
-    /// points, which column ticks alone do not show.
-    changed: Vec<Option<Vec<(ComponentKey, StableKey)>>>,
-    log: Vec<LogEntry>,
-    referrers: Vec<Vec<Referrer>>,
-    owned: Vec<Vec<StableKey>>,
-    claimed: Vec<Vec<StableKey>>,
-    live: Vec<bool>,
-}
-
 /// The keys every test here names.
 fn keys() -> Vec<StableKey> {
     vec![net(1), net(2), net(3), net(4), predicted(), bound()]
 }
 
-fn state(world: &World, marks: &[ChangeMark]) -> State {
-    let components: Vec<ComponentKey> = world
-        .registry()
-        .iter()
-        .filter(|info| info.role() == TypeRole::Component)
-        .map(|info| info.key())
-        .collect();
-    let mut columns = Vec::new();
-    for &component in &components {
-        for column in world.columns_erased(component) {
-            columns.push(Column {
-                component,
-                keys: column.keys().to_vec(),
-                regions: column.regions().to_vec(),
-                bytes: column.bytes().to_vec(),
-                row_ticks: column.row_ticks().map(<[_]>::to_vec),
-                column_tick: column.column_tick(),
-            });
-        }
-    }
-    let changed = marks
-        .iter()
-        .map(|&mark| {
-            let mut rows = Vec::new();
-            for &component in &components {
-                for column in world.columns_erased(component) {
-                    if column.row_ticks().is_none() {
-                        continue;
-                    }
-                    for row in column.changed_since(mark)? {
-                        rows.push((component, column.keys()[row]));
-                    }
-                }
-            }
-            rows.sort();
-            Some(rows)
-        })
-        .collect();
-    let mut cursor = world.structural_log().cursor_at_start();
-    let log =
-        world.structural_log().since(&mut cursor).expect("a current cursor").copied().collect();
-    State {
-        mark: world.mark(),
-        columns,
-        changed,
-        log,
-        referrers: keys().into_iter().map(|key| world.referrers(key).collect()).collect(),
-        owned: keys().into_iter().map(|key| world.owned_by(key).collect()).collect(),
-        claimed: [PLAYER, OTHER_PLAYER].map(|player| world.claimed(player).collect()).to_vec(),
-        live: keys().into_iter().map(|key| world.contains(key)).collect(),
-    }
+/// What [`world_state`] observes of the keys and players these tests name.
+fn state(world: &World, marks: &[ChangeMark]) -> WorldState {
+    world_state(world, marks, &keys(), &[PLAYER, OTHER_PLAYER])
 }
 
 /// Two worlds, one written through the typed methods and one through the erased ones,

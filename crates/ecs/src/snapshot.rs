@@ -123,6 +123,9 @@ impl WorldSnapshot {
             .filter(|&(net, _)| !world.storage.entities.contains_key(&StableKey::Net(*net)))
             .map(|(&net, &predicted)| (net, predicted))
             .collect();
+        // A rewrite that would close a cycle of owners (a revived entity owned by a `Net`
+        // key bound since to an entity whose chain reaches it) empties that reference
+        // instead (README, Regions, "Ownership is a forest").
         for (net, predicted) in rebinds {
             world.rekey_references(StableKey::Net(net), StableKey::Predicted(predicted));
         }

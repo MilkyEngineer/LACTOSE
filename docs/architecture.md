@@ -377,12 +377,19 @@ tick N        tick N+1 simulation ───────────────�
   rebased (a restore puts them back as snapshotted) and every consumer's state is reset,
   forcing a full pass; a region load stamps its rows at the current tick instead.
 - **Regions** are the unit of streaming, relevance and persistence. Region membership is a
-  component; chunks belong to archetypes, not regions, so scattered players do not fragment
-  storage into mostly-empty chunks. Region operations (unload, save, relevance) are filtered
-  scans, and the only world that is ever snapshotted whole is the separate prediction world.
-  A region owns an asset version table and region resources. Entities move between regions
-  by a command that changes the membership component; identities do not change. Entities owned by another entity (inventory items,
-  attachments) migrate with their owner.
+  component; chunks belong to archetypes, not regions, so scattered players do not fragment storage
+  into mostly-empty chunks. Region operations (unload, save, relevance) are filtered scans, and the
+  only world that is ever snapshotted whole is the separate prediction world. A region owns an asset
+  version table and region resources. Entities move between regions by a command that changes the
+  membership component; identities do not change. Ownership (`OwnedBy`) is a forest the ECS keeps
+  over the live world: an entity has at most one owner, is never its own owner and no chain of
+  owners returns to its start. A write that would close a cycle is refused; a region load, or a
+  bind, that would close one through a saved or stale edge the world could not see leaves the
+  closing reference empty and logs it, so every saved region loads and the broken edge is what the
+  next save records. Entities owned by another entity (inventory items, attachments) migrate with
+  their owner and are despawned with it; writing `OwnedBy` moves nothing, so an owned entity may
+  reside in another region than its owner, where `OwnedBy` is a weak cross-region reference like any
+  other.
 - **Region modes**: `Simulated`, `Replicated` (rows written only at the input sync point from
   staged network state), `Frozen`. The input sync point is the first sync point of a tick,
   before any stage runs; it is where the time scale, asset version tables, region bundles and
