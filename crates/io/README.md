@@ -128,10 +128,22 @@ runs, the span constructors.
     workers, and SILO's loads run there. It streams the frame in slices: a poll decodes
     for at most about 0.5 ms, then wakes its own waker and returns `Pending`, as section
     5.1's background CPU work yields, so a 32 MiB range is many polls and never one long
-    one. Each slice runs inside the request's span and under an `AllocTag::Io` scope.
-  - Every error the decoder reports is `InvalidData`, and so is a frame that decodes to
-    any length but `decoded_len` or ends before every stored byte is consumed. The stored
-    bytes are never handed out; their buffer is freed when the decode ends.
+    one. Within a slice the decoder is given about 64 KiB of output at a time, never the
+    whole decoded buffer: with room for the whole content and the whole frame in hand,
+    zstd decodes the frame in one call however long it is. Each slice runs inside the
+    request's span.
+  - Decoding in steps makes zstd hold a window buffer of its own for the decode, up to
+    the smaller of the frame's window and `decoded_len`, and at most 2^27 bytes. zstd
+    allocates it, and its context, with its own `malloc`, outside the global allocator:
+    neither is charged to `AllocTag::Io`, neither is one of this crate's fallible
+    allocations, and both are freed when the decode ends or the future is dropped. The
+    decoder's window limit is set to 2^27 explicitly, so the bound is this crate's and
+    not zstd's default: a frame whose window exceeds 2^27 bytes is `InvalidData`, and the
+    cooker never compresses with a window log above 27.
+  - zstd failing to allocate its own memory is `ResourceExhausted`. Every other error the
+    decoder reports is `InvalidData`, and so is a frame that decodes to any length but
+    `decoded_len` or ends before every stored byte is consumed. The stored bytes are never
+    handed out; their buffer is freed when the decode ends.
   - `decoded_len` is the caller's claim from the index that named the range, checked
     against the frame's header and trusted for the allocation; the frame is never allowed
     to grow the buffer past it. `len` or `decoded_len` above `MAX_READ_BYTES` is
@@ -163,19 +175,21 @@ runs, the span constructors.
 - A read on a `File` whose pool has stopped is `Cancelled`.
 - `MAX_READ_BYTES` caps each request, not the pool: requests in flight at once may each
   hold that much, and an encoded read holds its stored and its decoded buffer until its
-  decode ends.
+  decode ends. While it decodes, an encoded read also holds zstd's window buffer, up to
+  the smaller of the frame's window and `decoded_len` and at most 2^27 bytes, which zstd
+  allocates outside the global allocator and so is not charged to `AllocTag::Io`.
 
 ### The atomic replace
 
 - `Io::replace(path, bytes)` is architecture section 15.3's operation as one request. On
-  the pool thread: the temporaries of `path` a crash left are removed (below); a temporary
-  file `<name>.<unique>.tmp` is created in the same directory as `path` (so the rename is
-  never across volumes) with `create_new`, so a leftover of another attempt is never
-  reused, the next unique name being tried, a bounded number of times, when one exists
-  already; `bytes` is written to it in full; the temporary is synced (`fsync`, which `std`
-  issues as `F_FULLFSYNC` on Apple platforms, and `FlushFileBuffers` on Windows); it is
-  renamed over `path`; and on Unix the directory is synced so the rename itself is
-  durable. A `path` with no directory part (`slot0.carton`) is in the current directory,
+  the pool thread: on the first replace into its directory, the temporaries an earlier
+  process left there are removed (below); a temporary file `<name>.<unique>.tmp` is
+  created in the same directory as `path` (so the rename is never across volumes) with
+  `create_new`, so a leftover of another attempt is never reused, the next unique name
+  being tried, a bounded number of times, when one exists already; `bytes` is written to
+  it in full; the temporary is synced (`fsync`, which `std` issues as `F_FULLFSYNC` on
+  Apple platforms, and `FlushFileBuffers` on Windows); it is renamed over `path`; and on
+  Unix the directory is synced so the rename itself is durable. A `path` with no directory part (`slot0.carton`) is in the current directory,
   which is the one synced.
 - When the future resolves `Ok`, a reader of `path` on this machine sees all of `bytes`,
   and a crash or power loss after that point keeps them, to the extent the platform's
@@ -188,8 +202,11 @@ runs, the span constructors.
   a newer save is never overtaken by an older one whose future was dropped. A replace
   waiting behind another of its path holds no pool thread, and no pool thread ever waits
   for one. A replace dropped before it started never runs, and the next of its path does
-  not wait for it. Paths are compared as `Path` values, as given: two spellings of one
-  file (`saves/a` and `./saves/a`, a symbolic link) are two paths and are not ordered.
+  not wait for it. Paths are compared as `Path` values, as given, within one `Io`: two
+  spellings of one file (`saves/a` and `./saves/a`, a symbolic link) are two paths, and
+  replaces through two `Io`s share no order. Such replaces are unordered with each other:
+  each runs every step with its own temporary, the last rename wins, and neither fails
+  because of the other.
 - A failure resolves `Err(ReplaceFailed)`, which holds the error and `bytes`, unchanged and
   never copied, so a caller retries without keeping a copy of its own. That holds for
   every failure, `Cancelled` included.
@@ -207,16 +224,22 @@ runs, the span constructors.
 - A `Replace` dropped before it started never touches the disk. One dropped after it
   started runs every step, so the path is replaced or left as it was and the temporary is
   cleaned up; the drop only discards the result.
-- Before it creates its temporary, a replace removes every `<name>.<unique>.tmp` beside
-  `path` whose `<unique>` has this crate's form, sixteen lowercase hexadecimal digits, so
-  a temporary of another path never matches. These are what a crash, or a process exit
-  that skipped a replace's cleanup, left. The sweep is best effort: a removal that fails
-  does not fail the replace. It is safe within one process because replaces of one path
-  are ordered; two processes replacing the same path are unsupported, since one could
-  remove the other's temporary while it is written.
-- A `.tmp` is an ordinary file to `Io::read_dir` until the next replace of its path
-  removes it, and one exists beside every replace in flight. Callers that list a
-  directory of slots ignore names ending in `.tmp`.
+- A temporary's `<unique>` is sixteen lower-case hexadecimal digits: eight of a token
+  taken once per process (hashed by `std`'s randomly keyed `RandomState` from the process
+  id and the time it is first needed), then eight of a process-wide counter. The first
+  replace into a directory through an `Io`, keyed as the directory is spelled, sweeps it
+  before creating its temporary: it removes every file of the directory named
+  `<any>.<unique>.tmp`, of any name, whose token is not this process's. These are what a
+  crash, or a process exit that skipped a replace's cleanup, left. Later replaces into
+  the directory through that `Io` do not sweep it; a directory spelled two ways is swept
+  twice, which costs one more listing. The sweep is best effort: a removal that fails
+  does not fail the replace. It never removes a temporary of this process, so no replace
+  removes another's, whatever the spellings and whichever `Io`. Two processes writing
+  into one directory are unsupported: one's sweep may remove the other's temporary while
+  it is written, failing that replace.
+- A `.tmp` is an ordinary file to `Io::read_dir` until a later process's first replace
+  into its directory removes it, and one exists beside every replace in flight. Callers
+  that list a directory of slots ignore names ending in `.tmp`.
 
 ### Directories
 
@@ -274,13 +297,14 @@ failed replace's inside its `ReplaceFailed`. A system call's `std::io::Error` ma
 `From<std::io::Error>` and keeps its source, except that the two kinds no request returns
 are made `Io`: `Unsupported` (`ENOTSUP`, from an `F_FULLFSYNC` on a file system without
 it) and `Network` (a timeout or a reset on a network file system). A zstd error is
-`InvalidData`, never through `From`.
+mapped from its code, never through `From`: `ResourceExhausted` when zstd cannot allocate
+its own memory, `InvalidData` for every other.
 
 | Kind | When |
 |---|---|
 | `NotFound` | `open`, `read_file`: no such file. `read_dir`: no such directory. `replace`: the directory of `path` does not exist, before the rename only |
-| `InvalidData` | A read whose range runs past the end of the file, overflows, or (encoded) is empty; a file that shrinks under a read or that changes size under `read_file`; a decode of anything but one whole, non-skippable frame whose header and output are exactly `decoded_len` |
-| `ResourceExhausted` | A `len`, `decoded_len` or whole-file size above `MAX_READ_BYTES`, before any allocation; a buffer the allocator refuses; the operating system out of memory |
+| `InvalidData` | A read whose range runs past the end of the file, overflows, or (encoded) is empty; a file that shrinks under a read or that changes size under `read_file`; a decode of anything but one whole, non-skippable frame whose header and output are exactly `decoded_len`; a frame whose window exceeds 2^27 bytes; any other error zstd reports |
+| `ResourceExhausted` | A `len`, `decoded_len` or whole-file size above `MAX_READ_BYTES`, before any allocation; a buffer the allocator refuses; zstd unable to allocate its window or context during a decode; the operating system out of memory |
 | `StorageFull` | `replace`: the disk or quota filled during the creation, the write or the sync, before the rename. `create_dir_all`: the disk or quota is full |
 | `Io` | Anything else the operating system reports: permissions, a directory where a file was named or a file where a directory was, a Windows sharing violation, a replace's temporary name taken on every try, every failure of a replace after its rename |
 | `Cancelled` | A request submitted to a pool that has stopped, or queued or waiting behind a replace when it stopped. Never from dropping the future: a dropped future has no one to tell |
@@ -345,10 +369,11 @@ own events.
   waits for a consumer that needs one.
 - **Deleting and renaming files, and removing directories.** No consumer of milestone 1
   deletes: saves are replaced, packs are immutable, the cooker writes over its outputs,
-  and a replace sweeps its own path's leftover temporaries. A save-slot delete in the UI
-  is the first consumer and brings `remove_file` with it.
-- **Two processes sharing a save directory.** A replace's sweep assumes no other process
-  replaces the same path.
+  and a replace sweeps the temporaries an earlier process left. A save-slot delete in
+  the UI is the first consumer and brings `remove_file` with it.
+- **Two processes writing into one directory.** A replace's sweep removes every
+  temporary with another process's token, so it assumes no other process writes into the
+  directory; a lock file or a per-process subdirectory waits for a consumer that runs two.
 - **Metadata without opening** (size, modified time) and **watching a directory** for the
   cooker's hot reload (`asset`'s milestone 2 work). Both are requests of the same shape
   and arrive with their consumer.
@@ -396,17 +421,26 @@ and orderings, never on timings.
 - **Decode.** A zstd frame round-trips to the bytes it was made from, in a buffer of
   exactly `decoded_len`; the content-size header disagreeing with `decoded_len` is
   `InvalidData`. A frame of several MiB, polled by hand, returns `Pending` with its own
-  waker woken more than once before it resolves; the pool's thread is never inside the
-  decode (`AllocTag::current()` in the decode is `Io` through the scope, and the thread
-  is the poller's).
+  waker woken more than once before it resolves, and the decode runs on the polling
+  thread, never the pool's. One step of a slice decodes at most about 64 KiB of output
+  (a test hook counts the output per `decompress_stream` call), so a whole frame given
+  at once still takes several calls and polls. A frame of a little over 2^27 bytes of
+  zeros compressed with `WindowLog(28)` is `InvalidData`; the same content compressed with
+  `WindowLog(27)` decodes. zstd's memory-allocation code maps to `ResourceExhausted` and
+  every other code to `InvalidData` (a unit test of the mapping).
 - **Atomic replace.** The new content is seen whole after `Ok`; the previous content is
   kept and the temporary removed when the write fails (a `path` that is a directory, a
   read-only directory), and the `ReplaceFailed` holds the very bytes given (same pointer
   and length); the temporary is created in the same directory (observed by a listing
   taken while a slow replace is in flight); a replace of a bare file name works in the
-  current directory; a leftover `<name>.<sixteen hex>.tmp` is removed by the next replace
-  of `<name>`, and a sibling path's temporary and a file `<name>.bak.tmp` are not; a
-  temporary name already taken is skipped to the next; a `File` opened before a replace
+  current directory; the first replace into a directory removes a leftover
+  `<any>.<sixteen hex>.tmp` whose token is not this process's, of any name, and leaves a
+  temporary with this process's token, a file `<name>.bak.tmp` and a file with fifteen
+  hex digits; a second replace into the directory does not list it again (a leftover
+  placed after the first is still there); with two `Io`s, and with two spellings of one
+  path (`d/a` and `./d/a`), replaces of one path held in flight at once both resolve
+  `Ok`, the path holds one of the two contents, and no temporary is left; a temporary
+  name already taken is skipped to the next; a `File` opened before a replace
   reads the previous content after it, on Unix and on Windows; a replace over a path we
   hold open ourselves succeeds on Windows. A failure after the rename is `Io` (forced
   with a test hook in place of the directory sync). Durability across a power loss is

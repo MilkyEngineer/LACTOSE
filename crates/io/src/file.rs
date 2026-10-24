@@ -98,13 +98,16 @@ impl File {
     /// The pool reads and checks the stored bytes; the decode runs in the returned future's
     /// own poll, on the thread that polls it (a background worker for SILO's loads,
     /// architecture section 5.1), in slices that yield at least every 0.5 ms. The stored
-    /// bytes are never handed out. `InvalidData` if the range is empty, short or overflows,
-    /// if the stored bytes are not one whole frame of `encoding` ending exactly at
-    /// `offset + len`, or if they decode to any other length; `ResourceExhausted` if `len`
-    /// or `decoded_len` exceeds [`MAX_READ_BYTES`](crate::MAX_READ_BYTES) or a buffer
-    /// cannot be allocated, before either is; `Io` for anything else the read reports;
-    /// `Cancelled` if the pool has stopped. Nothing is submitted until the future is first
-    /// polled.
+    /// bytes are never handed out. While it decodes, zstd holds a window buffer of its own,
+    /// up to the smaller of the frame's window and `decoded_len` and at most 2^27 bytes,
+    /// allocated outside the global allocator and so not charged to `AllocTag::Io`.
+    /// `InvalidData` if the range is empty, short or overflows, if the stored bytes are not
+    /// one whole frame of `encoding` ending exactly at `offset + len`, if the frame's window
+    /// exceeds 2^27 bytes, or if they decode to any other length; `ResourceExhausted` if
+    /// `len` or `decoded_len` exceeds [`MAX_READ_BYTES`](crate::MAX_READ_BYTES) or a buffer
+    /// cannot be allocated, before either is, or if zstd cannot allocate its own memory;
+    /// `Io` for anything else the read reports; `Cancelled` if the pool has stopped. Nothing
+    /// is submitted until the future is first polled.
     #[must_use = "a read does nothing until polled"]
     pub fn read_encoded_at(&self, offset: u64, len: u64, encoding: Encoding) -> ReadAt {
         todo!(
@@ -129,12 +132,14 @@ impl fmt::Debug for File {
 /// Resolves to the bytes asked for, every one of them or an error, never a short buffer.
 /// Dropping it cancels the read: one not yet started never runs; one started finishes on
 /// the pool thread and its buffer is freed there; an encoded read dropped after the pool
-/// handed it its stored bytes frees both its buffers on the dropping thread. The drop never blocks. The future holds
-/// the file open until the pool's part of the read completes or the future is dropped.
+/// handed it its stored bytes frees both its buffers, and zstd's context, on the dropping
+/// thread. The drop never blocks. The future holds the file open until the pool's part of
+/// the read completes or the future is dropped.
 ///
 /// Polling an encoded read whose stored bytes have arrived decodes a slice of them on the
-/// polling thread, at most about 0.5 ms of work, then wakes itself and returns `Pending`
-/// until the frame is done, as section 5.1's background CPU work yields.
+/// polling thread, about 0.5 ms of work in steps of about 64 KiB of output, then wakes
+/// itself and returns `Pending` until the frame is done, as section 5.1's background CPU
+/// work yields.
 #[must_use = "a read does nothing until polled"]
 pub struct ReadAt {
     state: ReadState,

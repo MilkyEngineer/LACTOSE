@@ -10,7 +10,7 @@
 //! through `From` alone: a request returns only the kinds `README.md` lists.
 
 use core::num::NonZero;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
 
@@ -33,6 +33,19 @@ pub(crate) struct BlockingPool {
     threads: Mutex<Vec<ThreadHandle>>,
     /// The configured thread count.
     pool_threads: NonZero<u32>,
+    /// The directories [`replace`] has swept for this pool, keyed as spelled: the first
+    /// replace into a directory takes its key and sweeps it, every later one skips the
+    /// sweep. A directory spelled two ways is swept twice, which costs one more listing.
+    /// Held only to test and insert, never across the sweep.
+    swept: Mutex<HashSet<PathBuf>>,
+}
+
+/// This process's temporary-name token: eight lower-case hex digits, taken once per
+/// process (a `OnceLock<u32>`), from `std::hash::RandomState` (randomly keyed per process)
+/// hashing the process id and the time of the first call. A temporary carries it, so a
+/// sweep tells this process's live temporaries from what another process left.
+fn token() -> u32 {
+    todo!("OnceLock: RandomState::new().hash_one((std::process::id(), SystemTime::now())) as u32")
 }
 
 struct Queue {
@@ -134,10 +147,11 @@ fn read_at(file: &OpenFile, offset: u64, len: u64) -> Result<Vec<u8>> {
 /// 3. `Vec::try_reserve_exact(decoded_len)` for the output: a failure is
 ///    `ResourceExhausted`.
 ///
-/// Every zstd error maps to `InvalidData` explicitly, from its code and
+/// Every zstd error here maps to `InvalidData` explicitly, from its code and
 /// `zstd_safe::get_error_name`, never through `From<std::io::Error>`, which made them
-/// `Io`. The decoded count is checked by the decode (`decode.rs`), which also maps its
-/// stream's errors to `InvalidData`.
+/// `Io`. The decoded count, the window bound and the stream's errors are the decode's
+/// (`decode.rs`), which maps zstd's memory-allocation error to `ResourceExhausted` and
+/// every other to `InvalidData`.
 fn read_encoded_at(file: &OpenFile, offset: u64, len: u64, encoding: Encoding) -> Result<Encoded> {
     todo!("read_at, the three frame checks, then the reserved output buffer")
 }
@@ -158,17 +172,21 @@ fn read_file(path: &Path) -> Result<Vec<u8>> {
 ///
 /// 0. The directory is `path.parent()`, and `"."` when that is empty (`slot0.carton`). A
 ///    `path` with no file name is `Io` before anything is touched.
-/// 1. Sweep: list the directory and remove every `<name>.<unique>.tmp` whose `<unique>`
-///    has this crate's form, sixteen lowercase hexadecimal digits, so another path's
-///    temporary never matches (`<name>` is `path`'s file name; a sibling `a.b` has
-///    temporaries `a.b.<unique>.tmp`, whose middle is not sixteen hex digits for `a`).
-///    Best effort: a listing or removal that fails is ignored, and the create below
-///    reports the directory's real state. Safe because replaces of one path are ordered
-///    within the process (the waitlist); two processes replacing one path are unsupported.
-/// 2. Create `<name>.<unique>.tmp` in the directory with `create_new`, so a leftover is
-///    never reused; `<unique>` is the process id and a counter, each as eight hex digits.
-///    On `AlreadyExists` take the next counter value and try again, up to 16 times, then
-///    `Io`. `NotFound` if the directory does not exist.
+/// 1. Sweep, once per directory per pool: if the directory, as spelled, is not yet in
+///    `swept`, insert it and list it, removing every regular file named
+///    `<any>.<token><counter>.tmp` (sixteen lower-case hex digits in all, `<any>` not
+///    empty) whose `<token>` is not this process's [`token`], whatever its `<any>`: the
+///    leftovers of an earlier process, a crashed one or an earlier run of a container's
+///    pid 1 among them. Best effort: a listing or removal that fails is ignored, and the
+///    create below reports the directory's real state. It never removes a temporary of
+///    this process, so no replace of this process, under any spelling and from any `Io`,
+///    removes another's. A second process writing into the same directory is unsupported:
+///    its live temporaries carry a foreign token.
+/// 2. Create `<name>.<token><counter>.tmp` in the directory with `create_new`, so a
+///    leftover is never reused; `<token>` is [`token`] and `<counter>` a process-wide
+///    `AtomicU32`, each as eight lower-case hex digits. On `AlreadyExists` take the next
+///    counter value and try again, up to 16 times, then `Io`. `NotFound` if the directory
+///    does not exist.
 /// 3. `write_all(bytes)`, then `sync_all` (`fsync`; `F_FULLFSYNC` on Apple platforms,
 ///    which `std` issues for `sync_all`; `FlushFileBuffers` on Windows). `StorageFull`
 ///    from either step.
@@ -180,15 +198,22 @@ fn read_file(path: &Path) -> Result<Vec<u8>> {
 /// system call said (a directory removed after the rename would otherwise be `NotFound`,
 /// which `app` reads as "no save directory"): the new content is in place and its
 /// durability unknown. A started replace runs every step however its future was dropped.
-fn replace(path: &Path, bytes: Vec<u8>) -> Result<(), ReplaceFailed> {
+/// Two replaces of one file under two spellings, or from two `Io`s, are not ordered with
+/// each other: both run every step, the last rename wins, and neither fails because of
+/// the other.
+fn replace(
+    swept: &Mutex<HashSet<PathBuf>>,
+    path: &Path,
+    bytes: Vec<u8>,
+) -> Result<(), ReplaceFailed> {
     todo!("the steps above, `bytes` returned in the error on every failure")
 }
 
 /// Every entry of the directory at `path`, by its own file type (a symbolic link is
 /// `Other`), sorted by name. `NotFound` if there is no such directory; `Io` if `path` is
 /// not a directory or cannot be read. A `.tmp` left by a crashed [`replace`] is listed
-/// like any other file until the next replace of its path removes it; callers that list
-/// slots ignore the suffix.
+/// like any other file until a later process's first replace into its directory removes
+/// it; callers that list slots ignore the suffix.
 fn read_dir(path: &Path) -> Result<Vec<DirEntry>> {
     todo!("read_dir, file_type() per entry, collect, sort_unstable by name")
 }
