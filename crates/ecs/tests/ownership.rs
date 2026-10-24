@@ -8,8 +8,14 @@
 //! bound `Net` entity emptying the reference whose rewrite would close a cycle; a region's
 //! own save and a client's documents loading after a cycle closed across regions; an owned
 //! entity staying put when given to an owner elsewhere and when the owner's region unloads;
-//! seeded random histories that always save and load. Every case that touches storage runs
-//! under every layout; the histories are spread over them.
+//! seeded random histories that always save and load; a deep chain of owners loading as
+//! fast as a flat one. Every case that touches storage runs under every layout; the
+//! histories are spread over them.
+//!
+//! The world logs through one global subscriber into one buffer for the process, and a
+//! command apply logs on the executor's threads, so the log cannot be told apart by thread.
+//! Every test therefore holds [`serial`] for its whole body: under plain `cargo test`, which
+//! runs a binary's tests on parallel threads, they would otherwise read each other's lines.
 
 #![forbid(unsafe_code)]
 
@@ -140,8 +146,8 @@ impl Line {
 }
 
 /// What the world logged at target `casein` since the last [`capture`]. One buffer for the
-/// process: a command apply logs on the executor's threads, nextest runs each test in its
-/// own process, and Miri runs a binary's tests one at a time.
+/// process, since a command apply logs on the executor's threads; [`serial`] keeps two tests
+/// from sharing it.
 static LINES: Mutex<Vec<Line>> = Mutex::new(Vec::new());
 
 struct Capture;
@@ -178,6 +184,16 @@ impl Subscriber for Capture {
 }
 
 static SUBSCRIBER: Once = Once::new();
+
+/// Held for a whole test: the log buffer is one for the process, so tests that run on
+/// threads of one process (plain `cargo test`) must not interleave.
+static SERIAL: Mutex<()> = Mutex::new(());
+
+/// The guard every test holds; a test that panicked while holding it poisons nothing for
+/// the next.
+fn serial() -> std::sync::MutexGuard<'static, ()> {
+    SERIAL.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 /// Starts capturing `casein` events afresh.
 fn capture() {
@@ -326,6 +342,7 @@ impl Path {
 
 #[test]
 fn a_self_owner_is_refused() {
+    let _serial = serial();
     for layout in layouts() {
         for path in PATHS {
             let mut world = world(WorldKind::Prediction, layout);
@@ -355,6 +372,7 @@ fn a_self_owner_is_refused() {
 
 #[test]
 fn closing_a_cycle_is_refused_on_the_last_write() {
+    let _serial = serial();
     for layout in layouts() {
         for path in PATHS {
             for len in [2, 3] {
@@ -441,6 +459,7 @@ fn ownership_commands(cmd: Commands, key: StableKeyOf, _source: &Counter) {
 
 #[test]
 fn a_command_closing_a_cycle_is_dropped() {
+    let _serial = serial();
     let executor = executor();
     for layout in layouts() {
         let mut world = server_from(FIRST_ALLOCATED, layout);
@@ -495,6 +514,7 @@ fn predicted_spawn(cmd: Commands, _claimed: With<ClaimedBy>, counter: &Counter) 
 
 #[test]
 fn a_refused_predicted_spawn_binds_nothing() {
+    let _serial = serial();
     let executor = executor();
     let schedule = || {
         let mut builder = Schedule::builder(WorldKind::Server);
@@ -535,6 +555,7 @@ fn a_refused_predicted_spawn_binds_nothing() {
 
 #[test]
 fn a_chain_through_a_dangling_owner() {
+    let _serial = serial();
     let item = net(1);
     let dangling = net(5);
     for layout in layouts() {
@@ -617,6 +638,7 @@ fn a_chain_through_a_dangling_owner() {
 
 #[test]
 fn a_load_whose_owners_cycle_is_refused_whole() {
+    let _serial = serial();
     let (c1, c2) = (cooked(0xA1), cooked(0xA2));
     for layout in layouts() {
         // Within one document: a cycle the bundle cannot see, through the baseline's own
@@ -657,6 +679,7 @@ fn a_load_whose_owners_cycle_is_refused_whole() {
 
 #[test]
 fn a_row_whose_bound_id_lacks_its_origin_is_refused() {
+    let _serial = serial();
     let row = vec![Record::Spawn { id: net_50(), components: vec![data(pos(6, 0))] }];
     for layout in layouts() {
         for live in [false, true] {
@@ -696,6 +719,7 @@ fn load_all(world: &mut World, documents: &[(RegionId, &Baseline, &Overlay)]) ->
 
 #[test]
 fn a_cycle_across_two_documents_is_broken_at_the_document_row() {
+    let _serial = serial();
     let (a1, b1) = (cooked(0xA1), cooked(0xB1));
     let (a, b) = (REGION, OTHER_REGION);
     // A's row owned by B's, B's by A's.
@@ -788,6 +812,7 @@ fn a_cycle_across_two_documents_is_broken_at_the_document_row() {
 
 #[test]
 fn a_bind_that_would_close_a_cycle_empties_the_reference() {
+    let _serial = serial();
     for layout in layouts() {
         // The predicted entity's chain is 1, 2 or 3 long and ends at an entity owned by the
         // `NetId` the bind names.
@@ -837,6 +862,7 @@ fn a_bind_that_would_close_a_cycle_empties_the_reference() {
 
 #[test]
 fn a_rekey_that_would_revive_a_cycle_empties_the_reference() {
+    let _serial = serial();
     for layout in layouts() {
         // A restore that revives an entity owned by a `Net` key bound since the snapshot to
         // an entity whose chain reaches it.
@@ -907,6 +933,7 @@ fn two_regions(kind: WorldKind, layout: LayoutConfig, mode: RegionMode) -> World
 
 #[test]
 fn a_saved_region_loads_after_a_cycle_closed_through_an_unloaded_entity() {
+    let _serial = serial();
     let executor = executor();
     let empty = baseline(&[]);
     let (a, b) = (REGION, OTHER_REGION);
@@ -973,6 +1000,7 @@ fn a_saved_region_loads_after_a_cycle_closed_through_an_unloaded_entity() {
 
 #[test]
 fn a_client_loads_documents_sent_at_different_times() {
+    let _serial = serial();
     let empty = baseline(&[]);
     let (a, b) = (REGION, OTHER_REGION);
     let (e, p, x) = (net(1), net(2), net(3));
@@ -1233,6 +1261,7 @@ fn histories() -> u64 {
 
 #[test]
 fn random_histories_always_save_and_load() {
+    let _serial = serial();
     let per_mode = histories();
     let layouts = layouts();
     for live_only in [true, false] {
@@ -1249,6 +1278,7 @@ fn random_histories_always_save_and_load() {
 
 #[test]
 fn an_owned_entity_stays_where_it_is() {
+    let _serial = serial();
     let (a2, a6, b1) = (cooked(0xA2), cooked(0xA6), cooked(0xB1));
     let (a, b) = (REGION, OTHER_REGION);
     for layout in layouts() {
@@ -1314,4 +1344,52 @@ fn an_owned_entity_stays_where_it_is() {
             assert_eq!(world.region_of(key(a6)), Some(a), "{context}");
         }
     }
+}
+
+// ---- Cost ----
+
+/// A document of `n` runtime rows: with `deep`, row k is owned by row k - 1, a chain of `n`;
+/// otherwise every row by the first.
+fn chain_document(n: u64, deep: bool) -> (Baseline, Overlay) {
+    let id = |bits: u64| NetId::from_bits(bits).unwrap();
+    let mut records = Vec::new();
+    for k in 1..=n {
+        records.push(Record::Spawn { id: id(k), components: vec![data(pos(k as i32, 0))] });
+        if k > 1 {
+            let owner = if deep { k - 1 } else { 1 };
+            records.push(Record::OwnershipChange { id: id(k), owner: Some(id(owner)) });
+        }
+    }
+    document(&[], records)
+}
+
+/// The best of three loads of `document` into a fresh world.
+#[expect(clippy::disallowed_types, reason = "test code outside the step: a cost ratio")]
+fn best_load(document: &(Baseline, Overlay)) -> std::time::Duration {
+    (0..3)
+        .map(|_| {
+            let mut world = WorldBuilder::new(WorldKind::Server, registry()).build().unwrap();
+            create(&mut world, REGION);
+            let start = std::time::Instant::now();
+            world.load_region(REGION, &document.0, Some(&document.1)).unwrap();
+            start.elapsed()
+        })
+        .min()
+        .expect("three loads")
+}
+
+/// The load walks owners once, before any spawn, and the spawns walk nothing: a chain of
+/// 8000 owners loads in about the time of 8000 rows with one owner, where a walk per row
+/// costs about 260 times as much. The bound of 5 holds on a loaded machine.
+#[test]
+#[cfg_attr(miri, ignore = "a timing ratio; Miri's timings mean nothing")]
+fn a_deep_chain_loads_as_fast_as_a_flat_one() {
+    let _serial = serial();
+    let flat = best_load(&chain_document(8000, false));
+    let deep = best_load(&chain_document(8000, true));
+    assert!(
+        deep < flat * 5,
+        "a chain of 8000 owners took {deep:?} to load against {flat:?} flat: the load walks \
+         each row's chain again (a per-row walk in the spawns)"
+    );
 }
