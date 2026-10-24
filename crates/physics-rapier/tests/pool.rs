@@ -73,6 +73,11 @@ impl Held {
 
 /// Steps [`Walk`] on a pool of `threads` threads with all but one held. Returns
 /// whether every step finished while they were held.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "the test builds the solver pool lactose-app builds, and steps on a second thread \
+              so that a hung step times out"
+)]
 fn steps_with_one_free_thread(threads: usize) -> bool {
     let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).build().unwrap();
     let held = Held::spawn(&pool, threads - 1);

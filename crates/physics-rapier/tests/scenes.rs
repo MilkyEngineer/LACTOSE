@@ -18,6 +18,10 @@ use lactose_physics_api::{
     QueryFilter, Ray, Shape, Teleported, Transform, Velocity,
 };
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "the test builds the solver pool that lactose-app builds in a shipped binary"
+)]
 fn rapier(threads: usize) -> Box<dyn lactose_physics_api::PhysicsBackend> {
     let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).build().unwrap();
     lactose_physics_rapier::backend(pool)

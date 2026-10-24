@@ -187,6 +187,22 @@ disallowed-methods = [
   { path = "std::thread::available_parallelism", reason = "architecture section 8.2: the process environment is not a simulation input" },
   { path = "std::backtrace::Backtrace::capture", reason = "architecture section 8.2: the process environment is not a simulation input" },
   { path = "std::net::ToSocketAddrs::to_socket_addrs", reason = "architecture section 8.2: networking is outside the boundary; state enters through the staged frame of lactose_net_api" },
+  # Architecture sections 5.1 and 8.2: a boundary crate creates no thread. Parallel work goes
+  # through `lactose_task`, under the executor's determinism and chaos model, and the physics
+  # step through the solver pool of section 16. Clippy matches items, so every function that
+  # starts a thread is its own entry, those of `Scope` and `Builder` included. A test that
+  # needs a thread lifts the lint with `#[expect]` on its one item.
+  { path = "std::thread::spawn", reason = "architecture section 8.2: a boundary crate creates no thread; parallel work goes through lactose_task" },
+  { path = "std::thread::scope", reason = "architecture section 8.2: a boundary crate creates no thread; parallel work goes through lactose_task" },
+  { path = "std::thread::Scope::spawn", reason = "architecture section 8.2: a boundary crate creates no thread; parallel work goes through lactose_task" },
+  { path = "std::thread::Builder::spawn", reason = "architecture section 8.2: a boundary crate creates no thread; parallel work goes through lactose_task" },
+  { path = "std::thread::Builder::spawn_scoped", reason = "architecture section 8.2: a boundary crate creates no thread; parallel work goes through lactose_task" },
+  { path = "std::thread::Builder::spawn_unchecked", reason = "architecture section 8.2: a boundary crate creates no thread; parallel work goes through lactose_task" },
+  # Section 16: `lactose-app` builds the solver pool outside the boundary and hands it to the
+  # backend's constructor, so no boundary crate builds a rayon pool.
+  { path = "rayon::ThreadPoolBuilder::build", reason = "architecture section 16: the solver pool is built outside the boundary and handed to the backend", allow-invalid = true },
+  { path = "rayon::ThreadPoolBuilder::build_global", reason = "architecture section 16: the solver pool is built outside the boundary and handed to the backend", allow-invalid = true },
+  { path = "rayon::ThreadPoolBuilder::build_scoped", reason = "architecture section 16: the solver pool is built outside the boundary and handed to the backend", allow-invalid = true },
 ]
 
 disallowed-types = [

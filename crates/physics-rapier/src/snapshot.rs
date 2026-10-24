@@ -326,6 +326,10 @@ mod tests {
 
     /// A backend holding one body of each shape and a fixed cuboid, stepped once, and a
     /// second body waiting for the next step.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the test builds the solver pool that lactose-app builds in a shipped binary"
+    )]
     fn stepped() -> Rapier {
         let pool = rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap();
         let mut backend = Rapier::new(Arc::new(pool));

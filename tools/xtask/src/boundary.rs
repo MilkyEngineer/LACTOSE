@@ -31,13 +31,14 @@ const PIN_FLAGS: [&str; 2] = ["-C", "target-cpu=x86-64-v3"];
 
 /// Entries the reference lint file must keep, one or two from each family of rule in
 /// section 8.2, so a file that was emptied and then copied everywhere is still caught.
-const REQUIRED_LINT_PATHS: [&str; 13] = [
+const REQUIRED_LINT_PATHS: [&str; 14] = [
     "f32::min",
     "f64::sin",
     "f64::to_bits",
     "f64::powi",
     "std::fs::read",
     "std::env::var",
+    "std::thread::spawn",
     "std::time::Instant",
     "std::collections::HashMap",
     "std::hash::RandomState",
@@ -48,9 +49,10 @@ const REQUIRED_LINT_PATHS: [&str; 13] = [
 ];
 
 /// The entries of the reference lint file, by path prefix, that keep the outside world out:
-/// files, the process environment, subprocesses and the network (section 8.2). Every crate of
-/// `[boundary_internal] any` that does not carry the whole file carries these, as written.
-const OUTSIDE_WORLD: [&str; 13] = [
+/// files, the process environment, subprocesses, the network and threads the executor does
+/// not run (section 8.2). Every crate of `[boundary_internal] any` that does not carry the
+/// whole file carries these, as written.
+const OUTSIDE_WORLD: [&str; 17] = [
     "std::fs::",
     "std::path::",
     "std::os::unix::fs::",
@@ -64,6 +66,10 @@ const OUTSIDE_WORLD: [&str; 13] = [
     "std::backtrace::",
     "std::net::",
     "std::os::unix::net::",
+    "std::thread::spawn",
+    "std::thread::scope",
+    "std::thread::Scope::",
+    "std::thread::Builder::",
 ];
 
 /// The two lint tables of a lint file.
@@ -101,7 +107,7 @@ pub fn check(tiers: &TierFile, policy: &Policy, ws: &Workspace, files: &Files) -
         let boundary = tiers.in_boundary(&package.name);
         let carrier = boundary || policy.lint_file_carriers.contains(&package.name);
         // Compiled into every boundary crate, so held to the bans that keep the outside world
-        // out (section 8.2), but not to the float or executor ones.
+        // out (section 8.2), but not to the float, executor or solver-pool ones.
         let internal = !carrier && tiers.boundary_internal.any.contains(&package.name);
         if carrier {
             lint_file_copy(package, files, &mut findings);
@@ -261,8 +267,8 @@ fn outside_world_lint_file(package: &Package, files: &Files, findings: &mut Vec<
             format!(
                 "`{}` is in [boundary_internal] `any` of {TIER_FILE}, so it compiles into every \
                  boundary crate and must carry a clippy.toml with the entries of \
-                 {REFERENCE_CLIPPY} that ban files, the environment, subprocesses and the \
-                 network",
+                 {REFERENCE_CLIPPY} that ban files, the environment, subprocesses, the \
+                 network and thread creation",
                 package.name
             ),
         ));
@@ -292,8 +298,8 @@ fn outside_world_lint_file(package: &Package, files: &Files, findings: &mut Vec<
                 &path,
                 format!(
                     "`{table}` has an entry for `{name}` that {REFERENCE_CLIPPY} does not have \
-                     as written; the two must agree on every file, environment, subprocess and \
-                     network entry"
+                     as written; the two must agree on every file, environment, subprocess, \
+                     network and thread entry"
                 ),
             ));
         }
@@ -852,14 +858,14 @@ mod tests {
     const FORBID: &str = "//! Docs.\n#![forbid(unsafe_code)]\n";
     const MANIFEST: &str = "[package]\nname = \"x\"\n[lints]\nworkspace = true\n";
 
-    /// A lint file of the required entries that `keep` keeps: the first six are methods.
+    /// A lint file of the required entries that `keep` keeps: the first seven are methods.
     fn lint_file_of(keep: impl Fn(&str) -> bool) -> String {
         let mut text = String::from("disallowed-methods = [\n");
-        for path in REQUIRED_LINT_PATHS[..6].iter().filter(|path| keep(path)) {
+        for path in REQUIRED_LINT_PATHS[..7].iter().filter(|path| keep(path)) {
             text.push_str(&format!("  {{ path = \"{path}\", reason = \"r\" }},\n"));
         }
         text.push_str("]\ndisallowed-types = [\n");
-        for path in REQUIRED_LINT_PATHS[6..].iter().filter(|path| keep(path)) {
+        for path in REQUIRED_LINT_PATHS[7..].iter().filter(|path| keep(path)) {
             text.push_str(&format!("  \"{path}\",\n"));
         }
         text.push_str("]\n");
@@ -1061,6 +1067,37 @@ mod tests {
             [
                 "crates/core/clippy.toml: no longer disallows `f64::sin`, which architecture section 8.2 bans inside the boundary",
                 "crates/core/clippy.toml: no longer disallows `std::time::Instant`, which architecture section 8.2 bans inside the boundary",
+            ]
+        );
+    }
+
+    #[test]
+    fn thread_creation_stays_banned_in_the_reference_and_in_what_every_boundary_crate_compiles() {
+        // A boundary crate creates no thread (architecture section 8.2): the reference keeps
+        // the ban, and a crate of `[boundary_internal] any` carries it as written there.
+        let (mut ws, mut files) = conforming();
+        let spawn = "  { path = \"std::thread::spawn\", reason = \"r\" },\n";
+        assert!(outside_world_file().contains(spawn));
+        let unbanned = lint_file().replace(spawn, "");
+        files.insert(REFERENCE_CLIPPY, unbanned.clone());
+        files.insert("crates/math/clippy.toml", unbanned);
+        assert_eq!(
+            run(&ws, &files),
+            [
+                "crates/core/clippy.toml: no longer disallows `std::thread::spawn`, which architecture section 8.2 bans inside the boundary"
+            ]
+        );
+        files.insert(REFERENCE_CLIPPY, lint_file());
+        files.insert("crates/math/clippy.toml", lint_file());
+        ws.packages.push(package("lactose-reflect", &[("lactose-core", Normal)]));
+        files.insert("crates/reflect/README.md", "");
+        files.insert("crates/reflect/Cargo.toml", MANIFEST);
+        files.insert("crates/reflect/src/lib.rs", FORBID);
+        files.insert("crates/reflect/clippy.toml", outside_world_file().replace(spawn, ""));
+        assert_eq!(
+            run(&ws, &files),
+            [
+                "crates/reflect/clippy.toml: `disallowed-methods` lacks the entry for `std::thread::spawn` that crates/core/clippy.toml has; copy it as written there"
             ]
         );
     }
@@ -1455,7 +1492,7 @@ mod tests {
         assert_eq!(
             run(&ws, &files),
             [
-                "crates/reflect/clippy.toml: `lactose-reflect` is in [boundary_internal] `any` of crate-tiers.toml, so it compiles into every boundary crate and must carry a clippy.toml with the entries of crates/core/clippy.toml that ban files, the environment, subprocesses and the network"
+                "crates/reflect/clippy.toml: `lactose-reflect` is in [boundary_internal] `any` of crate-tiers.toml, so it compiles into every boundary crate and must carry a clippy.toml with the entries of crates/core/clippy.toml that ban files, the environment, subprocesses, the network and thread creation"
             ]
         );
         // The outside-world entries alone, or with the rest of the reference.
@@ -1487,11 +1524,11 @@ mod tests {
                     table("methods")
                 ),
                 format!(
-                    "{} has an entry for `std::env::var` that crates/core/clippy.toml does not have as written; the two must agree on every file, environment, subprocess and network entry",
+                    "{} has an entry for `std::env::var` that crates/core/clippy.toml does not have as written; the two must agree on every file, environment, subprocess, network and thread entry",
                     table("methods")
                 ),
                 format!(
-                    "{} has an entry for `std::net::UdpSocket` that crates/core/clippy.toml does not have as written; the two must agree on every file, environment, subprocess and network entry",
+                    "{} has an entry for `std::net::UdpSocket` that crates/core/clippy.toml does not have as written; the two must agree on every file, environment, subprocess, network and thread entry",
                     table("types")
                 ),
             ]

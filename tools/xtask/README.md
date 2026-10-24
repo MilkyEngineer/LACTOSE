@@ -56,9 +56,11 @@ file is held to the rules wherever it is fetched from.
   byte-identical to `crates/core/clippy.toml`, and that file still bans a required minimum.
 - Each other crate of `[boundary_internal] any` compiles into every boundary crate and has a
   `clippy.toml` whose entries under the paths that reach files, the environment, a
-  subprocess or the network (`OUTSIDE_WORLD` in `src/boundary.rs`) are exactly those of
-  `crates/core/clippy.toml`, compared entry by entry as parsed TOML. The reference's float
-  and executor entries are not required of it. A unit test holds `OUTSIDE_WORLD` to the
+  subprocess or the network, or create a thread (`OUTSIDE_WORLD` in `src/boundary.rs`), are
+  exactly those of `crates/core/clippy.toml`, compared entry by entry as parsed TOML. A
+  thread the executor does not run is outside its determinism and chaos model wherever the
+  code that starts it lives. The reference's float, executor and solver-pool entries are not
+  required of it. A unit test holds `OUTSIDE_WORLD` to the
   reference's entries that cite section 8.2, so an entry added there is not missed.
 - Nothing switches the boundary lints off. In a boundary crate, a crate of
   `[lint_file_carriers]` or a crate of `[boundary_internal] any`, `allow`, `expect` or

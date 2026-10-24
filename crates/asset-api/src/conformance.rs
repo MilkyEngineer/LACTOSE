@@ -443,6 +443,10 @@ fn generation_moves_only_with_publication<H: Harness>(harness: &H) {
 /// one a sequential store could have given: content always hashes to its version, the
 /// generation never goes back, and a resolved table always holds the dependency of the
 /// version of `A` it names, although each round publishes that pair anew.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "the suite drives a store from several threads; its feature is for dev-dependencies alone"
+)]
 fn concurrent_use_is_consistent<H: Harness>(harness: &H) {
     const ROUNDS: usize = 40;
     let dependency = |round: usize| AssetId::from_name(&format!("conformance/dependency-{round}"));
