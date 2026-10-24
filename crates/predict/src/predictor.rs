@@ -18,7 +18,7 @@ use lactose_ecs::{Executor, RegionId, World, WorldKind};
 use lactose_net_api::StagedInbox;
 use lactose_physics_api::Physics;
 use lactose_reflect::{Reflect, TypeInfo};
-use lactose_sim::{RunError, Simulation, StagedState, TickInput};
+use lactose_sim::{RunError, Simulation, StagedState, TICK_RATE_HZ, TickInput};
 
 use crate::compare::PredictionTolerance;
 use crate::fact::{Resolved, recorded};
@@ -35,6 +35,16 @@ mod rollback;
 /// ([`Predictor::set_depth`]), before it relies on a correction costing no lead: a
 /// rollback to the oldest slot of an unsized ring may overrun the frame (D122).
 pub const DEFAULT_DEPTH: u32 = 60;
+
+/// How long a substitution the reconciliation acted on is remembered after the ring has
+/// dropped its slot, so a repeat of the report is still skipped: ten seconds at the tick
+/// rate, whatever the depth. The server repeats a substitution until it sees acknowledged
+/// a packet that carried it (`crates/net-api/README.md`, `substituted`): every packet it
+/// sends from the first carries it, and the client acknowledges every packet it stages, so
+/// the repeats last about a round trip plus the client's send interval, longer only while
+/// every packet from the client is lost. A repeat later than this reads as a first report
+/// whose slot has left the ring, `TooOld`, never a rollback. Each entry is one `Tick`.
+const REPEAT_WINDOW: u32 = 10 * TICK_RATE_HZ;
 
 /// Who the prediction world predicts for: the player the server assigned on join
 /// (`JoinAccepted::player`) and the player's own entity, the row the server's session
@@ -85,6 +95,15 @@ struct State {
     /// at or after them is reconciled; a frame spans every tick since the previous one, so
     /// a repair is found by its tick, possibly in a later call.
     awaiting: BTreeSet<Tick>,
+    /// The input ticks a call replaced by a substitute on the server's first report, so a
+    /// repeat of the report is skipped wherever the ring stands; each is remembered while
+    /// the ring holds its slot or for [`REPEAT_WINDOW`] ticks, whichever is longer, and
+    /// all are forgotten by a full frame and by `resync`.
+    substituted: BTreeSet<Tick>,
+    /// The tick the newest full frame or `resync` restarted the ring at: a substitution
+    /// or repair at or before it is skipped. Remembered as an entry of `substituted` is,
+    /// so a repeat after the ring dropped the restart's slot is still skipped.
+    restart: Option<Tick>,
     /// The facts compared at the tick their frame was popped at instead of their own, by
     /// that tick: each places its entity in a region the slot it would be compared at
     /// lacked and the popped tick loaded, and later facts about the same entity for a tick
@@ -236,6 +255,8 @@ impl Predictor {
             physics: world.service::<Physics>().is_some(),
             known: BTreeMap::new(),
             awaiting: BTreeSet::new(),
+            substituted: BTreeSet::new(),
+            restart: None,
             kept: BTreeMap::new(),
             recorded: world
                 .registry()
@@ -354,17 +375,18 @@ impl Predictor {
         state.ring.rebuild_at(tick);
         state.horizon(world);
         state.awaiting.clear();
+        state.substituted.clear();
+        state.restart = Some(tick);
         state.kept.clear();
         state.stats.resyncs += 1;
         Ok(())
     }
 
     /// Runs one tick ahead with `input`, which must carry the local player's sample in
-    /// `inputs` with `input_tick` equal to the tick the step runs, `tick() + 1`, and
-    /// `substituted` false (`InvalidData` with the predictor handed back before anything
-    /// ran, since the input tick is what gives a predicted spawn the key the server
-    /// derives, and the flag is what marks a tick the reconciliation replaced), then takes
-    /// the slot for the new tick: the world snapshot, the physics snapshot if the world has
+    /// `inputs` with `input_tick` equal to the tick the step runs, `tick() + 1`
+    /// (`InvalidData` with the predictor handed back before anything ran, since the input
+    /// tick is what gives a predicted spawn the key the server derives), then takes the
+    /// slot for the new tick: the world snapshot, the physics snapshot if the world has
     /// physics (a failed one leaves the slot without its physics part, logged and
     /// counted), the frames the hook popped in this step, `input` itself, and the record
     /// of every replicated persistent component but `Teleported` of every entity the local
@@ -397,20 +419,9 @@ impl Predictor {
     ) -> core::result::Result<Self, PredictError> {
         let tick = next(self.tick());
         let player = self.state.local.player;
-        let Some(sample) = input.inputs.get(&player).filter(|sample| sample.input_tick == tick)
-        else {
+        if input.inputs.get(&player).map(|sample| sample.input_tick) != Some(tick) {
             let error = invalid(format!(
                 "the step for tick {} carries no sample of the local player for that input tick",
-                tick.0
-            ));
-            return Err(PredictError { error, predictor: Some(self) });
-        };
-        // The ring's flag is what marks a tick the reconciliation replaced, so a repeated
-        // report of it is skipped; the client's own sample never carries it.
-        if sample.substituted {
-            let error = invalid(format!(
-                "the local player's sample for tick {} is marked substituted, which only the \
-                 server's are",
                 tick.0
             ));
             return Err(PredictError { error, predictor: Some(self) });

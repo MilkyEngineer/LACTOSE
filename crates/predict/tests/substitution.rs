@@ -8,11 +8,11 @@
 mod common;
 
 use common::*;
-use lactose_core::{ErrorKind, Tick};
+use lactose_core::Tick;
 use lactose_input::PlayerInput;
 use lactose_net_api::StagedFrame;
-use lactose_predict::{CorrectionCause, ResyncReason};
-use lactose_sim::TickInput;
+use lactose_predict::{CorrectionCause, Reconciled, ResyncReason};
+use lactose_sim::TICK_RATE_HZ;
 
 /// What the player sends: walking, with a jump pressed at 14 and held through 16.
 fn sample(tick: u32) -> PlayerInput {
@@ -309,7 +309,7 @@ fn a_substitution_repeated_within_and_across_calls_counts_once() {
     assert_eq!(rig.hash(), reference.hash());
 }
 
-/// A repeat is known by the ring's sample of its own tick, so one whose previous tick has
+/// A repeat is known by the ticks the predictor acted on, so one whose previous tick has
 /// left the ring is skipped, not `TooOld`.
 #[test]
 fn a_repeat_whose_previous_tick_left_the_ring_is_skipped() {
@@ -335,16 +335,176 @@ fn a_repeat_whose_previous_tick_left_the_ring_is_skipped() {
     assert_eq!(rig.p().stats().substitutions, 1);
 }
 
-/// The ring's sample marks a tick the reconciliation replaced; a step whose local sample
-/// says the server substituted it is refused, since the client never sends one.
+/// What the server applied when it lost 14 and 15: 15's substitute continues 14's.
+fn lost_14_15(tick: u32) -> PlayerInput {
+    match tick {
+        14 | 15 => sample(13).substitute(),
+        16 => sample(16).after_substitute(&sample(13).substitute()),
+        _ => sample(tick),
+    }
+}
+
+fn points(reconciled: &Reconciled) -> Vec<(Tick, CorrectionCause)> {
+    reconciled.corrections.iter().map(|c| (c.tick, c.cause)).collect()
+}
+
+/// The receiver's split under the rule: the frame of 14 reports 14; the frame of 15 holds
+/// region changes alone (an empty frame here: predict reads none of them) and makes the
+/// repair of 15 due; the frame of 16, the first that may carry 15, reports 14 again and 15
+/// for the first time. A repaired tick is no repeat. Each frame a call of its own.
 #[test]
-fn a_local_sample_marked_substituted_is_refused() {
+fn a_repaired_tick_first_reported_after_a_split_frame_is_substituted_across_calls() {
     let mut rig = Rig::joined();
-    let mut sample = moving(1).to_player_sample(Tick(12));
-    sample.substituted = true;
-    let mut input = TickInput::default();
-    input.inputs.insert(PLAYER, sample);
-    let error = rig.try_step_with(input).expect_err("refused");
-    assert_eq!(error.kind(), ErrorKind::InvalidData);
-    assert_eq!(rig.tick(), Tick(11));
+    let mut reference = Rig::joined();
+    rig.step_to(20, sample);
+    reference.step_to(23, lost_14_15);
+    rig.push(substituted(14, &[14]));
+    rig.step(sample(21));
+    let first = rig.reconcile();
+    rig.push(StagedFrame::new(Tick(15)));
+    rig.step(sample(22));
+    let split = rig.reconcile();
+    rig.push(substituted(16, &[14, 15]));
+    rig.step(sample(23));
+    let second = rig.reconcile();
+    assert_eq!(points(&first), vec![(Tick(13), CorrectionCause::Substituted)]);
+    assert_eq!(points(&split), vec![(Tick(14), CorrectionCause::Repaired)]);
+    assert_eq!(points(&second), vec![(Tick(14), CorrectionCause::Substituted)]);
+    assert_eq!(second.resync, None);
+    assert_eq!(rig.p().stats().substitutions, 2);
+    assert_eq!(rig.hash(), reference.hash());
+}
+
+/// The same three frames in one call.
+#[test]
+fn a_repaired_tick_first_reported_after_a_split_frame_is_substituted_in_one_call() {
+    let mut rig = Rig::joined();
+    let mut reference = Rig::joined();
+    rig.step_to(20, sample);
+    reference.step_to(21, lost_14_15);
+    rig.push(substituted(14, &[14]));
+    rig.push(StagedFrame::new(Tick(15)));
+    rig.push(substituted(16, &[14, 15]));
+    rig.step(sample(21));
+    let reconciled = rig.reconcile();
+    assert_eq!(points(&reconciled), vec![(Tick(13), CorrectionCause::Substituted)]);
+    assert_eq!(rig.p().stats().substitutions, 2);
+    assert_eq!(rig.hash(), reference.hash());
+}
+
+/// A repeat after the slot of its own tick left the ring is skipped, not `TooOld`. The
+/// repair of 19 is due with the frame of 19, in a call of its own: a repair due only once
+/// its previous slot has left the ring is `TooOld`, as a first report is.
+#[test]
+fn a_repeat_after_its_own_slot_left_the_ring_is_skipped() {
+    let mut rig = Rig::joined();
+    rig.p_mut().set_depth(6).unwrap();
+    rig.step_to(20, sample);
+    rig.push(substituted(18, &[18]));
+    rig.step(sample(21));
+    assert_eq!(points(&rig.reconcile()), vec![(Tick(17), CorrectionCause::Substituted)]);
+    rig.push(substituted(19, &[18]));
+    rig.step(sample(22));
+    assert_eq!(points(&rig.reconcile()), vec![(Tick(18), CorrectionCause::Repaired)]);
+    rig.step(sample(23));
+    rig.push(substituted(23, &[18]));
+    rig.step(sample(24));
+    assert_eq!(rig.p().ring().oldest(), Some(Tick(19)));
+    let hash = rig.hash();
+    let repeated = rig.reconcile();
+    assert_eq!(repeated.resync, None);
+    assert!(repeated.corrections.is_empty());
+    assert_eq!(rig.hash(), hash);
+    assert_eq!(rig.p().stats().substitutions, 1);
+}
+
+/// A full frame between the first report and its repeats: the repeats are at or before
+/// the restart, which is remembered after its slot has left the ring.
+#[test]
+fn a_repeat_after_a_full_frame_whose_restart_left_the_ring_is_skipped() {
+    let mut rig = Rig::joined();
+    rig.p_mut().set_depth(6).unwrap();
+    rig.step_to(20, sample);
+    rig.push(substituted(18, &[18]));
+    rig.step(sample(21));
+    assert_eq!(points(&rig.reconcile()), vec![(Tick(17), CorrectionCause::Substituted)]);
+    rig.push(join_frame(Tick(19)));
+    rig.step(sample(22));
+    assert!(rig.reconcile().corrections.is_empty());
+    assert_eq!(rig.p().ring().rebuilt_at(), Some(Tick(22)));
+    rig.push(substituted(20, &[18]));
+    rig.step(sample(23));
+    let held = rig.reconcile();
+    assert_eq!(held.resync, None);
+    assert!(held.corrections.is_empty());
+    rig.step_to(28, sample);
+    rig.push(substituted(27, &[18]));
+    rig.step(sample(29));
+    assert_eq!(rig.p().ring().oldest(), Some(Tick(24)));
+    assert_eq!(rig.p().ring().rebuilt_at(), None);
+    let late = rig.reconcile();
+    assert_eq!(late.resync, None);
+    assert!(late.corrections.is_empty());
+    assert_eq!(rig.p().stats().substitutions, 1);
+}
+
+/// Outside the rule: 15 first, then 14 first in a later frame. The repair of 15 that 14
+/// arms falls on a tick already substituted, so it substitutes 15 again, continuing 14's
+/// substitute, and arms the repair of 16; the next repeat of 15 is skipped.
+#[test]
+fn an_older_substitution_first_reported_after_a_newer_one_substitutes_the_newer_again() {
+    let mut rig = Rig::joined();
+    let mut reference = Rig::joined();
+    rig.step_to(20, sample);
+    reference.step_to(23, lost_14_15);
+    rig.push(substituted(15, &[15]));
+    rig.step(sample(21));
+    let first = rig.reconcile();
+    rig.push(substituted(16, &[14, 15]));
+    rig.step(sample(22));
+    let older = rig.reconcile();
+    rig.push(substituted(17, &[15]));
+    rig.step(sample(23));
+    let repeated = rig.reconcile();
+    assert_eq!(points(&first), vec![(Tick(14), CorrectionCause::Substituted)]);
+    assert_eq!(points(&older), vec![(Tick(13), CorrectionCause::Substituted)]);
+    assert!(repeated.corrections.is_empty());
+    assert_eq!(repeated.resync, None);
+    assert_eq!(rig.p().stats().substitutions, 2);
+    assert_eq!(rig.hash(), reference.hash());
+}
+
+/// How late a repeat may come at the default depth: while the ring holds its tick's slot
+/// or for ten seconds of ticks after it, whichever is longer, it is skipped; later, once
+/// its slot has left the ring, it reads as a first report and is `TooOld`.
+#[test]
+fn a_repeat_is_skipped_for_ten_seconds_after_its_tick() {
+    let window = 10 * TICK_RATE_HZ;
+    for lag in [30, 58, 59, 60, 61, 62, 70, window - 1, window, window + 1] {
+        let mut rig = Rig::joined();
+        rig.step_to(20, sample);
+        rig.push(substituted(18, &[18]));
+        rig.step(sample(21));
+        rig.reconcile();
+        rig.push(StagedFrame::new(Tick(19)));
+        rig.step(sample(22));
+        rig.reconcile();
+        // The repeat in the frame of 16 + lag, popped at 18 + lag.
+        rig.step_to(18 + lag - 1, sample);
+        rig.push(substituted(16 + lag, &[18]));
+        rig.step(sample(18 + lag));
+        let repeated = rig.reconcile();
+        if lag <= window {
+            assert_eq!(repeated.resync, None, "a repeat popped {lag} ticks after its tick");
+            assert!(repeated.corrections.is_empty());
+        } else {
+            let oldest = rig.p().ring().oldest().expect("a ring");
+            assert_eq!(
+                repeated.resync,
+                Some(ResyncReason::TooOld { frame: Tick(16 + lag), oldest }),
+                "a repeat popped {lag} ticks after its tick"
+            );
+        }
+        assert_eq!(rig.p().stats().substitutions, 1);
+    }
 }
