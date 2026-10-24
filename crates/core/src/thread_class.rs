@@ -19,9 +19,10 @@ pub enum ThreadClass {
     Audio,
     /// A thread of the physics solver pool.
     PhysicsSolver,
-    /// A thread of the file IO pool (`lactose-io`): asleep in a system call for most of its
-    /// life, decompressing between. Utility priority like `Background`, as its own class so
-    /// a platform that pins by class and index never puts it on a background worker's core.
+    /// A thread of the file IO pool (`lactose-io`): it makes blocking file system calls and
+    /// decodes nothing, since asset decode runs on background workers. Utility priority like
+    /// `Background`, as its own class so a platform that pins by class and index never puts
+    /// it on a background worker's core.
     Io,
 }
 
@@ -32,9 +33,9 @@ impl ThreadClass {
     /// class is best effort: an operating system that refuses it yields an error of kind
     /// `Platform`, and the thread still runs correctly at its default priority.
     ///
-    /// Enter a class once, at thread start. On Linux the background class lowers priority
-    /// in a way an unprivileged thread cannot undo, so a later `enter` of another class
-    /// leaves it lowered. On Windows the class sets thread priority only; steering
+    /// Enter a class once, at thread start. On Linux the two utility classes, `Background`
+    /// and `Io`, lower priority in a way an unprivileged thread cannot undo, so a later
+    /// `enter` of another class leaves it lowered. On Windows the class sets thread priority only; steering
     /// background threads to efficiency cores is an open item in `docs/verification.md`.
     pub fn enter(self) -> Result<()> {
         fp::set_deterministic();
