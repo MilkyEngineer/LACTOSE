@@ -223,6 +223,8 @@ owns its data and may be cancelled by drop. Waiting is an `.await`.
 - Background workers run on efficiency cores at utility QoS (two low-priority threads on
   homogeneous CPUs). They run asset decode, compression, and long futures. Background CPU
   work yields at 0.5 millisecond slices.
+- IO threads (`ThreadClass::Io`, the pool in `io`) run at utility QoS, half the cores on client and
+  server (section 9.7), separate from the background workers.
 - The platform thread pumps OS events. A dedicated present thread calls present so a blocking
   `nextDrawable` or FIFO present never stalls the event pump or a worker.
 
@@ -562,7 +564,8 @@ presentation, pose evaluation, VFX, audio, UI, asset IO timing and input samplin
   depends on it: the sample it quantises enters through `input`, a boundary crate. `net-host` is
   outside and no boundary crate depends on it: what crosses into the simulation is the staged
   frame of `net-api`, a boundary crate, which the network thread builds from what `net-host`
-  decodes. `ecs` depends on `task` for
+  decodes. `io` is outside the boundary; no boundary crate depends on it, directly or at any
+  depth. `ecs` depends on `task` for
   execution only and re-exports `Executor`, which every boundary crate can then name; the
   boundary lint file bans the executor's worker counts, arbitrary work, thread creation,
   deadlines and scheduling history, so what a boundary crate can do with it is run a
@@ -797,8 +800,9 @@ interaction keep it possible later. No system may hold a direct reference across
 - **Cross-boundary movement.** An entity entering a `Frozen` or unloaded region is frozen at
   the boundary and becomes part of that region's state; its body is a fixed collider until the
   region activates.
-- **Server IO** uses a blocking pool sized to half the cores, separate from the two background
-  workers, so region publish latency does not grow with player count.
+- **Server IO** uses `io`'s pool sized to half the cores (`IoConfig::for_platform`, the client's
+  default too until measured), separate from the background workers, so region publish latency does
+  not grow with player count.
 - **Packet parsing** runs on the dedicated network thread (section 5.1).
 
 ## 10. Snapshots

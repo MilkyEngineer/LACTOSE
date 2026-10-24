@@ -882,6 +882,125 @@ rationale the author supplied during the editorial pass rather than one taken fr
 - Driven by: milestone 1, the `persist` facade brief and its design reviews r1 to r5
   (2026-10-18 to 2026-10-24).
 
+**D130. The `io` facade: what sections 4, 5.1, 8.2, 9.7, 15.3, 19 and 20 left open** (§3, §4, §5.1, §8.2, §9.7, §14, §15.3, §19, §20, §21, `lactose-io`, `lactose-core`, `lactose-task`)
+- Why: the facade is written before its implementation so `asset`, `app`'s save path, `cook`
+  and the server build against the final surface; each choice below is one the sections did not
+  settle, and each is a contract in `crates/io/README.md`. The first review (D1, S1 to S4, D3,
+  M1 to M9) changed the decode's place, the replace's ordering, failure kinds and return type,
+  and three names; the second (N1 to N4) fixed how the decode slices, bounded zstd's window,
+  and made the replace's sweep per directory and per process.
+  - *Every request is a future that submits at its first poll, resolves once to all of what was
+    asked or an error, and is cancelled by drop.* Section 5.1 gives `'static` futures cancelled
+    by drop and decides nothing else. A not-started request never runs and has no side effect;
+    a started one finishes on the pool thread and discards its result there, so a dropped
+    replace never tears a slot and a dropped read never leaks a buffer; the drop never blocks.
+    Lazy submission matches the executor's own futures and costs an unpolled future nothing but
+    its allocation: its span too is created at the first poll. The cost, accepted: concurrency
+    is one task per request, since `task` has no join; a loop that awaits futures one after
+    another runs them one after another. Rules out eager submission and a completion handle
+    API.
+  - *One FIFO queue, no priority, no ordering between requests but through the caller, except
+    that replaces of one path run in submission order.* Section 9.7 sizes the pool and says
+    nothing of order. `LoadPriority` in `asset-api` orders what SILO submits; milestone 3's IO
+    budget decides whether a request carries a priority. Rules out a priority queue at
+    milestone 1.
+  - *The pool is half the cores on client and server alike.* Section 9.7 states the server's
+    rule; the client has none. `IoConfig::for_topology` is `(performance +
+    efficiency).div_ceil(2).max(1)` for both (`IoConfig::for_platform` applies it to the
+    platform's topology), and `app` may set the count with `IoConfig::new`; `IoConfig` is
+    `#[non_exhaustive]` so a later setting adds no breakage. A verification row measures the
+    client at milestone 3.
+  - *A range is read and decoded as one request at the interface: the pool reads and checks the
+    stored frame, and the decode runs in the `ReadAt` future's own poll, on the background
+    worker that polls it, as streaming zstd in slices that yield at section 5.1's 0.5 ms.*
+    Section 5.1 gives asset decode to the background workers; the review measured a decode at
+    1.3 to 12 times an uncached read of its range and 24 to 44 times a warm one (zstd 0.13.3,
+    levels 3 and 19, 256 KiB to 32 MiB ranges, on an M1), which on the pool would be CPU
+    outside the executor's core count, without a yield, keeping a pool thread from queued
+    saves. `docs/verification.md` section 3 requires only the one request, and the signatures
+    do not change: a backend with a hardware decoder still completes the whole request. Before
+    the decoded buffer is allocated the pool requires the stored range to be exactly one zstd
+    frame (`find_frame_compressed_size` equal to its length), not a skippable one, whose
+    content size is `decoded_len`; the decode checks its count. Within a slice the stream is
+    given about 64 KiB of output at a time, never the whole decoded buffer: with room for the
+    whole content and the whole frame as input, zstd takes its single-pass shortcut and decodes
+    the frame in one call, which the second review measured at 54 to 75 ms for a 32 MiB frame
+    of compressible code (levels 19 and 3, machine load about 16). Decoding in steps makes zstd
+    decode through a window buffer of its own, up to the smaller of the frame's window and its
+    content size; the context's `WindowLogMax` is set to 27 explicitly, so that buffer is at
+    most 2^27 bytes and the bound is this crate's, not zstd's default, and a frame whose window
+    exceeds 2^27 is `InvalidData`. The window buffer and the context are allocated by zstd's
+    own `malloc`, outside the global allocator, so they are not charged to `AllocTag::Io` and
+    are not among the crate's fallible allocations; zstd failing to allocate them is
+    `ResourceExhausted`, and every other zstd error is `InvalidData`. `tools/cook` must not
+    compress with a window log above 27. Rules out decoding on the pool, a `read` followed by a
+    separate decompress call, concatenated or skippable frames, and frames with a window above
+    2^27.
+  - *Buffers are allocated by the pool under `AllocTag::Io`, exactly the size asked, and owned
+    by the caller.* Loaders take `&[u8]` and build the asset, so the read buffer is a
+    transient. `MAX_READ_BYTES` (1 GiB) caps each request, not the pool; a range is checked
+    against the file's current size, and for an encoded read against the frame's header before
+    the decoded buffer is allocated, and every one of the crate's own buffers is allocated with
+    `try_reserve_exact`, so a corrupt index is an error value and never an abort (section 19).
+    zstd's window buffer and context during a decode are outside this: zstd allocates them
+    itself, and its failure to is `ResourceExhausted` too. `read_file` reads exactly the size
+    it checked and probes one more byte: a file that changes size while it is read is
+    `InvalidData`, and the caller retries. Rules out caller-provided buffers at milestone 1 and
+    a retry inside `io`.
+  - *The atomic replace is one request that takes `Vec<u8>` and hands it back on failure,
+    ordered per path, with its failure modes by kind.* Section 15.3 names the steps and not the
+    failures. A replace creates its temporary `<name>.<token><counter>.tmp` in the same
+    directory (`"."` for a bare file name) with `create_new`, trying the next counter on
+    `AlreadyExists` a bounded number of times, writes, syncs (`F_FULLFSYNC` on Apple), renames,
+    and on Unix syncs the directory. The token is eight hex digits taken once per process from
+    `std`'s randomly keyed `RandomState` over the process id and the time, and the counter
+    eight more. A failure before the rename keeps the previous content and removes the
+    temporary: `StorageFull`, `NotFound` (a missing directory, created by `app` at startup, not
+    retried) or `Io`; every failure after the rename is `Io`, with the new content in place and
+    its durability unknown, so `NotFound` and `StorageFull` always mean the slot is untouched.
+    Replaces of one path, as spelled, through one `Io` run in submission order, dropped or not,
+    through a per-path waitlist that never blocks a pool thread: the first review showed a
+    dropped, started older save landing after a newer one that resolved `Ok`. Two spellings of
+    one path, or two `Io`s, are unordered with each other: the last rename wins and neither
+    fails because of the other. The first replace into a directory through an `Io`, keyed as
+    spelled, sweeps it once, removing every `<any>.<sixteen hex digits>.tmp` whose token is not
+    this process's: the leftovers of a crash or of an earlier run, of any name. It never
+    removes a temporary of this process, so no replace removes another's, which the second
+    review showed happening under two spellings and between two `Io`s when the sweep was per
+    path. Two processes writing into one directory are unsupported, since one's sweep may
+    remove the other's temporary. `Replace` resolves to `Result<(), ReplaceFailed>`, whose
+    `bytes` are the caller's, unchanged and uncopied, so a retry after a full disk needs no
+    second copy. Rules out partial-visibility windows, cross-volume failures, temporaries that
+    accumulate, an older save overtaking a newer one, and one replace removing another's
+    temporary within a process.
+  - *The pool's threads are a new class, `ThreadClass::Io`, created through
+    `Platform::spawn_thread`.* Section 5.1 names only workers and the platform, present and
+    network threads. Utility priority like `Background`, as its own class so a platform that
+    pins by class and index never puts an IO thread on a background worker's core; each thread
+    under `AllocTag::Io` for its life; it makes file system calls and decodes nothing.
+    `Io::start` takes `&dyn Platform` and keeps nothing of the executor; a request's future is
+    woken through its `Waker`, so `block_on` and any poll loop drive it. Rules out
+    `std::thread` in `io` and a dependency on `Executor`.
+  - *The cooker uses the same futures through `Executor::block_on`.* No second, blocking API;
+    outputs are written whole with `replace`. Rules out a sync facade.
+  - *Backends sit behind a private `Backend` trait (section 20); the blocking pool is the
+    reference and io_uring and IOCP are named places; the crate forbids `unsafe` and keeps
+    `SAFETY.md` for the completion backends.* On Windows the blocking backend's synchronous
+    handles serialise the reads on one `File`; this is stated, and a milestone 3 row decides
+    between a handle per pool thread and IOCP. Rules out an `io-api` crate and `unsafe` in the
+    reference backend.
+  - *Errors: each request lists the kinds it can return.* A system call's error maps through
+    `From<std::io::Error>`, with `Unsupported` (`ENOTSUP` from `F_FULLFSYNC`) and `Network` (a
+    network file system's timeout) made `Io`, since `app` has no file policy for either; a zstd
+    error is mapped from its code, never through `From`. Rules out a kind `app` cannot act on.
+  - *One span per request at target `io`, level `INFO`*, created at the first poll, entered on
+    the pool thread for the work and in each decode slice, with the names and fields the README
+    tables (`io.open` carries `file` from its creation). `io` has no codename, so its target is
+    the role name: an exception to section 19's "Log targets are the codenames", with the
+    precedent of `physics` for `physics-api`'s contract (D119). Rules out a codename for a
+    crate without one.
+- Driven by: milestone 1, the `io` facade brief and its design reviews r1 and r2 (2026-10-24).
+
 ## 8. Physics and animation
 
 **D58. One physics world per server process, determinism and parallel together, pinned exactly** (§16, §2 Physics)
