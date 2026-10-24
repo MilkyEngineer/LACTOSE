@@ -551,6 +551,12 @@ presentation, pose evaluation, VFX, audio, UI, asset IO timing and input samplin
   detection selects correctly rounded paths only and is allowlisted.
 - No wall-clock time. `Instant` and `SystemTime` are banned; `Duration` as a value type is
   fine. Tick index and fixed delta only.
+- No file system, process environment, subprocess or network access: what the simulation reads
+  enters as a tick input. The boundary lint file bans `std::fs`, `std::env`, `std::net`,
+  `std::process::Command`, standard input and what the process learns of itself (its ids, its
+  terminal, its working directory, the core count, the backtrace variables); a test that needs one
+  lifts the lint with `#[expect]` on its one item. Every crate of `[boundary_internal] any` carries
+  these bans too, and a boundary crate's tests are held to the dependency allowlist as the crate is.
 - No thread-local state. No global mutable state. The one exception is the allocation tag
   in `core`, which the allocator alone reads and no simulation result can observe.
 - Hash maps are `core::FixedHashMap`. Iteration order is never observable.
@@ -642,13 +648,13 @@ replays exactly. The one-row capacity uses a matching small slab.
 Static enforcement uses stable tooling: `clippy.toml` per boundary crate with
 `disallowed-methods` and `disallowed-types` (thread-locals are banned through
 `std::thread::LocalKey`, since a local exception cannot reach an item macro); the boundary
-dependency allowlist in `crate-tiers.toml`, checked by `cargo xtask boundary`; `cargo-deny` with
-`multiple-versions = "deny"` for shared crates; `cargo xtask vendor` for each crate built from
-`vendor/` (section 8.2): offline, the copy is its patch applied to its record and the patch is
-within the rule; online, the record is re-derived from the crates.io archive and the advisory
-check runs over the upstream versions, which `cargo-deny` skips behind a path source. The two
-proc-macro crates carry the boundary `clippy.toml` as well, since the code they emit is
-compiled inside boundary crates.
+dependency allowlist in `crate-tiers.toml`, checked by `cargo xtask boundary`, directly and through
+the workspace closure; `cargo-deny` with `multiple-versions = "deny"` for shared crates; `cargo
+xtask vendor` for each crate built from `vendor/` (section 8.2): offline, the copy is its patch
+applied to its record and the patch is within the rule; online, the record is re-derived from the
+crates.io archive and the advisory check runs over the upstream versions, which `cargo-deny` skips
+behind a path source. The two proc-macro crates carry the boundary `clippy.toml` as well, since the
+code they emit is compiled inside boundary crates.
 No custom lint crate. Miri runs on nightly as the one exception to the stable-toolchain rule.
 Because Cargo resolves features per build, CI dumps `cargo tree -e features` for the boundary
 dependencies of each shipped binary, the SOUR test crate among them, and requires them

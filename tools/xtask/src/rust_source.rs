@@ -10,8 +10,9 @@
 pub(crate) struct Attribute {
     /// True for `#![...]`, false for `#[...]`.
     pub(crate) inner: bool,
-    /// The text between the brackets with whitespace removed and the contents of string
-    /// literals emptied, so `allow(dead_code, reason = "a, b")` reads `allow(dead_code,reason="")`.
+    /// The text between the brackets with whitespace and comments removed and the contents of
+    /// string literals emptied, so `allow(dead_code /* c */, reason = "a, b")` reads
+    /// `allow(dead_code,reason="")`.
     pub(crate) body: String,
     /// The line the attribute starts on, from 1.
     pub(crate) line: usize,
@@ -20,6 +21,9 @@ pub(crate) struct Attribute {
     pub(crate) leading: bool,
     /// True for an outer attribute whose item is a `mod`.
     pub(crate) on_module: bool,
+    /// For an outer attribute on a `mod`, the file a `path = "..."` in it names, as written:
+    /// `#[path = "..."]` itself, or the same inside a `cfg_attr`.
+    pub(crate) path: Option<String>,
 }
 
 /// Every attribute of `source`, in order.
@@ -40,12 +44,15 @@ pub(crate) fn attributes(source: &str) -> Vec<Attribute> {
         } else if let Some((inner, open)) = attribute_start(bytes, i)
             && let Some(end) = skip_brackets(source, open)
         {
+            let text = &source[open + 1..end - 1];
+            let on_module = !inner && next_item_is_module(source, end);
             attributes.push(Attribute {
                 inner,
-                body: code_only(&source[open + 1..end - 1]),
+                body: code_only(text),
                 line: source[..i].matches('\n').count() + 1,
                 leading: inner && !seen_item,
-                on_module: !inner && next_item_is_module(source, end),
+                on_module,
+                path: on_module.then(|| path_value(text)).flatten(),
             });
             seen_item |= !inner;
             i = end;
@@ -176,7 +183,7 @@ fn skip_raw_string(bytes: &[u8], i: usize) -> Option<usize> {
 }
 
 /// `i` is at `[` or `(`. Returns the index after the matching close, skipping string
-/// literals, or `None` if it never closes.
+/// literals and comments, or `None` if it never closes.
 fn skip_brackets(source: &str, mut i: usize) -> Option<usize> {
     let bytes = source.as_bytes();
     let (open, close) = if bytes[i] == b'(' { (b'(', b')') } else { (b'[', b']') };
@@ -184,6 +191,13 @@ fn skip_brackets(source: &str, mut i: usize) -> Option<usize> {
     while i < bytes.len() {
         if bytes[i] == b'"' {
             i = skip_string(bytes, i);
+            continue;
+        }
+        // `/` is ASCII, so `i` is a character boundary for `skip_comment`.
+        if bytes[i] == b'/'
+            && let Some(end) = skip_comment(source, i)
+        {
+            i = end;
             continue;
         }
         if bytes[i] == open {
@@ -199,7 +213,7 @@ fn skip_brackets(source: &str, mut i: usize) -> Option<usize> {
     None
 }
 
-/// `text` without whitespace and with the contents of its string literals removed.
+/// `text` without whitespace or comments and with the contents of its string literals removed.
 fn code_only(text: &str) -> String {
     let bytes = text.as_bytes();
     let mut out = String::new();
@@ -208,6 +222,8 @@ fn code_only(text: &str) -> String {
         if bytes[i] == b'"' {
             out.push_str("\"\"");
             i = skip_string(bytes, i);
+        } else if let Some(end) = skip_comment(text, i) {
+            i = end;
         } else {
             let c = text[i..].chars().next().unwrap_or(' ');
             if !c.is_whitespace() {
@@ -217,6 +233,61 @@ fn code_only(text: &str) -> String {
         }
     }
     out
+}
+
+/// The string a `path = ...` key in `text`, an attribute's contents, names, wherever the key
+/// stands. Of the escapes only `\\` and `\"` are undone; a path needs no other.
+fn path_value(text: &str) -> Option<String> {
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let key = bytes[i..].starts_with(b"path")
+            && (i == 0 || !is_ident(bytes[i - 1]))
+            && !bytes.get(i + 4).copied().is_some_and(is_ident);
+        if key {
+            let equals = skip_whitespace(bytes, i + 4);
+            if bytes.get(equals) == Some(&b'=') {
+                return string_value(text, skip_whitespace(bytes, equals + 1));
+            }
+        }
+        // A literal starts only at an ASCII byte, so stepping by bytes slices no character.
+        i = skip_literal(text, i).unwrap_or(i + 1);
+    }
+    None
+}
+
+/// The contents of the string or raw string literal that starts at `at`.
+fn string_value(text: &str, at: usize) -> Option<String> {
+    let bytes = text.as_bytes();
+    let (first, end, hashes) = match bytes.get(at)? {
+        b'"' => (at + 1, skip_string(bytes, at), 0),
+        b'r' => {
+            let hashes = bytes[at + 1..].iter().take_while(|b| **b == b'#').count();
+            (at + 2 + hashes, skip_raw_string(bytes, at)?, hashes)
+        }
+        _ => return None,
+    };
+    // The closing quote, which an unterminated literal lacks.
+    let last = end.checked_sub(1 + hashes).filter(|&last| last >= first)?;
+    if bytes.get(last) != Some(&b'"') {
+        return None;
+    }
+    let raw = &text[first..last];
+    if bytes[at] == b'r' {
+        return Some(raw.to_owned());
+    }
+    let mut value = String::new();
+    let mut chars = raw.chars();
+    while let Some(c) = chars.next() {
+        match (c, chars.clone().next()) {
+            ('\\', Some(escaped @ ('\\' | '"'))) => {
+                value.push(escaped);
+                chars.next();
+            }
+            _ => value.push(c),
+        }
+    }
+    Some(value)
 }
 
 /// Whether the item after the outer attribute that ends at `from` is a `mod`, looking past
@@ -273,8 +344,11 @@ mod tests {
 
     #[test]
     fn bodies_lose_whitespace_and_string_contents() {
-        let source = "//! Docs with a ' quote.\n#! [ allow( dead_code , reason = \"a ] b, warnings\" ) ]\nfn f<'a>(c: &'a str) -> char { '\\'' }\n#[cfg(test)] fn g() { let _ = '\"'; }\n#[x]\nfn h() {}\n";
-        assert_eq!(bodies(source), ["allow(dead_code,reason=\"\")", "cfg(test)", "x"]);
+        let source = "//! Docs with a ' quote.\n#! [ allow( dead_code , reason = \"a ] b, warnings\" ) ]\nfn f<'a>(c: &'a str) -> char { '\\'' }\n#[cfg(test)] fn g() { let _ = '\"'; }\n#[x]\nfn h() {}\n#[allow(a /* ] \" */, // ]\n b)]\nfn i() {}\n";
+        assert_eq!(
+            bodies(source),
+            ["allow(dead_code,reason=\"\")", "cfg(test)", "x", "allow(a,b)"]
+        );
         assert_eq!(attributes(source)[0].line, 2);
         assert_eq!(attributes(source)[2].line, 5);
     }
@@ -310,5 +384,26 @@ mod tests {
         assert!(!on_module("#[a] struct Model;"));
         assert!(!on_module("#[a]"));
         assert!(!attributes("#![a]\nmod m;")[0].on_module, "inner attributes sit on no item");
+    }
+
+    #[test]
+    fn an_attribute_on_a_module_knows_the_file_it_names() {
+        let path = |source: &str| attributes(source)[0].path.clone();
+        let named = |source: &str, file: &str| assert_eq!(path(source).as_deref(), Some(file));
+        named("#[path = \"../a/protocol.rs\"]\nmod protocol;", "../a/protocol.rs");
+        named("#[cfg_attr(unix, path = \"u.rs\")] pub mod m;", "u.rs");
+        named("#[path = r#\"raw \"x\".rs\"#] mod m;", "raw \"x\".rs");
+        named("#[path = \"a\\\\b \\\".rs\"] mod m;", "a\\b \".rs");
+        named("#[path=\"é/ü.rs\"] mod m;", "é/ü.rs");
+        for source in [
+            "#[doc = \"path = \\\"no.rs\\\"\"] mod m;",
+            "#[module_path = \"no.rs\"] mod m;",
+            "#[path = \"no.rs\"] fn f() {}",
+            "#![path = \"no.rs\"] mod m;",
+            "#[path] mod m;",
+            "#[path = \"unterminated] mod m;",
+        ] {
+            assert_eq!(attributes(source).first().and_then(|a| a.path.clone()), None, "{source:?}");
+        }
     }
 }

@@ -27,6 +27,10 @@
 //! A configuration that two selected modes share (every mode is measured against the same
 //! baseline) is launched once and its records reused, except where the mode is the repeat.
 
+#[allow(
+    unfulfilled_lint_expectations,
+    reason = "the boundary lints these expectations name are configured only in the boundary crates that include this file"
+)]
 pub mod protocol;
 pub mod stand_in;
 

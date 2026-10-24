@@ -3766,6 +3766,66 @@ relayed by an event when it acts on another body** (§6.1, §10, `lactose-ecs`,
     applied (11 ulps after 60 ticks, 258 after 600, at eight-byte scalars). The README states
     this bound instead of an exact end.
 
+**D132. The boundary's workspace closure, its tests, and its bans on the outside world** (§8.2, §8.3, `crate-tiers.toml`, `tools/xtask`, every boundary crate's `clippy.toml`, `lactose-reflect`, `lactose-asset-api`)
+- Why: the io facade's review (D130, finding D2) found that `lactose-io`, added to an
+  allowlisted crate (`asset-api`), reached five boundary crates unreported, since `cargo xtask
+  boundary` judged only direct workspace edges; and a boundary crate could reach files, the
+  environment and the network through std itself, which no lint banned. The reviews of the fix
+  (round 1: S1, S2, M3 to M7; round 2: four minors) widened the bans, refused dev edges and
+  closed the scan's blind spots.
+  - *Every workspace crate a boundary crate reaches through normal and build edges, at any
+    depth, through crates outside the boundary, is a boundary crate or one
+    `[boundary_internal]` lets that crate name.* A boundary crate on the way is not passed
+    through: its own reach is judged as its own, so `task`, which `ecs` alone may name, reaches
+    every crate that depends on `ecs` without a finding, and a refused crate behind `task` is
+    `ecs`'s finding. Rules out judging direct edges only.
+  - *A boundary crate's tests are held to the same rule.* Section 8.2 says "directly or at any
+    depth", and the tests run under SOUR. A workspace dev-dependency must be one the crate may
+    compile, a `[test_support]` crate or one of `[boundary_internal] dev`, which names
+    `lactose-task` for the SOUR executor. What such a crate compiles is judged at depth against
+    the same list; a boundary crate a test names is not a test root, its reach being its own.
+    Cargo never compiles a dependency's dev-dependencies, so only the crate's own dev edges are
+    followed. Rules out leaving workspace dev edges to the tier check, which let a test read
+    files through `io` with no annotation while the same test must `#[expect]` `std::fs`.
+    Third-party crates a test compiles are still judged at the direct edge only
+    (`[boundary_third_party.direct]` `dev`).
+  - *The boundary lint file bans the std routes out.* It bans:
+    - `std::fs`: its free functions, the `Path` methods that touch the file system, `File`,
+      `OpenOptions`, `DirBuilder` and the platform extensions;
+    - `std::env`: every function;
+    - `std::net`: the socket types, the Unix sockets and `to_socket_addrs`;
+    - `std::process::Command` and standard input;
+    - what the process learns of itself: `process::id`, `parent_id`, `IsTerminal::is_terminal`,
+      the working directory behind `path::absolute`, `available_parallelism` and
+      `Backtrace::capture`.
+
+    Clippy matches items, not modules, so each route is its own entry, and `cargo xtask
+    boundary` requires a sample of them. `std::thread::spawn` is left to a later change. Rules
+    out a module-level ban, which clippy cannot express.
+  - *A crate of `[boundary_internal] any` outside the boundary (`reflect` and `asset-api`
+    today, `present-api` once it exists) carries a `clippy.toml` whose file, environment,
+    subprocess and network entries are exactly the reference's.* It compiles into every
+    boundary crate, so a `std::fs::read` in it is D2 without `io`. The check selects those
+    entries by path prefix, compares them entry by entry as parsed TOML, and a unit test holds
+    the prefixes to the reference's entries that cite section 8.2. The float and executor bans
+    are not required of it. It is held to the attribute, `[lints]` and `.clippy.toml` checks a
+    boundary crate is. Rules out a byte-identical copy, which would impose the float bans, and
+    moving the crates into `[boundary]`.
+  - *`#[expect]` on one item is the only way to lift a boundary lint, in a boundary crate, a
+    crate of `[lint_file_carriers]` or a crate of `[boundary_internal] any`.* An `allow` or
+    `warn` on an item is now a finding too, since only an expectation fails once the item no
+    longer needs it. The scan knows the lints' old names (`clippy::disallowed_method`,
+    `clippy::disallowed_type`), which clippy still honours, and ignores comments inside an
+    attribute. It reads every file a `#[path]` names (also inside `cfg_attr`), resolved against
+    the including file's directory, wherever it lives: the SOUR protocol in `tools/xtask`
+    reaches seven boundary crates' tests that way (anim, input, net-api, physics-api,
+    physics-rapier, predict, sim). A named file the scan cannot read is a finding. The
+    protocol's items expect the bans, and the `mod protocol` declarations outside the boundary
+    (in `tools/xtask`, in `net-host`'s tests and in `app`'s tests) allow the expectations left
+    unfulfilled there.
+- Driven by: the io facade's review (D130, finding D2) and the boundary-closure reviews r1 to
+  r3 (2026-10-24).
+
 ## 10. Review history
 
 - **Revision 1** (`a29af04`): the design baseline.
