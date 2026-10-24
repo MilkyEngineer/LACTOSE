@@ -139,9 +139,10 @@ fn apply_root_motion(motion: &RootMotion, pos: Mut<Transform>) {
 }
 
 /// The movement sketch for a dynamic character (the spike's capsule, `ROTATION_X |
-/// ROTATION_Z` locked): the root motion as this tick's velocity, linear and angular, so the
-/// solver moves and turns the body with no placement and no `Teleported`. A game has one
-/// of the two movement sketches; this sketch has both, ordered.
+/// ROTATION_Z` locked): the root motion as this tick's horizontal and yaw velocity, so the
+/// solver moves and turns the body with no placement and no `Teleported`; the row's
+/// vertical velocity, the fall the solver accumulated, is kept, and a jump is the game's
+/// write to it. A game has one of the two movement sketches; this sketch has both, ordered.
 #[system(
     name = "sketch::drive_capsule",
     worlds = [server, prediction],
@@ -149,7 +150,7 @@ fn apply_root_motion(motion: &RootMotion, pos: Mut<Transform>) {
     after = apply_root_motion
 )]
 fn drive_capsule(dt: Res<TickDelta>, motion: &RootMotion, pos: &Transform, vel: Mut<Velocity>) {
-    let next = motion.velocity(pos, dt.0);
+    let next = motion.velocity(pos, &vel, dt.0);
     vel.set_if_neq(next);
 }
 
@@ -173,11 +174,13 @@ fn pickups(hp: &Health, root: &Transform) {
 }
 
 /// The ragdoll sketch: bone rows spawned from the pose when the character gets them, and
-/// made limp when it dies. The helpers record commands on other rows, so the kernel
-/// declares what they write.
+/// made limp when it dies. Server-only, as every caller of the two helpers is: bone rows
+/// exist in the server world alone, and a prediction world's limp character keeps an empty
+/// pose that presentation ragdolls. The helpers record commands on other rows, so the
+/// kernel declares what they write.
 #[system(
     name = "sketch::ragdoll",
-    worlds = [server, prediction],
+    worlds = [server],
     in_set = HITS,
     writes = [Bones, BoneLink, RigidBody]
 )]

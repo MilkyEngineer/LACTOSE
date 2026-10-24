@@ -24,9 +24,9 @@
 //!   the root-local [`SimPose`]; the game reads them after [`sets::EVALUATE`]
 //!   ([`AnimState::phase_crossed`] is section 6.1's `footsteps` test) and applies the root
 //!   motion itself.
-//! - In `Stage::Post`, after the physics write-back, the bone rows of a ragdoll
-//!   ([`Bones`], [`BoneLink`]) are swept to the pose or, limp, drive it; a reader of the
-//!   stepped pose is in a set after [`sets::BONES`].
+//! - In `Stage::Post`, after the physics write-back and in the server world alone, the
+//!   bone rows of a ragdoll ([`Bones`], [`BoneLink`]) are swept to the pose or, limp, drive
+//!   it; a reader of the stepped pose is in a set after [`sets::BONES`].
 //! - The authored data are three simulation asset kinds, [`Clip`], [`StateMachine`] and
 //!   [`Skeleton`], read from the region's exact-version table; their loaders are pure
 //!   decoders.

@@ -297,11 +297,13 @@ pub struct BoneBody {
     /// `body_type` says here.
     pub body: RigidBody,
     /// The collider, placed in the bone's space. Its `groups` follow the bone rule
-    /// (`README.md`, "Bones and ragdolls"): a bone collider's `filter` admits none of its
-    /// own `membership` bits, so no bone touches a bone, its owner's or another's, and the
-    /// game keeps the character capsule's groups and the bone groups disjoint; what hits a
-    /// bone is a query, a sensor or a weapon collider in a group the bone admits.
-    /// [`Skeleton::validate`] checks the first half.
+    /// (`README.md`, "Bones and ragdolls"), which is on the skeleton's bone group set, not
+    /// on one collider: over the skeleton's bodies, no `filter` meets any `membership`,
+    /// which [`Skeleton::validate`] checks, so no two of its bones touch; the game gives
+    /// every skeleton's bones the one bone group set, so no two characters' bones touch;
+    /// and a bone's `filter` excludes the character capsule's `membership`, so no bone
+    /// touches a capsule. What hits a bone is a query, a sensor or a weapon collider in a
+    /// group the bone's filter admits and whose filter admits the bone's membership.
     pub collider: Collider,
     /// The joint to the nearest ancestor bone that has a body, or `None` for the ragdoll's
     /// root body.
@@ -368,8 +370,9 @@ impl Skeleton {
     /// zero without a parent and every other bone's parent before it; no two bones with one
     /// key and no two with one role other than `Other`; every socket on a bone in range; a
     /// joint only on a bone that has a body, and a body's joint reaching an ancestor with a
-    /// body (the ragdoll's root body alone has none); every body's collider with
-    /// `groups.membership & groups.filter == 0` (the bone rule, [`BoneBody::collider`]);
+    /// body (the ragdoll's root body alone has none); the OR of every body's
+    /// `groups.membership` and the OR of every body's `groups.filter` sharing no bit (the
+    /// bone rule, [`BoneBody::collider`]);
     /// every rest rotation a unit quaternion and every scalar finite. `InvalidData`
     /// otherwise, naming the first failure.
     pub fn validate(&self) -> Result<()> {

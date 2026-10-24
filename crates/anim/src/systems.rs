@@ -2,9 +2,10 @@
 //! sections 5.2, 6.1 and 17; `lactose-sim`'s `Stage::Simulation` and `Stage::Post`). In
 //! `Stage::Simulation`: the advance, which runs each character's state machine and phase
 //! from its parameters and writes its root motion and events; and the evaluation, which
-//! writes the root-local sim pose. In `Stage::Post`, after the physics write-back: a limp
-//! ragdoll's bone rows report where the step left them, the owner's pose is fitted to
-//! them, and an animated character's bone rows are swept to its pose. The module is
+//! writes the root-local sim pose. In `Stage::Post`, after the physics write-back and in
+//! the server world alone, which alone has bone rows: a limp ragdoll's bone rows report
+//! where the step left them, the owner's pose is fitted to them, and an animated
+//! character's bone rows are swept to its pose. The module is
 //! private: [`register_systems`] places all five, and a consumer orders itself against
 //! them through [`sets`] alone.
 
@@ -39,7 +40,9 @@ pub mod sets {
     pub static EVALUATE: SystemSet = SystemSet::new("anim::evaluate").after(&[&ADVANCE]);
 
     /// A limp ragdoll's bone rows reporting their stepped transforms
-    /// (`anim::report_bones`), in `Stage::Post` after the physics write-back.
+    /// (`anim::report_bones`), in `Stage::Post` after the physics write-back. This set and
+    /// the two after it hold systems in the server world alone and are empty in a
+    /// prediction world, which has no bone rows.
     pub static REPORT: SystemSet = SystemSet::new("anim::report");
 
     /// The ragdoll fit (`anim::fit_ragdoll`): a limp character's `SimPose` rewritten from
@@ -72,8 +75,10 @@ pub fn register_types(types: &mut TypeTable) -> Result<()> {
 
 /// Adds this crate's five systems and six sets: the advance and the evaluation to
 /// `Stage::Simulation`, the report, the fit and the sweep to `Stage::Post`. What `app`
-/// passes to `SimulationBuilder::systems`. Every system declares
-/// `worlds = [server, prediction]`, so a `Client` registration adds the sets alone.
+/// passes to `SimulationBuilder::systems`. The advance and the evaluation declare
+/// `worlds = [server, prediction]` and the three `Stage::Post` systems `worlds = [server]`,
+/// so a prediction registration adds the `Stage::Post` sets with nothing in them and a
+/// `Client` registration adds the sets alone.
 pub fn register_systems(registration: &mut Registration) {
     registration
         .stage(Stage::Simulation)
@@ -97,9 +102,9 @@ pub fn register_systems(registration: &mut Registration) {
 /// state's rate, writes the root motion the clip moved by between the two phases, emits an
 /// `AnimEvent` for every authored event the advance passed, and clears the triggers it
 /// read. Writes `AnimParams` only when a trigger was set. With the machine missing from the
-/// region's table, leaves `AnimState` and `AnimParams` as they are, writes
-/// `RootMotion::ZERO` and emits nothing; with the state's clip missing, the same after the
-/// state has been set.
+/// region's table, a hold: marks `AnimState` held and leaves the rest of it and `AnimParams`
+/// as they are, writes `RootMotion::ZERO` and emits nothing; with the state's clip missing,
+/// the same after the state has been set.
 #[system(name = "anim::advance", worlds = [server, prediction], in_set = sets::ADVANCE)]
 pub(crate) fn advance(
     ctx: Ctx,
@@ -130,8 +135,9 @@ pub(crate) fn evaluate(
 }
 
 /// A bone row reporting its stepped `Transform` to its owner, when its link says the owner
-/// is limp; an animated character's bone rows emit nothing.
-#[system(name = "anim::report_bones", worlds = [server, prediction], in_set = sets::REPORT)]
+/// is limp; an animated character's bone rows emit nothing. Server world only, as every
+/// bone system is: bone rows exist there alone.
+#[system(name = "anim::report_bones", worlds = [server], in_set = sets::REPORT)]
 pub(crate) fn report_bones(moved: EventWriter<BoneMoved>, link: &BoneLink, transform: &Transform) {
     todo!()
 }
@@ -143,7 +149,7 @@ pub(crate) fn report_bones(moved: EventWriter<BoneMoved>, link: &BoneLink, trans
 /// onto its parent's fitted pose, so hands and feet hang off the fallen limbs and sockets
 /// with them. Written whole into `SimPose`. Does nothing for a character whose bones are
 /// not limp; with the skeleton or the clip missing, writes `SimPose::EMPTY`.
-#[system(name = "anim::fit_ragdoll", worlds = [server, prediction], in_set = sets::FIT)]
+#[system(name = "anim::fit_ragdoll", worlds = [server], in_set = sets::FIT)]
 #[expect(clippy::too_many_arguments, reason = "a kernel's parameters are its row columns")]
 pub(crate) fn fit_ragdoll(
     ctx: Ctx,
@@ -167,7 +173,7 @@ pub(crate) fn fit_ragdoll(
 /// and a declaration would only order every `Transform` reader of the stage against this
 /// set for nothing (and falsify physics-api's "every other `Stage::Post` system reads the
 /// stepped rows after the write-back with no edge").
-#[system(name = "anim::drive_bones", worlds = [server, prediction], in_set = sets::BONES)]
+#[system(name = "anim::drive_bones", worlds = [server], in_set = sets::BONES)]
 pub(crate) fn drive_bones(cmd: Commands, bones: &Bones, pose: &SimPose, root: &Transform) {
     todo!()
 }

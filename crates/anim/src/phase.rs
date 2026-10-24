@@ -57,14 +57,20 @@ impl Phase {
     /// The units a state advances per tick, in integers: `speed` is taken to Q16.16 once
     /// (`speed * 2^16` through `Scalar::to_i64`, toward zero, clamped to `[0, 2^32 - 1]`),
     /// and the rate is `ceil(2^32 * q / (duration_ticks * 2^16))` in 128-bit arithmetic,
-    /// clamped to `u32::MAX`. Zero for a speed that is not finite, negative or zero, or for
-    /// a zero `duration_ticks`, so the state holds its phase.
+    /// clamped to `u32::MAX`. Zero, so the state holds its phase, for a speed that is not
+    /// finite, negative or zero, for a finite positive speed below `2^-16` (under one Q16.16
+    /// unit), and for a zero `duration_ticks`.
     ///
     /// What follows from the ceiling, and is part of this contract: a one-shot of `d`
     /// ticks at speed one holds `END` on tick `d` of its state; a mark at
-    /// `from_fraction(f, d)` is crossed on tick `f`; a loop of `d` ticks wraps on tick `d`,
-    /// and wraps one tick early once every `rate / (d * rate - 2^32)` cycles (about 1.6
-    /// million cycles at `d = 60`), never within a session. Both scalar widths give the
+    /// `from_fraction(f, d)` is crossed on tick `f`; a loop of `d` ticks at speed one wraps
+    /// on tick `d` of each cycle until the lead the ceiling adds, `d * rate - 2^32` units a
+    /// cycle, sums to a rate: its `m`-th wrap, `m = ceil(rate / (d * rate - 2^32))`, comes
+    /// one tick early, on tick `m * d - 1` of the state, never sooner than `2^32 / (d - 1)`
+    /// ticks in. At 60 Hz the first early wrap comes after 452 hours at `d = 60`, 191 hours
+    /// at `d = 600` and `d = 1800`, 10.4 hours at `d = 3600` and, for loops up to two
+    /// minutes, 2.78 hours at the shortest (`d = 7161`); a game that needs a loop exact to
+    /// the tick for longer restarts the state. Both scalar widths give the
     /// same rate for any speed both can hold, since the only float operation is a product
     /// by a power of two. A speed of `duration_ticks` cycles per tick or more is clamped to
     /// `u32::MAX`: a one-shot then reaches `END` in one tick and a loop's phase moves back
