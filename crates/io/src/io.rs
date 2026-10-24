@@ -177,6 +177,10 @@ impl Io {
     /// call, from any clone, resolve `Cancelled`. Blocks the calling thread until every
     /// thread has exited, so it is for the main thread and tools, before the executor's
     /// own shutdown. Clones left after this call are inert handles.
+    ///
+    /// Never call it from a pool thread, which runs the wakers of the requests it
+    /// completes: it hangs there, behind a `shutdown` already joining that thread or, alone,
+    /// joining the thread it runs on.
     pub fn shutdown(self) {
         self.owner.backend.join();
     }

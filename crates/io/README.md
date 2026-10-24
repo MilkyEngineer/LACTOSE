@@ -289,9 +289,11 @@ runs, the span constructors.
   requests already started finish; requests queued or waiting behind a replace of their
   path, and requests submitted after it from any clone, resolve `Cancelled`; then it
   blocks until every thread has exited, in every clone that calls it at once. It is for
-  the main thread and tools, before `Executor::shutdown`. Clones left after it are inert
-  handles whose requests resolve `Cancelled`. An encoded read whose stored bytes arrived
-  before the stop still decodes.
+  the main thread and tools, before `Executor::shutdown`. Never call it from a pool thread,
+  which runs the wakers of the requests it completes: it hangs there, behind a `shutdown`
+  already joining that thread or, alone, joining the thread it runs on. Clones left after
+  it are inert handles whose requests resolve `Cancelled`. An encoded read whose stored
+  bytes arrived before the stop still decodes.
 - Dropping the last `Io` clone without `shutdown` stops the pool the same way but does not
   wait: the threads exit after their current request and are not joined. Open `File`s
   outlive it as handles whose reads resolve `Cancelled`.

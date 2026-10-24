@@ -18,10 +18,8 @@ allocator hands out or takes back is `System`'s, with the very layout the caller
 intact. Recording a size reads the layout and touches no block. Its own test runs under
 Miri with `MIRIFLAGS=-Zmiri-tree-borrows cargo +nightly miri test -p lactose-io --test
 requests -- the_tests_allocator`; the other tests there call into zstd's C library and the
-file system, which Miri does not run. Under the default Stacked Borrows model Miri stops
-in `lactose_core::TaggedAlloc::dealloc` instead, which reads its tag byte past the block
-through the pointer a `Box` was retagged to: that is `core`'s allocator, whatever the
-allocator under it.
+file system, which Miri does not run. Tree Borrows is needed for `lactose_core::TaggedAlloc`
+above it, whatever the allocator under it (`crates/core/SAFETY.md`, `alloc`).
 
 When a completion backend lands, it lives in its own module under `src/backend/` and the
 crate-level `forbid` becomes `#![deny(unsafe_code)]` with `#![allow(unsafe_code)]` on that
