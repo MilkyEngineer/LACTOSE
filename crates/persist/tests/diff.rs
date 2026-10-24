@@ -12,15 +12,15 @@ use std::sync::Arc;
 
 use common::*;
 use lactose_asset_api::AssetSet;
-use lactose_bundle::{Baseline, BaselineRow, ComponentData, Record};
+use lactose_bundle::{Baseline, BaselineRow, ComponentData, ComponentSchema, Record};
 use lactose_core::{ComponentKey, ErrorKind};
 use lactose_ecs::{
-    OwnedBy, RegionConfig, RegionId, RegionMode, RegionRows, WorldBuilder, WorldKind,
+    ExportedRow, OwnedBy, RegionConfig, RegionId, RegionMode, RegionRows, WorldBuilder, WorldKind,
 };
 use lactose_math::Scalar;
 use lactose_net_api::OverlayPayload;
-use lactose_persist::{RegionRecords, SchemaTable, diff};
-use lactose_reflect::{Reflect, Registry};
+use lactose_persist::{Loader, Migrations, RegionRecords, SchemaTable, diff};
+use lactose_reflect::{Reflect, Registry, resource};
 use lactose_sim::RegionExport;
 use lactose_sim::harness::{ChunkCapacity, layout_mode};
 
@@ -335,4 +335,107 @@ fn a_spawned_moved_in_or_gained_component_is_written_canonical() {
         _ => None,
     });
     assert_eq!(added, Some(&data(Velocity { x: canonical_nan, y: Scalar::ONE })));
+}
+
+/// A persistent region resource of scalars, which no type of the shared game is.
+#[resource(key = "diff::wind", persistent)]
+#[derive(PartialEq, Debug)]
+pub struct Wind {
+    /// Along x.
+    #[field(id = 1)]
+    pub x: Scalar,
+    /// Along y.
+    #[field(id = 2)]
+    pub y: Scalar,
+}
+
+#[test]
+fn a_scalar_resource_is_written_canonical_by_the_save_and_the_load() {
+    let mut registry = registry();
+    registry.register::<Wind>().unwrap();
+    let table = SchemaTable::from_registry(&registry).unwrap();
+    let odd = Wind { x: odd_nan(), y: Scalar::from_f64(-0.0) };
+    let canonical = Wind {
+        x: Scalar::from_canonical_bits(odd_nan().to_canonical_bits()),
+        y: Scalar::from_f64(-0.0),
+    };
+    assert_ne!(data(odd).bytes, data(canonical).bytes);
+    let rows = RegionRows { seed: 1, resources: vec![data(odd)], ..RegionRows::default() };
+    let export = RegionExport { region: A, rows };
+    let empty = Baseline::from_rows(AssetSet::new(), [], []).unwrap();
+    let saved = RegionRecords::from_export(&export, &empty, &table).unwrap();
+    // The NaN is made canonical; the negative zero is a value and stays.
+    assert_eq!(saved.resources, vec![data(canonical)]);
+
+    // Records whose resource is not canonical: the loader writes it canonical.
+    let mut odd_records = saved.clone();
+    odd_records.resources = vec![data(odd)];
+    let migrations = Migrations::new();
+    let loaded = Loader::new(&table, &migrations).migrate(&odd_records).unwrap();
+    assert_eq!(loaded.resources, vec![data(canonical)]);
+}
+
+/// `cooked_schemas()` with `component`'s version moved on: a cook another build made.
+fn stale_schemas(component: ComponentKey) -> Vec<ComponentSchema> {
+    cooked_schemas()
+        .into_iter()
+        .map(|schema| {
+            if schema.component() != component {
+                return schema;
+            }
+            let fields = schema.fields().iter().copied();
+            let version = schema.schema_version() + 1;
+            ComponentSchema::new(component, version, schema.element_size(), fields).unwrap()
+        })
+        .collect()
+}
+
+#[test]
+fn a_baseline_column_in_another_schema_is_refused_as_stated() {
+    let id = c(A, 1);
+    let records_over = |baseline: &Baseline| RegionRecords {
+        region: A,
+        seed: 1,
+        baseline_hash: baseline.content_hash(),
+        overlay: None,
+        resources: Vec::new(),
+        resource_schemas: Vec::new(),
+        transient_resources: Vec::new(),
+        layouts: BTreeMap::new(),
+    };
+    let migrations = Migrations::new();
+    let loader = Loader::new(schemas(), &migrations);
+    let export = |components: Vec<ComponentData>| RegionExport {
+        region: A,
+        rows: RegionRows {
+            seed: 1,
+            rows: vec![ExportedRow { id, owner: None, components, transient: Vec::new() }],
+            ..RegionRows::default()
+        },
+    };
+
+    // A saved column: the diff cannot compare it byte for byte (`InvalidData`), and the
+    // loader refuses the out-of-date cook (`VersionMismatch`).
+    let row = BaselineRow { id, components: vec![data(pos(1, 1))] };
+    let stale = Arc::new(
+        Baseline::from_rows(AssetSet::new(), stale_schemas(Position::KEY), [row]).unwrap(),
+    );
+    let error =
+        RegionRecords::from_export(&export(vec![data(pos(1, 1))]), &stale, schemas()).unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::InvalidData, "{error}");
+    let records = records_over(&stale);
+    let error = loader.bundle(&records, stale, RegionMode::Simulated, None).unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::VersionMismatch, "{error}");
+
+    // A derived column: the diff never compares it, so it accepts it; the loader still
+    // refuses the cook.
+    let row = BaselineRow { id, components: vec![data(pos(1, 1)), data(Cache(3))] };
+    let stale =
+        Arc::new(Baseline::from_rows(AssetSet::new(), stale_schemas(Cache::KEY), [row]).unwrap());
+    let saved =
+        RegionRecords::from_export(&export(vec![data(pos(1, 1))]), &stale, schemas()).unwrap();
+    assert!(saved.overlay.is_none());
+    let error =
+        loader.bundle(&records_over(&stale), stale, RegionMode::Simulated, None).unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::VersionMismatch, "{error}");
 }

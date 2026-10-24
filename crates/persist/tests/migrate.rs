@@ -106,8 +106,10 @@ fn health_v1_to_v2(value: &mut FieldValues) -> Result<()> {
     Ok(())
 }
 
+/// Reads a field only version 2 has, so the chain holds only in version order.
 fn health_v2_to_v3(value: &mut FieldValues) -> Result<()> {
-    value.write(FieldId(4), 1_u16);
+    let max: u16 = value.read(FieldId(3))?;
+    value.write(FieldId(4), max / 20);
     Ok(())
 }
 
@@ -372,7 +374,7 @@ fn a_v1_save_loads_through_the_readme_step_and_hashes_as_a_v2_save() {
     let migrations = with(&[(2, health_v2_to_v3), (1, health_v1_to_v2)]);
     let world = loaded(&newer, &load(&newer, &migrations, &old).unwrap());
     let health = world.get::<v3::Health>(net(NetId::cooked(1))).unwrap();
-    assert_eq!((health.points, health.max, health.regen), (40, 40, 1));
+    assert_eq!((health.points, health.max, health.regen), (40, 40, 2));
 }
 
 /// Loads `records` under `build` and `migrations`, which must refuse with `kind` and a
@@ -915,6 +917,44 @@ fn a_transient_type_relaid_loads_zeroed_with_no_step() {
     let world = world_of(relaid_registry(), &bundle);
     assert_eq!(world.get_erased(net(runtime(1)), saved::Buzz::KEY), Some(&[0_u8; 8][..]));
     assert_eq!(resource_bytes(&world, saved::Hum::KEY), Some(vec![0; 8]));
+}
+
+#[test]
+fn a_transient_set_field_is_kept_under_its_schema_and_dropped_under_another() {
+    let table = saved_table();
+    let buzz =
+        |a: u32| ComponentData { component: saved::Buzz::KEY, bytes: a.to_le_bytes().to_vec() };
+    let schemas = [Tag::KEY, saved::Buzz::KEY].map(|key| table.schema(key).unwrap().clone());
+    let row = BaselineRow { id: NetId::cooked(1), components: vec![data(Tag(1)), buzz(5)] };
+    let baseline = Arc::new(Baseline::from_rows(AssetSet::new(), schemas, [row]).unwrap());
+    let set = Record::SetField {
+        id: NetId::cooked(1),
+        component: saved::Buzz::KEY,
+        field: FieldId(1),
+        bytes: 7_u32.to_le_bytes().to_vec(),
+    };
+    let tag = Record::AddComponent { id: NetId::cooked(1), data: data(Tag(2)) };
+    let records = records(&table, &baseline, vec![tag.clone(), set], vec![], vec![]);
+    let migrations = Migrations::new();
+
+    // Under its own schema the record passes through, and the value still loads zeroed.
+    let loader = Loader::new(&table, &migrations);
+    let same = loader.migrate(&records).unwrap();
+    assert!(Arc::ptr_eq(same.overlay.as_ref().unwrap(), records.overlay.as_ref().unwrap()));
+    let bundle = loader.bundle(&records, baseline, RegionMode::Simulated, None).unwrap();
+    let registry = || {
+        use saved::*;
+        registry!(Buzz, Hum, Stock, Gate, Lock, Memo, Tally)
+    };
+    let world = world_of(registry(), &bundle);
+    let key = net(NetId::cooked(1));
+    assert_eq!(world.get_erased(key, saved::Buzz::KEY), Some(&[0_u8; 4][..]));
+    assert_eq!(world.get::<Tag>(key), Some(&Tag(2)));
+
+    // Under another schema it is dropped, not refused, and the rest of the overlay stays.
+    let relaid = SchemaTable::from_registry(&registry!(relaid::Buzz, relaid::Hum)).unwrap();
+    let migrated = Loader::new(&relaid, &migrations).migrate(&records).unwrap();
+    assert_eq!(migrated.overlay.as_ref().unwrap().records(), [tag].as_slice());
 }
 
 #[test]

@@ -346,9 +346,11 @@ impl Migrations {
     /// Fails as [`migrate`](Self::migrate) fails; with `NotFound` for a component the table
     /// does not know (a removed type: never dropped silently); with `InvalidData` for a
     /// carried component `layouts` lacks; and with `Unsupported` for a `SetField` record of
-    /// a component whose version or digest differs, since one field cannot be migrated
-    /// without the rest of its value (this crate's diff never writes a `SetField`, so none
-    /// is in a save it wrote; one at the registry's version and digest passes through).
+    /// a persistent component whose version or digest differs, since one field cannot be
+    /// migrated without the rest of its value (this crate's diff never writes a `SetField`,
+    /// so none is in a save it wrote; one at the registry's version and digest passes
+    /// through). A transient type's `SetField` is dropped when its schema differs and kept
+    /// when it is equal; either way its value loads zeroed.
     pub fn migrate_overlay(
         &self,
         overlay: &Arc<Overlay>,
