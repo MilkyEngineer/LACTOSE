@@ -3010,6 +3010,48 @@ rationale the author supplied during the editorial pass rather than one taken fr
   substitution at or before a resync's restart skipped, after the restart's slot left the ring
   too. The review's original q1 and q2, first reported in frame 17 after the claim's frame 14
   was reconciled, break (b) and are the shape it excludes.
+- Addendum (lane predict-repair-skip, 2026-10-24; fix rounds 1 and 2, 2026-10-24): *A
+  substitution or repair whose replacement equals the ring's sample byte for byte is no
+  correction point.* Review r2 of the repeated report noted (item 5) that such a replacement
+  cost a re-simulation, and a resync past the ring, while changing nothing. Examples are the
+  substitute of `moving(1)` with no action held, or a repair whose edges already match the
+  substitute before it. Decided: `lactose-predict` compares the replacement's sample bytes with
+  the ring's, and an equal one makes no point. Nothing is restored or re-simulated on its
+  account, and `Reconciled` reports no correction for it. Slot *t* already ran that sample, so
+  the replacement is no reason to roll back; a fact the tolerance absorbed stays absorbed, as
+  without it (a rollback from *t* − 1 would write every fact at *t* − 1, the absorbed ones
+  included, D124). A rollback from another point re-simulates the tick with its unchanged
+  sample. The tick is still acted on. A first report is counted in
+  `PredictionStats::substitutions` and kept among the substitutions acted on, so a repeat is
+  skipped. It arms the repair after it. The slot's `PlayerSample::substituted` mark is written.
+  That mark changes no tick by a rule now stated in `lactose-sim` (the `InputApplier` and
+  `PlayerSample::substituted` docs and its README): of the entry, what `apply` writes depends
+  on `sample.sample` and `sample.input_tick` alone, never on `sample.substituted`, nor on state
+  the applier keeps between calls; the mark is the journal's. A later replacement of the same
+  tick is judged by its own bytes: a re-substitution once the tick before it changed, or a
+  repair armed again. Past the ring, equality is not known: the sample of *t* − 1 left with its
+  slot and the predictor keeps none past it. The client's redundancy window (eight ticks) is
+  `net`'s and the packet record is `net-host`'s, outside the boundary. So a substitution or
+  repair whose *t* − 1 is before the horizon is `TooOld` whatever its bytes, as before, and the
+  review's s3 shape still resyncs. Rejected: remembering, beside each substitution acted on,
+  the substitute it wrote, so that a repair due after its previous slot left the ring could be
+  judged. It would decide a single tick at the horizon, the one whose oldest slot is the
+  substituted tick itself, at the cost of new state. In the ring, a repeat whose previous slot
+  is unchanged now equals what the first report wrote, so q1, q2, q4 and the repeat tests whose
+  previous slot the ring holds hold the skip by the substitutions count alone. A repeat whose
+  previous slot has left the ring fails without the skip on a `TooOld` resync. The
+  depth-above-the-window test, which pops its repeat when the ring's oldest slot is the
+  substituted tick, is the one that review r2's M16 (forgetting by the window alone) fails, on
+  a `TooOld` resync. Tests that forced a rollback with a substitution by the sample the player
+  sent anyway now change the sample's yaw alone, which no test system reads. Held by
+  tests/substitution.rs: an equal substitution and an equal repair re-simulate nothing
+  (`Reconciled::resimulated` and `PredictionStats::ticks_resimulated`), the hash is unchanged
+  and equal to a run of the server's inputs, and the substitution is counted once with its
+  repeat skipped; an equal substitution is substituted again once the tick before it changes;
+  an equal repair past the ring is `TooOld` with nothing changed; the applier writes the same
+  world for samples marked substituted as unmarked. Held by tests/physics.rs: an equal
+  substitution at the tick after an absorbed fact leaves it absorbed, nothing pushed. Also held
+  by tests/ring.rs and the two rollback tests of tests/hook.rs.
 
 **D123. A third-party crate is built from a patched copy only under `vendor/`, by one rule
 for every crate, checked by `cargo xtask vendor`** (§8.2, §8.3, §9.1, §16, §20,

@@ -24,19 +24,20 @@ fn a_rollback_to_every_slot_resimulates_to_the_straight_run() {
     for (layout, workers) in layouts {
         let mut rig = Rig::joined_with(layout, workers);
         let mut straight = Rig::joined_with(layout, workers);
-        rig.step_to(20, walking);
-        straight.step_to(20, walking);
+        rig.step_to(20, looking);
+        straight.step_to(20, looking);
         assert_eq!(rig.hash(), straight.hash());
-        // Each frame reports a substitution of a tick by the sample the player sent anyway
-        // (from 13: the rebuild tick 11 applied no sample, so substituting 12 would change
-        // it): a rollback to the tick before it, with nothing to change.
+        // Each frame reports a substitution of a tick by a sample that differs from the
+        // player's by its yaw alone, which no system reads (from 13: the rebuild tick 11
+        // applied no sample, so substituting 12 would stop the walk): a rollback to the tick
+        // before it, with nothing in the world to change.
         for i in 0..9 {
             let present = 21 + i;
             let mut frame = StagedFrame::new(Tick(present));
             frame.substituted.insert(Tick(13 + i));
             rig.push(frame);
-            rig.step(walking(present));
-            straight.step(walking(present));
+            rig.step(looking(present));
+            straight.step(looking(present));
             let reconciled = rig.reconcile();
             assert_eq!(reconciled.corrections.len(), 1);
             let correction = &reconciled.corrections[0];

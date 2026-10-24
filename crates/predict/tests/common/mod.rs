@@ -19,7 +19,7 @@ use lactose_ecs::{
     Changed, ClaimedBy, Commands, Executor, LayoutConfig, Mut, PresentEvent, PresentEvents,
     PresentKind, RegionConfig, RegionId, RegionMode, Res, StableKeyOf, World, WorldKind, system,
 };
-use lactose_input::{Action, Actions, Axis2, PlayerInput, PlayerInputApplier};
+use lactose_input::{Action, Actions, Axis2, PlayerInput, PlayerInputApplier, Yaw};
 use lactose_math::{Scalar, Vec3};
 use lactose_net_api::{InterpolationSlot, StagedFrame, StagedInbox, StagedSpawn};
 use lactose_physics_api::{
@@ -565,6 +565,14 @@ pub fn claim(world: &World, key: StableKey) -> Option<PlayerId> {
 /// The sample the tests' player sends for each tick unless a test says otherwise.
 pub fn walking(_tick: u32) -> PlayerInput {
     moving(1)
+}
+
+/// Walking, facing a yaw of `tick` units, which no system reads: each sample differs from
+/// the substitute of the one before it by its yaw alone, so a substitution of it rolls back
+/// (a substitute equal to the sample rolls nothing back) and re-simulates to the world the
+/// player's own samples made.
+pub fn looking(tick: u32) -> PlayerInput {
+    PlayerInput { yaw: Yaw(u16::try_from(tick).expect("a small tick")), ..walking(tick) }
 }
 
 // ---- A backend whose snapshot fails on demand ----

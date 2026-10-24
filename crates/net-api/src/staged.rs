@@ -54,7 +54,8 @@ pub struct StagedFrame {
     pub acked_input: Option<Tick>,
     /// The input ticks of the receiving player for which the server substituted the
     /// previous input (architecture section 9.2): the client is told, so that
-    /// `lactose-predict` re-simulates those ticks with the substitute.
+    /// `lactose-predict` re-simulates those ticks with the substitute where it differs
+    /// from the sample it ran.
     pub substituted: BTreeSet<Tick>,
     /// Regions that became relevant, irrelevant or received a new asset table, by region:
     /// `app` turns these into `TickInput::{loaded, unloaded, assets}` under `Directed`
