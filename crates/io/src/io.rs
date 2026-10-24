@@ -179,8 +179,8 @@ impl Io {
     /// own shutdown. Clones left after this call are inert handles.
     ///
     /// Never call it from a pool thread, which runs the wakers of the requests it
-    /// completes: it hangs there, behind a `shutdown` already joining that thread or, alone,
-    /// joining the thread it runs on.
+    /// completes: behind a `shutdown` already joining that thread it hangs, and alone it
+    /// joins the thread it runs on, which panics (and so aborts a binary).
     pub fn shutdown(self) {
         self.owner.backend.join();
     }
