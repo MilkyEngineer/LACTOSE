@@ -410,14 +410,13 @@ What a system is, from its parameters (`SystemParam` has the table):
   world hash is `lactose-sim`'s, over `columns_erased` and `region_resources_erased`.
 - A transient component is not saved, but its presence is part of the entity's archetype,
   which its systems and the world hash depend on: `ExportedRow::transient` lists the keys
-  of the row's transient components, `lactose-persist` encodes their presence as it sees
-  fit (for instance the component with zeroed bytes in the entity's records), diffs that
-  presence against the baseline and ignores the transient values, and `load_region` stores
-  a transient component a document carries as zeroed, whatever its bytes. Transient region
-  resources likewise: `RegionRows::transient_resources` lists them, and the loader puts
-  each back with `insert_region_resource_zeroed`. Transient values therefore differ from a
-  twin that never reloaded at the reload point, until the next input sync point zeroes
-  both.
+  of the row's transient components, `lactose-persist` encodes their presence as the
+  component with zeroed bytes in the entity's records (D129), diffs that presence against
+  the baseline and ignores the transient values, and `load_region` stores a transient
+  component a document carries as zeroed, whatever its bytes. Transient region resources
+  likewise: `RegionRows::transient_resources` lists them, and the loader puts each back with
+  `insert_region_resource_zeroed`. Transient values therefore differ from a twin that never
+  reloaded at the reload point, until the next input sync point zeroes both.
 - Region resources are validated when inserted, typed or erased, and when updated through
   `update_region_resource`, which runs a closure on a copy and stores the result only if it
   is valid (a placeholder in a reference field is refused with `InvalidData` and the old

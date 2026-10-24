@@ -60,13 +60,13 @@ and its source is part of the boundary build ID.
 | `app` (client, milestone 1 spike and 4) | Frames from the network thread into the inbox of each client world, and the due frames' time scale and region changes into the step's `TickInput` | `StagedInbox::push` (first, `#[must_use]`), then `StagedInbox::due(Tick(simulation.tick().0 + 1))`, the tick the next step runs, into `TickInput::{time_scale, loaded, unloaded, assets}` through `RegionRelevance::to_bundle`; the fold rule under "The staged frame" |
 | | The client worlds at the server's tick | `SimulationBuilder::tick(accepted.tick)`, or on a re-join `World::set_tick` with `StagedInbox::reset` beside it, from `lactose-net-host`'s `JoinAccepted` |
 | `app` (server) | Register the gather and take its frame | `register_systems`, `setup`; `GatherState::take` between runs, the frame to the packer |
-| | The relevance message on a region entering a client's set | `RegionRelevance::from_export` over `RegionExport` and `persist`'s overlay; `with_digest` for a client that caches |
+| | The relevance message on a region entering a client's set | `lactose-persist`'s `RegionRecords::from_export` over the `RegionExport`, then `to_relevance(table)` (D129); `with_digest` for a client that caches |
 | `lactose-net` (milestone 4) | The client's `StagedState` hook's input and output | `StagedInbox::pop_through`, `StagedFrame`'s fields, `RemoteSlot`; rows written and `removed` applied through `lactose-ecs`'s `World::insert_erased` and `World::remove_erased`, spawns through `World::spawn_erased` |
 | | Resync and late join as one path | `StagedFrame::resync`, `full` |
 | The milestone 1 spike | The same, typed by hand for its few components | `tests/consumers.rs`: the client hook, the prediction hook, `app` between runs on both ends, the gather |
 | `lactose-predict` | Binds for its own predicted spawns; which entities the local player has claimed, as claims and releases arrive; the proxies' per-tick history; the reconciliation record; the processed-input acknowledgement; substituted ticks; moves and removals | `StagedSpawn::origin` with the local player; `StagedSpawn::slot` on a spawn of a live key (`None`: claimed, start predicting it; `Some`: released, stop); `StagedRow` with `exact: false` by `(key, tick)`; `StagedRow` with `exact: true` for claimed entities; `StagedFrame::{acked_input, substituted, moves, removed}`; `StagedInbox::oldest_after` for `Behind`, `StagedInbox::reset` on a re-join |
 | `lactose-presentation` (milestone 2) | Which slot to sample per remote entity | `RemoteSlot` rows through extract, into `lactose-net-host`'s `InterpolationReader::sample_batch` |
-| `lactose-persist` | Nothing new: the overlay it diffs is what `RegionRelevance` carries | `RegionRelevance::from_export(export, baseline_hash, overlay, table)` |
+| `lactose-persist` | The message's fields, `pub`, which its `RegionRecords::to_relevance` fills from a region's records (D129) | `RegionRelevance`, `OverlayPayload` |
 | Game crates | Nothing: no game system names this crate | `RemoteSlot` is never a system parameter |
 
 ## The registration `app` writes
@@ -338,17 +338,17 @@ which `build`'s `derived` check does not see.
 "Regions")
 
 - When a region enters a client's set, the server's `app` exports it between runs
-  (`World::export_region`, the same export a save or an unload makes), runs `persist`'s
-  diff against the cooked baseline into an `Overlay`, and builds `RegionRelevance::
-  from_export(export, baseline.content_hash(), overlay, table)`: the seed, the persistent
-  resources and the transient keys are copied from the export, the overlay is `Full`
-  (`Cooked` when the diff is empty and the caller passes `None`), the table is the
-  region's resolved `VersionTable` if it has one. Co-located clients entering the same
-  region in one frame share one export and one overlay. `with_digest` replaces a `Full`
-  overlay by `Digest(overlay.digest())` for a client the server knows holds a copy (it was
-  sent earlier in the session, or the client said so on join); the client's cache policy
-  is `net`'s. The message travels on `net`'s reliable ordered channel, with the time scale
-  and the other control messages.
+  (`World::export_region`, the same export a save or an unload makes), runs
+  `lactose_persist::RegionRecords::from_export(export, &baseline, &schemas)` and builds the
+  message with `RegionRecords::to_relevance(table)`, which fills the fields `from_export`
+  here fills: the seed, the resources (canonical, as a save holds them) and the transient
+  keys from the records, the overlay `Full`, or `Cooked` when the diff was empty (D129), the
+  table is the region's resolved `VersionTable` if it has one. Co-located clients entering
+  the same region in one frame share one export and one overlay. `with_digest` replaces a
+  `Full` overlay by `Digest(overlay.digest())` for a client the server knows holds a copy
+  (it was sent earlier in the session, or the client said so on join); the client's cache
+  policy is `net`'s. The message travels on `net`'s reliable ordered channel, with the time
+  scale and the other control messages.
 - `to_bundle(baseline, cached, assets)` on the client gives the `RegionBundle` for
   `TickInput::loaded`: `baseline`, fetched from the store by `baseline_hash`, which must
   equal its content hash (`VersionMismatch` otherwise); the overlay, `Full(overlay)`

@@ -121,7 +121,7 @@ crates/
   task/           F            [WHISK] executor: continuation counters, fork-join scope, worker classes, timer root, main-thread lane
   ecs/            F  boundary  [CASEIN] entities, archetypes, chunks, per-row change ticks, structural change log, queries, scheduler, command buffers, regions and region modes as storage, world snapshot, bulk row copy, system macro
   ecs-macros/     F            proc macros: `#[system]`, `#[finalize]`
-  reflect/        F            type registry, field IDs, typed references, persistence policy, serde bridge
+  reflect/        F            type registry, field IDs, typed references, persistence policy (a serde bridge is deferred: saves use `bundle`'s canonical encodings and `persist`'s container, D129)
   reflect-macros/ F            proc macros: `#[component]`, field IDs, reflection metadata, per-type visitors
   sim/            F  boundary  [CURD] region lifecycle (activation, streaming, unload policy), input sync point orchestration, the tick step and the frame's passes (the loop is the timer root's, in `app`), time scale, world hash (monomorphised per-type hashers)
   anim/           F  boundary  animation state machines, phase, events, root motion, sim skeleton (sockets, hands, feet, head, ragdoll bodies)
@@ -980,12 +980,15 @@ and the same records are what the server sends a client when the region becomes 
 (section 9.3). The record format lives in `bundle` so `cook`, `asset`, `persist` and `net`
 share it. Each region state has
 one record set: a runtime-spawned or migrated entity is a `Spawn` or `SpawnFromBaseline`
-carrying whole components; a changed baseline row is `AddComponent` (a whole component, also
-over one the row already has), `RemoveComponent`, `SetField` and `OwnershipChange`; a destroyed
-or departed row is `Destroy` alone. Rebasing onto a patched baseline keeps every
-runtime-spawned and migrated entity, drops every record of a cooked entity that is no longer a
-row, drops `RemoveComponent` and `SetField` of a component the row no longer has, and returns
-the dropped records so `persist` can re-home an entity the patch moved to another region.
+carrying whole components; a changed baseline row is `AddComponent` (a whole component, also over
+one the row already has), `RemoveComponent`, `SetField` and `OwnershipChange`; `persist`'s diff
+writes a changed component as `AddComponent` and never as `SetField` (D129); a destroyed or departed
+row is `Destroy` alone. Rebasing onto a patched baseline keeps every runtime-spawned and migrated
+entity, drops every record of a cooked entity that is no longer a row, drops `RemoveComponent` and
+`SetField` of a component the row no longer has, and returns the dropped records so `persist` can
+re-home an entity the patch moved to another region. An `AddComponent` the rebase keeps overwrites
+the patched row's component whole, so a patch to a field of a component the save touched does not
+reach that entity until the diff writes field-level records (D129).
 
 ### 15.3 Save operation
 
@@ -998,9 +1001,14 @@ joins) are not saved; on a load every player joins again.
 
 Self-describing binary container with engine version, schema hash and a per-region index.
 Baseline and overlay documents carry, for each component they hold, its schema version, element
-size and field layout (field ID, offset, size), so the binary keeps no historical layouts.
-Matching schema takes the bulk-copy-plus-remap fast path; mismatched schema decodes by field ID
-and runs migrations in version order. After load, change ticks are rebased (section 6).
+size and field layout (field ID, offset, size), so the binary keeps no historical layouts. A save
+carries beside each type's schema the digest of its full layout (D129), which the field layout alone
+cannot tell from a same-size change; equal versions with different digests are refused. Matching
+schema takes the bulk-copy-plus-remap fast path; mismatched schema decodes by field ID and runs
+migrations in version order. A migration is one registered step per type and version read, over the
+value's fields by ID; the result is assembled under the current layout and validated; a transient
+type is taken by presence and never migrated (D129). After load, change ticks are rebased
+(section 6).
 
 ### 15.5 Enforcement
 

@@ -1,6 +1,7 @@
 //! Bulk copy (architecture section 15.2): a cooked baseline and an overlay with every
-//! record kind load into a region; the export diffs back to the same overlay, the way
-//! `lactose-persist` diffs it; region resources travel beside the rows.
+//! record kind load into a region; the export diffs back to the same overlay through a
+//! field-level diff, which the bundle format accepts (`lactose-persist` writes whole
+//! components, D129); region resources travel beside the rows.
 
 #![forbid(unsafe_code)]
 
@@ -91,8 +92,9 @@ fn overlay(registry: &Registry, baseline: &Baseline) -> Overlay {
     Overlay::new(baseline.content_hash(), schemas(registry), records).unwrap()
 }
 
-/// What `lactose-persist` writes for a region: the records that turn `baseline` into the
-/// exported rows.
+/// A field-level diff of a region, which the bundle format accepts: the records that turn
+/// `baseline` into the exported rows, one `SetField` per changed field so the test covers
+/// that record kind. `lactose-persist` writes a changed component whole (D129).
 fn diff(registry: &Registry, baseline: &Baseline, exported: &RegionRows) -> Overlay {
     let schemas = schemas(registry);
     let schema = |key: ComponentKey| schemas.iter().find(|s| s.component() == key).unwrap();

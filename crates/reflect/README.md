@@ -64,5 +64,6 @@ field-ID reuse means. That check is not part of this crate.
 
 ## Not here yet
 
-The serde bridge the architecture lists under `reflect` arrives in milestone 1 with
-`lactose-persist`, its first user. This crate has no serde dependency.
+The architecture lists a serde bridge under `reflect`; `lactose-persist` needs none, since
+its documents are `lactose-bundle`'s canonical encodings and its container's (D129), so none
+is planned until a tool asks for one. This crate has no serde dependency.

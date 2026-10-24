@@ -720,6 +720,168 @@ rationale the author supplied during the editorial pass rather than one taken fr
 - Driven by: R3-4.
 - Replaced: revision 3.1's overlay that never left the server.
 
+**D129. The `persist` facade: what sections 4, 9.3, 15.2, 15.3, 15.4, 15.5 and 19 left open** (§4, §9.3, §15.1, §15.2, §15.3, §15.4, §15.5, §19, `lactose-persist`, `lactose-ecs`, `lactose-bundle`, `lactose-reflect`, `lactose-net-api`)
+- Why: the facade is written before its implementation so `app`, the game crates' migrations,
+  the journal tooling and the section 15.5 tests build against the final surface; each choice
+  below is one the sections did not settle, and each is a contract in
+  `crates/persist/README.md`.
+  - *The diff writes a changed baseline component whole, never `SetField`, for the migration
+    rule's sake alone.* Section 15.2 lists both for a changed row and decides neither, and
+    either is one rule per state (D101). A migration step is an opaque function over a value's
+    fields by ID, so the loader cannot know which fields a step reads, and a layout change
+    always comes with a re-cook, so the old baseline value a partial record would need is gone;
+    a whole value is the one thing a step can run on. The costs, accepted at milestone 1: the
+    unchanged fields of a changed component travel with it, which `net` sends uncompressed (a 1
+    KiB component with one 8-byte field changed, over 1,000 rows, is a 1.04 MB overlay against
+    27 KB with `SetField`, a factor of 38 that grows with component size), and a content patch
+    to a field the save never touched does not reach an entity whose component the save
+    touched, since `Overlay::rebase` keeps an `AddComponent` whole and it overwrites the
+    patched row. A verification row measures both on the milestone 3 scenes and decides a
+    per-component rule and a partial-value migration rule; `SetField` stays in the format and
+    the loader, and `Migrations::migrate_overlay` refuses it under a changed version or digest
+    with `Unsupported`.
+  - *A save carries a layout digest beside each type's schema, and equal versions with
+    different digests are refused.* A document's `ComponentSchema` (key, version, size,
+    top-level field ID, offset and size) is equal across a reorder inside a nested `#[value]`
+    struct, renumbered enum discriminants and a same-size type change, so the fast path would
+    reinterpret the old bytes silently, and `World::load_region` has the same blind spot.
+    `LayoutDigest` is xxh64 over the layout part of `TypeInfo::write_schema` (after the key,
+    version, role, persistence and tracking bytes) with two changes: the Rust name of a
+    `Struct` or `Enum` field is replaced by an empty tag, so renaming a `#[value]` type, an
+    enum or a field is free, and a primitive's tag stays; and each enum variant's name is
+    written beside its value, in declaration order, so a permutation of discriminants among the
+    variants is seen, and a variant rename or a reorder of the variants' declarations is a
+    version bump with a step that changes nothing. It sees all three changes and not a tracking
+    flag. `RegionRecords::layouts` carries one per type a section holds bytes of;
+    `Migrations::migrate` takes it, and on equal versions an equal digest is the fast path and
+    a different one `VersionMismatch`. What no digest sees is a change of meaning under an
+    unchanged layout (a field's unit; one `#[value]` struct replaced by another of the same
+    layout, or one enum by another of the same size with the same (name, value) pairs in the
+    same order; one primitive by another of the same tag), which only a version bump and a step
+    carry. Rules out trusting the document schema, a loader that relies on the container's
+    schema hash, and a silent permutation of variants.
+  - *A transient type is taken by presence, never by value, and a persistence change is
+    restored from a zero value or dropped, with no new field.* `Migrations::migrate` returns
+    the all-zero value of the registry's size for a type whose persistence is `Transient`,
+    whatever the document's schema, digest and bytes, with no version check and no step;
+    `migrate_overlay` never reads a transient component's bytes (kept under an equal schema, so
+    the `Arc` is returned; zeroed under a changed one). A type now transient is restored zeroed
+    (`Loader::migrate` moves a resource to the transient keys). A type now persistent is
+    restored from a zero value by two rules, since a document records which resources were
+    transient and not which components were: a transient key joins the resources as the
+    all-zero value at the registry's layout and no step runs; a component is read by the
+    persistent rule from the schema and digest it was saved under, so a type made persistent
+    must have kept the version and layout it was saved under, or have the steps from that
+    version, which run over the all-zero old value; `Loader::bundle` validates the result like
+    any value. A type now `derived` is dropped: a component leaves its spawn record and its own
+    records are dropped whole, and an overlay left with no record becomes `None`, since a
+    derived value is rebuilt on load and the build declared it so. A removed transient type is
+    `NotFound` like any removed type, since the document does not record persistence. Rules out
+    a layout change to a type that stays transient breaking a save.
+  - *A migration is a plain function per (type, version read), run in version order over the
+    value's fields by ID; the loader assembles by the registry's layout and refuses what a step
+    left unset or left over.* The binary keeps no historical layouts (§15.4), so a step is
+    typed on neither version; it sees `FieldValues`. A document version above the build's and a
+    missing step are `VersionMismatch`; the value is validated through `TypeInfo::validate`
+    after the chain; a type the registry lacks is `NotFound`, never dropped. Rules out closures
+    and stateful migrations, implicit defaults for a field a step left unset, and silent drops
+    of a removed type (a persistence change is the stated exception above); a removed, renamed,
+    split or merged type has no step today and is named as additive.
+  - *Every value this crate writes is canonical, and the policy table refuses what the world
+    hasher refuses; a saved value is at most 16 KiB.* The ECS exports memory bytes; `persist`
+    rewrites every `lactose_math::Scalar` leaf to its canonical bits (D105), as the hash does;
+    `SchemaTable::from_registry` refuses a raw float or a foreign scalar tag with
+    `Unsupported`, as `TypeTable::register` does, and a saved type over `MAX_COMPONENT_BYTES`
+    with `InvalidData`, which the ECS caps for components and not for resources, so
+    registration gains the same refusal (below).
+  - *`SchemaHash` is over the saved types' key, version, role, persistence and layout digest,
+    ascending by key.* Tracking and derived types change nothing; it is the container's
+    shortcut and a tool's line, never what the loader relies on.
+  - *A region's records are the overlay with the seed, the persistent resources with their
+    schemas, the transient resource keys and the layout digests beside it, in one canonical
+    form.* `Overlay` has a field for none of them (`docs/verification.md`);
+    `RegionRecords::check` is the form (no empty overlay as `Some`, the hash equal to the
+    overlay's, every list ascending, the transient keys disjoint from the resources' types,
+    schemas one-to-one with resources, digests exactly the carried types), produced by every
+    builder and refused by every writer and decoder, so equal state gives equal records, except
+    that records migrated from an older build keep the saved bytes of a now-transient
+    component, which no loader reads. The relevance message is
+    `RegionRecords::to_relevance(table)`, built by the server's `app` from the same records a
+    save holds, behind a normal `net-api` dependency, so the `Cooked` rule and the
+    canonicalisation exist once; the message leaves the digests and resource schemas behind,
+    both ends sharing a build by the handshake's protocol hash. Rules out a second `None` rule
+    in `app` and raw resources in the message.
+  - *The container's shape is types; a region is a section written and read on its own; the
+    bytes are the implementation's within stated invariants.* A preamble stating the
+    header-and-index block's length, the block hashed on its own, no whole-file hash, each
+    section one zstd frame hashed on its own with its index entry stating its offset, sizes and
+    hash, and its content stating the region, seed and baseline hash the entry states, so
+    `decode_section` refuses a section that disagrees with its entry;
+    `RegionRecords::encode_section` per region on a worker, the one builder of an
+    `EncodedSection` (read through `entry()` and `bytes()`), and `Container::assemble`
+    afterwards; `Container::index_len`, `index` over a prefix and `decode_section` over one
+    section's bytes, so a streaming load reads the front of the file and the sections it wants,
+    and a damaged section leaves the others readable (§19). Caps before allocation as
+    `lactose-bundle` does; `decode(encode(c)) == c`; bytes deterministic within a build and not
+    across builds; `CONTAINER_FORMAT_VERSION` moves with any change. Rules out a whole-file
+    hash, a whole-slice-only API and serial encoding of every section.
+  - *Nothing in this crate runs on a thread or touches a file.* The save copy is `sim`'s pass
+    on frame-critical workers; the diff, the section and the assembly are pure functions `app`
+    runs as background tasks; the slot write is `app`'s through `io`. Rules out an executor or
+    an `io` dependency here.
+  - *The loader validates before anything loads, and a mismatched baseline hash means rebase
+    first.* `Loader::bundle` refuses the mismatch rather than rebasing, since the dropped
+    records need a cross-region pass the crate does not have yet; `RegionRecords::rebase` is
+    the per-section step.
+  - *A save carries no asset table and no region mode.* Both are resolved or decided outside
+    the boundary (§14; `Directed` control or the policy) and the world hash covers both (§8.3),
+    so section 15.5's hash equality between a save and its load holds under the condition that
+    the load resolves the same table (one store, no publish between the save and the load) and
+    the policy's mode; carrying an optional table and mode per section is deferred to milestone
+    3 with `lactose-asset`.
+  - *Cross-crate additions, for the implementation lane and the lanes named:* `lactose-ecs`
+    exports its `bulk::schema_of` as `pub fn document_schema(info: &TypeInfo) ->
+    ComponentSchema`, the one derivation of a document's schema, which
+    `SchemaTable::from_registry` calls; `lactose-bundle` exports its schema-table encoder and
+    decoder (`write_table`, `read_table`) for the container's resource schema table;
+    `lactose-bundle`'s `ComponentSchema` gains the layout digest (a format bump) and
+    `World::load_region` compares it, after which `RegionRecords::layouts` goes and a cooked
+    column's same-size change is caught at the sync point too; a committed record per
+    registration set of each saved type's version and `LayoutDigest` (a `Registry::dump` with
+    the digest beside each type will do), compared per type by a test that fails when a type's
+    digest changed and its version did not, and on a field ID reused (§15's "CI rejects ID
+    reuse"), the guard that keeps a version bump from being forgotten; registration
+    (`TypeTable::register` or `WorldBuilder`) refuses a non-derived resource over
+    `MAX_COMPONENT_BYTES` where it refuses components; `[harness]` gains `lactose-persist` when
+    its reload tests land.
+  - Named and deferred: field-level records and the migration of partial values (the milestone
+    3 row); the re-homing pass after `rebase` (milestone 3); the slot write through `io` and
+    the disk-full and corrupt-save policies (§19, milestone 4); declared type drops, renames
+    and cross-type steps; a section's list of transient component keys; the region's asset set
+    beyond the baseline's and the streamed baseline (milestone 3); a pinned table and mode per
+    section; the compression level and the measured save cost; a serde bridge in `reflect`,
+    which no save needs.
+- What the design reviews changed (r1: 2 serious, 6 minor defects, 4 design findings; `61ca11f`
+  was the facade before it): the layout digest per section and the refusal on equal versions;
+  transient types by presence; the 16 KiB cap stated and the registration refusal named; the
+  relevance message from the records through `to_relevance`; the schema hash over layout parts;
+  the schema-table export named; `RegionRecords::check` and the refusals; the per-section
+  container with a prefix-readable index; the rationale rested on migration with both costs
+  stated and the verification row at milestone 3; the table-and-mode condition; the refused
+  migration shapes named; r2 (5 minor): the persistence-change rules, the digest's empty struct
+  and enum tags, the section's content agreeing with its entry behind `entry()` and `bytes()`,
+  the transient keys disjoint from the resources; r3 (3 minor): a now-persistent component read
+  from its saved version and a now-persistent resource zeroed with no step, an emptied overlay
+  `None`, variant names in the digest so a permutation is seen and a variant rename is a bump,
+  the test rows one change per case; r4 (3 minor): this entry made one text with the crate's,
+  the exception to equal records named (migrated records keep a now-transient component's saved
+  bytes), the digest's test rows pinned to the variants' names swapped over unchanged values
+  and a declaration reorder named as a bump; r5 (1 minor): the declaration reorder pinned by a
+  test row, and what no digest sees of an enum stated as the same (name, value) pairs in the
+  same order.
+- Driven by: milestone 1, the `persist` facade brief and its design reviews r1 to r5
+  (2026-10-18 to 2026-10-24).
+
 ## 8. Physics and animation
 
 **D58. One physics world per server process, determinism and parallel together, pinned exactly** (§16, §2 Physics)
