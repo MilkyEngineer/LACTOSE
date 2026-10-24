@@ -3230,6 +3230,144 @@ relayed by an event when it acts on another body** (§6.1, §10, `lactose-ecs`,
   `--slots` is a per-machine convention, and CI never uses `heavy`.
 - Driven by: the xtask heavy lane with two review rounds (2026-10-18).
 
+**D128. The `anim` facade: what sections 6.1, 13, 15.1, 16 and 17 left open** (§5.3, §6.1, §8.2, §9.4, §13, §14, §15.1, §15.2, §16, §17, §22, `lactose-anim`)
+- Why: the facade is written before its implementation so `game-sim`, the milestone 1 netcode
+  spike's predicted character, `predict`, `net`, presentation and the cooker build against the
+  final surface; each choice below is one the sections did not settle, and each is a contract
+  in `crates/anim/README.md`.
+  - *The phase is a `u32` fraction of its clip in units of `1 / 2^32`*, advanced by an integer
+    rate per tick: the speed taken to Q16.16 once (toward zero, clamped; a speed below one
+    Q16.16 unit gives rate zero), then `ceil(2^32 × q / (duration_ticks × 2^16))` in 128-bit
+    integers, clamped to `u32::MAX`; wrapping for a loop, saturating at `END` for a one-shot.
+    The ceiling makes a one-shot of `d` ticks end on tick `d`, a mark at `f / d` cross on tick
+    `f` and a loop wrap on tick `d` until the ceiling's lead sums to a rate (the first early
+    wrap comes after at least `2^32 / (d − 1)` ticks: at 60 Hz, 452 hours at `d = 60`, 191
+    hours at `d = 600`, 2.78 hours at the shortest among loops up to two minutes); the
+    fixed-point speed makes both scalar widths compute one rate. `AnimState` is integers only,
+    so a predicted character's state compares with the server's by bytes and needs no
+    tolerance; a crossing is reported exactly once per pass over a mark (`phase_crossed`,
+    section 6.1's test, takes a `Phase`; the entry phase counts on the entry tick only when the
+    entry set it, never when a `keep_phase` transition kept it, so a walk-to-run transition
+    does not double a footstep; a tick the advance holds, its machine or clip missing, is
+    marked held and reports no crossing and no entry, so a hold does not repeat the last
+    advance's marks; the one exception is a hold on the tick that entered the initial state,
+    which is not marked held, so that tick reports the entry and its entry phase once and the
+    held ticks after it report nothing); a re-cooked clip with another sample count leaves a
+    stored phase valid. Rules out a scalar phase (a tolerance question on every replicated
+    character), a frame-indexed phase (a re-cook changes a save's meaning) and a truncated rate
+    (a tick late on every duration that is not a power of two, and a different tick under each
+    scalar width).
+  - *Parameters are a persistent, replicated component the game writes and the advance reads*:
+    eight scalar values, level flags, and triggers consumed by the first advance that tries
+    transitions after they were set, so a trigger fires at most one transition; the bits are
+    checked. Persistent because a parameter holds like an animator's parameter and a transient
+    column would need a declared game writer every tick for the schedule to build; replicated
+    because the kernel that reads it runs in the prediction world (D121). A value derived from
+    a solver-written row is quantised to an integer grid first (`AnimParams::quantise`), D124's
+    rule, or taken from the input; the two sides' values then differ only when a grid midpoint
+    lies between the two quantities, a rare and ordinary correction. Rules out an event-driven
+    machine, a transient parameter column and an unquantised speed parameter (a mismatch on
+    every absorbed residual).
+  - *The sim pose is root-local, transient and extracted*: for an animated character evaluated
+    in `Stage::Simulation` from the state and the clips alone, valid for the whole tick, placed
+    by whichever root `Transform` the reader holds (`SimPose::world`), so one evaluation serves
+    hit volumes in the simulation stage, the stepped root in the post stage and presentation's
+    interpolated root; for a limp character written by the ragdoll fit in the server world's
+    `Stage::Post`, so its pose exists there from `sets::FIT` on and is empty before, and is
+    empty all tick in a prediction world; transient so it is zeroed, hashed (SOUR catches a
+    layout-dependent evaluation) and never saved; extracted so presentation reads the sim
+    bones, fitted or evaluated, from the snapshot. Rules out a world-space pose, a derived
+    pose, a resource and a persistent fitted pose (a second solver-derived replicated field).
+  - *Sixteen sim bones at most, sockets as offsets.* A pose of eight-byte scalars is 904 bytes,
+    under the ECS's 1 KiB warning; hips, spine, chest, head, limbs, hands and feet fit; a
+    socket composes on demand. Rules out a variable-length pose and a bone per socket.
+  - *The pose drives kinematic bone rows through `Commands::set` in `Stage::Post`; limp,
+    dynamic bone rows drive the pose through `BoneMoved` events, and the fit composes the
+    bodiless bones onto their fitted parents.* A kernel reads its own row only, so the
+    cross-row paths are commands and events; writing the bones after the write-back puts no
+    `Transform` writer in the stage the game moves the root in, and the bodies lag the root by
+    one step either way. The sweep declares no write of `Transform`: its commands apply at the
+    closing sync point, so a declaration would order every `Stage::Post` reader of `Transform`
+    against it for nothing and falsify physics-api's no-edge rule. Two colliders touch only
+    when each one's filter meets the other's membership, so the bone collider rule is on the
+    group set, not on one collider: over a skeleton's bodies the OR of the memberships and the
+    OR of the filters share no bit (checked at load), every skeleton's bones use the one bone
+    group set the game keeps, and a bone's filter excludes the character capsule's membership;
+    `Joint` has no contacts flag and groups are per collider, not per pair. The bone rows are
+    what `physics-api`'s consumer sketch anticipated: `Transform`, a kinematic `RigidBody`, a
+    `Collider`, `OwnedBy` and a `BoneLink`, joints as `Joint` rows owned by the bone row. Rules
+    out bones evaluating themselves, a once-per-tick or exclusive writer, bodies as a
+    physics-side feature, and a fit that leaves the clip pose on the hands and feet.
+  - *Bone rows are the server's alone, in every session.* `Bones::spawn` and `Bones::set_limp`
+    are called from server-only systems and the three `Stage::Post` systems declare `worlds =
+    [server]`, so the rows' keys are runtime `NetId`s with no claim, `predict`'s destruction of
+    an unechoed predicted spawn and the full frame's unload never meet them, the prediction
+    world has none, predicted queries hit capsules only (the server's hit test, which sees the
+    bones, is authoritative), and a limp local character's pose is empty in prediction and
+    ragdolled by presentation as a remote one is. A limp local character's root, moved by a
+    server-only system with the claim kept, would be a correction with a re-simulation on every
+    frame it moves, the storm D124 rejects; so by default the server keeps the root still while
+    the character is limp (the motion lives in the pose and in presentation, and moving the
+    root to the hips is part of getting up, deferred), or a game releases the local player's
+    claim while it is limp so the root follows the server's proxy rows
+    (`crates/predict/README.md`, the hook row). `Bones` stays replicated because the evaluation
+    that reads it runs in the prediction world; its value is the server's alone. The rows are
+    not to go on the wire: sent, they would be the solver-derived replicated state D124 forbids
+    (a kinematic bone's `Transform` is `SimPose::world` of a root whose residual the tolerance
+    absorbed, with the write-back's `Velocity` beside it), at about 150 KB a tick per client
+    for 200 characters (computed from `net-host`'s documented sizes). The mechanism is
+    `lactose-net-api`'s `Unreplicated` marker, skipped by the gather and left out of the region
+    relevance message by `lactose-persist`, both proposed below; until they land, `Bones` is
+    not used in a networked session, since a bone row's components replicate today like any
+    row's; the milestone 1 spike's character has none. Rules out predicted bone rows (they need
+    exemptions from `predict`'s unechoed-spawn destruction and the full frame's unload, and a
+    way to spawn the rows of a character that arrives with `Bones`), replicating bone rows
+    under the root's tolerance and keeping a character with bones kinematic in prediction.
+  - *Six sets, one of them the game's.* `DRIVE` is declared by this crate and holds the game's
+    parameter writers, since a set has `after` edges only; `ADVANCE`, `EVALUATE` in
+    `Stage::Simulation` and `REPORT`, `FIT`, `BONES` in `Stage::Post` are the chains a game
+    orders itself after (the three `Stage::Post` sets are empty in a prediction world); the
+    schedule refuses an unordered game system that touches the crate's components; a
+    `Stage::Post` reader of `Transform` needs no edge.
+  - *Three simulation asset kinds with pure-decoder loaders, the byte form named only.* `Clip`
+    (samples per bone, a root track, events, cooked for one skeleton), `StateMachine` (states
+    playing clips at a finite non-negative speed, ordered transitions with conjunctive
+    conditions, cuts, timed blends and restarts, phase kept or set on entry) and `Skeleton`
+    (bones parents-first with roles, rest poses and ragdoll bodies under the collider rule;
+    sockets); each validates at load; the cooker fixes the bytes with the implementation lane.
+    Rules out a machine authored in Rust (section 18) and a per-tick bone-name match.
+  - *Root motion is an output the movement system applies*: `RootMotion` per tick in the
+    character's space at the tick's start (the root track's difference turned back by the yaw
+    already turned, the wrap handled likewise), `apply` composing it onto a kinematic root,
+    `velocity` replacing a dynamic root's horizontal and yaw velocity with what covers it and
+    keeping the rest of the row's velocity, the vertical being the game's (gravity, jumps), so
+    the solver turns the body with no placement and no `Teleported`; this crate declares no
+    write of `Transform` or `Velocity`. Rules out anim moving the root, a clip-start-space
+    displacement (wrong for any clip that turns) and a velocity that overwrites the fall the
+    solver accumulated.
+  - *The advance is one fixed sequence per tick*: machine lookup (a hold if missing), enter the
+    initial state if unset or out of range, end a blend it cannot continue, clip lookup (a hold
+    if missing), at most one transition tried before the phase moves, tick count (clearing the
+    held mark), rate (with `speed_param`) and blend, root motion, events in the order passed,
+    triggers cleared when transitions were tried; a hold marks the state held and changes
+    nothing else, except that a hold on the tick that entered the initial state does not mark
+    it, so the entry is reported on that tick; `Finished` is taken the tick after `END`.
+  - *The 0.5 ms for 200 characters is the evaluation alone*, measured by `tests/cost.rs`:
+    release, 200 sixteen-bone characters without `Bones`, a cross-fade on half,
+    `SimPose::evaluate` alone and `Simulation::step` against the same world whose characters
+    lack `SimPose`, one and four workers, with load averages; the step difference is the
+    criterion, and the bone commands with a body on every bone are a third figure outside it
+    (review r1 measured 0.25 to 0.28 µs per bone command at 3,200 bones, about a third of
+    D119's 0.8 µs at 100k rows).
+  - Named and deferred: blend spaces, layers and additive clips, IK, getting up from a ragdoll
+    (the root moved to the hips included), bone rows in a networked session (`net-api`'s
+    marker, `net-host`'s gather skip, `persist`'s relevance filter), bone rows in the
+    prediction world (a predicted ragdoll and predicted hits on bones), `Joint::contacts`,
+    remote phase interpolation (`net-host`), clip compression, the SOUR test and `[harness]`
+    entry, `tracing` at target `anim`.
+- Driven by: milestone 1, the `anim` facade brief and its reviews r1 (2026-10-18), r2 and r3
+  (2026-10-24).
+
 ## 10. Review history
 
 - **Revision 1** (`a29af04`): the design baseline.

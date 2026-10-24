@@ -177,6 +177,7 @@ transitive = [
 "lactose-ecs" = { normal = ["bytemuck", "tracing"] }
 "lactose-sim" = { normal = ["tracing"], dev = ["xxhash-rust"] }
 "lactose-physics-api" = { normal = ["tracing"] }
+"lactose-anim" = { normal = ["tracing"] }
 # D119: the solver and its math (rapier3d-f64 is the vendored, patched copy under vendor/),
 # its thread pool, and serde with postcard for the snapshot bytes.
 "lactose-physics-rapier" = { normal = [

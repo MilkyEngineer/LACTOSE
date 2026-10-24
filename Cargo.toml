@@ -25,6 +25,7 @@ lactose-bundle = { path = "crates/bundle" }
 lactose-sim = { path = "crates/sim" }
 lactose-physics-api = { path = "crates/physics-api" }
 lactose-physics-rapier = { path = "crates/physics-rapier" }
+lactose-anim = { path = "crates/anim" }
 lactose-predict = { path = "crates/predict" }
 lactose-input = { path = "crates/input" }
 lactose-input-host = { path = "crates/input-host" }

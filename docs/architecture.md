@@ -445,10 +445,13 @@ fn apply_damage(events: Events<Damage>, key: StableKeyOf, hp: Mut<Health>) {
 }
 
 // Presentation event. Keyed by (origin key, tick, kind, sequence) so rollback re-emission
-// deduplicates and events from mispredicted ticks are cancelled.
-#[system(name = "game_sim::footsteps", worlds = [server, prediction])]
+// deduplicates and events from mispredicted ticks are cancelled. `Phase` is
+// `lactose_anim`'s integer clip fraction; the set orders the reader after the advance that
+// writes `AnimState`, or the schedule refuses the build.
+static ANIM_READERS: SystemSet = SystemSet::new("game_sim::anim_readers").after(&[&lactose_anim::sets::ADVANCE]);
+#[system(name = "game_sim::footsteps", worlds = [server, prediction], in_set = ANIM_READERS)]
 fn footsteps(present: PresentEvents, key: StableKeyOf, anim: &AnimState) {
-    if anim.phase_crossed(0.5) { present.emit(*key, AudioRequest::Footstep); }
+    if anim.phase_crossed(Phase::HALF) { present.emit(*key, AudioRequest::Footstep); }
 }
 
 // Exclusive system: runs alone at a sync point with the whole world.
@@ -1087,7 +1090,10 @@ including `snapshot` and `restore`.
 
 `anim` is inside the boundary: state machines, phase, events, root motion, and a deterministic
 sim skeleton covering sockets, hands, feet, head and ragdoll bodies. Full pose evaluation and
-skinning are presentation and renderer work.
+skinning are presentation and renderer work. The phase is an integer fraction of the clip, the sim
+pose is root-local and evaluated once per tick for an animated character, root motion is an output
+the game's movement system applies, and bone rows are physics bodies the pose drives or, limp, that
+drive it, in the server world alone. D128.
 
 ## 18. Gameplay authoring
 
