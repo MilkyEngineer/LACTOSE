@@ -55,6 +55,11 @@ pub(crate) enum Point<'a> {
     Started(&'a Request),
     /// A replace's temporary, just created, before anything is written to it.
     Created(&'a Path),
+    /// A replace's temporary, written and just synced, before the rename; then its
+    /// directory, just synced after the rename (on Windows, which has no directory sync,
+    /// just after the rename). Told by the sync functions themselves, so a replace that
+    /// skips a sync tells nothing for it.
+    Synced(&'a Path),
 }
 
 /// The observer of [`Point`]s a test starts a pool with.
@@ -219,10 +224,14 @@ impl BlockingPool {
             }
             Request::Replace { path, bytes, complete } => {
                 #[cfg(test)]
-                let created = |temporary: &Path| self.observe(Point::Created(temporary));
+                let (created, synced) = (
+                    |temporary: &Path| self.observe(Point::Created(temporary)),
+                    |synced: &Path| self.observe(Point::Synced(synced)),
+                );
                 #[cfg(not(test))]
-                let created = |_: &Path| {};
-                let result = replace(&self.swept, &path, bytes, &created, sync_directory);
+                let (created, synced) = (|_: &Path| {}, |_: &Path| {});
+                let steps = Steps { created: &created, synced: &synced, sync_directory };
+                let result = replace(&self.swept, &path, bytes, &steps);
                 complete.complete(result);
                 self.release(&path);
             }
@@ -318,8 +327,10 @@ impl Backend for BlockingPool {
 
     fn join(&self) {
         self.stop();
-        let threads = std::mem::take(&mut *lock(&self.threads));
-        for thread in threads {
+        // Held across the joins, so a second `join` that runs at once returns only once
+        // every thread has exited too. No pool thread takes this lock.
+        let mut threads = lock(&self.threads);
+        for thread in threads.drain(..) {
             thread.join();
         }
     }
@@ -533,13 +544,13 @@ fn read_file_with(path: &Path, between: impl FnOnce()) -> Result<Vec<u8>> {
 ///    leftover is never reused; `<token>` is [`token`] and `<counter>` the process-wide
 ///    [`COUNTER`], each as eight lower-case hex digits. On `AlreadyExists` take the next
 ///    counter value and try again, [`CREATE_ATTEMPTS`] times in all, then `Io`. `NotFound`
-///    if the directory does not exist. `created` is told the temporary's path.
-/// 3. `write_all(bytes)`, then `sync_all` (`fsync`; `F_FULLFSYNC` on Apple platforms,
-///    which `std` issues for `sync_all`; `FlushFileBuffers` on Windows). `StorageFull`
-///    from either step.
+///    if the directory does not exist. `steps.created` is told the temporary's path.
+/// 3. `write_all(bytes)`, then [`sync_file`] (`sync_all`: `fsync`; `F_FULLFSYNC` on Apple
+///    platforms, which `std` issues for `sync_all`; `FlushFileBuffers` on Windows).
+///    `StorageFull` from either step.
 /// 4. `rename` the temporary over `path`. Same directory, so never across volumes.
-/// 5. `sync_directory`: on Unix, open the directory and `sync_all` it, so the rename is
-///    durable too.
+/// 5. `steps.sync_directory`, which is [`sync_directory`] but in a test: on Unix, open the
+///    directory and `sync_all` it, so the rename is durable too.
 ///
 /// A failure in steps 2 to 4 removes the temporary file (best effort) and leaves `path` as
 /// it was, with the kind [`os_error`] gives. A failure in step 5 is `Io` whatever the
@@ -550,21 +561,33 @@ fn replace(
     swept: &Mutex<HashSet<PathBuf>>,
     path: &Path,
     bytes: Vec<u8>,
-    created: &dyn Fn(&Path),
-    sync_directory: fn(&Path) -> std::io::Result<()>,
+    steps: &Steps<'_>,
 ) -> Result<(), ReplaceFailed> {
-    match write_and_rename(swept, path, &bytes, created, sync_directory) {
+    match write_and_rename(swept, path, &bytes, steps) {
         Ok(()) => Ok(()),
         Err(error) => Err(ReplaceFailed { error, bytes }),
     }
 }
 
+/// What a replace tells of its steps, and how it syncs the directory: the pool passes
+/// observers that do nothing outside the crate's tests, and [`sync_directory`].
+struct Steps<'a> {
+    /// Told the temporary's path once it is created, before anything is written to it.
+    created: &'a Told<'a>,
+    /// Told by [`sync_file`] and [`sync_directory`] what they synced.
+    synced: &'a Told<'a>,
+    /// The directory sync after the rename, given `synced`.
+    sync_directory: fn(&Path, &Told<'_>) -> std::io::Result<()>,
+}
+
+/// An observer of one kind of step of a replace, told the path the step was about.
+type Told<'a> = dyn Fn(&Path) + 'a;
+
 fn write_and_rename(
     swept: &Mutex<HashSet<PathBuf>>,
     path: &Path,
     bytes: &[u8],
-    created: &dyn Fn(&Path),
-    sync_directory: fn(&Path) -> std::io::Result<()>,
+    steps: &Steps<'_>,
 ) -> Result<()> {
     let Some(name) = path.file_name() else {
         return Err(Error::new(ErrorKind::Io, format!("{} names no file", path.display())));
@@ -575,15 +598,15 @@ fn write_and_rename(
     };
     sweep(swept, directory);
     let (temporary, mut file) = create_temporary(directory, name)?;
-    created(&temporary);
-    let written = file.write_all(bytes).and_then(|()| file.sync_all());
+    (steps.created)(&temporary);
+    let written = file.write_all(bytes).and_then(|()| sync_file(&file, &temporary, steps.synced));
     // Closed before the rename: Windows renames an open file only with delete sharing.
     drop(file);
     if let Err(error) = written.and_then(|()| std::fs::rename(&temporary, path)) {
         let _ = std::fs::remove_file(&temporary);
         return Err(os_error(error, REPLACE));
     }
-    sync_directory(directory).map_err(|error| {
+    (steps.sync_directory)(directory, steps.synced).map_err(|error| {
         Error::new(
             ErrorKind::Io,
             format!(
@@ -619,18 +642,21 @@ fn create_temporary(directory: &Path, name: &OsStr) -> Result<(PathBuf, std::fs:
     })
 }
 
+/// `file.sync_all()`, then `synced` told `path`.
+fn sync_file(file: &std::fs::File, path: &Path, synced: &Told<'_>) -> std::io::Result<()> {
+    file.sync_all()?;
+    synced(path);
+    Ok(())
+}
+
 /// The directory sync after a rename: on Unix the directory opened and `sync_all`ed, so the
-/// rename itself is durable. Windows has no directory sync; `io` does not attempt one.
-fn sync_directory(directory: &Path) -> std::io::Result<()> {
+/// rename itself is durable; then `synced` told `directory`. Windows has no directory sync;
+/// `io` does not attempt one.
+fn sync_directory(directory: &Path, synced: &Told<'_>) -> std::io::Result<()> {
     #[cfg(unix)]
-    {
-        std::fs::File::open(directory)?.sync_all()
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = directory;
-        Ok(())
-    }
+    std::fs::File::open(directory)?.sync_all()?;
+    synced(directory);
+    Ok(())
 }
 
 /// The first replace into `directory` through this pool, keyed as spelled, inserts its key
@@ -781,10 +807,12 @@ mod tests {
         let path = scratch.path("slot");
         std::fs::write(&path, b"old").unwrap();
         let swept = Mutex::new(HashSet::new());
-        let fails = |_: &Path| Err(std::io::Error::from(std::io::ErrorKind::NotFound));
+        let fails =
+            |_: &Path, _: &Told<'_>| Err(std::io::Error::from(std::io::ErrorKind::NotFound));
+        let steps = Steps { created: &|_| {}, synced: &|_| {}, sync_directory: fails };
         let bytes = b"new".to_vec();
         let pointer = bytes.as_ptr();
-        let failed = replace(&swept, &path, bytes, &|_| {}, fails).unwrap_err();
+        let failed = replace(&swept, &path, bytes, &steps).unwrap_err();
         assert_eq!(failed.error.kind(), ErrorKind::Io, "{}", failed.error);
         assert_eq!(failed.bytes.as_ptr(), pointer);
         assert_eq!(std::fs::read(&path).unwrap(), b"new");

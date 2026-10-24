@@ -253,6 +253,7 @@ impl Recorder {
                     recorder.gate.hold();
                 }
             }
+            Point::Synced(path) => lock(&recorder.seen).push(format!("synced {}", name(path))),
         })
     }
 
@@ -462,6 +463,61 @@ fn replaces_of_two_paths_run_at_once() {
     assert_eq!(std::fs::read(scratch.path("two")).unwrap(), b"2");
 }
 
+/// A replace that waits behind another of its path joins the back of the queue when that
+/// one finishes, or is skipped because its future was dropped: it starts after every
+/// request first polled while it waited.
+#[test]
+fn a_replace_released_from_behind_another_of_its_path_joins_the_back_of_the_queue() {
+    let scratch = Scratch::new();
+    for name in ["held", "r1", "r2"] {
+        std::fs::create_dir(scratch.path(name)).unwrap();
+    }
+    let recorder = Recorder::holding_started(&["read_dir held"]);
+    let io = Io::start_hooked(&StdPlatform, threads(1), recorder.hook()).unwrap();
+    let mut held = io.read_dir(scratch.path("held"));
+    assert!(poll_once(&mut held).is_pending());
+    recorder.gate.arrived(1);
+    let mut a = io.replace(scratch.path("one"), b"A".to_vec());
+    let mut b = io.replace(scratch.path("one"), b"B".to_vec());
+    let mut r1 = io.read_dir(scratch.path("r1"));
+    let mut x = io.replace(scratch.path("two"), b"X".to_vec());
+    let mut y = io.replace(scratch.path("two"), b"Y".to_vec());
+    let mut r2 = io.read_dir(scratch.path("r2"));
+    for future in [&mut a, &mut b] {
+        assert!(poll_once(future).is_pending());
+    }
+    assert!(poll_once(&mut r1).is_pending());
+    for future in [&mut x, &mut y] {
+        assert!(poll_once(future).is_pending());
+    }
+    assert!(poll_once(&mut r2).is_pending());
+    // Dropped while queued: Y is released when the thread reaches X and skips it.
+    drop(x);
+    recorder.gate.open();
+    for future in [&mut held, &mut r1, &mut r2] {
+        wait(future).unwrap();
+    }
+    for future in [&mut a, &mut b, &mut y] {
+        wait(future).unwrap();
+    }
+    io.shutdown();
+    let starts: Vec<String> =
+        recorder.seen().into_iter().filter(|line| line.starts_with("start")).collect();
+    assert_eq!(
+        starts,
+        [
+            "start read_dir held",
+            "start replace one A",
+            "start read_dir r1",
+            "start read_dir r2",
+            "start replace one B",
+            "start replace two Y",
+        ]
+    );
+    assert_eq!(std::fs::read(scratch.path("one")).unwrap(), b"B");
+    assert_eq!(std::fs::read(scratch.path("two")).unwrap(), b"Y");
+}
+
 // ---- The atomic replace: temporaries ----
 
 #[test]
@@ -487,6 +543,56 @@ fn the_temporary_is_created_beside_the_path() {
     io.shutdown();
     assert_eq!(scratch.names(), ["saves"]);
     assert_eq!(std::fs::read(&slot).unwrap(), b"save");
+}
+
+/// Each step of a replace through the pool, with what the files hold at it: the temporary
+/// is written before it is synced, the rename comes after that sync, and the directory is
+/// synced after the rename. The sync functions themselves tell the hook, so a replace that
+/// skips one shows a step fewer.
+#[test]
+fn a_replace_writes_and_syncs_its_temporary_then_renames_then_syncs_the_directory() {
+    let scratch = Scratch::new();
+    let saves = scratch.path("saves");
+    std::fs::create_dir(&saves).unwrap();
+    let slot = saves.join("slot0.carton");
+    std::fs::write(&slot, b"old").unwrap();
+    let steps = Arc::new(Mutex::new(Vec::new()));
+    let hook: Hook = {
+        let (steps, slot) = (Arc::clone(&steps), slot.clone());
+        Arc::new(move |point| {
+            let read = |path: &Path| match std::fs::read(path) {
+                Ok(bytes) => String::from_utf8(bytes).unwrap(),
+                Err(error) => format!("{:?}", error.kind()),
+            };
+            let step = match point {
+                Point::Created(temporary) => format!("created, holding {:?}", read(temporary)),
+                Point::Synced(path) if path.extension() == Some("tmp".as_ref()) => format!(
+                    "synced the temporary, holding {:?}, the slot {:?}",
+                    read(path),
+                    read(&slot)
+                ),
+                Point::Synced(path) => format!(
+                    "synced {}, the slot holding {:?}, {} entries",
+                    name(path),
+                    read(&slot),
+                    std::fs::read_dir(path).unwrap().count()
+                ),
+                Point::Submitted(_) | Point::Started(_) => return,
+            };
+            lock(&steps).push(step);
+        })
+    };
+    let io = Io::start_hooked(&StdPlatform, threads(1), hook).unwrap();
+    wait(&mut io.replace(&slot, b"new".to_vec())).unwrap();
+    io.shutdown();
+    assert_eq!(
+        *lock(&steps),
+        [
+            "created, holding \"\"",
+            "synced the temporary, holding \"new\", the slot \"old\"",
+            "synced saves, the slot holding \"new\", 1 entries",
+        ]
+    );
 }
 
 #[test]
@@ -592,11 +698,12 @@ fn a_temporary_name_already_taken_is_skipped() {
 
 // ---- The pool ----
 
-/// A platform that records each thread it is asked for and each join, and refuses the
-/// spawn numbered `refuse`.
+/// A platform that records each thread it is asked for, each join begun and ended and each
+/// thread's exit, and refuses the spawn numbered `refuse`.
 #[derive(Default)]
 struct Spy {
     specs: Mutex<Vec<(String, ThreadClass, u32)>>,
+    joining: Arc<AtomicU32>,
     joined: Arc<AtomicU32>,
     exited: Arc<AtomicU32>,
     refuse: Option<usize>,
@@ -625,8 +732,9 @@ impl Platform for Spy {
                 exited.fetch_add(1, Ordering::SeqCst);
             }),
         )?;
-        let joined = Arc::clone(&self.joined);
+        let (joining, joined) = (Arc::clone(&self.joining), Arc::clone(&self.joined));
         Ok(ThreadHandle::new(move || {
+            joining.fetch_add(1, Ordering::SeqCst);
             thread.join();
             joined.fetch_add(1, Ordering::SeqCst);
         }))
@@ -727,6 +835,46 @@ fn shutdown_cancels_what_waits_finishes_what_started_and_joins() {
     wait(&mut started).unwrap();
     assert_eq!(std::fs::read(&slot).unwrap(), b"A");
     assert_eq!(recorder.count("start"), 1);
+}
+
+/// Two `shutdown`s at once: the second, called while the first is joining a thread held in
+/// a request, returns only after that thread has exited, as the first does.
+#[test]
+fn every_shutdown_called_at_once_returns_after_every_thread_has_exited() {
+    let scratch = Scratch::new();
+    std::fs::create_dir(scratch.path("held")).unwrap();
+    let recorder = Recorder::holding_started(&["read_dir held"]);
+    let spy = Spy::default();
+    let io = Io::start_hooked(&spy, threads(1), recorder.hook()).unwrap();
+    let mut held = io.read_dir(scratch.path("held"));
+    assert!(poll_once(&mut held).is_pending());
+    recorder.gate.arrived(1);
+    let shutdown = |io: Io| {
+        let exited = Arc::clone(&spy.exited);
+        std::thread::spawn(move || {
+            io.shutdown();
+            exited.load(Ordering::SeqCst)
+        })
+    };
+    let first = shutdown(io.clone());
+    let deadline = Instant::now() + LIMIT;
+    while spy.joining.load(Ordering::SeqCst) < 1 {
+        assert!(Instant::now() < deadline, "the first shutdown never began to join");
+        std::thread::yield_now();
+    }
+    let second = shutdown(io);
+    // Time for a second shutdown that does not wait to return. The assertions are on what
+    // it saw and whether it returned with the thread held, never on how long it took.
+    let grace = Instant::now() + Duration::from_millis(200);
+    while !second.is_finished() && Instant::now() < grace {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert!(!second.is_finished(), "the second shutdown returned with a thread running");
+    recorder.gate.open();
+    assert_eq!(first.join().unwrap(), 1);
+    assert_eq!(second.join().unwrap(), 1);
+    assert_eq!(spy.joined.load(Ordering::SeqCst), 1);
+    assert_eq!(wait(&mut held).unwrap(), Vec::new());
 }
 
 #[test]

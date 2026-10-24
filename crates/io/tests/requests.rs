@@ -3,9 +3,13 @@
 //! replace as a caller sees it, directories, and what a stopped pool answers. The proofs
 //! that hold a pool thread at a chosen point are the crate's unit tests in `src/tests.rs`.
 //!
-//! The counts of `AllocTag::Io` assume one process per test, as `cargo nextest` runs them.
+//! The counts of `AllocTag::Io` and the largest block asked of the allocator assume one
+//! process per test, as `cargo nextest` runs them.
+//!
+//! The one `unsafe` in the crate is here: the tests' allocator records the largest block
+//! asked of it, to prove a request above the cap allocates nothing near it (`SAFETY.md`).
 
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 
 mod common;
 
@@ -21,7 +25,53 @@ use zstd::zstd_safe::CParameter;
 use common::{LIMIT, Scratch, frame, poll_with, start, text, wait};
 
 #[global_allocator]
-static ALLOCATOR: TaggedAlloc = TaggedAlloc::system();
+static ALLOCATOR: TaggedAlloc<largest::Largest> = TaggedAlloc::new(largest::Largest);
+
+/// The system allocator, recording the largest block asked of it.
+#[allow(unsafe_code, reason = "a `GlobalAlloc` is an `unsafe` trait; see `SAFETY.md`")]
+mod largest {
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static LARGEST: AtomicUsize = AtomicUsize::new(0);
+
+    /// The size of the largest block asked for since the last call, on any thread (the
+    /// tagged allocator above asks for one byte more than its caller).
+    pub(crate) fn take() -> usize {
+        LARGEST.swap(0, Ordering::SeqCst)
+    }
+
+    pub(crate) struct Largest;
+
+    // SAFETY: every method forwards its arguments unchanged to `System` and returns what
+    // `System` returns, so `System`'s guarantees are this allocator's; recording a size
+    // touches no block.
+    unsafe impl GlobalAlloc for Largest {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            LARGEST.fetch_max(layout.size(), Ordering::Relaxed);
+            // SAFETY: the caller upholds `alloc`'s contract, which is `System`'s.
+            unsafe { System.alloc(layout) }
+        }
+
+        unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+            LARGEST.fetch_max(layout.size(), Ordering::Relaxed);
+            // SAFETY: the caller upholds `alloc_zeroed`'s contract, which is `System`'s.
+            unsafe { System.alloc_zeroed(layout) }
+        }
+
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            // SAFETY: `ptr` was allocated by `System` with `layout`, through this allocator.
+            unsafe { System.dealloc(ptr, layout) }
+        }
+
+        unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+            LARGEST.fetch_max(new_size, Ordering::Relaxed);
+            // SAFETY: `ptr` was allocated by `System` with `layout`, through this allocator,
+            // and the caller upholds the rest of `realloc`'s contract, which is `System`'s.
+            unsafe { System.realloc(ptr, layout, new_size) }
+        }
+    }
+}
 
 fn zstd(decoded_len: usize) -> Encoding {
     Encoding::Zstd { decoded_len: decoded_len as u64 }
@@ -92,8 +142,25 @@ fn a_length_above_the_cap_is_resource_exhausted_before_any_allocation() {
     // the file and resolved `Ok`.
     let large = scratch.path("large");
     std::fs::File::create(&large).unwrap().set_len(above).unwrap();
-    assert_eq!(wait(io.read_file(&large)).unwrap_err().kind(), ErrorKind::ResourceExhausted);
+    let mut read = io.read_file(&large);
+    largest::take();
+    assert_eq!(wait(&mut read).unwrap_err().kind(), ErrorKind::ResourceExhausted);
+    let largest = largest::take();
+    assert!(largest < 1 << 20, "a block of {largest} bytes was asked for");
     io.shutdown();
+}
+
+#[test]
+fn the_tests_allocator_records_the_largest_block_asked_of_it() {
+    largest::take();
+    let mut bytes = vec![0u8; 3000];
+    bytes.reserve_exact(5000);
+    bytes.shrink_to(10);
+    drop(bytes);
+    drop(Vec::<u8>::with_capacity(100));
+    // The tagged allocator asks for one byte more; only the reallocation asks for 8000.
+    assert!(largest::take() >= 8001);
+    assert!(largest::take() < 8001);
 }
 
 #[test]
@@ -459,6 +526,23 @@ fn a_replace_of_a_bare_name_lands_in_the_current_directory() {
     io.shutdown();
     assert_eq!(std::fs::read(scratch.path("slot0.carton")).unwrap(), b"newer");
     assert_eq!(scratch.names(), ["slot0.carton"]);
+}
+
+/// A replace whose last component is a symbolic link renames over the link: the path
+/// becomes a file holding the bytes, and the link's target keeps its content.
+#[cfg(unix)]
+#[test]
+fn a_replace_of_a_symbolic_link_replaces_the_link_and_leaves_its_target() {
+    let scratch = Scratch::new();
+    std::fs::write(scratch.path("target"), b"old").unwrap();
+    std::os::unix::fs::symlink(scratch.path("target"), scratch.path("link")).unwrap();
+    let io = start(1);
+    wait(io.replace(scratch.path("link"), b"new".to_vec())).unwrap();
+    io.shutdown();
+    assert!(std::fs::symlink_metadata(scratch.path("link")).unwrap().file_type().is_file());
+    assert_eq!(std::fs::read(scratch.path("link")).unwrap(), b"new");
+    assert_eq!(std::fs::read(scratch.path("target")).unwrap(), b"old");
+    assert_eq!(scratch.names(), ["link", "target"]);
 }
 
 // ---- Directories ----

@@ -181,9 +181,9 @@ impl fmt::Debug for File {
 /// the read completes or the future is dropped.
 ///
 /// Polling an encoded read whose stored bytes have arrived decodes a slice of them on the
-/// polling thread, about 0.5 ms of work in steps of about 64 KiB of output, then wakes
-/// itself and returns `Pending` until the frame is done, as section 5.1's background CPU
-/// work yields.
+/// polling thread, about 0.5 ms of work in steps of at most 64 KiB of output and 64 KiB of
+/// stored input, then wakes itself and returns `Pending` until the frame is done, as
+/// section 5.1's background CPU work yields.
 #[must_use = "a read does nothing until polled"]
 pub struct ReadAt {
     pub(crate) state: ReadState,

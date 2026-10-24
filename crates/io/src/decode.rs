@@ -23,8 +23,8 @@ pub(crate) const SLICE: Duration = Duration::from_micros(500);
 /// never compresses with a window log above it.
 pub(crate) const WINDOW_LOG_MAX: u32 = 27;
 
-/// The output one step of a slice gives the stream, about 64 KiB, between two looks at the
-/// clock.
+/// The most output, and the most stored input, one step of a slice gives the stream: about
+/// 64 KiB each, between two looks at the clock.
 pub(crate) const STEP: usize = 64 << 10;
 
 /// zstd's frame magic number, little-endian at the start of every frame that is not
@@ -130,12 +130,15 @@ impl Decode {
     /// Each step zero-fills `decoded` up to `end = min(written + STEP, decoded_len)` (the
     /// capacity is already reserved, so this never allocates) and calls `decompress_stream`
     /// with `OutBuffer::around_pos(&mut decoded[..end], written)` and an `InBuffer` over
-    /// `stored` at `consumed`, then checks the clock. The output given to one call is never
-    /// the whole spare capacity: with output room for the frame's whole content and the
-    /// whole frame as input, zstd takes its single-pass shortcut and decodes the frame in
-    /// one call however long it is, the very wait this slicing exists to cut. Writing into
-    /// the spare capacity without zero-filling needs zstd-safe's `unsafe` `WriteBuf`, which
-    /// this crate forbids.
+    /// `stored[..min(consumed + STEP, len)]` at `consumed`, then checks the clock. Both
+    /// sides are bounded, because one call's time grows with either. With output room for
+    /// the frame's whole content and the whole frame as input, zstd takes its single-pass
+    /// shortcut and decodes the frame in one call however long it is. With the whole frame
+    /// as input and only the output bounded, one call consumes every block that writes
+    /// nothing (a frame of millions of empty blocks) or little (blocks of one byte each),
+    /// so its time grows with the stored size. Either is the very wait this slicing exists
+    /// to cut. Writing into the spare capacity without zero-filling needs zstd-safe's
+    /// `unsafe` `WriteBuf`, which this crate forbids.
     ///
     /// `Ready(Ok)` with exactly `decoded_len` bytes once the stream reports the frame
     /// complete with every stored byte consumed and the output full. `Ready(Err)` with
@@ -145,15 +148,15 @@ impl Decode {
     /// waker and returns `Pending`, which puts a task behind the other ready tasks of its
     /// class.
     pub(crate) fn poll_slice(&mut self, cx: &mut Context<'_>) -> Poll<Result<Vec<u8>>> {
-        self.poll_observed(cx, &mut |_| {})
+        self.poll_observed(cx, &mut |_, _| {})
     }
 
     /// [`Decode::poll_slice`], telling `observe` the bytes each `decompress_stream` call
-    /// wrote.
+    /// wrote and the stored bytes it consumed, in that order.
     fn poll_observed(
         &mut self,
         cx: &mut Context<'_>,
-        observe: &mut dyn FnMut(usize),
+        observe: &mut dyn FnMut(usize, usize),
     ) -> Poll<Result<Vec<u8>>> {
         let _entered = self.span.clone().entered();
         let result = self.slice(observe);
@@ -175,7 +178,7 @@ impl Decode {
     }
 
     /// One slice: `None` if it ran out of time before the frame ended.
-    fn slice(&mut self, observe: &mut dyn FnMut(usize)) -> Option<Result<Vec<u8>>> {
+    fn slice(&mut self, observe: &mut dyn FnMut(usize, usize)) -> Option<Result<Vec<u8>>> {
         let start = Instant::now();
         let context = match &mut self.context {
             Some(context) => context,
@@ -193,7 +196,8 @@ impl Decode {
             }
             let before = (self.written, self.consumed);
             let mut output = OutBuffer::around_pos(&mut self.decoded[..end], self.written);
-            let mut input = InBuffer::around(&self.stored);
+            let mut input =
+                InBuffer::around(&self.stored[..self.stored.len().min(self.consumed + STEP)]);
             input.set_pos(self.consumed);
             let remaining = match context.decompress_stream(&mut output, &mut input) {
                 Ok(remaining) => remaining,
@@ -201,7 +205,7 @@ impl Decode {
             };
             self.written = output.pos();
             self.consumed = input.pos();
-            observe(self.written - before.0);
+            observe(self.written - before.0, self.consumed - before.1);
             if remaining == 0 {
                 if self.consumed != self.stored.len() {
                     return invalid("the frame ends before the stored range does");
@@ -264,33 +268,105 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_step_never_writes_more_than_its_share_of_output() {
-        let content = crate::tests::text(6 << 20, 7);
-        let stored = zstd::bulk::compress(&content, 3).unwrap();
-        check_frame(&stored, content.len() as u64).unwrap();
+    /// Every call a whole decode of `stored` makes, as (written, consumed), and the
+    /// decoded bytes.
+    struct Observed {
+        decoded: Vec<u8>,
+        calls: Vec<(usize, usize)>,
+        polls: usize,
+        wakes: usize,
+    }
+
+    fn decode_observed(stored: Vec<u8>, decoded_len: usize) -> Observed {
+        check_frame(&stored, decoded_len as u64).unwrap();
         let mut decoded = Vec::new();
-        decoded.try_reserve_exact(content.len()).unwrap();
-        let mut decode = Decode::new(stored, decoded, content.len(), tracing::Span::none());
+        decoded.try_reserve_exact(decoded_len).unwrap();
+        let mut decode = Decode::new(stored, decoded, decoded_len, tracing::Span::none());
         let wakes = Arc::new(Count(Default::default()));
         let waker = Waker::from(Arc::clone(&wakes));
         let mut cx = Context::from_waker(&waker);
-        let (mut calls, mut largest, mut polls) = (0usize, 0usize, 0usize);
+        let (mut calls, mut polls) = (Vec::new(), 0usize);
         let decoded = loop {
             polls += 1;
-            let mut observe = |written: usize| {
-                calls += 1;
-                largest = largest.max(written);
-            };
+            let mut observe = |written: usize, consumed: usize| calls.push((written, consumed));
             if let Poll::Ready(result) = decode.poll_observed(&mut cx, &mut observe) {
                 break result.unwrap();
             }
         };
-        assert!(decoded == content, "the decode differs from what was compressed");
-        assert_eq!(decoded.capacity(), content.len());
+        let wakes = wakes.0.load(std::sync::atomic::Ordering::Relaxed);
+        Observed { decoded, calls, polls, wakes }
+    }
+
+    /// A single-segment frame by hand with a four-byte content size, made of `blocks`, each
+    /// a block type (0 raw, 2 compressed) and its body; the last is flagged last here.
+    fn frame_of_blocks(content_size: u32, blocks: &[(u32, &[u8])]) -> Vec<u8> {
+        let mut frame = vec![0x28, 0xB5, 0x2F, 0xFD, 0xA0];
+        frame.extend_from_slice(&content_size.to_le_bytes());
+        for (i, &(kind, body)) in blocks.iter().enumerate() {
+            let last = u32::from(i + 1 == blocks.len());
+            let header = last | (kind << 1) | ((body.len() as u32) << 3);
+            frame.extend_from_slice(&header.to_le_bytes()[..3]);
+            frame.extend_from_slice(body);
+        }
+        frame
+    }
+
+    #[test]
+    fn a_step_never_writes_more_than_its_share_of_output() {
+        let content = crate::tests::text(6 << 20, 7);
+        let stored = zstd::bulk::compress(&content, 3).unwrap();
+        let observed = decode_observed(stored, content.len());
+        assert!(observed.decoded == content, "the decode differs from what was compressed");
+        assert_eq!(observed.decoded.capacity(), content.len());
+        let largest = observed.calls.iter().map(|call| call.0).max().unwrap();
         assert!(largest <= STEP, "one call wrote {largest} bytes");
+        let calls = observed.calls.len();
         assert!(calls >= content.len() / STEP, "{calls} calls for {} bytes", content.len());
-        assert!(polls > 1, "the whole frame decoded in one poll");
-        assert_eq!(wakes.0.load(std::sync::atomic::Ordering::Relaxed), polls - 1);
+        assert!(observed.polls > 1, "the whole frame decoded in one poll");
+        assert_eq!(observed.wakes, observed.polls - 1);
+    }
+
+    /// Blocks that write nothing cost a call time without filling its output, so only a
+    /// bound on the input keeps one call short: 200 000 empty raw blocks are about 600 KB
+    /// that one unbounded call would take whole.
+    #[test]
+    fn a_step_never_consumes_more_than_its_share_of_a_frame_of_empty_blocks() {
+        let content = crate::tests::text(1000, 3);
+        let mut blocks = vec![(0, &[][..]); 200_000];
+        blocks.push((0, &content[..]));
+        let stored = frame_of_blocks(1000, &blocks);
+        let stored_len = stored.len();
+        let observed = decode_observed(stored, content.len());
+        assert!(observed.decoded == content);
+        let largest = observed.calls.iter().map(|call| call.1).max().unwrap();
+        assert!(largest <= STEP, "one call consumed {largest} of {stored_len} stored bytes");
+        let consumed: usize = observed.calls.iter().map(|call| call.1).sum();
+        assert_eq!(consumed, stored_len);
+        let calls = observed.calls.len();
+        assert!(calls >= stored_len / STEP, "{calls} calls for {stored_len} stored bytes");
+    }
+
+    /// Blocks of one decoded byte each, raw (four stored bytes per decoded byte) and
+    /// compressed (one raw literal and no sequences, six): a 64 KiB output step alone would
+    /// take a quarter or a sixth of a MiB of blocks in one call.
+    #[test]
+    fn a_step_never_consumes_more_than_its_share_of_a_frame_of_one_byte_blocks() {
+        let content = crate::tests::text(200_000, 9);
+        let literals: Vec<[u8; 3]> = content.iter().map(|&byte| [1 << 3, byte, 0]).collect();
+        let raw: Vec<_> = content.chunks(1).map(|byte| (0, byte)).collect();
+        let compressed: Vec<_> = literals.iter().map(|body| (2, &body[..])).collect();
+        let raw = frame_of_blocks(200_000, &raw);
+        let compressed = frame_of_blocks(200_000, &compressed);
+        for (name, stored) in [("raw", raw), ("compressed", compressed)] {
+            let stored_len = stored.len();
+            let observed = decode_observed(stored, content.len());
+            assert!(observed.decoded == content, "{name}");
+            let written = observed.calls.iter().map(|call| call.0).max().unwrap();
+            let consumed = observed.calls.iter().map(|call| call.1).max().unwrap();
+            assert!(written <= STEP, "{name}: one call wrote {written} bytes");
+            assert!(consumed <= STEP, "{name}: one call consumed {consumed} of {stored_len}");
+            let calls = observed.calls.len();
+            assert!(calls >= stored_len / STEP, "{name}: {calls} calls for {stored_len} bytes");
+        }
     }
 }

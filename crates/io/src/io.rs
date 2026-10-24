@@ -130,7 +130,9 @@ impl Io {
     /// process. Replaces of one `path`, spelled the same, run in the order they were
     /// submitted, dropped or not, so the last one submitted lands last; under two spellings
     /// or from two `Io`s they are unordered, the last rename wins, and neither fails because
-    /// of the other. Two processes writing into one directory are unsupported.
+    /// of the other. Two processes writing into one directory are unsupported. A `path`
+    /// whose last component is a symbolic link becomes a regular file, the link's target
+    /// unchanged.
     ///
     /// On failure the future hands `bytes` back, unchanged, in a [`ReplaceFailed`] beside
     /// the error. A failure before the rename keeps `path`'s previous content and removes
