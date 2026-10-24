@@ -636,8 +636,8 @@ addendum, review r2 of `lactose-net-host`, N1, prediction world)
   is still acted on: a substitution is counted in `PredictionStats::substitutions`,
   remembered as a repeat is (below), and arms the repair after it, and the sample's
   `PlayerSample::substituted` mark is written as for any replacement. That mark changes
-  no tick by `lactose-sim`'s rule for `InputApplier`: what `apply` writes depends on
-  `sample` and `input_tick` alone, the mark being the journal's. A rollback from another
+  no tick by `lactose-sim`'s rule for `InputApplier`: of the entry, what `apply` writes
+  depends on `sample` and `input_tick` alone, never on the mark, which is the journal's. A rollback from another
   point re-simulates the tick with its unchanged sample, and a later replacement of the same tick (a re-substitution once
   *t* − 1 has changed, a repair armed again) is judged by its own bytes. Equality is
   known only while the ring holds slot *t* − 1: this crate keeps no sample past its slot

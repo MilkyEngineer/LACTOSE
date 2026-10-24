@@ -457,8 +457,9 @@ impl State {
             },
             _ => applied.substitute(),
         };
-        // The mark is the journal's: by `lactose_sim::InputApplier`'s rule what an applier
-        // writes depends on the sample and its input tick alone, so it changes no tick.
+        // The mark is the journal's: by `lactose_sim::InputApplier`'s rule, of the entry,
+        // what an applier writes depends on the sample and its input tick alone, never on
+        // the mark, so it changes no tick.
         sample.substituted = cause == CorrectionCause::Substituted;
         let replacement = replacement.to_sample_bytes();
         if sample.sample == replacement {

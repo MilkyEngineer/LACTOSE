@@ -66,9 +66,10 @@ pub struct PlayerSample {
     pub input_tick: Tick,
     /// Whether the server substituted the previous input for a lost one (architecture
     /// section 9.2). Journaled, so a replay applies the same substitute; the client is told
-    /// by `net`, not through the simulation. No [`InputApplier`] reads it: what `apply`
-    /// writes depends on `sample` and `input_tick` alone; the mark is the journal's, and
-    /// `lactose-predict` does not re-simulate a substitute equal to the sample it ran.
+    /// by `net`, not through the simulation. No [`InputApplier`] reads it: of the entry,
+    /// what `apply` writes depends on `sample` and `input_tick` alone; the mark is the
+    /// journal's, and `lactose-predict` does not re-simulate a substitute equal to the
+    /// sample it ran.
     pub substituted: bool,
     /// The sample: the plain-data bytes of the quantised input component `lactose-input`
     /// defines, exactly as that component is laid out in memory. `sim` never interprets
@@ -159,11 +160,12 @@ pub enum SessionEvent {
 /// drive the simulation from state no save, journal or hash holds.
 ///
 /// The same implementation serves the server (samples from `net`), the prediction world
-/// (the local player's own sample) and a replay (samples from the journal). What `apply`
-/// writes depends on `sample.sample` and `sample.input_tick` alone, never on
-/// `sample.substituted`: the mark is the journal's, and `lactose-predict` does not
-/// re-simulate a substitute equal to the sample it ran, so an applier that read the mark
-/// would leave the prediction world without what the server's run wrote.
+/// (the local player's own sample) and a replay (samples from the journal). Of `sample`,
+/// what `apply` writes depends on `sample.sample` and `sample.input_tick` alone, never on
+/// `sample.substituted`, nor on state the applier keeps between calls; beside them it
+/// reads the world and `player` as above. The mark is the journal's: `lactose-predict`
+/// does not re-simulate a substitute equal to the sample it ran, so an applier that read
+/// the mark would leave the prediction world without what the server's run wrote.
 pub trait InputApplier: Send + Sync + 'static {
     /// Writes `sample` for `player` this tick.
     fn apply(&mut self, world: &mut World, player: PlayerId, sample: &PlayerSample) -> Result<()>;
