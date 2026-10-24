@@ -61,10 +61,15 @@ reference remap pass. Rows are in ascending `NetId` order.
 
 A cooked entity that moves from region A to region B is `Destroy` in A's overlay and
 `SpawnFromBaseline` in B's, so B loads without A. `Overlay::new` and `Overlay::decode` enforce
-what can be judged from the records alone, including that ownership records name no destroyed
-owner and form no cycle. `Overlay::check_against` judges what needs the baseline. Left to
-whoever applies an overlay: that each owner exists, ownership cycles that pass through the
-baseline's own ownership, schema agreement or migration, and cross-region references.
+what can be judged from the records alone, including that no entity is its own owner and that
+the ownership records form no cycle among themselves. A `Destroy` says only that the entity is
+no longer a row of this region, which a move to another region or an unload also is, so an
+owner this overlay destroys is accepted; whether an owner exists is the applier's. These are
+the format's only judgements of ownership, and a new one must be one the world refuses too
+(`crates/ecs/README.md`, "Ownership"), or an export could fail to be an overlay.
+`Overlay::check_against` judges what needs the baseline. Left to whoever applies an overlay:
+that each owner exists, ownership cycles that pass through the baseline's own ownership or
+through other regions, schema agreement or migration, and cross-region references.
 
 **Patched baselines.** An overlay records the content hash of the baseline it was made
 against. If that differs from the baseline at hand, `Overlay::rebase` produces an overlay that

@@ -223,6 +223,7 @@ pub(crate) fn load_region(
         }
         keys.insert(id, key);
     }
+    check_owners(world, &rows, &keys)?;
     for (&id, &key) in &keys {
         if let StableKey::Predicted(predicted) = key {
             world.bind(predicted, id)?;
@@ -252,6 +253,59 @@ pub(crate) fn load_region(
             })
             .collect();
         world.spawn_entity(keys[&id], region, components, stamp)?;
+    }
+    Ok(())
+}
+
+/// `InvalidData` if the owners `rows` will have, under the `keys` the load gives them, would
+/// close a cycle of owners with each other, through the baseline's own `ecs::owned_by`
+/// column, or with live entities of other regions (README, "Ownership"). Walked before
+/// anything binds or spawns, so a refused document changes nothing; the binds the load
+/// makes are covered, since an owner is resolved as it will be stored and read after them.
+fn check_owners(
+    world: &World,
+    rows: &BTreeMap<NetId, Row>,
+    keys: &BTreeMap<NetId, StableKey>,
+) -> Result<()> {
+    // A `Net` key of a row of the document names the row under its load key; anything
+    // else names what it names in the world.
+    let resolve = |key: StableKey| match key {
+        StableKey::Net(id) => keys.get(&id).copied().unwrap_or_else(|| world.canonical(key)),
+        key => world.canonical(key),
+    };
+    // The owner each row will have: an `OwnershipChange`'s, as the spawn below writes it,
+    // or its own `ecs::owned_by`.
+    let mut owners: BTreeMap<StableKey, Option<StableKey>> = BTreeMap::new();
+    for (id, row) in rows {
+        let owner = match row.owner {
+            Some(owner) => owner.map(StableKey::Net),
+            None => row
+                .components
+                .get(&OwnedBy::KEY)
+                .and_then(|bytes| bytemuck::checked::try_pod_read_unaligned::<OwnedBy>(bytes).ok())
+                .and_then(|value| value.owner.get()),
+        };
+        owners.insert(keys[id], owner.map(resolve));
+    }
+    let owner_of = |key: StableKey| match owners.get(&key) {
+        Some(&owner) => owner,
+        None => world.stored_owner(key).map(resolve),
+    };
+    // Each chain is followed until it ends, reaches a key already cleared, or returns to a
+    // key on itself, which is a cycle: every key has one owner at most.
+    let mut cleared = BTreeSet::new();
+    for &start in owners.keys() {
+        let mut chain = BTreeSet::new();
+        let mut at = Some(start);
+        while let Some(key) = at.filter(|key| !cleared.contains(key)) {
+            if !chain.insert(key) {
+                return Err(invalid(format!(
+                    "the document's owners would close a cycle of owners through {key:?}"
+                )));
+            }
+            at = owner_of(key);
+        }
+        cleared.extend(chain);
     }
     Ok(())
 }

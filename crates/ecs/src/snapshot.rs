@@ -123,8 +123,20 @@ impl WorldSnapshot {
             .filter(|&(net, _)| !world.storage.entities.contains_key(&StableKey::Net(*net)))
             .map(|(&net, &predicted)| (net, predicted))
             .collect();
-        for (net, predicted) in rebinds {
+        for &(net, predicted) in &rebinds {
             world.rekey_references(StableKey::Net(net), StableKey::Predicted(predicted));
+        }
+        // The snapshot's ownership was a forest. The rewrite closes a cycle only when an
+        // entity the restore revives is owned by a `Net` key bound since to an entity whose
+        // owner chain reaches it, which takes a mispredicted `OwnedBy` on a predicted spawn
+        // (README, "Ownership"); the walks stay bounded, but it is a logic error.
+        for &(_, predicted) in &rebinds {
+            debug_assert!(
+                !world.owns_itself(StableKey::Predicted(predicted)),
+                "the restore closed a cycle of owners through {predicted:?}: a revived entity \
+                 is owned by its `Net` key, bound since the snapshot to an entity whose owner \
+                 chain reaches it"
+            );
         }
         world.events.clear();
         // Empty between runs, where a restore is made (D126); cleared all the same, as the

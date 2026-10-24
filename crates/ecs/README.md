@@ -208,7 +208,9 @@ What a system is, from its parameters (`SystemParam` has the table):
   `RegionId`, then entity sources by origin key. Events order the same way. Commands
   against a missing entity, moves to an unloaded region and region-less spawns are dropped
   and logged at target `casein`, as are a spawn that names `InRegion` or `PredictedOrigin`
-  and a write that fails validation; a reference to a missing entity is written empty.
+  and a write that fails validation; a reference to a missing entity is written empty. A
+  `set` of `OwnedBy`, or a spawn whose bundle's `OwnedBy`, would make the entity its own
+  owner or close a cycle is dropped and logged the same way (Regions, "Ownership").
   `despawn` and `move_to_region` take the entities the target owns with it, and a later
   command in the same apply may move an owned entity again. `Commands::set` and
   `Commands::remove` of `InRegion` or `PredictedOrigin` panic when recorded, as the direct
@@ -323,8 +325,43 @@ What a system is, from its parameters (`SystemParam` has the table):
   live entity or a bind already holds, such as one spawned directly with its key.
 - `InRegion` and `PredictedOrigin` are the world's: read-only through every path.
   `ClaimedBy` is written by `net` and `predict` on join and removed to release the claim.
-  `OwnedBy` is a relationship. `ClaimedBy` and `InRegion` are not saved; `OwnedBy` and
-  `PredictedOrigin` are.
+  `OwnedBy` is a relationship (the two bullets below). `ClaimedBy` and `InRegion` are not
+  saved; `OwnedBy` and `PredictedOrigin` are.
+- Ownership is a forest. An entity has at most one owner (`OwnedBy`), is never its own
+  owner, and no chain of owners returns to its start. The chain of `k` is `k`, its owner,
+  its owner's owner, …, over live entities, ending at the first that has no owner or whose
+  owner is not live; keys are compared as origin keys, so a bound `Net` key is its
+  predicted entity. A write of `OwnedBy { owner }` to `k` is refused if `k` is on the chain
+  of `owner` (`owner == k` included): `InvalidData` from `insert`, `insert_erased`, `spawn`
+  and `spawn_erased`, with nothing changed, not even the point; at command apply a `set`,
+  or a spawn whose bundle carries such an `OwnedBy`, is dropped and logged at target
+  `casein` like a write that fails validation, and the rest of the buffer applies.
+  `load_region` walks the document's rows (under the keys the load will give them) and the
+  live world together before it binds or spawns anything, and refuses whole a document
+  whose owners would close a cycle with each other, with the baseline's own
+  `ecs::owned_by` column or with live entities of other regions, as it refuses any invalid
+  row; the binds a load makes are covered by that walk. `bind` is refused if the entity at
+  the end of the predicted entity's chain is owned by the `Net` key being bound, since the
+  rewrite would close the cycle. The cost is one lookup per link of the chain, paid only
+  by `OwnedBy` writes, the ownership edges of a load and binds. `despawn` and
+  `move_to_region` visit each entity of the tree once whatever the graph. A `restore` puts
+  back the snapshot's graph, a forest when taken; the one state this rule does not guard
+  is a revived entity whose owner is a `Net` key bound since the snapshot to an entity
+  whose chain reaches it, which needs a mispredicted `OwnedBy` on a predicted spawn
+  (`OwnedBy` is not replicated and is never corrected): a debug assertion names it, and it
+  is a logic error, not a hang.
+- Writing `OwnedBy` moves nothing. An owned entity resides where it was spawned or last
+  moved and follows its owner from the next `move_to_region` or `despawn` on (architecture
+  section 6, D12), so an entity given to an owner in another region stays where it is
+  until that owner moves, and an owner's region may unload while what it owns stays
+  loaded. `OwnedBy` is then a weak cross-region reference like any `EntityRef` field:
+  `World::get` on the owner is `None`, the export writes the owner's `NetId` and a reload
+  in either region order restores it, and `owned_by` finds the entity again once the owner
+  is live. The world therefore accepts no ownership state `lactose_bundle::Overlay::new`
+  refuses (an entity its own owner, a cycle among one overlay's records) and refuses no
+  state the format accepts (an owner the overlay destroys, an owner elsewhere or absent),
+  so a region's export is always an overlay: `lactose-persist`'s diff never fails on an
+  export, which is the invariant every save, unload and relevance message rests on.
 - `World::claimed(player)` yields the entities with `ClaimedBy { player }` in ascending
   origin-key order, from an index the world maintains wherever `ClaimedBy` enters or
   leaves a row (a spawn, `insert`, `remove`, a despawn, a command apply, a predicted
@@ -487,5 +524,6 @@ repeat, layout and chaos modes.
 | `regressions_two.rs` | The findings of the second review: new chunks' column ticks above 2^31, presentation batches across the wrap, `writes` visibility by stage, a restore that revives a bound `Net` entity, `update_region_resource`, transient region resources through a reload, schedule ties, resource references through bind and restore, aliases a restore orphans |
 | `wrap_program.rs` | One program with marks, cursors, `Changed` readers, a pass, column and row ticks, presentation events and a rollback, run across the 2^30 rebase, 2^31 and the `u32` wrap, equal to a run far from any boundary |
 | `erased_rows.rs` | Typed and erased writes of the same values leave identical columns, row and column ticks, `changed_since` sets, structural logs, reverse and claim indices under every layout, `Net` references rewritten and `OwnedBy` and `ClaimedBy` among them; an equal `insert_erased` unseen by a `Changed` reader; every refusal with its kind and nothing changed, a refused typed `insert` included; a placeholder refused by name, and stored empty by a typed write; padding zeroed; `get_erased` through a restore and a snapshot round trip |
+| `ownership.rs` | The forest rule: a self-owner and the closing write of a two- and a three-entity cycle refused through every direct path with nothing changed, dropped and logged at apply with the rest of the buffer applied, refused whole by `load_region` within one document (through the baseline's own column) and across two documents in either order, and refused at `bind`; a chain through a dangling owner accepted and the write that closes it later refused; an owned entity staying put when given to an owner elsewhere and when the owner's region unloads, exported and reloaded in either order |
 | `claims.rs` | The claim index behind `World::claimed`: current after every direct method, command, predicted spawn, ownership despawn, unload and restore, in key order under every layout |
 | `compile_fail.rs` | What `#[system]` and `#[finalize]` reject, and what they accept under `#![forbid(unsafe_code)]` |

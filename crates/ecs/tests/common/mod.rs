@@ -6,15 +6,15 @@
 
 use std::sync::Arc;
 
-use lactose_core::{EntityRef, PlainArray, PlayerId, StableKey, Tick};
+use lactose_core::{ComponentKey, EntityRef, PlainArray, PlayerId, StableKey, Tick};
 use lactose_ecs::{
-    Channel, ChannelWriter, ChunkOrder, ClaimedBy, CommandChannel, Commands, Ctx, Event,
-    EventWriter, Events, InRegion, LayoutConfig, Mut, OwnedBy, PredictedOrigin, PresentEvent,
-    PresentEvents, PresentKind, RegionConfig, RegionId, RegionMode, Res, ResMut, Schedule,
-    StableKeyOf, SystemSet, World, WorldBuilder, WorldKind, finalize, system,
+    ChangeMark, Channel, ChannelWriter, ChunkOrder, ClaimedBy, CommandChannel, Commands, Ctx,
+    Event, EventWriter, Events, InRegion, LayoutConfig, LogEntry, Mut, OwnedBy, PredictedOrigin,
+    PresentEvent, PresentEvents, PresentKind, Referrer, RegionConfig, RegionId, RegionMode, Res,
+    ResMut, Schedule, StableKeyOf, SystemSet, World, WorldBuilder, WorldKind, finalize, system,
 };
 use lactose_math::{ExactSum, Scalar, Vec2};
-use lactose_reflect::{Padding, Registry, component, resource, value};
+use lactose_reflect::{Padding, Registry, TypeRole, component, resource, value};
 use lactose_task::Executor;
 
 // ---- Components ----
@@ -524,4 +524,94 @@ pub fn vel(x: i32, y: i32) -> Velocity {
 /// No padding.
 pub fn pad<const N: usize>() -> Padding<N> {
     Padding::default()
+}
+
+// ---- What a refused write must leave unchanged ----
+
+/// One chunk's column, as the world stores it.
+#[derive(PartialEq, Debug)]
+pub struct Column {
+    component: ComponentKey,
+    keys: Vec<StableKey>,
+    regions: Vec<RegionId>,
+    bytes: Vec<u8>,
+    row_ticks: Option<Vec<Tick>>,
+    column_tick: Tick,
+}
+
+/// Everything a direct write can change that a consumer can observe, for the keys and
+/// players a test names.
+#[derive(PartialEq, Debug)]
+pub struct WorldState {
+    mark: ChangeMark,
+    columns: Vec<Column>,
+    /// For each mark, the rows of every tracked column changed since it: the stamps'
+    /// points, which column ticks alone do not show.
+    changed: Vec<Option<Vec<(ComponentKey, StableKey)>>>,
+    log: Vec<LogEntry>,
+    referrers: Vec<Vec<Referrer>>,
+    owned: Vec<Vec<StableKey>>,
+    claimed: Vec<Vec<StableKey>>,
+    live: Vec<bool>,
+}
+
+/// The observable state of `world`: every column with its stamps and ticks, the rows changed
+/// since each of `marks`, the structural log, and the reverse index, the ownership and the
+/// claims of `keys` and `players`.
+pub fn world_state(
+    world: &World,
+    marks: &[ChangeMark],
+    keys: &[StableKey],
+    players: &[PlayerId],
+) -> WorldState {
+    let components: Vec<ComponentKey> = world
+        .registry()
+        .iter()
+        .filter(|info| info.role() == TypeRole::Component)
+        .map(|info| info.key())
+        .collect();
+    let mut columns = Vec::new();
+    for &component in &components {
+        for column in world.columns_erased(component) {
+            columns.push(Column {
+                component,
+                keys: column.keys().to_vec(),
+                regions: column.regions().to_vec(),
+                bytes: column.bytes().to_vec(),
+                row_ticks: column.row_ticks().map(<[_]>::to_vec),
+                column_tick: column.column_tick(),
+            });
+        }
+    }
+    let changed = marks
+        .iter()
+        .map(|&mark| {
+            let mut rows = Vec::new();
+            for &component in &components {
+                for column in world.columns_erased(component) {
+                    if column.row_ticks().is_none() {
+                        continue;
+                    }
+                    for row in column.changed_since(mark)? {
+                        rows.push((component, column.keys()[row]));
+                    }
+                }
+            }
+            rows.sort();
+            Some(rows)
+        })
+        .collect();
+    let mut cursor = world.structural_log().cursor_at_start();
+    let log =
+        world.structural_log().since(&mut cursor).expect("a current cursor").copied().collect();
+    WorldState {
+        mark: world.mark(),
+        columns,
+        changed,
+        log,
+        referrers: keys.iter().map(|&key| world.referrers(key).collect()).collect(),
+        owned: keys.iter().map(|&key| world.owned_by(key).collect()).collect(),
+        claimed: players.iter().map(|&player| world.claimed(player).collect()).collect(),
+        live: keys.iter().map(|&key| world.contains(key)).collect(),
+    }
 }
