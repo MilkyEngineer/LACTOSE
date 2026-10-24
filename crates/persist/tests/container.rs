@@ -150,7 +150,8 @@ fn the_index_entries_are_checked() {
     };
     let region_1 = get_u64(&bytes, entry_at(1, REGION));
     let region_0 = get_u64(&bytes, entry_at(0, REGION));
-    let cases: Vec<(&str, Box<dyn Fn(&mut Vec<u8>)>)> = vec![
+    type Damage = Box<dyn Fn(&mut Vec<u8>)>;
+    let cases: Vec<(&str, Damage)> = vec![
         ("a duplicate region", Box::new(move |b| put_u64(b, entry_at(0, REGION), region_1))),
         (
             "a descending index",

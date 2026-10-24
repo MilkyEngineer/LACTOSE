@@ -33,5 +33,15 @@ lactose-sim.workspace = true
 # Each section of the container is one zstd frame (architecture section 15.3).
 zstd.workspace = true
 
+[dev-dependencies]
+# The reload tests record under SOUR and build their executor as a SOUR test does
+# (`ChaosConfig`); a dev-dependency, so the library names nothing of `task`.
+lactose-task.workspace = true
+# Section 15.5's tests with physics components: the bodies, the sync and the test backend of
+# its own tests (`tests/physics.rs` includes them by path).
+lactose-physics-api.workspace = true
+# The included test backend logs what it ignores.
+tracing.workspace = true
+
 [lints]
 workspace = true
