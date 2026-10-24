@@ -292,3 +292,47 @@ fn a_resource_among_components_or_a_value_of_another_size_is_invalid() {
     let error = RegionRecords::from_export(&export, &baseline_a(), &table).unwrap_err();
     assert_eq!(error.kind(), ErrorKind::InvalidData, "{error}");
 }
+
+#[test]
+fn a_spawned_moved_in_or_gained_component_is_written_canonical() {
+    let registry = Arc::new(registry());
+    let table = SchemaTable::from_registry(&registry).unwrap();
+    let mut world = WorldBuilder::new(WorldKind::Server, registry).build().unwrap();
+    for (region, baseline) in [(A, baseline_a()), (B, baseline_b())] {
+        let config =
+            RegionConfig { id: region, seed: seed_of(region), mode: RegionMode::Simulated };
+        world.create_region(config).unwrap();
+        world.load_region(region, &baseline, None).unwrap();
+    }
+    let canonical_nan = Scalar::from_canonical_bits(odd_nan().to_canonical_bits());
+    let odd = Position { x: odd_nan(), y: Scalar::ONE };
+    let canonical = Position { x: canonical_nan, y: Scalar::ONE };
+    assert_ne!(data(odd).bytes, data(canonical).bytes);
+    // Spawned at runtime, moved in from B, and gained by a baseline row that lacked it.
+    let spawned = world.allocate_net_id().unwrap();
+    world.spawn(net(spawned), A, (odd,)).unwrap();
+    world.insert(net(c(B, 1)), odd).unwrap();
+    world.move_to_region(net(c(B, 1)), A).unwrap();
+    world.insert(net(c(A, 6)), Velocity { x: odd_nan(), y: Scalar::ONE }).unwrap();
+    let rows = world.export_region(A).unwrap();
+
+    let overlay = diff(&rows, &baseline_a(), &table).unwrap();
+    let records = overlay.records();
+    let spawn = records.iter().find_map(|record| match record {
+        Record::Spawn { id, components } if *id == spawned => Some(components),
+        _ => None,
+    });
+    assert_eq!(spawn, Some(&vec![data(canonical)]));
+    let moved = records.iter().find_map(|record| match record {
+        Record::SpawnFromBaseline { id, components } if *id == c(B, 1) => Some(components),
+        _ => None,
+    });
+    assert_eq!(moved, Some(&sorted(vec![data(canonical), data(Age(3))])));
+    let added = records.iter().find_map(|record| match record {
+        Record::AddComponent { id, data } if *id == c(A, 6) && data.component == Velocity::KEY => {
+            Some(data)
+        }
+        _ => None,
+    });
+    assert_eq!(added, Some(&data(Velocity { x: canonical_nan, y: Scalar::ONE })));
+}

@@ -12,10 +12,9 @@ written under an older schema to the registry's.
 | Determinism boundary | outside. It reads what the boundary exported and builds what the boundary loads, so it computes no float, reads no clock and orders everything by key, and its outputs are functions of its inputs on every machine ("Determinism" below); no boundary crate may depend on it |
 | Unsafe | none, `#![forbid(unsafe_code)]` |
 
-**Status: facade.** Every public signature is final and every body that decides anything
-is `todo!()`; nothing here runs. This file is the contract the implementation lane meets,
-and every sentence under "Behaviour the signatures cannot express" is one a dependent crate
-may rely on. Architecture sections 4, 6, 7, 8.2, 9.3, 14, 15.1, 15.2, 15.3, 15.4, 15.5, 19
+**Status: implemented** (milestone 1). The tests under "Proof for milestone 1" hold this
+file's contract, and every sentence under "Behaviour the signatures cannot express" is
+one a dependent crate may rely on. Architecture sections 4, 6, 7, 8.2, 9.3, 14, 15.1, 15.2, 15.3, 15.4, 15.5, 19
 and 22 are the design; where this file and the architecture disagree, the architecture
 wins and this file is wrong. Decision D129 records the choices those sections left open and
 what the design review changed. `crates/ecs/README.md` ("Snapshots and bulk copy":
@@ -228,7 +227,9 @@ its value is never saved ("Migrations" below).
   a version, a layout (through the digest), a role or a persistence change does. It is the
   container's one-comparison shortcut and what a tool prints; the loader never relies on
   it, since every section carries its own schemas and digests and `Migrations::migrate`
-  compares per type.
+  compares per type. Nor would a shortcut save anything worth a second path: `Loader::
+  migrate` over a section of 100k records whose types are all current costs about
+  0.05 ms (Apple M1, release), against 10 to 26 ms to decode the section.
 
 **The diff** (architecture section 15.2; `crates/bundle/README.md`, "Overlay")
 
@@ -376,10 +377,12 @@ export:
   `NetId` counter) over one `RegionRecords` per region, ascending by region. `insert`
   replaces a region's section; `decode(encode(c)) == c`; containers compare by content.
 - A region is a section of its own, made and read on its own. `RegionRecords::encode_section`
-  is one zstd frame, level and parameters pinned by the implementation, carrying its
-  content size, whose content is the region, the seed and the baseline hash, the overlay
-  as `Overlay::encode` behind a presence byte, the resource schema table as
-  `lactose-bundle` writes one (its encoder exported for this, D129), the resources as key
+  is one zstd frame at level 3 (measured, D129), without zstd's own checksum since the
+  entry's xxh64 covers the frame, carrying its content size, whose content is the region,
+  the seed and the baseline hash, the overlay as `Overlay::encode` behind a presence
+  byte, the resource schema table as
+  `lactose-bundle` writes one (its encoder is crate-private, so this crate writes the
+  same bytes and `tests/format.rs` holds the two equal), the resources as key
   and bytes of the schema's size, the transient keys ascending, and the layout digests as
   key and digest ascending. It returns an `EncodedSection`, which only it builds: the
   bytes, and a `RegionIndexEntry` that states the region, seed, baseline hash and overlay
@@ -391,7 +394,7 @@ export:
   block, and the sections' bytes back to back in index order, offsets assigned; `encode`
   is `encode_section` of every section then `assemble`.
 - The encoding is the implementation's within these invariants, pinned by golden bytes in
-  `tests/format.rs` once written, and `CONTAINER_FORMAT_VERSION` moves with any change
+  `tests/format.rs`, and `CONTAINER_FORMAT_VERSION` moves with any change
   (before the first shipped save freely; after it, with a converter): every integer
   little-endian, counts `u32`, sizes and offsets `u64`; the preamble is `PREAMBLE_BYTES`
   (16): a magic, the format version, a zero `u16` and the byte length of the
@@ -446,7 +449,10 @@ and 15.5; D124, D126)
   crosses threads (`lib.rs` asserts it), which is what lets `app` place the work. A failed
   `from_export`, `encode_section` or `assemble` loses nothing: each is a pure function
   that returns an error and no partial value, the simulation runs on, nothing has been
-  written, and the slot keeps its previous save.
+  written, and the slot keeps its previous save. Measured at 100k rows (Apple M1,
+  release; `docs/verification.md`): `from_export` and `encode_section` together take
+  about 19 ms per region with a tenth of its rows changed and 41 to 63 ms when every
+  row is new to the baseline.
 - The load: on a background task `index_len` and `index` over the front of the file, then
   `decode_section` over each wanted region's bytes (or `decode` over a whole file), then
   `Loader::bundle` per region; the bundles cross into the simulation through
@@ -517,8 +523,6 @@ and 15.5; D124, D126)
   architecture section 14) in the section, and the overlay against a baseline streamed
   from `lactose-asset` rather than handed in by the caller: milestone 3, through the
   `[exceptions]` edge; `Loader::bundle` and `decode_section` are the named places.
-- The compression level, the save's size and time at 100k rows, and the schema-hash
-  shortcut's use by the loader: measured at implementation (`docs/verification.md`).
 - Player portability between hosts (architecture section 22.1, milestone 4).
 - A serde bridge in `lactose-reflect`: not needed by this crate, whose documents are
   `lactose-bundle`'s canonical encodings and the container's (D129 proposes the
@@ -526,16 +530,15 @@ and 15.5; D124, D126)
 
 ## Proof for milestone 1
 
-Nothing runs yet. The implementation lane replaces every `todo!()`, lists this crate under
-`[harness]` in `tools/xtask/ci-policy.toml` (its reload tests step a simulation, so they
-record under SOUR) and proves:
+The crate is listed under `[harness]` in `tools/xtask/ci-policy.toml`: its reload tests
+step a simulation, so they record under SOUR (`tests/sour/mod.rs` is the glue). The tests:
 
 | What | How |
 |---|---|
-| The diff | `tests/diff.rs`: a world with every change kind (a destroyed, a moved-in, a moved-out and a spawned entity; a component added, removed and changed; a transient component present and absent; an owner set, changed and cleared; a NaN written to a scalar) exported and diffed gives exactly the records of the table above, in canonical order, with the transient's bytes zeroed and the NaN canonical; the digest is equal under every `layout_mode` capacity, order and seed and with one and four workers; the empty diff is `None`; a key the table lacks and a resource among components are refused as stated and nothing is produced; the relevance message's resources equal the save's and `Cooked` exactly when the overlay is `None` |
+| The diff | `tests/diff.rs`: a world with every change kind (a destroyed, a moved-in, a moved-out and a spawned entity; a component added, removed and changed; a transient component present and absent; an owner set, changed and cleared; a NaN written to a scalar of a changed, a spawned, a moved-in and a gained component) exported and diffed gives exactly the records of the table above, in canonical order, with the transient's bytes zeroed and the NaN canonical; the digest is equal under every `layout_mode` capacity, order and seed and with one and four workers; the empty diff is `None`; a key the table lacks and a resource among components are refused as stated and nothing is produced; the relevance message's resources equal the save's and `Cooked` exactly when the overlay is `None` |
 | Round trip | `tests/roundtrip.rs`: the diff's overlay loads back through `World::load_region` and `insert_region_resource_erased` into a world that exports the same `RegionRows` (the ECS's `bulk.rs` does this with a hand-built overlay); `SchemaTable`'s schemas are accepted by the loader for every type of a registry with nested structs, arrays, enums and padding; `decode(encode(c)) == c`; `index` and `decode_section` agree with `decode` section by section, and `assemble` of sections made in any order equals `encode`; golden container bytes in `tests/format.rs` |
 | Canonical records | `tests/records.rs`: `check` refuses `Some` of an empty overlay, a `baseline_hash` other than the overlay's, unsorted or duplicate resources, schemas or keys, a schema that is not its resource's, a transient key that is also a resource's type, and `layouts` with an entry missing or extra, each naming the failure; `insert`, `encode_section` and `Loader::bundle` refuse the same and change nothing |
-| Section 15.5 and D124 | `tests/reload.rs`, with a small game as `crates/sim/tests/common` writes one: the original reloads in place at tick T through this crate's bundles, a fresh process loads the container's bytes, an untouched twin never reloads, all K ticks hash-equal with one store and the policy's modes (test 1 and 4; with `lactose-physics-api`'s components, the reload and the fresh process equal each other and the twin within D124's tolerance); the two-frame path likewise; an unload and reload through `from_export` and `bundle` exports the same `RegionExport` (test 2); the save taken while a left player's row is kept |
+| Section 15.5 and D124 | `tests/reload.rs`, with a small game as `crates/sim/tests/common` writes one: the original reloads in place at tick T through this crate's bundles, a fresh process loads the container's bytes, an untouched twin never reloads, all K ticks hash-equal with one store and the policy's modes (test 1 and 4; `tests/physics.rs` does the same with `lactose-physics-api`'s components, a joint and a contact, over its test backend included by path, where the reload, the fresh process and the twin are bit-equal in the hash, the backend's bytes and the handle rows at every tick, since that backend keeps no solver state the rows lack; Rapier's twin within D124's tolerance is `lactose-physics-rapier`'s own test); the two-frame path likewise; an unload and reload through `from_export` and `bundle` exports the same `RegionExport` (test 2); the save taken while a left player's row is kept |
 | Migrations | `tests/migrate.rs`: a container written under `Health` version 1 (bytes pinned) loads through the step of the README's example and the world hashes as one saved at version 2 would (test 3); a newer version, a missing step, a field left over, a field unset, an invalid value and a `SetField` under a changed schema are each refused as stated and nothing loads; equal versions are refused with `VersionMismatch` by the digest where the document schema is equal, one change per case: a nested reorder, discriminants renumbered in declaration order, the variants' names swapped over unchanged values (`{A = 0, B = 1}` to `{B = 0, A = 1}`), at the top level and as an array element, which only the names catch, the variants' declarations reordered, each name keeping its value (`{A = 0, B = 1}` to `{B = 1, A = 0}`), a variant renamed, a same-size type change; a transient component and a transient resource with a changed layout load zeroed with no step and no bump, a transient component with an unchanged layout leaves the overlay as the same `Arc`, and a persistent resource that became transient moves to the transient keys; a transient key whose type became persistent loads as the zeroed value with no step; a transient component whose type became persistent loads from a zero value under its saved version and digest, through its steps when the version moved since, and is refused with `VersionMismatch` when its layout moved without a bump; a restored zero that fails validation is `InvalidData`; a type that became `derived` is dropped, an overlay it emptied becoming `None`, and the world rebuilds it; a resource migrates under the schema and digest the section carries; an overlay whose types match comes back as the same `Arc` with the same digest; a second step for one (type, version) is refused |
 | The schema hash and the digest | `tests/schema.rs`: a golden hash and golden digests for a small registry; equal across registration order and with a derived type added or a tracking flag set; the hash changed by a version bump, a field ID, offset, size, primitive tag or kind, a type's size, a role and a persistence change, the digest by every layout change and by none of the rest, one change per case against one base type: a nested reorder, discriminants renumbered in declaration order, the variants' names swapped over unchanged values (`{A = 0, B = 1}` to `{B = 0, A = 1}`), at the top level and as an array element, which only the names catch, the variants' declarations reordered, each name keeping its value (`{A = 0, B = 1}` to `{B = 1, A = 0}`), a variant renamed, a same-size primitive change (`u64` to `i64`, `u64` to `Scalar`), and an array element's primitive, nested order and enum changed, each changing the digest; a renamed field, `#[value]` struct or enum type leaving both equal; `from_registry` refuses a raw float, a foreign scalar tag and a 20 KiB persistent resource |
 | The container's caps and the prefix read | `tests/container.rs`: a preamble too short, a wrong magic, a wrong version, a block over the cap, a damaged block hash, a non-ascending index, an entry inside the block, past the cap or overlapping another, an entry over the section cap, a section of another length, another hash or another decompressed size, and a section whose content states another region, seed, baseline hash or overlay digest than its entry are each refused as stated, with an allocation bound checked by a counting allocator in the test; `index` over exactly `index_len` bytes equals `index` over the file; one damaged section fails alone and every other section decodes |
