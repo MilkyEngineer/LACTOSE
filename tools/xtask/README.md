@@ -58,9 +58,13 @@ on, and a listed feature the crate does not declare are findings.
 
 - Each boundary crate, and each crate of `[lint_file_carriers]`, has a `clippy.toml`
   byte-identical to `crates/core/clippy.toml`, and that file still bans a required minimum
-  and every route to a thread outside an executor (`THREAD_ROUTES` in `src/boundary.rs`; a
-  unit test holds the list to the reference's entries that say a boundary crate creates no
-  thread or cite section 16, so none can be dropped quietly behind `allow-invalid`).
+  (`REQUIRED_LINT_PATHS` in `src/boundary.rs`, the executor's core count and rayon's worker
+  index among it) and every route to a thread outside an executor (`THREAD_ROUTES`; a unit
+  test holds the list to the reference's entries that say a boundary crate creates no thread
+  or cite section 16, so none can be dropped quietly behind `allow-invalid`). Every entry of
+  that file under `rayon::`, `rapier3d_f64::`, `parry3d_f64::` or `std::thread::` is in
+  `THREAD_ROUTES` or in `NOT_THREAD_ROUTES`, the few there that start no thread, whatever its
+  reason says.
 - Each other crate of `[boundary_internal] any` compiles into every boundary crate and has a
   `clippy.toml` whose entries under the paths that reach files, the environment, a
   subprocess or the network, or create a thread through the standard library (`OUTSIDE_WORLD` in `src/boundary.rs`), are

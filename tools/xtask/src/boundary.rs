@@ -30,14 +30,20 @@ const PIN_CPU: &str = "x86-64-v3";
 const PIN_FLAGS: [&str; 2] = ["-C", "target-cpu=x86-64-v3"];
 
 /// Entries the reference lint file must keep, one or two from each family of rule in
-/// section 8.2, so a file that was emptied and then copied everywhere is still caught.
-const REQUIRED_LINT_PATHS: [&str; 13] = [
+/// section 8.2, so a file that was emptied and then copied everywhere is still caught. The
+/// executor's core count and rayon's worker index are here, not in [`THREAD_ROUTES`]: they
+/// start no thread, and no test uses them.
+const REQUIRED_LINT_PATHS: [&str; 17] = [
     "f32::min",
     "f64::sin",
     "f64::to_bits",
     "f64::powi",
     "std::fs::read",
     "std::env::var",
+    "lactose_task::Platform::topology",
+    "lactose_task::Platform::hardware_threads",
+    "rayon::current_thread_index",
+    "rayon::ThreadPool::current_thread_index",
     "std::time::Instant",
     "std::collections::HashMap",
     "std::hash::RandomState",
@@ -49,11 +55,14 @@ const REQUIRED_LINT_PATHS: [&str; 13] = [
 
 /// Every route to a thread outside an executor that the reference lint file bans (sections 5.1,
 /// 8.2 and 16): the standard library's, the executor's platform, and the solver pool's and
-/// rayon's global pool's. Each is required, not a sample: no test uses most of them, and
+/// rayon's global pool's, among them the public functions of the pinned Rapier and parry found
+/// to run parallel work outside `PhysicsPipeline::step` and the traits a parallel iterator of a
+/// crate's own is written with. Each is required, not a sample: no test uses most of them, and
 /// `allow-invalid` keeps clippy quiet about an entry whatever happens to it. A unit test holds
 /// this list to the reference's entries that say a boundary crate creates no thread or cite
-/// section 16, so an entry added there is pinned here too.
-const THREAD_ROUTES: [&str; 82] = [
+/// section 16, and the check holds every entry under [`THREAD_PREFIXES`] to this list or
+/// [`NOT_THREAD_ROUTES`], so an entry added there is pinned here too.
+const THREAD_ROUTES: [&str; 104] = [
     "lactose_task::Executor::platform",
     "lactose_task::Platform::spawn_thread",
     "std::thread::spawn",
@@ -70,6 +79,23 @@ const THREAD_ROUTES: [&str; 82] = [
     "rapier3d_f64::pipeline::PhysicsPipeline::configure_thread_pool",
     "rapier3d_f64::pipeline::PhysicsWorld::clear_thread_pool",
     "rapier3d_f64::pipeline::PhysicsPipeline::clear_thread_pool",
+    "rapier3d_f64::pipeline::PhysicsWorld::detect_collisions",
+    "rapier3d_f64::pipeline::CollisionPipeline::step",
+    "rapier3d_f64::geometry::BroadPhaseBvh::update",
+    "rapier3d_f64::dynamics::CCDSolver::find_first_impact",
+    "rapier3d_f64::dynamics::CCDSolver::solve_continuous",
+    "rapier3d_f64::dynamics::SoftBodySet::sync_particle_positions",
+    "rapier3d_f64::dynamics::SoftBodyBuilder::volumetric",
+    "rapier3d_f64::dynamics::SoftBodyBuilder::volumetric_with",
+    "parry3d_f64::partitioning::Bvh::refit_parallel",
+    "parry3d_f64::partitioning::Bvh::refit_without_resolve_parallel",
+    "parry3d_f64::partitioning::Bvh::insert_or_update_batch_partially_parallel",
+    "parry3d_f64::partitioning::Bvh::traverse_bvtt_single_tree_parallel",
+    "parry3d_f64::query::PersistentQueryDispatcher::contact_manifolds",
+    "parry3d_f64::query::details::contact_manifolds_composite_shape_shape",
+    "parry3d_f64::query::details::contact_manifolds_trimesh_shape",
+    "parry3d_f64::query::details::contact_manifolds_trimesh_shape_shapes",
+    "parry3d_f64::transformation::volume_mesh",
     "rayon::spawn",
     "rayon::spawn_fifo",
     "rayon::join",
@@ -136,6 +162,29 @@ const THREAD_ROUTES: [&str; 82] = [
     "rayon::str::ParallelString::par_split_ascii_whitespace",
     "rayon::str::ParallelString::par_matches",
     "rayon::str::ParallelString::par_match_indices",
+    "rayon::iter::plumbing::Producer",
+    "rayon::iter::plumbing::UnindexedProducer",
+    "rayon::iter::plumbing::ProducerCallback",
+    "rayon::iter::plumbing::Consumer",
+    "rayon::iter::plumbing::UnindexedConsumer",
+];
+
+/// The path prefixes of the thread routes: the check holds every reference entry under one to
+/// [`THREAD_ROUTES`] or [`NOT_THREAD_ROUTES`], whatever its reason says.
+const THREAD_PREFIXES: [&str; 4] = ["rayon::", "rapier3d_f64::", "parry3d_f64::", "std::thread::"];
+
+/// The reference's entries under [`THREAD_PREFIXES`] that start no thread: rayon's worker
+/// index, Rapier's multibody paths into `matrixmultiply`, the core count and thread-local state.
+const NOT_THREAD_ROUTES: [&str; 9] = [
+    "rayon::current_thread_index",
+    "rayon::ThreadPool::current_thread_index",
+    "rapier3d_f64::dynamics::Multibody::inverse_kinematics",
+    "rapier3d_f64::dynamics::Multibody::inverse_kinematics_delta",
+    "rapier3d_f64::dynamics::Multibody::inverse_kinematics_delta_with_jacobian",
+    "rapier3d_f64::dynamics::MultibodyJointSet::insert",
+    "rapier3d_f64::dynamics::MultibodyJointSet::insert_kinematic",
+    "std::thread::available_parallelism",
+    "std::thread::LocalKey",
 ];
 
 /// The entries of the reference lint file, by path prefix, that keep the outside world out:
@@ -324,6 +373,20 @@ fn reference_lint_file(files: &Files, findings: &mut Vec<Finding>) {
             format!(
                 "no longer disallows `{route}`, a route to a thread outside an executor, which \
                  architecture sections 8.2 and 16 ban inside the boundary"
+            ),
+        ));
+    }
+    let unpinned = banned.iter().filter(|path| {
+        THREAD_PREFIXES.iter().any(|prefix| path.starts_with(prefix))
+            && !THREAD_ROUTES.contains(path)
+            && !NOT_THREAD_ROUTES.contains(path)
+    });
+    for path in unpinned {
+        findings.push(Finding::new(
+            REFERENCE_CLIPPY,
+            format!(
+                "disallows `{path}`, which tools/xtask/src/boundary.rs lists neither in \
+                 `THREAD_ROUTES` nor in `NOT_THREAD_ROUTES`; list it in the one it belongs to"
             ),
         ));
     }
@@ -957,16 +1020,16 @@ mod tests {
     const FORBID: &str = "//! Docs.\n#![forbid(unsafe_code)]\n";
     const MANIFEST: &str = "[package]\nname = \"x\"\n[lints]\nworkspace = true\n";
 
-    /// A lint file of the required entries and thread routes that `keep` keeps: the first six
-    /// required entries and every route are methods.
+    /// A lint file of the required entries and thread routes that `keep` keeps: the first ten
+    /// required entries and every route are methods (the check reads both tables as one).
     fn lint_file_of(keep: impl Fn(&str) -> bool) -> String {
         let mut text = String::from("disallowed-methods = [\n");
-        let methods = REQUIRED_LINT_PATHS[..6].iter().chain(&THREAD_ROUTES);
+        let methods = REQUIRED_LINT_PATHS[..10].iter().chain(&THREAD_ROUTES);
         for path in methods.filter(|path| keep(path)) {
             text.push_str(&format!("  {{ path = \"{path}\", reason = \"r\" }},\n"));
         }
         text.push_str("]\ndisallowed-types = [\n");
-        for path in REQUIRED_LINT_PATHS[6..].iter().filter(|path| keep(path)) {
+        for path in REQUIRED_LINT_PATHS[10..].iter().filter(|path| keep(path)) {
             text.push_str(&format!("  \"{path}\",\n"));
         }
         text.push_str("]\n");
@@ -1226,10 +1289,9 @@ mod tests {
         // section 16, is pinned by `THREAD_ROUTES`, and every route is such an entry.
         let reference: toml::Table =
             toml::from_str(include_str!("../../../crates/core/clippy.toml")).unwrap();
-        let found: BTreeSet<&str> = reference["disallowed-methods"]
-            .as_array()
-            .unwrap()
+        let found: BTreeSet<&str> = LINT_TABLES
             .iter()
+            .flat_map(|table| reference[*table].as_array().unwrap())
             .filter(|entry| {
                 let reason = entry["reason"].as_str().unwrap();
                 reason.contains("creates no thread")
@@ -1240,6 +1302,46 @@ mod tests {
         let pinned: BTreeSet<&str> = THREAD_ROUTES.into_iter().collect();
         assert_eq!(pinned.len(), THREAD_ROUTES.len(), "a route is listed twice");
         assert_eq!(found, pinned);
+    }
+
+    #[test]
+    fn an_entry_under_a_thread_prefix_is_a_listed_route_or_a_listed_non_route() {
+        // Review round 2, M6: an adaptor banned with a reason that cites neither "creates no
+        // thread" nor section 16 is still a route the check must pin.
+        let (ws, mut files) = conforming();
+        let added = "rayon::iter::IndexedParallelIterator::enumerate";
+        let unpinned = lint_file().replace(
+            "disallowed-methods = [\n",
+            &format!("disallowed-methods = [\n  {{ path = \"{added}\", reason = \"r\" }},\n"),
+        );
+        files.insert(REFERENCE_CLIPPY, unpinned.clone());
+        files.insert("crates/math/clippy.toml", unpinned);
+        assert_eq!(
+            run(&ws, &files),
+            [format!(
+                "crates/core/clippy.toml: disallows `{added}`, which tools/xtask/src/boundary.rs lists neither in `THREAD_ROUTES` nor in `NOT_THREAD_ROUTES`; list it in the one it belongs to"
+            )]
+        );
+        // The non-routes are real entries of the reference, under a prefix, and no route.
+        let reference: toml::Table =
+            toml::from_str(include_str!("../../../crates/core/clippy.toml")).unwrap();
+        let banned: BTreeSet<&str> = LINT_TABLES
+            .iter()
+            .flat_map(|table| reference[*table].as_array().unwrap())
+            .map(|entry| entry["path"].as_str().unwrap())
+            .collect();
+        for path in NOT_THREAD_ROUTES {
+            assert!(banned.contains(path), "{path}");
+            assert!(THREAD_PREFIXES.iter().any(|prefix| path.starts_with(prefix)), "{path}");
+            assert!(!THREAD_ROUTES.contains(&path), "{path}");
+        }
+        for route in THREAD_ROUTES {
+            assert!(
+                THREAD_PREFIXES.iter().any(|prefix| route.starts_with(prefix))
+                    || route.starts_with("lactose_task::"),
+                "{route}"
+            );
+        }
     }
 
     #[test]

@@ -89,11 +89,13 @@ disallowed-methods = [
   { path = "f64::rem_euclid", reason = "goes through `%`, the platform fmod; use lactose_math" },
   { path = "f64::div_euclid", reason = "goes through `%`, the platform fmod; use lactose_math" },
   { path = "f64::mul_add", reason = "result depends on the caller's target features; use lactose_math::Scalar::mul_add" },
-  # Architecture section 8.2: the worker index is never a semantic key. `lactose-ecs` keeps
-  # per-slot partials and opts out at those call sites, item by item, like `lactose-math` does
-  # for the float methods.
+  # Architecture section 8.2: the worker index is never a semantic key, the executor's or the
+  # solver pool's. `lactose-ecs` keeps per-slot partials and opts out at those call sites,
+  # item by item, like `lactose-math` does for the float methods.
   { path = "lactose_task::JobContext::slot", reason = "the worker index is not a semantic key; key by StableKey", allow-invalid = true },
   { path = "lactose_task::ChildContext::slot", reason = "the worker index is not a semantic key; key by StableKey", allow-invalid = true },
+  { path = "rayon::current_thread_index", reason = "the worker index is not a semantic key; key by StableKey", allow-invalid = true },
+  { path = "rayon::ThreadPool::current_thread_index", reason = "the worker index is not a semantic key; key by StableKey", allow-invalid = true },
   # Architecture section 8.2: `lactose_ecs` re-exports the executor so that a boundary crate
   # can drive a schedule, and the re-export reaches every boundary crate. What one may do
   # with it is run a schedule. The worker count, spawning or running arbitrary work, thread
@@ -109,6 +111,8 @@ disallowed-methods = [
   { path = "lactose_task::Executor::execution_log", reason = "scheduling history is not simulation input", allow-invalid = true },
   { path = "lactose_task::Executor::chaos_config", reason = "scheduling configuration is not simulation input", allow-invalid = true },
   { path = "lactose_task::Platform::spawn_thread", reason = "a boundary crate creates no thread", allow-invalid = true },
+  { path = "lactose_task::Platform::topology", reason = "the core count is not a simulation input", allow-invalid = true },
+  { path = "lactose_task::Platform::hardware_threads", reason = "the core count is not a simulation input", allow-invalid = true },
   # D119: nalgebra hands products above its small-dimension cutoff to `matrixmultiply`,
   # whose kernels are selected by CPU feature at run time. The step forms none; inverse
   # kinematics does, so it is banned (paths on the pinned rapier3d-f64 0.36.0).
@@ -208,14 +212,36 @@ disallowed-methods = [
   { path = "rayon::ThreadPool::new", reason = "architecture section 16: the solver pool is built outside the boundary and handed to the backend", allow-invalid = true },
   { path = "rapier3d_f64::pipeline::PhysicsWorld::configure_thread_pool", reason = "architecture section 16: the solver pool is built outside the boundary and handed to the backend", allow-invalid = true },
   { path = "rapier3d_f64::pipeline::PhysicsPipeline::configure_thread_pool", reason = "architecture section 16: the solver pool is built outside the boundary and handed to the backend", allow-invalid = true },
-  # Section 16: Rapier's parallel work runs on that pool and nowhere else. Off it, each of
-  # rayon's entry points starts its global pool: the free functions, the iterator sources and
-  # bridges, and the methods of the prelude's traits that make or drive a parallel iterator;
-  # and Rapier stepping without a pool does too, so its `clear_thread_pool` is banned.
-  # `set_thread_pool(None)` is not, being the backend's own setter; lactose-physics-rapier's
-  # tests/global_pool.rs holds that no step starts the global pool.
+  # Section 16: Rapier's parallel work runs on that pool and nowhere else. Off it, rayon
+  # starts its global pool. Banned here: rayon's free functions, iterator sources and bridges,
+  # the methods of the prelude's traits that make or drive a parallel iterator (and, under
+  # disallowed-types, the traits a parallel iterator of a crate's own is written with), Rapier's
+  # `clear_thread_pool`, and the public functions of the pinned Rapier (0.36.0) and parry
+  # (0.31.1) found to run parallel work outside `PhysicsPipeline::step`, which alone runs on
+  # the pool it was handed. The list is not provably complete: Rapier's and parry's public
+  # functions that run parallel work outside `PhysicsPipeline::step`, beyond those listed, are
+  # not banned, nor is a world stepped without a pool (one made by `new`, or after
+  # `set_thread_pool(None)`). lactose-physics-rapier's tests/global_pool.rs holds that the
+  # backend's own worlds never start the global pool.
   { path = "rapier3d_f64::pipeline::PhysicsWorld::clear_thread_pool", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
   { path = "rapier3d_f64::pipeline::PhysicsPipeline::clear_thread_pool", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rapier3d_f64::pipeline::PhysicsWorld::detect_collisions", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rapier3d_f64::pipeline::CollisionPipeline::step", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rapier3d_f64::geometry::BroadPhaseBvh::update", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rapier3d_f64::dynamics::CCDSolver::find_first_impact", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rapier3d_f64::dynamics::CCDSolver::solve_continuous", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rapier3d_f64::dynamics::SoftBodySet::sync_particle_positions", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rapier3d_f64::dynamics::SoftBodyBuilder::volumetric", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rapier3d_f64::dynamics::SoftBodyBuilder::volumetric_with", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "parry3d_f64::partitioning::Bvh::refit_parallel", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "parry3d_f64::partitioning::Bvh::refit_without_resolve_parallel", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "parry3d_f64::partitioning::Bvh::insert_or_update_batch_partially_parallel", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "parry3d_f64::partitioning::Bvh::traverse_bvtt_single_tree_parallel", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "parry3d_f64::query::PersistentQueryDispatcher::contact_manifolds", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "parry3d_f64::query::details::contact_manifolds_composite_shape_shape", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "parry3d_f64::query::details::contact_manifolds_trimesh_shape", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "parry3d_f64::query::details::contact_manifolds_trimesh_shape_shapes", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "parry3d_f64::transformation::volume_mesh", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
   { path = "rayon::spawn", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
   { path = "rayon::spawn_fifo", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
   { path = "rayon::join", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
@@ -295,6 +321,17 @@ disallowed-types = [
   # Bans `thread_local!` through the type it declares. The `disallowed-macros` lint cannot
   # be used for it: on the pinned toolchain a local `expect` does not reach an item macro.
   { path = "std::thread::LocalKey", reason = "no thread-local state inside the boundary" },
+  # Section 16: rayon's adaptors bridge a parallel iterator onto the current pool, the global
+  # one off the solver pool. They are not banned, being of no use without a parallel iterator:
+  # the iterators rayon makes are banned at their sources (under disallowed-methods), and one
+  # of a crate's own is written with these traits, its `drive` methods bounded by the consumer
+  # traits. This lint catches a trait in a bound or a named import, not in an impl header, a
+  # glob import or an expression path; an iterator cannot be written without the bounds.
+  { path = "rayon::iter::plumbing::Producer", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rayon::iter::plumbing::UnindexedProducer", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rayon::iter::plumbing::ProducerCallback", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rayon::iter::plumbing::Consumer", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rayon::iter::plumbing::UnindexedConsumer", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
   # Architecture section 8.2: the types that open a file or a socket or start a process; the
   # free functions are under disallowed-methods.
   { path = "std::fs::File", reason = "architecture section 8.2: file IO is outside the boundary; what the simulation reads enters as a tick input" },

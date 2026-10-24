@@ -1,7 +1,10 @@
 //! Rapier's parallel work runs on the pool the backend is handed and nowhere else (architecture
-//! section 16). Off that pool, rayon starts its global pool, sized by the core count, and the
-//! boundary lint file bans every rayon entry point that would; what it cannot ban is the
-//! backend setting Rapier's pool to `None`, so this test holds it at run time.
+//! section 16). Off that pool, rayon starts its global pool, sized by the core count. The
+//! boundary lint file bans the routes to it that it names, but not every one: Rapier's and
+//! parry's public functions that run parallel work outside `PhysicsPipeline::step`, beyond
+//! those listed, and stepping a world without a pool (the backend's own
+//! `set_thread_pool(None)` among them) are not banned, so this test holds the backend at run
+//! time.
 //!
 //! A backend's life (a pile above the narrow phase's broadcast threshold, stepped,
 //! snapshotted and restored into a second backend that steps on) leaves rayon's global pool
