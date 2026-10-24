@@ -102,9 +102,9 @@ finding.
   other `[patch]` table exists, and no cargo configuration file sets `[patch]`, `[source]`
   or `paths`. No cargo configuration file has an `include` key, and no `.cargo` directory or
   cargo configuration file is a symbolic link or tracked by git beneath a directory the
-  file walk skips (`target/`, a nested checkout). No config alias passes `--config` or `-Z`,
-  no workflow or script passes `--config` at all, and none of them sets `CARGO_HOME`. Every
-  resolved package with no source that is not a member lives at
+  file walk skips (`target/`, a nested checkout, the root's `.scratchpad/`). No config alias
+  passes `--config` or `-Z`, no workflow or script passes `--config` at all, and none of
+  them sets `CARGO_HOME`. Every resolved package with no source that is not a member lives at
   `vendor/<name>-<version>/` and is named by such an entry; every directory under `vendor/`
   is such a package, holds that name and version, and the name resolves at no other version
   with every feature on. Nothing else lives directly under `vendor/` but those directories,

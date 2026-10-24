@@ -8,6 +8,9 @@ use std::path::Path;
 
 use crate::Finding;
 
+/// The coordinator's local scratchpad at the repository root, which git ignores.
+const SCRATCHPAD: &str = ".scratchpad";
+
 /// File contents keyed by repository-relative path with `/` separators, the symbolic links
 /// that were not followed, and the directories that were not entered.
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
@@ -62,16 +65,16 @@ impl Files {
     }
 
     /// Every directory not entered (build output, version-control metadata, nested
-    /// checkouts), sorted.
+    /// checkouts, the root's scratchpad), sorted.
     pub fn skipped(&self) -> impl Iterator<Item = &str> {
         self.skipped.iter().map(String::as_str)
     }
 
     /// Reads the files the checks look at from the repository at `root`.
     ///
-    /// Build output, version-control metadata and nested checkouts (a directory other than
-    /// `root` that has its own `.git`) are skipped and recorded. Symbolic links are recorded,
-    /// not followed.
+    /// Build output, version-control metadata, nested checkouts (a directory other than
+    /// `root` that has its own `.git`) and the scratchpad `.scratchpad` directly under `root`
+    /// are skipped and recorded. Symbolic links are recorded, not followed.
     ///
     /// # Errors
     /// If a directory or a wanted file cannot be read.
@@ -90,7 +93,11 @@ fn walk(dir: &Path, prefix: &str, files: &mut Files) -> Result<(), String> {
         let kind = entry.file_type().map_err(|e| format!("{}: {e}", entry.path().display()))?;
         let relative = if prefix.is_empty() { name.clone() } else { format!("{prefix}/{name}") };
         if kind.is_dir() {
-            if name == ".git" || name == "target" || entry.path().join(".git").exists() {
+            if name == ".git"
+                || name == "target"
+                || (prefix.is_empty() && name == SCRATCHPAD)
+                || entry.path().join(".git").exists()
+            {
                 files.insert_skipped(relative);
                 continue;
             }
@@ -197,6 +204,26 @@ mod tests {
                 format!("d/.cargo/config.toml: {link}"),
             ]
         );
+    }
+
+    #[test]
+    fn the_root_scratchpad_is_skipped_and_a_nested_one_is_read() -> Result<(), String> {
+        let root = std::env::temp_dir()
+            .join(format!("lactose-xtask-repo-{}-scratchpad", std::process::id()));
+        if root.exists() {
+            fs::remove_dir_all(&root).map_err(|e| e.to_string())?;
+        }
+        let script = "RUSTFLAGS=-Ctarget-cpu=native cargo build\n";
+        for dir in [".scratchpad", "crates/a/.scratchpad"] {
+            fs::create_dir_all(root.join(dir)).map_err(|e| e.to_string())?;
+            fs::write(root.join(dir).join("x.sh"), script).map_err(|e| e.to_string())?;
+        }
+        let files = Files::load(&root);
+        fs::remove_dir_all(&root).map_err(|e| e.to_string())?;
+        let files = files?;
+        assert_eq!(files.paths().collect::<Vec<_>>(), ["crates/a/.scratchpad/x.sh"]);
+        assert_eq!(files.skipped().collect::<Vec<_>>(), [".scratchpad"]);
+        Ok(())
     }
 
     #[test]
