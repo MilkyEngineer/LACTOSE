@@ -104,7 +104,8 @@ pub fn register_systems(registration: &mut Registration) {
 /// read. Writes `AnimParams` only when a trigger was set. With the machine missing from the
 /// region's table, a hold: marks `AnimState` held and leaves the rest of it and `AnimParams`
 /// as they are, writes `RootMotion::ZERO` and emits nothing; with the state's clip missing,
-/// the same after the state has been set.
+/// the same after the state has been set, except that a hold on the tick that entered the
+/// initial state does not mark it held, so the entry is reported on that tick.
 #[system(name = "anim::advance", worlds = [server, prediction], in_set = sets::ADVANCE)]
 pub(crate) fn advance(
     ctx: Ctx,

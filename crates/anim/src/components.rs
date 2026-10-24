@@ -151,7 +151,8 @@ pub struct AnimState {
     /// The outgoing state's phase while a transition blends; unused otherwise.
     #[field(id = 3)]
     blend_phase: Phase,
-    /// Ticks since the state was entered, this tick included; one on the entry tick.
+    /// Ticks since the state was entered, this tick included; one on the entry tick, zero
+    /// while the initial state's clip has been missing since its entry (a hold).
     #[field(id = 4)]
     ticks_in_state: u32,
     /// The state, or `u16::MAX` before the first advance.
@@ -181,9 +182,11 @@ impl AnimState {
     /// it.
     const ENTRY_SET: u8 = 1 << 2;
     /// This tick's advance was a hold (the machine or a clip missing): set by the hold,
-    /// cleared by the next advance that moves the phase. The rest of the row is as the last
-    /// advance left it, so the accessors that report what happened this tick read false
-    /// while it is set rather than repeat that advance.
+    /// cleared by the entry of the initial state and by the next advance that moves the
+    /// phase. The rest of the row is as the last advance left it, so the accessors that
+    /// report what happened this tick read false while it is set rather than repeat that
+    /// advance. A hold on the tick that entered the initial state does not set it: that
+    /// tick's row is the entry, which is reported then and on no other tick.
     const HELD: u8 = 1 << 3;
 
     /// No state yet: what a character is spawned with. The first `anim::advance` enters the
@@ -243,8 +246,9 @@ impl AnimState {
     }
 
     /// Whether the state was entered this tick, by the first advance or by a transition.
-    /// False on a held tick, which reports nothing (`README.md`, "The state machine"),
-    /// including the tick whose entry of the initial state was followed by a hold.
+    /// False on a held tick, which reports nothing (`README.md`, "The state machine"). The
+    /// tick that entered the initial state is not held even when its clip was missing, so
+    /// the entry is reported on it.
     #[must_use]
     pub const fn entered(&self) -> bool {
         self.flags & (Self::ENTERED | Self::HELD) == Self::ENTERED
@@ -267,7 +271,8 @@ impl AnimState {
         self.flags & Self::FINISHED != 0
     }
 
-    /// Ticks since the state was entered, this tick included; one on the entry tick.
+    /// Ticks since the state was entered, this tick included; one on the entry tick, zero
+    /// while the initial state's clip has been missing since its entry (a hold).
     #[must_use]
     pub const fn ticks_in_state(&self) -> u32 {
         self.ticks_in_state
@@ -283,7 +288,8 @@ impl AnimState {
     /// passes it, through the wrap of a looping clip. A tick with no advance passes
     /// nothing: at rate zero the two phases are equal, and on a held tick (the machine or a
     /// clip missing), whose row keeps the last advance's phases, this is false for every
-    /// mark, the entry phase of a state entered on that tick included.
+    /// mark. The tick that entered the initial state is not held even when its clip was
+    /// missing, so the entry phase is reported on it, once.
     #[must_use]
     pub const fn phase_crossed(&self, mark: Phase) -> bool {
         if self.flags & Self::HELD != 0 {
@@ -661,7 +667,9 @@ impl Bones {
     /// every bone row's [`BoneLink`] rewritten with `limp`. Called only from a system that
     /// declares `worlds = [server]`, as [`spawn`](Self::spawn) is; the calling kernel
     /// declares `writes = [Bones, BoneLink, RigidBody]`. Nothing happens when `limp` equals
-    /// the current value.
+    /// the current value. The character's root is not moved: a game that moves a local
+    /// player's root while it is limp, with its claim kept, makes every such frame a
+    /// correction (`README.md`, "Bones and ragdolls", says what to do instead).
     pub fn set_limp(
         &self,
         cmd: &mut Commands<'_>,
@@ -737,20 +745,36 @@ mod tests {
     }
 
     #[test]
-    fn a_hold_after_an_entry_reports_nothing() {
-        // The initial state entered at phase zero (step 2), then a hold (step 4): the row
-        // is `entering(0)` marked held, and every tick the clip stays missing leaves it so.
-        let entered = AnimState::entering(0);
-        assert!(entered.phase_crossed(Phase::ZERO));
-        assert!(entered.entered() && entered.entry_was_set());
+    fn an_entry_then_a_hold_is_reported_once() {
+        // The initial state entered at phase zero (step 2), then its clip missing (step 4):
+        // the hold does not mark that tick held, so the row is the entry before step 6, and
+        // the entry and its entry phase are reported on it.
+        let entry_tick = AnimState { ticks_in_state: 0, ..AnimState::entering(0) };
+        assert!(entry_tick.entered() && entry_tick.entry_was_set());
+        assert!(entry_tick.phase_crossed(Phase::ZERO));
+        assert!(!entry_tick.phase_crossed(Phase::HALF));
 
-        let held = held(entered);
+        // Every later tick the clip stays missing marks it held and reports nothing.
+        let held = held(entry_tick);
         for mark in [Phase::ZERO, Phase::HALF, Phase::END] {
             assert!(!held.phase_crossed(mark), "{mark:?}");
         }
         assert!(!held.entered());
         assert!(!held.entry_was_set());
         assert_eq!(held.state(), Some(0));
+        assert_eq!(held.ticks_in_state(), 0);
+
+        // The first advance once the clip arrives (no transition, entered cleared, the
+        // held mark cleared) passes `(ZERO, phase]`, so phase zero is not reported again.
+        let arrived = AnimState {
+            phase: Phase::from_fraction(1, 60),
+            ticks_in_state: 1,
+            flags: 0,
+            ..entry_tick
+        };
+        assert!(!arrived.entered());
+        assert!(!arrived.phase_crossed(Phase::ZERO));
+        assert!(arrived.phase_crossed(Phase::from_fraction(1, 60)));
     }
 
     #[test]
