@@ -1,14 +1,17 @@
 //! The authored data the simulation animates with (architecture sections 14, 17 and 18):
 //! clips, state machines and sim skeletons, as the three simulation asset kinds a region's
-//! exact-version table carries, and the loaders that decode their cooked bytes. The byte
-//! form is the implementation lane's, fixed together with the cooker and recorded in
-//! `README.md` then; what is fixed here is the runtime form every kernel reads and the
-//! kind keys and format versions the cooker emits.
+//! exact-version table carries, and the loaders that decode their cooked bytes (the byte
+//! form is `README.md`'s, "Assets", and `codec.rs`'s): the runtime form every kernel reads,
+//! the checks a loader runs on it, and the kind keys and format versions the cooker emits.
+
+use std::borrow::Cow;
 
 use lactose_asset_api::{Asset, AssetId, AssetKind, AssetRef, Loader, SimulationAsset};
-use lactose_core::Result;
-use lactose_math::{Scalar, Vec3};
+use lactose_core::{Error, ErrorKind, Result};
+use lactose_math::{Quat, Scalar, Vec3};
 use lactose_physics_api::{Collider, JointKind, RigidBody};
+
+use crate::codec;
 
 use crate::components::{BoneIndex, BonePose, ParamIndex, RootMotion, StateIndex};
 use crate::keys::{AnimEventKey, BoneKey, StateKey};
@@ -78,10 +81,12 @@ impl Clip {
     /// `phase * intervals / 2^32` in integer arithmetic, with `intervals` equal to `frames`
     /// for a looping clip (the sample after the last is sample zero) and `frames - 1`
     /// otherwise, the fraction one `lactose_math` division; [`Phase::END`] on a one-shot
-    /// samples the last frame exactly. A `bone` at or past `bones` is the identity.
+    /// samples the last frame exactly, as does a phase whose position falls on a frame (a
+    /// zero fraction), which is that frame's sample unblended. A `bone` at or past `bones`
+    /// is the identity.
     #[must_use]
     pub fn sample(&self, phase: Phase, bone: BoneIndex) -> BonePose {
-        todo!()
+        self.pose_at(self.cursor(phase), bone)
     }
 
     /// What the root moved by between phase `from` and phase `to` of this tick's advance, in
@@ -101,7 +106,90 @@ impl Clip {
     /// `from == to`.
     #[must_use]
     pub fn root_motion(&self, from: Phase, to: Phase) -> RootMotion {
-        todo!()
+        if self.root.is_empty() || from == to {
+            return RootMotion::ZERO;
+        }
+        let start = self.track(from);
+        let reached = self.track(to);
+        let turn_back = Quat::from_rotation_y(-start.yaw);
+        if to >= from || !self.looping {
+            return RootMotion {
+                translation: turn_back * (reached.translation - start.translation),
+                yaw: reached.yaw - start.yaw,
+            };
+        }
+        let first = self.root_entry(0);
+        let end = self.root_entry(self.root.len() - 1);
+        let total = end.yaw;
+        let turned = Quat::from_rotation_y(total - start.yaw);
+        RootMotion {
+            translation: turn_back * (end.translation - start.translation)
+                + turned * (reached.translation - first.translation),
+            yaw: total - start.yaw + reached.yaw,
+        }
+    }
+
+    /// The two frames `phase` lies between and the fraction between them, by the rule of
+    /// [`sample`](Self::sample). Frame `b` is `frames` past the last frame of a looping
+    /// clip: sample zero for a pose, the cycle's end for the root track.
+    pub(crate) fn cursor(&self, phase: Phase) -> Cursor {
+        let intervals = if self.looping { self.frames } else { self.frames.saturating_sub(1) };
+        if intervals == 0 || (!self.looping && phase == Phase::END) {
+            let last = intervals as usize;
+            return Cursor { a: last, b: last, t: None };
+        }
+        // Below 2^64: both factors are below 2^32.
+        let position = u64::from(phase.0) * u64::from(intervals);
+        let a = (position >> 32) as usize;
+        let fraction = position & (Phase::UNITS - 1);
+        if fraction == 0 {
+            return Cursor { a, b: a, t: None };
+        }
+        let t = Scalar::from_u64(fraction) / Scalar::from_u64(Phase::UNITS);
+        Cursor { a, b: a + 1, t: Some(t) }
+    }
+
+    /// Bone `bone`'s parent-local pose at `cursor`: the identity past the bones, and for a
+    /// frame the samples do not hold (a clip `validate` refuses).
+    pub(crate) fn pose_at(&self, cursor: Cursor, bone: BoneIndex) -> BonePose {
+        let bones = usize::from(self.bones);
+        let bone = usize::from(bone);
+        if bone >= bones {
+            return BonePose::IDENTITY;
+        }
+        let frames = self.frames as usize;
+        let at = |frame: usize| {
+            let frame = if frame >= frames { 0 } else { frame };
+            self.samples.get(frame * bones + bone).copied().unwrap_or(BonePose::IDENTITY)
+        };
+        match cursor.t {
+            None => at(cursor.a),
+            Some(t) => at(cursor.a).blend(at(cursor.b), t),
+        }
+    }
+
+    /// The root track at `phase`, sampled by the rule of [`sample`](Self::sample).
+    fn track(&self, phase: Phase) -> RootSample {
+        let cursor = self.cursor(phase);
+        let a = self.root_entry(cursor.a);
+        match cursor.t {
+            None => a,
+            Some(t) => {
+                let b = self.root_entry(cursor.b);
+                RootSample {
+                    translation: a.translation.lerp(b.translation, t),
+                    yaw: a.yaw.lerp(b.yaw, t),
+                }
+            }
+        }
+    }
+
+    /// Entry `index` of the root track, or zero past it (a track `validate` refuses).
+    fn root_entry(&self, index: usize) -> RootSample {
+        self.root
+            .get(index)
+            .copied()
+            .unwrap_or(RootSample { translation: Vec3::ZERO, yaw: Scalar::ZERO })
     }
 
     /// The checks the loader runs: `duration_ticks` at least one; `frames` at least two, or
@@ -109,7 +197,44 @@ impl Clip {
     /// stated on the field; every rotation a unit quaternion; every scalar finite; events
     /// ascending by phase. `InvalidData` otherwise, naming the first failure.
     pub fn validate(&self) -> Result<()> {
-        todo!()
+        if self.duration_ticks == 0 {
+            return Err(invalid("a clip lasts at least one tick"));
+        }
+        if self.frames < 2 && !(self.looping && self.frames == 1) {
+            return Err(invalid("a clip has two frames, or one when it loops"));
+        }
+        let samples = u64::from(self.frames) * u64::from(self.bones);
+        if self.samples.len() as u64 != samples {
+            return Err(invalid(format!(
+                "a clip of {} frames and {} bones holds {samples} samples, not {}",
+                self.frames,
+                self.bones,
+                self.samples.len()
+            )));
+        }
+        let root = u64::from(self.frames) + u64::from(self.looping);
+        if !self.root.is_empty() && self.root.len() as u64 != root {
+            return Err(invalid(format!(
+                "a clip's root track holds {root} entries or none, not {}",
+                self.root.len()
+            )));
+        }
+        for (index, sample) in self.samples.iter().enumerate() {
+            pose_is_valid(sample).map_err(|what| invalid(format!("sample {index}: {what}")))?;
+        }
+        for (index, entry) in self.root.iter().enumerate() {
+            if !entry.translation.is_finite() || !entry.yaw.is_finite() {
+                return Err(invalid(format!("root entry {index}: a scalar is not finite")));
+            }
+        }
+        let descending = self.events.windows(2).position(|pair| pair[1].phase < pair[0].phase);
+        if let Some(index) = descending {
+            return Err(invalid(format!(
+                "event {}: the events are not ascending by phase",
+                index + 1
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -227,7 +352,35 @@ impl StateMachine {
     /// every speed finite and not negative. `InvalidData` otherwise, naming the first
     /// failure.
     pub fn validate(&self) -> Result<()> {
-        todo!()
+        let states = self.states.len();
+        if states == 0 || states >= usize::from(u16::MAX) {
+            return Err(invalid(format!(
+                "a state machine has at least one state and fewer than {}, not {states}",
+                u16::MAX
+            )));
+        }
+        if usize::from(self.initial) >= states {
+            return Err(invalid(format!("the initial state {} is past the states", self.initial)));
+        }
+        for (index, state) in self.states.iter().enumerate() {
+            if !state.speed.is_finite() || state.speed < Scalar::ZERO {
+                return Err(invalid(format!("state {index}: the speed is negative or not finite")));
+            }
+            if state.speed_param.is_some_and(|param| usize::from(param) >= PARAM_SLOTS) {
+                return Err(invalid(format!(
+                    "state {index}: the speed parameter is past the slots"
+                )));
+            }
+            if self.states[..index].iter().any(|other| other.key == state.key) {
+                return Err(invalid(format!("state {index}: another state has its key")));
+            }
+        }
+        for (index, transition) in self.transitions.iter().enumerate() {
+            transition
+                .check(states)
+                .map_err(|what| invalid(format!("transition {index}: {what}")))?;
+        }
+        Ok(())
     }
 }
 
@@ -373,11 +526,163 @@ impl Skeleton {
     /// body (the ragdoll's root body alone has none); the OR of every body's
     /// `groups.membership` and the OR of every body's `groups.filter` sharing no bit (the
     /// bone rule, [`BoneBody::collider`]);
-    /// every rest rotation a unit quaternion and every scalar finite. `InvalidData`
-    /// otherwise, naming the first failure.
+    /// every rest and socket rotation a unit quaternion and every scalar finite.
+    /// `InvalidData` otherwise, naming the first failure.
     pub fn validate(&self) -> Result<()> {
-        todo!()
+        let bones = self.bones.len();
+        if bones == 0 || bones > MAX_SIM_BONES {
+            return Err(invalid(format!(
+                "a skeleton has at least one bone and at most {MAX_SIM_BONES}, not {bones}"
+            )));
+        }
+        let (mut membership, mut filter) = (0u32, 0u32);
+        for (index, bone) in self.bones.iter().enumerate() {
+            let fail = |what: &str| invalid(format!("bone {index}: {what}"));
+            match (index, bone.parent) {
+                (0, Some(_)) => return Err(fail("the root bone has a parent")),
+                (0, None) => {}
+                (_, None) => return Err(fail("only bone zero has no parent")),
+                (_, Some(parent)) if usize::from(parent) >= index => {
+                    return Err(fail("the parent does not precede the bone"));
+                }
+                (_, Some(_)) => {}
+            }
+            if self.bones[..index].iter().any(|other| other.key == bone.key) {
+                return Err(fail("another bone has its key"));
+            }
+            if bone.role != BoneRole::Other
+                && self.bones[..index].iter().any(|other| other.role == bone.role)
+            {
+                return Err(fail("another bone has its role"));
+            }
+            pose_is_valid(&bone.rest).map_err(|what| fail(&format!("the rest pose: {what}")))?;
+            let Some(body) = &bone.body else { continue };
+            body_is_finite(body).map_err(fail)?;
+            if body.joint.is_some() && self.body_above(index).is_none() {
+                return Err(fail("the joint reaches no ancestor with a body"));
+            }
+            membership |= body.collider.groups.membership;
+            filter |= body.collider.groups.filter;
+        }
+        if membership & filter != 0 {
+            return Err(invalid(format!(
+                "the bones' memberships {membership:#x} meet their filters {filter:#x}, so two \
+                 bones of the skeleton would touch"
+            )));
+        }
+        for (index, socket) in self.sockets.iter().enumerate() {
+            if usize::from(socket.bone) >= bones {
+                return Err(invalid(format!("socket {index}: the bone is past the bones")));
+            }
+            pose_is_valid(&socket.offset)
+                .map_err(|what| invalid(format!("socket {index}: the offset: {what}")))?;
+        }
+        Ok(())
     }
+
+    /// The nearest ancestor of bone `index` that has a body, walking at most as many
+    /// parents as there are bones, so a skeleton `validate` refuses cannot loop it.
+    pub(crate) fn body_above(&self, index: usize) -> Option<usize> {
+        let mut bone = self.bones.get(index)?;
+        for _ in 0..self.bones.len() {
+            let parent = usize::from(bone.parent?);
+            bone = self.bones.get(parent)?;
+            if bone.body.is_some() {
+                return Some(parent);
+            }
+        }
+        None
+    }
+}
+
+impl Transition {
+    /// Whether every index and bit of the transition is in range for a machine of `states`
+    /// states: what [`StateMachine::validate`] checks of it, and what the advance checks
+    /// before it tries it.
+    pub(crate) fn check(&self, states: usize) -> core::result::Result<(), &'static str> {
+        if self.from.is_some_and(|from| usize::from(from) >= states) {
+            return Err("the state it leaves is past the states");
+        }
+        if usize::from(self.to) >= states {
+            return Err("the state it enters is past the states");
+        }
+        for condition in &self.conditions {
+            match *condition {
+                Condition::Above { param, .. } | Condition::Below { param, .. }
+                    if usize::from(param) >= PARAM_SLOTS =>
+                {
+                    return Err("a condition's parameter is past the slots");
+                }
+                Condition::Flag { bit, .. } | Condition::Trigger(bit) if bit >= 32 => {
+                    return Err("a condition's bit is past the word");
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Where a phase falls between two frames of a clip: frames `a` and `b` and the fraction
+/// between them, or `None` when the phase is on frame `a`, which it then samples exactly.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub(crate) struct Cursor {
+    a: usize,
+    b: usize,
+    t: Option<Scalar>,
+}
+
+/// The tolerance of the unit-quaternion check on the squared length: the one the physics
+/// backend applies to the rotations it is handed.
+const UNIT_TOLERANCE: Scalar = Scalar::from_f64(1e-6);
+
+/// Whether `pose` is finite with a unit rotation.
+fn pose_is_valid(pose: &BonePose) -> core::result::Result<(), &'static str> {
+    if !pose.translation.is_finite() || !pose.rotation.is_finite() {
+        return Err("a scalar is not finite");
+    }
+    if (pose.rotation.length_squared() - Scalar::ONE).abs() >= UNIT_TOLERANCE {
+        return Err("the rotation is not a unit quaternion");
+    }
+    Ok(())
+}
+
+/// Whether every scalar of `body` is finite.
+fn body_is_finite(body: &BoneBody) -> core::result::Result<(), &'static str> {
+    let rigid = &body.body;
+    let collider = &body.collider;
+    let scalars = [
+        rigid.mass,
+        rigid.linear_damping,
+        rigid.angular_damping,
+        rigid.gravity_scale,
+        collider.shape.radius,
+        collider.friction,
+        collider.restitution,
+        collider.density,
+        collider.impact_threshold,
+    ];
+    let vectors = [collider.shape.half_extents, collider.offset];
+    let joint = body.joint.is_none_or(|joint| {
+        joint.anchor_parent.is_finite()
+            && joint.anchor_bone.is_finite()
+            && joint.axis.is_finite()
+            && joint.limits.is_none_or(|(min, max)| min.is_finite() && max.is_finite())
+    });
+    if scalars.iter().all(|scalar| scalar.is_finite())
+        && vectors.iter().all(|vector| vector.is_finite())
+        && collider.rotation.is_finite()
+        && joint
+    {
+        Ok(())
+    } else {
+        Err("a scalar of the body is not finite")
+    }
+}
+
+/// An `InvalidData` error.
+pub(crate) fn invalid(message: impl Into<Cow<'static, str>>) -> Error {
+    Error::new(ErrorKind::InvalidData, message)
 }
 
 impl Asset for Skeleton {
@@ -390,7 +695,10 @@ impl SimulationAsset for Skeleton {}
 /// The loader of [`Clip`]s: a pure decoder of the cooked bytes, bit-identical on every
 /// host, which is the promise [`SimulationAsset`] makes; it validates what it decodes with
 /// [`Clip::validate`]. The one dependency is the clip's skeleton. `app` registers it with
-/// the store through `ErasedLoader::new`.
+/// the store through `ErasedLoader::new`. Each of the three loaders refuses bytes in
+/// another format or for another scalar width (`VersionMismatch`), bytes that are
+/// truncated or run on past the asset, and a `dependencies` list other than the set of
+/// assets the bytes name (`InvalidData`, `README.md`, "Assets", gives the byte form).
 #[derive(Clone, Copy, Default, Debug)]
 pub struct ClipLoader;
 
@@ -398,12 +706,16 @@ impl Loader for ClipLoader {
     type Asset = Clip;
 
     fn load(&self, bytes: &[u8], dependencies: &[AssetId]) -> Result<Clip> {
-        todo!()
+        let clip = codec::decode_clip(bytes)?;
+        codec::check_dependencies(dependencies, [clip.skeleton.id()])?;
+        clip.validate()?;
+        Ok(clip)
     }
 }
 
 /// The loader of [`StateMachine`]s: a pure decoder, validating with
-/// [`StateMachine::validate`]. The dependencies are the states' clips.
+/// [`StateMachine::validate`]. The dependencies are the states' clips, as for
+/// [`ClipLoader`].
 #[derive(Clone, Copy, Default, Debug)]
 pub struct StateMachineLoader;
 
@@ -411,12 +723,16 @@ impl Loader for StateMachineLoader {
     type Asset = StateMachine;
 
     fn load(&self, bytes: &[u8], dependencies: &[AssetId]) -> Result<StateMachine> {
-        todo!()
+        let machine = codec::decode_state_machine(bytes)?;
+        let clips = machine.states.iter().map(|state| state.clip.id());
+        codec::check_dependencies(dependencies, clips)?;
+        machine.validate()?;
+        Ok(machine)
     }
 }
 
 /// The loader of [`Skeleton`]s: a pure decoder, validating with [`Skeleton::validate`]. No
-/// dependencies.
+/// dependencies, as for [`ClipLoader`].
 #[derive(Clone, Copy, Default, Debug)]
 pub struct SkeletonLoader;
 
@@ -424,6 +740,9 @@ impl Loader for SkeletonLoader {
     type Asset = Skeleton;
 
     fn load(&self, bytes: &[u8], dependencies: &[AssetId]) -> Result<Skeleton> {
-        todo!()
+        let skeleton = codec::decode_skeleton(bytes)?;
+        codec::check_dependencies(dependencies, [])?;
+        skeleton.validate()?;
+        Ok(skeleton)
     }
 }

@@ -11,9 +11,9 @@
 
 use lactose_asset_api::AssetRef;
 use lactose_core::{EntityRef, PlainArray, StableKey};
-use lactose_ecs::Commands;
+use lactose_ecs::{Commands, OwnedBy};
 use lactose_math::{Quat, Scalar, Vec3};
-use lactose_physics_api::{Transform, Velocity};
+use lactose_physics_api::{BodyType, Joint, Transform, Velocity};
 use lactose_reflect::{Padding, ZeroByte, component, value};
 
 use crate::assets::{Clip, MAX_SIM_BONES, PARAM_SLOTS, Skeleton, StateMachine};
@@ -144,50 +144,51 @@ impl AnimRig {
 pub struct AnimState {
     /// The phase after this tick's advance.
     #[field(id = 1)]
-    phase: Phase,
+    pub(crate) phase: Phase,
     /// The phase before this tick's advance, in the current state.
     #[field(id = 2)]
-    previous_phase: Phase,
+    pub(crate) previous_phase: Phase,
     /// The outgoing state's phase while a transition blends; unused otherwise.
     #[field(id = 3)]
-    blend_phase: Phase,
+    pub(crate) blend_phase: Phase,
     /// Ticks since the state was entered, this tick included; one on the entry tick, zero
-    /// while the initial state's clip has been missing since its entry (a hold).
+    /// while the state's clip has been missing since its entry (a hold).
     #[field(id = 4)]
-    ticks_in_state: u32,
+    pub(crate) ticks_in_state: u32,
     /// The state, or `u16::MAX` before the first advance.
     #[field(id = 5)]
-    state: u16,
+    pub(crate) state: u16,
     /// The outgoing state while a transition blends; equal to `state` otherwise.
     #[field(id = 6)]
-    previous_state: u16,
+    pub(crate) previous_state: u16,
     /// The length of the blend in ticks, from the transition; zero when none is in progress.
     #[field(id = 7)]
-    blend_ticks: u16,
+    pub(crate) blend_ticks: u16,
     /// [`Self::ENTERED`], [`Self::FINISHED`], [`Self::ENTRY_SET`] and [`Self::HELD`].
     #[field(id = 8)]
-    flags: u8,
+    pub(crate) flags: u8,
     #[field(padding)]
     _pad: Padding<1>,
 }
 
 impl AnimState {
     /// The state was entered this tick.
-    const ENTERED: u8 = 1;
+    pub(crate) const ENTERED: u8 = 1;
     /// The state's one-shot clip has reached [`Phase::END`], this tick or earlier.
-    const FINISHED: u8 = 1 << 1;
+    pub(crate) const FINISHED: u8 = 1 << 1;
     /// This tick's entry set the phase (the initial state, or a transition without
     /// `keep_phase`) rather than keeping the outgoing state's, so a mark at the entry phase
     /// counts on the entry tick; a kept phase was already passed by the tick that reached
     /// it.
-    const ENTRY_SET: u8 = 1 << 2;
+    pub(crate) const ENTRY_SET: u8 = 1 << 2;
     /// This tick's advance was a hold (the machine or a clip missing): set by the hold,
-    /// cleared by the entry of the initial state and by the next advance that moves the
-    /// phase. The rest of the row is as the last advance left it, so the accessors that
-    /// report what happened this tick read false while it is set rather than repeat that
-    /// advance. A hold on the tick that entered the initial state does not set it: that
-    /// tick's row is the entry, which is reported then and on no other tick.
-    const HELD: u8 = 1 << 3;
+    /// cleared by an entry (of the initial state, or by a transition) and by the next
+    /// advance that moves the phase. The rest of the row is as the last advance left it, so
+    /// the accessors that report what happened this tick read false while it is set rather
+    /// than repeat that advance. A hold on the tick of an entry (the initial state's, or a
+    /// transition's whose target clip is missing) does not set it: that tick's row is the
+    /// entry, which is reported then and on no other tick.
+    pub(crate) const HELD: u8 = 1 << 3;
 
     /// No state yet: what a character is spawned with. The first `anim::advance` enters the
     /// machine's initial state at phase zero and marks it entered.
@@ -247,8 +248,8 @@ impl AnimState {
 
     /// Whether the state was entered this tick, by the first advance or by a transition.
     /// False on a held tick, which reports nothing (`README.md`, "The state machine"). The
-    /// tick that entered the initial state is not held even when its clip was missing, so
-    /// the entry is reported on it.
+    /// tick of an entry is not held even when the entered state's clip was missing, so the
+    /// entry is reported on it.
     #[must_use]
     pub const fn entered(&self) -> bool {
         self.flags & (Self::ENTERED | Self::HELD) == Self::ENTERED
@@ -272,7 +273,7 @@ impl AnimState {
     }
 
     /// Ticks since the state was entered, this tick included; one on the entry tick, zero
-    /// while the initial state's clip has been missing since its entry (a hold).
+    /// while the state's clip has been missing since its entry (a hold).
     #[must_use]
     pub const fn ticks_in_state(&self) -> u32 {
         self.ticks_in_state
@@ -288,8 +289,8 @@ impl AnimState {
     /// passes it, through the wrap of a looping clip. A tick with no advance passes
     /// nothing: at rate zero the two phases are equal, and on a held tick (the machine or a
     /// clip missing), whose row keeps the last advance's phases, this is false for every
-    /// mark. The tick that entered the initial state is not held even when its clip was
-    /// missing, so the entry phase is reported on it, once.
+    /// mark. The tick of an entry is not held even when the entered state's clip was
+    /// missing, so a set entry phase is reported on it, once.
     #[must_use]
     pub const fn phase_crossed(&self, mark: Phase) -> bool {
         if self.flags & Self::HELD != 0 {
@@ -507,10 +508,37 @@ impl SimPose {
 
     /// The skeleton's rest pose, each bone's rest composed down its parent chain: what a
     /// character shows before its first evaluation, and what a test compares an evaluation
-    /// against.
+    /// against. [`EMPTY`](Self::EMPTY) for a skeleton of no bone, of more than
+    /// [`MAX_SIM_BONES`], or whose parents do not precede their children.
     #[must_use]
     pub fn rest(skeleton: &Skeleton) -> Self {
-        todo!()
+        Self::compose(skeleton, |bone| skeleton.bones[usize::from(bone)].rest)
+    }
+
+    /// Every bone of `skeleton` from its parent-local pose `local`, composed onto its
+    /// parent's pose in bone order; [`EMPTY`](Self::EMPTY) for a skeleton of no bone or
+    /// more than [`MAX_SIM_BONES`], or one whose parents do not precede their children
+    /// (one `Skeleton::validate` refuses). A bone without a parent is root-local as it
+    /// stands.
+    fn compose(skeleton: &Skeleton, mut local: impl FnMut(BoneIndex) -> BonePose) -> Self {
+        let count = skeleton.bones.len();
+        if count == 0 || count > MAX_SIM_BONES {
+            return Self::EMPTY;
+        }
+        let mut pose = Self::EMPTY;
+        for (index, bone) in skeleton.bones.iter().enumerate() {
+            // Below `MAX_SIM_BONES`, so the index is a `BoneIndex`.
+            let local = local(index as BoneIndex);
+            pose.bones[index] = match bone.parent {
+                None => local,
+                Some(parent) if usize::from(parent) < index => {
+                    pose.bones[usize::from(parent)].compose(local)
+                }
+                Some(_) => return Self::EMPTY,
+            };
+        }
+        pose.count = count as u8;
+        pose
     }
 
     /// The pose of `skeleton` at `phase` of `clip`, blended with `outgoing` when a transition
@@ -519,8 +547,11 @@ impl SimPose {
     /// ([`BonePose::blend`]), then composed onto the parent's pose ([`BonePose::compose`]),
     /// parents first, which the skeleton's bone order guarantees. The one evaluation this
     /// crate performs per character per tick, and what the milestone 1 cost test times
-    /// (`README.md`, "Proof for milestone 1"). Allocates nothing. A `clip` cooked for another
-    /// skeleton, or with another bone count, gives [`EMPTY`](Self::EMPTY).
+    /// (`README.md`, "Proof for milestone 1"). Allocates nothing. A `clip` (or an outgoing
+    /// clip) with another bone count than the skeleton's gives [`EMPTY`](Self::EMPTY), as
+    /// does a skeleton `Skeleton::validate` refuses. Which skeleton a clip was cooked for is
+    /// an asset ID this function does not see: `anim::evaluate` compares
+    /// [`Clip::skeleton`] with the rig's and writes `EMPTY` for another skeleton's clip.
     #[must_use]
     pub fn evaluate(
         skeleton: &Skeleton,
@@ -528,7 +559,59 @@ impl SimPose {
         phase: Phase,
         outgoing: Option<Outgoing<'_>>,
     ) -> Self {
-        todo!()
+        let bones = skeleton.bones.len();
+        if usize::from(clip.bones) != bones
+            || outgoing.is_some_and(|outgoing| usize::from(outgoing.clip.bones) != bones)
+        {
+            return Self::EMPTY;
+        }
+        // One cursor per clip: the frames and the fraction are the same for every bone.
+        let cursor = clip.cursor(phase);
+        let outgoing = outgoing.map(|outgoing| (outgoing, outgoing.clip.cursor(outgoing.phase)));
+        Self::compose(skeleton, |bone| {
+            let pose = clip.pose_at(cursor, bone);
+            match outgoing {
+                None => pose,
+                Some((outgoing, at)) => {
+                    pose.blend(outgoing.clip.pose_at(at, bone), outgoing.weight)
+                }
+            }
+        })
+    }
+
+    /// The pose of a limp character: each bone with a world `reported` by its bone row
+    /// taken into `root`'s space, each other bone `local(bone)` composed onto its parent's
+    /// fitted pose. [`EMPTY`](Self::EMPTY) as [`compose`](Self::compose) gives it.
+    pub(crate) fn fit(
+        skeleton: &Skeleton,
+        root: &Transform,
+        reported: &[Option<Transform>; MAX_SIM_BONES],
+        mut local: impl FnMut(BoneIndex) -> BonePose,
+    ) -> Self {
+        let mut pose = Self::compose(skeleton, |_| BonePose::IDENTITY);
+        if pose.is_empty() {
+            return pose;
+        }
+        let to_root = root.rotation.conjugate();
+        for (index, bone) in skeleton.bones.iter().enumerate() {
+            // Below `MAX_SIM_BONES`, so the index is a `BoneIndex`.
+            let index = index as BoneIndex;
+            let fitted = match reported[usize::from(index)] {
+                Some(world) => BonePose::new(
+                    to_root * (world.translation - root.translation),
+                    to_root * world.rotation,
+                ),
+                None => {
+                    let local = local(index);
+                    match bone.parent.and_then(|parent| pose.bone(parent)) {
+                        Some(parent) => parent.compose(local),
+                        None => local,
+                    }
+                }
+            };
+            pose.set_bone(index, fitted);
+        }
+        pose
     }
 
     /// How many bones the pose holds.
@@ -657,7 +740,57 @@ impl Bones {
         root: &Transform,
         pose: &SimPose,
     ) {
-        todo!()
+        if existing.is_some() {
+            tracing::warn!(
+                target: "anim",
+                owner = ?owner,
+                "Bones::spawn on a character that already has bones: nothing spawned"
+            );
+            return;
+        }
+        let count = skeleton.bones.len();
+        if count > MAX_SIM_BONES {
+            tracing::warn!(
+                target: "anim",
+                owner = ?owner,
+                bones = count,
+                "Bones::spawn with a skeleton of more than MAX_SIM_BONES bones: nothing spawned"
+            );
+            return;
+        }
+        let rest;
+        let pose = if pose.len() == count {
+            pose
+        } else {
+            rest = SimPose::rest(skeleton);
+            &rest
+        };
+        let owned = OwnedBy { owner: EntityRef::new(owner) };
+        let mut keys = [EntityRef::NONE; MAX_SIM_BONES];
+        for (index, bone) in skeleton.bones.iter().enumerate() {
+            let Some(body) = &bone.body else { continue };
+            // Below `MAX_SIM_BONES`, so the index is a `BoneIndex`.
+            let transform = pose.bones[index].in_world(root);
+            let mut rigid = body.body;
+            rigid.body_type = BodyType::Kinematic;
+            let link = BoneLink::new(owner, index as BoneIndex);
+            let row = cmd.spawn((transform, rigid, body.collider, owned, link));
+            keys[index] = EntityRef::new(row);
+            let Some(joint) = &body.joint else { continue };
+            // Parents precede their children, so the ancestor's row is already spawned.
+            let Some(above) = skeleton.body_above(index).and_then(|above| keys[above].get()) else {
+                continue;
+            };
+            let mut row_joint = Joint::new(joint.kind, above, row)
+                .with_anchors(joint.anchor_parent, joint.anchor_bone)
+                .with_axis(joint.axis);
+            if let Some((min, max)) = joint.limits {
+                row_joint = row_joint.with_limits(min, max);
+            }
+            cmd.spawn((row_joint, OwnedBy { owner: EntityRef::new(row) }));
+        }
+        let bones = Self { keys: PlainArray(keys), count: count as u8, limp: false, _pad: pad() };
+        cmd.set(owner, bones);
     }
 
     /// Records, on `cmd`, the switch of `owner`'s bones between animated and limp: this
@@ -677,7 +810,21 @@ impl Bones {
         skeleton: &Skeleton,
         limp: bool,
     ) {
-        todo!()
+        if self.limp == limp {
+            return;
+        }
+        cmd.set(owner, Self { limp, ..*self });
+        let body_type = if limp { BodyType::Dynamic } else { BodyType::Kinematic };
+        for (index, key) in self.keys.iter().enumerate().take(self.len()) {
+            let Some(row) = key.get() else { continue };
+            if let Some(body) = skeleton.bones.get(index).and_then(|bone| bone.body.as_ref()) {
+                let mut rigid = body.body;
+                rigid.body_type = body_type;
+                cmd.set(row, rigid);
+            }
+            let link = BoneLink { limp, ..BoneLink::new(owner, index as BoneIndex) };
+            cmd.set(row, link);
+        }
     }
 
     /// Whether the bodies drive the pose.

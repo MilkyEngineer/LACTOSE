@@ -27,6 +27,9 @@ lactose-reflect.workspace = true
 # `Stage`, `Registration` and `TypeTable`: where the systems are placed and how the
 # components are registered.
 lactose-sim.workspace = true
+# Holds, refused transitions and a second `Bones::spawn`, at target `anim` (`README.md`,
+# "What is logged").
+tracing.workspace = true
 
 [dev-dependencies]
 # The prediction world's build check (D121, D122), run over this crate's systems by the
