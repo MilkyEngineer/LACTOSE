@@ -140,8 +140,9 @@ impl<'a> Loader<'a> {
     ///
     /// In order: `records` passes [`check`](RegionRecords::check); `baseline.content_hash()`
     /// equals `records.baseline_hash` (`VersionMismatch` otherwise: the baseline was
-    /// patched, so [`RegionRecords::rebase`] first); the records are [migrated](Self::migrate);
-    /// the overlay, if any, passes `Overlay::check_against(baseline)`; every value a
+    /// patched, so [`migrate`](Self::migrate) and [`RegionRecords::rebase`] first); the
+    /// records are [migrated](Self::migrate); the overlay, if any, passes
+    /// `Overlay::check_against(baseline)`; every value a
     /// record or a resource carries is validated against the registry
     /// (`TypeInfo::validate`, `InvalidData`), a resource restored zeroed by `migrate`
     /// included and a transient component by presence alone, since it is zeroed; a

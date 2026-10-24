@@ -819,7 +819,12 @@ pub fn c(region: RegionId, n: u64) -> NetId {
 
 /// Region A's baseline: one row per change the test makes.
 pub fn baseline_a() -> Baseline {
-    let rows = [
+    Baseline::from_rows(AssetSet::new(), cooked_schemas(), rows_a()).unwrap()
+}
+
+/// The rows of [`baseline_a`], for a test that cooks a patched copy of it.
+pub fn rows_a() -> Vec<BaselineRow> {
+    vec![
         BaselineRow { id: c(A, 1), components: vec![data(pos(1, 1)), data(Health(10))] },
         BaselineRow { id: c(A, 2), components: vec![data(pos(2, 2)), data(Mass(Scalar::ONE))] },
         BaselineRow {
@@ -839,8 +844,7 @@ pub fn baseline_a() -> Baseline {
             id: c(A, 8),
             components: vec![data(pos(8, 8)), data(Contacts(9)), data(Cache(1))],
         },
-    ];
-    Baseline::from_rows(AssetSet::new(), cooked_schemas(), rows).unwrap()
+    ]
 }
 
 /// Region B's baseline: the row that moves into A.

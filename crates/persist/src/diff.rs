@@ -40,6 +40,12 @@ use crate::schema::{LayoutDigest, Saved, SchemaTable};
 /// the size the table's schema states, or a baseline `OwnedBy` whose reference is not a
 /// `Net` key; and as `Overlay::new` fails.
 pub fn diff(rows: &RegionRows, baseline: &Baseline, schemas: &SchemaTable) -> Result<Overlay> {
+    diff_rows(&rows.rows, baseline, schemas)
+}
+
+/// [`diff`] over the rows alone: what [`RegionRecords::rebase`] runs on the rows it
+/// applied, which have no resources or seed.
+fn diff_rows(rows: &[ExportedRow], baseline: &Baseline, schemas: &SchemaTable) -> Result<Overlay> {
     for schema in baseline.schemas() {
         let info = component_info(schemas, schema.component())?;
         // A saved column is compared byte for byte, so it must be in the layout the
@@ -53,7 +59,7 @@ pub fn diff(rows: &RegionRows, baseline: &Baseline, schemas: &SchemaTable) -> Re
             )));
         }
     }
-    strictly_ascending(rows.rows.iter().map(|row| row.id), "the export's rows")?;
+    strictly_ascending(rows.iter().map(|row| row.id), "the export's rows")?;
 
     // Every baseline row, ascending, with where it lies.
     let mut cooked: Vec<(NetId, &Archetype, usize)> = baseline
@@ -66,7 +72,7 @@ pub fn diff(rows: &RegionRows, baseline: &Baseline, schemas: &SchemaTable) -> Re
     cooked.sort_unstable_by_key(|&(id, ..)| id);
 
     let mut differ = Differ { schemas, records: Vec::new(), ours: Vec::new(), theirs: Vec::new() };
-    let mut exported = rows.rows.iter().peekable();
+    let mut exported = rows.iter().peekable();
     let mut cooked = cooked.into_iter().peekable();
     loop {
         match (exported.peek(), cooked.peek()) {
@@ -219,6 +225,91 @@ impl Differ<'_> {
         saved.canonicalise(&mut self.theirs);
         self.ours != self.theirs
     }
+}
+
+/// `overlay` applied to the rows of `baseline` as `World::load_region` applies it, in the
+/// form `World::export_region` copies the loaded rows out: the owner from the last
+/// `OwnershipChange`, else from the row's `ecs::owned_by` value; the persistent components
+/// other than `ecs::owned_by` by value; the transient ones by presence; no derived
+/// component, since an export never carries one. The values are as the records and the
+/// baseline hold them, not validated: the diff canonicalises what it compares.
+fn applied(
+    overlay: &Overlay,
+    baseline: &Baseline,
+    schemas: &SchemaTable,
+) -> Result<Vec<ExportedRow>> {
+    #[derive(Default)]
+    struct Row {
+        components: BTreeMap<ComponentKey, Vec<u8>>,
+        owner: Option<Option<NetId>>,
+    }
+    let destroyed: BTreeSet<NetId> = overlay
+        .records()
+        .iter()
+        .filter_map(|record| match record {
+            Record::Destroy { id } => Some(*id),
+            _ => None,
+        })
+        .collect();
+    let mut rows: BTreeMap<NetId, Row> = BTreeMap::new();
+    for archetype in baseline.archetypes() {
+        for (index, &id) in archetype.ids().iter().enumerate() {
+            if destroyed.contains(&id) {
+                continue;
+            }
+            let row = rows.entry(id).or_default();
+            for column in archetype.columns() {
+                row.components.insert(column.component, value_of(&column, index).to_vec());
+            }
+        }
+    }
+    for record in overlay.records() {
+        match record {
+            Record::Spawn { id, components } | Record::SpawnFromBaseline { id, components } => {
+                let row = rows.entry(*id).or_default();
+                for data in components {
+                    row.components.insert(data.component, data.bytes.clone());
+                }
+            }
+            Record::Destroy { .. } => {}
+            Record::AddComponent { id, data } => {
+                rows.entry(*id).or_default().components.insert(data.component, data.bytes.clone());
+            }
+            Record::RemoveComponent { id, component } => {
+                rows.entry(*id).or_default().components.remove(component);
+            }
+            Record::SetField { id, component, field, bytes } => {
+                let info = schemas.info(*component).ok_or_else(|| unknown(*component))?;
+                let value = rows.entry(*id).or_default().components.get_mut(component).ok_or_else(
+                    || invalid("a `SetField` names a component the row lacks".to_owned()),
+                )?;
+                info.write_field(value, *field, bytes)?;
+            }
+            Record::OwnershipChange { id, owner } => {
+                rows.entry(*id).or_default().owner = Some(*owner);
+            }
+        }
+    }
+    let mut exported = Vec::with_capacity(rows.len());
+    for (id, row) in rows {
+        let mut owner = None;
+        let mut components = Vec::new();
+        let mut transient = Vec::new();
+        for (component, bytes) in row.components {
+            if component == OwnedBy::KEY {
+                owner = baseline_owner(&bytes)?;
+                continue;
+            }
+            match component_info(schemas, component)?.persistence() {
+                Persistence::Persistent => components.push(ComponentData { component, bytes }),
+                Persistence::Transient => transient.push(component),
+                Persistence::Derived => {}
+            }
+        }
+        let owner = row.owner.unwrap_or(owner);
+        exported.push(ExportedRow { id, owner, components, transient });
+    }
+    Ok(exported)
 }
 
 /// Row `index`'s value in `column`.
@@ -518,30 +609,58 @@ impl RegionRecords {
     }
 
     /// Carries these records over to `patched`, a re-cooked baseline whose content hash
-    /// differs from [`baseline_hash`](Self::baseline_hash): `Overlay::rebase`, after which
-    /// `baseline_hash` names `patched` and the overlay fits it, or `None` if nothing is
-    /// left. Returns the records the rebase dropped, in order, so the caller can re-home
-    /// those of a cooked entity the patch moved to another region (the cross-region pass
-    /// is not in this crate yet). With no overlay only the hash changes. `layouts` keeps
-    /// the entries of the types still carried. Fails only as `Overlay::rebase` fails.
-    pub fn rebase(&mut self, patched: &Baseline) -> Result<Vec<Record>> {
-        let (overlay, dropped) = match &self.overlay {
-            Some(overlay) => {
-                let (rebased, dropped) = overlay.rebase(patched)?;
-                ((!rebased.records().is_empty()).then(|| Arc::new(rebased)), dropped)
-            }
-            None => (None, Vec::new()),
+    /// differs from [`baseline_hash`](Self::baseline_hash), and the result is the record set
+    /// [`from_export`](Self::from_export) would give the same state against `patched`:
+    /// `Overlay::rebase` decides what is kept and what is dropped (architecture section
+    /// 15.2), the kept records are applied to the patched rows into the export's form (the
+    /// owner from `OwnershipChange`, else the row's `ecs::owned_by` value; persistent
+    /// components by value; transient components by presence; a derived column is the
+    /// baseline's), and [`diff`] runs over them against `patched`.
+    ///
+    /// Afterwards `baseline_hash` names `patched`, the overlay fits it or is `None` if
+    /// nothing is left, and `layouts` holds the table's digest of every type the new overlay
+    /// carries and the resources' entries as they were. Returns the records the rebase
+    /// dropped, in order, so the caller can re-home those of a cooked entity the patch
+    /// moved to another region (the cross-region pass is not in this crate yet). With no
+    /// overlay only the hash changes.
+    ///
+    /// The records must be at the table's schemas, as [`Loader::migrate`](crate::Loader::migrate)
+    /// leaves them: fails with `NotFound` for a type the overlay carries that the table does
+    /// not know and `VersionMismatch` for one carried at another schema or digest than the
+    /// table's, and otherwise as `Overlay::rebase` and [`diff`] fail. On failure the
+    /// records are unchanged.
+    pub fn rebase(&mut self, patched: &Baseline, schemas: &SchemaTable) -> Result<Vec<Record>> {
+        let Some(overlay) = &self.overlay else {
+            self.baseline_hash = patched.content_hash();
+            return Ok(Vec::new());
         };
+        for schema in overlay.schemas() {
+            let component = schema.component();
+            let info = schemas.info(component).ok_or_else(|| unknown(component))?;
+            if schemas.schema(component) != Some(schema)
+                || self.layouts.get(&component).copied() != schemas.layout(component)
+            {
+                return Err(Error::new(
+                    ErrorKind::VersionMismatch,
+                    format!(
+                        "the records carry `{}` at another schema than the table's",
+                        info.name()
+                    ),
+                ));
+            }
+        }
+        let (kept, dropped) = overlay.rebase(patched)?;
+        let rebased = diff_rows(&applied(&kept, patched, schemas)?, patched, schemas)?;
+        let overlay = (!rebased.records().is_empty()).then(|| Arc::new(rebased));
+        let carried = overlay.iter().flat_map(|overlay| overlay.schemas()).map(|schema| {
+            let component = schema.component();
+            (component, schemas.layout(component).expect("the diff carries saved types"))
+        });
+        let resources =
+            self.resources.iter().map(|data| (data.component, self.layouts[&data.component]));
+        self.layouts = carried.chain(resources).collect();
         self.baseline_hash = patched.content_hash();
         self.overlay = overlay;
-        let carried: BTreeSet<ComponentKey> = self
-            .overlay
-            .iter()
-            .flat_map(|overlay| overlay.schemas())
-            .map(ComponentSchema::component)
-            .chain(self.resources.iter().map(|data| data.component))
-            .collect();
-        self.layouts.retain(|component, _| carried.contains(component));
         Ok(dropped)
     }
 }
