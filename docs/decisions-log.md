@@ -1001,6 +1001,106 @@ rationale the author supplied during the editorial pass rather than one taken fr
     crate without one.
 - Driven by: milestone 1, the `io` facade brief and its design reviews r1 and r2 (2026-10-24).
 
+**D131. The `app` facade: what sections 2, 5.1, 9.2, 11, 14, 15.3, 16, 18 and 19 left open** (§2, §3, §4, §5.1, §9.2, §9.3, §11, §14, §15.2, §15.3, §16, §18, §19, §22, `lactose-app`, `lactose-io`, `lactose-persist`, `lactose-predict`, `lactose-sim`, `lactose-task`)
+- Why: the facade is written before the headless binary, the milestone 1 netcode spike and the
+  SOUR test of the assembly so each is written against the final surface; each choice below is
+  one the sections did not settle, and each is a contract in `crates/app/README.md`. The first
+  review (A to O) changed the time-scale path, added the store of saved regions, removed the
+  slot writer in favour of `Io::replace`, and returned the lifecycle's refusals to the caller;
+  the second (S1, M1 to M4) reconciled the store against the world after each step, made the
+  step that carries a pause the last of its frame, advanced the clock estimate by the ticks the
+  client's pacer granted, and made a content resync once per failing frame.
+  - *A game crate registers as a `static` of function pointers (`CrateRegistration`), listed in
+    `Game::crates`; every `TypeTable` of the process is built by `Game::types` from the same
+    list in the same order, engine crates first.* Section 18 forbids code before `main` and
+    section 9.1 needs one protocol hash on both ends; a function pointer carries no state into
+    a save and the dev-profile restart rebuilds from the same functions. Rules out inventory
+    registration, trait objects with state, and per-kind type lists.
+  - *One executor per process, built by `start_executor`; one solver pool per world, sized
+    `frame_worker_count() - reserved_workers` (at least one), built with an `exit_handler` the
+    world's `shutdown` waits on.* Section 16 sizes the pool from the executor; rayon's
+    `ThreadPool::drop` returns before its threads exit, so a shutdown that joins workers must
+    count solver exits itself. Rules out a shared pool across worlds at milestone 1 (milestone
+    4 decides for a client's two worlds) and dropping a world as its shutdown.
+  - *The timer root's constants are the assembly's: `CATCH_UP_CAP` four, `LOG_RETENTION` 120,
+    pinned `LOG_RETENTION >= CATCH_UP_CAP`; a pacer's first tick is due at its build instant
+    and a loop resyncs it before its first frame.* Section 11 names the cap; the retention
+    bound is what a rollback across a frame's catch-up needs; the pacer's documented first
+    deadline means a paced run that did not poll since the build would start behind. Rules out
+    a cap or retention per world.
+  - *A time scale reaches the server's pacer by direction: nonzero at `set_time_scale`, zero
+    after the step that carries it; the step that carries a zero, pending or the frame
+    callback's own, is the last of its frame, and a frame with a pending zero and no tick owed
+    runs that one tick; a zero set while an unpause is pending on a paused world cancels it
+    with no tick; on a client the fold sets the pacer before the poll.* A pause must reach the
+    world before the ticks stop (the world's mirror reads it) and no tick may run after it,
+    however many ticks the frame owed; an unpause must make a tick due before any tick can
+    carry it; with one path for both, one direction cannot be proved. Rules out the pacer
+    reading the world's mirror after the step for both directions, a frame stepping the rest of
+    its budget past a pause, and a scale the frame callback sets unpausing the server.
+  - *A server keeps the saved state of every region that is not loaded (`Server::kept`), from a
+    loaded save or an unload's export diffed once, and reconciles it after every step against
+    the world the step left: each export diffed against the baseline its region had when it was
+    exported, every region loaded after the step out of the store, every region not loaded out
+    of the baselines. It answers a `Load` of a kept region from the store, a frame's own
+    `loaded` entry for a kept region lends only its mode and asset table, and a save point
+    holds loaded and kept regions alike; an export that cannot be diffed fails the step with
+    the server gone.* Under `Anchored` the lifecycle, not the caller, decides what is loaded,
+    and section 15.2 saves what the world holds: without the store a region unloaded between
+    two saves, or saved but not loaded at the first frame, is lost. The sync point loads a
+    frame's bundles before the region policy runs, so a region can load and unload again in one
+    step (a join whose player leaves in the step that loads the saved neighbourhood), and under
+    `Directed` a reload bundle can be refused after its region's unload: a store reconciled
+    against the frame loses both. The diff at unload is the only time the export and its
+    baseline are both at hand, and a server that lost a region's saved state must not be saved.
+    Rules out refusing `Start::Loaded` under `Anchored`, re-exporting kept regions per save,
+    reconciling the store against `frame.loaded`, a frame entry discarding saved state (a
+    cooked reset is a named future call), and handing back a server missing a region.
+  - *`Start::Loaded` takes a `SavedWorld`, the one shape `load` produces, `save_point` yields
+    and `encode_save` encodes.* A save can start a server with no file between, and the records
+    are kept at the registry's schemas (`Loader::migrate` at load) so a kept region is re-saved
+    without a reload. Rules out a load that produces bundles, and a container decoded per
+    region at the first step.
+  - *The lifecycle's load, session and asset failures are returned in the output of the step
+    that reported them and logged at `warn`; they are not errors of the run.* Section 14 makes
+    a refused load a reported event and the tick carries on; a SOUR test asserts there were
+    none. Rules out swallowing them in the frame and turning them into a `Stop`.
+  - *A client's resync target is stated once: the last clock estimate advanced by the ticks the
+    client's own pacer granted since it was taken, or the hint (`Behind`'s server tick,
+    `TooOld`'s frame tick) if later, plus the lead; a cooked-content failure in the fold is a
+    content resync at the world's own tick with the pacer untouched, once per failing frame
+    tick, reported for the resync request.* A stale estimate must never put the world behind a
+    frame the inbox holds, which would repeat the resync every frame; the pacer's grants
+    already follow a replicated pause and slow motion, which wall time does not, so the target
+    no longer overshoots the server after either. Section 14 makes a client-only asset failure
+    a request for a resync, not a divergence, so the clock is right and only the content is
+    retried, and a failing frame that stays queued through a pause must not repeat it. Rules
+    out `Source::Cooked → Stop`, a clock resync for a content failure, and advancing the
+    estimate by wall time.
+  - *The error policy is a value, `ErrorPolicy::respond(source, error) -> Response`, a table at
+    milestone 1: `Stop` for the executor, a load, the server and an unkept prediction failure;
+    `Resync` for a kept prediction failure and a cooked failure; `Log` for a save.* Section 19
+    gives `app` the policy; a table a test reads is the smallest shape that is also the
+    milestone 4 extension point (kinds read then). Rules out responses chosen at the call site.
+  - *The slot is written with `lactose_io::Io::replace` and nothing in `app` wraps it;
+    `Headless` starts the one `Io`, creates the save directory at start, and shuts the pool
+    down before the executor.* Section 15.3 gives the atomic replace to `io` (D130); a wrapper
+    would restate its contract and drift. Rules out a `write_slot` in `app` and `std::fs` on a
+    worker.
+  - *A replay executor is for step-driven runs only; `Headless::run` refuses one.* A recorded
+    log is followable only by the same sequence of runs; a paced loop interleaves steps and
+    passes by wall time. Rules out replaying a paced run.
+  - *`app` logs at target `app`, an exception to section 19 like `io` (D130) and `physics`
+    (D119).* The assembly has no codename, and `EnvFilter` matches a directive's target by
+    prefix, so the engine's codename would select every `lactose_*` crate's default-target
+    events. Rules out a section 23 row for the assembly and the module path as the target.
+  - *Cooked content comes from a `Cooked` stand-in (`baseline` by hash, `table` by region,
+    `pin`) until `lactose-asset` lands at milestone 3, when `load`, `build_server`,
+    `build_client`, `Headless::start` and the fold change signature with it, listed then.* The
+    headless app and the spike need three calls and no store. Rules out a milestone 1
+    dependency on the asset store's traits.
+- Driven by: milestone 1, the `app` facade brief and its reviews r1 and r2 (2026-10-24).
+
 ## 8. Physics and animation
 
 **D58. One physics world per server process, determinism and parallel together, pinned exactly** (§16, §2 Physics)

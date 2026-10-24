@@ -679,12 +679,13 @@ Section 9.7 gives the capacity model.
 
 - Received packets are parsed on the dedicated network thread (section 5.1) into per-client
   staging queues.
-- At the input sync point, and only there, staged inputs are applied to the server tick and
-  staged state is applied to `Replicated` rows on the client. Nothing writes simulation rows
-  concurrently with systems or extract. Staged state reaches each client world as one frame
-  per server tick that `app` queues in the world's inbox between runs; a frame's region
-  relevance, time scale and asset tables enter through the `TickInput` of the step whose sync
-  point applies the frame, and the client's worlds start at the tick the join acceptance names.
+- At the input sync point, and only there, staged inputs are applied to the server tick and staged
+  state is applied to `Replicated` rows on the client. Nothing writes simulation rows concurrently
+  with systems or extract. Staged state reaches each client world as one frame per server tick that
+  `app` queues in the world's inbox between runs; a frame's region relevance, time scale and asset
+  tables enter through the `TickInput` of the step whose sync point applies the frame, and the
+  client's worlds start at the tick the join acceptance names, the prediction world that tick plus
+  the lead `app` chooses until the first clock estimate arrives (D131).
 - Each input packet carries the last eight ticks' samples (`lactose_input::REDUNDANT_SAMPLES`,
   amendable by `net`), so a single lost packet costs nothing. Inputs
   are quantised on the client before simulation, so the client simulates exactly the value the
@@ -1117,7 +1118,8 @@ The policy is in section 3.
 
 - `core::Error` is the taxonomy. Subsystems return `Result`; `app` holds policy. `ErrorKind`
   has stable `u8` codes, so a failure can be journaled as a tick-stamped event.
-- `tracing` is also the logging facade. Log targets are the codenames from section 23.
+- `tracing` is also the logging facade. Log targets are the codenames from section 23; a crate
+  without one logs at its role name (`io`, `physics`, `app`; D119, D130, D131).
 - Tested device-lost recovery: re-upload assets, rebuild the GPU scene from region data, full
   extract.
 - Network drop, reconnect, disk full and corrupt save each have a defined path by milestone 4.

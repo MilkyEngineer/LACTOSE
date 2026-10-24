@@ -1,0 +1,58 @@
+[package]
+name = "lactose-app"
+description = "The assembly: the executor and the solver pool, the worlds built from every crate's registration, the timer root that steps them, the client's prediction loop, the error policy and the save path. The thin binaries link it."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[dependencies]
+# The sim skeleton's registration (`register_types`, `register_systems`), wired beside
+# physics into every world.
+lactose-anim.workspace = true
+# `PinnedTable` and `VersionTable`: what a region's asset table is before and after the
+# store pins it, which the fold into `TickInput::assets` and the save-load path carry.
+lactose-asset-api.workspace = true
+# `Baseline`: the cooked rows a save diffs against and a load rebuilds over.
+lactose-bundle.workspace = true
+lactose-core.workspace = true
+# The world and its executor re-export: `World` for the setup functions, `WorldKind`,
+# `LayoutConfig`, `RegionId`, `RegionMode`, `PresentEventBatch`.
+lactose-ecs.workspace = true
+# The input applier every world takes, the sample a client sends and its history.
+lactose-input.workspace = true
+# The file IO pool: started by the headless app, which creates the save directory with
+# `Io::create_dir_all` and writes the slot with `Io::replace` (architecture section 15.3).
+lactose-io.workspace = true
+# The staged inbox a client world holds, the gather state the server's frame takes, the
+# relevance message a region becomes.
+lactose-net-api.workspace = true
+# `JoinAccepted` and `ClockEstimate`: what the client's app builds its worlds from and
+# paces by.
+lactose-net-host.workspace = true
+# The save container, the schema table, the records of a region and the loader.
+lactose-persist.workspace = true
+# The backend's setup function and `PhysicsConfig`; the sets `app` orders against.
+lactose-physics-api.workspace = true
+# The one backend, built here with the solver pool (architecture section 16).
+lactose-physics-rapier.workspace = true
+# The prediction world's owner, its registration and its build check.
+lactose-predict.workspace = true
+# The simulation this crate builds and steps, its registration, its frame and its save point.
+lactose-sim.workspace = true
+# The executor, its builder and the pacer: this crate is the timer root.
+lactose-task.workspace = true
+# The solver pool handed to the physics backend, sized here.
+rayon.workspace = true
+# Events, refusals and the policy's decisions, at target `app` (architecture sections 3
+# and 19).
+tracing.workspace = true
+
+[dev-dependencies]
+# The compile-only sketches in `tests/` write a game crate the way `game-sim` will: its
+# components through the reflect macros.
+lactose-reflect.workspace = true
+
+[lints]
+workspace = true

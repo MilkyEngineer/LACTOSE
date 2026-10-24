@@ -385,6 +385,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "lactose-app"
+version = "0.0.0"
+dependencies = [
+ "lactose-anim",
+ "lactose-asset-api",
+ "lactose-bundle",
+ "lactose-core",
+ "lactose-ecs",
+ "lactose-input",
+ "lactose-io",
+ "lactose-net-api",
+ "lactose-net-host",
+ "lactose-persist",
+ "lactose-physics-api",
+ "lactose-physics-rapier",
+ "lactose-predict",
+ "lactose-reflect",
+ "lactose-sim",
+ "lactose-task",
+ "rayon",
+ "tracing",
+]
+
+[[package]]
 name = "lactose-asset-api"
 version = "0.0.0"
 dependencies = [

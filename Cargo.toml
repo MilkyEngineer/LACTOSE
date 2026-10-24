@@ -32,6 +32,8 @@ lactose-input-host = { path = "crates/input-host" }
 lactose-net-api = { path = "crates/net-api" }
 lactose-net-host = { path = "crates/net-host" }
 lactose-io = { path = "crates/io" }
+lactose-persist = { path = "crates/persist" }
+lactose-app = { path = "crates/app" }
 
 # Third-party crates. Cargo.lock pins the exact versions; docs/verification.md lists the
 # claims that are re-checked against those versions.
