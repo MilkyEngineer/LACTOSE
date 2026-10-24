@@ -6,7 +6,7 @@
 
 use std::sync::Arc;
 
-use lactose_core::{ComponentKey, EntityRef, PlainArray, PlayerId, StableKey, Tick};
+use lactose_core::{ComponentKey, EntityRef, NetId, PlainArray, PlayerId, StableKey, Tick};
 use lactose_ecs::{
     ChangeMark, Channel, ChannelWriter, ChunkOrder, ClaimedBy, CommandChannel, Commands, Ctx,
     Event, EventWriter, Events, InRegion, LayoutConfig, LogEntry, Mut, OwnedBy, PredictedOrigin,
@@ -553,11 +553,13 @@ pub struct WorldState {
     owned: Vec<Vec<StableKey>>,
     claimed: Vec<Vec<StableKey>>,
     live: Vec<bool>,
+    /// The `NetId` bound to each `Predicted` key among the keys.
+    aliases: Vec<Option<NetId>>,
 }
 
 /// The observable state of `world`: every column with its stamps and ticks, the rows changed
-/// since each of `marks`, the structural log, and the reverse index, the ownership and the
-/// claims of `keys` and `players`.
+/// since each of `marks`, the structural log, and the reverse index, the ownership, the
+/// claims and the aliases of `keys` and `players`.
 pub fn world_state(
     world: &World,
     marks: &[ChangeMark],
@@ -613,5 +615,12 @@ pub fn world_state(
         owned: keys.iter().map(|&key| world.owned_by(key).collect()).collect(),
         claimed: players.iter().map(|&player| world.claimed(player).collect()).collect(),
         live: keys.iter().map(|&key| world.contains(key)).collect(),
+        aliases: keys
+            .iter()
+            .filter_map(|&key| match key {
+                StableKey::Predicted(predicted) => Some(world.alias(predicted)),
+                _ => None,
+            })
+            .collect(),
     }
 }

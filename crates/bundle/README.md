@@ -66,10 +66,11 @@ the ownership records form no cycle among themselves. A `Destroy` says only that
 no longer a row of this region, which a move to another region or an unload also is, so an
 owner this overlay destroys is accepted; whether an owner exists is the applier's. These are
 the format's only judgements of ownership, and a new one must be one the world refuses too
-(`crates/ecs/README.md`, "Ownership"), or an export could fail to be an overlay.
-`Overlay::check_against` judges what needs the baseline. Left to whoever applies an overlay:
-that each owner exists, ownership cycles that pass through the baseline's own ownership or
-through other regions, schema agreement or migration, and cross-region references.
+(`crates/ecs/README.md`, Regions, "Writing `OwnedBy` moves nothing"), or an export could fail
+to be an overlay. `Overlay::check_against` judges what needs the baseline. Left to whoever
+applies an overlay: that each owner exists, ownership cycles that pass through the baseline's
+own ownership or through other regions, schema agreement or migration, and cross-region
+references.
 
 **Patched baselines.** An overlay records the content hash of the baseline it was made
 against. If that differs from the baseline at hand, `Overlay::rebase` produces an overlay that

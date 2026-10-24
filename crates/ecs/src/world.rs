@@ -799,11 +799,11 @@ impl World {
     /// received after a snapshot is not lost to the rollback. A reference stored as `net`
     /// before the bind, such as an owner loaded from another region's save, is rewritten
     /// to `predicted`, in rows and region resources alike, so stored bytes are origin keys
-    /// whatever the order of loads and inserts. Fails if
-    /// `predicted` or `net` is already bound to something else, if `net` names a live
-    /// entity of its own, whose references a bind would redirect, or if the entity at the
-    /// end of `predicted`'s owner chain is owned by `net`, which the rewrite would close
-    /// into a cycle of owners.
+    /// whatever the order of loads and inserts; a stored `Net` reference whose rewrite would
+    /// close a cycle of owners is written empty instead and logged (README, Regions,
+    /// "Ownership is a forest"), so a bind never fails on ownership. Fails if `predicted` or
+    /// `net` is already bound to something else, or if `net` names a live entity of its
+    /// own, whose references a bind would redirect.
     pub fn bind(&mut self, predicted: PredictionKey, net: NetId) -> Result<()> {
         let bound_net = self.aliases.by_predicted.get(&predicted);
         let bound_predicted = self.aliases.by_net.get(&net);
@@ -814,13 +814,6 @@ impl World {
         }
         if self.storage.entities.contains_key(&StableKey::Net(net)) {
             return Err(invalid("the NetId names a live entity of its own"));
-        }
-        // `net` is not live, so a chain that reaches it ends there.
-        if self.owner_chain(StableKey::Predicted(predicted)).last() == Some(StableKey::Net(net)) {
-            return Err(invalid(
-                "the bind would close a cycle of owners: the predicted entity's owner chain \
-                 ends at an entity owned by the NetId",
-            ));
         }
         self.aliases.by_predicted.insert(predicted, net);
         self.aliases.by_net.insert(net, predicted);
@@ -1381,11 +1374,14 @@ impl World {
     /// save or the relevance message, and the transient ones the export listed with
     /// [`insert_region_resource_zeroed`](Self::insert_region_resource_zeroed). Every
     /// component schema must match the registry's; a mismatch is an error of kind
-    /// `VersionMismatch`, and `lactose-persist` migrates the document first. A document
-    /// whose owners would close a cycle, with each other, with the baseline's own
-    /// `ecs::owned_by` column or with live entities, is refused whole with `InvalidData`,
-    /// as any invalid row is: nothing binds or spawns. Rows are stamped at the current
-    /// point and logged as spawned; no epoch starts.
+    /// `VersionMismatch`, and `lactose-persist` migrates the document first. A row without
+    /// `PredictedOrigin` whose `NetId` is bound is `InvalidData`. The owners are walked once,
+    /// before anything binds or spawns (README, Regions, "Ownership is a forest"): a
+    /// document whose rows' owners close a cycle within it, through its records or its
+    /// baseline's own `ecs::owned_by` column, is refused whole with `InvalidData`, as any
+    /// invalid row is; a cycle through live entities of other regions is broken at the
+    /// document row, which loads without `OwnedBy`, logged at `warn`. Rows are stamped at
+    /// the current point and logged as spawned; no epoch starts.
     pub fn load_region(
         &mut self,
         region: RegionId,
@@ -1514,13 +1510,12 @@ impl World {
         typed::<OwnedBy>(self.storage.component(loc, OwnedBy::KEY)?).owner.get()
     }
 
-    /// The owner chain of `start` (README, "Ownership"): `start`, its owner, its owner's
-    /// owner, ..., as origin keys, ending with the first key that names no live entity or
-    /// whose entity has no owner.
+    /// The owner chain of `start` (README, Regions, "Ownership is a forest"): `start`, its
+    /// owner, its owner's owner, ..., as origin keys, ending with the first key that names
+    /// no live entity or whose entity has no owner.
     pub(crate) fn owner_chain(&self, start: StableKey) -> impl Iterator<Item = StableKey> + '_ {
-        // Ownership is a forest, so a chain holds each live entity once at most and ends.
-        // The bound keeps the one cycle a restore can revive (`WorldSnapshot::restore_into`
-        // asserts against it) from hanging a walk.
+        // Ownership is a forest, so a chain holds each live entity once at most and ends;
+        // the bound only keeps a broken invariant from hanging a walk.
         let mut steps = self.storage.entities.len() + 1;
         let mut next = Some(self.canonical(start));
         core::iter::from_fn(move || {
@@ -1531,21 +1526,30 @@ impl World {
         })
     }
 
-    /// Whether the live entity `key` is on a cycle of owners: a state no write makes and
-    /// only a restore can revive (README, "Ownership").
-    pub(crate) fn owns_itself(&self, key: StableKey) -> bool {
-        let key = self.canonical(key);
-        self.stored_owner(key).is_some_and(|owner| self.owner_chain(owner).any(|at| at == key))
+    /// The entity on `to`'s owner chain whose stored owner is `from`, where rewriting
+    /// `from` to `to` would close a cycle of owners. At most one: the chain returns to `to`
+    /// through it and through nothing else.
+    fn closing_owner(&self, from: StableKey, to: StableKey) -> Option<StableKey> {
+        let mut at = to;
+        for _ in 0..=self.storage.entities.len() {
+            // Compared as stored: once bound, `from` is canonically `to` itself.
+            let owner = self.stored_owner(at)?;
+            if owner == from {
+                return Some(at);
+            }
+            at = self.canonical(owner);
+        }
+        None
     }
 
-    /// `InvalidData` if `component` is an [`OwnedBy`] whose owner would make `key` its own
-    /// owner or close a cycle of owners: if `key` is on the owner's chain. The bytes have
-    /// been validated.
-    fn check_owner(&self, key: StableKey, component: &ErasedComponent) -> Result<()> {
-        if component.key() != OwnedBy::KEY {
+    /// `InvalidData` if `bytes` of `component` are an [`OwnedBy`] whose owner would make
+    /// `key` its own owner or close a cycle of owners: if `key` is on the owner's chain.
+    /// The bytes have been validated.
+    fn check_owner(&self, key: StableKey, component: ComponentKey, bytes: &[u8]) -> Result<()> {
+        if component != OwnedBy::KEY {
             return Ok(());
         }
-        let value: OwnedBy = bytemuck::checked::pod_read_unaligned(component.bytes());
+        let value: OwnedBy = bytemuck::checked::pod_read_unaligned(bytes);
         let Some(owner) = value.owner.get() else { return Ok(()) };
         let key = self.canonical(key);
         if self.owner_chain(owner).any(|at| at == key) {
@@ -1674,6 +1678,7 @@ impl World {
             self.resolve_references(component, None, Some(key));
         }
         let row = self.spawn_row(key, region, components)?;
+        self.check_row_owner(key, &row)?;
         let stamp = self.bump();
         self.push_spawned(key, region, row, stamp);
         Ok(())
@@ -1682,7 +1687,11 @@ impl World {
     /// Rewrites every stored reference to `from` into `to`, the same entity under its origin
     /// key: a `Net` key written before the bind that makes it an alias, for instance an
     /// owner loaded from another region's save. The bytes then match every other machine's;
-    /// no row is stamped, since nothing about the entity changed.
+    /// no row is stamped, since nothing about the entity changed. The one `OwnedBy` whose
+    /// rewrite would close a cycle of owners is written empty in place instead, its
+    /// component kept and its reverse index entry dropped, and logged at `warn` (README,
+    /// Regions, "Ownership is a forest"): a bind, a restore or a despawn merges two keys
+    /// and never refuses to.
     pub(crate) fn rekey_references(&mut self, from: StableKey, to: StableKey) {
         // Region resources are not indexed: every one with a reference field is visited, so
         // its bytes do not depend on whether it was inserted before or after the bind.
@@ -1695,7 +1704,22 @@ impl World {
                 }
             }
         }
-        let Some(entries) = self.references.by_target.remove(&from) else { return };
+        let Some(mut entries) = self.references.by_target.remove(&from) else { return };
+        if let Some(closing) = self.closing_owner(from, to) {
+            entries
+                .retain(|&(source, component, _)| (source, component) != (closing, OwnedBy::KEY));
+            let loc = self.storage.loc(closing).expect("a chain holds live entities");
+            let empty = OwnedBy { owner: EntityRef::NONE };
+            self.storage.overwrite(loc, OwnedBy::KEY, bytemuck::bytes_of(&empty));
+            tracing::warn!(
+                target: "casein",
+                entity = ?closing,
+                owner = ?from,
+                origin = ?to,
+                "an owner reference emptied: its rewrite to the origin key would close a cycle \
+                 of owners"
+            );
+        }
         let mut rows: Vec<(StableKey, ComponentKey)> =
             entries.iter().map(|&(source, component, _)| (source, component)).collect();
         rows.dedup();
@@ -1762,13 +1786,30 @@ impl World {
         stamp: Stamp,
     ) -> Result<()> {
         let row = self.spawn_row(key, region, components)?;
+        self.check_row_owner(key, &row)?;
         self.push_spawned(key, region, row, stamp);
         Ok(())
     }
 
-    /// The row [`spawn_entity`](Self::spawn_entity) would push, every check made and
-    /// nothing changed: the components with `InRegion`, and `PredictedOrigin` for a
-    /// `Predicted` key that lacks it, ascending by key and validated.
+    /// [`spawn_entity`](Self::spawn_entity) for a region load, whose pre-pass has walked
+    /// the owners of the whole document once: no row walks its chain again, so a deep
+    /// chain loads in one pass.
+    pub(crate) fn spawn_loaded(
+        &mut self,
+        key: StableKey,
+        region: RegionId,
+        components: Vec<ErasedComponent>,
+        stamp: Stamp,
+    ) -> Result<()> {
+        let row = self.spawn_row(key, region, components)?;
+        self.push_spawned(key, region, row, stamp);
+        Ok(())
+    }
+
+    /// The row [`spawn_entity`](Self::spawn_entity) would push, every check but the
+    /// ownership rule made and nothing changed: the components with `InRegion`, and
+    /// `PredictedOrigin` for a `Predicted` key that lacks it, ascending by key and
+    /// validated.
     fn spawn_row(
         &self,
         key: StableKey,
@@ -1807,10 +1848,14 @@ impl World {
                 not_found(format!("`{}` is not registered", component.info.name()))
             })?;
             info.validate(component.bytes())?;
-            self.check_owner(key, component)?;
             row.push((info, component.bytes().to_vec()));
         }
         Ok(row)
+    }
+
+    /// The ownership rule over a row [`spawn_row`](Self::spawn_row) built for `key`.
+    fn check_row_owner(&self, key: StableKey, row: &[(&'static TypeInfo, Vec<u8>)]) -> Result<()> {
+        row.iter().try_for_each(|(info, bytes)| self.check_owner(key, info.key(), bytes))
     }
 
     /// Pushes a row [`spawn_row`](Self::spawn_row) checked, stamped at `stamp`, and indexes
@@ -1860,7 +1905,7 @@ impl World {
         component: &ErasedComponent,
     ) -> Result<&'static TypeInfo> {
         let info = self.checked_info(component)?;
-        self.check_owner(key, component)?;
+        self.check_owner(key, component.key(), component.bytes())?;
         Ok(info)
     }
 
@@ -1949,7 +1994,7 @@ impl World {
         }
         // A bound `Net` key whose own entity is gone (one a restore revived) names the
         // predicted entity again: the references to it go to the origin key, as the bind
-        // left them.
+        // left them, but for one that would close a cycle of owners, which is emptied.
         if let StableKey::Net(net) = key
             && let Some(&predicted) = self.aliases.by_net.get(&net)
         {

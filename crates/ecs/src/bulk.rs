@@ -216,6 +216,13 @@ pub(crate) fn load_region(
                 }
                 StableKey::Predicted(predicted)
             }
+            // A bound id names the predicted entity the bind made, and an honest export of
+            // it carries its `PredictedOrigin`: as `Net(id)` the row would be a second entity.
+            None if world.aliases.by_net.contains_key(&id) => {
+                return Err(invalid(format!(
+                    "the row {id:?} lacks the `PredictedOrigin` of the entity its id is bound to"
+                )));
+            }
             None => StableKey::Net(id),
         };
         if world.contains(key) || world.contains(StableKey::Net(id)) {
@@ -223,7 +230,7 @@ pub(crate) fn load_region(
         }
         keys.insert(id, key);
     }
-    check_owners(world, &rows, &keys)?;
+    let breaks = check_owners(world, &mut rows, &keys)?;
     for (&id, &key) in &keys {
         if let StableKey::Predicted(predicted) = key {
             world.bind(predicted, id)?;
@@ -252,21 +259,34 @@ pub(crate) fn load_region(
                 payload: Payload::Bytes(bytes),
             })
             .collect();
-        world.spawn_entity(keys[&id], region, components, stamp)?;
+        world.spawn_loaded(keys[&id], region, components, stamp)?;
+    }
+    for (row, owner) in breaks {
+        tracing::warn!(
+            target: "casein",
+            ?row,
+            ?owner,
+            ?region,
+            "a load broke a cycle of owners: the row loads without `OwnedBy`"
+        );
     }
     Ok(())
 }
 
-/// `InvalidData` if the owners `rows` will have, under the `keys` the load gives them, would
-/// close a cycle of owners with each other, through the baseline's own `ecs::owned_by`
-/// column, or with live entities of other regions (README, "Ownership"). Walked before
-/// anything binds or spawns, so a refused document changes nothing; the binds the load
-/// makes are covered, since an owner is resolved as it will be stored and read after them.
+/// The ownership pre-pass of a load (README, Regions, "Ownership is a forest"): walks the
+/// owners `rows` will have, under the `keys` the load gives them, together with the live
+/// world, before anything binds or spawns. `InvalidData` for a cycle among the document's
+/// own rows, which no honest export contains. A cycle through a live entity outside the
+/// document is broken instead: of the rows on it whose owner is such an entity, the smallest
+/// key loads without `OwnedBy`. Starts are taken in ascending key order and each break
+/// applies before the next walk, so the outcome depends on the document and the live world
+/// only. Returns the broken rows with the owners they lose. The binds the load makes are
+/// covered, since an owner is resolved as it will be stored and read after them.
 fn check_owners(
     world: &World,
-    rows: &BTreeMap<NetId, Row>,
+    rows: &mut BTreeMap<NetId, Row>,
     keys: &BTreeMap<NetId, StableKey>,
-) -> Result<()> {
+) -> Result<Vec<(StableKey, StableKey)>> {
     // A `Net` key of a row of the document names the row under its load key; anything
     // else names what it names in the world.
     let resolve = |key: StableKey| match key {
@@ -275,8 +295,8 @@ fn check_owners(
     };
     // The owner each row will have: an `OwnershipChange`'s, as the spawn below writes it,
     // or its own `ecs::owned_by`.
-    let mut owners: BTreeMap<StableKey, Option<StableKey>> = BTreeMap::new();
-    for (id, row) in rows {
+    let mut owners: BTreeMap<StableKey, (NetId, Option<StableKey>)> = BTreeMap::new();
+    for (&id, row) in rows.iter() {
         let owner = match row.owner {
             Some(owner) => owner.map(StableKey::Net),
             None => row
@@ -285,29 +305,55 @@ fn check_owners(
                 .and_then(|bytes| bytemuck::checked::try_pod_read_unaligned::<OwnedBy>(bytes).ok())
                 .and_then(|value| value.owner.get()),
         };
-        owners.insert(keys[id], owner.map(resolve));
+        owners.insert(keys[&id], (id, owner.map(resolve)));
     }
-    let owner_of = |key: StableKey| match owners.get(&key) {
-        Some(&owner) => owner,
-        None => world.stored_owner(key).map(resolve),
-    };
+    let starts: Vec<StableKey> = owners.keys().copied().collect();
+    let mut breaks = Vec::new();
     // Each chain is followed until it ends, reaches a key already cleared, or returns to a
-    // key on itself, which is a cycle: every key has one owner at most.
+    // key on itself: every key has one owner at most, so that is a cycle. A key is cleared
+    // once its chain is known to end, which a later break, removing an edge, keeps true.
     let mut cleared = BTreeSet::new();
-    for &start in owners.keys() {
-        let mut chain = BTreeSet::new();
+    for start in starts {
+        let mut chain: Vec<StableKey> = Vec::new();
+        let mut on_chain: BTreeMap<StableKey, usize> = BTreeMap::new();
         let mut at = Some(start);
         while let Some(key) = at.filter(|key| !cleared.contains(key)) {
-            if !chain.insert(key) {
-                return Err(invalid(format!(
-                    "the document's owners would close a cycle of owners through {key:?}"
-                )));
+            if let Some(&first) = on_chain.get(&key) {
+                let cycle = &chain[first..];
+                let in_document = |key: &StableKey| owners.contains_key(key);
+                if cycle.iter().all(in_document) {
+                    return Err(invalid(format!(
+                        "the document's owners close a cycle of owners through {key:?}"
+                    )));
+                }
+                // A cycle that leaves the document returns to it, so some row on it is owned
+                // by a live entity outside; the chain ends there once that edge is gone.
+                let broken = (0..cycle.len())
+                    .filter(|&i| {
+                        in_document(&cycle[i]) && !in_document(&cycle[(i + 1) % cycle.len()])
+                    })
+                    .map(|i| cycle[i])
+                    .min();
+                let Some(broken) = broken else {
+                    return Err(invalid(format!(
+                        "the live world holds a cycle of owners through {key:?}"
+                    )));
+                };
+                let (id, owner) = owners.get_mut(&broken).expect("a row of the document");
+                breaks.push((broken, owner.take().expect("a row on a cycle has an owner")));
+                rows.get_mut(id).expect("a row of the document").owner = Some(None);
+                break;
             }
-            at = owner_of(key);
+            on_chain.insert(key, chain.len());
+            chain.push(key);
+            at = match owners.get(&key) {
+                Some(&(_, owner)) => owner,
+                None => world.stored_owner(key).map(resolve),
+            };
         }
         cleared.extend(chain);
     }
-    Ok(())
+    Ok(breaks)
 }
 
 /// The `NetId` a stored key is exported under.
