@@ -474,6 +474,57 @@ fn an_older_substitution_first_reported_after_a_newer_one_substitutes_the_newer_
     assert_eq!(rig.hash(), reference.hash());
 }
 
+/// The same order with the repair of 16 made in a call between: the re-substitution of 15
+/// arms the repair of 16 again, which now continues the new substitute.
+#[test]
+fn a_resubstitution_repairs_the_tick_after_it_again() {
+    let mut rig = Rig::joined();
+    let mut reference = Rig::joined();
+    rig.step_to(20, sample);
+    reference.step_to(23, lost_14_15);
+    rig.push(substituted(15, &[15]));
+    rig.step(sample(21));
+    let first = rig.reconcile();
+    rig.push(StagedFrame::new(Tick(16)));
+    rig.step(sample(22));
+    let repair = rig.reconcile();
+    rig.push(substituted(17, &[14, 15]));
+    rig.step(sample(23));
+    let older = rig.reconcile();
+    assert_eq!(points(&first), vec![(Tick(14), CorrectionCause::Substituted)]);
+    assert_eq!(points(&repair), vec![(Tick(15), CorrectionCause::Repaired)]);
+    assert_eq!(points(&older), vec![(Tick(13), CorrectionCause::Substituted)]);
+    assert_eq!(rig.p().stats().substitutions, 2);
+    assert_eq!(rig.hash(), reference.hash());
+}
+
+/// A substitution at or before a resync's restart is skipped, a repeat of one acted on
+/// before the resync included, and still after the restart's slot has left the ring.
+#[test]
+fn a_substitution_at_or_before_a_resync_is_skipped() {
+    let mut rig = Rig::joined();
+    rig.p_mut().set_depth(6).unwrap();
+    rig.step_to(20, sample);
+    rig.push(substituted(19, &[18]));
+    rig.step(sample(21));
+    assert_eq!(points(&rig.reconcile()), vec![(Tick(17), CorrectionCause::Substituted)]);
+    rig.p_mut().resync(Tick(30)).unwrap();
+    rig.step(sample(31));
+    rig.push(substituted(31, &[18, 30]));
+    rig.step(sample(32));
+    let held = rig.reconcile();
+    assert_eq!(held.resync, None);
+    assert!(held.corrections.is_empty());
+    rig.step_to(39, sample);
+    assert_eq!(rig.p().ring().oldest(), Some(Tick(34)));
+    rig.push(substituted(38, &[18, 30]));
+    rig.step(sample(40));
+    let late = rig.reconcile();
+    assert_eq!(late.resync, None);
+    assert!(late.corrections.is_empty());
+    assert_eq!(rig.p().stats().substitutions, 1);
+}
+
 /// How late a repeat may come at the default depth: while the ring holds its tick's slot
 /// or for ten seconds of ticks after it, whichever is longer, it is skipped; later, once
 /// its slot has left the ring, it reads as a first report and is `TooOld`.
