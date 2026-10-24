@@ -546,6 +546,7 @@ dependencies = [
  "lactose-net-api",
  "lactose-reflect",
  "lactose-sim",
+ "zstd",
 ]
 
 [[package]]

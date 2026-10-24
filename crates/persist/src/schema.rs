@@ -5,9 +5,10 @@
 
 use std::collections::BTreeMap;
 
-use lactose_bundle::ComponentSchema;
-use lactose_core::{ComponentKey, Result};
-use lactose_reflect::{Persistence, Registry, TypeInfo, TypeRole};
+use lactose_bundle::{ComponentSchema, FieldLayout, MAX_COMPONENT_BYTES};
+use lactose_core::{ComponentKey, Error, ErrorKind, Result, xxh64};
+use lactose_math::{Scalar, ScalarBits};
+use lactose_reflect::{Field, FieldKind, Persistence, Registry, StructInfo, TypeInfo, TypeRole};
 
 /// The digest of a type's layout at one schema version: what a document's
 /// [`ComponentSchema`] does not see, in one number.
@@ -56,9 +57,9 @@ impl LayoutDigest {
     /// `Struct` and `Enum` kinds and each variant's name beside its value.
     #[must_use]
     pub fn of(info: &TypeInfo) -> Self {
-        todo!(
-            "hash the layout part of `write_schema` with empty struct and enum tags and variant names"
-        )
+        let mut out = Vec::new();
+        write_layout(info.layout(), &mut out);
+        Self(xxh64(&out, 0))
     }
 }
 
@@ -84,15 +85,57 @@ impl SchemaHash {
     /// The hash of `registry`'s saved types, as stated on the type.
     #[must_use]
     pub fn of(registry: &Registry) -> Self {
-        todo!("hash each saved type's key, version, role, persistence and layout digest")
+        Self::over(
+            registry
+                .iter()
+                .filter(|info| info.persistence() != Persistence::Derived)
+                .map(|info| (info, LayoutDigest::of(info))),
+        )
+    }
+
+    /// The hash over `saved`, ascending by key, each type with its digest: the one stream
+    /// [`SchemaHash::of`] and [`SchemaTable::from_registry`] both hash.
+    fn over<'a>(saved: impl Iterator<Item = (&'a TypeInfo, LayoutDigest)>) -> Self {
+        let mut out = Vec::new();
+        for (info, layout) in saved {
+            out.extend_from_slice(&info.key().0.to_le_bytes());
+            out.extend_from_slice(&info.version().to_le_bytes());
+            out.push(match info.role() {
+                TypeRole::Component => 0,
+                TypeRole::Resource => 1,
+            });
+            out.push(match info.persistence() {
+                Persistence::Persistent => 0,
+                Persistence::Transient => 1,
+                Persistence::Derived => unreachable!("a derived type is never hashed"),
+            });
+            out.extend_from_slice(&layout.0.to_le_bytes());
+        }
+        Self(xxh64(&out, 0))
     }
 }
 
 /// What the table keeps for a saved type.
 #[derive(Clone, Debug)]
-struct Saved {
-    schema: ComponentSchema,
-    layout: LayoutDigest,
+pub(crate) struct Saved {
+    pub(crate) schema: ComponentSchema,
+    pub(crate) layout: LayoutDigest,
+    /// The offset of every `Scalar` leaf at any depth, ascending: what
+    /// [`Saved::canonicalise`] rewrites.
+    scalars: Vec<usize>,
+}
+
+impl Saved {
+    /// Rewrites every `Scalar` leaf of `value`, one value of this type, to its canonical
+    /// bits (`README.md`, "Determinism"). `value` is the schema's size.
+    pub(crate) fn canonicalise(&self, value: &mut [u8]) {
+        for &offset in &self.scalars {
+            let leaf = &mut value[offset..offset + Scalar::BYTES];
+            let bits = ScalarBits::from_le_bytes((&*leaf).try_into().expect("a scalar's width"));
+            let canonical = Scalar::from_canonical_bits(bits).to_canonical_bits();
+            leaf.copy_from_slice(&canonical.to_le_bytes());
+        }
+    }
 }
 
 /// One registered type as the table keeps it.
@@ -137,7 +180,24 @@ impl SchemaTable {
     /// over it is legal to the world and refused here, for the whole table
     /// (`README.md`, "Policy"; D129 names the refusal at registration as the fix).
     pub fn from_registry(registry: &Registry) -> Result<Self> {
-        todo!("derive one schema and digest per saved type and the table's hash")
+        let mut entries = BTreeMap::new();
+        for info in registry.iter() {
+            let saved = match info.persistence() {
+                Persistence::Derived => None,
+                Persistence::Persistent | Persistence::Transient => Some(saved_of(info)?),
+            };
+            entries.insert(info.key(), Entry { info, saved });
+        }
+        let hash = SchemaHash::over(
+            entries.values().filter_map(|entry| Some((entry.info, entry.saved.as_ref()?.layout))),
+        );
+        Ok(Self { entries, hash })
+    }
+
+    /// What the table keeps for `component`: `None` for a type that is not registered or
+    /// is `derived`.
+    pub(crate) fn saved(&self, component: ComponentKey) -> Option<&Saved> {
+        self.entries.get(&component)?.saved.as_ref()
     }
 
     /// The hash of the saved types' schemas, [`SchemaHash::of`] the same registry.
@@ -209,5 +269,146 @@ impl<'a> Iterator for Schemas<'a> {
 
     fn next(&mut self) -> Option<Self::Item> {
         self.entries.by_ref().find_map(|entry| entry.saved.as_ref().map(|saved| &saved.schema))
+    }
+}
+
+/// The schema a document carries for `info`, derived exactly as `lactose-ecs` derives the
+/// one its loader compares against (`README.md`, "Schemas"; `tests/roundtrip.rs` holds the
+/// two equal). Fails as `ComponentSchema::new` fails, for a type over
+/// `MAX_COMPONENT_BYTES`.
+pub(crate) fn document_schema(info: &TypeInfo) -> Result<ComponentSchema> {
+    let fields = info.layout().fields().iter().filter_map(|field| {
+        Some(FieldLayout {
+            id: field.id()?,
+            offset: field.offset() as u32,
+            size: field.size() as u32,
+        })
+    });
+    ComponentSchema::new(info.key(), info.version(), info.layout().size() as u32, fields)
+}
+
+/// What the table keeps for the saved type `info`, after the refusals
+/// [`SchemaTable::from_registry`] states.
+fn saved_of(info: &TypeInfo) -> Result<Saved> {
+    let size = info.layout().size();
+    if size > MAX_COMPONENT_BYTES as usize {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            format!(
+                "`{}` is saved but is {size} bytes, over the {MAX_COMPONENT_BYTES} a document \
+                 carries",
+                info.name()
+            ),
+        ));
+    }
+    let mut scalars = Vec::new();
+    for field in info.layout().fields() {
+        let (kind, tag) = (field.kind(), field.type_name());
+        scalar_leaves(info.name(), &kind, tag, field.offset(), field.size(), &mut scalars)?;
+    }
+    Ok(Saved { schema: document_schema(info)?, layout: LayoutDigest::of(info), scalars })
+}
+
+/// Collects the offset of every `Scalar` leaf of a field of `kind` at `offset`, refusing a
+/// raw float and a foreign scalar at any depth, as `lactose-sim`'s registration does.
+fn scalar_leaves(
+    name: &str,
+    kind: &FieldKind,
+    tag: &str,
+    offset: usize,
+    size: usize,
+    out: &mut Vec<usize>,
+) -> Result<()> {
+    let refuse = |what: String| {
+        Err(Error::new(
+            ErrorKind::Unsupported,
+            format!(
+                "`{name}` is saved but holds {what}; make it `derived` or use \
+                 `lactose_math::Scalar`"
+            ),
+        ))
+    };
+    match kind {
+        FieldKind::Float => return refuse("a raw float".to_owned()),
+        FieldKind::Scalar { .. } if tag != <Scalar as Field>::NAME || size != Scalar::BYTES => {
+            return refuse(format!("the scalar `{tag}`"));
+        }
+        FieldKind::Scalar { .. } => out.push(offset),
+        FieldKind::Struct(info) => {
+            for field in info.fields() {
+                let (kind, at) = (field.kind(), offset + field.offset());
+                scalar_leaves(name, &kind, field.type_name(), at, field.size(), out)?;
+            }
+        }
+        FieldKind::Array { element, element_name, len } => {
+            let element_size = size.checked_div(*len).unwrap_or(0);
+            for index in 0..*len {
+                let at = offset + index * element_size;
+                scalar_leaves(name, element, element_name, at, element_size, out)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// The layout part of `TypeInfo::write_schema`, with the two changes [`LayoutDigest`]
+/// states.
+fn write_layout(layout: &StructInfo, out: &mut Vec<u8>) {
+    out.extend_from_slice(&(layout.size() as u32).to_le_bytes());
+    out.extend_from_slice(&(layout.align() as u32).to_le_bytes());
+    let fields = layout.fields().iter().filter(|field| !field.is_padding());
+    out.extend_from_slice(&(fields.clone().count() as u32).to_le_bytes());
+    for field in fields {
+        let id = field.id().expect("a non-padding field has an ID");
+        out.extend_from_slice(&id.0.to_le_bytes());
+        out.extend_from_slice(&(field.offset() as u32).to_le_bytes());
+        out.extend_from_slice(&(field.size() as u32).to_le_bytes());
+        write_tag(&field.kind(), field.type_name(), out);
+        write_kind(&field.kind(), out);
+    }
+}
+
+/// A primitive's type tag, or an empty one for a `Struct` or `Enum`, whose structure
+/// follows.
+fn write_tag(kind: &FieldKind, tag: &str, out: &mut Vec<u8>) {
+    let tag = match kind {
+        FieldKind::Struct(_) | FieldKind::Enum(_) => "",
+        _ => tag,
+    };
+    out.extend_from_slice(&(tag.len() as u32).to_le_bytes());
+    out.extend_from_slice(tag.as_bytes());
+}
+
+fn write_kind(kind: &FieldKind, out: &mut Vec<u8>) {
+    match kind {
+        FieldKind::Bool => out.push(0),
+        FieldKind::Unsigned => out.push(1),
+        FieldKind::Signed => out.push(2),
+        FieldKind::Float => out.push(3),
+        FieldKind::Scalar { .. } => out.push(4),
+        FieldKind::EntityRef => out.push(5),
+        FieldKind::AssetRef { .. } => out.push(6),
+        FieldKind::Enum(info) => {
+            out.push(7);
+            out.push(info.size as u8);
+            out.extend_from_slice(&(info.variants.len() as u32).to_le_bytes());
+            for variant in info.variants {
+                out.extend_from_slice(&variant.value.to_le_bytes());
+                out.extend_from_slice(&(variant.name.len() as u32).to_le_bytes());
+                out.extend_from_slice(variant.name.as_bytes());
+            }
+        }
+        FieldKind::Struct(info) => {
+            out.push(8);
+            write_layout(info, out);
+        }
+        FieldKind::Array { element, element_name, len } => {
+            out.push(9);
+            out.extend_from_slice(&(*len as u32).to_le_bytes());
+            write_tag(element, element_name, out);
+            write_kind(element, out);
+        }
+        FieldKind::Padding => out.push(10),
     }
 }

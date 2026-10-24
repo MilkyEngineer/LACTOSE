@@ -13,9 +13,8 @@
 //!
 //! # Status
 //!
-//! A facade: every public signature is final and every body that decides anything is
-//! `todo!()`. The implementation lane replaces the bodies behind this surface and removes
-//! the crate-level `allow` with the last `todo!()`.
+//! Implemented (D129): every item of the surface does what `README.md` states, and its
+//! "Proof for milestone 1" table names the tests that hold it.
 //!
 //! # Where to start
 //!
@@ -69,13 +68,8 @@
 //! ```
 
 #![forbid(unsafe_code)]
-#![allow(
-    dead_code,
-    unused_variables,
-    reason = "facade: every body is `todo!()` until the implementation lane replaces it, and \
-              the fields and parameters it will use are declared now"
-)]
 
+mod codec;
 mod container;
 mod diff;
 mod load;

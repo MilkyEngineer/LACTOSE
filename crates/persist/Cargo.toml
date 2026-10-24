@@ -30,6 +30,8 @@ lactose-reflect.workspace = true
 # `RegionExport` and `SavePoint`, the input of a save, and `RegionBundle`, the output of a
 # load; types only.
 lactose-sim.workspace = true
+# Each section of the container is one zstd frame (architecture section 15.3).
+zstd.workspace = true
 
 [lints]
 workspace = true

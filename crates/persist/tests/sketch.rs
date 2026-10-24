@@ -1,9 +1,9 @@
-//! Compile-only consumer sketches against the facade: what the server's `app` writes to
+//! Compile-only consumer sketches against the surface: what the server's `app` writes to
 //! save and to load, in a fresh process, in place and one region at a time; what it writes
 //! to build the relevance message from a region's records; what a game crate writes to
-//! migrate a component; and the shape of the section 15.5 tests. Type-checked and never
-//! run (every deciding body of the crate is `todo!()`). They pin the surface the README
-//! promises: a change that breaks one is a signature change to list.
+//! migrate a component; and the shape of the section 15.5 tests, which `reload.rs`,
+//! `migrate.rs` and `schema.rs` run. Type-checked and never run. They pin the surface the
+//! README promises: a change that breaks one is a signature change to list.
 
 #![forbid(unsafe_code)]
 #![allow(dead_code, unused_variables, missing_docs)]
