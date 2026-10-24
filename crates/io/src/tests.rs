@@ -299,13 +299,19 @@ fn a_future_dropped_while_queued_never_runs() {
     assert!(poll_once(&mut blocker).is_pending());
     recorder.gate.arrived(1);
     let mut queued = io.replace(scratch.path("slot"), b"queued".to_vec());
-    assert!(poll_once(&mut queued).is_pending());
+    let mut listing = io.read_dir(scratch.path("blocker"));
+    let mut after = io.read_dir(scratch.path("blocker"));
+    assert!(poll_once(&mut queued).is_pending() && poll_once(&mut listing).is_pending());
+    assert!(poll_once(&mut after).is_pending());
     drop(queued);
+    drop(listing);
     recorder.gate.open();
     assert_eq!(wait(&mut blocker).unwrap(), Vec::new());
+    // One thread and one FIFO queue: the dropped requests were reached before this one.
+    assert_eq!(wait(&mut after).unwrap(), Vec::new());
     io.shutdown();
-    assert_eq!(recorder.count("submit replace"), 1);
-    assert_eq!(recorder.count("start replace"), 0, "{:?}", recorder.seen());
+    assert_eq!(recorder.count("submit"), 4);
+    assert_eq!(recorder.count("start"), 2, "{:?}", recorder.seen());
     assert_eq!(scratch.names(), ["blocker"], "the dropped replace touched the directory");
 }
 
