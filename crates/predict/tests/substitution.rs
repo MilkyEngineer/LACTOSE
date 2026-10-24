@@ -559,3 +559,28 @@ fn a_repeat_is_skipped_for_ten_seconds_after_its_tick() {
         assert_eq!(rig.p().stats().substitutions, 1);
     }
 }
+
+/// A depth above the window: a repeat whose slot the ring still holds, popped later than
+/// the window after its tick, is skipped, not rolled back again.
+#[test]
+fn a_repeat_is_skipped_while_the_ring_holds_its_slot_past_the_window() {
+    let window = 10 * TICK_RATE_HZ;
+    let mut rig = Rig::joined();
+    rig.p_mut().set_depth(window + 100).unwrap();
+    rig.step_to(20, sample);
+    rig.push(substituted(18, &[18]));
+    rig.step(sample(21));
+    rig.reconcile();
+    rig.push(StagedFrame::new(Tick(19)));
+    rig.step(sample(22));
+    rig.reconcile();
+    let lag = window + 50;
+    rig.step_to(18 + lag - 1, sample);
+    rig.push(substituted(16 + lag, &[18]));
+    rig.step(sample(18 + lag));
+    assert_eq!(rig.p().ring().oldest(), Some(Tick(11)));
+    let repeated = rig.reconcile();
+    assert_eq!(repeated.resync, None);
+    assert!(repeated.corrections.is_empty(), "a repeat is no rollback");
+    assert_eq!(rig.p().stats().substitutions, 1);
+}

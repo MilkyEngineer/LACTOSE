@@ -36,9 +36,9 @@ mod rollback;
 /// rollback to the oldest slot of an unsized ring may overrun the frame (D122).
 pub const DEFAULT_DEPTH: u32 = 60;
 
-/// How long a substitution the reconciliation acted on is remembered after the ring has
-/// dropped its slot, so a repeat of the report is still skipped: ten seconds at the tick
-/// rate, whatever the depth. The server repeats a substitution until it sees acknowledged
+/// How long a substitution the reconciliation acted on is remembered, so a repeat of the
+/// report is skipped: while the ring holds its slot or for ten seconds after its tick,
+/// whichever is longer, whatever the depth. The server repeats a substitution until it sees acknowledged
 /// a packet that carried it (`crates/net-api/README.md`, `substituted`): every packet it
 /// sends from the first carries it, and the client acknowledges every packet it stages, so
 /// the repeats last about a round trip plus the client's send interval, longer only while
