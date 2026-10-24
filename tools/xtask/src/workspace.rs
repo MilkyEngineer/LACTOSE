@@ -152,6 +152,31 @@ impl Workspace {
         found.into_iter().map(|target| chain(&parent, target)).collect()
     }
 
+    /// The shortest chain of crate names from `start` to each crate it reaches through
+    /// declared edges that ship (normal and build), passing only through workspace members
+    /// for which `through` holds: a crate for which it does not hold ends its chains. `start`
+    /// itself is always left and is not reported. Sorted by the crate reached.
+    #[must_use]
+    pub fn reach(&self, start: &str, through: &dyn Fn(&str) -> bool) -> Vec<Vec<String>> {
+        let mut parent: BTreeMap<&str, Option<&str>> = BTreeMap::from([(start, None)]);
+        let mut queue = VecDeque::from([start]);
+        while let Some(name) = queue.pop_front() {
+            let Some(package) = self.package(name) else {
+                continue;
+            };
+            for dep in package.deps.iter().filter(|d| d.kind.ships()) {
+                if parent.contains_key(dep.name.as_str()) {
+                    continue;
+                }
+                parent.insert(&dep.name, Some(&package.name));
+                if through(&dep.name) {
+                    queue.push_back(&dep.name);
+                }
+            }
+        }
+        parent.keys().filter(|&&name| name != start).map(|name| chain(&parent, name)).collect()
+    }
+
     /// Every third-party crate that the member `name` compiles through normal and build
     /// edges, at any depth and through any workspace crate, each with the shortest chain of
     /// crate names that reaches it. Empty when the metadata carried no resolved graph.
@@ -741,5 +766,42 @@ mod tests {
         // A name with no package behind it still ends a chain.
         let outside = ws.chains_to(&["lactose-b"], &|name| name == "lactose-c");
         assert_eq!(outside, [["lactose-b", "lactose-c"]]);
+    }
+
+    #[test]
+    fn reach_passes_only_through_the_crates_it_is_told_to() {
+        let ws = workspace(vec![
+            package(
+                "lactose-a",
+                &[
+                    ("lactose-b", DepKind::Normal),
+                    ("lactose-e", DepKind::Build),
+                    ("lactose-d", DepKind::Dev),
+                ],
+            ),
+            package("lactose-b", &[("lactose-c", DepKind::Normal), ("serde", DepKind::Normal)]),
+            package("lactose-c", &[("lactose-f", DepKind::Normal)]),
+            package("lactose-d", &[]),
+            package("lactose-e", &[("lactose-a", DepKind::Normal)]),
+            package("lactose-f", &[]),
+        ]);
+        // `c` is reached but not passed through, so `f` is not reached; the start is not
+        // reported although `e` depends on it; `d` is a dev edge.
+        let chains = ws.reach("lactose-a", &|name| name != "lactose-c");
+        assert_eq!(
+            chains,
+            [
+                vec!["lactose-a", "lactose-b"],
+                vec!["lactose-a", "lactose-b", "lactose-c"],
+                vec!["lactose-a", "lactose-e"],
+                vec!["lactose-a", "lactose-b", "serde"],
+            ]
+        );
+        let all: Vec<String> = ws
+            .reach("lactose-a", &|_| true)
+            .into_iter()
+            .filter_map(|c| c.last().cloned())
+            .collect();
+        assert_eq!(all, ["lactose-b", "lactose-c", "lactose-e", "lactose-f", "serde"]);
     }
 }

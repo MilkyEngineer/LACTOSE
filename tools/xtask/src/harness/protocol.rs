@@ -53,7 +53,16 @@
 //! deletes the logs of runs that agreed and keeps the rest for CI to upload, so the diverging
 //! schedule replays exactly.
 
+// This file is compiled into the tests of boundary crates, under their `clippy.toml`, which
+// bans `std::fs` and `std::env` (architecture section 8.2), and into this crate, which does
+// not. Each item that reaches a file or the environment therefore allows the lint for itself:
+// an `expect` would be unfulfilled here.
+
 use std::fmt;
+#[allow(
+    clippy::disallowed_types,
+    reason = "the runner passes the mode in the environment and collects hashes in a file (architecture section 8.3)"
+)]
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::num::NonZeroU32;
@@ -208,6 +217,10 @@ impl Session {
     ///
     /// # Errors
     /// If the runner's variables are present but malformed or of another schema version.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "the runner passes the mode in the environment and collects hashes in a file (architecture section 8.3)"
+    )]
     pub fn from_env() -> Result<Self, ProtocolError> {
         Self::from_vars(&|name| std::env::var(name).ok())
     }
@@ -254,6 +267,10 @@ impl Session {
     ///
     /// # Errors
     /// If the name contains a tab or a line break, or the hash file cannot be written.
+    #[allow(
+        clippy::disallowed_types,
+        reason = "the runner passes the mode in the environment and collects hashes in a file (architecture section 8.3)"
+    )]
     pub fn recorder(&self, test: &str, applied: &RunConfig) -> Result<Recorder, ProtocolError> {
         check_test_name(test)?;
         let file = match &self.hash_file {
@@ -283,6 +300,10 @@ impl Session {
     ///
     /// # Errors
     /// If the log cannot be written.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "the runner passes the mode in the environment and collects hashes in a file (architecture section 8.3)"
+    )]
     pub fn write_execution_log(&self, test: &str, log: &[u8]) -> Result<(), ProtocolError> {
         let Some(path) = self.execution_log_path(test) else {
             return Ok(());
@@ -325,6 +346,10 @@ fn check_test_name(test: &str) -> Result<(), ProtocolError> {
 /// Appends one test's records to the file the runner named, or discards them outside the
 /// runner.
 #[derive(Debug)]
+#[allow(
+    clippy::disallowed_types,
+    reason = "the runner passes the mode in the environment and collects hashes in a file (architecture section 8.3)"
+)]
 pub struct Recorder {
     test: String,
     file: Option<File>,
@@ -449,6 +474,10 @@ mod tests {
         Session::from_vars(&lookup(&owned))
     }
 
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "the runner passes the mode in the environment and collects hashes in a file (architecture section 8.3)"
+    )]
     fn scratch(name: &str) -> PathBuf {
         let dir = std::env::temp_dir()
             .join(format!("lactose-harness-protocol-{}-{name}", std::process::id()));
@@ -519,6 +548,10 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "the runner passes the mode in the environment and collects hashes in a file (architecture section 8.3)"
+    )]
     fn records_round_trip_through_a_file_under_the_configuration_the_test_applied() {
         let dir = scratch("records");
         let path = dir.join("hashes.tsv");
@@ -593,6 +626,10 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "the runner passes the mode in the environment and collects hashes in a file (architecture section 8.3)"
+    )]
     fn execution_logs_land_at_a_path_that_no_other_test_name_shares() {
         // Review item 7: `a::b` and `a__b` collided under the first mapping.
         let dir = scratch("logs");

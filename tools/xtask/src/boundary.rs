@@ -31,15 +31,19 @@ const PIN_FLAGS: [&str; 2] = ["-C", "target-cpu=x86-64-v3"];
 
 /// Entries the reference lint file must keep, one or two from each family of rule in
 /// section 8.2, so a file that was emptied and then copied everywhere is still caught.
-const REQUIRED_LINT_PATHS: [&str; 8] = [
+const REQUIRED_LINT_PATHS: [&str; 12] = [
     "f32::min",
     "f64::sin",
     "f64::to_bits",
     "f64::powi",
+    "std::fs::read",
+    "std::env::var",
     "std::time::Instant",
     "std::collections::HashMap",
     "std::hash::RandomState",
     "std::thread::LocalKey",
+    "std::fs::File",
+    "std::net::TcpStream",
 ];
 
 /// Lint levels that leave a lint weaker than `deny`.
@@ -384,15 +388,18 @@ fn dependency_allowlist(
     let internal = &tiers.boundary_internal;
     let third_party = &tiers.boundary_third_party;
     let direct = third_party.direct.get(&package.name);
+    // The workspace crates `package` may compile, whether it names them or reaches them.
+    let may_compile = |name: &str| {
+        tiers.in_boundary(name)
+            || internal.any.iter().any(|c| c == name)
+            || internal.only.get(&package.name).is_some_and(|only| only.iter().any(|c| c == name))
+    };
     for dep in &package.deps {
         // A name the tier file lists is a workspace crate wherever it is fetched from.
         let is_internal = dep.source == DepSource::Member || tiers.tier(&dep.name).is_some();
         let allowed = if is_internal {
             // The tier check owns workspace dev-dependencies.
-            dep.kind == DepKind::Dev
-                || tiers.in_boundary(&dep.name)
-                || internal.any.contains(&dep.name)
-                || internal.only.get(&package.name).is_some_and(|only| only.contains(&dep.name))
+            dep.kind == DepKind::Dev || may_compile(&dep.name)
         } else {
             direct.is_some_and(|list| {
                 list.normal.contains(&dep.name)
@@ -420,6 +427,30 @@ fn dependency_allowlist(
                 package.name, dep.name
             ),
         ));
+    }
+
+    // The workspace crates it reaches through crates outside the boundary, at any depth. A
+    // boundary crate on the way is not passed through: its own reach is judged as its own,
+    // against its own `only` list (section 8.2: `ecs` compiles `task`, and every crate that
+    // depends on `ecs` therefore does). Dev edges are not followed: Cargo never compiles a
+    // dependency's dev-dependencies, and the crate's own are the tier check's (above).
+    let workspace_crate = |name: &str| tiers.tier(name).is_some() || ws.package(name).is_some();
+    let through =
+        |name: &str| workspace_crate(name) && !tiers.in_boundary(name) && may_compile(name);
+    for chain in ws.reach(&package.name, &through) {
+        let reached = chain.last().map_or("", String::as_str);
+        // A refused direct edge was reported above, in the words it always had.
+        if chain.len() > 2 && workspace_crate(reached) && !may_compile(reached) {
+            findings.push(Finding::new(
+                package.manifest(),
+                format!(
+                    "boundary crate `{}` reaches non-boundary crate `{reached}` ({}), which \
+                     [boundary_internal] in {TIER_FILE} does not allow at any depth",
+                    package.name,
+                    chain.join(" -> ")
+                ),
+            ));
+        }
     }
 
     // Everything the crate ends up compiling. Its own direct dependencies were judged above.
@@ -618,11 +649,11 @@ mod tests {
 
     fn lint_file() -> String {
         let mut text = String::from("disallowed-methods = [\n");
-        for path in &REQUIRED_LINT_PATHS[..4] {
+        for path in &REQUIRED_LINT_PATHS[..6] {
             text.push_str(&format!("  {{ path = \"{path}\", reason = \"r\" }},\n"));
         }
         text.push_str("]\ndisallowed-types = [\n");
-        for path in &REQUIRED_LINT_PATHS[4..] {
+        for path in &REQUIRED_LINT_PATHS[6..] {
             text.push_str(&format!("  \"{path}\",\n"));
         }
         text.push_str("]\n");
@@ -974,6 +1005,66 @@ mod tests {
                 "crates/ecs/Cargo.toml: boundary crate `lactose-ecs` compiles third-party crate `xxhash-rust` (lactose-ecs -> lactose-core -> xxhash-rust), which is on no `normal` list and not in `transitive` of [boundary_third_party] in crate-tiers.toml".to_owned(),
                 format!("crates/math/Cargo.toml: boundary crate `lactose-math` depends on third-party crate `bytemuck`, which [boundary_third_party.direct] \"lactose-math\" {tail}"),
                 format!("crates/math/Cargo.toml: boundary crate `lactose-math` depends on non-boundary crate `lactose-task`, which [boundary_internal] {tail}"),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_boundary_crate_may_not_reach_a_refused_workspace_crate_at_any_depth() {
+        // Review of the io facade, D2: `lactose-io` added to an allowlisted foundation crate
+        // reached every boundary crate above it unreported.
+        let (_, mut files) = conforming();
+        for role in ["ecs", "io"] {
+            files.insert(format!("crates/{role}/README.md"), "");
+            files.insert(format!("crates/{role}/SAFETY.md"), "");
+        }
+        files.insert("crates/ecs/Cargo.toml", MANIFEST);
+        files.insert("crates/ecs/clippy.toml", lint_file());
+        for role in ["reflect", "future"] {
+            files.insert(format!("crates/{role}/README.md"), "");
+            files.insert(format!("crates/{role}/src/lib.rs"), FORBID);
+        }
+        let ws = workspace(vec![
+            package("lactose-core", &[]),
+            package(
+                "lactose-math",
+                &[("lactose-reflect", Normal), ("lactose-ecs", Normal), ("lactose-io", Dev)],
+            ),
+            package(
+                "lactose-ecs",
+                &[
+                    ("lactose-core", Normal),
+                    ("lactose-task", Normal),
+                    ("lactose-reflect", Normal),
+                    ("lactose-io", Normal),
+                ],
+            ),
+            package(
+                "lactose-reflect",
+                &[
+                    ("lactose-core", Normal),
+                    ("lactose-io", Normal),
+                    ("lactose-future", Build),
+                    ("lactose-app", Dev),
+                ],
+            ),
+            package("lactose-io", &[("lactose-task", Normal), ("lactose-net", Normal)]),
+            package("lactose-task", &[("lactose-core", Normal)]),
+            package("lactose-future", &[]),
+        ]);
+        let tail = "which [boundary_internal] in crate-tiers.toml does not allow at any depth";
+        assert_eq!(
+            run(&ws, &files),
+            [
+                // The direct edge keeps its own words, and is not reported again at depth.
+                "crates/ecs/Cargo.toml: boundary crate `lactose-ecs` depends on non-boundary crate `lactose-io`, which [boundary_internal] in crate-tiers.toml does not allow".to_owned(),
+                // Build edges are followed; `task` is `ecs`'s own to compile.
+                format!("crates/ecs/Cargo.toml: boundary crate `lactose-ecs` reaches non-boundary crate `lactose-future` (lactose-ecs -> lactose-reflect -> lactose-future), {tail}"),
+                format!("crates/math/Cargo.toml: boundary crate `lactose-math` reaches non-boundary crate `lactose-future` (lactose-math -> lactose-reflect -> lactose-future), {tail}"),
+                // A dev edge to it does not excuse a shipping path. Nothing past a refused
+                // crate is reported (`io` -> `net`), nor `task` through `ecs`, a boundary crate
+                // whose own reach is judged as its own, nor a dev edge of `reflect`.
+                format!("crates/math/Cargo.toml: boundary crate `lactose-math` reaches non-boundary crate `lactose-io` (lactose-math -> lactose-reflect -> lactose-io), {tail}"),
             ]
         );
     }

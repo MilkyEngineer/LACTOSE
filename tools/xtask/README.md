@@ -69,6 +69,12 @@ file is held to the rules wherever it is fetched from.
 - A boundary crate names only what the allowlists in `crate-tiers.toml` let it name, and
   every third-party crate it ends up compiling through normal and build edges is vetted
   there.
+- Every workspace crate a boundary crate reaches through normal and build edges, at any
+  depth, through crates outside the boundary, is one `[boundary_internal]` lets that crate
+  name; the finding gives the chain. A boundary crate on the way is not passed through: its
+  own reach is checked as its own, so `task`, which `ecs` alone may name, reaches every crate
+  that depends on `ecs` without a finding. Dev edges are not followed: cargo never compiles a dependency's
+  dev-dependencies, and a crate's own workspace dev-dependencies are the tier check's.
 - The x86-64-v3 pin is the only `rustflags` setting in any cargo configuration file, and
   no workflow, script or cargo configuration names `RUSTFLAGS` or sets a target CPU or
   target feature (`target_cpu` and `target-cpu` are the same to rustc and to this check).
