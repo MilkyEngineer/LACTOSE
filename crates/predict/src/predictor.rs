@@ -360,10 +360,11 @@ impl Predictor {
     }
 
     /// Runs one tick ahead with `input`, which must carry the local player's sample in
-    /// `inputs` with `input_tick` equal to the tick the step runs, `tick() + 1`
-    /// (`InvalidData` with the predictor handed back before anything ran, since the input
-    /// tick is what gives a predicted spawn the key the server derives), then takes the
-    /// slot for the new tick: the world snapshot, the physics snapshot if the world has
+    /// `inputs` with `input_tick` equal to the tick the step runs, `tick() + 1`, and
+    /// `substituted` false (`InvalidData` with the predictor handed back before anything
+    /// ran, since the input tick is what gives a predicted spawn the key the server
+    /// derives, and the flag is what marks a tick the reconciliation replaced), then takes
+    /// the slot for the new tick: the world snapshot, the physics snapshot if the world has
     /// physics (a failed one leaves the slot without its physics part, logged and
     /// counted), the frames the hook popped in this step, `input` itself, and the record
     /// of every replicated persistent component but `Teleported` of every entity the local
@@ -396,9 +397,20 @@ impl Predictor {
     ) -> core::result::Result<Self, PredictError> {
         let tick = next(self.tick());
         let player = self.state.local.player;
-        if input.inputs.get(&player).map(|sample| sample.input_tick) != Some(tick) {
+        let Some(sample) = input.inputs.get(&player).filter(|sample| sample.input_tick == tick)
+        else {
             let error = invalid(format!(
                 "the step for tick {} carries no sample of the local player for that input tick",
+                tick.0
+            ));
+            return Err(PredictError { error, predictor: Some(self) });
+        };
+        // The ring's flag is what marks a tick the reconciliation replaced, so a repeated
+        // report of it is skipped; the client's own sample never carries it.
+        if sample.substituted {
+            let error = invalid(format!(
+                "the local player's sample for tick {} is marked substituted, which only the \
+                 server's are",
                 tick.0
             ));
             return Err(PredictError { error, predictor: Some(self) });

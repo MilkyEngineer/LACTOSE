@@ -8,10 +8,11 @@
 mod common;
 
 use common::*;
-use lactose_core::Tick;
+use lactose_core::{ErrorKind, Tick};
 use lactose_input::PlayerInput;
 use lactose_net_api::StagedFrame;
 use lactose_predict::{CorrectionCause, ResyncReason};
+use lactose_sim::TickInput;
 
 /// What the player sends: walking, with a jump pressed at 14 and held through 16.
 fn sample(tick: u32) -> PlayerInput {
@@ -158,4 +159,192 @@ fn a_substitution_before_the_horizon_is_too_old() {
     assert!(reconciled.corrections.is_empty());
     assert_eq!(rig.hash(), hash);
     assert_eq!(rig.p().stats().substitutions, 0);
+}
+
+// ---- A repeated report ----
+//
+// net-api's rule: a substitution is in the first frame accepted at or after its tick, and
+// the server may repeat it in later frames until it sees one of them acknowledged. Each
+// case below keeps that rule. A repeat that rolled back again would re-simulate a claim or
+// a release an earlier call reconciled, which a replay never re-applies and no later frame
+// restates (review r2 of the proxy region, P1: q1, q2 and q4).
+
+/// Pushes `frame`, steps once with the walking sample and reconciles.
+fn reconcile_frame(rig: &mut Rig, frame: StagedFrame) -> Vec<Summary> {
+    let present = rig.tick().0 + 1;
+    rig.push(frame);
+    rig.step(walking(present));
+    summaries(&rig.reconcile())
+}
+
+/// `frame` repeating the substitution of 13, reconciled in a call of its own.
+fn repeat_13(rig: &mut Rig, mut frame: StagedFrame) -> Vec<Summary> {
+    frame.substituted.insert(Tick(13));
+    reconcile_frame(rig, frame)
+}
+
+/// The cart's release into [`OTHER_REGION`].
+fn release_cart(frame: &mut StagedFrame) {
+    let components = vec![data(at(50, 0)), data(Health(10))];
+    frame.spawns.insert(net(2), remote(OTHER_REGION, 1, components));
+}
+
+/// q1 under the rule: the substitution of 13 first in the frame of 13, the claim of key 7
+/// in the frame of 14, a call of its own, the report repeated there and in the next three
+/// frames.
+#[test]
+fn a_repeated_substitution_keeps_a_claim_an_earlier_call_reconciled() {
+    let mut rig = Rig::joined();
+    rig.step_to(13, walking);
+    let first = repeat_13(&mut rig, StagedFrame::new(Tick(13)));
+    let points: Vec<_> = first.iter().map(|s| (s.0, s.2)).collect();
+    assert_eq!(points, vec![(Tick(12), CorrectionCause::Substituted)]);
+    let mut frame = StagedFrame::new(Tick(14));
+    frame.spawns.insert(net(7), claimed(REGION, vec![data(at(60, 0)), data(Health(1))]));
+    let claim_call = repeat_13(&mut rig, frame);
+    assert_eq!(claim(rig.world(), key(7)), Some(PLAYER));
+    // The repair of 14, due with the first frame at or after it, and the claim at 14: one
+    // rollback, from 13. The repeat adds no point at 12.
+    let points: Vec<_> = claim_call.iter().map(|s| (s.0, s.2, s.3.clone())).collect();
+    assert_eq!(
+        points,
+        vec![
+            (Tick(13), CorrectionCause::Repaired, vec![]),
+            (Tick(14), CorrectionCause::Mismatch, vec![key(7)]),
+        ]
+    );
+    for tick in 15..18 {
+        let corrections = repeat_13(&mut rig, StagedFrame::new(Tick(tick)));
+        assert!(rig.world().contains(key(7)), "frame {tick}: the claimed entity is live");
+        assert_eq!(claim(rig.world(), key(7)), Some(PLAYER));
+        assert!(corrections.is_empty(), "frame {tick}: a repeat is no rollback");
+    }
+    assert_eq!(rig.p().stats().substitutions, 1);
+}
+
+/// q2 under the rule: the frame of 13 lost, so the substitution of 13 is first in the
+/// frame of 14, which releases the cart; the report repeated in the next three frames,
+/// each a call of its own, which carry the cart's proxy rows.
+#[test]
+fn a_repeated_substitution_keeps_a_release_an_earlier_call_reconciled() {
+    let mut rig = Rig::joined();
+    rig.step_to(14, walking);
+    let mut frame = StagedFrame::new(Tick(14));
+    release_cart(&mut frame);
+    let release_call = repeat_13(&mut rig, frame);
+    let points: Vec<_> = release_call.iter().map(|s| (s.0, s.2)).collect();
+    assert_eq!(
+        points,
+        vec![(Tick(12), CorrectionCause::Substituted), (Tick(14), CorrectionCause::Mismatch),]
+    );
+    assert_eq!(claim(rig.world(), cart()), None);
+    assert_eq!(rig.world().region_of(cart()), Some(OTHER_REGION));
+    for tick in 15..18 {
+        let x = 50 + i32::try_from(tick).expect("small");
+        let mut frame = StagedFrame::new(Tick(tick));
+        dequantised(&mut frame, cart(), &at(x, 0));
+        let corrections = repeat_13(&mut rig, frame);
+        assert_eq!(claim(rig.world(), cart()), None, "frame {tick}: the release holds");
+        assert_eq!(rig.world().region_of(cart()), Some(OTHER_REGION));
+        assert_eq!(rig.position(cart()), Some(at(x, 0)), "frame {tick}: the proxy row applies");
+        assert!(corrections.is_empty(), "frame {tick}: a repeat is no rollback");
+    }
+    assert_eq!(rig.p().stats().substitutions, 1);
+}
+
+/// q4, the reviewer's shape: the substitution of 13 first in the frame of 13, a call of
+/// its own; the release in the frame of 14 with the report repeated, another call; the
+/// report repeated once more in the frame of 15, then the cart's proxy rows alone.
+#[test]
+fn a_resent_substitution_after_a_release_in_its_own_call_keeps_the_release() {
+    let mut rig = Rig::joined();
+    rig.step_to(13, walking);
+    assert_eq!(repeat_13(&mut rig, StagedFrame::new(Tick(13))).len(), 1);
+    let mut frame = StagedFrame::new(Tick(14));
+    release_cart(&mut frame);
+    let release_call = repeat_13(&mut rig, frame);
+    let points: Vec<_> = release_call.iter().map(|s| (s.0, s.2)).collect();
+    assert_eq!(
+        points,
+        vec![(Tick(13), CorrectionCause::Repaired), (Tick(14), CorrectionCause::Mismatch),]
+    );
+    assert_eq!(claim(rig.world(), cart()), None);
+    for tick in 15..20 {
+        let x = 50 + i32::try_from(tick).expect("small");
+        let mut frame = StagedFrame::new(Tick(tick));
+        dequantised(&mut frame, cart(), &at(x, 0));
+        let corrections =
+            if tick == 15 { repeat_13(&mut rig, frame) } else { reconcile_frame(&mut rig, frame) };
+        assert_eq!(claim(rig.world(), cart()), None, "frame {tick}: the release holds");
+        assert_eq!(rig.world().region_of(cart()), Some(OTHER_REGION));
+        assert_eq!(rig.position(cart()), Some(at(x, 0)), "frame {tick}: the proxy row applies");
+        assert!(corrections.is_empty(), "frame {tick}: nothing to correct");
+    }
+    assert_eq!(rig.p().stats().substitutions, 1);
+}
+
+/// A report repeated in three frames of one call and again in the next call is one
+/// substitution, one rollback and one repair.
+#[test]
+fn a_substitution_repeated_within_and_across_calls_counts_once() {
+    let mut rig = Rig::joined();
+    let mut reference = Rig::joined();
+    rig.step_to(20, sample);
+    reference.step_to(22, applied);
+    rig.push(substituted(14, &[14]));
+    rig.push(substituted(15, &[14]));
+    rig.push(substituted(16, &[14]));
+    rig.step(sample(21));
+    let reconciled = rig.reconcile();
+    let points: Vec<_> = reconciled.corrections.iter().map(|c| (c.tick, c.cause)).collect();
+    // The substitution of 14 at 13 and the repair of 15 at 14, from the frame of 15.
+    assert_eq!(points, vec![(Tick(13), CorrectionCause::Substituted)]);
+    assert_eq!(rig.p().stats().substitutions, 1);
+    rig.push(substituted(17, &[14]));
+    rig.step(sample(22));
+    let repeated = rig.reconcile();
+    assert!(repeated.corrections.is_empty(), "a repeat in a later call is no rollback");
+    assert_eq!(repeated.resync, None);
+    assert_eq!(rig.p().stats().substitutions, 1);
+    assert_eq!(rig.hash(), reference.hash());
+}
+
+/// A repeat is known by the ring's sample of its own tick, so one whose previous tick has
+/// left the ring is skipped, not `TooOld`.
+#[test]
+fn a_repeat_whose_previous_tick_left_the_ring_is_skipped() {
+    let mut rig = Rig::joined();
+    rig.p_mut().set_depth(6).unwrap();
+    rig.step_to(20, sample);
+    // The frame of 18 lost: the substitution of 18 first in the frame of 19, with the
+    // repair of 19.
+    rig.push(substituted(19, &[18]));
+    rig.step(sample(21));
+    let first = rig.reconcile();
+    let points: Vec<_> = first.corrections.iter().map(|c| (c.tick, c.cause)).collect();
+    assert_eq!(points, vec![(Tick(17), CorrectionCause::Substituted)]);
+    rig.step(sample(22));
+    rig.push(substituted(22, &[18]));
+    rig.step(sample(23));
+    assert_eq!(rig.p().ring().oldest(), Some(Tick(18)));
+    let hash = rig.hash();
+    let repeated = rig.reconcile();
+    assert_eq!(repeated.resync, None);
+    assert!(repeated.corrections.is_empty());
+    assert_eq!(rig.hash(), hash);
+    assert_eq!(rig.p().stats().substitutions, 1);
+}
+
+/// The ring's sample marks a tick the reconciliation replaced; a step whose local sample
+/// says the server substituted it is refused, since the client never sends one.
+#[test]
+fn a_local_sample_marked_substituted_is_refused() {
+    let mut rig = Rig::joined();
+    let mut sample = moving(1).to_player_sample(Tick(12));
+    sample.substituted = true;
+    let mut input = TickInput::default();
+    input.inputs.insert(PLAYER, sample);
+    let error = rig.try_step_with(input).expect_err("refused");
+    assert_eq!(error.kind(), ErrorKind::InvalidData);
+    assert_eq!(rig.tick(), Tick(11));
 }

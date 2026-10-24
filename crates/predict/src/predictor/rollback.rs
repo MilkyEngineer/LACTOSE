@@ -190,7 +190,8 @@ impl State {
                 out.resync = Some(ResyncReason::TooOld { frame: tick, oldest });
                 break;
             }
-            let Some(frame_replaced) = self.substitutions(&popped, present, oldest) else {
+            let Some(frame_replaced) = self.substitutions(&popped, present, oldest, &replaced)
+            else {
                 out.resync = Some(ResyncReason::TooOld { frame: tick, oldest });
                 break;
             };
@@ -338,19 +339,35 @@ impl State {
 
     /// The substitutions a frame reports and the repairs it makes due, by input tick,
     /// with the awaited repairs updated; `None` if one of them reaches before `oldest`,
-    /// which is `TooOld`, and then nothing changed.
+    /// which is `TooOld`, and then nothing changed. A repeat, a tick whose ring sample a
+    /// call already replaced by a substitute or that an earlier frame of this call
+    /// (`earlier`) reports, is skipped and arms no repair: rolling back again would
+    /// re-simulate claims and releases an earlier call reconciled, which a replay never
+    /// re-applies.
     fn substitutions(
         &mut self,
         popped: &Popped,
         present: Tick,
         oldest: Tick,
+        earlier: &[(Tick, CorrectionCause)],
     ) -> Option<Vec<(Tick, CorrectionCause)>> {
         let restart = self.ring.rebuilt_at();
         let skipped = |tick: Tick| restart.is_some_and(|restart| !before(restart, tick));
+        let player = self.local.player;
+        let repeated = |tick: Tick| {
+            earlier.contains(&(tick, CorrectionCause::Substituted))
+                || self
+                    .ring
+                    .slot(tick)
+                    .and_then(|slot| slot.input.inputs.get(&player))
+                    .is_some_and(|sample| sample.substituted)
+        };
         let mut awaiting = self.awaiting.clone();
         let mut replaced = Vec::new();
         for &tick in &popped.frame.substituted {
-            if skipped(tick) {
+            // Before the horizon check: a repeat whose previous tick has left the ring
+            // changes nothing and is no `TooOld`.
+            if skipped(tick) || repeated(tick) {
                 continue;
             }
             if before(prev(tick), oldest) {
