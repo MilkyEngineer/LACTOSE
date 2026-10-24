@@ -108,13 +108,17 @@ impl StepOutput {
 ///
 /// # Validation
 ///
-/// The backend validates every value it is given (finite scalars, unit quaternions,
-/// positive extents and radii, a mass that is zero or positive, a joint's `limit_min` no
-/// greater than its `limit_max` when it is limited, a non-zero axis on a revolute or
-/// prismatic joint; a fixed or spherical joint's axis is unused and may be zero). An
-/// invalid value is logged at target `physics` and the call does nothing; `create_body`
-/// and `create_joint` return `InvalidData`, and the sync retries the row when it changes. A
-/// backend therefore never aborts the process on a row's bytes.
+/// The backend validates every value it is given by this crate's predicates and by nothing
+/// else (`README.md`, "Validity"; D135): [`BodyDesc::validate`] at `create_body`,
+/// [`Joint::validate`] at `create_joint`, the value's own `validate` at every `set_*`, and
+/// [`PhysicsCommand::validate`](crate::PhysicsCommand::validate) on each command of a step.
+/// A refused value is logged at target `physics` and the call does nothing: `create_body`
+/// and `create_joint` return the [`Invalid`](crate::Invalid) as an `InvalidData` error
+/// whose message is the `Invalid`'s, and the sync retries the row when it changes; a
+/// `set_*` is ignored; a command is dropped. A joint whose two ends are one body is refused
+/// at `create_joint` with `InvalidData` likewise, a rule on the resolved keys the
+/// predicates cannot see. A backend therefore never aborts the process on a row's bytes,
+/// and [`conformance::validity`](crate::conformance::validity) holds it to exactly this.
 ///
 /// # Equal values
 ///

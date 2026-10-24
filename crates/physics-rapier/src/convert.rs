@@ -1,6 +1,7 @@
 //! Between the `physics-api` values and Rapier's: keys and their `user_data` code, vectors,
-//! rotations and poses, shapes, and the validation every value passes before it reaches the
-//! solver.
+//! rotations and poses, and shapes. The validation every value passes before it reaches the
+//! solver is `physics-api`'s own (`Transform::validate` and the rest; D135), applied in
+//! `backend`, `query` and `snapshot`.
 //!
 //! Every conversion is exact in both directions while `Scalar` is 64-bit: `to_f64` and
 //! `from_f64` are identities on every finite value (`from_f64` canonicalises a NaN, which
@@ -8,9 +9,7 @@
 
 use lactose_core::{NetId, PlayerId, PredictionKey, StableKey, Tick};
 use lactose_math::{Quat, Scalar, Vec3};
-use lactose_physics_api::{
-    Collider, Joint, JointKind, RigidBody, Shape, ShapeKind, Transform, Velocity, locked_axes,
-};
+use lactose_physics_api::{Shape, ShapeKind, Transform};
 use rapier3d_f64::geometry::SharedShape;
 use rapier3d_f64::math::{Pose, Rotation, Vector};
 
@@ -155,73 +154,6 @@ pub(crate) fn shape_of(shape: &SharedShape) -> Option<Shape> {
     None
 }
 
-// ---- Validation ----
-
-/// What `Transform` must be: a finite translation and a unit quaternion, to within the
-/// tolerance the test backend uses.
-pub(crate) fn valid_transform(transform: &Transform) -> bool {
-    let unit = (transform.rotation.length_squared() - Scalar::ONE).abs() < Scalar::from_f64(1e-6);
-    transform.translation.is_finite() && transform.rotation.is_finite() && unit
-}
-
-pub(crate) fn valid_velocity(velocity: &Velocity) -> bool {
-    velocity.linear.is_finite() && velocity.angular.is_finite()
-}
-
-fn non_negative(value: Scalar) -> bool {
-    value.is_finite() && value >= Scalar::ZERO
-}
-
-fn positive(value: Scalar) -> bool {
-    value.is_finite() && value > Scalar::ZERO
-}
-
-pub(crate) fn valid_shape(shape: &Shape) -> bool {
-    match shape.kind {
-        ShapeKind::Sphere => positive(shape.radius),
-        ShapeKind::Capsule => positive(shape.radius) && non_negative(shape.half_extents.y),
-        ShapeKind::Cuboid => shape.half_extents.to_array().into_iter().all(positive),
-    }
-}
-
-pub(crate) fn valid_body(body: &RigidBody) -> bool {
-    non_negative(body.mass)
-        && non_negative(body.linear_damping)
-        && non_negative(body.angular_damping)
-        && body.gravity_scale.is_finite()
-        && body.locked_axes & !(locked_axes::TRANSLATION | locked_axes::ROTATION) == 0
-}
-
-pub(crate) fn valid_collider(collider: &Collider) -> bool {
-    let unit = (collider.rotation.length_squared() - Scalar::ONE).abs() < Scalar::from_f64(1e-6);
-    valid_shape(&collider.shape)
-        && collider.offset.is_finite()
-        && collider.rotation.is_finite()
-        && unit
-        && non_negative(collider.friction)
-        && non_negative(collider.restitution)
-        && non_negative(collider.density)
-        && non_negative(collider.impact_threshold)
-}
-
-/// Finite anchors, a non-zero finite axis and finite ordered limits when limited.
-pub(crate) fn valid_joint(joint: &Joint) -> bool {
-    let limits = !joint.limited
-        || (joint.limit_min.is_finite()
-            && joint.limit_max.is_finite()
-            && joint.limit_min <= joint.limit_max);
-    // A fixed or spherical joint never reads its axis, so a zero one is no error there.
-    let axis = match joint.kind {
-        JointKind::Fixed | JointKind::Spherical => true,
-        JointKind::Revolute | JointKind::Prismatic => joint.axis.try_normalize().is_some(),
-    };
-    joint.anchor_a.is_finite()
-        && joint.anchor_b.is_finite()
-        && joint.axis.is_finite()
-        && axis
-        && limits
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -271,7 +203,7 @@ mod tests {
             Shape::cuboid(Vec3::new(Scalar::ONE, Scalar::from_f64(0.25), Scalar::from_i32(50))),
         ];
         for shape in shapes {
-            assert!(valid_shape(&shape));
+            assert_eq!(shape.validate(), Ok(()));
             let read = shape_of(&shared_shape(&shape)).expect("a shape this crate builds");
             assert!(same(&read, &shape), "{shape:?} read back as {read:?}");
         }

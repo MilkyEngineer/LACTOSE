@@ -1,6 +1,7 @@
 //! The conformance suite a backend's test crate runs (architecture sections 10 and 20):
 //! the snapshot-and-restore run that `lactose-physics-rapier` must pass before this crate
-//! is frozen, as a function so that every backend runs the same scene under every layout.
+//! is frozen, as a function so that every backend runs the same scene under every layout,
+//! and the [`validity`] run that holds a backend to the rules of `README.md`, "Validity".
 //!
 //! ```no_run
 //! use lactose_ecs::{Executor, LayoutConfig};
@@ -25,19 +26,20 @@ use lactose_ecs::{
     ChannelWriter, ClaimedBy, Commands, Executor, LayoutConfig, Mut, OwnedBy, RegionConfig,
     RegionId, RegionMode, Res, StableKeyOf, SystemSet, World, WorldKind, system,
 };
-use lactose_math::{Scalar, Vec3};
+use lactose_math::{Quat, Scalar, Vec3};
 use lactose_sim::{
     CurrentTick, Registration, Simulation, SimulationBuilder, Stage, TickInput, TypeTable,
 };
 
-use crate::backend::PhysicsBackend;
-use crate::command::{PhysicsCommands, PhysicsExt};
+use crate::backend::{BodyDesc, PhysicsBackend, StepInput, StepOutput};
+use crate::command::{PhysicsCommand, PhysicsCommands, PhysicsExt};
 use crate::components::{
     BodyHandle, BodyType, Collider, Joint, JointHandle, JointKind, RigidBody, Shape, Transform,
-    Velocity,
+    Velocity, locked_axes,
 };
 use crate::service::{PhysicsConfig, register_types, restore, setup, snapshot};
 use crate::systems::register_systems;
+use crate::validity::Invalid;
 
 /// How many ticks the run simulates.
 pub const TICKS: u32 = 10;
@@ -421,4 +423,374 @@ fn react(cmd: Commands, key: StableKeyOf, now: Res<CurrentTick>, body: &RigidBod
     cmd.spawn((at, Velocity::ZERO, *body, Collider::new(Shape::sphere(Scalar::HALF))));
     cmd.despawn(sphere(1));
     cmd.set(sphere(2), Transform::at(Vec3::new(Scalar::from_i32(-20), Scalar::TWO, Scalar::ZERO)));
+}
+
+// ---- The validity run ----
+
+/// The bytes of `backend`'s world.
+fn bytes(backend: &dyn PhysicsBackend) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    backend.snapshot(&mut out)?;
+    Ok(out)
+}
+
+fn mismatch(what: impl Into<String>) -> Error {
+    Error::new(ErrorKind::InvalidData, what.into())
+}
+
+/// What a creating call must have done with a value the rules refuse: returned the
+/// `Invalid` as an `InvalidData` error whose message is the `Invalid`'s.
+fn refused_as(what: &str, result: Result<()>, expected: &Invalid) -> Result<()> {
+    match result {
+        Ok(()) => Err(mismatch(format!("{what}: accepted, but the rules refuse it: {expected}"))),
+        Err(error) if error.kind() != ErrorKind::InvalidData => {
+            Err(mismatch(format!("{what}: refused with {:?}, not InvalidData", error.kind())))
+        }
+        Err(error) if error.message() != expected.to_string() => Err(mismatch(format!(
+            "{what}: refused with the message {:?}, not the rules' {:?}",
+            error.message(),
+            expected.to_string()
+        ))),
+        Err(_) => Ok(()),
+    }
+}
+
+/// The description of a dynamic body with `collider` at `transform`, at rest.
+fn described<'a>(transform: &'a Transform, collider: &'a Collider) -> BodyDesc<'a> {
+    BodyDesc {
+        body: Some(RigidBody::dynamic()),
+        collider: Some(collider),
+        transform,
+        velocity: None,
+        frozen: false,
+    }
+}
+
+fn vec(x: f64, y: f64, z: f64) -> Vec3 {
+    Vec3::new(scalar(x), scalar(y), scalar(z))
+}
+
+/// One edit of a valid value that breaks a rule.
+type Edit<T> = fn(&mut T);
+
+/// A rotation about nothing whose squared length is one plus `off`.
+fn off_unit(off: f64) -> Quat {
+    Quat::new(Scalar::ZERO, Scalar::ZERO, Scalar::ZERO, scalar((1.0 + off).sqrt()))
+}
+
+/// Holds `backend` to the validity rules (`README.md`, "Validity"; D135): what the
+/// predicates refuse, the backend refuses or ignores with the predicates' message and
+/// without touching its world, and what they accept, it accepts. The backend is driven
+/// directly, with no world, so a backend's test crate calls it once per pool size.
+///
+/// The run: two dynamic unit spheres are created and the world's bytes are taken. Then,
+/// for a table that breaks each rule of each predicate at least once, every refused
+/// [`Transform`], [`Velocity`], [`RigidBody`] and [`Collider`] goes through `create_body`
+/// in the description of a third body (`InvalidData` with the `Invalid`'s message) and
+/// through its `set_*` on the first sphere (ignored); every refused [`Joint`] goes through
+/// `create_joint` between the two spheres (`InvalidData`), and a valid one between the
+/// first sphere and itself (`InvalidData`); after every call the bytes equal those taken.
+/// Then each refused [`PhysicsCommand`] is the one command of a step under no gravity,
+/// after which the first sphere, if reported, is where it was created, at rest and not
+/// teleported. Last, the edges the rules accept (a rotation off unit by half the
+/// tolerance, a negated identity, a zero mass, a negative gravity scale, every axis
+/// locked, a capsule of zero half height, zero coefficients, a restitution above one, a
+/// fixed or spherical joint with a zero axis, a revolute joint about a scaled axis, equal
+/// limits) go through `create_body` and `create_joint` and are accepted.
+///
+/// Fails with `InvalidData` naming the first value the backend treated otherwise.
+pub fn validity(mut backend: Box<dyn PhysicsBackend>) -> Result<()> {
+    let nan = vec(f64::NAN, 0.0, 0.0);
+    let ball = Collider::new(Shape::sphere(Scalar::HALF));
+    let edited_body = |edit: Edit<RigidBody>| {
+        let mut body = RigidBody::dynamic();
+        edit(&mut body);
+        body
+    };
+    let edited_collider = |edit: Edit<Collider>| {
+        let mut collider = ball;
+        edit(&mut collider);
+        collider
+    };
+    let (first, second, third, joint_key) = (sphere(0), sphere(1), sphere(2), sphere(3));
+    let origin = Transform::at(vec(0.0, 5.0, 0.0));
+    backend.create_body(first, &described(&origin, &ball))?;
+    backend.create_body(second, &described(&Transform::at(vec(3.0, 5.0, 0.0)), &ball))?;
+    let baseline = bytes(&*backend)?;
+    let unchanged = |backend: &dyn PhysicsBackend, what: &str| -> Result<()> {
+        if bytes(backend)? == baseline {
+            Ok(())
+        } else {
+            Err(mismatch(format!("{what}: the refused call changed the backend's bytes")))
+        }
+    };
+    let rules_accept = |what: &str| mismatch(format!("{what}: the rules accept it"));
+
+    let transforms = [
+        ("a NaN translation", Transform::at(nan)),
+        ("an infinite translation", Transform::at(vec(0.0, f64::INFINITY, 0.0))),
+        (
+            "a NaN rotation",
+            Transform::new(
+                Vec3::ZERO,
+                Quat::new(scalar(f64::NAN), Scalar::ZERO, Scalar::ZERO, Scalar::ONE),
+            ),
+        ),
+        ("a rotation off unit by twice the tolerance", Transform::new(Vec3::ZERO, off_unit(2e-6))),
+        (
+            "a zero rotation",
+            Transform::new(
+                Vec3::ZERO,
+                Quat::new(Scalar::ZERO, Scalar::ZERO, Scalar::ZERO, Scalar::ZERO),
+            ),
+        ),
+    ];
+    for (what, transform) in &transforms {
+        let expected = transform.validate().err().ok_or_else(|| rules_accept(what))?;
+        let create = format!("create_body with {what}");
+        let result = backend.create_body(third, &described(transform, &ball)).map(|_| ());
+        refused_as(&create, result, &expected)?;
+        unchanged(&*backend, &create)?;
+        backend.set_transform(first, transform);
+        unchanged(&*backend, &format!("set_transform with {what}"))?;
+    }
+
+    let velocities = [
+        ("a NaN linear velocity", Velocity { linear: nan, angular: Vec3::ZERO }),
+        (
+            "an infinite angular velocity",
+            Velocity { linear: Vec3::ZERO, angular: vec(0.0, 0.0, f64::NEG_INFINITY) },
+        ),
+    ];
+    for (what, velocity) in &velocities {
+        let expected = velocity.validate().err().ok_or_else(|| rules_accept(what))?;
+        let create = format!("create_body with {what}");
+        let desc = BodyDesc { velocity: Some(velocity), ..described(&origin, &ball) };
+        refused_as(&create, backend.create_body(third, &desc).map(|_| ()), &expected)?;
+        unchanged(&*backend, &create)?;
+        backend.set_velocity(first, velocity);
+        unchanged(&*backend, &format!("set_velocity with {what}"))?;
+    }
+
+    let bodies: [(&str, Edit<RigidBody>); 6] = [
+        ("a NaN mass", |b| b.mass = Scalar::from_f64(f64::NAN)),
+        ("a negative mass", |b| b.mass = -Scalar::ONE),
+        ("a negative linear damping", |b| b.linear_damping = -Scalar::HALF),
+        ("a negative angular damping", |b| b.angular_damping = -Scalar::HALF),
+        ("a NaN gravity scale", |b| b.gravity_scale = Scalar::from_f64(f64::NAN)),
+        ("an unknown locked-axes bit", |b| b.locked_axes = 1 << 6),
+    ];
+    for (what, edit) in bodies {
+        let body = edited_body(edit);
+        let expected = body.validate().err().ok_or_else(|| rules_accept(what))?;
+        let create = format!("create_body with {what}");
+        let desc = BodyDesc { body: Some(body), ..described(&origin, &ball) };
+        refused_as(&create, backend.create_body(third, &desc).map(|_| ()), &expected)?;
+        unchanged(&*backend, &create)?;
+        backend.set_body(first, Some(&body));
+        unchanged(&*backend, &format!("set_body with {what}"))?;
+    }
+
+    let colliders: [(&str, Edit<Collider>); 11] = [
+        ("a zero sphere radius", |c| c.shape = Shape::sphere(Scalar::ZERO)),
+        ("a negative capsule radius", |c| c.shape = Shape::capsule(Scalar::HALF, -Scalar::ONE)),
+        ("a negative capsule half height", |c| {
+            c.shape = Shape::capsule(-Scalar::HALF, Scalar::ONE)
+        }),
+        ("a zero cuboid extent", |c| {
+            c.shape = Shape::cuboid(Vec3::new(Scalar::ONE, Scalar::ZERO, Scalar::ONE));
+        }),
+        ("a NaN in a shape field the kind does not read", |c| {
+            c.shape.half_extents.x = Scalar::from_f64(f64::NAN);
+        }),
+        ("a NaN offset", |c| {
+            c.offset = Vec3::new(Scalar::from_f64(f64::NAN), Scalar::ZERO, Scalar::ZERO)
+        }),
+        ("a non-unit collider rotation", |c| {
+            c.rotation = Quat::new(Scalar::ZERO, Scalar::ZERO, Scalar::ZERO, Scalar::TWO);
+        }),
+        ("a negative friction", |c| c.friction = -Scalar::HALF),
+        ("a negative restitution", |c| c.restitution = -Scalar::HALF),
+        ("a negative density", |c| c.density = -Scalar::ONE),
+        ("a negative impact threshold", |c| c.impact_threshold = -Scalar::ONE),
+    ];
+    for (what, edit) in colliders {
+        let collider = edited_collider(edit);
+        let expected = collider.validate().err().ok_or_else(|| rules_accept(what))?;
+        let create = format!("create_body with {what}");
+        let desc = BodyDesc { collider: Some(&collider), ..described(&origin, &ball) };
+        refused_as(&create, backend.create_body(third, &desc).map(|_| ()), &expected)?;
+        unchanged(&*backend, &create)?;
+        backend.set_collider(first, Some(&collider));
+        unchanged(&*backend, &format!("set_collider with {what}"))?;
+    }
+
+    let joint = |kind: JointKind| Joint::new(kind, first, second);
+    let joints = [
+        ("a NaN anchor", joint(JointKind::Spherical).with_anchors(nan, Vec3::ZERO)),
+        ("a zero revolute axis", joint(JointKind::Revolute).with_axis(Vec3::ZERO)),
+        ("a zero prismatic axis", joint(JointKind::Prismatic).with_axis(Vec3::ZERO)),
+        (
+            "reversed limits on a fixed joint",
+            joint(JointKind::Fixed).with_limits(Scalar::HALF, -Scalar::HALF),
+        ),
+        (
+            "reversed limits on a spherical joint",
+            joint(JointKind::Spherical).with_limits(Scalar::HALF, -Scalar::HALF),
+        ),
+        (
+            "reversed limits on a revolute joint",
+            joint(JointKind::Revolute).with_limits(Scalar::HALF, -Scalar::HALF),
+        ),
+        ("a NaN limit on an unlimited joint", {
+            let mut unlimited = joint(JointKind::Fixed);
+            unlimited.limit_max = Scalar::from_f64(f64::NAN);
+            unlimited
+        }),
+    ];
+    for (what, value) in &joints {
+        let expected = value.validate().err().ok_or_else(|| rules_accept(what))?;
+        let create = format!("create_joint with {what}");
+        let result = backend.create_joint(joint_key, value, first, second).map(|_| ());
+        refused_as(&create, result, &expected)?;
+        unchanged(&*backend, &create)?;
+    }
+    let same = "create_joint between a body and itself";
+    match backend.create_joint(joint_key, &joint(JointKind::Fixed), first, first) {
+        Ok(_) => return Err(mismatch(format!("{same}: accepted"))),
+        Err(error) if error.kind() != ErrorKind::InvalidData => {
+            return Err(mismatch(format!(
+                "{same}: refused with {:?}, not InvalidData",
+                error.kind()
+            )));
+        }
+        Err(_) => unchanged(&*backend, same)?,
+    }
+
+    let commands = [
+        ("a NaN impulse", PhysicsCommand::ApplyImpulse { body: first, impulse: nan }),
+        (
+            "a NaN point",
+            PhysicsCommand::ApplyImpulseAt { body: first, impulse: Vec3::X, point: nan },
+        ),
+        ("a NaN torque impulse", PhysicsCommand::ApplyTorqueImpulse { body: first, torque: nan }),
+        ("a NaN force", PhysicsCommand::ApplyForce { body: first, force: nan }),
+        ("a NaN torque", PhysicsCommand::ApplyTorque { body: first, torque: nan }),
+        (
+            "a teleport to a NaN",
+            PhysicsCommand::Teleport { body: first, transform: Transform::at(nan) },
+        ),
+        (
+            "a teleport with a non-unit rotation",
+            PhysicsCommand::Teleport {
+                body: first,
+                transform: Transform::new(Vec3::ZERO, off_unit(2e-6)),
+            },
+        ),
+    ];
+    let mut output = StepOutput::default();
+    for (tick, (what, command)) in (1..).zip(commands) {
+        if command.validate().is_ok() {
+            return Err(rules_accept(what));
+        }
+        let input = StepInput {
+            tick: Tick(tick),
+            dt: scalar(1.0 / 60.0),
+            gravity: Vec3::ZERO,
+            commands: std::slice::from_ref(&command),
+        };
+        output.clear();
+        backend.step(&input, &mut output);
+        if let Some(state) = output.bodies.iter().find(|state| state.key == first)
+            && (state.transform != origin || state.velocity != Velocity::ZERO || state.teleported)
+        {
+            return Err(mismatch(format!("a step with {what} moved the body: {state:?}")));
+        }
+    }
+
+    let minus_identity = Quat::new(Scalar::ZERO, Scalar::ZERO, Scalar::ZERO, -Scalar::ONE);
+    let accepted: [(&str, Transform, RigidBody, Collider); 7] = [
+        (
+            "a rotation off unit by half the tolerance",
+            Transform::new(vec(0.0, 9.0, 0.0), off_unit(0.5e-6)),
+            RigidBody::dynamic(),
+            ball,
+        ),
+        (
+            "a negated identity rotation",
+            Transform::new(vec(0.0, 11.0, 0.0), minus_identity),
+            RigidBody::dynamic(),
+            ball,
+        ),
+        (
+            "a zero mass and a negative gravity scale",
+            Transform::at(vec(0.0, 13.0, 0.0)),
+            edited_body(|b| {
+                b.mass = Scalar::ZERO;
+                b.gravity_scale = -Scalar::ONE;
+            }),
+            ball,
+        ),
+        (
+            "every axis locked",
+            Transform::at(vec(0.0, 15.0, 0.0)),
+            edited_body(|b| b.locked_axes = locked_axes::TRANSLATION | locked_axes::ROTATION),
+            ball,
+        ),
+        (
+            "a capsule of zero half height",
+            Transform::at(vec(0.0, 17.0, 0.0)),
+            RigidBody::kinematic(),
+            Collider::new(Shape::capsule(Scalar::ZERO, Scalar::HALF)),
+        ),
+        (
+            "zero coefficients",
+            Transform::at(vec(0.0, 19.0, 0.0)),
+            RigidBody::fixed(),
+            edited_collider(|c| {
+                c.friction = Scalar::ZERO;
+                c.restitution = Scalar::ZERO;
+                c.density = Scalar::ZERO;
+                c.impact_threshold = Scalar::ZERO;
+            }),
+        ),
+        (
+            "a restitution above one",
+            Transform::at(vec(0.0, 21.0, 0.0)),
+            RigidBody::dynamic(),
+            edited_collider(|c| c.restitution = Scalar::from_f64(7.0)),
+        ),
+    ];
+    for (index, (what, transform, body, collider)) in accepted.iter().enumerate() {
+        let desc = BodyDesc { body: Some(*body), ..described(transform, collider) };
+        if let Err(invalid) = desc.validate() {
+            return Err(mismatch(format!("{what}: the rules refuse it: {invalid}")));
+        }
+        let key = sphere(10 + u32::try_from(index).map_err(|_| mismatch("too many edges"))?);
+        backend
+            .create_body(key, &desc)
+            .map_err(|error| mismatch(format!("create_body with {what}: refused: {error}")))?;
+    }
+    let accepted_joints = [
+        ("a fixed joint with a zero axis", joint(JointKind::Fixed).with_axis(Vec3::ZERO)),
+        ("a spherical joint with a zero axis", joint(JointKind::Spherical).with_axis(Vec3::ZERO)),
+        (
+            "a revolute joint about a scaled axis",
+            joint(JointKind::Revolute).with_axis(vec(0.0, 0.0, 3.0)),
+        ),
+        (
+            "a prismatic joint with equal limits",
+            joint(JointKind::Prismatic).with_limits(Scalar::HALF, Scalar::HALF),
+        ),
+    ];
+    for (what, value) in &accepted_joints {
+        if let Err(invalid) = value.validate() {
+            return Err(mismatch(format!("{what}: the rules refuse it: {invalid}")));
+        }
+        backend
+            .create_joint(joint_key, value, first, second)
+            .map_err(|error| mismatch(format!("create_joint with {what}: refused: {error}")))?;
+        backend.remove_joint(joint_key);
+    }
+    Ok(())
 }

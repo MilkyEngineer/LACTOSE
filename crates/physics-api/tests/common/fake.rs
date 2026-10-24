@@ -21,9 +21,9 @@ use lactose_core::{Error, ErrorKind, NetId, PlayerId, PredictionKey, Result, Sta
 use lactose_math::{Canonical, Quat, Scalar, Vec3};
 use lactose_physics_api::{
     BodyDesc, BodyHandle, BodyState, BodyType, Collider, CollisionGroups, ContactEvent,
-    ContactPhase, Joint, JointHandle, JointKind, PhysicsBackend, PhysicsCommand, QueryFilter, Ray,
-    RayHit, RigidBody, Shape, ShapeHit, ShapeKind, StepInput, StepOutput, Transform, TriggerEvent,
-    Velocity,
+    ContactPhase, Invalid, Joint, JointHandle, JointKind, PhysicsBackend, PhysicsCommand,
+    QueryFilter, Ray, RayHit, RigidBody, Shape, ShapeHit, ShapeKind, StepInput, StepOutput,
+    Transform, TriggerEvent, Velocity,
 };
 
 /// One call the backend received.
@@ -211,34 +211,11 @@ fn invalid(message: &'static str) -> Error {
     Error::new(ErrorKind::InvalidData, message)
 }
 
-fn valid_transform(transform: &Transform) -> bool {
-    let unit = (transform.rotation.length_squared() - Scalar::ONE).abs() < Scalar::from_f64(1e-6);
-    transform.translation.is_finite() && transform.rotation.is_finite() && unit
-}
-
-fn valid_joint(joint: &Joint) -> bool {
-    let limits = !joint.limited
-        || (joint.limit_min.is_finite()
-            && joint.limit_max.is_finite()
-            && joint.limit_min <= joint.limit_max);
-    let axis = match joint.kind {
-        JointKind::Fixed | JointKind::Spherical => true,
-        JointKind::Revolute | JointKind::Prismatic => joint.axis.try_normalize().is_some(),
-    };
-    joint.anchor_a.is_finite()
-        && joint.anchor_b.is_finite()
-        && joint.axis.is_finite()
-        && axis
-        && limits
-}
-
-fn valid_shape(shape: &Shape) -> bool {
-    let positive = |value: Scalar| value > Scalar::ZERO && value.is_finite();
-    match shape.kind {
-        ShapeKind::Sphere => positive(shape.radius),
-        ShapeKind::Capsule => positive(shape.radius) && shape.half_extents.y >= Scalar::ZERO,
-        ShapeKind::Cuboid => shape.half_extents.to_array().into_iter().all(positive),
-    }
+/// What every `set_*` does with a value the rules refuse: logs it and ignores the call.
+/// The rules are `lactose_physics_api`'s predicates and nothing of the fake's own
+/// (`README.md`, "Validity").
+fn ignored(call: &'static str, key: StableKey, invalid: Invalid) {
+    tracing::debug!(target: "physics", %invalid, ?key, "ignored {call}");
 }
 
 /// The radius of a sphere around the shape's centre that holds it.
@@ -303,14 +280,9 @@ impl PhysicsBackend for Fake {
         });
         assert!(!self.state.bodies.contains_key(&key), "create_body for a key the backend holds");
         assert!(desc.body.is_some() || desc.collider.is_some(), "a body with neither part");
-        if !valid_transform(desc.transform) {
-            return Err(invalid("not a valid transform"));
-        }
-        if desc.collider.is_some_and(|collider| !valid_shape(&collider.shape)) {
-            return Err(invalid("not a valid shape"));
-        }
-        if desc.body.is_some_and(|body| body.mass.is_nan() || body.mass < Scalar::ZERO) {
-            return Err(invalid("not a valid mass"));
+        if let Err(invalid) = desc.validate() {
+            tracing::debug!(target: "physics", %invalid, ?key, "refused body");
+            return Err(invalid.into());
         }
         let handle = self.handle();
         let body = Body {
@@ -341,6 +313,9 @@ impl PhysicsBackend for Fake {
 
     fn set_body(&mut self, key: StableKey, body: Option<&RigidBody>) {
         self.calls.push(Call::SetBody(key, body.copied()));
+        if let Some(invalid) = body.and_then(|body| body.validate().err()) {
+            return ignored("set_body", key, invalid);
+        }
         if let Some(held) = self.body_mut(key)
             && held.body.as_ref() != body
         {
@@ -351,6 +326,9 @@ impl PhysicsBackend for Fake {
 
     fn set_collider(&mut self, key: StableKey, collider: Option<&Collider>) {
         self.calls.push(Call::SetCollider(key, collider.copied()));
+        if let Some(invalid) = collider.and_then(|collider| collider.validate().err()) {
+            return ignored("set_collider", key, invalid);
+        }
         if let Some(held) = self.body_mut(key)
             && held.collider.as_ref() != collider
         {
@@ -361,8 +339,8 @@ impl PhysicsBackend for Fake {
 
     fn set_transform(&mut self, key: StableKey, transform: &Transform) {
         self.calls.push(Call::SetTransform(key, *transform));
-        if !valid_transform(transform) {
-            return;
+        if let Err(invalid) = transform.validate() {
+            return ignored("set_transform", key, invalid);
         }
         if let Some(held) = self.body_mut(key)
             && held.transform != *transform
@@ -379,6 +357,9 @@ impl PhysicsBackend for Fake {
 
     fn set_velocity(&mut self, key: StableKey, velocity: &Velocity) {
         self.calls.push(Call::SetVelocity(key, *velocity));
+        if let Err(invalid) = velocity.validate() {
+            return ignored("set_velocity", key, invalid);
+        }
         if let Some(held) = self.body_mut(key)
             && held.velocity != *velocity
             && held.kind() != BodyType::Kinematic
@@ -411,8 +392,12 @@ impl PhysicsBackend for Fake {
             self.state.bodies.contains_key(&body_a) && self.state.bodies.contains_key(&body_b),
             "create_joint between bodies the backend does not hold"
         );
-        if !valid_joint(joint) || body_a == body_b {
-            return Err(invalid("not a valid joint"));
+        if let Err(invalid) = joint.validate() {
+            tracing::debug!(target: "physics", %invalid, ?key, "refused joint");
+            return Err(invalid.into());
+        }
+        if body_a == body_b {
+            return Err(invalid("a joint between a body and itself"));
         }
         let handle = self.handle();
         self.state.joints.insert(key, JointRow { handle, kind: joint.kind, body_a, body_b });
@@ -431,6 +416,10 @@ impl PhysicsBackend for Fake {
         );
         let dt = input.dt;
         for command in input.commands {
+            if let Err(invalid) = command.validate() {
+                tracing::debug!(target: "physics", %invalid, key = ?command.body(), "dropped command");
+                continue;
+            }
             let Some(body) = self.body_mut(command.body()) else { continue };
             if let PhysicsCommand::Teleport { transform, .. } = *command {
                 body.transform = transform;

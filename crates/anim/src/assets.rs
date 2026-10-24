@@ -7,9 +7,9 @@
 use std::borrow::Cow;
 
 use lactose_asset_api::{Asset, AssetId, AssetKind, AssetRef, Loader, SimulationAsset};
-use lactose_core::{Error, ErrorKind, Result};
+use lactose_core::{Error, ErrorKind, Result, StableKey};
 use lactose_math::{Quat, Scalar, Vec3};
-use lactose_physics_api::{Collider, JointKind, RigidBody, ShapeKind, locked_axes};
+use lactose_physics_api::{Collider, Invalid, Joint, JointKind, RigidBody, Transform};
 
 use crate::codec;
 
@@ -227,7 +227,7 @@ impl Clip {
             )));
         }
         for (index, sample) in self.samples.iter().enumerate() {
-            pose_is_valid(sample).map_err(|what| invalid(format!("sample {index}: {what}")))?;
+            check_pose(sample).map_err(|what| invalid(format!("sample {index}: {what}")))?;
         }
         for (index, entry) in self.root.iter().enumerate() {
             if !entry.translation.is_finite() || !entry.yaw.is_finite() {
@@ -504,6 +504,40 @@ pub struct BoneJoint {
     pub limits: Option<(Scalar, Scalar)>,
 }
 
+impl BoneJoint {
+    /// The joint row [`Bones::spawn`](crate::Bones::spawn) writes for this joint between
+    /// the ancestor's row `above` and the bone's row `bone`: what [`Skeleton::validate`]
+    /// holds to `Joint::validate`, so the row the backend is handed is the value checked.
+    pub(crate) fn row(&self, above: StableKey, bone: StableKey) -> Joint {
+        let joint = Joint::new(self.kind, above, bone)
+            .with_anchors(self.anchor_parent, self.anchor_bone)
+            .with_axis(self.axis);
+        match self.limits {
+            Some((min, max)) => joint.with_limits(min, max),
+            None => joint,
+        }
+    }
+}
+
+impl BoneBody {
+    /// Whether every physics backend accepts the rows [`Bones::spawn`](crate::Bones::spawn)
+    /// writes for this body: `RigidBody::validate`, `Collider::validate` and
+    /// `Joint::validate` on the joint row (the rules of `crates/physics-api/README.md`,
+    /// "Validity", which this crate does not restate), the first failure named by field and
+    /// rule.
+    fn check(&self) -> core::result::Result<(), Invalid> {
+        self.body.validate()?;
+        self.collider.validate()?;
+        match &self.joint {
+            // The keys are not read by the rule; the row's are resolved at spawn.
+            Some(joint) => {
+                joint.row(StableKey::Placeholder(0), StableKey::Placeholder(1)).validate()
+            }
+            None => Ok(()),
+        }
+    }
+}
+
 /// A point hung off a bone: a weapon grip, a shield mount, a camera target. An offset, not
 /// a bone, so it costs no evaluation and does not count against [`MAX_SIM_BONES`].
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -550,19 +584,15 @@ impl Skeleton {
     /// joint only on a bone that has a body, and a body's joint reaching an ancestor with a
     /// body (the ragdoll's root body alone has none); the OR of every body's
     /// `groups.membership` and the OR of every body's `groups.filter` sharing no bit (the
-    /// bone rule, [`BoneBody::collider`]);
-    /// every rest and socket rotation a unit quaternion and every scalar finite; and every
-    /// [`BoneBody`] one the physics backend accepts, so no bone's body is refused at every
-    /// sync (the row's rotation, a product down the chain, is normalised where it is
-    /// written): the mass and both dampings non-negative; `locked_axes` within
-    /// `locked_axes::TRANSLATION | locked_axes::ROTATION`; a sphere's radius positive, a
-    /// capsule's radius positive and its half height (`half_extents.y`) non-negative, a
-    /// cuboid's three half extents positive; the collider's rotation a unit quaternion;
-    /// friction, restitution, density and the impact threshold non-negative; a revolute or
-    /// prismatic joint's axis non-zero; a limited joint's `min` at most its `max`. These
-    /// are the rules of `lactose-physics-rapier`'s conversion, the backend `physics-api`'s
-    /// validity statement ("a NaN, a non-unit quaternion, a negative extent") leaves to.
-    /// `InvalidData` otherwise, naming the first failure.
+    /// bone rule, [`BoneBody::collider`]); every rest and socket pose one
+    /// `Transform::validate` accepts as a row's transform (finite, a unit rotation within
+    /// `UNIT_TOLERANCE`); and every [`BoneBody`] one every physics backend accepts, so no
+    /// bone's body is refused at every sync: `RigidBody::validate`, `Collider::validate`
+    /// and `Joint::validate` on the joint row [`Bones::spawn`](crate::Bones::spawn) writes,
+    /// the rules of `crates/physics-api/README.md`, "Validity" (D135), which this crate
+    /// does not restate (the row's rotation, a product down the chain, is normalised where
+    /// it is written). `InvalidData` otherwise, naming the bone and the first failure by
+    /// field and rule.
     pub fn validate(&self) -> Result<()> {
         let bones = self.bones.len();
         if bones == 0 || bones > MAX_SIM_BONES {
@@ -590,9 +620,9 @@ impl Skeleton {
             {
                 return Err(fail("another bone has its role"));
             }
-            pose_is_valid(&bone.rest).map_err(|what| fail(&format!("the rest pose: {what}")))?;
+            check_pose(&bone.rest).map_err(|what| fail(&format!("the rest pose: {what}")))?;
             let Some(body) = &bone.body else { continue };
-            body_is_valid(body).map_err(fail)?;
+            body.check().map_err(|what| fail(&what.to_string()))?;
             if body.joint.is_some() && self.body_above(index).is_none() {
                 return Err(fail("the joint reaches no ancestor with a body"));
             }
@@ -609,7 +639,7 @@ impl Skeleton {
             if usize::from(socket.bone) >= bones {
                 return Err(invalid(format!("socket {index}: the bone is past the bones")));
             }
-            pose_is_valid(&socket.offset)
+            check_pose(&socket.offset)
                 .map_err(|what| invalid(format!("socket {index}: the offset: {what}")))?;
         }
         Ok(())
@@ -667,95 +697,11 @@ pub(crate) struct Cursor {
     t: Option<Scalar>,
 }
 
-/// The tolerance of the unit-quaternion check on the squared length: the one the physics
-/// backend applies to the rotations it is handed.
-const UNIT_TOLERANCE: Scalar = Scalar::from_f64(1e-6);
-
-/// Whether `pose` is finite with a unit rotation.
-fn pose_is_valid(pose: &BonePose) -> core::result::Result<(), &'static str> {
-    if !pose.translation.is_finite() || !pose.rotation.is_finite() {
-        return Err("a scalar is not finite");
-    }
-    if (pose.rotation.length_squared() - Scalar::ONE).abs() >= UNIT_TOLERANCE {
-        return Err("the rotation is not a unit quaternion");
-    }
-    Ok(())
-}
-
-/// Whether the physics backend accepts `body`: every scalar finite, then the rules
-/// [`Skeleton::validate`] lists, which are `lactose-physics-rapier`'s `valid_body`,
-/// `valid_collider`, `valid_shape` and `valid_joint` over the rows `Bones::spawn` writes.
-fn body_is_valid(body: &BoneBody) -> core::result::Result<(), &'static str> {
-    body_is_finite(body)?;
-    let non_negative = |value: Scalar| value >= Scalar::ZERO;
-    let positive = |value: Scalar| value > Scalar::ZERO;
-    let rigid = &body.body;
-    if ![rigid.mass, rigid.linear_damping, rigid.angular_damping].into_iter().all(non_negative) {
-        return Err("the body's mass or damping is negative");
-    }
-    if rigid.locked_axes & !(locked_axes::TRANSLATION | locked_axes::ROTATION) != 0 {
-        return Err("the body's locked axes name an unknown bit");
-    }
-    let collider = &body.collider;
-    let shape = &collider.shape;
-    let extents = match shape.kind {
-        ShapeKind::Sphere => positive(shape.radius),
-        ShapeKind::Capsule => positive(shape.radius) && non_negative(shape.half_extents.y),
-        ShapeKind::Cuboid => shape.half_extents.to_array().into_iter().all(positive),
-    };
-    if !extents {
-        return Err("the collider's shape has a zero or negative extent");
-    }
-    if (collider.rotation.length_squared() - Scalar::ONE).abs() >= UNIT_TOLERANCE {
-        return Err("the collider's rotation is not a unit quaternion");
-    }
-    let coefficients =
-        [collider.friction, collider.restitution, collider.density, collider.impact_threshold];
-    if !coefficients.into_iter().all(non_negative) {
-        return Err("the collider's friction, restitution, density or threshold is negative");
-    }
-    let Some(joint) = &body.joint else { return Ok(()) };
-    let axial = matches!(joint.kind, JointKind::Revolute | JointKind::Prismatic);
-    if axial && joint.axis.try_normalize().is_none() {
-        return Err("the joint's axis is zero");
-    }
-    if joint.limits.is_some_and(|(min, max)| min > max) {
-        return Err("the joint's lower limit is above its upper");
-    }
-    Ok(())
-}
-
-/// Whether every scalar of `body` is finite.
-fn body_is_finite(body: &BoneBody) -> core::result::Result<(), &'static str> {
-    let rigid = &body.body;
-    let collider = &body.collider;
-    let scalars = [
-        rigid.mass,
-        rigid.linear_damping,
-        rigid.angular_damping,
-        rigid.gravity_scale,
-        collider.shape.radius,
-        collider.friction,
-        collider.restitution,
-        collider.density,
-        collider.impact_threshold,
-    ];
-    let vectors = [collider.shape.half_extents, collider.offset];
-    let joint = body.joint.is_none_or(|joint| {
-        joint.anchor_parent.is_finite()
-            && joint.anchor_bone.is_finite()
-            && joint.axis.is_finite()
-            && joint.limits.is_none_or(|(min, max)| min.is_finite() && max.is_finite())
-    });
-    if scalars.iter().all(|scalar| scalar.is_finite())
-        && vectors.iter().all(|vector| vector.is_finite())
-        && collider.rotation.is_finite()
-        && joint
-    {
-        Ok(())
-    } else {
-        Err("a scalar of the body is not finite")
-    }
+/// Whether `pose` is one `Transform::validate` accepts as a row's transform: finite, with a
+/// unit rotation within `lactose_physics_api::UNIT_TOLERANCE`. The failure names the
+/// transform's field, `Transform::translation` or `Transform::rotation`.
+fn check_pose(pose: &BonePose) -> core::result::Result<(), Invalid> {
+    Transform::new(pose.translation, pose.rotation).validate()
 }
 
 /// An `InvalidData` error.

@@ -23,7 +23,8 @@ use lactose_ecs::{ClaimedBy, OwnedBy, WorldKind};
 
 use lactose_math::{Quat, Scalar, Vec3};
 use lactose_physics_api::{
-    BodyType, Collider, CollisionGroups, Joint, JointKind, RigidBody, Shape, Transform, locked_axes,
+    BodyType, Collider, CollisionGroups, Joint, JointKind, RigidBody, Shape, Transform,
+    UNIT_TOLERANCE, locked_axes,
 };
 
 const LOOP_CLIP: AssetRef<Clip> = clip_ref("bones/loop");
@@ -346,7 +347,8 @@ fn validate_refuses_bodies_whose_memberships_meet_their_filters() {
 }
 
 /// `Skeleton::validate` refuses a body the physics backend would refuse at every sync, one
-/// case per class of `physics-rapier`'s rules, and accepts the edges those rules accept.
+/// case per rule of `physics-api`'s predicates, naming the bone and the predicate's field
+/// and rule, and accepts the edges those rules accept.
 #[test]
 fn validate_refuses_a_body_the_backend_would_refuse() {
     type Edit = fn(&mut BoneBody);
@@ -357,27 +359,48 @@ fn validate_refuses_a_body_the_backend_would_refuse() {
         skeleton
     };
     let refused: [(Edit, &str); 17] = [
-        (|b| b.collider.shape = Shape::sphere(s(0.0)), "zero or negative extent"),
-        (|b| b.collider.shape = Shape::sphere(s(-0.1)), "zero or negative extent"),
+        (|b| b.collider.shape = Shape::sphere(s(0.0)), "`Shape::radius` is not positive"),
+        (|b| b.collider.shape = Shape::sphere(s(-0.1)), "`Shape::radius` is not positive"),
         // `capsule(half_height, radius)`: a zero radius, then a negative half height.
-        (|b| b.collider.shape = Shape::capsule(s(0.1), s(0.0)), "zero or negative extent"),
-        (|b| b.collider.shape = Shape::capsule(s(-0.1), s(0.1)), "zero or negative extent"),
-        (|b| b.collider.shape = Shape::cuboid(v(0.1, 0.0, 0.1)), "zero or negative extent"),
-        (|b| b.collider.shape = Shape::cuboid(v(0.1, 0.1, -0.1)), "zero or negative extent"),
+        (|b| b.collider.shape = Shape::capsule(s(0.1), s(0.0)), "`Shape::radius` is not positive"),
+        (
+            |b| b.collider.shape = Shape::capsule(s(-0.1), s(0.1)),
+            "`Shape::half_extents.y` is not zero or positive",
+        ),
+        (
+            |b| b.collider.shape = Shape::cuboid(v(0.1, 0.0, 0.1)),
+            "`Shape::half_extents.y` is not positive",
+        ),
+        (
+            |b| b.collider.shape = Shape::cuboid(v(0.1, 0.1, -0.1)),
+            "`Shape::half_extents.z` is not positive",
+        ),
         (
             |b| b.collider.rotation = Quat::new(s(0.0), s(0.0), s(0.0), s(2.0)),
-            "rotation is not a unit quaternion",
+            "`Collider::rotation` is not a unit quaternion",
         ),
-        (|b| b.body.mass = s(-1.0), "mass or damping is negative"),
-        (|b| b.body.linear_damping = s(-0.5), "mass or damping is negative"),
-        (|b| b.body.angular_damping = s(-0.5), "mass or damping is negative"),
-        (|b| b.body.locked_axes = 1 << 6, "unknown bit"),
-        (|b| b.collider.friction = s(-0.1), "is negative"),
-        (|b| b.collider.restitution = s(-0.1), "is negative"),
-        (|b| b.collider.density = s(-1.0), "is negative"),
-        (|b| b.collider.impact_threshold = s(-1.0), "is negative"),
-        (|b| b.joint.as_mut().unwrap().limits = Some((s(0.5), s(-0.5))), "lower limit"),
-        (|b| b.collider.shape.radius = s(f64::NAN), "not finite"),
+        (|b| b.body.mass = s(-1.0), "`RigidBody::mass` is not zero or positive"),
+        (
+            |b| b.body.linear_damping = s(-0.5),
+            "`RigidBody::linear_damping` is not zero or positive",
+        ),
+        (
+            |b| b.body.angular_damping = s(-0.5),
+            "`RigidBody::angular_damping` is not zero or positive",
+        ),
+        (|b| b.body.locked_axes = 1 << 6, "`RigidBody::locked_axes` is not within the known"),
+        (|b| b.collider.friction = s(-0.1), "`Collider::friction` is not zero or positive"),
+        (|b| b.collider.restitution = s(-0.1), "`Collider::restitution` is not zero or positive"),
+        (|b| b.collider.density = s(-1.0), "`Collider::density` is not zero or positive"),
+        (
+            |b| b.collider.impact_threshold = s(-1.0),
+            "`Collider::impact_threshold` is not zero or positive",
+        ),
+        (
+            |b| b.joint.as_mut().unwrap().limits = Some((s(0.5), s(-0.5))),
+            "`Joint::limit_min` is not at most `limit_max`",
+        ),
+        (|b| b.collider.shape.radius = s(f64::NAN), "`Shape::radius` is not finite"),
     ];
     for (index, (edit, message)) in refused.into_iter().enumerate() {
         let error = with(edit).validate().unwrap_err();
@@ -398,7 +421,7 @@ fn validate_refuses_a_body_the_backend_would_refuse() {
         let result = skeleton.validate();
         assert_eq!(result.is_ok(), accepted, "{kind:?}: {result:?}");
         if let Err(error) = result {
-            assert!(error.message().contains("the joint's axis is zero"), "{error}");
+            assert!(error.message().contains("`Joint::axis` is not a direction"), "{error}");
         }
     }
     // The edges the rules accept: no mass, a capsule of zero half height (a sphere), every
@@ -426,9 +449,9 @@ fn off_unit(q: Quat, excess: f64) -> Quat {
     Quat::new(q.x * k, q.y * k, q.z * k, q.w * k)
 }
 
-/// The test backend's unit test on a rotation, which physics-rapier's matches.
+/// The unit test on a rotation every backend applies, `Transform::validate`'s.
 fn unit(q: Quat) -> bool {
-    (q.length_squared() - Scalar::ONE).abs() < s(1e-6)
+    (q.length_squared() - Scalar::ONE).abs() < UNIT_TOLERANCE
 }
 
 /// Every rest and clip rotation within the unit tolerance on its own, so both `validate`s

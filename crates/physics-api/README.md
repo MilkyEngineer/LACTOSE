@@ -19,7 +19,8 @@ the contract the backend lane and the consumers meet, and every sentence under "
 the signatures cannot express" is one a dependent crate may rely on. Architecture
 sections 4, 5.3, 6.1, 8.2, 8.3, 9.4, 9.7, 10, 15.1, 16 and 17 are the design; where this
 file and the architecture disagree, the architecture wins and this file is wrong. Decision
-D119 records the choices those sections left open and what the two design reviews changed.
+D119 records the choices those sections left open and what the two design reviews changed;
+D135 records the validity rules ("Validity" below).
 `crates/ecs/README.md` and `crates/sim/README.md` are the contracts this crate builds on and never restates: what they
 say about commands, channels, events, change marks, the structural log, snapshots, stages
 and setup functions holds here unchanged.
@@ -49,6 +50,9 @@ build run for every world kind: a change that breaks it is a signature change to
 | `snapshot`, `restore`, `corrected`, `PhysicsSnapshot` | The physics world beside a `WorldSnapshot`, and how `predict` names what it corrected |
 | `conformance::{snapshot_restore, ConformanceReport, TICKS, SNAPSHOT_TICK, BODIES}` | The run a backend passes before this surface is frozen |
 | `conformance::empty_restore` | The run that shows a backend emptied and restored to its empty world's bytes steps as a new one does (D124) |
+| `Transform::validate`, `Velocity::validate`, `RigidBody::validate`, `Shape::validate`, `Collider::validate`, `Joint::validate`, `BodyDesc::validate`, `PhysicsCommand::validate` | Whether every backend accepts the value: the one implementation of the validity rules ("Validity" below), `Ok(())` or the first field that breaks a rule, applied by every backend and called by every crate that authors a body (D135) |
+| `Invalid`, `Rule`, `UNIT_TOLERANCE` | Why a value is refused, as a field and a rule, shown as `` `Type::field` is not <rule> `` and an `InvalidData` error through `From`; the tolerance of the unit-quaternion rule |
+| `conformance::validity` | The run that holds a backend to the validity rules: what the predicates refuse it refuses with their message or ignores, its world unchanged, and what they accept it accepts |
 
 Hidden plumbing: none. The three systems live in a private module and `sets` is the only
 way to order against them; the bookkeeping of `Physics` is private and "Snapshot and
@@ -68,15 +72,18 @@ constructors and accessors are `#[doc(hidden)]`: the backend's, not game code's.
 | | Ray, shape cast and overlap from any stage, deterministic | `Res<Physics>` and its `cast_ray`, `cast_shape`, `overlap`; results in origin keys and `Scalar`s ("Queries" below) |
 | | A derived handle, rebuilt on load | `BodyHandle` and `JointHandle`, written by the sync; `Option<&BodyHandle>` in a kernel says whether the entity is a live body, and nothing trusts the value |
 | | A transform without physics | `Transform` and `Velocity` are this crate's for every entity; a crate that needs them and no physics depends on this crate for the types, which pull no backend |
+| | Refusing authored data before it reaches a row, by the rules every backend applies | The `validate` of each type from a loader or the cooker, and the `Invalid` it names for the message ("Validity" below) |
 | `physics-rapier` | The trait: bodies and joints by key, the step over a slice of commands, snapshot and restore as bytes, queries | `PhysicsBackend`; `StepInput::commands` is `&[PhysicsCommand]`, so a backend's own test steps without a world; `StepOutput` takes the moved bodies and the events |
 | | The blocking wait and the solver pool | The step calls `PhysicsBackend::step` inside `Job::block_in_place` with `PhysicsConfig::reserved_workers`; the pool is the backend's own, built by `app` with frame worker count minus the reservation threads, at least one, and passed to the backend's constructor |
 | | Creation and removal of bodies as rows appear and disappear | The sync's: from the structural log, keyed by origin key, with the prediction-world rule and the region modes applied ("Bodies" below); the backend is told `create_body`, `remove_body`, `set_body`, `set_frozen` and holds no world-kind rule |
 | | How a backend is registered | `app` writes the `setup` closure and `register_systems` ("The registration" below); the backend crate exports a constructor and registers no system |
 | | The determinism obligations, and what is not yet shown | "The backend's obligations" below, and the `PhysicsBackend` docs |
 | | The conformance test | `conformance::snapshot_restore` and `conformance::empty_restore`, called from the backend's test crate with each pool size and each layout |
+| | What to refuse, where, and how to say it | `BodyDesc::validate` at `create_body`, `Joint::validate` at `create_joint`, the value's `validate` at each `set_*`, `PhysicsCommand::validate` on each command, and no rule of its own; `Invalid` into `Error` for the refusal ("Validity" below); `conformance::validity` from its test crate |
 | `predict` | `snapshot` and `restore` beside `WorldSnapshot`, with the same identity rule, sized for the budget | `snapshot(world)` after `World::snapshot`, `restore(world, &snap)` after `World::restore`; `PhysicsSnapshot::size_in_bytes` ("Snapshot and restore" below) |
 | | Re-simulation identical to the first run; corrections pushed to the solver | The snapshot carries the sync's pending work; `corrected(world, &keys)` after `restore` names the rows a correction wrote (stamped, under D122) |
 | `anim` | Ragdoll bodies and sockets: a named place and the types | Bone rows with `RigidBody::kinematic()` and a capsule `Collider` owned by the character, `Joint` rows owned by a bone, `Mut<RigidBody>` to go limp, `&Transform` in `Stage::Post` for sockets; `tests/consumers.rs`, section 2. Limited joints wait on the backend's verification item |
+| | Refusing a skeleton at load whose bodies a backend would refuse at every sync | `RigidBody::validate`, `Collider::validate` and `Joint::validate` on the rows `Bones::spawn` writes, `Transform::validate` on each rest, sample and socket pose, from `Skeleton::validate` and `Clip::validate`, with the `Invalid`'s text in the message ("Validity" below) |
 | `sim` and SOUR | The systems placed, readers after them, a setup function for the pool | `register_systems` places `sets::SYNC` and `sets::STEP` in `Stage::Physics` and `sets::WRITE_BACK` first in `Stage::Post`; `setup` is the setup function; `Res<TickDelta>` is the step's delta |
 | | Determinism as a contract on the backend; the conformance shape; the place for snapshot hashing | `PhysicsBackend` docs and "The backend's obligations"; `conformance::snapshot_restore` with its `LayoutConfig`; `PhysicsSnapshot::hash` and `ConformanceReport::physics_hash` |
 | `present-api`, `net` | The transform to extract and replicate, and the no-interpolate flag | `Transform` is `extracted` and `replicated`; `Teleported` is `persistent, extracted, replicated` and holds a tick to compare with the last one covered; `Velocity`, `RigidBody`, `Collider` and `Joint` are `replicated` |
@@ -170,8 +177,8 @@ system there. `app` orders any other exclusive `Stage::Post` system against
   `None`, and the handle stays. So a ragdoll goes limp by writing `body_type` through
   `Mut<RigidBody>`, and a fixed collider becomes a body by `cmd.set(key,
   RigidBody::dynamic())`. A `create_body` or `create_joint` the backend refuses
-  (`InvalidData`: a NaN, a non-unit quaternion, a negative extent) is logged and the row is
-  retried when it changes.
+  (`InvalidData`, with the `Invalid` the predicates name: "Validity" below) is logged and
+  the row is retried when it changes.
 - A body in a region whose mode is not `Simulated` is a fixed collider at its last pose
   (architecture section 9.7): the sync calls `set_frozen(key, true)` for every body of a
   region when its mode leaves `Simulated` and for a body moved into such a region, and
@@ -339,7 +346,8 @@ gather compare it with the last tick they covered, and zero means never.
   in every world that runs such systems, and a test does the same or records nothing.
 - A command for a key that is not a body when the step runs is dropped and logged at
   target `physics`. An impulse or force on a kinematic, fixed or frozen body is dropped
-  likewise. A `Teleport` works on every body.
+  likewise, and so is a command whose value `PhysicsCommand::validate` refuses ("Validity"
+  below). A `Teleport` works on every body.
 - `ApplyForce` and `ApplyTorque` act for one step alone; a sustained force is recorded
   every tick.
 
@@ -402,6 +410,87 @@ gather compare it with the last tick they covered, and zero means never.
 - Spawn a joint owned by one of its bodies (`OwnedBy`) so it migrates and despawns with
   it. Joint rows are `persistent, replicated`: a ragdoll's joints survive a save and are
   predicted with the bones.
+
+**Validity** (architecture sections 8.2 and 16; D135)
+
+- One set of rules says what a `Transform`, `Velocity`, `RigidBody`, `Shape`, `Collider`,
+  `Joint`, `BodyDesc` and `PhysicsCommand` must be for a backend to accept it. The rules
+  are stated here and implemented once, as the `validate` method of each type
+  (`src/validity.rs`); every backend applies those methods and no rule of its own, and
+  every crate that authors a body (`lactose-anim`'s skeleton and clip loaders now; the
+  cooker and a game's loaders when they exist) calls them at load, so one value is accepted
+  or refused the same way, with the same words, by every caller. A rule reads the fields
+  named below and nothing else: `RigidBody::body_type` and `can_sleep`, `Collider::groups`,
+  `sensor`, `events` and `material`, `Joint::body_a` and `body_b` and a command's `body`
+  are not read, and every value of theirs passes. Within a value every scalar a rule reads
+  is checked finite before any bound, so a NaN is reported as not finite and never as out
+  of a bound; the checks run in the order listed and the first failure is the answer.
+  Every comparison is an IEEE comparison on `Scalar`s, equal on every host and at either
+  scalar width.
+- `Transform`: `translation` finite; `rotation` finite and unit. *Unit* means
+  `(rotation.length_squared() - 1).abs() < UNIT_TOLERANCE` with `UNIT_TOLERANCE = 1e-6`,
+  strict, so a rotation off by exactly the tolerance is refused; the negated identity is
+  unit. A normalised quaternion is within a few units in the last place of one at either
+  width. A product of rotations down a chain is normalised by the crate that writes the
+  row (`lactose-anim`'s bone rows); the tolerance is no licence to skip that.
+- `Velocity`: `linear` and `angular` finite; no bound on their size.
+- `RigidBody`: `mass`, `linear_damping`, `angular_damping` and `gravity_scale` finite;
+  `mass`, `linear_damping` and `angular_damping` zero or positive (`-0.0` is zero);
+  `gravity_scale` of any sign; `locked_axes` with no bit outside
+  `locked_axes::TRANSLATION | locked_axes::ROTATION`.
+- `Shape`: `half_extents` and `radius` finite whatever the kind; then a sphere's `radius`
+  positive; a capsule's `radius` positive and its `half_extents.y` zero or positive (zero
+  is a sphere); a cuboid's `half_extents.x`, `.y` and `.z` each positive. A capsule's
+  `half_extents.x` and `.z` and a cuboid's `radius` are read for finiteness alone.
+- `Collider`: its `shape` as above; `offset` finite; `rotation` finite and unit;
+  `friction`, `restitution`, `density` and `impact_threshold` finite and zero or positive,
+  with no upper bound (a restitution above one passes). In that order: the shape, every
+  scalar finite, the unit rotation, the bounds.
+- `Joint`: `anchor_a`, `anchor_b`, `axis`, `limit_min` and `limit_max` finite whether the
+  kind reads them or not; a revolute or prismatic joint's `axis` a direction
+  (`Vec3::try_normalize` succeeds: a positive finite computed length, so the zero vector
+  and one whose squares underflow or overflow are refused; the length is otherwise free and
+  the backend normalises); a fixed or spherical joint's `axis` is read for finiteness
+  alone, so a zero axis passes there; when `limited`, `limit_min <= limit_max`, equal
+  allowed, whatever the kind; an unlimited joint's limits are read for finiteness alone.
+  The references are not read: that the two resolved ends are one body is a rule on keys
+  the predicate cannot see, which the backend applies at `create_joint` (`InvalidData`,
+  like a refused value) and the sync leaves to it; an empty reference parks the joint and
+  a reference to a non-body makes it wait ("Joints" above).
+- `BodyDesc`: its `transform`, then its `body`, `collider` and `velocity` where present,
+  each by its own rule, so two backends name one field for one description. That at least
+  one of `body` and `collider` is present is the sync's promise, not a rule.
+- `PhysicsCommand`: a `Teleport`'s `transform` as a `Transform`; an `impulse`, `point`,
+  `torque` or `force` finite, with no bound on size.
+- The answer is `Ok(())` or an `Invalid { field, rule }`: `field` as `Type::field`, with
+  the component after a dot when the rule is on one component of a vector
+  (`Shape::half_extents.y`), the type being the one that holds the field (a collider's
+  shape reports as `Shape::..`, a teleport's transform as `Transform::..`); `rule` one of
+  `Finite`, `Unit`, `NonNegative`, `Positive`, `Direction`, `KnownBits` and `Ordered`.
+  `Display` is `` `Type::field` is not <rule> `` (`` `Shape::radius` is not positive ``,
+  `` `Joint::limit_min` is not at most `limit_max` ``), and `From<Invalid> for Error` is
+  `InvalidData` with that text, so a backend's refusal and a loader's message agree to the
+  character. `Invalid` is `Copy`, `Eq`, `Hash` and `std::error::Error`.
+- What a backend does with a refused value, which `conformance::validity` checks:
+  `create_body` applies `BodyDesc::validate` and `create_joint` `Joint::validate` before
+  it touches anything and returns the `Invalid` as `InvalidData` with its message, its
+  world and snapshot bytes unchanged, and the sync logs the refusal and retries the row
+  when it changes ("Bodies" above); `set_body`, `set_collider`, `set_transform` and
+  `set_velocity` apply the value's `validate` and ignore a refused value, logged at target
+  `physics`, world unchanged; the step applies `PhysicsCommand::validate` to each command
+  and drops a refused one, logged, whatever body it names. No rule moves: the sync hands
+  rows over unchecked as before and the backend refuses them as before; what D135 changed
+  is that every backend, the test backend included, refuses one set of values with one
+  message, and a loader can refuse them first. A query's probe is not this crate's to
+  check: `physics-rapier` answers nothing (`None`, nothing appended) for a `Shape` or
+  `Transform` the predicates refuse, and the conformance run does not yet hold a backend
+  to that.
+- Two tightenings over what the backends refused before D135, both towards refusing more:
+  every scalar of a value is finite, read by its kind or not (a NaN in a sphere's
+  `half_extents`, a cuboid's `radius` or an unlimited joint's limits, which `lactose-anim`
+  refused and the backends let through); and the test backend refuses everything Rapier
+  refuses (it checked the transform, the shape and the mass alone), so a test written
+  against it sees what the real backend does with a bad row.
 
 **Snapshot and restore** (architecture section 10)
 
@@ -489,10 +578,11 @@ docs restate them per method)
   by CPU feature and is allowlisted as an explicit second exception beside `libm` because
   it is unreachable from the step: only multibody inverse kinematics reaches it, and the
   boundary lint file bans that entry point.
-- It validates every value it is given and never aborts on a row's bytes: an invalid value
-  is logged and the call does nothing, `create_body` and `create_joint` return
-  `InvalidData`. It compares before it mutates: an equal value changes nothing and wakes
-  nothing. It converts what reaches a row, an event or a query answer to `Scalar` exactly,
+- It validates every value it is given by this crate's predicates and by nothing else
+  ("Validity" above) and never aborts on a row's bytes: a refused value is logged and the
+  call does nothing, `create_body` and `create_joint` return the `Invalid` as
+  `InvalidData`; `conformance::validity` holds it to this. It compares before it mutates:
+  an equal value changes nothing and wakes nothing. It converts what reaches a row, an event or a query answer to `Scalar` exactly,
   and never produces a NaN in a persistent column deliberately.
 - The order of the lists in `StepOutput` is free; this crate sorts what is observable.
 - A call for a key it does not hold does nothing and logs at target `physics`; it never
@@ -553,6 +643,7 @@ Rapier, and the size and time of Rapier's snapshot bytes.
 | Snapshot and restore | `snapshot.rs`: `conformance::snapshot_restore` with the test backend under two pool sizes, the production layout and SOUR's, one and four workers, every report equal, the resumed run's backend calls equal to the first run's, and the scene's pending work, velocity write, command, limp bone, freeze and thaw each seen in them; probe B: the re-simulated syncs make the first run's calls and the rows are equal; probe C: a correction is pushed only when named through `corrected`; the predict loop with spawns, despawns, moves, commands, a claim and a release, re-run equal apart from the corrected key's two equal-value pushes; a world restored alone is diffed without clearing and keeps running; the 2^30 rebase diffs without clearing (probe D); a snapshot taken before the first sync restores into a full diff; another resource's snapshot and another tick's are refused and change nothing; `NotFound` without `Physics`; a second `setup` is refused; a scene with pending work at many ticks, a predicted body bound mid-run and one never bound, re-simulated from seven restore points under four layouts, one and four workers and two pool sizes, makes the first run's calls and rows; the unbound-predicted set is carried, emptied by binds and never looked up for a bound body (`src/service.rs` unit test) |
 | The write-back | `rows.rs`: only rows whose bytes changed are stamped; `Teleported` holds the teleport's tick across two further ticks (probe T); a key despawned at the post sync point is skipped; `cost.rs`: 100k entities with 2,000 moved bodies, the write-back stamping exactly the moved rows and the sync pushing none, the microseconds of both printed, and the sync of resting bodies by `Net`, bound predicted and unbound predicted keys; a body reported twice is written the same whichever copy comes first |
 | The scalar | The size assertions in `lib.rs`; `types.rs`: no component's layout holds a raw float, every hashed one registers with the world hasher, the handles are `derived` |
+| Validity | `src/validity.rs` unit tests: each rule of each predicate refused and its edges accepted (a rotation half the tolerance off unit, the negated identity, `-0.0` as zero, a negative gravity scale, every axis locked, a zero capsule half height, a restitution above one, a zero axis on a fixed or spherical joint, equal limits), the finite-before-bound order, the `BodyDesc` order, every `Rule` and `Invalid` text and the `InvalidData` conversion; `tests/validity.rs`: `conformance::validity` with the test backend under two pool sizes; `lactose-physics-rapier`'s `conformance.rs`: the same with Rapier; `lactose-anim`'s `bones.rs` and `format.rs`: `Skeleton::validate` and `Clip::validate` name the predicates' field and rule |
 | SOUR | `sour.rs`: a server scene and a prediction scene with a rollback, 150 ticks each, the re-simulated ticks recorded again (the runner requires them equal); and the rolled-back scene ending with the straight run's hashes; the rollback tick holds a post-stage spawn, a despawn and `cmd.set` writes of a transform and a velocity, the tick after it records a command, and a claimed row records `Physics::body_count` and whether that despawned sphere is a body every tick, so a restore that dropped any part of the carried work changes a hash, a lost removal included although the test backend never moves a row for the ghost body |
 | Reload | `reload.rs`: a same-frame reload of every region removes every body, restores the empty world and then makes a fresh process's calls; a one-region reload keeps the solver and the handle rows; a two-frame reload restores at the unload and creates in key order at the load; removals that empty the solver restore it and make the next sync a full diff; a reload across a restore sees the carried despawns; `set_tick` then the full frame makes a fresh client's calls, a one-region reload across `set_tick` keeps the solver and its handle rows, and a rollback to a slot taken after `set_tick` repeats the fresh rebuild; an impulse recorded in `Stage::Simulation` of the reload tick is in that tick's step in the reloaded world and in a fresh process (D126); a post-stage reaction carried by a persistent row and turned into an impulse by the next tick's simulation stage lands at the same step, with equal steps and world hashes, on the straight, one-frame, fresh-process, restore and two-frame paths (D126); `snapshot.rs`: `conformance::empty_restore` with the test backend under two layouts; `lactose-physics-rapier`'s `reload.rs` and `conformance.rs`: the same with Rapier, world hashes equal to a fresh process, and a kinematic body swept through a touching crate by a `Transform` written in `Stage::Post` where a carried `Teleport` places it (D126) |
 | The snapshot size | `cost.rs` prints `size_in_bytes` and `snapshot` time for 50 claimed bodies plus 0 to 10,000 statics; the test backend's bytes say nothing of Rapier's, which the backend lane measures against the 100 µs budget |

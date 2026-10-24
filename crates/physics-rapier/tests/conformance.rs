@@ -3,12 +3,16 @@
 //! layouts. Every run's report is equal: the world hashes of the first and the resumed run,
 //! the snapshot's size, and the physics bytes' hashes at the end of both runs. And the
 //! empty world's bytes: a backend emptied and restored to them steps as a new one does.
+//! And the validity run: what `physics-api`'s rules refuse, this backend refuses with
+//! their message or ignores, and what they accept, it accepts.
 
 #![forbid(unsafe_code)]
 
 use lactose_ecs::{Executor, LayoutConfig};
 use lactose_physics_api::PhysicsConfig;
-use lactose_physics_api::conformance::{SNAPSHOT_TICK, TICKS, empty_restore, snapshot_restore};
+use lactose_physics_api::conformance::{
+    SNAPSHOT_TICK, TICKS, empty_restore, snapshot_restore, validity,
+};
 use lactose_sim::harness::{ChunkCapacity, layout_mode};
 
 fn backend(threads: usize) -> Box<dyn lactose_physics_api::PhysicsBackend> {
@@ -55,5 +59,12 @@ fn an_emptied_backend_steps_as_a_new_one_under_every_pool_size_and_layout() {
     }
     for hashes in &runs[1..] {
         assert_eq!(*hashes, runs[0]);
+    }
+}
+
+#[test]
+fn the_backend_holds_to_the_validity_rules_under_every_pool_size() {
+    for threads in [1, 4] {
+        validity(backend(threads)).unwrap_or_else(|error| panic!("{threads} threads: {error}"));
     }
 }

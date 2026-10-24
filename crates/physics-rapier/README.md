@@ -72,11 +72,14 @@ the backend does not canonicalise.
 
 - A call with a value equal to the one recorded does nothing. Equality is bitwise on the
   canonical bits, so `0.0` and `-0.0` differ.
-- A value that fails validation (a non-finite scalar, a rotation that is not unit, a
-  negative mass, damping, density, friction, restitution or threshold, a non-positive shape
-  extent, an unknown locked-axis bit, a zero axis on a revolute or prismatic joint, limits
-  out of order, a joint between a body and itself) returns `InvalidData` from a creating
-  call and is logged and dropped by a setting call; the bookkeeping is unchanged either way.
+- Validation is `physics-api`'s and nothing of this crate's own (`crates/physics-api/
+  README.md`, "Validity"; D135): `BodyDesc::validate` at `create_body`, `Joint::validate`
+  at `create_joint`, the value's `validate` at each `set_*`, `PhysicsCommand::validate` on
+  each command, and `Shape::validate` and `Transform::validate` on a query's probe and on
+  a restored shape. A refused value returns the `Invalid` as `InvalidData`, with its
+  message, from a creating call, is logged and ignored by a setting call, and is dropped
+  from a step; a joint between a body and itself is refused likewise; the bookkeeping is
+  unchanged either way. `conformance::validity` holds this backend to it.
 - Every honoured write and command wakes the body. A kinematic body ignores velocity
   writes; a dynamic body in a frozen region keeps the velocity it was given for when it
   thaws.
