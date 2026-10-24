@@ -383,6 +383,9 @@ pub struct Options {
     pub setup: Option<fn(&mut lactose_ecs::World) -> Result<()>>,
     /// Whether physics-api's systems run, with the test backend behind them.
     pub physics: bool,
+    /// Whether the test backend looks for contacts: quadratic in the colliders, so a cost
+    /// scene turns it off, as every cost test over the backend does.
+    pub contacts: bool,
 }
 
 impl Options {
@@ -394,6 +397,7 @@ impl Options {
             systems: None,
             setup: None,
             physics: false,
+            contacts: true,
         }
     }
 
@@ -416,7 +420,8 @@ impl Options {
             .systems(lactose_anim::register_systems)
             .systems(register_recording);
         if self.physics {
-            let backend = Box::new(Fake::new(calls.clone()));
+            let fake = Fake::new(calls.clone());
+            let backend = Box::new(if self.contacts { fake } else { fake.without_contacts() });
             builder = builder
                 .setup(move |world| {
                     lactose_physics_api::setup(world, backend, PhysicsConfig::default())

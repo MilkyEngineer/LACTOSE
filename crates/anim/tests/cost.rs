@@ -4,7 +4,8 @@
 //! half of them mid cross-fade. (a) `SimPose::evaluate` over the 200 for 1,000 ticks; (b)
 //! `Simulation::step` of the world holding them against the same world whose characters
 //! lack `SimPose`, on one and four workers; (c) the same 200 with `Bones` and a body on
-//! every bone over the physics test backend, against the same scene without them. Asserts
+//! every bone, against the same scene without them, over the physics test backend with its
+//! contact search off and with no physics at all. Asserts
 //! on counts (every pose evaluated, half the characters blending, the bone rows there);
 //! timings are printed, never asserted: run it by hand in release on an idle machine,
 //! `cargo test -p lactose-anim --release --test cost -- --ignored --nocapture`, with
@@ -197,12 +198,15 @@ fn the_sim_skeleton_budget() {
         );
     }
 
-    // (c) Bodies on every bone over the physics test backend, against the same scene
-    // without them.
-    for workers in [1, 4] {
+    // (c) Bodies on every bone, against the same scene without them: over the physics test
+    // backend with its contact search off (quadratic in the colliders, it would time the
+    // backend), and with no physics at all, which leaves this crate's own share (the bone
+    // commands, the report scan and their application at the sync point).
+    for (workers, physics) in [(1, true), (4, true), (1, false), (4, false)] {
         let scene = |bones: bool| {
             let mut options = Options::new(WorldKind::Server);
-            options.physics = true;
+            options.physics = physics;
+            options.contacts = false;
             let mut fixture = options.build_on(executor(workers));
             fixture.assets(library(true).pin());
             for n in 1..=CHARACTERS {
@@ -226,9 +230,10 @@ fn the_sim_skeleton_budget() {
         let mut without = scene(false);
         let without_spans = spans(&mut without);
         let (with, without) = (median(with_spans), median(without_spans));
+        let over = if physics { "test backend, contacts off" } else { "no physics" };
         println!(
-            "(c) bones on every bone, test backend, {workers} worker(s): median {:.1} us with, \
-             {:.1} us without, {:.1} us of bone commands and bodies per tick",
+            "(c) a body on every bone, {over}, {workers} worker(s): median {:.1} us with, \
+             {:.1} us without, {:.1} us of bodies per tick",
             micros(with),
             micros(without),
             micros(with.saturating_sub(without))

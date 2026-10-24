@@ -1,7 +1,9 @@
 //! The cooked byte form of the three asset kinds (`README.md`, "Assets"): little-endian,
-//! every field at a fixed width in declaration order with no alignment and no padding,
-//! every scalar its canonical bits at the width of the build's `Scalar`, every count a
-//! `u32` before the elements it counts. Decoding reads integers and canonical bits and
+//! every field at a fixed width in the order listed below the README's statement of the
+//! form, which is not always the declaration order (`StateMachine::initial`, a
+//! `Transition`'s conditions and a `Shape`'s kind are not), with no alignment and no
+//! padding, every scalar its canonical bits at the width of the build's `Scalar`, every
+//! count a `u32` before the elements it counts. Decoding reads integers and canonical bits and
 //! nothing else: no float is parsed and no layout of the host is observed, so a decode is
 //! bit-identical on every host. A loader decodes, checks the declared dependencies against
 //! the assets the bytes name, then validates.

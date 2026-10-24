@@ -25,8 +25,9 @@ use lactose_physics_api::{BodyType, JointKind, ShapeKind};
 
 // ---- The encoder: the README's statement of the byte form ----
 
-/// Little-endian, fixed widths, declaration order, no padding; a scalar is its canonical
-/// bits at the build's width; a count is a `u32` before what it counts.
+/// Little-endian, fixed widths, in the order listed below the README's statement (not the
+/// declaration order), no padding; a scalar is its canonical bits at the build's width; a
+/// count is a `u32` before what it counts.
 #[derive(Default)]
 struct Writer(Vec<u8>);
 
@@ -615,6 +616,8 @@ fn every_clip_validation_failure_is_refused() {
         |c| c.root[2] = RootSample { translation: Vec3::ZERO, yaw: s(f64::INFINITY) },
         "root entry 2",
     );
+    refused_clip(|c| c.root[0].yaw = s(0.3), "root entry 0: the track does not start at");
+    refused_clip(|c| c.root[0].translation.x = s(0.5), "root entry 0: the track does not");
     refused_clip(|c| c.events[0].phase = Phase::END, "event 1: the events are not ascending");
 }
 
@@ -748,4 +751,207 @@ fn every_skeleton_validation_failure_is_refused() {
         |k| k.sockets[0].offset.rotation = Quat::from_array([s(0.0), s(0.0), s(0.0), s(2.0)]),
         "socket 0: the offset: the rotation",
     );
+}
+
+// ---- Golden bytes ----
+
+/// Eight-byte scalars' bits, written out: the golden bytes below are at that width.
+const F0: [u8; 8] = 0u64.to_le_bytes();
+const F1: [u8; 8] = 0x3FF0_0000_0000_0000u64.to_le_bytes();
+const F2: [u8; 8] = 0x4000_0000_0000_0000u64.to_le_bytes();
+const F_HALF: [u8; 8] = 0x3FE0_0000_0000_0000u64.to_le_bytes();
+const F_QUARTER: [u8; 8] = 0x3FD0_0000_0000_0000u64.to_le_bytes();
+/// The preamble of format version one at eight-byte scalars.
+const PREAMBLE: [u8; 8] = [1, 0, 0, 0, 8, 0, 0, 0];
+
+fn concat(pieces: &[&[u8]]) -> Vec<u8> {
+    pieces.concat()
+}
+
+/// One small asset of each kind against bytes written by hand from the README's per-kind
+/// lists, independent of the encoder above: each decodes to the expected value and the
+/// encoder writes exactly those bytes, so a swap or a width shared by the encoder and the
+/// decoder is caught here.
+#[test]
+fn one_asset_of_each_kind_matches_its_golden_bytes() {
+    use lactose_anim::{State, Transition};
+    use lactose_physics_api::{Collider, CollisionGroups, RigidBody, Shape, locked_axes};
+    assert_eq!(Scalar::BYTES, 8, "the golden bytes are at eight-byte scalars");
+    let skeleton_id = AssetId::from_bits(0x0102_0304_0506_0708);
+    let clip_id = AssetId::from_bits(0x31);
+
+    // A one-shot clip of two frames and one bone, its root entry zero the identity, and one
+    // event.
+    let clip = Clip {
+        skeleton: AssetRef::new(skeleton_id),
+        duration_ticks: 2,
+        frames: 2,
+        looping: false,
+        bones: 1,
+        samples: vec![
+            BonePose { translation: v(1.0, 0.0, 0.0), rotation: Quat::IDENTITY },
+            BonePose { translation: v(2.0, 0.0, 0.0), rotation: Quat::IDENTITY },
+        ],
+        root: vec![
+            RootSample { translation: Vec3::ZERO, yaw: Scalar::ZERO },
+            RootSample { translation: v(0.0, 0.0, 1.0), yaw: s(0.25) },
+        ],
+        events: vec![ClipEvent { phase: Phase(0x4000_0000), event: AnimEventKey(0x11) }],
+    };
+    let golden = concat(&[
+        &PREAMBLE,
+        &[8, 7, 6, 5, 4, 3, 2, 1], // skeleton
+        &[2, 0, 0, 0],             // duration_ticks
+        &[2, 0, 0, 0],             // frames
+        &[0],                      // looping
+        &[1],                      // bones
+        &[2, 0, 0, 0],             // two samples
+        &[F1, F0, F0, F0, F0, F0, F1].concat(),
+        &[F2, F0, F0, F0, F0, F0, F1].concat(),
+        &[2, 0, 0, 0], // two root entries
+        &[F0, F0, F0, F0].concat(),
+        &[F0, F0, F1, F_QUARTER].concat(),
+        &[1, 0, 0, 0], // one event
+        &[0, 0, 0, 0x40],
+        &[0x11, 0, 0, 0, 0, 0, 0, 0],
+    ]);
+    assert_eq!(load_clip(&golden, &[skeleton_id]).unwrap(), clip);
+    assert_eq!(encode_clip(&clip), golden);
+
+    // One state and a restart: `initial` first, a transition's conditions last.
+    let machine = StateMachine {
+        states: vec![State {
+            key: StateKey(0x21),
+            clip: AssetRef::new(clip_id),
+            speed: s(1.0),
+            speed_param: None,
+        }],
+        transitions: vec![Transition {
+            from: Some(0),
+            to: 0,
+            conditions: vec![Condition::Trigger(2), Condition::Above { param: 1, value: s(0.5) }],
+            blend_ticks: 4,
+            keep_phase: true,
+            entry_phase: Phase::ZERO,
+        }],
+        initial: 0,
+    };
+    let golden = concat(&[
+        &PREAMBLE,
+        &[0, 0],       // initial
+        &[1, 0, 0, 0], // one state
+        &[0x21, 0, 0, 0, 0, 0, 0, 0],
+        &[0x31, 0, 0, 0, 0, 0, 0, 0],
+        &F1,
+        &[0xFF],       // no speed parameter
+        &[1, 0, 0, 0], // one transition
+        &[0, 0],       // from
+        &[0, 0],       // to
+        &[4, 0],       // blend_ticks
+        &[1],          // keep_phase
+        &[0, 0, 0, 0], // entry_phase
+        &[2, 0, 0, 0], // two conditions
+        &[6, 2],       // Trigger(2)
+        &[3, 1],       // Above, parameter 1
+        &F_HALF,
+    ]);
+    assert_eq!(load_machine(&golden, &[clip_id]).unwrap(), machine);
+    assert_eq!(encode_machine(&machine), golden);
+
+    // One bone with a body and one socket: a shape's kind before its extents.
+    let mut body = RigidBody::dynamic();
+    body.mass = s(2.0);
+    body.linear_damping = s(0.5);
+    body.angular_damping = s(0.25);
+    body.gravity_scale = s(1.0);
+    body.locked_axes = locked_axes::ROTATION_X | locked_axes::ROTATION_Z;
+    body.can_sleep = true;
+    let mut collider = Collider::new(Shape::sphere(s(0.5)));
+    collider.offset = v(0.0, 0.25, 0.0);
+    collider.rotation = Quat::IDENTITY;
+    collider.friction = s(0.5);
+    collider.restitution = s(0.0);
+    collider.density = s(1.0);
+    collider.impact_threshold = s(0.0);
+    collider.groups = CollisionGroups::new(1, 2);
+    collider.sensor = false;
+    collider.events = true;
+    collider.material = 3;
+    let skeleton = Skeleton {
+        bones: vec![Bone {
+            key: BoneKey(0x41),
+            parent: None,
+            role: BoneRole::Hips,
+            rest: BonePose { translation: v(0.0, 1.0, 0.0), rotation: Quat::IDENTITY },
+            body: Some(BoneBody { body, collider, joint: None }),
+        }],
+        sockets: vec![Socket { key: BoneKey(0x51), bone: 0, offset: BonePose::IDENTITY }],
+    };
+    let golden = concat(&[
+        &PREAMBLE,
+        &[1, 0, 0, 0], // one bone
+        &[0x41, 0, 0, 0, 0, 0, 0, 0],
+        &[0xFF], // no parent
+        &[1],    // Hips
+        &[F0, F1, F0, F0, F0, F0, F1].concat(),
+        &[1], // a body
+        &[F2, F_HALF, F_QUARTER, F1].concat(),
+        &[0],    // dynamic
+        &[0x28], // ROTATION_X | ROTATION_Z
+        &[1],    // can_sleep
+        &[0],    // a sphere
+        &[F0, F0, F0].concat(),
+        &F_HALF, // radius
+        &[F0, F_QUARTER, F0].concat(),
+        &[F0, F0, F0, F1].concat(),
+        &[F_HALF, F0, F1, F0].concat(),
+        &[1, 0, 0, 0], // membership
+        &[2, 0, 0, 0], // filter
+        &[0],          // sensor
+        &[1],          // events
+        &[3, 0],       // material
+        &[0],          // no joint
+        &[1, 0, 0, 0], // one socket
+        &[0x51, 0, 0, 0, 0, 0, 0, 0],
+        &[0], // bone
+        &[F0, F0, F0, F0, F0, F0, F1].concat(),
+    ]);
+    assert_eq!(load_skeleton(&golden, &[]).unwrap(), skeleton);
+    assert_eq!(encode_skeleton(&skeleton), golden);
+}
+
+/// The largest machine the format holds, 65,534 states, is checked by sorting rather than
+/// pairwise; the result is the same first failure, in index order with the other checks.
+#[test]
+fn a_machine_of_65534_states_names_its_first_repeated_key() {
+    const STATES: usize = u16::MAX as usize - 1;
+    let mut machine = StateMachine {
+        states: (0..STATES)
+            .map(|index| {
+                let mut state = state("any", WALK, 1.0);
+                state.key = StateKey(u64::MAX - index as u64 * 7_919);
+                state
+            })
+            .collect(),
+        transitions: Vec::new(),
+        initial: 0,
+    };
+    machine.validate().unwrap();
+    let bytes = encode_machine(&machine);
+    assert_eq!(load_machine(&bytes, &[WALK.id()]).unwrap(), machine);
+    // Two repeats: 65,533 repeats 40,000's key and 50,000 repeats 3's; 50,000 is first.
+    machine.states[40_000].key = machine.states[STATES - 1].key;
+    machine.states[50_000].key = machine.states[3].key;
+    let error = machine.validate().unwrap_err();
+    assert_eq!(error.message(), "state 50000: another state has its key");
+    let error = load_machine(&encode_machine(&machine), &[WALK.id()]).unwrap_err();
+    assert_eq!(error.message(), "state 50000: another state has its key");
+    // An earlier state's other failure still comes first.
+    machine.states[45_000].speed = s(-1.0);
+    let error = machine.validate().unwrap_err();
+    assert_eq!(error.message(), "state 45000: the speed is negative or not finite");
+    machine.states[45_000].speed = s(1.0);
+    machine.states[50_000].key = StateKey(1);
+    let error = machine.validate().unwrap_err();
+    assert_eq!(error.message(), format!("state {}: another state has its key", STATES - 1));
 }

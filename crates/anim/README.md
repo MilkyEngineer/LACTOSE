@@ -216,8 +216,9 @@ exclusive and needs no edge: `anim::report_bones` in `sets::REPORT`
 4. Looks the state's `Clip` up (and the outgoing state's, during a blend). If either is
    missing or of the wrong kind: a hold, as in step 1, with the state as steps 2 and 3 left
    it, except that a hold on a tick whose step 2 entered does not mark the row held: that
-   tick reports the entry, and its entry phase as crossed, once, with `ticks_in_state` zero;
-   the held ticks after it report nothing, and the first advance once the clip is there
+   tick reports the entry, and its entry phase as crossed, once, with `ticks_in_state` zero,
+   and no `ClipEvent` fires, the clip's events not being there; the held ticks after it
+   report nothing, and the first advance once the clip is there
    passes `(ZERO, phase]` and does not report the entry phase again.
 5. Otherwise, unless the state was entered in step 2, tries the transitions in the
    machine's order, with `AnimState` and `AnimParams` as they are before this tick's
@@ -234,8 +235,8 @@ exclusive and needs no edge: `anim::report_bones` in `sets::REPORT`
    transition stands and the tick ends there as step 4's hold on an entry tick does: the
    row is not marked held, `ticks_in_state` stays zero, `RootMotion::ZERO` is written,
    nothing is emitted, the triggers are consumed (step 10, since the transitions were
-   tried), and the tick reports the entry, and a set entry phase as crossed, once; the
-   ticks after it, until the clip is there, are step 4's holds, and the first advance then
+   tried), and the tick reports the entry, and a set entry phase as crossed, once, with no
+   `ClipEvent` fired, the clip's events not being there; the ticks after it, until the clip is there, are step 4's holds, and the first advance then
    passes `(entry phase, phase]`. Not taking any: entered is cleared and `previous_phase`
    becomes the phase.
 6. `ticks_in_state` is incremented, saturating, and the held mark is cleared.
@@ -277,7 +278,7 @@ never leaves loops forever.
   `min(ceil(2^32 * q / (duration_ticks * 2^16)), u32::MAX)` in 128-bit integers; zero for a
   speed that is not finite, negative or zero, for a finite positive speed below `2^-16`
   (under one Q16.16 unit) and for a zero duration. The ceiling is part of the contract and
-  gives: a one-shot of `d` ticks holds `END` on tick `d` of its state;
+  gives, for `d` up to `2^16` ticks (18.2 minutes at 60 Hz): a one-shot of `d` ticks holds `END` on tick `d` of its state;
   `Phase::from_fraction(f, d)` is crossed on tick `f`; a loop of `d` ticks wraps on tick `d`
   of each cycle until the lead the ceiling adds, `d * rate - 2^32` units a cycle, sums to a
   rate: its `m`-th wrap, `m = ceil(rate / (d * rate - 2^32))`, comes one tick early, on tick
@@ -304,7 +305,11 @@ never leaves loops forever.
   whatever the rate, and a tick with no advance reports nothing: at rate zero the two phases
   are equal, and a held tick reads false for every mark (step 1).
 - `ClipEvent`s are passed by the same rule, so an authored event and a game's own mark at
-  the same phase fire on the same tick.
+  the same phase fire on the same tick, except on an entry tick whose clip is missing,
+  where `phase_crossed` reports a set entry phase and no `ClipEvent` fires, the clip's
+  events not being there (steps 4 and 5): an authored event at the entry phase is not
+  emitted for that entry, and the first advance once the clip is there passes only
+  `(entry phase, phase]`.
 - `Phase::fraction` is in `[0, 1]`: below one for every phase at eight-byte scalars, and
   `END` rounds to one at four-byte scalars.
 - A phase is a fraction, not a frame, so a re-cooked clip with another sample count or
@@ -318,7 +323,10 @@ never leaves loops forever.
 
 - A clip's root track is the root's pose per frame in character space at the clip's start,
   `frames + 1` entries for a loop (the last where the cycle ends: sample zero displaced by
-  the cycle's total motion) and `frames` for a one-shot, or empty. `Clip::root_motion(from,
+  the cycle's total motion) and `frames` for a one-shot, or empty. Entry zero is the
+  identity, the character at the clip's start, which `Clip::validate` checks: the wrap
+  below takes the last entry's yaw as the cycle's turn, which holds only from an unturned
+  entry zero. `Clip::root_motion(from,
   to)` gives the motion in the character's space at `from`, turning the track's difference
   back by the yaw already turned: `translation = R(-yaw(from)) * (track(to) - track(from))`
   and `yaw = yaw(to) - yaw(from)`, with `track` and `yaw` sampled by the rule of
@@ -409,7 +417,10 @@ never leaves loops forever.
   placeholders resolved at apply. The bone rows exist from the next sync point on and are
   bodies from the next physics sync point on, when the write-back also adds a `Velocity` to
   each swept row. The helper takes the character's current `Bones` and does nothing, logged,
-  when it is `Some`: a character has one set of bone rows. Called from a server-only system,
+  when it is `Some`: a character has one set of bone rows. It is called at most once per
+  owner per tick: the `Bones` it reads is the row as of the last sync point, which a call
+  earlier in the same tick has not written yet, so a second call in that tick records a
+  second set of rows that `Bones` does not name and nothing sweeps. Called from a server-only system,
   the spawns are not predicted: each row's origin key is a runtime `NetId` and no claim
   passes on (`crates/ecs/README.md`, "Keys"), so `lactose-predict`'s destruction of an
   unechoed predicted spawn never applies to them. `Bones::set_limp` is called from a
@@ -469,19 +480,17 @@ never leaves loops forever.
   `Bones` costs nothing in `Stage::Post`.
 - The cost of bodies, outside the evaluation budget: each animated character with bones
   records one command per bone body per tick, which the closing sync point applies as a
-  row write and the next physics sync pushes as a kinematic sweep. Measured on the facade's
-  ECS (review r1, release, no physics, 200 characters with sixteen bone rows each, on a
-  loaded machine): 0.25 to 0.28 µs per bone command, about 0.8 to 0.9 ms a tick for 3,200
-  bones at one and four workers; D119's figure of 0.8 µs per command is at 100k rows and
-  is about three times that. So 200 characters with eleven bodies each are about 0.6 ms of
-  a 4 ms tick before the sync's own scan and the solver's sweeps. The levers are the number
-  of bones with a `BoneBody` (hit volumes need few; a skeleton may give bodies to the head
-  and hands alone) and whether a character has `Bones` at all; the sim pose itself costs
-  none of it. `tests/cost.rs` records bodies as their own figure, over the physics test
-  backend: the bone commands, the sync's kinematic pushes and the test backend's own
-  bookkeeping together, not split, and not Rapier's solver. On the M1 it is about 9.5 ms a
-  tick for 3,200 bodies on a loaded machine ("Proof for milestone 1", the budget row), so a
-  body on every bone of 200 characters does not fit a 4 ms tick there.
+  row write and the next physics sync pushes as a kinematic sweep. `tests/cost.rs`
+  records it as its own figure, (c), for 200 characters with a body on each of sixteen
+  bones (3,200 bodies), in two parts ("Proof for milestone 1", the budget row): with no
+  physics, this crate's share (the bone commands, the report scan and their application at
+  the sync point) is about 1.4 ms a tick on the M1, about 0.43 µs a body; over the physics
+  test backend with its contact search off, about 3.3 to 3.4 ms, the difference being
+  `physics-api`'s sync and write-back and the test backend's bookkeeping. Neither is
+  Rapier's solver, so there is no conclusion on a 4 ms tick before a Rapier run. The
+  levers are the number of bones with a `BoneBody` (hit volumes need few; a skeleton may
+  give bodies to the head and hands alone) and whether a character has `Bones` at all; the
+  sim pose itself costs none of it.
 - Limited joints wait on the backend's verification item, as `physics-api` says; a
   `BoneJoint` with `limits` is authored data that the backend may refuse until then.
 
@@ -492,11 +501,14 @@ never leaves loops forever.
   loaders are pure decoders of their bytes, bit-identical on every host, which is the
   promise `SimulationAsset` makes, and each validates what it decoded with the type's
   `validate` (the doc comments list the checks: among them a negative or non-finite speed
-  refused, a restart transition allowed, the bone collider rule) and returns `InvalidData`
+  refused, a restart transition allowed, a root track whose entry zero is not the identity
+  refused, the bone collider rule, and every bone body one the physics backend accepts:
+  positive extents, a unit collider rotation, non-negative mass, damping and coefficients,
+  known locked-axes bits, a non-zero hinge or slider axis, ordered limits) and returns `InvalidData`
   otherwise. A clip's one dependency is its skeleton; a machine's are its states' clips; a
   skeleton has none.
 - The cooked byte form, `FORMAT_VERSION` one for each kind: little-endian, every field at
-  its fixed width in declaration order with no alignment and no padding; a scalar is its
+  its fixed width in the order listed below with no alignment and no padding; a scalar is its
   canonical bits (`Canonical`) at the width of the build's `Scalar` (S bytes), a `Vec3`
   three of them, a `Quat` four (x, y, z, w), a pose its translation then its rotation; an
   asset reference is its `u64` ID; a `bool` is one byte, 0 or 1; an optional index is
@@ -686,12 +698,12 @@ with recording systems, the physics test backend).
 | What | How |
 |---|---|
 | The state machine | `tests/machine.rs`: a machine with a loop, a one-shot, a `keep_phase` transition, a restart and a trigger: the transition order, one per tick, the entry tick's fields, a trigger consumed by the first advance that tries (not by the entry advance, not by a hold), `Finished` one tick after `END`, a blend's weight per tick and its end, a blend ended by a machine with fewer states; under three layouts and one and four workers, hashes equal |
-| Phase | `tests/phase.rs`: `rate` for the duration and speed cases in the contract, the Q16.16 path checked against a hand-computed f32 path for durations 1 to 600; a one-shot of `d` ticks at `END` on tick `d`, `from_fraction(f, d)` crossed on tick `f`, a loop wrapping on tick `d`; `advanced` wrapping and saturating; `passed` across the wrap and at `END`; `phase_crossed` once per pass at every rate, on the entry tick at a set entry phase (an entry whose clip is missing included), not at a kept one (the walk-to-run case), never on a held tick |
-| Events | `tests/events.rs`: authored events emitted once per pass in the order passed, across a wrap included, to the character's key, read by a later system; none from the outgoing clip |
-| Root motion | `tests/root_motion.rs`: a loop's motion over one cycle equals the track's total at every rate; a quarter-circle turning clip applied tick by tick with `apply` ends where it was authored within one unit in the last place per tick applied (measured at eight-byte scalars: 11 ulps after 60 ticks, 258 after 600); a one-shot's reaches its end; a blend interpolates; `apply` and `velocity` against a hand-composed transform |
+| Phase | `tests/phase.rs`: `rate` for the duration and speed cases in the contract, the Q16.16 path checked against a hand-computed f32 path for durations 1 to 600; a one-shot of `d` ticks at `END` on tick `d`, `from_fraction(f, d)` crossed on tick `f`, a loop wrapping on tick `d`; `advanced` wrapping and saturating; `passed` across the wrap and at `END`; `phase_crossed` once per pass at every rate, on the entry tick at a set entry phase (an entry whose clip is missing included), not at a kept one (the walk-to-run case), never on a held tick, and again on the first advance after a hold; the ceiling's one-shot consequence for every `d` up to `2^16` and sampled marks up to it, and the one-shot a tick early at `2^16 + 1` |
+| Events | `tests/events.rs`: authored events emitted once per pass in the order passed, across a wrap included, to the character's key, read by a later system; none from the outgoing clip; none at the entry phase of an entry whose clip is missing (an initial entry and a transition), with `phase_crossed` true there, and the events at that phase next on the tick an advance passes them, a cycle on |
+| Root motion | `tests/root_motion.rs`: a loop's motion over one cycle equals the track's total at every rate; a quarter-circle turning clip applied tick by tick with `apply` ends where it was authored within one unit in the last place per tick applied (measured at eight-byte scalars: 11 ulps after 60 ticks, 258 after 600); a one-shot's reaches its end; a blend interpolates; `apply` and `velocity` against a hand-composed transform; a looping turn's cycle sums to the track's turn, and a track whose entry zero is turned or moved refused |
 | Evaluation | `tests/evaluation.rs`: `evaluate` equals a hand-composed pose for a two-bone chain at authored phases, with and without a blend, bit for bit; `rest`; a clip for another skeleton gives `EMPTY`; a limp character's row is `EMPTY` after `sets::EVALUATE` and the fitted pose after `sets::FIT` in a server world, `EMPTY` all tick in a prediction world; the same bits under every layout and worker count |
-| Bones | `tests/bones.rs`: `spawn` from a server-only system records the stated rows and the `Bones` write, placeholders resolved, the rows' keys `NetId`s with no claim, nothing on a second call; the three `Stage::Post` systems run in a server world and not in a prediction world; `drive_bones` sweeps the kinematic bodies to the previous tick's pose, seen by the physics test backend; `set_limp` makes them dynamic, `report_bones` emits from limp rows alone, `fit_ragdoll` writes every bone, the unreported ones composed onto their fitted parents; `Skeleton::validate` refuses bodies whose memberships meet their filters, a pair with (membership 1, filter 2) and (membership 2, filter 1) included; a character without bones costs no command |
+| Bones | `tests/bones.rs`: `spawn` from a server-only system records the stated rows and the `Bones` write, placeholders resolved, the rows' keys `NetId`s with no claim, nothing on a second call on a later tick; the three `Stage::Post` systems run in a server world and not in a prediction world; `drive_bones` sweeps the kinematic bodies to the previous tick's pose, seen by the physics test backend; `set_limp` makes them dynamic, `report_bones` emits from limp rows alone, `fit_ragdoll` writes every bone, the unreported ones composed onto their fitted parents; `Skeleton::validate` refuses bodies whose memberships meet their filters, a pair with (membership 1, filter 2) and (membership 2, filter 1) included; `Skeleton::validate` refuses a body the physics backend would refuse, one case per class (a zero or negative extent of each shape, a non-unit collider rotation, a negative mass, damping or coefficient, an unknown locked-axes bit, limits with `min` above `max`, a zero revolute or prismatic axis) and accepts the edges the backend accepts; a character without bones costs no command |
 | Prediction | `tests/prediction.rs`, over the real `Predictor`: the build check over this crate's systems; a predicted character rolled back and re-simulated with the ring's inputs hashes equal to the straight run; a corrected `AnimState` re-simulates from the server's phase; a quantised speed parameter over a sweep of speeds, each against itself plus residuals of the sizes the tolerance absorbs: the count of differing quantised values is the count of grid midpoints straddled, and is a small fraction of the sweep (rarity, not agreement) |
-| The cooked byte form | `tests/format.rs`, with an encoder written from "Assets": each kind round trips through its loader and through `ErasedLoader`, bit for bit, at the stated byte counts; every truncation, trailing bytes, another format version or scalar width, a dependency list other than the named assets, an unknown tag, a `bool` byte other than 0 or 1, a count the bytes cannot hold, and every `validate` failure of the three kinds refused |
+| The cooked byte form | `tests/format.rs`, with an encoder written from "Assets": each kind round trips through its loader and through `ErasedLoader`, bit for bit, at the stated byte counts; every truncation, trailing bytes, another format version or scalar width, a dependency list other than the named assets, an unknown tag, a `bool` byte other than 0 or 1, a count the bytes cannot hold, and every `validate` failure of the three kinds refused; one asset of each kind against bytes written by hand, so a mistake the encoder and the decoder share is caught; a machine of 65,534 states round trips and names its first repeated key |
 | SOUR | `tests/sour.rs`: 200 characters with a sixteen-bone skeleton, a looping clip with events and root motion and a machine with triggers, 300 ticks, a game sketch driving the parameters and applying the root motion; a server crowd whose every twentieth character grows bones, goes limp and recovers over the physics test backend, and a prediction crowd rolled back at tick 100 and re-simulated; hashes recorded under workers, repeat, layout and chaos modes; `lactose-anim` listed under `[harness]` |
-| The budget | `tests/cost.rs`, an ignored test run by hand in release on the M1 and the x86 desktop: 200 characters without `Bones`, each a sixteen-bone skeleton and a 60-sample looping clip, half of them mid cross-fade; (a) `SimPose::evaluate` over the 200 for 1,000 ticks, median and best microseconds per tick; (b) `Simulation::step` of the world holding them against the same world whose characters lack the `SimPose` component (a character without it is never evaluated), one and four workers, the difference per tick; (c) the same 200 with `Bones` and a body on every bone over the physics test backend, against the same scene without them, the bodies' cost per tick (the bone commands, the sync's pushes and the backend's bookkeeping together), reported outside the criterion; all with `uptime`'s load averages. The criterion is section 22's: (b) at most 0.5 ms; (a) says how much of it is the evaluation and how much the ECS's dispatch, (c) what bodies add. If (b) misses, the first levers are the row write (skip `set_if_neq`-equal bones, which a holding character has) and the sample reads (a frame index cached per state), never the bone cap. Measured on the M1 (release, one run, load averages 17.96 23.48 17.58 before and 14.34 21.59 17.21 after, so on a heavily loaded machine): (a) median 161.9 µs, best 157.3 µs per tick; (b) 206.9 µs per tick at one worker (294.1 with `SimPose`, 87.2 without) and 196.8 µs at four (294.0, 97.3), inside the 0.5 ms criterion, most of it the evaluation (a); (c) 9,485.6 µs per tick at one worker (9,920.6 with, 435.0 without) and 13,545.3 µs at four (14,476.2, 930.9). The x86 desktop: not yet measured |
+| The budget | `tests/cost.rs`, an ignored test run by hand in release on the M1 and the x86 desktop: 200 characters without `Bones`, each a sixteen-bone skeleton and a 60-sample looping clip, half of them mid cross-fade; (a) `SimPose::evaluate` over the 200 for 1,000 ticks, median and best microseconds per tick; (b) `Simulation::step` of the world holding them against the same world whose characters lack the `SimPose` component (a character without it is never evaluated), one and four workers, the difference per tick; (c) the same 200 with `Bones` and a body on every bone against the same scene without them, the bodies' cost per tick, twice: over the physics test backend with its contact search off (quadratic in the colliders, it would time the backend; every cost test over the backend turns it off), and with no physics at all, which leaves this crate's share (the bone commands, the report scan and their application); reported outside the criterion; all with `uptime`'s load averages. The criterion is section 22's: (b) at most 0.5 ms; (a) says how much of it is the evaluation and how much the ECS's dispatch, (c) what bodies add. If (b) misses, the first levers are the row write (skip `set_if_neq`-equal bones, which a holding character has) and the sample reads (a frame index cached per state), never the bone cap. Measured on the M1 (release, one run, load averages 3.81 4.45 4.42 before and 3.10 4.23 4.34 after): (a) median 157.8 µs, best 150.9 µs per tick; (b) 196.9 µs per tick at one worker (282.9 with `SimPose`, 86.0 without) and 189.3 µs at four (289.5, 100.2), inside the 0.5 ms criterion, most of it the evaluation (a); (c) over the test backend, contacts off, 3,331.2 µs per tick at one worker (3,748.1 with, 416.9 without) and 3,382.1 µs at four (3,787.7, 405.6); with no physics, 1,372.3 µs at one worker (1,782.0, 409.7) and 1,380.8 µs at four (1,794.0, 413.2). No conclusion on a 4 ms tick before a Rapier run. The x86 desktop: not yet measured |

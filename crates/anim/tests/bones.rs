@@ -13,14 +13,17 @@ mod common;
 use common::fake::Call;
 use common::{
     Fixture, Library, MACHINE, Options, Ragdoll, RagdollAction, SKELETON, bone_body, chain, clip,
-    clip_ref, key, state, v,
+    clip_ref, key, s, state, v,
 };
-use lactose_anim::{AnimRig, BoneLink, Bones, Clip, SimPose, Skeleton, StateMachine};
+use lactose_anim::{AnimRig, BoneBody, BoneLink, Bones, Clip, SimPose, Skeleton, StateMachine};
 use lactose_asset_api::AssetRef;
 use lactose_core::{ErrorKind, StableKey};
 use lactose_ecs::{ClaimedBy, OwnedBy, WorldKind};
 
-use lactose_physics_api::{BodyType, Collider, CollisionGroups, Joint, RigidBody, Transform};
+use lactose_math::{Quat, Vec3};
+use lactose_physics_api::{
+    BodyType, Collider, CollisionGroups, Joint, JointKind, RigidBody, Shape, Transform, locked_axes,
+};
 
 const LOOP_CLIP: AssetRef<Clip> = clip_ref("bones/loop");
 const BONES: usize = 4;
@@ -334,4 +337,79 @@ fn validate_refuses_bodies_whose_memberships_meet_their_filters() {
     let mut free = chain(2, |_| true);
     free.bones[1].body = Some(bone_body(false));
     assert!(free.validate().is_ok());
+}
+
+/// `Skeleton::validate` refuses a body the physics backend would refuse at every sync, one
+/// case per class of `physics-rapier`'s rules, and accepts the edges those rules accept.
+#[test]
+fn validate_refuses_a_body_the_backend_would_refuse() {
+    type Edit = fn(&mut BoneBody);
+    let with = |edit: Edit| {
+        let mut skeleton = chain(2, |_| true);
+        let body = skeleton.bones[1].body.as_mut().unwrap();
+        edit(body);
+        skeleton
+    };
+    let refused: [(Edit, &str); 17] = [
+        (|b| b.collider.shape = Shape::sphere(s(0.0)), "zero or negative extent"),
+        (|b| b.collider.shape = Shape::sphere(s(-0.1)), "zero or negative extent"),
+        // `capsule(half_height, radius)`: a zero radius, then a negative half height.
+        (|b| b.collider.shape = Shape::capsule(s(0.1), s(0.0)), "zero or negative extent"),
+        (|b| b.collider.shape = Shape::capsule(s(-0.1), s(0.1)), "zero or negative extent"),
+        (|b| b.collider.shape = Shape::cuboid(v(0.1, 0.0, 0.1)), "zero or negative extent"),
+        (|b| b.collider.shape = Shape::cuboid(v(0.1, 0.1, -0.1)), "zero or negative extent"),
+        (
+            |b| b.collider.rotation = Quat::new(s(0.0), s(0.0), s(0.0), s(2.0)),
+            "rotation is not a unit quaternion",
+        ),
+        (|b| b.body.mass = s(-1.0), "mass or damping is negative"),
+        (|b| b.body.linear_damping = s(-0.5), "mass or damping is negative"),
+        (|b| b.body.angular_damping = s(-0.5), "mass or damping is negative"),
+        (|b| b.body.locked_axes = 1 << 6, "unknown bit"),
+        (|b| b.collider.friction = s(-0.1), "is negative"),
+        (|b| b.collider.restitution = s(-0.1), "is negative"),
+        (|b| b.collider.density = s(-1.0), "is negative"),
+        (|b| b.collider.impact_threshold = s(-1.0), "is negative"),
+        (|b| b.joint.as_mut().unwrap().limits = Some((s(0.5), s(-0.5))), "lower limit"),
+        (|b| b.collider.shape.radius = s(f64::NAN), "not finite"),
+    ];
+    for (index, (edit, message)) in refused.into_iter().enumerate() {
+        let error = with(edit).validate().unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::InvalidData, "case {index}: {error}");
+        assert!(error.message().contains(message), "case {index}: {error}");
+        assert!(error.message().contains("bone 1"), "case {index}: {error}");
+    }
+    // A zero axis is refused on the joints that read it and accepted on those that do not.
+    for (kind, accepted) in [
+        (JointKind::Revolute, false),
+        (JointKind::Prismatic, false),
+        (JointKind::Spherical, true),
+        (JointKind::Fixed, true),
+    ] {
+        let mut skeleton = chain(2, |_| true);
+        let joint = skeleton.bones[1].body.as_mut().unwrap().joint.as_mut().unwrap();
+        (joint.kind, joint.axis) = (kind, Vec3::ZERO);
+        let result = skeleton.validate();
+        assert_eq!(result.is_ok(), accepted, "{kind:?}: {result:?}");
+        if let Err(error) = result {
+            assert!(error.message().contains("the joint's axis is zero"), "{error}");
+        }
+    }
+    // The edges the rules accept: no mass, a capsule of zero half height (a sphere), every
+    // coefficient zero, every axis locked, equal limits.
+    let accepted: [Edit; 5] = [
+        |b| b.body.mass = s(0.0),
+        |b| b.collider.shape = Shape::capsule(s(0.0), s(0.1)),
+        |b| {
+            b.collider.friction = s(0.0);
+            b.collider.restitution = s(0.0);
+            b.collider.density = s(0.0);
+            b.collider.impact_threshold = s(0.0);
+        },
+        |b| b.body.locked_axes = locked_axes::TRANSLATION | locked_axes::ROTATION,
+        |b| b.joint.as_mut().unwrap().limits = Some((s(0.25), s(0.25))),
+    ];
+    for (index, edit) in accepted.into_iter().enumerate() {
+        assert!(with(edit).validate().is_ok(), "accepted case {index}");
+    }
 }

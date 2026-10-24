@@ -166,3 +166,76 @@ fn the_entry_at_a_set_phase_emits_the_events_there_first() {
         fixture.take_events().iter().map(|(_, e)| (e.phase, e.event)).collect();
     assert_eq!(events, [(Phase::HALF, AnimEventKey(3)), (Phase::HALF, AnimEventKey(4))]);
 }
+
+/// Steps 4 and 5 and "Phase and crossings": on an entry tick whose clip is missing,
+/// `phase_crossed` reports the set entry phase and no `ClipEvent` fires, the clip's events
+/// not being there; the first advance once it is there passes only `(entry phase, phase]`,
+/// so the events at the entry phase next fire a whole cycle later, passed by an advance.
+#[test]
+fn an_entry_whose_clip_is_missing_emits_nothing_at_its_entry_phase() {
+    let mut fixture = Fixture::new(WorldKind::Server);
+    fixture.assets(library().pin());
+    fixture.spawn(key(1), AnimRig::new(MACHINE, SKELETON));
+    fixture.set_params(key(1), |params| params.values[0] = s(1.0));
+    fixture.step();
+    fixture.set_params(key(1), |params| params.trigger(AWAY));
+    fixture.run(8);
+    assert_eq!((fixture.state(key(1)).state(), fixture.state(key(1)).blend()), (Some(1), None));
+    // Back to the loud state at half, its clip gone: the entry and the mark, no event.
+    fixture.assets(library().pin_without(&[EVENTS_CLIP.id()]));
+    fixture.set_params(key(1), |params| params.trigger(BACK));
+    fixture.take_events();
+    fixture.step();
+    let row = fixture.state(key(1));
+    assert_eq!(row.state(), Some(0));
+    assert!(row.entered() && row.entry_was_set() && row.phase_crossed(Phase::HALF));
+    assert!(fixture.take_events().is_empty(), "the clip's events are not there");
+    fixture.run(2);
+    assert!(fixture.take_events().is_empty(), "a hold emits nothing");
+    // The clip is back: its first advance passes (HALF, phase], not HALF.
+    fixture.assets(library().pin());
+    fixture.step();
+    let row = fixture.state(key(1));
+    assert_eq!(row.previous_phase(), Phase::HALF);
+    assert!(!row.phase_crossed(Phase::HALF));
+    assert!(fixture.take_events().iter().all(|(_, event)| event.phase != Phase::HALF));
+    // The marks at half fire again on the tick an advance passes them, a cycle on.
+    let mut ticks = 1;
+    loop {
+        fixture.step();
+        ticks += 1;
+        let at_half: Vec<AnimEventKey> = fixture
+            .take_events()
+            .iter()
+            .filter(|(_, event)| event.phase == Phase::HALF)
+            .map(|(_, event)| event.event)
+            .collect();
+        if !at_half.is_empty() {
+            let row = fixture.state(key(1));
+            assert!(!row.entered() && row.previous_phase() < Phase::HALF);
+            assert_eq!(at_half, [AnimEventKey(3), AnimEventKey(4)]);
+            assert_eq!(ticks, LOOP_TICKS, "a whole cycle after the arrival");
+            break;
+        }
+        assert!(ticks < 2 * LOOP_TICKS, "the marks at half fire again");
+    }
+}
+
+/// Step 4's entry tick: the initial state entered at zero with its clip missing reports
+/// the mark at zero and emits nothing; the first advance once the clip is there passes
+/// `(ZERO, phase]`, so the event at zero is not emitted for that entry.
+#[test]
+fn an_initial_entry_whose_clip_is_missing_emits_nothing_at_zero() {
+    let mut fixture = Fixture::new(WorldKind::Server);
+    fixture.assets(library().pin_without(&[EVENTS_CLIP.id()]));
+    fixture.spawn(key(1), AnimRig::new(MACHINE, SKELETON));
+    fixture.set_params(key(1), |params| params.values[0] = s(1.0));
+    fixture.step();
+    let row = fixture.state(key(1));
+    assert!(row.entered() && row.entry_was_set() && row.phase_crossed(Phase::ZERO));
+    assert!(fixture.take_events().is_empty());
+    fixture.assets(library().pin());
+    fixture.step();
+    let events: Vec<Phase> = fixture.take_events().iter().map(|(_, e)| e.phase).collect();
+    assert_eq!(events, [Phase(1_000)], "the advance from zero, not the entry at zero");
+}

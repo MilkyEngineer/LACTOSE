@@ -9,7 +9,7 @@ use std::borrow::Cow;
 use lactose_asset_api::{Asset, AssetId, AssetKind, AssetRef, Loader, SimulationAsset};
 use lactose_core::{Error, ErrorKind, Result};
 use lactose_math::{Quat, Scalar, Vec3};
-use lactose_physics_api::{Collider, JointKind, RigidBody};
+use lactose_physics_api::{Collider, JointKind, RigidBody, ShapeKind, locked_axes};
 
 use crate::codec;
 
@@ -51,7 +51,9 @@ pub struct Clip {
     pub samples: Vec<BonePose>,
     /// The root's pose per frame in the character's space, or empty for a clip without root
     /// motion: `frames + 1` entries for a looping clip, the last being where the cycle ends
-    /// (sample zero displaced by the cycle's total motion), `frames` for a one-shot.
+    /// (sample zero displaced by the cycle's total motion), `frames` for a one-shot. Entry
+    /// zero is the identity, the character at the clip's start: the last entry's yaw is
+    /// then the cycle's turn, which the wrap of [`root_motion`](Self::root_motion) adds.
     pub root: Vec<RootSample>,
     /// The authored events, ascending by phase.
     pub events: Vec<ClipEvent>,
@@ -194,8 +196,9 @@ impl Clip {
 
     /// The checks the loader runs: `duration_ticks` at least one; `frames` at least two, or
     /// one when looping; `samples.len() == frames * bones`; `root` empty or of the length
-    /// stated on the field; every rotation a unit quaternion; every scalar finite; events
-    /// ascending by phase. `InvalidData` otherwise, naming the first failure.
+    /// stated on the field, its entry zero the identity (no translation, no yaw); every
+    /// rotation a unit quaternion; every scalar finite; events ascending by phase.
+    /// `InvalidData` otherwise, naming the first failure.
     pub fn validate(&self) -> Result<()> {
         if self.duration_ticks == 0 {
             return Err(invalid("a clip lasts at least one tick"));
@@ -226,6 +229,15 @@ impl Clip {
             if !entry.translation.is_finite() || !entry.yaw.is_finite() {
                 return Err(invalid(format!("root entry {index}: a scalar is not finite")));
             }
+        }
+        // The wrap adds the last entry's yaw as the cycle's turn, which holds only from an
+        // unturned entry zero; the track is in the character's space at the clip's start.
+        if self
+            .root
+            .first()
+            .is_some_and(|first| first.translation != Vec3::ZERO || first.yaw != Scalar::ZERO)
+        {
+            return Err(invalid("root entry 0: the track does not start at the identity"));
         }
         let descending = self.events.windows(2).position(|pair| pair[1].phase < pair[0].phase);
         if let Some(index) = descending {
@@ -362,6 +374,14 @@ impl StateMachine {
         if usize::from(self.initial) >= states {
             return Err(invalid(format!("the initial state {} is past the states", self.initial)));
         }
+        // The first state whose key an earlier state has, found by sorting (a cooked
+        // machine holds up to 65,534 states): in each run of one key, ascending by index,
+        // the second is the first repeat.
+        let mut keys: Vec<(StateKey, usize)> =
+            self.states.iter().enumerate().map(|(index, state)| (state.key, index)).collect();
+        keys.sort_unstable();
+        let repeat = keys.windows(2).filter(|pair| pair[0].0 == pair[1].0).map(|pair| pair[1].1);
+        let first_repeat = repeat.min();
         for (index, state) in self.states.iter().enumerate() {
             if !state.speed.is_finite() || state.speed < Scalar::ZERO {
                 return Err(invalid(format!("state {index}: the speed is negative or not finite")));
@@ -371,7 +391,7 @@ impl StateMachine {
                     "state {index}: the speed parameter is past the slots"
                 )));
             }
-            if self.states[..index].iter().any(|other| other.key == state.key) {
+            if first_repeat == Some(index) {
                 return Err(invalid(format!("state {index}: another state has its key")));
             }
         }
@@ -526,7 +546,16 @@ impl Skeleton {
     /// body (the ragdoll's root body alone has none); the OR of every body's
     /// `groups.membership` and the OR of every body's `groups.filter` sharing no bit (the
     /// bone rule, [`BoneBody::collider`]);
-    /// every rest and socket rotation a unit quaternion and every scalar finite.
+    /// every rest and socket rotation a unit quaternion and every scalar finite; and every
+    /// [`BoneBody`] one the physics backend accepts, so no bone's body is refused at every
+    /// sync: the mass and both dampings non-negative; `locked_axes` within
+    /// `locked_axes::TRANSLATION | locked_axes::ROTATION`; a sphere's radius positive, a
+    /// capsule's radius positive and its half height (`half_extents.y`) non-negative, a
+    /// cuboid's three half extents positive; the collider's rotation a unit quaternion;
+    /// friction, restitution, density and the impact threshold non-negative; a revolute or
+    /// prismatic joint's axis non-zero; a limited joint's `min` at most its `max`. These
+    /// are the rules of `lactose-physics-rapier`'s conversion, the backend `physics-api`'s
+    /// validity statement ("a NaN, a non-unit quaternion, a negative extent") leaves to.
     /// `InvalidData` otherwise, naming the first failure.
     pub fn validate(&self) -> Result<()> {
         let bones = self.bones.len();
@@ -557,7 +586,7 @@ impl Skeleton {
             }
             pose_is_valid(&bone.rest).map_err(|what| fail(&format!("the rest pose: {what}")))?;
             let Some(body) = &bone.body else { continue };
-            body_is_finite(body).map_err(fail)?;
+            body_is_valid(body).map_err(fail)?;
             if body.joint.is_some() && self.body_above(index).is_none() {
                 return Err(fail("the joint reaches no ancestor with a body"));
             }
@@ -643,6 +672,49 @@ fn pose_is_valid(pose: &BonePose) -> core::result::Result<(), &'static str> {
     }
     if (pose.rotation.length_squared() - Scalar::ONE).abs() >= UNIT_TOLERANCE {
         return Err("the rotation is not a unit quaternion");
+    }
+    Ok(())
+}
+
+/// Whether the physics backend accepts `body`: every scalar finite, then the rules
+/// [`Skeleton::validate`] lists, which are `lactose-physics-rapier`'s `valid_body`,
+/// `valid_collider`, `valid_shape` and `valid_joint` over the rows `Bones::spawn` writes.
+fn body_is_valid(body: &BoneBody) -> core::result::Result<(), &'static str> {
+    body_is_finite(body)?;
+    let non_negative = |value: Scalar| value >= Scalar::ZERO;
+    let positive = |value: Scalar| value > Scalar::ZERO;
+    let rigid = &body.body;
+    if ![rigid.mass, rigid.linear_damping, rigid.angular_damping].into_iter().all(non_negative) {
+        return Err("the body's mass or damping is negative");
+    }
+    if rigid.locked_axes & !(locked_axes::TRANSLATION | locked_axes::ROTATION) != 0 {
+        return Err("the body's locked axes name an unknown bit");
+    }
+    let collider = &body.collider;
+    let shape = &collider.shape;
+    let extents = match shape.kind {
+        ShapeKind::Sphere => positive(shape.radius),
+        ShapeKind::Capsule => positive(shape.radius) && non_negative(shape.half_extents.y),
+        ShapeKind::Cuboid => shape.half_extents.to_array().into_iter().all(positive),
+    };
+    if !extents {
+        return Err("the collider's shape has a zero or negative extent");
+    }
+    if (collider.rotation.length_squared() - Scalar::ONE).abs() >= UNIT_TOLERANCE {
+        return Err("the collider's rotation is not a unit quaternion");
+    }
+    let coefficients =
+        [collider.friction, collider.restitution, collider.density, collider.impact_threshold];
+    if !coefficients.into_iter().all(non_negative) {
+        return Err("the collider's friction, restitution, density or threshold is negative");
+    }
+    let Some(joint) = &body.joint else { return Ok(()) };
+    let axial = matches!(joint.kind, JointKind::Revolute | JointKind::Prismatic);
+    if axial && joint.axis.try_normalize().is_none() {
+        return Err("the joint's axis is zero");
+    }
+    if joint.limits.is_some_and(|(min, max)| min > max) {
+        return Err("the joint's lower limit is above its upper");
     }
     Ok(())
 }

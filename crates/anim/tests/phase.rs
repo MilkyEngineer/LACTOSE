@@ -306,3 +306,29 @@ fn an_entry_whose_clip_is_missing_reports_its_set_phase_once() {
         [(1, true, true, 0), (2, false, false, 0), (3, false, false, 1), (4, false, false, 2)]
     );
 }
+
+/// The ceiling's consequences are bounded to `d` up to `2^16` ticks (18.2 minutes at 60
+/// Hz): a one-shot of every such `d` holds `END` on tick `d` and not before, and sampled
+/// marks are crossed on their tick; at `d = 2^16 + 1` the one-shot is one tick early,
+/// which is why the bound is there.
+#[test]
+fn the_ceilings_consequences_hold_up_to_two_to_the_sixteen_ticks() {
+    let end = u128::from(Phase::END.0);
+    // `advanced` saturates at `END`, so a one-shot holds it from the first tick at or past it.
+    let first_end = |d: u32| {
+        let rate = Phase::rate(d, s(1.0));
+        u32::try_from(end.div_ceil(u128::from(rate))).unwrap()
+    };
+    for d in 1..=1u32 << 16 {
+        assert_eq!(first_end(d), d, "one-shot of {d}");
+    }
+    assert_eq!(first_end((1 << 16) + 1), 1 << 16, "past the bound, a tick early");
+    for d in [7_201u32, 10_000, 30_001, 65_535, 1 << 16] {
+        let rate = Phase::rate(d, s(1.0));
+        for f in (1..d).step_by(97).chain([d - 1]) {
+            let mark = u128::from(Phase::from_fraction(f, d).0);
+            let on_tick = unwrapped(rate, f - 1) < mark && mark <= unwrapped(rate, f);
+            assert!(on_tick, "d {d}, f {f}");
+        }
+    }
+}

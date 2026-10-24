@@ -267,3 +267,47 @@ fn no_root_track_and_no_advance_move_nothing() {
     let expected = yaw(-0.468_75) * v(0.0, 0.0, -0.125) + yaw(0.5 - 0.468_75) * v(0.0, 0.0, -0.25);
     assert_eq!(wrapped.translation, expected);
 }
+
+/// A looping turn of four frames, 0.1 rad and a quarter unit forward a frame, its entry
+/// zero at `first_yaw` and `first_z`.
+fn turning(first_yaw: f64, first_z: f64) -> Clip {
+    let mut clip = clip(2, 4, 40, true, 0.0);
+    clip.root = (0..5u32)
+        .map(|frame| RootSample {
+            translation: v(0.0, 0.0, first_z - 0.25 * f64::from(frame)),
+            yaw: s(first_yaw + 0.1 * f64::from(frame)),
+        })
+        .collect();
+    clip
+}
+
+/// The review's probe: the wrap adds the last entry's yaw as the cycle's turn, so a track
+/// whose entry zero is turned would add that yaw every cycle (0.7 rad a cycle for a 0.4
+/// rad turn from 0.3). `Clip::validate` refuses a track that does not start at the
+/// identity, turned or moved, and the identity's cycle sums to the track's turn.
+#[test]
+fn a_root_track_starts_at_the_identity() {
+    let clip = turning(0.0, 0.0);
+    clip.validate().unwrap();
+    let rate = Phase::rate(40, s(1.0));
+    let start = Phase(123_456_789);
+    let (mut phase, mut moved, mut turned) = (start, 0u64, Scalar::ZERO);
+    while moved + u64::from(rate) < UNITS {
+        let next = phase.advanced(rate, true);
+        turned += clip.root_motion(phase, next).yaw;
+        (phase, moved) = (next, moved + u64::from(rate));
+    }
+    turned += clip.root_motion(phase, start).yaw;
+    assert!((turned - s(0.4)).abs() < s(1e-12), "one cycle turns {turned:?}");
+    for (first_yaw, first_z) in [(0.3, 0.0), (-0.1, 0.0), (0.0, 0.5), (0.3, 0.5)] {
+        let error = turning(first_yaw, first_z).validate().unwrap_err();
+        assert!(
+            error.message().contains("root entry 0: the track does not start at the identity"),
+            "{first_yaw}, {first_z}: {error}"
+        );
+    }
+    // A clip without root motion has no entry zero to check.
+    let mut still = turning(0.3, 0.5);
+    still.root.clear();
+    still.validate().unwrap();
+}

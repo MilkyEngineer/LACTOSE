@@ -730,8 +730,12 @@ impl Bones {
     /// function will put on every row it spawns; until then the rows replicate like any
     /// row. The placeholders are resolved at apply, so the
     /// owner's row names its bones from the next sync point on. The calling kernel declares
-    /// `writes = [Bones]`; the spawns are structural and need no declaration. A second call
-    /// on an owner that already has bones does nothing and is logged at target `anim`.
+    /// `writes = [Bones]`; the spawns are structural and need no declaration. Call it at
+    /// most once per owner per tick: a call on an owner whose `existing` bones are `Some`
+    /// does nothing and is logged at target `anim`, but `existing` is the row as of the
+    /// last sync point, which an earlier call in the same tick has not written yet, so a
+    /// second call in that tick records a second set of rows that `Bones` never names and
+    /// nothing sweeps.
     pub fn spawn(
         cmd: &mut Commands<'_>,
         owner: StableKey,
