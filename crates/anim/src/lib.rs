@@ -9,10 +9,10 @@
 //!
 //! # Status
 //!
-//! Facade: every public signature is final and every deciding body is `todo!()`; the
-//! integer, compositional and phase helpers are real. The implementation lane replaces
-//! the bodies behind this surface and removes the crate-level `allow` below with the last
-//! of them.
+//! Implemented for milestone 1 behind the facade's surface: the state machine, phase,
+//! events, root motion, the sim skeleton's evaluation, the bone rows and the three loaders
+//! (whose cooked byte form `README.md` gives). `README.md`, "Not in this crate yet", lists
+//! what is not.
 //!
 //! # Where to start
 //!
@@ -49,13 +49,9 @@
 //! ```
 
 #![forbid(unsafe_code)]
-#![allow(
-    dead_code,
-    unused_variables,
-    reason = "facade: every deciding body is `todo!()`; the implementation removes this with the last of them"
-)]
 
 mod assets;
+mod codec;
 mod components;
 mod event;
 mod keys;

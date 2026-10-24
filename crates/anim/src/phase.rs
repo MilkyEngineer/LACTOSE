@@ -61,8 +61,8 @@ impl Phase {
     /// finite, negative or zero, for a finite positive speed below `2^-16` (under one Q16.16
     /// unit), and for a zero `duration_ticks`.
     ///
-    /// What follows from the ceiling, and is part of this contract: a one-shot of `d`
-    /// ticks at speed one holds `END` on tick `d` of its state; a mark at
+    /// What follows from the ceiling, for `d` up to `2^16` ticks (18.2 minutes at 60 Hz),
+    /// and is part of this contract: a one-shot of `d` ticks at speed one holds `END` on tick `d` of its state; a mark at
     /// `from_fraction(f, d)` is crossed on tick `f`; a loop of `d` ticks at speed one wraps
     /// on tick `d` of each cycle until the lead the ceiling adds, `d * rate - 2^32` units a
     /// cycle, sums to a rate: its `m`-th wrap, `m = ceil(rate / (d * rate - 2^32))`, comes

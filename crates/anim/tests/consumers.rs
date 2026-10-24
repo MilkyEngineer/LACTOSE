@@ -1,8 +1,8 @@
-//! Compile-only consumer sketches against the facade: what a game crate writes (a
+//! Compile-only consumer sketches against the surface: what a game crate writes (a
 //! character's state machine driven by a sketch input, a footstep from a phase crossing,
 //! root motion applied by a movement sketch, a hit test and a ragdoll from the sim
-//! skeleton), what presentation reads, and `app`'s registration, type-checked and never run
-//! (every deciding body of the crate is `todo!()`). The one test builds the schedule of
+//! skeleton), what presentation reads, and `app`'s registration, type-checked and never
+//! stepped (the other test files run the bodies). The one test builds the schedule of
 //! every world kind, with the prediction world's build check, so the sets, the transient
 //! writers, the replication policies and the absence of a `Transform` write in
 //! `Stage::Post` are shown to pass the real schedule. They pin the

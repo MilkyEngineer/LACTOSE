@@ -3538,6 +3538,91 @@ relayed by an event when it acts on another body** (§6.1, §10, `lactose-ecs`,
     entry, `tracing` at target `anim`.
 - Driven by: milestone 1, the `anim` facade brief and its reviews r1 (2026-10-18), r2 and r3
   (2026-10-24).
+- Addendum (implementation, lane anim-impl, 2026-10-24; fix rounds 1 and 2 and review rounds 1
+  to 3, 2026-10-24): implemented. What the implementation settled:
+  - The cooked byte form, `FORMAT_VERSION` 1 for `Clip`, `StateMachine` and `Skeleton`:
+    - Little-endian; every field at its fixed width in the order listed below the README's
+      statement of the form ("Assets"), with no alignment and no padding. That order is not
+      always the declaration order: `StateMachine::initial` comes first, a `Transition`'s
+      conditions come last, and a `Shape`'s kind comes before its extents.
+    - A scalar is its canonical bits at the build's scalar width S; a `Vec3` is three scalars,
+      a `Quat` four (x, y, z, w), a pose its translation then its rotation.
+    - An asset reference is its `u64` ID; a `bool` is one byte, 0 or 1; an optional index is
+      `0xFF` (`0xFFFF` for a state); a list is a `u32` count before its elements.
+    - Every asset begins with two `u32`s: the format version and S.
+    - Enums are tag bytes. Every field of `BoneBody` and the collider is written.
+    - A loader refuses:
+      - another version or S (`VersionMismatch`);
+      - a truncation, a count the remaining bytes cannot hold (checked before allocating),
+        trailing bytes, a non-0/1 bool, an unknown tag, or a dependency list other than the
+        assets the bytes name (`InvalidData`);
+      - then whatever `validate` refuses.
+    - The decode reads integers and canonical bits alone, so it is bit-identical on every host.
+    - `crates/anim/tests/format.rs` holds an encoder written from the README statement, plus
+      golden bytes for one asset of each kind written by hand. In the golden assets every two
+      neighbouring fields of one width hold different values in at least one asset, and every
+      condition tag, a transition from any state, a sphere and a cuboid, two body types and a
+      limited revolute joint appear. So a mistake shared by the encoder and the decoder is
+      caught: a swap of `duration_ticks` and `frames`, or of a joint's two anchors, made in
+      both, fails the test. tools/cook's processors must match both.
+  - Validation:
+    - `Skeleton::validate` refuses a `BoneBody` the physics backend would refuse at every sync:
+      - mass and damping ≥ 0; known locked-axes bits;
+      - positive sphere and capsule radii, a non-negative capsule half height and positive
+        cuboid extents;
+      - a unit collider rotation; non-negative friction, restitution, density and threshold;
+      - a non-zero revolute or prismatic axis; min ≤ max limits.
+    - These rules are physics-rapier's conversion checks as of this commit, since physics-api's
+      validity statement names only NaNs, non-unit quaternions and negative extents. They are
+      to be replaced by physics-api's predicates when it states them.
+    - A bone row's rotation is the product of rotations each held to the unit tolerance on its
+      own, so its error grows with depth past that tolerance. `Bones::spawn` and
+      `anim::drive_bones` therefore normalise the rotation of every transform they write to a
+      bone row, so the row's `Transform` is accepted too. This is a correctly rounded square
+      root and four divisions through `lactose_math`, which section 8.2 permits. It changed the
+      bone-row bits of the server-crowd SOUR scene (291 of its 300 tick hashes, from tick 10
+      on); no other scene's hashes moved.
+    - `Clip::validate` refuses a root track whose entry zero is not the identity. The track is
+      in the character's space at the clip's start: `root_motion` turns each translation back
+      by the yaw since entry zero, and the wrap adds the last entry's yaw as the cycle's turn.
+      A turned entry zero would turn the translation of every motion by its yaw, one-shots
+      included, as well as add it to the cycle's turn. The translation is refused with it, for
+      the same space.
+    - `StateMachine::validate` finds repeated state keys by sorting, so a 65,534-state machine
+      validates in O(n log n).
+  - A transition into a state whose clip is missing or of the wrong kind stands. The tick ends
+    as an entry-tick hold:
+    - the row is not marked held, `ticks_in_state` stays zero, `RootMotion::ZERO` is written
+      and nothing is emitted;
+    - the triggers are consumed, since the transitions were tried;
+    - the entry, and a set entry phase as crossed, are reported once;
+    - no `ClipEvent` fires, the clip's events not being there, so an authored event at the
+      entry phase is not emitted for that entry;
+    - later ticks hold until the clip is present, and the first advance then passes (entry
+      phase, phase].
+  - This keeps "entered" a once-per-entry signal whether or not the asset is loaded.
+  - `Bones::spawn` is called at most once per owner per tick: the `Bones` it reads is the row
+    as of the last sync point.
+  - `Phase::rate`'s ceiling consequences (a one-shot of `d` ticks at `END` on tick `d`,
+    `from_fraction(f, d)` crossed on tick `f`) are stated for `d` up to 2^16 ticks, 18.2
+    minutes at 60 Hz. At 2^16 + 1 the one-shot is a tick early.
+  - Measured cost (M1, release, one run, load averages 3.81 4.45 4.42 before and 3.10 4.23 4.34
+    after; taken before the bone-row normalisation, which adds one square root and four
+    divisions per animated bone row per tick):
+    - (a) `SimPose::evaluate` for 200 characters, half blending: median 157.8 µs, best 150.9 µs
+      per tick.
+    - (b) the `SimPose` share of `Simulation::step`: 196.9 µs at one worker and 189.3 µs at
+      four, inside section 22's 0.5 ms.
+    - (c) a body on every bone (3,200):
+      - this crate's share with no physics (bone commands, report scan, apply): 1,372.3 µs at
+        one worker and 1,380.8 µs at four, about 0.43 µs a body;
+      - over the physics test backend with its contact search off: 3,331.2 µs and 3,382.1 µs,
+        the difference being physics-api's sync and write-back and the backend's bookkeeping.
+      - Neither is Rapier, so no conclusion on a 4 ms tick before a Rapier run.
+    - The x86 desktop is not yet measured.
+  - Root motion applied tick by tick drifts by about one unit in the last place per tick
+    applied (11 ulps after 60 ticks, 258 after 600, at eight-byte scalars). The README states
+    this bound instead of an exact end.
 
 ## 10. Review history
 

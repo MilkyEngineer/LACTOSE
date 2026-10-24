@@ -30,5 +30,5 @@ packages = []
 [harness]
 packages = [
   "lactose-sim", "lactose-physics-api", "lactose-input", "lactose-physics-rapier", "lactose-net-api",
-  "lactose-predict", "lactose-net-host",
+  "lactose-predict", "lactose-net-host", "lactose-anim",
 ]
