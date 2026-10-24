@@ -78,7 +78,12 @@ fits the patched one and returns the records it dropped, so `persist` can re-hom
 entity the patch moved elsewhere. It keeps every runtime-spawned and migrated entity; drops
 every record of a cooked entity that is no longer a row; drops `RemoveComponent` and
 `SetField` of a component the row no longer has; and keeps `AddComponent`, which overwrites.
-A migrated entity that the patch made a local row is rewritten as component records.
+A migrated entity that the patch made a local row is rewritten as component records. The
+result is a valid overlay for the patched baseline with the same meaning, not the one record
+set of that state: a migrated entity the patch made a local row is rewritten as an
+`AddComponent` per component it carries and a `RemoveComponent` per column it lacks, whatever
+the values and whatever the column; `lactose-persist`'s `RegionRecords::rebase` applies the
+result and diffs it again to the canonical set.
 
 **Encoding.** Little-endian, `u32` counts, a magic and format version in front and the xxh64
 of everything before it at the end. That trailing hash is the content hash, and a document

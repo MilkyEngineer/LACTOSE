@@ -341,6 +341,10 @@ impl Overlay {
     ///   canonical form for a local row, with the same meaning: an `AddComponent` for
     ///   each component it carries and a `RemoveComponent` for each component the row has
     ///   and it does not. Nothing is dropped for it.
+    ///   The result is a valid overlay for the patched baseline with the same meaning, not
+    ///   the one record set of that state: such an entity is rewritten whatever the values
+    ///   and whatever the column; `lactose-persist`'s `RegionRecords::rebase` applies the
+    ///   result and diffs it again to the canonical set.
     /// - Every record of any other cooked entity that is not a row of `patched` is
     ///   dropped, `Destroy` included.
     /// - For a row of `patched`: a `RemoveComponent` of a component the row does not have

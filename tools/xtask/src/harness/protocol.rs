@@ -55,9 +55,9 @@
 
 // This file is compiled into the tests of boundary crates, under their `clippy.toml`, which
 // bans `std::fs` and `std::env` (architecture section 8.2), and into this crate and the tests
-// of `lactose-net-host`, which do not. Each item that reaches a file or the environment
-// expects the lint for itself; the two `mod protocol` declarations outside the boundary allow
-// the expectations that are unfulfilled there.
+// of `lactose-net-host`, `lactose-persist` and `lactose-app`, which do not. Each item that
+// reaches a file or the environment expects the lint for itself; the `mod protocol`
+// declarations outside the boundary allow the expectations that are unfulfilled there.
 
 use std::fmt;
 #[expect(

@@ -2,17 +2,20 @@
 //! `RegionBundle` the input sync point loads, migrated to the registry's schemas and
 //! validated first, so a refused region changes nothing.
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use lactose_asset_api::PinnedTable;
-use lactose_bundle::Baseline;
-use lactose_core::Result;
+use lactose_bundle::{Baseline, ComponentData, ComponentSchema, Record};
+use lactose_core::{ComponentKey, Error, ErrorKind, NetId, Result};
 use lactose_ecs::RegionMode;
+use lactose_reflect::{Persistence, TypeInfo, TypeRole};
 use lactose_sim::RegionBundle;
 
-use crate::diff::RegionRecords;
+use crate::codec::invalid;
+use crate::diff::{RegionRecords, unknown};
 use crate::migrate::Migrations;
-use crate::schema::SchemaTable;
+use crate::schema::{Saved, SchemaTable, document_schema};
 
 /// What a load needs beyond the records: the loading build's saved schemas and its
 /// migrations. One per registry, shared by every region's load.
@@ -68,7 +71,67 @@ impl<'a> Loader<'a> {
     /// transient type the table does not know, and with `InvalidData` for records that
     /// fail [`RegionRecords::check`] or for a resource whose type is a component.
     pub fn migrate(&self, records: &RegionRecords) -> Result<RegionRecords> {
-        todo!("migrate the overlay and the resources, or return the records unchanged")
+        records.check()?;
+        let schemas = self.schemas;
+        let overlay = match &records.overlay {
+            Some(overlay) => {
+                let migrated =
+                    self.migrations.migrate_overlay(overlay, &records.layouts, schemas)?;
+                (!migrated.records().is_empty()).then_some(migrated)
+            }
+            None => None,
+        };
+        let mut resources = Vec::with_capacity(records.resources.len());
+        let mut transient_resources = BTreeSet::new();
+        for (data, schema) in records.resources.iter().zip(&records.resource_schemas) {
+            let info = resource_of(schemas, data.component)?;
+            match info.persistence() {
+                Persistence::Derived => {}
+                Persistence::Transient => {
+                    transient_resources.insert(data.component);
+                }
+                Persistence::Persistent => {
+                    let layout = records.layouts[&data.component];
+                    let mut bytes = self.migrations.migrate(info, schema, layout, &data.bytes)?;
+                    saved(schemas, data.component).canonicalise(&mut bytes);
+                    resources.push(ComponentData { component: data.component, bytes });
+                }
+            }
+        }
+        for &component in &records.transient_resources {
+            let info = resource_of(schemas, component)?;
+            match info.persistence() {
+                Persistence::Derived => {}
+                Persistence::Transient => {
+                    transient_resources.insert(component);
+                }
+                Persistence::Persistent => {
+                    let size = saved(schemas, component).schema.element_size() as usize;
+                    resources.push(ComponentData { component, bytes: vec![0; size] });
+                }
+            }
+        }
+        resources.sort_by_key(|data| data.component);
+        let resource_schemas =
+            resources.iter().map(|data| saved(schemas, data.component).schema.clone()).collect();
+        let carried = overlay.iter().flat_map(|overlay| overlay.schemas());
+        let layouts = carried
+            .map(ComponentSchema::component)
+            .chain(resources.iter().map(|data| data.component))
+            .map(|component| (component, saved(schemas, component).layout))
+            .collect();
+        let migrated = RegionRecords {
+            region: records.region,
+            seed: records.seed,
+            baseline_hash: records.baseline_hash,
+            overlay,
+            resources,
+            resource_schemas,
+            transient_resources: transient_resources.into_iter().collect(),
+            layouts,
+        };
+        migrated.check()?;
+        Ok(migrated)
     }
 
     /// The bundle that loads `records` over `baseline` in `mode` with `assets`: what goes
@@ -77,8 +140,9 @@ impl<'a> Loader<'a> {
     ///
     /// In order: `records` passes [`check`](RegionRecords::check); `baseline.content_hash()`
     /// equals `records.baseline_hash` (`VersionMismatch` otherwise: the baseline was
-    /// patched, so [`RegionRecords::rebase`] first); the records are [migrated](Self::migrate);
-    /// the overlay, if any, passes `Overlay::check_against(baseline)`; every value a
+    /// patched, so [`migrate`](Self::migrate) and [`RegionRecords::rebase`] first); the
+    /// records are [migrated](Self::migrate); the overlay, if any, passes
+    /// `Overlay::check_against(baseline)`; every value a
     /// record or a resource carries is validated against the registry
     /// (`TypeInfo::validate`, `InvalidData`), a resource restored zeroed by `migrate`
     /// included and a transient component by presence alone, since it is zeroed; a
@@ -103,6 +167,112 @@ impl<'a> Loader<'a> {
         mode: RegionMode,
         assets: Option<PinnedTable>,
     ) -> Result<RegionBundle> {
-        todo!("check, compare the hash, migrate, validate, then assemble the bundle")
+        records.check()?;
+        if baseline.content_hash() != records.baseline_hash {
+            return Err(Error::new(
+                ErrorKind::VersionMismatch,
+                format!(
+                    "the records of region {} were made against baseline {:#018x}, not \
+                     {:#018x}: rebase them first",
+                    records.region.0,
+                    records.baseline_hash,
+                    baseline.content_hash()
+                ),
+            ));
+        }
+        let records = self.migrate(records)?;
+        if let Some(overlay) = &records.overlay {
+            overlay.check_against(&baseline)?;
+            for record in overlay.records() {
+                match record {
+                    Record::Spawn { components, .. }
+                    | Record::SpawnFromBaseline { components, .. } => {
+                        for data in components {
+                            self.validate(data)?;
+                        }
+                    }
+                    Record::AddComponent { data, .. } => self.validate(data)?,
+                    Record::SetField { id, component, field, bytes } => {
+                        let info = self.schemas.info(*component).expect("migrated");
+                        if info.persistence() != Persistence::Persistent {
+                            continue;
+                        }
+                        let mut value = self.baseline_value(&baseline, *id, info)?;
+                        info.write_field(&mut value, *field, bytes)?;
+                        info.validate(&value)?;
+                    }
+                    Record::Destroy { .. }
+                    | Record::RemoveComponent { .. }
+                    | Record::OwnershipChange { .. } => {}
+                }
+            }
+        }
+        for data in &records.resources {
+            self.validate(data)?;
+        }
+        for schema in baseline.schemas() {
+            self.baseline_schema(schema)?;
+        }
+        Ok(RegionBundle {
+            seed: records.seed,
+            mode,
+            baseline,
+            overlay: records.overlay,
+            resources: records.resources,
+            transient_resources: records.transient_resources,
+            assets,
+        })
     }
+
+    /// Validates `data`, a value the migrated records carry; a transient one counts by
+    /// presence alone.
+    fn validate(&self, data: &ComponentData) -> Result<()> {
+        let info = self.schemas.info(data.component).expect("migrated records name known types");
+        match info.persistence() {
+            Persistence::Persistent => info.validate(&data.bytes),
+            Persistence::Transient | Persistence::Derived => Ok(()),
+        }
+    }
+
+    /// The value of `info`'s type in row `id` of `baseline`, which `check_against` has
+    /// shown the row has.
+    fn baseline_value(&self, baseline: &Baseline, id: NetId, info: &TypeInfo) -> Result<Vec<u8>> {
+        let column = baseline.schema(info.key()).expect("the row has the component");
+        self.baseline_schema(column)?;
+        let archetype = baseline.archetype_of(id).expect("a cooked row");
+        let index = archetype.ids().binary_search(&id).expect("a row of its archetype");
+        let column = archetype.column(info.key()).expect("the row has the component");
+        let size = column.element_size as usize;
+        Ok(column.bytes[index * size..(index + 1) * size].to_vec())
+    }
+
+    /// Fails unless `schema`, a baseline's, is the one the registry derives for its type.
+    fn baseline_schema(&self, schema: &ComponentSchema) -> Result<()> {
+        let info =
+            self.schemas.info(schema.component()).ok_or_else(|| unknown(schema.component()))?;
+        if *schema != document_schema(info)? {
+            return Err(Error::new(
+                ErrorKind::VersionMismatch,
+                format!(
+                    "the baseline's schema of `{}` is not the registry's: re-cook it",
+                    info.name()
+                ),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// The registry's description of the region resource `component`.
+fn resource_of(schemas: &SchemaTable, component: ComponentKey) -> Result<&'static TypeInfo> {
+    let info = schemas.info(component).ok_or_else(|| unknown(component))?;
+    if info.role() != TypeRole::Resource {
+        return Err(invalid(format!("the component `{}` is among the resources", info.name())));
+    }
+    Ok(info)
+}
+
+/// What the table keeps for `component`, a type `migrate` has shown is saved.
+fn saved(schemas: &SchemaTable, component: ComponentKey) -> &Saved {
+    schemas.saved(component).expect("a saved type")
 }

@@ -4,19 +4,38 @@
 //! a region is written on a worker and read without the rest. CARTON is its name on the
 //! tools that read it.
 //!
-//! This facade fixes the shape (the types here) and the invariants of the encoding
-//! (`README.md`, "The container"); the byte layout within them is the implementation's,
-//! pinned by golden bytes once written.
+//! The shape is the types here and the invariants of the encoding are `README.md`'s ("The
+//! container"); the byte layout within them is this file's, pinned by the golden bytes of
+//! `tests/format.rs`:
+//!
+//! - the preamble: the magic `LSAV`, the format (`u16`), a zero `u16`, the block's length
+//!   (`u64`);
+//! - the block: the engine version (three `u16`), the schema hash (`u64`), the tick
+//!   (`u32`), the `NetId` counter (`u64`, never zero), the entry count (`u32`), each entry
+//!   as region, seed and baseline hash (`u64` each), the overlay's presence (`u8`, zero or
+//!   one) and digest (`u64`, zero when absent), offset, compressed size, decompressed size
+//!   and hash (`u64` each), then the xxh64 of the block's preceding bytes;
+//! - a section's content, before compression: region, seed and baseline hash (`u64`
+//!   each), the overlay's presence (`u8`) and, when present, its length (`u64`) and
+//!   `Overlay::encode`; the resource schema table as `lactose-bundle` writes one; each
+//!   resource as its key (`u64`) and the bytes of its schema's size, in the table's order;
+//!   the transient keys (a count and a `u64` each, ascending); the layout digests (a count
+//!   and a key and digest, `u64` each, ascending). One zstd frame at `SECTION_LEVEL`, with
+//!   its content size and without a checksum (the entry's xxh64 is the check).
 
 use std::collections::BTreeMap;
 use std::num::NonZeroU64;
+use std::sync::Arc;
 
-use lactose_core::{Result, Tick};
+use lactose_bundle::{ComponentData, Overlay};
+use lactose_core::{Error, ErrorKind, Result, Tick, xxh64};
 use lactose_ecs::RegionId;
 use lactose_sim::SavePoint;
+use zstd::zstd_safe::CParameter;
 
+use crate::codec::{Reader, Writer, invalid};
 use crate::diff::RegionRecords;
-use crate::schema::{SchemaHash, SchemaTable};
+use crate::schema::{LayoutDigest, SchemaHash, SchemaTable};
 
 /// The container format this build writes and reads. A reader refuses any other with
 /// `VersionMismatch`: before the first shipped save the format changes freely with this
@@ -198,8 +217,143 @@ impl RegionRecords {
     /// independent per region, so `app` runs it beside `from_export` on a background
     /// worker.
     pub fn encode_section(&self) -> Result<EncodedSection> {
-        todo!("check, write the section's content, compress and hash it")
+        self.check()?;
+        let content = self.content()?;
+        let compress = || -> std::io::Result<Vec<u8>> {
+            let mut compressor = zstd::bulk::Compressor::new(SECTION_LEVEL)?;
+            compressor.set_parameter(CParameter::ChecksumFlag(false))?;
+            compressor.set_parameter(CParameter::ContentSizeFlag(true))?;
+            compressor.compress(&content)
+        };
+        let mut bytes = compress().map_err(|error| {
+            Error::new(ErrorKind::Io, format!("compressing a section failed: {error}"))
+        })?;
+        bytes.shrink_to_fit();
+        let entry = RegionIndexEntry {
+            region: self.region,
+            seed: self.seed,
+            baseline_hash: self.baseline_hash,
+            overlay_digest: self.overlay.as_ref().map(|overlay| overlay.digest()),
+            offset: 0,
+            compressed_bytes: bytes.len() as u64,
+            bytes: content.len() as u64,
+            hash: xxh64(&bytes, 0),
+        };
+        Ok(EncodedSection { entry, bytes })
     }
+
+    /// The section's content before compression, as [`encode_section`](Self::encode_section)
+    /// states it.
+    fn content(&self) -> Result<Vec<u8>> {
+        let mut out = Writer::default();
+        out.u64(self.region.0);
+        out.u64(self.seed);
+        out.u64(self.baseline_hash);
+        match &self.overlay {
+            Some(overlay) => {
+                let encoded = overlay.encode();
+                out.u8(1);
+                out.u64(encoded.len() as u64);
+                out.bytes(&encoded);
+            }
+            None => out.u8(0),
+        }
+        out.schemas(&self.resource_schemas);
+        for data in &self.resources {
+            out.u64(data.component.0);
+            out.bytes(&data.bytes);
+        }
+        out.count(self.transient_resources.len());
+        for component in &self.transient_resources {
+            out.u64(component.0);
+        }
+        out.count(self.layouts.len());
+        for (component, layout) in &self.layouts {
+            out.u64(component.0);
+            out.u64(layout.0);
+        }
+        if out.bytes.len() > MAX_SECTION_BYTES {
+            return Err(Error::new(
+                ErrorKind::ResourceExhausted,
+                format!("a section of {} bytes is over MAX_SECTION_BYTES", out.bytes.len()),
+            ));
+        }
+        Ok(out.bytes)
+    }
+
+    /// The records a section's content states, as [`content`](Self::content) writes them,
+    /// canonical and nothing after them.
+    fn from_content(content: &[u8]) -> Result<Self> {
+        let mut reader = Reader::new(content);
+        let region = RegionId(reader.u64()?);
+        let seed = reader.u64()?;
+        let baseline_hash = reader.u64()?;
+        let overlay = if reader.flag()? {
+            let len = reader.len()?;
+            Some(Arc::new(Overlay::decode(reader.take(len)?)?))
+        } else {
+            None
+        };
+        let resource_schemas = reader.schemas()?;
+        let mut resources = Vec::with_capacity(resource_schemas.len());
+        for schema in &resource_schemas {
+            let component = reader.component()?;
+            if component != schema.component() {
+                return Err(invalid("a resource is not the type its schema names"));
+            }
+            let bytes = reader.take(schema.element_size() as usize)?.to_vec();
+            resources.push(ComponentData { component, bytes });
+        }
+        let count = reader.count(8)?;
+        let mut transient_resources = Vec::with_capacity(count);
+        for _ in 0..count {
+            transient_resources.push(reader.component()?);
+        }
+        let count = reader.count(16)?;
+        let mut layouts = BTreeMap::new();
+        for _ in 0..count {
+            let (component, layout) = (reader.component()?, LayoutDigest(reader.u64()?));
+            if layouts.last_key_value().is_some_and(|(&last, _)| last >= component) {
+                return Err(invalid("the layout digests are not strictly ascending"));
+            }
+            layouts.insert(component, layout);
+        }
+        reader.finish()?;
+        let records = Self {
+            region,
+            seed,
+            baseline_hash,
+            overlay,
+            resources,
+            resource_schemas,
+            transient_resources,
+            layouts,
+        };
+        records.check()?;
+        Ok(records)
+    }
+}
+
+/// The zstd level of every section: the measured choice (`docs/verification.md`, D129's
+/// save-cost row). Pinned: a change changes the bytes `tests/format.rs` holds.
+const SECTION_LEVEL: i32 = 3;
+
+/// The container's magic, the first four bytes of the preamble.
+const MAGIC: [u8; 4] = *b"LSAV";
+
+/// The header's bytes in the block: the engine version, the schema hash, the tick, the
+/// counter and the entry count.
+const HEADER_BYTES: usize = 6 + 8 + 4 + 8 + 4;
+
+/// One index entry's bytes: region, seed, baseline hash, the overlay's presence byte and
+/// digest, offset, both sizes and the hash.
+const ENTRY_BYTES: usize = 8 * 3 + 1 + 8 + 8 * 4;
+
+/// The block's trailing hash.
+const HASH_BYTES: usize = 8;
+
+fn too_large(what: &str, len: usize, cap: usize) -> Error {
+    Error::new(ErrorKind::ResourceExhausted, format!("{what} of {len} bytes is over {cap}"))
 }
 
 /// A save: a header and the records of every region it holds, one section per region.
@@ -274,7 +428,8 @@ impl Container {
     /// The container's bytes: [`encode_section`](RegionRecords::encode_section) of every
     /// section, then [`assemble`](Self::assemble). Fails as they fail.
     pub fn encode(&self) -> Result<Vec<u8>> {
-        todo!("encode each section and assemble")
+        let sections = self.regions().map(RegionRecords::encode_section).collect::<Result<_>>()?;
+        Self::assemble(&self.header, sections)
     }
 
     /// The bytes of a container holding `sections` under `header`: the preamble, then the
@@ -287,7 +442,66 @@ impl Container {
     /// `ResourceExhausted` if the whole would exceed [`MAX_CONTAINER_BYTES`]. The sections
     /// are taken as made, so `app` encodes each region on a worker and assembles here.
     pub fn assemble(header: &ContainerHeader, sections: Vec<EncodedSection>) -> Result<Vec<u8>> {
-        todo!("sort, place, write the block and the sections")
+        if header.format != CONTAINER_FORMAT_VERSION {
+            return Err(Error::new(
+                ErrorKind::VersionMismatch,
+                format!(
+                    "this build writes container format {CONTAINER_FORMAT_VERSION}, not {}",
+                    header.format
+                ),
+            ));
+        }
+        let mut sections = sections;
+        sections.sort_by_key(|section| section.entry.region);
+        if let Some(pair) =
+            sections.windows(2).find(|pair| pair[0].entry.region == pair[1].entry.region)
+        {
+            return Err(invalid(format!("two sections of region {}", pair[0].entry.region.0)));
+        }
+        let block_len = HEADER_BYTES + sections.len() * ENTRY_BYTES + HASH_BYTES;
+        let start = PREAMBLE_BYTES + block_len;
+        let total = sections
+            .iter()
+            .try_fold(start, |end, section| end.checked_add(section.bytes.len()))
+            .filter(|&total| total <= MAX_CONTAINER_BYTES)
+            .ok_or_else(|| {
+                let len = sections.iter().map(|section| section.bytes.len()).sum::<usize>();
+                too_large("a container", start.saturating_add(len), MAX_CONTAINER_BYTES)
+            })?;
+
+        let mut out = Writer { bytes: Vec::with_capacity(total) };
+        out.bytes(&MAGIC);
+        out.u16(header.format);
+        out.u16(0);
+        out.u64(block_len as u64);
+        out.u16(header.engine.major);
+        out.u16(header.engine.minor);
+        out.u16(header.engine.patch);
+        out.u64(header.schema_hash.0);
+        out.u32(header.tick.0);
+        out.u64(header.next_net_id.get());
+        out.count(sections.len());
+        let mut offset = start as u64;
+        for section in &sections {
+            let entry = &section.entry;
+            out.u64(entry.region.0);
+            out.u64(entry.seed);
+            out.u64(entry.baseline_hash);
+            out.u8(u8::from(entry.overlay_digest.is_some()));
+            out.u64(entry.overlay_digest.unwrap_or(0));
+            out.u64(offset);
+            out.u64(entry.compressed_bytes);
+            out.u64(entry.bytes);
+            out.u64(entry.hash);
+            offset += entry.compressed_bytes;
+        }
+        let hash = xxh64(&out.bytes[PREAMBLE_BYTES..], 0);
+        out.u64(hash);
+        debug_assert_eq!(out.bytes.len(), start);
+        for section in &sections {
+            out.bytes(&section.bytes);
+        }
+        Ok(out.bytes)
     }
 
     /// How many bytes from the front of the file [`index`](Self::index) needs, from the
@@ -297,7 +511,36 @@ impl Container {
     /// `VersionMismatch` for another format version. Reads nothing else, so a reader asks
     /// `io` for the preamble, then for the rest of the prefix.
     pub fn index_len(preamble: &[u8]) -> Result<usize> {
-        todo!("check the preamble and read the block length")
+        let Some(preamble) = preamble.get(..PREAMBLE_BYTES) else {
+            return Err(invalid(format!(
+                "a container's preamble is {PREAMBLE_BYTES} bytes, got {}",
+                preamble.len()
+            )));
+        };
+        let mut reader = Reader::new(preamble);
+        if reader.take(4)? != MAGIC {
+            return Err(invalid("not a save container".to_owned()));
+        }
+        let format = reader.u16()?;
+        if format != CONTAINER_FORMAT_VERSION {
+            return Err(Error::new(
+                ErrorKind::VersionMismatch,
+                format!(
+                    "container format {format} is not the supported format \
+                     {CONTAINER_FORMAT_VERSION}"
+                ),
+            ));
+        }
+        if reader.u16()? != 0 {
+            return Err(invalid("a container's reserved word is not zero".to_owned()));
+        }
+        let block_len = reader.u64()?;
+        match usize::try_from(block_len) {
+            Ok(len) if len <= MAX_CONTAINER_BYTES - PREAMBLE_BYTES => Ok(PREAMBLE_BYTES + len),
+            _ => Err(invalid(format!(
+                "a header-and-index block of {block_len} bytes is over MAX_CONTAINER_BYTES"
+            ))),
+        }
     }
 
     /// The header and the index from the front of the file: `prefix` is at least
@@ -308,7 +551,90 @@ impl Container {
     /// [`MAX_CONTAINER_BYTES`] or overlaps another's, or an entry whose decompressed size
     /// exceeds [`MAX_SECTION_BYTES`].
     pub fn index(prefix: &[u8]) -> Result<ContainerIndex> {
-        todo!("check the block's hash, read the header and the entries")
+        let len = Self::index_len(prefix)?;
+        let Some(block) = prefix.get(PREAMBLE_BYTES..len) else {
+            return Err(invalid(format!(
+                "the header and index are {len} bytes from the front, got {}",
+                prefix.len()
+            )));
+        };
+        let Some((sealed, hash)) = block.split_last_chunk::<HASH_BYTES>() else {
+            return Err(invalid("the header-and-index block is shorter than its hash".to_owned()));
+        };
+        if u64::from_le_bytes(*hash) != xxh64(sealed, 0) {
+            return Err(invalid("the header-and-index block's hash does not match".to_owned()));
+        }
+        let mut reader = Reader::new(sealed);
+        let engine =
+            EngineVersion { major: reader.u16()?, minor: reader.u16()?, patch: reader.u16()? };
+        let schema_hash = SchemaHash(reader.u64()?);
+        let tick = Tick(reader.u32()?);
+        let next_net_id = NonZeroU64::new(reader.u64()?)
+            .ok_or_else(|| invalid("a container's NetId counter is zero".to_owned()))?;
+        let header = ContainerHeader {
+            format: CONTAINER_FORMAT_VERSION,
+            engine,
+            schema_hash,
+            tick,
+            next_net_id,
+        };
+        let count = reader.count(ENTRY_BYTES)?;
+        let mut regions: Vec<RegionIndexEntry> = Vec::with_capacity(count);
+        for _ in 0..count {
+            let region = RegionId(reader.u64()?);
+            let (seed, baseline_hash) = (reader.u64()?, reader.u64()?);
+            let present = reader.flag()?;
+            let digest = reader.u64()?;
+            if !present && digest != 0 {
+                return Err(invalid("an absent overlay's digest is not zero".to_owned()));
+            }
+            let entry = RegionIndexEntry {
+                region,
+                seed,
+                baseline_hash,
+                overlay_digest: present.then_some(digest),
+                offset: reader.u64()?,
+                compressed_bytes: reader.u64()?,
+                bytes: reader.u64()?,
+                hash: reader.u64()?,
+            };
+            if regions.last().is_some_and(|last| last.region >= region) {
+                return Err(invalid("the index is not strictly ascending by region".to_owned()));
+            }
+            let end = entry.offset.checked_add(entry.compressed_bytes);
+            if entry.offset < len as u64 {
+                return Err(invalid(format!(
+                    "the section of region {} lies within the header-and-index block",
+                    region.0
+                )));
+            }
+            if end.is_none_or(|end| end > MAX_CONTAINER_BYTES as u64) {
+                return Err(invalid(format!(
+                    "the section of region {} lies beyond MAX_CONTAINER_BYTES",
+                    region.0
+                )));
+            }
+            if entry.bytes > MAX_SECTION_BYTES as u64 {
+                return Err(invalid(format!(
+                    "the section of region {} decompresses to {} bytes, over MAX_SECTION_BYTES",
+                    region.0, entry.bytes
+                )));
+            }
+            regions.push(entry);
+        }
+        reader.finish()?;
+        let mut placed: Vec<&RegionIndexEntry> = regions.iter().collect();
+        placed.sort_unstable_by_key(|entry| (entry.offset, entry.compressed_bytes));
+        if let Some(pair) = placed
+            .windows(2)
+            .find(|pair| pair[0].offset + pair[0].compressed_bytes > pair[1].offset)
+        {
+            return Err(invalid(format!(
+                "the sections of regions {} and {} overlap",
+                pair[0].region.0, pair[1].region.0
+            )));
+        }
+        Ok(ContainerIndex { header, regions })
     }
 
     /// One region's records from its section: `section` is exactly the
@@ -323,7 +649,33 @@ impl Container {
     /// `lactose-bundle`'s bound on its documents. A failure here says nothing about any
     /// other section.
     pub fn decode_section(entry: &RegionIndexEntry, section: &[u8]) -> Result<RegionRecords> {
-        todo!("check the hash, decompress to the stated size, decode the content")
+        if section.len() as u64 != entry.compressed_bytes {
+            return Err(invalid(format!(
+                "the section of region {} is {} bytes, its entry states {}",
+                entry.region.0,
+                section.len(),
+                entry.compressed_bytes
+            )));
+        }
+        if xxh64(section, 0) != entry.hash {
+            return Err(invalid(format!(
+                "the section of region {} does not hash to its entry's hash",
+                entry.region.0
+            )));
+        }
+        let content = decompress(entry, section)?;
+        let records = RegionRecords::from_content(&content)?;
+        let agrees = records.region == entry.region
+            && records.seed == entry.seed
+            && records.baseline_hash == entry.baseline_hash
+            && records.overlay.as_ref().map(|overlay| overlay.digest()) == entry.overlay_digest;
+        if !agrees {
+            return Err(invalid(format!(
+                "the section of region {} states other records than its entry",
+                entry.region.0
+            )));
+        }
+        Ok(records)
     }
 
     /// One region's records from a whole file held in memory: [`index`](Self::index), the
@@ -331,7 +683,11 @@ impl Container {
     /// [`decode_section`](Self::decode_section) over the entry's bytes (`InvalidData` if
     /// `bytes` is too short for them).
     pub fn decode_region(bytes: &[u8], region: RegionId) -> Result<RegionRecords> {
-        todo!("index, find the entry, decode its section")
+        let index = Self::index(bytes)?;
+        let entry = index.entry(region).ok_or_else(|| {
+            Error::new(ErrorKind::NotFound, format!("the container holds no region {}", region.0))
+        })?;
+        Self::decode_section(entry, section_of(bytes, entry)?)
     }
 
     /// Every region's records from a whole file held in memory: [`index`](Self::index),
@@ -339,8 +695,50 @@ impl Container {
     /// on the first section that does: a caller that wants what is readable of a damaged
     /// file reads the index and each section itself (`README.md`, "The container").
     pub fn decode(bytes: &[u8]) -> Result<Self> {
-        todo!("index, then every section")
+        let index = Self::index(bytes)?;
+        let mut regions = BTreeMap::new();
+        for entry in &index.regions {
+            regions.insert(entry.region, Self::decode_section(entry, section_of(bytes, entry)?)?);
+        }
+        Ok(Self { header: index.header, regions })
     }
+}
+
+/// The bytes of `entry`'s section within a whole file.
+fn section_of<'a>(bytes: &'a [u8], entry: &RegionIndexEntry) -> Result<&'a [u8]> {
+    let start = usize::try_from(entry.offset).ok();
+    let end = start.zip(usize::try_from(entry.compressed_bytes).ok());
+    end.and_then(|(start, len)| bytes.get(start..start.checked_add(len)?)).ok_or_else(|| {
+        invalid(format!("the file ends before the section of region {}", entry.region.0))
+    })
+}
+
+/// A section's content: exactly one zstd frame that states and decompresses to exactly
+/// `entry.bytes`, at most [`MAX_SECTION_BYTES`] by the index's check. Nothing is
+/// allocated beyond that before the frame is known to state it.
+fn decompress(entry: &RegionIndexEntry, section: &[u8]) -> Result<Vec<u8>> {
+    let refuse = |what: &str| invalid(format!("the section of region {} {what}", entry.region.0));
+    let size = usize::try_from(entry.bytes)
+        .ok()
+        .filter(|&size| size <= MAX_SECTION_BYTES)
+        .ok_or_else(|| refuse("is over MAX_SECTION_BYTES"))?;
+    match zstd::zstd_safe::find_frame_compressed_size(section) {
+        Ok(len) if len == section.len() => {}
+        _ => return Err(refuse("is not exactly one zstd frame")),
+    }
+    match zstd::zstd_safe::get_frame_content_size(section) {
+        Ok(Some(stated)) if stated == entry.bytes => {}
+        _ => return Err(refuse("does not state its entry's decompressed size")),
+    }
+    let mut decompressor =
+        zstd::bulk::Decompressor::new().map_err(|_| refuse("could not be decompressed"))?;
+    let content = decompressor
+        .decompress(section, size)
+        .map_err(|_| refuse("does not decompress to its entry's size"))?;
+    if content.len() != size {
+        return Err(refuse("does not decompress to its entry's size"));
+    }
+    Ok(content)
 }
 
 /// The sections of a [`Container`], ascending by region. See [`Container::regions`].

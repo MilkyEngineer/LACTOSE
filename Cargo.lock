@@ -545,8 +545,12 @@ dependencies = [
  "lactose-ecs",
  "lactose-math",
  "lactose-net-api",
+ "lactose-physics-api",
  "lactose-reflect",
  "lactose-sim",
+ "lactose-task",
+ "tracing",
+ "zstd",
 ]
 
 [[package]]

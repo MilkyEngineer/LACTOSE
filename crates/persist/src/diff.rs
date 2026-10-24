@@ -2,17 +2,19 @@
 //! cooked baseline into the typed records of `lactose_bundle`, and the per-region unit a
 //! save and the relevance message are built from.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use lactose_asset_api::VersionTable;
-use lactose_bundle::{Baseline, ComponentData, ComponentSchema, Overlay, Record};
-use lactose_core::{ComponentKey, Result};
-use lactose_ecs::{RegionId, RegionRows};
+use lactose_bundle::{Archetype, Baseline, ComponentData, ComponentSchema, Overlay, Record};
+use lactose_core::{ComponentKey, Error, ErrorKind, NetId, Result, StableKey};
+use lactose_ecs::{ExportedRow, OwnedBy, RegionId, RegionRows};
 use lactose_net_api::{OverlayPayload, RegionRelevance};
+use lactose_reflect::{Persistence, Reflect, TypeInfo, TypeRole};
 use lactose_sim::RegionExport;
 
-use crate::schema::{LayoutDigest, SchemaTable};
+use crate::codec::invalid;
+use crate::schema::{LayoutDigest, Saved, SchemaTable};
 
 /// The overlay of `rows`, a region's state as `World::export_region` copied it out,
 /// against `baseline`, the cooked baseline the region was loaded from: every difference
@@ -38,7 +40,368 @@ use crate::schema::{LayoutDigest, SchemaTable};
 /// the size the table's schema states, or a baseline `OwnedBy` whose reference is not a
 /// `Net` key; and as `Overlay::new` fails.
 pub fn diff(rows: &RegionRows, baseline: &Baseline, schemas: &SchemaTable) -> Result<Overlay> {
-    todo!("compare each exported row with its baseline row and build the overlay")
+    diff_rows(&rows.rows, baseline, schemas)
+}
+
+/// [`diff`] over the rows alone: what [`RegionRecords::rebase`] runs on the rows it
+/// applied, which have no resources or seed.
+fn diff_rows(rows: &[ExportedRow], baseline: &Baseline, schemas: &SchemaTable) -> Result<Overlay> {
+    for schema in baseline.schemas() {
+        let info = component_info(schemas, schema.component())?;
+        // A saved column is compared byte for byte, so it must be in the layout the
+        // export's bytes are in; a derived one is never read.
+        if let Some(saved) = schemas.saved(info.key())
+            && *schema != saved.schema
+        {
+            return Err(invalid(format!(
+                "the baseline's schema of `{}` is not the registry's",
+                info.name()
+            )));
+        }
+    }
+    strictly_ascending(rows.iter().map(|row| row.id), "the export's rows")?;
+
+    // Every baseline row, ascending, with where it lies.
+    let mut cooked: Vec<(NetId, &Archetype, usize)> = baseline
+        .archetypes()
+        .iter()
+        .flat_map(|archetype| {
+            archetype.ids().iter().enumerate().map(move |(row, &id)| (id, archetype, row))
+        })
+        .collect();
+    cooked.sort_unstable_by_key(|&(id, ..)| id);
+
+    let mut differ = Differ { schemas, records: Vec::new(), ours: Vec::new(), theirs: Vec::new() };
+    let mut exported = rows.iter().peekable();
+    let mut cooked = cooked.into_iter().peekable();
+    loop {
+        match (exported.peek(), cooked.peek()) {
+            (None, None) => break,
+            (Some(row), Some(&(id, ..))) if row.id == id => {
+                let (_, archetype, index) = cooked.next().expect("peeked");
+                differ.both(exported.next().expect("peeked"), archetype, index)?;
+            }
+            (Some(row), Some(&(id, ..))) if row.id < id => {
+                differ.spawn(exported.next().expect("peeked"))?;
+            }
+            (Some(_), None) => differ.spawn(exported.next().expect("peeked"))?,
+            (_, Some(_)) => {
+                let (id, ..) = cooked.next().expect("peeked");
+                differ.records.push(Record::Destroy { id });
+            }
+        }
+    }
+    Overlay::new(baseline.content_hash(), schemas.schemas().cloned(), differ.records)
+}
+
+/// The records of one diff as they are found, and two scratch buffers for comparing a
+/// value with its baseline without allocating per component.
+struct Differ<'a> {
+    schemas: &'a SchemaTable,
+    records: Vec<Record>,
+    ours: Vec<u8>,
+    theirs: Vec<u8>,
+}
+
+impl Differ<'_> {
+    /// An exported row the baseline lacks.
+    fn spawn(&mut self, row: &ExportedRow) -> Result<()> {
+        strictly_ascending(row.components.iter().map(|data| data.component), "a row's components")?;
+        strictly_ascending(row.transient.iter().copied(), "a row's transient components")?;
+        let mut components = Vec::with_capacity(row.components.len() + row.transient.len());
+        for data in &row.components {
+            let saved = exported_value(self.schemas, data)?;
+            let mut bytes = data.bytes.clone();
+            saved.canonicalise(&mut bytes);
+            components.push(ComponentData { component: data.component, bytes });
+        }
+        for &component in &row.transient {
+            components.push(zeroed(transient(self.schemas, component)?));
+        }
+        let id = row.id;
+        self.records.push(if id.is_cooked() {
+            Record::SpawnFromBaseline { id, components }
+        } else {
+            Record::Spawn { id, components }
+        });
+        if row.owner.is_some() {
+            self.records.push(Record::OwnershipChange { id, owner: row.owner });
+        }
+        Ok(())
+    }
+
+    /// A row of both: row `index` of `archetype` in the baseline.
+    fn both(&mut self, row: &ExportedRow, archetype: &Archetype, index: usize) -> Result<()> {
+        let id = row.id;
+        let mut owner = None;
+        let mut columns = archetype.columns().peekable();
+        let mut exported = row.components.iter().peekable();
+        strictly_ascending(row.components.iter().map(|data| data.component), "a row's components")?;
+        // The persistent components, merged by key with the baseline's persistent columns.
+        loop {
+            let column = loop {
+                match columns.peek() {
+                    Some(column) if column.component == OwnedBy::KEY => {
+                        owner = baseline_owner(value_of(column, index))?;
+                        columns.next();
+                    }
+                    Some(column) if !persistent(self.schemas, column.component)? => {
+                        columns.next();
+                    }
+                    other => break other.copied(),
+                }
+            };
+            match (exported.peek(), column) {
+                (None, None) => break,
+                (Some(data), Some(column)) if data.component == column.component => {
+                    let saved = exported_value(self.schemas, data)?;
+                    if self.changed(saved, &data.bytes, value_of(&column, index)) {
+                        let bytes = self.ours.clone();
+                        let data = ComponentData { component: data.component, bytes };
+                        self.records.push(Record::AddComponent { id, data });
+                    }
+                    exported.next();
+                    columns.next();
+                }
+                (Some(data), Some(column)) if data.component < column.component => {
+                    self.add(id, data)?;
+                    exported.next();
+                }
+                (Some(data), None) => {
+                    self.add(id, data)?;
+                    exported.next();
+                }
+                (_, Some(column)) => {
+                    let component = column.component;
+                    self.records.push(Record::RemoveComponent { id, component });
+                    columns.next();
+                }
+            }
+        }
+        // The transient components, by presence alone.
+        strictly_ascending(row.transient.iter().copied(), "a row's transient components")?;
+        let mut had = BTreeSet::new();
+        for column in archetype.columns() {
+            let info = component_info(self.schemas, column.component)?;
+            if info.persistence() == Persistence::Transient {
+                had.insert(column.component);
+            }
+        }
+        for &component in &row.transient {
+            let saved = transient(self.schemas, component)?;
+            if !had.remove(&component) {
+                self.records.push(Record::AddComponent { id, data: zeroed(saved) });
+            }
+        }
+        for component in had {
+            self.records.push(Record::RemoveComponent { id, component });
+        }
+        if row.owner != owner {
+            self.records.push(Record::OwnershipChange { id, owner: row.owner });
+        }
+        Ok(())
+    }
+
+    /// A persistent component the baseline row lacks.
+    fn add(&mut self, id: NetId, data: &ComponentData) -> Result<()> {
+        let saved = exported_value(self.schemas, data)?;
+        let mut bytes = data.bytes.clone();
+        saved.canonicalise(&mut bytes);
+        self.records.push(Record::AddComponent {
+            id,
+            data: ComponentData { component: data.component, bytes },
+        });
+        Ok(())
+    }
+
+    /// Whether `exported` and `cooked`, two values of one saved type, differ once both are
+    /// canonical. Leaves the canonical `exported` in `self.ours`.
+    fn changed(&mut self, saved: &Saved, exported: &[u8], cooked: &[u8]) -> bool {
+        self.ours.clear();
+        self.ours.extend_from_slice(exported);
+        saved.canonicalise(&mut self.ours);
+        self.theirs.clear();
+        self.theirs.extend_from_slice(cooked);
+        saved.canonicalise(&mut self.theirs);
+        self.ours != self.theirs
+    }
+}
+
+/// `overlay` applied to the rows of `baseline` as `World::load_region` applies it, in the
+/// form `World::export_region` copies the loaded rows out: the owner from the last
+/// `OwnershipChange`, else from the row's `ecs::owned_by` value; the persistent components
+/// other than `ecs::owned_by` by value; the transient ones by presence; no derived
+/// component, since an export never carries one. The values are as the records and the
+/// baseline hold them, not validated: the diff canonicalises what it compares.
+fn applied(
+    overlay: &Overlay,
+    baseline: &Baseline,
+    schemas: &SchemaTable,
+) -> Result<Vec<ExportedRow>> {
+    #[derive(Default)]
+    struct Row {
+        components: BTreeMap<ComponentKey, Vec<u8>>,
+        owner: Option<Option<NetId>>,
+    }
+    let destroyed: BTreeSet<NetId> = overlay
+        .records()
+        .iter()
+        .filter_map(|record| match record {
+            Record::Destroy { id } => Some(*id),
+            _ => None,
+        })
+        .collect();
+    let mut rows: BTreeMap<NetId, Row> = BTreeMap::new();
+    for archetype in baseline.archetypes() {
+        for (index, &id) in archetype.ids().iter().enumerate() {
+            if destroyed.contains(&id) {
+                continue;
+            }
+            let row = rows.entry(id).or_default();
+            for column in archetype.columns() {
+                row.components.insert(column.component, value_of(&column, index).to_vec());
+            }
+        }
+    }
+    for record in overlay.records() {
+        match record {
+            Record::Spawn { id, components } | Record::SpawnFromBaseline { id, components } => {
+                let row = rows.entry(*id).or_default();
+                for data in components {
+                    row.components.insert(data.component, data.bytes.clone());
+                }
+            }
+            Record::Destroy { .. } => {}
+            Record::AddComponent { id, data } => {
+                rows.entry(*id).or_default().components.insert(data.component, data.bytes.clone());
+            }
+            Record::RemoveComponent { id, component } => {
+                rows.entry(*id).or_default().components.remove(component);
+            }
+            Record::SetField { id, component, field, bytes } => {
+                let info = schemas.info(*component).ok_or_else(|| unknown(*component))?;
+                let value = rows.entry(*id).or_default().components.get_mut(component).ok_or_else(
+                    || invalid("a `SetField` names a component the row lacks".to_owned()),
+                )?;
+                info.write_field(value, *field, bytes)?;
+            }
+            Record::OwnershipChange { id, owner } => {
+                rows.entry(*id).or_default().owner = Some(*owner);
+            }
+        }
+    }
+    let mut exported = Vec::with_capacity(rows.len());
+    for (id, row) in rows {
+        let mut owner = None;
+        let mut components = Vec::new();
+        let mut transient = Vec::new();
+        for (component, bytes) in row.components {
+            if component == OwnedBy::KEY {
+                owner = baseline_owner(&bytes)?;
+                continue;
+            }
+            match component_info(schemas, component)?.persistence() {
+                Persistence::Persistent => components.push(ComponentData { component, bytes }),
+                Persistence::Transient => transient.push(component),
+                Persistence::Derived => {}
+            }
+        }
+        let owner = row.owner.unwrap_or(owner);
+        exported.push(ExportedRow { id, owner, components, transient });
+    }
+    Ok(exported)
+}
+
+/// Row `index`'s value in `column`.
+fn value_of<'a>(column: &lactose_bundle::Column<'a>, index: usize) -> &'a [u8] {
+    let size = column.element_size as usize;
+    &column.bytes[index * size..(index + 1) * size]
+}
+
+/// The owner a baseline `OwnedBy` value names: `None` for the empty reference.
+fn baseline_owner(bytes: &[u8]) -> Result<Option<NetId>> {
+    let value: OwnedBy = bytemuck::checked::try_pod_read_unaligned(bytes)
+        .map_err(|_| invalid("an invalid `OwnedBy` in the baseline".to_owned()))?;
+    match value.owner.get() {
+        None => Ok(None),
+        Some(StableKey::Net(owner)) => Ok(Some(owner)),
+        Some(other) => {
+            Err(invalid(format!("a baseline `OwnedBy` names {other:?}, which is not a `Net` key")))
+        }
+    }
+}
+
+/// The registry's description of `component`, which must be a registered component.
+fn component_info(schemas: &SchemaTable, component: ComponentKey) -> Result<&'static TypeInfo> {
+    let info = schemas.info(component).ok_or_else(|| unknown(component))?;
+    if info.role() != TypeRole::Component {
+        return Err(invalid(format!("the resource `{}` is among a row's components", info.name())));
+    }
+    Ok(info)
+}
+
+/// Whether the baseline column `component` is persistent and so compared by value.
+fn persistent(schemas: &SchemaTable, component: ComponentKey) -> Result<bool> {
+    Ok(component_info(schemas, component)?.persistence() == Persistence::Persistent)
+}
+
+/// What the table keeps for `data`, a persistent component of an exported row, after the
+/// refusals the diff states.
+fn exported_value<'a>(schemas: &'a SchemaTable, data: &ComponentData) -> Result<&'a Saved> {
+    let info = component_info(schemas, data.component)?;
+    if info.key() == OwnedBy::KEY || info.persistence() != Persistence::Persistent {
+        return Err(invalid(format!(
+            "`{}` is among a row's persistent components but is not one",
+            info.name()
+        )));
+    }
+    let saved = schemas.saved(data.component).expect("a persistent type is saved");
+    sized(info, saved, &data.bytes)?;
+    Ok(saved)
+}
+
+/// What the table keeps for `component`, a transient component of an exported row.
+fn transient(schemas: &SchemaTable, component: ComponentKey) -> Result<&Saved> {
+    let info = component_info(schemas, component)?;
+    if info.persistence() != Persistence::Transient {
+        return Err(invalid(format!(
+            "`{}` is among a row's transient components but is not one",
+            info.name()
+        )));
+    }
+    Ok(schemas.saved(component).expect("a transient type is saved"))
+}
+
+/// The all-zero value of a saved type: how a transient value is carried.
+fn zeroed(saved: &Saved) -> ComponentData {
+    let size = saved.schema.element_size() as usize;
+    ComponentData { component: saved.schema.component(), bytes: vec![0; size] }
+}
+
+/// Fails unless `bytes` is the size `saved`'s schema states.
+fn sized(info: &TypeInfo, saved: &Saved, bytes: &[u8]) -> Result<()> {
+    let size = saved.schema.element_size() as usize;
+    if bytes.len() == size {
+        Ok(())
+    } else {
+        Err(invalid(format!("`{}` is {size} bytes, got {}", info.name(), bytes.len())))
+    }
+}
+
+fn strictly_ascending<T: Ord>(items: impl IntoIterator<Item = T>, what: &str) -> Result<()> {
+    let mut items = items.into_iter();
+    let Some(mut previous) = items.next() else { return Ok(()) };
+    for item in items {
+        if item <= previous {
+            return Err(invalid(format!("{what} are not strictly ascending")));
+        }
+        previous = item;
+    }
+    Ok(())
+}
+
+pub(crate) fn unknown(component: ComponentKey) -> Error {
+    Error::new(ErrorKind::NotFound, format!("type {:#018x} is not registered", component.0))
 }
 
 /// One region's part of a save, and what the relevance message carries (architecture
@@ -105,7 +468,44 @@ impl RegionRecords {
         baseline: &Baseline,
         schemas: &SchemaTable,
     ) -> Result<Self> {
-        todo!("diff the rows, canonicalise the resources, keep the seed, keys and digests")
+        let overlay = diff(&export.rows, baseline, schemas)?;
+        let overlay = (!overlay.records().is_empty()).then(|| Arc::new(overlay));
+        let mut resources = Vec::with_capacity(export.rows.resources.len());
+        for data in &export.rows.resources {
+            let (info, saved) = resource(schemas, data.component, Persistence::Persistent)?;
+            sized(info, saved, &data.bytes)?;
+            let mut bytes = data.bytes.clone();
+            saved.canonicalise(&mut bytes);
+            resources.push(ComponentData { component: data.component, bytes });
+        }
+        resources.sort_by_key(|data| data.component);
+        let mut transient_resources = export.rows.transient_resources.clone();
+        for &component in &transient_resources {
+            resource(schemas, component, Persistence::Transient)?;
+        }
+        transient_resources.sort_unstable();
+        let resource_schemas = resources
+            .iter()
+            .map(|data| schemas.saved(data.component).expect("checked above").schema.clone())
+            .collect();
+        let carried = overlay.iter().flat_map(|overlay| overlay.schemas());
+        let layouts = carried
+            .map(ComponentSchema::component)
+            .chain(resources.iter().map(|data| data.component))
+            .map(|component| (component, schemas.layout(component).expect("a saved type")))
+            .collect();
+        let records = Self {
+            region: export.region,
+            seed: export.rows.seed,
+            baseline_hash: baseline.content_hash(),
+            overlay,
+            resources,
+            resource_schemas,
+            transient_resources,
+            layouts,
+        };
+        records.check()?;
+        Ok(records)
     }
 
     /// Whether these records are in canonical form: `overlay` is `None` or holds a record;
@@ -118,7 +518,71 @@ impl RegionRecords {
     /// crate holds this, so a caller that assembles records by hand runs it before handing
     /// them over.
     pub fn check(&self) -> Result<()> {
-        todo!("check each canonical rule in order")
+        if let Some(overlay) = &self.overlay {
+            if overlay.records().is_empty() {
+                return Err(invalid("the records hold an empty overlay, not `None`".to_owned()));
+            }
+            if overlay.baseline_hash() != self.baseline_hash {
+                return Err(invalid(format!(
+                    "the records name baseline {:#018x} and their overlay {:#018x}",
+                    self.baseline_hash,
+                    overlay.baseline_hash()
+                )));
+            }
+        }
+        strictly_ascending(self.resources.iter().map(|data| data.component), "the resources")?;
+        if self.resource_schemas.len() != self.resources.len() {
+            return Err(invalid(format!(
+                "{} resources have {} schemas",
+                self.resources.len(),
+                self.resource_schemas.len()
+            )));
+        }
+        for (data, schema) in self.resources.iter().zip(&self.resource_schemas) {
+            if schema.component() != data.component {
+                return Err(invalid(format!(
+                    "the schema of resource {:#018x} names {:#018x}",
+                    data.component.0,
+                    schema.component().0
+                )));
+            }
+            if schema.element_size() as usize != data.bytes.len() {
+                return Err(invalid(format!(
+                    "resource {:#018x} is {} bytes and its schema states {}",
+                    data.component.0,
+                    data.bytes.len(),
+                    schema.element_size()
+                )));
+            }
+        }
+        strictly_ascending(self.transient_resources.iter().copied(), "the transient resources")?;
+        for &component in &self.transient_resources {
+            if self.resources.binary_search_by_key(&component, |data| data.component).is_ok() {
+                return Err(invalid(format!(
+                    "resource {:#018x} is both saved and transient",
+                    component.0
+                )));
+            }
+        }
+        let carried: BTreeSet<ComponentKey> = self
+            .overlay
+            .iter()
+            .flat_map(|overlay| overlay.schemas())
+            .map(ComponentSchema::component)
+            .chain(self.resources.iter().map(|data| data.component))
+            .collect();
+        if let Some(missing) =
+            carried.iter().find(|component| !self.layouts.contains_key(component))
+        {
+            return Err(invalid(format!("no layout digest for {:#018x}", missing.0)));
+        }
+        if let Some(extra) = self.layouts.keys().find(|component| !carried.contains(component)) {
+            return Err(invalid(format!(
+                "a layout digest for {:#018x}, which the records do not carry",
+                extra.0
+            )));
+        }
+        Ok(())
     }
 
     /// The relevance message for these records (architecture section 9.3): the region,
@@ -145,13 +609,77 @@ impl RegionRecords {
     }
 
     /// Carries these records over to `patched`, a re-cooked baseline whose content hash
-    /// differs from [`baseline_hash`](Self::baseline_hash): `Overlay::rebase`, after which
-    /// `baseline_hash` names `patched` and the overlay fits it, or `None` if nothing is
-    /// left. Returns the records the rebase dropped, in order, so the caller can re-home
-    /// those of a cooked entity the patch moved to another region (the cross-region pass
-    /// is not in this crate yet). With no overlay only the hash changes. `layouts` keeps
-    /// the entries of the types still carried. Fails only as `Overlay::rebase` fails.
-    pub fn rebase(&mut self, patched: &Baseline) -> Result<Vec<Record>> {
-        todo!("rebase the overlay and take the patched baseline's hash")
+    /// differs from [`baseline_hash`](Self::baseline_hash), and the result is the record set
+    /// [`from_export`](Self::from_export) would give the same state against `patched`:
+    /// `Overlay::rebase` decides what is kept and what is dropped (architecture section
+    /// 15.2), the kept records are applied to the patched rows into the export's form (the
+    /// owner from `OwnershipChange`, else the row's `ecs::owned_by` value; persistent
+    /// components by value; transient components by presence; a derived column is the
+    /// baseline's), and [`diff`] runs over them against `patched`.
+    ///
+    /// Afterwards `baseline_hash` names `patched`, the overlay fits it or is `None` if
+    /// nothing is left, and `layouts` holds the table's digest of every type the new overlay
+    /// carries and the resources' entries as they were. Returns the records the rebase
+    /// dropped, in order, so the caller can re-home those of a cooked entity the patch
+    /// moved to another region (the cross-region pass is not in this crate yet). With no
+    /// overlay only the hash changes.
+    ///
+    /// The records must pass [`check`](Self::check) and be at the table's schemas, as
+    /// [`Loader::migrate`](crate::Loader::migrate) leaves them: fails as `check` fails, with
+    /// `NotFound` for a type the overlay carries that the table does not know and
+    /// `VersionMismatch` for one carried at another schema or digest than the table's, and
+    /// otherwise as `Overlay::rebase` and [`diff`] fail. On failure the records are
+    /// unchanged.
+    pub fn rebase(&mut self, patched: &Baseline, schemas: &SchemaTable) -> Result<Vec<Record>> {
+        self.check()?;
+        let Some(overlay) = &self.overlay else {
+            self.baseline_hash = patched.content_hash();
+            return Ok(Vec::new());
+        };
+        for schema in overlay.schemas() {
+            let component = schema.component();
+            let info = schemas.info(component).ok_or_else(|| unknown(component))?;
+            if schemas.schema(component) != Some(schema)
+                || self.layouts.get(&component).copied() != schemas.layout(component)
+            {
+                return Err(Error::new(
+                    ErrorKind::VersionMismatch,
+                    format!(
+                        "the records carry `{}` at another schema than the table's",
+                        info.name()
+                    ),
+                ));
+            }
+        }
+        let (kept, dropped) = overlay.rebase(patched)?;
+        let rebased = diff_rows(&applied(&kept, patched, schemas)?, patched, schemas)?;
+        let overlay = (!rebased.records().is_empty()).then(|| Arc::new(rebased));
+        let carried = overlay.iter().flat_map(|overlay| overlay.schemas()).map(|schema| {
+            let component = schema.component();
+            (component, schemas.layout(component).expect("the diff carries saved types"))
+        });
+        let resources =
+            self.resources.iter().map(|data| (data.component, self.layouts[&data.component]));
+        self.layouts = carried.chain(resources).collect();
+        self.baseline_hash = patched.content_hash();
+        self.overlay = overlay;
+        Ok(dropped)
     }
+}
+
+/// The description and saved form of the region resource `component`, which must be a
+/// registered resource of `persistence`.
+fn resource(
+    schemas: &SchemaTable,
+    component: ComponentKey,
+    persistence: Persistence,
+) -> Result<(&'static TypeInfo, &Saved)> {
+    let info = schemas.info(component).ok_or_else(|| unknown(component))?;
+    if info.role() != TypeRole::Resource || info.persistence() != persistence {
+        return Err(invalid(format!(
+            "`{}` is exported as a {persistence:?} region resource but is not one",
+            info.name()
+        )));
+    }
+    Ok((info, schemas.saved(component).expect("a saved type")))
 }

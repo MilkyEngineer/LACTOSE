@@ -1018,9 +1018,11 @@ writes a changed component as `AddComponent` and never as `SetField` (D129); a d
 row is `Destroy` alone. Rebasing onto a patched baseline keeps every runtime-spawned and migrated
 entity, drops every record of a cooked entity that is no longer a row, drops `RemoveComponent` and
 `SetField` of a component the row no longer has, and returns the dropped records so `persist` can
-re-home an entity the patch moved to another region. An `AddComponent` the rebase keeps overwrites
-the patched row's component whole, so a patch to a field of a component the save touched does not
-reach that entity until the diff writes field-level records (D129).
+re-home an entity the patch moved to another region. `persist` then diffs the rebased state against
+the patched baseline, so a rebased section is the one record set of its state (D134). An
+`AddComponent` the rebase keeps overwrites the patched row's component whole, so a patch to a field
+of a component the save touched does not reach that entity until the diff writes field-level records
+(D129).
 
 ### 15.3 Save operation
 

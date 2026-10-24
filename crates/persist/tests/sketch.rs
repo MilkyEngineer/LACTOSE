@@ -1,9 +1,9 @@
-//! Compile-only consumer sketches against the facade: what the server's `app` writes to
+//! Compile-only consumer sketches against the surface: what the server's `app` writes to
 //! save and to load, in a fresh process, in place and one region at a time; what it writes
 //! to build the relevance message from a region's records; what a game crate writes to
-//! migrate a component; and the shape of the section 15.5 tests. Type-checked and never
-//! run (every deciding body of the crate is `todo!()`). They pin the surface the README
-//! promises: a change that breaks one is a signature change to list.
+//! migrate a component; and the shape of the section 15.5 tests, which `reload.rs`,
+//! `migrate.rs` and `schema.rs` run. Type-checked and never run. They pin the surface the
+//! README promises: a change that breaks one is a signature change to list.
 
 #![forbid(unsafe_code)]
 #![allow(dead_code, unused_variables, missing_docs)]
@@ -241,16 +241,18 @@ fn recover(file: &[u8]) -> Result<(Vec<RegionRecords>, Vec<RegionId>)> {
     Ok((readable, damaged))
 }
 
-/// A save whose baselines were re-cooked since: each section is carried over before it
-/// is loaded, and the records the rebase dropped go to the cross-region pass that is not
-/// in this crate yet.
+/// A save whose baselines were re-cooked since: each section is migrated to this build
+/// and carried over before it is loaded, and the records the rebase dropped go to the
+/// cross-region pass that is not in this crate yet.
 fn rebase_all(container: &mut Container, context: &SaveContext) -> Result<()> {
+    let loader = Loader::new(&context.schemas, &context.migrations);
     let regions: Vec<RegionId> = container.regions().map(|records| records.region).collect();
     for region in regions {
         let mut records = container.remove(region).expect("listed above");
         let patched = context.baseline(region);
         if patched.content_hash() != records.baseline_hash {
-            let dropped = records.rebase(&patched)?;
+            records = loader.migrate(&records)?;
+            let dropped = records.rebase(&patched, &context.schemas)?;
             let _ = dropped;
         }
         container.insert(records)?;

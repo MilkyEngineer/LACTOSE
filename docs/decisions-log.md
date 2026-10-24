@@ -881,6 +881,41 @@ rationale the author supplied during the editorial pass rather than one taken fr
   same order.
 - Driven by: milestone 1, the `persist` facade brief and its design reviews r1 to r5
   (2026-10-18 to 2026-10-24).
+- Addendum (lane persist-impl, 2026-10-25): implemented. Every todo!() is replaced; the one
+  public change is D134's `RegionRecords::rebase(&mut self, patched, schemas)`. `[harness]`
+  lists `lactose-persist`, whose reload tests (four in `tests/reload.rs`, one in
+  `tests/physics.rs` over `physics-api`'s test backend, included by path, bit-equal with its
+  twin) record under SOUR and agree under workers, repeat, layout (rows 1, 7, 64, 16 KiB) and
+  chaos (seeds 1 to 3). What the facade left to the implementation: a section is one zstd frame
+  at level 3 with zstd's checksum off (the entry's xxh64 covers the frame) and the content size
+  on; the resource schema table is written by this crate byte for byte as `lactose-bundle`'s
+  crate-private `write_table` writes one, `tests/format.rs` holding the two equal until bundle
+  exports it; `SchemaTable`'s derivation is held equal to the ECS's by the loader's acceptance
+  in `tests/roundtrip.rs` until the ECS exports `document_schema`; `diff` refuses a baseline
+  persistent column saved in another schema than the table's (`InvalidData`; `Loader::bundle`
+  says `VersionMismatch` for it and for a derived column the diff accepts); `assemble` refuses
+  a header of another format (`VersionMismatch`); a persistent component's `SetField` under a
+  changed version or digest is `Unsupported`, while a transient type's `SetField` is dropped
+  when its schema differs and kept when it is equal, its value loading zeroed either way.
+  D133's invariant is what `from_export` rests on: in `tests/diff.rs` 200 seeded histories of
+  legal writes, unloads and reloads over two regions keep the world a forest with `from_export`
+  never failing, every unload's records reload (each edge a reload breaks is a row's edge to a
+  live entity of the other region whose chain returns to the row; 10 in the 200), and a restart
+  in either order loads and round-trips exactly. The level, measured on an Apple M1 (release,
+  median of 7, load 3.9 to 3.5) over a 100k-row region of four small components: levels 1 and 3
+  within 5% of each other in size (level 1 smaller on float noise, larger on structured
+  values), level 3 at most 22.6 ms; levels 6, 9 and 19 cost 3 to 270 times more for no gain.
+  Mutation checks: each change kind of the diff, each of `check`'s canonical-order refusals,
+  the block and section hashes and their seeds, both caps, the index order and prefix read, a
+  skipped or reordered migration step, the scalar canonicalisation of a spawned, gained or
+  resource value on the save and the load, the transient `SetField` rule, the reuse of an
+  unchanged overlay, both baseline-schema refusals, a runtime owner dropped or refused by the
+  diff, and each part of D134's rebase (the re-diff, the patched rows as the base, the kept
+  overlay as what is applied, the owner, derived and transient rules, `Destroy`, a persistent
+  `SetField`'s write, the `check` and the schema precondition) each fail a test. The
+  cross-crate additions above (ecs `document_schema`, bundle's table codec export and digest,
+  the committed version-and-digest guard, the 16 KiB registration refusal) remain for their
+  lanes.
 
 **D130. The `io` facade: what sections 4, 5.1, 8.2, 9.7, 15.3, 19 and 20 left open** (§3, §4, §5.1, §8.2, §9.7, §14, §15.3, §19, §20, §21, `lactose-io`, `lactose-core`, `lactose-task`)
 - Why: the facade is written before its implementation so `asset`, `app`'s save path, `cook`
@@ -4080,6 +4115,50 @@ relayed by an event when it acts on another body** (§6.1, §10, `lactose-ecs`,
 - Replaced: `Overlay::new`'s refusal of an owner the overlay destroys (D101's implementation);
   the ECS's acceptance of a self-owner and a cycle, which D114 and D117 did not mention; the
   first text's `load_region` refusal of a cross-region cycle and its refused `bind`.
+
+**D134. A rebased section is the diff of its state: `RegionRecords::rebase` takes the schema table** (§15.2, §15.4, `lactose-persist`, `lactose-bundle`)
+- Why: the persist implementation's review found that `Overlay::rebase` rewrites a migrated
+  entity the patch made a row as an `AddComponent` per component it carries and a
+  `RemoveComponent` per column it lacks, a valid overlay for the patched baseline but not the
+  record set `from_export` gives the same state: an `AddComponent` equal to the patched value,
+  a `RemoveComponent` of a derived column (which also strips the loaded entity of it), a zeroed
+  `AddComponent` of a transient the row has, and a `RemoveComponent` of `ecs::owned_by` where
+  the diff writes `OwnershipChange`. Two record sets for one state is what D101 forbids: the
+  digest would depend on the path, the client's cache by digest would miss, and the store would
+  hold a set no export makes.
+  - *The signature changes to `rebase(&mut self, patched: &Baseline, schemas: &SchemaTable) ->
+    Result<Vec<Record>>`.* The canonical set is `from_export`'s rule, which needs the table for
+    canonical scalar bytes and each type's persistence; a rebase without it cannot be
+    canonical. The records must pass `check` (`InvalidData` otherwise) and be at the table's
+    schemas and digests, as `Loader::migrate` leaves them (`VersionMismatch` otherwise), the
+    records unchanged on any failure, since the applier writes fields and the diff compares
+    bytes in the table's layout; a section of an old save is migrated, then rebased, then
+    bundled. Rules out naming `rebase` an exception to "equal state gives equal records".
+  - *The rule is apply-then-diff.* `Overlay::rebase` keeps and drops as §15.2 says; the kept
+    overlay is applied to the patched rows into the export's form (the owner from
+    `OwnershipChange`, else the row's `ecs::owned_by` column; persistent components, a
+    `SetField` written into the patched value; transient components by presence; a derived
+    column is the baseline's) and diffed against `patched` by the one diff. Equal state gives
+    equal records by construction and a later rule of the diff needs no mirror. Equal means
+    equal once canonical: another NaN payload in the patch is the saved NaN, and negative zero
+    is a value of its own. Rules out a post-pass that enumerates the diff's rules, and a diff
+    over the old baseline, which would re-emit every component the patch changed and undo the
+    patch.
+  - *`Overlay::rebase` is unchanged, and named as valid rather than canonical.* The bundle
+    cannot know the ownership key, and its `RemoveComponent(ecs::owned_by)` loads to the right
+    state, the column removed and then the `OwnershipChange` applied in record order. Rules out
+    a hidden ownership key in `bundle`. Named and deferred: ownership as a row property of the
+    baseline at milestone 3 with RICOTTA, which removes the column and the special cases; a
+    shared `Overlay::apply_to` for `load_region` and this rebase.
+  - *A patch whose cooked ownership closes a cycle with a saved `OwnershipChange` within one
+    region is refused at `load_region`, since the cycle lies within the document (the cook and
+    the save contradict); one that crosses regions is broken by the load like any other (D133).
+    Neither is repaired by `rebase`; the re-homing pass (milestone 3) is the place to decide
+    it.*
+- Driven by: persist implementation review r1, F4, and the fix round's stop on the signature;
+  review r2, N1 and N2 (2026-10-25). Implemented in persist-impl fix rounds 1b and 1c:
+  `tests/rebase.rs`.
+- Replaced: D129's `RegionRecords::rebase(&mut self, patched: &Baseline)`.
 
 **D135. One set of validity rules for physics values, stated and implemented in `physics-api`** (§8.2, §16, §17, `lactose-physics-api`, `lactose-physics-rapier`, `lactose-anim`)
 - Why: the rules a body, collider, joint, transform, velocity and command must meet were held

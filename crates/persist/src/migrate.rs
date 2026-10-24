@@ -9,14 +9,17 @@
 //! assembled under the registry's layout by field ID and validated.
 
 use std::collections::BTreeMap;
+use std::collections::btree_map::Entry;
 use std::sync::Arc;
 
 use bytemuck::{CheckedBitPattern, NoUninit};
-use lactose_bundle::{ComponentSchema, Overlay};
-use lactose_core::{ComponentKey, FieldId, Result};
-use lactose_reflect::TypeInfo;
+use lactose_bundle::{ComponentData, ComponentSchema, Overlay, Record};
+use lactose_core::{ComponentKey, Error, ErrorKind, FieldId, Result};
+use lactose_reflect::{Persistence, TypeInfo, TypeRole};
 
-use crate::schema::{LayoutDigest, SchemaTable};
+use crate::codec::invalid;
+use crate::diff::unknown;
+use crate::schema::{LayoutDigest, SchemaTable, document_schema};
 
 /// One migration step: a function over the fields of a value at version `from` that
 /// leaves them at version `from + 1`.
@@ -76,7 +79,27 @@ impl FieldValues {
     /// Field `id` read as a `T`. Fails with `NotFound` if the value lacks the field and
     /// with `InvalidData` if its bytes are not a valid `T` of `T`'s size.
     pub fn read<T: CheckedBitPattern>(&self, id: FieldId) -> Result<T> {
-        todo!("checked unaligned read of the field's bytes")
+        let bytes = self.get(id).ok_or_else(|| {
+            Error::new(
+                ErrorKind::NotFound,
+                format!(
+                    "{:#018x} has no field {} at version {}",
+                    self.component.0, id.0, self.version
+                ),
+            )
+        })?;
+        if bytes.len() != size_of::<T>() {
+            return Err(invalid(format!(
+                "field {} of {:#018x} is {} bytes, read as {} bytes",
+                id.0,
+                self.component.0,
+                bytes.len(),
+                size_of::<T>()
+            )));
+        }
+        bytemuck::checked::try_pod_read_unaligned(bytes).map_err(|_| {
+            invalid(format!("field {} of {:#018x} is not a valid value", id.0, self.component.0))
+        })
     }
 
     /// Sets field `id` to `bytes`, replacing any value it had.
@@ -138,7 +161,16 @@ impl Migrations {
     /// Registers `migration`. Fails with `InvalidData` if a step for the same type and
     /// version is registered already: two crates cannot both own a type's migration.
     pub fn register(&mut self, migration: Migration) -> Result<()> {
-        todo!("refuse a duplicate (component, from), else insert")
+        match self.steps.entry((migration.component, migration.from)) {
+            Entry::Occupied(_) => Err(invalid(format!(
+                "a step from version {} of {:#018x} is registered already",
+                migration.from, migration.component.0
+            ))),
+            Entry::Vacant(slot) => {
+                slot.insert(migration.run);
+                Ok(())
+            }
+        }
     }
 
     /// The step that reads version `from` of `component`, if registered.
@@ -200,7 +232,90 @@ impl Migrations {
         layout: LayoutDigest,
         bytes: &[u8],
     ) -> Result<Vec<u8>> {
-        todo!("transient to zeroes; fast path, refusals, then split, run the steps and assemble")
+        let name = info.name();
+        let size = info.layout().size();
+        if info.persistence() == Persistence::Transient {
+            return Ok(vec![0; size]);
+        }
+        if schema.component() != info.key() {
+            return Err(invalid(format!(
+                "a schema of {:#018x} is not one of `{name}`",
+                schema.component().0
+            )));
+        }
+        if bytes.len() != schema.element_size() as usize {
+            return Err(invalid(format!(
+                "a value of `{name}` is {} bytes and its schema states {}",
+                bytes.len(),
+                schema.element_size()
+            )));
+        }
+        let (from, to) = (schema.schema_version(), info.version());
+        if from > to {
+            return Err(mismatch(format!(
+                "`{name}` was saved at version {from}, newer than this build's {to}"
+            )));
+        }
+        if from == to {
+            if layout != LayoutDigest::of(info) || *schema != document_schema(info)? {
+                return Err(mismatch(format!(
+                    "`{name}` changed its layout at version {to} without a version bump"
+                )));
+            }
+            return Ok(bytes.to_vec());
+        }
+        let mut steps = Vec::with_capacity((to - from) as usize);
+        for version in from..to {
+            let step = self.step(info.key(), version).ok_or_else(|| {
+                mismatch(format!(
+                    "no migration of `{name}` from version {version} (saved at {from}, this \
+                     build at {to})"
+                ))
+            })?;
+            steps.push((version, step));
+        }
+        let fields = schema.fields().iter().map(|field| {
+            let at = field.offset as usize..(field.offset + field.size) as usize;
+            (field.id, bytes[at].to_vec())
+        });
+        let mut value =
+            FieldValues { component: info.key(), version: from, fields: fields.collect() };
+        for (version, step) in steps {
+            value.version = version;
+            step(&mut value)?;
+        }
+        value.version = to;
+
+        let mut out = vec![0; size];
+        for field in info.layout().fields() {
+            let Some(id) = field.id() else { continue };
+            let bytes = value.take(id).ok_or_else(|| {
+                mismatch(format!(
+                    "migrating `{name}` to version {to} left field `{}` ({}) unset",
+                    field.name(),
+                    id.0
+                ))
+            })?;
+            if bytes.len() != field.size() {
+                return Err(mismatch(format!(
+                    "migrating `{name}` to version {to} left field `{}` ({}) {} bytes, not {}",
+                    field.name(),
+                    id.0,
+                    bytes.len(),
+                    field.size()
+                )));
+            }
+            out[field.offset()..field.offset() + field.size()].copy_from_slice(&bytes);
+        }
+        if let Some(id) = value.ids().next() {
+            return Err(mismatch(format!(
+                "migrating `{name}` to version {to} left field {}, which the type lacks",
+                id.0
+            )));
+        }
+        info.zero_padding(&mut out)?;
+        info.validate(&out)?;
+        Ok(out)
     }
 
     /// Brings every value `overlay` carries to the registry's schemas: each component of a
@@ -231,15 +346,139 @@ impl Migrations {
     /// Fails as [`migrate`](Self::migrate) fails; with `NotFound` for a component the table
     /// does not know (a removed type: never dropped silently); with `InvalidData` for a
     /// carried component `layouts` lacks; and with `Unsupported` for a `SetField` record of
-    /// a component whose version or digest differs, since one field cannot be migrated
-    /// without the rest of its value (this crate's diff never writes a `SetField`, so none
-    /// is in a save it wrote; one at the registry's version and digest passes through).
+    /// a persistent component whose version or digest differs, since one field cannot be
+    /// migrated without the rest of its value (this crate's diff never writes a `SetField`,
+    /// so none is in a save it wrote; one at the registry's version and digest passes
+    /// through). A transient type's `SetField` is dropped when its schema differs and kept
+    /// when it is equal; either way its value loads zeroed.
     pub fn migrate_overlay(
         &self,
         overlay: &Arc<Overlay>,
         layouts: &BTreeMap<ComponentKey, LayoutDigest>,
         schemas: &SchemaTable,
     ) -> Result<Arc<Overlay>> {
-        todo!("migrate each carried value and rebuild the overlay, or return it unchanged")
+        let mut plans = BTreeMap::new();
+        for schema in overlay.schemas() {
+            let component = schema.component();
+            let info = component_of(schemas, component)?;
+            let plan = match info.persistence() {
+                Persistence::Derived => Plan::Drop,
+                Persistence::Transient if schemas.schema(component) == Some(schema) => Plan::Keep,
+                Persistence::Transient => Plan::Zero,
+                Persistence::Persistent => {
+                    let layout = *layouts.get(&component).ok_or_else(|| {
+                        invalid(format!("no layout digest for `{}`", info.name()))
+                    })?;
+                    let current = schemas.saved(component).expect("a persistent type is saved");
+                    if *schema == current.schema && layout == current.layout {
+                        Plan::Keep
+                    } else {
+                        Plan::Migrate(info, layout)
+                    }
+                }
+            };
+            plans.insert(component, plan);
+        }
+        // A `RemoveComponent` carries no bytes, so its component is not in the table above.
+        for record in overlay.records() {
+            if let Record::RemoveComponent { component, .. } = *record
+                && let Entry::Vacant(slot) = plans.entry(component)
+            {
+                let info = component_of(schemas, component)?;
+                let derived = info.persistence() == Persistence::Derived;
+                slot.insert(if derived { Plan::Drop } else { Plan::Keep });
+            }
+        }
+        if plans.values().all(|plan| matches!(plan, Plan::Keep)) {
+            return Ok(Arc::clone(overlay));
+        }
+
+        let value = |data: &ComponentData| -> Result<Option<ComponentData>> {
+            let bytes = match plans[&data.component] {
+                Plan::Keep => data.bytes.clone(),
+                Plan::Drop => return Ok(None),
+                Plan::Zero => {
+                    let size = schemas.saved(data.component).expect("saved").schema.element_size();
+                    vec![0; size as usize]
+                }
+                Plan::Migrate(info, layout) => {
+                    let schema = overlay.schema(data.component).expect("a carried component");
+                    let mut bytes = self.migrate(info, schema, layout, &data.bytes)?;
+                    schemas.saved(data.component).expect("saved").canonicalise(&mut bytes);
+                    bytes
+                }
+            };
+            Ok(Some(ComponentData { component: data.component, bytes }))
+        };
+        let mut records = Vec::with_capacity(overlay.records().len());
+        for record in overlay.records() {
+            let record = match record {
+                Record::Spawn { id, components } => {
+                    let components = components.iter().filter_map(|d| value(d).transpose());
+                    Record::Spawn { id: *id, components: components.collect::<Result<_>>()? }
+                }
+                Record::SpawnFromBaseline { id, components } => {
+                    let components = components.iter().filter_map(|d| value(d).transpose());
+                    let components = components.collect::<Result<_>>()?;
+                    Record::SpawnFromBaseline { id: *id, components }
+                }
+                Record::AddComponent { id, data } => match value(data)? {
+                    Some(data) => Record::AddComponent { id: *id, data },
+                    None => continue,
+                },
+                Record::RemoveComponent { component, .. } => match plans[component] {
+                    Plan::Drop => continue,
+                    Plan::Keep | Plan::Zero | Plan::Migrate(..) => record.clone(),
+                },
+                Record::SetField { component, .. } => {
+                    match plans[component] {
+                        Plan::Keep => record.clone(),
+                        // A transient value loads zeroed, so a field of one says nothing.
+                        Plan::Drop | Plan::Zero => continue,
+                        Plan::Migrate(info, _) => {
+                            return Err(Error::new(
+                                ErrorKind::Unsupported,
+                                format!(
+                                    "a `SetField` of `{}` cannot be migrated without the rest \
+                                     of its value",
+                                    info.name()
+                                ),
+                            ));
+                        }
+                    }
+                }
+                Record::Destroy { .. } | Record::OwnershipChange { .. } => record.clone(),
+            };
+            records.push(record);
+        }
+        Ok(Arc::new(Overlay::new(overlay.baseline_hash(), schemas.schemas().cloned(), records)?))
     }
+}
+
+/// What [`Migrations::migrate_overlay`] does with each component an overlay names.
+#[derive(Clone, Copy)]
+enum Plan {
+    /// At the registry's version and digest, or transient under the table's schema.
+    Keep,
+    /// Persistent at another version or digest: through [`Migrations::migrate`] under the
+    /// digest the records carry.
+    Migrate(&'static TypeInfo, LayoutDigest),
+    /// Transient under another schema: zeroes of the registry's size.
+    Zero,
+    /// Derived now: never from a document.
+    Drop,
+}
+
+/// The registry's description of `component`, which an overlay names: `NotFound` for a
+/// type the table does not know, `InvalidData` for a resource.
+fn component_of(schemas: &SchemaTable, component: ComponentKey) -> Result<&'static TypeInfo> {
+    let info = schemas.info(component).ok_or_else(|| unknown(component))?;
+    if info.role() != TypeRole::Component {
+        return Err(invalid(format!("the resource `{}` is in an overlay", info.name())));
+    }
+    Ok(info)
+}
+
+fn mismatch(message: String) -> Error {
+    Error::new(ErrorKind::VersionMismatch, message)
 }
