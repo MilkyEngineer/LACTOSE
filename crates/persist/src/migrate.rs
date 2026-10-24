@@ -168,8 +168,10 @@ impl Migrations {
     /// - `info.persistence()` is `Transient`: the all-zero value of `info`'s size, whatever
     ///   `schema`, `layout` and `bytes` say. A transient value is never saved (architecture
     ///   section 15.1): a save carries its presence, the loader zeroes it, and a layout
-    ///   change to a transient type breaks no save, needs no bump and no step, and runs no
-    ///   check.
+    ///   change to a type that stays transient breaks no save, needs no bump and no step,
+    ///   and runs no check (a type made persistent since the save is read by the rules
+    ///   below from the schema and digest it was saved under:
+    ///   [`Loader::migrate`](crate::Loader::migrate)).
     /// - `schema.schema_version()` greater than `info.version()`: `VersionMismatch`, a
     ///   newer save than the build.
     /// - Equal versions: `layout` equal to [`LayoutDigest::of`]`(info)` is the fast path
@@ -218,10 +220,12 @@ impl Migrations {
     /// component whatever a document says; when the schema differs (a layout change to a
     /// transient type) the record's component is rewritten as zeroes of the registry's size
     /// under the table's schema, since the loader requires every schema of a document to
-    /// match the registry's. A component the registry now says is `derived` is dropped from
-    /// the record (and a `RemoveComponent` or `SetField` of it dropped whole): a derived
-    /// value is rebuilt on load and never comes from a document, and the build declared it
-    /// so.
+    /// match the registry's. A component the registry now says is `derived` is dropped: it
+    /// leaves its `Spawn` or `SpawnFromBaseline` record, which stays, and an `AddComponent`,
+    /// `RemoveComponent` or `SetField` of it is dropped whole, since a derived value is
+    /// rebuilt on load and never comes from a document, and the build declared it so. An
+    /// overlay whose every record was dropped comes back empty, the one way this function
+    /// yields an empty overlay; [`Loader::migrate`](crate::Loader::migrate) makes it `None`.
     ///
     /// Fails as [`migrate`](Self::migrate) fails; with `NotFound` for a component the table
     /// does not know (a removed type: never dropped silently); with `InvalidData` for a

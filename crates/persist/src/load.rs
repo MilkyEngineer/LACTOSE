@@ -48,21 +48,25 @@ impl<'a> Loader<'a> {
     /// carried type is at the registry's version and digest come back equal, the overlay
     /// as the same `Arc`.
     ///
-    /// A type whose persistence changed since the save takes one rule for a resource and a
-    /// component alike: now transient, the saved value is dropped and the type is restored
-    /// zeroed (a resource leaves `resources` and joins `transient_resources`; a component's
-    /// bytes are never read, `migrate_overlay`); now persistent, the type is restored
-    /// zeroed as a persistent value (a transient key leaves `transient_resources` and
-    /// joins `resources` as the all-zero value under the registry's schema and digest; a
-    /// component's zeroed bytes go through `migrate`'s persistent rule), which
-    /// [`bundle`](Self::bundle) then validates like any value, so a type whose all-zero
-    /// value is invalid refuses the region with `InvalidData`; now derived, the type is
-    /// dropped (a transient key or a resource leaves the records; a component leaves its
-    /// record), since a derived value is rebuilt on load and never comes from a document,
-    /// and the build declared it so. Fails as the two migrations fail, with `NotFound` for
-    /// a resource or transient type the table does not know, and with `InvalidData` for
-    /// records that fail [`RegionRecords::check`] or for a resource whose type is a
-    /// component.
+    /// A type whose persistence changed since the save: now transient, the saved value is
+    /// dropped and the type is restored zeroed (a resource leaves `resources` and joins
+    /// `transient_resources`; a component's bytes are never read, `migrate_overlay`). Now
+    /// persistent, a resource and a component part ways, since a document records which
+    /// resources were transient and not which components were: a transient key leaves
+    /// `transient_resources` and joins `resources` as the all-zero value under the
+    /// registry's schema and digest, and no step runs (a key has no saved version for one
+    /// to start from); a component is read by `migrate`'s persistent rule from the schema
+    /// and digest it was saved under, like any component, so a type made persistent loads
+    /// only if it kept the version and layout it was saved under, or has the steps from
+    /// that version, which run over the all-zero old value. Either way
+    /// [`bundle`](Self::bundle) validates the restored value like any other, so one that is
+    /// invalid refuses the region with `InvalidData`. Now derived, the type is dropped (a
+    /// transient key or a resource leaves the records; a component leaves its record,
+    /// `migrate_overlay`) and an overlay left with no record becomes `None`, since a
+    /// derived value is rebuilt on load and never comes from a document, and the build
+    /// declared it so. Fails as the two migrations fail, with `NotFound` for a resource or
+    /// transient type the table does not know, and with `InvalidData` for records that
+    /// fail [`RegionRecords::check`] or for a resource whose type is a component.
     pub fn migrate(&self, records: &RegionRecords) -> Result<RegionRecords> {
         todo!("migrate the overlay and the resources, or return the records unchanged")
     }

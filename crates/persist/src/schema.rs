@@ -18,11 +18,16 @@ use lactose_reflect::{Persistence, Registry, TypeInfo, TypeRole};
 /// persistence and the tracking bits), that is, from the layout's size on: size,
 /// alignment, the count of non-padding fields, and each field's ID, offset, size, type tag
 /// and kind, with nested layouts, enum sizes and discriminants, and array lengths and
-/// element kinds written out; with one change: a field, or an array element, of kind
+/// element kinds written out; with two changes. A field, or an array element, of kind
 /// `Struct` or `Enum` contributes an empty type tag (a zero length and no bytes) in place
-/// of its Rust name, since its structure follows and a name is not a layout. The tracking
-/// bits are left out on purpose: marking a type replicated or extracted changes no saved
-/// byte. A primitive's tag stays, since it is what tells `u32` from `RegionId`.
+/// of its Rust name, since its structure follows and a name is not a layout; a primitive's
+/// tag stays, since it is what tells `u32` from `RegionId`. And an enum's variants are
+/// written, in declaration order, as each variant's value (`u32`) followed by its name (a
+/// `u32` length and the UTF-8 bytes), where `write_schema` writes the values alone: a
+/// saved discriminant means the variant of that name, so the name is part of the layout,
+/// and a permutation of discriminants among the variants, or of their names, is seen. The
+/// tracking bits are left out on purpose: marking a type replicated or extracted changes
+/// no saved byte.
 ///
 /// A `ComponentSchema` holds the key, the version, the size and each top-level field's ID,
 /// offset and size, so three kinds of change leave it equal: a reorder inside a nested
@@ -31,24 +36,28 @@ use lactose_reflect::{Persistence, Registry, TypeInfo, TypeRole};
 /// sees all three, so a save carries it beside each saved type's schema and
 /// [`Migrations::migrate`](crate::Migrations::migrate) refuses equal versions with
 /// different digests. Free, because no saved byte depends on them: renaming a field (its
-/// ID stays), a `#[value]` struct or enum type, or an enum variant (its discriminant is
-/// the saved value, and variant names are not in `write_schema`). What no digest sees is
-/// a change of meaning under an unchanged layout (a field's unit; one enum replaced by
-/// another with the same size and discriminants; one primitive by another of the same
-/// tag): only a version bump and a step carry that, and the build-time guard D129 names
-/// (a committed record of each saved type's version and digest, compared by a test that
-/// fails when the digest changed and the version did not) is what makes the bump hard to
-/// forget.
+/// ID stays) or a `#[value]` struct or enum type. Not free: renaming an enum variant,
+/// which changes the digest and so is a version bump with a step that changes nothing
+/// (the saved value means the same variant under its new name); the bump is the price of
+/// seeing a permutation. What no digest sees is a change of meaning under an unchanged
+/// layout (a field's unit; one `#[value]` struct replaced by another of the same layout;
+/// one enum by another of the same size, discriminants and variant names; one primitive
+/// by another of the same tag): only a version bump and a step carry that, and the
+/// build-time guard D129 names (a committed record of each saved type's version and
+/// digest, compared by a test that fails when the digest changed and the version did not)
+/// is what makes the bump hard to forget.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct LayoutDigest(pub u64);
 
 impl LayoutDigest {
     /// The digest of `info`'s layout, as stated on the type: the implementation walks the
-    /// layout as `write_schema` does and writes the same bytes, empty tags for `Struct` and
-    /// `Enum` kinds.
+    /// layout as `write_schema` does and writes the same bytes, with empty tags for
+    /// `Struct` and `Enum` kinds and each variant's name beside its value.
     #[must_use]
     pub fn of(info: &TypeInfo) -> Self {
-        todo!("hash the layout part of `write_schema` with empty struct and enum tags")
+        todo!(
+            "hash the layout part of `write_schema` with empty struct and enum tags and variant names"
+        )
     }
 }
 
