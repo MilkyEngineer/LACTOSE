@@ -16,7 +16,7 @@ use crate::backend::Backend;
 use crate::config::IoConfig;
 use crate::file::File;
 use crate::request::Pending;
-use crate::types::DirEntry;
+use crate::types::{DirEntry, ReplaceFailed};
 
 /// A handle to the file IO pool: `pool_threads` platform threads of class `ThreadClass::Io`
 /// that complete every request of this crate.
@@ -66,24 +66,26 @@ impl Io {
 
     /// Opens the file at `path` for reading.
     ///
-    /// Resolves to a [`File`] that knows its size. `NotFound` if there is no such file;
-    /// `Io` for a directory, a permission failure or anything else the open reports;
-    /// `Cancelled` if the pool has stopped.
+    /// Resolves to a [`File`] that knows its size. The handle's [`FileId`](crate::FileId)
+    /// is taken now, not at the first poll. `NotFound` if there is no such file; `Io` for a
+    /// directory, a permission failure or anything else the open reports; `Cancelled` if
+    /// the pool has stopped.
     #[must_use = "an open does nothing until polled"]
     pub fn open(&self, path: impl Into<PathBuf>) -> Open {
-        todo!("a `Pending` of `Request::Open` with the next FileId under `span::open`")
+        todo!("a `Pending` of `Request::Open` with the next FileId")
     }
 
     /// Reads the whole file at `path`.
     ///
     /// Resolves to its content, in a buffer allocated on the pool thread under
     /// `AllocTag::Io` and owned by the caller. `NotFound` and `Io` as for [`Io::open`];
-    /// `ResourceExhausted` if the file is larger than [`MAX_READ_BYTES`](crate::MAX_READ_BYTES),
-    /// before anything is allocated; `Cancelled` if the pool has stopped. For a file read
+    /// `ResourceExhausted` if the file is larger than [`MAX_READ_BYTES`](crate::MAX_READ_BYTES)
+    /// or its buffer cannot be allocated, before anything is; `InvalidData` if the file's
+    /// size changes while it is read; `Cancelled` if the pool has stopped. For a file read
     /// in ranges, [`Io::open`] and [`File::read_at`].
     #[must_use = "a read does nothing until polled"]
     pub fn read_file(&self, path: impl Into<PathBuf>) -> ReadFile {
-        todo!("a `Pending` of `Request::ReadFile` under `span::read_file`")
+        todo!("a `Pending` of `Request::ReadFile`")
     }
 
     /// Replaces the content of the file at `path` with `bytes`, atomically and durably:
@@ -92,18 +94,24 @@ impl Io {
     /// When the future resolves `Ok`, a reader of `path` on this machine sees all of
     /// `bytes`, and a crash or power loss after that point keeps them. At no point does a
     /// reader see anything but the previous content or the new. The temporary file is
-    /// `<name>.<unique>.tmp` in the same directory as `path`, never on another volume.
-    /// `bytes` is consumed; a caller that may retry keeps its own copy.
+    /// `<name>.<unique>.tmp` in the same directory as `path`, never on another volume; a
+    /// `path` with no directory part is in the current directory. Before creating it, the
+    /// replace removes the temporaries of `path` a crash left. Replaces of one `path` run in
+    /// the order they were submitted, dropped or not, so the last one submitted lands last.
+    /// Two processes replacing one `path` are unsupported.
     ///
-    /// `StorageFull` if the disk or quota fills while writing or syncing; `NotFound` if
-    /// `path`'s directory does not exist (callers create it with [`Io::create_dir_all`]
-    /// first); `Io` for a permission failure, a `path` that is a directory, or on Windows
-    /// a `path` another process holds open without delete sharing; `Cancelled` if the
-    /// pool has stopped. On any failure `path` keeps its previous content and the
-    /// temporary file is removed.
+    /// On failure the future hands `bytes` back, unchanged, in a [`ReplaceFailed`] beside
+    /// the error. A failure before the rename keeps `path`'s previous content and removes
+    /// the temporary: `StorageFull` if the disk or quota fills while writing or syncing;
+    /// `NotFound` if `path`'s directory does not exist (callers create it with
+    /// [`Io::create_dir_all`] first); `Io` for a permission failure, a `path` that is a
+    /// directory or names no file, or on Windows a `path` another process holds open
+    /// without delete sharing. A failure syncing the directory after the rename is `Io`,
+    /// with the new content in place and its durability unknown; every failure after the
+    /// rename is `Io`. `Cancelled` if the pool has stopped.
     #[must_use = "a replace does nothing until polled"]
     pub fn replace(&self, path: impl Into<PathBuf>, bytes: Vec<u8>) -> Replace {
-        todo!("a `Pending` of `Request::Replace` under `span::replace`")
+        todo!("a `Pending` of `Request::Replace`")
     }
 
     /// Lists the directory at `path`.
@@ -114,16 +122,16 @@ impl Io {
     /// pool has stopped.
     #[must_use = "a listing does nothing until polled"]
     pub fn read_dir(&self, path: impl Into<PathBuf>) -> ReadDir {
-        todo!("a `Pending` of `Request::ReadDir` under `span::read_dir`")
+        todo!("a `Pending` of `Request::ReadDir`")
     }
 
     /// Creates the directory at `path` and every missing parent; succeeds if it exists.
     ///
-    /// `Io` on a permission failure or when a file is in the way; `Cancelled` if the pool
-    /// has stopped.
+    /// `Io` on a permission failure or when a file is in the way; `StorageFull` if the disk
+    /// or quota is full; `Cancelled` if the pool has stopped.
     #[must_use = "a create does nothing until polled"]
     pub fn create_dir_all(&self, path: impl Into<PathBuf>) -> CreateDirAll {
-        todo!("a `Pending` of `Request::CreateDirAll` under `span::create_dir_all`")
+        todo!("a `Pending` of `Request::CreateDirAll`")
     }
 
     /// Stops the pool and waits for its threads.
@@ -180,19 +188,20 @@ impl Future for ReadFile {
     }
 }
 
-/// An atomic replace in flight: [`Io::replace`]. Resolves once the new content is durable.
-/// Dropping it does not tear the file: a replace not yet started never runs, and one
-/// started runs to its end, so the path holds the previous content or the new, never a
-/// part of either.
+/// An atomic replace in flight: [`Io::replace`]. Resolves once the new content is durable,
+/// or to a [`ReplaceFailed`] holding the bytes. Dropping it does not tear the file: a
+/// replace not yet started never runs, and one started runs to its end, so the path holds
+/// the previous content or the new, never a part of either; a replace of the same path
+/// submitted after it still lands after it.
 #[must_use = "a replace does nothing until polled"]
 pub struct Replace {
-    pending: Pending<()>,
+    pending: Pending<(), ReplaceFailed>,
 }
 
 impl Future for Replace {
-    type Output = Result<()>;
+    type Output = Result<(), ReplaceFailed>;
 
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<()>> {
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), ReplaceFailed>> {
         Pin::new(&mut self.pending).poll(cx)
     }
 }

@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 
 use lactose_asset_api::{AssetId, AssetVersion, CookedHeader, ErasedLoader, UntypedHandle};
 use lactose_core::{Error, ErrorKind, Result};
-use lactose_io::{DirEntry, Encoding, EntryKind, File, Io, IoConfig, Read};
+use lactose_io::{DirEntry, Encoding, EntryKind, File, Io, IoConfig, ReadAt, ReplaceFailed};
 use lactose_task::{Executor, Platform, StdPlatform, Task, WorkerClass};
 
 // ---- 1. app: the pool, started once from the executor's platform ----
@@ -27,7 +27,7 @@ fn app_start(executor: &Executor) -> Result<Io> {
 
 /// A count `app` chose itself, from a platform layer or a setting.
 fn app_start_with(platform: &dyn Platform, pool_threads: NonZero<u32>) -> Result<Io> {
-    Io::start(platform, IoConfig { pool_threads })
+    Io::start(platform, IoConfig::new(pool_threads))
 }
 
 /// The save directory exists before the first save, so a `NotFound` from a replace is a
@@ -45,26 +45,46 @@ fn app_shutdown(io: Io, executor: Executor) {
 // ---- 2. app and persist: the save written and read back ----
 
 /// What `app` does with a failed save, chosen from the kind and never from the message.
+/// `DiskFull` keeps the bytes, so the save is written again once the player frees space,
+/// without assembling it again.
 enum SaveOutcome {
     Saved,
-    DiskFull,
+    DiskFull(Vec<u8>),
     NoSaveDirectory,
     ShuttingDown,
     Failed(Error),
 }
 
 /// The bytes `Container::assemble` produced, written as one request: temporary file
-/// beside the slot, sync, rename. The bytes are consumed; a retry assembles again.
+/// beside the slot, sync, rename. A failure hands the bytes back.
+///
+/// `StorageFull` and `NotFound` come only before the rename, so the slot still holds the
+/// previous save. `Io` may come after it, from the directory sync, with the new save in
+/// place and its durability unknown, or before it with the previous save kept; either
+/// way writing the same bytes once more is the remedy, and replaces of one slot land in
+/// submission order, so the retry is the last to land.
 async fn app_write_save(io: &Io, slot: PathBuf, bytes: Vec<u8>) -> SaveOutcome {
-    match io.replace(slot, bytes).await {
-        Ok(()) => SaveOutcome::Saved,
-        Err(error) => match error.kind() {
-            ErrorKind::StorageFull => SaveOutcome::DiskFull,
-            ErrorKind::NotFound => SaveOutcome::NoSaveDirectory,
-            ErrorKind::Cancelled => SaveOutcome::ShuttingDown,
-            _ => SaveOutcome::Failed(error),
+    let failed = match io.replace(slot.clone(), bytes).await {
+        Ok(()) => return SaveOutcome::Saved,
+        Err(failed) => failed,
+    };
+    let failed = match failed.error.kind() {
+        ErrorKind::StorageFull => return SaveOutcome::DiskFull(failed.bytes),
+        ErrorKind::NotFound => return SaveOutcome::NoSaveDirectory,
+        ErrorKind::Cancelled => return SaveOutcome::ShuttingDown,
+        ErrorKind::Io => match io.replace(slot, failed.bytes).await {
+            Ok(()) => return SaveOutcome::Saved,
+            Err(failed) => failed,
         },
-    }
+        _ => failed,
+    };
+    SaveOutcome::Failed(failed.error)
+}
+
+/// A caller that only reports the failure converts it into its error with `?`.
+async fn app_write_or_report(io: &Io, slot: PathBuf, bytes: Vec<u8>) -> Result<()> {
+    io.replace(slot, bytes).await?;
+    Ok(())
 }
 
 /// The load: the preamble first, then the index it names, then one section per region,
@@ -103,7 +123,7 @@ async fn app_list_slots(io: &Io, save_dir: &Path) -> Result<Vec<PathBuf>> {
         .collect())
 }
 
-// ---- 3. SILO: a pack opened once, ranges read and decoded on the pool ----
+// ---- 3. SILO: a pack opened once, ranges read by the pool and decoded by their futures ----
 
 /// Where one asset's cooked bytes lie in a pack and how they are stored, as the store's
 /// catalog will hold it from the pack index.
@@ -122,9 +142,10 @@ async fn silo_open_pack(io: &Io, path: &Path, trailer_len: u64) -> Result<(File,
     Ok((pack, trailer))
 }
 
-/// One load: the range, decoded in the same request when it is stored compressed, then
-/// the loader over the decoded bytes on the background worker that ran this task. The
-/// buffer is the store's and is dropped here once the loader has built the asset.
+/// One load: the range, decoded as part of the same request when it is stored compressed,
+/// in this task's own polls on the background worker that runs it, then the loader over
+/// the decoded bytes on the same worker. The buffer is the store's and is dropped here
+/// once the loader has built the asset.
 async fn silo_load(
     pack: File,
     entry: PackEntry,
@@ -145,7 +166,7 @@ async fn silo_load(
 /// The store spawns a load as a background task; the task owns its clone of the handle,
 /// so the descriptor stays open for as long as a read on it is in flight.
 fn silo_spawn_read(executor: &Executor, pack: &File, entry: &PackEntry) -> Task<Result<Vec<u8>>> {
-    let read: Read = pack.read_at(entry.offset, entry.stored_len);
+    let read: ReadAt = pack.read_at(entry.offset, entry.stored_len);
     executor.spawn(WorkerClass::Background, read)
 }
 
@@ -186,13 +207,14 @@ fn cook_directory(executor: &Executor, io: &Io, sources: &Path, outputs: &Path) 
 // ---- 5. The server: a region publish that never waits behind another ----
 
 /// The container bytes a background worker assembled, written by the pool while the
-/// worker goes on to the next region; `pool_threads` of these run at once.
+/// worker goes on to the next region; `pool_threads` of these run at once. A failed
+/// publish keeps its bytes for the retry.
 fn server_publish_region(
     executor: &Executor,
     io: &Io,
     path: PathBuf,
     bytes: Vec<u8>,
-) -> Task<Result<()>> {
+) -> Task<Result<(), ReplaceFailed>> {
     executor.spawn(WorkerClass::Background, io.replace(path, bytes))
 }
 

@@ -10,14 +10,16 @@ use std::task::{Context, Poll};
 use lactose_core::Result;
 
 use crate::backend::Backend;
-use crate::request::Pending;
+use crate::decode::Decode;
+use crate::request::{Encoded, Pending};
 use crate::types::Encoding;
 
 /// The number a pool gives each file it opens, for the `file` field of its read spans.
 ///
-/// Unique within one [`Io`](crate::Io) for its lifetime, never reused; the `io.open` span
-/// records it on completion, so a profiler joins every `io.read` to the open that made
-/// the handle. Nothing else is derived from it.
+/// Unique within one [`Io`](crate::Io) for its lifetime, never reused, and not dense: it is
+/// taken when [`Io::open`](crate::Io::open) is called, so an open dropped unpolled or failed
+/// leaves a gap. The `io.open` span carries it from its creation, so a profiler joins every
+/// `io.read` to the open that made the handle. Nothing else is derived from it.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct FileId(pub(crate) u64);
 
@@ -32,7 +34,9 @@ impl fmt::Display for FileId {
 /// Opened by [`Io::open`](crate::Io::open). Cloning shares the one descriptor; the
 /// descriptor closes when the last clone and the last read in flight on it are gone,
 /// on whichever thread drops it last, without a request. Reads are positional and
-/// independent, so any number may be in flight at once on the same handle.
+/// independent, so any number may be in flight at once on the same handle. On Windows the
+/// blocking backend's handle is synchronous, and the system runs the reads on one handle one
+/// at a time; reads on two opens of one path do not wait for each other (`README.md`).
 #[derive(Clone)]
 pub struct File {
     inner: Arc<OpenFile>,
@@ -77,12 +81,13 @@ impl File {
     /// Resolves to a buffer of exactly `len` bytes, allocated on the pool thread under
     /// `AllocTag::Io` and owned by the caller. `InvalidData` if the file ends before
     /// `offset + len` or the range overflows; `ResourceExhausted` if `len` exceeds
-    /// [`MAX_READ_BYTES`](crate::MAX_READ_BYTES); `Cancelled` if the pool has stopped. A
-    /// `len` of zero resolves to an empty buffer without touching the file. Nothing is
-    /// submitted until the future is first polled.
+    /// [`MAX_READ_BYTES`](crate::MAX_READ_BYTES) or the buffer cannot be allocated, before
+    /// any of it is; `Io` for anything else the read reports; `Cancelled` if the pool has
+    /// stopped. A `len` of zero resolves to an empty buffer without touching the file.
+    /// Nothing is submitted until the future is first polled.
     #[must_use = "a read does nothing until polled"]
-    pub fn read_at(&self, offset: u64, len: u64) -> Read {
-        todo!("check the range, then a `Pending` of `Request::Read` under `span::read`")
+    pub fn read_at(&self, offset: u64, len: u64) -> ReadAt {
+        todo!("check the range, then a `Pending` of `Request::Read`; `Pending::failed` if not")
     }
 
     /// Reads the `len` stored bytes at `offset` and decodes them as `encoding`, as one
@@ -90,15 +95,22 @@ impl File {
     ///
     /// Resolves to the decoded bytes: exactly `encoding`'s `decoded_len` of them, in a
     /// buffer allocated on the pool thread under `AllocTag::Io` and owned by the caller.
-    /// The stored bytes are decoded on the pool thread and never handed out. `InvalidData`
-    /// if the range is short or overflows, if the stored bytes are not one whole frame of
-    /// `encoding` ending exactly at `offset + len`, or if they decode to any other length;
-    /// `ResourceExhausted` if `len` or `decoded_len` exceeds
-    /// [`MAX_READ_BYTES`](crate::MAX_READ_BYTES); `Cancelled` if the pool has stopped.
-    /// Nothing is submitted until the future is first polled.
+    /// The pool reads and checks the stored bytes; the decode runs in the returned future's
+    /// own poll, on the thread that polls it (a background worker for SILO's loads,
+    /// architecture section 5.1), in slices that yield at least every 0.5 ms. The stored
+    /// bytes are never handed out. `InvalidData` if the range is empty, short or overflows,
+    /// if the stored bytes are not one whole frame of `encoding` ending exactly at
+    /// `offset + len`, or if they decode to any other length; `ResourceExhausted` if `len`
+    /// or `decoded_len` exceeds [`MAX_READ_BYTES`](crate::MAX_READ_BYTES) or a buffer
+    /// cannot be allocated, before either is; `Io` for anything else the read reports;
+    /// `Cancelled` if the pool has stopped. Nothing is submitted until the future is first
+    /// polled.
     #[must_use = "a read does nothing until polled"]
-    pub fn read_encoded_at(&self, offset: u64, len: u64, encoding: Encoding) -> Read {
-        todo!("check both lengths, then a `Pending` of `Request::Read` under `span::read`")
+    pub fn read_encoded_at(&self, offset: u64, len: u64, encoding: Encoding) -> ReadAt {
+        todo!(
+            "check both lengths and the range, then a `Pending` of `Request::ReadEncoded`; \
+             `Pending::failed` if not"
+        )
     }
 }
 
@@ -116,17 +128,38 @@ impl fmt::Debug for File {
 ///
 /// Resolves to the bytes asked for, every one of them or an error, never a short buffer.
 /// Dropping it cancels the read: one not yet started never runs; one started finishes on
-/// the pool thread and its buffer is freed there. The drop never blocks. The future holds
-/// the file open until it completes or is dropped.
+/// the pool thread and its buffer is freed there; an encoded read dropped after the pool
+/// handed it its stored bytes frees both its buffers on the dropping thread. The drop never blocks. The future holds
+/// the file open until the pool's part of the read completes or the future is dropped.
+///
+/// Polling an encoded read whose stored bytes have arrived decodes a slice of them on the
+/// polling thread, at most about 0.5 ms of work, then wakes itself and returns `Pending`
+/// until the frame is done, as section 5.1's background CPU work yields.
 #[must_use = "a read does nothing until polled"]
-pub struct Read {
-    pending: Pending<Vec<u8>>,
+pub struct ReadAt {
+    state: ReadState,
 }
 
-impl Future for Read {
+/// Where a read is. Hidden and changeable.
+enum ReadState {
+    /// A raw read, or one failed before it was made.
+    Raw(Pending<Vec<u8>>),
+    /// An encoded read whose stored range the pool has not yet returned.
+    Stored(Pending<Encoded>),
+    /// An encoded read decoding in this future's polls.
+    Decoding(Decode),
+    /// Resolved; polling again is a broken invariant.
+    Done,
+}
+
+impl Future for ReadAt {
     type Output = Result<Vec<u8>>;
 
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<Vec<u8>>> {
-        Pin::new(&mut self.pending).poll(cx)
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<Vec<u8>>> {
+        todo!(
+            "Raw: the pending's result. Stored: on `Encoded::Stored` move to `Decoding` with \
+             the pending's span and decode a first slice; `Encoded::Decoded` is the result. \
+             Decoding: `Decode::poll_slice`"
+        )
     }
 }

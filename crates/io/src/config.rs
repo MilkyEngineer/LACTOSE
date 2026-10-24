@@ -10,15 +10,23 @@ use lactose_task::{CoreTopology, Platform};
 /// half the cores, separate from the background workers, so a region publish never waits
 /// behind another; [`IoConfig::for_platform`] is that rule, and a client uses the same
 /// rule until a measurement says otherwise (`docs/verification.md`). `app` may set the
-/// count directly.
+/// count directly with [`IoConfig::new`]. `#[non_exhaustive]`, so a later setting (a
+/// backend, a priority) is a new field with a default and no caller's code changes.
+#[non_exhaustive]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct IoConfig {
     /// Threads in the pool. Each runs one request at a time, from start to finish, so this
-    /// is also the number of requests in flight at once.
+    /// is also the number of requests the pool runs at once.
     pub pool_threads: NonZero<u32>,
 }
 
 impl IoConfig {
+    /// A pool of `pool_threads` threads, the count `app` chose itself.
+    #[must_use]
+    pub const fn new(pool_threads: NonZero<u32>) -> Self {
+        Self { pool_threads }
+    }
+
     /// Section 9.7's rule from the platform's topology: see [`IoConfig::for_topology`].
     #[must_use]
     pub fn for_platform(platform: &dyn Platform) -> Self {
@@ -33,7 +41,7 @@ impl IoConfig {
     pub fn for_topology(topology: CoreTopology) -> Self {
         let cores = topology.performance.saturating_add(topology.efficiency);
         let threads = cores.div_ceil(2).max(1);
-        Self { pool_threads: NonZero::new(threads).expect("at least one") }
+        Self::new(NonZero::new(threads).expect("at least one"))
     }
 }
 

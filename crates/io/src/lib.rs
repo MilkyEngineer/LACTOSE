@@ -1,5 +1,5 @@
 //! File IO (architecture section 4, `io`): whole files and positional ranges read into
-//! caller-owned buffers, a range decoded in the same request, the atomic replace of
+//! caller-owned buffers, a range decoded as part of the same request, the atomic replace of
 //! section 15.3, and directory listing, each as a `Send + 'static` future completed by a
 //! pool of platform threads of class `ThreadClass::Io` (section 9.7). SILO reads packs
 //! through it, `app` writes saves through it, the cooker reads sources and writes outputs
@@ -13,7 +13,8 @@
 //! # Status
 //!
 //! A facade: every public signature is final and every body that decides anything is
-//! `todo!()`. [`IoConfig::for_topology`] and the span helpers are real. The
+//! `todo!()`. [`IoConfig`]'s constructors, [`ReplaceFailed`]'s impls and the span helpers
+//! are real. The
 //! implementation lane replaces the bodies behind this surface and removes the
 //! crate-level `allow` with the last `todo!()`.
 //!
@@ -24,10 +25,13 @@
 //!   [`Io::read_file`], [`Io::replace`], [`Io::read_dir`] and [`Io::create_dir_all`] are
 //!   the requests that take a path.
 //! - [`File`] is an open file; [`File::read_at`] and [`File::read_encoded_at`] are the
-//!   positional reads a pack is served by, the second decoding its range as one request.
-//! - [`Open`], [`Read`], [`ReadFile`], [`Replace`], [`ReadDir`] and [`CreateDirAll`] are
+//!   positional reads a pack is served by, the second decoding its range as one request:
+//!   the pool reads the stored bytes and the future decodes them in its own poll, on the
+//!   background worker that polls it.
+//! - [`Open`], [`ReadAt`], [`ReadFile`], [`Replace`], [`ReadDir`] and [`CreateDirAll`] are
 //!   the futures. Each submits at its first poll, resolves to all of what was asked or an
-//!   error, and cancels when dropped.
+//!   error, and cancels when dropped. A failed [`Replace`] hands its bytes back in a
+//!   [`ReplaceFailed`].
 //!
 //! ```no_run
 //! use lactose_io::{Encoding, Io, IoConfig};
@@ -38,13 +42,14 @@
 //! let platform = executor.platform().as_ref();
 //! let io = Io::start(platform, IoConfig::for_platform(platform))?;
 //!
-//! // SILO: a pack opened once, then a range read and decoded in one request on the pool.
+//! // SILO: a pack opened once, then a range read by the pool and decoded by its future.
 //! let pack = executor.block_on(io.open("cooked/world.pack"))?;
 //! let range = pack.read_encoded_at(4096, 1500, Encoding::Zstd { decoded_len: 8192 });
 //! let bytes = executor.block_on(range)?;
 //! assert_eq!(bytes.len(), 8192);
 //!
 //! // The save: temporary file beside the slot, sync, rename, as one request, from a task.
+//! // A failure hands the bytes back beside the error.
 //! let save: Vec<u8> = Vec::new();
 //! let written = executor.spawn(WorkerClass::Background, io.replace("saves/slot0.carton", save));
 //! executor.block_on(written)??;
@@ -64,6 +69,7 @@
 
 mod backend;
 mod config;
+mod decode;
 mod file;
 mod io;
 mod request;
@@ -71,15 +77,16 @@ mod span;
 mod types;
 
 pub use config::IoConfig;
-pub use file::{File, FileId, Read};
+pub use file::{File, FileId, ReadAt};
 pub use io::{CreateDirAll, Io, Open, ReadDir, ReadFile, Replace};
-pub use types::{DirEntry, Encoding, EntryKind, MAX_READ_BYTES};
+pub use types::{DirEntry, Encoding, EntryKind, MAX_READ_BYTES, ReplaceFailed};
 
 /// What the contract promises at the type level, pinned so the implementation cannot lose
 /// it without a compile error: the pool handle and an open file are shared across threads
 /// by every consumer; every future is `Send + 'static` so `Executor::spawn` takes it and
 /// `Unpin` so a caller polls it without pinning; each resolves to exactly what its method
-/// documents; the plain data is `Copy`; and the cap is the number the README states.
+/// documents, a failed replace with its bytes; the plain data is `Copy`; and the cap is
+/// the number the README states.
 const _: () = {
     const fn send_sync<T: Send + Sync + 'static>() {}
     const fn future<F: Future<Output = T> + Send + Sync + Unpin + 'static, T>() {}
@@ -89,11 +96,12 @@ const _: () = {
     send_sync::<File>();
     send_sync::<IoConfig>();
     send_sync::<DirEntry>();
+    send_sync::<ReplaceFailed>();
 
     future::<Open, lactose_core::Result<File>>();
-    future::<Read, lactose_core::Result<Vec<u8>>>();
+    future::<ReadAt, lactose_core::Result<Vec<u8>>>();
     future::<ReadFile, lactose_core::Result<Vec<u8>>>();
-    future::<Replace, lactose_core::Result<()>>();
+    future::<Replace, lactose_core::Result<(), ReplaceFailed>>();
     future::<ReadDir, lactose_core::Result<Vec<DirEntry>>>();
     future::<CreateDirAll, lactose_core::Result<()>>();
 

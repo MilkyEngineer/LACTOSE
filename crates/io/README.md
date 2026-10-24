@@ -1,9 +1,9 @@
 # lactose-io
 
 File IO (architecture section 4, `io`): whole files and positional ranges of a file read
-into caller-owned buffers, a range decoded in the same request, the atomic replace of
-section 15.3, and directory listing, each a `Send + 'static` future completed by a pool of
-platform threads of class `ThreadClass::Io`. SILO reads packs through it, `app` writes
+into caller-owned buffers, a range decoded as part of the same request, the atomic replace
+of section 15.3, and directory listing, each a `Send + 'static` future completed by a pool
+of platform threads of class `ThreadClass::Io`. SILO reads packs through it, `app` writes
 and reads saves through it, the cooker reads sources and writes outputs through it. The
 simulation never calls it.
 
@@ -14,14 +14,15 @@ simulation never calls it.
 | Unsafe | none, `#![forbid(unsafe_code)]`; `SAFETY.md` says where the completion backends' `unsafe` will live |
 
 **Status: facade.** Every public signature is final and every deciding body is `todo!()`;
-`IoConfig::for_topology`, `IoConfig::for_platform` and the span constructors are real.
-Every sentence under "Behaviour the signatures cannot express" is one a dependent crate
-may rely on and the implementation must meet. Architecture sections 3, 4, 5.1, 9.7, 14,
-15.3, 19, 20, 21 and 22 and `docs/verification.md` section 3 are the design; where this
-file and the architecture disagree, the architecture wins and this file is wrong.
+`IoConfig`'s constructors, `ReplaceFailed`'s trait impls and the span constructors are
+real. Every sentence under "Behaviour the signatures cannot express" is one a dependent
+crate may rely on and the implementation must meet. Architecture sections 3, 4, 5.1, 9.7,
+14, 15.3, 19, 20, 21 and 22 and `docs/verification.md` section 3 are the design; where
+this file and the architecture disagree, the architecture wins and this file is wrong.
 Decision D130 records the choices those sections left open. `crates/core/README.md`
 (errors, `AllocTag`, `ThreadClass`) and `crates/task/README.md` (the executor, `Task`,
-`Platform`, `block_on`) are the contracts this crate builds on and never restates.
+`Platform`, `block_on`, `yield_now`) are the contracts this crate builds on and never
+restates.
 
 Amending a signature is allowed in the change that needs it. Say so in the change
 description and list what changed, because `asset`, `persist`'s callers in `app`, `cook`
@@ -33,25 +34,27 @@ what each of them writes: a change that breaks it is a signature change to list.
 | Item | Purpose |
 |---|---|
 | `Io` | The pool handle: `Clone`, one per process, started by `app` with `Io::start(platform, config)` and cloned into whatever submits requests; `open`, `read_file`, `replace`, `read_dir`, `create_dir_all` are the requests that take a path; `pool_threads`; `shutdown(self)` |
-| `IoConfig` | The one setting, `pool_threads: NonZero<u32>`; `for_platform` and `for_topology` are section 9.7's rule, half the cores rounded up, at least one, the same on client and server |
-| `File`, `FileId` | An open file: `Clone` over one descriptor, `path`, `size` at the open, `id` for the spans; `read_at(offset, len)` and `read_encoded_at(offset, len, encoding)` are the positional reads, any number in flight at once |
-| `Encoding` | How a stored range is decoded in the same request: `Zstd { decoded_len }`, the exact decoded length from the index that named the range; `#[non_exhaustive]` for a platform's own format |
-| `Open`, `Read`, `ReadFile`, `Replace`, `ReadDir`, `CreateDirAll` | The futures, one per request: `Send + Sync + Unpin + 'static`, submitted at the first poll, cancelled by drop; each resolves to all of what was asked or an error |
+| `IoConfig` | The one setting, `pool_threads: NonZero<u32>`, `#[non_exhaustive]`; `IoConfig::new(pool_threads)` for a count `app` chose, `for_platform` and `for_topology` for section 9.7's rule, half the cores rounded up, at least one, the same on client and server |
+| `File`, `FileId` | An open file: `Clone` over one descriptor, `path`, `size` at the open, `id` for the spans; `read_at(offset, len)` and `read_encoded_at(offset, len, encoding)` are the positional reads, any number in flight at once (one at a time per handle on Windows, below) |
+| `Encoding` | How a stored range is decoded as part of the same request: `Zstd { decoded_len }`, the exact decoded length from the index that named the range; `#[non_exhaustive]` for a platform's own format |
+| `Open`, `ReadAt`, `ReadFile`, `Replace`, `ReadDir`, `CreateDirAll` | The futures, one per request: `Send + Sync + Unpin + 'static`, submitted at the first poll, cancelled by drop; each resolves to all of what was asked or an error. `Replace` resolves to `Result<(), ReplaceFailed>`, every other to `lactose_core::Result` |
+| `ReplaceFailed` | A failed replace: `error`, and `bytes`, the bytes it was given, handed back unchanged and uncopied for a retry; `#[non_exhaustive]`, converts into its `Error` with `?` |
 | `DirEntry`, `EntryKind` | One entry of a listing: its own name and its own kind (`File`, `Directory`, `Other`), sorted by name |
-| `MAX_READ_BYTES` | 1 GiB, the most one read may ask for stored or decoded; above it `ResourceExhausted` before any allocation |
+| `MAX_READ_BYTES` | 1 GiB, the most one request may ask for, stored, decoded or whole-file; above it `ResourceExhausted` before any allocation |
 
 Everything else is hidden and changeable: the `Backend` trait (architecture section 20:
 "its backends sit behind a trait inside the crate"), the blocking pool behind it, the
-request enum, the completion a future and its backend share, the span constructors.
+request enum, the completion a future and its backend share, the decode an encoded read
+runs, the span constructors.
 
 ## What each consumer needs, and where this surface gives it
 
 | Consumer | Needs | Where |
 |---|---|---|
-| SILO (`asset`) | A pack opened once for the session and read in ranges named by its index; each range into a buffer the store owns, as a `'static` future it spawns per load; the range decoded in the same request so a console's hardware decoder serves it unchanged (`docs/verification.md` section 3); many reads in flight on one handle; a load abandoned by dropping its task; a corrupt index entry failing as a value, never as an allocation | `Io::open`, `File::read_at`, `File::read_encoded_at`, `Read` (`Send + 'static`, cancelled by drop), `MAX_READ_BYTES`; the loader runs over the returned bytes on the worker that awaited them |
-| `app`, saves (SKIM, CARTON) | The bytes `Container::assemble` produced written as one request that is atomic and durable or has not happened, with failure modes `app` chooses policy from by kind: disk full, missing directory, permissions; the preamble then the sections as positional reads of one open slot; the slot listing; the save directory created at startup | `Io::replace` and its error table, `Io::open` + `File::read_at`, `Io::read_dir`, `Io::create_dir_all` |
+| SILO (`asset`) | A pack opened once for the session and read in ranges named by its index; each range into a buffer the store owns, as a `'static` future it spawns per load; the range decoded as part of the same request so a console's hardware decoder serves it unchanged (`docs/verification.md` section 3), and decoded on a background worker where software does it (architecture section 5.1); many reads in flight on one handle; a load abandoned by dropping its task; a corrupt index entry failing as a value, never as an allocation | `Io::open`, `File::read_at`, `File::read_encoded_at`, `ReadAt` (`Send + 'static`, cancelled by drop, decoding in its own polls), `MAX_READ_BYTES`; the loader runs over the returned bytes on the worker that awaited them |
+| `app`, saves (SKIM, CARTON) | The bytes `Container::assemble` produced written as one request that is atomic and durable or has not happened, with failure modes `app` chooses policy from by kind: disk full, missing directory, permissions; a retry without a second copy of the bytes; a newer save never overtaken by an older one; the preamble then the sections as positional reads of one open slot; the slot listing; the save directory created at startup | `Io::replace`, its order per path, `ReplaceFailed` and the error table, `Io::open` + `File::read_at`, `Io::read_dir`, `Io::create_dir_all` |
 | The cooker (RICOTTA) | Sources listed and read, outputs written whole, from a tool with no scheduler of its own | The same futures through `Executor::block_on`; there is no second, blocking API |
-| The server (section 9.7) | A pool sized to half the cores, separate from the background workers, so a region publish never waits behind another; threads from the platform, not `std::thread` | `IoConfig::for_platform`, `Io::start` through `Platform::spawn_thread` with `ThreadClass::Io`, `pool_threads` requests in flight at once |
+| The server (section 9.7) | A pool sized to half the cores, separate from the background workers, so a region publish never waits behind another; threads from the platform, not `std::thread` | `IoConfig::for_platform`, `Io::start` through `Platform::spawn_thread` with `ThreadClass::Io`, `pool_threads` requests run at once |
 | Profiling (section 3) | One span per request, target `io`, with the fields a profiler joins on | The span table below |
 | The executor (WHISK) | Nothing of it is used but the platform for threads; a request's future is a plain `std` future woken through its `Waker`, so any poll loop drives it | `Io::start(&dyn Platform, ..)`; the futures are `Unpin` |
 
@@ -60,8 +63,8 @@ request enum, the completion a future and its backend share, the span constructo
 ### Requests and futures
 
 - Every request is a future, and nothing is submitted until it is first polled: no queue
-  entry, no system call. A future created and dropped unpolled has cost its own
-  allocation and its span, and nothing else.
+  entry, no system call, no span. A future created and dropped unpolled has cost its own
+  allocation, and nothing else.
 - A future resolves exactly once, to all of what was asked or to an error. A read never
   resolves to fewer bytes than its `len`; a replace never resolves `Ok` with the file half
   written; a listing never resolves to part of a directory.
@@ -73,17 +76,22 @@ request enum, the completion a future and its backend share, the span constructo
   has no side effect: no file is opened, no byte is read or written. One already started
   runs to its end on the pool thread and its result is discarded there: a read's buffer is
   freed on the pool thread, an open's descriptor is closed there, a replace completes its
-  rename or its cleanup. The drop itself never blocks and never waits for the pool.
+  rename or its cleanup. An encoded read dropped after the pool handed it its stored bytes
+  frees its buffers on the thread that drops it. The drop itself never blocks and never
+  waits for the pool.
 - One future is one request, and a future awaited to its end before the next is created
   or polled gives one request in flight. Several requests in flight at once are several
   futures polled at once: one `Task` per request through `Executor::spawn`, or any poll
   loop that polls them together. A loop that awaits them one after another runs them one
   after another.
 - Requests start in the order their futures were first polled (one FIFO queue) and
-  complete in no particular order. The one ordering guarantee between requests is through
-  the caller: a request's effects are visible to every request whose future is first
-  polled after the first request's future resolved. Two requests in flight at once on the
-  same path are unordered.
+  complete in no particular order, with one exception: a replace starts only after every
+  replace of the same path first polled before it has finished (below). Otherwise the
+  one ordering guarantee between requests is through the caller: a request's effects are
+  visible to every request whose future is first polled after the first request's future
+  resolved. Other requests in flight at once on the same path are unordered, with each
+  other and with a replace of it: a `read_file` of a path while a replace of it is in
+  flight sees the previous content or the new.
 - There is no priority. `LoadPriority` in `asset-api` orders what SILO submits, not what
   this crate runs; the IO budget of milestone 3 decides whether that changes.
 - Each request's own bookkeeping (the future, the request record, the completion) is
@@ -94,28 +102,57 @@ request enum, the completion a future and its backend share, the span constructo
 ### Reads
 
 - `File::read_at(offset, len)` resolves to exactly `len` bytes read from `offset`, in a
-  `Vec<u8>` whose length and capacity are `len`, owned by the caller. The file ending
-  before `offset + len` is `InvalidData`, with no partial buffer; `offset + len`
-  overflowing `u64` is `InvalidData`; `len` above `MAX_READ_BYTES` is `ResourceExhausted`,
-  decided before anything is allocated or submitted. A `len` of zero resolves to an empty
-  buffer without a system call, whatever the offset.
-- `File::read_encoded_at(offset, len, encoding)` reads the `len` stored bytes at `offset`
-  and decodes them on the pool thread, as one request, into a `Vec<u8>` whose length and
-  capacity are `encoding`'s `decoded_len`. The stored bytes are never handed out. The
-  stored bytes must be exactly one frame of `encoding`, starting at `offset` and ending at
-  `offset + len`; a truncated frame, trailing bytes after it, a frame that decodes to any
-  length but `decoded_len`, or a frame whose own content-size header disagrees with
-  `decoded_len`, is `InvalidData`. `decoded_len` is the caller's claim from the index that
-  named the range, and is what is trusted for the allocation; the frame is never allowed
-  to grow the buffer past it. `len` or `decoded_len` above `MAX_READ_BYTES` is
-  `ResourceExhausted` before anything is allocated. Two allocations under `AllocTag::Io`:
-  the stored buffer, freed on the pool thread, and the decoded one, returned.
-- `Io::read_file(path)` resolves to the file's whole content as it is when the read runs.
-  A file whose size exceeds `MAX_READ_BYTES` is `ResourceExhausted` before anything is
-  allocated. It is the one-shot form; a file read in ranges is opened once.
+  `Vec<u8>` whose length and capacity are `len`, owned by the caller. `offset + len`
+  overflowing `u64` is `InvalidData` and `len` above `MAX_READ_BYTES` is
+  `ResourceExhausted`, decided before anything is submitted. On the pool thread the range
+  is checked against the file's current size before the buffer is allocated: a file
+  ending before `offset + len` is `InvalidData`, and so is a file that shrinks under the
+  read, with no partial buffer. A buffer the allocator refuses is `ResourceExhausted`,
+  never an abort. A `len` of zero resolves to an empty buffer without a system call,
+  whatever the offset.
+- `File::read_encoded_at(offset, len, encoding)` resolves to the `len` stored bytes at
+  `offset` decoded, in a `Vec<u8>` whose length and capacity are `encoding`'s
+  `decoded_len`. It is one request at the interface (`docs/verification.md` section 3):
+  - The pool reads the stored bytes, with the checks of `read_at`, and checks them before
+    the decoded buffer is allocated. They must be exactly one frame of `encoding`,
+    starting at `offset` and ending at `offset + len`, and not a skippable frame; the
+    frame's own content-size header must be present and equal `decoded_len`. A truncated
+    frame, trailing bytes after it (a second frame included), a skippable frame, or a
+    missing or disagreeing content size is `InvalidData`, and so is an empty range,
+    decided before anything is submitted. The cooker therefore writes every frame with its
+    content size (zstd's one-shot compression does; a streaming one must pledge the size).
+    The pool then allocates the decoded buffer under `AllocTag::Io` (`ResourceExhausted`
+    if the allocator refuses) and hands both buffers to the future.
+  - The decode runs in the `ReadAt` future's own poll, on the thread that polls it, never
+    on a pool thread: architecture section 5.1 gives asset decode to the background
+    workers, and SILO's loads run there. It streams the frame in slices: a poll decodes
+    for at most about 0.5 ms, then wakes its own waker and returns `Pending`, as section
+    5.1's background CPU work yields, so a 32 MiB range is many polls and never one long
+    one. Each slice runs inside the request's span and under an `AllocTag::Io` scope.
+  - Every error the decoder reports is `InvalidData`, and so is a frame that decodes to
+    any length but `decoded_len` or ends before every stored byte is consumed. The stored
+    bytes are never handed out; their buffer is freed when the decode ends.
+  - `decoded_len` is the caller's claim from the index that named the range, checked
+    against the frame's header and trusted for the allocation; the frame is never allowed
+    to grow the buffer past it. `len` or `decoded_len` above `MAX_READ_BYTES` is
+    `ResourceExhausted` before anything is submitted.
+  - A backend with a hardware decoder completes the whole request itself, decode
+    included; the future then resolves without decoding.
+- `Io::read_file(path)` resolves to the file's whole content. On the pool thread the
+  file is opened and its size taken; a size above `MAX_READ_BYTES` or a buffer the
+  allocator refuses is `ResourceExhausted` before anything is read. Exactly that many
+  bytes are then read, and one more is tried: a file that shrank or grew while it was read
+  is `InvalidData`, with no buffer, never a truncated content or one past the cap. A
+  caller reading a file another process is writing retries. It is the one-shot form; a
+  file read in ranges is opened once.
 - A `File` is read-only, positional and cursorless: reads on it share nothing but the
   descriptor, and any number may be in flight at once, on any threads. `File::size()` is
   the size at the open; a read checks its range against the file, not against `size()`.
+- On Windows the blocking backend reads through `std`'s synchronous handles, and the
+  system serialises every operation on one synchronous handle: reads on one `File` run one
+  at a time there, whatever `pool_threads` is. Reads on different `File`s, two opens of
+  one path among them, run at once. `docs/verification.md` has the row that measures it
+  for SILO's packs.
 - A `File` stays open while any clone or any read in flight on it exists, and closes when
   the last is dropped, on that thread, without a request. A file replaced while a handle
   on it is open keeps serving the content the handle was opened on: the previous content
@@ -124,34 +161,61 @@ request enum, the completion a future and its backend share, the span constructo
   file. Packs are immutable and saves are only ever replaced, so no caller sees a file
   change under a handle.
 - A read on a `File` whose pool has stopped is `Cancelled`.
+- `MAX_READ_BYTES` caps each request, not the pool: requests in flight at once may each
+  hold that much, and an encoded read holds its stored and its decoded buffer until its
+  decode ends.
 
 ### The atomic replace
 
 - `Io::replace(path, bytes)` is architecture section 15.3's operation as one request. On
-  the pool thread: a temporary file `<name>.<unique>.tmp` is created in the same directory
-  as `path` (so the rename is never across volumes) with `create_new`, so a leftover of
-  another attempt is never reused; `bytes` is written to it in full; the temporary is
-  synced (`fsync`, which `std` issues as `F_FULLFSYNC` on Apple platforms, and
-  `FlushFileBuffers` on Windows); it is renamed over `path`; and on Unix the directory is
-  synced so the rename itself is durable.
+  the pool thread: the temporaries of `path` a crash left are removed (below); a temporary
+  file `<name>.<unique>.tmp` is created in the same directory as `path` (so the rename is
+  never across volumes) with `create_new`, so a leftover of another attempt is never
+  reused, the next unique name being tried, a bounded number of times, when one exists
+  already; `bytes` is written to it in full; the temporary is synced (`fsync`, which `std`
+  issues as `F_FULLFSYNC` on Apple platforms, and `FlushFileBuffers` on Windows); it is
+  renamed over `path`; and on Unix the directory is synced so the rename itself is
+  durable. A `path` with no directory part (`slot0.carton`) is in the current directory,
+  which is the one synced.
 - When the future resolves `Ok`, a reader of `path` on this machine sees all of `bytes`,
   and a crash or power loss after that point keeps them, to the extent the platform's
   rename is durable (`docs/verification.md` has the row). At no point does a reader of
   `path` see anything but the previous content or the new: there is no moment at which
   `path` is missing or partial.
-- On any failure, `path` keeps its previous content and the temporary file is removed
-  (best effort: a crash between the failure and the removal can leave it). The kinds:
-  `StorageFull` when the disk or quota fills during the write or the sync; `NotFound` when
-  `path`'s directory does not exist, which callers prevent with `Io::create_dir_all` at
-  startup rather than retry; `Io` for a permission failure, for a `path` that is a
-  directory, and on Windows for a `path` another process holds open without delete
-  sharing. A cross-volume rename cannot happen.
-- `bytes` is consumed by the request. A caller that may retry after a failure keeps its
-  own copy or produces the bytes again.
+- Replaces of one path run in the order they were submitted (their futures first
+  polled), dropped or not: a replace of `path` starts only after every replace of the same
+  `path` submitted before it has finished, so the last submitted is the last to land, and
+  a newer save is never overtaken by an older one whose future was dropped. A replace
+  waiting behind another of its path holds no pool thread, and no pool thread ever waits
+  for one. A replace dropped before it started never runs, and the next of its path does
+  not wait for it. Paths are compared as `Path` values, as given: two spellings of one
+  file (`saves/a` and `./saves/a`, a symbolic link) are two paths and are not ordered.
+- A failure resolves `Err(ReplaceFailed)`, which holds the error and `bytes`, unchanged and
+  never copied, so a caller retries without keeping a copy of its own. That holds for
+  every failure, `Cancelled` included.
+- A failure before the rename keeps `path`'s previous content, and the temporary is
+  removed (best effort: a crash between the failure and the removal can leave it). A
+  failure syncing the directory after the rename resolves `Io` with the new content in
+  place and its durability unknown; writing the same bytes again is the remedy. Every
+  failure after the rename is `Io`, so `NotFound` and `StorageFull` always mean `path` is
+  untouched. The kinds: `StorageFull` when the disk or quota fills during the creation,
+  the write or the sync; `NotFound` when `path`'s directory does not exist, which callers
+  prevent with `Io::create_dir_all` at startup rather than retry; `Io` for a permission
+  failure, for a `path` that is a directory or names no file, on Windows for a `path`
+  another process holds open without delete sharing, and for any failure after the
+  rename. A cross-volume rename cannot happen.
 - A `Replace` dropped before it started never touches the disk. One dropped after it
   started runs every step, so the path is replaced or left as it was and the temporary is
   cleaned up; the drop only discards the result.
-- A `.tmp` left by a crash is an ordinary file to `Io::read_dir`. Callers that list a
+- Before it creates its temporary, a replace removes every `<name>.<unique>.tmp` beside
+  `path` whose `<unique>` has this crate's form, sixteen lowercase hexadecimal digits, so
+  a temporary of another path never matches. These are what a crash, or a process exit
+  that skipped a replace's cleanup, left. The sweep is best effort: a removal that fails
+  does not fail the replace. It is safe within one process because replaces of one path
+  are ordered; two processes replacing the same path are unsupported, since one could
+  remove the other's temporary while it is written.
+- A `.tmp` is an ordinary file to `Io::read_dir` until the next replace of its path
+  removes it, and one exists beside every replace in flight. Callers that list a
   directory of slots ignore names ending in `.tmp`.
 
 ### Directories
@@ -164,7 +228,8 @@ request enum, the completion a future and its backend share, the span constructo
   while it is being listed gives some listing of it; the sort is of what was read.
 - `Io::create_dir_all(path)` creates every missing directory on the way to `path` and
   resolves `Ok` when `path` is a directory, including when it already was. `Io` on a
-  permission failure or when a file is in the way.
+  permission failure, when a file is in the way, or when a directory on the way is removed
+  while it runs; `StorageFull` when the disk or quota is full.
 
 ### The pool
 
@@ -178,61 +243,80 @@ request enum, the completion a future and its backend share, the span constructo
 - `Io::start` fails with what the platform reports if a thread cannot be created, after
   stopping the threads it did create. Nothing else fails at start.
 - Each thread takes one request at a time from the one FIFO queue and runs it from its
-  first system call to its result, decoding included. `pool_threads` is therefore the
-  number of requests in flight at once; a request waits for a thread, never for another
-  request's completion.
+  first system call to its result. `pool_threads` is therefore the number of requests the
+  pool runs at once; a request waits for a thread, and a replace for the earlier replaces
+  of its path, never for anything else. A pool thread makes file system calls and checks
+  frames; it decodes nothing.
 - `IoConfig::for_topology` is `(performance + efficiency).div_ceil(2).max(1)`: four
   threads on a 4+4 part, eight on a server the topology reports as fifteen homogeneous
   cores, one on a four-vCPU runner. Client and server use the same rule until a
   measurement says otherwise (`docs/verification.md`); `app` may set `pool_threads`
-  directly.
-- Decoding runs on the pool thread, not on a background worker. The thread is asleep in
-  a system call for most of its life, the decode of one range is short next to the read
-  that fetched it, and a platform with a hardware decoder completes the request as a whole
-  (D130). `docs/verification.md` measures whether a client's pool contends with its
-  frame.
+  directly with `IoConfig::new`.
 - `Io` is `Clone`, and every clone is the one pool. `Io::shutdown(self)` stops it:
-  requests already started finish; requests queued, and requests submitted after it from
-  any clone, resolve `Cancelled`; then it blocks until every thread has exited. It is for
-  the main thread and tools, before `Executor::shutdown`. Clones left after it are inert
-  handles whose requests resolve `Cancelled`.
+  requests already started finish; requests queued or waiting behind a replace of their
+  path, and requests submitted after it from any clone, resolve `Cancelled`; then it
+  blocks until every thread has exited. It is for the main thread and tools, before
+  `Executor::shutdown`. Clones left after it are inert handles whose requests resolve
+  `Cancelled`. An encoded read whose stored bytes arrived before the stop still decodes.
 - Dropping the last `Io` clone without `shutdown` stops the pool the same way but does not
   wait: the threads exit after their current request and are not joined. Open `File`s
   outlive it as handles whose reads resolve `Cancelled`.
-- No request ever runs on the caller's thread, blocks the caller's thread, or waits for
-  the executor. The pool never calls into the executor; a request's future is woken
+- No request runs its system calls on the caller's thread, blocks the caller's thread, or
+  waits for the executor; the one work done in a future's poll is an encoded read's decode,
+  in 0.5 ms slices. The pool never calls into the executor; a request's future is woken
   through the `Waker` of its last poll, so `Executor::block_on` and a hand-written poll
   loop drive it as well as a spawned task does.
 
 ### Errors
 
-Every failure is a `lactose_core::Error` whose kind is the one policy dispatches on;
-`std::io::Error`s map through `From<std::io::Error>` and keep their source.
+Every failure is a `lactose_core::Error` whose kind is the one policy dispatches on, a
+failed replace's inside its `ReplaceFailed`. A system call's `std::io::Error` maps through
+`From<std::io::Error>` and keeps its source, except that the two kinds no request returns
+are made `Io`: `Unsupported` (`ENOTSUP`, from an `F_FULLFSYNC` on a file system without
+it) and `Network` (a timeout or a reset on a network file system). A zstd error is
+`InvalidData`, never through `From`.
 
 | Kind | When |
 |---|---|
-| `NotFound` | `open`, `read_file`: no such file. `read_dir`: no such directory. `replace`: the directory of `path` does not exist |
-| `InvalidData` | A read whose range runs past the end of the file or overflows; a decode of anything but one whole frame of exactly `decoded_len` bytes |
-| `ResourceExhausted` | A `len`, `decoded_len` or whole-file size above `MAX_READ_BYTES`, before any allocation |
-| `StorageFull` | `replace`: the disk or quota filled during the write or the sync |
-| `Io` | Anything else the operating system reports: permissions, a directory where a file was named or a file where a directory was, a Windows sharing violation |
-| `Cancelled` | A request submitted to a pool that has stopped, or queued when it stopped. Never from dropping the future: a dropped future has no one to tell |
+| `NotFound` | `open`, `read_file`: no such file. `read_dir`: no such directory. `replace`: the directory of `path` does not exist, before the rename only |
+| `InvalidData` | A read whose range runs past the end of the file, overflows, or (encoded) is empty; a file that shrinks under a read or that changes size under `read_file`; a decode of anything but one whole, non-skippable frame whose header and output are exactly `decoded_len` |
+| `ResourceExhausted` | A `len`, `decoded_len` or whole-file size above `MAX_READ_BYTES`, before any allocation; a buffer the allocator refuses; the operating system out of memory |
+| `StorageFull` | `replace`: the disk or quota filled during the creation, the write or the sync, before the rename. `create_dir_all`: the disk or quota is full |
+| `Io` | Anything else the operating system reports: permissions, a directory where a file was named or a file where a directory was, a Windows sharing violation, a replace's temporary name taken on every try, every failure of a replace after its rename |
+| `Cancelled` | A request submitted to a pool that has stopped, or queued or waiting behind a replace when it stopped. Never from dropping the future: a dropped future has no one to tell |
 
-`Unsupported`, `VersionMismatch`, `Network`, `DeviceLost` and `Platform` are never returned
-by a request. `Io::start` returns the platform's own error, of whatever kind the platform
-gives a thread it cannot create (`Io` from `StdPlatform`).
+The kinds each request can return, and no other:
+
+| Request | Kinds |
+|---|---|
+| `Io::open` | `NotFound`, `ResourceExhausted`, `Io`, `Cancelled` |
+| `File::read_at` | `InvalidData`, `ResourceExhausted`, `Io`, `Cancelled` |
+| `File::read_encoded_at` | `InvalidData`, `ResourceExhausted`, `Io`, `Cancelled` |
+| `Io::read_file` | `NotFound`, `InvalidData`, `ResourceExhausted`, `Io`, `Cancelled` |
+| `Io::replace` | `NotFound`, `StorageFull`, `ResourceExhausted`, `Io`, `Cancelled` |
+| `Io::read_dir` | `NotFound`, `ResourceExhausted`, `Io`, `Cancelled` |
+| `Io::create_dir_all` | `StorageFull`, `ResourceExhausted`, `Io`, `Cancelled` |
+
+`VersionMismatch`, `Network`, `DeviceLost`, `Unsupported` and `Platform` are never
+returned by a request. `Io::start` returns the platform's own error, of whatever kind the
+platform gives a thread it cannot create (`Io` from `StdPlatform`).
 
 ### Tracing
 
-One span per request, target `io`, level `INFO`, created with the future, entered on the
-pool thread for the work, and closed when the request's state is released (after the
-result is taken or the future is dropped), so a profiler sees the time waiting and the
-time working. A future dropped unpolled closes its span without ever entering it. `error`
-is recorded on completion with the kind, for a failure only.
+One span per request, target `io`, level `INFO`. The target is the crate's role name:
+`io` has no codename, an exception to architecture section 19's "Log targets are the
+codenames" that D130 states, as `physics` is for `physics-api`'s contract. The span is
+created at the future's first poll, when the request is submitted, and closed when the
+request's state is released (after the result is taken or the future is dropped). It is
+entered on the pool thread for the work, and, for an encoded read, in each decode slice of
+the future's poll. A profiler that shows entered spans only, as Tracy does, sees the work
+and not the wait. A future dropped unpolled creates no span; one polled and dropped before
+the pool started it closes its span without it ever being entered. `error` is recorded on
+completion with the kind, for a failure only.
 
 | Span | Fields at creation | Recorded at completion |
 |---|---|---|
-| `io.open` | `path` | `file` (the `FileId`), `size`, `error` |
+| `io.open` | `path`, `file` (the `FileId` the handle will carry) | `size`, `error` |
 | `io.read` | `file`, `offset`, `len`, `encoding` (`"raw"` or `"zstd"`), `decoded_len` (equal to `len` for a raw read) | `error` |
 | `io.read_file` | `path` | `len`, `error` |
 | `io.replace` | `path`, `len` | `error` |
@@ -247,7 +331,7 @@ own events.
 - **io_uring and IOCP backends** (architecture section 4). The `Backend` trait and
   `src/backend/` are where they go; `SAFETY.md` is where their `unsafe` is argued;
   `docs/verification.md` has the CI spike row. Until one lands every platform runs the
-  blocking pool.
+  blocking pool, with its one-read-at-a-time handles on Windows.
 - **Priority and an IO budget.** The queue is FIFO. Milestone 3's streaming decides, with
   `asset-api`'s budget type, whether a request carries a priority and whether the pool
   reorders; SILO's `LoadPriority` orders its own submissions until then.
@@ -260,8 +344,11 @@ own events.
   allocation is the simplest ownership; a zero-copy read into an asset's final storage
   waits for a consumer that needs one.
 - **Deleting and renaming files, and removing directories.** No consumer of milestone 1
-  deletes: saves are replaced, packs are immutable, the cooker writes over its outputs.
-  A save-slot delete in the UI is the first consumer and brings `remove_file` with it.
+  deletes: saves are replaced, packs are immutable, the cooker writes over its outputs,
+  and a replace sweeps its own path's leftover temporaries. A save-slot delete in the UI
+  is the first consumer and brings `remove_file` with it.
+- **Two processes sharing a save directory.** A replace's sweep assumes no other process
+  replaces the same path.
 - **Metadata without opening** (size, modified time) and **watching a directory** for the
   cooker's hot reload (`asset`'s milestone 2 work). Both are requests of the same shape
   and arrive with their consumer.
@@ -271,35 +358,58 @@ own events.
 ## Proof for milestone 1
 
 Tests the implementation writes, all under `cargo nextest`, none under SOUR: this crate
-is outside the determinism boundary and nothing in it hashes.
+is outside the determinism boundary and nothing in it hashes. Every one asserts on counts
+and orderings, never on timings.
 
-- **Config.** `for_topology` on the listed topologies (exists).
+- **Config.** `for_topology` on the listed topologies (exists); `IoConfig::new` keeps its
+  count.
 - **Cancellation.** A future created and dropped unpolled submits nothing: the queue is
-  untouched and its span is never entered. A future dropped while queued never runs: with one
+  untouched and no span is created. A future dropped while queued never runs: with one
   pool thread held by a slow request, a queued replace is dropped and the path is never
   created. A future dropped after its request started completes on the pool: no panic, the
   buffer is freed, `AllocTag::Io` live bytes return to zero. The drop returns at once
-  while the pool thread is still inside the request.
+  while the pool thread is still inside the request. An encoded read dropped between two
+  decode slices frees both buffers, and `AllocTag::Io` live bytes return to zero.
 - **Ordering.** With one pool thread, requests start in first-poll order. A replace
   awaited to `Ok` followed by a `read_file` of the same path sees the new content.
+- **Replace order per path** (the shape of the review's `review_replace_race.rs`). With
+  two pool threads, a large replace A of a path is polled until its temporary exists
+  (observed by a listing), and its future dropped; a small replace B of the same path is
+  then submitted and awaited. B resolves `Ok` only after A has finished, the path holds
+  B's bytes then, and still does once the pool is idle. A third replace of the same path
+  dropped while it waits behind A never runs and does not delay B. Two replaces of
+  different paths run at once.
 - **Errors.** Each row of the table is produced: a missing file, a missing directory for
-  a replace, a range past the end (and no partial buffer), an overflowing range, a
-  truncated frame, trailing bytes after a frame, a wrong `decoded_len`, a `len` above the
-  cap (and `AllocTag::Io` total allocations unchanged), a permission failure, a directory
-  opened as a file, a request after `shutdown`, a read on a `File` after the last `Io`
-  dropped. `StorageFull` is produced on a size-limited filesystem where the runner has one
-  (a `tmpfs` with `size=` on Linux); elsewhere the mapping of `ENOSPC` is `core`'s test.
+  a replace, a range past the end (and no partial buffer), an overflowing range, an empty
+  encoded range, a truncated frame, trailing bytes after a frame, two concatenated frames
+  whose sizes sum to `decoded_len`, a skippable frame before a frame, a frame without a
+  content size, a content size above and below `decoded_len`, a `len` above the cap (and
+  `AllocTag::Io` total allocations unchanged), a permission failure, a directory opened as
+  a file, a request after `shutdown`, a read on a `File` after the last `Io` dropped. Each
+  decode failure is `InvalidData`, none `Io`. `StorageFull` is produced on a size-limited
+  filesystem where the runner has one (a `tmpfs` with `size=` on Linux); elsewhere the
+  mapping of `ENOSPC` is `core`'s test. The remapping of `Unsupported` and `Network` to
+  `Io` is a unit test of the mapping function over constructed `std::io::Error`s.
 - **Short reads.** A file shorter than `offset + len` by one byte is `InvalidData`; a file
-  exactly `offset + len` long succeeds.
+  exactly `offset + len` long succeeds. A `read_file` of a file appended to between its
+  size check and its end (a test hook between the two) is `InvalidData`.
 - **Decode.** A zstd frame round-trips to the bytes it was made from, in a buffer of
   exactly `decoded_len`; the content-size header disagreeing with `decoded_len` is
-  `InvalidData`.
+  `InvalidData`. A frame of several MiB, polled by hand, returns `Pending` with its own
+  waker woken more than once before it resolves; the pool's thread is never inside the
+  decode (`AllocTag::current()` in the decode is `Io` through the scope, and the thread
+  is the poller's).
 - **Atomic replace.** The new content is seen whole after `Ok`; the previous content is
   kept and the temporary removed when the write fails (a `path` that is a directory, a
-  read-only directory); the temporary is created in the same directory (observed by a
-  listing taken while a slow replace is in flight); a `File` opened before a replace reads
-  the previous content after it, on Unix and on Windows; a replace over a path we hold
-  open ourselves succeeds on Windows. Durability across a power loss is
+  read-only directory), and the `ReplaceFailed` holds the very bytes given (same pointer
+  and length); the temporary is created in the same directory (observed by a listing
+  taken while a slow replace is in flight); a replace of a bare file name works in the
+  current directory; a leftover `<name>.<sixteen hex>.tmp` is removed by the next replace
+  of `<name>`, and a sibling path's temporary and a file `<name>.bak.tmp` are not; a
+  temporary name already taken is skipped to the next; a `File` opened before a replace
+  reads the previous content after it, on Unix and on Windows; a replace over a path we
+  hold open ourselves succeeds on Windows. A failure after the rename is `Io` (forced
+  with a test hook in place of the directory sync). Durability across a power loss is
   `docs/verification.md`'s row, not a test.
 - **Directories.** A listing is sorted, kinds are the entries' own, a symbolic link is
   `Other`, a `.tmp` is listed; `create_dir_all` creates the chain and is idempotent.
@@ -307,8 +417,11 @@ is outside the determinism boundary and nothing in it hashes.
   indices stated; `pool_threads` requests run at once (a barrier each waits on with two
   threads); `AllocTag::current()` is `Io` on the pool thread; a request's buffer is
   charged to `Io`.
-- **Shutdown.** Queued requests resolve `Cancelled`, started ones finish, `shutdown`
-  returns after the threads exit; dropping the last `Io` with requests in flight neither
-  hangs nor panics and the started requests complete.
-- **Tracing.** A capturing subscriber sees one span per request with the names and fields
-  of the table, `error` recorded on a failure and empty on success.
+- **Shutdown.** Queued requests and replaces waiting behind their path resolve
+  `Cancelled`, started ones finish, `shutdown` returns after the threads exit; dropping
+  the last `Io` with requests in flight neither hangs nor panics and the started requests
+  complete.
+- **Tracing.** A capturing subscriber sees one span per polled request with the names and
+  fields of the table, `io.open` carrying `file` from its creation and `size` on success,
+  `error` recorded on a failure and empty on success, and no span for a future dropped
+  unpolled.

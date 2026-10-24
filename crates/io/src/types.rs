@@ -1,14 +1,18 @@
 //! The plain data a request carries and returns: how a stored range is decoded, what a
-//! directory listing holds, and the one size cap.
+//! directory listing holds, what a failed replace hands back, and the one size cap.
 
 use std::ffi::OsString;
+use std::fmt;
 
-/// The most bytes one read may ask for, stored or decoded: 1 GiB.
+use lactose_core::Error;
+
+/// The most bytes one request may ask for, stored or decoded: 1 GiB.
 ///
-/// A range or a `decoded_len` above it fails with `ErrorKind::ResourceExhausted` before
-/// anything is allocated, so a corrupt pack index or save index asking for an absurd
-/// length is an error value and never an allocation failure (architecture section 19).
-/// Larger content is read in ranges.
+/// A range, a `decoded_len` or a whole file above it fails with
+/// `ErrorKind::ResourceExhausted` before anything is allocated, so a corrupt pack index or
+/// save index asking for an absurd length is an error value (architecture section 19). The
+/// cap is per request: requests in flight at once may each hold up to this much. Larger
+/// content is read in ranges.
 pub const MAX_READ_BYTES: u64 = 1 << 30;
 
 /// How the bytes of a stored range are decoded before they are handed back.
@@ -46,4 +50,45 @@ pub enum EntryKind {
     Directory,
     /// Anything else: a symbolic link, a device, a socket, a pipe.
     Other,
+}
+
+/// A failed [`Io::replace`](crate::Io::replace): the error, and the bytes it was given,
+/// handed back unchanged and never copied so a retry needs no copy of its own.
+///
+/// Converts into its `error` with `?` where only the error matters.
+#[non_exhaustive]
+pub struct ReplaceFailed {
+    /// What went wrong; its kind says whether `path` may hold the new content
+    /// (`README.md`, "The atomic replace").
+    pub error: Error,
+    /// The bytes the replace was given, as they were.
+    pub bytes: Vec<u8>,
+}
+
+impl fmt::Debug for ReplaceFailed {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ReplaceFailed")
+            .field("error", &self.error)
+            .field("bytes", &self.bytes.len())
+            .finish()
+    }
+}
+
+impl fmt::Display for ReplaceFailed {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.error, f)
+    }
+}
+
+/// Transparent: the display and the source are the error's own.
+impl std::error::Error for ReplaceFailed {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        std::error::Error::source(&self.error)
+    }
+}
+
+impl From<ReplaceFailed> for Error {
+    fn from(failed: ReplaceFailed) -> Self {
+        failed.error
+    }
 }
