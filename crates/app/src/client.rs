@@ -19,23 +19,34 @@ use lactose_task::{Executor, TickPacer};
 
 use crate::game::Game;
 use crate::policy::ErrorPolicy;
+use crate::runtime::SolverExit;
 use crate::save::Cooked;
 use crate::world::WorldConfig;
 
 /// A client's prediction world between runs: the predictor, its pacer, the lead it runs
-/// ahead of the server by, the last clock estimate, the local player's recent samples and
-/// the cooked content the fold builds bundles from. Built by [`build_client`] on join;
-/// stepped by value from the timer root through [`frame`](Self::frame); dropped with the
+/// ahead of the server by, the last clock estimate and when it was taken, whether a clock
+/// resync is pending, the local player's recent samples and the cooked content the fold
+/// builds bundles from. Built by [`build_client`] on join; stepped by value from the timer
+/// root through [`frame`](Self::frame); ended by [`shutdown`](Self::shutdown) with the
 /// session. The replicated world (`WorldKind::Client`) is not here yet: its hook is
 /// `lactose-net`'s, milestone 4 (`README.md`, "Not in this crate yet").
 pub struct Client {
     predictor: Predictor,
     pacer: TickPacer,
     lead: u32,
-    estimate: Option<ClockEstimate>,
+    estimate: Option<Estimate>,
+    pending_resync: bool,
     history: SampleHistory,
     cooked: Arc<dyn Cooked>,
+    solver: SolverExit,
     policy: ErrorPolicy,
+}
+
+/// The last clock estimate and the instant it was taken at: what the clock target advances
+/// from. Hidden plumbing, changeable.
+struct Estimate {
+    taken: Instant,
+    estimate: ClockEstimate,
 }
 
 /// Builds the prediction world on join, from the same `game` and `config` as a server:
@@ -43,12 +54,12 @@ pub struct Client {
 /// setup the server gets plus `lactose_predict::register_types` and the build check
 /// `lactose_predict::check_prediction_reads`, then
 /// `Predictor::new(simulation, LocalPlayer { player: accepted.player, entity }, DEFAULT_DEPTH)`,
-/// and a pacer whose first tick falls due now. `entity` is the player's own entity as the
-/// server named it: a parameter until `JoinAccepted::entity` lands (proposed with D122),
-/// then read from `accepted`, a signature change to list. `lead` is the ticks the world
-/// runs ahead of the server by: the spike's choice at milestone 1, the clock estimate's
-/// `lead_ticks` rounded up at milestone 4. Fails as the builder, the check and
-/// `Predictor::new` fail, and as the solver pool fails.
+/// and a pacer built at `Instant::now()`, whose first tick is due at once. `entity` is the
+/// player's own entity as the server named it: a parameter until `JoinAccepted::entity`
+/// lands (proposed with D122), then read from `accepted`, a signature change to list.
+/// `lead` is the ticks the world runs ahead of the server by: the spike's choice at
+/// milestone 1, the clock estimate's `lead_ticks` rounded up at milestone 4. Fails as the
+/// builder, the check and `Predictor::new` fail, and as the solver pool fails.
 pub fn build_client(
     executor: &Executor,
     game: &Game,
@@ -69,7 +80,8 @@ impl Client {
     }
 
     /// `Simulation::hash` of the prediction world: what the spike compares against the
-    /// server's for the same tick when it looks for divergence.
+    /// server's hash of the same tick, recorded as the server passed that tick, since the
+    /// client stands [`lead`](Self::lead) ticks ahead of it.
     pub fn hash(&self) -> Result<u64> {
         self.predictor.simulation().hash()
     }
@@ -78,6 +90,13 @@ impl Client {
     #[must_use]
     pub fn local(&self) -> LocalPlayer {
         self.predictor.local()
+    }
+
+    /// The ticks the world runs ahead of the server by: what [`build_client`] was given,
+    /// until a [`clock`](Self::clock) estimate replaces it.
+    #[must_use]
+    pub fn lead(&self) -> u32 {
+        self.lead
     }
 
     /// The predictor, between runs: its stats, ring and tolerance.
@@ -94,7 +113,7 @@ impl Client {
 
     /// The local player's last eight samples by tick (`REDUNDANT_SAMPLES`), newest last:
     /// what every input packet carries (architecture section 9.2). Filled by
-    /// [`frame`](Self::frame) as it steps.
+    /// [`frame`](Self::frame) as it steps, and read by it for a tick it predicts again.
     #[must_use]
     pub fn history(&self) -> &SampleHistory {
         &self.history
@@ -103,46 +122,77 @@ impl Client {
     /// Queues a staged frame the network delivered, between runs: `StagedInbox::push` on
     /// the prediction world's inbox. `false` when the inbox refused it (a tick not after
     /// the newest queued, or a frame from before an accepted full frame), which is logged
-    /// and enters nothing.
+    /// at `debug` and enters nothing.
     #[must_use]
     pub fn push(&mut self, frame: Arc<StagedFrame>) -> bool {
         todo!("push into the inbox")
     }
 
-    /// How the clock estimate reaches the timer root (architecture section 9.2): the pacer's
-    /// scale becomes the replicated time scale times `rate_thousandths / 1000`; `lead_ticks`
-    /// rounded up becomes the lead; and if `snap` is set the pacer resyncs at `now` and the
-    /// predictor resyncs to `server_tick + lead`, which the next [`frame`](Self::frame)
-    /// reports in [`ClientOutput::resync`] so a full frame is requested. The estimate is
-    /// `lactose-net`'s to compute (named only at milestone 1; the spike computes one from
-    /// its round trip by hand).
+    /// How the clock estimate reaches the timer root (architecture section 9.2), between
+    /// runs: the pacer's scale becomes the world's `TimeScale` times
+    /// `rate_thousandths / 1000`; `lead_ticks` rounded up becomes the lead; the estimate is
+    /// kept with `now` as the instant it was taken, for the clock target; and `snap` marks
+    /// a clock resync, which the next [`frame`](Self::frame) performs on entry and reports.
+    /// The estimate is `lactose-net`'s to compute at milestone 4; the spike computes one
+    /// from its round trip by hand.
     pub fn clock(&mut self, now: Instant, estimate: ClockEstimate) {
-        todo!("apply the estimate to the pacer, the lead and, on snap, the predictor")
+        todo!("apply the estimate to the pacer and the lead, keep it, mark a snap")
     }
 
-    /// One frame of the timer root's client half, by value, in the order
-    /// `crates/predict/README.md` states: the due frames' time scale and region changes
-    /// folded into the first new tick's `TickInput` (`StagedInbox::due`; a `Relevant`
-    /// region through `RegionRelevance::to_bundle` with the cooked baseline and table, an
-    /// `Irrelevant` one into `unloaded`, `Assets` pinned into `assets`; a full frame puts
-    /// every loaded region in `unloaded` first); `pacer.poll(now)`; one `Predictor::step`
-    /// per due tick with `sample(tick).to_player_sample(tick)` as the local player's input,
-    /// the sample kept in the history; `Predictor::reconcile`, timed; `Predictor::passes`;
-    /// the presentation events taken; a resync if the reconciliation asks for one
-    /// (`pacer.resync(now)`, then `Predictor::resync` to the last estimate's `server_tick`
-    /// plus the lead, or without an estimate to `Behind`'s `server` plus the lead or, for
-    /// `TooOld`, the world's own tick); `pacer.resync(now)` alone if the budget was
-    /// `behind`. Resolves
-    /// with the client and a [`ClientOutput`], or with [`ClientError`]: the client kept when
-    /// the predictor came back (the policy's response is `Resync`, and the output of the
-    /// next frame reports it), gone after `Cancelled`.
+    /// One frame of the timer root's client half, by value, in this order and nothing
+    /// else. The clock target of a resync at `now` with a hint `h` (`Behind`'s `server`,
+    /// or none) is the last estimate's `server_tick` advanced by the whole tick periods
+    /// elapsed since the estimate was taken, or `h` if that is later or there is no
+    /// estimate, plus the lead; with neither an estimate nor a hint, the world's own tick.
+    ///
+    /// 1. A pending clock resync (a `snap`, or the kept failure of the previous frame):
+    ///    `pacer.resync(now)`, then `Predictor::resync` to the clock target with no hint.
+    /// 2. The fold, from `StagedInbox::due(next)` for `next = tick() + 1`: the newest due
+    ///    frame's `time_scale` that is `Some` goes into the input and to the pacer now,
+    ///    before the poll, times the estimate's `rate_thousandths / 1000`, so a replicated
+    ///    pause stops the ticks at once and an unpause makes them due; and the region
+    ///    changes as `crates/net-api/README.md` states (`Irrelevant` removes any pending
+    ///    `loaded` and `assets` entry and inserts `unloaded`; `Relevant` inserts `loaded`
+    ///    through `RegionRelevance::to_bundle(baseline, None, table)` with `baseline` from
+    ///    `Cooked::baseline` and `table` the message's table through `Cooked::pin`, or
+    ///    `None`; `Assets` inserts the table pinned; a `full` frame first clears what
+    ///    earlier due frames folded and puts every region of `World::regions` in
+    ///    `unloaded`). A region whose baseline or pin `Cooked` cannot give is left out and
+    ///    logged (`Source::Cooked`, `Resync`), and unless step 1 resynced, the world is
+    ///    resynced at its own tick with the pacer untouched: a content resync, reported so
+    ///    the full frame that follows retries the region.
+    /// 3. `pacer.poll(now)`.
+    /// 4. One `Predictor::step` per due tick, with the fold's input in the first and an
+    ///    empty one after. The local player's sample for `next` is the history's if it
+    ///    holds one (a tick predicted before a backward resync is predicted again with the
+    ///    sample the server was sent), else `sample(next)`, inserted; `sample` runs on the
+    ///    task that drives the frame and must not block.
+    /// 5. `Predictor::reconcile`, its wall time measured around the await.
+    /// 6. `Predictor::passes`.
+    /// 7. `take_present_events`.
+    /// 8. If `Reconciled::resync` is `Some`: `pacer.resync(now)`, then `Predictor::resync`
+    ///    to the clock target, with `Behind`'s `server` as the hint and none for `TooOld`.
+    /// 9. If the budget was `behind`: `pacer.resync(now)`.
+    ///
+    /// Resolves with the client and a [`ClientOutput`], or with [`ClientError`]: the client
+    /// kept when the predictor came back, with a clock resync marked for the next frame's
+    /// step 1 (the policy's response is `Resync`); gone after `Cancelled`.
     pub fn frame<'a>(
         self,
         executor: &'a Executor,
         now: Instant,
         sample: &'a mut (dyn FnMut(Tick) -> PlayerInput + Send),
     ) -> ClientFrame<'a> {
-        todo!("fold, poll, step, reconcile, run the passes, take the events, resync")
+        todo!("resync on entry, fold, poll, step, reconcile, run the passes, take the events")
+    }
+
+    /// Drops the world and waits for its solver threads: the predictor goes first, which
+    /// drops the prediction world, `Physics` and its backend, which terminates the pool;
+    /// then every `solver-<n>` thread's exit is waited for. Dropping a `Client` without
+    /// this terminates the pool and does not wait. From the thread that owns the client,
+    /// never from a worker or a solver thread.
+    pub fn shutdown(self) {
+        todo!("drop the predictor, then wait on the solver exit")
     }
 }
 
@@ -162,9 +212,10 @@ pub struct ClientOutput {
     /// The wall time `reconcile` took: divided by `reconciled.resimulated` for the rollback
     /// cost per tick the spike records (architecture section 22).
     pub rollback: Duration,
-    /// `Some(tick)` if the world was resynced this frame and now stands at `tick`: the
-    /// caller requests a full frame from the server (`ResyncRequest`, reason
-    /// `BehindCatchUp` for both of the predictor's reasons at milestone 1).
+    /// `Some(tick)` if the world was resynced this frame, by step 1, 2 or 8 of
+    /// [`Client::frame`], and now stands at `tick`: the caller requests a full frame from
+    /// the server (`ResyncRequest`; reason `BehindCatchUp` at milestone 1, since the
+    /// output does not say which step it was, "Not in this crate yet").
     pub resync: Option<Tick>,
     /// The presentation events delivered this frame and the cancellations, taken after the
     /// passes: presentation's at milestone 2, dropped by the spike.
@@ -172,8 +223,8 @@ pub struct ClientOutput {
 }
 
 /// How a client run fails: the error, and the client when its world survived. `Some` when
-/// `PredictError` handed the predictor back, so the caller keeps its world and resyncs;
-/// `None` after `Cancelled`. Converts into [`Error`].
+/// `PredictError` handed the predictor back, so the caller keeps its world and the next
+/// frame resyncs it; `None` after `Cancelled`. Converts into [`Error`].
 pub struct ClientError {
     /// What failed.
     pub error: Error,

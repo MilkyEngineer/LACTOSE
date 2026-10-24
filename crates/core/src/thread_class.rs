@@ -19,6 +19,11 @@ pub enum ThreadClass {
     Audio,
     /// A thread of the physics solver pool.
     PhysicsSolver,
+    /// A thread of the file IO pool (`lactose-io`): it makes blocking file system calls and
+    /// decodes nothing, since asset decode runs on background workers. Utility priority like
+    /// `Background`, as its own class so a platform that pins by class and index never puts
+    /// it on a background worker's core.
+    Io,
 }
 
 impl ThreadClass {
@@ -28,9 +33,9 @@ impl ThreadClass {
     /// class is best effort: an operating system that refuses it yields an error of kind
     /// `Platform`, and the thread still runs correctly at its default priority.
     ///
-    /// Enter a class once, at thread start. On Linux the background class lowers priority
-    /// in a way an unprivileged thread cannot undo, so a later `enter` of another class
-    /// leaves it lowered. On Windows the class sets thread priority only; steering
+    /// Enter a class once, at thread start. On Linux the two utility classes, `Background`
+    /// and `Io`, lower priority in a way an unprivileged thread cannot undo, so a later
+    /// `enter` of another class leaves it lowered. On Windows the class sets thread priority only; steering
     /// background threads to efficiency cores is an open item in `docs/verification.md`.
     pub fn enter(self) -> Result<()> {
         fp::set_deterministic();
@@ -183,7 +188,7 @@ mod os {
 
     pub(super) fn set_scheduling(class: ThreadClass) -> Result<()> {
         let qos = match class {
-            ThreadClass::Background => libc::qos_class_t::QOS_CLASS_UTILITY,
+            ThreadClass::Background | ThreadClass::Io => libc::qos_class_t::QOS_CLASS_UTILITY,
             ThreadClass::FrameCritical
             | ThreadClass::Network
             | ThreadClass::Present
@@ -208,9 +213,9 @@ mod os {
     const BACKGROUND_NICE: libc::c_int = 10;
 
     pub(super) fn set_scheduling(class: ThreadClass) -> Result<()> {
-        // Raising priority needs privileges a game does not have, so only the background
-        // class is adjusted. On Linux a nice value applies to one thread when given its ID.
-        if class != ThreadClass::Background {
+        // Raising priority needs privileges a game does not have, so only the two utility
+        // classes are adjusted. On Linux a nice value applies to one thread when given its ID.
+        if !matches!(class, ThreadClass::Background | ThreadClass::Io) {
             return Ok(());
         }
         // SAFETY: `gettid` has no preconditions, and `setpriority` takes plain values and
@@ -241,7 +246,7 @@ mod os {
 
     pub(super) fn set_scheduling(class: ThreadClass) -> Result<()> {
         let priority = match class {
-            ThreadClass::Background => THREAD_PRIORITY_BELOW_NORMAL,
+            ThreadClass::Background | ThreadClass::Io => THREAD_PRIORITY_BELOW_NORMAL,
             ThreadClass::Audio => THREAD_PRIORITY_TIME_CRITICAL,
             ThreadClass::FrameCritical
             | ThreadClass::Network
@@ -285,6 +290,7 @@ mod tests {
             ThreadClass::Audio,
             ThreadClass::PhysicsSolver,
             ThreadClass::Background,
+            ThreadClass::Io,
         ] {
             std::thread::spawn(move || {
                 class.enter().unwrap();

@@ -6,7 +6,7 @@ use lactose_physics_api::PhysicsConfig;
 use lactose_sim::{RegionControl, RegionPolicy};
 
 use crate::runtime::LOG_RETENTION;
-use crate::save::Loaded;
+use crate::save::SavedWorld;
 
 /// What the assembly decides for one world: the storage layout, who decides which regions
 /// are loaded, the region policy, the physics configuration and the log retention. The
@@ -24,7 +24,7 @@ pub struct WorldConfig {
     /// activation radius (not in this crate yet).
     pub policy: RegionPolicy,
     /// Gravity and the reserved workers: the solver pool is sized from the reservation
-    /// (`README.md`, "The solver pool").
+    /// (`README.md`, "The executor and the solver pool").
     pub physics: PhysicsConfig,
     /// `SimulationBuilder::log_retention`, at least [`CATCH_UP_CAP`](crate::CATCH_UP_CAP);
     /// a smaller value is a build error of kind `InvalidData`.
@@ -53,8 +53,11 @@ impl WorldConfig {
 pub enum Start {
     /// Tick zero and the counter's first value; every region enters through the frames.
     Fresh,
-    /// From a save ([`load`](crate::load)): the saved tick and counter into the builder, the
-    /// saved regions into the first frame's `loaded` before anything else that frame
-    /// carries, every player joining again through `sessions`.
-    Loaded(Loaded),
+    /// From a save ([`load`](crate::load), or a [`SavedWorld`] a save point produced): the
+    /// saved tick and counter into the builder, every saved region into the server's store
+    /// (`Server::kept`), from which the first step loads every one under `Directed` and the
+    /// lifecycle's `Load` requests bring each back under `Anchored` as players join, so no
+    /// saved region is lost; every player joins again through `sessions` (`README.md`,
+    /// "Saves and loads").
+    Loaded(SavedWorld),
 }

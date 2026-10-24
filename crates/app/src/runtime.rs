@@ -1,8 +1,8 @@
-//! The executor every binary starts, and the constants of the timer root (architecture
-//! sections 5.1 and 11; D111, D112).
+//! The executor every binary starts, the solver pool each world gets, and the constants of
+//! the timer root (architecture sections 5.1, 11 and 16; D111, D112).
 
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use lactose_core::Result;
@@ -40,10 +40,14 @@ pub struct Workers {
     pub background_workers: Option<u32>,
     /// Chaos scheduling, or free scheduling. A runtime option, never a Cargo feature.
     pub chaos: Option<ChaosConfig>,
-    /// A recorded execution log to replay instead of scheduling freely.
+    /// A recorded execution log to replay instead of scheduling freely: for step-driven
+    /// runs only, since a paced run interleaves steps and passes by wall time, which no
+    /// recorded log can follow. `Headless::run` refuses an executor built with one
+    /// (`README.md`, "The executor and the solver pool").
     pub replay: Option<ExecutionLog>,
-    /// The thread and topology provider: the standard one when `None`, which the headless
-    /// binary uses; the platform crate's instance from the client binary at milestone 4.
+    /// The thread and topology provider for the executor and the IO pool: the standard one
+    /// when `None`, which the headless binary uses; the platform crate's instance from the
+    /// client binary at milestone 4.
     pub platform: Option<Arc<dyn Platform>>,
 }
 
@@ -62,16 +66,39 @@ impl fmt::Debug for Workers {
 /// Starts the executor every binary runs on: `Executor::builder()` with each `Some` of
 /// `workers` applied, then `build`. The one place an executor is built; the solver pool of
 /// each world is built beside its world from this executor's frame worker count
-/// (`README.md`, "The solver pool"). Fails as `ExecutorBuilder::build` fails, which the
-/// policy treats as fatal: no binary runs without its executor.
+/// (`README.md`, "The executor and the solver pool"). Fails as `ExecutorBuilder::build`
+/// fails, which the policy treats as fatal: no binary runs without its executor.
 pub fn start_executor(workers: Workers) -> Result<Executor> {
     todo!("apply the overrides to the builder and build")
 }
 
-/// The solver pool of one world: `frame_worker_count - reserved` threads, at least one,
-/// named `solver-<n>`, built with rayon's builder and never with `use_current_thread`, so
-/// the pool is the backend's alone (`crates/physics-rapier/README.md`). Fails with
-/// `Platform` if rayon cannot start a thread.
-pub(crate) fn solver_pool(executor: &Executor, reserved: u32) -> Result<rayon::ThreadPool> {
-    todo!("size the pool from the frame worker count and build it")
+/// The solver pool of one world and the handle its world waits on at shutdown:
+/// `frame_worker_count - reserved` threads, at least one, named `solver-<n>`, built with
+/// rayon's builder and never with `use_current_thread`, so the pool is the backend's alone
+/// (`crates/physics-rapier/README.md`), with an `exit_handler` that raises the handle's
+/// count as each thread exits. Fails with `Platform` if rayon cannot start a thread.
+pub(crate) fn solver_pool(
+    executor: &Executor,
+    reserved: u32,
+) -> Result<(rayon::ThreadPool, SolverExit)> {
+    todo!("size the pool from the frame worker count and build it with the exit handler")
+}
+
+/// What a world keeps of its solver pool once the pool itself has gone to the backend: the
+/// thread count, and the count of threads that have exited, which every thread's
+/// `exit_handler` raises. Hidden plumbing, changeable.
+pub(crate) struct SolverExit {
+    threads: usize,
+    exited: Arc<(Mutex<usize>, Condvar)>,
+}
+
+impl SolverExit {
+    /// Blocks until every solver thread has exited: what `Server::shutdown` and
+    /// `Client::shutdown` call after dropping the world, whose backend's drop terminated the
+    /// pool, so that "shut down" means the threads are gone and not only told to go. Never
+    /// before the world is dropped (nothing would be exiting) and never from a solver thread
+    /// (it would wait for itself).
+    pub(crate) fn wait(&self) {
+        todo!("wait on the condition variable until exited == threads")
+    }
 }

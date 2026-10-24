@@ -118,15 +118,16 @@ struct Inbound {
     inputs: BTreeMap<PlayerId, PlayerSample>,
 }
 
-/// Start: the executor, then the server world, fresh.
-fn server_start() -> Result<(Executor, Server)> {
+/// Start: the executor, then the server world, fresh, over the spike's cooked content.
+fn server_start(cooked: Arc<InMemory>) -> Result<(Executor, Server)> {
     let executor = start_executor(Workers::default())?;
-    let server = build_server(&executor, &GAME, WorldConfig::headless(), Start::Fresh)?;
+    let server = build_server(&executor, &GAME, WorldConfig::headless(), Start::Fresh, cooked)?;
     Ok((executor, server))
 }
 
 /// One server frame: the due ticks take what arrived, the passes run, the gather's frame
-/// is packed for the client. A server failure is the policy's `Stop`: the error goes up.
+/// is packed for the client. The callback drains what the network thread left and never
+/// waits for it. A server failure is the policy's `Stop`: the error goes up.
 async fn server_frame(
     executor: &Executor,
     server: Server,
@@ -151,18 +152,22 @@ async fn server_frame(
 
 /// A join, after the tick that carried its session event ran: the player's entity as the
 /// world named it, the acceptance, and the first full frame from the relevance message of
-/// the region the player stands in.
+/// the region the player stands in, over the table the server simulates it with. A full
+/// frame carries the time scale and the acknowledgement as `Some`: the server's scale, and
+/// the join tick, since no input of the player has been applied yet.
 fn accept_join(
+    executor: &Executor,
     server: &Server,
     player: PlayerId,
     region: RegionId,
-    cooked: &InMemory,
 ) -> Result<(JoinAccepted, StableKey, Arc<StagedFrame>)> {
     let entity = lactose_input::player_entity(server.simulation().world(), player)
         .ok_or_else(|| Error::new(ErrorKind::NotFound, "the join's tick has not run"))?;
     let accepted = JoinAccepted { player, tick: server.tick() };
-    let relevance = server.relevance(region, cooked.table(region))?;
+    let relevance = server.relevance(executor, region)?;
     let mut frame = StagedFrame::resync(server.tick());
+    frame.time_scale = Some(server.time_scale());
+    frame.acked_input = Some(server.tick());
     frame.regions.insert(region, RegionChange::Relevant(relevance));
     Ok((accepted, entity, Arc::new(frame)))
 }
@@ -186,7 +191,7 @@ fn client_join(
     Ok(client)
 }
 
-/// The spike's scripted input: walk forward.
+/// The spike's scripted input: walk forward. Runs on the frame's task and returns at once.
 fn scripted(tick: Tick) -> PlayerInput {
     PlayerInput::IDLE
 }
@@ -194,8 +199,8 @@ fn scripted(tick: Tick) -> PlayerInput {
 /// One client frame: the staged frame the transport delivered is pushed, the frame runs
 /// with the scripted sample, the last eight samples go back as the input packet, a resync
 /// becomes a request, and the loop sleeps to the next deadline. A kept failure is the
-/// policy's `Resync`: the client is kept and the next frame reports the resync; a torn
-/// one is `Stop`.
+/// policy's `Resync`: the client is kept and the next frame resyncs on entry and reports
+/// it; a torn one is `Stop`.
 async fn client_frame(
     executor: &Executor,
     client: Client,
@@ -216,7 +221,8 @@ async fn client_frame(
         Err(ClientError { error, client: Some(kept) }) => return Ok(kept),
         Err(ClientError { error, client: None }) => return Err(error),
     };
-    // What the milestone measures: the rollback cost per re-simulated tick.
+    // What the milestone measures: the rollback cost per re-simulated tick and the
+    // corrections.
     let per_tick: Option<Duration> =
         (out.reconciled.resimulated > 0).then(|| out.rollback / out.reconciled.resimulated);
     let corrections = out.reconciled.corrections.len();
@@ -245,7 +251,10 @@ fn clock_from_round_trip(client: &mut Client, now: Instant, server_tick: Tick, r
 }
 
 /// One tick of the spike end to end, both ends in one process: the server's frame, its
-/// packed frame delivered, the client's frame, its inputs delivered back.
+/// packed frame delivered, the client's frame, its inputs delivered back. The client
+/// stands `LEAD` ticks ahead, so its hash is kept by tick and compared with the server's
+/// when the server reaches that tick: equal when the prediction world holds every region
+/// of the server with every component replicated, as the spike's game arranges.
 async fn one_tick(
     executor: &Executor,
     server: Server,
@@ -253,10 +262,22 @@ async fn one_tick(
     inbound: &mut Inbound,
     transport: &mut dyn Transport,
     to: ConnectionId,
+    predicted: &mut BTreeMap<Tick, u64>,
 ) -> Result<(Server, Client)> {
     let (server, packed) = server_frame(executor, server, inbound, Instant::now()).await?;
+    if let Some(hash) = predicted.remove(&server.tick()) {
+        let divergence = hash != server.hash()?;
+    }
     let client =
         client_frame(executor, client, Some(packed), Instant::now(), transport, to).await?;
-    let divergence = server.hash()? != client.hash()?;
+    predicted.insert(client.tick(), client.hash()?);
     Ok((server, client))
+}
+
+/// The end of the spike: each world dropped and its solver threads waited for, then the
+/// executor.
+fn spike_end(executor: Executor, server: Server, client: Client) {
+    client.shutdown();
+    server.shutdown();
+    executor.shutdown();
 }

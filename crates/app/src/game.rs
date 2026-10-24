@@ -19,8 +19,8 @@ pub struct CrateRegistration {
     /// The crate's name, as `Cargo.toml` spells it: the log names it, and so does the
     /// build error when one of its functions fails.
     pub name: &'static str,
-    /// `register_types`: every component and resource the crate defines, into the one
-    /// `TypeTable` every world of the process is built from.
+    /// `register_types`: every component and resource the crate defines, into the
+    /// `TypeTable` of every world and every load, each of which [`Game::types`] builds.
     pub types: fn(&mut TypeTable) -> Result<()>,
     /// `setup`: the crate's configuration resources, or `None` when it inserts nothing. Runs
     /// in every world kind; what it inserts is `derived` (`crates/sim/README.md`, "Game
@@ -58,17 +58,19 @@ pub struct Game {
 }
 
 impl Game {
-    /// The one `TypeTable` every world of the process is built from: `TypeTable::new()`,
-    /// then the engine's `register_types` in the order the README states, then every
-    /// crate's `types` in list order. The first error ends the fold, with the crate's
-    /// name in the message.
+    /// The `TypeTable` a world or a load is built from, a fresh one per call and every one
+    /// the same function of the same list: `TypeTable::new()`, then the engine's
+    /// `register_types` in the order the README states, then every crate's `types` in list
+    /// order. Every `TypeTable` of the process is built by this, so every world and every
+    /// save of the process agree on the registry. The first error ends the fold, with the
+    /// crate's name in the message.
     pub fn types(&self) -> Result<TypeTable> {
         todo!("fold the engine's and every crate's register_types into one table")
     }
 
-    /// The one `Migrations` a loader takes: every crate's `migrations` in list order, into
-    /// `Migrations::new()`. The first error ends the fold, with the crate's name in the
-    /// message.
+    /// The `Migrations` a loader takes, a fresh one per call: every crate's `migrations` in
+    /// list order, into `Migrations::new()`. The first error ends the fold, with the
+    /// crate's name in the message.
     pub fn migrations(&self) -> Result<Migrations> {
         todo!("fold every crate's register_migrations into one table")
     }

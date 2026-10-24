@@ -1,5 +1,6 @@
-//! The server world and the timer root's frame around it (architecture sections 5.1, 9.2,
-//! 9.3 and 11; `crates/sim/README.md`, "The timer root").
+//! The server world, its store of saved regions and the timer root's frame around it
+//! (architecture sections 5.1, 9.2, 9.3, 11 and 15.2; `crates/sim/README.md`, "The timer
+//! root" and "Regions").
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -9,52 +10,68 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Instant;
 
-use lactose_asset_api::VersionTable;
 use lactose_bundle::Baseline;
 use lactose_core::{Error, Result, Tick};
 use lactose_ecs::RegionId;
 use lactose_net_api::{RegionRelevance, StagingFrame};
-use lactose_persist::SchemaTable;
-use lactose_sim::{RegionExport, RegionRequest, SavePoint, Simulation, TickInput, TimeScale};
+use lactose_persist::{Migrations, SchemaTable};
+use lactose_sim::{
+    AssetFailureEvent, LoadFailure, RegionBundle, RegionRequest, SessionFailure, Simulation,
+    TickInput, TimeScale,
+};
 use lactose_task::{Executor, TickPacer};
 
 use crate::game::Game;
 use crate::policy::ErrorPolicy;
-use crate::save::SaveEncode;
+use crate::runtime::SolverExit;
+use crate::save::{Cooked, SaveEncode, SavedRegion, SavedWorld};
 use crate::world::{Start, WorldConfig};
 
-/// A server world between runs: the simulation, its pacer, the schema table a save and a
-/// relevance message share, the time scale the server decided, and the baseline of every
-/// region it stepped a bundle for. Built by [`build_server`]; stepped by value from the
-/// timer root through [`step`](Self::step) or [`frame`](Self::frame); dropped at shutdown,
-/// which drops the physics backend and joins its solver pool.
+/// A server world between runs: the simulation, its pacer, the schema table and the
+/// migrations a save and a reload share, the cooked content a reload's table comes from,
+/// the time scale the server decided, the baseline of every loaded region, and the store:
+/// the saved state of every region that is not loaded ([`kept`](Self::kept)), with the
+/// bundles queued for the next step. Built by [`build_server`]; stepped by value from the
+/// timer root through [`step`](Self::step) or [`frame`](Self::frame); ended by
+/// [`shutdown`](Self::shutdown), which drops the world and waits for its solver threads.
 pub struct Server {
     simulation: Simulation,
     pacer: TickPacer,
     schemas: Arc<SchemaTable>,
+    migrations: Migrations,
+    cooked: Arc<dyn Cooked>,
     time_scale: TimeScale,
     pending_scale: Option<TimeScale>,
     baselines: BTreeMap<RegionId, Arc<Baseline>>,
+    kept: BTreeMap<RegionId, Arc<SavedRegion>>,
+    queued: BTreeMap<RegionId, RegionBundle>,
+    solver: SolverExit,
     policy: ErrorPolicy,
 }
 
-/// Builds a server world from `game` and `config`, starting at `start`: the one type table
-/// (`Game::types`), the solver pool and the backend, every setup function, every
-/// registration function and every ordering edge in the order `README.md` states
-/// ("Registration"), the input and session appliers, `config` into the builder, and a
-/// pacer whose first tick falls due now. Fails as the builder fails (a registration or
-/// setup error carries its crate's name; `log_retention` below the cap is `InvalidData`),
-/// as the solver pool fails, and with `InvalidData` if `start` is `Loaded` and `config.regions`
-/// is `Anchored` but a saved region is not in the atlas. A `Loaded` start's bundles are
-/// not loaded here: they go into the first frame, which [`Server::frame`] and
-/// [`Server::step`] prepend to that frame's `loaded` (`README.md`, "Saving and loading").
+/// Builds a server world from `game` and `config`, starting at `start`, over `cooked`: the
+/// type table (`Game::types`), the schema table and the migrations, the solver pool and the
+/// backend, every setup function, every registration function and every ordering edge in
+/// the order `README.md` states ("Registration"), the input and session appliers, `config`
+/// into the builder, and a pacer built at `Instant::now()`, whose first tick is due at
+/// once. A `Loaded` start puts the saved tick and counter into the builder and every saved
+/// region into the store; under `Directed` each is also queued for the first step, as
+/// `Loader::bundle(&records, baseline, RegionMode::Simulated, table)` with `table` the
+/// region's `Cooked::table` pinned through `Cooked::pin`, or `None`; under `Anchored`
+/// nothing is queued, and the lifecycle's `Load` requests bring the regions back as
+/// players join (`README.md`, "Saves and loads"). Fails as the builder fails (a
+/// registration or setup error carries its crate's name; `log_retention` below the cap is
+/// `InvalidData`), as the solver pool fails, as `Loader::bundle` fails for a region queued
+/// here, and with `InvalidData` if `start` is `Loaded`, `config.regions` is `Anchored` and
+/// a saved region is not in the atlas.
 pub fn build_server(
     executor: &Executor,
     game: &Game,
     config: WorldConfig,
     start: Start,
+    cooked: Arc<dyn Cooked>,
 ) -> Result<Server> {
-    todo!("build the type table, the pool, the backend and the simulation")
+    todo!("build the type table, the pool, the backend, the simulation and the store")
 }
 
 impl Server {
@@ -92,54 +109,97 @@ impl Server {
         &self.schemas
     }
 
-    /// The time scale the server decided, as the pacer runs by it: `REAL_TIME` at build.
+    /// The scale the pacer paces by, kept as `README.md` ("Time scale") states:
+    /// `REAL_TIME` at build; a nonzero scale from the call that set it; zero from the step
+    /// that carried it. After any step that carried a scale, by either path and from either
+    /// origin, it is that scale, so between steps it equals the world's `TimeScale` mirror
+    /// except after a nonzero [`set_time_scale`](Self::set_time_scale) whose step has not
+    /// run, when it leads the mirror.
     #[must_use]
     pub fn time_scale(&self) -> TimeScale {
         self.time_scale
     }
 
-    /// Decides the time scale from the next tick on (architecture section 11): the next
-    /// step's `TickInput::time_scale` carries it, whichever path runs that step, and the
-    /// pacer paces by `thousandths / 1000` from the next poll. Zero pauses: no tick falls
-    /// due, the passes still run once per frame. What the frame callback put in
-    /// `time_scale` is replaced, since the scale is the assembly's decision on the server.
+    /// Decides the time scale (architecture section 11): `scale` is carried by the next
+    /// step, by either path, as `TickInput::time_scale` in place of what the frame callback
+    /// put there; a `scale` equal to [`time_scale`](Self::time_scale) with none pending is
+    /// dropped. The pacer takes it by direction. Nonzero: the pacer paces by
+    /// `thousandths / 1000` from the call and [`time_scale`](Self::time_scale) is `scale`
+    /// at once, so a paused server has ticks due at its next [`frame`](Self::frame) and the
+    /// first of them carries the unpause. Zero: the pacer and
+    /// [`time_scale`](Self::time_scale) change only after the step that carried it, and a
+    /// frame whose poll owes no tick runs that one tick for it, so the pause reaches the
+    /// world before the ticks stop. The passes still run once per frame while paused.
     pub fn set_time_scale(&mut self, scale: TimeScale) {
-        todo!("record the scale for the next step and the pacer")
+        todo!("record the scale for the next step; a nonzero one reaches the pacer now")
     }
 
-    /// The baseline of the last bundle this world stepped for `region` and did not refuse:
-    /// what a save of the region is diffed against, and a relevance message built over.
-    /// `None` for a region no accepted bundle has named.
+    /// `TickPacer::resync(now)`: forgets the ticks owed and makes the next fall due one
+    /// period after `now`. What `Headless::run` does at its start, and what a loop does
+    /// before its first [`frame`](Self::frame) after steps, a save or any other gap in
+    /// which it did not poll, so the gap is not caught up at the cap.
+    pub fn resync(&mut self, now: Instant) {
+        self.pacer.resync(now);
+    }
+
+    /// The baseline of the bundle that loaded `region`, while it is loaded: what a save or a
+    /// relevance message diffs its export against. `None` for a region that is not loaded,
+    /// or was created through `Simulation::world_mut` with no bundle. The baseline moves
+    /// into the region's [`SavedRegion`] when the region unloads, and a reload records the
+    /// reloading bundle's.
     #[must_use]
     pub fn baseline(&self, region: RegionId) -> Option<&Arc<Baseline>> {
         self.baselines.get(&region)
     }
 
-    /// One tick, by value, with `frame` and nothing else: for SOUR tests and tools, from
-    /// the thread that owns the server through `Executor::block_on`, or from the timer
-    /// root. Runs no pass. Applies a pending time scale and, on the first step of a `Loaded`
-    /// start, prepends the save's bundles to `frame.loaded`; records the baseline of every
-    /// bundle the sync point accepted; logs the lifecycle's load, session and asset failures
-    /// and leaves its requests and exports for a frame to take. Resolves with the server at
-    /// the next tick, or with [`ServerError`]: the server kept when `Simulation::step`
-    /// handed it back, gone otherwise.
-    pub fn step(self, executor: &Executor, frame: TickInput) -> ServerStep<'_> {
-        todo!("step the simulation once")
+    /// The store: the saved state of every region that is not loaded, by region. A region
+    /// enters it from a `Start::Loaded` save, or from the export of its unload, diffed; it
+    /// leaves it in the step that loads the region again. Never a loaded region. What
+    /// [`save_point`](Self::save_point) includes beside the loaded regions' exports, so no
+    /// saved or unloaded region is lost between saves (`README.md`, "Saves and loads").
+    #[must_use]
+    pub fn kept(&self) -> &BTreeMap<RegionId, Arc<SavedRegion>> {
+        &self.kept
     }
 
-    /// One frame of the timer root, by value: `pacer.poll(now)`, then one
-    /// [`step`](Self::step) per due tick with `frames(tick)` as its input (the tick the
-    /// step runs, `Tick(self.tick().0 + 1)` at each call), then `Simulation::run_passes`
-    /// once whether or not a tick ran, then the between-run takes into a [`FrameOutput`]:
-    /// the gather's frame, the lifecycle's requests and exports. `None` from `frames` ends
-    /// the frame's stepping before that tick: it does not run, the ticks still due this
-    /// frame are forgotten (the pacer counted them), and the passes run as usual; what a
-    /// bounded run returns at its last tick. The pacer's `behind` is reported, not acted
-    /// on: the overload ladder is not in this crate yet. The caller sleeps until
-    /// `next_deadline` (`Executor::sleep_until`) and calls again. Resolves with the server
-    /// and the output, or with [`ServerError`] as [`step`](Self::step) does; a failure of
-    /// the passes after the ticks ran hands the server back with the ticks kept, as
-    /// `RunError` does.
+    /// One tick, by value, with `frame` and nothing paced: for SOUR tests and tools through
+    /// `Executor::block_on` from the thread that owns the server, and what
+    /// [`frame`](Self::frame) runs per due tick. Before `Simulation::step`, in this order: a
+    /// pending time scale replaces `frame.time_scale`; every bundle queued for this step
+    /// goes into `frame.loaded`; and a `frame.loaded` entry for a region the store holds is
+    /// replaced by the stored state, the entry lending its `mode` and its `assets`, the
+    /// rest of it dropped and logged at `info` (`README.md`, "Saves and loads": a frame's
+    /// entry never discards what was saved).
+    /// After it: every export the lifecycle made is diffed against the region's
+    /// [`baseline`](Self::baseline) into the store (`RegionRecords::from_export`; a failure
+    /// there is this run's error, with the server kept, since it means the registry and the
+    /// schema table disagree); the baseline of every bundle in `frame.loaded` the sync
+    /// point accepted is recorded and its region leaves the store; every `Load` request for
+    /// a kept region is answered by queuing its bundle for the next step; and the requests
+    /// and the load, session and asset failures are taken into the [`StepOutput`], the
+    /// failures also logged at `warn`. Resolves with the server at the next tick and the
+    /// output, or with [`ServerError`]: the server kept when `Simulation::step` handed it
+    /// back, gone otherwise.
+    pub fn step(self, executor: &Executor, frame: TickInput) -> ServerStep<'_> {
+        todo!("edit the frame, step the simulation once, keep the exports, take the outputs")
+    }
+
+    /// One frame of the timer root, by value: `pacer.poll(now)`, the budget's ticks taken
+    /// as one when it owes none and a zero scale is pending; then one [`step`](Self::step)
+    /// per tick with `frames(next)` as its input (`next` the tick about to run,
+    /// `Tick(tick().0 + 1)`), its requests and failures appended to the output's; then
+    /// `Simulation::run_passes` once, whether or not a tick ran; then `GatherState::take`
+    /// into the output. `None` from `frames` ends the frame's stepping before that tick: it
+    /// does not run, the ticks still due this frame are forgotten (the pacer counted them)
+    /// and the passes run as usual; it is for ending a bounded run at its last tick and
+    /// nothing else, since what it forgets is simulation time lost. `frames` runs on the
+    /// task that drives the frame, a frame-critical worker, between steps, so what it
+    /// drains (a jitter buffer, a session queue) is read in tick order and never
+    /// concurrently with a step; it must not block. `behind` is reported, not acted on: the
+    /// overload ladder is not in this crate yet. The caller sleeps until `next_deadline`
+    /// (`Executor::sleep_until`) and calls again. Resolves with the server and the output,
+    /// or with [`ServerError`] as [`step`](Self::step) does; a failure of the passes after
+    /// the ticks ran hands the server back with the ticks kept, as `RunError` does.
     pub fn frame<'a>(
         self,
         executor: &'a Executor,
@@ -149,46 +209,95 @@ impl Server {
         todo!("poll the pacer, step the due ticks, run the passes, take the outputs")
     }
 
-    /// The save copy of every loaded region at a sync point, by value:
-    /// `Simulation::save_point`. Resolves with the server and the [`SavePoint`] the
-    /// encoding takes ([`encode_save`](Self::encode_save)), or with [`ServerError`] with the
-    /// server kept, since a failed export changes nothing.
+    /// The save copy of every region at a sync point, by value: `Simulation::save_point`,
+    /// then one `WorkerClass::Background` task per exported region running
+    /// `RegionRecords::from_export(&export, &baseline, &schemas)` with the region's
+    /// [`baseline`](Self::baseline), joined in ascending region order, and beside them
+    /// every kept region's [`SavedRegion`], shared. Resolves with the server, unchanged, and
+    /// a [`SavedWorld`] at the save's tick, for [`encode_save`](Self::encode_save) or a
+    /// `Start::Loaded`; or with [`ServerError`] with the server kept: a failed export or
+    /// diff changes nothing, and a loaded region with no recorded baseline (one created
+    /// through `Simulation::world_mut`) is `NotFound`.
     pub fn save_point(self, executor: &Executor) -> ServerSave<'_> {
-        todo!("take the save copy")
+        todo!("take the save copy, diff each export, add the kept regions")
     }
 
-    /// The container bytes of `save`, between runs: one background task per region
-    /// (`Executor::spawn`, `WorkerClass::Background`), each
-    /// `RegionRecords::from_export(export, baseline, schemas)?.encode_section()?` with the
-    /// region's [`baseline`](Self::baseline) and this world's [`schemas`](Self::schemas),
-    /// then `Container::assemble(&ContainerHeader::of(&save, &schemas), sections)` once
-    /// every task resolved. Fails with `NotFound` for a region whose baseline this world
-    /// never recorded, and as `lactose-persist` fails; nothing is written by this call, so
-    /// a failure loses nothing. The bytes go to [`write_slot`](crate::write_slot).
-    pub fn encode_save(&self, executor: &Executor, save: SavePoint) -> SaveEncode {
+    /// The container bytes of `saved`, between runs: one `WorkerClass::Background` task per
+    /// region running `RegionRecords::encode_section`, then
+    /// `Container::assemble(&ContainerHeader::new(saved.tick, saved.next_net_id,
+    /// schemas.hash()), sections)` once every task resolved, with this world's
+    /// [`schemas`](Self::schemas) and the sections in ascending region order. Fails as
+    /// `lactose-persist` fails; nothing is written by this call, so a failure loses
+    /// nothing. The bytes go to `Io::replace` (`README.md`, "Saves and loads").
+    pub fn encode_save(&self, executor: &Executor, saved: SavedWorld) -> SaveEncode {
         todo!("spawn one encode per region and assemble")
     }
 
     /// The relevance message for `region`, between runs, for a client whose set it enters
-    /// (architecture section 9.3): `World::export_region`, then
-    /// `RegionRecords::from_export(&export, baseline, schemas)?.to_relevance(assets)` with
-    /// the region's [`baseline`](Self::baseline). `assets` is the region's resolved table,
-    /// or `None` if it has none yet. On the calling thread at milestone 1; milestone 4
-    /// moves the diff to a background task and shares one message between co-located
-    /// clients. Fails with `NotFound` for a region that is not loaded or whose baseline this
-    /// world never recorded, and as the export and the diff fail.
-    pub fn relevance(
-        &self,
-        region: RegionId,
-        assets: Option<VersionTable>,
-    ) -> Result<RegionRelevance> {
+    /// (architecture section 9.3): `World::export_region(region)`, then
+    /// `RegionRecords::from_export(&export, &baseline, &schemas)?.to_relevance(assets)` with
+    /// the region's [`baseline`](Self::baseline) and `assets` the table the world holds for
+    /// it (`World::region_assets(region).map(|pinned| pinned.table().clone())`), or `None`
+    /// if none has entered, so the client builds the region over the assets the server
+    /// simulates it with. On the calling thread at milestone 1, `executor` unused;
+    /// milestone 4 moves the diff to a background task and shares one message between
+    /// co-located clients, with this signature. Fails with `NotFound` for a region that is
+    /// not loaded or whose baseline this world never recorded, and as the export and the
+    /// diff fail.
+    pub fn relevance(&self, executor: &Executor, region: RegionId) -> Result<RegionRelevance> {
         todo!("export the region and diff it")
     }
+
+    /// Drops the world and waits for its solver threads: the simulation goes first, which
+    /// drops `Physics` and its backend, which terminates the pool; then every `solver-<n>`
+    /// thread's exit is waited for, so the threads are gone and not only told to go.
+    /// Dropping a `Server` without this terminates the pool and does not wait. From the
+    /// thread that owns the server, never from a worker or a solver thread.
+    pub fn shutdown(self) {
+        todo!("drop the simulation, then wait on the solver exit")
+    }
+}
+
+/// The lifecycle's refusals of one step, taken after it: a SOUR test, the store's driver
+/// and the milestone 4 binary read them here; the step that reported them has carried on.
+#[derive(Debug, Default)]
+pub struct LifecycleFailures {
+    /// The bundles the sync point refused (`RegionLifecycle::take_load_failures`), a bundle
+    /// the server could not build for a kept region included, as a `LoadFailure` at the
+    /// step's tick with `Loader::bundle`'s error.
+    pub loads: Vec<LoadFailure>,
+    /// The session events the applier refused (`take_session_failures`).
+    pub sessions: Vec<SessionFailure>,
+    /// The asset failures the frame stamped (`take_asset_failures`).
+    pub assets: Vec<AssetFailureEvent>,
+}
+
+impl LifecycleFailures {
+    /// Whether nothing was refused. Real, not `todo!()`: it is a value.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.loads.is_empty() && self.sessions.is_empty() && self.assets.is_empty()
+    }
+}
+
+/// What one step produced beside the next tick: what a step-driven run reads per tick,
+/// and what each step of a frame adds to the [`FrameOutput`].
+#[derive(Debug, Default)]
+pub struct StepOutput {
+    /// The lifecycle's requests this step, in the order issued, every one. A `Load` of a
+    /// region the store holds is answered by the server itself in the next step and is
+    /// still reported, so the caller can resolve the region's table and release it later;
+    /// a `Load` of any other region is the caller's to answer through a later frame's
+    /// `loaded`; a `Release` says the region's export is in the store now. Empty under
+    /// `Directed`.
+    pub requests: Vec<RegionRequest>,
+    /// The lifecycle's refusals this step.
+    pub failures: LifecycleFailures,
 }
 
 /// What one frame of the timer root produced, for what runs between frames.
 pub struct FrameOutput {
-    /// New ticks run this frame, after the cap.
+    /// New ticks run this frame, after the cap; one when a pending pause ran its tick.
     pub ticks: u32,
     /// The cap was hit with ticks still owed: the overload ladder's input.
     pub behind: bool,
@@ -197,18 +306,16 @@ pub struct FrameOutput {
     /// The replication gather's frame since the last take (`GatherState::take`): the
     /// packer's. Empty on a world with no changed rows; dropped by the headless app.
     pub gathered: StagingFrame,
-    /// Regions the lifecycle asked for this frame: the asset store's to answer through a
-    /// later frame's `loaded`. Empty under `Directed`.
+    /// Every step's requests this frame, in step order (`StepOutput::requests`).
     pub requests: Vec<RegionRequest>,
-    /// Regions the lifecycle unloaded this frame, copied out: `lactose-persist`'s to diff
-    /// for a save-on-unload, or to drop.
-    pub exports: Vec<RegionExport>,
+    /// Every step's refusals this frame, in step order (`StepOutput::failures`).
+    pub failures: LifecycleFailures,
 }
 
 /// How a server run fails: the error, and the server when its world survived. `Some`
 /// when the run's `RunError` handed the simulation back (a failure before anything ran,
-/// a `Gather` pass that no longer prepares, a failed export), so the caller keeps its
-/// world; `None` after `Cancelled`, when the executor shut down during the run and the
+/// a `Gather` pass that no longer prepares, a failed export or diff), so the caller keeps
+/// its world; `None` after `Cancelled`, when the executor shut down during the run and the
 /// world dropped with it. Converts into [`Error`], so `?` into a plain `Result` drops the
 /// server as a plain error would; the policy's response is `Stop` either way.
 pub struct ServerError {
@@ -244,14 +351,15 @@ impl From<ServerError> for Error {
 /// A run in flight, owning the server until it resolves.
 type Run<'a, T> = Pin<Box<dyn Future<Output = core::result::Result<T, ServerError>> + Send + 'a>>;
 
-/// One tick in flight: resolves to the server at the next tick. See [`Server::step`].
+/// One tick in flight: resolves to the server at the next tick and what the step produced.
+/// See [`Server::step`].
 #[must_use = "futures do nothing unless awaited"]
 pub struct ServerStep<'a> {
-    run: Run<'a, Server>,
+    run: Run<'a, (Server, StepOutput)>,
 }
 
 impl Future for ServerStep<'_> {
-    type Output = core::result::Result<Server, ServerError>;
+    type Output = core::result::Result<(Server, StepOutput), ServerError>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         self.run.as_mut().poll(cx)
@@ -273,14 +381,15 @@ impl Future for ServerFrame<'_> {
     }
 }
 
-/// A save copy in flight: resolves to the server and the copy. See [`Server::save_point`].
+/// A save copy in flight: resolves to the server and every region's saved state. See
+/// [`Server::save_point`].
 #[must_use = "futures do nothing unless awaited"]
 pub struct ServerSave<'a> {
-    run: Run<'a, (Server, SavePoint)>,
+    run: Run<'a, (Server, SavedWorld)>,
 }
 
 impl Future for ServerSave<'_> {
-    type Output = core::result::Result<(Server, SavePoint), ServerError>;
+    type Output = core::result::Result<(Server, SavedWorld), ServerError>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         self.run.as_mut().poll(cx)

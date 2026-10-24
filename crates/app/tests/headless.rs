@@ -15,13 +15,14 @@
 mod protocol;
 
 use std::num::NonZeroU32;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use lactose_app::{
     CATCH_UP_CAP, Cooked, CrateRegistration, ErrorPolicy, Game, Headless, HeadlessConfig,
-    LOG_RETENTION, Response, RunReport, Source, Start, TICK_PERIOD, Workers, WorldConfig, load,
+    LOG_RETENTION, LOG_TARGET, LifecycleFailures, Response, RunReport, Source, Start, StepOutput,
+    TICK_PERIOD, Workers, WorldConfig, load,
 };
 use lactose_asset_api::{
     Asset, AssetId, AssetKind, AssetSet, AssetVersion, LoadPriority, PinnedTable, PublishedAssets,
@@ -155,7 +156,10 @@ impl Cooked for InMemory {
     }
 }
 
-/// The frames a headless run feeds: the region's bundle in the first, nothing after.
+/// The frames a headless run feeds: the region's bundle in the first, nothing after. On a
+/// `Start::Loaded` run the first frame's entry meets the saved region in the server's
+/// store: the saved state loads, and this entry lends it the mode and the pinned table
+/// (`README.md`, "Saves and loads").
 fn frames(cooked: Arc<InMemory>) -> Box<dyn FnMut(Tick) -> TickInput + Send> {
     let mut first = true;
     Box::new(move |tick| {
@@ -171,38 +175,44 @@ fn frames(cooked: Arc<InMemory>) -> Box<dyn FnMut(Tick) -> TickInput + Send> {
 
 /// The binary's `main`: the executor's defaults, the headless world, `ticks` ticks at
 /// tick rate from a spawned timer root, the hash on stdout, an orderly shutdown. `main`
-/// returns the first error, which is the policy's `Stop`.
+/// returns the first error, which is the policy's `Stop`; a failed save is logged, as the
+/// policy says, and the run still reports.
 fn headless_main(ticks: u32, save_to: Option<PathBuf>) -> Result<()> {
     let cooked = Arc::new(InMemory::new(RegionId(1))?);
     let config = HeadlessConfig {
         workers: Workers::default(),
         world: WorldConfig::headless(),
         start: Start::Fresh,
+        saves: save_to.as_deref().and_then(Path::parent).map(Path::to_path_buf),
     };
-    let mut app = Headless::start(&GAME, config)?;
+    let mut app = Headless::start(&GAME, config, Arc::clone(&cooked) as Arc<dyn Cooked>)?;
     let report: RunReport = app.run(ticks, frames(cooked))?;
     println!(
         "{} ticks in {} frames ({} behind), hash {:#018x}",
         report.ticks, report.frames, report.behind, report.hash
     );
-    if let Some(slot) = save_to {
-        app.save(slot)?;
+    if let Some(slot) = save_to
+        && let Err(error) = app.save(slot)
+    {
+        tracing::warn!(target: LOG_TARGET, %error, "the save failed; the run is reported");
     }
     let _log = app.shutdown();
     Ok(())
 }
 
 /// The same binary resuming from a slot: the save decoded before any world exists, its
-/// tick and regions into the first frame through `Start::Loaded`.
+/// tick and regions into the server's store through `Start::Loaded`, from which the first
+/// step loads every one under `Directed`.
 fn resume_main(slot: &[u8], ticks: u32) -> Result<RunReport> {
     let cooked = Arc::new(InMemory::new(RegionId(1))?);
-    let loaded = load(&GAME, slot, &*cooked)?;
+    let saved = load(&GAME, slot, &*cooked)?;
     let config = HeadlessConfig {
         workers: Workers::default(),
         world: WorldConfig::headless(),
-        start: Start::Loaded(loaded),
+        start: Start::Loaded(saved),
+        saves: None,
     };
-    let mut app = Headless::start(&GAME, config)?;
+    let mut app = Headless::start(&GAME, config, cooked)?;
     let report = app.run(ticks, Box::new(|_| TickInput::default()))?;
     app.shutdown();
     Ok(report)
@@ -212,8 +222,9 @@ fn resume_main(slot: &[u8], ticks: u32) -> Result<RunReport> {
 
 /// Runs `ticks` ticks under the runner's session, one `step` each, recording the hash
 /// after every tick and the chaos log at the end: `lactose_sim::harness::run_recorded`'s
-/// shape, over the assembly instead of a bare simulation. Outside the runner the session
-/// is production and nothing is recorded.
+/// shape, over the assembly instead of a bare simulation. A refused bundle or session
+/// event is the step's output and fails the test. Outside the runner the session is
+/// production and nothing is recorded.
 fn sour_run(test: &str, ticks: u32) -> Result<()> {
     let session = Session::from_env().map_err(protocol_error)?;
     let config = *session.config();
@@ -238,8 +249,9 @@ fn sour_run(test: &str, ticks: u32) -> Result<()> {
         ..Workers::default()
     };
     let world = WorldConfig { layout, regions: RegionControl::Directed, ..WorldConfig::headless() };
-    let config_applied = HeadlessConfig { workers, world, start: Start::Fresh };
-    let mut app = Headless::start(&GAME, config_applied)?;
+    let config_applied = HeadlessConfig { workers, world, start: Start::Fresh, saves: None };
+    let cooked = Arc::new(InMemory::new(RegionId(1))?);
+    let mut app = Headless::start(&GAME, config_applied, Arc::clone(&cooked) as Arc<dyn Cooked>)?;
     let applied = RunConfig {
         workers: config.workers.map(|_| {
             NonZeroU32::new(app.executor().frame_worker_count()).expect("at least one worker")
@@ -248,10 +260,16 @@ fn sour_run(test: &str, ticks: u32) -> Result<()> {
         chaos_seed: config.chaos_seed,
     };
     let mut recorder = session.recorder(test, &applied).map_err(protocol_error)?;
-    let mut frames = frames(Arc::new(InMemory::new(RegionId(1))?));
+    let mut frames = frames(cooked);
     for _ in 0..ticks {
         let next = Tick(app.tick().0 + 1);
-        app.step(frames(next))?;
+        let out: StepOutput = app.step(frames(next))?;
+        if !out.failures.is_empty() {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                format!("refused at {next:?}: {out:?}"),
+            ));
+        }
         recorder.record(app.tick().0, app.hash()?).map_err(protocol_error)?;
     }
     if let Some(log) = app.shutdown() {
@@ -287,12 +305,26 @@ fn the_milestone_1_policy_is_the_table() {
     }
     assert_eq!(policy.respond(Source::Prediction { kept: true }, &error), Response::Resync);
     assert_eq!(policy.respond(Source::Prediction { kept: false }, &error), Response::Stop);
-    for source in [Source::Save, Source::Cooked] {
-        assert_eq!(policy.respond(source, &error), Response::Log, "{source:?}");
-    }
+    assert_eq!(policy.respond(Source::Save, &error), Response::Log);
+    // Architecture section 14: a client-only asset failure requests a resync.
+    assert_eq!(policy.respond(Source::Cooked, &error), Response::Resync);
     // The milestone 1 table reads no error kind: a disk-full save is logged like any other.
     let full = Error::new(ErrorKind::StorageFull, "the disk");
     assert_eq!(policy.respond(Source::Save, &full), Response::Log);
+}
+
+#[test]
+fn the_log_target_is_no_module_path_prefix() {
+    // `EnvFilter` matches a directive's target by prefix: the target must not be one that
+    // a `lactose_*` module path starts with.
+    assert_eq!(LOG_TARGET, "app");
+    assert!(!"lactose_app".starts_with(LOG_TARGET));
+}
+
+#[test]
+fn no_refusal_is_empty() {
+    assert!(LifecycleFailures::default().is_empty());
+    assert!(StepOutput::default().failures.is_empty());
 }
 
 #[test]

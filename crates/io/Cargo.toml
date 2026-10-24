@@ -1,0 +1,27 @@
+[package]
+name = "lactose-io"
+description = "Async file IO: positional reads with decompression, the atomic replace and directory listing, as futures completed by a blocking pool of the executor's platform threads."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[dependencies]
+# `Error`, `Result` and `ErrorKind` for every failure, `ThreadClass::Io` for the pool's
+# threads and `AllocTag::Io` for its buffers.
+lactose-core.workspace = true
+# `Platform`, `ThreadSpec` and `CoreTopology`: the pool's threads are created through the
+# executor's platform, never with `std::thread` (architecture section 5.1), and sized from
+# its topology (section 9.7). Nothing else of the executor is used: a request's future is
+# polled by whoever spawned it.
+lactose-task.workspace = true
+# One span per request, target `io` (architecture section 3, "Traced from day one").
+tracing.workspace = true
+
+[dev-dependencies]
+# The consumer sketch hands a decoded range to `ErasedLoader::load`, as SILO will.
+lactose-asset-api.workspace = true
+
+[lints]
+workspace = true

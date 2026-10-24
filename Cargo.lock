@@ -389,6 +389,7 @@ dependencies = [
  "lactose-core",
  "lactose-ecs",
  "lactose-input",
+ "lactose-io",
  "lactose-net-api",
  "lactose-net-host",
  "lactose-persist",
@@ -474,6 +475,16 @@ dependencies = [
  "lactose-input",
  "lactose-sim",
  "loom",
+]
+
+[[package]]
+name = "lactose-io"
+version = "0.0.0"
+dependencies = [
+ "lactose-asset-api",
+ "lactose-core",
+ "lactose-task",
+ "tracing",
 ]
 
 [[package]]

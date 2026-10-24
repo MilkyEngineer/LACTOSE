@@ -22,6 +22,9 @@ lactose-core.workspace = true
 lactose-ecs.workspace = true
 # The input applier every world takes, the sample a client sends and its history.
 lactose-input.workspace = true
+# The file IO pool: started by the headless app, which creates the save directory with
+# `Io::create_dir_all` and writes the slot with `Io::replace` (architecture section 15.3).
+lactose-io.workspace = true
 # The staged inbox a client world holds, the gather state the server's frame takes, the
 # relevance message a region becomes.
 lactose-net-api.workspace = true
@@ -42,7 +45,7 @@ lactose-sim.workspace = true
 lactose-task.workspace = true
 # The solver pool handed to the physics backend, sized here.
 rayon.workspace = true
-# Events, refusals and the policy's decisions, at target `lactose` (architecture sections 3
+# Events, refusals and the policy's decisions, at target `app` (architecture sections 3
 # and 19).
 tracing.workspace = true
 

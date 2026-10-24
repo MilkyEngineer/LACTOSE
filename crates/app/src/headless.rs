@@ -1,17 +1,20 @@
-//! The headless app (architecture section 2, "app-headless"): the executor and one server
-//! world, stepped from a test or run at tick rate by a tool, with no network, store or
-//! presentation. What the `app-headless` binary's `main` is, and what a SOUR test of the
-//! assembly drives.
+//! The headless app (architecture section 2, "app-headless"): the executor, the IO pool
+//! and one server world, stepped from a test or run at tick rate by a tool, with no
+//! network, store or presentation. What the `app-headless` binary's `main` is, and what a
+//! SOUR test of the assembly drives.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use lactose_core::{Result, Tick};
+use lactose_io::Io;
 use lactose_sim::TickInput;
 use lactose_task::{ExecutionLog, Executor};
 
 use crate::game::Game;
 use crate::runtime::Workers;
-use crate::server::Server;
+use crate::save::Cooked;
+use crate::server::{Server, StepOutput};
 use crate::world::{Start, WorldConfig};
 
 /// What a headless run is built from.
@@ -23,15 +26,21 @@ pub struct HeadlessConfig {
     pub world: WorldConfig,
     /// Fresh, or from a save.
     pub start: Start,
+    /// The save directory, created at start with `Io::create_dir_all`; `None` for a run
+    /// that never saves, when a [`save`](Headless::save) into a directory that does not
+    /// exist fails as `Io::replace` says (`NotFound`).
+    pub saves: Option<PathBuf>,
 }
 
-/// The headless app: the executor, the server world and the policy. Built by
+/// The headless app: the executor, the IO pool, the server world and the policy. Built by
 /// [`start`](Self::start) on the thread that owns it, which drives every run through
 /// `Executor::block_on` and is never a worker.
 pub struct Headless {
     executor: Executor,
+    io: Io,
     server: Option<Server>,
     tick: Tick,
+    replay: bool,
 }
 
 /// What [`Headless::run`] did.
@@ -48,18 +57,27 @@ pub struct RunReport {
 }
 
 impl Headless {
-    /// [`start_executor`](crate::start_executor) with `config.workers`, then
-    /// [`build_server`](crate::build_server) with `config.world` and `config.start`. Fails
-    /// as they fail, with the executor shut down again; the policy's response to a startup
-    /// failure is `Stop`, so the binary's `main` returns it.
-    pub fn start(game: &Game, config: HeadlessConfig) -> Result<Self> {
-        todo!("start the executor and build the server")
+    /// [`start_executor`](crate::start_executor) with `config.workers`; then
+    /// `Io::start(&platform, IoConfig::for_platform(&platform))` with `config.workers`'
+    /// platform, or `StdPlatform` when it is `None`; then `Io::create_dir_all` of
+    /// `config.saves` when `Some`, blocked on; then [`build_server`](crate::build_server)
+    /// with `config.world`, `config.start` and `cooked`. Fails as they fail, with what was
+    /// started shut down again in reverse; the policy's response to a startup failure is
+    /// `Stop`, so the binary's `main` returns it.
+    pub fn start(game: &Game, config: HeadlessConfig, cooked: Arc<dyn Cooked>) -> Result<Self> {
+        todo!("start the executor and the IO pool, create the save directory, build the server")
     }
 
     /// The executor, for what a test spawns or sleeps beside the world.
     #[must_use]
     pub fn executor(&self) -> &Executor {
         &self.executor
+    }
+
+    /// The IO pool, for what a test or a tool reads or lists beside the world.
+    #[must_use]
+    pub fn io(&self) -> &Io {
+        &self.io
     }
 
     /// The server world, between runs; `None` after a run tore it.
@@ -87,44 +105,51 @@ impl Headless {
     /// One tick with `frame`, driven from the calling thread (`Executor::block_on` over
     /// [`Server::step`]), no pass and no pacing: what `lactose_sim::harness::run_recorded`
     /// does for a simulation, for a SOUR test or a tool that records the hash after every
-    /// tick. On a kept failure the server stays and the error is returned; on a torn one
-    /// `server()` is `None` afterwards and every later run fails with `Cancelled`.
-    pub fn step(&mut self, frame: TickInput) -> Result<()> {
+    /// tick. Returns what the step produced, its refusals included, so a test sees a
+    /// refused bundle. On a kept failure the server stays and the error is returned; on a
+    /// torn one `server()` is `None` afterwards and every later run fails with `Cancelled`.
+    pub fn step(&mut self, frame: TickInput) -> Result<StepOutput> {
         todo!("block on one step")
     }
 
-    /// The timer root for `ticks` ticks: a task spawned on a frame-critical worker that
-    /// owns the server until it returns, driven from the calling thread. Each frame is
-    /// [`Server::frame`] at `Instant::now()` with `frames` as its callback, wrapped to
-    /// return `None` once `ticks` ticks have run so the last frame stops exactly there,
-    /// then `Executor::sleep_until(next_deadline)`; what a frame produced is dropped
-    /// (gathered rows) or logged (requests, exports), since the headless app has no packer
-    /// and no store. Returns when `ticks` ticks have run, with the report, or with the first
-    /// error as [`step`](Self::step) does. A zero time scale makes this wait forever: a
-    /// tool pauses nothing it wants to finish.
+    /// The timer root for `ticks` ticks: [`Server::resync`] at `Instant::now()` first, so
+    /// the gap since the last frame (steps, a save, the start) is not caught up at the cap;
+    /// then a task spawned on a frame-critical worker that owns the server until it
+    /// returns, driven from the calling thread. Each frame is [`Server::frame`] at
+    /// `Instant::now()` with `frames` as its callback, wrapped to return `None` once
+    /// `ticks` ticks have run so the last frame stops exactly there, then
+    /// `Executor::sleep_until(next_deadline)`; what a frame produced is dropped (gathered
+    /// rows) or logged (requests, refusals), since the headless app has no packer and no
+    /// store. Returns when `ticks` ticks have run, with the report, or with the first error
+    /// as [`step`](Self::step) does. Refuses with `Unsupported`, before anything runs, an
+    /// executor built with `Workers::replay`: a paced run interleaves steps and passes by
+    /// wall time, which no recorded log can follow, so replay is for step-driven runs. A
+    /// zero time scale makes this wait forever: a tool pauses nothing it wants to finish.
     pub fn run(
         &mut self,
         ticks: u32,
         frames: Box<dyn FnMut(Tick) -> TickInput + Send>,
     ) -> Result<RunReport> {
-        todo!("spawn the timer root and block on it")
+        todo!("resync the pacer, spawn the timer root and block on it")
     }
 
-    /// A save of every loaded region to `slot`, from the calling thread, between runs: the
-    /// save copy ([`Server::save_point`]), its encoding ([`Server::encode_save`]) and the
-    /// slot write ([`write_slot`](crate::write_slot)), each blocked on in turn. The world
-    /// is unchanged either way: a failed copy or encoding writes nothing, a failed write
-    /// leaves the previous save in place. Returns the error for the binary's `main` to
-    /// report; the policy's response to [`Source::Save`](crate::Source::Save) is `Log`,
-    /// which is what a tool does with it.
+    /// A save of every region, loaded or kept, to `slot`, from the calling thread, between
+    /// runs: [`Server::save_point`], [`Server::encode_save`] and `Io::replace(slot, bytes)`,
+    /// each blocked on in turn. A failed save copy is `Source::Server`, `Stop`: the error
+    /// is returned and the server is as it was. A failed encode or replace is
+    /// `Source::Save`, `Log`: the error is returned, the world is unchanged, and the slot
+    /// holds the previous save unless `Io::replace` failed after its rename, as its
+    /// contract states (`crates/io/README.md`, "The atomic replace"); the bytes a
+    /// `ReplaceFailed` hands back are dropped, since a tool retries by saving again.
     pub fn save(&mut self, slot: PathBuf) -> Result<()> {
-        todo!("block on the save copy, the encoding and the slot write")
+        todo!("block on the save copy, the encoding and the replace")
     }
 
-    /// Drops the server world (which drops the physics backend and joins its solver pool),
-    /// reads the execution log if chaos recorded one (D112: read, not taken), then
-    /// `Executor::shutdown`, which joins the workers. What a SOUR test writes the log from.
+    /// [`Server::shutdown`] (the world dropped, its solver threads waited for), then
+    /// `Executor::execution_log` read if chaos recorded one (D112: read, not taken), then
+    /// `Io::shutdown`, then `Executor::shutdown`, which joins the workers. What a SOUR test
+    /// writes the log from.
     pub fn shutdown(self) -> Option<ExecutionLog> {
-        todo!("drop the world, read the log, shut the executor down")
+        todo!("shut the server down, read the log, shut the pool and the executor down")
     }
 }

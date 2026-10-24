@@ -1,11 +1,12 @@
 //! The assembly (architecture sections 2, 4 and 5.1): what turns every crate's
 //! registration into an executor, a solver pool and the worlds, then runs them. This crate
 //! is the timer root, the owner of the error policy, the place the `dyn` resources are
-//! wired, the client's loop around the prediction world, and the save path from the sync
-//! point to the slot. The thin binaries (`app-headless` at milestone 1, `app-client` and
-//! `app-server` at milestone 4) link it and add what one build needs: a platform, a
-//! renderer, a transport. Nothing that renders, presents, pumps a window or plays sound is
-//! named here, which is what keeps the server's denylist satisfiable (D83).
+//! wired, the client's loop around the prediction world, the server's store of saved
+//! regions, and the save path from the sync point to the slot. The thin binaries
+//! (`app-headless` at milestone 1, `app-client` and `app-server` at milestone 4) link it
+//! and add what one build needs: a platform, a renderer, a transport. Nothing that
+//! renders, presents, pumps a window or plays sound is named here, which is what keeps the
+//! server's denylist satisfiable (D83).
 //!
 //! Facade: every public signature is final and every deciding body is `todo!()`. The
 //! README is the contract; `tests/headless.rs` and `tests/spike.rs` are compile-only
@@ -33,18 +34,20 @@ pub use game::{CrateRegistration, Game};
 pub use headless::{Headless, HeadlessConfig, RunReport};
 pub use policy::{ErrorPolicy, LOG_TARGET, Response, Source};
 pub use runtime::{CATCH_UP_CAP, LOG_RETENTION, TICK_PERIOD, Workers, start_executor};
-pub use save::{Cooked, Loaded, SaveEncode, SlotWrite, load, write_slot};
+pub use save::{Cooked, SaveEncode, SavedRegion, SavedWorld, load};
 pub use server::{
-    FrameOutput, Server, ServerError, ServerFrame, ServerSave, ServerStep, build_server,
+    FrameOutput, LifecycleFailures, Server, ServerError, ServerFrame, ServerSave, ServerStep,
+    StepOutput, build_server,
 };
 pub use world::{Start, WorldConfig};
 
 /// What the contract promises at the type level, pinned so the implementation cannot lose
 /// it without a compile error: a registration is a value a game crate can put in a
-/// `static` and every binary can copy; the configurations cross into the task that starts
-/// the worlds; the server and the client are owned by the timer root's task, which runs on
-/// whichever frame-critical worker picks it up; every run future and every save future is
-/// `Send` for the same reason; the cooked-content stand-in is shared with background tasks.
+/// `static` and every binary can copy; the configurations and a saved world cross into the
+/// task that starts the worlds; the server and the client are owned by the timer root's
+/// task, which runs on whichever frame-critical worker picks it up; every run future, every
+/// output and the save future are `Send` for the same reason; the cooked-content stand-in
+/// is shared with background tasks.
 const _: () = {
     const fn send<T: Send>() {}
     const fn send_sync<T: Send + Sync + ?Sized>() {}
@@ -54,7 +57,8 @@ const _: () = {
     send::<Workers>();
     send_sync::<WorldConfig>();
     send_sync::<Start>();
-    send_sync::<Loaded>();
+    send_sync::<SavedRegion>();
+    send_sync::<SavedWorld>();
     send::<Server>();
     send::<Client>();
     send::<Headless>();
@@ -63,7 +67,8 @@ const _: () = {
     send::<ServerSave<'_>>();
     send::<ClientFrame<'_>>();
     send::<SaveEncode>();
-    send::<SlotWrite>();
+    send::<StepOutput>();
+    send::<LifecycleFailures>();
     send::<FrameOutput>();
     send::<ClientOutput>();
     send_sync::<dyn Cooked>();
