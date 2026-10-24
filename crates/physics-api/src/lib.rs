@@ -27,7 +27,13 @@
 //!   [`register_types`].
 //! - `lactose-predict` takes [`snapshot`] beside `World::snapshot`, gives it back to
 //!   [`restore`] after `World::restore`, and names what it corrected with [`corrected`].
-//! - [`conformance`] is the run a backend passes before this surface is frozen.
+//! - Every value a backend is handed has a `validate` ([`Transform::validate`],
+//!   [`Collider::validate`], [`Joint::validate`], [`BodyDesc::validate`], ..) that says
+//!   whether every backend accepts it and names the field and [`Rule`] otherwise, as an
+//!   [`Invalid`]; a backend applies them and a crate that authors bodies calls them at
+//!   load (`README.md`, "Validity").
+//! - [`conformance`] is the run a backend passes before this surface is frozen, and
+//!   [`conformance::validity`] holds it to the rules above on the rows that run lists.
 //!
 //! ```no_run
 //! use lactose_ecs::WorldKind;
@@ -60,6 +66,7 @@ mod query;
 mod service;
 mod sync;
 mod systems;
+mod validity;
 
 pub use backend::{BodyDesc, BodyState, PhysicsBackend, StepInput, StepOutput};
 pub use command::{PhysicsCommand, PhysicsCommands, PhysicsExt};
@@ -73,11 +80,13 @@ pub use service::{
     Physics, PhysicsConfig, PhysicsSnapshot, corrected, register_types, restore, setup, snapshot,
 };
 pub use systems::{register_systems, sets};
+pub use validity::{Invalid, Rule, UNIT_TOLERANCE};
 
 /// What the contract promises at the type level, pinned so the implementation cannot lose
 /// it without a compile error: kernels on every worker read `Physics` at once; a snapshot,
 /// a command and the step's lists cross threads; the events and the channel are what the
-/// ECS requires of them; and no layout depends on the scalar's width (architecture section
+/// ECS requires of them; a refusal is a plain error value a backend may return and a
+/// loader may wrap; and no layout depends on the scalar's width (architecture section
 /// 16): each component is its scalars, then a tail that is a multiple of eight bytes, so
 /// the sizes below hold for a four-byte scalar as for an eight-byte one.
 const _: () = {
@@ -89,6 +98,7 @@ const _: () = {
     const fn event<E: Event>() {}
     const fn channel<C: CommandChannel>() {}
     const fn component<T: Component>() {}
+    const fn error<E: std::error::Error + Copy + Send + Sync + 'static>() {}
 
     send_sync::<Physics>();
     send_sync::<PhysicsSnapshot>();
@@ -96,6 +106,7 @@ const _: () = {
     send_sync::<StepOutput>();
     send_sync::<Box<dyn PhysicsBackend>>();
     send_sync::<conformance::ConformanceReport>();
+    error::<Invalid>();
 
     event::<ContactEvent>();
     event::<TriggerEvent>();

@@ -12,9 +12,7 @@ use rapier3d_f64::parry::query::ShapeCastOptions;
 use rapier3d_f64::pipeline::{QueryFilter as SolverFilter, QueryFilterFlags};
 
 use crate::backend::{Rapier, groups};
-use crate::convert::{
-    key_code, key_from_code, pose, shared_shape, valid_shape, valid_transform, vec3, vector,
-};
+use crate::convert::{key_code, key_from_code, pose, shared_shape, vec3, vector};
 
 /// The keyed filter as the solver's: sensors out unless asked for, the groups tested as two
 /// colliders are, and the excluded key's collider out by its `user_data`.
@@ -81,8 +79,8 @@ pub(crate) fn cast_shape(
     max_distance: Scalar,
     filter: &QueryFilter,
 ) -> Option<ShapeHit> {
-    let usable = valid_shape(shape)
-        && valid_transform(at)
+    let usable = shape.validate().is_ok()
+        && at.validate().is_ok()
         && direction.is_finite()
         && direction.try_normalize().is_some()
         && max_distance.is_finite()
@@ -139,7 +137,7 @@ pub(crate) fn overlap(
     filter: &QueryFilter,
     hits: &mut Vec<StableKey>,
 ) {
-    if !valid_shape(shape) || !valid_transform(at) {
+    if shape.validate().is_err() || at.validate().is_err() {
         return;
     }
     let probe = shared_shape(shape);

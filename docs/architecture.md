@@ -1108,6 +1108,12 @@ which sets ring depth, so the test measures that loop, not only server throughpu
 `physics-rapier` is inside the boundary. Replacement is a backend swap behind `physics-api`
 including `snapshot` and `restore`.
 
+A backend validates every `Transform`, `Velocity`, `RigidBody`, `Shape`, `Collider`, `Joint`,
+`BodyDesc` and `PhysicsCommand` it is given by the rules `physics-api` states and exports as
+predicates, and adds no rule of its own on them; it also applies the same-body, step-input and
+query-parameter rules `physics-api` states, so every backend and every crate that authors a body
+refuses one set of values with one message (D135).
+
 ## 17. Animation
 
 `anim` is inside the boundary: state machines, phase, events, root motion, and a deterministic

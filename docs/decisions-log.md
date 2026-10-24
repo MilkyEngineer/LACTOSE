@@ -3977,6 +3977,54 @@ relayed by an event when it acts on another body** (§6.1, §10, `lactose-ecs`,
 - Driven by: the io facade's review (D130, finding D2) and the boundary-closure reviews r1 to
   r3 (2026-10-24).
 
+**D135. One set of validity rules for physics values, stated and implemented in `physics-api`** (§8.2, §16, §17, `lactose-physics-api`, `lactose-physics-rapier`, `lactose-anim`)
+- Why: the rules a body, collider, joint, transform, velocity and command must meet were held
+  in three places, each a little different: `physics-rapier`'s `convert.rs`, the test backend,
+  and `anim`'s `Skeleton::validate`, which the anim implementation review (round 2, finding D1)
+  called a copy to be replaced. The test backend checked a body's transform, shape and mass, a
+  joint's values, and `set_transform` alone, so a test written against it accepted rows Rapier
+  refuses. anim refused a NaN in a field the kind does not read; the backends did not.
+  - *The rules are stated once, in `physics-api`'s README, and implemented once as `validate`
+    on each value (`Transform`, `Velocity`, `RigidBody`, `Shape`, `Collider`, `Joint`,
+    `BodyDesc`, `PhysicsCommand`), answering `Ok` or the first field that breaks a rule as
+    `Invalid { field, rule }`.* A backend applies these and adds no rule of its own on those
+    eight types; a crate that authors a body calls them at load. Rules out a backend-specific
+    rule a loader cannot know, and a message that differs by caller.
+  - *Three rules on what those values do not hold are `physics-api`'s too, and every backend
+    applies them alike:* a joint whose two ends are one key is refused at `create_joint` first,
+    before its value is read, with the message `a joint between a body and itself`; a step
+    whose `dt` is not finite and above zero, or whose gravity is not finite, steps nothing; a
+    query with a non-finite origin, a direction that does not normalise, a non-finite or
+    negative `max_distance`, or a probe shape or pose its predicate refuses answers nothing.
+    Rapier's behaviour was the reference. Rules out a test backend that steps or answers where
+    the real one does not.
+  - *Every scalar a value holds is finite, read by its kind or not.* A NaN in a sphere's
+    `half_extents`, a cuboid's `radius` or an unlimited joint's limits is refused everywhere,
+    as anim already did. Rules out a value that is accepted until a kind change makes it read.
+  - *A revolute or prismatic axis is a direction when its squared length is a normal finite
+    number (at least `Scalar::MIN_POSITIVE`).* A subnormal square passes `try_normalize` but
+    normalises short of unit length, and the backend would build its frame about another axis.
+    Rules out an axis accepted by one test and mis-built by the solver.
+  - *The unit tolerance is `1e-6` on the squared length, strict, as one exported constant.* A
+    normalised quaternion is within a few ulps at either width; a crate normalises what it
+    composes before writing it (anim's bone rows). Rules out a per-crate tolerance.
+  - *A joint's references and a command's body are not read by a predicate.* The same-body rule
+    is on resolved keys and stays the backend's; the sync's parking and waiting rules stand.
+    Rules out a predicate that needs a world.
+  - *No rule moves.* The backend still refuses at create (`InvalidData` with the `Invalid`'s
+    message), ignores at `set_*` and drops a refused command while applying the rest; the sync
+    hands rows over unchecked. What changes is that every backend, the test backend included,
+    refuses one set with one message, and a loader can refuse first. `conformance::validity`
+    holds a backend to this on the rows it lists (every check of every predicate, two-fault
+    order rows compared by message, the three rules above, the accepted edges); a deviation on
+    a value no row holds passes it.
+  - *The error is a plain `Copy` value with a `Display` and a `From` into `InvalidData`,* not
+    an enum of fields. Its field is `Type::field`, or `PhysicsCommand::Variant::field` for a
+    command's own field. A loader prefixes context (`bone 1: `) and the text stays the
+    backend's. Rules out two error shapes for one refusal.
+- Driven by: the anim implementation review, round 2, finding D1; the brief `physics-validity`;
+  the physics-validity reviews r1 (S1, S2, M1 to M5) and r2, m1 to m4 (2026-10-25).
+
 ## 10. Review history
 
 - **Revision 1** (`a29af04`): the design baseline.

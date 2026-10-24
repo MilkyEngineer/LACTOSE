@@ -606,11 +606,11 @@ fn every_clip_validation_failure_is_refused() {
     refused_clip(|c| c.root.truncate(3), "root track holds 4 entries or none, not 3");
     refused_clip(
         |c| c.samples[4].rotation = Quat::from_array([s(0.0); 4]),
-        "sample 4: the rotation",
+        "sample 4: `Transform::rotation` is not a unit quaternion",
     );
     refused_clip(
         |c| c.samples[1].translation = v(f64::NAN, 0.0, 0.0),
-        "sample 1: a scalar is not finite",
+        "sample 1: `Transform::translation` is not finite",
     );
     refused_clip(
         |c| c.root[2] = RootSample { translation: Vec3::ZERO, yaw: s(f64::INFINITY) },
@@ -708,22 +708,22 @@ fn every_skeleton_validation_failure_is_refused() {
     refused_skeleton(|k| k.bones[3].role = BoneRole::Hips, "bone 3: another bone has its role");
     refused_skeleton(
         |k| k.bones[1].rest.rotation = Quat::from_array([s(1.0); 4]),
-        "bone 1: the rest pose: the rotation",
+        "bone 1: the rest pose: `Transform::rotation` is not a unit quaternion",
     );
     refused_skeleton(
         |k| k.bones[1].rest.translation = v(0.0, f64::INFINITY, 0.0),
-        "bone 1: the rest pose: a scalar",
+        "bone 1: the rest pose: `Transform::translation` is not finite",
     );
     refused_skeleton(
         |k| k.bones[1].body.as_mut().unwrap().collider.friction = s(f64::NAN),
-        "bone 1: a scalar of the body is not finite",
+        "bone 1: `Collider::friction` is not finite",
     );
     refused_skeleton(
         |k| {
             let joint = k.bones[2].body.as_mut().unwrap().joint.as_mut().unwrap();
             joint.limits = Some((s(0.0), s(f64::NEG_INFINITY)));
         },
-        "bone 2: a scalar of the body",
+        "bone 2: `Joint::limit_max` is not finite",
     );
     refused_skeleton(
         |k| k.bones[1].body = Some(bone_body(true)),
@@ -749,7 +749,7 @@ fn every_skeleton_validation_failure_is_refused() {
     refused_skeleton(|k| k.sockets[1].bone = 4, "socket 1: the bone is past the bones");
     refused_skeleton(
         |k| k.sockets[0].offset.rotation = Quat::from_array([s(0.0), s(0.0), s(0.0), s(2.0)]),
-        "socket 0: the offset: the rotation",
+        "socket 0: the offset: `Transform::rotation` is not a unit quaternion",
     );
 }
 

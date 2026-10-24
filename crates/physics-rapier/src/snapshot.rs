@@ -30,7 +30,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::backend::Rapier;
 use crate::book::{Book, Plain};
-use crate::convert::{key_code, shape_of, shared_shape, valid_shape};
+use crate::convert::{key_code, shape_of, shared_shape};
 
 /// The first bytes of every snapshot: the format and its version.
 const TAG: &[u8; 4] = b"LPR1";
@@ -167,7 +167,7 @@ fn shapes_out(colliders: &ColliderSet) -> Result<SetImage<Plain<Shape>>> {
 /// `set_collider` uses.
 fn shapes_in(image: SetImage<Plain<Shape>>) -> Result<ColliderSet> {
     let image = image
-        .map(|Plain(shape)| valid_shape(&shape).then(|| shared_shape(&shape)))
+        .map(|Plain(shape)| shape.validate().is_ok().then(|| shared_shape(&shape)))
         .ok_or_else(|| invalid("a carried shape is not a valid Shape"))?;
     let bytes =
         postcard::to_allocvec(&image).map_err(|_| invalid("the collider set did not encode"))?;
