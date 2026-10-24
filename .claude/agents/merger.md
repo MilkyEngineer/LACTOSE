@@ -61,10 +61,15 @@ pushed to. You never push and never open a pull request.
    crates the brief names, `cargo clippy -p <crate> ... --all-targets --target
    x86_64-unknown-linux-gnu -- -D warnings` and the same for `x86_64-pc-windows-msvc`, never
    with `--workspace` (this Mac has no Linux C cross-compiler, and `lactose-task`'s `zstd`
-   dev-dependency builds C, so a workspace run fails for a reason no branch causes); when
+   dev-dependency builds C, so a workspace run fails for a reason no branch causes); a crate
+   that depends on `zstd` normally, directly or through another crate (today `lactose-io` and
+   so `lactose-app`), runs its cross-target clippy with `CC_<target>` and `AR_<target>` set
+   to `"$(git rev-parse --show-toplevel)/tools/xtask/cross-lint/cc.sh"` and `.../ar.sh`,
+   stand-ins that create empty objects and archives (clippy never links; the path must be
+   absolute, because the cc crate runs the compiler from the build script's directory); when
    it touches `lactose-ecs` or `lactose-core`, `cargo +nightly miri test -p <crate>` (about
-   twelve minutes for the ECS); when it touches `lactose-task`,
-   `cargo test -p lactose-task --features loom --release`.
+   twelve minutes for the ECS); when it touches `lactose-task`, `cargo test -p lactose-task
+   --features loom --release`.
 6. A gate that fails: stop, leave the merge uncommitted, and report the gate and its output.
    Do not fix code. The coordinator decides whether the lane fixes it or the merge is
    amended.

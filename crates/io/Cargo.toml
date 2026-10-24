@@ -18,6 +18,9 @@ lactose-core.workspace = true
 lactose-task.workspace = true
 # One span per request, target `io` (architecture section 3, "Traced from day one").
 tracing.workspace = true
+# The decode of an encoded read: the frame checks on the pool and the streaming decode in the
+# read's future, through `zstd::zstd_safe`'s safe wrappers (README, "Reads").
+zstd.workspace = true
 
 [dev-dependencies]
 # The consumer sketch hands a decoded range to `ErasedLoader::load`, as SILO will.

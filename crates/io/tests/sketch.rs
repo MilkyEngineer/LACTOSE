@@ -1,10 +1,10 @@
-//! Compile-only consumer sketches against the facade: what `app` writes to start the pool
+//! Compile-only consumer sketches against the surface: what `app` writes to start the pool
 //! and to save a slot, what SILO writes to read a pack range and hand it to a loader, what
 //! the cooker writes to read sources and write outputs, and what the server writes to
-//! publish a region. Type-checked and never run (every deciding body of the crate is
-//! `todo!()`), except the one test, which runs the real `IoConfig::for_platform` against
-//! the standard platform. They pin the surface the README promises: a change that breaks
-//! one is a signature change to list.
+//! publish a region. Type-checked and never run, except the one test, which runs the real
+//! `IoConfig::for_platform` against the standard platform; the behaviour is proved by the
+//! other tests. They pin the surface the README promises: a change that breaks one is a
+//! signature change to list.
 
 #![forbid(unsafe_code)]
 #![allow(dead_code, unused_variables, missing_docs)]

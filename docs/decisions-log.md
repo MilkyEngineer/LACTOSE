@@ -1000,6 +1000,80 @@ rationale the author supplied during the editorial pass rather than one taken fr
     precedent of `physics` for `physics-api`'s contract (D119). Rules out a codename for a
     crate without one.
 - Driven by: milestone 1, the `io` facade brief and its design reviews r1 and r2 (2026-10-24).
+- Addendum (lane io-impl, 2026-10-25; fix rounds 1 to 4): `lactose-io` is implemented behind
+  the facade's surface, by the blocking backend on every platform, with no signature change.
+  - Replaces of one path are ordered by a waitlist in the queue, keyed by `Path` equality (so
+    `d/./a` and `d/a/` are `d/a`; `./d/a` is another key).
+    - A replace of a keyed path waits there. The thread that finishes or skips the one before
+      it moves it to the back of the FIFO queue, so it starts after every request first polled
+      while it waited.
+    - No pool thread waits. A cancelled request is skipped before it starts.
+    - `stop` cancels the queue and every waitlist outside the lock.
+    - `join` holds the thread list's lock across the joins, so every `shutdown` called at once
+      returns only after every thread has exited. `shutdown` is therefore never called from a
+      pool thread, which runs the wakers of the requests it completes: behind a `shutdown`
+      already joining that thread it hangs, and alone it joins the thread it runs on, which
+      panics on Unix (and so aborts a binary) and hangs on Windows.
+  - A replace renames over a final symbolic link: the path becomes a regular file and the
+    target is unchanged.
+  - Error kinds are confined per request.
+    - A system call's error maps through `From<std::io::Error>`, and any kind outside the
+      request's README list becomes `Io` with its source kept. A `NotFound` from
+      `create_dir_all` is therefore `Io`.
+    - A `read_dir` entry removed mid-listing is left out.
+  - Refused before submission:
+    - a length above `MAX_READ_BYTES` is `ResourceExhausted`, checked first;
+    - an overflowing range is `InvalidData`;
+    - an empty encoded range is `InvalidData`.
+    A zero-length `read_at` resolves empty without submitting, even on a stopped pool. A
+    refused request still has its span, with `error` recorded.
+  - The pool checks a stored range before reserving the decoded buffer: zstd's frame magic,
+    `find_frame_compressed_size == len`, and `get_frame_content_size == Some(decoded_len)`.
+  - The future decodes with a `DCtx` set to `WindowLogMax(27)`.
+    - Each `decompress_stream` call is given at most 64 KiB of output and at most 64 KiB of the
+      stored range. The input bound keeps a crafted frame of millions of empty or one-byte
+      blocks from being one long call.
+    - Output goes into progressively zero-filled spare capacity (`OutBuffer::around_pos`; the
+      uninitialised `WriteBuf` would need `unsafe`).
+    - The decode yields after 0.5 ms with a self-wake.
+    - zstd's memory-allocation code is `ResourceExhausted`; every other zstd error is
+      `InvalidData`.
+  - The temporary token is a `RandomState` hash of the process id and the first-use time,
+    truncated to 32 bits. The counter is process-wide. `create_new` tries 16 names, then gives
+    `Io`.
+  - Proof: 54 tests under nextest.
+    - The proofs that hold a pool thread, or watch a replace's steps, use `#[cfg(test)]` hooks
+      of the pool. The sync functions report each sync themselves, so a replace that skips one
+      shows a step fewer.
+    - The integration tests' allocator records the largest block asked of it. That needs one
+      `unsafe impl GlobalAlloc` in `tests/requests.rs`, argued in the crate's `SAFETY.md`; the
+      library keeps `#![forbid(unsafe_code)]`. That test binary runs under Miri only with Tree
+      Borrows, because of `core`'s tag trailer (`crates/core/SAFETY.md`).
+    - Each of these mutations fails at least one test:
+      - removing the waitlist;
+      - removing the skip of a dropped queued request;
+      - removing the output or input step bound;
+      - ignoring the sweep's token check;
+      - removing the temporary or directory sync;
+      - moving the read_file cap after the allocation;
+      - releasing a waitlisted replace to the front;
+      - joining without the lock.
+    - `StorageFull` is tested where `LACTOSE_IO_SMALL_FS` names a small file system; it was run
+      on an 8 MiB APFS disk image.
+  - zstd is a normal dependency of `lactose-io`, and so of `lactose-app`, so both build
+    zstd-sys's C code. Their cross-target clippy on the Mac uses stand-in `CC_<target>` and
+    `AR_<target>` scripts.
+  - Measured on the M1, macOS 14.7.4:
+    - At load averages 6.99 7.94 9.22: the pool's threads run at `QOS_CLASS_UTILITY`, relative
+      priority 0. `sync_all` on a directory returns `Ok` on APFS (the data volume and a disk
+      image) and on HFS+ and exFAT (fskit) disk images, and `Io::replace` into each resolves
+      `Ok`.
+    - At load averages 4.42 6.76 8.86 to 3.56 6.38 8.66, the longest decode poll, over three
+      runs:
+      - 0.75 ms for a frame of 10M empty blocks (82.8 ms before the input bound);
+      - 0.95 ms for the same frame decoding to 1 MiB;
+      - 0.84 ms for one-byte blocks (2.5 ms before);
+      - 0.61 ms for 32 MiB of level-3 text.
 
 **D131. The `app` facade: what sections 2, 5.1, 9.2, 11, 14, 15.3, 16, 18 and 19 left open** (§2, §3, §4, §5.1, §9.2, §9.3, §11, §14, §15.2, §15.3, §16, §18, §19, §22, `lactose-app`, `lactose-io`, `lactose-persist`, `lactose-predict`, `lactose-sim`, `lactose-task`)
 - Why: the facade is written before the headless binary, the milestone 1 netcode spike and the
