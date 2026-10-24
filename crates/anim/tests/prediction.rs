@@ -4,6 +4,8 @@
 //! ring's inputs; a corrected `AnimState` that re-simulates from the server's phase; and
 //! `AnimParams::quantise` over a sweep of speeds, the rarity of a straddled grid midpoint.
 
+#![forbid(unsafe_code)]
+
 mod common;
 
 use std::num::NonZeroU64;

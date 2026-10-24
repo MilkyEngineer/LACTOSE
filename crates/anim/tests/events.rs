@@ -2,6 +2,8 @@
 //! 1", the events row): one `AnimEvent` per pass in the order passed, across a wrap
 //! included, to the character's key, read by a later system; none from the outgoing clip.
 
+#![forbid(unsafe_code)]
+
 mod common;
 
 use common::{

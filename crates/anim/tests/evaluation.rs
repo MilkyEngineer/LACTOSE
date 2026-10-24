@@ -4,6 +4,8 @@
 //! character's row in a server and a prediction world; the same bits under every layout and
 //! worker count.
 
+#![forbid(unsafe_code)]
+
 mod common;
 
 use common::{

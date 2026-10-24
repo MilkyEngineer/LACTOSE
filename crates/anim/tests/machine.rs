@@ -4,6 +4,8 @@
 //! states, a transition into a state whose clip is missing, and the same hashes under three
 //! layouts and one and four workers.
 
+#![forbid(unsafe_code)]
+
 mod common;
 
 use common::{

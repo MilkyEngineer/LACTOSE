@@ -6,6 +6,8 @@
 //! RICOTTA's processors, which write these bytes, come with `tools/cook`; this encoder is
 //! the test's alone.
 
+#![forbid(unsafe_code)]
+
 mod common;
 
 use common::{MACHINE, SKELETON, bone_body, chain, clip, clip_ref, s, state, transition, v, yaw};

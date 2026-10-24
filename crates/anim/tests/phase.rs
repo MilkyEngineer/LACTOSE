@@ -3,6 +3,8 @@
 //! gives, `advanced` and `passed`, and `phase_crossed` once per pass at every rate, on a
 //! set entry phase and not on a kept one, never on a held tick.
 
+#![forbid(unsafe_code)]
+
 mod common;
 
 use common::{

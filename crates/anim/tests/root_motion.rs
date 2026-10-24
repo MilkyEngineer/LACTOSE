@@ -3,6 +3,8 @@
 //! turning clip applied tick by tick ends where it was authored, a one-shot's reaches its
 //! end, a blend interpolates, and `apply` and `velocity` against hand-composed transforms.
 
+#![forbid(unsafe_code)]
+
 mod common;
 
 use common::{

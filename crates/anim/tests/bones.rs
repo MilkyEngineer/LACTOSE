@@ -6,6 +6,8 @@
 //! checks; and no command for a character without bones. The fit itself is in
 //! `tests/evaluation.rs`.
 
+#![forbid(unsafe_code)]
+
 mod common;
 
 use common::fake::Call;
