@@ -321,7 +321,9 @@ of its own in a set after `sets::INPUT` that declares `writes = [Sample]`, so th
 readers have a declared writer. It is never `derived`: a derived value is neither hashed
 nor saved, so a stale sample (a player who left while the game kept the row) would drive
 the simulation from state no save, journal or hash holds. The same applier serves the
-server, the prediction world and a replay.
+server, the prediction world and a replay. What `apply` writes depends on `sample` and
+`input_tick` alone, never on `PlayerSample::substituted`: the mark is the journal's, and
+`lactose-predict` does not re-simulate a substitute equal to the sample it ran.
 
 What `StagedState::apply` may do: on a client, everything received, through `World::spawn`
 with the server's key, `World::bind`, `World::insert`, `World::columns_mut` or

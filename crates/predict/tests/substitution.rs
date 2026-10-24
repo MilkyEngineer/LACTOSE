@@ -12,7 +12,7 @@ use lactose_core::Tick;
 use lactose_input::{Action, Actions, PlayerInput};
 use lactose_net_api::StagedFrame;
 use lactose_predict::{CorrectionCause, Reconciled, ResyncReason};
-use lactose_sim::TICK_RATE_HZ;
+use lactose_sim::{TICK_RATE_HZ, TickInput};
 
 /// What the player sends: walking, with a jump pressed at 14 and held through 16.
 fn sample(tick: u32) -> PlayerInput {
@@ -307,6 +307,26 @@ fn an_equal_repair_past_the_ring_is_too_old() {
     assert!(reconciled.corrections.is_empty());
     assert_eq!(resimulated, 0);
     assert_eq!(rig.hash(), hash);
+}
+
+/// What the equal-replacement skip relies on, `lactose_sim::InputApplier`'s rule: the
+/// applier writes the same world whether or not a sample carries the substitution mark,
+/// which an equal replacement writes into the ring without re-simulating.
+#[test]
+fn the_applier_writes_the_same_world_with_or_without_the_mark() {
+    let run = |marked: bool| {
+        let mut rig = Rig::joined();
+        rig.step_to(13, sample);
+        for tick in 14..=17 {
+            let mut entry = sample(tick).to_player_sample(Tick(tick));
+            entry.substituted = marked;
+            let mut input = TickInput::default();
+            input.inputs.insert(PLAYER, entry);
+            rig.try_step_with(input).expect("the step runs");
+        }
+        rig.hash()
+    };
+    assert_eq!(run(true), run(false));
 }
 
 // ---- A repeated report ----
@@ -712,12 +732,15 @@ fn a_repeat_is_skipped_for_ten_seconds_after_its_tick() {
 }
 
 /// A depth above the window: a repeat whose slot the ring still holds, popped later than
-/// the window after its tick, is skipped, not rolled back again.
+/// the window after its tick, is skipped, not rolled back again. It is popped when the
+/// ring's oldest slot is the substituted tick itself, so a repeat forgotten while the ring
+/// holds its slot would read as a first report whose previous slot is gone: `TooOld`.
 #[test]
 fn a_repeat_is_skipped_while_the_ring_holds_its_slot_past_the_window() {
     let window = 10 * TICK_RATE_HZ;
+    let depth = window + 100;
     let mut rig = Rig::joined();
-    rig.p_mut().set_depth(window + 100).unwrap();
+    rig.p_mut().set_depth(depth).unwrap();
     rig.step_to(20, jump_at_18);
     rig.push(substituted(18, &[18]));
     rig.step(sample(21));
@@ -725,11 +748,12 @@ fn a_repeat_is_skipped_while_the_ring_holds_its_slot_past_the_window() {
     rig.push(StagedFrame::new(Tick(19)));
     rig.step(sample(22));
     rig.reconcile();
-    let lag = window + 50;
-    rig.step_to(18 + lag - 1, sample);
-    rig.push(substituted(16 + lag, &[18]));
-    rig.step(sample(18 + lag));
-    assert_eq!(rig.p().ring().oldest(), Some(Tick(11)));
+    let present = 18 + depth - 1;
+    assert!(present - 18 > window);
+    rig.step_to(present - 1, sample);
+    rig.push(substituted(present - 2, &[18]));
+    rig.step(sample(present));
+    assert_eq!(rig.p().ring().oldest(), Some(Tick(18)));
     let repeated = rig.reconcile();
     assert_eq!(repeated.resync, None);
     assert!(repeated.corrections.is_empty(), "a repeat is no rollback");

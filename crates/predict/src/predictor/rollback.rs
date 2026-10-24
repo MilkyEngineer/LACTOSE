@@ -417,10 +417,10 @@ impl State {
     /// Replaces the ring's sample of the local player for input tick `tick`: with the
     /// previous tick's (as replaced) through `PlayerInput::substitute`, or with its own
     /// through `PlayerInput::after_substitute` against the previous tick's. Whether that
-    /// changed its bytes, which alone makes `tick - 1` a correction point: a replacement
-    /// equal to the sample is what slot `tick` already ran, so a rollback on its account
-    /// would re-simulate to the world the predictor holds. A sample that does not decode
-    /// is logged and left.
+    /// changed its bytes, which alone makes `tick - 1` a correction point: slot `tick`
+    /// already ran a replacement equal to the sample, so the replacement is no reason to
+    /// roll back; a fact the tolerance absorbed stays absorbed, as without it. A sample
+    /// that does not decode is logged and left.
     fn replace_sample(&mut self, tick: Tick, cause: CorrectionCause) -> bool {
         let player = self.local.player;
         let decode = |bytes: &[u8]| {
@@ -457,7 +457,8 @@ impl State {
             },
             _ => applied.substitute(),
         };
-        // The mark is the journal's and no step reads it, so setting it changes no tick.
+        // The mark is the journal's: by `lactose_sim::InputApplier`'s rule what an applier
+        // writes depends on the sample and its input tick alone, so it changes no tick.
         sample.substituted = cause == CorrectionCause::Substituted;
         let replacement = replacement.to_sample_bytes();
         if sample.sample == replacement {
