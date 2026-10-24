@@ -13,8 +13,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use lactose_app::{
-    Client, ClientError, Cooked, Game, Server, ServerError, Start, Workers, WorldConfig,
-    build_client, build_server, start_executor,
+    Client, ClientError, ClientOutput, Cooked, Game, Server, ServerError, Start, Workers,
+    WorldConfig, build_client, build_server, start_executor,
 };
 use lactose_asset_api::{PinnedTable, VersionTable};
 use lactose_bundle::Baseline;
@@ -200,7 +200,8 @@ fn scripted(tick: Tick) -> PlayerInput {
 /// with the scripted sample, the last eight samples go back as the input packet, a resync
 /// becomes a request, and the loop sleeps to the next deadline. A kept failure is the
 /// policy's `Resync`: the client is kept and the next frame resyncs on entry and reports
-/// it; a torn one is `Stop`.
+/// it; a torn one is `Stop`. Hands back what the frame produced, `None` for a kept
+/// failure.
 async fn client_frame(
     executor: &Executor,
     client: Client,
@@ -208,7 +209,7 @@ async fn client_frame(
     now: Instant,
     transport: &mut dyn Transport,
     to: ConnectionId,
-) -> Result<Client> {
+) -> Result<(Client, Option<ClientOutput>)> {
     let mut client = client;
     if let Some(frame) = delivered
         && !client.push(frame)
@@ -218,7 +219,7 @@ async fn client_frame(
     let mut sample = scripted;
     let (client, out) = match client.frame(executor, now, &mut sample).await {
         Ok(done) => done,
-        Err(ClientError { error, client: Some(kept) }) => return Ok(kept),
+        Err(ClientError { error, client: Some(kept) }) => return Ok((kept, None)),
         Err(ClientError { error, client: None }) => return Err(error),
     };
     // What the milestone measures: the rollback cost per re-simulated tick and the
@@ -232,29 +233,30 @@ async fn client_frame(
         transport.send(to, &encode_resync(&request))?;
     }
     executor.sleep_until(out.next_deadline).await?;
-    Ok(client)
+    Ok((client, Some(out)))
 }
 
 /// The spike's clock estimate from its own round trip, handed to the timer root between
 /// frames; `net` computes the real one at milestone 4.
-fn clock_from_round_trip(client: &mut Client, now: Instant, server_tick: Tick, rtt: Duration) {
+fn clock_from_round_trip(client: &mut Client, server_tick: Tick, rtt: Duration) {
     let half = rtt.as_secs_f32() / 2.0;
-    client.clock(
-        now,
-        ClockEstimate {
-            server_tick,
-            lead_ticks: half * 60.0 + 1.0,
-            rate_thousandths: 1000,
-            snap: false,
-        },
-    );
+    client.clock(ClockEstimate {
+        server_tick,
+        lead_ticks: half * 60.0 + 1.0,
+        rate_thousandths: 1000,
+        snap: false,
+    });
 }
 
 /// One tick of the spike end to end, both ends in one process: the server's frame, its
 /// packed frame delivered, the client's frame, its inputs delivered back. The client
 /// stands `LEAD` ticks ahead, so its hash is kept by tick and compared with the server's
 /// when the server reaches that tick: equal when the prediction world holds every region
-/// of the server with every component replicated, as the spike's game arranges.
+/// of the server with every component replicated, as the spike's game arranges. A tick
+/// the server ran past within one frame is dropped uncompared. A correction re-simulates
+/// from its tick to the present, so the hashes recorded from its tick on are the first
+/// prediction's and are dropped (the correction is counted instead), and the present's,
+/// recorded after the frame, is the corrected one; a resync drops every hash.
 async fn one_tick(
     executor: &Executor,
     server: Server,
@@ -268,8 +270,19 @@ async fn one_tick(
     if let Some(hash) = predicted.remove(&server.tick()) {
         let divergence = hash != server.hash()?;
     }
-    let client =
+    predicted.retain(|tick, _| *tick > server.tick());
+    let (client, out) =
         client_frame(executor, client, Some(packed), Instant::now(), transport, to).await?;
+    match out {
+        // A kept failure resyncs at the next frame, and a resync rebuilt the world.
+        None => predicted.clear(),
+        Some(out) if out.resync.is_some() => predicted.clear(),
+        Some(out) => {
+            if let Some(oldest) = out.reconciled.corrections.first() {
+                predicted.retain(|tick, _| *tick < oldest.tick);
+            }
+        }
+    }
     predicted.insert(client.tick(), client.hash()?);
     Ok((server, client))
 }

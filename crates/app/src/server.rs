@@ -42,6 +42,9 @@ pub struct Server {
     cooked: Arc<dyn Cooked>,
     time_scale: TimeScale,
     pending_scale: Option<TimeScale>,
+    /// The scale the last step carried, `REAL_TIME` at build: the world's `TimeScale`
+    /// mirror, kept here so the pacer is never read back from the world.
+    carried: TimeScale,
     baselines: BTreeMap<RegionId, Arc<Baseline>>,
     kept: BTreeMap<RegionId, Arc<SavedRegion>>,
     queued: BTreeMap<RegionId, RegionBundle>,
@@ -111,10 +114,13 @@ impl Server {
 
     /// The scale the pacer paces by, kept as `README.md` ("Time scale") states:
     /// `REAL_TIME` at build; a nonzero scale from the call that set it; zero from the step
-    /// that carried it. After any step that carried a scale, by either path and from either
-    /// origin, it is that scale, so between steps it equals the world's `TimeScale` mirror
-    /// except after a nonzero [`set_time_scale`](Self::set_time_scale) whose step has not
-    /// run, when it leads the mirror.
+    /// that carried it, or from the call that cancelled a pending nonzero scale while the
+    /// world's mirror was already zero. After any step that carried a scale, by either path
+    /// and from either origin, it is that scale. So between runs, with no scale pending, it
+    /// equals the world's `TimeScale` mirror; with a nonzero scale pending it is that scale,
+    /// ahead of the mirror; with a zero pending it is the scale the pacer still paces by
+    /// until the step that carries the zero, which under [`frame`](Self::frame) is the
+    /// frame's last.
     #[must_use]
     pub fn time_scale(&self) -> TimeScale {
         self.time_scale
@@ -127,9 +133,14 @@ impl Server {
     /// `thousandths / 1000` from the call and [`time_scale`](Self::time_scale) is `scale`
     /// at once, so a paused server has ticks due at its next [`frame`](Self::frame) and the
     /// first of them carries the unpause. Zero: the pacer and
-    /// [`time_scale`](Self::time_scale) change only after the step that carried it, and a
-    /// frame whose poll owes no tick runs that one tick for it, so the pause reaches the
-    /// world before the ticks stop. The passes still run once per frame while paused.
+    /// [`time_scale`](Self::time_scale) change only after the step that carried it, a
+    /// frame whose poll owes no tick runs that one tick for it, and the step that carries
+    /// it is the frame's last, so the pause reaches the world before the ticks stop and no
+    /// tick runs after it. A zero set while a nonzero scale is pending and the world's
+    /// mirror is already zero (an unpause taken back before any step carried it) is no
+    /// pause to carry: it cancels the pending scale and puts the pacer and
+    /// [`time_scale`](Self::time_scale) back to zero, and no tick runs for it. The passes
+    /// still run once per frame while paused.
     pub fn set_time_scale(&mut self, scale: TimeScale) {
         todo!("record the scale for the next step; a nonzero one reaches the pacer now")
     }
@@ -170,16 +181,26 @@ impl Server {
     /// replaced by the stored state, the entry lending its `mode` and its `assets`, the
     /// rest of it dropped and logged at `info` (`README.md`, "Saves and loads": a frame's
     /// entry never discards what was saved).
-    /// After it: every export the lifecycle made is diffed against the region's
-    /// [`baseline`](Self::baseline) into the store (`RegionRecords::from_export`; a failure
-    /// there is this run's error, with the server kept, since it means the registry and the
-    /// schema table disagree); the baseline of every bundle in `frame.loaded` the sync
-    /// point accepted is recorded and its region leaves the store; every `Load` request for
-    /// a kept region is answered by queuing its bundle for the next step; and the requests
-    /// and the load, session and asset failures are taken into the [`StepOutput`], the
-    /// failures also logged at `warn`. Resolves with the server at the next tick and the
-    /// output, or with [`ServerError`]: the server kept when `Simulation::step` handed it
-    /// back, gone otherwise.
+    /// After it, the store is reconciled against the world the step left, never against the
+    /// frame, since under `Anchored` a bundle can load and its region unload again in one
+    /// step: every export the lifecycle made is diffed into the store
+    /// (`RegionRecords::from_export`) against the baseline the region had when it was
+    /// exported, its [`baseline`](Self::baseline) from before the step if it was loaded
+    /// at the step's start (a `Directed` unload runs before the frame's bundles), else the
+    /// baseline of this step's bundle that loaded it; the baseline of every bundle in
+    /// `frame.loaded` the sync point accepted is recorded; every region loaded after the
+    /// step (`World::regions`) leaves the store, and every region not loaded leaves the
+    /// baselines; every `Load` request for a kept region is answered by queuing its bundle
+    /// for the next step; and the requests and the load, session and asset failures are
+    /// taken into the [`StepOutput`], the failures also logged at `warn`. A diff that fails
+    /// (the registry and the schema table disagree, or the region has no recorded
+    /// baseline, `NotFound`) loses that region's saved state, so after the rest of this
+    /// bookkeeping is done for every other region the run fails with the first such error
+    /// in ascending region order and the server gone (`server: None`): a server missing a
+    /// region is never handed back to be saved. Resolves with the server at the next tick
+    /// and the output, or with [`ServerError`]: the server kept when `Simulation::step`
+    /// failed and handed it back, gone when it did not hand it back and after a failed
+    /// diff.
     pub fn step(self, executor: &Executor, frame: TickInput) -> ServerStep<'_> {
         todo!("edit the frame, step the simulation once, keep the exports, take the outputs")
     }
@@ -192,7 +213,9 @@ impl Server {
     /// into the output. `None` from `frames` ends the frame's stepping before that tick: it
     /// does not run, the ticks still due this frame are forgotten (the pacer counted them)
     /// and the passes run as usual; it is for ending a bounded run at its last tick and
-    /// nothing else, since what it forgets is simulation time lost. `frames` runs on the
+    /// nothing else, since what it forgets is simulation time lost. A step that carried a
+    /// zero scale, pending or the callback's own, ends the frame's stepping after it the
+    /// same way, so no tick runs with the world paused. `frames` runs on the
     /// task that drives the frame, a frame-critical worker, between steps, so what it
     /// drains (a jitter buffer, a session queue) is read in tick order and never
     /// concurrently with a step; it must not block. `behind` is reported, not acted on: the
@@ -288,8 +311,10 @@ pub struct StepOutput {
     /// region the store holds is answered by the server itself in the next step and is
     /// still reported, so the caller can resolve the region's table and release it later;
     /// a `Load` of any other region is the caller's to answer through a later frame's
-    /// `loaded`; a `Release` says the region's export is in the store now. Empty under
-    /// `Directed`.
+    /// `loaded`. So the caller answers only the `Load`s whose region is not in
+    /// [`Server::kept`] read after this step: a bundle it sends for a kept region once the
+    /// server's own has loaded is refused as already loaded. A `Release` says the region's
+    /// export is in the store now. Empty under `Directed`.
     pub requests: Vec<RegionRequest>,
     /// The lifecycle's refusals this step.
     pub failures: LifecycleFailures,
@@ -314,10 +339,12 @@ pub struct FrameOutput {
 
 /// How a server run fails: the error, and the server when its world survived. `Some`
 /// when the run's `RunError` handed the simulation back (a failure before anything ran,
-/// a `Gather` pass that no longer prepares, a failed export or diff), so the caller keeps
-/// its world; `None` after `Cancelled`, when the executor shut down during the run and the
-/// world dropped with it. Converts into [`Error`], so `?` into a plain `Result` drops the
-/// server as a plain error would; the policy's response is `Stop` either way.
+/// a `Gather` pass that no longer prepares, a save point's failed export or diff), so the
+/// caller keeps its world; `None` after `Cancelled`, when the executor shut down during the
+/// run and the world dropped with it, and after a step whose unload export could not be
+/// diffed into the store, since that server has lost a region's saved state. Converts
+/// into [`Error`], so `?` into a plain `Result` drops the server as a plain error would;
+/// the policy's response is `Stop` either way.
 pub struct ServerError {
     /// What failed.
     pub error: Error,

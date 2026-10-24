@@ -147,7 +147,9 @@ impl Headless {
 
     /// [`Server::shutdown`] (the world dropped, its solver threads waited for), then
     /// `Executor::execution_log` read if chaos recorded one (D112: read, not taken), then
-    /// `Io::shutdown`, then `Executor::shutdown`, which joins the workers. What a SOUR test
+    /// `Io::shutdown`, then `Executor::shutdown`, which joins the workers. After a run tore
+    /// the world there is no server: `Server::shutdown` is skipped, and the torn world's
+    /// solver pool is terminated when that world drops and not waited for. What a SOUR test
     /// writes the log from.
     pub fn shutdown(self) -> Option<ExecutionLog> {
         todo!("shut the server down, read the log, shut the pool and the executor down")

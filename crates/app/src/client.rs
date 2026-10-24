@@ -24,28 +24,32 @@ use crate::save::Cooked;
 use crate::world::WorldConfig;
 
 /// A client's prediction world between runs: the predictor, its pacer, the lead it runs
-/// ahead of the server by, the last clock estimate and when it was taken, whether a clock
-/// resync is pending, the local player's recent samples and the cooked content the fold
-/// builds bundles from. Built by [`build_client`] on join; stepped by value from the timer
-/// root through [`frame`](Self::frame); ended by [`shutdown`](Self::shutdown) with the
-/// session. The replicated world (`WorldKind::Client`) is not here yet: its hook is
-/// `lactose-net`'s, milestone 4 (`README.md`, "Not in this crate yet").
+/// ahead of the server by, the last clock estimate and the ticks the pacer granted since,
+/// whether a clock resync is pending, the newest frame tick whose fold failed, the local
+/// player's recent samples and the cooked content the fold builds bundles from. Built by
+/// [`build_client`] on join; stepped by value from the timer root through
+/// [`frame`](Self::frame); ended by [`shutdown`](Self::shutdown) with the session. The
+/// replicated world (`WorldKind::Client`) is not here yet: its hook is `lactose-net`'s,
+/// milestone 4 (`README.md`, "Not in this crate yet").
 pub struct Client {
     predictor: Predictor,
     pacer: TickPacer,
     lead: u32,
     estimate: Option<Estimate>,
     pending_resync: bool,
+    /// The newest staged frame tick whose fold `Cooked` failed: no content resync is made
+    /// again for a frame at or before it.
+    content_failed: Option<Tick>,
     history: SampleHistory,
     cooked: Arc<dyn Cooked>,
     solver: SolverExit,
     policy: ErrorPolicy,
 }
 
-/// The last clock estimate and the instant it was taken at: what the clock target advances
-/// from. Hidden plumbing, changeable.
+/// The last clock estimate and the ticks the client's pacer granted since it was taken:
+/// what the clock target advances from. Hidden plumbing, changeable.
 struct Estimate {
-    taken: Instant,
+    granted: u64,
     estimate: ClockEstimate,
 }
 
@@ -131,19 +135,23 @@ impl Client {
     /// How the clock estimate reaches the timer root (architecture section 9.2), between
     /// runs: the pacer's scale becomes the world's `TimeScale` times
     /// `rate_thousandths / 1000`; `lead_ticks` rounded up becomes the lead; the estimate is
-    /// kept with `now` as the instant it was taken, for the clock target; and `snap` marks
-    /// a clock resync, which the next [`frame`](Self::frame) performs on entry and reports.
-    /// The estimate is `lactose-net`'s to compute at milestone 4; the spike computes one
-    /// from its round trip by hand.
-    pub fn clock(&mut self, now: Instant, estimate: ClockEstimate) {
+    /// kept for the clock target, with a count of the ticks the pacer grants from here on
+    /// starting at zero; and `snap` marks a clock resync, which the next
+    /// [`frame`](Self::frame) performs on entry and reports. The estimate is
+    /// `lactose-net`'s to compute at milestone 4; the spike computes one from its round
+    /// trip by hand.
+    pub fn clock(&mut self, estimate: ClockEstimate) {
         todo!("apply the estimate to the pacer and the lead, keep it, mark a snap")
     }
 
     /// One frame of the timer root's client half, by value, in this order and nothing
-    /// else. The clock target of a resync at `now` with a hint `h` (`Behind`'s `server`,
-    /// or none) is the last estimate's `server_tick` advanced by the whole tick periods
-    /// elapsed since the estimate was taken, or `h` if that is later or there is no
-    /// estimate, plus the lead; with neither an estimate nor a hint, the world's own tick.
+    /// else. The clock target of a resync with a hint `h` (`Behind`'s `server`, or
+    /// `TooOld`'s `frame`) is the last estimate's `server_tick` advanced by the ticks this
+    /// client's pacer granted since the estimate was taken (the sum of every poll's budget,
+    /// which the replicated scale and the rate already shape, so the target does not
+    /// overshoot the server by a pause's length or the ticks slow motion did not run, as
+    /// wall time would), or `h` if that is later or there is no estimate,
+    /// plus the lead; with neither an estimate nor a hint, the world's own tick.
     ///
     /// 1. A pending clock resync (a `snap`, or the kept failure of the previous frame):
     ///    `pacer.resync(now)`, then `Predictor::resync` to the clock target with no hint.
@@ -157,11 +165,15 @@ impl Client {
     ///    `Cooked::baseline` and `table` the message's table through `Cooked::pin`, or
     ///    `None`; `Assets` inserts the table pinned; a `full` frame first clears what
     ///    earlier due frames folded and puts every region of `World::regions` in
-    ///    `unloaded`). A region whose baseline or pin `Cooked` cannot give is left out and
-    ///    logged (`Source::Cooked`, `Resync`), and unless step 1 resynced, the world is
-    ///    resynced at its own tick with the pacer untouched: a content resync, reported so
-    ///    the full frame that follows retries the region.
-    /// 3. `pacer.poll(now)`.
+    ///    `unloaded`). A region whose baseline or pin `Cooked` cannot give is left out of
+    ///    the fold. The client remembers the newest frame tick whose fold failed, and
+    ///    resyncs once per failing frame tick: when the newest failing due frame is newer
+    ///    than the remembered tick, the failure is logged (`Source::Cooked`, `Resync`), its
+    ///    tick remembered, and unless step 1 resynced, the world is resynced at its own
+    ///    tick with the pacer untouched: a content resync, reported so the full frame that
+    ///    follows retries the region. A failing frame folded again (one that stays queued
+    ///    through a pause) is left out again and resyncs nothing.
+    /// 3. `pacer.poll(now)`, its budget's ticks added to the estimate's granted count.
     /// 4. One `Predictor::step` per due tick, with the fold's input in the first and an
     ///    empty one after. The local player's sample for `next` is the history's if it
     ///    holds one (a tick predicted before a backward resync is predicted again with the
@@ -171,7 +183,7 @@ impl Client {
     /// 6. `Predictor::passes`.
     /// 7. `take_present_events`.
     /// 8. If `Reconciled::resync` is `Some`: `pacer.resync(now)`, then `Predictor::resync`
-    ///    to the clock target, with `Behind`'s `server` as the hint and none for `TooOld`.
+    ///    to the clock target, with `Behind`'s `server` or `TooOld`'s `frame` as the hint.
     /// 9. If the budget was `behind`: `pacer.resync(now)`.
     ///
     /// Resolves with the client and a [`ClientOutput`], or with [`ClientError`]: the client
