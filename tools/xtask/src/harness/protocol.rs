@@ -54,12 +54,13 @@
 //! schedule replays exactly.
 
 // This file is compiled into the tests of boundary crates, under their `clippy.toml`, which
-// bans `std::fs` and `std::env` (architecture section 8.2), and into this crate, which does
-// not. Each item that reaches a file or the environment therefore allows the lint for itself:
-// an `expect` would be unfulfilled here.
+// bans `std::fs` and `std::env` (architecture section 8.2), and into this crate and the tests
+// of `lactose-net-host`, which do not. Each item that reaches a file or the environment
+// expects the lint for itself; the two `mod protocol` declarations outside the boundary allow
+// the expectations that are unfulfilled there.
 
 use std::fmt;
-#[allow(
+#[expect(
     clippy::disallowed_types,
     reason = "the runner passes the mode in the environment and collects hashes in a file (architecture section 8.3)"
 )]
@@ -217,7 +218,7 @@ impl Session {
     ///
     /// # Errors
     /// If the runner's variables are present but malformed or of another schema version.
-    #[allow(
+    #[expect(
         clippy::disallowed_methods,
         reason = "the runner passes the mode in the environment and collects hashes in a file (architecture section 8.3)"
     )]
@@ -267,7 +268,7 @@ impl Session {
     ///
     /// # Errors
     /// If the name contains a tab or a line break, or the hash file cannot be written.
-    #[allow(
+    #[expect(
         clippy::disallowed_types,
         reason = "the runner passes the mode in the environment and collects hashes in a file (architecture section 8.3)"
     )]
@@ -300,7 +301,7 @@ impl Session {
     ///
     /// # Errors
     /// If the log cannot be written.
-    #[allow(
+    #[expect(
         clippy::disallowed_methods,
         reason = "the runner passes the mode in the environment and collects hashes in a file (architecture section 8.3)"
     )]
@@ -346,7 +347,7 @@ fn check_test_name(test: &str) -> Result<(), ProtocolError> {
 /// Appends one test's records to the file the runner named, or discards them outside the
 /// runner.
 #[derive(Debug)]
-#[allow(
+#[expect(
     clippy::disallowed_types,
     reason = "the runner passes the mode in the environment and collects hashes in a file (architecture section 8.3)"
 )]
@@ -474,7 +475,7 @@ mod tests {
         Session::from_vars(&lookup(&owned))
     }
 
-    #[allow(
+    #[expect(
         clippy::disallowed_methods,
         reason = "the runner passes the mode in the environment and collects hashes in a file (architecture section 8.3)"
     )]
@@ -548,7 +549,7 @@ mod tests {
     }
 
     #[test]
-    #[allow(
+    #[expect(
         clippy::disallowed_methods,
         reason = "the runner passes the mode in the environment and collects hashes in a file (architecture section 8.3)"
     )]
@@ -626,7 +627,7 @@ mod tests {
     }
 
     #[test]
-    #[allow(
+    #[expect(
         clippy::disallowed_methods,
         reason = "the runner passes the mode in the environment and collects hashes in a file (architecture section 8.3)"
     )]

@@ -118,12 +118,15 @@ disallowed-methods = [
   # crate inserts a multibody joint.
   { path = "rapier3d_f64::dynamics::MultibodyJointSet::insert", reason = "multibody mass assembly reaches matrixmultiply, whose kernels are chosen by CPU feature", allow-invalid = true },
   { path = "rapier3d_f64::dynamics::MultibodyJointSet::insert_kinematic", reason = "multibody mass assembly reaches matrixmultiply, whose kernels are chosen by CPU feature", allow-invalid = true },
-  # Architecture section 8.2: file IO (`io`), the process environment and the network
-  # (`net-host`) are outside the boundary; what a simulation reads enters as a tick input.
-  # Clippy matches items, not modules, so each module is closed here by its free functions
-  # and the methods of `Path` that touch the file system, and under disallowed-types by its
-  # types with constructors, with the platform extensions that open the same doors. A test
-  # that reads a file or a variable lifts the lint with `#[expect]` on its one item.
+  # Architecture section 8.2: file IO (`io`), the process environment, subprocesses and the
+  # network (`net-host`) are outside the boundary; what a simulation reads enters as a tick
+  # input. Clippy matches items, not modules, so each module is closed here by its free
+  # functions and the methods of `Path` that touch the file system, and under
+  # disallowed-types by its types with constructors, with the platform extensions that open
+  # the same doors. The environment includes what the process learns of itself: standard
+  # input, its ids, whether it has a terminal, the working directory behind
+  # `path::absolute`, the core count and the backtrace variables. A test that reads a file
+  # or a variable lifts the lint with `#[expect]` on its one item.
   { path = "std::fs::canonicalize", reason = "architecture section 8.2: file IO is outside the boundary; what the simulation reads enters as a tick input" },
   { path = "std::fs::copy", reason = "architecture section 8.2: file IO is outside the boundary; what the simulation reads enters as a tick input" },
   { path = "std::fs::create_dir", reason = "architecture section 8.2: file IO is outside the boundary; what the simulation reads enters as a tick input" },
@@ -140,6 +143,8 @@ disallowed-methods = [
   { path = "std::fs::remove_file", reason = "architecture section 8.2: file IO is outside the boundary; what the simulation reads enters as a tick input" },
   { path = "std::fs::rename", reason = "architecture section 8.2: file IO is outside the boundary; what the simulation reads enters as a tick input" },
   { path = "std::fs::set_permissions", reason = "architecture section 8.2: file IO is outside the boundary; what the simulation reads enters as a tick input" },
+  { path = "std::fs::set_times", reason = "architecture section 8.2: file IO is outside the boundary; what the simulation reads enters as a tick input" },
+  { path = "std::fs::set_times_nofollow", reason = "architecture section 8.2: file IO is outside the boundary; what the simulation reads enters as a tick input" },
   { path = "std::fs::soft_link", reason = "architecture section 8.2: file IO is outside the boundary; what the simulation reads enters as a tick input" },
   { path = "std::fs::symlink_metadata", reason = "architecture section 8.2: file IO is outside the boundary; what the simulation reads enters as a tick input" },
   { path = "std::fs::write", reason = "architecture section 8.2: file IO is outside the boundary; what the simulation reads enters as a tick input" },
@@ -174,6 +179,13 @@ disallowed-methods = [
   { path = "std::env::var_os", reason = "architecture section 8.2: the process environment is not a simulation input" },
   { path = "std::env::vars", reason = "architecture section 8.2: the process environment is not a simulation input" },
   { path = "std::env::vars_os", reason = "architecture section 8.2: the process environment is not a simulation input" },
+  { path = "std::path::absolute", reason = "architecture section 8.2: the process environment is not a simulation input" },
+  { path = "std::io::stdin", reason = "architecture section 8.2: the process environment is not a simulation input" },
+  { path = "std::io::IsTerminal::is_terminal", reason = "architecture section 8.2: the process environment is not a simulation input" },
+  { path = "std::process::id", reason = "architecture section 8.2: the process environment is not a simulation input" },
+  { path = "std::os::unix::process::parent_id", reason = "architecture section 8.2: the process environment is not a simulation input", allow-invalid = true },
+  { path = "std::thread::available_parallelism", reason = "architecture section 8.2: the process environment is not a simulation input" },
+  { path = "std::backtrace::Backtrace::capture", reason = "architecture section 8.2: the process environment is not a simulation input" },
   { path = "std::net::ToSocketAddrs::to_socket_addrs", reason = "architecture section 8.2: networking is outside the boundary; state enters through the staged frame of lactose_net_api" },
 ]
 
@@ -188,8 +200,8 @@ disallowed-types = [
   # Bans `thread_local!` through the type it declares. The `disallowed-macros` lint cannot
   # be used for it: on the pinned toolchain a local `expect` does not reach an item macro.
   { path = "std::thread::LocalKey", reason = "no thread-local state inside the boundary" },
-  # Architecture section 8.2: the types that open a file or a socket; the free functions
-  # are under disallowed-methods.
+  # Architecture section 8.2: the types that open a file or a socket or start a process; the
+  # free functions are under disallowed-methods.
   { path = "std::fs::File", reason = "architecture section 8.2: file IO is outside the boundary; what the simulation reads enters as a tick input" },
   { path = "std::fs::OpenOptions", reason = "architecture section 8.2: file IO is outside the boundary; what the simulation reads enters as a tick input" },
   { path = "std::fs::DirBuilder", reason = "architecture section 8.2: file IO is outside the boundary; what the simulation reads enters as a tick input" },
@@ -199,4 +211,5 @@ disallowed-types = [
   { path = "std::os::unix::net::UnixDatagram", reason = "architecture section 8.2: networking is outside the boundary; state enters through the staged frame of lactose_net_api", allow-invalid = true },
   { path = "std::os::unix::net::UnixListener", reason = "architecture section 8.2: networking is outside the boundary; state enters through the staged frame of lactose_net_api", allow-invalid = true },
   { path = "std::os::unix::net::UnixStream", reason = "architecture section 8.2: networking is outside the boundary; state enters through the staged frame of lactose_net_api", allow-invalid = true },
+  { path = "std::process::Command", reason = "architecture section 8.2: a subprocess reaches files, the environment and the network alike" },
 ]

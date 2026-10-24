@@ -54,27 +54,42 @@ file is held to the rules wherever it is fetched from.
 
 - Each boundary crate, and each crate of `[lint_file_carriers]`, has a `clippy.toml`
   byte-identical to `crates/core/clippy.toml`, and that file still bans a required minimum.
-- Nothing switches the boundary lints off. In a boundary crate, `allow`, `expect` or `warn`
-  of `clippy::disallowed_methods`, `clippy::disallowed_types`, `clippy::all`,
-  `clippy::style` or `warnings` is a finding as an inner attribute anywhere, or as an outer
-  attribute on a `mod`, in any `.rs` file of the package. `#[expect(..., reason = "...")]`
-  on one item that is not a module is the sanctioned form. Also findings: a `.clippy.toml`
-  in the crate directory or above it, those lints weakened in `[lints]` or
-  `[workspace.lints]`, and `CLIPPY_CONF_DIR` or an `-A` flag for those lints in a workflow,
-  script or cargo configuration file.
+- Each other crate of `[boundary_internal] any` compiles into every boundary crate and has a
+  `clippy.toml` whose entries under the paths that reach files, the environment, a
+  subprocess or the network (`OUTSIDE_WORLD` in `src/boundary.rs`) are exactly those of
+  `crates/core/clippy.toml`, compared entry by entry as parsed TOML. The reference's float
+  and executor entries are not required of it. A unit test holds `OUTSIDE_WORLD` to the
+  reference's entries that cite section 8.2, so an entry added there is not missed.
+- Nothing switches the boundary lints off. In a boundary crate or a crate of
+  `[boundary_internal] any`, `allow`, `expect` or `warn` of `clippy::disallowed_methods`,
+  `clippy::disallowed_types`, `clippy::all`, `clippy::style` or `warnings` is a finding as
+  an inner attribute anywhere or as an outer attribute on a `mod`, and `allow` or `warn` of
+  them is a finding on any item, since only an `expect` fails once it is no longer needed.
+  `#[expect(..., reason = "...")]` on one item that is not a module is the sanctioned form.
+  Every `.rs` file of the package is read, and every file a `#[path]` in them names (also
+  inside `cfg_attr`), resolved against the including file's directory, wherever it lives; a
+  named file the check cannot read is a finding. Also findings: a `.clippy.toml` in the
+  crate directory or above it, those lints weakened in `[lints]` or `[workspace.lints]`, and
+  `CLIPPY_CONF_DIR` or an `-A` flag for those lints in a workflow, script or cargo
+  configuration file.
 - A crate on the unsafe list has a `SAFETY.md`. Every other crate has
   `#![forbid(unsafe_code)]` before the first item of every crate root: library, binaries,
   integration tests, benches, examples and `build.rs`.
 - Every crate has a `README.md`.
 - A boundary crate names only what the allowlists in `crate-tiers.toml` let it name, and
   every third-party crate it ends up compiling through normal and build edges is vetted
-  there.
+  there. Architecture section 8.2 says "directly or at any depth" and a boundary crate's
+  tests run under SOUR, so a dev-dependency on a workspace crate is held to the same list,
+  with three additions for tests only: the crate itself, a `[test_support]` crate and
+  `[boundary_internal] dev`.
 - Every workspace crate a boundary crate reaches through normal and build edges, at any
-  depth, through crates outside the boundary, is one `[boundary_internal]` lets that crate
-  name; the finding gives the chain. A boundary crate on the way is not passed through: its
-  own reach is checked as its own, so `task`, which `ecs` alone may name, reaches every crate
-  that depends on `ecs` without a finding. Dev edges are not followed: cargo never compiles a dependency's
-  dev-dependencies, and a crate's own workspace dev-dependencies are the tier check's.
+  depth, through crates outside the boundary, is a boundary crate or one
+  `[boundary_internal]` lets that crate name; the finding gives the chain. A boundary crate
+  on the way is not passed through: its own reach is checked as its own, so `task`, which
+  `ecs` alone may name, reaches every crate that depends on `ecs` without a finding. The
+  same holds for what each workspace crate outside the boundary that its tests name reaches,
+  against what a test may name. Cargo never compiles a dependency's dev-dependencies, so the
+  crate's own dev edges are the only ones followed.
 - The x86-64-v3 pin is the only `rustflags` setting in any cargo configuration file, and
   no workflow, script or cargo configuration names `RUSTFLAGS` or sets a target CPU or
   target feature (`target_cpu` and `target-cpu` are the same to rustc and to this check).
@@ -84,7 +99,10 @@ file is held to the rules wherever it is fetched from.
   reads. `vendor` refuses both through the same function.
 
 The scanner reads source text. It does not expand macros, so an attribute a macro writes is
-not seen.
+not seen. It resolves a `#[path]` inside an inline `mod` block as if it stood outside it,
+where rustc adds the block's name to the directory; no such attribute exists today. A plain
+`mod name;` in a file reached only through `#[path]` from outside the package is not
+followed.
 
 ## `features`
 

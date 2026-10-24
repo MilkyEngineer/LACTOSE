@@ -94,6 +94,9 @@ pub struct InternalAllowlist {
     /// Permitted for the named boundary crate alone.
     #[serde(default)]
     pub only: BTreeMap<String, Vec<String>>,
+    /// Permitted for every boundary crate as a dev-dependency only, for its tests.
+    #[serde(default)]
+    pub dev: Vec<String>,
 }
 
 /// The third-party crates one boundary crate may name.
@@ -273,7 +276,10 @@ fn file_consistency(tiers: &TierFile, findings: &mut Vec<Finding>) {
     tiered(&mut tiers.boundary.iter(), "boundary");
     tiered(&mut tiers.server_denylist.iter(), "server_denylist");
     tiered(&mut tiers.test_support.iter(), "test_support");
-    tiered(&mut internal.any.iter().chain(internal.only.values().flatten()), "boundary_internal");
+    tiered(
+        &mut internal.any.iter().chain(internal.only.values().flatten()).chain(&internal.dev),
+        "boundary_internal",
+    );
 
     let third_party = &tiers.boundary_third_party;
     let keyed = [
@@ -417,6 +423,7 @@ pub(crate) mod fixture {
         "lactose-renderer" = { may_depend_on = ["lactose-render-graph"], reason = "passes" }
         [boundary_internal]
         any = ["lactose-reflect", "lactose-reflect-macros"]
+        dev = ["lactose-task"]
         [boundary_internal.only]
         "lactose-ecs" = ["lactose-task", "lactose-ecs-macros"]
         [boundary_third_party]
@@ -615,7 +622,8 @@ mod tests {
                 r#""lactose-app" = { may_depend_on = ["lactose-net", "game-sim"], reason = "assembles" }"#,
             )
             .replace(r#""lactose-math" = { normal = ["libm"] }"#, r#""lactose-task" = { normal = ["libm"] }"#)
-            .replace(r#""lactose-ecs" = ["lactose-task", "lactose-ecs-macros"]"#, r#""lactose-io" = ["lactose-nowhere"]"#);
+            .replace(r#""lactose-ecs" = ["lactose-task", "lactose-ecs-macros"]"#, r#""lactose-io" = ["lactose-nowhere"]"#)
+            .replace(r#"dev = ["lactose-task"]"#, r#"dev = ["lactose-task", "lactose-elsewhere"]"#);
         let found = messages(&check(&TierFile::parse(&text).unwrap(), &Workspace::default()));
         assert_eq!(
             found,
@@ -623,6 +631,7 @@ mod tests {
                 "crate-tiers.toml: `lactose-core` is listed in more than one tier section, or twice in one",
                 "crate-tiers.toml: `lactose-ghost` is in [boundary] but in no tier section",
                 "crate-tiers.toml: `lactose-nowhere` is in [boundary_internal] but in no tier section",
+                "crate-tiers.toml: `lactose-elsewhere` is in [boundary_internal] but in no tier section",
                 "crate-tiers.toml: `lactose-io` has an entry in [boundary_internal.only] but is not in [boundary]",
                 "crate-tiers.toml: `lactose-task` has an entry in [boundary_third_party.direct] but is not in [boundary]",
                 "crate-tiers.toml: [exceptions] entry `lactose-app` names `lactose-app` (assembly); exceptions lift backend-to-backend edges only",

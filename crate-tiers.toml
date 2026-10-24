@@ -94,8 +94,10 @@ crates = [
 
 # The dependency allowlist of the determinism boundary (architecture section 8.2), enforced by
 # `cargo xtask boundary`. A boundary crate may always depend on another boundary crate, subject
-# to the tier rules above. Its normal and build dependencies on anything else must be named
-# here. Dev-dependencies on workspace crates are left to the tier rules.
+# to the tier rules above. Its dependencies of every kind on anything else must be named here,
+# and so must every workspace crate it reaches through them: section 8.2 says "directly or at
+# any depth", and its tests run under SOUR. A test may also name the crate itself and a
+# [test_support] crate.
 
 # Non-boundary foundation crates a boundary crate may depend on. Section 8.2 names the first
 # three for any boundary crate ("only for types and for operations that are deterministic by
@@ -113,6 +115,11 @@ any = [
   "lactose-reflect", "lactose-asset-api", "lactose-present-api",
   "lactose-reflect-macros",
 ]
+
+# `dev`: what a boundary crate's tests may name and reach besides the lists above. The SOUR
+# tests build their executor from `lactose-task`, which no shipped boundary crate but
+# `lactose-ecs` compiles.
+dev = ["lactose-task"]
 
 [boundary_internal.only]
 "lactose-ecs" = ["lactose-task", "lactose-ecs-macros"]
