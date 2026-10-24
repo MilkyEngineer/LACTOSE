@@ -208,8 +208,9 @@ its value is never saved ("Migrations" below).
   or a `#[value]` struct or enum type; neither is a layout change and neither needs a
   bump. Not free: renaming an enum variant changes the digest, so it is a version bump
   with a step that changes nothing (the saved value means the same variant under its new
-  name); the bump is the price of seeing a permutation. A save carries the digest of
-  every type its sections hold bytes of (`RegionRecords::layouts`), and
+  name), and so is reordering the variants' declarations, since the pairs are written in
+  declaration order; the bump is the price of seeing a permutation. A save carries the
+  digest of every type its sections hold bytes of (`RegionRecords::layouts`), and
   `Migrations::migrate` refuses equal versions with different digests. What no digest
   sees is a change of meaning under an unchanged layout (a field's unit; one `#[value]`
   struct replaced by another of the same layout; one enum by another of the same size,
@@ -288,8 +289,9 @@ export:
   bytes of and per resource. `from_export`, `Loader::migrate` and `decode_section` produce
   it; `Container::insert`, `encode_section`, `Loader::bundle` and `decode_section` refuse
   records that fail it with `InvalidData` naming the first failure; so "equal state gives
-  equal records" holds for every `RegionRecords` this crate handles, and a caller that
-  assembles records by hand runs `check` first.
+  equal records" holds for every `RegionRecords` this crate handles, except that records
+  migrated from an older build keep the saved bytes of a now-transient component, which no
+  loader reads; a caller that assembles records by hand runs `check` first.
 - An unload, a save and a relevance message are one path: the ECS's export, `from_export`,
   and the bundle or the message built from the records. The server's `app` runs it on the
   export of a region that became relevant and `net` sends the message; co-located clients
@@ -317,23 +319,24 @@ export:
   rewritten as zeroes of the registry's size under the table's schema, since the loader
   requires every schema of a document to match the registry's. `Loader::migrate` moves a
   resource the registry now says is transient from `resources` to `transient_resources`.
-- A type that became persistent is restored zeroed, by two rules, since a document
-  records which resources were transient (`transient_resources`) and not which components
-  were: a transient key whose type is now persistent leaves `transient_resources` and
-  joins `resources` as the all-zero value under the registry's schema and digest, and no
-  step runs (a key has no saved version for one to start from); a component is read by
-  the persistent rule below from the schema and digest it was saved under, like any
-  component, so a type made persistent loads only if it kept the version and layout it
-  was saved under, or has the steps from that version, which run over the all-zero old
-  value (a bump or a layout change made while the type was transient breaks the older
-  saves once it is persistent). `Loader::bundle` then validates the restored value like
-  any other, so one that is invalid refuses the region with `InvalidData`. A type the
-  registry now says is `derived`, component or resource, saved by value or by presence,
-  is dropped: a derived value is rebuilt on load and never comes from a document, and the
-  build declared it so; the component leaves its `Spawn` or `SpawnFromBaseline` record,
-  which stays, an `AddComponent`, `RemoveComponent` or `SetField` of it is dropped whole,
-  and an overlay left with no record becomes `None`. A transient type the registry lacks
-  is `NotFound` like any removed type, since the document does not say it was transient.
+- A type that became persistent is restored from a zero value, by two rules, since a
+  document records which resources were transient (`transient_resources`) and not which
+  components were: a transient key whose type is now persistent leaves
+  `transient_resources` and joins `resources` as the all-zero value under the registry's
+  schema and digest, and no step runs (a key has no saved version for one to start from);
+  a component is read by the persistent rule below from the schema and digest it was saved
+  under, like any component, so a type made persistent loads only if it kept the version
+  and layout it was saved under, or has the steps from that version, which run over the
+  all-zero old value (a bump or a layout change made while the type was transient breaks
+  the older saves once it is persistent). `Loader::bundle` then validates the restored
+  value like any other, so one that is invalid refuses the region with `InvalidData`. A
+  type the registry now says is `derived`, component or resource, saved by value or by
+  presence, is dropped: a derived value is rebuilt on load and never comes from a
+  document, and the build declared it so; the component leaves its `Spawn` or
+  `SpawnFromBaseline` record, which stays, an `AddComponent`, `RemoveComponent` or
+  `SetField` of it is dropped whole, and an overlay left with no record becomes `None`. A
+  transient type the registry lacks is `NotFound` like any removed type, since the
+  document does not say it was transient.
 - For a persistent type, a section's schema and digest of it are compared with the
   registry's (the table's). `Migrations::migrate` decides, in this order: a document
   version above the registry's is `VersionMismatch` (a newer save than the build); equal
@@ -499,9 +502,9 @@ and 15.5; D124, D126)
   then a removed type; a declared rename); a component split into two or merged from two
   (a declared cross-type step). Fields within one component, a renamed field or `#[value]`
   type, the layout of a type that stays transient, and a persistence change (restored
-  zeroed or dropped, "Migrations"; a component made persistent is read from its saved
-  version, so a bump since then needs its steps) need none of these; a renamed enum
-  variant needs only a bump and a step that changes nothing ("Schemas").
+  from a zero value or dropped, "Migrations"; a component made persistent is read from
+  its saved version, so a bump since then needs its steps) need none of these; a renamed
+  enum variant needs only a bump and a step that changes nothing ("Schemas").
 - Carrying a region's asset table and mode per section, so a save pins what the hash
   covers: deferred until a save must load against a store that has published since
   (milestone 3, with `lactose-asset`); until then the condition under "Policy" holds.
@@ -532,7 +535,7 @@ record under SOUR) and proves:
 | Round trip | `tests/roundtrip.rs`: the diff's overlay loads back through `World::load_region` and `insert_region_resource_erased` into a world that exports the same `RegionRows` (the ECS's `bulk.rs` does this with a hand-built overlay); `SchemaTable`'s schemas are accepted by the loader for every type of a registry with nested structs, arrays, enums and padding; `decode(encode(c)) == c`; `index` and `decode_section` agree with `decode` section by section, and `assemble` of sections made in any order equals `encode`; golden container bytes in `tests/format.rs` |
 | Canonical records | `tests/records.rs`: `check` refuses `Some` of an empty overlay, a `baseline_hash` other than the overlay's, unsorted or duplicate resources, schemas or keys, a schema that is not its resource's, a transient key that is also a resource's type, and `layouts` with an entry missing or extra, each naming the failure; `insert`, `encode_section` and `Loader::bundle` refuse the same and change nothing |
 | Section 15.5 and D124 | `tests/reload.rs`, with a small game as `crates/sim/tests/common` writes one: the original reloads in place at tick T through this crate's bundles, a fresh process loads the container's bytes, an untouched twin never reloads, all K ticks hash-equal with one store and the policy's modes (test 1 and 4; with `lactose-physics-api`'s components, the reload and the fresh process equal each other and the twin within D124's tolerance); the two-frame path likewise; an unload and reload through `from_export` and `bundle` exports the same `RegionExport` (test 2); the save taken while a left player's row is kept |
-| Migrations | `tests/migrate.rs`: a container written under `Health` version 1 (bytes pinned) loads through the step of the README's example and the world hashes as one saved at version 2 would (test 3); a newer version, a missing step, a field left over, a field unset, an invalid value and a `SetField` under a changed schema are each refused as stated and nothing loads; equal versions are refused with `VersionMismatch` by the digest where the document schema is equal, one change per case: a nested reorder, discriminants renumbered in declaration order, discriminants permuted among the variants in place, a variant renamed, a same-size type change; a transient component and a transient resource with a changed layout load zeroed with no step and no bump, a transient component with an unchanged layout leaves the overlay as the same `Arc`, and a persistent resource that became transient moves to the transient keys; a transient key whose type became persistent loads as the zeroed value with no step; a transient component whose type became persistent loads zeroed under its saved version and digest, through its steps when the version moved since, and is refused with `VersionMismatch` when its layout moved without a bump; a restored zero that fails validation is `InvalidData`; a type that became `derived` is dropped, an overlay it emptied becoming `None`, and the world rebuilds it; a resource migrates under the schema and digest the section carries; an overlay whose types match comes back as the same `Arc` with the same digest; a second step for one (type, version) is refused |
-| The schema hash and the digest | `tests/schema.rs`: a golden hash and golden digests for a small registry; equal across registration order and with a derived type added or a tracking flag set; the hash changed by a version bump, a field ID, offset, size, primitive tag or kind, a type's size, a role and a persistence change, the digest by every layout change and by none of the rest, one change per case against one base type: a nested reorder, discriminants renumbered in declaration order, discriminants permuted among the variants in place, a variant renamed, a same-size primitive change (`u64` to `i64`, `u64` to `Scalar`), and an array element's primitive, nested order and enum changed, each changing the digest; a renamed field, `#[value]` struct or enum type leaving both equal; `from_registry` refuses a raw float, a foreign scalar tag and a 20 KiB persistent resource |
+| Migrations | `tests/migrate.rs`: a container written under `Health` version 1 (bytes pinned) loads through the step of the README's example and the world hashes as one saved at version 2 would (test 3); a newer version, a missing step, a field left over, a field unset, an invalid value and a `SetField` under a changed schema are each refused as stated and nothing loads; equal versions are refused with `VersionMismatch` by the digest where the document schema is equal, one change per case: a nested reorder, discriminants renumbered in declaration order, the variants' names swapped over unchanged values (`{A = 0, B = 1}` to `{B = 0, A = 1}`), at the top level and as an array element, which only the names catch, a variant renamed, a same-size type change; a transient component and a transient resource with a changed layout load zeroed with no step and no bump, a transient component with an unchanged layout leaves the overlay as the same `Arc`, and a persistent resource that became transient moves to the transient keys; a transient key whose type became persistent loads as the zeroed value with no step; a transient component whose type became persistent loads zeroed under its saved version and digest, through its steps when the version moved since, and is refused with `VersionMismatch` when its layout moved without a bump; a restored zero that fails validation is `InvalidData`; a type that became `derived` is dropped, an overlay it emptied becoming `None`, and the world rebuilds it; a resource migrates under the schema and digest the section carries; an overlay whose types match comes back as the same `Arc` with the same digest; a second step for one (type, version) is refused |
+| The schema hash and the digest | `tests/schema.rs`: a golden hash and golden digests for a small registry; equal across registration order and with a derived type added or a tracking flag set; the hash changed by a version bump, a field ID, offset, size, primitive tag or kind, a type's size, a role and a persistence change, the digest by every layout change and by none of the rest, one change per case against one base type: a nested reorder, discriminants renumbered in declaration order, the variants' names swapped over unchanged values (`{A = 0, B = 1}` to `{B = 0, A = 1}`), at the top level and as an array element, which only the names catch, a variant renamed, a same-size primitive change (`u64` to `i64`, `u64` to `Scalar`), and an array element's primitive, nested order and enum changed, each changing the digest; a renamed field, `#[value]` struct or enum type leaving both equal; `from_registry` refuses a raw float, a foreign scalar tag and a 20 KiB persistent resource |
 | The container's caps and the prefix read | `tests/container.rs`: a preamble too short, a wrong magic, a wrong version, a block over the cap, a damaged block hash, a non-ascending index, an entry inside the block, past the cap or overlapping another, an entry over the section cap, a section of another length, another hash or another decompressed size, and a section whose content states another region, seed, baseline hash or overlay digest than its entry are each refused as stated, with an allocation bound checked by a counting allocator in the test; `index` over exactly `index_len` bytes equals `index` over the file; one damaged section fails alone and every other section decodes |
 | The consumers | `tests/sketch.rs`, type-checked: `app`'s save with per-region sections, the relevance message, the loads (fresh, in place, two frames, one region from a prefix and a section, the corrupt-save read), a game crate's migration, the shape of the tests above |

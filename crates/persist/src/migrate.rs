@@ -225,7 +225,8 @@ impl Migrations {
     /// `RemoveComponent` or `SetField` of it is dropped whole, since a derived value is
     /// rebuilt on load and never comes from a document, and the build declared it so. An
     /// overlay whose every record was dropped comes back empty, the one way this function
-    /// yields an empty overlay; [`Loader::migrate`](crate::Loader::migrate) makes it `None`.
+    /// yields an empty overlay besides an empty `overlay`, which comes back as the same
+    /// `Arc`; [`Loader::migrate`](crate::Loader::migrate) makes it `None`.
     ///
     /// Fails as [`migrate`](Self::migrate) fails; with `NotFound` for a component the table
     /// does not know (a removed type: never dropped silently); with `InvalidData` for a

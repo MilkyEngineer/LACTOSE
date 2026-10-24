@@ -51,8 +51,9 @@ pub fn diff(rows: &RegionRows, baseline: &Baseline, schemas: &SchemaTable) -> Re
 /// and the resources by this crate's canonicalisation, and every list is in ascending key
 /// order. The canonical form is [`check`](Self::check), and every function of this crate
 /// that builds, takes or writes records holds it, so two `RegionRecords` that compare
-/// unequal describe different states. Two `RegionRecords` compare by content, the overlay
-/// included.
+/// unequal describe different states, except that records migrated from an older build
+/// keep the saved bytes of a now-transient component, which no loader reads. Two
+/// `RegionRecords` compare by content, the overlay included.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct RegionRecords {
     /// The region.

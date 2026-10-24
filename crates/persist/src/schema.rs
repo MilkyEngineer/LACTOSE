@@ -38,12 +38,13 @@ use lactose_reflect::{Persistence, Registry, TypeInfo, TypeRole};
 /// different digests. Free, because no saved byte depends on them: renaming a field (its
 /// ID stays) or a `#[value]` struct or enum type. Not free: renaming an enum variant,
 /// which changes the digest and so is a version bump with a step that changes nothing
-/// (the saved value means the same variant under its new name); the bump is the price of
-/// seeing a permutation. What no digest sees is a change of meaning under an unchanged
-/// layout (a field's unit; one `#[value]` struct replaced by another of the same layout;
-/// one enum by another of the same size, discriminants and variant names; one primitive
-/// by another of the same tag): only a version bump and a step carry that, and the
-/// build-time guard D129 names (a committed record of each saved type's version and
+/// (the saved value means the same variant under its new name), and so is reordering the
+/// variants' declarations, since the pairs are written in declaration order; the bump is
+/// the price of seeing a permutation. What no digest sees is a change of meaning under an
+/// unchanged layout (a field's unit; one `#[value]` struct replaced by another of the same
+/// layout; one enum by another of the same size, discriminants and variant names; one
+/// primitive by another of the same tag): only a version bump and a step carry that, and
+/// the build-time guard D129 names (a committed record of each saved type's version and
 /// digest, compared by a test that fails when the digest changed and the version did not)
 /// is what makes the bump hard to forget.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
