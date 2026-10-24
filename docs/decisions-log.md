@@ -3874,8 +3874,8 @@ relayed by an event when it acts on another body** (§6.1, §10, `lactose-ecs`,
       `Backtrace::capture`.
 
     Clippy matches items, not modules, so each route is its own entry, and `cargo xtask
-    boundary` requires a sample of them. `std::thread::spawn` is left to a later change. Rules
-    out a module-level ban, which clippy cannot express.
+    boundary` requires a sample of them. Thread creation outside an executor is banned too (the
+    addendum below). Rules out a module-level ban, which clippy cannot express.
   - *A crate of `[boundary_internal] any` outside the boundary (`reflect` and `asset-api`
     today, `present-api` once it exists) carries a `clippy.toml` whose file, environment,
     subprocess and network entries are exactly the reference's.* It compiles into every
@@ -3897,6 +3897,83 @@ relayed by an event when it acts on another body** (§6.1, §10, `lactose-ecs`,
     protocol's items expect the bans, and the `mod protocol` declarations outside the boundary
     (in `tools/xtask`, in `net-host`'s tests and in `app`'s tests) allow the expectations left
     unfulfilled there.
+- Addendum (lane boundary-thread-ban, 2026-10-25; fix rounds 1 and 2, 2026-10-25): *No thread
+  creation outside an executor.* A thread the executor does not run is outside its determinism
+  and chaos model wherever the code that starts it lives. The boundary lint file now bans:
+  - the standard library's routes: `thread::spawn`, `Builder::spawn`, `spawn_scoped` and
+    `spawn_unchecked`, `Scope::spawn`, and `thread::scope`, banned as the scope its threads
+    start in;
+  - `lactose_task::Platform::spawn_thread`;
+  - the pool builders (section 16: the solver pool is built outside the boundary and handed to
+    the backend): rayon's `ThreadPoolBuilder::build`, `build_global` and `build_scoped`,
+    `ThreadPool::new`, and Rapier's `configure_thread_pool`;
+  - the routes found to start rayon's global pool, which is sized by the core count:
+    - Rapier's `clear_thread_pool`;
+    - rayon's free functions (`spawn`, `spawn_fifo`, `join`, `join_context`, `scope`,
+      `scope_fifo`, `in_place_scope`, `in_place_scope_fifo`, `broadcast`, `spawn_broadcast`,
+      `current_num_threads`), its iterator sources and bridges, and the prelude traits' methods
+      that make or drive a parallel iterator;
+    - under disallowed-types, `rayon::iter::plumbing`'s `Producer`, `UnindexedProducer`,
+      `ProducerCallback`, `Consumer` and `UnindexedConsumer`, the traits a parallel iterator of
+      a crate's own is written with;
+    - the public functions of the pinned Rapier (0.36.0) and parry (0.31.1) found to run
+      parallel work outside `PhysicsPipeline::step`, the one function Rapier runs on the pool
+      it was handed: `PhysicsWorld::detect_collisions`, `CollisionPipeline::step`,
+      `BroadPhaseBvh::update`, `CCDSolver::find_first_impact` and `solve_continuous`,
+      `SoftBodySet::sync_particle_positions`, `SoftBodyBuilder::volumetric` and
+      `volumetric_with`; parry's `Bvh::refit_parallel`, `refit_without_resolve_parallel`,
+      `insert_or_update_batch_partially_parallel` and `traverse_bvtt_single_tree_parallel`,
+      `PersistentQueryDispatcher::contact_manifolds`,
+      `contact_manifolds_composite_shape_shape`, `contact_manifolds_trimesh_shape` and
+      `contact_manifolds_trimesh_shape_shapes`, and `volume_mesh`.
+
+  rayon's adaptors and consumers are left out because they need a parallel iterator. rayon's
+  own are banned at their sources, and one of a crate's own must name the consumer traits in
+  the bounds of its `drive` methods, which the lint catches. It does not catch them in an impl
+  header, a glob import or an expression path, none of which makes an iterator without those
+  bounds. `yield_now`, `yield_local` and `max_num_threads` build no registry and are left out
+  too.
+
+  The worker index and the core count are banned beside the executor's, though they start no
+  thread: rayon's `current_thread_index` (free and on `ThreadPool`) as `JobContext::slot` is
+  (the worker index is not a semantic key), and `lactose_task::Platform::topology` and
+  `hardware_threads` (the core count is not a simulation input). `cargo xtask boundary`
+  requires them by name.
+
+  The section-16 and rayon entries carry `allow-invalid`, since only `physics-rapier` and `ecs`
+  name those crates. So `cargo xtask boundary` requires every listed thread route by name
+  (`THREAD_ROUTES`), and two ties keep that list honest:
+  - a unit test holds the list to the reference's entries that say a boundary crate creates no
+    thread or cite section 16;
+  - the check holds every reference entry under `rayon::`, `rapier3d_f64::`, `parry3d_f64::` or
+    `std::thread::` to that list or to a short list of the entries there that start no thread,
+    whatever its reason says; an entry under `lactose_task::` is tied by its reason alone.
+
+  A crate of `[boundary_internal] any` carries the standard library's entries alone. Tests that
+  build the solver pool or need a thread lift the ban on their one item.
+
+  Asset-api's `conformance` feature compiles library code: the conformance suite and
+  `ReferenceStore`, whose concurrency check starts threads. It is not a test, so a new
+  `crate-tiers.toml` table, `[dev_only_features]`, holds it to dev-dependency edges. `cargo
+  xtask tiers` reports a normal or build edge that turns it on, a `[features]` value forwarding
+  to it (`name/feature` or `name?/feature`, under the dependency's rename), the crate's
+  `default` turning it on, and a listed feature the crate does not declare, and holds any
+  feature of the crate that turns it on to the same rule.
+
+  Not closed:
+  - Rapier's and parry's public functions that run parallel work outside
+    `PhysicsPipeline::step`, beyond those listed. They were found by reading the pinned
+    sources, so the list is not provably complete and a version bump needs the search again.
+  - A world stepped without a pool: one made by `new`, or after the backend's own
+    `set_thread_pool(None)`. `lactose-physics-rapier`'s `tests/global_pool.rs` holds the
+    backend at run time: a backend's life (stepped, snapshotted, restored, stepped) leaves
+    rayon's global pool unbuilt.
+  - Raw platform thread and thread-pool calls (`libc::fork`, `libc::pthread_create`, Win32
+    `QueueUserWorkItem`, and the thread-pool and timer-queue calls core's windows-sys features
+    expose). They need `unsafe`, so only `lactose-core` could reach them.
+
+  Rules out banning `ThreadPool`'s methods, which run on the handed pool, and a module-level
+  ban, which clippy cannot express.
 - Driven by: the io facade's review (D130, finding D2) and the boundary-closure reviews r1 to
   r3 (2026-10-24).
 

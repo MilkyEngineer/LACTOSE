@@ -557,6 +557,17 @@ presentation, pose evaluation, VFX, audio, UI, asset IO timing and input samplin
   terminal, its working directory, the core count, the backtrace variables); a test that needs one
   lifts the lint with `#[expect]` on its one item. Every crate of `[boundary_internal] any` carries
   these bans too, and a boundary crate's tests are held to the dependency allowlist as the crate is.
+- No thread creation outside an executor. Parallel work goes through `lactose_task`'s executor, and
+  the physics step through the solver pool of section 16, which `lactose-app` builds and hands to
+  the backend. The boundary lint file bans `std::thread::spawn`, `Builder`'s and `Scope`'s spawns
+  and `std::thread::scope`, the scope those threads start in;
+  `lactose_task::Platform::spawn_thread`; rayon's and Rapier's pool builders; and the routes found
+  to start rayon's global pool: rayon's free functions, iterator sources and bridges, the traits a
+  parallel iterator of a crate's own is written with, Rapier's `clear_thread_pool`, and the public
+  functions of the pinned Rapier and parry found to run parallel work outside
+  `PhysicsPipeline::step`. The list is not provably complete (D132). `cargo xtask boundary` requires
+  each listed route. A test that needs a thread lifts the lint with `#[expect]` on its one item.
+  Every crate of `[boundary_internal] any` carries the standard library's entries.
 - No thread-local state. No global mutable state. The one exception is the allocation tag
   in `core`, which the allocator alone reads and no simulation result can observe.
 - Hash maps are `core::FixedHashMap`. Iteration order is never observable.

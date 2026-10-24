@@ -15,6 +15,8 @@
 # Game crates may depend on foundation crates and on other game crates.
 # Dev-dependency concessions: a crate may dev-depend on itself, and any crate may dev-depend
 #   on a [test_support] crate.
+# A feature listed in [dev_only_features] is turned on by dev-dependency edges alone: no normal
+#   or build edge may enable it, and no `[features]` value may forward to it.
 # Build scripts and proc macros may not depend on boundary crates (they compile for the host
 # without the pinned target features).
 # Every dependency that is a path dependency must be a workspace member, and a dependency
@@ -61,6 +63,12 @@ crates = ["game-sim", "game-present", "game-ai", "game-content"]
 # Crates any crate may name as a dev-dependency, whatever its tier. Each is also in a tier
 # section, whose rules govern its normal and build edges.
 crates = ["lactose-rhi-null"]
+
+[dev_only_features]
+# Features that compile library code for tests, which nothing that ships may compile. Each
+# key is a crate; a feature of it that turns a listed one on is held to the same rule.
+# asset-api's `conformance` builds the store conformance suite and its `ReferenceStore`.
+"lactose-asset-api" = ["conformance"]
 
 [boundary]
 # Crates inside the determinism boundary. clippy.toml and the allowlists below apply here.

@@ -11,6 +11,10 @@ use lactose_physics_api::PhysicsConfig;
 use lactose_physics_api::conformance::{SNAPSHOT_TICK, TICKS, empty_restore, snapshot_restore};
 use lactose_sim::harness::{ChunkCapacity, layout_mode};
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "the test builds the solver pool that lactose-app builds in a shipped binary"
+)]
 fn backend(threads: usize) -> Box<dyn lactose_physics_api::PhysicsBackend> {
     let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).build().unwrap();
     lactose_physics_rapier::backend(pool)

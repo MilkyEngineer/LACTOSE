@@ -10,6 +10,10 @@ use lactose_physics_api::{
     RigidBody, Shape, StepInput, StepOutput, Transform, TriggerEvent, Velocity,
 };
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "the test builds the solver pool that lactose-app builds in a shipped binary"
+)]
 pub fn backend(threads: usize) -> Box<dyn PhysicsBackend> {
     let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).build().unwrap();
     lactose_physics_rapier::backend(pool)

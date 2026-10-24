@@ -1,9 +1,10 @@
-# The determinism boundary's bans on files, the process environment, subprocesses and the
-# network (architecture section 8.2), for a crate outside [boundary] that [boundary_internal]
-# `any` in crate-tiers.toml lets every boundary crate compile. `cargo xtask boundary` checks
-# that these entries are exactly those of crates/core/clippy.toml, as written there. The
-# float and executor bans of that file do not apply here. A test that reads a file or a
-# variable lifts the lint with `#[expect]` on its one item.
+# The determinism boundary's bans on files, the process environment, subprocesses, the
+# network and the standard library's thread creation (architecture section 8.2), for a crate
+# outside [boundary] that [boundary_internal] `any` in crate-tiers.toml lets every boundary
+# crate compile. `cargo xtask boundary` checks that these entries are exactly those of
+# crates/core/clippy.toml, as written there. That file's float, executor, solver-pool and rayon
+# bans name crates this one does not depend on and do not apply here. A test that reads a file
+# or a variable, or creates a thread, lifts the lint with `#[expect]` on its one item.
 
 disallowed-methods = [
   { path = "std::fs::canonicalize", reason = "architecture section 8.2: file IO is outside the boundary; what the simulation reads enters as a tick input" },
@@ -66,6 +67,12 @@ disallowed-methods = [
   { path = "std::thread::available_parallelism", reason = "architecture section 8.2: the process environment is not a simulation input" },
   { path = "std::backtrace::Backtrace::capture", reason = "architecture section 8.2: the process environment is not a simulation input" },
   { path = "std::net::ToSocketAddrs::to_socket_addrs", reason = "architecture section 8.2: networking is outside the boundary; state enters through the staged frame of lactose_net_api" },
+  { path = "std::thread::spawn", reason = "architecture section 8.2: a boundary crate creates no thread; parallel work goes through lactose_task" },
+  { path = "std::thread::scope", reason = "architecture section 8.2: a boundary crate creates no thread; parallel work goes through lactose_task" },
+  { path = "std::thread::Scope::spawn", reason = "architecture section 8.2: a boundary crate creates no thread; parallel work goes through lactose_task" },
+  { path = "std::thread::Builder::spawn", reason = "architecture section 8.2: a boundary crate creates no thread; parallel work goes through lactose_task" },
+  { path = "std::thread::Builder::spawn_scoped", reason = "architecture section 8.2: a boundary crate creates no thread; parallel work goes through lactose_task" },
+  { path = "std::thread::Builder::spawn_unchecked", reason = "architecture section 8.2: a boundary crate creates no thread; parallel work goes through lactose_task" },
 ]
 
 disallowed-types = [

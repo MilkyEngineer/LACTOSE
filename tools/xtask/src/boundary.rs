@@ -30,14 +30,20 @@ const PIN_CPU: &str = "x86-64-v3";
 const PIN_FLAGS: [&str; 2] = ["-C", "target-cpu=x86-64-v3"];
 
 /// Entries the reference lint file must keep, one or two from each family of rule in
-/// section 8.2, so a file that was emptied and then copied everywhere is still caught.
-const REQUIRED_LINT_PATHS: [&str; 13] = [
+/// section 8.2, so a file that was emptied and then copied everywhere is still caught. The
+/// executor's core count and rayon's worker index are here, not in [`THREAD_ROUTES`]: they
+/// start no thread, and no test uses them.
+const REQUIRED_LINT_PATHS: [&str; 17] = [
     "f32::min",
     "f64::sin",
     "f64::to_bits",
     "f64::powi",
     "std::fs::read",
     "std::env::var",
+    "lactose_task::Platform::topology",
+    "lactose_task::Platform::hardware_threads",
+    "rayon::current_thread_index",
+    "rayon::ThreadPool::current_thread_index",
     "std::time::Instant",
     "std::collections::HashMap",
     "std::hash::RandomState",
@@ -47,10 +53,145 @@ const REQUIRED_LINT_PATHS: [&str; 13] = [
     "std::process::Command",
 ];
 
+/// Every route to a thread outside an executor that the reference lint file bans (sections 5.1,
+/// 8.2 and 16): the standard library's, the executor's platform, and the solver pool's and
+/// rayon's global pool's, among them the public functions of the pinned Rapier and parry found
+/// to run parallel work outside `PhysicsPipeline::step` and the traits a parallel iterator of a
+/// crate's own is written with. Each is required, not a sample: no test uses most of them, and
+/// `allow-invalid` keeps clippy quiet about an entry whatever happens to it. A unit test holds
+/// this list to the reference's entries that say a boundary crate creates no thread or cite
+/// section 16, and the check holds every entry under [`THREAD_PREFIXES`] to this list or
+/// [`NOT_THREAD_ROUTES`], so an entry added there is pinned here too.
+const THREAD_ROUTES: [&str; 104] = [
+    "lactose_task::Executor::platform",
+    "lactose_task::Platform::spawn_thread",
+    "std::thread::spawn",
+    "std::thread::scope",
+    "std::thread::Scope::spawn",
+    "std::thread::Builder::spawn",
+    "std::thread::Builder::spawn_scoped",
+    "std::thread::Builder::spawn_unchecked",
+    "rayon::ThreadPoolBuilder::build",
+    "rayon::ThreadPoolBuilder::build_global",
+    "rayon::ThreadPoolBuilder::build_scoped",
+    "rayon::ThreadPool::new",
+    "rapier3d_f64::pipeline::PhysicsWorld::configure_thread_pool",
+    "rapier3d_f64::pipeline::PhysicsPipeline::configure_thread_pool",
+    "rapier3d_f64::pipeline::PhysicsWorld::clear_thread_pool",
+    "rapier3d_f64::pipeline::PhysicsPipeline::clear_thread_pool",
+    "rapier3d_f64::pipeline::PhysicsWorld::detect_collisions",
+    "rapier3d_f64::pipeline::CollisionPipeline::step",
+    "rapier3d_f64::geometry::BroadPhaseBvh::update",
+    "rapier3d_f64::dynamics::CCDSolver::find_first_impact",
+    "rapier3d_f64::dynamics::CCDSolver::solve_continuous",
+    "rapier3d_f64::dynamics::SoftBodySet::sync_particle_positions",
+    "rapier3d_f64::dynamics::SoftBodyBuilder::volumetric",
+    "rapier3d_f64::dynamics::SoftBodyBuilder::volumetric_with",
+    "parry3d_f64::partitioning::Bvh::refit_parallel",
+    "parry3d_f64::partitioning::Bvh::refit_without_resolve_parallel",
+    "parry3d_f64::partitioning::Bvh::insert_or_update_batch_partially_parallel",
+    "parry3d_f64::partitioning::Bvh::traverse_bvtt_single_tree_parallel",
+    "parry3d_f64::query::PersistentQueryDispatcher::contact_manifolds",
+    "parry3d_f64::query::details::contact_manifolds_composite_shape_shape",
+    "parry3d_f64::query::details::contact_manifolds_trimesh_shape",
+    "parry3d_f64::query::details::contact_manifolds_trimesh_shape_shapes",
+    "parry3d_f64::transformation::volume_mesh",
+    "rayon::spawn",
+    "rayon::spawn_fifo",
+    "rayon::join",
+    "rayon::join_context",
+    "rayon::scope",
+    "rayon::scope_fifo",
+    "rayon::in_place_scope",
+    "rayon::in_place_scope_fifo",
+    "rayon::broadcast",
+    "rayon::spawn_broadcast",
+    "rayon::current_num_threads",
+    "rayon::iter::empty",
+    "rayon::iter::once",
+    "rayon::iter::repeat",
+    "rayon::iter::repeat_n",
+    "rayon::iter::repeatn",
+    "rayon::iter::split",
+    "rayon::iter::walk_tree",
+    "rayon::iter::walk_tree_prefix",
+    "rayon::iter::walk_tree_postfix",
+    "rayon::iter::plumbing::bridge",
+    "rayon::iter::plumbing::bridge_producer_consumer",
+    "rayon::iter::plumbing::bridge_unindexed",
+    "rayon::iter::IntoParallelIterator::into_par_iter",
+    "rayon::iter::IntoParallelRefIterator::par_iter",
+    "rayon::iter::IntoParallelRefMutIterator::par_iter_mut",
+    "rayon::iter::ParallelBridge::par_bridge",
+    "rayon::iter::ParallelExtend::par_extend",
+    "rayon::iter::FromParallelIterator::from_par_iter",
+    "rayon::iter::ParallelDrainFull::par_drain",
+    "rayon::iter::ParallelDrainRange::par_drain",
+    "rayon::slice::ParallelSlice::par_split",
+    "rayon::slice::ParallelSlice::par_split_inclusive",
+    "rayon::slice::ParallelSlice::par_windows",
+    "rayon::slice::ParallelSlice::par_array_windows",
+    "rayon::slice::ParallelSlice::par_chunks",
+    "rayon::slice::ParallelSlice::par_chunks_exact",
+    "rayon::slice::ParallelSlice::par_rchunks",
+    "rayon::slice::ParallelSlice::par_rchunks_exact",
+    "rayon::slice::ParallelSlice::par_chunk_by",
+    "rayon::slice::ParallelSliceMut::par_split_mut",
+    "rayon::slice::ParallelSliceMut::par_split_inclusive_mut",
+    "rayon::slice::ParallelSliceMut::par_chunks_mut",
+    "rayon::slice::ParallelSliceMut::par_chunks_exact_mut",
+    "rayon::slice::ParallelSliceMut::par_rchunks_mut",
+    "rayon::slice::ParallelSliceMut::par_rchunks_exact_mut",
+    "rayon::slice::ParallelSliceMut::par_sort",
+    "rayon::slice::ParallelSliceMut::par_sort_by",
+    "rayon::slice::ParallelSliceMut::par_sort_by_key",
+    "rayon::slice::ParallelSliceMut::par_sort_by_cached_key",
+    "rayon::slice::ParallelSliceMut::par_sort_unstable",
+    "rayon::slice::ParallelSliceMut::par_sort_unstable_by",
+    "rayon::slice::ParallelSliceMut::par_sort_unstable_by_key",
+    "rayon::slice::ParallelSliceMut::par_chunk_by_mut",
+    "rayon::str::ParallelString::par_chars",
+    "rayon::str::ParallelString::par_char_indices",
+    "rayon::str::ParallelString::par_bytes",
+    "rayon::str::ParallelString::par_encode_utf16",
+    "rayon::str::ParallelString::par_split",
+    "rayon::str::ParallelString::par_split_inclusive",
+    "rayon::str::ParallelString::par_split_terminator",
+    "rayon::str::ParallelString::par_lines",
+    "rayon::str::ParallelString::par_split_whitespace",
+    "rayon::str::ParallelString::par_split_ascii_whitespace",
+    "rayon::str::ParallelString::par_matches",
+    "rayon::str::ParallelString::par_match_indices",
+    "rayon::iter::plumbing::Producer",
+    "rayon::iter::plumbing::UnindexedProducer",
+    "rayon::iter::plumbing::ProducerCallback",
+    "rayon::iter::plumbing::Consumer",
+    "rayon::iter::plumbing::UnindexedConsumer",
+];
+
+/// The path prefixes of the thread routes: the check holds every reference entry under one to
+/// [`THREAD_ROUTES`] or [`NOT_THREAD_ROUTES`], whatever its reason says.
+const THREAD_PREFIXES: [&str; 4] = ["rayon::", "rapier3d_f64::", "parry3d_f64::", "std::thread::"];
+
+/// The reference's entries under [`THREAD_PREFIXES`] that start no thread: rayon's worker
+/// index, Rapier's multibody paths into `matrixmultiply`, the core count and thread-local state.
+const NOT_THREAD_ROUTES: [&str; 9] = [
+    "rayon::current_thread_index",
+    "rayon::ThreadPool::current_thread_index",
+    "rapier3d_f64::dynamics::Multibody::inverse_kinematics",
+    "rapier3d_f64::dynamics::Multibody::inverse_kinematics_delta",
+    "rapier3d_f64::dynamics::Multibody::inverse_kinematics_delta_with_jacobian",
+    "rapier3d_f64::dynamics::MultibodyJointSet::insert",
+    "rapier3d_f64::dynamics::MultibodyJointSet::insert_kinematic",
+    "std::thread::available_parallelism",
+    "std::thread::LocalKey",
+];
+
 /// The entries of the reference lint file, by path prefix, that keep the outside world out:
-/// files, the process environment, subprocesses and the network (section 8.2). Every crate of
-/// `[boundary_internal] any` that does not carry the whole file carries these, as written.
-const OUTSIDE_WORLD: [&str; 13] = [
+/// files, the process environment, subprocesses, the network and the standard library's
+/// thread creation (section 8.2). Every crate of `[boundary_internal] any` that does not carry the
+/// whole file carries these, as written.
+const OUTSIDE_WORLD: [&str; 17] = [
     "std::fs::",
     "std::path::",
     "std::os::unix::fs::",
@@ -64,6 +205,10 @@ const OUTSIDE_WORLD: [&str; 13] = [
     "std::backtrace::",
     "std::net::",
     "std::os::unix::net::",
+    "std::thread::spawn",
+    "std::thread::scope",
+    "std::thread::Scope::",
+    "std::thread::Builder::",
 ];
 
 /// The two lint tables of a lint file.
@@ -101,7 +246,7 @@ pub fn check(tiers: &TierFile, policy: &Policy, ws: &Workspace, files: &Files) -
         let boundary = tiers.in_boundary(&package.name);
         let carrier = boundary || policy.lint_file_carriers.contains(&package.name);
         // Compiled into every boundary crate, so held to the bans that keep the outside world
-        // out (section 8.2), but not to the float or executor ones.
+        // out (section 8.2), but not to the float, executor or solver-pool ones.
         let internal = !carrier && tiers.boundary_internal.any.contains(&package.name);
         if carrier {
             lint_file_copy(package, files, &mut findings);
@@ -222,6 +367,29 @@ fn reference_lint_file(files: &Files, findings: &mut Vec<Finding>) {
             ));
         }
     }
+    for route in THREAD_ROUTES.iter().filter(|route| !banned.contains(*route)) {
+        findings.push(Finding::new(
+            REFERENCE_CLIPPY,
+            format!(
+                "no longer disallows `{route}`, a route to a thread outside an executor, which \
+                 architecture sections 8.2 and 16 ban inside the boundary"
+            ),
+        ));
+    }
+    let unpinned = banned.iter().filter(|path| {
+        THREAD_PREFIXES.iter().any(|prefix| path.starts_with(prefix))
+            && !THREAD_ROUTES.contains(path)
+            && !NOT_THREAD_ROUTES.contains(path)
+    });
+    for path in unpinned {
+        findings.push(Finding::new(
+            REFERENCE_CLIPPY,
+            format!(
+                "disallows `{path}`, which tools/xtask/src/boundary.rs lists neither in \
+                 `THREAD_ROUTES` nor in `NOT_THREAD_ROUTES`; list it in the one it belongs to"
+            ),
+        ));
+    }
 }
 
 /// Architecture section 8.3: one `clippy.toml` per boundary crate, all identical.
@@ -261,8 +429,8 @@ fn outside_world_lint_file(package: &Package, files: &Files, findings: &mut Vec<
             format!(
                 "`{}` is in [boundary_internal] `any` of {TIER_FILE}, so it compiles into every \
                  boundary crate and must carry a clippy.toml with the entries of \
-                 {REFERENCE_CLIPPY} that ban files, the environment, subprocesses and the \
-                 network",
+                 {REFERENCE_CLIPPY} that ban files, the environment, subprocesses, the \
+                 network and thread creation",
                 package.name
             ),
         ));
@@ -292,8 +460,8 @@ fn outside_world_lint_file(package: &Package, files: &Files, findings: &mut Vec<
                 &path,
                 format!(
                     "`{table}` has an entry for `{name}` that {REFERENCE_CLIPPY} does not have \
-                     as written; the two must agree on every file, environment, subprocess and \
-                     network entry"
+                     as written; the two must agree on every file, environment, subprocess, \
+                     network and thread entry"
                 ),
             ));
         }
@@ -852,14 +1020,16 @@ mod tests {
     const FORBID: &str = "//! Docs.\n#![forbid(unsafe_code)]\n";
     const MANIFEST: &str = "[package]\nname = \"x\"\n[lints]\nworkspace = true\n";
 
-    /// A lint file of the required entries that `keep` keeps: the first six are methods.
+    /// A lint file of the required entries and thread routes that `keep` keeps: the first ten
+    /// required entries and every route are methods (the check reads both tables as one).
     fn lint_file_of(keep: impl Fn(&str) -> bool) -> String {
         let mut text = String::from("disallowed-methods = [\n");
-        for path in REQUIRED_LINT_PATHS[..6].iter().filter(|path| keep(path)) {
+        let methods = REQUIRED_LINT_PATHS[..10].iter().chain(&THREAD_ROUTES);
+        for path in methods.filter(|path| keep(path)) {
             text.push_str(&format!("  {{ path = \"{path}\", reason = \"r\" }},\n"));
         }
         text.push_str("]\ndisallowed-types = [\n");
-        for path in REQUIRED_LINT_PATHS[6..].iter().filter(|path| keep(path)) {
+        for path in REQUIRED_LINT_PATHS[10..].iter().filter(|path| keep(path)) {
             text.push_str(&format!("  \"{path}\",\n"));
         }
         text.push_str("]\n");
@@ -1063,6 +1233,115 @@ mod tests {
                 "crates/core/clippy.toml: no longer disallows `std::time::Instant`, which architecture section 8.2 bans inside the boundary",
             ]
         );
+    }
+
+    #[test]
+    fn every_thread_route_stays_banned_in_the_reference_and_in_what_every_boundary_crate_compiles()
+    {
+        // A boundary crate creates no thread outside an executor (architecture sections 8.2
+        // and 16): the reference keeps every route, and a crate of `[boundary_internal] any`
+        // carries the standard library's as written there.
+        let (mut ws, mut files) = conforming();
+        let entry = |path: &str| format!("  {{ path = \"{path}\", reason = \"r\" }},\n");
+        for route in THREAD_ROUTES {
+            let unbanned = lint_file().replace(&entry(route), "");
+            assert_ne!(unbanned, lint_file(), "{route}");
+            files.insert(REFERENCE_CLIPPY, unbanned.clone());
+            files.insert("crates/math/clippy.toml", unbanned);
+            assert_eq!(
+                run(&ws, &files),
+                [format!(
+                    "crates/core/clippy.toml: no longer disallows `{route}`, a route to a thread outside an executor, which architecture sections 8.2 and 16 ban inside the boundary"
+                )]
+            );
+        }
+        files.insert(REFERENCE_CLIPPY, lint_file());
+        files.insert("crates/math/clippy.toml", lint_file());
+        ws.packages.push(package("lactose-reflect", &[("lactose-core", Normal)]));
+        files.insert("crates/reflect/README.md", "");
+        files.insert("crates/reflect/Cargo.toml", MANIFEST);
+        files.insert("crates/reflect/src/lib.rs", FORBID);
+        let std_routes: Vec<&str> =
+            THREAD_ROUTES.into_iter().filter(|route| route.starts_with("std::")).collect();
+        assert_eq!(std_routes.len(), 6);
+        for route in std_routes {
+            assert!(outside_world_file().contains(&entry(route)), "{route}");
+            files.insert(
+                "crates/reflect/clippy.toml",
+                outside_world_file().replace(&entry(route), ""),
+            );
+            assert_eq!(
+                run(&ws, &files),
+                [format!(
+                    "crates/reflect/clippy.toml: `disallowed-methods` lacks the entry for `{route}` that crates/core/clippy.toml has; copy it as written there"
+                )]
+            );
+        }
+        // The pool and executor routes are not the outside world's: an `any` crate cannot
+        // name them.
+        assert!(!outside_world_file().contains("rayon::"));
+        assert!(!outside_world_file().contains("lactose_task::"));
+    }
+
+    #[test]
+    fn the_thread_routes_are_the_real_references_thread_entries() {
+        // Every entry of the reference that says a boundary crate creates no thread, or cites
+        // section 16, is pinned by `THREAD_ROUTES`, and every route is such an entry.
+        let reference: toml::Table =
+            toml::from_str(include_str!("../../../crates/core/clippy.toml")).unwrap();
+        let found: BTreeSet<&str> = LINT_TABLES
+            .iter()
+            .flat_map(|table| reference[*table].as_array().unwrap())
+            .filter(|entry| {
+                let reason = entry["reason"].as_str().unwrap();
+                reason.contains("creates no thread")
+                    || reason.starts_with("architecture section 16: ")
+            })
+            .map(|entry| entry["path"].as_str().unwrap())
+            .collect();
+        let pinned: BTreeSet<&str> = THREAD_ROUTES.into_iter().collect();
+        assert_eq!(pinned.len(), THREAD_ROUTES.len(), "a route is listed twice");
+        assert_eq!(found, pinned);
+    }
+
+    #[test]
+    fn an_entry_under_a_thread_prefix_is_a_listed_route_or_a_listed_non_route() {
+        // Review round 2, M6: an adaptor banned with a reason that cites neither "creates no
+        // thread" nor section 16 is still a route the check must pin.
+        let (ws, mut files) = conforming();
+        let added = "rayon::iter::IndexedParallelIterator::enumerate";
+        let unpinned = lint_file().replace(
+            "disallowed-methods = [\n",
+            &format!("disallowed-methods = [\n  {{ path = \"{added}\", reason = \"r\" }},\n"),
+        );
+        files.insert(REFERENCE_CLIPPY, unpinned.clone());
+        files.insert("crates/math/clippy.toml", unpinned);
+        assert_eq!(
+            run(&ws, &files),
+            [format!(
+                "crates/core/clippy.toml: disallows `{added}`, which tools/xtask/src/boundary.rs lists neither in `THREAD_ROUTES` nor in `NOT_THREAD_ROUTES`; list it in the one it belongs to"
+            )]
+        );
+        // The non-routes are real entries of the reference, under a prefix, and no route.
+        let reference: toml::Table =
+            toml::from_str(include_str!("../../../crates/core/clippy.toml")).unwrap();
+        let banned: BTreeSet<&str> = LINT_TABLES
+            .iter()
+            .flat_map(|table| reference[*table].as_array().unwrap())
+            .map(|entry| entry["path"].as_str().unwrap())
+            .collect();
+        for path in NOT_THREAD_ROUTES {
+            assert!(banned.contains(path), "{path}");
+            assert!(THREAD_PREFIXES.iter().any(|prefix| path.starts_with(prefix)), "{path}");
+            assert!(!THREAD_ROUTES.contains(&path), "{path}");
+        }
+        for route in THREAD_ROUTES {
+            assert!(
+                THREAD_PREFIXES.iter().any(|prefix| route.starts_with(prefix))
+                    || route.starts_with("lactose_task::"),
+                "{route}"
+            );
+        }
     }
 
     #[test]
@@ -1455,7 +1734,7 @@ mod tests {
         assert_eq!(
             run(&ws, &files),
             [
-                "crates/reflect/clippy.toml: `lactose-reflect` is in [boundary_internal] `any` of crate-tiers.toml, so it compiles into every boundary crate and must carry a clippy.toml with the entries of crates/core/clippy.toml that ban files, the environment, subprocesses and the network"
+                "crates/reflect/clippy.toml: `lactose-reflect` is in [boundary_internal] `any` of crate-tiers.toml, so it compiles into every boundary crate and must carry a clippy.toml with the entries of crates/core/clippy.toml that ban files, the environment, subprocesses, the network and thread creation"
             ]
         );
         // The outside-world entries alone, or with the rest of the reference.
@@ -1487,11 +1766,11 @@ mod tests {
                     table("methods")
                 ),
                 format!(
-                    "{} has an entry for `std::env::var` that crates/core/clippy.toml does not have as written; the two must agree on every file, environment, subprocess and network entry",
+                    "{} has an entry for `std::env::var` that crates/core/clippy.toml does not have as written; the two must agree on every file, environment, subprocess, network and thread entry",
                     table("methods")
                 ),
                 format!(
-                    "{} has an entry for `std::net::UdpSocket` that crates/core/clippy.toml does not have as written; the two must agree on every file, environment, subprocess and network entry",
+                    "{} has an entry for `std::net::UdpSocket` that crates/core/clippy.toml does not have as written; the two must agree on every file, environment, subprocess, network and thread entry",
                     table("types")
                 ),
             ]
