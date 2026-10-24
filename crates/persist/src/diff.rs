@@ -624,12 +624,14 @@ impl RegionRecords {
     /// moved to another region (the cross-region pass is not in this crate yet). With no
     /// overlay only the hash changes.
     ///
-    /// The records must be at the table's schemas, as [`Loader::migrate`](crate::Loader::migrate)
-    /// leaves them: fails with `NotFound` for a type the overlay carries that the table does
-    /// not know and `VersionMismatch` for one carried at another schema or digest than the
-    /// table's, and otherwise as `Overlay::rebase` and [`diff`] fail. On failure the
-    /// records are unchanged.
+    /// The records must pass [`check`](Self::check) and be at the table's schemas, as
+    /// [`Loader::migrate`](crate::Loader::migrate) leaves them: fails as `check` fails, with
+    /// `NotFound` for a type the overlay carries that the table does not know and
+    /// `VersionMismatch` for one carried at another schema or digest than the table's, and
+    /// otherwise as `Overlay::rebase` and [`diff`] fail. On failure the records are
+    /// unchanged.
     pub fn rebase(&mut self, patched: &Baseline, schemas: &SchemaTable) -> Result<Vec<Record>> {
+        self.check()?;
         let Some(overlay) = &self.overlay else {
             self.baseline_hash = patched.content_hash();
             return Ok(Vec::new());

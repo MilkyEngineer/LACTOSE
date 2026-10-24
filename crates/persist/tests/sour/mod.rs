@@ -11,6 +11,10 @@
     clippy::wrong_self_convention,
     reason = "the runner's module as written; it is included, not owned, here"
 )]
+#[allow(
+    unfulfilled_lint_expectations,
+    reason = "the boundary lints these expectations name are not configured outside the boundary"
+)]
 mod protocol;
 
 use std::num::NonZeroU32;

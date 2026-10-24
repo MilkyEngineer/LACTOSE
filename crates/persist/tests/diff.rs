@@ -1,7 +1,8 @@
 //! The diff (README, "The diff"): every change kind gives exactly its records in canonical
 //! order, with transient bytes zeroed and scalars canonical; the digest is a function of
 //! region state alone, whatever the layout and the worker count; the empty diff is `None`
-//! and the relevance message's `Cooked`; and what the table cannot account for is refused.
+//! and the relevance message's `Cooked`; what the table cannot account for is refused; and
+//! every ownership state a history of legal writes reaches saves, and its records load.
 
 #![forbid(unsafe_code)]
 
@@ -13,9 +14,10 @@ use std::sync::Arc;
 use common::*;
 use lactose_asset_api::AssetSet;
 use lactose_bundle::{Baseline, BaselineRow, ComponentData, ComponentSchema, Record};
-use lactose_core::{ComponentKey, ErrorKind};
+use lactose_core::{ComponentKey, ErrorKind, NetId, Result, StableKey};
 use lactose_ecs::{
-    ExportedRow, OwnedBy, RegionConfig, RegionId, RegionMode, RegionRows, WorldBuilder, WorldKind,
+    ExportedRow, OwnedBy, RegionConfig, RegionId, RegionMode, RegionRows, World, WorldBuilder,
+    WorldKind,
 };
 use lactose_math::Scalar;
 use lactose_net_api::OverlayPayload;
@@ -438,4 +440,339 @@ fn a_baseline_column_in_another_schema_is_refused_as_stated() {
     let error =
         loader.bundle(&records_over(&stale), stale, RegionMode::Simulated, None).unwrap_err();
     assert_eq!(error.kind(), ErrorKind::VersionMismatch, "{error}");
+}
+
+// ---- Ownership (`crates/ecs/README.md`, Regions, "Ownership is a forest") ----
+
+/// A and B as `common` cooks them, B with an owner inside it and one in A.
+fn owner_baselines() -> BTreeMap<RegionId, Arc<Baseline>> {
+    let b = [
+        BaselineRow { id: c(B, 1), components: vec![data(pos(20, 20)), data(Age(3))] },
+        BaselineRow { id: c(B, 2), components: vec![data(pos(21, 21)), data(owned_by(c(B, 1)))] },
+        BaselineRow { id: c(B, 3), components: vec![data(pos(22, 22)), data(owned_by(c(A, 3)))] },
+    ];
+    let b = Baseline::from_rows(AssetSet::new(), cooked_schemas(), b).unwrap();
+    [(A, Arc::new(baseline_a())), (B, Arc::new(b))].into_iter().collect()
+}
+
+/// A server world of `baselines`' regions, each loaded with no overlay.
+fn server_of(baselines: &BTreeMap<RegionId, Arc<Baseline>>) -> World {
+    let mut world = bare_world();
+    for (&region, baseline) in baselines {
+        let config =
+            RegionConfig { id: region, seed: seed_of(region), mode: RegionMode::Simulated };
+        world.create_region(config).unwrap();
+        world.load_region(region, baseline, None).unwrap();
+    }
+    world
+}
+
+/// The records of `region` of `world` against its cooked baseline.
+fn save(
+    world: &World,
+    region: RegionId,
+    baselines: &BTreeMap<RegionId, Arc<Baseline>>,
+    table: &SchemaTable,
+) -> Result<RegionRecords> {
+    let export = RegionExport { region, rows: world.export_region(region)? };
+    RegionRecords::from_export(&export, &baselines[&region], table)
+}
+
+/// Loads `records` into `world` as the sync point does, through `Loader::bundle`.
+fn load(
+    world: &mut World,
+    records: &RegionRecords,
+    baselines: &BTreeMap<RegionId, Arc<Baseline>>,
+    table: &SchemaTable,
+) -> Result<()> {
+    let migrations = Migrations::new();
+    let baseline = Arc::clone(&baselines[&records.region]);
+    let bundle =
+        Loader::new(table, &migrations).bundle(records, baseline, RegionMode::Simulated, None)?;
+    let config =
+        RegionConfig { id: records.region, seed: bundle.seed, mode: RegionMode::Simulated };
+    world.create_region(config)?;
+    world.load_region(records.region, &bundle.baseline, bundle.overlay.as_deref())?;
+    for data in &bundle.resources {
+        world.insert_region_resource_erased(records.region, data.clone())?;
+    }
+    for &key in &bundle.transient_resources {
+        world.insert_region_resource_zeroed(records.region, key)?;
+    }
+    Ok(())
+}
+
+/// Panics if some live entity's chain of owners returns to it.
+fn assert_forest(world: &World, context: &str) {
+    let live: Vec<StableKey> = [A, B]
+        .into_iter()
+        .filter(|&region| world.region(region).is_some())
+        .flat_map(|region| world.entities_in(region))
+        .collect();
+    for &start in &live {
+        let mut at = start;
+        for _ in 0..=live.len() {
+            let owner = world.get::<OwnedBy>(at).and_then(|owned| owned.owner.get());
+            let Some(owner) = owner.and_then(|owner| world.origin(owner)) else { break };
+            assert_ne!(owner, start, "{context}: a cycle of owners through {start:?}");
+            at = owner;
+        }
+    }
+}
+
+fn records_for(records: &RegionRecords, id: NetId) -> Vec<Record> {
+    let all = records.overlay.iter().flat_map(|overlay| overlay.records());
+    all.filter(|record| record.id() == id).cloned().collect()
+}
+
+fn owner_of(world: &World, key: StableKey) -> Option<StableKey> {
+    world.get::<OwnedBy>(key).and_then(|owned| owned.owner.get())
+}
+
+/// Each entity of `region` and its owner, live or not.
+fn owners_in(world: &World, region: RegionId) -> BTreeMap<StableKey, Option<StableKey>> {
+    world.entities_in(region).map(|key| (key, owner_of(world, key))).collect()
+}
+
+/// `records` but their owners: what a load that breaks a cycle leaves as it was.
+fn but_owners(records: &RegionRecords) -> (Vec<Record>, u64, Vec<ComponentData>) {
+    let all = records.overlay.iter().flat_map(|overlay| overlay.records());
+    let others = all.filter(|record| !matches!(record, Record::OwnershipChange { .. }));
+    (others.cloned().collect(), records.seed, records.resources.clone())
+}
+
+#[test]
+fn a_cross_region_owner_saves_and_reloads_in_either_order() {
+    let baselines = owner_baselines();
+    let table = SchemaTable::from_registry(&registry()).unwrap();
+    let mut world = server_of(&baselines);
+    // A cooked owner that walked to B, and a runtime owner spawned there.
+    world.move_to_region(net(c(A, 2)), B).unwrap();
+    world.insert(net(c(A, 6)), owned_by(c(A, 2))).unwrap();
+    let runtime = world.allocate_net_id().unwrap();
+    world.spawn(net(runtime), B, (pos(40, 40),)).unwrap();
+    world.insert(net(c(A, 5)), owned_by(runtime)).unwrap();
+    assert_eq!(world.region_of(net(c(A, 6))), Some(A), "writing `OwnedBy` moves nothing");
+
+    let saved_a = save(&world, A, &baselines, &table).unwrap();
+    assert_eq!(records_for(&saved_a, c(A, 2)), [Record::Destroy { id: c(A, 2) }]);
+    let owner = Record::OwnershipChange { id: c(A, 6), owner: Some(c(A, 2)) };
+    assert_eq!(records_for(&saved_a, c(A, 6)), [owner]);
+    let owner = Record::OwnershipChange { id: c(A, 5), owner: Some(runtime) };
+    assert_eq!(records_for(&saved_a, c(A, 5)), [owner]);
+    let saved_b = save(&world, B, &baselines, &table).unwrap();
+
+    // The owners' region unloads; what they own stays, and saves the same.
+    world.unload_region(B).unwrap();
+    assert_eq!(save(&world, A, &baselines, &table).unwrap(), saved_a);
+
+    for order in [[&saved_a, &saved_b], [&saved_b, &saved_a]] {
+        let context = format!("order {:?}", order.map(|records| records.region));
+        let mut fresh = bare_world();
+        for records in order {
+            load(&mut fresh, records, &baselines, &table).expect(&context);
+        }
+        assert_eq!(save(&fresh, A, &baselines, &table).unwrap(), saved_a, "{context}");
+        assert_eq!(save(&fresh, B, &baselines, &table).unwrap(), saved_b, "{context}");
+        let owned: Vec<StableKey> = fresh.owned_by(net(c(A, 2))).collect();
+        assert_eq!(owned, [net(c(A, 6))], "{context}");
+        let owned: Vec<StableKey> = fresh.owned_by(net(runtime)).collect();
+        assert_eq!(owned, [net(c(A, 5))], "{context}");
+    }
+}
+
+#[test]
+fn what_the_ecs_refuses_never_reaches_the_diff() {
+    let baselines = owner_baselines();
+    let table = SchemaTable::from_registry(&registry()).unwrap();
+    let mut world = server_of(&baselines);
+    let cooked = save(&world, A, &baselines, &table).unwrap();
+
+    let error = world.insert(net(c(A, 6)), owned_by(c(A, 6))).unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::InvalidData, "{error}");
+    assert_eq!(save(&world, A, &baselines, &table).unwrap(), cooked);
+
+    world.insert(net(c(A, 6)), owned_by(c(A, 7))).unwrap();
+    let owned = save(&world, A, &baselines, &table).unwrap();
+    let error = world.insert(net(c(A, 7)), owned_by(c(A, 6))).unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::InvalidData, "{error}");
+    assert_eq!(save(&world, A, &baselines, &table).unwrap(), owned);
+    assert_forest(&world, "after the refusals");
+}
+
+/// splitmix64.
+struct Rng(u64);
+
+impl Rng {
+    fn next(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    fn below(&mut self, n: usize) -> usize {
+        (self.next() % n as u64) as usize
+    }
+
+    fn chance(&mut self, percent: u64) -> bool {
+        self.next() % 100 < percent
+    }
+}
+
+/// One seeded history of spawns, owner writes (refusals ignored), moves, despawns, unloads
+/// and reloads over A and B, checked after every step and by a restart at the end. Returns
+/// how many owner edges the reloads broke: each a row of the reloaded region left without
+/// the owner it had at the unload, that owner live in the other region and owned, through
+/// its chain, by the row, so that the edge would close a cycle; nothing else of the region
+/// may differ from the records it loaded.
+fn history(seed: u64, baselines: &BTreeMap<RegionId, Arc<Baseline>>, table: &SchemaTable) -> usize {
+    let mut rng = Rng(seed);
+    let mut world = server_of(baselines);
+    let loaded = |world: &World| -> Vec<RegionId> {
+        [A, B].into_iter().filter(|&region| world.region(region).is_some()).collect()
+    };
+    let live = |world: &World| -> Vec<StableKey> {
+        loaded(world).into_iter().flat_map(|region| world.entities_in(region)).collect()
+    };
+    // Every key the history may name as an owner: the cooked rows, two never spawned, and
+    // every entity it spawns, live or not, as a direct write may name them.
+    let mut pool: Vec<NetId> = (1..=8).map(|n| c(A, n)).chain((1..=3).map(|n| c(B, n))).collect();
+    pool.push(world.allocate_net_id().unwrap());
+    pool.push(world.allocate_net_id().unwrap());
+    let mut saved: BTreeMap<RegionId, RegionRecords> = BTreeMap::new();
+    let mut owners: BTreeMap<RegionId, BTreeMap<StableKey, Option<StableKey>>> = BTreeMap::new();
+    let mut log: Vec<String> = Vec::new();
+    let mut broken = 0;
+    for _ in 0..20 + rng.below(60) {
+        let (keys, regions) = (live(&world), loaded(&world));
+        let owner = pool[rng.below(pool.len())];
+        match rng.below(100) {
+            0..=14 if !regions.is_empty() => {
+                let region = regions[rng.below(regions.len())];
+                let id = world.allocate_net_id().unwrap();
+                pool.push(id);
+                if rng.chance(50) {
+                    log.push(format!("spawn {id:?} in {region:?} owned by {owner:?}"));
+                    let _ = world.spawn(net(id), region, (pos(1, 1), owned_by(owner)));
+                } else {
+                    log.push(format!("spawn {id:?} in {region:?}"));
+                    world.spawn(net(id), region, (pos(1, 1),)).unwrap();
+                }
+            }
+            15..=49 if !keys.is_empty() => {
+                let key = keys[rng.below(keys.len())];
+                log.push(format!("set {key:?} owned by {owner:?}"));
+                let _ = world.insert(key, owned_by(owner));
+            }
+            50..=54 if !keys.is_empty() => {
+                let key = keys[rng.below(keys.len())];
+                log.push(format!("clear the owner of {key:?}"));
+                world.remove::<OwnedBy>(key).unwrap();
+            }
+            55..=64 if !keys.is_empty() => {
+                let key = keys[rng.below(keys.len())];
+                let region = regions[rng.below(regions.len())];
+                log.push(format!("move {key:?} to {region:?}"));
+                world.move_to_region(key, region).unwrap();
+            }
+            65..=72 if !keys.is_empty() => {
+                let key = keys[rng.below(keys.len())];
+                log.push(format!("despawn {key:?}"));
+                world.despawn(key).unwrap();
+            }
+            73..=86 if !regions.is_empty() => {
+                let region = regions[rng.below(regions.len())];
+                log.push(format!("unload {region:?}"));
+                let records = save(&world, region, baselines, table)
+                    .unwrap_or_else(|error| panic!("{error}: seed {seed:#x} {log:#?}"));
+                owners.insert(region, owners_in(&world, region));
+                world.unload_region(region).unwrap();
+                saved.insert(region, records);
+            }
+            87..=99 if !saved.is_empty() => {
+                let unloaded: Vec<RegionId> = saved.keys().copied().collect();
+                let region = unloaded[rng.below(unloaded.len())];
+                log.push(format!("reload {region:?}"));
+                let records = saved.remove(&region).unwrap();
+                load(&mut world, &records, baselines, table)
+                    .unwrap_or_else(|error| panic!("{error}: seed {seed:#x} {log:#?}"));
+                let context = format!("seed {seed:#x} {log:#?}");
+                let before = owners.remove(&region).unwrap();
+                let now = owners_in(&world, region);
+                assert!(before.keys().eq(now.keys()), "{context}");
+                let mut breaks = 0;
+                for (&key, &owner) in &before {
+                    if now[&key] == owner {
+                        continue;
+                    }
+                    assert_eq!(now[&key], None, "{context}: {key:?}");
+                    let owner = owner.unwrap();
+                    let elsewhere = world.region_of(owner).is_some_and(|at| at != region);
+                    assert!(elsewhere, "{context}: {key:?} lost {owner:?}");
+                    let closes = core::iter::successors(Some(owner), |&at| owner_of(&world, at))
+                        .take(live(&world).len() + 1)
+                        .any(|at| at == key);
+                    assert!(closes, "{context}: {key:?} lost {owner:?}, which no cycle needed");
+                    breaks += 1;
+                }
+                let again = save(&world, region, baselines, table).unwrap();
+                if breaks == 0 {
+                    assert_eq!(again, records, "{context}");
+                } else {
+                    assert_eq!(but_owners(&again), but_owners(&records), "{context}");
+                }
+                broken += breaks;
+            }
+            _ => continue,
+        }
+        let context = format!("seed {seed:#x} {log:#?}");
+        assert_forest(&world, &context);
+        for region in loaded(&world) {
+            if let Err(error) = save(&world, region, baselines, table) {
+                panic!("{error}: {context}");
+            }
+        }
+    }
+
+    // A restart from the saves in either order, then a second round trip of that world's
+    // own records (saved, loaded fresh in the same order, saved), which is exact.
+    for region in loaded(&world) {
+        saved.insert(region, save(&world, region, baselines, table).unwrap());
+    }
+    for order in [[A, B], [B, A]] {
+        let context = format!("seed {seed:#x} restart {order:?} {log:#?}");
+        let mut fresh = bare_world();
+        for region in order {
+            load(&mut fresh, &saved[&region], baselines, table).expect(&context);
+        }
+        assert_forest(&fresh, &context);
+        let first = order.map(|region| save(&fresh, region, baselines, table).expect(&context));
+        let mut again = bare_world();
+        for records in &first {
+            load(&mut again, records, baselines, table).expect(&context);
+        }
+        let second = order.map(|region| save(&again, region, baselines, table).expect(&context));
+        assert_eq!(second, first, "{context}");
+    }
+    broken
+}
+
+/// What every save, unload and relevance message rests on: whatever a history of legal
+/// writes leaves, `from_export` succeeds and its records load, the world staying a forest. A
+/// cycle that two regions' documents close is broken by the load (logged at `warn`, target
+/// `casein`); the breaks are counted, here from the world's owners before the unload and
+/// after the reload rather than from the log, and the seeds are fixed so that some history
+/// reaches one.
+#[test]
+fn every_reachable_state_saves() {
+    let baselines = owner_baselines();
+    let table = SchemaTable::from_registry(&registry()).unwrap();
+    let histories = 200_u64;
+    let broken: usize = (0..histories)
+        .map(|i| history(i.wrapping_mul(0x2545_F491_4F6C_DD1D), &baselines, &table))
+        .sum();
+    println!("{histories} histories, {broken} owner edges broken by a reload");
+    assert!(broken > 0, "no history closed a cycle across the two regions");
 }

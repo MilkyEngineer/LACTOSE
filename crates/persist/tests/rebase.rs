@@ -346,3 +346,67 @@ fn records_not_at_the_tables_schemas_are_refused_unchanged() {
     assert_eq!(error.kind(), ErrorKind::VersionMismatch);
     assert_eq!(saved, before);
 }
+
+#[test]
+fn records_that_fail_check_are_refused_unchanged() {
+    let Changed { world, table, .. } = changed();
+    let mut saved = RegionRecords::from_export(&export(&world), &baseline_a(), &table).unwrap();
+    // A persistent resource without its layout digest, which `check` refuses and nothing
+    // else on the rebase's path reads.
+    assert!(saved.layouts.remove(&Weather::KEY).is_some());
+    let before = saved.clone();
+    let mut rows = rows_a();
+    rows[6].components[1] = data(Contacts(1));
+    let error = saved.rebase(&cook(rows), &table).unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::InvalidData);
+    assert_eq!(saved, before);
+}
+
+/// The records `Overlay::rebase` keeps, loaded by `World::load_region` against `patched`,
+/// exported and diffed: the state of the bundle's own path, as an oracle.
+fn via_bundle(saved: &RegionRecords, patched: &Baseline, table: &SchemaTable) -> Option<u64> {
+    let (kept, _) = saved.overlay.as_ref().unwrap().rebase(patched).unwrap();
+    let mut world = bare_world();
+    let config = RegionConfig { id: A, seed: seed_of(A), mode: RegionMode::Simulated };
+    world.create_region(config).unwrap();
+    world.load_region(A, patched, Some(&kept)).unwrap();
+    digest(&RegionRecords::from_export(&export(&world), patched, table).unwrap())
+}
+
+#[test]
+fn a_persistent_set_field_is_applied_to_the_patched_value() {
+    let Changed { world, table, .. } = changed();
+    let saved = RegionRecords::from_export(&export(&world), &baseline_a(), &table).unwrap();
+    // A `SetField` of Velocity.x beside the diff's records, as a save from another writer
+    // may hold, while the patch moves Velocity.y.
+    let one = data(Velocity { x: Scalar::ONE, y: Scalar::ZERO });
+    let set = Record::SetField {
+        id: c(A, 3),
+        component: Velocity::KEY,
+        field: FieldId(1),
+        bytes: one.bytes[..Scalar::BYTES].to_vec(),
+    };
+    let overlay = saved.overlay.as_ref().unwrap();
+    let records = overlay.records().iter().cloned().chain([set]);
+    let overlay = Overlay::new(saved.baseline_hash, table.schemas().cloned(), records).unwrap();
+    let saved = RegionRecords { overlay: Some(Arc::new(overlay)), ..saved };
+    saved.check().unwrap();
+    let mut rows = rows_a();
+    rows[2].components[3] = data(Velocity { x: Scalar::ZERO, y: Scalar::from_i32(5) });
+    let patched = cook(rows);
+
+    let (rebased, dropped) = rebase_onto(&saved, &patched, &table);
+    assert!(dropped.is_empty());
+    let velocity: Vec<Record> = of(&rebased, c(A, 3))
+        .into_iter()
+        .filter(|record| match record {
+            Record::AddComponent { data, .. } => data.component == Velocity::KEY,
+            Record::SetField { component, .. } => *component == Velocity::KEY,
+            _ => false,
+        })
+        .collect();
+    let both = data(Velocity { x: Scalar::ONE, y: Scalar::from_i32(5) });
+    assert_eq!(velocity, vec![Record::AddComponent { id: c(A, 3), data: both }]);
+    assert_eq!(digest(&rebased), via_bundle(&saved, &patched, &table));
+    assert_eq!(reloaded(&rebased, &Arc::new(patched), &table), rebased);
+}
