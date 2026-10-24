@@ -3,8 +3,7 @@
 //! layouts. Every run's report is equal: the world hashes of the first and the resumed run,
 //! the snapshot's size, and the physics bytes' hashes at the end of both runs. And the
 //! empty world's bytes: a backend emptied and restored to them steps as a new one does.
-//! And the validity run: what `physics-api`'s rules refuse, this backend refuses with
-//! their message or ignores, and what they accept, it accepts.
+//! And the validity run: `physics-api`'s validity rules, held on the rows that run lists.
 
 #![forbid(unsafe_code)]
 

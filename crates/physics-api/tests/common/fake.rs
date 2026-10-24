@@ -212,10 +212,26 @@ fn invalid(message: &'static str) -> Error {
 }
 
 /// What every `set_*` does with a value the rules refuse: logs it and ignores the call.
-/// The rules are `lactose_physics_api`'s predicates and nothing of the fake's own
-/// (`README.md`, "Validity").
+/// The rules are `lactose_physics_api`'s predicates, its step-input and query-parameter
+/// rules, and nothing of the fake's own (`README.md`, "Validity").
 fn ignored(call: &'static str, key: StableKey, invalid: Invalid) {
     tracing::debug!(target: "physics", %invalid, ?key, "ignored {call}");
+}
+
+/// Whether a query's direction and reach are ones every backend answers for
+/// (`README.md`, "Validity"): the direction finite with a positive finite length, the
+/// distance finite and zero or positive.
+fn usable_sweep(direction: Vec3, max_distance: Scalar) -> bool {
+    direction.is_finite()
+        && direction.try_normalize().is_some()
+        && max_distance.is_finite()
+        && max_distance >= Scalar::ZERO
+}
+
+/// Whether a query's probe is one every backend answers for: a shape and a pose the
+/// predicates accept.
+fn usable_probe(shape: &Shape, pose: &Transform) -> bool {
+    shape.validate().is_ok() && pose.validate().is_ok()
 }
 
 /// The radius of a sphere around the shape's centre that holds it.
@@ -392,12 +408,13 @@ impl PhysicsBackend for Fake {
             self.state.bodies.contains_key(&body_a) && self.state.bodies.contains_key(&body_b),
             "create_joint between bodies the backend does not hold"
         );
+        // The rule on keys first: it needs no value.
+        if body_a == body_b {
+            return Err(invalid("a joint between a body and itself"));
+        }
         if let Err(invalid) = joint.validate() {
             tracing::debug!(target: "physics", %invalid, ?key, "refused joint");
             return Err(invalid.into());
-        }
-        if body_a == body_b {
-            return Err(invalid("a joint between a body and itself"));
         }
         let handle = self.handle();
         self.state.joints.insert(key, JointRow { handle, kind: joint.kind, body_a, body_b });
@@ -414,6 +431,10 @@ impl PhysicsBackend for Fake {
         assert!(
             output.bodies.is_empty() && output.contacts.is_empty() && output.triggers.is_empty()
         );
+        if !input.dt.is_finite() || input.dt <= Scalar::ZERO || !input.gravity.is_finite() {
+            tracing::debug!(target: "physics", tick = input.tick.0, "skipped step: not a valid dt or gravity");
+            return;
+        }
         let dt = input.dt;
         for command in input.commands {
             if let Err(invalid) = command.validate() {
@@ -523,6 +544,9 @@ impl PhysicsBackend for Fake {
     }
 
     fn cast_ray(&self, ray: &Ray, filter: &QueryFilter) -> Option<RayHit> {
+        if !ray.origin.is_finite() || !usable_sweep(ray.direction, ray.max_distance) {
+            return None;
+        }
         let mut best: Option<RayHit> = None;
         for (&key, body) in &self.state.bodies {
             let (Some(collider), Some((centre, radius))) = (body.collider, bounds(body)) else {
@@ -554,6 +578,9 @@ impl PhysicsBackend for Fake {
         max_distance: Scalar,
         filter: &QueryFilter,
     ) -> Option<ShapeHit> {
+        if !usable_probe(shape, pose) || !usable_sweep(direction, max_distance) {
+            return None;
+        }
         let inflate = bounding_radius(shape);
         let mut best: Option<ShapeHit> = None;
         for (&key, body) in &self.state.bodies {
@@ -585,6 +612,9 @@ impl PhysicsBackend for Fake {
         filter: &QueryFilter,
         hits: &mut Vec<StableKey>,
     ) {
+        if !usable_probe(shape, pose) {
+            return;
+        }
         let reach = bounding_radius(shape);
         let mut found = Vec::new();
         for (&key, body) in &self.state.bodies {

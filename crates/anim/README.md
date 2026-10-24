@@ -510,7 +510,13 @@ never leaves loops forever.
   D135): `RigidBody::validate` and `Collider::validate` on the body, `Joint::validate` on
   the joint row `Bones::spawn` writes, and `Transform::validate` on each rest, sample and
   socket pose as a row's transform; the error names the bone, then the predicate's field
-  and rule (`` bone 1: `Shape::radius` is not positive ``). A bone row's rotation is the
+  and rule (`` bone 1: `Shape::radius` is not positive ``). The field a message names is
+  the row's, not the asset's: a pose's `translation` and `rotation` report as
+  `Transform::translation` and `Transform::rotation`, `BoneBody::body` as `RigidBody::..`,
+  `BoneBody::collider` as `Collider::..` and its shape as `Shape::..`, and a `BoneJoint`'s
+  `anchor_parent`, `anchor_bone`, `axis` and `limits` as `Joint::anchor_a`,
+  `Joint::anchor_b`, `Joint::axis` and `Joint::limit_min` and `Joint::limit_max`. A bone
+  row's rotation is the
   product of rotations each held to the unit
   tolerance on its own, whose error grows with depth, so `Bones::spawn` and
   `anim::drive_bones` normalise it as they write the row and the backend accepts its

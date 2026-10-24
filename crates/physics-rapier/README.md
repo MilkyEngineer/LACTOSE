@@ -72,14 +72,21 @@ the backend does not canonicalise.
 
 - A call with a value equal to the one recorded does nothing. Equality is bitwise on the
   canonical bits, so `0.0` and `-0.0` differ.
-- Validation is `physics-api`'s and nothing of this crate's own (`crates/physics-api/
-  README.md`, "Validity"; D135): `BodyDesc::validate` at `create_body`, `Joint::validate`
-  at `create_joint`, the value's `validate` at each `set_*`, `PhysicsCommand::validate` on
-  each command, and `Shape::validate` and `Transform::validate` on a query's probe and on
-  a restored shape. A refused value returns the `Invalid` as `InvalidData`, with its
-  message, from a creating call, is logged and ignored by a setting call, and is dropped
-  from a step; a joint between a body and itself is refused likewise; the bookkeeping is
-  unchanged either way. `conformance::validity` holds this backend to it.
+- Validation is `physics-api`'s, with no rule of this crate's own on the values it is
+  given (`crates/physics-api/README.md`, "Validity"; D135): `BodyDesc::validate` at
+  `create_body`, `Joint::validate` at `create_joint`, the value's `validate` at each
+  `set_*`, `PhysicsCommand::validate` on each command, and `Shape::validate` and
+  `Transform::validate` on a restored shape. A refused value returns the `Invalid` as
+  `InvalidData`, with its message, from a creating call, is logged and ignored by a setting
+  call, and is dropped from a step, whose other commands apply; the bookkeeping is
+  unchanged either way. It applies `physics-api`'s three rules on what those values do not
+  hold: a joint between a body and itself is refused first, before its value is read, with
+  the message `a joint between a body and itself`; a step whose `dt` is not finite and
+  above zero, or whose gravity is not finite, steps nothing; a query with a non-finite
+  origin, a direction that does not normalise, a non-finite or negative `max_distance`, or
+  a probe shape or pose its predicate refuses, answers nothing. `conformance::validity`
+  holds this backend to these rules on the rows it lists, under one and four solver
+  threads.
 - Every honoured write and command wakes the body. A kinematic body ignores velocity
   writes; a dynamic body in a frozen region keeps the velocity it was given for when it
   thaws.

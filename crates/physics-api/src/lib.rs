@@ -33,7 +33,7 @@
 //!   [`Invalid`]; a backend applies them and a crate that authors bodies calls them at
 //!   load (`README.md`, "Validity").
 //! - [`conformance`] is the run a backend passes before this surface is frozen, and
-//!   [`conformance::validity`] holds it to the rules above.
+//!   [`conformance::validity`] holds it to the rules above on the rows that run lists.
 //!
 //! ```no_run
 //! use lactose_ecs::WorldKind;

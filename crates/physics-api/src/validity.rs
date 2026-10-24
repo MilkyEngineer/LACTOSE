@@ -37,9 +37,10 @@ pub enum Rule {
     NonNegative,
     /// Strictly positive.
     Positive,
-    /// A direction: a finite vector whose computed length is positive and finite
-    /// (`Vec3::try_normalize` succeeds), so the zero vector and one whose squares underflow
-    /// or overflow are not.
+    /// A direction: a finite vector whose squared length is a normal finite number, at
+    /// least `Scalar::MIN_POSITIVE`, so that it normalises to unit length. The zero vector
+    /// is not, nor one whose squared length is subnormal (it normalises to a shorter vector
+    /// than unit, and a backend would turn about another axis) or overflows.
     Direction,
     /// Only bits of [`locked_axes::TRANSLATION`] and [`locked_axes::ROTATION`] set.
     KnownBits,
@@ -54,7 +55,7 @@ impl fmt::Display for Rule {
             Rule::Unit => "a unit quaternion",
             Rule::NonNegative => "zero or positive",
             Rule::Positive => "positive",
-            Rule::Direction => "a direction with a positive finite length",
+            Rule::Direction => "a direction with a normal finite squared length",
             Rule::KnownBits => "within the known `locked_axes` bits",
             Rule::Ordered => "at most `limit_max`",
         })
@@ -70,7 +71,9 @@ pub struct Invalid {
     /// The field as `Type::field`, with a component of a vector after a dot when the rule
     /// is on that component alone: `"Transform::rotation"`, `"Shape::half_extents.y"`,
     /// `"Joint::limit_min"`. The type is the one that holds the field, so a collider's
-    /// shape reports as `Shape::..`, and a teleport's transform as `Transform::..`.
+    /// shape reports as `Shape::..`, and a teleport's transform as `Transform::..`. A
+    /// command's other fields report with their variant, since two variants share a
+    /// field's name: `"PhysicsCommand::ApplyImpulseAt::point"`.
     pub field: &'static str,
     /// The rule it breaks.
     pub rule: Rule,
@@ -217,12 +220,13 @@ impl Collider {
 impl Joint {
     /// Whether every backend accepts the joint's value: `anchor_a`, `anchor_b`, `axis`,
     /// `limit_min` and `limit_max` finite, whether the kind reads them or not; a revolute
-    /// or prismatic joint's `axis` a direction (a fixed or spherical joint never reads it,
-    /// so a zero one is accepted there); when `limited`, `limit_min` at most `limit_max`,
-    /// equal allowed, whatever the kind. `body_a` and `body_b` are not read: a reference is
-    /// resolved by the sync, which parks a joint whose reference is empty and waits for one
-    /// whose body is not a body, and the backend refuses a joint whose two resolved ends
-    /// are one body (`README.md`, "Joints").
+    /// or prismatic joint's `axis` a direction, its squared length a normal finite number
+    /// (a fixed or spherical joint never reads it, so a zero one is accepted there); when
+    /// `limited`, `limit_min` at most `limit_max`, equal allowed, whatever the kind.
+    /// `body_a` and `body_b` are not read: a reference is resolved by the sync, which parks
+    /// a joint whose reference is empty and waits for one whose body is not a body, and the
+    /// backend refuses a joint whose two resolved ends are one body before it reads the
+    /// value (`README.md`, "Validity").
     pub fn validate(&self) -> Result<(), Invalid> {
         finite_vec("Joint::anchor_a", self.anchor_a)?;
         finite_vec("Joint::anchor_b", self.anchor_b)?;
@@ -230,7 +234,11 @@ impl Joint {
         finite("Joint::limit_min", self.limit_min)?;
         finite("Joint::limit_max", self.limit_max)?;
         let reads_axis = matches!(self.kind, JointKind::Revolute | JointKind::Prismatic);
-        if reads_axis && self.axis.try_normalize().is_none() {
+        // A subnormal squared length passes `try_normalize` but normalises to a vector
+        // shorter than unit, and the backend would build its frame about another axis.
+        let squared = self.axis.length_squared();
+        let direction = squared >= Scalar::MIN_POSITIVE && squared.is_finite();
+        if reads_axis && !direction {
             return refuse("Joint::axis", Rule::Direction);
         }
         // Both limits are finite by now, so `>` is the negation of `<=`.
@@ -263,24 +271,29 @@ impl BodyDesc<'_> {
 
 impl PhysicsCommand {
     /// Whether every backend applies the command's value: a teleport's `transform` by
-    /// [`Transform::validate`]; an impulse, point, torque or force finite, with no bound
-    /// on its size. The body it names is not read: a command for a key that is not a
-    /// body is dropped by the step, not refused by this.
+    /// [`Transform::validate`], reported as `Transform::..`; an impulse, point, torque or
+    /// force finite, with no bound on its size, reported with its variant
+    /// (`PhysicsCommand::ApplyImpulseAt::impulse`). The body it names is not read: a
+    /// command for a key that is not a body is dropped by the step, not refused by this.
     pub fn validate(&self) -> Result<(), Invalid> {
         match *self {
             PhysicsCommand::Teleport { transform, .. } => transform.validate(),
             PhysicsCommand::ApplyImpulse { impulse, .. } => {
-                finite_vec("PhysicsCommand::impulse", impulse)
+                finite_vec("PhysicsCommand::ApplyImpulse::impulse", impulse)
             }
             PhysicsCommand::ApplyImpulseAt { impulse, point, .. } => {
-                finite_vec("PhysicsCommand::impulse", impulse)?;
-                finite_vec("PhysicsCommand::point", point)
+                finite_vec("PhysicsCommand::ApplyImpulseAt::impulse", impulse)?;
+                finite_vec("PhysicsCommand::ApplyImpulseAt::point", point)
             }
-            PhysicsCommand::ApplyTorqueImpulse { torque, .. }
-            | PhysicsCommand::ApplyTorque { torque, .. } => {
-                finite_vec("PhysicsCommand::torque", torque)
+            PhysicsCommand::ApplyTorqueImpulse { torque, .. } => {
+                finite_vec("PhysicsCommand::ApplyTorqueImpulse::torque", torque)
             }
-            PhysicsCommand::ApplyForce { force, .. } => finite_vec("PhysicsCommand::force", force),
+            PhysicsCommand::ApplyTorque { torque, .. } => {
+                finite_vec("PhysicsCommand::ApplyTorque::torque", torque)
+            }
+            PhysicsCommand::ApplyForce { force, .. } => {
+                finite_vec("PhysicsCommand::ApplyForce::force", force)
+            }
         }
     }
 }
@@ -528,11 +541,20 @@ mod tests {
                 refused("Joint::axis", Rule::Direction),
                 "{kind:?}"
             );
-            // A length that underflows or overflows in the square is no direction either.
+            // A length that underflows or overflows in the square is no direction either,
+            // nor one whose square is subnormal: it would normalise short of unit.
             assert_eq!(
                 joint(kind).with_axis(v(1e-200, 0.0, 0.0)).validate(),
                 refused("Joint::axis", Rule::Direction)
             );
+            for subnormal in [1.6e-162, 1e-160, 1.4e-154] {
+                assert_eq!(
+                    joint(kind).with_axis(v(0.0, subnormal, 0.0)).validate(),
+                    refused("Joint::axis", Rule::Direction),
+                    "{subnormal:e}"
+                );
+            }
+            assert_eq!(joint(kind).with_axis(v(0.0, 1.5e-154, 0.0)).validate(), Ok(()));
             assert_eq!(
                 joint(kind).with_axis(v(1e200, 0.0, 0.0)).validate(),
                 refused("Joint::axis", Rule::Direction)
@@ -594,27 +616,27 @@ mod tests {
         assert_eq!(PhysicsCommand::ApplyImpulse { body, impulse: fine }.validate(), Ok(()));
         assert_eq!(
             PhysicsCommand::ApplyImpulse { body, impulse: nan }.validate(),
-            refused("PhysicsCommand::impulse", Rule::Finite)
+            refused("PhysicsCommand::ApplyImpulse::impulse", Rule::Finite)
         );
         assert_eq!(
             PhysicsCommand::ApplyImpulseAt { body, impulse: fine, point: nan }.validate(),
-            refused("PhysicsCommand::point", Rule::Finite)
+            refused("PhysicsCommand::ApplyImpulseAt::point", Rule::Finite)
         );
         assert_eq!(
             PhysicsCommand::ApplyImpulseAt { body, impulse: nan, point: nan }.validate(),
-            refused("PhysicsCommand::impulse", Rule::Finite)
+            refused("PhysicsCommand::ApplyImpulseAt::impulse", Rule::Finite)
         );
         assert_eq!(
             PhysicsCommand::ApplyTorqueImpulse { body, torque: nan }.validate(),
-            refused("PhysicsCommand::torque", Rule::Finite)
+            refused("PhysicsCommand::ApplyTorqueImpulse::torque", Rule::Finite)
         );
         assert_eq!(
             PhysicsCommand::ApplyTorque { body, torque: nan }.validate(),
-            refused("PhysicsCommand::torque", Rule::Finite)
+            refused("PhysicsCommand::ApplyTorque::torque", Rule::Finite)
         );
         assert_eq!(
             PhysicsCommand::ApplyForce { body, force: nan }.validate(),
-            refused("PhysicsCommand::force", Rule::Finite)
+            refused("PhysicsCommand::ApplyForce::force", Rule::Finite)
         );
         let placed = PhysicsCommand::Teleport { body, transform: Transform::at(fine) };
         assert_eq!(placed.validate(), Ok(()));
@@ -637,7 +659,7 @@ mod tests {
             (Rule::Unit, "a unit quaternion"),
             (Rule::NonNegative, "zero or positive"),
             (Rule::Positive, "positive"),
-            (Rule::Direction, "a direction with a positive finite length"),
+            (Rule::Direction, "a direction with a normal finite squared length"),
             (Rule::KnownBits, "within the known `locked_axes` bits"),
             (Rule::Ordered, "at most `limit_max`"),
         ];

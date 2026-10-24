@@ -108,17 +108,31 @@ impl StepOutput {
 ///
 /// # Validation
 ///
-/// The backend validates every value it is given by this crate's predicates and by nothing
-/// else (`README.md`, "Validity"; D135): [`BodyDesc::validate`] at `create_body`,
-/// [`Joint::validate`] at `create_joint`, the value's own `validate` at every `set_*`, and
+/// The backend validates every [`Transform`], [`Velocity`], [`RigidBody`], [`Shape`],
+/// [`Collider`], [`Joint`], [`BodyDesc`] and [`PhysicsCommand`](crate::PhysicsCommand) it
+/// is given by this crate's predicates and adds no rule of its own on them (`README.md`,
+/// "Validity"; D135): [`BodyDesc::validate`] at `create_body`, [`Joint::validate`] at
+/// `create_joint`, the value's own `validate` at every `set_*`, and
 /// [`PhysicsCommand::validate`](crate::PhysicsCommand::validate) on each command of a step.
 /// A refused value is logged at target `physics` and the call does nothing: `create_body`
 /// and `create_joint` return the [`Invalid`](crate::Invalid) as an `InvalidData` error
 /// whose message is the `Invalid`'s, and the sync retries the row when it changes; a
-/// `set_*` is ignored; a command is dropped. A joint whose two ends are one body is refused
-/// at `create_joint` with `InvalidData` likewise, a rule on the resolved keys the
-/// predicates cannot see. A backend therefore never aborts the process on a row's bytes,
-/// and [`conformance::validity`](crate::conformance::validity) holds it to exactly this.
+/// `set_*` is ignored; a command is dropped and the step goes on with the next one.
+///
+/// Three rules on what the predicates do not see, every backend applies alike:
+///
+/// - `create_joint` refuses a joint whose two ends are one key first, before it reads the
+///   value, with `InvalidData` and the message `a joint between a body and itself`.
+/// - `step` does nothing, and reports nothing, unless `dt` is finite and above zero and
+///   `gravity` is finite.
+/// - A query answers nothing (`None`, or no key appended) unless a ray's `origin` is
+///   finite, the direction normalises ([`Vec3::try_normalize`]), `max_distance` is finite
+///   and not negative, and a probe's shape and pose pass [`Shape::validate`] and
+///   [`Transform::validate`].
+///
+/// A backend therefore never aborts the process on a row's bytes.
+/// [`conformance::validity`](crate::conformance::validity) holds a backend to these rules
+/// on the rows it runs, which its documentation lists; it cannot hold one on every value.
 ///
 /// # Equal values
 ///
@@ -191,7 +205,8 @@ pub trait PhysicsBackend: Send + Sync + 'static {
     /// Applies `input.commands` in order, then advances the world by `input.dt`, and
     /// reports what moved and what touched into `output`, which arrives cleared. A command
     /// for a key it does not hold, or an impulse or force on a kinematic, fixed or frozen
-    /// body, is dropped and logged at target `physics`.
+    /// body, is dropped and logged at target `physics`. An input whose `dt` or `gravity`
+    /// the step-input rule refuses steps nothing (see "Validation" above).
     ///
     /// Called inside the step system's `block_in_place`, the one sanctioned blocking wait
     /// (architecture section 16): the solver pool may be used freely here, and the
@@ -218,7 +233,8 @@ pub trait PhysicsBackend: Send + Sync + 'static {
     fn restore(&mut self, bytes: &[u8]) -> Result<()>;
 
     /// The first hit along `ray` among the colliders `filter` admits, with the lowest
-    /// `StableKey` among hits at exactly equal distance.
+    /// `StableKey` among hits at exactly equal distance. A query the query-parameter rule
+    /// refuses answers nothing, here and in the two below (see "Validation" above).
     fn cast_ray(&self, ray: &Ray, filter: &QueryFilter) -> Option<RayHit>;
 
     /// The first hit of `shape`, placed at `pose` and swept along the unit vector
