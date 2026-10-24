@@ -180,7 +180,8 @@ impl Io {
     ///
     /// Never call it from a pool thread, which runs the wakers of the requests it
     /// completes: behind a `shutdown` already joining that thread it hangs, and alone it
-    /// joins the thread it runs on, which panics (and so aborts a binary).
+    /// joins the thread it runs on, which panics on Unix (and so aborts a binary) and hangs
+    /// on Windows.
     pub fn shutdown(self) {
         self.owner.backend.join();
     }
