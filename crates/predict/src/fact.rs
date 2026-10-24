@@ -17,7 +17,7 @@ use crate::compare::{Comparison, PredictionTolerance, compare};
 use crate::predictor::LocalPlayer;
 use crate::reconcile::Absorbed;
 use crate::ring::{EntityRecord, Slot};
-use crate::staged_region::place;
+use crate::staged_region::place_residence;
 
 /// One statement of a delta frame about an entity the server has or had claimed for the
 /// local player, recorded by the hook in the frame's order (spawns, moves, removals, rows,
@@ -429,9 +429,11 @@ fn write_fact(
             Ok(changed)
         }
         // As the hook applies a release in a predicted tick: the claim removed, the entity
-        // moved where the releasing spawn has it and its components upserted, and its
-        // placement recorded, so a replay, which never re-applies a claim change, leaves
-        // the proxy as the first run did.
+        // moved where the releasing spawn has it, its components upserted and where that
+        // left it recorded. The move holds the proxy where the server released it during
+        // the replayed ticks between this one and the tick the releasing frame was popped
+        // at, where the replay's upsert of that frame restates it (a replay never
+        // re-applies the claim change itself).
         Fact::Released { region, components, .. } => {
             if !live {
                 return Ok(false);
@@ -443,7 +445,7 @@ fn write_fact(
             }
             changed |= move_to(world, key, *region)?;
             changed |= insert(world, key, components)?;
-            place(world, key, *region)?;
+            place_residence(world, key)?;
             Ok(changed)
         }
         Fact::Moved { region, .. } => {

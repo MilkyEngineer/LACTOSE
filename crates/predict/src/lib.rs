@@ -28,8 +28,8 @@
 //!   name only components the server corrects, and an exclusive one must be one of
 //!   [`EXCLUSIVE_SYSTEMS`].
 //! - [`StagedRegion`] is the one component of this crate, registered through
-//!   [`register_types`]: where the frames last placed each proxy, which the hook's
-//!   tombstone rule reads instead of where the proxy resides.
+//!   [`register_types`]: where each proxy resided after the frames last placed it, which
+//!   the hook's tombstone rule reads beside where the proxy resides now.
 //!
 //! ```no_run
 //! use lactose_core::{NetId, PlayerId, StableKey, Tick};

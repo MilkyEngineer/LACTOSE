@@ -15,7 +15,7 @@ use lactose_sim::{StagedState, StreamingAnchor};
 
 use crate::fact::{Fact, written_components};
 use crate::predictor::LocalPlayer;
-use crate::staged_region::{place, placed};
+use crate::staged_region::{names_placement, place_residence, placed, placement_data};
 
 /// The `StagedState` hook of the prediction world, installed by
 /// [`Predictor::new`](crate::Predictor::new) as the world's `dyn StagedState` service and
@@ -30,8 +30,9 @@ use crate::staged_region::{place, placed};
 /// it ran. For each frame, oldest first, it applies what the README states under "The
 /// hook": binds, the spawns of proxies as upserts, the proxies' rows as this tick's
 /// position, moves, removals and tombstones, each proxy's
-/// [`StagedRegion`](crate::StagedRegion) written beside its spawn, upsert, move and
-/// release; a full frame whole, as a rebuild. What a delta
+/// [`StagedRegion`](crate::StagedRegion) spawned with it and rewritten after its upsert,
+/// move and release with where the entry left it; a full frame whole, as a rebuild. What a
+/// delta
 /// frame carries of an entity the server has or had claimed is a fact for the
 /// reconciliation, which it records with the tick it popped the frame at; of those it
 /// writes only a claim or a release, and only in a predicted tick. Before and after
@@ -161,7 +162,7 @@ fn claimed_by(world: &World, local: LocalPlayer, key: StableKey) -> bool {
 
 /// Writes every component of `components` to the live `key`, each only if its bytes
 /// differ, and moves it to `region` if it resides elsewhere: an upsert. The caller
-/// records the placement of a proxy ([`placed_by_frame`]); a full frame upserts claimed
+/// records where it left a proxy ([`placed_by_frame`]); a full frame upserts claimed
 /// entities too, whose region is not the frames' to record.
 fn upsert(
     world: &mut World,
@@ -182,13 +183,51 @@ fn upsert(
     }
 }
 
-/// Records `region`, the one a frame's spawn or move states for the live proxy `key`, as
-/// where the frames last placed it (`StagedRegion`), whether or not the world could move
-/// it there: it is where the server has the entity, which the tombstone rule compares
-/// against.
-fn placed_by_frame(world: &mut World, key: StableKey, region: RegionId, replaying: bool) {
-    if let Err(error) = place(world, key, region) {
+/// Records where a frame's entry left the live proxy `key` (`StagedRegion`): the entry's
+/// region when the world could move the proxy there, else the region it stayed in. The
+/// entry's region is not recorded when the world lacks it (the step's fold took the
+/// region's `Relevant` and `Irrelevant` together): the server's owed `Left` tombstone
+/// names the region the server has the entity in, so a later `Left` naming where the
+/// proxy stayed means the server moved it back there while owing one, and the proxy is
+/// that region's to settle, its unreplicated rows kept (review r1 of the proxy-region
+/// change, S1).
+fn placed_by_frame(world: &mut World, key: StableKey, replaying: bool) {
+    if let Err(error) = place_residence(world, key) {
         refused("a proxy's placement", key, &error, replaying);
+    }
+}
+
+/// Spawns the proxy `key` in `region` with `components` and its placement among them, so
+/// the row is born in its final archetype rather than moved to one after the spawn; a
+/// frame that names the placement itself, which no server does, has it rewritten after
+/// the spawn. Returns whether the key is live.
+fn spawn_proxy(
+    world: &mut World,
+    key: StableKey,
+    region: RegionId,
+    components: &[ComponentData],
+    replaying: bool,
+) -> bool {
+    let named = names_placement(components);
+    let result = if named {
+        world.spawn_erased(key, region, components)
+    } else {
+        let mut with_placement = Vec::with_capacity(components.len() + 1);
+        with_placement.extend_from_slice(components);
+        with_placement.push(placement_data(region));
+        world.spawn_erased(key, region, &with_placement)
+    };
+    match result {
+        Ok(()) => {
+            if named {
+                placed_by_frame(world, key, replaying);
+            }
+            true
+        }
+        Err(error) => {
+            refused("a proxy's spawn", key, &error, replaying);
+            false
+        }
     }
 }
 
@@ -218,8 +257,13 @@ fn apply_frame(
 fn rebuild(world: &mut World, local: LocalPlayer, frame: &StagedFrame, replaying: bool) {
     for (&net, spawn) in &frame.spawns {
         let key = spawn.key(net);
-        if world.contains(key) {
+        let live = world.contains(key);
+        if live {
             upsert(world, key, spawn.region, &spawn.components, replaying);
+        } else if spawn.slot.is_some() {
+            if !spawn_proxy(world, key, spawn.region, &spawn.components, replaying) {
+                continue;
+            }
         } else if let Err(error) = world.spawn_erased(key, spawn.region, &spawn.components) {
             refused("a spawn", key, &error, replaying);
             continue;
@@ -237,8 +281,8 @@ fn rebuild(world: &mut World, local: LocalPlayer, frame: &StagedFrame, replaying
         if let Err(error) = result {
             refused("a claim", key, &error, replaying);
         }
-        if spawn.slot.is_some() {
-            placed_by_frame(world, key, spawn.region, replaying);
+        if live && spawn.slot.is_some() {
+            placed_by_frame(world, key, replaying);
         }
     }
     for (&key, &region) in &frame.moves {
@@ -251,7 +295,7 @@ fn rebuild(world: &mut World, local: LocalPlayer, frame: &StagedFrame, replaying
             refused("a move", key, &error, replaying);
         }
         if !claimed_by(world, local, key) {
-            placed_by_frame(world, key, region, replaying);
+            placed_by_frame(world, key, replaying);
         }
     }
     for &(key, component) in &frame.removed {
@@ -305,10 +349,7 @@ fn apply_delta(
                 }
             }
             Some(_) if !world.contains(key) => {
-                match world.spawn_erased(key, spawn.region, &spawn.components) {
-                    Ok(()) => placed_by_frame(world, key, spawn.region, replaying),
-                    Err(error) => refused("a proxy's spawn", key, &error, replaying),
-                }
+                spawn_proxy(world, key, spawn.region, &spawn.components, replaying);
             }
             Some(_) if claimed_by(world, local, key) => {
                 let components = spawn.components.clone();
@@ -317,7 +358,7 @@ fn apply_delta(
                     match world.remove::<ClaimedBy>(key) {
                         Ok(_) => {
                             upsert(world, key, spawn.region, &spawn.components, replaying);
-                            placed_by_frame(world, key, spawn.region, replaying);
+                            placed_by_frame(world, key, replaying);
                         }
                         Err(error) => refused("a release", key, &error, replaying),
                     }
@@ -325,7 +366,7 @@ fn apply_delta(
             }
             Some(_) => {
                 upsert(world, key, spawn.region, &spawn.components, replaying);
-                placed_by_frame(world, key, spawn.region, replaying);
+                placed_by_frame(world, key, replaying);
             }
         }
     }
@@ -340,7 +381,7 @@ fn apply_delta(
         {
             refused("a move", key, &error, replaying);
         }
-        placed_by_frame(world, key, region, replaying);
+        placed_by_frame(world, key, replaying);
     }
     for &(key, component) in &frame.removed {
         let claimed = claimed_by(world, local, key);
@@ -404,14 +445,14 @@ fn apply_delta(
 
 /// Whether a tombstone of the live `key` is its region's to settle, and skipped: a `Left`
 /// tombstone of an entity residing in the region it names (so the world has that region
-/// loaded, and its unload takes the entity), which is also where the frames last placed
-/// it (`StagedRegion`; where it resides, for an entity no frame has placed), so the
-/// server has the entity there. The region's unload is still to come, or the server names
-/// the region and the entity enters again whole; a later move or destruction comes as
-/// another tombstone of the key (`crates/net-api/README.md`, "The staged frame"). A proxy
-/// a prediction system moved into the region the tombstone names is not settled by it:
-/// the server has the entity elsewhere, the tombstone is the last the server sends of it
-/// once acknowledged, and keeping it would leave a ghost until the region unloads (D121's
+/// loaded, and its unload takes the entity), which is also where the frames last left it
+/// (`StagedRegion`; where it resides, for an entity no frame has placed), so the server
+/// has the entity there. The region's unload is still to come, or the server names the
+/// region and the entity enters again whole; a later move or destruction comes as another
+/// tombstone of the key (`crates/net-api/README.md`, "The staged frame"). A proxy a
+/// prediction system moved into the region the tombstone names is not settled by it: the
+/// server has the entity elsewhere, the tombstone is the last the server sends of it once
+/// acknowledged, and keeping it would leave a ghost until the region unloads (D121's
 /// addendum, review r2 of `lactose-net-host`, N1, closed here).
 fn settled_by_its_region(world: &World, key: StableKey, tombstone: &Tombstone) -> bool {
     tombstone.cause == TombstoneCause::Left
