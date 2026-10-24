@@ -12,7 +12,8 @@ pub mod fake;
 use std::num::NonZeroU64;
 use std::sync::{Arc, Mutex};
 
-use lactose_bundle::ComponentData;
+use lactose_asset_api::AssetSet;
+use lactose_bundle::{Baseline, BaselineRow, ComponentData, ComponentSchema, FieldLayout};
 use lactose_core::{Error, NetId, PlayerId, Result, StableKey, Tick};
 use lactose_ecs::{
     Changed, ClaimedBy, Commands, Executor, LayoutConfig, Mut, PresentEvent, PresentEvents,
@@ -30,7 +31,9 @@ use lactose_predict::{
     check_prediction_reads,
 };
 use lactose_reflect::{Reflect, component};
-use lactose_sim::{Pass, Registration, Simulation, SimulationBuilder, Stage, TickInput, TypeTable};
+use lactose_sim::{
+    Pass, RegionBundle, Registration, Simulation, SimulationBuilder, Stage, TickInput, TypeTable,
+};
 
 use fake::Fake;
 
@@ -108,6 +111,16 @@ fn throw(cmd: Commands, input: &PlayerInput) {
     }
 }
 
+/// Kicks the ball, key 5, into [`OTHER_REGION`] on the press edge of `Interact`: a game
+/// system that moves a proxy in the prediction world, which the frames never confirm.
+/// Journaled by the sample, so a rollback replays it.
+#[system(name = "test::kick", worlds = [server, prediction])]
+fn kick(cmd: Commands, input: &PlayerInput) {
+    if input.pressed.contains(Action::Interact) {
+        cmd.move_to_region(key(5), OTHER_REGION);
+    }
+}
+
 #[system(name = "test::trail", worlds = [server, prediction])]
 fn trail(_changed: Changed<Position>, position: &Position, trail: Mut<Trail>) {
     trail.x = position.x;
@@ -137,6 +150,7 @@ pub fn register_types(types: &mut TypeTable) -> Result<()> {
     types.register::<Diary>()?;
     lactose_input::register_types(types)?;
     lactose_net_api::register_types(types)?;
+    lactose_predict::register_types(types)?;
     lactose_physics_api::register_types(types)
 }
 
@@ -147,7 +161,7 @@ pub fn types() -> TypeTable {
 }
 
 pub fn register_game(registration: &mut Registration) {
-    registration.stage(Stage::Simulation).add(&WALK).add(&THROW);
+    registration.stage(Stage::Simulation).add(&WALK).add(&THROW).add(&KICK);
     registration.stage(Stage::Post).add(&TRAIL).add(&CHIRP);
     registration.pass(Pass::Extract).add(&EXTRACT);
 }
@@ -159,6 +173,8 @@ pub const REGION: RegionId = RegionId(1);
 pub const OTHER_REGION: RegionId = RegionId(2);
 /// A region no prediction world here loads.
 pub const UNLOADED: RegionId = RegionId(9);
+/// A region a test loads by bundle ([`step_regions`]), with one cooked row.
+pub const COOKED: RegionId = RegionId(7);
 
 pub fn net(n: u64) -> NetId {
     NetId::runtime(NonZeroU64::new(n).expect("non-zero")).expect("a runtime counter")
@@ -181,6 +197,12 @@ pub fn cart() -> StableKey {
 /// An entity the local player has not claimed: a proxy.
 pub fn proxy() -> StableKey {
     key(3)
+}
+
+/// The cooked row [`COOKED`]'s bundle places: a proxy no frame has placed until the server
+/// names the region.
+pub fn cooked_key() -> StableKey {
+    StableKey::Net(NetId::cooked(77))
 }
 
 pub fn local() -> LocalPlayer {
@@ -207,6 +229,17 @@ pub fn moving(x: i16) -> PlayerInput {
 pub fn throwing() -> PlayerInput {
     let throw = Actions::EMPTY.with(Action::Throw);
     PlayerInput { held: throw, pressed: throw, ..PlayerInput::IDLE }
+}
+
+/// Standing, with `action` pressed on this sample.
+pub fn press(action: Action) -> PlayerInput {
+    let pressed = Actions::EMPTY.with(action);
+    PlayerInput { held: pressed, pressed, ..PlayerInput::IDLE }
+}
+
+/// Standing, with `Interact` pressed: the kick of key 5 into [`OTHER_REGION`].
+pub fn kicking() -> PlayerInput {
+    press(Action::Interact)
 }
 
 /// Moving by `x` with `Jump` held, and pressed on this sample if `pressed`.
@@ -265,6 +298,62 @@ pub fn exact<T: Reflect>(frame: &mut StagedFrame, key: StableKey, value: &T) {
 /// Stages a dequantised row of `value` for `key` at the frame's tick.
 pub fn dequantised<T: Reflect>(frame: &mut StagedFrame, key: StableKey, value: &T) {
     assert!(frame.push_row(key, T::KEY, frame.tick, false, bytes(value)));
+}
+
+// ---- Region bundles ----
+
+/// The bundle schemas of every component `world` registers.
+pub fn schemas(world: &World) -> Vec<ComponentSchema> {
+    world
+        .registry()
+        .iter()
+        .map(|info| {
+            let fields = info.layout().fields().iter().filter_map(|field| {
+                Some(FieldLayout {
+                    id: field.id()?,
+                    offset: u32::try_from(field.offset()).expect("a small offset"),
+                    size: u32::try_from(field.size()).expect("a small size"),
+                })
+            });
+            let size = u32::try_from(info.layout().size()).expect("a small component");
+            ComponentSchema::new(info.key(), info.version(), size, fields).expect("a schema")
+        })
+        .collect()
+}
+
+/// A region bundle with one cooked row, [`cooked_key`], at (7, 7) with health 7 and a
+/// `Diary` the stream never sends.
+pub fn cooked_bundle(world: &World) -> RegionBundle {
+    let row = BaselineRow {
+        id: NetId::cooked(77),
+        components: vec![data(at(7, 7)), data(Health(7)), data(Diary(42))],
+    };
+    let baseline = Baseline::from_rows(AssetSet::new(), schemas(world), [row]);
+    RegionBundle {
+        seed: 77,
+        mode: RegionMode::Simulated,
+        baseline: Arc::new(baseline.expect("a baseline of one row")),
+        overlay: None,
+        resources: Vec::new(),
+        transient_resources: Vec::new(),
+        assets: None,
+    }
+}
+
+/// One predicted tick with `input`, unloading `unload` and loading `load` with
+/// [`cooked_bundle`] in it, as `app`'s fold of the frames' region changes does.
+pub fn step_regions(rig: &mut Rig, input: PlayerInput, unload: &[RegionId], load: &[RegionId]) {
+    let next = Tick(rig.tick().0 + 1);
+    let mut tick_input = TickInput::default();
+    tick_input.inputs.insert(PLAYER, input.to_player_sample(next));
+    for &region in unload {
+        tick_input.unloaded.insert(region);
+    }
+    for &region in load {
+        let bundle = cooked_bundle(rig.world());
+        tick_input.loaded.insert(region, bundle);
+    }
+    rig.try_step_with(tick_input).expect("the step");
 }
 
 // ---- The prediction world ----

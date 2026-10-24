@@ -2320,10 +2320,11 @@ rationale the author supplied during the editorial pass rather than one taken fr
     named again moves nothing, and a resync starts the interest over; a destruction replaces it
     with a `Destroyed` tombstone. The model packer asserts the invariant every tick. The hook,
     in the replicated and the prediction world, skips a `Left` tombstone of an entity residing
-    in the region the tombstone names, which settles the entity: that region's unload is still
-    to come, or the packer names the region and the entity enters again. Without the skip, a
-    tombstone applied after the client loaded the region again despawned the entity the load
-    placed, and the re-entry spawn restored only its replicated components, so the cooked
+    in the region the tombstone names (in the prediction world, one the frames also placed
+    there: D122's addendum of 2026-10-18), which settles the entity: that region's unload is
+    still to come, or the packer names the region and the entity enters again. Without the
+    skip, a tombstone applied after the client loaded the region again despawned the entity the
+    load placed, and the re-entry spawn restored only its replicated components, so the cooked
     unreplicated rows were lost until a full frame. The receiver keeps the key of each handle a
     staged `Left` tombstone released, until a spawn reuses the handle's slot or a full frame
     clears the mirror, and stages a later tombstone under that handle other than the one it
@@ -2376,16 +2377,17 @@ rationale the author supplied during the editorial pass rather than one taken fr
     full frame. That includes a load whose state predates a tombstone the client staged first,
     since a datagram stamped later can overtake the region changes on the reliable channel. In
     the prediction world, a proxy a prediction system moved into a region the packer has not
-    named is kept by the hook for a `Left` tombstone naming that region, and stays there once
-    the server has seen the tombstone acknowledged (the replicated world, which runs no
-    systems, despawns it); the hook sees neither the replicated world nor where the server last
-    placed a proxy, so closing this needs a wider change, such as the hook recording the region
-    the frames last placed each proxy in, inside the world so that a rollback restores it
-    (review r2, N1, prediction world). A tombstone that names the key while the entity's whole
-    send is unacknowledged would close the case of a record whose handle the client lacks; the
-    rest needs the packer to know what a region's load places. A load naming a key still live
-    elsewhere on the client is refused. Rotations do not round-trip exactly; the rates are
-    measurements (verification row 91), and nothing relies on a value being stable.
+    named was kept by the hook for a `Left` tombstone naming that region; closed by D122's
+    addendum of 2026-10-18 (`StagedRegion`, the region each proxy resided in after the frames
+    last placed it, restored by every rollback), which leaves only a region load's rows, before
+    the packer names the region again, settled by where they reside, so one a prediction system
+    moved into the region a later `Left` tombstone names is kept (`lactose-predict`'s accepted
+    residual) (review r2, N1, prediction world). A tombstone that names the key while the
+    entity's whole send is unacknowledged would close the case of a record whose handle the
+    client lacks; the rest needs the packer to know what a region's load places. A load naming
+    a key still live elsewhere on the client is refused. Rotations do not round-trip exactly;
+    the rates are measurements (verification row 91), and nothing relies on a value being
+    stable.
 - Driven by: milestone 1, the `net-api` facade brief and its two design reviews (2026-10-10).
 
 **D122. The `predict` facade: what sections 5.1, 7, 9.2, 9.4, 10, 11 and 22 left open** (§5.1, §5.3,
@@ -2676,6 +2678,67 @@ rationale the author supplied during the editorial pass rather than one taken fr
     | 10,000 | 3.06 MB, 333–380 µs | 2.92 MB, 707–723 µs | 1.6–1.8 ms | 1.8–1.9 ms |
 
     The record is 14.4 kB in each case. A re-simulated tick costs about a predicted tick.
+- Addendum (lane predict-proxy-region, 2026-10-18; fix rounds 1 and 2, 2026-10-24): *Where the
+  frames left each proxy is a column.* The hook kept a proxy a prediction system had moved,
+  through `Commands::move_to_region`, into a region the server could not name, for the `Left`
+  tombstone naming that region, because its rule read where the proxy resides (D121's
+  implementation addendum, review r2 of `lactose-net-host`, N1, prediction world). Of the
+  options, (a) is taken: `StagedRegion`, a `derived` component of `lactose-predict` whose
+  `region` is private and read through `StagedRegion::region`, registered through
+  `lactose_predict::register_types` and required by `Predictor::new` (`NotFound` otherwise),
+  records the region each proxy resided in after the staged frames last placed it. The hook
+  writes it, in a predicted tick and a replay alike: a proxy is spawned with it among its
+  components (the spawn's region, so the row is born in its final archetype), and it is
+  rewritten after an upsert, a frame's move and a release with where the entry left the proxy,
+  `World::region_of` after the attempt: the entry's region, or the region the proxy stayed in
+  when the world lacks the entry's (the step's fold took that region's `Relevant` and
+  `Irrelevant` together). The region it stayed in, not the entry's: the `Left` tombstone the
+  server owes for the leave names the region the server has the entity in, so a later `Left`
+  naming where the proxy stayed means the server moved the entity back there while owing one,
+  and the proxy is that region's to settle, its unreplicated rows kept; recording the entry's
+  region despawned such a proxy where the server has it and lost a cooked row's unreplicated
+  components to the re-entry spawn (review r1 of this change, S1). A correction of a release
+  rewrites it the same way, and also moves the entity where the releasing spawn has it, as the
+  hook's predicted-tick release did: the move holds the entity where the server released it
+  through the re-simulated ticks before the releasing frame is re-popped, so a region change
+  replayed between takes it along, and that frame's upsert restates it there, since a replay
+  never re-applies the claim change itself. It is never written to a claimed entity, whose
+  region is predicted by its own kernels and reconciled by facts. The tombstone rule skips a
+  `Left` tombstone only when the entity resides in the region it names and resided there after
+  the frames last placed it; a proxy a prediction system moved into that region is despawned,
+  as the replicated world despawns its copy. A proxy no frame has placed (a region load's row
+  until the server names the region) has no `StagedRegion` and is settled by where it resides,
+  as before. Cost: eight bytes per proxy per slot in `SlotBytes::world`; per frame, one read
+  and a write when it differs per proxy upsert, move and release, one read per `Left` tombstone
+  of a live proxy, and nothing per rollback, since the column rides in the snapshot; measured
+  with the review's probe (4,000 proxies in one frame, release profile, medians of seven runs,
+  load averages 2 to 18), the spawn step 2.3 ms before the change and 2.9 ms spawned with the
+  placement (7.3 ms when it was inserted after the spawn), the upsert step 2.1 to 2.5 ms, a
+  move of every proxy into another region 1.4 to 2.2 ms, a `Left` of every proxy skipped 0.82
+  to 1.0 ms and despawning 1.5 to 1.6 ms. D126 is unchanged: the record is a row, and the
+  hook's service resource holds nothing new. Section 9.4's comparison is unchanged: a derived
+  component is not in the record. Rules out refusing a prediction-world move of an unclaimed
+  entity at command apply (the ECS's, a dropped command the game could not see, and a game may
+  move a proxy the server will confirm a round trip later), reverting a prediction system's
+  move from the structural log (hook-local, and a restore clears the log, so a replay would
+  differ from the first run), and stamping a region load's rows at their load (an archetype
+  change per loaded row once per load, for the one case left open: a row a region's reload
+  placed while its earlier `Left` tombstone is still owed, the region named again before the
+  server sees that tombstone acknowledged, within about a round trip of the leave and longer
+  when a packet carrying it is lost, moved by a prediction system into a region the server then
+  moves the entity into and cannot name, within that window; a kick the local player's input
+  drives, the shipped kind, cannot reach it without a lost packet; with one, or with a move the
+  server makes of its own within the window, it can). No architecture amendment. Held by
+  `tests/hook.rs` (a `[server, prediction]` kernel's kick on an input edge, the kicked proxy
+  despawned by the `Left` naming the region while a frame-placed one is kept, hash for hash
+  after a rollback through it; the fallback; a frame's move the world refused leaving a cooked
+  row placed where it stayed, kept with its `Diary` by the `Left` naming that region through
+  the re-entry spawn, and a proxy a prediction system kicked before the refused move placed in
+  the kicked-into region and kept by the `Left` naming it (review r2 of this change, m1: the
+  rule "place only on a successful move" fails it); the placement through spawn, move, upsert
+  and release and its correction; the release's correction holding the released entity where
+  the server released it through a re-simulated unload of that region, hash for hash with a run
+  that had the release in time) and `tests/check.rs` (the registry refusal).
 
 **D123. A third-party crate is built from a patched copy only under `vendor/`, by one rule
 for every crate, checked by `cargo xtask vendor`** (§8.2, §8.3, §9.1, §16, §20,

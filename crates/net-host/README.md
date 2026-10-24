@@ -361,15 +361,18 @@ reshape.
   the region, in flight, or lost) stays on the client, if the server destroys it or moves it
   to a region the client does not hold, until the region unloads or a full frame. That
   includes a load whose state predates a tombstone the client staged first: region changes
-  travel on the reliable channel, and a datagram stamped later can overtake them. So does,
-  in the prediction world, a proxy a prediction system moved into a region the packer has
-  not named, kept by the hook for a `Left` tombstone naming that region, once the server has
-  seen the tombstone acknowledged (the replicated world, which runs no systems, despawns
-  it). A load naming a key still live elsewhere on the client is refused. A tombstone that
-  names the key while the entity's whole send is unacknowledged would close the case of a
-  record whose handle the client lacks; the rest needs the packer to know what a region's
-  load places, or the prediction world's hook to know where the replicated world holds the
-  entity, and the model holds neither.
+  travel on the reliable channel, and a datagram stamped later can overtake them. A proxy a
+  prediction system moved into a region the packer has not named is despawned by the `Left`
+  tombstone naming that region, as the replicated world's copy is, since `lactose-predict`'s
+  hook compares the tombstone's region with where the proxy resided after the frames last
+  placed it (`StagedRegion`, D122's addendum) as well as where it resides; a row a region's
+  load placed, before the packer names the region again, is still settled by where it
+  resides, so one a prediction system moved into the region a later `Left` tombstone names
+  is kept (`lactose-predict`'s accepted residual). A load naming a key still live elsewhere
+  on the client is refused. A tombstone that names the key while the entity's whole send is
+  unacknowledged would close the case of a record whose handle the client lacks; the rest
+  needs the packer to know what a region's load places, or the prediction world's hook to
+  stamp the rows a load places, and the model holds neither.
 - What this costs, accepted: a spawn or a move into a region that the step popping it folds
   into no load (its `Relevant` and `Irrelevant` together, or a full frame's unload) is
   refused with `NotFound` and skipped by the hook, which happens under region toggling and

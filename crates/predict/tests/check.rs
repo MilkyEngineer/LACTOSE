@@ -7,9 +7,11 @@ mod common;
 use common::*;
 use lactose_core::{ErrorKind, SystemKey};
 use lactose_ecs::{Mut, SystemDescriptor, SystemSet, World, WorldKind, finalize, system};
-use lactose_input::PlayerInput;
+use lactose_input::{PlayerInput, PlayerInputApplier};
 use lactose_math::IntSum;
-use lactose_predict::{EXCLUSIVE_SYSTEMS, check_prediction_reads, prediction_may_name};
+use lactose_predict::{
+    DEFAULT_DEPTH, EXCLUSIVE_SYSTEMS, Predictor, check_prediction_reads, prediction_may_name,
+};
 use lactose_reflect::Reflect;
 use lactose_sim::{SimulationBuilder, Stage, TypeTable};
 
@@ -119,6 +121,29 @@ fn a_component_the_registry_lacks_is_refused() {
     let error = check_prediction_reads(empty.registry(), &[&FOLLOW]).unwrap_err();
     assert_eq!(error.kind(), ErrorKind::InvalidData);
     assert!(error.to_string().contains("check::follow"));
+}
+
+/// `Predictor::new` requires the registry to hold `StagedRegion`, which the hook writes on
+/// every proxy a frame places: a prediction world built without
+/// `lactose_predict::register_types` is refused, naming the function.
+#[test]
+fn a_registry_without_the_placement_is_refused_by_the_predictor() {
+    let mut types = TypeTable::new();
+    lactose_input::register_types(&mut types).unwrap();
+    lactose_net_api::register_types(&mut types).unwrap();
+    let simulation = SimulationBuilder::new(WorldKind::Prediction, types)
+        .tick(START)
+        .setup(lactose_net_api::setup)
+        .systems(lactose_input::register_systems)
+        .systems(lactose_net_api::register_systems)
+        .inputs(Box::new(PlayerInputApplier::new()))
+        .build()
+        .unwrap();
+    let Err(error) = Predictor::new(simulation, local(), DEFAULT_DEPTH) else {
+        panic!("a predictor built over a registry without `StagedRegion`")
+    };
+    assert_eq!(error.kind(), ErrorKind::NotFound);
+    assert!(error.to_string().contains("lactose_predict::register_types"), "{error}");
 }
 
 #[test]

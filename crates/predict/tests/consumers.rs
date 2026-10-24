@@ -57,11 +57,14 @@ fn write_diary(diary: Mut<Diary>) {
 #[system(name = "sketch::sweep", worlds = [server, prediction], exclusive)]
 fn sweep(world: &mut World) {}
 
+/// Every crate's types, this crate's `StagedRegion` among them: `Predictor::new` refuses
+/// a prediction world whose registry lacks it.
 pub fn register_types(types: &mut TypeTable) -> Result<()> {
     types.register::<Health>()?;
     types.register::<Diary>()?;
     lactose_input::register_types(types)?;
     lactose_net_api::register_types(types)?;
+    lactose_predict::register_types(types)?;
     lactose_physics_api::register_types(types)
 }
 

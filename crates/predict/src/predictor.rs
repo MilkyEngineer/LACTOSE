@@ -17,7 +17,7 @@ use lactose_core::{ComponentKey, Error, ErrorKind, PlayerId, Result, StableKey, 
 use lactose_ecs::{Executor, RegionId, World, WorldKind};
 use lactose_net_api::StagedInbox;
 use lactose_physics_api::Physics;
-use lactose_reflect::TypeInfo;
+use lactose_reflect::{Reflect, TypeInfo};
 use lactose_sim::{RunError, Simulation, StagedState, TickInput};
 
 use crate::compare::PredictionTolerance;
@@ -25,6 +25,7 @@ use crate::fact::{Resolved, recorded};
 use crate::hook::{PredictionHook, PredictionRecord, record};
 use crate::reconcile::{PredictionStats, Reconciled};
 use crate::ring::{Ring, Slot};
+use crate::staged_region::StagedRegion;
 
 mod rollback;
 
@@ -193,7 +194,9 @@ pub(crate) const fn prev(tick: Tick) -> Tick {
 impl Predictor {
     /// Takes ownership of `simulation`, which must be a `WorldKind::Prediction` world
     /// between runs (`InvalidData` otherwise) holding a `lactose_net_api::StagedInbox`
-    /// (`NotFound` otherwise); on either refusal the simulation is dropped with the error,
+    /// and a registry with [`StagedRegion`](crate::StagedRegion) in it, which
+    /// [`register_types`](crate::register_types) registers (`NotFound` otherwise); on any
+    /// refusal the simulation is dropped with the error,
     /// as a wrong build would be. Replaces whatever `dyn StagedState` service the world
     /// holds with a [`PredictionHook`](crate::PredictionHook), inserts the record the
     /// hook fills beside it, which holds `local` (the one copy), takes the ring's first
@@ -216,6 +219,13 @@ impl Predictor {
             return Err(Error::new(
                 ErrorKind::NotFound,
                 "the prediction world holds no `StagedInbox`: `lactose_net_api::setup` inserts it",
+            ));
+        }
+        if world.registry().get(StagedRegion::KEY).is_none() {
+            return Err(Error::new(
+                ErrorKind::NotFound,
+                "the prediction world's registry lacks `StagedRegion`: \
+                 `lactose_predict::register_types` registers it",
             ));
         }
         install(world, local);

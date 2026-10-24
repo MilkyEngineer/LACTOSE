@@ -17,6 +17,7 @@ use crate::compare::{Comparison, PredictionTolerance, compare};
 use crate::predictor::LocalPlayer;
 use crate::reconcile::Absorbed;
 use crate::ring::{EntityRecord, Slot};
+use crate::staged_region::place_residence;
 
 /// One statement of a delta frame about an entity the server has or had claimed for the
 /// local player, recorded by the hook in the frame's order (spawns, moves, removals, rows,
@@ -27,9 +28,10 @@ pub(crate) enum Fact {
     /// A spawn with no interpolation slot: the entity exists, claimed, in `region`, and its
     /// recorded components are exactly these, with these exact bytes.
     Claimed { key: StableKey, region: RegionId, components: Vec<ComponentData> },
-    /// A spawn with a slot of an entity the prediction world had claimed: released, with
-    /// these dequantised components.
-    Released { key: StableKey, components: Vec<ComponentData> },
+    /// A spawn with a slot of an entity the prediction world had claimed: released, in
+    /// `region` (the server's, which the proxy's `StagedRegion` takes), with these
+    /// dequantised components.
+    Released { key: StableKey, region: RegionId, components: Vec<ComponentData> },
     /// The entity resides in `region`.
     Moved { key: StableKey, region: RegionId, claimed: bool },
     /// The entity lacks `component`.
@@ -426,7 +428,13 @@ fn write_fact(
             changed |= strip(world, key, recorded, components)?;
             Ok(changed)
         }
-        Fact::Released { components, .. } => {
+        // As the hook applies a release in a predicted tick: the claim removed, the entity
+        // moved where the releasing spawn has it, its components upserted and where that
+        // left it recorded. The move holds the proxy where the server released it during
+        // the replayed ticks between this one and the tick the releasing frame was popped
+        // at, where the replay's upsert of that frame restates it (a replay never
+        // re-applies the claim change itself).
+        Fact::Released { region, components, .. } => {
             if !live {
                 return Ok(false);
             }
@@ -435,7 +443,9 @@ fn write_fact(
                 world.remove::<ClaimedBy>(key)?;
                 changed = true;
             }
+            changed |= move_to(world, key, *region)?;
             changed |= insert(world, key, components)?;
+            place_residence(world, key)?;
             Ok(changed)
         }
         Fact::Moved { region, .. } => {
