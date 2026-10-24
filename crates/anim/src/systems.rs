@@ -19,6 +19,7 @@ use lactose_sim::{Registration, Stage, TypeTable};
 use crate::assets::{Clip, Condition, MAX_SIM_BONES, Skeleton, State, StateMachine, Transition};
 use crate::components::{
     AnimParams, AnimRig, AnimState, BoneIndex, BoneLink, Bones, Outgoing, RootMotion, SimPose,
+    row_transform,
 };
 use crate::event::{AnimEvent, BoneMoved};
 use crate::phase::Phase;
@@ -508,14 +509,14 @@ pub(crate) fn fit_ragdoll(
 
 /// An animated character's bone rows swept to its pose: for every bone with a row,
 /// `Commands::set` of the bone's `Transform` at `SimPose::world` of the character's stepped
-/// root, which the next tick's physics sync sweeps the kinematic body to during its step.
-/// Does nothing for a limp character, whose bodies move themselves, nor for a bone the
-/// pose lacks (an empty pose, the rig's assets missing). The write of
-/// `Transform` is deliberately not declared: the commands apply at the stage's closing sync
-/// point, after every `Stage::Post` system has run, so no reader in the stage can see them
-/// and a declaration would only order every `Transform` reader of the stage against this
-/// set for nothing (and falsify physics-api's "every other `Stage::Post` system reads the
-/// stepped rows after the write-back with no edge").
+/// root, its rotation normalised, which the next tick's physics sync sweeps the kinematic
+/// body to during its step. Does nothing for a limp character, whose bodies move
+/// themselves, nor for a bone the pose lacks (an empty pose, the rig's assets missing).
+/// The write of `Transform` is deliberately not declared: the commands apply at the stage's
+/// closing sync point, after every `Stage::Post` system has run, so no reader in the stage
+/// can see them and a declaration would only order every `Transform` reader of the stage
+/// against this set for nothing (and falsify physics-api's "every other `Stage::Post`
+/// system reads the stepped rows after the write-back with no edge").
 #[system(name = "anim::drive_bones", worlds = [server], in_set = sets::BONES)]
 pub(crate) fn drive_bones(cmd: Commands, bones: &Bones, pose: &SimPose, root: &Transform) {
     if bones.is_limp() {
@@ -525,7 +526,7 @@ pub(crate) fn drive_bones(cmd: Commands, bones: &Bones, pose: &SimPose, root: &T
         // Below `MAX_SIM_BONES`, so the index is a `BoneIndex`.
         let bone = bone as BoneIndex;
         if let (Some(row), Some(transform)) = (bones.key(bone), pose.world(root, bone)) {
-            cmd.set(row, transform);
+            cmd.set(row, row_transform(transform));
         }
     }
 }

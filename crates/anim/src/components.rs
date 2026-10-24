@@ -716,12 +716,12 @@ impl Bones {
     /// Records, on `cmd`, the spawn of `owner`'s bone rows from `skeleton`, placed by `root`
     /// at `pose` (the character's current [`SimPose`], or its rest pose), and the write of
     /// this component onto `owner` naming them. For every bone with a [`BoneBody`]: a row
-    /// with `Transform` (the bone's world pose), the body's `RigidBody` made
-    /// [`kinematic`](lactose_physics_api::RigidBody::kinematic), its `Collider`, `OwnedBy`
-    /// the owner and a [`BoneLink`] back to it (the physics write-back adds a `Velocity`
-    /// at the first step that sweeps it); and for every such bone with a
-    /// [`BoneJoint`](crate::BoneJoint) whose parent chain reaches a bone with a body, a
-    /// `Joint` row to that body, owned by the bone row. Called only from a system that
+    /// with `Transform` (the bone's world pose, its rotation normalised), the body's
+    /// `RigidBody` made [`kinematic`](lactose_physics_api::RigidBody::kinematic), its
+    /// `Collider`, `OwnedBy` the owner and a [`BoneLink`] back to it (the physics
+    /// write-back adds a `Velocity` at the first step that sweeps it); and for every such
+    /// bone with a [`BoneJoint`](crate::BoneJoint) whose parent chain reaches a bone with
+    /// a body, a `Joint` row to that body, owned by the bone row. Called only from a system that
     /// declares `worlds = [server]`: the spawns are then not predicted, each row's origin
     /// key is a runtime `NetId` and no claim passes on, so `lactose-predict`'s destruction
     /// of an unechoed predicted spawn never applies to them, and the prediction world has
@@ -774,7 +774,7 @@ impl Bones {
         for (index, bone) in skeleton.bones.iter().enumerate() {
             let Some(body) = &bone.body else { continue };
             // Below `MAX_SIM_BONES`, so the index is a `BoneIndex`.
-            let transform = pose.bones[index].in_world(root);
+            let transform = row_transform(pose.bones[index].in_world(root));
             let mut rigid = body.body;
             rigid.body_type = BodyType::Kinematic;
             let link = BoneLink::new(owner, index as BoneIndex);
@@ -854,6 +854,24 @@ impl Bones {
     #[must_use]
     pub fn key(&self, bone: BoneIndex) -> Option<StableKey> {
         self.keys.get(usize::from(bone)).and_then(|key| key.get())
+    }
+}
+
+/// `transform` with its rotation normalised: what [`Bones::spawn`] and `anim::drive_bones`
+/// write to a bone row. `Skeleton::validate` and `Clip::validate` hold each rotation to the
+/// backends' unit tolerance on its own, but a row's rotation is their product down the
+/// chain and the root's, whose error grows with depth past that tolerance, and the backend
+/// would refuse the row at every sync. `Quat::normalize` is a correctly rounded square root
+/// and four divisions, IEEE basic operations through `lactose_math` with no approximate
+/// reciprocal square root, which architecture section 8.2 permits. A rotation without
+/// a positive finite length (a root that is no rotation) is left as it is rather than made
+/// NaN; the backend refuses it either way.
+pub(crate) fn row_transform(transform: Transform) -> Transform {
+    let length = transform.rotation.length();
+    if length > Scalar::ZERO && length.is_finite() {
+        Transform::new(transform.translation, transform.rotation.normalize())
+    } else {
+        transform
     }
 }
 

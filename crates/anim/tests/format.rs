@@ -761,6 +761,9 @@ const F1: [u8; 8] = 0x3FF0_0000_0000_0000u64.to_le_bytes();
 const F2: [u8; 8] = 0x4000_0000_0000_0000u64.to_le_bytes();
 const F_HALF: [u8; 8] = 0x3FE0_0000_0000_0000u64.to_le_bytes();
 const F_QUARTER: [u8; 8] = 0x3FD0_0000_0000_0000u64.to_le_bytes();
+const F_EIGHTH: [u8; 8] = 0x3FC0_0000_0000_0000u64.to_le_bytes();
+/// `sqrt(43) / 8` rounded, the `w` that makes `(1/8, 1/4, 1/2, w)` a unit quaternion.
+const W_BITS: u64 = 0x3FEA_3AD1_2A1D_A160;
 /// The preamble of format version one at eight-byte scalars.
 const PREAMBLE: [u8; 8] = [1, 0, 0, 0, 8, 0, 0, 0];
 
@@ -770,21 +773,24 @@ fn concat(pieces: &[&[u8]]) -> Vec<u8> {
 
 /// One small asset of each kind against bytes written by hand from the README's per-kind
 /// lists, independent of the encoder above: each decodes to the expected value and the
-/// encoder writes exactly those bytes, so a swap or a width shared by the encoder and the
-/// decoder is caught here.
+/// encoder writes exactly those bytes. Every two neighbouring fields of one width hold
+/// different values, and every condition tag, a transition from any state, a sphere and a
+/// cuboid, two body types and a limited revolute joint appear, so a swap or a width
+/// the encoder and the decoder share is caught here.
 #[test]
 fn one_asset_of_each_kind_matches_its_golden_bytes() {
-    use lactose_anim::{State, Transition};
+    use lactose_anim::{BoneJoint, State, Transition};
     use lactose_physics_api::{Collider, CollisionGroups, RigidBody, Shape, locked_axes};
     assert_eq!(Scalar::BYTES, 8, "the golden bytes are at eight-byte scalars");
     let skeleton_id = AssetId::from_bits(0x0102_0304_0506_0708);
     let clip_id = AssetId::from_bits(0x31);
 
-    // A one-shot clip of two frames and one bone, its root entry zero the identity, and one
-    // event.
+    // A one-shot clip of three ticks, two frames and one bone, its root entry zero the
+    // identity, and one event. Every two neighbours of one width differ throughout, so a
+    // swap of them shared by the encoder and the decoder changes the bytes.
     let clip = Clip {
         skeleton: AssetRef::new(skeleton_id),
-        duration_ticks: 2,
+        duration_ticks: 3,
         frames: 2,
         looping: false,
         bones: 1,
@@ -801,7 +807,7 @@ fn one_asset_of_each_kind_matches_its_golden_bytes() {
     let golden = concat(&[
         &PREAMBLE,
         &[8, 7, 6, 5, 4, 3, 2, 1], // skeleton
-        &[2, 0, 0, 0],             // duration_ticks
+        &[3, 0, 0, 0],             // duration_ticks
         &[2, 0, 0, 0],             // frames
         &[0],                      // looping
         &[1],                      // bones
@@ -818,78 +824,159 @@ fn one_asset_of_each_kind_matches_its_golden_bytes() {
     assert_eq!(load_clip(&golden, &[skeleton_id]).unwrap(), clip);
     assert_eq!(encode_clip(&clip), golden);
 
-    // One state and a restart: `initial` first, a transition's conditions last.
+    // Two states, a transition between them and one from any state, one condition of each
+    // tag: `initial` first, a transition's conditions last.
+    let walk_id = AssetId::from_bits(0x32);
     let machine = StateMachine {
-        states: vec![State {
-            key: StateKey(0x21),
-            clip: AssetRef::new(clip_id),
-            speed: s(1.0),
-            speed_param: None,
-        }],
-        transitions: vec![Transition {
-            from: Some(0),
-            to: 0,
-            conditions: vec![Condition::Trigger(2), Condition::Above { param: 1, value: s(0.5) }],
-            blend_ticks: 4,
-            keep_phase: true,
-            entry_phase: Phase::ZERO,
-        }],
-        initial: 0,
+        states: vec![
+            State {
+                key: StateKey(0x21),
+                clip: AssetRef::new(clip_id),
+                speed: s(1.0),
+                speed_param: None,
+            },
+            State {
+                key: StateKey(0x22),
+                clip: AssetRef::new(walk_id),
+                speed: s(0.5),
+                speed_param: Some(3),
+            },
+        ],
+        transitions: vec![
+            Transition {
+                from: Some(0),
+                to: 1,
+                conditions: vec![
+                    Condition::Finished,
+                    Condition::PhaseAtLeast(Phase(0x8000_0000)),
+                    Condition::TicksAtLeast(9),
+                ],
+                blend_ticks: 4,
+                keep_phase: true,
+                entry_phase: Phase::ZERO,
+            },
+            Transition {
+                from: None,
+                to: 0,
+                conditions: vec![
+                    Condition::Above { param: 1, value: s(0.5) },
+                    Condition::Below { param: 2, value: s(0.25) },
+                    Condition::Flag { bit: 3, set: true },
+                    Condition::Trigger(5),
+                ],
+                blend_ticks: 6,
+                keep_phase: false,
+                entry_phase: Phase(0x2000_0000),
+            },
+        ],
+        initial: 1,
     };
     let golden = concat(&[
         &PREAMBLE,
-        &[0, 0],       // initial
-        &[1, 0, 0, 0], // one state
+        &[1, 0],       // initial
+        &[2, 0, 0, 0], // two states
         &[0x21, 0, 0, 0, 0, 0, 0, 0],
         &[0x31, 0, 0, 0, 0, 0, 0, 0],
         &F1,
-        &[0xFF],       // no speed parameter
-        &[1, 0, 0, 0], // one transition
-        &[0, 0],       // from
-        &[0, 0],       // to
-        &[4, 0],       // blend_ticks
-        &[1],          // keep_phase
-        &[0, 0, 0, 0], // entry_phase
-        &[2, 0, 0, 0], // two conditions
-        &[6, 2],       // Trigger(2)
-        &[3, 1],       // Above, parameter 1
+        &[0xFF], // no speed parameter
+        &[0x22, 0, 0, 0, 0, 0, 0, 0],
+        &[0x32, 0, 0, 0, 0, 0, 0, 0],
         &F_HALF,
+        &[3],                // speed parameter 3
+        &[2, 0, 0, 0],       // two transitions
+        &[0, 0],             // from
+        &[1, 0],             // to
+        &[4, 0],             // blend_ticks
+        &[1],                // keep_phase
+        &[0, 0, 0, 0],       // entry_phase
+        &[3, 0, 0, 0],       // three conditions
+        &[0],                // Finished
+        &[1, 0, 0, 0, 0x80], // PhaseAtLeast
+        &[2, 9, 0, 0, 0],    // TicksAtLeast(9)
+        &[0xFF, 0xFF],       // from any state
+        &[0, 0],             // to
+        &[6, 0],             // blend_ticks
+        &[0],                // keep_phase
+        &[0, 0, 0, 0x20],    // entry_phase
+        &[4, 0, 0, 0],       // four conditions
+        &[3, 1],             // Above, parameter 1
+        &F_HALF,
+        &[4, 2], // Below, parameter 2
+        &F_QUARTER,
+        &[5, 3, 1], // Flag, bit 3, set
+        &[6, 5],    // Trigger(5)
     ]);
-    assert_eq!(load_machine(&golden, &[clip_id]).unwrap(), machine);
+    assert_eq!(load_machine(&golden, &[clip_id, walk_id]).unwrap(), machine);
     assert_eq!(encode_machine(&machine), golden);
 
-    // One bone with a body and one socket: a shape's kind before its extents.
-    let mut body = RigidBody::dynamic();
-    body.mass = s(2.0);
-    body.linear_damping = s(0.5);
-    body.angular_damping = s(0.25);
-    body.gravity_scale = s(1.0);
-    body.locked_axes = locked_axes::ROTATION_X | locked_axes::ROTATION_Z;
-    body.can_sleep = true;
-    let mut collider = Collider::new(Shape::sphere(s(0.5)));
-    collider.offset = v(0.0, 0.25, 0.0);
-    collider.rotation = Quat::IDENTITY;
-    collider.friction = s(0.5);
-    collider.restitution = s(0.0);
-    collider.density = s(1.0);
-    collider.impact_threshold = s(0.0);
-    collider.groups = CollisionGroups::new(1, 2);
-    collider.sensor = false;
-    collider.events = true;
-    collider.material = 3;
+    // Two bones with bodies, the second a kinematic cuboid on a limited revolute joint to
+    // the first, and one socket: a shape's kind before its extents.
+    let mut hips = RigidBody::dynamic();
+    hips.mass = s(2.0);
+    hips.linear_damping = s(0.5);
+    hips.angular_damping = s(0.25);
+    hips.gravity_scale = s(1.0);
+    hips.locked_axes = locked_axes::ROTATION_X | locked_axes::ROTATION_Z;
+    hips.can_sleep = true;
+    let mut hips_collider = Collider::new(Shape::sphere(s(0.5)));
+    hips_collider.offset = v(0.0, 0.25, 0.0);
+    hips_collider.rotation = Quat::IDENTITY;
+    hips_collider.friction = s(0.5);
+    hips_collider.restitution = s(0.25);
+    hips_collider.density = s(1.0);
+    hips_collider.impact_threshold = s(2.0);
+    hips_collider.groups = CollisionGroups::new(1, 2);
+    hips_collider.sensor = false;
+    hips_collider.events = true;
+    hips_collider.material = 3;
+    let mut foot = RigidBody::kinematic();
+    foot.mass = s(1.0);
+    foot.linear_damping = s(0.0);
+    foot.angular_damping = s(0.5);
+    foot.gravity_scale = s(2.0);
+    foot.locked_axes = 0;
+    foot.can_sleep = false;
+    let mut foot_collider = Collider::new(Shape::cuboid(v(0.5, 1.0, 2.0)));
+    foot_collider.offset = v(0.25, 0.0, 0.0);
+    // Four different coefficients, so a swap inside a quaternion is caught too.
+    foot_collider.rotation = Quat::new(s(0.125), s(0.25), s(0.5), s(f64::from_bits(W_BITS)));
+    foot_collider.friction = s(1.0);
+    foot_collider.restitution = s(0.5);
+    foot_collider.density = s(2.0);
+    foot_collider.impact_threshold = s(0.25);
+    foot_collider.groups = CollisionGroups::new(4, 8);
+    foot_collider.sensor = true;
+    foot_collider.events = false;
+    foot_collider.material = 0x0102;
+    let hinge = BoneJoint {
+        kind: JointKind::Revolute,
+        anchor_parent: v(0.0, 0.25, 0.0),
+        anchor_bone: v(0.0, 0.0, 0.5),
+        axis: v(1.0, 0.0, 0.0),
+        limits: Some((s(0.25), s(1.0))),
+    };
     let skeleton = Skeleton {
-        bones: vec![Bone {
-            key: BoneKey(0x41),
-            parent: None,
-            role: BoneRole::Hips,
-            rest: BonePose { translation: v(0.0, 1.0, 0.0), rotation: Quat::IDENTITY },
-            body: Some(BoneBody { body, collider, joint: None }),
-        }],
-        sockets: vec![Socket { key: BoneKey(0x51), bone: 0, offset: BonePose::IDENTITY }],
+        bones: vec![
+            Bone {
+                key: BoneKey(0x41),
+                parent: None,
+                role: BoneRole::Hips,
+                rest: BonePose { translation: v(0.0, 1.0, 0.0), rotation: Quat::IDENTITY },
+                body: Some(BoneBody { body: hips, collider: hips_collider, joint: None }),
+            },
+            Bone {
+                key: BoneKey(0x42),
+                parent: Some(0),
+                role: BoneRole::FootRight,
+                rest: BonePose { translation: v(0.0, 0.5, 0.0), rotation: Quat::IDENTITY },
+                body: Some(BoneBody { body: foot, collider: foot_collider, joint: Some(hinge) }),
+            },
+        ],
+        sockets: vec![Socket { key: BoneKey(0x51), bone: 1, offset: BonePose::IDENTITY }],
     };
     let golden = concat(&[
         &PREAMBLE,
-        &[1, 0, 0, 0], // one bone
+        &[2, 0, 0, 0], // two bones
         &[0x41, 0, 0, 0, 0, 0, 0, 0],
         &[0xFF], // no parent
         &[1],    // Hips
@@ -904,16 +991,43 @@ fn one_asset_of_each_kind_matches_its_golden_bytes() {
         &F_HALF, // radius
         &[F0, F_QUARTER, F0].concat(),
         &[F0, F0, F0, F1].concat(),
-        &[F_HALF, F0, F1, F0].concat(),
+        &[F_HALF, F_QUARTER, F1, F2].concat(),
         &[1, 0, 0, 0], // membership
         &[2, 0, 0, 0], // filter
         &[0],          // sensor
         &[1],          // events
         &[3, 0],       // material
         &[0],          // no joint
+        &[0x42, 0, 0, 0, 0, 0, 0, 0],
+        &[0], // parent
+        &[7], // FootRight
+        &[F0, F_HALF, F0, F0, F0, F0, F1].concat(),
+        &[1], // a body
+        &[F1, F0, F_HALF, F2].concat(),
+        &[1], // kinematic
+        &[0], // no locked axis
+        &[0], // can_sleep
+        &[2], // a cuboid
+        &[F_HALF, F1, F2].concat(),
+        &F0, // radius
+        &[F_QUARTER, F0, F0].concat(),
+        &[F_EIGHTH, F_QUARTER, F_HALF, W_BITS.to_le_bytes()].concat(),
+        &[F1, F_HALF, F2, F_QUARTER].concat(),
+        &[4, 0, 0, 0], // membership
+        &[8, 0, 0, 0], // filter
+        &[1],          // sensor
+        &[0],          // events
+        &[2, 1],       // material
+        &[1],          // a joint
+        &[2],          // revolute
+        &[F0, F_QUARTER, F0].concat(),
+        &[F0, F0, F_HALF].concat(),
+        &[F1, F0, F0].concat(),
+        &[1], // limited
+        &[F_QUARTER, F1].concat(),
         &[1, 0, 0, 0], // one socket
         &[0x51, 0, 0, 0, 0, 0, 0, 0],
-        &[0], // bone
+        &[1], // bone
         &[F0, F0, F0, F0, F0, F0, F1].concat(),
     ]);
     assert_eq!(load_skeleton(&golden, &[]).unwrap(), skeleton);

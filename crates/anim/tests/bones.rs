@@ -2,9 +2,10 @@
 //! bones row): the rows `Bones::spawn` records and nothing on a second call; the three
 //! `Stage::Post` systems in a server world and not in a prediction world; the kinematic
 //! bodies swept to the previous tick's pose as the physics test backend sees it; `set_limp`
-//! both ways; `report_bones` from limp rows alone; the collider rule `Skeleton::validate`
-//! checks; and no command for a character without bones. The fit itself is in
-//! `tests/evaluation.rs`.
+//! both ways; `report_bones` from limp rows alone; the collider rule and the body rules
+//! `Skeleton::validate` checks; every body accepted when the chain's composed rotations
+//! leave the unit tolerance; and no command for a character without bones. The fit itself
+//! is in `tests/evaluation.rs`.
 
 #![forbid(unsafe_code)]
 
@@ -20,7 +21,7 @@ use lactose_asset_api::AssetRef;
 use lactose_core::{ErrorKind, StableKey};
 use lactose_ecs::{ClaimedBy, OwnedBy, WorldKind};
 
-use lactose_math::{Quat, Vec3};
+use lactose_math::{Quat, Scalar, Vec3};
 use lactose_physics_api::{
     BodyType, Collider, CollisionGroups, Joint, JointKind, RigidBody, Shape, Transform, locked_axes,
 };
@@ -76,6 +77,11 @@ fn rows<T: lactose_reflect::Component>(fixture: &Fixture) -> Vec<StableKey> {
     keys
 }
 
+/// `transform` with its rotation normalised, as a bone row's is written.
+fn normalised(transform: Transform) -> Transform {
+    Transform::new(transform.translation, transform.rotation.normalize())
+}
+
 #[test]
 fn spawn_records_the_stated_rows_and_nothing_on_a_second_call() {
     let actions = [(1, HERO, RagdollAction::Spawn), (4, HERO, RagdollAction::Spawn)];
@@ -94,7 +100,7 @@ fn spawn_records_the_stated_rows_and_nothing_on_a_second_call() {
         let StableKey::Net(id) = key else { panic!("{key:?} is not a Net key") };
         assert!(!id.is_cooked(), "a runtime NetId, resolved from its placeholder");
         let world = fixture.world();
-        let expected = pose.bones()[usize::from(bone)].in_world(&root());
+        let expected = normalised(pose.bones()[usize::from(bone)].in_world(&root()));
         assert_eq!(*world.get::<Transform>(key).unwrap(), expected, "bone {bone} at the pose");
         let body = skeleton.bones[usize::from(bone)].body.unwrap();
         let mut kinematic = body.body;
@@ -159,7 +165,7 @@ fn drive_bones_sweeps_the_kinematic_bodies_to_the_previous_ticks_pose() {
         let calls = fixture.calls.take();
         let mut expected: Vec<_> = [0u8, 1, 3]
             .iter()
-            .map(|&bone| (bones.key(bone).unwrap(), pose.world(&root, bone).unwrap()))
+            .map(|&bone| (bones.key(bone).unwrap(), normalised(pose.world(&root, bone).unwrap())))
             .collect();
         expected.sort_unstable_by_key(|&(key, _)| key);
         // Only the hero's bone rows are swept: the two characters without bones cost no
@@ -412,4 +418,75 @@ fn validate_refuses_a_body_the_backend_would_refuse() {
     for (index, edit) in accepted.into_iter().enumerate() {
         assert!(with(edit).validate().is_ok(), "accepted case {index}");
     }
+}
+
+/// `q` scaled so that its squared length is `1 + excess`.
+fn off_unit(q: Quat, excess: f64) -> Quat {
+    let k = s((1.0 + excess).sqrt());
+    Quat::new(q.x * k, q.y * k, q.z * k, q.w * k)
+}
+
+/// The test backend's unit test on a rotation, which physics-rapier's matches.
+fn unit(q: Quat) -> bool {
+    (q.length_squared() - Scalar::ONE).abs() < s(1e-6)
+}
+
+/// Every rest and clip rotation within the unit tolerance on its own, so both `validate`s
+/// pass, but their product down a 4-bone chain past it: every bone row still gets a body
+/// the test backend accepts, created once, and every sweep is one it applies.
+#[test]
+fn a_chain_of_rotations_each_within_the_tolerance_gets_every_body() {
+    const EXCESS: f64 = 0.9e-6;
+    let mut skeleton = chain(BONES, |_| true);
+    for bone in &mut skeleton.bones {
+        bone.rest.rotation = off_unit(bone.rest.rotation, EXCESS);
+    }
+    let mut walk = clip(BONES as u8, 4, 4, true, 0.0);
+    for sample in &mut walk.samples {
+        sample.rotation = off_unit(sample.rotation, EXCESS);
+    }
+    skeleton.validate().unwrap();
+    walk.validate().unwrap();
+    // The premise: the composed rotation of the deepest bone is past the tolerance.
+    let rest = SimPose::rest(&skeleton);
+    assert!(!unit(rest.bones()[BONES - 1].rotation), "the chain stays within the tolerance");
+    let machine = StateMachine {
+        states: vec![state("walk", LOOP_CLIP, 1.0)],
+        transitions: Vec::new(),
+        initial: 0,
+    };
+    let library =
+        Library::new().with(SKELETON, skeleton).with(MACHINE, machine).with(LOOP_CLIP, walk);
+    let mut options = Options::new(WorldKind::Server);
+    options.physics = true;
+    let mut fixture = options.build();
+    fixture.assets(library.pin());
+    fixture.spawn_at(key(HERO), AnimRig::new(MACHINE, SKELETON), root());
+    fixture.world_mut().service_mut::<Ragdoll>().unwrap().actions =
+        vec![(2, key(HERO), RagdollAction::Spawn)];
+    fixture.run(24);
+    let mut created = Vec::new();
+    let mut swept = 0;
+    for call in fixture.calls.take() {
+        match call {
+            Call::CreateBody { key, transform, .. } => {
+                assert!(unit(transform.rotation), "{key:?} created at {transform:?}");
+                created.push(key);
+            }
+            Call::SetTransform(key, transform) => {
+                assert!(unit(transform.rotation), "{key:?} swept to {transform:?}");
+                swept += 1;
+            }
+            _ => {}
+        }
+    }
+    // The hero's root has no body, so the creates are the bone rows', each once: a refused
+    // create would be retried at every sync.
+    let bones = bones_of(&fixture, HERO);
+    let mut expected: Vec<StableKey> =
+        (0..BONES as u8).map(|bone| bones.key(bone).unwrap()).collect();
+    expected.sort_unstable();
+    created.sort_unstable();
+    assert_eq!(created, expected);
+    assert!(swept > 0, "the animated bones are swept");
 }

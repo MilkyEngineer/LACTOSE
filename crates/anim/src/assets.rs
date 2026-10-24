@@ -52,8 +52,10 @@ pub struct Clip {
     /// The root's pose per frame in the character's space, or empty for a clip without root
     /// motion: `frames + 1` entries for a looping clip, the last being where the cycle ends
     /// (sample zero displaced by the cycle's total motion), `frames` for a one-shot. Entry
-    /// zero is the identity, the character at the clip's start: the last entry's yaw is
-    /// then the cycle's turn, which the wrap of [`root_motion`](Self::root_motion) adds.
+    /// zero is the identity, the character at the clip's start: an entry's yaw is then how
+    /// far the character has turned since the start, which
+    /// [`root_motion`](Self::root_motion) turns every translation back by, and the last
+    /// entry's yaw the cycle's turn, which its wrap adds.
     pub root: Vec<RootSample>,
     /// The authored events, ascending by phase.
     pub events: Vec<ClipEvent>,
@@ -196,8 +198,10 @@ impl Clip {
 
     /// The checks the loader runs: `duration_ticks` at least one; `frames` at least two, or
     /// one when looping; `samples.len() == frames * bones`; `root` empty or of the length
-    /// stated on the field, its entry zero the identity (no translation, no yaw); every
-    /// rotation a unit quaternion; every scalar finite; events ascending by phase.
+    /// stated on the field, its entry zero the identity (no translation, no yaw: a turned
+    /// entry zero would turn the translation of every motion by its yaw, one-shots
+    /// included, besides adding it to the wrap's turn); every rotation a unit quaternion;
+    /// every scalar finite; events ascending by phase.
     /// `InvalidData` otherwise, naming the first failure.
     pub fn validate(&self) -> Result<()> {
         if self.duration_ticks == 0 {
@@ -230,8 +234,9 @@ impl Clip {
                 return Err(invalid(format!("root entry {index}: a scalar is not finite")));
             }
         }
-        // The wrap adds the last entry's yaw as the cycle's turn, which holds only from an
-        // unturned entry zero; the track is in the character's space at the clip's start.
+        // The track is in the character's space at the clip's start: `root_motion` turns
+        // each translation back by the yaw since entry zero and the wrap adds the last
+        // entry's yaw as the cycle's turn, both of which hold only from an unturned entry zero.
         if self
             .root
             .first()
@@ -548,7 +553,8 @@ impl Skeleton {
     /// bone rule, [`BoneBody::collider`]);
     /// every rest and socket rotation a unit quaternion and every scalar finite; and every
     /// [`BoneBody`] one the physics backend accepts, so no bone's body is refused at every
-    /// sync: the mass and both dampings non-negative; `locked_axes` within
+    /// sync (the row's rotation, a product down the chain, is normalised where it is
+    /// written): the mass and both dampings non-negative; `locked_axes` within
     /// `locked_axes::TRANSLATION | locked_axes::ROTATION`; a sphere's radius positive, a
     /// capsule's radius positive and its half height (`half_extents.y`) non-negative, a
     /// cuboid's three half extents positive; the collider's rotation a unit quaternion;
