@@ -6,16 +6,17 @@ use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll};
 
 use lactose_core::Result;
 use lactose_task::Platform;
 
 use crate::backend::Backend;
+use crate::backend::blocking::BlockingPool;
 use crate::config::IoConfig;
-use crate::file::File;
-use crate::request::Pending;
+use crate::file::{File, FileId};
+use crate::request::{Completion, Failure, Pending, Request};
 use crate::types::{DirEntry, ReplaceFailed};
 
 /// A handle to the file IO pool: `pool_threads` platform threads of class `ThreadClass::Io`
@@ -54,7 +55,33 @@ impl Io {
     /// already created are stopped first. Nothing of the executor is kept: the platform is
     /// used for the spawns and released.
     pub fn start(platform: &dyn Platform, config: IoConfig) -> Result<Self> {
-        todo!("BlockingPool::start(platform, config.pool_threads) behind an Owner")
+        let backend = BlockingPool::start(platform, config.pool_threads)?;
+        Ok(Self::over(backend, config.pool_threads))
+    }
+
+    /// [`Io::start`], with the crate's tests told of every point of the pool's work.
+    #[cfg(test)]
+    pub(crate) fn start_hooked(
+        platform: &dyn Platform,
+        config: IoConfig,
+        hook: crate::backend::blocking::Hook,
+    ) -> Result<Self> {
+        let backend = BlockingPool::start_hooked(platform, config.pool_threads, hook)?;
+        Ok(Self::over(backend, config.pool_threads))
+    }
+
+    fn over(backend: Arc<dyn Backend>, pool_threads: NonZero<u32>) -> Self {
+        Self { owner: Arc::new(Owner { backend, next_file_id: AtomicU64::new(0), pool_threads }) }
+    }
+
+    /// A request for the backend: its completion, and the future's side of it.
+    fn pending<T, E: Failure>(
+        &self,
+        request: impl FnOnce(Arc<Completion<T, E>>) -> Request,
+    ) -> Pending<T, E> {
+        let completion = Completion::new();
+        let request = request(Arc::clone(&completion));
+        Pending::new(Arc::clone(&self.owner.backend), completion, request)
     }
 
     /// The number of threads the pool was started with, which is also the number of
@@ -72,7 +99,9 @@ impl Io {
     /// the pool has stopped.
     #[must_use = "an open does nothing until polled"]
     pub fn open(&self, path: impl Into<PathBuf>) -> Open {
-        todo!("a `Pending` of `Request::Open` with the next FileId")
+        let id = FileId(self.owner.next_file_id.fetch_add(1, Ordering::Relaxed));
+        let path = path.into();
+        Open { pending: self.pending(|complete| Request::Open { path, id, complete }) }
     }
 
     /// Reads the whole file at `path`.
@@ -85,7 +114,8 @@ impl Io {
     /// in ranges, [`Io::open`] and [`File::read_at`].
     #[must_use = "a read does nothing until polled"]
     pub fn read_file(&self, path: impl Into<PathBuf>) -> ReadFile {
-        todo!("a `Pending` of `Request::ReadFile`")
+        let path = path.into();
+        ReadFile { pending: self.pending(|complete| Request::ReadFile { path, complete }) }
     }
 
     /// Replaces the content of the file at `path` with `bytes`, atomically and durably:
@@ -113,7 +143,8 @@ impl Io {
     /// rename is `Io`. `Cancelled` if the pool has stopped.
     #[must_use = "a replace does nothing until polled"]
     pub fn replace(&self, path: impl Into<PathBuf>, bytes: Vec<u8>) -> Replace {
-        todo!("a `Pending` of `Request::Replace`")
+        let path = path.into();
+        Replace { pending: self.pending(|complete| Request::Replace { path, bytes, complete }) }
     }
 
     /// Lists the directory at `path`.
@@ -124,7 +155,8 @@ impl Io {
     /// pool has stopped.
     #[must_use = "a listing does nothing until polled"]
     pub fn read_dir(&self, path: impl Into<PathBuf>) -> ReadDir {
-        todo!("a `Pending` of `Request::ReadDir`")
+        let path = path.into();
+        ReadDir { pending: self.pending(|complete| Request::ReadDir { path, complete }) }
     }
 
     /// Creates the directory at `path` and every missing parent; succeeds if it exists.
@@ -133,7 +165,8 @@ impl Io {
     /// or quota is full; `Cancelled` if the pool has stopped.
     #[must_use = "a create does nothing until polled"]
     pub fn create_dir_all(&self, path: impl Into<PathBuf>) -> CreateDirAll {
-        todo!("a `Pending` of `Request::CreateDirAll`")
+        let path = path.into();
+        CreateDirAll { pending: self.pending(|complete| Request::CreateDirAll { path, complete }) }
     }
 
     /// Stops the pool and waits for its threads.
@@ -143,7 +176,7 @@ impl Io {
     /// thread has exited, so it is for the main thread and tools, before the executor's
     /// own shutdown. Clones left after this call are inert handles.
     pub fn shutdown(self) {
-        todo!("backend.stop(); backend.join()")
+        self.owner.backend.join();
     }
 }
 
@@ -155,7 +188,7 @@ impl fmt::Debug for Io {
 
 impl Drop for Owner {
     fn drop(&mut self) {
-        todo!("backend.stop(); no join")
+        self.backend.stop();
     }
 }
 

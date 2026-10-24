@@ -13,12 +13,12 @@ simulation never calls it.
 | Determinism boundary | outside |
 | Unsafe | none, `#![forbid(unsafe_code)]`; `SAFETY.md` says where the completion backends' `unsafe` will live |
 
-**Status: facade.** Every public signature is final and every deciding body is `todo!()`;
-`IoConfig`'s constructors, `ReplaceFailed`'s trait impls and the span constructors are
-real. Every sentence under "Behaviour the signatures cannot express" is one a dependent
-crate may rely on and the implementation must meet. Architecture sections 3, 4, 5.1, 9.7,
-14, 15.3, 19, 20, 21 and 22 and `docs/verification.md` section 3 are the design; where
-this file and the architecture disagree, the architecture wins and this file is wrong.
+**Status: implemented for milestone 1**, by the blocking backend on every platform. Every
+body runs, and every row of "Proof for milestone 1" names the tests that hold it. Every
+sentence under "Behaviour the signatures cannot express" is one a dependent crate may rely
+on. Architecture sections 3, 4, 5.1, 9.7, 14, 15.3, 19, 20, 21 and 22 and
+`docs/verification.md` section 3 are the design; where this file and the architecture
+disagree, the architecture wins and this file is wrong.
 Decision D130 records the choices those sections left open. `crates/core/README.md`
 (errors, `AllocTag`, `ThreadClass`) and `crates/task/README.md` (the executor, `Task`,
 `Platform`, `block_on`, `yield_now`) are the contracts this crate builds on and never
@@ -382,12 +382,17 @@ own events.
 
 ## Proof for milestone 1
 
-Tests the implementation writes, all under `cargo nextest`, none under SOUR: this crate
-is outside the determinism boundary and nothing in it hashes. Every one asserts on counts
-and orderings, never on timings.
+The tests, all under `cargo nextest`, none under SOUR: this crate is outside the
+determinism boundary and nothing in it hashes. Every one asserts on counts and orderings,
+never on timings; a bounded wait only turns a hang into a failure. The proofs that hold a
+pool thread at a chosen point of a request do it through a `#[cfg(test)]` hook of the
+blocking pool and are the unit tests of `src/tests.rs`; the rest go through the public
+surface in `tests/`, with `tests/common/mod.rs` as their shared support. Counts of
+`AllocTag::Io` and of the temporary counter assume one process per test, as nextest runs
+them. Each row ends with the tests that hold it.
 
 - **Config.** `for_topology` on the listed topologies (exists); `IoConfig::new` keeps its
-  count.
+  count. `src/config.rs`: `half_the_cores_rounded_up_at_least_one`, `new_keeps_its_count`.
 - **Cancellation.** A future created and dropped unpolled submits nothing: the queue is
   untouched and no span is created. A future dropped while queued never runs: with one
   pool thread held by a slow request, a queued replace is dropped and the path is never
@@ -395,15 +400,24 @@ and orderings, never on timings.
   buffer is freed, `AllocTag::Io` live bytes return to zero. The drop returns at once
   while the pool thread is still inside the request. An encoded read dropped between two
   decode slices frees both buffers, and `AllocTag::Io` live bytes return to zero.
+  `src/tests.rs`: `a_future_dropped_unpolled_submits_nothing`,
+  `a_future_dropped_while_queued_never_runs`,
+  `a_future_dropped_after_its_request_started_completes_on_the_pool`,
+  `an_encoded_read_dropped_between_two_slices_frees_both_buffers`; the span half in
+  `tests/spans.rs`.
 - **Ordering.** With one pool thread, requests start in first-poll order. A replace
   awaited to `Ok` followed by a `read_file` of the same path sees the new content.
+  `src/tests.rs`: `requests_start_in_first_poll_order`; `tests/requests.rs`:
+  `a_replace_is_seen_whole_after_ok_and_by_the_next_read_file`.
 - **Replace order per path** (the shape of the review's `review_replace_race.rs`). With
   two pool threads, a large replace A of a path is polled until its temporary exists
   (observed by a listing), and its future dropped; a small replace B of the same path is
   then submitted and awaited. B resolves `Ok` only after A has finished, the path holds
   B's bytes then, and still does once the pool is idle. A third replace of the same path
   dropped while it waits behind A never runs and does not delay B. Two replaces of
-  different paths run at once.
+  different paths run at once. `src/tests.rs`:
+  `replaces_of_one_path_run_in_submission_order_dropped_or_not`,
+  `replaces_of_two_paths_run_at_once`.
 - **Errors.** Each row of the table is produced: a missing file, a missing directory for
   a replace, a range past the end (and no partial buffer), an overflowing range, an empty
   encoded range, a truncated frame, trailing bytes after a frame, two concatenated frames
@@ -415,9 +429,22 @@ and orderings, never on timings.
   filesystem where the runner has one (a `tmpfs` with `size=` on Linux); elsewhere the
   mapping of `ENOSPC` is `core`'s test. The remapping of `Unsupported` and `Network` to
   `Io` is a unit test of the mapping function over constructed `std::io::Error`s.
+  `tests/requests.rs`: `a_missing_file_or_directory_is_not_found`,
+  `a_range_past_the_end_or_overflowing_is_invalid_data_and_allocates_nothing`,
+  `every_stored_range_but_one_whole_frame_of_the_stated_size_is_invalid_data`,
+  `a_length_above_the_cap_is_resource_exhausted_before_any_allocation`,
+  `a_permission_failure_is_io` (Unix, skipped as root),
+  `a_directory_opened_or_read_as_a_file_is_io`, `a_request_after_shutdown_is_cancelled`,
+  `a_read_on_a_file_after_the_last_io_is_dropped_is_cancelled`; `tests/storage_full.rs`, run
+  where `LACTOSE_IO_SMALL_FS` names a directory on a file system with less than 64 MiB
+  free and passing without running elsewhere; `src/backend/blocking.rs`:
+  `unsupported_and_network_become_io_and_keep_their_source`.
 - **Short reads.** A file shorter than `offset + len` by one byte is `InvalidData`; a file
   exactly `offset + len` long succeeds. A `read_file` of a file appended to between its
   size check and its end (a test hook between the two) is `InvalidData`.
+  `tests/requests.rs`:
+  `a_file_one_byte_short_is_invalid_data_and_one_exactly_long_enough_is_read`;
+  `src/backend/blocking.rs`: `a_file_appended_to_while_it_is_read_is_invalid_data`.
 - **Decode.** A zstd frame round-trips to the bytes it was made from, in a buffer of
   exactly `decoded_len`; the content-size header disagreeing with `decoded_len` is
   `InvalidData`. A frame of several MiB, polled by hand, returns `Pending` with its own
@@ -427,7 +454,13 @@ and orderings, never on timings.
   at once still takes several calls and polls. A frame of a little over 2^27 bytes of
   zeros compressed with `WindowLog(28)` is `InvalidData`; the same content compressed with
   `WindowLog(27)` decodes. zstd's memory-allocation code maps to `ResourceExhausted` and
-  every other code to `InvalidData` (a unit test of the mapping).
+  every other code to `InvalidData` (a unit test of the mapping). `tests/requests.rs`:
+  `a_frame_round_trips_at_its_offset_into_a_buffer_of_exactly_decoded_len`,
+  `every_stored_range_but_one_whole_frame_of_the_stated_size_is_invalid_data`,
+  `a_frame_of_several_mib_decodes_in_many_polls_on_the_polling_thread`,
+  `a_window_above_two_to_the_27_is_invalid_data_and_one_at_it_decodes`; `src/decode.rs`:
+  `a_step_never_writes_more_than_its_share_of_output`,
+  `zstd_allocation_failure_is_resource_exhausted_and_every_other_code_invalid_data`.
 - **Atomic replace.** The new content is seen whole after `Ok`; the previous content is
   kept and the temporary removed when the write fails (a `path` that is a directory, a
   read-only directory), and the `ReplaceFailed` holds the very bytes given (same pointer
@@ -444,18 +477,36 @@ and orderings, never on timings.
   reads the previous content after it, on Unix and on Windows; a replace over a path we
   hold open ourselves succeeds on Windows. A failure after the rename is `Io` (forced
   with a test hook in place of the directory sync). Durability across a power loss is
-  `docs/verification.md`'s row, not a test.
+  `docs/verification.md`'s row, not a test. `tests/requests.rs`:
+  `a_replace_is_seen_whole_after_ok_and_by_the_next_read_file`,
+  `a_replace_of_a_path_that_is_a_directory_fails_with_its_bytes_and_leaves_nothing`,
+  `a_permission_failure_is_io`, `a_replace_of_a_bare_name_lands_in_the_current_directory`,
+  `a_file_opened_before_a_replace_reads_the_previous_content_after_it` (a handle of our own
+  held open across it); `src/tests.rs`: `the_temporary_is_created_beside_the_path`,
+  `the_first_replace_into_a_directory_sweeps_only_foreign_temporaries`,
+  `replaces_through_two_pools_or_two_spellings_both_land`,
+  `a_temporary_name_already_taken_is_skipped`; `src/backend/blocking.rs`:
+  `the_temporary_pattern_is_any_name_sixteen_hex_digits_and_tmp`,
+  `a_failure_after_the_rename_is_io_with_the_new_content_in_place`.
 - **Directories.** A listing is sorted, kinds are the entries' own, a symbolic link is
   `Other`, a `.tmp` is listed; `create_dir_all` creates the chain and is idempotent.
+  `tests/requests.rs`: `a_listing_is_sorted_by_name_with_each_entry_s_own_kind` (the link on
+  Unix), `create_dir_all_creates_the_chain_and_succeeds_again`.
 - **The pool.** Threads are created through a spy `Platform` with the names, class and
   indices stated; `pool_threads` requests run at once (a barrier each waits on with two
   threads); `AllocTag::current()` is `Io` on the pool thread; a request's buffer is
-  charged to `Io`.
+  charged to `Io`. `src/tests.rs`:
+  `the_threads_come_from_the_platform_with_their_names_class_and_indices`,
+  `a_thread_the_platform_refuses_fails_the_start_after_stopping_the_others`,
+  `pool_threads_requests_run_at_once_under_the_io_tag`; `tests/requests.rs`:
+  `reads_on_one_file_in_flight_at_once_each_get_their_own_range`.
 - **Shutdown.** Queued requests and replaces waiting behind their path resolve
   `Cancelled`, started ones finish, `shutdown` returns after the threads exit; dropping
   the last `Io` with requests in flight neither hangs nor panics and the started requests
-  complete.
+  complete. `src/tests.rs`: `shutdown_cancels_what_waits_finishes_what_started_and_joins`,
+  `dropping_the_last_handle_stops_the_pool_without_waiting`; `tests/requests.rs`:
+  `an_encoded_read_whose_stored_bytes_arrived_before_the_stop_still_decodes`.
 - **Tracing.** A capturing subscriber sees one span per polled request with the names and
   fields of the table, `io.open` carrying `file` from its creation and `size` on success,
   `error` recorded on a failure and empty on success, and no span for a future dropped
-  unpolled.
+  unpolled. `tests/spans.rs`: `one_span_per_polled_request_with_the_fields_of_the_table`.
