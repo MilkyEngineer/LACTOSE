@@ -177,7 +177,7 @@ fn a_proxy_a_prediction_system_moved_is_despawned_by_a_left_tombstone_naming_its
     frame.spawns.insert(net(5), remote(REGION, 3, vec![data(at(1, 1)), data(Health(2))]));
     frame.spawns.insert(net(6), remote(OTHER_REGION, 4, vec![data(at(2, 2)), data(Health(3))]));
     rig.push(frame);
-    rig.step(walking(13));
+    rig.step(looking(13));
     assert_eq!(placed(rig.world(), key(5)), Some(REGION));
     assert_eq!(placed(rig.world(), key(6)), Some(OTHER_REGION));
     // The kick's command applies in tick 14; the frames keep the placement.
@@ -194,8 +194,9 @@ fn a_proxy_a_prediction_system_moved_is_despawned_by_a_left_tombstone_naming_its
     assert!(rig.world().contains(key(6)), "settled by its region");
     assert!(rig.reconcile().corrections.is_empty());
 
-    // A substitution of 13 by the sample the player sent anyway rolls back to 12 and
-    // re-simulates the kick and the tombstone's frame, to the same world.
+    // A substitution of 13 by a sample that differs from the player's by its yaw alone
+    // rolls back to 12 and re-simulates the kick and the tombstone's frame, to the same
+    // world.
     let mut frame = StagedFrame::new(Tick(15));
     frame.substituted.insert(Tick(13));
     rig.push(frame);
@@ -424,7 +425,7 @@ fn proxies_are_spawned_moved_written_stripped_and_tombstoned_in_the_frame_order(
     frame.spawns.insert(net(5), remote(REGION, 3, vec![data(at(1, 1)), data(Health(2))]));
     dequantised(&mut frame, proxy(), &at(-49, 0));
     rig.push(frame);
-    rig.step(walking(13));
+    rig.step(looking(13));
     let world = rig.world();
     assert_eq!(world.get::<Position>(ball), Some(&at(1, 1)));
     assert_eq!(claim(world, ball), None);
@@ -456,9 +457,9 @@ fn proxies_are_spawned_moved_written_stripped_and_tombstoned_in_the_frame_order(
     assert!(reconciled.corrections.is_empty());
     assert_eq!(reconciled.frames, 3);
 
-    // A rollback replays the proxies' history: a substitution of 13 by the sample the
-    // player sent anyway restores 12 and re-simulates 13 to 16 with the frames popped
-    // there, to the same world.
+    // A rollback replays the proxies' history: a substitution of 13 by a sample that
+    // differs from the player's by its yaw alone restores 12 and re-simulates 13 to 16
+    // with the frames popped there, to the same world.
     let mut frame = StagedFrame::new(Tick(15));
     frame.substituted.insert(Tick(13));
     rig.push(frame);
