@@ -432,12 +432,12 @@ addendum, review r2 of `lactose-net-host`, N1, prediction world)
   prediction system into a region the server then moves the entity into and cannot name,
   within that window; the `Left` tombstone the receiver stages under the released handle
   then names where the proxy resides and it is kept. A kick the local player's input
-  drives, the shipped kind, cannot reach it: it is predicted no earlier than the reload,
-  the server applies it a lead later, and the acknowledgement arrives about a round trip
-  after the leave; a move the server makes of its own within the window can. Closing it
-  needs the loaded rows stamped at their load, an archetype change per loaded row once per
-  load, which is not worth paying for a case that needs the same unshipped system and that
-  race.
+  drives, the shipped kind, cannot reach it without a lost packet (it is predicted no
+  earlier than the reload, the server applies it a lead later, and the acknowledgement
+  arrives about a round trip after the leave); with one, or with a move the server makes
+  of its own within the window, it can. Closing it needs the loaded rows stamped at their
+  load, an archetype change per loaded row once per load, which is not worth paying for a
+  case that needs the same unshipped system and that race.
 
 **Reconciliation** (architecture section 9.4)
 

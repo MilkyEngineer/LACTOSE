@@ -289,6 +289,33 @@ fn a_frame_move_the_world_refused_leaves_the_proxy_settled_by_the_region_it_stay
     rig.step(walking(18));
     assert!(!rig.world().contains(cooked_key()));
     assert!(rig.reconcile().corrections.is_empty());
+
+    // A prediction system moved the proxy before the refused move (review r2, m1): the
+    // placement is where it stayed, the kicked-into region, not the last placement, and a
+    // `Left` naming that region keeps it.
+    let mut rig = Rig::joined();
+    rig.step_to(12, walking);
+    let mut frame = StagedFrame::new(Tick(12));
+    frame.spawns.insert(net(5), remote(REGION, 3, vec![data(at(1, 1)), data(Health(2))]));
+    rig.push(frame);
+    rig.step(walking(13));
+    rig.step(kicking());
+    let world = rig.world();
+    assert_eq!(world.region_of(key(5)), Some(OTHER_REGION));
+    assert_eq!(placed(world, key(5)), Some(REGION));
+    let mut frame = StagedFrame::new(Tick(14));
+    frame.moves.insert(key(5), UNLOADED);
+    rig.push(frame);
+    rig.step(walking(15));
+    let world = rig.world();
+    assert_eq!(world.region_of(key(5)), Some(OTHER_REGION));
+    assert_eq!(placed(world, key(5)), Some(OTHER_REGION), "where the move left it");
+    let mut frame = StagedFrame::new(Tick(15));
+    frame.despawns.insert(key(5), left(OTHER_REGION, 15));
+    rig.push(frame);
+    rig.step(walking(16));
+    assert!(rig.world().contains(key(5)), "settled by the region it stayed in");
+    assert!(rig.reconcile().corrections.is_empty());
 }
 
 /// The correction of a release moves the entity where the releasing spawn has it, as the
