@@ -51,6 +51,18 @@ pub struct Dep {
     pub kind: DepKind,
     /// Where it comes from.
     pub source: DepSource,
+    /// The name the declaring package uses for it, when it renames it.
+    pub rename: Option<String>,
+    /// The features the declaration turns on, `default` aside.
+    pub features: Vec<String>,
+}
+
+impl Dep {
+    /// The name the declaring package's `[features]` values use for the dependency.
+    #[must_use]
+    pub fn key(&self) -> &str {
+        self.rename.as_deref().unwrap_or(&self.name)
+    }
 }
 
 /// One workspace member.
@@ -69,6 +81,8 @@ pub struct Package {
     pub build_script: bool,
     /// Every declared dependency, in manifest order.
     pub deps: Vec<Dep>,
+    /// The `[features]` table: each feature and the values it turns on.
+    pub features: BTreeMap<String, Vec<String>>,
 }
 
 impl Package {
@@ -253,6 +267,8 @@ struct RawDep {
     optional: bool,
     #[serde(default)]
     rename: Option<String>,
+    #[serde(default)]
+    features: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -377,6 +393,8 @@ pub fn parse_metadata(json: &str) -> Result<Metadata, String> {
                     Some(_) => DepSource::Path,
                     None => DepSource::External,
                 },
+                rename: dep.rename.clone(),
+                features: dep.features.clone(),
             })
             .collect();
         packages.push(Package {
@@ -386,6 +404,7 @@ pub fn parse_metadata(json: &str) -> Result<Metadata, String> {
             proc_macro,
             build_script,
             deps,
+            features: package.features.clone(),
         });
     }
     packages.sort_by(|a, b| a.name.cmp(&b.name));
@@ -502,8 +521,15 @@ pub(crate) mod fixture {
             build_script: false,
             deps: deps
                 .iter()
-                .map(|&(dep, kind)| Dep { name: dep.to_owned(), kind, source: source_of(dep) })
+                .map(|&(dep, kind)| Dep {
+                    name: dep.to_owned(),
+                    kind,
+                    source: source_of(dep),
+                    rename: None,
+                    features: Vec::new(),
+                })
                 .collect(),
+            features: std::collections::BTreeMap::new(),
         }
     }
 
@@ -585,7 +611,8 @@ mod tests {
          "dependencies": [
            {"name": "bytemuck", "kind": null, "path": null},
            {"name": "xxhash-rust", "kind": "dev", "path": null},
-           {"name": "shim", "kind": null, "path": "C:\\elsewhere"}],
+           {"name": "shim", "kind": null, "path": "C:\\elsewhere", "rename": "shim2", "features": ["fast"]}],
+         "features": {"default": ["extra"], "extra": ["shim2/fast"]},
          "targets": [{"kind": ["lib"], "src_path": "C:\\ws\\crates\\core\\src\\lib.rs"},
                      {"kind": ["test"], "src_path": "C:\\ws\\crates\\core\\tests\\t.rs"}]},
         {"name": "lactose-reflect-macros", "version": "0.0.0", "id": "macros-id", "manifest_path": "C:\\ws\\crates\\reflect-macros\\Cargo.toml",
@@ -627,6 +654,12 @@ mod tests {
         let sources: Vec<DepSource> = core.deps.iter().map(|d| d.source).collect();
         assert_eq!(sources, [DepSource::External, DepSource::External, DepSource::Path]);
         assert_eq!(core.deps[1].kind, DepKind::Dev);
+        assert_eq!(
+            (core.deps[2].key(), core.deps[2].features.as_slice()),
+            ("shim2", &["fast".to_owned()][..])
+        );
+        assert_eq!((core.deps[0].key(), core.deps[0].rename.as_deref()), ("bytemuck", None));
+        assert_eq!(core.features["extra"], ["shim2/fast"]);
         let macros = ws.package("lactose-reflect-macros").unwrap();
         assert!(macros.proc_macro && macros.build_script);
         assert_eq!(

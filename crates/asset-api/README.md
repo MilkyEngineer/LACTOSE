@@ -6,7 +6,7 @@ The store behind it is SILO (`lactose-asset`).
 | | |
 |---|---|
 | Tier | foundation |
-| Determinism boundary | outside; boundary crates may use its types (architecture section 8.2), so its `clippy.toml` carries the boundary's bans on files, the environment, subprocesses, the network and thread creation; the conformance suite's one threaded check lifts the thread ban on its one item, and the feature that compiles it is for `[dev-dependencies]` alone |
+| Determinism boundary | outside; boundary crates may use its types (architecture section 8.2), so its `clippy.toml` carries the boundary's bans on files, the environment, subprocesses, the network and the standard library's thread creation; the conformance suite's one threaded check lifts the thread ban on its one item, and the `conformance` feature that compiles the suite is library code that `[dev_only_features]` in `crate-tiers.toml` holds to dev-dependency edges, which `cargo xtask tiers` checks |
 | Unsafe | none, `#![forbid(unsafe_code)]`. `AssetRef<T>` is plain data through `lactose_core::typed_plain_data!`, whose `unsafe impl`s are justified in `crates/core/SAFETY.md` |
 
 ## What it holds

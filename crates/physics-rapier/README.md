@@ -19,9 +19,12 @@ what they leave to the backend. Decision D119 is the design.
 ## The one public item
 
 `backend(pool: rayon::ThreadPool) -> Box<dyn PhysicsBackend>`. `app` builds the pool, since
-the boundary lint file bans rayon's pool builders here (a test that builds one lifts the ban
-on its one item); each
-of its threads enters `ThreadClass::PhysicsSolver` before the backend is returned (a refused
+the boundary lint file bans here rayon's pool builders, Rapier's `configure_thread_pool` and
+`clear_thread_pool`, and every rayon entry point that would start rayon's global pool (a test
+that builds a pool lifts the ban on its one item). The one route the file cannot ban is the
+backend's own `set_thread_pool(None)`; `tests/global_pool.rs` holds at run time that a
+backend's life never starts the global pool. Each
+of the pool's threads enters `ThreadClass::PhysicsSolver` before the backend is returned (a refused
 scheduling class is logged and the thread runs at its default priority).
 Rapier's parallel work runs on that pool and nowhere else. The pool's size changes no output:
 `tests/determinism.rs` and `tests/conformance.rs` compare one, two and four threads.

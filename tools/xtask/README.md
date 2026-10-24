@@ -48,18 +48,25 @@ The header comments of `crate-tiers.toml` are the rules; `src/tiers.rs` implemen
 written. A crate the file lists but that does not exist yet is fine. A workspace crate the
 file does not list, a path dependency that is not a workspace member, and an `[exceptions]`
 entry that names anything but backend crates are findings. A dependency whose name is in the
-file is held to the rules wherever it is fetched from.
+file is held to the rules wherever it is fetched from. A feature in `[dev_only_features]`, or
+a feature of its crate that turns it on, may be turned on by a dev-dependency edge alone: a
+normal or build edge enabling it, a `[features]` value forwarding to it (`name/feature` or
+`name?/feature`, under the dependency's rename if it has one), the crate's `default` turning it
+on, and a listed feature the crate does not declare are findings.
 
 ## `boundary`
 
 - Each boundary crate, and each crate of `[lint_file_carriers]`, has a `clippy.toml`
-  byte-identical to `crates/core/clippy.toml`, and that file still bans a required minimum.
+  byte-identical to `crates/core/clippy.toml`, and that file still bans a required minimum
+  and every route to a thread outside an executor (`THREAD_ROUTES` in `src/boundary.rs`; a
+  unit test holds the list to the reference's entries that say a boundary crate creates no
+  thread or cite section 16, so none can be dropped quietly behind `allow-invalid`).
 - Each other crate of `[boundary_internal] any` compiles into every boundary crate and has a
   `clippy.toml` whose entries under the paths that reach files, the environment, a
-  subprocess or the network, or create a thread (`OUTSIDE_WORLD` in `src/boundary.rs`), are
+  subprocess or the network, or create a thread through the standard library (`OUTSIDE_WORLD` in `src/boundary.rs`), are
   exactly those of `crates/core/clippy.toml`, compared entry by entry as parsed TOML. A
   thread the executor does not run is outside its determinism and chaos model wherever the
-  code that starts it lives. The reference's float, executor and solver-pool entries are not
+  code that starts it lives. The reference's float, executor, solver-pool and rayon entries are not
   required of it. A unit test holds `OUTSIDE_WORLD` to the
   reference's entries that cite section 8.2, so an entry added there is not missed.
 - Nothing switches the boundary lints off. In a boundary crate, a crate of
