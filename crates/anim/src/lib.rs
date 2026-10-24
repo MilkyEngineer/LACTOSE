@@ -9,9 +9,10 @@
 //!
 //! # Status
 //!
-//! Facade: every public signature is final and every deciding body is `todo!()`. The
-//! implementation lane replaces the bodies behind this surface and removes the crate-level
-//! `allow` below with the last of them.
+//! Facade: every public signature is final and every deciding body is `todo!()`; the
+//! integer, compositional and phase helpers are real. The implementation lane replaces
+//! the bodies behind this surface and removes the crate-level `allow` below with the last
+//! of them.
 //!
 //! # Where to start
 //!

@@ -84,10 +84,21 @@ impl Clip {
         todo!()
     }
 
-    /// What the root moved by between phase `from` and phase `to` of this tick's advance:
-    /// the root track sampled at both (each by the rule of [`sample`](Self::sample)) and
-    /// subtracted, the cycle's total motion added once when a looping clip wrapped
-    /// (`to < from`). Zero for a clip without a root track or when `from == to`.
+    /// What the root moved by between phase `from` and phase `to` of this tick's advance, in
+    /// the character's space at `from`. The track is in the clip-start space, so the
+    /// difference is turned back by the yaw already turned: with `track(p)` and `yaw(p)` the
+    /// track sampled at `p` by the rule of [`sample`](Self::sample), `R(a)` the rotation by
+    /// `a` about `+Y`, `end` the track's last entry and `total` its yaw,
+    ///
+    /// - without a wrap (`to >= from`): `translation = R(-yaw(from)) * (track(to) -
+    ///   track(from))` and `yaw = yaw(to) - yaw(from)`;
+    /// - across a wrap (`to < from`, a looping clip): `translation = R(-yaw(from)) *
+    ///   (end - track(from)) + R(total - yaw(from)) * (track(to) - track(0))` and `yaw =
+    ///   total - yaw(from) + yaw(to)`.
+    ///
+    /// So a looping walk's motion sums to its cycle's total over one cycle at any rate,
+    /// turned as the character turns. Zero for a clip without a root track or when
+    /// `from == to`.
     #[must_use]
     pub fn root_motion(&self, from: Phase, to: Phase) -> RootMotion {
         todo!()
@@ -128,17 +139,21 @@ pub struct State {
     pub key: StateKey,
     /// The clip the state plays.
     pub clip: AssetRef<Clip>,
-    /// The playback speed, one for the clip's authored rate.
+    /// The playback speed, one for the clip's authored rate; finite and not negative.
     pub speed: Scalar,
     /// A parameter whose value multiplies `speed` (a walk cycle scaled by the character's
-    /// speed), or `None`.
+    /// speed, which the game quantises first, D124: `AnimParams::quantise`), or `None`. A
+    /// product that is not finite, negative or zero holds the state (`Phase::rate`).
     pub speed_param: Option<ParamIndex>,
 }
 
-/// A transition from one state (or any state) to another.
+/// A transition from one state (or any state) to another, or from a state to itself: a
+/// restart, which enters the state again (entered, the phase set or kept, a blend between
+/// the clip at its two phases if `blend_ticks` is set).
 #[derive(Clone, PartialEq, Debug)]
 pub struct Transition {
-    /// The state the transition leaves, or `None` for any state but `to`.
+    /// The state the transition leaves, or `None` for any state but `to` (an any-state
+    /// transition never restarts its target; a restart names `from` equal to `to`).
     pub from: Option<StateIndex>,
     /// The state it enters.
     pub to: StateIndex,
@@ -206,10 +221,11 @@ impl StateMachine {
     }
 
     /// The checks the loader runs: fewer than `u16::MAX` states and at least one; `initial`
-    /// and every transition's `from` and `to` in range, with `to` not equal to `from`; every
-    /// `speed_param` and every condition's `param` below [`PARAM_SLOTS`], every flag and
-    /// trigger bit below 32; no two states with one key; every speed finite. `InvalidData`
-    /// otherwise, naming the first failure.
+    /// and every transition's `from` and `to` in range (`from` equal to `to` is a restart
+    /// and allowed); every `speed_param` and every condition's `param` below
+    /// [`PARAM_SLOTS`], every flag and trigger bit below 32; no two states with one key;
+    /// every speed finite and not negative. `InvalidData` otherwise, naming the first
+    /// failure.
     pub fn validate(&self) -> Result<()> {
         todo!()
     }
@@ -280,7 +296,12 @@ pub struct BoneBody {
     /// makes it kinematic and [`Bones::set_limp`](crate::Bones::set_limp) dynamic, whatever
     /// `body_type` says here.
     pub body: RigidBody,
-    /// The collider, placed in the bone's space.
+    /// The collider, placed in the bone's space. Its `groups` follow the bone rule
+    /// (`README.md`, "Bones and ragdolls"): a bone collider's `filter` admits none of its
+    /// own `membership` bits, so no bone touches a bone, its owner's or another's, and the
+    /// game keeps the character capsule's groups and the bone groups disjoint; what hits a
+    /// bone is a query, a sensor or a weapon collider in a group the bone admits.
+    /// [`Skeleton::validate`] checks the first half.
     pub collider: Collider,
     /// The joint to the nearest ancestor bone that has a body, or `None` for the ragdoll's
     /// root body.
@@ -347,9 +368,10 @@ impl Skeleton {
     /// zero without a parent and every other bone's parent before it; no two bones with one
     /// key and no two with one role other than `Other`; every socket on a bone in range; a
     /// joint only on a bone that has a body, and a body's joint reaching an ancestor with a
-    /// body (the ragdoll's root body alone has none); every rest rotation a unit
-    /// quaternion and every scalar finite. `InvalidData` otherwise, naming the first
-    /// failure.
+    /// body (the ragdoll's root body alone has none); every body's collider with
+    /// `groups.membership & groups.filter == 0` (the bone rule, [`BoneBody::collider`]);
+    /// every rest rotation a unit quaternion and every scalar finite. `InvalidData`
+    /// otherwise, naming the first failure.
     pub fn validate(&self) -> Result<()> {
         todo!()
     }

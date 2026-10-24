@@ -13,10 +13,12 @@ use crate::phase::Phase;
 /// An authored clip event whose phase the character's state passed this tick, emitted by
 /// `anim::advance` with the character's own origin key as the target, so a later kernel on
 /// the same row reads its events with `Events::<AnimEvent>::for_target(*key)` and a
-/// once-per-tick system reads every character's with `iter`. Emitted in ascending phase
-/// order within the tick for one character, and once per pass over the event's phase
-/// (`README.md`, "Phase and crossings"); the phase is the event's authored phase, not the
-/// state's. Cleared at the input sync point like every event, and never in a snapshot.
+/// once-per-tick system reads every character's with `iter`. Emitted in the order the
+/// advance passed them: ascending by phase, and across a wrap those in `(from, END]`
+/// ascending, then those in `[ZERO, to]` ascending; once per pass over the event's phase,
+/// by the rule of `AnimState::phase_crossed` (`README.md`, "Phase and crossings"); the
+/// phase is the event's authored phase, not the state's. Cleared at the input sync point
+/// like every event, and never in a snapshot.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct AnimEvent {
     /// The character whose clip carried the event: its origin key.

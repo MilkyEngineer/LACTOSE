@@ -13,7 +13,7 @@ use lactose_asset_api::AssetRef;
 use lactose_core::{EntityRef, PlainArray, StableKey};
 use lactose_ecs::Commands;
 use lactose_math::{Quat, Scalar, Vec3};
-use lactose_physics_api::Transform;
+use lactose_physics_api::{Transform, Velocity};
 use lactose_reflect::{Padding, ZeroByte, component, value};
 
 use crate::assets::{Clip, MAX_SIM_BONES, PARAM_SLOTS, Skeleton, StateMachine};
@@ -51,6 +51,13 @@ pub struct BonePose {
 impl BonePose {
     /// At the parent's origin, unrotated.
     pub const IDENTITY: Self = Self { translation: Vec3::ZERO, rotation: Quat::IDENTITY };
+
+    /// Every scalar zero: not a valid pose (its rotation has no length), the bytes a zeroed
+    /// transient column holds and what an unused [`SimPose`] slot is.
+    pub const ZERO: Self = Self {
+        translation: Vec3::ZERO,
+        rotation: Quat::new(Scalar::ZERO, Scalar::ZERO, Scalar::ZERO, Scalar::ZERO),
+    };
 
     /// A pose from its parts.
     #[must_use]
@@ -156,7 +163,7 @@ pub struct AnimState {
     /// The length of the blend in ticks, from the transition; zero when none is in progress.
     #[field(id = 7)]
     blend_ticks: u16,
-    /// [`Self::ENTERED`] and [`Self::FINISHED`].
+    /// [`Self::ENTERED`], [`Self::FINISHED`] and [`Self::ENTRY_SET`].
     #[field(id = 8)]
     flags: u8,
     #[field(padding)]
@@ -168,6 +175,11 @@ impl AnimState {
     const ENTERED: u8 = 1;
     /// The state's one-shot clip has reached [`Phase::END`], this tick or earlier.
     const FINISHED: u8 = 1 << 1;
+    /// This tick's entry set the phase (the initial state, or a transition without
+    /// `keep_phase`) rather than keeping the outgoing state's, so a mark at the entry phase
+    /// counts on the entry tick; a kept phase was already passed by the tick that reached
+    /// it.
+    const ENTRY_SET: u8 = 1 << 2;
 
     /// No state yet: what a character is spawned with. The first `anim::advance` enters the
     /// machine's initial state at phase zero and marks it entered.
@@ -195,7 +207,7 @@ impl AnimState {
             state,
             previous_state: state,
             blend_ticks: 0,
-            flags: Self::ENTERED,
+            flags: Self::ENTERED | Self::ENTRY_SET,
             _pad: pad(),
         }
     }
@@ -231,6 +243,14 @@ impl AnimState {
         self.flags & Self::ENTERED != 0
     }
 
+    /// Whether this tick's entry set the phase (the initial state, or a transition without
+    /// `keep_phase`) rather than keeping the outgoing state's phase. False when the state
+    /// was not entered this tick.
+    #[must_use]
+    pub const fn entry_was_set(&self) -> bool {
+        self.flags & (Self::ENTERED | Self::ENTRY_SET) == (Self::ENTERED | Self::ENTRY_SET)
+    }
+
     /// Whether the state's clip is a one-shot whose phase has reached [`Phase::END`]: set on
     /// the tick it gets there and kept until the state changes. Never set in a looping
     /// state.
@@ -246,14 +266,18 @@ impl AnimState {
     }
 
     /// Whether this tick's advance passed `mark` in the current state's clip: section 6.1's
-    /// `phase_crossed`. True exactly once per pass over the mark: on the tick the phase
-    /// reaches or passes it, through the wrap of a looping clip, and on the entry tick for a
-    /// mark at or after the entry phase up to the phase reached (so a mark at phase zero
-    /// fires when a state is entered at zero). On a tick with no advance (speed zero, a
-    /// missing asset) nothing is passed.
+    /// `phase_crossed`, [`Phase::passed`] from the previous phase to the phase, plus the
+    /// entry phase itself on the tick the state was entered with a set phase (the initial
+    /// state, or a transition without `keep_phase`), so a mark at phase zero fires when a
+    /// state is entered at zero. A kept phase was already passed by the tick that reached
+    /// it, so the entry tick of a `keep_phase` transition reports only what its own advance
+    /// passed. True exactly once per pass over the mark: on the tick the phase reaches or
+    /// passes it, through the wrap of a looping clip. On a tick with no advance (rate zero,
+    /// a missing asset) nothing is passed.
     #[must_use]
     pub const fn phase_crossed(&self, mark: Phase) -> bool {
-        todo!()
+        Phase::passed(self.previous_phase, self.phase, mark)
+            || (self.entry_was_set() && mark.0 == self.previous_phase.0)
     }
 
     /// The transition blend in progress, if any: the outgoing state, its phase, and the
@@ -291,6 +315,13 @@ pub struct Blend {
 /// clears a trigger. Persistent and replicated: a parameter holds across ticks like an
 /// animator's parameter, so a game writes a value when it changes rather than every tick,
 /// and a predicted character's parameters are corrected with its state.
+///
+/// D124's rule applies to the values: a replicated field compares by canonical bits, so a
+/// value derived from a solver-written row (a speed from `Velocity`) is quantised to an
+/// integer grid first ([`quantise`](Self::quantise)) or taken from the input sample, or
+/// every residual the root's tolerance absorbs becomes a mismatch here and a correction.
+/// The bits are checked: a `bit` of 32 or more is a debug assertion, and in a release
+/// build the flag reads false and the write does nothing.
 #[component(key = "anim::params", persistent, replicated)]
 #[derive(PartialEq, Debug)]
 pub struct AnimParams {
@@ -300,8 +331,9 @@ pub struct AnimParams {
     /// Level flags, one bit each, kept until the game clears them.
     #[field(id = 2)]
     pub flags: u32,
-    /// Triggers, one bit each: set by the game, read by the next `anim::advance` for its
-    /// transitions and cleared by it, so a trigger fires at most one transition.
+    /// Triggers, one bit each: set by the game, read by the next advance that tries
+    /// transitions and cleared by it, so a trigger fires at most one transition
+    /// (`README.md`, "The state machine", says which advances try).
     #[field(id = 3)]
     pub triggers: u32,
 }
@@ -311,38 +343,63 @@ impl AnimParams {
     pub const ZERO: Self =
         Self { values: PlainArray([Scalar::ZERO; PARAM_SLOTS]), flags: 0, triggers: 0 };
 
+    /// The mask of `bit`, or zero for a bit past the word (a debug assertion).
+    const fn mask(bit: u8) -> u32 {
+        debug_assert!(bit < 32, "a flag or trigger bit is below 32");
+        match 1u32.checked_shl(bit as u32) {
+            Some(mask) => mask,
+            None => 0,
+        }
+    }
+
     /// Whether flag `bit` is set.
     #[must_use]
     pub const fn flag(&self, bit: u8) -> bool {
-        self.flags & (1 << bit) != 0
+        self.flags & Self::mask(bit) != 0
     }
 
     /// Sets or clears flag `bit`.
     pub const fn set_flag(&mut self, bit: u8, on: bool) {
         if on {
-            self.flags |= 1 << bit;
+            self.flags |= Self::mask(bit);
         } else {
-            self.flags &= !(1 << bit);
+            self.flags &= !Self::mask(bit);
         }
     }
 
-    /// Sets trigger `bit`, for the next advance to consume.
+    /// Sets trigger `bit`, for the next advance that tries transitions to consume.
     pub const fn trigger(&mut self, bit: u8) {
-        self.triggers |= 1 << bit;
+        self.triggers |= Self::mask(bit);
+    }
+
+    /// `value` snapped to the nearest multiple of `1 / steps_per_unit`: the one-liner a game
+    /// uses before it stores a solver-derived quantity (a speed from `Velocity`) in a value,
+    /// so that the server's and the client's values agree by bits wherever the quantities
+    /// agree within half a step (D124). `round` toward the nearest integer through
+    /// `lactose_math`, then one division; a non-finite `value` or a zero `steps_per_unit`
+    /// gives zero.
+    #[must_use]
+    pub fn quantise(value: Scalar, steps_per_unit: u32) -> Scalar {
+        if steps_per_unit == 0 || !value.is_finite() {
+            return Scalar::ZERO;
+        }
+        let steps = Scalar::from_u32(steps_per_unit);
+        Scalar::from_i64((value * steps).round().to_i64()) / steps
     }
 }
 
 /// The displacement the current state's clip moved its root by this tick, in the
-/// character's own space (`-Z` forward, `+Y` up, architecture section 5.3): what the
-/// character's movement system applies to its `Transform` or `Velocity`, this crate never
-/// moving the root itself. Written by `anim::advance` every tick (zero when the clip has no
-/// root track, during a hold, or when the rig's assets are missing) and zeroed at the input
-/// sync point. During a transition blend the outgoing clip's displacement is blended in by
-/// the blend weight.
+/// character's own space as it was at the start of the tick (`-Z` forward, `+Y` up,
+/// architecture section 5.3; `Clip::root_motion` turns the track's clip-start-space
+/// difference back by the yaw already turned): what the character's movement system
+/// applies to its `Transform` or `Velocity`, this crate never moving the root itself.
+/// Written by `anim::advance` every tick (zero when the clip has no root track, during a
+/// hold, or when the rig's assets are missing) and zeroed at the input sync point. During
+/// a transition blend the outgoing clip's displacement is blended in by the blend weight.
 #[component(key = "anim::root_motion", transient)]
 #[derive(PartialEq, Debug)]
 pub struct RootMotion {
-    /// The root's displacement this tick, in the character's space.
+    /// The root's displacement this tick, in the character's space at the tick's start.
     #[field(id = 1)]
     pub translation: Vec3,
     /// The root's turn this tick about `+Y`, in radians, positive to the left.
@@ -356,8 +413,8 @@ impl RootMotion {
 
     /// `root` moved by this motion: the translation turned into world space by the root's
     /// rotation and added, the yaw applied about the world's `+Y` before the root's
-    /// rotation. What a kinematic character writes to its `Transform` (the physics sync
-    /// sweeps it there) and a dynamic one divides by the tick delta into its `Velocity`.
+    /// rotation. What a kinematic character writes to its `Transform`: the physics sync
+    /// sweeps it there during the step.
     #[must_use]
     pub fn apply(&self, root: &Transform) -> Transform {
         Transform::new(
@@ -365,19 +422,41 @@ impl RootMotion {
             Quat::from_rotation_y(self.yaw) * root.rotation,
         )
     }
+
+    /// This motion as the velocity that covers it in one tick of `dt` seconds: the
+    /// translation turned into world space by the root's rotation and divided by `dt`, the
+    /// yaw divided by `dt` as an angular velocity about the world's `+Y`. What a dynamic
+    /// character writes to its `Velocity` (the physics sync sets it, the step integrates it):
+    /// the solver then turns the body as it moves it, with no placement and so no
+    /// `Teleported`, which keeps clients interpolating; such a character locks
+    /// `ROTATION_X | ROTATION_Z` and leaves `ROTATION_Y` free, and takes the solver's own
+    /// contribution to its yaw (contact torque, damping) as the price of being dynamic. A
+    /// zero `dt` gives `Velocity::ZERO`.
+    #[must_use]
+    pub fn velocity(&self, root: &Transform, dt: Scalar) -> Velocity {
+        if dt == Scalar::ZERO {
+            return Velocity::ZERO;
+        }
+        Velocity {
+            linear: root.rotation * self.translation / dt,
+            angular: Vec3::Y * (self.yaw / dt),
+        }
+    }
 }
 
 /// The evaluated sim skeleton: every bone's pose relative to the character's root, in the
-/// skeleton's bone order, for the state (and blend) the character is in this tick. Written
-/// by `anim::evaluate` in `Stage::Simulation`, from the clips alone, so it is valid for the
-/// whole tick whatever the root does; a reader composes a bone with the root `Transform` of
-/// the moment through [`world`](Self::world): the stepped root in `Stage::Post`, which is
-/// where hit volumes, hand and foot placement and sockets are read. Rewritten in
-/// `Stage::Post` by `anim::fit_ragdoll` for a limp ragdoll, from the bone rows' stepped
-/// transforms. Transient (zeroed at the input sync point, hashed, so SOUR catches a
-/// layout-dependent evaluation) and extracted, so presentation reads the sim bones from the
-/// snapshot beside the root it interpolates. A character without this component is never
-/// evaluated.
+/// skeleton's bone order, for the state (and blend) the character is in this tick. For an
+/// animated character it is written by `anim::evaluate` in `Stage::Simulation`, from the
+/// clips alone, so it is valid for the whole tick whatever the root does; a reader composes
+/// a bone with the root `Transform` of the moment through [`world`](Self::world): the
+/// stepped root in `Stage::Post`, which is where hit volumes, hand and foot placement and
+/// sockets are read. For a limp ragdoll `anim::evaluate` leaves it [`EMPTY`](Self::EMPTY)
+/// and `anim::fit_ragdoll` writes it in `Stage::Post` from the bone rows' stepped
+/// transforms, so a limp character's pose exists from [`sets::FIT`](crate::sets::FIT) on
+/// and a `Stage::Simulation` reader finds it empty. Transient (zeroed at the input sync
+/// point, hashed, so SOUR catches a layout-dependent evaluation) and extracted, so
+/// presentation reads the sim bones from the snapshot beside the root it interpolates. A
+/// character without this component is never evaluated.
 #[component(key = "anim::sim_pose", transient, extracted)]
 #[derive(PartialEq, Debug)]
 pub struct SimPose {
@@ -392,10 +471,11 @@ pub struct SimPose {
 }
 
 impl SimPose {
-    /// No bones: what a character is spawned with, and what a tick leaves when the rig's
-    /// assets are missing.
+    /// No bones, every slot zero: the bytes of a zeroed transient column, what a character
+    /// is spawned with, and what a tick leaves when the rig's assets are missing or the
+    /// character is limp before the fit. Writing it onto a zeroed row changes no byte.
     pub const EMPTY: Self =
-        Self { bones: PlainArray([BonePose::IDENTITY; MAX_SIM_BONES]), count: 0, _pad: pad() };
+        Self { bones: PlainArray([BonePose::ZERO; MAX_SIM_BONES]), count: 0, _pad: pad() };
 
     /// The skeleton's rest pose, each bone's rest composed down its parent chain: what a
     /// character shows before its first evaluation, and what a test compares an evaluation
@@ -496,7 +576,10 @@ pub struct Outgoing<'a> {
 /// dynamic and the pose follows them instead. Holds references, so it is written through
 /// `Commands::set` only ([`spawn`](Self::spawn), [`set_limp`](Self::set_limp)) and the
 /// schedule refuses `Mut` on it. Replicated, since the kernels that read it run in the
-/// prediction world; the bone rows themselves are replicated through their own components.
+/// prediction world. The bone rows themselves never go on the wire: they are rebuilt on
+/// each side from the character's `AnimState` and root, by the server's and the local
+/// player's own kernels, under `lactose-net-api`'s proposed `Unreplicated` marker
+/// (`README.md`, "Prediction and replication").
 #[component(key = "anim::bones", persistent, replicated)]
 #[derive(PartialEq, Eq, Debug)]
 pub struct Bones {
@@ -519,16 +602,20 @@ impl Bones {
     /// this component onto `owner` naming them. For every bone with a [`BoneBody`]: a row
     /// with `Transform` (the bone's world pose), the body's `RigidBody` made
     /// [`kinematic`](lactose_physics_api::RigidBody::kinematic), its `Collider`, `OwnedBy`
-    /// the owner and a [`BoneLink`] back to it; and for every such bone with a
+    /// the owner and a [`BoneLink`] back to it (the physics write-back adds a `Velocity`
+    /// at the first step that sweeps it); and for every such bone with a
     /// [`BoneJoint`](crate::BoneJoint) whose parent chain reaches a bone with a body, a
-    /// `Joint` row to that body, owned by the bone row. The placeholders are resolved at
-    /// apply, so the owner's row names its bones from the next sync point on. The calling
-    /// kernel declares `writes = [Bones]`; the spawns are structural and need no
-    /// declaration. A second call on an owner that has bones spawns a second set: despawn
-    /// the owner's bones first (despawning the owner does).
+    /// `Joint` row to that body, owned by the bone row. Spawned from the character's own
+    /// kernel, the rows inherit its claim in the prediction world, which is what lets the
+    /// bone kernels run there; they are never replicated or compared (`README.md`,
+    /// "Prediction and replication"). The placeholders are resolved at apply, so the
+    /// owner's row names its bones from the next sync point on. The calling kernel declares
+    /// `writes = [Bones]`; the spawns are structural and need no declaration. A second call
+    /// on an owner that already has bones does nothing and is logged at target `anim`.
     pub fn spawn(
         cmd: &mut Commands<'_>,
         owner: StableKey,
+        existing: Option<&Self>,
         skeleton: &Skeleton,
         root: &Transform,
         pose: &SimPose,

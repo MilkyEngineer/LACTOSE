@@ -13,12 +13,14 @@ not here.
 | Unsafe | none, `#![forbid(unsafe_code)]` |
 
 **Status: facade.** Every public signature is final and every deciding body is `todo!()`;
-the registration functions, the integer and compositional helpers are real. Every sentence
-under "Behaviour the signatures cannot express" is one a dependent crate may rely on and
-the implementation must meet. Architecture sections 4, 5.3, 6, 6.1, 8.2, 9.4, 13, 14, 15.1,
-16, 17 and 22 are the design; where this file and the architecture disagree, the
-architecture wins and this file is wrong. Decision D128 records the choices those sections
-left open. `crates/ecs/README.md`, `crates/sim/README.md`, `crates/physics-api/README.md`,
+the registration functions and the integer, compositional and phase helpers (`Phase::rate`,
+`Phase::passed`, `AnimState::phase_crossed`, `AnimParams::quantise`, `RootMotion::apply`
+and `velocity`, `BonePose::compose` and `blend`) are real. Every sentence under "Behaviour
+the signatures cannot express" is one a dependent crate may rely on and the implementation
+must meet. Architecture sections 4, 5.3, 6, 6.1, 8.2, 9.4, 13, 14, 15.1, 16, 17 and 22 are
+the design; where this file and the architecture disagree, the architecture wins and this
+file is wrong. Decision D128 records the choices those sections left open.
+`crates/ecs/README.md`, `crates/sim/README.md`, `crates/physics-api/README.md`,
 `crates/predict/README.md` and `crates/asset-api/README.md` are the contracts this crate
 builds on and never restates: what they say about commands, events, transient columns,
 stages and sets, bodies and the write-back, the prediction world's filter and build check,
@@ -35,11 +37,11 @@ every world kind: a change that breaks it is a signature change to list.
 | Item | Purpose |
 |---|---|
 | `AnimRig` | Which state machine and sim skeleton a character animates with: two `AssetRef`s, persistent, replicated, extracted |
-| `AnimState`, `Blend`, `StateIndex` | Where the state machine is: the state, its phase before and after this tick, the outgoing state and phase of a blend, ticks in state, entered and finished; `phase_crossed` is section 6.1's test; persistent, replicated, extracted, all integers |
-| `AnimParams`, `ParamIndex`, `PARAM_SLOTS` | What the game tells the machine: eight scalar values, level flags, one-tick triggers; persistent, replicated |
-| `RootMotion` | What the clip moved the root by this tick, in character space, for the movement system to apply; transient |
+| `AnimState`, `Blend`, `StateIndex` | Where the state machine is: the state, its phase before and after this tick, the outgoing state and phase of a blend, ticks in state, entered (and whether the entry set the phase), finished; `phase_crossed` is section 6.1's test; persistent, replicated, extracted, all integers |
+| `AnimParams`, `ParamIndex`, `PARAM_SLOTS` | What the game tells the machine: eight scalar values, level flags, one-tick triggers, the bits checked; `quantise` for a solver-derived value (D124); persistent, replicated |
+| `RootMotion` | What the clip moved the root by this tick, in the character's space at the tick's start, for the movement system to apply: `apply` for a kinematic root, `velocity` for a dynamic one; transient |
 | `SimPose`, `BonePose`, `BoneIndex`, `Outgoing`, `MAX_SIM_BONES` | The evaluated sim skeleton, root-local, at most sixteen bones; `world` and `socket` place a bone by a root `Transform`; `evaluate` is the per-character work; transient, extracted |
-| `Phase` | A clip fraction in units of `1 / 2^32`: wrapping for a loop, saturating at `END` for a one-shot; `rate`, `advanced`, `passed` |
+| `Phase` | A clip fraction in units of `1 / 2^32`: wrapping for a loop, saturating at `END` for a one-shot; `rate` (integer, from a Q16.16 speed), `advanced`, `passed`, `fraction` |
 | `AnimEvent`, `AnimEventKey` | An authored clip event the phase passed this tick, emitted to the character's own key |
 | `Bones`, `BoneLink`, `BoneMoved` | A character's bone rows (kinematic bodies swept to the pose, or limp and driving it), the row's link back, and the event a limp bone reports its stepped transform with |
 | `Clip`, `RootSample`, `ClipEvent`, `ClipLoader` | A clip cooked for one skeleton: parent-local samples per bone, a root track, events; kind `anim::clip` |
@@ -50,24 +52,23 @@ every world kind: a change that breaks it is a signature change to list.
 Hidden plumbing: none. The five systems live in a private module and `sets` is the only
 way to order against them; `SimPose::set_bone` is crate-private, the ragdoll fit's write.
 What the implementation may reshape without a signature change: the cooked byte form of
-the three asset kinds (named only, below), and the bodies of `Phase::rate`,
-`Phase::passed`, `AnimState::phase_crossed`, `Clip::sample`, `Clip::root_motion`,
-`SimPose::evaluate`, `SimPose::rest`, `Bones::spawn` and `Bones::set_limp`, each of whose
-contract is its doc comment and the sections below.
+the three asset kinds (named only, below), and the bodies of `Clip::sample`,
+`Clip::root_motion`, `SimPose::evaluate`, `SimPose::rest`, `Bones::spawn`, `Bones::set_limp`
+and the three `validate`s, each of whose contract is its doc comment and the sections below.
 
 ## What each consumer needs, and where this surface gives it
 
 | Consumer | Needs | Where |
 |---|---|---|
 | Game crates (`game-sim`, milestone 5; the milestone 1 spike's predicted character) | A state machine and phase advanced per tick from simulation inputs | `AnimParams` written in `sets::DRIVE` (`Mut`, `set_if_neq`); `anim::advance` in `sets::ADVANCE` reads them and writes `AnimState`; the machine is the `AnimRig`'s asset |
-| | Phase crossings and authored events as deterministic events | `AnimState::phase_crossed(mark)` in any system after `sets::ADVANCE`; `Events<AnimEvent>` with `for_target(*key)` ("Phase and crossings" below) |
-| | Root motion as a displacement the movement system applies | `RootMotion` after `sets::ADVANCE`, `RootMotion::apply(&Transform)` for the kinematic sweep target or the velocity ("Root motion" below); this crate never moves the root |
-| | Hand, foot, head and socket transforms for hit volumes and placement | `SimPose::world(&root, bone)` and `SimPose::socket(..)` with `Skeleton::bone_of(BoneRole)` and `Skeleton::socket(BoneKey)`, after `sets::EVALUATE` in `Stage::Simulation` or after `sets::BONES` in `Stage::Post` with the stepped root |
+| | Phase crossings and authored events as deterministic events, exactly once per pass | `AnimState::phase_crossed(mark)` in any system after `sets::ADVANCE`; `Events<AnimEvent>` with `for_target(*key)` ("Phase and crossings" below) |
+| | Root motion as a displacement the movement system applies, to a kinematic or a dynamic root | `RootMotion` after `sets::ADVANCE`: `apply(&Transform)` is the kinematic sweep target, `velocity(&Transform, dt)` the dynamic body's `Velocity` ("Root motion" below); this crate never moves the root |
+| | Hand, foot, head and socket transforms for hit volumes and placement | `SimPose::world(&root, bone)` and `SimPose::socket(..)` with `Skeleton::bone_of(BoneRole)` and `Skeleton::socket(BoneKey)`, after `sets::EVALUATE` in `Stage::Simulation` (animated characters) or after `sets::BONES` in `Stage::Post` with the stepped root (every character, the fitted ragdoll included) |
 | | Everything in fixed point or `lactose_math` scalars, keyed by `StableKey`, under section 8.2 | `Phase` and every `AnimState` field are integers; values are `Scalar`; keys are origin keys ("Keys and units" below) |
 | | A ragdoll, and bodies to hit | `Bones::spawn` and `Bones::set_limp` from the character's own kernel ("Bones and ragdolls" below) |
-| `predict`, `net-api` | Which components are persistent and replicated, and that every simulation-read field compares at full precision | `AnimRig`, `AnimState`, `AnimParams`, `Bones` and `BoneLink` are `persistent, replicated`; `RootMotion` and `SimPose` are `transient`; the replicated integers compare by bytes, the parameter scalars by canonical bits ("Prediction and replication" below); nothing holds state outside rows and no channel exists |
-| `physics-api` | The ragdoll bodies as bodies or colliders, and the direction | Bone rows with `Transform`, `RigidBody` and `Collider`, joints as `Joint` rows: the pose drives kinematic bodies through `Commands::set` of `Transform` in `Stage::Post`; limp, dynamic bodies drive the pose through `BoneMoved` events ("Bones and ragdolls" below) |
-| Presentation (milestones 2 and 3) | The sim skeleton's evaluated transforms as rows the presentation schedule reads | `SimPose` (`extracted`, root-local) beside the extracted root `Transform`; `AnimRig` and `AnimState` extracted for the render pose ("Presentation" below) |
+| `predict`, `net-api` | Which components are persistent and replicated, that every simulation-read field compares at full precision, and that no replicated field is derived from a solver-written value (D124) | `AnimRig`, `AnimState`, `AnimParams`, `Bones` and `BoneLink` are `persistent, replicated`; `RootMotion` and `SimPose` are `transient`; the replicated integers compare by bytes, the parameter scalars by canonical bits, so a solver-derived parameter goes through `AnimParams::quantise`; bone rows never go on the wire ("Prediction and replication" below); nothing holds state outside rows and no channel exists |
+| `physics-api` | The ragdoll bodies as bodies or colliders, the direction, and a collider rule that keeps them off their owner | Bone rows with `Transform`, `RigidBody` and `Collider`, joints as `Joint` rows: the pose drives kinematic bodies through `Commands::set` of `Transform` in `Stage::Post`; limp, dynamic bodies drive the pose through `BoneMoved` events; a bone collider admits no bone and no capsule ("Bones and ragdolls" below) |
+| Presentation (milestones 2 and 3) | The sim skeleton's evaluated transforms as rows the presentation schedule reads | `SimPose` (`extracted`, root-local, the fitted pose for a limp character) beside the extracted root `Transform`; `AnimRig` and `AnimState` extracted for the render pose ("Presentation" below) |
 | Assets (`asset`, `cook`) | The authored clip, machine and skeleton data as `asset-api` kinds, and the cooked form named | `Clip`, `StateMachine`, `Skeleton` with `KIND` and `FORMAT_VERSION`; `ClipLoader`, `StateMachineLoader`, `SkeletonLoader` through `ErasedLoader::new`; the byte form is named only ("Assets" below) |
 | `sim`, SOUR | Systems placed in the stages, readers after them, every type registered | `register_systems` puts `ADVANCE` and `EVALUATE` in `Stage::Simulation` and `REPORT`, `FIT`, `BONES` in `Stage::Post`; `register_types` ("The tick" below) |
 | `app` | Registration beside every other crate's, in every world kind | `register_types` and `register_systems`; no setup function, no resource |
@@ -75,11 +76,13 @@ contract is its doc comment and the sections below.
 ## The registration a game crate writes
 
 ```rust
-use lactose_anim::{AnimParams, AnimState, RootMotion, SimPose, sets};
-use lactose_ecs::{Mut, SystemSet, system};
+use lactose_anim::{AnimParams, AnimState, Phase, RootMotion, SimPose, sets};
+use lactose_ecs::{Mut, PresentEvents, StableKeyOf, SystemSet, system};
 use lactose_physics_api::Transform;
 use lactose_sim::{Registration, Stage};
 
+/// Section 6.1's `footsteps` goes here: after the advance, which writes the state it reads.
+pub static ANIM_READERS: SystemSet = SystemSet::new("game_sim::anim_readers").after(&[&sets::ADVANCE]);
 /// Readers of the state, the root motion and the events, in `Stage::Simulation`.
 pub static MOVEMENT: SystemSet = SystemSet::new("game_sim::movement").after(&[&sets::EVALUATE]);
 /// Readers of the stepped pose, in `Stage::Post`.
@@ -89,6 +92,11 @@ pub static HITS: SystemSet = SystemSet::new("game_sim::hits").after(&[&sets::BON
 #[system(name = "game_sim::drive_anim", worlds = [server, prediction], in_set = sets::DRIVE)]
 fn drive_anim(params: Mut<AnimParams> /* , the game's inputs */) { /* params.set_if_neq(..) */ }
 
+#[system(name = "game_sim::footsteps", worlds = [server, prediction], in_set = ANIM_READERS)]
+fn footsteps(present: PresentEvents, key: StableKeyOf, anim: &AnimState) {
+    if anim.phase_crossed(Phase::HALF) { /* present.emit(*key, AudioRequest::footstep(..)) */ }
+}
+
 #[system(name = "game_sim::apply_root_motion", worlds = [server, prediction], in_set = MOVEMENT)]
 fn apply_root_motion(motion: &RootMotion, pos: Mut<Transform>) {
     let next = motion.apply(&pos);
@@ -96,7 +104,12 @@ fn apply_root_motion(motion: &RootMotion, pos: Mut<Transform>) {
 }
 
 pub fn register_systems(registration: &mut Registration) {
-    registration.stage(Stage::Simulation).sets(&[&MOVEMENT]).add(&DRIVE_ANIM).add(&APPLY_ROOT_MOTION);
+    registration
+        .stage(Stage::Simulation)
+        .sets(&[&ANIM_READERS, &MOVEMENT])
+        .add(&DRIVE_ANIM)
+        .add(&FOOTSTEPS)
+        .add(&APPLY_ROOT_MOTION);
     registration.stage(Stage::Post).sets(&[&HITS]);
 }
 ```
@@ -106,7 +119,8 @@ pub fn register_systems(registration: &mut Registration) {
 adds `lactose_anim::register_systems` with `SimulationBuilder::systems`. There is no setup
 function: this crate holds no resource. A character is spawned with the five components
 (`AnimRig`, `AnimState::UNSET`, `AnimParams::ZERO`, `RootMotion::ZERO`, `SimPose::EMPTY`)
-beside its `Transform`; `tests/consumers.rs` is the whole of it.
+beside its `Transform`; `tests/consumers.rs` is the whole of it, section 6.1's `footsteps`
+included as the architecture writes it.
 
 ## Behaviour the signatures cannot express
 
@@ -124,12 +138,15 @@ beside its `Transform`; `tests/consumers.rs` is the whole of it.
   computed, no clock is read, no map is iterated, and nothing but rows carries state across
   a tick: the assets are immutable, pinned by the region, and read through `Ctx::assets`.
 - Character space is the simulation's: right-handed, `+Y` up, `-Z` forward at yaw zero, a
-  positive yaw turning left (architecture section 5.3). A clip's samples, its root track
-  and `RootMotion` are in it; a `SimPose` is in it relative to the root; the cooker turns
+  positive yaw turning left (architecture section 5.3). A clip's samples are in it; a
+  clip's root track is in it as it was at the clip's start; `RootMotion` is in it as it is
+  at the start of the tick; a `SimPose` is in it relative to the root. The cooker turns
   glTF's `+Z` forward half a turn about `+Y` as it does for meshes.
 - Every component is its scalars then a tail that is a multiple of eight bytes, sizes
   asserted in `lib.rs` for both scalar widths; a field added later takes the next free ID
-  and never renumbers another.
+  and never renumbers another. `AnimParams` checks its bits: a flag or trigger bit of 32 or
+  more is a debug assertion, and in a release build the flag reads false and the write does
+  nothing.
 
 **The tick** (architecture sections 5.2, 6.1 and 16; `crates/sim/README.md`, the stages)
 
@@ -137,20 +154,27 @@ Five systems, every one `worlds = [server, prediction]`, in six sets. In `Stage:
 in this order: the game's parameter writers in `sets::DRIVE` (this crate places nothing
 there); `anim::advance` in `sets::ADVANCE` (`Ctx`, `EventWriter<AnimEvent>`, `&AnimRig`,
 `Mut<AnimParams>`, `Mut<AnimState>`, `Mut<RootMotion>`); `anim::evaluate` in
-`sets::EVALUATE` (`Ctx`, `&AnimRig`, `&AnimState`, `Mut<SimPose>`). In `Stage::Post`, after
-the physics write-back, which is exclusive and needs no edge: `anim::report_bones` in
-`sets::REPORT` (`EventWriter<BoneMoved>`, `&BoneLink`, `&Transform`); `anim::fit_ragdoll`
-in `sets::FIT` (`Events<BoneMoved>`, `StableKeyOf`, `&Bones`, `&Transform`,
-`Mut<SimPose>`); `anim::drive_bones` in `sets::BONES` (`Commands`, `&Bones`, `&SimPose`,
-`&Transform`, `writes = [Transform]`).
+`sets::EVALUATE` (`Ctx`, `&AnimRig`, `&AnimState`, `Option<&Bones>`, `Mut<SimPose>`). In
+`Stage::Post`, after the physics write-back, which is exclusive and needs no edge:
+`anim::report_bones` in `sets::REPORT` (`EventWriter<BoneMoved>`, `&BoneLink`,
+`&Transform`); `anim::fit_ragdoll` in `sets::FIT` (`Ctx`, `Events<BoneMoved>`,
+`StableKeyOf`, `&AnimRig`, `&AnimState`, `&Bones`, `&Transform`, `Mut<SimPose>`);
+`anim::drive_bones` in `sets::BONES` (`Commands`, `&Bones`, `&SimPose`, `&Transform`, no
+declared write).
 
 - The rule a game follows, which the schedule enforces by refusing the build on an
   unordered conflict: a `Stage::Simulation` system that touches `AnimParams`, `AnimState`,
   `RootMotion` or `SimPose` is in `sets::DRIVE` (a parameter writer) or in a set declared
   `.after(&[&sets::ADVANCE])` or `.after(&[&sets::EVALUATE])`; a `Stage::Post` system that
-  touches `Transform`, `SimPose` or `Bones` is in a set declared `.after(&[&sets::BONES])`.
-  `sets::DRIVE` is the one set another crate's systems are placed in; `app` may instead
-  order the game's own set before `sets::ADVANCE` with `Registration::order`.
+  reads `SimPose`, or that declares a write of `Bones`, `BoneLink` or `RigidBody` (the
+  ragdoll helpers), is in a set declared `.after(&[&sets::BONES])`. A `Stage::Post` reader
+  of `Transform` needs no edge against this crate: `anim::drive_bones` writes bone
+  transforms through commands, which apply at the stage's closing sync point after every
+  system has run, so it declares no write and physics-api's "every other `Stage::Post`
+  system reads the stepped rows after the write-back with no edge" stays true with this
+  crate registered. `sets::DRIVE` is the one set another crate's systems are placed in;
+  `app` may instead order the game's own set before `sets::ADVANCE` with
+  `Registration::order`.
 - `RootMotion` and `SimPose` are transient: zeroed at the input sync point, written by
   `anim::advance` and `anim::evaluate` through `Mut` every tick, and the schedule refuses a
   reader not ordered after one of those writers (`TransientBeforeWriter`), so no system
@@ -159,9 +183,9 @@ in `sets::FIT` (`Events<BoneMoved>`, `StableKeyOf`, `&Bones`, `&Transform`,
   writer in its own stage as well.
 - A `Client` world runs none of the five (it runs no simulation system); `register_systems`
   there declares the sets alone, so one registration function serves every kind. In the
-  prediction world each runs over the claimed rows: the local player's character and what
-  it has claimed, bone rows included, since a bone spawned from a claimed kernel inherits
-  the claim.
+  prediction world each runs over the claimed rows: the local player's character and the
+  bone rows its kernels spawned, which are predicted spawns and inherit the claim
+  (`crates/ecs/README.md`, "Keys").
 - `anim::advance` stamps `AnimState` every tick it advances (the phase changes) and
   `AnimParams` only when it clears a trigger, through `set_if_neq`; `anim::evaluate` and
   `anim::fit_ragdoll` stamp `SimPose` every tick they write it. A game writer of
@@ -171,84 +195,131 @@ in `sets::FIT` (`Events<BoneMoved>`, `StableKeyOf`, `&Bones`, `&Transform`,
 
 `anim::advance` does the following for one character, in this order, and nothing else:
 
-1. Looks the rig's `StateMachine` up in the region's pinned table (`Ctx::assets`), and
-   then the current state's `Clip` (and the outgoing state's, during a blend). If the table
-   has not entered or any of them is missing or of the wrong kind, it leaves `AnimState`
-   and `AnimParams` as they are, writes `RootMotion::ZERO`, emits nothing and logs at
-   target `anim` ("What is logged" below). The tick runs.
+1. Looks the rig's `StateMachine` up in the region's pinned table (`Ctx::assets`). If the
+   table has not entered or the machine is missing or of the wrong kind, it leaves
+   `AnimState` and `AnimParams` as they are, writes `RootMotion::ZERO`, emits nothing and
+   logs at target `anim` ("What is logged" below). The tick runs; this is a hold.
 2. If the state is `UNSET` or its index is out of the machine's range, enters
-   `StateMachine::initial` at `Phase::ZERO`: entered, ticks in state zero (one after step
-   4), no blend, not finished. No transition is tried on that tick.
-3. Otherwise tries the transitions in the machine's order, with `AnimState` and
-   `AnimParams` as they are before this tick's advance (the phase of the previous tick, the
-   triggers the game set since). A transition applies when `from` is the current state, or
-   `from` is `None` and `to` is not the current state; it is taken when every one of its
-   conditions holds (`Condition` names each); the first taken ends the search, so at most
-   one transition is taken per tick. Taking it: the state becomes `to`, entered, with its
-   phase at `entry_phase` or, with `keep_phase`, at the phase it had; `previous_phase` is
-   set to that entry phase; finished is cleared; with `blend_ticks` above zero the outgoing
-   state and its phase are kept as the blend, with the blend's length, else the blend is
-   none. Not taking any: entered is cleared and `previous_phase` becomes the phase.
-4. `ticks_in_state` is incremented, saturating.
-5. The phase advances by `Phase::rate(clip.duration_ticks, state.speed * value)` where
+   `StateMachine::initial` at `Phase::ZERO`: entered with the phase set, ticks in state
+   zero (one after step 6), no blend, not finished. No transition is tried on that tick.
+3. If a blend is in progress and its outgoing state is out of range, or its clip is
+   missing, the blend ends (the outgoing state set equal to the state) and the tick goes
+   on: a save or a replicated state taken mid-blend against a machine with fewer states
+   plays on.
+4. Looks the state's `Clip` up (and the outgoing state's, during a blend). If either is
+   missing or of the wrong kind: a hold, as in step 1, with the state as steps 2 and 3
+   left it.
+5. Otherwise, unless the state was entered in step 2, tries the transitions in the
+   machine's order, with `AnimState` and `AnimParams` as they are before this tick's
+   advance (the phase of the previous tick, the triggers the game set since). A transition
+   applies when `from` is the current state (a `from` equal to `to` is a restart and
+   applies in the current state), or `from` is `None` and `to` is not the current state;
+   it is taken when every one of its conditions holds (`Condition` names each); the first
+   taken ends the search, so at most one transition is taken per tick. Taking it: the
+   state becomes `to`, entered; its phase is `entry_phase`, with the entry marked as set,
+   or, with `keep_phase`, the phase it had, with the entry marked as kept;
+   `previous_phase` is set to that entry phase; finished is cleared; with `blend_ticks`
+   above zero the outgoing state and its phase are kept as the blend, with the blend's
+   length, else the blend is none. Not taking any: entered is cleared and `previous_phase`
+   becomes the phase.
+6. `ticks_in_state` is incremented, saturating.
+7. The phase advances by `Phase::rate(clip.duration_ticks, state.speed * value)` where
    `value` is `AnimParams::values[speed_param]` or one, wrapping for a looping clip and
    saturating at `END` otherwise (`Phase::advanced`); a one-shot that holds `END` after the
    advance is finished, and stays so until the state changes. During a blend the outgoing
    state's phase advances likewise by its own rate, and the blend ends, its outgoing state
    set equal to the state, on the tick `ticks_in_state` reaches the blend's length.
-6. `RootMotion` is written as `clip.root_motion(previous_phase, phase)`; during a blend it
+8. `RootMotion` is written as `clip.root_motion(previous_phase, phase)`; during a blend it
    is blended with the outgoing clip's root motion over its own advance, translation and
    yaw each interpolated by the outgoing weight.
-7. One `AnimEvent` is emitted for every `ClipEvent` of the current clip the advance passed
-   ("Phase and crossings" below), in ascending phase order, to the character's own key;
-   none for the outgoing clip.
-8. If any trigger was set, `AnimParams` is rewritten with `triggers` zero through
-   `set_if_neq`; values and flags are never written by this crate.
+9. One `AnimEvent` is emitted for every `ClipEvent` of the current clip the advance passed
+   ("Phase and crossings" below), in the order it passed them (ascending by phase; across
+   a wrap those in `(from, END]` ascending, then those in `[ZERO, to]` ascending), to the
+   character's own key; none for the outgoing clip.
+10. If step 5 tried the transitions and any trigger was set, `AnimParams` is rewritten
+    with `triggers` zero through `set_if_neq`; values and flags are never written by this
+    crate.
 
-So a trigger set by the game in `sets::DRIVE` fires a transition in the same tick's
-advance and is gone by the next; a `Finished` transition is taken the tick after the
-one-shot reached its end, which is one tick of holding the last frame; and a state the
-game never leaves loops forever.
+The trigger rule that follows: a trigger is consumed by the first advance that tries
+transitions after it was set (step 5), whether or not a transition took it. The entry
+advance (step 2) and a hold (steps 1 and 4) try none and consume none, so a trigger the
+game sets before the character's first advance, or while its assets are missing, waits for
+the first advance that tries, which may be later than the game expects; a game that wants a
+trigger to lapse clears it itself. So a trigger set by the game in `sets::DRIVE` fires a
+transition in the same tick's advance and is gone by the next; a `Finished` transition is
+taken the tick after the one-shot reached its end, which is one tick of holding the last
+frame; a restart (`from == to`) re-enters the state, with a blend between the clip at its
+two phases when `blend_ticks` is set; a negative or non-finite speed is refused at load and
+a negative or non-finite `speed * value` holds the phase (rate zero); and a state the game
+never leaves loops forever.
 
 **Phase and crossings** (architecture section 6.1)
 
-- `Phase::rate(duration_ticks, speed)` is `2^32 * speed / duration_ticks` through
-  `lactose_math`, truncated toward zero, clamped to `[0, u32::MAX]`, zero for a speed that
-  is not finite, negative or zero or for a zero duration. The truncation is part of the
-  contract: at speed one a clip of `d` ticks wraps one tick late once every `2^32 / d`
-  cycles, which is never within a session, and a change of rounding would desynchronise the
-  phases of two builds.
+- `Phase::rate(duration_ticks, speed)` is an integer ceiling from a fixed-point speed:
+  `q = clamp(to_i64(speed * 2^16), 0, 2^32 - 1)` (toward zero; the one float operation is
+  a product by a power of two, exact in both scalar widths), then
+  `min(ceil(2^32 * q / (duration_ticks * 2^16)), u32::MAX)` in 128-bit integers; zero for
+  a speed that is not finite, negative or zero or for a zero duration. The ceiling is part
+  of the contract and gives: a one-shot of `d` ticks holds `END` on tick `d` of its state;
+  `Phase::from_fraction(f, d)` is crossed on tick `f`; a loop of `d` ticks wraps on tick
+  `d`, and wraps one tick early once every `rate / (d * rate - 2^32)` cycles (about 1.6
+  million cycles at `d = 60`), never within a session; both scalar widths give one rate for
+  any speed both hold. The clamp is part of it too: a speed of `duration_ticks` cycles per
+  tick or more gives `u32::MAX`, under which a one-shot reaches `END` in one tick and a
+  loop's phase moves back one unit a tick, which is meaningless; a machine's speeds are
+  authored below its clips' durations and a `speed_param` that could exceed them is the
+  game's to bound, since the clip is another asset and neither `Phase::rate` nor the
+  machine's validation sees its duration.
 - `Phase::passed(from, to, mark)` is `mark` in `(from, to]` when `to >= from`, and in
   `(from, END] ∪ [ZERO, to]` when `to < from` (a loop that wrapped; an advance wraps at most
-  once). `AnimState::phase_crossed(mark)` is `passed(previous_phase, phase, mark)`, except on
-  the tick the state was entered, when a mark equal to the entry phase also counts (a
-  footstep authored at phase zero plays when the cycle starts). Each pass over a mark is
-  therefore reported exactly once, by the system that reads the state this tick, whatever
-  the rate, and a tick with no advance (rate zero, a missing asset) reports nothing.
+  once). `AnimState::phase_crossed(mark)` is `passed(previous_phase, phase, mark)`, plus,
+  on the tick the state was entered with its phase set (the initial state, or a transition
+  without `keep_phase`), a mark equal to the entry phase (a footstep authored at phase zero
+  plays when the cycle starts). A kept phase was already passed by the tick that reached
+  it, so the entry tick of a `keep_phase` transition reports only what its own advance
+  passed, and a walk-to-run transition on the tick after the walk landed on a mark does not
+  double the footstep. `AnimState::entry_was_set` tells the two entries apart. Each pass
+  over a mark is therefore reported exactly once, by the system that reads the state this
+  tick, whatever the rate, and a tick with no advance (rate zero, a hold) reports nothing.
 - `ClipEvent`s are passed by the same rule, so an authored event and a game's own mark at
   the same phase fire on the same tick.
+- `Phase::fraction` is in `[0, 1]`: below one for every phase at eight-byte scalars, and
+  `END` rounds to one at four-byte scalars.
 - A phase is a fraction, not a frame, so a re-cooked clip with another sample count or
   another `duration_ticks` entering at the input sync point (architecture section 14)
   changes what a stored phase samples and how fast it moves, never whether it is valid, and
   a saved or replicated `AnimState` is valid against any version of its machine's assets
-  whose state count covers its index.
+  whose state count covers its index (step 2 re-enters the initial state otherwise, step 3
+  ends a blend it cannot continue).
 
 **Root motion** (architecture section 17)
 
 - A clip's root track is the root's pose per frame in character space at the clip's start,
   `frames + 1` entries for a loop (the last where the cycle ends: sample zero displaced by
   the cycle's total motion) and `frames` for a one-shot, or empty. `Clip::root_motion(from,
-  to)` samples the track at both phases by the sampling rule of `Clip::sample` and
-  subtracts, adding the cycle's total motion once when `to < from`; so a looping walk's
-  motion sums to its total over one cycle whatever the rate, and a one-shot's to its
-  track's end.
-- The displacement is the character's: `RootMotion::apply(&root)` turns the translation
-  into world space by the root's rotation and adds it, and applies the yaw about the
-  world's `+Y` before the root's rotation. A kinematic character writes that transform to
-  its `Transform` row (the physics sync sweeps it there during the step); a dynamic one
-  divides the translation by `TickDelta` into its `Velocity`; a game that steers by input
-  ignores or scales it. This crate moves no root and declares no write of `Transform` in
-  `Stage::Simulation`.
+  to)` gives the motion in the character's space at `from`, turning the track's difference
+  back by the yaw already turned: `translation = R(-yaw(from)) * (track(to) - track(from))`
+  and `yaw = yaw(to) - yaw(from)`, with `track` and `yaw` sampled by the rule of
+  `Clip::sample` and `R(a)` the rotation by `a` about `+Y`; across a wrap (`to < from`),
+  `R(-yaw(from)) * (end - track(from)) + R(total - yaw(from)) * (track(to) - track(0))`
+  and `total - yaw(from) + yaw(to)`, `end` and `total` the track's last entry and its yaw.
+  So a looping walk's motion sums to its total over one cycle whatever the rate, a turning
+  clip ends where it was authored, and a one-shot's motion reaches its track's end.
+- The displacement is the character's at the start of the tick. `RootMotion::apply(&root)`
+  turns the translation into world space by the root's rotation and adds it, and applies
+  the yaw about the world's `+Y` before the root's rotation: what a kinematic character
+  writes to its `Transform` row, and the physics sync sweeps it there during the step.
+  `RootMotion::velocity(&root, dt)` is the same motion as the `Velocity` that covers it in
+  one tick of `dt` seconds (`TickDelta`): the linear part the translation turned into world
+  space and divided by `dt`, the angular part the yaw divided by `dt` about the world's
+  `+Y`. A dynamic character writes that velocity: the solver moves and turns the body
+  during the step with no placement and so no `Teleported`, and clients keep interpolating
+  it. Such a character locks `ROTATION_X | ROTATION_Z` and leaves `ROTATION_Y` free (the
+  spike's capsule locks all three and turns nothing), and takes the solver's own
+  contribution to its yaw, contact torque and angular damping, as the price of being
+  dynamic; a character that must turn exactly is kinematic. A game that steers by input
+  ignores or scales either. This crate moves no root and declares no write of `Transform`
+  or `Velocity`.
 
 **The sim skeleton** (architecture sections 13 and 17)
 
@@ -268,6 +339,15 @@ game never leaves loops forever.
   the skeleton's bone count; any other clip gives `SimPose::EMPTY`, as does a state that is
   `UNSET`. A character without `SimPose` is not evaluated at all: a non-player with a state
   machine and no skeleton spawns without the component and pays nothing.
+- A limp character (`Bones::is_limp`) is not evaluated either: `anim::evaluate` writes
+  `SimPose::EMPTY` and `anim::fit_ragdoll` writes the pose in `Stage::Post` from the bone
+  rows ("Bones and ragdolls" below). So one evaluation serves an animated character's
+  whole tick, and a limp character's pose exists from `sets::FIT` on: a `Stage::Simulation`
+  reader finds it empty (`SimPose::world` gives `None`), a `Stage::Post` reader after
+  `sets::BONES` and presentation find the fitted pose. A hit volume read in
+  `Stage::Simulation` therefore misses a ragdoll, which is what the bodies are for.
+- `SimPose::EMPTY` and `BonePose::ZERO` are all zero bytes, the content of a zeroed
+  transient column, so a tick that leaves a row empty stamps nothing.
 - A socket is an offset on a bone, not a bone: `SimPose::socket` composes it on demand, so
   sockets are free at evaluation and do not count against `MAX_SIM_BONES`. Hands, feet
   and the head are bones found by `Skeleton::bone_of(BoneRole)`.
@@ -275,7 +355,7 @@ game never leaves loops forever.
   reads, a lerp and an nlerp, the same again and a blend during a cross-fade, and one
   compose; then a 904-byte row write at eight-byte scalars. Two binary searches in the
   pinned table find the assets. That is what "Proof for milestone 1" measures against the
-  0.5 ms budget for 200 characters.
+  0.5 ms budget for 200 characters, and nothing else is in that budget.
 
 **Bones and ragdolls** (architecture sections 16 and 17; `crates/physics-api/README.md`,
 "Bodies" and "Joints")
@@ -295,7 +375,20 @@ game never leaves loops forever.
   bone whose `BoneJoint` has an ancestor with a body, a `Joint` row owned by the bone row;
   and `Bones` written onto the character naming the rows, placeholders resolved at apply.
   The bone rows exist from the next sync point on and are bodies from the next physics
-  sync point on.
+  sync point on, when the write-back also adds a `Velocity` to each swept row. The helper
+  takes the character's current `Bones` and does nothing, logged, when it is `Some`: a
+  character has one set of bone rows.
+- A bone collider touches no bone and no character capsule: its `CollisionGroups` have
+  `membership & filter == 0`, so that no two bones (its owner's or another character's,
+  jointed or not) make a contact, and the game assigns the character capsule's groups and
+  the bone groups disjoint bits. `Skeleton::validate` refuses a `BoneBody` whose collider
+  breaks the first half; the second is the game's bit assignment, as every group is. What
+  hits a bone is a query, a sensor or a weapon collider whose groups the bone admits. The
+  rule exists because physics-api's `Joint` has no contacts flag and groups are per
+  collider, not per pair: an animated kinematic bone overlapping its owner's dynamic
+  capsule would push the capsule every step, and limp jointed bones would collide at every
+  joint. A `Joint::contacts` flag is proposed to physics-api with D128 and would relax the
+  joint half of the rule; the capsule half stands either way.
 - `anim::drive_bones`, in `Stage::Post` after the write-back, records for an animated
   character `Commands::set` of each bone row's `Transform` at `SimPose::world` of the
   character's stepped root. The commands apply at the run's closing sync point and the
@@ -308,27 +401,31 @@ game never leaves loops forever.
 - `Bones::set_limp(.., true)` rewrites `Bones`, every bone row's `RigidBody` as the
   skeleton's body made dynamic and every `BoneLink` as limp, all through commands; the
   physics sync sees the body change at the next physics sync point and the joints hold
-  the ragdoll together. From then on `anim::drive_bones` does nothing for the character,
-  `anim::report_bones` emits a `BoneMoved` from every limp bone row's stepped `Transform`
-  in `Stage::Post`, and `anim::fit_ragdoll` writes each reported bone into the character's
-  `SimPose` in root-local space against the character's own stepped `Transform`, leaving a
-  bone no row reported at the evaluation's pose. What the character's root does when it is
-  limp (following the hips, dropping its capsule) is the game's: a `Commands::set` of its
-  own `Transform` from the hips bone's `BoneMoved`, which the game may read too.
-  `set_limp(.., false)` reverses all of it; the pose then sweeps the bodies back from
-  wherever they lie, with no blend.
+  the ragdoll together. From then on `anim::evaluate` leaves the character's `SimPose`
+  empty, `anim::drive_bones` does nothing for it, `anim::report_bones` emits a `BoneMoved`
+  from every limp bone row's stepped `Transform` in `Stage::Post`, and `anim::fit_ragdoll`
+  writes the whole pose in skeleton order: a reported bone in root-local space against the
+  character's own stepped `Transform`, and a bone no row reported (one without a body) as
+  its parent-local sample from the state's clip at its phase, blended as the evaluation
+  blends, composed onto its parent's fitted pose, so hands, feet and the sockets on them
+  hang off the fallen limbs. What the character's root does when it is limp (following the
+  hips, dropping its capsule) is the game's: a `Commands::set` of its own `Transform` from
+  the hips bone's `BoneMoved`, which the game may read too. `set_limp(.., false)` reverses
+  all of it; the pose then sweeps the bodies back from wherever they lie, with no blend.
 - An animated character's bone rows emit no event (`BoneLink::limp` is false), so a
   character that never ragdolls costs its bone commands alone; a character without
   `Bones` costs nothing in `Stage::Post`.
-- The cost of bodies: each animated character with bones records one command per bone
-  body per tick, which the closing sync point applies as a row write and the next physics
-  sync pushes as a kinematic sweep. On today's ECS a `Commands::set` row write is about
-  0.8 µs (D119's 1.6 ms for 2,000 rows), so 200 characters with eleven bodies each are
-  about 2 ms of a 4 ms tick before the sync's own scan and the solver's sweeps. The levers
-  are the number of bones with a `BoneBody` (hit volumes need few; a skeleton may give
-  bodies to the head and hands alone) and whether a character has `Bones` at all; the sim
-  pose itself costs none of it. `tests/cost.rs` records the bone commands beside the
-  evaluation.
+- The cost of bodies, outside the evaluation budget: each animated character with bones
+  records one command per bone body per tick, which the closing sync point applies as a
+  row write and the next physics sync pushes as a kinematic sweep. Measured on the facade's
+  ECS (review r1, release, no physics, 200 characters with sixteen bone rows each, on a
+  loaded machine): 0.25 to 0.28 µs per bone command, about 0.8 to 0.9 ms a tick for 3,200
+  bones at one and four workers; D119's figure of 0.8 µs per command is at 100k rows and
+  is about three times that. So 200 characters with eleven bodies each are about 0.6 ms of
+  a 4 ms tick before the sync's own scan and the solver's sweeps. The levers are the number
+  of bones with a `BoneBody` (hit volumes need few; a skeleton may give bodies to the head
+  and hands alone) and whether a character has `Bones` at all; the sim pose itself costs
+  none of it. `tests/cost.rs` records the bone commands as their own figure.
 - Limited joints wait on the backend's verification item, as `physics-api` says; a
   `BoneJoint` with `limits` is authored data that the backend may refuse until then.
 
@@ -338,9 +435,10 @@ game never leaves loops forever.
   (`StateMachine`) and `anim::skeleton` (`Skeleton`), each `FORMAT_VERSION` one. Their
   loaders are pure decoders of their bytes, bit-identical on every host, which is the
   promise `SimulationAsset` makes, and each validates what it decoded with the type's
-  `validate` (the doc comments list the checks) and returns `InvalidData` otherwise.
-  A clip's one dependency is its skeleton; a machine's are its states' clips; a skeleton
-  has none.
+  `validate` (the doc comments list the checks: among them a negative or non-finite speed
+  refused, a restart transition allowed, the bone collider rule) and returns `InvalidData`
+  otherwise. A clip's one dependency is its skeleton; a machine's are its states' clips; a
+  skeleton has none.
 - The cooked byte form is named and not fixed: the implementation lane fixes it together
   with the cooker (RICOTTA) and records it here. Nothing a kernel reads depends on it: the
   runtime form above is the contract. A clip is cooked for one skeleton, in that skeleton's
@@ -351,12 +449,12 @@ game never leaves loops forever.
   exact-version table, so they are in the region's asset set (architecture section 14; the
   open item on spawned entities' assets in `docs/verification.md` applies to a character
   spawned at run time). Until the table has entered, or while an asset is missing, the
-  character holds: step 1 of the advance.
+  character holds: steps 1 and 4 of the advance.
 - A hot reload of any of the three enters as a new table at the input sync point, where a
   stored `AnimState` stays valid as "Phase and crossings" says.
 
 **Prediction and replication** (architecture sections 9.4 and 15.1;
-`crates/predict/README.md`)
+`crates/predict/README.md`; D124)
 
 - Policies: `AnimRig` `persistent, replicated, extracted`; `AnimState` `persistent,
   replicated, extracted`; `AnimParams`, `Bones` and `BoneLink` `persistent, replicated`;
@@ -368,37 +466,73 @@ game never leaves loops forever.
   does: `AnimState` is integers, so a predicted state and phase agree with the server's or
   are corrected to it, never absorbed by a tolerance. The animation phase is persistent
   state (section 15.1) and saved with the row.
+- D124's rule holds for the parameters: the tolerance absorbs a dynamic root's `Transform`
+  and `Velocity` and nothing else, so a parameter derived from them (a speed from
+  `Velocity::linear`) would mismatch by a bit on every absorbed residual and change the
+  rate by a unit, a correction every frame a contact lasts. A game stores such a value
+  quantised to an integer grid, `AnimParams::quantise(value, steps_per_unit)` (sixteen
+  steps per unit per second is a walk-to-run blend's resolution), or takes it from the
+  input sample; the build check cannot see this, so this sentence states it.
+- Bone rows never go on the wire. They are predicted spawns: spawned from the claimed
+  character's kernel, their keys are `Predicted(player, input tick, ordinal)` and the same
+  on the server and the local player's prediction world, so each side has its own from its
+  own kernels, and nothing needs sending; sent, they would be the derived state D124
+  forbids (a kinematic bone's `Transform` is `SimPose::world` of a root whose residual the
+  tolerance absorbed, and its write-back `Velocity` beside it) and a claimed limp ragdoll
+  would be D124's storm case. The mechanism is `lactose-net-api`'s proposed `Unreplicated`
+  marker (`derived`, not replicated, so it is outside the handshake's covered set), which
+  `Bones::spawn` puts on every bone and joint row and whose entity the gather skips: no
+  spawn, row, move or tombstone of it enters a frame, the relevance snapshot omits it, and
+  `lactose-predict` therefore never records, compares or corrects it. What that avoids,
+  computed from `lactose-net-host`'s documented sizes and not measured: about 150 KB a tick
+  per client for 200 remote characters' eleven bones (a quantised `Transform` and a
+  full-precision `Velocity` each), and about 4.7 KB of a claimed character's eleven bone
+  and ten joint rows sent whole in every packet, against 1,200-byte datagrams. Until the
+  marker exists a character with `Bones` is server-only: the milestone 1 spike's character
+  has none, and `lactose-net-host` builds the marker before milestone 5's characters. A
+  corrected `Bones` whose keys the prediction world never spawned (a `Bones::spawn` on a
+  mispredicted input) is `lactose-predict`'s item in "Not in this crate yet"; a game spawns
+  a character's bones in the invocation that spawns the character, where the keys cannot
+  differ.
+- `Bones` and `BoneLink` themselves are replicated and compared: `Bones` names the rows
+  the character's own kernels spawn on each side, `BoneLink` sits on a row that is not
+  sent, so it is compared nowhere, and both are replicated only so that the kernels that
+  read them may run in the prediction world (D121).
 - The transient components are rebuilt every tick from the persistent ones and the assets,
   so a rollback restores `AnimState` and `AnimParams` and re-simulates `RootMotion` and
   `SimPose`; nothing of this crate is in a snapshot but rows, and no channel exists (D126).
 - The RNG is not used: nothing here draws.
 - The milestone 1 netcode spike's predicted character carries the five components; its
-  root motion reaches the physics sync through the game's `Transform` write, so a
-  mispredicted phase is corrected as a mismatch of `AnimState`, and the step that follows
-  sweeps the capsule from the corrected pose.
+  root motion reaches the physics sync through the game's `Transform` or `Velocity` write,
+  so a mispredicted phase is corrected as a mismatch of `AnimState`, and the step that
+  follows moves the capsule from the corrected pose.
 
 **Presentation** (architecture sections 5.3 and 13)
 
-- Extract copies `AnimRig`, `AnimState` and `SimPose` beside the root `Transform`.
+- Extract copies `AnimRig`, `AnimState` and `SimPose` beside the root `Transform`, at the
+  end of the tick, so a limp character's extracted `SimPose` is the fitted one.
   Presentation evaluates the render pose from the state, its phase (`Phase::fraction`) and
   its blend (`AnimState::blend`) against the render clips, which is its full pose
   evaluation; it places the sim bones and sockets by the root it interpolates through
   `SimPose::world` and `SimPose::socket`, so a weapon mesh sits where the simulation says
-  the grip is and the render skeleton can be fitted to the sim feet and hands. A root-local
-  pose interpolates correctly between two snapshots of a moving character, which a
-  world-space pose would not.
+  the grip is and the render skeleton can be fitted to the sim feet and hands, or to the
+  fallen ragdoll. A root-local pose interpolates correctly between two snapshots of a
+  moving character, which a world-space pose would not.
 - Remote characters are not in the snapshot (section 5.3): their `AnimState` arrives
   through replication and presentation samples it from the interpolation buffer, whose
-  interpolation of an animation phase is `lactose-net-host`'s deferred item. Nothing here
-  changes for it.
+  interpolation of an animation phase is `lactose-net-host`'s deferred item. A remote
+  character has no bone rows on a client ("Prediction and replication" above): its render
+  skeleton follows its state, and a remote ragdoll is presentation's blend from the last
+  state, which is listed under "Not in this crate yet".
 
 **What is logged**
 
 - At target `anim`: a rig whose table has not entered or whose assets are missing or of the
-  wrong kind (at trace, since it repeats every tick), a transition the loader should have
-  refused (at error, once per advance that meets it), a `Bones::spawn` on a character that
-  already has bones (at warn). The facade carries no `tracing` dependency: the allowlist
-  entry for it is proposed with D128.
+  wrong kind (at trace, since it repeats every tick); a transition the loader should have
+  refused (at debug, every advance that meets it, since only a hand-built asset bypasses
+  `validate` and a shipped game never logs it); a `Bones::spawn` on a character that
+  already has bones (at warn, once per call). The facade carries no `tracing` dependency:
+  the allowlist entry for it is proposed with D128.
 
 ## Not in this crate yet
 
@@ -412,6 +546,13 @@ game never leaves loops forever.
   milestone 5; a sim-side IK pass that writes `SimPose` after `sets::EVALUATE` is where it
   would go.
 - Getting up: a limp ragdoll blended back into a clip. `set_limp(.., false)` cuts.
+- Bone rows in a networked session: `lactose-net-api`'s `Unreplicated` marker (proposed
+  with D128), and `lactose-predict`'s handling of a corrected `Bones` whose keys the
+  prediction world never spawned (re-spawning them from the skeleton at the correction, or
+  refusing a mid-life `Bones::spawn` on a predicted character). Until both exist a
+  character with `Bones` is server-only. A remote ragdoll on a client is presentation's.
+- A `Joint::contacts` flag in physics-api (proposed with D128), which would let jointed
+  bones share groups with other colliders; the collider rule above stands until then.
 - The interpolation of a remote character's phase (`lactose-net-host`, milestone 4) and the
   visual blend of a correction (presentation, milestone 2).
 - The cooked byte form of the three kinds, the cooker's processors and the format's test:
@@ -422,22 +563,24 @@ game never leaves loops forever.
 ## Proof for milestone 1
 
 Today: `tests/consumers.rs`, compile-only, whose one test builds the schedule of a server,
-a prediction and a client world with this crate's systems beside a game sketch (parameters
-driven from a sketch input, a footstep from `phase_crossed(Phase::HALF)` and an authored
-event, root motion applied by a movement sketch, a hit test and a ragdoll from the stepped
-pose, presentation reading the extracted rows), the prediction world under
+a prediction and a client world with this crate's systems beside a game sketch (a speed
+quantised from the solver's velocity and a trigger driven from a sketch input, section
+6.1's `footsteps` as the amendment writes it, an authored event, root motion applied to a
+kinematic root and as a dynamic root's velocity, a `Stage::Post` reader of `Transform`
+with no edge against this crate, a hit test and a ragdoll from the stepped pose,
+presentation reading the extracted rows), the prediction world under
 `check_prediction_reads`. The implementation lane adds the tests below, each a nextest
 test asserting on counts, orders, bytes and hashes and never on timing, the SOUR test
 recording under every mode.
 
 | What | How |
 |---|---|
-| The state machine | A machine with a loop, a one-shot, a `keep_phase` transition and a trigger: the transition order, one per tick, the entry tick's fields, a trigger consumed, `Finished` one tick after `END`, a blend's weight per tick and its end; under three layouts and one and four workers, hashes equal |
-| Phase | `rate` for the duration and speed cases in the contract; `advanced` wrapping and saturating; `passed` across the wrap and at `END`; `phase_crossed` once per pass at every rate, on the entry tick at the entry phase, never on a held tick |
-| Events | Authored events emitted in phase order once per pass, to the character's key, read by a later system; none from the outgoing clip |
-| Root motion | A loop's motion over one cycle equals the track's total at every rate; a one-shot's reaches its end; a blend interpolates; `apply` against a hand-composed transform |
-| Evaluation | `evaluate` equals a hand-composed pose for a two-bone chain at authored phases, with and without a blend, bit for bit; `rest`; a clip for another skeleton gives `EMPTY`; the same bits under every layout and worker count |
-| Bones | `spawn` records the stated rows and the `Bones` write, placeholders resolved; `drive_bones` sweeps the kinematic bodies to the previous tick's pose, seen by the physics test backend; `set_limp` makes them dynamic, `report_bones` emits from limp rows alone, `fit_ragdoll` rewrites the pose; a character without bones costs no command |
-| Prediction | The build check over this crate's systems; a predicted character rolled back and re-simulated with the ring's inputs hashes equal to the straight run; a corrected `AnimState` re-simulates from the server's phase |
+| The state machine | A machine with a loop, a one-shot, a `keep_phase` transition, a restart and a trigger: the transition order, one per tick, the entry tick's fields, a trigger consumed by the first advance that tries (not by the entry advance, not by a hold), `Finished` one tick after `END`, a blend's weight per tick and its end, a blend ended by a machine with fewer states; under three layouts and one and four workers, hashes equal |
+| Phase | `rate` for the duration and speed cases in the contract, the Q16.16 path checked against a hand-computed f32 path for durations 1 to 600; a one-shot of `d` ticks at `END` on tick `d`, `from_fraction(f, d)` crossed on tick `f`, a loop wrapping on tick `d`; `advanced` wrapping and saturating; `passed` across the wrap and at `END`; `phase_crossed` once per pass at every rate, on the entry tick at a set entry phase, not at a kept one (the walk-to-run case), never on a held tick |
+| Events | Authored events emitted once per pass in the order passed, across a wrap included, to the character's key, read by a later system; none from the outgoing clip |
+| Root motion | A loop's motion over one cycle equals the track's total at every rate; a quarter-circle turning clip applied tick by tick with `apply` ends where it was authored, within one unit in the last place; a one-shot's reaches its end; a blend interpolates; `apply` and `velocity` against a hand-composed transform |
+| Evaluation | `evaluate` equals a hand-composed pose for a two-bone chain at authored phases, with and without a blend, bit for bit; `rest`; a clip for another skeleton gives `EMPTY`; a limp character's row is `EMPTY` after `sets::EVALUATE` and the fitted pose after `sets::FIT`; the same bits under every layout and worker count |
+| Bones | `spawn` records the stated rows and the `Bones` write, placeholders resolved, nothing on a second call; `drive_bones` sweeps the kinematic bodies to the previous tick's pose, seen by the physics test backend; `set_limp` makes them dynamic, `report_bones` emits from limp rows alone, `fit_ragdoll` writes every bone, the unreported ones composed onto their fitted parents; `Skeleton::validate` refuses a collider that admits its own groups; a character without bones costs no command |
+| Prediction | The build check over this crate's systems; a predicted character rolled back and re-simulated with the ring's inputs hashes equal to the straight run; a corrected `AnimState` re-simulates from the server's phase; a quantised speed parameter agrees by bits on the two sides of an absorbed residual |
 | SOUR | `tests/sour.rs`: 200 characters with a sixteen-bone skeleton, a looping clip with events and root motion and a machine with triggers, 300 ticks, hashes recorded under workers, repeat, layout and chaos modes; `lactose-anim` listed under `[harness]` |
-| The budget | `tests/cost.rs`, an ignored test run by hand in release on the M1 and the x86 desktop: 200 characters, each a sixteen-bone skeleton with a body on every bone and a 60-sample looping clip, half of them mid cross-fade; (a) `SimPose::evaluate` over the 200 for 1,000 ticks, median and best microseconds per tick; (b) `Simulation::step` of the world holding them with and without `anim::evaluate` registered, one and four workers, the difference per tick; reported with `uptime`'s load averages. The criterion is (b) at most 0.5 ms; (a) says how much of it is the evaluation and how much the ECS's dispatch. If (b) misses, the first levers are the row write (skip `set_if_neq`-equal bones, which a holding character has) and the sample reads (a frame index cached per state), never the bone cap |
+| The budget | `tests/cost.rs`, an ignored test run by hand in release on the M1 and the x86 desktop: 200 characters without `Bones`, each a sixteen-bone skeleton and a 60-sample looping clip, half of them mid cross-fade; (a) `SimPose::evaluate` over the 200 for 1,000 ticks, median and best microseconds per tick; (b) `Simulation::step` of the world holding them against the same world whose characters lack the `SimPose` component (a character without it is never evaluated), one and four workers, the difference per tick; (c) the same 200 with `Bones` and a body on every bone, the bone commands' cost per tick, reported outside the criterion; all with `uptime`'s load averages. The criterion is section 22's: (b) at most 0.5 ms; (a) says how much of it is the evaluation and how much the ECS's dispatch, (c) what bodies add. If (b) misses, the first levers are the row write (skip `set_if_neq`-equal bones, which a holding character has) and the sample reads (a frame index cached per state), never the bone cap |

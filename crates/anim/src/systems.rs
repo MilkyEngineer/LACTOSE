@@ -47,10 +47,11 @@ pub mod sets {
     pub static FIT: SystemSet = SystemSet::new("anim::fit").after(&[&REPORT]);
 
     /// The bone sweep (`anim::drive_bones`): an animated character's bone rows written to
-    /// its pose through commands, which declares a write of `Transform`. A `Stage::Post`
-    /// system that reads `Transform`, [`SimPose`](crate::SimPose) or
-    /// [`Bones`](crate::Bones) is in a set declared `.after(&[&BONES])`, or it conflicts
-    /// with the sweep and the fit and the schedule refuses the build.
+    /// its pose through commands, which apply at the stage's closing sync point and so
+    /// conflict with nothing. A `Stage::Post` reader of [`SimPose`](crate::SimPose) is in
+    /// a set declared `.after(&[&BONES])` (or `.after(&[&FIT])`, the fit being the writer
+    /// it must follow); a `Stage::Post` reader of `Transform` needs no edge against this
+    /// crate.
     pub static BONES: SystemSet = SystemSet::new("anim::bones").after(&[&FIT]);
 }
 
@@ -88,14 +89,17 @@ pub fn register_systems(registration: &mut Registration) {
 }
 
 /// The advance: one character's state machine for one tick (`README.md`, "The state
-/// machine"). With the rig's machine from the region's assets: enters the initial state if
-/// the state is unset; tries the transitions in order against the parameters and the state
-/// as they are, taking the first whose conditions all hold; then advances the phase (and
-/// the outgoing phase of a blend) by the state's rate, writes the root motion the clip moved
-/// by between the two phases, emits an `AnimEvent` for every authored event the advance
-/// passed, and clears the triggers it read. Writes `AnimParams` only when a trigger was
-/// set. With the machine or the state's clip missing from the region's table, leaves
-/// `AnimState` and `AnimParams` as they are, writes `RootMotion::ZERO` and emits nothing.
+/// machine", states the order). With the rig's machine from the region's assets: enters the
+/// initial state if the state is unset or out of range; ends a blend whose outgoing state
+/// is out of range or whose clip is missing; with the state's clip, tries the transitions
+/// in order against the parameters and the state as they are, taking the first whose
+/// conditions all hold; then advances the phase (and the outgoing phase of a blend) by the
+/// state's rate, writes the root motion the clip moved by between the two phases, emits an
+/// `AnimEvent` for every authored event the advance passed, and clears the triggers it
+/// read. Writes `AnimParams` only when a trigger was set. With the machine missing from the
+/// region's table, leaves `AnimState` and `AnimParams` as they are, writes
+/// `RootMotion::ZERO` and emits nothing; with the state's clip missing, the same after the
+/// state has been set.
 #[system(name = "anim::advance", worlds = [server, prediction], in_set = sets::ADVANCE)]
 pub(crate) fn advance(
     ctx: Ctx,
@@ -111,10 +115,17 @@ pub(crate) fn advance(
 /// The evaluation: [`SimPose::evaluate`] with the rig's skeleton, the state's clip at its
 /// phase and the blend's outgoing clip at its phase, written whole into the row. With the
 /// skeleton, the clip or (during a blend) the outgoing clip missing, or the state unset,
-/// writes [`SimPose::EMPTY`]. The per-character work the milestone 1 budget of 0.5 ms for
-/// 200 characters bounds (`README.md`, "Proof for milestone 1").
+/// or the character's bones limp (the fit in `Stage::Post` writes the pose then), writes
+/// [`SimPose::EMPTY`]. The per-character work the milestone 1 budget of 0.5 ms for 200
+/// characters bounds (`README.md`, "Proof for milestone 1").
 #[system(name = "anim::evaluate", worlds = [server, prediction], in_set = sets::EVALUATE)]
-pub(crate) fn evaluate(ctx: Ctx, rig: &AnimRig, state: &AnimState, pose: Mut<SimPose>) {
+pub(crate) fn evaluate(
+    ctx: Ctx,
+    rig: &AnimRig,
+    state: &AnimState,
+    bones: Option<&Bones>,
+    pose: Mut<SimPose>,
+) {
     todo!()
 }
 
@@ -125,14 +136,21 @@ pub(crate) fn report_bones(moved: EventWriter<BoneMoved>, link: &BoneLink, trans
     todo!()
 }
 
-/// A limp character's pose rebuilt from its bone rows: each `BoneMoved` for this character
-/// taken into root-local space against the character's own stepped `Transform` and written
-/// into its `SimPose`; a bone no row reported keeps the evaluation's pose. Does nothing for
-/// a character whose bones are not limp.
+/// A limp character's pose rebuilt from its bone rows, in skeleton order: a bone a
+/// `BoneMoved` reported is taken into root-local space against the character's own
+/// stepped `Transform`; a bone no row reported (one without a body) is its parent-local
+/// sample from the state's clip at its phase (blended as `anim::evaluate` blends) composed
+/// onto its parent's fitted pose, so hands and feet hang off the fallen limbs and sockets
+/// with them. Written whole into `SimPose`. Does nothing for a character whose bones are
+/// not limp; with the skeleton or the clip missing, writes `SimPose::EMPTY`.
 #[system(name = "anim::fit_ragdoll", worlds = [server, prediction], in_set = sets::FIT)]
+#[expect(clippy::too_many_arguments, reason = "a kernel's parameters are its row columns")]
 pub(crate) fn fit_ragdoll(
+    ctx: Ctx,
     moved: Events<BoneMoved>,
     key: StableKeyOf,
+    rig: &AnimRig,
+    state: &AnimState,
     bones: &Bones,
     root: &Transform,
     pose: Mut<SimPose>,
@@ -143,13 +161,13 @@ pub(crate) fn fit_ragdoll(
 /// An animated character's bone rows swept to its pose: for every bone with a row,
 /// `Commands::set` of the bone's `Transform` at `SimPose::world` of the character's stepped
 /// root, which the next tick's physics sync sweeps the kinematic body to during its step.
-/// Does nothing for a limp character, whose bodies move themselves.
-#[system(
-    name = "anim::drive_bones",
-    worlds = [server, prediction],
-    in_set = sets::BONES,
-    writes = [Transform]
-)]
+/// Does nothing for a limp character, whose bodies move themselves. The write of
+/// `Transform` is deliberately not declared: the commands apply at the stage's closing sync
+/// point, after every `Stage::Post` system has run, so no reader in the stage can see them
+/// and a declaration would only order every `Transform` reader of the stage against this
+/// set for nothing (and falsify physics-api's "every other `Stage::Post` system reads the
+/// stepped rows after the write-back with no edge").
+#[system(name = "anim::drive_bones", worlds = [server, prediction], in_set = sets::BONES)]
 pub(crate) fn drive_bones(cmd: Commands, bones: &Bones, pose: &SimPose, root: &Transform) {
     todo!()
 }

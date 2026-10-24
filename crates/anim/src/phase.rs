@@ -32,6 +32,10 @@ impl Phase {
     /// The number of phase units in one clip, `2^32`.
     pub const UNITS: u64 = 1 << 32;
 
+    /// The fraction bits of the fixed-point speed [`rate`](Self::rate) computes with: a
+    /// speed is taken to Q16.16 once, so both scalar widths give one rate.
+    pub const SPEED_FRACTION_BITS: u32 = 16;
+
     /// The phase `numerator / denominator` of the way through the clip, rounded down to a
     /// unit; `END` at or past the whole clip. A zero `denominator` is a panic, a broken
     /// invariant of the caller's.
@@ -42,23 +46,42 @@ impl Phase {
         if units >= Self::UNITS { Self::END } else { Self(units as u32) }
     }
 
-    /// The phase as a scalar in `[0, 1)`: the units divided by `2^32`, one `lactose_math`
-    /// division, the same bits on every target.
+    /// The phase as a scalar in `[0, 1]`: the units divided by `2^32`, one `lactose_math`
+    /// division, the same bits on every target. Below one for every phase under an
+    /// eight-byte scalar; `END` rounds to one under a four-byte scalar.
     #[must_use]
     pub fn fraction(self) -> Scalar {
         Scalar::from_u32(self.0) / Scalar::from_u64(Self::UNITS)
     }
 
-    /// The units a state advances per tick: `2^32 * speed / duration_ticks` computed through
-    /// `lactose_math`, truncated toward zero and clamped to `[0, u32::MAX]`. A `speed` that
-    /// is not finite, negative or zero, or a zero `duration_ticks`, gives zero, so the state
-    /// holds its phase. At speed one a clip of `d` ticks takes `d` ticks per cycle and wraps
-    /// one tick late once every `2^32 / d` cycles because of the truncation; the rounding is
-    /// part of this contract and never changes, since a change would desynchronise the
-    /// phases of two builds.
+    /// The units a state advances per tick, in integers: `speed` is taken to Q16.16 once
+    /// (`speed * 2^16` through `Scalar::to_i64`, toward zero, clamped to `[0, 2^32 - 1]`),
+    /// and the rate is `ceil(2^32 * q / (duration_ticks * 2^16))` in 128-bit arithmetic,
+    /// clamped to `u32::MAX`. Zero for a speed that is not finite, negative or zero, or for
+    /// a zero `duration_ticks`, so the state holds its phase.
+    ///
+    /// What follows from the ceiling, and is part of this contract: a one-shot of `d`
+    /// ticks at speed one holds `END` on tick `d` of its state; a mark at
+    /// `from_fraction(f, d)` is crossed on tick `f`; a loop of `d` ticks wraps on tick `d`,
+    /// and wraps one tick early once every `rate / (d * rate - 2^32)` cycles (about 1.6
+    /// million cycles at `d = 60`), never within a session. Both scalar widths give the
+    /// same rate for any speed both can hold, since the only float operation is a product
+    /// by a power of two. A speed of `duration_ticks` cycles per tick or more is clamped to
+    /// `u32::MAX`: a one-shot then reaches `END` in one tick and a loop's phase moves back
+    /// one unit a tick, which is meaningless; a state machine's speed is authored below
+    /// its clips' durations, and a `speed_param` that could exceed it is the game's to
+    /// bound, since the clip is another asset and neither this function nor the machine's
+    /// validation can see its duration.
     #[must_use]
     pub fn rate(duration_ticks: u32, speed: Scalar) -> u32 {
-        todo!()
+        if duration_ticks == 0 || !speed.is_finite() || speed <= Scalar::ZERO {
+            return 0;
+        }
+        let q = (speed * Scalar::from_u32(1 << Self::SPEED_FRACTION_BITS)).to_i64();
+        let q = u128::try_from(q.clamp(0, i64::from(u32::MAX))).unwrap_or(0);
+        let divisor = u128::from(duration_ticks) << Self::SPEED_FRACTION_BITS;
+        let units = (u128::from(Self::UNITS) * q).div_ceil(divisor);
+        u32::try_from(units).unwrap_or(u32::MAX)
     }
 
     /// This phase `rate` units on: wrapping around the clip when `looping`, saturating at
@@ -74,6 +97,10 @@ impl Phase {
     /// `2^32`). Equal `from` and `to` passed nothing.
     #[must_use]
     pub const fn passed(from: Self, to: Self, mark: Self) -> bool {
-        todo!()
+        if to.0 >= from.0 {
+            from.0 < mark.0 && mark.0 <= to.0
+        } else {
+            mark.0 > from.0 || mark.0 <= to.0
+        }
     }
 }
