@@ -2216,6 +2216,7 @@ deleted file mode 100644
         let mut repo = repo();
         repo.files.insert_skipped("target");
         repo.files.insert_skipped("tools/cook/target");
+        repo.files.insert_skipped(".scratchpad");
         repo.tracked = [
             "Cargo.toml",
             ".cargo/config.toml",
@@ -2223,6 +2224,7 @@ deleted file mode 100644
             "target/notes.txt",
             "tools/cook/target/x/.cargo/env",
             "targets/.cargo/config",
+            ".scratchpad/.cargo/config.toml",
         ]
         .map(str::to_owned)
         .to_vec();
@@ -2234,6 +2236,7 @@ deleted file mode 100644
                 format!(
                     "tools/cook/target/x/.cargo/env: tracked under tools/cook/target/, {reads}"
                 ),
+                format!(".scratchpad/.cargo/config.toml: tracked under .scratchpad/, {reads}"),
             ]
         );
     }
