@@ -28,9 +28,10 @@ A crate other crates are written against gets a facade first:
 
 1. `architect` writes the facade from a brief.
 2. `reviewer` reviews it.
-3. The same `architect` fixes every finding the coordinator accepts.
+3. A `lane` fixes every finding the coordinator accepts. A finding whose fix would change the
+   design substantially goes back to the same `architect` instead.
 4. `reviewer-diff` reviews the fix round.
-5. The same `architect` does a short last fix round, which goes straight to the merge.
+5. The agent that made the fix does a short last fix round, which goes straight to the merge.
 
 An implementation, of a facade or of a crate with no facade:
 
