@@ -60,11 +60,13 @@ file is held to the rules wherever it is fetched from.
   `crates/core/clippy.toml`, compared entry by entry as parsed TOML. The reference's float
   and executor entries are not required of it. A unit test holds `OUTSIDE_WORLD` to the
   reference's entries that cite section 8.2, so an entry added there is not missed.
-- Nothing switches the boundary lints off. In a boundary crate or a crate of
-  `[boundary_internal] any`, `allow`, `expect` or `warn` of `clippy::disallowed_methods`,
-  `clippy::disallowed_types`, `clippy::all`, `clippy::style` or `warnings` is a finding as
-  an inner attribute anywhere or as an outer attribute on a `mod`, and `allow` or `warn` of
-  them is a finding on any item, since only an `expect` fails once it is no longer needed.
+- Nothing switches the boundary lints off. In a boundary crate, a crate of
+  `[lint_file_carriers]` or a crate of `[boundary_internal] any`, `allow`, `expect` or
+  `warn` of `clippy::disallowed_methods`, `clippy::disallowed_types`, their old names
+  `clippy::disallowed_method` and `clippy::disallowed_type`, `clippy::all`, `clippy::style`
+  or `warnings` is a finding as an inner attribute anywhere or as an outer attribute on a
+  `mod`, and `allow` or `warn` of them is a finding on any item, since only an `expect`
+  fails once it is no longer needed. Comments inside an attribute are ignored.
   `#[expect(..., reason = "...")]` on one item that is not a module is the sanctioned form.
   Every `.rs` file of the package is read, and every file a `#[path]` in them names (also
   inside `cfg_attr`), resolved against the including file's directory, wherever it lives; a
@@ -80,8 +82,7 @@ file is held to the rules wherever it is fetched from.
   every third-party crate it ends up compiling through normal and build edges is vetted
   there. Architecture section 8.2 says "directly or at any depth" and a boundary crate's
   tests run under SOUR, so a dev-dependency on a workspace crate is held to the same list,
-  with three additions for tests only: the crate itself, a `[test_support]` crate and
-  `[boundary_internal] dev`.
+  with two additions for tests only: a `[test_support]` crate and `[boundary_internal] dev`.
 - Every workspace crate a boundary crate reaches through normal and build edges, at any
   depth, through crates outside the boundary, is a boundary crate or one
   `[boundary_internal]` lets that crate name; the finding gives the chain. A boundary crate

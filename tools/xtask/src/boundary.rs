@@ -74,12 +74,15 @@ const WEAK_LEVELS: [&str; 3] = ["allow", "expect", "warn"];
 
 /// Whether `lint` is one of the lints that carry the boundary rules, or a group that contains
 /// them. `clippy::disallowed_methods` and `clippy::disallowed_types` are in `clippy::style`
-/// and `clippy::all`, and CI turns every warning into an error through `warnings`.
+/// and `clippy::all`, and CI turns every warning into an error through `warnings`. Clippy
+/// still honours the lints' old names, `disallowed_method` and `disallowed_type`.
 fn is_boundary_lint(lint: &str) -> bool {
     matches!(
         lint.replace('-', "_").as_str(),
         "clippy::disallowed_methods"
             | "clippy::disallowed_types"
+            | "clippy::disallowed_method"
+            | "clippy::disallowed_type"
             | "clippy::all"
             | "clippy::style"
             | "warnings"
@@ -106,14 +109,19 @@ pub fn check(tiers: &TierFile, policy: &Policy, ws: &Workspace, files: &Files) -
             outside_world_lint_file(package, files, &mut findings);
         }
         if carrier || internal {
+            let kind = if boundary {
+                "boundary crate"
+            } else if carrier {
+                "[lint_file_carriers] crate"
+            } else {
+                "[boundary_internal] crate"
+            };
             stray_lint_files(package, files, &mut stray_configs);
             manifest_lints(package, files, &mut findings);
+            lint_attributes(package, kind, files, &mut findings);
         }
         if boundary {
-            lint_attributes(package, "boundary crate", files, &mut findings);
             dependency_allowlist(tiers, ws, package, &mut findings);
-        } else if internal {
-            lint_attributes(package, "[boundary_internal] crate", files, &mut findings);
         }
     }
     findings.extend(stray_configs.into_iter().map(|path| {
@@ -563,9 +571,7 @@ fn dependency_allowlist(
         // A name the tier file lists is a workspace crate wherever it is fetched from.
         let is_internal = dep.source == DepSource::Member || tiers.tier(&dep.name).is_some();
         let allowed = if is_internal {
-            may_compile(&dep.name)
-                || dep.kind == DepKind::Dev
-                    && (dep.name == package.name || test_may_compile(&dep.name))
+            may_compile(&dep.name) || dep.kind == DepKind::Dev && test_may_compile(&dep.name)
         } else {
             direct.is_some_and(|list| {
                 list.normal.contains(&dep.name)
@@ -1028,6 +1034,17 @@ mod tests {
         );
         files.insert("crates/reflect-macros/clippy.toml", lint_file());
         assert_eq!(run(&ws, &files), NONE, "and its dependencies are not held to the allowlist");
+        // Round 2, finding 2: nor may its sources switch the lints off.
+        files.insert(
+            "crates/reflect-macros/src/lib.rs",
+            format!("{FORBID}#[allow(clippy::disallowed_methods)]\nfn f() {{}}\n"),
+        );
+        assert_eq!(
+            run(&ws, &files),
+            [
+                "crates/reflect-macros/src/lib.rs: line 3: `allow(clippy::disallowed_methods)` never goes stale, on an item of [lint_file_carriers] crate `lactose-reflect-macros`; the only sanctioned form is `#[expect(clippy::disallowed_methods, reason = \"...\")]` (or `disallowed_types`) on the one item that needs it"
+            ]
+        );
     }
 
     #[test]
@@ -1078,6 +1095,11 @@ mod tests {
             "#[allow(clippy::disallowed_methods)]\nfn f() {}",
             "#[warn(clippy::disallowed_types)]\nstruct S;",
             "#[cfg_attr(test, allow(clippy::all))]\nimpl S {}",
+            // Round 2, finding 1: a comment in the list, and the lints' old names.
+            "#[allow(clippy::disallowed_methods /* c */)]\nfn f() {}",
+            "#[allow(\n    clippy::disallowed_types, // ]\n)]\nstruct S;",
+            "#[allow(renamed_and_removed_lints, clippy::disallowed_method)]\nfn f() {}",
+            "#[allow(renamed_and_removed_lints, clippy::disallowed_type)]\nfn f() {}",
         ];
         for attribute in reported {
             let mut files = files.clone();
@@ -1254,7 +1276,8 @@ mod tests {
                 &[("lactose-core", Normal), ("lactose-future", Normal), ("lactose-io", Normal)],
             ),
             package("lactose-io", &[("lactose-net", Normal)]),
-            package("lactose-rhi-null", &[("lactose-renderer", Normal), ("lactose-task", Dev)]),
+            // Round 2, R02: `task` is passed through from `rhi-null` too, as a test may.
+            package("lactose-rhi-null", &[("lactose-renderer", Normal), ("lactose-task", Normal)]),
             package("lactose-future", &[]),
         ]);
         let tail = "which [boundary_internal] in crate-tiers.toml does not allow at any depth";
@@ -1262,8 +1285,8 @@ mod tests {
             run(&ws, &files),
             [
                 "crates/math/Cargo.toml: boundary crate `lactose-math` dev-depends on non-boundary crate `lactose-io`, which [boundary_internal] in crate-tiers.toml does not allow".to_owned(),
-                // `io` is not named again through `task`, nor `net` behind it, nor a dev edge
-                // of `rhi-null`.
+                // `io` is not named again through `task`, nor `net` behind it, nor `task` or
+                // what it reaches through `rhi-null`.
                 format!("crates/math/Cargo.toml: boundary crate `lactose-math` reaches non-boundary crate `lactose-future` in its tests (lactose-math -> lactose-task -> lactose-future), {tail}"),
                 format!("crates/math/Cargo.toml: boundary crate `lactose-math` reaches non-boundary crate `lactose-renderer` in its tests (lactose-math -> lactose-rhi-null -> lactose-renderer), {tail}"),
             ]
@@ -1343,19 +1366,24 @@ mod tests {
         files.insert("crates/ecs/clippy.toml", lint_file());
         files.insert("crates/future/README.md", "");
         files.insert("crates/future/src/lib.rs", FORBID);
-        let ws = workspace(vec![
-            package("lactose-core", &[]),
-            package("lactose-math", &[("lactose-ecs", Normal)]),
-            package("lactose-ecs", &[("lactose-core", Normal), ("lactose-task", Normal)]),
-            package("lactose-task", &[("lactose-core", Normal), ("lactose-future", Normal)]),
-            package("lactose-future", &[]),
-        ]);
-        assert_eq!(
-            run(&ws, &files),
-            [
-                "crates/ecs/Cargo.toml: boundary crate `lactose-ecs` reaches non-boundary crate `lactose-future` (lactose-ecs -> lactose-task -> lactose-future), which [boundary_internal] in crate-tiers.toml does not allow at any depth"
-            ]
-        );
+        // Round 2, R14: the same holds when only `math`'s tests name `ecs`. A boundary crate
+        // is not a test root, though its tests may name `task`, which `ecs` passes through.
+        for kind in [Normal, Dev] {
+            let ws = workspace(vec![
+                package("lactose-core", &[]),
+                package("lactose-math", &[("lactose-ecs", kind)]),
+                package("lactose-ecs", &[("lactose-core", Normal), ("lactose-task", Normal)]),
+                package("lactose-task", &[("lactose-core", Normal), ("lactose-future", Normal)]),
+                package("lactose-future", &[]),
+            ]);
+            assert_eq!(
+                run(&ws, &files),
+                [
+                    "crates/ecs/Cargo.toml: boundary crate `lactose-ecs` reaches non-boundary crate `lactose-future` (lactose-ecs -> lactose-task -> lactose-future), which [boundary_internal] in crate-tiers.toml does not allow at any depth"
+                ],
+                "{kind:?}"
+            );
+        }
     }
 
     #[test]
@@ -1383,6 +1411,9 @@ mod tests {
             "#[allow(clippy::disallowed_types)]\nfn f() {}\n#[path = \"../protocol.rs\"]\nmod back;\n\
              #[path = \"../../../../../crates/math/src/lib.rs\"]\nmod again;\n",
         );
+        // Round 2, R05: `../../../../outside.rs` climbs out of the repository; it is not the
+        // file at its root.
+        files.insert("outside.rs", "#![allow(clippy::all)]\n");
         // A crate outside the boundary that includes the same file is not this check's.
         files.insert(
             "crates/task/tests/sour.rs",

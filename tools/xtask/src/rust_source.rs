@@ -10,8 +10,9 @@
 pub(crate) struct Attribute {
     /// True for `#![...]`, false for `#[...]`.
     pub(crate) inner: bool,
-    /// The text between the brackets with whitespace removed and the contents of string
-    /// literals emptied, so `allow(dead_code, reason = "a, b")` reads `allow(dead_code,reason="")`.
+    /// The text between the brackets with whitespace and comments removed and the contents of
+    /// string literals emptied, so `allow(dead_code /* c */, reason = "a, b")` reads
+    /// `allow(dead_code,reason="")`.
     pub(crate) body: String,
     /// The line the attribute starts on, from 1.
     pub(crate) line: usize,
@@ -182,7 +183,7 @@ fn skip_raw_string(bytes: &[u8], i: usize) -> Option<usize> {
 }
 
 /// `i` is at `[` or `(`. Returns the index after the matching close, skipping string
-/// literals, or `None` if it never closes.
+/// literals and comments, or `None` if it never closes.
 fn skip_brackets(source: &str, mut i: usize) -> Option<usize> {
     let bytes = source.as_bytes();
     let (open, close) = if bytes[i] == b'(' { (b'(', b')') } else { (b'[', b']') };
@@ -190,6 +191,13 @@ fn skip_brackets(source: &str, mut i: usize) -> Option<usize> {
     while i < bytes.len() {
         if bytes[i] == b'"' {
             i = skip_string(bytes, i);
+            continue;
+        }
+        // `/` is ASCII, so `i` is a character boundary for `skip_comment`.
+        if bytes[i] == b'/'
+            && let Some(end) = skip_comment(source, i)
+        {
+            i = end;
             continue;
         }
         if bytes[i] == open {
@@ -205,7 +213,7 @@ fn skip_brackets(source: &str, mut i: usize) -> Option<usize> {
     None
 }
 
-/// `text` without whitespace and with the contents of its string literals removed.
+/// `text` without whitespace or comments and with the contents of its string literals removed.
 fn code_only(text: &str) -> String {
     let bytes = text.as_bytes();
     let mut out = String::new();
@@ -214,6 +222,8 @@ fn code_only(text: &str) -> String {
         if bytes[i] == b'"' {
             out.push_str("\"\"");
             i = skip_string(bytes, i);
+        } else if let Some(end) = skip_comment(text, i) {
+            i = end;
         } else {
             let c = text[i..].chars().next().unwrap_or(' ');
             if !c.is_whitespace() {
@@ -334,8 +344,11 @@ mod tests {
 
     #[test]
     fn bodies_lose_whitespace_and_string_contents() {
-        let source = "//! Docs with a ' quote.\n#! [ allow( dead_code , reason = \"a ] b, warnings\" ) ]\nfn f<'a>(c: &'a str) -> char { '\\'' }\n#[cfg(test)] fn g() { let _ = '\"'; }\n#[x]\nfn h() {}\n";
-        assert_eq!(bodies(source), ["allow(dead_code,reason=\"\")", "cfg(test)", "x"]);
+        let source = "//! Docs with a ' quote.\n#! [ allow( dead_code , reason = \"a ] b, warnings\" ) ]\nfn f<'a>(c: &'a str) -> char { '\\'' }\n#[cfg(test)] fn g() { let _ = '\"'; }\n#[x]\nfn h() {}\n#[allow(a /* ] \" */, // ]\n b)]\nfn i() {}\n";
+        assert_eq!(
+            bodies(source),
+            ["allow(dead_code,reason=\"\")", "cfg(test)", "x", "allow(a,b)"]
+        );
         assert_eq!(attributes(source)[0].line, 2);
         assert_eq!(attributes(source)[2].line, 5);
     }
