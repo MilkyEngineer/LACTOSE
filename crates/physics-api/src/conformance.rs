@@ -541,10 +541,10 @@ fn step_from(
 ///   infinite, reports nothing and leaves the bytes as they were, its valid command
 ///   included.
 /// - Over that state, a ray, a shape cast and an overlap aimed at the first sphere answer
-///   it, and each with a parameter the query rule refuses answers nothing: a non-finite
-///   origin, a direction that is not finite or has no positive finite length, a
-///   `max_distance` that is NaN, infinite or negative, a shape or pose the predicates
-///   refuse.
+///   it, and each with a parameter the query rule refuses answers nothing: an origin
+///   with a NaN or an infinite component, a direction that is not finite or has no
+///   positive finite length, a `max_distance` that is NaN, infinite or negative, a shape
+///   the predicates refuse, a pose with a NaN or an infinite component or off unit.
 /// - Last, the edges the rules accept (a rotation off unit by half the tolerance, a
 ///   negated identity, a zero mass, a negative gravity scale, every axis locked, a capsule
 ///   of zero half height, zero coefficients, a restitution above one, a friction of
@@ -554,7 +554,9 @@ fn step_from(
 ///   and are accepted.
 ///
 /// The run holds the rules on these rows, not on every value: a backend that deviates on a
-/// value no row holds passes it.
+/// value no row holds passes it. No row asks a query along a non-unit direction that
+/// normalises: the rule leaves that answer unspecified, so a backend that refuses one
+/// (`Rule::Direction` applied to a query, say) passes.
 ///
 /// Fails with `InvalidData` naming the first row the backend treated otherwise.
 pub fn validity(mut backend: Box<dyn PhysicsBackend>) -> Result<()> {
@@ -911,7 +913,12 @@ pub fn validity(mut backend: Box<dyn PhysicsBackend>) -> Result<()> {
         ("an infinite max_distance", infinity),
         ("a negative max_distance", -Scalar::ONE),
     ];
-    let mut rays = vec![("a NaN origin", Ray::new(nan, ahead, reach))];
+    // Behind the sphere, one component infinite: a NaN alone does not hold the finite check.
+    let afar = vec(0.0, 5.0, f64::NEG_INFINITY);
+    let mut rays = vec![
+        ("a NaN origin", Ray::new(nan, ahead, reach)),
+        ("an infinite origin component", Ray::new(afar, ahead, reach)),
+    ];
     for &(what, direction) in &directions {
         rays.push((what, Ray::new(behind.translation, direction, reach)));
     }
@@ -929,6 +936,7 @@ pub fn validity(mut backend: Box<dyn PhysicsBackend>) -> Result<()> {
     let mut casts = vec![
         ("a refused shape", refused_probe, behind, ahead, reach),
         ("a NaN pose", probe, lost_probe, ahead, reach),
+        ("an infinite pose component", probe, Transform::at(afar), ahead, reach),
         ("a non-unit pose", probe, askew(&behind), ahead, reach),
     ];
     for &(what, direction) in &directions {
@@ -945,6 +953,7 @@ pub fn validity(mut backend: Box<dyn PhysicsBackend>) -> Result<()> {
     let overlaps = [
         ("a refused shape", refused_probe, origin),
         ("a NaN pose", probe, lost_probe),
+        ("an infinite pose component", probe, Transform::at(afar)),
         ("a non-unit pose", probe, askew(&origin)),
     ];
     for (what, shape, pose) in &overlaps {

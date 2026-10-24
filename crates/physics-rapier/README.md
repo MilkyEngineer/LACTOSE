@@ -84,7 +84,9 @@ the backend does not canonicalise.
   the message `a joint between a body and itself`; a step whose `dt` is not finite and
   above zero, or whose gravity is not finite, steps nothing; a query with a non-finite
   origin, a direction that does not normalise, a non-finite or negative `max_distance`, or
-  a probe shape or pose its predicate refuses, answers nothing. `conformance::validity`
+  a probe shape or pose its predicate refuses, answers nothing. A query's direction is
+  unit by contract: this backend passes it to Rapier as given, so distances are in units
+  of its length, and a non-unit one is the caller's error. `conformance::validity`
   holds this backend to these rules on the rows it lists, under one and four solver
   threads.
 - Every honoured write and command wakes the body. A kinematic body ignores velocity

@@ -478,7 +478,10 @@ gather compare it with the last tick they covered, and zero means never.
   no key appended) for a ray whose `origin` is not finite, a direction that does not
   normalise (`Vec3::try_normalize` fails: not finite, zero, or a length that underflows
   or overflows), a `max_distance` that is not finite or is negative, or a probe `Shape`
-  or pose `Transform` its predicate refuses.
+  or pose `Transform` its predicate refuses. A query's direction is unit by contract
+  (`Ray`): one `try_normalize` refuses answers nothing, and any other non-unit direction is
+  the caller's error, with an unspecified answer (the backends measure distance in units
+  of it differently).
 - The answer is `Ok(())` or an `Invalid { field, rule }`: `field` as `Type::field`, with
   the component after a dot when the rule is on one component of a vector
   (`Shape::half_extents.y`), the type being the one that holds the field (a collider's
@@ -507,12 +510,15 @@ gather compare it with the last tick they covered, and zero means never.
   snapshot bytes unchanged; each refused command in a step beside a valid one, the step's
   bytes and bodies equal to the valid one's alone; the same-body rule with a valid and a
   refused value; the step-input rule on zero, negative, NaN and infinite `dt` and
-  non-finite gravity; the query-parameter rule on each refused parameter; and the
-  accepted edges. A backend that deviates on a value no row holds passes it.
-- Two tightenings over what the backends refused before D135, both towards refusing more:
-  every scalar of a value is finite, read by its kind or not (a NaN in a sphere's
+  non-finite gravity; the query-parameter rule on each refused parameter, a non-finite
+  origin or pose by a NaN and by an infinite component; and the accepted edges. A backend
+  that deviates on a value no row holds passes it, and no row asks a non-unit direction
+  that normalises, whose answer the rule leaves unspecified.
+- Three tightenings over what the backends refused before D135, all towards refusing
+  more: every scalar of a value is finite, read by its kind or not (a NaN in a sphere's
   `half_extents`, a cuboid's `radius` or an unlimited joint's limits, which `lactose-anim`
-  refused and the backends let through); and the test backend applies the same predicates
+  refused and the backends let through); a revolute or prismatic axis whose squared length
+  is subnormal, which normalised short of unit (D135); and the test backend applies the same predicates
   and the same three rules as Rapier (before, it checked a body's transform, shape and
   mass, a joint's values, and `set_transform` alone), so a test written against it sees
   what the real backend does with a bad row.

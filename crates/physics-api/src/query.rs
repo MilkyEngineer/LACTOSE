@@ -6,8 +6,10 @@ use lactose_math::{Scalar, Vec3};
 
 use crate::components::CollisionGroups;
 
-/// A ray: `origin + direction * t` for `t` in `[0, max_distance]`. `direction` is a unit
-/// vector, so distances are in world units; a backend may assert it in debug builds.
+/// A ray: `origin + direction * t` for `t` in `[0, max_distance]`. `direction` is unit by
+/// contract, so distances are in world units. A direction `Vec3::try_normalize` refuses
+/// answers nothing (`README.md`, "Validity"); any other non-unit direction is the caller's
+/// error, and the answer to it is unspecified.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct Ray {
     /// Where the ray starts.

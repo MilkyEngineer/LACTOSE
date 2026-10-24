@@ -81,7 +81,9 @@ impl Deviant {
         let mut collider = *collider;
         match self.deviation {
             Deviation::Collider(fix) => fix(&mut collider),
+            // An own rule refuses only what the rules accept: the predicate runs first.
             Deviation::OwnCollider(refuses) if refuses(&collider) => {
+                collider.validate()?;
                 return Err(Invalid { field: "Collider::friction", rule: Rule::Finite }.into());
             }
             Deviation::BoundsBeforeShape => {
@@ -154,6 +156,7 @@ impl PhysicsBackend for Deviant {
         match self.deviation {
             Deviation::Joint(fix) => fix(&mut joint),
             Deviation::OwnJoint(refuses) if refuses(&joint) => {
+                joint.validate()?;
                 return Err(Invalid { field: "Joint::anchor_a", rule: Rule::Finite }.into());
             }
             Deviation::ValueBeforeSameBody => joint.validate()?,
@@ -228,27 +231,31 @@ fn a_backend_that_breaks_the_rules_fails_the_validity_run() {
     let control =
         Deviant { inner: Fake::new(CallLog::default()), deviation: Deviation::Body(|_| {}) };
     validity(Box::new(control)).expect("the wrapper alone passes the run");
-    let deviations: [(&str, Deviation); 25] = [
+    let deviations: [(&str, &str, Deviation); 25] = [
         (
             "skips the finite check on linear_damping",
+            "create_body with a NaN linear damping:",
             Deviation::Body(|b| {
                 finite_or(&mut b.linear_damping, Scalar::ZERO);
             }),
         ),
         (
             "skips the finite check on angular_damping",
+            "create_body with a NaN angular damping:",
             Deviation::Body(|b| {
                 finite_or(&mut b.angular_damping, Scalar::ZERO);
             }),
         ),
         (
             "skips the finite check on Shape::radius",
+            "create_body with an infinite sphere radius:",
             Deviation::Collider(|c| {
                 finite_or(&mut c.shape.radius, Scalar::ONE);
             }),
         ),
         (
             "skips the finite check on Collider::rotation",
+            "create_body with an infinite collider rotation component:",
             Deviation::Collider(|c| {
                 if !c.rotation.is_finite() {
                     c.rotation = Quat::IDENTITY;
@@ -257,30 +264,35 @@ fn a_backend_that_breaks_the_rules_fails_the_validity_run() {
         ),
         (
             "skips the finite check on friction",
+            "create_body with an infinite friction:",
             Deviation::Collider(|c| {
                 finite_or(&mut c.friction, Scalar::HALF);
             }),
         ),
         (
             "skips the finite check on restitution",
+            "create_body with an infinite restitution:",
             Deviation::Collider(|c| {
                 finite_or(&mut c.restitution, Scalar::HALF);
             }),
         ),
         (
             "skips the finite check on density",
+            "create_body with an infinite density:",
             Deviation::Collider(|c| {
                 finite_or(&mut c.density, Scalar::HALF);
             }),
         ),
         (
             "skips the finite check on impact_threshold",
+            "create_body with an infinite impact threshold:",
             Deviation::Collider(|c| {
                 finite_or(&mut c.impact_threshold, Scalar::HALF);
             }),
         ),
         (
             "skips the positive check on a cuboid's x",
+            "create_body with a zero cuboid x extent:",
             Deviation::Collider(|c| {
                 if c.shape.half_extents.x == Scalar::ZERO {
                     c.shape.half_extents.x = Scalar::ONE;
@@ -289,6 +301,7 @@ fn a_backend_that_breaks_the_rules_fails_the_validity_run() {
         ),
         (
             "skips the positive check on a cuboid's z",
+            "create_body with a zero cuboid z extent:",
             Deviation::Collider(|c| {
                 if c.shape.half_extents.z == Scalar::ZERO {
                     c.shape.half_extents.z = Scalar::ONE;
@@ -297,6 +310,7 @@ fn a_backend_that_breaks_the_rules_fails_the_validity_run() {
         ),
         (
             "skips the finite check on anchor_b",
+            "create_joint with a NaN anchor_b:",
             Deviation::Joint(|j| {
                 if !j.anchor_b.is_finite() {
                     j.anchor_b = Vec3::ZERO;
@@ -305,6 +319,7 @@ fn a_backend_that_breaks_the_rules_fails_the_validity_run() {
         ),
         (
             "skips the finite check on a fixed joint's axis",
+            "create_joint with a NaN axis on a fixed joint:",
             Deviation::Joint(|j| {
                 if j.kind == JointKind::Fixed && !j.axis.is_finite() {
                     j.axis = Vec3::ZERO;
@@ -313,6 +328,7 @@ fn a_backend_that_breaks_the_rules_fails_the_validity_run() {
         ),
         (
             "skips the finite check on an unlimited limit_min",
+            "create_joint with a NaN limit_min on an unlimited joint:",
             Deviation::Joint(|j| {
                 if !j.limited {
                     finite_or(&mut j.limit_min, Scalar::ZERO);
@@ -321,6 +337,7 @@ fn a_backend_that_breaks_the_rules_fails_the_validity_run() {
         ),
         (
             "refuses only the exact zero axis",
+            "create_joint with a revolute axis whose square underflows:",
             Deviation::Joint(|j| {
                 if j.axis != Vec3::ZERO && j.axis.is_finite() {
                     j.axis = Vec3::X;
@@ -329,6 +346,7 @@ fn a_backend_that_breaks_the_rules_fails_the_validity_run() {
         ),
         (
             "takes an axis try_normalize takes, a subnormal square included",
+            "create_joint with a revolute axis whose square is subnormal:",
             Deviation::Joint(|j| {
                 if j.axis.is_finite() && j.axis.try_normalize().is_some() {
                     j.axis = Vec3::X;
@@ -337,6 +355,7 @@ fn a_backend_that_breaks_the_rules_fails_the_validity_run() {
         ),
         (
             "skips the finite check on ApplyImpulseAt's impulse",
+            "a step with a NaN impulse at a finite point before a valid impulse:",
             Deviation::Command(|command| {
                 if let PhysicsCommand::ApplyImpulseAt { impulse, .. } = command
                     && !impulse.is_finite()
@@ -347,30 +366,55 @@ fn a_backend_that_breaks_the_rules_fails_the_validity_run() {
         ),
         (
             "refuses a friction above 1e6",
+            "create_body with a friction of 1e300:",
             Deviation::OwnCollider(|c| c.friction > Scalar::from_f64(1e6)),
         ),
         (
             "refuses a limited fixed or spherical joint",
+            "create_joint with a limited fixed joint:",
             Deviation::OwnJoint(|j| {
                 j.limited && matches!(j.kind, JointKind::Fixed | JointKind::Spherical)
             }),
         ),
         (
             "refuses an anchor farther than 1e6",
+            "create_joint with anchors at 1e300:",
             Deviation::OwnJoint(|j| {
                 j.anchor_a.length() > Scalar::from_f64(1e6)
                     || j.anchor_b.length() > Scalar::from_f64(1e6)
             }),
         ),
-        ("checks a description in reverse", Deviation::ReversedDescription),
-        ("checks a collider's coefficients before its shape", Deviation::BoundsBeforeShape),
-        ("checks a joint's value before the same-body rule", Deviation::ValueBeforeSameBody),
-        ("steps any dt and gravity", Deviation::AnyStepInput),
-        ("answers a ray of any reach", Deviation::AnyReach),
-        ("drops a whole step for one refused command", Deviation::WholeStepDropped),
+        (
+            "checks a description in reverse",
+            "create_body with a negative mass and a NaN velocity:",
+            Deviation::ReversedDescription,
+        ),
+        (
+            "checks a collider's coefficients before its shape",
+            "create_body with a zero sphere radius and a NaN friction:",
+            Deviation::BoundsBeforeShape,
+        ),
+        (
+            "checks a joint's value before the same-body rule",
+            "create_joint between a body and itself with a zero revolute axis:",
+            Deviation::ValueBeforeSameBody,
+        ),
+        ("steps any dt and gravity", "a step with a zero dt:", Deviation::AnyStepInput),
+        ("answers a ray of any reach", "a ray with a NaN max_distance:", Deviation::AnyReach),
+        (
+            "drops a whole step for one refused command",
+            "a step with a NaN impulse before a valid impulse:",
+            Deviation::WholeStepDropped,
+        ),
     ];
-    for (what, deviation) in deviations {
+    for (what, row, deviation) in deviations {
         let deviant = Deviant { inner: Fake::new(CallLog::default()), deviation };
-        assert!(validity(Box::new(deviant)).is_err(), "a backend that {what} passes the run");
+        let Err(error) = validity(Box::new(deviant)) else {
+            panic!("a backend that {what} passes the run");
+        };
+        // The row the deviation is meant to fail at, so that a row removed or weakened is
+        // seen here and not covered by another row failing for an unrelated reason.
+        let error = error.to_string();
+        assert!(error.contains(row), "a backend that {what} fails elsewhere: {error}");
     }
 }

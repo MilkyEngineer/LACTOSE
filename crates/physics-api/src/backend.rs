@@ -128,7 +128,9 @@ impl StepOutput {
 /// - A query answers nothing (`None`, or no key appended) unless a ray's `origin` is
 ///   finite, the direction normalises ([`Vec3::try_normalize`]), `max_distance` is finite
 ///   and not negative, and a probe's shape and pose pass [`Shape::validate`] and
-///   [`Transform::validate`].
+///   [`Transform::validate`]. A query's direction is unit by contract: one
+///   `try_normalize` refuses answers nothing, and any other non-unit direction is the
+///   caller's error, with an unspecified answer.
 ///
 /// A backend therefore never aborts the process on a row's bytes.
 /// [`conformance::validity`](crate::conformance::validity) holds a backend to these rules
