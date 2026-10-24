@@ -42,11 +42,11 @@ use lactose_reflect::{Persistence, Registry, TypeInfo, TypeRole};
 /// variants' declarations, since the pairs are written in declaration order; the bump is
 /// the price of seeing a permutation. What no digest sees is a change of meaning under an
 /// unchanged layout (a field's unit; one `#[value]` struct replaced by another of the same
-/// layout; one enum by another of the same size, discriminants and variant names; one
-/// primitive by another of the same tag): only a version bump and a step carry that, and
-/// the build-time guard D129 names (a committed record of each saved type's version and
-/// digest, compared by a test that fails when the digest changed and the version did not)
-/// is what makes the bump hard to forget.
+/// layout; one enum by another of the same size with the same (name, value) pairs in the
+/// same order; one primitive by another of the same tag): only a version bump and a step
+/// carry that, and the build-time guard D129 names (a committed record of each saved
+/// type's version and digest, compared by a test that fails when the digest changed and
+/// the version did not) is what makes the bump hard to forget.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct LayoutDigest(pub u64);
 
