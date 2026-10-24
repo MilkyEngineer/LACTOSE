@@ -32,10 +32,20 @@ lactose-sim.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+# The prediction test's join and corrections: the staged frame's component bytes.
+lactose-bundle.workspace = true
+# The prediction test's player sample, its applier, and the sample a rollback replays.
+lactose-input.workspace = true
+# The prediction test's staged frames and inbox, as `app`'s prediction world has them.
+lactose-net-api.workspace = true
 # The prediction world's build check (D121, D122), run over this crate's systems by the
 # consumer sketch so that every component a `[server, prediction]` system names is one the
-# server replicates or the tick rebuilds.
+# server replicates or the tick rebuilds; the predictor the prediction test rolls back.
 lactose-predict.workspace = true
+# The SOUR test builds its executor the way a SOUR test does (`ChaosConfig`); a
+# dev-dependency, so the boundary allowlist is untouched and the library names nothing of
+# `task`.
+lactose-task.workspace = true
 
 [lints]
 workspace = true

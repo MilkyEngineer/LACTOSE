@@ -12,12 +12,9 @@ not here.
 | Determinism boundary | inside |
 | Unsafe | none, `#![forbid(unsafe_code)]` |
 
-**Status: facade.** Every public signature is final and every deciding body is `todo!()`;
-the registration functions and the integer, compositional and phase helpers (`Phase::rate`,
-`Phase::passed`, `AnimState::phase_crossed`, `AnimParams::quantise`, `RootMotion::apply`
-and `velocity`, `BonePose::compose` and `blend`) are real. Every sentence under "Behaviour
-the signatures cannot express" is one a dependent crate may rely on and the implementation
-must meet. Architecture sections 4, 5.3, 6, 6.1, 8.2, 9.4, 13, 14, 15.1, 16, 17 and 22 are
+**Status: implemented for milestone 1.** Every body runs, and every row of "Proof for
+milestone 1" names the tests that hold it. Every sentence under "Behaviour the signatures
+cannot express" is one a dependent crate may rely on. Architecture sections 4, 5.3, 6, 6.1, 8.2, 9.4, 13, 14, 15.1, 16, 17 and 22 are
 the design; where this file and the architecture disagree, the architecture wins and this
 file is wrong. Decision D128 records the choices those sections left open.
 `crates/ecs/README.md`, `crates/sim/README.md`, `crates/physics-api/README.md`,
@@ -51,10 +48,11 @@ every world kind: a change that breaks it is a signature change to list.
 
 Hidden plumbing: none. The five systems live in a private module and `sets` is the only
 way to order against them; `SimPose::set_bone` is crate-private, the ragdoll fit's write.
-What the implementation may reshape without a signature change: the cooked byte form of
-the three asset kinds (named only, below), and the bodies of `Clip::sample`,
-`Clip::root_motion`, `SimPose::evaluate`, `SimPose::rest`, `Bones::spawn`, `Bones::set_limp`
-and the three `validate`s, each of whose contract is its doc comment and the sections below.
+What the implementation may reshape without a signature change: the bodies of
+`Clip::sample`, `Clip::root_motion`, `SimPose::evaluate`, `SimPose::rest`, `Bones::spawn`,
+`Bones::set_limp` and the three `validate`s, each of whose contract is its doc comment and
+the sections below. The cooked byte form ("Assets" below) changes only with its kind's
+`FORMAT_VERSION`.
 
 ## What each consumer needs, and where this surface gives it
 
@@ -69,7 +67,7 @@ and the three `validate`s, each of whose contract is its doc comment and the sec
 | `predict`, `net-api` | Which components are persistent and replicated, that every simulation-read field compares at full precision, and that no replicated field is derived from a solver-written value (D124) | `AnimRig`, `AnimState`, `AnimParams`, `Bones` and `BoneLink` are `persistent, replicated`; `RootMotion` and `SimPose` are `transient`; the replicated integers compare by bytes, the parameter scalars by canonical bits, so a solver-derived parameter goes through `AnimParams::quantise`; bone rows are the server's alone and, once `net-api`'s `Unreplicated` marker lands, are not sent; until then `Bones` is not for a networked session ("Prediction and replication" below); nothing holds state outside rows and no channel exists |
 | `physics-api` | The ragdoll bodies as bodies or colliders, the direction, and a collider rule that keeps them off their owner | Bone rows with `Transform`, `RigidBody` and `Collider`, joints as `Joint` rows: the pose drives kinematic bodies through `Commands::set` of `Transform` in `Stage::Post`; limp, dynamic bodies drive the pose through `BoneMoved` events; a bone collider admits no bone and no capsule ("Bones and ragdolls" below) |
 | Presentation (milestones 2 and 3) | The sim skeleton's evaluated transforms as rows the presentation schedule reads | `SimPose` (`extracted`, root-local, the fitted pose for a limp character in a server world, empty in a prediction world) beside the extracted root `Transform`; `AnimRig` and `AnimState` extracted for the render pose ("Presentation" below) |
-| Assets (`asset`, `cook`) | The authored clip, machine and skeleton data as `asset-api` kinds, and the cooked form named | `Clip`, `StateMachine`, `Skeleton` with `KIND` and `FORMAT_VERSION`; `ClipLoader`, `StateMachineLoader`, `SkeletonLoader` through `ErasedLoader::new`; the byte form is named only ("Assets" below) |
+| Assets (`asset`, `cook`) | The authored clip, machine and skeleton data as `asset-api` kinds, and the cooked form | `Clip`, `StateMachine`, `Skeleton` with `KIND` and `FORMAT_VERSION`; `ClipLoader`, `StateMachineLoader`, `SkeletonLoader` through `ErasedLoader::new`; the byte form ("Assets" below) |
 | `sim`, SOUR | Systems placed in the stages, readers after them, every type registered | `register_systems` puts `ADVANCE` and `EVALUATE` in `Stage::Simulation` and `REPORT`, `FIT`, `BONES` in `Stage::Post`; `register_types` ("The tick" below) |
 | `app` | Registration beside every other crate's, in every world kind | `register_types` and `register_systems`; no setup function, no resource |
 
@@ -154,7 +152,7 @@ Five systems in six sets: the two of `Stage::Simulation` declare
 `worlds = [server, prediction]`, the three of `Stage::Post` `worlds = [server]`, since bone
 rows exist in the server world alone ("Prediction and replication" below). In
 `Stage::Simulation`, in this order: the game's parameter writers in `sets::DRIVE` (this
-crate places nothing there); `anim::advance` in `sets::ADVANCE` (`Ctx`,
+crate places nothing there); `anim::advance` in `sets::ADVANCE` (`Ctx`, `StableKeyOf`,
 `EventWriter<AnimEvent>`, `&AnimRig`, `Mut<AnimParams>`, `Mut<AnimState>`,
 `Mut<RootMotion>`); `anim::evaluate` in `sets::EVALUATE` (`Ctx`, `&AnimRig`, `&AnimState`,
 `Option<&Bones>`, `Mut<SimPose>`). In `Stage::Post`, after the physics write-back, which is
@@ -232,7 +230,13 @@ exclusive and needs no edge: `anim::report_bones` in `sets::REPORT`
    or, with `keep_phase`, the phase it had, with the entry marked as kept;
    `previous_phase` is set to that entry phase; finished is cleared; with `blend_ticks`
    above zero the outgoing state and its phase are kept as the blend, with the blend's
-   length, else the blend is none. Not taking any: entered is cleared and `previous_phase`
+   length, else the blend is none. If the clip of `to` is missing or of the wrong kind, the
+   transition stands and the tick ends there as step 4's hold on an entry tick does: the
+   row is not marked held, `ticks_in_state` stays zero, `RootMotion::ZERO` is written,
+   nothing is emitted, the triggers are consumed (step 10, since the transitions were
+   tried), and the tick reports the entry, and a set entry phase as crossed, once; the
+   ticks after it, until the clip is there, are step 4's holds, and the first advance then
+   passes `(entry phase, phase]`. Not taking any: entered is cleared and `previous_phase`
    becomes the phase.
 6. `ticks_in_state` is incremented, saturating, and the held mark is cleared.
 7. The phase advances by `Phase::rate(clip.duration_ticks, state.speed * value)` where
@@ -322,7 +326,9 @@ never leaves loops forever.
   `R(-yaw(from)) * (end - track(from)) + R(total - yaw(from)) * (track(to) - track(0))`
   and `total - yaw(from) + yaw(to)`, `end` and `total` the track's last entry and its yaw.
   So a looping walk's motion sums to its total over one cycle whatever the rate, a turning
-  clip ends where it was authored, and a one-shot's motion reaches its track's end.
+  clip applied tick by tick ends where it was authored up to the rounding of each tick's
+  application (about a unit in the last place per tick applied), and a one-shot's motion
+  reaches its track's end.
 - The displacement is the character's at the start of the tick. `RootMotion::apply(&root)`
   turns the translation into world space by the root's rotation and adds it, and applies the
   yaw about the world's `+Y` before the root's rotation: what a kinematic character writes
@@ -354,7 +360,9 @@ never leaves loops forever.
   stepped root in `Stage::Post`. `Clip::sample` reads the two frames the phase lies between
   (`phase * intervals / 2^32` in integer arithmetic, `intervals` the frame count for a
   loop and one less for a one-shot) and blends them by the fraction, one `lactose_math`
-  division; `END` on a one-shot samples the last frame exactly. Allocates nothing: the
+  division; `END` on a one-shot samples the last frame exactly, as does a phase whose
+  position falls on a frame (a zero fraction), which is that frame's sample unblended.
+  Allocates nothing: the
   pose is a fixed array, the clip is read in place.
 - A clip is evaluated only against the skeleton it was cooked for (`Clip::skeleton`), with
   the skeleton's bone count; any other clip gives `SimPose::EMPTY`, as does a state that is
@@ -483,12 +491,45 @@ never leaves loops forever.
   refused, a restart transition allowed, the bone collider rule) and returns `InvalidData`
   otherwise. A clip's one dependency is its skeleton; a machine's are its states' clips; a
   skeleton has none.
-- The cooked byte form is named and not fixed: the implementation lane fixes it together
-  with the cooker (RICOTTA) and records it here. Nothing a kernel reads depends on it: the
-  runtime form above is the contract. A clip is cooked for one skeleton, in that skeleton's
-  bone order and count, with its samples already in character space convention and as the
-  simulation scalar; a change of scalar width is a cook change, as it is for every
-  simulation asset.
+- The cooked byte form, `FORMAT_VERSION` one for each kind: little-endian, every field at
+  its fixed width in declaration order with no alignment and no padding; a scalar is its
+  canonical bits (`Canonical`) at the width of the build's `Scalar` (S bytes), a `Vec3`
+  three of them, a `Quat` four (x, y, z, w), a pose its translation then its rotation; an
+  asset reference is its `u64` ID; a `bool` is one byte, 0 or 1; an optional index is
+  `0xFF` (`0xFFFF` for a state) for none; every list is a `u32` count before its elements.
+  Each asset begins with a preamble of two `u32`s, the format version and S.
+  - `Clip`: skeleton; `duration_ticks` and `frames` (`u32`); `looping` and `bones` (`u8`);
+    the samples (poses, frame-major); the root track (translation, then yaw); the events
+    (phase `u32`, key `u64`).
+  - `StateMachine`: `initial` (`u16`); the states (key `u64`, clip, speed, `speed_param`
+    `u8`); the transitions (`from`, `to` and `blend_ticks` `u16`, `keep_phase`,
+    `entry_phase` `u32`, then the conditions, each a tag byte and its fields: 0
+    `Finished`; 1 `PhaseAtLeast`, `u32`; 2 `TicksAtLeast`, `u32`; 3 `Above` and 4
+    `Below`, parameter `u8` and value; 5 `Flag`, bit `u8` and `set`; 6 `Trigger`, bit
+    `u8`).
+  - `Skeleton`: the bones (key `u64`, parent `u8`, role `u8` in `BoneRole`'s declaration
+    order from 0, rest pose, then a presence byte and the `BoneBody`) and the sockets (key
+    `u64`, bone `u8`, offset pose). A `BoneBody` is the body's mass, linear and angular
+    damping and gravity scale, then `body_type` (0 dynamic, 1 kinematic, 2 fixed),
+    `locked_axes` and `can_sleep` as bytes; the collider's shape kind (0 sphere, 1
+    capsule, 2 cuboid), half extents, radius, offset, rotation, friction, restitution,
+    density and impact threshold, membership and filter `u32`, `sensor` and `events`,
+    material `u16`; then a presence byte and the joint: kind (0 fixed, 1 spherical, 2
+    revolute, 3 prismatic), the parent's and the bone's anchors, the axis, and a presence
+    byte before the two limits. Every field of the body and the collider is written; their
+    padding is not.
+
+  A loader refuses another format version or S (`VersionMismatch`); bytes that end inside
+  a field, a count the remaining bytes cannot hold (before allocating for it), bytes left
+  over after the asset, a `bool` other than 0 or 1 and an unknown tag (`InvalidData`); a
+  dependency list other than the set of assets the bytes name, `AssetId::NONE` left out
+  (`InvalidData`); then whatever `validate` refuses. Decoding reads integers and canonical
+  bits alone, so a decode is bit-identical on every host. RICOTTA's processors, which
+  write this form from the authored sources, come with `tools/cook`; `tests/format.rs`
+  holds an encoder written from this statement. A clip is cooked for one skeleton, in that
+  skeleton's bone order and count, with its samples already in character space convention
+  and as the simulation scalar; a change of scalar width is a cook change, as it is for
+  every simulation asset.
 - A rig's machine and skeleton, and the machine's clips, are read from the region's
   exact-version table, so they are in the region's asset set (architecture section 14; the
   open item on spawned entities' assets in `docs/verification.md` applies to a character
@@ -582,9 +623,12 @@ never leaves loops forever.
 - At target `anim`: a rig whose table has not entered or whose assets are missing or of the
   wrong kind (at trace, since it repeats every tick); a transition the loader should have
   refused (at debug, every advance that meets it, since only a hand-built asset bypasses
-  `validate` and a shipped game never logs it); a `Bones::spawn` on a character that
-  already has bones (at warn, once per call). The facade carries no `tracing` dependency:
-  the allowlist entry for it is proposed with D128.
+  `validate` and a shipped game never logs it; likewise an initial state past the states,
+  which holds, and a speed parameter past the slots, read as one); a `Bones::spawn` on a
+  character that already has bones or with a skeleton of more than `MAX_SIM_BONES` bones
+  (at warn, once per call, nothing spawned). `tracing` is the one third-party crate the
+  library names, allowed by its entry in `crate-tiers.toml`'s
+  `[boundary_third_party.direct]`.
 
 ## Not in this crate yet
 
@@ -612,14 +656,14 @@ never leaves loops forever.
   bones share groups with other colliders; the collider rule above stands until then.
 - The interpolation of a remote character's phase (`lactose-net-host`, milestone 4) and the
   visual blend of a correction (presentation, milestone 2).
-- The cooked byte form of the three kinds, the cooker's processors and the format's test:
-  the implementation lane with RICOTTA.
-- A SOUR test and the `[harness]` entry: the implementation's, proposed with D128.
+- The cooker's processors for the three kinds, which write the byte form "Assets" states
+  from the authored sources (glTF animation and skins, the machine's source): RICOTTA's,
+  with `tools/cook`.
 - Clip compression and streaming of clip data: milestone 3's budgets.
 
 ## Proof for milestone 1
 
-Today: `tests/consumers.rs`, compile-only, whose one test builds the schedule of a server, a
+`tests/consumers.rs`, compile-only, whose one test builds the schedule of a server, a
 prediction and a client world with this crate's systems beside a game sketch (a speed
 quantised from the solver's velocity and a trigger driven from a sketch input, section 6.1's
 `footsteps` as the amendment writes it, an authored event, root motion applied to a
@@ -629,18 +673,21 @@ stepped pose, a server-only ragdoll, presentation reading the extracted rows), t
 prediction world under `check_prediction_reads`; and the unit tests of the held mark in
 `src/components.rs` (an entry whose clip is missing, reported on its tick and not on the
 held ticks after it; a hold after an advance and after a transition, no crossing and no
-entry reported). The implementation lane adds the tests below, each a
-nextest test asserting on counts, orders, bytes and hashes and never on timing, the SOUR
-test recording under every mode.
+entry reported). Beside them, the tests below, each a nextest test asserting on counts,
+orders, bytes and hashes and never on timing (the budget's test prints its timings and is
+ignored), the SOUR test recording under every mode; `tests/common/mod.rs` is their shared
+support (authored data built in code, a store that publishes it, a one-region simulation
+with recording systems, the physics test backend).
 
 | What | How |
 |---|---|
-| The state machine | A machine with a loop, a one-shot, a `keep_phase` transition, a restart and a trigger: the transition order, one per tick, the entry tick's fields, a trigger consumed by the first advance that tries (not by the entry advance, not by a hold), `Finished` one tick after `END`, a blend's weight per tick and its end, a blend ended by a machine with fewer states; under three layouts and one and four workers, hashes equal |
-| Phase | `rate` for the duration and speed cases in the contract, the Q16.16 path checked against a hand-computed f32 path for durations 1 to 600; a one-shot of `d` ticks at `END` on tick `d`, `from_fraction(f, d)` crossed on tick `f`, a loop wrapping on tick `d`; `advanced` wrapping and saturating; `passed` across the wrap and at `END`; `phase_crossed` once per pass at every rate, on the entry tick at a set entry phase (an entry whose clip is missing included), not at a kept one (the walk-to-run case), never on a held tick |
-| Events | Authored events emitted once per pass in the order passed, across a wrap included, to the character's key, read by a later system; none from the outgoing clip |
-| Root motion | A loop's motion over one cycle equals the track's total at every rate; a quarter-circle turning clip applied tick by tick with `apply` ends where it was authored, within one unit in the last place; a one-shot's reaches its end; a blend interpolates; `apply` and `velocity` against a hand-composed transform |
-| Evaluation | `evaluate` equals a hand-composed pose for a two-bone chain at authored phases, with and without a blend, bit for bit; `rest`; a clip for another skeleton gives `EMPTY`; a limp character's row is `EMPTY` after `sets::EVALUATE` and the fitted pose after `sets::FIT` in a server world, `EMPTY` all tick in a prediction world; the same bits under every layout and worker count |
-| Bones | `spawn` from a server-only system records the stated rows and the `Bones` write, placeholders resolved, the rows' keys `NetId`s with no claim, nothing on a second call; the three `Stage::Post` systems run in a server world and not in a prediction world; `drive_bones` sweeps the kinematic bodies to the previous tick's pose, seen by the physics test backend; `set_limp` makes them dynamic, `report_bones` emits from limp rows alone, `fit_ragdoll` writes every bone, the unreported ones composed onto their fitted parents; `Skeleton::validate` refuses bodies whose memberships meet their filters, a pair with (membership 1, filter 2) and (membership 2, filter 1) included; a character without bones costs no command |
-| Prediction | The build check over this crate's systems; a predicted character rolled back and re-simulated with the ring's inputs hashes equal to the straight run; a corrected `AnimState` re-simulates from the server's phase; a quantised speed parameter over a sweep of speeds, each against itself plus residuals of the sizes the tolerance absorbs: the count of differing quantised values is the count of grid midpoints straddled, and is a small fraction of the sweep (rarity, not agreement) |
-| SOUR | `tests/sour.rs`: 200 characters with a sixteen-bone skeleton, a looping clip with events and root motion and a machine with triggers, 300 ticks, hashes recorded under workers, repeat, layout and chaos modes; `lactose-anim` listed under `[harness]` |
+| The state machine | `tests/machine.rs`: a machine with a loop, a one-shot, a `keep_phase` transition, a restart and a trigger: the transition order, one per tick, the entry tick's fields, a trigger consumed by the first advance that tries (not by the entry advance, not by a hold), `Finished` one tick after `END`, a blend's weight per tick and its end, a blend ended by a machine with fewer states; under three layouts and one and four workers, hashes equal |
+| Phase | `tests/phase.rs`: `rate` for the duration and speed cases in the contract, the Q16.16 path checked against a hand-computed f32 path for durations 1 to 600; a one-shot of `d` ticks at `END` on tick `d`, `from_fraction(f, d)` crossed on tick `f`, a loop wrapping on tick `d`; `advanced` wrapping and saturating; `passed` across the wrap and at `END`; `phase_crossed` once per pass at every rate, on the entry tick at a set entry phase (an entry whose clip is missing included), not at a kept one (the walk-to-run case), never on a held tick |
+| Events | `tests/events.rs`: authored events emitted once per pass in the order passed, across a wrap included, to the character's key, read by a later system; none from the outgoing clip |
+| Root motion | `tests/root_motion.rs`: a loop's motion over one cycle equals the track's total at every rate; a quarter-circle turning clip applied tick by tick with `apply` ends where it was authored within one unit in the last place per tick applied (measured at eight-byte scalars: 11 ulps after 60 ticks, 258 after 600); a one-shot's reaches its end; a blend interpolates; `apply` and `velocity` against a hand-composed transform |
+| Evaluation | `tests/evaluation.rs`: `evaluate` equals a hand-composed pose for a two-bone chain at authored phases, with and without a blend, bit for bit; `rest`; a clip for another skeleton gives `EMPTY`; a limp character's row is `EMPTY` after `sets::EVALUATE` and the fitted pose after `sets::FIT` in a server world, `EMPTY` all tick in a prediction world; the same bits under every layout and worker count |
+| Bones | `tests/bones.rs`: `spawn` from a server-only system records the stated rows and the `Bones` write, placeholders resolved, the rows' keys `NetId`s with no claim, nothing on a second call; the three `Stage::Post` systems run in a server world and not in a prediction world; `drive_bones` sweeps the kinematic bodies to the previous tick's pose, seen by the physics test backend; `set_limp` makes them dynamic, `report_bones` emits from limp rows alone, `fit_ragdoll` writes every bone, the unreported ones composed onto their fitted parents; `Skeleton::validate` refuses bodies whose memberships meet their filters, a pair with (membership 1, filter 2) and (membership 2, filter 1) included; a character without bones costs no command |
+| Prediction | `tests/prediction.rs`, over the real `Predictor`: the build check over this crate's systems; a predicted character rolled back and re-simulated with the ring's inputs hashes equal to the straight run; a corrected `AnimState` re-simulates from the server's phase; a quantised speed parameter over a sweep of speeds, each against itself plus residuals of the sizes the tolerance absorbs: the count of differing quantised values is the count of grid midpoints straddled, and is a small fraction of the sweep (rarity, not agreement) |
+| The cooked byte form | `tests/format.rs`, with an encoder written from "Assets": each kind round trips through its loader and through `ErasedLoader`, bit for bit, at the stated byte counts; every truncation, trailing bytes, another format version or scalar width, a dependency list other than the named assets, an unknown tag, a `bool` byte other than 0 or 1, a count the bytes cannot hold, and every `validate` failure of the three kinds refused |
+| SOUR | `tests/sour.rs`: 200 characters with a sixteen-bone skeleton, a looping clip with events and root motion and a machine with triggers, 300 ticks, a game sketch driving the parameters and applying the root motion; a server crowd whose every twentieth character grows bones, goes limp and recovers over the physics test backend, and a prediction crowd rolled back at tick 100 and re-simulated; hashes recorded under workers, repeat, layout and chaos modes; `lactose-anim` listed under `[harness]` |
 | The budget | `tests/cost.rs`, an ignored test run by hand in release on the M1 and the x86 desktop: 200 characters without `Bones`, each a sixteen-bone skeleton and a 60-sample looping clip, half of them mid cross-fade; (a) `SimPose::evaluate` over the 200 for 1,000 ticks, median and best microseconds per tick; (b) `Simulation::step` of the world holding them against the same world whose characters lack the `SimPose` component (a character without it is never evaluated), one and four workers, the difference per tick; (c) the same 200 with `Bones` and a body on every bone, the bone commands' cost per tick, reported outside the criterion; all with `uptime`'s load averages. The criterion is section 22's: (b) at most 0.5 ms; (a) says how much of it is the evaluation and how much the ECS's dispatch, (c) what bodies add. If (b) misses, the first levers are the row write (skip `set_if_neq`-equal bones, which a holding character has) and the sample reads (a frame index cached per state), never the bone cap |

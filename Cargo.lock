@@ -370,13 +370,17 @@ name = "lactose-anim"
 version = "0.0.0"
 dependencies = [
  "lactose-asset-api",
+ "lactose-bundle",
  "lactose-core",
  "lactose-ecs",
+ "lactose-input",
  "lactose-math",
+ "lactose-net-api",
  "lactose-physics-api",
  "lactose-predict",
  "lactose-reflect",
  "lactose-sim",
+ "lactose-task",
  "tracing",
 ]
 
