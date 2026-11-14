@@ -1274,6 +1274,22 @@ editorial pass rather than one taken from a review.
   the step ran on, and `lactose-physics-rapier` asserts it inside its pool's `install`, on the
   solver thread that steps; the other solver threads' state is set once at thread start and is
   not re-checked (`crates/physics-rapier/README.md`, Known gaps).
+- Addendum (lane spike-net, 2026-11-15; review rounds 1 and 2): the milestone 1 netcode spike
+  (`crates/app/tests/spike.rs`) measured the whole-send rule (D121, section 9.4) with its own
+  packer: fifty claimed bodies cost a mean 12.4 kB per update (worst 20.4 kB), about 371 kB/s at
+  30 Hz, eleven times the `SendBudget` default of 1,100 B per packet at 30 pps; a lone claimed
+  character costs 456 B. Per thrown body per update, 397 B: 292 B of payload (Transform 56,
+  Velocity 48, RigidBody 40, Collider 144, Lifetime 4) and 105 B of 21-byte row headers;
+  Transform and Velocity with their headers are 146 B (37%). A Transform-and-Velocity-only send
+  would be about 7.3 kB in an update carrying all fifty (20.4 kB whole) and about 4.6 kB on the
+  mean, still 4 to 7 times the budget, so `lactose-net`'s packer must budget whole sends across
+  updates or split them. The spike's correction figures were taken with every claimed body in
+  every update, unbudgeted, so they are not what `lactose-net` will see: under a budget each
+  body is compared about a tenth as often. The data does not reopen D121. Open, for the planner:
+  whether a whole send must carry components that do not change while the entity is claimed
+  (RigidBody, Collider). A whole-world `Client::hash` comparison is meaningful only when every
+  dynamic entity in the prediction world is claimed or static; the spike compares a column (the
+  carrier) where it is not.
 
 **D136. The `asset` facade, and the change it makes to `asset-api`'s store contract: what sections 4, 5.1, 8.2, 14, 15.2, 18, 19 and 20 left open** (§3, §4, §5.1, §8.2, §9.7, §14, §15.2, §18, §19, §20, §22, `lactose-asset`, `lactose-asset-api`, `lactose-bundle`, `lactose-io`, `lactose-task`, `lactose-app`, `lactose-persist`, `tools/cook`)
 - Why: the facade is written before its implementation so the cooker's skeleton, the milestone
@@ -3774,6 +3790,27 @@ checkpoint carries the physics snapshot** (§1, §2, §9.4, §10, §15.5, §16, 
   commands are closed by D126: a run's closing sync point clears every channel, so none is in
   flight at a save, a reload or a snapshot, and a writer of the channel in or after the sync's
   stage is a schedule build error.
+- Addendum (lane spike-net, 2026-11-15; review rounds 1 and 2): the milestone 1 netcode spike
+  (`crates/app/tests/spike.rs`) gives no case for doubling the defaults. Its correction rates
+  are driven by proxy blocking before a claim (claim scene), by solver-history departure (thrown
+  scene) and by contact onset (claim on approach), and doubling every default cut them 16%, 0%
+  and 4%. The one isolated contact, a claim made on approach, is not a residual at the margin:
+  its first contact tick corrects at 57 times a default because a resting body's sleep state is
+  solver state the rows do not carry. Its absorbed maxima (translation 65%, rotation 57%, linear
+  96%, angular at the tolerance) take translation and rotation from facts corrected at that
+  onset, since `PredictionStats::absorbed` counts a field within tolerance of a fact that
+  mismatched in another; in facts that agreed they are 14%, 14%, 96% and at the tolerance. The
+  decision waits on a sleep-state rule for claimed bodies and a re-measure
+  (docs/verification.md, rows "The reconciliation tolerance (D124)" and "A claimed body's sleep
+  state"). A lone predicted character corrects only around a join (once, the full frame's stale
+  start) and a resync (9 times around the clock script's stall), never otherwise. "A residual at
+  the margin costs one correction, not a storm" fails for fifty contact bodies once the client's
+  solver history departs from the server's: 30 to 95 corrections every cycle for the rest of the
+  session (row "Solver history departure"). A 39-tick correction (after a 40-tick outage, with
+  the recovering FULL never dropped) over fifty contact bodies costs 535 to 769 µs per
+  rolled-back tick at the median, 21 to 30 ms per correction on an Apple M1, which exceeds a
+  frame; the worst single sample was 22.5 ms per tick at load 19 to 25. A correction-depth or
+  cost cap belongs to predict's milestone 4 review.
 - Replaced: section 2's and 9.4's "at full precision" without qualification; D122's "Full
   precision means canonical bytes per field, no tolerance" for the solver-written rows of a
   dynamic body, its "a tolerance for dynamic bodies is decided at milestone 4" and its
