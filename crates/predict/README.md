@@ -292,7 +292,8 @@ sync point"; `crates/net-api/README.md`, "The staged frame")
      `Some` and the key is not live: `World::spawn` under the key with every component
      and its `StagedRegion`, the spawn's region, among them (so the row is born in its
      final archetype; a frame naming the component itself, which no server does, has it
-     rewritten after the spawn), a proxy, without `RemoteSlot` or `ClaimedBy`. If `slot`
+     rewritten after the spawn, and from D141 skipped as any unreplicated component of a
+     spawn is; facade), a proxy, without `RemoteSlot` or `ClaimedBy`. If `slot`
      is `Some` and the key is live
      and not claimed: an upsert, each component written whole so an equal value does not
      dirty the row, except `Transform`, `Velocity` and `Teleported`, which are written as
