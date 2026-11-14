@@ -18,9 +18,10 @@ overwrite through `World::insert` nor a per-entity invocation that emits and com
 nothing allocates, a per-entity system runs a kernel over the rows of one unit (a chunk, or
 a random range of one) with its columns lent as slices, a `Changed` filter and
 `World::changed_since` skip every chunk whose column tick is old, and each system is a
-graph node whose units run on any worker (D137). Architecture sections 5.2, 6 and 6.1 are the design; where this file
-and the architecture disagree, the architecture wins and this file is wrong. Decision D114 records the choices the sections left open and
-what the design review changed.
+graph node whose units run on any worker (D137). Architecture sections 5.2, 6 and 6.1 are
+the design; where this file and the architecture disagree, the architecture wins and this
+file is wrong. Decision D114 records the choices the sections left open and what the
+design review changed.
 
 Amending a signature is allowed in the change that needs it. Say so in the change description
 and list what changed, because `sim`, `predict`, `physics-api`, `net`, `persist`,

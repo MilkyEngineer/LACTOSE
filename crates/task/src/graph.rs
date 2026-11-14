@@ -22,8 +22,9 @@ use crate::{WorkerClass, lock};
 /// A node owns or shares its data (`'static`); the executor never borrows from the caller
 /// across threads, and a run takes no per-run argument. `lactose-ecs` implements this for a
 /// system bound to a shared world, and owns the argument that makes that sound: declared
-/// access for concurrent nodes, and running exclusive systems between graph runs, when no
-/// node is live.
+/// access for concurrent nodes, and exclusive systems run in a sync-point node that the
+/// graph orders after every node of one stage and before every node of the next, when no
+/// other node is live.
 ///
 /// A panic in any method aborts the process.
 pub trait GraphNode: Send + Sync + 'static {

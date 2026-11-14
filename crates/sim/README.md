@@ -11,9 +11,9 @@ point what enters the boundary.
 | Unsafe | none, `#![forbid(unsafe_code)]` |
 
 **Status: implemented.** Every behaviour below runs and is tested (the table at the end
-names the tests), and the simulation tests record their hashes under SOUR. Nothing is
-optimised: the world hash is sequential outside the crate's own pass, and the ECS run is
-the naive one. Every sentence under "Behaviour the signatures cannot express" is one a
+names the tests), and the simulation tests record their hashes under SOUR. Little is
+optimised: the world hash is sequential outside the crate's own pass, and the ECS run
+forks each system's units over the workers (D137 part B). Every sentence under "Behaviour the signatures cannot express" is one a
 dependent crate may rely on. Architecture sections 4, 5.1, 6, 8.2, 8.3, 9.1, 9.2, 9.3, 9.7, 11, 14, 15.2, 15.3
 and 15.5 are the design; where this file and the architecture disagree, the architecture
 wins and this file is wrong. Decision D118 records the choices those sections left open
