@@ -2,8 +2,8 @@
 
 The precision half of architecture section 16's scalar rule (milestone 1 plan, decision 5.4;
 verification row "Scalar precision"), and the reading for the row "Rapier's 64-bit build uses
-SIMD". Run 2 is the result. Run 1 is kept below: its control failed, and the probe was
-redesigned.
+SIMD". Run 2 is the result, with the straight walk as an added experiment. Run 1 is kept below:
+its control failed, and the probe was redesigned.
 
 ## Answer
 
@@ -11,33 +11,61 @@ redesigned.
   of the ten minutes. Every run in both precisions passes the self-check.
 - **32 bits fails the one-millimetre rule at 6 km.** The largest difference is 157.75 mm on the
   (6000, 0, 6000) pair and 94.38 mm on the (6000, 0, 0) pair. Both are about a hundred times
-  the limit, and both are reached in the first 30 seconds. Before the walker first touches a
-  block, the two pairs differ by 88.14 mm and 34.07 mm. The 12 km pair, which is informative
-  only, reaches 120.84 mm without touching any block. By section 16's rule 64 bits stays, and
-  the rule's SOUR half is moot.
-- **Row 41: yes for the contact solver, scalar elsewhere.** In the 64-bit build every
-  rigid-body contact constraint is solved by 4-lane `wide::f64x4` kernels. Those kernels are
-  NEON `.2d` on aarch64 and AVX `ymm` on x86-64-v3. The glam-based code around them is scalar
-  f64. Details under "Row 41" below.
+  the limit; both are reached in the first 30 seconds, after which the closed square undoes
+  each lap's error; a walk that does not retrace keeps growing. Before the walker first comes
+  within the 2 cm prediction distance of a block, the two pairs differ by 88.14 mm and
+  34.07 mm. The 12 km pair, which is informative only, reaches 120.84 mm without coming within
+  it. A straight walk, which does not retrace, drifts 6.1 mm per metre walked at 6 km and
+  13.7 mm per metre at 12 km. By section 16's rule 64 bits stays, and the rule's SOUR half is
+  moot.
+- **Row 41: yes for the contact solver.** In the 64-bit build every rigid-body contact
+  constraint is solved by 4-lane `wide::f64x4` kernels. The one the default friction model
+  selects, `ContactWithTwistFriction`, is NEON `.2d` on aarch64 and AVX `ymm` on x86-64-v3. The
+  glam-based code examined is scalar f64; the substep integration was not isolated. Details
+  under "Row 41" below.
 
 ## Run 2: the result
 
 - CPU and operating system: Apple M1 (4 performance, 4 efficiency cores), macOS 14.7.4 (23H420).
 - Topology and workers: do not apply. The probe is one thread: Rapier is built without
   `parallel` and steps on the calling thread.
-- Commit: `a6d8fba` (clean). This tree's code is that of `4c2cef5`; only `docs/results` differs.
+- Commit: `017823e` (clean). This tree's code is that of `4c2cef5`; only `docs/results` differs.
   The probe is a scratch crate outside the workspace, with its own empty `[workspace]` table
-  and its own lock file. Its full source, as run 2 ran it, is at the end of this file.
+  and its own lock file, which this file does not carry; a rebuild must resolve the versions
+  listed below (for example with `cargo update -p <crate> --precise <version>`), or it is not
+  the run recorded here. Its full source, as run 2 ran it, is at the end of this file.
 - Build profile: `release` with `panic = "abort"`, toolchain 1.99.0 (the repository's
   `rust-toolchain.toml`).
 - Command, from the repository root, with the two files below in a directory `<probe>`:
   `cargo build --release --manifest-path <probe>/Cargo.toml && <probe>/target/release/scalar-probe`.
-- Load average: 5.76 14.48 16.56 before, 5.38 14.25 16.47 after. The run is deterministic, so
+- Load average: 7.30 7.99 13.79 before, 8.71 8.27 13.85 after. The run is deterministic, so
   load affects no figure: each precision's origin run, stepped a second time in the same
-  process, was bit-equal to the first.
-- Resolved versions, the same as the workspace's `Cargo.lock`: `rapier3d` and `rapier3d-f64`
-  0.36.0 (upstream crates.io, not the vendored copy), `parry3d` and `parry3d-f64` 0.31.1,
-  `glamx` 0.3.1, `glam` 0.33.12, `simba` 0.10.2, `wide` 1.7.1, `nalgebra` 0.35.0, `libm` 0.2.16.
+  process, was bit-equal to the first. Run 2 first ran at `a6d8fba`, without the straight
+  walk, with load averages 5.76 14.48 16.56 before and 5.38 14.25 16.47 after; this run
+  reproduces every figure of that one exactly.
+- Resolved versions of the numerical crates in the probe's lock file:
+
+| Crate | Version | Note |
+|---|---|---|
+| `rapier3d`, `rapier3d-f64` | 0.36.0 | Upstream crates.io, pinned by the manifest; not the vendored copy |
+| `parry3d`, `parry3d-f64` | 0.31.1 | |
+| `glamx` | 0.3.1 | |
+| `glam` | 0.33.12 | The version `glamx` uses; the lock also holds 0.30.10, 0.31.1 and 0.32.1 for `nalgebra`'s conversions |
+| `simba` | 0.10.2 | |
+| `wide` | 1.7.1 | |
+| `safe_arch` | 1.2.0 | `wide`'s x86 intrinsics |
+| `nalgebra` | 0.35.0 | |
+| `matrixmultiply` | 0.3.11 | |
+| `num-traits` | 0.2.19 | |
+| `num-complex` | 0.4.6 | |
+| `approx` | 0.5.1 | |
+| `libm` | 0.2.16 | |
+| `ordered-float` | 5.5.1 | The workspace's `Cargo.lock` has 5.5.0 |
+| `robust` | 1.2.0 | |
+| `spade` | 2.15.1 | |
+| `rstar` | 0.13.1 | The workspace's `Cargo.lock` has 0.13.0 |
+
+  Every other crate in the table has the same version in the workspace's `Cargo.lock`.
 
 ### The scene, and how it maps to the support scene
 
@@ -76,9 +104,9 @@ with one change, the closed square:
 What differs from the support scene besides the closed square, and why none of it is expected
 to matter:
 
-- The probe steps without `parallel` and without a solver pool. The workspace's scenes report
-  bit-equal results on pools of one, two and four threads (verification row 33,
-  `crates/physics-rapier/tests/pool.rs`).
+- The probe builds Rapier without `parallel`. With it, the workspace's scenes are bit-equal on
+  pools of one, two and four threads (verification row 33); without it, the staged solver runs
+  the same stages on one worker, which was read from the source, not measured.
 - The probe uses upstream Rapier, not the vendored patched copy. The walk scene exercises
   neither patched path: it has no joint, so the angular limit's `sin_cos` is not reached, and
   the deferred tree optimisation is taken only on a pool of more than one thread.
@@ -96,21 +124,25 @@ in its scene's coordinates. The run fails the check if any of these happens:
 - the walker's centre goes below y = 0;
 - the walker's capsule comes within 1 m of the floor's edge, that is, the centre's |x| or |z|
   exceeds 48.7 m;
-- the walker has an active contact with any collider other than the floor and the five blocks.
+- the walker has a solver contact (Rapier's active contact, which includes speculative
+  contacts within the 2 cm prediction distance) with any collider other than the floor and the
+  five blocks.
 
 A failed run is reported as a failed check, and no difference is read from it. Every run
 passed:
 
-| Run | 64-bit: check; first touch of a block | 32-bit: check; first touch of a block | Walker's range, x and z (m) |
+| Run | 64-bit: check; first comes within the 2 cm prediction distance of a block | 32-bit: check; first comes within the 2 cm prediction distance of a block | Walker's range, x and z (m) |
 |---|---|---|---|
 | origin | passed; never | passed; never | x −3.13 to 2.85, z −3.00 to 2.97 in both precisions |
-| (6000, 0, 6000) | passed; never | passed; tick 749 (345 ticks touching) | 32-bit: x −3.22 to 2.85, z −3.00 to 3.08 |
-| (6000, 0, 0) | passed; never | passed; tick 750 (344 ticks touching) | 32-bit: x −3.22 to 2.85, z −3.00 to 3.02 |
+| (6000, 0, 6000) | passed; never | passed; tick 749 (345 ticks within it) | 32-bit: x −3.22 to 2.85, z −3.00 to 3.08 |
+| (6000, 0, 0) | passed; never | passed; tick 750 (344 ticks within it) | 32-bit: x −3.22 to 2.85, z −3.00 to 3.02 |
 | (12000, 0, 12000) | passed; never | passed; never | 32-bit: x −3.14 to 2.93, z −3.00 to 3.06 |
 
-In 64 bits the walker never touches a block, at any translation. In 32 bits it touches one only
-in the two 6 km runs, from tick 749 or 750. Its centre stays between y = 0.76 m and 3.66 m in
-every run.
+In 64 bits the walker never comes within the 2 cm prediction distance of a block, at any
+translation. In 32 bits it does so only in the two 6 km runs, from tick 749 or 750. It does
+not touch the block: the review measured its closest approach at about 6.8 mm, but the solver
+acts on such speculative contacts. Its centre stays between y = 0.76 m and 3.66 m in every
+run. The probe's output and source still say "touch" for this.
 
 ### Translations
 
@@ -127,29 +159,32 @@ covers every tick and every body: each body's position relative to its own scene
 difference taken in f64. The fixed bodies never differ, so every largest value is the walker's.
 Figures are in millimetres, with the tick of the largest value in parentheses. The last column
 is informative: the largest difference over the ticks before either run of the pair first
-touches anything other than the floor.
+comes within the 2 cm prediction distance of anything other than the floor.
 
 #### 64-bit, the control
 
-| Translation | Largest \|Δx\| | Largest \|Δy\| | Largest \|Δz\| | Largest length | Length at tick 36,000 | Largest before a first touch other than the floor |
+| Translation | Largest \|Δx\| | Largest \|Δy\| | Largest \|Δz\| | Largest length | Length at tick 36,000 | Largest before either run comes within 2 cm of a block |
 |---|---|---|---|---|---|---|
-| (6000, 0, 6000) | 0.0000 | 0.0318 (23352) | 0.0000 | **0.0318** (23352) | 0.0000 | 0.0318 (23352); never touches |
-| (6000, 0, 0) | 0.0000 | 0.0319 (3851) | 0.0000 | **0.0319** (3851) | 0.0000 | 0.0319 (3851); never touches |
-| (12000, 0, 12000) | 0.0000 | 0.0319 (26651) | 0.0000 | **0.0319** (26651) | 0.0000 | 0.0319 (26651); never touches |
+| (6000, 0, 6000) | 0.0000 | 0.0318 (23352) | 0.0000 | **0.0318** (23352) | 0.0000 | 0.0318 (23352); never within 2 cm |
+| (6000, 0, 0) | 0.0000 | 0.0319 (3851) | 0.0000 | **0.0319** (3851) | 0.0000 | 0.0319 (3851); never within 2 cm |
+| (12000, 0, 12000) | 0.0000 | 0.0319 (26651) | 0.0000 | **0.0319** (26651) | 0.0000 | 0.0319 (26651); never within 2 cm |
 
 The largest length in each minute, minutes 1 to 10, stays between 0.024 and 0.032 mm on every
 pair. It does not grow.
 
 **Verdict: the control passes.** Every 64-bit pair is under 1 mm at every tick, by a factor of
-about 30. The scene does not amplify differences, so the 32-bit figures are read.
+about 30. The 0.03 mm is not the f64 spacing magnified: it is the same at 6 km and 12 km, whose
+spacings differ by two, and it lies in y only, where the jump landings make the scene sensitive
+to any perturbation. It bounds what the scene adds to a difference, so 32-bit figures thousands
+of times larger, in x and z, are read as 32-bit error.
 
 #### 32-bit
 
-| Translation | Largest \|Δx\| | Largest \|Δy\| | Largest \|Δz\| | Largest length | Length at tick 36,000 | Largest before a first touch other than the floor |
+| Translation | Largest \|Δx\| | Largest \|Δy\| | Largest \|Δz\| | Largest length | Length at tick 36,000 | Largest before either run comes within 2 cm of a block |
 |---|---|---|---|---|---|---|
-| (6000, 0, 6000) | 94.38 (1439) | 0.107 (3240) | 142.67 (3900) | **157.75** (1649) | 110.92 | 88.14 (449); first touch at tick 749 |
-| (6000, 0, 0) | 94.38 (1439) | 0.172 (1440) | 43.39 (3147) | **94.38** (1440) | 53.03 | 34.07 (242); first touch at tick 750 |
-| (12000, 0, 12000) | 80.09 (120) | 0.116 (3540) | 90.49 (239) | 120.84 (239) | 90.14 | 120.84 (239); never touches |
+| (6000, 0, 6000) | 94.38 (1439) | 0.107 (3240) | 142.67 (3900) | **157.75** (1649) | 110.92 | 88.14 (449); first within 2 cm at tick 749 |
+| (6000, 0, 0) | 94.38 (1439) | 0.172 (1440) | 43.39 (3147) | **94.38** (1440) | 53.03 | 34.07 (242); first within 2 cm at tick 750 |
+| (12000, 0, 12000) | 80.09 (120) | 0.116 (3540) | 90.49 (239) | 120.84 (239) | 90.14 | 120.84 (239); never within 2 cm |
 
 The largest length in each minute, minutes 1 to 10:
 
@@ -160,12 +195,50 @@ The largest length in each minute, minutes 1 to 10:
 | (12000, 0, 12000) | 120.84, then 120.84 in every later minute |
 
 **Verdict at 6 km: fail.** Both 6 km pairs exceed 1 mm, by about a hundred times: 157.75 mm
-and 94.38 mm. The difference needs no contact to arise. On the floor alone, before any block
-is touched, the 6 km pairs reach 88.14 mm and 34.07 mm within 8 seconds. The 12 km pair never
-touches a block and reaches 120.84 mm. Each pair reaches its largest difference in
-the first 30 seconds, and the difference then stays flat for the rest of the ten minutes. This
-is not the random-walk growth the plan expected, about 27 mm after ten minutes. The probe
-measures the size of the error, not its cause.
+and 94.38 mm. The difference needs no contact to arise. On the floor alone, before the walker
+comes within the 2 cm prediction distance of a block, the 6 km pairs reach 88.14 mm and
+34.07 mm within 8 seconds. The 12 km pair never comes within it and reaches 120.84 mm.
+
+Each pair reaches its largest difference in the first 30 seconds, and the largest in each later
+minute does not grow, because the closed square retraces itself. The error is not a random walk
+but a speed bias: each substep moves the walker about 12.5 mm, and the f32 sum is rounded to
+the spacing at the walker's coordinate (0.49 mm at 6 km, 0.98 mm at 12 km) with a consistent
+sign along a side, so a side ends tens of millimetres long or short and the opposite side
+undoes it. Each 32-bit run becomes periodic bit for bit with the scene's 2,700-tick period and
+returns to the same offset every period (the review's measurement). A path that does not
+retrace accumulates the bias with distance walked, so these figures are lower bounds for the
+scene's motion, not a ceiling; the straight walk below measures that growth. The bias depends
+on the step's fraction of the spacing and on the offset the first period leaves, not on the
+spacing alone, which is why the 12 km pair can lie below the 6 km diagonal.
+
+#### The straight walk, an added experiment
+
+The square retraces its path, so it cannot show how the error grows with distance. The
+straight walk is the same scene, bodies and velocity rule, with the walker driven along +x at
+3 m/s for 600 ticks and no jumps. It runs at the origin and at (64, 0, 0), (1024, 0, 0),
+(6000, 0, 0) and (12000, 0, 0), in both precisions, each against its precision's origin. The
+walker stays at z = −3, 4.5 m from the blocks' row, and ends near x = 26.5 m. Every run passed
+the self-check, and none came within 2 cm of a block. From its start at x = −3, the origin
+walker walks 5.90 m by tick 120, 14.74 m by tick 300 and 29.48 m by tick 600, in both
+precisions.
+
+The walker's Δx in mm, and Δx at tick 600 per metre the origin walker walked:
+
+| Translation | 32-bit, tick 120 | 32-bit, tick 300 | 32-bit, tick 600 | 32-bit, mm per metre | 64-bit, ticks 120, 300 and 600 |
+|---|---|---|---|---|---|
+| (64, 0, 0) | 0.1454 | 0.4616 | 0.6390 | 0.022 | 0.0000 |
+| (1024, 0, 0) | 3.8915 | 15.1939 | 33.6819 | 1.14 | 0.0000 |
+| (6000, 0, 0) | −33.5841 | −88.1996 | −179.5750 | −6.09 | 0.0000 |
+| (12000, 0, 0) | 80.6737 | 201.8394 | 403.4328 | 13.69 | 0.0000 |
+
+In 32 bits, Δy stays under 0.003 mm and Δz is 0 in every pair; in 64 bits every difference is
+0.0000 mm to four decimals. At 6 km and 12 km Δx grows in proportion to the distance walked:
+5.70, 5.98 and 6.09 mm per metre at the three ticks at 6 km, and 13.68, 13.69 and 13.69 at
+12 km. That is a speed bias of about 0.6 % at 6 km and 1.4 % at 12 km, which no closed path
+bounds. These figures agree with the review's own straight walk to the precision it gave:
+−33.6, −88.2 and −179.6 mm at 6 km, +80.7, +201.8 and +403.4 mm at 12 km, 33.7 mm at 1024 m
+and 0.64 mm at 64 m at tick 600, and 0.0000 in 64 bits. The review's 29.43 m for the distance
+walked is taken from the walker's position after the first step, 0.05 m past its start.
 
 ## Run 1: the control failed
 
@@ -223,34 +296,47 @@ From the vendored source (`vendor/rapier3d-f64-0.36.0`) and the pinned registry 
   unless LLVM pairs lanes by itself.
 
 From one release build of `lactose-physics-rapier` at `4c2cef5`, the vendored crate's own
-object code:
+object code. The backend leaves `friction_model` at its default, `FrictionModel::Simplified`, so
+the staged solver sets `use_twist` (`init.rs`) and solves every contact chunk with
+`ContactWithTwistFriction<SimdReal>::solve` (`solve.rs`); the Coulomb kernel is compiled but
+not called.
 
-- aarch64 (this machine): `rapier3d_f64::dynamics::solver::contact_constraint::contact_with_coulomb_friction::ContactWithCoulombFriction<simba::simd::WideF64x4>::solve`
-  holds 710 floating-point arithmetic and compare instructions. All 710 are vector `.2d`
-  (336 `fmul`, 214 `fadd`, 72 `fsub`, 18 `fdiv`, 2 `fsqrt`, the rest compares, `fabs`, `fneg`
-  and `fmaxnm`). None is a scalar `d` register operation, and none is fused. Each `f64x4`
-  operation is a pair of `.2d` instructions:
+- aarch64 (this machine): `rapier3d_f64::dynamics::solver::contact_constraint::contact_with_twist_friction::ContactWithTwistFriction<simba::simd::WideF64x4>::solve`
+  holds 832 floating-point arithmetic and compare instructions. All 832 are vector `.2d`
+  (396 `fmul`, 254 `fadd`, 88 `fsub`, 18 `fdiv`, 2 `fsqrt`, the rest compares, `fabs`, `fneg`,
+  `fmaxnm` and `fminnm`). None is a scalar `d` register operation, and none is fused. An
+  excerpt, products and sums compared with zero two lanes at a time:
 
   ```text
-  6a5c:  fmul.2d  v16, v9, v16
-  6a60:  fmul.2d  v17, v12, v17
-  6a74:  fmul.2d  v18, v13, v18
-  6a78:  fmul.2d  v19, v21, v19
-  6a7c:  fadd.2d  v16, v16, v18
-  6a80:  fadd.2d  v17, v17, v19
+  50d8:  fmul.2d  v14, v19, v12
+  50dc:  fadd.2d  v14, v17, v14
+  50e0:  fcmge.2d v14, v14, #0.0
+  50e4:  orn.16b  v8, v8, v14
+  50e8:  fcmge.2d v14, v30, #0.0
+  50ec:  mvn.16b  v14, v14
+  50f0:  fmul.2d  v25, v6, v30
+  50f4:  fadd.2d  v25, v18, v25
+  50f8:  fcmge.2d v25, v25, #0.0
+  50fc:  orn.16b  v14, v14, v25
   ```
 
-  For contrast, `RigidBodyVelocity<f64>::integrate`, written on glam, is entirely scalar
+- The substep integration, `integrate_linearized`, is inlined into the solver's worker and was
+  not isolated. For contrast, `RigidBodyVelocity<f64>::integrate`, written on glam and reached
+  in a step only through CCD and the public prediction calls, is entirely scalar
   (`fmul d0, d8, d0`, 73 `fmul`, 41 `fadd`, 17 `fsub`, no `.2d`).
 - x86-64-v3 (cross-compiled with `--target x86_64-unknown-linux-gnu`, disassembled and not run):
-  the same `solve` holds 324 `ymm` arithmetic instructions (`vmulpd`, `vaddpd`, `vsubpd`,
-  `vdivpd`, `vmaxpd`), with no `xmm`-only packed or scalar `sd` arithmetic and no `vfmadd`.
-  `RigidBodyVelocity<f64>::integrate` is mostly scalar (64 `sd` instructions), with 31 packed
-  ones where LLVM paired lanes.
+  the twist kernel has no symbol of its own. It is inlined into the solve pass's chunk closure
+  (`staged_island_solver::solve::solve_pass::{closure}`), which holds 502 `ymm` floating-point
+  instructions: 479 arithmetic (239 `vmulpd`, 165 `vaddpd`, 59 `vsubpd`, 9 `vdivpd`, 5 `vmaxpd`,
+  1 `vminpd`, 1 `vsqrtpd`), 5 `vcmpunordpd` compares and 18 `vandpd` and `vxorpd` masks, with
+  55 `vblendpd` and `vblendvpd` blends besides. It holds one scalar `vdivsd`, no `xmm`-only
+  packed arithmetic and no `vfmadd`. The closure calls the Coulomb solve out of line, on the
+  branch the twist setting does not take. `RigidBodyVelocity<f64>::integrate` is mostly scalar
+  (64 `sd` instructions), with 31 packed ones where LLVM paired lanes.
 
 So the 64-bit cost argument stands on this: the contact solver is SIMD in both precisions, at
-two f64 lanes per NEON instruction against four f32 lanes. The integration, the narrow phase
-and the rest of the glam-based code are scalar f64 on aarch64.
+two f64 lanes per NEON instruction against four f32 lanes. The glam-based code examined is
+scalar f64 on aarch64; the substep integration was not isolated.
 
 ## The probe, as run 2 ran it
 
@@ -297,9 +383,11 @@ panic = "abort"
 //! `crates/physics-rapier/tests/support/mod.rs` with its square closed, rebuilt on Rapier's own
 //! API in 32 and 64 bits, stepped 36,000 ticks at 60 Hz at the origin and translated, checked
 //! to stay on its floor, and compared with the origin run of the same precision, each position
-//! taken relative to its own scene origin, in f64.
+//! taken relative to its own scene origin, in f64. Then the straight walk: the same scene
+//! walked along +x for 600 ticks without jumps, a path that does not retrace itself.
 
 const TICKS: u32 = 36_000;
+const STRAIGHT_TICKS: u32 = 600;
 /// The floor (key 1), the five blocks (keys 2 to 6) and the walker (key 10), in key order.
 const BODIES: usize = 7;
 const FLOOR: usize = 0;
@@ -311,7 +399,8 @@ const RADIUS: f64 = 0.3;
 const MARGIN: f64 = 1.0;
 
 /// One run: each tick's body positions relative to the run's scene origin, in f64, and what
-/// the walker touched.
+/// the walker touched. A touch is a solver contact: Rapier's active contact, which includes
+/// speculative contacts within the 2 cm prediction distance.
 struct Run {
     trace: Vec<[[f64; 3]; BODIES]>,
     /// The first tick the walker touched a body other than the floor.
@@ -403,25 +492,27 @@ macro_rules! scene {
                 })
             }
 
-            /// Steps the walk scene with its every position translated by `origin`.
-            pub fn run(origin: [f64; 3]) -> super::Run {
+            /// Steps the walk scene for `ticks` ticks with its every position translated by
+            /// `origin`; `straight` walks along +x without jumps instead of the square.
+            pub fn run(origin: [f64; 3], ticks: u32, straight: bool) -> super::Run {
                 let [ox, oy, oz] = origin;
                 let mut world = PhysicsWorld::new();
                 let mut handles = Vec::with_capacity(super::BODIES);
                 let mut colliders = Vec::with_capacity(super::BODIES);
                 let mut last: Option<Vector> = None;
                 let mut run = super::Run {
-                    trace: Vec::with_capacity(super::TICKS as usize),
+                    trace: Vec::with_capacity(ticks as usize),
                     first_touch: None,
                     touch_ticks: 0,
                     failed: None,
                 };
-                for tick in 1..=super::TICKS {
+                for tick in 1..=ticks {
                     // `Walk::drive` with the square closed: a 540-tick cycle of four 120-tick
                     // sides at 3 m/s, then 60 ticks of rest, keeping the reported vertical
-                    // velocity; a jump every 300 ticks.
+                    // velocity; a jump every 300 ticks. The straight walk keeps the first side.
                     let phase = tick % 540;
                     let (x, z) = match (phase / 120, phase >= 480) {
+                        _ if straight => (3.0, 0.0),
                         (_, true) => (0.0, 0.0),
                         (0, false) => (3.0, 0.0),
                         (1, false) => (0.0, 3.0),
@@ -490,7 +581,8 @@ macro_rules! scene {
                     let walker = handles[super::WALKER];
 
                     // The backend's `apply_commands`, then the step's gravity and dt.
-                    if tick % 300 == 150
+                    if !straight
+                        && tick % 300 == 150
                         && let Some(body) = world.bodies.get_mut(walker)
                     {
                         body.apply_impulse(v(0.0, 3.0, 0.0), true);
@@ -615,13 +707,13 @@ fn main() {
         ("(12000, 0, 12000)", [12_000.0, 0.0, 12_000.0]),
     ];
     // The 64-bit control first.
-    let precisions: [(&str, fn([f64; 3]) -> Run); 2] =
+    let precisions: [(&str, fn([f64; 3], u32, bool) -> Run); 2] =
         [("64-bit", double::run), ("32-bit", single::run)];
     for (name, step) in precisions {
         let results: Vec<Run> = runs
             .iter()
             .map(|&(label, origin)| {
-                let run = step(origin);
+                let run = step(origin, TICKS, false);
                 let w = run.trace[run.trace.len() - 1][WALKER];
                 let (mut low, mut high) = ([f64::INFINITY; 3], [f64::NEG_INFINITY; 3]);
                 for p in &run.trace {
@@ -680,11 +772,58 @@ fn main() {
         }
         println!();
         // Same precision, origin against origin: the probe is deterministic in itself.
-        let again = step(runs[0].1);
+        let again = step(runs[0].1, TICKS, false);
         let equal = again.trace.iter().zip(&results[0].trace).all(|(a, b)| {
             a.iter().flatten().zip(b.iter().flatten()).all(|(x, y)| x.to_bits() == y.to_bits())
         });
         println!("{name} origin run repeated: bit-equal {equal}");
+        println!();
+    }
+
+    // The straight walk: each translation against its precision's origin, the walker's
+    // difference at three ticks, and its growth with the distance the origin walker walked.
+    let walks: [(&str, [f64; 3]); 5] = [
+        ("origin", [0.0, 0.0, 0.0]),
+        ("(64, 0, 0)", [64.0, 0.0, 0.0]),
+        ("(1024, 0, 0)", [1_024.0, 0.0, 0.0]),
+        ("(6000, 0, 0)", [6_000.0, 0.0, 0.0]),
+        ("(12000, 0, 0)", [12_000.0, 0.0, 0.0]),
+    ];
+    let at = [120_u32, 300, STRAIGHT_TICKS];
+    for (name, step) in precisions {
+        let results: Vec<Run> =
+            walks.iter().map(|&(_, origin)| step(origin, STRAIGHT_TICKS, true)).collect();
+        let walked = |tick: u32| results[0].trace[tick as usize - 1][WALKER][0] + 3.0;
+        println!(
+            "straight {name}: origin walker walked {:.4} m, {:.4} m, {:.4} m by ticks 120, 300, 600",
+            walked(at[0]),
+            walked(at[1]),
+            walked(at[2]),
+        );
+        for (index, (label, _)) in walks.iter().enumerate() {
+            let check = match (&results[index].failed, results[index].first_touch) {
+                (Some((tick, why)), _) => format!("FAILED at tick {tick}: {why}"),
+                (None, Some(tick)) => format!("FAILED: touched a block at tick {tick}"),
+                (None, None) => "passed".to_string(),
+            };
+            if index == 0 {
+                println!("straight {name} {label}: check {check}");
+                continue;
+            }
+            let d = |tick: u32, axis: usize| {
+                let i = tick as usize - 1;
+                results[index].trace[i][WALKER][axis] - results[0].trace[i][WALKER][axis]
+            };
+            let cells: Vec<String> = at
+                .iter()
+                .map(|&t| format!("{} {} {} ({t})", mm(d(t, 0)), mm(d(t, 1)), mm(d(t, 2))))
+                .collect();
+            println!(
+                "straight {name} {label}: check {check}; walker dx dy dz mm (tick): {}; dx per metre walked at tick 600: {:.4} mm/m",
+                cells.join("; "),
+                d(STRAIGHT_TICKS, 0) * 1_000.0 / walked(STRAIGHT_TICKS),
+            );
+        }
         println!();
     }
 }
