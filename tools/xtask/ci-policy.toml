@@ -37,8 +37,9 @@ packages = ["lactose-app-headless"]
 # edits this list in the same commit.
 [harness]
 packages = [
-  "lactose-sim", "lactose-physics-api", "lactose-input", "lactose-physics-rapier", "lactose-net-api",
-  "lactose-predict", "lactose-net-host", "lactose-anim", "lactose-persist", "lactose-app",
+  "lactose-sim", "lactose-ecs", "lactose-physics-api", "lactose-input", "lactose-physics-rapier",
+  "lactose-net-api", "lactose-predict", "lactose-net-host", "lactose-anim", "lactose-persist",
+  "lactose-app",
 ]
 tests = [
   "lactose_anim::sour::a_prediction_crowd_with_a_rollback",
@@ -64,5 +65,6 @@ tests = [
   "lactose_physics_rapier::sour::a_server_scene",
   "lactose_physics_rapier::sour::the_conformance_run",
   "lactose_predict::sour::a_prediction_scene_with_corrections_and_substitutions",
+  "lactose_sim::cost::scene",
   "lactose_sim::sour::anchored_world",
 ]

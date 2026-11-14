@@ -1,9 +1,11 @@
 //! Times a step from its spans, summed by label until taken: each `casein` sync point and
-//! stage, and each system. A system's time is its graph node's: the executor's span of every
-//! range it ran (target `whisk`, named after the node), summed over the ranges, so on several
-//! workers it is the system's work, not its wall time. An exclusive system runs inside a sync
-//! point's node, so its time is its `casein` "system" span. A span entered inside one of the
-//! same label, as a system's `casein` span is inside its node's range, is not counted again.
+//! each system. A system's time is its graph node's: the executor's span of every range it
+//! ran (target `whisk`, named after the node), summed over the ranges, so on several workers
+//! it is the system's work, not its wall time. A node's last range holds its `finalize` and
+//! the `units` of the nodes it releases, so per-system figures overlap by them. An exclusive
+//! system runs inside a sync point's node, so its time is its `casein` "system" span. A span
+//! entered inside one of the same label, as a system's `casein` span is inside its node's
+//! range, is not counted again.
 //! A module of its own so that `crates/app/tests/cost.rs` times its scenes the same way.
 //!
 //! Cheap per span: no allocation once a label has been seen, one lock where a span is

@@ -15,13 +15,25 @@ use lactose_core::ComponentKey;
 pub struct Access {
     kind: AccessKind,
     target: fn() -> AccessTarget,
+    /// The Rust type of a component entry, which its target names only by key.
+    component: Option<fn() -> &'static str>,
 }
 
 impl Access {
     /// An entry of `kind` whose target `target` yields when evaluated.
     #[must_use]
     pub const fn new(kind: AccessKind, target: fn() -> AccessTarget) -> Self {
-        Self { kind, target }
+        Self { kind, target, component: None }
+    }
+
+    /// An entry of `kind` on component `T`, which records `T`'s type name for diagnostics.
+    pub(crate) const fn component<T: lactose_reflect::Component>(kind: AccessKind) -> Self {
+        Self { kind, target: component_target::<T>, component: Some(core::any::type_name::<T>) }
+    }
+
+    /// `core::any::type_name` of the component a component entry names, for diagnostics.
+    pub(crate) fn component_name(&self) -> Option<&'static str> {
+        self.component.map(|name| name())
     }
 
     /// How the parameter touches its target.
@@ -143,7 +155,7 @@ pub(crate) fn component_target<T: lactose_reflect::Component>() -> AccessTarget 
 #[doc(hidden)]
 #[must_use]
 pub const fn writes<T: lactose_reflect::Component>() -> Access {
-    Access::new(AccessKind::Writes, component_target::<T>)
+    Access::component::<T>(AccessKind::Writes)
 }
 
 /// The target function of a resource parameter; `T` may be a `dyn` trait type.

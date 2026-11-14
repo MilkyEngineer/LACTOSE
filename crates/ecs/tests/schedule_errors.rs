@@ -257,7 +257,7 @@ fn an_assembler_orders_sets_that_do_not_name_each_other() {
 
 #[test]
 fn parameter_errors() {
-    let cases: [(&'static SystemDescriptor, ScheduleError); 10] = [
+    let cases: [(&'static SystemDescriptor, ScheduleError); 11] = [
         (
             &EXCLUSIVE_ENTITY,
             ScheduleError::ExclusiveWithEntityAccess { system: "test::exclusive_entity" },
@@ -295,6 +295,13 @@ fn parameter_errors() {
             },
         ),
         (&STORE_ONLY, ScheduleError::RegionParamInWorldSystem { system: "test::finalize_ctx" }),
+        (
+            &STORE_READS,
+            ScheduleError::InvalidParameter {
+                system: "test::finalize_component",
+                parameter: core::any::type_name::<Counter>(),
+            },
+        ),
     ];
     for (system, expected) in cases {
         assert_eq!(build_error(&[system]), expected);
@@ -309,6 +316,16 @@ fn store_only(_counter: &Counter) -> u32 {
 
 #[lactose_ecs::finalize(store_only)]
 fn store_with_ctx(_sum: i128, _ctx: Ctx) {}
+
+/// A reduction whose finalize takes a component, which a finalize cannot: the error names
+/// the component's type.
+#[system(name = "test::finalize_component", reduce = lactose_math::IntSum<u32>)]
+fn store_reads(_counter: &Counter) -> u32 {
+    1
+}
+
+#[lactose_ecs::finalize(store_reads)]
+fn store_with_component(_sum: i128, _counter: &Counter) {}
 
 #[test]
 fn order_errors() {

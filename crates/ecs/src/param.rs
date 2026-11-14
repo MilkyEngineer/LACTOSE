@@ -10,9 +10,7 @@ use lactose_core::{StableKey, SystemKey, Tick};
 use lactose_reflect::{Component, Resource};
 use lactose_task::JobContext;
 
-use crate::access::{
-    Access, AccessKind, component_target, no_target, region_resource_target, resource_target,
-};
+use crate::access::{Access, AccessKind, no_target, region_resource_target, resource_target};
 use crate::change::Stamp;
 use crate::region::RegionId;
 use crate::rng::Rng;
@@ -156,7 +154,7 @@ impl<T: Resource> SystemParam for RegionRes<'_, T> {
 impl<T: Component> sealed::Sealed for &T {}
 
 impl<T: Component> SystemParam for &T {
-    const ACCESS: Access = Access::new(AccessKind::Read, component_target::<T>);
+    const ACCESS: Access = Access::component::<T>(AccessKind::Read);
 }
 
 /// A component of the entity, written.
@@ -217,19 +215,19 @@ impl<T: Component> DerefMut for Mut<'_, T> {
 impl<T: Component> sealed::Sealed for Mut<'_, T> {}
 
 impl<T: Component> SystemParam for Mut<'_, T> {
-    const ACCESS: Access = Access::new(AccessKind::Write, component_target::<T>);
+    const ACCESS: Access = Access::component::<T>(AccessKind::Write);
 }
 
 impl<T: Component> sealed::Sealed for Option<&T> {}
 
 impl<T: Component> SystemParam for Option<&T> {
-    const ACCESS: Access = Access::new(AccessKind::OptionalRead, component_target::<T>);
+    const ACCESS: Access = Access::component::<T>(AccessKind::OptionalRead);
 }
 
 impl<T: Component> sealed::Sealed for Option<Mut<'_, T>> {}
 
 impl<T: Component> SystemParam for Option<Mut<'_, T>> {
-    const ACCESS: Access = Access::new(AccessKind::OptionalWrite, component_target::<T>);
+    const ACCESS: Access = Access::component::<T>(AccessKind::OptionalWrite);
 }
 
 /// Restricts the kernel to entities that have `T`, without reading it.
@@ -238,7 +236,7 @@ pub struct With<T: Component>(PhantomData<fn() -> T>);
 impl<T: Component> sealed::Sealed for With<T> {}
 
 impl<T: Component> SystemParam for With<T> {
-    const ACCESS: Access = Access::new(AccessKind::With, component_target::<T>);
+    const ACCESS: Access = Access::component::<T>(AccessKind::With);
 }
 
 /// Restricts the kernel to entities that lack `T`.
@@ -247,7 +245,7 @@ pub struct Without<T: Component>(PhantomData<fn() -> T>);
 impl<T: Component> sealed::Sealed for Without<T> {}
 
 impl<T: Component> SystemParam for Without<T> {
-    const ACCESS: Access = Access::new(AccessKind::Without, component_target::<T>);
+    const ACCESS: Access = Access::component::<T>(AccessKind::Without);
 }
 
 /// Restricts the kernel of system `S` to entities whose `T` changed since `S` last ran:
@@ -270,7 +268,7 @@ pub struct Changed<T: Component>(PhantomData<fn() -> T>);
 impl<T: Component> sealed::Sealed for Changed<T> {}
 
 impl<T: Component> SystemParam for Changed<T> {
-    const ACCESS: Access = Access::new(AccessKind::Changed, component_target::<T>);
+    const ACCESS: Access = Access::component::<T>(AccessKind::Changed);
 }
 
 /// The region's context: the tick, the region, its RNG streams and its assets. In a

@@ -1,6 +1,8 @@
 //! What the integration tests share: the components and resources of a small game, the
 //! systems of architecture section 6.1 written as a game crate would, and helpers that
-//! build worlds, executors and schedules.
+//! build worlds, executors and schedules. Every test's executor is the one SOUR's session
+//! names (architecture section 8.3), so each test also runs under the runner's worker
+//! counts and chaos seeds.
 
 #![allow(dead_code, reason = "each test file uses part of the shared module")]
 
@@ -15,7 +17,15 @@ use lactose_ecs::{
 };
 use lactose_math::{ExactSum, Scalar, Vec2};
 use lactose_reflect::{Padding, Registry, TypeRole, component, resource, value};
-use lactose_task::Executor;
+use lactose_task::{ChaosConfig, Executor};
+
+#[cfg(not(miri))]
+#[path = "../../../../tools/xtask/src/harness/protocol.rs"]
+#[expect(
+    clippy::wrong_self_convention,
+    reason = "the runner's module as written; it is included, not owned, here"
+)]
+pub mod protocol;
 
 // ---- Components ----
 
@@ -471,9 +481,40 @@ pub fn world_with(kind: WorldKind, layout: LayoutConfig, registry: Arc<Registry>
     world
 }
 
-/// A small executor: one worker of each class.
+/// The runner's session, or the production one outside the runner.
+#[cfg(not(miri))]
+pub fn session() -> protocol::Session {
+    protocol::Session::from_env().expect("the runner's variables are well formed")
+}
+
+/// The session's frame worker count and chaos seed. Neither under Miri, which no runner
+/// launches and whose isolation refuses the files the protocol's own tests write.
+pub fn run_config() -> (Option<u32>, Option<u64>) {
+    #[cfg(not(miri))]
+    {
+        let config = *session().config();
+        (config.workers.map(core::num::NonZeroU32::get), config.chaos_seed)
+    }
+    #[cfg(miri)]
+    (None, None)
+}
+
+/// The session's executor: its frame worker count, two outside the runner, and under a
+/// chaos seed every perturbation with the execution log recorded; one background worker.
 pub fn executor() -> Executor {
-    Executor::builder().frame_workers(1).background_workers(1).build().unwrap()
+    let (workers, chaos_seed) = run_config();
+    let workers = workers.unwrap_or(2);
+    let mut builder = Executor::builder().frame_workers(workers).background_workers(1);
+    if let Some(seed) = chaos_seed {
+        builder = builder.chaos(ChaosConfig {
+            seed,
+            shuffle_steals: true,
+            inject_yields: true,
+            force_split: true,
+            record: true,
+        });
+    }
+    builder.build().unwrap()
 }
 
 /// Runs one tick and hands the world back.

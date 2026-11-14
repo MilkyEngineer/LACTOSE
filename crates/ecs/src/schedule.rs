@@ -14,8 +14,8 @@ use lactose_task::Executor;
 
 use crate::access::{Access, AccessKind, AccessTarget};
 use crate::change::Stamp;
+use crate::node::{RunGraph, RunState};
 use crate::region::RegionId;
-use crate::run::{RunState, run};
 use crate::system::{SystemDescriptor, SystemSet};
 use crate::world::{World, WorldKind, WorldSet, is_tracked, refuses_mut};
 
@@ -289,6 +289,7 @@ impl ScheduleBuilder {
             plan: Arc::new(plan),
             pass_marks: vec![None; systems],
             world: None,
+            graph: None,
         })
     }
 }
@@ -336,8 +337,11 @@ fn check_table(
         if targets.iter().any(region) {
             return Err(ScheduleError::RegionParamInWorldSystem { system: name });
         }
-        if targets.iter().any(component) {
-            return Err(ScheduleError::InvalidParameter { system: name, parameter: "component" });
+        if let Some(access) =
+            table.iter().find(|access| component(&(access.kind(), access.target())))
+        {
+            let parameter = access.component_name().unwrap_or("component");
+            return Err(ScheduleError::InvalidParameter { system: name, parameter });
         }
         if has(AccessKind::World) {
             return Err(ScheduleError::InvalidParameter { system: name, parameter: "&mut World" });
@@ -821,6 +825,9 @@ pub struct Schedule {
     pass_marks: Vec<Option<(u32, Stamp)>>,
     /// The world the schedule serves, once it has met one; compared by address only.
     world: Option<Weak<()>>,
+    /// The plan as a graph, built at the first run and kept between runs; a cancelled run
+    /// drops it with the world.
+    graph: Option<RunGraph>,
 }
 
 impl Schedule {
@@ -998,8 +1005,9 @@ impl Schedule {
             Error::new(ErrorKind::InvalidData, error.to_string()).with_source(error)
         })?;
         let marks = core::mem::replace(&mut self.pass_marks, vec![None; self.plan.order.len()]);
-        let state = RunState::new(world, self.plan.clone(), tick, marks);
-        let state = run(executor, state).await?;
+        let graph = self.graph.take().unwrap_or_else(|| RunGraph::new(self.plan.clone()));
+        let (graph, state) = graph.run(executor, RunState::new(world, tick, marks)).await?;
+        self.graph = Some(graph);
         let (world, marks) = state.into_parts();
         self.pass_marks = marks;
         Ok(world)
@@ -1105,8 +1113,9 @@ pub enum ScheduleError {
         /// The system.
         system: &'static str,
         /// The parameter's type: `Commands`, `Job`, `&mut World`, `ChannelTake`, the
-        /// resource's type name, or `component` for a component parameter of a finalize,
-        /// whose type the table does not record.
+        /// resource's type name, or for a component parameter of a finalize the
+        /// component's type name (`component` for an entry made with [`Access::new`],
+        /// which records none).
         parameter: &'static str,
     },
     /// Sets or edges form a cycle, or an edge points at a later stage.
