@@ -4958,6 +4958,27 @@ relayed by an event when it acts on another body** (§6.1, §10, `lactose-ecs`,
 - Replaced: nothing in `docs/architecture.md` until the next revision, which states what
   criterion 1's tick excludes, the spike's sentence and the sentences
   `docs/plans/milestone-1.md` section 8 lists.
+- Addendum (lane measure, 2026-11-15; review rounds 1 to 3): *`cargo xtask measure` is the
+  command that writes them.* `--all` runs every measurement and a name runs one
+  (`tools/xtask/src/measure.rs`). Each writes `<measurement>-<machine>-<UTC date>.md`, and a
+  `.json` where it printed figures, with the header of the plan's section 4. A measurement that
+  fails to run is reported, the rest still run, and the command exits 2. A threshold a file
+  states, the task benchmark's pass and FAIL verdicts included, is never a failure of the
+  command. A test's figures are its standard-output lines `measure: <name> <value>`, the only
+  contract between test and command, so a test also runs by hand; a test that prints none, or a
+  line that does not read, fails its measurement. N is the performance cores the platform
+  reports or, on a part that reports no core types, its physical cores, at most eight;
+  `LACTOSE_MEASURE_WORKERS` overrides it with a count above zero, empty is unset, and the header
+  records it. `--short` cuts repetitions and marks its files `-short`; `headless-120` and
+  `edit-to-playing` are neither cut nor marked. Edit-to-playing edits a detached worktree of
+  HEAD under the target directory, never the developer's tree, so it measures HEAD and its
+  Commit row carries no `-dirty`; the worktree's own target directory, 1.4 to 2.2 GiB, is kept
+  for the next run's warm build. In the cost tests a system's time is the sum of its graph
+  node's range spans, which is work and not wall time on several workers, and a node's last
+  range also holds its `finalize` and the `units` of the nodes it releases, so per-system
+  figures overlap by them; an exclusive system's is its `casein` span, inside its sync point's
+  node. Every figure the lane's runs printed was taken on the M1 under agent load; they steer
+  and prove nothing.
 
 **D140. Architecture revision 3.3: the project review's findings against the document, and the milestone 1 plan's rulings written in** (§1 goal 7, §2 Graphics, §3, §4, §8.1, §8.2, §8.3, §9.4, §10, §12.1, §13, §14, §15.1, §16, §18, §20, §22, §22.1, §23)
 - Why: the whole-project review at `6ed8461` found sentences of the architecture that the

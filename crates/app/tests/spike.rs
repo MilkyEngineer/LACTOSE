@@ -44,8 +44,8 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use lactose_app::{
-    Client, ClientError, Cooked, CrateRegistration, Game, Start, TICK_PERIOD, Workers, WorldConfig,
-    build_client, build_server, start_executor,
+    Client, ClientError, ClientOutput, Cooked, CrateRegistration, Game, Start, TICK_PERIOD,
+    Workers, WorldConfig, build_client, build_server, start_executor,
 };
 use lactose_asset_api::{
     Asset, AssetId, AssetKind, AssetSet, AssetVersion, LoadPriority, PinnedTable, PublishedAssets,
@@ -77,9 +77,11 @@ use lactose_net_host::transport::{
     ConnectionId, Datagram, LinkStats, MAX_DATAGRAM_BYTES, Transport, TransportEvent,
 };
 use lactose_net_host::{ClockEstimate, InterpolationBuffer};
-use lactose_physics_api::{BodyType, Collider, RigidBody, Shape, Transform, Velocity, locked_axes};
+use lactose_physics_api::{
+    BodyType, Collider, RigidBody, Shape, Teleported, Transform, Velocity, locked_axes,
+};
 use lactose_predict::{CorrectionCause, PredictionStats, PredictionTolerance, SlotBytes};
-use lactose_reflect::{Reflect, TypeRole, component};
+use lactose_reflect::{Persistence, Reflect, TypeInfo, TypeRole, component};
 use lactose_sim::harness::{ChunkCapacity, layout_mode, layout_mode_of};
 use lactose_sim::{
     PlayerSample, RegionBundle, Registration, SessionApplier, SessionEvent, Stage, StreamingAnchor,
@@ -341,29 +343,43 @@ static APPROACH: Game = Game {
     order: None,
     sessions: Some(lone_crate),
 };
+/// The dynamic character among unclaimed bodies, which the prediction world holds as
+/// kinematic proxies: the slot's measurement alone, outside the recorded scenes.
+static PROXIES: Game =
+    Game { name: "spike-proxies", crates: &[SPIKE], order: None, sessions: Some(proxies) };
 
 fn dynamic() -> Box<dyn SessionApplier> {
-    Box::new(Arena { kinematic: false, crates: 0 })
+    Box::new(Arena { kinematic: false, crates: 0, proxies: 0 })
 }
 
 fn kinematic() -> Box<dyn SessionApplier> {
-    Box::new(Arena { kinematic: true, crates: 0 })
+    Box::new(Arena { kinematic: true, crates: 0, proxies: 0 })
 }
 
 fn crates() -> Box<dyn SessionApplier> {
-    Box::new(Arena { kinematic: false, crates: 4 })
+    Box::new(Arena { kinematic: false, crates: 4, proxies: 0 })
 }
 
 fn lone_crate() -> Box<dyn SessionApplier> {
-    Box::new(Arena { kinematic: false, crates: 1 })
+    Box::new(Arena { kinematic: false, crates: 1, proxies: 0 })
 }
 
-/// The session applier: a join builds the arena (a floor and four walls, fixed, and the
-/// first `crates` crates of the claim scene) and the player's capsule, claimed and
-/// anchored.
+fn proxies() -> Box<dyn SessionApplier> {
+    Box::new(Arena { kinematic: false, crates: 0, proxies: PREDICTION_ROWS - FIXED })
+}
+
+/// The arena's fixed colliders: a floor and four walls.
+const FIXED: u32 = 5;
+/// The fixed colliders and proxies a prediction world holds at most, together (D139).
+const PREDICTION_ROWS: u32 = 64;
+
+/// The session applier: a join builds the arena (a floor and four walls, fixed, the first
+/// `crates` crates of the claim scene, and `proxies` unclaimed boxes at rest behind the
+/// character, ten to a row) and the player's capsule, claimed and anchored.
 struct Arena {
     kinematic: bool,
     crates: u32,
+    proxies: u32,
 }
 
 impl SessionApplier for Arena {
@@ -371,7 +387,7 @@ impl SessionApplier for Arena {
         let SessionEvent::Join { region } = event else { return Ok(()) };
         let (ten, half) = (Scalar::from_i32(10), Scalar::HALF);
         let thin = scalar(0.25);
-        let statics = [
+        let statics: [_; FIXED as usize] = [
             (
                 Vec3::new(Scalar::ZERO, -half, Scalar::ZERO),
                 Vec3::new(scalar(12.0), half, scalar(12.0)),
@@ -399,6 +415,23 @@ impl SessionApplier for Arena {
                 world.spawn(key, region, row)?;
             }
         }
+        let quarter = scalar(0.25);
+        for index in 0..self.proxies {
+            let key = StableKey::Net(world.allocate_net_id()?);
+            let (column, row) = (index % 10, index / 10);
+            let at = Vec3::new(
+                scalar(-4.5) + Scalar::from_u32(column),
+                quarter,
+                Scalar::from_u32(3 + row),
+            );
+            let row = (
+                Transform::at(at),
+                Velocity::ZERO,
+                RigidBody::dynamic(),
+                Collider::new(Shape::cuboid(Vec3::new(quarter, quarter, quarter))),
+            );
+            world.spawn(key, region, row)?;
+        }
         let body = if self.kinematic {
             RigidBody::kinematic()
         } else {
@@ -421,7 +454,8 @@ impl SessionApplier for Arena {
     }
 }
 
-/// The four scenes, and the measurement's claim on approach.
+/// The four scenes, the measurement's claim on approach, and the slot's thrown scene among
+/// proxies.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Scene {
     Capsule,
@@ -429,6 +463,7 @@ enum Scene {
     Thrown,
     Claim,
     Approach,
+    Proxies,
 }
 
 impl Scene {
@@ -439,6 +474,7 @@ impl Scene {
             Self::Thrown => "fifty thrown bodies",
             Self::Claim => "claim in contact",
             Self::Approach => "claim on approach",
+            Self::Proxies => "fifty thrown bodies among proxies",
         }
     }
 
@@ -448,12 +484,13 @@ impl Scene {
             Self::Kinematic => &KINEMATIC,
             Self::Claim => &CRATES,
             Self::Approach => &APPROACH,
+            Self::Proxies => &PROXIES,
         }
     }
 
     /// The scripted sample of `tick`. The walk: idle, ahead, a turn right, a turn left,
-    /// back, idle; the claim scenes walk ahead into the crates and stop; the thrown scene
-    /// holds `Throw` over phases 60 to 89 beside the walk.
+    /// back, idle; the claim scenes walk ahead into the crates and stop; the thrown scenes
+    /// hold `Throw` over phases 60 to 89 beside the walk.
     fn input(self, tick: Tick) -> PlayerInput {
         let phase = tick.0 % CYCLE;
         let stick = |turn: f64, forward: f64| Axis2 {
@@ -472,7 +509,7 @@ impl Scene {
             }
         };
         let mut input = PlayerInput { movement, ..PlayerInput::IDLE };
-        if self == Self::Thrown {
+        if matches!(self, Self::Thrown | Self::Proxies) {
             let throw = Actions::EMPTY.with(Action::Throw);
             if (60..90).contains(&phase) {
                 input.held = throw;
@@ -1983,6 +2020,10 @@ enum Observed<'a> {
     Client(&'a World),
     /// The record of a frame.
     Record(Tick, u64),
+    /// The run's end, the client still running: an observer may take the client to run
+    /// more frames of its own, at `clock`'s times from the frame after `frame`, and must
+    /// put it back.
+    Ended { client: &'a mut Option<Client>, clock: &'a ClientClock, frame: u32 },
 }
 
 type Observe<'a> = dyn FnMut(Observed<'_>) -> Result<()> + 'a;
@@ -2367,6 +2408,8 @@ fn run(
 
     outcome.datagrams_dropped = lock(&link).dropped;
     if let Some(mut end) = end {
+        let ended = Observed::Ended { client: &mut end.client, clock: &end.clock, frame: end.ran };
+        observe(ended)?;
         let client = end.client.take().expect("held");
         outcome.stats = Some(client.predictor().stats());
         outcome.ring_depth = client.predictor().ring().depth();
@@ -2640,6 +2683,7 @@ fn recorded(scene: Scene, test: &str) {
                 let recorder = recorder.as_mut().expect("opened with the server");
                 recorder.record(tick.0, hash).map_err(protocol_error)?;
             }
+            Observed::Ended { .. } => {}
         }
         Ok(())
     };
@@ -2972,4 +3016,249 @@ fn ten_minutes_of_the_claim_in_contact_on_the_server_clock() {
 #[ignore = "ten minutes of ticks, in release"]
 fn ten_minutes_of_a_claim_on_approach_on_the_server_clock() {
     measure(Scene::Approach, ClockScript::Exact);
+}
+
+// ---- The slot and the rollback ----
+
+/// Whether `cargo xtask measure --short` runs the test: fewer repetitions, the same figures.
+fn short() -> bool {
+    std::env::var_os("LACTOSE_MEASURE_SHORT").is_some()
+}
+
+/// One figure for `cargo xtask measure`, which reads the lines that start `measure: `.
+fn figure(name: &str, value: impl std::fmt::Display) {
+    println!("measure: {name} {value}");
+}
+
+fn micros(span: Duration) -> f64 {
+    span.as_secs_f64() * 1e6
+}
+
+fn median_of(mut spans: Vec<Duration>) -> Duration {
+    spans.sort();
+    spans[spans.len() / 2]
+}
+
+/// The frames of the thrown scene before its measurement: the throw at frame 60 and ninety
+/// frames of the fifty bodies in flight and landing.
+const THROWN_FRAMES: u32 = 150;
+
+/// Runs `scene` on the server's clock to [`THROWN_FRAMES`] on four workers, as the spike's
+/// measurement does, then hands `measure` the executor, the client, its clock and the last
+/// frame it ran.
+fn after_the_throw(
+    scene: Scene,
+    mut measure: impl FnMut(&Executor, &mut Option<Client>, &ClientClock, u32) -> Result<()>,
+) {
+    let executor = executor(4);
+    let plan = Plan { ticks: THROWN_FRAMES, clock: ClockScript::Exact, ..Plan::recorded(scene) };
+    let mut ended = false;
+    let mut observe = |observed: Observed<'_>| match observed {
+        Observed::Ended { client, clock, frame } => {
+            ended = true;
+            measure(&executor, client, clock, frame)
+        }
+        _ => Ok(()),
+    };
+    run(&executor, LayoutConfig::default(), plan, &mut observe).unwrap();
+    assert!(ended, "the client joined and ran to the end");
+    executor.shutdown();
+}
+
+/// Runs the client's frame `n` alone, at `clock`'s time for it with `scene`'s sample, and
+/// puts the client back.
+fn alone_frame(
+    executor: &Executor,
+    held: &mut Option<Client>,
+    clock: &ClientClock,
+    scene: Scene,
+    n: u32,
+) -> Result<ClientOutput> {
+    let mut sample = |tick: Tick| scene.input(tick);
+    let client = held.take().expect("held between frames");
+    match executor.block_on(client.frame(executor, clock.now(n), &mut sample)) {
+        Ok((client, out)) => {
+            *held = Some(client);
+            Ok(out)
+        }
+        Err(ClientError { error, client }) => {
+            *held = client;
+            Err(error)
+        }
+    }
+}
+
+/// Criterion 5 (architecture section 22, plan decision 5.1): one prediction slot of the
+/// thrown scene's client, its fifty bodies in flight, with Rapier, in an arena that holds
+/// the most D139 admits: five fixed colliders and 59 unclaimed bodies, which the prediction
+/// world holds as kinematic proxies, 64 together. The client first runs two frames alone,
+/// so that its newest slot holds no server frame and weighs what this take weighs.
+///
+/// The take is a copy of what `lactose-predict` takes after every predicted tick, timed by
+/// part: the world snapshot, the physics snapshot, and the record of every claimed entity's
+/// replicated persistent components but `Teleported`. Criterion 5 reads `snapshot_us`, the
+/// world and physics snapshots together; `take_us` adds the record. The restore is what a
+/// rollback restores, the world then the physics; criterion 5 reads `restore_us`. Each
+/// figure is the median of 200 rounds (20 in a short run). The three sizes are asserted
+/// equal to the client's ring's for its newest slot, so that the copy cannot drift from the
+/// take unseen, and the world hash after the restores is the hash before them.
+/// `cargo xtask measure prediction-slot` runs it.
+#[test]
+#[ignore = "a measurement, run by `cargo xtask measure`: timings are reported, not asserted"]
+fn cost_of_a_prediction_slot() {
+    let rounds = if short() { 20 } else { 200 };
+    after_the_throw(Scene::Proxies, |executor, held, clock, last| {
+        for n in 1..=2 {
+            alone_frame(executor, held, clock, Scene::Proxies, last + n)?;
+        }
+        let client = held.as_mut().expect("held between frames");
+        let (tick, hash) = (client.tick(), client.hash()?);
+        let ring = client.predictor().ring().slot_bytes(tick).expect("the newest slot");
+        let world = client.predictor_mut().simulation_mut().world_mut();
+        let recorded: Vec<ComponentKey> = world
+            .registry()
+            .iter()
+            .filter(|info| {
+                info.role() == TypeRole::Component
+                    && info.persistence() == Persistence::Persistent
+                    && info.tracking().replicated
+                    && info.key() != Teleported::KEY
+            })
+            .map(TypeInfo::key)
+            .collect();
+        let claimed = world.claimed(PLAYER).count();
+        assert!(claimed > THROWN as usize, "the character and the thrown bodies: {claimed}");
+        let fixed = world.query::<(&Collider, lactose_ecs::Without<RigidBody>)>().count();
+        let proxies = world.query::<(&RigidBody, lactose_ecs::Without<ClaimedBy>)>().count();
+        assert_eq!(fixed, FIXED as usize, "the arena's fixed colliders");
+        assert_eq!(fixed + proxies, PREDICTION_ROWS as usize, "the most D139 admits");
+        let entities = world.entities_in(REGION).count();
+
+        let mut times: [Vec<Duration>; 6] = Default::default();
+        let mut bytes = SlotBytes::default();
+        for _ in 0..rounds {
+            let start = Instant::now();
+            let snapshot = world.snapshot();
+            let taken_world = Instant::now();
+            let physics = lactose_physics_api::snapshot(world)?;
+            let taken_physics = Instant::now();
+            let record: BTreeMap<StableKey, (RegionId, BTreeMap<ComponentKey, Vec<u8>>)> = world
+                .claimed(PLAYER)
+                .filter_map(|key| {
+                    let components = recorded
+                        .iter()
+                        .filter_map(|&component| {
+                            Some((component, world.get_erased(key, component)?.to_vec()))
+                        })
+                        .collect();
+                    Some((key, (world.region_of(key)?, components)))
+                })
+                .collect();
+            let taken = Instant::now();
+            times[0].push(taken_world - start);
+            times[1].push(taken_physics - taken_world);
+            times[2].push(taken - taken_physics);
+            let record_bytes =
+                record.values().flat_map(|(_, components)| components.values()).map(Vec::len);
+            bytes = SlotBytes {
+                world: snapshot.size_in_bytes(),
+                physics: physics.size_in_bytes(),
+                record: record_bytes.sum(),
+            };
+
+            let start = Instant::now();
+            world.restore(&snapshot)?;
+            let restored_world = Instant::now();
+            lactose_physics_api::restore(world, &physics)?;
+            let restored = Instant::now();
+            times[3].push(restored_world - start);
+            times[4].push(restored - restored_world);
+            times[5].push(restored - start);
+        }
+        assert_eq!(client.hash()?, hash, "a restore of the slot just taken changes nothing");
+        assert_eq!(bytes, ring, "this take weighs what the ring's newest slot weighs");
+
+        let [world_us, physics_us, record_us, world_restore_us, physics_restore_us, restore_us] =
+            times.map(|spans| micros(median_of(spans)));
+        let us = |value: f64| format!("{value:.1}");
+        figure("workers", 4);
+        figure("frames", THROWN_FRAMES + 2);
+        figure("tick", tick.0);
+        figure("rounds", rounds);
+        figure("entities", entities);
+        figure("claimed", claimed);
+        figure("fixed_colliders", fixed);
+        figure("proxies", proxies);
+        figure("world_snapshot_us", us(world_us));
+        figure("physics_snapshot_us", us(physics_us));
+        figure("snapshot_us", us(world_us + physics_us));
+        figure("record_us", us(record_us));
+        figure("take_us", us(world_us + physics_us + record_us));
+        figure("world_restore_us", us(world_restore_us));
+        figure("physics_restore_us", us(physics_restore_us));
+        figure("restore_us", us(restore_us));
+        figure("world_bytes", bytes.world);
+        figure("physics_bytes", bytes.physics);
+        figure("record_bytes", bytes.record);
+        Ok(())
+    });
+}
+
+/// How far back the rollback's correction lands: a frame for the tick six before the
+/// client's, whose next frame predicts one more tick before it reconciles.
+const ROLLBACK_DEPTH: u32 = 6;
+/// Frames the client runs alone first, so that a correction that far back is after every
+/// frame the server sent it.
+const ALONE: u32 = 8;
+
+/// Criterion 7 (architecture section 22, recorded): a seven-tick rollback on the client of
+/// the thrown scene, its fifty bodies in flight, with Rapier: a frame for the tick
+/// [`ROLLBACK_DEPTH`] before the client's, whose exact row moves the character a metre,
+/// then one client frame, which predicts its tick, restores the slot of the frame's tick,
+/// corrects it and re-simulates the seven ticks to the present. `ClientOutput::rollback`
+/// is the reconcile's wall time; each figure is the median of 20 rollbacks (3 in a short
+/// run). `cargo xtask measure rollback-seven-ticks` runs it.
+#[test]
+#[ignore = "a measurement, run by `cargo xtask measure`: timings are reported, not asserted"]
+fn cost_of_a_seven_tick_rollback() {
+    let rollbacks = if short() { 3 } else { 20 };
+    after_the_throw(Scene::Thrown, |executor, held, clock, last| {
+        let frame = |held: &mut Option<Client>, n: u32| {
+            alone_frame(executor, held, clock, Scene::Thrown, n)
+        };
+        for n in 1..=ALONE {
+            frame(held, last + n)?;
+        }
+        let (mut spans, mut resimulated) = (Vec::new(), Vec::new());
+        for n in 1..=rollbacks {
+            let client = held.as_mut().expect("held between frames");
+            let present = client.tick();
+            let world = client.predictor().simulation().world();
+            let key = player_entity(world, PLAYER).expect("the character");
+            let at = *world.get::<Transform>(key).expect("the character's transform");
+            let metre = Vec3::new(scalar(1.0), Scalar::ZERO, Scalar::ZERO);
+            let moved = Transform::new(at.translation + metre, at.rotation);
+            let mut staged = StagedFrame::new(Tick(present.0 - ROLLBACK_DEPTH));
+            let bytes = lactose_reflect::bytemuck::bytes_of(&moved);
+            assert!(staged.push_row(key, Transform::KEY, staged.tick, true, bytes));
+            assert!(client.push(Arc::new(staged)), "the frame is after every one accepted");
+            let out = frame(held, last + ALONE + n)?;
+            assert_eq!(out.reconciled.corrections.len(), 1, "one correction, at the frame's tick");
+            assert!(out.resync.is_none(), "a correction inside the ring, not a resync");
+            resimulated.push(out.reconciled.resimulated);
+            spans.push(out.rollback);
+        }
+        assert!(
+            resimulated.iter().all(|&ticks| ticks == ROLLBACK_DEPTH + 1),
+            "every rollback re-simulates seven ticks: {resimulated:?}"
+        );
+        let span = median_of(spans);
+        figure("workers", 4);
+        figure("frames", THROWN_FRAMES + ALONE);
+        figure("rollbacks", rollbacks);
+        figure("resimulated", ROLLBACK_DEPTH + 1);
+        figure("rollback_us", format!("{:.1}", micros(span)));
+        figure("per_tick_us", format!("{:.1}", micros(span) / f64::from(ROLLBACK_DEPTH + 1)));
+        Ok(())
+    });
 }

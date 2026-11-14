@@ -411,10 +411,13 @@ fn shared_differences(triple: &str, root: &Root, reference: &Root, findings: &mu
 }
 
 /// Features a boundary dependency is compiled with in every build that resolves it, as
-/// (package name, feature). D119: without `scalar-math`, glam's `Vec3A` and `Vec4` take their
-/// `min` and `max` from the SIMD instructions of the target (`minps`/`maxps`, `vminq`/`vmaxq`),
-/// which treat NaN differently; with it, from compare-and-select.
-const REQUIRED_FEATURES: [(&str, &str); 1] = [("glam", "scalar-math")];
+/// (package name, feature, the decision that requires it). D119: without `scalar-math`,
+/// glam's `Vec3A` and `Vec4` take their `min` and `max` from the SIMD instructions of the
+/// target (`minps`/`maxps`, `vminq`/`vmaxq`), which treat NaN differently; with it, from
+/// compare-and-select. D105: without `libm`, its transcendentals are the platform's float
+/// library; with it, the one pinned `libm` crate.
+const REQUIRED_FEATURES: [(&str, &str, &str); 2] =
+    [("glam", "scalar-math", "D119"), ("glam", "libm", "D105")];
 
 /// Each feature list of `root`'s boundary tree, for a package built for the target, that
 /// lacks a feature `REQUIRED_FEATURES` names for the package.
@@ -426,7 +429,9 @@ pub fn missing_required(triple: &str, root: &Root) -> Vec<Finding> {
             continue;
         }
         let name = package.split_once(' ').map_or(package.as_str(), |(name, _)| name);
-        for (_, feature) in REQUIRED_FEATURES.iter().filter(|(required, _)| *required == name) {
+        for (_, feature, decision) in
+            REQUIRED_FEATURES.iter().filter(|(required, ..)| *required == name)
+        {
             // A list is printed `[a, b]`.
             let lacks = |list: &&String| {
                 !list.trim_matches(['[', ']']).split(", ").any(|listed| listed == *feature)
@@ -437,7 +442,7 @@ pub fn missing_required(triple: &str, root: &Root) -> Vec<Finding> {
                     format!(
                         "on {triple}, boundary dependency `{package}` is compiled with {list}, \
                          without `{feature}`; every build of the boundary compiles it with \
-                         `{feature}` (D119)"
+                         `{feature}` ({decision})"
                     ),
                 ));
             }
@@ -870,6 +875,23 @@ lactose-physics-api v0.0.0 (/ws/crates/physics-api)|
             ]
         );
         assert_eq!(missing_required("t", &roots(SERVER, SERVER)[0]), []);
+    }
+
+    #[test]
+    fn glam_compiled_without_libm_for_the_target_is_reported() {
+        let server = SERVER.replace(
+            "│   └── libm v0.2.16|default",
+            "│   ├── libm v0.2.16|default\n│   └── glam v0.30.10|scalar-math,std",
+        );
+        let [root, _] = roots(&server, SERVER);
+        let found: Vec<String> =
+            missing_required("t", &root).iter().map(ToString::to_string).collect();
+        assert_eq!(
+            found,
+            [
+                "crates/app-server/Cargo.toml: on t, boundary dependency `glam v0.30.10` is compiled with [scalar-math, std], without `libm`; every build of the boundary compiles it with `libm` (D105)"
+            ]
+        );
     }
 
     #[test]

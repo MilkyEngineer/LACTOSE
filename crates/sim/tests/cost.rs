@@ -34,289 +34,7 @@ use lactose_sim::{
 
 // ---- The scene ----
 
-#[component(key = "cost::position", persistent, replicated)]
-struct Position {
-    #[field(id = 1)]
-    x: Scalar,
-    #[field(id = 2)]
-    y: Scalar,
-}
-
-#[component(key = "cost::velocity", persistent)]
-struct Velocity {
-    #[field(id = 1)]
-    x: Scalar,
-    #[field(id = 2)]
-    y: Scalar,
-}
-
-#[component(key = "cost::health", persistent, replicated)]
-struct Health(#[field(id = 1)] i32);
-
-#[component(key = "cost::timer", persistent)]
-struct Timer(#[field(id = 1)] u32);
-
-#[component(key = "cost::marker", persistent)]
-struct Marker;
-
-/// Contacts this tick: transient, zeroed at every input sync point.
-#[component(key = "cost::contacts", transient)]
-struct Contacts(#[field(id = 1)] u32);
-
-/// A player's steering this tick: transient, written by the input applier.
-#[component(key = "cost::steer", transient)]
-struct Steer {
-    #[field(id = 1)]
-    dx: i32,
-    #[field(id = 2)]
-    dy: i32,
-}
-
-/// A region's wind, read by every mover's kernel and turned at the post sync point.
-#[resource(key = "cost::wind", persistent)]
-struct Wind(#[field(id = 1)] Scalar);
-
-/// A region's gusts this tick: transient, zeroed at the input sync point.
-#[resource(key = "cost::gusts", transient)]
-struct Gusts(#[field(id = 1)] u32);
-
-/// How many rows the scene was built with, from which a hit picks its target.
-#[resource(key = "cost::population", derived)]
-struct Population(#[field(id = 1)] u32);
-
-/// What the reduction writes.
-#[resource(key = "cost::energy", derived)]
-struct Energy(#[field(id = 1)] Scalar);
-
-/// One hit on one entity.
-#[derive(Clone, Copy)]
-struct Hit {
-    target: StableKey,
-    amount: i32,
-}
-
-impl Event for Hit {
-    fn target(&self) -> StableKey {
-        self.target
-    }
-}
-
-const ROWS: u64 = 100_000;
-const REGIONS: u64 = 16;
-const PLAYERS: u32 = 64;
-/// The first player's key, after every row's.
-const FIRST_PLAYER: u64 = 1_000_000;
-
-fn key(n: u64) -> StableKey {
-    StableKey::Net(NetId::cooked(n))
-}
-
-fn region(n: u64) -> RegionId {
-    RegionId(1 + n % REGIONS)
-}
-
-static MOVEMENT: SystemSet = SystemSet::new("cost::movement");
-static INPUT: SystemSet = SystemSet::new("cost::input").after(&[&sets::INPUT]);
-
-/// The declared writer of [`Steer`]: the applier writes it inside `sim`'s systems.
-#[system(name = "cost::input_writer", worlds = [server], exclusive, in_set = INPUT, writes = [Steer])]
-fn input_writer(_world: &mut World) {}
-
-#[system(name = "cost::steer", worlds = [server], in_set = MOVEMENT)]
-fn steer(input: &Steer, vel: Mut<Velocity>) {
-    vel.x += Scalar::from_i32(input.dx);
-    vel.y += Scalar::from_i32(input.dy);
-}
-
-#[system(name = "cost::integrate", worlds = [server], in_set = MOVEMENT, after = steer)]
-fn integrate(dt: Res<TickDelta>, wind: RegionRes<Wind>, vel: &Velocity, pos: Mut<Position>) {
-    let next = Position { x: pos.x + (vel.x + wind.0) * dt.0, y: pos.y + vel.y * dt.0 };
-    pos.set_if_neq(next);
-}
-
-#[system(name = "cost::drag", worlds = [server], in_set = MOVEMENT, after = integrate)]
-fn drag(vel: Mut<Velocity>, _plain: Without<Marker>) {
-    let half = Scalar::from_i32(1) / Scalar::from_i32(2);
-    vel.x *= half;
-    vel.y *= half;
-}
-
-#[system(name = "cost::touch", worlds = [server], in_set = MOVEMENT, after = integrate)]
-fn touch(pos: &Position, contacts: Mut<Contacts>) {
-    contacts.0 = 1 + u32::from(pos.y < Scalar::ZERO);
-}
-
-/// One row in a hundred hits another, chosen by the RNG keyed by the striker.
-#[system(name = "cost::strike", worlds = [server], in_set = MOVEMENT, after = touch)]
-fn strike(
-    ctx: Ctx,
-    rows: Res<Population>,
-    key: StableKeyOf,
-    contacts: &Contacts,
-    hits: EventWriter<Hit>,
-) {
-    let mut rng = ctx.rng(*key);
-    if rng.next_below(100) == 0 {
-        let target = self::key(1 + u64::from(rng.next_below(rows.0)));
-        hits.emit(Hit { target, amount: contacts.0 as i32 });
-    }
-}
-
-#[system(name = "cost::take_hits", worlds = [server], in_set = MOVEMENT, after = strike)]
-fn take_hits(events: Events<Hit>, key: StableKeyOf, hp: Mut<Health>) {
-    for hit in events.for_target(*key) {
-        hp.0 -= hit.amount;
-    }
-}
-
-/// One timed row in a thousand is replaced by a fresh one each tick.
-#[system(name = "cost::timers", worlds = [server], in_set = MOVEMENT, after = integrate)]
-fn timers(ctx: Ctx, key: StableKeyOf, timer: Mut<Timer>, pos: &Position, cmd: Commands) {
-    timer.0 += 1;
-    if ctx.rng(*key).next_below(1_000) == 0 {
-        cmd.despawn(*key);
-        let velocity = Velocity { x: Scalar::ONE, y: Scalar::ZERO };
-        cmd.spawn((Position { x: pos.x, y: pos.y }, velocity, Timer(0)));
-    }
-}
-
-#[system(name = "cost::energy", worlds = [server], in_set = MOVEMENT, after = drag, reduce = ExactSum<Scalar>)]
-fn energy(vel: &Velocity) -> Scalar {
-    vel.x * vel.x + vel.y * vel.y
-}
-
-#[finalize(energy)]
-fn store_energy(sum: Scalar, out: ResMut<Energy>) {
-    out.0 = sum;
-}
-
-/// Every simulated region's wind turns and its gusts count, at the post sync point.
-#[system(name = "cost::weather", worlds = [server], exclusive)]
-fn weather(world: &mut World) {
-    let regions: Vec<RegionId> = world.regions().collect();
-    for region in regions {
-        world.update_region_resource::<Wind>(region, |wind| wind.0 = -wind.0).unwrap();
-        world.update_region_resource::<Gusts>(region, |gusts| gusts.0 += 1).unwrap();
-    }
-}
-
-fn register_systems(registration: &mut Registration) {
-    registration.stage(Stage::Input).sets(&[&INPUT]).add(&INPUT_WRITER);
-    registration
-        .stage(Stage::Simulation)
-        .sets(&[&MOVEMENT])
-        .add(&STEER)
-        .add(&INTEGRATE)
-        .add(&DRAG)
-        .add(&TOUCH)
-        .add(&STRIKE)
-        .add(&TAKE_HITS)
-        .add(&TIMERS)
-        .add(&ENERGY);
-    registration.stage(Stage::Post).add(&WEATHER);
-}
-
-fn types() -> TypeTable {
-    let mut types = TypeTable::new();
-    types.register::<Position>().unwrap();
-    types.register::<Velocity>().unwrap();
-    types.register::<Health>().unwrap();
-    types.register::<Timer>().unwrap();
-    types.register::<Marker>().unwrap();
-    types.register::<Contacts>().unwrap();
-    types.register::<Steer>().unwrap();
-    types.register::<Wind>().unwrap();
-    types.register::<Gusts>().unwrap();
-    types.register::<Energy>().unwrap();
-    types.register::<Population>().unwrap();
-    types
-}
-
-/// Writes each player's sample to the entity the player has claimed.
-struct Steering;
-
-impl InputApplier for Steering {
-    fn apply(&mut self, world: &mut World, player: PlayerId, sample: &PlayerSample) -> Result<()> {
-        let value: Steer = lactose_reflect::decode(&sample.sample)?;
-        let key = world.claimed(player).next().expect("every player has an entity");
-        world.insert(key, value)
-    }
-}
-
-/// The scene: `rows` rows of four archetypes spread over the regions, and the players.
-fn scene(rows: u64) -> Simulation {
-    scene_in(rows, LayoutConfig::default())
-}
-
-/// The scene under `layout`.
-fn scene_in(rows: u64, layout: LayoutConfig) -> Simulation {
-    let mut simulation = SimulationBuilder::new(WorldKind::Server, types())
-        .layout(layout)
-        .setup(move |world| {
-            world.insert_resource(Energy(Scalar::ZERO));
-            world.insert_resource(Population(rows as u32));
-            Ok(())
-        })
-        .systems(register_systems)
-        .inputs(Box::new(Steering))
-        .build()
-        .unwrap();
-    let world = simulation.world_mut();
-    for n in 0..REGIONS {
-        let id = RegionId(1 + n);
-        world.create_region(RegionConfig { id, seed: n, mode: RegionMode::Simulated }).unwrap();
-        world.insert_region_resource(id, Wind(Scalar::from_i32(n as i32 - 8))).unwrap();
-        world.insert_region_resource(id, Gusts(0)).unwrap();
-    }
-    for n in 1..=rows {
-        let at = Position { x: Scalar::from_i32(n as i32), y: Scalar::from_i32(-(n as i32 % 7)) };
-        let moving = Velocity { x: Scalar::ONE, y: Scalar::from_i32(n as i32 % 3) };
-        let result = match n % 10 {
-            0..4 => world.spawn(key(n), region(n), (at, moving, Health(100), Contacts(0))),
-            4..7 => world.spawn(key(n), region(n), (at, moving, Timer(n as u32 % 600))),
-            7..9 => world.spawn(key(n), region(n), (at, Health(100))),
-            _ => world.spawn(
-                key(n),
-                region(n),
-                (at, moving, Health(200), Timer(0), Marker, Contacts(0)),
-            ),
-        };
-        result.unwrap();
-    }
-    for player in 0..PLAYERS {
-        let n = FIRST_PLAYER + u64::from(player);
-        let row = (
-            Position { x: Scalar::ZERO, y: Scalar::ZERO },
-            Velocity { x: Scalar::ZERO, y: Scalar::ZERO },
-            Health(1_000),
-            Contacts(0),
-            Steer { dx: 0, dy: 0 },
-            ClaimedBy { player: PlayerId(player) },
-        );
-        world.spawn(key(n), region(n), row).unwrap();
-    }
-    simulation
-}
-
-/// Every player's input for `tick`.
-fn frame(tick: u32) -> TickInput {
-    let mut frame = TickInput::default();
-    for player in 0..PLAYERS {
-        let steer = Steer { dx: (tick % 3) as i32 - 1, dy: (player % 3) as i32 - 1 };
-        let sample = PlayerSample {
-            input_tick: Tick(tick),
-            substituted: false,
-            sample: lactose_reflect::bytemuck::bytes_of(&steer).to_vec(),
-        };
-        frame.inputs.insert(PlayerId(player), sample);
-    }
-    frame
-}
-
-fn step(executor: &Executor, simulation: Simulation) -> Simulation {
-    let tick = simulation.tick().0 + 1;
-    executor.block_on(simulation.step(executor, frame(tick))).unwrap()
-}
+include!("cost/scene.rs");
 
 /// The scene at a small scale runs, every system does its work, and the result does not
 /// depend on the worker count: each per-entity system's units fork over the workers
@@ -401,107 +119,8 @@ fn the_scene_records_its_hash_every_tick_under_the_session() {
 
 // ---- The measurement ----
 
-/// Times the `casein` spans (each sync point, each exclusive system, and the `units` and
-/// `finalize` of every other) and the executor's spans, one per range of a node's units and
-/// named after the node (architecture 5.1), summed by name until taken. A node's time is
-/// the sum over its ranges, so on several workers it is not wall time, and the range that
-/// finishes last holds the node's `finalize` and the `units` of the nodes it releases.
-mod timing {
-    use std::collections::BTreeMap;
-    use std::sync::Mutex;
-    use std::sync::OnceLock;
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::time::Duration;
-
-    use tracing::field::{Field, Visit};
-    use tracing::span::{Attributes, Id, Record};
-    use tracing::subscriber::Interest;
-    use tracing::{Event, Metadata, Subscriber};
-
-    /// The time since the first call: the one place the subscriber reads the clock.
-    #[expect(clippy::disallowed_types, reason = "test code timing the step from outside")]
-    fn clock() -> Duration {
-        static START: OnceLock<std::time::Instant> = OnceLock::new();
-        START.get_or_init(std::time::Instant::now).elapsed()
-    }
-
-    struct Open {
-        label: String,
-        entered: Option<Duration>,
-    }
-
-    #[derive(Default)]
-    pub struct Spans {
-        next: AtomicU64,
-        open: Mutex<BTreeMap<u64, Open>>,
-        totals: Mutex<BTreeMap<String, Duration>>,
-    }
-
-    impl Spans {
-        /// The time spent in each span since the last take, by label.
-        pub fn take(&self) -> BTreeMap<String, Duration> {
-            core::mem::take(&mut *self.totals.lock().unwrap())
-        }
-    }
-
-    struct Name(String);
-
-    impl Visit for Name {
-        fn record_str(&mut self, field: &Field, value: &str) {
-            if field.name() == "name" || field.name() == "stage" {
-                self.0 = value.to_owned();
-            }
-        }
-
-        fn record_debug(&mut self, field: &Field, value: &dyn core::fmt::Debug) {
-            if field.name() == "name" || field.name() == "stage" {
-                self.0 = format!("{value:?}");
-            }
-        }
-    }
-
-    impl Subscriber for &'static Spans {
-        fn register_callsite(&self, metadata: &'static Metadata<'static>) -> Interest {
-            if self.enabled(metadata) { Interest::always() } else { Interest::never() }
-        }
-
-        fn enabled(&self, metadata: &Metadata<'_>) -> bool {
-            metadata.is_span() && matches!(metadata.target(), "casein" | "whisk")
-        }
-
-        fn new_span(&self, span: &Attributes<'_>) -> Id {
-            let mut name = Name(String::new());
-            span.record(&mut name);
-            let label = match span.metadata().target() {
-                "whisk" => format!("node {}", span.metadata().name()),
-                _ => format!("{} {}", span.metadata().name(), name.0),
-            };
-            let id = self.next.fetch_add(1, Ordering::Relaxed) + 1;
-            self.open.lock().unwrap().insert(id, Open { label, entered: None });
-            Id::from_u64(id)
-        }
-
-        fn record(&self, _: &Id, _: &Record<'_>) {}
-
-        fn record_follows_from(&self, _: &Id, _: &Id) {}
-
-        fn event(&self, _: &Event<'_>) {}
-
-        fn enter(&self, span: &Id) {
-            if let Some(open) = self.open.lock().unwrap().get_mut(&span.into_u64()) {
-                open.entered = Some(clock());
-            }
-        }
-
-        fn exit(&self, span: &Id) {
-            let now = clock();
-            let Some(open) = self.open.lock().unwrap().remove(&span.into_u64()) else { return };
-            if let Some(entered) = open.entered {
-                *self.totals.lock().unwrap().entry(open.label).or_default() += now - entered;
-            }
-        }
-    }
-}
+#[path = "cost/timing.rs"]
+mod timing;
 
 /// The median and the 90th percentile of `samples`, in microseconds.
 fn quantiles(samples: &mut [core::time::Duration]) -> (f64, f64) {
@@ -510,34 +129,112 @@ fn quantiles(samples: &mut [core::time::Duration]) -> (f64, f64) {
     (at(0.5).as_secs_f64() * 1e6, at(0.9).as_secs_f64() * 1e6)
 }
 
-/// The time of a step at 100,000 rows, phase by phase, and of the hash after it, printed
-/// for the report. Run with `cargo nextest run -p lactose-sim --run-ignored only
-/// --cargo-profile release --no-capture -E 'test(cost_)'`.
+/// Whether `cargo xtask measure --short` runs the test: fewer ticks, the same figures.
+#[expect(clippy::disallowed_methods, reason = "the measurement's repetitions, outside the step")]
+fn short() -> bool {
+    std::env::var_os("LACTOSE_MEASURE_SHORT").is_some()
+}
+
+/// One figure for `cargo xtask measure`, which reads the lines that start `measure: `.
+fn figure(name: &str, value: impl core::fmt::Display) {
+    println!("measure: {name} {value}");
+}
+
+/// The variable that sets N in place of the topology's, as `cargo xtask measure` passes it.
+const WORKERS_VAR: &str = "LACTOSE_MEASURE_WORKERS";
+
+/// N of plan decision 5.1, by the rule of the plan's section 4: the performance cores the
+/// platform reports or, on a part that reports no core types (efficiency zero), its
+/// physical cores, which `CoreTopology::homogeneous` stores as one more than its
+/// `performance`; at most eight. [`WORKERS_VAR`] overrides it, a whole number above zero;
+/// empty, it is unset, as `cargo xtask measure` reads it. `lactose-app`'s cost test has a copy
+/// of this rule, and the two must match. Returns N and the topology, printed beside it.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "the worker count the measurement runs on, read outside the step"
+)]
+fn measured_workers() -> (u32, lactose_task::CoreTopology) {
+    use lactose_task::{Platform, StdPlatform};
+    let topology = StdPlatform.topology();
+    if let Some(value) = std::env::var_os(WORKERS_VAR).filter(|value| !value.is_empty()) {
+        let value = value.to_string_lossy();
+        let n = value
+            .parse::<u32>()
+            .ok()
+            .filter(|&n| n > 0)
+            .unwrap_or_else(|| panic!("{WORKERS_VAR} is `{value}`, not a count above zero"));
+        return (n, topology);
+    }
+    let cores =
+        if topology.efficiency == 0 { topology.performance + 1 } else { topology.performance };
+    (cores.min(8), topology)
+}
+
+/// How many sets of the scene's components its rows hold: the four kinds of rows, the
+/// players' and any a despawn and spawn left.
+fn archetypes(world: &mut World) -> usize {
+    let mut keys = Vec::new();
+    world.query::<&Position>().for_each(|key, _| keys.push(key));
+    let shapes: std::collections::BTreeSet<[bool; 7]> = keys
+        .iter()
+        .map(|&key| {
+            [
+                world.get::<Velocity>(key).is_some(),
+                world.get::<Health>(key).is_some(),
+                world.get::<Timer>(key).is_some(),
+                world.get::<Marker>(key).is_some(),
+                world.get::<Contacts>(key).is_some(),
+                world.get::<Steer>(key).is_some(),
+                world.get::<ClaimedBy>(key).is_some(),
+            ]
+        })
+        .collect();
+    shapes.len()
+}
+
+/// Criterion 1 (architecture section 22, plan decision 5.1): the median step at 100,064 rows
+/// on one frame worker (T₁) and on N ([`measured_workers`]: the performance cores, or the
+/// physical cores of a part that reports no core types, up to eight) (T_N), in one sitting;
+/// then S = (N·T_N − T₁)/(N − 1), the time that did not shrink with workers, and the
+/// projected eight-core tick S + (T₁ − S)/8. Each phase of the step, and the
+/// hash after it, which is outside the step, are printed beside them; the world hash after
+/// the last tick is the same on both worker counts. `cargo xtask measure tick-100k` runs it
+/// and writes the result file; by hand, `cargo nextest run -p lactose-sim --run-ignored only
+/// --cargo-profile release --no-capture -E 'test(=cost_of_a_tick_at_100k_rows)'`.
 #[test]
-#[ignore = "a measurement, run by hand: timings are reported, not asserted"]
+#[ignore = "a measurement, run by `cargo xtask measure`: timings are reported, not asserted"]
 #[expect(clippy::disallowed_types, reason = "test code measuring the step, outside it")]
 fn cost_of_a_tick_at_100k_rows() {
     use std::time::{Duration, Instant};
     const WARM: u32 = 10;
-    const TICKS: u32 = 60;
+    let ticks: u32 = if short() { 6 } else { 60 };
     let spans: &'static timing::Spans = Box::leak(Box::default());
     tracing::subscriber::set_global_default(spans).unwrap();
-    for workers in [1, 4] {
+    let (n, topology) = measured_workers();
+    let counts = if n > 1 { vec![1, n] } else { vec![1] };
+    let mut medians = Vec::new();
+    let mut last_hashes = Vec::new();
+    let mut systems = std::collections::BTreeSet::new();
+    let mut shape = (0, 0);
+    for &workers in &counts {
         let executor =
             Executor::builder().frame_workers(workers).background_workers(1).build().unwrap();
         let mut simulation = scene(ROWS);
+        let world = simulation.world_mut();
+        shape = (world.query::<&Position>().count(), archetypes(world));
         let mut phases: BTreeMap<String, Vec<Duration>> = BTreeMap::new();
         let mut steps = Vec::new();
         let mut hashes = Vec::new();
-        for tick in 0..WARM + TICKS {
+        let mut last = 0;
+        for tick in 0..WARM + ticks {
             spans.take();
             let start = Instant::now();
             simulation = step(&executor, simulation);
             let stepped = start.elapsed();
             let start = Instant::now();
-            let hash = simulation.hash().unwrap();
+            last = simulation.hash().unwrap();
             let hashed = start.elapsed();
-            assert_ne!(hash, 0);
+            assert_ne!(last, 0);
             if tick < WARM {
                 continue;
             }
@@ -548,18 +245,55 @@ fn cost_of_a_tick_at_100k_rows() {
             }
         }
         let rows = simulation.world_mut().query::<&Position>().count();
-        println!("{workers} frame worker(s), {rows} rows, {TICKS} ticks: median / p90 in µs");
+        println!("{workers} frame worker(s), {rows} rows, {ticks} ticks: median / p90 in µs");
         let (median, p90) = quantiles(&mut steps);
         println!("  {:<40} {median:>9.1} {p90:>9.1}", "step (whole)");
         for (label, samples) in &mut phases {
             let (median, p90) = quantiles(samples);
             println!("  {label:<40} {median:>9.1} {p90:>9.1}");
+            if let Some(name) = label.strip_prefix("system ") {
+                systems.insert(name.to_owned());
+            }
         }
-        let (median, p90) = quantiles(&mut hashes);
-        println!("  {:<40} {median:>9.1} {p90:>9.1}", "hash (all regions)");
+        let (hash_median, hash_p90) = quantiles(&mut hashes);
+        println!("  {:<40} {hash_median:>9.1} {hash_p90:>9.1}", "hash (all regions)");
         let start = Instant::now();
         let one = simulation.world_hash(RegionId(1)).unwrap();
         println!("  {:<40} {:>9.1}", "hash (one region)", start.elapsed().as_secs_f64() * 1e6);
         assert_ne!(one, 0);
+        medians.push(median);
+        last_hashes.push(last);
+    }
+    assert!(
+        last_hashes.windows(2).all(|pair| pair[0] == pair[1]),
+        "the world hash after the last tick depends on the worker count: {last_hashes:x?}"
+    );
+
+    let t1 = medians[0];
+    figure("rows", shape.0);
+    figure("archetypes", shape.1);
+    figure("regions", REGIONS);
+    figure("systems", systems.len());
+    figure("ticks", ticks);
+    figure("warm_up_ticks", WARM);
+    figure("workers", counts.iter().map(u32::to_string).collect::<Vec<_>>().join(" and "));
+    figure("hash", format!("{:#018x}", last_hashes[0]));
+    figure("topology.performance", topology.performance);
+    figure("topology.efficiency", topology.efficiency);
+    figure("n", n);
+    figure("t1_us", format!("{t1:.1}"));
+    if let [_, tn] = medians[..] {
+        let nf = f64::from(n);
+        let serial = (nf * tn - t1) / (nf - 1.0);
+        let projected = serial + (t1 - serial) / 8.0;
+        figure("tn_us", format!("{tn:.1}"));
+        figure("s_us", format!("{serial:.1}"));
+        figure("projection_us", format!("{projected:.1}"));
+        println!(
+            "T1 {t1:.1} µs, T{n} {tn:.1} µs, S {serial:.1} µs, projected eight-core tick \
+             {projected:.1} µs (at most 4,000)"
+        );
+    } else {
+        println!("T1 {t1:.1} µs; one performance core, so no T_N and no projection");
     }
 }
