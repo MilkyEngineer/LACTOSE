@@ -25,7 +25,8 @@ fn poll(settled: Pin<&mut Settled>) -> Poll<()> {
 
 #[test]
 fn settled_waits_for_the_loads_accepted_before_its_first_poll_and_no_others() {
-    let env = Env::new("settling_marks");
+    // The held call keeps one background worker; the other load's own steps need another.
+    let env = Env::with_background_workers("settling_marks", 2);
     let (loaders, gate) = test_loaders();
     let store = env.store(loaders);
     let (first, later) = (id("first"), id("later"));

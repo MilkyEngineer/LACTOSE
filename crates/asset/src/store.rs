@@ -408,9 +408,15 @@ async fn read_pack(io: &Io, path: &Path) -> Result<Arc<Pack>> {
     Ok(Arc::new(Pack { file, entries }))
 }
 
-/// A run of steps 3 and 4 of a load, on a background worker: the read, one yield, the
-/// check, the loader's call. It holds no handle to the store, so that dropping the last
-/// one closes the store and cancels it.
+/// Whether the store is still open: `closed` is read under the lock, which the last
+/// handle's drop sets under it.
+fn open(store: &Weak<Inner>) -> bool {
+    store.upgrade().is_some_and(|store| !store.lock().closed())
+}
+
+/// A run of steps 3 and 4 of a load, on a background worker: a check, the read, one
+/// yield, a second check, the loader's call. It holds no handle to the store, so that
+/// dropping the last one closes the store and cancels it.
 ///
 /// `guard` is an argument, not a local, so that it lives in the future from the call on:
 /// a future dropped before its first poll (inside `spawn`, at an executor's shutdown)
@@ -418,6 +424,13 @@ async fn read_pack(io: &Io, path: &Path) -> Result<Arc<Pack>> {
 async fn run_load(store: Weak<Inner>, loaders: Arc<Loaders>, spawn: Spawn, mut guard: Cancelled) {
     let Spawn { id, version, run, source, trace } = spawn;
     let key = key(id, version);
+    // The first check: no read is submitted once the store is closed. A step that runs
+    // without a handle (a load's own end, which may read again) can spawn a run after
+    // the last handle's drop has taken every load's task out.
+    if !open(&store) {
+        guard.armed = false;
+        return;
+    }
     let entry = source.entry();
     let read = if entry.compressed {
         let encoding = Encoding::Zstd { decoded_len: entry.decoded_len };
@@ -430,10 +443,8 @@ async fn run_load(store: Weak<Inner>, loaders: Arc<Loaders>, spawn: Spawn, mut g
         Ok(bytes) => {
             trace.span().record("bytes", bytes.len() as u64);
             yield_now().await;
-            // The check: no loader's call begins once the store is closed. It reads
-            // `closed` under the lock, which the last handle's drop sets under it.
-            let open = store.upgrade().is_some_and(|store| !store.lock().closed());
-            if !open {
+            // The second check: no loader's call begins once the store is closed.
+            if !open(&store) {
                 guard.armed = false;
                 return;
             }

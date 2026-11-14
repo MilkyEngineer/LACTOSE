@@ -445,7 +445,7 @@ impl<'a> Step<'a> {
         }
         match self.state.source(id, version) {
             Some(source) => {
-                self.accept(source, priority, "exact");
+                self.accept(source, priority, "exact", None);
                 self.ask_dependencies();
             }
             None => {
@@ -500,20 +500,30 @@ impl<'a> Step<'a> {
                 self.touch(id);
             }
         } else if !self.state.loads.contains_key(&key) {
-            self.accept(source, priority, cause);
+            self.accept(source, priority, cause, None);
         }
     }
 
     /// Accepts a load of `source`'s entry: steps 1 and 2 in this call, steps 3 and 4 on a
-    /// task spawned after it.
-    fn accept(&mut self, source: Source, priority: LoadPriority, cause: &'static str) {
+    /// task spawned after it. `carried` is the sequence number of the load this one
+    /// replaces (rule 2 onto another header), kept so that a wait that covered that load
+    /// covers this one; otherwise the next number is taken.
+    fn accept(
+        &mut self,
+        source: Source,
+        priority: LoadPriority,
+        cause: &'static str,
+        carried: Option<u64>,
+    ) {
         let entry = source.entry();
         let (id, version, kind) = (entry.id, entry.version, entry.header.kind());
         let key = key(id, version);
         let trace = LoadTrace::new(id, Some(version), Some(kind), priority, cause);
         self.effects.traces.push(Trace::Open(Arc::clone(&trace)));
-        let seq = self.state.next_seq;
-        self.state.next_seq += 1;
+        let seq = carried.unwrap_or_else(|| {
+            self.state.next_seq += 1;
+            self.state.next_seq - 1
+        });
         self.state.in_flight.insert(seq);
         let run = self.state.next_run;
         self.state.next_run += 1;
@@ -702,20 +712,22 @@ impl<'a> Step<'a> {
         }))
     }
 
-    /// Rule 2 for a load in flight: a load whose own steps failed for its source reads
-    /// again, as the same load, from the pack with the latest place that holds its
-    /// version, if a mount since its acceptance made that another pack. Returns whether it
-    /// does.
-    fn read_again(&mut self, key: Key, ending: &Ending) -> bool {
+    /// Rule 2 for a load in flight: the pack with the latest place that holds the load's
+    /// version, if its own steps failed for their source and a mount since its acceptance
+    /// made that another pack.
+    fn newer_source(&self, key: Key, ending: &Ending) -> Option<Source> {
         let load = &self.state.loads[&key];
         if !matches!(ending, Ending::Own) || !matches!(load.own, Own::Done(Err((_, Cause::Source))))
         {
-            return false;
+            return None;
         }
-        let Some(source) = self.state.source(load.id, load.version) else { return false };
-        if Arc::ptr_eq(&source.pack, &load.source.pack) {
-            return false;
-        }
+        let source = self.state.source(load.id, load.version)?;
+        (!Arc::ptr_eq(&source.pack, &load.source.pack)).then_some(source)
+    }
+
+    /// Rule 2 onto an entry with the same header: the load reads again from `source`, as
+    /// the same load. Its dependencies, and so its waits, stay as they are.
+    fn read_again(&mut self, key: Key, source: Source) {
         let run = self.state.next_run;
         self.state.next_run += 1;
         let load = self.state.loads.get_mut(&key).expect("a load reading again is in flight");
@@ -727,7 +739,6 @@ impl<'a> Step<'a> {
         self.effects.dropped.push(Box::new(own));
         self.effects.dropped.push(Box::new(read));
         self.effects.spawns.push(Spawn { id, version, run, source, trace });
-        true
     }
 
     fn dep_state(&self, dependency: AssetId) -> DepState {
@@ -1037,14 +1048,32 @@ impl<'a> Step<'a> {
 
     /// Ends the load `key`: publishes it or records its failure, in one step with the move
     /// of the generation, and queues what waited for it. A load that reads again from a
-    /// newer source does not end.
+    /// newer source with the same header does not end. One whose newer source has another
+    /// header (another kind or dependency list: damage the version's hash caught) ends,
+    /// and if it was the followed asset's named version, the newest is asked for again at
+    /// once, as rule 2 asks: a load of the newer entry, keeping the ended load's place for
+    /// `Settled`, accepted before what waited for it looks again.
     fn end(&mut self, key: Key, ending: Ending) {
-        if self.read_again(key, &ending) {
-            return;
-        }
+        let renewed = match self.newer_source(key, &ending) {
+            None => None,
+            Some(source)
+                if source.entry().header == self.state.loads[&key].source.entry().header =>
+            {
+                self.read_again(key, source);
+                return;
+            }
+            Some(source) => {
+                let load = &self.state.loads[&key];
+                let followed = self.state.assets.get(&load.id).is_some_and(|asset| asset.followed);
+                let named = self.state.named_version(load.id) == Some(load.version);
+                (followed && named).then_some(source)
+            }
+        };
         let load = self.state.loads.remove(&key).expect("an ending load is in flight");
         let Load { id, version, source, own, seq, task, trace, .. } = load;
-        self.state.in_flight.remove(&seq);
+        if renewed.is_none() {
+            self.state.in_flight.remove(&seq);
+        }
         for dependency in source.entry().header.dependencies() {
             if let Some(waiting) = self.state.waiters.get_mut(dependency) {
                 waiting.remove(&key);
@@ -1091,6 +1120,10 @@ impl<'a> Step<'a> {
         }
         self.effects.dropped.push(Box::new(source));
         self.effects.traces.push(Trace::Failure { load: trace, failure, dependency, message });
+        if let Some(source) = renewed {
+            self.accept(source, LoadPriority::default(), "mount", Some(seq));
+            self.ask_dependencies();
+        }
         self.touch(id);
         self.wake_settled();
     }

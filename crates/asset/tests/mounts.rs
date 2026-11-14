@@ -11,12 +11,12 @@ use std::pin::pin;
 use std::task::{Context, Waker};
 
 use common::capture::capture;
-use common::format::index_range;
+use common::format::{dependency_count, entry_at, reseal};
 use common::*;
 use lactose_asset::{Storage, Store};
 use lactose_asset_api::{
-    AssetCatalog, AssetFailure, AssetId, AssetRef, AssetSet, AssetVersion, LoadPriority,
-    PinnedTable, PublishedAssets, Readiness,
+    AssetCatalog, AssetFailure, AssetId, AssetRef, AssetSet, AssetVersion, CookedAsset,
+    LoadPriority, PinnedTable, PublishedAssets, Readiness,
 };
 use lactose_core::ErrorKind;
 
@@ -294,15 +294,8 @@ fn a_missing_dependency_added_later_repairs_its_dependants_at_that_mount() {
 
 /// Flips the first byte of the payload of the entry `at` (in ID order) of a raw pack.
 fn damage(pack: &mut [u8], at: usize) {
-    let (start, _) = index_range(pack);
-    let dependencies = |entry: usize| {
-        u32::from_le_bytes(pack[entry + 28..entry + 32].try_into().unwrap()) as usize
-    };
-    let mut entry = start + 4;
-    for _ in 0..at {
-        entry += 57 + 8 * dependencies(entry);
-    }
-    let field = entry + 33 + 8 * dependencies(entry);
+    let entry = entry_at(pack, at);
+    let field = entry + 33 + 8 * dependency_count(pack, entry);
     let offset = u64::from_le_bytes(pack[field..field + 8].try_into().unwrap()) as usize;
     pack[offset] ^= 0x20;
 }
@@ -442,11 +435,14 @@ fn a_new_source_mounted_while_a_damaged_load_is_in_flight_repairs_it() {
     store.request_newest(damaged, NOW);
     gate.wait_entered(b"hold");
     env.mount(&store, second.clone()).unwrap();
+    let generation = store.generation();
     gate.open(b"hold");
     env.settle(&store);
     let expected = Readiness::Ready(assets[at].1.version());
     assert_eq!(fresh(&env, &[first, second], damaged), expected);
     assert_eq!(newest_version(&store, damaged), expected);
+    // The same header: the load reads again as the same load, and records no failure.
+    assert_eq!(store.generation(), generation + 2, "two publishes and nothing between");
     env.shutdown();
 }
 
@@ -482,6 +478,90 @@ fn a_dependency_renamed_back_to_a_version_in_flight_repairs_its_dependant() {
     assert!(matches!(expected, Readiness::Ready(_)), "{expected:?}");
     assert_eq!(newest_version(&store, dependant), expected);
     env.shutdown();
+}
+
+/// Rule 2 for a load in flight whose newer source has another header: the first pack's
+/// entry is the second's with `edit` applied to its index entry and the index resealed,
+/// damage the version's hash catches, since it covers the header. `a` waits for a held
+/// dependency while the second pack is mounted; the store must end where a store new to
+/// the process that mounted both packs ends.
+fn newer_source_with_another_header(
+    name: &str,
+    assets: &[(AssetId, CookedAsset)],
+    damaged: &[(AssetId, CookedAsset)],
+    a: AssetId,
+    edit: impl FnOnce(&mut [u8], usize),
+) -> Readiness<AssetVersion> {
+    // The held call keeps one background worker; the damaged load's own steps need another.
+    let env = Env::with_background_workers(name, 2);
+    let (loaders, gate) = test_loaders();
+    let store = env.store(loaders);
+    let at = damaged.iter().position(|(id, _)| *id == a).unwrap();
+    let mut bytes = pack(damaged, Storage::Raw);
+    let entry = entry_at(&bytes, at);
+    edit(&mut bytes, entry);
+    reseal(&mut bytes);
+    let (first, second) = (env.write(bytes), env.pack(assets, Storage::Raw));
+    let expected = fresh(&env, &[first.clone(), second.clone()], a);
+
+    env.mount(&store, first).unwrap();
+    gate.hold(b"hold");
+    store.request_newest(a, NOW);
+    gate.wait_entered(b"hold");
+    env.mount(&store, second).unwrap();
+    // A wait first polled while `a`'s first load is in flight covers the load that
+    // replaces it.
+    let mut settled = pin!(store.settled());
+    assert!(settled.as_mut().poll(&mut Context::from_waker(Waker::noop())).is_pending());
+    gate.open(b"hold");
+    env.wait(settled);
+    assert_eq!(newest_version(&store, a), expected);
+    env.shutdown();
+    expected
+}
+
+/// Another kind: the damaged entry names the text kind, the intact one a kind with no
+/// loader. The load ends, and the newest is asked for again from the intact entry:
+/// `Unsupported`, with no loader call.
+#[test]
+fn a_newer_source_of_another_kind_ends_the_load_and_asks_again() {
+    let (held, a) = (id("held"), id("of another kind"));
+    let mut assets = vec![(held, gated(b"hold", [])), (a, unloadable(b"payload", [held]))];
+    assets.sort_by_key(|(id, _)| *id);
+    let text_kind = text(b"any", []).header.kind().0.to_le_bytes();
+    let answer = newer_source_with_another_header("mounts_newer_kind", &assets, &assets, a, {
+        move |bytes, entry| bytes[entry + 16..entry + 24].copy_from_slice(&text_kind)
+    });
+    let failure = AssetFailure {
+        id: a,
+        version: Some(assets.iter().find(|(id, _)| *id == a).unwrap().1.version()),
+        kind: ErrorKind::Unsupported,
+    };
+    assert_eq!(answer, Readiness::Failed(failure));
+}
+
+/// Another dependency list: the damaged entry declares `held` alone under the intact
+/// entry's version, the intact one `held` and `extra`. The load ends, and the newest is
+/// asked for again from the intact entry, which asks for `extra` and is published.
+#[test]
+fn a_newer_source_with_another_dependency_ends_the_load_and_asks_again() {
+    let (held, a, extra) = (id("held"), id("with another dependency"), id("extra"));
+    let mut assets = vec![
+        (held, gated(b"hold", [])),
+        (a, text(b"payload", [held, extra])),
+        (extra, text(b"extra", [])),
+    ];
+    assets.sort_by_key(|(id, _)| *id);
+    let at = assets.iter().position(|(id, _)| *id == a).unwrap();
+    let version = assets[at].1.version();
+    let mut damaged = assets.clone();
+    damaged[at].1 = text(b"payload", [held]);
+    let answer = newer_source_with_another_header("mounts_newer_deps", &assets, &damaged, a, {
+        move |bytes, entry| {
+            bytes[entry + 8..entry + 16].copy_from_slice(&version.to_bits().to_le_bytes())
+        }
+    });
+    assert_eq!(answer, Readiness::Ready(version));
 }
 
 fn entered(gate: &Gate, bytes: &[u8]) -> usize {

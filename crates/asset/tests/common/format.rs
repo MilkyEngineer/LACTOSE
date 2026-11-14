@@ -97,3 +97,19 @@ pub fn reseal(pack: &mut [u8]) {
     let trailer = pack.len() - TRAILER_LEN;
     pack[trailer + 8..trailer + 16].copy_from_slice(&hash.to_le_bytes());
 }
+
+/// The number of dependencies the index entry at offset `entry` of `pack` declares.
+pub fn dependency_count(pack: &[u8], entry: usize) -> usize {
+    let count = u32::from_le_bytes(pack[entry + 28..entry + 32].try_into().expect("a word"));
+    usize::try_from(count).expect("a count in memory")
+}
+
+/// The offset of entry `at` in the index of a well-formed `pack`.
+pub fn entry_at(pack: &[u8], at: usize) -> usize {
+    let (start, _) = index_range(pack);
+    let mut entry = start + 4;
+    for _ in 0..at {
+        entry += 57 + 8 * dependency_count(pack, entry);
+    }
+    entry
+}

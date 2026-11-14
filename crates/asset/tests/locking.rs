@@ -9,7 +9,8 @@
 //!
 //! A hand-written global subscriber stops a load's task at the poll that resumes after
 //! the load's one yield (the first entry of its `silo.load` span after `bytes` was
-//! recorded), and counts the reads made and the loads published after the test dropped its
+//! recorded), or a step at a `silo.publish` or at a recorded failure's `warn`, and counts
+//! the loads accepted, the reads made and the loads published after the test dropped its
 //! last handle.
 
 #![forbid(unsafe_code)]
@@ -24,8 +25,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use std::task::{Context, Poll, Waker};
 
+use common::format::{entry_at, reseal};
 use common::*;
-use lactose_asset::{Settled, Store};
+use lactose_asset::{Settled, Storage, Store};
 use lactose_asset_api::{
     Asset, AssetCatalog, AssetId, AssetKind, CookedAsset, ErasedLoader, LoadPriority, Loader,
     Readiness, SimulationAsset,
@@ -34,7 +36,7 @@ use lactose_core::Result;
 use lactose_task::WorkerClass;
 use tracing::field::{Field, Visit};
 use tracing::span::{Attributes, Id, Record};
-use tracing::{Event, Metadata, Subscriber};
+use tracing::{Event, Level, Metadata, Subscriber};
 
 const NOW: LoadPriority = LoadPriority(0);
 
@@ -57,10 +59,14 @@ struct Hook {
     on_resume: Mutex<Option<AssetHook>>,
     /// Called at every `silo.publish` event, with its asset.
     on_publish: Mutex<Option<AssetHook>>,
+    /// Called at every recorded failure's `warn`, with its asset.
+    on_failure: Mutex<Option<AssetHook>>,
     /// Set by a test once its last handle to the store is dropped.
     dropped: AtomicBool,
     /// `io.read` spans created once `dropped` was set: reads submitted.
     reads_after_drop: AtomicU64,
+    /// `silo.load` spans created once `dropped` was set: loads accepted.
+    loads_after_drop: AtomicU64,
     /// Entries of `io.read` spans once `dropped` was set: reads the pool ran.
     read_entries_after_drop: AtomicU64,
     /// `silo.publish` events once `dropped` was set.
@@ -112,8 +118,10 @@ impl Subscriber for &'static Hook {
         let mut asset = String::new();
         attributes.record(&mut Fields { asset: &mut asset, bytes: false });
         let name = attributes.metadata().name();
-        if name == "io.read" {
-            self.after_drop(&self.reads_after_drop);
+        match name {
+            "io.read" => self.after_drop(&self.reads_after_drop),
+            "silo.load" => self.after_drop(&self.loads_after_drop),
+            _ => {}
         }
         let info = SpanInfo { name, asset, bytes_recorded: false, resumed: false };
         self.spans.lock().unwrap().insert(id, info);
@@ -134,13 +142,17 @@ impl Subscriber for &'static Hook {
     fn record_follows_from(&self, _: &Id, _: &Id) {}
 
     fn event(&self, event: &Event<'_>) {
-        if event.metadata().name() != "silo.publish" {
+        let hook = if event.metadata().name() == "silo.publish" {
+            self.after_drop(&self.publishes_after_drop);
+            &self.on_publish
+        } else if *event.metadata().level() == Level::WARN {
+            &self.on_failure
+        } else {
             return;
-        }
-        self.after_drop(&self.publishes_after_drop);
+        };
         let mut asset = String::new();
         event.record(&mut Fields { asset: &mut asset, bytes: false });
-        let hook = self.on_publish.lock().unwrap().clone();
+        let hook = hook.lock().unwrap().clone();
         if let Some(hook) = hook {
             hook(&asset);
         }
@@ -546,6 +558,51 @@ fn a_loader_call_past_its_check_at_the_drop_publishes_nothing() {
     keeper.release();
     env.executor.clone().shutdown();
     env.io.clone().shutdown();
+}
+
+/// A run that a step without a handle spawns after the last handle's drop submits no read.
+/// The step is a load's end that asks again (rule 2 onto an entry with another dependency
+/// list), stopped at the ended load's failure, before its spawns, while the test drops
+/// its handle; the load it then accepts proves the spawn came after the drop.
+#[test]
+fn a_run_spawned_after_the_drop_submits_no_read() {
+    let hook = hook();
+    // One worker for the held call, one for the damaged load's own steps.
+    let env = Env::with_background_workers("locking_spawned_after_drop", 2);
+    let (loaders, gate) = test_loaders();
+    let store = env.store(loaders);
+    let (held, a, extra) = (id("held"), id("asked again"), id("extra"));
+    let mut assets = vec![
+        (held, gated(b"hold", [])),
+        (a, text(b"payload", [held, extra])),
+        (extra, text(b"extra", [])),
+    ];
+    assets.sort_by_key(|(id, _)| *id);
+    let at = assets.iter().position(|(id, _)| *id == a).unwrap();
+    let version = assets[at].1.version();
+    let mut damaged = assets.clone();
+    damaged[at].1 = text(b"payload", [held]);
+    let mut bytes = pack(&damaged, Storage::Raw);
+    let entry = entry_at(&bytes, at);
+    bytes[entry + 8..entry + 16].copy_from_slice(&version.to_bits().to_le_bytes());
+    reseal(&mut bytes);
+    env.mount(&store, env.write(bytes)).unwrap();
+    gate.hold(b"hold");
+    store.request_newest(a, NOW);
+    gate.wait_entered(b"hold");
+    env.mount(&store, env.pack(&assets, Storage::Raw)).unwrap();
+    let (on_failure, stopped) = stop_at(a);
+    *hook.on_failure.lock().unwrap() = Some(on_failure);
+    gate.open(b"hold");
+    stopped.wait("the ended load's failure");
+    drop(store);
+    hook.dropped.store(true, Ordering::SeqCst);
+    stopped.release();
+    // The stopped step has spawned its runs once both workers have each run a task.
+    env.drain(2);
+    assert!(hook.loads_after_drop.load(Ordering::SeqCst) > 0, "the load asked again");
+    assert_eq!(hook.reads_after_drop.load(Ordering::SeqCst), 0, "a read submitted after the drop");
+    env.shutdown();
 }
 
 #[test]
