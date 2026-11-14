@@ -40,7 +40,7 @@ writes: a change that breaks it is a signature change to list.
 | `Mount`, `Settled` | The two futures: `Send + Unpin + 'static`, lazy, cancelled by drop. `Mount` resolves to `lactose_core::Result<()>`, `Settled` to `()` |
 | `PackBuilder`, `Storage` | The pack writer, for the cooker and for tests: `add(id, &cooked, storage)` returns the version it recorded, `finish()` returns the pack's bytes; `Storage::Raw` or `Storage::Zstd { level }` per payload |
 | `PACK_FORMAT_VERSION` | 1: the pack format this build writes and mounts |
-| `RegionBaseline`, `RegionBaselineLoader` | A region's cooked baseline as an asset kind, named by its content hash: `id(content_hash)`, `cook(&baseline)` for the cooker, `lookup(catalog, content_hash)` for `app` and `persist`, `baseline()` for the shared `Arc<Baseline>`; and its loader, which every store registers itself |
+| `RegionBaseline`, `RegionBaselineLoader` | A region's cooked baseline as an asset kind, named by its content hash: `name(content_hash)` and `id(content_hash)`, `cook(&baseline)` for the cooker, `lookup(catalog, content_hash)` for `app` and `persist`, `baseline()` for the shared `Arc<Baseline>`; and its loader, which every store registers itself |
 | `LOG_TARGET` | `"silo"`: the `tracing` target of everything this crate emits |
 
 Hidden and changeable: the index decode a mount runs and the entry it yields
@@ -54,11 +54,11 @@ the lock), and what `Mount` and `Settled` hold.
 | `app`, building a runtime | One store over the cooked packs, built from the executor and the pool it already has and from every kind's loader; packs mounted in an order it controls, one after another or at once; the store dropped before the pool and the executor stop, with no shutdown of its own to call | `Store::new`, `Store::mount` (the place is the call's), "Settling, cancellation and shutdown" |
 | `app`, wiring resources (architecture section 4) | The catalogue for everything outside the boundary and the exact-version view for a boundary world, from the one store | `Arc::new(store.clone())` as `Arc<dyn AssetCatalog>`, upcast to `Arc<dyn PublishedAssets>`; pinned in `lib.rs` |
 | `app` at milestone 1 | Nothing: `app` keeps its `Cooked` stand-in (D131). A binary that wants cooked packs behind it, for the edit-to-playing measurement, bridges the three calls over a store it loaded before the first step | `tests/sketch.rs` section 2: `mount`, `request_newest`, `settled`, then `RegionBaseline::lookup`, `resolve`, `PinnedTable::pin`, each answering at once |
-| `app` at milestone 3, the store's driver | For each `RegionRequest::Load`: the baseline by content hash; the region's set requested; one consistent table once the set is published; the table pinned; all without blocking a frame and without resolving every region every frame; a later table when a pack was mounted; a failure as a value for `TickInput::failures` | `RegionBaseline::lookup`, `request_newest`, `generation`, `resolve`, `PinnedTable::pin`; "Publication" and "Hot reload" below; `tests/sketch.rs` section 3 |
+| `app` at milestone 3, the store's driver | For each `RegionRequest::Load`: the baseline by content hash; the region's set requested; one consistent table once the set is published; the table pinned; all without blocking a frame and without resolving every region every frame; a later table when a pack was mounted; a failure as a value for `TickInput::failures` | `RegionBaseline::lookup`, `request_newest`, `generation`, `resolve`, `PinnedTable::pin`; "Publication" and "Hot reload" below; `tests/sketch.rs` section 3. The driver's side of it: it requests a set once, and retries a failure on a decision, never every frame, because a request that fails again moves the generation and would make it resolve every region every frame ("Publication") |
 | A boundary world (architecture section 8.2) | Exact versions only; reads that touch no store, no lock and no atomic | `dyn PublishedAssets`; `PinnedTable`, which owns its assets and outlives the store |
 | Code outside the boundary (the renderer and presentation, milestone 2) | The newest version of an asset by typed reference; to see a reload by asking again, and to know when asking again can matter | `dyn AssetCatalog::newest_typed`, `generation` |
 | A client or a replay (milestone 4) | A table it was given, loaded by exact version, whichever pack holds each version, however many newer packs are mounted | `request(id, version)` searches every mounted pack; `PinnedTable::pin` |
-| RICOTTA (`tools/cook`), the milestone 1 skeleton | A writer for the file the store mounts, so that the cooker states no frame rule and no index layout; the version each asset was recorded under; a repeated ID reported; the baseline's ID and bytes; a way for its output to reach a running store | `PackBuilder`, `Storage`, `RegionBaseline::cook`; the bytes written whole with `Io::replace`; "The pack format" and "Mounting" below. The cooker is a leaf crate and may name this one |
+| RICOTTA (`tools/cook`), the milestone 1 skeleton | A writer for the file the store mounts, so that the cooker states no frame rule and no index layout; the version each asset was recorded under; a repeated ID reported; the baseline's name, ID and bytes, the name for its collision report over every name it publishes; a way for its output to reach a running store | `PackBuilder`, `Storage`, `RegionBaseline::name` and `RegionBaseline::cook`; the bytes written whole with `Io::replace`; "The pack format" and "Mounting" below. The cooker is a leaf crate and may name this one |
 | The dev loop (architecture section 18) | A newly cooked pack visible in a running store without a restart and without the caller listing what changed; a restart that reads no payload it does not need | `Store::mount`: the store reloads what it follows, and a mount reads a pack's tail only |
 | `persist` at milestone 3 | The baseline a region's records were made against, by the hash the records carry, from the store it is handed | `RegionBaseline::lookup(catalog, records.baseline_hash)`; `RegionBaselineLoader` for its tests over the reference store |
 | Tests and tools | A wait that ends when what was asked for is in, with no polling loop; the conformance suite | `Store::settled`; `tests/conformance.rs` |
@@ -117,9 +117,14 @@ is this crate's (D136), written by `PackBuilder` alone and read by `Store::mount
   forbids no dependency either: an asset that declares itself, or a cycle across packs,
   is a failed load ("Requests and loads"), not a malformed pack.
 - An index is read with one request, so one longer than `MAX_READ_BYTES` (1 GiB) is
-  `ResourceExhausted`, and decoding one allocates at most four times its length on a
-  64-bit host. An index entry is 57 bytes and eight more per dependency: a pack of
-  100,000 assets without dependencies has an index of 5.7 MB.
+  `ResourceExhausted`. N is checked against the file first, from the trailer and the
+  file's size, before any read of the index: an N past the file is `InvalidData` whatever
+  its size, also above 1 GiB, and only an N that lies within the file and is longer than
+  `MAX_READ_BYTES` is `ResourceExhausted`. Decoding an index allocates at most four
+  times its length on a 64-bit host, so a well-formed index of the largest length costs
+  a mount about 5 GiB: a pack is a trusted local file, not a message. An index entry is
+  57 bytes and eight more per dependency: a pack of 100,000 assets without dependencies
+  has an index of 5.7 MB.
 - `PackBuilder::add` refuses `AssetId::NONE` and an ID already added with another
   version (`InvalidData`: two names that hash to one ID surface here, for the cooker's
   collision check to report), and content longer than `MAX_READ_BYTES`
@@ -155,6 +160,17 @@ is this crate's (D136), written by `PackBuilder` alone and read by `Store::mount
   failed. It fails **for a dependency** when a declared dependency of it failed, and
   **for itself** otherwise: no pack holds it, its kind has no loader, or its read or its
   loader's call failed.
+- A failure of a load for itself is **of the version** when the same content would fail
+  the same way from any pack: no loader for its kind (`Unsupported`), a cooked format
+  the loader does not read (`VersionMismatch`), and any failure `ErasedLoader::load`
+  returned over bytes that hash to the version, which is the loader refusing intact
+  bytes, whatever kind it gave. It is **of the source** when another pack that holds the
+  version might load it: every failure of the read (`Io`; `ResourceExhausted`;
+  `InvalidData` for a range past the file or a stored range that is not one frame of the
+  stated length; `Cancelled`), and `InvalidData` from `ErasedLoader::load` when the
+  bytes do not hash to the version. The store tells the last from a loader's refusal by
+  hashing the content itself when the call returns `InvalidData`. `NotFound` is neither:
+  no mounted pack holds the version.
 - A version is **published** when its load ends well. A published version never changes,
   is never replaced and is never unloaded.
 - The **current** version of an asset is the one `newest` answers with. A version
@@ -196,13 +212,20 @@ is this crate's (D136), written by `PackBuilder` alone and read by `Store::mount
   version; the named versions change as the definition says; and the store does what
   `request_newest` does, at `LoadPriority::default()`, for
   1. every followed asset whose named version the mount changed, an asset it named for
-     the first time included, unless that version is current or loading; and
-  2. every followed asset whose named version last failed for a dependency that this
-     mount asks for again, under 1 or under 2, and is not loading.
+     the first time included, unless that version is current or loading;
+  2. every followed asset whose named version last failed for itself with a failure of
+     the source, when the mounted pack holds that version and is now the pack the
+     version is read from (the latest place that holds it); and
+  3. every followed asset whose named version last failed for a dependency that this
+     mount asks for again, under any of the three, and is not loading.
 
   The loads this accepts are accepted before the future resolves. Nothing else is asked
-  for: a followed asset the mount did not rename, whose named version failed for itself,
-  is left as it is, since the same bytes would fail the same way.
+  for. A followed asset the mount did not rename, whose named version failed with a
+  failure of the version, is left as it is, since the same content would fail the same
+  way; so is one whose failure was of the source when the mount brings no new source
+  for that version. A pack mounted over a damaged or unreadable one, holding the same
+  versions, therefore repairs what the damage had failed, and the dependants with it,
+  as a fresh process that mounted both would have loaded them from the later pack.
 - Renaming changes no answer of `get`, `newest` or `resolve`. A mount changes an answer,
   and moves the generation, only through what those requests do: at the mount itself
   where one finds the newly named version already published, which becomes current, or
@@ -221,7 +244,7 @@ is this crate's (D136), written by `PackBuilder` alone and read by `Store::mount
   | `NotFound` | No file at `path` |
   | `InvalidData` | The file is not a well-formed pack by any rule of "The pack format"; the file's size changed under the reads |
   | `VersionMismatch` | A pack of a format version other than `PACK_FORMAT_VERSION` |
-  | `ResourceExhausted` | An index longer than `MAX_READ_BYTES`; a buffer the allocator refuses |
+  | `ResourceExhausted` | An index that lies within the file and is longer than `MAX_READ_BYTES`; a buffer the allocator refuses |
   | `Io` | Anything else the open or a read reports: permissions, a directory at `path` |
   | `Cancelled` | The pool has stopped |
 
@@ -235,9 +258,14 @@ is this crate's (D136), written by `PackBuilder` alone and read by `Store::mount
 ### Requests and loads
 
 - `request` and `request_newest` never block, read nothing and run no loader. They take
-  the store's lock, decide, and for each load they accept that has something to read
-  spawn one task with `Executor::spawn(WorkerClass::Background, ..)` before they return.
-  They may be called from any thread, a worker included.
+  the store's lock, decide, register every load they accept and release the lock; only
+  then do they spawn one task per accepted load that has something to read, with
+  `Executor::spawn(WorkerClass::Background, ..)`, and store its `Task`, all before they
+  return. The spawn is outside the lock because a load's future can be dropped inside
+  `spawn`, on the calling thread, when the executor has shut down or is shutting down,
+  and the guard that then records the load as `Cancelled` takes the lock. The same
+  holds for the loads a mount accepts. They may be called from any thread, a worker
+  included.
 - `AssetId::NONE` names no asset and no pack can hold it: a request for it does nothing
   (nothing is followed, recorded or logged, and the generation does not move), and `get`
   and `newest` of it are `Failed` with `{ id: NONE, version: None, kind: NotFound }`,
@@ -254,7 +282,7 @@ is this crate's (D136), written by `PackBuilder` alone and read by `Store::mount
   it is called so); if the named version is published, that version becomes current if
   it is not; if the named version is loading, nothing happens; otherwise a load of the
   named version is accepted, a recorded failure of it retried.
-- An accepted load whose pack entry was found goes through these steps; the last says
+- An accepted load whose pack entry was found goes through these steps; the last two say
   which failure it reports.
   1. **The dependencies.** Inside the accepting call, every declared dependency becomes
      followed, and each that was not followed before or has no current version is asked
@@ -275,19 +303,39 @@ is this crate's (D136), written by `PackBuilder` alone and read by `Store::mount
   5. **The end.** The load ends when steps 3 and 4, unless skipped, have ended and every
      declared dependency has a current version or has failed. A dependency has failed,
      for this purpose, when it has no current version and no load of its named version
-     is in flight (its `newest` is then `Failed`, and the kind is that failure's), or
-     when it is waiting, directly or through other loads, for this load (a cycle,
-     `InvalidData`). The load then fails with the first of: the kind of the failed
-     dependency with the lowest `AssetId` (it failed for that dependency); `Unsupported`
-     if its kind has no loader; the read's failure; what `ErasedLoader::load` returned
-     (in these three it failed for itself). Otherwise it is published.
-- This is the order the reference store of `asset-api` reports in: a failing dependency
-  before anything of the load's own, a cycle as `InvalidData` at the dependency that
-  closes it. Because a load waits for every dependency to end before it reports, which
-  failure it reports never depends on which task finished first. Unlike the reference
-  store, which stops at the first failing dependency, this store asks for all of a
-  load's dependencies when it accepts the load, so dependencies with higher IDs than a
-  failing one are loaded, or recorded as failed, here and left untouched there.
+     is in flight: its `newest` is then `Failed`, and its kind is that failure's. The
+     load then fails with the first of: the kind of its first failed dependency in
+     ascending `AssetId` order (it failed for that dependency); `Unsupported` if its
+     kind has no loader; the read's failure; what `ErasedLoader::load` returned (in
+     these three it failed for itself). Otherwise it is published.
+  6. **Cycles.** A set of loads in which each waits for each other, directly or through
+     loads of the set, is a cycle; a load whose asset declares itself, and so waits for
+     itself, is a cycle of one. Its members can never be published, and none of them
+     ends by step 5. They are decided together, in one step, once steps 3 and 4 of every
+     member have ended and every dependency of a member outside the cycle has a current
+     version or has failed. Each member then fails for its first failed dependency in
+     ascending `AssetId` order, the other members counting as failed: with that
+     dependency's kind if it is outside the cycle; with the kind decided for it if it is
+     a member; and with `InvalidData` where following first failed dependencies from
+     member to member comes back round. So a member whose lowest failed dependency is a
+     missing asset outside the cycle is `NotFound`, a member whose lowest is that member
+     is `NotFound` through it, and members that each wait first for another of the cycle
+     are `InvalidData`.
+- Which failure a load reports is therefore the same whichever task finished first and
+  whatever the order of the requests: a load waits for every dependency to end before it
+  reports, and a cycle is decided as a whole. It is the order `asset-api` states and its
+  conformance suite pins for every store (`failures_follow_dependencies_in_id_order`): a
+  failing dependency before anything of the load's own, the lowest ID first.
+- Which loads a store starts beyond the ones a request names is the store's own
+  (`crates/asset-api/README.md`, "What the store decides"). This store asks for all of a
+  load's dependencies when it accepts the load, so that they load side by side with it
+  and with each other; the reference store stops at the first failing one. A dependency
+  with a higher ID than a failing one is therefore loaded, or recorded as failed, here
+  and left untouched there.
+- Dependency chains and cycles are as long as a cook makes them, so every walk over
+  dependencies is a loop over a work list and never a recursion per link: accepting a
+  load's dependencies (step 1), finding and deciding a cycle (step 6), a mount's rule 3,
+  and `resolve`. A chain of 100,000 links is accepted in one call on a worker's stack.
 - An exact request asks for its dependencies as any load does (step 1): by newest
   version, as the trait states, never by a version from the caller's table. A client
   that requests every entry of a table by exact version, with the server's packs
@@ -331,16 +379,14 @@ is this crate's (D136), written by `PackBuilder` alone and read by `Store::mount
   is replaced by the retry's outcome, and the newest failure of an asset stays the answer
   after a mount named a new version for it, until the load of that version ends. So a
   caller acts, waits for the generation to move, and looks again; it need not look
-  before. (`asset-api` says a failure "stays the answer until a later request retries"
-  and that `newest` is `Failed` "only when ... the load of the version the index names
-  has failed": for a store whose loads take time the two cannot both hold beside the
-  generation's promise, and this store keeps the generation's. D136 proposes the
-  wording.)
-- A change is visible to every lookup no later than the generation shows it. So a
-  caller reads the generation first and looks second, and keeps the value it read: when
-  it later reads the same value it has missed nothing. A lookup may see a change a
-  moment before the generation shows it, which costs that caller one more look and
-  never a missed change. (`tests/sketch.rs`, `driver_poll`, is that order.)
+  before. This is `asset-api`'s contract as D136 amended it, and its conformance suite
+  holds every store to it (`answers_change_only_with_the_generation`). Before, the trait
+  read as if a retry or a renaming turned `Failed` into `Pending`, which no store whose
+  loads take time can do and keep the generation's promise.
+- A lookup never sees a change the generation does not show yet, nor the reverse: the
+  change and the move are one step under the store's lock, and `generation()` reads
+  under it. A caller that reads the same generation twice has missed nothing between
+  the two reads.
 - Every end of a retry moves the generation, so the protocol above cannot hang. For the
   same reason a caller retries a failure on a decision (a pack was mounted by hand, a
   player asked), never on every move of the generation: a retry that fails again moves
@@ -349,16 +395,20 @@ is this crate's (D136), written by `PackBuilder` alone and read by `Store::mount
 ### Hot reload
 
 - Hot reload is the mount rule above and nothing else: when a mount resolves, the store
-  asks again, as `request_newest` does, for the followed assets the mount renamed and
-  for the followed assets that had failed for one of those, transitively. That covers a
-  new version of a loaded asset, a fixed version of one that failed, an asset no pack
-  held when it was first asked for, and the dependants a missing or broken dependency
-  had failed: a pack that adds the dependency repairs them at its mount.
+  asks again, as `request_newest` does, for the followed assets the mount renamed, for
+  those whose failure was of the source and to which the mount brings a new source, and
+  for the followed assets that had failed for one of either, transitively. That covers
+  a new version of a loaded asset, a fixed version of one that failed, an intact copy of
+  one whose pack was damaged or unreadable, an asset no pack held when it was first
+  asked for, and the dependants any of these had failed: the pack that repairs a
+  dependency repairs its dependants at its mount.
 - A mount retries nothing it could not have repaired. A followed asset whose named
-  version failed for itself and which the mount does not rename (corrupt bytes, a cooked
-  format the loader no longer reads, a kind without a loader) is not read again; neither
-  is one that failed for a dependency the mount does not ask for. A caller's
-  `request_newest` retries either, at any time.
+  version failed with a failure of the version and which the mount does not rename (a
+  loader refusing intact bytes, a cooked format the loader no longer reads, a kind
+  without a loader) is not read again; neither is one whose failure was of the source
+  when the mount does not hold that version; neither is one that failed for a dependency
+  the mount does not ask for. A caller's `request_newest` retries any of them, at any
+  time.
 - The store reloads what it follows and nothing else: an asset loaded only by exact
   version is never reloaded, and nothing is loaded that was not asked for by name, by
   exact version or as a dependency of such a load.
@@ -386,10 +436,14 @@ is this crate's (D136), written by `PackBuilder` alone and read by `Store::mount
 - `newest(id)`: `Ready` with the current version if the asset has one; else `Failed`
   with the asset's newest failure if one is recorded; else `Pending`. A newest failure
   is recorded, replacing the one before, when a load ends in failure while the index
-  names its version and the asset is followed (the load's failure), and when
-  `request_newest`, by name or for a dependency, finds no mounted pack holding the asset
-  (`{ id, version: None, kind: NotFound }`). An asset that is not followed has no newest
-  failure: its `newest` is `Ready` or `Pending`.
+  names its version (the load's failure), whoever asked for the load and whether or not
+  the asset is followed, and when `request_newest`, by name or for a dependency, finds
+  no mounted pack holding the asset (`{ id, version: None, kind: NotFound }`). The end
+  of a load of a version the index does not name then is an answer for `get` alone.
+- What an exact request can do to `newest` is therefore only what the end of its load
+  does. An asset that is not followed is not reloaded, so its `newest` may stand at a
+  version, or a failure, of a version the index named earlier, until `request_newest`
+  asks.
 - `resolve(set)` is one critical section, so its table is consistent: `Failed` with the
   failure of the lowest `AssetId` in `set` whose `newest` is `Failed`; else `Pending` if
   any member's is `Pending`; else `Ready` with the current version of every member and
@@ -413,7 +467,7 @@ is this crate's (D136), written by `PackBuilder` alone and read by `Store::mount
   | `NotFound` | No mounted pack holds that version of the asset (`request`), or the asset at all (`request_newest`, `version: None`) |
   | `Unsupported` | No loader is registered for the kind the pack's index gives the asset, and no dependency of it failed |
   | `VersionMismatch` | The cooked format version in the index is not the loader's (`ErasedLoader::load`) |
-  | `InvalidData` | The content does not hash to its version; the stored range is not one zstd frame of the stated length, or runs past the file (`io`); the loader refused the bytes; a dependency cycle among assets without a current version |
+  | `InvalidData` | The content does not hash to its version; the stored range is not one zstd frame of the stated length, or runs past the file (`io`); the loader refused the bytes; a dependency cycle among assets without a current version, for the members step 6 says |
   | `ResourceExhausted` | A buffer the allocator refused, or zstd unable to allocate, in the read (`io`); a loader that returned it |
   | `Io` | The read failed in the operating system |
   | `Cancelled` | The pool stopped before the read ran, or the executor shut down before the load ended |
@@ -462,11 +516,13 @@ is this crate's (D136), written by `PackBuilder` alone and read by `Store::mount
   `Baseline::decode`, and refuses declared dependencies with `InvalidData`. The cooked
   format version moves with `lactose-bundle`'s document format version, in one change;
   a baseline in another document format is `VersionMismatch` from the decode either way.
-- A baseline's `AssetId` is `RegionBaseline::id(content_hash)`: `AssetId::from_name` of
-  `region_baseline/` followed by its `Baseline::content_hash` as sixteen lower-case
-  hexadecimal digits. Equal baselines are one asset with one version in every store; a
-  re-cooked region's baseline is another asset, and the old one stays loadable while a
-  mounted pack holds it.
+- A baseline's declared name is `RegionBaseline::name(content_hash)`: `region_baseline/`
+  followed by its `Baseline::content_hash` as sixteen lower-case hexadecimal digits. Its
+  `AssetId` is `RegionBaseline::id(content_hash)`, `AssetId::from_name` of that name, so
+  it shares the one namespace of asset names and RICOTTA's collision check covers it
+  with the name the cooker gets from `name`, never one it rebuilds. Equal baselines are
+  one asset with one version in every store; a re-cooked region's baseline is another
+  asset, and the old one stays loadable while a mounted pack holds it.
 - `RegionBaseline::lookup(catalog, content_hash)` is `newest_typed` of that ID, checked:
   an asset of another kind under the ID, or a baseline whose content hash is not
   `content_hash`, is `Failed` with `InvalidData`, the ID and the published version. It
@@ -477,6 +533,12 @@ is this crate's (D136), written by `PackBuilder` alone and read by `Store::mount
   which its driver requests by name.
 - Every store registers the loader itself; a loader of this kind among
   `Store::new`'s `loaders` is the duplicate `Store::new` refuses.
+- A baseline's load is one `ErasedLoader::load` call like any other kind's, and this
+  kind is the first to exceed architecture section 5.1's slice: for a region of 100,000
+  rows (an 8.4 MB document) the design review measured the version hash at 3.0 ms and
+  `Baseline::decode` at 4.3 ms, 7.3 ms for the one call (release, Apple M1). Nothing
+  loads a baseline through the store before milestone 3; `docs/verification.md` has the
+  row that decides it there.
 
 ### Tracing
 
@@ -536,8 +598,10 @@ Everything is at target `silo` (`LOG_TARGET`), the store's codename (architectur
   `io`'s appending writer). The index carries explicit offsets so that it needs no new
   format.
 - **Slicing the version check and the loader** to architecture section 5.1's 0.5 ms
-  ("Requests and loads" above; the verification row decides whether the store hashes in
-  slices and whether a large kind's loader must be sliceable).
+  ("Requests and loads" and "The region baseline" above). The store owns the region
+  baseline's loader, so it can slice that decode itself; slicing the version hash needs
+  an `asset-api` entry that skips `ErasedLoader::load`'s own check. The verification row
+  decides both at milestone 3, where a baseline is first loaded through the store.
 - **Refusing a stale cooked format from the index.** `ErasedLoader` exposes its kind and
   not its format version, so `VersionMismatch` is found only after the asset was read
   and hashed. An accessor in `asset-api` would let the store refuse it without a read,
@@ -573,19 +637,22 @@ SOUR: this crate is outside the determinism boundary. Tests write packs into
 
 | What | How |
 |---|---|
-| Conformance | `asset-api`'s suite passes against the store, once over raw packs and once over `Storage::Zstd` packs, each `provide` one pack written and mounted (`tests/conformance.rs`, the `ignore` removed) |
+| Conformance | `asset-api`'s suite, its 21 checks, passes against the store, once over raw packs and once over `Storage::Zstd` packs, each `provide` one pack written and mounted (`tests/conformance.rs`, the `ignore` removed). Among them, for every store: no answer changes while the generation stands still around a renaming cook; a retry that fails again moves the generation; an exact request of a published version changes nothing; the end of a load of the named version answers `newest` whoever asked; the empty ID; and the failure a load reports with several failing dependencies and with a cycle, in both orders of requests |
 | A pack read through `io` | Assets of several sizes, empty and several MiB among them, added raw and compressed, written, mounted, requested, and read back equal through `get_typed`; the compressed ones through `read_encoded_at` (the `io.read` span says `zstd`) with the decode on the background worker; a frame no shorter than its bytes is stored raw |
-| The format | Golden bytes of an empty pack, a one-entry and a two-entry pack; the index sorted whatever the add order; each rule of "The pack format" broken in turn refuses the mount with `InvalidData`, nothing mounted; another format version is `VersionMismatch`, and a file without the magic `InvalidData`, before anything else is read; an index length past the file, and a count past the index, allocate nothing (no block of 1 MiB asked of the allocator); `add` refuses `AssetId::NONE`, an ID added again with another version, a level of 0 and of 23 and bytes over the cap, adding nothing, and an ID added again with the same version changes no byte of the pack |
+| The format | Golden bytes of an empty pack, a one-entry and a two-entry pack; the index sorted whatever the add order; each rule of "The pack format" broken in turn refuses the mount with `InvalidData`, nothing mounted; another format version is `VersionMismatch`, and a file without the magic `InvalidData`, before anything else is read; an index length past the file is `InvalidData` with no read of an index, below 1 GiB and above it (a trailer naming 2 GiB in a file of a few bytes), and one within the file and over 1 GiB is `ResourceExhausted` (a sparse file); neither, nor a count past the index, allocates (no block of 1 MiB asked of the allocator); `add` refuses `AssetId::NONE`, an ID added again with another version, a level of 0 and of 23 and bytes over the cap, adding nothing, and an ID added again with the same version changes no byte of the pack |
 | Hash verification failure as a value | A pack whose index claims a version its content does not hash to (the harness's `claim`), and a pack with one payload byte flipped, raw and compressed: `Failed` with `InvalidData`, the claimed version in the failure, `warn` logged, no panic; the other assets of the pack load |
 | Mount order | Three packs holding one asset at three versions: mounted in turn, and with the three futures created in order and awaited in reverse, the named version is the last call's; an exact request finds each of the three; a failed and a dropped mount leave a place empty and change nothing; a path mounted, replaced by rename and mounted again serves both contents |
 | Mount cost | A mount of a pack of 100,000 entries and several hundred MiB of payload issues one `io.open` span and two `io.read` spans, of 24 bytes and of the index's length, and nothing else; its time is recorded with the load averages for the verification row |
 | A publish observed through `generation` | With an asset followed and current, a new pack holding a new version is mounted: the generation is unchanged when the mount resolves, moves when the reload publishes, `newest` then answers the new version and `resolve` a new table, while a handle and a `PinnedTable` taken before still read the old one; a pack that renames nothing followed moves nothing; a pack naming an earlier, published version makes it current at the mount and moves the generation |
 | Following | An asset requested only by exact version is not reloaded by a mount; a dependency nobody named is reloaded; an asset requested before any pack held it loads when a pack that holds it is mounted; a missing dependency added by a later pack repairs its dependant, and that dependant's dependant, at that mount; an asset that failed for itself is not read again by the mount of a pack that does not hold it (no `io.read` span, the generation unmoved), and is by `request_newest`; one that failed for a dependency is not retried by a mount that renames neither |
-| The generation's promise | Around a retry held in flight by a gated loader, and around a mount that renames a failed asset: `get`, `newest` and `resolve` answer as before until the load ends, and the generation moves exactly when they change; a repeated `request_newest` of an unknown asset moves it each time; requests for what is published or loading never move it |
-| Failures | Each row of the failure table produced: `Cancelled` by a request after `Io::shutdown`, by a request after `Executor::shutdown`, and for the loads queued behind a gated loader on a one-background-worker executor when it shuts down; a kind without a loader costs no read (no `io.read` span); the reported kind with two failing dependencies is the lower ID's on every run, also when the higher one fails first (gated loaders); a cycle beside a failing dependency of lower ID reports the dependency's kind, and of higher ID `InvalidData`; a corrupt asset, and one of a kind without a loader, each with a failing dependency, report the dependency's kind, as the reference store does over the same content |
+| A new source for a failed version | An asset and its dependency in one pack, the dependency's payload damaged in place (and, separately, its stored range made to run past the file): both fail. A second pack holding the same versions intact is mounted, renaming nothing: the dependency is read from the second pack and published, and its dependant with it (rules 2 and 3). The same second pack mounted over an asset whose loader refuses its intact bytes, or whose cooked format the loader does not read, or whose kind has no loader, reads nothing and moves nothing; so does a second pack given an earlier place than the damaged one |
+| The generation's promise | Around a retry held in flight by a gated loader, and around a mount that renames a failed asset: `get`, `newest` and `resolve` answer as before until the load ends, and the generation moves exactly when they change; a repeated `request_newest` of an unknown asset moves it each time; requests for what is published or loading never move it; readers on several threads that read the generation, look, and read it again never see two different answers between two equal reads while packs are mounted and loads end under them |
+| Failures | Each row of the failure table produced: `Cancelled` by a request after `Io::shutdown`, by a request after `Executor::shutdown` (the request returns, under a bounded wait: the future dropped inside `spawn` records its failure and nothing deadlocks), and for the loads queued behind a gated loader on a one-background-worker executor when it shuts down; a kind without a loader costs no read (no `io.read` span); the reported kind with two failing dependencies is the lower ID's on every run, also when the higher one fails first (gated loaders); a corrupt asset, and one of a kind without a loader, each with a failing dependency, report the dependency's kind |
+| Cycles | A declares [B, C] with B below C, no pack holds B, and C declares [A]: with A's loader gated to end first, and with C's gated to end first, A is `NotFound` and C is `NotFound` in both runs; with the cycle's dependency the lower ID, both are `InvalidData` in both runs; neither member's failure is recorded before the other member's loader has ended (once the request has returned, the generation does not move while either loader is held); a load outside the cycle that depends on a member fails with that member's kind |
+| Long chains | One pack of a 100,000-link dependency chain: `request_newest` of its head from a task on a background worker accepts every link in that one call, all are published and `resolve` of the head returns 100,000 entries; the same chain closed into a cycle fails every member `InvalidData`; the chain with its last link's dependency missing fails every link `NotFound`, and a pack that adds the missing asset repairs all 100,000 at its mount (rule 3). None overflows a worker's stack |
 | Settling | `settled()` resolves only after a gated load ends, resolves while a load accepted after its first poll is still held, covers the dependencies and the loads a mount accepted, and resolves after an executor shutdown |
 | Cancellation by drop | On an executor with one background worker, with more loads accepted than that and every loader gated, the last handle is dropped while the first loader's call is held: the drop returns at once; when the gate opens the held call returns, its asset is dropped, and no other loader call ever begins (counted by the loader); `AllocTag::Io` live bytes return to zero once the pool is idle; a handle taken before the drop still reads its asset. On a store kept alive, a `Mount` polled once and dropped mounts nothing: a request for its asset is `NotFound` |
 | Memory tags and threads | A loader observes `AllocTag::current() == Asset` and a background worker's thread, whatever tag and thread the requester had; the store's lock is not held across a gated loader (a lookup returns while the loader is held) |
-| The region baseline | `id` golden values; `cook` then a load through the store and through the reference store gives a baseline equal to the original, shared by `Arc`; `lookup` is `Pending` before the request, `Ready` after, `InvalidData` for another kind under the ID and for a baseline under the wrong ID; a baseline cooked with a dependency is refused by the loader |
+| The region baseline | `name` and `id` golden values, `id` the `AssetId::from_name` of `name`; `cook` then a load through the store and through the reference store gives a baseline equal to the original, shared by `Arc`; `lookup` is `Pending` before the request, `Ready` after, `InvalidData` for another kind under the ID and for a baseline under the wrong ID; a baseline cooked with a dependency is refused by the loader |
 | A boundary world's read | With `lactose-ecs` as a dev-dependency: a table resolved and pinned from the store enters a world through `World::set_region_assets`, a kernel reads a `SimulationAsset` through `Ctx::assets()`, and after a reload the kernel reads the old version until the new table is set (the `docs/verification.md` item on `Ctx::assets`) |
 | Tracing | A capturing subscriber sees the spans and events of the table with their fields, `silo.load` a root span with the read's `io.read` inside it, nothing for a request that does nothing, and one `warn` per recorded failure |

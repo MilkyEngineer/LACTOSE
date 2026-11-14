@@ -85,7 +85,8 @@ pub enum Readiness<T> {
     /// Not published and not failed. A lookup never starts a load, so this is also the
     /// answer for something nobody has requested.
     Pending,
-    /// The load failed. The failure stays the answer until a later request retries.
+    /// The load failed. The failure stays the answer until the outcome of a later load
+    /// replaces it: a request that retries does not change the answer, the retry's end does.
     Failed(AssetFailure),
 }
 
@@ -125,11 +126,18 @@ impl<T> Readiness<T> {
 ///   content hashes to its version ([`CookedHeader::version_of`]). A store verifies that
 ///   on load, which [`ErasedLoader::load`] does for it; a mismatch is a failure value.
 /// - Nothing is loaded unasked. A store loads a requested asset, a dependency of one, or
-///   the new current version of an asset it has already loaded (hot reload).
+///   the new current version of an asset it has already loaded (hot reload). Which of
+///   those loads it starts beyond the ones a request names is the store's own: whether and
+///   when it reloads, and whether it goes on to an asset's other dependencies once one of
+///   them has failed.
 /// - An asset is published only once each of its declared dependencies has a current
-///   published version. A dependency that cannot be published fails the dependant with
-///   the dependency's [`ErrorKind`]. A dependency cycle among assets that are not yet
-///   published fails every asset in it with `InvalidData`.
+///   published version. A dependency that cannot be published fails the dependant, before
+///   any failure of the dependant's own, with the [`ErrorKind`] the dependency failed
+///   with: of several, the one with the lowest [`AssetId`]. A dependency cycle among
+///   assets that are not yet published fails every asset in it, and where following each
+///   asset's first failing dependency leads round the cycle the kind is `InvalidData`.
+///   Which failure a load reports depends on neither the order of requests nor the order
+///   in which loads end.
 /// - A failed load is reported as an [`AssetFailure`] naming the asset and the version
 ///   that failed: `NotFound` for an asset or version the store's sources do not hold,
 ///   `Unsupported` for a kind with no registered loader, `VersionMismatch` for another
@@ -137,6 +145,9 @@ impl<T> Readiness<T> {
 ///   otherwise the kind the loader returned.
 /// - A published version stays available through [`PublishedAssets::get`] at least as
 ///   long as any handle to it is alive.
+/// - [`AssetId::NONE`] names no asset: a request for it does nothing, and a lookup of it
+///   is `Failed` with `{ id: NONE, version: None, kind: NotFound }`, as a typed lookup
+///   through an empty reference is.
 ///
 /// `lactose_asset_api::conformance` checks these. Residency (unloading, budgets) is not
 /// expressed yet; milestone 3 amends these traits with it.
@@ -146,12 +157,15 @@ impl<T> Readiness<T> {
 pub trait PublishedAssets: Send + Sync {
     /// Asks the store to load and publish exactly `version` of `id` and, transitively, the
     /// current version of each declared dependency that has no published version yet.
-    /// Requesting something already published or already loading does nothing; requesting
+    /// Requesting something already published or already loading does nothing, also when
+    /// the index names that version: an already published version becomes current only
+    /// through [`AssetCatalog::request_newest`] or a reload of the store's own. Requesting
     /// something that failed retries it.
     fn request(&self, id: AssetId, version: AssetVersion, priority: LoadPriority);
 
     /// The published asset `(id, version)`. Readers inside the determinism boundary take
-    /// `version` from their region's [`VersionTable`].
+    /// `version` from their region's [`VersionTable`]. `Failed` carries the failure of the
+    /// last load of it to end.
     fn get(&self, id: AssetId, version: AssetVersion) -> Readiness<UntypedHandle>;
 }
 
@@ -169,19 +183,33 @@ pub trait PublishedAssets: Send + Sync {
 ///
 /// What an implementation must uphold, beyond [`PublishedAssets`]:
 ///
-/// - The current version of an asset changes only by a publication. A failed load of the
-///   index's new version leaves the previous current version in place.
-/// - Publication is atomic with respect to every method here.
+/// - The current version of an asset changes only when a version of it is published while
+///   the index names that version, whoever requested the load, or when a request for the
+///   newest version, or a reload the store starts itself, finds the version the index
+///   names already published. A failed load of the index's new version leaves the previous
+///   current version in place.
+/// - A change of the index changes no answer by itself. What follows from it (a request, a
+///   reload) changes answers when a load ends, or when it makes an already published
+///   version current.
+/// - Publication is atomic with respect to every method here, and so is every other change
+///   of an answer: a lookup never sees a change that [`AssetCatalog::generation`] does not
+///   show yet, nor the reverse.
 pub trait AssetCatalog: PublishedAssets {
     /// Asks the store to load and publish the version of `id` its pack index currently
     /// names, with the dependency, repeat and retry behaviour of
-    /// [`PublishedAssets::request`].
+    /// [`PublishedAssets::request`], and to make that version current if it is published
+    /// already. If the index names no version of `id`, the request is a failed load,
+    /// `NotFound` with no version, recorded each time it is made.
     fn request_newest(&self, id: AssetId, priority: LoadPriority);
 
     /// The current published version of `id`.
     ///
-    /// The answer is `Failed` only when the asset has no current published version and
-    /// the load of the version the index names has failed, or the index names none.
+    /// The answer is `Failed` only when the asset has no current published version. It
+    /// then carries the failure of the last load to end of a version the index named when
+    /// that load ended, whoever requested it, or of the last request for the newest
+    /// version that found the index naming none, whichever came later. It stays the answer
+    /// until another such load ends: a change of the index and a load in flight do not
+    /// change it. An asset with neither a current version nor such a failure is `Pending`.
     fn newest(&self, id: AssetId) -> Readiness<UntypedHandle>;
 
     /// The current version of every asset in `set` and of every asset those versions
@@ -194,10 +222,12 @@ pub trait AssetCatalog: PublishedAssets {
     /// version; otherwise `Ready`. An empty set is ready.
     fn resolve(&self, set: &AssetSet) -> Readiness<VersionTable>;
 
-    /// A counter that increases with every publication and every recorded failure, and
-    /// never otherwise. While it is unchanged, [`AssetCatalog::newest`] and
-    /// [`AssetCatalog::resolve`] answer as they did, so a caller resolves its regions
-    /// again only after it moves.
+    /// A counter that increases with every publication, every change of an asset's current
+    /// version and every recorded failure, a retry that fails again included, and never
+    /// otherwise. While it is unchanged, [`PublishedAssets::get`], [`AssetCatalog::newest`]
+    /// and [`AssetCatalog::resolve`] answer as they did, so a caller resolves its regions
+    /// again only after it moves; and since every retry ends in a move, a caller that
+    /// retried a failure looks again when it moves and never waits for ever.
     fn generation(&self) -> u64;
 }
 

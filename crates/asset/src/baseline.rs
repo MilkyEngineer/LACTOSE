@@ -32,10 +32,19 @@ pub struct RegionBaseline {
 }
 
 impl RegionBaseline {
+    /// The declared name of the baseline whose `Baseline::content_hash` is `content_hash`:
+    /// the 32 bytes `region_baseline/` followed by `content_hash` as sixteen lower-case
+    /// hexadecimal digits (`region_baseline/00000000000000ff` for 255).
+    ///
+    /// A baseline shares the one namespace of asset names: the cooker passes this name to
+    /// its collision check with every other name it publishes, and never rebuilds it.
+    #[must_use]
+    pub fn name(content_hash: u64) -> String {
+        todo!("format the content-addressed name")
+    }
+
     /// The ID of the baseline whose `Baseline::content_hash` is `content_hash`:
-    /// `AssetId::from_name` of the 32-byte name made of `region_baseline/` and
-    /// `content_hash` as sixteen lower-case hexadecimal digits
-    /// (`region_baseline/00000000000000ff` for 255).
+    /// `AssetId::from_name` of [`RegionBaseline::name`]`(content_hash)`.
     #[must_use]
     pub fn id(content_hash: u64) -> AssetId {
         todo!("hash the content-addressed name")

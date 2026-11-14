@@ -35,8 +35,8 @@ use lactose_task::Executor;
 ///   another and never withdrawn;
 /// - an asset is **followed** once its newest version has been asked for, by
 ///   `request_newest` or as a declared dependency of a load. Each mount asks again for the
-///   followed assets it renamed and for those that had failed for one of them, which is
-///   the store's hot reload.
+///   followed assets it renamed, for those it is a new source for after a failed read, and
+///   for those that had failed for one of either, which is the store's hot reload.
 ///
 /// No method blocks, waits for IO or runs a loader: loads run as tasks on the executor's
 /// background workers, and a lookup holds the store's lock for its own map work only,
@@ -92,10 +92,13 @@ impl Store {
     /// asset becomes the asset's named version unless a pack with a later place holds the
     /// asset; and the store does what `AssetCatalog::request_newest` does, at the lowest
     /// priority, for every followed asset whose named version the mount changed (unless
-    /// that version is current or loading) and, transitively, for every followed asset
-    /// whose named version last failed for a dependency the mount asks for again. A
-    /// followed asset the mount did not rename and whose named version failed for itself
-    /// is not retried.
+    /// that version is current or loading); for every followed asset whose named version
+    /// failed for a reason of the source (the read, or content that did not hash to its
+    /// version) when this pack holds that version and is now where it is read from; and,
+    /// transitively, for every followed asset whose named version last failed for a
+    /// dependency the mount asks for again. A followed asset the mount did not rename and
+    /// whose named version failed for a reason of the version (no loader, another cooked
+    /// format, a loader refusing intact bytes) is not retried.
     ///
     /// Renaming changes no answer of `get`, `newest` or `resolve`: a mount changes one,
     /// and moves the generation, only through those requests, at the mount itself where
@@ -111,9 +114,10 @@ impl Store {
     ///
     /// Nothing is opened until the future is first polled. It resolves to
     /// `ErrorKind::NotFound` if there is no such file; `InvalidData` if the file is not a
-    /// well-formed pack (`README.md`, "The pack format", lists every rule);
-    /// `VersionMismatch` if it is a pack of another format version; `ResourceExhausted` if
-    /// its index is longer than `lactose_io::MAX_READ_BYTES` or a buffer cannot be
+    /// well-formed pack (`README.md`, "The pack format", lists every rule), an index
+    /// length that runs past the file included, whatever its size; `VersionMismatch` if it
+    /// is a pack of another format version; `ResourceExhausted` if its index lies within
+    /// the file and is longer than `lactose_io::MAX_READ_BYTES`, or a buffer cannot be
     /// allocated; `Io` for anything else the open or a read reports; `Cancelled` if the
     /// pool has stopped. A failed mount mounts nothing.
     #[must_use = "a mount does nothing until polled"]
@@ -150,9 +154,10 @@ impl fmt::Debug for Store {
 impl PublishedAssets for Store {
     /// Accepts a load of exactly `version` of `id` from the mounted pack with the latest
     /// place that holds it, unless that version is published or already loading, in which
-    /// case the call does nothing, its priority included. A recorded failure is retried.
-    /// The asset is not followed for it and never becomes current because of it unless the
-    /// index names `version` when the load ends.
+    /// case the call does nothing, its priority included, also when the index names
+    /// `version`. A recorded failure is retried. The asset is not followed for it, and the
+    /// end of the load is an answer for `newest` (the current version, or the newest
+    /// failure) only if the index names `version` when the load ends.
     ///
     /// If no mounted pack holds `(id, version)` the load ends inside this call, failed with
     /// `ErrorKind::NotFound`. `priority` is recorded on the load's span and orders nothing
@@ -186,7 +191,7 @@ impl AssetCatalog for Store {
     /// `Ready` with the current version if the asset has one; otherwise `Failed` with its
     /// newest failure if one is recorded; otherwise `Pending`. The newest failure of an
     /// asset is the later of: the failure of a load that ended while the index named its
-    /// version and the asset was followed; and `{ id, version: None, kind: NotFound }`,
+    /// version, whoever asked for the load; and `{ id, version: None, kind: NotFound }`,
     /// recorded when the asset's newest version was asked for and no mounted pack held
     /// the asset. A request and a load in flight leave the answer as it was, and so does a
     /// mount but for the published version it may make current.
@@ -202,10 +207,11 @@ impl AssetCatalog for Store {
         todo!("walk the current versions and their declared dependencies")
     }
 
-    /// Moves, by at least one and atomically with the change, when a version is published,
-    /// when an already published version becomes current, and when a failure is recorded
-    /// (a retry that fails again records it again). It never moves otherwise, and while it
-    /// is unchanged `get`, `newest` and `resolve` answer as they did.
+    /// Moves, by at least one and in one step with the change under the store's lock, when
+    /// a version is published, when an already published version becomes current, and when
+    /// a failure is recorded (a retry that fails again records it again). It never moves
+    /// otherwise, and while it is unchanged `get`, `newest` and `resolve` answer as they
+    /// did: no lookup sees a change this does not show yet, nor the reverse.
     fn generation(&self) -> u64 {
         todo!("read the counter")
     }

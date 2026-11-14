@@ -351,6 +351,19 @@ fn cook_pack(
     Ok(())
 }
 
+/// The cooker's collision check runs over every name it publishes, the baseline's among
+/// them: two names that hash to one ID, or a name that hashes to zero, are reported by
+/// name. The baseline's name comes from the kind, not from a format string of the
+/// cooker's.
+fn cook_names(sources: &[(&str, Vec<u8>)], baseline: &Baseline) -> Vec<(AssetId, String)> {
+    let baseline_name = RegionBaseline::name(baseline.content_hash());
+    let mut names: Vec<(AssetId, String)> =
+        sources.iter().map(|(name, _)| (AssetId::from_name(name), (*name).to_owned())).collect();
+    names.push((RegionBaseline::id(baseline.content_hash()), baseline_name));
+    names.sort();
+    names
+}
+
 // ---- 7. Publication: the cooker's output reaching a running store ----
 
 /// Whoever knows the cooker ran mounts its pack. The mount asks again for every followed
