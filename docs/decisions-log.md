@@ -1210,6 +1210,208 @@ rationale the author supplied during the editorial pass rather than one taken fr
     dependency on the asset store's traits.
 - Driven by: milestone 1, the `app` facade brief and its reviews r1 and r2 (2026-10-24).
 
+**D136. The `asset` facade, and the change it makes to `asset-api`'s store contract: what sections 4, 5.1, 8.2, 14, 15.2, 18, 19 and 20 left open** (§3, §4, §5.1, §8.2, §9.7, §14, §15.2, §18, §19, §20, §22, `lactose-asset`, `lactose-asset-api`, `lactose-bundle`, `lactose-io`, `lactose-task`, `lactose-app`, `lactose-persist`, `tools/cook`)
+- Why: the facade is written before its implementation so the cooker's skeleton, the milestone
+  3 `app` and `persist` build against the final surface; each choice below is one the sections
+  did not settle, and each is a contract in `crates/asset/README.md`. The design review (r1:
+  S1, M1 to M7) found that the store's rule for failures changed `asset-api`'s merged contract
+  and that the reference store met neither the old text nor the new; it also changed how a
+  cycle's failures are decided and what a mount retries. Its second round (r2: N1, N2) found
+  that the suite's check of that rule asserted nothing of a store that reloads by itself, and
+  that the order-independence of a load's failure holds only while the index stands still.
+  - *The pack is SILO's own format, owned by `lactose-asset`, written by `PackBuilder` and read
+    by `Store::mount`: a payload area, an index sorted by asset ID that holds each asset's
+    version, `CookedHeader` and explicit range, and a 24-byte trailer whose last eight bytes
+    are the same in every format version.* Section 15.2 puts the record format in `bundle` and
+    names no pack, and `bundle` fixes baselines and overlays only. The writer lives with the
+    reader because the conformance harness and the cooker both need it, a backend crate cannot
+    dev-depend on the leaf cooker, `bundle` is inside the boundary, where a compressor is a
+    determinism review and a pack is not simulation data, and `asset-api` is the interface
+    another store implements over another container. The cooker, a leaf, names `lactose-asset`
+    for it. The builder compresses, so `io`'s three frame rules (one frame, its content size, a
+    window of at most 2^27; D130) are met in one place for every writer, and it keeps a frame
+    only when it is shorter than the bytes. A pack holds one version of an asset; offsets are
+    explicit so milestone 3's streaming writer needs no new format; the index is hashed and a
+    payload is checked by its version when loaded; a mount is one open and two reads, so a
+    restart's cost follows the index and never the payloads (section 18). An index length is
+    checked against the file before it is read, so one past the file is `InvalidData` whatever
+    its size. `add` takes an ID again when the content has the same version, since equal
+    baselines of two regions are one asset, and refuses another version, which is where two
+    names that hash to one ID surface. Rules out a pack format in `bundle` or `asset-api`,
+    compression in the cooker, several versions of one asset in a pack, and a mount that reads
+    payloads.
+  - *A cooked pack reaches a running store by `Store::mount`, called by whoever knows the
+    cooker ran; "newest" is the version in the mounted pack with the latest place, and a place
+    is taken by the call, in call order.* Section 14 makes versions unordered and D98 makes
+    "newest" a fact about the store's index. Mount order is a fact about the store alone: no
+    counter in the pack, no clock, no ledger. The place is the call's, not the completion's, so
+    mounts in flight at once name what mounts in turn name, and no named version depends on
+    which read finished first; which version is current still follows the loads, as it must. A
+    watched directory needs an `io` request that does not exist yet (D130; milestone 2). Rules
+    out a cook sequence or timestamp in the pack, a manifest read by the store at milestone 1,
+    unmounting, and completion-ordered mounts.
+  - *Hot reload is following: an asset whose newest version was asked for, by name or as a
+    declared dependency, is followed; a mount asks again for the followed assets it renamed,
+    for those whose named version failed for a reason of the source when the mounted pack holds
+    that version and is where it is now read, and, transitively, for the followed assets that
+    had failed for one of either.* `asset-api` lets a store load "the new current version of an
+    asset it has already loaded". One rule covers a new version, a fixed version of a failed
+    asset, an intact copy of one whose pack was damaged or unreadable, an asset first named by
+    a later pack, and the dependants any of these had failed, so the driver watches
+    `generation` and requests nothing again. A failure is of the source when another pack
+    holding the version might load it: every failure of the read (`Io`, `ResourceExhausted`,
+    `InvalidData` for a range past the file or a stored range that is not one frame,
+    `Cancelled`) and content that does not hash to its version. It is of the version when the
+    same content would fail from any pack: `Unsupported`, `VersionMismatch`, and a loader
+    refusing bytes that hash to the version; a mount that does not rename such an asset does
+    not read it again, so a stale cooked format is not re-read at every mount of a dev session.
+    Rules out reload driven by the caller, reload of assets loaded only by exact version, a
+    retry of every failure at every mount, and a damaged pack that a later intact copy does not
+    repair (review M3).
+  - *D136 changes `asset-api`'s merged contract (D99): while `generation` is unchanged, `get`,
+    `newest` and `resolve` answer as they did; a recorded failure stays the answer until the
+    outcome of a later load replaces it; a change of the index changes no answer by itself.*
+    D99's text said a failure "stays the answer until a later request retries", that `newest`
+    is `Failed` "only when ... the load of the version the index names has failed", that the
+    current version "changes only by a publication", and that answers stand while the
+    generation does. For a store whose loads take time these cannot all hold: a retry in
+    flight, or a newly named version in flight, would have to turn `Failed` into `Pending` with
+    nothing published and nothing failed. Both stores also made a published version current
+    without a publication, and the reference store answered `Pending` after a cook with the
+    generation unmoved, against the text as it stood (review S1). The generation's promise is
+    the one kept, because a driver's loop is built on it and it is what lets a region not be
+    resolved every frame; the other sentences are amended to it in
+    `crates/asset-api/src/store.rs`. `newest`'s failure is that of the last load to end of a
+    version the index named when it ended, whoever requested it, or of the last request that
+    found the index naming none. The current version changes when a version is published while
+    named, or when a request for the newest version or a store's own reload finds the named
+    version published. No lookup sees a change the generation does not show, nor the reverse
+    (the next point). The generation moves on every recorded failure, a failed retry and a
+    repeated request for an unnamed asset included, so every retry ends in a move and a caller
+    that retries and waits never waits for ever; for the same reason a driver retries on a
+    decision and never every frame. Rules out `Pending` during a retry, a generation that moves
+    when a load is accepted, and a driver that requests again on every move.
+  - *"No lookup sees a change the generation does not show, nor the reverse" is one
+    linearisation point: a store changes an answer and moves its generation in a single step
+    that every reader sees whole or not at all.* SILO at milestone 1 reads every lookup and the
+    generation under its one lock, so nothing changes now. A milestone 3 backend that takes
+    lookups off that lock keeps its published state as one immutable snapshot behind an atomic
+    swap, or behind a seqlock, with the generation a field of the snapshot; loads that end
+    build the next snapshot under a writer's lock and swap it in. Per-asset locks beside a
+    separate counter cannot meet the rule in either order: with the counter moved first, a
+    reader can see the new generation over the old answer and then wait for a move that never
+    comes; with the answer changed first, a reader can see a new answer under the generation it
+    read before. The caller's protocol alone (read the generation, look up, look again when it
+    moves) needs less: a counter moved both before and after each change would serve it, and
+    would still change an answer between two equal reads of the generation, against
+    `generation`'s own promise and the comparison the suite makes. `docs/verification.md` has
+    the milestone 3 row. Rules out per-asset locks with a separate generation counter, and a
+    generation kept outside the state it counts.
+  - *The conformance suite states the contract and the reference store is one store that passes
+    it: six checks are added, 21 in all, the reference store is brought to them, and what stays
+    the store's own is named in the trait.* Pinned for every store: a cook that renames an
+    asset changes no answer by itself; a retry that fails again moves the generation; an exact
+    request of a published version changes nothing, also when the index names it; the end of a
+    load of the named version answers `newest` whoever asked; `AssetId::NONE` names no asset, a
+    request for it does nothing and a lookup of it is `Failed` with `NotFound`; and a load
+    reports its first failing dependency in ascending ID order before anything of its own, a
+    cycle by the same rule, in every order of requests. The first is checked whatever the
+    generation does, because a store that reloads by itself may have moved it by the time the
+    suite looks: each answer of an asset somebody asked the newest version of is the one from
+    before the cook or the newly named version, never `Pending` in between, and exactly the one
+    from before while the generation stands still; an asset nobody asked the newest version of
+    is compared outright, since no store loads anything of it at a cook. Compared only under an
+    unmoved generation, as the check first was, it passed a store that forgot a failure at a
+    cook and moved its generation (review r2, N1). `crates/asset-api/tests/conformance.rs` runs
+    the suite against seven stores that each break one of these rules: each fails exactly one
+    of the 21 checks, on that check's own message, and each of the six checks fails at least
+    one of them. Two break the first rule, one whose generation stands still at the cook, as
+    the reference store's did, and one whose generation moves; one reports its highest failing
+    dependency where the rule is the lowest. Left to the store, and said so in the trait:
+    whether and when it reloads once the index names another version (the reference never; SILO
+    at a mount), whether it goes on to an asset's other dependencies once one has failed (the
+    reference stops; SILO asks for all when it accepts the load), the order of loads under a
+    priority, and the failures only IO can cause. The reference store's walk over dependencies
+    became a loop: recursing per link, it overflowed a 2 MiB stack at ten thousand links
+    (review M6). Rules out a reference store that is the contract by itself, a divergence
+    between two stores that neither the suite nor the trait names, and a check that binds a
+    store only while its generation stands still.
+  - *The store owns its loads: `Store::new(executor, io, loaders)`, one
+    `WorkerClass::Background` task per load under `AllocTag::Asset`, registered under the
+    store's lock and spawned outside it, no budget and no order among loads at milestone 1,
+    `Store::settled` as the one wait, cancellation by dropping the last handle.*
+    `crates/io/README.md` already has SILO spawn a task per load, and `task` has no join. A
+    load's future can be dropped inside `Executor::spawn`, on the calling thread, when the
+    executor has shut down, and the guard that records it as `Cancelled` takes the lock: a
+    spawn under the lock would deadlock on it (review M1). `LoadPriority` is recorded and
+    orders nothing until milestone 3's budgets exist. A wait is needed by tools, tests and a
+    start that must not step before its content is in; a frame loop needs none. Load tasks hold
+    no handle, so the last handle dropped cancels them, and every accepted load ends,
+    `Cancelled` after a shutdown, so the wait always resolves. Rules out a driver future `app`
+    polls, a blocking wait, a per-request handle before residency, a shutdown method, and a
+    spawn under the store's lock.
+  - *A load waits for every dependency to end before it reports, and reports the first of: no
+    pack holds it (`NotFound`); its first failed dependency in ascending ID order (that
+    dependency's kind); no loader for its kind (`Unsupported`, with nothing read); the read's
+    failure; `ErasedLoader::load`'s. Loads that wait for each other in a cycle are decided
+    together, once every member's read and loader and every dependency outside the cycle have
+    ended.* A failure is journaled, so for an index that does not change while the load is in
+    flight its kind depends on neither the order of the requests nor which task finished first.
+    Each member of a cycle fails for its first failed dependency, the other members counting as
+    failed: with that dependency's kind if it is outside the cycle, with the kind decided for
+    it if it is a member, and with `InvalidData` where following first failed dependencies
+    comes back round. Decided member by member, as each load's own waits ended, a member's kind
+    depended on whether its neighbour had already failed (review M2). A mount that resolves
+    while a load is in flight is the exception, because it changes what the load waits for:
+    where a dependency's named version fails and a pack that renames the dependency to a good
+    version is being mounted, the dependant is recorded failed and then asked for again by the
+    mount's transitive rule if the dependency's load ends first, and waits for the new version
+    and is published with no failure recorded if the mount resolves first. Both orders end with
+    the dependant published; one of them records, and so journals, a failure (review r2, N2).
+    Every walk over dependencies (accepting a load, finding a cycle, a mount's transitive rule,
+    `resolve`) is a loop over a work list, since a dependency chain is as long as a cook makes
+    it. Rules out first-to-finish reporting, a cycle member decided alone, a recursion per
+    dependency, and a claim of order-independence across a mount.
+  - *A load yields before its loader's call and cannot yield inside it.* Section 5.1's 0.5 ms
+    slice holds for the decode (`io`, D130) and not for `ErasedLoader::load`, which hashes the
+    content and decodes it in one synchronous call by `asset-api`'s design (D99). The store's
+    own kind is the first to exceed it: a region baseline of 100,000 rows takes 7.3 ms for the
+    one call (review M7). Nothing loads a baseline through the store before milestone 3, where
+    it is decided. Rules out a second hash pass in the store and an asynchronous loader trait
+    before that decision.
+  - *The region baseline is an asset kind of this crate, content-addressed:
+    `RegionBaseline::name(content_hash)` is its declared name, `RegionBaseline::id` the ID of
+    that name; it declares no dependencies; `RegionBaseline::lookup(catalog, content_hash)`
+    reads it.* A save's records, a relevance message and `app`'s `Cooked::baseline` name a
+    baseline by `Baseline::content_hash`, which is not an `AssetVersion`; deriving the name
+    from the hash makes "the baseline with this hash" the newest version of one ID in every
+    store, with no second index and no trait amendment. The name is in the one namespace of
+    asset names, so the cooker's collision check covers it with the name `name` returns. The
+    kind lives here because `persist`'s one backend edge is to this crate (`crate-tiers.toml`)
+    and because the asset must hand out the `Arc<Baseline>` a `RegionBundle` takes, which
+    `AssetHandle` does not expose. It declares no dependencies so that a save's load and an
+    unload's diff read a baseline without its region's assets. Which baseline a region has now
+    is the cooked region layout's, at milestone 3. Rules out a name-addressed baseline per
+    region, the region's asset set as the baseline's dependencies, `impl Asset for Baseline` in
+    `bundle`, and a name the cooker rebuilds.
+  - *SILO logs at target `silo`: one span per mount and one per load, the load's created by the
+    request that accepted it, as a root span, with publication an event inside it.* Section 19
+    gives a codenamed crate its codename (the brief said `asset`; the architecture wins). A
+    request is a non-blocking call that does no work of its own: a span per request would be a
+    span per call that does nothing, and a load span parented to its requester would hold a
+    frame's span open for the length of a load. Rules out target `asset`, a span per request,
+    and a load span that is a child of its requester.
+  - *Milestone 1 wires nothing into `app`: `Cooked` stays (D131), and a binary may bridge its
+    three calls over a store loaded before the first step.* The bridge is three lookups
+    (`crates/asset/tests/sketch.rs`), possible because `Store::settled` exists. Rules out an
+    `app` dependency on `lactose-asset` before milestone 3.
+- Driven by: milestone 1, the `asset` facade brief and its design reviews r1 and r2
+  (2026-11-14).
+- Replaced: D99's wording of `Readiness::Failed`, of `AssetCatalog::newest`, of the rule for an
+  asset's current version and of `generation`; the reference store's reading of the index at
+  each `newest`, its single move for a repeated request of an unnamed asset, its exact request
+  that made a published version current, its `Pending` for the empty ID and its recursive walk.
+
 ## 8. Physics and animation
 
 **D58. One physics world per server process, determinism and parallel together, pinned exactly** (§16, §2 Physics)

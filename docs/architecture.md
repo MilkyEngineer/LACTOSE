@@ -137,7 +137,7 @@ crates/
   input/          F  boundary  the quantised per-tick sample (`PlayerInput`: integers only, with absolute camera yaw and pitch), its byte image on the wire and in the journal, the applier that writes it at the input sync point, the redundancy window
   input-host/     F            the host side of input: raw samples and the quantiser, the latest-sample slot for the late latch, gamepad and keyboard sources and action mapping (milestone 5)
   io/             F            async file IO: blocking pool reference backend; io_uring and IOCP optimisations
-  asset/          B            [SILO] loading, dependency tracking, versioned publication, hot reload
+  asset/          B            [SILO] the pack format the cooker writes, loading, dependency tracking, versioned publication, hot reload, the region baseline as an asset
   physics-rapier/ B  boundary  [QUARK] Rapier backend
   net/            B            [MILKMAN] transport implementations, replication, interest management, bandwidth prioritisation, clock sync; implements `net-host`'s traits and fills `net-api`'s frames
   persist/        B            [SKIM] world overlay, save container [CARTON], migrations
@@ -222,7 +222,9 @@ owns its data and may be cancelled by drop. Waiting is an `.await`.
   extract, graph compile and record.
 - Background workers run on efficiency cores at utility QoS (two low-priority threads on
   homogeneous CPUs). They run asset decode, compression, and long futures. Background CPU
-  work yields at 0.5 millisecond slices.
+  work yields at 0.5 millisecond slices. An asset's version check and loader are one
+  synchronous call of `asset-api`'s `ErasedLoader`, which the store yields before and cannot
+  yield inside (D136; `docs/verification.md` has the row).
 - IO threads (`ThreadClass::Io`, the pool in `io`) run at utility QoS, half the cores on client and
   server (section 9.7), separate from the background workers.
 - The platform thread pumps OS events. A dedicated present thread calls present so a blocking
@@ -962,12 +964,16 @@ and ragdoll bodies.
 ## 14. Assets and streaming
 
 - The cooker emits runtime formats only: cluster-ready mesh pools, block-compressed textures,
-  resolved material blocks, compiled shaders, collision, region bundles.
+  resolved material blocks, compiled shaders, collision, region bundles. A region's cooked
+  baseline is an asset of `asset`'s region-baseline kind, named by its content hash (D136).
 - Assets are versioned and immutable after publish. A version is the content hash of the
   cooked header and bytes, so an asset ID and version name the same content on every machine
   and after every cook; versions are unordered and a store verifies the hash on load. Inside
   the boundary a region sees the version in its table; outside, readers see the version the
-  store's index currently publishes.
+  store's index currently publishes. SILO's index is its mounted packs: a cooked pack reaches
+  a running store by being mounted, the version SILO's index names for an asset is the one in
+  the pack mounted latest, by the order of the mount calls, among those that hold it, and
+  readers see that version once it has loaded (D136).
 - A region's version table is resolved outside the boundary as the closure of its asset set
   over declared dependencies, and enters at the input sync point. Boundary worlds receive only
   exact-version access; the catalogue (newest, resolve, publication generation) is given only

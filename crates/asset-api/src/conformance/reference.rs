@@ -16,9 +16,12 @@ use crate::version::{AssetSet, AssetVersion, VersionTable};
 /// A store for tests: cooked assets are handed to it in memory, and every requested load
 /// runs synchronously inside [`Harness::settle`].
 ///
-/// It is the executable statement of the store contract, and a stand-in for tests of crates
-/// that need a store. It is not a backend: it performs no IO, never unloads anything,
-/// ignores budgets and serialises every call behind one lock.
+/// It is the smallest store that passes the conformance suite, and a stand-in for tests of
+/// crates that need a store. It is not a backend: it performs no IO, never unloads
+/// anything, ignores budgets and serialises every call behind one lock. Where the traits
+/// leave a choice to the store it makes the smallest one: it loads nothing by itself when
+/// its source changes, and it stops at an asset's first failing dependency without looking
+/// at the ones after it.
 pub struct ReferenceStore {
     state: Mutex<State>,
 }
@@ -45,9 +48,29 @@ struct State {
     dependencies: BTreeMap<VersionKey, Vec<AssetId>>,
     /// The current published version per asset.
     current: BTreeMap<AssetId, AssetVersion>,
-    /// Requests for the newest version of an asset the index does not name.
-    unknown: BTreeMap<AssetId, AssetFailure>,
+    /// What `newest` answers for an asset without a current version: the failure of the
+    /// last load to end of a version the index named when it ended, or of the last request
+    /// for its newest version that found the index naming none. A change of the index
+    /// leaves it alone: only the end of a later load replaces it.
+    newest_failure: BTreeMap<AssetId, AssetFailure>,
     generation: u64,
+}
+
+/// One load in the middle of its dependencies, on the explicit stack of [`State::load`].
+struct Walk {
+    id: AssetId,
+    version: AssetVersion,
+    cooked: CookedAsset,
+    /// The next declared dependency to look at.
+    next: usize,
+}
+
+/// The loads a [`State::load`] is in the middle of: a stack, since a dependency is loaded
+/// before the next is looked at, and the same loads as a set, to notice a cycle.
+#[derive(Default)]
+struct Walks {
+    stack: Vec<Walk>,
+    members: BTreeSet<VersionKey>,
 }
 
 impl ReferenceStore {
@@ -72,7 +95,7 @@ impl ReferenceStore {
                 outcomes: BTreeMap::new(),
                 dependencies: BTreeMap::new(),
                 current: BTreeMap::new(),
-                unknown: BTreeMap::new(),
+                newest_failure: BTreeMap::new(),
                 generation: 0,
             }),
         }
@@ -100,9 +123,14 @@ impl Harness for ReferenceStore {
         // Stable, so equal priorities keep request order.
         requests.sort_by_key(|request| core::cmp::Reverse(request.priority));
         for request in requests {
-            let _ = state.load(request.id, request.version, &mut Vec::new());
+            let _ = state.load(request.id, request.version);
         }
     }
+}
+
+/// The failure every lookup of [`AssetId::NONE`] answers with.
+fn no_asset() -> AssetFailure {
+    AssetFailure { id: AssetId::NONE, version: None, kind: ErrorKind::NotFound }
 }
 
 impl State {
@@ -111,90 +139,163 @@ impl State {
     }
 
     fn newest(&self, id: AssetId) -> Readiness<UntypedHandle> {
+        if id.is_none() {
+            return Readiness::Failed(no_asset());
+        }
         if let Some(handle) = self.current.get(&id).and_then(|&version| self.published(id, version))
         {
             return Readiness::Ready(handle.clone());
         }
-        let named =
-            self.index.get(&id).and_then(|version| self.outcomes.get(&(id, version.to_bits())));
-        match (named, self.unknown.get(&id)) {
-            (Some(Err(failure)), _) | (None, Some(failure)) => Readiness::Failed(*failure),
-            _ => Readiness::Pending,
+        match self.newest_failure.get(&id) {
+            Some(failure) => Readiness::Failed(*failure),
+            None => Readiness::Pending,
         }
     }
 
-    /// Loads and publishes `version` of `id`, or the version the index names.
-    /// `loading` is the chain of dependants, which detects a dependency cycle.
-    fn load(
+    /// Loads and publishes `version` of `id`, or the version the index names for a request
+    /// that names none, with the dependencies it needs first.
+    ///
+    /// The walk is depth-first over declared dependencies in ascending order and stops at a
+    /// load's first failing dependency, on an explicit stack: a dependency chain is as long
+    /// as a cook makes it, and a thread's stack is not.
+    fn load(&mut self, id: AssetId, version: Option<AssetVersion>) -> Result<(), ErrorKind> {
+        let mut walks = Walks::default();
+        // The result of the load that ended last: the dependency the load on top of the
+        // stack was waiting for, or at the end the request's own.
+        let mut ended = self.begin(id, version, &mut walks);
+        while let Some(walk) = walks.stack.last_mut() {
+            if let Some(Err(kind)) = ended.take() {
+                // Its first failing dependency fails the dependant, with the dependency's
+                // kind and before anything of the dependant's own is looked at.
+                let walk = walks.pop();
+                let failure = AssetFailure { id: walk.id, version: Some(walk.version), kind };
+                ended = Some(self.end(walk.id, walk.version, Err(failure)));
+                continue;
+            }
+            let dependencies = walk.cooked.header.dependencies();
+            let waiting = dependencies[walk.next..]
+                .iter()
+                .position(|dependency| !self.current.contains_key(dependency));
+            match waiting {
+                Some(skipped) => {
+                    let dependency = dependencies[walk.next + skipped];
+                    walk.next += skipped + 1;
+                    ended = self.begin(dependency, None, &mut walks);
+                }
+                None => {
+                    let walk = walks.pop();
+                    ended = Some(self.finish(walk));
+                }
+            }
+        }
+        ended.expect("the request's own load ended")
+    }
+
+    /// Starts the load of `version` of `id`, or of the version the index names. `None`
+    /// means the load is now on the stack; otherwise it has ended and this is its result.
+    fn begin(
         &mut self,
         id: AssetId,
         version: Option<AssetVersion>,
-        loading: &mut Vec<AssetId>,
-    ) -> Result<(), ErrorKind> {
+        walks: &mut Walks,
+    ) -> Option<Result<(), ErrorKind>> {
+        let newest = version.is_none();
         let Some(version) = version.or_else(|| self.index.get(&id).copied()) else {
+            // A request for the newest version of an asset the index does not name is a
+            // failed load, recorded every time it is made.
             let kind = ErrorKind::NotFound;
-            let failure = AssetFailure { id, version: None, kind };
-            if self.unknown.insert(id, failure).is_none() {
-                self.generation += 1;
-            }
-            return Err(kind);
+            self.newest_failure.insert(id, AssetFailure { id, version: None, kind });
+            self.generation += 1;
+            return Some(Err(kind));
         };
-        self.unknown.remove(&id);
-        let named = self.index.get(&id) == Some(&version);
+        let key = (id, version.to_bits());
         if self.published(id, version).is_some() {
-            // The index may have come back to a version that was published earlier.
-            if named && self.current.insert(id, version) != Some(version) {
+            // Only a request for the newest version makes a published one current: the
+            // index may have come back to a version that was published earlier.
+            if newest && self.current.insert(id, version) != Some(version) {
+                self.newest_failure.remove(&id);
                 self.generation += 1;
             }
-            return Ok(());
+            return Some(Ok(()));
         }
-        let outcome = self.load_version(id, version, loading);
+        if walks.members.contains(&key) {
+            // The walk came back to a load it is in the middle of: a dependency cycle.
+            // That load records its own end when the failure reaches it.
+            return Some(Err(ErrorKind::InvalidData));
+        }
+        let Some(cooked) = self.source.get(&key).cloned() else {
+            let failure = AssetFailure { id, version: Some(version), kind: ErrorKind::NotFound };
+            return Some(self.end(id, version, Err(failure)));
+        };
+        walks.members.insert(key);
+        walks.stack.push(Walk { id, version, cooked, next: 0 });
+        None
+    }
+
+    /// Runs the loader of a load whose dependencies all have a current version.
+    fn finish(&mut self, walk: Walk) -> Result<(), ErrorKind> {
+        let Walk { id, version, cooked, .. } = walk;
+        let fail = |kind| AssetFailure { id, version: Some(version), kind };
+        let outcome = match self.loaders.get(&cooked.header.kind()) {
+            None => Err(fail(ErrorKind::Unsupported)),
+            Some(loader) => loader
+                .load(id, version, &cooked.header, &cooked.bytes)
+                .map_err(|error| fail(error.kind())),
+        };
+        if outcome.is_ok() {
+            let dependencies = cooked.header.dependencies().to_vec();
+            self.dependencies.insert((id, version.to_bits()), dependencies);
+        }
+        self.end(id, version, outcome)
+    }
+
+    /// Records the end of a load, in one step: the outcome for `get`; for `newest`, if the
+    /// index names the version now, the new current version or the failure; and the
+    /// generation.
+    fn end(
+        &mut self,
+        id: AssetId,
+        version: AssetVersion,
+        outcome: Outcome,
+    ) -> Result<(), ErrorKind> {
         let result = outcome.as_ref().map(drop).map_err(|failure| failure.kind);
-        if result.is_ok() && named {
-            self.current.insert(id, version);
+        if self.index.get(&id) == Some(&version) {
+            match &outcome {
+                Ok(_) => {
+                    self.current.insert(id, version);
+                    self.newest_failure.remove(&id);
+                }
+                Err(failure) => {
+                    self.newest_failure.insert(id, *failure);
+                }
+            }
         }
         self.outcomes.insert((id, version.to_bits()), outcome);
         self.generation += 1;
         result
     }
+}
 
-    fn load_version(
-        &mut self,
-        id: AssetId,
-        version: AssetVersion,
-        loading: &mut Vec<AssetId>,
-    ) -> Outcome {
-        let fail = |kind| AssetFailure { id, version: Some(version), kind };
-        let Some(cooked) = self.source.get(&(id, version.to_bits())).cloned() else {
-            return Err(fail(ErrorKind::NotFound));
-        };
-        if loading.contains(&id) {
-            return Err(fail(ErrorKind::InvalidData));
-        }
-        loading.push(id);
-        for &dependency in cooked.header.dependencies() {
-            if !self.current.contains_key(&dependency) {
-                self.load(dependency, None, loading).map_err(fail)?;
-            }
-        }
-        loading.pop();
-        let Some(loader) = self.loaders.get(&cooked.header.kind()) else {
-            return Err(fail(ErrorKind::Unsupported));
-        };
-        let handle = loader
-            .load(id, version, &cooked.header, &cooked.bytes)
-            .map_err(|error| fail(error.kind()))?;
-        self.dependencies.insert((id, version.to_bits()), cooked.header.dependencies().to_vec());
-        Ok(handle)
+impl Walks {
+    /// Takes the load on top of the stack, which has ended.
+    fn pop(&mut self) -> Walk {
+        let walk = self.stack.pop().expect("a load on the stack");
+        self.members.remove(&(walk.id, walk.version.to_bits()));
+        walk
     }
 }
 
 impl PublishedAssets for ReferenceStore {
     fn request(&self, id: AssetId, version: AssetVersion, priority: LoadPriority) {
-        self.state().requests.push(Request { id, version: Some(version), priority });
+        if !id.is_none() {
+            self.state().requests.push(Request { id, version: Some(version), priority });
+        }
     }
 
     fn get(&self, id: AssetId, version: AssetVersion) -> Readiness<UntypedHandle> {
+        if id.is_none() {
+            return Readiness::Failed(no_asset());
+        }
         match self.state().outcomes.get(&(id, version.to_bits())) {
             Some(Ok(handle)) => Readiness::Ready(handle.clone()),
             Some(Err(failure)) => Readiness::Failed(*failure),
@@ -205,7 +306,9 @@ impl PublishedAssets for ReferenceStore {
 
 impl AssetCatalog for ReferenceStore {
     fn request_newest(&self, id: AssetId, priority: LoadPriority) {
-        self.state().requests.push(Request { id, version: None, priority });
+        if !id.is_none() {
+            self.state().requests.push(Request { id, version: None, priority });
+        }
     }
 
     fn newest(&self, id: AssetId) -> Readiness<UntypedHandle> {

@@ -27,9 +27,13 @@ pub trait Harness: Sync {
     fn catalog(&self) -> &dyn AssetCatalog;
 
     /// Makes `cooked` available to the store's source as `version` of `id`, and makes that
-    /// the version the pack index names for `id`, as a cook that published it would. This
-    /// alone loads and publishes nothing. `version` is `cooked.version()` except where the
-    /// suite checks that a store notices the difference.
+    /// the version the pack index names for `id`, as a cook that published it would. By
+    /// itself this changes no answer, and it loads nothing of an asset whose newest version
+    /// nobody has asked for. A store that reloads by itself may, for an asset somebody has
+    /// asked the newest version of, start loading the new version, or make it current if
+    /// it is published already, moving the generation with any answer it changes.
+    /// `version` is `cooked.version()` except where the suite checks that a store notices
+    /// the difference.
     fn provide(&self, id: AssetId, version: AssetVersion, cooked: CookedAsset);
 
     /// Returns once every load the store has accepted so far has been published or has
@@ -44,7 +48,7 @@ pub trait Harness: Sync {
 ///
 /// Panics on the first violated requirement.
 pub fn run<H: Harness>(make: impl Fn(Vec<ErasedLoader>) -> H) {
-    let checks: [fn(&H); 15] = [
+    let checks: [fn(&H); 21] = [
         publishes_what_was_requested,
         typed_lookups_check_the_kind,
         unknown_assets_fail_as_not_found,
@@ -60,6 +64,12 @@ pub fn run<H: Harness>(make: impl Fn(Vec<ErasedLoader>) -> H) {
         pinned_tables_ignore_later_publications,
         generation_moves_only_with_publication,
         concurrent_use_is_consistent,
+        answers_change_only_with_the_generation,
+        every_failed_retry_moves_the_generation,
+        an_exact_request_of_a_published_version_changes_nothing,
+        the_end_of_a_load_answers_newest_whoever_asked,
+        the_empty_id_names_no_asset,
+        failures_follow_dependencies_in_id_order,
     ];
     for check in checks {
         check(&make(vec![ErasedLoader::new(TextLoader), ErasedLoader::new(FlagLoader)]));
@@ -524,4 +534,258 @@ fn concurrent_use_is_consistent<H: Harness>(harness: &H) {
 fn expected_dependency(expected: &[(AssetVersion, AssetId)], version: AssetVersion) -> AssetId {
     let found = expected.iter().find(|(known, _)| *known == version);
     found.expect("a version of A that was never provided").1
+}
+
+/// A cook that renames an asset changes no answer by itself, whatever the asset's state: a
+/// ready one, a failed one, one the index did not name. The failure of a renamed asset
+/// stays the answer until a load of the newly named version ends, and is never `Pending`
+/// in between.
+///
+/// A store that reloads by itself may have the new versions loading, or loaded, by the
+/// time the suite looks. So for an asset somebody asked the newest version of, each answer
+/// is held to the one from before the cook or the newly named version, and to the one from
+/// before exactly while the generation stands still. For an asset nobody asked the newest
+/// version of, no store loads anything at a cook, and its answers are compared outright.
+fn answers_change_only_with_the_generation<H: Harness>(harness: &H) {
+    let catalog = harness.catalog();
+    let set = AssetSet::from_iter([A]);
+    let one = publish(harness, A, text("one"));
+    let bad = publish(harness, B, corrupt_text());
+    let failure = failed(B, Some(bad), ErrorKind::InvalidData);
+    catalog.request_newest(MISSING, PRIORITY);
+    // D fails by an exact request of the version the index names: nobody asks for its newest.
+    let lone = offer(harness, D, corrupt_text());
+    catalog.request(D, lone, PRIORITY);
+    harness.settle();
+    let unknown = failed(MISSING, None, ErrorKind::NotFound);
+    assert_eq!(failure_of(catalog.newest(B)), Some(failure));
+    assert_eq!(failure_of(catalog.newest(MISSING)), Some(unknown));
+    let lone_answers = || (newest_text(harness, D), text_at(harness, D, lone));
+    let lone_before = lone_answers();
+
+    let before = catalog.generation();
+    let two = offer(harness, A, text("two"));
+    let fixed = offer(harness, B, text("fixed"));
+    let found = offer(harness, MISSING, text("found"));
+    let mended = offer(harness, D, text("mended"));
+    let renamed = newest_text(harness, A);
+    let table = catalog.resolve(&set);
+    let stale = newest_text(harness, B);
+    let stale_at = failure_of(catalog.get(B, bad));
+    let stale_unknown = newest_text(harness, MISSING);
+    let lone_after = lone_answers();
+    let unmoved = catalog.generation() == before;
+
+    let old_table = Readiness::Ready(VersionTable::from_iter([(A, one)]));
+    let new_table = Readiness::Ready(VersionTable::from_iter([(A, two)]));
+    let (old_failure, old_unknown) = (Readiness::Failed(failure), Readiness::Failed(unknown));
+    if unmoved {
+        // While the generation stands still, every answer is the one from before the cook.
+        assert_eq!(renamed, ready_text(one, "one"), "a cook alone does not change newest");
+        assert_eq!(table, old_table, "nor resolve");
+        assert_eq!(
+            stale, old_failure,
+            "a failure stays the answer after the index renamed its asset"
+        );
+        assert_eq!(stale_unknown, old_unknown, "and for an asset the index did not name before");
+    }
+    // Whether or not a reload of the store's own has ended: the answer from before the cook
+    // or the newly named version, and never `Pending` in between.
+    assert!(
+        renamed == ready_text(one, "one") || renamed == ready_text(two, "two"),
+        "newest of a renamed asset is its old version or its new one, got {renamed:?}"
+    );
+    assert!(
+        table == old_table || table == new_table,
+        "resolve of a renamed asset is its old table or its new one, got {table:?}"
+    );
+    assert!(
+        stale == old_failure || stale == ready_text(fixed, "fixed"),
+        "a renamed failure is the old failure or the new version, never pending, got {stale:?}"
+    );
+    assert_eq!(stale_at, Some(failure), "the failed version stays failed by exact version");
+    assert!(
+        stale_unknown == old_unknown || stale_unknown == ready_text(found, "found"),
+        "an unnamed asset is its old failure or its first version, got {stale_unknown:?}"
+    );
+    // Nobody asked for the newest D, so no store loads anything of it at a cook.
+    assert_eq!(lone_after, lone_before, "a cook changes no answer of an asset nobody asked for");
+    assert!(matches!(catalog.get(D, mended), Readiness::Pending), "and loads nothing of it");
+
+    catalog.request_newest(A, PRIORITY);
+    catalog.request_newest(B, PRIORITY);
+    catalog.request_newest(MISSING, PRIORITY);
+    harness.settle();
+    assert!(catalog.generation() > before, "the ends of the loads move the generation");
+    assert_eq!(newest_text(harness, A), ready_text(two, "two"));
+    assert_eq!(newest_text(harness, B), ready_text(fixed, "fixed"), "a later load's outcome");
+    assert_eq!(newest_text(harness, MISSING), ready_text(found, "found"));
+    assert_eq!(failure_of(catalog.get(B, bad)), Some(failure), "the failed version stays failed");
+
+    // A failure is replaced by a later failure too.
+    let first = publish(harness, C, corrupt_text());
+    let second = publish(harness, C, CookedAsset::new::<Text>(vec![0xC3], []));
+    assert_ne!(first, second);
+    let replaced = Some(failed(C, Some(second), ErrorKind::InvalidData));
+    assert_eq!(failure_of(catalog.newest(C)), replaced, "the last load to end");
+}
+
+/// A retry that fails again is a recorded failure like the first: the generation moves, so
+/// a caller that retries and waits for the generation to move never waits for ever.
+fn every_failed_retry_moves_the_generation<H: Harness>(harness: &H) {
+    let catalog = harness.catalog();
+    catalog.request_newest(MISSING, PRIORITY);
+    harness.settle();
+    let unknown = Some(failed(MISSING, None, ErrorKind::NotFound));
+    let first = catalog.generation();
+    catalog.request_newest(MISSING, PRIORITY);
+    harness.settle();
+    let second = catalog.generation();
+    assert!(second > first, "a repeated request for an asset the index does not name");
+    assert_eq!(failure_of(catalog.newest(MISSING)), unknown);
+
+    let bad = publish(harness, A, corrupt_text());
+    let failure = Some(failed(A, Some(bad), ErrorKind::InvalidData));
+    let failed_at = catalog.generation();
+    catalog.request_newest(A, PRIORITY);
+    harness.settle();
+    let retried = catalog.generation();
+    assert!(retried > failed_at, "a retry of the named version that fails again");
+    catalog.request(A, bad, PRIORITY);
+    harness.settle();
+    assert!(catalog.generation() > retried, "a retry by exact version that fails again");
+    assert_eq!(failure_of(catalog.newest(A)), failure);
+}
+
+/// A request by exact version for something already published does nothing, also when the
+/// index has come to name that version: only a request for the newest version makes an
+/// already published version current.
+fn an_exact_request_of_a_published_version_changes_nothing<H: Harness>(harness: &H) {
+    let catalog = harness.catalog();
+    let one = offer(harness, A, text("one"));
+    offer(harness, A, text("two"));
+    catalog.request(A, one, PRIORITY);
+    harness.settle();
+    assert_eq!(text_at(harness, A, one), Readiness::Ready("one".into()));
+    assert!(matches!(catalog.newest(A), Readiness::Pending), "the index named another version");
+
+    // The index comes back to the published version. Nobody has asked for the newest A.
+    assert_eq!(offer(harness, A, text("one")), one);
+    let before = catalog.generation();
+    catalog.request(A, one, PRIORITY);
+    harness.settle();
+    let newest = catalog.newest(A);
+    assert!(matches!(newest, Readiness::Pending), "an exact request of a published version");
+    assert_eq!(catalog.generation(), before, "moves nothing");
+
+    catalog.request_newest(A, PRIORITY);
+    harness.settle();
+    assert_eq!(newest_text(harness, A), ready_text(one, "one"), "request_newest makes it current");
+    assert!(catalog.generation() > before);
+}
+
+/// The end of a load of the version the index names is the asset's answer for `newest`,
+/// whoever asked for the load: the current version if it was published, its failure if it
+/// failed. The end of a load of any other version is an answer for `get` alone.
+fn the_end_of_a_load_answers_newest_whoever_asked<H: Harness>(harness: &H) {
+    let catalog = harness.catalog();
+    let good = offer(harness, A, text("alpha"));
+    let bad = offer(harness, B, corrupt_text());
+    offer(harness, C, text("gamma"));
+    let absent = text("never provided").version();
+    catalog.request(A, good, PRIORITY);
+    catalog.request(B, bad, PRIORITY);
+    catalog.request(C, absent, PRIORITY);
+    harness.settle();
+
+    assert_eq!(newest_text(harness, A), ready_text(good, "alpha"), "published while named");
+    let failure = Some(failed(B, Some(bad), ErrorKind::InvalidData));
+    assert_eq!(failure_of(catalog.newest(B)), failure, "failed by exact request while named");
+    let missing = Some(failed(C, Some(absent), ErrorKind::NotFound));
+    assert_eq!(failure_of(catalog.get(C, absent)), missing);
+    assert!(matches!(catalog.newest(C), Readiness::Pending), "a version the index does not name");
+}
+
+/// [`AssetId::NONE`] names no asset in any store: a request for it does nothing, and a
+/// lookup of it fails as a typed lookup through an empty reference does.
+fn the_empty_id_names_no_asset<H: Harness>(harness: &H) {
+    let catalog = harness.catalog();
+    let version = text("anything").version();
+    let before = catalog.generation();
+    catalog.request(AssetId::NONE, version, PRIORITY);
+    catalog.request_newest(AssetId::NONE, PRIORITY);
+    harness.settle();
+    let none = Some(failed(AssetId::NONE, None, ErrorKind::NotFound));
+    assert_eq!(failure_of(catalog.get(AssetId::NONE, version)), none, "get of the empty ID");
+    assert_eq!(failure_of(catalog.newest(AssetId::NONE)), none, "newest of the empty ID");
+    assert_eq!(catalog.generation(), before, "a request for the empty ID does nothing");
+}
+
+/// The three IDs of one scenario: two dependencies, the lower ID first, and the asset that
+/// declares them.
+fn scenario(name: &str) -> (AssetId, AssetId, AssetId) {
+    let id = |role: &str| AssetId::from_name(&format!("conformance/{name}/{role}"));
+    let (a, b) = (id("a"), id("b"));
+    (a.min(b), a.max(b), id("root"))
+}
+
+/// Which failure a load reports when several apply is the same in every store and in every
+/// order of requests, for an index that does not change while the load is in flight: the
+/// kind of its first dependency, in ascending [`AssetId`] order, that cannot be published,
+/// before anything of its own; and for a dependency cycle `InvalidData`, unless a failing
+/// dependency with a lower ID decides first.
+fn failures_follow_dependencies_in_id_order<H: Harness>(harness: &H) {
+    let catalog = harness.catalog();
+    let kind_of = |id: AssetId| failure_of(catalog.newest(id)).map(|failure| failure.kind);
+    let request = |ids: &[AssetId]| {
+        for &id in ids {
+            catalog.request_newest(id, PRIORITY);
+        }
+        harness.settle();
+    };
+
+    // Two failing dependencies: the lower ID's kind, whichever kind that is.
+    let (low, high, root) = scenario("corrupt-then-missing");
+    offer(harness, low, corrupt_text());
+    offer(harness, root, text_with("root", [low, high]));
+    request(&[root]);
+    assert_eq!(kind_of(root), Some(ErrorKind::InvalidData), "the lower dependency is corrupt");
+    let (low, high, root) = scenario("missing-then-corrupt");
+    offer(harness, high, corrupt_text());
+    offer(harness, root, text_with("root", [low, high]));
+    request(&[root]);
+    assert_eq!(kind_of(root), Some(ErrorKind::NotFound), "the lower dependency is missing");
+
+    // A dependency's failure comes before the dependant's own: corrupt bytes, and no loader.
+    let (missing, _, root) = scenario("corrupt-root");
+    offer(harness, root, CookedAsset::new::<Text>(vec![0xFF, 0xFE], [missing]));
+    request(&[root]);
+    assert_eq!(kind_of(root), Some(ErrorKind::NotFound), "before the dependant's own bytes");
+    let (missing, _, root) = scenario("unloadable-root");
+    let no_loader = AssetKind::from_name("conformance.unregistered");
+    let header = CookedHeader::new(no_loader, 1, [missing]);
+    offer(harness, root, CookedAsset { header, bytes: Vec::new() });
+    request(&[root]);
+    assert_eq!(kind_of(root), Some(ErrorKind::NotFound), "before the dependant's own loader");
+
+    // A cycle beside a missing dependency. With the missing one lower, it decides the
+    // root's kind and, through the root, the kind of the dependency that closes the cycle,
+    // in either order of requests.
+    for (name, root_first) in [("cycle-after-missing", true), ("cycle-after-missing-2", false)] {
+        let (low, high, root) = scenario(name);
+        offer(harness, high, text_with("back to the root", [root]));
+        offer(harness, root, text_with("root", [low, high]));
+        request(&if root_first { [root, high] } else { [high, root] });
+        assert_eq!(kind_of(root), Some(ErrorKind::NotFound), "{name}: the lower dependency");
+        assert_eq!(kind_of(high), Some(ErrorKind::NotFound), "{name}: through the root");
+    }
+    // With the dependency that closes the cycle lower, the cycle decides both.
+    for (name, root_first) in [("cycle-before-missing", true), ("cycle-before-missing-2", false)] {
+        let (low, high, root) = scenario(name);
+        offer(harness, low, text_with("back to the root", [root]));
+        offer(harness, root, text_with("root", [low, high]));
+        request(&if root_first { [root, low] } else { [low, root] });
+        assert_eq!(kind_of(root), Some(ErrorKind::InvalidData), "{name}: the cycle comes first");
+        assert_eq!(kind_of(low), Some(ErrorKind::InvalidData), "{name}: a member of the cycle");
+    }
 }

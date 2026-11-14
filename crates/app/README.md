@@ -588,7 +588,8 @@ root")
   replicated world first. `build_client` loses its `entity` parameter when
   `JoinAccepted::entity` lands (proposed with D122).
 - `Cooked` is replaced at milestone 3 by `lactose-asset`'s traits: `Cooked::baseline`
-  becomes a region-baseline asset read through the catalog by content hash, `Cooked::table`
+  becomes `lactose_asset::RegionBaseline::lookup(catalog, content_hash)` after a
+  `request_newest` of `RegionBaseline::id(content_hash)`, `Cooked::table`
   becomes `AssetCatalog::resolve` of the region's set, `Cooked::pin` becomes
   `PinnedTable::pin` over the published store. `load`, `build_server`, `build_client`,
   `Headless::start` and the fold change signature with it, listed then.

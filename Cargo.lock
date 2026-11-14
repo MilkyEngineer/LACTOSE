@@ -409,6 +409,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "lactose-asset"
+version = "0.0.0"
+dependencies = [
+ "lactose-asset-api",
+ "lactose-bundle",
+ "lactose-core",
+ "lactose-ecs",
+ "lactose-io",
+ "lactose-sim",
+ "lactose-task",
+ "tracing",
+ "zstd",
+]
+
+[[package]]
 name = "lactose-asset-api"
 version = "0.0.0"
 dependencies = [

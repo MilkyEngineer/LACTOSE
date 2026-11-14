@@ -63,7 +63,7 @@ pushed to. You never push and never open a pull request.
    with `--workspace` (this Mac has no Linux C cross-compiler, and `lactose-task`'s `zstd`
    dev-dependency builds C, so a workspace run fails for a reason no branch causes); a crate
    that depends on `zstd` normally, directly or through another crate (today `lactose-io`,
-   `lactose-persist` and so `lactose-app`), runs its cross-target clippy with `CC_<target>`
+   `lactose-asset`, `lactose-persist` and so `lactose-app`), runs its lints with `CC_<target>`
    and `AR_<target>` set to `"$(git rev-parse --show-toplevel)/tools/xtask/cross-lint/cc.sh"`
    and `.../ar.sh`, stand-ins that create empty objects and archives (clippy never links; the
    path must be absolute, because the cc crate runs the compiler from the build script's
