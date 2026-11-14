@@ -140,7 +140,7 @@ The lanes that follow, in the order their dependencies allow:
 | `ricotta` | The RICOTTA skeleton in `tools/cook`: inputs, processors behind `asset-api`'s traits, one pack out, the pack-set manifest or naming rule. One kind cooked end to end, chosen in its brief: `lactose-anim`'s kinds have cooked formats today, and no authored scene format exists for a baseline | `schema-digest` merged | A pack `ricotta` wrote mounts in SILO, and its assets load and pin. Cooking the same inputs twice writes the same bytes. Row 133's milestone 1 half | 7 |
 | `schema-guard` | A committed record of each saved type's version and layout digest, and the test that fails on a digest changed without a version bump and on a field ID reused | `schema-digest` merged | Section 15's "CI rejects ID reuse" becomes true: both mutations fail | 5 |
 | `scalar-probe` | The precision probe of decision 5.4, and the readings for row 41 | None | Result file `scalar-precision` | 4 |
-| `spike-rhi` | The RHI spike (decision 5.10), under MoltenVK on the M1 and under lavapipe on the linux-x64 runner | The GPU reviewer defined (approved by the owner, not yet in `.claude/agents/`); the Vulkan SDK on the development Mac, which the owner installs | Result file `spike-rhi`, a column for each driver | 5 |
+| `spike-rhi` | The RHI spike (decision 5.10), under MoltenVK on the M1 | The GPU reviewer defined (approved by the owner, not yet in `.claude/agents/`); the Vulkan SDK on the development Mac, which the owner installs | Result file `spike-rhi`, each "no" marked as MoltenVK's or as a design question | 4 |
 | `rhi-api` | Architect: the facade of `lactose-rhi-api`, unstable until the native Metal spike (D43), with its conformance suite's shape | `spike-rhi` merged; the owner's ruling on the move to milestone 2 (decision 5.10) | A facade; the reviewer and the GPU reviewer both read it | 7 |
 | `rhi-null` | `lactose-rhi-null` against the facade | `rhi-api` merged; revision 3.3's ruling on whether the server links it (C2) | The conformance suite passes on the null backend; it stays test support (`crate-tiers.toml`) | 7 |
 | `data-path` | A container's sections checked against each other and its header (finding D3). A zero-size field refused at registration (finding D4). The migrate, rebase and bundle sequence tested for a type the baseline carries (finding D5). The reading for row 42 | None | The review's three probes as tests | 7 |
@@ -154,7 +154,7 @@ scalar decision (3); the definition of the GPU reviewer and its review (2); the 
 (8). The coordinator's verification pass and its workflow pass are its own work.
 
 The whole is about 165 runs at two fix rounds a lane, and about 200 if a third of the lanes take
-four or five: 15 to finish the lanes in flight, 132 for the lanes above and 18 for the document
+four or five: 15 to finish the lanes in flight, 131 for the lanes above and 18 for the document
 work. Document rounds have run long too, and this plan's answer and revision 3.3's eighteen items
 are counted low. If the owner moves `rhi-api` and `rhi-null` to milestone 2 (decision 5.10),
 fourteen of these runs leave milestone 1.
@@ -169,7 +169,7 @@ unblocked.
 
 | Queue | Lanes, in order | Runs |
 |---|---|---|
-| 1, the ECS and then render | `scalar-probe`, `ecs-a`, `ecs-kernel`, `ecs-fork`, `spike-rhi`, `rhi-api`, `rhi-null`, `keeper`, `readme-sweep` | 52 |
+| 1, the ECS and then render | `scalar-probe`, `ecs-a`, `ecs-kernel`, `ecs-fork`, `spike-rhi`, `rhi-api`, `rhi-null`, `keeper`, `readme-sweep` | 51 |
 | 2, the client and then the save path | `client-fix`, `sour-evidence`, `spike-net`, `stream-impl`, `data-path`, `binds-design`, `binds-impl` | 49 |
 | 3, assets and tools | `silo`, `stream-design`, `xtask-policy`, `measure`, `schema-digest`, `ricotta`, `schema-guard` | 46 |
 
@@ -208,8 +208,8 @@ Five rules bind whatever the coordinator reorders:
 - `xtask-policy` moves ahead of the second architect round and of the data-path lane, because
   `measure` waits on it.
 - The render lanes start when queue 1 is free of the ECS, not after everything else. They are a
-  chain of nineteen runs with three outside prerequisites, and nothing else depends on them. The
-  spike is five of the nineteen; the owner is asked whether the other fourteen move to milestone 2
+  chain of eighteen runs with three outside prerequisites, and nothing else depends on them. The
+  spike is four of the eighteen; the owner is asked whether the other fourteen move to milestone 2
   (decision 5.10).
 
 **The coordinator's passes.**
@@ -220,8 +220,8 @@ Five rules bind whatever the coordinator reorders:
   `ci.yml` rewritten; a step in the nightly SOUR jobs that prints the runner's CPU model and
   feature flags (decision 5.7); the nightly Miri job split per crate. That job took 38 to 57
   minutes of its 60 in the eight green nightlies of 5 to 13 November, and `ecs-kernel` and
-  `ecs-fork` add tests to it. Two manually dispatched jobs follow their lanes: `measure`'s short
-  run on the linux-x64 and windows-x64 runners, and `spike-rhi`'s run under lavapipe.
+  `ecs-fork` add tests to it. One manually dispatched job follows its lane: `measure`'s short run
+  on the linux-x64 and windows-x64 runners.
 - Two things for the owner: the commands of session A, now; and the draft of the upstream
   `sin_cos` report, which the owner files (row 102).
 
@@ -445,19 +445,19 @@ the mitigation as a proposal before milestone 1 exits. Section 18's own fallback
 **5.10 The RHI spike is milestone 1's; whether `rhi-api`'s facade and `rhi-null` follow it there is
 the owner's question.** The spike's question: what must `rhi-api` expose for section 12.1's list to
 run on Vulkan 1.3 with no call a null backend cannot honour? Its evidence is a throwaway `ash`
-program, headless and never a workspace member. It walks the list: a device and queues, a buffer
-with a device address, one bindless heap, a pipeline from precompiled SPIR-V with a specialisation
-constant, a pipeline cache saved and reloaded, encoders recorded on two threads, a pass with a
-transient attachment and a local read, a timeline semaphore, an indexed indirect draw, and a
-readback of the triangle. Its result file records, for each item, the feature or extension used,
-whether the driver reports it, the state the caller carried between calls (which is what a null
-backend must keep), and what needed external synchronisation. It runs twice. On the M1 under
-MoltenVK it shows the Apple interim path. Under lavapipe on the linux-x64 runner it shows a
-conformant Vulkan 1.3, so that a "no" under MoltenVK, which has a row of its own (row 15), is not
-read as a "no" of the design. Only main is pushed. So for the runner's run the default is that the
-program is checked in beside its result file as a standalone crate outside the workspace, built by
-a manually dispatched job, and removed with that job once the file holds both columns; the lane's
-brief settles it within those two limits. The desktop's GPU is `rhi-vulkan`'s at milestone 2.
+program, headless, on the M1 under MoltenVK. It is never checked in, inside the workspace or
+outside it: `unsafe` stays in the crates of section 21. It walks the list: a device and queues, a
+buffer with a device address, one bindless heap, a pipeline from precompiled SPIR-V with a
+specialisation constant, a pipeline cache saved and reloaded, encoders recorded on two threads, a
+pass with a transient attachment and a local read, a timeline semaphore, an indexed indirect draw,
+and a readback of the triangle. Its result file records, for each item, the feature or extension
+used, whether MoltenVK reports it, the state the caller carried between calls (which is what a null
+backend must keep), and what needed external synchronisation. MoltenVK translates Vulkan to Metal
+and has a row of its own (row 15), so a "no" from it is not yet a "no" of the design. The result
+file marks each "no" as MoltenVK's, judged against MoltenVK's published limits and the
+feature's Vulkan requirement, or as a design question. The conformant reference run, the same list
+under lavapipe, moves to milestone 2 with the Vulkan backend's first Linux job, and settles the
+design questions. The desktop's GPU is `rhi-vulkan`'s at milestone 2 too.
 
 Section 22 delivers `lactose-rhi-null` in milestone 1 and `lactose-rhi-api` in milestone 2, and the
 first implements the second. As written, then, the facade is a milestone 1 delivery, unstable until
@@ -466,7 +466,7 @@ milestone 1. The alternative moves both to milestone 2, behind its MoltenVK, Kos
 Metal spikes, so the facade is written once with every spike's result and the null backend once
 against it. This plan recommends the move. Section 20 freezes an `-api` on its first real backend,
 and a null backend honours any surface, so the pair proves nothing in milestone 1. The move takes
-no run out of the project. Fourteen leave milestone 1, about 165 becoming about 151, and arrive in
+no run out of the project. Fourteen leave milestone 1, about 165 becoming about 150, and arrive in
 milestone 2, less what a facade written before the Metal spike risks: an amendment round of about
 four runs and a rework of the null backend of about three. It takes revision 3.3's ruling on C2 off
 milestone 1's path. It needs revision 3.3, since section 22 names `rhi-null` in milestone 1. What
@@ -603,12 +603,14 @@ The coordinator allocates the numbers at merge. D137 is reserved for `ecs-a`.
   - *Edit-to-playing at milestone 1 is measured on the headless binary's sketch game*, by an edit
     in the binary's crate and an edit in `lactose-app`, read against the slower. Section 22.1's
     build-time mitigation is decided only if that floor is over thirty seconds.
-  - *The RHI spike is milestone 1's: a throwaway program that walks section 12.1's list under
-    MoltenVK on the M1 and under lavapipe on the linux-x64 runner.* `lactose-rhi-api`'s facade and
-    `lactose-rhi-null` move to milestone 2, behind its MoltenVK, KosmicKrisp and native Metal
-    spikes, so the facade is written once with every spike's result; the next revision moves
-    `rhi-null` in section 22. Rules out a facade and a null backend with no consumer, written
-    before the spikes that amend them.
+  - *The RHI spike is milestone 1's: a throwaway program, never checked in, that walks section
+    12.1's list under MoltenVK on the M1.* Its result file marks each "no" as MoltenVK's or as a
+    design question, and the conformant reference run under lavapipe is milestone 2's, with the
+    Vulkan backend's first Linux job. `lactose-rhi-api`'s facade and `lactose-rhi-null` move to
+    milestone 2, behind its MoltenVK, KosmicKrisp and native Metal spikes, so the facade is
+    written once with every spike's result; the next revision moves `rhi-null` in section 22.
+    Rules out a facade and a null backend with no consumer, written before the spikes that amend
+    them, and FFI code outside section 21's crates.
   - *A measurement that proves a criterion is a file under `docs/results`* with its machine,
     date, commit, topology and load, written by `cargo xtask measure`.
   - *Re-gated*: the physics phase's stall on render recording to milestone 2; how a re-spawned
@@ -628,9 +630,12 @@ The entry's RHI bullet is written for the recommended answer to the owner's ques
 owner keeps the facade and the null backend in milestone 1, the bullet is this instead:
 
 ```
-  - *The RHI spike is milestone 1's: a throwaway program that walks section 12.1's list under
-    MoltenVK on the M1 and under lavapipe on the linux-x64 runner.* `lactose-rhi-api`'s facade is
-    written in milestone 1, unstable (D43), since `lactose-rhi-null` implements it.
+  - *The RHI spike is milestone 1's: a throwaway program, never checked in, that walks section
+    12.1's list under MoltenVK on the M1.* Its result file marks each "no" as MoltenVK's or as a
+    design question, and the conformant reference run under lavapipe is milestone 2's, with the
+    Vulkan backend's first Linux job. `lactose-rhi-api`'s facade is written in milestone 1,
+    unstable (D43), since `lactose-rhi-null` implements it. Rules out FFI code outside section
+    21's crates.
 ```
 
 ### Verification rows
@@ -687,6 +692,7 @@ Measured on eight performance cores in session B; the M1's projection of decisio
 | A prediction world holds at most 64 fixed colliders and proxies together as rows (D-next+1): with Rapier a slot's take reaches the 100 µs budget near 100 fixed colliders beside fifty bodies and its restore near 75, and a kinematic proxy is serialised as a fixed collider is. `physics-api`'s snapshot carries the backend's whole world (architecture section 10, D119); design with streaming how cooked static scenery reaches the prediction world's solver outside the per-tick snapshot, and what enforces the bound until then | 3 |
 | The netcode spike's recorded streams (D-next+1): `crates/app/tests/spike.rs` records both worlds' hashes each tick and a hash of every packet either end sends under SOUR, over a seeded link that delays below a tick and reorders within one, and a scripted client clock that drifts, wakes late and steps. The nightly architecture mode compares them across linux-x64, windows-x64 and macos-arm64. Equal bytes on every platform are what stands for "x86 server, aarch64 client" in section 22; a difference is a finding and calls for a run across two machines | 1 |
 | Section 22's milestone 1 timing criteria are proven by result files under `docs/results`, written by `cargo xtask measure` on a quiet Apple M1 and on the owner's x86 desktop at one commit (`docs/plans/milestone-1.md`, section 4). Criterion 1 is proven by the desktop's run on eight performance cores; on the M1 a projection from a one-worker and a four-worker run steers (D-next+1). Edit-to-playing is measured on the headless binary's sketch game, by an edit in the binary's crate and one in `lactose-app`; section 22.1's build-time mitigation is decided only if it is over thirty seconds, and asked again at milestone 5 | 1 |
+| The RHI spike ran under MoltenVK alone (D-next+1): its result file marks each "no" as MoltenVK's, against MoltenVK's published limits and the feature's Vulkan requirement, or as a design question. Run the same list of architecture section 12.1 under lavapipe with `rhi-vulkan`'s first Linux job, as the conformant reference, and settle each design question from it | 2 |
 | The nightly Miri job took 38 to 57 minutes of its 60-minute limit in the eight green nightlies of 5 to 13 November 2026, before the ECS hot-path work added tests, and a timeout also drops the two weak-memory steps after `lactose-ecs`. Split the job per crate before the parallel ECS runner merges | 1 |
 ```
 
