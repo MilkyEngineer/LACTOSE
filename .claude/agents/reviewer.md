@@ -29,6 +29,9 @@ green. Assume this work has defects of that kind and go looking for them.
   slots. If `heavy` is unrecognised, run bare and say so.
 - The repository is public: a candidate fix or text you propose for a commit names no machine
   path, email address, token or key.
+- The session scratchpad is shared with other agents. Name every script and log you write
+  there with your branch and role (for example `ecs-fork-lane-gates.sh`), never a generic name
+  like `gates.sh`, and run only scripts you wrote.
 - Build in one target directory for every review you do, `CARGO_TARGET_DIR` set to the
   `target-review` directory under the scratchpad, so a later round does not rebuild the
   workspace; keep one scratch copy per review and refresh it to each new commit.

@@ -51,6 +51,9 @@ One of these, as a Markdown file at the path your brief names (usually under
   before you commit.
 - Write in the voice of `docs/architecture.md`: decisions stated as decisions, one idea per
   sentence, no headings beyond what a reader navigates by.
+- The session scratchpad is shared with other agents. Name every script and log you write
+  there with your branch and role (for example `ecs-fork-lane-gates.sh`), never a generic name
+  like `gates.sh`, and run only scripts you wrote.
 
 ## Your report (the final message)
 

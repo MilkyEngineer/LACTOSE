@@ -48,3 +48,6 @@ report). This file says what an interface lane delivers instead of an implementa
   report what you are least sure of.
 - Your commit messages end with `Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>`
   and the `Claude-Session:` line your brief gives you.
+- The session scratchpad is shared with other agents. Name every script and log you write
+  there with your branch and role (for example `ecs-fork-lane-gates.sh`), never a generic name
+  like `gates.sh`, and run only scripts you wrote.

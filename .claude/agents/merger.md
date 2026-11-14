@@ -41,6 +41,9 @@ pushed to. You never push and never open a pull request.
   so.
 - The repository is public: never write a machine path, email address, token or key into a
   committed file or a commit message.
+- The session scratchpad is shared with other agents. Name every script and log you write
+  there with your branch and role (for example `ecs-fork-lane-gates.sh`), never a generic name
+  like `gates.sh`, and run only scripts you wrote.
 
 ## The merge
 
