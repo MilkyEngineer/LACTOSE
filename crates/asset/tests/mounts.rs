@@ -83,21 +83,28 @@ fn a_failed_and_a_dropped_mount_leave_their_place_empty_and_change_nothing() {
     let first_path = env.pack(&[(x, first.clone())], Storage::Raw);
     let second_path = env.pack(&[(x, second.clone())], Storage::Raw);
     let (loaders, _) = test_loaders();
-    let store = env.store(loaders);
-    env.mount(&store, first_path).unwrap();
-    store.request_newest(x, NOW);
-    env.settle(&store);
-    let generation = store.generation();
-
-    let missing = env.mount(&store, env.dir.join("no such pack")).unwrap_err();
-    assert_eq!(missing.kind(), ErrorKind::NotFound);
+    // Held until both dropped mounts are gone, so the one polled once is dropped with its
+    // open still queued: a pool fast enough to finish the open and both reads within that
+    // poll would resolve it there and mount the pack.
+    let (store, pool) = env.held_store(loaders);
+    // Places 0 to 3, taken at the calls; nothing is opened before a mount's first poll.
+    let mounted = store.mount(first_path);
+    let missing = store.mount(env.dir.join("no such pack"));
     drop(store.mount(second_path.clone()));
-    // Polled once, then dropped: its open may have started.
     {
         let mut mount = pin!(store.mount(second_path));
         let poll = mount.as_mut().poll(&mut Context::from_waker(Waker::noop()));
-        assert!(poll.is_pending(), "a mount resolves no sooner than its reads");
+        assert!(poll.is_pending(), "the open is queued on the held pool");
     }
+    pool.release();
+    env.wait(mounted).unwrap();
+    store.request_newest(x, NOW);
+    env.settle(&store);
+    assert_eq!(newest_version(&store, x), Readiness::Ready(first.version()));
+    let generation = store.generation();
+
+    let missing = env.wait(missing).unwrap_err();
+    assert_eq!(missing.kind(), ErrorKind::NotFound);
     env.settle(&store);
     assert_eq!(store.generation(), generation);
     store.request_newest(x, NOW);
