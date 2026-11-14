@@ -9,6 +9,7 @@
 //! Cheap per span: no allocation once a label has been seen, one lock where a span is
 //! created and one where it closes; the label's text is built only by `take`.
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
@@ -87,23 +88,17 @@ impl Spans {
     }
 }
 
-/// The spans each thread is inside: a stack per thread, since a span is entered and
-/// exited on one thread.
-#[expect(clippy::disallowed_types, reason = "test code timing the step from outside")]
-mod entered {
-    use std::cell::RefCell;
-    use std::time::Duration;
+thread_local! {
+    /// The spans this thread is inside, innermost last (a span is entered and exited on one
+    /// thread): each one's label, and when it was entered, or `None` when it is inside a span
+    /// of its own label and is not counted.
+    #[expect(clippy::disallowed_types, reason = "test code timing the step from outside")]
+    static ENTERED: RefCell<Vec<(usize, Option<Duration>)>> = const { RefCell::new(Vec::new()) };
+}
 
-    thread_local! {
-        /// Innermost last: each span's label, and when it was entered, or `None` when it is
-        /// inside a span of its own label and is not counted.
-        static ENTERED: RefCell<Vec<(usize, Option<Duration>)>> =
-            const { RefCell::new(Vec::new()) };
-    }
-
-    pub fn with<R>(f: impl FnOnce(&mut Vec<(usize, Option<Duration>)>) -> R) -> R {
-        ENTERED.with_borrow_mut(f)
-    }
+/// This thread's entered spans.
+fn entered<R>(f: impl FnOnce(&mut Vec<(usize, Option<Duration>)>) -> R) -> R {
+    ENTERED.with_borrow_mut(f)
 }
 
 /// The `casein` span's `name` or `stage` field, interned.
@@ -167,7 +162,7 @@ impl Subscriber for &'static Spans {
 
     fn enter(&self, span: &Id) {
         let index = (span.into_u64() - 1) as usize;
-        entered::with(|entered| {
+        entered(|entered| {
             let nested = entered.iter().any(|&(outer, _)| outer == index);
             entered.push((index, (!nested).then(clock)));
         });
@@ -176,7 +171,7 @@ impl Subscriber for &'static Spans {
     fn exit(&self, span: &Id) {
         let now = clock();
         let index = (span.into_u64() - 1) as usize;
-        let Some(entered) = entered::with(|entered| {
+        let Some(entered) = entered(|entered| {
             let at = entered.iter().rposition(|&(open, _)| open == index)?;
             entered.remove(at).1
         }) else {
