@@ -350,14 +350,20 @@ impl<'r> UnitColumn<'r> for NoColumn {
 #[doc(hidden)]
 pub struct SinkColumn<P>(pub(crate) usize, PhantomData<fn() -> P>);
 
+/// Panics unless parameter `index`'s table entry is `P`'s own, kind and target. What the run
+/// prepared for an entry (a sink, an event list, a channel's entries, a resource) is found
+/// by the entry, so the kind tells an event sink from a presentation one and the target one
+/// event, channel or resource type from another.
+pub(crate) fn expect_access<P: SystemParam>(unit: &Unit<'_>, index: usize) {
+    let access = unit.access(index);
+    if access.kind() != P::ACCESS.kind() || access.target() != P::ACCESS.target() {
+        mismatch(index);
+    }
+}
+
 impl<'r, P: SystemParam> UnitColumn<'r> for SinkColumn<P> {
     fn take(unit: &mut Unit<'r>, index: usize) -> Self {
-        // The sinks are made per table entry, so the entry must be `P`'s own: its kind
-        // tells an event sink from a presentation one, its target one event type from another.
-        let access = unit.access(index);
-        if access.kind() != P::ACCESS.kind() || access.target() != P::ACCESS.target() {
-            mismatch(index);
-        }
+        expect_access::<P>(unit, index);
         Self(index, PhantomData)
     }
 }

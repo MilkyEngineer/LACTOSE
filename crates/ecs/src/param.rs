@@ -1,6 +1,7 @@
 //! System parameters: the types a `#[system]` function takes, each declaring the access it
 //! needs (architecture section 6.1).
 
+use core::any::TypeId;
 use core::marker::PhantomData;
 use core::ops::{Deref, DerefMut};
 
@@ -10,8 +11,7 @@ use lactose_reflect::{Component, Resource};
 use lactose_task::JobContext;
 
 use crate::access::{
-    Access, AccessKind, AccessTarget, component_target, no_target, region_resource_target,
-    resource_target,
+    Access, AccessKind, component_target, no_target, region_resource_target, resource_target,
 };
 use crate::change::Stamp;
 use crate::region::RegionId;
@@ -20,6 +20,7 @@ use crate::storage::{RowView, typed, typed_mut};
 use crate::system::{Fetch, Invocation, Slot, mismatch};
 use crate::unit::{
     MutColumn, NeverColumn, NoColumn, ReadColumn, RegionResColumn, Row, RowFetch, Unit, UnitColumn,
+    expect_access,
 };
 use crate::world::World;
 
@@ -538,14 +539,12 @@ pub struct ResColumn<'r, T: ?Sized> {
 
 impl<'r, T: ?Sized + 'static> UnitColumn<'r> for ResColumn<'r, T> {
     fn take(unit: &mut Unit<'r>, index: usize) -> Self {
-        let AccessTarget::Resource { type_id, .. } = unit.access(index).target() else {
-            mismatch(index)
-        };
+        expect_access::<Res<'static, T>>(unit, index);
         let (_, value) = unit
             .env()
             .resources
             .iter()
-            .find(|(id, _)| *id == type_id)
+            .find(|(id, _)| *id == TypeId::of::<T>())
             .expect("a resource the schedule checked is held for the system's run");
         Self { value: resource_ref(*value) }
     }

@@ -48,17 +48,19 @@ the invoking crate keeps `#![forbid(unsafe_code)]` (section 21, as for `#[compon
 `tests/compile_fail.rs` compiles every kind of system in such a crate.
 
 Today a table that disagrees with its entry point cannot cause undefined behaviour: each
-parameter is fetched from a value prepared for its index by safe code, and a mismatch is a
-panic ("parameter N does not match the system's access table"). For `Kernel::each` the
-value is what the run lent the unit for that index, and each parameter checks the table
-entry it takes, once per unit: a column parameter that its entry names the same component
-(and the lent bytes are exactly the unit's rows of that type), a `RegionRes` that its entry
-is that region resource, an output sink (an event, presentation or channel writer, or
-`Commands`) that its entry is its own parameter type's, kind and target. So
-`tests/obligation.rs`'s kernels that take a lent column as another component, a region
-resource as another, or a lent event sink as another event type's, panic before they read
-a row. The obligation exists for the parallel implementation, which will hand out rows to
-concurrent jobs by the table.
+parameter is fetched from a value prepared for its index by safe code, through a checked
+cast or downcast. For `Kernel::each` each parameter checks, once per unit, that the table
+entry it takes is its own: a column parameter that its entry names the same component (and
+the lent bytes are exactly the unit's rows of that type), a `RegionRes` that its entry is
+that region resource, and every other parameter the run prepares something for (an output
+sink, `Res`, `Events`, `Channel`) that its entry is its own parameter type's, kind and
+target. A mismatch is a panic ("parameter N does not match the system's access table")
+before the kernel reads a row; `tests/obligation.rs` holds a kernel for each of those
+kinds. `Kernel::run` checks only the kind of each prepared value: a parameter of another
+kind panics with the same message, but one of the right kind and another type reads the
+declared value as its own wherever the cast or downcast allows it, as an empty event list
+or channel, or a region resource of the same size. The obligation exists for the parallel
+implementation, which will hand out rows to concurrent jobs by the table.
 
 The rule for forking per-entity runs over workers: lending stays per table entry, with
 checked casts of the bytes lent for that entry, as today. A kernel whose code disagrees

@@ -50,7 +50,8 @@ pub trait GraphNode: Send + Sync + 'static {
     ///
     /// Reductions merge their partial results here. `run` is called a scheduling-dependent
     /// number of times over scheduling-dependent ranges, so a node keeps one partial per
-    /// unit, in storage sized at `units()`, and merges them here in unit order.
+    /// unit, in storage sized at `units()`, and merges them here with a combiner whose result
+    /// does not depend on their order.
     fn finalize(&self, ctx: &mut JobContext<'_>) {
         let _ = ctx;
     }

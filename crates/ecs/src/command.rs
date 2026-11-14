@@ -7,11 +7,11 @@ use core::marker::PhantomData;
 use lactose_core::{ComponentKey, EntityRef, FieldId, FixedHashMap, StableKey};
 use lactose_reflect::{AssetReference, Component, ReferenceVisitor, Reflect, TypeInfo};
 
-use crate::access::{Access, AccessKind, AccessTarget, channel_target, no_target};
+use crate::access::{Access, AccessKind, channel_target, no_target};
 use crate::param::{SystemParam, sealed};
 use crate::region::{InRegion, PredictedOrigin, RegionId};
 use crate::system::{Fetch, Invocation, Slot, mismatch};
-use crate::unit::{NeverColumn, Row, RowFetch, SinkColumn, Unit, UnitColumn};
+use crate::unit::{NeverColumn, Row, RowFetch, SinkColumn, Unit, UnitColumn, expect_access};
 
 /// A set of components spawned together: a tuple of one to eight [`Component`]s, each of
 /// a different type. One component is spelled `(Bomb { fuse: 180 },)`.
@@ -552,10 +552,8 @@ pub struct ChannelColumn<'r, C: CommandChannel> {
 
 impl<'r, C: CommandChannel> UnitColumn<'r> for ChannelColumn<'r, C> {
     fn take(unit: &mut Unit<'r>, index: usize) -> Self {
-        let AccessTarget::Channel { type_id, .. } = unit.access(index).target() else {
-            mismatch(index)
-        };
-        let entries = unit.env().channels.get(&type_id).map_or(&[][..], |stored| {
+        expect_access::<Channel<'static, C>>(unit, index);
+        let entries = unit.env().channels.get(&TypeId::of::<C>()).map_or(&[][..], |stored| {
             stored
                 .entries
                 .downcast_ref::<Vec<ChannelEntry<C>>>()
