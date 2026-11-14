@@ -1050,9 +1050,9 @@ impl<'a> Step<'a> {
     /// of the generation, and queues what waited for it. A load that reads again from a
     /// newer source with the same header does not end. One whose newer source has another
     /// header (another kind or dependency list: damage the version's hash caught) ends,
-    /// and if it was the followed asset's named version, the newest is asked for again at
-    /// once, as rule 2 asks: a load of the newer entry, keeping the ended load's place for
-    /// `Settled`, accepted before what waited for it looks again.
+    /// and is renewed at once whatever asked for it, as rule 2 asks: a load of the newer
+    /// entry at the ended load's priority, keeping its place for `Settled`, accepted
+    /// before what waited for it looks again.
     fn end(&mut self, key: Key, ending: Ending) {
         let renewed = match self.newer_source(key, &ending) {
             None => None,
@@ -1062,12 +1062,7 @@ impl<'a> Step<'a> {
                 self.read_again(key, source);
                 return;
             }
-            Some(source) => {
-                let load = &self.state.loads[&key];
-                let followed = self.state.assets.get(&load.id).is_some_and(|asset| asset.followed);
-                let named = self.state.named_version(load.id) == Some(load.version);
-                (followed && named).then_some(source)
-            }
+            Some(source) => Some((source, self.state.loads[&key].trace.priority())),
         };
         let load = self.state.loads.remove(&key).expect("an ending load is in flight");
         let Load { id, version, source, own, seq, task, trace, .. } = load;
@@ -1120,8 +1115,8 @@ impl<'a> Step<'a> {
         }
         self.effects.dropped.push(Box::new(source));
         self.effects.traces.push(Trace::Failure { load: trace, failure, dependency, message });
-        if let Some(source) = renewed {
-            self.accept(source, LoadPriority::default(), "mount", Some(seq));
+        if let Some((source, priority)) = renewed {
+            self.accept(source, priority, "renew", Some(seq));
             self.ask_dependencies();
         }
         self.touch(id);

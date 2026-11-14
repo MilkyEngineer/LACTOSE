@@ -177,8 +177,9 @@ impl Store {
     /// that finds something to load, the loads of its dependencies with it, and the
     /// requests a mount makes when it resolves. The future waits for no load accepted
     /// after its first poll, except as a load accepted before waits for one (a dependency
-    /// that a later mount renamed); a load that reads again from a newer source is still
-    /// the load it was. Every accepted load ends, also when the executor or
+    /// that a later mount renamed), and a load renewed from a newer pack's entry with
+    /// another header, which takes the ended load's place; a load that reads again from a
+    /// newer source is still the load it was. Every accepted load ends, also when the executor or
     /// the pool has stopped (it then fails with `Cancelled`), so the future always
     /// resolves. It is the store's one wait, for tools, tests and a start-up that must not
     /// step before its content is in: a frame loop watches `AssetCatalog::generation`

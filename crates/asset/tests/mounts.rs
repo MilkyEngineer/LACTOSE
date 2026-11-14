@@ -564,6 +564,224 @@ fn a_newer_source_with_another_dependency_ends_the_load_and_asks_again() {
     assert_eq!(answer, Readiness::Ready(version));
 }
 
+/// A pack of `assets` whose entry for `a` claims `version`, the version of another header:
+/// damage the version's hash catches.
+fn claiming(assets: &[(AssetId, CookedAsset)], a: AssetId, version: AssetVersion) -> Vec<u8> {
+    let mut bytes = pack(assets, Storage::Raw);
+    let entry = entry_at(&bytes, assets.iter().position(|(id, _)| *id == a).unwrap());
+    bytes[entry + 8..entry + 16].copy_from_slice(&version.to_bits().to_le_bytes());
+    reseal(&mut bytes);
+    bytes
+}
+
+fn sorted(mut assets: Vec<(AssetId, CookedAsset)>) -> Vec<(AssetId, CookedAsset)> {
+    assets.sort_by_key(|(id, _)| *id);
+    assets
+}
+
+fn version_of(assets: &[(AssetId, CookedAsset)], a: AssetId) -> AssetVersion {
+    assets.iter().find(|(id, _)| *id == a).unwrap().1.version()
+}
+
+fn pending<F: Future>(future: std::pin::Pin<&mut F>) -> bool {
+    future.poll(&mut Context::from_waker(Waker::noop())).is_pending()
+}
+
+/// Rule 2 onto another header renews the load whatever asked for it: a version requested
+/// by exact version alone, not followed, is published as a store new to the process
+/// publishes it, by a load of cause `"renew"` at the request's priority.
+#[test]
+fn an_exact_request_onto_another_header_is_renewed() {
+    let capture = capture();
+    // The held call keeps one background worker; the damaged load's own steps need another.
+    let env = Env::with_background_workers("mounts_renew_exact", 2);
+    let (loaders, gate) = test_loaders();
+    let store = env.store(loaders);
+    let (held, a, extra) = (id("held"), id("asked by exact version"), id("extra"));
+    let assets = sorted(vec![
+        (held, gated(b"hold", [])),
+        (a, text(b"payload", [held, extra])),
+        (extra, text(b"extra", [])),
+    ]);
+    let version = version_of(&assets, a);
+    let damaged = sorted(vec![
+        (held, gated(b"hold", [])),
+        (a, text(b"payload", [held])),
+        (extra, text(b"extra", [])),
+    ]);
+    let first = env.write(claiming(&damaged, a, version));
+    let second = env.pack(&assets, Storage::Raw);
+    let priority = LoadPriority(3);
+    let fresh = {
+        let (loaders, gate) = test_loaders();
+        gate.open_all();
+        let fresh = env.store(loaders);
+        env.mount(&fresh, first.clone()).unwrap();
+        env.mount(&fresh, second.clone()).unwrap();
+        fresh.request(a, version, priority);
+        env.settle(&fresh);
+        fresh.get(a, version).map(|handle| handle.version())
+    };
+    assert_eq!(fresh, Readiness::Ready(version));
+
+    env.mount(&store, first).unwrap();
+    gate.hold(b"hold");
+    store.request(a, version, priority);
+    gate.wait_entered(b"hold");
+    env.mount(&store, second).unwrap();
+    let from = capture.span_count();
+    gate.open(b"hold");
+    env.settle(&store);
+    assert_eq!(store.get(a, version).map(|handle| handle.version()), fresh);
+    let renewals: Vec<_> = capture
+        .named(from, "silo.load")
+        .into_iter()
+        .filter(|(_, span)| span.field("cause") == Some("renew"))
+        .collect();
+    assert_eq!(renewals.len(), 1, "one renewal");
+    assert_eq!(renewals[0].1.field("priority"), Some("3"), "at the request's priority");
+    env.shutdown();
+}
+
+/// A dependant of a renewed version waits through the renewal, `Pending` while the ended
+/// load's failure is the version's answer, and is published as a store new to the process
+/// publishes it; a wait first polled before covers the renewal.
+#[test]
+fn a_dependant_waits_through_the_renewal() {
+    // Two held calls at once at most, and a load's own steps beside them.
+    let env = Env::with_background_workers("mounts_renew_dependant", 3);
+    let (loaders, gate) = test_loaders();
+    let store = env.store(loaders);
+    let (held, a, extra, d) = (id("held"), id("renewed"), id("extra"), id("dependant"));
+    let assets = sorted(vec![
+        (held, gated(b"hold", [])),
+        (a, text(b"payload", [held, extra])),
+        (extra, gated(b"extra", [])),
+        (d, text(b"dependant", [a])),
+    ]);
+    let damaged = sorted(vec![
+        (held, gated(b"hold", [])),
+        (a, text(b"payload", [held])),
+        (extra, gated(b"extra", [])),
+        (d, text(b"dependant", [a])),
+    ]);
+    let first = env.write(claiming(&damaged, a, version_of(&assets, a)));
+    let second = env.pack(&assets, Storage::Raw);
+    let expected = fresh(&env, &[first.clone(), second.clone()], d);
+    assert_eq!(expected, Readiness::Ready(version_of(&assets, d)));
+
+    env.mount(&store, first).unwrap();
+    gate.hold(b"hold");
+    gate.hold(b"extra");
+    store.request_newest(d, NOW);
+    gate.wait_entered(b"hold");
+    env.mount(&store, second).unwrap();
+    let mut settled = pin!(store.settled());
+    assert!(pending(settled.as_mut()));
+    gate.open(b"hold");
+    // The renewal asks for `extra`, which only the intact header declares.
+    gate.wait_entered(b"extra");
+    assert!(matches!(store.newest(a), Readiness::Failed(_)), "the ended load's failure");
+    assert_eq!(newest_version(&store, d), Readiness::Pending, "the dependant waits");
+    assert!(pending(settled.as_mut()), "the wait covers the renewal");
+    gate.open(b"extra");
+    env.wait(settled);
+    assert_eq!(newest_version(&store, d), expected);
+    env.shutdown();
+}
+
+/// Two loads renewed in one step each keep their own place: a wait first polled before
+/// both resolves only once both renewals have ended.
+#[test]
+fn two_renewals_in_one_step_each_keep_their_place() {
+    // Two held calls at once at most, and a load's own steps beside them.
+    let env = Env::with_background_workers("mounts_renew_two", 3);
+    let (loaders, gate) = test_loaders();
+    let store = env.store(loaders);
+    let (held, a1, a2, x1, x2) = (id("held"), id("a1"), id("a2"), id("x1"), id("x2"));
+    let make = |one: Vec<AssetId>, two: Vec<AssetId>| {
+        sorted(vec![
+            (held, gated(b"hold", [])),
+            (a1, text(b"one", one)),
+            (a2, text(b"two", two)),
+            (x1, gated(b"x1", [])),
+            (x2, gated(b"x2", [])),
+        ])
+    };
+    let assets = make(vec![held, x1], vec![held, x2]);
+    let (v1, v2) = (version_of(&assets, a1), version_of(&assets, a2));
+    let damaged = make(vec![held], vec![held]);
+    let mut bytes = claiming(&damaged, a1, v1);
+    let entry = entry_at(&bytes, damaged.iter().position(|(id, _)| *id == a2).unwrap());
+    bytes[entry + 8..entry + 16].copy_from_slice(&v2.to_bits().to_le_bytes());
+    reseal(&mut bytes);
+    let first = env.write(bytes);
+    let second = env.pack(&assets, Storage::Raw);
+
+    env.mount(&store, first).unwrap();
+    for held in [&b"hold"[..], b"x1", b"x2"] {
+        gate.hold(held);
+    }
+    store.request_newest(a1, NOW);
+    store.request_newest(a2, NOW);
+    gate.wait_entered(b"hold");
+    env.mount(&store, second).unwrap();
+    let mut settled = pin!(store.settled());
+    assert!(pending(settled.as_mut()));
+    gate.open(b"hold");
+    gate.wait_entered(b"x1");
+    gate.wait_entered(b"x2");
+    gate.open(b"x1");
+    eventually("a1 published", || newest_version(&store, a1) == Readiness::Ready(v1));
+    assert!(pending(settled.as_mut()), "a2's renewal is still in flight");
+    gate.open(b"x2");
+    env.wait(settled);
+    assert_eq!(newest_version(&store, a2), Readiness::Ready(v2));
+    env.shutdown();
+}
+
+/// A renewal renewed again, by a third pack mounted while it is in flight, keeps the
+/// first load's place throughout and ends where a store new to the process ends.
+#[test]
+fn a_renewal_renewed_again_keeps_its_place() {
+    // Two held calls at once at most, and a load's own steps beside them.
+    let env = Env::with_background_workers("mounts_renew_twice", 3);
+    let (loaders, gate) = test_loaders();
+    let store = env.store(loaders);
+    let (held, h2, a) = (id("held"), id("h2"), id("renewed twice"));
+    let make = |dependencies: Vec<AssetId>| {
+        sorted(vec![
+            (held, gated(b"hold", [])),
+            (h2, gated(b"h2", [])),
+            (a, text(b"payload", dependencies)),
+        ])
+    };
+    let intact = make(vec![held, h2]);
+    let version = version_of(&intact, a);
+    let p0 = env.write(claiming(&make(vec![held]), a, version));
+    let p1 = env.write(claiming(&make(vec![h2]), a, version));
+    let p2 = env.pack(&intact, Storage::Raw);
+    let expected = fresh(&env, &[p0.clone(), p1.clone(), p2.clone()], a);
+    assert_eq!(expected, Readiness::Ready(version));
+
+    env.mount(&store, p0).unwrap();
+    gate.hold(b"hold");
+    gate.hold(b"h2");
+    store.request_newest(a, NOW);
+    gate.wait_entered(b"hold");
+    env.mount(&store, p1).unwrap();
+    let mut settled = pin!(store.settled());
+    assert!(pending(settled.as_mut()));
+    gate.open(b"hold");
+    gate.wait_entered(b"h2");
+    env.mount(&store, p2).unwrap();
+    assert!(pending(settled.as_mut()), "the first renewal is waited for");
+    gate.open(b"h2");
+    env.wait(settled);
+    assert_eq!(newest_version(&store, a), expected);
+    env.shutdown();
+}
+
 fn entered(gate: &Gate, bytes: &[u8]) -> usize {
     gate.entered().iter().filter(|entered| entered.as_slice() == bytes).count()
 }

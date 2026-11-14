@@ -38,6 +38,11 @@ impl LoadTrace {
         Arc::new(Self { id, version, kind, priority, cause, span: OnceLock::new() })
     }
 
+    /// The priority the load was accepted at.
+    pub(crate) fn priority(&self) -> LoadPriority {
+        self.priority
+    }
+
     /// The span, made now if no caller has made it yet. Never called under the lock.
     pub(crate) fn span(&self) -> &Span {
         self.span.get_or_init(|| {
