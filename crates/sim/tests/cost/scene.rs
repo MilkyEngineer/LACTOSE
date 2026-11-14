@@ -85,6 +85,8 @@ fn region(n: u64) -> RegionId {
 
 static MOVEMENT: SystemSet = SystemSet::new("cost::movement");
 static INPUT: SystemSet = SystemSet::new("cost::input").after(&[&sets::INPUT]);
+/// The scene's post stage, which a world with more systems there orders against them.
+static POST: SystemSet = SystemSet::new("cost::post");
 
 /// The declared writer of [`Steer`]: the applier writes it inside `sim`'s systems.
 #[system(name = "cost::input_writer", worlds = [server], exclusive, in_set = INPUT, writes = [Steer])]
@@ -159,7 +161,7 @@ fn store_energy(sum: Scalar, out: ResMut<Energy>) {
 }
 
 /// Every simulated region's wind turns and its gusts count, at the post sync point.
-#[system(name = "cost::weather", worlds = [server], exclusive)]
+#[system(name = "cost::weather", worlds = [server], exclusive, in_set = POST)]
 fn weather(world: &mut World) {
     let regions: Vec<RegionId> = world.regions().collect();
     for region in regions {
@@ -181,7 +183,7 @@ fn register_systems(registration: &mut Registration) {
         .add(&TAKE_HITS)
         .add(&TIMERS)
         .add(&ENERGY);
-    registration.stage(Stage::Post).add(&WEATHER);
+    registration.stage(Stage::Post).sets(&[&POST]).add(&WEATHER);
 }
 
 fn types() -> TypeTable {
@@ -218,8 +220,15 @@ fn scene(rows: u64) -> Simulation {
 
 /// The scene under `layout`.
 fn scene_in(rows: u64, layout: LayoutConfig) -> Simulation {
-    let mut simulation = SimulationBuilder::new(WorldKind::Server, types())
-        .layout(layout)
+    let mut simulation = builder(rows, types()).layout(layout).build().unwrap();
+    populate(simulation.world_mut(), rows);
+    simulation
+}
+
+/// The scene's world over `types`, which holds [`types`] and whatever a caller registers
+/// beside them: the scene's setup, systems and input applier.
+fn builder(rows: u64, types: TypeTable) -> SimulationBuilder {
+    SimulationBuilder::new(WorldKind::Server, types)
         .setup(move |world| {
             world.insert_resource(Energy(Scalar::ZERO));
             world.insert_resource(Population(rows as u32));
@@ -227,9 +236,10 @@ fn scene_in(rows: u64, layout: LayoutConfig) -> Simulation {
         })
         .systems(register_systems)
         .inputs(Box::new(Steering))
-        .build()
-        .unwrap();
-    let world = simulation.world_mut();
+}
+
+/// The scene's regions, `rows` rows of four archetypes spread over them, and the players.
+fn populate(world: &mut World, rows: u64) {
     for n in 0..REGIONS {
         let id = RegionId(1 + n);
         world.create_region(RegionConfig { id, seed: n, mode: RegionMode::Simulated }).unwrap();
@@ -263,7 +273,6 @@ fn scene_in(rows: u64, layout: LayoutConfig) -> Simulation {
         );
         world.spawn(key(n), region(n), row).unwrap();
     }
-    simulation
 }
 
 /// Every player's input for `tick`.

@@ -97,100 +97,8 @@ fn the_scene_gives_one_hash_and_one_reduction_every_tick_under_every_layout() {
 
 // ---- The measurement ----
 
-/// Times the `casein` spans: each sync point, stage and system, summed by name until taken.
-mod timing {
-    use std::collections::BTreeMap;
-    use std::sync::Mutex;
-    use std::sync::OnceLock;
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::time::Duration;
-
-    use tracing::field::{Field, Visit};
-    use tracing::span::{Attributes, Id, Record};
-    use tracing::subscriber::Interest;
-    use tracing::{Event, Metadata, Subscriber};
-
-    /// The time since the first call: the one place the subscriber reads the clock.
-    #[expect(clippy::disallowed_types, reason = "test code timing the step from outside")]
-    fn clock() -> Duration {
-        static START: OnceLock<std::time::Instant> = OnceLock::new();
-        START.get_or_init(std::time::Instant::now).elapsed()
-    }
-
-    struct Open {
-        label: String,
-        entered: Option<Duration>,
-    }
-
-    #[derive(Default)]
-    pub struct Spans {
-        next: AtomicU64,
-        open: Mutex<BTreeMap<u64, Open>>,
-        totals: Mutex<BTreeMap<String, Duration>>,
-    }
-
-    impl Spans {
-        /// The time spent in each span since the last take, by label.
-        pub fn take(&self) -> BTreeMap<String, Duration> {
-            core::mem::take(&mut *self.totals.lock().unwrap())
-        }
-    }
-
-    struct Name(String);
-
-    impl Visit for Name {
-        fn record_str(&mut self, field: &Field, value: &str) {
-            if field.name() == "name" || field.name() == "stage" {
-                self.0 = value.to_owned();
-            }
-        }
-
-        fn record_debug(&mut self, field: &Field, value: &dyn core::fmt::Debug) {
-            if field.name() == "name" || field.name() == "stage" {
-                self.0 = format!("{value:?}");
-            }
-        }
-    }
-
-    impl Subscriber for &'static Spans {
-        fn register_callsite(&self, metadata: &'static Metadata<'static>) -> Interest {
-            if self.enabled(metadata) { Interest::always() } else { Interest::never() }
-        }
-
-        fn enabled(&self, metadata: &Metadata<'_>) -> bool {
-            metadata.is_span() && metadata.target() == "casein"
-        }
-
-        fn new_span(&self, span: &Attributes<'_>) -> Id {
-            let mut name = Name(String::new());
-            span.record(&mut name);
-            let label = format!("{} {}", span.metadata().name(), name.0);
-            let id = self.next.fetch_add(1, Ordering::Relaxed) + 1;
-            self.open.lock().unwrap().insert(id, Open { label, entered: None });
-            Id::from_u64(id)
-        }
-
-        fn record(&self, _: &Id, _: &Record<'_>) {}
-
-        fn record_follows_from(&self, _: &Id, _: &Id) {}
-
-        fn event(&self, _: &Event<'_>) {}
-
-        fn enter(&self, span: &Id) {
-            if let Some(open) = self.open.lock().unwrap().get_mut(&span.into_u64()) {
-                open.entered = Some(clock());
-            }
-        }
-
-        fn exit(&self, span: &Id) {
-            let now = clock();
-            let Some(open) = self.open.lock().unwrap().remove(&span.into_u64()) else { return };
-            if let Some(entered) = open.entered {
-                *self.totals.lock().unwrap().entry(open.label).or_default() += now - entered;
-            }
-        }
-    }
-}
+#[path = "cost/timing.rs"]
+mod timing;
 
 /// The median and the 90th percentile of `samples`, in microseconds.
 fn quantiles(samples: &mut [core::time::Duration]) -> (f64, f64) {
@@ -199,34 +107,91 @@ fn quantiles(samples: &mut [core::time::Duration]) -> (f64, f64) {
     (at(0.5).as_secs_f64() * 1e6, at(0.9).as_secs_f64() * 1e6)
 }
 
-/// The time of a step at 100,000 rows, phase by phase, and of the hash after it, printed
-/// for the report. Run with `cargo nextest run -p lactose-sim --run-ignored only
-/// --cargo-profile release --no-capture -E 'test(cost_)'`.
+/// Whether `cargo xtask measure --short` runs the test: fewer ticks, the same figures.
+#[expect(clippy::disallowed_methods, reason = "the measurement's repetitions, outside the step")]
+fn short() -> bool {
+    std::env::var_os("LACTOSE_MEASURE_SHORT").is_some()
+}
+
+/// One figure for `cargo xtask measure`, which reads the lines that start `measure: `.
+fn figure(name: &str, value: impl core::fmt::Display) {
+    println!("measure: {name} {value}");
+}
+
+/// N of plan decision 5.1: the frame workers a default executor starts, one per performance
+/// core it counts (architecture section 5.1), at most eight.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "the worker count the measurement runs on, read outside the step"
+)]
+fn performance_workers() -> u32 {
+    Executor::builder().build().unwrap().frame_worker_count().min(8)
+}
+
+/// How many sets of the scene's components its rows hold: the four kinds of rows, the
+/// players' and any a despawn and spawn left.
+fn archetypes(world: &mut World) -> usize {
+    let mut keys = Vec::new();
+    world.query::<&Position>().for_each(|key, _| keys.push(key));
+    let shapes: std::collections::BTreeSet<[bool; 7]> = keys
+        .iter()
+        .map(|&key| {
+            [
+                world.get::<Velocity>(key).is_some(),
+                world.get::<Health>(key).is_some(),
+                world.get::<Timer>(key).is_some(),
+                world.get::<Marker>(key).is_some(),
+                world.get::<Contacts>(key).is_some(),
+                world.get::<Steer>(key).is_some(),
+                world.get::<ClaimedBy>(key).is_some(),
+            ]
+        })
+        .collect();
+    shapes.len()
+}
+
+/// Criterion 1 (architecture section 22, plan decision 5.1): the median step at 100,064 rows
+/// on one frame worker (T₁) and on N, the performance cores the executor counts up to eight
+/// (T_N), in one sitting; then S = (N·T_N − T₁)/(N − 1), the time that did not shrink with
+/// workers, and the projected eight-core tick S + (T₁ − S)/8. Each phase of the step, and the
+/// hash after it, which is outside the step, are printed beside them; the world hash after
+/// the last tick is the same on both worker counts. `cargo xtask measure tick-100k` runs it
+/// and writes the result file; by hand, `cargo nextest run -p lactose-sim --run-ignored only
+/// --cargo-profile release --no-capture -E 'test(=cost_of_a_tick_at_100k_rows)'`.
 #[test]
-#[ignore = "a measurement, run by hand: timings are reported, not asserted"]
+#[ignore = "a measurement, run by `cargo xtask measure`: timings are reported, not asserted"]
 #[expect(clippy::disallowed_types, reason = "test code measuring the step, outside it")]
 fn cost_of_a_tick_at_100k_rows() {
     use std::time::{Duration, Instant};
     const WARM: u32 = 10;
-    const TICKS: u32 = 60;
+    let ticks: u32 = if short() { 6 } else { 60 };
     let spans: &'static timing::Spans = Box::leak(Box::default());
     tracing::subscriber::set_global_default(spans).unwrap();
-    for workers in [1, 4] {
+    let n = performance_workers();
+    let counts = if n > 1 { vec![1, n] } else { vec![1] };
+    let mut medians = Vec::new();
+    let mut last_hashes = Vec::new();
+    let mut systems = std::collections::BTreeSet::new();
+    let mut shape = (0, 0);
+    for &workers in &counts {
         let executor =
             Executor::builder().frame_workers(workers).background_workers(1).build().unwrap();
         let mut simulation = scene(ROWS);
+        let world = simulation.world_mut();
+        shape = (world.query::<&Position>().count(), archetypes(world));
         let mut phases: BTreeMap<String, Vec<Duration>> = BTreeMap::new();
         let mut steps = Vec::new();
         let mut hashes = Vec::new();
-        for tick in 0..WARM + TICKS {
+        let mut last = 0;
+        for tick in 0..WARM + ticks {
             spans.take();
             let start = Instant::now();
             simulation = step(&executor, simulation);
             let stepped = start.elapsed();
             let start = Instant::now();
-            let hash = simulation.hash().unwrap();
+            last = simulation.hash().unwrap();
             let hashed = start.elapsed();
-            assert_ne!(hash, 0);
+            assert_ne!(last, 0);
             if tick < WARM {
                 continue;
             }
@@ -237,18 +202,53 @@ fn cost_of_a_tick_at_100k_rows() {
             }
         }
         let rows = simulation.world_mut().query::<&Position>().count();
-        println!("{workers} frame worker(s), {rows} rows, {TICKS} ticks: median / p90 in µs");
+        println!("{workers} frame worker(s), {rows} rows, {ticks} ticks: median / p90 in µs");
         let (median, p90) = quantiles(&mut steps);
         println!("  {:<40} {median:>9.1} {p90:>9.1}", "step (whole)");
         for (label, samples) in &mut phases {
             let (median, p90) = quantiles(samples);
             println!("  {label:<40} {median:>9.1} {p90:>9.1}");
+            if let Some(name) = label.strip_prefix("system ") {
+                systems.insert(name.to_owned());
+            }
         }
-        let (median, p90) = quantiles(&mut hashes);
-        println!("  {:<40} {median:>9.1} {p90:>9.1}", "hash (all regions)");
+        let (hash_median, hash_p90) = quantiles(&mut hashes);
+        println!("  {:<40} {hash_median:>9.1} {hash_p90:>9.1}", "hash (all regions)");
         let start = Instant::now();
         let one = simulation.world_hash(RegionId(1)).unwrap();
         println!("  {:<40} {:>9.1}", "hash (one region)", start.elapsed().as_secs_f64() * 1e6);
         assert_ne!(one, 0);
+        medians.push(median);
+        last_hashes.push(last);
+    }
+    assert!(
+        last_hashes.windows(2).all(|pair| pair[0] == pair[1]),
+        "the world hash after the last tick depends on the worker count: {last_hashes:x?}"
+    );
+
+    let t1 = medians[0];
+    figure("rows", shape.0);
+    figure("archetypes", shape.1);
+    figure("regions", REGIONS);
+    figure("systems", systems.len());
+    figure("ticks", ticks);
+    figure("warm_up_ticks", WARM);
+    figure("workers", counts.iter().map(u32::to_string).collect::<Vec<_>>().join(" and "));
+    figure("hash", format!("{:#018x}", last_hashes[0]));
+    figure("n", n);
+    figure("t1_us", format!("{t1:.1}"));
+    if let [_, tn] = medians[..] {
+        let nf = f64::from(n);
+        let serial = (nf * tn - t1) / (nf - 1.0);
+        let projected = serial + (t1 - serial) / 8.0;
+        figure("tn_us", format!("{tn:.1}"));
+        figure("s_us", format!("{serial:.1}"));
+        figure("projection_us", format!("{projected:.1}"));
+        println!(
+            "T1 {t1:.1} µs, T{n} {tn:.1} µs, S {serial:.1} µs, projected eight-core tick \
+             {projected:.1} µs (at most 4,000)"
+        );
+    } else {
+        println!("T1 {t1:.1} µs; one performance core, so no T_N and no projection");
     }
 }
