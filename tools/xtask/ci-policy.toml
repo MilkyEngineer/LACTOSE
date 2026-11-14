@@ -29,6 +29,7 @@ packages = ["lactose-app-headless"]
 # compiles them. Once `lactose-sim` exists this list may not be empty.
 [harness]
 packages = [
-  "lactose-sim", "lactose-physics-api", "lactose-input", "lactose-physics-rapier", "lactose-net-api",
-  "lactose-predict", "lactose-net-host", "lactose-anim", "lactose-persist", "lactose-app",
+  "lactose-sim", "lactose-ecs", "lactose-physics-api", "lactose-input", "lactose-physics-rapier",
+  "lactose-net-api", "lactose-predict", "lactose-net-host", "lactose-anim", "lactose-persist",
+  "lactose-app",
 ]
