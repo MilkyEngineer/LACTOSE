@@ -33,10 +33,11 @@ impl ThreadClass {
     /// class is best effort: an operating system that refuses it yields an error of kind
     /// `Platform`, and the thread still runs correctly at its default priority.
     ///
-    /// Enter a class once, at thread start. On Linux the two utility classes, `Background`
-    /// and `Io`, lower priority in a way an unprivileged thread cannot undo, so a later
-    /// `enter` of another class leaves it lowered. On Windows the class sets thread priority only; steering
-    /// background threads to efficiency cores is an open item in `docs/verification.md`.
+    /// Enter a class at thread start; entering the class a thread is already in is
+    /// harmless. On Linux the two utility classes, `Background` and `Io`, lower priority in a
+    /// way an unprivileged thread cannot undo, so a later `enter` of another class leaves it
+    /// lowered. On Windows the class sets thread priority only; steering background threads
+    /// to efficiency cores is an open item in `docs/verification.md`.
     pub fn enter(self) -> Result<()> {
         fp::set_deterministic();
         os::set_scheduling(self)
@@ -45,10 +46,12 @@ impl ThreadClass {
 
 /// Floating-point control state (MXCSR on x86-64, FPCR on aarch64).
 ///
-/// The deterministic state is the IEEE default every thread starts with: round to nearest,
-/// denormals honoured, no flush to zero, no default-NaN mode, exceptions masked. Engine
-/// threads re-assert it because foreign code (audio drivers, plug-ins, some game overlays)
-/// changes it and does not always put it back.
+/// The deterministic state is the IEEE default: round to nearest, denormals honoured, no
+/// flush to zero, no default-NaN mode, exceptions masked. On Linux a new thread starts in
+/// its creator's floating-point state (POSIX), so a thread that runs boundary work sets the
+/// state at start, whatever thread created it. Engine threads re-assert it because foreign
+/// code (audio drivers, plug-ins, some game overlays) changes it and does not always put it
+/// back.
 pub mod fp {
     /// Puts the calling thread's floating-point control register in the deterministic state.
     pub fn set_deterministic() {

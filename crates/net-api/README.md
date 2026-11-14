@@ -137,14 +137,14 @@ which `build`'s `derived` check does not see.
   region loads are lost. `oldest_after(tick)` is the tick of the oldest queued frame after
   `tick`, the first one `due(tick)` leaves out; `lactose-predict` asks it with the present
   tick. `accepted_tick` is the newest tick ever accepted, queued or popped: `app` resyncs a
-  client that fell behind to at or beyond it, since a target short of a frame already queued
-  is behind again at the next frame. `reset` empties the inbox and forgets the newest tick
-  it accepted: a re-join that moves a client world's tick with `World::set_tick` calls
-  `reset` on that world's inbox in the same between-run access, since the new session's
-  ticks may lie before the old session's and `push` would refuse every one of them, the full
-  frame included. Frames of the old session not yet pushed when `reset` is called are
-  dropped, never pushed after it: one accepted after the reset would make `push` refuse the
-  new session's.
+  client that fell behind, or met a frame older than its ring (`TooOld`), to at or beyond
+  it, since a target short of a frame already queued is behind again at the next frame.
+  `reset` empties the inbox and forgets the newest tick it accepted: a re-join that moves a
+  client world's tick with `World::set_tick` calls `reset` on that world's inbox in the same
+  between-run access, since the new session's ticks may lie before the old session's and
+  `push` would refuse every one of them, the full frame included. Frames of the old session
+  not yet pushed when `reset` is called are dropped, never pushed after it: one accepted
+  after the reset would make `push` refuse the new session's.
 - The fold, per step: `time_scale` is the last `Some` among the due frames. Region changes
   fold per region in frame order with the later change winning, except that an
   `Irrelevant` followed by a `Relevant` becomes an unload plus a load, which the sim
@@ -380,11 +380,14 @@ which `build`'s `derived` check does not see.
   or `None` for `Cooked`; `resources` and `transient_resources` as carried; `assets` as the
   client's `app` pinned it from the table, or `None` if the table has not arrived; `mode:
   RegionMode::Replicated`, the replicated world's mode. A prediction world's regions are
-  `Simulated` instead, since it runs its kernels and steps its bodies only there: `app` sets
-  `RegionBundle::mode` to `Simulated` on the bundle it folds into the prediction world,
-  which it builds under `RegionControl::Directed` so the lifecycle loads the mode the bundle
-  names. A region the server holds `Frozen` cannot be mirrored as such, since `RegionChange`
-  carries no mode. The sim's load path then validates everything before `create_region`, as
+  `Simulated` instead once their table is published, since it runs its kernels and steps its
+  bodies only there: `app` sets `RegionBundle::mode` to `Simulated` on the bundle it folds
+  into the prediction world when `assets` is `Some`, `Frozen` when it is `None` (the
+  `RegionChange::Assets` that brings the table sets it `Simulated`), and builds that world
+  under `RegionControl::Directed` so the lifecycle loads the mode the bundle names. A region
+  the server holds `Frozen` with its table published cannot be mirrored as such, since
+  `RegionChange` carries no mode: the client simulates it and each frame carrying its rows
+  corrects it. The sim's load path then validates everything before `create_region`, as
   it does a save. The region's entities then arrive as spawns, which the hook applies as
   upserts over the rows the bundle loaded.
 - A `RegionChange::Irrelevant` becomes `TickInput::unloaded`, which despawns the region's

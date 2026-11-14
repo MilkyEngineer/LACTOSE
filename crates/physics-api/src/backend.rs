@@ -156,9 +156,11 @@ impl StepOutput {
 /// worker identity and no thread-local state; its pool's threads enter
 /// `lactose_core::ThreadClass::PhysicsSolver` at start, which sets their floating-point
 /// state; solver threads number the frame worker count minus the reservation, at least
-/// one. Every number it computes goes through its pinned math crates, and what reaches a
-/// row or an event is converted to [`Scalar`] exactly. A method called for a key it does
-/// not hold does nothing and logs at target `physics`; it never panics on a key.
+/// one. `step` returns with the calling thread's floating-point control state as it found
+/// it; `lactose-physics-api` asserts this in debug builds. Every number it computes goes
+/// through its pinned math crates, and what reaches a row or an event is converted to
+/// [`Scalar`] exactly. A method called for a key it does not hold does nothing and logs at
+/// target `physics`; it never panics on a key.
 pub trait PhysicsBackend: Send + Sync + 'static {
     /// Creates the body or fixed collider for `key` from `desc`. The sync calls it once per
     /// row that becomes a body, never for a key it already holds.

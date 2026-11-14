@@ -5,7 +5,7 @@
 use std::num::NonZeroU64;
 use std::sync::{Arc, Mutex, PoisonError};
 
-use lactose_app::{Client, ClientOutput, Cooked, Start, WorldConfig, build_client};
+use lactose_app::{Client, ClientOutput, Cooked, Start, TICK_PERIOD, WorldConfig, build_client};
 use lactose_bundle::ComponentData;
 use lactose_core::{ErrorKind, NetId, PlayerId, Result, StableKey, Tick};
 use lactose_ecs::{Executor, RegionId, RegionMode, World};
@@ -549,8 +549,9 @@ struct Joined {
 /// that step, as a packer sends them. The server is given the samples the client predicted
 /// with, so a prediction that runs the kernels and the physics as the server does is
 /// corrected once, by the first frame of the fold's tick (the full frame carries the rows
-/// of the join, which the fold places `lead` ticks later), and never after it.
-fn joined(body: Body, frames: u32) -> Joined {
+/// of the join, which the fold places `lead` ticks later), and never after it. `frozen`
+/// sets the server's region `Frozen` by a step after the join, before the full frame.
+fn joined(body: Body, frozen: bool, frames: u32) -> Joined {
     let executor = executor(2);
     let content = Content::new();
     let server = server(&executor, WorldConfig::headless(), Start::Fresh, &content);
@@ -571,6 +572,14 @@ fn joined(body: Body, frames: u32) -> Joined {
             Shape::cuboid(Vec3::new(Scalar::from_i32(10), Scalar::HALF, Scalar::from_i32(10)));
         let fixed = (Transform::at(Vec3::ZERO), Collider::new(slab));
         world.spawn(floor, REGION, fixed).expect("the floor");
+    }
+    if frozen {
+        let mut freeze = TickInput::default();
+        freeze.modes.insert(REGION, RegionMode::Frozen);
+        let (stepped, out) = step(&executor, server, freeze);
+        assert!(out.failures.is_empty(), "{out:?}");
+        server = stepped;
+        assert_eq!(server.simulation().world().region_mode(REGION), Some(RegionMode::Frozen));
     }
     let join = server.tick();
 
@@ -641,7 +650,7 @@ fn joined(body: Body, frames: u32) -> Joined {
 
 #[test]
 fn a_folded_region_runs_the_prediction_kernels_and_the_frames_after_correct_nothing() {
-    let run = joined(Body::None, 60);
+    let run = joined(Body::None, false, 60);
     assert_eq!(run.mode, Some(RegionMode::Simulated), "the fold loads the region simulated");
     let ((server_tick, server_count, _), (client_tick, client_count, _)) = (run.server, run.client);
     assert!(client_tick > server_tick);
@@ -656,7 +665,7 @@ fn a_folded_region_runs_the_prediction_kernels_and_the_frames_after_correct_noth
 
 #[test]
 fn a_predicted_body_lands_as_the_servers_does_and_the_frames_after_correct_nothing() {
-    let run = joined(Body::Landing, 240);
+    let run = joined(Body::Landing, false, 240);
     assert_eq!(run.mode, Some(RegionMode::Simulated));
     let ((server_tick, server_count, server_y), (client_tick, client_count, client_y)) =
         (run.server, run.client);
@@ -666,6 +675,98 @@ fn a_predicted_body_lands_as_the_servers_does_and_the_frames_after_correct_nothi
     assert!(client_y == Some(landed), "the prediction's body rests where the server's does");
     assert_eq!(run.corrected, [(run.fold, run.fold)], "the fold's lag alone is corrected");
     assert_eq!(run.resyncs, 0);
+}
+
+/// Pins today's behaviour, a cost stated in the README: `RegionChange` carries no mode,
+/// so a region the server holds `Frozen` with its table published is folded `Simulated`,
+/// the client's kernel advances the counter the server's does not, and nearly every
+/// frame's rows correct it. A mode variant is a `lactose-net-api` change; when it lands,
+/// this test asserts the region folds `Frozen` and the frames correct nothing.
+#[test]
+fn a_region_the_server_holds_frozen_is_simulated_and_corrected_at_every_frame_today() {
+    let run = joined(Body::None, true, 60);
+    assert_eq!(run.mode, Some(RegionMode::Simulated));
+    let ((_, server_count, _), (_, client_count, _)) = (run.server, run.client);
+    assert!(client_count > server_count, "the client's kernel ran where the server's did not");
+    assert!(run.corrected.len() >= 55, "a correction at nearly every frame: {:?}", run.corrected);
+    assert!(run.corrected.iter().all(|&(at, restored)| at == restored));
+    assert_eq!(run.resyncs, 0);
+}
+
+/// Architecture section 14: a region enters `Simulated` only once its table is published.
+/// A relevance message built before its table carries none: the fold loads the region
+/// `Frozen`, and the frame that brings the table as `RegionChange::Assets` makes it
+/// `Simulated`.
+#[test]
+fn a_region_folded_without_its_table_is_frozen_until_the_table_enters() {
+    let executor = executor(2);
+    let content = Content::new();
+    let clock = Clock::new();
+    let mut message = relevance(&executor, &content, &[1]).remove(0);
+    let published = message.assets.take().expect("the server's region has its table");
+    let mut client = client(&executor, &content, clock);
+    let mut full = StagedFrame::resync(Tick(client.tick().0 + 1));
+    full.regions.insert(RegionId(1), RegionChange::Relevant(message));
+    push(&mut client, full);
+    let (mut client, _) = frame(&executor, client, clock, 1, &mut sampled);
+    assert_eq!(world(&client).region_mode(RegionId(1)), Some(RegionMode::Frozen));
+    assert!(world(&client).region_assets(RegionId(1)).is_none());
+
+    let mut later = StagedFrame::new(Tick(client.tick().0 + 1));
+    later.regions.insert(RegionId(1), RegionChange::Assets(published));
+    push(&mut client, later);
+    let (client, _) = frame(&executor, client, clock, 2, &mut sampled);
+    assert_eq!(world(&client).region_mode(RegionId(1)), Some(RegionMode::Simulated));
+    assert!(world(&client).region_assets(RegionId(1)).is_some());
+    client.shutdown();
+    executor.shutdown();
+}
+
+/// Region 1's mode and whether its table entered, after one fold of `changes`: one frame
+/// per change at ascending ticks up to the world's next, the last one `full` if `full`.
+fn folded(changes: Vec<RegionChange>, full: bool) -> (Option<RegionMode>, bool) {
+    let executor = executor(2);
+    let content = Content::new();
+    let clock = Clock::new();
+    let mut client = client(&executor, &content, clock);
+    let next = client.tick().0 + 1;
+    let first = next + 1 - u32::try_from(changes.len()).expect("a few");
+    for (at, change) in (first..=next).zip(changes) {
+        let mut staged = if full && at == next {
+            StagedFrame::resync(Tick(at))
+        } else {
+            StagedFrame::new(Tick(at))
+        };
+        staged.regions.insert(RegionId(1), change);
+        push(&mut client, staged);
+    }
+    let (client, out) = frame(&executor, client, clock, 1, &mut sampled);
+    assert_eq!(out.ticks, 1);
+    let world = world(&client);
+    let folded = (world.region_mode(RegionId(1)), world.region_assets(RegionId(1)).is_some());
+    client.shutdown();
+    executor.shutdown();
+    folded
+}
+
+/// A table the fold drops takes the `Simulated` its `Assets` change set with it: a full
+/// frame after the table, or an `Irrelevant` between the table and a `Relevant` with none,
+/// leaves the region `Frozen` with no table.
+#[test]
+fn a_mode_the_fold_drops_with_its_table_does_not_outlive_it() {
+    let executor = executor(2);
+    let mut message = relevance(&executor, &Content::new(), &[1]).remove(0);
+    executor.shutdown();
+    let published = message.assets.take().expect("the server's region has its table");
+    let relevant = || RegionChange::Relevant(message.clone());
+    let assets = || RegionChange::Assets(published.clone());
+
+    let kept = folded(vec![assets(), relevant()], false);
+    assert_eq!(kept, (Some(RegionMode::Simulated), true), "the table and its mode enter");
+    let full = folded(vec![assets(), relevant()], true);
+    assert_eq!(full, (Some(RegionMode::Frozen), false), "a full frame drops both");
+    let dropped = folded(vec![assets(), RegionChange::Irrelevant, relevant()], false);
+    assert_eq!(dropped, (Some(RegionMode::Frozen), false), "so does `Irrelevant`");
 }
 
 // ---- The resync hint: the newest frame accepted ----
@@ -735,20 +836,33 @@ fn mismatch(client: &Client, frame: &mut StagedFrame, value: u32) {
 /// A client holding region 1 from a full frame, with the local player's claimed counter
 /// in it, eight frames on; and the region's relevance message.
 fn holding(executor: &Executor, content: &Arc<Content>, clock: Clock) -> (Client, RegionRelevance) {
-    let message = relevance(executor, content, &[1]).remove(0);
+    let (client, mut messages) = holding_all(executor, content, clock, &[1]);
+    (client, messages.remove(0))
+}
+
+/// [`holding`] of regions `ids`, the counter in the first; and their relevance messages.
+fn holding_all(
+    executor: &Executor,
+    content: &Arc<Content>,
+    clock: Clock,
+    ids: &[u64],
+) -> (Client, Vec<RegionRelevance>) {
+    let messages = relevance(executor, content, ids);
     let mut client = client(executor, content, clock);
     let StableKey::Net(net) = client.predictor().local().entity else { panic!("a NetId") };
     let mut full = StagedFrame::resync(Tick(client.tick().0 + 1));
-    full.regions.insert(RegionId(1), RegionChange::Relevant(message.clone()));
+    for message in &messages {
+        full.regions.insert(message.region, RegionChange::Relevant(message.clone()));
+    }
     let components = vec![data(Counter(0))];
-    full.spawns
-        .insert(net, StagedSpawn { origin: None, region: RegionId(1), slot: None, components });
+    let region = RegionId(ids[0]);
+    full.spawns.insert(net, StagedSpawn { origin: None, region, slot: None, components });
     push(&mut client, full);
     for periods in 1..=8 {
         client = frame(executor, client, clock, periods, &mut sampled).0;
     }
-    assert_eq!(regions(&client), [1]);
-    (client, message)
+    assert_eq!(regions(&client), ids);
+    (client, messages)
 }
 
 const REFUSED: &str = "a region bundle was refused";
@@ -756,7 +870,9 @@ const REFUSED: &str = "a region bundle was refused";
 /// A frame naming the loaded region `Relevant` again, older than the world, with a row the
 /// prediction did not make: the bundle is refused at the step, and the reconciliation's
 /// rollback re-applies the refused tick. One report and one content resync at the world's
-/// own tick; five later frames roll back five times and report nothing more.
+/// own tick, which leaves the pacer as it was: the frame runs half a period late, and the
+/// next, on the period, still owes its tick. Five later frames roll back five times and
+/// report nothing more.
 #[test]
 fn a_refused_bundle_is_reported_once_and_resyncs_the_content() {
     let log = capture();
@@ -770,8 +886,11 @@ fn a_refused_bundle_is_reported_once_and_resyncs_the_content() {
     again.regions.insert(RegionId(1), RegionChange::Relevant(message));
     mismatch(&client, &mut again, 900);
     push(&mut client, again);
-    let (mut client, out) = frame(&executor, client, clock, 9, &mut sampled);
+    let late = clock.at(9) + TICK_PERIOD / 2;
+    let (mut client, out) =
+        executor.block_on(client.frame(&executor, late, &mut sampled)).expect("the frame");
     assert_eq!(out.ticks, 1);
+    assert_eq!(out.next_deadline, clock.at(10));
     assert!(out.reconciled.resimulated > 1, "the rollback re-applied the refused tick");
     assert_eq!(out.resync, Some(client.tick()), "a content resync at the world's own tick");
     assert_eq!(logged(&log, tracing::Level::WARN, REFUSED), 1, "reported once");
@@ -783,6 +902,8 @@ fn a_refused_bundle_is_reported_once_and_resyncs_the_content() {
         push(&mut client, later);
         let out;
         (client, out) = frame(&executor, client, clock, 10 + n, &mut sampled);
+        assert_eq!(out.ticks, 1, "the content resync left the pacer's debt");
+        assert_eq!(out.next_deadline, clock.at(11 + n));
         assert!(out.reconciled.resimulated > 0, "a rollback");
         assert_eq!(out.resync, None);
     }
@@ -820,6 +941,118 @@ fn a_refusal_a_later_rollback_re_applies_is_not_reported_again() {
     assert!(out.reconciled.resimulated > 1, "the rollback re-applied the refused tick");
     assert_eq!(out.resync, None);
     assert_eq!(logged(&log, tracing::Level::WARN, REFUSED), 1, "reported once");
+    client.shutdown();
+    executor.shutdown();
+}
+
+/// Two loaded regions named `Relevant` again by one frame older than the world: both
+/// bundles are refused at the same tick, and each is reported.
+#[test]
+fn two_regions_refused_at_one_tick_are_each_reported() {
+    let log = capture();
+    let executor = executor(2);
+    let content = Content::new();
+    let clock = Clock::new();
+    let (mut client, messages) = holding_all(&executor, &content, clock, &[1, 2]);
+    let present = client.tick();
+
+    let mut again = StagedFrame::new(Tick(present.0 - 1));
+    for message in messages {
+        again.regions.insert(message.region, RegionChange::Relevant(message));
+    }
+    push(&mut client, again);
+    let (client, out) = frame(&executor, client, clock, 9, &mut sampled);
+    assert_eq!(out.resync, Some(client.tick()), "one content resync");
+    assert_eq!(logged(&log, tracing::Level::WARN, REFUSED), 2, "one report per region");
+    assert_eq!(regions(&client), [1, 2]);
+    client.shutdown();
+    executor.shutdown();
+}
+
+/// Entity X, a runtime id that is not the local player's.
+fn x_key() -> StableKey {
+    StableKey::Net(NetId::runtime(NonZeroU64::new(50).expect("non-zero")).expect("runtime"))
+}
+
+/// Region 2's relevance message, its overlay holding X.
+fn relevance_with_x(executor: &Executor, content: &Arc<Content>) -> RegionRelevance {
+    let server = server(executor, WorldConfig::headless(), Start::Fresh, content);
+    let (mut server, out) = step(executor, server, load(content, [2]));
+    assert!(out.failures.is_empty(), "{out:?}");
+    server.simulation_mut().world_mut().spawn(x_key(), RegionId(2), (Counter(7),)).expect("X");
+    let message = server.relevance(executor, RegionId(2)).expect("relevance");
+    server.shutdown();
+    message
+}
+
+/// A refusal its first application never made. Frame A (older than the world) makes region
+/// 2 relevant: its bundle, with X in the overlay, loads at the world's next tick T. Frame B
+/// (before T) claims X for the player in region 1: the reconciliation corrects its tick by
+/// spawning X there, and the re-simulation re-applies region 2's bundle at T against a
+/// world where X is live, which the sync point refuses. Reported once, with a content
+/// resync, though its tick is one an earlier frame ran.
+#[test]
+fn a_refusal_only_the_rollback_makes_is_reported_and_resyncs_the_content() {
+    let log = capture();
+    let executor = executor(2);
+    let content = Content::new();
+    let clock = Clock::new();
+    let (mut client, _) = holding(&executor, &content, clock);
+    let two = relevance_with_x(&executor, &content);
+
+    let mut a = StagedFrame::new(Tick(4));
+    a.regions.insert(RegionId(2), RegionChange::Relevant(two));
+    push(&mut client, a);
+    let (mut client, out) = frame(&executor, client, clock, 9, &mut sampled);
+    assert_eq!(regions(&client), [1, 2], "region 2 loaded at its first application");
+    assert!(world(&client).contains(x_key()));
+    assert_eq!((out.resync, logged(&log, tracing::Level::WARN, REFUSED)), (None, 0));
+
+    let StableKey::Net(x) = x_key() else { panic!("a NetId") };
+    let mut b = StagedFrame::new(Tick(5));
+    let components = vec![data(Counter(7))];
+    b.spawns.insert(x, StagedSpawn { origin: None, region: RegionId(1), slot: None, components });
+    push(&mut client, b);
+    let (client, out) = frame(&executor, client, clock, 10, &mut sampled);
+    assert!(out.reconciled.resimulated > 1, "the rollback re-applied region 2's bundle");
+    assert_eq!(regions(&client), [1], "the re-application was refused");
+    assert_eq!(logged(&log, tracing::Level::WARN, REFUSED), 1, "and reported");
+    assert_eq!(out.resync, Some(client.tick()), "with a content resync");
+    client.shutdown();
+    executor.shutdown();
+}
+
+/// The kept refusals go with the ring: a refusal in a frame whose fold failed is kept, a
+/// clock resync takes the world back before its tick, and the same region refused at the
+/// same tick again is a new refusal, reported and resynced.
+#[test]
+fn a_refusal_after_a_backward_resync_is_reported_again() {
+    let log = capture();
+    let executor = executor(2);
+    let content = Content::new();
+    let clock = Clock::new();
+    let (mut client, message) = holding(&executor, &content, clock);
+    let present = client.tick();
+
+    let mut failing = StagedFrame::new(Tick(present.0 - 1));
+    failing.regions.insert(RegionId(1), RegionChange::Relevant(message.clone()));
+    failing.regions.insert(RegionId(5), unresolvable(5));
+    push(&mut client, failing);
+    let (mut client, out) = frame(&executor, client, clock, 9, &mut sampled);
+    assert_eq!((out.ticks, out.resync), (1, Some(present)));
+    assert_eq!(logged(&log, tracing::Level::WARN, REFUSED), 1);
+
+    client.clock(estimate(present.0 - LEAD, true));
+    let (mut client, out) = frame(&executor, client, clock, 10, &mut sampled);
+    assert_eq!((out.ticks, out.resync), (0, Some(present)), "back before the refused tick");
+
+    let mut again = StagedFrame::new(present);
+    again.regions.insert(RegionId(1), RegionChange::Relevant(message));
+    push(&mut client, again);
+    let (client, out) = frame(&executor, client, clock, 11, &mut sampled);
+    assert_eq!(out.ticks, 1);
+    assert_eq!(logged(&log, tracing::Level::WARN, REFUSED), 2, "reported again");
+    assert_eq!(out.resync, Some(client.tick()));
     client.shutdown();
     executor.shutdown();
 }

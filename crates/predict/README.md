@@ -58,7 +58,7 @@ boundary `clippy.toml`.
 | Consumer | Needs | Where |
 |---|---|---|
 | `app` (client, milestone 1 spike, then milestone 4) | One owner of the prediction world beside the replicated world, from the same registration functions, running ahead of the server from the start | `SimulationBuilder::new(WorldKind::Prediction, types)` with every crate's `register_types` (`lactose_predict::register_types` among them), `setup` and `register_systems` (`lactose_net_api::setup` for the inbox, `lactose_physics_api::setup` for physics), `.tick(Tick(accepted.tick.0 + lead))` and `.check(lactose_predict::check_prediction_reads)`, then `Predictor::new(simulation, LocalPlayer { player, entity }, depth)`; "The loop `app` writes" below |
-| | Step ahead each frame with the local inputs; the frames the network thread delivered applied | `Predictor::step` with a `TickInput` carrying `inputs[local.player]` for the tick; the frames through `StagedInbox::push` on `simulation_mut().world_mut()` before the step, folded as for the replicated world but with each bundle's mode `Simulated`; the step's hook pops them |
+| | Step ahead each frame with the local inputs; the frames the network thread delivered applied | `Predictor::step` with a `TickInput` carrying `inputs[local.player]` for the tick; the frames through `StagedInbox::push` on `simulation_mut().world_mut()` before the step, folded as for the replicated world but with each bundle's mode `Simulated` once its region's table is published, `Frozen` before; the step's hook pops them |
 | | Compare, roll back, correct, re-simulate; know what it cost | `Predictor::reconcile` after the frame's steps: `Reconciled::{confirmed, corrections, resimulated, resync}`; the time measured around the call, outside the boundary, divided by `resimulated` |
 | | The ring's depth from the budget and the measured per-tick cost; the horizon | `Predictor::set_depth`; `Ring::{depth, oldest, newest, rebuilt_at, len, bytes, slot_bytes}`; a frame older than the ring is `ResyncReason::TooOld` |
 | | Resync when the world must be rebuilt or has fallen behind; a changed player entity | `Reconciled::resync`, `Predictor::resync(tick)`, then the server's full frame through the inbox; `Predictor::set_local` |
@@ -83,7 +83,8 @@ loop {
     // 1. Every frame the network thread delivered, into both inboxes; a refused frame
     //    enters nothing. Then the due frames' time scale and region changes folded into
     //    the first new tick's `TickInput`, as for the replicated world except that each
-    //    `RegionRelevance::to_bundle` bundle's `mode` is set to `Simulated`: a prediction
+    //    `RegionRelevance::to_bundle` bundle's `mode` is set to `Simulated` with a table
+    //    and `Frozen` without one (an `Assets` change sets it `Simulated`): a prediction
     //    world runs its kernels and steps its bodies only in a `Simulated` region, and it
     //    is built under `RegionControl::Directed`, so the lifecycle loads that mode.
     // 2. The pacer. The cap is for catch-up; re-simulation is bounded by the ring depth
@@ -791,9 +792,11 @@ README.md`, "The applier")
   owner, `app` (`crates/app/README.md`, "The client's frame", step 5), never this crate:
   it takes the load failures and the asset failures through
   `simulation_mut().lifecycle_mut()` once per frame, after `reconcile`. The ring never
-  replays an asset failure, but it re-passes a recorded bundle, so a bundle the
-  lifecycle refused is refused again at each re-simulation of its tick: `app` reports a
-  refusal once and resyncs the content, which restarts the ring after it.
+  replays an asset failure, but it re-passes a recorded bundle, so a bundle the lifecycle
+  refused is refused again at each re-simulation of its tick, and one it loaded can be
+  refused there when a correction made live an entity its overlay holds: `app` reports a
+  refusal unless it reported that tick and region since the ring last restarted, and resyncs
+  the content, which restarts the ring after it.
 - A rollback's re-simulation runs to the present in the `reconcile` that detects it,
   always: a world left at an older tick would be extracted and presented there. Its length
   is bounded by the ring depth, and it does not count against the catch-up cap of

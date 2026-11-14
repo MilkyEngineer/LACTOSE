@@ -225,6 +225,15 @@ order.
   took 16 to 50 ms on one thread and 21 to 42 ms on four, about 3 µs a step more on four.
   Runs from 400 ms, 6 of 600 on one thread and 2 of 600 on four, came in bursts with the
   machine's load; none hung.
+- **The solver threads' floating-point state is set once, at thread start** (architecture
+  section 5.1), and not re-checked on every thread per step. Nothing but the step runs on the
+  pool: the backend owns it, rayon's pool builders and Rapier's `configure_thread_pool` are
+  banned inside the boundary (`clippy.toml`), and `tests/global_pool.rs` checks that rayon's
+  global pool never starts. Nothing in the pinned dependency closure writes the control
+  register (`ldmxcsr`, `_mm_setcsr`, `msr fpcr`, `fesetround`, `fesetenv`, `_controlfp`),
+  which is re-checked at each bump. `step` asserts the state in debug builds inside the
+  pool's `install`, which runs inline on the solver thread that steps: that thread only,
+  not the other solver threads (the narrow phase's broadcast, the parallel solver's jobs).
 - A snapshot that decodes and passes the check but whose Rapier state is otherwise
   inconsistent (bytes not written by this backend) can make a later Rapier call panic.
 - `MultibodyJointSet::insert` and `insert_kinematic`, and `Multibody::inverse_kinematics` and

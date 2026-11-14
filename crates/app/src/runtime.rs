@@ -215,9 +215,13 @@ pub(crate) mod tests {
     #[test]
     fn every_solver_thread_enters_its_class_before_it_takes_work() {
         let (pool, exit) = pool(3, started, || {}).unwrap();
-        // A broadcast runs on every thread, so each has started by the time it returns.
+        // A broadcast runs on every thread, so each has started by the time it returns. The
+        // floating-point half holds without the handler where threads start in the default
+        // state (macOS); no safe code leaves it, so the test cannot perturb it first.
         let deterministic = pool.broadcast(|_| fp::is_deterministic());
         assert_eq!(deterministic, [true; 3]);
+        // `Relaxed` suffices: each thread's increment precedes its broadcast job, and
+        // `broadcast` returns only after every job's completion latch is set.
         assert_eq!(STARTED.load(Ordering::Relaxed), 3, "every thread ran the start handler");
         drop(pool);
         exit.wait();
