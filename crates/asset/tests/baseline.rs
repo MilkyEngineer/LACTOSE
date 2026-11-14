@@ -171,3 +171,17 @@ fn a_world_reads_the_table_it_was_given_until_the_next_is_set() {
     assert_eq!(reads(world), b"two");
     env.shutdown();
 }
+
+/// The store registers the baseline's loader itself: a second one is refused like a second
+/// loader of any kind.
+#[test]
+fn a_second_loader_of_one_kind_is_refused_the_baseline_kind_included() {
+    let env = Env::new("baseline_second_loader");
+    let two = vec![ErasedLoader::new(TextLoader), ErasedLoader::new(TextLoader)];
+    let refused = lactose_asset::Store::new(env.executor.clone(), env.io.clone(), two);
+    assert_eq!(refused.err().map(|error| error.kind()), Some(ErrorKind::InvalidData));
+    let baseline = vec![ErasedLoader::new(RegionBaselineLoader)];
+    let refused = lactose_asset::Store::new(env.executor.clone(), env.io.clone(), baseline);
+    assert_eq!(refused.err().map(|error| error.kind()), Some(ErrorKind::InvalidData));
+    env.shutdown();
+}

@@ -216,10 +216,14 @@ is this crate's (D136), written by `PackBuilder` alone and read by `Store::mount
      the source, when the mounted pack holds that version and is now the pack the
      version is read from (the latest place that holds it); and
   3. every followed asset whose named version last failed for a dependency that this
-     mount asks for again, under any of the three, and is not loading.
+     mount asks for again under any of the three, or renamed to a version that is
+     loading, and is not loading itself.
 
   The loads this accepts are accepted before the future resolves. Nothing else is asked
-  for. A followed asset the mount did not rename, whose named version failed with a
+  for. A load in flight whose version the mount gives a new source (the version rule 2
+  would ask for, were it not loading) is not asked for again: if its own steps 3 and 4
+  then fail with a failure of the source, it reads again from the pack the version is
+  now read from, as the same load, instead of ending ("Requests and loads", step 5). A followed asset the mount did not rename, whose named version failed with a
   failure of the version, is left as it is, since the same content would fail the same
   way; so is one whose failure was of the source when the mount brings no new source
   for that version. A pack mounted over a damaged or unreadable one, holding the same
@@ -274,7 +278,10 @@ is this crate's (D136), written by `PackBuilder` alone and read by `Store::mount
   pack with the latest place that holds exactly that version; no other pack is tried,
   also not after a failure. If no mounted pack holds it, the load ends inside the call,
   failed with `NotFound`. A recorded failure of `(id, version)` is retried this way. An
-  exact request does not make the asset followed.
+  exact request does not make the asset followed. Finding the pack costs one binary
+  search of each mounted pack's index, latest place first, and so does the end of a load
+  that failed for its source, which looks for a newer one (step 5); the named version of an asset is kept in a map of
+  its own, so a newest request and every look at a dependency cost one map search.
 - `request_newest(id, priority)` makes `id` followed, then: if no mounted pack holds
   `id`, the load ends inside the call, failed with `NotFound` and no version, and
   `{ id, version: None, kind: NotFound }` becomes the asset's newest failure (every time
@@ -306,7 +313,11 @@ is this crate's (D136), written by `PackBuilder` alone and read by `Store::mount
      load then fails with the first of: the kind of its first failed dependency in
      ascending `AssetId` order (it failed for that dependency); `Unsupported` if its
      kind has no loader; the read's failure; what `ErasedLoader::load` returned (in
-     these three it failed for itself). Otherwise it is published.
+     these three it failed for itself). Otherwise it is published. A load that would
+     fail for itself with a failure of the source, when a mount since its steps 3 and 4
+     began has made another pack the one its version is read from, does not end: it
+     runs steps 3 and 4 again from that pack, the same load, still waited for by every
+     `Settled` that waited for it.
   6. **Cycles.** A set of loads in which each waits for each other, directly or through
      loads of the set, is a cycle; a load whose asset declares itself, and so waits for
      itself, is a cycle of one. Its members can never be published, and none of them
@@ -432,11 +443,22 @@ is this crate's (D136), written by `PackBuilder` alone and read by `Store::mount
 
 ### Lookups
 
-- `get`, `newest`, `resolve` and `generation` never start a load, never wait and never
-  block on IO, a decode or a loader: the store holds its lock for its own map work only.
-  They are for code between runs, IO completion and presentation; per-entity code inside
-  the boundary reads through a `PinnedTable`, which takes no lock and touches no atomic
-  (architecture section 3, "No locks on the hot path").
+- `get`, `newest`, `resolve` and `generation` never start a load and never block on IO,
+  a decode or a loader. They are for code between runs, IO completion and presentation;
+  per-entity code inside the boundary reads through a `PinnedTable`, which takes no lock
+  and touches no atomic (architecture section 3, "No locks on the hot path").
+- Nothing runs under the store's lock but the store's own map work: no loader, `io`,
+  executor call, waker (wake or drop), task or future drop, asset drop, or tracing
+  subscriber callback. Each method and each load's end is one step under the lock; what
+  a step lets go of, the wakers it wakes, the tasks it spawns or drops and what it tells
+  the subscriber are carried out after the lock is released, in that order: the
+  subscriber, the wakes, the drops, the tasks. A lookup waits only for the step in
+  progress, and a step's length follows the loads it accepts or ends: a request that
+  accepts a chain of 100,000 links, or the end of a load that 100,000 waited for, is one
+  step of that length (`docs/verification.md` has the measurement). For the cycle
+  searches of step 6, a load found to wait for one whose steps 3 and 4 still run keeps
+  that finding until those steps end or a mount renames something, so that the links of
+  a chain ending one by one are not each walked to its end again.
 - `get(id, version)`: `Ready` if the version is published; else `Failed` with the
   failure recorded when the last load of it ended, if one ended in failure; else
   `Pending`.
@@ -502,12 +524,20 @@ is this crate's (D136), written by `PackBuilder` alone and read by `Store::mount
   nothing; the file, if it was opened, is closed. A `Settled` dropped waits for nothing.
 - The last handle to the store is the last of: every `Store` clone, the `Arc<dyn ..>`
   views made from them included, and every `Mount` and `Settled` not yet resolved or
-  dropped. Load tasks hold none. Dropping the last handle cancels every load in flight:
-  each task is dropped at its next suspension point, a read the pool has not started
-  never starts, one it has started finishes on the pool thread where its buffer is
-  freed, and a loader's call that is running returns and its asset is dropped. Nothing is
-  published afterwards. The drop does not wait for any of it and never blocks. Each
-  mounted pack's descriptor closes when the last read on it has ended.
+  dropped. Load tasks hold none. The last handle's drop closes the store under its lock
+  and then, after the lock is released, drops every load's task: a task is dropped at
+  its next suspension point, a read the pool has not started never starts, and one it
+  has started finishes on the pool thread where its buffer is freed. A load checks that
+  the store is open, under the lock, after its read and its yield and immediately before
+  its loader's call, and the step that would publish it checks again. So after the last
+  handle's drop returns, no load that has not passed its check calls its loader, and
+  nothing is published; a loader call already past its check may still run, and its
+  result is dropped. Each mounted pack's descriptor closes when the last read on it has
+  ended.
+- The drop does not wait for any of it. `Store`'s drop never blocks while the caller
+  keeps an `Executor` handle of its own: when the store's handle is the executor's last,
+  dropping it is the executor's shutdown, which off the executor's own workers joins
+  them, a loader's call in progress included (`crates/task/README.md`).
 - The store owns no thread and has no shutdown. It keeps one `Executor` handle and one
   `Io` handle for its life; `app` drops it before `Io::shutdown` and
   `Executor::shutdown`. Left alive past them it is inert: its lookups still answer, and
@@ -536,8 +566,10 @@ is this crate's (D136), written by `PackBuilder` alone and read by `Store::mount
   starts no load; the caller asks first with `request_newest(RegionBaseline::id(..), ..)`.
 - A baseline declares no dependencies so that it can be read without its region's
   assets: the load of a save validates every section against its baseline, and the diff
-  of an unload needs the baseline alone. The region's asset set is `Baseline::assets`,
-  which its driver requests by name.
+  of an unload needs the baseline alone. At milestone 1 the region's asset set is
+  `Baseline::assets`, which its driver requests by name; the assets of residents the
+  baseline does not hold join it at milestone 3 (architecture section 14,
+  `docs/verification.md`).
 - Every store registers the loader itself; a loader of this kind among
   `Store::new`'s `loaders` is the duplicate `Store::new` refuses.
 - A baseline's load is one `ErasedLoader::load` call like any other kind's, and this
@@ -559,6 +591,13 @@ Everything is at target `silo` (`LOG_TARGET`), the store's codename (architectur
 | `silo.publish` | event, `INFO`, inside the load's span | `asset`, `version`, `current` (whether it became the current version), `generation` | |
 | `silo.current` | event, `INFO` | `asset`, `version`, `generation`: an already published version became current, at a `request_newest` or a mount | |
 | a recorded failure | event, `WARN`, inside the load's span | `asset`, `version`, `kind`, `dependency`, the message | |
+| `silo.search` | event, `TRACE` | `searches` (cycle searches of step 6 in one step), `visits` (loads they visited) | |
+
+- Every span and event is made, recorded and emitted after the lock of the step it
+  reports was released ("Lookups"), on the thread that ran the step, in the step's order.
+  A subscriber's callbacks never run under the lock. A subscriber must not call the
+  store. Another thread can see a step's change (a lookup, a `Settled` resolving)
+  before the subscriber sees the step's events; a load's span closes only after them.
 
 - `silo.mount` is created at the mount's first poll and closed when the future resolves
   or is dropped; its `io.open` span and its two `io.read` spans are created inside it.
@@ -636,9 +675,18 @@ produces. `tests/sketch.rs` compiles the consumers' code against the surface and
 log target, the format version and the baseline kind's key.
 
 Each row below is proved by nextest tests asserting on counts, orders, bytes and values,
-never on timing: a bounded wait (60 s) only turns a hang into a failure, and a test loader
-held and released by the test (`tests/common`, `Gate`) stands in for a slow one. None runs
-under SOUR: this crate is outside the determinism boundary. Tests write packs into
+never on timing: a bounded wait only turns a hang into a failure (60 s; 240 s for the
+three 100,000-link tests, which take seconds unloaded and over a minute on a machine
+loaded near 30, under nextest's 300 s kill), and a test loader held and released by the
+test (`tests/common`, `Gate`) stands in for a slow one. A bounded wait polls its deadline
+before its future, so a wait whose wake was lost fails rather than passing late. The
+point where a load's own steps have ended is reached by observation, not by a sleep: the
+held loader's call has returned, and every other background worker has then run a task
+of the test's (`Env::drain`). The tests of code that calls the store back from where it
+must not run under the lock (`tests/locking.rs`) can only fail by a deadlock: the call
+runs on a thread of its own, and one that has not returned within 10 s exits the test
+process as failed. A test that fails opens every gate as it unwinds, so that its held
+calls return and its process ends with the failure. None runs under SOUR: this crate is outside the determinism boundary. Tests write packs into
 `CARGO_TARGET_TMPDIR` through `Io::replace` and read them through the real pool; the
 sparse files of the format and mount-cost rows, and the damage done to a mounted file in
 place, are written with `std::fs`. `tests/common` also holds a pack writer written from
@@ -648,22 +696,23 @@ theirs. The file of each row is named at its end.
 
 | What | How |
 |---|---|
-| Conformance | `asset-api`'s suite, its 21 checks, passes against the store, once over raw packs and once over `Storage::Zstd` packs, each `provide` one pack written and mounted (`tests/conformance.rs`). Among them, for every store: no answer changes while the generation stands still around a renaming cook; a retry that fails again moves the generation; an exact request of a published version changes nothing; the end of a load of the named version answers `newest` whoever asked; the empty ID; and the failure a load reports with several failing dependencies and with a cycle, in both orders of requests |
+| Conformance | `asset-api`'s suite, its 21 checks, passes against the store, once over raw packs and once over packs whose every entry is one zstd frame (storage code 1, written by the tests' own pack writer, since `PackBuilder` would store the suite's short assets raw), each `provide` one pack written and mounted, the index claiming the version the suite gives, every wait bounded (`tests/conformance.rs`). Among them, for every store: no answer changes while the generation stands still around a renaming cook; a retry that fails again moves the generation; an exact request of a published version changes nothing; the end of a load of the named version answers `newest` whoever asked; the empty ID; and the failure a load reports with several failing dependencies and with a cycle, in both orders of requests |
 | A pack read through `io` | Assets of several sizes, empty and several MiB among them, added raw and compressed, written, mounted, requested, and read back equal through `get_typed`; the compressed ones through `read_encoded_at` (the `io.read` span says `zstd`) with the decode on the background worker; a frame no shorter than its bytes is stored raw (`tests/reads.rs`, `tests/pack.rs`) |
-| The format | Golden bytes of an empty pack, a one-entry and a two-entry pack; the index sorted whatever the add order; each rule of "The pack format" broken in turn refuses the mount with `InvalidData`, nothing mounted; another format version is `VersionMismatch`, and a file without the magic `InvalidData`, before anything else is read; an index length past the file is `InvalidData` with no read of an index, below 1 GiB and above it (a trailer naming 2 GiB in a file of a few bytes), and one within the file and over 1 GiB is `ResourceExhausted` (a sparse file); neither issues a read of the index, and a count past the index (`u32::MAX` in an index of four bytes) is refused with `InvalidData` (that nothing is reserved first is the decoder's order of checks: an allocator that records block sizes needs `unsafe`, which this crate's tests do not have); `add` refuses `AssetId::NONE`, an ID added again with another version, a level of 0 and of 23 and bytes over the cap, adding nothing, and an ID added again with the same version changes no byte of the pack (`tests/pack.rs`) |
+| The format | Golden bytes of an empty pack, a one-entry and a two-entry pack; the index sorted whatever the add order; each rule of "The pack format" broken in turn refuses the mount with `InvalidData`, nothing mounted; another format version is `VersionMismatch`, and a file without the magic `InvalidData`, before anything else is read; an index length past the file is `InvalidData` with no read of an index, below 1 GiB and above it (a trailer naming 2 GiB in a file of a few bytes), and one within the file and over 1 GiB is `ResourceExhausted` (a sparse file); neither issues a read of the index, and a count past the index (`u32::MAX` in an index of four bytes) is refused with `InvalidData` with nothing reserved before the count is checked (`AllocTag::Asset`'s allocation count for the refusal is at most one more, its message, than for an index whose hash is wrong, `tests/index.rs`), and so is an entry's dependency count past the index (`u32::MAX`; no more allocations than for the same entry with no dependencies refused for its storage code); a stored range within the payload area and longer than `MAX_READ_BYTES` is `InvalidData` (a sparse file); a mounted index is charged to `AllocTag::Asset` while the pack is mounted (`tests/index.rs`); `add` refuses `AssetId::NONE`, an ID added again with another version, a level of 0 and of 23 and bytes over the cap, adding nothing, and an ID added again with the same version changes no byte of the pack (`tests/pack.rs`) |
 | Hash verification failure as a value | A pack whose index claims a version its content does not hash to (the harness's `claim`), and a pack with one payload byte flipped, raw and compressed: `Failed` with `InvalidData`, the claimed version in the failure, `warn` logged, no panic; the other assets of the pack load (`tests/reads.rs`) |
 | Mount order | Three packs holding one asset at three versions: mounted in turn, and with the three futures created in order and awaited in reverse, the named version is the last call's; an exact request finds each of the three; a failed and a dropped mount leave a place empty and change nothing; a path mounted, replaced by rename and mounted again serves both contents (`tests/mounts.rs`) |
 | Mount cost | A mount of a pack of 100,000 entries and several hundred MiB of payload issues one `io.open` span and two `io.read` spans, of 24 bytes and of the index's length, and nothing else; its time is recorded with the load averages for the verification row (`tests/spans.rs`) |
 | A publish observed through `generation` | With an asset followed and current, a new pack holding a new version is mounted: the generation is unchanged when the mount resolves, moves when the reload publishes, `newest` then answers the new version and `resolve` a new table, while a handle and a `PinnedTable` taken before still read the old one; a pack that renames nothing followed moves nothing; a pack naming an earlier, published version makes it current at the mount and moves the generation (`tests/mounts.rs`) |
-| Following | An asset requested only by exact version is not reloaded by a mount; a dependency nobody named is reloaded; an asset requested before any pack held it loads when a pack that holds it is mounted; a missing dependency added by a later pack repairs its dependant, and that dependant's dependant, at that mount; an asset that failed for itself is not read again by the mount of a pack that does not hold it (no `io.read` span, the generation unmoved), and is by `request_newest`; one that failed for a dependency is not retried by a mount that renames neither (`tests/mounts.rs`) |
-| A new source for a failed version | An asset and its dependency in one pack, the dependency's payload damaged in place (and, separately, its stored range made to run past the file): both fail. A second pack holding the same versions intact is mounted, renaming nothing: the dependency is read from the second pack and published, and its dependant with it (rules 2 and 3). The same second pack mounted over an asset whose loader refuses its intact bytes, or whose cooked format the loader does not read, or whose kind has no loader, reads nothing and moves nothing; so does a second pack given an earlier place than the damaged one (`tests/mounts.rs`) |
-| The generation's promise | Around a retry held in flight by a gated loader, and around a mount that renames a failed asset: `get`, `newest` and `resolve` answer as before until the load ends, and the generation moves exactly when they change; a repeated `request_newest` of an unknown asset moves it each time; requests for what is published or loading never move it; readers on several threads that read the generation, look, and read it again never see two different answers between two equal reads while packs are mounted and loads end under them (`tests/generation.rs`) |
+| Following | An asset requested only by exact version is not reloaded by a mount; a dependency nobody named is reloaded; an asset requested before any pack held it loads when a pack that holds it is mounted; a missing dependency added by a later pack repairs its dependant, and that dependant's dependant, at that mount; an asset that failed for itself is not read again by the mount of a pack that does not hold it (no `io.read` span, the generation unmoved), and is by `request_newest`; one that failed for a dependency is not retried by a mount that renames neither; rule 3 reads again neither a dependant requested only by exact version nor one renamed, since it failed, to a version that failed for itself (that loader's call is not made again) (`tests/mounts.rs`) |
+| A new source for a failed version | An asset and its dependency in one pack, the dependency's payload damaged in place (and, separately, its stored range made to run past the file): both fail. A second pack holding the same versions intact is mounted, renaming nothing: the dependency is read from the second pack and published, and its dependant with it (rules 2 and 3). The same second pack mounted over an asset whose loader refuses its intact bytes, or whose cooked format the loader does not read, or whose kind has no loader, reads nothing and moves nothing; so does a second pack given an earlier place than the damaged one. Mounted while the damaged version's load is still in flight (held there by a gated dependency), the second pack repairs it too: the load reads again from it. A dependant that failed for a dependency's version in between is repaired by the mount that renames the dependency back to a version still in flight. In both, the store ends where a store new to the process that mounted the same packs in the same order does (`tests/mounts.rs`) |
+| The generation's promise | Around a retry held in flight by a gated loader, and around a mount that renames a failed asset: `get`, `newest` and `resolve` answer as before until the load ends, and the generation moves exactly when they change; a repeated `request_newest` of an unknown asset moves it each time, and an exact request of a version no pack holds moves it; requests for what is published or loading never move it; the failure of an exact request of a version the index does not name changes `get` and not `newest`; readers on several threads that read the generation, look, and read it again never see two different answers between two equal reads while packs are mounted and loads end under them (`tests/generation.rs`) |
 | Failures | Each row of the failure table produced: `Cancelled` by a request after `Io::shutdown`, by a request after `Executor::shutdown` (the request returns, under a bounded wait: the future dropped inside `spawn` records its failure and nothing deadlocks), and for the loads queued behind a gated loader on a one-background-worker executor when it shuts down; a kind without a loader costs no read (no `io.read` span); the reported kind with two failing dependencies is the lower ID's on every run, also when the higher one fails first (gated loaders); a corrupt asset, and one of a kind without a loader, each with a failing dependency, report the dependency's kind (`tests/failures.rs`) |
-| Cycles | A declares [B, C] with B below C, no pack holds B, and C declares [A]: with A's loader gated to end first, and with C's gated to end first, A is `NotFound` and C is `NotFound` in both runs; with the cycle's dependency the lower ID, both are `InvalidData` in both runs; neither member's failure is recorded before the other member's loader has ended (once the request has returned, the generation does not move while either loader is held); a load outside the cycle that depends on a member fails with that member's kind (`tests/failures.rs`) |
-| Long chains | One pack of a 100,000-link dependency chain: `request_newest` of its head from a task on a background worker accepts every link in that one call, all are published and `resolve` of the head returns 100,000 entries; the same chain closed into a cycle fails every member `InvalidData`; the chain with its last link's dependency missing fails every link `NotFound`, and a pack that adds the missing asset repairs all 100,000 at its mount (rule 3). None overflows a worker's stack (`tests/failures.rs`) |
-| Settling | `settled()` resolves only after a gated load ends, resolves while a load accepted after its first poll is still held, covers the dependencies and the loads a mount accepted, and resolves after an executor shutdown (`tests/settling.rs`) |
-| Cancellation by drop | On an executor with one background worker, with more loads accepted than that and every loader gated, the last handle is dropped while the first loader's call is held: the drop returns at once; when the gate opens the held call returns, its asset is dropped, and no other loader call ever begins (counted by the loader); `AllocTag::Io` live bytes return, once the pool is idle, to what they were before the store was made (with one pool thread, after one pack was written: what the pool keeps for itself until it stops is not the store's); a handle taken before the drop still reads its asset. On a store kept alive, a `Mount` polled once and dropped mounts nothing: a request for its asset is `NotFound` (`tests/drop.rs`, and `tests/mounts.rs` for a dropped mount) |
-| Memory tags and threads | A loader observes `AllocTag::current() == Asset` and a background worker's thread, whatever tag and thread the requester had; the store's lock is not held across a gated loader (a lookup returns while the loader is held) (`tests/settling.rs`) |
-| The region baseline | `name` and `id` golden values, `id` the `AssetId::from_name` of `name`; `cook` then a load through the store and through the reference store gives a baseline equal to the original, shared by `Arc`; `lookup` is `Pending` before the request, `Ready` after, `InvalidData` for another kind under the ID and for a baseline under the wrong ID; a baseline cooked with a dependency is refused by the loader (`tests/baseline.rs`) |
+| Cycles | A declares [B, C] with B below C, no pack holds B, and C declares [A]: with A's loader gated to end first, and with C's gated to end first, A is `NotFound` and C is `NotFound` in both runs; with the cycle's dependency the lower ID, both are `InvalidData` in both runs; neither member's failure is recorded before the other member's loader has ended (once one member's call has returned and its steps have ended, the generation does not move while the other's is held); a load outside the cycle that depends on a member fails with that member's kind. A cycle a mount's rename forms among loads one of which was found to wait for a load whose call is held is decided while that call is still held, and so is one a rename forms onto a version whose load waits already, at that mount. The cycle searches of a chain of 2,000 links ending one by one, tail first and head first, each link also declaring a leaf that publishes in between, visit at most 8 loads per link in all (`silo.search`'s `visits`; about 3.5 and 4.6 measured) (`tests/failures.rs`) |
+| Long chains | One pack of a 100,000-link dependency chain: `request_newest` of its head from a task on a background worker accepts every link in that one call, all are published and `resolve` of the head returns 100,000 entries; the same chain closed into a cycle fails every member `InvalidData`; the chain with its last link's dependency missing fails every link `NotFound`, and a pack that adds the missing asset repairs all 100,000 at its mount (rule 3). None overflows a worker's stack. These three need the 240 s bound under load (`tests/failures.rs`) |
+| Settling | `settled()` resolves only after a gated load ends, resolves while a load accepted after its first poll is still held, covers the dependencies and the loads a mount accepted, and resolves after an executor shutdown; a `Settled` first polled while a load is held is woken exactly once by the step that publishes it, and by the step that fails it, counted after the executor's shutdown joined the worker that ran the step, with no wait (`tests/settling.rs`) |
+| Cancellation by drop | On an executor with one background worker, with more loads accepted than that and every loader gated, the last handle is dropped while the first loader's call is held: the drop returns at once; when the gate opens the held call returns, its asset is dropped, and no other loader call ever begins (counted by the loader); `AllocTag::Io` live bytes return, once the pool is idle, to its baseline: the pool's swept-directory set, one entry per directory replaced into, kept under `AllocTag::Io` until the pool stops, measured after one pack was written into the test's one directory; a handle taken before the drop still reads its asset. With the store's state kept alive past the drop by a publish stopped on another worker: a load stopped between its yield and its check calls no loader, and a loader call past its check when the drop returns publishes nothing (no `silo.publish` after it) and its asset is dropped, not kept. No load task polled for the first time after the drop submits a read, and no read queued in the pool behind a held one runs after it (Unix: a FIFO holds the pool's one thread). On a store kept alive, a `Mount` polled once and dropped mounts nothing: a request for its asset is `NotFound` (`tests/drop.rs`, `tests/locking.rs`, and `tests/mounts.rs` for a dropped mount) |
+| Nothing under the lock | Each of these calls the store back, and returns: a lookup and a request while a loader's call is held (`tests/settling.rs`); a waker whose wake calls the store; a waker whose drop calls the store, replaced by a second poll; an executor task whose last waker is replaced, and whose future's drop takes the lock; an asset whose drop calls the store, dropped by the step that fails its load for a dependency; a `Settled` dropped while the store holds the only handle to a waker whose drop calls the store; a lookup while the subscriber is held at a `silo.publish`. And a loader call past its check at the last handle's drop ends while an earlier such call's asset is held in its drop (`tests/locking.rs`) |
+| Memory tags and threads | A loader observes `AllocTag::current() == Asset` and a background worker's thread, whatever tag and thread the requester had (`tests/settling.rs`) |
+| The region baseline | `name` and `id` golden values, `id` the `AssetId::from_name` of `name`; `cook` then a load through the store and through the reference store gives a baseline equal to the original, shared by `Arc`; `lookup` is `Pending` before the request, `Ready` after, `InvalidData` for another kind under the ID and for a baseline under the wrong ID; a baseline cooked with a dependency is refused by the loader; a second loader of the baseline kind among `Store::new`'s loaders, like a second loader of any kind, is `InvalidData` (`tests/baseline.rs`) |
 | A boundary world's read | With `lactose-ecs` and `lactose-sim` as dev-dependencies: a table resolved and pinned from the store enters a world (built by `SimulationBuilder`, never stepped) through `World::set_region_assets`, the world reads a `SimulationAsset` through the table it holds, and after a reload it reads the old version until the new table is set (`tests/baseline.rs`). A kernel reading it through `Ctx::assets()` needs a world that runs a system, which is a simulation test and so `[harness]` work: that part of the `docs/verification.md` item on `Ctx::assets` stays open |
-| Tracing | A capturing subscriber sees the spans and events of the table with their fields, `silo.load` a root span with the read's `io.read` inside it, nothing for a request that does nothing, and one `warn` per recorded failure (`tests/spans.rs`; the `warn` of a damaged asset also in `tests/reads.rs`) |
+| Tracing | A capturing subscriber sees the spans and events of the table with their fields, `silo.load` a root span with the read's `io.read` inside it, nothing for a request that does nothing, and one `warn` per recorded failure, read once every `silo.load` span has closed, since a step's events follow its release of the lock (`tests/spans.rs`; the `warn` of a damaged asset also in `tests/reads.rs`) |

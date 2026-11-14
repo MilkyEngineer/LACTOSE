@@ -73,6 +73,7 @@ mod baseline;
 mod pack;
 mod state;
 mod store;
+mod trace;
 
 pub use baseline::{RegionBaseline, RegionBaselineLoader};
 pub use pack::{PACK_FORMAT_VERSION, PackBuilder, Storage};

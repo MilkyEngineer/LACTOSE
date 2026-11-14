@@ -18,7 +18,7 @@ use lactose_task::{Executor, WorkerClass, yield_now};
 use tracing::Instrument;
 use tracing::field::{Empty, debug};
 
-use crate::state::{Cause, Hex, Key, Loaders, Pack, Spawn, State, Step, key};
+use crate::state::{Cause, Effects, Hex, Key, Leftover, Loaders, Pack, Spawn, State, Step, key};
 use crate::{LOG_TARGET, RegionBaselineLoader, pack};
 
 /// A handle to the asset store: `Clone`, one store per process, every clone the same store.
@@ -44,22 +44,36 @@ use crate::{LOG_TARGET, RegionBaselineLoader, pack};
 ///   for those that had failed for one of either, which is the store's hot reload.
 ///
 /// No method blocks, waits for IO or runs a loader: loads run as tasks on the executor's
-/// background workers, and a lookup holds the store's lock for its own map work only,
-/// never across a read, a decode or a loader.
+/// background workers, and the store's lock is held for its own map work only, never
+/// across a read, a decode, a loader, a waker, a drop or a `tracing` callback.
 ///
-/// Dropping the last handle cancels every load in flight; [`Settled`] and [`Mount`] each
-/// hold one. The store owns no thread and has no shutdown of its own: once the executor
-/// or the pool has stopped, a load fails with `ErrorKind::Cancelled`.
+/// Dropping the last handle closes the store and cancels every load in flight;
+/// [`Settled`] and [`Mount`] each hold one. `README.md`, "Settling, cancellation and
+/// shutdown", says exactly what holds once that drop returns. The store owns no thread
+/// and has no shutdown of its own: once the executor or the pool has stopped, a load
+/// fails with `ErrorKind::Cancelled`.
 #[derive(Clone)]
 pub struct Store {
+    handle: Arc<Handle>,
+}
+
+/// What [`Store`], [`Mount`] and [`Settled`] hold: dropping the last of them closes the
+/// store. Load tasks never hold one, only a `Weak` of the [`Inner`] behind it.
+struct Handle {
     inner: Arc<Inner>,
 }
 
-/// What the handles share. Hidden and changeable: the packs, the loads and the published
-/// versions the implementation keeps beside these are its own.
-///
-/// Load tasks hold a `Weak` of it and never a handle, so dropping the last handle drops
-/// `state`, and with it every load's `Task`, which cancels the load.
+impl Drop for Handle {
+    fn drop(&mut self) {
+        // The tasks are dropped, which cancels their loads, after the lock is released:
+        // a dropped task's future ends its load under the lock again.
+        let tasks = self.inner.lock().close();
+        drop(tasks);
+    }
+}
+
+/// What the handles and the load tasks share. Hidden and changeable: the packs, the loads
+/// and the published versions the implementation keeps beside these are its own.
 struct Inner {
     executor: Executor,
     io: Io,
@@ -96,7 +110,12 @@ impl Store {
             }
         }
         let state = Mutex::new(State::default());
-        Ok(Self { inner: Arc::new(Inner { executor, io, loaders: Arc::new(indexed), state }) })
+        let inner = Arc::new(Inner { executor, io, loaders: Arc::new(indexed), state });
+        Ok(Self { handle: Arc::new(Handle { inner }) })
+    }
+
+    fn inner(&self) -> &Arc<Inner> {
+        &self.handle.inner
     }
 
     /// Mounts the pack at `path`: opens it through the pool, reads its trailer and its
@@ -117,7 +136,10 @@ impl Store {
     /// failed for a reason of the source (the read, or content that did not hash to its
     /// version) when this pack holds that version and is now where it is read from; and,
     /// transitively, for every followed asset whose named version last failed for a
-    /// dependency the mount asks for again. A followed asset the mount did not rename and
+    /// dependency the mount asks for again or renamed to a version already loading. A load
+    /// in flight whose read or content fails for its source reads again, as the same load,
+    /// from the pack with the latest place that holds its version, if a mount made that
+    /// another pack after the load was accepted. A followed asset the mount did not rename and
     /// whose named version failed for a reason of the version (no loader, another cooked
     /// format, a loader refusing intact bytes) is not retried.
     ///
@@ -144,8 +166,8 @@ impl Store {
     #[must_use = "a mount does nothing until polled"]
     pub fn mount(&self, path: impl Into<PathBuf>) -> Mount {
         let path = path.into();
-        let place = self.inner.lock().take_place();
-        Mount { run: Box::pin(Arc::clone(&self.inner).mount(place, path)) }
+        let place = self.inner().lock().take_place();
+        Mount { run: Box::pin(mount(Arc::clone(&self.handle), place, path)) }
     }
 
     /// A future that resolves once every load the store accepted before the future's first
@@ -155,20 +177,23 @@ impl Store {
     /// that finds something to load, the loads of its dependencies with it, and the
     /// requests a mount makes when it resolves. The future waits for no load accepted
     /// after its first poll, except as a load accepted before waits for one (a dependency
-    /// that a later mount renamed). Every accepted load ends, also when the executor or
+    /// that a later mount renamed); a load that reads again from a newer source is still
+    /// the load it was. Every accepted load ends, also when the executor or
     /// the pool has stopped (it then fails with `Cancelled`), so the future always
     /// resolves. It is the store's one wait, for tools, tests and a start-up that must not
     /// step before its content is in: a frame loop watches `AssetCatalog::generation`
     /// instead.
     #[must_use = "futures do nothing unless awaited"]
     pub fn settled(&self) -> Settled {
-        Settled { run: Box::pin(Wait { store: Some(Arc::clone(&self.inner)), slot: None }) }
+        Settled { run: Box::pin(Wait { store: Some(Arc::clone(&self.handle)), slot: None }) }
     }
 }
 
 impl fmt::Debug for Store {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Store").field("loaders", &self.inner.loaders.len()).finish_non_exhaustive()
+        f.debug_struct("Store")
+            .field("loaders", &self.inner().loaders.len())
+            .finish_non_exhaustive()
     }
 }
 
@@ -187,7 +212,7 @@ impl PublishedAssets for Store {
     /// at milestone 1. A request for `AssetId::NONE` does nothing.
     fn request(&self, id: AssetId, version: AssetVersion, priority: LoadPriority) {
         if !id.is_none() {
-            self.inner.step(|step| step.exact(id, version, priority));
+            self.inner().step(|step| step.exact(id, version, priority));
         }
     }
 
@@ -199,7 +224,7 @@ impl PublishedAssets for Store {
         if id.is_none() {
             return Readiness::Failed(no_asset());
         }
-        self.inner.lock().get(id, version)
+        self.inner().lock().get(id, version)
     }
 }
 
@@ -214,7 +239,7 @@ impl AssetCatalog for Store {
     /// 1. A request for `AssetId::NONE` does nothing.
     fn request_newest(&self, id: AssetId, priority: LoadPriority) {
         if !id.is_none() {
-            self.inner.step(|step| step.newest(id, priority, "newest"));
+            self.inner().step(|step| step.newest(id, priority, "newest"));
         }
     }
 
@@ -229,7 +254,7 @@ impl AssetCatalog for Store {
         if id.is_none() {
             return Readiness::Failed(no_asset());
         }
-        self.inner.lock().newest(id)
+        self.inner().lock().newest(id)
     }
 
     /// The table of the trait, taken in one critical section: `Failed` with the failure of
@@ -237,7 +262,7 @@ impl AssetCatalog for Store {
     /// member's is `Pending`; else the current version of every member and of every asset
     /// those versions declare as a dependency, transitively.
     fn resolve(&self, set: &AssetSet) -> Readiness<VersionTable> {
-        self.inner.lock().resolve(set)
+        self.inner().lock().resolve(set)
     }
 
     /// Moves, by at least one and in one step with the change under the store's lock, when
@@ -246,7 +271,7 @@ impl AssetCatalog for Store {
     /// otherwise, and while it is unchanged `get`, `newest` and `resolve` answer as they
     /// did: no lookup sees a change this does not show yet, nor the reverse.
     fn generation(&self) -> u64 {
-        self.inner.lock().generation()
+        self.inner().lock().generation()
     }
 }
 
@@ -286,68 +311,79 @@ impl Inner {
     }
 
     /// Runs `change` as one critical section and ends what can end, then, with the lock
-    /// released, wakes the waits that ended and spawns the loads that were accepted.
+    /// released, carries out the step's effects in their order: tells the subscriber,
+    /// wakes the waits that ended, drops what the step let go of, lets go of ended loads'
+    /// tasks and spawns the loads that were accepted.
     fn step<R>(self: &Arc<Self>, change: impl FnOnce(&mut Step<'_>) -> R) -> R {
         let (result, effects) = {
             let mut state = self.lock();
             let mut step = Step::new(&mut state, &self.loaders);
             let result = change(&mut step);
             step.settle();
-            (result, step.effects)
+            (result, step.finish())
         };
-        for waker in effects.wakers {
+        let Effects { traces, wakers, dropped, tasks, spawns } = effects;
+        for trace in traces {
+            trace.emit();
+        }
+        for waker in wakers {
             waker.wake();
         }
-        for task in effects.tasks {
+        drop(dropped);
+        for task in tasks {
             task.detach();
         }
-        for spawn in effects.spawns {
+        for spawn in spawns {
             self.spawn(spawn);
         }
         result
     }
 
-    /// Spawns steps 3 and 4 of an accepted load. Outside the lock: a shut-down executor
-    /// drops the future inside `spawn`, and its guard then takes the lock to record the
-    /// load as cancelled.
+    /// Spawns a run of steps 3 and 4. Outside the lock: a shut-down executor drops the
+    /// future inside `spawn`, and its guard then takes the lock to record the load as
+    /// cancelled.
     fn spawn(self: &Arc<Self>, spawn: Spawn) {
-        let (key, seq) = (key(spawn.id, spawn.version), spawn.seq);
-        let span = spawn.span.clone();
-        let guard = Cancelled { store: Arc::downgrade(self), key, seq, armed: true };
-        let run = run_load(Arc::downgrade(self), Arc::clone(&self.loaders), spawn, guard);
+        let (key, run) = (key(spawn.id, spawn.version), spawn.run);
+        let span = spawn.trace.span().clone();
+        let guard = Cancelled { store: Arc::downgrade(self), key, run, armed: true };
+        let future = run_load(Arc::downgrade(self), Arc::clone(&self.loaders), spawn, guard);
         let task = {
             // A task re-enters its spawner's tag for every poll and for its drop.
             let _tag = AllocTag::Asset.scope();
-            self.executor.spawn(WorkerClass::Background, run.instrument(span))
+            self.executor.spawn(WorkerClass::Background, future.instrument(span))
         };
-        let unused = self.lock().give_task(key, seq, task);
-        if let Some(task) = unused {
-            task.detach();
+        let leftover = self.lock().give_task(key, run, task);
+        match leftover {
+            None => {}
+            Some(Leftover::Detach(task)) => task.detach(),
+            Some(Leftover::Cancel(task)) => drop(task),
         }
     }
+}
 
-    /// The future of [`Store::mount`], for the place the call took.
-    async fn mount(self: Arc<Self>, place: usize, path: PathBuf) -> Result<()> {
-        let span = tracing::info_span!(
-            target: LOG_TARGET,
-            "silo.mount",
-            path = %path.display(),
-            place = place as u64,
-            assets = Empty,
-            requested = Empty,
-            error = Empty,
-        );
-        match read_pack(&self.io, &path).instrument(span.clone()).await {
-            Ok(pack) => {
-                span.record("assets", pack.entries.len() as u64);
-                let requested = span.in_scope(|| self.step(|step| step.mounted(place, &pack)));
-                span.record("requested", requested);
-                Ok(())
-            }
-            Err(error) => {
-                span.record("error", debug(error.kind()));
-                Err(error)
-            }
+/// The future of [`Store::mount`], for the place the call took. It holds a handle, so the
+/// store stays open while a mount is in flight.
+async fn mount(handle: Arc<Handle>, place: usize, path: PathBuf) -> Result<()> {
+    let span = tracing::info_span!(
+        target: LOG_TARGET,
+        "silo.mount",
+        path = %path.display(),
+        place = place as u64,
+        assets = Empty,
+        requested = Empty,
+        error = Empty,
+    );
+    let inner = &handle.inner;
+    match read_pack(&inner.io, &path).instrument(span.clone()).await {
+        Ok(pack) => {
+            span.record("assets", pack.entries.len() as u64);
+            let requested = span.in_scope(|| inner.step(|step| step.mounted(place, &pack)));
+            span.record("requested", requested);
+            Ok(())
+        }
+        Err(error) => {
+            span.record("error", debug(error.kind()));
+            Err(error)
         }
     }
 }
@@ -372,14 +408,15 @@ async fn read_pack(io: &Io, path: &Path) -> Result<Arc<Pack>> {
     Ok(Arc::new(Pack { file, entries }))
 }
 
-/// Steps 3 and 4 of a load, on a background worker: the read, one yield, the loader's
-/// call. It holds no handle to the store, so that dropping the last one cancels it.
+/// A run of steps 3 and 4 of a load, on a background worker: the read, one yield, the
+/// check, the loader's call. It holds no handle to the store, so that dropping the last
+/// one closes the store and cancels it.
 ///
 /// `guard` is an argument, not a local, so that it lives in the future from the call on:
 /// a future dropped before its first poll (inside `spawn`, at an executor's shutdown)
 /// drops it too, and the load still ends.
 async fn run_load(store: Weak<Inner>, loaders: Arc<Loaders>, spawn: Spawn, mut guard: Cancelled) {
-    let Spawn { id, version, seq, source, span } = spawn;
+    let Spawn { id, version, run, source, trace } = spawn;
     let key = key(id, version);
     let entry = source.entry();
     let read = if entry.compressed {
@@ -391,10 +428,12 @@ async fn run_load(store: Weak<Inner>, loaders: Arc<Loaders>, spawn: Spawn, mut g
     let result = match read.await {
         Err(error) => Err((error, Cause::Source)),
         Ok(bytes) => {
-            span.record("bytes", bytes.len() as u64);
+            trace.span().record("bytes", bytes.len() as u64);
             yield_now().await;
-            if store.strong_count() == 0 {
-                // No loader's call begins once the last handle is gone.
+            // The check: no loader's call begins once the store is closed. It reads
+            // `closed` under the lock, which the last handle's drop sets under it.
+            let open = store.upgrade().is_some_and(|store| !store.lock().closed());
+            if !open {
                 guard.armed = false;
                 return;
             }
@@ -410,7 +449,7 @@ async fn run_load(store: Weak<Inner>, loaders: Arc<Loaders>, spawn: Spawn, mut g
     };
     guard.armed = false;
     if let Some(store) = store.upgrade() {
-        store.step(|step| step.own_done(key, seq, result));
+        store.step(|step| step.own_done(key, run, result));
     }
 }
 
@@ -419,7 +458,7 @@ async fn run_load(store: Weak<Inner>, loaders: Arc<Loaders>, spawn: Spawn, mut g
 struct Cancelled {
     store: Weak<Inner>,
     key: Key,
-    seq: u64,
+    run: u64,
     armed: bool,
 }
 
@@ -429,8 +468,8 @@ impl Drop for Cancelled {
             && let Some(store) = self.store.upgrade()
         {
             let error = Error::new(ErrorKind::Cancelled, "the load's task was dropped");
-            let (key, seq) = (self.key, self.seq);
-            store.step(|step| step.own_done(key, seq, Err((error, Cause::Source))));
+            let (key, run) = (self.key, self.run);
+            store.step(|step| step.own_done(key, run, Err((error, Cause::Source))));
         }
     }
 }
@@ -443,7 +482,7 @@ fn no_asset() -> AssetFailure {
 /// The future inside [`Settled`]: a handle to the store until it resolves, and from its
 /// first poll its number among the waits and its mark.
 struct Wait {
-    store: Option<Arc<Inner>>,
+    store: Option<Arc<Handle>>,
     slot: Option<(u64, u64)>,
 }
 
@@ -452,8 +491,13 @@ impl Future for Wait {
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
         let this = &mut *self;
-        let Some(store) = &this.store else { return Poll::Ready(()) };
-        if !store.lock().poll_settled(&mut this.slot, cx.waker()) {
+        let Some(handle) = &this.store else { return Poll::Ready(()) };
+        // A waker's clone and drop are code that is not the store's: both happen here,
+        // outside the lock.
+        let waker = cx.waker().clone();
+        let (done, unused) = handle.inner.lock().poll_settled(&mut this.slot, waker);
+        drop(unused);
+        if !done {
             return Poll::Pending;
         }
         this.store = None;
@@ -463,8 +507,9 @@ impl Future for Wait {
 
 impl Drop for Wait {
     fn drop(&mut self) {
-        if let (Some(store), Some((number, _))) = (self.store.take(), self.slot) {
-            store.lock().forget_settled(number);
+        if let (Some(handle), Some((number, _))) = (self.store.take(), self.slot) {
+            let unused = handle.inner.lock().forget_settled(number);
+            drop(unused);
         }
     }
 }

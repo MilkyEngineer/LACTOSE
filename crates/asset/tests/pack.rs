@@ -455,3 +455,27 @@ fn an_index_within_the_file_and_over_the_cap_is_resource_exhausted() {
     std::fs::remove_file(path).unwrap();
     env.shutdown();
 }
+
+#[test]
+fn a_stored_range_within_the_payload_and_over_the_cap_is_invalid() {
+    let env = Env::new("pack_stored_over_the_cap");
+    // A zstd entry whose stored range lies within a sparse payload area of 1 GiB and one
+    // byte, so that only the cap on one read refuses it.
+    let len = MAX_READ_BYTES + 1;
+    let entry = RawEntry { storage: 1, stored: len, decoded: 16, ..RawEntry::raw(1, 1, 0, len) };
+    let sealed = seal(&[], &index(1, &[entry]));
+    let path = env.dir.join("stored-over-the-cap.pack");
+    let mut file = std::fs::File::create(&path).unwrap();
+    file.set_len(len).unwrap();
+    file.seek(SeekFrom::Start(len)).unwrap();
+    file.write_all(&sealed).unwrap();
+    drop(file);
+
+    let (loaders, _) = test_loaders();
+    let store = env.store(loaders);
+    let refused = env.mount(&store, path.clone()).unwrap_err();
+    assert_eq!(refused.kind(), ErrorKind::InvalidData);
+    assert_nothing_mounted(&env, &store);
+    std::fs::remove_file(path).unwrap();
+    env.shutdown();
+}

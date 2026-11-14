@@ -19,10 +19,11 @@ static ALLOCATOR: TaggedAlloc = TaggedAlloc::system();
 #[test]
 fn dropping_the_last_handle_cancels_every_load_and_never_blocks() {
     let env = Env::one_thread_each("drop_last_handle");
-    // The pool keeps what its thread allocates for itself under `AllocTag::Io` at start
-    // and at its first replace (the thread's own state, the directories it has swept of
-    // stale temporaries) until it stops; one pack written measures that. A replace
-    // completes after it frees what it allocated, so nothing of its own is in flight.
+    // The baseline of `AllocTag::Io` is the pool's swept-directory set: one entry per
+    // directory replaced into, kept under `AllocTag::Io` until the pool stops. Every pack
+    // of this test is written into one directory, so one pack written before the
+    // measurement adds that entry. A replace completes after it frees what else it
+    // allocated, so nothing of its own is in flight.
     env.pack(&[(id("warm"), text(b"warm", []))], lactose_asset::Storage::Raw);
     let idle = ALLOCATOR.stats(AllocTag::Io).live_bytes;
     let (loaders, gate) = test_loaders();

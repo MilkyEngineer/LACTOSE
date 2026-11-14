@@ -8,8 +8,9 @@ mod common;
 
 use std::future::Future;
 use std::pin::{Pin, pin};
-use std::sync::mpsc;
-use std::task::{Context, Poll, Waker};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, mpsc};
+use std::task::{Context, Poll, Wake, Waker};
 
 use common::*;
 use lactose_asset::Settled;
@@ -129,20 +130,69 @@ fn lookups_return_while_a_loader_is_held() {
     gate.wait_entered(b"held");
 
     let (answered, answers) = mpsc::channel();
+    let (returned, returns) = mpsc::channel();
     let reader = store.clone();
     std::thread::spawn(move || {
         let mut set = AssetSet::new();
         set.insert(other);
-        let generation = reader.generation();
         let newest = reader.newest(held).map(|_| ());
         let resolved = reader.resolve(&set).map(|table| table.len());
+        let _ = reader.generation();
         reader.request_newest(held, NOW);
-        answered.send((generation, newest, resolved)).unwrap();
+        returned.send(()).unwrap();
+        answered.send((newest, resolved)).unwrap();
     });
-    let (_, newest, resolved) = answers.recv_timeout(LIMIT).expect("the lookups returned");
+    returns_or_exit(&returns, "a lookup while a loader's call is held");
+    let (newest, resolved) = answers.recv().unwrap();
     assert_eq!(newest, Readiness::Pending);
     assert_eq!(resolved, Readiness::Ready(1));
     gate.open(b"held");
     env.settle(&store);
     env.shutdown();
+}
+
+/// A waker that counts its wakes.
+#[derive(Default)]
+struct Counting(AtomicU64);
+
+impl Wake for Counting {
+    fn wake(self: Arc<Self>) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+/// A `Settled` first polled while `asset`'s held load is in flight is woken by the step
+/// that ends it. The executor's shutdown joins the worker that ran the step, which wakes
+/// before its poll returns, so the count is read after any wake: no wait bounds it.
+fn woken_when(name: &str, bytes: &'static [u8]) -> (u64, bool) {
+    let env = Env::new(name);
+    let (loaders, gate) = test_loaders();
+    let store = env.store(loaders);
+    let x = id("x");
+    env.provide(&store, &[(x, gated(bytes, []))]);
+    gate.hold(bytes);
+    store.request_newest(x, NOW);
+    let counting = Arc::new(Counting::default());
+    let waker = Waker::from(Arc::clone(&counting));
+    let mut settled = pin!(store.settled());
+    assert_eq!(settled.as_mut().poll(&mut Context::from_waker(&waker)), Poll::Pending);
+    gate.wait_entered(bytes);
+    gate.open(bytes);
+    eventually("the load ended", || store.newest(x).map(|_| ()) != Readiness::Pending);
+    env.executor.clone().shutdown();
+    let published = store.newest(x).ready().is_some();
+    let woken = counting.0.load(Ordering::SeqCst);
+    assert_eq!(poll(settled.as_mut()), Poll::Ready(()));
+    env.io.clone().shutdown();
+    (woken, published)
+}
+
+#[test]
+fn a_wait_is_woken_by_the_publish_that_ends_it() {
+    assert_eq!(woken_when("settling_woken_publish", b"published"), (1, true));
+}
+
+#[test]
+fn a_wait_is_woken_by_the_failure_that_ends_it() {
+    assert_eq!(woken_when("settling_woken_failure", b"refuse"), (1, false));
 }

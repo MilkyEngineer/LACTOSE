@@ -15,7 +15,9 @@ use common::capture::capture;
 use common::format::index_range;
 use common::*;
 use lactose_asset::{Storage, Store};
-use lactose_asset_api::{AssetCatalog, AssetId, AssetSet, CookedAsset, LoadPriority, Readiness};
+use lactose_asset_api::{
+    AssetCatalog, AssetId, AssetSet, CookedAsset, LoadPriority, PublishedAssets, Readiness,
+};
 use lactose_core::ErrorKind;
 use lactose_task::WorkerClass;
 use tracing::Level;
@@ -264,12 +266,11 @@ fn cycle(name: &str, member_lower: bool, c_first: bool) -> (ErrorKind, ErrorKind
     let first: &[u8] = if c_first { b"c" } else { b"a" };
     gate.open(first);
     gate.wait_returned(first);
-    // Neither member's failure is recorded while the other's loader is held: the first's
-    // task is given time to end its steps.
-    for _ in 0..200 {
-        assert_eq!(store.generation(), generation);
-        std::thread::sleep(std::time::Duration::from_millis(1));
-    }
+    // The first member's steps 3 and 4 have ended once the three workers the other's held
+    // loader leaves free have each returned from their polls; neither member's failure is
+    // recorded while the other's loader is held.
+    env.drain(3);
+    assert_eq!(store.generation(), generation);
     assert_eq!(store.newest(a).map(|_| ()), Readiness::Pending);
     assert_eq!(store.newest(c).map(|_| ()), Readiness::Pending);
     gate.open_all();
@@ -299,6 +300,127 @@ fn a_cycle_that_comes_back_round_is_invalid_data_whichever_member_ends_first() {
         let kinds = cycle(&name, true, c_first);
         let invalid = ErrorKind::InvalidData;
         assert_eq!(kinds, (invalid, invalid, invalid));
+    }
+}
+
+/// A cycle formed by a rename, among loads one of which was found to wait for a load
+/// still running before the rename: A declares B, B at its first version declares C,
+/// whose loader is held, and a mount renames B to a version that declares A. A and B's
+/// new version fail as a cycle while C's call is still held.
+#[test]
+fn a_cycle_a_rename_forms_behind_a_running_load_is_decided_while_it_runs() {
+    let env = Env::with_background_workers("failures_cycle_renamed", 4);
+    let (loaders, gate) = test_loaders();
+    let store = env.store(loaders);
+    let (a, b, c) = (id("renamed a"), id("renamed b"), id("renamed c"));
+    env.provide(&store, &[(a, gated(b"a", [b])), (b, gated(b"b1", [c])), (c, gated(b"c", []))]);
+    gate.hold(b"a");
+    gate.hold(b"c");
+    store.request_newest(a, NOW);
+    gate.wait_entered(b"a");
+    gate.wait_entered(b"c");
+    gate.wait_returned(b"b1");
+    // B's first version's steps 3 and 4 have ended: it waits for C, which runs.
+    env.drain(2);
+    gate.open(b"a");
+    gate.wait_returned(b"a");
+    // A's have ended too: A was found to wait, through B, for C.
+    env.drain(3);
+    assert_eq!(store.newest(a).map(|_| ()), Readiness::Pending);
+
+    env.provide(&store, &[(b, gated(b"b2", [a]))]);
+    gate.wait_returned(b"b2");
+    env.drain(3);
+    assert_eq!(failed_kind(&store, a), Some(ErrorKind::InvalidData));
+    assert_eq!(failed_kind(&store, b), Some(ErrorKind::InvalidData));
+    assert!(gate.returned().iter().all(|returned| returned != b"c"), "C's call is held");
+    gate.open(b"c");
+    env.settle(&store);
+    env.shutdown();
+}
+
+/// A cycle a rename forms onto a version whose load waits already: W declares D, named at
+/// a version whose dependency's loader is held; D's other version, requested exactly,
+/// declares W. A mount that renames D to that version decides W and it at once, while
+/// the held call still runs, since the rename gives W another look.
+#[test]
+fn a_rename_onto_a_waiting_version_that_closes_a_cycle_decides_it_at_the_mount() {
+    let env = Env::with_background_workers("failures_cycle_rename_waiting", 4);
+    let (loaders, gate) = test_loaders();
+    let store = env.store(loaders);
+    let (w, d, c) = (id("waiting w"), id("waiting d"), id("waiting c"));
+    let d2 = gated(b"d2", [w]);
+    let version = d2.version();
+    env.provide(&store, &[(w, gated(b"w", [d])), (d, d2.clone())]);
+    env.provide(&store, &[(d, gated(b"d1", [c])), (c, gated(b"c", []))]);
+    gate.hold(b"c");
+    store.request_newest(w, NOW);
+    gate.wait_entered(b"c");
+    store.request(d, version, NOW);
+    for bytes in [b"w".as_slice(), b"d1", b"d2"] {
+        gate.wait_returned(bytes);
+    }
+    // Every call but C's has ended its steps 3 and 4: W waits, through D's first
+    // version, for C, and D's second version waits for W.
+    env.drain(3);
+    assert_eq!(store.newest(w).map(|_| ()), Readiness::Pending);
+
+    env.provide(&store, &[(d, d2)]);
+    assert_eq!(failed_kind(&store, w), Some(ErrorKind::InvalidData));
+    assert_eq!(failed_kind(&store, d), Some(ErrorKind::InvalidData));
+    assert!(gate.returned().iter().all(|returned| returned != b"c"), "C's call is held");
+    gate.open(b"c");
+    env.settle(&store);
+    env.shutdown();
+}
+
+/// The successors the cycle searches visit in all, while the links of a chain of `n` end
+/// their steps 3 and 4 one by one, each also declaring a leaf that publishes in between;
+/// the chain's last link declares a load whose call is held until every leaf published.
+/// `tail_first` requests the links from the tail, so that each ending link was found
+/// behind the held load by the one after it; otherwise from the head.
+fn search_visits(n: usize, tail_first: bool) -> u64 {
+    let capture = capture();
+    let env = Env::with_background_workers(&format!("failures_walk_{tail_first}"), 4);
+    let (loaders, gate) = test_loaders();
+    let store = env.store(loaders);
+    let link = |at: usize| id(&format!("walk link {at}"));
+    let leaf = |at: usize| id(&format!("walk leaf {at}"));
+    let held = id("walk held");
+    let mut assets = vec![(held, gated(b"held", []))];
+    for at in 0..n {
+        let next = if at + 1 < n { link(at + 1) } else { held };
+        assets.push((link(at), text(format!("link {at}").as_bytes(), [next, leaf(at)])));
+        assets.push((leaf(at), text(format!("leaf {at}").as_bytes(), [])));
+    }
+    env.provide(&store, &assets);
+    gate.hold(b"held");
+    let events = capture.event_count();
+    let order: Vec<usize> = if tail_first { (0..n).rev().collect() } else { (0..n).collect() };
+    for at in order {
+        store.request_newest(link(at), NOW);
+    }
+    eventually("every leaf published", || store.generation() >= n as u64);
+    gate.open(b"held");
+    env.settle(&store);
+    assert!(store.newest(link(0)).ready().is_some());
+    capture.closed(0, "silo.load");
+    let searches = capture.events()[events..]
+        .iter()
+        .filter(|event| event.name == "silo.search")
+        .map(|event| event.fields["visits"].parse::<u64>().expect("a count"))
+        .sum();
+    env.shutdown();
+    searches
+}
+
+#[test]
+fn the_cycle_searches_of_a_chain_ending_link_by_link_visit_linear_successors() {
+    const N: usize = 2000;
+    for tail_first in [true, false] {
+        let visits = search_visits(N, tail_first);
+        eprintln!("{N} links, tail first {tail_first}: {visits} successors visited");
+        assert!(visits <= 8 * N as u64, "{visits} successors visited, tail first {tail_first}");
     }
 }
 
@@ -336,7 +458,7 @@ fn request_head_on_a_worker(env: &Env, store: &Store) -> usize {
 
 #[test]
 fn a_chain_of_100000_links_is_accepted_in_one_call_and_published() {
-    let env = Env::new("failures_chain");
+    let env = Env::long("failures_chain");
     let (loaders, _) = test_loaders();
     let store = env.store(loaders);
     env.provide(&store, &chain(&[]));
@@ -353,7 +475,7 @@ fn a_chain_of_100000_links_is_accepted_in_one_call_and_published() {
 
 #[test]
 fn a_chain_of_100000_links_closed_into_a_cycle_fails_every_link_invalid_data() {
-    let env = Env::new("failures_chain_cycle");
+    let env = Env::long("failures_chain_cycle");
     let (loaders, _) = test_loaders();
     let store = env.store(loaders);
     env.provide(&store, &chain(&[link(0)]));
@@ -367,7 +489,7 @@ fn a_chain_of_100000_links_closed_into_a_cycle_fails_every_link_invalid_data() {
 
 #[test]
 fn a_chain_of_100000_links_missing_its_tail_fails_and_is_repaired_at_one_mount() {
-    let env = Env::new("failures_chain_repair");
+    let env = Env::long("failures_chain_repair");
     let (loaders, _) = test_loaders();
     let store = env.store(loaders);
     let tail = id("the missing tail");

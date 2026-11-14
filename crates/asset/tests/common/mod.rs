@@ -22,10 +22,28 @@ use lactose_asset_api::{
 };
 use lactose_core::{AllocTag, Error, ErrorKind, Result};
 use lactose_io::{Io, IoConfig};
-use lactose_task::{Executor, Sleep};
+use lactose_task::{Executor, Sleep, WorkerClass};
 
 /// The longest any test waits for something that should happen: past it, the wait fails.
 pub const LIMIT: Duration = Duration::from_secs(60);
+
+/// The limit of the 100,000-link tests, which take seconds unloaded and over a minute on a
+/// machine loaded near 30: under nextest's 300 s kill, so that a hang still fails as one.
+pub const LONG_LIMIT: Duration = Duration::from_secs(240);
+
+/// How long a test waits for a call that must return at once, before it reports the call
+/// stuck (on the store's lock, if the code under test ran something there that waits for
+/// it) and exits, since the stuck thread would also stop the test's own teardown.
+pub const STUCK: Duration = Duration::from_secs(10);
+
+/// Waits for `returned` (sent by a thread once its call returned) up to [`STUCK`];
+/// otherwise reports `what` as stuck and exits the test process as failed.
+pub fn returns_or_exit(returned: &std::sync::mpsc::Receiver<()>, what: &str) {
+    if returned.recv_timeout(STUCK).is_err() {
+        eprintln!("{what} never returned within {STUCK:?}: it is stuck on the store's lock");
+        std::process::exit(101);
+    }
+}
 
 /// An executor, a pool and a directory of packs of the test's own.
 pub struct Env {
@@ -33,6 +51,7 @@ pub struct Env {
     pub io: Io,
     pub dir: PathBuf,
     packs: AtomicU64,
+    limit: Duration,
 }
 
 impl Env {
@@ -43,6 +62,11 @@ impl Env {
     /// An executor with exactly `count` background workers.
     pub fn with_background_workers(name: &str, count: u32) -> Self {
         Self::build(name, Executor::builder().background_workers(count), None)
+    }
+
+    /// An env whose every wait is bounded by [`LONG_LIMIT`] rather than [`LIMIT`].
+    pub fn long(name: &str) -> Self {
+        Self { limit: LONG_LIMIT, ..Self::new(name) }
     }
 
     /// One background worker and one pool thread: every request and every load runs on
@@ -59,7 +83,7 @@ impl Env {
         let io = Io::start(platform, config).expect("the pool");
         let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("asset").join(name);
         executor.block_on(io.create_dir_all(dir.clone())).expect("the test's directory");
-        Self { executor, io, dir, packs: AtomicU64::new(0) }
+        Self { executor, io, dir, packs: AtomicU64::new(0), limit: LIMIT }
     }
 
     pub fn store(&self, loaders: Vec<ErasedLoader>) -> Store {
@@ -98,11 +122,30 @@ impl Env {
         self.wait(store.settled());
     }
 
-    /// Drives `future` to its end on this thread, failing the test if that takes longer
-    /// than [`LIMIT`].
+    /// Drives `future` to its end on this thread, failing the test if that takes longer than
+    /// the env's limit, [`LIMIT`] unless it was made [`Env::long`].
     pub fn wait<F: Future>(&self, future: F) -> F::Output {
-        let deadline = self.executor.sleep_until(Instant::now() + LIMIT);
-        self.executor.block_on(Bounded { future: Box::pin(future), deadline })
+        wait_on(&self.executor, future, self.limit)
+    }
+
+    /// Returns once every run of a load's steps 3 and 4 that is on a background worker now
+    /// has returned from its poll, `free` being the number of background workers not held
+    /// inside a loader: it spawns `free` tasks that each hold a worker until all of them
+    /// do. A run that ends a load's steps ends them in the poll its loader returns in, so
+    /// after a held loader call returned, this is the point its own steps ended.
+    pub fn drain(&self, free: usize) {
+        let barrier = Arc::new(std::sync::Barrier::new(free));
+        let tasks: Vec<_> = (0..free)
+            .map(|_| {
+                let barrier = Arc::clone(&barrier);
+                self.executor.spawn(WorkerClass::Background, async move {
+                    barrier.wait();
+                })
+            })
+            .collect();
+        for task in tasks {
+            self.wait(task).expect("a draining task");
+        }
     }
 
     pub fn shutdown(self) {
@@ -111,22 +154,30 @@ impl Env {
     }
 }
 
+/// Drives `future` to its end on this thread, failing the test if that takes longer than
+/// `limit`.
+pub fn wait_on<F: Future>(executor: &Executor, future: F, limit: Duration) -> F::Output {
+    let deadline = executor.sleep_until(Instant::now() + limit);
+    executor.block_on(Bounded { future: Box::pin(future), deadline, limit })
+}
+
+/// A wait that fails once its deadline passes. The deadline is polled first: a wait whose
+/// wake was lost is polled again only by the deadline's own wake, and must fail then
+/// rather than find its future ready and pass slowly.
 struct Bounded<F> {
     future: Pin<Box<F>>,
     deadline: Sleep,
+    limit: Duration,
 }
 
 impl<F: Future> Future for Bounded<F> {
     type Output = F::Output;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<F::Output> {
-        if let Poll::Ready(output) = self.future.as_mut().poll(cx) {
-            return Poll::Ready(output);
-        }
         if Pin::new(&mut self.deadline).poll(cx).is_ready() {
-            panic!("a wait took longer than {LIMIT:?}");
+            panic!("a wait took longer than {:?}", self.limit);
         }
-        Poll::Pending
+        self.future.as_mut().poll(cx)
     }
 }
 
@@ -328,9 +379,30 @@ impl Loader for GatedLoader {
 }
 
 /// The loaders most tests build a store with, and the gate of the gated one.
-pub fn test_loaders() -> (Vec<ErasedLoader>, Arc<Gate>) {
+pub fn test_loaders() -> (Vec<ErasedLoader>, Opener) {
     let gate = Arc::new(Gate::default());
     let loaders =
         vec![ErasedLoader::new(TextLoader), ErasedLoader::new(GatedLoader(Arc::clone(&gate)))];
-    (loaders, gate)
+    (loaders, Opener(gate))
+}
+
+/// The test's handle to the gate: a test that panics opens every gate as it unwinds, so
+/// that its held loader calls return and the failure ends the process at once rather
+/// than at a held call's bounded wait.
+pub struct Opener(Arc<Gate>);
+
+impl std::ops::Deref for Opener {
+    type Target = Gate;
+
+    fn deref(&self) -> &Gate {
+        &self.0
+    }
+}
+
+impl Drop for Opener {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            self.0.open_all();
+        }
+    }
 }

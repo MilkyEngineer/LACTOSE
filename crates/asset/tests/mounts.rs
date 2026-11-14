@@ -292,13 +292,34 @@ fn a_missing_dependency_added_later_repairs_its_dependants_at_that_mount() {
     env.shutdown();
 }
 
-/// Flips a byte of the payload of the entry `at` (in ID order) of a raw pack.
-fn damage(pack: &mut [u8], at: usize) -> usize {
+/// Flips the first byte of the payload of the entry `at` (in ID order) of a raw pack.
+fn damage(pack: &mut [u8], at: usize) {
     let (start, _) = index_range(pack);
-    let entry = start + 4 + 57 * at + 33;
-    let offset = u64::from_le_bytes(pack[entry..entry + 8].try_into().unwrap()) as usize;
+    let dependencies = |entry: usize| {
+        u32::from_le_bytes(pack[entry + 28..entry + 32].try_into().unwrap()) as usize
+    };
+    let mut entry = start + 4;
+    for _ in 0..at {
+        entry += 57 + 8 * dependencies(entry);
+    }
+    let field = entry + 33 + 8 * dependencies(entry);
+    let offset = u64::from_le_bytes(pack[field..field + 8].try_into().unwrap()) as usize;
     pack[offset] ^= 0x20;
-    offset
+}
+
+/// What a store new to the process answers for the newest version of `ask` after
+/// mounting `packs` in order and requesting it: what the store that mounted them as it
+/// ran must answer too, once it settles.
+fn fresh(env: &Env, packs: &[std::path::PathBuf], ask: AssetId) -> Readiness<AssetVersion> {
+    let (loaders, gate) = test_loaders();
+    gate.open_all();
+    let store = env.store(loaders);
+    for path in packs {
+        env.mount(&store, path.clone()).unwrap();
+    }
+    store.request_newest(ask, NOW);
+    env.settle(&store);
+    newest_version(&store, ask)
 }
 
 fn ordered(first: &str, second: &str) -> (AssetId, AssetId) {
@@ -395,5 +416,115 @@ fn a_second_source_reads_nothing_for_a_failure_the_bytes_did_not_cause() {
     env.settle(&store);
     assert_eq!(store.generation(), generation);
     assert_eq!(capture.closed(from, "io.read").len(), 2);
+    env.shutdown();
+}
+
+/// Rule 2 in flight: a later pack holds a version intact while its load from a damaged
+/// source is still in flight, held there by a dependency whose loader is held. The load
+/// reads again from the new source when its own steps fail for the bytes, as a store new
+/// to the process that mounted the same packs would read it.
+#[test]
+fn a_new_source_mounted_while_a_damaged_load_is_in_flight_repairs_it() {
+    let env = Env::new("mounts_new_source_in_flight");
+    let (loaders, gate) = test_loaders();
+    let store = env.store(loaders);
+    let (held, damaged) = (id("a held dependency"), id("a damaged dependant"));
+    let mut assets = vec![(held, gated(b"hold", [])), (damaged, text(b"intact", [held]))];
+    assets.sort_by_key(|(id, _)| *id);
+    let at = assets.iter().position(|(id, _)| *id == damaged).unwrap();
+    let mut bytes = pack(&assets, Storage::Raw);
+    damage(&mut bytes, at);
+    let first = env.write(bytes);
+    let second = env.pack(&assets, Storage::Raw);
+
+    env.mount(&store, first.clone()).unwrap();
+    gate.hold(b"hold");
+    store.request_newest(damaged, NOW);
+    gate.wait_entered(b"hold");
+    env.mount(&store, second.clone()).unwrap();
+    gate.open(b"hold");
+    env.settle(&store);
+    let expected = Readiness::Ready(assets[at].1.version());
+    assert_eq!(fresh(&env, &[first, second], damaged), expected);
+    assert_eq!(newest_version(&store, damaged), expected);
+    env.shutdown();
+}
+
+/// Rule 3 for a dependency renamed back to a version still in flight: the dependant that
+/// failed for the version in between is read again, as a store new to the process that
+/// mounted the same packs would read it.
+#[test]
+fn a_dependency_renamed_back_to_a_version_in_flight_repairs_its_dependant() {
+    // The held call keeps one background worker; the dependant's own steps need another.
+    let env = Env::with_background_workers("mounts_renamed_back", 2);
+    let (loaders, gate) = test_loaders();
+    let store = env.store(loaders);
+    let (dependant, dependency) = (id("a dependant"), id("a dependency renamed back"));
+    let good = gated(b"hold the good one", []);
+    let first = env
+        .pack(&[(dependant, text(b"a", [dependency])), (dependency, good.clone())], Storage::Raw);
+    let bad = env.pack(&[(dependency, unloadable(b"of a kind with no loader", []))], Storage::Raw);
+    let back = env.pack(&[(dependency, good.clone())], Storage::Raw);
+
+    env.mount(&store, first.clone()).unwrap();
+    gate.hold(b"hold the good one");
+    store.request_newest(dependant, NOW);
+    gate.wait_entered(b"hold the good one");
+    env.mount(&store, bad.clone()).unwrap();
+    eventually("the dependant failed for the version in between", || {
+        matches!(store.newest(dependant), Readiness::Failed(_))
+    });
+    env.mount(&store, back.clone()).unwrap();
+    gate.open(b"hold the good one");
+    env.settle(&store);
+    assert_eq!(newest_version(&store, dependency), Readiness::Ready(good.version()));
+    let expected = fresh(&env, &[first, bad, back], dependant);
+    assert!(matches!(expected, Readiness::Ready(_)), "{expected:?}");
+    assert_eq!(newest_version(&store, dependant), expected);
+    env.shutdown();
+}
+
+fn entered(gate: &Gate, bytes: &[u8]) -> usize {
+    gate.entered().iter().filter(|entered| entered.as_slice() == bytes).count()
+}
+
+/// Rule 3 reads again only a dependant whose named version is the one that failed: one
+/// renamed since to a version that failed for itself is not read again.
+#[test]
+fn rule_3_skips_a_dependant_renamed_since_it_failed() {
+    let env = Env::new("mounts_rule_3_renamed");
+    let (loaders, gate) = test_loaders();
+    let store = env.store(loaders);
+    let (dependant, dependency) = (id("a dependant renamed"), id("its dependency"));
+    env.provide(&store, &[(dependant, text(b"first", [dependency]))]);
+    store.request_newest(dependant, NOW);
+    env.settle(&store);
+    assert!(matches!(store.newest(dependant), Readiness::Failed(_)));
+    env.provide(&store, &[(dependant, gated(b"refuse the second", []))]);
+    env.settle(&store);
+    assert_eq!(entered(&gate, b"refuse the second"), 1);
+    env.provide(&store, &[(dependency, text(b"dependency", []))]);
+    env.settle(&store);
+    assert_eq!(entered(&gate, b"refuse the second"), 1, "a failure of its own read again");
+    env.shutdown();
+}
+
+/// Rule 3 reads again only what is followed: an asset requested by exact version alone
+/// that failed for a missing dependency stays failed when a mount adds the dependency.
+#[test]
+fn rule_3_skips_a_dependant_requested_only_by_exact_version() {
+    let env = Env::new("mounts_rule_3_exact");
+    let (loaders, _) = test_loaders();
+    let store = env.store(loaders);
+    let (dependant, dependency) = (id("an exact dependant"), id("its dependency"));
+    let cooked = text(b"exact", [dependency]);
+    let version = cooked.version();
+    env.provide(&store, &[(dependant, cooked)]);
+    store.request(dependant, version, NOW);
+    env.settle(&store);
+    assert!(matches!(store.get(dependant, version), Readiness::Failed(_)));
+    env.provide(&store, &[(dependency, text(b"dependency", []))]);
+    env.settle(&store);
+    assert!(matches!(store.get(dependant, version), Readiness::Failed(_)), "not followed");
     env.shutdown();
 }

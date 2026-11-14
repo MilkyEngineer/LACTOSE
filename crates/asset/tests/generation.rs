@@ -186,3 +186,48 @@ fn readers_never_see_two_answers_under_one_generation() {
     assert_eq!(last.newest[0], Readiness::Ready(version(a, VERSIONS - 1).version()));
     env.shutdown();
 }
+
+/// A failure of an exact request for a version the index does not name changes `get` of
+/// that version and moves the generation, but is not `newest`'s answer.
+#[test]
+fn an_exact_failure_of_a_version_not_named_is_not_the_newest_failure() {
+    let env = Env::new("generation_exact_not_named");
+    let (loaders, gate) = test_loaders();
+    let store = env.store(loaders);
+    let a = id("named twice");
+    let old = unloadable(b"old", []);
+    let old_version = old.version();
+    env.provide(&store, &[(a, old)]);
+    env.provide(&store, &[(a, gated(b"hold the new one", []))]);
+    gate.hold(b"hold the new one");
+    store.request_newest(a, NOW);
+    gate.wait_entered(b"hold the new one");
+    let generation = store.generation();
+    store.request(a, old_version, NOW);
+    let failure = AssetFailure { id: a, version: Some(old_version), kind: ErrorKind::Unsupported };
+    assert_eq!(store.get(a, old_version).map(|_| ()), Readiness::Failed(failure));
+    assert!(store.generation() > generation);
+    let newest = store.newest(a).map(|handle| handle.version());
+    gate.open_all();
+    env.settle(&store);
+    assert_eq!(newest, Readiness::Pending, "the failure of a version not named");
+    env.shutdown();
+}
+
+/// An exact request of a version no mounted pack holds records a failure, which changes
+/// `get`'s answer: the generation moves with it.
+#[test]
+fn an_exact_request_of_an_absent_version_moves_the_generation() {
+    let env = Env::new("generation_absent_version");
+    let (loaders, _) = test_loaders();
+    let store = env.store(loaders);
+    let a = id("present");
+    env.provide(&store, &[(a, text(b"present", []))]);
+    let absent = AssetVersion::from_bits(0x1234).unwrap();
+    let generation = store.generation();
+    store.request(a, absent, NOW);
+    let failure = AssetFailure { id: a, version: Some(absent), kind: ErrorKind::NotFound };
+    assert_eq!(store.get(a, absent).map(|_| ()), Readiness::Failed(failure));
+    assert!(store.generation() > generation);
+    env.shutdown();
+}
