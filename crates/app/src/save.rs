@@ -12,8 +12,8 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use lactose_asset_api::{PinnedTable, VersionTable};
-use lactose_bundle::Baseline;
-use lactose_core::{Result, Tick};
+use lactose_bundle::{Baseline, Record};
+use lactose_core::{Error, ErrorKind, NetId, Result, Tick};
 use lactose_ecs::{RegionId, RegionMode};
 use lactose_persist::{Container, Loader, RegionRecords, SchemaTable};
 
@@ -72,15 +72,25 @@ pub struct SavedWorld {
 
 /// Decodes a save for a fresh process: `game.types()` for the registry,
 /// `SchemaTable::from_registry` over it, `game.migrations()`, `Container::decode` over the
-/// whole file, then for every section in ascending region order the baseline from
-/// `cooked.baseline(records.baseline_hash)`, `Loader::bundle(&records, baseline,
-/// RegionMode::Frozen, None)` to validate the section (the bundle is dropped: a save that
-/// cannot load fails here, before any world exists, not at the step that reloads a region
-/// hours in) and `Loader::migrate(&records)` as the entry's records. Synchronous, on the
-/// thread that starts the binary, before any world exists: the registry a load needs is the
-/// world's, and the tick and counter it yields are the builder's. The first error ends the
-/// load with nothing built; the policy's response to [`Source::Load`](crate::Source::Load)
-/// is `Stop`.
+/// whole file (which also refuses a counter not above a runtime `NetId` a section spawns
+/// and one entity held by two sections: `Container::check_sections`), then every section's
+/// baseline from `cooked.baseline(records.baseline_hash)`, then the check that needs them:
+/// a section's `SpawnFromBaseline` of a cooked `NetId` that another section's baseline holds
+/// as a row, where that section has no `Destroy` of it, is `InvalidData` naming both
+/// regions, since the second region's load would find the entity live. Then for every
+/// section in ascending region order `Loader::bundle(&records, baseline, RegionMode::Frozen,
+/// None)` to validate the section (the bundle is dropped: a save that cannot load fails
+/// here, before any world exists, not at the step that reloads a region hours in) and
+/// `Loader::migrate(&records)` as the entry's records. Synchronous, on the thread that
+/// starts the binary, before any world exists: the registry a load needs is the world's,
+/// and the tick and counter it yields are the builder's. The first error ends the load
+/// with nothing built; the policy's response to [`Source::Load`](crate::Source::Load) is
+/// `Stop`.
+///
+/// What no section's baseline shows is not checked: a cooked entity that a section spawns
+/// from the baseline while its home region has no section in the file is found live when
+/// that region first loads fresh, since a region's baseline is known only when the store
+/// can name it (milestone 3, `README.md`, "Not in this crate yet").
 pub fn load(game: &Game, container: &[u8], cooked: &dyn Cooked) -> Result<SavedWorld> {
     decode(game, container, cooked).inspect_err(|error| {
         ErrorPolicy::MILESTONE_1.decide(Source::Load, error);
@@ -93,16 +103,60 @@ fn decode(game: &Game, container: &[u8], cooked: &dyn Cooked) -> Result<SavedWor
     let schemas = SchemaTable::from_registry(types.registry())?;
     let migrations = game.migrations()?;
     let decoded = Container::decode(container)?;
+    let sections = decoded
+        .regions()
+        .map(|records| Ok((records, cooked.baseline(records.baseline_hash)?)))
+        .collect::<Result<Vec<_>>>()?;
+    check_cooked_homes(&sections)?;
     let loader = Loader::new(&schemas, &migrations);
     let mut regions = BTreeMap::new();
-    for records in decoded.regions() {
-        let baseline = cooked.baseline(records.baseline_hash)?;
+    for (records, baseline) in sections {
         loader.bundle(records, Arc::clone(&baseline), RegionMode::Frozen, None)?;
         let records = loader.migrate(records)?;
         regions.insert(records.region, Arc::new(SavedRegion { records, baseline }));
     }
     let header = decoded.header();
     Ok(SavedWorld { tick: header.tick, next_net_id: header.next_net_id, regions })
+}
+
+/// Refuses a section that spawns from the baseline a cooked entity which another section's
+/// baseline holds as a row that section does not destroy, as [`load`] states. A home
+/// section that changes the row was refused by `Container::check_sections`; one that
+/// leaves it unchanged has no record of it, so only its baseline shows it.
+fn check_cooked_homes(sections: &[(&RegionRecords, Arc<Baseline>)]) -> Result<()> {
+    for (records, _) in sections {
+        let Some(overlay) = &records.overlay else { continue };
+        // Records ascend by `NetId` and cooked IDs order above runtime ones.
+        let list = overlay.records();
+        let cooked = list.partition_point(|record| !record.id().is_cooked());
+        for record in &list[cooked..] {
+            let Record::SpawnFromBaseline { id, .. } = *record else { continue };
+            let home = sections.iter().find(|(home, baseline)| {
+                home.region != records.region && baseline.contains(id) && !destroys(home, id)
+            });
+            if let Some((home, _)) = home {
+                return Err(Error::new(
+                    ErrorKind::InvalidData,
+                    format!(
+                        "the section of region {} spawns NetId {:#x} from the baseline, which \
+                         region {}'s baseline holds as a row its section does not destroy",
+                        records.region.0,
+                        id.to_bits(),
+                        home.region.0
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Whether `records` hold a `Destroy` of `id`.
+fn destroys(records: &RegionRecords, id: NetId) -> bool {
+    let Some(overlay) = &records.overlay else { return false };
+    let list = overlay.records();
+    let at = list.partition_point(|record| record.id() < id);
+    matches!(list.get(at), Some(&Record::Destroy { id: destroyed }) if destroyed == id)
 }
 
 /// A save being encoded: one background task per region, then the assembly. See

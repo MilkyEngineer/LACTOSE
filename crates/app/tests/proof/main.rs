@@ -9,6 +9,7 @@
 
 mod client;
 mod common;
+mod cross_section;
 mod registration;
 mod server;
 mod store;

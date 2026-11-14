@@ -917,6 +917,43 @@ editorial pass rather than one taken from a review.
   cross-crate additions above (ecs `document_schema`, bundle's table codec export and digest,
   the committed version-and-digest guard, the 16 KiB registration refusal) remain for their
   lanes.
+- Addendum (lane data-path, 2026-11-15; review rounds 1 and 2): the whole-project review of
+  milestone 1, findings D3, D4 and D5, with review round 1. A container's sections are checked
+  against each other and against the header by `Container::check_sections(header, sections)`,
+  which takes the header and each section's `RegionRecords` and needs no `Container`. An entity
+  resides in a section when the section spawns it (`Spawn` or `SpawnFromBaseline`) or holds
+  records other than a `Destroy` for a cooked row of its baseline; the check refuses, with
+  `InvalidData` naming the `NetId` and the regions, one `NetId` resident in two sections, and a
+  runtime `NetId` spawned at or above the header's `next_net_id`. `Container::decode` runs it
+  after every section decodes and before anything is built, and `encode` before writing, so
+  `decode(encode(c)) == c` whenever `encode` succeeds; `insert`, `assemble` and `decode_section`
+  do not run it. A writer that assembles encoded sections runs it over the records first: app's
+  `encode_save` does so before it spawns a task, so a refused save writes nothing and the slot
+  keeps the last good save (the failure is `Source::Save`, logged). A world's own export can
+  fail it today: a server world accepts a direct spawn under a runtime `NetId` at or above its
+  counter and leaves the counter (verification row "A `Server` world's direct spawn under a
+  runtime `NetId`"). The check walks each overlay's records in their canonical order: they
+  ascend by `NetId`, and runtime IDs sort below cooked ones (the cooked bit is the high bit), so
+  the highest runtime ID is the last record before the cooked tail; persist's
+  `tests/container.rs` pins that order. Its cost against `index` plus `decode_section`, release,
+  median of 9: +1-3% on 100k spawns in one or two sections, and +7-11% on two sections whose
+  100k cooked rows all changed (load 9.75 13.13 18.63 to 9.13 12.95 18.53). The case that needs
+  a baseline, a section that spawns a cooked `NetId` from the baseline while another section's
+  baseline holds that row unchanged and does not destroy it, is refused by `app::load` before
+  any world exists; a home region with no section in the file is not checked until the region
+  store (milestone 3). A reference to a runtime id at or above the counter (an `EntityRef`, an
+  owner) is not checked: the container has no field kinds, and the effect is an alias, not a
+  failed load. Registration refuses a field with an ID of zero bytes (`PlainArray<_, 0>`, an
+  empty `#[value]` struct, an array of them), at any depth, naming the type and the field, in
+  `StructInfo::check`, since a document schema states each field by a non-empty range; a tag
+  type and `Padding<0>` still register, and the ECS's `schema_of` panic and the nameless
+  `from_registry` failure are no longer reachable from a registered type. Migrate, then rebase
+  onto the re-cooked baseline, then bundle is proven for a type the cooked baseline carries
+  (`Health` cooked at version 1 and 2, `tests/migrate.rs`): the result equals the native version
+  2 save and loads a world of the same hash and export; `app::load` runs it once the store names
+  a region's current baseline (D136). Mutation checks: the zero-byte arm, each `check_sections`
+  call, the counter's use of the last runtime record, the residency of changed rows and app's
+  baseline check each fail their tests.
 
 **D130. The `io` facade: what sections 4, 5.1, 8.2, 9.7, 15.3, 19 and 20 left open** (§3, §4, §5.1, §8.2, §9.7, §14, §15.3, §19, §20, §21, `lactose-io`, `lactose-core`, `lactose-task`)
 - Why: the facade is written before its implementation so `asset`, `app`'s save path, `cook`

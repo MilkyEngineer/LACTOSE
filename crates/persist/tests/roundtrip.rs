@@ -12,8 +12,8 @@ use std::sync::Arc;
 
 use common::*;
 use lactose_asset_api::AssetSet;
-use lactose_bundle::{Baseline, BaselineRow, ComponentSchema, FieldLayout};
-use lactose_core::{PlainArray, StableKey};
+use lactose_bundle::{Baseline, BaselineRow, ComponentData, ComponentSchema, FieldLayout};
+use lactose_core::{FieldId, NetId, PlainArray, StableKey};
 use lactose_ecs::{
     ClaimedBy, InRegion, OwnedBy, PredictedOrigin, RegionConfig, RegionId, RegionMode,
     WorldBuilder, WorldKind,
@@ -318,4 +318,86 @@ fn sections_made_in_any_order_assemble_to_the_same_bytes() {
         assert_eq!(entry.region, records.region);
         assert_eq!(entry.compressed_bytes as usize, section.bytes().len());
     }
+}
+
+/// A persistent component with a zero-length array field, which no document schema can
+/// state.
+#[component(key = "roundtrip::zero_array", persistent)]
+pub struct ZeroArray {
+    /// A field of four bytes.
+    #[field(id = 1)]
+    pub count: u32,
+    /// The field of no bytes.
+    #[field(id = 2)]
+    pub none: PlainArray<u8, 0>,
+}
+
+/// A derived component with the same field.
+#[component(key = "roundtrip::zero_derived", derived)]
+pub struct ZeroDerived {
+    /// A field of four bytes.
+    #[field(id = 1)]
+    pub count: u32,
+    /// The field of no bytes.
+    #[field(id = 2)]
+    pub none: PlainArray<u8, 0>,
+}
+
+/// The world's own types and `Position`.
+fn engine_registry() -> Registry {
+    let mut registry = Registry::new();
+    registry.register::<InRegion>().unwrap();
+    registry.register::<OwnedBy>().unwrap();
+    registry.register::<ClaimedBy>().unwrap();
+    registry.register::<PredictedOrigin>().unwrap();
+    registry.register::<Position>().unwrap();
+    registry
+}
+
+#[test]
+fn a_zero_size_field_is_refused_at_registration_so_no_table_or_load_meets_it() {
+    // Registration refuses both, naming the type and the field, and the registry is as it
+    // was: the table builds, where before it refused the whole game naming no type.
+    let mut registry = engine_registry();
+    for (error, name) in [
+        (registry.register::<ZeroArray>().unwrap_err(), "`roundtrip::zero_array`: field `none`"),
+        (
+            registry.register::<ZeroDerived>().unwrap_err(),
+            "`roundtrip::zero_derived`: field `none`",
+        ),
+    ] {
+        assert_eq!(error.kind(), lactose_core::ErrorKind::InvalidData, "{error}");
+        assert!(error.message().contains(name), "`{error}` names `{name}`");
+    }
+    assert_eq!(registry.len(), engine_registry().len());
+    SchemaTable::from_registry(&registry).unwrap();
+
+    // A baseline that names the derived type's key under a well-formed schema, as any
+    // document can: the world, which cannot have registered the type, refuses the region
+    // with an error instead of panicking on the registry's schema of it.
+    let schema = ComponentSchema::new(
+        ZeroDerived::KEY,
+        1,
+        4,
+        [FieldLayout { id: FieldId(1), offset: 0, size: 4 }],
+    )
+    .unwrap();
+    let position = Position::KEY;
+    let position = schemas().schema(position).unwrap().clone();
+    let rows = [BaselineRow {
+        id: NetId::cooked(1),
+        components: vec![
+            data(pos(1, 1)),
+            ComponentData { component: ZeroDerived::KEY, bytes: vec![0; 4] },
+        ],
+    }];
+    let baseline = Baseline::from_rows(AssetSet::new(), [schema, position], rows).unwrap();
+    let baseline = Baseline::decode(&baseline.encode()).unwrap();
+    let mut world = WorldBuilder::new(WorldKind::Server, Arc::new(registry)).build().unwrap();
+    let region = RegionId(1);
+    let config = RegionConfig { id: region, seed: 1, mode: RegionMode::Simulated };
+    world.create_region(config).unwrap();
+    let error = world.load_region(region, &baseline, None).unwrap_err();
+    assert_eq!(error.kind(), lactose_core::ErrorKind::NotFound, "{error}");
+    assert!(error.message().contains("is not registered"), "{error}");
 }

@@ -27,8 +27,8 @@ use std::collections::BTreeMap;
 use std::num::NonZeroU64;
 use std::sync::Arc;
 
-use lactose_bundle::{ComponentData, Overlay};
-use lactose_core::{Error, ErrorKind, Result, Tick, xxh64};
+use lactose_bundle::{ComponentData, Overlay, Record};
+use lactose_core::{Error, ErrorKind, NetId, Result, Tick, xxh64};
 use lactose_ecs::RegionId;
 use lactose_sim::SavePoint;
 use zstd::zstd_safe::CParameter;
@@ -368,7 +368,8 @@ fn too_large(what: &str, len: usize, cap: usize) -> Error {
 /// it; [`decode`](Self::decode) and [`decode_region`](Self::decode_region) are the
 /// in-memory shorthands over a whole file.
 ///
-/// Two containers compare by content. `decode(encode(c))` equals `c`.
+/// Two containers compare by content. `decode(encode(c))` equals `c` whenever `encode`
+/// succeeds.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Container {
     header: ContainerHeader,
@@ -426,8 +427,11 @@ impl Container {
     }
 
     /// The container's bytes: [`encode_section`](RegionRecords::encode_section) of every
-    /// section, then [`assemble`](Self::assemble). Fails as they fail.
+    /// section, then [`assemble`](Self::assemble). Fails as they fail, and first as
+    /// [`check_sections`](Self::check_sections) fails, so it never writes what
+    /// [`decode`](Self::decode) refuses.
     pub fn encode(&self) -> Result<Vec<u8>> {
+        Self::check_sections(&self.header, self.regions.values())?;
         let sections = self.regions().map(RegionRecords::encode_section).collect::<Result<_>>()?;
         Self::assemble(&self.header, sections)
     }
@@ -440,7 +444,11 @@ impl Container {
     /// leaves the others readable. Deterministic for one build: equal inputs give equal
     /// bytes. Fails with `InvalidData` if two sections name one region, and with
     /// `ResourceExhausted` if the whole would exceed [`MAX_CONTAINER_BYTES`]. The sections
-    /// are taken as made, so `app` encodes each region on a worker and assembles here.
+    /// are taken as made, so `app` encodes each region on a worker and assembles here; their
+    /// records are not read, so what [`decode`](Self::decode) refuses across sections is
+    /// not seen here, and a writer calls [`check_sections`](Self::check_sections) over the
+    /// records first. A world's own export can fail it: a server world accepts a direct
+    /// spawn under a runtime `NetId` at or above its counter and leaves the counter.
     pub fn assemble(header: &ContainerHeader, sections: Vec<EncodedSection>) -> Result<Vec<u8>> {
         if header.format != CONTAINER_FORMAT_VERSION {
             return Err(Error::new(
@@ -694,13 +702,108 @@ impl Container {
     /// then [`decode_section`](Self::decode_section) for every entry. Fails as they fail,
     /// on the first section that does: a caller that wants what is readable of a damaged
     /// file reads the index and each section itself (`README.md`, "The container").
+    ///
+    /// Then the sections are checked against each other and against the header with
+    /// [`check_sections`](Self::check_sections), and the container is refused as it
+    /// refuses. A reader of single sections ([`decode_section`](Self::decode_section)) sees
+    /// one section and checks none of that; it calls `check_sections` over the sections it
+    /// holds.
     pub fn decode(bytes: &[u8]) -> Result<Self> {
         let index = Self::index(bytes)?;
         let mut regions = BTreeMap::new();
         for entry in &index.regions {
             regions.insert(entry.region, Self::decode_section(entry, section_of(bytes, entry)?)?);
         }
-        Ok(Self { header: index.header, regions })
+        let container = Self { header: index.header, regions };
+        Self::check_sections(&container.header, container.regions.values())?;
+        Ok(container)
+    }
+
+    /// Checks `sections` against each other and against `header`, as
+    /// [`decode`](Self::decode) and [`encode`](Self::encode) do, without a container: what a
+    /// writer calls before [`assemble`](Self::assemble), which never reads the records, and
+    /// what a reader of single sections calls over those it holds. Fails with
+    /// `InvalidData`, naming the `NetId` and the regions:
+    ///
+    /// - if a section spawns a runtime `NetId` that is not below `header.next_net_id`,
+    ///   since a server started from the save would hand that ID out again;
+    /// - if two sections each hold one `NetId` as a resident entity, since the second
+    ///   region's load would find it live. A section holds an entity it spawns (`Spawn`,
+    ///   `SpawnFromBaseline`) and a row of its baseline it changes (`AddComponent`,
+    ///   `RemoveComponent`, `SetField`, `OwnershipChange`); a `Destroy` holds nothing.
+    ///
+    /// A section that holds a row of its baseline unchanged has no record of it, so a
+    /// cooked entity another section spawns while it is still such a row is not seen here:
+    /// that takes the baselines (`lactose_app::load` checks it). Sections are named in the
+    /// order given; give them ascending by region, as `assemble` takes them.
+    pub fn check_sections<'a>(
+        header: &ContainerHeader,
+        sections: impl IntoIterator<Item = &'a RegionRecords>,
+    ) -> Result<()> {
+        let counter = header.next_net_id.get();
+        let sections: Vec<&RegionRecords> = sections.into_iter().collect();
+        for records in &sections {
+            let Some(overlay) = &records.overlay else { continue };
+            let list = overlay.records();
+            // An overlay's records strictly ascend by (`NetId`, ...) and a runtime `NetId`,
+            // without the cooked bit, orders below every cooked one; an overlay has records
+            // of a runtime entity only beside its `Spawn`. So the last record below the
+            // cooked range names the highest runtime `NetId` the section spawns.
+            // `tests/container.rs` pins both orders.
+            let runtime = list.partition_point(|record| !record.id().is_cooked());
+            if let Some(record) = list[..runtime].last()
+                && record.id().to_bits() >= counter
+            {
+                return Err(invalid(format!(
+                    "the section of region {} spawns the runtime NetId {}, which is not below \
+                     the header's NetId counter {counter}",
+                    records.region.0,
+                    record.id().to_bits()
+                )));
+            }
+        }
+        if sections.len() < 2 {
+            return Ok(());
+        }
+        // Each section's resident entities, one run ascending by `NetId`: the ID, the
+        // region, and whether the section spawns it. A stable sort puts the sections that
+        // hold one ID side by side, in the order given.
+        let mut held: Vec<(NetId, RegionId, bool)> = Vec::new();
+        for records in &sections {
+            let Some(overlay) = &records.overlay else { continue };
+            for entity in overlay.records().chunk_by(|a, b| a.id() == b.id()) {
+                if let [Record::Destroy { .. }] = entity {
+                    continue;
+                }
+                let spawned = entity.iter().any(|record| {
+                    matches!(record, Record::Spawn { .. } | Record::SpawnFromBaseline { .. })
+                });
+                held.push((entity[0].id(), records.region, spawned));
+            }
+        }
+        held.sort_by_key(|&(id, _, _)| id);
+        let Some(pair) = held.windows(2).find(|pair| pair[0].0 == pair[1].0) else {
+            return Ok(());
+        };
+        let ((id, first, spawns_first), (_, second, spawns_second)) = (pair[0], pair[1]);
+        let (id, first, second) = (id.to_bits(), first.0, second.0);
+        Err(invalid(match (spawns_first, spawns_second) {
+            (true, true) => {
+                format!("the sections of regions {first} and {second} both spawn NetId {id:#x}")
+            }
+            (true, false) => format!(
+                "the section of region {first} spawns NetId {id:#x}, which the section of \
+                 region {second} holds as a row of its baseline"
+            ),
+            (false, true) => format!(
+                "the section of region {second} spawns NetId {id:#x}, which the section of \
+                 region {first} holds as a row of its baseline"
+            ),
+            (false, false) => format!(
+                "the sections of regions {first} and {second} both hold NetId {id:#x} as a \
+                 row of their baselines"
+            ),
+        }))
     }
 }
 

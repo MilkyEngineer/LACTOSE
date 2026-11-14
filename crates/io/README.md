@@ -200,7 +200,10 @@ runs, the span constructors.
   and a crash or power loss after that point keeps them, to the extent the platform's
   rename is durable (`docs/verification.md` has the row). At no point does a reader of
   `path` see anything but the previous content or the new: there is no moment at which
-  `path` is missing or partial.
+  `path` is missing or partial. On Windows that is relied on and not documented:
+  Microsoft does not say whether the replace `std::fs::rename` issues (`MoveFileExW` with
+  `MOVEFILE_REPLACE_EXISTING`, falling back to `FileRenameInfoEx`) is atomic, and it is
+  not verified (`docs/verification.md`, the row "`std::fs::File::sync_all` issues").
 - Replaces of one path run in the order they were submitted (their futures first
   polled), dropped or not: a replace of `path` starts only after every replace of the same
   `path` submitted before it has finished, so the last submitted is the last to land, and

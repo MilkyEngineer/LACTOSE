@@ -635,6 +635,108 @@ pub struct ReexportedValue(#[field(id = 1)] pub u8);
 #[component(key = "test::bad_transient", transient)]
 pub struct BadTransient(#[field(id = 1)] pub NetId);
 
+/// A value with no fields: zero bytes.
+#[value]
+pub struct Nothing;
+
+/// A value holding an empty array, so zero bytes itself.
+#[value]
+pub struct HoldsNoBytes {
+    /// The empty array.
+    #[field(id = 1)]
+    pub none: PlainArray<u8, 0>,
+}
+
+/// A persistent component with a zero-length array beside a real field.
+#[component(key = "test::zero_array", persistent)]
+pub struct ZeroArray {
+    /// A real field.
+    #[field(id = 1)]
+    pub count: u32,
+    /// The empty field.
+    #[field(id = 2)]
+    pub none: PlainArray<u8, 0>,
+}
+
+/// A derived component whose empty field is a value with no fields.
+#[component(key = "test::zero_value", derived)]
+pub struct ZeroValue {
+    /// A real field.
+    #[field(id = 1)]
+    pub count: u32,
+    /// The empty field.
+    #[field(id = 2)]
+    pub nothing: Nothing,
+}
+
+/// An array of four empty values: zero bytes for all its length.
+#[component(key = "test::zero_elements", transient)]
+pub struct ZeroElements {
+    /// A real field.
+    #[field(id = 1)]
+    pub count: u32,
+    /// The empty field.
+    #[field(id = 2)]
+    pub nothings: PlainArray<Nothing, 4>,
+}
+
+/// A component whose own fields hold bytes, with an empty field one level down.
+#[component(key = "test::zero_nested", persistent)]
+pub struct ZeroNested {
+    /// A real field.
+    #[field(id = 1)]
+    pub count: u32,
+    /// Holds the empty field, and is empty itself.
+    #[field(id = 2)]
+    pub inner: HoldsNoBytes,
+}
+
+/// A component whose only field is an empty value, so a zero-size type with a field.
+#[component(key = "test::only_nothing", persistent)]
+pub struct OnlyNothing {
+    /// The empty field.
+    #[field(id = 1)]
+    pub nothing: Nothing,
+}
+
+/// A tag: zero bytes and no field, which registers.
+#[component(key = "test::tag", persistent)]
+pub struct Tag;
+
+/// Explicit padding of no bytes is padding, not a field, and registers.
+#[component(key = "test::zero_padding", persistent)]
+pub struct ZeroPadding {
+    /// A real field.
+    #[field(id = 1)]
+    pub count: u32,
+    #[field(padding)]
+    _pad: Padding<0>,
+}
+
+#[test]
+fn registration_refuses_a_field_of_zero_bytes_naming_the_type_and_the_field() {
+    fn refused<T: Reflect>(expected: &str) {
+        let mut registry = Registry::new();
+        let error = registry.register::<T>().unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::InvalidData, "{error}");
+        assert!(error.message().contains(expected), "`{error}` names `{expected}`");
+        assert!(error.message().contains("is zero bytes"), "{error}");
+        assert!(registry.is_empty());
+    }
+    // Under every policy, and whether the empty field is an array, a value, an array of
+    // empty values or a field one level down.
+    refused::<ZeroArray>("`test::zero_array`: field `none` of type `PlainArray`");
+    refused::<ZeroValue>("`test::zero_value`: field `nothing` of type `Nothing`");
+    refused::<ZeroElements>("`test::zero_elements`: field `nothings` of type `PlainArray`");
+    refused::<ZeroNested>("`test::zero_nested`: field `inner` of type `HoldsNoBytes`");
+    refused::<OnlyNothing>("`test::only_nothing`: field `nothing`");
+
+    let mut registry = Registry::new();
+    registry.register::<Tag>().unwrap();
+    registry.register::<ZeroPadding>().unwrap();
+    assert_eq!(registry.len(), 2);
+}
+
 #[test]
 fn registration_rejects_what_contradicts_the_type() {
     fn rejected<T: Reflect>(expected: &str) {

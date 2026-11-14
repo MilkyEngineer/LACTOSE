@@ -404,15 +404,21 @@ impl Server {
         ServerSave { run: Box::pin(async move { Ok(self.run_save(executor).await?) }) }
     }
 
-    /// The container bytes of `saved`, between runs: one `WorkerClass::Background` task per
-    /// region running `RegionRecords::encode_section`, then
-    /// `Container::assemble(&ContainerHeader::new(saved.tick, saved.next_net_id,
+    /// The container bytes of `saved`, between runs: `Container::check_sections` over the
+    /// header and every region's records on the calling thread, so a save that `load`'s
+    /// check across sections would refuse fails here, with no task spawned; then one
+    /// `WorkerClass::Background` task per region running `RegionRecords::encode_section`,
+    /// then `Container::assemble(&ContainerHeader::new(saved.tick, saved.next_net_id,
     /// schemas.hash()), sections)` once every task resolved, with this world's
     /// [`schemas`](Self::schemas) and the sections in ascending region order. Fails as
     /// `lactose-persist` fails; nothing is written by this call, so a failure loses
     /// nothing. The bytes go to `Io::replace` (`README.md`, "Saves and loads").
     pub fn encode_save(&self, executor: &Executor, saved: SavedWorld) -> SaveEncode {
         let header = ContainerHeader::new(saved.tick, saved.next_net_id, self.core.schemas.hash());
+        let sections = saved.regions.values().map(|region| &region.records);
+        if let Err(error) = Container::check_sections(&header, sections) {
+            return SaveEncode::new(Box::pin(async move { Err(error) }));
+        }
         let tasks: Vec<_> = saved
             .regions
             .into_values()

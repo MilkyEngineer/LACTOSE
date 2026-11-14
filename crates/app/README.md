@@ -539,12 +539,18 @@ root")
   `Simulation::world_mut`) is `NotFound`; a failed export or diff hands the server back
   unchanged. A `SavedWorld` is also what `load` produces and what `Start::Loaded` takes, so
   a save point can start a server with no file between.
-- `Server::encode_save(executor, saved)` spawns one `WorkerClass::Background` task per
-  region of `saved.regions`, each `records.encode_section()`, and once every task
-  resolved, `Container::assemble(&ContainerHeader::new(saved.tick, saved.next_net_id,
+- `Server::encode_save(executor, saved)` first runs `Container::check_sections` over the
+  header and every region's records on the calling thread, since `assemble` never reads
+  the records: a save the next start's `load` would refuse (a runtime `NetId` at or above
+  the counter, which a direct `World::spawn` on a server world can leave; one entity held
+  by two regions) fails there with no task spawned. Then it spawns one
+  `WorkerClass::Background` task per region of `saved.regions`, each
+  `records.encode_section()`, and once every task resolved,
+  `Container::assemble(&ContainerHeader::new(saved.tick, saved.next_net_id,
   schemas.hash()), sections)` with the sections in ascending region order and this world's
-  `Server::schemas`. The future fails as `persist` fails and writes nothing. The world is
-  not touched: the encode runs beside the next frame.
+  `Server::schemas`. The future fails as `persist` fails and writes nothing, so under
+  `Headless::save` the slot keeps the previous save and the policy logs (`Source::Save`,
+  `Log`). The world is not touched: the encode runs beside the next frame.
 - `Server::schemas` is `SchemaTable::from_registry(types.registry())` built once at
   `build_server`, so every save and relevance message of the world is written with the
   table the world was built with. `Server::baseline(region)` is the baseline of the bundle
@@ -561,11 +567,17 @@ root")
   executor, as `io` requires.
 - `load(game, bytes, cooked)` runs on the calling thread before any world exists:
   `game.types()`, `SchemaTable::from_registry`, `game.migrations()`, `Container::decode`
-  over the whole file, then for each section in ascending region order the baseline from
-  `cooked.baseline(records.baseline_hash)`, `Loader::bundle(&records, baseline,
-  RegionMode::Frozen, None)` to validate the section (the bundle is dropped), and
-  `Loader::migrate(&records)` as the entry's records, so a save that cannot load fails at
-  load and a kept region is re-saved at the registry's schemas without a reload between.
+  over the whole file (which refuses, with `InvalidData`, a counter not above a runtime
+  `NetId` a section spawns and one entity held by two sections: the checks across
+  sections, `crates/persist/README.md`, "The container"), then every section's baseline
+  from `cooked.baseline(records.baseline_hash)`, then the check that needs them: a
+  `SpawnFromBaseline` of a cooked `NetId` that another section's baseline holds as a row,
+  where that section has no `Destroy` of it, is `InvalidData` naming both regions, since
+  the second region's load would find the entity live. Then for each section in ascending
+  region order `Loader::bundle(&records, baseline, RegionMode::Frozen, None)` to validate
+  the section (the bundle is dropped), and `Loader::migrate(&records)` as the entry's
+  records, so a save that cannot load fails at load and a kept region is re-saved at the
+  registry's schemas without a reload between.
   The first error ends the load with nothing built and nothing to undo. The result's
   `tick` and `next_net_id` are the builder's; its `regions` are the store's. A save
   carries no session state, so every player joins again through `TickInput::sessions`,
@@ -658,6 +670,16 @@ root")
   writes its own and feeds the result through the frame callback.
 - `Server::relevance` on a background task and shared between clients (the signature is
   final); `ServerError` and `ClientError` carrying a `Source` of their own.
+- A load against a re-cooked baseline: `load` asks `Cooked::baseline` only by the hash a
+  section saved (`records.baseline_hash`), so a save made against a baseline since
+  re-cooked fails `NotFound` there. Carrying it over is `Loader::migrate`, then
+  `RegionRecords::rebase` onto the region's current baseline, then `Loader::bundle`, the
+  sequence `lactose-persist`'s `tests/migrate.rs` runs for a type the baseline carries;
+  `load` runs it once the store can name a region's current baseline (milestone 3,
+  `docs/verification.md`, "A region's current baseline (D136)"), with the re-homing pass
+  for what the rebase drops. The same store lets `load` check a cooked entity a section
+  spawns from the baseline against its home region's baseline when the file has no section
+  of that region; today that region's first fresh load finds the entity live.
 - The slot listing and the load's reads through `Io::read_dir` and `Io::open`: `load`
   takes the bytes, which the binary reads with `Io::read_file` or `std::fs` at milestone 1.
 - `Workers::platform` from the platform crate, the present thread, and everything a
@@ -693,7 +715,7 @@ timing:
 | Time scale, client | A due frame carrying `Some(PAUSED)` pauses the pacer at the fold and the frame runs no tick and pops nothing; a later frame carrying `Some(REAL_TIME)` makes ticks due at its fold, the first step carries `Some(REAL_TIME)` and the hook pops both frames; a new client paced at rate zero, or whose first due frame carries a pause, runs no tick |
 | The store | A region unloaded under `Directed` is in `kept` after the step and not in `baselines`; a frame that loads it fresh loads the stored state with the frame's mode and table, `info` logged; a `save_point` after the unload holds it; under `Anchored`, a saved world of N regions with one pinned, started `Loaded`, loads the pinned region at the first step, reports no refusal, and after a `Join` into a saved region the lifecycle's `Load` is answered from the store at the next step and the region leaves `kept`; a world resumed that way matches the one that was never saved, counter and hash, at every tick; such a resume fails at `build_server` with `NotFound` when the pinned region has no table and with the pin's error when its pin fails, and under `Directed` a pin failure at the build fails it while a missing table loads the region with none; a save after K ticks holds every one of the N regions; join then leave: a saved world of 25 regions started `Loaded` under `Anchored`, a `Join` whose `Load`s the store answers, and the player's `Leave` in the step that loads the 25 bundles, so every bundle is accepted and its region unloaded again in one step: all 25 are in `kept` after that step, none in the baselines, and a save then holds all 25; under `Directed`, a region unloaded and reloaded in one frame whose reload bundle is refused is in `kept` with its export's records and not in the baselines, and one whose reload is accepted is loaded, not kept, with the reloading bundle's baseline; an unload whose diff fails (a region created through `Simulation::world_mut`, no baseline) fails the step with `NotFound` and `server: None`; a kept region whose table cannot be pinned at a store answer is no refusal: it loads `Frozen` with no table and takes one through `TickInput::assets`; a region is never both loaded and kept |
 | Baselines | A region loaded, unloaded and saved is diffed against the bundle it was loaded with, also when its reload in the same frame is refused; a refused bundle records nothing; a reload records the reloading bundle's baseline |
-| Save and load | `save_point`, `encode_save`, `Io::replace` into a temporary directory, `load`, a `Start::Loaded` headless app stepped K ticks against the original stepped K more: equal hashes; the same through a `SavedWorld` with no file; a `Start::Loaded` with a corrupt section fails at `load`; a failed replace leaves the previous file |
+| Save and load | `save_point`, `encode_save`, `Io::replace` into a temporary directory, `load`, a `Start::Loaded` headless app stepped K ticks against the original stepped K more: equal hashes; the same through a `SavedWorld` with no file; a `Start::Loaded` with a corrupt section fails at `load`; a failed replace leaves the previous file; `tests/proof/cross_section.rs`: a direct runtime spawn above the counter fails `encode_save` with nothing written and the last save still loads, and a splice of a section spawning a cooked entity from the baseline with a home section that leaves the row unchanged (frozen) or changes it (simulated) is refused by `load` naming both regions, while each play's own save loads |
 | Refusals | A bundle for a loaded region is a `LoadFailure` in `StepOutput::failures` and in `FrameOutput::failures`; a session event the applier refuses, or a `Join` for a region the atlas lacks under `Anchored`, and an asset failure the frame carries appear the same way; `is_empty` otherwise |
 | The client's frame | Over the proof's game: a full frame folded loads exactly its regions; a kept failure keeps the client and the next frame resyncs on entry and reports it; `clock` with `snap` resyncs at the next frame; a fold whose `Cooked` fails resyncs at the world's own tick with the pacer's deadline unchanged, and a failing frame that stays queued through a 120-frame pause resyncs once, not per frame, while a newer failing frame resyncs again; `build_client` under `Anchored` is `InvalidData`; after a backward resync the re-predicted ticks step with the history's samples and the sampler is not called; a stale estimate with `Behind` resyncs to at least `server + lead`, and `TooOld` to at least its `frame + lead`; an estimate taken, then a replicated pause of 120 frames and an unpause, then a resync with no hint lands at the estimate plus the ticks the pacer granted plus the lead, not the pause's length further; the history holds the last eight samples |
 | The fold's mode | A server and a client in one process, the server sent each tick the claimed entity's exact rows and the samples the client predicted with: after the join's full frame is folded the region is `Simulated`, the claimed counter stands ahead of the server's by exactly the ticks the client leads by, and the only correction in 60 frames is the first frame of the fold's tick restoring that tick (the full frame carries the join's rows, which the fold places `lead` ticks later); the same over 240 frames with the player a dynamic body falling onto a fixed slab, which rests at the server's height; a relevance message with no table folds the region `Frozen`, and the frame that brings the table as `RegionChange::Assets` makes it `Simulated`; a full frame after the table, or an `Irrelevant` between the table and a `Relevant` with none, in one fold, leaves the region `Frozen` with no table; today's cost, pinned by a test named for it: a region the server holds `Frozen` with its table published folds `Simulated`, the client's counter runs ahead of the server's and at least 55 of 60 frames correct it, each at its own tick, with no resync |

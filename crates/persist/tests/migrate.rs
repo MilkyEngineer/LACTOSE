@@ -377,6 +377,120 @@ fn a_v1_save_loads_through_the_readme_step_and_hashes_as_a_v2_save() {
     assert_eq!((health.points, health.max, health.regen), (40, 40, 2));
 }
 
+// ---- A type the cooked baseline carries: migrate, then rebase, then bundle ----
+
+/// The home region cooked with `Health` in its rows, as the build of `health` lays it out:
+/// the first cooked row's health the save changes, the second's it changes to a value the
+/// re-cook's equals once migrated, the third's it removes and the fourth's it never
+/// touches.
+fn health_baseline<H: Reflect>(build: &Build, health: [H; 4]) -> Arc<Baseline> {
+    let rows = health.into_iter().zip(1..).map(|(health, n)| BaselineRow {
+        id: NetId::cooked(n),
+        components: vec![data(pos(n as i32, 0)), data(health)],
+    });
+    let schemas = [Position::KEY, H::KEY].map(|key| build.table.schema(key).unwrap().clone());
+    Arc::new(Baseline::from_rows(AssetSet::new(), schemas, rows).unwrap())
+}
+
+/// The cook of a version 1 build.
+fn health_baseline_v1(build: &Build) -> Arc<Baseline> {
+    health_baseline(build, [v1::Health(40), v1::Health(70_000), v1::Health(9), v1::Health(12)])
+}
+
+/// The re-cook of a version 2 build: the same authored values, each as the README's step
+/// turns it.
+fn health_baseline_v2(build: &Build) -> Arc<Baseline> {
+    let health = |points| v2::Health { points, max: points };
+    health_baseline(build, [health(40), health(u16::MAX), health(9), health(12)])
+}
+
+/// The home region loaded from `baseline` and played: the first cooked row's health set
+/// to `changed`, the second's to `capped`, the third's removed, an entity spawned with
+/// `spawned`, and the weather.
+fn played_on<H: Component>(
+    build: &Build,
+    baseline: &Baseline,
+    [changed, capped, spawned]: [H; 3],
+) -> World {
+    let mut world = build.world();
+    let config = RegionConfig { id: HOME, seed: 0x5eed, mode: RegionMode::Simulated };
+    world.create_region(config).unwrap();
+    world.load_region(HOME, baseline, None).unwrap();
+    world.insert(net(NetId::cooked(1)), changed).unwrap();
+    world.insert(net(NetId::cooked(2)), capped).unwrap();
+    world.remove::<H>(net(NetId::cooked(3))).unwrap().unwrap();
+    let id = world.allocate_net_id().unwrap();
+    world.spawn(net(id), HOME, (pos(5, 5), spawned)).unwrap();
+    world.insert_region_resource(HOME, Weather(4)).unwrap();
+    world
+}
+
+fn records_against(build: &Build, world: &World, baseline: &Baseline) -> RegionRecords {
+    let export = RegionExport { region: HOME, rows: world.export_region(HOME).unwrap() };
+    RegionRecords::from_export(&export, baseline, &build.table).unwrap()
+}
+
+#[test]
+fn a_v1_save_of_a_type_the_baseline_carries_migrates_rebases_and_bundles_as_a_v2_save() {
+    // A version 1 build cooks, plays and saves, through the container's bytes.
+    let old_build = build::<v1::Health>();
+    let old_baseline = health_baseline_v1(&old_build);
+    let old_world =
+        played_on(&old_build, &old_baseline, [v1::Health(25), v1::Health(80_000), v1::Health(-5)]);
+    let header = ContainerHeader::new(Tick(12), old_world.next_net_id(), old_build.table.hash());
+    let mut container = Container::new(header);
+    container.insert(records_against(&old_build, &old_world, &old_baseline)).unwrap();
+    let old =
+        Container::decode(&container.encode().unwrap()).unwrap().region(HOME).unwrap().clone();
+    assert_eq!(old.baseline_hash, old_baseline.content_hash());
+
+    // A version 2 build re-cooks, and the same play on the re-cook is the native save.
+    let new = build::<v2::Health>();
+    let new_baseline = health_baseline_v2(&new);
+    assert_ne!(new_baseline.content_hash(), old_baseline.content_hash());
+    let health = |points| v2::Health { points, max: points };
+    let native = played_on(&new, &new_baseline, [health(25), health(u16::MAX), health(0)]);
+    let saved = records_against(&new, &native, &new_baseline);
+    let migrations = with(&[(1, health_v1_to_v2)]);
+    let loader = new.loader(&migrations);
+
+    // No step can be skipped. The old baseline's column is at version 1, which the
+    // registry refuses; the re-cook is not the baseline the records name.
+    let error = loader.bundle(&old, Arc::clone(&old_baseline), RegionMode::Simulated, None);
+    assert_eq!(error.unwrap_err().kind(), ErrorKind::VersionMismatch);
+    let error = loader.bundle(&old, Arc::clone(&new_baseline), RegionMode::Simulated, None);
+    assert_eq!(error.unwrap_err().kind(), ErrorKind::VersionMismatch);
+    let mut unmigrated = old.clone();
+    let error = unmigrated.rebase(&new_baseline, &new.table).unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::VersionMismatch, "{error}");
+    assert_eq!(unmigrated, old);
+
+    // Migrate, then rebase onto the re-cook, then bundle.
+    let mut migrated = loader.migrate(&old).unwrap();
+    let error = loader.bundle(&migrated, Arc::clone(&new_baseline), RegionMode::Simulated, None);
+    assert_eq!(error.unwrap_err().kind(), ErrorKind::VersionMismatch, "rebase first");
+    let dropped = migrated.rebase(&new_baseline, &new.table).unwrap();
+    // The re-cook moved and removed no row, so nothing is dropped; the second row's
+    // change equals the re-cook once migrated, and the re-diff leaves no record of it.
+    assert!(dropped.is_empty(), "{dropped:?}");
+    assert_eq!(migrated, saved);
+    let overlay = migrated.overlay.as_ref().unwrap();
+    assert!(overlay.records().iter().all(|record| record.id() != NetId::cooked(2)));
+    let bundle =
+        loader.bundle(&migrated, Arc::clone(&new_baseline), RegionMode::Simulated, None).unwrap();
+
+    // The world it loads is the native version 2 world: hash, export and values.
+    let from_v1 = loaded(&new, &bundle);
+    let hash = new.hashers.world_hash(&native, HOME).unwrap();
+    assert_eq!(new.hashers.world_hash(&from_v1, HOME).unwrap(), hash);
+    assert_eq!(from_v1.export_region(HOME).unwrap(), native.export_region(HOME).unwrap());
+    let health_of = |n| from_v1.get::<v2::Health>(net(NetId::cooked(n)));
+    assert_eq!(health_of(1), Some(&health(25)));
+    assert_eq!(health_of(2), Some(&health(u16::MAX)));
+    assert_eq!(health_of(3), None);
+    assert_eq!(health_of(4), Some(&health(12)));
+}
+
 /// Loads `records` under `build` and `migrations`, which must refuse with `kind` and a
 /// message naming `named`.
 fn refused(

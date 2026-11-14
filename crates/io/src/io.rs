@@ -123,16 +123,18 @@ impl Io {
     ///
     /// When the future resolves `Ok`, a reader of `path` on this machine sees all of
     /// `bytes`, and a crash or power loss after that point keeps them. At no point does a
-    /// reader see anything but the previous content or the new. The temporary file is
-    /// `<name>.<unique>.tmp` in the same directory as `path`, never on another volume; a
-    /// `path` with no directory part is in the current directory. The first replace into a
-    /// directory removes the temporaries an earlier process left there, never one of this
-    /// process. Replaces of one `path`, spelled the same, run in the order they were
-    /// submitted, dropped or not, so the last one submitted lands last; under two spellings
-    /// or from two `Io`s they are unordered, the last rename wins, and neither fails because
-    /// of the other. Two processes writing into one directory are unsupported. A `path`
-    /// whose last component is a symbolic link becomes a regular file, the link's target
-    /// unchanged.
+    /// reader see anything but the previous content or the new; on Windows that is relied
+    /// on and not documented, since Microsoft does not call the rename `std` issues
+    /// (`MoveFileExW` with `MOVEFILE_REPLACE_EXISTING`) atomic (`docs/verification.md`, the
+    /// row "`std::fs::File::sync_all` issues"). The temporary file is `<name>.<unique>.tmp`
+    /// in the same directory as `path`, never on another volume; a `path` with no directory
+    /// part is in the current directory. The first replace into a directory removes the
+    /// temporaries an earlier process left there, never one of this process. Replaces of one
+    /// `path`, spelled the same, run in the order they were submitted, dropped or not, so
+    /// the last one submitted lands last; under two spellings or from two `Io`s they are
+    /// unordered, the last rename wins, and neither fails because of the other. Two
+    /// processes writing into one directory are unsupported. A `path` whose last component
+    /// is a symbolic link becomes a regular file, the link's target unchanged.
     ///
     /// On failure the future hands `bytes` back, unchanged, in a [`ReplaceFailed`] beside
     /// the error. A failure before the rename keeps `path`'s previous content and removes
