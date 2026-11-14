@@ -64,7 +64,9 @@ runs, the span constructors.
 
 - Every request is a future, and nothing is submitted until it is first polled: no queue
   entry, no system call, no span. A future created and dropped unpolled has cost its own
-  allocation, and nothing else.
+  allocation, and nothing else. The first poll submits the request, if it goes to the pool
+  at all, and then looks for its result: a request the pool finishes within that poll
+  resolves at it.
 - A future resolves exactly once, to all of what was asked or to an error. A read never
   resolves to fewer bytes than its `len`; a replace never resolves `Ok` with the file half
   written; a listing never resolves to part of a directory.

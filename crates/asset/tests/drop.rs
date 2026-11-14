@@ -6,12 +6,15 @@
 
 mod common;
 
+use std::future::Future;
+use std::pin::pin;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc;
+use std::task::{Context, Poll, Waker};
 
 use common::*;
 use lactose_asset_api::{AssetCatalog, LoadPriority, Readiness};
-use lactose_core::{AllocTag, TaggedAlloc};
+use lactose_core::{AllocTag, ErrorKind, TaggedAlloc};
 
 #[global_allocator]
 static ALLOCATOR: TaggedAlloc = TaggedAlloc::system();
@@ -54,9 +57,13 @@ fn dropping_the_last_handle_cancels_every_load_and_never_blocks() {
     gate.open_all();
     gate.wait_returned(&held);
     eventually("the held call's asset dropped", || GATED_LIVE.load(Ordering::SeqCst) == 0);
-    // The read buffers and the packs' files, the last of them closed with the store.
+    // The read buffers and the packs' files, the last of them closed with the store. At
+    // most `idle`, not exactly it: the baseline may include a block still in flight then.
+    // On macOS a `std::sync::Mutex` allocates at its first lock, under the locking thread's
+    // tag, so a request's completion first locked by the pool thread is charged to `Io`
+    // until the pool drops the request, which may be after `idle` was read.
     let deadline = std::time::Instant::now() + LIMIT;
-    while ALLOCATOR.stats(AllocTag::Io).live_bytes != idle {
+    while ALLOCATOR.stats(AllocTag::Io).live_bytes > idle {
         let stats = ALLOCATOR.stats(AllocTag::Io);
         assert!(std::time::Instant::now() < deadline, "Io holds {stats:?}, {idle} bytes idle");
         std::thread::sleep(std::time::Duration::from_millis(1));
@@ -71,26 +78,68 @@ fn dropping_the_last_handle_cancels_every_load_and_never_blocks() {
     env.io.clone().shutdown();
 }
 
+/// The store's pool is held, so the first poll leaves the open queued: a pool fast enough
+/// to finish the open and both reads within that poll would resolve the mount there.
 #[test]
 fn a_mount_polled_once_and_dropped_mounts_nothing() {
-    use std::future::Future;
-    use std::pin::pin;
-    use std::task::{Context, Waker};
-
     let env = Env::new("drop_mount");
     let (loaders, _) = test_loaders();
-    let store = env.store(loaders);
-    let x = id("x");
+    let store = env.held_store(loaders);
+    let (x, y) = (id("x"), id("y"));
     let path = env.pack(&[(x, text(b"x", []))], lactose_asset::Storage::Raw);
     {
         let mut mount = pin!(store.mount(path));
         let poll = mount.as_mut().poll(&mut Context::from_waker(Waker::noop()));
-        assert!(poll.is_pending(), "a mount resolves no sooner than its reads");
+        assert!(poll.is_pending(), "the open is queued on the held pool");
     }
+    store.release();
+    // The pool's one thread runs its queue in the order the futures were first polled
+    // (`crates/io/README.md`, "Requests and futures" and "The pool"): once this mount has
+    // resolved, it has passed the dropped mount's open, which it skips as cancelled.
+    env.provide(&store, &[(y, text(b"y", []))]);
     store.request_newest(x, LoadPriority::default());
+    store.request_newest(y, LoadPriority::default());
     env.settle(&store);
     assert!(
-        matches!(store.newest(x), Readiness::Failed(failure) if failure.kind == lactose_core::ErrorKind::NotFound)
+        matches!(store.newest(x), Readiness::Failed(failure) if failure.kind == ErrorKind::NotFound)
     );
+    assert!(store.newest(y).ready().is_some());
+    env.shutdown();
+}
+
+/// On a pool left to run, a mount's first poll resolves it if the open and both reads end
+/// within that poll; the pack is then mounted, as by any mount that resolved `Ok`.
+/// Otherwise the drop mounts nothing, then or later: the check waits for another mount
+/// resolved after it on the pool's one thread.
+#[test]
+fn a_mount_dropped_after_one_poll_mounts_its_pack_only_if_that_poll_resolved_it() {
+    let env = Env::one_thread_each("drop_mount_running_pool");
+    let (loaders, _) = test_loaders();
+    let store = env.store(loaders);
+    let (x, y) = (id("x"), id("y"));
+    let path = env.pack(&[(x, text(b"x", []))], lactose_asset::Storage::Raw);
+    let resolved = {
+        let mut mount = pin!(store.mount(path));
+        match mount.as_mut().poll(&mut Context::from_waker(Waker::noop())) {
+            Poll::Ready(result) => {
+                result.expect("the pack mounted");
+                true
+            }
+            Poll::Pending => false,
+        }
+    };
+    env.provide(&store, &[(y, text(b"y", []))]);
+    store.request_newest(x, LoadPriority::default());
+    store.request_newest(y, LoadPriority::default());
+    env.settle(&store);
+    assert!(store.newest(y).ready().is_some());
+    if resolved {
+        let handle = store.newest(x).ready().expect("the mounted pack's version");
+        assert_eq!(handle.downcast::<Text>().expect("a text asset").0, b"x");
+    } else {
+        assert!(
+            matches!(store.newest(x), Readiness::Failed(failure) if failure.kind == ErrorKind::NotFound)
+        );
+    }
     env.shutdown();
 }

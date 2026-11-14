@@ -1,6 +1,7 @@
-//! What the store's tests share: an executor and a pool, a directory of packs under
-//! `CARGO_TARGET_TMPDIR`, waits bounded so that a hang fails instead, and test asset kinds,
-//! among them one whose loader a test holds and releases by name.
+//! What the store's tests share: an executor and a pool, a store on a pool held before
+//! its first request, a directory of packs under `CARGO_TARGET_TMPDIR`, waits bounded so
+//! that a hang fails instead, and test asset kinds, among them one whose loader a test
+//! holds and releases by name.
 
 #![allow(dead_code, reason = "each test binary uses part of this")]
 
@@ -22,7 +23,9 @@ use lactose_asset_api::{
 };
 use lactose_core::{AllocTag, Error, ErrorKind, Result};
 use lactose_io::{Io, IoConfig};
-use lactose_task::{Executor, Sleep, WorkerClass};
+use lactose_task::{
+    CoreTopology, Executor, Platform, Sleep, ThreadHandle, ThreadSpec, WorkerClass,
+};
 
 /// The longest any test waits for something that should happen: past it, the wait fails.
 pub const LIMIT: Duration = Duration::from_secs(60);
@@ -90,6 +93,20 @@ impl Env {
         Store::new(self.executor.clone(), self.io.clone(), loaders).expect("one loader per kind")
     }
 
+    /// A store on a pool of its own, held: see [`HeldStore`]. The env's own pool still
+    /// writes the packs.
+    pub fn held_store(&self, loaders: Vec<ErasedLoader>) -> HeldStore {
+        let release = Arc::new(Release::default());
+        let platform = HoldingPlatform {
+            platform: Arc::clone(self.executor.platform()),
+            release: Arc::clone(&release),
+        };
+        let one = std::num::NonZero::new(1).unwrap();
+        let io = Io::start(&platform, IoConfig::new(one)).expect("the held pool");
+        let store = Store::new(self.executor.clone(), io, loaders).expect("one loader per kind");
+        HeldStore { store, release }
+    }
+
     /// Writes `bytes` whole at a new path of the directory.
     pub fn write(&self, bytes: Vec<u8>) -> PathBuf {
         let number = self.packs.fetch_add(1, Ordering::Relaxed);
@@ -151,6 +168,103 @@ impl Env {
     pub fn shutdown(self) {
         self.io.shutdown();
         self.executor.shutdown();
+    }
+}
+
+/// Whether a held pool's threads may begin.
+#[derive(Default)]
+struct Release {
+    released: Mutex<bool>,
+    changed: Condvar,
+}
+
+impl Release {
+    fn released(&self) -> MutexGuard<'_, bool> {
+        self.released.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn release(&self) {
+        *self.released() = true;
+        self.changed.notify_all();
+    }
+
+    /// Unbounded: nothing joins a thread held here before the release, and the
+    /// [`HeldStore`]'s drop releases it.
+    fn wait(&self) {
+        let mut released = self.released();
+        while !*released {
+            released = self.changed.wait(released).unwrap_or_else(PoisonError::into_inner);
+        }
+    }
+}
+
+/// The executor's platform, with every thread it starts waiting for the release before
+/// its body runs.
+struct HoldingPlatform {
+    platform: Arc<dyn Platform>,
+    release: Arc<Release>,
+}
+
+impl Platform for HoldingPlatform {
+    fn topology(&self) -> CoreTopology {
+        self.platform.topology()
+    }
+
+    fn hardware_threads(&self) -> Option<u32> {
+        self.platform.hardware_threads()
+    }
+
+    fn spawn_thread(
+        &self,
+        spec: ThreadSpec,
+        body: Box<dyn FnOnce() + Send + 'static>,
+    ) -> Result<ThreadHandle> {
+        let release = Arc::clone(&self.release);
+        self.platform.spawn_thread(
+            spec,
+            Box::new(move || {
+                release.wait();
+                body();
+            }),
+        )
+    }
+}
+
+/// A store whose pool's one thread does not begin until [`HeldStore::release`], or the
+/// held store's drop. Until then every request the store submits stays queued, so a
+/// first poll that submits one (a mount's open) returns `Pending` on any schedule: the
+/// hold proves that the request had not run, not merely that it was slow. Once released,
+/// the thread runs the queue in the order the requests' futures were first polled, one at
+/// a time, skipping those whose futures were dropped (`crates/io/README.md`, "Requests
+/// and futures" and "The pool"; a priority that reorders the queue is milestone 3's to
+/// decide).
+///
+/// Its fields are private, so no test can let go of the hold by a pattern such as
+/// `let (store, _) = ...`; the store is reached through `Deref`.
+pub struct HeldStore {
+    store: Store,
+    release: Arc<Release>,
+}
+
+impl HeldStore {
+    /// Lets the pool's thread begin.
+    pub fn release(&self) {
+        self.release.release();
+    }
+}
+
+impl std::ops::Deref for HeldStore {
+    type Target = Store;
+
+    fn deref(&self) -> &Store {
+        &self.store
+    }
+}
+
+/// A test that fails or never releases leaves no pool thread waiting.
+impl Drop for HeldStore {
+    fn drop(&mut self) {
+        self.release.release();
     }
 }
 

@@ -1599,6 +1599,25 @@ editorial pass rather than one taken from a review.
   - The three 100,000-link tests need a 240 s bound under load, under nextest's 300 s kill.
   - A held test loader keeps its background worker, since a loader's call is not sliced. A test
     that needs another load's steps to run while a call is held names its worker count.
+- Addendum (lane asset-mount-flake, 2026-11-15; review rounds 1 and 2):
+  `a_failed_and_a_dropped_mount_leave_their_place_empty_and_change_nothing` failed on CI (run
+  43618087733, first attempt, ubuntu-latest) at its assertion that a mount polled once is
+  `Pending`. An `io` request is submitted at its future's first poll, which then looks for the
+  result, and a mount's first poll makes its open and both reads that way in turn: a poller
+  descheduled between submit and look at each of the three finds each done, and the mount
+  resolves at that poll. A 5 ms sleep inserted there failed that test and
+  `a_mount_polled_once_and_dropped_mounts_nothing`, as they were, on every run. Both now run the
+  store on a one-thread pool held before it starts (`Env::held_store`, a `HeldStore` no pattern
+  can split), so the first poll is `Pending` on any schedule, and the first checks the
+  generation at the drop, before the release; `crates/asset/README.md` states the rule.
+  `a_mount_dropped_after_one_poll_mounts_its_pack_only_if_that_poll_resolved_it`, on a pool left
+  to run, checks the dropped mount only after a later mount has resolved on the pool's one
+  thread. `dropping_the_last_handle_cancels_every_load_and_never_blocks` settles to at most its
+  `AllocTag::Io` baseline, since on macOS a mutex's first lock on the pool thread can leave a
+  block in that baseline. `lactose-io`'s
+  `an_encoded_read_whose_stored_bytes_arrived_before_the_stop_still_decodes` keeps its
+  first-poll `Pending`: even with its stored bytes in, a 4 MiB decode would have to end within
+  one 0.5 ms slice, about 7.8 GiB/s, six times the best measured.
 
 ## 8. Physics and animation
 
