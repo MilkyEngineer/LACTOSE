@@ -9,9 +9,10 @@
 //!
 //! # Status
 //!
-//! Storage, change tracking, commands, events, snapshots and bulk copy are complete, and a
-//! schedule run executes every system in order on one worker, a per-entity system as a
-//! kernel over the rows of each chunk. Milestone 1 forks those units over workers next.
+//! Storage, change tracking, commands, events, snapshots and bulk copy are complete. A
+//! schedule run is a `lactose-task` graph: each system that is not exclusive is a node
+//! whose units, a chunk's rows or a batch of them, fork over the executor's workers, and
+//! what they emit reaches the world in plan order whatever order they finished in.
 //!
 //! # Where to start
 //!
@@ -26,6 +27,10 @@
 //!   [`World::structural_log`] for spawns, despawns and moves.
 //! - [`World::snapshot`] and [`World::restore`] serve the prediction world; the bulk-copy
 //!   methods move region rows to and from `lactose_bundle` documents.
+
+// The `#[system]` expansion names `::lactose_ecs`; the crate's own tests declare systems.
+#[cfg(test)]
+extern crate self as lactose_ecs;
 
 mod access;
 mod apply;

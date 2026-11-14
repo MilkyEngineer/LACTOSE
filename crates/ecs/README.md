@@ -11,14 +11,14 @@ against.
 
 **Status: naive implementation.** Every behaviour below is implemented and tested. Storage
 is real (archetypes, chunks, column ticks, row stamps, SOUR's layout options), and a
-schedule run is one graph node on the executor that runs every sync point and every system
-in execution order on one worker, without forking over chunks. Milestone 1 rewrites the hot
-paths behind the same surface: so far `World::query` visits only the archetypes it admits,
-`Events::for_target` reads an index, neither a typed overwrite through `World::insert`
-nor a per-entity invocation that emits and commands nothing allocates, a per-entity
-system runs a kernel over the rows of one unit (a chunk, or a random range of one) with
-its columns lent as slices, and a `Changed` filter and `World::changed_since` skip every
-chunk whose column tick is old; forking the units over workers comes next (D137). Architecture sections 5.2, 6 and 6.1 are the design; where this file
+schedule run is a graph on the executor whose system nodes fork their units over workers.
+Milestone 1 rewrites the hot paths behind the same surface: so far `World::query` visits
+only the archetypes it admits, `Events::for_target` reads an index, neither a typed
+overwrite through `World::insert` nor a per-entity invocation that emits and commands
+nothing allocates, a per-entity system runs a kernel over the rows of one unit (a chunk, or
+a random range of one) with its columns lent as slices, a `Changed` filter and
+`World::changed_since` skip every chunk whose column tick is old, and each system is a
+graph node whose units run on any worker (D137). Architecture sections 5.2, 6 and 6.1 are the design; where this file
 and the architecture disagree, the architecture wins and this file is wrong. Decision D114 records the choices the sections left open and
 what the design review changed.
 
@@ -305,24 +305,33 @@ What a system is, from its parameters (`SystemParam` has the table):
   `run_pass`, which has no previous tick to measure from, `Changed<T>` passes what changed
   since the same schedule's previous pass of the epoch; in `World::query`, what changed
   after the current point of the previous tick (everything at tick zero).
-- A run is one graph node on the executor, named `casein::tick` or `casein::pass`, which
-  runs every sync point and every system in execution order on one worker; the world moves
-  into the node and back out when the run resolves. If the executor has shut down first the
-  run resolves to `Cancelled` before anything ran, and the world drops with the node. The
-  layout options are honoured: chunks are issued in `chunk_order`, rows are permuted
-  within their chunks at every sync point, and under `split_batches` a chunk's rows are
-  cut into units of random length, so a reduction's partials are merged from batches of
-  random size.
+- A run is a graph on the executor, built from the plan at the schedule's first run and
+  kept: a node per sync point (`casein::sync`), a node per system that is not exclusive,
+  named by the system, and per stage a node per event type the stage both emits and reads
+  (`casein::events`). A sync point applies the commands, runs its stage's exclusive
+  systems in plan order and gives every system of the stage the stamp its plan position
+  fixes; then the stage's system nodes run, each after its ancestors in the plan and
+  beside every system it does not conflict with. The world moves into the graph and back
+  out when the run resolves. If the executor has shut down first the run resolves to
+  `Cancelled` before anything ran, and the world drops with the graph. The layout options
+  are honoured: chunks are issued in `chunk_order`, rows are permuted within their chunks
+  at every sync point, and under `split_batches` a chunk's rows are cut into units of
+  random length, so a reduction's partials are merged from batches of random size.
 - A per-entity system's run is a set of units, each a chunk or (under `split_batches`) a
-  range of one chunk's rows, all made before any runs: the run tests each issued chunk's
-  `Changed` column ticks against the window, then writes the coarse tick of every column
-  the system writes on that chunk, skipped or not; a chunk that fails the test has no unit
-  and no row of it is read. A unit gets a range of each written column, split off the
-  chunk so units are disjoint, and the same range of each column it only reads; its kernel
-  loops over the rows. What a row emits, commands or sends is kept per row in storage the
-  run owns and merged after every unit has run, in source-key order (D117); a reduction
-  keeps one partial per unit, merged by `Reducer::merge`. Nothing is kept per worker, so
-  the units can fork over workers without changing a hash. Each run emits a `casein` trace
+  range of one chunk's rows, all made by the node's `units` before any runs: it tests each
+  issued chunk's `Changed` column ticks against the window, then writes the coarse tick of
+  every column the system writes on that chunk, skipped or not; a chunk that fails the test
+  has no unit and no row of it is read. The cuts are drawn from (layout seed, tick, system,
+  archetype, chunk), never from the order units run in. A unit gets its rows of each
+  written column, disjoint from every other unit's, and the same rows of each column it
+  only reads; its kernel loops over the rows. A per-region system's units are its admitted
+  regions, a once-per-tick system's one unit. What a unit emits, commands or sends is kept
+  in a slot of that unit and merged in the node's finalize, in unit order and then by
+  source key (D117); a reduction keeps one partial per unit, merged by `Reducer::merge`.
+  Events reach the world by emitting system in plan order: an event type a stage both
+  emits and reads is merged after its emitters and before its readers, any other at the
+  next sync point. Nothing is kept per worker, so a hash does not depend on how the units
+  forked. Each run emits a `casein` trace
   event `per_entity` with the system's name and its counts (`units`, `chunks_skipped`,
   `rows`, `invocations`), and `World::changed_since` one named `changed_since` with
   `chunks_skipped` and `rows_visited`, for the tests that hold the skip by count.
@@ -585,7 +594,11 @@ What a system is, from its parameters (`SystemParam` has the table):
 The tests in `tests/`, each a nextest test that asserts on counts and orders and never on
 timing; under Miri a representative quarter of the layouts runs. Milestone 0 requires
 `cargo +nightly miri test -p lactose-ecs` to pass; milestone 1 requires SOUR in workers,
-repeat, layout and chaos modes.
+repeat, layout and chaos modes. The crate is a `[harness]` package
+(`tools/xtask/ci-policy.toml`): every test builds its executor from SOUR's session
+(`tests/common`), with the session's frame workers (two outside the runner) and, under a
+chaos seed, every perturbation, so each test runs under the runner's worker counts and
+chaos seeds; under Miri, which no runner launches, the session is not read.
 
 | File | What it proves |
 |---|---|
@@ -609,6 +622,14 @@ repeat, layout and chaos modes.
 | `erased_rows.rs` | Typed and erased writes of the same values leave identical columns, row and column ticks, `changed_since` sets, structural logs, reverse and claim indices under every layout, `Net` references rewritten and `OwnedBy` and `ClaimedBy` among them; an equal `insert_erased` unseen by a `Changed` reader; every refusal with its kind and nothing changed, a refused typed `insert` included; a placeholder refused by name, and stored empty by a typed write; padding zeroed; `get_erased` through a restore and a snapshot round trip |
 | `ownership.rs` | The forest rule: a self-owner and the closing write of a two- and a three-entity cycle refused through every direct path with nothing changed, aliases included, and dropped and logged at apply with the rest of the buffer applied, a refused predicted spawn leaving no bind and no `NetId` used; a chain through a dangling owner accepted and the write that closes it later refused; `load_region` refusing a cycle within one document (through the baseline's own column, or the baseline alone) and a row whose bound id lacks `PredictedOrigin`, and breaking a cycle through live entities of other regions at the smallest document row whose owner is outside, one `warn` line, the re-export carrying the break and reloading without one, across two documents in either order and three regions; `bind`, `restore` and the despawn of a bound `Net` entity emptying the one reference whose rewrite would close a cycle; a region's own save reloading after a cycle closed through it while unloaded, and a client loading documents sent at different times; an owned entity staying put when given to an owner elsewhere and when the owner's region unloads, exported and reloaded in either order; seeded random histories in which the live world never cycles, every export is an overlay, and every reload and restart in either order loads and round-trips exactly; a chain of 8000 owners loading within five times the time of 8000 rows with one owner |
 | `units.rs` | A per-entity run is one unit per chunk, or more under `split_batches` with the same reduction; a `Changed` filter and `World::changed_since` skip every chunk whose column tick is old, held by the counts of the `casein` trace events |
+| `fork.rs` | On one worker and on four under chaos seeds with every split forced, over the production layout and seven-row chunks cut into random batches: each unit runs once (every row counted once a tick, each tick's reduction total the row count), and two unordered emitters, a per-region emitter and two unordered spawners leave the same events and spawned keys as one worker, each emitter's events contiguous and in source order |
 | `alloc.rs` | A row that emits nothing allocates nothing, with `Ctx::rng` keyed by the row among the parameters |
 | `claims.rs` | The claim index behind `World::claimed`: current after every direct method, command, predicted spawn, ownership despawn, unload and restore, in key order under every layout |
 | `compile_fail.rs` | What `#[system]` and `#[finalize]` reject, and what they accept under `#![forbid(unsafe_code)]` |
+
+In the crate itself, where a world's clock can be moved without running every tick
+(`src/world.rs`): a row written once is carried through two rebase points by scheduled
+ticks, across the `u32` wrap, and a pass that first runs when the row is 2^31 - 1 ticks
+old, the oldest age the clamp leaves, sees it; without the clamp it would be 2^31 + 1 ticks
+old and missed. No pass sees it twice in one epoch. `src/run.rs` holds `first_pass_window`
+against every age the clamp allows.

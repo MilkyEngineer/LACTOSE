@@ -2174,3 +2174,121 @@ impl<'w> Iterator for ErasedResources<'w> {
         self.resources.next()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use lactose_core::{NetId, StableKey, Tick};
+    use lactose_reflect::{Registry, component};
+    use lactose_task::Executor;
+
+    use super::{REBASE_TICKS, World, WorldBuilder, WorldKind};
+    use crate::{
+        Changed, ClaimedBy, InRegion, OwnedBy, PredictedOrigin, RegionConfig, RegionId, RegionMode,
+        Res, Schedule, SystemDescriptor, system,
+    };
+
+    /// A tracked component, so its rows carry the stamps the clamp moves.
+    #[component(key = "test::aged", persistent, replicated)]
+    struct Aged(#[field(id = 1)] u32);
+
+    /// How many rows the reader saw since it was last asked.
+    type Seen = Mutex<u32>;
+
+    #[system(name = "test::idle", worlds = [server])]
+    fn idle() {}
+
+    #[system(name = "test::read_aged", worlds = [server])]
+    fn read_aged(_changed: Changed<Aged>, _aged: &Aged, seen: Res<Seen>) {
+        *seen.lock().unwrap() += 1;
+    }
+
+    const REGION: RegionId = RegionId(1);
+
+    fn registry() -> Arc<Registry> {
+        let mut registry = Registry::new();
+        registry.register::<InRegion>().unwrap();
+        registry.register::<OwnedBy>().unwrap();
+        registry.register::<ClaimedBy>().unwrap();
+        registry.register::<PredictedOrigin>().unwrap();
+        registry.register::<Aged>().unwrap();
+        Arc::new(registry)
+    }
+
+    fn schedule(system: &'static SystemDescriptor) -> Schedule {
+        let mut builder = Schedule::builder(WorldKind::Server);
+        builder.stage("only", &[]).add(system);
+        builder.build().unwrap()
+    }
+
+    /// Moves the clock to `to` as ticks that write nothing would, which holds only while
+    /// no rebase point lies on the way.
+    fn skip_to(world: &mut World, to: u32) {
+        let span = to.wrapping_sub(world.tick.0);
+        let until_rebase = REBASE_TICKS - world.tick.0 % REBASE_TICKS;
+        assert!(span < until_rebase, "the skip from {} to {to} passes a rebase", world.tick.0);
+        world.tick = Tick(to);
+        world.storage.clock = Tick(to);
+    }
+
+    /// Runs `pass` and returns how many rows its reader saw.
+    fn seen(pass: &mut Schedule, world: World, executor: &Executor) -> (World, u32) {
+        let mut world = executor.block_on(pass.run_pass(world, executor)).unwrap();
+        let count = core::mem::take(world.service_mut::<Seen>().unwrap().get_mut().unwrap());
+        (world, count)
+    }
+
+    /// A row written once, carried through two rebase points by ticks the schedule runs, is
+    /// seen by a pass that first runs at the row's oldest age, 2^31 - 1 ticks, and by no
+    /// pass twice in one epoch. Without the clamp the row would be 2^31 + 1 ticks old
+    /// there, outside every window. The second base crosses the `u32` wrap.
+    #[test]
+    fn a_pass_sees_a_row_written_before_two_rebases_once_per_epoch() {
+        let executor = Executor::builder().frame_workers(2).background_workers(1).build().unwrap();
+        for base in [REBASE_TICKS, 3 * REBASE_TICKS] {
+            let next = base.wrapping_add(REBASE_TICKS);
+            let last = next.wrapping_add(REBASE_TICKS);
+            let mut world = WorldBuilder::new(WorldKind::Server, registry())
+                .tick(Tick(base - 2))
+                .build()
+                .unwrap();
+            let config = RegionConfig { id: REGION, seed: 1, mode: RegionMode::Simulated };
+            world.create_region(config).unwrap();
+            let key = StableKey::Net(NetId::from_bits(1).unwrap());
+            world.spawn(key, REGION, (Aged(1),)).unwrap();
+            world.insert_service::<Seen>(Box::new(Mutex::new(0)));
+            let mut ticks = schedule(&IDLE);
+            let mut early = schedule(&READ_AGED);
+            let mut late = schedule(&READ_AGED);
+            let mut count;
+
+            for _ in 0..2 {
+                world = executor.block_on(ticks.run_tick(world, &executor)).unwrap();
+            }
+            assert_eq!(world.tick(), Tick(base), "the first rebase point");
+            skip_to(&mut world, next.wrapping_sub(1));
+            world = executor.block_on(ticks.run_tick(world, &executor)).unwrap();
+            assert_eq!(world.tick(), Tick(next), "the second, 2^30 + 2 ticks after the write");
+            (world, count) = seen(&mut early, world, &executor);
+            assert_eq!(count, 1, "a first pass sees the row, base {base}");
+            (world, count) = seen(&mut early, world, &executor);
+            assert_eq!(count, 0, "and only once");
+
+            skip_to(&mut world, last.wrapping_sub(1));
+            (world, count) = seen(&mut late, world, &executor);
+            assert_eq!(count, 1, "a first pass at the row's oldest age, base {base}");
+            (world, count) = seen(&mut late, world, &executor);
+            assert_eq!(count, 0);
+            (world, count) = seen(&mut early, world, &executor);
+            assert_eq!(count, 0, "a pass that saw the row in this epoch");
+
+            world = executor.block_on(ticks.run_tick(world, &executor)).unwrap();
+            assert_eq!(world.tick(), Tick(last), "the third rebase point");
+            (world, count) = seen(&mut early, world, &executor);
+            assert_eq!(count, 1, "once more in a new epoch, base {base}");
+            (_, count) = seen(&mut early, world, &executor);
+            assert_eq!(count, 0);
+        }
+    }
+}
