@@ -15,31 +15,57 @@ env:
 
 # Architecture section 20: Miri, loom, the full SOUR matrix and architecture mode run nightly.
 jobs:
+  # One job per crate, so each has the whole time limit and a timeout drops only its own
+  # crate. As one job it took 38 to 57 minutes of its 60 in the green nightlies of 5 to 13
+  # November 2026, and a timeout in `lactose-ecs` dropped the weak-memory steps after it.
   miri:
-    name: miri
+    name: miri (${{ matrix.name }})
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: core
+            key: core
+            args: -p lactose-core
+          # Architecture sections 20 and 22: `task` and `ecs` pass Miri. The executor runs
+          # twice: over its stand-in deque, then over the real `crossbeam-deque`, which needs
+          # Tree Borrows and leaks its epoch garbage by design (crates/task/SAFETY.md).
+          - name: task
+            key: task
+            args: -p lactose-task
+          - name: task, real deque
+            key: task-real-deque
+            args: -p lactose-task
+            real_deque: "1"
+            miriflags: -Zmiri-tree-borrows -Zmiri-ignore-leaks
+          - name: ecs
+            key: ecs
+            args: -p lactose-ecs
+          # The latest-sample slot's atomics: Miri's weak-memory emulation checks the shipped
+          # `Native` orderings, which the loom models (over their own atomics) do not.
+          - name: input-host
+            key: input-host
+            args: -p lactose-input-host
+          # The interpolation buffer's sequence lock (crates/net-host): Miri's weak-memory
+          # emulation catches the reader-side orderings the hardware stress test misses.
+          - name: net-host
+            key: net-host
+            args: -p lactose-net-host --test interpolation
     steps:
       - uses: actions/checkout@v4
       # Miri is the one sanctioned use of a nightly toolchain (architecture section 8.3).
       - run: rustup toolchain install $MIRI_TOOLCHAIN --profile minimal --component miri,rust-src
+      # Every entry is the same job, so each takes its own cache key.
       - uses: Swatinem/rust-cache@v2
-      - run: cargo +$MIRI_TOOLCHAIN miri test -p lactose-core --locked
-      # Architecture sections 20 and 22: `task` and `ecs` pass Miri. The executor runs twice:
-      # over its stand-in deque, then over the real `crossbeam-deque`, which needs Tree
-      # Borrows and leaks its epoch garbage by design (crates/task/SAFETY.md).
-      - run: cargo +$MIRI_TOOLCHAIN miri test -p lactose-task --locked
-      - run: cargo +$MIRI_TOOLCHAIN miri test -p lactose-task --locked
+        with:
+          key: miri-${{ matrix.key }}
+      # An empty LACTOSE_MIRI_REAL_DEQUE leaves the stand-in deque (crates/task/build.rs).
+      - run: cargo +$MIRI_TOOLCHAIN miri test ${{ matrix.args }} --locked
         env:
-          LACTOSE_MIRI_REAL_DEQUE: "1"
-          MIRIFLAGS: -Zmiri-tree-borrows -Zmiri-ignore-leaks
-      - run: cargo +$MIRI_TOOLCHAIN miri test -p lactose-ecs --locked
-      # The latest-sample slot's atomics: Miri's weak-memory emulation checks the shipped
-      # `Native` orderings, which the loom models (over their own atomics) do not.
-      - run: cargo +$MIRI_TOOLCHAIN miri test -p lactose-input-host --locked
-      # The interpolation buffer's sequence lock (crates/net-host): Miri's weak-memory
-      # emulation catches the reader-side orderings the hardware stress test misses.
-      - run: cargo +$MIRI_TOOLCHAIN miri test -p lactose-net-host --test interpolation --locked
+          LACTOSE_MIRI_REAL_DEQUE: ${{ matrix.real_deque }}
+          MIRIFLAGS: ${{ matrix.miriflags }}
 
   # Architecture section 5.1: the scope latch and the sleep-and-wake protocol are modelled
   # under loom, as is input-host's latest-sample sequence lock (architecture section 5.3),
@@ -61,9 +87,11 @@ jobs:
   # of architecture mode. Each platform also emits its baseline hashes, which the next job
   # compares across platforms.
   #
-  # Not wired yet: the Haswell-masked linux-x64 run of architecture mode. It needs the tests
-  # to run under a CPU model that hides everything newer than the x86-64-v3 baseline, and
-  # the hosted runners offer no way to do that without an emulator.
+  # Not wired: the Haswell-masked linux-x64 run of architecture mode, which needs the tests
+  # to run under an emulator that hides everything newer than the x86-64-v3 baseline. It is
+  # gated at milestone 4 (docs/verification.md, D139). Until then each platform prints its
+  # CPU model and feature flags beside its hashes, so the history shows which feature sets
+  # have agreed; a comparison that differs between two x86 hosts wires it at once.
   sour:
     name: sour (${{ matrix.platform }})
     runs-on: ${{ matrix.os }}
@@ -84,7 +112,42 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@v2
         with:
-          tool: cargo-nextest
+          tool: cargo-nextest@0.9.151
+      # The runner's CPU model and feature flags, in the log and the job summary. They only
+      # inform, so neither step can fail the job.
+      - name: CPU model and feature flags
+        if: runner.os != 'Windows'
+        continue-on-error: true
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = Linux ]; then
+            model=$(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2-)
+            flags=$(grep -m1 '^flags' /proc/cpuinfo | cut -d: -f2-)
+          else
+            model=$(sysctl -n machdep.cpu.brand_string)
+            flags=$(sysctl hw.optional | sed -n 's/^hw\.optional\.\(.*\): 1$/\1/p' | tr '\n' ' ')
+          fi
+          {
+            echo "### CPU of ${{ matrix.platform }}"
+            echo
+            echo "- model: \`$(echo $model)\`"
+            echo "- feature flags: \`$(echo $flags)\`"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+      # Windows lists no flags; IsProcessorFeaturePresent answers for the x86 levels that matter
+      # against the x86-64-v3 baseline.
+      - name: CPU model and feature flags (Windows)
+        if: runner.os == 'Windows'
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $model = (Get-CimInstance Win32_Processor).Name.Trim()
+          $kernel = Add-Type -PassThru -Name Kernel32 -Namespace Cpu -MemberDefinition @'
+          [DllImport("kernel32.dll")] public static extern bool IsProcessorFeaturePresent(uint feature);
+          '@
+          $names = [ordered]@{ 36 = 'ssse3'; 37 = 'sse4.1'; 38 = 'sse4.2'; 39 = 'avx'; 40 = 'avx2'; 41 = 'avx512f' }
+          $flags = ($names.Keys | Where-Object { $kernel::IsProcessorFeaturePresent($_) } | ForEach-Object { $names[$_] }) -join ' '
+          $lines = @("### CPU of ${{ matrix.platform }}", '', "- model: ``$model``", "- feature flags (IsProcessorFeaturePresent): ``$flags``")
+          $lines | Tee-Object -FilePath $env:GITHUB_STEP_SUMMARY -Append
       - name: Build the CI driver
         run: cargo build --locked -p lactose-xtask
       - name: Runner self-test

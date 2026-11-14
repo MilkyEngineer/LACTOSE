@@ -22,30 +22,22 @@ env:
 # clippy and the Windows release tests have a job of their own, so they run beside the
 # Windows debug test build instead of before and after it.
 #
-# Where each job's budget goes, in minutes. rust-cache restores the dependencies; the
-# workspace crates and the vendored rapier3d-f64 are path crates, so every run compiles and
-# links them again, and the Windows test build grows with every crate merged.
-# - check (windows-latest). Run 38128490654 (f70c25f), with clippy and the release tests still
-#   in it, took 14.8 of its 15: setup 0.7, clippy 1.0, the test step 11.2 (its build 9.9, the
-#   run 1.2), doctests 0.1, the release golden vectors 1.3, cache save 0.4. The margin was
-#   under a minute warm, and about a minute without clippy. The job grew with each merge: 8.5,
-#   7.8, 9.2, 10.1, 11.3, 12.6, a timeout, 14.8. Without clippy and the release tests it is
-#   about 12.6, a margin of about 2.4 warm, which the next one or two crate merges use up.
-#   The test build runs 1.4 to 2.3 times Linux's, by about as much in its early phase, which
-#   links almost nothing, as in its late one, which links the test binaries: the time is
-#   rustc's on this runner, not the linker's. lld-link (.cargo/config.toml) takes the part that
-#   is the linker's. Its first run rebuilds every dependency, since the linker is part of each
-#   unit's fingerprint: an estimated 2 to 3 minutes more, which may time out (see the cache
-#   note below). Due now, as its own lane: one integration-test binary per crate.
-#   lactose-ecs's 22 built as one took 5.2 s instead of 14 on an M1 at -j4.
-# - windows-lint-release, an estimated 3.5 to 4 warm and 6 to 8 cold: setup 0.7 plus the cache
-#   restore and save, clippy 1.0 warm (4 to 6 cold), the release golden vectors 1.3.
-# - check (ubuntu-latest), 6.4-6.9 in runs 38126112367 and 38126882535: setup 0.3, clippy
-#   0.4-1.0, the test build 3.8-4.6, the test run 0.4-0.6, the release golden vectors 0.4-0.6.
-#   It links with lld already.
-# - check (macos-latest), 2.0-2.6 in the same runs: the test build 1.0-1.3, clippy 0.1-0.5.
-# - policy, 0.6-0.7: building the CI driver 0.25, the checks 0.1.
-# - sour, 4.2-4.8: the build of the harness packages' tests 2.9, three passes of 0.3 each.
+# Where each job's budget goes, in minutes, from the three green runs 43548888588 (6443887),
+# 43550976114 (6ed8461) and 43556574172 (3264406), each warm. rust-cache restores the
+# dependencies; the workspace crates and the vendored rapier3d-f64 are path crates, so every
+# run compiles and links them again, and the test builds grow with every crate merged.
+# - check (windows-latest), 5.2 to 5.7: the test step 4.5 to 4.8 (its build most of it),
+#   doctests 0.1. lld-link (.cargo/config.toml) links. The job reached 14.8 of its 15 in
+#   October with clippy and the release tests still in it; they moved to the next job.
+# - windows-lint-release, 2.6 to 3.6: clippy 0.5 to 0.7, the release golden vectors 1.3 to 2.3.
+# - check (ubuntu-latest), 5.1 to 6.5: clippy 0.3, the test step 3.1 to 4.0, the release golden
+#   vectors 1.0 to 1.6. It links with lld.
+# - check (macos-latest), 4.0 to 8.4: the test step 4.9 to 5.4, the release golden vectors
+#   1.6 to 2.1, clippy 0.5 to 0.6.
+# - policy, 0.5 to 0.6: building the CI driver 0.1, the checks under 0.1 each.
+# - sour, 3.2 to 4.3: the pull-request modes 2.4 to 2.7, building the harness packages' tests
+#   most of it.
+# A job that passes 10 of its 15 warm is the signal to split it, before a cold run times out.
 #
 # rust-cache keys every cache by job ID (its default add-job-id-key), so each job restores and
 # saves only its own. No job here may set `shared-key`, which drops the job ID: the Windows
@@ -73,7 +65,7 @@ jobs:
           cache-on-failure: true
       - uses: taiki-e/install-action@v2
         with:
-          tool: cargo-nextest
+          tool: cargo-nextest@0.9.151
       - name: Format
         if: matrix.os == 'ubuntu-latest'
         run: cargo fmt --all --check
@@ -109,7 +101,7 @@ jobs:
           cache-on-failure: true
       - uses: taiki-e/install-action@v2
         with:
-          tool: cargo-nextest
+          tool: cargo-nextest@0.9.151
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       # Runs even if clippy found something, so one run reports both.
@@ -128,9 +120,11 @@ jobs:
       - uses: actions/checkout@v4
       - run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@v2
+      # Pinned: an upgrade is a change of this line, and docs/verification.md's re-check of
+      # how cargo-deny treats path sources goes with it.
       - uses: taiki-e/install-action@v2
         with:
-          tool: cargo-deny
+          tool: cargo-deny@0.20.2
       # The `cargo xtask` alias is `--locked` too, so no later step can rewrite Cargo.lock.
       - name: Build the CI driver
         run: cargo build --locked -p lactose-xtask
@@ -164,9 +158,9 @@ jobs:
           fi
 
   # SOUR, the determinism harness (architecture section 8.3): workers mode and one layout
-  # capacity on every pull request. The self-test proves the runner itself on stand-in
-  # simulations, which is all there is to run until a package is listed under [harness] in
-  # tools/xtask/ci-policy.toml.
+  # capacity on every pull request, over every package listed under [harness] in
+  # tools/xtask/ci-policy.toml. The self-test first proves the runner itself on stand-in
+  # simulations.
   sour:
     name: sour
     runs-on: ubuntu-latest
@@ -177,7 +171,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@v2
         with:
-          tool: cargo-nextest
+          tool: cargo-nextest@0.9.151
       - name: Build the CI driver
         run: cargo build --locked -p lactose-xtask
       - name: Runner self-test
