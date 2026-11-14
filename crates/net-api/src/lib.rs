@@ -101,8 +101,12 @@ pub fn register_systems(registration: &mut Registration) {
 /// it without a compile error: the frames travel between the network thread, `app` and
 /// the worlds and are shared by `Arc`; the two service resources satisfy
 /// `World::insert_service`; `RemoteSlot` is a derived, extracted component of eight bytes
-/// and its slot is plain data; and the lag cap agrees with section 9.5.
+/// and its slot is plain data; the lag cap agrees with section 9.5; and `OwnedBy` is
+/// persistent and not replicated, which is why a client's hooks apply a tombstone or a move
+/// to the one entity it names (D141): a replicated `OwnedBy` is a change to that contract,
+/// and to the protocol hash, before it is a change of one flag.
 const _: () = {
+    use lactose_ecs::OwnedBy;
     use lactose_reflect::bytemuck::{CheckedBitPattern, NoUninit};
     use lactose_reflect::{Component, Persistence, Reflect};
     use lactose_sim::TICK_RATE_HZ;
@@ -131,4 +135,7 @@ const _: () = {
     assert!(RemoteSlot::SCHEMA.info().tracking().extracted);
     assert!(!RemoteSlot::SCHEMA.info().tracking().replicated);
     assert!(lag::LAG_COMPENSATION_MAX_TICKS * 1000 / TICK_RATE_HZ <= 250);
+
+    assert!(matches!(OwnedBy::SCHEMA.info().persistence(), Persistence::Persistent));
+    assert!(!OwnedBy::SCHEMA.info().tracking().replicated);
 };

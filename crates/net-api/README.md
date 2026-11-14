@@ -22,6 +22,14 @@ names the test that holds each. Architecture sections 4, 5.3, 6, 7, 8.1, 8.2, 9.
 disagree, the architecture wins and this file is wrong. Decision D121 records the choices
 those sections left open, for this crate and for `lactose-net-host` together, and what the
 first design review changed.
+
+**The additions of D141 are a facade** until the lane `stream-impl` implements them:
+`StagedFrame::transient`, `StagingFrame::transient`, the hook's use of
+`World::despawn_alone` and `World::move_alone_to_region`, and its skipping of a spawn's
+unreplicated component. The fields exist and nothing fills or reads them yet; the hook
+sketches under `tests/` still call `World::despawn` and `World::move_to_region`. Each
+sentence below that is not yet true is marked "(D141; facade)", and "Proof for D141" names
+the tests that will hold them.
 `crates/sim/README.md` is the contract the hook and the pass here meet ("The input sync
 point": `StagedState`; "Runs": `run_passes` and `Pass::Gather`; "Regions": `RegionExport`
 and the relevance overlay) and `crates/ecs/README.md` the storage contract they write
@@ -38,10 +46,10 @@ change that breaks it is a signature change to list.
 
 | Item | Purpose |
 |---|---|
-| `StagedFrame`, `StagedSpawn`, `Tombstone`, `TombstoneCause`, `StagedRow`, `StagedRows` | What a client received for one server tick, as the sync point applies it: spawns (or upserts) with the server's key and origin, moves, component removals, rows by (origin key, component) with their server tick and precision, tombstones, the time scale, the processed-input acknowledgement, substituted inputs and region changes |
+| `StagedFrame`, `StagedSpawn`, `Tombstone`, `TombstoneCause`, `StagedRow`, `StagedRows` | What a client received for one server tick, as the sync point applies it: spawns (or upserts) with the server's key and origin, the transient components of claimed entities by key, moves, component removals, rows by (origin key, component) with their server tick and precision, tombstones, the time scale, the processed-input acknowledgement, substituted inputs and region changes |
 | `StagedInbox`, `DueFrames` | The service resource `app` fills between runs and a client world's `StagedState` hook drains inside the tick, without a lock; `due` is what `app` folds into the step's `TickInput` |
 | `RemoteSlot`, `InterpolationSlot` | The one component this crate adds to a client world: the entity's slot in `lactose-net-host`'s interpolation buffer, written by the hook from the staged spawn |
-| `StagingFrame`, `GatheredRow`, `GatheredRows` | What the replication gather produced: every replicated row changed since the last gather, grouped by region, and the structural log since the last gather |
+| `StagingFrame`, `GatheredRow`, `GatheredRows` | What the replication gather produced: every replicated row changed since the last gather, grouped by region, the structural log since the last gather, and which entities have which unreplicated transient components |
 | `GatherState` | The gather's mark, cursor and frame under construction: the service resource the `net::gather` system takes and `app` takes the frame from |
 | `RegionRelevance`, `OverlayPayload`, `RegionChange` | The message a region's relevance sends (overlay or digest, seed, resources, table), built from a `RegionExport`, and what the client builds its `RegionBundle` from |
 | `register_types`, `setup`, `register_systems` | The registration triple `app` calls for every world kind |
@@ -61,10 +69,11 @@ and its source is part of the boundary build ID.
 | | The client worlds at the server's tick | `SimulationBuilder::tick(accepted.tick)`, or on a re-join `World::set_tick` with `StagedInbox::reset` beside it, from `lactose-net-host`'s `JoinAccepted` |
 | `app` (server) | Register the gather and take its frame | `register_systems`, `setup`; `GatherState::take` between runs, the frame to the packer |
 | | The relevance message on a region entering a client's set | `lactose-persist`'s `RegionRecords::from_export` over the `RegionExport`, then `to_relevance(table)` (D129); `with_digest` for a client that caches |
-| `lactose-net` (milestone 4) | The client's `StagedState` hook's input and output | `StagedInbox::pop_through`, `StagedFrame`'s fields, `RemoteSlot`; rows written and `removed` applied through `lactose-ecs`'s `World::insert_erased` and `World::remove_erased`, spawns through `World::spawn_erased` |
+| `lactose-net` (milestone 4) | The client's `StagedState` hook's input and output | `StagedInbox::pop_through`, `StagedFrame`'s fields, `RemoteSlot`; rows written and `removed` applied through `lactose-ecs`'s `World::insert_erased` and `World::remove_erased`, spawns through `World::spawn_erased`, moves and tombstones through `World::move_alone_to_region` and `World::despawn_alone` |
+| | What to state of a claimed entity's transient components | `StagingFrame::transient` from the gather, kept in the packer's mirror; `StagedFrame::transient` beside every claimed spawn and every claimed entity's exact rows ("Transient presence") |
 | | Resync and late join as one path | `StagedFrame::resync`, `full` |
 | The milestone 1 spike | The same, typed by hand for its few components | `tests/consumers.rs`: the client hook, the prediction hook, `app` between runs on both ends, the gather |
-| `lactose-predict` | Binds for its own predicted spawns; which entities the local player has claimed, as claims and releases arrive; the proxies' per-tick history; the reconciliation record; the processed-input acknowledgement; substituted ticks; moves and removals | `StagedSpawn::origin` with the local player; `StagedSpawn::slot` on a spawn of a live key (`None`: claimed, start predicting it; `Some`: released, stop); `StagedRow` with `exact: false` by `(key, tick)`; `StagedRow` with `exact: true` for claimed entities; `StagedFrame::{acked_input, substituted, moves, removed}`; `StagedInbox::oldest_after` for `Behind`, `StagedInbox::reset` on a re-join |
+| `lactose-predict` | Binds for its own predicted spawns; which entities the local player has claimed, as claims and releases arrive; the proxies' per-tick history; the reconciliation record; the processed-input acknowledgement; substituted ticks; moves and removals | `StagedSpawn::origin` with the local player; `StagedSpawn::slot` on a spawn of a live key (`None`: claimed, start predicting it; `Some`: released, stop); `StagedRow` with `exact: false` by `(key, tick)`; `StagedRow` with `exact: true` for claimed entities; `StagedFrame::{acked_input, substituted, moves, removed}`; `StagedFrame::transient` for the transient components it spawns or corrects a claimed entity with; `StagedInbox::oldest_after` for `Behind`, `StagedInbox::reset` on a re-join |
 | `lactose-presentation` (milestone 2) | Which slot to sample per remote entity | `RemoteSlot` rows through extract, into `lactose-net-host`'s `InterpolationReader::sample_batch` |
 | `lactose-persist` | The message's fields, `pub`, which its `RegionRecords::to_relevance` fills from a region's records (D129) | `RegionRelevance`, `OverlayPayload` |
 | Game crates | Nothing: no game system names this crate | `RemoteSlot` is never a system parameter |
@@ -165,7 +174,9 @@ which `build`'s `derived` check does not see.
   prediction world's hook also applies spawns of unclaimed entities, moves, removals and
   tombstones as the replicated world's does, without `RemoteSlot`, so the prediction world
   holds every relevant entity as a proxy; a claimed entity's spawn, rows, move, removal and
-  tombstone are reconciliation facts it never writes directly (D122).
+  tombstone are reconciliation facts it never writes directly (D122). `transient` is read
+  by the prediction world's hook and corrections alone, for the entities the local player
+  has claimed ("Transient presence" below; D141; facade).
   `TimeScale` is a replicated world resource, and resources are not gathered: the
   server's `app` puts its own value in the frame.
 - What the replicated world's hook does, in this order and nothing else, for each frame
@@ -176,17 +187,22 @@ which `build`'s `derived` check does not see.
   `slot` is `None`) and otherwise `World::spawn_erased` in its region with its components,
   then `World::bind(origin, net)` if `origin` is `Some`, then `World::insert(key,
   RemoteSlot { slot })` if `slot` is `Some`; then each move in ascending key order,
-  `World::move_to_region(key, region)` unless `World::region_of(key)` is already `region`
-  (an owned entity moved with its owner) or the key is not live; then each removal in
+  `World::move_alone_to_region(key, region)` unless `World::region_of(key)` is already
+  `region` or the key is not live (D141; facade); then each removal in
   ascending (key, component) order, `World::remove_erased` of that component, nothing if
   the entity or the component is absent; then each row in ascending (key, component)
   order, written as an upsert writes a component (so a row for a pair
   removed in the same frame re-adds the component with the newer value), nothing if the
   entity does not exist (its spawn was lost and the server resends it, since nothing of
-  it is acknowledged); then each tombstone in ascending key order, `World::despawn` if
-  the entity exists, nothing otherwise, since a region that became irrelevant took its
-  rows with it, and nothing for a `TombstoneCause::Left` tombstone of an entity that
-  `World::region_of` places in the tombstone's region. The hook despawns nothing else. An entry that fails (a spawn into a region
+  it is acknowledged); then each tombstone in ascending key order, `World::despawn_alone`
+  if the entity exists (D141; facade), nothing otherwise, since a region that became
+  irrelevant took its rows with it, and nothing for a `TombstoneCause::Left` tombstone of an
+  entity that `World::region_of` places in the tombstone's region. The hook despawns nothing
+  else: it applies each move and each tombstone to the one entity named, never to what
+  that entity owns ("One entity per entry" below). It writes replicated components alone:
+  a component of a spawn, or a row, that the registry lacks or holds as unreplicated is a
+  defect of the sender, logged and skipped with the rest of the spawn applied (D141;
+  facade), and it does not read `transient`. An entry that fails (a spawn into a region
   the world has not loaded, a move or a decode the world refuses) is logged and skipped,
   never returned as the hook's error: the frame is already popped, and the rest of it
   applies. A frame never names a key both in `spawns` and in `despawns`, never names a
@@ -196,6 +212,59 @@ which `build`'s `derived` check does not see.
   the client holds; a change of claim is sent as a spawn of the live entity with `slot`
   set (the player released it) or `None` (the player claimed it). In every case the row is
   live and the spawn carries the whole entity, so the hook writes it whole.
+- One entity per entry (D141; facade). `OwnedBy` is persistent and not replicated, so a
+  client holds ownership edges only as each region's relevance document stated them, and
+  what the server gives or releases afterwards does not reach it before the region's next
+  document. `World::despawn` and `World::move_to_region` take the entities the target
+  owns, by the edges the world holds; a hook that called them would take an entity the
+  server released after the document along with its former owner, on the client alone, and
+  no later row would bring it back, since a row of an entity that is not live is skipped.
+  The hook therefore applies a tombstone with `World::despawn_alone` and a move with
+  `World::move_alone_to_region`. Nothing is lost by that: the server's structural log holds
+  a `Despawned` or a `Moved` entry for every entity of a tree it despawned or moved, and
+  the packer turns each into an entry of its own for every client that holds the entity:
+  a tombstone, a move, or a spawn where the move brings the entity into the client's set.
+  The entries of one tree may reach a client in different frames, since a cap
+  makes sends partial; until an owned entity's own entry arrives it stays where it was,
+  its owner gone or elsewhere, which the ECS holds as it holds an owner whose region
+  unloaded. An entity a region's document placed whose handle the client does not hold has
+  no tombstone coming, owned or not (`crates/net-host/README.md`, "Interest and the
+  packer", the open item). A game that needs the server's ownership on a client needs
+  `OwnedBy` replicated: a change to this contract, which must first settle how a client
+  applies a row that closes a cycle against an edge it has not yet seen removed
+  (`docs/verification.md`).
+- Transient presence (D141; facade). A row the stream builds holds the replicated
+  components the frames carry. A region document also restores the presence of every
+  transient component (D129), and a kernel runs on a row only if the row has every
+  component it names; so a claimed entity that the stream built, and no document placed,
+  would never be run by a kernel that names a transient component the server's entity has.
+  `StagedFrame::transient` carries that presence for the entities the receiving player has
+  claimed, the only rows a kernel runs on in a client's worlds: by origin key, the set of
+  the entity's components whose persistence is transient and that are not replicated. A
+  statement is whole (the server's entity has exactly these) and carries no value, since
+  such a column is zero at every input sync point on both machines. The packer keeps each
+  entity's set in its mirror from `StagingFrame::transient` and puts a statement, the empty
+  set for an entity that has none, beside every spawn whose `slot` is `None` and beside
+  every claimed entity's exact rows; so a frame that states a claimed entity's replicated
+  components states its transient ones too, and `lactose-predict` builds or corrects the
+  entity from that frame alone. It states nothing of an entity the player has not claimed,
+  and a statement of one is ignored. The bound: a statement names a component once at most
+  (it is a set) and names only registered components that are transient and not
+  replicated, at most as many as the registry holds; the receiver refuses a packet whose
+  statement names any other, as it refuses a row of another length, and a hook skips such
+  a key with a log. On the wire one bit per such component is enough, in the registry's
+  ascending key order, which is the same on both ends because the protocol hash covers
+  every transient type's key, persistence and tracking; the encoding is `lactose-net`'s.
+  No registered type changes, so the protocol hash does not move. The prediction world's
+  hook and corrections apply a statement (`crates/predict/README.md`, "What a row built
+  from the stream has"). The replicated world's hook does not read it, since no kernel
+  runs there: a replicated-world row that the stream built lacks the transient components
+  a document would have given it, as it lacks every other unreplicated one. A frame with
+  no statement for an entity says nothing of its unreplicated transient components, and
+  they are left as they are. A replicated transient component needs no statement: it is
+  among a spawn's
+  components and among a claimed entity's exact rows. A derived component is never
+  stated: the system that owns it rebuilds it.
 - `moves` come from the gather's `Moved` entries. Positions on the wire are relative to the
   region the entity resides in, and the wire states which region each quantised position
   is relative to, so the network thread adds the right origin after a move; an entity
@@ -314,6 +383,30 @@ which `build`'s `derived` check does not see.
   order. Then `World::mark()` and `StructuralLog::cursor()` are taken for the next gather.
   Replicated resources are not gathered (`TimeScale` travels in the frame's own field,
   region resources in the relevance message).
+- Transient presence (D141; facade). The gather also fills `StagingFrame::transient`, for
+  the packer's mirror: which components that are transient and not replicated each entity
+  has, by origin key; presence and never a value, since the gather copies rows of
+  replicated columns alone and such a column is zero at every input sync point. A full
+  pass states every entity that has at least one,
+  and an entity it does not state has none. An incremental gather states, of the entities
+  live at the gather, each one the structural log since the cursor spawned that has at
+  least one, and each one whose set that log changed (an `Added` or a `Removed` entry of
+  such a component), with the set the entity has at the gather, which for a changed one
+  may be empty; an entity it does not state has none if the log spawned it and is
+  unchanged otherwise. So the packer's mirror gives an entity it first meets no such
+  component until a frame states one, forgets an entity's set with the entity at its
+  `Despawned` entry, and applies a frame's structural entries before its statements. The
+  set is read by key and never by chunk or row, at most one `World::get_erased` for each
+  entity the window spawned or changed and each registered component that is transient and
+  not replicated (three in the engine: the input sample, the root motion and the sim
+  pose), so a statement is the same under every chunk layout and worker count; a full
+  pass reads each such column's keys once. The gather reads the set because a `Spawned`
+  entry names no component, so the packer could not derive it from the log. `merge` keeps
+  the newer
+  frame's statement of an entity, drops the statement of an entity the newer frame
+  despawned, takes a full newer frame's statements alone, and leaves a full frame with no
+  empty set (a full frame states an entity that has none by not stating it), so a merged
+  frame states what one gather over both windows would.
 - The cost, measured in the first design review (release, 100k rows by 20 replicated
   components, 4,000 changed rows per tick, load about 5): skipping chunks by column tick
   and forking over the rest, about 0.8 ms per gather; forking over every one of the
@@ -351,7 +444,8 @@ which `build`'s `derived` check does not see.
   set whole, the `Moved` entries that become `StagedFrame::moves` and change which dirty
   list a row is in, and the `Removed` entries of replicated components that become
   `StagedFrame::removed` and drop the row from the mirror (`Removed` of an unreplicated
-  component and `Added` are carried and ignored).
+  component and `Added` are carried and ignored by the packer; the gather has already
+  read those of an unreplicated transient component into `transient`).
 - `push_row`, `push_structural` and `finish` are public so a test or the spike builds a
   frame by hand; `rows` and `region` on a frame pushed to and not finished are a
   `debug_assert` failure.
@@ -435,3 +529,22 @@ that every path of the hook ran, and records both worlds' hashes.
 | The fold | Under the real sim: a frame for the tick the next step runs is folded and popped in that step (worlds built at 10, a full frame for 10, a delta for 12 loading a region and spawning into it: the region is loaded and the entity live after the step for 12); Relevant then Irrelevant in one step leaves the region unloaded; Irrelevant then Relevant unloads and loads it; a refused frame enters nothing; a full frame unloads every loaded region and reloads the relevant ones; a delta then a full frame due in one step load exactly the full frame's regions | `fold.rs` |
 | The gather's decision | A stale cursor with a current mark gives a full frame with every row, none skipped; a current cursor with a stale mark the same | `gather.rs` (stale cursor), `src/staging.rs` (stale mark, which no public call reaches: every epoch change also resets the structural log) |
 | The relevance message | `from_export` copies the seed, resources and transient keys; `to_bundle` builds the bundle the sim loads, and refuses the wrong baseline, a digest without a cache or with another digest, and an overlay against another baseline, carried or cached, each as `VersionMismatch` | `relevance.rs` |
+
+## Proof for D141
+
+A facade: none of these tests exists yet. Each row is a test the lane `stream-impl` adds,
+by the name given, and the sentence it holds; the first two are the whole-project review's
+S3 probe as a test of this crate's hook sketch (`tests/common/mod.rs`, `ClientHook`), which
+the lane moves to `World::despawn_alone` and `World::move_alone_to_region` with the
+sketches of `tests/consumers.rs`.
+
+| Test | What it holds | File |
+|---|---|---|
+| `a_released_item_survives_its_former_owners_tombstone` | A `Client` world loads a region document in which an item is `OwnedBy` an owner. The server then releases the item, which no frame carries, and destroys the owner: one frame, one tombstone, the owner's. After the step the owner is gone and the item is live in its region with every component the document gave it, its `OwnedBy` as written; the server's next row of the item is written. With `World::despawn` in the hook the item is gone and the row skipped, which is the failure the test names | `staged.rs` |
+| `a_released_item_stays_when_its_former_owner_moves` | The same document; the frame moves the owner to another loaded region. The owner resides there and the item where it was; a later frame's move of the item moves it | `staged.rs` |
+| `every_entity_of_a_destroyed_tree_leaves_by_its_own_tombstone` | An owner and what it owns, both destroyed on the server, their tombstones in two frames: the owned entity is live between them, its owner not, and gone after its own; the structural log holds one `Despawned` entry for each | `staged.rs` |
+| `the_hook_writes_replicated_components_alone` | A spawn that carries, beside its replicated components, a derived one and an unreplicated transient one as values gives the row neither, logs both and applies the rest; a row of an unreplicated component is skipped; a frame's `transient` statements change nothing in a `Client` world | `staged.rs` |
+| `a_statement_is_part_of_a_frame` | Two frames that differ in one statement are unequal; a frame that holds a statement alone is not empty | `staged.rs` |
+| `the_gather_states_what_it_spawned_and_what_changed` | Under every layout and with one and several workers, equal frames: an incremental gather states an entity spawned in its window that has such a component, with its set, and states nothing of one spawned without any; it restates an entity that gained or lost one (the empty set after the last), states nothing of an entity whose rows alone changed, and never names a replicated, persistent or derived component; an entity spawned and despawned in one window is not stated, and one despawned and spawned again without any leaves no statement | `gather.rs` |
+| `a_full_gather_states_every_entity_that_has_one` | After a stale mark: every entity with an unreplicated transient component is stated with its set, and no other entity | `gather.rs` |
+| `a_merged_frame_states_what_one_gather_would` | Two frames not taken: the newer statement of an entity wins, the statement of an entity the newer frame despawned is gone, a full newer frame's statements stand alone, an empty set merged into a full frame leaves no statement, and the result equals one gather over both windows | `gather.rs` |

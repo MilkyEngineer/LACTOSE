@@ -78,12 +78,15 @@ pub use systems::{register_systems, register_types, sets};
 /// loaders, shared between threads; and no layout depends on the scalar's width
 /// (architecture section 16): each component is its scalars, then a tail that is a multiple
 /// of eight bytes, so the sizes below hold for a four-byte scalar as for an eight-byte one,
-/// and a `SimPose` of eight-byte scalars stays under the ECS's 1 KiB component warning.
+/// and a `SimPose` of eight-byte scalars stays under the ECS's 1 KiB component warning. And
+/// the policy the stream rests on (D141): `RootMotion` and `SimPose` are transient and not
+/// replicated, so a claimed character the stream builds has them by the frame's statement
+/// of its transient components, zeroed, and never by a value.
 const _: () = {
     use lactose_asset_api::{Loader, SimulationAsset};
     use lactose_ecs::Event;
     use lactose_math::Scalar;
-    use lactose_reflect::Component;
+    use lactose_reflect::{Component, Persistence, Reflect};
 
     const fn send_sync<T: Send + Sync>() {}
     const fn event<E: Event>() {}
@@ -123,4 +126,9 @@ const _: () = {
     assert!(7 * MAX_SIM_BONES * 8 + 8 <= 1024);
     assert!(size_of::<Bones>() == 16 * MAX_SIM_BONES + 8);
     assert!(size_of::<BoneLink>() == 24);
+
+    assert!(matches!(RootMotion::SCHEMA.info().persistence(), Persistence::Transient));
+    assert!(!RootMotion::SCHEMA.info().tracking().replicated);
+    assert!(matches!(SimPose::SCHEMA.info().persistence(), Persistence::Transient));
+    assert!(!SimPose::SCHEMA.info().tracking().replicated);
 };

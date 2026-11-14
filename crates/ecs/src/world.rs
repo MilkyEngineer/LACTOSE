@@ -778,6 +778,39 @@ impl World {
         Ok(())
     }
 
+    /// Despawns `key` alone, immediately: what [`despawn`](Self::despawn) does to the one
+    /// entity, logged as despawned and a death for its alias as there, while every entity
+    /// it owns stays. An entity left so keeps its [`OwnedBy`](crate::OwnedBy) as written, a
+    /// reference to an entity that is not live, which the world already holds when an
+    /// owner's region unloads: its owner chain ends at it, an export writes the owner as
+    /// stored, and [`owned_by`](Self::owned_by) finds it again if `key` is spawned again.
+    ///
+    /// For a world that applies another world's structural log entry by entry, as a
+    /// client's two worlds apply the server's: that log holds a `Despawned` entry for every
+    /// entity of a tree the server despawned, each reaches the client as a tombstone of its
+    /// own, and the client's `OwnedBy` edges are only as fresh as each region's last
+    /// document, so `despawn` there would take an entity the server has since released
+    /// (D141). The simulation's own despawns are `despawn` and
+    /// [`Commands::despawn`](crate::Commands::despawn), which take the tree. `NotFound` if
+    /// the entity does not exist.
+    #[expect(unused_variables, reason = "facade (D141): the lane `stream-impl` writes the body")]
+    pub fn despawn_alone(&mut self, key: StableKey) -> Result<()> {
+        todo!("D141: the lane `stream-impl`")
+    }
+
+    /// Moves `key` alone to `region`, immediately: what
+    /// [`move_to_region`](Self::move_to_region) does to the one entity, logged as moved as
+    /// there, while every entity it owns stays in the region it resides in, which the world
+    /// already holds when an entity is given to an owner elsewhere. An entity that already
+    /// resides in `region` is left as it is, with nothing written or logged. For the caller
+    /// [`despawn_alone`](Self::despawn_alone) is for, and for its reason: the server's log
+    /// holds a `Moved` entry for every entity of a tree it moved (D141). `NotFound` if the
+    /// entity does not exist or `region` is not loaded.
+    #[expect(unused_variables, reason = "facade (D141): the lane `stream-impl` writes the body")]
+    pub fn move_alone_to_region(&mut self, key: StableKey, region: RegionId) -> Result<()> {
+        todo!("D141: the lane `stream-impl`")
+    }
+
     /// Allocates the next runtime `NetId` from the server counter, passing over any that
     /// already names a live entity or a bind, such as one spawned directly with its key.
     pub fn allocate_net_id(&mut self) -> Result<NetId> {

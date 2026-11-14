@@ -45,6 +45,7 @@ and list what changed, because `sim`, `predict`, `physics-api`, `net`, `persist`
 | `World::region_mode` | A loaded region's mode in one lookup, for a consumer that reads every region's mode at every sync point (`World::region` counts the region's entities) |
 | `World::load_region`, `World::export_region`, `RegionRows` | Bulk copy of region rows and resources to and from `lactose_bundle` documents |
 | `World::get_erased`, `World::insert_erased`, `World::remove_erased`, `World::spawn_erased` | One entity's components by key from the registry, `lactose_bundle::ComponentData` in and stored bytes out: what `lactose-predict` and `net`'s generic hook are written against (D121, D122) |
+| `World::despawn_alone`, `World::move_alone_to_region` | One entity despawned or moved without the entities it owns: how a client's staged-state hooks and `lactose-predict`'s corrections apply a tombstone or a move of the server's (D141). A facade: the signatures and the contract below are final, the bodies are `todo!()` until the lane `stream-impl` |
 
 The hidden `__private` module and the hidden items of `SystemDescriptor`, `Bundle`,
 `QueryItem`, `QueryItems` and `Kernel` are the macro's and the implementation's, and may
@@ -381,11 +382,23 @@ What a system is, from its parameters (`SystemParam` has the table):
   document an honest export made loads, with a cycle it closes through other regions broken
   as above: a region's export is always an overlay and an overlay a region exported always
   loads, which is the invariant every save, unload and relevance message rests on. On a
-  client `OwnedBy` is neither replicated nor corrected (`crates/net-api/README.md`), so its
-  edges are as fresh as each region's last relevance document; a break on a client is
-  logged, not reported, and lasts until the region's next document. No engine crate reads a
-  replicated entity's `OwnedBy` on a client; a game that needs the server's ownership there
-  needs `OwnedBy` replicated, which is a `net-api` change.
+  client `OwnedBy` is neither replicated nor corrected (`crates/net-api/README.md`, "The
+  staged frame"), so its edges are as fresh as each region's last relevance document; a
+  break on a client is logged, not reported, and lasts until the region's next document.
+  The world reads those edges in every kind: `despawn` and `move_to_region`, direct and at
+  command apply, take the tree as the world holds it. A client's staged-state hooks
+  therefore never call them. The server's log names every entity of a tree it despawned or
+  moved, each entry reaches the client as a tombstone or a move of its own, and the hooks
+  apply each to the one entity it names, with `World::despawn_alone` and
+  `World::move_alone_to_region` (D141; a facade until the lane `stream-impl`, as the
+  surface table says), so a stale edge takes no entity the server released.
+  `despawn_alone` leaves what the entity owned with its `OwnedBy` as written, a reference to
+  an entity that is not live, as an owner's unload does; `move_alone_to_region` leaves it in
+  the region it resides in, as a write of `OwnedBy` does. A prediction system's own
+  `Commands::despawn` or `Commands::move_to_region` still takes the tree through the
+  prediction world's edges, which is an open item (`docs/verification.md`); a game that
+  needs the server's ownership on a client needs `OwnedBy` replicated, which is a `net-api`
+  change.
 - `World::claimed(player)` yields the entities with `ClaimedBy { player }` in ascending
   origin-key order, from an index the world maintains wherever `ClaimedBy` enters or
   leaves a row (a spawn, `insert`, `remove`, a despawn, a command apply, a predicted

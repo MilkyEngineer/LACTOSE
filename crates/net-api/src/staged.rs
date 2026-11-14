@@ -67,11 +67,35 @@ pub struct StagedFrame {
     /// key already live has each component written whole and its [`RemoteSlot`] set or
     /// removed; a key that is not live is spawned and bound.
     pub spawns: BTreeMap<NetId, StagedSpawn>,
+    /// What the server states of the transient components, those that are not replicated,
+    /// of entities the receiving player has claimed, by origin key as the rows are keyed:
+    /// the server's entity has exactly these (architecture section 9.4, D141). Presence and
+    /// never a value. A transient column is zeroed at every input sync point and its value
+    /// is not sent, but a kernel runs on a row only if the row has every component it
+    /// names, so a claimed entity the stream builds needs the ones the server's entity has.
+    ///
+    /// The packer puts a statement, the empty set for an entity that has none, beside every
+    /// spawn whose [`slot`](StagedSpawn::slot) is `None` and beside every claimed entity's
+    /// exact rows, so a frame that states a claimed entity's replicated components states
+    /// these too, and it states nothing of any other entity. Every key names a registered
+    /// component whose persistence is transient and that is not replicated, so a statement
+    /// is bounded by the registry's count of those; a set cannot name one twice, and it is
+    /// applied in ascending key order.
+    ///
+    /// Read by the prediction world's hook and `lactose-predict`'s corrections alone: they
+    /// give the entity each named component it lacks, zeroed, take from it each such
+    /// component the statement does not name, and leave a named one it has as it is. A
+    /// frame that holds no statement for an entity says nothing of these and they are left
+    /// as they are. The replicated world's hook does not read it: no kernel runs there. A
+    /// facade (D141): nothing reads it until the lane `stream-impl`.
+    pub transient: BTreeMap<StableKey, BTreeSet<ComponentKey>>,
     /// Entities that moved between regions, by origin key, with the region they reside in
     /// now: from the gather's `Moved` entries (architecture section 6). The hook applies
-    /// them after the spawns and before the rows, through `World::move_to_region`; owned
-    /// entities follow their owner, so a later entry for one of them is a no-op. An entity
-    /// moving into a region the client does not have leaves with a tombstone instead.
+    /// them after the spawns and before the rows, each to the one entity it names, through
+    /// `World::move_alone_to_region`: the server's log holds an entry for every entity of
+    /// an owned tree it moved, and a client's `OwnedBy` edges, as old as each region's
+    /// document, decide nothing (D141). An entity moving into a region the client does not
+    /// have leaves with a tombstone instead.
     pub moves: BTreeMap<StableKey, RegionId>,
     /// Replicated components the server removed from live entities, by (origin key,
     /// component key): from the gather's `Removed` entries. The hook applies them after
@@ -83,7 +107,9 @@ pub struct StagedFrame {
     /// section 9.3, each saying whether the server destroyed the entity or it left the
     /// client's set alive (its region left it, or it moved into a region the client does
     /// not hold). A frame never names a key here and in `spawns`, in `removed` or among
-    /// its rows.
+    /// its rows. The hook despawns the one entity a tombstone names, through
+    /// `World::despawn_alone`: every entity of an owned tree the server destroyed has a
+    /// tombstone of its own (D141).
     pub despawns: BTreeMap<StableKey, Tombstone>,
     rows: BTreeMap<(StableKey, ComponentKey), RowSlot>,
     bytes: Vec<u8>,
@@ -110,6 +136,7 @@ impl StagedFrame {
             substituted: BTreeSet::new(),
             regions: BTreeMap::new(),
             spawns: BTreeMap::new(),
+            transient: BTreeMap::new(),
             moves: BTreeMap::new(),
             removed: BTreeSet::new(),
             despawns: BTreeMap::new(),
@@ -199,6 +226,7 @@ impl StagedFrame {
             && self.substituted.is_empty()
             && self.regions.is_empty()
             && self.spawns.is_empty()
+            && self.transient.is_empty()
             && self.moves.is_empty()
             && self.removed.is_empty()
             && self.despawns.is_empty()
@@ -221,6 +249,7 @@ impl PartialEq for StagedFrame {
             && self.substituted == other.substituted
             && self.regions == other.regions
             && self.spawns == other.spawns
+            && self.transient == other.transient
             && self.moves == other.moves
             && self.removed == other.removed
             && self.despawns == other.despawns
@@ -302,7 +331,11 @@ pub struct StagedSpawn {
     /// spawn to start predicting the entity (`None`, claimed) or stop (`Some`, released).
     pub slot: Option<InterpolationSlot>,
     /// Every replicated component of the entity, in ascending key order, exact or
-    /// dequantised as the rows are.
+    /// dequantised as the rows are, and no other component: the presence of a claimed
+    /// entity's unreplicated transient components travels in [`StagedFrame::transient`],
+    /// and a derived component is rebuilt on the client by the system that owns it. A hook
+    /// skips, as a defect of the sender, a component here that the registry lacks or holds
+    /// as unreplicated (D141).
     pub components: Vec<ComponentData>,
 }
 
