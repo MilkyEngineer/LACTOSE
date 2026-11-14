@@ -560,7 +560,7 @@ impl<'a, 'r, T: ?Sized + 'static> RowFetch<'a, 'r> for Res<'a, T> {
 }
 
 impl<'a, 'r, T: Resource> RowFetch<'a, 'r> for RegionRes<'a, T> {
-    type Column = RegionResColumn;
+    type Column = RegionResColumn<T>;
 
     fn row(column: &'a mut Self::Column, row: &mut Row<'a>) -> Self {
         Self { value: typed(row.region.resources[column.0]) }

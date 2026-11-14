@@ -57,7 +57,7 @@ change with them. Their shape today:
 | `Kernel { run, each, finalize, reducer }` | The entry points: `run` and `finalize` take `&mut Invocation`, `each` (a per-entity system's) takes `&mut Unit`; and a reduction's `ReducerOps` (how to make and merge its partials without naming the reducer) |
 | `Invocation<'r, 'j>` | One value per parameter, prepared from the access table by the schedule, each taken once; and a reduction's partial or merged total |
 | `Fetch<'r, 'j>`, `fetch(invocation, index)` | How each parameter type is made from its prepared value; implemented for exactly the `SystemParam` types |
-| `Unit<'r>`, `Row<'a>`, `UnitColumn<'r>`, `RowFetch<'a, 'r>`, `column(unit, index)`, `next_row(unit)`, `row(column, row)` | A per-entity run's unit: its rows, its columns lent per parameter index and taken once each, and the row the loop is on; how each parameter type is made for one row from its column (`RowFetch::Column`), implemented for exactly the `SystemParam` types |
+| `Unit<'r>`, `Row<'a>`, `UnitColumn<'r>`, `RowFetch<'a, 'r>`, `column(unit, index)`, `next_row(unit)`, `row(column, row)` | A per-entity run's unit: its rows, its columns lent per parameter index and taken once each, each checked against its table entry when taken, and the row the loop is on; how each parameter type is made for one row from its column (`RowFetch::Column`), implemented for exactly the `SystemParam` types |
 | `identity::<R>()`, `add::<R>(partial, item)`, `keep::<R>(unit, partial)` | A reduction's partial in `each`: made empty, fed each row's item, handed to the run when the unit ends |
 | `reduce::<R>(invocation, item)`, `finish::<R>(invocation)` | A kernel's item into the partial; the merged total out for the finalize |
 | `Finalize<O>` | What `#[finalize(f)]` emits as `const __finalize_f`: the finalize's access table and its entry point, built by an `unsafe` constructor |
@@ -313,17 +313,17 @@ What a system is, from its parameters (`SystemParam` has the table):
   cut into units of random length, so a reduction's partials are merged from batches of
   random size.
 - A per-entity system's run is a set of units, each a chunk or (under `split_batches`) a
-  range of one chunk's rows, all made before any runs: the run first writes the coarse
-  tick of every column the system writes, once, on every chunk it issues; a chunk whose
-  column tick for some `Changed<T>` is not after the system's window has no unit and no row
-  of it is read. A unit gets a range of each written column, split off the chunk so units
-  are disjoint, and the whole of each read column; its kernel loops over the rows. What a
-  row emits, commands or sends is kept per row in storage the run owns and merged after
-  every unit has run, in source-key order (D117); a reduction keeps one partial per unit,
-  merged by `Reducer::merge`. Nothing is kept per worker, so the units can fork over
-  workers without changing a hash. Each run emits a `casein` trace event `per_entity`
-  with the system's name and its counts (`units`, `chunks_skipped`, `rows`,
-  `invocations`), and `World::changed_since` one named `changed_since` with
+  range of one chunk's rows, all made before any runs: the run tests each issued chunk's
+  `Changed` column ticks against the window, then writes the coarse tick of every column
+  the system writes on that chunk, skipped or not; a chunk that fails the test has no unit
+  and no row of it is read. A unit gets a range of each written column, split off the
+  chunk so units are disjoint, and the same range of each column it only reads; its kernel
+  loops over the rows. What a row emits, commands or sends is kept per row in storage the
+  run owns and merged after every unit has run, in source-key order (D117); a reduction
+  keeps one partial per unit, merged by `Reducer::merge`. Nothing is kept per worker, so
+  the units can fork over workers without changing a hash. Each run emits a `casein` trace
+  event `per_entity` with the system's name and its counts (`units`, `chunks_skipped`,
+  `rows`, `invocations`), and `World::changed_since` one named `changed_since` with
   `chunks_skipped` and `rows_visited`, for the tests that hold the skip by count.
 - `run_tick` takes the world by value and hands it back when the tick resolves; the future
   is `Send` and is driven by the timer root task, which owns the world and the schedule. On
@@ -449,8 +449,8 @@ What a system is, from its parameters (`SystemParam` has the table):
   typed column, or `ErasedColumn::changed_since` on each column of `columns_erased` for a
   pass that works from the registry (the replication gather), which select the same rows
   under every layout, by stamp and never by tick. Both skip a chunk whose column tick is not
-  after the mark without reading its rows, so their cost is the chunks written since the
-  mark, not the column.
+  after the mark without reading its rows, so their cost is the chunks a writing system was
+  issued over since the mark, not the column.
 - At the input sync point a transient column's rows are zeroed, and a tracked row whose
   bytes were not already zero is stamped there; every region's transient resources are
   zeroed too.

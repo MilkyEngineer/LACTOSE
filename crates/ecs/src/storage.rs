@@ -61,6 +61,7 @@ pub(crate) fn typed_mut<T: CheckedBitPattern + bytemuck::NoUninit>(bytes: &mut [
 
 /// `bytes`, which hold `len` values of `T` back to back, as a slice.
 pub(crate) fn typed_slice<T: CheckedBitPattern>(bytes: &[u8], len: usize) -> &[T] {
+    assert_eq!(bytes.len(), len * size_of::<T>(), "{len} values of the column's type");
     if size_of::<T>() == 0 {
         // A cast cannot give a zero-sized type a length, so the slice is built from the one
         // value; a `Vec` of a zero-sized type owns no allocation, so leaking it leaks nothing.
@@ -76,6 +77,7 @@ pub(crate) fn typed_slice_mut<T: CheckedBitPattern + bytemuck::NoUninit>(
     bytes: &mut [u8],
     len: usize,
 ) -> &mut [T] {
+    assert_eq!(bytes.len(), len * size_of::<T>(), "{len} values of the column's type");
     if size_of::<T>() == 0 {
         let empty: [u64; 0] = [];
         let one: T = *bytemuck::checked::from_bytes(bytemuck::cast_slice(&empty));

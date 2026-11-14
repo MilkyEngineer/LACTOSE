@@ -93,10 +93,13 @@ impl SystemDescriptor {
     ///
     /// `access` must describe exactly what `kernel.run` and `kernel.each` touch and
     /// `finalize_access` what `kernel.finalize` touches: every component, resource, event
-    /// and channel each reads or writes, with the right kind. The schedule orders systems
-    /// by these tables, and the storage hands out `&mut` rows on the strength of them
-    /// (`SAFETY.md`). The `#[system]` expansion derives both from the parameter types and
-    /// the `writes` list and is the one sound caller.
+    /// and channel each reads or writes, with the right kind. The tables are positional:
+    /// entry N of `access` describes parameter N of `kernel.run` and of `kernel.each`, and
+    /// entry N of `finalize_access` parameter N of `kernel.finalize`. The schedule orders
+    /// systems by these tables, and the storage hands out `&mut` rows on the strength of
+    /// them (`SAFETY.md`). The `#[system]` expansion derives the tables from the parameter
+    /// types in order and the `writes` list, and the three entry points from the same
+    /// parameters, and is the one sound caller.
     #[doc(hidden)]
     #[must_use]
     #[allow(clippy::too_many_arguments, reason = "positional on purpose: see above")]

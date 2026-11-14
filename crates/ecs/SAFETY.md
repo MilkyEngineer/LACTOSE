@@ -5,9 +5,10 @@ comments rely on. The crate's tests run under Miri.
 
 Architecture section 21 admits `unsafe` here for chunk column storage and for the
 `#[system]` expansion's call of `unsafe SystemDescriptor::new`. The crate needs only the
-second: storage and the per-chunk kernel path are safe code, and the crate holds three `unsafe fn`
-(`SystemDescriptor::new`, `Finalize::new`, `Finalize::call`) and one `unsafe` block, all on the path from an access table to the code that fetches by it. A
-change that adds a place amends this file in the same commit.
+second: storage and the per-chunk kernel path are safe code, and the crate holds three
+`unsafe fn` (`SystemDescriptor::new`, `Finalize::new`, `Finalize::call`) and one `unsafe`
+block, all on the path from an access table to the code that fetches by it. A change that
+adds a place amends this file in the same commit.
 
 ## The access tables (`SystemDescriptor::new`, `Finalize::new`, `Finalize::call`)
 
@@ -19,14 +20,17 @@ hand two kernels `&mut` to one row from safe code. So `SystemDescriptor::new` is
 with the obligation that the kernel's table describes exactly what both kernel entry points
 fetch (`Kernel::run`, the one call of a per-region, once-per-tick or exclusive system, and
 `Kernel::each`, a per-entity system's loop over the rows of one unit) and the finalize's
-table what the finalize fetches, and the `#[system]` expansion, which derives all three from the
-parameter types and the `writes` list, is its one caller. A `writes` entry fetches nothing:
-it declares a write the system makes through commands or `&mut World`, outside every
-kernel, and only adds an ordering constraint, so it can make a table overstate what the
-kernel touches but never understate it. A `ChannelWriter` fetches a sink the run made for
-that parameter alone and appends to the invocation's buffer after the kernel, and a
-`ChannelTake` fetches the store the run removed from the world before lending it, so
-neither aliases what another parameter holds (D126).
+table what the finalize fetches. The obligation is positional: entry N of the kernel's table
+describes parameter N of `Kernel::run` and of `Kernel::each`, and entry N of the finalize's
+table parameter N of `Kernel::finalize`, because the run prepares and lends each parameter
+by its index. The `#[system]` expansion, which derives the tables from the parameter types
+in order and the `writes` list, is its one caller. A `writes` entry fetches nothing: it
+declares a write the system makes through commands or `&mut World`, outside every kernel,
+and only adds an ordering constraint, so it can make a table overstate what the kernel
+touches but never understate it. A `ChannelWriter` fetches a sink the run made for that
+parameter alone and appends to the invocation's buffer after the kernel, and a `ChannelTake`
+fetches the store the run removed from the world before lending it, so neither aliases what
+another parameter holds (D126).
 
 The `#[finalize]` pairing is by name: `#[finalize(f)]` emits `__finalize_f`, a
 `Finalize<O>` holding the finalize function's table and its entry point, and the
@@ -44,11 +48,24 @@ the invoking crate keeps `#![forbid(unsafe_code)]` (section 21, as for `#[compon
 `tests/compile_fail.rs` compiles every kind of system in such a crate.
 
 Today a table that disagrees with its entry point cannot cause undefined behaviour: each
-parameter is fetched from a value prepared for its index by safe code (for `Kernel::each`,
-a column the run lent the unit for that index, or nothing for a parameter that is not a
-column), and a mismatch is a panic ("parameter N does not match the system's access
-table"). The obligation exists for the parallel implementation, which will hand out rows
-to concurrent jobs by the table.
+parameter is fetched from a value prepared for its index by safe code, and a mismatch is a
+panic ("parameter N does not match the system's access table"). For `Kernel::each` the
+value is what the run lent the unit for that index, and each parameter checks the table
+entry it takes, once per unit: a column parameter that its entry names the same component
+(and the lent bytes are exactly the unit's rows of that type), a `RegionRes` that its entry
+is that region resource, an output sink (an event, presentation or channel writer, or
+`Commands`) that its entry is its own parameter type's, kind and target. So
+`tests/obligation.rs`'s kernels that take a lent column as another component, a region
+resource as another, or a lent event sink as another event type's, panic before they read
+a row. The obligation exists for the parallel implementation, which will hand out rows to
+concurrent jobs by the table.
+
+The rule for forking per-entity runs over workers: lending stays per table entry, with
+checked casts of the bytes lent for that entry, as today. A kernel whose code disagrees
+with its table can then misread only what its table declared, and soundness rests on the
+schedule's conflict sets and the lending code, never on a kernel. A fork that cast by
+parameter type from raw pointers instead would make the positional obligation above
+load-bearing for soundness.
 
 ## Chunk columns (no `unsafe`)
 

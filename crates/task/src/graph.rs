@@ -49,8 +49,8 @@ pub trait GraphNode: Send + Sync + 'static {
     /// Also called when `units()` is zero.
     ///
     /// Reductions merge their partial results here. `run` is called a scheduling-dependent
-    /// number of times, so a node keeps one partial per [`JobContext::slot`] and merges
-    /// them with a combiner whose result does not depend on order.
+    /// number of times over scheduling-dependent ranges, so a node keeps one partial per
+    /// unit, in storage sized at `units()`, and merges them here in unit order.
     fn finalize(&self, ctx: &mut JobContext<'_>) {
         let _ = ctx;
     }

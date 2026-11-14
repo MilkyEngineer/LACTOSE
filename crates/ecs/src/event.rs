@@ -428,7 +428,7 @@ impl PresentLog {
 // How the event parameters are made for a row of a unit (the per-chunk kernel path).
 
 impl<'a, 'r, E: Event> RowFetch<'a, 'r> for EventWriter<'a, E> {
-    type Column = SinkColumn;
+    type Column = SinkColumn<EventWriter<'static, E>>;
 
     fn row(column: &'a mut Self::Column, row: &mut Row<'a>) -> Self {
         Self { sink: row.emit.take(column.0), _event: PhantomData }
@@ -459,7 +459,7 @@ impl<'a, 'r, E: Event> RowFetch<'a, 'r> for Events<'a, E> {
 }
 
 impl<'a, 'r> RowFetch<'a, 'r> for PresentEvents<'a> {
-    type Column = SinkColumn;
+    type Column = SinkColumn<PresentEvents<'static>>;
 
     fn row(column: &'a mut Self::Column, row: &mut Row<'a>) -> Self {
         Self { sink: row.present.take(column.0) }

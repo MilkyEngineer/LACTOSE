@@ -14,8 +14,10 @@ use std::collections::BTreeMap;
 use std::sync::{Mutex, Once};
 
 use common::*;
+use lactose_core::StableKey;
 use lactose_ecs::{
-    Changed, LayoutConfig, ResMut, Schedule, StableKeyOf, World, WorldKind, finalize, system,
+    Changed, Ctx, LayoutConfig, RegionConfig, RegionId, RegionMode, Res, ResMut, Schedule,
+    StableKeyOf, World, WorldKind, finalize, system,
 };
 use lactose_math::{ExactSum, Scalar};
 use tracing::field::{Field, Visit};
@@ -129,6 +131,72 @@ fn a_changed_filter_skips_every_chunk_whose_column_tick_is_old() {
         runs("units::wounded"),
         [[chunks, 0, ROWS, ROWS], [0, chunks, 0, 0], [2, chunks - 2, 2 * u64::from(CHUNK_ROWS), 3],]
     );
+}
+
+/// What `units::wounded_rows` saw of each row it ran on: the key, the region and the mass.
+type Seen = Mutex<Vec<(StableKey, RegionId, Scalar)>>;
+
+#[system(name = "units::wounded_rows", worlds = [server])]
+fn wounded_rows(
+    mass: &Mass,
+    _changed: Changed<Health>,
+    key: StableKeyOf,
+    ctx: Ctx,
+    seen: Res<Seen>,
+) {
+    seen.lock().expect("the rows").push((*key, ctx.region(), mass.0));
+}
+
+/// The rows `units::wounded_rows` ran on in the third tick, after rows 2 and 6 of the first
+/// chunk and row 3 of the third changed, sorted; and the units of that run. Even keys live in
+/// `OTHER_REGION`, so a chunk holds rows of both regions.
+fn changed_rows_after_three_ticks(
+    layout: LayoutConfig,
+) -> (Vec<(StableKey, RegionId, Scalar)>, u64) {
+    let executor = executor();
+    let mut world = world(WorldKind::Server, layout);
+    world
+        .create_region(RegionConfig { id: OTHER_REGION, seed: 7, mode: RegionMode::Simulated })
+        .unwrap();
+    for id in 1..=ROWS {
+        let region = if id % 2 == 0 { OTHER_REGION } else { REGION };
+        world.spawn(net(id), region, (Health(100), Mass(Scalar::from_i32(id as i32)))).unwrap();
+    }
+    world.insert_service::<Seen>(Box::new(Mutex::new(Vec::new())));
+    let mut builder = Schedule::builder(WorldKind::Server);
+    builder.stage("simulation", &[]).add(&WOUNDED_ROWS);
+    let mut schedule = builder.build().unwrap();
+    world = tick(&mut schedule, world, &executor);
+    world = tick(&mut schedule, world, &executor);
+    world.service_mut::<Seen>().unwrap().get_mut().unwrap().clear();
+    for id in [3, 7, 20] {
+        world.insert(net(id), Health(50)).unwrap();
+    }
+    world = tick(&mut schedule, world, &executor);
+    let mut rows = std::mem::take(world.service_mut::<Seen>().unwrap().get_mut().unwrap());
+    rows.sort_by_key(|&(key, ..)| key);
+    let [.., [units, ..]] = runs("units::wounded_rows")[..] else { panic!("three runs") };
+    (rows, units)
+}
+
+/// A unit after a cut reads the `Changed` selection, the keys, the regions and the read
+/// columns from its own first row in the chunk, so the rows a filter passes, and what the
+/// kernel sees of them, are the same however the chunk is cut. Seeds 1 to 8 each cut the
+/// two written chunks into more than two units; the rows are compared, not counted, since a
+/// unit that read the wrong bits could still run three rows.
+#[test]
+fn a_changed_filter_over_split_units_runs_exactly_the_rows_it_runs_unsplit() {
+    capture();
+    let (whole, units) = changed_rows_after_three_ticks(rows_of(CHUNK_ROWS));
+    let row = |id: u64, region| (net(id), region, Scalar::from_i32(id as i32));
+    assert_eq!(whole, [row(3, REGION), row(7, REGION), row(20, OTHER_REGION)]);
+    assert_eq!(units, 2);
+    for seed in 1..=8 {
+        let layout = LayoutConfig { split_batches: true, seed, ..rows_of(CHUNK_ROWS) };
+        let (split, units) = changed_rows_after_three_ticks(layout);
+        assert_eq!(split, whole, "seed {seed}: the rows the filter passed");
+        assert!(units > 2, "seed {seed}: {units} units over the two written chunks");
+    }
 }
 
 #[system(name = "units::weigh", worlds = [server], reduce = ExactSum<Scalar>)]

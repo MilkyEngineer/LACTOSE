@@ -529,7 +529,7 @@ impl<'a, C: CommandChannel> Iterator for ChannelEntries<'a, C> {
 // kernel path).
 
 impl<'a, 'r> RowFetch<'a, 'r> for Commands<'a> {
-    type Column = SinkColumn;
+    type Column = SinkColumn<Commands<'static>>;
 
     fn row(_: &'a mut Self::Column, row: &mut Row<'a>) -> Self {
         Self { buffer: row.commands.take().expect("one `Commands` per system") }
@@ -537,7 +537,7 @@ impl<'a, 'r> RowFetch<'a, 'r> for Commands<'a> {
 }
 
 impl<'a, 'r, C: CommandChannel> RowFetch<'a, 'r> for ChannelWriter<'a, C> {
-    type Column = SinkColumn;
+    type Column = SinkColumn<ChannelWriter<'static, C>>;
 
     fn row(column: &'a mut Self::Column, row: &mut Row<'a>) -> Self {
         Self { sink: row.channels.take(column.0), _channel: PhantomData }

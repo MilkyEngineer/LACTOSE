@@ -10,6 +10,7 @@
 //! the units ran.
 
 use core::any::{Any, TypeId};
+use core::marker::PhantomData;
 
 use lactose_asset_api::PinnedTable;
 use lactose_core::{StableKey, SystemKey, Tick};
@@ -276,8 +277,18 @@ pub struct MutColumn<'r, T> {
     pub(crate) now: Stamp,
 }
 
+/// Panics unless parameter `index`'s table entry targets `target`. The run lends each
+/// parameter what its entry names, so a kernel whose code disagrees with its table panics
+/// here instead of reading what was lent for that entry as another type.
+fn expect_target(unit: &Unit<'_>, index: usize, target: AccessTarget) {
+    if unit.access(index).target() != target {
+        mismatch(index);
+    }
+}
+
 impl<'r, T: lactose_reflect::Component> UnitColumn<'r> for ReadColumn<'r, T> {
     fn take(unit: &mut Unit<'r>, index: usize) -> Self {
+        expect_target(unit, index, AccessTarget::Component(T::KEY));
         match unit.lend(index) {
             Lent::Read(bytes) => Self { values: typed_slice(bytes, unit.len()) },
             _ => mismatch(index),
@@ -287,6 +298,7 @@ impl<'r, T: lactose_reflect::Component> UnitColumn<'r> for ReadColumn<'r, T> {
 
 impl<'r, T: lactose_reflect::Component> UnitColumn<'r> for Option<ReadColumn<'r, T>> {
     fn take(unit: &mut Unit<'r>, index: usize) -> Self {
+        expect_target(unit, index, AccessTarget::Component(T::KEY));
         match unit.lend(index) {
             Lent::Read(bytes) => Some(ReadColumn { values: typed_slice(bytes, unit.len()) }),
             Lent::Absent => None,
@@ -305,6 +317,7 @@ fn mut_column<'r, T: lactose_reflect::Component>(
 
 impl<'r, T: lactose_reflect::Component> UnitColumn<'r> for MutColumn<'r, T> {
     fn take(unit: &mut Unit<'r>, index: usize) -> Self {
+        expect_target(unit, index, AccessTarget::Component(T::KEY));
         match unit.lend(index) {
             Lent::Write(bytes, stamps) => mut_column(unit, bytes, stamps),
             _ => mismatch(index),
@@ -314,6 +327,7 @@ impl<'r, T: lactose_reflect::Component> UnitColumn<'r> for MutColumn<'r, T> {
 
 impl<'r, T: lactose_reflect::Component> UnitColumn<'r> for Option<MutColumn<'r, T>> {
     fn take(unit: &mut Unit<'r>, index: usize) -> Self {
+        expect_target(unit, index, AccessTarget::Component(T::KEY));
         match unit.lend(index) {
             Lent::Write(bytes, stamps) => Some(mut_column(unit, bytes, stamps)),
             Lent::Absent => None,
@@ -332,27 +346,34 @@ impl<'r> UnitColumn<'r> for NoColumn {
     }
 }
 
-/// The parameter's index, for an output sink the row hands out.
+/// The parameter's index, for the output sink of parameter type `P` the row hands out.
 #[doc(hidden)]
-pub struct SinkColumn(pub(crate) usize);
+pub struct SinkColumn<P>(pub(crate) usize, PhantomData<fn() -> P>);
 
-impl<'r> UnitColumn<'r> for SinkColumn {
-    fn take(_: &mut Unit<'r>, index: usize) -> Self {
-        Self(index)
+impl<'r, P: SystemParam> UnitColumn<'r> for SinkColumn<P> {
+    fn take(unit: &mut Unit<'r>, index: usize) -> Self {
+        // The sinks are made per table entry, so the entry must be `P`'s own: its kind
+        // tells an event sink from a presentation one, its target one event type from another.
+        let access = unit.access(index);
+        if access.kind() != P::ACCESS.kind() || access.target() != P::ACCESS.target() {
+            mismatch(index);
+        }
+        Self(index, PhantomData)
     }
 }
 
-/// The place of a region resource among the system's, for the row's region.
+/// The place of region resource `T` among the system's, for the row's region.
 #[doc(hidden)]
-pub struct RegionResColumn(pub(crate) usize);
+pub struct RegionResColumn<T>(pub(crate) usize, PhantomData<fn() -> T>);
 
-impl<'r> UnitColumn<'r> for RegionResColumn {
+impl<'r, T: lactose_reflect::Resource> UnitColumn<'r> for RegionResColumn<T> {
     fn take(unit: &mut Unit<'r>, index: usize) -> Self {
+        expect_target(unit, index, AccessTarget::RegionResource(T::KEY));
         let before = unit.env.table[..index]
             .iter()
             .filter(|access| matches!(access.target(), AccessTarget::RegionResource(_)))
             .count();
-        Self(before)
+        Self(before, PhantomData)
     }
 }
 
