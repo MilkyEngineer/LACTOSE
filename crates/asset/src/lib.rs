@@ -11,7 +11,8 @@
 //!
 //! # Status
 //!
-//! Facade (D136): every public signature is final and every deciding body is `todo!()`.
+//! Implemented (D136): the store, the pack format and the region baseline do what
+//! `README.md` says, proved by the tests its "Proof for milestone 1" lists.
 //!
 //! # Where to start
 //!
@@ -67,14 +68,10 @@
 //! ```
 
 #![forbid(unsafe_code)]
-#![allow(
-    dead_code,
-    unused_variables,
-    reason = "facade: every deciding body is todo!(); the implementation removes this with the last"
-)]
 
 mod baseline;
 mod pack;
+mod state;
 mod store;
 
 pub use baseline::{RegionBaseline, RegionBaselineLoader};

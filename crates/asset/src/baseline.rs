@@ -4,9 +4,11 @@
 
 use std::sync::Arc;
 
-use lactose_asset_api::{Asset, AssetCatalog, AssetId, AssetKind, CookedAsset, Loader, Readiness};
+use lactose_asset_api::{
+    Asset, AssetCatalog, AssetFailure, AssetId, AssetKind, AssetRef, CookedAsset, Loader, Readiness,
+};
 use lactose_bundle::Baseline;
-use lactose_core::Result;
+use lactose_core::{Error, ErrorKind, Result};
 
 /// A region's cooked baseline as a published asset (architecture sections 14 and 15.2).
 ///
@@ -40,14 +42,14 @@ impl RegionBaseline {
     /// its collision check with every other name it publishes, and never rebuilds it.
     #[must_use]
     pub fn name(content_hash: u64) -> String {
-        todo!("format the content-addressed name")
+        format!("region_baseline/{content_hash:016x}")
     }
 
     /// The ID of the baseline whose `Baseline::content_hash` is `content_hash`:
     /// `AssetId::from_name` of [`RegionBaseline::name`]`(content_hash)`.
     #[must_use]
     pub fn id(content_hash: u64) -> AssetId {
-        todo!("hash the content-addressed name")
+        AssetId::from_name(&Self::name(content_hash))
     }
 
     /// What the cooker adds to a pack for `baseline`: [`RegionBaseline::id`] of its content
@@ -55,7 +57,8 @@ impl RegionBaseline {
     /// pair to pass to `PackBuilder::add`.
     #[must_use]
     pub fn cook(baseline: &Baseline) -> (AssetId, CookedAsset) {
-        todo!("encode the baseline under its content-addressed ID")
+        let id = Self::id(baseline.content_hash());
+        (id, CookedAsset::new::<Self>(baseline.encode(), []))
     }
 
     /// The baseline, shared: what `RegionBundle::baseline` and a diff take.
@@ -74,7 +77,19 @@ impl RegionBaseline {
     /// another content hash (a cooker that named it wrongly), the answer is `Failed` with
     /// `ErrorKind::InvalidData`, the asset's ID and the published version.
     pub fn lookup(catalog: &dyn AssetCatalog, content_hash: u64) -> Readiness<Arc<Baseline>> {
-        todo!("look the content-addressed ID up and check what it holds")
+        let id = Self::id(content_hash);
+        match catalog.newest_typed(AssetRef::<Self>::new(id)) {
+            Readiness::Ready(handle) if handle.baseline.content_hash() == content_hash => {
+                Readiness::Ready(Arc::clone(&handle.baseline))
+            }
+            Readiness::Ready(handle) => Readiness::Failed(AssetFailure {
+                id,
+                version: Some(handle.version()),
+                kind: ErrorKind::InvalidData,
+            }),
+            Readiness::Pending => Readiness::Pending,
+            Readiness::Failed(failure) => Readiness::Failed(failure),
+        }
     }
 }
 
@@ -102,6 +117,12 @@ impl Loader for RegionBaselineLoader {
     /// `ResourceExhausted` above `lactose_bundle::MAX_DOCUMENT_BYTES`), and with
     /// `ErrorKind::InvalidData` if `dependencies` is not empty.
     fn load(&self, bytes: &[u8], dependencies: &[AssetId]) -> Result<RegionBaseline> {
-        todo!("decode the baseline and refuse declared dependencies")
+        if !dependencies.is_empty() {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                "a region baseline declares no dependencies",
+            ));
+        }
+        Ok(RegionBaseline { baseline: Arc::new(Baseline::decode(bytes)?) })
     }
 }

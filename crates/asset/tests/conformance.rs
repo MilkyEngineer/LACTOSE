@@ -1,8 +1,6 @@
 //! The conformance suite of `lactose-asset-api` (architecture section 20) against the
 //! store: the harness that turns the suite's `provide` into a pack on disk and a mount,
-//! and its `settle` into [`Store::settled`]. The test is ignored while the store's bodies
-//! are `todo!()`; the implementation removes the attribute and nothing else here needs to
-//! change.
+//! and its `settle` into [`Store::settled`].
 
 #![forbid(unsafe_code)]
 
@@ -91,7 +89,6 @@ fn claim(pack: &mut [u8], version: AssetVersion) {
 }
 
 #[test]
-#[ignore = "facade: the store's bodies are todo!(); the implementation removes this"]
 fn the_store_conforms_over_raw_and_compressed_packs() {
     let executor = Executor::builder().build().expect("an executor");
     let platform = executor.platform().as_ref();
