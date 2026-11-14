@@ -7,12 +7,16 @@
 //! despawns and spawns rows every tick) and hashed after every step as SOUR does. The time
 //! of each phase (sync points, each system, the hash) is collected from the `casein` spans
 //! and printed; it is measured by an ignored test, run by hand, and reported, never
-//! asserted. What the scene computes is asserted in a test that runs everywhere.
+//! asserted. What the scene computes is asserted in a test that runs everywhere, and the
+//! scene at a small scale records its hash under the runner's session.
 
 #![forbid(unsafe_code)]
 
+mod glue;
+
 use std::collections::BTreeMap;
 
+use glue::{Harness, protocol_error};
 use lactose_core::{NetId, PlayerId, Result, StableKey, Tick};
 use lactose_ecs::{
     ClaimedBy, Commands, Ctx, Event, EventWriter, Events, Executor, LayoutConfig, Mut,
@@ -21,7 +25,7 @@ use lactose_ecs::{
 };
 use lactose_math::{ExactSum, Scalar};
 use lactose_reflect::{component, resource};
-use lactose_sim::harness::{ChunkCapacity, layout_mode};
+use lactose_sim::harness::{ChunkCapacity, layout_mode, run_recorded};
 use lactose_sim::{
     InputApplier, PlayerSample, Registration, Simulation, SimulationBuilder, Stage, TickDelta,
     TickInput, TypeTable, sets,
@@ -314,10 +318,9 @@ fn step(executor: &Executor, simulation: Simulation) -> Simulation {
 }
 
 /// The scene at a small scale runs, every system does its work, and the result does not
-/// depend on the worker count. Until the run forks over chunks (D137's part B), each system
-/// runs as one job, so the equality of the two worker counts holds by construction; the
-/// scene builds its own executor, so SOUR's modes give it no coverage, and the next test
-/// runs it under every layout instead.
+/// depend on the worker count: each per-entity system's units fork over the workers
+/// (D137 part B), so one worker and four run the same units in different orders and on
+/// different threads.
 #[test]
 fn the_scene_runs_and_its_hash_is_the_same_on_one_and_four_workers() {
     let mut hashes = Vec::new();
@@ -375,6 +378,24 @@ fn the_scene_gives_one_hash_and_one_reduction_every_tick_under_every_layout() {
             assert_eq!(first, None, "{capacity:?} seed {seed}: first differing tick");
         }
     }
+}
+
+/// The scene at a small scale, under the runner's session: its worker count, its layout
+/// and, in chaos mode, every perturbation with each split forced, recording the hash after
+/// every step, so every SOUR mode compares the scene's ticks with the baseline's.
+#[test]
+fn the_scene_records_its_hash_every_tick_under_the_session() {
+    const TEST: &str = "lactose_sim::cost::scene";
+    let harness = Harness::from_env().unwrap();
+    let mut simulation = scene_in(2_000, harness.layout);
+    let mut recorder = harness.recorder(TEST, &simulation).unwrap();
+    let mut record = |tick: Tick, hash: u64| recorder.record(tick.0, hash).map_err(protocol_error);
+    let frames = (1..=30).map(frame);
+    simulation = run_recorded(&harness.executor, simulation, frames, &mut record).unwrap();
+    harness.finish(TEST).unwrap();
+    let mut hurt = 0;
+    simulation.world_mut().query::<&Health>().for_each(|_, hp| hurt += usize::from(hp.0 < 100));
+    assert!(hurt > 0, "hits landed");
 }
 
 // ---- The measurement ----

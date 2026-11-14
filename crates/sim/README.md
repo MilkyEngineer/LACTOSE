@@ -571,8 +571,8 @@ for bit:
   `Production` as `production`), and the chaos seed from `Executor::chaos_config`, so all
   three are what the builders report rather than what the session asked for. A test with
   several worlds writes one `applied` line per world whose hash it records; the runner
-  holds every one to the launched configuration. `tests/sour.rs` is the glue
-  as the recording tests use it.
+  holds every one to the launched configuration. `tests/glue` is the glue
+  as the recording tests (`sour.rs`, `cost.rs`) use it.
 - Every simulation test of this crate and of the game crates records this way; the package
   with such tests is listed under `[harness]` in `tools/xtask/ci-policy.toml`. Until
   `lactose-app-headless` exists, whose test target is the SOUR test crate of section 8.3,
@@ -640,8 +640,9 @@ another build.
 ## Proof for milestone 1
 
 The tests in `tests/`, each a nextest test that asserts on counts, orders and hashes and
-never on timing. `tests/sour.rs` records under SOUR, which runs the package in workers,
-repeat, layout and chaos modes; `tests/common/mod.rs` is a small game written as a game
+never on timing. `tests/sour.rs` and `tests/cost.rs` record under SOUR, which runs the
+package in workers, repeat, layout and chaos modes; `tests/common/mod.rs` is a small game
+written as a game
 crate writes it, the hooks `app`, `input` and `net` write, and a driver that answers the
 lifecycle as `app` and `persist` would.
 
@@ -657,4 +658,4 @@ lifecycle as `app` and `persist` would.
 | Refusals | `refusals.rs`, `runs.rs`, `sync_point.rs`: a bundle against another baseline, a second bundle for a loaded region, an unwanted bundle, a bad resource, a document schema the registry disagrees with, a table for an unloaded region, a frame's `modes` and `unloaded` under `Anchored`, a `Join` for a region outside the atlas, a non-`derived` world resource at build: each refused as stated, nothing changed, the tick runs, the failure is reported |
 | Runs | `runs.rs`: a removed resource fails the next run with the simulation inside the error, and `run_passes` prepares both passes first and `Gather` again after `Extract`, handing the simulation back; `save_point` off the server likewise; `Cancelled` hands nothing back; the log is trimmed to the retention and a lagging consumer sees `None`; the server drains presentation events |
 | The build check | `check.rs`: one call per build after every registration function, checks in the order added, with every system of the kind in registration order on a server, a prediction and a client world; a failing check's error fails the build before the schedule prepares and stops the later checks; a passing check leaves the hashes unchanged |
-| SOUR | `sour.rs`: the program of `tests/common` for 300 ticks, built from the session and recording `(tick, hash)` after every step |
+| SOUR | `sour.rs`: the program of `tests/common` for 300 ticks, built from the session and recording `(tick, hash)` after every step; `cost.rs`: the milestone 1 cost scene at 2,000 rows for 30 ticks, likewise, its per-entity units forked over the session's workers |
