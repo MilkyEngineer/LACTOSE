@@ -23,6 +23,7 @@ use std::time::Instant;
 
 use lactose_xtask::harness::{self, Dirs, Selection, stand_in};
 use lactose_xtask::heavy;
+use lactose_xtask::measure;
 use lactose_xtask::policy::Policy;
 use lactose_xtask::repo::Files;
 use lactose_xtask::tiers::TierFile;
@@ -56,6 +57,11 @@ cargo xtask <command>
                              run the program once it holds one of <n> machine-wide slots
                              (default 2, the same for every caller on the machine), and
                              exit with its status
+  measure (--all | <name>…) [--short] [--out <dir>]
+                             run the milestone measurements and write each one's result
+                             files to docs/results (or <dir>); --short cuts repetitions
+                             and marks the files as short; the names are in
+                             docs/results/README.md
   help                       print this text
 
 Findings are printed as `path: message`. Exit status: 0 clean, 1 findings, 2 could not run.";
@@ -175,6 +181,7 @@ fn main() -> ExitCode {
             Ok(code) => process::exit(code),
             Err(message) => ("heavy", Err(message)),
         },
+        ["measure", ref rest @ ..] => ("measure", run_measurements(rest)),
         _ => ("xtask", Err(format!("unrecognised arguments `{}`\n\n{USAGE}", args.join(" ")))),
     };
     match checked {
@@ -194,6 +201,21 @@ fn main() -> ExitCode {
             ExitCode::from(2)
         }
     }
+}
+
+/// Runs the measurements; writes files, never findings. Not a check: a failed measurement
+/// is reported once the others have run.
+fn run_measurements(args: &[&str]) -> Checked {
+    let options = measure::parse(args)?;
+    let context = Context::load()?;
+    let workspace = measure::Workspace {
+        cargo: context.cargo,
+        root: context.root,
+        target_dir: context.target_dir,
+    };
+    let written = measure::run(&workspace, &options)?;
+    eprintln!("measure: {} file(s) written", written.len());
+    Ok(Vec::new())
 }
 
 fn check_tiers() -> Checked {

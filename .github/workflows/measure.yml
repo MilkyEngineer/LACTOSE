@@ -1,0 +1,51 @@
+name: measure
+
+# Run by hand only: never on a push, a pull request or a schedule.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+# `cargo xtask measure --all --short` on the x86-64 platforms (docs/results/README.md), so the
+# command keeps working on the machines session B runs it on. A runner is shared and its
+# numbers mean nothing, so every result file is discarded except edit-to-playing's: criterion
+# 9 accepts a runner's figure, marked as one, for an operating system the owner's desktop does
+# not boot (docs/plans/milestone-1.md, section 4). The machine name marks the files.
+jobs:
+  measure:
+    name: measure (${{ matrix.platform }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            platform: linux-x64
+          - os: windows-latest
+            platform: windows-x64
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@0.9.151
+      - name: Build the CI driver
+        run: cargo build --locked -p lactose-xtask
+      - name: Every measurement, short
+        run: cargo xtask measure --all --short --out target/measure/results
+        env:
+          LACTOSE_MEASURE_MACHINE: github-runner-${{ matrix.platform }}
+      # Whatever the run got to, so a failure elsewhere still keeps a figure written.
+      - name: Keep edit-to-playing
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: edit-to-playing-${{ matrix.platform }}
+          path: target/measure/results/edit-to-playing-*
+          if-no-files-found: warn

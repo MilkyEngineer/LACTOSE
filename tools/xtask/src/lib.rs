@@ -7,7 +7,8 @@
 //! Every check is a pure function from parsed inputs to a list of [`Finding`]s. The binary in
 //! `main.rs` only gathers the inputs (the tier file, `cargo metadata`, file contents) and
 //! prints what the checks return. [`heavy`] is not a check: it bounds how many heavy
-//! commands run at once on one machine.
+//! commands run at once on one machine. Nor is [`measure`]: it runs the milestone
+//! measurements and writes their result files.
 
 #![forbid(unsafe_code)]
 
@@ -15,6 +16,7 @@ pub mod boundary;
 pub mod features;
 pub mod harness;
 pub mod heavy;
+pub mod measure;
 pub mod policy;
 pub mod repo;
 mod rust_source;

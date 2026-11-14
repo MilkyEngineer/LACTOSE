@@ -22,11 +22,12 @@ of a manifest it writes under the target directory.
 | `vendor` | each crate built from `vendor/` is its patch applied to its record, the patch is within the rule, the record is the crates.io archive's, and the advisory check covers the upstream versions (sections 8.2, 8.3) |
 | `sour run`, `sour compare`, `sour self-test`, `sour matrix` | SOUR, the determinism harness (section 8.3) |
 | `heavy` | nothing: it bounds how many heavy commands run at once on one machine (below) |
+| `measure` | nothing: it runs the milestone measurements and writes their result files (below) |
 
 Findings are printed to standard output as `path: message`, one per line, and nothing else
 is printed there. The exit status is 0 for none, 1 for findings and 2 when a check could not
-run. `heavy` is not a check and is outside this contract, except that it too writes nothing
-to standard output itself.
+run. `heavy` and `measure` are not checks and are outside this contract, except that they too
+write nothing to standard output themselves.
 
 ## Where the rules live
 
@@ -184,7 +185,9 @@ finding.
 
 Every root's tree compiles glam for the target with its `scalar-math` feature (D119):
 without it, glam's `Vec3A` and `Vec4` `min` and `max` are the target's SIMD instructions,
-which treat NaN differently on x86-64 and aarch64.
+which treat NaN differently on x86-64 and aarch64. It also compiles glam with `libm`, so
+glam's transcendentals are the pinned `libm` crate's rather than the platform's float
+library.
 
 No workspace package but `lactose-task` names loom, read from `cargo metadata`: no
 dependency on it under any rename, no dependency declaration or `[features]` value that turns
@@ -345,3 +348,31 @@ second one only after the first while both hold a slot; chain several in one `sh
 wrap a command that waits on another. Do not wrap: `cargo fmt`, `cargo xtask tiers`,
 `boundary`, `features` and `vendor`, `cargo deny`, or a single nextest run over one crate
 whose build is done. CI never uses `heavy`: its runners are single-tenant.
+
+## Measurements
+
+`cargo xtask measure (--all | <name>…) [--short] [--out <dir>]` runs the measurements the
+milestone criteria rest on and writes each one's result files to `docs/results` (or
+`<dir>`), with the header of `docs/plans/milestone-1.md`, section 4. The names, what each
+runs and where each threshold is stated are in `docs/results/README.md`; `--all` runs every
+one in that order and, when one fails, still runs the rest and exits 2 at the end. It runs
+`cargo nextest run`, `cargo bench` and `cargo run`, all `--locked`, and their output goes to
+standard error as it comes.
+
+- Before the measurements, an ignored test prints the core topology the executor detects and
+  its default frame workers, which every file's header carries.
+- A measurement that is a test prints each figure as a line `measure: <name> <value>`. The
+  files carry those figures, the `.json` with each value a number where it reads as one, and
+  the `.md` with the test's whole output.
+- `--short` sets `LACTOSE_MEASURE_SHORT=1` for the tests and `WHISK_BENCH_RUNS=100` for the
+  benchmark, and names the files `…-short`. It cuts nothing of `headless-120`, which has no
+  repetitions, or `edit-to-playing`, which keeps its five so that a runner's short run still
+  yields the criterion's figure, and leaves their files unmarked.
+- The machine in the file names is `LACTOSE_MEASURE_MACHINE` where it is set, else the CPU's
+  model name as a slug (the WHISK benchmark's rule).
+- `edit-to-playing` builds in a detached worktree of `HEAD` under
+  `target/measure/edit-to-playing/`, removed again when it ends, with a target directory of
+  its own that it keeps for the next run's warm build.
+
+It loads the machine for minutes: under other agents' load, wrap it in `heavy`, and read its
+numbers as steering only. The numbers that prove a criterion come from a quiet machine.
