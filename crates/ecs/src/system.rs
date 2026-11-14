@@ -10,7 +10,7 @@ use lactose_task::JobContext;
 use crate::access::Access;
 use crate::change::Stamp;
 use crate::command::{ChannelCommand, CommandBuffer};
-use crate::event::{EventRecord, PresentRecord};
+use crate::event::{EventList, EventRecord, PresentRecord};
 use crate::param::{Ctx, SystemParam};
 use crate::storage::RowView;
 use crate::world::{World, WorldSet};
@@ -250,6 +250,11 @@ impl<'r, 'j> Invocation<'r, 'j> {
         Self { slots, reducer }
     }
 
+    /// The slots, for a caller that reuses their buffer.
+    pub(crate) fn into_slots(self) -> Vec<Slot<'r, 'j>> {
+        self.slots
+    }
+
     /// The slot of parameter `index`, which a fetch takes.
     pub(crate) fn take(&mut self, index: usize) -> Slot<'r, 'j> {
         core::mem::replace(&mut self.slots[index], Slot::Taken)
@@ -276,7 +281,7 @@ pub(crate) enum Slot<'r, 'j> {
     Ctx(Ctx<'r>),
     Commands(&'r mut CommandBuffer),
     EmitEvents(&'r mut Vec<EventRecord>),
-    ReadEvents(&'r [EventRecord]),
+    ReadEvents(&'r EventList),
     Present(&'r mut Vec<PresentRecord>),
     /// The `Vec<ChannelEntry<C>>` of a channel, if it has entries.
     Channel(Option<&'r (dyn Any + Send + Sync)>),

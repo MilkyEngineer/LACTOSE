@@ -9,6 +9,7 @@ use lactose_reflect::Component;
 use crate::access::{Access, AccessKind, AccessTarget};
 use crate::change::Stamp;
 use crate::param::{Changed, Mut, SystemParam, With, Without, sealed};
+use crate::storage::{Archetype, Chunk, Loc, Storage};
 use crate::system::{Fetch, Invocation, ReducerSlot, Slot};
 use crate::world::{World, is_tracked, refuses_mut};
 
@@ -162,21 +163,62 @@ impl Filter {
         Self { access, changed_after, now: now.tick }
     }
 
-    /// Whether the entity `key` matches, by its archetype and its row stamps.
-    fn matches(&self, world: &World, key: StableKey) -> bool {
-        let Some(loc) = world.storage.loc(key) else { return false };
-        let archetype = &world.storage.archetypes[loc.archetype as usize];
-        let chunk = &archetype.chunks[loc.chunk as usize];
+    /// Whether every row of `archetype` has what the query requires and lacks what it
+    /// excludes.
+    fn admits(&self, archetype: &Archetype) -> bool {
         self.access.iter().all(|&(kind, component)| match kind {
-            AccessKind::Read | AccessKind::Write | AccessKind::With => archetype.has(component),
+            AccessKind::Read | AccessKind::Write | AccessKind::With | AccessKind::Changed => {
+                archetype.has(component)
+            }
             AccessKind::Without => !archetype.has(component),
-            AccessKind::Changed => archetype.column_index(component).is_some_and(|index| {
-                chunk.stamps[index].as_ref().is_some_and(|stamps| {
-                    stamps.get(loc.row as usize).after(self.changed_after, self.now)
-                })
-            }),
             _ => true,
         })
+    }
+
+    /// Whether row `row` of `chunk`, in an admitted archetype, passes every `Changed` item.
+    fn passes(&self, archetype: &Archetype, chunk: &Chunk, row: usize) -> bool {
+        self.access.iter().all(|&(kind, component)| {
+            kind != AccessKind::Changed
+                || archetype.column_index(component).is_some_and(|index| {
+                    chunk.stamps[index]
+                        .as_ref()
+                        .is_some_and(|stamps| stamps.get(row).after(self.changed_after, self.now))
+                })
+        })
+    }
+
+    /// Whether the entity at `loc` matches, by its archetype and its row stamps.
+    fn matches(&self, storage: &Storage, loc: Loc) -> bool {
+        let archetype = &storage.archetypes[loc.archetype as usize];
+        self.admits(archetype)
+            && self.passes(archetype, &archetype.chunks[loc.chunk as usize], loc.row as usize)
+    }
+
+    /// The archetypes whose rows a query visits: only those it admits.
+    fn archetypes<'s>(&self, storage: &'s Storage) -> impl Iterator<Item = (u32, &'s Archetype)> {
+        storage
+            .archetypes
+            .iter()
+            .enumerate()
+            .filter(|(_, archetype)| self.admits(archetype))
+            .map(|(index, archetype)| (index as u32, archetype))
+    }
+
+    /// Calls `f` with the key and place of every matching row, in storage order. Only the
+    /// rows of admitted archetypes are visited.
+    fn each_match(&self, storage: &Storage, mut f: impl FnMut(StableKey, Loc)) {
+        for (index, archetype) in self.archetypes(storage) {
+            for (chunk_index, chunk) in archetype.chunks.iter().enumerate() {
+                for (row, &key) in chunk.keys.iter().enumerate() {
+                    if self.passes(archetype, chunk, row) {
+                        f(
+                            key,
+                            Loc { archetype: index, chunk: chunk_index as u32, row: row as u32 },
+                        );
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -202,9 +244,8 @@ impl<'w, Q: QueryItems> Query<'w, Q> {
         Self { world, filter, now, _items: PhantomData }
     }
 
-    /// The items of the live entity `key`, which matches.
-    fn row(&mut self, key: StableKey) -> Q::Item<'_> {
-        let loc = self.world.storage.loc(key).expect("a live entity");
+    /// The items of the matching row at `loc`.
+    fn row(&mut self, loc: Loc) -> Q::Item<'_> {
         let archetype = &mut self.world.storage.archetypes[loc.archetype as usize];
         let chunk = &mut archetype.chunks[loc.chunk as usize];
         for &(kind, component) in &self.filter.access {
@@ -256,16 +297,12 @@ impl<'w, Q: QueryItems> Query<'w, Q> {
     /// Calls `f` once per matching entity with its origin key and items, in ascending key
     /// order.
     pub fn for_each(&mut self, mut f: impl FnMut(StableKey, Q::Item<'_>)) {
-        let keys: Vec<StableKey> = self
-            .world
-            .storage
-            .entities
-            .keys()
-            .copied()
-            .filter(|&key| self.filter.matches(self.world, key))
-            .collect();
-        for key in keys {
-            f(key, self.row(key));
+        let mut rows = Vec::new();
+        self.filter.each_match(&self.world.storage, |key, loc| rows.push((key, loc)));
+        // Keys are unique, so this order is total and independent of the layout.
+        rows.sort_unstable_by_key(|&(key, _)| key);
+        for (key, loc) in rows {
+            f(key, self.row(loc));
         }
     }
 
@@ -273,20 +310,100 @@ impl<'w, Q: QueryItems> Query<'w, Q> {
     #[must_use]
     pub fn get(&mut self, key: StableKey) -> Option<Q::Item<'_>> {
         let key = self.world.origin(key)?;
-        if !self.filter.matches(self.world, key) {
+        let loc = self.world.storage.loc(key)?;
+        if !self.filter.matches(&self.world.storage, loc) {
             return None;
         }
-        Some(self.row(key))
+        Some(self.row(loc))
     }
 
     /// How many entities match.
     #[must_use]
     pub fn count(&self) -> usize {
-        self.world
-            .storage
-            .entities
-            .keys()
-            .filter(|&&key| self.filter.matches(self.world, key))
-            .count()
+        let mut count = 0;
+        self.filter.each_match(&self.world.storage, |_, _| count += 1);
+        count
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use lactose_core::NetId;
+    use lactose_reflect::{Registry, component};
+
+    use super::*;
+    use crate::{ClaimedBy, InRegion, OwnedBy, PredictedOrigin, RegionConfig, RegionId};
+    use crate::{RegionMode, WorldBuilder, WorldKind};
+
+    #[component(key = "ecs_test::common", persistent)]
+    struct Common(#[field(id = 1)] u64);
+
+    #[component(key = "ecs_test::rare", persistent, replicated)]
+    struct Rare(#[field(id = 1)] u64);
+
+    /// Rows in the world: enough that visiting every row would show at full size, few
+    /// enough under Miri that the crate's run stays inside the nightly job.
+    const ROWS: u64 = if cfg!(miri) { 105 } else { 10_005 };
+    /// Rows that also have `Rare`.
+    const RARE: u64 = 5;
+    /// Every `STRIDE`-th id has `Rare`, from id 0, which places exactly `RARE` of them.
+    const STRIDE: u64 = (ROWS - RARE) / RARE + 1;
+
+    /// Every row has `Common`; `RARE` of them, one every `STRIDE` ids, have `Rare` too.
+    fn world() -> World {
+        let mut registry = Registry::new();
+        registry.register::<InRegion>().unwrap();
+        registry.register::<OwnedBy>().unwrap();
+        registry.register::<ClaimedBy>().unwrap();
+        registry.register::<PredictedOrigin>().unwrap();
+        registry.register::<Common>().unwrap();
+        registry.register::<Rare>().unwrap();
+        let mut world = WorldBuilder::new(WorldKind::Server, Arc::new(registry)).build().unwrap();
+        let region = RegionId(1);
+        world
+            .create_region(RegionConfig { id: region, seed: 1, mode: RegionMode::Simulated })
+            .unwrap();
+        for id in 0..ROWS {
+            let key = StableKey::Net(NetId::cooked(id));
+            if id % STRIDE == 0 {
+                world.spawn(key, region, (Common(id), Rare(id))).unwrap();
+            } else {
+                world.spawn(key, region, (Common(id),)).unwrap();
+            }
+        }
+        world
+    }
+
+    /// The rows a query over `Q` visits: those of the archetypes it admits.
+    fn visited<Q: QueryItems>(world: &mut World) -> u64 {
+        let query = world.query::<Q>();
+        query
+            .filter
+            .archetypes(&query.world.storage)
+            .flat_map(|(_, archetype)| &archetype.chunks)
+            .map(|chunk| u64::try_from(chunk.len()).unwrap())
+            .sum()
+    }
+
+    #[test]
+    fn a_query_visits_only_the_rows_of_archetypes_it_admits() {
+        let mut world = world();
+        assert_eq!(visited::<&Rare>(&mut world), RARE);
+        assert_eq!(visited::<(&Common, With<Rare>)>(&mut world), RARE);
+        assert_eq!(visited::<(&Common, Without<Rare>)>(&mut world), ROWS - RARE);
+        assert_eq!(visited::<Changed<Rare>>(&mut world), RARE);
+        assert_eq!(visited::<Option<&Rare>>(&mut world), ROWS);
+
+        let mut seen = Vec::new();
+        world.query::<&Rare>().for_each(|key, rare| seen.push((key, rare.0)));
+        let expected: Vec<(StableKey, u64)> = (0..RARE)
+            .map(|n| n * STRIDE)
+            .map(|id| (StableKey::Net(NetId::cooked(id)), id))
+            .collect();
+        assert_eq!(seen, expected);
+        let count = world.query::<(&Common, Without<Rare>)>().count();
+        assert_eq!(u64::try_from(count).unwrap(), ROWS - RARE);
     }
 }

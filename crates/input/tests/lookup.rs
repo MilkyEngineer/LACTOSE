@@ -70,10 +70,11 @@ fn the_lookup_answers_among_many_rows_and_allocates_nothing() {
 }
 
 /// Applying a sample to a row that holds the component is a decode, the lookup and the
-/// ECS's `World::insert`: the applier allocates exactly what the same inserts made
-/// directly allocate (the ECS's own erased copy), whatever the world's size.
+/// ECS's `World::insert`, whose overwrite of a component without references is a copy in
+/// place: the applier allocates nothing, and neither do the same inserts made directly,
+/// whatever the world's size.
 #[test]
-fn the_applier_allocates_only_what_the_insert_does() {
+fn the_applier_allocates_nothing() {
     let mut simulation = populated(100_000);
     let world = simulation.world_mut();
     let mut applier = PlayerInputApplier::new();
@@ -93,7 +94,8 @@ fn the_applier_allocates_only_what_the_insert_does() {
             world.insert(key(500 + u64::from(player)), *sample).unwrap();
         }
     });
-    assert_eq!(applied, inserted);
+    assert_eq!(applied, 0, "the applier allocated");
+    assert_eq!(inserted, 0, "`World::insert` allocated on an overwrite");
 }
 
 /// The lookup's time for 64 players among 1,000 and 100,000 other rows, printed for the

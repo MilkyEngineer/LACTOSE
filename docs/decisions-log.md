@@ -4442,6 +4442,44 @@ relayed by an event when it acts on another body** (§6.1, §10, `lactose-ecs`,
 - Driven by: the anim implementation review, round 2, finding D1; the brief `physics-validity`;
   the physics-validity reviews r1 (S1, S2, M1 to M5) and r2, m1 to m4 (2026-10-25).
 
+**D137. ECS hot paths behind the same surface, measured at 100k rows; forking over chunks next** (§6, §8.2, §22, `lactose-ecs`, `lactose-sim`)
+- Why: the first measurement of a milestone 1 tick through `Simulation::step`, 100,064 rows in
+  four archetypes over sixteen regions (`crates/sim/tests/cost.rs`, ignored, release), took
+  94 ms against the 4 ms target. `World::query` visited every live entity, `Events::for_target`
+  scanned every event of its type per row, the typed `insert` overwrite boxed its value, every
+  per-entity invocation allocated its slots, output and sinks, and `World::region` walked the
+  entity table.
+  - *`World::query` visits the archetypes its filter admits and checks `Changed` per row.* Its
+    order is still ascending origin key. A unit test counts the rows it visits, at a size that
+    shrinks under Miri so the crate's Miri run keeps it. Rules out a query whose cost is the
+    world's size.
+  - *A typed `insert` of a component without an `EntityRef` field, other than `ClaimedBy`, is a
+    copy in place and allocates nothing.* An indexed component (a reference or the claim)
+    keeps the path that copies the old value to unindex it. `crates/input/tests/lookup.rs`
+    asserts the input applier, and the same inserts made directly, allocate nothing. Rules out
+    an applier that allocates per player per tick.
+  - *Each event type keeps an index of (target, emission position), keyed by the target's
+    origin key and by the `Net` key bound to it when the event was emitted, sorted after each
+    emitting system.* `for_target` is a binary search, and reads in emission order. Rules out a
+    per-row scan of every event.
+  - *A per-entity invocation that emits and commands nothing allocates nothing.* Its slots,
+    output and buffers are reused across rows, resources are lent as one shared slice, and
+    sinks are cursors. Per-region and once-per-tick invocations still allocate their slots.
+    `crates/ecs/tests/alloc.rs` holds it by counting allocations at two world sizes. A vector
+    is reused across lifetimes by collecting an emptied vector in place, which std does not
+    guarantee. The test holds that reuse; correctness does not depend on it. Rules out
+    allocation per row.
+  - *`World::region` counts a region's rows from the region columns.*
+  - *Each sync point carries a span at target `casein`*, so the cost test can report it.
+  - *Time is measured and reported, never asserted.* Result: 41 ms per tick on one core
+    (Apple M1, load about 7), the hash of all sixteen regions 16 ms. The remaining time is
+    per-row invocation overhead. Forking per-entity runs over chunks comes next, with a
+    per-chunk kernel path; SOUR layout and chaos modes must hold its hashes, and
+    `lactose-ecs` should join `[harness]` with it.
+  - *No public signature changed.*
+- Driven by: the first cost measurement of a milestone 1 tick (`crates/sim/tests/cost.rs`);
+  the ECS hot paths part A review, rounds 1 and 2 (2026-11-14).
+
 ## 10. Review history
 
 - **Revision 1** (`a29af04`): the design baseline.

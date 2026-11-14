@@ -1,6 +1,6 @@
-//! Region modes and per-region systems: kernels run over `Simulated` regions only, a
-//! per-region system runs once per such region that holds its region resources, and its
-//! RNG streams are the world's.
+//! Region modes and per-region systems: kernels run over `Simulated` regions only, and only
+//! in those that hold their region resources; a per-region system runs once per such
+//! region; and its RNG streams are the world's.
 
 #![forbid(unsafe_code)]
 
@@ -70,6 +70,40 @@ fn only_simulated_regions_run_and_a_missing_region_resource_skips_one() {
     assert_eq!(world.region(FROZEN).unwrap().mode, RegionMode::Simulated);
 }
 
+/// A kernel that reads a region resource.
+#[system(name = "test::weathered", worlds = [server])]
+fn weathered(weather: RegionRes<Weather>, counter: lactose_ecs::Mut<Counter>) {
+    counter.0 += u64::from(weather.0);
+}
+
+#[test]
+fn a_kernel_runs_only_in_simulated_regions_that_hold_its_region_resources() {
+    let executor = executor();
+    let mut world = world(WorldKind::Server, LayoutConfig::default());
+    let config = |id, mode| RegionConfig { id, seed: id.0 * 3, mode };
+    world.create_region(config(OTHER_REGION, RegionMode::Simulated)).unwrap();
+    world.create_region(config(FROZEN, RegionMode::Frozen)).unwrap();
+    world.insert_region_resource(REGION, Weather(2)).unwrap();
+    world.insert_region_resource(FROZEN, Weather(3)).unwrap();
+    world.spawn(net(1), REGION, (Counter(0),)).unwrap();
+    world.spawn(net(2), OTHER_REGION, (Counter(0),)).unwrap();
+    world.spawn(net(3), FROZEN, (Counter(0),)).unwrap();
+    let mut builder = Schedule::builder(WorldKind::Server);
+    builder.stage("weather", &[]).add(&WEATHERED);
+    let mut schedule = builder.build().unwrap();
+
+    world = tick(&mut schedule, world, &executor);
+    assert_eq!(world.get::<Counter>(net(1)), Some(&Counter(2)));
+    assert_eq!(world.get::<Counter>(net(2)), Some(&Counter(0)), "no weather: not run");
+    assert_eq!(world.get::<Counter>(net(3)), Some(&Counter(0)), "frozen: not run");
+
+    world.insert_region_resource(OTHER_REGION, Weather(5)).unwrap();
+    world = tick(&mut schedule, world, &executor);
+    assert_eq!(world.get::<Counter>(net(1)), Some(&Counter(4)));
+    assert_eq!(world.get::<Counter>(net(2)), Some(&Counter(5)), "runs once it holds one");
+    assert_eq!(world.get::<Counter>(net(3)), Some(&Counter(0)));
+}
+
 #[test]
 fn region_mode_is_the_mode_region_reports() {
     let mut world = world(WorldKind::Server, LayoutConfig::default());
@@ -131,4 +165,29 @@ fn region_resources_are_validated_and_hold_origin_keys() {
     assert_eq!(world.region_resource::<Boss>(REGION).unwrap().target, stored);
     let error = world.update_region_resource::<Boss>(RegionId(77), |_| {}).unwrap_err();
     assert_eq!(error.kind(), lactose_core::ErrorKind::NotFound);
+}
+
+/// A region's entity count is its rows in every archetype, after spawns, a move and a
+/// despawn, under every layout.
+#[test]
+fn a_regions_entity_count_covers_every_archetype() {
+    for layout in [LayoutConfig::default()].into_iter().chain(layouts()) {
+        let mut world = world(WorldKind::Server, layout);
+        world
+            .create_region(RegionConfig { id: OTHER_REGION, seed: 2, mode: RegionMode::Simulated })
+            .unwrap();
+        for id in 1..=30 {
+            let region = if id % 3 == 0 { OTHER_REGION } else { REGION };
+            match id % 4 {
+                0 => world.spawn(net(id), region, (pos(0, 0),)).unwrap(),
+                1 => world.spawn(net(id), region, (pos(0, 0), Counter(id))).unwrap(),
+                _ => world.spawn(net(id), region, (Counter(id),)).unwrap(),
+            }
+        }
+        let count = |world: &lactose_ecs::World, region| world.region(region).unwrap().entity_count;
+        assert_eq!((count(&world, REGION), count(&world, OTHER_REGION)), (20, 10), "{layout:?}");
+        world.move_to_region(net(1), OTHER_REGION).unwrap();
+        world.despawn(net(3)).unwrap();
+        assert_eq!((count(&world, REGION), count(&world, OTHER_REGION)), (19, 10), "{layout:?}");
+    }
 }

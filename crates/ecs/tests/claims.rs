@@ -1,8 +1,8 @@
 //! The claim index behind `World::claimed`: every path that gives a row `ClaimedBy` or
 //! takes it away keeps the index current (spawn, insert, remove, despawn, ownership
 //! despawn, commands, predicted spawns, a region unload, a snapshot and restore), the
-//! keys come out in ascending origin-key order, and the result is the same under every
-//! layout.
+//! keys come out in ascending origin-key order, a spawn inherits the claim of the row that
+//! spawned it, and the result is the same under every layout.
 
 #![forbid(unsafe_code)]
 
@@ -137,4 +137,71 @@ fn an_unload_releases_and_a_restore_puts_the_index_back() {
     assert_eq!(claimed(&world, PLAYER), [a, b], "the snapshot carries the index");
     assert_eq!(claimed(&world, OTHER), []);
     assert_eq!(world.get::<ClaimedBy>(b).map(|claim| claim.player), Some(PLAYER));
+}
+
+/// Both players' input ticks, so a claimed row's spawn is predicted.
+#[system(name = "test::both_inputs", worlds = [server, prediction], exclusive)]
+fn both_inputs(world: &mut World) {
+    let tick = world.tick();
+    world.set_input_tick(PLAYER, tick);
+    world.set_input_tick(OTHER, tick);
+}
+
+/// The row whose counter is 1 spawns; the others command nothing, so an invocation that
+/// runs before it leaves its output for reuse.
+#[system(name = "test::spawn_from_one", worlds = [server, prediction])]
+fn spawn_from_one(cmd: Commands, counter: &Counter) {
+    if counter.0 == 1 {
+        cmd.spawn((pos(0, 0), Counter(99)));
+    }
+}
+
+/// The spawns of one tick over `rows` (id, claim, counter): each spawn's predicting player,
+/// if its key is predicted, and the claim it inherited.
+fn spawns(
+    layout: LayoutConfig,
+    rows: &[(u64, Option<PlayerId>, u64)],
+) -> Vec<(Option<PlayerId>, Option<PlayerId>)> {
+    let executor = executor();
+    let mut world = world(WorldKind::Server, layout);
+    for &(id, claim, counter) in rows {
+        match claim {
+            Some(player) => world
+                .spawn(net(id), REGION, (pos(0, 0), Counter(counter), ClaimedBy { player }))
+                .unwrap(),
+            None => world.spawn(net(id), REGION, (pos(0, 0), Counter(counter))).unwrap(),
+        }
+    }
+    let mut builder = Schedule::builder(WorldKind::Server);
+    builder.stage("input", &[]).add(&BOTH_INPUTS);
+    builder.stage("spawn", &[]).add(&SPAWN_FROM_ONE);
+    let mut schedule = builder.build().unwrap();
+    world = tick(&mut schedule, world, &executor);
+    let mut spawned = Vec::new();
+    world.query::<(&Counter, Option<&ClaimedBy>)>().for_each(|key, (counter, claim)| {
+        if counter.0 == 99 {
+            let predicted = match key {
+                StableKey::Predicted(key) => Some(key.player),
+                _ => None,
+            };
+            spawned.push((predicted, claim.map(|claim| claim.player)));
+        }
+    });
+    spawned
+}
+
+#[test]
+fn a_spawn_inherits_its_own_rows_claim_after_another_claimed_row() {
+    for layout in [LayoutConfig::default()].into_iter().chain(layouts()) {
+        let rows = [(1, Some(PLAYER), 0), (2, Some(OTHER), 1)];
+        assert_eq!(spawns(layout, &rows), [(Some(OTHER), Some(OTHER))], "{layout:?}");
+    }
+}
+
+#[test]
+fn a_spawn_from_an_unclaimed_row_after_a_claimed_row_inherits_no_claim() {
+    for layout in [LayoutConfig::default()].into_iter().chain(layouts()) {
+        let rows = [(1, Some(PLAYER), 0), (2, None, 1)];
+        assert_eq!(spawns(layout, &rows), [(None, None)], "{layout:?}");
+    }
 }

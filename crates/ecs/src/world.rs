@@ -686,9 +686,9 @@ impl World {
         if self.get_erased(origin, component.key()) == Some(component.bytes()) {
             return Ok(false);
         }
-        let info = self.checked_write(origin, &component)?;
+        let info = self.checked_write(origin, component.info, component.bytes())?;
         let stamp = self.bump();
-        self.store_component(origin, info, component, stamp)?;
+        self.store_component(origin, info, component.bytes(), stamp)?;
         Ok(true)
     }
 
@@ -742,11 +742,19 @@ impl World {
     pub fn insert<T: Component>(&mut self, key: StableKey, value: T) -> Result<()> {
         assert!(!is_worlds_own(T::KEY), "`{}` is written by the world only", T::SCHEMA.name());
         let origin = self.origin(key).ok_or_else(|| not_found("no such entity"))?;
-        let mut component = ErasedComponent::of(value);
-        self.resolve_references(&mut component, None, None);
-        let info = self.checked_write(origin, &component)?;
+        if has_entity_ref(T::SCHEMA.info()) {
+            // A reference is rewritten to its origin key in a value in transit.
+            let mut component = ErasedComponent::of(value);
+            self.resolve_references(&mut component, None, None);
+            let info = self.checked_write(origin, component.info, component.bytes())?;
+            let stamp = self.bump();
+            return self.store_component(origin, info, component.bytes(), stamp);
+        }
+        // Nothing to rewrite: the value's own bytes are stored, and nothing allocates.
+        let bytes = bytemuck::bytes_of(&value);
+        let info = self.checked_write(origin, T::SCHEMA.info(), bytes)?;
         let stamp = self.bump();
-        self.store_component(origin, info, component, stamp)
+        self.store_component(origin, info, bytes, stamp)
     }
 
     /// Removes component `T` from `key`, immediately, returning it; `None` if absent.
@@ -1007,8 +1015,16 @@ impl World {
     #[must_use]
     pub fn region(&self, region: RegionId) -> Option<RegionInfo> {
         let state = self.regions.get(&region)?;
-        let entity_count =
-            self.storage.entities.values().filter(|&&loc| self.region_at(loc) == region).count();
+        // A pass over every chunk's region column, in storage order.
+        let mut entity_count = 0;
+        for archetype in &self.storage.archetypes {
+            let index = archetype.column_index(InRegion::KEY).expect("every row has a region");
+            let column = &archetype.columns[index];
+            for chunk in &archetype.chunks {
+                let regions = typed_slice::<InRegion>(chunk.column(column), chunk.len());
+                entity_count += regions.iter().filter(|row| row.region == region).count();
+            }
+        }
         Some(RegionInfo {
             id: region,
             seed: state.seed,
@@ -1892,65 +1908,67 @@ impl World {
         component: ErasedComponent,
         stamp: Stamp,
     ) -> Result<()> {
-        let info = self.checked_write(key, &component)?;
-        self.store_component(key, info, component, stamp)
+        let info = self.checked_write(key, component.info, component.bytes())?;
+        self.store_component(key, info, component.bytes(), stamp)
     }
 
-    /// The registry's description of `component` to write to `key`: what
+    /// The registry's description of a value of `info` to write to `key`: what
     /// [`checked_info`](Self::checked_info) checks, and the ownership rule. Called before
     /// the stamp is taken, so a refusal changes nothing, not even the point.
     fn checked_write(
         &self,
         key: StableKey,
-        component: &ErasedComponent,
+        info: &'static TypeInfo,
+        bytes: &[u8],
     ) -> Result<&'static TypeInfo> {
-        let info = self.checked_info(component)?;
-        self.check_owner(key, component.key(), component.bytes())?;
+        let info = self.checked_info(info, bytes)?;
+        self.check_owner(key, info.key(), bytes)?;
         Ok(info)
     }
 
-    /// Stores a component [`checked_write`](Self::checked_write) accepted.
+    /// Stores the bytes of a component [`checked_write`](Self::checked_write) accepted.
     fn store_component(
         &mut self,
         key: StableKey,
         info: &'static TypeInfo,
-        component: ErasedComponent,
+        bytes: &[u8],
         stamp: Stamp,
     ) -> Result<()> {
         let loc = self.storage.loc(key).ok_or_else(|| not_found("no such entity"))?;
+        // Only a reference or a claim is indexed; any other overwrite is a copy in place.
+        let indexed = info.key() == ClaimedBy::KEY || has_entity_ref(info);
         if let Some(old) = self.storage.component(loc, info.key()) {
-            let old = old.to_vec();
-            self.index_references(key, info, &old, false);
-            self.index_claim(key, info, &old, false);
-            self.storage.write(loc, info.key(), component.bytes(), stamp);
+            if indexed {
+                let old = old.to_vec();
+                self.index_references(key, info, &old, false);
+                self.index_claim(key, info, &old, false);
+            }
+            self.storage.write(loc, info.key(), bytes, stamp);
         } else {
             let (_, mut values) = self.storage.take(key).expect("the entity is live");
-            values.push(RowValue {
-                info,
-                bytes: component.bytes().to_vec(),
-                stamp,
-                column_tick: stamp,
-            });
+            values.push(RowValue { info, bytes: bytes.to_vec(), stamp, column_tick: stamp });
             values.sort_by_key(|value| value.info.key());
             let infos: Vec<&'static TypeInfo> = values.iter().map(|value| value.info).collect();
             let archetype = self.storage.archetype(&infos);
             self.storage.push(archetype, key, &values);
             self.log.push(self.tick, StructuralChange::Added { key, component: info.key() });
         }
-        self.index_references(key, info, component.bytes(), true);
-        self.index_claim(key, info, component.bytes(), true);
+        if indexed {
+            self.index_references(key, info, bytes, true);
+            self.index_claim(key, info, bytes, true);
+        }
         Ok(())
     }
 
-    /// The registry's description of `component`, whose bytes it validates: `NotFound` if it
-    /// is not registered, `InvalidData` if the bytes are not a valid value.
-    fn checked_info(&self, component: &ErasedComponent) -> Result<&'static TypeInfo> {
-        let info = self
+    /// The registry's description of a value of `info`, whose bytes it validates:
+    /// `NotFound` if it is not registered, `InvalidData` if the bytes are not a valid value.
+    fn checked_info(&self, info: &'static TypeInfo, bytes: &[u8]) -> Result<&'static TypeInfo> {
+        let registered = self
             .registry
-            .get(component.key())
-            .ok_or_else(|| not_found(format!("`{}` is not registered", component.info.name())))?;
-        info.validate(component.bytes())?;
-        Ok(info)
+            .get(info.key())
+            .ok_or_else(|| not_found(format!("`{}` is not registered", info.name())))?;
+        registered.validate(bytes)?;
+        Ok(registered)
     }
 
     /// Removes a component of the live entity `key`, returning its bytes if it had it.
