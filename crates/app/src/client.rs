@@ -1,6 +1,7 @@
 //! The client's prediction world and the timer root's frame around it (architecture
 //! sections 9.2, 9.4 and 11; `crates/predict/README.md`, "The loop `app` writes").
 
+use std::collections::BTreeSet;
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
@@ -8,8 +9,8 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
-use lactose_core::{Error, Result, StableKey, Tick};
-use lactose_ecs::{PresentEventBatch, WorldKind};
+use lactose_core::{Error, ErrorKind, Result, StableKey, Tick};
+use lactose_ecs::{PresentEventBatch, RegionMode, WorldKind};
 use lactose_input::{PlayerInput, SampleHistory};
 use lactose_net_api::{RegionChange, RegionRelevance, StagedFrame, StagedInbox};
 use lactose_net_host::ClockEstimate;
@@ -18,7 +19,7 @@ use lactose_predict::{
     DEFAULT_DEPTH, LocalPlayer, PredictError, Predictor, Reconciled, ResyncReason,
     check_prediction_reads,
 };
-use lactose_sim::{RegionBundle, TickInput, TimeScale};
+use lactose_sim::{RegionBundle, RegionControl, TickInput, TimeScale};
 use lactose_task::{Executor, TickPacer};
 use tracing::debug;
 
@@ -27,12 +28,14 @@ use crate::game::Game;
 use crate::policy::{ErrorPolicy, LOG_TARGET, Source, run_source};
 use crate::runtime::{CATCH_UP_CAP, SolverExit, TICK_PERIOD};
 use crate::save::Cooked;
+use crate::server::{LifecycleFailures, log_failures};
 use crate::world::WorldConfig;
 
 /// A client's prediction world between runs: the predictor, its pacer, the lead it runs
 /// ahead of the server by, the last clock estimate and the ticks the pacer granted since,
-/// whether a clock resync is pending, the newest frame tick whose fold failed, the local
-/// player's recent samples and the cooked content the fold builds bundles from. Built by
+/// whether a clock resync is pending, the newest frame tick whose fold failed, the tick the
+/// last frame's steps started from, the local player's recent samples and the cooked
+/// content the fold builds bundles from. Built by
 /// [`build_client`] on join; stepped by value from the timer root through
 /// [`frame`](Self::frame); ended by [`shutdown`](Self::shutdown) with the session. The
 /// replicated world (`WorldKind::Client`) is not here yet: its hook is `lactose-net`'s,
@@ -54,6 +57,10 @@ struct Core {
     /// The newest staged frame tick whose fold `Cooked` failed: no content resync is made
     /// again for a frame at or before it.
     content_failed: Option<Tick>,
+    /// The world's tick before the last frame's steps: a refusal the lifecycle stamped at
+    /// or before it is a rollback's re-application of a bundle refused when its tick first
+    /// ran, and was taken then.
+    stepped_from: Tick,
     history: SampleHistory,
     cooked: Arc<dyn Cooked>,
     solver: SolverExit,
@@ -68,7 +75,9 @@ struct Estimate {
 }
 
 /// Builds the prediction world on join, from the same `game` and `config` as a server:
-/// `WorldKind::Prediction` at `Tick(accepted.tick.0 + lead)`, with every registration and
+/// `WorldKind::Prediction` at `Tick(accepted.tick.0 + lead)`, under `config.regions`, which
+/// must be `RegionControl::Directed`, since the fold decides what the world loads and in
+/// which mode (`Simulated`: the world predicts what it holds), with every registration and
 /// setup the server gets plus `lactose_predict::register_types` and the build check
 /// `lactose_predict::check_prediction_reads`, then
 /// `Predictor::new(simulation, LocalPlayer { player: accepted.player, entity }, DEFAULT_DEPTH)`,
@@ -76,8 +85,9 @@ struct Estimate {
 /// player's own entity as the server named it: a parameter until `JoinAccepted::entity`
 /// lands (proposed with D122), then read from `accepted`, a signature change to list.
 /// `lead` is the ticks the world runs ahead of the server by: the spike's choice at
-/// milestone 1, the clock estimate's `lead_ticks` rounded up at milestone 4. Fails as the
-/// builder, the check and `Predictor::new` fail, and as the solver pool fails.
+/// milestone 1, the clock estimate's `lead_ticks` rounded up at milestone 4. Fails with
+/// `InvalidData`, before anything is built, when `config.regions` is `Anchored`; as the
+/// builder, the check and `Predictor::new` fail; and as the solver pool fails.
 pub fn build_client(
     executor: &Executor,
     game: &Game,
@@ -87,6 +97,14 @@ pub fn build_client(
     lead: u32,
     cooked: Arc<dyn Cooked>,
 ) -> Result<Client> {
+    // Under `Anchored` the lifecycle would load every region `Frozen` and decide what the
+    // world holds itself, against the frames the server sends.
+    if !matches!(config.regions, RegionControl::Directed) {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            "a prediction world's regions are `Directed`: the fold loads what the frames name",
+        ));
+    }
     let types = game.types()?;
     let (builder, solver) = assemble::world(executor, game, &config, WorldKind::Prediction, types)?;
     let simulation = builder
@@ -95,6 +113,7 @@ pub fn build_client(
         .build()?;
     let local = LocalPlayer { player: accepted.player, entity };
     let predictor = Predictor::new(simulation, local, DEFAULT_DEPTH)?;
+    let stepped_from = predictor.tick();
     let core = Core {
         pacer: TickPacer::new(Instant::now(), TICK_PERIOD, CATCH_UP_CAP),
         paused: false,
@@ -102,6 +121,7 @@ pub fn build_client(
         estimate: None,
         pending_resync: false,
         content_failed: None,
+        stepped_from,
         history: SampleHistory::new(),
         cooked,
         solver,
@@ -194,13 +214,13 @@ impl Client {
     }
 
     /// One frame of the timer root's client half, by value, in this order and nothing
-    /// else. The clock target of a resync with a hint `h` (`Behind`'s `server`, or
-    /// `TooOld`'s `frame`) is the last estimate's `server_tick` advanced by the ticks this
-    /// client's pacer granted since the estimate was taken (the sum of every poll's budget,
-    /// which the replicated scale and the rate already shape, so the target does not
-    /// overshoot the server by a pause's length or the ticks slow motion did not run, as
-    /// wall time would), or `h` if that is later or there is no estimate,
-    /// plus the lead; with neither an estimate nor a hint, the world's own tick.
+    /// else. The clock target of a resync with a hint `h` (step 8's) is the last estimate's
+    /// `server_tick` advanced by the ticks this client's pacer granted since the estimate
+    /// was taken (the sum of every poll's budget, which the replicated scale and the rate
+    /// already shape, so the target does not overshoot the server by a pause's length or
+    /// the ticks slow motion did not run, as wall time would), or `h` if that is later or
+    /// there is no estimate, plus the lead; with neither an estimate nor a hint, the
+    /// world's own tick.
     ///
     /// 1. A pending clock resync (a `snap`, or the kept failure of the previous frame):
     ///    `pacer.resync(now)`, then `Predictor::resync` to the clock target with no hint.
@@ -212,16 +232,18 @@ impl Client {
     ///    `loaded` and `assets` entry and inserts `unloaded`; `Relevant` inserts `loaded`
     ///    through `RegionRelevance::to_bundle(baseline, None, table)` with `baseline` from
     ///    `Cooked::baseline` and `table` the message's table through `Cooked::pin`, or
-    ///    `None`; `Assets` inserts the table pinned; a `full` frame first clears what
-    ///    earlier due frames folded and puts every region of `World::regions` in
-    ///    `unloaded`). A region whose baseline or pin `Cooked` cannot give is left out of
-    ///    the fold. The client remembers the newest frame tick whose fold failed, and
-    ///    resyncs once per failing frame tick: when the newest failing due frame is newer
-    ///    than the remembered tick, the failure is logged (`Source::Cooked`, `Resync`), its
-    ///    tick remembered, and unless step 1 resynced, the world is resynced at its own
-    ///    tick with the pacer untouched: a content resync, reported so the full frame that
-    ///    follows retries the region. A failing frame folded again (one that stays queued
-    ///    through a pause) is left out again and resyncs nothing.
+    ///    `None`, its `mode` set to `Simulated`, since the prediction world runs its
+    ///    kernels and steps its bodies there and only there; `Assets` inserts the table
+    ///    pinned; a `full` frame first clears what earlier due frames folded and puts
+    ///    every region of `World::regions` in `unloaded`). A region whose baseline or pin
+    ///    `Cooked` cannot give is left out of the fold. The client remembers the newest
+    ///    frame tick whose fold failed, and resyncs once per failing frame tick: when the
+    ///    newest failing due frame is newer than the remembered tick, the failure is logged
+    ///    (`Source::Cooked`, `Resync`), its tick remembered, and unless step 1 resynced,
+    ///    the world is resynced at its own tick with the pacer untouched: a content
+    ///    resync, reported so the full frame that follows retries the region. A failing
+    ///    frame folded again (one that stays queued through a pause) is left out again and
+    ///    resyncs nothing.
     /// 3. `pacer.poll(now)`, preceded by `pacer.resync(now)` while the pacer is paced at
     ///    zero, its budget's ticks added to the estimate's granted count.
     /// 4. One `Predictor::step` per due tick, with the fold's input in the first and an
@@ -229,16 +251,26 @@ impl Client {
     ///    holds one (a tick predicted before a backward resync is predicted again with the
     ///    sample the server was sent), else `sample(next)`, inserted; `sample` runs on the
     ///    task that drives the frame and must not block.
-    /// 5. `Predictor::reconcile`, its wall time measured around the await.
+    /// 5. `Predictor::reconcile`, its wall time measured around the await; then the
+    ///    prediction world's lifecycle failures taken (`take_load_failures`,
+    ///    `take_session_failures`, `take_asset_failures`) and logged at `warn` as the server's are, but for a
+    ///    refusal a rollback's re-simulation repeated: one stamped at or before the tick
+    ///    step 4 started from, or a second with the tick and region of one this frame's
+    ///    steps made.
     /// 6. `Predictor::passes`.
     /// 7. `take_present_events`.
     /// 8. If `Reconciled::resync` is `Some`: `pacer.resync(now)`, then `Predictor::resync`
-    ///    to the clock target, with `Behind`'s `server` or `TooOld`'s `frame` as the hint.
+    ///    to the clock target, with the hint the newest tick the inbox accepted
+    ///    (`StagedInbox::accepted_tick`), or `Behind`'s `server` or `TooOld`'s `frame` if
+    ///    later, so one resync lands at or beyond every frame the inbox holds. Otherwise,
+    ///    if step 5 took a refused bundle and no step resynced this frame, the world is
+    ///    resynced at its own tick with the pacer untouched: a content resync, as step 2's.
     /// 9. If the budget was `behind`: `pacer.resync(now)`.
     ///
     /// Resolves with the client and a [`ClientOutput`], or with [`ClientError`]: the client
-    /// kept when the predictor came back, with a clock resync marked for the next frame's
-    /// step 1 (the policy's response is `Resync`); gone after `Cancelled`.
+    /// kept when the predictor came back, with the lifecycle's failures taken as in step 5
+    /// and a clock resync marked for the next frame's step 1 (the policy's response is
+    /// `Resync`); gone after `Cancelled`.
     pub fn frame<'a>(
         self,
         executor: &'a Executor,
@@ -311,6 +343,7 @@ impl Client {
         }
 
         // 4. The steps.
+        core.stepped_from = predictor.tick();
         let local = predictor.local().player;
         let mut folded = Some(input.frame);
         for _ in 0..budget.ticks {
@@ -333,11 +366,12 @@ impl Client {
 
         // 5. The reconciliation, timed.
         let started = Instant::now();
-        let (predictor, reconciled) = match predictor.reconcile(executor).await {
+        let (mut predictor, reconciled) = match predictor.reconcile(executor).await {
             Ok(done) => done,
             Err(failure) => return Err(core.failed(failure)),
         };
         let rollback = if reconciled.resimulated == 0 { Duration::ZERO } else { started.elapsed() };
+        let refused = core.refusals(&mut predictor);
 
         // 6. The passes.
         let mut predictor = match predictor.passes(executor).await {
@@ -348,18 +382,33 @@ impl Client {
         // 7. The presentation events.
         let events = predictor.simulation_mut().world_mut().take_present_events();
 
-        // 8. A resync the reconciliation asked for.
+        // 8. A resync the reconciliation asked for, or the content resync a refused bundle
+        // asks for.
         if let Some(reason) = reconciled.resync {
             core.pacer.resync(now);
             let hint = match reason {
                 ResyncReason::Behind { server, .. } => server,
                 ResyncReason::TooOld { frame, .. } => frame,
             };
+            // The newest frame the inbox accepted, not the reason's: landing before a
+            // frame already queued would resync again at the next frame.
+            let accepted = predictor
+                .simulation()
+                .world()
+                .service::<StagedInbox>()
+                .and_then(StagedInbox::accepted_tick);
+            let hint = accepted.map_or(hint, |accepted| Tick(accepted.0.max(hint.0)));
             let target = core.target(Some(hint), predictor.tick());
             if let Err(error) = predictor.resync(target) {
                 return Err(core.kept(error, predictor));
             }
             resync = Some(target);
+        } else if refused && resync.is_none() {
+            let own = predictor.tick();
+            if let Err(error) = predictor.resync(own) {
+                return Err(core.kept(error, predictor));
+            }
+            resync = Some(own);
         }
 
         // 9. A frame behind.
@@ -461,15 +510,42 @@ impl Core {
         Fold { frame, failed }
     }
 
-    /// A `Relevant` region's bundle over the cooked baseline and its table pinned.
+    /// A `Relevant` region's bundle over the cooked baseline and its table pinned, loaded
+    /// `Simulated`: `to_bundle` gives the replicated world's mode, and the prediction world
+    /// runs its kernels and steps its bodies only in a `Simulated` region.
     fn relevant(&self, relevance: &RegionRelevance) -> Result<RegionBundle> {
         let baseline = self.cooked.baseline(relevance.baseline_hash)?;
         let table = relevance.assets.as_ref().map(|table| self.cooked.pin(table)).transpose()?;
-        relevance.to_bundle(baseline, None, table)
+        let mut bundle = relevance.to_bundle(baseline, None, table)?;
+        bundle.mode = RegionMode::Simulated;
+        Ok(bundle)
     }
 
-    /// A kept failure: the client back with a clock resync marked, after the policy saw it.
-    fn kept(mut self, error: Error, predictor: Predictor) -> Box<ClientError> {
+    /// Takes the prediction world's lifecycle failures and logs them at `warn` as the
+    /// server's are, every asset failure and every refused bundle but a re-application;
+    /// returns whether a bundle was refused. A rollback's re-simulation passes the bundles
+    /// of the ticks it runs again and the sync point refuses them again: one at or before
+    /// `stepped_from` was taken when its tick first ran, in an earlier frame, and one that
+    /// repeats a refusal of this frame's steps has its tick and region.
+    fn refusals(&self, predictor: &mut Predictor) -> bool {
+        let lifecycle = predictor.simulation_mut().lifecycle_mut();
+        let mut loads = lifecycle.take_load_failures();
+        // Empty while the fold carries no session event; taken so nothing is left behind.
+        let sessions = lifecycle.take_session_failures();
+        let assets = lifecycle.take_asset_failures();
+        let mut first = BTreeSet::new();
+        loads.retain(|failure| {
+            failure.tick.0 > self.stepped_from.0 && first.insert((failure.tick.0, failure.region))
+        });
+        let refused = !loads.is_empty();
+        log_failures(&LifecycleFailures { loads, sessions, assets });
+        refused
+    }
+
+    /// A kept failure: the client back with a clock resync marked, after the policy saw it,
+    /// and the lifecycle's failures taken, since the run may have stepped.
+    fn kept(mut self, error: Error, mut predictor: Predictor) -> Box<ClientError> {
+        self.refusals(&mut predictor);
         self.policy.decide(Source::Prediction { kept: true }, &error);
         self.pending_resync = true;
         Box::new(ClientError { error, client: Some(Client { predictor, core: self }) })
@@ -511,8 +587,9 @@ pub struct ClientOutput {
     /// cost per tick the spike records (architecture section 22).
     pub rollback: Duration,
     /// `Some(tick)` if the world was resynced this frame, by step 1, 2 or 8 of
-    /// [`Client::frame`], and now stands at `tick`: the caller requests a full frame from
-    /// the server (`ResyncRequest`; reason `BehindCatchUp` at milestone 1, since the
+    /// [`Client::frame`] (a clock resync, a fold that failed, a reconciliation behind or too
+    /// old, or a refused bundle), and now stands at `tick`: the caller requests a full frame
+    /// from the server (`ResyncRequest`; reason `BehindCatchUp` at milestone 1, since the
     /// output does not say which step it was, "Not in this crate yet").
     pub resync: Option<Tick>,
     /// The presentation events delivered this frame and the cancellations, taken after the

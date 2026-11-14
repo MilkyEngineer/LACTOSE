@@ -184,6 +184,13 @@ impl Physics {
         let input = StepInput { tick: *tick, dt, gravity: config.gravity, commands };
         let backend = &mut **backend;
         job.context().block_in_place(config.reserved_workers, || backend.step(&input, output));
+        // The step ran the backend's code on this worker and waited on the solver pool:
+        // the boundary jobs that follow here need the state every worker starts in
+        // (architecture section 5.1).
+        debug_assert!(
+            lactose_core::thread_class::fp::is_deterministic(),
+            "the physics step left the floating-point control state changed"
+        );
         commands.clear();
         // The emission order is a function of the step's result alone: ascending by
         // (target, other, phase), whatever order the backend reported in. Ties, which only

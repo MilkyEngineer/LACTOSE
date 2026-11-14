@@ -803,7 +803,7 @@ fn no_baseline(region: RegionId) -> Error {
 }
 
 /// Every refusal of a step at `warn`, with the region or player and the kind.
-fn log_failures(failures: &LifecycleFailures) {
+pub(crate) fn log_failures(failures: &LifecycleFailures) {
     for failure in &failures.loads {
         warn!(
             target: LOG_TARGET,

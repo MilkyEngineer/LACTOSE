@@ -6,15 +6,24 @@ use std::num::NonZeroU64;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use lactose_app::{Client, ClientOutput, Cooked, Start, WorldConfig, build_client};
-use lactose_core::{NetId, PlayerId, Result, StableKey, Tick};
-use lactose_ecs::{Executor, RegionId, World};
+use lactose_bundle::ComponentData;
+use lactose_core::{ErrorKind, NetId, PlayerId, Result, StableKey, Tick};
+use lactose_ecs::{Executor, RegionId, RegionMode, World};
 use lactose_input::{PlayerInput, Yaw};
-use lactose_net_api::{OverlayPayload, RegionChange, RegionRelevance, StagedFrame, StagedInbox};
+use lactose_math::{Scalar, Vec3};
+use lactose_net_api::{
+    OverlayPayload, RegionChange, RegionRelevance, StagedFrame, StagedInbox, StagedSpawn,
+};
 use lactose_net_host::ClockEstimate;
 use lactose_net_host::message::JoinAccepted;
-use lactose_sim::{StagedState, TimeScale};
+use lactose_physics_api::{Collider, RigidBody, Shape, Transform, Velocity};
+use lactose_reflect::{Reflect, TypeRole};
+use lactose_sim::{SessionEvent, StagedState, TickInput, TimeScale};
 
-use crate::common::{Clock, Content, GAME, capture, executor, logged, server, step, table_of};
+use crate::common::{
+    Clock, Content, Counter, GAME, anchored, capture, executor, load, logged, server, step,
+    table_of,
+};
 
 const LEAD: u32 = 2;
 
@@ -471,6 +480,346 @@ fn a_frame_older_than_the_ring_targets_its_tick_plus_the_lead_when_that_is_later
     push(&mut client, StagedFrame::new(old));
     let (client, out) = frame(&executor, client, clock, 11, &mut sampled);
     assert_eq!(out.resync, Some(Tick(old.0 + LONG)), "the frame's tick plus the lead");
+    client.shutdown();
+    executor.shutdown();
+}
+
+#[test]
+fn a_prediction_world_under_anchored_regions_is_refused() {
+    let executor = executor(2);
+    let content = Content::new();
+    let accepted = JoinAccepted { player: PlayerId(1), tick: Tick(0) };
+    let entity = StableKey::Net(NetId::runtime(NonZeroU64::MIN).expect("a runtime id"));
+    let cooked = Arc::clone(&content) as Arc<dyn Cooked>;
+    let error = build_client(&executor, &GAME, anchored([100]), accepted, entity, LEAD, cooked)
+        .err()
+        .expect("an anchored prediction world is refused");
+    assert_eq!(error.kind(), ErrorKind::InvalidData);
+    // The builder of `lactose-sim` refuses it too, but only after the solver pool started.
+    assert!(error.to_string().contains("`Directed`"), "refused before the build: {error}");
+    executor.shutdown();
+}
+
+// ---- The fold's mode: a server and a client in one process ----
+
+const PLAYER: PlayerId = PlayerId(1);
+const REGION: RegionId = RegionId(1);
+
+/// Every replicated component `key` has in `world`, in ascending key order: what a packer
+/// sends of a claimed entity.
+fn replicated(world: &World, key: StableKey) -> Vec<ComponentData> {
+    let mut components: Vec<ComponentData> = world
+        .registry()
+        .iter()
+        .filter(|info| info.role() == TypeRole::Component && info.tracking().replicated)
+        .filter_map(|info| {
+            let bytes = world.get_erased(key, info.key())?;
+            Some(ComponentData { component: info.key(), bytes: bytes.to_vec() })
+        })
+        .collect();
+    components.sort_by_key(|data| data.component);
+    components
+}
+
+/// What the joined player's entity carries besides the session applier's counter.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Body {
+    None,
+    /// A dynamic sphere two metres above a fixed slab whose top is at half a metre.
+    Landing,
+}
+
+/// What [`joined`] measured once its frames ran.
+struct Joined {
+    mode: Option<RegionMode>,
+    /// The tick the full frame was folded at: the join's rows, `lead` ticks stale.
+    fold: u32,
+    /// Every correction: the tick of the frame that made it, and the tick it restored.
+    corrected: Vec<(u32, u32)>,
+    resyncs: u32,
+    /// The server's tick, its counter and its body's height.
+    server: (u32, u32, Option<Scalar>),
+    /// The same of the client.
+    client: (u32, u32, Option<Scalar>),
+}
+
+/// A server that loads region 1 and joins the player, and a client that folds the join's
+/// full frame (the region's relevance message and the player's entity, claimed) and then
+/// runs `frames` frames, each after one server step and the claimed entity's exact rows at
+/// that step, as a packer sends them. The server is given the samples the client predicted
+/// with, so a prediction that runs the kernels and the physics as the server does is
+/// corrected once, by the first frame of the fold's tick (the full frame carries the rows
+/// of the join, which the fold places `lead` ticks later), and never after it.
+fn joined(body: Body, frames: u32) -> Joined {
+    let executor = executor(2);
+    let content = Content::new();
+    let server = server(&executor, WorldConfig::headless(), Start::Fresh, &content);
+    let mut first = load(&content, [REGION.0]);
+    first.sessions.insert(PLAYER, SessionEvent::Join { region: REGION });
+    let (mut server, out) = step(&executor, server, first);
+    assert!(out.failures.is_empty(), "{out:?}");
+    let entity = lactose_input::player_entity(server.simulation().world(), PLAYER).expect("joined");
+    if body == Body::Landing {
+        let world = server.simulation_mut().world_mut();
+        let up = Transform::at(Vec3::new(Scalar::ZERO, Scalar::from_i32(2), Scalar::ZERO));
+        world.insert(entity, up).expect("transform");
+        world.insert(entity, RigidBody::dynamic()).expect("body");
+        world.insert(entity, Collider::new(Shape::sphere(Scalar::HALF))).expect("collider");
+        world.insert(entity, Velocity::ZERO).expect("velocity");
+        let floor = StableKey::Net(world.allocate_net_id().expect("an id"));
+        let slab =
+            Shape::cuboid(Vec3::new(Scalar::from_i32(10), Scalar::HALF, Scalar::from_i32(10)));
+        let fixed = (Transform::at(Vec3::ZERO), Collider::new(slab));
+        world.spawn(floor, REGION, fixed).expect("the floor");
+    }
+    let join = server.tick();
+
+    let mut full = StagedFrame::resync(join);
+    full.time_scale = Some(server.time_scale());
+    full.acked_input = Some(join);
+    let relevance = server.relevance(&executor, REGION).expect("relevance");
+    full.regions.insert(REGION, RegionChange::Relevant(relevance));
+    let StableKey::Net(net) = entity else { panic!("a server entity has a NetId") };
+    let components = replicated(server.simulation().world(), entity);
+    full.spawns.insert(net, StagedSpawn { origin: None, region: REGION, slot: None, components });
+
+    let accepted = JoinAccepted { player: PLAYER, tick: join };
+    let cooked = Arc::clone(&content) as Arc<dyn Cooked>;
+    let mut client =
+        build_client(&executor, &GAME, WorldConfig::headless(), accepted, entity, LEAD, cooked)
+            .expect("the client builds");
+    client.clock(estimate(join.0, true));
+    push(&mut client, full);
+    let clock = Clock::new();
+    let (client, out) = frame(&executor, client, clock, 0, &mut sampled);
+    assert_eq!(out.ticks, 0);
+    let (mut client, out) = frame(&executor, client, clock, 1, &mut sampled);
+    assert_eq!(out.ticks, 1);
+    let (mode, fold) = (world(&client).region_mode(REGION), client.tick().0);
+
+    let (mut corrected, mut resyncs) = (Vec::new(), 0);
+    for i in 1..=frames {
+        let next = Tick(server.tick().0 + 1);
+        let mut input = TickInput::default();
+        if next.0 > join.0 + LEAD {
+            input.inputs.insert(PLAYER, sampled(next).to_player_sample(next));
+        }
+        let (stepped, out) = step(&executor, server, input);
+        assert!(out.failures.is_empty(), "{out:?}");
+        server = stepped;
+
+        let mut delta = StagedFrame::new(server.tick());
+        delta.acked_input = Some(server.tick());
+        for data in replicated(server.simulation().world(), entity) {
+            assert!(delta.push_row(entity, data.component, delta.tick, true, &data.bytes));
+        }
+        push(&mut client, delta);
+        let out;
+        (client, out) = frame(&executor, client, clock, 1 + i, &mut sampled);
+        assert_eq!(out.ticks, 1);
+        let at = server.tick().0;
+        corrected.extend(out.reconciled.corrections.iter().map(|done| (at, done.tick.0)));
+        resyncs += u32::from(out.resync.is_some());
+    }
+    let of = |world: &World, tick: Tick| {
+        let counter = world.get::<Counter>(entity).map_or(u32::MAX, |counter| counter.0);
+        (tick.0, counter, world.get::<Transform>(entity).map(|at| at.translation.y))
+    };
+    let joined = Joined {
+        mode,
+        fold,
+        corrected,
+        resyncs,
+        server: of(server.simulation().world(), server.tick()),
+        client: of(world(&client), client.tick()),
+    };
+    client.shutdown();
+    server.shutdown();
+    executor.shutdown();
+    joined
+}
+
+#[test]
+fn a_folded_region_runs_the_prediction_kernels_and_the_frames_after_correct_nothing() {
+    let run = joined(Body::None, 60);
+    assert_eq!(run.mode, Some(RegionMode::Simulated), "the fold loads the region simulated");
+    let ((server_tick, server_count, _), (client_tick, client_count, _)) = (run.server, run.client);
+    assert!(client_tick > server_tick);
+    assert_eq!(
+        client_count,
+        server_count + (client_tick - server_tick),
+        "the kernel advanced the claimed counter through every predicted tick"
+    );
+    assert_eq!(run.corrected, [(run.fold, run.fold)], "the fold's lag alone is corrected");
+    assert_eq!(run.resyncs, 0);
+}
+
+#[test]
+fn a_predicted_body_lands_as_the_servers_does_and_the_frames_after_correct_nothing() {
+    let run = joined(Body::Landing, 240);
+    assert_eq!(run.mode, Some(RegionMode::Simulated));
+    let ((server_tick, server_count, server_y), (client_tick, client_count, client_y)) =
+        (run.server, run.client);
+    assert_eq!(client_count, server_count + (client_tick - server_tick));
+    let landed = server_y.expect("a transform");
+    assert!(landed < Scalar::from_i32(2), "the server's body fell");
+    assert!(client_y == Some(landed), "the prediction's body rests where the server's does");
+    assert_eq!(run.corrected, [(run.fold, run.fold)], "the fold's lag alone is corrected");
+    assert_eq!(run.resyncs, 0);
+}
+
+// ---- The resync hint: the newest frame accepted ----
+
+/// A client that receives one empty frame per period from the server's tick one on, then
+/// misses `stall` periods while their frames queue, then takes them all at once and runs on
+/// for twenty periods: one resync, to at or beyond the newest frame plus the lead, and the
+/// lead kept after it.
+fn stalled(stall: u32) {
+    let executor = executor(2);
+    let content = Content::new();
+    let clock = Clock::new();
+    let mut client = client(&executor, &content, clock);
+    for periods in 1..=10 {
+        push(&mut client, StagedFrame::new(Tick(periods)));
+        client = frame(&executor, client, clock, periods, &mut sampled).0;
+    }
+    assert_eq!(client.tick(), Tick(10 + LEAD));
+    let resyncs_before = client.predictor().stats().resyncs;
+
+    let newest = 10 + stall;
+    for tick in 11..=newest {
+        push(&mut client, StagedFrame::new(Tick(tick)));
+    }
+    let mut resyncs = Vec::new();
+    for periods in newest..newest + 20 {
+        if periods > newest {
+            push(&mut client, StagedFrame::new(Tick(periods)));
+        }
+        let out;
+        (client, out) = frame(&executor, client, clock, periods, &mut sampled);
+        if let Some(tick) = out.resync {
+            resyncs.push((periods, tick));
+            assert!(tick.0 >= newest + LEAD, "{tick:?} lands before a frame already queued");
+        }
+        assert!(client.tick().0 >= periods + LEAD, "the lead is kept at {periods}");
+    }
+    assert_eq!(resyncs.len(), 1, "{resyncs:?}");
+    assert_eq!(client.predictor().stats().resyncs - resyncs_before, 1);
+    client.shutdown();
+    executor.shutdown();
+}
+
+#[test]
+fn a_stall_of_twelve_frames_resyncs_once_beyond_the_newest() {
+    stalled(12);
+}
+
+#[test]
+fn a_stall_of_twenty_five_frames_resyncs_once_beyond_the_newest() {
+    stalled(25);
+}
+
+// ---- A bundle the prediction world refuses ----
+
+fn data<T: Reflect>(value: T) -> ComponentData {
+    ComponentData { component: T::KEY, bytes: lactose_reflect::bytemuck::bytes_of(&value).to_vec() }
+}
+
+/// A row of the local player's counter the prediction did not make, at `frame`'s tick.
+fn mismatch(client: &Client, frame: &mut StagedFrame, value: u32) {
+    let entity = client.predictor().local().entity;
+    let bytes = lactose_reflect::bytemuck::bytes_of(&Counter(value)).to_vec();
+    assert!(frame.push_row(entity, Counter::KEY, frame.tick, true, &bytes));
+}
+
+/// A client holding region 1 from a full frame, with the local player's claimed counter
+/// in it, eight frames on; and the region's relevance message.
+fn holding(executor: &Executor, content: &Arc<Content>, clock: Clock) -> (Client, RegionRelevance) {
+    let message = relevance(executor, content, &[1]).remove(0);
+    let mut client = client(executor, content, clock);
+    let StableKey::Net(net) = client.predictor().local().entity else { panic!("a NetId") };
+    let mut full = StagedFrame::resync(Tick(client.tick().0 + 1));
+    full.regions.insert(RegionId(1), RegionChange::Relevant(message.clone()));
+    let components = vec![data(Counter(0))];
+    full.spawns
+        .insert(net, StagedSpawn { origin: None, region: RegionId(1), slot: None, components });
+    push(&mut client, full);
+    for periods in 1..=8 {
+        client = frame(executor, client, clock, periods, &mut sampled).0;
+    }
+    assert_eq!(regions(&client), [1]);
+    (client, message)
+}
+
+const REFUSED: &str = "a region bundle was refused";
+
+/// A frame naming the loaded region `Relevant` again, older than the world, with a row the
+/// prediction did not make: the bundle is refused at the step, and the reconciliation's
+/// rollback re-applies the refused tick. One report and one content resync at the world's
+/// own tick; five later frames roll back five times and report nothing more.
+#[test]
+fn a_refused_bundle_is_reported_once_and_resyncs_the_content() {
+    let log = capture();
+    let executor = executor(2);
+    let content = Content::new();
+    let clock = Clock::new();
+    let (mut client, message) = holding(&executor, &content, clock);
+    let present = client.tick();
+
+    let mut again = StagedFrame::new(Tick(present.0 - 1));
+    again.regions.insert(RegionId(1), RegionChange::Relevant(message));
+    mismatch(&client, &mut again, 900);
+    push(&mut client, again);
+    let (mut client, out) = frame(&executor, client, clock, 9, &mut sampled);
+    assert_eq!(out.ticks, 1);
+    assert!(out.reconciled.resimulated > 1, "the rollback re-applied the refused tick");
+    assert_eq!(out.resync, Some(client.tick()), "a content resync at the world's own tick");
+    assert_eq!(logged(&log, tracing::Level::WARN, REFUSED), 1, "reported once");
+    let restart = client.tick();
+
+    for n in 0..5 {
+        let mut later = StagedFrame::new(Tick(restart.0 + n));
+        mismatch(&client, &mut later, 910 + 10 * n);
+        push(&mut client, later);
+        let out;
+        (client, out) = frame(&executor, client, clock, 10 + n, &mut sampled);
+        assert!(out.reconciled.resimulated > 0, "a rollback");
+        assert_eq!(out.resync, None);
+    }
+    assert_eq!(logged(&log, tracing::Level::WARN, REFUSED), 1, "and only once");
+    assert_eq!(regions(&client), [1]);
+    client.shutdown();
+    executor.shutdown();
+}
+
+/// A refused bundle in a frame step 2 already resynced, its fold having failed for another
+/// region: no second resync, and a later frame's rollback from the restart re-applies the
+/// refused tick without a second report.
+#[test]
+fn a_refusal_a_later_rollback_re_applies_is_not_reported_again() {
+    let log = capture();
+    let executor = executor(2);
+    let content = Content::new();
+    let clock = Clock::new();
+    let (mut client, message) = holding(&executor, &content, clock);
+    let present = client.tick();
+
+    let mut failing = StagedFrame::new(Tick(present.0 - 1));
+    failing.regions.insert(RegionId(1), RegionChange::Relevant(message));
+    failing.regions.insert(RegionId(5), unresolvable(5));
+    push(&mut client, failing);
+    let (mut client, out) = frame(&executor, client, clock, 9, &mut sampled);
+    assert_eq!(out.ticks, 1);
+    assert_eq!(out.resync, Some(present), "the fold's content resync, and no other");
+    assert_eq!(logged(&log, tracing::Level::WARN, REFUSED), 1);
+
+    let mut at_restart = StagedFrame::new(present);
+    mismatch(&client, &mut at_restart, 900);
+    push(&mut client, at_restart);
+    let (client, out) = frame(&executor, client, clock, 10, &mut sampled);
+    assert!(out.reconciled.resimulated > 1, "the rollback re-applied the refused tick");
+    assert_eq!(out.resync, None);
+    assert_eq!(logged(&log, tracing::Level::WARN, REFUSED), 1, "reported once");
     client.shutdown();
     executor.shutdown();
 }

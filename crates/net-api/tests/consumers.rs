@@ -500,7 +500,7 @@ fn the_prediction_hook_learns_a_claim() {
         claimed: std::collections::BTreeSet::new(),
     };
     let simulation = app_build(WorldKind::Prediction, Tick(10), Some(Box::new(hook))).unwrap();
-    let mut simulation = with_region(simulation, lactose_ecs::RegionMode::Replicated);
+    let mut simulation = with_region(simulation, lactose_ecs::RegionMode::Simulated);
     let key = StableKey::Net(net(1));
     simulation.world_mut().spawn(key, REGION, (Position { x: 0, y: 0, z: 0 },)).unwrap();
     let mut frame = StagedFrame::new(Tick(11));

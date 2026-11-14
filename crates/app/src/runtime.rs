@@ -5,9 +5,11 @@ use std::fmt;
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::time::Duration;
 
-use lactose_core::{Error, ErrorKind, Result};
+use lactose_core::{Error, ErrorKind, Result, ThreadClass};
 use lactose_sim::TICK_RATE_HZ;
 use lactose_task::{ChaosConfig, ExecutionLog, Executor, Platform};
+
+use crate::policy::LOG_TARGET;
 
 /// The catch-up cap: at most this many new ticks run in one frame, in every shipped
 /// configuration (architecture section 5.1). What every pacer is built with. A rollback's
@@ -92,8 +94,11 @@ pub fn start_executor(workers: Workers) -> Result<Executor> {
 /// The solver pool of one world and the handle its world waits on at shutdown:
 /// `frame_worker_count - reserved` threads, at least one, named `solver-<n>`, built with
 /// rayon's builder and never with `use_current_thread`, so the pool is the backend's alone
-/// (`crates/physics-rapier/README.md`), with an `exit_handler` that raises the handle's
-/// count as each thread exits. Fails with `Platform` if rayon cannot start a thread.
+/// (`crates/physics-rapier/README.md`), with a `start_handler` that enters
+/// `ThreadClass::PhysicsSolver` on each thread before it takes work, as the executor's
+/// workers enter theirs (the floating-point state, and the scheduling class, best effort:
+/// a refusal is logged at `warn`), and an `exit_handler` that raises the handle's count as
+/// each thread exits. Fails with `Platform` if rayon cannot start a thread.
 pub(crate) fn solver_pool(
     executor: &Executor,
     reserved: u32,
@@ -101,20 +106,36 @@ pub(crate) fn solver_pool(
     let threads = executor.frame_worker_count().saturating_sub(reserved).max(1);
     #[cfg(test)]
     if tests::SLOW_EXIT.load(std::sync::atomic::Ordering::Relaxed) {
-        return pool(usize::try_from(threads).unwrap_or(1), tests::slow);
+        return pool(usize::try_from(threads).unwrap_or(1), || {}, tests::slow);
     }
-    pool(usize::try_from(threads).unwrap_or(1), || {})
+    pool(usize::try_from(threads).unwrap_or(1), || {}, || {})
 }
 
-/// The pool of [`solver_pool`] with `threads` threads, `before_exit` running on each thread
-/// as it exits, before the count is raised: nothing in production, a delay in the test
-/// that proves the wait outlasts a slow exit.
-fn pool(threads: usize, before_exit: fn()) -> Result<(rayon::ThreadPool, SolverExit)> {
+/// The pool of [`solver_pool`] with `threads` threads, `after_start` running on each
+/// thread once it entered its class and `before_exit` as it exits, before the count is
+/// raised: nothing in production; a count, and a delay, in the tests that prove every
+/// thread starts in its class and the wait outlasts a slow exit.
+fn pool(
+    threads: usize,
+    after_start: fn(),
+    before_exit: fn(),
+) -> Result<(rayon::ThreadPool, SolverExit)> {
     let exited = Arc::new((Mutex::new(0_usize), Condvar::new()));
     let raised = Arc::clone(&exited);
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(threads)
         .thread_name(|index| format!("solver-{index}"))
+        .start_handler(move |index| {
+            if let Err(error) = ThreadClass::PhysicsSolver.enter() {
+                tracing::warn!(
+                    target: LOG_TARGET,
+                    thread = index,
+                    %error,
+                    "a solver thread runs without its scheduling class"
+                );
+            }
+            after_start();
+        })
         .exit_handler(move |_| {
             before_exit();
             let (count, changed) = &*raised;
@@ -160,7 +181,9 @@ impl SolverExit {
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    use lactose_core::thread_class::fp;
 
     use super::*;
 
@@ -174,12 +197,30 @@ pub(crate) mod tests {
 
     #[test]
     fn the_wait_outlasts_a_slow_exit() {
-        let (pool, exit) = pool(3, slow).unwrap();
+        let (pool, exit) = pool(3, || {}, slow).unwrap();
         let (threads, exited) = exit.counts();
         assert_eq!(threads, 3);
         drop(pool);
         exit.wait();
         assert_eq!(*exited.0.lock().unwrap(), 3);
+    }
+
+    /// The solver threads that ran the start handler's `after_start`.
+    static STARTED: AtomicUsize = AtomicUsize::new(0);
+
+    fn started() {
+        STARTED.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn every_solver_thread_enters_its_class_before_it_takes_work() {
+        let (pool, exit) = pool(3, started, || {}).unwrap();
+        // A broadcast runs on every thread, so each has started by the time it returns.
+        let deterministic = pool.broadcast(|_| fp::is_deterministic());
+        assert_eq!(deterministic, [true; 3]);
+        assert_eq!(STARTED.load(Ordering::Relaxed), 3, "every thread ran the start handler");
+        drop(pool);
+        exit.wait();
     }
 
     #[test]
