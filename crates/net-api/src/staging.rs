@@ -40,6 +40,29 @@ pub struct StagingFrame {
     /// of every replicated column is here, `structural` is empty, and every client's
     /// acked ticks are void: the packer resyncs every client from it.
     pub full: bool,
+    /// The transient components entities have, those that are not replicated, by origin
+    /// key, as the gather found them: what the packer's mirror keeps beside an entity's
+    /// rows, so that it can state them to the client that has the entity claimed
+    /// ([`StagedFrame::transient`](crate::StagedFrame::transient), D141). Presence and
+    /// never a value: the gather copies rows of replicated columns alone, and such a column
+    /// is zero at every input sync point.
+    ///
+    /// A full frame states every entity that has at least one, and an entity it does not
+    /// state has none. An incremental frame states, of the entities live at the gather,
+    /// each one the structural log since the cursor spawned that has at least one, and
+    /// each one whose set that log changed (an `Added` or a `Removed` entry of such a
+    /// component), with the set the entity has at the gather, which for a changed one may
+    /// be empty. An entity it does not state has none if the log spawned it and is
+    /// unchanged otherwise. A set is read by key, never by chunk or row, so it is the same
+    /// under every layout.
+    ///
+    /// [`merge`](Self::merge) keeps the newer frame's statement of an entity, drops the
+    /// statement of an entity the newer frame despawned, takes a full newer frame's
+    /// statements alone, and leaves a full frame with no empty set, since a full frame
+    /// states an entity that has none by not stating it. A facade (D141): the gather fills
+    /// it and `merge` folds it from the lane `stream-impl` on; until then it is empty
+    /// unless a caller writes it, and `merge` does not fold it.
+    pub transient: BTreeMap<StableKey, BTreeSet<ComponentKey>>,
     rows: Vec<RowEntry>,
     bytes: Vec<u8>,
     structural: Vec<LogEntry>,
@@ -63,6 +86,7 @@ impl StagingFrame {
         Self {
             tick,
             full: false,
+            transient: BTreeMap::new(),
             rows: Vec::new(),
             bytes: Vec::new(),
             structural: Vec::new(),

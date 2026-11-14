@@ -395,8 +395,10 @@ tick N        tick N+1 simulation ───────────────�
   closing reference empty and logs it, so every saved region loads and the broken edge is what the
   next save records. Entities owned by another entity (inventory items, attachments) migrate with
   their owner and are despawned with it; writing `OwnedBy` moves nothing, so an owned entity may
-  reside in another region than its owner, where `OwnedBy` is a weak cross-region reference like any
-  other.
+  reside in another region than its owner, where `OwnedBy` is a weak cross-region reference like
+  any other. That is the rule of the world that simulates them. A client's worlds apply the
+  server's structural log entry by entry, each tombstone and each move to the one entity it
+  names, because a client holds `OwnedBy` only as each region's document stated it (D141).
 - **Region modes**: `Simulated`, `Replicated` (rows written only at the input sync point from
   staged network state), `Frozen`. The input sync point is the first sync point of a tick,
   before any stage runs; it is where the time scale, asset version tables, region bundles and
@@ -753,12 +755,15 @@ Section 9.7 gives the capacity model.
   an always-relevant set; co-located clients share per-region dirty lists so packing cost is
   proportional to clients times relevant rows, not clients squared. Each packet is filled by
   priority (distance and staleness) up to the client's cap. Destroyed entities travel as
-  tombstones from the structural log.
+  tombstones from the structural log, one for each entity of an owned tree, and a client applies
+  a tombstone or a move to the one entity it names, never to what its own `OwnedBy` edges say
+  that entity owns (D141).
 - Entities are addressed on the wire by short per-connection handles (a sixteen-bit index and
   generation the server assigns and the client mirrors from the spawns, which carry them), not
   by 64-bit keys. Positions are quantised relative to the origin of the region the wire names; a
-  region move travels as a frame entry applied through `move_to_region`, and so does a component
-  removal through `World::remove`. Send rate 20 to 30 Hz.
+  region move travels as a frame entry applied to the one entity it names through
+  `World::move_alone_to_region`, and so does a component removal through `World::remove`. Send
+  rate 20 to 30 Hz.
 - When a region becomes relevant to a client, the server sends that region's overlay (or a
   digest the client verifies against its cached copy) with the region's seed and persistent
   region resources beside it, and the client applies it to the cooked baseline before any
@@ -809,24 +814,30 @@ Section 9.7 gives the capacity model.
   from replicated state. Section 10 defines what a snapshot holds.
 - **Reconciliation** compares predicted and authoritative state per field at full precision;
   the server sends every simulation-read field of predicted entities at full precision on each
-  update, since it cannot know when the client mispredicted. Every field agrees by canonical
-  bytes; the `Transform` and `Velocity` the physics write-back writes on a dynamic body also
-  agree when each scalar is within a stated tolerance (`lactose-predict`'s, two millimetres,
-  two thousandths of a quaternion component, two centimetres per second and two hundredths of
-  a radian per second by default), because the solver holds state the rows do not carry
-  (section 16) and it is not corrected, so a corrected dynamic body differs from the server by
-  rounding for as long as it is in contact. The tolerance decides whether a frame makes a
-  correction; a correction writes every fact at its tick, the absorbed ones included, which is
-  what converges. `Teleported` of a claimed entity is the client's own no-interpolate flag and
-  is never compared or corrected. A replicated field a game derives from a solver-written
-  value compares by canonical bytes and is corrected when it differs, so a game keeps derived
-  replicated state integer. Claimed dynamic bodies in contact with each other are corrected
-  every few frames until they settle, so the claim policy claims a thrown object with its
-  throw and releases it at rest. Mispredictions against
-  non-predicted entities are expected and smoothed visually. Proxies live about half a round
-  trip in the past relative to the local player; this is an accepted limitation, and predicted
-  interactions with proxies are presented tentatively until confirmed. Corrections are written
-  stamped, so a `Changed` reader in a re-simulated tick sees them once (D122).
+  update, since it cannot know when the client mispredicted. Beside them it states, by key and
+  never by value, which of its transient components that are not replicated the entity has (a
+  replicated one is among the rows): a kernel runs on a row only if the row has every component
+  it names, so wherever the prediction world builds or corrects a claimed entity from a frame
+  that holds such a statement, it leaves the entity with the transient components stated, zeroed
+  where it adds one; a frame that holds none leaves its unreplicated ones as they are, and a
+  derived component is added there by the system that owns it (D141). Every field agrees by
+  canonical bytes; the `Transform` and `Velocity` the physics write-back writes on a dynamic
+  body also agree when each scalar is within a stated tolerance (`lactose-predict`'s, two
+  millimetres, two thousandths of a quaternion component, two centimetres per second and two
+  hundredths of a radian per second by default), because the solver holds state the rows do not
+  carry (section 16) and it is not corrected, so a corrected dynamic body differs from the
+  server by rounding for as long as it is in contact. The tolerance decides whether a frame
+  makes a correction; a correction writes every fact at its tick, the absorbed ones included,
+  which is what converges. `Teleported` of a claimed entity is the client's own no-interpolate
+  flag and is never compared or corrected. A replicated field a game derives from a
+  solver-written value compares by canonical bytes and is corrected when it differs, so a game
+  keeps derived replicated state integer. Claimed dynamic bodies in contact with each other are
+  corrected every few frames until they settle, so the claim policy claims a thrown object with
+  its throw and releases it at rest. Mispredictions against non-predicted entities are expected
+  and smoothed visually. Proxies live about half a round trip in the past relative to the local
+  player; this is an accepted limitation, and predicted interactions with proxies are presented
+  tentatively until confirmed. Corrections are written stamped, so a `Changed` reader in a
+  re-simulated tick sees them once (D122).
 - Later: forward nearby players' inputs so the prediction world includes them.
 
 ### 9.5 Lag compensation
@@ -1043,8 +1054,8 @@ or duplicate IDs fail registration. CI rejects ID reuse.
 | Policy | Meaning | Example |
 |---|---|---|
 | `persistent` | Saved at full precision | transform, health, velocity, animation phase, timers, quest flags |
-| `transient` | Written before read every tick, never saved; hashed | per-tick accumulators, contact lists, the player input sample |
-| `derived` | Not saved, not hashed; the system that owns the value rebuilds it after a load, and there is no load hook | physics handles, which the physics sync writes |
+| `transient` | Written before read every tick, never saved; hashed. Its presence on an entity is kept: in a save's records (D129) and, for an entity a client predicts, in the frame's statement (section 9.4) | per-tick accumulators, contact lists, the player input sample |
+| `derived` | Not saved, not hashed; the system that owns the value rebuilds it after a load, and on a client row the replication stream built when the type is not replicated, and there is no hook for either | physics handles, which the physics sync writes |
 
 Transient safety is structural (section 6): the ECS zeroes transient columns every tick and
 the scheduler orders every reader after a declared writer.

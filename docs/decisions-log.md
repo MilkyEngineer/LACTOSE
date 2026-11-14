@@ -4409,12 +4409,23 @@ relayed by an event when it acts on another body** (§6.1, §10, `lactose-ecs`,
     order is an input (a frame's regions, ascending at the sync point), which is what §8
     requires; no order is more right than another, since the documents together were not a
     forest. On a client `OwnedBy` is neither replicated nor corrected (`net-api`), so its edges
-    are as fresh as each region's last document, a break there is logged and lasts until the
-    region's next document, and no engine crate reads a replicated entity's `OwnedBy` on a
-    client; a game that does needs `OwnedBy` replicated, a `net-api` change. Rules out a table
-    of unloaded entities' edges consulted at writes (it would need persistence and could not
-    see a client's stale documents), refusing a load an honest history produced, and an
-    order-independent rule that would rewrite live rows of other regions.
+    are as fresh as each region's last document, and a break there is logged and lasts until the
+    region's next document. The ECS reads those edges in every world: `despawn` and
+    `move_to_region`, direct and at command apply, take the tree, which this entry's first text
+    overlooked when it said no engine crate reads a replicated entity's `OwnedBy` on a client
+    (both staged-state hooks did, through those two methods). A client's hooks and
+    `lactose-predict`'s corrections therefore apply each tombstone and each move to the one
+    entity it names (`World::despawn_alone`, `World::move_alone_to_region`, which a `Server`
+    world refuses, so that no despawn and no move leaves an owned entity behind where a region
+    is exported; D141). A direct write on a server can still leave one, by naming a despawned
+    predicted owner or a predicted origin that has no alias, until D141's rule for a server's
+    `OwnedBy` is implemented (`docs/verification.md`); from then on a server stores no owner its
+    export cannot write. What still walks a client's edges is a prediction system's own
+    `Commands::despawn` or `Commands::move_to_region` (`docs/verification.md`); a game that
+    needs the server's ownership on a client needs `OwnedBy` replicated, a `net-api` change.
+    Rules out a table of unloaded entities' edges consulted at writes (it would need persistence
+    and could not see a client's stale documents), refusing a load an honest history produced,
+    and an order-independent rule that would rewrite live rows of other regions.
   - *An owned entity need not reside in its owner's region; writing `OwnedBy` moves nothing.*
     D12 is a rule for `move_to_region` and `despawn`, which take the tree; an entity given to
     an owner elsewhere stays until that owner next moves, and an owner's region may unload
@@ -4853,6 +4864,238 @@ relayed by an event when it acts on another body** (§6.1, §10, `lactose-ecs`,
   small: a slot's cost is the backend's bytes, which copy-on-write cannot share, so a slot
   over budget changes the bound, not the representation. D81's asset set is widened, not
   reversed. Section 15.1's `on_load`, a hook that was never built.
+
+**D141. What a client world gets from the stream: one entity per tombstone and move, and a claimed entity's transient components by key** (§6, §9.3, §9.4, §15.1, `lactose-ecs`, `lactose-net-api`, `lactose-predict`, `lactose-anim`)
+- Why: the whole-project review of milestone 1 found two ways a client's row differs from the
+  server's entity that no frame corrects. S3: `OwnedBy` is persistent and not replicated, so a
+  client holds edges as old as each region's document, while `World::despawn` and
+  `World::move_to_region`, which both staged-state hooks called, take the tree; a tombstone or a
+  move of a former owner took a released item with it on the client alone (the probe: the server
+  has the item live in region 7; the prediction world has it gone, or moved to region 2 with the
+  owner), and no later row brought it back. S4: a row the stream builds holds replicated
+  components only, a region document also restores transient presence (D129), and a kernel runs
+  on a row only if the row has every component it names; so `anim::advance` and
+  `anim::evaluate`, which name `RootMotion` and `SimPose`, never ran on a claimed character
+  built by a claimed spawn, a late echo or a correction's re-spawn, and two test suites hid it
+  by sending unreplicated components as values in a join frame. Each choice below is a contract
+  in the four crates' READMEs, written as a facade before the lane `stream-impl`.
+  - *A client's hooks and corrections apply a tombstone or a move to the one entity it names,
+    and the two methods that do it are a client's alone.* `World::despawn_alone` and
+    `World::move_alone_to_region` do to one entity, in a `Client` or a `Prediction` world, what
+    `despawn` and `move_to_region` do, leaving what it owns in place with its `OwnedBy` as
+    written: a reference to an entity that is not live, or an owned entity in another region
+    than its owner. Both hooks, in a full and a delta frame, in a predicted tick and a replay,
+    an upsert's and a release's move, `lactose-predict`'s corrections and its despawn of an
+    unechoed predicted spawn call them and never the cascading forms. Nothing is lost: the
+    server's structural log holds a `Despawned` or a `Moved` entry for every entity of a tree,
+    and the packer turns each into an entry of its own. It costs the wire nothing, the save path
+    nothing (no document changes, and D133's break of a cycle at a client's load stands) and the
+    rollback nothing (two ordinary logged writes, snapshotted and replayed entry by entry). A
+    `Server` world refuses both with `Unsupported`, before it looks at the key or the region and
+    with nothing changed. A despawn is a death where an unload keeps the owner's alias: after
+    `despawn_alone` of a bound predicted origin the next rollback horizon, which a server sets
+    at every step, prunes the alias, the owned row's `OwnedBy` then names no `NetId`, and the
+    row's region cannot be exported, so it never unloads, the save fails, and D133's rule that a
+    region's export is always an overlay breaks (the review's probe, under every layout; an
+    unload of the owner's region and the cascading `despawn` never reach that state). A server
+    is the one kind that exports, and nothing on a server applies another world's log; a client
+    exports nothing, and there the reference dangles as any may until its owner returns.
+    Accepted: the entries of one tree may arrive in different frames, since a cap makes sends
+    partial, so an owned entity outlives its owner on the client by that interval; an unechoed
+    spawn's own unechoed spawns go at their own input ticks; and an owned entity that a region
+    document placed and whose handle the client does not hold stays after its owner's tombstone
+    until the region unloads or a full frame, the open item of `lactose-net-host` that the
+    cascade hid when the edge happened to be fresh. Rules out the cascade on any path that
+    applies the server's statements; a switch on the world's kind inside `despawn` (a
+    `[server, prediction]` kernel's `Commands::despawn` must mean one thing in both worlds);
+    keeping a despawned owner's alias for as long as a reference names it, as an unload does (it
+    would also have closed the direct-write hole of the next bullet, but an alias would be held
+    as long as a stale edge lasts, in every kind, a server could drop an owner from under what
+    it owns, against §6, and the stored origin would differ from the `Net` key a fresh process
+    stores, since no save carries a dead entity's bind); and unlinking the owned entities before
+    the owner's despawn (it would write rows the server did not).
+  - *A server stores no `OwnedBy` its export cannot write.* The export writes an owner as a
+    `NetId`, so a stored owner that is a predicted origin needs its alias for as long as it is
+    stored, and the horizon prunes a despawned origin's alias. Command apply empties a reference
+    to an entity that is not live; a direct write does not. `World::insert`, `insert_erased`,
+    `spawn` and `spawn_erased`, and `load_region` for an owner outside its document, keep a
+    reference to a missing entity and store a bound `Net` key as its predicted origin, also when
+    that entity has been despawned. So on the code this entry was written against a `Server`
+    world reaches, without the alone forms, the state they are refused for: an `OwnedBy` written
+    or loaded with a despawned predicted owner before the horizon passes, or written with a
+    predicted origin that has no alias, is a row whose region cannot be exported (the review's
+    probes and the architect's, under every layout; the seeded histories of
+    `crates/ecs/tests/ownership.rs` fail as soon as they pass a server's per-step horizon; no
+    shipped server code writes `OwnedBy` directly, and sim never loads between a despawn and the
+    next horizon). The rule, in a `Server` world, on those five paths, for `OwnedBy` alone: an
+    owner that is a despawned predicted entity whose alias the world still holds is stored as
+    its `Net` key; an owner that is a predicted origin with no alias, live or not, is refused
+    with `InvalidData` and nothing changed; every other owner is stored as before, an unloaded
+    one under its origin, whose alias an unload keeps, and an owner that the same document loads
+    under the key the load gives it. The `Net` key is what the export writes and what a fresh
+    process that loads the save stores, so no stored byte depends on when the horizon passes,
+    and a load inside the window, which stored the origin where a fresh process stores the `Net`
+    key, agrees with it (§15.5). With the refusal of the alone forms, D133's invariant then
+    holds on every path of a server. It is `OwnedBy`'s rule alone because no other reference is
+    exported through a `NetId`: every other reference field is exported as stored, and a
+    replicated one must hold on a client the bytes the server holds. It is a server's rule alone
+    because a server is the one kind that exports and a despawned entity never returns there; on
+    a client an entity the hook despawned may return, and its origin key is what the return is
+    found by. Rules out keeping a despawned owner's alias while a reference names it (the bullet
+    above); rewriting the references to a despawned origin when its alias is pruned, the inverse
+    of a bind (the stored bytes would change as the horizon passes, so a save taken inside the
+    window and its fresh load would differ until the next step, and a write that names an origin
+    with no alias would still be stored); emptying the reference as command apply does (a direct
+    write cannot tell a despawned plain `Net` owner from an unloaded one, so the rule would hold
+    for predicted owners alone); and the rule on every reference or in every kind (a client's
+    replicated row must store the predicted origin the server stores, whether or not the client
+    has bound it).
+  - *`OwnedBy` stays persistent and not replicated.* Replicating it would not close S3 by
+    itself: sends are partial, so an owner's tombstone can arrive before the row that removes an
+    edge, and a cascade would still take the released entity. What it would cost: a `StableKey`
+    image for every owned entity on every whole send and in every packet of a claimed one; the
+    protocol hash, its pins and every recording made under them; and three things designed
+    first. A row can arrive before the removal that makes it legal, so `insert_erased` refuses
+    it under D133's forest, the hook skips it and a claimed entity's correction is refused at
+    every frame. A client would write the column from two sources, a document's owner resolved
+    through the client's binds and a row's stored origin key, which disagree for an owner whose
+    bind the client lacks until the binds decision settles finding D1. And `OwnedBy` would join
+    the reconciliation record. A static assertion in `lactose-net-api` pins the policy, so a
+    change of the flag meets this entry. Rules out replicating `OwnedBy` at milestone 1; it
+    stays the named change for a game that reads the server's ownership on a client (D122,
+    D133).
+  - *Open: a prediction system's own cascade.* A `[server, prediction]` kernel's
+    `Commands::despawn` or `Commands::move_to_region` of a claimed owner still takes, at apply,
+    what the prediction world's edges say it owns, a document's and those predicted commands
+    wrote: a proxy the server released is gone from the prediction world, or moved to a region
+    the frames never placed it in, until a whole send or a full frame (the replicated world,
+    which runs no system, keeps it), and an entity the server gave the owner since is missed. A
+    tombstone does not end it: `owned_by` lists by the stored key, so an owner the hook
+    despawned alone and that returns, by a re-entry spawn, which carries its origin key, or by a
+    region's next document, owns again what a stale edge says it owns, whatever the ring's
+    depth; only a bound owner spawned again under its bare `Net` key, which no hook does, owns
+    it again only while its alias lives. No shipped system despawns or moves an owner, and the
+    spike's thrown bodies own nothing. The one candidate known, the ECS's, is that in a
+    prediction world the cascade stops at an entity the local player has not claimed. It is a
+    switch on the world's kind at command apply: taking it would reverse, for the predicted
+    path, this entry's rule that `Commands::despawn` means one thing in both worlds, on the
+    ground §9.4 gives for kernels (a prediction world predicts claimed rows only). No candidate
+    without a switch is known, since stopping at unclaimed entities in every kind would change
+    what a server's despawn takes. Decided with a replicated `OwnedBy`, before a game predicts
+    an owner's despawn or region move (`docs/verification.md`).
+  - *A claimed entity's unreplicated transient components travel as a statement by key, in the
+    frame.* `StagedFrame::transient` maps an origin key to the set of the entity's components
+    that are transient and not replicated: the server's entity has exactly these. Presence and
+    never a value, since such a column is zero at every input sync point on both machines. The
+    packer keeps each entity's set in its mirror from `StagingFrame::transient`, which the
+    gather fills (a `Spawned` log entry names no component, so the packer cannot derive it), and
+    puts a statement, the empty set included, beside every spawn whose slot is `None` and beside
+    every claimed entity's exact rows; so a frame that states a claimed entity's replicated
+    components states its transient ones, and `lactose-predict` builds or corrects the entity
+    from that frame alone, a re-spawn from exact rows included. Bounded: a set names a component
+    once, and only registered components that are transient and not replicated, at most as many
+    as the registry holds (three in the engine); the receiver refuses a packet whose statement
+    names any other and a hook skips such a key. Deterministic: read by key and never by chunk
+    or row, held in ordered maps, applied in ascending component key order, and inserted as zero
+    bytes, which registration guarantees valid for a transient type. On the wire one bit per
+    such type, in the registry's key order, is enough; the encoding is `lactose-net`'s. The
+    protocol hash does not move: no registered type changes, the candidate types and their order
+    follow from the covered types' key, persistence and tracking, and `PROTOCOL_VERSION` names a
+    framing that does not exist yet, so the engine pin in
+    `crates/app/tests/proof/registration.rs` and `lactose-net-host`'s pins stand. Rules out a
+    list on `StagedSpawn` (a frame's exact rows need the statement too, and a new field would
+    break every constructor in five crates' tests and the spike written beside this round, where
+    a frame's field breaks none); zeroed images among a spawn's components, as a document
+    carries presence (904 zero bytes a frame for one sim pose, and a component list whose
+    entries mean two things); a statement of every transient component, replicated ones included
+    (two statements that can disagree); and a value on the wire.
+  - *The statement is for where kernels run, and it is exact.* In a client's worlds a kernel
+    runs on the rows the local player has claimed in the prediction world and nowhere else. The
+    prediction world's hook and corrections alone read the statement. Wherever they act on a
+    claimed spawn or on a frame's exact rows (a full frame's spawn, a claim applied at once to
+    an entity that was not claimed, a correction's write or re-spawn) they leave the entity with
+    the transient components stated: a named one the row lacks inserted zeroed; a named one it
+    has left untouched, since the input applier, which runs before the hook, or a kernel may
+    have written it this tick; an unreplicated one the statement does not name removed; and a
+    replicated transient one that the spawn's components or the exact rows do not name removed
+    as a recorded component is. A frame that holds no statement for an entity states nothing of
+    its unreplicated transient components and they are left as they are, so every frame built
+    before this entry, the spike's stand-in packer's among them, behaves as it did. A statement
+    travels with its fact: exact rows folded into a kept claimed spawn replace its statement
+    when their frame holds one, and keep it otherwise. The replicated world's hook does not read
+    it and a proxy gets none: each would be a column in every ring slot for no kernel. This
+    narrows D122's addendum ("never `Teleported` or a transient component"): never `Teleported`,
+    and a transient component by presence alone. Rules out an additive statement that never
+    removes (a transient component the client has and the server does not would run a kernel on
+    one side at every tick, corrected at every frame and never converging), and applying it to
+    proxies or in the replicated world.
+  - *Presence is written, never compared.* It is not in the ring's record, so a difference in
+    presence alone is no correction point; every correction that writes an entity's claimed
+    spawn or exact rows writes its presence, and a rollback writes every fact at its tick, so
+    the first correction a difference causes removes it. A difference in presence alone causes
+    none: where the kernels that match a component write nothing recorded (`anim::evaluate`
+    writes `SimPose` alone), a `[server]`-only system that removes it from a claimed entity is
+    not followed until a full frame, whose spawn of the entity applies the statement, or a
+    correction something recorded causes, while the entity stays claimed. Presence in the
+    record, compared as a component's presence is, is the fix if a game needs it, at one lookup
+    per claimed entity, tick and transient type. Applying a statement at once in a predicted
+    tick is ruled out: it would put an older server tick's presence on a newer predicted state.
+    A transient component that only a client system adds to a claimed entity does not outlast a
+    correction: such a component is `derived`.
+  - *A hook writes replicated components alone.* A component of a spawn, or a row, that the
+    registry lacks or holds as unreplicated is a sender's defect, logged and skipped, in a full
+    frame as in a delta frame, where before a full frame's spawn wrote whatever it carried.
+    Rules out the way the gap was hidden: `lactose-predict`'s test join frame sent the derived
+    `Trail`, and `lactose-anim`'s sent `RootMotion` and `SimPose` as values.
+  - *A derived component is added by the system that owns it.* It is never stated, as a save
+    carries none for a runtime entity (D129, §15.1). A prediction system that needs one adds it
+    with a kernel over the rows lacking it (`Without<T>`, `Commands::set`, no `writes = [T]`,
+    which the schedule refuses beside `Without<T>`), in every world its readers run in, with the
+    value computed from the row as it is rather than a default, since a `Changed` reader has
+    already passed the write that made the row; a reader in the adder's own stage sees the
+    component a tick later and takes `Option` if it cannot lose that tick. `lactose-predict`'s
+    README states the rule.
+  - *`lactose-anim` adds no kernel.* The review proposed one over the rows lacking `RootMotion`
+    or `SimPose` in the interim. There is no interim: the statement and the hook's use of it
+    land together, and no packer ships before `lactose-net`. And it would be wrong: whether a
+    character has `SimPose` is the game's choice (one without it is not evaluated), which a
+    kernel cannot tell from a loss, and both are hashed columns that a `[server, prediction]`
+    kernel would add to a server row spawned without them. Static assertions pin the two as
+    transient and not replicated.
+- What the design reviews changed. The first (1 serious, 5 minor; `d93066a` was the facade
+  before it): the two methods refused in a `Server` world, where the first text ruled a kind
+  check out on the ground that the state they leave is one the world already accepts, which the
+  review's probe showed false on a server; `owned_by` stated by the stored key, and with it that
+  an owner's return revives a stale edge; the candidate for the predicted cascade named as the
+  kind switch it is; the case in which presence does not converge; amendment A4 narrowed to a
+  frame that holds a statement; and the fold of exact rows that carry no statement. The second
+  (2 minor, one of them a hole already on main; `eeda771`): the rule for a server's `OwnedBy`,
+  since a direct write reached the unexportable state without the alone forms; and a full frame
+  as what follows a presence change.
+- To measure with `net`'s packer: the statement's bits per claimed entity per packet; the
+  gather's reads at a region load, at most one `World::get_erased` per spawned entity and
+  unreplicated transient type.
+- Proof, for the lane `stream-impl`: the review's two probes as tests,
+  `a_released_item_survives_its_former_owners_tombstone` (in `lactose-net-api` and
+  `lactose-predict`) and `a_claimed_spawn_carries_its_transient_components`, with the rows of
+  "Proof for D141" in the three READMEs. In `crates/ecs/tests/ownership.rs`:
+  `the_alone_forms_are_refused_in_a_server_world`; the seeded save and load histories pass a
+  server's per-step horizon, `set_rollback_horizon(tick + 1)`, after each operation (they fail
+  on the code before the rule, at a write that names a despawned predicted owner), with a
+  `despawn_alone` and a `move_alone_to_region` operation that are refused in them and an
+  operation that despawns an entity and names it as an owner before the horizon;
+  `a_server_stores_no_owner_it_cannot_export` (the four direct paths, by either key, inside the
+  window and after it, a live unbound owner, an unloaded one, and a client's worlds unchanged);
+  `a_load_inside_the_window_stores_what_a_fresh_process_stores`;
+  `despawn_alone_leaves_what_the_entity_owned` and `move_alone_moves_one_entity` in `Client` and
+  `Prediction` worlds.
+- Driven by: the whole-project review of milestone 1 (2026-11-14), findings S3 and S4 and their
+  probes; `docs/plans/milestone-1.md`, lane `stream-design`; its three design reviews
+  (2026-11-15; the third found nothing to change).
+- Replaced: D133's "no engine crate reads a replicated entity's `OwnedBy` on a client"; D122's
+  addendum "never `Teleported` or a transient component" for a claimed spawn; the cascading
+  calls in both hooks' contracts (D121, D122); architecture §9.3's "applied through
+  `move_to_region`".
 
 ## 10. Review history
 
