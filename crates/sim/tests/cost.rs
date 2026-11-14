@@ -6,9 +6,10 @@
 //! resources read by kernels and written at a sync point, a reduction, command traffic that
 //! despawns and spawns rows every tick) and hashed after every step as SOUR does. The time
 //! of each phase (sync points, each system, the hash) is collected from the `casein` spans
-//! and printed; it is measured by an ignored test, run by hand, and reported, never
-//! asserted. What the scene computes is asserted in a test that runs everywhere, and the
-//! scene at a small scale records its hash under the runner's session.
+//! and the executor's per-range spans and printed; it is measured by an ignored test, run
+//! by hand, and reported, never asserted. What the scene computes is asserted in a test
+//! that runs everywhere, and the scene at a small scale records its hash under the
+//! runner's session.
 
 #![forbid(unsafe_code)]
 
@@ -400,7 +401,11 @@ fn the_scene_records_its_hash_every_tick_under_the_session() {
 
 // ---- The measurement ----
 
-/// Times the `casein` spans: each sync point, stage and system, summed by name until taken.
+/// Times the `casein` spans (each sync point, each exclusive system, and the `units` and
+/// `finalize` of every other) and the executor's spans, one per range of a node's units and
+/// named after the node (architecture 5.1), summed by name until taken. A node's time is
+/// the sum over its ranges, so on several workers it is not wall time, and the range that
+/// finishes last holds the node's `finalize` and the `units` of the nodes it releases.
 mod timing {
     use std::collections::BTreeMap;
     use std::sync::Mutex;
@@ -461,13 +466,16 @@ mod timing {
         }
 
         fn enabled(&self, metadata: &Metadata<'_>) -> bool {
-            metadata.is_span() && metadata.target() == "casein"
+            metadata.is_span() && matches!(metadata.target(), "casein" | "whisk")
         }
 
         fn new_span(&self, span: &Attributes<'_>) -> Id {
             let mut name = Name(String::new());
             span.record(&mut name);
-            let label = format!("{} {}", span.metadata().name(), name.0);
+            let label = match span.metadata().target() {
+                "whisk" => format!("node {}", span.metadata().name()),
+                _ => format!("{} {}", span.metadata().name(), name.0),
+            };
             let id = self.next.fetch_add(1, Ordering::Relaxed) + 1;
             self.open.lock().unwrap().insert(id, Open { label, entered: None });
             Id::from_u64(id)
