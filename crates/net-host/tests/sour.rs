@@ -34,7 +34,7 @@ use lactose_math::{Quat, Scalar, Vec3};
 use lactose_net_host::{QuantisedPosition, QuantisedRotation};
 use lactose_reflect::Reflect;
 use lactose_sim::Simulation;
-use lactose_sim::harness::{ChunkCapacity, layout_mode};
+use lactose_sim::harness::{ChunkCapacity, layout_mode, layout_mode_of};
 use lactose_task::ChaosConfig;
 use protocol::{Capacity, Layout, Recorder, RunConfig, Session};
 
@@ -84,14 +84,15 @@ impl Sour {
             workers: config.workers.map(|_| {
                 NonZeroU32::new(self.executor.frame_worker_count()).expect("at least one worker")
             }),
-            layout: if *layout == LayoutConfig::default() {
-                Layout::Production
-            } else {
-                let capacity = match layout.chunk_rows {
-                    Some(n) => Capacity::Rows(n),
-                    None => Capacity::Bytes(16 * 1024),
-                };
-                Layout::Perturbed { capacity, seed: layout.seed }
+            // The world's layout as the runner names it; one no SOUR mode builds fails here.
+            layout: match layout_mode_of(layout)? {
+                (ChunkCapacity::Production, _) => Layout::Production,
+                (ChunkCapacity::Rows(n), seed) => {
+                    Layout::Perturbed { capacity: Capacity::Rows(n), seed }
+                }
+                (ChunkCapacity::Bytes(n), seed) => {
+                    Layout::Perturbed { capacity: Capacity::Bytes(n), seed }
+                }
             },
             chaos_seed: self.executor.chaos_config().map(|chaos| chaos.seed),
         };
@@ -147,12 +148,12 @@ fn wire_values(world: &World, bytes: &mut Vec<u8>) {
     }
 }
 
+/// What `replicate` calls after every server tick: the server world, the client world once
+/// it is built, the tick and the hash of the server's, the client's and the wire values.
+type Record<'a> = dyn FnMut(&Simulation, Option<&Simulation>, Tick, u64) -> Result<()> + 'a;
+
 /// The replication, recording after every server tick through `record`.
-fn replicate(
-    executor: &Executor,
-    layout: LayoutConfig,
-    record: &mut dyn FnMut(&Simulation, Tick, u64) -> Result<()>,
-) -> Result<()> {
+fn replicate(executor: &Executor, layout: LayoutConfig, record: &mut Record<'_>) -> Result<()> {
     let mut replication = Replication::new(layout, 40, &[REGIONS[0], REGIONS[1]], 5);
     replication.link = LinkConfig::POOR;
     replication.lag = 6;
@@ -170,7 +171,8 @@ fn replicate(
         let client = replication.client.as_ref().map(Simulation::hash).transpose()?;
         bytes.extend_from_slice(&client.unwrap_or(0).to_le_bytes());
         wire_values(replication.server().world(), &mut bytes);
-        record(replication.server(), replication.server().tick(), xxh64(&bytes, 0))?;
+        let (server, client) = (replication.server(), replication.client.as_ref());
+        record(server, client, server.tick(), xxh64(&bytes, 0))?;
     }
     calm(&mut replication, executor, next);
     replication.assert_converged("the recorded replication");
@@ -182,12 +184,21 @@ fn a_replication_and_its_wire_values() {
     let test = "lactose_net_host::sour::a_replication_and_its_wire_values";
     let sour = Sour::from_env().unwrap();
     let mut recorder: Option<Recorder> = None;
-    let mut record = |server: &Simulation, tick: Tick, hash: u64| -> Result<()> {
-        if recorder.is_none() {
-            recorder = Some(sour.recorder(test, server)?);
-        }
-        recorder.as_mut().expect("opened").record(tick.0, hash).map_err(protocol_error)
-    };
+    let mut client_reported = false;
+    let mut record =
+        |server: &Simulation, client: Option<&Simulation>, tick: Tick, hash| -> Result<()> {
+            if recorder.is_none() {
+                recorder = Some(sour.recorder(test, server)?);
+            }
+            // The client world's hash joins the records once it is built: its own applied line,
+            // which the runner holds to the launched configuration like the server's. The
+            // client is built once.
+            if let Some(client) = client.filter(|_| !client_reported) {
+                sour.recorder(test, client)?;
+                client_reported = true;
+            }
+            recorder.as_mut().expect("opened").record(tick.0, hash).map_err(protocol_error)
+        };
     replicate(&sour.executor, sour.layout, &mut record).unwrap();
     sour.finish(test).unwrap();
 }
@@ -198,7 +209,7 @@ fn a_replication_and_its_wire_values() {
 fn the_records_are_the_same_under_another_layout_and_worker_count() {
     let run = |layout: LayoutConfig, workers: u32| {
         let mut records = Vec::new();
-        let mut record = |_: &Simulation, tick: Tick, hash: u64| -> Result<()> {
+        let mut record = |_: &Simulation, _: Option<&Simulation>, tick: Tick, hash| -> Result<()> {
             records.push((tick, hash));
             Ok(())
         };

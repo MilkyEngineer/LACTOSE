@@ -11,6 +11,7 @@ use lactose_core::{Error, ErrorKind, NetId, PlayerId, Result, StableKey, Tick};
 use lactose_ecs::{RegionId, World};
 use lactose_input::{PlayerInput, Yaw};
 use lactose_net_api::GatherState;
+use lactose_net_host::handshake::ProtocolHash;
 use lactose_net_host::message::JoinAccepted;
 use lactose_physics_api::Physics;
 use lactose_sim::{PlayerSample, Registration, SessionEvent, TickInput, TypeTable};
@@ -218,4 +219,60 @@ fn a_frames_input_reaches_the_players_entity() {
     assert_eq!(world.get::<PlayerInput>(key), Some(&input));
     server.shutdown();
     executor.shutdown();
+}
+
+/// The engine's registry, as `Game::types` builds it for a game with no crates of its own:
+/// every engine crate's `register_types`, in the README's order (the verification row
+/// "`lactose-net-api` is implemented"). A change to any covered type moves the hash; the
+/// name lists catch a change of policy, a type moving between covered and not.
+/// `lactose-net-host`'s own pin covers only the engine crates it depends on, which leaves
+/// out `lactose-anim` and `lactose-predict`.
+#[test]
+fn the_hash_of_the_engine_registry_is_pinned() {
+    let empty = Game { name: "empty", crates: &[], order: None, sessions: None };
+    let types = empty.types().unwrap();
+    let registry = types.registry();
+    // In ascending key order, which is the order the stream covers them in.
+    let named = |covered: bool| -> Vec<&str> {
+        registry
+            .iter()
+            .filter(|info| ProtocolHash::covers(info) == covered)
+            .map(|info| info.name())
+            .collect()
+    };
+    let covered = [
+        "anim::sim_pose",
+        "physics::joint",
+        "physics::teleported",
+        "ecs::predicted_origin",
+        "anim::state",
+        "physics::rigid_body",
+        "anim::bones",
+        "input::player_input",
+        "physics::velocity",
+        "anim::bone_link",
+        "ecs::owned_by",
+        "physics::transform",
+        "physics::collider",
+        "anim::params",
+        "anim::rig",
+        "sim::time_scale",
+        "anim::root_motion",
+    ];
+    assert_eq!(named(true), covered);
+    // `derived` and not replicated: never sent and never compared.
+    let uncovered = [
+        "sim::streaming_anchor",
+        "net::remote_slot",
+        "sim::tick_delta",
+        "physics::joint_handle",
+        "physics::body_handle",
+        "ecs::in_region",
+        "ecs::claimed_by",
+        "predict::staged_region",
+        "sim::current_tick",
+        "sim::region_policy",
+    ];
+    assert_eq!(named(false), uncovered);
+    assert_eq!(ProtocolHash::of(registry), ProtocolHash(0x1458_0671_8FB1_1F86));
 }

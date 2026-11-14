@@ -16,7 +16,7 @@ use lactose_ecs::{
 };
 use lactose_math::Scalar;
 use lactose_reflect::component;
-use lactose_sim::harness::{ChunkCapacity, layout_mode};
+use lactose_sim::harness::{ChunkCapacity, layout_mode, layout_mode_of};
 use lactose_sim::{
     CurrentTick, Pass, RegionAtlas, RegionCell, RegionControl, RegionPolicy, Registration,
     SimulationBuilder, Stage, TickInput, TypeTable, sets,
@@ -504,4 +504,37 @@ fn layout_mode_covers_both_chunk_orders_and_refuses_another_slab() {
         .build()
         .unwrap();
     assert_eq!(*simulation.world().layout(), perturbed(Some(7), ChunkOrder::Reversed));
+}
+
+/// `layout_mode_of` names every layout `layout_mode` builds and refuses every other: a
+/// world that keeps the capacity and seed but drops a perturbation reports no SOUR layout.
+#[test]
+fn layout_mode_of_inverts_layout_mode_and_refuses_a_dropped_perturbation() {
+    assert_eq!(layout_mode_of(&LayoutConfig::default()).unwrap(), (ChunkCapacity::Production, 0));
+    for capacity in [
+        ChunkCapacity::Rows(1),
+        ChunkCapacity::Rows(7),
+        ChunkCapacity::Rows(64),
+        ChunkCapacity::Bytes(16384),
+    ] {
+        let layout = layout_mode(capacity, 1_592_597_104).unwrap();
+        assert_eq!(layout_mode_of(&layout).unwrap(), (capacity, 1_592_597_104));
+        let dropped = [
+            LayoutConfig { permute_rows: false, ..layout },
+            LayoutConfig { split_batches: false, ..layout },
+            LayoutConfig { chunk_order: ChunkOrder::Natural, ..layout },
+            LayoutConfig {
+                permute_rows: false,
+                split_batches: false,
+                chunk_order: ChunkOrder::Natural,
+                ..layout
+            },
+        ];
+        for layout in dropped {
+            let error = layout_mode_of(&layout).expect_err("no SOUR layout");
+            assert_eq!(error.kind(), ErrorKind::InvalidData, "{layout:?}");
+        }
+    }
+    let seeded = LayoutConfig { seed: 5, ..LayoutConfig::default() };
+    assert_eq!(layout_mode_of(&seeded).err().unwrap().kind(), ErrorKind::InvalidData);
 }

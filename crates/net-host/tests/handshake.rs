@@ -177,9 +177,12 @@ fn the_hash_of_a_small_registry_is_pinned() {
     assert_eq!(ProtocolHash::of(&small::<base::Body>()), ProtocolHash(0x3CCB_5B16_AE7D_00C4));
 }
 
-/// Every engine type a game's registry holds before its own: the sim's and the world's,
-/// `lactose-net-api`'s, `lactose-input`'s and `lactose-physics-api`'s. A change to any of
-/// them is a protocol break and moves this pin (verification row 91).
+/// The engine types of the crates this crate depends on: the sim's and the world's,
+/// `lactose-net-api`'s, `lactose-input`'s and `lactose-physics-api`'s. A change to any
+/// covered type moves the hash; the name lists catch a change of policy. It is not the whole
+/// engine registry: `lactose-anim`'s and `lactose-predict`'s types are in every game's
+/// registry too, and `lactose-app`'s pin is over `Game::types` (the verification row
+/// "`lactose-net-api` is implemented").
 fn engine() -> TypeTable {
     let mut types = TypeTable::new();
     let registered: [Result<()>; 3] = [

@@ -48,7 +48,7 @@ breaks one is a signature change to list.
 | `Hashers`, `Simulation::world_hash`, `Simulation::hash` | The world hash of architecture section 8.3 |
 | `RegionDigest`, `DigestRows`, `Differences`, `FieldDifference` | The field-level diff produced on a mismatch |
 | `TickDelta`, `CurrentTick`, `TimeScale`, `TICK_RATE_HZ` | Time as the simulation sees it |
-| `harness::{ChunkCapacity, layout_mode, run_recorded}` | What a simulation test under SOUR uses |
+| `harness::{ChunkCapacity, layout_mode, layout_mode_of, run_recorded}` | What a simulation test under SOUR uses |
 | `journal::{Journal, JournalFrame, JournalLoad}` | Journal replay's types; the facade names them only |
 
 Hidden plumbing, which the implementation may reshape: the input sync point's systems, in a
@@ -77,7 +77,7 @@ slot, the lifecycle slot, the save slot). No consumer can name a system or the l
 | `persist` | Save at a sync point into records; load through the one path an unload uses | `save_point` → `SavePoint { tick, next_net_id, regions }`; `SimulationBuilder::{tick, next_net_id}` plus `TickInput::loaded`; `RegionLifecycle::take_exports` on unload |
 | Region lifecycle | Policy inputs and outputs as data, testable without `net` or `asset` | Inputs: `StreamingAnchor` rows, joins, `RegionPolicy`, `RegionAtlas`, pinned regions, `TickInput::{loaded, assets}`; outputs: `RegionLifecycle::{take_requests, take_exports, take_load_failures, take_session_failures, take_asset_failures}` and the modes on the world |
 | The world hash | `world_hash(region) -> u64`, per-type hashers from the erased registry, a diff on mismatch | `Simulation::world_hash`, `Hashers` filled by `TypeTable::register`, `RegionDigest::diff` |
-| SOUR | Build from the session, run ticks, record a hash per tick, write the chaos log | `harness::layout_mode`, `harness::run_recorded`, `Simulation::hash`; the glue is `tests/sour_glue.rs` |
+| SOUR | Build from the session, run ticks, record a hash per tick, write the chaos log | `harness::layout_mode`, `harness::layout_mode_of`, `harness::run_recorded`, `Simulation::hash`; the glue is `tests/sour_glue.rs` |
 | Journal replay | A place for the types | `journal` |
 
 ## The registration a game crate writes
@@ -548,6 +548,12 @@ for bit:
   executor builder's `ChaosConfig` with `shuffle_steals`, `inject_yields`, `force_split`
   and `record` on and the seed; that type is `lactose-task`'s, so the test's glue builds
   it.
+- `harness::layout_mode_of(layout)` inverts `layout_mode`: `(Production, 0)` for the
+  default, `(capacity, seed)` when the layout equals `layout_mode(capacity, seed)` in every
+  field, and `InvalidData` for any other layout, such as a layout-mode configuration with
+  a perturbation dropped. A test reports its world's layout through it, so a world that
+  keeps the capacity and seed but not the perturbations fails before it records, and the
+  runner fails the run.
 - `harness::run_recorded` steps once per frame, records `(tick, Simulation::hash())` after
   every step, runs no pass (a `Server` world's presentation events are drained by the step
   itself), and hands the simulation back; it uses `Executor::block_on`, so it is called
@@ -560,10 +566,12 @@ for bit:
   the boundary allowlist permits; once it moves, the glue lives in one test-support crate
   outside the boundary, `lactose-sour`, that every simulation test crate dev-depends on,
   so the `#[expect]`s below live in one place. The `applied` line reports the worker count
-  from `Executor::frame_worker_count`, the layout from `World::layout` (`chunk_rows:
-  Some(n)` as `rows:n:seed`, `None` with permutation as `bytes:16384:seed`, the default as
-  `production`), and the chaos seed from `Executor::chaos_config`, so all three are what
-  the builders report rather than what the session asked for. `tests/sour.rs` is the glue
+  from `Executor::frame_worker_count`, the layout from `World::layout` through
+  `layout_mode_of` (`Rows(n)` as `rows:n:seed`, `Bytes(16384)` as `bytes:16384:seed`,
+  `Production` as `production`), and the chaos seed from `Executor::chaos_config`, so all
+  three are what the builders report rather than what the session asked for. A test with
+  several worlds writes one `applied` line per world whose hash it records; the runner
+  holds every one to the launched configuration. `tests/sour.rs` is the glue
   as the recording tests use it.
 - Every simulation test of this crate and of the game crates records this way; the package
   with such tests is listed under `[harness]` in `tools/xtask/ci-policy.toml`. Until

@@ -2305,6 +2305,17 @@ editorial pass rather than one taken from a review.
     re-simulated frames.
 - Driven by: milestone 1, the `sim` facade brief, its two design reviews and the
   implementation's reviews (2026-10-10).
+- Addendum (lane sour-evidence, 2026-11-14; review round 1):
+  `harness::layout_mode_of(&LayoutConfig) -> Result<(ChunkCapacity, u64)>` inverts
+  `layout_mode`: `(Production, 0)` for the default, `(capacity, seed)` only when the
+  configuration equals `layout_mode(capacity, seed)` in every field, and `InvalidData` for any
+  other, so a world built with a perturbation dropped fails its test before it records and the
+  runner fails the run. Every glue reports its world's layout through it rather than reading
+  `chunk_rows` and `seed` alone, and a test writes one `applied` line per world whose hash it
+  records (net-api's and net-host's client worlds included), which refines D96's one recorded
+  configuration per test; the runner holds each to the launched configuration. The review's
+  mutations that dropped the perturbations in `lactose-app`'s assembly and forced the client
+  worlds to the default layout both fail layout mode.
 
 **D119. The `physics-api` facade: what sections 4, 6.1, 9.4, 9.7, 10, 15.1 and 16 left open**
 (§4, §5.3, §6.1, §8.2, §8.3, §9.4, §9.7, §10, §15.1, §16, §17, `lactose-physics-api`,

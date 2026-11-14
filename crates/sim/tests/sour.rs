@@ -19,7 +19,7 @@ use std::num::NonZeroU32;
 use common::*;
 use lactose_core::{Error, ErrorKind, Result};
 use lactose_ecs::{Executor, LayoutConfig, RegionMode};
-use lactose_sim::harness::{ChunkCapacity, layout_mode, run_recorded};
+use lactose_sim::harness::{ChunkCapacity, layout_mode, layout_mode_of, run_recorded};
 use lactose_sim::{RegionRequest, Simulation};
 use lactose_task::ChaosConfig;
 use protocol::{Capacity, Layout, Recorder, RunConfig, Session};
@@ -75,14 +75,15 @@ impl Sour {
             workers: config.workers.map(|_| {
                 NonZeroU32::new(self.executor.frame_worker_count()).expect("at least one worker")
             }),
-            layout: if *layout == LayoutConfig::default() {
-                Layout::Production
-            } else {
-                let capacity = match layout.chunk_rows {
-                    Some(n) => Capacity::Rows(n),
-                    None => Capacity::Bytes(16 * 1024),
-                };
-                Layout::Perturbed { capacity, seed: layout.seed }
+            // The world's layout as the runner names it; one no SOUR mode builds fails here.
+            layout: match layout_mode_of(layout)? {
+                (ChunkCapacity::Production, _) => Layout::Production,
+                (ChunkCapacity::Rows(n), seed) => {
+                    Layout::Perturbed { capacity: Capacity::Rows(n), seed }
+                }
+                (ChunkCapacity::Bytes(n), seed) => {
+                    Layout::Perturbed { capacity: Capacity::Bytes(n), seed }
+                }
             },
             chaos_seed: self.executor.chaos_config().map(|chaos| chaos.seed),
         };

@@ -96,8 +96,9 @@ pub struct ConformanceReport {
 /// taken; after tick [`TICKS`] both are restored and the run continues to [`TICKS`] again.
 /// Driven with `Executor::block_on`, so it is called from a test's main thread.
 ///
-/// Fails with `InvalidData` naming the first tick whose hash differs, with what building
-/// the simulation fails with, and as a step fails.
+/// Fails with `InvalidData` naming the first tick whose hash differs, or if the world
+/// reports a layout other than `layout`, so that a SOUR test may record `layout` as the
+/// one its run applied; with what building the simulation fails with; and as a step fails.
 pub fn snapshot_restore(
     executor: &Executor,
     backend: Box<dyn PhysicsBackend>,
@@ -112,6 +113,13 @@ pub fn snapshot_restore(
         .systems(register_systems)
         .systems(register_scene)
         .build()?;
+    let built = *simulation.world().layout();
+    if built != layout {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            format!("the world reports the layout {built:?}, not {layout:?}"),
+        ));
+    }
     spawn_scene(simulation.world_mut())?;
 
     let mut first = Vec::new();

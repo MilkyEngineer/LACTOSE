@@ -319,8 +319,9 @@ impl PhysicsSnapshot {
 
     /// `xxh64` of the backend's bytes with seed zero: the place where architecture section
     /// 8.3 adds the physics world to the world hash once the backend's serialisation is
-    /// shown to be order-stable (`docs/verification.md`). Until then SOUR records nothing
-    /// of it and two equal physics worlds may hash apart.
+    /// shown to be order-stable (`docs/verification.md`). Until then SOUR records it after
+    /// the conformance run (`lactose-physics-rapier`'s `the_conformance_run`), no world hash
+    /// includes it, and two equal physics worlds may hash apart.
     #[must_use]
     pub fn hash(&self) -> u64 {
         xxh64(&self.bytes, 0)
