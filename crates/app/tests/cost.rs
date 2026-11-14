@@ -97,7 +97,8 @@ fn rapier(frame_workers: u32) -> Box<dyn PhysicsBackend> {
     lactose_physics_rapier::backend(pool)
 }
 
-/// The `casein` spans, installed once per process (nextest runs each test in its own).
+/// The step's spans (`timing`), installed once per process (nextest runs each test in its
+/// own).
 fn spans() -> &'static timing::Spans {
     let spans: &'static timing::Spans = Box::leak(Box::default());
     tracing::subscriber::set_global_default(spans).unwrap();
@@ -208,7 +209,7 @@ static EMPTY: Game = Game { name: "cost", crates: &[], order: None, sessions: No
 /// world `build_server` assembles on the default executor, its solver pool the frame
 /// workers less one, over 100,000 rows: [`BODIES`] awake bodies on a floor, [`STATICS`]
 /// fixed boxes and [`PLAIN`] rows with a transform alone. The phase is the sync, the step
-/// and the write-back, each from its `casein` span; each figure is the median over 60
+/// and the write-back, each from its system's spans (`timing`); each figure is the median over 60
 /// ticks (10 in a short run) after 30 of warm-up, and the whole server step is printed
 /// beside it. `cargo xtask measure physics-phase` runs it.
 #[test]
