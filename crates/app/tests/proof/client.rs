@@ -2,6 +2,7 @@
 //! root over a stand-in clock. Every client starts with a `snap` estimate at the server's
 //! tick zero, whose resync in the first frame puts the pacer at the clock's base.
 
+use std::collections::BTreeMap;
 use std::num::NonZeroU64;
 use std::sync::{Arc, Mutex, PoisonError};
 
@@ -529,9 +530,20 @@ enum Body {
     Landing,
 }
 
+/// Which of the claimed entity's rows each frame after the full frame carries.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Rows {
+    /// Every row, every step: more than the packer of architecture section 9.3 sends.
+    Every,
+    /// The rows that changed since the last send, as that packer sends them.
+    Changed,
+}
+
 /// What [`joined`] measured once its frames ran.
 struct Joined {
     mode: Option<RegionMode>,
+    /// The rows the frames after the full frame carried.
+    sent: usize,
     /// The tick the full frame was folded at: the join's rows, `lead` ticks stale.
     fold: u32,
     /// Every correction: the tick of the frame that made it, and the tick it restored.
@@ -545,13 +557,15 @@ struct Joined {
 
 /// A server that loads region 1 and joins the player, and a client that folds the join's
 /// full frame (the region's relevance message and the player's entity, claimed) and then
-/// runs `frames` frames, each after one server step and the claimed entity's exact rows at
-/// that step, as a packer sends them. The server is given the samples the client predicted
-/// with, so a prediction that runs the kernels and the physics as the server does is
-/// corrected once, by the first frame of the fold's tick (the full frame carries the rows
-/// of the join, which the fold places `lead` ticks later), and never after it. `frozen`
-/// sets the server's region `Frozen` by a step after the join, before the full frame.
-fn joined(body: Body, frozen: bool, frames: u32) -> Joined {
+/// runs `frames` frames, each after one server step and carrying the claimed entity's rows
+/// at that step that `rows` selects. With [`Rows::Every`] each frame carries every row,
+/// which the packer of architecture section 9.3 does not send for a row that did not
+/// change. The server is given the samples the client predicted with, so a prediction that
+/// runs the kernels and the physics as the server does is corrected once, by the first
+/// frame of the fold's tick (the full frame carries the rows of the join, which the fold
+/// places `lead` ticks later), and never after it. `frozen` sets the server's region
+/// `Frozen` by a step after the join, before the full frame.
+fn joined(body: Body, frozen: bool, rows: Rows, frames: u32) -> Joined {
     let executor = executor(2);
     let content = Content::new();
     let server = server(&executor, WorldConfig::headless(), Start::Fresh, &content);
@@ -590,6 +604,8 @@ fn joined(body: Body, frozen: bool, frames: u32) -> Joined {
     full.regions.insert(REGION, RegionChange::Relevant(relevance));
     let StableKey::Net(net) = entity else { panic!("a server entity has a NetId") };
     let components = replicated(server.simulation().world(), entity);
+    let mut last: BTreeMap<_, Vec<u8>> =
+        components.iter().map(|data| (data.component, data.bytes.clone())).collect();
     full.spawns.insert(net, StagedSpawn { origin: None, region: REGION, slot: None, components });
 
     let accepted = JoinAccepted { player: PLAYER, tick: join };
@@ -606,7 +622,7 @@ fn joined(body: Body, frozen: bool, frames: u32) -> Joined {
     assert_eq!(out.ticks, 1);
     let (mode, fold) = (world(&client).region_mode(REGION), client.tick().0);
 
-    let (mut corrected, mut resyncs) = (Vec::new(), 0);
+    let (mut corrected, mut resyncs, mut sent) = (Vec::new(), 0, 0);
     for i in 1..=frames {
         let next = Tick(server.tick().0 + 1);
         let mut input = TickInput::default();
@@ -620,7 +636,12 @@ fn joined(body: Body, frozen: bool, frames: u32) -> Joined {
         let mut delta = StagedFrame::new(server.tick());
         delta.acked_input = Some(server.tick());
         for data in replicated(server.simulation().world(), entity) {
+            if rows == Rows::Changed && last.get(&data.component) == Some(&data.bytes) {
+                continue;
+            }
             assert!(delta.push_row(entity, data.component, delta.tick, true, &data.bytes));
+            last.insert(data.component, data.bytes);
+            sent += 1;
         }
         push(&mut client, delta);
         let out;
@@ -636,6 +657,7 @@ fn joined(body: Body, frozen: bool, frames: u32) -> Joined {
     };
     let joined = Joined {
         mode,
+        sent,
         fold,
         corrected,
         resyncs,
@@ -650,7 +672,7 @@ fn joined(body: Body, frozen: bool, frames: u32) -> Joined {
 
 #[test]
 fn a_folded_region_runs_the_prediction_kernels_and_the_frames_after_correct_nothing() {
-    let run = joined(Body::None, false, 60);
+    let run = joined(Body::None, false, Rows::Every, 60);
     assert_eq!(run.mode, Some(RegionMode::Simulated), "the fold loads the region simulated");
     let ((server_tick, server_count, _), (client_tick, client_count, _)) = (run.server, run.client);
     assert!(client_tick > server_tick);
@@ -665,7 +687,7 @@ fn a_folded_region_runs_the_prediction_kernels_and_the_frames_after_correct_noth
 
 #[test]
 fn a_predicted_body_lands_as_the_servers_does_and_the_frames_after_correct_nothing() {
-    let run = joined(Body::Landing, false, 240);
+    let run = joined(Body::Landing, false, Rows::Every, 240);
     assert_eq!(run.mode, Some(RegionMode::Simulated));
     let ((server_tick, server_count, server_y), (client_tick, client_count, client_y)) =
         (run.server, run.client);
@@ -678,18 +700,41 @@ fn a_predicted_body_lands_as_the_servers_does_and_the_frames_after_correct_nothi
 }
 
 /// Pins today's behaviour, a cost stated in the README: `RegionChange` carries no mode,
-/// so a region the server holds `Frozen` with its table published is folded `Simulated`,
-/// the client's kernel advances the counter the server's does not, and nearly every
-/// frame's rows correct it. A mode variant is a `lactose-net-api` change; when it lands,
-/// this test asserts the region folds `Frozen` and the frames correct nothing.
+/// so a region the server holds `Frozen` with its table published is folded `Simulated`
+/// and the client's kernel advances the counter the server's does not. This test's frames
+/// carry every row every step, so nearly every frame corrects it; under a packer that
+/// sends changed rows only none does (the next test). A mode variant is a
+/// `lactose-net-api` change; when it lands, this test asserts the region folds `Frozen`
+/// and the frames correct nothing.
 #[test]
-fn a_region_the_server_holds_frozen_is_simulated_and_corrected_at_every_frame_today() {
-    let run = joined(Body::None, true, 60);
+fn a_region_the_server_holds_frozen_is_simulated_by_the_client_today() {
+    let run = joined(Body::None, true, Rows::Every, 60);
     assert_eq!(run.mode, Some(RegionMode::Simulated));
     let ((_, server_count, _), (_, client_count, _)) = (run.server, run.client);
     assert!(client_count > server_count, "the client's kernel ran where the server's did not");
     assert!(run.corrected.len() >= 55, "a correction at nearly every frame: {:?}", run.corrected);
     assert!(run.corrected.iter().all(|&(at, restored)| at == restored));
+    assert_eq!(run.resyncs, 0);
+}
+
+/// Pins today's cost under the packer of architecture section 9.3, which sends a row only
+/// when it changed since the last send: the server changes no row in a region it holds
+/// `Frozen`, so no frame after the full frame carries one, nothing corrects the region the
+/// client simulates, and its counter runs ahead of the server's by every frame. When a
+/// mode variant lands in `RegionChange`, this test asserts the region folds `Frozen` and
+/// the counters agree.
+#[test]
+fn a_region_the_server_holds_frozen_diverges_uncorrected_under_a_changed_rows_packer_today() {
+    let frames = 60;
+    let run = joined(Body::None, true, Rows::Changed, frames);
+    assert_eq!(run.mode, Some(RegionMode::Simulated));
+    assert_eq!(run.sent, 0, "the server changed no row of the frozen region");
+    assert_eq!(run.corrected, [], "no frame corrects the region");
+    let ((_, server_count, _), (_, client_count, _)) = (run.server, run.client);
+    assert!(
+        client_count >= server_count + frames,
+        "the client's counter ran on through every frame: {client_count} against {server_count}"
+    );
     assert_eq!(run.resyncs, 0);
 }
 
@@ -1026,7 +1071,7 @@ fn a_refusal_only_the_rollback_makes_is_reported_and_resyncs_the_content() {
 /// clock resync takes the world back before its tick, and the same region refused at the
 /// same tick again is a new refusal, reported and resynced.
 #[test]
-fn a_refusal_after_a_backward_resync_is_reported_again() {
+fn a_refusal_after_a_backward_clock_resync_is_reported_again() {
     let log = capture();
     let executor = executor(2);
     let content = Content::new();
@@ -1053,6 +1098,53 @@ fn a_refusal_after_a_backward_resync_is_reported_again() {
     assert_eq!(out.ticks, 1);
     assert_eq!(logged(&log, tracing::Level::WARN, REFUSED), 2, "reported again");
     assert_eq!(out.resync, Some(client.tick()));
+    client.shutdown();
+    executor.shutdown();
+}
+
+/// The kept refusals go with the ring when step 8's reason resyncs it: a frame older than
+/// the ring (depth two) names the loaded region `Relevant` again, so its bundle is refused
+/// at the world's next tick T and reported, and the reconciliation is `TooOld`; with a
+/// stale estimate the reason's resync lands before T. The same region refused at T again
+/// is a new refusal, reported and resynced.
+#[test]
+fn a_refusal_after_a_backward_reason_resync_is_reported_again() {
+    let log = capture();
+    let executor = executor(2);
+    let content = Content::new();
+    let clock = Clock::new();
+    let (mut client, message) = holding(&executor, &content, clock);
+    client.predictor_mut().set_depth(2).expect("a depth of two");
+    let mut periods = 9;
+    for _ in 0..4 {
+        client = frame(&executor, client, clock, periods, &mut sampled).0;
+        periods += 1;
+    }
+    let refused = Tick(client.tick().0 + 1);
+
+    client.clock(estimate(4, false));
+    let mut old = StagedFrame::new(Tick(8));
+    old.regions.insert(RegionId(1), RegionChange::Relevant(message.clone()));
+    push(&mut client, old);
+    let (mut client, out) = frame(&executor, client, clock, periods, &mut sampled);
+    periods += 1;
+    assert_eq!(logged(&log, tracing::Level::WARN, REFUSED), 1, "the refusal at T, reported");
+    assert!(out.reconciled.resync.is_some(), "the frame is older than the ring");
+    let target = out.resync.expect("the reason's resync");
+    assert!(target < refused, "back before the refused tick: {target:?}");
+    client.predictor_mut().set_depth(60).expect("the default depth");
+
+    while client.tick().0 + 1 < refused.0 {
+        client = frame(&executor, client, clock, periods, &mut sampled).0;
+        periods += 1;
+    }
+    let mut again = StagedFrame::new(client.tick());
+    again.regions.insert(RegionId(1), RegionChange::Relevant(message));
+    push(&mut client, again);
+    let (client, out) = frame(&executor, client, clock, periods, &mut sampled);
+    assert_eq!(client.tick(), refused, "the same tick");
+    assert_eq!(logged(&log, tracing::Level::WARN, REFUSED), 2, "reported again");
+    assert_eq!(out.resync, Some(client.tick()), "with a content resync");
     client.shutdown();
     executor.shutdown();
 }

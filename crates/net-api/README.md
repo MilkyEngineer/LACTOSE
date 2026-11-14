@@ -386,10 +386,15 @@ which `build`'s `derived` check does not see.
   `RegionChange::Assets` that brings the table sets it `Simulated`), and builds that world
   under `RegionControl::Directed` so the lifecycle loads the mode the bundle names. A region
   the server holds `Frozen` with its table published cannot be mirrored as such, since
-  `RegionChange` carries no mode: the client simulates it and each frame carrying its rows
-  corrects it. The sim's load path then validates everything before `create_region`, as
-  it does a save. The region's entities then arrive as spawns, which the hook applies as
-  upserts over the rows the bundle loaded.
+  `RegionChange` carries no mode: the client's prediction world simulates it, and only a
+  frame that carries its rows corrects it. The packer of architecture section 9.3 sends
+  changed rows only and the server changes none in a region it holds `Frozen`, so there the
+  client's prediction diverges uncorrected until the next full frame
+  (`crates/app/README.md`, step 2 of the client's frame). A mode variant in `RegionChange`
+  is a change to this crate, decided before `lactose-net`'s packer sends region changes.
+  The sim's load path then validates everything before `create_region`, as it does a save.
+  The region's entities then arrive as spawns, which the hook applies as upserts over the
+  rows the bundle loaded.
 - A `RegionChange::Irrelevant` becomes `TickInput::unloaded`, which despawns the region's
   entities; the tombstones sent beside it ("The staged frame") release their slots and
   handles. `RegionChange::Assets(table)` is a table published or replaced after
