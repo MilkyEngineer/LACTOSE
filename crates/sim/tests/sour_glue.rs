@@ -17,7 +17,7 @@ mod protocol;
 use std::num::NonZeroU32;
 
 use lactose_ecs::{Executor, LayoutConfig, WorldKind};
-use lactose_sim::harness::{ChunkCapacity, layout_mode, run_recorded};
+use lactose_sim::harness::{ChunkCapacity, layout_mode, layout_mode_of, run_recorded};
 use lactose_sim::{Registration, SimulationBuilder, TickInput, TypeTable};
 use lactose_task::ChaosConfig;
 use protocol::{Capacity, Layout, RunConfig, Session};
@@ -29,16 +29,13 @@ fn chaos_mode(seed: u64) -> ChaosConfig {
     ChaosConfig { seed, shuffle_steals: true, inject_yields: true, force_split: true, record: true }
 }
 
-/// The layout the world reports, as the runner spells it.
-fn applied_layout(layout: &LayoutConfig) -> Layout {
-    if *layout == LayoutConfig::default() {
-        return Layout::Production;
-    }
-    let capacity = match layout.chunk_rows {
-        Some(n) => Capacity::Rows(n),
-        None => Capacity::Bytes(16 * 1024),
-    };
-    Layout::Perturbed { capacity, seed: layout.seed }
+/// The layout a world reports, as the runner spells it; one no SOUR mode builds fails.
+fn applied_layout(layout: &LayoutConfig) -> lactose_core::Result<Layout> {
+    Ok(match layout_mode_of(layout)? {
+        (ChunkCapacity::Production, _) => Layout::Production,
+        (ChunkCapacity::Rows(n), seed) => Layout::Perturbed { capacity: Capacity::Rows(n), seed },
+        (ChunkCapacity::Bytes(n), seed) => Layout::Perturbed { capacity: Capacity::Bytes(n), seed },
+    })
 }
 
 fn register(_: &mut Registration) {}
@@ -74,7 +71,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         .build()?;
     let applied = RunConfig {
         workers: config.workers.map(|_| NonZeroU32::new(executor.frame_worker_count()).unwrap()),
-        layout: applied_layout(simulation.world().layout()),
+        layout: applied_layout(simulation.world().layout())?,
         chaos_seed: executor.chaos_config().map(|chaos| chaos.seed),
     };
     let mut recorder = session.recorder(NAME, &applied)?;

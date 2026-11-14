@@ -36,7 +36,7 @@ use lactose_core::{
 use lactose_ecs::{Executor, LayoutConfig, RegionId, World};
 use lactose_net_api::{RemoteSlot, StagedInbox};
 use lactose_reflect::Reflect;
-use lactose_sim::harness::{ChunkCapacity, layout_mode};
+use lactose_sim::harness::{ChunkCapacity, layout_mode, layout_mode_of};
 use lactose_sim::{Simulation, TickInput};
 use lactose_task::ChaosConfig;
 use protocol::{Capacity, Layout, Recorder, RunConfig, Session};
@@ -92,14 +92,15 @@ impl Sour {
             workers: config.workers.map(|_| {
                 NonZeroU32::new(self.executor.frame_worker_count()).expect("at least one worker")
             }),
-            layout: if *layout == LayoutConfig::default() {
-                Layout::Production
-            } else {
-                let capacity = match layout.chunk_rows {
-                    Some(n) => Capacity::Rows(n),
-                    None => Capacity::Bytes(16 * 1024),
-                };
-                Layout::Perturbed { capacity, seed: layout.seed }
+            // The world's layout as the runner names it; one no SOUR mode builds fails here.
+            layout: match layout_mode_of(layout)? {
+                (ChunkCapacity::Production, _) => Layout::Production,
+                (ChunkCapacity::Rows(n), seed) => {
+                    Layout::Perturbed { capacity: Capacity::Rows(n), seed }
+                }
+                (ChunkCapacity::Bytes(n), seed) => {
+                    Layout::Perturbed { capacity: Capacity::Bytes(n), seed }
+                }
             },
             chaos_seed: self.executor.chaos_config().map(|chaos| chaos.seed),
         };
@@ -261,7 +262,7 @@ fn rows_in(
 fn replicate(
     executor: &Executor,
     layout: LayoutConfig,
-    record: &mut dyn FnMut(&Simulation, Tick, u64) -> Result<()>,
+    record: &mut dyn FnMut(&Simulation, &Simulation, Tick, u64) -> Result<()>,
 ) -> Result<()> {
     let mut server = server(layout);
     populate(server.world_mut())?;
@@ -337,7 +338,7 @@ fn replicate(
         }
         let current = client.as_ref().expect("the first frame is taken");
         hashes.extend_from_slice(&current.hash()?.to_le_bytes());
-        record(&server, server.tick(), xxh64(&hashes, 0))?;
+        record(&server, current, server.tick(), xxh64(&hashes, 0))?;
     }
     // The first gather and the one after the trim; eight frames merged into the next.
     assert_eq!((fulls, merged), (2, 8));
@@ -364,9 +365,13 @@ fn a_scene_replicated_to_a_client() {
     let test = "lactose_net_api::sour::a_scene_replicated_to_a_client";
     let sour = Sour::from_env().unwrap();
     let mut recorder: Option<Recorder> = None;
-    let mut record = |server: &Simulation, tick: Tick, hash: u64| -> Result<()> {
+    let mut record = |server: &Simulation, client: &Simulation, tick: Tick, hash| -> Result<()> {
         if recorder.is_none() {
             recorder = Some(sour.recorder(test, server)?);
+            // The client world's hash is in every record too: its own applied line, which
+            // the runner holds to the launched configuration like the server's. The client
+            // is built once, before the first record.
+            sour.recorder(test, client)?;
         }
         recorder.as_mut().expect("opened").record(tick.0, hash).map_err(protocol_error)
     };
@@ -380,7 +385,7 @@ fn a_scene_replicated_to_a_client() {
 fn the_records_are_the_same_under_another_layout_and_worker_count() {
     let run = |layout: LayoutConfig, workers: u32| {
         let mut records = Vec::new();
-        let mut record = |_: &Simulation, tick: Tick, hash: u64| -> Result<()> {
+        let mut record = |_: &Simulation, _: &Simulation, tick: Tick, hash: u64| -> Result<()> {
             records.push((tick, hash));
             Ok(())
         };

@@ -577,7 +577,8 @@ gather compare it with the last tick they covered, and zero means never.
   measurement decides how many statics the prediction world may hold. `hash` is the named
   place where section 8.3 adds the bytes to the world hash once the backend's
   serialisation is shown to be order-stable (`docs/verification.md`); until then
-  `ConformanceReport::physics_hash` reports it and SOUR records nothing of it.
+  `ConformanceReport::physics_hash` reports it, `lactose-physics-rapier`'s SOUR test
+  `the_conformance_run` records its first value, and no world hash includes it.
 
 **The backend's obligations** (architecture sections 1, 2 and 8.2; the `PhysicsBackend`
 docs restate them per method)

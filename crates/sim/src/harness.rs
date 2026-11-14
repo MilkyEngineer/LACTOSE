@@ -9,8 +9,9 @@
 //!
 //! A test, in order: reads its session; builds the executor with the session's worker
 //! count and, under a chaos seed, a `ChaosConfig` with every perturbation and recording on;
-//! builds its simulation with [`layout_mode`] for the session's layout; runs its ticks
-//! through [`run_recorded`], recording [`Simulation::hash`] after every step; writes the
+//! builds its simulation with [`layout_mode`] for the session's layout; reports the layout
+//! its world was built with through [`layout_mode_of`]; runs its ticks through
+//! [`run_recorded`], recording [`Simulation::hash`] after every step; writes the
 //! executor's execution log under a chaos seed. Outside the runner the session is the
 //! production configuration and records nothing, so the same test runs under plain
 //! `cargo nextest run`.
@@ -62,6 +63,33 @@ pub fn layout_mode(capacity: ChunkCapacity, seed: u64) -> Result<LayoutConfig> {
         }
     };
     Ok(LayoutConfig { chunk_rows, seed, permute_rows: true, chunk_order, split_batches: true })
+}
+
+/// The capacity and seed [`layout_mode`] builds `layout` from: what a test reports as the
+/// layout its world was built with, read from the world rather than from its session.
+/// `(Production, 0)` for `LayoutConfig::default()`; `(capacity, seed)` when `layout` is
+/// `layout_mode(capacity, seed)` in every field.
+///
+/// Fails with `InvalidData` for any other layout, such as a layout-mode configuration with
+/// a perturbation dropped: no capacity and seed name it, so a test whose world reports it
+/// fails before it records anything, and the runner fails the run.
+pub fn layout_mode_of(layout: &LayoutConfig) -> Result<(ChunkCapacity, u64)> {
+    if *layout == LayoutConfig::default() {
+        return Ok((ChunkCapacity::Production, 0));
+    }
+    let capacity = match layout.chunk_rows {
+        Some(rows) => ChunkCapacity::Rows(rows),
+        None => ChunkCapacity::Bytes(SLAB_BYTES),
+    };
+    if layout_mode(capacity, layout.seed)? == *layout {
+        return Ok((capacity, layout.seed));
+    }
+    Err(Error::new(
+        ErrorKind::InvalidData,
+        format!(
+            "{layout:?} is no SOUR layout: not the production one, nor one `layout_mode` builds"
+        ),
+    ))
 }
 
 /// Steps `simulation` once per frame of `inputs` on `executor`, calling `record` with the

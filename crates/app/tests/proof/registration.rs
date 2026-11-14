@@ -222,10 +222,11 @@ fn a_frames_input_reaches_the_players_entity() {
 }
 
 /// The engine's registry, as `Game::types` builds it for a game with no crates of its own:
-/// every engine crate's `register_types`, in the README's order. A change to any engine
-/// type that crosses the wire or is hashed is a protocol break and moves this pin
-/// (verification row 91). `lactose-net-host`'s own pin covers only the engine crates it
-/// depends on, which leaves out `lactose-anim` and `lactose-predict`.
+/// every engine crate's `register_types`, in the README's order (the verification row
+/// "`lactose-net-api` is implemented"). A change to any covered type moves the hash; the
+/// name lists catch a change of policy, a type moving between covered and not.
+/// `lactose-net-host`'s own pin covers only the engine crates it depends on, which leaves
+/// out `lactose-anim` and `lactose-predict`.
 #[test]
 fn the_hash_of_the_engine_registry_is_pinned() {
     let empty = Game { name: "empty", crates: &[], order: None, sessions: None };

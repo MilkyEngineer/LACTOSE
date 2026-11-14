@@ -42,7 +42,7 @@ use lactose_math::{Scalar, Vec3};
 use lactose_persist::Migrations;
 use lactose_physics_api::{Collider, RigidBody, Shape, Transform, Velocity};
 use lactose_reflect::component;
-use lactose_sim::harness::{ChunkCapacity, layout_mode};
+use lactose_sim::harness::{ChunkCapacity, layout_mode, layout_mode_of};
 use lactose_sim::{
     PlayerSample, RegionBundle, RegionControl, Registration, SessionApplier, SessionEvent, Stage,
     StreamingAnchor, TickInput, TypeTable,
@@ -372,7 +372,7 @@ fn sour_run(test: &str, ticks: u32) -> Result<()> {
         workers: config.workers.map(|_| {
             NonZeroU32::new(app.executor().frame_worker_count()).expect("at least one worker")
         }),
-        layout: applied_layout(world.layout()),
+        layout: applied_layout(world.layout())?,
         chaos_seed: app.executor().chaos_config().map(|chaos| chaos.seed),
     };
     let mut recorder = session.recorder(test, &applied).map_err(protocol_error)?;
@@ -416,16 +416,13 @@ fn protocol_error(error: protocol::ProtocolError) -> Error {
     Error::new(ErrorKind::InvalidData, error.to_string())
 }
 
-/// The layout a world reports, as the runner spells it (`lactose-sim`'s glue).
-fn applied_layout(layout: &LayoutConfig) -> Layout {
-    if *layout == LayoutConfig::default() {
-        return Layout::Production;
-    }
-    let capacity = match layout.chunk_rows {
-        Some(n) => Capacity::Rows(n),
-        None => Capacity::Bytes(16 * 1024),
-    };
-    Layout::Perturbed { capacity, seed: layout.seed }
+/// The layout a world reports, as the runner spells it; one no SOUR mode builds fails.
+fn applied_layout(layout: &LayoutConfig) -> lactose_core::Result<Layout> {
+    Ok(match layout_mode_of(layout)? {
+        (ChunkCapacity::Production, _) => Layout::Production,
+        (ChunkCapacity::Rows(n), seed) => Layout::Perturbed { capacity: Capacity::Rows(n), seed },
+        (ChunkCapacity::Bytes(n), seed) => Layout::Perturbed { capacity: Capacity::Bytes(n), seed },
+    })
 }
 
 fn chaos(seed: u64) -> ChaosConfig {

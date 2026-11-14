@@ -3,9 +3,11 @@
 //! the glue `lactose-sim`'s README shows (the protocol module by `#[path]`, the executor from
 //! `lactose-task`) and `physics-api`'s test harness by path, recording `(tick, hash)` after
 //! every step. The solver pool has two threads in every mode: the pool's size is not one of
-//! SOUR's axes, and `determinism.rs` and `conformance.rs` vary it. The prediction scene also rolls back and records the re-simulated ticks again,
-//! which the runner requires equal to the first run's. Outside the runner the session is
-//! production and nothing is recorded.
+//! SOUR's axes, and `determinism.rs` and `conformance.rs` vary it. The prediction scene also
+//! rolls back and records the re-simulated ticks again, which the runner requires equal to
+//! the first run's. Beside them, `physics-api`'s conformance run with the hash of the
+//! backend's bytes, and a limited hinge driven against both its limits. Outside the runner
+//! the session is production and nothing is recorded.
 
 #![forbid(unsafe_code)]
 
@@ -31,7 +33,7 @@ use lactose_physics_api::{
     Collider, Joint, JointKind, PhysicsBackend, PhysicsCommand, PhysicsConfig, RigidBody, Shape,
     Transform, Velocity, conformance, corrected, restore, snapshot,
 };
-use lactose_sim::harness::{ChunkCapacity, layout_mode, run_recorded};
+use lactose_sim::harness::{ChunkCapacity, layout_mode, layout_mode_of, run_recorded};
 use lactose_sim::{Simulation, TickInput};
 use lactose_task::ChaosConfig;
 use protocol::{Capacity, Layout, Recorder, RunConfig, Session};
@@ -86,14 +88,15 @@ impl Sour {
             workers: config.workers.map(|_| {
                 NonZeroU32::new(self.executor.frame_worker_count()).expect("at least one worker")
             }),
-            layout: if *layout == LayoutConfig::default() {
-                Layout::Production
-            } else {
-                let capacity = match layout.chunk_rows {
-                    Some(n) => Capacity::Rows(n),
-                    None => Capacity::Bytes(16 * 1024),
-                };
-                Layout::Perturbed { capacity, seed: layout.seed }
+            // The world's layout as the runner names it; one no SOUR mode builds fails here.
+            layout: match layout_mode_of(layout)? {
+                (ChunkCapacity::Production, _) => Layout::Production,
+                (ChunkCapacity::Rows(n), seed) => {
+                    Layout::Perturbed { capacity: Capacity::Rows(n), seed }
+                }
+                (ChunkCapacity::Bytes(n), seed) => {
+                    Layout::Perturbed { capacity: Capacity::Bytes(n), seed }
+                }
             },
             chaos_seed: self.executor.chaos_config().map(|chaos| chaos.seed),
         };
@@ -379,10 +382,14 @@ fn the_conformance_run() {
 const HINGE_BASE: u64 = 2;
 const ARM: u64 = 3;
 const HINGE: u64 = 4;
-/// The hinge's limits in radians. Asymmetric, so the centre of the limit row is not zero
-/// and the `sin_cos` of half of it, the route the vendored Rapier's patch sends to `libm`
-/// (D123), is a rounded value rather than the exact one of zero.
-const HINGE_LIMITS: (f64, f64) = (-0.35, 0.8);
+/// The hinge's limits in radians, chosen so that the recording tells the vendored Rapier's
+/// patch (D123: the limit row's `sin_cos` of half its centre through `libm`) from its
+/// absence. Half the centre is 0.3075, a hard rounding case: Apple's `cos` is 0.524 ulp off
+/// there and `libm`'s is correctly rounded, so with the patch reverted the recorded hashes
+/// differ on macOS from tick 17. An easy case such as (-0.35, 0.8), whose 0.1125 every
+/// library under about 0.6 ulp rounds alike, records the same either way. Both limits stay
+/// effective: unlimited, the arm swings from the floor at about -0.47 to 2.84.
+const HINGE_LIMITS: (f64, f64) = (-0.27, 1.5);
 /// The ticks at which the arm is swung, about `+Z` and `-Z` in turn.
 const SWINGS: [u32; 3] = [30, 75, 120];
 
@@ -456,7 +463,8 @@ fn a_limited_hinge_driven_against_its_limits() {
     }
     sour.finish(test).unwrap();
     println!(
-        "hinge: from {lowest:?} to {highest:?}; {at_lo} ticks at the lower limit, {at_hi} at the upper"
+        "hinge: from {lowest:?} to {highest:?}; {at_lo} ticks at the lower limit, \
+         {at_hi} at the upper"
     );
     // Each limit is reached and holds: the arm overshoots neither by more than a twentieth
     // of a radian.
