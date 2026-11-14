@@ -6,11 +6,11 @@
 //! it off is in use: a lint attribute on a whole crate or module, an `allow` on an item,
 //! another configuration file, a `[lints]` table, or a flag in a workflow or script.
 
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use crate::policy::Policy;
 use crate::repo::{Files, is_build_configuration, is_cargo_config, unread_cargo_configuration};
-use crate::rust_source::{Attribute, attributes, items};
+use crate::rust_source::{Attribute, Impl, attributes, items};
 use crate::tiers::{TierFile, turning_on};
 use crate::workspace::{DepKind, DepSource, Package, Workspace};
 use crate::{ARCHITECTURE, Finding, POLICY_FILE, TIER_FILE};
@@ -30,6 +30,9 @@ const HARNESS_PROTOCOL: &str = "tools/xtask/src/harness/protocol.rs";
 /// The trait that declares an asset kind the simulation reads (D99).
 const SIMULATION_ASSET: &str = "SimulationAsset";
 
+/// The trait that decodes an asset kind from cooked bytes (D99).
+const LOADER: &str = "Loader";
+
 /// The `[target]` key and the flags of the pin (architecture section 8.2).
 const PIN_KEY: &str = r#"cfg(target_arch = "x86_64")"#;
 const PIN_CPU: &str = "x86-64-v3";
@@ -39,11 +42,12 @@ const PIN_FLAGS: [&str; 2] = ["-C", "target-cpu=x86-64-v3"];
 /// [`NOT_THREAD_ROUTES`], in the file's order: the float methods and the trait routes to them,
 /// the executor's worker index and the methods of its re-export, files, the environment,
 /// subprocesses and the network, and the types. The check requires the reference's entries
-/// to be exactly this list, [`THREAD_ROUTES`] and [`NOT_THREAD_ROUTES`], so a ban deleted from
-/// the reference and every copy is reported, and so is one added without being pinned here.
-/// `allow-invalid` keeps clippy quiet about an entry whatever happens to it, and no test uses
-/// most of them.
-const REQUIRED_LINT_PATHS: [&str; 189] = [
+/// to be exactly this list, [`THREAD_ROUTES`] and [`NOT_THREAD_ROUTES`], each in the table
+/// [`pinned_table`] names, so a ban deleted from the reference and every copy is reported, and
+/// so is one moved to the other table, where clippy no longer applies it, or one added without
+/// being pinned here. `allow-invalid` keeps clippy quiet about an entry whatever happens to
+/// it, and no test uses most of them.
+const REQUIRED_LINT_PATHS: [&str; 273] = [
     "f32::min",
     "f32::max",
     "f32::clamp",
@@ -144,6 +148,78 @@ const REQUIRED_LINT_PATHS: [&str; 189] = [
     "simba::simd::SimdRealField::simd_copysign",
     "simba::simd::SimdSigned::is_simd_positive",
     "simba::simd::SimdSigned::is_simd_negative",
+    "num_traits::sign::Signed::is_positive",
+    "num_traits::sign::Signed::is_negative",
+    "glam::Vec2::copysign",
+    "glam::Vec2::is_negative_bitmask",
+    "glam::Vec2::is_negative_mask",
+    "glam::Vec2::rem_euclid",
+    "glam::Vec2::div_euclid",
+    "glam::Vec3::copysign",
+    "glam::Vec3::is_negative_bitmask",
+    "glam::Vec3::is_negative_mask",
+    "glam::Vec3::rem_euclid",
+    "glam::Vec3::div_euclid",
+    "glam::Vec3A::copysign",
+    "glam::Vec3A::is_negative_bitmask",
+    "glam::Vec3A::is_negative_mask",
+    "glam::Vec3A::rem_euclid",
+    "glam::Vec3A::div_euclid",
+    "glam::Vec4::copysign",
+    "glam::Vec4::is_negative_bitmask",
+    "glam::Vec4::is_negative_mask",
+    "glam::Vec4::rem_euclid",
+    "glam::Vec4::div_euclid",
+    "glam::DVec2::copysign",
+    "glam::DVec2::is_negative_bitmask",
+    "glam::DVec2::is_negative_mask",
+    "glam::DVec2::rem_euclid",
+    "glam::DVec2::div_euclid",
+    "glam::DVec3::copysign",
+    "glam::DVec3::is_negative_bitmask",
+    "glam::DVec3::is_negative_mask",
+    "glam::DVec3::rem_euclid",
+    "glam::DVec3::div_euclid",
+    "glam::DVec4::copysign",
+    "glam::DVec4::is_negative_bitmask",
+    "glam::DVec4::is_negative_mask",
+    "glam::DVec4::rem_euclid",
+    "glam::DVec4::div_euclid",
+    "num_complex::Complex::cis",
+    "num_complex::Complex::norm",
+    "num_complex::Complex::arg",
+    "num_complex::Complex::to_polar",
+    "num_complex::Complex::from_polar",
+    "num_complex::Complex::exp",
+    "num_complex::Complex::ln",
+    "num_complex::Complex::sqrt",
+    "num_complex::Complex::cbrt",
+    "num_complex::Complex::powf",
+    "num_complex::Complex::log",
+    "num_complex::Complex::powc",
+    "num_complex::Complex::expf",
+    "num_complex::Complex::sin",
+    "num_complex::Complex::cos",
+    "num_complex::Complex::tan",
+    "num_complex::Complex::asin",
+    "num_complex::Complex::acos",
+    "num_complex::Complex::atan",
+    "num_complex::Complex::sinh",
+    "num_complex::Complex::cosh",
+    "num_complex::Complex::tanh",
+    "num_complex::Complex::asinh",
+    "num_complex::Complex::acosh",
+    "num_complex::Complex::atanh",
+    "num_complex::Complex::finv",
+    "num_complex::Complex::fdiv",
+    "num_complex::Complex::exp2",
+    "num_complex::Complex::log2",
+    "num_complex::Complex::log10",
+    "glamx::MatExt::symmetric_eigen",
+    "glamx::MatExt::symmetric_eigenvalues",
+    "glamx::MatExt::svd",
+    "approx::UlpsEq::ulps_eq",
+    "approx::UlpsEq::ulps_ne",
     "lactose_task::JobContext::slot",
     "lactose_task::ChildContext::slot",
     "lactose_task::Executor::frame_worker_count",
@@ -223,6 +299,60 @@ const REQUIRED_LINT_PATHS: [&str; 189] = [
     "hashbrown::HashSet",
     "num_traits::Float",
     "num_traits::real::Real",
+    "num_complex::Complex",
+    "glamx::SymmetricEigen3",
+    "glamx::SymmetricEigen3A",
+    "glamx::DSymmetricEigen3",
+    "glamx::Svd2",
+    "glamx::DSvd2",
+    "glamx::Svd3",
+    "glamx::Svd3A",
+    "glamx::DSvd3",
+    "simba::simd::WideF32x4",
+    "simba::simd::WideF32x8",
+    "simba::simd::WideF64x4",
+    "std::fs::File",
+    "std::fs::OpenOptions",
+    "std::fs::DirBuilder",
+    "std::net::TcpListener",
+    "std::net::TcpStream",
+    "std::net::UdpSocket",
+    "std::os::unix::net::UnixDatagram",
+    "std::os::unix::net::UnixListener",
+    "std::os::unix::net::UnixStream",
+    "std::process::Command",
+];
+
+/// The pinned entries that belong under `disallowed-types`, in the reference's order; every
+/// other pinned entry belongs under `disallowed-methods`.
+const PINNED_TYPES: [&str; 37] = [
+    "std::time::Instant",
+    "std::time::SystemTime",
+    "std::collections::HashMap",
+    "std::collections::HashSet",
+    "std::hash::RandomState",
+    "hashbrown::HashMap",
+    "hashbrown::HashSet",
+    "num_traits::Float",
+    "num_traits::real::Real",
+    "num_complex::Complex",
+    "glamx::SymmetricEigen3",
+    "glamx::SymmetricEigen3A",
+    "glamx::DSymmetricEigen3",
+    "glamx::Svd2",
+    "glamx::DSvd2",
+    "glamx::Svd3",
+    "glamx::Svd3A",
+    "glamx::DSvd3",
+    "simba::simd::WideF32x4",
+    "simba::simd::WideF32x8",
+    "simba::simd::WideF64x4",
+    "std::thread::LocalKey",
+    "rayon::iter::plumbing::Producer",
+    "rayon::iter::plumbing::UnindexedProducer",
+    "rayon::iter::plumbing::ProducerCallback",
+    "rayon::iter::plumbing::Consumer",
+    "rayon::iter::plumbing::UnindexedConsumer",
     "std::fs::File",
     "std::fs::OpenOptions",
     "std::fs::DirBuilder",
@@ -607,6 +737,18 @@ fn forbids_unsafe(body: &str) -> bool {
         .is_some_and(|lints| lints.split(',').any(|lint| lint == "unsafe_code"))
 }
 
+/// Whether one of the three lists pins `path`.
+fn is_pinned(path: &str) -> bool {
+    REQUIRED_LINT_PATHS.contains(&path)
+        || THREAD_ROUTES.contains(&path)
+        || NOT_THREAD_ROUTES.contains(&path)
+}
+
+/// The lint table a pinned path belongs in.
+fn pinned_table(path: &str) -> &'static str {
+    if PINNED_TYPES.contains(&path) { "disallowed-types" } else { "disallowed-methods" }
+}
+
 /// The reference lint file exists and still bans what section 8.2 bans.
 fn reference_lint_file(files: &Files, findings: &mut Vec<Finding>) {
     let Some(text) = files.text(REFERENCE_CLIPPY) else {
@@ -623,39 +765,55 @@ fn reference_lint_file(files: &Files, findings: &mut Vec<Finding>) {
             return;
         }
     };
-    let banned: BTreeSet<&str> = LINT_TABLES
+    // Each entry with its table: clippy reads a path only in the table it belongs to, so an
+    // entry moved to the other one bans nothing, as if deleted.
+    let banned: BTreeSet<(&str, &str)> = LINT_TABLES
         .iter()
-        .filter_map(|key| config.get(*key).and_then(toml::Value::as_array))
-        .flatten()
-        .filter_map(|entry| entry.as_str().or_else(|| entry.get("path")?.as_str()))
+        .filter_map(|table| Some((*table, config.get(*table)?.as_array()?)))
+        .flat_map(|(table, entries)| {
+            entries
+                .iter()
+                .filter_map(move |e| Some((table, e.as_str().or_else(|| e.get("path")?.as_str())?)))
+        })
         .collect();
-    // The reference's entries are exactly the three lists: none can be dropped from it and
-    // every copy at once, and none added there without being pinned here.
-    for required in REQUIRED_LINT_PATHS.iter().chain(&NOT_THREAD_ROUTES) {
-        if !banned.contains(required) {
+    // The reference's entries are exactly the three lists, each in its table: none can be
+    // dropped from it and every copy at once or moved to the other table, and none added there
+    // without being pinned here.
+    for (table, path) in &banned {
+        let wanted = pinned_table(path);
+        if is_pinned(path) && *table != wanted {
             findings.push(Finding::new(
                 REFERENCE_CLIPPY,
                 format!(
-                    "no longer disallows `{required}`, which architecture section 8.2 bans \
-                     inside the boundary"
+                    "lists `{path}` under `{table}`, where clippy does not apply it; it belongs \
+                     under `{wanted}`"
                 ),
             ));
         }
     }
-    for route in THREAD_ROUTES.iter().filter(|route| !banned.contains(*route)) {
+    let missing = |path: &&&str| !banned.contains(&(pinned_table(path), **path));
+    for required in REQUIRED_LINT_PATHS.iter().chain(&NOT_THREAD_ROUTES).filter(missing) {
         findings.push(Finding::new(
             REFERENCE_CLIPPY,
             format!(
-                "no longer disallows `{route}`, a route to a thread outside an executor, which \
-                 architecture sections 8.2 and 16 ban inside the boundary"
+                "no longer disallows `{required}` under `{}`, which architecture section 8.2 \
+                 bans inside the boundary",
+                pinned_table(required)
             ),
         ));
     }
-    let unpinned = banned.iter().filter(|path| {
-        !REQUIRED_LINT_PATHS.contains(path)
-            && !THREAD_ROUTES.contains(path)
-            && !NOT_THREAD_ROUTES.contains(path)
-    });
+    for route in THREAD_ROUTES.iter().filter(missing) {
+        findings.push(Finding::new(
+            REFERENCE_CLIPPY,
+            format!(
+                "no longer disallows `{route}` under `{}`, a route to a thread outside an \
+                 executor, which architecture sections 8.2 and 16 ban inside the boundary",
+                pinned_table(route)
+            ),
+        ));
+    }
+    let unpinned: BTreeSet<&str> =
+        banned.iter().map(|(_, path)| *path).filter(|path| !is_pinned(path)).collect();
     for path in unpinned {
         let message = if THREAD_PREFIXES.iter().any(|prefix| path.starts_with(prefix)) {
             format!(
@@ -942,95 +1100,167 @@ fn harness_packages(policy: &Policy, ws: &Workspace, files: &Files, findings: &m
     }
 }
 
-/// D99: a kind the simulation reads is decoded by its `Loader` outside the boundary, so it is
-/// declared, by `impl SimulationAsset`, only in a boundary crate, where section 8.2 holds the
-/// decoder. Shipped code is read: from each crate root under `src/`, through every
-/// out-of-line `mod` (by `#[path]` or by the file layout), skipping what a `cfg` compiles
-/// only for tests or a `[dev_only_features]` feature. A file under `src/` that no `mod` was
-/// seen to reach (one declared inside an inline module, say) is read as shipped, so a module
-/// the scan cannot place errs towards a finding.
+/// D99: a kind the simulation reads is declared, by `impl SimulationAsset`, only in a
+/// boundary crate, and decoded only there: a `Loader` outside the boundary whose `type Asset`
+/// names a kind a boundary crate declares, or is a type parameter, is reported, so the
+/// decoder stays under section 8.2.
+///
+/// Shipped code is read, from the root of each library, proc-macro and binary target,
+/// wherever it lives, through every out-of-line `mod` (by `#[path]`, by the file layout, and
+/// inside inline modules) and every `include!` of a literal path, skipping what a `cfg`
+/// compiles only for tests or a `[dev_only_features]` feature. A file is read again when a
+/// shipped route reaches it after a test-only one, and a file under `src/` that no route
+/// reaches is read as shipped, so a module the walk cannot place errs towards a finding.
+///
+/// Names are compared as written, by their last path segment: a kind brought in under
+/// another name (`use ... as`, a type alias) or a loader a macro writes is not seen, and a
+/// type outside the boundary that shares a kind's name is reported.
 fn simulation_assets(tiers: &TierFile, ws: &Workspace, files: &Files, findings: &mut Vec<Finding>) {
-    for package in ws.packages.iter().filter(|package| !tiers.in_boundary(&package.name)) {
+    let shipped = |package: &Package| {
         let listed = tiers.dev_only_features.get(&package.name).map_or(&[][..], Vec::as_slice);
         let features: Vec<String> =
             turning_on(package, listed).into_iter().map(str::to_owned).collect();
-        let shipped = format!("{}/src/", package.dir);
-        let mut scan = ModuleScan { package, files, features: &features, seen: BTreeSet::new() };
-        let roots: Vec<String> =
-            package.crate_roots.iter().filter(|root| root.starts_with(&shipped)).cloned().collect();
-        scan.from(roots, true, findings);
-        let unreached: Vec<String> = package_sources(package, files)
-            .into_iter()
-            .filter(|path| path.starts_with(&shipped) && !scan.seen.contains(*path))
-            .map(str::to_owned)
-            .collect();
-        scan.from(unreached, false, findings);
-    }
-}
-
-/// The walk of [`simulation_assets`] over one package's module tree.
-struct ModuleScan<'a> {
-    package: &'a Package,
-    files: &'a Files,
-    features: &'a [String],
-    /// Every file read so far, each read once.
-    seen: BTreeSet<String>,
-}
-
-impl ModuleScan<'_> {
-    /// Reads `starts` as shipped, crate roots if `roots`, and every module file they reach.
-    fn from(&mut self, starts: Vec<String>, roots: bool, findings: &mut Vec<Finding>) {
-        // (file, whether it is a crate root, whether it is compiled only for tests)
-        let mut queue: VecDeque<(String, bool, bool)> = VecDeque::new();
-        for start in starts {
-            if self.seen.insert(start.clone()) {
-                queue.push_back((start, roots, false));
-            }
-        }
-        while let Some((file, root, test_only)) = queue.pop_front() {
-            let Some(source) = self.files.text(&file) else {
+        shipped_impls(package, files, &features)
+    };
+    let (inside, outside): (Vec<&Package>, Vec<&Package>) =
+        ws.packages.iter().partition(|package| tiers.in_boundary(&package.name));
+    let kinds: BTreeSet<String> = inside
+        .into_iter()
+        .flat_map(shipped)
+        .filter(|(_, found)| found.trait_name == SIMULATION_ASSET && !found.self_type.is_empty())
+        .map(|(_, found)| found.self_type)
+        .collect();
+    for package in outside {
+        for (file, found) in shipped(package) {
+            let line = found.line;
+            let message = if found.trait_name == SIMULATION_ASSET {
+                format!(
+                    "line {line}: `impl {SIMULATION_ASSET}` in `{}`, which is not a boundary \
+                     crate; a kind the simulation reads is declared in a boundary crate, where \
+                     architecture section 8.2 holds its loader (D99), or only in tests",
+                    package.name
+                )
+            } else if found.trait_name == LOADER {
+                let Some(decoded) = loads_for_the_simulation(&found, &kinds) else {
+                    continue;
+                };
+                format!(
+                    "line {line}: `impl {LOADER}` in `{}`, which is not a boundary crate, \
+                     decodes {decoded}; the loader of a kind the simulation reads sits in a \
+                     boundary crate, where architecture section 8.2 holds it (D99), or only in \
+                     tests",
+                    package.name
+                )
+            } else {
                 continue;
             };
-            let found = items(&source, SIMULATION_ASSET, self.features);
-            for (line, gated) in found.impls {
-                if test_only || gated {
-                    continue;
-                }
-                findings.push(Finding::new(
-                    &file,
-                    format!(
-                        "line {line}: `impl {SIMULATION_ASSET}` in `{}`, which is not a boundary \
-                         crate; a kind the simulation reads is declared in a boundary crate, \
-                         where architecture section 8.2 holds its loader (D99), or only in \
-                         tests",
-                        self.package.name
-                    ),
-                ));
+            findings.push(Finding::new(file, message));
+        }
+    }
+}
+
+/// What a loader outside the boundary decodes, said for a finding, if it may be a kind the
+/// simulation reads: its `type Asset` names one of `kinds` by its last path segment, names a
+/// type parameter of the implementation, or cannot be read.
+fn loads_for_the_simulation(found: &Impl, kinds: &BTreeSet<String>) -> Option<String> {
+    let Some((_, asset)) = found.types.iter().find(|(name, _)| name == "Asset") else {
+        return Some(format!(
+            "a kind its text does not show (no `type Asset = ...;` in its body), which may be \
+             one a boundary crate declares a `{SIMULATION_ASSET}`"
+        ));
+    };
+    let words = || asset.split(|c: char| !c.is_ascii_alphanumeric() && c != '_');
+    if let Some(parameter) = words().find(|word| found.generics.iter().any(|g| g == word)) {
+        return Some(format!(
+            "`{asset}`, which names its type parameter `{parameter}`, so it may decode a kind \
+             a boundary crate declares a `{SIMULATION_ASSET}`"
+        ));
+    }
+    let outer = asset.split('<').next().unwrap_or_default();
+    let last = outer.rsplit("::").next().unwrap_or_default();
+    kinds
+        .contains(last)
+        .then(|| format!("`{asset}`, which a boundary crate declares a `{SIMULATION_ASSET}`"))
+}
+
+/// Every trait implementation `package` ships, with its file, each once: the walk of
+/// [`simulation_assets`] over the package's module tree.
+fn shipped_impls(package: &Package, files: &Files, features: &[String]) -> Vec<(String, Impl)> {
+    // (file, the directory its out-of-line modules sit in, whether only tests compile it)
+    let mut queue: VecDeque<(String, String, bool)> = package
+        .shipped_roots
+        .iter()
+        .map(|root| (root.clone(), parent(root).to_owned(), false))
+        .collect();
+    // Each file read, under the directory it was read with, and whether it was read as
+    // shipped: a file reached again as shipped after a test-only route is read again.
+    let mut read: BTreeMap<(String, String), bool> = BTreeMap::new();
+    let mut found: BTreeMap<(String, usize), Impl> = BTreeMap::new();
+    let mut sweep = true;
+    loop {
+        while let Some((file, dir, test_only)) = queue.pop_front() {
+            let key = (file, dir);
+            if read.get(&key).is_some_and(|&shipped| shipped || test_only) {
+                continue;
             }
-            // A crate root or `mod.rs` holds its modules beside it, any other file in the
-            // directory of its own name.
-            let dir = match file.rsplit_once('/') {
-                Some((dir, "mod.rs")) => dir.to_owned(),
-                Some((dir, _)) if root => dir.to_owned(),
-                _ => file.trim_end_matches(".rs").to_owned(),
+            read.insert(key.clone(), !test_only);
+            let (file, dir) = key;
+            let Some(source) = files.text(&file) else {
+                continue;
             };
-            for module in found.modules {
-                let candidates = match &module.path {
-                    Some(named) => module_file(&file, named).into_iter().collect(),
-                    None => vec![
-                        format!("{dir}/{}.rs", module.name),
-                        format!("{dir}/{}/mod.rs", module.name),
-                    ],
+            let items = items(&source, features);
+            for implementation in items.impls.into_iter().filter(|i| !test_only && !i.test_only) {
+                found.insert((file.clone(), implementation.line), implementation);
+            }
+            for module in items.modules {
+                let inline: String = module.inline.iter().map(|name| format!("/{name}")).collect();
+                let base = format!("{dir}{inline}");
+                let child = match &module.path {
+                    // Outside an inline module a `#[path]` is relative to the file's own
+                    // directory, inside one to the module's.
+                    Some(named) if inline.is_empty() => module_file(&file, named),
+                    Some(named) => joined(&base, named),
+                    None => [
+                        format!("{base}/{}.rs", module.name),
+                        format!("{base}/{}/mod.rs", module.name),
+                    ]
+                    .into_iter()
+                    .find(|candidate| files.contains(candidate)),
                 };
-                let child = candidates.into_iter().find(|candidate| self.files.contains(candidate));
-                if let Some(child) = child
-                    && self.seen.insert(child.clone())
-                {
-                    queue.push_back((child, false, test_only || module.test_only));
+                // A `#[path]` file holds its modules beside it, as a `mod.rs` does; a
+                // `name.rs` in the directory `name`, which is where `name/mod.rs` holds them.
+                let child_dir = match &module.path {
+                    Some(_) => child.as_deref().map(|child| parent(child).to_owned()),
+                    None => Some(format!("{base}/{}", module.name)),
+                };
+                if let (Some(child), Some(child_dir)) = (child, child_dir) {
+                    queue.push_back((child, child_dir, test_only || module.test_only));
+                }
+            }
+            // An included file is part of the module it sits in, and holds its own modules
+            // beside it.
+            for include in items.includes {
+                if let Some(child) = module_file(&file, &include.path) {
+                    let child_dir = parent(&child).to_owned();
+                    queue.push_back((child, child_dir, test_only || include.test_only));
                 }
             }
         }
+        if !std::mem::take(&mut sweep) {
+            break;
+        }
+        let src = format!("{}/src/", package.dir);
+        for path in package_sources(package, files) {
+            if path.starts_with(&src) && !read.keys().any(|(file, _)| file == path) {
+                let dir = match path.strip_suffix("/mod.rs") {
+                    Some(dir) => dir.to_owned(),
+                    None => path.trim_end_matches(".rs").to_owned(),
+                };
+                queue.push_back((path.to_owned(), dir, false));
+            }
+        }
     }
+    found.into_iter().map(|((file, _), implementation)| (file, implementation)).collect()
 }
 
 /// A boundary crate's `direct` lists name only crates its manifest names. A crate it only
@@ -1059,11 +1289,21 @@ fn unnamed_allowlist_entries(tiers: &TierFile, package: &Package, findings: &mut
 /// to the directory of `from`, as for every `mod` outside an inline module block. `None` for
 /// a path that is absolute or leaves the repository.
 fn module_file(from: &str, named: &str) -> Option<String> {
+    joined(parent(from), named)
+}
+
+/// The directory of a repository path, `""` at the root.
+fn parent(path: &str) -> &str {
+    path.rsplit_once('/').map_or("", |(dir, _)| dir)
+}
+
+/// The repository path that `named` names relative to the directory `dir`; `None` for a path
+/// that is absolute or leaves the repository.
+fn joined(dir: &str, named: &str) -> Option<String> {
     if named.starts_with(['/', '\\']) || named.get(1..2) == Some(":") {
         return None;
     }
-    let mut parts: Vec<&str> = from.split('/').collect();
-    parts.pop();
+    let mut parts: Vec<&str> = dir.split('/').filter(|part| !part.is_empty()).collect();
     for part in named.split(['/', '\\']) {
         match part {
             "" | "." => {}
@@ -1473,11 +1713,10 @@ mod tests {
     const FORBID: &str = "//! Docs.\n#![forbid(unsafe_code)]\n";
     const MANIFEST: &str = "[package]\nname = \"x\"\n[lints]\nworkspace = true\n";
 
-    /// Whether a pinned path names a function, which the fixtures put under
-    /// `disallowed-methods`, or a type.
+    /// Whether a pinned path belongs under `disallowed-methods` rather than
+    /// `disallowed-types`.
     fn names_a_function(path: &str) -> bool {
-        let last = path.rsplit("::").next().unwrap();
-        last.starts_with(|c: char| c.is_ascii_lowercase())
+        pinned_table(path) == "disallowed-methods"
     }
 
     /// The line a fixture lint file holds for `path`: a function as a table, a type as a
@@ -1719,8 +1958,8 @@ mod tests {
         assert_eq!(
             run(&ws, &files),
             [
-                "crates/core/clippy.toml: no longer disallows `f64::sin`, which architecture section 8.2 bans inside the boundary",
-                "crates/core/clippy.toml: no longer disallows `std::time::Instant`, which architecture section 8.2 bans inside the boundary",
+                "crates/core/clippy.toml: no longer disallows `f64::sin` under `disallowed-methods`, which architecture section 8.2 bans inside the boundary",
+                "crates/core/clippy.toml: no longer disallows `std::time::Instant` under `disallowed-types`, which architecture section 8.2 bans inside the boundary",
             ]
         );
     }
@@ -1740,7 +1979,8 @@ mod tests {
             assert_eq!(
                 run(&ws, &files),
                 [format!(
-                    "crates/core/clippy.toml: no longer disallows `{route}`, a route to a thread outside an executor, which architecture sections 8.2 and 16 ban inside the boundary"
+                    "crates/core/clippy.toml: no longer disallows `{route}` under `{}`, a route to a thread outside an executor, which architecture sections 8.2 and 16 ban inside the boundary",
+                    pinned_table(route)
                 )]
             );
         }
@@ -1854,9 +2094,43 @@ mod tests {
             assert_eq!(
                 run(&ws, &files),
                 [format!(
-                    "crates/core/clippy.toml: no longer disallows `{path}`, which architecture section 8.2 bans inside the boundary"
+                    "crates/core/clippy.toml: no longer disallows `{path}` under `{}`, which architecture section 8.2 bans inside the boundary",
+                    pinned_table(path)
                 )]
             );
+        }
+    }
+
+    #[test]
+    fn any_ban_moved_to_the_other_table_in_the_reference_and_every_copy_is_reported() {
+        // Review round 1, F2: clippy reads a path only in its own table, so a method under
+        // `disallowed-types`, or a type under `disallowed-methods`, bans nothing.
+        let (ws, mut files) = conforming();
+        for path in REQUIRED_LINT_PATHS.iter().chain(&THREAD_ROUTES).chain(&NOT_THREAD_ROUTES) {
+            let wanted = pinned_table(path);
+            let other = if wanted == "disallowed-types" {
+                "disallowed-methods"
+            } else {
+                "disallowed-types"
+            };
+            let moved = lint_file()
+                .replace(&entry(path), "")
+                .replace(&format!("{other} = [\n"), &format!("{other} = [\n{}", entry(path)));
+            assert_ne!(moved, lint_file(), "{path}");
+            files.insert(REFERENCE_CLIPPY, moved.clone());
+            files.insert("crates/math/clippy.toml", moved);
+            let found = run(&ws, &files);
+            let misplaced = format!(
+                "crates/core/clippy.toml: lists `{path}` under `{other}`, where clippy does not apply it; it belongs under `{wanted}`"
+            );
+            assert!(found.contains(&misplaced), "{path}: {found:?}");
+            assert!(
+                found.iter().any(|f| f.starts_with(&format!(
+                    "crates/core/clippy.toml: no longer disallows `{path}` under `{wanted}`"
+                ))),
+                "{path}: {found:?}"
+            );
+            assert_eq!(found.len(), 2, "{path}: {found:?}");
         }
     }
 
@@ -1881,6 +2155,9 @@ mod tests {
         let mut all = BTreeSet::new();
         for path in REQUIRED_LINT_PATHS.iter().chain(&THREAD_ROUTES).chain(&NOT_THREAD_ROUTES) {
             assert!(all.insert(*path), "`{path}` is pinned twice");
+        }
+        for path in PINNED_TYPES {
+            assert!(is_pinned(path), "`{path}` is a pinned type that no list pins");
         }
         // An entry under a thread prefix is classified as a route or not, never just required.
         for path in REQUIRED_LINT_PATHS {
@@ -2720,8 +2997,8 @@ mod tests {
             run(&ws, &files),
             [at("crates/task/extra/more.rs", 2), at("crates/task/src/kinds/deeper/mod.rs", 3)]
         );
-        // A module declared inside an inline one is not placed by the scan, so its file is read
-        // as shipped, wherever it sits under `src/`; outside `src/` it is not read at all.
+        // A module declared inside an inline one sits in the inline module's directory, and a
+        // file under `src/` that no route reaches is read as shipped.
         files.insert("crates/task/src/lib.rs", "mod kinds;\nmod outer {\n    mod inner;\n}\n");
         files.insert("crates/task/src/outer/inner.rs", declared);
         files.insert("crates/task/src/orphan.rs", declared);
@@ -2772,5 +3049,213 @@ mod tests {
             run(&ws, &files),
             [at("crates/task/src/lib.rs", 10), at("crates/task/src/suite.rs", 2)]
         );
+    }
+
+    /// What row 66 reports for an `impl SimulationAsset` at `line` of `file` in `lactose-task`.
+    fn declared_outside(file: &str, line: usize) -> String {
+        format!(
+            "{file}: line {line}: `impl SimulationAsset` in `lactose-task`, which is not a boundary crate; a kind the simulation reads is declared in a boundary crate, where architecture section 8.2 holds its loader (D99), or only in tests"
+        )
+    }
+
+    #[test]
+    fn every_shipped_route_to_a_simulation_asset_outside_the_boundary_is_followed() {
+        // Review round 1, F3: the review's cases A to L, and the forms its fix names. Each
+        // case is the files it adds to `lactose-task`, its shipped roots if not the library's,
+        // and what is reported.
+        let declared = "pub struct Kind;\nimpl lactose_asset_api::SimulationAsset for Kind {}\n";
+        let in_lib = |before: &str| vec![("crates/task/src/lib.rs", format!("{before}{declared}"))];
+        type Case =
+            (&'static str, Vec<(&'static str, String)>, Vec<&'static str>, (&'static str, usize));
+        let cases: Vec<Case> = vec![
+            (
+                "A: a test-only `#[path]` alias reaches the file first",
+                vec![
+                    ("crates/task/src/lib.rs", "#[cfg(test)]\n#[path = \"kinds.rs\"]\nmod test_kinds;\nmod kinds;\n".to_owned()),
+                    ("crates/task/src/kinds.rs", declared.to_owned()),
+                ],
+                vec![],
+                ("crates/task/src/kinds.rs", 2),
+            ),
+            (
+                "A: the same file and directory, reached test-only and then shipped",
+                vec![
+                    ("crates/task/src/lib.rs", "#[cfg(test)]\n#[path = \"k/mod.rs\"]\nmod t;\nmod k;\n".to_owned()),
+                    ("crates/task/src/k/mod.rs", declared.to_owned()),
+                ],
+                vec![],
+                ("crates/task/src/k/mod.rs", 2),
+            ),
+            (
+                "B: a test-only inline module's `mod kinds;` is its own file",
+                vec![
+                    ("crates/task/src/lib.rs", "#[cfg(test)]\nmod t {\n    mod kinds;\n}\nmod kinds;\n".to_owned()),
+                    ("crates/task/src/kinds.rs", declared.to_owned()),
+                    ("crates/task/src/t/kinds.rs", "\n".to_owned()),
+                ],
+                vec![],
+                ("crates/task/src/kinds.rs", 2),
+            ),
+            (
+                "B: a `#[path]` inside an inline module is relative to the module's directory",
+                vec![
+                    ("crates/task/src/lib.rs", "mod outer {\n    #[path = \"x.rs\"]\n    mod inner;\n}\n".to_owned()),
+                    ("crates/task/src/outer/x.rs", declared.to_owned()),
+                    ("crates/task/src/x.rs", "\n".to_owned()),
+                ],
+                vec![],
+                ("crates/task/src/outer/x.rs", 2),
+            ),
+            (
+                "C: a library root outside `src/`",
+                vec![("crates/task/lib.rs", declared.to_owned())],
+                vec!["crates/task/lib.rs"],
+                ("crates/task/lib.rs", 2),
+            ),
+            (
+                "C: a module of a library root outside `src/`",
+                vec![
+                    ("crates/task/lib.rs", "mod kinds;\n".to_owned()),
+                    ("crates/task/kinds.rs", declared.to_owned()),
+                ],
+                vec!["crates/task/lib.rs"],
+                ("crates/task/kinds.rs", 2),
+            ),
+            (
+                "D: a binary root read first, with a test-only alias of a shipped module",
+                vec![
+                    ("crates/task/src/lib.rs", "mod kinds;\n".to_owned()),
+                    ("crates/task/src/bin/tool.rs", "#[cfg(test)]\n#[path = \"../kinds.rs\"]\nmod k;\nfn main() {}\n".to_owned()),
+                    ("crates/task/src/kinds.rs", declared.to_owned()),
+                ],
+                vec!["crates/task/src/bin/tool.rs", "crates/task/src/lib.rs"],
+                ("crates/task/src/kinds.rs", 2),
+            ),
+            (
+                "E: `include!` of a file outside `src/`",
+                vec![
+                    ("crates/task/src/lib.rs", "include!(\"../gen/kinds.rs\");\n".to_owned()),
+                    ("crates/task/gen/kinds.rs", declared.to_owned()),
+                ],
+                vec![],
+                ("crates/task/gen/kinds.rs", 2),
+            ),
+            (
+                "E: a module of an included file sits beside it",
+                vec![
+                    ("crates/task/src/lib.rs", "mod a {\n    include!(\"../gen/kinds.rs\");\n}\n".to_owned()),
+                    ("crates/task/gen/kinds.rs", "mod more;\n".to_owned()),
+                    ("crates/task/gen/more.rs", declared.to_owned()),
+                ],
+                vec![],
+                ("crates/task/gen/more.rs", 2),
+            ),
+            ("F: `cfg(not(test))`", in_lib("#[cfg(not(test))]\n"), vec![], ("crates/task/src/lib.rs", 3)),
+            ("G: `cfg(any(test, feature))`", in_lib("#[cfg(any(test, feature = \"x\"))]\n"), vec![], ("crates/task/src/lib.rs", 3)),
+            ("H: `cfg_attr(test, ...)`", in_lib("#[cfg_attr(test, allow(dead_code))]\n"), vec![], ("crates/task/src/lib.rs", 3)),
+            ("I: `cfg(all(feature, not(test)))`", in_lib("#[cfg(all(feature = \"x\", not(test)))]\n"), vec![], ("crates/task/src/lib.rs", 3)),
+            ("J: a gated item with a `;` in brackets before it", in_lib("#[cfg(test)]\nconst N: [u8; 2] = [0; 2];\n"), vec![], ("crates/task/src/lib.rs", 4)),
+            ("K: a gated function before it", in_lib("#[cfg(test)]\nfn helper() {}\n"), vec![], ("crates/task/src/lib.rs", 4)),
+            (
+                "L: a generic header under a global path",
+                vec![("crates/task/src/lib.rs", "pub struct K<T>(T);\nunsafe impl<T: Copy> ::lactose_asset_api::SimulationAsset for K<T> where T: Default {}\n".to_owned())],
+                vec![],
+                ("crates/task/src/lib.rs", 2),
+            ),
+        ];
+        for (name, added, roots, (file, line)) in cases {
+            let (mut ws, mut files) = conforming();
+            if !roots.is_empty() {
+                ws.packages[2].shipped_roots =
+                    roots.iter().map(|root| (*root).to_owned()).collect();
+                ws.packages[2].crate_roots = ws.packages[2].shipped_roots.clone();
+            }
+            for (path, text) in &added {
+                files.insert(*path, text.as_str());
+            }
+            assert_eq!(run(&ws, &files), [declared_outside(file, line)], "{name}");
+        }
+    }
+
+    #[test]
+    fn a_loader_outside_the_boundary_for_a_kind_the_simulation_reads_is_reported() {
+        // Review round 1, F4: the review's probe, a loader in a crate outside the boundary
+        // (`task`) for a kind a boundary crate (`math`) declares, judged with the platform's
+        // `sin`.
+        let (ws, mut files) = conforming();
+        files.insert(
+            "crates/math/src/lib.rs",
+            format!(
+                "{FORBID}pub struct Clip;\nimpl lactose_asset_api::SimulationAsset for Clip {{}}\n\
+                 pub struct ClipLoader;\nimpl Loader for ClipLoader {{\n    type Asset = Clip;\n}}\n\
+                 #[cfg(test)]\nmod tests {{\n    impl SimulationAsset for Probe {{}}\n}}\n"
+            ),
+        );
+        assert_eq!(run(&ws, &files), NONE, "the kind's own loader sits in its boundary crate");
+        let probe = "//! Review probe (xtask-policy r1, row 66): a loader for a simulation kind, outside the boundary.\n\
+                     use lactose_asset_api::{AssetId, Loader};\n\
+                     use lactose_anim::{Clip, ClipLoader};\n\
+                     use lactose_core::Result;\n\
+                     \n\
+                     /// Decodes a clip, then judges it with the platform's `sin`.\n\
+                     pub struct PlatformClipLoader;\n\
+                     \n\
+                     impl Loader for PlatformClipLoader {\n\
+                     \x20   type Asset = Clip;\n\
+                     \n\
+                     \x20   fn load(&self, bytes: &[u8], dependencies: &[AssetId]) -> Result<Clip> {\n\
+                     \x20       let clip = ClipLoader.load(bytes, dependencies)?;\n\
+                     \x20       let judged = (bytes.len() as f64).sin();\n\
+                     \x20       if judged > 2.0 { ClipLoader.load(&[], dependencies) } else { Ok(clip) }\n\
+                     \x20   }\n\
+                     }\n";
+        files.insert("crates/task/src/lib.rs", "mod platform;\n");
+        files.insert("crates/task/src/platform.rs", probe);
+        let loader = |line: usize, decoded: &str| {
+            format!(
+                "crates/task/src/platform.rs: line {line}: `impl Loader` in `lactose-task`, which is not a boundary crate, decodes {decoded}; the loader of a kind the simulation reads sits in a boundary crate, where architecture section 8.2 holds it (D99), or only in tests"
+            )
+        };
+        let a_kind =
+            |asset: &str| format!("`{asset}`, which a boundary crate declares a `SimulationAsset`");
+        assert_eq!(run(&ws, &files), [loader(9, &a_kind("Clip"))]);
+
+        // Under any path, with a type parameter, and with no `type Asset` in sight.
+        files.insert(
+            "crates/task/src/platform.rs",
+            "impl lactose_asset_api::Loader for A {\n    type Asset = lactose_math::Clip;\n}\n\
+             impl<L: Loader> Loader for Wrapped<L> {\n    type Asset = L::Asset;\n}\n\
+             impl<T> Loader for Any<T> where T: Asset {\n    type Asset = Vec<T>;\n}\n\
+             impl Loader for Hidden {\n    asset_type!();\n}\n",
+        );
+        assert_eq!(
+            run(&ws, &files),
+            [
+                loader(1, &a_kind("lactose_math::Clip")),
+                loader(
+                    4,
+                    "`L::Asset`, which names its type parameter `L`, so it may decode a kind a boundary crate declares a `SimulationAsset`"
+                ),
+                loader(
+                    7,
+                    "`Vec<T>`, which names its type parameter `T`, so it may decode a kind a boundary crate declares a `SimulationAsset`"
+                ),
+                loader(
+                    10,
+                    "a kind its text does not show (no `type Asset = ...;` in its body), which may be one a boundary crate declares a `SimulationAsset`"
+                ),
+            ]
+        );
+
+        // A loader for a kind no boundary crate declares, one for a kind declared only in a
+        // boundary crate's tests, and one compiled only for tests, are not.
+        files.insert(
+            "crates/task/src/platform.rs",
+            "impl Loader for RegionBaselineLoader {\n    type Asset = RegionBaseline;\n}\n\
+             impl Loader for ProbeLoader {\n    type Asset = Probe;\n}\n\
+             #[cfg(test)]\nmod tests {\n    impl Loader for TestLoader {\n        type Asset = Clip;\n    }\n}\n\
+             impl Other for B {\n    type Asset = Clip;\n}\n",
+        );
+        assert_eq!(run(&ws, &files), NONE);
     }
 }

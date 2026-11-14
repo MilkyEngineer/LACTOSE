@@ -175,11 +175,18 @@ transitive = [
   # item of docs/verification.md).
   "safe_arch",
   # Rapier's math (D119), which `lactose-physics-rapier` reaches through `rapier3d-f64` and
-  # names only through its re-exports (`rapier3d_f64::na`, `rapier3d_f64::parry`). Under the
-  # resolved features glam and simba compute transcendentals through `libm` (simba's
-  # `libm_force`); the routes from simba's `RealField` and `SimdSigned` and from num-traits'
-  # `Float` to the standard library's float methods are banned in every boundary clippy.toml,
-  # and no boundary crate may name num-traits, which is on no `normal` list.
+  # names only through its re-exports (`rapier3d_f64::na`, `rapier3d_f64::parry`,
+  # `rapier3d_f64::glamx`). Under the resolved features simba computes transcendentals
+  # through `libm` (its `libm_force`), and so does glam, except its Euclidean division and
+  # remainder, which go through `%` (the platform's fmod); glamx's 3x3 eigen decompositions
+  # and its SVDs, and num-complex's `Complex` through num-traits' `Float`, call the standard
+  # library's float methods. Every boundary clippy.toml bans each route a boundary crate can
+  # name: simba's `RealField` and `SimdSigned` sign, min, max and copysign methods; num-traits'
+  # `Float`, `Real` and `Signed` sign tests; glam's sign-bit methods, `copysign` and Euclidean
+  # division; `Complex` and its float methods; glamx's eigen and SVD types and their `MatExt`
+  # methods; approx's `UlpsEq`; and simba's `wide` lanes, whose min and max differ between
+  # targets on the sign of zero. No boundary crate may name num-traits, which is on no
+  # `normal` list.
   "glam", "glamx", "nalgebra", "num-traits", "parry3d-f64", "simba", "wide",
   # postcard's framing helper; byte shuffling only.
   "cobs",

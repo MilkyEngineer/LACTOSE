@@ -109,6 +109,94 @@ disallowed-methods = [
   { path = "simba::simd::SimdRealField::simd_copysign", reason = "observes NaN sign", allow-invalid = true },
   { path = "simba::simd::SimdSigned::is_simd_positive", reason = "observes NaN sign", allow-invalid = true },
   { path = "simba::simd::SimdSigned::is_simd_negative", reason = "observes NaN sign", allow-invalid = true },
+  # num-traits' `Signed` is a supertrait of `RealField`, so its sign tests are callable on any
+  # scalar bounded by it; on a float they are the inherent `is_sign_positive` and
+  # `is_sign_negative`. Banned for integers too, where a comparison does the same.
+  { path = "num_traits::sign::Signed::is_positive", reason = "observes NaN sign", allow-invalid = true },
+  { path = "num_traits::sign::Signed::is_negative", reason = "observes NaN sign", allow-invalid = true },
+  # glam computes its float methods through `libm` (its `libm` feature, which Rapier's
+  # `enhanced-determinism` turns on) or by compare-and-select, except these: the sign tests
+  # read the sign bit and `copysign` copies it, NaN's included, and the Euclidean division
+  # and remainder go through `%`.
+  { path = "glam::Vec2::copysign", reason = "observes NaN sign", allow-invalid = true },
+  { path = "glam::Vec2::is_negative_bitmask", reason = "observes NaN sign", allow-invalid = true },
+  { path = "glam::Vec2::is_negative_mask", reason = "observes NaN sign", allow-invalid = true },
+  { path = "glam::Vec2::rem_euclid", reason = "goes through `%`, the platform fmod; use lactose_math", allow-invalid = true },
+  { path = "glam::Vec2::div_euclid", reason = "goes through `%`, the platform fmod; use lactose_math", allow-invalid = true },
+  { path = "glam::Vec3::copysign", reason = "observes NaN sign", allow-invalid = true },
+  { path = "glam::Vec3::is_negative_bitmask", reason = "observes NaN sign", allow-invalid = true },
+  { path = "glam::Vec3::is_negative_mask", reason = "observes NaN sign", allow-invalid = true },
+  { path = "glam::Vec3::rem_euclid", reason = "goes through `%`, the platform fmod; use lactose_math", allow-invalid = true },
+  { path = "glam::Vec3::div_euclid", reason = "goes through `%`, the platform fmod; use lactose_math", allow-invalid = true },
+  { path = "glam::Vec3A::copysign", reason = "observes NaN sign", allow-invalid = true },
+  { path = "glam::Vec3A::is_negative_bitmask", reason = "observes NaN sign", allow-invalid = true },
+  { path = "glam::Vec3A::is_negative_mask", reason = "observes NaN sign", allow-invalid = true },
+  { path = "glam::Vec3A::rem_euclid", reason = "goes through `%`, the platform fmod; use lactose_math", allow-invalid = true },
+  { path = "glam::Vec3A::div_euclid", reason = "goes through `%`, the platform fmod; use lactose_math", allow-invalid = true },
+  { path = "glam::Vec4::copysign", reason = "observes NaN sign", allow-invalid = true },
+  { path = "glam::Vec4::is_negative_bitmask", reason = "observes NaN sign", allow-invalid = true },
+  { path = "glam::Vec4::is_negative_mask", reason = "observes NaN sign", allow-invalid = true },
+  { path = "glam::Vec4::rem_euclid", reason = "goes through `%`, the platform fmod; use lactose_math", allow-invalid = true },
+  { path = "glam::Vec4::div_euclid", reason = "goes through `%`, the platform fmod; use lactose_math", allow-invalid = true },
+  { path = "glam::DVec2::copysign", reason = "observes NaN sign", allow-invalid = true },
+  { path = "glam::DVec2::is_negative_bitmask", reason = "observes NaN sign", allow-invalid = true },
+  { path = "glam::DVec2::is_negative_mask", reason = "observes NaN sign", allow-invalid = true },
+  { path = "glam::DVec2::rem_euclid", reason = "goes through `%`, the platform fmod; use lactose_math", allow-invalid = true },
+  { path = "glam::DVec2::div_euclid", reason = "goes through `%`, the platform fmod; use lactose_math", allow-invalid = true },
+  { path = "glam::DVec3::copysign", reason = "observes NaN sign", allow-invalid = true },
+  { path = "glam::DVec3::is_negative_bitmask", reason = "observes NaN sign", allow-invalid = true },
+  { path = "glam::DVec3::is_negative_mask", reason = "observes NaN sign", allow-invalid = true },
+  { path = "glam::DVec3::rem_euclid", reason = "goes through `%`, the platform fmod; use lactose_math", allow-invalid = true },
+  { path = "glam::DVec3::div_euclid", reason = "goes through `%`, the platform fmod; use lactose_math", allow-invalid = true },
+  { path = "glam::DVec4::copysign", reason = "observes NaN sign", allow-invalid = true },
+  { path = "glam::DVec4::is_negative_bitmask", reason = "observes NaN sign", allow-invalid = true },
+  { path = "glam::DVec4::is_negative_mask", reason = "observes NaN sign", allow-invalid = true },
+  { path = "glam::DVec4::rem_euclid", reason = "goes through `%`, the platform fmod; use lactose_math", allow-invalid = true },
+  { path = "glam::DVec4::div_euclid", reason = "goes through `%`, the platform fmod; use lactose_math", allow-invalid = true },
+  # nalgebra re-exports num-complex's `Complex`, and its `UnitComplex` dereferences to one, so
+  # these are callable without naming the type: each goes through num-traits' `Float`, which
+  # under the resolved `std` feature is the standard library's methods.
+  { path = "num_complex::Complex::cis", reason = "platform libm, through num_traits::Float; use lactose_math", allow-invalid = true },
+  { path = "num_complex::Complex::norm", reason = "platform libm, through num_traits::Float; use lactose_math", allow-invalid = true },
+  { path = "num_complex::Complex::arg", reason = "platform libm, through num_traits::Float; use lactose_math", allow-invalid = true },
+  { path = "num_complex::Complex::to_polar", reason = "platform libm, through num_traits::Float; use lactose_math", allow-invalid = true },
+  { path = "num_complex::Complex::from_polar", reason = "platform libm, through num_traits::Float; use lactose_math", allow-invalid = true },
+  { path = "num_complex::Complex::exp", reason = "platform libm, through num_traits::Float; use lactose_math", allow-invalid = true },
+  { path = "num_complex::Complex::ln", reason = "platform libm, through num_traits::Float; use lactose_math", allow-invalid = true },
+  { path = "num_complex::Complex::sqrt", reason = "platform libm, through num_traits::Float; use lactose_math", allow-invalid = true },
+  { path = "num_complex::Complex::cbrt", reason = "platform libm, through num_traits::Float; use lactose_math", allow-invalid = true },
+  { path = "num_complex::Complex::powf", reason = "platform libm, through num_traits::Float; use lactose_math", allow-invalid = true },
+  { path = "num_complex::Complex::log", reason = "platform libm, through num_traits::Float; use lactose_math", allow-invalid = true },
+  { path = "num_complex::Complex::powc", reason = "platform libm, through num_traits::Float; use lactose_math", allow-invalid = true },
+  { path = "num_complex::Complex::expf", reason = "platform libm, through num_traits::Float; use lactose_math", allow-invalid = true },
+  { path = "num_complex::Complex::sin", reason = "platform libm, through num_traits::Float; use lactose_math", allow-invalid = true },
+  { path = "num_complex::Complex::cos", reason = "platform libm, through num_traits::Float; use lactose_math", allow-invalid = true },
+  { path = "num_complex::Complex::tan", reason = "platform libm, through num_traits::Float; use lactose_math", allow-invalid = true },
+  { path = "num_complex::Complex::asin", reason = "platform libm, through num_traits::Float; use lactose_math", allow-invalid = true },
+  { path = "num_complex::Complex::acos", reason = "platform libm, through num_traits::Float; use lactose_math", allow-invalid = true },
+  { path = "num_complex::Complex::atan", reason = "platform libm, through num_traits::Float; use lactose_math", allow-invalid = true },
+  { path = "num_complex::Complex::sinh", reason = "platform libm, through num_traits::Float; use lactose_math", allow-invalid = true },
+  { path = "num_complex::Complex::cosh", reason = "platform libm, through num_traits::Float; use lactose_math", allow-invalid = true },
+  { path = "num_complex::Complex::tanh", reason = "platform libm, through num_traits::Float; use lactose_math", allow-invalid = true },
+  { path = "num_complex::Complex::asinh", reason = "platform libm, through num_traits::Float; use lactose_math", allow-invalid = true },
+  { path = "num_complex::Complex::acosh", reason = "platform libm, through num_traits::Float; use lactose_math", allow-invalid = true },
+  { path = "num_complex::Complex::atanh", reason = "platform libm, through num_traits::Float; use lactose_math", allow-invalid = true },
+  { path = "num_complex::Complex::finv", reason = "platform libm, through num_traits::Float; use lactose_math", allow-invalid = true },
+  { path = "num_complex::Complex::fdiv", reason = "platform libm, through num_traits::Float; use lactose_math", allow-invalid = true },
+  { path = "num_complex::Complex::exp2", reason = "platform libm, through num_traits::Float; use lactose_math", allow-invalid = true },
+  { path = "num_complex::Complex::log2", reason = "platform libm, through num_traits::Float; use lactose_math", allow-invalid = true },
+  { path = "num_complex::Complex::log10", reason = "platform libm, through num_traits::Float; use lactose_math", allow-invalid = true },
+  # glamx's 3x3 eigen decomposition calls the standard library's `acos` and `cos`, and its
+  # SVDs `sin`, `cos` and `atan2` or the eigen decomposition, whatever its `libm` feature;
+  # these reach them from a matrix without naming the types banned under disallowed-types.
+  # The 2x2 eigen decomposition, banned with them as one trait method, is exact squares and
+  # `sqrt`.
+  { path = "glamx::MatExt::symmetric_eigen", reason = "platform libm, through glamx's eigen decomposition and SVD; use lactose_math", allow-invalid = true },
+  { path = "glamx::MatExt::symmetric_eigenvalues", reason = "platform libm, through glamx's eigen decomposition and SVD; use lactose_math", allow-invalid = true },
+  { path = "glamx::MatExt::svd", reason = "platform libm, through glamx's eigen decomposition and SVD; use lactose_math", allow-invalid = true },
+  # approx's ULP comparison; glamx's rotations implement it on the bits of a NaN.
+  { path = "approx::UlpsEq::ulps_eq", reason = "observes NaN sign and payload", allow-invalid = true },
+  { path = "approx::UlpsEq::ulps_ne", reason = "observes NaN sign and payload", allow-invalid = true },
   # Architecture section 8.2: the worker index is never a semantic key, the executor's or the
   # solver pool's.
   { path = "lactose_task::JobContext::slot", reason = "the worker index is not a semantic key; key by StableKey", allow-invalid = true },
@@ -343,6 +431,24 @@ disallowed-types = [
   # none of the crates it reaches re-exports it.
   { path = "num_traits::Float", reason = "reaches the inherent float methods, platform libm among them; use lactose_math", allow-invalid = true },
   { path = "num_traits::real::Real", reason = "reaches the inherent float methods, platform libm among them; use lactose_math", allow-invalid = true },
+  # D119: nalgebra re-exports num-complex's `Complex`, whose float methods go through
+  # num-traits' `Float` to the standard library's (the methods are banned under
+  # disallowed-methods as well, for a value reached through `UnitComplex`).
+  { path = "num_complex::Complex", reason = "its float methods reach platform libm through num_traits::Float; use lactose_math", allow-invalid = true },
+  # glamx's 3x3 eigen decompositions and its SVDs call the standard library's transcendentals.
+  { path = "glamx::SymmetricEigen3", reason = "platform libm; use lactose_math", allow-invalid = true },
+  { path = "glamx::SymmetricEigen3A", reason = "platform libm; use lactose_math", allow-invalid = true },
+  { path = "glamx::DSymmetricEigen3", reason = "platform libm; use lactose_math", allow-invalid = true },
+  { path = "glamx::Svd2", reason = "platform libm; use lactose_math", allow-invalid = true },
+  { path = "glamx::DSvd2", reason = "platform libm; use lactose_math", allow-invalid = true },
+  { path = "glamx::Svd3", reason = "platform libm; use lactose_math", allow-invalid = true },
+  { path = "glamx::Svd3A", reason = "platform libm; use lactose_math", allow-invalid = true },
+  { path = "glamx::DSvd3", reason = "platform libm; use lactose_math", allow-invalid = true },
+  # simba's SIMD lanes over `wide`: lane `max` and `min` are the target's vector instructions,
+  # which differ between x86-64 and aarch64 on the sign of zero and on NaN.
+  { path = "simba::simd::WideF32x4", reason = "lane min and max differ between targets on signed zero and NaN", allow-invalid = true },
+  { path = "simba::simd::WideF32x8", reason = "lane min and max differ between targets on signed zero and NaN", allow-invalid = true },
+  { path = "simba::simd::WideF64x4", reason = "lane min and max differ between targets on signed zero and NaN", allow-invalid = true },
   # Bans `thread_local!` through the type it declares. The `disallowed-macros` lint cannot
   # be used for it: on the pinned toolchain a local `expect` does not reach an item macro.
   { path = "std::thread::LocalKey", reason = "no thread-local state inside the boundary" },

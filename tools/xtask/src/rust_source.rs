@@ -329,44 +329,73 @@ pub(crate) struct Module {
     pub(crate) path: Option<String>,
     /// Whether it is compiled only for tests (see [`items`]).
     pub(crate) test_only: bool,
+    /// The inline modules (`mod name { ... }`) it is declared in, outermost first.
+    pub(crate) inline: Vec<String>,
+}
+
+/// An `include!` of a string literal.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub(crate) struct Include {
+    /// The file it names, as written.
+    pub(crate) path: String,
+    /// Whether it is compiled only for tests (see [`items`]).
+    pub(crate) test_only: bool,
+}
+
+/// A trait implementation, `impl ... Trait for Type`.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub(crate) struct Impl {
+    /// The line of its `impl`, from 1.
+    pub(crate) line: usize,
+    /// Whether it is compiled only for tests (see [`items`]).
+    pub(crate) test_only: bool,
+    /// The last segment of the trait's path, without generic arguments.
+    pub(crate) trait_name: String,
+    /// The last segment of the implementing type's path, without generic arguments; empty
+    /// for a type that is not a path (a tuple, an array).
+    pub(crate) self_type: String,
+    /// The names of its type and const parameters.
+    pub(crate) generics: Vec<String>,
+    /// Each `type Name = Value;` in its body, as the name and the value with whitespace and
+    /// comments removed.
+    pub(crate) types: Vec<(String, String)>,
 }
 
 /// What [`items`] finds in one file.
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
 pub(crate) struct Items {
-    /// Each implementation of the trait asked for, as the line of its `impl` and whether it
-    /// is compiled only for tests.
-    pub(crate) impls: Vec<(usize, bool)>,
+    /// Each trait implementation, in order.
+    pub(crate) impls: Vec<Impl>,
     /// Each out-of-line module declaration, in order.
     pub(crate) modules: Vec<Module>,
+    /// Each `include!` of a string literal, in order.
+    pub(crate) includes: Vec<Include>,
 }
 
-/// The implementations of the trait named `name` in `source` (an `impl` whose header has
-/// `name` followed by `for`, under any path), and its out-of-line modules. An item is
-/// compiled only for tests if a `cfg` on it, on an item around it or at the top of the file
-/// holds only under `test` or a feature of `features` (`any` of such, or `all` with one).
+/// The trait implementations, out-of-line modules and literal `include!`s of `source`. An
+/// item is compiled only for tests if a `cfg` on it, on an item around it or at the top of
+/// the file holds only under `test` or a feature of `features` (`any` of such, or `all`
+/// with one).
 ///
-/// Token reading, not parsing: an impl a macro expands to is not seen, a trait imported
-/// under another name is not recognised, and a header `impl Trait for` inside a
-/// `macro_rules!` body is reported as if it were an impl.
-pub(crate) fn items(source: &str, name: &str, features: &[String]) -> Items {
-    enum Token<'a> {
-        Word(&'a str),
-        Other,
-    }
+/// Token reading, not parsing: an item a macro expands to is not seen, a trait imported
+/// under another name is read under that name, an `include!` of anything but a literal is
+/// not followed, and an `impl Trait for` header inside a `macro_rules!` body is reported as
+/// if it were an implementation.
+pub(crate) fn items(source: &str, features: &[String]) -> Items {
     let bytes = source.as_bytes();
-    let line = |at: usize| source[..at].matches('\n').count() + 1;
     let mut found = Items::default();
-    // Whether each open brace level is compiled only for tests; the first is the file.
-    let mut levels = vec![false];
+    // One entry per open brace; the first is the file.
+    let mut levels = vec![Level::default()];
     // The item being read: its tokens, where its `impl` is, and its outer attributes.
-    let mut header: Vec<Token<'_>> = Vec::new();
+    let mut header: Vec<Token> = Vec::new();
     let mut impl_at = None;
     let mut gated = false;
     let mut path = None;
+    // Open parentheses and brackets in the item, inside which a `;` ends nothing.
+    let mut nesting = 0usize;
     let mut i = 0;
     while i < bytes.len() {
-        let enclosing = levels.last().copied().unwrap_or(false);
+        let enclosing = levels.last().is_some_and(|level| level.test_only);
         let byte = bytes[i];
         if byte.is_ascii_whitespace() {
             i += 1;
@@ -378,41 +407,57 @@ pub(crate) fn items(source: &str, name: &str, features: &[String]) -> Items {
             let body = &source[open + 1..end - 1];
             if inner {
                 if let Some(level) = levels.last_mut() {
-                    *level |= cfg_test_only(body, features);
+                    level.test_only |= cfg_test_only(body, features);
                 }
             } else {
                 gated |= cfg_test_only(body, features);
                 path = path.or_else(|| path_value(body));
             }
             i = end;
-        } else if matches!(byte, b'{' | b'}' | b';') {
-            let words: Vec<&str> = header
-                .iter()
-                .map(|token| match token {
-                    Token::Word(word) => *word,
-                    Token::Other => "",
-                })
-                .collect();
-            let implements = words.windows(2).any(|pair| pair == [name, "for"]);
-            if let (Some(at), true, b'{' | b';') = (impl_at, implements, byte) {
-                found.impls.push((line(at), enclosing || gated));
+        } else if matches!(byte, b'{' | b'}') || byte == b';' && nesting == 0 {
+            let test_only = enclosing || gated;
+            for literal in included(&header, source) {
+                found.includes.push(Include { path: literal, test_only });
+            }
+            let mut opened = None;
+            if let (Some(at), b'{' | b';') = (impl_at, byte)
+                && let Some(implementation) = implementation(&header[at..], source, test_only)
+            {
+                opened = Some(found.impls.len());
+                found.impls.push(implementation);
             }
             if byte == b';'
-                && let [.., "mod", module] = words[..]
-                && !module.is_empty()
+                && let Some(index) = levels.last().and_then(|level| level.implementation)
+                && let Some(alias) = associated_type(&header, source)
             {
-                found.modules.push(Module {
-                    name: module.to_owned(),
-                    path: path.take(),
-                    test_only: enclosing || gated,
-                });
+                found.impls[index].types.push(alias);
             }
-            match byte {
-                b'{' => levels.push(enclosing || gated),
-                b'}' if levels.len() > 1 => {
-                    levels.pop();
+            let module = match header[..] {
+                [.., keyword, name] if keyword.is(source, "mod") && name.kind == Kind::Word => {
+                    Some(name.text(source).to_owned())
                 }
-                _ => {}
+                _ => None,
+            };
+            match byte {
+                b';' => {
+                    if let Some(name) = module {
+                        found.modules.push(Module {
+                            name,
+                            path: path.take(),
+                            test_only,
+                            inline: levels.iter().filter_map(|l| l.module.clone()).collect(),
+                        });
+                    }
+                }
+                b'{' => {
+                    levels.push(Level { test_only, module, implementation: opened, nesting });
+                    nesting = 0;
+                }
+                _ => {
+                    if levels.len() > 1 {
+                        nesting = levels.pop().map_or(0, |level| level.nesting);
+                    }
+                }
             }
             (header, impl_at, gated, path) = (Vec::new(), None, false, None);
             i += 1;
@@ -421,22 +466,176 @@ pub(crate) fn items(source: &str, name: &str, features: &[String]) -> Items {
                 .then(|| skip_raw_string(bytes, i + 1))
                 .flatten()
         }) {
-            header.push(Token::Other);
+            header.push(Token { start: i, end, kind: Kind::Literal });
             i = end;
         } else if is_ident(byte) {
             let end = bytes[i..].iter().position(|b| !is_ident(*b)).map_or(bytes.len(), |n| i + n);
-            let word = &source[i..end];
-            if word == "impl" && impl_at.is_none() {
-                impl_at = Some(i);
+            if &source[i..end] == "impl" && impl_at.is_none() {
+                impl_at = Some(header.len());
             }
-            header.push(Token::Word(word));
+            header.push(Token { start: i, end, kind: Kind::Word });
             i = end;
         } else {
-            header.push(Token::Other);
-            i += source[i..].chars().next().map_or(1, char::len_utf8);
+            let end = i + source[i..].chars().next().map_or(1, char::len_utf8);
+            match byte {
+                b'(' | b'[' => nesting += 1,
+                b')' | b']' => nesting = nesting.saturating_sub(1),
+                _ => {}
+            }
+            header.push(Token { start: i, end, kind: Kind::Punct });
+            i = end;
         }
     }
     found
+}
+
+/// One open brace of [`items`].
+#[derive(Default)]
+struct Level {
+    /// Whether what it holds is compiled only for tests.
+    test_only: bool,
+    /// The name of the inline module it opens.
+    module: Option<String>,
+    /// The index in [`Items::impls`] of the implementation whose body it opens.
+    implementation: Option<usize>,
+    /// The parentheses and brackets open outside it.
+    nesting: usize,
+}
+
+/// A word, a literal or one other character of [`items`]' source, by its byte range.
+#[derive(Clone, Copy)]
+struct Token {
+    start: usize,
+    end: usize,
+    kind: Kind,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    Word,
+    Literal,
+    Punct,
+}
+
+impl Token {
+    fn text(self, source: &str) -> &str {
+        &source[self.start..self.end]
+    }
+
+    fn is(self, source: &str, text: &str) -> bool {
+        self.kind != Kind::Literal && self.text(source) == text
+    }
+}
+
+/// The change in angle, parenthesis and bracket depth at `tokens[at]`. The `>` of `->`
+/// closes nothing.
+fn depth_change(tokens: &[Token], at: usize, source: &str) -> isize {
+    let token = tokens[at];
+    if token.kind != Kind::Punct {
+        return 0;
+    }
+    match token.text(source) {
+        "<" | "(" | "[" => 1,
+        ">" if at > 0 && tokens[at - 1].is(source, "-") && tokens[at - 1].end == token.start => 0,
+        ">" | ")" | "]" => -1,
+        _ => 0,
+    }
+}
+
+/// The trait implementation whose header is `tokens`, from its `impl` to the `{` or `;`
+/// that ends it; `None` for an inherent implementation or a header that is not one.
+fn implementation(tokens: &[Token], source: &str, test_only: bool) -> Option<Impl> {
+    let mut generics = Vec::new();
+    let mut at = 1;
+    // `impl<...>`: each parameter's name follows the `<` or a `,` at depth one; a lifetime's
+    // follows a `'` and is skipped.
+    if tokens.get(at).is_some_and(|token| token.is(source, "<")) {
+        let mut depth = 0isize;
+        let mut expecting = false;
+        while at < tokens.len() {
+            depth += depth_change(tokens, at, source);
+            let token = tokens[at];
+            at += 1;
+            if depth == 0 {
+                break;
+            }
+            if depth == 1 && (token.is(source, "<") || token.is(source, ",")) {
+                expecting = true;
+            } else if expecting && token.kind == Kind::Word && !token.is(source, "const") {
+                generics.push(token.text(source).to_owned());
+                expecting = false;
+            } else if token.kind != Kind::Word {
+                expecting = false;
+            }
+        }
+    }
+    // The trait's path runs to the first `for` at depth zero that is not `for<...>`.
+    let mut depth = 0isize;
+    let mut trait_name = None;
+    let mut split = None;
+    for index in at..tokens.len() {
+        let token = tokens[index];
+        if depth == 0
+            && token.is(source, "for")
+            && !tokens.get(index + 1).is_some_and(|next| next.is(source, "<"))
+        {
+            split = Some(index);
+            break;
+        }
+        if depth == 0 && token.kind == Kind::Word {
+            trait_name = Some(token.text(source));
+        }
+        depth += depth_change(tokens, index, source);
+    }
+    let (split, trait_name) = (split?, trait_name?);
+    let mut depth = 0isize;
+    let mut self_type = "";
+    for index in split + 1..tokens.len() {
+        let token = tokens[index];
+        if depth == 0 && token.kind == Kind::Word {
+            if token.is(source, "where") {
+                break;
+            }
+            self_type = token.text(source);
+        }
+        depth += depth_change(tokens, index, source);
+    }
+    Some(Impl {
+        line: source[..tokens[0].start].matches('\n').count() + 1,
+        test_only,
+        trait_name: trait_name.to_owned(),
+        self_type: self_type.to_owned(),
+        generics,
+        types: Vec::new(),
+    })
+}
+
+/// The name and value of `type Name = Value;` if `tokens`, an item without its `;`, is one.
+fn associated_type(tokens: &[Token], source: &str) -> Option<(String, String)> {
+    match tokens {
+        [keyword, name, equals, first, ..]
+            if keyword.is(source, "type") && name.kind == Kind::Word && equals.is(source, "=") =>
+        {
+            let last = tokens[tokens.len() - 1];
+            Some((name.text(source).to_owned(), code_only(&source[first.start..last.end])))
+        }
+        _ => None,
+    }
+}
+
+/// The literal of each `include!("...")` among `tokens`.
+fn included(tokens: &[Token], source: &str) -> Vec<String> {
+    tokens
+        .windows(5)
+        .filter(|w| {
+            w[0].is(source, "include")
+                && w[1].is(source, "!")
+                && w[2].is(source, "(")
+                && w[3].kind == Kind::Literal
+                && w[4].is(source, ")")
+        })
+        .filter_map(|w| string_value(source, w[3].start))
+        .collect()
 }
 
 /// Whether an attribute's text is a `cfg` that holds only under `test` or a feature of
@@ -571,9 +770,19 @@ mod tests {
         }
     }
 
-    fn impls(source: &str, features: &[&str]) -> Vec<(usize, bool)> {
+    fn found(source: &str, features: &[&str]) -> Items {
         let features: Vec<String> = features.iter().map(|f| (*f).to_owned()).collect();
-        items(source, "Asset", &features).impls
+        items(source, &features)
+    }
+
+    /// The line of each implementation of `Asset` and whether it is compiled only for tests.
+    fn impls(source: &str, features: &[&str]) -> Vec<(usize, bool)> {
+        found(source, features)
+            .impls
+            .into_iter()
+            .filter(|implementation| implementation.trait_name == "Asset")
+            .map(|implementation| (implementation.line, implementation.test_only))
+            .collect()
     }
 
     #[test]
@@ -627,20 +836,87 @@ mod tests {
     fn out_of_line_modules_are_found_with_their_path_and_gate() {
         let source = "mod a;\npub(crate) mod b {}\n#[path = \"x/c.rs\"]\nmod c;\n\
                       #[cfg(test)]\nmod d;\nmod e { mod f; }\n#[cfg(feature = \"dev\")] mod g;\n";
-        let module = |name: &str, path: Option<&str>, test_only| Module {
+        let module = |name: &str, path: Option<&str>, test_only, inline: &[&str]| Module {
             name: name.to_owned(),
             path: path.map(str::to_owned),
             test_only,
+            inline: inline.iter().map(|m| (*m).to_owned()).collect(),
         };
         assert_eq!(
-            items(source, "Asset", &["dev".to_owned()]).modules,
+            found(source, &["dev"]).modules,
             [
-                module("a", None, false),
-                module("c", Some("x/c.rs"), false),
-                module("d", None, true),
-                module("f", None, false),
-                module("g", None, true),
+                module("a", None, false, &[]),
+                module("c", Some("x/c.rs"), false, &[]),
+                module("d", None, true, &[]),
+                module("f", None, false, &["e"]),
+                module("g", None, true, &[]),
             ]
         );
+        // The inline modules around a declaration, but not the other blocks.
+        let source = "#[cfg(test)]\nmod t {\n    mod u { fn f() {} mod v; }\n    impl X { }\n    mod w;\n}\n";
+        assert_eq!(
+            found(source, &[]).modules,
+            [module("v", None, true, &["t", "u"]), module("w", None, true, &["t"])]
+        );
+    }
+
+    #[test]
+    fn an_implementation_knows_its_trait_type_parameters_and_associated_types() {
+        let source = "impl<'a, T: Fn(&'a u8) -> Vec<u8>, const N: usize> crate::x::Loader<T> \
+                      for k::Kind<'a, T, N> where T: for<'b> Fn(&'b u8) {\n\
+                          type Asset = lactose_anim::Clip; // c\n\
+                          type Error = Vec< T >;\n\
+                          fn f() { type Inner = u8; let _ = [0u8; 2]; }\n\
+                      }\n\
+                      impl Other for [u8; 4] { type Asset = A; }\n\
+                      impl<T> Inherent<T> { type Asset = A; }\n\
+                      impl !Send for (A, B) {}\n";
+        let words = |words: &[&str]| words.iter().map(|w| (*w).to_owned()).collect();
+        let pair = |a: &str, b: &str| (a.to_owned(), b.to_owned());
+        let implementation = |line, trait_name: &str, generics, types| Impl {
+            line,
+            test_only: false,
+            trait_name: trait_name.to_owned(),
+            self_type: String::new(),
+            generics,
+            types,
+        };
+        assert_eq!(
+            found(source, &[]).impls,
+            [
+                Impl {
+                    self_type: "Kind".to_owned(),
+                    ..implementation(
+                        1,
+                        "Loader",
+                        words(&["T", "N"]),
+                        vec![pair("Asset", "lactose_anim::Clip"), pair("Error", "Vec<T>")],
+                    )
+                },
+                implementation(6, "Other", Vec::new(), vec![pair("Asset", "A")]),
+                implementation(8, "Send", Vec::new(), Vec::new()),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_literal_include_is_found_with_its_gate() {
+        let source = "include!(\"a.rs\");\n#[cfg(test)]\nmod t { include!(r\"b.rs\"); }\n\
+                      fn f() -> u8 { include!(\"c.rs\") }\n\
+                      include!(concat!(env!(\"OUT_DIR\"), \"/d.rs\"));\n\
+                      const S: &str = include_str!(\"e.rs\");\n";
+        let include = |path: &str, test_only| Include { path: path.to_owned(), test_only };
+        assert_eq!(
+            found(source, &[]).includes,
+            [include("a.rs", false), include("b.rs", true), include("c.rs", false)]
+        );
+    }
+
+    #[test]
+    fn a_semicolon_inside_brackets_ends_no_item() {
+        // The gate on the constant is the constant's alone.
+        let source = "#[cfg(test)]\nconst N: [u8; 2] = [0; 2];\nimpl Asset for A {}\n\
+                      #[cfg(test)]\nfn f() -> [u8; 2] { [0; 2] }\nimpl Asset for B {}\n";
+        assert_eq!(impls(source, &[]), [(3, false), (6, false)]);
     }
 }

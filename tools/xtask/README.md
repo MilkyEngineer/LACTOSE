@@ -65,8 +65,15 @@ on, and a listed feature the crate does not declare are findings.
   or cite section 16, so none can be dropped quietly behind `allow-invalid`), one of the few
   entries under `rayon::`, `rapier3d_f64::`, `parry3d_f64::` or `std::thread::` that start
   no thread (`NOT_THREAD_ROUTES`), or in `REQUIRED_LINT_PATHS`, the rest in the reference's
-  order. An entry the file drops, and an entry it adds that none of the three lists holds,
-  are findings, so the reference's banned set equals the union of the three.
+  order. Each is pinned with its table: `PINNED_TYPES` lists the entries that belong under
+  `disallowed-types`, every other one belongs under `disallowed-methods`, and clippy applies
+  a path only in its own table. An entry the file drops or moves to the other table, and an
+  entry it adds that none of the three lists holds, are findings, so the reference's banned
+  set equals the union of the three, each entry in its table. `tests/boundary_lints.rs` runs
+  clippy with the reference over a probe that calls each route D119 bans through the
+  solver's math crates (simba, num-traits, num-complex, glam, glamx, approx), one line per
+  route, and requires every line refused: each of those entries carries `allow-invalid`,
+  which would otherwise hide a path that stopped resolving.
 - Each other crate of `[boundary_internal] any` compiles into every boundary crate and has a
   `clippy.toml` whose entries under the paths that reach files, the environment, a
   subprocess or the network, or create a thread through the standard library (`OUTSIDE_WORLD` in `src/boundary.rs`), are
@@ -122,16 +129,26 @@ on, and a listed feature the crate does not declare are findings.
 - The packages whose sources include the harness protocol (`src/harness/protocol.rs`) by
   `#[path]` are exactly `[harness]` `packages`: a package that records and is not listed
   is never launched, and one listed that does not record proves nothing.
-- `impl SimulationAsset` appears in a crate outside the boundary only in code compiled for
-  tests (D99: a kind the simulation reads is declared where section 8.2 holds its loader).
-  Shipped code is read from each crate root under `src/`, through every out-of-line `mod`,
-  by `#[path]` or the file layout; an item under a `cfg` that holds only for `test` or a
-  `[dev_only_features]` feature (or one that turns it on) is skipped, as are `tests/`,
-  `benches/` and `examples/`. A file under `src/` that no `mod` is seen to reach (one
-  declared inside an inline module, say) is read as shipped, unless its own inner `cfg`
-  says otherwise. The scan reads tokens: an impl a macro writes is not seen, nor
-  one of the trait imported under another name, and an `impl SimulationAsset for` header in a
-  `macro_rules!` body is reported as if it were an impl.
+- D99: outside the boundary, `impl SimulationAsset` and a `Loader` for a kind the
+  simulation reads appear only in code compiled for tests, so a kind is declared, and
+  decoded, where section 8.2 holds its loader. The kinds are the implementing types of the
+  shipped `impl SimulationAsset`s of the boundary crates. A shipped `impl Loader` outside
+  the boundary is a finding when its `type Asset` names a kind by its last path segment
+  (`lactose_anim::Clip` is `Clip`), names a type parameter of the impl (`T`, `Vec<T>`,
+  `L::Asset`), or is not in its body as written.
+  Shipped code is read from the root of each library, proc-macro and binary target,
+  wherever it lives, through every out-of-line `mod` (by `#[path]`, by the file layout, and
+  inside inline modules, whose names are directories) and every `include!` of a string
+  literal, with rustc's rules for where each one's own modules sit. An item under a `cfg`
+  that holds only for `test` or a `[dev_only_features]` feature (or one that turns it on)
+  is skipped, as are `tests/`, `benches/`, `examples/` and the build script. A file reached
+  by a shipped route after a test-only one is read again as shipped, and a file under
+  `src/` that no route reaches is read as shipped, unless its own inner `cfg` says
+  otherwise. The scan reads tokens and compares names as written: an impl a macro writes is
+  not seen, nor an `include!` whose path is not a literal (`concat!(env!(...))`), nor a
+  trait or kind brought in under another name (`use ... as`, a type alias); a type outside
+  the boundary that shares a kind's name is reported; and an `impl ... for` header in a
+  `macro_rules!` body is read as if it were an impl.
 - No cargo configuration file has an `include` key, and no `.cargo` directory or cargo
   configuration file is a symbolic link: cargo would read through either what no check
   reads. `vendor` refuses both through the same function.
