@@ -27,7 +27,9 @@ interface matter more than volume.
 ## Environment
 
 - Run `. "$HOME/.cargo/env"` before any cargo command. The toolchain is pinned by
-  `rust-toolchain.toml`. Nightly is for Miri only: `cargo +nightly miri test -p <crate>`.
+  `rust-toolchain.toml`. Nightly is for Miri only, and only the one `.github/workflows/nightly.yml`
+  pins as `MIRI_TOOLCHAIN`: `cargo +nightly-2026-10-04 miri test -p <crate>`. Another nightly
+  rebuilds the shared Miri sysroot under every other agent's run.
 - Never set `RUSTFLAGS` (it replaces the x86-64-v3 pin in `.cargo/config.toml`). Always run
   cargo from inside the worktree.
 - This machine is an Apple M1 (4 performance, 4 efficiency cores). x86-64 binaries cannot run
@@ -96,7 +98,7 @@ into your report:
 - `cargo nextest run --workspace --no-tests=pass`
 - `cargo xtask sour run --pr` when a crate inside the determinism boundary or under
   `[harness]` changed
-- `cargo +nightly miri test -p <crate>` for every crate of yours that contains `unsafe`
+- `cargo +nightly-2026-10-04 miri test -p <crate>` for every crate of yours that contains `unsafe`
 - any extra proof your brief names, run after your final change, not before it
 
 Run the workspace clippy, workspace nextest, sour and Miri commands above through `cargo xtask

@@ -23,7 +23,9 @@ pushed to. You never push and never open a pull request.
 ## Environment
 
 - `. "$HOME/.cargo/env"` before any cargo command. Never set `RUSTFLAGS`. Nightly is for
-  Miri only: `cargo +nightly miri test -p <crate>`.
+  Miri only, and only the one `.github/workflows/nightly.yml` pins as `MIRI_TOOLCHAIN`:
+  `cargo +nightly-2026-10-04 miri test -p <crate>`. Another nightly rebuilds the shared Miri
+  sysroot under every other agent's run.
 - `cargo xtask` runs `--locked`: after any manifest change or `Cargo.lock` conflict,
   regenerate the lock with `cargo metadata --format-version 1 > /dev/null`.
 - Never `git add -A` and never `git stash`. Stage files by name.
@@ -68,7 +70,8 @@ pushed to. You never push and never open a pull request.
    and `.../ar.sh`, stand-ins that create empty objects and archives (clippy never links; the
    path must be absolute, because the cc crate runs the compiler from the build script's
    directory); when it touches `lactose-ecs` or `lactose-core`,
-   `cargo +nightly miri test -p <crate>` (about twelve minutes for the ECS); when it touches
+   `cargo +nightly-2026-10-04 miri test -p <crate>` (about 40 minutes for the ECS on CI, longer on
+   a loaded machine); when it touches
    `lactose-task`, `cargo test -p lactose-task --features loom --release`.
 6. A gate that fails: stop, leave the merge uncommitted, and report the gate and its output.
    Do not fix code. The coordinator decides whether the lane fixes it or the merge is
