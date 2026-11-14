@@ -541,12 +541,14 @@ hands out by `&mut` (`World::resource_mut`, `ResMut`), so a bind and a restore l
 world resource as its writer left it: one that held a `Net` key bound later would keep
 it where every row holds the origin key, and a restore would put back whatever the
 snapshot held. No engine resource holds a reference, and none may. The refusal is the
-ECS's and not this crate's, so that it has no gap: `World::insert_resource`, the one way
-a world resource enters a world, does not compile for a type whose layout holds an
-`EntityRef` at any depth (`crates/ecs/README.md`, "Snapshots and bulk copy"), whether or
-not the type is registered and whether a setup function, a hook or an exclusive system
-inserts it. `build` therefore checks nothing for it. State that names an entity is a
-component, or a region resource, of a pinned region when it belongs to none.
+ECS's and not this crate's, so that it covers every insert: `World::insert_resource` does
+not build for a type whose layout holds an `EntityRef` at any depth
+(`crates/ecs/README.md`, "Snapshots and bulk copy"), whether or not the type is
+registered and whether a setup function, a hook or an exclusive system inserts it.
+`build` therefore checks nothing for it. A reflected type handed to
+`World::insert_service` instead is a service, which that assertion does not see and
+whose keys are its owner's to keep. State that names an entity is a component, or a
+region resource, of a pinned region when it belongs to none.
 
 The hash is a pure function of that state: identical under every chunk layout, worker
 count, archetype history and registration order, on x86-64 and aarch64. The encoding, bit

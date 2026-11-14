@@ -194,9 +194,9 @@ impl SimulationBuilder {
     /// [`TypeTable`] knows (the README says why and what the check does not cover). It
     /// holds no entity reference either: the world rewrites the references of rows and
     /// region resources at a bind and at a restore, never a world resource's, so
-    /// [`World::insert_resource`] does not compile for a type whose layout holds an
+    /// [`World::insert_resource`] does not build for a type whose layout holds an
     /// `EntityRef` at any depth (D142; a facade until the lane `binds-impl`). That refusal
-    /// is the world's and has no gap, so `build` checks nothing for it.
+    /// is the world's, at every insert, so `build` checks nothing for it.
     #[must_use]
     pub fn setup(mut self, f: impl FnOnce(&mut World) -> Result<()> + Send + 'static) -> Self {
         self.setups.push(Box::new(f));

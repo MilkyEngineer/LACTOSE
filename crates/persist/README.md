@@ -374,8 +374,7 @@ export:
   registry's (the table's). `Migrations::migrate` decides, in this order: a document
   version above the registry's is `VersionMismatch` (a newer save than the build); equal
   versions with an equal `LayoutDigest` are the fast path (the value is used as it is, the
-  bulk-copy path of the ECS, which rewrites no reference; no step, no validation here);
-  equal versions with
+  ECS's bulk copy of a row's bytes; no step, no validation here); equal versions with
   different digests are `VersionMismatch`, a layout changed without a bump, which the
   macros cannot see, so it is caught here; else every step from the document's version up
   to the registry's version minus one must be registered (`VersionMismatch` naming the
