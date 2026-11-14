@@ -2,47 +2,48 @@
 
 The precision half of architecture section 16's scalar rule (milestone 1 plan, decision 5.4;
 verification row "Scalar precision"), and the reading for the row "Rapier's 64-bit build uses
-SIMD".
+SIMD". Run 2 is the result. Run 1 is kept below: its control failed, and the probe was
+redesigned.
+
+## Answer
+
+- **The 64-bit control passes.** Every 64-bit pair stays at or under 0.0319 mm at every tick
+  of the ten minutes. Every run in both precisions passes the self-check.
+- **32 bits fails the one-millimetre rule at 6 km.** The largest difference is 157.75 mm on the
+  (6000, 0, 6000) pair and 94.38 mm on the (6000, 0, 0) pair. Both are about a hundred times
+  the limit, and both are reached in the first 30 seconds. Before the walker first touches a
+  block, the two pairs differ by 88.14 mm and 34.07 mm. The 12 km pair, which is informative
+  only, reaches 120.84 mm without touching any block. By section 16's rule 64 bits stays, and
+  the rule's SOUR half is moot.
+- **Row 41: yes for the contact solver, scalar elsewhere.** In the 64-bit build every
+  rigid-body contact constraint is solved by 4-lane `wide::f64x4` kernels. Those kernels are
+  NEON `.2d` on aarch64 and AVX `ymm` on x86-64-v3. The glam-based code around them is scalar
+  f64. Details under "Row 41" below.
+
+## Run 2: the result
 
 - CPU and operating system: Apple M1 (4 performance, 4 efficiency cores), macOS 14.7.4 (23H420).
 - Topology and workers: do not apply. The probe is one thread: Rapier is built without
-  `parallel` and steps on the calling thread. The disassembly is not a timing.
-- Commit: `4c2cef5` (clean). The probe is a scratch crate outside the workspace, with its own
-  empty `[workspace]` table and its own lock file; its full source is below.
+  `parallel` and steps on the calling thread.
+- Commit: `a6d8fba` (clean). This tree's code is that of `4c2cef5`; only `docs/results` differs.
+  The probe is a scratch crate outside the workspace, with its own empty `[workspace]` table
+  and its own lock file. Its full source, as run 2 ran it, is at the end of this file.
 - Build profile: `release` with `panic = "abort"`, toolchain 1.99.0 (the repository's
   `rust-toolchain.toml`).
 - Command, from the repository root, with the two files below in a directory `<probe>`:
   `cargo build --release --manifest-path <probe>/Cargo.toml && <probe>/target/release/scalar-probe`.
-- Load average: 13.20 15.58 13.87 before, 12.39 15.37 13.81 after. The run is deterministic, so
+- Load average: 5.76 14.48 16.56 before, 5.38 14.25 16.47 after. The run is deterministic, so
   load affects no figure: each precision's origin run, stepped a second time in the same
   process, was bit-equal to the first.
 - Resolved versions, the same as the workspace's `Cargo.lock`: `rapier3d` and `rapier3d-f64`
   0.36.0 (upstream crates.io, not the vendored copy), `parry3d` and `parry3d-f64` 0.31.1,
   `glamx` 0.3.1, `glam` 0.33.12, `simba` 0.10.2, `wide` 1.7.1, `nalgebra` 0.35.0, `libm` 0.2.16.
 
-## Answer
-
-- **The 64-bit control fails, so the probe is not read.** The pair translated by (6000, 0, 0)
-  differs from the origin run by 17.83 mm, from tick 8,044. That is where the walker slides
-  off the edge of the floor. The scene amplifies differences through that contact. The
-  32-bit figures below are recorded but are not the result. The precision half of the rule
-  stays undecided until the redesigned probe proposed below has run.
-- **The walk scene does not stay on its floor for ten minutes.** The support scene's square is
-  open: its fourth side walks 60 ticks against the second side's 120, because the rest takes
-  the last 60 ticks of the fourth side. The walker therefore drifts about 3 m in +z every 480
-  ticks. It leaves the 100 m floor at tick 8,105 or 8,106 (64-bit) and 7,990 to 8,039
-  (32-bit), then falls for eight minutes to y = −176 km, a depth consistent with Rapier's
-  speed cap (400 m/s, `normalized_max_linear_velocity`). For most of the ten minutes it is
-  therefore not "at the map edge" but 176 km below it.
-- **Row 41: yes for the contact solver, scalar elsewhere.** In the 64-bit build every
-  rigid-body contact constraint is solved by 4-lane `wide::f64x4` kernels. Those kernels are
-  NEON `.2d` on aarch64 and AVX `ymm` on x86-64-v3. The glam-based code around them is scalar
-  f64. Details under "Row 41" below.
-
-## The scene, and how it maps to the support scene
+### The scene, and how it maps to the support scene
 
 The walk scene of `crates/physics-rapier/tests/support/mod.rs` (`Walk::create`, `Walk::drive`,
-`Walk::run`) is rebuilt as `lactose-physics-rapier`'s backend hands it to Rapier, line for line:
+`Walk::run`) is rebuilt as `lactose-physics-rapier`'s backend hands it to Rapier, line for line,
+with one change, the closed square:
 
 - The bodies, in key order: the floor (key 1), a fixed body with a 50 × 1 × 50 half-extent cuboid
   offset by (0, −1, 0); five fixed blocks (keys 2 to 6) at (−4 + 2i, 0.3, 2), half extents
@@ -55,7 +56,12 @@ The walk scene of `crates/physics-rapier/tests/support/mod.rs` (`Walk::create`, 
 - The bodies enter the solver at the first step, as the backend's `flush` puts them there:
   inserted in key order, the walker with the tick-1 velocity in its builder, then mass
   recomputed from the colliders.
-- Each tick does what `Walk::drive` and the backend do, in the backend's order. The walker's
+- **The square is closed.** `Walk::drive` rests for the last 60 ticks of every 480, which cuts
+  the fourth side to 60 ticks, so run 1's walker drifted off the floor. Run 2's cycle is 540
+  ticks: four sides of 120 ticks at 3 m/s (+x, +z, −x, −z), then 60 ticks of rest. The jump
+  every 300 ticks and the velocity rule are unchanged. The support scene itself is not changed:
+  the probe owns its copy.
+- Each tick does what the drive and the backend do, in the backend's order. The walker's
   velocity (3 m/s along the square, the vertical component the last report gave) is written
   only if its bits differ from the solver's, and then the walker is woken and its mass
   recomputed. The impulse (0, 3, 0) is applied at every tick that is 150 modulo 300. Gravity is
@@ -67,7 +73,8 @@ The walk scene of `crates/physics-rapier/tests/support/mod.rs` (`Walk::create`, 
 - In 32 bits, each value the support scene computes in f64 is rounded once to f32. Positions
   are read back as f32, widened to f64, and the run's origin is subtracted in f64.
 
-What differs from the support scene, and why none of it is expected to matter:
+What differs from the support scene besides the closed square, and why none of it is expected
+to matter:
 
 - The probe steps without `parallel` and without a solver pool. The workspace's scenes report
   bit-equal results on pools of one, two and four threads (verification row 33,
@@ -81,76 +88,114 @@ What differs from the support scene, and why none of it is expected to matter:
 - No 32-bit `lactose-math::Scalar` exists. The probe assumes that a 32-bit build would hand
   Rapier the same values, rounded once.
 
-## Results
+### The self-check
+
+Every run, in both precisions and at every translation, checks its own scene after every step,
+in its scene's coordinates. The run fails the check if any of these happens:
+
+- the walker's centre goes below y = 0;
+- the walker's capsule comes within 1 m of the floor's edge, that is, the centre's |x| or |z|
+  exceeds 48.7 m;
+- the walker has an active contact with any collider other than the floor and the five blocks.
+
+A failed run is reported as a failed check, and no difference is read from it. Every run
+passed:
+
+| Run | 64-bit: check; first touch of a block | 32-bit: check; first touch of a block | Walker's range, x and z (m) |
+|---|---|---|---|
+| origin | passed; never | passed; never | x −3.13 to 2.85, z −3.00 to 2.97 in both precisions |
+| (6000, 0, 6000) | passed; never | passed; tick 749 (345 ticks touching) | 32-bit: x −3.22 to 2.85, z −3.00 to 3.08 |
+| (6000, 0, 0) | passed; never | passed; tick 750 (344 ticks touching) | 32-bit: x −3.22 to 2.85, z −3.00 to 3.02 |
+| (12000, 0, 12000) | passed; never | passed; never | 32-bit: x −3.14 to 2.93, z −3.00 to 3.06 |
+
+In 64 bits the walker never touches a block, at any translation. In 32 bits it touches one only
+in the two 6 km runs, from tick 749 or 750. Its centre stays between y = 0.76 m and 3.66 m in
+every run.
+
+### Translations
+
+The runs are (6000, 0, 6000), (6000, 0, 0) and (12000, 0, 12000), each against the origin. The
+result is read at 6 km, D59's figure. 12 km lies past the next binade boundary, 8,192 m, and is
+informative only unless the planner states a larger extent. Run 1's 8 km run is dropped: 6 km
+and 8 km lie in the same binade, [4,096, 8,192) m, in both precisions, so they test the same
+spacing.
+
+### Results
 
 Each translated run is compared with the origin run of the same precision. The comparison
 covers every tick and every body: each body's position relative to its own scene origin, the
 difference taken in f64. The fixed bodies never differ, so every largest value is the walker's.
-Figures are in millimetres, with the tick of the largest value in parentheses. 6 km and 8 km lie
-in the same binade, [4,096, 8,192) m, in both precisions, so their spacing is the same. The two
-rows agree to the printed precision in every column except the last-tick length of the 32-bit
-runs, which differs in the fourth decimal.
+Figures are in millimetres, with the tick of the largest value in parentheses. The last column
+is informative: the largest difference over the ticks before either run of the pair first
+touches anything other than the floor.
 
-### 64-bit, the control
+#### 64-bit, the control
 
-| Translation | Largest \|Δx\| | Largest \|Δy\| | Largest \|Δz\| | Largest length | Length at tick 36,000 | Largest length before the walker left the floor |
+| Translation | Largest \|Δx\| | Largest \|Δy\| | Largest \|Δz\| | Largest length | Length at tick 36,000 | Largest before a first touch other than the floor |
 |---|---|---|---|---|---|---|
-| (6000, 0, 6000) | 0.0220 (7937) | 0.0650 (10735) | 0.0273 (7937) | 0.0653 (8070) | 0.0653 | 0.0653 (8070) |
-| (8000, 0, 8000) | 0.0220 (7937) | 0.0650 (10735) | 0.0273 (7937) | 0.0653 (8070) | 0.0653 | 0.0653 (8070) |
-| (6000, 0, 0) | 0.1816 (7947) | 17.8318 (14433) | 0.2447 (8018) | **17.8326** (16439) | 17.8326 | 17.8326 (8044) |
+| (6000, 0, 6000) | 0.0000 | 0.0318 (23352) | 0.0000 | **0.0318** (23352) | 0.0000 | 0.0318 (23352); never touches |
+| (6000, 0, 0) | 0.0000 | 0.0319 (3851) | 0.0000 | **0.0319** (3851) | 0.0000 | 0.0319 (3851); never touches |
+| (12000, 0, 12000) | 0.0000 | 0.0319 (26651) | 0.0000 | **0.0319** (26651) | 0.0000 | 0.0319 (26651); never touches |
 
-Largest length per minute, minutes 1 to 10:
+The largest length in each minute, minutes 1 to 10, stays between 0.024 and 0.032 mm on every
+pair. It does not grow.
+
+**Verdict: the control passes.** Every 64-bit pair is under 1 mm at every tick, by a factor of
+about 30. The scene does not amplify differences, so the 32-bit figures are read.
+
+#### 32-bit
+
+| Translation | Largest \|Δx\| | Largest \|Δy\| | Largest \|Δz\| | Largest length | Length at tick 36,000 | Largest before a first touch other than the floor |
+|---|---|---|---|---|---|---|
+| (6000, 0, 6000) | 94.38 (1439) | 0.107 (3240) | 142.67 (3900) | **157.75** (1649) | 110.92 | 88.14 (449); first touch at tick 749 |
+| (6000, 0, 0) | 94.38 (1439) | 0.172 (1440) | 43.39 (3147) | **94.38** (1440) | 53.03 | 34.07 (242); first touch at tick 750 |
+| (12000, 0, 12000) | 80.09 (120) | 0.116 (3540) | 90.49 (239) | 120.84 (239) | 90.14 | 120.84 (239); never touches |
+
+The largest length in each minute, minutes 1 to 10:
 
 | Translation | mm |
 |---|---|
-| (6000, 0, 6000) | 0.0306, 0.0307, 0.0653, 0.0653, 0.0653, 0.0653, 0.0653, 0.0653, 0.0653, 0.0653 |
-| (8000, 0, 8000) | 0.0306, 0.0307, 0.0653, 0.0653, 0.0653, 0.0653, 0.0653, 0.0653, 0.0653, 0.0653 |
-| (6000, 0, 0) | 0.0307, 0.0300, 17.8326, 17.8326, 17.8326, 17.8326, 17.8326, 17.8326, 17.8326, 17.8326 |
+| (6000, 0, 6000) | 157.75, then 157.75 in every later minute |
+| (6000, 0, 0) | 94.38, then 82.26 to 82.27 in every later minute |
+| (12000, 0, 12000) | 120.84, then 120.84 in every later minute |
 
-On the floor, among the blocks, the control stays at or under 0.031 mm for the first two
-minutes. The difference jumps at the floor's edge (ticks 7,937 to 8,070). The (6000, 0, 0) run
-leaves one tick earlier than the origin run, and the offset it takes there holds through the
-fall: from minute 3 to minute 10 the largest length does not change, so the two runs fall
-at equal speeds, as they would at the speed cap.
+**Verdict at 6 km: fail.** Both 6 km pairs exceed 1 mm, by about a hundred times: 157.75 mm
+and 94.38 mm. The difference needs no contact to arise. On the floor alone, before any block
+is touched, the 6 km pairs reach 88.14 mm and 34.07 mm within 8 seconds. The 12 km pair never
+touches a block and reaches 120.84 mm. Each pair reaches its largest difference in
+the first 30 seconds, and the difference then stays flat for the rest of the ten minutes. This
+is not the random-walk growth the plan expected, about 27 mm after ten minutes. The probe
+measures the size of the error, not its cause.
 
-**Verdict: the control fails** (17.83 mm ≥ 1 mm). By decision 5.4 the scene amplifies
-differences through its contacts, and the probe is redesigned, not read.
+## Run 1: the control failed
 
-### 32-bit, recorded and not read
+Run 1 stepped the support scene's walk unchanged, at (6000, 0, 6000), (8000, 0, 8000) and
+(6000, 0, 0), at commit `4c2cef5`, with load averages 13.20 15.58 13.87 before and 12.39 15.37
+13.81 after. Its probe differed from run 2's in three ways:
 
-| Translation | Largest \|Δx\| | Largest \|Δy\| | Largest \|Δz\| | Largest length | Length at tick 36,000 | Largest length before the walker left the floor |
-|---|---|---|---|---|---|---|
-| (6000, 0, 6000) | 107.80 (10919) | 1,084,515.6 (29209) | 3,036.6 (8099) | 1,084,516.0 (29219) | 1,084,515.7 | 4,024.8 (7989) |
-| (8000, 0, 8000) | 107.80 (10919) | 1,084,515.6 (29209) | 3,036.6 (8099) | 1,084,516.0 (29219) | 1,084,515.7 | 4,024.8 (7989) |
-| (6000, 0, 0) | 79.56 (1742) | 46.88 (14433) | 4.06 (19914) | 79.56 (1742) | 67.81 | 79.56 (1742) |
+- its drive was `Walk::drive`'s own, with the open square;
+- it had no self-check, only a record of the tick the walker fell below y = −2;
+- it ran 8 km in place of 12 km.
 
-Largest length per minute, minutes 1 to 10:
+Its source is in this file's first commit.
 
-| Translation | mm |
-|---|---|
-| (6000, 0, 6000) | 119.49, 126.60, 1,065,152.9, 1,081,721.5, 1,081,975.4, 1,081,974.6, 1,079,446.7, 1,079,446.1, 1,084,516.0, 1,084,515.8 |
-| (8000, 0, 8000) | the same to the printed precision |
-| (6000, 0, 0) | 79.56, 79.55, 67.04, 67.11, 68.43, 68.43, 68.42, 68.41, 68.41, 68.40 |
+The 64-bit control, largest length in mm (tick):
 
-These numbers are not the result. One observation steers the redesign without deciding
-anything: in the first two minutes, on the floor and away from its edge, the 32-bit pairs
-differ by 80 to 127 mm. Over the same span the 64-bit control differs by 0.031 mm. The plan
-expected about 27 mm after ten minutes.
+| Translation | Whole run | Before the walker left the floor | First 2 minutes |
+|---|---|---|---|
+| (6000, 0, 6000) | 0.0653 (8070) | 0.0653 (8070) | 0.031 |
+| (8000, 0, 8000) | 0.0653 (8070) | 0.0653 (8070) | 0.031 |
+| (6000, 0, 0) | **17.8326** (16439) | 17.8326 (8044) | 0.031 |
 
-## Proposed redesign
-
-1. Keep the walker on the floor, among the blocks, for all 36,000 ticks. Close the square:
-   make the cycle 540 ticks, four sides of 120 ticks and then 60 ticks of rest, in place of the
-   rest taking the last 60 ticks of the fourth side. Keep the support scene's bodies, jump and
-   velocity rule unchanged. The support scene itself need not change: the probe owns its copy.
-2. The probe checks its own scene and refuses to report if the check fails. The walker's centre
-   must stay above y = 0. It must stay at least 1 m inside the floor's edges. Its contacts must
-   be only the floor and the blocks.
-3. The control's criterion is unchanged: under 1 mm for every pair, at every tick, before any
-   32-bit figure is read.
-4. Add a translation past 8,192 m, for example 12 km. 6 km and 8 km share a spacing in both
-   precisions, so 8 km tests nothing that 6 km does not. Whether the map extent goes past
-   8,192 m is the planner's to state. D59's figure is 6 km.
+- **The cause.** `Walk::drive`'s rest takes the last 60 ticks of the fourth side of the square.
+  The walker therefore drifts about 3 m in +z every 480 ticks. It slides off the 100 m floor's
+  edge near tick 8,100 and falls for the rest of the run, to y = −176 km, a depth consistent
+  with Rapier's 400 m/s speed cap. The edge contact amplified the (6000, 0, 0) pair's
+  difference to 17.83 mm at tick 8,044, so the control failed. Its 32-bit figures were not
+  read.
+- **The redesign,** accepted by the coordinator: close the square; check the scene in every
+  run; keep the control's criterion; and replace 8 km by 12 km, past the binade boundary. Run 2
+  is that redesign.
 
 ## Row 41: Rapier's 64-bit build uses SIMD
 
@@ -207,7 +252,7 @@ So the 64-bit cost argument stands on this: the contact solver is SIMD in both p
 two f64 lanes per NEON instruction against four f32 lanes. The integration, the narrow phase
 and the rest of the glam-based code are scalar f64 on aarch64.
 
-## The probe
+## The probe, as run 2 ran it
 
 `Cargo.toml`:
 
@@ -248,20 +293,34 @@ panic = "abort"
 `src/main.rs`:
 
 ```rust
-//! The precision probe of milestone 1 plan decision 5.4: the walk scene of
-//! `crates/physics-rapier/tests/support/mod.rs`, rebuilt on Rapier's own API in 32 and 64 bits,
-//! stepped 36,000 ticks at 60 Hz at the origin and translated, and compared with the origin run
-//! of the same precision, each position taken relative to its own scene origin, in f64.
-
-use std::time::Instant;
+//! The precision probe of milestone 1 plan decision 5.4, run 2: the walk scene of
+//! `crates/physics-rapier/tests/support/mod.rs` with its square closed, rebuilt on Rapier's own
+//! API in 32 and 64 bits, stepped 36,000 ticks at 60 Hz at the origin and translated, checked
+//! to stay on its floor, and compared with the origin run of the same precision, each position
+//! taken relative to its own scene origin, in f64.
 
 const TICKS: u32 = 36_000;
 /// The floor (key 1), the five blocks (keys 2 to 6) and the walker (key 10), in key order.
 const BODIES: usize = 7;
+const FLOOR: usize = 0;
 const WALKER: usize = 6;
+/// The floor's half extent in x and z, the walker's radius, and the margin the walker keeps
+/// from the floor's edge.
+const FLOOR_HALF: f64 = 50.0;
+const RADIUS: f64 = 0.3;
+const MARGIN: f64 = 1.0;
 
-/// Each tick's body positions, relative to the run's scene origin, in f64.
-type Trace = Vec<[[f64; 3]; BODIES]>;
+/// One run: each tick's body positions relative to the run's scene origin, in f64, and what
+/// the walker touched.
+struct Run {
+    trace: Vec<[[f64; 3]; BODIES]>,
+    /// The first tick the walker touched a body other than the floor.
+    first_touch: Option<u32>,
+    /// How many ticks the walker touched a body other than the floor.
+    touch_ticks: u32,
+    /// The first failure of the self-check, with its tick.
+    failed: Option<(u32, String)>,
+}
 
 /// One precision's scene. `$real` is Rapier's `Real`; every value the backend hands Rapier is
 /// computed in f64 as the support scene computes it, then rounded once to `$real`.
@@ -270,7 +329,7 @@ macro_rules! scene {
         mod $module {
             use $rapier::dynamics::{LockedAxes, RigidBodyBuilder, RigidBodyHandle, RigidBodyType};
             use $rapier::geometry::{
-                ActiveCollisionTypes, ColliderBuilder, Group, InteractionGroups,
+                ActiveCollisionTypes, ColliderBuilder, ColliderHandle, Group, InteractionGroups,
                 InteractionTestMode, SharedShape,
             };
             use $rapier::math::{Pose, Rotation, Vector};
@@ -320,14 +379,14 @@ macro_rules! scene {
                 at: Vector,
                 shape: SharedShape,
                 offset: Vector,
-            ) -> RigidBodyHandle {
+            ) -> (RigidBodyHandle, ColliderHandle) {
                 let builder = RigidBodyBuilder::new(RigidBodyType::Fixed)
                     .pose(Pose::from_parts(at, Rotation::IDENTITY))
                     .user_data(key);
                 let body = world.insert_body(builder);
-                world.insert_collider(collider(shape, offset, key), Some(body));
+                let collider = world.insert_collider(collider(shape, offset, key), Some(body));
                 recompute_mass(world, body);
-                body
+                (body, collider)
             }
 
             fn recompute_mass(world: &mut PhysicsWorld, handle: RigidBodyHandle) {
@@ -345,16 +404,24 @@ macro_rules! scene {
             }
 
             /// Steps the walk scene with its every position translated by `origin`.
-            pub fn run(origin: [f64; 3]) -> super::Trace {
+            pub fn run(origin: [f64; 3]) -> super::Run {
                 let [ox, oy, oz] = origin;
                 let mut world = PhysicsWorld::new();
                 let mut handles = Vec::with_capacity(super::BODIES);
+                let mut colliders = Vec::with_capacity(super::BODIES);
                 let mut last: Option<Vector> = None;
-                let mut trace = Vec::with_capacity(super::TICKS as usize);
+                let mut run = super::Run {
+                    trace: Vec::with_capacity(super::TICKS as usize),
+                    first_touch: None,
+                    touch_ticks: 0,
+                    failed: None,
+                };
                 for tick in 1..=super::TICKS {
-                    // `Walk::drive`: a square at 3 m/s keeping the reported vertical velocity,
-                    // a rest for the last 60 ticks of every 480, a jump every 300.
-                    let (x, z) = match ((tick / 120) % 4, tick % 480 >= 420) {
+                    // `Walk::drive` with the square closed: a 540-tick cycle of four 120-tick
+                    // sides at 3 m/s, then 60 ticks of rest, keeping the reported vertical
+                    // velocity; a jump every 300 ticks.
+                    let phase = tick % 540;
+                    let (x, z) = match (phase / 120, phase >= 480) {
                         (_, true) => (0.0, 0.0),
                         (0, false) => (3.0, 0.0),
                         (1, false) => (0.0, 3.0),
@@ -368,22 +435,26 @@ macro_rules! scene {
                     // at the first step, in key order, the walker with its written velocity;
                     // later, a velocity write that differs in bits wakes the walker.
                     if tick == 1 {
-                        handles.push(fixed(
+                        let (body, floor) = fixed(
                             &mut world,
                             1,
                             v(ox, oy, oz),
-                            SharedShape::cuboid(r(50.0), r(1.0), r(50.0)),
+                            SharedShape::cuboid(r(super::FLOOR_HALF), r(1.0), r(super::FLOOR_HALF)),
                             v(0.0, -1.0, 0.0),
-                        ));
+                        );
+                        handles.push(body);
+                        colliders.push(floor);
                         for i in 0..5_u32 {
                             let i = f64::from(i);
-                            handles.push(fixed(
+                            let (body, block) = fixed(
                                 &mut world,
                                 2 + i as u128,
                                 v(-4.0 + 2.0 * i + ox, 0.3 + oy, 2.0 + oz),
                                 SharedShape::cuboid(r(0.5), r(0.3 + 0.1 * i), r(0.5)),
                                 Vector::ZERO,
-                            ));
+                            );
+                            handles.push(body);
+                            colliders.push(block);
                         }
                         let builder = RigidBodyBuilder::new(RigidBodyType::Dynamic)
                             .pose(Pose::from_parts(
@@ -399,8 +470,9 @@ macro_rules! scene {
                             .linvel(linear)
                             .angvel(Vector::ZERO);
                         let walker = world.insert_body(builder);
-                        let capsule = SharedShape::capsule_y(r(0.5), r(0.3));
-                        world.insert_collider(collider(capsule, Vector::ZERO, 10), Some(walker));
+                        let capsule = SharedShape::capsule_y(r(0.5), r(super::RADIUS));
+                        let collider = collider(capsule, Vector::ZERO, 10);
+                        colliders.push(world.insert_collider(collider, Some(walker)));
                         recompute_mass(&mut world, walker);
                         handles.push(walker);
                     } else {
@@ -439,9 +511,43 @@ macro_rules! scene {
                         let t = world.bodies[handle].position().translation;
                         *slot = [f64::from(t.x) - ox, f64::from(t.y) - oy, f64::from(t.z) - oz];
                     }
-                    trace.push(positions);
+
+                    // The self-check: what the walker touches after this step, and where it is.
+                    let own = colliders[super::WALKER];
+                    let mut touched_other = false;
+                    for pair in world.contact_pairs_with(own) {
+                        if !pair.has_any_active_contact() {
+                            continue;
+                        }
+                        let other =
+                            if pair.collider1 == own { pair.collider2 } else { pair.collider1 };
+                        match colliders.iter().position(|&c| c == other) {
+                            Some(super::FLOOR) => {}
+                            Some(index) if index < super::WALKER => touched_other = true,
+                            _ => {
+                                run.failed
+                                    .get_or_insert((tick, "touched an unknown collider".into()));
+                            }
+                        }
+                    }
+                    if touched_other {
+                        run.first_touch.get_or_insert(tick);
+                        run.touch_ticks += 1;
+                    }
+                    let [wx, wy, wz] = positions[super::WALKER];
+                    let inside = super::FLOOR_HALF - super::MARGIN - super::RADIUS;
+                    if wy < 0.0 {
+                        run.failed.get_or_insert((tick, format!("centre below y = 0 ({wy:.6})")));
+                    }
+                    if wx.abs() > inside || wz.abs() > inside {
+                        run.failed.get_or_insert((
+                            tick,
+                            format!("within 1 m of the floor's edge ({wx:.6}, {wz:.6})"),
+                        ));
+                    }
+                    run.trace.push(positions);
                 }
-                trace
+                run
             }
         }
     };
@@ -453,29 +559,23 @@ scene!(double, rapier3d_f64, f64);
 /// The largest difference between a translated run and the origin run.
 struct Largest {
     axis: [(f64, u32); 3],
-    length: (f64, u32, usize),
-    per_minute: Vec<f64>,
+    length: (f64, u32),
     last_tick: f64,
-    /// The largest length over the ticks before either run's walker left the floor.
-    on_floor: (f64, u32),
+    /// Over the ticks before either run's walker first touched a body other than the floor.
+    before_touch: (f64, u32),
+    per_minute: Vec<f64>,
 }
 
-/// The first tick the walker's centre is below the floor's underside (y = -2): it has left
-/// the floor.
-fn departure(trace: &Trace) -> Option<u32> {
-    trace.iter().position(|p| p[WALKER][1] < -2.0).map(|index| index as u32 + 1)
-}
-
-fn compare(origin: &Trace, moved: &Trace) -> Largest {
+fn compare(origin: &Run, moved: &Run) -> Largest {
     let mut largest = Largest {
         axis: [(0.0, 0); 3],
-        length: (0.0, 0, 0),
-        per_minute: vec![0.0; 10],
+        length: (0.0, 0),
         last_tick: 0.0,
-        on_floor: (0.0, 0),
+        before_touch: (0.0, 0),
+        per_minute: vec![0.0; 10],
     };
-    let left = departure(origin).unwrap_or(TICKS + 1).min(departure(moved).unwrap_or(TICKS + 1));
-    for (index, (a, b)) in origin.iter().zip(moved).enumerate() {
+    let touch = origin.first_touch.unwrap_or(TICKS + 1).min(moved.first_touch.unwrap_or(TICKS + 1));
+    for (index, (a, b)) in origin.trace.iter().zip(&moved.trace).enumerate() {
         let tick = index as u32 + 1;
         for body in 0..BODIES {
             let d = [b[body][0] - a[body][0], b[body][1] - a[body][1], b[body][2] - a[body][2]];
@@ -486,14 +586,14 @@ fn compare(origin: &Trace, moved: &Trace) -> Largest {
             }
             let length = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
             if length > largest.length.0 {
-                largest.length = (length, tick, body);
+                largest.length = (length, tick);
+            }
+            if tick < touch && length > largest.before_touch.0 {
+                largest.before_touch = (length, tick);
             }
             let minute = (index / 3_600).min(9);
             if length > largest.per_minute[minute] {
                 largest.per_minute[minute] = length;
-            }
-            if tick < left && length > largest.on_floor.0 {
-                largest.on_floor = (length, tick);
             }
             if tick == TICKS && body == WALKER {
                 largest.last_tick = length;
@@ -511,42 +611,58 @@ fn main() {
     let runs: [(&str, [f64; 3]); 4] = [
         ("origin", [0.0, 0.0, 0.0]),
         ("(6000, 0, 6000)", [6_000.0, 0.0, 6_000.0]),
-        ("(8000, 0, 8000)", [8_000.0, 0.0, 8_000.0]),
         ("(6000, 0, 0)", [6_000.0, 0.0, 0.0]),
+        ("(12000, 0, 12000)", [12_000.0, 0.0, 12_000.0]),
     ];
     // The 64-bit control first.
-    let precisions: [(&str, fn([f64; 3]) -> Trace); 2] =
+    let precisions: [(&str, fn([f64; 3]) -> Run); 2] =
         [("64-bit", double::run), ("32-bit", single::run)];
-    for (name, run) in precisions {
-        let traces: Vec<Trace> = runs
+    for (name, step) in precisions {
+        let results: Vec<Run> = runs
             .iter()
             .map(|&(label, origin)| {
-                let start = Instant::now();
-                let trace = run(origin);
-                let w = trace[trace.len() - 1][WALKER];
-                let lowest = trace.iter().map(|p| p[WALKER][1]).fold(f64::INFINITY, f64::min);
+                let run = step(origin);
+                let w = run.trace[run.trace.len() - 1][WALKER];
+                let (mut low, mut high) = ([f64::INFINITY; 3], [f64::NEG_INFINITY; 3]);
+                for p in &run.trace {
+                    for axis in 0..3 {
+                        low[axis] = low[axis].min(p[WALKER][axis]);
+                        high[axis] = high[axis].max(p[WALKER][axis]);
+                    }
+                }
+                let check = match &run.failed {
+                    None => "passed".to_string(),
+                    Some((tick, why)) => format!("FAILED at tick {tick}: {why}"),
+                };
                 println!(
-                    "{name} {label}: {} ticks in {:.2} s; walker left the floor at tick {:?}; at the last tick ({:.6}, {:.6}, {:.6}), lowest y {:.6}",
-                    trace.len(),
-                    start.elapsed().as_secs_f64(),
-                    departure(&trace),
+                    "{name} {label}: check {check}; first touch of a body other than the floor {:?}, {} ticks touching; walker at the last tick ({:.6}, {:.6}, {:.6}); range x [{:.3}, {:.3}] y [{:.3}, {:.3}] z [{:.3}, {:.3}]",
+                    run.first_touch,
+                    run.touch_ticks,
                     w[0],
                     w[1],
                     w[2],
-                    lowest,
+                    low[0],
+                    high[0],
+                    low[1],
+                    high[1],
+                    low[2],
+                    high[2],
                 );
-                trace
+                run
             })
             .collect();
         println!();
         println!(
-            "| {name} run | max |dx| mm (tick) | max |dy| mm (tick) | max |dz| mm (tick) | max length mm (tick, body) | length at tick 36,000 mm |"
+            "{name}: translation; largest dx, dy, dz mm (tick); largest length mm (tick); length at tick 36,000 mm; largest length before the first touch of a body other than the floor mm (tick)"
         );
-        println!("|---|---|---|---|---|---|");
         for (index, (label, _)) in runs.iter().enumerate().skip(1) {
-            let l = compare(&traces[0], &traces[index]);
+            if results[0].failed.is_some() || results[index].failed.is_some() {
+                println!("{label}: not compared, a run of the pair failed its check");
+                continue;
+            }
+            let l = compare(&results[0], &results[index]);
             println!(
-                "| {label} | {} ({}) | {} ({}) | {} ({}) | {} ({}, {}) | {} |",
+                "{label}: {} ({}), {} ({}), {} ({}); {} ({}); {}; {} ({})",
                 mm(l.axis[0].0),
                 l.axis[0].1,
                 mm(l.axis[1].0),
@@ -555,29 +671,17 @@ fn main() {
                 l.axis[2].1,
                 mm(l.length.0),
                 l.length.1,
-                l.length.2,
                 mm(l.last_tick),
+                mm(l.before_touch.0),
+                l.before_touch.1,
             );
-        }
-        println!();
-        println!(
-            "| {name} run | largest length per minute, mm (minutes 1 to 10) | largest length before the walker left the floor, mm (tick) |"
-        );
-        println!("|---|---|---|");
-        for (index, (label, _)) in runs.iter().enumerate().skip(1) {
-            let l = compare(&traces[0], &traces[index]);
             let minutes: Vec<String> = l.per_minute.iter().map(|&m| mm(m)).collect();
-            println!(
-                "| {label} | {} | {} ({}) |",
-                minutes.join(", "),
-                mm(l.on_floor.0),
-                l.on_floor.1
-            );
+            println!("{label} largest length per minute, mm: {}", minutes.join(", "));
         }
         println!();
         // Same precision, origin against origin: the probe is deterministic in itself.
-        let again = run(runs[0].1);
-        let equal = again.iter().zip(&traces[0]).all(|(a, b)| {
+        let again = step(runs[0].1);
+        let equal = again.trace.iter().zip(&results[0].trace).all(|(a, b)| {
             a.iter().flatten().zip(b.iter().flatten()).all(|(x, y)| x.to_bits() == y.to_bits())
         });
         println!("{name} origin run repeated: bit-equal {equal}");
