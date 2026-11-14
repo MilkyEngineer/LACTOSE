@@ -4480,6 +4480,114 @@ relayed by an event when it acts on another body** (§6.1, §10, `lactose-ecs`,
 - Driven by: the first cost measurement of a milestone 1 tick (`crates/sim/tests/cost.rs`);
   the ECS hot paths part A review, rounds 1 and 2 (2026-11-14).
 
+**D138. Milestone 0's unshown criteria are exit conditions of milestone 1** (§5.1, §20, §22, `lactose-task`, `docs/results`)
+- Why: milestone 1's lanes began with part of section 22's milestone 0 proof not shown, and no
+  decision recorded it. On the developer's Apple M1 the two checked-in runs of the benchmark
+  (`docs/results/whisk-apple-m1-2026-10-09.md` at `00f1f3d`,
+  `docs/results/whisk-apple-m1-2026-10-10.md` at `8cf544c`) pass the makespan ratio (at most 1.139
+  at P50 and 1.206 at P99, against 1.25 and 1.5), the wake from an idle pool (P99 32.8 and 30.4 µs
+  against 35) and the steal (P99 125 and 167 ns against 1 µs). They fail tick start: P99 24.5 and
+  29.9 µs at 60 Hz against 20, with P50 3.7 and 2.8 µs and none of 5,000 deadlines over 1 ms. The
+  quiet machine is the slower of the two states the keeper shows, and the cause is not known
+  (D116). At `3264406` no x86 desktop had run the benchmark, so the x86 half of every criterion
+  was unshown.
+  Five verification rows gated at milestone 0 are open: the wake and tick-start rows, the
+  wall-clock log of samples over 1 ms, the first run of the Linux and Windows topology parsers on
+  real hardware, and Windows efficiency-core steering. Loom and Miri pass nightly.
+  - *Milestone 1 was not held for them.* The criteria prove the executor. Nothing a milestone 1
+    lane builds depends on an x86 figure or on the 10 µs between the measured tick start and its
+    criterion: each consumer measures its own cost. Rules out reading milestone 0 as closed.
+  - *Each is an exit condition of milestone 1.* It closes by a result file under `docs/results`,
+    or by an owner decision that restates it, recorded as an addendum here.
+  - *The x86 half closes in one session on the owner's desktop* at main's head, which the owner
+    runs before the plan is approved: the benchmark and `lactose-task`'s tests. The files it
+    writes pass or fail makespan, wake, tick start and steal on x86, and the topology it prints
+    closes the parsers' row.
+  - *Tick start gets one bounded attempt.* One lane on `lactose-task`, after the x86 numbers,
+    finds what separates the two machine states or shows a keeper that meets 20 µs at P99 on a
+    quiet M1 for at most 1.5% of a core. This reopens D113's rejection of a warm sleeper for the
+    keeper alone; its power cost is recorded with the attempt. One hypothesis it tests, not
+    confirmed: the keeper spins the last 50 µs, and a final timed park that ends late by the
+    deep-idle exit the wake spike measured (P99 24 to 29 µs) passes the deadline. The same lane
+    logs the wall-clock time of every sample over 1 ms. If the attempt fails, the criterion is
+    restated at the 35 µs of the wake criterion in the next architecture revision, with the
+    attempt recorded, as the owner decided on 14 November 2026. Rules out a second attempt,
+    and a criterion that stays failed and unrecorded.
+  - *Windows efficiency-core steering is re-gated to milestone 2*, where the first Windows client
+    runs asset work beside frame work. It needs hybrid x86 hardware to measure.
+- Driven by: the whole-project review at `6ed8461` (no milestone 1 plan; milestone 0's failed
+  criterion carried without a record); `docs/plans/milestone-1.md`.
+- Replaced: nothing. It records what was done without a record.
+
+**D139. The milestone 1 plan: how its criteria are judged, what is re-gated, and the decisions that came due** (§5.2, §8.3, §9.4, §10, §12.1, §14, §15.4, §16, §18, §20, §22, §22.1, §23, `docs/plans/milestone-1.md`)
+- Why: no document mapped section 22's milestone 1 criteria, or the verification rows that gate
+  milestone 1, to a lane or an owner. Four criteria had nothing proving them, criterion 1 had
+  been measured only on four performance cores, and several rows waited on decisions nobody had
+  been asked to take. `docs/plans/milestone-1.md` is the map and gives each decision's reasons;
+  these are the decisions.
+  - *Each criterion keeps its own workload.* The 100k tick is the scene of
+    `crates/sim/tests/cost.rs`, without physics and without the world hash; the physics phase is
+    measured on its own scene; the composed tick is recorded and is not a criterion. Rules out
+    reading the 4 ms as a tick with the 3 ms physics phase inside it.
+  - *Criterion 1 is proven by a direct run on eight performance cores*, the owner's desktop: the
+    median tick on eight frame workers at most 4 ms, one worker for each of eight performance
+    cores as the executor counts them. On the M1 a projection steers and proves nothing:
+    S + (T₁ − S)/8 at most 4 ms, T₁ and T_N the median tick on one and on N frame workers in one
+    sitting, and S = (N·T_N − T₁)/(N − 1). On the M1 that is 7·T₄ − T₁ at most 24 ms. Rules out a
+    projection standing as proof while a machine with eight performance cores is in reach.
+  - *The parallel runner is two lanes, the per-chunk kernel path first, then chunks as the units
+    of a graph node, released as one range that splits on steal.* Both conform to sections 5.2
+    and 6 as written, and a unit's outputs live in storage the node owns, indexed by chunk. Rules
+    out a scope per system, partials folded in chunk order and buffers pooled by worker slot.
+  - *The netcode spike runs in one process over a seeded link and a scripted clock, and SOUR's
+    architecture mode over the bytes both ends record is its x86 server.* The link delays below a
+    tick and reorders within one, and the client's clock drifts, wakes late and steps by script,
+    since a live link adds those and not only jitter. Rules out a second binary and a two-machine
+    session, unless the bytes differ between platforms.
+  - *The 32-bit scalar branch is built only if a probe on upstream 32-bit Rapier passes the
+    precision half of section 16's rule.* Rules out a second vendored Rapier and a scalar switch
+    in `lactose-math` built to test a rule the arithmetic says it fails.
+  - *Copy-on-write snapshots are not built* (D34's condition): the cost of a slot is Rapier's
+    serialisation of colliders and bodies, about 0.6 µs each to write and about 1.1 µs for a
+    fixed collider to restore, which copy-on-write in `lactose-predict` cannot share. A prediction
+    world holds at most 64 fixed colliders and proxies together as rows. Milestone 3 must design
+    how cooked static scenery reaches the solver outside the per-tick snapshot, since
+    `physics-api`'s snapshot carries the backend's whole world today (section 10, D119).
+  - *The bundle's layout digest lands in milestone 1*, before the cooker: it changes the bytes
+    of every baseline and overlay, and every test that pins them moves with it.
+  - *The Haswell-masked run stays in section 8.3 and gates milestone 4*, with architecture mode's
+    move to every pull request. Until then the nightly prints each runner's CPU model and flags.
+  - *A region's asset set at milestone 1 is `Baseline::assets`.* The assets of residents the
+    baseline does not hold, and a declared spawnable set, are milestone 3's, with
+    `lactose-persist`'s deferral.
+  - *Edit-to-playing at milestone 1 is measured on the headless binary's sketch game*, by an edit
+    in the binary's crate and an edit in `lactose-app`, read against the slower. Section 22.1's
+    build-time mitigation is decided only if that floor is over thirty seconds.
+  - *The RHI spike is milestone 1's: a throwaway program, never checked in, that walks section
+    12.1's list under MoltenVK on the M1.* Its result file marks each "no" as MoltenVK's or as a
+    design question, and the conformant reference run under lavapipe is milestone 2's, with the
+    Vulkan backend's first Linux job. `lactose-rhi-api`'s facade and `lactose-rhi-null` move to
+    milestone 2, behind its MoltenVK, KosmicKrisp and native Metal spikes, so the facade is
+    written once with every spike's result; the next revision moves `rhi-null` in section 22.
+    Rules out a facade and a null backend with no consumer, written before the spikes that amend
+    them, and FFI code outside section 21's crates.
+  - *A measurement that proves a criterion is a file under `docs/results`* with its machine,
+    date, commit, topology and load, written by `cargo xtask measure`.
+  - *Re-gated*: the physics phase's stall on render recording to milestone 2; how a re-spawned
+    body presents to milestone 2; the directory sync on other file systems to milestone 4;
+    `ordered` and per-region reductions to milestone 5. Durability after a power loss is stated
+    as each platform's contract and is not measured.
+- Driven by: the whole-project review at `6ed8461` (its findings on the missing plan, the
+  unproven criteria, the unrecorded measurements, the bundle digest, the asset set and the
+  Haswell run); the owner's decision of 14 November 2026 to plan before revision 3.3, and the
+  owner's answers of the same day (the desktop has eight or more performance cores; criterion 1
+  is the tick without the physics phase; the netcode spike runs in one process; `rhi-api` and
+  `rhi-null` move to milestone 2; tick start is restated at 35 µs if the keeper's attempt
+  fails).
+- Replaced: nothing in `docs/architecture.md` until the next revision, which states what
+  criterion 1's tick excludes, the spike's sentence and the sentences
+  `docs/plans/milestone-1.md` section 8 lists.
+
 ## 10. Review history
 
 - **Revision 1** (`a29af04`): the design baseline.

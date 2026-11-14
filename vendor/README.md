@@ -58,8 +58,10 @@ change upstream drops the directory, the patch and the entry.
 - Patch: `rapier3d-f64-0.36.0.patch`, two files, sixteen changed lines: six in the joint
   helper (two removed, four added, two of them the notice), ten in the broad phase (two
   removed, eight added, three of them the notice).
-- Upstream report: to be filed, one issue per defect (the owner files them on dimforge/rapier;
-  the links go here).
+- Upstream report: the joint helper's `sin_cos` is dimforge/rapier issue #1054, fixed by the open
+  pull request #1074, whose other sites `lactose-physics-rapier` does not reach (its multibody
+  and soft-body sets stay empty and it never calls `RevoluteJoint::angle`); the broad phase's
+  hang is issue #1008, addressed by the open pull request #1018.
 - Dropped when: a bump reaches a version whose `AngularLimitParams::new` takes the trait
   route, and whose step never blocks a pool thread on a job it queued. Each hunk drops on its
   own.
