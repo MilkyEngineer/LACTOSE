@@ -330,7 +330,16 @@ pub(crate) struct Module {
     /// Whether it is compiled only for tests (see [`items`]).
     pub(crate) test_only: bool,
     /// The inline modules (`mod name { ... }`) it is declared in, outermost first.
-    pub(crate) inline: Vec<String>,
+    pub(crate) inline: Vec<InlineModule>,
+}
+
+/// An inline module, `mod name { ... }`, around a declaration.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub(crate) struct InlineModule {
+    /// The module's name.
+    pub(crate) name: String,
+    /// The directory a `path` attribute on it names, as written.
+    pub(crate) path: Option<String>,
 }
 
 /// An `include!` of a string literal.
@@ -356,8 +365,8 @@ pub(crate) struct Impl {
     pub(crate) self_type: String,
     /// The names of its type and const parameters.
     pub(crate) generics: Vec<String>,
-    /// Each `type Name = Value;` in its body, as the name and the value with whitespace and
-    /// comments removed.
+    /// Each `type Name = Value;` in its body, as the name and the value without comments,
+    /// with one space between two adjacent words and none elsewhere.
     pub(crate) types: Vec<(String, String)>,
 }
 
@@ -450,6 +459,7 @@ pub(crate) fn items(source: &str, features: &[String]) -> Items {
                     }
                 }
                 b'{' => {
+                    let module = module.map(|name| InlineModule { name, path: path.take() });
                     levels.push(Level { test_only, module, implementation: opened, nesting });
                     nesting = 0;
                 }
@@ -494,8 +504,8 @@ pub(crate) fn items(source: &str, features: &[String]) -> Items {
 struct Level {
     /// Whether what it holds is compiled only for tests.
     test_only: bool,
-    /// The name of the inline module it opens.
-    module: Option<String>,
+    /// The inline module it opens.
+    module: Option<InlineModule>,
     /// The index in [`Items::impls`] of the implementation whose body it opens.
     implementation: Option<usize>,
     /// The parentheses and brackets open outside it.
@@ -613,11 +623,22 @@ fn implementation(tokens: &[Token], source: &str, test_only: bool) -> Option<Imp
 /// The name and value of `type Name = Value;` if `tokens`, an item without its `;`, is one.
 fn associated_type(tokens: &[Token], source: &str) -> Option<(String, String)> {
     match tokens {
-        [keyword, name, equals, first, ..]
-            if keyword.is(source, "type") && name.kind == Kind::Word && equals.is(source, "=") =>
+        [keyword, name, equals, value @ ..]
+            if keyword.is(source, "type")
+                && name.kind == Kind::Word
+                && equals.is(source, "=")
+                && !value.is_empty() =>
         {
-            let last = tokens[tokens.len() - 1];
-            Some((name.text(source).to_owned(), code_only(&source[first.start..last.end])))
+            // The tokens without whitespace or comments, but with a space between two words,
+            // so `<L as Loader>::Asset` keeps `L` a word of its own.
+            let mut text = String::new();
+            for (at, token) in value.iter().enumerate() {
+                if at > 0 && token.kind != Kind::Punct && value[at - 1].kind != Kind::Punct {
+                    text.push(' ');
+                }
+                text.push_str(token.text(source));
+            }
+            Some((name.text(source).to_owned(), text))
         }
         _ => None,
     }
@@ -836,11 +857,18 @@ mod tests {
     fn out_of_line_modules_are_found_with_their_path_and_gate() {
         let source = "mod a;\npub(crate) mod b {}\n#[path = \"x/c.rs\"]\nmod c;\n\
                       #[cfg(test)]\nmod d;\nmod e { mod f; }\n#[cfg(feature = \"dev\")] mod g;\n";
+        // An inline module around it is written `name`, or `name=path` under a `#[path]`.
         let module = |name: &str, path: Option<&str>, test_only, inline: &[&str]| Module {
             name: name.to_owned(),
             path: path.map(str::to_owned),
             test_only,
-            inline: inline.iter().map(|m| (*m).to_owned()).collect(),
+            inline: inline
+                .iter()
+                .map(|m| {
+                    let (name, path) = m.split_once('=').map_or((*m, None), |(n, p)| (n, Some(p)));
+                    InlineModule { name: name.to_owned(), path: path.map(str::to_owned) }
+                })
+                .collect(),
         };
         assert_eq!(
             found(source, &["dev"]).modules,
@@ -858,6 +886,16 @@ mod tests {
             found(source, &[]).modules,
             [module("v", None, true, &["t", "u"]), module("w", None, true, &["t"])]
         );
+        // Review round 2, R1: an inline module keeps its own `#[path]`, and only its own.
+        let source = "#[path = \"../gen\"]\nmod g {\n    #[path = \"k.rs\"]\n    mod kinds;\n    mod h { mod i; }\n}\nmod j;\n";
+        assert_eq!(
+            found(source, &[]).modules,
+            [
+                module("kinds", Some("k.rs"), false, &["g=../gen"]),
+                module("i", None, false, &["g=../gen", "h"]),
+                module("j", None, false, &[]),
+            ]
+        );
     }
 
     #[test]
@@ -866,6 +904,7 @@ mod tests {
                       for k::Kind<'a, T, N> where T: for<'b> Fn(&'b u8) {\n\
                           type Asset = lactose_anim::Clip; // c\n\
                           type Error = Vec< T >;\n\
+                          type Source = < T as /* c */ crate::X >::Y;\n\
                           fn f() { type Inner = u8; let _ = [0u8; 2]; }\n\
                       }\n\
                       impl Other for [u8; 4] { type Asset = A; }\n\
@@ -890,11 +929,15 @@ mod tests {
                         1,
                         "Loader",
                         words(&["T", "N"]),
-                        vec![pair("Asset", "lactose_anim::Clip"), pair("Error", "Vec<T>")],
+                        vec![
+                            pair("Asset", "lactose_anim::Clip"),
+                            pair("Error", "Vec<T>"),
+                            pair("Source", "<T as crate::X>::Y"),
+                        ],
                     )
                 },
-                implementation(6, "Other", Vec::new(), vec![pair("Asset", "A")]),
-                implementation(8, "Send", Vec::new(), Vec::new()),
+                implementation(7, "Other", Vec::new(), vec![pair("Asset", "A")]),
+                implementation(9, "Send", Vec::new(), Vec::new()),
             ]
         );
     }

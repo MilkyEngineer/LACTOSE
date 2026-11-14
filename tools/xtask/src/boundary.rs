@@ -486,8 +486,9 @@ const THREAD_ROUTES: [&str; 104] = [
 const THREAD_PREFIXES: [&str; 4] = ["rayon::", "rapier3d_f64::", "parry3d_f64::", "std::thread::"];
 
 /// The reference's entries under [`THREAD_PREFIXES`] that start no thread: rayon's worker
-/// index, Rapier's multibody paths into `matrixmultiply`, the core count and thread-local state.
-const NOT_THREAD_ROUTES: [&str; 9] = [
+/// index, Rapier's multibody paths into `matrixmultiply`, the Rapier and parry angles that call
+/// the platform library, the core count and thread-local state.
+const NOT_THREAD_ROUTES: [&str; 11] = [
     "rayon::current_thread_index",
     "rayon::ThreadPool::current_thread_index",
     "rapier3d_f64::dynamics::Multibody::inverse_kinematics",
@@ -495,6 +496,8 @@ const NOT_THREAD_ROUTES: [&str; 9] = [
     "rapier3d_f64::dynamics::Multibody::inverse_kinematics_delta_with_jacobian",
     "rapier3d_f64::dynamics::MultibodyJointSet::insert",
     "rapier3d_f64::dynamics::MultibodyJointSet::insert_kinematic",
+    "rapier3d_f64::dynamics::RevoluteJoint::angle",
+    "parry3d_f64::math::VectorExt::angle",
     "std::thread::available_parallelism",
     "std::thread::LocalKey",
 ];
@@ -1102,19 +1105,21 @@ fn harness_packages(policy: &Policy, ws: &Workspace, files: &Files, findings: &m
 
 /// D99: a kind the simulation reads is declared, by `impl SimulationAsset`, only in a
 /// boundary crate, and decoded only there: a `Loader` outside the boundary whose `type Asset`
-/// names a kind a boundary crate declares, or is a type parameter, is reported, so the
-/// decoder stays under section 8.2.
+/// names a kind a boundary crate declares or a type parameter of the implementation, or is
+/// not written in its body, is reported, so the decoder stays under section 8.2.
 ///
 /// Shipped code is read, from the root of each library, proc-macro and binary target,
 /// wherever it lives, through every out-of-line `mod` (by `#[path]`, by the file layout, and
-/// inside inline modules) and every `include!` of a literal path, skipping what a `cfg`
-/// compiles only for tests or a `[dev_only_features]` feature. A file is read again when a
-/// shipped route reaches it after a test-only one, and a file under `src/` that no route
-/// reaches is read as shipped, so a module the walk cannot place errs towards a finding.
+/// inside inline modules, which add their name or their own `#[path]` to the directory) and
+/// every `include!` of a literal path, skipping what a `cfg` compiles only for tests or a
+/// `[dev_only_features]` feature. A file is read again when a shipped route reaches it after
+/// a test-only one, and a file under `src/` that no route reaches is read as shipped, so a
+/// module the walk cannot place errs towards a finding.
 ///
-/// Names are compared as written, by their last path segment: a kind brought in under
-/// another name (`use ... as`, a type alias) or a loader a macro writes is not seen, and a
-/// type outside the boundary that shares a kind's name is reported.
+/// Names are compared as written, by their last path segment, of the self type for a
+/// qualified path `<T as Trait>::Name`: a kind brought in under another name (`use ... as`, a
+/// type alias, a projection such as `<Self as Decodes>::Kind`) or a loader a macro writes is
+/// not seen, and a type outside the boundary that shares a kind's name is reported.
 fn simulation_assets(tiers: &TierFile, ws: &Workspace, files: &Files, findings: &mut Vec<Finding>) {
     let shipped = |package: &Package| {
         let listed = tiers.dev_only_features.get(&package.name).map_or(&[][..], Vec::as_slice);
@@ -1176,7 +1181,12 @@ fn loads_for_the_simulation(found: &Impl, kinds: &BTreeSet<String>) -> Option<St
              a boundary crate declares a `{SIMULATION_ASSET}`"
         ));
     }
-    let outer = asset.split('<').next().unwrap_or_default();
+    // The type the path names: of `<T as Trait>::Name`, its self type `T`.
+    let outer = match asset.strip_prefix('<') {
+        Some(qualified) => qualified.split(" as ").next().unwrap_or_default(),
+        None => asset.as_str(),
+    };
+    let outer = outer.split('<').next().unwrap_or_default();
     let last = outer.rsplit("::").next().unwrap_or_default();
     kinds
         .contains(last)
@@ -1213,12 +1223,25 @@ fn shipped_impls(package: &Package, files: &Files, features: &[String]) -> Vec<(
                 found.insert((file.clone(), implementation.line), implementation);
             }
             for module in items.modules {
-                let inline: String = module.inline.iter().map(|name| format!("/{name}")).collect();
-                let base = format!("{dir}{inline}");
+                // The directory of the innermost inline module around the declaration: each
+                // is a directory of its name under the one around it, or the one its `#[path]`
+                // names relative to it. At the top of a file that is the file's own
+                // directory, without the one a `name.rs` adds for its modules.
+                let mut base = Some(dir.clone());
+                for (depth, inline) in module.inline.iter().enumerate() {
+                    base = match &inline.path {
+                        Some(named) if depth == 0 => joined(parent(&file), named),
+                        Some(named) => base.and_then(|base| joined(&base, named)),
+                        None => base.map(|base| format!("{base}/{}", inline.name)),
+                    };
+                }
+                let Some(base) = base else {
+                    continue;
+                };
                 let child = match &module.path {
                     // Outside an inline module a `#[path]` is relative to the file's own
                     // directory, inside one to the module's.
-                    Some(named) if inline.is_empty() => module_file(&file, named),
+                    Some(named) if module.inline.is_empty() => module_file(&file, named),
                     Some(named) => joined(&base, named),
                     None => [
                         format!("{base}/{}.rs", module.name),
@@ -3107,6 +3130,63 @@ mod tests {
                 ("crates/task/src/outer/x.rs", 2),
             ),
             (
+                // Review round 2, R1: an inline module's `#[path]` names its directory.
+                "B: an inline module's `#[path]` outside `src/`",
+                vec![
+                    ("crates/task/src/lib.rs", "#[path = \"../gen\"]\nmod g {\n    mod kinds;\n}\n".to_owned()),
+                    ("crates/task/gen/kinds.rs", declared.to_owned()),
+                ],
+                vec![],
+                ("crates/task/gen/kinds.rs", 2),
+            ),
+            (
+                "B: an inline module's `#[path]` inside `src/`, with a test-only alias first",
+                vec![
+                    (
+                        "crates/task/src/lib.rs",
+                        "#[cfg(test)]\n#[path = \"other/kinds.rs\"]\nmod t;\n#[path = \"other\"]\nmod g {\n    mod kinds;\n}\n"
+                            .to_owned(),
+                    ),
+                    ("crates/task/src/other/kinds.rs", declared.to_owned()),
+                ],
+                vec![],
+                ("crates/task/src/other/kinds.rs", 2),
+            ),
+            (
+                // As rustc places them: at the top of `a.rs` an inline module's `#[path]` is
+                // relative to `src/`, not `src/a/`.
+                "B: an inline module's `#[path]` at the top of a `name.rs`",
+                vec![
+                    (
+                        "crates/task/src/lib.rs",
+                        "#[cfg(test)]\n#[path = \"p/kinds.rs\"]\nmod t;\nmod a;\n".to_owned(),
+                    ),
+                    ("crates/task/src/a.rs", "#[path = \"p\"]\nmod g {\n    mod kinds;\n}\n".to_owned()),
+                    ("crates/task/src/p/kinds.rs", declared.to_owned()),
+                    ("crates/task/src/a/p/kinds.rs", "\n".to_owned()),
+                ],
+                vec![],
+                ("crates/task/src/p/kinds.rs", 2),
+            ),
+            (
+                // Under another inline module, relative to that module's directory.
+                "B: an inline module's `#[path]` inside another inline module of a `name.rs`",
+                vec![
+                    (
+                        "crates/task/src/lib.rs",
+                        "#[cfg(test)]\n#[path = \"a/m/q/kinds.rs\"]\nmod t;\nmod a;\n".to_owned(),
+                    ),
+                    (
+                        "crates/task/src/a.rs",
+                        "mod m {\n    #[path = \"q\"]\n    mod g {\n        mod kinds;\n    }\n}\n".to_owned(),
+                    ),
+                    ("crates/task/src/a/m/q/kinds.rs", declared.to_owned()),
+                    ("crates/task/src/q/kinds.rs", "\n".to_owned()),
+                ],
+                vec![],
+                ("crates/task/src/a/m/q/kinds.rs", 2),
+            ),
+            (
                 "C: a library root outside `src/`",
                 vec![("crates/task/lib.rs", declared.to_owned())],
                 vec!["crates/task/lib.rs"],
@@ -3226,7 +3306,9 @@ mod tests {
             "impl lactose_asset_api::Loader for A {\n    type Asset = lactose_math::Clip;\n}\n\
              impl<L: Loader> Loader for Wrapped<L> {\n    type Asset = L::Asset;\n}\n\
              impl<T> Loader for Any<T> where T: Asset {\n    type Asset = Vec<T>;\n}\n\
-             impl Loader for Hidden {\n    asset_type!();\n}\n",
+             impl Loader for Hidden {\n    asset_type!();\n}\n\
+             impl<L: Loader> Loader for Qualified<L> {\n    type Asset = <L as Loader>::Asset;\n}\n\
+             impl Loader for Projected {\n    type Asset = <lactose_math::Clip as Decoded>::Output;\n}\n",
         );
         assert_eq!(
             run(&ws, &files),
@@ -3244,6 +3326,12 @@ mod tests {
                     10,
                     "a kind its text does not show (no `type Asset = ...;` in its body), which may be one a boundary crate declares a `SimulationAsset`"
                 ),
+                // Review round 2, R2: the words of a qualified path stay apart.
+                loader(
+                    13,
+                    "`<L as Loader>::Asset`, which names its type parameter `L`, so it may decode a kind a boundary crate declares a `SimulationAsset`"
+                ),
+                loader(16, &a_kind("<lactose_math::Clip as Decoded>::Output")),
             ]
         );
 
@@ -3254,8 +3342,10 @@ mod tests {
             "impl Loader for RegionBaselineLoader {\n    type Asset = RegionBaseline;\n}\n\
              impl Loader for ProbeLoader {\n    type Asset = Probe;\n}\n\
              #[cfg(test)]\nmod tests {\n    impl Loader for TestLoader {\n        type Asset = Clip;\n    }\n}\n\
-             impl Other for B {\n    type Asset = Clip;\n}\n",
+             impl Other for B {\n    type Asset = Clip;\n}\n\
+             impl Loader for Aliased {\n    type Asset = <Self as Decodes>::Kind;\n}\n",
         );
+        // The last is the admitted limit: a projection names its type only through the trait.
         assert_eq!(run(&ws, &files), NONE);
     }
 }

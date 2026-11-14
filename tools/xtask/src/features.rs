@@ -29,6 +29,10 @@
 //! Between harness trees, a host package both hold at a common version is compared at the
 //! versions both hold, so a proc macro's own `syn` 2 beside the workspace's `syn` 3 is not a
 //! split; a target package is compared at all its versions.
+//!
+//! Agreement is not enough where a dependency's features decide what a result is: each tree
+//! must also compile such a package for the target with the feature [`missing_required`]
+//! names for it.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -404,6 +408,42 @@ fn shared_differences(triple: &str, root: &Root, reference: &Root, findings: &mu
             ));
         }
     }
+}
+
+/// Features a boundary dependency is compiled with in every build that resolves it, as
+/// (package name, feature). D119: without `scalar-math`, glam's `Vec3A` and `Vec4` take their
+/// `min` and `max` from the SIMD instructions of the target (`minps`/`maxps`, `vminq`/`vmaxq`),
+/// which treat NaN differently; with it, from compare-and-select.
+const REQUIRED_FEATURES: [(&str, &str); 1] = [("glam", "scalar-math")];
+
+/// Each feature list of `root`'s boundary tree, for a package built for the target, that
+/// lacks a feature `REQUIRED_FEATURES` names for the package.
+#[must_use]
+pub fn missing_required(triple: &str, root: &Root) -> Vec<Finding> {
+    let mut findings = Vec::new();
+    for ((package, built), lists) in &root.tree {
+        if *built != Built::Target {
+            continue;
+        }
+        let name = package.split_once(' ').map_or(package.as_str(), |(name, _)| name);
+        for (_, feature) in REQUIRED_FEATURES.iter().filter(|(required, _)| *required == name) {
+            // A list is printed `[a, b]`.
+            let lacks = |list: &&String| {
+                !list.trim_matches(['[', ']']).split(", ").any(|listed| listed == *feature)
+            };
+            for list in lists.iter().filter(lacks) {
+                findings.push(Finding::new(
+                    &root.path,
+                    format!(
+                        "on {triple}, boundary dependency `{package}` is compiled with {list}, \
+                         without `{feature}`; every build of the boundary compiles it with \
+                         `{feature}` (D119)"
+                    ),
+                ));
+            }
+        }
+    }
+    findings
 }
 
 /// Shipped binaries that the comparison would silently skip: workspace packages named
@@ -805,6 +845,31 @@ lactose-physics-api v0.0.0 (/ws/crates/physics-api)|
                 format!("{head} `libm v0.2.16` (target) is absent here but [default] {tail}"),
             ]
         );
+    }
+
+    #[test]
+    fn glam_compiled_without_scalar_math_for_the_target_is_reported() {
+        // Review round 2: the D119 claim about glam's `min` and `max` holds under
+        // `scalar-math`. A list without it is reported, whatever the other roots hold; a
+        // host copy, a list with it, and a package that only shares the prefix are not.
+        let server = SERVER.replace(
+            "│   └── libm v0.2.16|default",
+            "│   ├── libm v0.2.16|default\n│   ├── glam v0.30.10|libm,scalar-math,std\n│   ├── glamx v0.1.0|\n│   └── glam v0.29.3|libm,std",
+        );
+        let server = server.replace(
+            "│           └── syn v3.0.6|default,derive",
+            "│           ├── syn v3.0.6|default,derive\n│           └── glam v0.30.10|std",
+        );
+        let [root, _] = roots(&server, SERVER);
+        let found: Vec<String> =
+            missing_required("t", &root).iter().map(ToString::to_string).collect();
+        assert_eq!(
+            found,
+            [
+                "crates/app-server/Cargo.toml: on t, boundary dependency `glam v0.29.3` is compiled with [libm, std], without `scalar-math`; every build of the boundary compiles it with `scalar-math` (D119)"
+            ]
+        );
+        assert_eq!(missing_required("t", &roots(SERVER, SERVER)[0]), []);
     }
 
     #[test]

@@ -73,7 +73,9 @@ on, and a listed feature the crate does not declare are findings.
   clippy with the reference over a probe that calls each route D119 bans through the
   solver's math crates (simba, num-traits, num-complex, glam, glamx, approx), one line per
   route, and requires every line refused: each of those entries carries `allow-invalid`,
-  which would otherwise hide a path that stopped resolving.
+  which would otherwise hide a path that stopped resolving. Rapier's `RevoluteJoint::angle`
+  and parry's `VectorExt::angle` are pinned but not in that probe, which does not compile
+  Rapier.
 - Each other crate of `[boundary_internal] any` compiles into every boundary crate and has a
   `clippy.toml` whose entries under the paths that reach files, the environment, a
   subprocess or the network, or create a thread through the standard library (`OUTSIDE_WORLD` in `src/boundary.rs`), are
@@ -134,19 +136,22 @@ on, and a listed feature the crate does not declare are findings.
   decoded, where section 8.2 holds its loader. The kinds are the implementing types of the
   shipped `impl SimulationAsset`s of the boundary crates. A shipped `impl Loader` outside
   the boundary is a finding when its `type Asset` names a kind by its last path segment
-  (`lactose_anim::Clip` is `Clip`), names a type parameter of the impl (`T`, `Vec<T>`,
-  `L::Asset`), or is not in its body as written.
+  (`lactose_anim::Clip` is `Clip`, and `<lactose_anim::Clip as T>::Name` is `Clip`), names
+  a type parameter of the impl (`T`, `Vec<T>`, `L::Asset`, `<L as Loader>::Asset`), or is
+  not in its body as written.
   Shipped code is read from the root of each library, proc-macro and binary target,
   wherever it lives, through every out-of-line `mod` (by `#[path]`, by the file layout, and
-  inside inline modules, whose names are directories) and every `include!` of a string
-  literal, with rustc's rules for where each one's own modules sit. An item under a `cfg`
+  inside inline modules, each of which adds its name, or the directory its own `#[path]`
+  names, to the directory) and every `include!` of a string literal, placing each one's own
+  modules where rustc does. An item under a `cfg`
   that holds only for `test` or a `[dev_only_features]` feature (or one that turns it on)
   is skipped, as are `tests/`, `benches/`, `examples/` and the build script. A file reached
   by a shipped route after a test-only one is read again as shipped, and a file under
   `src/` that no route reaches is read as shipped, unless its own inner `cfg` says
   otherwise. The scan reads tokens and compares names as written: an impl a macro writes is
   not seen, nor an `include!` whose path is not a literal (`concat!(env!(...))`), nor a
-  trait or kind brought in under another name (`use ... as`, a type alias); a type outside
+  trait or kind brought in under another name (`use ... as`, a type alias, a projection
+  such as `<Self as Decodes>::Kind`); a type outside
   the boundary that shares a kind's name is reported; and an `impl ... for` header in a
   `macro_rules!` body is read as if it were an impl.
 - No cargo configuration file has an `include` key, and no `.cargo` directory or cargo
@@ -154,8 +159,10 @@ on, and a listed feature the crate does not declare are findings.
   reads. `vendor` refuses both through the same function.
 
 The scanner reads source text. It does not expand macros, so an attribute a macro writes is
-not seen. It resolves a `#[path]` inside an inline `mod` block as if it stood outside it,
-where rustc adds the block's name to the directory; no such attribute exists today. A plain
+not seen. In the lint check it resolves a `#[path]` inside an inline `mod` block as if it
+stood outside it, where rustc adds the block's name to the directory, and reports a
+`#[path]` on an inline block, which names a directory, as naming no source file; no such
+attribute exists today. A plain
 `mod name;` in a file reached only through `#[path]` from outside the package is not
 followed.
 
@@ -174,6 +181,10 @@ its own dev-dependencies) and lack packages another holds, since two harness pac
 always differ that way. `--package <name>` (repeatable) compares the named packages
 instead. A workspace package named `lactose-app-*` that is not in `[feature_roots]` is a
 finding.
+
+Every root's tree compiles glam for the target with its `scalar-math` feature (D119):
+without it, glam's `Vec3A` and `Vec4` `min` and `max` are the target's SIMD instructions,
+which treat NaN differently on x86-64 and aarch64.
 
 No workspace package but `lactose-task` names loom, read from `cargo metadata`: no
 dependency on it under any rename, no dependency declaration or `[features]` value that turns

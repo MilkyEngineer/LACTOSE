@@ -333,6 +333,7 @@ fn check_features(args: &[&str]) -> Checked {
             roots.len()
         );
         findings.extend(features::compare(triple, &trees));
+        findings.extend(trees.iter().flat_map(|root| features::missing_required(triple, root)));
     }
     findings.extend(features::default_readers(&context.root, &compiled, &context.workspace.dirs)?);
     Ok(findings)

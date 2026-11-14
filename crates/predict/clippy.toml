@@ -115,44 +115,46 @@ disallowed-methods = [
   { path = "num_traits::sign::Signed::is_positive", reason = "observes NaN sign", allow-invalid = true },
   { path = "num_traits::sign::Signed::is_negative", reason = "observes NaN sign", allow-invalid = true },
   # glam computes its float methods through `libm` (its `libm` feature, which Rapier's
-  # `enhanced-determinism` turns on) or by compare-and-select, except these: the sign tests
-  # read the sign bit and `copysign` copies it, NaN's included, and the Euclidean division
-  # and remainder go through `%`.
+  # `enhanced-determinism` turns on) or, under its `scalar-math` feature, by
+  # compare-and-select, except these: the sign tests read the sign bit and `copysign` copies
+  # it, NaN's included, and the Euclidean division and remainder call the platform `fmod`, as
+  # `%` does. Section 8.2 bans the scalar Euclidean forms and these follow it; `%` itself, on a
+  # scalar or through glam's `Rem`, is an operator no lint sees.
   { path = "glam::Vec2::copysign", reason = "observes NaN sign", allow-invalid = true },
   { path = "glam::Vec2::is_negative_bitmask", reason = "observes NaN sign", allow-invalid = true },
   { path = "glam::Vec2::is_negative_mask", reason = "observes NaN sign", allow-invalid = true },
-  { path = "glam::Vec2::rem_euclid", reason = "goes through `%`, the platform fmod; use lactose_math", allow-invalid = true },
-  { path = "glam::Vec2::div_euclid", reason = "goes through `%`, the platform fmod; use lactose_math", allow-invalid = true },
+  { path = "glam::Vec2::rem_euclid", reason = "calls the platform fmod, as `%` does; section 8.2 bans the scalar forms", allow-invalid = true },
+  { path = "glam::Vec2::div_euclid", reason = "calls the platform fmod, as `%` does; section 8.2 bans the scalar forms", allow-invalid = true },
   { path = "glam::Vec3::copysign", reason = "observes NaN sign", allow-invalid = true },
   { path = "glam::Vec3::is_negative_bitmask", reason = "observes NaN sign", allow-invalid = true },
   { path = "glam::Vec3::is_negative_mask", reason = "observes NaN sign", allow-invalid = true },
-  { path = "glam::Vec3::rem_euclid", reason = "goes through `%`, the platform fmod; use lactose_math", allow-invalid = true },
-  { path = "glam::Vec3::div_euclid", reason = "goes through `%`, the platform fmod; use lactose_math", allow-invalid = true },
+  { path = "glam::Vec3::rem_euclid", reason = "calls the platform fmod, as `%` does; section 8.2 bans the scalar forms", allow-invalid = true },
+  { path = "glam::Vec3::div_euclid", reason = "calls the platform fmod, as `%` does; section 8.2 bans the scalar forms", allow-invalid = true },
   { path = "glam::Vec3A::copysign", reason = "observes NaN sign", allow-invalid = true },
   { path = "glam::Vec3A::is_negative_bitmask", reason = "observes NaN sign", allow-invalid = true },
   { path = "glam::Vec3A::is_negative_mask", reason = "observes NaN sign", allow-invalid = true },
-  { path = "glam::Vec3A::rem_euclid", reason = "goes through `%`, the platform fmod; use lactose_math", allow-invalid = true },
-  { path = "glam::Vec3A::div_euclid", reason = "goes through `%`, the platform fmod; use lactose_math", allow-invalid = true },
+  { path = "glam::Vec3A::rem_euclid", reason = "calls the platform fmod, as `%` does; section 8.2 bans the scalar forms", allow-invalid = true },
+  { path = "glam::Vec3A::div_euclid", reason = "calls the platform fmod, as `%` does; section 8.2 bans the scalar forms", allow-invalid = true },
   { path = "glam::Vec4::copysign", reason = "observes NaN sign", allow-invalid = true },
   { path = "glam::Vec4::is_negative_bitmask", reason = "observes NaN sign", allow-invalid = true },
   { path = "glam::Vec4::is_negative_mask", reason = "observes NaN sign", allow-invalid = true },
-  { path = "glam::Vec4::rem_euclid", reason = "goes through `%`, the platform fmod; use lactose_math", allow-invalid = true },
-  { path = "glam::Vec4::div_euclid", reason = "goes through `%`, the platform fmod; use lactose_math", allow-invalid = true },
+  { path = "glam::Vec4::rem_euclid", reason = "calls the platform fmod, as `%` does; section 8.2 bans the scalar forms", allow-invalid = true },
+  { path = "glam::Vec4::div_euclid", reason = "calls the platform fmod, as `%` does; section 8.2 bans the scalar forms", allow-invalid = true },
   { path = "glam::DVec2::copysign", reason = "observes NaN sign", allow-invalid = true },
   { path = "glam::DVec2::is_negative_bitmask", reason = "observes NaN sign", allow-invalid = true },
   { path = "glam::DVec2::is_negative_mask", reason = "observes NaN sign", allow-invalid = true },
-  { path = "glam::DVec2::rem_euclid", reason = "goes through `%`, the platform fmod; use lactose_math", allow-invalid = true },
-  { path = "glam::DVec2::div_euclid", reason = "goes through `%`, the platform fmod; use lactose_math", allow-invalid = true },
+  { path = "glam::DVec2::rem_euclid", reason = "calls the platform fmod, as `%` does; section 8.2 bans the scalar forms", allow-invalid = true },
+  { path = "glam::DVec2::div_euclid", reason = "calls the platform fmod, as `%` does; section 8.2 bans the scalar forms", allow-invalid = true },
   { path = "glam::DVec3::copysign", reason = "observes NaN sign", allow-invalid = true },
   { path = "glam::DVec3::is_negative_bitmask", reason = "observes NaN sign", allow-invalid = true },
   { path = "glam::DVec3::is_negative_mask", reason = "observes NaN sign", allow-invalid = true },
-  { path = "glam::DVec3::rem_euclid", reason = "goes through `%`, the platform fmod; use lactose_math", allow-invalid = true },
-  { path = "glam::DVec3::div_euclid", reason = "goes through `%`, the platform fmod; use lactose_math", allow-invalid = true },
+  { path = "glam::DVec3::rem_euclid", reason = "calls the platform fmod, as `%` does; section 8.2 bans the scalar forms", allow-invalid = true },
+  { path = "glam::DVec3::div_euclid", reason = "calls the platform fmod, as `%` does; section 8.2 bans the scalar forms", allow-invalid = true },
   { path = "glam::DVec4::copysign", reason = "observes NaN sign", allow-invalid = true },
   { path = "glam::DVec4::is_negative_bitmask", reason = "observes NaN sign", allow-invalid = true },
   { path = "glam::DVec4::is_negative_mask", reason = "observes NaN sign", allow-invalid = true },
-  { path = "glam::DVec4::rem_euclid", reason = "goes through `%`, the platform fmod; use lactose_math", allow-invalid = true },
-  { path = "glam::DVec4::div_euclid", reason = "goes through `%`, the platform fmod; use lactose_math", allow-invalid = true },
+  { path = "glam::DVec4::rem_euclid", reason = "calls the platform fmod, as `%` does; section 8.2 bans the scalar forms", allow-invalid = true },
+  { path = "glam::DVec4::div_euclid", reason = "calls the platform fmod, as `%` does; section 8.2 bans the scalar forms", allow-invalid = true },
   # nalgebra re-exports num-complex's `Complex`, and its `UnitComplex` dereferences to one, so
   # these are callable without naming the type: each goes through num-traits' `Float`, which
   # under the resolved `std` feature is the standard library's methods.
@@ -230,6 +232,11 @@ disallowed-methods = [
   # crate inserts a multibody joint.
   { path = "rapier3d_f64::dynamics::MultibodyJointSet::insert", reason = "multibody mass assembly reaches matrixmultiply, whose kernels are chosen by CPU feature", allow-invalid = true },
   { path = "rapier3d_f64::dynamics::MultibodyJointSet::insert_kinematic", reason = "multibody mass assembly reaches matrixmultiply, whose kernels are chosen by CPU feature", allow-invalid = true },
+  # D119: two public Rapier and parry methods call the platform library past `libm_force`
+  # (`asin`, `acos`). Pinned in tools/xtask but not proven by tests/boundary_lints.rs, whose
+  # probe does not compile Rapier.
+  { path = "rapier3d_f64::dynamics::RevoluteJoint::angle", reason = "platform libm (asin); use lactose_math", allow-invalid = true },
+  { path = "parry3d_f64::math::VectorExt::angle", reason = "platform libm (acos); use lactose_math", allow-invalid = true },
   # Architecture section 8.2: file IO (`io`), the process environment, subprocesses and the
   # network (`net-host`) are outside the boundary; what a simulation reads enters as a tick
   # input. Clippy matches items, not modules, so each module is closed here by its free

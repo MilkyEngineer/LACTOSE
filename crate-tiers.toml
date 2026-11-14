@@ -177,16 +177,19 @@ transitive = [
   # Rapier's math (D119), which `lactose-physics-rapier` reaches through `rapier3d-f64` and
   # names only through its re-exports (`rapier3d_f64::na`, `rapier3d_f64::parry`,
   # `rapier3d_f64::glamx`). Under the resolved features simba computes transcendentals
-  # through `libm` (its `libm_force`), and so does glam, except its Euclidean division and
-  # remainder, which go through `%` (the platform's fmod); glamx's 3x3 eigen decompositions
-  # and its SVDs, and num-complex's `Complex` through num-traits' `Float`, call the standard
-  # library's float methods. Every boundary clippy.toml bans each route a boundary crate can
-  # name: simba's `RealField` and `SimdSigned` sign, min, max and copysign methods; num-traits'
+  # through `libm` (its `libm_force`), and so does glam except its `%` operator and its
+  # Euclidean division and remainder, which call the platform's `fmod`; glam's vector `min`
+  # and `max` are compare-and-select only under its `scalar-math` feature, which `cargo xtask
+  # features` requires in every build it compares. glamx's 3x3 eigen decompositions and its
+  # SVDs, and num-complex's `Complex` through num-traits' `Float`, call the standard library's
+  # float methods. Every boundary clippy.toml bans each route a boundary crate can name:
+  # simba's `RealField` and `SimdSigned` sign, min, max and copysign methods; num-traits'
   # `Float`, `Real` and `Signed` sign tests; glam's sign-bit methods, `copysign` and Euclidean
   # division; `Complex` and its float methods; glamx's eigen and SVD types and their `MatExt`
-  # methods; approx's `UlpsEq`; and simba's `wide` lanes, whose min and max differ between
-  # targets on the sign of zero. No boundary crate may name num-traits, which is on no
-  # `normal` list.
+  # methods; approx's `UlpsEq`; parry's `VectorExt::angle` and Rapier's
+  # `RevoluteJoint::angle`; and simba's `wide` lanes, whose min and max differ between targets
+  # on the sign of zero. `%` is an operator no lint sees (docs/verification.md). No boundary
+  # crate may name num-traits, which is on no `normal` list.
   "glam", "glamx", "nalgebra", "num-traits", "parry3d-f64", "simba", "wide",
   # postcard's framing helper; byte shuffling only.
   "cobs",
