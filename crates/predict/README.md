@@ -545,12 +545,18 @@ facade)
   is no correction point. It is written with every correction that writes the entity's
   claimed spawn or exact rows, and a rollback writes every fact at its tick, so the first
   correction after a difference removes it; a kernel that ran on one side only shows
-  through the replicated components it writes. A statement travels with its fact: a kept
-  fact keeps it, and exact rows folded into a kept claimed spawn replace its statement
-  with theirs as they replace its components ("Reconciliation"). Recording presence would
-  make it a
-  correction point of its own, at one `World::get_erased` per claimed entity and transient
-  type in every slot, and is not built ("Not in this crate yet").
+  through the replicated components it writes. A difference in presence alone never causes
+  that correction, though. Where the kernels that match a component write nothing recorded
+  (`anim::evaluate` writes `SimPose` alone), a `[server]`-only system that removes it from
+  a claimed entity is never followed: every later frame states the entity without it, no
+  recorded component differs, and the client goes on running the kernel on a component
+  the server's entity no longer has, for as long as the entity stays claimed. A statement
+  travels with its fact: a kept fact keeps it, and exact rows folded into a kept claimed
+  spawn replace its statement with theirs when their frame holds one, and keep it
+  otherwise, as they replace its components ("Reconciliation"). Recording presence would
+  make it a correction point of its own, at one `World::get_erased` per claimed entity and
+  transient type in every slot; it is the fix if a game needs one, and is not built ("Not
+  in this crate yet").
 - A derived component that is not replicated is never sent, a hook skips one a frame
   carries as a value, and a save or a relevance document carries none for an entity
   spawned at run time (D129): the system that owns the value rebuilds it (architecture
@@ -1040,14 +1046,27 @@ README.md`, "The applier")
   after the document, which no fact restores (the proxy is gone from the prediction world,
   or resides in a region the frames never placed it in, until a whole send or a full
   frame), and it misses an entity the server gave the owner since, which the server's own
-  entry then corrects or applies. Decided with a replicated `OwnedBy`, before a game
-  predicts an owner's despawn or region move (`docs/verification.md`); the candidate rule
-  is the ECS's: in a prediction world the cascade stops at an entity the local player has
-  not claimed, since a proxy is the server's to destroy or move.
-- Transient presence in the record. A difference in presence alone is no correction point
-  ("What a row built from the stream has"); and a claimed entity's transient components
-  change on the client only with a statement, so a server-only system that adds or removes
-  one is followed at the entity's next correction, not at once.
+  entry then corrects or applies. An owner the hook despawned alone and that returns, by
+  a re-entry spawn or a region's next document, owns again what a stale edge says it owns:
+  `World::owned_by` lists by the stored key, which a returning owner spawns under (a bound
+  owner's is its predicted origin, which the spawn carries), so the tombstone does not end
+  the hazard, whatever the ring's depth. Decided with a replicated `OwnedBy`, before a game
+  predicts an owner's despawn or region move (`docs/verification.md`). The one candidate
+  known is the ECS's: in a prediction world the cascade stops at an entity the local player
+  has not claimed, since a proxy is the server's to destroy or move. That is a switch on
+  the world's kind at command apply, so taking it would reverse, for the predicted path,
+  D141's rule that `Commands::despawn` means one thing in both worlds; no candidate without
+  a switch is known, since stopping at unclaimed entities in every kind would change what
+  a server's despawn takes.
+- Transient presence in the record. A difference in presence alone is no correction point,
+  and never causes one ("What a row built from the stream has"): a claimed entity's
+  transient components change on the client only where a correction or a claim writes a
+  statement, so a `[server]`-only system that adds or removes one is followed at the
+  entity's next correction if something else causes it, and otherwise not while the entity
+  stays claimed. Presence in the record, compared like a component's presence, is the fix
+  if a game needs it. Applying a statement at once in a predicted tick is ruled out: the
+  frame is for an older server tick than the tick that pops it, and it would put that
+  tick's presence on a newer predicted state.
 - The visual blend of a correction: presentation's, milestone 2, from `Correction`.
 - The lag-compensation tick the client saw: a field of the input sample's schema version 2
   at milestone 4; nothing here.
@@ -1097,7 +1116,8 @@ hook" above that says a claimed spawn carries no transient component.
 | `a_respawn_from_exact_rows_carries_its_transient_components` | A claimed entity the prediction world despawned too early is re-spawned by a frame's exact rows with the frame's statement: the stated components are present, zeroed, and the kernel that names them runs in every re-simulated tick | `tests/corrections.rs` |
 | `a_claim_of_a_live_proxy_brings_its_transient_components` | A proxy the stream spawned, which has none, claimed by a spawn with a statement: it has the stated components after the predicted tick, after the correction at the frame's tick and after a later rollback through it; one a region document gave it that the statement does not name is removed; a claim into a region the world lacks changes nothing | `tests/claims.rs` |
 | `a_statement_is_exact_and_writes_no_value` | The local player's `PlayerInput`, written by the applier before the hook, has the same bytes after a full frame's upsert and after a correction whose statement names it; an unreplicated transient component the statement does not name is removed and one named and absent inserted zeroed, in ascending key order (the structural log's order under every layout); with no statement none is removed; a replicated transient component a frame's exact rows do not name is removed; a key that is not a transient unreplicated component is skipped and logged; a release leaves all of them | `tests/corrections.rs` |
-| `a_difference_in_presence_alone_is_no_correction_point` | A frame whose statement differs from the row only in presence makes no correction and re-simulates nothing; the next frame with a component that differs makes one, after which the entity has the stated components | `tests/corrections.rs` |
+| `a_difference_in_presence_alone_is_no_correction_point` | A frame whose statement differs from the row only in presence makes no correction and re-simulates nothing, and neither does any later frame that differs only so (the limit "What a row built from the stream has" states: a `[server]`-only removal is not followed while nothing recorded differs); the next frame with a component that differs makes one, after which the entity has the stated components | `tests/corrections.rs` |
+| `a_kept_claimed_spawn_keeps_its_statement_under_rows_that_carry_none` | Exact rows from a frame with no statement, folded into a kept claimed spawn, replace its components and keep its statement, so a rollback through the kept slot re-spawns the entity with the stated components, hash for hash with the straight run; rows from a frame that holds a statement replace it | `tests/regions.rs` |
 | `a_proxy_gets_no_unreplicated_transient_component` | A statement of an entity the frame does not state claimed changes nothing, in a delta frame and a full frame, and `SlotBytes::world` is what it is without the statement | `tests/hook.rs` |
 | `a_spawn_writes_replicated_components_alone` | A full frame's spawn and a delta frame's proxy spawn that carry a derived and an unreplicated transient component as values: the row has neither, both are logged once in the predicted tick and at debug in a replay, and the rest of the spawn applies | `tests/hook.rs`, `tests/logs.rs` |
 | `a_derived_component_is_added_by_its_system` | The test game adds `Trail` with a `Without<Trail>` kernel that computes it from `Position`. A cart a correction re-spawns has no `Trail` at the correction's slot and has it, equal to its corrected `Position`, after the next tick; the `Changed<Position>` cache follows the server's later moves; the build check passes the kernel | `tests/corrections.rs`, `tests/check.rs` |

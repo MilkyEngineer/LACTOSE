@@ -45,7 +45,7 @@ and list what changed, because `sim`, `predict`, `physics-api`, `net`, `persist`
 | `World::region_mode` | A loaded region's mode in one lookup, for a consumer that reads every region's mode at every sync point (`World::region` counts the region's entities) |
 | `World::load_region`, `World::export_region`, `RegionRows` | Bulk copy of region rows and resources to and from `lactose_bundle` documents |
 | `World::get_erased`, `World::insert_erased`, `World::remove_erased`, `World::spawn_erased` | One entity's components by key from the registry, `lactose_bundle::ComponentData` in and stored bytes out: what `lactose-predict` and `net`'s generic hook are written against (D121, D122) |
-| `World::despawn_alone`, `World::move_alone_to_region` | One entity despawned or moved without the entities it owns: how a client's staged-state hooks and `lactose-predict`'s corrections apply a tombstone or a move of the server's (D141). A facade: the signatures and the contract below are final, the bodies are `todo!()` until the lane `stream-impl` |
+| `World::despawn_alone`, `World::move_alone_to_region` | One entity despawned or moved without the entities it owns, in a `Client` or a `Prediction` world: how a client's staged-state hooks and `lactose-predict`'s corrections apply a tombstone or a move of the server's (D141). A `Server` world refuses both with `Unsupported`. A facade: the signatures and the contract below are final, the bodies are `todo!()` until the lane `stream-impl` |
 
 The hidden `__private` module and the hidden items of `SystemDescriptor`, `Bundle`,
 `QueryItem`, `QueryItems` and `Kernel` are the macro's and the implementation's, and may
@@ -393,8 +393,18 @@ What a system is, from its parameters (`SystemParam` has the table):
   `World::move_alone_to_region` (D141; a facade until the lane `stream-impl`, as the
   surface table says), so a stale edge takes no entity the server released.
   `despawn_alone` leaves what the entity owned with its `OwnedBy` as written, a reference to
-  an entity that is not live, as an owner's unload does; `move_alone_to_region` leaves it in
-  the region it resides in, as a write of `OwnedBy` does. A prediction system's own
+  an entity that is not live; `move_alone_to_region` leaves it in the region it resides in,
+  as a write of `OwnedBy` does. That is not what an owner's unload leaves: an unload keeps
+  the owner's alias, and a despawn is a death, so once the rollback horizon passes it the
+  alias of a bound predicted origin is pruned, the reference left behind names no `NetId`,
+  and the region of the row that holds it cannot be exported. A `Server` world, the one
+  kind that exports, therefore refuses both methods with `Unsupported` and nothing changed:
+  on a server an owned entity leaves with its owner, and the invariant above holds because
+  no path leaves one behind. In a client's worlds nothing exports and the reference dangles
+  as any reference may; an owner that returns under the stored key, which for a bound
+  entity is its predicted origin (a staged spawn carries it, as a document's row does),
+  owns the entity again, and one spawned under its bare `Net` key does so only while its
+  alias lives. A prediction system's own
   `Commands::despawn` or `Commands::move_to_region` still takes the tree through the
   prediction world's edges, which is an open item (`docs/verification.md`); a game that
   needs the server's ownership on a client needs `OwnedBy` replicated, which is a `net-api`

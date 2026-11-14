@@ -226,8 +226,14 @@ which `build`'s `derived` check does not see.
   a tombstone, a move, or a spawn where the move brings the entity into the client's set.
   The entries of one tree may reach a client in different frames, since a cap
   makes sends partial; until an owned entity's own entry arrives it stays where it was,
-  its owner gone or elsewhere, which the ECS holds as it holds an owner whose region
-  unloaded. An entity a region's document placed whose handle the client does not hold has
+  its owner gone or elsewhere, its `OwnedBy` a reference to an entity that is not live or
+  not there, which a client's world holds like any other. The two methods are a client's
+  alone: a `Server` world refuses them, since a despawn that leaves an owned entity behind
+  can leave a region that cannot be exported (`crates/ecs/README.md`, Regions), and a
+  client exports nothing. An owner that comes back, by a re-entry spawn or a region's next
+  document, owns again what the client's stale edge says it owns, so a released entity can
+  again be taken by a prediction system's cascade (`docs/verification.md`), never by the
+  hook. An entity a region's document placed whose handle the client does not hold has
   no tombstone coming, owned or not (`crates/net-host/README.md`, "Interest and the
   packer", the open item). A game that needs the server's ownership on a client needs
   `OwnedBy` replicated: a change to this contract, which must first settle how a client
