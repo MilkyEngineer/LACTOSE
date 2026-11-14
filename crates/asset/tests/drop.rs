@@ -57,9 +57,13 @@ fn dropping_the_last_handle_cancels_every_load_and_never_blocks() {
     gate.open_all();
     gate.wait_returned(&held);
     eventually("the held call's asset dropped", || GATED_LIVE.load(Ordering::SeqCst) == 0);
-    // The read buffers and the packs' files, the last of them closed with the store.
+    // The read buffers and the packs' files, the last of them closed with the store. At
+    // most `idle`, not exactly it: the baseline may include a block still in flight then.
+    // On macOS a `std::sync::Mutex` allocates at its first lock, under the locking thread's
+    // tag, so a request's completion first locked by the pool thread is charged to `Io`
+    // until the pool drops the request, which may be after `idle` was read.
     let deadline = std::time::Instant::now() + LIMIT;
-    while ALLOCATOR.stats(AllocTag::Io).live_bytes != idle {
+    while ALLOCATOR.stats(AllocTag::Io).live_bytes > idle {
         let stats = ALLOCATOR.stats(AllocTag::Io);
         assert!(std::time::Instant::now() < deadline, "Io holds {stats:?}, {idle} bytes idle");
         std::thread::sleep(std::time::Duration::from_millis(1));
@@ -80,7 +84,7 @@ fn dropping_the_last_handle_cancels_every_load_and_never_blocks() {
 fn a_mount_polled_once_and_dropped_mounts_nothing() {
     let env = Env::new("drop_mount");
     let (loaders, _) = test_loaders();
-    let (store, pool) = env.held_store(loaders);
+    let store = env.held_store(loaders);
     let (x, y) = (id("x"), id("y"));
     let path = env.pack(&[(x, text(b"x", []))], lactose_asset::Storage::Raw);
     {
@@ -88,9 +92,10 @@ fn a_mount_polled_once_and_dropped_mounts_nothing() {
         let poll = mount.as_mut().poll(&mut Context::from_waker(Waker::noop()));
         assert!(poll.is_pending(), "the open is queued on the held pool");
     }
-    pool.release();
-    // The pool's one thread runs its queue in order: once this mount has resolved, it has
-    // passed the dropped mount's open, which it skips as cancelled.
+    store.release();
+    // The pool's one thread runs its queue in the order the futures were first polled
+    // (`crates/io/README.md`, "Requests and futures" and "The pool"): once this mount has
+    // resolved, it has passed the dropped mount's open, which it skips as cancelled.
     env.provide(&store, &[(y, text(b"y", []))]);
     store.request_newest(x, LoadPriority::default());
     store.request_newest(y, LoadPriority::default());
@@ -104,13 +109,14 @@ fn a_mount_polled_once_and_dropped_mounts_nothing() {
 
 /// On a pool left to run, a mount's first poll resolves it if the open and both reads end
 /// within that poll; the pack is then mounted, as by any mount that resolved `Ok`.
-/// Otherwise the drop mounts nothing.
+/// Otherwise the drop mounts nothing, then or later: the check waits for another mount
+/// resolved after it on the pool's one thread.
 #[test]
 fn a_mount_dropped_after_one_poll_mounts_its_pack_only_if_that_poll_resolved_it() {
-    let env = Env::new("drop_mount_running_pool");
+    let env = Env::one_thread_each("drop_mount_running_pool");
     let (loaders, _) = test_loaders();
     let store = env.store(loaders);
-    let x = id("x");
+    let (x, y) = (id("x"), id("y"));
     let path = env.pack(&[(x, text(b"x", []))], lactose_asset::Storage::Raw);
     let resolved = {
         let mut mount = pin!(store.mount(path));
@@ -122,8 +128,11 @@ fn a_mount_dropped_after_one_poll_mounts_its_pack_only_if_that_poll_resolved_it(
             Poll::Pending => false,
         }
     };
+    env.provide(&store, &[(y, text(b"y", []))]);
     store.request_newest(x, LoadPriority::default());
+    store.request_newest(y, LoadPriority::default());
     env.settle(&store);
+    assert!(store.newest(y).ready().is_some());
     if resolved {
         let handle = store.newest(x).ready().expect("the mounted pack's version");
         assert_eq!(handle.downcast::<Text>().expect("a text asset").0, b"x");

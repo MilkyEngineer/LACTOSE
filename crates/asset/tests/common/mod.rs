@@ -93,11 +93,9 @@ impl Env {
         Store::new(self.executor.clone(), self.io.clone(), loaders).expect("one loader per kind")
     }
 
-    /// A store on a pool of its own, of one thread that does not begin until the returned
-    /// [`HeldPool`] is released or dropped: every request the store submits before that
-    /// stays queued, so a first poll that submits one returns `Pending` however fast the
-    /// pool would have been. The env's own pool still writes the packs.
-    pub fn held_store(&self, loaders: Vec<ErasedLoader>) -> (Store, HeldPool) {
+    /// A store on a pool of its own, held: see [`HeldStore`]. The env's own pool still
+    /// writes the packs.
+    pub fn held_store(&self, loaders: Vec<ErasedLoader>) -> HeldStore {
         let release = Arc::new(Release::default());
         let platform = HoldingPlatform {
             platform: Arc::clone(self.executor.platform()),
@@ -106,7 +104,7 @@ impl Env {
         let one = std::num::NonZero::new(1).unwrap();
         let io = Io::start(&platform, IoConfig::new(one)).expect("the held pool");
         let store = Store::new(self.executor.clone(), io, loaders).expect("one loader per kind");
-        (store, HeldPool(release))
+        HeldStore { store, release }
     }
 
     /// Writes `bytes` whole at a new path of the directory.
@@ -191,7 +189,7 @@ impl Release {
     }
 
     /// Unbounded: nothing joins a thread held here before the release, and the
-    /// [`HeldPool`]'s drop releases it.
+    /// [`HeldStore`]'s drop releases it.
     fn wait(&self) {
         let mut released = self.released();
         while !*released {
@@ -232,21 +230,41 @@ impl Platform for HoldingPlatform {
     }
 }
 
-/// The test's handle to the pool of an [`Env::held_store`]. Dropping it releases the
-/// pool, so a test that fails or never releases leaves no pool thread waiting.
-pub struct HeldPool(Arc<Release>);
+/// A store whose pool's one thread does not begin until [`HeldStore::release`], or the
+/// held store's drop. Until then every request the store submits stays queued, so a
+/// first poll that submits one (a mount's open) returns `Pending` on any schedule: the
+/// hold proves that the request had not run, not merely that it was slow. Once released,
+/// the thread runs the queue in the order the requests' futures were first polled, one at
+/// a time, skipping those whose futures were dropped (`crates/io/README.md`, "Requests
+/// and futures" and "The pool"; a priority that reorders the queue is milestone 3's to
+/// decide).
+///
+/// Its fields are private, so no test can let go of the hold by a pattern such as
+/// `let (store, _) = ...`; the store is reached through `Deref`.
+pub struct HeldStore {
+    store: Store,
+    release: Arc<Release>,
+}
 
-impl HeldPool {
-    /// Lets the pool's thread begin: it runs what was queued, in order, skipping what was
-    /// cancelled.
+impl HeldStore {
+    /// Lets the pool's thread begin.
     pub fn release(&self) {
-        self.0.release();
+        self.release.release();
     }
 }
 
-impl Drop for HeldPool {
+impl std::ops::Deref for HeldStore {
+    type Target = Store;
+
+    fn deref(&self) -> &Store {
+        &self.store
+    }
+}
+
+/// A test that fails or never releases leaves no pool thread waiting.
+impl Drop for HeldStore {
     fn drop(&mut self) {
-        self.0.release();
+        self.release.release();
     }
 }
 

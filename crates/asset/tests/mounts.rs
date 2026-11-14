@@ -86,7 +86,11 @@ fn a_failed_and_a_dropped_mount_leave_their_place_empty_and_change_nothing() {
     // Held until both dropped mounts are gone, so the one polled once is dropped with its
     // open still queued: a pool fast enough to finish the open and both reads within that
     // poll would resolve it there and mount the pack.
-    let (store, pool) = env.held_store(loaders);
+    let store = env.held_store(loaders);
+    // Followed before any mount, so its newest is a `NotFound` failure: a drop that asked
+    // for it again, or published anything, would move the generation.
+    store.request_newest(x, NOW);
+    let before = store.generation();
     // Places 0 to 3, taken at the calls; nothing is opened before a mount's first poll.
     let mounted = store.mount(first_path);
     let missing = store.mount(env.dir.join("no such pack"));
@@ -96,7 +100,8 @@ fn a_failed_and_a_dropped_mount_leave_their_place_empty_and_change_nothing() {
         let poll = mount.as_mut().poll(&mut Context::from_waker(Waker::noop()));
         assert!(poll.is_pending(), "the open is queued on the held pool");
     }
-    pool.release();
+    assert_eq!(store.generation(), before, "the dropped mounts changed nothing");
+    store.release();
     env.wait(mounted).unwrap();
     store.request_newest(x, NOW);
     env.settle(&store);
