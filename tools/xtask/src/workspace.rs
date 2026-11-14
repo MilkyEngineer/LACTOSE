@@ -51,6 +51,8 @@ pub struct Dep {
     pub kind: DepKind,
     /// Where it comes from.
     pub source: DepSource,
+    /// Whether it is optional, compiled only when a feature turns it on.
+    pub optional: bool,
     /// The name the declaring package uses for it, when it renames it.
     pub rename: Option<String>,
     /// The features the declaration turns on, `default` aside.
@@ -75,6 +77,10 @@ pub struct Package {
     /// The root source file of every target (library, binaries, tests, benches, examples and
     /// the build script), relative to the workspace root. Each is a crate of its own.
     pub crate_roots: Vec<String>,
+    /// The roots of the targets the package ships, its library (or proc-macro) and binaries,
+    /// wherever their files are: [`Package::crate_roots`] without tests, benches, examples
+    /// and the build script.
+    pub shipped_roots: Vec<String>,
     /// True if the package has a proc-macro target.
     pub proc_macro: bool,
     /// True if the package has a build script.
@@ -368,16 +374,23 @@ pub fn parse_metadata(json: &str) -> Result<Metadata, String> {
         let manifest = relative(&raw.workspace_root, &package.manifest_path)?;
         let dir = manifest.strip_suffix("/Cargo.toml").unwrap_or_default().to_owned();
         let mut crate_roots = Vec::new();
+        let mut shipped_roots = Vec::new();
         let mut proc_macro = false;
         let mut build_script = false;
         for target in &package.targets {
             let is = |kind: &str| target.kind.iter().any(|k| k == kind);
             proc_macro |= is("proc-macro");
             build_script |= is("custom-build");
-            crate_roots.push(relative(&raw.workspace_root, &target.src_path)?);
+            let root = relative(&raw.workspace_root, &target.src_path)?;
+            if !["test", "bench", "example", "custom-build"].iter().any(|kind| is(kind)) {
+                shipped_roots.push(root.clone());
+            }
+            crate_roots.push(root);
         }
         crate_roots.sort();
         crate_roots.dedup();
+        shipped_roots.sort();
+        shipped_roots.dedup();
         let deps = package
             .dependencies
             .iter()
@@ -393,6 +406,7 @@ pub fn parse_metadata(json: &str) -> Result<Metadata, String> {
                     Some(_) => DepSource::Path,
                     None => DepSource::External,
                 },
+                optional: dep.optional,
                 rename: dep.rename.clone(),
                 features: dep.features.clone(),
             })
@@ -401,6 +415,7 @@ pub fn parse_metadata(json: &str) -> Result<Metadata, String> {
             name: package.name.clone(),
             dir,
             crate_roots,
+            shipped_roots,
             proc_macro,
             build_script,
             deps,
@@ -517,6 +532,7 @@ pub(crate) mod fixture {
             name: name.to_owned(),
             dir: format!("crates/{role}"),
             crate_roots: vec![format!("crates/{role}/src/lib.rs")],
+            shipped_roots: vec![format!("crates/{role}/src/lib.rs")],
             proc_macro: false,
             build_script: false,
             deps: deps
@@ -525,6 +541,7 @@ pub(crate) mod fixture {
                     name: dep.to_owned(),
                     kind,
                     source: source_of(dep),
+                    optional: false,
                     rename: None,
                     features: Vec::new(),
                 })
@@ -650,6 +667,7 @@ mod tests {
         let core = ws.package("lactose-core").unwrap();
         assert_eq!(core.dir, "crates/core");
         assert_eq!(core.crate_roots, ["crates/core/src/lib.rs", "crates/core/tests/t.rs"]);
+        assert_eq!(core.shipped_roots, ["crates/core/src/lib.rs"]);
         assert!(!core.proc_macro && !core.build_script);
         let sources: Vec<DepSource> = core.deps.iter().map(|d| d.source).collect();
         assert_eq!(sources, [DepSource::External, DepSource::External, DepSource::Path]);
@@ -666,6 +684,7 @@ mod tests {
             macros.crate_roots,
             ["crates/reflect-macros/build.rs", "crates/reflect-macros/src/lib.rs"]
         );
+        assert_eq!(macros.shipped_roots, ["crates/reflect-macros/src/lib.rs"]);
         assert_eq!(
             (macros.deps[0].kind, macros.deps[0].source),
             (DepKind::Build, DepSource::Member)

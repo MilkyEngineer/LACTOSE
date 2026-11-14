@@ -456,7 +456,7 @@ fn dev_only_features(tiers: &TierFile, ws: &Workspace, findings: &mut Vec<Findin
 
 /// The features of `package` that turn on one of `listed`, the listed ones included: a
 /// feature is in the set when one of its plain values is.
-fn turning_on<'a>(package: &'a Package, listed: &'a [String]) -> BTreeSet<&'a str> {
+pub(crate) fn turning_on<'a>(package: &'a Package, listed: &'a [String]) -> BTreeSet<&'a str> {
     let mut set: BTreeSet<&str> = listed.iter().map(String::as_str).collect();
     loop {
         let before = set.len();
@@ -614,6 +614,7 @@ mod tests {
             name: "lactose-renderer".to_owned(),
             kind: Normal,
             source: DepSource::External,
+            optional: false,
             rename: None,
             features: Vec::new(),
         });
@@ -634,6 +635,7 @@ mod tests {
             name: "shim".to_owned(),
             kind: Normal,
             source: DepSource::Path,
+            optional: false,
             rename: None,
             features: Vec::new(),
         });

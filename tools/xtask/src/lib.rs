@@ -51,3 +51,7 @@ pub const TIER_FILE: &str = "crate-tiers.toml";
 
 /// The repository-relative path of the data the checks hold that is not a dependency rule.
 pub const POLICY_FILE: &str = "tools/xtask/ci-policy.toml";
+
+/// The repository-relative path of the architecture document, whose unsafe policy table the
+/// policy file transcribes.
+pub const ARCHITECTURE: &str = "docs/architecture.md";

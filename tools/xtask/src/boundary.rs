@@ -6,14 +6,14 @@
 //! it off is in use: a lint attribute on a whole crate or module, an `allow` on an item,
 //! another configuration file, a `[lints]` table, or a flag in a workflow or script.
 
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use crate::policy::Policy;
 use crate::repo::{Files, is_build_configuration, is_cargo_config, unread_cargo_configuration};
-use crate::rust_source::attributes;
-use crate::tiers::TierFile;
+use crate::rust_source::{Attribute, Impl, attributes, items};
+use crate::tiers::{TierFile, turning_on};
 use crate::workspace::{DepKind, DepSource, Package, Workspace};
-use crate::{Finding, TIER_FILE};
+use crate::{ARCHITECTURE, Finding, POLICY_FILE, TIER_FILE};
 
 /// The boundary lint configuration every boundary crate copies byte for byte.
 pub const REFERENCE_CLIPPY: &str = "crates/core/clippy.toml";
@@ -24,32 +24,344 @@ pub const CARGO_CONFIG: &str = ".cargo/config.toml";
 /// The workspace manifest.
 const ROOT_MANIFEST: &str = "Cargo.toml";
 
+/// The harness protocol, which every simulation test includes by `#[path]` (section 8.3).
+const HARNESS_PROTOCOL: &str = "tools/xtask/src/harness/protocol.rs";
+
+/// The trait that declares an asset kind the simulation reads (D99).
+const SIMULATION_ASSET: &str = "SimulationAsset";
+
+/// The trait that decodes an asset kind from cooked bytes (D99).
+const LOADER: &str = "Loader";
+
 /// The `[target]` key and the flags of the pin (architecture section 8.2).
 const PIN_KEY: &str = r#"cfg(target_arch = "x86_64")"#;
 const PIN_CPU: &str = "x86-64-v3";
 const PIN_FLAGS: [&str; 2] = ["-C", "target-cpu=x86-64-v3"];
 
-/// Entries the reference lint file must keep, one or two from each family of rule in
-/// section 8.2, so a file that was emptied and then copied everywhere is still caught. The
-/// executor's core count and rayon's worker index are here, not in [`THREAD_ROUTES`]: they
-/// start no thread, and no test uses them.
-const REQUIRED_LINT_PATHS: [&str; 17] = [
+/// Every entry of the reference lint file that is neither a thread route nor in
+/// [`NOT_THREAD_ROUTES`], in the file's order: the float methods and the trait routes to them,
+/// the executor's worker index and the methods of its re-export, files, the environment,
+/// subprocesses and the network, and the types. The check requires the reference's entries
+/// to be exactly this list, [`THREAD_ROUTES`] and [`NOT_THREAD_ROUTES`], each in the table
+/// [`pinned_table`] names, so a ban deleted from the reference and every copy is reported, and
+/// so is one moved to the other table, where clippy no longer applies it, or one added without
+/// being pinned here. `allow-invalid` keeps clippy quiet about an entry whatever happens to
+/// it, and no test uses most of them.
+const REQUIRED_LINT_PATHS: [&str; 273] = [
     "f32::min",
-    "f64::sin",
-    "f64::to_bits",
+    "f32::max",
+    "f32::clamp",
+    "f32::powi",
+    "f32::total_cmp",
+    "f32::to_bits",
+    "f32::copysign",
+    "f32::is_sign_negative",
+    "f32::sin",
+    "f32::cos",
+    "f32::tan",
+    "f32::asin",
+    "f32::acos",
+    "f32::atan",
+    "f32::atan2",
+    "f32::sin_cos",
+    "f32::sinh",
+    "f32::cosh",
+    "f32::tanh",
+    "f32::exp",
+    "f32::exp2",
+    "f32::exp_m1",
+    "f32::ln",
+    "f32::ln_1p",
+    "f32::log",
+    "f32::log2",
+    "f32::log10",
+    "f32::powf",
+    "f32::cbrt",
+    "f32::hypot",
+    "f64::min",
+    "f64::max",
+    "f64::clamp",
     "f64::powi",
-    "std::fs::read",
-    "std::env::var",
+    "f64::total_cmp",
+    "f64::to_bits",
+    "f64::copysign",
+    "f64::is_sign_negative",
+    "f64::sin",
+    "f64::cos",
+    "f64::tan",
+    "f64::asin",
+    "f64::acos",
+    "f64::atan",
+    "f64::atan2",
+    "f64::sin_cos",
+    "f64::sinh",
+    "f64::cosh",
+    "f64::tanh",
+    "f64::exp",
+    "f64::exp2",
+    "f64::exp_m1",
+    "f64::ln",
+    "f64::ln_1p",
+    "f64::log",
+    "f64::log2",
+    "f64::log10",
+    "f64::powf",
+    "f64::cbrt",
+    "f64::hypot",
+    "f32::algebraic_add",
+    "f32::algebraic_sub",
+    "f32::algebraic_mul",
+    "f32::algebraic_div",
+    "f32::algebraic_rem",
+    "f32::to_le_bytes",
+    "f32::to_be_bytes",
+    "f32::to_ne_bytes",
+    "f32::abs_sub",
+    "f64::algebraic_add",
+    "f64::algebraic_sub",
+    "f64::algebraic_mul",
+    "f64::algebraic_div",
+    "f64::algebraic_rem",
+    "f64::to_le_bytes",
+    "f64::to_be_bytes",
+    "f64::to_ne_bytes",
+    "f64::abs_sub",
+    "f32::is_sign_positive",
+    "f32::rem_euclid",
+    "f32::div_euclid",
+    "f32::mul_add",
+    "f64::is_sign_positive",
+    "f64::rem_euclid",
+    "f64::div_euclid",
+    "f64::mul_add",
+    "f32::asinh",
+    "f32::acosh",
+    "f32::atanh",
+    "f64::asinh",
+    "f64::acosh",
+    "f64::atanh",
+    "simba::scalar::RealField::max",
+    "simba::scalar::RealField::min",
+    "simba::scalar::RealField::copysign",
+    "simba::scalar::RealField::is_sign_positive",
+    "simba::scalar::RealField::is_sign_negative",
+    "simba::simd::SimdRealField::simd_copysign",
+    "simba::simd::SimdSigned::is_simd_positive",
+    "simba::simd::SimdSigned::is_simd_negative",
+    "num_traits::sign::Signed::is_positive",
+    "num_traits::sign::Signed::is_negative",
+    "glam::Vec2::copysign",
+    "glam::Vec2::is_negative_bitmask",
+    "glam::Vec2::is_negative_mask",
+    "glam::Vec2::rem_euclid",
+    "glam::Vec2::div_euclid",
+    "glam::Vec3::copysign",
+    "glam::Vec3::is_negative_bitmask",
+    "glam::Vec3::is_negative_mask",
+    "glam::Vec3::rem_euclid",
+    "glam::Vec3::div_euclid",
+    "glam::Vec3A::copysign",
+    "glam::Vec3A::is_negative_bitmask",
+    "glam::Vec3A::is_negative_mask",
+    "glam::Vec3A::rem_euclid",
+    "glam::Vec3A::div_euclid",
+    "glam::Vec4::copysign",
+    "glam::Vec4::is_negative_bitmask",
+    "glam::Vec4::is_negative_mask",
+    "glam::Vec4::rem_euclid",
+    "glam::Vec4::div_euclid",
+    "glam::DVec2::copysign",
+    "glam::DVec2::is_negative_bitmask",
+    "glam::DVec2::is_negative_mask",
+    "glam::DVec2::rem_euclid",
+    "glam::DVec2::div_euclid",
+    "glam::DVec3::copysign",
+    "glam::DVec3::is_negative_bitmask",
+    "glam::DVec3::is_negative_mask",
+    "glam::DVec3::rem_euclid",
+    "glam::DVec3::div_euclid",
+    "glam::DVec4::copysign",
+    "glam::DVec4::is_negative_bitmask",
+    "glam::DVec4::is_negative_mask",
+    "glam::DVec4::rem_euclid",
+    "glam::DVec4::div_euclid",
+    "num_complex::Complex::cis",
+    "num_complex::Complex::norm",
+    "num_complex::Complex::arg",
+    "num_complex::Complex::to_polar",
+    "num_complex::Complex::from_polar",
+    "num_complex::Complex::exp",
+    "num_complex::Complex::ln",
+    "num_complex::Complex::sqrt",
+    "num_complex::Complex::cbrt",
+    "num_complex::Complex::powf",
+    "num_complex::Complex::log",
+    "num_complex::Complex::powc",
+    "num_complex::Complex::expf",
+    "num_complex::Complex::sin",
+    "num_complex::Complex::cos",
+    "num_complex::Complex::tan",
+    "num_complex::Complex::asin",
+    "num_complex::Complex::acos",
+    "num_complex::Complex::atan",
+    "num_complex::Complex::sinh",
+    "num_complex::Complex::cosh",
+    "num_complex::Complex::tanh",
+    "num_complex::Complex::asinh",
+    "num_complex::Complex::acosh",
+    "num_complex::Complex::atanh",
+    "num_complex::Complex::finv",
+    "num_complex::Complex::fdiv",
+    "num_complex::Complex::exp2",
+    "num_complex::Complex::log2",
+    "num_complex::Complex::log10",
+    "glamx::MatExt::symmetric_eigen",
+    "glamx::MatExt::symmetric_eigenvalues",
+    "glamx::MatExt::svd",
+    "approx::UlpsEq::ulps_eq",
+    "approx::UlpsEq::ulps_ne",
+    "lactose_task::JobContext::slot",
+    "lactose_task::ChildContext::slot",
+    "lactose_task::Executor::frame_worker_count",
+    "lactose_task::Executor::slot_count",
+    "lactose_task::Executor::spawn",
+    "lactose_task::Executor::run_graph",
+    "lactose_task::Executor::sleep_until",
+    "lactose_task::Executor::execution_log",
+    "lactose_task::Executor::chaos_config",
     "lactose_task::Platform::topology",
     "lactose_task::Platform::hardware_threads",
-    "rayon::current_thread_index",
-    "rayon::ThreadPool::current_thread_index",
+    "std::fs::canonicalize",
+    "std::fs::copy",
+    "std::fs::create_dir",
+    "std::fs::create_dir_all",
+    "std::fs::exists",
+    "std::fs::hard_link",
+    "std::fs::metadata",
+    "std::fs::read",
+    "std::fs::read_dir",
+    "std::fs::read_link",
+    "std::fs::read_to_string",
+    "std::fs::remove_dir",
+    "std::fs::remove_dir_all",
+    "std::fs::remove_file",
+    "std::fs::rename",
+    "std::fs::set_permissions",
+    "std::fs::set_times",
+    "std::fs::set_times_nofollow",
+    "std::fs::soft_link",
+    "std::fs::symlink_metadata",
+    "std::fs::write",
+    "std::path::Path::canonicalize",
+    "std::path::Path::exists",
+    "std::path::Path::is_dir",
+    "std::path::Path::is_file",
+    "std::path::Path::is_symlink",
+    "std::path::Path::metadata",
+    "std::path::Path::read_dir",
+    "std::path::Path::read_link",
+    "std::path::Path::symlink_metadata",
+    "std::path::Path::try_exists",
+    "std::os::unix::fs::chown",
+    "std::os::unix::fs::chroot",
+    "std::os::unix::fs::lchown",
+    "std::os::unix::fs::symlink",
+    "std::os::windows::fs::symlink_dir",
+    "std::os::windows::fs::symlink_file",
+    "std::env::args",
+    "std::env::args_os",
+    "std::env::current_dir",
+    "std::env::current_exe",
+    "std::env::home_dir",
+    "std::env::join_paths",
+    "std::env::remove_var",
+    "std::env::set_current_dir",
+    "std::env::set_var",
+    "std::env::split_paths",
+    "std::env::temp_dir",
+    "std::env::var",
+    "std::env::var_os",
+    "std::env::vars",
+    "std::env::vars_os",
+    "std::path::absolute",
+    "std::io::stdin",
+    "std::io::IsTerminal::is_terminal",
+    "std::process::id",
+    "std::os::unix::process::parent_id",
+    "std::backtrace::Backtrace::capture",
+    "std::net::ToSocketAddrs::to_socket_addrs",
     "std::time::Instant",
+    "std::time::SystemTime",
     "std::collections::HashMap",
+    "std::collections::HashSet",
     "std::hash::RandomState",
-    "std::thread::LocalKey",
+    "hashbrown::HashMap",
+    "hashbrown::HashSet",
+    "num_traits::Float",
+    "num_traits::real::Real",
+    "num_complex::Complex",
+    "glamx::SymmetricEigen3",
+    "glamx::SymmetricEigen3A",
+    "glamx::DSymmetricEigen3",
+    "glamx::Svd2",
+    "glamx::DSvd2",
+    "glamx::Svd3",
+    "glamx::Svd3A",
+    "glamx::DSvd3",
+    "simba::simd::WideF32x4",
+    "simba::simd::WideF32x8",
+    "simba::simd::WideF64x4",
     "std::fs::File",
+    "std::fs::OpenOptions",
+    "std::fs::DirBuilder",
+    "std::net::TcpListener",
     "std::net::TcpStream",
+    "std::net::UdpSocket",
+    "std::os::unix::net::UnixDatagram",
+    "std::os::unix::net::UnixListener",
+    "std::os::unix::net::UnixStream",
+    "std::process::Command",
+];
+
+/// The pinned entries that belong under `disallowed-types`, in the reference's order; every
+/// other pinned entry belongs under `disallowed-methods`.
+const PINNED_TYPES: [&str; 37] = [
+    "std::time::Instant",
+    "std::time::SystemTime",
+    "std::collections::HashMap",
+    "std::collections::HashSet",
+    "std::hash::RandomState",
+    "hashbrown::HashMap",
+    "hashbrown::HashSet",
+    "num_traits::Float",
+    "num_traits::real::Real",
+    "num_complex::Complex",
+    "glamx::SymmetricEigen3",
+    "glamx::SymmetricEigen3A",
+    "glamx::DSymmetricEigen3",
+    "glamx::Svd2",
+    "glamx::DSvd2",
+    "glamx::Svd3",
+    "glamx::Svd3A",
+    "glamx::DSvd3",
+    "simba::simd::WideF32x4",
+    "simba::simd::WideF32x8",
+    "simba::simd::WideF64x4",
+    "std::thread::LocalKey",
+    "rayon::iter::plumbing::Producer",
+    "rayon::iter::plumbing::UnindexedProducer",
+    "rayon::iter::plumbing::ProducerCallback",
+    "rayon::iter::plumbing::Consumer",
+    "rayon::iter::plumbing::UnindexedConsumer",
+    "std::fs::File",
+    "std::fs::OpenOptions",
+    "std::fs::DirBuilder",
+    "std::net::TcpListener",
+    "std::net::TcpStream",
+    "std::net::UdpSocket",
+    "std::os::unix::net::UnixDatagram",
+    "std::os::unix::net::UnixListener",
+    "std::os::unix::net::UnixStream",
     "std::process::Command",
 ];
 
@@ -174,8 +486,9 @@ const THREAD_ROUTES: [&str; 104] = [
 const THREAD_PREFIXES: [&str; 4] = ["rayon::", "rapier3d_f64::", "parry3d_f64::", "std::thread::"];
 
 /// The reference's entries under [`THREAD_PREFIXES`] that start no thread: rayon's worker
-/// index, Rapier's multibody paths into `matrixmultiply`, the core count and thread-local state.
-const NOT_THREAD_ROUTES: [&str; 9] = [
+/// index, Rapier's multibody paths into `matrixmultiply`, the Rapier and parry angles that call
+/// the platform library, the core count and thread-local state.
+const NOT_THREAD_ROUTES: [&str; 11] = [
     "rayon::current_thread_index",
     "rayon::ThreadPool::current_thread_index",
     "rapier3d_f64::dynamics::Multibody::inverse_kinematics",
@@ -183,6 +496,8 @@ const NOT_THREAD_ROUTES: [&str; 9] = [
     "rapier3d_f64::dynamics::Multibody::inverse_kinematics_delta_with_jacobian",
     "rapier3d_f64::dynamics::MultibodyJointSet::insert",
     "rapier3d_f64::dynamics::MultibodyJointSet::insert_kinematic",
+    "rapier3d_f64::dynamics::RevoluteJoint::angle",
+    "parry3d_f64::math::VectorExt::angle",
     "std::thread::available_parallelism",
     "std::thread::LocalKey",
 ];
@@ -239,6 +554,7 @@ fn is_boundary_lint(lint: &str) -> bool {
 pub fn check(tiers: &TierFile, policy: &Policy, ws: &Workspace, files: &Files) -> Vec<Finding> {
     let mut findings = Vec::new();
     reference_lint_file(files, &mut findings);
+    unsafe_list(policy, files, &mut findings);
     let mut stray_configs = BTreeSet::new();
     for package in &ws.packages {
         readme(package, files, &mut findings);
@@ -267,6 +583,7 @@ pub fn check(tiers: &TierFile, policy: &Policy, ws: &Workspace, files: &Files) -
         }
         if boundary {
             dependency_allowlist(tiers, ws, package, &mut findings);
+            unnamed_allowlist_entries(tiers, package, &mut findings);
         }
     }
     findings.extend(stray_configs.into_iter().map(|path| {
@@ -276,6 +593,8 @@ pub fn check(tiers: &TierFile, policy: &Policy, ws: &Workspace, files: &Files) -
              the boundary lint configuration of every crate at or below it",
         )
     }));
+    harness_packages(policy, ws, files, &mut findings);
+    simulation_assets(tiers, ws, files, &mut findings);
     workspace_lints(files, &mut findings);
     build_configuration(files, &mut findings);
     cargo_configs(files, &mut findings);
@@ -326,12 +645,111 @@ fn unsafe_policy(policy: &Policy, package: &Package, files: &Files, findings: &m
     }
 }
 
+/// Architecture section 21's table and `[unsafe_crates]` name the same crates. The section is
+/// found by its title, not its number; the table is the first one in it, and each row's
+/// first cell names its crates in backticks, by directory under `crates/` or by a path with
+/// a `/` (`tools/cook`), each `lactose-` and its last segment as a package.
+fn unsafe_list(policy: &Policy, files: &Files, findings: &mut Vec<Finding>) {
+    const TITLE: &str = "Unsafe policy";
+    let Some(text) = files.text(ARCHITECTURE) else {
+        findings.push(Finding::new(
+            ARCHITECTURE,
+            format!("is missing, so [unsafe_crates] in {POLICY_FILE} cannot be checked against it"),
+        ));
+        return;
+    };
+    let lines: Vec<&str> = text.lines().collect();
+    let heading = lines.iter().position(|line| {
+        line.strip_prefix("## ").and_then(|title| title.split_once(". ")).is_some_and(
+            |(number, title)| {
+                !number.is_empty() && number.bytes().all(|b| b.is_ascii_digit()) && title == TITLE
+            },
+        )
+    });
+    let Some(heading) = heading else {
+        findings.push(Finding::new(
+            ARCHITECTURE,
+            format!(
+                "has no `## <n>. {TITLE}` section, so [unsafe_crates] in {POLICY_FILE} cannot be \
+                 checked against it"
+            ),
+        ));
+        return;
+    };
+    let section = lines[heading + 1..].iter().take_while(|line| !line.starts_with("## "));
+    let table: Vec<(usize, &str)> = section
+        .enumerate()
+        .map(|(at, line)| (heading + 2 + at, line.trim()))
+        .skip_while(|(_, line)| !line.starts_with('|'))
+        .take_while(|(_, line)| line.starts_with('|'))
+        .collect();
+    // A header row and its separator, then the rows.
+    if table.len() < 3 {
+        findings.push(Finding::new(
+            ARCHITECTURE,
+            format!(
+                "line {}: the {TITLE} section has no table of crates, so [unsafe_crates] in \
+                 {POLICY_FILE} cannot be checked against it",
+                heading + 1
+            ),
+        ));
+        return;
+    }
+    let mut listed = BTreeSet::new();
+    for &(line, row) in &table[2..] {
+        let cell = row.trim_start_matches('|').split('|').next().unwrap_or("");
+        let names: Vec<&str> = cell.split('`').skip(1).step_by(2).collect();
+        if names.is_empty() {
+            findings.push(Finding::new(
+                ARCHITECTURE,
+                format!("line {line}: a row of the {TITLE} table names no crate in backticks"),
+            ));
+        }
+        for name in names {
+            let role = name.rsplit('/').next().unwrap_or(name);
+            listed.insert(format!("lactose-{role}"));
+        }
+    }
+    let number = lines[heading].trim_start_matches("## ").split('.').next().unwrap_or("");
+    let policy_list: BTreeSet<String> = policy.unsafe_crates.iter().cloned().collect();
+    for name in listed.difference(&policy_list) {
+        findings.push(Finding::new(
+            POLICY_FILE,
+            format!(
+                "[unsafe_crates] lacks `{name}`, which the table of architecture section \
+                 {number} lists; the two change in the same commit"
+            ),
+        ));
+    }
+    for name in policy_list.difference(&listed) {
+        findings.push(Finding::new(
+            POLICY_FILE,
+            format!(
+                "[unsafe_crates] lists `{name}`, which the table of architecture section \
+                 {number} does not; the two change in the same commit"
+            ),
+        ));
+    }
+}
+
 /// Whether an attribute body is `forbid(unsafe_code)`, alone or among other lints. A
 /// `cfg_attr` does not count: it forbids only sometimes.
 fn forbids_unsafe(body: &str) -> bool {
     body.strip_prefix("forbid(")
         .and_then(|rest| rest.strip_suffix(')'))
         .is_some_and(|lints| lints.split(',').any(|lint| lint == "unsafe_code"))
+}
+
+/// Whether one of the three lists pins `path`.
+fn is_pinned(path: &str) -> bool {
+    REQUIRED_LINT_PATHS.contains(&path)
+        || THREAD_ROUTES.contains(&path)
+        || NOT_THREAD_ROUTES.contains(&path)
+}
+
+/// The lint table a pinned path belongs in.
+fn pinned_table(path: &str) -> &'static str {
+    if PINNED_TYPES.contains(&path) { "disallowed-types" } else { "disallowed-methods" }
 }
 
 /// The reference lint file exists and still bans what section 8.2 bans.
@@ -350,45 +768,69 @@ fn reference_lint_file(files: &Files, findings: &mut Vec<Finding>) {
             return;
         }
     };
-    let banned: BTreeSet<&str> = LINT_TABLES
+    // Each entry with its table: clippy reads a path only in the table it belongs to, so an
+    // entry moved to the other one bans nothing, as if deleted.
+    let banned: BTreeSet<(&str, &str)> = LINT_TABLES
         .iter()
-        .filter_map(|key| config.get(*key).and_then(toml::Value::as_array))
-        .flatten()
-        .filter_map(|entry| entry.as_str().or_else(|| entry.get("path")?.as_str()))
+        .filter_map(|table| Some((*table, config.get(*table)?.as_array()?)))
+        .flat_map(|(table, entries)| {
+            entries
+                .iter()
+                .filter_map(move |e| Some((table, e.as_str().or_else(|| e.get("path")?.as_str())?)))
+        })
         .collect();
-    for required in REQUIRED_LINT_PATHS {
-        if !banned.contains(required) {
+    // The reference's entries are exactly the three lists, each in its table: none can be
+    // dropped from it and every copy at once or moved to the other table, and none added there
+    // without being pinned here.
+    for (table, path) in &banned {
+        let wanted = pinned_table(path);
+        if is_pinned(path) && *table != wanted {
             findings.push(Finding::new(
                 REFERENCE_CLIPPY,
                 format!(
-                    "no longer disallows `{required}`, which architecture section 8.2 bans \
-                     inside the boundary"
+                    "lists `{path}` under `{table}`, where clippy does not apply it; it belongs \
+                     under `{wanted}`"
                 ),
             ));
         }
     }
-    for route in THREAD_ROUTES.iter().filter(|route| !banned.contains(*route)) {
+    let missing = |path: &&&str| !banned.contains(&(pinned_table(path), **path));
+    for required in REQUIRED_LINT_PATHS.iter().chain(&NOT_THREAD_ROUTES).filter(missing) {
         findings.push(Finding::new(
             REFERENCE_CLIPPY,
             format!(
-                "no longer disallows `{route}`, a route to a thread outside an executor, which \
-                 architecture sections 8.2 and 16 ban inside the boundary"
+                "no longer disallows `{required}` under `{}`, which architecture section 8.2 \
+                 bans inside the boundary",
+                pinned_table(required)
             ),
         ));
     }
-    let unpinned = banned.iter().filter(|path| {
-        THREAD_PREFIXES.iter().any(|prefix| path.starts_with(prefix))
-            && !THREAD_ROUTES.contains(path)
-            && !NOT_THREAD_ROUTES.contains(path)
-    });
-    for path in unpinned {
+    for route in THREAD_ROUTES.iter().filter(missing) {
         findings.push(Finding::new(
             REFERENCE_CLIPPY,
             format!(
-                "disallows `{path}`, which tools/xtask/src/boundary.rs lists neither in \
-                 `THREAD_ROUTES` nor in `NOT_THREAD_ROUTES`; list it in the one it belongs to"
+                "no longer disallows `{route}` under `{}`, a route to a thread outside an \
+                 executor, which architecture sections 8.2 and 16 ban inside the boundary",
+                pinned_table(route)
             ),
         ));
+    }
+    let unpinned: BTreeSet<&str> =
+        banned.iter().map(|(_, path)| *path).filter(|path| !is_pinned(path)).collect();
+    for path in unpinned {
+        let message = if THREAD_PREFIXES.iter().any(|prefix| path.starts_with(prefix)) {
+            format!(
+                "disallows `{path}`, which tools/xtask/src/boundary.rs lists neither in \
+                 `THREAD_ROUTES` nor in `NOT_THREAD_ROUTES`; list it in the one it belongs to"
+            )
+        } else {
+            format!(
+                "disallows `{path}`, which tools/xtask/src/boundary.rs does not pin; add it to \
+                 `REQUIRED_LINT_PATHS` there, in the reference's order, so that dropping it is \
+                 caught"
+            )
+        };
+        findings.push(Finding::new(REFERENCE_CLIPPY, message));
     }
 }
 
@@ -520,6 +962,31 @@ fn package_sources<'a>(package: &Package, files: &'a Files) -> Vec<&'a str> {
         .collect()
 }
 
+/// Every source file a package compiles, as far as the text shows, with its attributes: its
+/// own sources, then each repository file a `#[path]` in one of them names, at any depth,
+/// each once. A `#[path]` that names no repository file is left for the caller to report.
+fn compiled_sources(package: &Package, files: &Files) -> Vec<(String, Vec<Attribute>)> {
+    let mut queue: VecDeque<String> =
+        package_sources(package, files).into_iter().map(str::to_owned).collect();
+    let mut seen: BTreeSet<String> = queue.iter().cloned().collect();
+    let mut sources = Vec::new();
+    while let Some(path) = queue.pop_front() {
+        let Some(source) = files.text(&path) else {
+            continue;
+        };
+        let found = attributes(&source);
+        for named in found.iter().filter_map(|attribute| attribute.path.as_ref()) {
+            if let Some(file) = module_file(&path, named).filter(|file| files.contains(file))
+                && seen.insert(file.clone())
+            {
+                queue.push_back(file);
+            }
+        }
+        sources.push((path, found));
+    }
+    sources
+}
+
 /// The boundary lints an attribute body weakens, each as `level(lint)`.
 fn weakened_lints(body: &str) -> Vec<String> {
     let mut found = Vec::new();
@@ -560,31 +1027,20 @@ fn weakened_lints(body: &str) -> Vec<String> {
 /// `#[path]` in them names, wherever that lives, since the file is compiled into the crate
 /// (the SOUR protocol is, from `tools/xtask`). `kind` names the crate in the findings.
 fn lint_attributes(package: &Package, kind: &str, files: &Files, findings: &mut Vec<Finding>) {
-    let mut queue: VecDeque<String> =
-        package_sources(package, files).into_iter().map(str::to_owned).collect();
-    let mut seen: BTreeSet<String> = queue.iter().cloned().collect();
-    while let Some(path) = queue.pop_front() {
-        let Some(source) = files.text(&path) else {
-            continue;
-        };
-        for attribute in attributes(&source) {
-            if let Some(named) = &attribute.path {
-                match module_file(&path, named).filter(|file| files.contains(file)) {
-                    Some(file) => {
-                        if seen.insert(file.clone()) {
-                            queue.push_back(file);
-                        }
-                    }
-                    None => findings.push(Finding::new(
-                        &path,
-                        format!(
-                            "line {}: `#[path]` names `{named}`, which is not a source file in \
-                             the repository, so the lint attributes of {kind} `{}` in it cannot \
-                             be checked",
-                            attribute.line, package.name
-                        ),
-                    )),
-                }
+    for (path, attributes) in compiled_sources(package, files) {
+        for attribute in attributes {
+            if let Some(named) = &attribute.path
+                && !module_file(&path, named).is_some_and(|file| files.contains(&file))
+            {
+                findings.push(Finding::new(
+                    &path,
+                    format!(
+                        "line {}: `#[path]` names `{named}`, which is not a source file in the \
+                         repository, so the lint attributes of {kind} `{}` in it cannot be \
+                         checked",
+                        attribute.line, package.name
+                    ),
+                ));
             }
             for weakened in weakened_lints(&attribute.body) {
                 let what = if attribute.inner {
@@ -610,15 +1066,267 @@ fn lint_attributes(package: &Package, kind: &str, files: &Files, findings: &mut 
     }
 }
 
+/// Architecture section 8.3: `[harness]` lists exactly the packages that compile the harness
+/// protocol, by `#[path]` from their tests. A package that records hashes but is not listed is
+/// never launched by `sour run`, so its simulation is never compared; a listed package that
+/// does not compile the protocol records nothing. The protocol's own package is neither.
+fn harness_packages(policy: &Policy, ws: &Workspace, files: &Files, findings: &mut Vec<Finding>) {
+    let listed = &policy.harness_packages;
+    for name in listed.iter().filter(|name| ws.package(name).is_none()) {
+        findings.push(Finding::new(
+            POLICY_FILE,
+            format!("[harness] `packages` lists `{name}`, which is not a workspace package"),
+        ));
+    }
+    for package in &ws.packages {
+        if HARNESS_PROTOCOL.starts_with(&format!("{}/", package.dir)) {
+            continue;
+        }
+        let records =
+            compiled_sources(package, files).iter().any(|(path, _)| path == HARNESS_PROTOCOL);
+        let message = match (records, listed.contains(&package.name)) {
+            (true, false) => format!(
+                "`{}` compiles the harness protocol ({HARNESS_PROTOCOL}), so its tests record \
+                 hashes, but [harness] `packages` in {POLICY_FILE} does not list it and `cargo \
+                 xtask sour run` never launches them; add \"{}\" to that list",
+                package.name, package.name
+            ),
+            (false, true) => format!(
+                "`{}` is listed in [harness] `packages` of {POLICY_FILE}, but no source of it \
+                 includes the harness protocol ({HARNESS_PROTOCOL}) by `#[path]`, so it records \
+                 nothing; remove it from that list, or record through the protocol",
+                package.name
+            ),
+            _ => continue,
+        };
+        findings.push(Finding::new(package.manifest(), message));
+    }
+}
+
+/// D99: a kind the simulation reads is declared, by `impl SimulationAsset`, only in a
+/// boundary crate, and decoded only there: a `Loader` outside the boundary whose `type Asset`
+/// names a kind a boundary crate declares or a type parameter of the implementation, or is
+/// not written in its body, is reported, so the decoder stays under section 8.2.
+///
+/// Shipped code is read, from the root of each library, proc-macro and binary target,
+/// wherever it lives, through every out-of-line `mod` (by `#[path]`, by the file layout, and
+/// inside inline modules, which add their name or their own `#[path]` to the directory) and
+/// every `include!` of a literal path, skipping what a `cfg` compiles only for tests or a
+/// `[dev_only_features]` feature. A file is read again when a shipped route reaches it after
+/// a test-only one, and a file under `src/` that no route reaches is read as shipped, so a
+/// module the walk cannot place errs towards a finding.
+///
+/// Names are compared as written, by their last path segment, of the self type for a
+/// qualified path `<T as Trait>::Name`: a kind brought in under another name (`use ... as`, a
+/// type alias, a projection such as `<Self as Decodes>::Kind`) or a loader a macro writes is
+/// not seen, and a type outside the boundary that shares a kind's name is reported.
+fn simulation_assets(tiers: &TierFile, ws: &Workspace, files: &Files, findings: &mut Vec<Finding>) {
+    let shipped = |package: &Package| {
+        let listed = tiers.dev_only_features.get(&package.name).map_or(&[][..], Vec::as_slice);
+        let features: Vec<String> =
+            turning_on(package, listed).into_iter().map(str::to_owned).collect();
+        shipped_impls(package, files, &features)
+    };
+    let (inside, outside): (Vec<&Package>, Vec<&Package>) =
+        ws.packages.iter().partition(|package| tiers.in_boundary(&package.name));
+    let kinds: BTreeSet<String> = inside
+        .into_iter()
+        .flat_map(shipped)
+        .filter(|(_, found)| found.trait_name == SIMULATION_ASSET && !found.self_type.is_empty())
+        .map(|(_, found)| found.self_type)
+        .collect();
+    for package in outside {
+        for (file, found) in shipped(package) {
+            let line = found.line;
+            let message = if found.trait_name == SIMULATION_ASSET {
+                format!(
+                    "line {line}: `impl {SIMULATION_ASSET}` in `{}`, which is not a boundary \
+                     crate; a kind the simulation reads is declared in a boundary crate, where \
+                     architecture section 8.2 holds its loader (D99), or only in tests",
+                    package.name
+                )
+            } else if found.trait_name == LOADER {
+                let Some(decoded) = loads_for_the_simulation(&found, &kinds) else {
+                    continue;
+                };
+                format!(
+                    "line {line}: `impl {LOADER}` in `{}`, which is not a boundary crate, \
+                     decodes {decoded}; the loader of a kind the simulation reads sits in a \
+                     boundary crate, where architecture section 8.2 holds it (D99), or only in \
+                     tests",
+                    package.name
+                )
+            } else {
+                continue;
+            };
+            findings.push(Finding::new(file, message));
+        }
+    }
+}
+
+/// What a loader outside the boundary decodes, said for a finding, if it may be a kind the
+/// simulation reads: its `type Asset` names one of `kinds` by its last path segment, names a
+/// type parameter of the implementation, or cannot be read.
+fn loads_for_the_simulation(found: &Impl, kinds: &BTreeSet<String>) -> Option<String> {
+    let Some((_, asset)) = found.types.iter().find(|(name, _)| name == "Asset") else {
+        return Some(format!(
+            "a kind its text does not show (no `type Asset = ...;` in its body), which may be \
+             one a boundary crate declares a `{SIMULATION_ASSET}`"
+        ));
+    };
+    let words = || asset.split(|c: char| !c.is_ascii_alphanumeric() && c != '_');
+    if let Some(parameter) = words().find(|word| found.generics.iter().any(|g| g == word)) {
+        return Some(format!(
+            "`{asset}`, which names its type parameter `{parameter}`, so it may decode a kind \
+             a boundary crate declares a `{SIMULATION_ASSET}`"
+        ));
+    }
+    // The type the path names: of `<T as Trait>::Name`, its self type `T`.
+    let outer = match asset.strip_prefix('<') {
+        Some(qualified) => qualified.split(" as ").next().unwrap_or_default(),
+        None => asset.as_str(),
+    };
+    let outer = outer.split('<').next().unwrap_or_default();
+    let last = outer.rsplit("::").next().unwrap_or_default();
+    kinds
+        .contains(last)
+        .then(|| format!("`{asset}`, which a boundary crate declares a `{SIMULATION_ASSET}`"))
+}
+
+/// Every trait implementation `package` ships, with its file, each once: the walk of
+/// [`simulation_assets`] over the package's module tree.
+fn shipped_impls(package: &Package, files: &Files, features: &[String]) -> Vec<(String, Impl)> {
+    // (file, the directory its out-of-line modules sit in, whether only tests compile it)
+    let mut queue: VecDeque<(String, String, bool)> = package
+        .shipped_roots
+        .iter()
+        .map(|root| (root.clone(), parent(root).to_owned(), false))
+        .collect();
+    // Each file read, under the directory it was read with, and whether it was read as
+    // shipped: a file reached again as shipped after a test-only route is read again.
+    let mut read: BTreeMap<(String, String), bool> = BTreeMap::new();
+    let mut found: BTreeMap<(String, usize), Impl> = BTreeMap::new();
+    let mut sweep = true;
+    loop {
+        while let Some((file, dir, test_only)) = queue.pop_front() {
+            let key = (file, dir);
+            if read.get(&key).is_some_and(|&shipped| shipped || test_only) {
+                continue;
+            }
+            read.insert(key.clone(), !test_only);
+            let (file, dir) = key;
+            let Some(source) = files.text(&file) else {
+                continue;
+            };
+            let items = items(&source, features);
+            for implementation in items.impls.into_iter().filter(|i| !test_only && !i.test_only) {
+                found.insert((file.clone(), implementation.line), implementation);
+            }
+            for module in items.modules {
+                // The directory of the innermost inline module around the declaration: each
+                // is a directory of its name under the one around it, or the one its `#[path]`
+                // names relative to it. At the top of a file that is the file's own
+                // directory, without the one a `name.rs` adds for its modules.
+                let mut base = Some(dir.clone());
+                for (depth, inline) in module.inline.iter().enumerate() {
+                    base = match &inline.path {
+                        Some(named) if depth == 0 => joined(parent(&file), named),
+                        Some(named) => base.and_then(|base| joined(&base, named)),
+                        None => base.map(|base| format!("{base}/{}", inline.name)),
+                    };
+                }
+                let Some(base) = base else {
+                    continue;
+                };
+                let child = match &module.path {
+                    // Outside an inline module a `#[path]` is relative to the file's own
+                    // directory, inside one to the module's.
+                    Some(named) if module.inline.is_empty() => module_file(&file, named),
+                    Some(named) => joined(&base, named),
+                    None => [
+                        format!("{base}/{}.rs", module.name),
+                        format!("{base}/{}/mod.rs", module.name),
+                    ]
+                    .into_iter()
+                    .find(|candidate| files.contains(candidate)),
+                };
+                // A `#[path]` file holds its modules beside it, as a `mod.rs` does; a
+                // `name.rs` in the directory `name`, which is where `name/mod.rs` holds them.
+                let child_dir = match &module.path {
+                    Some(_) => child.as_deref().map(|child| parent(child).to_owned()),
+                    None => Some(format!("{base}/{}", module.name)),
+                };
+                if let (Some(child), Some(child_dir)) = (child, child_dir) {
+                    queue.push_back((child, child_dir, test_only || module.test_only));
+                }
+            }
+            // An included file is part of the module it sits in, and holds its own modules
+            // beside it.
+            for include in items.includes {
+                if let Some(child) = module_file(&file, &include.path) {
+                    let child_dir = parent(&child).to_owned();
+                    queue.push_back((child, child_dir, test_only || include.test_only));
+                }
+            }
+        }
+        if !std::mem::take(&mut sweep) {
+            break;
+        }
+        let src = format!("{}/src/", package.dir);
+        for path in package_sources(package, files) {
+            if path.starts_with(&src) && !read.keys().any(|(file, _)| file == path) {
+                let dir = match path.strip_suffix("/mod.rs") {
+                    Some(dir) => dir.to_owned(),
+                    None => path.trim_end_matches(".rs").to_owned(),
+                };
+                queue.push_back((path.to_owned(), dir, false));
+            }
+        }
+    }
+    found.into_iter().map(|((file, _), implementation)| (file, implementation)).collect()
+}
+
+/// A boundary crate's `direct` lists name only crates its manifest names. A crate it only
+/// reaches through others is vetted on `transitive`, and an entry its manifest does not name
+/// is a permission waiting to be used by the next manifest edit.
+fn unnamed_allowlist_entries(tiers: &TierFile, package: &Package, findings: &mut Vec<Finding>) {
+    let Some(direct) = tiers.boundary_third_party.direct.get(&package.name) else {
+        return;
+    };
+    for (list, names) in [("normal", &direct.normal), ("dev", &direct.dev)] {
+        for name in names.iter().filter(|name| !package.deps.iter().any(|d| d.name == **name)) {
+            findings.push(Finding::new(
+                TIER_FILE,
+                format!(
+                    "[boundary_third_party.direct] \"{}\" has `{name}` on its `{list}` list, but \
+                     the crate's manifest does not name it; remove it there, and put a crate \
+                     the boundary crate reaches only through others on `transitive`",
+                    package.name
+                ),
+            ));
+        }
+    }
+}
+
 /// The repository path of the file that `#[path = "named"]` in the file `from` names: relative
 /// to the directory of `from`, as for every `mod` outside an inline module block. `None` for
 /// a path that is absolute or leaves the repository.
 fn module_file(from: &str, named: &str) -> Option<String> {
+    joined(parent(from), named)
+}
+
+/// The directory of a repository path, `""` at the root.
+fn parent(path: &str) -> &str {
+    path.rsplit_once('/').map_or("", |(dir, _)| dir)
+}
+
+/// The repository path that `named` names relative to the directory `dir`; `None` for a path
+/// that is absolute or leaves the repository.
+fn joined(dir: &str, named: &str) -> Option<String> {
     if named.starts_with(['/', '\\']) || named.get(1..2) == Some(":") {
         return None;
     }
-    let mut parts: Vec<&str> = from.split('/').collect();
-    parts.pop();
+    let mut parts: Vec<&str> = dir.split('/').filter(|part| !part.is_empty()).collect();
     for part in named.split(['/', '\\']) {
         match part {
             "" | "." => {}
@@ -866,9 +1574,9 @@ fn allowed_by_flag(line: &str) -> Vec<&str> {
 }
 
 /// Architecture section 8.2, for every file that can decide how cargo and clippy are invoked
-/// (cargo configuration, workflows, scripts): nothing sets rust flags through the environment,
-/// selects a CPU or a target feature, points clippy at another configuration, or allows a
-/// boundary lint from the command line.
+/// (cargo configuration, workflows, scripts): nothing sets rust or rustdoc flags through the
+/// environment, selects a CPU or a target feature, points clippy at another configuration, or
+/// allows a boundary lint from the command line.
 ///
 /// rustc reads `-C target_cpu` and `-C target-cpu` alike, so underscores are folded before
 /// matching. Only whole-line `#` comments are skipped; a trailing comment is scanned as if it
@@ -886,19 +1594,22 @@ fn build_configuration(files: &Files, findings: &mut Vec<Finding>) {
             let mut report = |message: String| {
                 findings.push(Finding::new(path, format!("line {}: {message}", index + 1)));
             };
-            // In a cargo configuration file the `rustflags` key is judged by structure, in
-            // `cargo_configs`; anywhere else the word in any spelling is a way to set them
-            // (`--config build.rustflags=...`, the environment variables).
-            let names_flags = if cargo_config {
-                line.contains("RUSTFLAGS")
-            } else {
-                line.to_ascii_uppercase().replace('-', "_").contains("RUSTFLAGS")
-            };
-            if names_flags {
-                report(format!(
-                    "names RUSTFLAGS; rust flags from the environment or the command line \
-                     replace the {PIN_CPU} pin in {CARGO_CONFIG} instead of adding to it"
-                ));
+            // In a cargo configuration file the `rustflags` and `rustdocflags` keys are judged
+            // by structure, in `cargo_configs`; anywhere else either word in any spelling is a
+            // way to set them (`--config build.rustflags=...`, the environment variables).
+            let folded_upper = line.to_ascii_uppercase().replace('-', "_");
+            for (variable, what) in [("RUSTFLAGS", "rust"), ("RUSTDOCFLAGS", "rustdoc")] {
+                let names = if cargo_config {
+                    line.contains(variable)
+                } else {
+                    folded_upper.contains(variable)
+                };
+                if names {
+                    report(format!(
+                        "names {variable}; {what} flags from the environment or the command \
+                         line replace the {PIN_CPU} pin in {CARGO_CONFIG} instead of adding to it"
+                    ));
+                }
             }
             let folded = line.replace('_', "-");
             for (at, _) in folded.match_indices("target-cpu") {
@@ -940,8 +1651,12 @@ fn build_configuration(files: &Files, findings: &mut Vec<Finding>) {
     }
 }
 
-/// Every `rustflags` key of a TOML value, as a dotted path with its value.
-fn rustflags_keys<'a>(
+/// The cargo configuration keys that set flags, for rustc and for rustdoc. Cargo does not pass
+/// `rustflags` to rustdoc, so a doctest is pinned only by `rustdocflags`.
+const FLAG_KEYS: [&str; 2] = ["rustflags", "rustdocflags"];
+
+/// Every key of [`FLAG_KEYS`] in a TOML value, as a dotted path with its value.
+fn flag_keys<'a>(
     value: &'a toml::Value,
     path: &mut Vec<&'a str>,
     found: &mut Vec<(String, &'a toml::Value)>,
@@ -951,22 +1666,22 @@ fn rustflags_keys<'a>(
     };
     for (key, child) in table {
         path.push(key);
-        if key == "rustflags" {
+        if FLAG_KEYS.contains(&key.as_str()) {
             found.push((path.join("."), child));
         } else {
-            rustflags_keys(child, path, found);
+            flag_keys(child, path, found);
         }
         path.pop();
     }
 }
 
-/// Cargo configuration files set `rustflags` in exactly one place: the x86-64-v3 pin in
-/// `.cargo/config.toml`. Any other `rustflags` key, in any table of any cargo configuration
-/// file, is a finding, because cargo joins or replaces flags by rules nobody should have to
-/// re-derive to know what the boundary was compiled with.
+/// Cargo configuration files set flags in exactly one place: the x86-64-v3 pin in
+/// `.cargo/config.toml`, as `rustflags` and as `rustdocflags` with the same flags. Any other
+/// `rustflags` or `rustdocflags` key, in any table of any cargo configuration file, is a
+/// finding, because cargo joins or replaces flags by rules nobody should have to re-derive to
+/// know what the boundary was compiled with; so is either half of the pin missing.
 fn cargo_configs(files: &Files, findings: &mut Vec<Finding>) {
-    let pin_path = format!("target.{PIN_KEY}.rustflags");
-    let mut pinned = false;
+    let mut pinned = [false; FLAG_KEYS.len()];
     for path in files.paths().filter(|path| is_cargo_config(path)) {
         let Some(text) = files.text(path) else {
             continue;
@@ -979,31 +1694,32 @@ fn cargo_configs(files: &Files, findings: &mut Vec<Finding>) {
             }
         };
         let mut found = Vec::new();
-        rustflags_keys(&config, &mut Vec::new(), &mut found);
+        flag_keys(&config, &mut Vec::new(), &mut found);
         for (key, value) in found {
             let flags: Option<Vec<&str>> = value
                 .as_array()
                 .map(|items| items.iter().filter_map(toml::Value::as_str).collect());
-            if path == CARGO_CONFIG && key == pin_path && flags.as_deref() == Some(&PIN_FLAGS[..]) {
-                pinned = true;
-            } else {
-                findings.push(Finding::new(
+            let pin = FLAG_KEYS.iter().position(|name| key == format!("target.{PIN_KEY}.{name}"));
+            match pin {
+                Some(index) if path == CARGO_CONFIG && flags.as_deref() == Some(&PIN_FLAGS[..]) => {
+                    pinned[index] = true;
+                }
+                _ => findings.push(Finding::new(
                     path,
                     format!(
-                        "sets `{key}`; the only rust flags permitted in a cargo configuration \
-                         file are the pin, [target.'{PIN_KEY}'] rustflags = {PIN_FLAGS:?} in \
-                         {CARGO_CONFIG}"
+                        "sets `{key}`; the only flags permitted in a cargo configuration file \
+                         are the pin, [target.'{PIN_KEY}'] rustflags = {PIN_FLAGS:?} and \
+                         rustdocflags the same, in {CARGO_CONFIG}"
                     ),
-                ));
+                )),
             }
         }
     }
-    if !pinned {
+    for (name, _) in FLAG_KEYS.iter().zip(pinned).filter(|(_, pinned)| !pinned) {
         findings.push(Finding::new(
             CARGO_CONFIG,
             format!(
-                "the x86-64 pin is missing: [target.'{PIN_KEY}'] must set rustflags = \
-                 {PIN_FLAGS:?}"
+                "the x86-64 pin is missing: [target.'{PIN_KEY}'] must set {name} = {PIN_FLAGS:?}"
             ),
         ));
     }
@@ -1016,21 +1732,36 @@ mod tests {
     use crate::workspace::fixture::{package, workspace, workspace_with};
     use DepKind::{Build, Dev, Normal};
 
-    const PIN: &str = "[target.'cfg(target_arch = \"x86_64\")']\nrustflags = [\"-C\", \"target-cpu=x86-64-v3\"]\n";
+    const PIN: &str = "[target.'cfg(target_arch = \"x86_64\")']\nrustflags = [\"-C\", \"target-cpu=x86-64-v3\"]\nrustdocflags = [\"-C\", \"target-cpu=x86-64-v3\"]\n";
     const FORBID: &str = "//! Docs.\n#![forbid(unsafe_code)]\n";
     const MANIFEST: &str = "[package]\nname = \"x\"\n[lints]\nworkspace = true\n";
 
-    /// A lint file of the required entries and thread routes that `keep` keeps: the first ten
-    /// required entries and every route are methods (the check reads both tables as one).
+    /// Whether a pinned path belongs under `disallowed-methods` rather than
+    /// `disallowed-types`.
+    fn names_a_function(path: &str) -> bool {
+        pinned_table(path) == "disallowed-methods"
+    }
+
+    /// The line a fixture lint file holds for `path`: a function as a table, a type as a
+    /// plain string (the check reads both tables, and both forms, as one).
+    fn entry(path: &str) -> String {
+        if names_a_function(path) {
+            format!("  {{ path = \"{path}\", reason = \"r\" }},\n")
+        } else {
+            format!("  \"{path}\",\n")
+        }
+    }
+
+    /// A lint file of the pinned entries that `keep` keeps.
     fn lint_file_of(keep: impl Fn(&str) -> bool) -> String {
+        let pinned = || REQUIRED_LINT_PATHS.iter().chain(&THREAD_ROUTES).chain(&NOT_THREAD_ROUTES);
         let mut text = String::from("disallowed-methods = [\n");
-        let methods = REQUIRED_LINT_PATHS[..10].iter().chain(&THREAD_ROUTES);
-        for path in methods.filter(|path| keep(path)) {
-            text.push_str(&format!("  {{ path = \"{path}\", reason = \"r\" }},\n"));
+        for path in pinned().filter(|path| names_a_function(path) && keep(path)) {
+            text.push_str(&entry(path));
         }
         text.push_str("]\ndisallowed-types = [\n");
-        for path in REQUIRED_LINT_PATHS[10..].iter().filter(|path| keep(path)) {
-            text.push_str(&format!("  \"{path}\",\n"));
+        for path in pinned().filter(|path| !names_a_function(path) && keep(path)) {
+            text.push_str(&entry(path));
         }
         text.push_str("]\n");
         text
@@ -1045,8 +1776,25 @@ mod tests {
         lint_file_of(|path| OUTSIDE_WORLD.iter().any(|prefix| path.starts_with(prefix)))
     }
 
+    /// The real policy file with no harness packages, which a test adds where it wants them.
     fn policy() -> Policy {
-        Policy::parse(include_str!("../ci-policy.toml")).unwrap()
+        let policy = Policy::parse(include_str!("../ci-policy.toml")).unwrap();
+        Policy { harness_packages: Vec::new(), ..policy }
+    }
+
+    /// An architecture document whose unsafe policy table is the policy file's list.
+    fn architecture() -> String {
+        let mut text = String::from(
+            "# Architecture\n\n## 20. Agent workflow\n\n| Role | `x` |\n|---|---|\n| a | `b` |\n\n\
+             ## 21. Unsafe policy\n\n| Crate | Why |\n|---|---|\n",
+        );
+        for name in policy().unsafe_crates {
+            let role = name.strip_prefix("lactose-").unwrap();
+            let cell = if role == "cook" { "tools/cook".to_owned() } else { role.to_owned() };
+            text.push_str(&format!("| `{cell}` | FFI, `unsafe` |\n"));
+        }
+        text.push_str("\nEach carries `SAFETY.md`.\n\n## 22. Milestones\n\n| # | Name |\n|---|---|\n| 0 | `skeleton` |\n");
+        text
     }
 
     /// A conforming repository: `core` (unsafe, boundary), `math` (boundary), `task` (unsafe).
@@ -1061,6 +1809,7 @@ mod tests {
         );
         let mut files = Files::default();
         files.insert(CARGO_CONFIG, PIN);
+        files.insert(ARCHITECTURE, architecture());
         files.insert(
             ROOT_MANIFEST,
             "[workspace]\n[workspace.lints.rust]\nmissing_docs = \"warn\"\n",
@@ -1088,8 +1837,12 @@ mod tests {
     }
 
     fn run(ws: &Workspace, files: &Files) -> Vec<String> {
+        run_with(&policy(), ws, files)
+    }
+
+    fn run_with(policy: &Policy, ws: &Workspace, files: &Files) -> Vec<String> {
         let tiers = TierFile::parse(TIERS).unwrap();
-        check(&tiers, &policy(), ws, files).iter().map(ToString::to_string).collect()
+        check(&tiers, policy, ws, files).iter().map(ToString::to_string).collect()
     }
 
     const NONE: [&str; 0] = [];
@@ -1221,16 +1974,15 @@ mod tests {
     fn a_weakened_reference_lint_file_is_caught_even_when_every_copy_matches() {
         // Review item 19.
         let (ws, mut files) = conforming();
-        let weakened = lint_file()
-            .replace("  \"std::time::Instant\",\n", "")
-            .replace("  { path = \"f64::sin\", reason = \"r\" },\n", "");
+        let weakened =
+            lint_file().replace("  \"std::time::Instant\",\n", "").replace(&entry("f64::sin"), "");
         files.insert(REFERENCE_CLIPPY, weakened.clone());
         files.insert("crates/math/clippy.toml", weakened);
         assert_eq!(
             run(&ws, &files),
             [
-                "crates/core/clippy.toml: no longer disallows `f64::sin`, which architecture section 8.2 bans inside the boundary",
-                "crates/core/clippy.toml: no longer disallows `std::time::Instant`, which architecture section 8.2 bans inside the boundary",
+                "crates/core/clippy.toml: no longer disallows `f64::sin` under `disallowed-methods`, which architecture section 8.2 bans inside the boundary",
+                "crates/core/clippy.toml: no longer disallows `std::time::Instant` under `disallowed-types`, which architecture section 8.2 bans inside the boundary",
             ]
         );
     }
@@ -1242,7 +1994,6 @@ mod tests {
         // and 16): the reference keeps every route, and a crate of `[boundary_internal] any`
         // carries the standard library's as written there.
         let (mut ws, mut files) = conforming();
-        let entry = |path: &str| format!("  {{ path = \"{path}\", reason = \"r\" }},\n");
         for route in THREAD_ROUTES {
             let unbanned = lint_file().replace(&entry(route), "");
             assert_ne!(unbanned, lint_file(), "{route}");
@@ -1251,7 +2002,8 @@ mod tests {
             assert_eq!(
                 run(&ws, &files),
                 [format!(
-                    "crates/core/clippy.toml: no longer disallows `{route}`, a route to a thread outside an executor, which architecture sections 8.2 and 16 ban inside the boundary"
+                    "crates/core/clippy.toml: no longer disallows `{route}` under `{}`, a route to a thread outside an executor, which architecture sections 8.2 and 16 ban inside the boundary",
+                    pinned_table(route)
                 )]
             );
         }
@@ -1351,6 +2103,102 @@ mod tests {
         let mut findings = Vec::new();
         reference_lint_file(&files, &mut findings);
         assert_eq!(findings, []);
+    }
+
+    #[test]
+    fn any_ban_deleted_from_the_reference_and_every_copy_is_reported() {
+        // Review X3: every entry is pinned, not a sample of each family.
+        let (ws, mut files) = conforming();
+        for path in REQUIRED_LINT_PATHS.iter().chain(&NOT_THREAD_ROUTES) {
+            let unbanned = lint_file().replace(&entry(path), "");
+            assert_ne!(unbanned, lint_file(), "{path}");
+            files.insert(REFERENCE_CLIPPY, unbanned.clone());
+            files.insert("crates/math/clippy.toml", unbanned);
+            assert_eq!(
+                run(&ws, &files),
+                [format!(
+                    "crates/core/clippy.toml: no longer disallows `{path}` under `{}`, which architecture section 8.2 bans inside the boundary",
+                    pinned_table(path)
+                )]
+            );
+        }
+    }
+
+    #[test]
+    fn any_ban_moved_to_the_other_table_in_the_reference_and_every_copy_is_reported() {
+        // Review round 1, F2: clippy reads a path only in its own table, so a method under
+        // `disallowed-types`, or a type under `disallowed-methods`, bans nothing.
+        let (ws, mut files) = conforming();
+        for path in REQUIRED_LINT_PATHS.iter().chain(&THREAD_ROUTES).chain(&NOT_THREAD_ROUTES) {
+            let wanted = pinned_table(path);
+            let other = if wanted == "disallowed-types" {
+                "disallowed-methods"
+            } else {
+                "disallowed-types"
+            };
+            let moved = lint_file()
+                .replace(&entry(path), "")
+                .replace(&format!("{other} = [\n"), &format!("{other} = [\n{}", entry(path)));
+            assert_ne!(moved, lint_file(), "{path}");
+            files.insert(REFERENCE_CLIPPY, moved.clone());
+            files.insert("crates/math/clippy.toml", moved);
+            let found = run(&ws, &files);
+            let misplaced = format!(
+                "crates/core/clippy.toml: lists `{path}` under `{other}`, where clippy does not apply it; it belongs under `{wanted}`"
+            );
+            assert!(found.contains(&misplaced), "{path}: {found:?}");
+            assert!(
+                found.iter().any(|f| f.starts_with(&format!(
+                    "crates/core/clippy.toml: no longer disallows `{path}` under `{wanted}`"
+                ))),
+                "{path}: {found:?}"
+            );
+            assert_eq!(found.len(), 2, "{path}: {found:?}");
+        }
+    }
+
+    #[test]
+    fn a_ban_added_to_the_reference_without_a_pin_is_reported() {
+        let (ws, mut files) = conforming();
+        let added = "f64::exp10";
+        let unpinned = lint_file()
+            .replace("disallowed-types = [\n", &format!("disallowed-types = [\n  \"{added}\",\n"));
+        files.insert(REFERENCE_CLIPPY, unpinned.clone());
+        files.insert("crates/math/clippy.toml", unpinned);
+        assert_eq!(
+            run(&ws, &files),
+            [format!(
+                "crates/core/clippy.toml: disallows `{added}`, which tools/xtask/src/boundary.rs does not pin; add it to `REQUIRED_LINT_PATHS` there, in the reference's order, so that dropping it is caught"
+            )]
+        );
+    }
+
+    #[test]
+    fn the_pinned_lists_are_disjoint_and_the_required_one_holds_no_thread_path() {
+        let mut all = BTreeSet::new();
+        for path in REQUIRED_LINT_PATHS.iter().chain(&THREAD_ROUTES).chain(&NOT_THREAD_ROUTES) {
+            assert!(all.insert(*path), "`{path}` is pinned twice");
+        }
+        for path in PINNED_TYPES {
+            assert!(is_pinned(path), "`{path}` is a pinned type that no list pins");
+        }
+        // An entry under a thread prefix is classified as a route or not, never just required.
+        for path in REQUIRED_LINT_PATHS {
+            assert!(!THREAD_PREFIXES.iter().any(|prefix| path.starts_with(prefix)), "{path}");
+        }
+        // Every family of item 1 of review X2 is pinned.
+        for path in [
+            "num_traits::Float",
+            "num_traits::real::Real",
+            "simba::scalar::RealField::max",
+            "simba::scalar::RealField::min",
+            "simba::scalar::RealField::copysign",
+            "simba::simd::SimdRealField::simd_copysign",
+            "simba::simd::SimdSigned::is_simd_positive",
+            "f64::asinh",
+        ] {
+            assert!(REQUIRED_LINT_PATHS.contains(&path), "{path}");
+        }
     }
 
     #[test]
@@ -1530,6 +2378,67 @@ mod tests {
     }
 
     #[test]
+    fn an_allowlist_entry_the_manifest_does_not_name_is_reported() {
+        // Review X2: the backend's list had grown the solver's math, which the backend names
+        // only through Rapier's re-exports.
+        let (_, files) = conforming();
+        let ws = workspace_with(
+            vec![
+                package("lactose-core", &[("bytemuck", Normal)]),
+                package("lactose-math", &[("lactose-core", Normal)]),
+                package("lactose-task", &[("lactose-core", Normal), ("crossbeam-deque", Normal)]),
+            ],
+            &[("bytemuck", &["bytemuck_derive"]), ("crossbeam-deque", &["crossbeam-epoch"])],
+        );
+        assert_eq!(
+            run(&ws, &files),
+            [
+                "crate-tiers.toml: [boundary_third_party.direct] \"lactose-core\" has `xxhash-rust` on its `dev` list, but the crate's manifest does not name it; remove it there, and put a crate the boundary crate reaches only through others on `transitive`",
+                "crate-tiers.toml: [boundary_third_party.direct] \"lactose-math\" has `libm` on its `normal` list, but the crate's manifest does not name it; remove it there, and put a crate the boundary crate reaches only through others on `transitive`",
+            ]
+        );
+    }
+
+    #[test]
+    fn the_physics_backend_may_not_name_the_solvers_math() {
+        // Review X2, against the real tier file: the solver's math is vetted on `transitive`,
+        // so naming it (num-traits' `Float` above all) is refused.
+        let tiers = TierFile::parse(include_str!("../../../crate-tiers.toml")).unwrap();
+        let backend = package(
+            "lactose-physics-rapier",
+            &[("rapier3d-f64", Normal), ("num-traits", Normal), ("simba", Normal), ("glam", Dev)],
+        );
+        let ws = workspace(vec![backend.clone()]);
+        let mut findings = Vec::new();
+        dependency_allowlist(&tiers, &ws, &backend, &mut findings);
+        unnamed_allowlist_entries(&tiers, &backend, &mut findings);
+        let found: Vec<String> = findings.iter().map(ToString::to_string).collect();
+        let refused = |kind: &str, name: &str| {
+            format!(
+                "crates/physics-rapier/Cargo.toml: boundary crate `lactose-physics-rapier` {kind} on third-party crate `{name}`, which [boundary_third_party.direct] \"lactose-physics-rapier\" in crate-tiers.toml does not allow"
+            )
+        };
+        let unnamed = |name: &str| {
+            format!(
+                "crate-tiers.toml: [boundary_third_party.direct] \"lactose-physics-rapier\" has `{name}` on its `normal` list, but the crate's manifest does not name it; remove it there, and put a crate the boundary crate reaches only through others on `transitive`"
+            )
+        };
+        assert_eq!(
+            found,
+            [
+                refused("depends", "num-traits"),
+                refused("depends", "simba"),
+                refused("dev-depends", "glam"),
+                unnamed("bytemuck"),
+                unnamed("postcard"),
+                unnamed("rayon"),
+                unnamed("serde"),
+                unnamed("tracing"),
+            ]
+        );
+    }
+
+    #[test]
     fn what_a_boundary_crates_tests_name_is_held_to_the_allowlist_at_any_depth() {
         // Review of the closure check, finding 2: `[boundary_internal] dev` lets a test name
         // `task`, and what `task` compiles is a test's to compile too.
@@ -1540,10 +2449,11 @@ mod tests {
         }
         files.insert("crates/io/SAFETY.md", "");
         let ws = workspace(vec![
-            package("lactose-core", &[]),
+            package("lactose-core", &[("bytemuck", Normal), ("xxhash-rust", Dev)]),
             package(
                 "lactose-math",
                 &[
+                    ("libm", Normal),
                     ("lactose-math", Dev),
                     ("lactose-task", Dev),
                     ("lactose-io", Dev),
@@ -1589,10 +2499,15 @@ mod tests {
         }
         files.insert("crates/reflect/clippy.toml", outside_world_file());
         let ws = workspace(vec![
-            package("lactose-core", &[]),
+            package("lactose-core", &[("bytemuck", Normal), ("xxhash-rust", Dev)]),
             package(
                 "lactose-math",
-                &[("lactose-reflect", Normal), ("lactose-ecs", Normal), ("lactose-io", Dev)],
+                &[
+                    ("libm", Normal),
+                    ("lactose-reflect", Normal),
+                    ("lactose-ecs", Normal),
+                    ("lactose-io", Dev),
+                ],
             ),
             package(
                 "lactose-ecs",
@@ -1649,8 +2564,8 @@ mod tests {
         // is not a test root, though its tests may name `task`, which `ecs` passes through.
         for kind in [Normal, Dev] {
             let ws = workspace(vec![
-                package("lactose-core", &[]),
-                package("lactose-math", &[("lactose-ecs", kind)]),
+                package("lactose-core", &[("bytemuck", Normal), ("xxhash-rust", Dev)]),
+                package("lactose-math", &[("libm", Normal), ("lactose-ecs", kind)]),
                 package("lactose-ecs", &[("lactose-core", Normal), ("lactose-task", Normal)]),
                 package("lactose-task", &[("lactose-core", Normal), ("lactose-future", Normal)]),
                 package("lactose-future", &[]),
@@ -1718,8 +2633,20 @@ mod tests {
                 format!(
                     "tools/xtask/src/harness/nested/inner.rs: line 1: `allow(clippy::disallowed_types)` never goes stale, on an item of boundary crate `lactose-math`; {sanctioned}"
                 ),
+                // Both record through the protocol, and the fixture policy lists no package.
+                unlisted_harness_package("math"),
+                unlisted_harness_package("task"),
             ]
         );
+    }
+
+    fn unlisted_harness_package(role: &str) -> String {
+        format!(
+            "crates/{role}/Cargo.toml: `lactose-{role}` compiles the harness protocol \
+             (tools/xtask/src/harness/protocol.rs), so its tests record hashes, but [harness] \
+             `packages` in tools/xtask/ci-policy.toml does not list it and `cargo xtask sour \
+             run` never launches them; add \"lactose-{role}\" to that list"
+        )
     }
 
     #[test]
@@ -1748,10 +2675,7 @@ mod tests {
                 "{ path = \"std::env::var\", reason = \"r\" }",
                 "{ path = \"std::env::var\", reason = \"s\" }",
             )
-            .replace(
-                "  \"std::fs::File\",\n",
-                "  \"std::fs::File\",\n  \"std::net::UdpSocket\",\n",
-            );
+            .replace("  \"std::fs::File\",\n", "  \"std::fs::File\",\n  \"std::net::Ipv4Addr\",\n");
         files.insert(path, reworded);
         let table = |name: &str| format!("crates/reflect/clippy.toml: `disallowed-{name}`");
         assert_eq!(
@@ -1770,7 +2694,7 @@ mod tests {
                     table("methods")
                 ),
                 format!(
-                    "{} has an entry for `std::net::UdpSocket` that crates/core/clippy.toml does not have as written; the two must agree on every file, environment, subprocess, network and thread entry",
+                    "{} has an entry for `std::net::Ipv4Addr` that crates/core/clippy.toml does not have as written; the two must agree on every file, environment, subprocess, network and thread entry",
                     table("types")
                 ),
             ]
@@ -1833,7 +2757,10 @@ mod tests {
         files.insert("crates/reflect/clippy.toml", outside_world_file());
         let ws = workspace_with(
             vec![
-                package("lactose-core", &[("bytemuck", Normal), ("lactose-reflect", Normal)]),
+                package(
+                    "lactose-core",
+                    &[("bytemuck", Normal), ("xxhash-rust", Dev), ("lactose-reflect", Normal)],
+                ),
                 package("lactose-reflect", &[("tracing", Normal), ("trybuild", Dev)]),
             ],
             &[("bytemuck", &["bytemuck_derive", "fast-float"]), ("tracing", &["tracing-core"])],
@@ -1867,11 +2794,12 @@ mod tests {
         assert_eq!(
             run(&ws, &files),
             [
-                ".cargo/config.toml: the x86-64 pin is missing: [target.'cfg(target_arch = \"x86_64\")'] must set rustflags = [\"-C\", \"target-cpu=x86-64-v3\"]"
+                ".cargo/config.toml: the x86-64 pin is missing: [target.'cfg(target_arch = \"x86_64\")'] must set rustflags = [\"-C\", \"target-cpu=x86-64-v3\"]",
+                ".cargo/config.toml: the x86-64 pin is missing: [target.'cfg(target_arch = \"x86_64\")'] must set rustdocflags = [\"-C\", \"target-cpu=x86-64-v3\"]",
             ]
         );
 
-        let only = "the only rust flags permitted in a cargo configuration file are the pin, [target.'cfg(target_arch = \"x86_64\")'] rustflags = [\"-C\", \"target-cpu=x86-64-v3\"] in .cargo/config.toml";
+        let only = "the only flags permitted in a cargo configuration file are the pin, [target.'cfg(target_arch = \"x86_64\")'] rustflags = [\"-C\", \"target-cpu=x86-64-v3\"] and rustdocflags the same, in .cargo/config.toml";
         files.insert(
             CARGO_CONFIG,
             format!("{PIN}[build]\nrustflags = [\"-C\", \"target_feature=+avx512f\"]\n[target.x86_64-unknown-linux-gnu]\nrustflags = [\"-Ctarget_cpu=native\"]\n[env]\nCLIPPY_CONF_DIR = \"elsewhere\"\n"),
@@ -1880,11 +2808,12 @@ mod tests {
         assert_eq!(
             run(&ws, &files),
             [
-                ".cargo/config.toml: line 4: sets `target-feature`; target features come from the pinned target CPU only".to_owned(),
-                ".cargo/config.toml: line 6: selects a target CPU (`target-cpu` `native`); the only permitted setting is the x86-64-v3 pin in .cargo/config.toml".to_owned(),
-                ".cargo/config.toml: line 8: names CLIPPY_CONF_DIR, which points clippy away from each crate's clippy.toml".to_owned(),
+                ".cargo/config.toml: line 5: sets `target-feature`; target features come from the pinned target CPU only".to_owned(),
+                ".cargo/config.toml: line 7: selects a target CPU (`target-cpu` `native`); the only permitted setting is the x86-64-v3 pin in .cargo/config.toml".to_owned(),
+                ".cargo/config.toml: line 9: names CLIPPY_CONF_DIR, which points clippy away from each crate's clippy.toml".to_owned(),
                 format!(".cargo/config.toml: sets `build.rustflags`; {only}"),
                 format!(".cargo/config.toml: sets `target.x86_64-unknown-linux-gnu.rustflags`; {only}"),
+                format!("tools/cook/.cargo/config.toml: sets `target.cfg(target_arch = \"x86_64\").rustdocflags`; {only}"),
                 format!("tools/cook/.cargo/config.toml: sets `target.cfg(target_arch = \"x86_64\").rustflags`; {only}"),
             ]
         );
@@ -1893,8 +2822,42 @@ mod tests {
         files.insert(CARGO_CONFIG, PIN.replace("\"]", "\", \"-C\", \"target-feature=+fma\"]"));
         let files = without(&files, &["tools/cook/.cargo/config.toml"]);
         let found = run(&ws, &files);
+        assert_eq!(found.len(), 6, "{found:#?}");
+        assert!(found[4].contains(
+            "the x86-64 pin is missing: [target.'cfg(target_arch = \"x86_64\")'] must set rustflags"
+        ));
+        assert!(found[5].contains("the x86-64 pin is missing: [target.'cfg(target_arch = \"x86_64\")'] must set rustdocflags"));
+    }
+
+    #[test]
+    fn doctests_are_pinned_too() {
+        // Row 70 of docs/verification.md: cargo does not pass `rustflags` to rustdoc.
+        let (ws, mut files) = conforming();
+        let rustdoc = "rustdocflags = [\"-C\", \"target-cpu=x86-64-v3\"]\n";
+        assert!(PIN.contains(rustdoc));
+        files.insert(CARGO_CONFIG, PIN.replace(rustdoc, ""));
+        assert_eq!(
+            run(&ws, &files),
+            [
+                ".cargo/config.toml: the x86-64 pin is missing: [target.'cfg(target_arch = \"x86_64\")'] must set rustdocflags = [\"-C\", \"target-cpu=x86-64-v3\"]"
+            ]
+        );
+        // Another value is not the pin, wherever it is set.
+        files.insert(
+            CARGO_CONFIG,
+            PIN.replace(rustdoc, "rustdocflags = [\"-C\", \"target-cpu=native\"]\n"),
+        );
+        let found = run(&ws, &files);
         assert_eq!(found.len(), 3, "{found:#?}");
-        assert!(found[2].contains("the x86-64 pin is missing"));
+        assert!(found[1].starts_with(".cargo/config.toml: sets `target.cfg(target_arch = \"x86_64\").rustdocflags`; the only flags"), "{found:#?}");
+        assert!(found[2].contains("must set rustdocflags"), "{found:#?}");
+        files.insert(CARGO_CONFIG, format!("{PIN}[build]\nrustdocflags = [\"--cfg\", \"x\"]\n"));
+        let found = run(&ws, &files);
+        assert_eq!(found.len(), 1, "{found:#?}");
+        assert!(
+            found[0].starts_with(".cargo/config.toml: sets `build.rustdocflags`;"),
+            "{found:#?}"
+        );
     }
 
     #[test]
@@ -1922,7 +2885,7 @@ mod tests {
         );
         files.insert(
             "scripts/bench.sh",
-            "CARGO_ENCODED_RUSTFLAGS=x cargo bench\ncargo rustc -- --codegen target-cpu=haswell\n",
+            "CARGO_ENCODED_RUSTFLAGS=x cargo bench\ncargo rustc -- --codegen target-cpu=haswell\nRUSTDOCFLAGS='-D warnings' cargo test --doc\n",
         );
         // Files that are neither configuration nor scripts are not scanned.
         files.insert("docs/notes.toml", "x = \"RUSTFLAGS target-cpu=native\"\n");
@@ -1938,10 +2901,451 @@ mod tests {
             ".github/workflows/ci.yml: line 10: names CLIPPY_CONF_DIR,",
             "scripts/bench.sh: line 1: names RUSTFLAGS;",
             "scripts/bench.sh: line 2: selects a target CPU (`target-cpu` `haswell`);",
+            "scripts/bench.sh: line 3: names RUSTDOCFLAGS; rustdoc flags",
         ];
         assert_eq!(found.len(), expect.len(), "{found:#?}");
         for (found, expect) in found.iter().zip(expect) {
             assert!(found.starts_with(expect), "{found}\n  expected: {expect}");
         }
+    }
+
+    #[test]
+    fn the_harness_packages_are_the_packages_that_include_the_protocol() {
+        // Review X4: a package dropped from the list records nothing, and nothing says so.
+        let (ws, mut files) = conforming();
+        let include = "#[path = \"../../../tools/xtask/src/harness/protocol.rs\"]\nmod protocol;\n";
+        files.insert(HARNESS_PROTOCOL, "pub fn f() {}\n");
+        files.insert("crates/math/tests/sour.rs", format!("{FORBID}{include}"));
+        files.insert("crates/task/tests/sour.rs", include);
+        let listing = |names: &[&str]| Policy {
+            harness_packages: names.iter().map(|name| (*name).to_owned()).collect(),
+            ..policy()
+        };
+        assert_eq!(run_with(&listing(&["lactose-math", "lactose-task"]), &ws, &files), NONE);
+        assert_eq!(
+            run_with(&listing(&["lactose-math"]), &ws, &files),
+            [unlisted_harness_package("task")]
+        );
+        // Listed and recording nothing, or no package at all.
+        let files = without(&files, &["crates/task/tests/sour.rs"]);
+        assert_eq!(
+            run_with(&listing(&["lactose-math", "lactose-task", "lactose-gone"]), &ws, &files),
+            [
+                "tools/xtask/ci-policy.toml: [harness] `packages` lists `lactose-gone`, which is not a workspace package",
+                "crates/task/Cargo.toml: `lactose-task` is listed in [harness] `packages` of tools/xtask/ci-policy.toml, but no source of it includes the harness protocol (tools/xtask/src/harness/protocol.rs) by `#[path]`, so it records nothing; remove it from that list, or record through the protocol",
+            ]
+        );
+    }
+
+    #[test]
+    fn the_unsafe_list_is_the_table_of_architecture_section_21() {
+        // Review X5: the table and the list drift apart, and a crate's forbid goes with it.
+        let (mut ws, mut files) = conforming();
+        ws.packages.push(package("lactose-sim", &[("lactose-core", Normal)]));
+        files.insert("crates/sim/README.md", "");
+        files.insert("crates/sim/Cargo.toml", MANIFEST);
+        files.insert("crates/sim/src/lib.rs", FORBID);
+        assert_eq!(run(&ws, &files), NONE);
+        files.insert(ARCHITECTURE, architecture().replace("| `tools/cook` |", "| `sim` |"));
+        files.insert("crates/sim/src/lib.rs", "pub fn f() {}\n");
+        let found = run(&ws, &files);
+        assert_eq!(
+            found[..2],
+            [
+                "tools/xtask/ci-policy.toml: [unsafe_crates] lacks `lactose-sim`, which the table of architecture section 21 lists; the two change in the same commit",
+                "tools/xtask/ci-policy.toml: [unsafe_crates] lists `lactose-cook`, which the table of architecture section 21 does not; the two change in the same commit",
+            ]
+        );
+        // The list still governs the forbid, so the crate without it is reported too.
+        assert_eq!(found.len(), 3, "{found:#?}");
+        assert!(
+            found[2].starts_with("crates/sim/src/lib.rs: `lactose-sim` is not on the unsafe list")
+        );
+
+        // A document the check cannot read is a finding, not a pass.
+        let cut = |from: &str, to: &str| {
+            let text = architecture();
+            let (head, rest) = text.split_once(from).unwrap();
+            format!("{head}{to}{}", &rest[rest.find("\n## 22").unwrap()..])
+        };
+        let (ws, mut files) = conforming();
+        for (text, expect) in [
+            (
+                cut("## 21. Unsafe policy", "## 21. Unsafe code\n"),
+                "docs/architecture.md: has no `## <n>. Unsafe policy` section",
+            ),
+            (
+                cut("| Crate |", "Prose only.\n"),
+                "docs/architecture.md: line 9: the Unsafe policy section has no table of crates",
+            ),
+            (
+                architecture().replace("| `core` |", "| core |"),
+                "a row of the Unsafe policy table names no crate in backticks",
+            ),
+        ] {
+            files.insert(ARCHITECTURE, text);
+            let found = run(&ws, &files);
+            assert!(found.first().is_some_and(|f| f.contains(expect)), "{found:#?}\n{expect}");
+        }
+        let files = without(&files, &[ARCHITECTURE]);
+        assert_eq!(
+            run(&ws, &files),
+            [
+                "docs/architecture.md: is missing, so [unsafe_crates] in tools/xtask/ci-policy.toml cannot be checked against it"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_simulation_asset_outside_the_boundary_is_reported() {
+        // Row 66 of docs/verification.md: `task` is no boundary crate, `math` is.
+        let (mut ws, mut files) = conforming();
+        let declared = "pub struct Kind;\nimpl lactose_asset::SimulationAsset for Kind {}\n";
+        files.insert("crates/task/src/kinds.rs", declared);
+        files.insert("crates/task/src/lib.rs", "mod kinds;\n");
+        let at = |file: &str, line: usize| {
+            format!(
+                "{file}: line {line}: `impl SimulationAsset` in `lactose-task`, which is not a boundary crate; a kind the simulation reads is declared in a boundary crate, where architecture section 8.2 holds its loader (D99), or only in tests"
+            )
+        };
+        assert_eq!(run(&ws, &files), [at("crates/task/src/kinds.rs", 2)]);
+        // A module under a nested directory, and one a `#[path]` names.
+        files.insert(
+            "crates/task/src/kinds.rs",
+            "#[path = \"../extra/more.rs\"]\nmod more;\nmod deeper;\n",
+        );
+        files.insert("crates/task/extra/more.rs", declared);
+        files.insert("crates/task/src/kinds/deeper/mod.rs", format!("\n{declared}"));
+        assert_eq!(
+            run(&ws, &files),
+            [at("crates/task/extra/more.rs", 2), at("crates/task/src/kinds/deeper/mod.rs", 3)]
+        );
+        // A module declared inside an inline one sits in the inline module's directory, and a
+        // file under `src/` that no route reaches is read as shipped.
+        files.insert("crates/task/src/lib.rs", "mod kinds;\nmod outer {\n    mod inner;\n}\n");
+        files.insert("crates/task/src/outer/inner.rs", declared);
+        files.insert("crates/task/src/orphan.rs", declared);
+        assert_eq!(
+            run(&ws, &files),
+            [
+                at("crates/task/extra/more.rs", 2),
+                at("crates/task/src/kinds/deeper/mod.rs", 3),
+                at("crates/task/src/orphan.rs", 2),
+                at("crates/task/src/outer/inner.rs", 2),
+            ]
+        );
+        files.insert("crates/task/src/orphan.rs", format!("#![cfg(test)]\n{declared}"));
+        files.insert("crates/task/src/outer/inner.rs", "");
+        assert_eq!(
+            run(&ws, &files),
+            [at("crates/task/extra/more.rs", 2), at("crates/task/src/kinds/deeper/mod.rs", 3)]
+        );
+
+        // Compiled only for tests or a dev-only feature, outside `src/`, or in a boundary crate.
+        let (_, mut files) = conforming();
+        files.insert(
+            "crates/task/src/lib.rs",
+            format!(
+                "#[cfg(test)]\nmod tests;\n#[cfg(test)]\nmod inline {{ {declared} }}\n\
+                 #[cfg(feature = \"suite\")]\nmod suite;\n#[cfg(feature = \"alias\")]\nimpl SimulationAsset for Kind {{}}\n"
+            ),
+        );
+        files.insert("crates/task/src/tests.rs", declared);
+        files.insert("crates/task/src/suite.rs", declared);
+        files.insert("crates/task/tests/kinds.rs", declared);
+        files.insert("crates/task/benches/kinds.rs", declared);
+        files.insert("crates/math/src/kinds.rs", declared);
+        files.insert("crates/math/src/lib.rs", format!("{FORBID}mod kinds;\n"));
+        ws.packages[2].crate_roots.push("crates/task/tests/kinds.rs".to_owned());
+        ws.packages[2].features.insert("suite".to_owned(), Vec::new());
+        ws.packages[2].features.insert("alias".to_owned(), vec!["suite".to_owned()]);
+        // `alias` turns `suite` on, so it is held to the dev edges too.
+        let tiers = TierFile::parse(&format!(
+            "{TIERS}\n[dev_only_features]\n\"lactose-task\" = [\"suite\"]\n"
+        ))
+        .unwrap();
+        let found: Vec<String> =
+            check(&tiers, &policy(), &ws, &files).iter().map(ToString::to_string).collect();
+        assert_eq!(found, NONE);
+        // Without the table, the feature ships, and both of its impls are reported.
+        assert_eq!(
+            run(&ws, &files),
+            [at("crates/task/src/lib.rs", 10), at("crates/task/src/suite.rs", 2)]
+        );
+    }
+
+    /// What row 66 reports for an `impl SimulationAsset` at `line` of `file` in `lactose-task`.
+    fn declared_outside(file: &str, line: usize) -> String {
+        format!(
+            "{file}: line {line}: `impl SimulationAsset` in `lactose-task`, which is not a boundary crate; a kind the simulation reads is declared in a boundary crate, where architecture section 8.2 holds its loader (D99), or only in tests"
+        )
+    }
+
+    #[test]
+    fn every_shipped_route_to_a_simulation_asset_outside_the_boundary_is_followed() {
+        // Review round 1, F3: the review's cases A to L, and the forms its fix names. Each
+        // case is the files it adds to `lactose-task`, its shipped roots if not the library's,
+        // and what is reported.
+        let declared = "pub struct Kind;\nimpl lactose_asset_api::SimulationAsset for Kind {}\n";
+        let in_lib = |before: &str| vec![("crates/task/src/lib.rs", format!("{before}{declared}"))];
+        type Case =
+            (&'static str, Vec<(&'static str, String)>, Vec<&'static str>, (&'static str, usize));
+        let cases: Vec<Case> = vec![
+            (
+                "A: a test-only `#[path]` alias reaches the file first",
+                vec![
+                    ("crates/task/src/lib.rs", "#[cfg(test)]\n#[path = \"kinds.rs\"]\nmod test_kinds;\nmod kinds;\n".to_owned()),
+                    ("crates/task/src/kinds.rs", declared.to_owned()),
+                ],
+                vec![],
+                ("crates/task/src/kinds.rs", 2),
+            ),
+            (
+                "A: the same file and directory, reached test-only and then shipped",
+                vec![
+                    ("crates/task/src/lib.rs", "#[cfg(test)]\n#[path = \"k/mod.rs\"]\nmod t;\nmod k;\n".to_owned()),
+                    ("crates/task/src/k/mod.rs", declared.to_owned()),
+                ],
+                vec![],
+                ("crates/task/src/k/mod.rs", 2),
+            ),
+            (
+                "B: a test-only inline module's `mod kinds;` is its own file",
+                vec![
+                    ("crates/task/src/lib.rs", "#[cfg(test)]\nmod t {\n    mod kinds;\n}\nmod kinds;\n".to_owned()),
+                    ("crates/task/src/kinds.rs", declared.to_owned()),
+                    ("crates/task/src/t/kinds.rs", "\n".to_owned()),
+                ],
+                vec![],
+                ("crates/task/src/kinds.rs", 2),
+            ),
+            (
+                "B: a `#[path]` inside an inline module is relative to the module's directory",
+                vec![
+                    ("crates/task/src/lib.rs", "mod outer {\n    #[path = \"x.rs\"]\n    mod inner;\n}\n".to_owned()),
+                    ("crates/task/src/outer/x.rs", declared.to_owned()),
+                    ("crates/task/src/x.rs", "\n".to_owned()),
+                ],
+                vec![],
+                ("crates/task/src/outer/x.rs", 2),
+            ),
+            (
+                // Review round 2, R1: an inline module's `#[path]` names its directory.
+                "B: an inline module's `#[path]` outside `src/`",
+                vec![
+                    ("crates/task/src/lib.rs", "#[path = \"../gen\"]\nmod g {\n    mod kinds;\n}\n".to_owned()),
+                    ("crates/task/gen/kinds.rs", declared.to_owned()),
+                ],
+                vec![],
+                ("crates/task/gen/kinds.rs", 2),
+            ),
+            (
+                "B: an inline module's `#[path]` inside `src/`, with a test-only alias first",
+                vec![
+                    (
+                        "crates/task/src/lib.rs",
+                        "#[cfg(test)]\n#[path = \"other/kinds.rs\"]\nmod t;\n#[path = \"other\"]\nmod g {\n    mod kinds;\n}\n"
+                            .to_owned(),
+                    ),
+                    ("crates/task/src/other/kinds.rs", declared.to_owned()),
+                ],
+                vec![],
+                ("crates/task/src/other/kinds.rs", 2),
+            ),
+            (
+                // As rustc places them: at the top of `a.rs` an inline module's `#[path]` is
+                // relative to `src/`, not `src/a/`.
+                "B: an inline module's `#[path]` at the top of a `name.rs`",
+                vec![
+                    (
+                        "crates/task/src/lib.rs",
+                        "#[cfg(test)]\n#[path = \"p/kinds.rs\"]\nmod t;\nmod a;\n".to_owned(),
+                    ),
+                    ("crates/task/src/a.rs", "#[path = \"p\"]\nmod g {\n    mod kinds;\n}\n".to_owned()),
+                    ("crates/task/src/p/kinds.rs", declared.to_owned()),
+                    ("crates/task/src/a/p/kinds.rs", "\n".to_owned()),
+                ],
+                vec![],
+                ("crates/task/src/p/kinds.rs", 2),
+            ),
+            (
+                // Under another inline module, relative to that module's directory.
+                "B: an inline module's `#[path]` inside another inline module of a `name.rs`",
+                vec![
+                    (
+                        "crates/task/src/lib.rs",
+                        "#[cfg(test)]\n#[path = \"a/m/q/kinds.rs\"]\nmod t;\nmod a;\n".to_owned(),
+                    ),
+                    (
+                        "crates/task/src/a.rs",
+                        "mod m {\n    #[path = \"q\"]\n    mod g {\n        mod kinds;\n    }\n}\n".to_owned(),
+                    ),
+                    ("crates/task/src/a/m/q/kinds.rs", declared.to_owned()),
+                    ("crates/task/src/q/kinds.rs", "\n".to_owned()),
+                ],
+                vec![],
+                ("crates/task/src/a/m/q/kinds.rs", 2),
+            ),
+            (
+                "C: a library root outside `src/`",
+                vec![("crates/task/lib.rs", declared.to_owned())],
+                vec!["crates/task/lib.rs"],
+                ("crates/task/lib.rs", 2),
+            ),
+            (
+                "C: a module of a library root outside `src/`",
+                vec![
+                    ("crates/task/lib.rs", "mod kinds;\n".to_owned()),
+                    ("crates/task/kinds.rs", declared.to_owned()),
+                ],
+                vec!["crates/task/lib.rs"],
+                ("crates/task/kinds.rs", 2),
+            ),
+            (
+                "D: a binary root read first, with a test-only alias of a shipped module",
+                vec![
+                    ("crates/task/src/lib.rs", "mod kinds;\n".to_owned()),
+                    ("crates/task/src/bin/tool.rs", "#[cfg(test)]\n#[path = \"../kinds.rs\"]\nmod k;\nfn main() {}\n".to_owned()),
+                    ("crates/task/src/kinds.rs", declared.to_owned()),
+                ],
+                vec!["crates/task/src/bin/tool.rs", "crates/task/src/lib.rs"],
+                ("crates/task/src/kinds.rs", 2),
+            ),
+            (
+                "E: `include!` of a file outside `src/`",
+                vec![
+                    ("crates/task/src/lib.rs", "include!(\"../gen/kinds.rs\");\n".to_owned()),
+                    ("crates/task/gen/kinds.rs", declared.to_owned()),
+                ],
+                vec![],
+                ("crates/task/gen/kinds.rs", 2),
+            ),
+            (
+                "E: a module of an included file sits beside it",
+                vec![
+                    ("crates/task/src/lib.rs", "mod a {\n    include!(\"../gen/kinds.rs\");\n}\n".to_owned()),
+                    ("crates/task/gen/kinds.rs", "mod more;\n".to_owned()),
+                    ("crates/task/gen/more.rs", declared.to_owned()),
+                ],
+                vec![],
+                ("crates/task/gen/more.rs", 2),
+            ),
+            ("F: `cfg(not(test))`", in_lib("#[cfg(not(test))]\n"), vec![], ("crates/task/src/lib.rs", 3)),
+            ("G: `cfg(any(test, feature))`", in_lib("#[cfg(any(test, feature = \"x\"))]\n"), vec![], ("crates/task/src/lib.rs", 3)),
+            ("H: `cfg_attr(test, ...)`", in_lib("#[cfg_attr(test, allow(dead_code))]\n"), vec![], ("crates/task/src/lib.rs", 3)),
+            ("I: `cfg(all(feature, not(test)))`", in_lib("#[cfg(all(feature = \"x\", not(test)))]\n"), vec![], ("crates/task/src/lib.rs", 3)),
+            ("J: a gated item with a `;` in brackets before it", in_lib("#[cfg(test)]\nconst N: [u8; 2] = [0; 2];\n"), vec![], ("crates/task/src/lib.rs", 4)),
+            ("K: a gated function before it", in_lib("#[cfg(test)]\nfn helper() {}\n"), vec![], ("crates/task/src/lib.rs", 4)),
+            (
+                "L: a generic header under a global path",
+                vec![("crates/task/src/lib.rs", "pub struct K<T>(T);\nunsafe impl<T: Copy> ::lactose_asset_api::SimulationAsset for K<T> where T: Default {}\n".to_owned())],
+                vec![],
+                ("crates/task/src/lib.rs", 2),
+            ),
+        ];
+        for (name, added, roots, (file, line)) in cases {
+            let (mut ws, mut files) = conforming();
+            if !roots.is_empty() {
+                ws.packages[2].shipped_roots =
+                    roots.iter().map(|root| (*root).to_owned()).collect();
+                ws.packages[2].crate_roots = ws.packages[2].shipped_roots.clone();
+            }
+            for (path, text) in &added {
+                files.insert(*path, text.as_str());
+            }
+            assert_eq!(run(&ws, &files), [declared_outside(file, line)], "{name}");
+        }
+    }
+
+    #[test]
+    fn a_loader_outside_the_boundary_for_a_kind_the_simulation_reads_is_reported() {
+        // Review round 1, F4: the review's probe, a loader in a crate outside the boundary
+        // (`task`) for a kind a boundary crate (`math`) declares, judged with the platform's
+        // `sin`.
+        let (ws, mut files) = conforming();
+        files.insert(
+            "crates/math/src/lib.rs",
+            format!(
+                "{FORBID}pub struct Clip;\nimpl lactose_asset_api::SimulationAsset for Clip {{}}\n\
+                 pub struct ClipLoader;\nimpl Loader for ClipLoader {{\n    type Asset = Clip;\n}}\n\
+                 #[cfg(test)]\nmod tests {{\n    impl SimulationAsset for Probe {{}}\n}}\n"
+            ),
+        );
+        assert_eq!(run(&ws, &files), NONE, "the kind's own loader sits in its boundary crate");
+        let probe = "//! Review probe (xtask-policy r1, row 66): a loader for a simulation kind, outside the boundary.\n\
+                     use lactose_asset_api::{AssetId, Loader};\n\
+                     use lactose_anim::{Clip, ClipLoader};\n\
+                     use lactose_core::Result;\n\
+                     \n\
+                     /// Decodes a clip, then judges it with the platform's `sin`.\n\
+                     pub struct PlatformClipLoader;\n\
+                     \n\
+                     impl Loader for PlatformClipLoader {\n\
+                     \x20   type Asset = Clip;\n\
+                     \n\
+                     \x20   fn load(&self, bytes: &[u8], dependencies: &[AssetId]) -> Result<Clip> {\n\
+                     \x20       let clip = ClipLoader.load(bytes, dependencies)?;\n\
+                     \x20       let judged = (bytes.len() as f64).sin();\n\
+                     \x20       if judged > 2.0 { ClipLoader.load(&[], dependencies) } else { Ok(clip) }\n\
+                     \x20   }\n\
+                     }\n";
+        files.insert("crates/task/src/lib.rs", "mod platform;\n");
+        files.insert("crates/task/src/platform.rs", probe);
+        let loader = |line: usize, decoded: &str| {
+            format!(
+                "crates/task/src/platform.rs: line {line}: `impl Loader` in `lactose-task`, which is not a boundary crate, decodes {decoded}; the loader of a kind the simulation reads sits in a boundary crate, where architecture section 8.2 holds it (D99), or only in tests"
+            )
+        };
+        let a_kind =
+            |asset: &str| format!("`{asset}`, which a boundary crate declares a `SimulationAsset`");
+        assert_eq!(run(&ws, &files), [loader(9, &a_kind("Clip"))]);
+
+        // Under any path, with a type parameter, and with no `type Asset` in sight.
+        files.insert(
+            "crates/task/src/platform.rs",
+            "impl lactose_asset_api::Loader for A {\n    type Asset = lactose_math::Clip;\n}\n\
+             impl<L: Loader> Loader for Wrapped<L> {\n    type Asset = L::Asset;\n}\n\
+             impl<T> Loader for Any<T> where T: Asset {\n    type Asset = Vec<T>;\n}\n\
+             impl Loader for Hidden {\n    asset_type!();\n}\n\
+             impl<L: Loader> Loader for Qualified<L> {\n    type Asset = <L as Loader>::Asset;\n}\n\
+             impl Loader for Projected {\n    type Asset = <lactose_math::Clip as Decoded>::Output;\n}\n",
+        );
+        assert_eq!(
+            run(&ws, &files),
+            [
+                loader(1, &a_kind("lactose_math::Clip")),
+                loader(
+                    4,
+                    "`L::Asset`, which names its type parameter `L`, so it may decode a kind a boundary crate declares a `SimulationAsset`"
+                ),
+                loader(
+                    7,
+                    "`Vec<T>`, which names its type parameter `T`, so it may decode a kind a boundary crate declares a `SimulationAsset`"
+                ),
+                loader(
+                    10,
+                    "a kind its text does not show (no `type Asset = ...;` in its body), which may be one a boundary crate declares a `SimulationAsset`"
+                ),
+                // Review round 2, R2: the words of a qualified path stay apart.
+                loader(
+                    13,
+                    "`<L as Loader>::Asset`, which names its type parameter `L`, so it may decode a kind a boundary crate declares a `SimulationAsset`"
+                ),
+                loader(16, &a_kind("<lactose_math::Clip as Decoded>::Output")),
+            ]
+        );
+
+        // A loader for a kind no boundary crate declares, one for a kind declared only in a
+        // boundary crate's tests, and one compiled only for tests, are not.
+        files.insert(
+            "crates/task/src/platform.rs",
+            "impl Loader for RegionBaselineLoader {\n    type Asset = RegionBaseline;\n}\n\
+             impl Loader for ProbeLoader {\n    type Asset = Probe;\n}\n\
+             #[cfg(test)]\nmod tests {\n    impl Loader for TestLoader {\n        type Asset = Clip;\n    }\n}\n\
+             impl Other for B {\n    type Asset = Clip;\n}\n\
+             impl Loader for Aliased {\n    type Asset = <Self as Decodes>::Kind;\n}\n",
+        );
+        // The last is the admitted limit: a projection names its type only through the trait.
+        assert_eq!(run(&ws, &files), NONE);
     }
 }

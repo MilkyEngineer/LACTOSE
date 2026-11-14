@@ -6,7 +6,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::Path;
 
-use crate::Finding;
+use crate::{ARCHITECTURE, Finding};
 
 /// The coordinator's local scratchpad at the repository root, which git ignores.
 const SCRATCHPAD: &str = ".scratchpad";
@@ -114,13 +114,15 @@ fn walk(dir: &Path, prefix: &str, files: &mut Files) -> Result<(), String> {
 }
 
 /// Whether a check reads the file: Rust sources, manifests and configuration, the two
-/// per-crate documents, and everything [`is_build_configuration`] names.
+/// per-crate documents, the architecture document, and everything [`is_build_configuration`]
+/// names.
 fn wanted(path: &str) -> bool {
     let name = path.rsplit('/').next().unwrap_or(path);
     name.ends_with(".rs")
         || name.ends_with(".toml")
         || name == "README.md"
         || name == "SAFETY.md"
+        || path == ARCHITECTURE
         || is_build_configuration(path)
 }
 

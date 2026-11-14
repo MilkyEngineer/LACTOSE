@@ -21,11 +21,18 @@ struct Packages {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct Harness {
+    packages: Vec<String>,
+    tests: Vec<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawPolicy {
     unsafe_crates: Crates,
     lint_file_carriers: Crates,
     feature_roots: Packages,
-    harness: Packages,
+    harness: Harness,
 }
 
 /// The parsed policy file.
@@ -39,6 +46,8 @@ pub struct Policy {
     pub feature_roots: Vec<String>,
     /// The packages whose tests run under the determinism harness.
     pub harness_packages: Vec<String>,
+    /// The tests that record hashes under the harness, by their recorded names.
+    pub harness_tests: Vec<String>,
 }
 
 impl Policy {
@@ -53,6 +62,7 @@ impl Policy {
             lint_file_carriers: raw.lint_file_carriers.crates,
             feature_roots: raw.feature_roots.packages,
             harness_packages: raw.harness.packages,
+            harness_tests: raw.harness.tests,
         })
     }
 }
@@ -64,9 +74,9 @@ mod tests {
     #[test]
     fn the_checked_in_file_parses() {
         let policy = Policy::parse(include_str!("../ci-policy.toml")).unwrap();
-        // Architecture section 21 lists nine crates.
-        assert_eq!(policy.unsafe_crates.len(), 9);
+        assert!(policy.unsafe_crates.contains(&"lactose-core".to_owned()));
         assert_eq!(policy.lint_file_carriers, ["lactose-reflect-macros", "lactose-ecs-macros"]);
+        assert!(!policy.harness_tests.is_empty());
     }
 
     #[test]

@@ -543,7 +543,10 @@ presentation, pose evaluation, VFX, audio, UI, asset IO timing and input samplin
   versions are documented as nondeterministic on signed zero. `f32::min`, `f32::max`, `clamp`, `powi`, `total_cmp`,
   `to_bits`, `copysign`, `is_sign_negative`, `is_sign_positive`, `rem_euclid`, `div_euclid` and
   `mul_add` and their `f64` forms are banned outside
-  `math`, as are trait routes to the platform library such as `num_traits::Float`; NaN sign and payload are never
+  `math`, as are trait routes to the platform library such as `num_traits::Float` and simba's
+  `RealField` `min`, `max`, `copysign` and sign tests, and the math crates' own routes to it
+  (num-complex's `Complex`, glamx's eigen and SVD, glam's Euclidean division and sign-bit methods);
+  NaN sign and payload are never
   observable. NaNs are canonicalised before hashing and serialisation, and one in a
   persistent column is a defect: in debug builds the world hasher asserts against it when it
   hashes a persistent type, and the save's serialiser when it diffs a live world's export.
@@ -689,7 +692,10 @@ xtask vendor` for each crate built from `vendor/` (section 8.2): offline, the co
 applied to its record and the patch is within the rule; online, the record is re-derived from the
 crates.io archive and the advisory check runs over the upstream versions, which `cargo-deny` skips
 behind a path source. The two proc-macro crates carry the boundary `clippy.toml` as well, since the
-code they emit is compiled inside boundary crates.
+code they emit is compiled inside boundary crates. `cargo xtask boundary` holds every entry of the
+reference `clippy.toml`, and its table, to the lists in `tools/xtask`, and `[harness]` in
+`tools/xtask/ci-policy.toml` to the packages that include the harness protocol;
+`cargo xtask sour run` holds the tests that record hashes to the list beside it.
 No custom lint crate. Miri runs on nightly as the one exception to the stable-toolchain rule.
 Because Cargo resolves features per build, CI dumps `cargo tree -e features` for the boundary
 dependencies of each shipped binary, the SOUR test crate among them, and requires them
@@ -1273,8 +1279,8 @@ The policy is in section 3.
   verification list; a long command that needs no interpretation runs in the background,
   never in a foreground agent turn.
 - CI: clippy `-D warnings`, fmt, nextest, SOUR in all applicable modes, Miri nightly on
-  `core`, `task` over each deque, `ecs`, `input-host` and `net-host`, `cargo-deny`, the tier
-  check, the vendor check.
+  `core`, `task` over each deque, `ecs`, `input-host` and `net-host`, `cargo-deny`, the tier,
+  boundary, feature and vendor checks.
 
 ## 21. Unsafe policy
 
@@ -1288,7 +1294,9 @@ The policy is in section 3.
 | `core` | arenas, the tagged allocator, handle tables, `unsafe impl` for generic plain-data types, the `thread_class` helper that `audio` and `physics-rapier` use instead of their own `unsafe` |
 | `tools/cook` | FFI to Slang and compression libraries |
 
-Each carries `SAFETY.md`. Every `unsafe` block has a `// SAFETY:` comment.
+Each carries `SAFETY.md`. Every `unsafe` block has a `// SAFETY:` comment. `[unsafe_crates]` in
+`tools/xtask/ci-policy.toml` equals this table, which `cargo xtask boundary` reads: each backticked
+name in a row's first cell is a crate, named by its last path segment.
 
 `reflect-macros` contains no `unsafe`, but the expansion of `#[component]`, `#[resource]` and
 `#[value]` contains one `unsafe impl` (`bytemuck::CheckedBitPattern` for the struct), which

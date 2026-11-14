@@ -4,8 +4,9 @@
 
 # Architecture section 21: the crates that may contain `unsafe`. Each carries SAFETY.md. Every
 # other workspace crate carries `#![forbid(unsafe_code)]` at the top of every crate root:
-# library, binaries, integration tests, benches, examples and the build script. Changing
-# this list means changing section 21 in the same commit.
+# library, binaries, integration tests, benches, examples and the build script. `cargo xtask
+# boundary` requires this list to equal the table of section 21, so the two change in the
+# same commit.
 [unsafe_crates]
 crates = [
   "lactose-task", "lactose-ecs", "lactose-io", "lactose-rhi-vulkan", "lactose-rhi-metal",
@@ -26,9 +27,42 @@ packages = ["lactose-app-headless"]
 
 # Architecture section 8.3: the packages whose tests run under SOUR, the determinism harness.
 # Their feature trees are compared with dev-dependencies included, since a test build
-# compiles them. Once `lactose-sim` exists this list may not be empty.
+# compiles them. Once `lactose-sim` exists this list may not be empty. `cargo xtask boundary`
+# requires this list to be exactly the packages whose tests compile the harness protocol
+# (tools/xtask/src/harness/protocol.rs).
+#
+# `tests` names every test that records hashes, as it records them. `cargo xtask sour run`
+# fails if a recording test is missing from it, or if a listed test did not record: renamed,
+# ignored, deleted or filtered out. A branch that adds, renames or removes a recording test
+# edits this list in the same commit.
 [harness]
 packages = [
   "lactose-sim", "lactose-physics-api", "lactose-input", "lactose-physics-rapier", "lactose-net-api",
   "lactose-predict", "lactose-net-host", "lactose-anim", "lactose-persist", "lactose-app",
+]
+tests = [
+  "lactose_anim::sour::a_prediction_crowd_with_a_rollback",
+  "lactose_anim::sour::a_server_crowd_with_ragdolls",
+  "lactose_app::headless::a_headless_run_under_sour",
+  "lactose_app::spike::a_claim_in_contact_is_recorded",
+  "lactose_app::spike::a_dynamic_capsule_is_recorded",
+  "lactose_app::spike::a_kinematic_character_is_recorded",
+  "lactose_app::spike::fifty_thrown_bodies_are_recorded",
+  "lactose_input::sour::the_prediction_program_with_a_rollback",
+  "lactose_input::sour::the_server_program",
+  "lactose_net_api::sour::a_scene_replicated_to_a_client",
+  "lactose_net_host::sour::a_replication_and_its_wire_values",
+  "lactose_persist::physics::reload_at_12",
+  "lactose_persist::reload::in_place_at_60",
+  "lactose_persist::reload::left_player_at_160",
+  "lactose_persist::reload::two_frames_at_60",
+  "lactose_persist::reload::unload_and_reload",
+  "lactose_physics_api::sour::a_prediction_scene_with_a_rollback",
+  "lactose_physics_api::sour::a_server_scene",
+  "lactose_physics_rapier::sour::a_limited_hinge_driven_against_its_limits",
+  "lactose_physics_rapier::sour::a_prediction_scene_with_a_rollback",
+  "lactose_physics_rapier::sour::a_server_scene",
+  "lactose_physics_rapier::sour::the_conformance_run",
+  "lactose_predict::sour::a_prediction_scene_with_corrections_and_substitutions",
+  "lactose_sim::sour::anchored_world",
 ]

@@ -1893,6 +1893,16 @@ editorial pass rather than one taken from a review.
   reads borrow from a region's `PinnedTable` and touch no atomic. Loaders run outside the
   boundary, so kinds the simulation reads are marked and their loaders constrained.
 - Driven by: milestone 0 asset-api lane and its review, findings 5, 6 and 11.
+- Addendum (lane xtask-policy, 2026-11-15; review rounds 1 to 3): the obligation is checked, by
+  name. Outside the boundary, shipped code may neither declare a kind (`impl SimulationAsset`)
+  nor implement `Loader` for one: a `type Asset` naming a kind a boundary crate declares (by
+  last path segment, of the self type for a qualified path), naming a type parameter of the impl
+  (`<L as Loader>::Asset` included), or not written in the impl's body is a
+  `cargo xtask boundary` finding, unless compiled only for tests or a dev-only feature. A token
+  scan: a kind or trait under another name (`use ... as`, a type alias, a projection such as
+  `<Self as Decodes>::Kind`), or a loader a macro writes, is not seen (verification row
+  "Enforcing that the loader of a simulation-read asset kind", review round 1 F3 and F4, round 2
+  R1 and R2).
 
 **D100. `typed_plain_data!` in `lactose-core`** (§21)
 - Why: bytemuck cannot derive `Pod` for a struct with a non-`Pod` marker parameter, and
@@ -2439,6 +2449,14 @@ editorial pass rather than one taken from a review.
   configuration per test; the runner holds each to the launched configuration. The review's
   mutations that dropped the perturbations in `lactose-app`'s assembly and forced the client
   worlds to the default layout both fail layout mode.
+- Addendum (lane xtask-policy, 2026-11-15; review rounds 1 to 3): *What SOUR runs is tied to the
+  tree.* `cargo xtask boundary` requires `[harness] packages` to be exactly the packages whose
+  sources include the harness protocol by `#[path]`. `cargo xtask sour run` requires the tests
+  that recorded in its baseline run to be exactly `[harness] tests` in
+  `tools/xtask/ci-policy.toml`: a listed test that recorded nothing (renamed, ignored, deleted)
+  and a recording test not listed are findings naming the entry to change. A branch that adds,
+  renames or removes a recording test or a harness package edits those lists in the same commit
+  (review X4).
 
 **D119. The `physics-api` facade: what sections 4, 6.1, 9.4, 9.7, 10, 15.1 and 16 left open**
 (§4, §5.3, §6.1, §8.2, §8.3, §9.4, §9.7, §10, §15.1, §16, §17, `lactose-physics-api`,
@@ -2684,6 +2702,41 @@ editorial pass rather than one taken from a review.
 - Driven by: milestone 1, the `physics-api` facade brief, its two design reviews and the
   implementation's reviews
   (2026-10-10).
+- Addendum (lane xtask-policy, 2026-11-15; review rounds 1 to 3): *The routes to the platform
+  float library through Rapier's math.* `lactose-physics-rapier`'s allowlist is cut to bytemuck,
+  postcard, rapier3d-f64, rayon, serde and tracing; glam, glamx, nalgebra, num-traits,
+  parry3d-f64, simba and wide are on `transitive`. Under the resolved features simba computes
+  transcendentals through the libm crate (`libm_force`), and so does glam except its `%`
+  operator and its Euclidean division and remainder, which call the platform `fmod`; glam's
+  vector `min` and `max` are compare-and-select only under its `scalar-math` feature (parry's
+  `enhanced-determinism` turns it on through glamx), and `cargo xtask features` fails any
+  compared build that compiles glam for the target without it (a host copy, which a build script
+  or proc macro would link, is not checked; none exists today). glamx's 3x3 eigen decompositions
+  and its SVDs call the standard library's `acos`, `cos`, `sin` and `atan2`, and num-complex's
+  `Complex`, which nalgebra re-exports, goes through num-traits' `Float` to the standard
+  library. The boundary lint file bans, with `allow-invalid`: simba's
+  `RealField::{max, min, copysign, is_sign_positive, is_sign_negative}`,
+  `SimdRealField::simd_copysign` and `SimdSigned::{is_simd_positive, is_simd_negative}`;
+  num-traits' `Signed::{is_positive, is_negative}` and the types `Float` and `Real`; glam's
+  `copysign`, `is_negative_bitmask` and `is_negative_mask` on all seven f32 and f64 vectors, and
+  their `rem_euclid` and `div_euclid`, which call the platform `fmod` as `%` does and follow
+  section 8.2's ban on the scalar forms; `num_complex::Complex` and its 30 float methods;
+  glamx's `SymmetricEigen3`, `SymmetricEigen3A`, `DSymmetricEigen3`, `Svd2`, `DSvd2`, `Svd3`,
+  `Svd3A`, `DSvd3` and `MatExt::{symmetric_eigen, symmetric_eigenvalues, svd}`; approx's
+  `UlpsEq::{ulps_eq, ulps_ne}` (glamx's rotations compare NaN bits); and simba's `WideF32x4`,
+  `WideF32x8` and `WideF64x4`, whose lane min and max differ between x86-64 and aarch64 on
+  signed zero and NaN. `f32`/`f64` `asinh`, `acosh` and `atanh` are banned too. The rest of
+  glam's and glamx's float methods are the libm crate or compare-and-select (found by `nm` on a
+  probe calling every public float method); `%` is an operator no lint sees, and its question is
+  a verification item. `tools/xtask/tests/boundary_lints.rs` runs clippy over one line per route
+  banned through these crates and requires each refused, at the lock's versions (review X2,
+  round 1 F1 and F5). Rapier's `RevoluteJoint::angle` (`asin`) and parry's `VectorExt::angle`
+  (`acos`) are banned too, pinned in `tools/xtask` but not proven by that test, whose probe does
+  not compile Rapier (review round 2). Calls inside Rapier and parry that reach the platform
+  library (glamx's 3x3 eigen decomposition from parry's `MassProperties` sum and convex hull,
+  `Bvh::optimize_incremental`'s `log2`, joint constraints' `sin`, trimesh pseudo-normals, soft
+  bodies) are not reachable by a boundary lint; they are listed for the planner and in the
+  verification row "`lactose-physics-api` (D119) is implemented".
 
 **D120. The `input` facade: what sections 4, 5.3, 6.1, 8.2 and 9.2 left open** (§3, §4, §5.3,
 §6.1, §8.1, §8.2, §9.1, §9.2, §15.1, `lactose-input`, `lactose-input-host`, `lactose-ecs`)
@@ -4433,6 +4486,18 @@ relayed by an event when it acts on another body** (§6.1, §10, `lactose-ecs`,
   ban, which clippy cannot express.
 - Driven by: the io facade's review (D130, finding D2) and the boundary-closure reviews r1 to
   r3 (2026-10-24).
+- Addendum (lane xtask-policy, 2026-11-15; review rounds 1 to 3): *The whole lint file is
+  pinned, each entry in its table, and the lists are tied to their sources.* Every entry of
+  `crates/core/clippy.toml` is in `THREAD_ROUTES`, `NOT_THREAD_ROUTES` or `REQUIRED_LINT_PATHS`
+  (the rest, in the file's order), and `PINNED_TYPES` names those that belong under
+  `disallowed-types`; the reference's (table, path) pairs must equal the pinned ones: a ban
+  deleted from the reference and every copy is a finding, so is one moved to the other table,
+  where clippy no longer applies it, and so is one added without being pinned (review X3, round
+  1 F2). A boundary crate's direct `normal` and `dev` lists hold only crates its manifest names;
+  a crate reached only through others is vetted on `transitive` (review X2). `[unsafe_crates]`
+  must equal the table of architecture section 21 (review X5). The pin covers `rustdocflags` as
+  it covers `rustflags`, and `RUSTDOCFLAGS` is refused where `RUSTFLAGS` is (verification row
+  "`cargo xtask boundary` should check that `rustdocflags`").
 
 **D133. Ownership is a forest the ECS keeps over the live world; an owner in another region, or in none, is a saved state; a load breaks a cycle it would close** (§6, §15.2, `lactose-ecs`, `lactose-bundle`, `lactose-persist`)
 - Why: the persist implementation's review found three ownership states `World::insert` accepts
