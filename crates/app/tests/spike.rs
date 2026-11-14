@@ -14,8 +14,9 @@
 //! fifty claimed dynamic bodies thrown and interacting, and a claim of a crate the
 //! character pushes and of a stack it bumps. Each runs under SOUR as a recording test,
 //! which records after every tick a hash of both worlds and of every datagram either end
-//! sent that frame; the ignored measurement test replays each to 36,000 ticks in release
-//! and prints its figures as one JSON object per scene.
+//! sent that frame. The ignored measurement tests replay each scene to 36,000 ticks in
+//! release, with the clock script and on the server's clock, and print the figures of each
+//! run as one JSON object.
 //!
 //! The seeds of the link and of the clock script are the test's, outside both worlds.
 //! Inside them every reference, ordering rule and RNG key is a `StableKey`.
@@ -511,7 +512,7 @@ fn invalid(message: impl Into<String>) -> Error {
 
 // ---- The link ----
 
-/// One frame's delay each way, in frames: a 100 ms round trip at sixty frames a second.
+/// The delay each way, in frames: a 100 ms round trip at sixty frames a second.
 const DELAY: u32 = 3;
 /// The share of messages the link loses, per thousand; every datagram of a message shares
 /// its fate.
@@ -1793,7 +1794,8 @@ impl ClientClock {
 
 /// The ticks of margin the estimator keeps on top of half the round trip.
 const MARGIN: f64 = 2.0;
-/// An error beyond which the estimate snaps instead of adjusting the rate.
+/// An error, in ticks, beyond which the estimate snaps instead of adjusting the rate: past
+/// the jitter of the late wakes, short of what the stall leaves.
 const SNAP_LIMIT: f64 = 4.0;
 
 /// The spike's clock estimate, from its own round trip: half of it plus the margin is the
@@ -1896,8 +1898,9 @@ struct Plan {
     ticks: u32,
     clock: ClockScript,
     link_seed: u64,
-    /// The update whose first `Transform` row has its lowest bit flipped as it is sent.
-    flip: Option<u32>,
+    /// The end and the frame at which one bit of what that end sends is flipped: the
+    /// lowest bit of the update's first `Transform` row, or of the newest sample's stick.
+    flip: Option<(Side, u32)>,
     /// The tick after which the stream hash so far is kept.
     prefix: Option<u32>,
 }
@@ -1954,6 +1957,10 @@ struct Outcome {
     divergence_fields: u64,
     compared: u64,
     agreed: u64,
+    /// Of the ticks compared, those at which the player's `Hop` agreed.
+    hop_agreed: u64,
+    /// The server ticks that ended with the player's `Hop` pending: the carrier set.
+    hop_pending: u32,
     yaw_errors: Vec<f64>,
     delta_bytes: Vec<usize>,
     full_bytes: Vec<usize>,
@@ -1981,7 +1988,9 @@ struct ClientEnd {
     joined: u32,
     /// The last frame the client ran.
     ran: u32,
-    predicted: BTreeMap<Tick, u64>,
+    /// The prediction world's hash and the player's `Hop` at the tick each frame ended on,
+    /// compared with the server's as it passes that tick.
+    predicted: BTreeMap<Tick, (u64, Option<u32>)>,
 }
 
 impl ClientEnd {
@@ -2010,6 +2019,11 @@ fn yaw_of(transform: &Transform) -> f64 {
 fn wrap(angle: f64) -> f64 {
     let turn = std::f64::consts::TAU;
     (angle + turn / 2.0).rem_euclid(turn) - turn / 2.0
+}
+
+/// The player's `Hop` in `world`.
+fn hop_of(world: &World) -> Option<u32> {
+    world.get::<Hop>(player_entity(world, PLAYER)?).map(|hop| hop.0)
 }
 
 /// The player's predicted spawns in `world`.
@@ -2124,7 +2138,7 @@ fn run(
         } else if n % SEND_INTERVAL == 0 {
             let mut delta = packer.pack(world, tick, inputs.echo.take(), inputs.consumed)?;
             outcome.whole_checks += packer.check_whole(&delta, world)?;
-            if plan.flip == Some(n)
+            if plan.flip == Some((Side::Server, n))
                 && let Some(row) = delta.rows.iter_mut().find(|row| row.component == Transform::KEY)
             {
                 row.bytes[0] ^= 1;
@@ -2153,11 +2167,14 @@ fn run(
             }
             previous_yaw = Some(yaw);
         }
+        let hop = hop_of(world);
+        outcome.hop_pending += u32::from(hop == Some(HOP_PENDING));
         if let Some(end) = &mut end
-            && let Some(hash) = end.predicted.remove(&tick)
+            && let Some((hash, predicted_hop)) = end.predicted.remove(&tick)
         {
             outcome.compared += 1;
             outcome.agreed += u64::from(hash == server_hash);
+            outcome.hop_agreed += u64::from(predicted_hop == hop);
             end.predicted.retain(|&predicted, _| predicted.0 > tick.0);
         }
         server = Some(current);
@@ -2355,7 +2372,8 @@ fn client_frame(
             end.predicted.retain(|predicted, _| predicted.0 < oldest);
         }
     }
-    end.predicted.insert(tick, client.hash()?);
+    let hop = hop_of(client.predictor().simulation().world());
+    end.predicted.insert(tick, (client.hash()?, hop));
     if n.is_multiple_of(30) {
         let ring = client.predictor().ring().bytes();
         let ring_bytes = &mut outcome.ring_bytes;
@@ -2380,7 +2398,13 @@ fn client_frame(
             messenger.send(transport, RESYNC, &encode_resync(&request))?;
         }
     }
-    let samples = client.history().iter().map(|(tick, input)| (tick, *input)).collect();
+    let mut samples: Vec<(Tick, PlayerInput)> =
+        client.history().iter().map(|(tick, input)| (tick, *input)).collect();
+    if plan.flip == Some((Side::Client, n))
+        && let Some((_, newest)) = samples.last_mut()
+    {
+        newest.movement.x ^= 1;
+    }
     let packet = InputPacket { sequence: end.sequence, ack: end.receiver.ack, samples };
     messenger.send(transport, INPUT, &packet.encode())?;
     end.estimator.sent(end.sequence, now);
@@ -2415,6 +2439,10 @@ fn check_outcome(plan: Plan, outcome: &Outcome) {
         outcome.resyncs.iter().filter(|&&frame| !planned_resync(plan, frame)).collect();
     assert!(stray.is_empty(), "resyncs outside the stall: {stray:?}");
     assert!(outcome.whole_checks > 0 && outcome.mirror_checks > 0);
+    // The carrier is set once a cycle, before phase 120, for the one tick between
+    // `Stage::Post` and the steering that spends it.
+    let cycles = (plan.ticks + CYCLE - 120) / CYCLE;
+    assert_eq!(outcome.hop_pending, cycles, "the carrier fires once a cycle");
     let stalls = plan.clock == ClockScript::Drifting && plan.ticks >= STALL.end + 60;
     if stalls {
         assert!(
@@ -2629,18 +2657,21 @@ fn the_link_reorders_only_within_a_tick_and_follows_its_seed() {
     assert_ne!(deliveries(LINK_SEED + 1), delivered, "another seed, another link");
 }
 
-/// One bit of one datagram, flipped on the server's end as it is sent, changes the record
-/// of the frame it was sent in and none before: the stream hash covers the packets.
+/// One bit of one datagram, flipped on either end as it is sent, changes the record of the
+/// frame it was sent in and none before: the stream hash covers the packets, and neither
+/// world has seen the bit by then.
 #[test]
 fn a_packet_differing_by_one_bit_changes_the_record_from_its_tick() {
     let executor = executor(2);
     let plan = Plan { ticks: 90, ..Plan::recorded(Scene::Capsule) };
     let clean = run(&executor, LayoutConfig::default(), plan, &mut quiet).unwrap();
-    let flipped = Plan { flip: Some(60), ..plan };
-    let dirty = run(&executor, LayoutConfig::default(), flipped, &mut quiet).unwrap();
+    for side in [Side::Server, Side::Client] {
+        let flipped = Plan { flip: Some((side, 60)), ..plan };
+        let dirty = run(&executor, LayoutConfig::default(), flipped, &mut quiet).unwrap();
+        let first = clean.records.iter().zip(&dirty.records).position(|(a, b)| a != b);
+        assert_eq!(first, Some(59), "{side:?}: the record of frame 60 is the first to differ");
+    }
     executor.shutdown();
-    let first = clean.records.iter().zip(&dirty.records).position(|(a, b)| a != b);
-    assert_eq!(first, Some(59), "the record of frame 60 is the first to differ");
 }
 
 /// The thrown scene's records are the same under a perturbed layout with four workers as
@@ -2712,7 +2743,8 @@ fn report(plan: Plan, outcome: &mut Outcome, recorded_stream: u64) -> String {
             "\"rollback_us_per_tick\":{{\"median\":{:.1},\"worst\":{:.1},\"rollbacks\":{}}},",
             "\"divergence\":{{\"entities\":{},\"fields\":{},\"mismatched_entities\":{},\"mismatched_fields\":{}}},",
             "\"deepest_correction\":{},\"resyncs\":{},\"substituted_ticks\":{},\"unechoed_spawns\":{},",
-            "\"hash_agreement\":{{\"compared\":{},\"agreed\":{}}},",
+            "\"hash_agreement\":{{\"compared\":{},\"agreed\":{},\"carrier_agreed\":{}}},",
+            "\"carrier_pending_ticks\":{},",
             "\"thrown_settle_ticks\":{},\"predicted_keys_at_checks\":{:?},\"yaw_error_rad_per_tick\":{{\"mean\":{:e},\"worst\":{:e}}},",
             "\"ring\":{{\"depth\":{},\"world_bytes\":{},\"physics_bytes\":{},\"record_bytes\":{}}},",
             "\"update_bytes\":{{\"mean\":{:.0},\"max\":{}}},\"full_bytes_max\":{},",
@@ -2751,6 +2783,8 @@ fn report(plan: Plan, outcome: &mut Outcome, recorded_stream: u64) -> String {
         stats.unechoed_spawns,
         outcome.compared,
         outcome.agreed,
+        outcome.hop_agreed,
+        outcome.hop_pending,
         settle,
         outcome.key_counts,
         yaw_mean,
