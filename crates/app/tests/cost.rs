@@ -10,7 +10,12 @@
 //! The scenes build their solver pools as `lactose-app` does, with `frame workers - 1`
 //! threads and at least one (`PhysicsConfig::default()` reserves one worker): the physics
 //! phase through `build_server` itself, the others by hand around a world of their own,
-//! since their scenes are not a game.
+//! since their scenes are not a game, with a pool that mirrors the crate's private one
+//! ([`rapier`]).
+//!
+//! N, the frame workers of plan decision 5.1, follows the plan's section 4: the performance
+//! cores the platform reports or, on a part that reports no core types, its physical cores,
+//! at most eight; `LACTOSE_MEASURE_WORKERS` overrides it ([`measured_workers`]).
 
 #![forbid(unsafe_code)]
 #![allow(missing_docs)]
@@ -74,26 +79,53 @@ fn executor(workers: Option<u32>) -> Executor {
     start_executor(Workers { frame_workers: workers, ..Workers::default() }).unwrap()
 }
 
-/// N of plan decision 5.1: the frame workers a default executor starts, one per performance
-/// core it counts (architecture section 5.1), at most eight.
-fn performance_workers() -> u32 {
-    let executor = executor(None);
-    let workers = executor.frame_worker_count().min(8);
-    executor.shutdown();
-    workers
+/// The variable that sets N in place of the topology's, as `cargo xtask measure` passes it.
+const WORKERS_VAR: &str = "LACTOSE_MEASURE_WORKERS";
+
+/// N of plan decision 5.1, by the rule of the plan's section 4: the performance cores the
+/// platform reports or, on a part that reports no core types (efficiency zero), its
+/// physical cores, which `CoreTopology::homogeneous` stores as one more than its
+/// `performance`; at most eight. [`WORKERS_VAR`] overrides it, a whole number above zero.
+/// The same rule as `lactose-sim`'s cost test.
+fn measured_workers() -> u32 {
+    if let Some(value) = std::env::var_os(WORKERS_VAR) {
+        let value = value.to_string_lossy();
+        return value
+            .parse::<u32>()
+            .ok()
+            .filter(|&n| n > 0)
+            .unwrap_or_else(|| panic!("{WORKERS_VAR} is `{value}`, not a count above zero"));
+    }
+    let topology = StdPlatform.topology();
+    let cores =
+        if topology.efficiency == 0 { topology.performance + 1 } else { topology.performance };
+    cores.min(8)
 }
 
 /// The worker counts a scene runs on: one, and N when that is more.
 fn worker_counts() -> Vec<u32> {
-    let n = performance_workers();
+    let n = measured_workers();
     if n > 1 { vec![1, n] } else { vec![1] }
 }
 
 /// The solver pool `lactose-app` gives a world on `frame_workers` frame workers, with the
-/// default reservation of one, and the backend over it.
+/// default reservation of one, and the backend over it. The crate's pool is private, so
+/// this mirrors `solver_pool` in `crates/app/src/runtime.rs`: the same threads, named
+/// `solver-{i}`, each entering `ThreadClass::PhysicsSolver` before it takes work (a
+/// refusal is printed, as the crate logs it); the exit count it keeps for its shutdown is
+/// not this test's.
 fn rapier(frame_workers: u32) -> Box<dyn PhysicsBackend> {
     let threads = frame_workers.saturating_sub(PhysicsConfig::default().reserved_workers).max(1);
-    let pool = rayon::ThreadPoolBuilder::new().num_threads(threads as usize).build().unwrap();
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(threads as usize)
+        .thread_name(|index| format!("solver-{index}"))
+        .start_handler(|index| {
+            if let Err(error) = lactose_core::ThreadClass::PhysicsSolver.enter() {
+                eprintln!("solver thread {index} runs without its scheduling class: {error}");
+            }
+        })
+        .build()
+        .unwrap();
     lactose_physics_rapier::backend(pool)
 }
 
@@ -114,15 +146,19 @@ fn physics_of(phases: &BTreeMap<String, Duration>) -> Duration {
     [SYNC, STEP, WRITE_BACK].iter().filter_map(|label| phases.get(*label)).sum()
 }
 
-/// The topology the executor detects and the frame workers a default executor starts:
-/// what `cargo xtask measure` writes into every result file's header.
+/// The topology the platform reports, the frame workers a default executor starts on it,
+/// and N ([`measured_workers`]): what `cargo xtask measure` writes into every result
+/// file's header.
 #[test]
 #[ignore = "run by `cargo xtask measure` for its result files' header"]
 fn the_topology_the_executor_detects() {
     let topology = StdPlatform.topology();
+    let executor = executor(None);
     figure("topology.performance", topology.performance);
     figure("topology.efficiency", topology.efficiency);
-    figure("frame_workers", performance_workers());
+    figure("frame_workers", executor.frame_worker_count());
+    figure("measured_workers", measured_workers());
+    executor.shutdown();
 }
 
 // ---- The physics rows ----
@@ -206,8 +242,8 @@ impl Cooked for Nothing {
 static EMPTY: Game = Game { name: "cost", crates: &[], order: None, sessions: None };
 
 /// Criterion 4 (architecture section 22, plan decision 5.1): the physics phase of a server
-/// world `build_server` assembles on the default executor, its solver pool the frame
-/// workers less one, over 100,000 rows: [`BODIES`] awake bodies on a floor, [`STATICS`]
+/// world `build_server` assembles on N frame workers, its solver pool the frame workers less
+/// one, over 100,000 rows: [`BODIES`] awake bodies on a floor, [`STATICS`]
 /// fixed boxes and [`PLAIN`] rows with a transform alone. The phase is the sync, the step
 /// and the write-back, each from its system's spans (`timing`); each figure is the median over 60
 /// ticks (10 in a short run) after 30 of warm-up, and the whole server step is printed
@@ -217,7 +253,7 @@ static EMPTY: Game = Game { name: "cost", crates: &[], order: None, sessions: No
 fn cost_of_the_physics_phase_at_100k_rows() {
     let (warm, ticks) = if short() { (5, 10) } else { (30, 60) };
     let spans = spans();
-    let executor = executor(None);
+    let executor = executor(Some(measured_workers()));
     let config = WorldConfig::headless();
     let solver = executor.frame_worker_count().saturating_sub(config.physics.reserved_workers);
     let mut server =
@@ -382,15 +418,15 @@ mod composed {
 /// loaded from its own bundle in one frame, so the next sync diffs every row against the
 /// carried bookkeeping. The step of the reload frame and its sync, the median of 5 reloads
 /// (1 in a short run) each 10 ticks after the last, beside the median of the ticks
-/// between them; the bundle is built outside the timing. On the default executor, its
-/// solver pool as `lactose-app` would give it. `cargo xtask measure reload-100k` runs it.
+/// between them; the bundle is built outside the timing. On N frame workers, its solver
+/// pool as `lactose-app` would give it. `cargo xtask measure reload-100k` runs it.
 #[test]
 #[ignore = "a measurement, run by `cargo xtask measure`: timings are reported, not asserted"]
 fn cost_of_a_100k_reload() {
     const BETWEEN: u32 = 10;
     let reloads = if short() { 1 } else { 5 };
     let spans = spans();
-    let executor = executor(None);
+    let executor = executor(Some(measured_workers()));
     let workers = executor.frame_worker_count();
     let mut types = TypeTable::new();
     lactose_physics_api::register_types(&mut types).unwrap();

@@ -343,29 +343,43 @@ static APPROACH: Game = Game {
     order: None,
     sessions: Some(lone_crate),
 };
+/// The dynamic character among unclaimed bodies, which the prediction world holds as
+/// kinematic proxies: the slot's measurement alone, outside the recorded scenes.
+static PROXIES: Game =
+    Game { name: "spike-proxies", crates: &[SPIKE], order: None, sessions: Some(proxies) };
 
 fn dynamic() -> Box<dyn SessionApplier> {
-    Box::new(Arena { kinematic: false, crates: 0 })
+    Box::new(Arena { kinematic: false, crates: 0, proxies: 0 })
 }
 
 fn kinematic() -> Box<dyn SessionApplier> {
-    Box::new(Arena { kinematic: true, crates: 0 })
+    Box::new(Arena { kinematic: true, crates: 0, proxies: 0 })
 }
 
 fn crates() -> Box<dyn SessionApplier> {
-    Box::new(Arena { kinematic: false, crates: 4 })
+    Box::new(Arena { kinematic: false, crates: 4, proxies: 0 })
 }
 
 fn lone_crate() -> Box<dyn SessionApplier> {
-    Box::new(Arena { kinematic: false, crates: 1 })
+    Box::new(Arena { kinematic: false, crates: 1, proxies: 0 })
 }
 
-/// The session applier: a join builds the arena (a floor and four walls, fixed, and the
-/// first `crates` crates of the claim scene) and the player's capsule, claimed and
-/// anchored.
+fn proxies() -> Box<dyn SessionApplier> {
+    Box::new(Arena { kinematic: false, crates: 0, proxies: PREDICTION_ROWS - FIXED })
+}
+
+/// The arena's fixed colliders: a floor and four walls.
+const FIXED: u32 = 5;
+/// The fixed colliders and proxies a prediction world holds at most, together (D139).
+const PREDICTION_ROWS: u32 = 64;
+
+/// The session applier: a join builds the arena (a floor and four walls, fixed, the first
+/// `crates` crates of the claim scene, and `proxies` unclaimed boxes at rest behind the
+/// character, ten to a row) and the player's capsule, claimed and anchored.
 struct Arena {
     kinematic: bool,
     crates: u32,
+    proxies: u32,
 }
 
 impl SessionApplier for Arena {
@@ -373,7 +387,7 @@ impl SessionApplier for Arena {
         let SessionEvent::Join { region } = event else { return Ok(()) };
         let (ten, half) = (Scalar::from_i32(10), Scalar::HALF);
         let thin = scalar(0.25);
-        let statics = [
+        let statics: [_; FIXED as usize] = [
             (
                 Vec3::new(Scalar::ZERO, -half, Scalar::ZERO),
                 Vec3::new(scalar(12.0), half, scalar(12.0)),
@@ -401,6 +415,23 @@ impl SessionApplier for Arena {
                 world.spawn(key, region, row)?;
             }
         }
+        let quarter = scalar(0.25);
+        for index in 0..self.proxies {
+            let key = StableKey::Net(world.allocate_net_id()?);
+            let (column, row) = (index % 10, index / 10);
+            let at = Vec3::new(
+                scalar(-4.5) + Scalar::from_u32(column),
+                quarter,
+                Scalar::from_u32(3 + row),
+            );
+            let row = (
+                Transform::at(at),
+                Velocity::ZERO,
+                RigidBody::dynamic(),
+                Collider::new(Shape::cuboid(Vec3::new(quarter, quarter, quarter))),
+            );
+            world.spawn(key, region, row)?;
+        }
         let body = if self.kinematic {
             RigidBody::kinematic()
         } else {
@@ -423,7 +454,8 @@ impl SessionApplier for Arena {
     }
 }
 
-/// The four scenes, and the measurement's claim on approach.
+/// The four scenes, the measurement's claim on approach, and the slot's thrown scene among
+/// proxies.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Scene {
     Capsule,
@@ -431,6 +463,7 @@ enum Scene {
     Thrown,
     Claim,
     Approach,
+    Proxies,
 }
 
 impl Scene {
@@ -441,6 +474,7 @@ impl Scene {
             Self::Thrown => "fifty thrown bodies",
             Self::Claim => "claim in contact",
             Self::Approach => "claim on approach",
+            Self::Proxies => "fifty thrown bodies among proxies",
         }
     }
 
@@ -450,12 +484,13 @@ impl Scene {
             Self::Kinematic => &KINEMATIC,
             Self::Claim => &CRATES,
             Self::Approach => &APPROACH,
+            Self::Proxies => &PROXIES,
         }
     }
 
     /// The scripted sample of `tick`. The walk: idle, ahead, a turn right, a turn left,
-    /// back, idle; the claim scenes walk ahead into the crates and stop; the thrown scene
-    /// holds `Throw` over phases 60 to 89 beside the walk.
+    /// back, idle; the claim scenes walk ahead into the crates and stop; the thrown scenes
+    /// hold `Throw` over phases 60 to 89 beside the walk.
     fn input(self, tick: Tick) -> PlayerInput {
         let phase = tick.0 % CYCLE;
         let stick = |turn: f64, forward: f64| Axis2 {
@@ -474,7 +509,7 @@ impl Scene {
             }
         };
         let mut input = PlayerInput { movement, ..PlayerInput::IDLE };
-        if self == Self::Thrown {
+        if matches!(self, Self::Thrown | Self::Proxies) {
             let throw = Actions::EMPTY.with(Action::Throw);
             if (60..90).contains(&phase) {
                 input.held = throw;
@@ -3008,15 +3043,15 @@ fn median_of(mut spans: Vec<Duration>) -> Duration {
 /// frames of the fifty bodies in flight and landing.
 const THROWN_FRAMES: u32 = 150;
 
-/// Runs the thrown scene on the server's clock to [`THROWN_FRAMES`] on four workers, as the
-/// spike's measurement does, then hands `measure` the executor, the client, its clock and
-/// the last frame it ran.
+/// Runs `scene` on the server's clock to [`THROWN_FRAMES`] on four workers, as the spike's
+/// measurement does, then hands `measure` the executor, the client, its clock and the last
+/// frame it ran.
 fn after_the_throw(
+    scene: Scene,
     mut measure: impl FnMut(&Executor, &mut Option<Client>, &ClientClock, u32) -> Result<()>,
 ) {
     let executor = executor(4);
-    let plan =
-        Plan { ticks: THROWN_FRAMES, clock: ClockScript::Exact, ..Plan::recorded(Scene::Thrown) };
+    let plan = Plan { ticks: THROWN_FRAMES, clock: ClockScript::Exact, ..Plan::recorded(scene) };
     let mut ended = false;
     let mut observe = |observed: Observed<'_>| match observed {
         Observed::Ended { client, clock, frame } => {
@@ -3030,23 +3065,55 @@ fn after_the_throw(
     executor.shutdown();
 }
 
-/// Criterion 5 (architecture section 22, plan decision 5.1): the take and the restore of
-/// one prediction slot on the client of the thrown scene, its fifty bodies in flight, with
-/// Rapier. The take is what `lactose-predict` takes after every predicted tick: the world
-/// snapshot, the physics snapshot, and the record of every claimed entity's replicated
-/// persistent components but `Teleported`; the restore is what a rollback restores: the
-/// world, then the physics. Each is the median of 200 (20 in a short run); the slot's
-/// size is printed as this take counts it and as the client's ring counts its newest
-/// slot. The world hash after the restores is the hash before them. `cargo xtask measure
-/// prediction-slot` runs it.
+/// Runs the client's frame `n` alone, at `clock`'s time for it with `scene`'s sample, and
+/// puts the client back.
+fn alone_frame(
+    executor: &Executor,
+    held: &mut Option<Client>,
+    clock: &ClientClock,
+    scene: Scene,
+    n: u32,
+) -> Result<ClientOutput> {
+    let mut sample = |tick: Tick| scene.input(tick);
+    let client = held.take().expect("held between frames");
+    match executor.block_on(client.frame(executor, clock.now(n), &mut sample)) {
+        Ok((client, out)) => {
+            *held = Some(client);
+            Ok(out)
+        }
+        Err(ClientError { error, client }) => {
+            *held = client;
+            Err(error)
+        }
+    }
+}
+
+/// Criterion 5 (architecture section 22, plan decision 5.1): one prediction slot of the
+/// thrown scene's client, its fifty bodies in flight, with Rapier, in an arena that holds
+/// the most D139 admits: five fixed colliders and 59 unclaimed bodies, which the prediction
+/// world holds as kinematic proxies, 64 together. The client first runs two frames alone,
+/// so that its newest slot holds no server frame and weighs what this take weighs.
+///
+/// The take is a copy of what `lactose-predict` takes after every predicted tick, timed by
+/// part: the world snapshot, the physics snapshot, and the record of every claimed entity's
+/// replicated persistent components but `Teleported`. Criterion 5 reads `snapshot_us`, the
+/// world and physics snapshots together; `take_us` adds the record. The restore is what a
+/// rollback restores, the world then the physics; criterion 5 reads `restore_us`. Each
+/// figure is the median of 200 rounds (20 in a short run). The three sizes are asserted
+/// equal to the client's ring's for its newest slot, so that the copy cannot drift from the
+/// take unseen, and the world hash after the restores is the hash before them.
+/// `cargo xtask measure prediction-slot` runs it.
 #[test]
 #[ignore = "a measurement, run by `cargo xtask measure`: timings are reported, not asserted"]
 fn cost_of_a_prediction_slot() {
     let rounds = if short() { 20 } else { 200 };
-    after_the_throw(|_, client, _, _| {
-        let client = client.as_mut().expect("held between frames");
+    after_the_throw(Scene::Proxies, |executor, held, clock, last| {
+        for n in 1..=2 {
+            alone_frame(executor, held, clock, Scene::Proxies, last + n)?;
+        }
+        let client = held.as_mut().expect("held between frames");
         let (tick, hash) = (client.tick(), client.hash()?);
-        let ring = client.predictor().ring().slot_bytes(tick).unwrap_or_default();
+        let ring = client.predictor().ring().slot_bytes(tick).expect("the newest slot");
         let world = client.predictor_mut().simulation_mut().world_mut();
         let recorded: Vec<ComponentKey> = world
             .registry()
@@ -3061,16 +3128,20 @@ fn cost_of_a_prediction_slot() {
             .collect();
         let claimed = world.claimed(PLAYER).count();
         assert!(claimed > THROWN as usize, "the character and the thrown bodies: {claimed}");
-        let bodies = world.query::<&RigidBody>().count();
-        let colliders = world.query::<&Collider>().count();
+        let fixed = world.query::<(&Collider, lactose_ecs::Without<RigidBody>)>().count();
+        let proxies = world.query::<(&RigidBody, lactose_ecs::Without<ClaimedBy>)>().count();
+        assert_eq!(fixed, FIXED as usize, "the arena's fixed colliders");
+        assert_eq!(fixed + proxies, PREDICTION_ROWS as usize, "the most D139 admits");
         let entities = world.entities_in(REGION).count();
 
-        let (mut takes, mut restores) = (Vec::new(), Vec::new());
-        let mut bytes = (0, 0, 0);
+        let mut times: [Vec<Duration>; 6] = Default::default();
+        let mut bytes = SlotBytes::default();
         for _ in 0..rounds {
             let start = Instant::now();
             let snapshot = world.snapshot();
+            let taken_world = Instant::now();
             let physics = lactose_physics_api::snapshot(world)?;
+            let taken_physics = Instant::now();
             let record: BTreeMap<StableKey, (RegionId, BTreeMap<ComponentKey, Vec<u8>>)> = world
                 .claimed(PLAYER)
                 .filter_map(|key| {
@@ -3083,34 +3154,52 @@ fn cost_of_a_prediction_slot() {
                     Some((key, (world.region_of(key)?, components)))
                 })
                 .collect();
-            takes.push(start.elapsed());
+            let taken = Instant::now();
+            times[0].push(taken_world - start);
+            times[1].push(taken_physics - taken_world);
+            times[2].push(taken - taken_physics);
             let record_bytes =
                 record.values().flat_map(|(_, components)| components.values()).map(Vec::len);
-            bytes = (snapshot.size_in_bytes(), physics.size_in_bytes(), record_bytes.sum());
+            bytes = SlotBytes {
+                world: snapshot.size_in_bytes(),
+                physics: physics.size_in_bytes(),
+                record: record_bytes.sum(),
+            };
 
             let start = Instant::now();
             world.restore(&snapshot)?;
+            let restored_world = Instant::now();
             lactose_physics_api::restore(world, &physics)?;
-            restores.push(start.elapsed());
+            let restored = Instant::now();
+            times[3].push(restored_world - start);
+            times[4].push(restored - restored_world);
+            times[5].push(restored - start);
         }
         assert_eq!(client.hash()?, hash, "a restore of the slot just taken changes nothing");
+        assert_eq!(bytes, ring, "this take weighs what the ring's newest slot weighs");
 
+        let [world_us, physics_us, record_us, world_restore_us, physics_restore_us, restore_us] =
+            times.map(|spans| micros(median_of(spans)));
+        let us = |value: f64| format!("{value:.1}");
         figure("workers", 4);
-        figure("frames", THROWN_FRAMES);
+        figure("frames", THROWN_FRAMES + 2);
         figure("tick", tick.0);
         figure("rounds", rounds);
         figure("entities", entities);
         figure("claimed", claimed);
-        figure("bodies", bodies);
-        figure("colliders", colliders);
-        figure("take_us", format!("{:.1}", micros(median_of(takes))));
-        figure("restore_us", format!("{:.1}", micros(median_of(restores))));
-        figure("world_bytes", bytes.0);
-        figure("physics_bytes", bytes.1);
-        figure("record_bytes", bytes.2);
-        figure("ring_world_bytes", ring.world);
-        figure("ring_physics_bytes", ring.physics);
-        figure("ring_record_bytes", ring.record);
+        figure("fixed_colliders", fixed);
+        figure("proxies", proxies);
+        figure("world_snapshot_us", us(world_us));
+        figure("physics_snapshot_us", us(physics_us));
+        figure("snapshot_us", us(world_us + physics_us));
+        figure("record_us", us(record_us));
+        figure("take_us", us(world_us + physics_us + record_us));
+        figure("world_restore_us", us(world_restore_us));
+        figure("physics_restore_us", us(physics_restore_us));
+        figure("restore_us", us(restore_us));
+        figure("world_bytes", bytes.world);
+        figure("physics_bytes", bytes.physics);
+        figure("record_bytes", bytes.record);
         Ok(())
     });
 }
@@ -3133,20 +3222,9 @@ const ALONE: u32 = 8;
 #[ignore = "a measurement, run by `cargo xtask measure`: timings are reported, not asserted"]
 fn cost_of_a_seven_tick_rollback() {
     let rollbacks = if short() { 3 } else { 20 };
-    after_the_throw(|executor, held, clock, last| {
-        let mut sample = |tick: Tick| Scene::Thrown.input(tick);
-        let mut frame = |held: &mut Option<Client>, n: u32| -> Result<ClientOutput> {
-            let client = held.take().expect("held between frames");
-            match executor.block_on(client.frame(executor, clock.now(n), &mut sample)) {
-                Ok((client, out)) => {
-                    *held = Some(client);
-                    Ok(out)
-                }
-                Err(ClientError { error, client }) => {
-                    *held = client;
-                    Err(error)
-                }
-            }
+    after_the_throw(Scene::Thrown, |executor, held, clock, last| {
+        let frame = |held: &mut Option<Client>, n: u32| {
+            alone_frame(executor, held, clock, Scene::Thrown, n)
         };
         for n in 1..=ALONE {
             frame(held, last + n)?;

@@ -118,14 +118,33 @@ fn figure(name: &str, value: impl core::fmt::Display) {
     println!("measure: {name} {value}");
 }
 
-/// N of plan decision 5.1: the frame workers a default executor starts, one per performance
-/// core it counts (architecture section 5.1), at most eight.
+/// The variable that sets N in place of the topology's, as `cargo xtask measure` passes it.
+const WORKERS_VAR: &str = "LACTOSE_MEASURE_WORKERS";
+
+/// N of plan decision 5.1, by the rule of the plan's section 4: the performance cores the
+/// platform reports or, on a part that reports no core types (efficiency zero), its
+/// physical cores, which `CoreTopology::homogeneous` stores as one more than its
+/// `performance`; at most eight. [`WORKERS_VAR`] overrides it, a whole number above zero.
+/// The same rule as `lactose-app`'s cost test. Returns N and the topology, printed beside it.
 #[expect(
     clippy::disallowed_methods,
     reason = "the worker count the measurement runs on, read outside the step"
 )]
-fn performance_workers() -> u32 {
-    Executor::builder().build().unwrap().frame_worker_count().min(8)
+fn measured_workers() -> (u32, lactose_task::CoreTopology) {
+    use lactose_task::{Platform, StdPlatform};
+    let topology = StdPlatform.topology();
+    if let Some(value) = std::env::var_os(WORKERS_VAR) {
+        let value = value.to_string_lossy();
+        let n = value
+            .parse::<u32>()
+            .ok()
+            .filter(|&n| n > 0)
+            .unwrap_or_else(|| panic!("{WORKERS_VAR} is `{value}`, not a count above zero"));
+        return (n, topology);
+    }
+    let cores =
+        if topology.efficiency == 0 { topology.performance + 1 } else { topology.performance };
+    (cores.min(8), topology)
 }
 
 /// How many sets of the scene's components its rows hold: the four kinds of rows, the
@@ -151,8 +170,8 @@ fn archetypes(world: &mut World) -> usize {
 }
 
 /// Criterion 1 (architecture section 22, plan decision 5.1): the median step at 100,064 rows
-/// on one frame worker (T₁) and on N, the performance cores the executor counts up to eight
-/// (T_N), in one sitting; then S = (N·T_N − T₁)/(N − 1), the time that did not shrink with
+/// on one frame worker (T₁) and on N ([`measured_workers`]: the performance cores, or the
+/// physical cores of a part that reports no core types, up to eight) (T_N), in one sitting; then S = (N·T_N − T₁)/(N − 1), the time that did not shrink with
 /// workers, and the projected eight-core tick S + (T₁ − S)/8. Each phase of the step, and the
 /// hash after it, which is outside the step, are printed beside them; the world hash after
 /// the last tick is the same on both worker counts. `cargo xtask measure tick-100k` runs it
@@ -167,7 +186,7 @@ fn cost_of_a_tick_at_100k_rows() {
     let ticks: u32 = if short() { 6 } else { 60 };
     let spans: &'static timing::Spans = Box::leak(Box::default());
     tracing::subscriber::set_global_default(spans).unwrap();
-    let n = performance_workers();
+    let (n, topology) = measured_workers();
     let counts = if n > 1 { vec![1, n] } else { vec![1] };
     let mut medians = Vec::new();
     let mut last_hashes = Vec::new();
@@ -235,6 +254,8 @@ fn cost_of_a_tick_at_100k_rows() {
     figure("warm_up_ticks", WARM);
     figure("workers", counts.iter().map(u32::to_string).collect::<Vec<_>>().join(" and "));
     figure("hash", format!("{:#018x}", last_hashes[0]));
+    figure("topology.performance", topology.performance);
+    figure("topology.efficiency", topology.efficiency);
     figure("n", n);
     figure("t1_us", format!("{t1:.1}"));
     if let [_, tn] = medians[..] {
