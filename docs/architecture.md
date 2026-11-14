@@ -35,8 +35,8 @@ In priority order. When two conflict, the earlier one wins.
    task, not a thread. The OS main thread pumps events only.
 6. **Multiplayer without a fixed player cap.** Server cost is bounded by active entity count
    and per-client cost by relevance, never by a constant.
-7. **Modular, interface-first where the interface is knowable.** A backend-driven interface is
-   frozen only once a real backend has passed its conformance suite (section 20).
+7. **Modular, interface-first where the interface is knowable.** An interface crate a backend
+   implements is frozen only once a real backend has passed its conformance suite (section 20).
 
 Non-goals for now: an editor, mobile, web, Intel Macs, a scripting language, multi-process
 server sharding.
@@ -92,10 +92,9 @@ would straddle it are split: `net` (outside) and `predict` (inside), `game-sim` 
 
 **Things you run get names, things you import get descriptions.** Codenames from the glossary
 (section 23) appear on binaries, tools, log targets, CI jobs, README titles and headings,
-never on crate names, types or functions. Test code is held to the same rule: a test or bench
-target is a thing you run and may carry the codename of what it runs (`tests/sour.rs`,
-`benches/whisk.rs`), and no type, function, module, constant or static declared inside one
-does.
+never on crate names, types, functions, modules, constants or statics. Test code is held to
+the same rule: a test or bench target is a thing you run and may carry the codename of what
+it runs (`tests/sour.rs`, `benches/whisk.rs`), and nothing declared inside one does.
 
 **Everything is data.** Components are padding-free plain data registered with the reflection
 registry. Entity and asset references in components are typed fields the registry knows about.
@@ -544,9 +543,11 @@ presentation, pose evaluation, VFX, audio, UI, asset IO timing and input samplin
   `mul_add` and their `f64` forms are banned outside
   `math`, as are trait routes to the platform library such as `num_traits::Float`; NaN sign and payload are never
   observable. NaNs are canonicalised before hashing and serialisation, and one in a
-  persistent column is a defect: the world hasher and the save's serialiser assert against it
-  in debug builds, where they canonicalise a value read from a live world. Nothing checks at
-  the write, and decoding a document or a frame asserts nothing.
+  persistent column is a defect: in debug builds the world hasher asserts against it when it
+  hashes a persistent type, and the save's serialiser when it diffs a live world's export.
+  Nothing checks at the write or at a decode, so a NaN that a document or a frame brings into
+  a live world is asserted at that world's next hash or save, as the defect of the build that
+  wrote it.
 - Fused multiply-add is correctly rounded and permitted. The hazard is code that chooses fused
   or unfused by target feature, which `wide` and glam do. Therefore x86-64 targets are pinned
   to the x86-64-v3 baseline through target-specific rustflags and rustdocflags in
@@ -791,9 +792,9 @@ Section 9.7 gives the capacity model.
   brings the table makes it `Simulated`. `app` directs these modes from the frames it folds;
   the activation policy of section 9.7 runs on the server alone. A region the server holds
   `Frozen` with its table published is simulated on the client all the same, and every frame
-  that carries rows of an entity the client predicts there corrects it, because a region
-  change carries no mode. A mode in `net-api`'s `RegionChange` is decided before `net`'s
-  packer sends region changes.
+  that carries rows of an entity the client predicts there corrects that entity, because a
+  region change carries no mode. A mode in `net-api`'s `RegionChange` is decided before
+  `net`'s packer sends region changes.
 - Systems declare the worlds they run in (section 6.1). The prediction world injects a
   predicted-only filter; game code never writes it. The local player exists in both client
   worlds, and the prediction world's copy shadows the replicated one for extract and the
@@ -876,15 +877,15 @@ journal checkpoint carries the physics snapshot beside them (section 15.5).
 
 `physics-api` conformance: run ten ticks, snapshot at tick three, restore, re-run, hash equal
 at tick ten. The cost is measured in milestone 1 and the prediction world is sized from it.
-A slot's cost is the backend's serialisation of every body and collider it holds, bytes that
-copy-on-write in `predict` cannot share between slots, so copy-on-write snapshots are not
-built. The bound is on what the world holds instead: at most 64 fixed colliders and proxies
-together as rows, beside the fifty claimed bodies of section 22, which keeps a slot's take
-and its restore inside the 100 µs budget with the pinned backend. The milestone 1 measurement
-of a slot, proxies included, confirms the count or changes it. It is a content rule, and
-nothing in the engine enforces it. Milestone 3 designs, with streaming, how cooked static
-scenery reaches the prediction world's solver outside the per-tick snapshot, and what
-replaces the bound.
+A slot's cost is dominated by the backend's serialisation of every body and collider it
+holds, bytes that copy-on-write in `predict` cannot share between slots, so copy-on-write
+snapshots are not built. The bound is on what the world holds instead: at most 64 fixed
+colliders and proxies together as rows, beside the fifty claimed bodies of section 22, which
+keeps a slot's take inside section 22's 100 µs budget with the pinned backend, and its
+restore, about 92 µs at that count, under it. The milestone 1 measurement of a slot, proxies
+included, confirms the count or changes it. It is a content rule, and nothing in the engine
+enforces it. Milestone 3 designs, with streaming, how cooked static scenery reaches the
+prediction world's solver outside the per-tick snapshot, and what replaces the bound.
 
 ## 11. Time and pacing
 
@@ -989,7 +990,8 @@ events; UI view-model resources; a debug-draw buffer; and the presentation snaps
 `presentation` runs the per-frame schedule on the snapshot (section 5.3). The camera rig is
 presentation, not simulation: its orbit, boom and boom collision are evaluated per frame
 against the immutable static collision asset (shared parry shapes also inserted into the
-prediction physics world, so presentation never touches a mutating world) and are not
+prediction physics world from milestone 3, section 9.4, so presentation never touches a
+mutating world) and are not
 authoritative, and the input it produces carries absolute
 yaw and pitch into the simulation. Pose evaluation for rendering runs here; the simulation uses
 the deterministic sim skeleton from `anim` for hit volumes, hand and foot placement, sockets
@@ -1220,10 +1222,11 @@ The policy is in section 3.
   over `todo!()` bodies, the README as its contract, and the decision text for what this
   document left open, reviewed before anything is written against it. Its implementation is
   a lane of its own, and so is each backend of an interface crate (`physics-rapier` behind
-  `physics-api`, `asset` behind `asset-api`, the RHI backends behind `rhi-api`). An `-api` a
-  backend implements is frozen once its first backend passes its conformance suite, a null
-  or test backend not counting. `rhi-api` stays unstable until the native Metal spike has
-  run. `io` has no `-api`; its backends sit behind a trait inside the crate.
+  `physics-api`, `asset` behind `asset-api`, the RHI backends behind `rhi-api`, `net` behind
+  `net-host`). An interface crate a backend implements is frozen once its first backend
+  passes its conformance suite, a null or test backend not counting. `rhi-api` stays unstable
+  until the native Metal spike has run. `io` has no `-api`; its backends sit behind a trait
+  inside the crate.
 - Amending an interface in the same PR as the implementation that needs it is permitted and
   must be called out.
 - One crate per lane, or one change whose brief names the crates it crosses. Build what the
@@ -1236,9 +1239,10 @@ The policy is in section 3.
   is a file under `docs/results` that carries its machine, date, commit, detected topology,
   workers and load; one command, `cargo xtask measure`, writes those of milestone 1 and
   later. A number taken while other work loads the machine steers and proves nothing.
-- Every `-api` a backend implements ships a conformance suite that each backend passes:
-  `physics-api`, `asset-api`, `rhi-api`. An interface crate no backend implements, such as
-  `net-api`, ships none. RHI conformance runs under lavapipe on Linux CI and
+- Every interface crate a backend implements ships a conformance suite that each backend
+  passes: `physics-api`, `asset-api`, `rhi-api`, and `net-host` for `net`'s transports, due
+  with `net` at milestone 4. An interface crate no backend implements, such as `net-api`,
+  ships none. RHI conformance runs under lavapipe on Linux CI and
   on a GPU runner nightly.
 - Each crate's `README.md` states responsibility, tier, boundary status and unsafe status.
 - Agents: `.claude/agents/` defines the standard set and `docs/agents.md` the process. `lane`
@@ -1254,8 +1258,9 @@ The policy is in section 3.
   briefs, decides the findings, pushes, and keeps this document, the decisions log and the
   verification list; a long command that needs no interpretation runs in the background,
   never in a foreground agent turn.
-- CI: clippy `-D warnings`, fmt, nextest, SOUR in all applicable modes, Miri nightly on `task`
-  and `ecs`, `cargo-deny`, the tier check, the vendor check.
+- CI: clippy `-D warnings`, fmt, nextest, SOUR in all applicable modes, Miri nightly on
+  `core`, `task` over each deque, `ecs`, `input-host` and `net-host`, `cargo-deny`, the tier
+  check, the vendor check.
 
 ## 21. Unsafe policy
 
@@ -1290,17 +1295,18 @@ in the expansion against the final type, never by what the macro parsed;
 | 5 | Game | `game-sim`, `game-present`, `audio`, `ui`, `nav`, input mapping, `debug-ui` | A playable slice: terrain, climbing, physics objects, co-op interaction, gamepad, sound. |
 
 Milestone 1's criteria are read as follows (D139). Each timing criterion has its own
-workload. The 100k tick runs on eight frame workers, one for each of eight performance cores
-as section 5.1 counts them: physical cores, a core's hardware threads counted once, and eight
-of the physical cores of a part that reports no core types. It excludes the physics phase,
-which is measured on its own scene, and the world hash, which SOUR pays at every step and a
-shipped binary only when it asks. The netcode spike runs in one process, over a seeded link
-that delays and drops packets, jitters them by less than a tick and reorders them within
-one, with a scripted client clock that drifts, wakes late and steps. Its x86 server and
-aarch64 client are SOUR's architecture mode over what both ends record, each world's hash at
-every tick and a hash of every packet sent: records equal on linux-x64, windows-x64 and
-macos-arm64 mean an x86 server and an aarch64 client exchange those bytes tick for tick. A
-difference between platforms is a finding and calls for a run across two machines.
+workload. The 100k tick runs on eight frame workers, one for each of eight performance
+cores: on a hybrid part, physical cores of the fastest class, a core's hardware threads
+counted once; on a part that reports no core types, eight of its physical cores. It excludes
+the physics phase, which is measured on its own scene, and the world hash, which SOUR pays at
+every step and a shipped binary only when it asks. The netcode spike runs in one process,
+over a seeded link that delays and drops packets, jitters them by less than a tick and
+reorders them within one, with a scripted client clock that drifts, wakes late and steps.
+Its x86 server and aarch64 client are SOUR's architecture mode over what both ends record,
+each world's hash at every tick and a hash of every packet sent: records equal on linux-x64,
+windows-x64 and macos-arm64 mean an x86 server and an aarch64 client exchange those bytes
+tick for tick. A difference between platforms is a finding and calls for a run across two
+machines.
 
 ### 22.1 Decided later, by milestone
 
@@ -1322,8 +1328,8 @@ difference between platforms is a finding and calls for a run across two machine
 ## 23. Glossary of names
 
 Codenames label subsystems on binaries, tools, test and bench targets, log targets, CI jobs,
-README titles and doc headings. Crate names, types and functions stay descriptive, in test
-code as elsewhere (section 3).
+README titles and doc headings. Crate names, types, functions, modules, constants and
+statics stay descriptive, in test code as elsewhere (section 3).
 
 | Name | Crate or surface | Role |
 |---|---|---|
