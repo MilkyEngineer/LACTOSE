@@ -4796,6 +4796,38 @@ relayed by an event when it acts on another body** (§6.1, §10, `lactose-ecs`,
   one graph node, so 7·T₄ − T₁ is 61 to 77 ms against the 24 ms that steers. Forking the units
   over workers (lending stays per table entry with checked casts, `crates/ecs/SAFETY.md`), and
   `lactose-ecs` joining `[harness]`, come next.
+- Addendum (lane ecs-fork, 2026-11-15; review rounds 1 and 2 and a concurrency review): *Part B,
+  second half: each system a graph node whose units fork over workers.* Each system that is not
+  exclusive is now a node of a `lactose-task` graph (`crates/ecs/src/node.rs`), beside a node
+  for each sync point and, per stage, a merge node for each event type the stage both emits and
+  reads. A node's `units` makes the kernel path's units (a chunk, a random range of one under
+  `split_batches` drawn from (seed, tick, system, archetype, chunk), a region, or one unit) and
+  writes each written column's coarse tick once, one element at a time. Its `run` never draws,
+  and keeps each unit's outputs in a slot owned by the node and indexed by unit. Its `finalize`
+  merges them in unit order on one thread, runs the reduction's finalize and hands outputs,
+  commands and events on in the order D117 fixes (units in unit order, sources by key, emitters
+  by plan position), whatever order the jobs finished in. Events are buffered per system and
+  merged by plan index in the merge node or at the next sync point; resources are lent as
+  references and none is removed; stamps are entered by plan position at the sync point. A sync
+  point holds the world alone and takes, once per allocation, the raw pointers the stage's nodes
+  reach columns, column ticks, row stamps, resources and event lists through (`StageView`).
+  Lending stays per table entry with checked casts, and soundness rests on the schedule's
+  conflict sets (`crates/ecs/SAFETY.md`). Every lock is taken with `try_*`, so a node that runs
+  outside its phase panics; the order of one stage's systems, and of a reader against its merge,
+  rests on the edges alone, which `check_conflicts` and `check_events` validate. Every job
+  debug-asserts the floating-point state. A system node's `run` opens no span of its own; the
+  executor's per-range span, named after the system, is the per-system zone (architecture 5.1).
+  `lactose-ecs` joined `[harness]`, and its tests run on SOUR's session executor.
+  `crates/ecs/tests/fork.rs` holds exactly-once units, the D117 order and, for each of its two
+  layouts, a recorded proof that units split across workers, on one worker and on four under
+  chaos seeds with forced splits; a merge in completion order fails it under every chaos seed.
+  SOUR's hash comparison cannot see a deterministic order change, so `tests/events.rs` holds the
+  order against literal values, for the in-stage merge and for the next sync point. The cost
+  scene at 2,000 rows records under SOUR (`lactose_sim::cost::scene`). Result on the Apple M1,
+  before and after binaries built in separate target directories and run alternately, three
+  rounds each, at load 17.15 → 11.88 (1 min): T₁ 9.72–9.92 → 10.15–10.61 ms, T₄ 9.71–10.13 →
+  3.31–4.16 ms, 7·T₄ − T₁ 58.0–61.2 → 13.1–18.5 ms against the 24 ms that steers. `ordered`
+  reductions remain milestone 5 (verification row "`ordered` reductions").
 
 **D138. Milestone 0's unshown criteria are exit conditions of milestone 1** (§5.1, §20, §22, `lactose-task`, `docs/results`)
 - Why: milestone 1's lanes began with part of section 22's milestone 0 proof not shown, and no

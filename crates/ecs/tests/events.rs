@@ -14,8 +14,8 @@ use common::*;
 use lactose_core::{EntityRef, StableKey};
 use lactose_ecs::{
     Channel, ChannelTake, ChannelWriter, ClaimedBy, Commands, Ctx, Event, EventWriter, Events,
-    LayoutConfig, Mut, Res, Schedule, ScheduleError, StableKeyOf, World, WorldKind, finalize,
-    system,
+    LayoutConfig, Mut, RegionConfig, RegionMode, Res, Schedule, ScheduleError, StableKeyOf, World,
+    WorldKind, finalize, system,
 };
 use lactose_math::{Scalar, Vec2};
 use lactose_reflect::component;
@@ -98,6 +98,75 @@ fn readers_see_every_event_in_emitter_then_source_then_sequence_order() {
     assert!(ticks[1].is_empty(), "events clear at the next input sync point");
     for layout in layouts() {
         assert_eq!(run_events(layout), ticks, "{layout:?}");
+    }
+}
+
+/// Three unordered emitters of one type, read only in the next stage: one per entity, one
+/// per region, and a finalize.
+#[system(name = "test::hand_rows", worlds = [server])]
+fn hand_rows(damage: EventWriter<Damage>, key: StableKeyOf, _counter: &Counter) {
+    emit(&mut damage, *key, 0);
+}
+
+#[system(name = "test::hand_regions", worlds = [server])]
+fn hand_regions(ctx: Ctx, damage: EventWriter<Damage>) {
+    emit(&mut damage, net(ctx.region().0), 1000);
+}
+
+#[system(name = "test::hand_tally", worlds = [server], reduce = lactose_math::IntSum<u32>)]
+fn hand_tally(_counter: &Counter) -> u32 {
+    1
+}
+
+#[finalize(hand_tally)]
+fn hand_tally_on(sum: i128, damage: EventWriter<Damage>) {
+    emit(&mut damage, net(500), 500 + i32::try_from(sum).unwrap());
+}
+
+/// Reads at the stage's opening sync point, before the stage's other systems.
+#[system(name = "test::read_handed_first", worlds = [server], exclusive)]
+fn read_handed_first(_world: &mut World, events: Events<Damage>, seen: Res<Seen>) {
+    let mut seen = seen.lock().unwrap();
+    seen.extend(events.iter().map(|event| (event.source, event.amount)));
+}
+
+#[system(name = "test::read_handed", worlds = [server])]
+fn read_handed(events: Events<Damage>, seen: Res<Seen>) {
+    let mut seen = seen.lock().unwrap();
+    seen.extend(events.iter().map(|event| (event.source, event.amount)));
+}
+
+#[test]
+fn a_later_stage_sees_handed_events_in_plan_then_source_order() {
+    // Unordered, the three run in key order, which is neither the order they were added in
+    // nor their sources' order (a tick's, a region's, then an entity's).
+    let mut keys = [HAND_ROWS.key(), HAND_REGIONS.key(), HAND_TALLY.key()];
+    keys.sort();
+    assert_eq!(keys, [HAND_ROWS.key(), HAND_TALLY.key(), HAND_REGIONS.key()]);
+    let tally = [(net(500), 504), (net(500), 505)];
+    let rows = [2, 4, 7, 9].map(|id| [(net(id), 0), (net(id), 1)]).concat();
+    let regions = [(net(10), 1000), (net(10), 1001), (net(20), 1000), (net(20), 1001)];
+    let one_reader = [&rows[..], &tally, &regions].concat();
+    for layout in [LayoutConfig::default()].into_iter().chain(layouts()) {
+        let executor = executor();
+        let mut world = world(WorldKind::Server, layout);
+        world
+            .create_region(RegionConfig { id: OTHER_REGION, seed: 1, mode: RegionMode::Simulated })
+            .unwrap();
+        for (id, region) in [(9, OTHER_REGION), (4, REGION), (7, OTHER_REGION), (2, REGION)] {
+            world.spawn(net(id), region, (Counter(0),)).unwrap();
+        }
+        world.insert_service::<Seen>(Box::new(Mutex::new(Vec::new())));
+        let mut builder = Schedule::builder(WorldKind::Server);
+        builder.stage("emit", &[]).add(&HAND_REGIONS).add(&HAND_ROWS).add(&HAND_TALLY);
+        builder.stage("read", &[]).add(&READ_HANDED).add(&READ_HANDED_FIRST);
+        let mut schedule = builder.build().unwrap();
+        for _ in 0..2 {
+            world = tick(&mut schedule, world, &executor);
+            let seen = std::mem::take(world.service_mut::<Seen>().unwrap().get_mut().unwrap());
+            // The exclusive reader first, then the other: each sees one tick's events.
+            assert_eq!(seen, [&one_reader[..], &one_reader].concat(), "{layout:?}");
+        }
     }
 }
 

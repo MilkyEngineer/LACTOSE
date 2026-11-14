@@ -63,9 +63,12 @@ fn only_simulated_regions_run_and_a_missing_region_resource_skips_one() {
 
     world.set_region_mode(FROZEN, RegionMode::Simulated).unwrap();
     world = tick(&mut schedule, world, &executor);
-    let regions: Vec<RegionId> =
+    let mut regions: Vec<RegionId> =
         world.service::<Reports>().unwrap().lock().unwrap().iter().map(|r| r.0).collect();
-    assert_eq!(regions, [REGION, FROZEN], "per-region invocations in ascending order");
+    // The invocations run concurrently, so a side channel sees them in any order; their
+    // outputs are handed on by region (`tests/fork.rs`).
+    regions.sort();
+    assert_eq!(regions, [REGION, FROZEN], "one invocation per simulated region");
     assert_eq!(world.get::<Counter>(net(2)), Some(&Counter(1)));
     assert_eq!(world.region(FROZEN).unwrap().mode, RegionMode::Simulated);
 }

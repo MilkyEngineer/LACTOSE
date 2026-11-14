@@ -445,7 +445,7 @@ pub struct EventsColumn<'r, E> {
 impl<'r, E: Event> UnitColumn<'r> for EventsColumn<'r, E> {
     fn take(unit: &mut Unit<'r>, index: usize) -> Self {
         expect_access::<Events<'static, E>>(unit, index);
-        let list = unit.env().events.get(&TypeId::of::<E>()).unwrap_or_else(|| EventList::empty());
+        let list = unit.env().event_list(TypeId::of::<E>());
         Self { list, _event: PhantomData }
     }
 }

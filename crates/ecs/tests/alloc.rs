@@ -57,7 +57,9 @@ fn allocations() -> u64 {
 
 /// The allocations of the third tick over `rows` rows.
 fn allocations_of_a_tick(rows: u64) -> u64 {
-    let executor = executor();
+    // Not the session's: a chaos executor records every job in its log, which allocates.
+    let executor =
+        lactose_task::Executor::builder().frame_workers(1).background_workers(1).build().unwrap();
     let mut world = world(WorldKind::Server, LayoutConfig::default());
     for id in 1..=rows {
         world.spawn(net(id), REGION, (pos(0, 0), vel(1, 1))).unwrap();

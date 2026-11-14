@@ -1287,7 +1287,7 @@ The policy is in section 3.
 | Crate | Why |
 |---|---|
 | `task` | deques, scope borrows, panic guard |
-| `ecs` | chunk column storage; the `#[system]` expansion's call of `unsafe SystemDescriptor::new`, which lands in the invoking crate like the `#[component]` impl and whose proof is in `crates/ecs/SAFETY.md` |
+| `ecs` | chunk column storage, and the schedule run's lending of chunk columns, column ticks, row stamps, resources and event lists to concurrent system nodes through raw pointers taken at sync points (`node.rs`); the `#[system]` expansion's call of `unsafe SystemDescriptor::new`, which lands in the invoking crate like the `#[component]` impl and whose proof is in `crates/ecs/SAFETY.md` |
 | `io` | platform completion APIs |
 | `rhi-vulkan`, `rhi-metal`, `rhi-dx12` | FFI to graphics drivers (`rhi-api` and `rhi-null` are not exempt) |
 | `platform` | present-thread QoS and window handles |

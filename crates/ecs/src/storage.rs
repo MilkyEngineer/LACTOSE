@@ -5,7 +5,8 @@
 //! of eight, so every column is aligned for every registered component (alignment at most
 //! eight, checked when the world is built). Typed access is a checked `bytemuck` cast of a
 //! row's or a column's bytes, and disjoint columns are reached by splitting the slab, so
-//! nothing here is `unsafe`.
+//! nothing here is `unsafe`; a schedule run reaches columns through pointers it takes here
+//! once per sync point (`node.rs`, `SAFETY.md`).
 
 use std::collections::BTreeMap;
 
@@ -45,6 +46,13 @@ impl AlignedBytes {
 
     pub(crate) fn as_bytes_mut(&mut self) -> &mut [u8] {
         &mut bytemuck::cast_slice_mut(&mut self.words)[..self.len]
+    }
+
+    /// The bytes' start, for a schedule run's view (`node.rs`), and their length. Taken
+    /// through `Vec::as_mut_ptr`, which creates no reference to the slab, so a pointer
+    /// derived from it stays valid until the slab is next borrowed.
+    pub(crate) fn as_mut_ptr(&mut self) -> (*mut u8, usize) {
+        (self.words.as_mut_ptr().cast(), self.len)
     }
 }
 

@@ -40,9 +40,20 @@ jobs:
             args: -p lactose-task
             real_deque: "1"
             miriflags: -Zmiri-tree-borrows -Zmiri-ignore-leaks
-          - name: ecs
+          # `lactose-ecs` in three: its two slowest test targets, every other target, and
+          # the doc tests, which cargo runs alone. A new test target whose name starts with
+          # `e` or `o` is added to the second entry by name.
+          - name: ecs, erased rows and ownership
             key: ecs
-            args: -p lactose-ecs
+            args: -p lactose-ecs --test erased_rows --test ownership
+          - name: ecs, the rest
+            key: ecs-rest
+            args: >-
+              -p lactose-ecs --lib --test '[!eo]*' --test erased --test events
+              --test obligation
+          - name: ecs, doc
+            key: ecs-doc
+            args: -p lactose-ecs --doc
           # The latest-sample slot's atomics: Miri's weak-memory emulation checks the shipped
           # `Native` orderings, which the loom models (over their own atomics) do not.
           - name: input-host
