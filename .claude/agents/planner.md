@@ -57,5 +57,5 @@ One of these, as a Markdown file at the path your brief names (usually under
 Plain text: the branch, worktree and commit; the file you wrote; the decisions it asks the
 owner to take, one line each; the amendment and decision text as one block the coordinator
 can apply verbatim; what you could not verify and why. End your commit messages with
-`Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>` and the `Claude-Session:` line
+`Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>` and the `Claude-Session:` line
 your brief gives you.

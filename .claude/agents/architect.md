@@ -46,5 +46,5 @@ report). This file says what an interface lane delivers instead of an implementa
   each fix round. The first draft of the ECS facade, written with full context, still drew
   nine blocking findings. Write for that review: state every contract, and say in the
   report what you are least sure of.
-- Your commit messages end with `Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>`
+- Your commit messages end with `Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>`
   and the `Claude-Session:` line your brief gives you.
