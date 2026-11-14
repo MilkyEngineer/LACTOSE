@@ -343,7 +343,15 @@ mod tests {
     #[component(key = "ecs_test::rare", persistent, replicated)]
     struct Rare(#[field(id = 1)] u64);
 
-    /// 10,000 rows with `Common` alone and 5 with `Common` and `Rare`.
+    /// Rows in the world: enough that visiting every row would show at full size, few
+    /// enough under Miri that the crate's run stays inside the nightly job.
+    const ROWS: u64 = if cfg!(miri) { 105 } else { 10_005 };
+    /// Rows that also have `Rare`.
+    const RARE: u64 = 5;
+    /// Every `STRIDE`-th id has `Rare`, from id 0, which places exactly `RARE` of them.
+    const STRIDE: u64 = (ROWS - RARE) / RARE + 1;
+
+    /// Every row has `Common`; `RARE` of them, one every `STRIDE` ids, have `Rare` too.
     fn world() -> World {
         let mut registry = Registry::new();
         registry.register::<InRegion>().unwrap();
@@ -357,9 +365,9 @@ mod tests {
         world
             .create_region(RegionConfig { id: region, seed: 1, mode: RegionMode::Simulated })
             .unwrap();
-        for id in 0..10_005 {
+        for id in 0..ROWS {
             let key = StableKey::Net(NetId::cooked(id));
-            if id % 2001 == 0 {
+            if id % STRIDE == 0 {
                 world.spawn(key, region, (Common(id), Rare(id))).unwrap();
             } else {
                 world.spawn(key, region, (Common(id),)).unwrap();
@@ -369,30 +377,33 @@ mod tests {
     }
 
     /// The rows a query over `Q` visits: those of the archetypes it admits.
-    fn visited<Q: QueryItems>(world: &mut World) -> usize {
+    fn visited<Q: QueryItems>(world: &mut World) -> u64 {
         let query = world.query::<Q>();
         query
             .filter
             .archetypes(&query.world.storage)
             .flat_map(|(_, archetype)| &archetype.chunks)
-            .map(Chunk::len)
+            .map(|chunk| u64::try_from(chunk.len()).unwrap())
             .sum()
     }
 
     #[test]
     fn a_query_visits_only_the_rows_of_archetypes_it_admits() {
         let mut world = world();
-        assert_eq!(visited::<&Rare>(&mut world), 5);
-        assert_eq!(visited::<(&Common, With<Rare>)>(&mut world), 5);
-        assert_eq!(visited::<(&Common, Without<Rare>)>(&mut world), 10_000);
-        assert_eq!(visited::<Changed<Rare>>(&mut world), 5);
-        assert_eq!(visited::<Option<&Rare>>(&mut world), 10_005);
+        assert_eq!(visited::<&Rare>(&mut world), RARE);
+        assert_eq!(visited::<(&Common, With<Rare>)>(&mut world), RARE);
+        assert_eq!(visited::<(&Common, Without<Rare>)>(&mut world), ROWS - RARE);
+        assert_eq!(visited::<Changed<Rare>>(&mut world), RARE);
+        assert_eq!(visited::<Option<&Rare>>(&mut world), ROWS);
 
         let mut seen = Vec::new();
         world.query::<&Rare>().for_each(|key, rare| seen.push((key, rare.0)));
-        let expected: Vec<(StableKey, u64)> =
-            (0..5).map(|n| n * 2001).map(|id| (StableKey::Net(NetId::cooked(id)), id)).collect();
+        let expected: Vec<(StableKey, u64)> = (0..RARE)
+            .map(|n| n * STRIDE)
+            .map(|id| (StableKey::Net(NetId::cooked(id)), id))
+            .collect();
         assert_eq!(seen, expected);
-        assert_eq!(world.query::<(&Common, Without<Rare>)>().count(), 10_000);
+        let count = world.query::<(&Common, Without<Rare>)>().count();
+        assert_eq!(u64::try_from(count).unwrap(), ROWS - RARE);
     }
 }

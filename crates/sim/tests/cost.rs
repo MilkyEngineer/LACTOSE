@@ -307,7 +307,10 @@ fn step(executor: &Executor, simulation: Simulation) -> Simulation {
 }
 
 /// The scene at a small scale runs, every system does its work, and the result does not
-/// depend on the worker count.
+/// depend on the worker count. Until the run forks over chunks (D137's part B), each system
+/// runs as one job, so the equality of the two worker counts holds by construction; the
+/// scene builds its own executor and the default layout, so SOUR's modes give it no
+/// coverage either. Part B runs it under SOUR's layout mode.
 #[test]
 fn the_scene_runs_and_its_hash_is_the_same_on_one_and_four_workers() {
     let mut hashes = Vec::new();

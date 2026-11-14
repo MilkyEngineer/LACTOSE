@@ -513,7 +513,8 @@ fn run_by_target(layout: LayoutConfig) -> Vec<(StableKey, StableKey, i32)> {
 }
 
 /// `for_target` finds a target's events, from every emitting system, by its origin key and,
-/// for a bound predicted entity, by its `Net` key as well, in emission order: (emitting
+/// for a predicted entity bound before the events were emitted, by its `Net` key as well, in
+/// emission order: (emitting
 /// system, source key, sequence). Computed here from the emitters' rules, independently of
 /// the index the world keeps.
 #[test]
@@ -545,5 +546,47 @@ fn for_target_finds_each_targets_events_in_emission_order() {
     assert_eq!(run_by_target(LayoutConfig::default()), expected);
     for layout in layouts() {
         assert_eq!(run_by_target(layout), expected, "{layout:?}");
+    }
+}
+
+/// What `read_both` saw: each `Damage` as (target, amount), then each `Push` as (target,
+/// strength).
+type BothSeen = Mutex<(Vec<(StableKey, i32)>, Vec<(StableKey, u32)>)>;
+
+/// Two writers of different event types in one invocation.
+#[system(name = "test::write_both", worlds = [server])]
+fn write_both(
+    damage: EventWriter<Damage>,
+    push: EventWriter<Push>,
+    key: StableKeyOf,
+    counter: &Counter,
+) {
+    damage.emit(Damage { target: *key, source: *key, amount: counter.0 as i32 });
+    push.emit(Push { target: *key, strength: counter.0 as u32 * 10 });
+}
+
+#[system(name = "test::read_both", worlds = [server], after = write_both)]
+fn read_both(damage: Events<Damage>, push: Events<Push>, seen: Res<BothSeen>) {
+    let mut seen = seen.lock().unwrap();
+    seen.0.extend(damage.iter().map(|event| (event.target, event.amount)));
+    seen.1.extend(push.iter().map(|event| (event.target, event.strength)));
+}
+
+#[test]
+fn an_invocation_with_two_event_writers_emits_through_both() {
+    for layout in [LayoutConfig::default()].into_iter().chain(layouts()) {
+        let executor = executor();
+        let mut world = world(WorldKind::Server, layout);
+        for id in [3, 1, 2] {
+            world.spawn(net(id), REGION, (Counter(id),)).unwrap();
+        }
+        world.insert_service::<BothSeen>(Box::new(Mutex::new((Vec::new(), Vec::new()))));
+        let mut builder = Schedule::builder(WorldKind::Server);
+        builder.stage("emit", &[]).add(&WRITE_BOTH).add(&READ_BOTH);
+        let mut schedule = builder.build().unwrap();
+        world = tick(&mut schedule, world, &executor);
+        let seen = std::mem::take(world.service_mut::<BothSeen>().unwrap().get_mut().unwrap());
+        assert_eq!(seen.0, [(net(1), 1), (net(2), 2), (net(3), 3)], "{layout:?}");
+        assert_eq!(seen.1, [(net(1), 10), (net(2), 20), (net(3), 30)], "{layout:?}");
     }
 }

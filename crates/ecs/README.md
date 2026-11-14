@@ -15,10 +15,9 @@ schedule run is one graph node on the executor that runs every sync point and ev
 in execution order on one worker, without forking over chunks. Milestone 1 rewrites the hot
 paths behind the same surface: so far `World::query` visits only the archetypes it admits,
 `Events::for_target` reads an index, and neither a typed overwrite through `World::insert`
-nor a kernel invocation that emits and commands nothing allocates; forking over chunks
-comes next (D137). Architecture sections 5.2, 6
-and 6.1 are the design; where this file and the architecture disagree, the architecture
-wins and this file is wrong. Decision D114 records the choices the sections left open and
+nor a per-entity invocation that emits and commands nothing allocates; forking over chunks
+comes next (D137). Architecture sections 5.2, 6 and 6.1 are the design; where this file
+and the architecture disagree, the architecture wins and this file is wrong. Decision D114 records the choices the sections left open and
 what the design review changed.
 
 Amending a signature is allowed in the change that needs it. Say so in the change description
@@ -128,8 +127,8 @@ What a system is, from its parameters (`SystemParam` has the table):
 
 - **Per-entity**: it has a component parameter. It runs once per entity that has every
   required component, lacks every `Without` component, passes every `Changed` filter,
-  resides in a `Simulated` region and passes the world's own filter (`ClaimedBy` in the
-  prediction world; none elsewhere). It runs as chunk jobs on the executor; nothing in its
+  resides in a `Simulated` region that holds every `RegionRes` it reads, and passes the
+  world's own filter (`ClaimedBy` in the prediction world; none elsewhere). It runs as chunk jobs on the executor; nothing in its
   parameters names a row, chunk or worker.
 - **Per-region**: no component parameter, but a `Ctx` or `RegionRes`. It runs once per
   `Simulated` region as independent jobs; its commands spawn into that region and its RNG is
@@ -226,10 +225,11 @@ What a system is, from its parameters (`SystemParam` has the table):
 - Events emitted through `EventWriter<E>` are visible to systems ordered after the emitter
   in the same tick, ordered by (emitting system, source origin key, sequence), and cleared at
   the input sync point. `Events::for_target` finds a target's events, by its origin key or
-  a bound `Net` key, through an index the world sorts after each emitting system, so its
-  cost is a binary search and the target's own events. The schedule requires every reader of `E` to be ordered after every
-  emitter of `E` (`ScheduleError::EventsBeforeEmitter`), so a reader's view never depends on
-  scheduling. Events are not in a snapshot: a snapshot point is between ticks.
+  the `Net` key bound to it when the event was emitted, through an index the world sorts
+  after each emitting system, so its cost is a binary search and the target's own events.
+  The schedule requires every reader of `E` to be ordered after every emitter of `E`
+  (`ScheduleError::EventsBeforeEmitter`), so a reader's view never depends on scheduling.
+  Events are not in a snapshot: a snapshot point is between ticks.
 - A channel is written through a `ChannelWriter<C>` parameter, in any kind of system: its
   entries wait in a sink of the invocation and reach the channel at the sync point that
   ends the stage, after the invocation's commands, keys resolved. Entries written in stage

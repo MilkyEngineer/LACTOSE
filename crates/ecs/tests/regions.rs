@@ -1,6 +1,6 @@
-//! Region modes and per-region systems: kernels run over `Simulated` regions only, a
-//! per-region system runs once per such region that holds its region resources, and its
-//! RNG streams are the world's.
+//! Region modes and per-region systems: kernels run over `Simulated` regions only, and only
+//! in those that hold their region resources; a per-region system runs once per such
+//! region; and its RNG streams are the world's.
 
 #![forbid(unsafe_code)]
 
@@ -68,6 +68,40 @@ fn only_simulated_regions_run_and_a_missing_region_resource_skips_one() {
     assert_eq!(regions, [REGION, FROZEN], "per-region invocations in ascending order");
     assert_eq!(world.get::<Counter>(net(2)), Some(&Counter(1)));
     assert_eq!(world.region(FROZEN).unwrap().mode, RegionMode::Simulated);
+}
+
+/// A kernel that reads a region resource.
+#[system(name = "test::weathered", worlds = [server])]
+fn weathered(weather: RegionRes<Weather>, counter: lactose_ecs::Mut<Counter>) {
+    counter.0 += u64::from(weather.0);
+}
+
+#[test]
+fn a_kernel_runs_only_in_simulated_regions_that_hold_its_region_resources() {
+    let executor = executor();
+    let mut world = world(WorldKind::Server, LayoutConfig::default());
+    let config = |id, mode| RegionConfig { id, seed: id.0 * 3, mode };
+    world.create_region(config(OTHER_REGION, RegionMode::Simulated)).unwrap();
+    world.create_region(config(FROZEN, RegionMode::Frozen)).unwrap();
+    world.insert_region_resource(REGION, Weather(2)).unwrap();
+    world.insert_region_resource(FROZEN, Weather(3)).unwrap();
+    world.spawn(net(1), REGION, (Counter(0),)).unwrap();
+    world.spawn(net(2), OTHER_REGION, (Counter(0),)).unwrap();
+    world.spawn(net(3), FROZEN, (Counter(0),)).unwrap();
+    let mut builder = Schedule::builder(WorldKind::Server);
+    builder.stage("weather", &[]).add(&WEATHERED);
+    let mut schedule = builder.build().unwrap();
+
+    world = tick(&mut schedule, world, &executor);
+    assert_eq!(world.get::<Counter>(net(1)), Some(&Counter(2)));
+    assert_eq!(world.get::<Counter>(net(2)), Some(&Counter(0)), "no weather: not run");
+    assert_eq!(world.get::<Counter>(net(3)), Some(&Counter(0)), "frozen: not run");
+
+    world.insert_region_resource(OTHER_REGION, Weather(5)).unwrap();
+    world = tick(&mut schedule, world, &executor);
+    assert_eq!(world.get::<Counter>(net(1)), Some(&Counter(4)));
+    assert_eq!(world.get::<Counter>(net(2)), Some(&Counter(5)), "runs once it holds one");
+    assert_eq!(world.get::<Counter>(net(3)), Some(&Counter(0)));
 }
 
 #[test]

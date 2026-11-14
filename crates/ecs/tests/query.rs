@@ -5,9 +5,13 @@
 
 mod common;
 
+use std::sync::Mutex;
+
 use common::*;
 use lactose_core::StableKey;
-use lactose_ecs::{Changed, LayoutConfig, Mut, With, Without, WorldKind};
+use lactose_ecs::{
+    Changed, LayoutConfig, Mut, Res, Schedule, With, Without, World, WorldKind, system,
+};
 use lactose_math::Scalar;
 
 #[test]
@@ -54,6 +58,44 @@ fn mut_items_stamp_on_write_and_changed_items_filter() {
     assert_eq!(changed, [net(2)]);
     // `Changed` in a query passes rows changed since this point of the previous tick.
     assert_eq!(world.query::<(Changed<Position>, &Position)>().count(), 3);
+}
+
+/// What `count_changed` saw, one count per tick.
+type ChangedCounts = Mutex<Vec<usize>>;
+
+/// Counts the rows whose `Position` changed since this point of the previous tick.
+#[system(name = "test::count_changed", worlds = [server], exclusive)]
+fn count_changed(world: &mut World, counts: Res<ChangedCounts>) {
+    let changed = world.query::<(Changed<Position>, &Position)>().count();
+    counts.lock().unwrap().push(changed);
+}
+
+/// Moves `net(2)` in the second tick only, after that tick's count.
+#[system(name = "test::move_second", worlds = [server], exclusive)]
+fn move_second(world: &mut World, counts: Res<ChangedCounts>) {
+    if counts.lock().unwrap().len() == 2 {
+        world.insert(net(2), pos(5, 5)).unwrap();
+    }
+}
+
+#[test]
+fn changed_items_pass_only_the_rows_written_since_the_previous_tick() {
+    let executor = executor();
+    let mut world = world(WorldKind::Server, LayoutConfig::default());
+    for id in 1..=3 {
+        world.spawn(net(id), REGION, (pos(0, 0),)).unwrap();
+    }
+    world.insert_service::<ChangedCounts>(Box::new(Mutex::new(Vec::new())));
+    let mut builder = Schedule::builder(WorldKind::Server);
+    builder.stage("count", &[]).add(&COUNT_CHANGED);
+    builder.stage("move", &[]).add(&MOVE_SECOND);
+    let mut schedule = builder.build().unwrap();
+    for _ in 0..4 {
+        world = tick(&mut schedule, world, &executor);
+    }
+    let counts = std::mem::take(world.service_mut::<ChangedCounts>().unwrap().get_mut().unwrap());
+    // The first count may see the spawns; from the second on, only `net(2)`'s move, once.
+    assert_eq!(counts[1..], [0, 1, 0]);
 }
 
 /// A tag: a component with no fields, so its column has no bytes.
