@@ -946,26 +946,52 @@ fn harness_packages(policy: &Policy, ws: &Workspace, files: &Files, findings: &m
 /// declared, by `impl SimulationAsset`, only in a boundary crate, where section 8.2 holds the
 /// decoder. Shipped code is read: from each crate root under `src/`, through every
 /// out-of-line `mod` (by `#[path]` or by the file layout), skipping what a `cfg` compiles
-/// only for tests or a `[dev_only_features]` feature.
+/// only for tests or a `[dev_only_features]` feature. A file under `src/` that no `mod` was
+/// seen to reach (one declared inside an inline module, say) is read as shipped, so a module
+/// the scan cannot place errs towards a finding.
 fn simulation_assets(tiers: &TierFile, ws: &Workspace, files: &Files, findings: &mut Vec<Finding>) {
     for package in ws.packages.iter().filter(|package| !tiers.in_boundary(&package.name)) {
         let listed = tiers.dev_only_features.get(&package.name).map_or(&[][..], Vec::as_slice);
         let features: Vec<String> =
             turning_on(package, listed).into_iter().map(str::to_owned).collect();
         let shipped = format!("{}/src/", package.dir);
-        // (file, whether it is a crate root, whether it is compiled only for tests)
-        let mut queue: VecDeque<(String, bool, bool)> = package
-            .crate_roots
-            .iter()
-            .filter(|root| root.starts_with(&shipped))
-            .map(|root| (root.clone(), true, false))
+        let mut scan = ModuleScan { package, files, features: &features, seen: BTreeSet::new() };
+        let roots: Vec<String> =
+            package.crate_roots.iter().filter(|root| root.starts_with(&shipped)).cloned().collect();
+        scan.from(roots, true, findings);
+        let unreached: Vec<String> = package_sources(package, files)
+            .into_iter()
+            .filter(|path| path.starts_with(&shipped) && !scan.seen.contains(*path))
+            .map(str::to_owned)
             .collect();
-        let mut seen: BTreeSet<String> = queue.iter().map(|(file, ..)| file.clone()).collect();
+        scan.from(unreached, false, findings);
+    }
+}
+
+/// The walk of [`simulation_assets`] over one package's module tree.
+struct ModuleScan<'a> {
+    package: &'a Package,
+    files: &'a Files,
+    features: &'a [String],
+    /// Every file read so far, each read once.
+    seen: BTreeSet<String>,
+}
+
+impl ModuleScan<'_> {
+    /// Reads `starts` as shipped, crate roots if `roots`, and every module file they reach.
+    fn from(&mut self, starts: Vec<String>, roots: bool, findings: &mut Vec<Finding>) {
+        // (file, whether it is a crate root, whether it is compiled only for tests)
+        let mut queue: VecDeque<(String, bool, bool)> = VecDeque::new();
+        for start in starts {
+            if self.seen.insert(start.clone()) {
+                queue.push_back((start, roots, false));
+            }
+        }
         while let Some((file, root, test_only)) = queue.pop_front() {
-            let Some(source) = files.text(&file) else {
+            let Some(source) = self.files.text(&file) else {
                 continue;
             };
-            let found = items(&source, SIMULATION_ASSET, &features);
+            let found = items(&source, SIMULATION_ASSET, self.features);
             for (line, gated) in found.impls {
                 if test_only || gated {
                     continue;
@@ -977,7 +1003,7 @@ fn simulation_assets(tiers: &TierFile, ws: &Workspace, files: &Files, findings: 
                          crate; a kind the simulation reads is declared in a boundary crate, \
                          where architecture section 8.2 holds its loader (D99), or only in \
                          tests",
-                        package.name
+                        self.package.name
                     ),
                 ));
             }
@@ -996,9 +1022,9 @@ fn simulation_assets(tiers: &TierFile, ws: &Workspace, files: &Files, findings: 
                         format!("{dir}/{}/mod.rs", module.name),
                     ],
                 };
-                let child = candidates.into_iter().find(|candidate| files.contains(candidate));
+                let child = candidates.into_iter().find(|candidate| self.files.contains(candidate));
                 if let Some(child) = child
-                    && seen.insert(child.clone())
+                    && self.seen.insert(child.clone())
                 {
                     queue.push_back((child, false, test_only || module.test_only));
                 }
@@ -2690,6 +2716,26 @@ mod tests {
         );
         files.insert("crates/task/extra/more.rs", declared);
         files.insert("crates/task/src/kinds/deeper/mod.rs", format!("\n{declared}"));
+        assert_eq!(
+            run(&ws, &files),
+            [at("crates/task/extra/more.rs", 2), at("crates/task/src/kinds/deeper/mod.rs", 3)]
+        );
+        // A module declared inside an inline one is not placed by the scan, so its file is read
+        // as shipped, wherever it sits under `src/`; outside `src/` it is not read at all.
+        files.insert("crates/task/src/lib.rs", "mod kinds;\nmod outer {\n    mod inner;\n}\n");
+        files.insert("crates/task/src/outer/inner.rs", declared);
+        files.insert("crates/task/src/orphan.rs", declared);
+        assert_eq!(
+            run(&ws, &files),
+            [
+                at("crates/task/extra/more.rs", 2),
+                at("crates/task/src/kinds/deeper/mod.rs", 3),
+                at("crates/task/src/orphan.rs", 2),
+                at("crates/task/src/outer/inner.rs", 2),
+            ]
+        );
+        files.insert("crates/task/src/orphan.rs", format!("#![cfg(test)]\n{declared}"));
+        files.insert("crates/task/src/outer/inner.rs", "");
         assert_eq!(
             run(&ws, &files),
             [at("crates/task/extra/more.rs", 2), at("crates/task/src/kinds/deeper/mod.rs", 3)]

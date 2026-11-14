@@ -127,7 +127,9 @@ on, and a listed feature the crate does not declare are findings.
   Shipped code is read from each crate root under `src/`, through every out-of-line `mod`,
   by `#[path]` or the file layout; an item under a `cfg` that holds only for `test` or a
   `[dev_only_features]` feature (or one that turns it on) is skipped, as are `tests/`,
-  `benches/` and `examples/`. The scan reads tokens: an impl a macro writes is not seen, nor
+  `benches/` and `examples/`. A file under `src/` that no `mod` is seen to reach (one
+  declared inside an inline module, say) is read as shipped, unless its own inner `cfg`
+  says otherwise. The scan reads tokens: an impl a macro writes is not seen, nor
   one of the trait imported under another name, and an `impl SimulationAsset for` header in a
   `macro_rules!` body is reported as if it were an impl.
 - No cargo configuration file has an `include` key, and no `.cargo` directory or cargo
