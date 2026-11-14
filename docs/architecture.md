@@ -791,10 +791,13 @@ Section 9.7 gives the capacity model.
   client loads a region whose relevance carries no table `Frozen`, and the region change that
   brings the table makes it `Simulated`. `app` directs these modes from the frames it folds;
   the activation policy of section 9.7 runs on the server alone. A region the server holds
-  `Frozen` with its table published is simulated on the client all the same, and every frame
-  that carries rows of an entity the client predicts there corrects that entity, because a
-  region change carries no mode. A mode in `net-api`'s `RegionChange` is decided before
-  `net`'s packer sends region changes.
+  `Frozen` with its table published is simulated on the client all the same, because
+  `RegionChange` carries no mode, and only a frame that carries rows of an entity the client
+  predicts there corrects that entity. The server sends a claimed entity whole on each update,
+  changed or not (reconciliation, below), so each update corrects it while the server holds
+  the region `Frozen`; a sender of changed rows alone would leave it uncorrected until the
+  next full frame, since a `Frozen` region changes none. A mode variant is a `net-api` change,
+  decided before `net`'s packer sends region changes.
 - Systems declare the worlds they run in (section 6.1). The prediction world injects a
   predicted-only filter; game code never writes it. The local player exists in both client
   worlds, and the prediction world's copy shadows the replicated one for extract and the
