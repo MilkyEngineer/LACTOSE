@@ -1098,13 +1098,16 @@ fn run_edit_to_playing(
     found.push(("slower_median_s".to_owned(), format!("{slower:.2}")));
     let gib = dir_size(&dir.join("target")) as f64 / f64::from(1 << 30);
     found.push(("copy_target_gib".to_owned(), format!("{gib:.1}")));
-    let ran = format!(
-        "{} in a detached worktree of `HEAD` at `{COPY_DIR}/tree` under the target directory: \
-         one warm build before each site, then {EDITS_PER_SITE} one-line edits there, each timed \
-         from its save to the report line",
-        shell_line(&[], "cargo", &args),
-    );
+    let ran = shell_line(&[], "cargo", &args);
     let mut header = header(options, machine, m, "dev", default_workers(machine), ran, load);
+    header.notes.push((
+        "Loop".to_owned(),
+        format!(
+            "in a detached worktree of `HEAD` at `{COPY_DIR}/tree` under the target directory: \
+             one warm build before each site, then {EDITS_PER_SITE} one-line edits there, each \
+             timed from its save to the report line"
+        ),
+    ));
     for site in &SITES {
         header.notes.push((
             format!("Edit `{}`", site.name),
