@@ -1990,7 +1990,7 @@ struct ClientEnd {
     ran: u32,
     /// The prediction world's hash and the player's `Hop` at the tick each frame ended on,
     /// compared with the server's as it passes that tick.
-    predicted: BTreeMap<Tick, (u64, Option<u32>)>,
+    predicted: BTreeMap<Tick, (u64, u32)>,
 }
 
 impl ClientEnd {
@@ -2174,7 +2174,7 @@ fn run(
         {
             outcome.compared += 1;
             outcome.agreed += u64::from(hash == server_hash);
-            outcome.hop_agreed += u64::from(predicted_hop == hop);
+            outcome.hop_agreed += u64::from(Some(predicted_hop) == hop);
             end.predicted.retain(|&predicted, _| predicted.0 > tick.0);
         }
         server = Some(current);
@@ -2372,8 +2372,11 @@ fn client_frame(
             end.predicted.retain(|predicted, _| predicted.0 < oldest);
         }
     }
-    let hop = hop_of(client.predictor().simulation().world());
-    end.predicted.insert(tick, (client.hash()?, hop));
+    // Compared from the first frame whose world holds the player: the join's full frame is
+    // folded a frame after the join.
+    if let Some(hop) = hop_of(client.predictor().simulation().world()) {
+        end.predicted.insert(tick, (client.hash()?, hop));
+    }
     if n.is_multiple_of(30) {
         let ring = client.predictor().ring().bytes();
         let ring_bytes = &mut outcome.ring_bytes;
@@ -2443,6 +2446,11 @@ fn check_outcome(plan: Plan, outcome: &Outcome) {
     // `Stage::Post` and the steering that spends it.
     let cycles = (plan.ticks + CYCLE - 120) / CYCLE;
     assert_eq!(outcome.hop_pending, cycles, "the carrier fires once a cycle");
+    // The carrier, written after the step and read by the next tick's steering, is
+    // reconciled like any other column: the prediction world's agrees with the server's at
+    // every tick compared.
+    assert!(outcome.compared > 0);
+    assert_eq!(outcome.hop_agreed, outcome.compared, "the predicted carrier is the server's");
     let stalls = plan.clock == ClockScript::Drifting && plan.ticks >= STALL.end + 60;
     if stalls {
         assert!(
