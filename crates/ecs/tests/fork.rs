@@ -19,8 +19,9 @@ use lactose_ecs::{
 };
 use lactose_task::{ChaosConfig, Executor};
 
-/// Rows per world; few under Miri, which runs every interleaving slowly.
-const ROWS: u64 = if cfg!(miri) { 24 } else { 600 };
+/// Rows per world; few under Miri, which runs every interleaving slowly. Off Miri, more
+/// than two chunks of the production layout, so its nodes have units to split.
+const ROWS: u64 = if cfg!(miri) { 24 } else { 3_000 };
 const TICKS: u32 = 3;
 const TARGET: u64 = 1;
 
@@ -106,8 +107,8 @@ fn nodes_on_several_workers(log: &[u8]) -> usize {
     reason = "test code outside the step: the log shows the run was split, never what it computed"
 )]
 fn each_unit_runs_once_under_forced_splits() {
-    let mut split_nodes = 0;
     for layout in fork_layouts() {
+        let mut split_nodes = 0;
         for (name, executor) in executors() {
             let mut world = world(WorldKind::Server, layout);
             for id in 1..=ROWS {
@@ -132,10 +133,13 @@ fn each_unit_runs_once_under_forced_splits() {
                 split_nodes += nodes_on_several_workers(log.as_bytes());
             }
         }
+        // Summed over the chaos seeds, so a loaded machine that leaves one run on one
+        // worker does not fail it. Under Miri the production layout holds every row in one
+        // chunk, so only the split layout can split.
+        if !cfg!(miri) || layout.chunk_rows.is_some() {
+            assert!(split_nodes > 0, "no node's units ran on two workers: {layout:?}");
+        }
     }
-    // Summed over every chaos run, so a loaded machine that leaves one run on one worker
-    // does not fail it.
-    assert!(split_nodes > 0, "no node's units ran on two workers");
 }
 
 // ---- The order D117 fixes ----
