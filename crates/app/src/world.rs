@@ -58,7 +58,9 @@ pub enum Start {
     /// (`Server::kept`), from which the first step loads every one under `Directed`, and
     /// under `Anchored` the pinned ones, the lifecycle's `Load` requests bringing the
     /// others back as players join, so no saved region is lost; every player joins again
-    /// through `sessions` (`README.md`, "Saves and loads"). `build_server` lists how
-    /// such a start fails.
+    /// through `sessions` (`README.md`, "Saves and loads"). From the lane `binds-impl` on
+    /// (D142; a facade until then) the saved world's binds go into the builder too, read
+    /// from the records of every saved region, so the world holds them before any region
+    /// loads. `build_server` lists how such a start fails.
     Loaded(SavedWorld),
 }

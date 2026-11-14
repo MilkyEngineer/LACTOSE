@@ -27,6 +27,11 @@ and never restates: what they say about runs, the sync point, the pacer, the pre
 loop, staged frames and the fold, the container, the atomic replace, the solver pool and
 the registration functions holds here unchanged.
 
+**The additions of D142 are a facade** until the lane `binds-impl` implements them: no
+signature of this crate changes, `build_server` and `load` do not yet do what the bullet
+"Binds" under "Saves and loads" states, every sentence below that is not yet true is
+marked "(D142; facade)", and "Proof for D142" names the tests that will hold them.
+
 Amending a signature is allowed in the change that needs it. Say so in the change
 description and list what changed, because `app-headless`, the milestone 1 netcode spike,
 the SOUR test of the assembly and, from milestone 4, `app-client`, `app-server` and `net`
@@ -71,7 +76,7 @@ the last frame's steps started from inside `Client`.
 | | Pace by its own round-trip estimate until `net` computes one | `Client::clock` with a `ClockEstimate` it fills by hand |
 | Game crates (milestone 5; the sketches now) | Register once and be built into every world kind, with no code of theirs running before `main` and nothing a dev-profile restart cannot redo | `CrateRegistration` as a `static` of function pointers; `Game::crates` in call order; `Game::sessions` for the player's entity |
 | | Order their own sets against another crate's, the engine's included, without owning a stage list | `Game::order`; a game crate names `lactose_input::sets::APPLY`, `lactose_physics_api::sets::WRITE_BACK` and `lactose_anim::sets::ADVANCE` directly, since it depends on those crates |
-| `persist` | Its pure calls placed on threads: one diff per exported region and one encode per region on background workers, the assembly once they resolve; the loader run before any world exists with the registry the world will have; the records' baseline by hash; the records of an unloaded region kept until it loads again | `Server::save_point`, `Server::encode_save`, `load`, `Cooked::baseline`, `Server::baseline`, `Server::kept` |
+| `persist` | Its pure calls placed on threads: one diff per exported region and one encode per region on background workers, the assembly once they resolve; the loader run before any world exists with the registry the world will have; the records' baseline by hash; the records of an unloaded region kept until it loads again; the saved world's binds read from every region's records and given to the builder before any region loads (D142; facade) | `Server::save_point`, `Server::encode_save`, `load`, `Cooked::baseline`, `Server::baseline`, `Server::kept`, `build_server` with `Start::Loaded` |
 | `io` | The pool started once by `app` with the binary's platform, the save directory created at startup, the slot written as one `Io::replace`, the pool shut down before the executor | `Headless::{start, save, shutdown}`; "Saves and loads" below |
 | The store's driver (`asset` at milestone 3, `net` at milestone 4) | Every `Load` the lifecycle issues, told which ones the server answers itself; the region's table resolvable for either; a `Release` when a region's export is in the store | `StepOutput::requests`, `FrameOutput::requests`, `Server::kept`; "Saves and loads" below |
 | `asset` (milestone 3) | A stand-in with the store's shape, replaced by its traits with a listed signature change | `Cooked`; "Not in this crate yet" |
@@ -530,6 +535,27 @@ root")
   this crate yet". `TickInput::loaded` is keyed by region, so there is no order between
   the server's bundle and the frame's and no second bundle for the sync point to refuse:
   one bundle goes in, and this rule says which.
+- Binds (D142; facade). A server built `Start::Loaded` starts with the saved world's
+  binds. `build_server` reads them with `Loader::binds` over the records of every saved
+  region, the ones it queues for the first step and the ones that stay in the store
+  alike, and hands them to `SimulationBuilder::binds` beside the saved tick and counter,
+  so the world holds the bind of every saved entity with a predicted origin before any
+  region loads. A save writes an owner as its `NetId`, and a region loads to the bytes
+  its export read only in a world that holds its owners' binds: without them a row whose
+  owner resides in a region left in the store loads under the owner's `Net` key, where
+  the server that saved holds its predicted origin, and the resumed world hashes apart
+  from the one never saved until a player comes near enough for that region to load,
+  which is the normal resume under `Anchored` (`crates/persist/README.md`, "Binds";
+  `crates/sim/README.md`, "Saves and loads"). `load` makes the same call over the
+  sections it decoded, once migrated, and drops the result: a save whose sections bind one
+  prediction key to two `NetId`s fails there with `InvalidData`, before any world exists,
+  and a `SavedWorld` that a save point produced takes the same path at `build_server`,
+  which fails as `Loader::binds` or the builder does. Nothing else changes. A save
+  point's `SavedWorld` already holds every region the world has a bind for, loaded or
+  kept, so its binds need no field; the store answers a `Load` as before, and the world,
+  which held the owner's bind all along, loads the row under its origin. The journal
+  tooling records the same value at a checkpoint, `Loader::binds` over
+  `Server::save_point`'s regions, as `lactose_sim::journal::Journal::binds`.
 - `Server::save_point` is `Simulation::save_point`, by value, then one
   `WorkerClass::Background` task per exported region running
   `RegionRecords::from_export(&export, &baseline, &schemas)` with the region's
@@ -542,7 +568,9 @@ root")
 - `Server::encode_save(executor, saved)` first runs `Container::check_sections` over the
   header and every region's records on the calling thread, since `assemble` never reads
   the records: a save the next start's `load` would refuse (a runtime `NetId` at or above
-  the counter, which a direct `World::spawn` on a server world can leave; one entity held
+  the counter, which a direct `World::spawn` on a server world can leave until the lane
+  `binds-impl`, after which the world keeps its counter above every runtime `NetId` it is
+  given, D142, facade; one entity held
   by two regions) fails there with no task spawned. Then it spawns one
   `WorkerClass::Background` task per region of `saved.regions`, each
   `records.encode_section()`, and once every task resolved,
@@ -577,7 +605,9 @@ root")
   region order `Loader::bundle(&records, baseline, RegionMode::Frozen, None)` to validate
   the section (the bundle is dropped), and `Loader::migrate(&records)` as the entry's
   records, so a save that cannot load fails at load and a kept region is re-saved at the
-  registry's schemas without a reload between.
+  registry's schemas without a reload between. Then, from the lane `binds-impl` on,
+  `Loader::binds` over the migrated records of every section, its result dropped ("Binds"
+  above; D142; facade).
   The first error ends the load with nothing built and nothing to undo. The result's
   `tick` and `next_net_id` are the builder's; its `regions` are the store's. A save
   carries no session state, so every player joins again through `TickInput::sessions`,
@@ -648,7 +678,15 @@ root")
 
 - A reset of a kept region to its cooked state (`Server::forget(region)`), and a reload of
   a kept region under `Directed` by name rather than by a frame's `loaded` entry: neither
-  is needed by the headless app or the spike.
+  is needed by the headless app or the spike. A reset must also drop the binds of the
+  entities it forgets, which the world keeps as it keeps an unloaded entity's, and the
+  ECS has no call for that yet; the same is owed to a region a frame replaces under
+  `Directed` with a state that lacks one of its entities (D142,
+  `docs/verification.md`).
+- The journal's writer, reader and replay driver (`crates/sim/README.md`, "Journal
+  replay"). What the writer takes from a server at a checkpoint is already here:
+  `Server::save_point` for the regions and, through `Loader::binds` over them, the binds
+  (D142).
 - The reason of a resync in `ClientOutput` (clock or content), so the caller can send
   `ResyncReason::AssetFailure` for a content resync: the spike sends `BehindCatchUp` for
   every resync at milestone 1.
@@ -687,6 +725,18 @@ root")
 - An edge against the replication gather: `net::gather` is in no `SystemSet`, so a game's
   exclusive `Pass::Gather` system cannot be ordered against it with `Registration::order`
   until `net-api` names a set; no game crate has one at milestone 1.
+
+## Proof for D142
+
+A facade: none of these tests exists yet. Each row is a test the lane `binds-impl` adds to
+`tests/proof/`, by the name given, and the sentence it holds.
+
+| Test | What it holds | File |
+|---|---|---|
+| `a_resume_that_keeps_a_predicted_owners_region_matches_the_world_never_saved` | Under `Anchored`, with a pinned region A and a region B that no player is near: a bound entity with a predicted origin in B owns a row of A, and B has unloaded into the store. `save_point`, `encode_save`, `load`, `Start::Loaded`. The resumed server holds the owner's bind before its first step, loads A at the first step with the row's `OwnedBy` the predicted origin, and equals the server that was never saved in hash and counter at each of K ticks, B staying in the store of both; a `Join` near B then loads it from the store in both and they stay equal. The same through a `SavedWorld` with no file. With the builder's binds taken out the resumed server differs at its first tick, which is the failure the test names | `store.rs` |
+| `the_binds_of_a_save_point_are_the_stores_and_the_worlds` | `Loader::binds` over a save point's regions holds the bind of an entity in a loaded region and of one in a kept region, and nothing else; after the step that despawns one, neither the world nor the next save point holds its bind | `store.rs` |
+| `a_save_whose_sections_bind_one_origin_twice_fails_at_load` | A splice of two sections that each spawn an entity with one predicted origin under two `NetId`s: `load` is `InvalidData` naming the key, both `NetId`s and both regions, with nothing built; `build_server` given the same regions as a `SavedWorld` fails the same way | `cross_section.rs` |
+| `a_direct_runtime_spawn_above_the_counter_saves_and_loads` | Replaces `a_direct_runtime_spawn_above_the_counter_fails_the_encode_and_the_last_save_stays`, which pins the behaviour D142 ends: the save encodes, its header's counter is above the spawned `NetId`, and it loads to a server whose next allocation is not that `NetId` | `cross_section.rs` |
 
 ## Proof for milestone 1
 

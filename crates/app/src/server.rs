@@ -88,7 +88,12 @@ impl From<Box<Failed>> for ServerError {
 /// under `Anchored` each saved pinned region is queued the same way in
 /// `RegionMode::Frozen`, with its table required, so it loads at the first step as it
 /// would have stepped on unsaved, and the lifecycle's `Load` requests bring the others
-/// back as players join (`README.md`, "Saves and loads"). Fails as the builder fails (a
+/// back as players join (`README.md`, "Saves and loads"). From the lane `binds-impl` on
+/// (D142; a facade until then), a `Loaded` start also puts the saved world's binds into the
+/// builder, `Loader::binds` over the records of every saved region, queued or kept, so the
+/// world holds the bind of every saved entity with a predicted origin before any region
+/// loads and a row owned from a region left in the store loads to the bytes the save's
+/// export read; the build then fails as `Loader::binds` fails too. Fails as the builder fails (a
 /// registration or setup error carries its crate's name; `log_retention` below the cap is
 /// `InvalidData`), as the solver pool fails, as `Cooked::pin` fails or `Loader::bundle`
 /// fails for a region queued here, and, when `start` is `Loaded` and `config.regions` is

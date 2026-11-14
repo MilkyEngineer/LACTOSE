@@ -6,6 +6,7 @@
 #![forbid(unsafe_code)]
 #![allow(dead_code, unused_variables, missing_docs)]
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use lactose_core::{NetId, PlayerId, PredictionKey, Result, StableKey, Tick};
@@ -319,10 +320,17 @@ fn load_from_save(save: &SavePoint, baseline: Arc<lactose_bundle::Baseline>) -> 
     frame
 }
 
-fn rebuild(save: &SavePoint, types: TypeTable) -> Result<Simulation> {
+/// `binds` are the saved world's, which `persist` reads from the records of every saved
+/// region, loaded or kept, so the world holds them before its first region loads (D142).
+fn rebuild(
+    save: &SavePoint,
+    binds: BTreeMap<PredictionKey, NetId>,
+    types: TypeTable,
+) -> Result<Simulation> {
     SimulationBuilder::new(WorldKind::Server, types)
         .tick(save.tick)
         .next_net_id(save.next_net_id)
+        .binds(binds)
         .build()
 }
 

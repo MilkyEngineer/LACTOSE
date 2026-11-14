@@ -347,6 +347,22 @@ What a system is, from its parameters (`SystemParam` has the table):
   not a death: the aliases of its predicted entities stay, so what they own elsewhere still
   exports and a reload finds them. `allocate_net_id` passes over a runtime `NetId` that a
   live entity or a bind already holds, such as one spawned directly with its key.
+- The counter stays above every runtime `NetId` the world is given (D142; a facade until
+  the lane `binds-impl`: until then the counter moves only at an allocation, which passes
+  over an ID in use as the bullet above says, and hands out again the ID of an entity
+  spawned directly above it once that entity is gone). `allocate_net_id` hands out the
+  counter's value and moves it on. A runtime `NetId` that enters the world any other way,
+  as the key of a direct `spawn` or `spawn_erased`, as a row of a `load_region` document,
+  or as the `NetId` of a `bind` (a load's among them), moves the counter to one past it
+  when the counter is not already above it; a refused spawn, load or bind moves nothing,
+  and a cooked `NetId` never does. There is no switch on the kind. What it buys is a
+  `Server` world's, the one kind that allocates and exports: `next_net_id` is above the
+  runtime `NetId` of every live entity and of every bind, so an allocation never returns
+  an ID in use, nor one that an entity now unloaded or despawned was given, and the
+  world's own export never fails the counter rule of
+  `lactose_persist::Container::check_sections`, whose header takes `next_net_id`. A
+  `restore` puts the counter back as snapshotted while the binds stay, which matters to
+  nothing: only a `Server` world allocates, and it never restores.
 - `InRegion` and `PredictedOrigin` are the world's: read-only through every path.
   `ClaimedBy` is written by `net` and `predict` on join and removed to release the claim.
   `OwnedBy` is a relationship (the two bullets below). `ClaimedBy` and `InRegion` are not
@@ -391,9 +407,17 @@ What a system is, from its parameters (`SystemParam` has the table):
   moved and follows its owner from the next `move_to_region` or `despawn` on (architecture
   section 6, D12), so an entity given to an owner in another region stays where it is until
   that owner moves, and an owner's region may unload while what it owns stays loaded.
-  `OwnedBy` is then a weak cross-region reference like any `EntityRef` field: `World::get`
-  on the owner is `None`, the export writes the owner's `NetId` and a reload in either
-  region order restores it, and `owned_by` finds the entity again once the owner is live.
+  `OwnedBy` is then a weak cross-region reference, and the one reference an export does
+  not write as stored: `World::get` on the owner is `None`; the export writes the owner's
+  `NetId`, where every other `EntityRef` field is exported as the origin key it holds; a
+  load stores the origin key that `NetId` names, through the keys of the document's own
+  rows or the world's binds, so it stores what the export read only in a world that holds
+  the owner's bind; and `owned_by` finds the entity again once the owner is live. A
+  server started from a save holds every bind of the save before its first region loads
+  (`lactose-sim`'s `SimulationBuilder::binds`, D142, a facade until the lane
+  `binds-impl`), so there a reload in either region order, or of one region alone,
+  restores the owner as stored. A world that loads the row without the owner's bind, as a
+  client may, holds the owner's `Net` key until the bind arrives, when `bind` rewrites it.
   The world therefore accepts no ownership state `lactose_bundle::Overlay::new` refuses (an
   entity its own owner, a cycle among one overlay's records), the format refuses no state
   the world accepts (an owner the overlay destroys, an owner elsewhere or absent), and every
@@ -525,6 +549,11 @@ What a system is, from its parameters (`SystemParam` has the table):
   ascending `NetId` order, the owner beside each row, the seed and the persistent region
   resources; diffing against the baseline into an `Overlay` is `lactose-persist`'s, and the
   world hash is `lactose-sim`'s, over `columns_erased` and `region_resources_erased`.
+  A baseline that carries an `ecs::predicted_origin` column is refused with `InvalidData`
+  and nothing changed, as a document that carries `ecs::in_region` is (D142; a facade
+  until the lane `binds-impl`): a cooked row has no predicted origin, so every bind a
+  load makes comes from a record of its overlay, which is what lets `lactose-persist`
+  read the binds of a save from its sections alone.
 - A transient component is not saved, but its presence is part of the entity's archetype,
   which its systems and the world hash depend on: `ExportedRow::transient` lists the keys
   of the row's transient components, `lactose-persist` encodes their presence as the
@@ -541,6 +570,13 @@ What a system is, from its parameters (`SystemParam` has the table):
   `bind` and `restore` rewrite their references as they do rows', so the stored bytes do not
   depend on the order of an insert and a bind. References in resources are not in the
   reverse index and may dangle.
+- A reflected world resource is another matter. The world stores it as the typed value
+  and hands it out by `&mut` (`resource_mut`, `ResMut`), so it cannot keep a world
+  resource's references as origin keys: `insert_resource` stores the value as given,
+  `bind` rewrites nothing in it, and `restore` puts the snapshot's value back as it was.
+  No world resource may therefore hold an entity reference; `lactose-sim` refuses one at
+  build (D142; a facade until the lane `binds-impl`), and state that names an entity is
+  a component or a region resource.
 
 **Erased row access**
 
@@ -579,6 +615,17 @@ What a system is, from its parameters (`SystemParam` has the table):
 - The overload ladder's decimation of non-player systems in the outer activation ring
   (architecture section 9.7) and `ordered` or per-region reductions (section 5.2) are
   additive attribute flags, added when milestone 1 or 4 needs them (`docs/verification.md`).
+
+## Proof for D142
+
+A facade: none of these tests exists yet, and no signature of this crate changes. Each row
+is a test the lane `binds-impl` adds, by the name given, and the sentence it holds.
+
+| Test | What it holds | File |
+|---|---|---|
+| `a_runtime_net_id_given_directly_moves_the_counter_past_it` | By `spawn`, `spawn_erased`, `bind` and `load_region` (a document's row, and the bind of a row that carries a predicted origin), in a `Server`, a `Client` and a `Prediction` world, under every layout: `next_net_id` is one past the `NetId` when it was not above it and unchanged when it was; a cooked `NetId` and a refused spawn, bind or load move nothing. The next allocation is the counter's value and never an ID in use; after the entity is despawned, or its region unloaded, its `NetId` is not handed out again. `export_region` of the `Server` world gives rows whose runtime `NetId`s are all below `next_net_id` | `binds.rs` |
+| `a_restore_puts_the_counter_back_and_keeps_the_binds` | A `Prediction` world: a bind made after a snapshot moved the counter; the restore returns the counter to the snapshot's value and the bind stays | `binds.rs` |
+| `a_baseline_that_carries_a_predicted_origin_is_refused` | `load_region` of a baseline with an `ecs::predicted_origin` column is `InvalidData` and leaves no row, no bind and no log entry; the same origin carried by a `Spawn` record of the overlay loads and binds | `bulk.rs` |
 
 ## Proof for milestone 0
 

@@ -165,8 +165,10 @@ fn browse(file: &[u8]) -> Result<(Tick, usize)> {
     Ok((index.header.tick, index.regions.len()))
 }
 
-/// A fresh process: the header into the builder, every region's bundle into the first
-/// frame, every player joining again (a save carries no session state).
+/// A fresh process: the header and the save's binds into the builder, every region's
+/// bundle into the first frame, every player joining again (a save carries no session
+/// state). The binds are read from every section, also those of regions a frame loads
+/// later or never, so the world holds them before its first region loads (D142).
 fn load_fresh(
     executor: &Executor,
     bytes: &[u8],
@@ -176,11 +178,15 @@ fn load_fresh(
 ) -> Result<Simulation> {
     let container = Container::decode(bytes)?;
     let header = container.header();
+    let loader = Loader::new(&context.schemas, &context.migrations);
+    let sections: Vec<RegionRecords> =
+        container.regions().map(|records| loader.migrate(records)).collect::<Result<_>>()?;
     let mut types = TypeTable::new();
     register_types(&mut types)?;
     let simulation = SimulationBuilder::new(WorldKind::Server, types)
         .tick(header.tick)
         .next_net_id(header.next_net_id)
+        .binds(loader.binds(&sections)?)
         .build()?;
     let frame = TickInput {
         loaded: bundles(&container, context, tables)?,

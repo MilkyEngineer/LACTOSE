@@ -6,10 +6,10 @@ use core::future::Future;
 use core::num::NonZeroU64;
 use core::pin::Pin;
 use core::task::{Context, Poll};
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
 
-use lactose_core::{Error, ErrorKind, Result, Tick, xxh64};
+use lactose_core::{Error, ErrorKind, NetId, PredictionKey, Result, Tick, xxh64};
 use lactose_ecs::{
     Executor, LayoutConfig, LogCursor, RegionId, Schedule, ScheduleError, SystemDescriptor, World,
     WorldBuilder, WorldKind,
@@ -40,7 +40,7 @@ type Run<'a, T> = Pin<Box<dyn Future<Output = core::result::Result<T, RunError>>
 
 /// Builds a [`Simulation`].
 ///
-/// Defaults: the production layout, tick zero, a fresh `NetId` counter,
+/// Defaults: the production layout, tick zero, a fresh `NetId` counter, no binds,
 /// [`RegionControl::Directed`], a policy of activation radius 1, streaming radius 2 and
 /// release radius 3, a structural-log retention of
 /// [`DEFAULT_LOG_RETENTION`](Self::DEFAULT_LOG_RETENTION) ticks, no setup, registration or
@@ -112,6 +112,38 @@ impl SimulationBuilder {
         self
     }
 
+    /// The binds the world starts with (architecture section 7): at [`build`](Self::build)
+    /// every pair is bound with [`World::bind`], in ascending prediction-key order, as soon
+    /// as the world exists and before anything is inserted into it, so the world holds
+    /// them before its first region loads.
+    ///
+    /// On a load these are the binds of the saved world: one for every entity of every
+    /// saved region, loaded or kept, that has a predicted origin, read from the regions'
+    /// records (`lactose_persist::Loader::binds`); a replay from a checkpoint passes
+    /// [`Journal::binds`](crate::journal::Journal::binds). A save writes an owner as its
+    /// `NetId`, and a load stores the origin key that `NetId` names in the world it loads
+    /// into. Without the owner's bind that is the `Net` key, where the world that saved
+    /// holds the predicted origin, and the two hash apart until the owner's region loads;
+    /// and a `Server` world refuses a direct write of an owner that is a predicted origin
+    /// with no bind (D141), which the world that saved accepts. With the binds restored
+    /// first, a load stores the bytes the export read, whichever regions load and in
+    /// whatever order (D142; the README, "Saves and loads").
+    ///
+    /// The default is none: a fresh server, and a client's worlds, which learn their binds
+    /// from the stream. A second call replaces the first. A bound entity need not be live,
+    /// nor ever load: the bind stays as an unloaded entity's does, and the load of its
+    /// region finds it and binds nothing new. Two prediction keys that name one `NetId`
+    /// fail [`build`](Self::build) with `InvalidData`, as [`World::bind`] refuses the
+    /// second; one prediction key under two `NetId`s cannot be written, the binds being a
+    /// map. A bound runtime `NetId` at or above the builder's counter moves the world's
+    /// counter past it, as any bind does (`crates/ecs/README.md`, Regions); the binds of a
+    /// save are all below the save's counter.
+    #[must_use]
+    #[expect(unused_variables, reason = "facade (D142): the lane `binds-impl` writes the body")]
+    pub fn binds(self, binds: BTreeMap<PredictionKey, NetId>) -> Self {
+        todo!("D142: the lane `binds-impl`")
+    }
+
     /// Who decides loads and modes. `Anchored` on a world that is not `Server`, with an
     /// empty atlas, or with a pinned region the atlas lacks, fails [`build`](Self::build)
     /// with `InvalidData`.
@@ -159,7 +191,11 @@ impl SimulationBuilder {
     /// [`ScheduleError::MissingResource`](lactose_ecs::ScheduleError::MissingResource)
     /// otherwise. A world resource inserted here is configuration or session state and
     /// so `derived`; `build` refuses any other policy among the resource types the
-    /// [`TypeTable`] knows (the README says why and what the check does not cover).
+    /// [`TypeTable`] knows (the README says why and what the check does not cover). It
+    /// holds no entity reference either: the world rewrites the references of rows and
+    /// region resources at a bind and at a restore, never a world resource's, so `build`
+    /// refuses a world resource whose type holds an `EntityRef` at any depth, with the
+    /// same coverage (D142; a facade until the lane `binds-impl`).
     #[must_use]
     pub fn setup(mut self, f: impl FnOnce(&mut World) -> Result<()> + Send + 'static) -> Self {
         self.setups.push(Box::new(f));
@@ -221,12 +257,14 @@ impl SimulationBuilder {
         self
     }
 
-    /// Builds the world with the registry, the layout, the tick and the counter; inserts
-    /// this crate's resources ([`TickDelta`](crate::TickDelta),
+    /// Builds the world with the registry, the layout, the tick and the counter; binds
+    /// the builder's [`binds`](Self::binds) (D142; a facade until the lane `binds-impl`);
+    /// inserts this crate's resources ([`TickDelta`](crate::TickDelta),
     /// [`CurrentTick`](crate::CurrentTick), [`TimeScale`](crate::TimeScale) at
     /// `REAL_TIME`, [`RegionPolicy`]) and services (the three hooks, the lifecycle, the
     /// frame and save slots); runs every setup function in order, then checks that no world
-    /// resource of a registered type whose policy is not `derived` is present; runs every
+    /// resource of a registered type is present whose policy is not `derived` or, from the
+    /// lane `binds-impl` on, whose type holds an entity reference (D142); runs every
     /// registration function in order, then every check function; builds the tick
     /// schedule, the pass schedules and
     /// the save pass with the orders their sets belong to; and prepares each against the
@@ -236,7 +274,8 @@ impl SimulationBuilder {
     /// Fails with `InvalidData` as the setters say, as a setup function does, as
     /// [`WorldBuilder::build`](lactose_ecs::WorldBuilder::build) does, for a non-`derived`
     /// world resource, and for a schedule that does not build or prepare; and with a check
-    /// function's error.
+    /// function's error. From the lane `binds-impl` on, also with `InvalidData` for binds
+    /// [`World::bind`] refuses and for a world resource that holds an entity reference.
     pub fn build(self) -> Result<Simulation> {
         let invalid = |message: &'static str| Err(Error::new(ErrorKind::InvalidData, message));
         let policy = self.policy;
@@ -699,7 +738,10 @@ impl Future for SavePointRun<'_> {
 /// [`SimulationBuilder::next_net_id`] and, region by region through
 /// [`TickInput::loaded`](crate::TickInput::loaded), on a load. World resources are not in
 /// it: they are configuration or session state, never saved. Nor is session state: a save
-/// carries no players, held joins or requests, so on a load every player joins again.
+/// carries no players, held joins or requests, so on a load every player joins again. Nor
+/// are the binds a load restores first ([`SimulationBuilder::binds`]): they are in the
+/// records, as the `PredictedOrigin` of each bound entity, in these regions and in the
+/// regions that were not loaded when the copy was taken, which this copy does not hold.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct SavePoint {
     /// The tick the copy was taken at.
