@@ -23,6 +23,9 @@ lactose-persist.workspace = true
 lactose-reflect.workspace = true
 # The frame the game feeds and the registration types.
 lactose-sim.workspace = true
+# The subscriber that writes every event at `info` and above to stderr (architecture
+# section 3, "traced from day one").
+tracing-subscriber.workspace = true
 
 [lints]
 workspace = true

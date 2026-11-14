@@ -1,23 +1,25 @@
 //! "The frame", "Time scale, server", "Refusals", "Relevance" and the policy's `Stop`
 //! reaching a run's `Result`: the server's timer root over a stand-in clock.
 
-use std::sync::{Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Instant;
 
-use lactose_app::{Cooked as _, FrameOutput, Server, Start, WorldConfig};
+use lactose_app::{
+    Cooked, CrateRegistration, FrameOutput, Game, Server, Start, WorldConfig, build_server,
+};
 use lactose_asset_api::{AssetFailure, AssetId, PinnedTable};
-use lactose_core::{ErrorKind, PlayerId, Tick};
-use lactose_ecs::{Executor, RegionId, RegionMode};
-use lactose_sim::{SessionEvent, TickInput, TimeScale};
+use lactose_core::{Error, ErrorKind, PlayerId, Result, Tick};
+use lactose_ecs::{Executor, RegionId, RegionMode, World};
+use lactose_sim::{Registration, SessionApplier, SessionEvent, TickInput, TimeScale, TypeTable};
 
 use crate::common::{
-    Clock, Content, anchored, executor, frame, load, mirror, passes, scales, server, session, step,
-    table_of,
+    Clock, Content, Counter, anchored, executor, frame, load, mirror, passes, scales, server,
+    session, step, table_of,
 };
 
 /// A server of the proof's game, its pacer resynced at the clock's base, so a frame at
 /// `clock.at(n)` owes exactly `n` periods at the scale it paces by.
-fn timed(executor: &Executor, content: &std::sync::Arc<Content>, clock: Clock) -> Server {
+fn timed(executor: &Executor, content: &Arc<Content>, clock: Clock) -> Server {
     let mut server = server(executor, WorldConfig::headless(), Start::Fresh, content);
     server.resync(clock.at(0));
     server
@@ -299,6 +301,65 @@ fn fifty_pause_cycles_drift_by_at_most_one_tick_per_pause() {
     executor.shutdown();
 }
 
+/// A pause carried by `step` on a new server, whose pacer owes its first tick: the next
+/// frame runs no tick.
+#[test]
+fn a_pause_carried_by_step_leaves_the_next_frame_no_tick() {
+    let executor = executor(2);
+    let content = Content::new();
+    let clock = Clock::new();
+    let mut server = server(&executor, WorldConfig::headless(), Start::Fresh, &content);
+    server.set_time_scale(TimeScale::PAUSED);
+    let (server, _) = step(&executor, server, TickInput::default());
+    assert_eq!(mirror(&server), TimeScale::PAUSED);
+    let at = server.tick();
+    let mut each = |_: Tick| Some(TickInput::default());
+    let (server, out) = frame(&executor, server, clock.at(1), &mut each);
+    assert_eq!(out.ticks, 0, "a paused world ran a tick");
+    assert_eq!(server.tick(), at);
+    server.shutdown();
+    executor.shutdown();
+}
+
+/// A pause carried in a frame that is behind: what the frame still owed is not paid after
+/// it.
+#[test]
+fn a_pause_in_a_behind_frame_leaves_the_next_frame_no_tick() {
+    let executor = executor(2);
+    let content = Content::new();
+    let clock = Clock::new();
+    let mut server = timed(&executor, &content, clock);
+    server.set_time_scale(TimeScale::PAUSED);
+    let mut each = |_: Tick| Some(TickInput::default());
+    let (server, out) = frame(&executor, server, clock.at(10), &mut each);
+    assert_eq!((out.ticks, out.behind), (1, true));
+    let at = server.tick();
+    let (server, out) = frame(&executor, server, clock.at(11), &mut each);
+    assert_eq!(out.ticks, 0, "a paused world ran {} ticks", out.ticks);
+    assert_eq!(server.tick(), at);
+    server.shutdown();
+    executor.shutdown();
+}
+
+/// A frame owing nothing runs no tick, unless a pause is pending: one tick carries it at
+/// once.
+#[test]
+fn a_pause_on_a_frame_owing_nothing_is_carried_by_one_tick() {
+    let executor = executor(2);
+    let content = Content::new();
+    let clock = Clock::new();
+    let server = timed(&executor, &content, clock);
+    let mut each = |_: Tick| Some(TickInput::default());
+    let (mut server, out) = frame(&executor, server, clock.at(0), &mut each);
+    assert_eq!(out.ticks, 0);
+    server.set_time_scale(TimeScale::PAUSED);
+    let (server, out) = frame(&executor, server, clock.at(0), &mut each);
+    assert_eq!(out.ticks, 1, "the pause is carried by one tick at once");
+    assert_eq!(mirror(&server), TimeScale::PAUSED);
+    server.shutdown();
+    executor.shutdown();
+}
+
 #[test]
 fn refusals_reach_the_step_and_the_frame_output() {
     let executor = executor(2);
@@ -348,6 +409,59 @@ fn a_join_the_sync_point_refuses_is_a_session_failure() {
     assert_eq!(out.failures.sessions[0].error.kind(), ErrorKind::NotFound);
     let (server, out) = step(&executor, server, TickInput::default());
     assert!(out.failures.is_empty());
+    server.shutdown();
+    executor.shutdown();
+}
+
+fn register_types(types: &mut TypeTable) -> Result<()> {
+    types.register::<Counter>()
+}
+
+fn register_systems(_: &mut Registration) {}
+
+static REFUSING: CrateRegistration = CrateRegistration {
+    name: "refusing",
+    types: register_types,
+    setup: None,
+    systems: register_systems,
+    migrations: None,
+};
+
+/// A game whose session applier refuses every event.
+static REFUSING_GAME: Game =
+    Game { name: "refusing", crates: &[REFUSING], order: None, sessions: Some(refusing) };
+
+fn refusing() -> Box<dyn SessionApplier> {
+    Box::new(Refuse)
+}
+
+struct Refuse;
+
+impl SessionApplier for Refuse {
+    fn apply(&mut self, _: &mut World, _: PlayerId, _: SessionEvent) -> Result<()> {
+        Err(Error::new(ErrorKind::InvalidData, "the game refuses every join"))
+    }
+}
+
+/// The game's applier refusing a join is a refusal of the step, not a silent drop: a SOUR
+/// test's `failures.is_empty()` would otherwise pass a run nobody joined.
+#[test]
+fn an_applier_refusal_is_a_session_failure() {
+    let executor = executor(2);
+    let content = Content::new();
+    let cooked = Arc::clone(&content) as Arc<dyn Cooked>;
+    let server =
+        build_server(&executor, &REFUSING_GAME, WorldConfig::headless(), Start::Fresh, cooked)
+            .expect("the server builds");
+    let (server, out) = step(&executor, server, load(&content, [1]));
+    assert!(out.failures.is_empty(), "{out:?}");
+    let (server, out) =
+        step(&executor, server, session(3, SessionEvent::Join { region: RegionId(1) }));
+    assert_eq!(out.failures.sessions.len(), 1, "{out:?}");
+    let failure = &out.failures.sessions[0];
+    assert_eq!((failure.tick, failure.player), (server.tick(), PlayerId(3)));
+    assert_eq!(failure.error.kind(), ErrorKind::InvalidData);
+    assert!(out.failures.loads.is_empty() && out.failures.assets.is_empty());
     server.shutdown();
     executor.shutdown();
 }

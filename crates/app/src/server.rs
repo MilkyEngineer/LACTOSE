@@ -84,8 +84,10 @@ impl From<Box<Failed>> for ServerError {
 /// once. A `Loaded` start puts the saved tick and counter into the builder and every saved
 /// region into the store; under `Directed` each is also queued for the first step, as
 /// `Loader::bundle(&records, baseline, RegionMode::Simulated, table)` with `table` the
-/// region's `Cooked::table` pinned through `Cooked::pin`, or `None`; under `Anchored`
-/// nothing is queued, and the lifecycle's `Load` requests bring the regions back as
+/// region's `Cooked::table` pinned through `Cooked::pin`, or `None` when it has none or
+/// the pin fails (logged at `warn`); under `Anchored` each saved pinned region is queued
+/// the same way in `RegionMode::Frozen`, so it loads at the first step as it would have
+/// stepped on unsaved, and the lifecycle's `Load` requests bring the others back as
 /// players join (`README.md`, "Saves and loads"). Fails as the builder fails (a
 /// registration or setup error carries its crate's name; `log_retention` below the cap is
 /// `InvalidData`), as the solver pool fails, as `Loader::bundle` fails for a region queued
@@ -108,7 +110,7 @@ pub fn build_server(
             RegionControl::Directed => {
                 let loader = Loader::new(&schemas, &migrations);
                 for (&region, entry) in &saved.regions {
-                    let table = pinned_table(&*cooked, region)?;
+                    let table = pinned_table(&*cooked, region);
                     let bundle = loader.bundle(
                         &entry.records,
                         Arc::clone(&entry.baseline),
@@ -118,12 +120,27 @@ pub fn build_server(
                     queued.insert(region, bundle);
                 }
             }
-            RegionControl::Anchored { atlas, .. } => {
+            RegionControl::Anchored { atlas, pinned } => {
                 if let Some(region) = saved.regions.keys().find(|&&r| atlas.cell(r).is_none()) {
                     return Err(Error::new(
                         ErrorKind::InvalidData,
                         format!("the saved region {} is not in the atlas", region.0),
                     ));
+                }
+                // A pinned region runs whenever the server does: a resume that waited for
+                // the lifecycle's request would run it a tick late, and diverge from the
+                // world that was never saved.
+                let loader = Loader::new(&schemas, &migrations);
+                for region in pinned {
+                    let Some(entry) = saved.regions.get(region) else { continue };
+                    let table = pinned_table(&*cooked, *region);
+                    let bundle = loader.bundle(
+                        &entry.records,
+                        Arc::clone(&entry.baseline),
+                        RegionMode::Frozen,
+                        table,
+                    )?;
+                    queued.insert(*region, bundle);
                 }
             }
         }
@@ -155,9 +172,31 @@ pub fn build_server(
     Ok(Server { simulation, core })
 }
 
-/// `region`'s cooked table pinned, or `None` while it has none.
-fn pinned_table(cooked: &dyn Cooked, region: RegionId) -> Result<Option<PinnedTable>> {
-    cooked.table(region).map(|table| cooked.pin(&table)).transpose()
+/// `region`'s cooked table pinned, or `None`, logged at `warn`, while it has none or its pin
+/// fails: the region then loads `Frozen` and waits for `TickInput::assets`, as a table not
+/// yet published is the store's ordinary transient case.
+fn pinned_table(cooked: &dyn Cooked, region: RegionId) -> Option<PinnedTable> {
+    let Some(table) = cooked.table(region) else {
+        warn!(
+            target: LOG_TARGET,
+            region = region.0,
+            "a saved region reloads with no table and waits frozen for one"
+        );
+        return None;
+    };
+    match cooked.pin(&table) {
+        Ok(pinned) => Some(pinned),
+        Err(error) => {
+            warn!(
+                target: LOG_TARGET,
+                region = region.0,
+                kind = ?error.kind(),
+                %error,
+                "a saved region's table cannot be pinned: it reloads with none and waits frozen"
+            );
+            None
+        }
+    }
 }
 
 /// The pacer's scale for `scale`.
@@ -716,20 +755,7 @@ impl Core {
         let saved = self.kept.get(&region).ok_or_else(|| {
             Error::new(ErrorKind::NotFound, format!("region {} is not kept", region.0))
         })?;
-        let assets = match assets {
-            Some(assets) => Some(assets),
-            None => {
-                let table = pinned_table(&*self.cooked, region)?;
-                if table.is_none() {
-                    warn!(
-                        target: LOG_TARGET,
-                        region = region.0,
-                        "a saved region reloads with no table and waits frozen for one"
-                    );
-                }
-                table
-            }
-        };
+        let assets = assets.or_else(|| pinned_table(&*self.cooked, region));
         Loader::new(&self.schemas, &self.migrations).bundle(
             &saved.records,
             Arc::clone(&saved.baseline),
@@ -739,8 +765,9 @@ impl Core {
     }
 
     /// The server's answer to a `Load` of `region`: its bundle queued for the next step if
-    /// it is kept, a refusal at `stepped` if it is kept and cannot be bundled, nothing if
-    /// it is the caller's to answer.
+    /// it is kept, a refusal at `stepped` if it is kept and `Loader::bundle` fails (the
+    /// lifecycle does not ask again: the caller's own entry brings it back), nothing if it
+    /// is the caller's to answer.
     fn answer(&mut self, region: RegionId, stepped: Tick) -> Option<LoadFailure> {
         if !self.kept.contains_key(&region) {
             return None;
@@ -808,7 +835,8 @@ pub struct LifecycleFailures {
     /// the server could not build for a kept region included, as a `LoadFailure` at the
     /// step's tick with `Loader::bundle`'s error.
     pub loads: Vec<LoadFailure>,
-    /// The session events the applier refused (`take_session_failures`).
+    /// The session events the sync point refused (`take_session_failures`): a `Join` for
+    /// a region the atlas lacks, or an event the game's applier failed.
     pub sessions: Vec<SessionFailure>,
     /// The asset failures the frame stamped (`take_asset_failures`).
     pub assets: Vec<AssetFailureEvent>,

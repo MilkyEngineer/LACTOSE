@@ -272,14 +272,15 @@ pub struct LoadFailure {
 }
 
 /// A session event the sync point refused: a `Join` for a region the atlas lacks
-/// (`NotFound`), which is neither held nor applied.
+/// (`NotFound`), which is neither held nor applied, or an event `SessionApplier::apply`
+/// failed, which is skipped.
 #[derive(Debug)]
 pub struct SessionFailure {
     /// The tick whose sync point refused the event.
     pub tick: Tick,
     /// The player.
     pub player: PlayerId,
-    /// Why.
+    /// Why: `NotFound` for the atlas, else the applier's error.
     pub error: Error,
 }
 
@@ -636,6 +637,7 @@ impl RegionLifecycle {
                     %error,
                     "session applier failed: the event is skipped"
                 );
+                self.session_failures.push(SessionFailure { tick, player, error });
             }
         }
     }

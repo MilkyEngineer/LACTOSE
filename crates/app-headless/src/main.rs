@@ -7,12 +7,14 @@
 //! 3.
 //!
 //! Usage: `lactose-app-headless [TICKS] [SLOT]`: `TICKS` (600 by default) ticks, then a save
-//! to the file `SLOT` if one is named, its directory created at start.
+//! to the file `SLOT` if one is named, its directory created at start. Exits 1 with the
+//! error when the policy stops the run, 2 after the report when the save failed.
 
 #![forbid(unsafe_code)]
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use std::process::ExitCode;
 use std::sync::Arc;
 
 use lactose_app::{
@@ -218,12 +220,23 @@ fn install_crash_hook() {
     }));
 }
 
+/// Architecture section 3: every event at `info` and above, the assembly's at target `app`
+/// and the policy's decisions among them, as text on stderr; stdout keeps the report.
+fn install_subscriber() {
+    tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_max_level(tracing_subscriber::filter::LevelFilter::INFO)
+        .init();
+}
+
 /// The run: the executor's defaults, the headless world, `ticks` ticks at tick rate from a
 /// spawned timer root, the report on stdout, an optional save, an orderly shutdown. The
 /// first error is returned, which is the policy's `Stop`; a failed save is logged, as the
-/// policy says, and the run still reports.
-fn main() -> Result<()> {
+/// policy says, the run still reports and shuts down, and the exit status is 2, so a
+/// script sees it.
+fn main() -> Result<ExitCode> {
     install_crash_hook();
+    install_subscriber();
     let Args { ticks, save_to } = Args::parse()?;
     let cooked = Arc::new(InMemory::new(RegionId(1))?);
     let config = HeadlessConfig {
@@ -238,13 +251,17 @@ fn main() -> Result<()> {
         "{} ticks in {} frames ({} behind), hash {:#018x}",
         report.ticks, report.frames, report.behind, report.hash
     );
+    let mut exit = ExitCode::SUCCESS;
     if let Some(slot) = save_to {
         match app.save(slot.clone()) {
             Ok(()) => println!("saved to {}", slot.display()),
             // `Headless::save` logged it as the policy decides: `Log`, and the run reports.
-            Err(error) => eprintln!("the save failed: {error}"),
+            Err(error) => {
+                eprintln!("the save failed: {error}");
+                exit = ExitCode::from(2);
+            }
         }
     }
     let _log = app.shutdown();
-    Ok(())
+    Ok(exit)
 }

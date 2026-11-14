@@ -39,9 +39,11 @@ pub struct HeadlessConfig {
 /// [`start`](Self::start) on the thread that owns it, which drives every run through
 /// `Executor::block_on` and is never a worker.
 pub struct Headless {
-    executor: Executor,
-    io: Io,
+    // Declared in drop order for an app dropped without `shutdown`: the world before the
+    // IO pool, the IO pool before the executor (`crates/io/README.md`).
     server: Option<Server>,
+    io: Io,
+    executor: Executor,
     tick: Tick,
     replay: bool,
 }

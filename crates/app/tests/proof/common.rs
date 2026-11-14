@@ -137,11 +137,13 @@ pub fn table_of(region: RegionId) -> VersionTable {
 }
 
 /// Cooked content for every region: one empty baseline, a table per region but those in
-/// `unresolved`, and a count of the pins.
+/// `unresolved`, a count of the pins, and a count of pins still to fail.
 pub struct Content {
     pub baseline: Arc<Baseline>,
     pub unresolved: BTreeSet<RegionId>,
     pub pins: AtomicU32,
+    /// The next pins to fail, each `NotFound` as an asset not yet published.
+    pub fail_pins: AtomicU32,
 }
 
 impl Content {
@@ -151,7 +153,12 @@ impl Content {
 
     pub fn without(unresolved: BTreeSet<RegionId>) -> Arc<Self> {
         let baseline = Arc::new(Baseline::from_rows(AssetSet::new(), [], []).expect("empty"));
-        Arc::new(Self { baseline, unresolved, pins: AtomicU32::new(0) })
+        Arc::new(Self {
+            baseline,
+            unresolved,
+            pins: AtomicU32::new(0),
+            fail_pins: AtomicU32::new(0),
+        })
     }
 
     /// `region`'s cooked bundle in `mode` over a fresh copy of the baseline (so a test can
@@ -184,6 +191,11 @@ impl Cooked for Content {
 
     fn pin(&self, table: &VersionTable) -> Result<PinnedTable> {
         self.pins.fetch_add(1, Ordering::Relaxed);
+        let fail =
+            self.fail_pins.try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1));
+        if fail.is_ok() {
+            return Err(Error::new(ErrorKind::NotFound, "the store has not published it yet"));
+        }
         PinnedTable::pin(&Store, table)
             .ready()
             .ok_or_else(|| Error::new(ErrorKind::NotFound, "the store has not published it"))

@@ -3,6 +3,7 @@
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use lactose_app::{SavedWorld, Server, Start, WorldConfig};
 use lactose_bundle::ComponentData;
@@ -140,14 +141,10 @@ fn an_anchored_saved_world_loads_its_pinned_region_and_answers_a_join_from_the_s
         assert_eq!(both, grid_ids(), "every region is loaded or kept");
     };
 
-    // The pinned region is requested at the first sync point and loads from the store at
-    // the next step.
+    // The pinned region loads from the store at the first step and is never requested.
     let (server, out) = step(&executor, server, TickInput::default());
     assert!(out.failures.is_empty(), "{out:?}");
-    assert_eq!(loads(&out.requests), BTreeSet::from([100]));
-    assert_eq!(loaded(&server), BTreeSet::new());
-    let (server, out) = step(&executor, server, TickInput::default());
-    assert!(out.failures.is_empty(), "{out:?}");
+    assert_eq!(loads(&out.requests), BTreeSet::new());
     assert_eq!(loaded(&server), BTreeSet::from([100]));
     all(&server);
 
@@ -172,6 +169,79 @@ fn an_anchored_saved_world_loads_its_pinned_region_and_answers_a_join_from_the_s
     }
     let (server, saved) = save(&executor, server);
     assert_eq!(ids(&saved), grid_ids(), "a save after K ticks holds every region");
+    server.shutdown();
+    executor.shutdown();
+}
+
+/// The pinned region is world-global state, simulated whenever the server runs: a server
+/// resumed from a save steps it from the first tick, so it matches the server that was
+/// never saved, counter and hash, at every tick (architecture section 15.5).
+#[test]
+fn an_anchored_resume_matches_the_original_that_was_not_reloaded() {
+    let executor = executor(2);
+    let content = Content::new();
+    let original = server(&executor, anchored([100]), Start::Fresh, &content);
+    let (original, out) = step(&executor, original, TickInput::default());
+    assert_eq!(loads(&out.requests), BTreeSet::from([100]));
+    let (mut original, out) = step(&executor, original, load(&content, [100]));
+    assert!(out.failures.is_empty(), "{out:?}");
+    let key = spawn_counter(&mut original, 100);
+    for _ in 0..3 {
+        original = step(&executor, original, TickInput::default()).0;
+    }
+    let (mut original, saved) = save(&executor, original);
+    let at_save = counter(&original, key).expect("loaded");
+
+    let mut resumed = server(&executor, anchored([100]), Start::Loaded(saved), &content);
+    for k in 1..=6 {
+        original = step(&executor, original, TickInput::default()).0;
+        let out;
+        (resumed, out) = step(&executor, resumed, TickInput::default());
+        assert!(out.failures.is_empty(), "{out:?}");
+        assert_eq!(resumed.tick(), original.tick());
+        assert_eq!(counter(&original, key), Some(at_save + k));
+        assert_eq!(counter(&resumed, key), counter(&original, key), "at {:?}", resumed.tick());
+        assert_eq!(resumed.hash().expect("hash"), original.hash().expect("hash"));
+    }
+    original.shutdown();
+    resumed.shutdown();
+    executor.shutdown();
+}
+
+/// A table whose pin fails at a store answer (an asset not yet published, the store's
+/// ordinary transient case) is no refusal: the region loads `Frozen` with no table, and a
+/// table through `TickInput::assets` reaches it.
+#[test]
+fn a_failed_pin_at_a_store_answer_loads_the_region_with_no_table() {
+    let log = capture();
+    let executor = executor(2);
+    let content = Content::new();
+    let saved = saved_grid(&executor, &content);
+    let server = server(&executor, anchored([]), Start::Loaded(saved), &content);
+    content.fail_pins.store(1, Ordering::Relaxed);
+    let (server, out) =
+        step(&executor, server, session(1, SessionEvent::Join { region: RegionId(124) }));
+    assert!(out.failures.is_empty(), "{out:?}");
+    let near: BTreeSet<u64> = [112, 113, 114, 117, 118, 119, 122, 123, 124].into();
+    assert_eq!(loads(&out.requests), near);
+    assert_eq!(content.fail_pins.load(Ordering::Relaxed), 0, "the first answer's pin failed");
+    assert_eq!(logged(&log, tracing::Level::WARN, "cannot be pinned"), 1);
+    let (server, out) = step(&executor, server, TickInput::default());
+    assert!(out.failures.is_empty(), "{out:?}");
+    assert_eq!(loaded(&server), near, "112 loads with the others");
+    let world = server.simulation().world();
+    assert!(world.region_assets(RegionId(112)).is_none());
+    assert_eq!(world.region_mode(RegionId(112)), Some(RegionMode::Frozen));
+    assert!(world.region_assets(RegionId(113)).is_some());
+    let mut assets = TickInput::default();
+    let pinned = content.bundle(RegionId(112), RegionMode::Frozen).assets.expect("pinned");
+    assets.assets.insert(RegionId(112), pinned);
+    let (server, out) = step(&executor, server, assets);
+    assert!(out.failures.is_empty(), "{out:?}");
+    assert_eq!(
+        server.simulation().world().region_assets(RegionId(112)).map(|p| p.table().clone()),
+        Some(table_of(RegionId(112)))
+    );
     server.shutdown();
     executor.shutdown();
 }
@@ -224,6 +294,7 @@ fn a_directed_reload_refused_keeps_the_export_and_one_accepted_loads() {
     let rows = world.export_region(RegionId(1)).expect("the export");
     let export = RegionExport { region: RegionId(1), rows };
     let baseline = server.baseline(RegionId(1)).expect("loaded");
+    let loaded_with = Arc::clone(baseline);
     let expected =
         RegionRecords::from_export(&export, baseline, server.schemas()).expect("the diff");
 
@@ -241,6 +312,10 @@ fn a_directed_reload_refused_keeps_the_export_and_one_accepted_loads() {
 
     assert_eq!(kept(&server), BTreeSet::from([1]));
     assert_eq!(server.kept()[&RegionId(1)].records, expected, "the export's records");
+    assert!(
+        Arc::ptr_eq(&server.kept()[&RegionId(1)].baseline, &loaded_with),
+        "diffed against the baseline it was loaded with, not the refused bundle's"
+    );
     assert!(server.baseline(RegionId(1)).is_none());
     assert_eq!(loaded(&server), BTreeSet::from([2]));
     assert!(Arc::ptr_eq(server.baseline(RegionId(2)).expect("loaded"), &reloaded_with));

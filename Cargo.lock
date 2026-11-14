@@ -395,6 +395,7 @@ dependencies = [
  "lactose-ecs",
  "lactose-input",
  "lactose-io",
+ "lactose-math",
  "lactose-net-api",
  "lactose-net-host",
  "lactose-persist",
@@ -420,6 +421,7 @@ dependencies = [
  "lactose-persist",
  "lactose-reflect",
  "lactose-sim",
+ "tracing-subscriber",
 ]
 
 [[package]]

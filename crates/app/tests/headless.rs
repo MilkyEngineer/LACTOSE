@@ -21,6 +21,7 @@ mod protocol;
 
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
+use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -36,12 +37,15 @@ use lactose_asset_api::{
 use lactose_bundle::Baseline;
 use lactose_core::{Error, ErrorKind, PlayerId, Result, StableKey, Tick};
 use lactose_ecs::{ClaimedBy, Mut, RegionId, RegionMode, World, system};
+use lactose_input::{AXIS_SCALE, Axis2, PlayerInput, Yaw, player_entity};
+use lactose_math::{Scalar, Vec3};
 use lactose_persist::Migrations;
+use lactose_physics_api::{Collider, RigidBody, Shape, Transform, Velocity};
 use lactose_reflect::component;
 use lactose_sim::harness::{ChunkCapacity, layout_mode};
 use lactose_sim::{
-    RegionBundle, RegionControl, Registration, SessionApplier, SessionEvent, Stage, TickInput,
-    TypeTable,
+    PlayerSample, RegionBundle, RegionControl, Registration, SessionApplier, SessionEvent, Stage,
+    StreamingAnchor, TickInput, TypeTable,
 };
 use lactose_task::{ChaosConfig, Executor};
 use protocol::{Capacity, Layout, RunConfig, Session};
@@ -198,11 +202,12 @@ fn frames(cooked: Arc<InMemory>) -> Result<Box<dyn FnMut(Tick) -> TickInput + Se
 
 // ---- 3. `main` of `app-headless` ----
 
-/// The binary's `main`: the executor's defaults, the headless world, `ticks` ticks at
-/// tick rate from a spawned timer root, the report on stdout, an optional save, an orderly
-/// shutdown. `main` returns the first error, which is the policy's `Stop`; a failed save is
-/// logged, as the policy says, and the run still reports.
-fn headless_main(ticks: u32, save_to: Option<PathBuf>) -> Result<()> {
+/// The binary's `main`, after it installs the crash hook and the stderr subscriber: the
+/// executor's defaults, the headless world, `ticks` ticks at tick rate from a spawned timer
+/// root, the report on stdout, an optional save, an orderly shutdown. `main` returns the
+/// first error, which is the policy's `Stop`; a failed save is logged, as the policy says,
+/// the run still reports, and the exit status is 2.
+fn headless_main(ticks: u32, save_to: Option<PathBuf>) -> Result<ExitCode> {
     let cooked = Arc::new(InMemory::new(RegionId(1))?);
     let config = HeadlessConfig {
         workers: Workers::default(),
@@ -216,15 +221,19 @@ fn headless_main(ticks: u32, save_to: Option<PathBuf>) -> Result<()> {
         "{} ticks in {} frames ({} behind), hash {:#018x}",
         report.ticks, report.frames, report.behind, report.hash
     );
+    let mut exit = ExitCode::SUCCESS;
     if let Some(slot) = save_to {
         match app.save(slot.clone()) {
             Ok(()) => println!("saved to {}", slot.display()),
             // `Headless::save` logged it as the policy decides: `Log`, and the run reports.
-            Err(error) => eprintln!("the save failed: {error}"),
+            Err(error) => {
+                eprintln!("the save failed: {error}");
+                exit = ExitCode::from(2);
+            }
         }
     }
     let _log = app.shutdown();
-    Ok(())
+    Ok(exit)
 }
 
 /// The same binary resuming from a slot: the save decoded before any world exists, its
@@ -247,11 +256,93 @@ fn resume_main(slot: &[u8], ticks: u32) -> Result<RunReport> {
 
 // ---- 4. A SOUR test of the assembly ----
 
-/// Runs `ticks` ticks under the runner's session, one `step` each, recording the hash
-/// after every tick and the chaos log at the end: `lactose_sim::harness::run_recorded`'s
-/// shape, over the assembly instead of a bare simulation. A refused bundle or session
-/// event is the step's output and fails the test. Outside the runner the session is
-/// production and nothing is recorded.
+/// Steers the player's body along the ground by its input, keeping what gravity gave it,
+/// so the input applier's writes reach the solver's state, which the world hash covers.
+#[system(name = "sketch::steer", worlds = [server, prediction])]
+fn steer(input: &PlayerInput, velocity: Mut<Velocity>) {
+    let planar = input.world_movement() * Scalar::from_i32(4);
+    velocity.linear = Vec3::new(planar.x, velocity.linear.y, planar.z);
+}
+
+fn register_steer(registration: &mut Registration) {
+    registration.stage(Stage::Simulation).add(&STEER);
+}
+
+fn no_types(_: &mut TypeTable) -> Result<()> {
+    Ok(())
+}
+
+/// What the SOUR run adds to the sketch: a system that steers player 1's body.
+static SKETCH_BODY: CrateRegistration = CrateRegistration {
+    name: "sketch-body",
+    types: no_types,
+    setup: None,
+    systems: register_steer,
+    migrations: None,
+};
+
+/// The sketch with a body: player 1 joins as a dynamic sphere, claimed and anchored, that
+/// falls under gravity while its input steers it, so the solver pool (sized from the
+/// workers SOUR's modes vary) and the input applier both enter the hash.
+static SOUR_GAME: Game = Game {
+    name: "sketch-sour",
+    crates: &[SKETCH_SIM, SKETCH_BODY],
+    order: None,
+    sessions: Some(bodies),
+};
+
+fn bodies() -> Box<dyn SessionApplier> {
+    Box::new(Bodies)
+}
+
+struct Bodies;
+
+impl SessionApplier for Bodies {
+    fn apply(&mut self, world: &mut World, player: PlayerId, event: SessionEvent) -> Result<()> {
+        match event {
+            SessionEvent::Join { region } => {
+                let key = StableKey::Net(world.allocate_net_id()?);
+                let start = Vec3::new(Scalar::ZERO, Scalar::from_i32(10), Scalar::ZERO);
+                let row = (
+                    Counter(0),
+                    ClaimedBy { player },
+                    StreamingAnchor { priority: 0 },
+                    Transform::at(start),
+                    Velocity::ZERO,
+                    RigidBody::dynamic(),
+                    Collider::new(Shape::sphere(Scalar::HALF)),
+                );
+                world.spawn(key, region, row)
+            }
+            SessionEvent::Leave => Ok(()),
+        }
+    }
+}
+
+/// Player 1's sample at `tick`: the stick forward, the yaw turning a little every tick.
+fn sample(tick: Tick) -> PlayerInput {
+    let movement = Axis2 { x: 0, y: AXIS_SCALE };
+    PlayerInput { movement, yaw: Yaw(tick.0.wrapping_mul(97) as u16), ..PlayerInput::default() }
+}
+
+/// `frames`, with player 1's sample in every tick's frame.
+fn sour_frames(cooked: Arc<InMemory>) -> Result<Box<dyn FnMut(Tick) -> TickInput + Send>> {
+    let mut frames = frames(cooked)?;
+    Ok(Box::new(move |tick| {
+        let mut input = frames(tick);
+        let bytes = sample(tick).to_sample_bytes().to_vec();
+        let sample = PlayerSample { input_tick: tick, substituted: false, sample: bytes };
+        input.inputs.insert(PlayerId(1), sample);
+        input
+    }))
+}
+
+/// Runs `ticks` ticks of [`SOUR_GAME`] under the runner's session, one `step` each,
+/// recording the hash after every tick and the chaos log at the end:
+/// `lactose_sim::harness::run_recorded`'s shape, over the assembly instead of a bare
+/// simulation. A refused bundle or session event is the step's output and fails the test;
+/// so does a body the input did not steer or the solver did not move, which every mode
+/// would agree on. Outside the runner the session is production and nothing is recorded.
 fn sour_run(test: &str, ticks: u32) -> Result<()> {
     let session = Session::from_env().map_err(protocol_error)?;
     let config = *session.config();
@@ -272,7 +363,8 @@ fn sour_run(test: &str, ticks: u32) -> Result<()> {
     let world = WorldConfig { layout, regions: RegionControl::Directed, ..WorldConfig::headless() };
     let config_applied = HeadlessConfig { workers, world, start: Start::Fresh, saves: None };
     let cooked = Arc::new(InMemory::new(RegionId(1))?);
-    let mut app = Headless::start(&GAME, config_applied, Arc::clone(&cooked) as Arc<dyn Cooked>)?;
+    let cooked_dyn = Arc::clone(&cooked) as Arc<dyn Cooked>;
+    let mut app = Headless::start(&SOUR_GAME, config_applied, cooked_dyn)?;
     let applied = RunConfig {
         workers: config.workers.map(|_| {
             NonZeroU32::new(app.executor().frame_worker_count()).expect("at least one worker")
@@ -281,7 +373,7 @@ fn sour_run(test: &str, ticks: u32) -> Result<()> {
         chaos_seed: config.chaos_seed,
     };
     let mut recorder = session.recorder(test, &applied).map_err(protocol_error)?;
-    let mut frames = frames(cooked)?;
+    let mut frames = sour_frames(cooked)?;
     for _ in 0..ticks {
         let next = Tick(app.tick().0 + 1);
         let out: StepOutput = app.step(frames(next))?;
@@ -293,8 +385,26 @@ fn sour_run(test: &str, ticks: u32) -> Result<()> {
         }
         recorder.record(app.tick().0, app.hash()?).map_err(protocol_error)?;
     }
+    steered(&app, Tick(ticks))?;
     if let Some(log) = app.shutdown() {
         session.write_execution_log(test, log.as_bytes()).map_err(protocol_error)?;
+    }
+    Ok(())
+}
+
+/// Player 1's body after `last`: it holds the last tick's sample, the input applier's
+/// write, and it has fallen and moved along the ground, the solver's.
+fn steered(app: &Headless, last: Tick) -> Result<()> {
+    let world = app.server().expect("the server").simulation().world();
+    let missing = |what: &str| Error::new(ErrorKind::NotFound, format!("player 1's {what}"));
+    let key = player_entity(world, PlayerId(1)).ok_or_else(|| missing("entity"))?;
+    if world.get::<PlayerInput>(key) != Some(&sample(last)) {
+        return Err(Error::new(ErrorKind::InvalidData, "the last sample was not applied"));
+    }
+    let at = world.get::<Transform>(key).ok_or_else(|| missing("transform"))?.translation;
+    let ground = at.x * at.x + at.z * at.z;
+    if at.y >= Scalar::from_i32(10) || ground <= Scalar::ONE {
+        return Err(Error::new(ErrorKind::InvalidData, format!("the body did not move: {at:?}")));
     }
     Ok(())
 }
@@ -539,5 +649,5 @@ fn a_registration_is_a_plain_value() {
 }
 
 // The binary's `main` and the resume sketch: type-checked here, run by the binary.
-const _: fn(u32, Option<PathBuf>) -> Result<()> = headless_main;
+const _: fn(u32, Option<PathBuf>) -> Result<ExitCode> = headless_main;
 const _: fn(&[u8], u32) -> Result<RunReport> = resume_main;

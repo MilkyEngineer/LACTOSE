@@ -19,23 +19,32 @@ use crate::common::{Clock, Content, GAME, capture, executor, logged, server, ste
 const LEAD: u32 = 2;
 
 fn estimate(server: u32, snap: bool) -> ClockEstimate {
+    paced(server, LEAD, 1000, snap)
+}
+
+fn paced(server: u32, lead: u32, rate: u32, snap: bool) -> ClockEstimate {
     ClockEstimate {
         server_tick: Tick(server),
-        lead_ticks: LEAD as f32,
-        rate_thousandths: 1000,
+        lead_ticks: lead as f32,
+        rate_thousandths: rate,
         snap,
     }
+}
+
+/// A client of the proof's game joined at tick zero with `lead`, its pacer as built:
+/// owing its first tick at once.
+fn built(executor: &Executor, content: &Arc<Content>, lead: u32) -> Client {
+    let accepted = JoinAccepted { player: PlayerId(1), tick: Tick(0) };
+    let entity = StableKey::Net(NetId::runtime(NonZeroU64::MIN).expect("a runtime id"));
+    let cooked = Arc::clone(content) as Arc<dyn Cooked>;
+    build_client(executor, &GAME, WorldConfig::headless(), accepted, entity, lead, cooked)
+        .expect("the client builds")
 }
 
 /// A client of the proof's game joined at tick zero, its pacer put at `clock.at(0)` by a
 /// first frame there, which runs no tick.
 fn client(executor: &Executor, content: &Arc<Content>, clock: Clock) -> Client {
-    let accepted = JoinAccepted { player: PlayerId(1), tick: Tick(0) };
-    let entity = StableKey::Net(NetId::runtime(NonZeroU64::MIN).expect("a runtime id"));
-    let cooked = Arc::clone(content) as Arc<dyn Cooked>;
-    let mut client =
-        build_client(executor, &GAME, WorldConfig::headless(), accepted, entity, LEAD, cooked)
-            .expect("the client builds");
+    let mut client = built(executor, content, LEAD);
     assert_eq!(client.tick(), Tick(LEAD));
     client.clock(estimate(0, true));
     let (client, out) = frame(executor, client, clock, 0, &mut sampled);
@@ -403,6 +412,65 @@ fn the_fold_carries_a_replicated_scale_into_the_step() {
         world(&client).resource::<TimeScale>().copied(),
         Some(TimeScale { thousandths: 500 })
     );
+    client.shutdown();
+    executor.shutdown();
+}
+
+/// A new client, whose pacer owes its first tick, told rate zero without a snap: its first
+/// frame runs no tick.
+#[test]
+fn a_new_client_paced_at_rate_zero_runs_no_tick() {
+    let executor = executor(2);
+    let content = Content::new();
+    let clock = Clock::new();
+    let mut client = built(&executor, &content, LEAD);
+    client.clock(paced(0, LEAD, 0, false));
+    let at = client.tick();
+    let (client, out) = frame(&executor, client, clock, 3, &mut sampled);
+    assert_eq!(out.ticks, 0, "a client paced at rate zero ran a tick");
+    assert_eq!(client.tick(), at);
+    client.shutdown();
+    executor.shutdown();
+}
+
+/// A new client whose first due frame carries a pause: no tick.
+#[test]
+fn a_replicated_pause_on_a_new_client_runs_no_tick() {
+    let executor = executor(2);
+    let content = Content::new();
+    let clock = Clock::new();
+    let mut client = built(&executor, &content, LEAD);
+    let mut paused = StagedFrame::new(client.tick());
+    paused.time_scale = Some(TimeScale::PAUSED);
+    push(&mut client, paused);
+    let at = client.tick();
+    let (client, out) = frame(&executor, client, clock, 3, &mut sampled);
+    assert_eq!(out.ticks, 0, "a paused client ran a tick");
+    assert_eq!(client.tick(), at);
+    client.shutdown();
+    executor.shutdown();
+}
+
+/// `TooOld` whose frame is later than the estimate advanced by the granted ticks: the
+/// target is the frame plus the lead, not the estimate's (step 8).
+#[test]
+fn a_frame_older_than_the_ring_targets_its_tick_plus_the_lead_when_that_is_later() {
+    const LONG: u32 = 10;
+    let executor = executor(2);
+    let content = Content::new();
+    let clock = Clock::new();
+    let mut client = built(&executor, &content, LONG);
+    client.clock(paced(0, LONG, 1000, true));
+    let (mut client, out) = frame(&executor, client, clock, 0, &mut sampled);
+    assert_eq!((out.ticks, out.resync), (0, Some(Tick(LONG))));
+    client.predictor_mut().set_depth(2).expect("a depth of two");
+    for periods in 1..=10 {
+        client = frame(&executor, client, clock, periods, &mut sampled).0;
+    }
+    let old = Tick(client.tick().0 - 5);
+    push(&mut client, StagedFrame::new(old));
+    let (client, out) = frame(&executor, client, clock, 11, &mut sampled);
+    assert_eq!(out.resync, Some(Tick(old.0 + LONG)), "the frame's tick plus the lead");
     client.shutdown();
     executor.shutdown();
 }
