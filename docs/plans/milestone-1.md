@@ -478,9 +478,8 @@ The coordinator allocates the numbers at merge. D137 is reserved for `ecs-a`.
     reading the 4 ms as a tick with the 3 ms physics phase inside it.
   - *On N performance cores below eight, criterion 1 is judged by projection*:
     S + (T − S) × N / 8 at most 4 ms, T the median tick on N frame workers and S the part of it
-    that runs as one job.
-    On the M1 that is T + S at most 8 ms. Rules out a criterion no machine in reach can prove; the
-    next revision restates the sentence.
+    that runs as one job. On the M1 that is T + S at most 8 ms. Rules out a criterion no machine
+    in reach can prove; the next revision restates the sentence.
   - *The parallel runner is two lanes, the per-chunk kernel path first, then chunk ranges as the
     units of a graph node.* Both conform to sections 5.2 and 6 as written. Rules out a scope per
     system, partials folded in chunk order and buffers pooled by worker slot.
