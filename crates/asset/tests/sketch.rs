@@ -3,8 +3,9 @@
 //! the driver that answers the region lifecycle at milestone 3, what a boundary world
 //! reads, what a client or a replay asks for, what the cooker writes, how a cooked pack
 //! reaches a running store, and what `persist` calls for a baseline. Type-checked and
-//! never run (every deciding body in the facade is `todo!()`); the tests at the end run
-//! what is real now. A change that breaks a sketch is a signature change to list.
+//! never run: the store's behaviour is proved by the other tests of this directory, and
+//! the two tests at the end pin the log target, the format version and the baseline
+//! kind's key. A change that breaks a sketch is a signature change to list.
 
 #![forbid(unsafe_code)]
 #![allow(dead_code, unused_variables, missing_docs)]

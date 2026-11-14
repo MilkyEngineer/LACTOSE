@@ -1476,6 +1476,76 @@ editorial pass rather than one taken from a review.
   asset's current version and of `generation`; the reference store's reading of the index at
   each `newest`, its single move for a repeated request of an unnamed asset, its exact request
   that made a published version current, its `Pending` for the empty ID and its recursive walk.
+- Addendum (lane asset-impl, 2026-11-14; fix rounds 1 to 3): implemented. What the
+  implementation settled:
+  - One lock holds the store's whole state, and nothing runs under it but the store's own map
+    work. Every change is one critical section (a step). It collects its effects (trace records,
+    wakers, values it lets go of, task handles, spawns) and carries them out after the release
+    in that order. Wakers are cloned, replaced and dropped outside the lock, and every span and
+    event (`silo.load`, `silo.publish`, failures, `silo.search`) is emitted after it. Every
+    lookup and the generation are read under the lock, which is the linearisation point. A
+    subscriber must not call the store; another thread may observe a change before the
+    subscriber is told of it.
+  - A load owns its task. `Store`, `Mount` and `Settled` share one handle. Its last drop marks
+    the store closed under the lock and drops every load's task after the release, so a queued
+    load is never polled again. A load task holds only a weak handle. It checks under the lock
+    that the store is open at its first poll, before it submits its read, and again after its
+    yield, before the loader call; the publishing step also reads `closed`. A guard passed into
+    the task future as an argument (not a local, so a future dropped before its first poll still
+    drops it) records the load as `Cancelled` when the executor drops the task. So every
+    accepted load ends. After the last handle's drop returns, no load task polled for the first
+    time submits a read, no load that has not passed its check calls its loader, and nothing is
+    published. A loader call already past its check may still run, and its result is dropped.
+    The drop never blocks while the caller keeps an `Executor` handle of its own. The window
+    between a run's spawn and its hand-off to the closed store is closed by the first check
+    alone, which no test isolates.
+  - Settling: each accepted load takes a sequence number. A wait's mark is the next number at
+    its first poll, and the wait resolves when no load below the mark is still in flight. A load
+    that rule 2 renews keeps its number.
+  - Failure causes: `Absent` (no pack held it); `Version` (the loader refused intact bytes, or
+    there is no loader for the kind, which ends inside the accepting call with no read);
+    `Source` (the read failed, or `InvalidData` whose bytes do not hash to the claimed version,
+    i.e. damage); `Dependency(id)`. Rule 3 re-asks dependants recorded as failed for a
+    dependency the mount asked for, transitively. A mount seeds rule 3 with every followed asset
+    it renamed to a version that is loading.
+  - Rule 2 re-reads only `Source` failures. For a load still in flight whose own steps failed
+    for their source, when a mount since its acceptance put the version in another pack:
+    - if the new entry's header (kind and dependency list) equals the old one, the load reads
+      again from that pack as the same load: it keeps its sequence number and its waits, and
+      records no failure;
+    - if the header differs (damage that only the version's hash caught), the load ends failed
+      and is renewed in the same step, whatever asked for it (an exact request as much as a
+      followed asset's named version). The renewal is a load of the newer entry at the ended
+      load's priority, with the trace cause "renew"; it keeps the ended load's sequence number,
+      so `Settled` still waits, and it is accepted before what waited for the version looks
+      again. Between the two, the failure is the version's answer (the generation moves) and
+      dependants stay `Pending`. The old header's dependencies stay followed, which changes no
+      answer.
+    - The store therefore ends where a store new to the process over the same mounts ends
+      (`Unsupported` for a kind with no loader, `Ready` when the new dependency list resolves).
+  - Cycles: a load blocked on dependencies is examined only once no load it reaches is still
+    running. The search's memo ("behind") records its target, the target's sequence number and
+    the mount count, and holds only while that same load's own steps run and no mount has
+    renamed since. Holders are not requeued when the target ends: the target is evaluated then,
+    and its own search reaches any cycle through it; requeueing would make head-first chains
+    quadratic. The named version of an asset is indexed (one map entry per mounted asset,
+    updated at each mount), so a walk step reads it in log time. Strongly connected components
+    are found by an iterative Tarjan, so 100,000-link chains need no deep stack. Only sink
+    components are decided. Each member fails for its lowest failed dependency, other members
+    counting as failed, with that dependency's kind, or `InvalidData` where the
+    lowest-dependency path comes back round. The searches of a 2,000-link chain ending link by
+    link visit at most 8 loads per link (about 3.5 tail first, 4.6 head first), counted by the
+    TRACE event `silo.search`, whose visits count is a diagnostic, not a contract.
+  - Pack decoding runs under `AllocTag::Asset` and read buffers under `AllocTag::Io`. The
+    trailer is checked in this order: magic, version, reserved word, then the index length
+    against the file and against `MAX_READ_BYTES`. The index is checked hash first, and its
+    count against the remaining bytes before anything is reserved.
+  - io's pool keeps under `AllocTag::Io` what its thread allocates for itself, its
+    swept-directory set (one entry per directory replaced into), until the pool stops. The drop
+    test compares against that baseline, not zero.
+  - The three 100,000-link tests need a 240 s bound under load, under nextest's 300 s kill.
+  - A held test loader keeps its background worker, since a loader's call is not sliced. A test
+    that needs another load's steps to run while a call is held names its worker count.
 
 ## 8. Physics and animation
 
