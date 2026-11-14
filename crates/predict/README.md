@@ -58,7 +58,7 @@ boundary `clippy.toml`.
 | Consumer | Needs | Where |
 |---|---|---|
 | `app` (client, milestone 1 spike, then milestone 4) | One owner of the prediction world beside the replicated world, from the same registration functions, running ahead of the server from the start | `SimulationBuilder::new(WorldKind::Prediction, types)` with every crate's `register_types` (`lactose_predict::register_types` among them), `setup` and `register_systems` (`lactose_net_api::setup` for the inbox, `lactose_physics_api::setup` for physics), `.tick(Tick(accepted.tick.0 + lead))` and `.check(lactose_predict::check_prediction_reads)`, then `Predictor::new(simulation, LocalPlayer { player, entity }, depth)`; "The loop `app` writes" below |
-| | Step ahead each frame with the local inputs; the frames the network thread delivered applied | `Predictor::step` with a `TickInput` carrying `inputs[local.player]` for the tick; the frames through `StagedInbox::push` on `simulation_mut().world_mut()` before the step, folded as for the replicated world; the step's hook pops them |
+| | Step ahead each frame with the local inputs; the frames the network thread delivered applied | `Predictor::step` with a `TickInput` carrying `inputs[local.player]` for the tick; the frames through `StagedInbox::push` on `simulation_mut().world_mut()` before the step, folded as for the replicated world but with each bundle's mode `Simulated` once its region's table is published, `Frozen` before; the step's hook pops them |
 | | Compare, roll back, correct, re-simulate; know what it cost | `Predictor::reconcile` after the frame's steps: `Reconciled::{confirmed, corrections, resimulated, resync}`; the time measured around the call, outside the boundary, divided by `resimulated` |
 | | The ring's depth from the budget and the measured per-tick cost; the horizon | `Predictor::set_depth`; `Ring::{depth, oldest, newest, rebuilt_at, len, bytes, slot_bytes}`; a frame older than the ring is `ResyncReason::TooOld` |
 | | Resync when the world must be rebuilt or has fallen behind; a changed player entity | `Reconciled::resync`, `Predictor::resync(tick)`, then the server's full frame through the inbox; `Predictor::set_local` |
@@ -82,7 +82,11 @@ keeping the predictor on every path that hands it back:
 loop {
     // 1. Every frame the network thread delivered, into both inboxes; a refused frame
     //    enters nothing. Then the due frames' time scale and region changes folded into
-    //    the first new tick's `TickInput`, exactly as for the replicated world.
+    //    the first new tick's `TickInput`, as for the replicated world except that each
+    //    `RegionRelevance::to_bundle` bundle's `mode` is set to `Simulated` with a table
+    //    and `Frozen` without one (an `Assets` change sets it `Simulated`): a prediction
+    //    world runs its kernels and steps its bodies only in a `Simulated` region, and it
+    //    is built under `RegionControl::Directed`, so the lifecycle loads that mode.
     // 2. The pacer. The cap is for catch-up; re-simulation is bounded by the ring depth
     //    and does not count against it (D122).
     let budget = pacer.poll(Instant::now());
@@ -158,8 +162,8 @@ step and rebuilds the world there ("Reconciliation" below).
   `resync` reinstalls the hook, and is the repair.
 - Between runs `app` does, through `simulation_mut()`, exactly what it does to the
   replicated world: pushes frames into the `StagedInbox`, reads `World::regions` for the
-  fold, takes the presentation events and the lifecycle's asset failures. Any other write
-  to simulation state there is an unjournaled edit the ring does not hold: the next
+  fold, takes the presentation events and the lifecycle's load and asset failures. Any other
+  write to simulation state there is an unjournaled edit the ring does not hold: the next
   rollback undoes it.
 - The order within a frame is push, fold, step the new ticks, reconcile, passes. Frames
   pushed after the last step of a frame are popped by the next frame's first step and
@@ -784,10 +788,15 @@ README.md`, "The applier")
   applier (`PlayerInputApplier`, installed by `app`), inside the tick, before the hook.
 - A re-simulated tick re-passes the ring's `TickInput` to `Simulation::step`: the same
   sample bytes through the same applier, the same region bundles (an `Arc` each), the same
-  time scale, with `failures` stripped. The prediction world's asset failures are this
-  crate's to take (`crates/sim/README.md`): `app` takes them through
-  `simulation_mut().lifecycle_mut().take_asset_failures()` once per frame, after
-  `reconcile`, and the ring never replays them.
+  time scale, with `failures` stripped. The prediction world's lifecycle outputs have one
+  owner, `app` (`crates/app/README.md`, "The client's frame", step 5), never this crate:
+  it takes the load failures and the asset failures through
+  `simulation_mut().lifecycle_mut()` once per frame, after `reconcile`. The ring never
+  replays an asset failure, but it re-passes a recorded bundle, so a bundle the lifecycle
+  refused is refused again at each re-simulation of its tick, and one it loaded can be
+  refused there when a correction made live an entity its overlay holds: `app` reports a
+  refusal unless it reported that tick and region since the ring last restarted, and resyncs
+  the content, which restarts the ring after it.
 - A rollback's re-simulation runs to the present in the `reconcile` that detects it,
   always: a world left at an older tick would be extracted and presented there. Its length
   is bounded by the ring depth, and it does not count against the catch-up cap of

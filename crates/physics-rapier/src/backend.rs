@@ -254,7 +254,16 @@ impl PhysicsBackend for Rapier {
 
         let mut candidates = self.moving();
         let collector = Collector { removed: &removed, events: Mutex::new(Vec::new()) };
-        self.world.step_with_events(&(), &collector);
+        // Entered here, Rapier's own `install` runs inline on the solver thread that steps,
+        // so the check reads that thread, not the caller (`README.md`, "Known gaps").
+        let world = &mut self.world;
+        self.pool.install(|| {
+            debug_assert!(
+                lactose_core::thread_class::fp::is_deterministic(),
+                "a solver thread runs the step without the deterministic floating-point state"
+            );
+            world.step_with_events(&(), &collector);
+        });
         let events = collector.events.into_inner().unwrap_or_else(PoisonError::into_inner);
 
         for handle in forced {

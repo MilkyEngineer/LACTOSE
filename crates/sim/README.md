@@ -418,11 +418,15 @@ does not export, and `take_exports` is always empty there.
 
 - The lifecycle's own state (what is requested, held joins, its outputs) is server-only
   session state, which the server never rolls back; it is not in a snapshot, and
-  architecture section 10's list of what a restore keeps is unchanged. A journal records
-  it with its checkpoint, since a save does not. A prediction world under `Directed`
-  rebuilds what it loaded from the ring's frames; its lifecycle holds asset failures
-  alone, for `lactose-predict` to take. A frame's `failures` are stamped each time the
-  frame is applied, so `predict` strips `failures` from the frames it re-simulates: the
+  architecture section 10's list of what a restore keeps is unchanged. A journal records it
+  with its checkpoint, since a save does not. A prediction world under `Directed` rebuilds
+  what it loaded from the ring's frames; its lifecycle holds load failures, which a
+  re-simulation of the refusing tick makes again since the ring re-passes its bundles, and
+  which a re-simulation can also make for a bundle its first application loaded, and asset
+  failures; `app` alone takes both, once per frame after `reconcile`, and reports a refusal
+  unless it reported that tick and region since the ring last restarted
+  (`crates/app/README.md`, "The client's frame"). A frame's `failures` are stamped each time
+  the frame is applied, so `predict` strips `failures` from the frames it re-simulates: the
   first application stamped them.
 - An unload's `RegionExport` is what a save of that region would hold: rows in ascending
   `NetId` order, reference fields as stored, the seed and the persistent resources, with the

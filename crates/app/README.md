@@ -56,8 +56,8 @@ Hidden plumbing, which the implementation may reshape: the solver pool's constru
 the exit count a world waits on (`runtime::solver_pool`, `runtime::SolverExit`); the
 pending time scale, the scale the last step carried, the bundles queued for the next step
 and the migrations inside `Server`; the clock estimate with the ticks granted since it was
-taken, the lead, the pending resync and the newest frame tick whose fold failed inside
-`Client`.
+taken, the lead, the pending resync, the newest frame tick whose fold failed and the tick
+the last frame's steps started from inside `Client`.
 
 ## What each consumer needs, and where this surface gives it
 
@@ -173,11 +173,15 @@ registration a game crate writes")
   hook is the predictor's (`Predictor::new` installs it). Nothing else is added: the
   replicated world's hook is `lactose-net`'s and the replicated world is not built here
   yet.
-- `WorldConfig` goes into the builder as `layout`, `regions`, `policy` and
-  `log_retention`; `physics` goes to the backend's setup. `log_retention` below
-  `CATCH_UP_CAP` is refused at build with `InvalidData`, since the builder cannot check it
-  and this crate owns the cap. A `Start::Loaded` sets `tick` and `next_net_id` from the
-  saved world; `Start::Fresh` leaves the builder's defaults.
+- `WorldConfig` goes into the builder as `layout`, `regions`, `policy` and `log_retention`;
+  `physics` goes to the backend's setup. `log_retention` below `CATCH_UP_CAP` is refused at
+  build with `InvalidData`, since the builder cannot check it and this crate owns the cap.
+  `build_client` refuses `regions` other than `Directed` with `InvalidData` before anything
+  is built: a prediction world loads the regions the frames name, in the mode its fold gives
+  them ("The client's frame" below). `lactose-sim`'s builder refuses an `Anchored` world
+  that is not a `Server` as well; `build_client`'s check refuses it earlier, before the
+  solver pool starts, with its own message. A `Start::Loaded` sets `tick` and `next_net_id`
+  from the saved world; `Start::Fresh` leaves the builder's defaults.
 - A function pointer is the registration's shape because the dev profile's restart rebuilds
   the worlds from the same functions with nothing to re-create, because every world of a
   process is built from the same set, and because nothing a registration holds can reach a
@@ -198,11 +202,16 @@ registration a game crate writes")
 - Each world gets its own solver pool and its own backend, built beside the world by
   `build_server` or `build_client`: `rayon::ThreadPoolBuilder` with
   `executor.frame_worker_count() - config.physics.reserved_workers` threads, at least one,
-  named `solver-<n>`, never `use_current_thread`, with an `exit_handler` that counts the
-  threads as they exit; `lactose_physics_rapier::backend(pool)`. A one-worker executor
+  named `solver-<n>`, never `use_current_thread`, with a `start_handler` that enters
+  `ThreadClass::PhysicsSolver` on each thread before it takes work (the deterministic
+  floating-point state, and the scheduling class best effort: a refusal is logged at `warn`
+  and the thread runs on) and an `exit_handler` that counts the threads as they exit;
+  `lactose_physics_rapier::backend(pool)`, which enters the class again on every thread, for
+  a pool built without this handler (entering the class a thread is already in is harmless):
+  the handler adds entry before any job, independent of the backend. A one-worker executor
   (SOUR's workers mode) gets a one-thread pool. Two worlds in one process (the spike) have
-  two pools; milestone 4 decides whether a client's two worlds share one. The count is
-  what `Server::shutdown` and `Client::shutdown` wait on ("Shutdown" below): rayon's
+  two pools; milestone 4 decides whether a client's two worlds share one. The count is what
+  `Server::shutdown` and `Client::shutdown` wait on ("Shutdown" below): rayon's
   `ThreadPool::drop` terminates the pool and returns before its threads have exited.
 - A `Platform` is the binary's: `Workers::platform` is `None` for the headless binary and
   `StdPlatform` is used, for the executor and the IO pool alike; `app-client` passes the
@@ -312,41 +321,58 @@ root")
 - `Client::push(frame)` is `StagedInbox::push` on the prediction world's inbox, between
   runs; `false` is logged and enters nothing. The replicated world's inbox is `net`'s at
   milestone 4, when `push` pushes into both.
-- The clock target of a resync with a hint `h` (the `server` of `ResyncReason::Behind`,
-  the `frame` of `ResyncReason::TooOld`, or none) is stated once and used by every resync
-  below: the last clock estimate's `server_tick` advanced by the ticks this client's pacer
-  granted since the estimate was taken (the sum of every poll's budget), or `h` if that is
-  later or there is no estimate, plus the lead; with neither an estimate nor a hint, the
-  world's own tick. The pacer paces by the replicated scale times the estimate's rate, so
-  the granted ticks follow the server's through a pause or slow motion, and the target
-  does not overshoot the server by the pause's length or the ticks slow motion did not
-  run, as wall time would; the pacer drops what it owes beyond the cap, so a client that
-  fell behind lands short, and the hint, which is a tick the server has reached, lifts it.
-  A stale estimate therefore never puts the world behind a frame the inbox already holds,
-  which would repeat the resync every frame until a new estimate arrived.
+- The clock target of a resync with a hint `h` (step 8's, or none) is stated once and used
+  by every resync below: the last clock estimate's `server_tick` advanced by the ticks this
+  client's pacer granted since the estimate was taken (the sum of every poll's budget), or
+  `h` if that is later or there is no estimate, plus the lead; with neither an estimate nor
+  a hint, the world's own tick. The pacer paces by the replicated scale times the estimate's
+  rate, so the granted ticks follow the server's through a pause or slow motion, and the
+  target does not overshoot the server by the pause's length or the ticks slow motion did
+  not run, as wall time would; the pacer drops what it owes beyond the cap, so a client that
+  fell behind lands short, and the hint lifts it. Step 8's hint is the newest tick the inbox
+  ever accepted (`StagedInbox::accepted_tick`), never before the reason's tick, whose frame
+  it accepted: a tick the server has reached, and at or beyond every frame queued, where the
+  reason's tick (`Behind`'s `server` is the oldest queued frame after the present) can land
+  short of frames already queued and resync again at the next frame. A stale estimate or a
+  stall therefore never puts the world behind a frame the inbox already holds, and one
+  resync covers what queued during it.
 - `Client::frame(executor, now, sample)` does the following, in this order, and nothing
   else:
   1. A pending clock resync (a `snap` from `clock`, or the kept failure of the previous
      frame): `pacer.resync(now)`, then `Predictor::resync` to the clock target with no
      hint.
-  2. The fold, from `StagedInbox::due(next)` for `next = tick() + 1`: the newest due
-     frame's `time_scale` that is `Some` into the input and into the pacer ("Time scale"
-     above), and each due frame's `regions` as `crates/net-api/README.md` states:
-     `Irrelevant` removes any pending `loaded` and `assets` entry and inserts `unloaded`;
-     `Relevant` inserts `loaded` through `RegionRelevance::to_bundle(baseline, None,
-     table)` with `baseline` from `Cooked::baseline(relevance.baseline_hash)` and `table`
-     the message's table pinned through `Cooked::pin`, or `None`; `Assets` inserts the
-     table pinned; a `full` frame first clears what earlier due frames folded and puts
-     every region of `World::regions` in `unloaded`. A region whose baseline or pin
-     `Cooked` cannot give is left out of the fold. The client remembers the newest frame
-     tick whose fold failed and resyncs once per failing frame tick: when the newest
-     failing due frame is newer than the remembered tick, the failure is logged (`Source::Cooked`,
-     `Resync`), its tick remembered, and unless step 1 resynced this frame the world is
-     resynced at its own tick with the pacer untouched: a content resync, reported in the
-     output so the full frame that follows retries the region (architecture section 14).
-     A failing frame folded again, as one that stays queued through a pause is every
-     frame, is left out again and resyncs nothing, so a pause does not send a
-     `ResyncRequest` per frame.
+  2. The fold, from `StagedInbox::due(next)` for `next = tick() + 1`: the newest due frame's
+     `time_scale` that is `Some` into the input and into the pacer ("Time scale" above), and
+     each due frame's `regions` as `crates/net-api/README.md` states: `Irrelevant` removes
+     any pending `loaded`, `assets` and `modes` entry and inserts `unloaded`; `Relevant`
+     inserts `loaded` through `RegionRelevance::to_bundle(baseline, None, table)` with
+     `baseline` from `Cooked::baseline(relevance.baseline_hash)` and `table` the message's
+     table pinned through `Cooked::pin`, or `None`, its `mode` then set to `Simulated` with
+     a table and `Frozen` without one: `to_bundle` gives the replicated world's mode, the
+     prediction world runs its kernels and steps its bodies only in a `Simulated` region,
+     and a region enters `Simulated` only once its table is published (architecture section
+     14; `build_client` requires `Directed`, under which the lifecycle loads the mode the
+     bundle names); `Assets` inserts the table pinned and the region's mode `Simulated`; a
+     `full` frame first clears what earlier due frames folded and puts every region of
+     `World::regions` in `unloaded`. A region the server holds `Frozen` while it has its
+     table (inactive under `Anchored`, or by a `Directed` frame's mode) is simulated by the
+     client's prediction world all the same, because `RegionChange` carries no mode: the
+     client runs kernels and steps bodies there that the server does not. Each update
+     corrects a claimed entity there, since the server sends a claimed entity whole in
+     every packet (`lactose-net-host`'s whole-send rule, architecture section 9.4; 58
+     corrections in 60 frames in the proof below, whose harness follows that rule); a
+     sender of changed rows alone would leave it uncorrected until the next full frame. A
+     mode variant is a `lactose-net-api` change, decided before `lactose-net`'s packer sends
+     region changes. A region whose baseline or pin `Cooked` cannot give is left out of the
+     fold.
+     The client remembers the newest frame tick whose fold failed and resyncs once per
+     failing frame tick: when the newest failing due frame is newer than the remembered
+     tick, the failure is logged (`Source::Cooked`, `Resync`), its tick remembered, and
+     unless step 1 resynced this frame the world is resynced at its own tick with the pacer
+     untouched: a content resync, reported in the output so the full frame that follows
+     retries the region (architecture section 14). A failing frame folded again, as one that
+     stays queued through a pause is every frame, is left out again and resyncs nothing, so
+     a pause does not send a `ResyncRequest` per frame.
   3. `pacer.poll(now)`, preceded by `pacer.resync(now)` while the pacer is paced at zero,
      as the server's frame does, its budget's ticks added to the estimate's granted count.
   4. One `Predictor::step` per due tick, with the fold's input in the first and an empty
@@ -355,21 +381,39 @@ root")
      resync is predicted again with the sample the server was sent, since
      `SampleHistory::insert` keeps the first and the packet carries the history. `sample`
      runs on the task that drives the frame and must not block.
-  5. `Predictor::reconcile`, its wall time measured around the await.
+  5. `Predictor::reconcile`, its wall time measured around the await; then the prediction
+     world's lifecycle failures, which `app` alone takes on a client:
+     `take_load_failures`, `take_session_failures` (empty while the fold carries no
+     session event) and `take_asset_failures`, each logged at `warn` as the server's are
+     ("Errors" below). A rollback re-applies a step's recorded input, and with it a refused
+     bundle, which the lifecycle reports again; it can also refuse a bundle its first
+     application loaded, when a correction made live an entity the bundle's overlay holds.
+     The client keeps the tick and region of every refusal it reported since the last
+     `Predictor::resync` (steps 1, 2 and 8 clear them); a refusal with a kept tick and
+     region is a repeat and is dropped unlogged, every other is reported, so a refusal is
+     reported once and none is lost.
   6. `Predictor::passes`.
   7. `take_present_events`.
   8. If `Reconciled::resync` is `Some`: `pacer.resync(now)`, then `Predictor::resync` to
-     the clock target, with `Behind`'s `server` or `TooOld`'s `frame` as the hint.
+     the clock target, with the hint the clock target names above. Otherwise, if step 5
+     reported a refused bundle or took an asset failure and neither step 1 nor step 2
+     resynced this frame, the world is resynced at its own tick with the pacer untouched: a
+     content resync, as step 2's, reported so the full frame that follows retries the region
+     (architecture section 14: a client-side asset failure requests a resync). It also
+     restarts the ring after the refusal, so no later rollback re-applies it. No asset
+     failure reaches a client today: the fold sets no `TickInput::failures`, and `predict`
+     strips them from the ticks it re-simulates.
   9. If the budget was `behind`: `pacer.resync(now)`.
 
   A kept failure of any run resolves with the client kept (`ClientError::client` is
   `Some`) and a clock resync marked: the policy's response is `Resync`, the caller calls
   `frame` again, and that frame performs it in step 1 and reports it.
 - `ClientOutput::resync` is `Some(tick)` only for a frame that resynced the world, by step
-  1, 2 or 8, and `tick` is where the world now stands: the caller sends a `ResyncRequest`
-  for it. `events` is what `take_present_events` returned; `reconciled` is what
-  `reconcile` returned, moved; `rollback` is the wall time of the reconcile await, zero
-  when nothing was re-simulated.
+  1, 2 or 8 (a clock resync, a fold that failed, a reconciliation behind or too old, or a
+  refused bundle or asset failure), and `tick` is where the world now stands: the caller
+  sends a `ResyncRequest` for it. `events` is what `take_present_events` returned;
+  `reconciled` is what `reconcile` returned, moved; `rollback` is the wall time of the
+  reconcile await, zero when nothing was re-simulated.
 - `Client::clock(estimate)` sets the lead to `lead_ticks` rounded up, the pacer's scale
   to the world's `TimeScale` times `rate_thousandths / 1000`, keeps the estimate with its
   granted count at zero, and on `snap` marks a clock resync for the next frame's step 1.
@@ -403,10 +447,12 @@ root")
   reads kinds: `StorageFull` on a save (the disk-full path), `InvalidData` and
   `VersionMismatch` on a load (the corrupt-save path), `Network` from the transport.
 - Every response is logged at `LOG_TARGET` with the source and the error before it is
-  acted on. The lifecycle's load, session and asset failures are not errors of a run: they
-  are returned in the `StepOutput` of the step that reported them and in the frame's
-  output, logged per event at `warn`, and the tick carries on; what to do with a refusal
-  is the caller's.
+  acted on. The lifecycle's load, session and asset failures are not errors of a run. On a
+  server they are returned in the `StepOutput` of the step that reported them and in the
+  frame's output, logged per event at `warn`, and the tick carries on; what to do with a
+  refusal is the caller's. On a client they are the prediction world's, taken in step 5 of
+  the frame and logged at `warn`, never returned (`ClientOutput` has no failures field): a
+  refusal or an asset failure becomes a resync, reported in `ClientOutput::resync`.
 - `ServerError` and `ClientError` convert into `lactose_core::Error`, so `?` into a plain
   `Result` drops the world as a plain error would; a caller that wants the world matches.
   After `Cancelled` (the executor shut down mid-run) the world is gone and `server` or
@@ -649,7 +695,11 @@ timing:
 | Baselines | A region loaded, unloaded and saved is diffed against the bundle it was loaded with, also when its reload in the same frame is refused; a refused bundle records nothing; a reload records the reloading bundle's baseline |
 | Save and load | `save_point`, `encode_save`, `Io::replace` into a temporary directory, `load`, a `Start::Loaded` headless app stepped K ticks against the original stepped K more: equal hashes; the same through a `SavedWorld` with no file; a `Start::Loaded` with a corrupt section fails at `load`; a failed replace leaves the previous file |
 | Refusals | A bundle for a loaded region is a `LoadFailure` in `StepOutput::failures` and in `FrameOutput::failures`; a session event the applier refuses, or a `Join` for a region the atlas lacks under `Anchored`, and an asset failure the frame carries appear the same way; `is_empty` otherwise |
-| The client's frame | Over the proof's game: a full frame folded loads exactly its regions; a kept failure keeps the client and the next frame resyncs on entry and reports it; `clock` with `snap` resyncs at the next frame; a fold whose `Cooked` fails resyncs at the world's own tick with the pacer's deadline unchanged, and a failing frame that stays queued through a 120-frame pause resyncs once, not per frame, while a newer failing frame resyncs again; after a backward resync the re-predicted ticks step with the history's samples and the sampler is not called; a stale estimate with `Behind` resyncs to at least `server + lead`, and `TooOld` to at least its `frame + lead`; an estimate taken, then a replicated pause of 120 frames and an unpause, then a resync with no hint lands at the estimate plus the ticks the pacer granted plus the lead, not the pause's length further; the history holds the last eight samples |
+| The client's frame | Over the proof's game: a full frame folded loads exactly its regions; a kept failure keeps the client and the next frame resyncs on entry and reports it; `clock` with `snap` resyncs at the next frame; a fold whose `Cooked` fails resyncs at the world's own tick with the pacer's deadline unchanged, and a failing frame that stays queued through a 120-frame pause resyncs once, not per frame, while a newer failing frame resyncs again; `build_client` under `Anchored` is `InvalidData`; after a backward resync the re-predicted ticks step with the history's samples and the sampler is not called; a stale estimate with `Behind` resyncs to at least `server + lead`, and `TooOld` to at least its `frame + lead`; an estimate taken, then a replicated pause of 120 frames and an unpause, then a resync with no hint lands at the estimate plus the ticks the pacer granted plus the lead, not the pause's length further; the history holds the last eight samples |
+| The fold's mode | A server and a client in one process, the server sent each tick the claimed entity's exact rows and the samples the client predicted with: after the join's full frame is folded the region is `Simulated`, the claimed counter stands ahead of the server's by exactly the ticks the client leads by, and the only correction in 60 frames is the first frame of the fold's tick restoring that tick (the full frame carries the join's rows, which the fold places `lead` ticks later); the same over 240 frames with the player a dynamic body falling onto a fixed slab, which rests at the server's height; a relevance message with no table folds the region `Frozen`, and the frame that brings the table as `RegionChange::Assets` makes it `Simulated`; a full frame after the table, or an `Irrelevant` between the table and a `Relevant` with none, in one fold, leaves the region `Frozen` with no table; today's cost, pinned by a test named for it: a region the server holds `Frozen` with its table published folds `Simulated`, the client's counter runs ahead of the server's and at least 55 of 60 frames correct it, each at its own tick, with no resync |
+| The resync hint | A client that misses 12, and 25, frame periods while their frames queue, then takes them all: exactly one resync, to at or beyond the newest queued frame plus the lead, and the world at or beyond each later frame's tick plus the lead for twenty frames after |
+| A refused bundle on the client | A frame naming the loaded region `Relevant` again, older than the world and with a row the prediction did not make: the step refuses the bundle and the rollback re-applies it, one `warn` is logged and the frame reports a content resync at the world's own tick; the frame runs half a period late and the next, on the period, still owes its tick (the content resync left the pacer); five later frames each roll back and log nothing; a refusal in a frame whose fold failed for another region is not resynced twice, and a later frame's rollback from the restart re-applies it without a second `warn`; two loaded regions refused at one tick log two `warn`s; a refusal kept from a frame whose fold failed, a clock resync back before its tick and the same region refused at the same tick again log a second `warn` and resync, and so do a refusal reported in a frame older than a ring of depth two, the reason's resync back before its tick and the same region refused at the same tick again; a refusal only a rollback makes (a correction makes live, before the tick a region's bundle loaded at, an entity that bundle's overlay holds) logs one `warn` and resyncs the content; an asset failure stepped into the prediction world by hand resyncs the content once (a unit test in `src/client.rs`: the fold sets no `TickInput::failures`, so no frame reaches this path today) |
 | Relevance | The message's `assets` is the world's table for the region, and `None` before one entered |
 | The policy | Each source's response, and that a `Stop` reaches the `Result` of the run that failed |
 | Shutdown | A chaos run's log is read after the world is dropped and before the executor is shut down; after `Server::shutdown` the solver pool's exit count equals its thread count, with the probe's slow `exit_handler` |
+| The solver pool's threads | Every thread of a three-thread pool ran the `start_handler` before its broadcast job (a unit test in `src/runtime.rs`); the floating-point half cannot be observed from a safe test, since no safe code leaves the deterministic state and a new thread starts in it here, so removing `enter` from the handler passes. `lactose-physics-api`'s step asserts the deterministic state, in debug builds, before and after the backend's step: the executor worker the step ran on, not a solver thread; `lactose-physics-rapier` asserts it inside its pool's `install`, on the solver thread that steps |

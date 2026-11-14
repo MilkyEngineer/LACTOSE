@@ -803,7 +803,7 @@ fn no_baseline(region: RegionId) -> Error {
 }
 
 /// Every refusal of a step at `warn`, with the region or player and the kind.
-fn log_failures(failures: &LifecycleFailures) {
+pub(crate) fn log_failures(failures: &LifecycleFailures) {
     for failure in &failures.loads {
         warn!(
             target: LOG_TARGET,
@@ -978,7 +978,7 @@ impl Future for ServerSave<'_> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::sync::PoisonError;
     use std::sync::atomic::Ordering;
 
@@ -988,7 +988,7 @@ mod tests {
     use crate::runtime::tests::SLOW_EXIT;
 
     /// Content with nothing cooked.
-    struct Nothing;
+    pub(crate) struct Nothing;
 
     impl Cooked for Nothing {
         fn baseline(&self, _: u64) -> Result<Arc<Baseline>> {
@@ -1004,7 +1004,9 @@ mod tests {
         }
     }
 
-    static EMPTY: Game = Game { name: "empty", crates: &[], order: None, sessions: None };
+    /// A game with no crate.
+    pub(crate) static EMPTY: Game =
+        Game { name: "empty", crates: &[], order: None, sessions: None };
 
     #[test]
     fn shutdown_waits_for_every_solver_thread_to_exit() {

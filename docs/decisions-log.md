@@ -1242,6 +1242,38 @@ editorial pass rather than one taken from a review.
   `SessionApplier::apply` fails as a `SessionFailure { tick, player, error }` with the
   applier's error, beside its `curd` warning; the event is still skipped. `SessionFailure`'s
   doc and `crates/sim/README.md` say so. No signature changed.
+- Addendum (lane app-client-fix, 2026-11-14; review rounds 1 and 2; the whole-project review's
+  S1, S2, S5 and C1): a prediction world is built `Directed`. `lactose-sim`'s builder refuses an
+  `Anchored` world that is not a `Server`, and `build_client` refuses it earlier, before the
+  solver pool starts, with its own message. A prediction world's region is `Frozen` until its
+  table is published and `Simulated` after: `app` folds a bundle `Simulated` when the relevance
+  carries a table and `Frozen` when it does not, a `RegionChange::Assets` sets it `Simulated`,
+  and a full frame or an `Irrelevant` drops a pending mode with its table. The cost: a region
+  the server holds `Frozen` with its table published is simulated by the client's prediction
+  world, because `RegionChange` carries no mode. Each update corrects a claimed entity there,
+  since the server sends a claimed entity whole in every packet (`lactose-net-host`'s whole-send
+  rule, section 9.4; 58 corrections in 60 frames in the proof's harness, which follows that
+  rule); a sender of changed rows alone would leave it uncorrected until the next full frame. A
+  mode variant is a `lactose-net-api` change, decided before `lactose-net`'s packer sends region
+  changes (docs/verification.md, section 4). The client's resync hint is
+  `StagedInbox::accepted_tick`: the reason's frame was accepted, so the hint is never before the
+  reason's tick. `app` alone takes the prediction world's lifecycle failures, once per frame
+  after `reconcile`, and logs them at target `app`. A refusal is a repeat, dropped unlogged,
+  only if its tick and region were reported since the last `Predictor::resync`; that set is
+  cleared after every resync (frame steps 1, 2 and 8), because a rollback re-passes recorded
+  bundles, so a refusal repeats, and a re-simulation can refuse a bundle its first application
+  loaded. A reported refusal or an asset failure is a content resync at the world's own tick,
+  reported in `ClientOutput::resync` (section 14: a client-side asset failure requests a
+  resync). This supersedes, for this crate, D118's "A prediction world's asset failures are
+  `predict`'s to take": `crates/sim/README.md` and `crates/predict/README.md` say so, and D118
+  stands as history. Each solver pool's `start_handler` enters `ThreadClass::PhysicsSolver`
+  before any job, independent of the backend; `lactose_physics_rapier::backend` enters it again
+  for a pool built without the handler, and entering the class a thread is already in is
+  harmless. The floating-point assertions run in debug builds only: `lactose-physics-api`'s step
+  asserts the deterministic state before and after the backend's step, on the executor worker
+  the step ran on, and `lactose-physics-rapier` asserts it inside its pool's `install`, on the
+  solver thread that steps; the other solver threads' state is set once at thread start and is
+  not re-checked (`crates/physics-rapier/README.md`, Known gaps).
 
 **D136. The `asset` facade, and the change it makes to `asset-api`'s store contract: what sections 4, 5.1, 8.2, 14, 15.2, 18, 19 and 20 left open** (§3, §4, §5.1, §8.2, §9.7, §14, §15.2, §18, §19, §20, §22, `lactose-asset`, `lactose-asset-api`, `lactose-bundle`, `lactose-io`, `lactose-task`, `lactose-app`, `lactose-persist`, `tools/cook`)
 - Why: the facade is written before its implementation so the cooker's skeleton, the milestone

@@ -306,7 +306,7 @@ impl Predictor {
     /// The simulation, for what `app` does between runs and nothing else: pushing frames
     /// into the world's `StagedInbox`, reading `World::regions` for the fold, taking the
     /// presentation events after [`reconcile`](Self::reconcile), and taking the
-    /// lifecycle's asset failures. A write to simulation state here is an unjournaled
+    /// lifecycle's load and asset failures. A write to simulation state here is an unjournaled
     /// edit the ring does not hold and a rollback undoes (`crates/sim/README.md`); a
     /// `dyn StagedState` inserted over the hook is caught by the next
     /// [`step`](Self::step), which refuses when the hook did not run, and repaired by
