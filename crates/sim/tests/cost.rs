@@ -337,21 +337,28 @@ fn the_scene_runs_and_its_hash_is_the_same_on_one_and_four_workers() {
 // ---- The measurement ----
 
 /// Times the `casein` spans: each sync point, stage and system, summed by name until taken.
-#[expect(clippy::disallowed_types, reason = "test code timing the step from outside")]
 mod timing {
     use std::collections::BTreeMap;
     use std::sync::Mutex;
+    use std::sync::OnceLock;
     use std::sync::atomic::{AtomicU64, Ordering};
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
     use tracing::field::{Field, Visit};
     use tracing::span::{Attributes, Id, Record};
     use tracing::subscriber::Interest;
     use tracing::{Event, Metadata, Subscriber};
 
+    /// The time since the first call: the one place the subscriber reads the clock.
+    #[expect(clippy::disallowed_types, reason = "test code timing the step from outside")]
+    fn clock() -> Duration {
+        static START: OnceLock<std::time::Instant> = OnceLock::new();
+        START.get_or_init(std::time::Instant::now).elapsed()
+    }
+
     struct Open {
         label: String,
-        entered: Option<Instant>,
+        entered: Option<Duration>,
     }
 
     #[derive(Default)]
@@ -410,12 +417,12 @@ mod timing {
 
         fn enter(&self, span: &Id) {
             if let Some(open) = self.open.lock().unwrap().get_mut(&span.into_u64()) {
-                open.entered = Some(Instant::now());
+                open.entered = Some(clock());
             }
         }
 
         fn exit(&self, span: &Id) {
-            let now = Instant::now();
+            let now = clock();
             let Some(open) = self.open.lock().unwrap().remove(&span.into_u64()) else { return };
             if let Some(entered) = open.entered {
                 *self.totals.lock().unwrap().entry(open.label).or_default() += now - entered;
