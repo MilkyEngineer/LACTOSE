@@ -1,0 +1,621 @@
+# Milestone 1 plan: World
+
+Status: proposed for the owner's approval. Written at main `3264406`, architecture revision 3.2.
+This plan maps each milestone 1 criterion of architecture section 22, and every
+`docs/verification.md` row that gates milestone 1, to a lane, the coordinator or the owner. It
+orders the lanes that remain and takes the decisions that order needs. It proposes two
+`docs/decisions-log.md` entries and the verification row text that goes with them (section 6). It
+amends no architecture sentence: revision 3.3 is a separate pass, and section 8 lists what it must
+settle.
+
+Conventions:
+
+- A verification row is cited by its line number in `docs/verification.md` at `3264406` and by its
+  opening words, since line numbers move.
+- Finding ids such as S1 or X1 are those of the whole-project review of 14 November 2026 at
+  `6ed8461`. Each is glossed where it is first used. Its D-series is always written "finding D1",
+  since the decisions log has a D1 of its own.
+- This plan re-checked in the tree the findings it builds a decision on: S1, X1, C1, C2, rows 68,
+  70 and 82, the unwired Haswell run and the lock's glam versions. The review's other findings are
+  cited as its verifier confirmed them, and the lanes that fix them re-prove them.
+- A name in code font such as `ecs-fork` is this plan's handle for a lane (section 3). It is not a
+  crate name.
+- Cost is counted in agent runs. An implementation lane is seven: the lane, its review, about two
+  fix rounds with a diff review each, and the merge. A second reviewer beside the first review
+  adds one, and a third fix round this plan expects adds two. A small lane with one fix round is
+  five. A facade is six: the architect, the review, a fix, a diff review, the last fix and the
+  merge. A text-only lane, or a probe that delivers a result file, is four. Lanes so far took two
+  to five review rounds, so the totals are a floor.
+
+## 1. The criteria
+
+Section 22 gives milestone 1 nine criteria. Status is what the tree and CI show at `3264406`.
+
+| # | Criterion | What proves it | Status at `3264406` | Closed by |
+|---|---|---|---|---|
+| 1 | 100k entities simulate a tick in at most 4 ms on 8 performance cores | `cost_of_a_tick_at_100k_rows` in `crates/sim/tests/cost.rs`: 100,064 rows, four archetypes, sixteen regions, eight kernels and two exclusive systems, the median of 60 ticks, the world hash excluded. Result file `tick-100k` | Not met, and the test is not on main: it lands with ECS hot paths part A (proposed D137, in review). That lane measured 41.3 ms on four frame workers and 40.8 ms on one (Apple M1, load about 7), from 94.1 ms. Every system runs as one job, so the worker count changes nothing | `ecs-a`, `ecs-kernel`, `ecs-fork`; judged as section 4 states |
+| 2 | SOUR passes in workers, repeat, layout and chaos modes | `cargo xtask sour run --nightly` on linux-x64, windows-x64 and macos-arm64, the nightly run's id recorded in row 122 | Green as a matrix, hollow in three places. CI run 43556574172 passed the pull-request modes at `3264406`; nightly 43408989655 passed every mode on three platforms at `d7827ea`, before the app and asset merges. The assembly's test and `lactose-predict`'s report the session's layout and chaos seed as applied instead of the world's and the executor's (X1). Each system is one graph node, so workers and chaos modes exercise no system (row 74). `lactose-ecs` is not a `[harness]` package | `sour-evidence`, `ecs-fork`, then the first nightly that holds both |
+| 3 | Physics snapshot conformance | `crates/physics-rapier/tests/conformance.rs` over `physics_api::conformance::snapshot_restore`: ten ticks, a snapshot at three, a restore, equal hashes at ten, on solver pools of one, two and four threads and two layouts | Met inside one process on every CI platform (run 43556574172). Its hashes and the hash of the physics bytes are not compared across platforms (M3) | `sour-evidence` records them; the first nightly that compares them closes it |
+| 4 | Physics phase at most 3 ms for 2,000 awake bodies | A new cost test: the physics stage of `Simulation::step` (`physics-api`'s sync, the Rapier step, the write-back) at 100k rows with 2,000 awake bodies. Result file `physics-phase` | Not measured as a phase. Its parts, on the M1 at load 3.5 to 5 (row 87): the step 0.97 to 0.99 ms on four solver threads and 1.24 to 1.27 ms on one, the sync 0.96 ms, the write-back 0.42 ms. The sum is 2.35 to 2.65 ms | `measure`; `ecs-kernel` takes the column scans (0.75 ms of the sync) down |
+| 5 | Prediction-world snapshot at most 100 µs | A new cost test: the take of one ring slot (`World::snapshot` plus `physics_api::snapshot`) through `lactose-predict` with Rapier, on the spike's scene. Result file `prediction-slot` | Not measured as a slot. Its parts: the world snapshot 5.4 µs with no statics (row 17); Rapier's write 32 µs beside no fixed collider and 92 µs beside 100 (row 87) | `measure`, confirmed by `spike-net`; decision 5.5 |
+| 6 | Sim-skeleton evaluation at most 0.5 ms for 200 characters | `the_sim_skeleton_budget` in `crates/anim/tests/cost.rs`, its figure (b). Result file `sim-skeleton` | Met on the M1: 196.9 µs on one worker and 189.3 µs on four, at load 3 to 4 (row 115). No result file, and no x86 figure | The quiet window and session B (section 4) |
+| 7 | Netcode spike over a throwaway transport: x86 server, aarch64 client, four scenarios, the correction rate, the largest absorbed difference per kind, rollback cost per tick and divergence recorded | `crates/app/tests/spike.rs` made to run (decision 5.3): its scenes recorded under SOUR, its figures in result file `spike-net` | Not started. The file is a compile-only sketch. The prediction world `lactose-app` builds loads every region `Replicated`, so it predicts nothing (S1); the fix round is in flight | `client-fix`, `sour-evidence`, `spike-net` |
+| 8 | Scalar decided by the section 16 rule | A precision probe's result file `scalar-precision` and a decision entry | Nothing exists. No document states the full map extent the rule tests at | `scalar-probe`, then the planner's decision (decision 5.4) |
+| 9 | Edit-to-playing at most 30 s per platform | The measurement section 4 defines. Result file `edit-to-playing` | Not measured and not defined. The dev profile and the linkers are configured (D125, row 63). No game crate exists | `measure`, the quiet window, session B |
+
+Of what section 22 says milestone 1 delivers, the simulation track's crates are merged, with
+`lactose-ecs` still the naive single-job runner. `lactose-io` is merged. `lactose-asset` is a
+merged facade whose implementation is in flight. `tools/cook`, the RHI spike and `lactose-rhi-null`
+are not started.
+
+## 2. The verification rows
+
+Every row whose gate names milestone 1 has an owner below, or is re-gated with its reason. "Pass"
+is the coordinator's verification pass: one edit of `docs/verification.md` after the `ecs-a` merge
+that marks closed rows Done with the run or file that closed them and cites rows by their opening
+words. Section 6 gives the exact text of every row this plan changes.
+
+| Row | Opening words | Owner | What closes it |
+|---|---|---|---|
+| 14 | Scalar precision | `scalar-probe`, then the planner | The probe's result file and the scalar decision entry |
+| 17 | Prediction-world snapshot cost | `measure`, `spike-net` | The slot measured through `lactose-predict` with Rapier; decision 5.5 settles copy-on-write |
+| 20 | Physics phase stall | `measure` for the share; re-gated for the stall | Split in two. The phase's share of the tick is measured at milestone 1 on the composed tick. The stall on render recording moves to milestone 2: nothing records a frame before `render-graph` exists |
+| 31 | Whether Rapier, parry or its math crates call `wide::mul_add` | `sour-evidence` | A reading of the pinned sources. This plan's search found no call site in `rapier3d-f64` 0.36.0, `parry3d-f64` 0.31.1, `nalgebra` 0.35.0 or `glamx` 0.3.1, and twenty mentions in `simba` 0.10.2 that the lane classifies |
+| 40 | Rapier's serialised snapshot is iteration-order stable | `sour-evidence` | The physics bytes' hash recorded under SOUR and equal on three platforms in a nightly |
+| 41 | Rapier's 64-bit build uses SIMD | `scalar-probe` | A reading of the vendored source and one disassembly; it is the cost half of the scalar decision |
+| 42 | `std::fs::File::sync_all` issues `F_FULLFSYNC` | Pass, then `data-path` | The pass records the Windows CI run of `crates/io`'s tests. `data-path` reads the pinned toolchain's std for the two Windows calls. Durability after a power loss is not measurable here and is stated as the platform's contract |
+| 43 | Directory fsync after a rename | Re-gated to 4 | macOS is measured. The file systems still open are deployment targets, and section 22.1 gives the disk-full and corrupt-save paths to milestone 4 |
+| 63 | `lld-link` on Windows | `measure`, the quiet window, session B | The edit-to-playing result files |
+| 64 | The first CI runs after the lld-link change | Pass | The trend of the Windows jobs over the runs since |
+| 65 | Assets of runtime-spawned entities | Re-gated to 3 | Decision 5.8 |
+| 66 | Enforcing that the loader of a simulation-read asset kind | `xtask-policy` | `cargo xtask boundary` requires every `impl SimulationAsset` outside tests to sit in a boundary crate, as `lactose-anim`'s three do |
+| 68 | `cargo xtask features` should fail if any normal or build edge | Pass | Closed by code: `[dev_only_features]` in `crate-tiers.toml`, enforced in `tools/xtask/src/tiers.rs` |
+| 70 | `cargo xtask boundary` should check that `rustdocflags` | `xtask-policy` | A check with a failing fixture. `boundary.rs` reads `rustflags` only today |
+| 72 | The ECS facade | `spike-net` | The predicted-key rule under lost and substituted inputs and after a disconnect, on both ends |
+| 73 | A region's seed and persistent region resources | Pass | Closed by D129: `RegionRecords` carries them beside the overlay, and so does the relevance message |
+| 74 | ECS implementation gaps | `ecs-fork`, `silo`, pass | `ecs-fork` makes workers and chaos modes mean something. `silo` tests `Ctx::assets` through a pinned table. D122 settled the correction path (corrections are written stamped, section 9.4). The pass trims the rest |
+| 75 | Two section 5.2 and 9.7 features | Re-gated to 4 and 5 | Decimation is milestone 4's. `ordered` and per-region reductions have no consumer before game systems. `ecs-fork` reports that its merge of partials leaves `ordered` additive |
+| 82 | A CI grep stops any crate but `lactose-task` naming loom | `xtask-policy` | The rule inside `cargo xtask features`; the workflow step goes |
+| 83 | `lactose-sim` (D118) is implemented | `ecs-a`, `binds-impl`; the rest re-gated to 3 | The `ecs-a` merge records the hash's cost. `binds-impl` adds `Debug`. The single-pass hash, the frame-level region request and the late-insert check are milestone 3's |
+| 86 | `lactose-physics-api` (D119) is implemented | `sour-evidence`, `spike-net` | The conformance scene, then the spike's contact scenes, equal on three platforms in the nightlies |
+| 87 | Physics costs on the milestone 1 ECS | `measure`, `ecs-kernel` | The whole phase measured; `changed_since` skips chunks whose column tick predates the mark |
+| 88 | The physics snapshot contract | `sour-evidence` | The recorded physics hash, and the reading of Rapier's deserialisation |
+| 89 | `World::query` visits every live entity | `ecs-a` | Its merge |
+| 90 | `lactose-input` is implemented | Pass | The x86-64 confirmations are CI's. The world-frame check against the camera rig stays at milestone 2 |
+| 93 | `lactose-net-api` is implemented | `sour-evidence`, `spike-net`, the scalar decision | The `ProtocolHash` pinned over `Game::types()` (C3). The spike measures the gather path. The quantiser bounds follow the scalar |
+| 94 | `lactose-predict` is implemented | `spike-net`, `measure` | Ring depth, the slot with Rapier and the absorbed figures. How a re-spawned body presents is milestone 2's |
+| 99 | `World::insert` of a component the row already holds | `ecs-a` | Its merge |
+| 101 | `cargo-deny` 0.20.2 skips a path source | Workflow pass | The workflow pins `cargo-deny`. The row becomes a standing check at each change of the pin, gate none |
+| 102 | The `sin_cos` patch is not upstream | The owner | The upstream report, its link in `vendor/README.md` |
+| 105 | The reconciliation tolerance (D124) | `spike-net`, the scalar decision | The spike's figures under the defaults; the defaults are re-set only if the scalar changes |
+| 106 | An empty solver is a fresh solver (D124) | Pass, `measure` | x86-64 is CI's nextest of `crates/physics-rapier/tests/reload.rs`. `measure` records the full diff's cost on a 100k-entity reload |
+| 108 | Rapier step never blocks a pool thread | Pass | Closed by D123 |
+| 109 | Every channel is cleared at a run's closing sync point | `spike-net` | A carrier column reconciled against a server |
+| 110 | The save's cost at the milestone 1 scale | Pass | Closed as measured. No criterion names it and no x86 run is owed |
+| 112 | `SchemaTable`'s schema derivation | `schema-digest` | `lactose-ecs` exports `document_schema`; `lactose-bundle` exports `write_table` and `read_table` |
+| 113 | A layout change without a version bump | `schema-digest`, `schema-guard` | The digest in `ComponentSchema`; the committed version-and-digest record |
+| 114 | A persistent region resource over 16 KiB | `schema-digest` | Registration refuses it |
+| 115 | Sim-skeleton evaluation | The quiet window, session B | Result files |
+| 116 | Bodies' cost per tick | `measure` | A Rapier run, recorded outside the criterion |
+| 117 | A dynamic character's yaw | `spike-net` | Measured on the spike's capsule |
+| 122 | The `app` implementation (D131) | Pass | The first nightly at or after the `sour-evidence` merge |
+| 125 | The headless binary's 120-tick run | Session B | The same hash on x86-64 |
+| 132 | Mount cost (D136) | `silo` | Recorded with the implementation |
+| 133 | The cooked pack set of a fresh process | `ricotta` | The manifest or naming rule, and the mount order |
+
+Rows 32, 84, 85 and 123 are closed. Row 36's remaining check, which glam Rapier selects, is closed:
+`Cargo.lock` gives `glamx` 0.3.1 its `glam` 0.33.12, and `deny.toml` bans `fast-math` and
+`core-simd`. Row 29 names glam 0.34.0, which the lock does not hold; the pass corrects it.
+
+Milestone 0 left seven rows without a Done mark. The pass closes row 12 (io_uring on CI runners)
+from the nightly probe and row 69 (cross-architecture agreement of `lactose-math`) from CI's x86-64
+runs. Rows 76, 78, 79 and 80 are carried into milestone 1 by the first entry of section 6. Row 62
+(Windows efficiency-core steering) is re-gated to milestone 2.
+
+## 3. The lanes
+
+Three lanes are in flight at `3264406`. Their costs are what remains.
+
+| Lane | What it does | Needs | Proof it owes | Runs |
+|---|---|---|---|---|
+| `ecs-a` | ECS hot paths part A (proposed D137): queries by archetype, an allocation-free overwrite, the event index, no allocation per row | In review | `crates/sim/tests/cost.rs` on main; rows 89 and 99 closed by counts, not timing | 2 |
+| `client-fix` | The client fix round: a prediction world's regions are `Simulated` (S1); the resync target after a stall (S2); the lifecycle's outputs taken (S5); the solver pool's start handler (C1, the `app` half) | In flight | In `crates/app/tests/proof/client.rs`: a kernel advanced a claimed row after a folded full frame; one resync after several queued frames; a refused bundle reported once | 6 |
+| `silo` | `lactose-asset` implemented against its facade (D136) | In flight; the concurrency reviewer reads beside its first review | The README's proof table; `asset-api`'s conformance suite over raw and zstd packs; row 132; `Ctx::assets`; the README sentence of decision 5.8 | 7 |
+
+The lanes that follow, in the order their dependencies allow:
+
+| Lane | What it does | Needs | Proof it owes | Runs |
+|---|---|---|---|---|
+| `sour-evidence` | `applied` built from the world's layout and the executor's chaos configuration in the assembly's and `lactose-predict`'s tests (X1). A recording test for the conformance scene: the world hash each tick and the physics bytes' hash at the end (M3). `ProtocolHash` pinned over `Game::types()` of an empty game (C3). The reading for row 31 | `client-fix` merged | A world that ignores its layout fails layout mode. Rows 40, 86, 88 and 122 rewritten from the first nightly after the merge | 7 |
+| `ecs-kernel` | ECS part B, first half: the per-chunk kernel path of the `#[system]` expansion, and `changed_since` skipping chunks by column tick | `ecs-a` merged | No public signature changes. Counts hold it: allocations, rows visited, chunks skipped. Miri. SOUR in the pull-request, layout and chaos modes. The cost test before and after, with load. Steering figure: the one-core tick at 100k rows at most 24 ms | 7 |
+| `ecs-fork` | ECS part B, second half: each system a graph node whose units are chunk ranges (decision 5.2). The debug assertion of the floating-point state at every job (C1, the ECS half). `lactose-ecs` joins `[harness]`. The cost scene, scaled down, recorded under SOUR | `ecs-kernel` merged; the concurrency reviewer reads beside its first review | Every SOUR mode. A merge of outputs in completion order fails chaos mode. Miri. The cost test on one worker and on every performance core | 10 |
+| `stream-design` | Architect: what a client world gets from the stream. The `OwnedBy` cascade on a client (S3) and transient presence on the wire (S4). Corrects D133 | `client-fix` merged | A facade and decision text; row 96 widened | 6 |
+| `spike-net` | The netcode spike (decision 5.3) | `client-fix` and `sour-evidence` merged | Criterion 7; rows 72, 93, 94, 105, 109 and 117 | 9 |
+| `stream-impl` | Implements `stream-design` in `lactose-net-api`, `lactose-predict`, `lactose-ecs` and `lactose-anim` | `stream-design` and `spike-net` merged | The review's two probes as tests: a released item survives its former owner's tombstone on the client; a claimed spawn carries its transient components | 7 |
+| `xtask-policy` | The backend's allowlist cut to its manifest, and trait routes to the platform library banned (X2). The whole lint file pinned (X3). `[harness]` and the recording tests tied to the tree (X4). The unsafe list compared with section 21 (X5). Rows 66, 70 and 82 | None | Each rule has a fixture that fails: a deleted ban, a dropped harness package, a swapped unsafe crate, a deleted `rustdocflags` | 7 |
+| `measure` | `cargo xtask measure` and the result-file convention (decision 5.11). The missing cost tests: the physics phase through `Simulation::step` with Rapier, a prediction slot and a seven-tick rollback through `lactose-predict` with Rapier, the composed tick, the full diff of a 100k reload, bone bodies on Rapier. The edit-to-playing measurement. The 100k test run at the machine's performance-core count, printing the part that runs as one job | `ecs-a` and `xtask-policy` merged | One command writes every result file on the M1, each with the header section 4 names. Times are printed, never asserted | 7 |
+| `schema-digest` | The D129 additions: `document_schema` exported, `write_table` and `read_table` exported, the layout digest in `ComponentSchema` (a bundle format bump) and compared by `World::load_region`, a non-derived resource over 16 KiB refused at registration | `silo` merged | Rows 112, 113 and 114. A same-size layout change without a version bump is refused at a region load | 7 |
+| `ricotta` | The RICOTTA skeleton in `tools/cook`: inputs, processors behind `asset-api`'s traits, one pack out, the pack-set manifest or naming rule. One kind cooked end to end, chosen in its brief: `lactose-anim`'s kinds have cooked formats today, and no authored scene format exists for a baseline | `schema-digest` merged | A pack `ricotta` wrote mounts in SILO, and its assets load and pin. Cooking the same inputs twice writes the same bytes. Row 133's milestone 1 half | 7 |
+| `schema-guard` | A committed record of each saved type's version and layout digest, and the test that fails on a digest changed without a version bump and on a field ID reused | `schema-digest` merged | Section 15's "CI rejects ID reuse" becomes true: both mutations fail | 5 |
+| `scalar-probe` | The precision probe of decision 5.4, and the readings for row 41 | None | Result file `scalar-precision` | 4 |
+| `spike-rhi` | The RHI spike (decision 5.10) | The GPU reviewer defined (approved by the owner, not yet in `.claude/agents/`); the Vulkan SDK on the development Mac | Result file `spike-rhi` | 4 |
+| `rhi-api` | Architect: the facade of `lactose-rhi-api`, unstable until the native Metal spike (D43), with its conformance suite's shape | `spike-rhi` merged | A facade; the reviewer and the GPU reviewer both read it | 7 |
+| `rhi-null` | `lactose-rhi-null` against the facade | `rhi-api` merged; revision 3.3's ruling on whether the server links it (C2) | The conformance suite passes on the null backend; it stays test support (`crate-tiers.toml`) | 7 |
+| `data-path` | A container's sections checked against each other and its header (finding D3). A zero-size field refused at registration (finding D4). The migrate, rebase and bundle sequence tested for a type the baseline carries (finding D5). The reading for row 42 | None | The review's three probes as tests | 7 |
+| `binds-design` | Architect: binds restored or carried across a save, the journal checkpoint included (finding D1). Corrects D133 | `data-path` merged | A facade and decision text | 6 |
+| `binds-impl` | Implements `binds-design` in `lactose-persist`, `lactose-sim`, `lactose-ecs` and `lactose-app` | `binds-design` and `ecs-fork` merged | A fresh process that leaves a predicted owner's region unloaded hashes equal to the original, beside section 15.5's tests | 7 |
+| `keeper` | One bounded attempt at the tick-start criterion (section 6, first entry), and the wall-clock log of samples over 1 ms (row 78) | Session A's numbers | Result file `whisk` from a quiet M1, or the cause stated | 4 to 8, counted as 6 |
+| `readme-sweep` | Text only: README sentences that are stale, misattribute the `net-api` and `net-host` split, wait for crates that have merged, or name a crate by a codename (the review's C4, C6, C8, C9 a and c, and S6) | `stream-design` decided, for the one sentence that cites it | Every corrected sentence names what it now agrees with | 4 |
+
+Document work beside the tracks: this plan's review and answer (2 runs); revision 3.3 (3); the
+scalar decision (3); the definition of the GPU reviewer and its review (2); the exit of section 7
+(8). The coordinator's verification pass and its workflow pass are its own work.
+
+The whole is about 165 agent runs: 15 to finish the lanes in flight, 131 for the lanes above and
+18 for the document work.
+
+Three lanes need a facade first: `stream-impl`, `binds-impl` and `rhi-null`. No other lane does.
+`lactose-ecs`'s surface is final, `tools/cook` is a leaf that writes SILO's format, and the spike
+lives in `lactose-app`'s tests.
+
+**Order.** Three tracks run at once, with the document work beside them. Each default queue below
+is in dependency order, and the coordinator refills a free slot from any queue whose head is
+unblocked.
+
+| Queue | Lanes, in order | Runs |
+|---|---|---|
+| 1, the ECS and then render | `ecs-a`, `ecs-kernel`, `ecs-fork`, `scalar-probe`, `spike-rhi`, `rhi-api`, `rhi-null`, `keeper`, `readme-sweep` | 51 |
+| 2, the client and then the save path | `client-fix`, `sour-evidence`, `spike-net`, `stream-impl`, `data-path`, `binds-design`, `binds-impl` | 49 |
+| 3, assets and tools | `silo`, `stream-design`, `xtask-policy`, `measure`, `schema-digest`, `ricotta`, `schema-guard` | 46 |
+
+Three rules bind whatever the coordinator reorders:
+
+- One lane at a time edits `lactose-ecs`. `stream-impl` and `binds-impl` both add to it, and they
+  start after `ecs-fork` has merged. An architect round that adds a signature to it merges between
+  two ECS lanes, never during one.
+- One lane at a time edits `tools/xtask`: `xtask-policy`, then `measure`.
+- The measurement commit is the first commit of main that holds `ecs-fork`, `measure`, `spike-net`
+  and `stream-impl`. The quiet window and session B run there (section 4). The render lanes and
+  the save-path lanes need not have merged by then. If `stream-impl` is the only one missing, the
+  commit does not wait for it: the spike's result file names the gap, and the spike is measured
+  again in a second quiet window after it merges.
+
+**Where this reorders the coordinator's queue, and why.**
+
+- ECS part B is two lanes, and the kernel path comes first (decision 5.2).
+- `measure` moves ahead of the spike's figures and of the last ECS merge. Every number after it is
+  a file with its machine, commit and load, which is what the review's M5 found missing.
+- `schema-digest` moves ahead of `ricotta` and directly behind `silo`. A bundle format bump moves
+  every test that pins document bytes, and is cheapest before the cooker adds its own (decision
+  5.6).
+- `spike-net` starts as soon as `client-fix` and `sour-evidence` have merged. It does not wait for
+  the two architect rounds. `stream-design` runs beside it and `stream-impl` follows it, so the
+  figures checked in at the measurement commit come from the hooks that ship.
+- `xtask-policy` moves ahead of the second architect round and of the data-path lane, because
+  `measure` waits on it.
+- The render lanes start when queue 1 is free of the ECS, not after everything else. They are a
+  chain of eighteen runs with three outside prerequisites, and nothing else depends on them.
+
+**The coordinator's passes.**
+
+- The verification pass, after the `ecs-a` merge: section 2's Done marks, the row text of section
+  6, rows cited by opening words, machine and load on every milestone 1 number that has them.
+- The workflow pass, pushed alone: `cargo-deny` and `cargo-nextest` pinned; the stale comments in
+  `ci.yml` rewritten; a step in the nightly SOUR jobs that prints the runner's CPU model and
+  feature flags (decision 5.7); the nightly Miri job split per crate. That job took 38 to 57
+  minutes of its 60 in the eight green nightlies of 5 to 13 November, and `ecs-kernel` and
+  `ecs-fork` add tests to it.
+
+## 4. Machines, workloads and result files
+
+The only machine the agents can measure on is the developer's Apple M1: four performance and four
+efficiency cores, under agent load. The x86 desktop is the owner's; its core count, its operating
+systems and its GPU are not recorded anywhere in the repository.
+
+**Three sittings produce every number a criterion rests on.**
+
+- *Session A*, the owner's, as soon as this plan is approved. On the x86 desktop at main's head:
+  `cargo bench -p lactose-task --bench whisk` and `cargo nextest run -p lactose-task`. The owner
+  sends back the two files the benchmark writes, the CPU model and the operating system. It closes,
+  or fails, the x86 half of milestone 0's criteria, and it tells this plan how many performance
+  cores criterion 1 can be run on. It needs no new code. No result file exists from Windows or
+  Linux, where CI lints the benchmark and does not run it; if it fails there, that failure is the
+  session's result and goes to `keeper`.
+- *The quiet window*, the coordinator's, at the measurement commit. Every track stops, the machine
+  holds `caffeinate -i -s`, and `cargo xtask measure --all` runs once. A number measured under
+  agent load stays in a lane's report: it steers, and it proves nothing.
+- *Session B*, the owner's, at the same commit. On the x86 desktop, on each operating system it
+  boots: `cargo xtask measure --all`. The owner commits the files it writes, or sends them back.
+
+**What each timing criterion runs, and against what.**
+
+| Criterion | Workload | On the M1 | On the x86 desktop |
+|---|---|---|---|
+| 1, the 100k tick | `cost_of_a_tick_at_100k_rows`; frame workers equal to the performance cores; T is the median step and S the part of it that runs as one job (sync points, exclusive systems, finalize steps) | T + S at most 8 ms on four workers (decision 5.1) | T at most 4 ms on eight workers if it has eight performance cores; otherwise the projection of decision 5.1 |
+| 4, the physics phase | The new phase test: 100k rows, 2,000 awake bodies on a floor, the solver pool at `lactose-app`'s default (frame workers minus one) | At most 3 ms | At most 3 ms |
+| 5, the snapshot | The new slot test: the spike's scene, one character, fifty claimed bodies and its fixed colliders | The take at most 100 µs; the restore recorded | Recorded; the client of criterion 7 is the aarch64 machine |
+| 6, the sim skeleton | `the_sim_skeleton_budget`, figure (b) | At most 0.5 ms | At most 0.5 ms |
+| 7, rollback cost per tick | The spike's measurement test | Recorded; it has no budget | Not run |
+| 9, edit-to-playing | From saving a one-line change in the body of the sketch game's system in `crates/app-headless/src/main.rs` to the report line of `cargo run -p lactose-app-headless -- 1`; dev profile, warm build, the median of five | At most 30 s | At most 30 s on each operating system |
+| Milestone 0, WHISK | `cargo bench -p lactose-task --bench whisk` | Its own thresholds (`crates/task/README.md`) | The same |
+
+The composed tick, the cost scene with the 2,000 awake bodies in it, is recorded beside criteria 1
+and 4. It is the share of the tick section 16 asks milestone 1 to measure, and it is not a
+criterion.
+
+The headless binary's 120-tick run (row 125) is part of `measure`: the hash it prints on x86-64
+must be the one row 125 records.
+
+**How a result is checked in.** `docs/results/<measurement>-<machine>-<date>.md`, with a `.json`
+beside it where the measurement writes one. The date is UTC. Each file opens with the CPU and
+operating system, the topology the executor detected, the workers used, the commit (with `-dirty`
+if the tree had changes), the build profile, the command, and the load average before and after
+(on Windows, the processor's idle share over the run). `cargo xtask measure` writes that header;
+`docs/results/README.md` lists each measurement with its command and where its threshold is
+stated. A verification row cites the file and no longer carries the number's history.
+
+## 5. Decisions this plan takes
+
+Each is a recommendation the owner approves with the plan. Each names what would change it.
+
+**5.1 Criterion 1 is the tick without physics, and four cores prove it by projection.** Each
+criterion of section 22 keeps its own workload: the 100k tick is the scene of
+`crates/sim/tests/cost.rs`, which holds no body, and the physics phase is measured on its own
+scene. The world hash is outside the tick: SOUR pays it at every step, and a shipped binary pays it
+only when it asks. The M1 has four performance cores and the desktop's count is unknown, so on N
+performance cores below eight the criterion is S + (T − S) × N / 8 at most 4 ms, which on the M1 is
+T + S at most 8 ms. That is the tick an eight-core machine would show if the forked part scaled
+linearly from N cores to eight, and it is a projection, not the criterion as written. Revision 3.3
+restates the sentence. Two facts would change this: session A showing eight performance cores on
+the desktop, which makes the direct run the proof; or the owner reading the 4 ms as the whole tick
+with the physics phase inside it, which leaves the ECS about 1 ms and makes the kernel path's
+target four times harder.
+
+**5.2 ECS part B is two lanes, and both conform to sections 5.2 and 6.** Part A's lane measured
+that about 40 of the 41 ms are per-row invocation overhead, and estimated the fork alone at 11 to
+12 ms on four cores. The fork cannot reach the criterion without the kernel path, and the kernel
+path rewrites the code the fork would otherwise parallelise first and lose. So `ecs-kernel` lands
+the per-chunk kernel path sequentially, and `ecs-fork` then forks the shape that stays. The
+arithmetic behind the steering figure: T + S at most 8 ms with S near 0.5 ms leaves the forked
+part 7 ms on four cores, 24 core-milliseconds at part A's estimate of 3.5 times, so the one-core
+tick must fall from 41 ms to about 24 ms. The review of part A left six design questions about
+the fork, and the architecture already answers them:
+
+- A system is a graph node with a remaining-units counter, its units are chunk ranges, and a
+  stolen range splits (sections 5.1 and 5.2). There is no scope per system.
+- A column's coarse tick is written once at dispatch, by the parent, before any unit runs
+  (section 6).
+- Partials merge through order-independent combinators. A reduction that needs key order is
+  `ordered` and sorts in finalize (section 5.2). Nothing folds in chunk order.
+- Buffers belong to a job. Nothing is pooled by worker slot, which the boundary lint file bans.
+- The layout mode's random splits are drawn before the fork, or keyed by tick, system, archetype
+  and chunk.
+- Outputs, events and commands merge in the order D117 fixes, whatever order the units finished.
+
+What would change this: `ecs-kernel` missing its steering figure by a wide margin, in which case
+the coordinator asks the planner for a ruling before `ecs-fork` is briefed.
+
+**5.3 The netcode spike runs in one process over a seeded link, and SOUR's architecture mode is its
+x86 server.** The spike is `crates/app/tests/spike.rs` made to run: a server and a client built by
+`lactose-app`, a throwaway transport that delays and drops packets by tick from a seed, a stand-in
+clock, scripted input samples, and the four scenarios of section 22. Its scenes are recording
+tests. Each records both worlds' hashes every tick and a hash of every packet either end sends, and
+the nightly architecture mode compares them across linux-x64, windows-x64 and macos-arm64. Each end
+is a function of the bytes it receives, the scripted samples and the seed. So if every platform
+records the same bytes, an x86 server paired with an aarch64 client exchanges those bytes too, tick
+by tick, and the aarch64 client's run on the M1 is a run against the x86 server. The figures the
+criterion names are measured on the M1 by an ignored release test and checked in. No second binary,
+socket or two-machine session is built: a live link would add only real jitter, which milestone 4
+injects anyway. The spike does not wait for S3 and S4, since no scenario owns an entity through
+another or carries an animated character; its checked-in figures are taken after `stream-impl`.
+What would change this: the recorded bytes differing between platforms. That difference is then the
+finding (row 86), and a live run across two machines is needed to measure the correction rate it
+causes.
+
+**5.4 The 32-bit branch is built only if a probe passes the precision half.** Section 16's rule
+adopts 32 bits only if positional error at the map edge stays under one millimetre over ten minutes
+and every SOUR mode passes. The precision half needs no engine change. `scalar-probe` runs the walk
+scene of `crates/physics-rapier/tests/support` for 36,000 ticks on upstream `rapier3d` 0.36.0 in 32
+bits, in a throwaway crate outside the workspace, at the origin and translated by the extent, and
+reports the largest difference between the two runs' positions relative to their scene origins. It
+runs the same pair in 64 bits as the control. The result file carries the probe's source. No
+document states the map extent, so the probe runs at 6 km (D59's figure) and at 8 km. If the error
+is at or over one millimetre, 64 bits stay, the SOUR half is moot, and the planner writes the
+decision with the 64-bit rollback loop's cost on the M1 from `measure`. The expectation, by
+arithmetic and not by measurement: a 32-bit position between 4 and 8 km is spaced 0.49 mm, a
+walking step rounds by up to half of that each tick, and 36,000 ticks accumulate about 27 mm as a
+random walk. What would change this: the probe passing. The owner is then asked whether to
+commission the branch (the scalar in `lactose-math` with new golden vectors, a second vendored
+Rapier, the quantiser bounds, every SOUR mode), which is worth its cost only if the 64-bit rollback
+loop leaves the ring shallower than the deepest correction the spike records.
+
+**5.5 Copy-on-write snapshots are not built, and a prediction world holds at most 64 fixed
+colliders as rows.** D34 builds copy-on-write only if the milestone 1 measurement exceeds the
+budget. The measurements in rows 17 and 87 already decide it. The part copy-on-write would share,
+the world snapshot, is 5.4 µs with no statics and 28 µs with a thousand. The cost is Rapier's
+serialisation of each fixed collider: 0.6 µs to write and 1.0 to 1.2 µs to restore, so the take
+reaches 100 µs near 100 fixed colliders and the restore near 75, and copy-on-write in
+`lactose-predict` cannot share Rapier's bytes. At 64 the take is about 76 µs and the restore about
+92 µs. The spike's scenes need a floor and a handful of blocks. The bound is a content rule at
+milestone 1, stated in the two READMEs and recorded by the spike's result file. Milestone 3 removes
+the need for it: section 9.4 already gives the prediction world "the immutable static collision
+asset", and cooked static scenery reaches the solver as that asset, held outside the per-tick
+snapshot, when `physics-api` gains collision meshes. What would change this: the slot measured
+through `lactose-predict` at the measurement commit exceeding 100 µs on the spike's scene.
+
+**5.6 The bundle's layout digest lands in milestone 1, before the cooker.** D129 left
+`ComponentSchema` without the digest, so a same-size layout change without a version bump is
+refused in a save and not seen in a baseline or an overlay. Adding it is a bundle format bump
+that changes every baseline's and overlay's bytes and every baseline's content hash. Each test
+that pins document bytes moves with it, and those only multiply: SILO's baseline kind is being
+implemented and the cooker comes next. So `schema-digest` follows `silo` and precedes `ricotta`,
+and row 113 is not re-gated. What would change this: the lane finding that the digest needs a
+change to `lactose-bundle`'s surface beyond the one D129 names. It then stops, and the row moves
+to milestone 3 with that reason.
+
+**5.7 The Haswell-masked run stays in section 8.3 and gates milestone 4.** It is the one dynamic
+check that no dependency selects a different numeric path on a CPU newer than the x86-64-v3
+baseline. That matters when clients on arbitrary x86 CPUs predict against a server, which is
+milestone 4, where architecture mode also moves to every pull request. It gets a verification row
+now. Until then the nightly prints each runner's CPU model and feature flags beside its hashes,
+so the history shows which feature sets have agreed. What would change this: any nightly
+comparison, the spike's stream above all, differing between two x86 hosts. The run is then wired
+at once.
+
+**5.8 A region's asset set at milestone 1 is `Baseline::assets`, and row 65 moves to milestone
+3.** Section 14, `crates/asset/README.md` and row 65 give the set three ways. Nothing at
+milestone 1 spawns or migrates an entity that references an asset outside its region's baseline,
+and `lactose-persist` already defers a section's resident assets to milestone 3. The asset README
+is corrected with `silo` (section 6). The rule milestone 3 needs is row 65's: the baseline's set,
+the `AssetRef`s of resident entities the baseline does not hold, and a spawnable set the baseline
+declares, with a spawn that names an asset outside the table a tick-stamped asset failure. It
+widens section 14 and is listed for revision 3.3. What would change this: a milestone 1 lane
+needing a runtime-spawned entity to read an asset through its region's table.
+
+**5.9 Edit-to-playing at milestone 1 is measured on the sketch game, and no build-time mitigation
+is taken unless it is over.** No game crate exists before milestone 5, so milestone 1 measures
+the floor: the headless binary's own game, one crate recompiled, the link and the start. Section
+22.1's row "Build-time mitigation if over budget" closes at milestone 1 with the measurement if
+it is under thirty seconds on every platform, and the row is asked again at milestone 5 against
+the real game crates. If the floor is over, the planner writes the mitigation as a proposal
+before milestone 1 exits. Section 18's own fallback is dylib reload.
+
+**5.10 The RHI spike answers one question, and `rhi-api`'s facade is written in milestone 1.**
+Section 22 delivers `lactose-rhi-null` in milestone 1 and `lactose-rhi-api` in milestone 2, and
+the first implements the second. The facade is therefore written in milestone 1 and stays
+unstable until the native Metal spike (D43). The spike's question: what must `rhi-api` expose for
+section 12.1's list to run on Vulkan 1.3 with no call a null backend cannot honour? Its evidence
+is a throwaway `ash` program, never merged, headless, on the M1 under MoltenVK. It walks the list:
+a device and queues, a buffer with a device address, one bindless heap, a pipeline from
+precompiled SPIR-V with a specialisation constant, a pipeline cache saved and reloaded, encoders
+recorded on two threads, a pass with a transient attachment and a local read, a timeline
+semaphore, an indexed indirect draw, and a readback of the triangle. Its result file records, for
+each item, the feature or extension used, whether MoltenVK reports it, the state the caller
+carried between calls (which is what a null backend must keep), and what needed external
+synchronisation. lavapipe and the desktop's GPU are `rhi-vulkan`'s at milestone 2. Before
+`rhi-null` is briefed, revision 3.3 settles whether the server links it (C2): `crate-tiers.toml`
+and D83 say it does not, and this plan assumes that.
+
+**5.11 A measurement that proves a criterion is a file, written by one command.** Section 20
+already requires results to be checked in. `cargo xtask measure` makes that one command on any
+machine, with the header of section 4, so an owner session is a clone and a command.
+
+**5.12 Milestone 0's unshown criteria are exit conditions of milestone 1.** The first entry of
+section 6 is the decision.
+
+**For the owner.** These are the questions and actions only the owner can supply.
+
+1. The x86 desktop's CPU model, the operating systems it boots, and its GPU.
+2. Session A now and session B at the measurement commit (section 4).
+3. The Vulkan SDK installed on the development Mac before `spike-rhi` is briefed.
+4. The upstream report of the `sin_cos` patch (row 102).
+5. Whether criterion 1's 4 ms is the tick without the physics phase (decision 5.1). Recommended:
+   yes.
+6. Whether the projection of decision 5.1 may stand as proof of criterion 1 if the desktop has
+   fewer than eight performance cores. Recommended: yes.
+7. Whether architecture mode over the spike's recorded bytes may stand for "x86 server, aarch64
+   client" (decision 5.3). Recommended: yes.
+8. If `keeper` does not reach 20 µs: whether the tick-start criterion is restated at 35 µs in
+   revision 3.3. Recommended: yes, with the cause or the failed attempt recorded.
+9. The reference map's extent, only if the probe's 6 km and 8 km runs fall on different sides of
+   one millimetre.
+
+## 6. Text for the coordinator (exact)
+
+The coordinator allocates the numbers at merge. D137 is reserved for `ecs-a`.
+
+### Decision entry: milestone 0's carried criteria
+
+```
+**D-next. Milestone 0's unshown criteria are exit conditions of milestone 1** (§5.1, §20, §22, `lactose-task`, `docs/results`)
+- Why: milestone 1's lanes began with part of section 22's milestone 0 proof not shown, and no
+  decision recorded it. On the developer's Apple M1 the two checked-in runs of the benchmark
+  (`docs/results/whisk-apple-m1-2026-10-09.md` at `00f1f3d`,
+  `docs/results/whisk-apple-m1-2026-10-10.md` at `8cf544c`) pass the makespan ratio (at most 1.139
+  at P50 and 1.206 at P99, against 1.25 and 1.5), the wake from an idle pool (P99 32.8 and 30.4 µs
+  against 35) and the steal (P99 125 and 167 ns against 1 µs). They fail tick start: P99 24.5 and
+  29.9 µs at 60 Hz against 20, with P50 3.7 and 2.8 µs and none of 5,000 deadlines over 1 ms. The
+  quiet machine is the slower of the two states the keeper shows, and the cause is not known
+  (D116). No x86 desktop has run the benchmark, so the x86 half of every criterion is unshown.
+  Five verification rows gated at milestone 0 are open: the wake and tick-start rows, the
+  wall-clock log of samples over 1 ms, the first run of the Linux and Windows topology parsers on
+  real hardware, and Windows efficiency-core steering. Loom and Miri pass nightly.
+  - *Milestone 1 was not held for them.* The criteria prove the executor. Nothing a milestone 1
+    lane builds depends on an x86 figure or on the 10 µs between the measured tick start and its
+    criterion: each consumer measures its own cost. Rules out reading milestone 0 as closed.
+  - *Each is an exit condition of milestone 1.* It closes by a result file under `docs/results`,
+    or by an owner decision that restates it, recorded as an addendum here.
+  - *The x86 half closes in one session on the owner's desktop* at main's head: the benchmark and
+    `lactose-task`'s tests. The files it writes pass or fail makespan, wake, tick start and steal
+    on x86, and the topology it prints closes the parsers' row.
+  - *Tick start gets one bounded attempt.* One lane on `lactose-task`, after the x86 numbers,
+    finds what separates the two machine states or shows a keeper that meets 20 µs at P99 on a
+    quiet M1 for at most 1.5% of a core. One hypothesis it tests, not confirmed: the keeper spins
+    the last 50 µs, and a final timed park that ends late by the deep-idle exit the wake spike
+    measured (P99 24 to 29 µs) passes the deadline. The same lane logs the wall-clock time of
+    every sample over 1 ms. If the attempt fails, the owner restates the criterion at the 35 µs of
+    the wake criterion in the next architecture revision, with the attempt recorded. Rules out a
+    second attempt, and a criterion that stays failed and unrecorded.
+  - *Windows efficiency-core steering is re-gated to milestone 2*, where the first Windows client
+    runs asset work beside frame work. It needs hybrid x86 hardware to measure.
+- Driven by: the whole-project review at `6ed8461` (no milestone 1 plan; milestone 0's failed
+  criterion carried without a record); `docs/plans/milestone-1.md`.
+- Replaced: nothing. It records what was done without a record.
+```
+
+### Decision entry: the plan's rulings
+
+```
+**D-next+1. The milestone 1 plan: how its criteria are judged, what is re-gated, and the decisions that came due** (§5.2, §8.3, §9.4, §12.1, §14, §15.4, §16, §18, §20, §22, §22.1, §23, `docs/plans/milestone-1.md`)
+- Why: no document mapped section 22's milestone 1 criteria, or the verification rows that gate
+  milestone 1, to a lane or an owner. Four criteria had nothing proving them, criterion 1 names a
+  machine nobody has, and several rows waited on decisions nobody had been asked to take.
+  `docs/plans/milestone-1.md` is the map and gives each decision's reasons; these are the
+  decisions.
+  - *Each criterion keeps its own workload.* The 100k tick is the scene of
+    `crates/sim/tests/cost.rs`, without physics and without the world hash; the physics phase is
+    measured on its own scene; the composed tick is recorded and is not a criterion. Rules out
+    reading the 4 ms as a tick with the 3 ms physics phase inside it.
+  - *On N performance cores below eight, criterion 1 is judged by projection*:
+    S + (T − S) × N / 8 at most 4 ms, T the median tick on N frame workers and S the part of it
+    that runs as one job.
+    On the M1 that is T + S at most 8 ms. Rules out a criterion no machine in reach can prove; the
+    next revision restates the sentence.
+  - *The parallel runner is two lanes, the per-chunk kernel path first, then chunk ranges as the
+    units of a graph node.* Both conform to sections 5.2 and 6 as written. Rules out a scope per
+    system, partials folded in chunk order and buffers pooled by worker slot.
+  - *The netcode spike runs in one process over a seeded link and a stand-in clock, and SOUR's
+    architecture mode over the bytes both ends record is its x86 server.* Rules out a second
+    binary and a two-machine session, unless the bytes differ between platforms.
+  - *The 32-bit scalar branch is built only if a probe on upstream 32-bit Rapier passes the
+    precision half of section 16's rule.* Rules out a second vendored Rapier and a scalar switch
+    in `lactose-math` built to test a rule the arithmetic says it fails.
+  - *Copy-on-write snapshots are not built* (D34's condition): the cost of a slot is Rapier's
+    serialisation of fixed colliders, 0.6 µs each to write and about 1.1 µs to restore, which
+    copy-on-write in `lactose-predict` cannot share. A prediction world holds at most 64 fixed
+    colliders as rows until cooked static scenery reaches the solver as the static collision asset
+    of section 9.4, outside the per-tick snapshot, at milestone 3.
+  - *The bundle's layout digest lands in milestone 1*, before the cooker: it changes the bytes
+    of every baseline and overlay, and every test that pins them moves with it.
+  - *The Haswell-masked run stays in section 8.3 and gates milestone 4*, with architecture mode's
+    move to every pull request. Until then the nightly prints each runner's CPU model and flags.
+  - *A region's asset set at milestone 1 is `Baseline::assets`.* The assets of residents the
+    baseline does not hold, and a declared spawnable set, are milestone 3's, with
+    `lactose-persist`'s deferral.
+  - *Edit-to-playing at milestone 1 is measured on the headless binary's sketch game*, and section
+    22.1's build-time mitigation is decided only if that floor is over thirty seconds.
+  - *`lactose-rhi-api`'s facade is written in milestone 1*, unstable (D43), since
+    `lactose-rhi-null` implements it. The RHI spike is a throwaway program on the M1 under
+    MoltenVK that walks section 12.1's list.
+  - *A measurement that proves a criterion is a file under `docs/results`* with its machine,
+    date, commit, topology and load, written by `cargo xtask measure`.
+  - *Re-gated*: the physics phase's stall on render recording to milestone 2; the directory sync
+    on other file systems to milestone 4; `ordered` and per-region reductions to milestone 5.
+- Driven by: the whole-project review at `6ed8461` (its findings on the missing plan, the
+  unproven criteria, the unrecorded measurements, the bundle digest, the asset set and the
+  Haswell run); the owner's decision of 14 November 2026 to plan before revision 3.3.
+- Replaced: nothing in `docs/architecture.md` until the next revision, which restates criterion 1,
+  the spike's sentence and the sentences `docs/plans/milestone-1.md` section 8 lists.
+```
+
+### Verification rows
+
+Each change is anchored on the row's opening words. Apply them after the `ecs-a` merge, which
+rewrites rows 74, 83, 89 and 99.
+
+```
+--- section 1, the row "Physics phase stall": replace with two rows ---
+| Physics phase share | The physics phase's share of the tick, on the composed tick of `cargo xtask measure` (the 100k cost scene with 2,000 awake bodies) | 1 |
+| Physics phase stall | The stall the physics phase imposes on render recording during the overlap; nothing records a frame before `render-graph` exists | 2 |
+
+--- section 1, the row "Scalar precision": replace with ---
+| Scalar precision | Simulation scalar precision at full map extent: the walk scene for 36,000 ticks on upstream 32-bit Rapier, at the origin and translated by 6 km and by 8 km, against the same pair in 64 bits; the result file carries the probe. The 32-bit branch is built only if the error stays under one millimetre (`docs/plans/milestone-1.md`, decision 5.4) | 1 |
+
+--- section 4, the row "Directory fsync after a rename (D130)": append to its text, and replace its gate `| 1 |` with `| 4 |` ---
+ Re-gated to milestone 4 (D-next+1): the file systems still unmeasured are deployment targets, and architecture section 22.1 gives the disk-full and corrupt-save paths to milestone 4
+
+--- section 4, the row "Windows efficiency-core steering": append to its text, and replace its gate `| 0 |` with `| 2 |` ---
+ Re-gated to milestone 2 (D-next): the first Windows client is where background work runs beside frame work, and the measurement needs hybrid x86 hardware
+
+--- section 4, the row "Assets of runtime-spawned entities": replace with ---
+| A region's asset set beyond its baseline's (architecture section 14). At milestone 1 the set is `Baseline::assets` and nothing spawns or migrates an entity that names an asset outside it. Decide with streaming: the set is the baseline's set, the `AssetRef`s of resident entities the baseline does not hold (read from the region's section by `persist`), and a spawnable set the baseline declares; a spawn that names an asset outside the table is a tick-stamped asset failure. It widens section 14 | 3 |
+
+--- section 4, the row "Two section 5.2 and 9.7 features": replace its gate `| 1 and 4 |` with ---
+| 4 (decimation) and 5 (`ordered` and per-region reductions, first needed by game systems) |
+
+--- section 4, the rows "Wake latency against the 20 µs P99 criterion", "The benchmark Mac enters idle or maintenance sleep", "The Linux and Windows core-topology parsers" and "Tick-start latency against the 20 µs P99 criterion": replace each gate `| 0 |` with ---
+| 1 (carried, D-next) |
+
+--- section 4, the row "A layout change without a version bump": replace with ---
+| A layout change without a version bump is refused by the digest in a save and not seen by `World::load_region` in a baseline or overlay until `lactose-bundle`'s `ComponentSchema` carries the digest (D129). The per-type version-and-digest record that would stop one being written, and the check on a reused field ID that section 15 names, do not exist yet. Both land in milestone 1, the digest before the cooker (D-next+1) | 1 |
+
+--- section 4, the row "`lactose-sim` (D118) is implemented": once `binds-impl` has given `Simulation` its `Debug`, strike that clause and replace its gate `| 1 and 3 |` with ---
+| 3 |
+
+--- section 4, the row "`cargo-deny` 0.20.2 skips a path source": replace its gate `| 1 |` with `| none |` once the workflow pins `cargo-deny`, and append ---
+ The workflow pins `cargo-deny`, so an upgrade is a change of that pin and the re-check goes with it
+
+--- section 4, add rows ---
+| The Haswell-masked linux-x64 run of architecture mode (architecture section 8.3, D30) is not wired: the nightly's SOUR jobs run on whatever CPU the runner has. Wire it under an emulator that hides everything newer than the x86-64-v3 baseline (Intel SDE or `qemu-x86_64 -cpu Haswell`), over the baseline run of the recording tests only, and measure what it costs the nightly, whose whole SOUR matrix takes five to six minutes on linux-x64 today. Until then the nightly prints each runner's CPU model and feature flags beside its hashes, so the history shows which feature sets have agreed; a comparison that differs between two x86 hosts wires it at once (D-next+1) | 4 |
+| A prediction world holds at most 64 fixed colliders as rows (D-next+1): with Rapier a slot's take reaches the 100 µs budget near 100 fixed colliders beside fifty bodies and its restore near 75. Cooked static scenery must reach the prediction world's solver as the static collision asset of architecture section 9.4, held outside the per-tick snapshot, when `physics-api` gains collision meshes; decide then what enforces the bound | 3 |
+| The netcode spike's recorded streams (D-next+1): `crates/app/tests/spike.rs` records both worlds' hashes each tick and a hash of every packet either end sends under SOUR, over a seeded link and a stand-in clock, and the nightly architecture mode compares them across linux-x64, windows-x64 and macos-arm64. Equal bytes on every platform are what stands for "x86 server, aarch64 client" in section 22; a difference is a finding and calls for a run across two machines | 1 |
+| Section 22's milestone 1 timing criteria are proven by result files under `docs/results`, written by `cargo xtask measure` on a quiet Apple M1 and on the owner's x86 desktop at one commit (`docs/plans/milestone-1.md`, section 4). Criterion 1 on fewer than eight performance cores is judged by projection (D-next+1). Edit-to-playing is measured on the headless binary's sketch game; section 22.1's build-time mitigation is decided only if it is over thirty seconds, and asked again at milestone 5 | 1 |
+| The nightly Miri job took 38 to 57 minutes of its 60-minute limit in the eight green nightlies of 5 to 13 November 2026, before the ECS hot-path work added tests, and a timeout also drops the two weak-memory steps after `lactose-ecs`. Split the job per crate before the parallel ECS runner merges | 1 |
+```
+
+### One README sentence, for the `silo` lane
+
+In `crates/asset/README.md`, replace "The region's asset set is `Baseline::assets`, which its
+driver requests by name." with:
+
+```
+At milestone 1 the region's asset set is `Baseline::assets`, which its driver requests by name;
+the assets of residents the baseline does not hold join it at milestone 3 (architecture section
+14, `docs/verification.md`).
+```
+
+## 7. The exit
+
+Milestone 1 exits when these have happened, in this order.
+
+1. The measurement commit exists. The quiet window and session B have run on it, and their result
+   files are on main.
+2. The planner has written the scalar decision from the probe and the measured rollback loop, and
+   the owner has approved it.
+3. Every queue of section 3 has drained, so section 22's delivers are on main: the parallel ECS
+   runner, SILO, the RICOTTA skeleton, the RHI spike's result and `lactose-rhi-null`.
+4. The coordinator's pass has left every row of section 2 Done or re-gated.
+5. A `reviewer` reads each of the nine criteria, and each carried criterion of milestone 0,
+   against its test and its result file. It reports one verdict per criterion: met; met as
+   restated, naming the decision; or not met. It re-runs what it can on the M1 and states what it
+   could not.
+6. The owner rules on every "not met": another lane, or a restatement recorded in the decisions
+   log. Milestone 1 does not exit on an unrecorded miss.
+7. The follow-up project review reads the determinism and readiness seams at that commit. Its
+   blocking and serious findings are fixed or routed before step 8.
+8. The planner writes the milestone 2 plan.
+
+## 8. For revision 3.3
+
+Revision 3.3 is the planner's next pass. It must settle these. The first seven are the review's.
+
+| Item | What 3.3 decides |
+|---|---|
+| C2: the null RHI backend is given to the server by sections 2 and 12.1 and denied to it by section 4 and `crate-tiers.toml` | Recommended: strike the server from both sentences; D83 replaced D51's clause. It gates `rhi-null` |
+| C10: section 20's interface rules are not the process in force | State the rule in force: a crate other crates are written against gets a facade first, and backends follow as their own lanes. Narrow "every `-api` ships a conformance suite" to interfaces a backend implements |
+| Finding D7: section 15.1 says derived types are "Rebuilt by `on_load`", and no such hook exists | Say who rebuilds a derived value: the system that owns it |
+| S1's sentence: a prediction world's region modes | State that a prediction world's regions are `Simulated`, and what a server-`Frozen` region is on a client, from the `client-fix` report |
+| C1's option: section 8.2's debug assertion on a NaN in a persistent column has no check | Add the check, or strike the sentence and open a row. Recommended: keep the sentence and assert where NaNs are already canonicalised, in the hasher and the serialiser, in debug builds; the check then goes with `binds-impl`, which already edits `lactose-sim` |
+| C9(b): codenames on test glue (`struct Sour`, `sour_*`, `silo_*` test functions) | Rename the glue, or give section 3 a test-glue exception. Recommended: rename |
+| X6's option: strike the Haswell-masked run from section 8.3 | Recommended: keep it, gated at milestone 4 (decision 5.7) |
+| Section 22, milestone 1, criterion 1 | Restate the machine: eight performance cores, or the projection of decision 5.1. State that the tick excludes the physics phase and the world hash |
+| Section 22, milestone 1, the netcode spike | State what "x86 server, aarch64 client" is proven by (decision 5.3) |
+| Section 22, rows 1 and 2 | `rhi-api`'s facade is a milestone 1 delivery, unstable until milestone 2's spikes |
+| Section 22, milestone 0, tick start | Only if `keeper` fails and the owner restates it: 35 µs, and D113's premise corrected |
+| Section 16, "Milestone 1 measures the physics phase's share of the tick and the stall it imposes on render recording during the overlap" | The stall moves to milestone 2 |
+| Section 22.1, "Build-time mitigation if over budget" | Closes at milestone 1 on the floor measurement and is asked again at milestone 5 |
+| Section 18, "Edit-to-playing time is measured per platform in milestone 1" | Say what milestone 1 measures before a game crate exists (decision 5.9) |
+| Section 14, a region's asset set | Row 65's rule: residents the baseline does not hold, and a declared spawnable set (decision 5.8) |
+| Sections 9.4, 10 and 23, copy-on-write and static scenery | Copy-on-write is not built; static scenery reaches a prediction world's solver as the collision asset, outside the snapshot (decision 5.5) |
+| Section 20, results | The result-file convention and `cargo xtask measure`; section 4's `xtask` line gains it |
+| Section 8.3, "Hashing `physics-api::snapshot` bytes is added once Rapier's serialisation is shown to be order-stable" | Amended by the `sour-evidence` merge if the nightly shows it, not by 3.3; listed so 3.3 does not restate the old sentence |
