@@ -426,6 +426,70 @@ pub fn unlisted_binaries(ws: &Workspace, roots: &[String]) -> Vec<Finding> {
         .collect()
 }
 
+/// The crate whose `loom` feature swaps the executor's primitives for loom's.
+const LOOM_OWNER: &str = "lactose-task";
+
+/// The one other package that may name loom: as an optional dependency that only its own
+/// feature `loom = ["dep:loom"]` turns on. The feature builds the package's loom models and
+/// changes nothing it ships.
+const LOOM_MODELS: &str = "lactose-input-host";
+
+/// Features unify across a build, so one package turning on `lactose-task/loom` would switch
+/// every executor in that build to loom's primitives, which panic outside a model. No
+/// workspace package but `lactose-task` names loom: no dependency on it, under any rename,
+/// no dependency declaration or feature that turns on a feature named `loom`, and no feature
+/// of that name, except `lactose-input-host`'s optional dependency and its feature
+/// `loom = ["dep:loom"]`. Read from `cargo metadata`, so a comment is not a use.
+#[must_use]
+pub fn loom_users(ws: &Workspace) -> Vec<Finding> {
+    let mut findings = Vec::new();
+    for package in ws.packages.iter().filter(|p| p.name != LOOM_OWNER) {
+        let models = package.name == LOOM_MODELS;
+        let mut report = |what: String| {
+            findings.push(Finding::new(
+                package.manifest(),
+                format!(
+                    "`{}` {what}; only {LOOM_OWNER} names loom, since a feature turned on in one \
+                     build turns its executor into loom's model everywhere ({LOOM_MODELS}'s \
+                     optional dependency and `loom = [\"dep:loom\"]` excepted)",
+                    package.name
+                ),
+            ));
+        };
+        for dep in &package.deps {
+            if dep.name == "loom" && !(models && dep.optional && dep.key() == "loom") {
+                report(format!("depends on loom (as `{}`)", dep.key()));
+            }
+            if dep.features.iter().any(|feature| feature == "loom") {
+                report(format!("turns on the `loom` feature of `{}`", dep.name));
+            }
+        }
+        for (feature, values) in &package.features {
+            let excepted = models && feature == "loom" && values == &["dep:loom"];
+            if excepted {
+                continue;
+            }
+            if feature == "loom" {
+                report(format!("has a feature named `loom` ({values:?})"));
+            }
+            for value in values.iter().filter(|value| names_loom(value)) {
+                report(format!("has the feature `{feature}` turn on `{value}`"));
+            }
+        }
+    }
+    findings
+}
+
+/// Whether a `[features]` value names loom: the dependency (`loom`, `dep:loom`, `loom/x`,
+/// `loom?/x`) or a feature named `loom` of a dependency (`x/loom`, `x?/loom`).
+fn names_loom(value: &str) -> bool {
+    let value = value.strip_prefix("dep:").unwrap_or(value);
+    match value.split_once('/') {
+        Some((dep, feature)) => dep.trim_end_matches('?') == "loom" || feature == "loom",
+        None => value == "loom",
+    }
+}
+
 /// Runs `cargo tree` for `package` as built for `triple`, over normal and build edges and,
 /// if `dev` is set, dev edges too.
 ///
@@ -815,5 +879,65 @@ root v0.0.0 (/ws)|
         assert!(found[0].to_string().starts_with(
             "crates/app-client/Cargo.toml: `lactose-app-client` is a shipped binary but is not in [feature_roots]"
         ));
+    }
+
+    #[test]
+    fn only_the_executor_names_loom() {
+        // Row 82 of docs/verification.md, formerly a grep step of the CI workflow.
+        use crate::workspace::DepKind::{Dev, Normal};
+        let feature = |values: &[&str]| values.iter().map(|v| (*v).to_owned()).collect::<Vec<_>>();
+        let mut task = package("lactose-task", &[("loom", Normal)]);
+        task.deps[0].optional = true;
+        task.features.insert("loom".to_owned(), feature(&["dep:loom"]));
+        let mut host = package("lactose-input-host", &[("lactose-task", Normal), ("loom", Dev)]);
+        host.deps[1].optional = true;
+        host.features.insert("loom".to_owned(), feature(&["dep:loom"]));
+        let ws = workspace(vec![task.clone(), host.clone()]);
+        assert_eq!(loom_users(&ws), []);
+
+        let tail = "only lactose-task names loom, since a feature turned on in one build turns \
+                    its executor into loom's model everywhere (lactose-input-host's optional \
+                    dependency and `loom = [\"dep:loom\"]` excepted)";
+        let mut ecs = package("lactose-ecs", &[("lactose-task", Normal), ("loom", Dev)]);
+        ecs.deps[0].features.push("loom".to_owned());
+        ecs.deps[1].rename = Some("model_checker".to_owned());
+        ecs.features.insert("loom".to_owned(), feature(&[]));
+        ecs.features.insert("check".to_owned(), feature(&["lactose-task?/loom", "loom/futures"]));
+        let found: Vec<String> = loom_users(&workspace(vec![task.clone(), ecs]))
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        let at = |what: &str| format!("crates/ecs/Cargo.toml: `lactose-ecs` {what}; {tail}");
+        assert_eq!(
+            found,
+            [
+                at("turns on the `loom` feature of `lactose-task`"),
+                at("depends on loom (as `model_checker`)"),
+                at("has the feature `check` turn on `lactose-task?/loom`"),
+                at("has the feature `check` turn on `loom/futures`"),
+                at("has a feature named `loom` ([])"),
+            ]
+        );
+
+        // The exception is the optional dependency and the one feature, nothing wider.
+        host.deps[1].optional = false;
+        host.features.insert("loom".to_owned(), feature(&["dep:loom", "lactose-task/loom"]));
+        let found: Vec<String> =
+            loom_users(&workspace(vec![task, host])).iter().map(ToString::to_string).collect();
+        assert_eq!(found.len(), 4, "{found:#?}");
+        assert!(found[0].contains("depends on loom (as `loom`)"), "{found:#?}");
+        assert!(found[1].contains("has a feature named `loom`"), "{found:#?}");
+        assert!(found[2].contains("turn on `dep:loom`"), "{found:#?}");
+        assert!(found[3].contains("turn on `lactose-task/loom`"), "{found:#?}");
+    }
+
+    #[test]
+    fn a_feature_value_names_loom_as_the_dependency_or_as_a_feature() {
+        for value in ["loom", "dep:loom", "loom/x", "loom?/x", "x/loom", "x?/loom"] {
+            assert!(names_loom(value), "{value}");
+        }
+        for value in ["bloom", "dep:loomish", "x/loomy", "x", "std"] {
+            assert!(!names_loom(value), "{value}");
+        }
     }
 }

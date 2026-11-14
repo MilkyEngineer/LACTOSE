@@ -174,6 +174,13 @@ transitive = [
   # lane arithmetic is IEEE add, mul and compare (the sign of zero in min and max is the open
   # item of docs/verification.md).
   "safe_arch",
+  # Rapier's math (D119), which `lactose-physics-rapier` reaches through `rapier3d-f64` and
+  # names only through its re-exports (`rapier3d_f64::na`, `rapier3d_f64::parry`). Under the
+  # resolved features glam and simba compute transcendentals through `libm` (simba's
+  # `libm_force`); the routes from simba's `RealField` and `SimdSigned` and from num-traits'
+  # `Float` to the standard library's float methods are banned in every boundary clippy.toml,
+  # and no boundary crate may name num-traits, which is on no `normal` list.
+  "glam", "glamx", "nalgebra", "num-traits", "parry3d-f64", "simba", "wide",
   # postcard's framing helper; byte shuffling only.
   "cobs",
   # The second exception beside `libm` (D119): its GEMM kernels are selected by CPU feature
@@ -192,10 +199,10 @@ transitive = [
 "lactose-sim" = { normal = ["tracing"], dev = ["xxhash-rust"] }
 "lactose-physics-api" = { normal = ["tracing"] }
 "lactose-anim" = { normal = ["tracing"] }
-# D119: the solver and its math (rapier3d-f64 is the vendored, patched copy under vendor/),
-# its thread pool, and serde with postcard for the snapshot bytes.
+# D119: the solver (rapier3d-f64 is the vendored, patched copy under vendor/), its thread
+# pool, and serde with postcard for the snapshot bytes. The solver's math is on `transitive`:
+# the crate names it only through Rapier's re-exports.
 "lactose-physics-rapier" = { normal = [
-  "bytemuck", "glam", "glamx", "nalgebra", "num-traits", "parry3d-f64", "postcard",
-  "rapier3d-f64", "rayon", "serde", "simba", "tracing", "wide",
+  "bytemuck", "postcard", "rapier3d-f64", "rayon", "serde", "tracing",
 ] }
 "lactose-predict" = { normal = ["tracing"] }

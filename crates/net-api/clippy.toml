@@ -89,6 +89,26 @@ disallowed-methods = [
   { path = "f64::rem_euclid", reason = "goes through `%`, the platform fmod; use lactose_math" },
   { path = "f64::div_euclid", reason = "goes through `%`, the platform fmod; use lactose_math" },
   { path = "f64::mul_add", reason = "result depends on the caller's target features; use lactose_math::Scalar::mul_add" },
+  { path = "f32::asinh", reason = "platform libm, through ln_1p and hypot; use lactose_math" },
+  { path = "f32::acosh", reason = "platform libm, through ln; use lactose_math" },
+  { path = "f32::atanh", reason = "platform libm, through ln_1p; use lactose_math" },
+  { path = "f64::asinh", reason = "platform libm, through ln_1p and hypot; use lactose_math" },
+  { path = "f64::acosh", reason = "platform libm, through ln; use lactose_math" },
+  { path = "f64::atanh", reason = "platform libm, through ln_1p; use lactose_math" },
+  # D119: the routes from Rapier's math to the float methods above, which a call on a scalar
+  # bounded by these traits takes instead of the inherent method. Under the resolved features
+  # simba's `RealField` hands `max`, `min` and the sign tests to the inherent methods and
+  # `copysign` to libm's, which observes the NaN sign alike; `simd_copysign` calls it, and
+  # `SimdSigned`'s sign tests reach the inherent ones through num-traits. The rest of
+  # `RealField` and `ComplexField` is compare-and-select or libm (simba's `libm_force`).
+  { path = "simba::scalar::RealField::max", reason = "reaches f64::max: nondeterministic on signed zero; use lactose_math", allow-invalid = true },
+  { path = "simba::scalar::RealField::min", reason = "reaches f64::min: nondeterministic on signed zero; use lactose_math", allow-invalid = true },
+  { path = "simba::scalar::RealField::copysign", reason = "observes NaN sign", allow-invalid = true },
+  { path = "simba::scalar::RealField::is_sign_positive", reason = "observes NaN sign", allow-invalid = true },
+  { path = "simba::scalar::RealField::is_sign_negative", reason = "observes NaN sign", allow-invalid = true },
+  { path = "simba::simd::SimdRealField::simd_copysign", reason = "observes NaN sign", allow-invalid = true },
+  { path = "simba::simd::SimdSigned::is_simd_positive", reason = "observes NaN sign", allow-invalid = true },
+  { path = "simba::simd::SimdSigned::is_simd_negative", reason = "observes NaN sign", allow-invalid = true },
   # Architecture section 8.2: the worker index is never a semantic key, the executor's or the
   # solver pool's.
   { path = "lactose_task::JobContext::slot", reason = "the worker index is not a semantic key; key by StableKey", allow-invalid = true },
@@ -317,6 +337,12 @@ disallowed-types = [
   { path = "std::hash::RandomState", reason = "randomly seeded" },
   { path = "hashbrown::HashMap", reason = "use lactose_core::FixedHashMap", allow-invalid = true },
   { path = "hashbrown::HashSet", reason = "iteration order is observable", allow-invalid = true },
+  # D119: num-traits' `Float` hands every method to the inherent one of the same name, the
+  # banned ones among them, and `Real` is implemented through it. This lint catches a trait in
+  # a bound or a named import; no boundary crate may name num-traits (crate-tiers.toml), and
+  # none of the crates it reaches re-exports it.
+  { path = "num_traits::Float", reason = "reaches the inherent float methods, platform libm among them; use lactose_math", allow-invalid = true },
+  { path = "num_traits::real::Real", reason = "reaches the inherent float methods, platform libm among them; use lactose_math", allow-invalid = true },
   # Bans `thread_local!` through the type it declares. The `disallowed-macros` lint cannot
   # be used for it: on the pinned toolchain a local `expect` does not reach an item macro.
   { path = "std::thread::LocalKey", reason = "no thread-local state inside the boundary" },

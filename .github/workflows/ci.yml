@@ -142,20 +142,6 @@ jobs:
       - name: Vendored crates
         if: success() || failure()
         run: cargo xtask vendor
-      # Features unify across a build, so one crate enabling `lactose-task/loom` would switch
-      # every executor to loom primitives, which panic outside a model. Only the root manifest
-      # (the version), `crates/task` and input-host's own optional `loom` feature and
-      # dependency may name loom; input-host's feature only builds its models and changes
-      # nothing it ships, and no other line of its manifest may mention loom.
-      - name: Nothing enables the loom feature
-        if: success() || failure()
-        run: |
-          if grep -rn --include=Cargo.toml loom crates tools | grep -v -e '^crates/task/' \
-               -e '^crates/input-host/Cargo.toml:[0-9]*:#' \
-               -e '^crates/input-host/Cargo.toml:[0-9]*:loom = \["dep:loom"]$' \
-               -e '^crates/input-host/Cargo.toml:[0-9]*:loom = { workspace = true, optional = true }$'; then
-            echo "only crates/task and input-host's optional loom feature may name loom"; exit 1
-          fi
 
   # SOUR, the determinism harness (architecture section 8.3): workers mode and one layout
   # capacity on every pull request, over every package listed under [harness] in

@@ -285,7 +285,7 @@ fn check_features(args: &[&str]) -> Checked {
         rest = tail;
     }
     let policy = &context.policy;
-    let mut findings = Vec::new();
+    let mut findings = features::loom_users(&context.workspace);
     let roots = if named.is_empty() {
         // The shipped binaries and the harness packages, each once.
         findings.extend(features::unlisted_binaries(&context.workspace, &policy.feature_roots));
@@ -409,6 +409,7 @@ fn harness_run(args: &[&str]) -> Checked {
         eprintln!("sour: {} mode(s), {} test run(s)", plans.len(), outcome.launches);
         findings.extend(outcome.findings);
         baseline = outcome.baseline.unwrap_or_default();
+        findings.extend(harness::recording_tests(&baseline, &context.policy.harness_tests));
     }
     if let Some(file) = emit {
         fs::write(&file, harness::emit(&baseline))

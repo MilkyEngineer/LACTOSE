@@ -224,6 +224,49 @@ pub fn unlisted_simulation(ws: &Workspace, packages: &[String]) -> Vec<Finding> 
     }
 }
 
+/// Compares the tests that recorded hashes in the baseline run with the committed list,
+/// `tests` under [harness] in the policy file. A test that did not record although listed was
+/// renamed, ignored, deleted or stopped recording, and its comparison is silently gone; one
+/// that recorded but is not listed was added without the list knowing. Either is a finding
+/// naming what to change there. An empty baseline is reported by [`run`] and not again here.
+#[must_use]
+pub fn recording_tests(baseline: &Hashes, listed: &[String]) -> Vec<Finding> {
+    if baseline.is_empty() {
+        return Vec::new();
+    }
+    let recorded: BTreeSet<&str> = baseline.keys().map(|(test, _)| test.as_str()).collect();
+    let mut findings = Vec::new();
+    let mut seen = BTreeSet::new();
+    for test in listed {
+        if !seen.insert(test.as_str()) {
+            findings.push(Finding::new(
+                POLICY_FILE,
+                format!("[harness] `tests` lists `{test}` twice; remove one"),
+            ));
+        } else if !recorded.contains(test.as_str()) {
+            findings.push(Finding::new(
+                POLICY_FILE,
+                format!(
+                    "[harness] `tests` lists `{test}`, which recorded no hash in the baseline \
+                     run: it was renamed, ignored, deleted, or no longer records. Make it record \
+                     again, or replace the entry with the name it records under now, or remove \
+                     it if the test is gone on purpose"
+                ),
+            ));
+        }
+    }
+    for test in recorded.iter().filter(|test| !seen.contains(*test)) {
+        findings.push(Finding::new(
+            POLICY_FILE,
+            format!(
+                "test `{test}` recorded hashes but [harness] `tests` does not list it; add \
+                 \"{test}\" to that list in the same commit as the test"
+            ),
+        ));
+    }
+    findings
+}
+
 /// The hashes one run recorded, keyed by (test, tick).
 pub type Hashes = BTreeMap<(String, u32), u64>;
 
@@ -1076,5 +1119,45 @@ mod tests {
             absent[0].message.starts_with("the sound stand-in recorded 0 hashes"),
             "{absent:?}"
         );
+    }
+
+    fn listed(tests: &[&str]) -> Vec<String> {
+        tests.iter().map(|test| (*test).to_owned()).collect()
+    }
+
+    #[test]
+    fn the_recording_tests_are_the_listed_ones() {
+        // Review X4: a test that stops recording takes its comparison with it, silently.
+        let baseline = hashes(&[("a::one", 1, 7), ("a::one", 2, 8), ("b::two", 1, 9)]);
+        assert_eq!(
+            lines(&recording_tests(&baseline, &listed(&["a::one", "b::two"]))),
+            [] as [&str; 0]
+        );
+
+        // Renamed: the old name records nothing, the new one is unlisted.
+        let renamed = hashes(&[("a::one", 1, 7), ("b::two_renamed", 1, 9)]);
+        assert_eq!(
+            lines(&recording_tests(&renamed, &listed(&["a::one", "b::two"]))),
+            [
+                "tools/xtask/ci-policy.toml: [harness] `tests` lists `b::two`, which recorded no hash in the baseline run: it was renamed, ignored, deleted, or no longer records. Make it record again, or replace the entry with the name it records under now, or remove it if the test is gone on purpose",
+                "tools/xtask/ci-policy.toml: test `b::two_renamed` recorded hashes but [harness] `tests` does not list it; add \"b::two_renamed\" to that list in the same commit as the test",
+            ]
+        );
+
+        // Ignored (or deleted, or no longer recording): it is listed and recorded nothing.
+        let ignored = hashes(&[("a::one", 1, 7)]);
+        let found = lines(&recording_tests(&ignored, &listed(&["a::one", "b::two"])));
+        assert_eq!(found.len(), 1, "{found:#?}");
+        assert!(found[0].contains("lists `b::two`, which recorded no hash"), "{found:#?}");
+
+        // A name listed twice is one entry too many.
+        let found = lines(&recording_tests(&baseline, &listed(&["a::one", "b::two", "a::one"])));
+        assert_eq!(
+            found,
+            ["tools/xtask/ci-policy.toml: [harness] `tests` lists `a::one` twice; remove one"]
+        );
+
+        // A run that recorded nothing is reported by `run`, not as every test missing.
+        assert_eq!(lines(&recording_tests(&Hashes::new(), &listed(&["a::one"]))), [] as [&str; 0]);
     }
 }

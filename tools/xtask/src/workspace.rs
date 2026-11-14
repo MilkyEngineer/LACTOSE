@@ -51,6 +51,8 @@ pub struct Dep {
     pub kind: DepKind,
     /// Where it comes from.
     pub source: DepSource,
+    /// Whether it is optional, compiled only when a feature turns it on.
+    pub optional: bool,
     /// The name the declaring package uses for it, when it renames it.
     pub rename: Option<String>,
     /// The features the declaration turns on, `default` aside.
@@ -393,6 +395,7 @@ pub fn parse_metadata(json: &str) -> Result<Metadata, String> {
                     Some(_) => DepSource::Path,
                     None => DepSource::External,
                 },
+                optional: dep.optional,
                 rename: dep.rename.clone(),
                 features: dep.features.clone(),
             })
@@ -525,6 +528,7 @@ pub(crate) mod fixture {
                     name: dep.to_owned(),
                     kind,
                     source: source_of(dep),
+                    optional: false,
                     rename: None,
                     features: Vec::new(),
                 })

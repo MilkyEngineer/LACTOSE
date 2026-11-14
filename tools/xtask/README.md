@@ -33,14 +33,16 @@ to standard output itself.
 | File | Holds |
 |---|---|
 | `crate-tiers.toml` | Every dependency rule: tiers, test-support crates, the boundary list, the boundary's dependency allowlists, the server denylist, exceptions |
-| `tools/xtask/ci-policy.toml` | What is not a dependency rule: the unsafe list of section 21, the crates that carry the boundary lint file without being in the boundary, the shipped binaries, the harness packages |
+| `tools/xtask/ci-policy.toml` | What is not a dependency rule: the unsafe list of section 21, the crates that carry the boundary lint file without being in the boundary, the shipped binaries, the harness packages and the tests that record hashes |
 | `deny.toml` | Licences, sources, advisories and duplicate versions, enforced by `cargo deny check` |
 | `crates/core/clippy.toml` | The boundary lints; every boundary crate carries an identical copy |
 
-A new shipped binary goes into `[feature_roots]`, and a package with simulation tests into
-`[harness]`, both in `ci-policy.toml`. Nothing in the code names a crate of the workspace
-except where a rule itself does: `lactose-app-server` (the server denylist), the
-`lactose-app-` prefix and `lactose-sim` (the two guards below).
+A new shipped binary goes into `[feature_roots]`, a package with simulation tests into
+`[harness]` `packages` and each simulation test into `[harness]` `tests`, all in
+`ci-policy.toml`, in the commit that adds them. Nothing in the code names a crate of the
+workspace except where a rule itself does: `lactose-app-server` (the server denylist), the
+`lactose-app-` prefix and `lactose-sim` (the two guards below), and `lactose-task` and
+`lactose-input-host` (the loom rule).
 
 ## `tiers`
 
@@ -57,14 +59,14 @@ on, and a listed feature the crate does not declare are findings.
 ## `boundary`
 
 - Each boundary crate, and each crate of `[lint_file_carriers]`, has a `clippy.toml`
-  byte-identical to `crates/core/clippy.toml`, and that file still bans a required minimum
-  (`REQUIRED_LINT_PATHS` in `src/boundary.rs`, the executor's core count and rayon's worker
-  index among it) and every route to a thread outside an executor (`THREAD_ROUTES`; a unit
+  byte-identical to `crates/core/clippy.toml`. Every entry of that file is pinned in
+  `src/boundary.rs`: it is a route to a thread outside an executor (`THREAD_ROUTES`; a unit
   test holds the list to the reference's entries that say a boundary crate creates no thread
-  or cite section 16, so none can be dropped quietly behind `allow-invalid`). Every entry of
-  that file under `rayon::`, `rapier3d_f64::`, `parry3d_f64::` or `std::thread::` is in
-  `THREAD_ROUTES` or in `NOT_THREAD_ROUTES`, the few there that start no thread, whatever its
-  reason says.
+  or cite section 16, so none can be dropped quietly behind `allow-invalid`), one of the few
+  entries under `rayon::`, `rapier3d_f64::`, `parry3d_f64::` or `std::thread::` that start
+  no thread (`NOT_THREAD_ROUTES`), or in `REQUIRED_LINT_PATHS`, the rest in the reference's
+  order. An entry the file drops, and an entry it adds that none of the three lists holds,
+  are findings, so the reference's banned set equals the union of the three.
 - Each other crate of `[boundary_internal] any` compiles into every boundary crate and has a
   `clippy.toml` whose entries under the paths that reach files, the environment, a
   subprocess or the network, or create a thread through the standard library (`OUTSIDE_WORLD` in `src/boundary.rs`), are
@@ -87,6 +89,10 @@ on, and a listed feature the crate does not declare are findings.
   crate directory or above it, those lints weakened in `[lints]` or `[workspace.lints]`, and
   `CLIPPY_CONF_DIR` or an `-A` flag for those lints in a workflow, script or cargo
   configuration file.
+- `[unsafe_crates]` equals the table of architecture section 21 (found by its heading,
+  `## <n>. Unsafe policy`): each backticked name in a row's first cell is a crate, its last
+  path segment the role, so `tools/cook` is `lactose-cook`. A missing document, heading or
+  table, or a row that names no crate, is a finding, not a pass.
 - A crate on the unsafe list has a `SAFETY.md`. Every other crate has
   `#![forbid(unsafe_code)]` before the first item of every crate root: library, binaries,
   integration tests, benches, examples and `build.rs`.
@@ -96,6 +102,9 @@ on, and a listed feature the crate does not declare are findings.
   there. Architecture section 8.2 says "directly or at any depth" and a boundary crate's
   tests run under SOUR, so a dev-dependency on a workspace crate is held to the same list,
   with two additions for tests only: a `[test_support]` crate and `[boundary_internal] dev`.
+  Each name on a boundary crate's `normal` or `dev` list is one its manifest names; a crate
+  it reaches only through others is vetted on `transitive`, so a list cannot grow
+  permissions the manifest does not use.
 - Every workspace crate a boundary crate reaches through normal and build edges, at any
   depth, through crates outside the boundary, is a boundary crate or one
   `[boundary_internal]` lets that crate name; the finding gives the chain. A boundary crate
@@ -104,10 +113,23 @@ on, and a listed feature the crate does not declare are findings.
   same holds for what each workspace crate outside the boundary that its tests name reaches,
   against what a test may name. Cargo never compiles a dependency's dev-dependencies, so the
   crate's own dev edges are the only ones followed.
-- The x86-64-v3 pin is the only `rustflags` setting in any cargo configuration file, and
-  no workflow, script or cargo configuration names `RUSTFLAGS` or sets a target CPU or
-  target feature (`target_cpu` and `target-cpu` are the same to rustc and to this check).
-  Whole-line `#` comments are skipped; a trailing comment is scanned.
+- The x86-64-v3 pin, as `rustflags` and as `rustdocflags` with the same flags (cargo passes
+  `rustflags` to rustc only, so doctests need their own), is the only flag setting in any
+  cargo configuration file, and no workflow, script or cargo configuration names
+  `RUSTFLAGS` or `RUSTDOCFLAGS` or sets a target CPU or target feature (`target_cpu` and
+  `target-cpu` are the same to rustc and to this check). Whole-line `#` comments are
+  skipped; a trailing comment is scanned.
+- The packages whose sources include the harness protocol (`src/harness/protocol.rs`) by
+  `#[path]` are exactly `[harness]` `packages`: a package that records and is not listed
+  is never launched, and one listed that does not record proves nothing.
+- `impl SimulationAsset` appears in a crate outside the boundary only in code compiled for
+  tests (D99: a kind the simulation reads is declared where section 8.2 holds its loader).
+  Shipped code is read from each crate root under `src/`, through every out-of-line `mod`,
+  by `#[path]` or the file layout; an item under a `cfg` that holds only for `test` or a
+  `[dev_only_features]` feature (or one that turns it on) is skipped, as are `tests/`,
+  `benches/` and `examples/`. The scan reads tokens: an impl a macro writes is not seen, nor
+  one of the trait imported under another name, and an `impl SimulationAsset for` header in a
+  `macro_rules!` body is reported as if it were an impl.
 - No cargo configuration file has an `include` key, and no `.cargo` directory or cargo
   configuration file is a symbolic link: cargo would read through either what no check
   reads. `vendor` refuses both through the same function.
@@ -133,6 +155,13 @@ its own dev-dependencies) and lack packages another holds, since two harness pac
 always differ that way. `--package <name>` (repeatable) compares the named packages
 instead. A workspace package named `lactose-app-*` that is not in `[feature_roots]` is a
 finding.
+
+No workspace package but `lactose-task` names loom, read from `cargo metadata`: no
+dependency on it under any rename, no dependency declaration or `[features]` value that turns
+on loom or a feature named `loom`, and no feature named `loom`. Features unify across a
+build, so one package turning on `lactose-task/loom` would make every executor in that build
+loom's model. `lactose-input-host`'s optional dependency on loom and its feature
+`loom = ["dep:loom"]`, which builds its own models, are the one exception.
 
 ## `vendor`
 
@@ -192,8 +221,10 @@ agree. `cargo xtask sour matrix` prints the modes; `src/harness/mod.rs` holds th
 - `sour run --pr | --nightly | --mode <name>…` launches `cargo nextest run` over the packages
   of `[harness]` once per configuration and reports, per test, the first tick whose hash
   differs. It also reports a test whose stated configuration is not the one it was launched
-  with, and a chaos test that left no execution log. `--emit <file>` writes the baseline
-  hashes.
+  with, and a chaos test that left no execution log. The tests that recorded in the baseline
+  run must be exactly `[harness]` `tests`: one listed that recorded nothing was renamed,
+  ignored, deleted or stopped recording, and one that recorded unlisted was added without
+  the list. `--emit <file>` writes the baseline hashes.
 - `sour compare <reference> <file>` compares two emitted files. Architecture mode is each
   machine emitting and one job comparing. A missing file, or a reference with no hashes, fails.
 - `sour self-test` proves the runner through nextest on the stand-in simulations in

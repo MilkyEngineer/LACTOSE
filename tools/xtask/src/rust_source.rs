@@ -320,6 +320,170 @@ fn next_item_is_module(source: &str, from: usize) -> bool {
     i < bytes.len() && keyword(i, "mod")
 }
 
+/// An out-of-line module declaration, `mod name;`.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub(crate) struct Module {
+    /// The module's name.
+    pub(crate) name: String,
+    /// The file a `path` attribute on it names, as written.
+    pub(crate) path: Option<String>,
+    /// Whether it is compiled only for tests (see [`items`]).
+    pub(crate) test_only: bool,
+}
+
+/// What [`items`] finds in one file.
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
+pub(crate) struct Items {
+    /// Each implementation of the trait asked for, as the line of its `impl` and whether it
+    /// is compiled only for tests.
+    pub(crate) impls: Vec<(usize, bool)>,
+    /// Each out-of-line module declaration, in order.
+    pub(crate) modules: Vec<Module>,
+}
+
+/// The implementations of the trait named `name` in `source` (an `impl` whose header has
+/// `name` followed by `for`, under any path), and its out-of-line modules. An item is
+/// compiled only for tests if a `cfg` on it, on an item around it or at the top of the file
+/// holds only under `test` or a feature of `features` (`any` of such, or `all` with one).
+///
+/// Token reading, not parsing: an impl a macro expands to is not seen, a trait imported
+/// under another name is not recognised, and a header `impl Trait for` inside a
+/// `macro_rules!` body is reported as if it were an impl.
+pub(crate) fn items(source: &str, name: &str, features: &[String]) -> Items {
+    enum Token<'a> {
+        Word(&'a str),
+        Other,
+    }
+    let bytes = source.as_bytes();
+    let line = |at: usize| source[..at].matches('\n').count() + 1;
+    let mut found = Items::default();
+    // Whether each open brace level is compiled only for tests; the first is the file.
+    let mut levels = vec![false];
+    // The item being read: its tokens, where its `impl` is, and its outer attributes.
+    let mut header: Vec<Token<'_>> = Vec::new();
+    let mut impl_at = None;
+    let mut gated = false;
+    let mut path = None;
+    let mut i = 0;
+    while i < bytes.len() {
+        let enclosing = levels.last().copied().unwrap_or(false);
+        let byte = bytes[i];
+        if byte.is_ascii_whitespace() {
+            i += 1;
+        } else if let Some(end) = skip_comment(source, i) {
+            i = end;
+        } else if let Some((inner, open)) = attribute_start(bytes, i)
+            && let Some(end) = skip_brackets(source, open)
+        {
+            let body = &source[open + 1..end - 1];
+            if inner {
+                if let Some(level) = levels.last_mut() {
+                    *level |= cfg_test_only(body, features);
+                }
+            } else {
+                gated |= cfg_test_only(body, features);
+                path = path.or_else(|| path_value(body));
+            }
+            i = end;
+        } else if matches!(byte, b'{' | b'}' | b';') {
+            let words: Vec<&str> = header
+                .iter()
+                .map(|token| match token {
+                    Token::Word(word) => *word,
+                    Token::Other => "",
+                })
+                .collect();
+            let implements = words.windows(2).any(|pair| pair == [name, "for"]);
+            if let (Some(at), true, b'{' | b';') = (impl_at, implements, byte) {
+                found.impls.push((line(at), enclosing || gated));
+            }
+            if byte == b';'
+                && let [.., "mod", module] = words[..]
+                && !module.is_empty()
+            {
+                found.modules.push(Module {
+                    name: module.to_owned(),
+                    path: path.take(),
+                    test_only: enclosing || gated,
+                });
+            }
+            match byte {
+                b'{' => levels.push(enclosing || gated),
+                b'}' if levels.len() > 1 => {
+                    levels.pop();
+                }
+                _ => {}
+            }
+            (header, impl_at, gated, path) = (Vec::new(), None, false, None);
+            i += 1;
+        } else if let Some(end) = skip_literal(source, i).or_else(|| {
+            (byte == b'b' && bytes.get(i + 1) == Some(&b'r'))
+                .then(|| skip_raw_string(bytes, i + 1))
+                .flatten()
+        }) {
+            header.push(Token::Other);
+            i = end;
+        } else if is_ident(byte) {
+            let end = bytes[i..].iter().position(|b| !is_ident(*b)).map_or(bytes.len(), |n| i + n);
+            let word = &source[i..end];
+            if word == "impl" && impl_at.is_none() {
+                impl_at = Some(i);
+            }
+            header.push(Token::Word(word));
+            i = end;
+        } else {
+            header.push(Token::Other);
+            i += source[i..].chars().next().map_or(1, char::len_utf8);
+        }
+    }
+    found
+}
+
+/// Whether an attribute's text is a `cfg` that holds only under `test` or a feature of
+/// `features`.
+fn cfg_test_only(body: &str, features: &[String]) -> bool {
+    let compact: String = body.chars().filter(|c| !c.is_whitespace()).collect();
+    compact
+        .strip_prefix("cfg(")
+        .and_then(|rest| rest.strip_suffix(')'))
+        .is_some_and(|predicate| holds_only_for_tests(predicate, features))
+}
+
+fn holds_only_for_tests(predicate: &str, features: &[String]) -> bool {
+    if predicate == "test" {
+        return true;
+    }
+    if let Some(feature) = predicate.strip_prefix("feature=\"").and_then(|r| r.strip_suffix('"')) {
+        return features.iter().any(|listed| listed == feature);
+    }
+    let operands = |op: &str| {
+        let inner = predicate.strip_prefix(op)?.strip_prefix('(')?.strip_suffix(')')?;
+        let mut parts = Vec::new();
+        let (mut depth, mut start) = (0usize, 0);
+        for (at, c) in inner.char_indices() {
+            match c {
+                '(' => depth += 1,
+                ')' => depth = depth.saturating_sub(1),
+                ',' if depth == 0 => {
+                    parts.push(&inner[start..at]);
+                    start = at + 1;
+                }
+                _ => {}
+            }
+        }
+        parts.push(&inner[start..]);
+        parts.retain(|part| !part.is_empty());
+        Some(parts)
+    };
+    if let Some(parts) = operands("any") {
+        return !parts.is_empty() && parts.iter().all(|part| holds_only_for_tests(part, features));
+    }
+    if let Some(parts) = operands("all") {
+        return parts.iter().any(|part| holds_only_for_tests(part, features));
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -405,5 +569,78 @@ mod tests {
         ] {
             assert_eq!(attributes(source).first().and_then(|a| a.path.clone()), None, "{source:?}");
         }
+    }
+
+    fn impls(source: &str, features: &[&str]) -> Vec<(usize, bool)> {
+        let features: Vec<String> = features.iter().map(|f| (*f).to_owned()).collect();
+        items(source, "Asset", &features).impls
+    }
+
+    #[test]
+    fn an_implementation_is_found_under_any_path_and_header() {
+        let source = "impl Asset for A {}\n\
+                      impl<T: Copy> crate::kinds::Asset for B<T> where T: Default {}\n\
+                      unsafe impl ::k::Asset for C {}\n\
+                      impl Asset for D;\n";
+        assert_eq!(impls(source, &[]), [(1, false), (2, false), (3, false), (4, false)]);
+        for source in [
+            "impl Assets for A {}\n",
+            "impl OtherAsset for A {}\n",
+            "impl A { fn asset() -> Asset { for _ in 0..1 {} Asset } }\n",
+            "fn f() { let asset = Asset; for x in xs {} }\n",
+            "// impl Asset for A {}\n",
+            "const S: &str = \"impl Asset for A {}\";\n",
+            "const S: &[u8] = br\"impl Asset for A {}\";\n",
+        ] {
+            assert_eq!(impls(source, &[]), [], "{source:?}");
+        }
+    }
+
+    #[test]
+    fn an_implementation_compiled_only_for_tests_says_so() {
+        let source = "#[cfg(test)]\nmod tests {\n    impl Asset for A {}\n}\n\
+                      #[cfg(test)]\nimpl Asset for B {}\n\
+                      #[cfg(any(test, feature = \"bench\"))]\nimpl Asset for C {}\n\
+                      #[cfg(all(unix, test))]\nimpl Asset for D {}\n\
+                      #[cfg(any(test, unix))]\nimpl Asset for E {}\n\
+                      #[cfg(not(test))]\nimpl Asset for F {}\n\
+                      mod m {\n    #![cfg(test)]\n    impl Asset for G {}\n}\n\
+                      impl Asset for H {}\n";
+        assert_eq!(
+            impls(source, &["bench"]),
+            [
+                (3, true),
+                (6, true),
+                (8, true),
+                (10, true),
+                (12, false),
+                (14, false),
+                (17, true),
+                (19, false),
+            ]
+        );
+        assert_eq!(impls(source, &[])[2], (8, false), "`bench` is not a test feature here");
+        assert_eq!(impls("#![cfg(test)]\nimpl Asset for A {}\n", &[]), [(2, true)]);
+    }
+
+    #[test]
+    fn out_of_line_modules_are_found_with_their_path_and_gate() {
+        let source = "mod a;\npub(crate) mod b {}\n#[path = \"x/c.rs\"]\nmod c;\n\
+                      #[cfg(test)]\nmod d;\nmod e { mod f; }\n#[cfg(feature = \"dev\")] mod g;\n";
+        let module = |name: &str, path: Option<&str>, test_only| Module {
+            name: name.to_owned(),
+            path: path.map(str::to_owned),
+            test_only,
+        };
+        assert_eq!(
+            items(source, "Asset", &["dev".to_owned()]).modules,
+            [
+                module("a", None, false),
+                module("c", Some("x/c.rs"), false),
+                module("d", None, true),
+                module("f", None, false),
+                module("g", None, true),
+            ]
+        );
     }
 }
