@@ -395,6 +395,7 @@ dependencies = [
  "lactose-ecs",
  "lactose-input",
  "lactose-io",
+ "lactose-math",
  "lactose-net-api",
  "lactose-net-host",
  "lactose-persist",
@@ -406,6 +407,21 @@ dependencies = [
  "lactose-task",
  "rayon",
  "tracing",
+]
+
+[[package]]
+name = "lactose-app-headless"
+version = "0.0.0"
+dependencies = [
+ "lactose-app",
+ "lactose-asset-api",
+ "lactose-bundle",
+ "lactose-core",
+ "lactose-ecs",
+ "lactose-persist",
+ "lactose-reflect",
+ "lactose-sim",
+ "tracing-subscriber",
 ]
 
 [[package]]

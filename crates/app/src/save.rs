@@ -14,10 +14,11 @@ use std::task::{Context, Poll};
 use lactose_asset_api::{PinnedTable, VersionTable};
 use lactose_bundle::Baseline;
 use lactose_core::{Result, Tick};
-use lactose_ecs::RegionId;
-use lactose_persist::RegionRecords;
+use lactose_ecs::{RegionId, RegionMode};
+use lactose_persist::{Container, Loader, RegionRecords, SchemaTable};
 
 use crate::game::Game;
+use crate::policy::{ErrorPolicy, Source};
 
 /// Where cooked content comes from until the asset store exists: the baseline a save or a
 /// relevance message names by content hash, the resolved asset table of a region, and the
@@ -81,7 +82,27 @@ pub struct SavedWorld {
 /// load with nothing built; the policy's response to [`Source::Load`](crate::Source::Load)
 /// is `Stop`.
 pub fn load(game: &Game, container: &[u8], cooked: &dyn Cooked) -> Result<SavedWorld> {
-    todo!("decode the container, validate and migrate every section")
+    decode(game, container, cooked).inspect_err(|error| {
+        ErrorPolicy::MILESTONE_1.decide(Source::Load, error);
+    })
+}
+
+/// [`load`] before the policy sees its error.
+fn decode(game: &Game, container: &[u8], cooked: &dyn Cooked) -> Result<SavedWorld> {
+    let types = game.types()?;
+    let schemas = SchemaTable::from_registry(types.registry())?;
+    let migrations = game.migrations()?;
+    let decoded = Container::decode(container)?;
+    let loader = Loader::new(&schemas, &migrations);
+    let mut regions = BTreeMap::new();
+    for records in decoded.regions() {
+        let baseline = cooked.baseline(records.baseline_hash)?;
+        loader.bundle(records, Arc::clone(&baseline), RegionMode::Frozen, None)?;
+        let records = loader.migrate(records)?;
+        regions.insert(records.region, Arc::new(SavedRegion { records, baseline }));
+    }
+    let header = decoded.header();
+    Ok(SavedWorld { tick: header.tick, next_net_id: header.next_net_id, regions })
 }
 
 /// A save being encoded: one background task per region, then the assembly. See
@@ -89,6 +110,13 @@ pub fn load(game: &Game, container: &[u8], cooked: &dyn Cooked) -> Result<SavedW
 #[must_use = "futures do nothing unless awaited"]
 pub struct SaveEncode {
     run: Pin<Box<dyn Future<Output = Result<Vec<u8>>> + Send>>,
+}
+
+impl SaveEncode {
+    /// The encode in flight.
+    pub(crate) fn new(run: Pin<Box<dyn Future<Output = Result<Vec<u8>>> + Send>>) -> Self {
+        Self { run }
+    }
 }
 
 impl Future for SaveEncode {

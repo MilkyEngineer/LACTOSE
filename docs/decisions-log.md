@@ -1209,6 +1209,38 @@ rationale the author supplied during the editorial pass rather than one taken fr
     headless app and the spike need three calls and no store. Rules out a milestone 1
     dependency on the asset store's traits.
 - Driven by: milestone 1, the `app` facade brief and its reviews r1 and r2 (2026-10-24).
+- Addendum (lane app-impl, 2026-11-14; review rounds 1 to 3): the facade is implemented with no
+  public item changed. A paused TickPacer still pays the tick it owed when it stopped, so the
+  server's frame resyncs the pacer before polling while `time_scale()` is zero, and the
+  client's step 3 does the same while its pacer runs at zero; the README states both. A
+  `Start::Loaded` under `Anchored` queues every saved pinned region for the first step
+  (`RegionMode::Frozen`), as `Directed` queues every region: a pinned region is simulated
+  whenever the server runs, so a resumed world matches the one that was never saved, tick for
+  tick (section 15.5). A table whose pin fails at a store answer is no refusal: the region
+  loads `Frozen` with no table, logged at `warn`, and takes one through `TickInput::assets`, as
+  a region with no table does, while its `Load` request stays visible to the store's driver; a
+  region queued at `build_server` is never requested, so there a pin failure, or a saved pinned
+  region with no table under `Anchored`, fails the build (`NotFound`, or the pin's error); a
+  stored state `Loader::bundle` cannot bundle is a `LoadFailure`, which the lifecycle does not
+  retry, so the caller recovers it with its own `loaded` entry. An event the game's session
+  applier fails is a `SessionFailure` in `StepOutput::failures` (lactose-sim, below), so
+  `failures.is_empty()` means nothing was refused. The SOUR test of the assembly runs a sketch
+  whose player is a dynamic body its input steers, so the solver pool and the input applier
+  enter the hash, and it fails unless the last sample was applied and the body moved. The
+  milestone 1 proof is tests/proof and tests/headless.rs; 17 mutations of the behaviour (the
+  pause ending its frame, the cancelled unpause, both paused resyncs, rate zero as paused, the
+  tick that carries a pending pause, the store reconciled against the world, the pre-step
+  baseline of a refused reload, the clock target by granted ticks, TooOld's hint, one content
+  resync per failing frame tick, the input applier, the pinned regions queued at a resume, the
+  store answer's pin failure loading with no table, the applier's refusal reported, and the
+  build's pin failure failing the build under `Anchored` and under `Directed`) are each caught.
+  `lactose-app` is a `[harness]` package and `lactose-app-headless` a feature root; the binary
+  installs `tracing-subscriber`'s `fmt` subscriber to stderr (features `fmt`, `std`), exits 2
+  when its final save fails, and the release profile sets `panic = "abort"`.
+- lactose-sim (D131 review): `RegionLifecycle::apply_sessions` reports an event
+  `SessionApplier::apply` fails as a `SessionFailure { tick, player, error }` with the
+  applier's error, beside its `curd` warning; the event is still skipped. `SessionFailure`'s
+  doc and `crates/sim/README.md` say so. No signature changed.
 
 **D136. The `asset` facade, and the change it makes to `asset-api`'s store contract: what sections 4, 5.1, 8.2, 14, 15.2, 18, 19 and 20 left open** (§3, §4, §5.1, §8.2, §9.7, §14, §15.2, §18, §19, §20, §22, `lactose-asset`, `lactose-asset-api`, `lactose-bundle`, `lactose-io`, `lactose-task`, `lactose-app`, `lactose-persist`, `tools/cook`)
 - Why: the facade is written before its implementation so the cooker's skeleton, the milestone

@@ -2,7 +2,7 @@
 //! registration functions, and one value for the game naming every crate and the ordering
 //! between them (architecture section 18).
 
-use lactose_core::Result;
+use lactose_core::{Error, Result};
 use lactose_ecs::World;
 use lactose_persist::Migrations;
 use lactose_sim::{Registration, SessionApplier, TypeTable};
@@ -65,13 +65,39 @@ impl Game {
     /// save of the process agree on the registry. The first error ends the fold, with the
     /// crate's name in the message.
     pub fn types(&self) -> Result<TypeTable> {
-        todo!("fold the engine's and every crate's register_types into one table")
+        /// A crate's name and its `register_types`.
+        type Types = (&'static str, fn(&mut TypeTable) -> Result<()>);
+        /// The engine's crates, in the README's order: before every game crate.
+        const ENGINE: [Types; 5] = [
+            ("lactose-input", lactose_input::register_types),
+            ("lactose-net-api", lactose_net_api::register_types),
+            ("lactose-physics-api", lactose_physics_api::register_types),
+            ("lactose-anim", lactose_anim::register_types),
+            ("lactose-predict", lactose_predict::register_types),
+        ];
+        let mut types = TypeTable::new();
+        let game = self.crates.iter().map(|registration| (registration.name, registration.types));
+        for (name, register) in ENGINE.into_iter().chain(game) {
+            register(&mut types).map_err(|error| named(name, &error))?;
+        }
+        Ok(types)
     }
 
     /// The `Migrations` a loader takes, a fresh one per call: every crate's `migrations` in
     /// list order, into `Migrations::new()`. The first error ends the fold, with the
     /// crate's name in the message.
     pub fn migrations(&self) -> Result<Migrations> {
-        todo!("fold every crate's register_migrations into one table")
+        let mut migrations = Migrations::new();
+        for registration in self.crates {
+            if let Some(register) = registration.migrations {
+                register(&mut migrations).map_err(|error| named(registration.name, &error))?;
+            }
+        }
+        Ok(migrations)
     }
+}
+
+/// `error` with the name of the crate whose registration function returned it.
+pub(crate) fn named(name: &str, error: &Error) -> Error {
+    Error::new(error.kind(), format!("`{name}`: {}", error.message()))
 }

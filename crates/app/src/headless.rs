@@ -5,16 +5,19 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Instant;
 
-use lactose_core::{Result, Tick};
-use lactose_io::Io;
+use lactose_core::{Error, ErrorKind, Result, Tick};
+use lactose_io::{Io, IoConfig};
 use lactose_sim::TickInput;
-use lactose_task::{ExecutionLog, Executor};
+use lactose_task::{ExecutionLog, Executor, WorkerClass};
+use tracing::debug;
 
 use crate::game::Game;
-use crate::runtime::Workers;
+use crate::policy::{ErrorPolicy, LOG_TARGET, Source};
+use crate::runtime::{Workers, start_executor};
 use crate::save::Cooked;
-use crate::server::{Server, StepOutput};
+use crate::server::{Failed, Server, StepOutput, build_server};
 use crate::world::{Start, WorldConfig};
 
 /// What a headless run is built from.
@@ -36,9 +39,11 @@ pub struct HeadlessConfig {
 /// [`start`](Self::start) on the thread that owns it, which drives every run through
 /// `Executor::block_on` and is never a worker.
 pub struct Headless {
-    executor: Executor,
-    io: Io,
+    // Declared in drop order for an app dropped without `shutdown`: the world before the
+    // IO pool, the IO pool before the executor (`crates/io/README.md`).
     server: Option<Server>,
+    io: Io,
+    executor: Executor,
     tick: Tick,
     replay: bool,
 }
@@ -65,7 +70,34 @@ impl Headless {
     /// started shut down again in reverse; the policy's response to a startup failure is
     /// `Stop`, so the binary's `main` returns it.
     pub fn start(game: &Game, config: HeadlessConfig, cooked: Arc<dyn Cooked>) -> Result<Self> {
-        todo!("start the executor and the IO pool, create the save directory, build the server")
+        let HeadlessConfig { workers, world, start, saves } = config;
+        let replay = workers.replay.is_some();
+        let executor = start_executor(workers).inspect_err(startup)?;
+        let platform = Arc::clone(executor.platform());
+        let io = match Io::start(&*platform, IoConfig::for_platform(&*platform)) {
+            Ok(io) => io,
+            Err(error) => {
+                startup(&error);
+                executor.shutdown();
+                return Err(error);
+            }
+        };
+        let built = match saves {
+            Some(saves) => executor.block_on(io.create_dir_all(saves)),
+            None => Ok(()),
+        }
+        .and_then(|()| build_server(&executor, game, world, start, cooked));
+        match built {
+            Ok(server) => {
+                Ok(Self { tick: server.tick(), executor, io, server: Some(server), replay })
+            }
+            Err(error) => {
+                startup(&error);
+                io.shutdown();
+                executor.shutdown();
+                Err(error)
+            }
+        }
     }
 
     /// The executor, for what a test spawns or sleeps beside the world.
@@ -99,7 +131,10 @@ impl Headless {
 
     /// `Server::hash`, or `Cancelled` after a run tore the world.
     pub fn hash(&self) -> Result<u64> {
-        todo!("hash the server world")
+        let server = self.server.as_ref().ok_or_else(torn)?;
+        server.hash().inspect_err(|error| {
+            ErrorPolicy::MILESTONE_1.decide(Source::Server { kept: true }, error);
+        })
     }
 
     /// One tick with `frame`, driven from the calling thread (`Executor::block_on` over
@@ -109,7 +144,14 @@ impl Headless {
     /// refused bundle. On a kept failure the server stays and the error is returned; on a
     /// torn one `server()` is `None` afterwards and every later run fails with `Cancelled`.
     pub fn step(&mut self, frame: TickInput) -> Result<StepOutput> {
-        todo!("block on one step")
+        let server = self.server.take().ok_or_else(torn)?;
+        match self.executor.block_on(server.run_step(&self.executor, frame)) {
+            Ok((server, output, _)) => {
+                self.keep(server);
+                Ok(output)
+            }
+            Err(failed) => Err(self.failed(failed)),
+        }
     }
 
     /// The timer root for `ticks` ticks: [`Server::resync`] at `Instant::now()` first, so
@@ -130,7 +172,33 @@ impl Headless {
         ticks: u32,
         frames: Box<dyn FnMut(Tick) -> TickInput + Send>,
     ) -> Result<RunReport> {
-        todo!("resync the pacer, spawn the timer root and block on it")
+        if self.replay {
+            let error = Error::new(
+                ErrorKind::Unsupported,
+                "a paced run cannot follow a recorded execution log: replay is for step-driven runs",
+            );
+            ErrorPolicy::MILESTONE_1.decide(Source::Executor, &error);
+            return Err(error);
+        }
+        let mut server = self.server.take().ok_or_else(torn)?;
+        server.resync(Instant::now());
+        let executor = self.executor.clone();
+        let task = self
+            .executor
+            .spawn(WorkerClass::FrameCritical, timer_root(executor, server, ticks, frames));
+        match self.executor.block_on(task) {
+            Ok(Ok((server, mut report))) => {
+                self.keep(server);
+                report.hash = self.hash()?;
+                Ok(report)
+            }
+            Ok(Err(failed)) => Err(self.failed(failed)),
+            Err(error) => {
+                // The task was cancelled with the executor, and the server with it.
+                ErrorPolicy::MILESTONE_1.decide(Source::Executor, &error);
+                Err(error)
+            }
+        }
     }
 
     /// A save of every region, loaded or kept, to `slot`, from the calling thread, between
@@ -142,7 +210,23 @@ impl Headless {
     /// contract states (`crates/io/README.md`, "The atomic replace"); the bytes a
     /// `ReplaceFailed` hands back are dropped, since a tool retries by saving again.
     pub fn save(&mut self, slot: PathBuf) -> Result<()> {
-        todo!("block on the save copy, the encoding and the replace")
+        let server = self.server.take().ok_or_else(torn)?;
+        let (server, saved) = match self.executor.block_on(server.save_point(&self.executor)) {
+            Ok(done) => done,
+            Err(failure) => {
+                let failed =
+                    Failed { error: failure.error, server: failure.server, tick: self.tick };
+                return Err(self.failed(Box::new(failed)));
+            }
+        };
+        let encoded = self.executor.block_on(server.encode_save(&self.executor, saved));
+        self.keep(server);
+        let written = encoded.and_then(|bytes| {
+            self.executor.block_on(self.io.replace(slot, bytes)).map_err(|failed| failed.error)
+        });
+        written.inspect_err(|error| {
+            ErrorPolicy::MILESTONE_1.decide(Source::Save, error);
+        })
     }
 
     /// [`Server::shutdown`] (the world dropped, its solver threads waited for), then
@@ -152,6 +236,77 @@ impl Headless {
     /// solver pool is terminated when that world drops and not waited for. What a SOUR test
     /// writes the log from.
     pub fn shutdown(self) -> Option<ExecutionLog> {
-        todo!("shut the server down, read the log, shut the pool and the executor down")
+        let Self { executor, io, server, .. } = self;
+        if let Some(server) = server {
+            server.shutdown();
+        }
+        let log = executor.execution_log();
+        io.shutdown();
+        executor.shutdown();
+        log
     }
+
+    /// The server back after a run, at its tick.
+    fn keep(&mut self, server: Server) {
+        self.tick = server.tick();
+        self.server = Some(server);
+    }
+
+    /// A run's failure: the server back if it survived, else the tick it was torn at.
+    fn failed(&mut self, failed: Box<Failed>) -> Error {
+        let Failed { error, server, tick } = *failed;
+        match server {
+            Some(server) => self.keep(server),
+            None => self.tick = tick,
+        }
+        error
+    }
+}
+
+/// The timer root's loop for [`Headless::run`], on the task that owns the server: frames
+/// at `Instant::now()` until `ticks` ticks have run, sleeping to each deadline between.
+/// The report's hash is the caller's to fill.
+async fn timer_root(
+    executor: Executor,
+    mut server: Server,
+    ticks: u32,
+    mut frames: Box<dyn FnMut(Tick) -> TickInput + Send>,
+) -> core::result::Result<(Server, RunReport), Box<Failed>> {
+    let mut report = RunReport { ticks: 0, frames: 0, behind: 0, hash: 0 };
+    let mut issued = 0_u32;
+    let mut bounded = move |tick: Tick| {
+        (issued < ticks).then(|| {
+            issued += 1;
+            frames(tick)
+        })
+    };
+    while report.ticks < ticks {
+        let (stepped, output) = server.run_frame(&executor, Instant::now(), &mut bounded).await?;
+        server = stepped;
+        report.ticks += output.ticks;
+        report.frames += 1;
+        report.behind += u32::from(output.behind);
+        for request in &output.requests {
+            debug!(target: LOG_TARGET, ?request, "a region request the headless app leaves unanswered");
+        }
+        if report.ticks >= ticks {
+            break;
+        }
+        if let Err(error) = executor.sleep_until(output.next_deadline).await {
+            ErrorPolicy::MILESTONE_1.decide(Source::Executor, &error);
+            let tick = server.tick();
+            return Err(Box::new(Failed { error, server: Some(server), tick }));
+        }
+    }
+    Ok((server, report))
+}
+
+/// The error of every run after one tore the server world.
+fn torn() -> Error {
+    Error::new(ErrorKind::Cancelled, "a run tore the server world: there is nothing to run")
+}
+
+/// A startup failure, logged as the policy decides: `Stop`.
+fn startup(error: &Error) {
+    ErrorPolicy::MILESTONE_1.decide(Source::Executor, error);
 }

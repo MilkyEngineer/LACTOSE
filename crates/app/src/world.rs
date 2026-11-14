@@ -35,7 +35,7 @@ impl WorldConfig {
     /// The headless configuration: the default layout, `Directed` regions, a policy of
     /// radii one, two and three (unread under `Directed`, valid should the control change),
     /// `PhysicsConfig::default()` (Earth gravity, one reserved worker) and
-    /// [`LOG_RETENTION`]. Real, not `todo!()`: it is a value.
+    /// [`LOG_RETENTION`].
     #[must_use]
     pub fn headless() -> Self {
         Self {
@@ -55,9 +55,10 @@ pub enum Start {
     Fresh,
     /// From a save ([`load`](crate::load), or a [`SavedWorld`] a save point produced): the
     /// saved tick and counter into the builder, every saved region into the server's store
-    /// (`Server::kept`), from which the first step loads every one under `Directed` and the
-    /// lifecycle's `Load` requests bring each back under `Anchored` as players join, so no
-    /// saved region is lost; every player joins again through `sessions` (`README.md`,
-    /// "Saves and loads").
+    /// (`Server::kept`), from which the first step loads every one under `Directed`, and
+    /// under `Anchored` the pinned ones, the lifecycle's `Load` requests bringing the
+    /// others back as players join, so no saved region is lost; every player joins again
+    /// through `sessions` (`README.md`, "Saves and loads"). `build_server` lists how
+    /// such a start fails.
     Loaded(SavedWorld),
 }

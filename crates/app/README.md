@@ -12,9 +12,8 @@ it: `app-headless` at milestone 1, `app-client` and `app-server` at milestone 4.
 | Determinism boundary | outside |
 | Unsafe | none, `#![forbid(unsafe_code)]` |
 
-**Status: facade.** Every public signature is final and every deciding body is `todo!()`;
-`WorldConfig::headless`, `ErrorPolicy::respond`, `LifecycleFailures::is_empty`,
-`Server::resync` and the accessors are real, since they are values. Every sentence under
+**Status: implemented.** Every public signature is the facade's (D131), unchanged, and every
+body is implemented; the proof below runs. Every sentence under
 "Behaviour the signatures cannot express" is one a dependent crate may rely on and the
 implementation must meet. Architecture sections 2, 3, 4, 5.1, 5.2, 8.3, 9.2, 9.3, 9.7,
 11, 14, 15.2, 15.3, 16, 18, 19, 20 and 22 are the design; where this file and the
@@ -31,9 +30,10 @@ the registration functions holds here unchanged.
 Amending a signature is allowed in the change that needs it. Say so in the change
 description and list what changed, because `app-headless`, the milestone 1 netcode spike,
 the SOUR test of the assembly and, from milestone 4, `app-client`, `app-server` and `net`
-are written against this surface. `tests/headless.rs` and `tests/spike.rs` are
-compile-only sketches of what each of them writes: a change that breaks one is a signature
-change to list.
+are written against this surface. `tests/headless.rs` holds the binary's `main` (which
+`crates/app-headless` is) and the SOUR test of the assembly, and `tests/spike.rs` is a
+compile-only sketch of the spike's loop: a change that breaks one is a signature change to
+list.
 
 ## Surface
 
@@ -220,10 +220,13 @@ root")
   `behind` set. `CATCH_UP_CAP` is four in every shipped configuration and `LOG_RETENTION`
   (120) is at least it, pinned at compile time.
 - `Server::frame(executor, now, frames)` does the following, in this order, and nothing
-  else: `pacer.poll(now)`, the budget's ticks taken as one when it owes none and a zero
-  scale is pending ("Time scale" below); for each tick, `frames(next)` with `next` the tick
-  about to run (`Tick(tick().0 + 1)`), and `Server::step` with what it returns, its
-  requests and refusals appended to the output's, or an end to the frame's stepping on
+  else: `pacer.poll(now)`, preceded by `pacer.resync(now)` while `time_scale()` is zero
+  (a pacer stopped with a tick owed still pays it out, which would run a tick on a paused
+  world, and an unpause owes from the last paused frame on), the budget's ticks taken as
+  one when it owes none and a zero scale is pending ("Time scale" below); for each tick,
+  `frames(next)` with `next` the tick about to run (`Tick(tick().0 + 1)`), and
+  `Server::step` with what it returns, its requests and refusals appended to the
+  output's, or an end to the frame's stepping on
   `None`, the due ticks not run being forgotten (the pacer counted them) and nothing else
   changing, and the same end after a step that carried a zero scale, pending or the
   callback's own, so no tick runs with the world paused; `Simulation::run_passes` once,
@@ -249,8 +252,9 @@ root")
   for a kept region by queuing its bundle for the next step; and take the requests and
   the load, session and asset failures into the `StepOutput`, logging each failure at
   `warn` with the region or player and the kind. A frame's output holds every step's
-  requests and failures in step order. Nothing is consumed silently: a SOUR test asserts
-  `StepOutput::failures.is_empty()` after every tick.
+  requests and failures in step order. Nothing is consumed silently, an event the game's
+  session applier fails included (`lactose-sim` reports it as a `SessionFailure`): a SOUR
+  test asserts `StepOutput::failures.is_empty()` after every tick.
 - `behind` is reported in `FrameOutput` and `RunReport`, never acted on here: the overload
   ladder is not in this crate yet. A frame that steps zero ticks still runs the passes and
   still reports a `next_deadline` one period ahead while paused.
@@ -343,7 +347,8 @@ root")
      A failing frame folded again, as one that stays queued through a pause is every
      frame, is left out again and resyncs nothing, so a pause does not send a
      `ResyncRequest` per frame.
-  3. `pacer.poll(now)`, its budget's ticks added to the estimate's granted count.
+  3. `pacer.poll(now)`, preceded by `pacer.resync(now)` while the pacer is paced at zero,
+     as the server's frame does, its budget's ticks added to the estimate's granted count.
   4. One `Predictor::step` per due tick, with the fold's input in the first and an empty
      one after. The local player's sample for `next` is `history.get(next)` when the
      history holds one, else `sample(next)`, inserted: a tick predicted before a backward
@@ -439,26 +444,41 @@ root")
 - Reloads from the store. Under `Anchored`, every `RegionRequest::Load` the lifecycle
   issues for a kept region is answered by the server itself: the bundle
   `Loader::bundle(&records, baseline, RegionMode::Frozen, table)`, with `table` the
-  region's `Cooked::table` pinned through `Cooked::pin` or `None` when it has none (logged
-  at `warn`; the region loads `Frozen` until a table arrives through `TickInput::assets`),
-  is queued for the next step, which puts it in `frame.loaded`. The request is still
-  reported in `StepOutput::requests`, so the store's driver can resolve the table and
-  release the region later; its own bundle for the region, if it sends one in the step the
-  server's is queued for, lends `mode` and `assets` as below. The caller answers only the
-  `Load`s whose region is not in `Server::kept` read after the step that issued them: a
-  bundle it sends for a kept region once the server's has loaded is refused as already
-  loaded, a `LoadFailure` that fails a SOUR test's `failures.is_empty()`. A `Cancel`
-  drops a queued bundle; the records stay kept. Under `Directed`, a `Start::Loaded`
-  queues every saved region for the first step, as
-  `Loader::bundle(.., RegionMode::Simulated, table)` built at `build_server` (so a region
-  that cannot be bundled fails the build), and a region unloaded through
+  region's `Cooked::table` pinned through `Cooked::pin`, or `None` when it has none or the
+  pin fails (logged at `warn`; the region loads `Frozen` until a table arrives through
+  `TickInput::assets`), is queued for the next step, which puts it in `frame.loaded`. The
+  request is still reported in `StepOutput::requests`, so the store's driver can resolve
+  the table and release the region later; its own bundle for the region, if it sends one
+  in the step the server's is queued for, lends `mode` and `assets` as below. The caller
+  answers only the `Load`s whose region is not in `Server::kept` read after the step that
+  issued them: a bundle it sends for a kept region once the server's has loaded is
+  refused as already loaded, a `LoadFailure` that fails a SOUR test's
+  `failures.is_empty()`. A `Cancel` drops a queued bundle; the records stay kept. Under
+  `Anchored`, a `Start::Loaded` also queues every saved pinned region for the first step, as
+  `Loader::bundle(.., RegionMode::Frozen, table)` built at `build_server`: a pinned region
+  is simulated whenever the server runs, so it loads at the first step, as it would have
+  stepped had the world never been saved, and is never requested. Its table is required:
+  being never requested, a pinned region loaded without one would wait frozen with nothing
+  in the output to say so, so `build_server` fails with `NotFound` when `Cooked::table`
+  has none for it and with the pin's error when `Cooked::pin` fails; a driver resuming an
+  `Anchored` world therefore publishes every saved pinned region's table before
+  `build_server`, or retries the build once it is published. Under `Directed`, a
+  `Start::Loaded` queues every saved region for the first step, as
+  `Loader::bundle(.., RegionMode::Simulated, table)` built at `build_server`, with `table`
+  `None` when the region has none (so a region that cannot be bundled, or whose table
+  cannot be pinned, fails the build), and a region unloaded through
   `TickInput::unloaded` comes back when a frame names it in `loaded` (next bullet). A
-  bundle the server cannot build for a kept region at a request is a `LoadFailure` in the
-  output with `Loader::bundle`'s error, and the records stay kept.
+  bundle the server cannot build for a kept region at a request (`Loader::bundle` fails)
+  is a `LoadFailure` in the output with that error, and the records stay kept; the
+  lifecycle does not request the region again, so the caller recovers it with its own
+  `loaded` entry for the region (next bullet), the one case in which it answers a kept
+  region.
 - A frame's own `loaded` entry for a region the store holds, or has queued, loads the
   stored state: the entry lends its `mode` and, when `Some`, its `assets`; its `baseline`,
   `overlay`, `resources` and `transient_resources` are dropped and logged at `info`, and
-  the baseline recorded for the region is the stored one. The rule is in that direction
+  the baseline recorded for the region is the stored one. A stored state that cannot be
+  bundled (as at a request) is a `LoadFailure` at that step, the entry dropped and the
+  records kept. The rule is in that direction
   because a saved region must not be lost by a caller that loads it fresh, which under
   `Directed` is the only way to ask for it back; a reset to the cooked state is "Not in
   this crate yet". `TickInput::loaded` is keyed by region, so there is no order between
@@ -568,14 +588,6 @@ root")
 
 ## Not in this crate yet
 
-- The `app-headless` binary itself: `tests/headless.rs`, section 3, is its `main`. It is a
-  package `lactose-app-headless` in `crates/app-headless`, with `panic = "abort"`, the
-  crash-dump hook of architecture section 5.1 and a `README.md` (which `cargo xtask
-  boundary` requires of every crate). When it lands, `lactose-app-headless` joins
-  `[feature_roots]` and `lactose-app` joins `[harness]` in `tools/xtask/ci-policy.toml`,
-  in that same change.
-- The SOUR test of the assembly: `tests/headless.rs`, section 4, is its glue; it runs once
-  the bodies exist.
 - A reset of a kept region to its cooked state (`Server::forget(region)`), and a reload of
   a kept region under `Directed` by name rather than by a frame's `loaded` entry: neither
   is needed by the headless app or the spike.
@@ -610,31 +622,34 @@ root")
 
 ## Proof for milestone 1
 
-Nothing runs: every deciding body is `todo!()`. The crate passes `cargo fmt`, clippy with
-`-D warnings` on every target, `cargo xtask tiers`, `cargo xtask boundary`, `cargo xtask
-features` and its doctests. `tests/headless.rs` and `tests/spike.rs` compile the
-consumers' code against the surface; their five tests run what is real now: the constants
-and `WorldConfig::headless`, the milestone 1 policy table, the log target, an empty
-refusal, and a registration as a plain value. `lib.rs` pins at compile time that
+Every row below runs. `tests/proof/` is one test binary with a module per area (the
+registration, the server's frame and time scale with the refusals and relevance, the store
+and its baselines, the client's frame); `tests/headless.rs` holds the headless app's rows,
+the policy table and `a_headless_run_under_sour`, the SOUR test of the assembly, which the
+runner records under every mode since `lactose-app` is a `[harness]` package; the
+`Server::shutdown` row is a unit test in `src/server.rs`. Every pacer runs over a stand-in
+clock: instants computed from one base and never read between frames, so a test's tick
+counts do not depend on the machine's load. `tests/spike.rs` compiles the spike's loop
+against the surface. `lib.rs` pins at compile time that
 `CrateRegistration` and `Game` are `Copy + Send + Sync + 'static`, that every
 configuration, saved world, world, run future, output and save future is `Send`, and that
 `dyn Cooked` is `Send + Sync`.
 
-What the implementation proves, each a nextest test asserting on counts, orders and hashes
-and never on timing, and the SOUR test recording under the runner:
+What the tests prove, each asserting on counts, orders, bytes and hashes and never on
+timing:
 
 | What | How |
 |---|---|
-| The registration order | A game of three sketch crates whose functions record their calls: types, setups and systems in the stated order, each kind alike; a failing `types` names its crate |
-| A headless run is a function of its frames | `Headless::step` for N ticks and `Headless::run` for N ticks with the same frames hash equal; two executors with different worker counts hash equal; a SOUR run under workers, layout and chaos modes; `run` on a replay executor is `Unsupported` before any tick |
+| The registration order | A game of three sketch crates whose functions record their calls: types, setups and systems in the stated order, each kind alike; a failing `types` names its crate; a frame's sample reaches the player's entity (`lactose_input::player_entity`), so the input applier is installed |
+| A headless run is a function of its frames | `Headless::step` for N ticks and `Headless::run` for N ticks with the same frames hash equal; two executors with different worker counts hash equal; a SOUR run under workers, layout and chaos modes, of the sketch with player 1 as a dynamic body its input steers, which fails unless the last sample was applied and the body moved; `run` on a replay executor is `Unsupported` before any tick |
 | The frame | A frame callback that records the ticks it was asked for sees consecutive ticks; `None` stops the frame at its tick and the passes still run; `behind` is reported when more than the cap is owed; a poll at the build instant owes one tick and a run after a gap starts with none owed |
-| Time scale, server | With the real `TickPacer` over a stand-in clock, at 60 Hz frames, at 30 Hz frames and at a 2x scale (frames owing two ticks): after `set_time_scale(PAUSED)` the next frame runs exactly one tick whose `TickInput` carries `Some(PAUSED)`, the mirror reads `PAUSED`, `time_scale()` reads `PAUSED` after that step and not before, and the following frames run no tick; a callback's own `Some(PAUSED)` in the first of two due ticks ends the frame after that tick; after `set_time_scale(REAL_TIME)` `time_scale()` reads `REAL_TIME` at once, the next frame runs ticks and the first carries `Some(REAL_TIME)`; on a paused server, `set_time_scale(REAL_TIME)` then `set_time_scale(PAUSED)` in one gap runs no tick and leaves `time_scale()` and the mirror at `PAUSED`, and `PAUSED` then `REAL_TIME` in one gap on a running server runs ticks with the mirror at `REAL_TIME`; between runs with no scale pending `time_scale()` equals the mirror; the same through `step`; a repeated scale is dropped; over 50 pause cycles the schedule drifts by at most one tick per pause |
-| Time scale, client | A due frame carrying `Some(PAUSED)` pauses the pacer at the fold and the frame runs no tick and pops nothing; a later frame carrying `Some(REAL_TIME)` makes ticks due at its fold, the first step carries `Some(REAL_TIME)` and the hook pops both frames |
-| The store | A region unloaded under `Directed` is in `kept` after the step and not in `baselines`; a frame that loads it fresh loads the stored state with the frame's mode and table, `info` logged; a `save_point` after the unload holds it; under `Anchored`, a saved world of N regions with one pinned, started `Loaded`, loads the pinned region at the first step, reports no refusal, and after a `Join` into a saved region the lifecycle's `Load` is answered from the store at the next step and the region leaves `kept`; a save after K ticks holds every one of the N regions; join then leave: a saved world of 25 regions started `Loaded` under `Anchored`, a `Join` whose `Load`s the store answers, and the player's `Leave` in the step that loads the 25 bundles, so every bundle is accepted and its region unloaded again in one step: all 25 are in `kept` after that step, none in the baselines, and a save then holds all 25; under `Directed`, a region unloaded and reloaded in one frame whose reload bundle is refused is in `kept` with its export's records and not in the baselines, and one whose reload is accepted is loaded, not kept, with the reloading bundle's baseline; an unload whose diff fails (a region created through `Simulation::world_mut`, no baseline) fails the step with `NotFound` and `server: None`; a region is never both loaded and kept |
-| Baselines | A region loaded, unloaded and saved is diffed against the bundle it was loaded with; a refused bundle records nothing; a reload records the reloading bundle's baseline |
+| Time scale, server | With the real `TickPacer` over a stand-in clock, at 60 Hz frames, at 30 Hz frames and at a 2x scale (frames owing two ticks): after `set_time_scale(PAUSED)` the next frame runs exactly one tick whose `TickInput` carries `Some(PAUSED)`, the mirror reads `PAUSED`, `time_scale()` reads `PAUSED` after that step and not before, and the following frames run no tick; a callback's own `Some(PAUSED)` in the first of two due ticks ends the frame after that tick; after `set_time_scale(REAL_TIME)` `time_scale()` reads `REAL_TIME` at once, the next frame runs ticks and the first carries `Some(REAL_TIME)`; on a paused server, `set_time_scale(REAL_TIME)` then `set_time_scale(PAUSED)` in one gap runs no tick and leaves `time_scale()` and the mirror at `PAUSED`, and `PAUSED` then `REAL_TIME` in one gap on a running server runs ticks with the mirror at `REAL_TIME`; between runs with no scale pending `time_scale()` equals the mirror; the same through `step`; a pause carried by `step` on a new server, or in a frame that is behind, leaves the next frame no tick, and a pause pending on a frame owing nothing is carried by one tick; a repeated scale is dropped; over 50 pause cycles the schedule drifts by at most one tick per pause |
+| Time scale, client | A due frame carrying `Some(PAUSED)` pauses the pacer at the fold and the frame runs no tick and pops nothing; a later frame carrying `Some(REAL_TIME)` makes ticks due at its fold, the first step carries `Some(REAL_TIME)` and the hook pops both frames; a new client paced at rate zero, or whose first due frame carries a pause, runs no tick |
+| The store | A region unloaded under `Directed` is in `kept` after the step and not in `baselines`; a frame that loads it fresh loads the stored state with the frame's mode and table, `info` logged; a `save_point` after the unload holds it; under `Anchored`, a saved world of N regions with one pinned, started `Loaded`, loads the pinned region at the first step, reports no refusal, and after a `Join` into a saved region the lifecycle's `Load` is answered from the store at the next step and the region leaves `kept`; a world resumed that way matches the one that was never saved, counter and hash, at every tick; such a resume fails at `build_server` with `NotFound` when the pinned region has no table and with the pin's error when its pin fails, and under `Directed` a pin failure at the build fails it while a missing table loads the region with none; a save after K ticks holds every one of the N regions; join then leave: a saved world of 25 regions started `Loaded` under `Anchored`, a `Join` whose `Load`s the store answers, and the player's `Leave` in the step that loads the 25 bundles, so every bundle is accepted and its region unloaded again in one step: all 25 are in `kept` after that step, none in the baselines, and a save then holds all 25; under `Directed`, a region unloaded and reloaded in one frame whose reload bundle is refused is in `kept` with its export's records and not in the baselines, and one whose reload is accepted is loaded, not kept, with the reloading bundle's baseline; an unload whose diff fails (a region created through `Simulation::world_mut`, no baseline) fails the step with `NotFound` and `server: None`; a kept region whose table cannot be pinned at a store answer is no refusal: it loads `Frozen` with no table and takes one through `TickInput::assets`; a region is never both loaded and kept |
+| Baselines | A region loaded, unloaded and saved is diffed against the bundle it was loaded with, also when its reload in the same frame is refused; a refused bundle records nothing; a reload records the reloading bundle's baseline |
 | Save and load | `save_point`, `encode_save`, `Io::replace` into a temporary directory, `load`, a `Start::Loaded` headless app stepped K ticks against the original stepped K more: equal hashes; the same through a `SavedWorld` with no file; a `Start::Loaded` with a corrupt section fails at `load`; a failed replace leaves the previous file |
-| Refusals | A bundle for a loaded region is a `LoadFailure` in `StepOutput::failures` and in `FrameOutput::failures`; a session event the applier refuses and an asset failure the frame carries appear the same way; `is_empty` otherwise |
-| The client's frame | Over the spike's game: a full frame folded loads exactly its regions; a kept failure keeps the client and the next frame resyncs on entry and reports it; `clock` with `snap` resyncs at the next frame; a fold whose `Cooked` fails resyncs at the world's own tick with the pacer's deadline unchanged, and a failing frame that stays queued through a 120-frame pause resyncs once, not per frame, while a newer failing frame resyncs again; after a backward resync the re-predicted ticks step with the history's samples and the sampler is not called; a stale estimate with `Behind` resyncs to at least `server + lead`, and `TooOld` to at least its `frame + lead`; an estimate taken, then a replicated pause of 120 frames and an unpause, then a resync with no hint lands at the estimate plus the ticks the pacer granted plus the lead, not the pause's length further; the history holds the last eight samples |
+| Refusals | A bundle for a loaded region is a `LoadFailure` in `StepOutput::failures` and in `FrameOutput::failures`; a session event the applier refuses, or a `Join` for a region the atlas lacks under `Anchored`, and an asset failure the frame carries appear the same way; `is_empty` otherwise |
+| The client's frame | Over the proof's game: a full frame folded loads exactly its regions; a kept failure keeps the client and the next frame resyncs on entry and reports it; `clock` with `snap` resyncs at the next frame; a fold whose `Cooked` fails resyncs at the world's own tick with the pacer's deadline unchanged, and a failing frame that stays queued through a 120-frame pause resyncs once, not per frame, while a newer failing frame resyncs again; after a backward resync the re-predicted ticks step with the history's samples and the sampler is not called; a stale estimate with `Behind` resyncs to at least `server + lead`, and `TooOld` to at least its `frame + lead`; an estimate taken, then a replicated pause of 120 frames and an unpause, then a resync with no hint lands at the estimate plus the ticks the pacer granted plus the lead, not the pause's length further; the history holds the last eight samples |
 | Relevance | The message's `assets` is the world's table for the region, and `None` before one entered |
 | The policy | Each source's response, and that a `Stop` reaches the `Result` of the run that failed |
 | Shutdown | A chaos run's log is read after the world is dropped and before the executor is shut down; after `Server::shutdown` the solver pool's exit count equals its thread count, with the probe's slow `exit_handler` |

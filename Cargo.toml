@@ -71,6 +71,9 @@ sha2 = { version = "0.10", default-features = false }
 syn = "3"
 toml = { version = "1", default-features = false, features = ["std", "parse", "serde"] }
 tracing = { version = "0.1", default-features = false, features = ["std"] }
+# The binaries' text subscriber to stderr (architecture section 3): `fmt` alone, no colour,
+# no filter syntax, no `log` bridge.
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "std"] }
 windows-sys = "0.61"
 xxhash-rust = "0.8"
 zstd = { version = "0.13", default-features = false }
@@ -95,3 +98,8 @@ split-debuginfo = "unpacked"
 
 [profile.dev.package."*"]
 opt-level = 3
+
+# Architecture section 5.1: panics abort in shipped binaries. Cargo ignores this for tests,
+# benches, build scripts and proc macros; the binaries' crash hook aborts in every profile.
+[profile.release]
+panic = "abort"

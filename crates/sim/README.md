@@ -303,7 +303,8 @@ session state, so on a load every player joins again. A `Join` is applied at the
 sync point at which its region is loaded, which may be later than its frame: until then
 the lifecycle holds it and its region counts as the player's position for activation. A
 `Join` for a region the atlas lacks, under `Anchored`, is refused and reported as a
-`SessionFailure` of kind `NotFound` (`take_session_failures`), neither held nor applied. A
+`SessionFailure` of kind `NotFound` (`take_session_failures`), neither held nor applied. An
+event the applier fails is skipped and reported the same way, with the applier's error. A
 `Leave` is applied at once, and a `Leave` for a held `Join` cancels it and is all of the
 leave: the join never reached the world, so the applier is not called. A newer `Join`
 replaces a held one. Held joins are

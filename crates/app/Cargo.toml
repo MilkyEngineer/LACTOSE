@@ -50,6 +50,8 @@ rayon.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+# The SOUR sketch's body: where it starts, the shape it has, how fast its input steers it.
+lactose-math.workspace = true
 # The compile-only sketches in `tests/` write a game crate the way `game-sim` will: its
 # components through the reflect macros.
 lactose-reflect.workspace = true

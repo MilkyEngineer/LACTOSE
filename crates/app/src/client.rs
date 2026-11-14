@@ -9,17 +9,23 @@ use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use lactose_core::{Error, Result, StableKey, Tick};
-use lactose_ecs::PresentEventBatch;
+use lactose_ecs::{PresentEventBatch, WorldKind};
 use lactose_input::{PlayerInput, SampleHistory};
-use lactose_net_api::StagedFrame;
+use lactose_net_api::{RegionChange, RegionRelevance, StagedFrame, StagedInbox};
 use lactose_net_host::ClockEstimate;
 use lactose_net_host::message::JoinAccepted;
-use lactose_predict::{LocalPlayer, Predictor, Reconciled};
+use lactose_predict::{
+    DEFAULT_DEPTH, LocalPlayer, PredictError, Predictor, Reconciled, ResyncReason,
+    check_prediction_reads,
+};
+use lactose_sim::{RegionBundle, TickInput, TimeScale};
 use lactose_task::{Executor, TickPacer};
+use tracing::debug;
 
+use crate::assemble;
 use crate::game::Game;
-use crate::policy::ErrorPolicy;
-use crate::runtime::SolverExit;
+use crate::policy::{ErrorPolicy, LOG_TARGET, Source, run_source};
+use crate::runtime::{CATCH_UP_CAP, SolverExit, TICK_PERIOD};
 use crate::save::Cooked;
 use crate::world::WorldConfig;
 
@@ -33,7 +39,15 @@ use crate::world::WorldConfig;
 /// milestone 4 (`README.md`, "Not in this crate yet").
 pub struct Client {
     predictor: Predictor,
+    core: Core,
+}
+
+/// Everything of a [`Client`] but the predictor, so a run can move the predictor out and
+/// put it back.
+struct Core {
     pacer: TickPacer,
+    /// Whether the pacer was last set to a zero scale.
+    paused: bool,
     lead: u32,
     estimate: Option<Estimate>,
     pending_resync: bool,
@@ -73,7 +87,27 @@ pub fn build_client(
     lead: u32,
     cooked: Arc<dyn Cooked>,
 ) -> Result<Client> {
-    todo!("build the prediction world and its predictor")
+    let types = game.types()?;
+    let (builder, solver) = assemble::world(executor, game, &config, WorldKind::Prediction, types)?;
+    let simulation = builder
+        .tick(Tick(accepted.tick.0.wrapping_add(lead)))
+        .check(check_prediction_reads)
+        .build()?;
+    let local = LocalPlayer { player: accepted.player, entity };
+    let predictor = Predictor::new(simulation, local, DEFAULT_DEPTH)?;
+    let core = Core {
+        pacer: TickPacer::new(Instant::now(), TICK_PERIOD, CATCH_UP_CAP),
+        paused: false,
+        lead,
+        estimate: None,
+        pending_resync: false,
+        content_failed: None,
+        history: SampleHistory::new(),
+        cooked,
+        solver,
+        policy: ErrorPolicy::MILESTONE_1,
+    };
+    Ok(Client { predictor, core })
 }
 
 impl Client {
@@ -100,7 +134,7 @@ impl Client {
     /// until a [`clock`](Self::clock) estimate replaces it.
     #[must_use]
     pub fn lead(&self) -> u32 {
-        self.lead
+        self.core.lead
     }
 
     /// The predictor, between runs: its stats, ring and tolerance.
@@ -120,7 +154,7 @@ impl Client {
     /// [`frame`](Self::frame) as it steps, and read by it for a tick it predicts again.
     #[must_use]
     pub fn history(&self) -> &SampleHistory {
-        &self.history
+        &self.core.history
     }
 
     /// Queues a staged frame the network delivered, between runs: `StagedInbox::push` on
@@ -129,7 +163,13 @@ impl Client {
     /// at `debug` and enters nothing.
     #[must_use]
     pub fn push(&mut self, frame: Arc<StagedFrame>) -> bool {
-        todo!("push into the inbox")
+        let tick = frame.tick;
+        let world = self.predictor.simulation_mut().world_mut();
+        let accepted = world.service_mut::<StagedInbox>().is_some_and(|inbox| inbox.push(frame));
+        if !accepted {
+            debug!(target: LOG_TARGET, tick = tick.0, "the inbox refused a staged frame");
+        }
+        accepted
     }
 
     /// How the clock estimate reaches the timer root (architecture section 9.2), between
@@ -141,7 +181,16 @@ impl Client {
     /// `lactose-net`'s to compute at milestone 4; the spike computes one from its round
     /// trip by hand.
     pub fn clock(&mut self, estimate: ClockEstimate) {
-        todo!("apply the estimate to the pacer and the lead, keep it, mark a snap")
+        let world = self.predictor.simulation().world();
+        let scale = world.resource::<TimeScale>().copied().unwrap_or(TimeScale::REAL_TIME);
+        let core = &mut self.core;
+        // `as` saturates a float: a negative or NaN lead is zero, a huge one `u32::MAX`.
+        core.lead = estimate.lead_ticks.ceil() as u32;
+        core.estimate = Some(Estimate { granted: 0, estimate });
+        core.pace(scale);
+        if estimate.snap {
+            core.pending_resync = true;
+        }
     }
 
     /// One frame of the timer root's client half, by value, in this order and nothing
@@ -173,7 +222,8 @@ impl Client {
     ///    tick with the pacer untouched: a content resync, reported so the full frame that
     ///    follows retries the region. A failing frame folded again (one that stays queued
     ///    through a pause) is left out again and resyncs nothing.
-    /// 3. `pacer.poll(now)`, its budget's ticks added to the estimate's granted count.
+    /// 3. `pacer.poll(now)`, preceded by `pacer.resync(now)` while the pacer is paced at
+    ///    zero, its budget's ticks added to the estimate's granted count.
     /// 4. One `Predictor::step` per due tick, with the fold's input in the first and an
     ///    empty one after. The local player's sample for `next` is the history's if it
     ///    holds one (a tick predicted before a backward resync is predicted again with the
@@ -195,7 +245,11 @@ impl Client {
         now: Instant,
         sample: &'a mut (dyn FnMut(Tick) -> PlayerInput + Send),
     ) -> ClientFrame<'a> {
-        todo!("resync on entry, fold, poll, step, reconcile, run the passes, take the events")
+        ClientFrame {
+            run: Box::pin(
+                async move { self.run_frame(executor, now, sample).await.map_err(|e| *e) },
+            ),
+        }
     }
 
     /// Drops the world and waits for its solver threads: the predictor goes first, which
@@ -204,8 +258,240 @@ impl Client {
     /// this terminates the pool and does not wait. From the thread that owns the client,
     /// never from a worker or a solver thread.
     pub fn shutdown(self) {
-        todo!("drop the predictor, then wait on the solver exit")
+        let Self { predictor, core } = self;
+        drop(predictor);
+        core.solver.wait();
     }
+
+    /// [`frame`](Self::frame).
+    async fn run_frame(
+        self,
+        executor: &Executor,
+        now: Instant,
+        sample: &mut (dyn FnMut(Tick) -> PlayerInput + Send),
+    ) -> core::result::Result<(Self, ClientOutput), Box<ClientError>> {
+        let Self { mut predictor, mut core } = self;
+        let mut resync = None;
+
+        // 1. A pending clock resync.
+        if core.pending_resync {
+            core.pacer.resync(now);
+            let target = core.target(None, predictor.tick());
+            if let Err(error) = predictor.resync(target) {
+                return Err(core.kept(error, predictor));
+            }
+            core.pending_resync = false;
+            resync = Some(target);
+        }
+
+        // 2. The fold.
+        let mut input = core.fold(&predictor);
+        if let Some((tick, error)) = input.failed.take()
+            && core.content_failed.is_none_or(|remembered| tick.0 > remembered.0)
+        {
+            core.policy.decide(Source::Cooked, &error);
+            core.content_failed = Some(tick);
+            if resync.is_none() {
+                let own = predictor.tick();
+                if let Err(error) = predictor.resync(own) {
+                    return Err(core.kept(error, predictor));
+                }
+                resync = Some(own);
+            }
+        }
+
+        // 3. The poll. A paused pacer still pays out what it owed when it stopped (a new
+        // pacer owes its first tick): forgetting it keeps the world paused from the fold on.
+        if core.paused {
+            core.pacer.resync(now);
+        }
+        let budget = core.pacer.poll(now);
+        if let Some(estimate) = &mut core.estimate {
+            estimate.granted += u64::from(budget.ticks);
+        }
+
+        // 4. The steps.
+        let local = predictor.local().player;
+        let mut folded = Some(input.frame);
+        for _ in 0..budget.ticks {
+            let next = Tick(predictor.tick().0.wrapping_add(1));
+            let player = match core.history.get(next) {
+                Some(input) => *input,
+                None => {
+                    let input = sample(next);
+                    core.history.insert(next, input);
+                    input
+                }
+            };
+            let mut frame = folded.take().unwrap_or_default();
+            frame.inputs.insert(local, player.to_player_sample(next));
+            predictor = match predictor.step(executor, frame).await {
+                Ok(predictor) => predictor,
+                Err(failure) => return Err(core.failed(failure)),
+            };
+        }
+
+        // 5. The reconciliation, timed.
+        let started = Instant::now();
+        let (predictor, reconciled) = match predictor.reconcile(executor).await {
+            Ok(done) => done,
+            Err(failure) => return Err(core.failed(failure)),
+        };
+        let rollback = if reconciled.resimulated == 0 { Duration::ZERO } else { started.elapsed() };
+
+        // 6. The passes.
+        let mut predictor = match predictor.passes(executor).await {
+            Ok(predictor) => predictor,
+            Err(failure) => return Err(core.failed(failure)),
+        };
+
+        // 7. The presentation events.
+        let events = predictor.simulation_mut().world_mut().take_present_events();
+
+        // 8. A resync the reconciliation asked for.
+        if let Some(reason) = reconciled.resync {
+            core.pacer.resync(now);
+            let hint = match reason {
+                ResyncReason::Behind { server, .. } => server,
+                ResyncReason::TooOld { frame, .. } => frame,
+            };
+            let target = core.target(Some(hint), predictor.tick());
+            if let Err(error) = predictor.resync(target) {
+                return Err(core.kept(error, predictor));
+            }
+            resync = Some(target);
+        }
+
+        // 9. A frame behind.
+        if budget.behind {
+            debug!(target: LOG_TARGET, tick = predictor.tick().0, "the client frame is behind");
+            core.pacer.resync(now);
+        }
+
+        let output = ClientOutput {
+            ticks: budget.ticks,
+            behind: budget.behind,
+            next_deadline: budget.next_deadline,
+            reconciled,
+            rollback,
+            resync,
+            events,
+        };
+        Ok((Self { predictor, core }, output))
+    }
+}
+
+/// What the fold produced: the input of the first step, and the newest failing frame's
+/// tick with its error.
+struct Fold {
+    frame: TickInput,
+    failed: Option<(Tick, Error)>,
+}
+
+impl Core {
+    /// The pacer at the world's `scale` times the estimate's rate.
+    fn pace(&mut self, scale: TimeScale) {
+        let rate =
+            self.estimate.as_ref().map_or(1000, |estimate| estimate.estimate.rate_thousandths);
+        let paced = f64::from(scale.thousandths) / 1000.0 * f64::from(rate) / 1000.0;
+        self.pacer.set_time_scale(paced);
+        self.paused = scale.is_paused() || rate == 0;
+    }
+
+    /// The clock target with `hint`; `own` with neither an estimate nor a hint.
+    fn target(&self, hint: Option<Tick>, own: Tick) -> Tick {
+        let advanced = self.estimate.as_ref().map(|estimate| {
+            let granted = u32::try_from(estimate.granted).unwrap_or(u32::MAX);
+            estimate.estimate.server_tick.0.saturating_add(granted)
+        });
+        let base = match (advanced, hint) {
+            (Some(advanced), Some(hint)) => advanced.max(hint.0),
+            (Some(advanced), None) => advanced,
+            (None, Some(hint)) => hint.0,
+            (None, None) => return own,
+        };
+        Tick(base.saturating_add(self.lead))
+    }
+
+    /// Step 2 of the frame: the due frames folded into one input, and the scale into the
+    /// pacer.
+    fn fold(&mut self, predictor: &Predictor) -> Fold {
+        let world = predictor.simulation().world();
+        let next = Tick(predictor.tick().0.wrapping_add(1));
+        let due: Vec<Arc<StagedFrame>> = world
+            .service::<StagedInbox>()
+            .map(|inbox| inbox.due(next).cloned().collect())
+            .unwrap_or_default();
+        let mut frame = TickInput::default();
+        let mut failed = None;
+        for staged in &due {
+            if let Some(scale) = staged.time_scale {
+                frame.time_scale = Some(scale);
+            }
+            if staged.full {
+                frame.loaded.clear();
+                frame.assets.clear();
+                frame.unloaded.extend(world.regions());
+            }
+            for (&region, change) in &staged.regions {
+                match change {
+                    RegionChange::Irrelevant => {
+                        frame.loaded.remove(&region);
+                        frame.assets.remove(&region);
+                        frame.unloaded.insert(region);
+                    }
+                    RegionChange::Relevant(relevance) => match self.relevant(relevance) {
+                        Ok(bundle) => {
+                            frame.loaded.insert(region, bundle);
+                        }
+                        Err(error) => failed = Some((staged.tick, error)),
+                    },
+                    RegionChange::Assets(table) => match self.cooked.pin(table) {
+                        Ok(pinned) => {
+                            frame.assets.insert(region, pinned);
+                        }
+                        Err(error) => failed = Some((staged.tick, error)),
+                    },
+                }
+            }
+        }
+        if let Some(scale) = frame.time_scale {
+            self.pace(scale);
+        }
+        Fold { frame, failed }
+    }
+
+    /// A `Relevant` region's bundle over the cooked baseline and its table pinned.
+    fn relevant(&self, relevance: &RegionRelevance) -> Result<RegionBundle> {
+        let baseline = self.cooked.baseline(relevance.baseline_hash)?;
+        let table = relevance.assets.as_ref().map(|table| self.cooked.pin(table)).transpose()?;
+        relevance.to_bundle(baseline, None, table)
+    }
+
+    /// A kept failure: the client back with a clock resync marked, after the policy saw it.
+    fn kept(mut self, error: Error, predictor: Predictor) -> Box<ClientError> {
+        self.policy.decide(Source::Prediction { kept: true }, &error);
+        self.pending_resync = true;
+        Box::new(ClientError { error, client: Some(Client { predictor, core: self }) })
+    }
+
+    /// A run's failure: kept as [`kept`](Self::kept) when the predictor came back, gone
+    /// otherwise.
+    fn failed(self, failure: PredictError) -> Box<ClientError> {
+        let PredictError { error, predictor } = failure;
+        match predictor {
+            Some(predictor) => self.kept(error, predictor),
+            None => {
+                self.policy.decide(run_source(&error, false, prediction_source), &error);
+                Box::new(ClientError { error, client: None })
+            }
+        }
+    }
+}
+
+/// `Source::Prediction`, for [`run_source`].
+fn prediction_source(kept: bool) -> Source {
+    Source::Prediction { kept }
 }
 
 /// What one client frame produced.
