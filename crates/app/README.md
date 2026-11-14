@@ -555,7 +555,11 @@ root")
   kept, so its binds need no field; the store answers a `Load` as before, and the world,
   which held the owner's bind all along, loads the row under its origin. The journal
   tooling records the same value at a checkpoint, `Loader::binds` over
-  `Server::save_point`'s regions, as `lactose_sim::journal::Journal::binds`.
+  `Server::save_point`'s regions, as `lactose_sim::journal::Journal::binds`. All of this
+  reads the records of every saved region, which `load` and the store hold in memory at
+  milestone 1. A store that keeps unloaded regions' sections on disk cannot read them
+  this way: the binds then travel beside its index, and `build_server` takes them from
+  there (milestone 3; `crates/persist/README.md`, "Not in this crate yet").
 - `Server::save_point` is `Simulation::save_point`, by value, then one
   `WorkerClass::Background` task per exported region running
   `RegionRecords::from_export(&export, &baseline, &schemas)` with the region's

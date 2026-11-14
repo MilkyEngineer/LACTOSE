@@ -233,8 +233,10 @@ exclusive systems of the input sync point are listed by name in
    (D142; facade). A server never rolls back and an entity it despawned never returns, so
    the step ends by passing the horizon over every despawn up to and including its own
    tick, and the world drops the bind of each despawned entity that had a predicted
-   origin: between steps a server holds no bind of a despawned entity ("Saves and loads",
-   the binds of a save). The delivered presentation-event keys the same call prunes are
+   origin: between steps a server holds no bind of an entity despawned in a step, and one
+   despawned through `world_mut()` between steps, an unjournaled edit, keeps its bind
+   until the next step ends ("Saves and loads", the binds of a save). The delivered
+   presentation-event keys the same call prunes are
    those of the events step 4 dropped. A `Client` world keeps step 1: it exports and saves
    nothing, so nothing there rests on when a despawned entity's bind goes.
 6. Resolves with the simulation at the new tick.
@@ -538,11 +540,13 @@ snapshot. It cannot do that for a world resource, which it stores as the typed v
 hands out by `&mut` (`World::resource_mut`, `ResMut`), so a bind and a restore leave a
 world resource as its writer left it: one that held a `Net` key bound later would keep
 it where every row holds the origin key, and a restore would put back whatever the
-snapshot held. No engine resource holds a reference, and none may: `build` refuses, with
-`InvalidData` naming the type, a world resource present after the setup functions whose
-type holds an `EntityRef` at any depth, whatever its policy, probing every resource type
-the `TypeTable` registered, with the coverage of the check above. State that names an
-entity is a component, or a region resource, of a pinned region when it belongs to none.
+snapshot held. No engine resource holds a reference, and none may. The refusal is the
+ECS's and not this crate's, so that it has no gap: `World::insert_resource`, the one way
+a world resource enters a world, does not compile for a type whose layout holds an
+`EntityRef` at any depth (`crates/ecs/README.md`, "Snapshots and bulk copy"), whether or
+not the type is registered and whether a setup function, a hook or an exclusive system
+inserts it. `build` therefore checks nothing for it. State that names an entity is a
+component, or a region resource, of a pinned region when it belongs to none.
 
 The hash is a pure function of that state: identical under every chunk layout, worker
 count, archetype history and registration order, on x86-64 and aarch64. The encoding, bit
@@ -727,8 +731,7 @@ added to `[harness] tests` in `tools/xtask/ci-policy.toml` in the commit that ad
 | `a_simulation_built_with_binds_holds_them_before_its_first_step` | `World::alias` gives each bound `NetId` before any step and no entity is live under either key; the binds are bound before any setup function runs; a second `binds` call replaced the first; the load of a region whose row carries a bound origin binds nothing new and loads the row under the origin key; a `Prediction` and a `Client` world take binds the same way | `persist.rs` |
 | `two_predicted_origins_bound_to_one_net_id_fail_the_build` | `InvalidData` from `build`, with `World::bind`'s message | `refusals.rs` |
 | `a_journal_from_a_checkpoint_with_a_predicted_owner_unloaded_replays_the_hashes` | A run under `Anchored` with a checkpoint taken while the owner's region is unloaded and the owned row's region loaded: the journal's `binds` hold the owner's bind, read from the export the unload left; the replay driver builds with them and reproduces every hash and output. With `binds` emptied the replay differs at its first tick | `persist.rs` |
-| `a_server_holds_no_bind_of_a_despawned_entity_between_steps` | A bound entity with a predicted origin despawned by a command: `World::alias` is `None` once the step has resolved, in the step that despawned it. One whose region the step unloaded keeps its bind. A `Client` world's step still sets the horizon to its current tick before the run, so the bind of an entity its hook despawned outlives the step | `runs.rs` |
-| `a_world_resource_that_holds_an_entity_reference_fails_the_build` | A registered resource type with an `EntityRef` field, at the top level and nested in a `#[value]` struct, inserted by a setup function: `InvalidData` naming the type, `derived` or not; the same type as a region resource builds, and a type without a reference builds | `refusals.rs` |
+| `a_server_holds_no_bind_of_an_entity_despawned_in_a_step` | A bound entity with a predicted origin despawned by a command: `World::alias` is `None` once the step has resolved, in the step that despawned it. One whose region the step unloaded keeps its bind. One despawned through `world_mut()` between steps keeps its bind through the next step and has none once that step has resolved. A `Client` world's step still sets the horizon to its current tick before the run, so the bind of an entity its hook despawned outlives the step | `runs.rs` |
 
 ## Proof for milestone 1
 

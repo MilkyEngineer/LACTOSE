@@ -374,7 +374,8 @@ export:
   registry's (the table's). `Migrations::migrate` decides, in this order: a document
   version above the registry's is `VersionMismatch` (a newer save than the build); equal
   versions with an equal `LayoutDigest` are the fast path (the value is used as it is, the
-  bulk-copy-plus-remap path of the ECS; no step, no validation here); equal versions with
+  bulk-copy path of the ECS, which rewrites no reference; no step, no validation here);
+  equal versions with
   different digests are `VersionMismatch`, a layout changed without a bump, which the
   macros cannot see, so it is caught here; else every step from the document's version up
   to the registry's version minus one must be registered (`VersionMismatch` naming the
@@ -521,14 +522,17 @@ export:
   `SetField` of it names a column no baseline has and its section cannot load. The pairs
   are therefore exactly the binds the loads of the sections would make, whichever load
   and in whatever order.
-- They are every bind the saving world held. Between two steps a `Server` world holds a
-  bind for exactly the entities with a predicted origin that reside in a loaded region or
-  in the kept state of an unloaded one (`crates/sim/README.md`, "Saves and loads"), and
-  the sections of a save point are those regions: the loaded regions' exports and the
-  server's store (`lactose_app::Server::save_point`). Which binds a save carries is
-  therefore no choice of this crate's: the bind of every entity it holds, and none of a
-  despawned entity, which no section holds and no server keeps past the step of the
-  despawn.
+- They are every bind the saving world held. Between two steps, with no unjournaled edit
+  since the last, a `Server` world holds a bind for exactly the entities with a predicted
+  origin that reside in a loaded region or in the kept state of an unloaded one
+  (`crates/sim/README.md`, "Saves and loads", which also names the two cases outside
+  it), and the sections of a save point are those regions: the loaded regions' exports
+  and the server's store (`lactose_app::Server::save_point`). Which binds a save carries
+  is therefore no choice of this crate's: the bind of every entity it holds, and none of
+  a despawned entity, which no section holds and no server keeps past the step of a
+  despawn made in a step. An entity despawned through `world_mut()` between steps, an
+  unjournaled edit, keeps its bind until the next step ends, so a save taken in between
+  starts a process without a bind the saving world still holds.
 - The container does not change for it. `CONTAINER_FORMAT_VERSION` stays 1, no golden
   byte and no pinned digest moves, and a save written before D142 loads as it is, since
   its sections always held the origins; what was missing was the load's use of them.
@@ -668,13 +672,14 @@ A facade: none of these tests exists yet. Each row is a test the lane `binds-imp
 the name given, and the sentence it holds. The first two are the whole-project review's
 probe D1 and its control, adopted beside the section 15.5 tests; a test that records
 under SOUR is added to `[harness] tests` in `tools/xtask/ci-policy.toml` in the commit
-that adds it.
+that adds it. Both record, and the lane runs them under every mode of SOUR's matrix,
+repeat, chaos and each layout capacity included, before it hands back.
 
 | Test | What it holds | File |
 |---|---|---|
 | `a_fresh_process_that_leaves_a_predicted_owners_region_unloaded_hashes_equal` | Regions A and B loaded from their baselines; an entity with a predicted origin spawned in B and bound; a cooked row of A given to it; both regions saved through the container's bytes; B unloads in the original, which then reloads A in place from the save. A fresh process decodes the bytes, builds with the header's tick and counter and `Loader::binds` over both sections, and loads A alone. The row's `OwnedBy` is the predicted origin in both, before any step, and the hash of A is equal then and after each of K ticks; B then loads in both and they stay equal; the records the fresh process exports for A are the save's. Built without the binds the fresh process stores the owner's `Net` key and hashes apart, which is the failure the test names | `reload.rs` |
 | `an_owner_with_a_net_key_in_an_unloaded_region_hashes_equal` | The control: the same history with an owner whose origin key is its `Net` key. Equal with the binds and without them, so the difference above is the bind | `reload.rs` |
-| `the_binds_of_a_saved_world_are_what_its_loads_bind` | Sections holding a `Spawn` that carries a predicted origin, a `SpawnFromBaseline` and an `AddComponent` that carry one (predicted entities bound to cooked `NetId`s), rows without one and a region in its cooked state: `binds` gives exactly those pairs; a world that loads every section, in either order, holds exactly those binds; and a world built with them loads each section alone to the export the save was made from | `binds.rs` |
+| `the_binds_of_a_saved_world_are_what_its_loads_bind` | A world saved through `export_region` and `from_export`, never hand-built records, holding: a predicted spawn bound to a runtime `NetId` (a `Spawn` that carries the origin); a predicted entity bound by a direct `World::bind` to a cooked `NetId` that is no row of its region's baseline (a `SpawnFromBaseline` that carries it); one bound to the `NetId` of a cooked row of the baseline that was despawned first (an `AddComponent` of the origin); rows without an origin; and a region in its cooked state. `binds` gives exactly those three pairs; a world that loads every section, in either order, holds exactly those binds; and a world built with them loads each section alone to the export the save was made from, each of the three entities under its predicted origin | `binds.rs` |
 | `a_save_points_binds_are_the_worlds` | After every step of 200 seeded histories of predicted spawns, despawns, moves, unloads and reloads over two regions, driven through `Simulation::step`: `binds` over the records of every region, the loaded ones' exports and the unloaded ones' kept records, holds a prediction key exactly when the world holds a bind for it, with the same `NetId`, for every key the history made | `binds.rs` |
 | `binds_refuse_what_no_export_holds` | One prediction key under two `NetId`s in one section, and across two sections; one `NetId` under two prediction keys across two sections; each `InvalidData` naming the key, the `NetId`s and the regions in the order given. A value that is not a valid `PredictedOrigin`, and records that fail `check`, are `InvalidData`; nothing is returned | `binds.rs` |
 | `binds_read_records_at_the_registrys_schema` | A section that carries `ecs::predicted_origin` under another layout digest than the table's is `VersionMismatch`; the same section through `Loader::migrate` is read | `binds.rs` |

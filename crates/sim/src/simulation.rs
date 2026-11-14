@@ -193,9 +193,10 @@ impl SimulationBuilder {
     /// so `derived`; `build` refuses any other policy among the resource types the
     /// [`TypeTable`] knows (the README says why and what the check does not cover). It
     /// holds no entity reference either: the world rewrites the references of rows and
-    /// region resources at a bind and at a restore, never a world resource's, so `build`
-    /// refuses a world resource whose type holds an `EntityRef` at any depth, with the
-    /// same coverage (D142; a facade until the lane `binds-impl`).
+    /// region resources at a bind and at a restore, never a world resource's, so
+    /// [`World::insert_resource`] does not compile for a type whose layout holds an
+    /// `EntityRef` at any depth (D142; a facade until the lane `binds-impl`). That refusal
+    /// is the world's and has no gap, so `build` checks nothing for it.
     #[must_use]
     pub fn setup(mut self, f: impl FnOnce(&mut World) -> Result<()> + Send + 'static) -> Self {
         self.setups.push(Box::new(f));
@@ -263,8 +264,7 @@ impl SimulationBuilder {
     /// [`CurrentTick`](crate::CurrentTick), [`TimeScale`](crate::TimeScale) at
     /// `REAL_TIME`, [`RegionPolicy`]) and services (the three hooks, the lifecycle, the
     /// frame and save slots); runs every setup function in order, then checks that no world
-    /// resource of a registered type is present whose policy is not `derived` or, from the
-    /// lane `binds-impl` on, whose type holds an entity reference (D142); runs every
+    /// resource of a registered type whose policy is not `derived` is present; runs every
     /// registration function in order, then every check function; builds the tick
     /// schedule, the pass schedules and
     /// the save pass with the orders their sets belong to; and prepares each against the
@@ -275,7 +275,7 @@ impl SimulationBuilder {
     /// [`WorldBuilder::build`](lactose_ecs::WorldBuilder::build) does, for a non-`derived`
     /// world resource, and for a schedule that does not build or prepare; and with a check
     /// function's error. From the lane `binds-impl` on, also with `InvalidData` for binds
-    /// [`World::bind`] refuses and for a world resource that holds an entity reference.
+    /// [`World::bind`] refuses.
     pub fn build(self) -> Result<Simulation> {
         let invalid = |message: &'static str| Err(Error::new(ErrorKind::InvalidData, message));
         let policy = self.policy;

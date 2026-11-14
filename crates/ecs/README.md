@@ -574,9 +574,18 @@ What a system is, from its parameters (`SystemParam` has the table):
   and hands it out by `&mut` (`resource_mut`, `ResMut`), so it cannot keep a world
   resource's references as origin keys: `insert_resource` stores the value as given,
   `bind` rewrites nothing in it, and `restore` puts the snapshot's value back as it was.
-  No world resource may therefore hold an entity reference; `lactose-sim` refuses one at
-  build (D142; a facade until the lane `binds-impl`), and state that names an entity is
-  a component or a region resource.
+  No world resource may therefore hold an entity reference, and `insert_resource`, the
+  one way a world resource enters a world, does not compile for a type whose layout holds
+  an `EntityRef` at any depth, in a nested `#[value]` struct or an array included (D142;
+  a facade until the lane `binds-impl`). The refusal is an assertion over `T::SCHEMA`
+  that the compiler evaluates where the call is instantiated, so it costs nothing at run
+  time and no signature changes; a build, and so every test run, reports it with the
+  call that made it, and `cargo check` and clippy, which instantiate nothing, do not. It
+  holds for a registered type and an unregistered one, and for an insert made at any
+  time. The same type stays legal as a region resource: `insert_region_resource` and its
+  erased and zeroed forms carry no such assertion, and the world keeps a region
+  resource's references as the bullet above says. State that names an entity is a
+  component or a region resource.
 
 **Erased row access**
 
@@ -626,6 +635,13 @@ is a test the lane `binds-impl` adds, by the name given, and the sentence it hol
 | `a_runtime_net_id_given_directly_moves_the_counter_past_it` | By `spawn`, `spawn_erased`, `bind` and `load_region` (a document's row, and the bind of a row that carries a predicted origin), in a `Server`, a `Client` and a `Prediction` world, under every layout: `next_net_id` is one past the `NetId` when it was not above it and unchanged when it was; a cooked `NetId` and a refused spawn, bind or load move nothing. The next allocation is the counter's value and never an ID in use; after the entity is despawned, or its region unloaded, its `NetId` is not handed out again. `export_region` of the `Server` world gives rows whose runtime `NetId`s are all below `next_net_id` | `binds.rs` |
 | `a_restore_puts_the_counter_back_and_keeps_the_binds` | A `Prediction` world: a bind made after a snapshot moved the counter; the restore returns the counter to the snapshot's value and the bind stays | `binds.rs` |
 | `a_baseline_that_carries_a_predicted_origin_is_refused` | `load_region` of a baseline with an `ecs::predicted_origin` column is `InvalidData` and leaves no row, no bind and no log entry; the same origin carried by a `Spawn` record of the overlay loads and binds | `bulk.rs` |
+| `a_world_resource_that_holds_an_entity_reference_does_not_compile` | `World::insert_resource` of a resource type with an `EntityRef` field, of one that holds it in a nested `#[value]` struct and of one that holds it in a `PlainArray`: each fails to build, the compiler's output naming the instantiation and the assertion's text. The case is built, not checked, since a check instantiates nothing. The controls build and run: a type without a reference through `insert_resource`, and the type with one as a region resource through `insert_region_resource`, as `regressions_two.rs` already holds for `Boss` | `compile_fail.rs`, `ui/world_resource_reference.rs` |
+
+Two tests of `events.rs` move with the counter rule and keep their runtime keys, so that
+they show it: `channel_entries_reach_later_stages_with_keys_resolved_and_do_not_outlive_the_tick`
+and `a_take_yields_the_earlier_stages_entries_with_keys_resolved_once` spawn directly under
+the runtime `NetId` 5 and then expect the allocated IDs 1 and 2; from the lane on they
+expect 6 and 7, with a comment naming D142.
 
 ## Proof for milestone 0
 

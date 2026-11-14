@@ -242,8 +242,8 @@ impl<'a> Loader<'a> {
     /// `NetId` the record's own. No other record is read and no baseline:
     /// `World::load_region` refuses a baseline that carries the component, so the pairs are
     /// exactly the binds the loads of `sections` would make, whichever load and in whatever
-    /// order, and they are every bind the saving world held between two steps
-    /// (`README.md`, "Binds").
+    /// order, and they are every bind the saving world held between two steps, with no
+    /// unjournaled edit since the last (`README.md`, "Binds").
     ///
     /// Fails with `InvalidData` for records that fail [`RegionRecords::check`]; for a value
     /// that is not a valid `PredictedOrigin`; and for one prediction key held under two
