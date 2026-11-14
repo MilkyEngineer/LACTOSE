@@ -1,0 +1,42 @@
+[package]
+name = "lactose-asset"
+description = "The asset store: cooked packs mounted and read through the file IO pool, loads on background workers, versioned publication and hot reload behind the asset interface's two store traits, and the pack format the cooker writes."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[dependencies]
+# The interface this crate is the first store behind: the two store traits, the loader
+# and the cooked record a pack index holds, the values that cross the store.
+lactose-asset-api.workspace = true
+# `Baseline`: the region-baseline asset kind is its canonical encoding (architecture
+# section 15.2); the edge needs no exception, `bundle` being foundation.
+lactose-bundle.workspace = true
+# `Error`, `Result` and `ErrorKind` for every failure, `AllocTag::Asset` for what a load
+# allocates, `xxh64` for a pack index's hash.
+lactose-core.workspace = true
+# A pack is opened once and read in ranges through the pool, each range decoded as part
+# of its request (architecture section 14, `crates/io/README.md`).
+lactose-io.workspace = true
+# The executor: one `WorkerClass::Background` task per load (architecture section 5.1).
+lactose-task.workspace = true
+# One span per mount and per load, target `silo` (architecture sections 3 and 19).
+tracing.workspace = true
+# The pack writer compresses a payload as one zstd frame that meets `io`'s frame rules
+# (README, "The pack format"). The store itself decodes nothing: `io` does.
+zstd.workspace = true
+
+[dev-dependencies]
+# The conformance suite every store must pass (architecture section 20), run against this
+# store in `tests/conformance.rs`. The feature is for dev-dependency edges alone.
+lactose-asset-api = { workspace = true, features = ["conformance"] }
+# The consumer sketch builds what `app` builds from the store's answers: `RegionId`,
+# `RegionMode`, and `RegionBundle` and `TickInput`, which take the baseline and the
+# pinned table.
+lactose-ecs.workspace = true
+lactose-sim.workspace = true
+
+[lints]
+workspace = true
