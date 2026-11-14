@@ -13,8 +13,8 @@ use std::sync::Mutex;
 use common::*;
 use lactose_core::StableKey;
 use lactose_ecs::{
-    ChunkOrder, Commands, Ctx, EventWriter, Events, LayoutConfig, Mut, Res, Schedule,
-    StableKeyOf, WorldKind, finalize, system,
+    ChunkOrder, Commands, Ctx, EventWriter, Events, LayoutConfig, Mut, Res, Schedule, StableKeyOf,
+    WorldKind, finalize, system,
 };
 use lactose_task::{ChaosConfig, Executor};
 
