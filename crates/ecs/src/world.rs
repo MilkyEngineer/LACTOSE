@@ -643,7 +643,10 @@ impl World {
     /// origin keys: a bound `Net` key inside a reference field of `bundle` is rewritten to
     /// the target's origin key here, as at command apply and [`insert`](Self::insert).
     /// `InvalidData` for an [`OwnedBy`](crate::OwnedBy) in `bundle` that would make `key`
-    /// its own owner or close a cycle of owners; a refused spawn changes nothing.
+    /// its own owner or close a cycle of owners; a refused spawn changes nothing. In a
+    /// `Server` world its `OwnedBy` goes by the rule [`insert`](Self::insert) states: a
+    /// despawned predicted owner is stored under its `Net` key, one with no alias is
+    /// `InvalidData`.
     pub fn spawn<B: Bundle>(&mut self, key: StableKey, region: RegionId, bundle: B) -> Result<()> {
         let components = erase_bundle(bundle);
         if components.iter().any(|component| is_worlds_own(component.key())) {
@@ -670,9 +673,13 @@ impl World {
     /// by name (`InvalidData`; `insert` would store the empty reference, but erased bytes
     /// come from the wire or a recorded slot, where a placeholder is never valid) and the
     /// bytes validated through `TypeInfo::validate` (`InvalidData`); `NotFound` if the
-    /// entity does not exist; `InvalidData` for an [`OwnedBy`](crate::OwnedBy) that would
-    /// make `key` its own owner or close a cycle of owners. A bound `Net` key in a reference
-    /// field is stored as the origin key, as `insert` stores it.
+    /// entity does not exist; in a `Server` world, the rule for an
+    /// [`OwnedBy`](crate::OwnedBy) that `insert` states (`InvalidData` for an owner that is
+    /// a predicted origin with no alias, and a despawned predicted owner rewritten to its
+    /// `Net` key before the test for equal bytes below); `InvalidData` for an `OwnedBy` that
+    /// would make `key` its own owner or close a cycle of owners. A bound `Net` key in a
+    /// reference field is stored as the origin key, as `insert` stores it. The one exception
+    /// is a `Server` world's `OwnedBy`, as `insert` states it.
     ///
     /// Adds the component if the row lacks it, an archetype change the structural log
     /// records, and otherwise writes it only if the stored bytes differ. A write stamps the
@@ -681,8 +688,11 @@ impl World {
     /// any with an `EntityRef` field); equal bytes change nothing, so no `Changed` reader
     /// sees them. Returns whether it wrote.
     pub fn insert_erased(&mut self, key: StableKey, data: &ComponentData) -> Result<bool> {
-        let component = self.erased_value(data)?;
+        let mut component = self.erased_value(data)?;
         let origin = self.origin(key).ok_or_else(|| not_found("no such entity"))?;
+        if let Some(bytes) = self.exportable_owned_by(component.key(), component.bytes())? {
+            component.payload = Payload::Bytes(bytes);
+        }
         if self.get_erased(origin, component.key()) == Some(component.bytes()) {
             return Ok(false);
         }
@@ -714,7 +724,9 @@ impl World {
     /// `Predicted` key gives [`PredictedOrigin`](crate::PredictedOrigin)), `InvalidData` for
     /// an [`OwnedBy`](crate::OwnedBy) that would make `key` its own owner or close a cycle of
     /// owners, and `NotFound` if the region is not loaded. Everything is checked before
-    /// anything changes, so a refused spawn changes nothing.
+    /// anything changes, so a refused spawn changes nothing. In a `Server` world its
+    /// `OwnedBy` goes by the rule [`insert`](Self::insert) states: a despawned predicted
+    /// owner is stored under its `Net` key, one with no alias is `InvalidData`.
     pub fn spawn_erased(
         &mut self,
         key: StableKey,
@@ -738,7 +750,10 @@ impl World {
     /// [`PredictedOrigin`](crate::PredictedOrigin), which are the world's. `NotFound` for a
     /// missing entity or an unregistered component; `InvalidData` for an
     /// [`OwnedBy`](crate::OwnedBy) that would make `key` its own owner or close a cycle of
-    /// owners. A refused insert changes nothing.
+    /// owners. A refused insert changes nothing. In a `Server` world an `OwnedBy` whose owner
+    /// is a despawned predicted entity, its alias still held, is stored under the owner's
+    /// `Net` key, and one whose owner is a predicted origin with no alias is `InvalidData`:
+    /// a server stores no owner its export cannot write (README, Regions; D141).
     pub fn insert<T: Component>(&mut self, key: StableKey, value: T) -> Result<()> {
         assert!(!is_worlds_own(T::KEY), "`{}` is written by the world only", T::SCHEMA.name());
         let origin = self.origin(key).ok_or_else(|| not_found("no such entity"))?;
@@ -746,6 +761,9 @@ impl World {
             // A reference is rewritten to its origin key in a value in transit.
             let mut component = ErasedComponent::of(value);
             self.resolve_references(&mut component, None, None);
+            if let Some(bytes) = self.exportable_owned_by(T::KEY, component.bytes())? {
+                component.payload = Payload::Bytes(bytes);
+            }
             let info = self.checked_write(origin, component.info, component.bytes())?;
             let stamp = self.bump();
             return self.store_component(origin, info, component.bytes(), stamp);
@@ -803,9 +821,11 @@ impl World {
     /// would take an entity the server has since released (D141). The simulation's own
     /// despawns are `despawn` and [`Commands::despawn`](crate::Commands::despawn), which
     /// take the tree. `NotFound` if the entity does not exist.
-    #[expect(unused_variables, reason = "facade (D141): the lane `stream-impl` writes the body")]
     pub fn despawn_alone(&mut self, key: StableKey) -> Result<()> {
-        todo!("D141: the lane `stream-impl`")
+        self.refuse_on_server()?;
+        let origin = self.origin(key).ok_or_else(|| not_found("no such entity"))?;
+        self.despawn_one(origin);
+        Ok(())
     }
 
     /// Moves `key` alone to `region`, immediately, in a `Client` or a `Prediction` world:
@@ -819,9 +839,18 @@ impl World {
     /// nothing changed: there an owned entity migrates with its owner (architecture section
     /// 6), and a server applies no other world's log. Then `NotFound` if the entity does
     /// not exist or `region` is not loaded.
-    #[expect(unused_variables, reason = "facade (D141): the lane `stream-impl` writes the body")]
     pub fn move_alone_to_region(&mut self, key: StableKey, region: RegionId) -> Result<()> {
-        todo!("D141: the lane `stream-impl`")
+        self.refuse_on_server()?;
+        let origin = self.origin(key).ok_or_else(|| not_found("no such entity"))?;
+        if !self.regions.contains_key(&region) {
+            return Err(not_found("the region is not loaded"));
+        }
+        // The point moves only for a write, as nothing is written for an entity already there.
+        if self.region_of(origin) != Some(region) {
+            let stamp = self.bump();
+            self.move_one(origin, region, stamp);
+        }
+        Ok(())
     }
 
     /// Allocates the next runtime `NetId` from the server counter, passing over any that
@@ -1444,7 +1473,10 @@ impl World {
     /// `overlay` destroys, a copy per archetype column plus a remap pass over reference
     /// fields; then applies `overlay`'s records in record order and restores every
     /// predicted origin key and alias from [`PredictedOrigin`](crate::PredictedOrigin).
-    /// Reference fields keep the origin keys they were exported with. A `Destroy` record
+    /// Reference fields keep the origin keys they were exported with. The one exception, in
+    /// a `Server` world: a row's owner outside the document that is a despawned predicted
+    /// entity, its alias still held, is stored under its `Net` key, which is what a fresh
+    /// process loading the same document stores (D141). A `Destroy` record
     /// never touches a live entity of another region: a cooked entity that moved is a row
     /// there, not here. Region resources are not in an overlay; the caller inserts them
     /// with [`insert_region_resource_erased`](Self::insert_region_resource_erased) from the
@@ -1619,6 +1651,59 @@ impl World {
         None
     }
 
+    /// `Unsupported` in a `Server` world, for the methods that apply another world's log one
+    /// entity at a time (D141).
+    fn refuse_on_server(&self) -> Result<()> {
+        if self.kind == WorldKind::Server {
+            return Err(Error::new(
+                ErrorKind::Unsupported,
+                "a `Server` world applies no other world's log: it despawns and moves trees",
+            ));
+        }
+        Ok(())
+    }
+
+    /// The key a `Server` world stores for an owner, so that its export can write it as a
+    /// `NetId` whenever the horizon passes (README, Regions; D141): a despawned predicted
+    /// entity whose alias is still held is stored under that `Net` key, which is what the
+    /// export writes and what a fresh process that loads the save stores; a predicted
+    /// origin with no alias is `InvalidData`; any other owner, an unloaded one among them,
+    /// is stored as given. Every owner is stored as given in a client's worlds, which export
+    /// nothing. `owner` is already an origin key, as a direct write resolves it.
+    pub(crate) fn exportable_owner(&self, owner: StableKey) -> Result<StableKey> {
+        if self.kind != WorldKind::Server {
+            return Ok(owner);
+        }
+        let StableKey::Predicted(predicted) = owner else { return Ok(owner) };
+        match self.aliases.by_predicted.get(&predicted) {
+            Some(&net) if self.despawned_predicted.contains_key(&predicted) => {
+                Ok(StableKey::Net(net))
+            }
+            Some(_) => Ok(owner),
+            None => Err(invalid(format!(
+                "`OwnedBy` {owner:?} names a predicted entity with no `NetId` to be exported under"
+            ))),
+        }
+    }
+
+    /// [`exportable_owner`](Self::exportable_owner) over the validated bytes of a component
+    /// written directly: the bytes to store instead, if `component` is an [`OwnedBy`] whose
+    /// owner the rule rewrites.
+    fn exportable_owned_by(
+        &self,
+        component: ComponentKey,
+        bytes: &[u8],
+    ) -> Result<Option<Vec<u8>>> {
+        if component != OwnedBy::KEY {
+            return Ok(None);
+        }
+        let value: OwnedBy = bytemuck::checked::pod_read_unaligned(bytes);
+        let Some(owner) = value.owner.get() else { return Ok(None) };
+        let stored = self.exportable_owner(owner)?;
+        Ok((stored != owner)
+            .then(|| bytemuck::bytes_of(&OwnedBy { owner: EntityRef::new(stored) }).to_vec()))
+    }
+
     /// `InvalidData` if `bytes` of `component` are an [`OwnedBy`] whose owner would make
     /// `key` its own owner or close a cycle of owners: if `key` is on the owner's chain.
     /// The bytes have been validated.
@@ -1754,7 +1839,12 @@ impl World {
         for component in &mut components {
             self.resolve_references(component, None, Some(key));
         }
-        let row = self.spawn_row(key, region, components)?;
+        let mut row = self.spawn_row(key, region, components)?;
+        for (info, bytes) in &mut row {
+            if let Some(stored) = self.exportable_owned_by(info.key(), bytes)? {
+                *bytes = stored;
+            }
+        }
         self.check_row_owner(key, &row)?;
         let stamp = self.bump();
         self.push_spawned(key, region, row, stamp);
@@ -2084,13 +2174,19 @@ impl World {
     /// Moves the live entity `root` and everything it owns to the loaded `region`.
     pub(crate) fn move_tree(&mut self, root: StableKey, region: RegionId, stamp: Stamp) {
         for key in self.ownership_tree(root) {
-            let loc = self.storage.loc(key).expect("the tree holds live entities");
-            let from = self.region_at(loc);
-            if from != region {
-                let bytes = bytemuck::bytes_of(&InRegion { region }).to_vec();
-                self.storage.write(loc, InRegion::KEY, &bytes, stamp);
-                self.log.push(self.tick, StructuralChange::Moved { key, from, to: region });
-            }
+            self.move_one(key, region, stamp);
+        }
+    }
+
+    /// Moves the live entity `key` alone to the loaded `region`, logged as moved; nothing if
+    /// it resides there.
+    fn move_one(&mut self, key: StableKey, region: RegionId, stamp: Stamp) {
+        let loc = self.storage.loc(key).expect("a live entity has a row");
+        let from = self.region_at(loc);
+        if from != region {
+            let bytes = bytemuck::bytes_of(&InRegion { region }).to_vec();
+            self.storage.write(loc, InRegion::KEY, &bytes, stamp);
+            self.log.push(self.tick, StructuralChange::Moved { key, from, to: region });
         }
     }
 }

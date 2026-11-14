@@ -86,6 +86,8 @@ pub struct InRegion {
 /// [`World::load_region`](crate::World::load_region) when the cycle lies within it, and
 /// broken at the document row when it crosses regions). Writing it moves nothing: an owned
 /// entity may reside in another region than its owner, where this is a weak reference.
+/// In a `Server` world the owner is always a key the export can write: a `Net` key, or a
+/// predicted origin that is bound and not despawned (D141).
 #[component(key = "ecs::owned_by", persistent)]
 pub struct OwnedBy {
     /// The owner, or the empty reference.

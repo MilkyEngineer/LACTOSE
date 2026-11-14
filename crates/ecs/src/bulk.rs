@@ -241,8 +241,14 @@ pub(crate) fn load_region(
     for (id, mut row) in rows {
         match row.owner {
             Some(Some(owner)) => {
-                let owner =
-                    keys.get(&owner).copied().unwrap_or(world.canonical(StableKey::Net(owner)));
+                // An owner outside the document is stored by a `Server` world's rule
+                // (`World::exportable_owner`), which never refuses here: a `Net` key names a
+                // predicted origin only through its alias.
+                let owner = keys.get(&owner).copied().unwrap_or_else(|| {
+                    world
+                        .exportable_owner(world.canonical(StableKey::Net(owner)))
+                        .expect("a `Net` owner names a predicted origin only through its alias")
+                });
                 let bytes = bytemuck::bytes_of(&OwnedBy { owner: EntityRef::new(owner) }).to_vec();
                 row.components.insert(OwnedBy::KEY, bytes);
             }
