@@ -108,16 +108,16 @@ impl SaveContext {
     }
 }
 
-/// One region's work, as a background task runs it: the diff and the section.
-fn section_of(export: &RegionExport, context: &SaveContext) -> Result<EncodedSection> {
-    RegionRecords::from_export(export, &context.baseline(export.region), &context.schemas)?
-        .encode_section()
+/// One region's diff, as a background task runs it.
+fn records_of(export: &RegionExport, context: &SaveContext) -> Result<RegionRecords> {
+    RegionRecords::from_export(export, &context.baseline(export.region), &context.schemas)
 }
 
 /// The save, as the timer root's task writes it: the save copy at a sync point, then one
-/// diff and one section per region (each independent, so `app` runs them as background
-/// tasks), then the assembled bytes, which `app` writes through `io` to a temporary file,
-/// syncs and renames over the slot.
+/// diff per region, the check across them, one section per region (the diffs and the
+/// sections each independent, so `app` runs them as background tasks), then the assembled
+/// bytes, which `app` writes through `io` to a temporary file, syncs and renames over the
+/// slot.
 async fn save(
     executor: &Executor,
     simulation: Simulation,
@@ -127,8 +127,11 @@ async fn save(
         simulation.save_point(executor).await.map_err(lactose_core::Error::from)?;
     let header = ContainerHeader::of(&save, &context.schemas);
     // One task per region in `app`; sequential here, since the sketch is never run.
-    let sections =
-        save.regions.iter().map(|export| section_of(export, context)).collect::<Result<_>>()?;
+    let records: Vec<RegionRecords> =
+        save.regions.iter().map(|export| records_of(export, context)).collect::<Result<_>>()?;
+    Container::check_sections(&header, &records)?;
+    let sections: Vec<EncodedSection> =
+        records.iter().map(RegionRecords::encode_section).collect::<Result<_>>()?;
     let bytes = Container::assemble(&header, sections)?;
     Ok((simulation, bytes))
 }
