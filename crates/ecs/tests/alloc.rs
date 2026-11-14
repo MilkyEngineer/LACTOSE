@@ -4,6 +4,9 @@
 //! whatever its size (the graph, the per-chunk buffers) cancels out.
 
 #![forbid(unsafe_code)]
+// A binary that installs `TaggedAlloc` runs under Miri only with Tree Borrows
+// (`crates/core/SAFETY.md`), and the crate's Miri run uses Stacked Borrows.
+#![cfg(not(miri))]
 
 mod common;
 
@@ -68,7 +71,7 @@ fn allocations_of_a_tick(rows: u64) -> u64 {
 
 #[test]
 fn a_row_that_emits_nothing_allocates_nothing() {
-    let (small, large) = if cfg!(miri) { (20, 120) } else { (1_000, 5_000) };
+    let (small, large) = (1_000, 5_000);
     let (small_tick, large_tick) = (allocations_of_a_tick(small), allocations_of_a_tick(large));
     // 4,000 more rows of two systems are 8,000 invocations; the bound admits a few
     // allocations per added chunk, none per row.
