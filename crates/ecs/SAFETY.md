@@ -109,9 +109,12 @@ point holds it alone and every other node shares it. The `StageView` sits in ano
 written by sync points alone. Each system's `SystemWork` is written alone by sync points and
 by its node's `units` and `finalize`, and shared by the node's unit jobs and by the merge
 nodes after it; its result slots, event buffers and hand-off buffers are `Mutex`es. Every
-lock is taken with `try_*`, and one that the graph's order should have left free panics ("a
-node of the run outlived its phase"), so a missing edge aborts the process rather than
-racing. A panic in a job aborts the process in any case (`lactose-task`), so no later node
+lock is taken with `try_*`, so a node that runs outside its phase (beside a sync point, or a
+merge node beside an emitter's `units` or `finalize`) panics ("a node of the run outlived
+its phase") instead of waiting. The locks do not order the systems of one stage against each
+other, or a reader against its merge: that rests on the edges `RunGraph::new` adds from the
+plan's ancestors, which `check_conflicts` and `check_events` validate, and a missing one
+races silently. A panic in a job aborts the process in any case (`lactose-task`), so no later node
 sees a poisoned lock.
 
 **The pointers.** With the world held alone, a stage's opening sync point takes, once per

@@ -8,6 +8,7 @@
 
 mod common;
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Mutex;
 
 use common::*;
@@ -34,7 +35,7 @@ fn executors() -> Vec<(String, Executor)> {
             shuffle_steals: true,
             inject_yields: true,
             force_split: true,
-            record: false,
+            record: true,
         };
         let four = Executor::builder()
             .frame_workers(4)
@@ -61,7 +62,7 @@ fn fork_layouts() -> [LayoutConfig; 2] {
 
 // ---- Exactly once ----
 
-/// What each tick's reduction counted.
+/// What each tick's reduction summed.
 type Totals = Mutex<Vec<i128>>;
 
 #[system(name = "test::count_rows", worlds = [server])]
@@ -69,10 +70,12 @@ fn count_rows(counter: Mut<Counter>) {
     counter.0 += 1;
 }
 
+/// Sums the counters after this tick's count: a row read before its count, or counted
+/// twice, changes the sum.
 #[system(name = "test::rows_seen", worlds = [server], after = count_rows,
     reduce = lactose_math::IntSum<u32>)]
-fn rows_seen(_counter: &Counter) -> u32 {
-    1
+fn rows_seen(counter: &Counter) -> u32 {
+    u32::try_from(counter.0).unwrap()
 }
 
 #[finalize(rows_seen)]
@@ -80,8 +83,30 @@ fn store_rows_seen(sum: i128, totals: Res<Totals>) {
     totals.lock().unwrap().push(sum);
 }
 
+/// How many nodes of a recorded log had their units run on more than one worker. The log
+/// is opaque to this crate; this reads the executor's version 1 encoding: a 16-byte header
+/// (magic, version, workers), then 28-byte records of worker, kind (0 for units), graph run
+/// ordinal, node index and unit range.
+fn nodes_on_several_workers(log: &[u8]) -> usize {
+    assert_eq!(&log[..12], b"WHISKLOG\x01\0\0\0", "the log encoding changed");
+    let mut workers: BTreeMap<(u64, u32), BTreeSet<u32>> = BTreeMap::new();
+    for record in log[16..].chunks(28) {
+        let u32_at = |at: usize| u32::from_le_bytes(record[at..at + 4].try_into().unwrap());
+        if u32_at(4) == 0 {
+            let run = u64::from_le_bytes(record[8..16].try_into().unwrap());
+            workers.entry((run, u32_at(16))).or_default().insert(u32_at(0));
+        }
+    }
+    workers.values().filter(|set| set.len() > 1).count()
+}
+
 #[test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "test code outside the step: the log shows the run was split, never what it computed"
+)]
 fn each_unit_runs_once_under_forced_splits() {
+    let mut split_nodes = 0;
     for layout in fork_layouts() {
         for (name, executor) in executors() {
             let mut world = world(WorldKind::Server, layout);
@@ -100,9 +125,17 @@ fn each_unit_runs_once_under_forced_splits() {
                 assert_eq!(counter, Some(&Counter(TICKS.into())), "row {id}, {name}, {layout:?}");
             }
             let totals = world.service::<Totals>().unwrap().lock().unwrap().clone();
-            assert_eq!(totals, vec![i128::from(ROWS); TICKS as usize], "{name}, {layout:?}");
+            let expected: Vec<i128> =
+                (1..=TICKS).map(|t| i128::from(ROWS * u64::from(t))).collect();
+            assert_eq!(totals, expected, "{name}, {layout:?}");
+            if let Some(log) = executor.execution_log() {
+                split_nodes += nodes_on_several_workers(log.as_bytes());
+            }
         }
     }
+    // Summed over every chaos run, so a loaded machine that leaves one run on one worker
+    // does not fail it.
+    assert!(split_nodes > 0, "no node's units ran on two workers");
 }
 
 // ---- The order D117 fixes ----

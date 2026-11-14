@@ -992,7 +992,8 @@ impl GraphNode for SystemNode {
 
     fn run(&self, units: Range<u32>, ctx: &mut JobContext<'_>) {
         assert_fp_state();
-        let _span = self.span();
+        // No span here: the executor calls `run` once per unit, and opens its own span per
+        // stolen range, named after the system (architecture 5.1: never per chunk job).
         let shared = &*self.shared;
         let world = beside(&shared.world);
         let world = world.as_ref().expect("a run holds the world");
