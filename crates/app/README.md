@@ -561,7 +561,10 @@ root")
   executor, as `io` requires.
 - `load(game, bytes, cooked)` runs on the calling thread before any world exists:
   `game.types()`, `SchemaTable::from_registry`, `game.migrations()`, `Container::decode`
-  over the whole file, then for each section in ascending region order the baseline from
+  over the whole file (which refuses, with `InvalidData`, sections that spawn one `NetId`
+  twice and a counter not above a runtime `NetId` a section spawns: the checks across
+  sections, `crates/persist/README.md`, "The container"), then for each section in
+  ascending region order the baseline from
   `cooked.baseline(records.baseline_hash)`, `Loader::bundle(&records, baseline,
   RegionMode::Frozen, None)` to validate the section (the bundle is dropped), and
   `Loader::migrate(&records)` as the entry's records, so a save that cannot load fails at
@@ -658,6 +661,14 @@ root")
   writes its own and feeds the result through the frame callback.
 - `Server::relevance` on a background task and shared between clients (the signature is
   final); `ServerError` and `ClientError` carrying a `Source` of their own.
+- A load against a re-cooked baseline: `load` asks `Cooked::baseline` only by the hash a
+  section saved (`records.baseline_hash`), so a save made against a baseline since
+  re-cooked fails `NotFound` there. Carrying it over is `Loader::migrate`, then
+  `RegionRecords::rebase` onto the region's current baseline, then `Loader::bundle`, the
+  sequence `lactose-persist`'s `tests/migrate.rs` runs for a type the baseline carries;
+  `load` runs it once the store can name a region's current baseline (milestone 3,
+  `docs/verification.md`, "A region's current baseline (D136)"), with the re-homing pass
+  for what the rebase drops.
 - The slot listing and the load's reads through `Io::read_dir` and `Io::open`: `load`
   takes the bytes, which the binary reads with `Io::read_file` or `std::fs` at milestone 1.
 - `Workers::platform` from the platform crate, the present thread, and everything a

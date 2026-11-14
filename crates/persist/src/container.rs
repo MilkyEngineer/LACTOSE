@@ -27,8 +27,8 @@ use std::collections::BTreeMap;
 use std::num::NonZeroU64;
 use std::sync::Arc;
 
-use lactose_bundle::{ComponentData, Overlay};
-use lactose_core::{Error, ErrorKind, Result, Tick, xxh64};
+use lactose_bundle::{ComponentData, Overlay, Record};
+use lactose_core::{Error, ErrorKind, NetId, Result, Tick, xxh64};
 use lactose_ecs::RegionId;
 use lactose_sim::SavePoint;
 use zstd::zstd_safe::CParameter;
@@ -368,7 +368,8 @@ fn too_large(what: &str, len: usize, cap: usize) -> Error {
 /// it; [`decode`](Self::decode) and [`decode_region`](Self::decode_region) are the
 /// in-memory shorthands over a whole file.
 ///
-/// Two containers compare by content. `decode(encode(c))` equals `c`.
+/// Two containers compare by content. `decode(encode(c))` equals `c` whenever `encode`
+/// succeeds.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Container {
     header: ContainerHeader,
@@ -426,8 +427,11 @@ impl Container {
     }
 
     /// The container's bytes: [`encode_section`](RegionRecords::encode_section) of every
-    /// section, then [`assemble`](Self::assemble). Fails as they fail.
+    /// section, then [`assemble`](Self::assemble). Fails as they fail, and first, with
+    /// `InvalidData`, for sections [`decode`](Self::decode) refuses together: two that spawn
+    /// one `NetId`, or a runtime `NetId` spawned at or above the header's counter.
     pub fn encode(&self) -> Result<Vec<u8>> {
+        self.check_across()?;
         let sections = self.regions().map(RegionRecords::encode_section).collect::<Result<_>>()?;
         Self::assemble(&self.header, sections)
     }
@@ -440,7 +444,10 @@ impl Container {
     /// leaves the others readable. Deterministic for one build: equal inputs give equal
     /// bytes. Fails with `InvalidData` if two sections name one region, and with
     /// `ResourceExhausted` if the whole would exceed [`MAX_CONTAINER_BYTES`]. The sections
-    /// are taken as made, so `app` encodes each region on a worker and assembles here.
+    /// are taken as made, so `app` encodes each region on a worker and assembles here; their
+    /// records are not read, so what [`decode`](Self::decode) refuses across sections (one
+    /// `NetId` spawned twice, a counter not above a spawned runtime `NetId`) is not seen
+    /// here. Sections exported from one world under its own counter have neither.
     pub fn assemble(header: &ContainerHeader, sections: Vec<EncodedSection>) -> Result<Vec<u8>> {
         if header.format != CONTAINER_FORMAT_VERSION {
             return Err(Error::new(
@@ -694,13 +701,59 @@ impl Container {
     /// then [`decode_section`](Self::decode_section) for every entry. Fails as they fail,
     /// on the first section that does: a caller that wants what is readable of a damaged
     /// file reads the index and each section itself (`README.md`, "The container").
+    ///
+    /// Then the sections are checked against each other and against the header, and the
+    /// container is refused with `InvalidData`, naming the `NetId` and the regions, if two
+    /// sections spawn one `NetId` (each by a `Spawn` or a `SpawnFromBaseline` record), since
+    /// the second region's load would find the entity live, or if a section spawns a
+    /// runtime `NetId` that is not below the header's `next_net_id`, since the server would
+    /// hand that ID out again. Each section is canonical on its own, so only a file spliced
+    /// or made by hand reaches either. A reader of single sections
+    /// ([`decode_section`](Self::decode_section)) sees one section and checks neither.
     pub fn decode(bytes: &[u8]) -> Result<Self> {
         let index = Self::index(bytes)?;
         let mut regions = BTreeMap::new();
         for entry in &index.regions {
             regions.insert(entry.region, Self::decode_section(entry, section_of(bytes, entry)?)?);
         }
-        Ok(Self { header: index.header, regions })
+        let container = Self { header: index.header, regions };
+        container.check_across()?;
+        Ok(container)
+    }
+
+    /// The sections against each other and against the header, as [`decode`](Self::decode)
+    /// states it.
+    fn check_across(&self) -> Result<()> {
+        let counter = self.header.next_net_id.get();
+        let mut spawned: BTreeMap<NetId, RegionId> = BTreeMap::new();
+        for records in self.regions.values() {
+            let Some(overlay) = &records.overlay else { continue };
+            for record in overlay.records() {
+                let (Record::Spawn { id, .. } | Record::SpawnFromBaseline { id, .. }) = record
+                else {
+                    continue;
+                };
+                if !id.is_cooked() && id.to_bits() >= counter {
+                    return Err(invalid(format!(
+                        "the section of region {} spawns the runtime NetId {}, which is not \
+                         below the header's NetId counter {counter}",
+                        records.region.0,
+                        id.to_bits()
+                    )));
+                }
+                // An overlay spawns an entity once (its canonical form), so a region found
+                // here already is another section's.
+                if let Some(first) = spawned.insert(*id, records.region) {
+                    return Err(invalid(format!(
+                        "the sections of regions {} and {} both spawn NetId {:#x}",
+                        first.0,
+                        records.region.0,
+                        id.to_bits()
+                    )));
+                }
+            }
+        }
+        Ok(())
     }
 }
 

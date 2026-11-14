@@ -211,8 +211,8 @@ impl StructInfo {
     }
 
     /// Checks that the description is self-consistent: fields tile the struct exactly, every
-    /// non-padding field has an ID, no ID repeats or is retired, every field has a size its
-    /// kind allows, and nested layouts pass the same checks.
+    /// non-padding field has an ID and at least one byte, no ID repeats or is retired, every
+    /// field has a size its kind allows, and nested layouts pass the same checks.
     pub(crate) fn check(&self) -> Result<()> {
         let name = self.name;
         let mut end = 0;
@@ -236,6 +236,16 @@ impl StructInfo {
                     return Err(invalid(format!(
                         "`{name}`: padding field `{}` has a field ID",
                         field.name
+                    )));
+                }
+                // A document's schema states a field by its range, and an empty range
+                // is no field (`lactose_bundle::ComponentSchema::new` refuses it), so a
+                // registered type is one every document can describe.
+                (Some(_), _) if field.size == 0 => {
+                    return Err(invalid(format!(
+                        "`{name}`: field `{}` of type `{}` is zero bytes; a field must hold \
+                         at least one byte",
+                        field.name, field.type_name
                     )));
                 }
                 (Some(id), _) => {

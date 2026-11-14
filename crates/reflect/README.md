@@ -33,6 +33,11 @@ What the engine knows about every component and resource type.
   implicit padding is a compile error that names the field. Order fields from the largest
   alignment down and close any gap with `#[field(padding)] _pad: Padding<N>`.
 - Arrays are `lactose_core::PlainArray<T, N>`, never a bare `[T; N]`.
+- A field with an ID holds at least one byte, at every depth: the registry refuses a
+  `PlainArray<_, 0>`, a `#[value]` struct with no bytes, or an array of such values as a
+  field, naming the type and the field, since a document schema states each field by a
+  non-empty range (`lactose-bundle`). A type of zero bytes with no field, a tag, registers,
+  and so does `Padding<0>`.
 - Inside the determinism boundary a float is the `lactose_math` scalar, a `ScalarField`,
   which visitors receive through `FieldVisitor::scalar` with canonical bits. Raw `f32` and
   `f64` are fields of kind `Float` for presentation components and arrive through their own

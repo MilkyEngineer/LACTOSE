@@ -39,8 +39,10 @@ impl Registry {
     /// It fails if another type holds the same key (two names with one hash, or one name
     /// declared twice), if `T::KEY` is not the hash of the described name, if the described
     /// fields do not tile `T`'s size exactly, if a field ID is missing, repeated or retired,
-    /// if a field's size is one its kind does not allow, or if a transient type is not
-    /// valid when zeroed.
+    /// if a field with an ID is zero bytes (a `PlainArray<_, 0>`, an empty `#[value]`
+    /// struct), at any depth, since no document schema can state an empty field, if a
+    /// field's size is one its kind does not allow, or if a transient type is not valid
+    /// when zeroed.
     ///
     /// Those checks catch an inconsistent description. They cannot tell whether a
     /// hand-written description names the right type for each field, so what may be relied

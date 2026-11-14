@@ -72,15 +72,16 @@ pub struct SavedWorld {
 
 /// Decodes a save for a fresh process: `game.types()` for the registry,
 /// `SchemaTable::from_registry` over it, `game.migrations()`, `Container::decode` over the
-/// whole file, then for every section in ascending region order the baseline from
-/// `cooked.baseline(records.baseline_hash)`, `Loader::bundle(&records, baseline,
-/// RegionMode::Frozen, None)` to validate the section (the bundle is dropped: a save that
-/// cannot load fails here, before any world exists, not at the step that reloads a region
-/// hours in) and `Loader::migrate(&records)` as the entry's records. Synchronous, on the
-/// thread that starts the binary, before any world exists: the registry a load needs is the
-/// world's, and the tick and counter it yields are the builder's. The first error ends the
-/// load with nothing built; the policy's response to [`Source::Load`](crate::Source::Load)
-/// is `Stop`.
+/// whole file (which also refuses sections that spawn one `NetId` twice and a counter not
+/// above a runtime `NetId` a section spawns), then for every section in ascending region
+/// order the baseline from `cooked.baseline(records.baseline_hash)`,
+/// `Loader::bundle(&records, baseline, RegionMode::Frozen, None)` to validate the section
+/// (the bundle is dropped: a save that cannot load fails here, before any world exists, not
+/// at the step that reloads a region hours in) and `Loader::migrate(&records)` as the
+/// entry's records. Synchronous, on the thread that starts the binary, before any world
+/// exists: the registry a load needs is the world's, and the tick and counter it yields are
+/// the builder's. The first error ends the load with nothing built; the policy's response to
+/// [`Source::Load`](crate::Source::Load) is `Stop`.
 pub fn load(game: &Game, container: &[u8], cooked: &dyn Cooked) -> Result<SavedWorld> {
     decode(game, container, cooked).inspect_err(|error| {
         ErrorPolicy::MILESTONE_1.decide(Source::Load, error);

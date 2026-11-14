@@ -12,13 +12,18 @@
 
 mod common;
 
+use std::num::NonZeroU64;
+use std::sync::Arc;
+
 use common::*;
-use lactose_core::{AllocTag, ErrorKind, TaggedAlloc, xxh64};
-use lactose_ecs::RegionId;
+use lactose_bundle::Baseline;
+use lactose_core::{AllocTag, ErrorKind, NetId, TaggedAlloc, Tick, xxh64};
+use lactose_ecs::{RegionConfig, RegionId, RegionMode, World, WorldBuilder, WorldKind};
 use lactose_persist::{
-    CONTAINER_FORMAT_VERSION, Container, ContainerHeader, MAX_CONTAINER_BYTES, MAX_SECTION_BYTES,
-    PREAMBLE_BYTES, RegionIndexEntry,
+    CONTAINER_FORMAT_VERSION, Container, ContainerHeader, Loader, MAX_CONTAINER_BYTES,
+    MAX_SECTION_BYTES, Migrations, PREAMBLE_BYTES, RegionIndexEntry, RegionRecords, SchemaTable,
 };
+use lactose_sim::RegionExport;
 
 #[global_allocator]
 static ALLOCATOR: TaggedAlloc = TaggedAlloc::system();
@@ -474,4 +479,173 @@ fn assemble_refuses_what_no_reader_would_accept() {
     assert_eq!(index.header.tick, save.tick);
     assert_eq!(index.header.next_net_id, save.next_net_id);
     assert_eq!(index.header.schema_hash, schemas().hash());
+}
+
+// ---- The sections against each other and against the header (README, "The container") ----
+
+/// A world of [`registry`]'s types with each region loaded from its baseline.
+fn loaded_world(regions: &[(RegionId, &Baseline)]) -> World {
+    let mut world = bare_world();
+    for &(region, baseline) in regions {
+        let config =
+            RegionConfig { id: region, seed: seed_of(region), mode: RegionMode::Simulated };
+        world.create_region(config).unwrap();
+        world.load_region(region, baseline, None).unwrap();
+    }
+    world
+}
+
+/// `region`'s records in `world`, against `baseline`, under the table of [`registry`].
+fn records_in_world(world: &World, region: RegionId, baseline: &Baseline) -> RegionRecords {
+    let table = SchemaTable::from_registry(&registry()).unwrap();
+    let export = RegionExport { region, rows: world.export_region(region).unwrap() };
+    RegionRecords::from_export(&export, baseline, &table).unwrap()
+}
+
+/// A world that played `region` alone: its first runtime entity spawned there.
+fn played(region: RegionId, baseline: &Baseline) -> (World, NetId) {
+    let mut world = loaded_world(&[(region, baseline)]);
+    let id = world.allocate_net_id().unwrap();
+    world.spawn(net(id), region, (pos(9, 9),)).unwrap();
+    (world, id)
+}
+
+/// The bytes of a container of `sections` under a header whose counter is `counter`,
+/// assembled as a server writes one: `assemble` never reads the records, so this is also
+/// what splicing sections from two saves gives.
+fn spliced(counter: u64, sections: &[&RegionRecords]) -> Vec<u8> {
+    let table = SchemaTable::from_registry(&registry()).unwrap();
+    let header = ContainerHeader::new(Tick(3), NonZeroU64::new(counter).unwrap(), table.hash());
+    let encoded = sections.iter().map(|records| records.encode_section().unwrap()).collect();
+    Container::assemble(&header, encoded).unwrap()
+}
+
+/// `result` is refused with `InvalidData` and a message holding every one of `named`.
+fn refused_naming(result: lactose_core::Result<impl core::fmt::Debug>, named: &[&str]) {
+    match result {
+        Ok(value) => panic!("accepted as {value:?}"),
+        Err(error) => {
+            assert_eq!(error.kind(), ErrorKind::InvalidData, "{error}");
+            for name in named {
+                assert!(error.message().contains(name), "`{error}` names `{name}`");
+            }
+        }
+    }
+}
+
+#[test]
+fn two_sections_that_spawn_one_runtime_id_are_refused_at_decode() {
+    // Two worlds, each spawning its first runtime entity: the same `NetId` in A and in B.
+    let (a, b) = (baseline_a(), baseline_b());
+    let (one, id_a) = played(A, &a);
+    let (two, id_b) = played(B, &b);
+    assert_eq!(id_a, id_b);
+    let (in_a, in_b) = (records_in_world(&one, A, &a), records_in_world(&two, B, &b));
+    let id = id_a.to_bits();
+    let (named_a, named_b) = (format!("regions {} and {}", A.0, B.0), format!("{id:#x}"));
+    let named = [named_a.as_str(), named_b.as_str(), "both spawn NetId"];
+
+    // The counter is above the id, so the duplicate alone is refused.
+    let bytes = spliced(id + 1, &[&in_a, &in_b]);
+    refused_naming(Container::decode(&bytes), &named);
+    // Each section is canonical on its own and decodes alone: only the whole shows it.
+    let index = Container::index(&bytes).unwrap();
+    for entry in &index.regions {
+        let at = entry.offset as usize..(entry.offset + entry.compressed_bytes) as usize;
+        Container::decode_section(entry, &bytes[at]).unwrap();
+    }
+    // The in-memory writer refuses what the reader refuses.
+    let mut container = Container::new(index.header);
+    container.insert(in_a.clone()).unwrap();
+    container.insert(in_b.clone()).unwrap();
+    refused_naming(container.encode(), &named);
+    // Either section alone, under that counter, is a save.
+    for records in [&in_a, &in_b] {
+        let alone = Container::decode(&spliced(id + 1, &[records])).unwrap();
+        assert_eq!(alone.region(records.region), Some(records));
+    }
+
+    // What the refusal prevents: both sections bundle, and the second region's load in
+    // one world finds the entity live.
+    let migrations = Migrations::new();
+    let table = SchemaTable::from_registry(&registry()).unwrap();
+    let loader = Loader::new(&table, &migrations);
+    let mut world = bare_world();
+    for (records, baseline) in [(&in_a, &a), (&in_b, &b)] {
+        let bundle =
+            loader.bundle(records, Arc::new(baseline.clone()), RegionMode::Frozen, None).unwrap();
+        let config =
+            RegionConfig { id: records.region, seed: bundle.seed, mode: RegionMode::Simulated };
+        world.create_region(config).unwrap();
+        let loaded = world.load_region(records.region, &bundle.baseline, bundle.overlay.as_deref());
+        if records.region == B {
+            assert!(loaded.unwrap_err().message().contains("already live"));
+        } else {
+            loaded.unwrap();
+        }
+    }
+}
+
+#[test]
+fn a_cooked_entity_spawned_from_the_baseline_by_two_sections_is_refused_at_decode() {
+    // A's sixth cooked entity moved into B in one play and into D in another: two
+    // sections spawn it from the baseline.
+    let d = RegionId(77);
+    let (a, b) = (baseline_a(), baseline_b());
+    let moved = |to: RegionId| {
+        let mut world = loaded_world(&[(A, &a), (to, &b)]);
+        world.move_to_region(net(c(A, 6)), to).unwrap();
+        records_in_world(&world, to, &b)
+    };
+    let (in_b, in_d) = (moved(B), moved(d));
+    let named = format!("regions {} and {}", d.0, B.0);
+    refused_naming(
+        Container::decode(&spliced(1, &[&in_b, &in_d])),
+        &[named.as_str(), "both spawn NetId"],
+    );
+    // Either alone is a save: a cooked ID is not the counter's.
+    Container::decode(&spliced(1, &[&in_b])).unwrap();
+    Container::decode(&spliced(1, &[&in_d])).unwrap();
+}
+
+#[test]
+fn a_counter_not_above_a_spawned_runtime_id_is_refused_at_decode() {
+    let a = baseline_a();
+    let (world, id) = played(A, &a);
+    let records = records_in_world(&world, A, &a);
+    let id = id.to_bits();
+    assert_eq!(world.next_net_id().get(), id + 1);
+    let region = format!("region {}", A.0);
+    for counter in [1, id] {
+        let named =
+            [region.as_str(), &format!("runtime NetId {id}"), &format!("NetId counter {counter}")];
+        refused_naming(Container::decode(&spliced(counter, &[&records])), &named);
+        let header = Container::index(&spliced(counter, &[&records])).unwrap().header;
+        let mut container = Container::new(header);
+        container.insert(records.clone()).unwrap();
+        refused_naming(container.encode(), &named);
+    }
+    // The world's own counter, one above the id, is a save; so is any higher one.
+    for counter in [id + 1, id + 100] {
+        let decoded = Container::decode(&spliced(counter, &[&records])).unwrap();
+        assert_eq!(decoded.header().next_net_id.get(), counter);
+    }
+
+    // What the refusal prevents: a server started at the low counter hands the id out
+    // again, and the kept region that holds it is refused when it comes back.
+    let mut server = WorldBuilder::new(WorldKind::Server, Arc::new(registry()))
+        .next_net_id(NonZeroU64::MIN)
+        .build()
+        .unwrap();
+    let again = server.allocate_net_id().unwrap();
+    assert_eq!(again.to_bits(), id);
+    let b = baseline_b();
+    let config = RegionConfig { id: B, seed: seed_of(B), mode: RegionMode::Simulated };
+    server.create_region(config).unwrap();
+    server.load_region(B, &b, None).unwrap();
+    server.spawn(net(again), B, (pos(1, 1),)).unwrap();
+    let config = RegionConfig { id: A, seed: seed_of(A), mode: RegionMode::Simulated };
+    server.create_region(config).unwrap();
+    let error = server.load_region(A, &a, records.overlay.as_deref()).unwrap_err();
+    assert!(error.message().contains("already live"), "{error}");
 }
