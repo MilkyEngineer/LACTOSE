@@ -1,6 +1,6 @@
 # LACTOSE
 
-Revision marker: architecture 3.2. At task start run `git show HEAD:CLAUDE.md | head -3` and
+Revision marker: architecture 3.3. At task start run `git show HEAD:CLAUDE.md | head -3` and
 confirm the marker matches this text; if not, read the file on disk, not this copy.
 
 Rust game engine. Read `docs/architecture.md` before any task. It is binding. `docs/decisions-log.md`
@@ -11,7 +11,8 @@ The work is done by agents under the process in `docs/agents.md`; their definiti
 ## Names
 
 Things you run get codenames, things you import get descriptions. Crates are `lactose-<role>`.
-Never use a codename for a crate, type or function.
+Never use a codename for a crate, type, function, module, constant or static, in test code
+as elsewhere; a test or bench target may carry one.
 
 | Codename | Means |
 |---|---|
@@ -19,7 +20,7 @@ Never use a codename for a crate, type or function.
 | CURD | `lactose-sim`, deterministic simulation core |
 | WHISK | `lactose-task`, work-stealing executor |
 | CASEIN | `lactose-ecs`, chunked archetype storage |
-| COW | copy-on-write snapshots in `lactose-predict` |
+| COW | copy-on-write snapshots in `lactose-predict` (not built: D139, D140) |
 | GOUDA | `lactose-render-graph` |
 | CHEDDAR | GPU scene in `lactose-renderer` |
 | BRIE | bindless heap in `lactose-renderer` |

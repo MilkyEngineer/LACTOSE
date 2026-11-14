@@ -8,9 +8,10 @@ its earlier revisions or the reviews, the entry says so.
 Notation: R1-n is finding n of `docs/reviews/review-1-revision-1.md`; R2-n is finding n of
 `docs/reviews/review-2-revision-2.md`; R3-n is finding n of `docs/reviews/review-3-revision-3.1.md`.
 Revision 1 is commit `a29af04`, revision 2 `f65d2b6`, revision 3 `4c7b609`, revision 3.1 (the
-editorial split) `d58492a`, revision 3.2 `0ac9fd0`. Section references (§) are to the current
-`docs/architecture.md` (revision 3.2) unless a revision is named. "Recorded in revision 3.1" marks
-rationale the author supplied during the editorial pass rather than one taken from a review.
+editorial split) `d58492a`, revision 3.2 `0ac9fd0`, revision 3.3 the commit that carries
+D140. Section references (§) are to the current `docs/architecture.md` (revision 3.3) unless
+a revision is named. "Recorded in revision 3.1" marks rationale the author supplied during the
+editorial pass rather than one taken from a review.
 `docs/reviews/traceability.md` maps every finding to where it is addressed.
 
 ## 1. Goals and scope
@@ -4588,6 +4589,124 @@ relayed by an event when it acts on another body** (§6.1, §10, `lactose-ecs`,
   criterion 1's tick excludes, the spike's sentence and the sentences
   `docs/plans/milestone-1.md` section 8 lists.
 
+**D140. Architecture revision 3.3: the project review's findings against the document, and the milestone 1 plan's rulings written in** (§1 goal 7, §2 Graphics, §3, §4, §8.1, §8.2, §8.3, §9.4, §10, §12.1, §13, §14, §15.1, §16, §18, §20, §22, §22.1, §23)
+- Why: the whole-project review at `6ed8461` found sentences of the architecture that the
+  tree, the tier file or the process in force contradict, and D139 took decisions the
+  document did not yet state. `docs/plans/milestone-1.md` section 8 lists both, each with its
+  recommendation, and the owner approved it on 14 November 2026. Finding ids below are the
+  ones that plan uses. The revision edits `docs/architecture.md` for each and changes no code.
+  - *The server links no RHI backend, the null one included* (§2 Graphics, §12.1; finding
+    C2). `[server_denylist]` in `crate-tiers.toml` names `lactose-rhi-null` and the tier check
+    enforces it, while sections 2 and 12.1 still gave the null backend to the server. The null
+    backend is for tests and graph unit tests. Rules out an `app-server` edge to
+    `lactose-rhi-null`, and a null backend shaped by what a server needs.
+  - *`rhi-null` is milestone 2's* (§22; D139 and the owner's answer of 14 November 2026). It
+    leaves row 1 for row 2, beside `rhi-api`, whose facade it implements.
+  - *A crate other crates are written against gets a facade first, and its implementation and
+    each backend are lanes of their own* (§1 goal 7, §20; finding C10). This is the process of
+    `docs/agents.md` and of every facade decision since D114. An interface crate a backend
+    implements is frozen once its first backend passes its conformance suite, a null or test
+    backend not counting, and every such crate ships a suite: `physics-api`, `asset-api`,
+    `rhi-api`, and `net-host` for `net`'s transports, due with `net` at milestone 4. A lane is
+    one crate, or one change whose brief names the crates it crosses. D66's reason, that
+    interface-first with one crate per task deadlocks on backend-driven crates (R1-17), no
+    longer holds: a facade is reviewed, not frozen, its backend's lane amends it in the same
+    change (section 20), and it freezes only on a real backend's conformance run. Rules out
+    one task owning an interface and its first backend, interface-first for three named
+    crates only, a conformance suite owed by `net-api`, and `rhi-api` frozen on `rhi-null`.
+  - *A derived value is rebuilt after a load by the system that owns it* (§15.1; finding D7
+    of the review). No `on_load` hook exists in `lactose-ecs`, `lactose-sim` or
+    `lactose-persist`; the physics sync writes its handles, and a loaded row holds the
+    baseline's value or none until its owner runs. Rules out a load hook.
+  - *A prediction world's region is `Frozen` until its asset table is published and
+    `Simulated` after, never `Replicated`* (§9.4; finding S1 and the client fix round's
+    reviews). Kernels run and bodies step only in a `Simulated` region, so a prediction world
+    loaded `Replicated` predicted nothing. `app` directs the modes from the frames it folds;
+    the activation policy runs on the server alone. A region the server holds `Frozen` with
+    its table published is simulated on the client all the same, because `RegionChange`
+    carries no mode, and only a frame that carries rows of an entity the client predicts
+    there corrects that entity. The server sends a claimed entity whole on each update,
+    changed or not (section 9.4's reconciliation rule and `lactose-net-host`'s whole-send
+    rule, D121), so each update corrects it while the server holds the region `Frozen`; a
+    sender of changed rows alone would leave it uncorrected until the next full frame. A mode
+    variant is a `lactose-net-api` change, decided before `lactose-net`'s packer sends region
+    changes. Rules out a prediction world under the activation policy, reading a
+    server-`Frozen` region as mirrored, and a packer that sends a claimed entity only when
+    its rows change.
+  - *A NaN in a persistent column is asserted in debug builds by the world hasher, when it
+    hashes a persistent type, and by the save's serialiser, when it diffs a live world's
+    export* (§8.2; finding C1). The sentence stays and gains its place. Rules out a check at
+    every write, a scan of the persistent columns at a sync point, and an assertion at a
+    decode: a NaN a document or a frame carries is the writing build's defect, which the
+    reading build's next hash or save asserts. The assertion is not in the code yet; it lands
+    with the lane that carries binds across a save, which edits both crates.
+  - *The naming rule covers modules, constants and statics, and test code is held to it* (§3,
+    §23; finding C9, part b). A test or bench target is a thing you run and may carry a
+    codename (`tests/sour.rs`, `benches/whisk.rs`); nothing declared inside one does, a test
+    function included. Rules out a test-glue exception. The renames are a lane's: `struct
+    Sour` in nine test files, `SOUR_GAME`, `sour_frames`, `sour_run`,
+    `a_headless_run_under_sour` with its session string, the systems `sour_drive` and
+    `sour_move` with their labels, `lactose-persist`'s `tests/sour` module and the five
+    `silo_*` functions of `crates/io/tests/sketch.rs`.
+  - *The Haswell-masked run stays in section 8.3 and gates milestone 4* (§8.3; finding X6,
+    D139). Until it is wired the nightly prints each runner's CPU model and feature flags
+    beside its hashes, and a comparison that differs between two x86 hosts wires it at once.
+    Rules out striking the run.
+  - *How milestone 1's criteria are read* (§22; D139). The 100k tick runs on eight frame
+    workers, one for each of eight performance cores: physical cores of the fastest class on
+    a hybrid part, eight physical cores on a part that reports no core types. It excludes the
+    physics phase and the world hash. The netcode spike runs in one process over a seeded
+    link and a scripted client clock, and its x86 server and aarch64 client are SOUR's
+    architecture mode over the hashes and packet bytes both ends record. The table's row
+    keeps its words; a paragraph under the table gives the reading.
+  - *The physics phase's stall on render recording is measured at milestone 2* (§16; D139).
+    Nothing records a frame before `render-graph` exists.
+  - *Milestone 1 measures the floor of edit-to-playing* (§18, §22.1; D139). No game crate
+    exists before milestone 5, so milestone 1 measures an edit in the headless binary's crate
+    and one in `app`, read against the slower. The build-time mitigation is decided at
+    milestone 1 only if that floor is over thirty seconds, and asked again at milestone 5 on
+    the game crates. Rules out closing the question on a floor.
+  - *A region's asset set is the baseline's assets, those of resident entities the baseline
+    does not hold, and a spawnable set the baseline declares* (§14; finding D6 of the review,
+    D139). A spawn that names an asset outside the table is a tick-stamped asset failure.
+    Until streaming lands in milestone 3 the set is the baseline's alone. Rules out a runtime
+    spawn or a migrant whose assets no table holds, and a silent miss. How `persist` reads the
+    residents' references, where the baseline declares the spawnable set and how a table is
+    resolved again when a resident migrates in are milestone 3's.
+  - *Copy-on-write snapshots are not built, and a prediction world holds at most 64 fixed
+    colliders and proxies together as rows* (§9.4, §10, §13, §23; D139). A slot's cost is
+    dominated by the backend's bytes. The bound keeps a slot's take inside section 22's
+    100 µs budget; it is a content rule that nothing enforces, and the milestone 1 slot
+    measurement, proxies included, confirms it or changes it. Milestone 3 designs how cooked
+    static scenery reaches the prediction world's solver outside the per-tick snapshot, which
+    is when section 13's shared shapes reach that world.
+  - *A measurement that proves a criterion is a file under `docs/results`, written by
+    `cargo xtask measure`* (§4, §20; D139). Rules out a criterion proven by a number in a
+    verification row or a lane's report.
+  - *Section 20's Miri sentence names what the nightly runs*: `core`, `task` over each deque,
+    `ecs`, `input-host` and `net-host`.
+  - *Not changed.* Section 22's milestone 0 tick-start criterion waits for the one bounded
+    attempt of D138. Section 8.3's sentence on hashing `physics-api::snapshot` bytes is
+    amended by the merge that records them. The status line and section 8.1 name the
+    revision.
+- Driven by: the whole-project review at `6ed8461` (its findings C1, C2, C9, C10, S1 and X6,
+  and findings D6 and D7 of its D-series); D139 and `docs/plans/milestone-1.md`, section 8;
+  the owner's answers of 14 November 2026; the client fix round's reviews, for what a
+  server-`Frozen` region costs a client; the revision's own review, whose probes placed the
+  NaN assertion.
+- Replaced: D51's "a server binary that must not link Vulkan" as a reason for the null
+  backend; D83's denylist is the rule. D66's vertical slices for backend-driven crates, with
+  section 20's interface-first rule for `asset-api`, `input` and `present-api` alone and its
+  "every `-api` ships a conformance suite"; D66's three tracks, week-one facade and netcode
+  spike stand. Section 22's placing of `rhi-null` in milestone 1. Supersedes D82's "milestone
+  1 measures the stall the step imposes on render recording". Section 18's "measured per
+  platform in milestone 1" (D68) becomes a floor at milestone 1 and the game crates at
+  milestone 5. Supersedes D34's "It is built only if the milestone 1 measurement of
+  prediction-world snapshot cost exceeds its budget" and its premise that a full copy is
+  small: a slot's cost is the backend's bytes, which copy-on-write cannot share, so a slot
+  over budget changes the bound, not the representation. D81's asset set is widened, not
+  reversed. Section 15.1's `on_load`, a hook that was never built.
+
 ## 10. Review history
 
 - **Revision 1** (`a29af04`): the design baseline.
@@ -4622,3 +4741,14 @@ relayed by an event when it acts on another body** (§6.1, §10, `lactose-ecs`,
   pulling (R3-21, D42). The rationale first recorded in revision 3.1 and the revision 3.2 decision
   table were later folded into the entries above (D72 to D86 added), and
   `docs/reviews/traceability.md` was regenerated over all three reviews.
+- **Whole-project review** at `6ed8461` (14 November 2026, not checked in): one blocking and
+  seven serious findings, read by seam across the tree and the documents.
+  `docs/plans/milestone-1.md` maps its findings to lanes, and D138 and D139 record the plan's
+  decisions.
+- **Revision 3.3** (the commit that carries D140) settled what that review found against the
+  architecture and wrote in the plan's rulings: the server links no RHI backend, and
+  `rhi-null` moves to milestone 2; facade first with each backend a lane of its own replaces
+  vertical slices; a prediction world's region modes; where the NaN assertion fires; how
+  milestone 1's criteria are read; and copy-on-write snapshots are not built. Its review
+  (not checked in) found nothing blocking, 4 serious and 9 minor findings, all answered
+  before the commit.
