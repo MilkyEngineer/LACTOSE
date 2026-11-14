@@ -22,7 +22,7 @@ crates = ["lactose-reflect-macros", "lactose-ecs-macros"]
 # identical to each other and to those of the [harness] packages. Every workspace package
 # named `lactose-app-*` must be listed here.
 [feature_roots]
-packages = []
+packages = ["lactose-app-headless"]
 
 # Architecture section 8.3: the packages whose tests run under SOUR, the determinism harness.
 # Their feature trees are compared with dev-dependencies included, since a test build
@@ -30,5 +30,5 @@ packages = []
 [harness]
 packages = [
   "lactose-sim", "lactose-physics-api", "lactose-input", "lactose-physics-rapier", "lactose-net-api",
-  "lactose-predict", "lactose-net-host", "lactose-anim", "lactose-persist",
+  "lactose-predict", "lactose-net-host", "lactose-anim", "lactose-persist", "lactose-app",
 ]

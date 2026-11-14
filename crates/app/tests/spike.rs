@@ -2,8 +2,8 @@
 //! surface (architecture section 22): the server's frame, a join, the relevance message
 //! that becomes the client's first full frame, the client's frame and what it sends back.
 //! The transport, the packing and the jitter buffer are the spike's own and are stubbed.
-//! Type-checked, never run (every deciding body in the facade is `todo!()`). A change that
-//! breaks this sketch is a signature change to list.
+//! Type-checked, never run: the spike runs it with a transport. A change that breaks this
+//! sketch is a signature change to list.
 
 #![forbid(unsafe_code)]
 #![allow(dead_code, unused_variables, missing_docs)]

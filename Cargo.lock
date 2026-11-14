@@ -409,6 +409,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "lactose-app-headless"
+version = "0.0.0"
+dependencies = [
+ "lactose-app",
+ "lactose-asset-api",
+ "lactose-bundle",
+ "lactose-core",
+ "lactose-ecs",
+ "lactose-persist",
+ "lactose-reflect",
+ "lactose-sim",
+]
+
+[[package]]
 name = "lactose-asset-api"
 version = "0.0.0"
 dependencies = [

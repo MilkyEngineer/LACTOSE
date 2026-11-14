@@ -35,7 +35,7 @@ impl WorldConfig {
     /// The headless configuration: the default layout, `Directed` regions, a policy of
     /// radii one, two and three (unread under `Directed`, valid should the control change),
     /// `PhysicsConfig::default()` (Earth gravity, one reserved worker) and
-    /// [`LOG_RETENTION`]. Real, not `todo!()`: it is a value.
+    /// [`LOG_RETENTION`].
     #[must_use]
     pub fn headless() -> Self {
         Self {

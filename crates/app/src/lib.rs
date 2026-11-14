@@ -8,18 +8,14 @@
 //! renders, presents, pumps a window or plays sound is named here, which is what keeps the
 //! server's denylist satisfiable (D83).
 //!
-//! Facade: every public signature is final and every deciding body is `todo!()`. The
-//! README is the contract; `tests/headless.rs` and `tests/spike.rs` are compile-only
-//! sketches of what the headless binary, a SOUR test and the milestone 1 netcode spike
-//! write against this surface.
+//! The README is the contract. `tests/proof/` and `tests/headless.rs` are the milestone 1
+//! proof, the latter with the headless binary's `main` and the SOUR test of the assembly;
+//! `tests/spike.rs` is a compile-only sketch of what the milestone 1 netcode spike writes
+//! against this surface.
 
 #![forbid(unsafe_code)]
-#![allow(
-    dead_code,
-    unused_variables,
-    reason = "facade: every deciding body is `todo!()`; the implementation removes this attribute with the last one"
-)]
 
+mod assemble;
 mod client;
 mod game;
 mod headless;

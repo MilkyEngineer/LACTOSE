@@ -2,7 +2,7 @@
 //! `Error` from each subsystem. Subsystems return `Result`; this is the one place that
 //! decides.
 
-use lactose_core::Error;
+use lactose_core::{Error, ErrorKind};
 
 /// The `tracing` target of everything this crate logs: `app`, the crate's role name, an
 /// exception to the codename rule of architecture section 19 like `io` and `physics`
@@ -75,9 +75,11 @@ impl ErrorPolicy {
     /// retries the region (architecture section 14).
     pub const MILESTONE_1: Self = Self { _private: () };
 
-    /// The response to `error` from `source`. Real, not `todo!()`: the table is the contract.
+    /// The response to `error` from `source`: the table is the contract.
     #[must_use]
     pub fn respond(&self, source: Source, error: &Error) -> Response {
+        // The milestone 1 table reads no error kind; milestone 4's does.
+        let _ = error;
         match source {
             Source::Executor | Source::Load | Source::Server { .. } => Response::Stop,
             Source::Prediction { kept: true } | Source::Cooked => Response::Resync,
@@ -85,4 +87,27 @@ impl ErrorPolicy {
             Source::Save => Response::Log,
         }
     }
+}
+
+impl ErrorPolicy {
+    /// [`respond`](Self::respond), logged at [`LOG_TARGET`] with the source and the error
+    /// before the caller acts on it: `error` for `Stop`, `warn` for `Resync` and `Log`.
+    pub(crate) fn decide(&self, source: Source, error: &Error) -> Response {
+        let response = self.respond(source, error);
+        match response {
+            Response::Stop => {
+                tracing::error!(target: LOG_TARGET, ?source, ?response, %error, "an error stops the run");
+            }
+            Response::Resync | Response::Log => {
+                tracing::warn!(target: LOG_TARGET, ?source, ?response, %error, "an error the run survives");
+            }
+        }
+        response
+    }
+}
+
+/// Where a world's run failure came from: the executor when it was cancelled (the executor
+/// shut down), otherwise the world, kept or not.
+pub(crate) fn run_source(error: &Error, kept: bool, world: fn(bool) -> Source) -> Source {
+    if error.kind() == ErrorKind::Cancelled { Source::Executor } else { world(kept) }
 }

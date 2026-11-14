@@ -94,3 +94,8 @@ split-debuginfo = "unpacked"
 
 [profile.dev.package."*"]
 opt-level = 3
+
+# Architecture section 5.1: panics abort in shipped binaries. Cargo ignores this for tests,
+# benches, build scripts and proc macros; the binaries' crash hook aborts in every profile.
+[profile.release]
+panic = "abort"
