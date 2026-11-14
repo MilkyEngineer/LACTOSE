@@ -1197,7 +1197,9 @@ The policy is in section 3.
   decision text) the same way, at the highest effort, for a crate other crates will be
   written against; `planner` writes milestone plans, proposals and the decisions that settle
   them; `reviewer` reads every lane, interface design and plan adversarially before it
-  merges, and `reviewer-diff` reads each later fix round against the previous review;
+  merges, `reviewer-concurrency` reads beside it the first review of code that runs on
+  several threads or adds `unsafe` other than an FFI call, and `reviewer-diff` reads each
+  later fix round against the previous reviews;
   `merger` runs a merge and its gates from a brief and commits it. The coordinator writes the
   briefs, decides the findings, pushes, and keeps this document, the decisions log and the
   verification list; a long command that needs no interpretation runs in the background,

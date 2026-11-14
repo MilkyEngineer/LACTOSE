@@ -19,6 +19,11 @@ are looking for.
 - The fixes themselves: a changed invariant, a new field that snapshot or restore does not
   carry, a sentence the README now states that the code does not meet, a test that passes
   for the wrong reason (run the mutation the brief names, or the obvious one).
+- When `reviewer-concurrency` ran beside `reviewer`, take both reports; re-check a fix that
+  changes an ordering, fence, wake, lock or job boundary against the concurrency items it
+  touches, re-running that report's stress loop and its crate's Miri or loom run. Copy that
+  report's probes into the one copy you refresh; never build its copy in `target-review` beside
+  yours, since cargo then runs either copy's build for both.
 - Nothing else unless it is in the diff or the brief names it.
 
 ## Budget
