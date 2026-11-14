@@ -33,6 +33,7 @@ mod bulk;
 mod change;
 mod command;
 mod event;
+mod node;
 mod param;
 mod query;
 mod region;

@@ -19,36 +19,47 @@ use lactose_math::Reducer;
 use crate::access::{Access, AccessTarget};
 use crate::change::Stamp;
 use crate::command::{ChannelCommand, ChannelStore, CommandBuffer};
-use crate::event::{EventRecord, EventStore, PresentRecord};
+use crate::event::{EventList, EventRecord, PresentRecord};
 use crate::param::SystemParam;
 use crate::region::{ClaimedBy, InRegion, RegionId};
-use crate::run::{Output, SinkCursor, Sinks};
+use crate::run::{Output, SinkCursor, Sinks, list_of};
 use crate::schedule::Source;
 use crate::storage::{typed_slice, typed_slice_mut};
 use crate::system::mismatch;
 
-/// What every unit of one system's run shares.
+/// What every unit of one system's run shares, made once per job in its scratch arena.
 pub(crate) struct UnitEnv<'r> {
     pub(crate) table: &'static [Access],
     pub(crate) system: SystemKey,
     pub(crate) tick: Tick,
     /// The stamp a mutable dereference writes.
     pub(crate) now: Stamp,
+    /// The world resources the table reads.
     pub(crate) resources: &'r [(TypeId, &'r (dyn Any + Send + Sync))],
-    pub(crate) events: &'r EventStore,
+    /// The lists of the event types the table reads, found before the units run: the
+    /// world's store is not searched while other systems run.
+    pub(crate) events: &'r [(TypeId, &'r EventList)],
     pub(crate) channels: &'r ChannelStore,
     /// The regions whose rows run, ascending by ID.
-    pub(crate) regions: Vec<Admitted<'r>>,
+    pub(crate) regions: &'r [Admitted<'r>],
     pub(crate) sinks: Sinks,
 }
 
+impl<'r> UnitEnv<'r> {
+    /// The list of event type `type_id`, which the table reads, or the empty list.
+    pub(crate) fn event_list(&self, type_id: TypeId) -> &'r EventList {
+        list_of(self.events, type_id)
+    }
+}
+
 /// A region whose rows run: simulated, and holding every region resource the system reads.
+#[derive(Clone, Copy)]
 pub(crate) struct Admitted<'r> {
     pub(crate) id: RegionId,
     pub(crate) seed: u64,
     pub(crate) assets: Option<&'r PinnedTable>,
     /// The bytes of each region resource the system reads, in parameter order.
-    pub(crate) resources: Vec<&'r [u8]>,
+    pub(crate) resources: &'r [&'r [u8]],
 }
 
 /// One parameter's column over a unit's rows, before the parameter takes it.
