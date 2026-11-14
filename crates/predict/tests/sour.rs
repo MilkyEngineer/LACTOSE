@@ -75,21 +75,21 @@ impl Sour {
         Ok((Self { session, layout }, executor.build()?))
     }
 
-    /// Opens the recorder with what the executor and the layout report they were built
-    /// with.
+    /// Opens the recorder with what the rig's executor and its prediction world report they
+    /// were built with.
     #[expect(
         clippy::disallowed_methods,
         reason = "SOUR's glue is test code outside the step: it reports what the executor \
                   was built with"
     )]
-    fn recorder(&self, test: &str, executor: &Executor) -> Result<Recorder> {
+    fn recorder(&self, test: &str, rig: &Rig) -> Result<Recorder> {
         let config = self.session.config();
-        let layout = self.layout;
+        let (executor, layout) = (&rig.executor, rig.world().layout());
         let applied = RunConfig {
             workers: config.workers.map(|_| {
                 NonZeroU32::new(executor.frame_worker_count()).expect("at least one worker")
             }),
-            layout: if layout == LayoutConfig::default() {
+            layout: if *layout == LayoutConfig::default() {
                 Layout::Production
             } else {
                 let capacity = match layout.chunk_rows {
@@ -271,7 +271,7 @@ fn digest(reconciled: &Reconciled) -> u64 {
 fn predict(
     executor: Executor,
     layout: LayoutConfig,
-    record: &mut dyn FnMut(&Executor, u32, u64) -> Result<()>,
+    record: &mut dyn FnMut(&Rig, u32, u64) -> Result<()>,
 ) -> Result<Executor> {
     let mut rig = bodies_rig(executor, layout);
     let mut sequence = 0;
@@ -280,7 +280,7 @@ fn predict(
         bytes.extend_from_slice(&rig.tick().0.to_le_bytes());
         bytes.extend_from_slice(&rig.hash().to_le_bytes());
         bytes.extend_from_slice(&done.to_le_bytes());
-        record(&rig.executor, sequence, xxh64(&bytes, 0))?;
+        record(rig, sequence, xxh64(&bytes, 0))?;
         sequence += 1;
         Ok(())
     };
@@ -342,9 +342,9 @@ fn a_prediction_scene_with_corrections_and_substitutions() {
     let test = "lactose_predict::sour::a_prediction_scene_with_corrections_and_substitutions";
     let (sour, executor) = Sour::from_env().unwrap();
     let mut recorder: Option<Recorder> = None;
-    let mut record = |executor: &Executor, sequence: u32, hash: u64| -> Result<()> {
+    let mut record = |rig: &Rig, sequence: u32, hash: u64| -> Result<()> {
         if recorder.is_none() {
-            recorder = Some(sour.recorder(test, executor)?);
+            recorder = Some(sour.recorder(test, rig)?);
         }
         recorder.as_mut().expect("opened").record(sequence, hash).map_err(protocol_error)
     };
@@ -358,7 +358,7 @@ fn a_prediction_scene_with_corrections_and_substitutions() {
 fn the_records_are_the_same_under_another_layout_and_worker_count() {
     let run = |layout: LayoutConfig, workers: u32| {
         let mut records = Vec::new();
-        let mut record = |_: &Executor, sequence: u32, hash: u64| -> Result<()> {
+        let mut record = |_: &Rig, sequence: u32, hash: u64| -> Result<()> {
             records.push((sequence, hash));
             Ok(())
         };

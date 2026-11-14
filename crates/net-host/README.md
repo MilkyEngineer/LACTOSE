@@ -114,10 +114,13 @@ reshape.
   as `u32`, every integer little-endian; then, for every registered type `covers` accepts,
   in ascending component key order, `TypeInfo::write_schema`, the per-type encoding
   `lactose-reflect` states byte for byte and pins with a golden test. The covered-set rule
-  is this crate's; the encoding is `reflect`'s. The hash of the engine's own registry
-  (`TypeTable::new` with the types of `lactose-net-api`, `lactose-input` and
-  `lactose-physics-api`) is pinned in `tests/handshake.rs`, so a change to any engine type
-  that crosses the wire or is hashed is seen as the protocol break it is.
+  is this crate's; the encoding is `reflect`'s. `tests/handshake.rs` pins the hash of the
+  engine types of the crates it depends on (`TypeTable::new` with the types of `lactose-net-api`,
+  `lactose-input` and `lactose-physics-api`). That is not every engine type a game's
+  registry holds: `lactose-anim`'s and `lactose-predict`'s are there too. The pin that sees
+  a change to any engine type that crosses the wire or is hashed as a protocol break is
+  `lactose-app`'s, over `Game::types` of a game with no crates of its own
+  (`tests/proof/registration.rs`).
 - `covers(info)` is: `tracking().replicated`, or `persistence()` is `Persistent` or
   `Transient`. Replicated types cross the wire; persistent and transient types are what the
   world hash and a desync digest compare, so a client whose hashed layout differs cannot

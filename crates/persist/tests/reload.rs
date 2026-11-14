@@ -97,15 +97,14 @@ fn joins(simulation: &mut Simulation) -> BTreeMap<PlayerId, SessionEvent> {
 /// The recorded run of `test`: the directed world to tick `at`, each step recorded.
 struct Run {
     sour: Sour,
-    recorder: sour::Recorder,
+    /// Opened by [`Run::original`] with the layout the original's world reports.
+    recorder: Option<sour::Recorder>,
     test: &'static str,
 }
 
 impl Run {
     fn new(test: &'static str) -> Self {
-        let sour = Sour::from_env().unwrap();
-        let recorder = sour.recorder(test, &sour.layout).unwrap();
-        Self { sour, recorder, test }
+        Self { sour: Sour::from_env().unwrap(), recorder: None, test }
     }
 
     fn executor(&self) -> &Executor {
@@ -114,7 +113,7 @@ impl Run {
 
     /// Steps `simulation` through `frame`, recording the hash.
     fn step(&mut self, simulation: Simulation, frame: TickInput) -> Simulation {
-        let recorder = &mut self.recorder;
+        let recorder = self.recorder.as_mut().expect("the original opened the recorder");
         let mut hashed = |tick: Tick, hash: u64| record(recorder, tick, hash);
         run_recorded(&self.sour.executor, simulation, [frame], &mut hashed).unwrap()
     }
@@ -123,7 +122,7 @@ impl Run {
     /// recorded.
     fn original(&mut self, ticks: u32) -> Simulation {
         let mut simulation = directed(self.sour.layout).build().unwrap();
-        assert_eq!(*simulation.world().layout(), self.sour.layout);
+        self.recorder = Some(self.sour.recorder(self.test, simulation.world().layout()).unwrap());
         for tick in 1..=ticks {
             simulation = self.step(simulation, directed_frame(tick));
         }

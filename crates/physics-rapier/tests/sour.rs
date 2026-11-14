@@ -24,12 +24,12 @@ use std::num::NonZeroU32;
 use common::*;
 use lactose_core::{Error, ErrorKind, Result, StableKey};
 use lactose_ecs::{
-    ClaimedBy, Executor, LayoutConfig, OwnedBy, RegionConfig, RegionMode, WorldKind,
+    ClaimedBy, Executor, LayoutConfig, OwnedBy, RegionConfig, RegionMode, World, WorldKind,
 };
-use lactose_math::Scalar;
+use lactose_math::{Scalar, Vec3};
 use lactose_physics_api::{
-    Collider, Joint, JointKind, PhysicsCommand, RigidBody, Shape, Transform, Velocity, corrected,
-    restore, snapshot,
+    Collider, Joint, JointKind, PhysicsBackend, PhysicsCommand, PhysicsConfig, RigidBody, Shape,
+    Transform, Velocity, conformance, corrected, restore, snapshot,
 };
 use lactose_sim::harness::{ChunkCapacity, layout_mode, run_recorded};
 use lactose_sim::{Simulation, TickInput};
@@ -73,16 +73,15 @@ impl Sour {
         Ok(Self { session, executor: executor.build()?, layout })
     }
 
-    /// Opens the recorder with what the executor and the world report they were built
-    /// with.
+    /// Opens the recorder with what the executor and `layout`, the layout the test's world
+    /// reports, were built with.
     #[expect(
         clippy::disallowed_methods,
         reason = "SOUR's glue is test code outside the step: it reports what the executor \
                   was built with"
     )]
-    fn recorder(&self, test: &str, simulation: &Simulation) -> Result<Recorder> {
+    fn recorder(&self, test: &str, layout: &LayoutConfig) -> Result<Recorder> {
         let config = self.session.config();
-        let layout = simulation.world().layout();
         let applied = RunConfig {
             workers: config.workers.map(|_| {
                 NonZeroU32::new(self.executor.frame_worker_count()).expect("at least one worker")
@@ -134,18 +133,23 @@ fn sphere_key(index: u64) -> StableKey {
     key(100 + index)
 }
 
-/// `physics-api`'s scene: a floor reporting contacts, a falling stack, two bones joined and
-/// driven, a second region frozen and thawed, and game code that pushes, teleports, writes
-/// velocities, spawns, despawns and moves through the run; stepped by Rapier.
+/// The backend every scene here steps with: Rapier on a pool of two threads.
 #[expect(
     clippy::disallowed_methods,
     reason = "the test builds the solver pool that lactose-app builds in a shipped binary"
 )]
+fn backend() -> Box<dyn PhysicsBackend> {
+    let pool = rayon::ThreadPoolBuilder::new().num_threads(2).build().unwrap();
+    lactose_physics_rapier::backend(pool)
+}
+
+/// `physics-api`'s scene: a floor reporting contacts, a falling stack, two bones joined and
+/// driven, a second region frozen and thawed, and game code that pushes, teleports, writes
+/// velocities, spawns, despawns and moves through the run; stepped by Rapier.
 fn scene(kind: WorldKind, layout: LayoutConfig) -> Harness {
     let mut options = Options::new(kind);
     options.layout = layout;
-    let pool = rayon::ThreadPoolBuilder::new().num_threads(2).build().unwrap();
-    let mut h = options.build_with(lactose_physics_rapier::backend(pool), CallLog::default());
+    let mut h = options.build_with(backend(), CallLog::default());
     let second = RegionConfig { id: OTHER_REGION, seed: 9, mode: RegionMode::Simulated };
     h.world_mut().create_region(second).unwrap();
     let claim = ClaimedBy { player: PLAYER };
@@ -261,7 +265,7 @@ fn step(
 fn record_scene(test: &str, kind: WorldKind) -> Result<()> {
     let sour = Sour::from_env()?;
     let Harness { mut simulation, .. } = scene(kind, sour.layout);
-    let mut recorder = sour.recorder(test, &simulation)?;
+    let mut recorder = sour.recorder(test, simulation.world().layout())?;
     let mut record =
         |tick: lactose_core::Tick, hash: u64| recorder.record(tick.0, hash).map_err(protocol_error);
     let mut saved = None;
@@ -345,4 +349,119 @@ fn the_rolled_back_scene_ends_where_the_straight_one_does() {
         hashes
     };
     assert_eq!(run(true), run(false));
+}
+
+/// `physics-api`'s conformance run (architecture section 10) on the session's executor and
+/// layout: the first run's world hash after each of its ticks, then, at tick
+/// `conformance::TICKS + 1`, the hash of the backend's bytes after its last tick, so
+/// architecture mode compares the scene and Rapier's serialised world across machines. The
+/// run itself requires the resumed run's hashes equal to the first run's.
+#[test]
+fn the_conformance_run() {
+    let test = "lactose_physics_rapier::sour::the_conformance_run";
+    let sour = Sour::from_env().unwrap();
+    let config = PhysicsConfig::default();
+    let report =
+        conformance::snapshot_restore(&sour.executor, backend(), config, sour.layout).unwrap();
+    // `snapshot_restore` builds the world and refuses one that reports another layout than
+    // the one it was given, so that one is the layout the run applied.
+    let mut recorder = sour.recorder(test, &sour.layout).unwrap();
+    let ticks: Vec<u32> = report.first.iter().map(|&(tick, _)| tick.0).collect();
+    assert_eq!(ticks, (1..=conformance::TICKS).collect::<Vec<_>>());
+    for &(tick, hash) in &report.first {
+        recorder.record(tick.0, hash).map_err(protocol_error).unwrap();
+    }
+    let bytes = report.physics_hash.0;
+    recorder.record(conformance::TICKS + 1, bytes).map_err(protocol_error).unwrap();
+    sour.finish(test).unwrap();
+}
+
+const HINGE_BASE: u64 = 2;
+const ARM: u64 = 3;
+const HINGE: u64 = 4;
+/// The hinge's limits in radians. Asymmetric, so the centre of the limit row is not zero
+/// and the `sin_cos` of half of it, the route the vendored Rapier's patch sends to `libm`
+/// (D123), is a rounded value rather than the exact one of zero.
+const HINGE_LIMITS: (f64, f64) = (-0.35, 0.8);
+/// The ticks at which the arm is swung, about `+Z` and `-Z` in turn.
+const SWINGS: [u32; 3] = [30, 75, 120];
+
+/// A limited revolute joint between two dynamic bodies, driven against both its limits: a
+/// heavy base resting on the floor and a light arm hinged at its top edge about `+Z`, which
+/// gravity holds against one limit and torque impulses swing against the other and back.
+fn hinge_scene(layout: LayoutConfig) -> Harness {
+    let mut options = Options::new(WorldKind::Server);
+    options.layout = layout;
+    let mut h = options.build_with(backend(), CallLog::default());
+    let s = Scalar::from_f64;
+    h.spawn(key(FLOOR), (Transform::IDENTITY, Collider::new(Shape::cuboid(v(50, 1, 50)))));
+    let base = Collider::new(Shape::cuboid(Vec3::new(Scalar::ONE, Scalar::HALF, Scalar::ONE)));
+    let on_floor = Transform::at(Vec3::new(Scalar::ZERO, s(1.5), Scalar::ZERO));
+    h.spawn(key(HINGE_BASE), (on_floor, Velocity::ZERO, RigidBody::dynamic(), base));
+    let arm = Collider::new(Shape::cuboid(Vec3::new(Scalar::ONE, s(0.1), s(0.1))));
+    // The hinge stands a quarter clear of the base's edge, so the arm's end never touches
+    // the base: a jointed pair keeps its contacts, and the base would stop the arm short.
+    let level = Transform::at(Vec3::new(s(2.25), Scalar::TWO, Scalar::ZERO));
+    h.spawn(key(ARM), (level, Velocity::ZERO, RigidBody::dynamic(), arm));
+    let (lo, hi) = HINGE_LIMITS;
+    let hinge = Joint::new(JointKind::Revolute, key(HINGE_BASE), key(ARM))
+        .with_anchors(Vec3::new(s(1.25), Scalar::HALF, Scalar::ZERO), -Vec3::X)
+        .with_axis(Vec3::Z)
+        .with_limits(s(lo), s(hi));
+    h.spawn(key(HINGE), (hinge,));
+    for (n, tick) in SWINGS.into_iter().enumerate() {
+        let about = if n % 2 == 0 { v(0, 0, 1) } else { v(0, 0, -1) };
+        let swing = PhysicsCommand::ApplyTorqueImpulse { body: key(ARM), torque: about };
+        h.script().at(tick, When::Simulation, key(ARM), Action::Command(swing));
+    }
+    h
+}
+
+/// The arm's angle about the hinge's axis relative to the base, in radians.
+fn hinge_angle(world: &World) -> Scalar {
+    let rotation = |n| world.get::<Transform>(key(n)).expect("a body's transform").rotation;
+    let relative = rotation(HINGE_BASE).conjugate() * rotation(ARM);
+    // The same rotation either way; the positive real part keeps the angle in (-π, π].
+    let (z, w) = if relative.w < Scalar::ZERO {
+        (-relative.z, -relative.w)
+    } else {
+        (relative.z, relative.w)
+    };
+    Scalar::TWO * z.atan2(w)
+}
+
+/// The hinge scene for [`TICKS`] ticks, recorded; the arm reaches each limit and stops
+/// there, so the limit rows enter the solve, and the run counts the ticks it spends within
+/// a hundredth of a radian of each.
+#[test]
+fn a_limited_hinge_driven_against_its_limits() {
+    let test = "lactose_physics_rapier::sour::a_limited_hinge_driven_against_its_limits";
+    let sour = Sour::from_env().unwrap();
+    let Harness { mut simulation, .. } = hinge_scene(sour.layout);
+    let mut recorder = sour.recorder(test, simulation.world().layout()).unwrap();
+    let mut record =
+        |tick: lactose_core::Tick, hash: u64| recorder.record(tick.0, hash).map_err(protocol_error);
+    let (lo, hi) = (Scalar::from_f64(HINGE_LIMITS.0), Scalar::from_f64(HINGE_LIMITS.1));
+    let near = Scalar::from_f64(0.01);
+    let (mut lowest, mut highest) = (Scalar::ZERO, Scalar::ZERO);
+    let (mut at_lo, mut at_hi) = (0, 0);
+    for _ in 0..TICKS {
+        simulation =
+            run_recorded(&sour.executor, simulation, [TickInput::default()], &mut record).unwrap();
+        let angle = hinge_angle(simulation.world());
+        lowest = lowest.min(angle);
+        highest = highest.max(angle);
+        at_lo += usize::from((angle - lo).abs() < near);
+        at_hi += usize::from((angle - hi).abs() < near);
+    }
+    sour.finish(test).unwrap();
+    println!(
+        "hinge: from {lowest:?} to {highest:?}; {at_lo} ticks at the lower limit, {at_hi} at the upper"
+    );
+    // Each limit is reached and holds: the arm overshoots neither by more than a twentieth
+    // of a radian.
+    let slack = Scalar::from_f64(0.05);
+    assert!(lowest < lo + near && lowest > lo - slack, "lowest {lowest:?}");
+    assert!(highest > hi - near && highest < hi + slack, "highest {highest:?}");
+    assert!(at_lo > 0 && at_hi > 0, "{at_lo} {at_hi}");
 }

@@ -36,7 +36,7 @@ use lactose_asset_api::{
 };
 use lactose_bundle::Baseline;
 use lactose_core::{Error, ErrorKind, PlayerId, Result, StableKey, Tick};
-use lactose_ecs::{ClaimedBy, Mut, RegionId, RegionMode, World, system};
+use lactose_ecs::{ClaimedBy, LayoutConfig, Mut, RegionId, RegionMode, World, system};
 use lactose_input::{AXIS_SCALE, Axis2, PlayerInput, Yaw, player_entity};
 use lactose_math::{Scalar, Vec3};
 use lactose_persist::Migrations;
@@ -365,12 +365,15 @@ fn sour_run(test: &str, ticks: u32) -> Result<()> {
     let cooked = Arc::new(InMemory::new(RegionId(1))?);
     let cooked_dyn = Arc::clone(&cooked) as Arc<dyn Cooked>;
     let mut app = Headless::start(&SOUR_GAME, config_applied, cooked_dyn)?;
+    // What the assembly built, as its world and executor report it, never the session's
+    // request: a world the assembly built under another layout fails the runner's check.
+    let world = app.server().expect("a started app has its server").simulation().world();
     let applied = RunConfig {
         workers: config.workers.map(|_| {
             NonZeroU32::new(app.executor().frame_worker_count()).expect("at least one worker")
         }),
-        layout: config.layout,
-        chaos_seed: config.chaos_seed,
+        layout: applied_layout(world.layout()),
+        chaos_seed: app.executor().chaos_config().map(|chaos| chaos.seed),
     };
     let mut recorder = session.recorder(test, &applied).map_err(protocol_error)?;
     let mut frames = sour_frames(cooked)?;
@@ -411,6 +414,18 @@ fn steered(app: &Headless, last: Tick) -> Result<()> {
 
 fn protocol_error(error: protocol::ProtocolError) -> Error {
     Error::new(ErrorKind::InvalidData, error.to_string())
+}
+
+/// The layout a world reports, as the runner spells it (`lactose-sim`'s glue).
+fn applied_layout(layout: &LayoutConfig) -> Layout {
+    if *layout == LayoutConfig::default() {
+        return Layout::Production;
+    }
+    let capacity = match layout.chunk_rows {
+        Some(n) => Capacity::Rows(n),
+        None => Capacity::Bytes(16 * 1024),
+    };
+    Layout::Perturbed { capacity, seed: layout.seed }
 }
 
 fn chaos(seed: u64) -> ChaosConfig {
