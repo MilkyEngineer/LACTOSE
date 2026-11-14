@@ -29,7 +29,8 @@ pub const SHORT_VAR: &str = "LACTOSE_MEASURE_SHORT";
 /// The variable that names the machine in the file names, in place of the CPU's slug.
 pub const MACHINE_VAR: &str = "LACTOSE_MEASURE_MACHINE";
 /// The variable the cost tests read for N, the frame workers of plan decision 5.1, in place
-/// of the topology's; passed through to them, and recorded in the header when set.
+/// of the topology's: a count above zero, refused before anything builds otherwise, passed
+/// to the tests and recorded in the header; empty, it is unset, as the tests read it.
 pub const WORKERS_VAR: &str = "LACTOSE_MEASURE_WORKERS";
 /// The prefix of a figure line in a measurement's standard output.
 pub const FIGURE_PREFIX: &str = "measure: ";
@@ -275,14 +276,29 @@ fn load_average(uptime: &str) -> Option<String> {
     (!averages.is_empty()).then(|| averages.to_owned())
 }
 
+/// [`WORKERS_VAR`]'s value: none when unset or empty, else a count above zero.
+fn workers_override(value: Option<&std::ffi::OsStr>) -> Result<Option<u32>, String> {
+    let Some(value) = value.filter(|value| !value.is_empty()) else { return Ok(None) };
+    value
+        .to_str()
+        .and_then(|text| text.parse::<u32>().ok())
+        .filter(|&n| n > 0)
+        .map(Some)
+        .ok_or_else(|| {
+            format!("{WORKERS_VAR} is `{}`, not a count above zero", value.to_string_lossy())
+        })
+}
+
 /// The mean of the samples the WMI sampler printed, a percentage: every line that reads as a
-/// number. Anything else it printed is not a sample.
+/// number but the first, which a fresh session's first query may answer with no interval
+/// behind it. Anything else it printed is not a sample.
 #[must_use]
 fn idle_share(samples: &str) -> Option<f64> {
     let samples: Vec<f64> = samples
         .lines()
         .filter_map(|line| line.trim().parse::<f64>().ok())
         .filter(|value| value.is_finite())
+        .skip(1)
         .collect();
     (!samples.is_empty()).then(|| samples.iter().sum::<f64>() / samples.len() as f64)
 }
@@ -638,14 +654,15 @@ struct Machine {
     commit: String,
     topology: Option<(u64, u64)>,
     default_workers: Option<String>,
-    /// [`WORKERS_VAR`], where it is set.
-    workers_override: Option<String>,
+    /// [`WORKERS_VAR`], where it is set and not empty.
+    workers_override: Option<u32>,
 }
 
 /// Runs the selected measurements, each writing its files; one that fails is reported and
 /// the rest still run. Returns the files written, or what failed.
 pub fn run(workspace: &Workspace, options: &Options) -> Result<Vec<PathBuf>, String> {
     let options = &options.resolved(&workspace.root)?;
+    let workers_override = workers_override(std::env::var_os(WORKERS_VAR).as_deref())?;
     let out = workspace.root.join(&options.out);
     fs::create_dir_all(&out).map_err(|e| format!("{}: {e}", out.display()))?;
     let cpu = cpu_name();
@@ -662,7 +679,7 @@ pub fn run(workspace: &Workspace, options: &Options) -> Result<Vec<PathBuf>, Str
         head,
         topology: None,
         default_workers: None,
-        workers_override: std::env::var(WORKERS_VAR).ok().filter(|n| !n.is_empty()),
+        workers_override,
     };
     eprintln!(
         "measure: {} ({}), machine `{}`, commit {}, {}",
@@ -672,7 +689,7 @@ pub fn run(workspace: &Workspace, options: &Options) -> Result<Vec<PathBuf>, Str
         machine.commit,
         if options.short { "short run" } else { "full run" }
     );
-    match probe(workspace) {
+    match probe(workspace, &machine) {
         Ok(found) => {
             let get = |name: &str| found.iter().find(|(n, _)| n == name).map(|(_, v)| v.clone());
             let core = |name: &str| get(name).and_then(|v| v.parse::<u64>().ok());
@@ -790,11 +807,12 @@ const IDLE_SAMPLER: &str = "while ($true) { \
     [Console]::Out.WriteLine($total.PercentIdleTime); [Console]::Out.Flush(); \
     Start-Sleep -Seconds 1 }";
 
-/// What the machine is doing, sampled across one run.
+/// What the machine is doing, sampled across one run. A sampler dropped unstopped, on an
+/// early return, stops its process all the same.
 enum Sampler {
     Uptime(String),
-    /// [`IDLE_SAMPLER`], and the thread reading it.
-    Wmi(Child, thread::JoinHandle<String>),
+    /// [`IDLE_SAMPLER`], and the thread reading it, until stopped.
+    Wmi(Option<(Child, thread::JoinHandle<String>)>),
     Unavailable,
 }
 
@@ -815,7 +833,7 @@ impl Sampler {
                             let _ = stdout.read_to_string(&mut text);
                             text
                         });
-                        Self::Wmi(child, reader)
+                        Self::Wmi(Some((child, reader)))
                     }
                     None => Self::Unavailable,
                 },
@@ -826,15 +844,28 @@ impl Sampler {
         }
     }
 
-    fn stop(self) -> Load {
-        match self {
-            Self::Uptime(before) => Load::Averages { before, after: uptime() },
-            Self::Wmi(mut child, reader) => {
+    fn stop(mut self) -> Load {
+        match &mut self {
+            Self::Uptime(before) => {
+                Load::Averages { before: std::mem::take(before), after: uptime() }
+            }
+            Self::Wmi(running) => Load::Idle(running.take().and_then(|(mut child, reader)| {
                 let _ = child.kill();
                 let _ = child.wait();
-                Load::Idle(reader.join().ok().as_deref().and_then(idle_share))
-            }
+                reader.join().ok().as_deref().and_then(idle_share)
+            })),
             Self::Unavailable => Load::Idle(None),
+        }
+    }
+}
+
+impl Drop for Sampler {
+    fn drop(&mut self) {
+        if let Self::Wmi(running) = self
+            && let Some((mut child, _)) = running.take()
+        {
+            let _ = child.kill();
+            let _ = child.wait();
         }
     }
 }
@@ -893,10 +924,19 @@ fn nextest_args(run: Run) -> Vec<String> {
     .collect()
 }
 
-fn probe(workspace: &Workspace) -> Result<Vec<(String, String)>, String> {
+fn probe(workspace: &Workspace, machine: &Machine) -> Result<Vec<(String, String)>, String> {
     let mut command = Command::new(&workspace.cargo);
     command.args(nextest_args(PROBE)).current_dir(&workspace.root);
+    pass_workers(&mut command, machine);
     figures(&capture(&mut command, |_, _| {})?)
+}
+
+/// Gives a test the workers' override as read here, and no empty one.
+fn pass_workers(command: &mut Command, machine: &Machine) {
+    command.env_remove(WORKERS_VAR);
+    if let Some(n) = machine.workers_override {
+        command.env(WORKERS_VAR, n.to_string());
+    }
 }
 
 /// The header's common fields for `m`.
@@ -971,8 +1011,8 @@ fn run_test(
     let mut command = Command::new(&workspace.cargo);
     command.args(&args).current_dir(&workspace.root);
     // A short run sets the variable; a full one makes sure the caller's does not leak in.
-    // The workers' override, where set, reaches the test by inheritance.
     command.env_remove(SHORT_VAR).envs(env.iter().map(|(name, value)| (name, value)));
+    pass_workers(&mut command, machine);
     let sampler = Sampler::start();
     let output = capture(&mut command, |_, _| {});
     let load = sampler.stop();
@@ -986,12 +1026,12 @@ fn run_test(
         .find(|(name, _)| name == "workers" || name == "frame_workers")
         .map_or_else(|| default_workers(machine), |(_, value)| value.clone());
     let mut shown = env.clone();
-    if let Some(n) = &machine.workers_override {
-        shown.push((WORKERS_VAR, n.clone()));
+    if let Some(n) = machine.workers_override {
+        shown.push((WORKERS_VAR, n.to_string()));
     }
     let ran = shell_line(&shown, "cargo", &args);
     let mut header = header(options, machine, m, "release", workers, ran, load);
-    if let Some(n) = &machine.workers_override {
+    if let Some(n) = machine.workers_override {
         header.notes.push((
             "Workers override".to_owned(),
             format!("`{WORKERS_VAR}={n}`: N, in place of the topology's"),
@@ -1142,10 +1182,17 @@ impl Copy {
     }
 
     /// Removes this worktree's registration, which fails harmlessly when there is none, then
-    /// its directory.
+    /// its directory. Forced twice, so that a registration a kill left locked mid-`add`
+    /// ("initializing") goes too; quiet, since on a first run there is nothing to remove.
     fn remove(&self) {
-        let path = self.tree.to_string_lossy().into_owned();
-        let _ = self.git(&["worktree", "remove", "--force", &path]);
+        let _ = Command::new("git")
+            .arg("-C")
+            .arg(&self.root)
+            .args(["worktree", "remove", "--force", "--force"])
+            .arg(&self.tree)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
         let _ = fs::remove_dir_all(&self.tree);
     }
 }
@@ -1354,11 +1401,30 @@ mod tests {
     }
 
     #[test]
-    fn the_idle_share_is_the_mean_of_the_wmi_sampler_s_lines() {
-        assert_eq!(idle_share("90\r\n80\r\n"), Some(85.0));
-        assert_eq!(idle_share("\r\n97\r\nGet-CimInstance : Access denied\r\n93\r\n"), Some(95.0));
+    fn the_idle_share_is_the_mean_of_the_wmi_sampler_s_lines_but_the_first() {
+        assert_eq!(idle_share("0\r\n90\r\n80\r\n"), Some(85.0));
+        assert_eq!(
+            idle_share("\r\n100\r\n97\r\nGet-CimInstance : Access denied\r\n93\r\n"),
+            Some(95.0)
+        );
+        assert_eq!(idle_share("97\r\n"), None);
         assert_eq!(idle_share(""), None);
         assert_eq!(idle_share("Get-CimInstance : Invalid class\r\n"), None);
+    }
+
+    /// Review r2, m1: an empty override was unset here but an error to every cost test, and
+    /// a value that is not a count reached them.
+    #[test]
+    fn the_workers_override_is_a_count_above_zero_or_unset() {
+        use std::ffi::OsStr;
+        assert_eq!(workers_override(None), Ok(None));
+        assert_eq!(workers_override(Some(OsStr::new(""))), Ok(None));
+        assert_eq!(workers_override(Some(OsStr::new("2"))), Ok(Some(2)));
+        for value in ["0", "-1", "two", " 2", "2.5"] {
+            let error = workers_override(Some(OsStr::new(value))).unwrap_err();
+            assert!(error.starts_with(WORKERS_VAR), "{value}: {error}");
+            assert!(error.contains(&format!("`{value}`")), "{value}: {error}");
+        }
     }
 
     #[test]

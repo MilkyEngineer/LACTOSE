@@ -85,10 +85,11 @@ const WORKERS_VAR: &str = "LACTOSE_MEASURE_WORKERS";
 /// N of plan decision 5.1, by the rule of the plan's section 4: the performance cores the
 /// platform reports or, on a part that reports no core types (efficiency zero), its
 /// physical cores, which `CoreTopology::homogeneous` stores as one more than its
-/// `performance`; at most eight. [`WORKERS_VAR`] overrides it, a whole number above zero.
-/// The same rule as `lactose-sim`'s cost test.
+/// `performance`; at most eight. [`WORKERS_VAR`] overrides it, a whole number above zero;
+/// empty, it is unset, as `cargo xtask measure` reads it. `lactose-sim`'s cost test has a copy
+/// of this rule, and the two must match.
 fn measured_workers() -> u32 {
-    if let Some(value) = std::env::var_os(WORKERS_VAR) {
+    if let Some(value) = std::env::var_os(WORKERS_VAR).filter(|value| !value.is_empty()) {
         let value = value.to_string_lossy();
         return value
             .parse::<u32>()

@@ -124,8 +124,9 @@ const WORKERS_VAR: &str = "LACTOSE_MEASURE_WORKERS";
 /// N of plan decision 5.1, by the rule of the plan's section 4: the performance cores the
 /// platform reports or, on a part that reports no core types (efficiency zero), its
 /// physical cores, which `CoreTopology::homogeneous` stores as one more than its
-/// `performance`; at most eight. [`WORKERS_VAR`] overrides it, a whole number above zero.
-/// The same rule as `lactose-app`'s cost test. Returns N and the topology, printed beside it.
+/// `performance`; at most eight. [`WORKERS_VAR`] overrides it, a whole number above zero;
+/// empty, it is unset, as `cargo xtask measure` reads it. `lactose-app`'s cost test has a copy
+/// of this rule, and the two must match. Returns N and the topology, printed beside it.
 #[expect(
     clippy::disallowed_methods,
     reason = "the worker count the measurement runs on, read outside the step"
@@ -133,7 +134,7 @@ const WORKERS_VAR: &str = "LACTOSE_MEASURE_WORKERS";
 fn measured_workers() -> (u32, lactose_task::CoreTopology) {
     use lactose_task::{Platform, StdPlatform};
     let topology = StdPlatform.topology();
-    if let Some(value) = std::env::var_os(WORKERS_VAR) {
+    if let Some(value) = std::env::var_os(WORKERS_VAR).filter(|value| !value.is_empty()) {
         let value = value.to_string_lossy();
         let n = value
             .parse::<u32>()
@@ -171,8 +172,9 @@ fn archetypes(world: &mut World) -> usize {
 
 /// Criterion 1 (architecture section 22, plan decision 5.1): the median step at 100,064 rows
 /// on one frame worker (T₁) and on N ([`measured_workers`]: the performance cores, or the
-/// physical cores of a part that reports no core types, up to eight) (T_N), in one sitting; then S = (N·T_N − T₁)/(N − 1), the time that did not shrink with
-/// workers, and the projected eight-core tick S + (T₁ − S)/8. Each phase of the step, and the
+/// physical cores of a part that reports no core types, up to eight) (T_N), in one sitting;
+/// then S = (N·T_N − T₁)/(N − 1), the time that did not shrink with workers, and the
+/// projected eight-core tick S + (T₁ − S)/8. Each phase of the step, and the
 /// hash after it, which is outside the step, are printed beside them; the world hash after
 /// the last tick is the same on both worker counts. `cargo xtask measure tick-100k` runs it
 /// and writes the result file; by hand, `cargo nextest run -p lactose-sim --run-ignored only

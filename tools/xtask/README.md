@@ -368,8 +368,9 @@ standard error as it comes.
   that does not read, fails its measurement.
 - The cost tests run on N frame workers: the performance cores the platform reports or, on
   a part that reports no core types, its physical cores, at most eight (the plan's section
-  4). `LACTOSE_MEASURE_WORKERS=<n>` sets N instead; the tests read it, and the header
-  records it.
+  4). `LACTOSE_MEASURE_WORKERS=<n>` sets N instead: a count above zero, refused before
+  anything builds otherwise, passed to the tests and recorded in the header. Empty, it is
+  unset, here and in the tests.
 - `--short` sets `LACTOSE_MEASURE_SHORT=1` for the tests and `WHISK_BENCH_RUNS=100` for the
   benchmark, and names the files `…-short`. It cuts nothing of `headless-120`, which has no
   repetitions, or `edit-to-playing`, which keeps its five so that a runner's short run still
@@ -380,8 +381,10 @@ standard error as it comes.
   with this command's rows: the command, the profile, the operating system and the load.
 - The load is `uptime`'s averages before and after a run; on Windows, the processor's mean
   idle share over it, which Windows PowerShell samples every second from WMI's
-  `Win32_PerfFormattedData_PerfOS_Processor` (`PercentIdleTime` of `_Total`), and which
-  the file calls unavailable when the sampler fails. The Windows CPU row is the registry's
+  `Win32_PerfFormattedData_PerfOS_Processor` (`PercentIdleTime` of `_Total`), the first
+  sample dropped, and which the file calls unavailable when the sampler fails or a run
+  ends before its second sample. The sampler wakes WMI once a second during a Windows run,
+  a perturbation not measured. The Windows CPU row is the registry's
   `ProcessorNameString`. The Windows paths have not been run.
 - `edit-to-playing` builds in a detached worktree of `HEAD` under
   `target/measure/edit-to-playing/`, removed again when it ends, with a target directory of
