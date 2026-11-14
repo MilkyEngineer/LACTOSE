@@ -536,40 +536,81 @@ fn expected_dependency(expected: &[(AssetVersion, AssetId)], version: AssetVersi
     found.expect("a version of A that was never provided").1
 }
 
-/// A cook that renames an asset changes no answer by itself, whatever the asset's state:
-/// a ready one, a failed one, one the index did not name. A store that reloads by itself
-/// may have the new versions loading already, so the answers are compared only while the
-/// generation stands still; a store whose loads run in [`Harness::settle`] is held to them
-/// outright. The failure of a renamed asset then stays the answer until a load of the
-/// newly named version ends.
+/// A cook that renames an asset changes no answer by itself, whatever the asset's state: a
+/// ready one, a failed one, one the index did not name. The failure of a renamed asset
+/// stays the answer until a load of the newly named version ends, and is never `Pending`
+/// in between.
+///
+/// A store that reloads by itself may have the new versions loading, or loaded, by the
+/// time the suite looks. So for an asset somebody asked the newest version of, each answer
+/// is held to the one from before the cook or the newly named version, and to the one from
+/// before exactly while the generation stands still. For an asset nobody asked the newest
+/// version of, no store loads anything at a cook, and its answers are compared outright.
 fn answers_change_only_with_the_generation<H: Harness>(harness: &H) {
     let catalog = harness.catalog();
     let set = AssetSet::from_iter([A]);
     let one = publish(harness, A, text("one"));
     let bad = publish(harness, B, corrupt_text());
-    let failure = Some(failed(B, Some(bad), ErrorKind::InvalidData));
+    let failure = failed(B, Some(bad), ErrorKind::InvalidData);
     catalog.request_newest(MISSING, PRIORITY);
+    // D fails by an exact request of the version the index names: nobody asks for its newest.
+    let lone = offer(harness, D, corrupt_text());
+    catalog.request(D, lone, PRIORITY);
     harness.settle();
-    let unknown = Some(failed(MISSING, None, ErrorKind::NotFound));
-    assert_eq!(failure_of(catalog.newest(B)), failure);
-    assert_eq!(failure_of(catalog.newest(MISSING)), unknown);
+    let unknown = failed(MISSING, None, ErrorKind::NotFound);
+    assert_eq!(failure_of(catalog.newest(B)), Some(failure));
+    assert_eq!(failure_of(catalog.newest(MISSING)), Some(unknown));
+    let lone_answers = || (newest_text(harness, D), text_at(harness, D, lone));
+    let lone_before = lone_answers();
 
     let before = catalog.generation();
     let two = offer(harness, A, text("two"));
     let fixed = offer(harness, B, text("fixed"));
     let found = offer(harness, MISSING, text("found"));
-    let ready = newest_text(harness, A);
+    let mended = offer(harness, D, text("mended"));
+    let renamed = newest_text(harness, A);
     let table = catalog.resolve(&set);
-    let stale = failure_of(catalog.newest(B));
+    let stale = newest_text(harness, B);
     let stale_at = failure_of(catalog.get(B, bad));
-    let stale_unknown = failure_of(catalog.newest(MISSING));
-    if catalog.generation() == before {
-        assert_eq!(ready, ready_text(one, "one"), "a cook alone does not change newest");
-        assert_eq!(table, Readiness::Ready(VersionTable::from_iter([(A, one)])), "nor resolve");
-        assert_eq!(stale, failure, "a failure stays the answer after the index renamed its asset");
-        assert_eq!(stale_at, failure, "and the answer by exact version");
-        assert_eq!(stale_unknown, unknown, "and for an asset the index did not name before");
+    let stale_unknown = newest_text(harness, MISSING);
+    let lone_after = lone_answers();
+    let unmoved = catalog.generation() == before;
+
+    let old_table = Readiness::Ready(VersionTable::from_iter([(A, one)]));
+    let new_table = Readiness::Ready(VersionTable::from_iter([(A, two)]));
+    let (old_failure, old_unknown) = (Readiness::Failed(failure), Readiness::Failed(unknown));
+    if unmoved {
+        // While the generation stands still, every answer is the one from before the cook.
+        assert_eq!(renamed, ready_text(one, "one"), "a cook alone does not change newest");
+        assert_eq!(table, old_table, "nor resolve");
+        assert_eq!(
+            stale, old_failure,
+            "a failure stays the answer after the index renamed its asset"
+        );
+        assert_eq!(stale_unknown, old_unknown, "and for an asset the index did not name before");
     }
+    // Whether or not a reload of the store's own has ended: the answer from before the cook
+    // or the newly named version, and never `Pending` in between.
+    assert!(
+        renamed == ready_text(one, "one") || renamed == ready_text(two, "two"),
+        "newest of a renamed asset is its old version or its new one, got {renamed:?}"
+    );
+    assert!(
+        table == old_table || table == new_table,
+        "resolve of a renamed asset is its old table or its new one, got {table:?}"
+    );
+    assert!(
+        stale == old_failure || stale == ready_text(fixed, "fixed"),
+        "a renamed failure is the old failure or the new version, never pending, got {stale:?}"
+    );
+    assert_eq!(stale_at, Some(failure), "the failed version stays failed by exact version");
+    assert!(
+        stale_unknown == old_unknown || stale_unknown == ready_text(found, "found"),
+        "an unnamed asset is its old failure or its first version, got {stale_unknown:?}"
+    );
+    // Nobody asked for the newest D, so no store loads anything of it at a cook.
+    assert_eq!(lone_after, lone_before, "a cook changes no answer of an asset nobody asked for");
+    assert!(matches!(catalog.get(D, mended), Readiness::Pending), "and loads nothing of it");
 
     catalog.request_newest(A, PRIORITY);
     catalog.request_newest(B, PRIORITY);
@@ -579,7 +620,7 @@ fn answers_change_only_with_the_generation<H: Harness>(harness: &H) {
     assert_eq!(newest_text(harness, A), ready_text(two, "two"));
     assert_eq!(newest_text(harness, B), ready_text(fixed, "fixed"), "a later load's outcome");
     assert_eq!(newest_text(harness, MISSING), ready_text(found, "found"));
-    assert_eq!(failure_of(catalog.get(B, bad)), failure, "the failed version stays failed");
+    assert_eq!(failure_of(catalog.get(B, bad)), Some(failure), "the failed version stays failed");
 
     // A failure is replaced by a later failure too.
     let first = publish(harness, C, corrupt_text());
@@ -689,9 +730,10 @@ fn scenario(name: &str) -> (AssetId, AssetId, AssetId) {
 }
 
 /// Which failure a load reports when several apply is the same in every store and in every
-/// order of requests: the kind of its first dependency, in ascending [`AssetId`] order,
-/// that cannot be published, before anything of its own; and for a dependency cycle
-/// `InvalidData`, unless a failing dependency with a lower ID decides first.
+/// order of requests, for an index that does not change while the load is in flight: the
+/// kind of its first dependency, in ascending [`AssetId`] order, that cannot be published,
+/// before anything of its own; and for a dependency cycle `InvalidData`, unless a failing
+/// dependency with a lower ID decides first.
 fn failures_follow_dependencies_in_id_order<H: Harness>(harness: &H) {
     let catalog = harness.catalog();
     let kind_of = |id: AssetId| failure_of(catalog.newest(id)).map(|failure| failure.kind);

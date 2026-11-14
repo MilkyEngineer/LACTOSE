@@ -321,11 +321,19 @@ is this crate's (D136), written by `PackBuilder` alone and read by `Store::mount
      missing asset outside the cycle is `NotFound`, a member whose lowest is that member
      is `NotFound` through it, and members that each wait first for another of the cycle
      are `InvalidData`.
-- Which failure a load reports is therefore the same whichever task finished first and
-  whatever the order of the requests: a load waits for every dependency to end before it
-  reports, and a cycle is decided as a whole. It is the order `asset-api` states and its
-  conformance suite pins for every store (`failures_follow_dependencies_in_id_order`): a
-  failing dependency before anything of the load's own, the lowest ID first.
+- For an index that does not change while a load is in flight, which failure the load
+  reports is therefore the same whichever task finished first and whatever the order of
+  the requests: a load waits for every dependency to end before it reports, and a cycle
+  is decided as a whole. It is the order `asset-api` states and its conformance suite
+  pins for every store (`failures_follow_dependencies_in_id_order`): a failing dependency
+  before anything of the load's own, the lowest ID first.
+- A mount that resolves while a load is in flight is the exception, because it changes
+  what the load waits for. A declares [B], B's named version is one its loader refuses,
+  and a pack that renames B to a good version is mounted while B's load is in flight. If
+  B's load ends first, A finds B failed and fails with its kind, and the mount's rule 3
+  then asks for A again; if the mount resolves first, B's named version is the good one,
+  in flight, so A waits for it and is published with no failure recorded. Both orders
+  end with A published; only one of them records, and so journals, a failure of A.
 - Which loads a store starts beyond the ones a request names is the store's own
   (`crates/asset-api/README.md`, "What the store decides"). This store asks for all of a
   load's dependencies when it accepts the load, so that they load side by side with it

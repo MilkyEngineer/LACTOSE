@@ -86,8 +86,9 @@ nothing and a lookup of it is `Failed` with `NotFound`.
 **What the store decides.** Which loads a store starts beyond the ones a request names:
 whether and when it reloads an asset whose newest version was asked for once the index
 names another, and whether it goes on to an asset's other dependencies once one has failed.
-The failure a load reports is the same in every store: the kind of its first failing
-dependency in ascending `AssetId` order, before any failure of its own.
+The failure a load reports is the same in every store, for an index that does not change
+while the load is in flight: the kind of its first failing dependency in ascending `AssetId`
+order, before any failure of its own.
 
 **Region readiness.** Outside the boundary, on the server: request a region's `AssetSet`,
 then call `AssetCatalog::resolve`. `Ready` carries a table that holds the current version of
@@ -116,7 +117,11 @@ a stand-in for tests of crates that need a store. It is not a backend: no IO, no
 no budgets, one lock. Where the traits leave a choice to the store it makes the smallest: it
 never reloads by itself and stops at an asset's first failing dependency. The suite, not the
 reference store, is the statement of the contract: `tests/conformance.rs` runs it against
-stores that each break one rule, to show it notices.
+twelve stores that each break one rule, to show it notices. The five oldest break broad rules
+and fail several checks. The seven that break a rule D136 added each fail exactly one check,
+on that check's own message, and each of the six checks D136 added fails at least one of
+them; the first of the six fails two, a store whose generation stands still at a cook and
+one whose generation moves.
 
 The feature is for dev-dependencies only. No normal or build dependency edge may enable it,
 so that nothing which ships can name `ReferenceStore`.

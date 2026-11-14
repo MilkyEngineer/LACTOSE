@@ -136,8 +136,10 @@ impl<T> Readiness<T> {
 ///   with: of several, the one with the lowest [`AssetId`]. A dependency cycle among
 ///   assets that are not yet published fails every asset in it, and where following each
 ///   asset's first failing dependency leads round the cycle the kind is `InvalidData`.
-///   Which failure a load reports depends on neither the order of requests nor the order
-///   in which loads end.
+///   For an index that does not change while the load is in flight, which failure a load
+///   reports depends on neither the order of requests nor the order in which loads end.
+///   A change of the index while a load is in flight can change what it waits for, and so
+///   whether it fails at all.
 /// - A failed load is reported as an [`AssetFailure`] naming the asset and the version
 ///   that failed: `NotFound` for an asset or version the store's sources do not hold,
 ///   `Unsupported` for a kind with no registered loader, `VersionMismatch` for another
