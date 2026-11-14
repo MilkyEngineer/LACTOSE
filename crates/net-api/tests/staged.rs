@@ -1,7 +1,9 @@
 //! The staged frame, the inbox and the client hook (README, "The staged frame"; proof row
 //! "The staged frame"): `push_row` keeps the newest row, the inbox accepts ascending ticks
 //! only and hands the hook exactly what `due` showed `app`, and the README's hook, written
-//! through the erased writes, leaves a client world as the frame says.
+//! through the erased writes, leaves a client world as the frame says: each move and
+//! tombstone applied to the one entity it names, and replicated components alone written
+//! (proof for D141).
 
 #![forbid(unsafe_code)]
 
@@ -371,7 +373,7 @@ fn a_spawn_of_a_live_key_is_an_upsert_that_sets_or_removes_the_slot() {
 }
 
 #[test]
-fn moves_apply_once_and_an_owned_entity_follows_its_owner() {
+fn moves_apply_once_each_to_the_entity_it_names() {
     let (mut simulation, skipped) = client_with_regions();
     let world = simulation.world_mut();
     world.spawn(key(1), REGION, (Position { x: 0, y: 0 },)).expect("spawn");
@@ -601,4 +603,168 @@ fn a_full_frame_over_a_client_with_stale_rows_ends_with_the_frames_values_and_sl
     assert_eq!(world.get::<RemoteSlot>(key(2)), None);
     assert!(!world.contains(key(3)));
     assert!(skipped_of(&skipped).is_empty());
+}
+
+// ---- One entity per entry, and what the hook writes (D141) ----
+
+/// A client at tick 11 that has loaded `REGION`'s document, in which the cooked item is
+/// `OwnedBy` the cooked owner, and an empty `OTHER_REGION`; with the owner's and the item's
+/// keys.
+fn client_with_document() -> (Simulation, Skipped, StableKey, StableKey) {
+    let (mut simulation, skipped) = client(Tick(10));
+    let (owner, item) = (NetId::cooked(REGION.0 * 1000 + 1), NetId::cooked(REGION.0 * 1000 + 2));
+    let document = baseline(vec![
+        BaselineRow { id: owner, components: vec![data(Position { x: 1, y: 0 })] },
+        BaselineRow {
+            id: item,
+            components: vec![
+                data(Position { x: 2, y: 0 }),
+                data(Health(2)),
+                data(OwnedBy { owner: EntityRef::new(StableKey::Net(owner)) }),
+            ],
+        },
+    ]);
+    let empty = baseline(vec![]);
+    let mut store = Store::with(&document);
+    store.baselines.insert(empty.content_hash(), Arc::clone(&empty));
+    let mut frame = StagedFrame::new(Tick(11));
+    frame.regions.insert(REGION, RegionChange::Relevant(relevance(REGION, &document)));
+    frame.regions.insert(OTHER_REGION, RegionChange::Relevant(relevance(OTHER_REGION, &empty)));
+    let (input, accepted) = between_runs(&mut simulation, [frame], &store);
+    assert_eq!(accepted, vec![true]);
+    simulation = step(&executor(2), simulation, input);
+    let (owner, item) = (StableKey::Net(owner), StableKey::Net(item));
+    assert_eq!(owner_of(simulation.world(), item), Some(owner));
+    (simulation, skipped, owner, item)
+}
+
+fn owner_of(world: &lactose_ecs::World, key: StableKey) -> Option<StableKey> {
+    world.get::<OwnedBy>(key).and_then(|value| value.owner.get())
+}
+
+fn destroyed(tick: u32) -> Tombstone {
+    Tombstone { region: REGION, tick: Tick(tick), cause: TombstoneCause::Destroyed }
+}
+
+#[test]
+fn a_released_item_survives_its_former_owners_tombstone() {
+    let (simulation, skipped, owner, item) = client_with_document();
+    // The server released the item, which no frame carries, and destroyed the owner.
+    let mut frame = StagedFrame::new(Tick(12));
+    frame.despawns.insert(owner, destroyed(12));
+    let simulation = apply(simulation, frame);
+    let world = simulation.world();
+    assert!(!world.contains(owner));
+    assert_eq!(world.region_of(item), Some(REGION));
+    assert_eq!(world.get::<Position>(item), Some(&Position { x: 2, y: 0 }));
+    assert_eq!(world.get::<Health>(item), Some(&Health(2)));
+    assert_eq!(owner_of(world, item), Some(owner), "as the document wrote it");
+    // The server's next row of the item is written.
+    let mut frame = StagedFrame::new(Tick(13));
+    assert!(frame.push_row(item, Health::KEY, Tick(13), false, bytes(&Health(20))));
+    let simulation = apply(simulation, frame);
+    assert_eq!(simulation.world().get::<Health>(item), Some(&Health(20)));
+    assert!(skipped_of(&skipped).is_empty());
+}
+
+#[test]
+fn a_released_item_stays_when_its_former_owner_moves() {
+    let (simulation, skipped, owner, item) = client_with_document();
+    let mut frame = StagedFrame::new(Tick(12));
+    frame.moves.insert(owner, OTHER_REGION);
+    let simulation = apply(simulation, frame);
+    let world = simulation.world();
+    assert_eq!(world.region_of(owner), Some(OTHER_REGION));
+    assert_eq!(world.region_of(item), Some(REGION));
+    let mut frame = StagedFrame::new(Tick(13));
+    frame.moves.insert(item, OTHER_REGION);
+    let simulation = apply(simulation, frame);
+    assert_eq!(simulation.world().region_of(item), Some(OTHER_REGION));
+    assert!(skipped_of(&skipped).is_empty());
+}
+
+#[test]
+fn every_entity_of_a_destroyed_tree_leaves_by_its_own_tombstone() {
+    let (simulation, skipped, owner, item) = client_with_document();
+    let mut cursor = simulation.world().structural_log().cursor();
+    let mut frame = StagedFrame::new(Tick(12));
+    frame.despawns.insert(owner, destroyed(12));
+    let simulation = apply(simulation, frame);
+    assert!(!simulation.world().contains(owner));
+    assert!(simulation.world().contains(item), "the owned entity waits for its own entry");
+    let mut frame = StagedFrame::new(Tick(13));
+    frame.despawns.insert(item, destroyed(13));
+    let simulation = apply(simulation, frame);
+    let world = simulation.world();
+    assert!(!world.contains(item));
+    let despawned: Vec<StableKey> = world
+        .structural_log()
+        .since(&mut cursor)
+        .expect("current")
+        .filter_map(|entry| match entry.change {
+            StructuralChange::Despawned { key, .. } => Some(key),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(despawned, vec![owner, item]);
+    assert!(skipped_of(&skipped).is_empty());
+}
+
+#[test]
+fn the_hook_writes_replicated_components_alone() {
+    let (mut simulation, skipped) = client_with_regions();
+    let world = simulation.world_mut();
+    world.spawn(key(2), REGION, (Position { x: 2, y: 0 },)).expect("spawn");
+    world.spawn(key(3), REGION, (Position { x: 3, y: 0 }, Impulse(3))).expect("spawn");
+    let mut frame = StagedFrame::new(Tick(11));
+    // A spawn carrying a derived and an unreplicated transient component as values, and an
+    // upsert of a live key carrying another.
+    let components =
+        vec![data(Position { x: 1, y: 0 }), data(Health(1)), data(Cached(1)), data(Impulse(1))];
+    frame.spawns.insert(net(1), spawn(REGION, Some(1), components));
+    let components = vec![data(Position { x: 3, y: 3 }), data(Grounded(1))];
+    frame.spawns.insert(net(3), spawn(REGION, Some(3), components));
+    // A row of an unreplicated component.
+    assert!(frame.push_row(key(2), Secret::KEY, Tick(11), false, bytes(&Secret(2))));
+    // Statements, which a `Client` world's hook does not read.
+    frame.transient.insert(key(2), BTreeSet::from([Impulse::KEY]));
+    frame.transient.insert(key(3), BTreeSet::new());
+    let simulation = apply(simulation, frame);
+    let world = simulation.world();
+    assert_eq!(world.get::<Position>(key(1)), Some(&Position { x: 1, y: 0 }));
+    assert_eq!(world.get::<Health>(key(1)), Some(&Health(1)));
+    assert_eq!(world.get::<RemoteSlot>(key(1)), Some(&RemoteSlot { slot: slot(1) }));
+    assert!(world.get::<Cached>(key(1)).is_none());
+    assert!(world.get::<Impulse>(key(1)).is_none());
+    assert_eq!(world.get::<Position>(key(3)), Some(&Position { x: 3, y: 3 }));
+    assert!(world.get::<Grounded>(key(3)).is_none());
+    assert!(world.get::<Secret>(key(2)).is_none());
+    assert!(world.get::<Impulse>(key(2)).is_none(), "a statement adds nothing");
+    assert!(world.get::<Impulse>(key(3)).is_some(), "a statement removes nothing");
+    let invalid = ErrorKind::InvalidData;
+    assert_eq!(
+        skipped_of(&skipped),
+        vec![
+            ("unreplicated component", key(1), invalid),
+            ("unreplicated component", key(1), invalid),
+            ("unreplicated component", key(3), invalid),
+            ("unreplicated row", key(2), invalid),
+        ]
+    );
+}
+
+#[test]
+fn a_statement_is_part_of_a_frame() {
+    let mut stated = StagedFrame::new(Tick(1));
+    stated.transient.insert(key(1), BTreeSet::from([Impulse::KEY]));
+    let mut other = StagedFrame::new(Tick(1));
+    other.transient.insert(key(1), BTreeSet::from([Grounded::KEY]));
+    let mut none = StagedFrame::new(Tick(1));
+    none.transient.insert(key(1), BTreeSet::new());
+    assert_ne!(stated, other);
+    assert_ne!(stated, none);
+    assert_ne!(none, StagedFrame::new(Tick(1)));
+    for frame in [&stated, &other, &none] {
+        assert!(!frame.is_empty(), "{frame:?}");
+    }
 }

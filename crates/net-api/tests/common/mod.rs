@@ -65,6 +65,21 @@ pub struct Mover(#[field(id = 1)] pub i32);
 #[derive(PartialEq, Debug)]
 pub struct Secret(#[field(id = 1)] pub i32);
 
+/// Transient and not replicated: what a statement names.
+#[component(key = "test::impulse", transient)]
+#[derive(PartialEq, Debug)]
+pub struct Impulse(#[field(id = 1)] pub i32);
+
+/// Transient and not replicated, the second a statement may name.
+#[component(key = "test::grounded", transient)]
+#[derive(PartialEq, Debug)]
+pub struct Grounded(#[field(id = 1)] pub u32);
+
+/// Derived: rebuilt by its owner, never stated and never sent.
+#[component(key = "test::cached", derived)]
+#[derive(PartialEq, Debug)]
+pub struct Cached(#[field(id = 1)] pub i32);
+
 #[system(name = "test::walk", worlds = [server])]
 pub fn walk(mover: &Mover, position: Mut<Position>, secret: Option<Mut<Secret>>) {
     position.x += mover.0;
@@ -80,6 +95,9 @@ pub fn register_types(types: &mut TypeTable) -> Result<()> {
     types.register::<Marked>()?;
     types.register::<Mover>()?;
     types.register::<Secret>()?;
+    types.register::<Impulse>()?;
+    types.register::<Grounded>()?;
+    types.register::<Cached>()?;
     lactose_net_api::register_types(types)
 }
 
@@ -233,7 +251,8 @@ pub type Skipped = Arc<Mutex<Vec<(&'static str, StableKey, ErrorKind)>>>;
 
 /// `lactose-net`'s hook as the README states it, written through the erased writes:
 /// spawns (upserts for live keys), moves, removals, rows, tombstones, in that order, each
-/// failing entry logged into `skipped` and skipped.
+/// move and tombstone applied to the one entity it names, each failing entry logged into
+/// `skipped` and skipped, and so is a component of a spawn or a row that is not replicated.
 /// How many times each path of the hook ran, by name: `spawn`, `upsert`, `bind`, `slot set`,
 /// `slot removed`, `move`, `remove`, `row` and `tombstone`.
 pub type Paths = Arc<Mutex<BTreeMap<&'static str, usize>>>;
@@ -264,13 +283,13 @@ pub fn apply_frame(world: &mut World, frame: &StagedFrame, skipped: &Skipped, pa
     };
     for (&net, spawn) in &frame.spawns {
         let key = spawn.key(net);
-        if let Err(error) = apply_spawn(world, key, net, spawn, &ran) {
+        if let Err(error) = apply_spawn(world, key, net, spawn, &ran, &skip) {
             skip("spawn", key, error);
         }
     }
     for (&key, &region) in &frame.moves {
         if world.contains(key) && world.region_of(key) != Some(region) {
-            match world.move_to_region(key, region) {
+            match world.move_alone_to_region(key, region) {
                 Ok(()) => ran("move"),
                 Err(error) => skip("move", key, error),
             }
@@ -285,7 +304,9 @@ pub fn apply_frame(world: &mut World, frame: &StagedFrame, skipped: &Skipped, pa
         }
     }
     for row in frame.rows() {
-        if world.contains(row.key) {
+        if !replicated_in(world, row.component) {
+            skip("unreplicated row", row.key, unreplicated());
+        } else if world.contains(row.key) {
             let data = ComponentData { component: row.component, bytes: row.bytes.to_vec() };
             match world.insert_erased(row.key, &data) {
                 Ok(_) => ran("row"),
@@ -301,12 +322,21 @@ pub fn apply_frame(world: &mut World, frame: &StagedFrame, skipped: &Skipped, pa
         if loaded_there {
             ran("tombstone skipped");
         } else if world.contains(key) {
-            match world.despawn(key) {
+            match world.despawn_alone(key) {
                 Ok(()) => ran("tombstone"),
                 Err(error) => skip("tombstone", key, error),
             }
         }
     }
+}
+
+/// Whether `component` is registered and replicated: the only components a frame writes.
+fn replicated_in(world: &World, component: ComponentKey) -> bool {
+    world.registry().get(component).is_some_and(|info| info.tracking().replicated)
+}
+
+fn unreplicated() -> Error {
+    Error::new(ErrorKind::InvalidData, "a frame names a component that is not replicated")
 }
 
 fn apply_spawn(
@@ -315,9 +345,18 @@ fn apply_spawn(
     net: NetId,
     spawn: &StagedSpawn,
     ran: &dyn Fn(&'static str),
+    skip: &dyn Fn(&'static str, StableKey, Error),
 ) -> Result<()> {
+    let mut components = Vec::with_capacity(spawn.components.len());
+    for data in &spawn.components {
+        if replicated_in(world, data.component) {
+            components.push(data.clone());
+        } else {
+            skip("unreplicated component", key, unreplicated());
+        }
+    }
     if world.contains(key) {
-        for data in &spawn.components {
+        for data in &components {
             world.insert_erased(key, data)?;
         }
         match spawn.slot {
@@ -334,7 +373,7 @@ fn apply_spawn(
         ran("upsert");
         return Ok(());
     }
-    world.spawn_erased(key, spawn.region, &spawn.components)?;
+    world.spawn_erased(key, spawn.region, &components)?;
     ran("spawn");
     if let Some(origin) = spawn.origin {
         world.bind(origin, net)?;

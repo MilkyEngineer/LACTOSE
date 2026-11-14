@@ -86,8 +86,7 @@ pub struct StagedFrame {
     /// give the entity each named component it lacks, zeroed, take from it each such
     /// component the statement does not name, and leave a named one it has as it is. A
     /// frame that holds no statement for an entity says nothing of these and they are left
-    /// as they are. The replicated world's hook does not read it: no kernel runs there. A
-    /// facade (D141): nothing reads it until the lane `stream-impl`.
+    /// as they are. The replicated world's hook does not read it: no kernel runs there.
     pub transient: BTreeMap<StableKey, BTreeSet<ComponentKey>>,
     /// Entities that moved between regions, by origin key, with the region they reside in
     /// now: from the gather's `Moved` entries (architecture section 6). The hook applies
