@@ -3,6 +3,7 @@
 
 use core::any::{Any, TypeId};
 use core::marker::PhantomData;
+use core::ops::Range;
 use std::collections::{BTreeMap, BTreeSet};
 
 use bytemuck::{CheckedBitPattern, NoUninit};
@@ -28,8 +29,43 @@ pub(crate) struct EventRecord {
     pub(crate) event: Box<dyn Any + Send + Sync>,
 }
 
-/// Every event type's events this tick, in emission order.
-pub(crate) type EventStore = FixedHashMap<TypeId, Vec<EventRecord>>;
+/// One event type's events this tick, in emission order, with an index by target.
+#[derive(Default)]
+pub(crate) struct EventList {
+    records: Vec<EventRecord>,
+    /// Every target and alias with the index of its record, ascending, so a target's
+    /// records are one run in emission order. Current after [`index`](Self::index).
+    by_target: Vec<(StableKey, u32)>,
+}
+
+/// The list a reader of a type no system has emitted this tick sees.
+static NO_EVENTS: EventList = EventList { records: Vec::new(), by_target: Vec::new() };
+
+impl EventList {
+    /// The empty list.
+    pub(crate) fn empty() -> &'static Self {
+        &NO_EVENTS
+    }
+
+    /// Appends `record`; [`index`](Self::index) brings the index up to date.
+    pub(crate) fn push(&mut self, record: EventRecord) {
+        let at = u32::try_from(self.records.len()).expect("fewer than 2^32 events of a type");
+        self.by_target.push((record.target, at));
+        if let Some(alias) = record.alias.filter(|&alias| alias != record.target) {
+            self.by_target.push((alias, at));
+        }
+        self.records.push(record);
+    }
+
+    /// Sorts the index after a run of pushes. The entries already indexed are one sorted
+    /// run, which the stable sort merges with the new ones in linear time.
+    pub(crate) fn index(&mut self) {
+        self.by_target.sort();
+    }
+}
+
+/// Every event type's events this tick.
+pub(crate) type EventStore = FixedHashMap<TypeId, EventList>;
 
 /// Emits events of type `E`.
 ///
@@ -74,7 +110,7 @@ impl<'r, 'j, E: Event> Fetch<'r, 'j> for EventWriter<'r, E> {
 
 /// Reads the events of type `E` emitted earlier in this tick.
 pub struct Events<'w, E: Event> {
-    records: &'w [EventRecord],
+    list: &'w EventList,
     _event: PhantomData<fn() -> E>,
 }
 
@@ -82,19 +118,30 @@ impl<E: Event> Events<'_, E> {
     /// The events whose target is `key`, in emission order.
     #[must_use]
     pub fn for_target(&self, key: StableKey) -> EventIter<'_, E> {
-        EventIter { records: self.records.iter(), target: Some(key), _event: PhantomData }
+        let entries = &self.list.by_target;
+        let start = entries.partition_point(|&(target, _)| target < key);
+        let len = entries[start..].partition_point(|&(target, _)| target == key);
+        EventIter {
+            records: &self.list.records,
+            order: Order::Indexed(entries[start..start + len].iter()),
+            _event: PhantomData,
+        }
     }
 
     /// Every event, in emission order.
     #[must_use]
     pub fn iter(&self) -> EventIter<'_, E> {
-        EventIter { records: self.records.iter(), target: None, _event: PhantomData }
+        EventIter {
+            records: &self.list.records,
+            order: Order::All(0..self.list.records.len()),
+            _event: PhantomData,
+        }
     }
 
     /// How many events there are.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.records.len()
+        self.list.records.len()
     }
 
     /// Whether there are no events.
@@ -113,7 +160,7 @@ impl<E: Event> SystemParam for Events<'_, E> {
 impl<'r, 'j, E: Event> Fetch<'r, 'j> for Events<'r, E> {
     fn fetch(invocation: &mut Invocation<'r, 'j>, index: usize) -> Self {
         match invocation.take(index) {
-            Slot::ReadEvents(records) => Self { records, _event: PhantomData },
+            Slot::ReadEvents(list) => Self { list, _event: PhantomData },
             _ => mismatch(index),
         }
     }
@@ -121,21 +168,27 @@ impl<'r, 'j, E: Event> Fetch<'r, 'j> for Events<'r, E> {
 
 /// Iterates events in emission order.
 pub struct EventIter<'a, E: Event> {
-    records: core::slice::Iter<'a, EventRecord>,
-    target: Option<StableKey>,
+    records: &'a [EventRecord],
+    order: Order<'a>,
     _event: PhantomData<fn() -> E>,
+}
+
+/// The records an [`EventIter`] visits, by index.
+enum Order<'a> {
+    All(Range<usize>),
+    /// One target's run of the index.
+    Indexed(core::slice::Iter<'a, (StableKey, u32)>),
 }
 
 impl<'a, E: Event> Iterator for EventIter<'a, E> {
     type Item = &'a E;
 
     fn next(&mut self) -> Option<Self::Item> {
-        loop {
-            let record = self.records.next()?;
-            if self.target.is_none_or(|key| record.target == key || record.alias == Some(key)) {
-                return Some(record.event.downcast_ref().expect("events of one type"));
-            }
-        }
+        let index = match &mut self.order {
+            Order::All(range) => range.next()?,
+            Order::Indexed(entries) => entries.next()?.1 as usize,
+        };
+        Some(self.records[index].event.downcast_ref().expect("events of one type"))
     }
 }
 

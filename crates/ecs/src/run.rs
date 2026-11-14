@@ -15,14 +15,14 @@ use crate::access::{Access, AccessKind, AccessTarget};
 use crate::apply::Pending;
 use crate::change::Stamp;
 use crate::command::{ChannelCommand, ChannelStore, CommandBuffer};
-use crate::event::{EventRecord, EventStore, PendingEmission, PresentRecord};
+use crate::event::{EventList, EventRecord, EventStore, PendingEmission, PresentRecord};
 use crate::param::Ctx;
 use crate::region::{ClaimedBy, InRegion, RegionId, RegionMode};
 use crate::rng::LayoutRng;
 use crate::schedule::{Plan, Source, SystemKind, predicts};
-use crate::storage::typed;
+use crate::storage::{RowView, typed};
 use crate::system::{Invocation, ReducerSlot, Slot, SystemDescriptor, mismatch};
-use crate::world::{BETWEEN, ResourceEntry, SLOT_WIDTH, World, WorldKind};
+use crate::world::{BETWEEN, RegionState, ResourceEntry, SLOT_WIDTH, World, WorldKind};
 
 use lactose_reflect::Reflect;
 
@@ -126,12 +126,16 @@ fn execute(state: &mut RunState, ctx: &mut JobContext<'_>) {
     let mut slot = 0;
     for (stage_index, stage) in plan.stages.iter().enumerate() {
         let stamp = enter_slot(world, tick, &mut slot);
-        if tick && stage_index == 0 {
-            world.input_sync(stamp);
-        } else {
-            world.apply(core::mem::take(&mut pending), stamp);
+        {
+            let _span =
+                tracing::trace_span!(target: "casein", "sync_point", stage = stage.name).entered();
+            if tick && stage_index == 0 {
+                world.input_sync(stamp);
+            } else {
+                world.apply(core::mem::take(&mut pending), stamp);
+            }
+            world.permute_rows();
         }
-        world.permute_rows();
         let _span = tracing::trace_span!(target: "casein", "stage", name = stage.name).entered();
         for index in stage.systems.clone() {
             let now = enter_slot(world, tick, &mut slot);
@@ -151,6 +155,7 @@ fn execute(state: &mut RunState, ctx: &mut JobContext<'_>) {
         }
     }
     let stamp = enter_slot(world, tick, &mut slot);
+    let _span = tracing::trace_span!(target: "casein", "sync_point", stage = "closing").entered();
     world.apply(pending, stamp);
     // No channel survives its run (D126): a taker's channel is already empty, and what a
     // channel with readers alone or a skipped taker's holds goes here, so no snapshot
@@ -224,6 +229,16 @@ impl Output {
         }
     }
 
+    /// This output, which an invocation left empty, for another invocation of the same
+    /// table.
+    fn reused(mut self, source: Source, claim: Option<PlayerId>, region: Option<RegionId>) -> Self {
+        debug_assert!(self.is_empty() && self.commands.spawns == 0 && !self.finalize);
+        self.source = source;
+        self.claim = claim;
+        self.commands.region = region;
+        self
+    }
+
     /// Moves the invocation's channel entries into its command buffer, after its commands:
     /// called once the kernel or the finalize has returned, before `is_empty` decides
     /// whether the output is kept, so an invocation whose only output is a channel entry
@@ -252,15 +267,46 @@ fn downgrade<T: ?Sized>(value: &mut T) -> &T {
     value
 }
 
+/// The world resources an invocation's parameters are lent.
+enum Resources<'r> {
+    /// Taken out of the world for the system's run, each lent to one parameter at a time.
+    Taken(Vec<(TypeId, Handle<'r>)>),
+    /// Read by every invocation of a per-entity or per-region system, which writes none.
+    Shared(&'r [(TypeId, &'r (dyn Any + Send + Sync))]),
+}
+
+/// The sinks of one kind, one per parameter, not yet handed out: parameters take theirs
+/// in ascending order, so each splits its own off the front.
+struct SinkCursor<'r, T> {
+    rest: &'r mut [T],
+    /// The parameter index of `rest[0]`.
+    next: usize,
+}
+
+impl<'r, T> SinkCursor<'r, T> {
+    fn new(sinks: &'r mut [T]) -> Self {
+        Self { rest: sinks, next: 0 }
+    }
+
+    fn take(&mut self, index: usize) -> &'r mut T {
+        let rest = core::mem::take(&mut self.rest);
+        let (sink, rest) =
+            rest[index - self.next..].split_first_mut().expect("one sink per parameter");
+        self.rest = rest;
+        self.next = index + 1;
+        sink
+    }
+}
+
 /// Everything an invocation's non-component parameters are made from.
 struct Env<'r, 'j> {
-    resources: Vec<(TypeId, Handle<'r>)>,
+    resources: Resources<'r>,
     events: &'r EventStore,
     channels: &'r ChannelStore,
     commands: Option<&'r mut CommandBuffer>,
-    emit: Vec<Option<&'r mut Vec<EventRecord>>>,
-    present: Vec<Option<&'r mut Vec<PresentRecord>>>,
-    write_channels: Vec<Option<&'r mut Vec<ChannelCommand>>>,
+    emit: SinkCursor<'r, Vec<EventRecord>>,
+    present: SinkCursor<'r, Vec<PresentRecord>>,
+    write_channels: SinkCursor<'r, Vec<ChannelCommand>>,
     /// The stores an exclusive system's `ChannelTake` parameters own, removed from the
     /// world for good.
     takes: Vec<(TypeId, Box<dyn Any + Send + Sync>)>,
@@ -270,7 +316,7 @@ struct Env<'r, 'j> {
 
 impl<'r, 'j> Env<'r, 'j> {
     fn new(
-        resources: Vec<(TypeId, Handle<'r>)>,
+        resources: Resources<'r>,
         events: &'r EventStore,
         channels: &'r ChannelStore,
         output: &'r mut Output,
@@ -283,9 +329,9 @@ impl<'r, 'j> Env<'r, 'j> {
             events,
             channels,
             commands: Some(commands),
-            emit: emit.iter_mut().map(Some).collect(),
-            present: present.iter_mut().map(Some).collect(),
-            write_channels: write_channels.iter_mut().map(Some).collect(),
+            emit: SinkCursor::new(emit),
+            present: SinkCursor::new(present),
+            write_channels: SinkCursor::new(write_channels),
             takes: Vec::new(),
             job,
             world,
@@ -293,8 +339,10 @@ impl<'r, 'j> Env<'r, 'j> {
     }
 
     fn handle(&mut self, type_id: TypeId) -> &mut Handle<'r> {
-        &mut self
-            .resources
+        let Resources::Taken(handles) = &mut self.resources else {
+            unreachable!("a system that shares its resources writes none")
+        };
+        &mut handles
             .iter_mut()
             .find(|(id, _)| *id == type_id)
             .expect("a resource the schedule checked is held for the system's run")
@@ -302,6 +350,13 @@ impl<'r, 'j> Env<'r, 'j> {
     }
 
     fn resource(&mut self, type_id: TypeId) -> &'r (dyn Any + Send + Sync) {
+        if let Resources::Shared(shared) = self.resources {
+            return shared
+                .iter()
+                .find(|(id, _)| *id == type_id)
+                .expect("a resource the schedule checked is held for the system's run")
+                .1;
+        }
         let handle = self.handle(type_id);
         let shared = match core::mem::replace(handle, Handle::Used) {
             Handle::Mut(value) => downgrade(value),
@@ -329,17 +384,13 @@ impl<'r, 'j> Env<'r, 'j> {
                 Slot::ResourceMut(self.resource_mut(type_id))
             }
             (AccessKind::ReadEvents, AccessTarget::Events { type_id, .. }) => {
-                Slot::ReadEvents(self.events.get(&type_id).map_or(&[], Vec::as_slice))
+                Slot::ReadEvents(self.events.get(&type_id).unwrap_or_else(|| EventList::empty()))
             }
-            (AccessKind::EmitEvents, _) => {
-                Slot::EmitEvents(self.emit[index].take().expect("one sink per parameter"))
-            }
+            (AccessKind::EmitEvents, _) => Slot::EmitEvents(self.emit.take(index)),
             (AccessKind::Read, AccessTarget::Channel { type_id, .. }) => {
                 Slot::Channel(self.channels.get(&type_id).map(|stored| &*stored.entries))
             }
-            (AccessKind::WriteChannel, _) => Slot::WriteChannel(
-                self.write_channels[index].take().expect("one sink per parameter"),
-            ),
+            (AccessKind::WriteChannel, _) => Slot::WriteChannel(self.write_channels.take(index)),
             (AccessKind::TakeChannel, AccessTarget::Channel { type_id, .. }) => {
                 // The schedule allows one take of a channel per system.
                 let store = self.takes.iter().position(|(id, _)| *id == type_id);
@@ -348,9 +399,7 @@ impl<'r, 'j> Env<'r, 'j> {
             (AccessKind::Commands, _) => {
                 Slot::Commands(self.commands.take().expect("one `Commands` per system"))
             }
-            (AccessKind::PresentEvents, _) => {
-                Slot::Present(self.present[index].take().expect("one sink per parameter"))
-            }
+            (AccessKind::PresentEvents, _) => Slot::Present(self.present.take(index)),
             (AccessKind::Job, _) => Slot::Job(self.job.take().expect("one `Job` per system")),
             // A `writes` declaration: no parameter fetches it.
             (AccessKind::Writes, _) => Slot::Unit,
@@ -362,8 +411,10 @@ impl<'r, 'j> Env<'r, 'j> {
     }
 }
 
-fn mut_handles(taken: &mut [(TypeId, ResourceEntry)]) -> Vec<(TypeId, Handle<'_>)> {
-    taken.iter_mut().map(|(id, entry)| (*id, Handle::Mut(&mut *entry.value))).collect()
+fn mut_handles(taken: &mut [(TypeId, ResourceEntry)]) -> Resources<'_> {
+    Resources::Taken(
+        taken.iter_mut().map(|(id, entry)| (*id, Handle::Mut(&mut *entry.value))).collect(),
+    )
 }
 
 fn resource_ids(system: &SystemDescriptor) -> Vec<TypeId> {
@@ -465,13 +516,17 @@ fn run_system(
 
     outputs.sort_by_key(|output| (output.source, output.finalize));
     let predicts = predicts(system.worlds());
+    let mut emitted: Vec<TypeId> = Vec::new();
     for output in outputs {
         let table = if output.finalize { system.finalize_access() } else { system.access() };
         for (param, records) in output.events.into_iter().enumerate() {
             let AccessTarget::Events { type_id, .. } = table[param].target() else { continue };
+            if !records.is_empty() && !emitted.contains(&type_id) {
+                emitted.push(type_id);
+            }
             for mut record in records {
                 (record.target, record.alias) = world.event_target(record.target);
-                world.events.get_or_insert_with(type_id, Vec::new).push(record);
+                world.events.get_or_insert_with(type_id, EventList::default).push(record);
             }
         }
         for (param, records) in output.present.into_iter().enumerate() {
@@ -493,6 +548,9 @@ fn run_system(
                 buffer: output.commands,
             });
         }
+    }
+    for type_id in emitted {
+        world.events.get_mut(&type_id).expect("a list the system appended to").index();
     }
 }
 
@@ -617,7 +675,7 @@ fn run_per_region(
         let mut output = Output::new(Source::Region(region), None, Some(region), sinks);
         let mut partial = system.kernel().reducer.map(|reducer| (reducer.identity)());
         {
-            let handles = shared.iter().map(|&(id, value)| (id, Handle::Shared(value))).collect();
+            let handles = Resources::Shared(&shared);
             let mut env =
                 Env::new(handles, &world.events, &world.channels, &mut output, None, None);
             let slots = table
@@ -690,26 +748,44 @@ fn run_per_entity(
     let jobs = layout.order(jobs, (tick.0.into(), system.key().0));
     let mut batches = LayoutRng::new(layout.seed, tick.0.into(), system.key().0);
     let reducer = system.kernel().reducer;
+    // The regions whose rows run: simulated, and holding every region resource the system
+    // reads. Ascending by ID.
+    let admitted: Vec<(RegionId, &RegionState)> = regions
+        .iter()
+        .filter(|(_, state)| {
+            state.mode == RegionMode::Simulated
+                && table.iter().all(|access| match access.target() {
+                    AccessTarget::RegionResource(key) => state.resources.contains_key(&key),
+                    _ => true,
+                })
+        })
+        .map(|(&region, state)| (region, state))
+        .collect();
 
+    // Buffers every row reuses, so a row that emits nothing allocates nothing: the
+    // parameters' columns, the changed columns, the slots, and the output of the last row
+    // that left it empty.
+    let mut params: Vec<Option<usize>> = Vec::with_capacity(table.len());
+    let mut changed_columns: Vec<usize> = Vec::with_capacity(changed.len());
+    let mut spare_slots: Vec<Slot<'static, 'static>> = Vec::with_capacity(table.len());
+    let mut spare_output: Option<Output> = None;
     for (archetype, chunk) in jobs {
         let arch = &mut storage.archetypes[archetype];
         let columns = &arch.columns;
         let column_of = |key| columns.binary_search_by_key(&key, |c| c.key).ok();
         // The column each data parameter is handed; filters on the same component take none.
-        let params: Vec<Option<usize>> = table
-            .iter()
-            .map(|access| match access.kind() {
-                AccessKind::Read
-                | AccessKind::Write
-                | AccessKind::OptionalRead
-                | AccessKind::OptionalWrite => component(access).and_then(column_of),
-                _ => None,
-            })
-            .collect();
+        params.clear();
+        params.extend(table.iter().map(|access| match access.kind() {
+            AccessKind::Read
+            | AccessKind::Write
+            | AccessKind::OptionalRead
+            | AccessKind::OptionalWrite => component(access).and_then(column_of),
+            _ => None,
+        }));
         let region_column = column_of(InRegion::KEY).expect("every row has a region");
         let claim_column = column_of(ClaimedBy::KEY);
-        let changed_columns: Vec<usize> =
-            changed.iter().filter_map(|&key| column_of(key)).collect();
+        changed_columns.clear();
+        changed_columns.extend(changed.iter().filter_map(|&key| column_of(key)));
         let chunk = &mut arch.chunks[chunk];
         // The dispatch of a writing system marks every chunk it is issued over.
         for column in written.iter().filter_map(|&key| column_of(key)) {
@@ -718,27 +794,24 @@ fn run_per_entity(
         }
         let len = chunk.len();
         let mut views = chunk.split(columns);
+        let mut pieces: Vec<Option<RowView<'_>>> = Vec::with_capacity(views.columns.len());
         let mut partial = reducer.map(|reducer| (reducer.identity)());
         for row in 0..len {
             let key = views.keys[row];
-            let mut pieces: Vec<Option<_>> =
-                views.columns.iter_mut().map(|view| Some(view.next_row())).collect();
+            pieces.clear();
+            pieces.extend(views.columns.iter_mut().map(|view| Some(view.next_row())));
             let piece = |column: usize| pieces[column].as_ref().expect("an unused piece");
             let region = typed::<InRegion>(piece(region_column).bytes).region;
-            let Some(state) = regions.get(&region).filter(|s| s.mode == RegionMode::Simulated)
-            else {
+            let Ok(at) = admitted.binary_search_by_key(&region, |&(id, _)| id) else {
                 continue;
             };
+            let state = admitted[at].1;
             let in_window = changed_columns.iter().all(|&column| {
                 piece(column)
                     .stamp()
                     .is_some_and(|stamp| stamp.after(since, now.tick) && now.after(stamp, now.tick))
             });
-            let lacks_resource = table.iter().any(|access| match access.target() {
-                AccessTarget::RegionResource(key) => !state.resources.contains_key(&key),
-                _ => false,
-            });
-            if !in_window || lacks_resource {
+            if !in_window {
                 continue;
             }
             let claim = claim_column.map(|column| typed::<ClaimedBy>(piece(column).bytes).player);
@@ -750,57 +823,69 @@ fn run_per_entity(
                 partials.extend(partial.replace((reducer.identity)()));
             }
 
-            let mut output = Output::new(Source::Entity(key), claim, Some(region), sinks);
+            let source = Source::Entity(key);
+            let mut output = match spare_output.take() {
+                Some(output) => output.reused(source, claim, Some(region)),
+                None => Output::new(source, claim, Some(region), sinks),
+            };
             {
-                let handles =
-                    shared.iter().map(|&(id, value)| (id, Handle::Shared(value))).collect();
-                let mut env = Env::new(handles, events, channels, &mut output, None, None);
-                let slots = table
-                    .iter()
-                    .enumerate()
-                    .map(|(p, access)| {
-                        let view = params[p].and_then(|column| pieces[column].take());
-                        match (access.kind(), access.target(), view) {
-                            (AccessKind::Read | AccessKind::OptionalRead, _, Some(view)) => {
-                                Slot::Read(view.bytes)
-                            }
-                            (AccessKind::Write | AccessKind::OptionalWrite, _, Some(view)) => {
-                                Slot::Write(view, now)
-                            }
-                            (AccessKind::OptionalRead | AccessKind::OptionalWrite, _, None) => {
-                                Slot::Absent
-                            }
-                            (AccessKind::With | AccessKind::Without | AccessKind::Changed, ..) => {
-                                Slot::Unit
-                            }
-                            (AccessKind::Entity, ..) => Slot::Key(key),
-                            (AccessKind::Region, ..) => Slot::Ctx(Ctx::new(
-                                state.seed,
-                                region,
-                                Some(key),
-                                system.key(),
-                                tick,
-                                state.assets.as_ref(),
-                            )),
-                            (_, AccessTarget::RegionResource(resource), _) => {
-                                Slot::Read(state.resources[&resource].bytes.as_bytes())
-                            }
-                            _ => env.slot(p, access),
+                let mut env =
+                    Env::new(Resources::Shared(&shared), events, channels, &mut output, None, None);
+                let mut slots = recycle(core::mem::take(&mut spare_slots));
+                slots.extend(table.iter().enumerate().map(|(p, access)| {
+                    let view = params[p].and_then(|column| pieces[column].take());
+                    match (access.kind(), access.target(), view) {
+                        (AccessKind::Read | AccessKind::OptionalRead, _, Some(view)) => {
+                            Slot::Read(view.bytes)
                         }
-                    })
-                    .collect();
+                        (AccessKind::Write | AccessKind::OptionalWrite, _, Some(view)) => {
+                            Slot::Write(view, now)
+                        }
+                        (AccessKind::OptionalRead | AccessKind::OptionalWrite, _, None) => {
+                            Slot::Absent
+                        }
+                        (AccessKind::With | AccessKind::Without | AccessKind::Changed, ..) => {
+                            Slot::Unit
+                        }
+                        (AccessKind::Entity, ..) => Slot::Key(key),
+                        (AccessKind::Region, ..) => Slot::Ctx(Ctx::new(
+                            state.seed,
+                            region,
+                            Some(key),
+                            system.key(),
+                            tick,
+                            state.assets.as_ref(),
+                        )),
+                        (_, AccessTarget::RegionResource(resource), _) => {
+                            Slot::Read(state.resources[&resource].bytes.as_bytes())
+                        }
+                        _ => env.slot(p, access),
+                    }
+                }));
                 let reducer =
                     partial.as_mut().map_or(ReducerSlot::None, |p| ReducerSlot::Partial(&mut **p));
                 let mut invocation = Invocation::new(slots, reducer);
                 (system.kernel().run)(&mut invocation);
+                spare_slots = recycle(invocation.into_slots());
             }
             output.close_channels();
-            if !output.is_empty() {
+            if output.is_empty() {
+                spare_output = Some(output);
+            } else {
                 outputs.push(output);
             }
         }
         partials.extend(partial);
     }
+}
+
+/// `slots`, emptied, as a vector of other lifetimes, so that one buffer serves every
+/// invocation of a system. The standard library collects a `vec::IntoIter` mapped to a type
+/// of the same layout in place, keeping the allocation; it does not promise to, and were it
+/// to stop, this would allocate and nothing else would change.
+fn recycle<'a, 'b, 'j, 'k>(mut slots: Vec<Slot<'a, 'j>>) -> Vec<Slot<'b, 'k>> {
+    slots.clear();
+    slots.into_iter().map(|_| unreachable!("the vector is empty")).collect()
 }
 
 #[cfg(test)]

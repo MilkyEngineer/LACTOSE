@@ -132,3 +132,28 @@ fn region_resources_are_validated_and_hold_origin_keys() {
     let error = world.update_region_resource::<Boss>(RegionId(77), |_| {}).unwrap_err();
     assert_eq!(error.kind(), lactose_core::ErrorKind::NotFound);
 }
+
+/// A region's entity count is its rows in every archetype, after spawns, a move and a
+/// despawn, under every layout.
+#[test]
+fn a_regions_entity_count_covers_every_archetype() {
+    for layout in [LayoutConfig::default()].into_iter().chain(layouts()) {
+        let mut world = world(WorldKind::Server, layout);
+        world
+            .create_region(RegionConfig { id: OTHER_REGION, seed: 2, mode: RegionMode::Simulated })
+            .unwrap();
+        for id in 1..=30 {
+            let region = if id % 3 == 0 { OTHER_REGION } else { REGION };
+            match id % 4 {
+                0 => world.spawn(net(id), region, (pos(0, 0),)).unwrap(),
+                1 => world.spawn(net(id), region, (pos(0, 0), Counter(id))).unwrap(),
+                _ => world.spawn(net(id), region, (Counter(id),)).unwrap(),
+            }
+        }
+        let count = |world: &lactose_ecs::World, region| world.region(region).unwrap().entity_count;
+        assert_eq!((count(&world, REGION), count(&world, OTHER_REGION)), (20, 10), "{layout:?}");
+        world.move_to_region(net(1), OTHER_REGION).unwrap();
+        world.despawn(net(3)).unwrap();
+        assert_eq!((count(&world, REGION), count(&world, OTHER_REGION)), (19, 10), "{layout:?}");
+    }
+}

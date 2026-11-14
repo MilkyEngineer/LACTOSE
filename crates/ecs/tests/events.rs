@@ -445,3 +445,105 @@ fn a_finalize_an_exclusive_and_a_once_per_tick_writer_reach_a_later_stage() {
         assert_eq!(take_seen(&mut world), [(net(600), 0), (net(503), 0), (net(700), 0)]);
     }
 }
+
+/// What `read_by_target` found: the key asked, then each event's source and amount.
+type Found = Mutex<Vec<(StableKey, StableKey, i32)>>;
+
+/// The predicted entity of `for_target_finds_each_targets_events_in_emission_order`, bound
+/// to `Net` key 77.
+fn predicted() -> StableKey {
+    StableKey::Predicted(lactose_core::PredictionKey {
+        player: PLAYER,
+        input_tick: lactose_core::Tick(4),
+        ordinal: 1,
+    })
+}
+
+fn bound_net() -> StableKey {
+    StableKey::Net(lactose_core::NetId::from_bits(77).unwrap())
+}
+
+/// The targets a source with counter `c` hits: two from the first emitter, one from the
+/// second; the predicted entity by its origin key or by its bound `Net` key.
+fn first_targets(c: u64) -> [(StableKey, i32); 2] {
+    let other = if c.is_multiple_of(2) { bound_net() } else { predicted() };
+    [(net(c % 3 + 1), c as i32), (other, c as i32 + 100)]
+}
+
+#[system(name = "test::spread_first", worlds = [server])]
+fn spread_first(damage: EventWriter<Damage>, key: StableKeyOf, counter: &Counter) {
+    for (target, amount) in first_targets(counter.0) {
+        damage.emit(Damage { target, source: *key, amount });
+    }
+}
+
+#[system(name = "test::spread_second", worlds = [server], after = spread_first)]
+fn spread_second(damage: EventWriter<Damage>, key: StableKeyOf, counter: &Counter) {
+    let amount = counter.0 as i32 + 200;
+    damage.emit(Damage { target: net(counter.0 % 3 + 1), source: *key, amount });
+}
+
+#[system(name = "test::read_by_target", worlds = [server], after = [spread_first, spread_second])]
+fn read_by_target(events: Events<Damage>, found: Res<Found>) {
+    let mut found = found.lock().unwrap();
+    let asked = (1..=7).map(net).chain([predicted(), bound_net(), net(99)]);
+    for key in asked {
+        for event in events.for_target(key) {
+            found.push((key, event.source, event.amount));
+        }
+    }
+}
+
+fn run_by_target(layout: LayoutConfig) -> Vec<(StableKey, StableKey, i32)> {
+    let executor = executor();
+    let mut world = world(WorldKind::Server, layout);
+    for id in [6, 3, 1, 5, 2, 4] {
+        world.spawn(net(id), REGION, (Counter(id),)).unwrap();
+    }
+    world.spawn(predicted(), REGION, (Counter(7),)).unwrap();
+    let StableKey::Predicted(key) = predicted() else { unreachable!() };
+    let StableKey::Net(id) = bound_net() else { unreachable!() };
+    world.bind(key, id).unwrap();
+    world.insert_service::<Found>(Box::new(Mutex::new(Vec::new())));
+    let mut builder = Schedule::builder(WorldKind::Server);
+    builder.stage("emit", &[]).add(&READ_BY_TARGET).add(&SPREAD_SECOND).add(&SPREAD_FIRST);
+    let mut schedule = builder.build().unwrap();
+    world = tick(&mut schedule, world, &executor);
+    std::mem::take(&mut *world.service_mut::<Found>().unwrap().get_mut().unwrap())
+}
+
+/// `for_target` finds a target's events, from every emitting system, by its origin key and,
+/// for a bound predicted entity, by its `Net` key as well, in emission order: (emitting
+/// system, source key, sequence). Computed here from the emitters' rules, independently of
+/// the index the world keeps.
+#[test]
+fn for_target_finds_each_targets_events_in_emission_order() {
+    let sources: Vec<(StableKey, u64)> =
+        (1..=6).map(|id| (net(id), id)).chain([(predicted(), 7)]).collect();
+    let mut emitted: Vec<(StableKey, StableKey, i32)> = Vec::new();
+    for &(source, c) in &sources {
+        for (target, amount) in first_targets(c) {
+            emitted.push((target, source, amount));
+        }
+    }
+    for &(source, c) in &sources {
+        emitted.push((net(c % 3 + 1), source, c as i32 + 200));
+    }
+    let origin = |key: StableKey| if key == bound_net() { predicted() } else { key };
+    let asked = (1..=7).map(net).chain([predicted(), bound_net(), net(99)]);
+    let expected: Vec<(StableKey, StableKey, i32)> = asked
+        .flat_map(|key| {
+            emitted
+                .iter()
+                .filter(move |&&(target, ..)| origin(target) == origin(key))
+                .map(move |&(_, source, amount)| (key, source, amount))
+        })
+        .collect();
+    // 21 events: 14 to `Net` targets, found once; 7 to the predicted entity, found by both keys.
+    assert_eq!(expected.len(), 14 + 2 * 7);
+
+    assert_eq!(run_by_target(LayoutConfig::default()), expected);
+    for layout in layouts() {
+        assert_eq!(run_by_target(layout), expected, "{layout:?}");
+    }
+}
