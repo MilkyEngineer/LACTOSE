@@ -225,6 +225,7 @@ fn a_journal_replayed_by_a_small_driver_reproduces_the_hashes() {
     let mut driver = Driver::default();
     let mut journal = Journal {
         checkpoint,
+        binds: BTreeMap::new(),
         tables: BTreeMap::new(),
         modes: BTreeMap::new(),
         players: BTreeMap::new(),
@@ -313,8 +314,17 @@ fn record_from(
         .within(cell_of(region_at(2, 2)), 100)
         .filter(|&region| simulation.lifecycle().is_requested(region))
         .collect();
-    let mut journal =
-        Journal { checkpoint, tables, modes, players, held_joins, requested, frames: Vec::new() };
+    // No entity of the program has a predicted origin, so its world holds no bind.
+    let mut journal = Journal {
+        checkpoint,
+        binds: BTreeMap::new(),
+        tables,
+        modes,
+        players,
+        held_joins,
+        requested,
+        frames: Vec::new(),
+    };
     let mut hashes = Vec::new();
     let mut seen = Vec::new();
     for tick in at + 1..=at + after {

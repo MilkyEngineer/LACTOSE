@@ -396,16 +396,20 @@ tick N        tick N+1 simulation ───────────────�
   next save records. Entities owned by another entity (inventory items, attachments) migrate with
   their owner and are despawned with it; writing `OwnedBy` moves nothing, so an owned entity may
   reside in another region than its owner, where `OwnedBy` is a weak cross-region reference like
-  any other. That is the rule of the world that simulates them. A client's worlds apply the
-  server's structural log entry by entry, each tombstone and each move to the one entity it
-  names, because a client holds `OwnedBy` only as each region's document stated it (D141).
+  any other, except in a save: an owner is written as its `NetId`, where every other reference
+  is written as the origin key it holds, and is stored at a load as the origin key that `NetId`
+  names in the loading world (section 7). That is the rule of the world that simulates them. A
+  client's worlds apply the server's structural log entry by entry, each tombstone and each move
+  to the one entity it names, because a client holds `OwnedBy` only as each region's document
+  stated it (D141).
 - **Region modes**: `Simulated`, `Replicated` (rows written only at the input sync point from
   staged network state), `Frozen`. The input sync point is the first sync point of a tick,
   before any stage runs; it is where the time scale, asset version tables, region bundles and
   mode changes, sessions, inputs and staged network state are applied.
 - **Relationships** are components holding `StableKey` with a reverse index maintained at
   command apply and included in snapshots. Cross-region references are weak and validated at apply.
-- **Resources** are singletons with declared access.
+- **Resources** are singletons with declared access. A world resource holds no entity reference
+  (section 8.3).
 - **Queries** are generic over component tuples and monomorphise.
 - **Transient columns** are zeroed by the ECS at the input sync point every tick, and the
   scheduler checks statically that every reader of a transient column is ordered after a
@@ -507,17 +511,29 @@ contract and D114 records the choices this section left open.
 |---|---|---|---|
 | `EntityId` | one process | process-local allocator, index plus generation, `NonZeroU64` so `Option` is free | storage lookup only; never on the wire or disk |
 | `StableKey` | everywhere a reference is stored | enum: `Net(NetId)`, `Predicted(PredictionKey)`, `Placeholder(u32)` within one command buffer | `EntityRef` fields, relationships, render slots, event targets, RNG keys, ordering ties |
-| `NetId` | server and all clients, and saves | 64-bit with a tag bit. Cooked: hash of (authored scene GUID, authored placement GUID, child path of authored GUIDs), so clients derive it without a message and re-cooking preserves it. Every element is a GUID stored in the authored file, never a name, path or index, so renaming a scene or reordering siblings preserves the ID. Runtime: one server counter, assigned at command apply and persisted in the save | the `Net` arm of `StableKey`; the persistent ID of every entity that has one. There is no separate `PersistentId` |
+| `NetId` | server and all clients, and saves | 64-bit with a tag bit. Cooked: hash of (authored scene GUID, authored placement GUID, child path of authored GUIDs), so clients derive it without a message and re-cooking preserves it. Every element is a GUID stored in the authored file, never a name, path or index, so renaming a scene or reordering siblings preserves the ID. Runtime: one server counter, assigned at command apply and persisted in the save; a runtime ID a world is given any other way, by a direct spawn, a load or a bind, moves the counter past it, so the counter is above every runtime ID in use | the `Net` arm of `StableKey`; the persistent ID of every entity that has one. There is no separate `PersistentId` |
 | `PredictionKey` | one client plus the server | (player ID, input tick, ordinal), where the input tick is the slot the player's input is applied for this tick and the ordinal is a hash of the spawning invocation (the source entity's origin key, the system key, the spawn's index within the invocation), for a spawn commanded from an entity the player has claimed by a system that runs in both the server and the prediction world; a hash of the invocation rather than a position in the command order, so a spawn the other machine cannot reproduce shifts nothing. The server records it as the entity's permanent origin key, persisted as a component so a save or a region overlay carries it, and stored references hold origin keys so a load changes no bytes | the `Predicted` arm of `StableKey` until the server binds a `NetId`; RNG and ordering use the origin key on both machines, so binding changes nothing. A predicted spawn the server never echoes is destroyed when the processed-input acknowledgement passes its input tick |
 | `SystemKey` | build | xxh64 of the declared system name, collision-checked | command order ties, RNG stream selection |
 | `ComponentKey` | build, wire, disk | xxh64 of the declared component name, collision-checked | registry, protocol hash, save records |
 | `PlayerId` | session | server-assigned on join | prediction keys, interest sets, input queues |
 
-Typed reference fields (`EntityRef` holding `StableKey`, `AssetRef` holding `AssetId`) are
-known to the registry and remapped on load, so the bulk-copy load path is a copy plus a remap
-pass. The prediction world keeps its prediction-to-network alias table across a rollback
-restore, since a bind is a fact from the server, and a bind for an entity the restore removed
-applies again when re-simulation respawns it.
+Typed reference fields (`EntityRef` holding `StableKey`, `AssetRef` holding `AssetId`) are known
+to the registry, so generic code can find them: command apply resolves a placeholder and writes
+a bound `Net` key as its origin key, a direct write and a bind do the same for a `Net` key, and
+the world hash reads both kinds. No load rewrites the references of the rows it loads: an
+`EntityRef` holds an origin key and an `AssetRef` an `AssetId`, the hash of the asset's declared
+name, each the same on every machine, and each is exported and loaded as it is, so the bulk-copy
+load path is a copy. The one exception is an owner, which a save writes as its `NetId` and a
+load resolves through the document's own rows or the world's binds (section 6). The binds a load
+makes rewrite the `Net` keys of other rows as any bind does. The prediction world keeps its
+prediction-to-network alias table across a rollback restore, since a bind is a fact from the
+server, and a bind for an entity the restore removed applies again when re-simulation respawns
+it. A server holds the bind of an entity for as long as the entity exists, live or in the saved
+state of an unloaded region, and drops it at the end of the step that despawned it, or of the
+next step for a despawn between steps. A save holds each bind as the entity's persisted origin
+key, and a world that starts from a save, or a replay from a journal's checkpoint, is given
+every bind of the save before its first region loads, since without the owner's bind a row loads
+to other bytes than its export read (D142).
 
 ## 8. Determinism
 
@@ -656,11 +672,13 @@ key, component key, field ID, canonical value) through a monomorphised per-type 
 chunk jobs when forked, and the row hashes fold by addition, so no sort is needed and the
 hash is identical under any layout. It covers persistent and transient columns and region
 resources, and the region's seed, mode and asset version table; derived columns and
-resources are excluded, and world resources are neither hashed nor saved: a world resource
-is configuration or session state and must be `derived`, and world-global persistent state
-is a resource of a pinned region. It runs at sync points, and a field-level diff is produced only on
-mismatch. Hashing `physics-api::snapshot` bytes is added once Rapier's serialisation is shown
-to be order-stable.
+resources are excluded, and world resources are neither hashed nor saved: a world resource is
+configuration or session state, must be `derived` and holds no entity reference, since a bind
+and a restore rewrite the references of rows and region resources alone, so
+`World::insert_resource` does not build for a type that holds one (D142), and world-global
+persistent state is a resource of a pinned region. It runs at sync points, and a field-level
+diff is produced only on mismatch. Hashing `physics-api::snapshot` bytes is added once Rapier's
+serialisation is shown to be order-stable.
 
 The harness, named SOUR, runs every simulation test in these modes and fails on any mismatch:
 
@@ -893,7 +911,8 @@ closing sync point of a run clears every channel after it applies the last stage
 nothing but rows carries simulation state across a tick boundary (D126).
 
 The server never rolls back. Save snapshots copy persistent columns only (section 15.3); a
-journal checkpoint carries the physics snapshot beside them (section 15.5).
+journal checkpoint carries the physics snapshot and the server's binds beside them (section
+15.5).
 
 `physics-api` conformance: run ten ticks, snapshot at tick three, restore, re-run, hash equal
 at tick ten. The cost is measured in milestone 1 and the prediction world is sized from it.
@@ -1104,27 +1123,32 @@ Baseline and overlay documents carry, for each component they hold, its schema v
 size and field layout (field ID, offset, size), so the binary keeps no historical layouts. A save
 carries beside each type's schema the digest of its full layout (D129), which the field layout alone
 cannot tell from a same-size change; equal versions with different digests are refused. Matching
-schema takes the bulk-copy-plus-remap fast path; mismatched schema decodes by field ID and runs
-migrations in version order. A migration is one registered step per type and version read, over the
-value's fields by ID; the result is assembled under the current layout and validated; a transient
-type is taken by presence and never migrated (D129). After load, change ticks are rebased
-(section 6).
+schema takes the bulk-copy fast path; mismatched schema decodes by field ID and runs migrations
+in version order. A migration is one registered step per type and version read, over the value's
+fields by ID; the result is assembled under the current layout and validated; a transient type
+is taken by presence and never migrated (D129). After load, change ticks are rebased (section
+6).
 
 ### 15.5 Enforcement
 
 - Test: the original performs an in-place reload at tick T; a fresh process loads the save;
-  both run K ticks and must hash identically.
+  both run K ticks and must hash identically. The fresh process may leave any saved region
+  unloaded, as an `Anchored` resume does.
 - Test: unload and reload a region; persistent columns match.
 - Test: load a save from the previous schema version through its migration.
 - Test: the fresh process is also compared against the un-reloaded original after K ticks,
   bit-exact for discrete state and within a stated tolerance for continuous state, so a
-  reload is shown not to change gameplay outcomes. This holds because network IDs and the
-  server counter are persisted, so RNG streams and ordering survive a load.
+  reload is shown not to change gameplay outcomes. This holds because network IDs, predicted
+  origins and the server counter are persisted and the loading world is given every bind of the
+  save before its first region loads (section 7), so stored references, RNG streams and ordering
+  survive a load.
 
 Journal replay (checkpoint plus input journal) is a debug and replay tool, not the save
 system. A checkpoint carries the physics snapshot of section 10 as bytes, since the solver
 holds state the rows do not carry (section 16) and a replay from a checkpoint without it
-hashes equal only until the first contact; a replay from a session's start needs none.
+hashes equal only until the first contact; a replay from a session's start needs none. It also
+carries the server's binds at the checkpoint, since a checkpoint's regions are the loaded ones
+alone (D142).
 
 The server owns the save in multiplayer. Player portability between hosts is an open item.
 

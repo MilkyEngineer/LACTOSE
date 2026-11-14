@@ -2,12 +2,12 @@
 //! `RegionBundle` the input sync point loads, migrated to the registry's schemas and
 //! validated first, so a refused region changes nothing.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use lactose_asset_api::PinnedTable;
 use lactose_bundle::{Baseline, ComponentData, ComponentSchema, Record};
-use lactose_core::{ComponentKey, Error, ErrorKind, NetId, Result};
+use lactose_core::{ComponentKey, Error, ErrorKind, NetId, PredictionKey, Result};
 use lactose_ecs::RegionMode;
 use lactose_reflect::{Persistence, TypeInfo, TypeRole};
 use lactose_sim::RegionBundle;
@@ -222,6 +222,45 @@ impl<'a> Loader<'a> {
             transient_resources: records.transient_resources,
             assets,
         })
+    }
+
+    /// The binds of a saved world (architecture section 7; D142): for every entity that
+    /// `sections` hold with a predicted origin, its prediction key and its `NetId`.
+    /// `sections` are the records of every region of one save, the regions that were
+    /// loaded at the save point and the ones kept unloaded alike (a container's sections,
+    /// a server's save point), each at the registry's schemas, as
+    /// [`migrate`](Self::migrate) leaves them. The result goes to
+    /// `SimulationBuilder::binds` beside the header's tick and counter, so the world holds
+    /// every bind of the save before its first region loads; a journal records the same
+    /// value at its checkpoint (`lactose_sim::journal::Journal::binds`).
+    ///
+    /// A save needs no field for them: a section holds a predicted origin as the
+    /// `ecs::predicted_origin` component of a record that carries whole components, a
+    /// `Spawn` (a predicted spawn is a runtime entity) or, for a predicted entity bound to
+    /// a cooked `NetId`, a `SpawnFromBaseline` or an `AddComponent`. Each such record gives
+    /// one pair, the key from the component's `player`, `input_tick` and `ordinal` and the
+    /// `NetId` the record's own. No other record is read and no baseline:
+    /// `World::load_region` refuses a baseline that carries the component, so the pairs are
+    /// exactly the binds the loads of `sections` would make, whichever load and in whatever
+    /// order, and they are every bind the saving world held between two steps, with no
+    /// unjournaled edit since the last (`README.md`, "Binds").
+    ///
+    /// Fails with `InvalidData` for records that fail [`RegionRecords::check`]; for a value
+    /// that is not a valid `PredictedOrigin`; and for one prediction key held under two
+    /// `NetId`s, in one section or in two, or one `NetId` under two prediction keys in two
+    /// sections, naming the key, the `NetId`s and the regions in the order given: no
+    /// world's export holds either, and the load of the second row would be refused. Fails
+    /// with `VersionMismatch` for a section that carries the component at another schema
+    /// or layout digest than the table's ([`migrate`](Self::migrate) first), and with
+    /// `NotFound` if a section carries it and the table lacks the type. One pass over the
+    /// records with a binary search among the components of each record that carries
+    /// whole components; nothing else is decoded.
+    #[expect(unused_variables, reason = "facade (D142): the lane `binds-impl` writes the body")]
+    pub fn binds<'r>(
+        &self,
+        sections: impl IntoIterator<Item = &'r RegionRecords>,
+    ) -> Result<BTreeMap<PredictionKey, NetId>> {
+        todo!("D142: the lane `binds-impl`")
     }
 
     /// Validates `data`, a value the migrated records carry; a transient one counts by

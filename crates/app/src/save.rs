@@ -81,7 +81,11 @@ pub struct SavedWorld {
 /// section in ascending region order `Loader::bundle(&records, baseline, RegionMode::Frozen,
 /// None)` to validate the section (the bundle is dropped: a save that cannot load fails
 /// here, before any world exists, not at the step that reloads a region hours in) and
-/// `Loader::migrate(&records)` as the entry's records. Synchronous, on the thread that
+/// `Loader::migrate(&records)` as the entry's records. From the lane `binds-impl` on (D142;
+/// a facade until then), `Loader::binds` then runs over the migrated records of every
+/// section and its result is dropped: a save whose sections bind one prediction key to two
+/// `NetId`s fails here with `InvalidData`, and `build_server` reads the binds again from
+/// the `SavedWorld`, as it does for one a save point produced. Synchronous, on the thread that
 /// starts the binary, before any world exists: the registry a load needs is the world's,
 /// and the tick and counter it yields are the builder's. The first error ends the load
 /// with nothing built; the policy's response to [`Source::Load`](crate::Source::Load) is

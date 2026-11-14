@@ -14,7 +14,9 @@
 //! # Status
 //!
 //! Implemented (D129): every item of the surface does what `README.md` states, and its
-//! "Proof for milestone 1" table names the tests that hold it.
+//! "Proof for milestone 1" table names the tests that hold it. One item is a facade:
+//! [`Loader::binds`] (D142) has its final signature and contract and a `todo!()` body until
+//! the lane `binds-impl`.
 //!
 //! # Where to start
 //!
@@ -29,8 +31,9 @@
 //!   region is an [`EncodedSection`] made on a worker and assembled, and read back by the
 //!   index and one section at a time.
 //! - [`Migrations`] holds each crate's [`Migration`] steps; a [`Loader`] migrates a
-//!   region's records to the registry's schemas and builds the `RegionBundle` the sync
-//!   point loads.
+//!   region's records to the registry's schemas, reads the binds the world must hold
+//!   before its first region loads ([`Loader::binds`]) and builds the `RegionBundle` the
+//!   sync point loads.
 //!
 //! ```no_run
 //! use std::sync::Arc;
@@ -55,10 +58,15 @@
 //! }
 //! let bytes = Container::assemble(&header, sections)?; // `app` writes these: temp file, sync, rename
 //!
-//! // The load: the header into the builder, one bundle per region into `TickInput::loaded`.
+//! // The load: the header and the save's binds into the builder, one bundle per region into
+//! // `TickInput::loaded`.
 //! let container = Container::decode(&bytes)?;
 //! let migrations = Migrations::new();
 //! let loader = Loader::new(&schemas, &migrations);
+//! let migrated: Vec<RegionRecords> =
+//!     container.regions().map(|records| loader.migrate(records)).collect::<Result<_, _>>()?;
+//! let binds = loader.binds(&migrated)?; // `SimulationBuilder::binds`, before any region loads
+//! # let _ = binds;
 //! for records in container.regions() {
 //!     let baseline = baseline_of(records.region);
 //!     let bundle = loader.bundle(records, baseline, RegionMode::Simulated, None)?;

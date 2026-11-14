@@ -10,7 +10,9 @@
 //!
 //! Implemented: every behaviour the README states runs and is tested, and the simulation
 //! tests of `tests/` record their hashes under SOUR. Nothing is optimised; the world hash
-//! is sequential outside the crate's own pass.
+//! is sequential outside the crate's own pass. The additions of D142 are a facade until the
+//! lane `binds-impl`: [`SimulationBuilder::binds`] has its final signature and contract and
+//! a `todo!()` body, and the README marks each sentence that is not yet true.
 //!
 //! # Where to start
 //!

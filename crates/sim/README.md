@@ -21,6 +21,12 @@ and what the two design reviews changed. `crates/ecs/README.md` is the storage c
 this crate builds on and never restates: what it says about the input sync point, regions,
 snapshots, exports and change tracking holds here unchanged.
 
+**The additions of D142 are a facade** until the lane `binds-impl` implements them:
+`SimulationBuilder::binds` has its final signature and a `todo!()` body,
+`journal::Journal::binds` is a field no shipped code fills yet, and every sentence below
+that is not yet true is marked "(D142; facade)". "Proof for D142" names the tests that
+will hold them.
+
 Amending a signature is allowed in the change that needs it. Say so in the change description
 and list what changed, because `app`, `predict`, `net`, `persist`, `physics-api`, `anim`,
 `input` and the game crates are written against this surface. `tests/consumers.rs` and
@@ -37,6 +43,7 @@ breaks one is a signature change to list.
 | `Simulation::step`, `Step`, `TickInput` | One tick from one frame of input, the unit of everything that enters the boundary |
 | `Simulation::run_passes`, `PassRun` | A frame's passes between ticks |
 | `Simulation::save_point`, `SavePointRun`, `SavePoint` | The save copy of every loaded region at a sync point |
+| `SimulationBuilder::binds` | The binds a world starts with: on a load, those of the saved world, bound before its first region loads (D142; facade) |
 | `RunError` | How a run fails: the error, and the simulation when nothing ran |
 | `Stage`, `Pass`, `Registration`, `StageBuilder`, `sets::INPUT` | The four stages of the tick schedule, the two passes, how a registration function adds to them and how `app` orders other crates' sets, and the one set a consumer orders itself after at the sync point |
 | `PlayerSample`, `InputApplier` | A player's quantised input for a tick, and the hook that writes the typed component |
@@ -74,7 +81,7 @@ slot, the lifecycle slot, the save slot). No consumer can name a system or the l
 | `input` | How a per-tick batch of inputs reaches the sync point; where the typed write happens | `TickInput::inputs` as `PlayerSample` bytes by player; `InputApplier` beside the component's definition |
 | `net-api`, `net` | Apply staged state at the sync point; the gather as a pass; spawn with the server's key and bind; sessions | `StagedState` on a client; `net-api`'s `net::gather` system, placed by `lactose_net_api::register_systems`, copies the rows changed since its `ChangeMark` and the structural log since its `LogCursor` into `GatherState`'s frame; `&mut World` inside the hook; `TickInput::sessions` on the server |
 | `predict` | The deterministic step to re-run; snapshot, restore, horizon; the proxy update at the sync point | `step` with the ring's `TickInput`s; `world_mut()` between runs; `StagedState` in the prediction world; `StreamingAnchor` on the local player's entity; `app` runs `run_passes` on the prediction world too |
-| `persist` | Save at a sync point into records; load through the one path an unload uses | `save_point` → `SavePoint { tick, next_net_id, regions }`; `SimulationBuilder::{tick, next_net_id}` plus `TickInput::loaded`; `RegionLifecycle::take_exports` on unload |
+| `persist` | Save at a sync point into records; load through the one path an unload uses; a world that holds the save's binds before its first region loads | `save_point` → `SavePoint { tick, next_net_id, regions }`; `SimulationBuilder::{tick, next_net_id, binds}` plus `TickInput::loaded`; `RegionLifecycle::take_exports` on unload |
 | Region lifecycle | Policy inputs and outputs as data, testable without `net` or `asset` | Inputs: `StreamingAnchor` rows, joins, `RegionPolicy`, `RegionAtlas`, pinned regions, `TickInput::{loaded, assets}`; outputs: `RegionLifecycle::{take_requests, take_exports, take_load_failures, take_session_failures, take_asset_failures}` and the modes on the world |
 | The world hash | `world_hash(region) -> u64`, per-type hashers from the erased registry, a diff on mismatch | `Simulation::world_hash`, `Hashers` filled by `TypeTable::register`, `RegionDigest::diff` |
 | SOUR | Build from the session, run ticks, record a hash per tick, write the chaos log | `harness::layout_mode`, `harness::layout_mode_of`, `harness::run_recorded`, `Simulation::hash`; the glue is `tests/sour_glue.rs` |
@@ -197,8 +204,10 @@ exclusive systems of the input sync point are listed by name in
 
 `Simulation::step(executor, input)` does the following, in this order, and nothing else:
 
-1. On a `Server` or `Client` world, `World::set_rollback_horizon(tick)` with the current
-   tick, since neither rolls back; the prediction world's horizon is `lactose-predict`'s.
+1. On a `Client` world, `World::set_rollback_horizon(tick)` with the current tick, since it
+   never rolls back; the prediction world's horizon is `lactose-predict`'s, and a `Server`
+   world's is step 5 (D142; facade: until the lane `binds-impl` a `Server` world's horizon
+   is set here too, to the current tick, and there is no step 5).
 2. Puts `input` where the sync point systems take it, and runs the tick schedule with
    `Schedule::run_tick`. The first stage's sync point is the input sync point: the ECS
    zeroes transient columns and clears events and input ticks (every channel is already
@@ -220,7 +229,17 @@ exclusive systems of the input sync point are listed by name in
 4. On a `Server` world, takes and drops the presentation events, so the queue does not
    grow (architecture section 9.4) whatever drives the steps; every other kind leaves them
    for `predict` or presentation.
-5. Resolves with the simulation at the new tick.
+5. On a `Server` world, `World::set_rollback_horizon` with the tick after the one just run
+   (D142; facade). A server never rolls back and an entity it despawned never returns, so
+   the step ends by passing the horizon over every despawn up to and including its own
+   tick, and the world drops the bind of each despawned entity that had a predicted
+   origin: between steps a server holds no bind of an entity despawned in a step, and one
+   despawned through `world_mut()` between steps, an unjournaled edit, keeps its bind
+   until the next step ends ("Saves and loads", the binds of a save). The delivered
+   presentation-event keys the same call prunes are
+   those of the events step 4 dropped. A `Client` world keeps step 1: it exports and saves
+   nothing, so nothing there rests on when a despawned entity's bind goes.
+6. Resolves with the simulation at the new tick.
 
 `Simulation::run_passes(executor)` prepares the `Pass::Extract` and `Pass::Gather`
 schedules, then runs each with `Schedule::run_pass`, in that order and only if a system
@@ -454,7 +473,44 @@ does not export, and `take_exports` is always empty there.
   that error and the simulation inside, unchanged, since an export reads and writes
   nothing. An unload that cannot export keeps the region loaded and logs the error rather
   than lose its state.
-- A load is `SimulationBuilder::tick(saved.tick).next_net_id(saved.next_net_id)` and then,
+- The binds of a save (architecture section 7; D142; facade). A save writes an owner as
+  its `NetId`, the one reference it does not write as stored, and `World::load_region`
+  stores the origin key that `NetId` names in the world it loads into: the key of the
+  document's own row, or what the world's binds say. So a region loads to the bytes its
+  export read only in a world that already holds the bind of every owner its rows name;
+  and a `Server` world also reads its binds at a direct write of `OwnedBy`, where an owner
+  that is a predicted origin with no bind is refused (D141, itself a facade until the lane
+  `stream-impl`). A world that starts from a save therefore starts with the save's binds,
+  `SimulationBuilder::binds`: one for every entity with a predicted origin in any saved
+  region, loaded at the save point or kept unloaded, which `lactose-persist` reads from
+  the regions' records (`Loader::binds`: each such entity's record carries its
+  `PredictedOrigin`), bound at `build` in ascending prediction-key order before anything
+  is inserted. That is every bind the saving world held. Between steps, with no
+  unjournaled edit since the last, a `Server` world holds a bind for exactly the entities
+  with a predicted origin that reside in a loaded region or in the kept state of one that
+  is not loaded (an unload's export, or a section of the save the world started from): it
+  starts with the save's binds, binds at command apply and at a load, an unload keeps the
+  binds of what it exports, and step 5 of `step` drops the bind of what was despawned. So
+  a fresh process, an in-place reload and the world that was never saved store the same
+  owners and refuse the same writes, whichever regions each has loaded: under `Directed`,
+  where the first frame loads every saved region, and under `Anchored`, where a resume
+  loads the pinned regions and the rest stay in `app`'s store until a player comes near.
+  Two cases fall outside it. An entity despawned through `world_mut()` between steps, an
+  unjournaled edit, keeps its bind until the next step ends. And an entity that leaves
+  the world without a despawn keeps its bind for good, since an unload is not a death:
+  one that a region replaced in one frame under `Directed` (unloaded and loaded again by
+  one frame) held and the replacing bundle lacks, or one of an export its driver
+  discards. A process started from a later save has no such bind, so a row that still
+  names such an entity as its owner loads there under the `Net` key. No shipped path does
+  either: the in-place reload of architecture section 15.5 replaces a region with its own
+  state, a server under `Anchored` loads from its store and from cooked state alone, and
+  `app` keeps every export (`docs/verification.md`). Every kind takes binds the same way,
+  and only a server needs them: a client's worlds learn theirs from the stream and from
+  the rows of each region document, export nothing and are never saved or replayed, and a
+  prediction world keeps its bind table across a restore.
+- A load is
+  `SimulationBuilder::tick(saved.tick).next_net_id(saved.next_net_id).binds(binds)`, with
+  the binds of the bullet above, and then,
   for each saved region, a `RegionBundle` in a frame, under `Directed` or when the policy
   wants it. A cooked region's persistent region resources come from the caller in
   `RegionBundle::resources`: empty until the bundle format carries them
@@ -476,6 +532,23 @@ resource is configuration or session state. `build` enforces it by refusing, wit
 and covers the types the table knows, so a resource of an unregistered type, or one
 inserted after build by a hook or an exclusive system, is the inserting crate's bug. The
 6.1 example's `Gravity` and `TotalMass` are therefore `derived`.
+
+A world resource holds no entity reference either (D142; facade). The ECS keeps the
+references of rows and of region resources as origin keys: it rewrites a stored `Net` key
+at the bind that makes it an alias and again at a restore, for a bind made since the
+snapshot. It cannot do that for a world resource, which it stores as the typed value and
+hands out by `&mut` (`World::resource_mut`, `ResMut`), so a bind and a restore leave a
+world resource as its writer left it: one that held a `Net` key bound later would keep
+it where every row holds the origin key, and a restore would put back whatever the
+snapshot held. No engine resource holds a reference, and none may. The refusal is the
+ECS's and not this crate's, so that it covers every insert: `World::insert_resource` does
+not build for a type whose layout holds an `EntityRef` at any depth
+(`crates/ecs/README.md`, "Snapshots and bulk copy"), whether or not the type is
+registered and whether a setup function, a hook or an exclusive system inserts it.
+`build` therefore checks nothing for it. A reflected type handed to
+`World::insert_service` instead is a service, which that assertion does not see and
+whose keys are its owner's to keep. State that names an entity is a component, or a
+region resource, of a pinned region when it belongs to none.
 
 The hash is a pure function of that state: identical under every chunk layout, worker
 count, archetype history and registration order, on x86-64 and aarch64. The encoding, bit
@@ -605,7 +678,15 @@ and one `JournalFrame` per tick after it; `JournalFrame::record(tick, &input)` i
 frame's record, mirroring `TickInput` field for field in its application order, with
 tables as `VersionTable`s and bundles as `JournalLoad` (the baseline by content hash, with
 the overlay, resources, transient keys and table the bundle carried), so every region and
-every player the replay runs can be rebuilt. Before its first step the replay driver
+every player the replay runs can be rebuilt. `Journal::binds` is the server's bind table
+at the checkpoint (D142; facade): the bind of every entity with a predicted origin, in the
+checkpoint's regions and in the regions unloaded then, which a checkpoint, the save copy
+of the loaded regions, does not hold. The recorder reads them from the records of the
+server's save point, loaded and kept regions alike, as a save's are read ("Saves and
+loads"), and the replay driver builds its simulation with them through
+`SimulationBuilder::binds`, beside the checkpoint's tick and counter, so that a row whose
+owner resided in an unloaded region loads to the bytes the recorded world held. Before
+its first step the replay driver
 loads the checkpoint's regions with their tables and modes, re-claims the players'
 entities, and hands the held joins and requested regions to
 `RegionLifecycle::restore_session_state` through `Simulation::lifecycle_mut`, called once,
@@ -636,6 +717,23 @@ another build.
   digests across machines; the types are here.
 - Per-anchor streaming priority (`StreamingAnchor::priority` is zero) and streaming
   budgets, milestone 3.
+
+## Proof for D142
+
+A facade: none of these tests exists yet. Each row is a test the lane `binds-impl` adds, by
+the name given, and the sentence it holds. The first two are the whole-project review's
+probe D1 and its control at this crate's level; `lactose-persist` runs them through a
+container's bytes and `lactose-app` under `Anchored`. A test that records under SOUR is
+added to `[harness] tests` in `tools/xtask/ci-policy.toml` in the commit that adds it.
+
+| Test | What it holds | File |
+|---|---|---|
+| `a_row_owned_from_an_unloaded_region_reloads_to_the_same_owner` | Two regions under `Directed`; an entity with a predicted origin in the second, bound; a cooked row of the first given to it; a save point; the second region unloads. The original reloads the first region in place from the save point's export. A fresh simulation is built with the tick, the counter and the binds read from both exports (each bound entity's `PredictedOrigin`) and loads the first region alone. Before any step and after each of K steps the row's `OwnedBy` is the predicted origin in both and the hashes are equal; then the second region loads in both and they stay equal. Built without the binds, the fresh simulation holds the owner's `Net` key and another hash, which is the failure the test names | `persist.rs` |
+| `an_owner_with_a_net_key_in_an_unloaded_region_reloads_alike` | The control: the same history with an owner whose origin key is its `Net` key. Equal with the binds and without them, so the difference above is the bind | `persist.rs` |
+| `a_simulation_built_with_binds_holds_them_before_its_first_step` | `World::alias` gives each bound `NetId` before any step and no entity is live under either key; the binds are bound before any setup function runs; a second `binds` call replaced the first; the load of a region whose row carries a bound origin binds nothing new and loads the row under the origin key; a `Prediction` and a `Client` world take binds the same way | `persist.rs` |
+| `two_predicted_origins_bound_to_one_net_id_fail_the_build` | `InvalidData` from `build`, with `World::bind`'s message | `refusals.rs` |
+| `a_journal_from_a_checkpoint_with_a_predicted_owner_unloaded_replays_the_hashes` | A run under `Anchored` with a checkpoint taken while the owner's region is unloaded and the owned row's region loaded: the journal's `binds` hold the owner's bind, read from the export the unload left; the replay driver builds with them and reproduces every hash and output. With `binds` emptied the replay differs at its first tick | `persist.rs` |
+| `a_server_holds_no_bind_of_an_entity_despawned_in_a_step` | A bound entity with a predicted origin despawned by a command: `World::alias` is `None` once the step has resolved, in the step that despawned it. One whose region the step unloaded keeps its bind. One despawned through `world_mut()` between steps keeps its bind through the next step and has none once that step has resolved. A `Client` world's step still sets the horizon to its current tick before the run, so the bind of an entity its hook despawned outlives the step | `runs.rs` |
 
 ## Proof for milestone 1
 

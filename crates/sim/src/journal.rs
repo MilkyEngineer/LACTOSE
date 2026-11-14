@@ -10,14 +10,17 @@
 //! what a save does not: the tables and modes in force at the checkpoint, and the session
 //! state (the joined players' entities, the held joins and the requested regions), which
 //! the replay driver restores before its first step, so every region and every player the
-//! replay runs can be rebuilt.
+//! replay runs can be rebuilt. And it records the server's binds at the checkpoint, since
+//! the checkpoint is the save copy of the loaded regions alone and the server also held
+//! the bind of every entity with a predicted origin in the regions it had unloaded, which
+//! the replay's world must hold before its first region loads (D142).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use lactose_asset_api::{AssetFailure, VersionTable};
 use lactose_bundle::{ComponentData, Overlay};
-use lactose_core::{ComponentKey, PlayerId, StableKey, Tick};
+use lactose_core::{ComponentKey, NetId, PlayerId, PredictionKey, StableKey, Tick};
 use lactose_ecs::{RegionId, RegionMode};
 
 use crate::input::{PlayerSample, SessionEvent, TickInput};
@@ -29,6 +32,18 @@ use crate::time::TimeScale;
 pub struct Journal {
     /// The state the journal starts from, at its tick.
     pub checkpoint: SavePoint,
+    /// Every bind the server's world held at the checkpoint: one for each entity with a
+    /// predicted origin, in the checkpoint's regions and in the regions that were not
+    /// loaded then, whose saved state the server's store held. The recorder reads them
+    /// from the records of all of those regions, as a save's are read
+    /// (`lactose_persist::Loader::binds` over the server's save point), and the replay
+    /// driver builds its simulation with them
+    /// ([`SimulationBuilder::binds`](crate::SimulationBuilder::binds)) before it loads the
+    /// checkpoint's regions. Without them a row whose owner resided in an unloaded region
+    /// loads under the owner's `Net` key where the recorded world held its predicted
+    /// origin, and the replay hashes apart from its first tick (D142). Empty when no
+    /// entity of the recorded world had a predicted origin, as at a fresh server's start.
+    pub binds: BTreeMap<PredictionKey, NetId>,
     /// The asset table of every region loaded at the checkpoint that had one.
     pub tables: BTreeMap<RegionId, VersionTable>,
     /// The mode of every region loaded at the checkpoint.

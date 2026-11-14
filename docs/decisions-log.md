@@ -115,6 +115,11 @@ editorial pass rather than one taken from a review.
   into a new process.
 - Driven by: R2-12.
 - Replaced: revision 2's plain bulk copy.
+- Addendum (D142, lane binds-design, 2026-11-15): no load remaps the references of the rows it
+  loads. An `EntityRef` holds an origin key and an `AssetRef` an `AssetId`, each the same on
+  every machine and loaded as exported; the one exception is an owner, written as its `NetId`
+  and resolved at a load. The binds a load makes rewrite a bound `Net` key already stored in the
+  world, as every bind does.
 
 **D9. Components are `NoUninit + CheckedBitPattern`** (§6, §2 Component data)
 - Why: padding bytes made a raw-byte hash nondeterministic (R1-6). `AnyBitPattern` then banned
@@ -954,6 +959,8 @@ editorial pass rather than one taken from a review.
   a region's current baseline (D136). Mutation checks: the zero-byte arm, each `check_sections`
   call, the counter's use of the last runtime record, the residency of changed rows and app's
   baseline check each fail their tests.
+- Addendum (D142, lane binds-design, 2026-11-15): `Loader::binds` reads a saved world's binds
+  from its sections; the container format is unchanged. A facade until the lane `binds-impl`.
 
 **D130. The `io` facade: what sections 4, 5.1, 8.2, 9.7, 15.3, 19 and 20 left open** (§3, §4, §5.1, §8.2, §9.7, §14, §15.3, §19, §20, §21, `lactose-io`, `lactose-core`, `lactose-task`)
 - Why: the facade is written before its implementation so `asset`, `app`'s save path, `cook`
@@ -1327,6 +1334,9 @@ editorial pass rather than one taken from a review.
   (RigidBody, Collider). A whole-world `Client::hash` comparison is meaningful only when every
   dynamic entity in the prediction world is claimed or static; the spike compares a column (the
   carrier) where it is not.
+- Addendum (D142, lane binds-design, 2026-11-15): `build_server` gives a `Start::Loaded` world
+  the saved world's binds; `load` refuses a save whose sections bind one origin twice. A facade
+  until the lane `binds-impl`.
 
 **D136. The `asset` facade, and the change it makes to `asset-api`'s store contract: what sections 4, 5.1, 8.2, 14, 15.2, 18, 19 and 20 left open** (§3, §4, §5.1, §8.2, §9.7, §14, §15.2, §18, §19, §20, §22, `lactose-asset`, `lactose-asset-api`, `lactose-bundle`, `lactose-io`, `lactose-task`, `lactose-app`, `lactose-persist`, `tools/cook`)
 - Why: the facade is written before its implementation so the cooker's skeleton, the milestone
@@ -2285,6 +2295,10 @@ editorial pass rather than one taken from a review.
     logged; `Changed` in `World::query` means after this point one tick back; a finalize
     asserts at compile time that its system exists and is a reduction.
 - Driven by: milestone 0, the ECS implementation lane and its reviews (2026-10-10).
+- Addendum (D142, lane binds-design, 2026-11-15): the counter moves past a runtime `NetId` given
+  by a spawn, a load or a bind; `load_region` refuses a baseline that carries
+  `ecs::predicted_origin`; `World::insert_resource` does not build for a type that holds an
+  `EntityRef`. A facade until the lane `binds-impl`.
 
 **D118. The `sim` facade: what sections 4, 6, 8.2, 8.3, 9.1, 9.7, 11, 14 and 15 left open** (§4,
 §5.2, §6, §6.1, §8.2, §8.3, §9.1, §9.7, §10, §11, §14, §15.3, §16, `lactose-sim`, `lactose-ecs`)
@@ -2476,6 +2490,9 @@ editorial pass rather than one taken from a review.
   and a recording test not listed are findings naming the entry to change. A branch that adds,
   renames or removes a recording test or a harness package edits those lists in the same commit
   (review X4).
+- Addendum (D142, lane binds-design, 2026-11-15): `SimulationBuilder::binds`; a `Server` world's
+  horizon is set after the run, to the tick after it; `Journal::binds`. A facade until the lane
+  `binds-impl`.
 
 **D119. The `physics-api` facade: what sections 4, 6.1, 9.4, 9.7, 10, 15.1 and 16 left open**
 (§4, §5.3, §6.1, §8.2, §8.3, §9.4, §9.7, §10, §15.1, §16, §17, `lactose-physics-api`,
@@ -4588,10 +4605,15 @@ relayed by an event when it acts on another body** (§6.1, §10, `lactose-ecs`,
     D12 is a rule for `move_to_region` and `despawn`, which take the tree; an entity given to
     an owner elsewhere stays until that owner next moves, and an owner's region may unload
     while what it owns stays loaded, as the ECS README already promised. `OwnedBy` is then a
-    weak cross-region reference like any `EntityRef`: exported as the owner's `NetId`, reloaded
-    in either region order. Section 15.2 says a departed row is `Destroy` alone, so
-    `Overlay::new` no longer refuses an owner the overlay destroys; whether an owner exists was
-    always the applier's. Rules out the bundle reading a `Destroy` as a death.
+    weak cross-region reference, and the one reference a save does not write as stored: every
+    other `EntityRef` field is exported and loaded as the origin key it holds, where an owner is
+    exported as its `NetId` and stored at a load as the origin key that `NetId` names in the
+    loading world, through the document's own rows or the world's binds. It reloads to the owner
+    the export read, in either region order or with the owner's region left unloaded, in a world
+    that holds the owner's bind, which a server started from a save does for every entity of the
+    save before its first region loads (D142). Section 15.2 says a departed row is `Destroy`
+    alone, so `Overlay::new` no longer refuses an owner the overlay destroys; whether an owner
+    exists was always the applier's. Rules out the bundle reading a `Destroy` as a death.
   - *The format keeps its self-owner and cycle checks.* They are judged from the records alone,
     refuse hostile bytes before any load, and are a subset of the world's rules, since a cycle
     among one overlay's records is a cycle among live entities of the region. The bundle README
@@ -5286,6 +5308,166 @@ relayed by an event when it acts on another body** (§6.1, §10, `lactose-ecs`,
   addendum "never `Teleported` or a transient component" for a claimed spawn; the cascading
   calls in both hooks' contracts (D121, D122); architecture §9.3's "applied through
   `move_to_region`".
+- Addendum (D142, lane binds-design, 2026-11-15): a server's step passes the horizon over its
+  own despawns when it ends, so on a server the window of the rule's first clause is the rest of
+  the despawning step, or the whole of the next step for a despawn through `world_mut()` between
+  steps.
+
+**D142. Binds across a save: a world that starts from a save holds the save's binds before its first region loads; the `NetId` counter stays above every runtime `NetId` a world is given; no world resource holds an entity reference** (§6, §7, §8.3, §10, §15.4, §15.5, `lactose-persist`, `lactose-sim`, `lactose-ecs`, `lactose-app`)
+- Why: the whole-project review of milestone 1 (finding D1) found that a fresh process which
+  leaves an owner's region unloaded stores another `OwnedBy` than the process that saved, when
+  the owner has a predicted origin, and hashes apart from it until that region loads. An owner
+  is exported as its `NetId` and stored at a load as the origin key that `NetId` names in the
+  loading world; the saving world holds the bind of an unloaded predicted entity, and nothing
+  gave it to a fresh one (the probe: `Net(n)` and 0xc1c0746bb48b2e63 against `Predicted(k)` and
+  0x94c4c025045e97dd, converging once the owner's region loads; the control with a plain `Net`
+  owner matches). Under `Anchored` a partial load is the normal resume, a journal replay from a
+  checkpoint loads the same way, and D141's rule for a server's `OwnedBy` reads the same binds
+  at a direct write. Two rows were open beside it: what a bind or a restore does to a reflected
+  world resource, and a server world's direct spawn above its counter. Each choice below is a
+  contract in the four crates' READMEs, written as a facade before the lane `binds-impl`.
+  - *A saved world's binds are read from its sections, and a world that starts from it is built
+    with them.* `Loader::binds(sections)` gives the prediction key and `NetId` of every entity
+    the sections hold with a predicted origin, from each record that carries
+    `ecs::predicted_origin` (a `Spawn`; a `SpawnFromBaseline` or an `AddComponent` for a
+    predicted entity bound to a cooked ID). `SimulationBuilder::binds` binds them at `build`, in
+    ascending prediction-key order, before anything is inserted. `build_server` does both for a
+    `Start::Loaded`, over every saved region, queued or kept; `load` makes the call once so a
+    spliced save fails before any world exists. A save always held them, entity by entity, as
+    the component D114 persists; what was missing was the load's use of them before its first
+    region. Reading them at the build keeps them equal to the regions the start is given, since
+    a `SavedWorld`'s regions are a public map. Rules out carrying the binds in `SavePoint` and
+    the container header: a second copy of what every section states, which a reader must hold
+    equal to the sections or trust over them, a format bump with new golden bytes and an ECS
+    call to enumerate the bind table, for nothing the sections lack while every section is in
+    memory; it is the named change for a store that is not (milestone 3). Rules out binding from
+    `app` through `world_mut()` (an unjournaled edit a replay driver would repeat by
+    convention), a `TickInput` field (the binds are start state like the tick and the counter,
+    and a checkpoint would still need its own copy), relying on the convergence at the owner's
+    load (`Directed` reaches it in its first frame, `Anchored` may never), and writing the owner
+    as stored (a bundle format change that still leaves the fresh process without the binds
+    D141's rule reads).
+  - *Which binds: the bind of every entity the save holds, loaded or kept, and no other.* Not
+    only those a saved reference names: D141 refuses, in a `Server` world, a direct `OwnedBy`
+    write whose owner is a predicted origin with no bind, so a world missing the bind of an
+    unloaded entity that no row names yet differs from the one that saved at the first such
+    write. Not the bind of a despawned entity: no section holds it, and no server holds it past
+    the end of the step that despawned it, or of the next step for a despawn through
+    `world_mut()` between steps, an unjournaled edit. Rules out per-section owner origins: they
+    restore the stored bytes of loaded rows and not the table a direct write reads, and need an
+    export field, a section change and the relevance message.
+  - *Between steps a server holds no bind of an entity despawned in a step.* `Simulation::step`
+    on a `Server` world ends with `World::set_rollback_horizon` at the tick after the one it
+    ran, in place of the call before the run with the current tick, which left the binds of a
+    tick's despawns for the whole of the next. A server never rolls back, so nothing there waits
+    on them. With them gone, and no unjournaled edit since the last step, a server's binds
+    between steps are exactly those of the entities that exist, live or in the kept state of an
+    unloaded region, which is what a save point's sections hold; a test holds the two equal
+    after every step. Before it, a save taken the tick after a despawn started a process without
+    a bind the original held for one more tick, in which a load or a direct write naming the
+    despawned entity stored what the fresh process stored otherwise. An entity despawned through
+    `world_mut()` between steps keeps its bind until the next step ends, and a save taken in
+    between starts a process without it; no shipped server path despawns that way. The cost is
+    `lactose-physics-api`'s: its sync removes the alias of a predicted body despawned after the
+    tick's physics sync point through its linear fallback. A `Client` world keeps the call
+    before the run. Rules out carrying the last tick's despawned binds with their ticks (a
+    format field for state that lives one tick) and passing the horizon at the save point alone
+    (the server that saved and a twin that did not would differ).
+  - *The journal's checkpoint carries the binds.* `Journal::binds` is `Loader::binds` over the
+    server's save point, loaded and kept regions alike, since a checkpoint is the save copy of
+    the loaded regions; the replay driver builds with them. Rules out reading them from the
+    journal's later loads: a region unloaded at the checkpoint may never load in the journal.
+  - *The container format does not change.* `CONTAINER_FORMAT_VERSION` stays 1, no golden byte
+    and no pinned digest moves, and a save written before this entry loads as it is.
+  - *A cooked baseline carries no predicted origin.* `World::load_region` refuses a baseline
+    with an `ecs::predicted_origin` column, as it refuses `ecs::in_region` in a document: a
+    prediction key names a player's input, no cook writes one, and with the refusal every bind a
+    load makes comes from a record, which makes the sections' binds exact. Rules out reading
+    baselines in `Loader::binds`.
+  - *A client's worlds.* Nothing there is saved, exported or replayed: `save_point` is
+    `Unsupported` off the server, an unload there exports nothing, and a prediction world keeps
+    its bind table across a restore. A client learns its binds from the stream and from each
+    region document's rows; an owner a document names whose bind the client lacks is stored
+    under its `Net` key until the bind arrives, when `bind` rewrites it. The relevance message
+    carries no binds; a replicated `OwnedBy` decides whether it should (`docs/verification.md`).
+  - *The counter stays above every runtime `NetId` a world is given.* `allocate_net_id` hands
+    out the counter's value and moves it on; a runtime `NetId` that enters by a direct spawn, a
+    row of a load or a bind moves the counter to one past it when it is not already above; a
+    refused spawn, load or bind moves nothing; no switch on the kind. In a `Server` world the
+    counter is then above the runtime ID of every live entity and every bind, an allocation
+    never returns an ID in use or one an unloaded or despawned entity had, and the world's own
+    export never fails `Container::check_sections`. A `restore` puts the counter back while the
+    binds stay, which matters to nothing: only a server allocates, and it never restores. Rules
+    out refusing such a key: client worlds spawn under the server's runtime IDs with a counter
+    they never move, so a refusal needs a switch on the kind, and on a server it would fire only
+    for tests and tools that spawn directly, for no state the advance does not also make
+    saveable. The lane `binds-impl` implements it: the rule covers `bind`, and the two tests
+    that pin today's behaviour are in `lactose-persist` and `lactose-app`.
+  - *No reflected world resource holds an entity reference, and `World::insert_resource` does
+    not build for one.* The world keeps the references of rows and region resources as origin
+    keys across a bind and a restore. It cannot for a world resource, which it stores as the
+    typed value and hands out by `&mut`. `World::insert_resource::<T>` therefore carries an
+    inline `const` assertion over `T::SCHEMA`, a `const fn` walk of the layout through nested
+    `#[value]` structs and arrays, that fails the build of any call whose `T` holds an
+    `EntityRef`. It covers every insert of a reflected resource as one: for a registered type or
+    an unregistered one, at build or from a hook or an exclusive system later, in a world
+    `lactose-sim` built or any other. `World::insert_service` takes any `'static` type and
+    stores it under the same `TypeId`, where `resource`, `resource_mut`, `Res` and `ResMut` read
+    it; a reflected type inserted that way is a service, which the assertion does not see and
+    whose keys are its owner's to keep. No signature changes and nothing runs. The assertion is
+    evaluated where the call is instantiated, so a build and every test run report it, with the
+    call, and `cargo check` and clippy do not. The same type stays legal as a region resource
+    (`insert_region_resource` and its erased forms), whose references the world does keep. Rules
+    out the check at `SimulationBuilder::build` that this entry's first text had (it saw only
+    the registered types present after the setup functions); a `Result` from `insert_resource`
+    (it returns `Option<T>`, and every caller would change for a programming error); a refusal
+    in `#[resource]` (one type can be a region resource, where a reference is legal); and
+    rewriting world resources as region resources are rewritten (a visitor stored with every
+    resource in the ECS's resource paths, which still leaves a write through `ResMut` or
+    `resource_mut` as written).
+  - Named and deferred: the binds beside the index for a store that does not hold every section
+    in memory (milestone 3); what a save with a damaged section binds (milestone 4); the binds
+    of entities that leave a server without a despawn, decided with `Server::forget`.
+- What the design reviews changed. The first (6 minor findings; `2796d34` was the facade before
+  it): the exception for a despawn through `world_mut()` stated wherever the rule is; the
+  world-resource refusal moved from `SimulationBuilder::build` to `World::insert_resource`, at
+  compile time; architecture §7's "remapped on load" corrected; two `events.rs` tests named
+  among those the counter rule moves; the milestone 3 store named in `lactose-app`'s README. The
+  second (2 minor; `95b14cb`): `World::insert_service` named as outside the refusal, which
+  covers every insert through `insert_resource` and not every way a reflected type reaches the
+  resource map; "no load remaps a reference" narrowed to the rows a load loads, since the binds
+  a load makes rewrite `Net` keys stored elsewhere.
+- To measure with the lane `binds-impl`: `Loader::binds` and the builder's binds at 100k
+  entities with a predicted origin; the physics sync's fallback for a predicted body despawned
+  after the tick's physics sync point.
+- Proof, for the lane `binds-impl`: the rows of "Proof for D142" in the four READMEs. The
+  review's probe and its control as
+  `a_fresh_process_that_leaves_a_predicted_owners_region_unloaded_hashes_equal` and
+  `an_owner_with_a_net_key_in_an_unloaded_region_hashes_equal`
+  (`crates/persist/tests/reload.rs`);
+  `a_resume_that_keeps_a_predicted_owners_region_matches_the_world_never_saved`
+  (`crates/app/tests/proof/store.rs`);
+  `a_journal_from_a_checkpoint_with_a_predicted_owner_unloaded_replays_the_hashes` and
+  `a_server_holds_no_bind_of_an_entity_despawned_in_a_step` (`crates/sim/tests`);
+  `a_save_points_binds_are_the_worlds` and `the_binds_of_a_saved_world_are_what_its_loads_bind`
+  (`crates/persist/tests/binds.rs`); `a_runtime_net_id_given_directly_moves_the_counter_past_it`
+  (`crates/ecs/tests/binds.rs`);
+  `a_world_resource_that_holds_an_entity_reference_does_not_build`
+  (`crates/ecs/tests/compile_fail.rs`).
+- Checked before the lane: the review's probe with the fresh world given the sections' binds
+  first stores `Predicted(k)` and hashes 0x94c4c025045e97dd, the original's. The first design
+  review's candidate implementation stays equal for 70 ticks with the binds and differs for 39
+  without; the server's horizon at the end of the step moves no recorded hash. The const
+  assertion was built in scratch tests: accepted over `Reflect::SCHEMA`, refused with E0080 at
+  `cargo build`, silent at `cargo check`.
+- Driven by: the whole-project review of milestone 1 (2026-11-14), finding D1, its probe and
+  control; `docs/plans/milestone-1.md`, lane `binds-design`; the data-path review's row on a
+  direct spawn above the counter; the world-resource clause of the row "ECS implementation gaps
+  after its reviews (D117)"; the design's two reviews (2026-11-15).
+- Replaced: D133's "like any `EntityRef`"; D8's remap on load of the rows a load loads, which no
+  load performs; D117's pass over IDs in use as the counter's only rule; D118's horizon before
+  the run for a `Server` world; D141's "sim never loads between a despawn and the next horizon"
+  as a description of the code before this entry.
 
 ## 10. Review history
 
