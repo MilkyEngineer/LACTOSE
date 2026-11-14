@@ -44,8 +44,8 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use lactose_app::{
-    Client, ClientError, Cooked, CrateRegistration, Game, Start, TICK_PERIOD, Workers, WorldConfig,
-    build_client, build_server, start_executor,
+    Client, ClientError, ClientOutput, Cooked, CrateRegistration, Game, Start, TICK_PERIOD,
+    Workers, WorldConfig, build_client, build_server, start_executor,
 };
 use lactose_asset_api::{
     Asset, AssetId, AssetKind, AssetSet, AssetVersion, LoadPriority, PinnedTable, PublishedAssets,
@@ -77,9 +77,11 @@ use lactose_net_host::transport::{
     ConnectionId, Datagram, LinkStats, MAX_DATAGRAM_BYTES, Transport, TransportEvent,
 };
 use lactose_net_host::{ClockEstimate, InterpolationBuffer};
-use lactose_physics_api::{BodyType, Collider, RigidBody, Shape, Transform, Velocity, locked_axes};
+use lactose_physics_api::{
+    BodyType, Collider, RigidBody, Shape, Teleported, Transform, Velocity, locked_axes,
+};
 use lactose_predict::{CorrectionCause, PredictionStats, PredictionTolerance, SlotBytes};
-use lactose_reflect::{Reflect, TypeRole, component};
+use lactose_reflect::{Persistence, Reflect, TypeInfo, TypeRole, component};
 use lactose_sim::harness::{ChunkCapacity, layout_mode, layout_mode_of};
 use lactose_sim::{
     PlayerSample, RegionBundle, Registration, SessionApplier, SessionEvent, Stage, StreamingAnchor,
@@ -1983,6 +1985,10 @@ enum Observed<'a> {
     Client(&'a World),
     /// The record of a frame.
     Record(Tick, u64),
+    /// The run's end, the client still running: an observer may take the client to run
+    /// more frames of its own, at `clock`'s times from the frame after `frame`, and must
+    /// put it back.
+    Ended { client: &'a mut Option<Client>, clock: &'a ClientClock, frame: u32 },
 }
 
 type Observe<'a> = dyn FnMut(Observed<'_>) -> Result<()> + 'a;
@@ -2367,6 +2373,8 @@ fn run(
 
     outcome.datagrams_dropped = lock(&link).dropped;
     if let Some(mut end) = end {
+        let ended = Observed::Ended { client: &mut end.client, clock: &end.clock, frame: end.ran };
+        observe(ended)?;
         let client = end.client.take().expect("held");
         outcome.stats = Some(client.predictor().stats());
         outcome.ring_depth = client.predictor().ring().depth();
@@ -2640,6 +2648,7 @@ fn recorded(scene: Scene, test: &str) {
                 let recorder = recorder.as_mut().expect("opened with the server");
                 recorder.record(tick.0, hash).map_err(protocol_error)?;
             }
+            Observed::Ended { .. } => {}
         }
         Ok(())
     };
@@ -2972,4 +2981,206 @@ fn ten_minutes_of_the_claim_in_contact_on_the_server_clock() {
 #[ignore = "ten minutes of ticks, in release"]
 fn ten_minutes_of_a_claim_on_approach_on_the_server_clock() {
     measure(Scene::Approach, ClockScript::Exact);
+}
+
+// ---- The slot and the rollback ----
+
+/// Whether `cargo xtask measure --short` runs the test: fewer repetitions, the same figures.
+fn short() -> bool {
+    std::env::var_os("LACTOSE_MEASURE_SHORT").is_some()
+}
+
+/// One figure for `cargo xtask measure`, which reads the lines that start `measure: `.
+fn figure(name: &str, value: impl std::fmt::Display) {
+    println!("measure: {name} {value}");
+}
+
+fn micros(span: Duration) -> f64 {
+    span.as_secs_f64() * 1e6
+}
+
+fn median_of(mut spans: Vec<Duration>) -> Duration {
+    spans.sort();
+    spans[spans.len() / 2]
+}
+
+/// The frames of the thrown scene before its measurement: the throw at frame 60 and ninety
+/// frames of the fifty bodies in flight and landing.
+const THROWN_FRAMES: u32 = 150;
+
+/// Runs the thrown scene on the server's clock to [`THROWN_FRAMES`] on four workers, as the
+/// spike's measurement does, then hands `measure` the executor, the client, its clock and
+/// the last frame it ran.
+fn after_the_throw(
+    mut measure: impl FnMut(&Executor, &mut Option<Client>, &ClientClock, u32) -> Result<()>,
+) {
+    let executor = executor(4);
+    let plan =
+        Plan { ticks: THROWN_FRAMES, clock: ClockScript::Exact, ..Plan::recorded(Scene::Thrown) };
+    let mut ended = false;
+    let mut observe = |observed: Observed<'_>| match observed {
+        Observed::Ended { client, clock, frame } => {
+            ended = true;
+            measure(&executor, client, clock, frame)
+        }
+        _ => Ok(()),
+    };
+    run(&executor, LayoutConfig::default(), plan, &mut observe).unwrap();
+    assert!(ended, "the client joined and ran to the end");
+    executor.shutdown();
+}
+
+/// Criterion 5 (architecture section 22, plan decision 5.1): the take and the restore of
+/// one prediction slot on the client of the thrown scene, its fifty bodies in flight, with
+/// Rapier. The take is what `lactose-predict` takes after every predicted tick: the world
+/// snapshot, the physics snapshot, and the record of every claimed entity's replicated
+/// persistent components but `Teleported`; the restore is what a rollback restores: the
+/// world, then the physics. Each is the median of 200 (20 in a short run); the slot's
+/// size is printed as this take counts it and as the client's ring counts its newest
+/// slot. The world hash after the restores is the hash before them. `cargo xtask measure
+/// prediction-slot` runs it.
+#[test]
+#[ignore = "a measurement, run by `cargo xtask measure`: timings are reported, not asserted"]
+fn cost_of_a_prediction_slot() {
+    let rounds = if short() { 20 } else { 200 };
+    after_the_throw(|_, client, _, _| {
+        let client = client.as_mut().expect("held between frames");
+        let (tick, hash) = (client.tick(), client.hash()?);
+        let ring = client.predictor().ring().slot_bytes(tick).unwrap_or_default();
+        let world = client.predictor_mut().simulation_mut().world_mut();
+        let recorded: Vec<ComponentKey> = world
+            .registry()
+            .iter()
+            .filter(|info| {
+                info.role() == TypeRole::Component
+                    && info.persistence() == Persistence::Persistent
+                    && info.tracking().replicated
+                    && info.key() != Teleported::KEY
+            })
+            .map(TypeInfo::key)
+            .collect();
+        let claimed = world.claimed(PLAYER).count();
+        assert!(claimed > THROWN as usize, "the character and the thrown bodies: {claimed}");
+        let bodies = world.query::<&RigidBody>().count();
+        let colliders = world.query::<&Collider>().count();
+        let entities = world.entities_in(REGION).count();
+
+        let (mut takes, mut restores) = (Vec::new(), Vec::new());
+        let mut bytes = (0, 0, 0);
+        for _ in 0..rounds {
+            let start = Instant::now();
+            let snapshot = world.snapshot();
+            let physics = lactose_physics_api::snapshot(world)?;
+            let record: BTreeMap<StableKey, (RegionId, BTreeMap<ComponentKey, Vec<u8>>)> = world
+                .claimed(PLAYER)
+                .filter_map(|key| {
+                    let components = recorded
+                        .iter()
+                        .filter_map(|&component| {
+                            Some((component, world.get_erased(key, component)?.to_vec()))
+                        })
+                        .collect();
+                    Some((key, (world.region_of(key)?, components)))
+                })
+                .collect();
+            takes.push(start.elapsed());
+            let record_bytes =
+                record.values().flat_map(|(_, components)| components.values()).map(Vec::len);
+            bytes = (snapshot.size_in_bytes(), physics.size_in_bytes(), record_bytes.sum());
+
+            let start = Instant::now();
+            world.restore(&snapshot)?;
+            lactose_physics_api::restore(world, &physics)?;
+            restores.push(start.elapsed());
+        }
+        assert_eq!(client.hash()?, hash, "a restore of the slot just taken changes nothing");
+
+        figure("workers", 4);
+        figure("frames", THROWN_FRAMES);
+        figure("tick", tick.0);
+        figure("rounds", rounds);
+        figure("entities", entities);
+        figure("claimed", claimed);
+        figure("bodies", bodies);
+        figure("colliders", colliders);
+        figure("take_us", format!("{:.1}", micros(median_of(takes))));
+        figure("restore_us", format!("{:.1}", micros(median_of(restores))));
+        figure("world_bytes", bytes.0);
+        figure("physics_bytes", bytes.1);
+        figure("record_bytes", bytes.2);
+        figure("ring_world_bytes", ring.world);
+        figure("ring_physics_bytes", ring.physics);
+        figure("ring_record_bytes", ring.record);
+        Ok(())
+    });
+}
+
+/// How far back the rollback's correction lands: a frame for the tick six before the
+/// client's, whose next frame predicts one more tick before it reconciles.
+const ROLLBACK_DEPTH: u32 = 6;
+/// Frames the client runs alone first, so that a correction that far back is after every
+/// frame the server sent it.
+const ALONE: u32 = 8;
+
+/// Criterion 7 (architecture section 22, recorded): a seven-tick rollback on the client of
+/// the thrown scene, its fifty bodies in flight, with Rapier: a frame for the tick
+/// [`ROLLBACK_DEPTH`] before the client's, whose exact row moves the character a metre,
+/// then one client frame, which predicts its tick, restores the slot of the frame's tick,
+/// corrects it and re-simulates the seven ticks to the present. `ClientOutput::rollback`
+/// is the reconcile's wall time; each figure is the median of 20 rollbacks (3 in a short
+/// run). `cargo xtask measure rollback-seven-ticks` runs it.
+#[test]
+#[ignore = "a measurement, run by `cargo xtask measure`: timings are reported, not asserted"]
+fn cost_of_a_seven_tick_rollback() {
+    let rollbacks = if short() { 3 } else { 20 };
+    after_the_throw(|executor, held, clock, last| {
+        let mut sample = |tick: Tick| Scene::Thrown.input(tick);
+        let mut frame = |held: &mut Option<Client>, n: u32| -> Result<ClientOutput> {
+            let client = held.take().expect("held between frames");
+            match executor.block_on(client.frame(executor, clock.now(n), &mut sample)) {
+                Ok((client, out)) => {
+                    *held = Some(client);
+                    Ok(out)
+                }
+                Err(ClientError { error, client }) => {
+                    *held = client;
+                    Err(error)
+                }
+            }
+        };
+        for n in 1..=ALONE {
+            frame(held, last + n)?;
+        }
+        let (mut spans, mut resimulated) = (Vec::new(), Vec::new());
+        for n in 1..=rollbacks {
+            let client = held.as_mut().expect("held between frames");
+            let present = client.tick();
+            let world = client.predictor().simulation().world();
+            let key = player_entity(world, PLAYER).expect("the character");
+            let at = *world.get::<Transform>(key).expect("the character's transform");
+            let metre = Vec3::new(scalar(1.0), Scalar::ZERO, Scalar::ZERO);
+            let moved = Transform::new(at.translation + metre, at.rotation);
+            let mut staged = StagedFrame::new(Tick(present.0 - ROLLBACK_DEPTH));
+            let bytes = lactose_reflect::bytemuck::bytes_of(&moved);
+            assert!(staged.push_row(key, Transform::KEY, staged.tick, true, bytes));
+            assert!(client.push(Arc::new(staged)), "the frame is after every one accepted");
+            let out = frame(held, last + ALONE + n)?;
+            assert_eq!(out.reconciled.corrections.len(), 1, "one correction, at the frame's tick");
+            assert!(out.resync.is_none(), "a correction inside the ring, not a resync");
+            resimulated.push(out.reconciled.resimulated);
+            spans.push(out.rollback);
+        }
+        assert!(
+            resimulated.iter().all(|&ticks| ticks == ROLLBACK_DEPTH + 1),
+            "every rollback re-simulates seven ticks: {resimulated:?}"
+        );
+        let span = median_of(spans);
+        figure("workers", 4);
+        figure("frames", THROWN_FRAMES + ALONE);
+        figure("rollbacks", rollbacks);
+        figure("resimulated", ROLLBACK_DEPTH + 1);
+        figure("rollback_us", format!("{:.1}", micros(span)));
+        figure("per_tick_us", format!("{:.1}", micros(span) / f64::from(ROLLBACK_DEPTH + 1)));
+        Ok(())
+    });
 }

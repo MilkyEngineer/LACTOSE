@@ -20,7 +20,8 @@ use lactose_ecs::{
 };
 use lactose_math::{Quat, Scalar, Vec3};
 use lactose_physics_api::{
-    Collider, CollisionGroups, JointKind, PhysicsConfig, RigidBody, Shape, Transform,
+    Collider, CollisionGroups, JointKind, PhysicsBackend, PhysicsConfig, RigidBody, Shape,
+    Transform,
 };
 use lactose_reflect::component;
 use lactose_sim::{
@@ -386,6 +387,9 @@ pub struct Options {
     /// Whether the test backend looks for contacts: quadratic in the colliders, so a cost
     /// scene turns it off, as every cost test over the backend does.
     pub contacts: bool,
+    /// The backend behind physics-api's systems, built for `workers`, in place of the test
+    /// backend: `lactose-app`'s cost test gives the Rapier backend.
+    pub backend: Option<fn(u32) -> Box<dyn PhysicsBackend>>,
 }
 
 impl Options {
@@ -398,6 +402,7 @@ impl Options {
             setup: None,
             physics: false,
             contacts: true,
+            backend: None,
         }
     }
 
@@ -421,7 +426,9 @@ impl Options {
             .systems(register_recording);
         if self.physics {
             let fake = Fake::new(calls.clone());
-            let backend = Box::new(if self.contacts { fake } else { fake.without_contacts() });
+            let fake = Box::new(if self.contacts { fake } else { fake.without_contacts() });
+            let backend =
+                self.backend.map_or(fake as Box<dyn PhysicsBackend>, |build| build(self.workers));
             builder = builder
                 .setup(move |world| {
                     lactose_physics_api::setup(world, backend, PhysicsConfig::default())

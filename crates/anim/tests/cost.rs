@@ -7,8 +7,9 @@
 //! every bone, against the same scene without them, over the physics test backend with its
 //! contact search off and with no physics at all. Asserts
 //! on counts (every pose evaluated, half the characters blending, the bone rows there);
-//! timings are printed, never asserted: run it by hand in release on an idle machine,
-//! `cargo test -p lactose-anim --release --test cost -- --ignored --nocapture`, with
+//! timings are printed, never asserted. `cargo xtask measure sim-skeleton` runs it in release
+//! and writes the result file, figure (b) being criterion 6; by hand, `cargo test -p
+//! lactose-anim --release --test cost -- --ignored --nocapture` on an idle machine, with
 //! `uptime` before and after.
 
 #![forbid(unsafe_code)]
@@ -36,7 +37,18 @@ const CHARACTERS: u64 = 200;
 const BONES: u8 = 16;
 const FRAMES: u32 = 60;
 const WARM_UP: u32 = 50;
-const TICKS: u32 = 1_000;
+
+/// The ticks each figure is the median of: fewer when `cargo xtask measure --short` runs
+/// the test, which proves the command finishes and keeps no number.
+#[expect(clippy::disallowed_methods, reason = "the measurement's repetitions, outside the step")]
+fn ticks() -> u32 {
+    if std::env::var_os("LACTOSE_MEASURE_SHORT").is_some() { 100 } else { 1_000 }
+}
+
+/// One figure for `cargo xtask measure`, which reads the lines that start `measure: `.
+fn figure(name: &str, value: impl std::fmt::Display) {
+    println!("measure: {name} {value}");
+}
 
 const WALK: AssetRef<Clip> = clip_ref("cost/walk");
 const RUN: AssetRef<Clip> = clip_ref("cost/run");
@@ -125,13 +137,13 @@ fn step(executor: &Executor, simulation: Simulation) -> Simulation {
     executor.block_on(simulation.step(executor, TickInput::default())).unwrap()
 }
 
-/// The per-tick spans of `TICKS` steps after the warm-up, and the world.
+/// The per-tick spans of [`ticks`] steps after the warm-up, and the world.
 fn step_spans(executor: &Executor, mut simulation: Simulation) -> (Vec<Duration>, Simulation) {
     for _ in 0..WARM_UP {
         simulation = step(executor, simulation);
     }
-    let mut spans = Vec::with_capacity(TICKS as usize);
-    for _ in 0..TICKS {
+    let mut spans = Vec::with_capacity(ticks() as usize);
+    for _ in 0..ticks() {
         let mut next = None;
         spans.push(timed(|| next = Some(step(executor, simulation))));
         simulation = next.unwrap();
@@ -154,9 +166,9 @@ fn the_sim_skeleton_budget() {
 
     // (a) The evaluation alone: the walk at each character's phase, half of them fading
     // from the run.
-    let mut spans = Vec::with_capacity(TICKS as usize);
+    let mut spans = Vec::with_capacity(ticks() as usize);
     let mut bones = 0usize;
-    for tick in 0..TICKS {
+    for tick in 0..ticks() {
         spans.push(timed(|| {
             for n in 0..CHARACTERS {
                 let at = |rate: u32| Phase((tick.wrapping_mul(rate)).wrapping_add(n as u32 * 977));
@@ -170,8 +182,9 @@ fn the_sim_skeleton_budget() {
             }
         }));
     }
-    assert_eq!(bones, (CHARACTERS * u64::from(BONES)) as usize * TICKS as usize);
+    assert_eq!(bones, (CHARACTERS * u64::from(BONES)) as usize * ticks() as usize);
     let best = spans.iter().min().copied().unwrap();
+    figure("a.evaluate_us", format!("{:.1}", micros(median(spans.clone()))));
     println!(
         "(a) SimPose::evaluate, 200 characters, half blending: median {:.1} us, best {:.1} us per tick",
         micros(median(spans)),
@@ -179,6 +192,10 @@ fn the_sim_skeleton_budget() {
     );
 
     // (b) The step with and without the pose, on one and four workers.
+    figure("characters", CHARACTERS);
+    figure("bones", BONES);
+    figure("ticks", ticks());
+    figure("workers", "1 and 4");
     for workers in [1, 4] {
         let executor = executor(workers);
         let (with, world) = step_spans(&executor, step_world(true));
@@ -189,6 +206,10 @@ fn the_sim_skeleton_budget() {
         let (without, world) = step_spans(&executor, step_world(false));
         assert_eq!(blending(world.world()), (CHARACTERS / 2) as usize);
         let (with, without) = (median(with), median(without));
+        figure(&format!("b.w{workers}.with_us"), format!("{:.1}", micros(with)));
+        figure(&format!("b.w{workers}.without_us"), format!("{:.1}", micros(without)));
+        let difference = micros(with.saturating_sub(without));
+        figure(&format!("b.w{workers}.difference_us"), format!("{difference:.1}"));
         println!(
             "(b) Simulation::step, {workers} worker(s): median {:.1} us with SimPose, {:.1} us \
              without, {:.1} us difference per tick",
@@ -221,7 +242,7 @@ fn the_sim_skeleton_budget() {
         };
         let spans = |fixture: &mut Fixture| {
             fixture.run(WARM_UP);
-            (0..TICKS).map(|_| timed(|| fixture.step())).collect::<Vec<_>>()
+            (0..ticks()).map(|_| timed(|| fixture.step())).collect::<Vec<_>>()
         };
         let mut with = scene(true);
         let with_spans = spans(&mut with);
@@ -231,6 +252,11 @@ fn the_sim_skeleton_budget() {
         let without_spans = spans(&mut without);
         let (with, without) = (median(with_spans), median(without_spans));
         let over = if physics { "test backend, contacts off" } else { "no physics" };
+        let name = if physics { "test_backend" } else { "no_physics" };
+        figure(&format!("c.{name}.w{workers}.with_us"), format!("{:.1}", micros(with)));
+        figure(&format!("c.{name}.w{workers}.without_us"), format!("{:.1}", micros(without)));
+        let bodies = micros(with.saturating_sub(without));
+        figure(&format!("c.{name}.w{workers}.bodies_us"), format!("{bodies:.1}"));
         println!(
             "(c) a body on every bone, {over}, {workers} worker(s): median {:.1} us with, \
              {:.1} us without, {:.1} us of bodies per tick",
