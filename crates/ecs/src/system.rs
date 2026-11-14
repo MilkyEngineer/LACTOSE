@@ -3,7 +3,7 @@
 
 use core::any::Any;
 
-use lactose_core::{StableKey, SystemKey};
+use lactose_core::SystemKey;
 use lactose_math::Reducer;
 use lactose_task::JobContext;
 
@@ -13,6 +13,7 @@ use crate::command::{ChannelCommand, CommandBuffer};
 use crate::event::{EventList, EventRecord, PresentRecord};
 use crate::param::{Ctx, SystemParam};
 use crate::storage::RowView;
+use crate::unit::Unit;
 use crate::world::{World, WorldSet};
 
 /// A named group of systems with an order relative to other sets, declared as a static:
@@ -90,12 +91,12 @@ impl SystemDescriptor {
     ///
     /// # Safety
     ///
-    /// `access` must describe exactly what `kernel.run` touches and `finalize_access` what
-    /// `kernel.finalize` touches: every component, resource, event and channel each reads
-    /// or writes, with the right kind. The schedule orders systems by these tables, and the
-    /// storage hands out `&mut` rows on the strength of them (`SAFETY.md`). The `#[system]`
-    /// expansion derives both from the parameter types and the `writes` list and is the
-    /// one sound caller.
+    /// `access` must describe exactly what `kernel.run` and `kernel.each` touch and
+    /// `finalize_access` what `kernel.finalize` touches: every component, resource, event
+    /// and channel each reads or writes, with the right kind. The schedule orders systems
+    /// by these tables, and the storage hands out `&mut` rows on the strength of them
+    /// (`SAFETY.md`). The `#[system]` expansion derives both from the parameter types and
+    /// the `writes` list and is the one sound caller.
     #[doc(hidden)]
     #[must_use]
     #[allow(clippy::too_many_arguments, reason = "positional on purpose: see above")]
@@ -197,9 +198,12 @@ impl core::fmt::Debug for SystemDescriptor {
 #[doc(hidden)]
 #[derive(Clone, Copy)]
 pub struct Kernel {
-    /// Runs the system over one invocation: one entity, one region, or the once-per-tick
-    /// call.
+    /// Runs the system over one invocation: one region, the once-per-tick call or the
+    /// exclusive call.
     pub run: fn(&mut Invocation<'_, '_>),
+    /// Runs a per-entity system over the rows of one unit: a chunk, or a range of one
+    /// chunk's rows.
+    pub each: fn(&mut Unit<'_>),
     /// Runs the finalize function of a reduction, or does nothing.
     pub finalize: fn(&mut Invocation<'_, '_>),
     /// How the reducer's partials are made and merged, for a reduction.
@@ -216,19 +220,19 @@ impl Kernel {
 #[doc(hidden)]
 #[derive(Clone, Copy)]
 pub struct ReducerOps {
-    pub(crate) identity: fn() -> Box<dyn Any>,
+    pub(crate) identity: fn() -> Box<dyn Any + Send>,
     pub(crate) merge: fn(&mut dyn Any, &dyn Any),
 }
 
 impl ReducerOps {
     /// The operations of `R`.
     #[must_use]
-    pub const fn of<R: Reducer + 'static>() -> Self {
+    pub const fn of<R: Reducer + Send + 'static>() -> Self {
         Self { identity: identity::<R>, merge: merge::<R> }
     }
 }
 
-fn identity<R: Reducer + 'static>() -> Box<dyn Any> {
+fn identity<R: Reducer + Send + 'static>() -> Box<dyn Any + Send> {
     Box::new(R::identity())
 }
 
@@ -248,11 +252,6 @@ pub struct Invocation<'r, 'j> {
 impl<'r, 'j> Invocation<'r, 'j> {
     pub(crate) fn new(slots: Vec<Slot<'r, 'j>>, reducer: ReducerSlot<'r>) -> Self {
         Self { slots, reducer }
-    }
-
-    /// The slots, for a caller that reuses their buffer.
-    pub(crate) fn into_slots(self) -> Vec<Slot<'r, 'j>> {
-        self.slots
     }
 
     /// The slot of parameter `index`, which a fetch takes.
@@ -277,7 +276,6 @@ pub(crate) enum Slot<'r, 'j> {
     Resource(&'r (dyn Any + Send + Sync)),
     /// A world resource, written.
     ResourceMut(&'r mut (dyn Any + Send + Sync)),
-    Key(StableKey),
     Ctx(Ctx<'r>),
     Commands(&'r mut CommandBuffer),
     EmitEvents(&'r mut Vec<EventRecord>),

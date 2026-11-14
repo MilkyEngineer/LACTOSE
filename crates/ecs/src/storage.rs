@@ -208,7 +208,6 @@ impl Chunk {
                 .as_mut()
                 .map(|s| (&mut s.ticks[..len], &mut s.positions[..len]));
             views.push(ColumnView {
-                size: column.size,
                 bytes,
                 stamps,
                 column_tick: ticks.next().expect("one column tick per column"),
@@ -226,37 +225,15 @@ pub(crate) struct ChunkViews<'c> {
 
 /// One column of a split chunk.
 pub(crate) struct ColumnView<'c> {
-    pub(crate) size: usize,
     pub(crate) bytes: &'c mut [u8],
     pub(crate) stamps: Option<(&'c mut [Tick], &'c mut [u32])>,
     pub(crate) column_tick: &'c mut Stamp,
 }
 
-impl<'c> ColumnView<'c> {
-    /// Splits off the first remaining row.
-    pub(crate) fn next_row(&mut self) -> RowView<'c> {
-        let (bytes, rest) = core::mem::take(&mut self.bytes).split_at_mut(self.size);
-        self.bytes = rest;
-        let stamps = self.stamps.take().map(|(ticks, positions)| {
-            let (tick, ticks) = ticks.split_first_mut().expect("a stamp per row");
-            let (position, positions) = positions.split_first_mut().expect("a stamp per row");
-            self.stamps = Some((ticks, positions));
-            (tick, position)
-        });
-        RowView { bytes, stamps }
-    }
-}
-
-/// One row of one column of a split chunk.
+/// One row of one column of a chunk, for writing with its stamp.
 pub(crate) struct RowView<'c> {
     pub(crate) bytes: &'c mut [u8],
     pub(crate) stamps: Option<(&'c mut Tick, &'c mut u32)>,
-}
-
-impl RowView<'_> {
-    pub(crate) fn stamp(&self) -> Option<Stamp> {
-        self.stamps.as_ref().map(|(tick, position)| Stamp { tick: **tick, position: **position })
-    }
 }
 
 /// The rows of one exact component set.

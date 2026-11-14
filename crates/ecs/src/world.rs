@@ -1204,9 +1204,17 @@ impl World {
         }
         let since = mark.stamp();
         let mut rows = Vec::new();
+        let (mut chunks_skipped, mut rows_visited) = (0_usize, 0_usize);
         for (archetype, index) in self.archetypes_with(T::KEY) {
             let columns = &self.storage.archetypes[archetype].columns;
             for chunk in &self.storage.archetypes[archetype].chunks {
+                // The column tick is at or after every row stamp of the chunk, so a chunk
+                // whose column tick is not after the mark holds no changed row.
+                if !chunk.column_ticks[index].after(since, self.tick) {
+                    chunks_skipped += 1;
+                    continue;
+                }
+                rows_visited += chunk.len();
                 let stamps = chunk.stamps[index].as_ref().expect("a tracked column");
                 let values = typed_slice::<T>(chunk.column(&columns[index]), chunk.len());
                 for (row, value) in values.iter().enumerate() {
@@ -1216,6 +1224,13 @@ impl World {
                 }
             }
         }
+        tracing::trace!(
+            target: "casein",
+            component = T::SCHEMA.name(),
+            chunks_skipped,
+            rows_visited,
+            "changed_since"
+        );
         Some(ChangedRows { rows: rows.into_iter() })
     }
 
@@ -1295,7 +1310,7 @@ impl World {
                     regions: typed_slice(chunk.column(&arch.columns[region_index]), chunk.len()),
                     bytes: chunk.column(&arch.columns[index]),
                     stamps: chunk.stamps[index].as_ref(),
-                    column_tick: chunk.column_ticks[index].tick,
+                    column_stamp: chunk.column_ticks[index],
                     epoch: self.epoch,
                     now: self.tick,
                 });

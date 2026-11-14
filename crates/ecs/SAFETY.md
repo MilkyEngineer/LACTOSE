@@ -4,8 +4,8 @@ Every `unsafe` block carries a `// SAFETY:` comment. This file states the invari
 comments rely on. The crate's tests run under Miri.
 
 Architecture section 21 admits `unsafe` here for chunk column storage and for the
-`#[system]` expansion's call of `unsafe SystemDescriptor::new`. The naive implementation
-needs only the second: storage is safe code, and the crate holds three `unsafe fn`
+`#[system]` expansion's call of `unsafe SystemDescriptor::new`. The crate needs only the
+second: storage and the per-chunk kernel path are safe code, and the crate holds three `unsafe fn`
 (`SystemDescriptor::new`, `Finalize::new`, `Finalize::call`) and one `unsafe` block, all on the path from an access table to the code that fetches by it. A
 change that adds a place amends this file in the same commit.
 
@@ -16,8 +16,10 @@ that conflict on a target are ordered, and within a system each parameter names 
 component and no resource is written beside another parameter on it. A table that
 understates what the kernel touches would let the parallel implementation of milestone 1
 hand two kernels `&mut` to one row from safe code. So `SystemDescriptor::new` is `unsafe`,
-with the obligation that the kernel's table and the finalize's table describe exactly what
-each entry point fetches, and the `#[system]` expansion, which derives both from the
+with the obligation that the kernel's table describes exactly what both kernel entry points
+fetch (`Kernel::run`, the one call of a per-region, once-per-tick or exclusive system, and
+`Kernel::each`, a per-entity system's loop over the rows of one unit) and the finalize's
+table what the finalize fetches, and the `#[system]` expansion, which derives all three from the
 parameter types and the `writes` list, is its one caller. A `writes` entry fetches nothing:
 it declares a write the system makes through commands or `&mut World`, outside every
 kernel, and only adds an ordering constraint, so it can make a table overstate what the
@@ -41,11 +43,12 @@ The expansions' `unsafe` blocks are spanned at the call site, never at a user to
 the invoking crate keeps `#![forbid(unsafe_code)]` (section 21, as for `#[component]`).
 `tests/compile_fail.rs` compiles every kind of system in such a crate.
 
-In the naive implementation a table that disagrees with its entry point cannot cause
-undefined behaviour: each parameter is fetched from a value prepared for its index by safe
-code, and a mismatch is a panic ("parameter N does not match the system's access table").
-The obligation exists for the parallel implementation, which will hand out rows to
-concurrent jobs by the table.
+Today a table that disagrees with its entry point cannot cause undefined behaviour: each
+parameter is fetched from a value prepared for its index by safe code (for `Kernel::each`,
+a column the run lent the unit for that index, or nothing for a parameter that is not a
+column), and a mismatch is a panic ("parameter N does not match the system's access
+table"). The obligation exists for the parallel implementation, which will hand out rows
+to concurrent jobs by the table.
 
 ## Chunk columns (no `unsafe`)
 
@@ -59,7 +62,11 @@ so every column is aligned for its type.
   `CheckedBitPattern` on load, and the cast checks them again.
 - Several columns of one chunk are reached at once by splitting the slab with
   `split_at_mut`, and one row of each by splitting again, so the `&mut` a `Mut` holds and
-  the `&` a `&T` holds are disjoint borrows the compiler checks.
+  the `&` a `&T` holds are disjoint borrows the compiler checks. A per-entity run cuts
+  each chunk into units the same way: a column the system writes is split with
+  `split_at_mut` into one range of rows per unit, its row stamps beside it, and a column
+  it only reads is shared, so the units of one chunk hold disjoint `&mut` ranges and can
+  move to different workers.
 - `Ctx` holds the region's seed, tick and asset table, not the world, so no `&World` lives
   beside the rows a kernel writes.
 - A component value with a placeholder in a reference field is not a valid value of its

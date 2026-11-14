@@ -26,9 +26,35 @@ const fn mix(mut z: u64) -> u64 {
     z ^ (z >> 31)
 }
 
+/// A few keys' canonical bytes, held on the stack: the longest use, two keys or a key and
+/// two words, takes 26 bytes.
+pub(crate) struct KeyBytes {
+    bytes: [u8; 32],
+    len: usize,
+}
+
+impl KeyBytes {
+    pub(crate) const fn new() -> Self {
+        Self { bytes: [0; 32], len: 0 }
+    }
+
+    pub(crate) fn push(&mut self, byte: u8) {
+        self.extend_from_slice(&[byte]);
+    }
+
+    pub(crate) fn extend_from_slice(&mut self, bytes: &[u8]) {
+        self.bytes[self.len..self.len + bytes.len()].copy_from_slice(bytes);
+        self.len += bytes.len();
+    }
+
+    pub(crate) fn as_slice(&self) -> &[u8] {
+        &self.bytes[..self.len]
+    }
+}
+
 /// The canonical bytes of a key, as the predicted ordinal and the RNG hash them: a tag
 /// byte (1 `Net`, 2 `Predicted`, 3 `Placeholder`) and the key's words, little-endian.
-pub(crate) fn key_bytes(key: StableKey, out: &mut Vec<u8>) {
+pub(crate) fn key_bytes(key: StableKey, out: &mut KeyBytes) {
     match key {
         StableKey::Net(id) => {
             out.push(1);
@@ -57,13 +83,13 @@ impl Rng {
         invoker: Option<StableKey>,
         key: StableKey,
     ) -> Self {
-        let mut bytes = Vec::with_capacity(32);
+        let mut bytes = KeyBytes::new();
         match invoker {
             Some(invoker) => key_bytes(invoker, &mut bytes),
             None => bytes.push(0),
         }
         key_bytes(key, &mut bytes);
-        Self { key: [seed, u64::from(tick.0), system.0, xxh64(&bytes, 0)], counter: 0 }
+        Self { key: [seed, u64::from(tick.0), system.0, xxh64(bytes.as_slice(), 0)], counter: 0 }
     }
 
     /// The next 64 random bits.

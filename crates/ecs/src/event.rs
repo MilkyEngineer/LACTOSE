@@ -9,10 +9,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use bytemuck::{CheckedBitPattern, NoUninit};
 use lactose_core::{FixedHashMap, StableKey, Tick};
 
-use crate::access::{Access, AccessKind, events_target, no_target};
+use crate::access::{Access, AccessKind, AccessTarget, events_target, no_target};
 use crate::change::tick_before;
 use crate::param::{SystemParam, sealed};
 use crate::system::{Fetch, Invocation, Slot, mismatch};
+use crate::unit::{Row, RowFetch, SinkColumn, Unit, UnitColumn};
 
 /// A simulation event: a cross-entity effect emitted by one system and consumed by a later
 /// one, never a direct write to another row. Indexed by its target.
@@ -421,5 +422,46 @@ impl PresentLog {
     /// Forgets delivered keys below `oldest`, which no restore can reach.
     pub(crate) fn prune(&mut self, oldest: Tick) {
         self.delivered.retain(|&tick, _| !tick_before(tick, oldest));
+    }
+}
+
+// How the event parameters are made for a row of a unit (the per-chunk kernel path).
+
+impl<'a, 'r, E: Event> RowFetch<'a, 'r> for EventWriter<'a, E> {
+    type Column = SinkColumn;
+
+    fn row(column: &'a mut Self::Column, row: &mut Row<'a>) -> Self {
+        Self { sink: row.emit.take(column.0), _event: PhantomData }
+    }
+}
+
+/// An event type's list, found once per unit.
+#[doc(hidden)]
+pub struct EventsColumn<'r> {
+    list: &'r EventList,
+}
+
+impl<'r> UnitColumn<'r> for EventsColumn<'r> {
+    fn take(unit: &mut Unit<'r>, index: usize) -> Self {
+        let AccessTarget::Events { type_id, .. } = unit.access(index).target() else {
+            mismatch(index)
+        };
+        Self { list: unit.env().events.get(&type_id).unwrap_or_else(|| EventList::empty()) }
+    }
+}
+
+impl<'a, 'r, E: Event> RowFetch<'a, 'r> for Events<'a, E> {
+    type Column = EventsColumn<'r>;
+
+    fn row(column: &'a mut Self::Column, _: &mut Row<'a>) -> Self {
+        Self { list: column.list, _event: PhantomData }
+    }
+}
+
+impl<'a, 'r> RowFetch<'a, 'r> for PresentEvents<'a> {
+    type Column = SinkColumn;
+
+    fn row(column: &'a mut Self::Column, row: &mut Row<'a>) -> Self {
+        Self { sink: row.present.take(column.0) }
     }
 }

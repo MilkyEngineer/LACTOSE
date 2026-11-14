@@ -217,6 +217,45 @@ fn call(function: &Ident, types: &[Type]) -> TokenStream {
     quote!(#function(#(#fetches),*))
 }
 
+/// The per-unit entry point: every parameter takes its column from the unit once, then
+/// `function` runs on each row the unit hands out, with each parameter made from its
+/// column for that row, and a reduction folds each result into the unit's partial. The
+/// column types are inferred from the parameters they make, as `fetch`'s are. Emitted for
+/// every system, since the kind is the schedule's to decide; it runs only for a
+/// per-entity one.
+fn each(function: &Ident, types: &[Type], reduce: Option<&Type>) -> TokenStream {
+    let columns: Vec<Ident> = (0..types.len()).map(|index| format_ident!("__c{}", index)).collect();
+    let takes = columns.iter().enumerate().map(|(index, column)| {
+        quote!(let mut #column = ::lactose_ecs::__private::column(__unit, #index);)
+    });
+    let rows = columns
+        .iter()
+        .map(|column| quote!(::lactose_ecs::__private::row(&mut #column, &mut __row)));
+    let call = quote!(#function(#(#rows),*));
+    let (start, fold, end) = match reduce {
+        Some(reduce) => (
+            quote!(let mut __partial = ::lactose_ecs::__private::identity::<#reduce>();),
+            quote!(::lactose_ecs::__private::add::<#reduce>(&mut __partial, #call);),
+            quote!(::lactose_ecs::__private::keep::<#reduce>(__unit, __partial);),
+        ),
+        None => (quote!(), quote!(#call;), quote!()),
+    };
+    quote! {
+        // A system without parameters makes nothing from the row.
+        #[allow(unused_mut, unused_variables)]
+        fn __each(__unit: &mut ::lactose_ecs::__private::Unit<'_>) {
+            #(#takes)*
+            #start
+            while let ::core::option::Option::Some(mut __row) =
+                ::lactose_ecs::__private::next_row(__unit)
+            {
+                #fold
+            }
+            #end
+        }
+    }
+}
+
 /// Expands `#[system(...)]`.
 pub(crate) fn system(args: TokenStream, item: TokenStream) -> TokenStream {
     try_system(args, item.clone()).unwrap_or_else(|error| failed(item, &error))
@@ -288,6 +327,7 @@ fn try_system(args: TokenStream, item: TokenStream) -> Result<TokenStream> {
     let after_count = args.after.len();
     let access = access_table(&types, &args.writes);
     let invoke = call(&ident, &types);
+    let each = each(&ident, &types, args.reduce.as_ref());
     let exclusive = args.exclusive;
     let finalize_name = format_ident!("__finalize_{}", ident.unraw());
 
@@ -335,6 +375,7 @@ fn try_system(args: TokenStream, item: TokenStream) -> Result<TokenStream> {
             const __ACCESS: &[::lactose_ecs::Access] = #access;
             static __AFTER: [&::lactose_ecs::SystemDescriptor; #after_count] = [#(&#after),*];
             #run
+            #each
             #finalize_fn
             unsafe {
                 ::lactose_ecs::SystemDescriptor::new(
@@ -348,6 +389,7 @@ fn try_system(args: TokenStream, item: TokenStream) -> Result<TokenStream> {
                     #reduce_name,
                     ::lactose_ecs::__private::Kernel {
                         run: __run,
+                        each: __each,
                         finalize: #finalize,
                         reducer: #reducer,
                     },
@@ -455,6 +497,20 @@ mod tests {
         let first = expansion.find("writes :: < A >").expect("a `writes` entry for A");
         assert!(parameter < first, "{expansion}");
         assert!(expansion.contains("writes :: < m :: B >"), "{expansion}");
+    }
+
+    #[test]
+    fn the_unit_entry_point_takes_each_column_once_and_calls_the_function_per_row() {
+        let expansion = expand("name = \"t::f\"", "fn f(a: &A, b: Mut<B>) {}");
+        let each = &expansion[expansion.find("fn __each").expect("the unit entry point")..];
+        for index in ["0", "1"] {
+            let take = format!("__private :: column (__unit , {index}usize)");
+            assert_eq!(each.matches(&take).count(), 1, "{each}");
+        }
+        let lend = each.find("while let").expect("the row loop");
+        assert!(each.find("column (__unit").unwrap() < lend, "columns taken before the loop");
+        assert!(each[lend..].contains("f (:: lactose_ecs :: __private :: row"), "{each}");
+        assert!(expansion.contains("each : __each"), "{expansion}");
     }
 
     #[test]
