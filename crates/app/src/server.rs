@@ -84,15 +84,16 @@ impl From<Box<Failed>> for ServerError {
 /// once. A `Loaded` start puts the saved tick and counter into the builder and every saved
 /// region into the store; under `Directed` each is also queued for the first step, as
 /// `Loader::bundle(&records, baseline, RegionMode::Simulated, table)` with `table` the
-/// region's `Cooked::table` pinned through `Cooked::pin`, or `None` when it has none or
-/// the pin fails (logged at `warn`); under `Anchored` each saved pinned region is queued
-/// the same way in `RegionMode::Frozen`, so it loads at the first step as it would have
-/// stepped on unsaved, and the lifecycle's `Load` requests bring the others back as
-/// players join (`README.md`, "Saves and loads"). Fails as the builder fails (a
+/// region's `Cooked::table` pinned through `Cooked::pin`, or `None` when it has none;
+/// under `Anchored` each saved pinned region is queued the same way in
+/// `RegionMode::Frozen`, with its table required, so it loads at the first step as it
+/// would have stepped on unsaved, and the lifecycle's `Load` requests bring the others
+/// back as players join (`README.md`, "Saves and loads"). Fails as the builder fails (a
 /// registration or setup error carries its crate's name; `log_retention` below the cap is
-/// `InvalidData`), as the solver pool fails, as `Loader::bundle` fails for a region queued
-/// here, and with `InvalidData` if `start` is `Loaded`, `config.regions` is `Anchored` and
-/// a saved region is not in the atlas.
+/// `InvalidData`), as the solver pool fails, as `Cooked::pin` fails or `Loader::bundle`
+/// fails for a region queued here, and, when `start` is `Loaded` and `config.regions` is
+/// `Anchored`, with `InvalidData` if a saved region is not in the atlas and `NotFound` if a
+/// saved pinned region has no `Cooked::table`.
 pub fn build_server(
     executor: &Executor,
     game: &Game,
@@ -110,7 +111,7 @@ pub fn build_server(
             RegionControl::Directed => {
                 let loader = Loader::new(&schemas, &migrations);
                 for (&region, entry) in &saved.regions {
-                    let table = pinned_table(&*cooked, region);
+                    let table = cooked.table(region).map(|table| cooked.pin(&table)).transpose()?;
                     let bundle = loader.bundle(
                         &entry.records,
                         Arc::clone(&entry.baseline),
@@ -129,16 +130,22 @@ pub fn build_server(
                 }
                 // A pinned region runs whenever the server does: a resume that waited for
                 // the lifecycle's request would run it a tick late, and diverge from the
-                // world that was never saved.
+                // world that was never saved. Queued here, it is never requested, so one
+                // that could load no table would wait frozen with nothing to say so.
                 let loader = Loader::new(&schemas, &migrations);
                 for region in pinned {
                     let Some(entry) = saved.regions.get(region) else { continue };
-                    let table = pinned_table(&*cooked, *region);
+                    let table = cooked.table(*region).ok_or_else(|| {
+                        Error::new(
+                            ErrorKind::NotFound,
+                            format!("the saved pinned region {} has no cooked table", region.0),
+                        )
+                    })?;
                     let bundle = loader.bundle(
                         &entry.records,
                         Arc::clone(&entry.baseline),
                         RegionMode::Frozen,
-                        table,
+                        Some(cooked.pin(&table)?),
                     )?;
                     queued.insert(*region, bundle);
                 }
@@ -173,8 +180,8 @@ pub fn build_server(
 }
 
 /// `region`'s cooked table pinned, or `None`, logged at `warn`, while it has none or its pin
-/// fails: the region then loads `Frozen` and waits for `TickInput::assets`, as a table not
-/// yet published is the store's ordinary transient case.
+/// fails: a region answered by the store then loads `Frozen` and waits for
+/// `TickInput::assets`, as a table not yet published is the store's ordinary transient case.
 fn pinned_table(cooked: &dyn Cooked, region: RegionId) -> Option<PinnedTable> {
     let Some(table) = cooked.table(region) else {
         warn!(

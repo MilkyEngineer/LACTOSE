@@ -57,7 +57,8 @@ pub enum Start {
     /// saved tick and counter into the builder, every saved region into the server's store
     /// (`Server::kept`), from which the first step loads every one under `Directed`, and
     /// under `Anchored` the pinned ones, the lifecycle's `Load` requests bringing the
-    /// others back as players join, so no saved region is lost; every player joins again through `sessions` (`README.md`,
-    /// "Saves and loads").
+    /// others back as players join, so no saved region is lost; every player joins again
+    /// through `sessions` (`README.md`, "Saves and loads"). `build_server` lists how
+    /// such a start fails.
     Loaded(SavedWorld),
 }

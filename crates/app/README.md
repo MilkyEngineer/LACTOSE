@@ -223,9 +223,10 @@ root")
   else: `pacer.poll(now)`, preceded by `pacer.resync(now)` while `time_scale()` is zero
   (a pacer stopped with a tick owed still pays it out, which would run a tick on a paused
   world, and an unpause owes from the last paused frame on), the budget's ticks taken as
-  one when it owes none and a zero scale is pending ("Time scale" below); for each tick, `frames(next)` with `next` the tick
-  about to run (`Tick(tick().0 + 1)`), and `Server::step` with what it returns, its
-  requests and refusals appended to the output's, or an end to the frame's stepping on
+  one when it owes none and a zero scale is pending ("Time scale" below); for each tick,
+  `frames(next)` with `next` the tick about to run (`Tick(tick().0 + 1)`), and
+  `Server::step` with what it returns, its requests and refusals appended to the
+  output's, or an end to the frame's stepping on
   `None`, the due ticks not run being forgotten (the pacer counted them) and nothing else
   changing, and the same end after a step that carried a zero scale, pending or the
   callback's own, so no tick runs with the world paused; `Simulation::run_passes` once,
@@ -445,21 +446,26 @@ root")
   `Loader::bundle(&records, baseline, RegionMode::Frozen, table)`, with `table` the
   region's `Cooked::table` pinned through `Cooked::pin`, or `None` when it has none or the
   pin fails (logged at `warn`; the region loads `Frozen` until a table arrives through
-  `TickInput::assets`), is queued for the next step, which puts it in `frame.loaded`. The request is still
-  reported in `StepOutput::requests`, so the store's driver can resolve the table and
-  release the region later; its own bundle for the region, if it sends one in the step the
-  server's is queued for, lends `mode` and `assets` as below. The caller answers only the
-  `Load`s whose region is not in `Server::kept` read after the step that issued them: a
-  bundle it sends for a kept region once the server's has loaded is refused as already
-  loaded, a `LoadFailure` that fails a SOUR test's `failures.is_empty()`. A `Cancel`
-  drops a queued bundle; the records stay kept. Under `Anchored`, a `Start::Loaded` also
-  queues every saved pinned region for the first step, as
+  `TickInput::assets`), is queued for the next step, which puts it in `frame.loaded`. The
+  request is still reported in `StepOutput::requests`, so the store's driver can resolve
+  the table and release the region later; its own bundle for the region, if it sends one
+  in the step the server's is queued for, lends `mode` and `assets` as below. The caller
+  answers only the `Load`s whose region is not in `Server::kept` read after the step that
+  issued them: a bundle it sends for a kept region once the server's has loaded is
+  refused as already loaded, a `LoadFailure` that fails a SOUR test's
+  `failures.is_empty()`. A `Cancel` drops a queued bundle; the records stay kept. Under
+  `Anchored`, a `Start::Loaded` also queues every saved pinned region for the first step,
+  as
   `Loader::bundle(.., RegionMode::Frozen, table)` built at `build_server`: a pinned region
   is simulated whenever the server runs, so it loads at the first step, as it would have
-  stepped had the world never been saved, and is never requested. Under `Directed`, a
+  stepped had the world never been saved, and is never requested. Its table is required:
+  being never requested, a pinned region loaded without one would wait frozen with nothing
+  in the output to say so, so `build_server` fails with `NotFound` when `Cooked::table`
+  has none for it and with the pin's error when `Cooked::pin` fails. Under `Directed`, a
   `Start::Loaded` queues every saved region for the first step, as
-  `Loader::bundle(.., RegionMode::Simulated, table)` built at `build_server` (so a region
-  that cannot be bundled fails the build), and a region unloaded through
+  `Loader::bundle(.., RegionMode::Simulated, table)` built at `build_server`, with `table`
+  `None` when the region has none (so a region that cannot be bundled, or whose table
+  cannot be pinned, fails the build), and a region unloaded through
   `TickInput::unloaded` comes back when a frame names it in `loaded` (next bullet). A
   bundle the server cannot build for a kept region at a request (`Loader::bundle` fails)
   is a `LoadFailure` in the output with that error, and the records stay kept; the
@@ -637,7 +643,7 @@ timing:
 | The frame | A frame callback that records the ticks it was asked for sees consecutive ticks; `None` stops the frame at its tick and the passes still run; `behind` is reported when more than the cap is owed; a poll at the build instant owes one tick and a run after a gap starts with none owed |
 | Time scale, server | With the real `TickPacer` over a stand-in clock, at 60 Hz frames, at 30 Hz frames and at a 2x scale (frames owing two ticks): after `set_time_scale(PAUSED)` the next frame runs exactly one tick whose `TickInput` carries `Some(PAUSED)`, the mirror reads `PAUSED`, `time_scale()` reads `PAUSED` after that step and not before, and the following frames run no tick; a callback's own `Some(PAUSED)` in the first of two due ticks ends the frame after that tick; after `set_time_scale(REAL_TIME)` `time_scale()` reads `REAL_TIME` at once, the next frame runs ticks and the first carries `Some(REAL_TIME)`; on a paused server, `set_time_scale(REAL_TIME)` then `set_time_scale(PAUSED)` in one gap runs no tick and leaves `time_scale()` and the mirror at `PAUSED`, and `PAUSED` then `REAL_TIME` in one gap on a running server runs ticks with the mirror at `REAL_TIME`; between runs with no scale pending `time_scale()` equals the mirror; the same through `step`; a pause carried by `step` on a new server, or in a frame that is behind, leaves the next frame no tick, and a pause pending on a frame owing nothing is carried by one tick; a repeated scale is dropped; over 50 pause cycles the schedule drifts by at most one tick per pause |
 | Time scale, client | A due frame carrying `Some(PAUSED)` pauses the pacer at the fold and the frame runs no tick and pops nothing; a later frame carrying `Some(REAL_TIME)` makes ticks due at its fold, the first step carries `Some(REAL_TIME)` and the hook pops both frames; a new client paced at rate zero, or whose first due frame carries a pause, runs no tick |
-| The store | A region unloaded under `Directed` is in `kept` after the step and not in `baselines`; a frame that loads it fresh loads the stored state with the frame's mode and table, `info` logged; a `save_point` after the unload holds it; under `Anchored`, a saved world of N regions with one pinned, started `Loaded`, loads the pinned region at the first step, reports no refusal, and after a `Join` into a saved region the lifecycle's `Load` is answered from the store at the next step and the region leaves `kept`; a world resumed that way matches the one that was never saved, counter and hash, at every tick; a save after K ticks holds every one of the N regions; join then leave: a saved world of 25 regions started `Loaded` under `Anchored`, a `Join` whose `Load`s the store answers, and the player's `Leave` in the step that loads the 25 bundles, so every bundle is accepted and its region unloaded again in one step: all 25 are in `kept` after that step, none in the baselines, and a save then holds all 25; under `Directed`, a region unloaded and reloaded in one frame whose reload bundle is refused is in `kept` with its export's records and not in the baselines, and one whose reload is accepted is loaded, not kept, with the reloading bundle's baseline; an unload whose diff fails (a region created through `Simulation::world_mut`, no baseline) fails the step with `NotFound` and `server: None`; a kept region whose table cannot be pinned at a store answer is no refusal: it loads `Frozen` with no table and takes one through `TickInput::assets`; a region is never both loaded and kept |
+| The store | A region unloaded under `Directed` is in `kept` after the step and not in `baselines`; a frame that loads it fresh loads the stored state with the frame's mode and table, `info` logged; a `save_point` after the unload holds it; under `Anchored`, a saved world of N regions with one pinned, started `Loaded`, loads the pinned region at the first step, reports no refusal, and after a `Join` into a saved region the lifecycle's `Load` is answered from the store at the next step and the region leaves `kept`; a world resumed that way matches the one that was never saved, counter and hash, at every tick; such a resume fails at `build_server` with `NotFound` when the pinned region has no table and with the pin's error when its pin fails, and under `Directed` a pin failure at the build fails it while a missing table loads the region with none; a save after K ticks holds every one of the N regions; join then leave: a saved world of 25 regions started `Loaded` under `Anchored`, a `Join` whose `Load`s the store answers, and the player's `Leave` in the step that loads the 25 bundles, so every bundle is accepted and its region unloaded again in one step: all 25 are in `kept` after that step, none in the baselines, and a save then holds all 25; under `Directed`, a region unloaded and reloaded in one frame whose reload bundle is refused is in `kept` with its export's records and not in the baselines, and one whose reload is accepted is loaded, not kept, with the reloading bundle's baseline; an unload whose diff fails (a region created through `Simulation::world_mut`, no baseline) fails the step with `NotFound` and `server: None`; a kept region whose table cannot be pinned at a store answer is no refusal: it loads `Frozen` with no table and takes one through `TickInput::assets`; a region is never both loaded and kept |
 | Baselines | A region loaded, unloaded and saved is diffed against the bundle it was loaded with, also when its reload in the same frame is refused; a refused bundle records nothing; a reload records the reloading bundle's baseline |
 | Save and load | `save_point`, `encode_save`, `Io::replace` into a temporary directory, `load`, a `Start::Loaded` headless app stepped K ticks against the original stepped K more: equal hashes; the same through a `SavedWorld` with no file; a `Start::Loaded` with a corrupt section fails at `load`; a failed replace leaves the previous file |
 | Refusals | A bundle for a loaded region is a `LoadFailure` in `StepOutput::failures` and in `FrameOutput::failures`; a session event the applier refuses, or a `Join` for a region the atlas lacks under `Anchored`, and an asset failure the frame carries appear the same way; `is_empty` otherwise |

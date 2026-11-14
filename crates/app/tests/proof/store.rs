@@ -5,7 +5,7 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-use lactose_app::{SavedWorld, Server, Start, WorldConfig};
+use lactose_app::{Cooked, SavedWorld, Server, Start, WorldConfig, build_server};
 use lactose_bundle::ComponentData;
 use lactose_core::{ComponentKey, ErrorKind, StableKey};
 use lactose_ecs::{Executor, RegionConfig, RegionId, RegionMode};
@@ -13,8 +13,8 @@ use lactose_persist::RegionRecords;
 use lactose_sim::{RegionExport, RegionRequest, SessionEvent, TickInput};
 
 use crate::common::{
-    Content, Counter, anchored, capture, executor, kept, load, loaded, logged, server, session,
-    step, table_of, try_step,
+    Content, Counter, GAME, anchored, capture, executor, kept, load, loaded, logged, server,
+    session, step, table_of, try_step,
 };
 
 /// Spawns a counter at zero into loaded `region`, an unjournaled edit.
@@ -204,6 +204,89 @@ fn an_anchored_resume_matches_the_original_that_was_not_reloaded() {
         assert_eq!(resumed.hash().expect("hash"), original.hash().expect("hash"));
     }
     original.shutdown();
+    resumed.shutdown();
+    executor.shutdown();
+}
+
+/// The error `build_server` fails with for `start` over `content`.
+fn build_error(
+    executor: &Executor,
+    config: WorldConfig,
+    start: Start,
+    content: &Arc<Content>,
+) -> lactose_core::Error {
+    let cooked = Arc::clone(content) as Arc<dyn Cooked>;
+    build_server(executor, &GAME, config, start, cooked).err().expect("the build fails")
+}
+
+/// An Anchored world saved with its pinned region 100 loaded, its counter at 1.
+fn saved_pinned(executor: &Executor, content: &Arc<Content>) -> SavedWorld {
+    let original = server(executor, anchored([100]), Start::Fresh, content);
+    let (original, _) = step(executor, original, TickInput::default());
+    let (mut original, _) = step(executor, original, load(content, [100]));
+    spawn_counter(&mut original, 100);
+    let original = step(executor, original, TickInput::default()).0;
+    let (original, saved) = save(executor, original);
+    original.shutdown();
+    saved
+}
+
+/// A resumed pinned region is never requested, so one loaded without its table would wait
+/// frozen with nothing in the output to say so: its pin failing fails the build.
+#[test]
+fn an_anchored_resume_whose_pinned_table_cannot_be_pinned_fails_the_build() {
+    let executor = executor(2);
+    let content = Content::new();
+    let saved = saved_pinned(&executor, &content);
+    content.fail_pins.store(1, Ordering::Relaxed);
+    let error = build_error(&executor, anchored([100]), Start::Loaded(saved.clone()), &content);
+    assert_eq!(error.kind(), ErrorKind::NotFound, "the pin's own error: {error}");
+    assert!(error.to_string().contains("not published"), "{error}");
+    assert_eq!(content.fail_pins.load(Ordering::Relaxed), 0, "the pin was tried");
+    let resumed = server(&executor, anchored([100]), Start::Loaded(saved), &content);
+    let (resumed, out) = step(&executor, resumed, TickInput::default());
+    assert!(out.failures.is_empty(), "{out:?}");
+    assert_eq!(loaded(&resumed), BTreeSet::from([100]), "a later build that pins loads it");
+    resumed.shutdown();
+    executor.shutdown();
+}
+
+/// The same with no table for the pinned region at the resume: `NotFound` from the build.
+#[test]
+fn an_anchored_resume_with_no_pinned_table_fails_the_build() {
+    let executor = executor(2);
+    let content = Content::new();
+    let saved = saved_pinned(&executor, &content);
+    let later = Content::without(BTreeSet::from([RegionId(100)]));
+    let error = build_error(&executor, anchored([100]), Start::Loaded(saved.clone()), &later);
+    assert_eq!(error.kind(), ErrorKind::NotFound, "{error}");
+    assert!(error.to_string().contains("pinned region 100 has no cooked table"), "{error}");
+    // A region that is not pinned may lack its table: it is requested, not queued.
+    let resumed = server(&executor, anchored([]), Start::Loaded(saved), &later);
+    resumed.shutdown();
+    executor.shutdown();
+}
+
+/// Under `Directed` every saved region is queued at the build, so a pin failure there fails
+/// the build; a region with no table loads with none.
+#[test]
+fn a_directed_resume_whose_table_cannot_be_pinned_fails_the_build() {
+    let executor = executor(2);
+    let content = Content::new();
+    let original = server(&executor, WorldConfig::headless(), Start::Fresh, &content);
+    let (original, _) = step(&executor, original, load(&content, [1]));
+    let (original, saved) = save(&executor, original);
+    original.shutdown();
+    content.fail_pins.store(1, Ordering::Relaxed);
+    let error =
+        build_error(&executor, WorldConfig::headless(), Start::Loaded(saved.clone()), &content);
+    assert_eq!(error.kind(), ErrorKind::NotFound, "the pin's own error: {error}");
+    assert!(error.to_string().contains("not published"), "{error}");
+    let later = Content::without(BTreeSet::from([RegionId(1)]));
+    let resumed = server(&executor, WorldConfig::headless(), Start::Loaded(saved), &later);
+    let (resumed, out) = step(&executor, resumed, TickInput::default());
+    assert!(out.failures.is_empty(), "{out:?}");
+    assert!(resumed.simulation().world().region_assets(RegionId(1)).is_none());
     resumed.shutdown();
     executor.shutdown();
 }
