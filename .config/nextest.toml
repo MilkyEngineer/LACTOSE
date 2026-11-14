@@ -4,3 +4,10 @@
 # 4 x 60 s in `tests/block_in_place.rs`, which reports before the kill.
 [profile.default]
 slow-timeout = { period = "60s", terminate-after = 5 }
+
+# The netcode spike's ignored measurements (`crates/app/tests/spike.rs`) replay ten minutes of
+# ticks in release: the slowest, fifty thrown bodies under the clock script, took 149 to 181 s
+# at load averages of 8 to 25 on an M1. Ten periods leave three times that.
+[[profile.default.overrides]]
+filter = 'test(/^ten_minutes_/)'
+slow-timeout = { period = "60s", terminate-after = 10 }

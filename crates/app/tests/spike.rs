@@ -16,7 +16,8 @@
 //! which records after every tick a hash of both worlds and of every datagram either end
 //! sent that frame. The ignored measurement tests replay each scene to 36,000 ticks in
 //! release, with the clock script and on the server's clock, and print the figures of each
-//! run as one JSON object.
+//! run as one JSON object; one more, not recorded, measures a claim made on approach,
+//! before the character touches the crate.
 //!
 //! The seeds of the link and of the clock script are the test's, outside both worlds.
 //! Inside them every reference, ordering rule and RNG key is a `StableKey`.
@@ -105,6 +106,9 @@ const LIFETIME: u32 = 240;
 const CLAIM_LONE: u32 = 100;
 const CLAIM_STACK: u32 = 160;
 const RELEASE: u32 = 260;
+/// The phase at which the server claims the lone crate on approach: some twenty ticks
+/// before the character reaches it, more than the lead.
+const CLAIM_APPROACH: u32 = 60;
 /// `Hop` states: idle, set in `Stage::Post` once the character is past the line, spent by
 /// the next tick's steering as a jump.
 const HOP_IDLE: u32 = 0;
@@ -263,6 +267,28 @@ fn claims(
     }
 }
 
+/// The server's claim of the lone crate on approach, before the character touches it,
+/// released as the claim scene's are; every cycle's first tick puts the crate back.
+#[system(name = "spike::claim_on_approach", worlds = [server], after = throw, writes = [ClaimedBy])]
+fn claim_on_approach(
+    ctx: Ctx,
+    key: StableKeyOf,
+    pushable: &Pushable,
+    transform: Mut<Transform>,
+    velocity: Mut<Velocity>,
+    commands: Commands,
+) {
+    match ctx.tick().0 % CYCLE {
+        0 => {
+            transform.set_if_neq(Transform::at(crate_home(pushable.0)));
+            velocity.set_if_neq(Velocity::ZERO);
+        }
+        CLAIM_APPROACH => commands.set(key.key(), ClaimedBy { player: PLAYER }),
+        RELEASE => commands.remove::<ClaimedBy>(key.key()),
+        _ => {}
+    }
+}
+
 fn register_types(types: &mut TypeTable) -> Result<()> {
     types.register::<Lifetime>()?;
     types.register::<Pushable>()?;
@@ -275,11 +301,26 @@ fn register_systems(registration: &mut Registration) {
     registration.stage(Stage::Post).add(&MARK_HOP);
 }
 
+fn register_approach_systems(registration: &mut Registration) {
+    let simulation = registration.stage(Stage::Simulation);
+    simulation.add(&STEER).add(&THROW).add(&EXPIRE).add(&CLAIM_ON_APPROACH);
+    registration.stage(Stage::Post).add(&MARK_HOP);
+}
+
 static SPIKE: CrateRegistration = CrateRegistration {
     name: "spike",
     types: register_types,
     setup: None,
     systems: register_systems,
+    migrations: None,
+};
+
+/// The spike's crate with the claim on approach in place of the claim scene's claims.
+static SPIKE_APPROACH: CrateRegistration = CrateRegistration {
+    name: "spike",
+    types: register_types,
+    setup: None,
+    systems: register_approach_systems,
     migrations: None,
 };
 
@@ -292,24 +333,37 @@ static KINEMATIC: Game =
 /// The dynamic character among four crates.
 static CRATES: Game =
     Game { name: "spike-crates", crates: &[SPIKE], order: None, sessions: Some(crates) };
+/// The dynamic character and the lone crate, claimed on approach: the measurement's one
+/// contact between claimed bodies.
+static APPROACH: Game = Game {
+    name: "spike-approach",
+    crates: &[SPIKE_APPROACH],
+    order: None,
+    sessions: Some(lone_crate),
+};
 
 fn dynamic() -> Box<dyn SessionApplier> {
-    Box::new(Arena { kinematic: false, crates: false })
+    Box::new(Arena { kinematic: false, crates: 0 })
 }
 
 fn kinematic() -> Box<dyn SessionApplier> {
-    Box::new(Arena { kinematic: true, crates: false })
+    Box::new(Arena { kinematic: true, crates: 0 })
 }
 
 fn crates() -> Box<dyn SessionApplier> {
-    Box::new(Arena { kinematic: false, crates: true })
+    Box::new(Arena { kinematic: false, crates: 4 })
+}
+
+fn lone_crate() -> Box<dyn SessionApplier> {
+    Box::new(Arena { kinematic: false, crates: 1 })
 }
 
 /// The session applier: a join builds the arena (a floor and four walls, fixed, and the
-/// crates of the claim scene) and the player's capsule, claimed and anchored.
+/// first `crates` crates of the claim scene) and the player's capsule, claimed and
+/// anchored.
 struct Arena {
     kinematic: bool,
-    crates: bool,
+    crates: u32,
 }
 
 impl SessionApplier for Arena {
@@ -331,9 +385,9 @@ impl SessionApplier for Arena {
             let key = StableKey::Net(world.allocate_net_id()?);
             world.spawn(key, region, (Transform::at(at), Collider::new(Shape::cuboid(extents))))?;
         }
-        if self.crates {
+        if self.crates > 0 {
             let extents = Vec3::new(scalar(0.4), scalar(0.4), scalar(0.4));
-            for index in 0..4 {
+            for index in 0..self.crates {
                 let key = StableKey::Net(world.allocate_net_id()?);
                 let row = (
                     Pushable(index),
@@ -367,13 +421,14 @@ impl SessionApplier for Arena {
     }
 }
 
-/// The four scenes.
+/// The four scenes, and the measurement's claim on approach.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Scene {
     Capsule,
     Kinematic,
     Thrown,
     Claim,
+    Approach,
 }
 
 impl Scene {
@@ -383,6 +438,7 @@ impl Scene {
             Self::Kinematic => "kinematic character",
             Self::Thrown => "fifty thrown bodies",
             Self::Claim => "claim in contact",
+            Self::Approach => "claim on approach",
         }
     }
 
@@ -391,19 +447,20 @@ impl Scene {
             Self::Capsule | Self::Thrown => &DYNAMIC,
             Self::Kinematic => &KINEMATIC,
             Self::Claim => &CRATES,
+            Self::Approach => &APPROACH,
         }
     }
 
     /// The scripted sample of `tick`. The walk: idle, ahead, a turn right, a turn left,
-    /// back, idle; the claim scene walks ahead into the crates and stops; the thrown
-    /// scene holds `Throw` over phases 60 to 89 beside the walk.
+    /// back, idle; the claim scenes walk ahead into the crates and stop; the thrown scene
+    /// holds `Throw` over phases 60 to 89 beside the walk.
     fn input(self, tick: Tick) -> PlayerInput {
         let phase = tick.0 % CYCLE;
         let stick = |turn: f64, forward: f64| Axis2 {
             x: (turn * f64::from(AXIS_SCALE)) as i16,
             y: (forward * f64::from(AXIS_SCALE)) as i16,
         };
-        let movement = if self == Self::Claim {
+        let movement = if matches!(self, Self::Claim | Self::Approach) {
             if (30..200).contains(&phase) { stick(0.0, 0.5) } else { Axis2::ZERO }
         } else {
             match phase {
@@ -1959,6 +2016,8 @@ struct Outcome {
     agreed: u64,
     /// Of the ticks compared, those at which the player's `Hop` agreed.
     hop_agreed: u64,
+    /// Of the ticks compared, those that ended with the server's carrier set.
+    hop_set_compared: u32,
     /// The server ticks that ended with the player's `Hop` pending: the carrier set.
     hop_pending: u32,
     yaw_errors: Vec<f64>,
@@ -2175,6 +2234,7 @@ fn run(
             outcome.compared += 1;
             outcome.agreed += u64::from(hash == server_hash);
             outcome.hop_agreed += u64::from(Some(predicted_hop) == hop);
+            outcome.hop_set_compared += u32::from(hop == Some(HOP_PENDING));
             end.predicted.retain(|&predicted, _| predicted.0 > tick.0);
         }
         server = Some(current);
@@ -2451,6 +2511,12 @@ fn check_outcome(plan: Plan, outcome: &Outcome) {
     // every tick compared.
     assert!(outcome.compared > 0);
     assert_eq!(outcome.hop_agreed, outcome.compared, "the predicted carrier is the server's");
+    // Among them the tick it is set on, but in the claim scene: a prediction a correction
+    // follows within the lead is not compared, and that scene corrects at every update
+    // while the character pushes the unclaimed crate, which is when the carrier is set.
+    if plan.scene != Scene::Claim {
+        assert!(outcome.hop_set_compared > 0, "a tick with the carrier set was compared");
+    }
     let stalls = plan.clock == ClockScript::Drifting && plan.ticks >= STALL.end + 60;
     if stalls {
         assert!(
@@ -2722,7 +2788,7 @@ fn report(plan: Plan, outcome: &mut Outcome, recorded_stream: u64) -> String {
     let worst_rollback = outcome.rollback_us.iter().copied().fold(0.0, f64::max);
     let median_rollback = median(&mut outcome.rollback_us);
     let mean = |values: &[usize]| values.iter().sum::<usize>() as f64 / values.len().max(1) as f64;
-    // How long after each throw the claimed bodies keep correcting.
+    // How long after a throw the claimed bodies kept correcting, in the worst cycle.
     let settle = if plan.scene == Scene::Thrown {
         (0..plan.ticks / CYCLE)
             .filter_map(|cycle| {
@@ -2739,6 +2805,16 @@ fn report(plan: Plan, outcome: &mut Outcome, recorded_stream: u64) -> String {
     } else {
         0
     };
+    // The mismatches of each cycle, and the first after the join's cycle: where a scene
+    // whose client agrees with the server leaves that agreement.
+    let mut per_cycle = vec![0u32; plan.ticks.div_ceil(CYCLE) as usize];
+    for tick in &outcome.mismatches {
+        if let Some(count) = per_cycle.get_mut((tick.0 / CYCLE) as usize) {
+            *count += 1;
+        }
+    }
+    let departure = outcome.mismatches.iter().map(|tick| tick.0).filter(|&t| t >= CYCLE).min();
+    let departure = departure.map_or_else(|| "null".to_string(), |tick| tick.to_string());
     let yaw_worst = outcome.yaw_errors.iter().map(|e| e.abs()).fold(0.0, f64::max);
     let yaw_mean = outcome.yaw_errors.iter().map(|e| e.abs()).sum::<f64>()
         / outcome.yaw_errors.len().max(1) as f64;
@@ -2751,8 +2827,8 @@ fn report(plan: Plan, outcome: &mut Outcome, recorded_stream: u64) -> String {
             "\"rollback_us_per_tick\":{{\"median\":{:.1},\"worst\":{:.1},\"rollbacks\":{}}},",
             "\"divergence\":{{\"entities\":{},\"fields\":{},\"mismatched_entities\":{},\"mismatched_fields\":{}}},",
             "\"deepest_correction\":{},\"resyncs\":{},\"substituted_ticks\":{},\"unechoed_spawns\":{},",
-            "\"hash_agreement\":{{\"compared\":{},\"agreed\":{},\"carrier_agreed\":{}}},",
-            "\"carrier_pending_ticks\":{},",
+            "\"hash_agreement\":{{\"compared\":{},\"agreed\":{},\"carrier_agreed\":{},\"carrier_set_compared\":{}}},",
+            "\"carrier_pending_ticks\":{},\"departure_tick\":{},\"mismatches_per_cycle\":{:?},",
             "\"thrown_settle_ticks\":{},\"predicted_keys_at_checks\":{:?},\"yaw_error_rad_per_tick\":{{\"mean\":{:e},\"worst\":{:e}}},",
             "\"ring\":{{\"depth\":{},\"world_bytes\":{},\"physics_bytes\":{},\"record_bytes\":{}}},",
             "\"update_bytes\":{{\"mean\":{:.0},\"max\":{}}},\"full_bytes_max\":{},",
@@ -2792,7 +2868,10 @@ fn report(plan: Plan, outcome: &mut Outcome, recorded_stream: u64) -> String {
         outcome.compared,
         outcome.agreed,
         outcome.hop_agreed,
+        outcome.hop_set_compared,
         outcome.hop_pending,
+        departure,
+        per_cycle,
         settle,
         outcome.key_counts,
         yaw_mean,
@@ -2831,10 +2910,12 @@ fn measure(scene: Scene, clock: ClockScript) {
     }
 }
 
-// One test per scene and clock, each inside the five-minute limit of the nextest profile
-// at the load this machine sees. Run in release, one at a time so that the rollback times
-// are the scene's own: `cargo nextest run -p lactose-app --test spike --release
-// --run-ignored only --test-threads 1 --no-capture`.
+// One test per scene and clock, each under the ten-minute limit `.config/nextest.toml`
+// gives these tests. Run in release, one at a time so that the rollback times are the
+// scene's own: `cargo nextest run -p lactose-app --test spike --release --run-ignored only
+// --test-threads 1 --no-capture`. Not shorter: on the server's clock the thrown scene
+// corrects nothing until the client's solver history departs from the server's, minutes
+// in, and every cycle after, so a run that ends before the departure reports almost none.
 
 #[test]
 #[ignore = "ten minutes of ticks, in release"]
@@ -2882,4 +2963,13 @@ fn ten_minutes_of_the_claim_in_contact_with_the_clock_script() {
 #[ignore = "ten minutes of ticks, in release"]
 fn ten_minutes_of_the_claim_in_contact_on_the_server_clock() {
     measure(Scene::Claim, ClockScript::Exact);
+}
+
+// Not recorded: the claim on approach holds one contact between claimed bodies, the
+// character's with the lone crate, so its absorbed maxima are that contact's (D124's
+// single-contact rule); the claim scene's mix the proxies and the stack in.
+#[test]
+#[ignore = "ten minutes of ticks, in release"]
+fn ten_minutes_of_a_claim_on_approach_on_the_server_clock() {
+    measure(Scene::Approach, ClockScript::Exact);
 }
