@@ -548,9 +548,11 @@ facade)
   through the replicated components it writes. A difference in presence alone never causes
   that correction, though. Where the kernels that match a component write nothing recorded
   (`anim::evaluate` writes `SimPose` alone), a `[server]`-only system that removes it from
-  a claimed entity is never followed: every later frame states the entity without it, no
-  recorded component differs, and the client goes on running the kernel on a component
-  the server's entity no longer has, for as long as the entity stays claimed. A statement
+  a claimed entity is not followed until a full frame, or a correction something recorded
+  causes, while the entity stays claimed: every delta frame states the entity without it,
+  no recorded component differs, and the client goes on running the kernel on a component
+  the server's entity no longer has. A full frame does follow it, since its spawn of the
+  entity applies the statement (the hook, item 1). A statement
   travels with its fact: a kept fact keeps it, and exact rows folded into a kept claimed
   spawn replace its statement with theirs when their frame holds one, and keep it
   otherwise, as they replace its components ("Reconciliation"). Recording presence would
@@ -1060,10 +1062,11 @@ README.md`, "The applier")
   a server's despawn takes.
 - Transient presence in the record. A difference in presence alone is no correction point,
   and never causes one ("What a row built from the stream has"): a claimed entity's
-  transient components change on the client only where a correction or a claim writes a
-  statement, so a `[server]`-only system that adds or removes one is followed at the
-  entity's next correction if something else causes it, and otherwise not while the entity
-  stays claimed. Presence in the record, compared like a component's presence, is the fix
+  transient components change on the client only where a full frame, a claim or a
+  correction writes a statement, so a `[server]`-only system that adds or removes one is
+  not followed until a full frame, or a correction something recorded causes, while the
+  entity stays claimed. Presence in the record, compared like a component's presence, is
+  the fix
   if a game needs it. Applying a statement at once in a predicted tick is ruled out: the
   frame is for an older server tick than the tick that pops it, and it would put that
   tick's presence on a newer predicted state.
@@ -1116,7 +1119,7 @@ hook" above that says a claimed spawn carries no transient component.
 | `a_respawn_from_exact_rows_carries_its_transient_components` | A claimed entity the prediction world despawned too early is re-spawned by a frame's exact rows with the frame's statement: the stated components are present, zeroed, and the kernel that names them runs in every re-simulated tick | `tests/corrections.rs` |
 | `a_claim_of_a_live_proxy_brings_its_transient_components` | A proxy the stream spawned, which has none, claimed by a spawn with a statement: it has the stated components after the predicted tick, after the correction at the frame's tick and after a later rollback through it; one a region document gave it that the statement does not name is removed; a claim into a region the world lacks changes nothing | `tests/claims.rs` |
 | `a_statement_is_exact_and_writes_no_value` | The local player's `PlayerInput`, written by the applier before the hook, has the same bytes after a full frame's upsert and after a correction whose statement names it; an unreplicated transient component the statement does not name is removed and one named and absent inserted zeroed, in ascending key order (the structural log's order under every layout); with no statement none is removed; a replicated transient component a frame's exact rows do not name is removed; a key that is not a transient unreplicated component is skipped and logged; a release leaves all of them | `tests/corrections.rs` |
-| `a_difference_in_presence_alone_is_no_correction_point` | A frame whose statement differs from the row only in presence makes no correction and re-simulates nothing, and neither does any later frame that differs only so (the limit "What a row built from the stream has" states: a `[server]`-only removal is not followed while nothing recorded differs); the next frame with a component that differs makes one, after which the entity has the stated components | `tests/corrections.rs` |
+| `a_difference_in_presence_alone_is_no_correction_point` | A frame whose statement differs from the row only in presence makes no correction and re-simulates nothing, and neither does any later delta frame that differs only so (the limit "What a row built from the stream has" states: a `[server]`-only removal is not followed until a full frame, or a correction something recorded causes); the next frame with a component that differs makes one, after which the entity has the stated components; and in a second run a full frame alone, with nothing recorded differing, leaves the entity with them | `tests/corrections.rs` |
 | `a_kept_claimed_spawn_keeps_its_statement_under_rows_that_carry_none` | Exact rows from a frame with no statement, folded into a kept claimed spawn, replace its components and keep its statement, so a rollback through the kept slot re-spawns the entity with the stated components, hash for hash with the straight run; rows from a frame that holds a statement replace it | `tests/regions.rs` |
 | `a_proxy_gets_no_unreplicated_transient_component` | A statement of an entity the frame does not state claimed changes nothing, in a delta frame and a full frame, and `SlotBytes::world` is what it is without the statement | `tests/hook.rs` |
 | `a_spawn_writes_replicated_components_alone` | A full frame's spawn and a delta frame's proxy spawn that carry a derived and an unreplicated transient component as values: the row has neither, both are logged once in the predicted tick and at debug in a replay, and the rest of the spawn applies | `tests/hook.rs`, `tests/logs.rs` |

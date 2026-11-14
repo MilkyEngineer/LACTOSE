@@ -398,9 +398,22 @@ What a system is, from its parameters (`SystemParam` has the table):
   the owner's alias, and a despawn is a death, so once the rollback horizon passes it the
   alias of a bound predicted origin is pruned, the reference left behind names no `NetId`,
   and the region of the row that holds it cannot be exported. A `Server` world, the one
-  kind that exports, therefore refuses both methods with `Unsupported` and nothing changed:
-  on a server an owned entity leaves with its owner, and the invariant above holds because
-  no path leaves one behind. In a client's worlds nothing exports and the reference dangles
+  kind that exports, therefore refuses both methods with `Unsupported` and nothing changed,
+  so that on a server no despawn and no move leaves an owned entity behind. A direct write
+  still can, on today's code: `insert`, `insert_erased`, `spawn`, `spawn_erased` and a
+  load keep a reference to an entity that is not live and store a bound `Net` key as its
+  predicted origin, so an `OwnedBy` that names a despawned predicted owner before the
+  horizon passes, or a predicted origin that has no alias, is a row the export refuses
+  (`docs/verification.md`). From the lane `stream-impl` on (D141; facade) a `Server` world
+  stores no such owner on those paths. An owner that is a despawned predicted entity whose
+  alias the world still holds is stored as its `Net` key, which is what the export writes
+  and what a fresh process that loads the save stores; an owner that is a predicted origin
+  with no alias, live or not, is refused with `InvalidData` and nothing changed; every
+  other owner is stored as before, an unloaded one under its origin, whose alias an unload
+  keeps; and the invariant above then holds on every path of a server. The rule is
+  `OwnedBy`'s alone, the one reference an export writes as a `NetId`, and a server's alone:
+  a despawned entity never returns there. In a client's worlds nothing exports and the
+  reference dangles
   as any reference may; an owner that returns under the stored key, which for a bound
   entity is its predicted origin (a staged spawn carries it, as a document's row does),
   owns the entity again, and one spawned under its bare `Net` key does so only while its
