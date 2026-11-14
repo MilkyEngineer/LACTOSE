@@ -4593,6 +4593,40 @@ relayed by an event when it acts on another body** (§6.1, §10, `lactose-ecs`,
   - *No public signature changed.*
 - Driven by: the first cost measurement of a milestone 1 tick (`crates/sim/tests/cost.rs`);
   the ECS hot paths part A review, rounds 1 and 2 (2026-11-14).
+- Addendum (lane ecs-kernel, 2026-11-14; review rounds 1 and 2): *Part B, first half: a
+  per-entity system runs a kernel over the rows of one unit.* The `#[system]` expansion emits
+  `Kernel::each`, which takes each parameter's column once per unit and loops over the unit's
+  rows. A unit is a chunk, or under `split_batches` a range of one chunk's rows, cut after each
+  row with probability one in three, drawn from (seed, tick, system, archetype, chunk). The run
+  makes every unit before any runs: on each issued chunk it tests the column tick of every
+  `Changed` column against the window, then writes the coarse tick of each column the system
+  writes, skipped or not; a chunk that fails the test has no unit. For the rest it builds the
+  `Changed` selection from the row stamps, splits each written column among the units with
+  `split_at_mut` and lends each read column as the same range. Every parameter that takes
+  something from a unit checks its table entry once per unit: a component column (optional or
+  not) its component and the lent length, a `RegionRes` its region resource, and an output sink,
+  `Res`, `Events` or `Channel` its own parameter's kind and target, so a kernel that takes what
+  was prepared for one entry as another type panics before it reads a row;
+  `crates/ecs/tests/obligation.rs` holds a kernel for each kind, each run in a child process.
+  Filters, the row's key and its context take nothing per entry, and `Kernel::run` still checks
+  only the kind of each prepared value. Outputs are kept per row and merged after the last unit
+  by (source, finalize) (D117); partials are merged by `Reducer::merge`; nothing is kept per
+  worker. `World::changed_since` and `ErasedColumn::changed_since` skip a chunk whose column
+  tick is not after the mark. `crates/ecs/tests/units.rs` holds the run's skip and
+  `World::changed_since`'s by the counts of `casein` trace events, and runs the `Changed`
+  scenario under `split_batches` at eight seeds over two regions, comparing the key, region and
+  value of every row the filter passes with the unsplit run; `crates/ecs/tests/pass.rs` holds a
+  pass's reader seeing a write one point after its window; the `ErasedColumn` skip is held only
+  by the equality tests of `erased.rs`. `Rng::keyed` and the predicted ordinal hash the same
+  bytes from a stack buffer, so a row that draws from `Ctx::rng` allocates nothing, and part A's
+  vector reuse across lifetimes is gone. `SystemDescriptor::new`'s obligation names
+  `kernel.each` and is positional: entry N of a table describes parameter N of each entry point.
+  No `unsafe` was added and no public signature changed. Result on the Apple M1 under shared
+  load (7 to 33), paired runs: the one-core tick 10.2 to 18.6 ms against 39.7 to 62.5 ms for the
+  binaries before; the physics sync 0.32 to 0.46 ms against 0.91 to 1.27 ms. The run is still
+  one graph node, so 7·T₄ − T₁ is 61 to 77 ms against the 24 ms that steers. Forking the units
+  over workers (lending stays per table entry with checked casts, `crates/ecs/SAFETY.md`), and
+  `lactose-ecs` joining `[harness]`, come next.
 
 **D138. Milestone 0's unshown criteria are exit conditions of milestone 1** (§5.1, §20, §22, `lactose-task`, `docs/results`)
 - Why: milestone 1's lanes began with part of section 22's milestone 0 proof not shown, and no

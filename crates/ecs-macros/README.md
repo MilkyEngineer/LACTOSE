@@ -41,7 +41,12 @@ For `#[system(..)] fn f(p0: T0, p1: T1)`:
   static of the `after` descriptors, the entry point
   `fn __run(invocation) { f(fetch(invocation, 0), fetch(invocation, 1)) }`, for a reduction
   `reduce::<R>(invocation, f(..))` and an entry point that finishes the reducer and calls
-  `__finalize_f`, and one `unsafe { SystemDescriptor::new(..) }` spanned at the call site.
+  `__finalize_f`; the per-unit entry point
+  `fn __each(unit) { let mut c0 = column(unit, 0); ..; while let Some(mut r) = next_row(unit) { f(row(&mut c0, &mut r), ..) } }`,
+  each column's type inferred from its parameter's `RowFetch::Column`, and for a reduction
+  a partial made by `identity::<R>()`, fed by `add::<R>(&mut partial, f(..))` and handed
+  over by `keep::<R>(unit, partial)`; and one `unsafe { SystemDescriptor::new(..) }`
+  spanned at the call site.
 
 For `#[finalize(f)] fn g(out: O, p1: T1)`: `g` itself, as above, and
 `const __finalize_f: Finalize<O>` with `g`'s visibility, holding the table of `p1..` and an

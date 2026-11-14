@@ -11,8 +11,8 @@ use std::sync::Mutex;
 use common::*;
 use lactose_core::StableKey;
 use lactose_ecs::{
-    Changed, EventWriter, Events, Job, LayoutConfig, Res, Schedule, StableKeyOf, World, WorldKind,
-    system,
+    Changed, EventWriter, Events, Job, LayoutConfig, Mut, Res, Schedule, StableKeyOf, World,
+    WorldKind, system,
 };
 
 /// What a pass gathered: per row, its key and its x position.
@@ -156,4 +156,44 @@ fn an_exclusive_systems_resources_leave_the_world_for_its_call() {
     world = tick(&mut schedule, world, &executor);
     assert_eq!(gathered(&mut world), [(net(1000), 2)], "not held inside; gravity is two");
     assert!(world.resource::<Gravity>().is_some(), "and back afterwards");
+}
+
+/// The keys `test::changed_reader` ran on.
+type Seen = Mutex<Vec<StableKey>>;
+
+#[system(name = "test::changed_reader", worlds = [server])]
+fn changed_reader(_changed: Changed<Counter>, key: StableKeyOf, seen: Res<Seen>) {
+    seen.lock().unwrap().push(*key);
+}
+
+#[system(name = "test::counter_writer", worlds = [server], after = changed_reader)]
+fn counter_writer(counter: Mut<Counter>) {
+    counter.0 += 1;
+}
+
+/// In a pass the points are consecutive, so a writer that runs right after a `Changed`
+/// reader stamps its column one point after the reader's window. The next pass's reader
+/// sees every row the writer changed: the chunk skip passes a column point one after the
+/// window.
+#[test]
+fn a_reader_sees_a_write_one_point_after_its_window_in_the_next_pass() {
+    let executor = executor();
+    let layout = LayoutConfig { chunk_rows: Some(2), ..LayoutConfig::default() };
+    let mut world = world(WorldKind::Server, layout);
+    for id in 1..=4 {
+        world.spawn(net(id), REGION, (Counter(0),)).unwrap();
+    }
+    world.insert_service::<Seen>(Box::new(Mutex::new(Vec::new())));
+    let mut builder = Schedule::builder(WorldKind::Server);
+    builder.stage("pass", &[]).add(&CHANGED_READER).add(&COUNTER_WRITER);
+    let mut pass = builder.build().unwrap();
+    let mut seen_per_pass = Vec::new();
+    for _ in 0..3 {
+        world = executor.block_on(pass.run_pass(world, &executor)).unwrap();
+        let mut seen = std::mem::take(world.service_mut::<Seen>().unwrap().get_mut().unwrap());
+        seen.sort();
+        seen_per_pass.push(seen);
+    }
+    let every = [net(1), net(2), net(3), net(4)];
+    assert_eq!(seen_per_pass, [every, every, every], "each pass sees the last pass's writes");
 }

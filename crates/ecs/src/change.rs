@@ -282,7 +282,8 @@ pub struct ErasedColumn<'w> {
     pub(crate) bytes: &'w [u8],
     /// The row stamps, on a tracked column.
     pub(crate) stamps: Option<&'w RowStamps>,
-    pub(crate) column_tick: Tick,
+    /// The chunk's coarse change point for the column.
+    pub(crate) column_stamp: Stamp,
     /// The world's epoch and tick, which a mark is judged against.
     pub(crate) epoch: u32,
     pub(crate) now: Tick,
@@ -328,7 +329,7 @@ impl ErasedColumn<'_> {
     /// The chunk's coarse change tick for this column.
     #[must_use]
     pub fn column_tick(&self) -> Tick {
-        self.column_tick
+        self.column_stamp.tick
     }
 
     /// The rows changed since `mark`, as ascending indices into [`keys`](Self::keys),
@@ -349,13 +350,11 @@ impl ErasedColumn<'_> {
         if mark.epoch() != self.epoch {
             return None;
         }
-        Some(ChangedIndices {
-            stamps,
-            len: self.keys.len(),
-            since: mark.stamp(),
-            now: self.now,
-            next: 0,
-        })
+        let since = mark.stamp();
+        // The column point is at or after every row stamp, so a chunk whose column point is
+        // not after the mark holds no changed row and its stamps are not read.
+        let len = if self.column_stamp.after(since, self.now) { self.keys.len() } else { 0 };
+        Some(ChangedIndices { stamps, len, since, now: self.now, next: 0 })
     }
 }
 

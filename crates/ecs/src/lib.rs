@@ -9,9 +9,9 @@
 //!
 //! # Status
 //!
-//! The naive implementation: storage, change tracking, commands, events, snapshots and
-//! bulk copy are complete, and a schedule run executes every system in order on one
-//! worker. Milestone 1 rewrites the hot paths to fork over chunks.
+//! Storage, change tracking, commands, events, snapshots and bulk copy are complete, and a
+//! schedule run executes every system in order on one worker, a per-entity system as a
+//! kernel over the rows of each chunk. Milestone 1 forks those units over workers next.
 //!
 //! # Where to start
 //!
@@ -42,6 +42,7 @@ mod schedule;
 mod snapshot;
 mod storage;
 mod system;
+mod unit;
 mod world;
 
 pub use access::{Access, AccessKind, AccessTarget};
@@ -100,6 +101,8 @@ const _: () = {
     send::<Schedule>();
     send::<WorldSnapshot>();
     send_sync::<SystemDescriptor>();
+    // A unit of a per-entity run moves to the worker that runs it.
+    send::<__private::Unit<'_>>();
 };
 
 /// Items the `#[system]` and `#[finalize]` expansions name. Not part of the interface: the
@@ -109,6 +112,9 @@ pub mod __private {
     pub use crate::access::writes;
     pub use crate::system::{
         Fetch, Finalize, Invocation, Kernel, ReducerOps, fetch, finish, reduce,
+    };
+    pub use crate::unit::{
+        Row, RowFetch, Unit, UnitColumn, add, column, identity, keep, next_row, row,
     };
     pub use lactose_core::SystemKey;
 }

@@ -4,10 +4,11 @@ Every `unsafe` block carries a `// SAFETY:` comment. This file states the invari
 comments rely on. The crate's tests run under Miri.
 
 Architecture section 21 admits `unsafe` here for chunk column storage and for the
-`#[system]` expansion's call of `unsafe SystemDescriptor::new`. The naive implementation
-needs only the second: storage is safe code, and the crate holds three `unsafe fn`
-(`SystemDescriptor::new`, `Finalize::new`, `Finalize::call`) and one `unsafe` block, all on the path from an access table to the code that fetches by it. A
-change that adds a place amends this file in the same commit.
+`#[system]` expansion's call of `unsafe SystemDescriptor::new`. The crate needs only the
+second: storage and the per-chunk kernel path are safe code, and the crate holds three
+`unsafe fn` (`SystemDescriptor::new`, `Finalize::new`, `Finalize::call`) and one `unsafe`
+block, all on the path from an access table to the code that fetches by it. A change that
+adds a place amends this file in the same commit.
 
 ## The access tables (`SystemDescriptor::new`, `Finalize::new`, `Finalize::call`)
 
@@ -16,15 +17,20 @@ that conflict on a target are ordered, and within a system each parameter names 
 component and no resource is written beside another parameter on it. A table that
 understates what the kernel touches would let the parallel implementation of milestone 1
 hand two kernels `&mut` to one row from safe code. So `SystemDescriptor::new` is `unsafe`,
-with the obligation that the kernel's table and the finalize's table describe exactly what
-each entry point fetches, and the `#[system]` expansion, which derives both from the
-parameter types and the `writes` list, is its one caller. A `writes` entry fetches nothing:
-it declares a write the system makes through commands or `&mut World`, outside every
-kernel, and only adds an ordering constraint, so it can make a table overstate what the
-kernel touches but never understate it. A `ChannelWriter` fetches a sink the run made for
-that parameter alone and appends to the invocation's buffer after the kernel, and a
-`ChannelTake` fetches the store the run removed from the world before lending it, so
-neither aliases what another parameter holds (D126).
+with the obligation that the kernel's table describes exactly what both kernel entry points
+fetch (`Kernel::run`, the one call of a per-region, once-per-tick or exclusive system, and
+`Kernel::each`, a per-entity system's loop over the rows of one unit) and the finalize's
+table what the finalize fetches. The obligation is positional: entry N of the kernel's table
+describes parameter N of `Kernel::run` and of `Kernel::each`, and entry N of the finalize's
+table parameter N of `Kernel::finalize`, because the run prepares and lends each parameter
+by its index. The `#[system]` expansion, which derives the tables from the parameter types
+in order and the `writes` list, is its one caller. A `writes` entry fetches nothing: it
+declares a write the system makes through commands or `&mut World`, outside every kernel,
+and only adds an ordering constraint, so it can make a table overstate what the kernel
+touches but never understate it. A `ChannelWriter` fetches a sink the run made for that
+parameter alone and appends to the invocation's buffer after the kernel, and a `ChannelTake`
+fetches the store the run removed from the world before lending it, so neither aliases what
+another parameter holds (D126).
 
 The `#[finalize]` pairing is by name: `#[finalize(f)]` emits `__finalize_f`, a
 `Finalize<O>` holding the finalize function's table and its entry point, and the
@@ -41,11 +47,27 @@ The expansions' `unsafe` blocks are spanned at the call site, never at a user to
 the invoking crate keeps `#![forbid(unsafe_code)]` (section 21, as for `#[component]`).
 `tests/compile_fail.rs` compiles every kind of system in such a crate.
 
-In the naive implementation a table that disagrees with its entry point cannot cause
-undefined behaviour: each parameter is fetched from a value prepared for its index by safe
-code, and a mismatch is a panic ("parameter N does not match the system's access table").
-The obligation exists for the parallel implementation, which will hand out rows to
-concurrent jobs by the table.
+Today a table that disagrees with its entry point cannot cause undefined behaviour: each
+parameter is fetched from a value prepared for its index by safe code, through a checked
+cast or downcast. For `Kernel::each` each parameter checks, once per unit, that the table
+entry it takes is its own: a column parameter that its entry names the same component (and
+the lent bytes are exactly the unit's rows of that type), a `RegionRes` that its entry is
+that region resource, and every other parameter the run prepares something for (an output
+sink, `Res`, `Events`, `Channel`) that its entry is its own parameter type's, kind and
+target. A mismatch is a panic ("parameter N does not match the system's access table")
+before the kernel reads a row; `tests/obligation.rs` holds a kernel for each of those
+kinds. `Kernel::run` checks only the kind of each prepared value: a parameter of another
+kind panics with the same message, but one of the right kind and another type reads the
+declared value as its own wherever the cast or downcast allows it, as an empty event list
+or channel, or a region resource of the same size. The obligation exists for the parallel
+implementation, which will hand out rows to concurrent jobs by the table.
+
+The rule for forking per-entity runs over workers: lending stays per table entry, with
+checked casts of the bytes lent for that entry, as today. A kernel whose code disagrees
+with its table can then misread only what its table declared, and soundness rests on the
+schedule's conflict sets and the lending code, never on a kernel. A fork that cast by
+parameter type from raw pointers instead would make the positional obligation above
+load-bearing for soundness.
 
 ## Chunk columns (no `unsafe`)
 
@@ -59,7 +81,11 @@ so every column is aligned for its type.
   `CheckedBitPattern` on load, and the cast checks them again.
 - Several columns of one chunk are reached at once by splitting the slab with
   `split_at_mut`, and one row of each by splitting again, so the `&mut` a `Mut` holds and
-  the `&` a `&T` holds are disjoint borrows the compiler checks.
+  the `&` a `&T` holds are disjoint borrows the compiler checks. A per-entity run cuts
+  each chunk into units the same way: a column the system writes is split with
+  `split_at_mut` into one range of rows per unit, its row stamps beside it, and a column
+  it only reads is shared, so the units of one chunk hold disjoint `&mut` ranges and can
+  move to different workers.
 - `Ctx` holds the region's seed, tick and asset table, not the world, so no `&World` lives
   beside the rows a kernel writes.
 - A component value with a placeholder in a reference field is not a valid value of its

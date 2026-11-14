@@ -8,7 +8,7 @@ use lactose_reflect::{Persistence, Reflect};
 use crate::change::Stamp;
 use crate::command::{Command, CommandBuffer, ErasedComponent, is_worlds_own};
 use crate::region::{ClaimedBy, RegionId};
-use crate::rng::{LayoutRng, key_bytes};
+use crate::rng::{KeyBytes, LayoutRng, key_bytes};
 use crate::schedule::Source;
 use crate::storage::{StableKeyMap, mark};
 use crate::world::{Aliases, World, WorldKind, has_entity_ref};
@@ -30,11 +30,11 @@ pub(crate) struct Pending {
 /// origin key in its canonical bytes, the system key and the spawn index, both
 /// little-endian (architecture section 7).
 pub(crate) fn predicted_ordinal(source: StableKey, system: SystemKey, index: u32) -> u32 {
-    let mut bytes = Vec::with_capacity(32);
+    let mut bytes = KeyBytes::new();
     key_bytes(source, &mut bytes);
     bytes.extend_from_slice(&system.0.to_le_bytes());
     bytes.extend_from_slice(&index.to_le_bytes());
-    xxh64(&bytes, 0) as u32
+    xxh64(bytes.as_slice(), 0) as u32
 }
 
 /// The key a command names: a placeholder through the buffer's spawns, anything else

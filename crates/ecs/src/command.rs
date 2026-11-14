@@ -11,6 +11,7 @@ use crate::access::{Access, AccessKind, channel_target, no_target};
 use crate::param::{SystemParam, sealed};
 use crate::region::{InRegion, PredictedOrigin, RegionId};
 use crate::system::{Fetch, Invocation, Slot, mismatch};
+use crate::unit::{NeverColumn, Row, RowFetch, SinkColumn, Unit, UnitColumn, expect_access};
 
 /// A set of components spawned together: a tuple of one to eight [`Component`]s, each of
 /// a different type. One component is spelled `(Bomb { fuse: 180 },)`.
@@ -521,5 +522,60 @@ impl<'a, C: CommandChannel> Iterator for ChannelEntries<'a, C> {
 
     fn next(&mut self) -> Option<Self::Item> {
         self.entries.next()
+    }
+}
+
+// How the command and channel parameters are made for a row of a unit (the per-chunk
+// kernel path).
+
+impl<'a, 'r> RowFetch<'a, 'r> for Commands<'a> {
+    type Column = SinkColumn<Commands<'static>>;
+
+    fn row(_: &'a mut Self::Column, row: &mut Row<'a>) -> Self {
+        Self { buffer: row.commands.take().expect("one `Commands` per system") }
+    }
+}
+
+impl<'a, 'r, C: CommandChannel> RowFetch<'a, 'r> for ChannelWriter<'a, C> {
+    type Column = SinkColumn<ChannelWriter<'static, C>>;
+
+    fn row(column: &'a mut Self::Column, row: &mut Row<'a>) -> Self {
+        Self { sink: row.channels.take(column.0), _channel: PhantomData }
+    }
+}
+
+/// A channel's entries, found once per unit.
+#[doc(hidden)]
+pub struct ChannelColumn<'r, C: CommandChannel> {
+    entries: &'r [ChannelEntry<C>],
+}
+
+impl<'r, C: CommandChannel> UnitColumn<'r> for ChannelColumn<'r, C> {
+    fn take(unit: &mut Unit<'r>, index: usize) -> Self {
+        expect_access::<Channel<'static, C>>(unit, index);
+        let entries = unit.env().channels.get(&TypeId::of::<C>()).map_or(&[][..], |stored| {
+            stored
+                .entries
+                .downcast_ref::<Vec<ChannelEntry<C>>>()
+                .expect("the entries of this channel")
+                .as_slice()
+        });
+        Self { entries }
+    }
+}
+
+impl<'a, 'r, C: CommandChannel> RowFetch<'a, 'r> for Channel<'a, C> {
+    type Column = ChannelColumn<'r, C>;
+
+    fn row(column: &'a mut Self::Column, _: &mut Row<'a>) -> Self {
+        Self { entries: column.entries }
+    }
+}
+
+impl<'a, 'r, C: CommandChannel> RowFetch<'a, 'r> for ChannelTake<C> {
+    type Column = NeverColumn;
+
+    fn row(column: &'a mut Self::Column, _: &mut Row<'a>) -> Self {
+        match *column {}
     }
 }

@@ -1,6 +1,7 @@
 //! System parameters: the types a `#[system]` function takes, each declaring the access it
 //! needs (architecture section 6.1).
 
+use core::any::TypeId;
 use core::marker::PhantomData;
 use core::ops::{Deref, DerefMut};
 
@@ -17,6 +18,10 @@ use crate::region::RegionId;
 use crate::rng::Rng;
 use crate::storage::{RowView, typed, typed_mut};
 use crate::system::{Fetch, Invocation, Slot, mismatch};
+use crate::unit::{
+    MutColumn, NeverColumn, NoColumn, ReadColumn, RegionResColumn, Row, RowFetch, Unit, UnitColumn,
+    expect_access,
+};
 use crate::world::World;
 
 pub(crate) mod sealed {
@@ -498,12 +503,11 @@ impl<'r, 'j> Fetch<'r, 'j> for Ctx<'r> {
     }
 }
 
+/// A per-entity system's parameter alone, made for a row of a unit; no invocation holds
+/// one.
 impl<'r, 'j> Fetch<'r, 'j> for StableKeyOf {
-    fn fetch(invocation: &mut Invocation<'r, 'j>, index: usize) -> Self {
-        match invocation.take(index) {
-            Slot::Key(key) => Self(key),
-            _ => mismatch(index),
-        }
+    fn fetch(_: &mut Invocation<'r, 'j>, index: usize) -> Self {
+        mismatch(index)
     }
 }
 
@@ -522,5 +526,139 @@ impl<'r, 'j> Fetch<'r, 'j> for &'r mut World {
             Slot::World(world) => world,
             _ => mismatch(index),
         }
+    }
+}
+
+// How each parameter is made for a row of a unit (the per-chunk kernel path).
+
+/// A world resource, found once per unit.
+#[doc(hidden)]
+pub struct ResColumn<'r, T: ?Sized> {
+    value: &'r T,
+}
+
+impl<'r, T: ?Sized + 'static> UnitColumn<'r> for ResColumn<'r, T> {
+    fn take(unit: &mut Unit<'r>, index: usize) -> Self {
+        expect_access::<Res<'static, T>>(unit, index);
+        let (_, value) = unit
+            .env()
+            .resources
+            .iter()
+            .find(|(id, _)| *id == TypeId::of::<T>())
+            .expect("a resource the schedule checked is held for the system's run");
+        Self { value: resource_ref(*value) }
+    }
+}
+
+impl<'a, 'r, T: ?Sized + 'static> RowFetch<'a, 'r> for Res<'a, T> {
+    type Column = ResColumn<'r, T>;
+
+    fn row(column: &'a mut Self::Column, _: &mut Row<'a>) -> Self {
+        Self { value: column.value }
+    }
+}
+
+impl<'a, 'r, T: Resource> RowFetch<'a, 'r> for RegionRes<'a, T> {
+    type Column = RegionResColumn<T>;
+
+    fn row(column: &'a mut Self::Column, row: &mut Row<'a>) -> Self {
+        Self { value: typed(row.region.resources[column.0]) }
+    }
+}
+
+impl<'a, 'r, T: Component> RowFetch<'a, 'r> for &'a T {
+    type Column = ReadColumn<'r, T>;
+
+    fn row(column: &'a mut Self::Column, row: &mut Row<'a>) -> Self {
+        let values: &'r [T] = column.values;
+        &values[row.index]
+    }
+}
+
+impl<'a, 'r, T: Component> RowFetch<'a, 'r> for Option<&'a T> {
+    type Column = Option<ReadColumn<'r, T>>;
+
+    fn row(column: &'a mut Self::Column, row: &mut Row<'a>) -> Self {
+        let values: &'r [T] = column.as_ref()?.values;
+        Some(&values[row.index])
+    }
+}
+
+fn row_mut<'a, T: Component>(column: &'a mut MutColumn<'_, T>, index: usize) -> Mut<'a, T> {
+    let stamp = column.stamps.as_mut().map(|(ticks, positions)| {
+        let stamp: (&'a mut Tick, &'a mut u32) = (&mut ticks[index], &mut positions[index]);
+        stamp
+    });
+    Mut { value: &mut column.values[index], stamp, now: column.now }
+}
+
+impl<'a, 'r, T: Component> RowFetch<'a, 'r> for Mut<'a, T> {
+    type Column = MutColumn<'r, T>;
+
+    fn row(column: &'a mut Self::Column, row: &mut Row<'a>) -> Self {
+        row_mut(column, row.index)
+    }
+}
+
+impl<'a, 'r, T: Component> RowFetch<'a, 'r> for Option<Mut<'a, T>> {
+    type Column = Option<MutColumn<'r, T>>;
+
+    fn row(column: &'a mut Self::Column, row: &mut Row<'a>) -> Self {
+        Some(row_mut(column.as_mut()?, row.index))
+    }
+}
+
+macro_rules! filter_row {
+    ($($filter:ident),+) => {$(
+        impl<'a, 'r, T: Component> RowFetch<'a, 'r> for $filter<T> {
+            type Column = NoColumn;
+
+            fn row(_: &'a mut Self::Column, _: &mut Row<'a>) -> Self {
+                Self(PhantomData)
+            }
+        }
+    )+};
+}
+
+filter_row!(With, Without, Changed);
+
+impl<'a, 'r> RowFetch<'a, 'r> for Ctx<'a> {
+    type Column = NoColumn;
+
+    fn row(_: &'a mut Self::Column, row: &mut Row<'a>) -> Self {
+        let region = row.region;
+        Ctx::new(region.seed, region.id, Some(row.key), row.env.system, row.env.tick, region.assets)
+    }
+}
+
+impl<'a, 'r> RowFetch<'a, 'r> for StableKeyOf {
+    type Column = NoColumn;
+
+    fn row(_: &'a mut Self::Column, row: &mut Row<'a>) -> Self {
+        Self(row.key)
+    }
+}
+
+impl<'a, 'r, T: ?Sized + 'static> RowFetch<'a, 'r> for ResMut<'a, T> {
+    type Column = NeverColumn;
+
+    fn row(column: &'a mut Self::Column, _: &mut Row<'a>) -> Self {
+        match *column {}
+    }
+}
+
+impl<'a, 'r, 'j> RowFetch<'a, 'r> for Job<'a, 'j> {
+    type Column = NeverColumn;
+
+    fn row(column: &'a mut Self::Column, _: &mut Row<'a>) -> Self {
+        match *column {}
+    }
+}
+
+impl<'a, 'r> RowFetch<'a, 'r> for &'a mut World {
+    type Column = NeverColumn;
+
+    fn row(column: &'a mut Self::Column, _: &mut Row<'a>) -> Self {
+        match *column {}
     }
 }

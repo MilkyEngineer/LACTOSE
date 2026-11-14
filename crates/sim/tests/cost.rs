@@ -15,12 +15,13 @@ use std::collections::BTreeMap;
 
 use lactose_core::{NetId, PlayerId, Result, StableKey, Tick};
 use lactose_ecs::{
-    ClaimedBy, Commands, Ctx, Event, EventWriter, Events, Executor, Mut, RegionConfig, RegionId,
-    RegionMode, RegionRes, Res, ResMut, StableKeyOf, SystemSet, Without, World, WorldKind,
-    finalize, system,
+    ClaimedBy, Commands, Ctx, Event, EventWriter, Events, Executor, LayoutConfig, Mut,
+    RegionConfig, RegionId, RegionMode, RegionRes, Res, ResMut, StableKeyOf, SystemSet, Without,
+    World, WorldKind, finalize, system,
 };
 use lactose_math::{ExactSum, Scalar};
 use lactose_reflect::{component, resource};
+use lactose_sim::harness::{ChunkCapacity, layout_mode};
 use lactose_sim::{
     InputApplier, PlayerSample, Registration, Simulation, SimulationBuilder, Stage, TickDelta,
     TickInput, TypeTable, sets,
@@ -239,7 +240,13 @@ impl InputApplier for Steering {
 
 /// The scene: `rows` rows of four archetypes spread over the regions, and the players.
 fn scene(rows: u64) -> Simulation {
+    scene_in(rows, LayoutConfig::default())
+}
+
+/// The scene under `layout`.
+fn scene_in(rows: u64, layout: LayoutConfig) -> Simulation {
     let mut simulation = SimulationBuilder::new(WorldKind::Server, types())
+        .layout(layout)
         .setup(move |world| {
             world.insert_resource(Energy(Scalar::ZERO));
             world.insert_resource(Population(rows as u32));
@@ -309,8 +316,8 @@ fn step(executor: &Executor, simulation: Simulation) -> Simulation {
 /// The scene at a small scale runs, every system does its work, and the result does not
 /// depend on the worker count. Until the run forks over chunks (D137's part B), each system
 /// runs as one job, so the equality of the two worker counts holds by construction; the
-/// scene builds its own executor and the default layout, so SOUR's modes give it no
-/// coverage either. Part B runs it under SOUR's layout mode.
+/// scene builds its own executor, so SOUR's modes give it no coverage, and the next test
+/// runs it under every layout instead.
 #[test]
 fn the_scene_runs_and_its_hash_is_the_same_on_one_and_four_workers() {
     let mut hashes = Vec::new();
@@ -335,6 +342,39 @@ fn the_scene_runs_and_its_hash_is_the_same_on_one_and_four_workers() {
         hashes.push(trace);
     }
     assert_eq!(hashes[0], hashes[1]);
+}
+
+/// Every kernel of the scene runs per chunk, or under `split_batches` per random range of a
+/// chunk's rows, so the scene under SOUR's layout mode at every chunk capacity is the same
+/// computation cut into different units: one hash every tick, and one merged output of the
+/// reduction, which is derived and so outside the hash.
+#[test]
+fn the_scene_gives_one_hash_and_one_reduction_every_tick_under_every_layout() {
+    let executor = Executor::builder().frame_workers(1).background_workers(1).build().unwrap();
+    let trace = |layout: LayoutConfig| {
+        let mut simulation = scene_in(2_000, layout);
+        let mut trace = Vec::new();
+        for _ in 0..20 {
+            simulation = step(&executor, simulation);
+            let energy = simulation.world_mut().resource::<Energy>().unwrap().0;
+            trace.push((simulation.hash().unwrap(), energy));
+        }
+        trace
+    };
+    let reference = trace(LayoutConfig::default());
+    assert!(reference.windows(2).all(|pair| pair[0].0 != pair[1].0), "every tick changes");
+    for capacity in [
+        ChunkCapacity::Rows(1),
+        ChunkCapacity::Rows(7),
+        ChunkCapacity::Rows(64),
+        ChunkCapacity::Bytes(16384),
+    ] {
+        for seed in [1, 0x5eed_1a70] {
+            let layout = layout_mode(capacity, seed).unwrap();
+            let first = trace(layout).iter().zip(&reference).position(|(a, b)| a != b);
+            assert_eq!(first, None, "{capacity:?} seed {seed}: first differing tick");
+        }
+    }
 }
 
 // ---- The measurement ----

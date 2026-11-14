@@ -61,6 +61,7 @@ pub(crate) fn typed_mut<T: CheckedBitPattern + bytemuck::NoUninit>(bytes: &mut [
 
 /// `bytes`, which hold `len` values of `T` back to back, as a slice.
 pub(crate) fn typed_slice<T: CheckedBitPattern>(bytes: &[u8], len: usize) -> &[T] {
+    assert_eq!(bytes.len(), len * size_of::<T>(), "{len} values of the column's type");
     if size_of::<T>() == 0 {
         // A cast cannot give a zero-sized type a length, so the slice is built from the one
         // value; a `Vec` of a zero-sized type owns no allocation, so leaking it leaks nothing.
@@ -76,6 +77,7 @@ pub(crate) fn typed_slice_mut<T: CheckedBitPattern + bytemuck::NoUninit>(
     bytes: &mut [u8],
     len: usize,
 ) -> &mut [T] {
+    assert_eq!(bytes.len(), len * size_of::<T>(), "{len} values of the column's type");
     if size_of::<T>() == 0 {
         let empty: [u64; 0] = [];
         let one: T = *bytemuck::checked::from_bytes(bytemuck::cast_slice(&empty));
@@ -208,7 +210,6 @@ impl Chunk {
                 .as_mut()
                 .map(|s| (&mut s.ticks[..len], &mut s.positions[..len]));
             views.push(ColumnView {
-                size: column.size,
                 bytes,
                 stamps,
                 column_tick: ticks.next().expect("one column tick per column"),
@@ -226,37 +227,15 @@ pub(crate) struct ChunkViews<'c> {
 
 /// One column of a split chunk.
 pub(crate) struct ColumnView<'c> {
-    pub(crate) size: usize,
     pub(crate) bytes: &'c mut [u8],
     pub(crate) stamps: Option<(&'c mut [Tick], &'c mut [u32])>,
     pub(crate) column_tick: &'c mut Stamp,
 }
 
-impl<'c> ColumnView<'c> {
-    /// Splits off the first remaining row.
-    pub(crate) fn next_row(&mut self) -> RowView<'c> {
-        let (bytes, rest) = core::mem::take(&mut self.bytes).split_at_mut(self.size);
-        self.bytes = rest;
-        let stamps = self.stamps.take().map(|(ticks, positions)| {
-            let (tick, ticks) = ticks.split_first_mut().expect("a stamp per row");
-            let (position, positions) = positions.split_first_mut().expect("a stamp per row");
-            self.stamps = Some((ticks, positions));
-            (tick, position)
-        });
-        RowView { bytes, stamps }
-    }
-}
-
-/// One row of one column of a split chunk.
+/// One row of one column of a chunk, for writing with its stamp.
 pub(crate) struct RowView<'c> {
     pub(crate) bytes: &'c mut [u8],
     pub(crate) stamps: Option<(&'c mut Tick, &'c mut u32)>,
-}
-
-impl RowView<'_> {
-    pub(crate) fn stamp(&self) -> Option<Stamp> {
-        self.stamps.as_ref().map(|(tick, position)| Stamp { tick: **tick, position: **position })
-    }
 }
 
 /// The rows of one exact component set.

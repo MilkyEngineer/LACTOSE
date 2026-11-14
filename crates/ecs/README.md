@@ -14,9 +14,11 @@ is real (archetypes, chunks, column ticks, row stamps, SOUR's layout options), a
 schedule run is one graph node on the executor that runs every sync point and every system
 in execution order on one worker, without forking over chunks. Milestone 1 rewrites the hot
 paths behind the same surface: so far `World::query` visits only the archetypes it admits,
-`Events::for_target` reads an index, and neither a typed overwrite through `World::insert`
-nor a per-entity invocation that emits and commands nothing allocates; forking over chunks
-comes next (D137). Architecture sections 5.2, 6 and 6.1 are the design; where this file
+`Events::for_target` reads an index, neither a typed overwrite through `World::insert`
+nor a per-entity invocation that emits and commands nothing allocates, a per-entity
+system runs a kernel over the rows of one unit (a chunk, or a random range of one) with
+its columns lent as slices, and a `Changed` filter and `World::changed_since` skip every
+chunk whose column tick is old; forking the units over workers comes next (D137). Architecture sections 5.2, 6 and 6.1 are the design; where this file
 and the architecture disagree, the architecture wins and this file is wrong. Decision D114 records the choices the sections left open and
 what the design review changed.
 
@@ -52,9 +54,11 @@ change with them. Their shape today:
 
 | Item | What it is |
 |---|---|
-| `Kernel { run, finalize, reducer }` | The entry points: `fn(&mut Invocation)` each, and a reduction's `ReducerOps` (how to make and merge its partials without naming the reducer) |
+| `Kernel { run, each, finalize, reducer }` | The entry points: `run` and `finalize` take `&mut Invocation`, `each` (a per-entity system's) takes `&mut Unit`; and a reduction's `ReducerOps` (how to make and merge its partials without naming the reducer) |
 | `Invocation<'r, 'j>` | One value per parameter, prepared from the access table by the schedule, each taken once; and a reduction's partial or merged total |
 | `Fetch<'r, 'j>`, `fetch(invocation, index)` | How each parameter type is made from its prepared value; implemented for exactly the `SystemParam` types |
+| `Unit<'r>`, `Row<'a>`, `UnitColumn<'r>`, `RowFetch<'a, 'r>`, `column(unit, index)`, `next_row(unit)`, `row(column, row)` | A per-entity run's unit: its rows, its columns lent per parameter index, what each parameter takes from it once, checked against that parameter's table entry (a filter, the row's key and its context take nothing), and the row the loop is on; how each parameter type is made for one row from its column (`RowFetch::Column`), implemented for exactly the `SystemParam` types |
+| `identity::<R>()`, `add::<R>(partial, item)`, `keep::<R>(unit, partial)` | A reduction's partial in `each`: made empty, fed each row's item, handed to the run when the unit ends |
 | `reduce::<R>(invocation, item)`, `finish::<R>(invocation)` | A kernel's item into the partial; the merged total out for the finalize |
 | `Finalize<O>` | What `#[finalize(f)]` emits as `const __finalize_f`: the finalize's access table and its entry point, built by an `unsafe` constructor |
 | `writes::<T>()` | The `AccessKind::Writes` entry `writes = [T]` adds to a table |
@@ -304,9 +308,23 @@ What a system is, from its parameters (`SystemParam` has the table):
   runs every sync point and every system in execution order on one worker; the world moves
   into the node and back out when the run resolves. If the executor has shut down first the
   run resolves to `Cancelled` before anything ran, and the world drops with the node. The
-  layout options are honoured: chunk jobs are issued in `chunk_order`, rows are permuted
-  within their chunks at every sync point, and a reduction's partials are split into
-  batches of random size and merged.
+  layout options are honoured: chunks are issued in `chunk_order`, rows are permuted
+  within their chunks at every sync point, and under `split_batches` a chunk's rows are
+  cut into units of random length, so a reduction's partials are merged from batches of
+  random size.
+- A per-entity system's run is a set of units, each a chunk or (under `split_batches`) a
+  range of one chunk's rows, all made before any runs: the run tests each issued chunk's
+  `Changed` column ticks against the window, then writes the coarse tick of every column
+  the system writes on that chunk, skipped or not; a chunk that fails the test has no unit
+  and no row of it is read. A unit gets a range of each written column, split off the
+  chunk so units are disjoint, and the same range of each column it only reads; its kernel
+  loops over the rows. What a row emits, commands or sends is kept per row in storage the
+  run owns and merged after every unit has run, in source-key order (D117); a reduction
+  keeps one partial per unit, merged by `Reducer::merge`. Nothing is kept per worker, so
+  the units can fork over workers without changing a hash. Each run emits a `casein` trace
+  event `per_entity` with the system's name and its counts (`units`, `chunks_skipped`,
+  `rows`, `invocations`), and `World::changed_since` one named `changed_since` with
+  `chunks_skipped` and `rows_visited`, for the tests that hold the skip by count.
 - `run_tick` takes the world by value and hands it back when the tick resolves; the future
   is `Send` and is driven by the timer root task, which owns the world and the schedule. On
   an error the world is not handed back (`Schedule::prepare` checks what can fail before
@@ -430,7 +448,9 @@ What a system is, from its parameters (`SystemParam` has the table):
   consumer that needs the exact point uses `changed_since`: `World::changed_since` for a
   typed column, or `ErasedColumn::changed_since` on each column of `columns_erased` for a
   pass that works from the registry (the replication gather), which select the same rows
-  under every layout, by stamp and never by tick.
+  under every layout, by stamp and never by tick. Both skip a chunk whose column tick is not
+  after the mark without reading its rows, so their cost is the chunks a writing system was
+  issued over since the mark, not the column.
 - At the input sync point a transient column's rows are zeroed, and a tracked row whose
   bytes were not already zero is stamped there; every region's transient resources are
   zeroed too.
@@ -552,5 +572,7 @@ repeat, layout and chaos modes.
 | `wrap_program.rs` | One program with marks, cursors, `Changed` readers, a pass, column and row ticks, presentation events and a rollback, run across the 2^30 rebase, 2^31 and the `u32` wrap, equal to a run far from any boundary |
 | `erased_rows.rs` | Typed and erased writes of the same values leave identical columns, row and column ticks, `changed_since` sets, structural logs, reverse and claim indices under every layout, `Net` references rewritten and `OwnedBy` and `ClaimedBy` among them; an equal `insert_erased` unseen by a `Changed` reader; every refusal with its kind and nothing changed, a refused typed `insert` included; a placeholder refused by name, and stored empty by a typed write; padding zeroed; `get_erased` through a restore and a snapshot round trip |
 | `ownership.rs` | The forest rule: a self-owner and the closing write of a two- and a three-entity cycle refused through every direct path with nothing changed, aliases included, and dropped and logged at apply with the rest of the buffer applied, a refused predicted spawn leaving no bind and no `NetId` used; a chain through a dangling owner accepted and the write that closes it later refused; `load_region` refusing a cycle within one document (through the baseline's own column, or the baseline alone) and a row whose bound id lacks `PredictedOrigin`, and breaking a cycle through live entities of other regions at the smallest document row whose owner is outside, one `warn` line, the re-export carrying the break and reloading without one, across two documents in either order and three regions; `bind`, `restore` and the despawn of a bound `Net` entity emptying the one reference whose rewrite would close a cycle; a region's own save reloading after a cycle closed through it while unloaded, and a client loading documents sent at different times; an owned entity staying put when given to an owner elsewhere and when the owner's region unloads, exported and reloaded in either order; seeded random histories in which the live world never cycles, every export is an overlay, and every reload and restart in either order loads and round-trips exactly; a chain of 8000 owners loading within five times the time of 8000 rows with one owner |
+| `units.rs` | A per-entity run is one unit per chunk, or more under `split_batches` with the same reduction; a `Changed` filter and `World::changed_since` skip every chunk whose column tick is old, held by the counts of the `casein` trace events |
+| `alloc.rs` | A row that emits nothing allocates nothing, with `Ctx::rng` keyed by the row among the parameters |
 | `claims.rs` | The claim index behind `World::claimed`: current after every direct method, command, predicted spawn, ownership despawn, unload and restore, in key order under every layout |
 | `compile_fail.rs` | What `#[system]` and `#[finalize]` reject, and what they accept under `#![forbid(unsafe_code)]` |

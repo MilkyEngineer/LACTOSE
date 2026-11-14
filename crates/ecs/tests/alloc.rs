@@ -45,6 +45,12 @@ fn quiet(damage: EventWriter<Damage>, cmd: Commands, key: StableKeyOf, _velocity
     }
 }
 
+/// Draws from the row's RNG stream, whose key is hashed from the row's key on every call.
+#[system(name = "test::roll", worlds = [server], after = quiet)]
+fn roll(ctx: Ctx, key: StableKeyOf, _velocity: &Velocity) {
+    core::hint::black_box(ctx.rng(*key).next_u32());
+}
+
 fn allocations() -> u64 {
     AllocTag::ALL.iter().map(|&tag| ALLOCATOR.stats(tag).total_allocations).sum()
 }
@@ -57,7 +63,7 @@ fn allocations_of_a_tick(rows: u64) -> u64 {
         world.spawn(net(id), REGION, (pos(0, 0), vel(1, 1))).unwrap();
     }
     let mut builder = Schedule::builder(WorldKind::Server);
-    builder.stage("move", &[]).add(&QUIET).add(&DRIFT);
+    builder.stage("move", &[]).add(&QUIET).add(&DRIFT).add(&ROLL);
     let mut schedule = builder.build().unwrap();
     for _ in 0..2 {
         world = tick(&mut schedule, world, &executor);
@@ -73,7 +79,7 @@ fn allocations_of_a_tick(rows: u64) -> u64 {
 fn a_row_that_emits_nothing_allocates_nothing() {
     let (small, large) = (1_000, 5_000);
     let (small_tick, large_tick) = (allocations_of_a_tick(small), allocations_of_a_tick(large));
-    // 4,000 more rows of two systems are 8,000 invocations; the bound admits a few
+    // 4,000 more rows of three systems are 12,000 invocations; the bound admits a few
     // allocations per added chunk, none per row.
     let extra = large_tick.saturating_sub(small_tick);
     assert!(
