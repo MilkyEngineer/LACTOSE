@@ -6,10 +6,11 @@
 //! the headless binary's 120-tick run, or the edit-to-playing loop. A test prints each figure
 //! as a line `measure: <name> <value>` on its standard output, which nextest passes through
 //! under `--no-capture`: the test needs no path from this command and stays runnable by
-//! hand, and the line is the one contract between them. Every result file opens with the
+//! hand, and the line is the one contract between them. A test that prints no figure, or a
+//! figure line that does not read, fails the measurement. Every result file opens with the
 //! header the plan names: the CPU and operating system, the topology the executor detected,
 //! the workers used, the commit, the build profile, the command, and the load average before
-//! and after the run (on Windows, the processor's idle share over it).
+//! and after the run (on Windows, the processor's idle share over it, sampled through WMI).
 //!
 //! Not a check: nothing is printed to standard output, progress and the measurements' own
 //! output go to standard error, and times are printed and written, never compared with a
@@ -18,7 +19,7 @@
 use std::fmt::Write as _;
 use std::fs;
 use std::io::{BufRead, BufReader, Read};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -27,6 +28,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 pub const SHORT_VAR: &str = "LACTOSE_MEASURE_SHORT";
 /// The variable that names the machine in the file names, in place of the CPU's slug.
 pub const MACHINE_VAR: &str = "LACTOSE_MEASURE_MACHINE";
+/// The variable the cost tests read for N, the frame workers of plan decision 5.1, in place
+/// of the topology's; passed through to them, and recorded in the header when set.
+pub const WORKERS_VAR: &str = "LACTOSE_MEASURE_WORKERS";
 /// The prefix of a figure line in a measurement's standard output.
 pub const FIGURE_PREFIX: &str = "measure: ";
 /// The edit-to-playing figure is the median of this many edits at each site (decision 5.9).
@@ -52,7 +56,7 @@ pub enum Run {
         test: &'static str,
     },
     /// `cargo bench -p lactose-task --bench whisk`, which writes its own pair of files.
-    Whisk,
+    TaskBench,
     /// `cargo run -p lactose-app-headless -- 120`, dev profile.
     Headless,
     /// The edit-to-playing loop of decision 5.9.
@@ -65,7 +69,7 @@ impl Run {
     /// still yields the criterion's figure.
     #[must_use]
     pub const fn cut_by_short(self) -> bool {
-        matches!(self, Self::Test { .. } | Self::Whisk)
+        matches!(self, Self::Test { .. } | Self::TaskBench)
     }
 }
 
@@ -165,7 +169,7 @@ pub const MEASUREMENTS: [Measurement; 11] = [
         name: "whisk",
         what: "Milestone 0's WHISK benchmark, which writes its own pair of files",
         threshold: "crates/task/README.md",
-        run: Run::Whisk,
+        run: Run::TaskBench,
     },
     Measurement {
         name: "headless-120",
@@ -194,14 +198,21 @@ const PROBE: Run =
 
 // ---- The pure parts ----
 
-/// The figures in `output`: every line `measure: <name> <value>`, in order.
-#[must_use]
-fn figures(output: &str) -> Vec<(String, String)> {
+/// The figures in `output`: every line `measure: <name> <value>`, in order. A line that
+/// starts with the prefix and lacks a name without spaces or a value is an error, not a
+/// figure dropped.
+fn figures(output: &str) -> Result<Vec<(String, String)>, String> {
     output
         .lines()
-        .filter_map(|line| line.trim_end().strip_prefix(FIGURE_PREFIX))
-        .filter_map(|rest| rest.split_once(' '))
-        .map(|(name, value)| (name.to_owned(), value.trim().to_owned()))
+        .filter_map(|line| line.strip_prefix(FIGURE_PREFIX).map(str::trim_end))
+        .map(|rest| match rest.split_once(' ') {
+            Some((name, value)) if !name.is_empty() && !value.trim().is_empty() => {
+                Ok((name.to_owned(), value.trim().to_owned()))
+            }
+            _ => Err(format!(
+                "a figure line does not read as `{FIGURE_PREFIX}<name> <value>`: `{rest}`"
+            )),
+        })
         .collect()
 }
 
@@ -264,19 +275,26 @@ fn load_average(uptime: &str) -> Option<String> {
     (!averages.is_empty()).then(|| averages.to_owned())
 }
 
-/// The mean of the samples in `typeperf`'s CSV output, a percentage: every line of two quoted
-/// fields whose second is a number. The header line and any message are not.
+/// The mean of the samples the WMI sampler printed, a percentage: every line that reads as a
+/// number. Anything else it printed is not a sample.
 #[must_use]
-fn idle_share(csv: &str) -> Option<f64> {
-    let samples: Vec<f64> = csv
+fn idle_share(samples: &str) -> Option<f64> {
+    let samples: Vec<f64> = samples
         .lines()
-        .filter_map(|line| {
-            let (_, value) = line.trim().split_once("\",\"")?;
-            value.trim_end_matches('"').trim().parse::<f64>().ok()
-        })
+        .filter_map(|line| line.trim().parse::<f64>().ok())
         .filter(|value| value.is_finite())
         .collect();
     (!samples.is_empty()).then(|| samples.iter().sum::<f64>() / samples.len() as f64)
+}
+
+/// The data of the value `name` in `reg query`'s output: what follows its type on the line
+/// that names it.
+#[must_use]
+fn registry_value(output: &str, name: &str) -> Option<String> {
+    let line = output.lines().map(str::trim).find(|line| line.starts_with(name))?;
+    let (_, data) = line.split_once("REG_SZ")?;
+    let data = data.trim();
+    (!data.is_empty()).then(|| data.to_owned())
 }
 
 /// What the headless binary's report line says.
@@ -508,10 +526,52 @@ fn shell_line(env: &[(&str, String)], program: &str, args: &[String]) -> String 
 pub struct Options {
     selected: Vec<&'static Measurement>,
     short: bool,
-    /// The directory the result files are written to.
+    /// The directory the result files are written to, relative to the repository root once
+    /// [`resolved`](Self::resolved).
     out: PathBuf,
-    /// The command as given, for the header.
-    command: String,
+    /// The arguments as given, for the header's command.
+    args: Vec<String>,
+}
+
+impl Options {
+    /// These options with `--out` relative to `root`: an absolute directory inside the
+    /// repository is rewritten relative to it, in the command too, so that no result file
+    /// names a path of this machine; one outside it, or a relative one that climbs out of it,
+    /// is refused.
+    fn resolved(&self, root: &Path) -> Result<Self, String> {
+        let outside = || {
+            format!(
+                "`--out {}` is outside the repository; give a directory inside it",
+                self.out.display()
+            )
+        };
+        let out = if self.out.is_absolute() {
+            self.out.strip_prefix(root).map_err(|_| outside())?.to_owned()
+        } else {
+            self.out.clone()
+        };
+        if out.components().any(|part| !matches!(part, Component::Normal(_) | Component::CurDir)) {
+            return Err(outside());
+        }
+        let out = if out.as_os_str().is_empty() { PathBuf::from(".") } else { out };
+        let mut args = self.args.clone();
+        if let Some(at) = args.iter().position(|arg| arg == "--out")
+            && let Some(value) = args.get_mut(at + 1)
+        {
+            *value = out.to_string_lossy().replace('\\', "/");
+        }
+        Ok(Self { out, args, ..self.clone() })
+    }
+
+    /// The command as given, `--out` as resolved.
+    fn command(&self) -> String {
+        let mut command = String::from("cargo xtask measure");
+        for arg in &self.args {
+            command.push(' ');
+            command.push_str(arg);
+        }
+        command
+    }
 }
 
 /// Parses the arguments after `measure`: `--all` or names, `--short`, `--out <dir>`.
@@ -526,7 +586,9 @@ pub fn parse(args: &[&str]) -> Result<Options, String> {
             "--short" => short = true,
             "--out" => {
                 let [dir, tail @ ..] = rest else { return Err("`--out` takes a directory".into()) };
-                out = Some(PathBuf::from(dir));
+                if out.replace(PathBuf::from(dir)).is_some() {
+                    return Err("`--out` is given once".into());
+                }
                 rest = tail;
             }
             name => {
@@ -545,12 +607,12 @@ pub fn parse(args: &[&str]) -> Result<Options, String> {
     if all {
         selected = MEASUREMENTS.iter().collect();
     }
-    let mut command = String::from("cargo xtask measure");
-    for arg in args {
-        command.push(' ');
-        command.push_str(arg);
-    }
-    Ok(Options { selected, short, out: out.unwrap_or_else(|| PathBuf::from(RESULTS)), command })
+    Ok(Options {
+        selected,
+        short,
+        out: out.unwrap_or_else(|| PathBuf::from(RESULTS)),
+        args: args.iter().map(|arg| (*arg).to_owned()).collect(),
+    })
 }
 
 /// The workspace the measurements run in.
@@ -570,28 +632,37 @@ struct Machine {
     cpu: String,
     os: String,
     date: String,
+    /// `HEAD`, abbreviated.
+    head: String,
+    /// `head`, with `-dirty` when a tracked file has changes.
     commit: String,
     topology: Option<(u64, u64)>,
     default_workers: Option<String>,
+    /// [`WORKERS_VAR`], where it is set.
+    workers_override: Option<String>,
 }
 
 /// Runs the selected measurements, each writing its files; one that fails is reported and
 /// the rest still run. Returns the files written, or what failed.
 pub fn run(workspace: &Workspace, options: &Options) -> Result<Vec<PathBuf>, String> {
+    let options = &options.resolved(&workspace.root)?;
     let out = workspace.root.join(&options.out);
     fs::create_dir_all(&out).map_err(|e| format!("{}: {e}", out.display()))?;
     let cpu = cpu_name();
+    let (head, dirty) = commit(&workspace.root);
     let mut machine = Machine {
         name: std::env::var(MACHINE_VAR)
             .ok()
             .filter(|n| !n.is_empty())
-            .unwrap_or_else(|| slug(&cpu)),
+            .unwrap_or_else(|| slug(&machine_source(&cpu))),
         os: os_name(),
         cpu,
         date: date(SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs())),
-        commit: commit(&workspace.root),
+        commit: if dirty { format!("{head}-dirty") } else { head.clone() },
+        head,
         topology: None,
         default_workers: None,
+        workers_override: std::env::var(WORKERS_VAR).ok().filter(|n| !n.is_empty()),
     };
     eprintln!(
         "measure: {} ({}), machine `{}`, commit {}, {}",
@@ -615,7 +686,7 @@ pub fn run(workspace: &Workspace, options: &Options) -> Result<Vec<PathBuf>, Str
         eprintln!("measure: {} ...", m.name);
         let result = match m.run {
             Run::Test { .. } => run_test(workspace, options, &machine, m, &out),
-            Run::Whisk => run_whisk(workspace, options, &machine, &out),
+            Run::TaskBench => run_task_bench(workspace, options, &machine, &out),
             Run::Headless => run_headless(workspace, options, &machine, m, &out),
             Run::EditToPlaying => run_edit_to_playing(workspace, options, &machine, m, &out),
         };
@@ -644,7 +715,8 @@ fn command_output(program: &str, args: &[&str]) -> Option<String> {
     output.status.success().then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned())
 }
 
-/// The CPU's model name, as the WHISK benchmark reads it.
+/// The CPU's model name: as the WHISK benchmark reads it on macOS and Linux, and on Windows
+/// the registry's `ProcessorNameString`, `PROCESSOR_IDENTIFIER` where that cannot be read.
 fn cpu_name() -> String {
     let name = if cfg!(target_os = "macos") {
         command_output("sysctl", &["-n", "machdep.cpu.brand_string"])
@@ -653,10 +725,28 @@ fn cpu_name() -> String {
             let line = info.lines().find(|line| line.starts_with("model name"))?;
             Some(line.split_once(':')?.1.trim().to_owned())
         })
+    } else if cfg!(windows) {
+        let key = r"HKLM\HARDWARE\DESCRIPTION\System\CentralProcessor\0";
+        command_output("reg", &["query", key, "/v", "ProcessorNameString"])
+            .and_then(|output| registry_value(&output, "ProcessorNameString"))
+            .or_else(|| std::env::var("PROCESSOR_IDENTIFIER").ok())
     } else {
         std::env::var("PROCESSOR_IDENTIFIER").ok()
     };
     name.filter(|name| !name.is_empty()).unwrap_or_else(|| "unknown CPU".to_owned())
+}
+
+/// What the machine's slug is derived from, by the WHISK benchmark's rule, so that its files
+/// and these share the name: the CPU's model name, but `PROCESSOR_IDENTIFIER` on Windows.
+fn machine_source(cpu: &str) -> String {
+    if cfg!(windows) {
+        std::env::var("PROCESSOR_IDENTIFIER")
+            .ok()
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| "unknown CPU".to_owned())
+    } else {
+        cpu.to_owned()
+    }
 }
 
 /// The operating system and its version, where it says.
@@ -680,33 +770,40 @@ fn os_name() -> String {
     }
 }
 
-/// The commit, with `-dirty` when a tracked file has changes.
-fn commit(root: &Path) -> String {
+/// `HEAD`, abbreviated, and whether a tracked file has changes.
+fn commit(root: &Path) -> (String, bool) {
     let root = root.to_string_lossy();
     let hash = command_output("git", &["-C", &root, "rev-parse", "--short=12", "HEAD"]);
     let dirty =
         command_output("git", &["-C", &root, "status", "--porcelain", "--untracked-files=no"])
             .is_some_and(|status| !status.is_empty());
-    match hash {
-        Some(hash) if dirty => format!("{hash}-dirty"),
-        Some(hash) => hash,
-        None => "unknown".to_owned(),
-    }
+    (hash.unwrap_or_else(|| "unknown".to_owned()), dirty)
 }
+
+/// The Windows sampler, run by the Windows PowerShell the platform ships: the processor's
+/// idle share every second, one number per line, from WMI's formatted performance class,
+/// whose names are not localized as `typeperf`'s counter paths are. No double quote, so
+/// that the argument needs no escaping on the command line.
+const IDLE_SAMPLER: &str = "while ($true) { \
+    $total = Get-CimInstance -ClassName Win32_PerfFormattedData_PerfOS_Processor \
+    -Filter 'Name=''_Total'''; \
+    [Console]::Out.WriteLine($total.PercentIdleTime); [Console]::Out.Flush(); \
+    Start-Sleep -Seconds 1 }";
 
 /// What the machine is doing, sampled across one run.
 enum Sampler {
     Uptime(String),
-    /// `typeperf`, sampling the idle share every second, and the thread reading it.
-    Typeperf(Child, thread::JoinHandle<String>),
+    /// [`IDLE_SAMPLER`], and the thread reading it.
+    Wmi(Child, thread::JoinHandle<String>),
     Unavailable,
 }
 
 impl Sampler {
     fn start() -> Self {
         if cfg!(windows) {
-            let spawned = Command::new("typeperf")
-                .args([r"\Processor(_Total)\% Idle Time", "-si", "1"])
+            let spawned = Command::new("powershell")
+                .args(["-NoProfile", "-NonInteractive", "-Command", IDLE_SAMPLER])
+                .stdin(Stdio::null())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::null())
                 .spawn();
@@ -718,7 +815,7 @@ impl Sampler {
                             let _ = stdout.read_to_string(&mut text);
                             text
                         });
-                        Self::Typeperf(child, reader)
+                        Self::Wmi(child, reader)
                     }
                     None => Self::Unavailable,
                 },
@@ -732,7 +829,7 @@ impl Sampler {
     fn stop(self) -> Load {
         match self {
             Self::Uptime(before) => Load::Averages { before, after: uptime() },
-            Self::Typeperf(mut child, reader) => {
+            Self::Wmi(mut child, reader) => {
                 let _ = child.kill();
                 let _ = child.wait();
                 Load::Idle(reader.join().ok().as_deref().and_then(idle_share))
@@ -799,7 +896,7 @@ fn nextest_args(run: Run) -> Vec<String> {
 fn probe(workspace: &Workspace) -> Result<Vec<(String, String)>, String> {
     let mut command = Command::new(&workspace.cargo);
     command.args(nextest_args(PROBE)).current_dir(&workspace.root);
-    Ok(figures(&capture(&mut command, |_, _| {})?))
+    figures(&capture(&mut command, |_, _| {})?)
 }
 
 /// The header's common fields for `m`.
@@ -824,7 +921,7 @@ fn header(
         workers,
         commit: machine.commit.clone(),
         profile,
-        command: options.command.clone(),
+        command: options.command(),
         ran,
         load,
         notes: Vec::new(),
@@ -874,24 +971,40 @@ fn run_test(
     let mut command = Command::new(&workspace.cargo);
     command.args(&args).current_dir(&workspace.root);
     // A short run sets the variable; a full one makes sure the caller's does not leak in.
+    // The workers' override, where set, reaches the test by inheritance.
     command.env_remove(SHORT_VAR).envs(env.iter().map(|(name, value)| (name, value)));
     let sampler = Sampler::start();
     let output = capture(&mut command, |_, _| {});
     let load = sampler.stop();
     let output = output?;
-    let found = figures(&output);
+    let found = figures(&output)?;
+    if found.is_empty() {
+        return Err(format!("the test printed no line `{FIGURE_PREFIX}<name> <value>`"));
+    }
     let workers = found
         .iter()
         .find(|(name, _)| name == "workers" || name == "frame_workers")
         .map_or_else(|| default_workers(machine), |(_, value)| value.clone());
-    let ran = shell_line(&env, "cargo", &args);
-    let header = header(options, machine, m, "release", workers, ran, load);
+    let mut shown = env.clone();
+    if let Some(n) = &machine.workers_override {
+        shown.push((WORKERS_VAR, n.clone()));
+    }
+    let ran = shell_line(&shown, "cargo", &args);
+    let mut header = header(options, machine, m, "release", workers, ran, load);
+    if let Some(n) = &machine.workers_override {
+        header.notes.push((
+            "Workers override".to_owned(),
+            format!("`{WORKERS_VAR}={n}`: N, in place of the topology's"),
+        ));
+    }
     write(out, &header, &found, &output)
 }
 
 /// The WHISK benchmark's own pair, written into a directory under the target directory and
-/// moved into `out`; a short run's carry `-short` and say so at the top of the summary.
-fn run_whisk(
+/// moved into `out`, the summary prefaced with this command's rows (the command, the
+/// profile, the operating system and the load); a short run's carry `-short` and say so at
+/// the top of the summary.
+fn run_task_bench(
     workspace: &Workspace,
     options: &Options,
     machine: &Machine,
@@ -904,16 +1017,41 @@ fn run_whisk(
         .iter()
         .map(|arg| (*arg).to_owned())
         .collect();
+    let mut env = vec![("WHISK_BENCH_MACHINE", machine.name.clone())];
+    if options.short {
+        env.push(("WHISK_BENCH_RUNS", "100".to_owned()));
+    }
     let mut command = Command::new(&workspace.cargo);
     command
         .args(&args)
         .current_dir(&workspace.root)
         .env("WHISK_BENCH_OUT", &scratch)
-        .env("WHISK_BENCH_MACHINE", &machine.name);
+        // A short run sets the runs; a full one makes sure the caller's do not leak in.
+        .env_remove("WHISK_BENCH_RUNS")
+        .envs(env.iter().map(|(name, value)| (name, value)));
+    let sampler = Sampler::start();
+    let output = capture(&mut command, |_, _| {});
+    let load = sampler.stop();
+    output?;
+    let (load_name, load) = load_text(&load);
+    let mut preface = String::new();
     if options.short {
-        command.env("WHISK_BENCH_RUNS", "100");
+        preface.push_str(
+            "> A short run (`WHISK_BENCH_RUNS=100`): its repetitions were cut so that the \
+             command is known to finish; its numbers mean nothing.\n\n",
+        );
     }
-    capture(&mut command, |_, _| {})?;
+    let ran = shell_line(&env, "cargo", &args);
+    let _ = writeln!(preface, "| | |\n|---|---|");
+    let _ = writeln!(
+        preface,
+        "| Command | `{}`, which ran `{ran}`, its files written under the target directory and \
+         moved here |",
+        options.command()
+    );
+    let _ = writeln!(preface, "| Profile | bench |");
+    let _ = writeln!(preface, "| OS | {} ({}) |", machine.os, std::env::consts::ARCH);
+    let _ = writeln!(preface, "| {load_name} | {load} |\n");
     let mut moved = Vec::new();
     let entries = fs::read_dir(&scratch).map_err(|e| format!("{}: {e}", scratch.display()))?;
     for entry in entries {
@@ -923,11 +1061,8 @@ fn run_whisk(
         let suffix = if options.short { "-short" } else { "" };
         let to = out.join(format!("{stem}{suffix}.{extension}"));
         let mut text = fs::read_to_string(&from).map_err(|e| format!("{}: {e}", from.display()))?;
-        if options.short && extension == "md" {
-            text = format!(
-                "> A short run of `{}` (`WHISK_BENCH_RUNS=100`): its numbers mean nothing.\n\n{text}",
-                options.command
-            );
+        if extension == "md" {
+            text = format!("{preface}{text}");
         }
         fs::write(&to, text).map_err(|e| format!("{}: {e}", to.display()))?;
         moved.push(to);
@@ -978,7 +1113,8 @@ fn run_headless(
 
 /// The detached worktree of the edit-to-playing loop: registered under the target
 /// directory, removed again however the loop ends, so the developer's tree is never
-/// touched and no registration outlives a run that ends normally.
+/// touched and no registration outlives a run that ends normally. Only this worktree is
+/// ever removed; the repository's other registrations are not this command's.
 struct Copy {
     root: PathBuf,
     tree: PathBuf,
@@ -998,24 +1134,25 @@ impl Copy {
 
     fn add(root: &Path, tree: PathBuf) -> Result<Self, String> {
         let copy = Self { root: root.to_owned(), tree };
-        let path = copy.tree.to_string_lossy().into_owned();
         // What a killed run left behind.
-        if copy.tree.exists() {
-            let _ = copy.git(&["worktree", "remove", "--force", &path]);
-            let _ = fs::remove_dir_all(&copy.tree);
-        }
-        copy.git(&["worktree", "prune"])?;
+        copy.remove();
+        let path = copy.tree.to_string_lossy().into_owned();
         copy.git(&["worktree", "add", "--detach", &path, "HEAD"])?;
         Ok(copy)
+    }
+
+    /// Removes this worktree's registration, which fails harmlessly when there is none, then
+    /// its directory.
+    fn remove(&self) {
+        let path = self.tree.to_string_lossy().into_owned();
+        let _ = self.git(&["worktree", "remove", "--force", &path]);
+        let _ = fs::remove_dir_all(&self.tree);
     }
 }
 
 impl Drop for Copy {
     fn drop(&mut self) {
-        let path = self.tree.to_string_lossy().into_owned();
-        if self.git(&["worktree", "remove", "--force", &path]).is_err() {
-            eprintln!("measure: could not remove the copy at {path}; `git worktree prune` will");
-        }
+        self.remove();
     }
 }
 
@@ -1100,6 +1237,12 @@ fn run_edit_to_playing(
     found.push(("copy_target_gib".to_owned(), format!("{gib:.1}")));
     let ran = shell_line(&[], "cargo", &args);
     let mut header = header(options, machine, m, "dev", default_workers(machine), ran, load);
+    // The copy is `HEAD` as committed, whatever the developer's tree holds.
+    header.commit.clone_from(&machine.head);
+    header.notes.push((
+        "Local changes".to_owned(),
+        "not measured: the loop runs on `HEAD` as committed".to_owned(),
+    ));
     header.notes.push((
         "Loop".to_owned(),
         format!(
@@ -1136,15 +1279,30 @@ mod tests {
     #[test]
     fn figures_are_the_measure_lines_in_order() {
         let output = "running 1 test\nmeasure: t1_us 1234.5\nT1 1234.5 µs\nmeasure: workers 1 and 4\n\
-                      measure:missing\nmeasure: hash 0x00ab\r\ntest ... ok\n";
+                      measure:unprefixed\nmeasure: hash 0x00ab\r\ntest ... ok\n";
         assert_eq!(
-            figures(output),
+            figures(output).unwrap(),
             [
                 ("t1_us".to_owned(), "1234.5".to_owned()),
                 ("workers".to_owned(), "1 and 4".to_owned()),
                 ("hash".to_owned(), "0x00ab".to_owned()),
             ]
         );
+        assert_eq!(figures("running 1 test\ntest ... ok\n").unwrap(), []);
+    }
+
+    /// Review r1, M1: a figure line that does not read was dropped, and the file written
+    /// without it.
+    #[test]
+    fn a_figure_line_that_does_not_read_is_an_error() {
+        for line in ["measure: t1_us", "measure: t1_us   ", "measure:  1.5", "measure: "] {
+            let output = format!("measure: n 4\n{line}\n");
+            let error = figures(&output).unwrap_err();
+            assert!(
+                error.contains(line.trim_start_matches(FIGURE_PREFIX).trim_end()),
+                "{line}: {error}"
+            );
+        }
     }
 
     #[test]
@@ -1157,7 +1315,7 @@ mod tests {
     }
 
     #[test]
-    fn the_machine_slug_is_whisks() {
+    fn the_machine_slug_follows_the_task_benchmark() {
         assert_eq!(slug("Apple M1"), "apple-m1");
         assert_eq!(slug("Intel(R) Core(TM) i9-13900K"), "intel-r-core-tm-i9-13900k");
         assert_eq!(
@@ -1196,12 +1354,22 @@ mod tests {
     }
 
     #[test]
-    fn the_idle_share_is_the_mean_of_typeperf_s_samples() {
-        let csv = "\r\n\"(PDH-CSV 4.0)\",\"\\\\HOST\\Processor(_Total)\\% Idle Time\"\r\n\
-                   \"11/15/2026 05:41:02.123\",\"90.0\"\r\n\"11/15/2026 05:41:03.123\",\"80.0\"\r\n\
-                   Exiting, please wait...\r\n";
-        assert_eq!(idle_share(csv), Some(85.0));
-        assert_eq!(idle_share("\"(PDH-CSV 4.0)\",\"x\"\n"), None);
+    fn the_idle_share_is_the_mean_of_the_wmi_sampler_s_lines() {
+        assert_eq!(idle_share("90\r\n80\r\n"), Some(85.0));
+        assert_eq!(idle_share("\r\n97\r\nGet-CimInstance : Access denied\r\n93\r\n"), Some(95.0));
+        assert_eq!(idle_share(""), None);
+        assert_eq!(idle_share("Get-CimInstance : Invalid class\r\n"), None);
+    }
+
+    #[test]
+    fn the_cpu_name_is_read_from_reg_query_s_output() {
+        let output = "\r\nHKEY_LOCAL_MACHINE\\HARDWARE\\DESCRIPTION\\System\\CentralProcessor\\0\r\n\
+                      \x20   ProcessorNameString    REG_SZ    AMD EPYC 7763 64-Core Processor\r\n\r\n";
+        assert_eq!(
+            registry_value(output, "ProcessorNameString").as_deref(),
+            Some("AMD EPYC 7763 64-Core Processor")
+        );
+        assert_eq!(registry_value("ERROR: not found", "ProcessorNameString"), None);
     }
 
     #[test]
@@ -1276,7 +1444,7 @@ mod tests {
         assert_eq!(all.selected.len(), MEASUREMENTS.len());
         assert!(all.short);
         assert_eq!(all.out, PathBuf::from(RESULTS));
-        assert_eq!(all.command, "cargo xtask measure --all --short");
+        assert_eq!(all.command(), "cargo xtask measure --all --short");
         let two = parse(&["tick-100k", "whisk", "tick-100k", "--out", "elsewhere"]).unwrap();
         let names: Vec<&str> = two.selected.iter().map(|m| m.name).collect();
         assert_eq!(names, ["tick-100k", "whisk"]);
@@ -1285,6 +1453,29 @@ mod tests {
         assert!(parse(&["--all", "whisk"]).is_err());
         assert!(parse(&["nothing"]).is_err());
         assert!(parse(&["--out"]).is_err());
+        assert!(parse(&["--all", "--out", "a", "--out", "b"]).is_err());
+    }
+
+    /// Review r1, M7: an absolute `--out` was written into the Command row as given, a
+    /// path of the machine, and one outside the repository was taken.
+    #[test]
+    fn the_output_directory_is_inside_the_repository_and_written_relative_to_it() {
+        let root = std::env::temp_dir().join("repository");
+        let inside = root.join("target").join("results");
+        let inside = inside.to_str().unwrap();
+        let options = parse(&["--all", "--out", inside, "--short"]).unwrap();
+        let resolved = options.resolved(&root).unwrap();
+        assert_eq!(resolved.out, Path::new("target").join("results"));
+        assert_eq!(resolved.command(), "cargo xtask measure --all --out target/results --short");
+        let relative = parse(&["--all", "--out", "target/results"]).unwrap();
+        assert_eq!(relative.resolved(&root).unwrap().out, PathBuf::from("target/results"));
+        let default = parse(&["--all"]).unwrap().resolved(&root).unwrap();
+        assert_eq!(default.out, PathBuf::from(RESULTS));
+        let elsewhere = std::env::temp_dir().join("elsewhere");
+        for out in [elsewhere.to_str().unwrap(), "../elsewhere", "target/../../elsewhere"] {
+            let error = parse(&["--all", "--out", out]).unwrap().resolved(&root).unwrap_err();
+            assert!(error.contains("outside the repository"), "{out}: {error}");
+        }
     }
 
     #[test]

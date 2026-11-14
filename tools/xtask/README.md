@@ -187,7 +187,7 @@ Every root's tree compiles glam for the target with its `scalar-math` feature (D
 without it, glam's `Vec3A` and `Vec4` `min` and `max` are the target's SIMD instructions,
 which treat NaN differently on x86-64 and aarch64. It also compiles glam with `libm`, so
 glam's transcendentals are the pinned `libm` crate's rather than the platform's float
-library.
+library (D105).
 
 No workspace package but `lactose-task` names loom, read from `cargo metadata`: no
 dependency on it under any rename, no dependency declaration or `[features]` value that turns
@@ -353,26 +353,40 @@ whose build is done. CI never uses `heavy`: its runners are single-tenant.
 
 `cargo xtask measure (--all | <name>…) [--short] [--out <dir>]` runs the measurements the
 milestone criteria rest on and writes each one's result files to `docs/results` (or
-`<dir>`), with the header of `docs/plans/milestone-1.md`, section 4. The names, what each
+`<dir>`, which must be inside the repository; an absolute one is written relative to its
+root in the files), with the header of `docs/plans/milestone-1.md`, section 4. The names, what each
 runs and where each threshold is stated are in `docs/results/README.md`; `--all` runs every
 one in that order and, when one fails, still runs the rest and exits 2 at the end. It runs
 `cargo nextest run`, `cargo bench` and `cargo run`, all `--locked`, and their output goes to
 standard error as it comes.
 
-- Before the measurements, an ignored test prints the core topology the executor detects and
-  its default frame workers, which every file's header carries.
+- Before the measurements, an ignored test prints the core topology the platform reports
+  and the default executor's frame workers, which every file's header carries.
 - A measurement that is a test prints each figure as a line `measure: <name> <value>`. The
   files carry those figures, the `.json` with each value a number where it reads as one, and
-  the `.md` with the test's whole output.
+  the `.md` with the test's whole output. A test that prints no figure, or a figure line
+  that does not read, fails its measurement.
+- The cost tests run on N frame workers: the performance cores the platform reports or, on
+  a part that reports no core types, its physical cores, at most eight (the plan's section
+  4). `LACTOSE_MEASURE_WORKERS=<n>` sets N instead; the tests read it, and the header
+  records it.
 - `--short` sets `LACTOSE_MEASURE_SHORT=1` for the tests and `WHISK_BENCH_RUNS=100` for the
   benchmark, and names the files `…-short`. It cuts nothing of `headless-120`, which has no
   repetitions, or `edit-to-playing`, which keeps its five so that a runner's short run still
   yields the criterion's figure, and leaves their files unmarked.
-- The machine in the file names is `LACTOSE_MEASURE_MACHINE` where it is set, else the CPU's
-  model name as a slug (the WHISK benchmark's rule).
+- The machine in the file names is `LACTOSE_MEASURE_MACHINE` where it is set, else a slug
+  of the CPU's model name, or of `PROCESSOR_IDENTIFIER` on Windows (the WHISK benchmark's
+  rule, so that its files and these share the name). The benchmark's summary is prefaced
+  with this command's rows: the command, the profile, the operating system and the load.
+- The load is `uptime`'s averages before and after a run; on Windows, the processor's mean
+  idle share over it, which Windows PowerShell samples every second from WMI's
+  `Win32_PerfFormattedData_PerfOS_Processor` (`PercentIdleTime` of `_Total`), and which
+  the file calls unavailable when the sampler fails. The Windows CPU row is the registry's
+  `ProcessorNameString`. The Windows paths have not been run.
 - `edit-to-playing` builds in a detached worktree of `HEAD` under
   `target/measure/edit-to-playing/`, removed again when it ends, with a target directory of
-  its own that it keeps for the next run's warm build.
+  its own that it keeps for the next run's warm build. Its Commit row is `HEAD` without
+  `-dirty`: local changes are not measured.
 
 It loads the machine for minutes: under other agents' load, wrap it in `heavy`, and read its
 numbers as steering only. The numbers that prove a criterion come from a quiet machine.
