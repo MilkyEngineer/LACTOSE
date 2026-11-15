@@ -186,8 +186,8 @@ fn package_of(words: &[String]) -> Option<&str> {
     None
 }
 
-/// What `cargo miri test` with `words` runs of `package`, which they name: one item per
-/// selection, so a target two patterns select is in it twice.
+/// What `cargo miri test` with `words` runs of `package`, which they name, sorted: a target
+/// two of the words select is run once, as cargo runs it.
 ///
 /// # Errors
 /// A word the check does not read, a target cargo would refuse, or `--doc` beside another
@@ -256,6 +256,8 @@ fn selected<'a>(package: &'a Package, words: &[String]) -> Result<Vec<Run<'a>>, 
             return Err(format!("`--test {text}` selects no test target, which cargo refuses"));
         }
     }
+    runs.sort();
+    runs.dedup();
     Ok(runs)
 }
 
@@ -871,6 +873,10 @@ mod tests {
     fn the_split_on_main_runs_every_target_once() {
         assert_eq!(run(ecs(&TESTS), &main_split()), [] as [&str; 0]);
         assert_eq!(run(ecs(&TESTS), &main_split().replace('\n', "\r\n")), [] as [&str; 0]);
+        // One entry that selects a target twice runs it once (cargo 1.99.0, `--test a --test
+        // '[ab]'`).
+        let text = main_split().replace("--test events", "--test events --test 'ev*'");
+        assert_eq!(run(ecs(&TESTS), &text), [] as [&str; 0]);
     }
 
     #[test]
