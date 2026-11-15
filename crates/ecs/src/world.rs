@@ -910,9 +910,16 @@ impl World {
         if self.storage.entities.contains_key(&StableKey::Net(net)) {
             return Err(invalid("the NetId names a live entity of its own"));
         }
+        // The two maps are one bijection, which `exportable_owner` relies on: `canonical`
+        // yields a predicted origin only through `by_net`. Only this insert and the horizon's
+        // prune change them, each on both sides.
         self.aliases.by_predicted.insert(predicted, net);
         self.aliases.by_net.insert(net, predicted);
-        self.debug_assert_aliases();
+        debug_assert!(
+            self.aliases.by_net.get(&net) == Some(&predicted)
+                && self.aliases.by_predicted.get(&predicted) == Some(&net),
+            "a bind maps each key to the other"
+        );
         // A server keeps what its rule stored under a despawned origin's `Net` key until the
         // origin returns, which rewrites it (`push_spawned`): a bind inside the window leaves
         // it, so the export can still write it after the horizon prunes the alias.
@@ -1479,21 +1486,10 @@ impl World {
             if !self.storage.entities.contains_key(&StableKey::Predicted(key))
                 && let Some(net) = self.aliases.by_predicted.remove(&key)
             {
-                self.aliases.by_net.remove(&net);
+                let removed = self.aliases.by_net.remove(&net);
+                debug_assert_eq!(removed, Some(key), "the alias maps are one bijection");
             }
         }
-        self.debug_assert_aliases();
-    }
-
-    /// The two alias maps are one bijection: [`bind`](Self::bind) inserts into both, after
-    /// refusing a mismatch, and the horizon removes from both. `exportable_owner` relies on
-    /// it, since `canonical` yields a predicted origin only through `by_net`.
-    fn debug_assert_aliases(&self) {
-        debug_assert_eq!(
-            self.aliases.by_predicted.len(),
-            self.aliases.by_net.len(),
-            "the alias maps are one bijection"
-        );
     }
 
     // ---- Bulk copy ----

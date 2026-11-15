@@ -798,6 +798,16 @@ fn history(
         world.set_rollback_horizon(horizon);
         let context = format!("seed {seed:#x} {log:#?}");
         assert_forest(&world, &context);
+        // The world's own index, which the export cannot see: every live row whose owner is
+        // live is listed among that owner's entities, whatever key the owner is stored under.
+        for key in live(&world) {
+            if let Some(owner) = owner_of(&world, key).filter(|&owner| world.contains(owner)) {
+                assert!(
+                    world.owned_by(owner).any(|owned| owned == key),
+                    "{key:?} is not listed under its live owner {owner:?}: {context}"
+                );
+            }
+        }
         for region in loaded(&world) {
             if let Err(error) = save(&world, region, baselines, table) {
                 panic!("{error}: {context}");
