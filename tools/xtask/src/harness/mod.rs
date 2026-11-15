@@ -225,7 +225,7 @@ pub fn unlisted_simulation(ws: &Workspace, packages: &[String]) -> Vec<Finding> 
 }
 
 /// Compares the tests that recorded hashes in the baseline run with the committed list,
-/// `tests` under [harness] in the policy file. A test that did not record although listed was
+/// `tests` under `[harness]` in the policy file. A test that did not record although listed was
 /// renamed, ignored, deleted or stopped recording, and its comparison is silently gone; one
 /// that recorded but is not listed was added without the list knowing. Either is a finding
 /// naming what to change there. An empty baseline is reported by [`run`] and not again here.

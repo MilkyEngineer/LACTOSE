@@ -59,7 +59,7 @@ pub enum Run {
         /// The test's path inside the target.
         test: &'static str,
     },
-    /// The netcode spike's ten-minute replays ([`REPLAYS`]), ignored tests run in release one
+    /// The netcode spike's ten-minute replays (`REPLAYS`), ignored tests run in release one
     /// at a time, each of which prints its figures as one JSON object.
     SpikeReplays,
     /// `cargo bench -p lactose-task --bench whisk`, which writes its own pair of files.

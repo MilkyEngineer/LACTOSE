@@ -126,10 +126,10 @@ impl Quantiser {
     ///
     /// - `movement`: the vector `(movement_x, movement_y)` scaled down to the unit disc if
     ///   longer (a non-finite component, NaN or infinite, counts as zero), then each
-    ///   component times [`AXIS_SCALE`](lactose_input::AXIS_SCALE), rounded to nearest, ties
+    ///   component times [`AXIS_SCALE`], rounded to nearest, ties
     ///   away from zero, as an `i16` (saturating);
     /// - `yaw`: `yaw` divided by `TAU`, its fraction of a turn (one rounding, in `[0, 1]`) times
-    ///   [`UNITS_PER_TURN`](lactose_input::UNITS_PER_TURN), rounded to nearest, modulo
+    ///   [`UNITS_PER_TURN`], rounded to nearest, modulo
     ///   `UNITS_PER_TURN` (1.0 is taken modulo a turn); a
     ///   non-finite yaw quantises to zero;
     /// - `pitch`: `pitch` clamped to `[-PI/2, PI/2]`, divided by `TAU`, times
