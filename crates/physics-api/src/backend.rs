@@ -174,8 +174,9 @@ impl BackendCopy for SnapshotBytes {
 /// of its solver pool and whatever ran before on those threads, and identical on x86-64
 /// and aarch64: the obligation is section 2's. The verification items name the two known
 /// gaps of the pinned Rapier (platform-libm `sin_cos` on limited joints, the sign of zero
-/// in SIMD min/max), which the backend lane closes before SOUR's architecture mode gates;
-/// until then the property is unproven, not excused. It reads no clock, no thread or
+/// in SIMD min/max): the first is patched (D123); the second showed no difference in the
+/// scenes SOUR's architecture mode records across the three CI platforms, which is
+/// evidence, not a proof (`docs/verification.md`). It reads no clock, no thread or
 /// worker identity and no thread-local state; its pool's threads enter
 /// `lactose_core::ThreadClass::PhysicsSolver` at start, which sets their floating-point
 /// state; solver threads number the frame worker count minus the reservation, at least

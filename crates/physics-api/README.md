@@ -599,11 +599,11 @@ gather compare it with the last tick they covered, and zero means never.
   as a copy, and these bytes stay for the fresh solver, the journal checkpoint and the hash
   (D143). `size_in_bytes` and `hash` are of the bytes the backend would write, not of what
   the copy weighs: the first call of either encodes the copy once, at the cost of one
-  backend write, and keeps the length and the hash, not the bytes. `hash` is the named
-  place where section 8.3 adds the bytes to the world hash once the backend's
-  serialisation is shown to be order-stable (`docs/verification.md`); until then
+  backend write, and keeps the length and the hash, not the bytes. `hash` is the named place
+  where section 8.3 adds the bytes to the world hash; the backend's serialisation was shown
+  order-stable in nightly 43703297881 (`docs/verification.md`).
   `ConformanceReport::physics_hash` reports it, `lactose-physics-rapier`'s SOUR test
-  `the_conformance_run` records its first value, and no world hash includes it.
+  `the_conformance_run` records its first value, and no world hash includes it yet.
 
 **The backend's obligations** (architecture sections 1, 2 and 8.2; the `PhysicsBackend`
 docs restate them per method)
@@ -628,10 +628,10 @@ docs restate them per method)
   (`conformance::empty_restore`).
 - The obligation is section 2's, identical on x86-64 and aarch64; the verification items
   name the two known gaps of the pinned Rapier (platform-libm `sin_cos` on limited joints,
-  the sign of zero in SIMD min/max), which the backend lane closes before SOUR's
-  architecture mode gates; until then the property is unproven, not excused. The `sin_cos`
-  route is patched or vendored, or `Joint::limited` refused until it is; the sign-of-zero
-  difference is measured through the conformance scene. `matrixmultiply` selects kernels
+  the sign of zero in SIMD min/max). The `sin_cos` route is patched (D123); the sign of
+  zero, measured through the conformance scene, the limited hinge and the spike's
+  recorded scenes, showed no difference across the three CI platforms, which is evidence,
+  not a proof (`docs/verification.md`). `matrixmultiply` selects kernels
   by CPU feature and is allowlisted as an explicit second exception beside `libm` because
   it is unreachable from the step: only multibody inverse kinematics reaches it, and the
   boundary lint file bans that entry point.

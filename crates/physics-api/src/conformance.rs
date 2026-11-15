@@ -68,8 +68,10 @@ pub struct ConformanceReport {
     /// snapshot's copy weighs.
     pub snapshot_bytes: usize,
     /// [`PhysicsSnapshot::hash`](crate::PhysicsSnapshot::hash) of a snapshot taken after
-    /// tick [`TICKS`] of the first run and of the resumed run. Reported, not required
-    /// equal, until the verification item on the bytes' order stability decides.
+    /// tick [`TICKS`] of the first run and of the resumed run. SOUR records the first
+    /// (`lactose-physics-rapier`'s `the_conformance_run`); it was equal across linux-x64,
+    /// windows-x64 and macos-arm64 in nightly 43703297881. The run reports the two and does
+    /// not require them equal; `lactose-physics-rapier`'s conformance test does.
     pub physics_hash: (u64, u64),
 }
 

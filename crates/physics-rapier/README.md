@@ -12,9 +12,11 @@ copy in `vendor/`, see `vendor/README.md`).
 
 **Status: implemented.** It passes `physics-api`'s conformance run for pools of one, two and
 four threads under two layouts, `physics-api`'s scenes re-run over it, and the SOUR scenes
-under `[harness]`. `crates/physics-api/README.md` and the trait's documentation are the
-contract; everything they say a backend does holds here and is not restated. This file states
-what they leave to the backend. Decision D119 is the design.
+under `[harness]`, among them the conformance run with its physics bytes and a limited hinge
+that reaches the patched `sin_cos` (D123), equal across linux-x64, windows-x64 and
+macos-arm64 (nightly 43703297881). `crates/physics-api/README.md` and the trait's
+documentation are the contract; everything they say a backend does holds here and is not
+restated. This file states what they leave to the backend. Decision D119 is the design.
 
 ## The one public item
 
@@ -260,8 +262,10 @@ backend stepped on, and the copy restored steps as the first time.
 
 - **The sign of zero in `min` and `max`** (architecture section 8.2): `f64::max` and the
   `wide` SIMD lanes can return zeros of different sign on x86-64 and AArch64. No patch under
-  fifty lines closes it, so the cross-architecture property stays unproven until SOUR's
-  architecture mode runs on CI (`docs/verification.md`).
+  fifty lines closes it. The conformance scene, the limited hinge, which runs the limit
+  clamps, and the spike's four recorded scenes, among them the claim in contact, produced no
+  difference across the three CI platforms (nightly 43703297881). That is evidence for these
+  scenes, not a proof (`docs/verification.md`).
 - **Snapshot cost** (`tests/cost.rs` with `--release`, printed, not asserted; Apple M1,
   load average about 5). Fifty dynamic bodies beside fixed colliders:
 

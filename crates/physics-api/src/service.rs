@@ -323,11 +323,10 @@ impl PhysicsSnapshot {
 
     /// `xxh64` of the bytes the backend would write of the world this snapshot holds, with
     /// seed zero, at the cost [`size_in_bytes`](Self::size_in_bytes) states: the place
-    /// where architecture section 8.3 adds the physics world to the world hash once the
-    /// backend's serialisation is shown to be order-stable (`docs/verification.md`). Until
-    /// then SOUR records it after the conformance run (`lactose-physics-rapier`'s
-    /// `the_conformance_run`), no world hash includes it, and two equal physics worlds may
-    /// hash apart.
+    /// where architecture section 8.3 adds the physics world to the world hash, which does
+    /// not include it yet. The backend's serialisation was shown order-stable in
+    /// nightly 43703297881 (`docs/verification.md`); SOUR records the hash after the
+    /// conformance run (`lactose-physics-rapier`'s `the_conformance_run`).
     #[must_use]
     pub fn hash(&self) -> u64 {
         self.encoded().1

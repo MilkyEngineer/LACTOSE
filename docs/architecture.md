@@ -681,8 +681,9 @@ configuration or session state, must be `derived` and holds no entity reference,
 and a restore rewrite the references of rows and region resources alone, so
 `World::insert_resource` does not build for a type that holds one (D142), and world-global
 persistent state is a resource of a pinned region. It runs at sync points, and a field-level
-diff is produced only on mismatch. Hashing `physics-api::snapshot` bytes is added once Rapier's
-serialisation is shown to be order-stable.
+diff is produced only on mismatch. Rapier's serialised bytes are shown order-stable: SOUR records
+their hash after the conformance run, equal across platforms in nightly 43703297881, so
+`PhysicsSnapshot::hash` may now join the world hash.
 
 The harness, named SOUR, runs every simulation test in these modes and fails on any mismatch:
 

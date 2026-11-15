@@ -708,8 +708,8 @@ another build.
   frame-level request for a region a game system wants ahead of any anchor (milestone 3)".
 - Section 14's hold of a player at a region boundary until the client acknowledges
   readiness: `net`'s at milestone 4, with no field here.
-- Hashing `physics-api::snapshot` bytes (architecture section 8.3), added once Rapier's
-  serialisation is shown order-stable.
+- Hashing `physics-api::snapshot` bytes into the world hash (architecture section 8.3).
+  Rapier's serialisation was shown order-stable in nightly 43703297881.
 - The journal writer, reader and replay driver, and the digest tool that compares two
   digests across machines; the types are here.
 - Per-anchor streaming priority (`StreamingAnchor::priority` is zero) and streaming
