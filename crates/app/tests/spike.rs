@@ -2074,8 +2074,9 @@ struct Outcome {
     key_counts: Vec<usize>,
     datagrams_dropped: u64,
     deltas_dropped: u32,
-    /// Server frames that ended with the region in any mode but `Simulated`, unloaded
-    /// included: a correction there inflates the rate (architecture section 9.4).
+    /// Server frames that ended with a loaded region in any mode but `Simulated`, or with
+    /// the spike's region unloaded: a correction there inflates the rate (architecture
+    /// section 9.4).
     server_frozen_ticks: u32,
     /// The most fixed colliders and proxies the prediction world held at the end of a client
     /// frame, which plan decision 5.5 bounds at [`PREDICTION_ROWS`].
@@ -2140,11 +2141,13 @@ fn predicted_keys(world: &World) -> BTreeSet<StableKey> {
         .collect()
 }
 
-/// The fixed colliders and proxies of `world`'s region: colliders with no body, and bodies
-/// no player claims, as the slot test's queries count them (which need the world `mut`).
+/// The fixed colliders and proxies of every region of `world`: colliders with no body, and
+/// bodies no player claims, as the slot test's queries count them (which need the world
+/// `mut`).
 fn fixed_and_proxies(world: &World) -> usize {
     world
-        .entities_in(REGION)
+        .regions()
+        .flat_map(|region| world.entities_in(region))
         .filter(|&key| match world.get::<RigidBody>(key) {
             Some(_) => world.get::<ClaimedBy>(key).is_none(),
             None => world.get::<Collider>(key).is_some(),
@@ -2230,8 +2233,9 @@ fn run(
         packer.owed.extend(owed);
         packer.absorb(&out.gathered)?;
         let world = current.simulation().world();
-        outcome.server_frozen_ticks +=
-            u32::from(world.region_mode(REGION) != Some(RegionMode::Simulated));
+        let simulated = |region| world.region_mode(region) == Some(RegionMode::Simulated);
+        let frozen = !world.regions().all(simulated) || world.region_mode(REGION).is_none();
+        outcome.server_frozen_ticks += u32::from(frozen);
         packer.sync_claims(world);
         let tick = current.tick();
         if n == 1 || resync_requested {

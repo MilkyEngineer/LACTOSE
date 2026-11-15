@@ -15,9 +15,9 @@
 //! the workers used, the commit, the build profile, the command, and the load average before
 //! and after the run (on Windows, the processor's idle share over it, sampled through WMI).
 //!
-//! Not a check: nothing is printed to standard output, progress and the measurements' own
-//! output go to standard error, and times are printed and written, never compared with a
-//! threshold.
+//! Not a check of any criterion (`spike-net`'s two counts aside): nothing is printed to
+//! standard output, progress and the measurements' own output go to standard error, and times
+//! are printed and written, never compared with a threshold.
 
 use std::fmt::Write as _;
 use std::fs;
@@ -1262,9 +1262,9 @@ fn run_spike_replays(
     // Written only once every replay has passed `check_replay`.
     header.notes.push((
         "Server's regions".to_owned(),
-        "every replay's `server_frozen_ticks` is 0: the server held its one region `Simulated` \
-         on every frame from its load to the end, so no correction is a server-`Frozen` \
-         region's (architecture section 9.4); the measurement fails otherwise"
+        "every replay's `server_frozen_ticks` is 0: the server held every loaded region \
+         `Simulated` on every frame from the load to the end, so no correction is a \
+         server-`Frozen` region's (architecture section 9.4); the measurement fails otherwise"
             .to_owned(),
     ));
     header.notes.push((
@@ -1586,8 +1586,6 @@ mod tests {
         assert_eq!(figures("running 1 test\ntest ... ok\n").unwrap(), []);
     }
 
-    /// Review r1, M1: a figure line that does not read was dropped, and the file written
-    /// without it.
     /// Review r1 of spike-net-file, M2: a retried test prints every attempt's figures, and
     /// the parse took both.
     #[test]
@@ -1651,6 +1649,8 @@ mod tests {
         }
     }
 
+    /// Review r1, M1: a figure line that does not read was dropped, and the file written
+    /// without it.
     #[test]
     fn a_figure_line_that_does_not_read_is_an_error() {
         for line in ["measure: t1_us", "measure: t1_us   ", "measure:  1.5", "measure: "] {
