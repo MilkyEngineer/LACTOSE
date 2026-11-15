@@ -27,8 +27,8 @@ use lactose_ecs::{
     StableKeyOf, Without, World, WorldBuilder, WorldKind, system,
 };
 use lactose_persist::{
-    CONTAINER_FORMAT_VERSION, Container, ContainerHeader, EngineVersion, FieldValues, Loader,
-    MigrateFn, Migration, Migrations, RegionRecords, SchemaTable,
+    CONTAINER_FORMAT_VERSION, Container, ContainerHeader, EngineVersion, FieldValues, LayoutDigest,
+    Loader, MigrateFn, Migration, Migrations, RegionRecords, SchemaTable,
 };
 use lactose_reflect::{Component, Padding, Reflect, Registry, component, resource, value};
 use lactose_sim::{
@@ -259,9 +259,9 @@ fn v1_container(build: &Build, world: &World) -> Vec<u8> {
 /// schema hash and the zstd frame make these bytes move with the world's own types and
 /// with zstd (pinned by `Cargo.lock`); the test below says which.
 const V1_CONTAINER: &str = concat!(
-    // The preamble: magic, format 1, zero, a block of 103 bytes.
+    // The preamble: magic, format 2, zero, a block of 103 bytes.
     "4c534156",
-    "0100",
+    "0200",
     "0000",
     "6700000000000000",
     // The header: engine 1.0.0, the version 1 table's schema hash, tick 12, counter 3, one
@@ -271,25 +271,25 @@ const V1_CONTAINER: &str = concat!(
     "0c000000",
     "0300000000000000",
     "01000000",
-    // The entry: region 7, seed, baseline hash, an overlay and its digest, offset 119, 201
-    // bytes compressed, 356 decompressed, the section's hash.
+    // The entry: region 7, seed, baseline hash, an overlay and its digest, offset 119, 206
+    // bytes compressed, 328 decompressed, the section's hash.
     "0700000000000000",
     "ed5e000000000000",
-    "82c9cd95f07eb7c6",
+    "4b4c066e28555151",
     "01",
-    "b086fae8876c1e43",
+    "0a897003705fa367",
     "7700000000000000",
-    "c900000000000000",
-    "6401000000000000",
-    "3dde686148938735",
+    "ce00000000000000",
+    "4801000000000000",
+    "e89905f73294d2f1",
     // The block's hash.
-    "369430b684ab52b8",
+    "ec0dc8525c5a341a",
     // The section: one zstd frame.
-    "28b52ffd606400fd050024070700ed5e0082c9cd95f07eb7c601dd004c4f564c0102000000c6d01cb2c7",
-    "c78c05100000000000082e56cab3f382b2fe04030100000840fbffffff01101070110100040180280000",
-    "00b086fae8876c1e43d16d465f758a0a3203202489c6470340927cc96c20349a22170f0a5ff9b7402091",
-    "23208002a2346e2d849f4f5820c660186d21421000b5f22f24865c46554e19d3a97d1b54311226d13c80",
-    "d6057c437b2e8ea10d1ba7bc0fc6c7221888eab90bee25fb4a7cd4a2b70d6c6201",
+    "28b52ffd60480025060054080700ed5e004b4c066e2855515101ed004c4f564c02c6d01cb2c7c78c0501",
+    "00000010000000202489c647034092000008000000022e56cab3f382b2fe040000000f0a5ff9b7402091",
+    "01030000000100000840fbffffff0102101070110100040180280000000a897003705fa367d16d465f75",
+    "8a0a327cc96c20349a221704000000000000001b00491100248799e73f57e27c17e002e540c6a82e9002",
+    "592b943341a8980167c0a6694e1b4c55ff67704b8494b39b06f869f3622d4fa3c17870c700b0",
 );
 
 fn hex(bytes: &[u8]) -> String {
@@ -586,8 +586,7 @@ fn a_set_field_under_a_changed_schema_is_unsupported() {
     };
     let schemas = v1_build.table.schemas().cloned();
     let overlay = Overlay::new(old.baseline_hash, schemas, [set]).unwrap();
-    let mut records = RegionRecords { overlay: Some(Arc::new(overlay)), ..old };
-    records.layouts.remove(&Position::KEY);
+    let records = RegionRecords { overlay: Some(Arc::new(overlay)), ..old };
     records.check().unwrap();
     let new = build::<v2::Health>();
     let migrations = with(&[(1, health_v1_to_v2)]);
@@ -950,12 +949,6 @@ fn records(
         .then(|| Arc::new(Overlay::new(hash, table.schemas().cloned(), overlay).unwrap()));
     resources.sort_by_key(|data| data.component);
     transient_resources.sort_unstable();
-    let carried =
-        overlay.iter().flat_map(|overlay| overlay.schemas()).map(|schema| schema.component());
-    let layouts = carried
-        .chain(resources.iter().map(|data| data.component))
-        .map(|component| (component, table.layout(component).unwrap()))
-        .collect();
     let resource_schemas =
         resources.iter().map(|data| table.schema(data.component).unwrap().clone()).collect();
     let records = RegionRecords {
@@ -966,10 +959,27 @@ fn records(
         resources,
         resource_schemas,
         transient_resources,
-        layouts,
     };
     records.check().unwrap();
     records
+}
+
+/// The layout digest `records` carry for `component`, in the overlay's schema table or the
+/// resources'.
+fn carried_digest(records: &RegionRecords, component: ComponentKey) -> Option<LayoutDigest> {
+    let overlay = records.overlay.iter().flat_map(|overlay| overlay.schemas());
+    let mut carried = overlay.chain(&records.resource_schemas);
+    let schema = carried.find(|schema| schema.component() == component)?;
+    Some(LayoutDigest(schema.layout_digest()))
+}
+
+/// Every type `records` carry bytes of, ascending.
+fn carried(records: &RegionRecords) -> Vec<ComponentKey> {
+    let overlay = records.overlay.iter().flat_map(|overlay| overlay.schemas());
+    let mut keys: Vec<_> =
+        overlay.chain(&records.resource_schemas).map(|schema| schema.component()).collect();
+    keys.sort_unstable();
+    keys
 }
 
 fn runtime(n: u64) -> NetId {
@@ -1025,7 +1035,7 @@ fn a_transient_type_relaid_loads_zeroed_with_no_step() {
     let Record::Spawn { components, .. } = &overlay.records()[0] else { panic!() };
     assert_eq!(components[1], ComponentData { component: saved::Buzz::KEY, bytes: vec![0; 8] });
     assert_eq!(migrated.transient_resources, vec![saved::Hum::KEY]);
-    assert_eq!(migrated.layouts[&saved::Buzz::KEY], relaid.layout(saved::Buzz::KEY).unwrap());
+    assert_eq!(carried_digest(&migrated, saved::Buzz::KEY), relaid.layout(saved::Buzz::KEY));
 
     let bundle = bundle_under(&relaid, &migrations, &records).unwrap();
     let world = world_of(relaid_registry(), &bundle);
@@ -1081,7 +1091,7 @@ fn a_persistent_resource_made_transient_moves_to_the_transient_keys() {
     let migrations = Migrations::new();
     let migrated = Loader::new(&relaid, &migrations).migrate(&records).unwrap();
     assert!(migrated.resources.is_empty() && migrated.resource_schemas.is_empty());
-    assert!(migrated.layouts.is_empty());
+    assert!(carried(&migrated).is_empty());
     let mut keys = vec![saved::Hum::KEY, saved::Stock::KEY];
     keys.sort_unstable();
     assert_eq!(migrated.transient_resources, keys);
@@ -1111,7 +1121,7 @@ fn a_transient_type_made_persistent_loads_from_a_zero_value() {
         vec![ComponentData { component: saved::Hum::KEY, bytes: vec![0; 8] }]
     );
     assert_eq!(migrated.resource_schemas, vec![kept.schema(saved::Hum::KEY).unwrap().clone()]);
-    assert_eq!(migrated.layouts[&saved::Hum::KEY], kept.layout(saved::Hum::KEY).unwrap());
+    assert_eq!(carried_digest(&migrated, saved::Hum::KEY), kept.layout(saved::Hum::KEY));
     let world = world_of(kept_registry(), &bundle_under(&kept, &migrations, &records).unwrap());
     assert_eq!(world.get::<kept::Buzz>(net(runtime(1))), Some(&kept::Buzz { a: 0 }));
     assert_eq!(world.region_resource::<kept::Hum>(HOME), Some(&kept::Hum { a: 0, b: 0 }));
@@ -1179,7 +1189,7 @@ fn a_type_made_derived_is_dropped() {
         &[Record::Spawn { id: runtime(1), components: vec![data(Tag(2))] }]
     );
     assert!(migrated.resources.is_empty() && migrated.transient_resources.is_empty());
-    assert_eq!(migrated.layouts.keys().copied().collect::<Vec<_>>(), vec![Tag::KEY]);
+    assert_eq!(carried(&migrated), vec![Tag::KEY]);
     let world = world_of(derived_registry(), &bundle_under(&derived, &migrations, &both).unwrap());
     assert_eq!(world.get::<derived::Memo>(net(runtime(1))), None);
     assert!(world.region_resources_erased(HOME).next().is_none());
@@ -1189,7 +1199,7 @@ fn a_type_made_derived_is_dropped() {
     let only_memo = records(&table, &baseline, vec![added], vec![], vec![]);
     let migrated = Loader::new(&derived, &migrations).migrate(&only_memo).unwrap();
     assert_eq!(migrated.overlay, None);
-    assert!(migrated.layouts.is_empty());
+    assert!(carried(&migrated).is_empty());
     migrated.check().unwrap();
     // A removal of the derived type goes too; one of a kept type stays.
     let memo_removed = Record::RemoveComponent { id: NetId::cooked(1), component: Memo::KEY };
@@ -1221,11 +1231,6 @@ fn the_world_rebuilds_a_type_made_derived() {
         Record::Spawn { id: spawned, components: vec![data(pos(5, 6)), data(saved::Memo(0xdead))] };
     let baseline = common::baseline(A);
     let overlay = Overlay::new(baseline.content_hash(), saved_schemas, [spawn]).unwrap();
-    let layouts = [
-        (Position::KEY, common::schemas().layout(Position::KEY).unwrap()),
-        (saved::Memo::KEY, saved_table().layout(saved::Memo::KEY).unwrap()),
-        (Weather::KEY, common::schemas().layout(Weather::KEY).unwrap()),
-    ];
     let records = RegionRecords {
         region: A,
         seed: seed_of(A),
@@ -1234,7 +1239,6 @@ fn the_world_rebuilds_a_type_made_derived() {
         resources: vec![data(Weather(1))],
         resource_schemas: vec![common::schemas().schema(Weather::KEY).unwrap().clone()],
         transient_resources: vec![common::Rain::KEY],
-        layouts: layouts.into_iter().collect(),
     };
     records.check().unwrap();
 
@@ -1286,7 +1290,7 @@ fn a_resource_migrates_under_the_schema_and_digest_the_section_carries() {
     let migrated = Loader::new(&wide, &migrations).migrate(&records).unwrap();
     assert_eq!(migrated.resources[0].bytes, (3_u64 << 32).to_le_bytes());
     assert_eq!(migrated.resource_schemas[0], *wide.schema(saved::Stock::KEY).unwrap());
-    assert_eq!(migrated.layouts[&saved::Stock::KEY], wide.layout(saved::Stock::KEY).unwrap());
+    assert_eq!(carried_digest(&migrated, saved::Stock::KEY), wide.layout(saved::Stock::KEY));
     let world = world_of(wide_registry(), &bundle_under(&wide, &migrations, &records).unwrap());
     assert_eq!(
         resource_bytes(&world, saved::Stock::KEY),
@@ -1294,14 +1298,20 @@ fn a_resource_migrates_under_the_schema_and_digest_the_section_carries() {
     );
 
     // The digest the section carries is the one compared: at version 1 relaid as `i32`, the
-    // document schema is the same and the digest is not.
+    // schema's version, size and fields are the same and its digest is not.
     let signed = SchemaTable::from_registry(&registry!(stock::Signed)).unwrap();
-    assert_eq!(signed.schema(saved::Stock::KEY), table.schema(saved::Stock::KEY));
+    let (old, new) = (table.schema(saved::Stock::KEY).unwrap(), signed.schema(saved::Stock::KEY));
+    let new = new.unwrap();
+    assert_eq!(
+        (old.schema_version(), old.element_size(), old.fields()),
+        (new.schema_version(), new.element_size(), new.fields())
+    );
+    assert_ne!(old.layout_digest(), new.layout_digest());
     let error = bundle_under(&signed, &Migrations::new(), &records).unwrap_err();
     assert_eq!(error.kind(), ErrorKind::VersionMismatch, "{error}");
     // And a section that states the new digest for the old bytes is believed: the digest is
     // the section's word for its layout.
     let mut lying = records.clone();
-    lying.layouts.insert(saved::Stock::KEY, signed.layout(saved::Stock::KEY).unwrap());
+    lying.resource_schemas[0] = new.clone();
     bundle_under(&signed, &Migrations::new(), &lying).unwrap();
 }

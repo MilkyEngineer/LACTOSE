@@ -138,12 +138,10 @@ fn the_records_carry_the_diff_and_the_resources_canonical() {
     assert_eq!(records.resources, vec![data(Weather(5))]);
     assert_eq!(records.resource_schemas, vec![table.schema(Weather::KEY).unwrap().clone()]);
     assert_eq!(records.transient_resources, vec![Rain::KEY]);
-    let mut layouts: Vec<ComponentKey> = overlay.schemas().iter().map(|s| s.component()).collect();
-    layouts.push(Weather::KEY);
-    layouts.sort_unstable();
-    assert_eq!(records.layouts.keys().copied().collect::<Vec<_>>(), layouts);
-    for (&key, &digest) in &records.layouts {
-        assert_eq!(Some(digest), table.layout(key));
+    // Every type carried under the table's schema, its layout digest with it.
+    for schema in overlay.schemas().iter().chain(&records.resource_schemas) {
+        assert_eq!(Some(schema), table.schema(schema.component()));
+        assert_eq!(Some(schema.layout_digest()), table.layout(schema.component()).map(|d| d.0));
     }
 
     // The relevance message: the same resources, the overlay in full.
@@ -176,7 +174,7 @@ fn the_cooked_state_is_no_overlay_and_a_cooked_message() {
     assert_eq!(overlay.baseline_hash(), baseline_a().content_hash());
     let records = RegionRecords::from_export(&export, &baseline_a(), &table).unwrap();
     assert!(records.overlay.is_none());
-    assert_eq!(records.layouts.keys().copied().collect::<Vec<_>>(), vec![Weather::KEY]);
+    assert_eq!(records.resource_schemas, vec![table.schema(Weather::KEY).unwrap().clone()]);
     let message = records.to_relevance(None);
     assert!(matches!(message.overlay, OverlayPayload::Cooked));
     assert_eq!(message.resources, vec![data(Weather(1))]);
@@ -475,7 +473,8 @@ fn a_debug_build_asserts_nothing_on_a_transient_column_or_a_decoded_value() {
             return schema.clone();
         }
         let fields = schema.fields().iter().copied();
-        ComponentSchema::new(Mass::KEY, from, schema.element_size(), fields).unwrap()
+        let (size, digest) = (schema.element_size(), schema.layout_digest());
+        ComponentSchema::new(Mass::KEY, from, size, digest, fields).unwrap()
     };
     let schemas = overlay.schemas().iter().map(previous);
     let rebuilt = Overlay::new(overlay.baseline_hash(), schemas, decoded);
@@ -506,7 +505,8 @@ fn stale_schemas(component: ComponentKey) -> Vec<ComponentSchema> {
             }
             let fields = schema.fields().iter().copied();
             let version = schema.schema_version() + 1;
-            ComponentSchema::new(component, version, schema.element_size(), fields).unwrap()
+            let (size, digest) = (schema.element_size(), schema.layout_digest());
+            ComponentSchema::new(component, version, size, digest, fields).unwrap()
         })
         .collect()
 }
@@ -522,7 +522,6 @@ fn a_baseline_column_in_another_schema_is_refused_as_stated() {
         resources: Vec::new(),
         resource_schemas: Vec::new(),
         transient_resources: Vec::new(),
-        layouts: BTreeMap::new(),
     };
     let migrations = Migrations::new();
     let loader = Loader::new(schemas(), &migrations);
@@ -982,4 +981,61 @@ fn every_reachable_state_saves() {
         .sum();
     println!("{histories} histories, {broken} owner edges broken by a reload");
     assert!(broken > 0, "no history closed a cycle across the two regions");
+}
+
+/// `cooked_schemas()` with `component` at its version under another layout digest: a cook
+/// made before a same-size layout change that bumped no version.
+fn unbumped_schemas(component: ComponentKey) -> Vec<ComponentSchema> {
+    cooked_schemas()
+        .into_iter()
+        .map(|schema| {
+            if schema.component() != component {
+                return schema;
+            }
+            let fields = schema.fields().iter().copied();
+            let (version, size) = (schema.schema_version(), schema.element_size());
+            let digest = schema.layout_digest() ^ 1;
+            ComponentSchema::new(component, version, size, digest, fields).unwrap()
+        })
+        .collect()
+}
+
+/// The digest case of `a_baseline_column_in_another_schema_is_refused_as_stated`: the diff
+/// refuses the saved column (`InvalidData`) and the loader refuses the cook
+/// (`VersionMismatch`) before the ECS sees it.
+#[test]
+fn a_baseline_column_at_its_version_with_another_digest_is_refused_by_the_diff_and_the_loader() {
+    let id = c(A, 1);
+    let migrations = Migrations::new();
+    let loader = Loader::new(schemas(), &migrations);
+    let row = BaselineRow { id, components: vec![data(pos(1, 1))] };
+    let stale = Arc::new(
+        Baseline::from_rows(AssetSet::new(), unbumped_schemas(Position::KEY), [row]).unwrap(),
+    );
+    let export = RegionExport {
+        region: A,
+        rows: RegionRows {
+            seed: 1,
+            rows: vec![ExportedRow {
+                id,
+                owner: None,
+                components: vec![data(pos(1, 1))],
+                transient: Vec::new(),
+            }],
+            ..RegionRows::default()
+        },
+    };
+    let error = RegionRecords::from_export(&export, &stale, schemas()).unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::InvalidData, "{error}");
+    let records = RegionRecords {
+        region: A,
+        seed: 1,
+        baseline_hash: stale.content_hash(),
+        overlay: None,
+        resources: Vec::new(),
+        resource_schemas: Vec::new(),
+        transient_resources: Vec::new(),
+    };
+    let error = loader.bundle(&records, stale, RegionMode::Simulated, None).unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::VersionMismatch, "{error}");
 }

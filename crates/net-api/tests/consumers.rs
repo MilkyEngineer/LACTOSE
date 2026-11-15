@@ -555,20 +555,8 @@ fn the_client_folds_what_its_hooks_pop() {
     let mut types = TypeTable::new();
     register_types(&mut types).unwrap();
     let registry = types.registry();
-    let schemas: Vec<lactose_bundle::ComponentSchema> = registry
-        .iter()
-        .map(|info| {
-            let fields = info.layout().fields().iter().filter_map(|field| {
-                Some(lactose_bundle::FieldLayout {
-                    id: field.id()?,
-                    offset: u32::try_from(field.offset()).unwrap(),
-                    size: u32::try_from(field.size()).unwrap(),
-                })
-            });
-            let size = u32::try_from(info.layout().size()).unwrap();
-            lactose_bundle::ComponentSchema::new(info.key(), info.version(), size, fields).unwrap()
-        })
-        .collect();
+    let schemas: Vec<lactose_bundle::ComponentSchema> =
+        registry.iter().map(|info| lactose_ecs::document_schema(info).unwrap()).collect();
     let baseline =
         Arc::new(Baseline::from_rows(lactose_asset_api::AssetSet::new(), schemas, []).unwrap());
     let hash = baseline.content_hash();

@@ -3,14 +3,15 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use lactose_bundle::{Baseline, ComponentData, ComponentSchema, Overlay, Record};
+use lactose_bundle::{Baseline, ComponentData, Overlay, Record};
 use lactose_core::{
     ComponentKey, EntityRef, Error, ErrorKind, NetId, PredictionKey, Result, StableKey,
 };
-use lactose_reflect::{Persistence, Reflect, TypeInfo, TypeRole};
+use lactose_reflect::{Persistence, Reflect, TypeRole};
 
 use crate::command::{ErasedComponent, Payload};
 use crate::region::{InRegion, OwnedBy, PredictedOrigin, RegionId};
+use crate::schema::document_schema;
 use crate::storage::typed;
 use crate::world::World;
 
@@ -68,20 +69,6 @@ fn invalid(message: impl Into<std::borrow::Cow<'static, str>>) -> Error {
     Error::new(ErrorKind::InvalidData, message)
 }
 
-/// The schema a document must carry for `info`: its version, size and the layout of its
-/// fields, padding excluded.
-pub(crate) fn schema_of(info: &TypeInfo) -> ComponentSchema {
-    let fields = info.layout().fields().iter().filter_map(|field| {
-        Some(lactose_bundle::FieldLayout {
-            id: field.id()?,
-            offset: field.offset() as u32,
-            size: field.size() as u32,
-        })
-    });
-    ComponentSchema::new(info.key(), info.version(), info.layout().size() as u32, fields)
-        .expect("a registered layout is a well-formed schema")
-}
-
 /// A row being assembled from the baseline and the overlay.
 #[derive(Default)]
 struct Row {
@@ -122,11 +109,22 @@ pub(crate) fn load_region(
         if info.role() != TypeRole::Component || info.key() == InRegion::KEY {
             return Err(invalid(format!("`{}` cannot be loaded as a row", info.name())));
         }
-        if *schema != schema_of(info) {
-            return Err(Error::new(
-                ErrorKind::VersionMismatch,
-                format!("the document's schema of `{}` is not the registry's", info.name()),
-            ));
+        let registered = document_schema(info)?;
+        if *schema != registered {
+            // The one difference worth naming: the same version under another layout.
+            let unbumped = schema.schema_version() == registered.schema_version()
+                && schema.layout_digest() != registered.layout_digest();
+            let message = if unbumped {
+                format!(
+                    "the document's `{}` is laid out otherwise at version {}: its layout \
+                     changed without a version bump",
+                    info.name(),
+                    registered.schema_version()
+                )
+            } else {
+                format!("the document's schema of `{}` is not the registry's", info.name())
+            };
+            return Err(Error::new(ErrorKind::VersionMismatch, message));
         }
     }
 

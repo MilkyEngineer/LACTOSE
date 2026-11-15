@@ -509,7 +509,6 @@ fn without_origin(saved: &SavedWorld) -> SavedWorld {
     });
     let rebuilt = Overlay::new(overlay.baseline_hash(), overlay.schemas().to_vec(), stripped);
     records.overlay = Some(Arc::new(rebuilt.expect("the records without the origin")));
-    records.layouts.remove(&PredictedOrigin::KEY);
     records.check().expect("still canonical");
     *entry = Arc::new(SavedRegion { records, baseline: Arc::clone(&entry.baseline) });
     saved

@@ -508,21 +508,7 @@ pub fn cooked(region: RegionId, n: u64) -> NetId {
 /// The document schema of every saved type of the game, as the cooker writes a baseline's,
 /// with the derived ones beside them, which a baseline may carry columns of.
 pub fn cooked_schemas() -> Vec<lactose_bundle::ComponentSchema> {
-    types()
-        .registry()
-        .iter()
-        .map(|info| {
-            let fields = info.layout().fields().iter().filter_map(|field| {
-                Some(lactose_bundle::FieldLayout {
-                    id: field.id()?,
-                    offset: field.offset() as u32,
-                    size: field.size() as u32,
-                })
-            });
-            let size = info.layout().size() as u32;
-            lactose_bundle::ComponentSchema::new(info.key(), info.version(), size, fields).unwrap()
-        })
-        .collect()
+    types().registry().iter().map(|info| lactose_ecs::document_schema(info).unwrap()).collect()
 }
 
 /// A region's cooked baseline: a spawner, and a marked rock the spawner owns, with a

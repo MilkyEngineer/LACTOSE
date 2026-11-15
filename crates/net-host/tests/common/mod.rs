@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex};
 
 use lactose_asset_api::AssetSet;
 use lactose_bundle::{
-    AuthoredGuid, Baseline, BaselineRow, ComponentData, ComponentSchema, FieldLayout, cooked_net_id,
+    AuthoredGuid, Baseline, BaselineRow, ComponentData, ComponentSchema, cooked_net_id,
 };
 use lactose_core::{ComponentKey, Error, ErrorKind, NetId, PlayerId, Result, StableKey, Tick};
 use lactose_ecs::{
@@ -132,20 +132,7 @@ pub fn data<T: Reflect>(value: T) -> ComponentData {
 }
 
 pub fn schemas(registry: &Registry) -> Vec<ComponentSchema> {
-    registry
-        .iter()
-        .map(|info| {
-            let fields = info.layout().fields().iter().filter_map(|field| {
-                Some(FieldLayout {
-                    id: field.id()?,
-                    offset: u32::try_from(field.offset()).expect("small"),
-                    size: u32::try_from(field.size()).expect("small"),
-                })
-            });
-            let size = u32::try_from(info.layout().size()).expect("small");
-            ComponentSchema::new(info.key(), info.version(), size, fields).expect("a schema")
-        })
-        .collect()
+    registry.iter().map(|info| lactose_ecs::document_schema(info).expect("a schema")).collect()
 }
 
 /// The cooked baseline every region shares unless a test cooks one: empty, so every

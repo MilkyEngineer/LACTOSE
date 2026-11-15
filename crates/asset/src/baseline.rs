@@ -98,7 +98,7 @@ impl Asset for RegionBaseline {
 
     /// The format of `Baseline::encode`. It moves when `lactose-bundle`'s document format
     /// version does, in the same change.
-    const FORMAT_VERSION: u32 = 1;
+    const FORMAT_VERSION: u32 = 2;
 }
 
 /// The loader of [`RegionBaseline`]: `Baseline::decode` over the cooked bytes, a pure

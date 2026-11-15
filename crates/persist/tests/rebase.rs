@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use common::*;
 use lactose_asset_api::AssetSet;
-use lactose_bundle::{Baseline, BaselineRow, Overlay, Record};
+use lactose_bundle::{Baseline, BaselineRow, ComponentSchema, Overlay, Record};
 use lactose_core::{ErrorKind, FieldId, NetId};
 use lactose_ecs::{OwnedBy, RegionConfig, RegionMode, World, WorldBuilder, WorldKind};
 use lactose_math::Scalar;
@@ -318,15 +318,15 @@ fn an_empty_result_is_none_and_a_region_without_an_overlay_takes_the_hash() {
     let saved = RegionRecords::from_export(&state, &baseline_a(), &table).unwrap();
     assert!(saved.overlay.is_some());
 
-    // The patch cooks the row as the save has it: no record is left, and only the
-    // resource's digest stays.
+    // The patch cooks the row as the save has it: no record is left, and only the resource
+    // stays.
     let mut rows = rows_a();
     rows[0] = BaselineRow { id: c(A, 1), components: vec![data(pos(1, 1)), data(Health(7))] };
     let patched = Arc::new(cook(rows));
     let (rebased, dropped) = rebase_onto(&saved, &patched, &table);
     assert!(rebased.overlay.is_none());
     assert!(dropped.is_empty());
-    assert!(rebased.layouts.keys().copied().eq([Weather::KEY]));
+    assert!(rebased.resources.iter().map(|data| data.component).eq([Weather::KEY]));
     assert_eq!(rebased, RegionRecords::from_export(&state, &patched, &table).unwrap());
     assert_eq!(reloaded(&rebased, &patched, &table), rebased);
 
@@ -364,7 +364,20 @@ fn rebase_then_bundle_then_load_equals_the_export() {
 fn records_not_at_the_tables_schemas_are_refused_unchanged() {
     let Changed { world, table, .. } = changed();
     let mut saved = RegionRecords::from_export(&export(&world), &baseline_a(), &table).unwrap();
-    saved.layouts.insert(Health::KEY, table.layout(Age::KEY).unwrap());
+    // The overlay carries `Health` under another layout digest at the table's version.
+    let overlay = saved.overlay.as_deref().unwrap();
+    let relaid = overlay.schemas().iter().map(|schema| {
+        if schema.component() != Health::KEY {
+            return schema.clone();
+        }
+        let digest = table.layout(Age::KEY).unwrap().0;
+        let (version, size) = (schema.schema_version(), schema.element_size());
+        let fields = schema.fields().iter().copied();
+        ComponentSchema::new(Health::KEY, version, size, digest, fields).unwrap()
+    });
+    let rebuilt = Overlay::new(overlay.baseline_hash(), relaid, overlay.records().to_vec());
+    saved.overlay = Some(Arc::new(rebuilt.unwrap()));
+    saved.check().unwrap();
     let before = saved.clone();
     let patched = cook(rows_a());
     let error = saved.rebase(&patched, &table).unwrap_err();
@@ -376,9 +389,10 @@ fn records_not_at_the_tables_schemas_are_refused_unchanged() {
 fn records_that_fail_check_are_refused_unchanged() {
     let Changed { world, table, .. } = changed();
     let mut saved = RegionRecords::from_export(&export(&world), &baseline_a(), &table).unwrap();
-    // A persistent resource without its layout digest, which `check` refuses and nothing
-    // else on the rebase's path reads.
-    assert!(saved.layouts.remove(&Weather::KEY).is_some());
+    // A persistent resource listed as transient too, which `check` refuses and nothing else
+    // on the rebase's path reads.
+    saved.transient_resources.push(Weather::KEY);
+    saved.transient_resources.sort_unstable();
     let before = saved.clone();
     let mut rows = rows_a();
     rows[6].components[1] = data(Contacts(1));

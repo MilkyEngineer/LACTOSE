@@ -961,6 +961,30 @@ editorial pass rather than one taken from a review.
   baseline check each fail their tests.
 - Addendum (D142, lane binds-design, 2026-11-15): `Loader::binds` reads a saved world's binds
   from its sections; the container format is unchanged. Implemented by the lane `binds-impl`.
+- Addendum (lane schema-digest, 2026-11-16; review round 1): the cross-crate additions, built.
+  `lactose-bundle`'s `ComponentSchema` carries the layout digest (`new` takes it,
+  `layout_digest` reads it; part of equality and of the bytes) at bundle format 2, a format-1
+  document refused with `VersionMismatch`; `write_table` and `read_table` are exported and
+  `lactose-persist` writes and reads its resource schema table through them. `lactose-ecs`
+  exports `document_schema(info) -> Result<ComponentSchema>` (a `Result`, since a derived
+  resource may exceed what `ComponentSchema::new` takes) and `LayoutDigest`, moved from persist
+  because the digest is now part of the schema the ECS derives; persist re-exports it, and the
+  digest's bytes are unchanged. `World::load_region` compares the digest, so a same-size layout
+  change at one version is refused in a cooked column and in an overlay, naming the type and
+  "without a version bump"; persist's diff and `Loader::bundle` refuse such a baseline column
+  first. `RegionRecords::layouts` is gone, and `Migrations::migrate` and
+  `Migrations::migrate_overlay` lose their digest arguments, the digest being in the schema they
+  already take. Two format versions follow, as D129 implies: `CONTAINER_FORMAT_VERSION` 1 to 2
+  and `lactose-asset`'s `RegionBaseline::FORMAT_VERSION` 1 to 2. `WorldBuilder::build` refuses a
+  persistent or transient resource over `MAX_COMPONENT_BYTES` with `InvalidData` naming it,
+  since a save's schema table holds the schema of every resource that is not `derived`. The
+  committed version-and-digest record stays schema-guard's: `SchemaTable::schemas()` mapped to
+  (component, schema version, layout digest) is what the loader compares, and `Registry::dump`,
+  filtered on its policy, gives the retired field IDs. The spike's recorded hashes moved at its
+  snapshot frames alone (frame 1 and each resync), through `crates/app/tests/spike.rs`'s
+  `Full::encode`, which writes the region baseline's content hash that format 2 changes: spike
+  digest 8db4551c007e6410 to b6a4efa4db9780a4 over 7,200 lines, equal in PR, layout and chaos
+  modes; no world hash moved.
 
 **D130. The `io` facade: what sections 4, 5.1, 8.2, 9.7, 15.3, 19 and 20 left open** (§3, §4, §5.1, §8.2, §9.7, §14, §15.3, §19, §20, §21, `lactose-io`, `lactose-core`, `lactose-task`)
 - Why: the facade is written before its implementation so `asset`, `app`'s save path, `cook`

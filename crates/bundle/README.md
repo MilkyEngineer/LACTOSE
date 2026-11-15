@@ -18,7 +18,8 @@ stored under their `ComponentKey` and `FieldId`.
 | Item | Purpose |
 |---|---|
 | `AuthoredGuid`, `cooked_net_id` | The one derivation of a cooked entity's `NetId` (architecture section 7) |
-| `ComponentSchema`, `FieldLayout` | A component's schema version, size and field layout, carried by every document that holds its bytes |
+| `ComponentSchema`, `FieldLayout` | A component's schema version, size, layout digest and field layout, carried by every document that holds its bytes |
+| `write_table`, `read_table` | A schema table's bytes as the documents carry them, for a format that embeds one (`lactose-persist`'s section) |
 | `Baseline`, `Archetype`, `Column`, `BaselineRow` | A region's cooked entities as columns of raw component bytes per archetype, with the region's asset set |
 | `Overlay`, `Record` | The seven record kinds of architecture section 15.2, keyed by `NetId` |
 | `ComponentData` | One component's bytes |
@@ -40,11 +41,15 @@ their input in any order, sort it, and reject contradictions. Equal content mean
 values and equal bytes; a decoder accepts only the canonical bytes.
 
 **Documents describe themselves.** Each carries a `ComponentSchema` for every component it
-holds bytes of: schema version, element size, and the offset and size of each field by
-`FieldId`. The caller supplies schemas as plain data from the reflection registry, and may
-pass the whole registry. This crate checks that each schema is well-formed and that the bytes
-stored under it have its size. A save written under an old schema can therefore be decoded
-field by field by a build that no longer knows that layout.
+holds bytes of: schema version, element size, a 64-bit layout digest, and the offset and
+size of each field by `FieldId`. The caller supplies schemas as plain data from the
+reflection registry (`lactose_ecs::document_schema` is the one derivation), and may pass the
+whole registry. This crate checks that each schema is well-formed and that the bytes stored
+under it have its size. A save written under an old schema can therefore be decoded field by
+field by a build that no longer knows that layout. The digest is opaque here: it sees what
+the fields cannot (a reorder inside a nested struct, a same-size type change, renumbered
+discriminants), it is part of a schema's equality and of the document's bytes, and the
+loader compares it (`crates/ecs/README.md`, Regions).
 
 **Baseline.** Rows are grouped by exact component set. Each column is the component's bytes
 for every row, back to back, so loading an archetype is one copy per column: a reference is
@@ -87,7 +92,9 @@ the values and whatever the column; `lactose-persist`'s `RegionRecords::rebase` 
 result and diffs it again to the canonical set.
 
 **Encoding.** Little-endian, `u32` counts, a magic and format version in front and the xxh64
-of everything before it at the end. That trailing hash is the content hash, and a document
+of everything before it at the end. This build writes and reads format 2, which added the
+layout digest to each schema of the table; a format-1 document is refused with
+`VersionMismatch`, so a document cooked before it is re-cooked. That trailing hash is the content hash, and a document
 keeps it, so `content_hash` and `digest` cost nothing. The layout tables are in the crate
 documentation and on `Baseline` and `Overlay`; golden bytes for both documents are pinned in
 `tests/format.rs`. Compression is not part of the format: `io` and `persist` wrap these bytes.

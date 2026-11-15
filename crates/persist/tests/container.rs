@@ -16,8 +16,8 @@ use std::num::NonZeroU64;
 use std::sync::Arc;
 
 use common::*;
-use lactose_bundle::Baseline;
-use lactose_core::{AllocTag, ErrorKind, NetId, TaggedAlloc, Tick, xxh64};
+use lactose_bundle::{Baseline, ComponentSchema};
+use lactose_core::{AllocTag, ComponentKey, ErrorKind, NetId, TaggedAlloc, Tick, xxh64};
 use lactose_ecs::{RegionConfig, RegionId, RegionMode, World, WorldBuilder, WorldKind};
 use lactose_persist::{
     CONTAINER_FORMAT_VERSION, Container, ContainerHeader, Loader, MAX_CONTAINER_BYTES,
@@ -331,21 +331,14 @@ fn lying_counts_in_a_section_allocate_nothing_for_them() {
         let mut content = Vec::new();
         header(&mut content);
         content.extend_from_slice(&1u32.to_le_bytes());
-        content.extend_from_slice(&[0; 16]);
+        // The key, version, size and layout digest.
+        content.extend_from_slice(&[0; 24]);
         content.extend_from_slice(&claim.to_le_bytes());
         content
     });
     by_claim("the transient count", &|claim| {
         let mut content = Vec::new();
         header(&mut content);
-        content.extend_from_slice(&0u32.to_le_bytes());
-        content.extend_from_slice(&claim.to_le_bytes());
-        content
-    });
-    by_claim("the layout count", &|claim| {
-        let mut content = Vec::new();
-        header(&mut content);
-        content.extend_from_slice(&0u32.to_le_bytes());
         content.extend_from_slice(&0u32.to_le_bytes());
         content.extend_from_slice(&claim.to_le_bytes());
         content
@@ -376,7 +369,7 @@ fn content_that_is_not_canonical_is_refused() {
     content.extend_from_slice(&5u64.to_le_bytes());
     content.extend_from_slice(&[0; 16]);
     content.push(0);
-    content.extend_from_slice(&[0; 12]);
+    content.extend_from_slice(&[0; 8]);
     let (entry, section) = section_of(&content);
     let records = Container::decode_section(&entry, &section).unwrap();
     assert_eq!(records.region, RegionId(5));
@@ -386,23 +379,23 @@ fn content_that_is_not_canonical_is_refused() {
     trailing.push(0);
     let mut presence = content.clone();
     presence[24] = 2;
-    let mut layouts = content.clone();
-    layouts.truncate(content.len() - 4);
-    layouts.extend_from_slice(&2u32.to_le_bytes());
+    let mut schemas = content.clone();
+    schemas.truncate(content.len() - 8);
+    let schema = ComponentSchema::new(ComponentKey(7), 1, 0, 1, []).unwrap();
+    lactose_bundle::write_table(&[schema.clone(), schema], &mut schemas);
     for key in [7u64, 7] {
-        layouts.extend_from_slice(&key.to_le_bytes());
-        layouts.extend_from_slice(&1u64.to_le_bytes());
+        schemas.extend_from_slice(&key.to_le_bytes());
     }
+    schemas.extend_from_slice(&0u32.to_le_bytes());
     let mut transient = content.clone();
-    transient.truncate(content.len() - 8);
+    transient.truncate(content.len() - 4);
     transient.extend_from_slice(&2u32.to_le_bytes());
     transient.extend_from_slice(&9u64.to_le_bytes());
     transient.extend_from_slice(&8u64.to_le_bytes());
-    transient.extend_from_slice(&0u32.to_le_bytes());
     for (what, bad) in [
         ("a byte after the content", trailing),
         ("a presence byte of two", presence),
-        ("repeated layout digests", layouts),
+        ("repeated resource schemas", schemas),
         ("descending transient keys", transient),
     ] {
         let (entry, section) = section_of(&bad);

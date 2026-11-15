@@ -381,7 +381,7 @@ fn binds_refuse_what_no_export_holds() {
 
     // Records that fail `check`.
     let mut broken = section(A, vec![spawn(5, k)]);
-    broken.layouts.clear();
+    broken.baseline_hash ^= 1;
     assert!(broken.check().is_err());
     assert_eq!(binds_of([&broken]).unwrap_err().kind(), ErrorKind::InvalidData);
 
@@ -417,16 +417,19 @@ fn binds_read_records_at_the_registrys_schema() {
     };
 
     // Under another layout digest than the table's, at the table's version.
-    let mut other_layout = section_under(current.clone());
-    let digest = other_layout.layouts.get_mut(&PredictedOrigin::KEY).unwrap();
-    *digest = schemas().layout(lactose_core::ComponentKey(Position::KEY.0)).unwrap();
+    let other_digest = schemas().layout(Position::KEY).unwrap().0;
+    let fields = current.fields().iter().copied();
+    let (version, size) = (current.schema_version(), current.element_size());
+    let relaid = ComponentSchema::new(PredictedOrigin::KEY, version, size, other_digest, fields);
+    let other_layout = section_under(relaid.unwrap());
     let error = binds_of([&other_layout]).unwrap_err();
     assert_eq!(error.kind(), ErrorKind::VersionMismatch, "{error}");
     assert!(error.message().contains("ecs::predicted_origin"), "{error}");
 
     // At an older version: refused as it is, read once `Loader::migrate` has run its step.
     let fields = current.fields().iter().copied();
-    let older = ComponentSchema::new(PredictedOrigin::KEY, 0, current.element_size(), fields);
+    let (size, digest) = (current.element_size(), current.layout_digest());
+    let older = ComponentSchema::new(PredictedOrigin::KEY, 0, size, digest, fields);
     let older = section_under(older.unwrap());
     let error = binds_of([&older]).unwrap_err();
     assert_eq!(error.kind(), ErrorKind::VersionMismatch, "{error}");

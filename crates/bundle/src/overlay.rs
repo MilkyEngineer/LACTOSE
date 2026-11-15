@@ -426,12 +426,8 @@ impl Overlay {
         let (mut reader, hash) = Reader::open(bytes, MAGIC)?;
         let baseline_hash = reader.u64()?;
 
-        let schemas = schema::read_table(&mut reader)?;
-        // Lookups below are binary searches, so the order has to hold first.
-        strictly_ascending(
-            schemas.iter().map(ComponentSchema::component),
-            "the schema table is not strictly ascending",
-        )?;
+        // Strictly ascending, so the lookups below can be binary searches.
+        let schemas = schema::read(&mut reader)?;
         let schema_of = |component| {
             schema::find(&schemas, component)
                 .ok_or(invalid("a record carries a component outside the schema table"))
@@ -668,7 +664,7 @@ fn seal(
 ) -> Result<(Vec<u8>, u64)> {
     let mut writer = Writer::new(MAGIC);
     writer.u64(baseline_hash);
-    schema::write_table(&mut writer, schemas);
+    writer.schemas(schemas);
     writer.count(records.len());
     let write_data = |writer: &mut Writer, data: &ComponentData| {
         writer.u64(data.component.0);

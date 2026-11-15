@@ -45,6 +45,7 @@ mod region;
 mod rng;
 mod run;
 mod schedule;
+mod schema;
 mod snapshot;
 mod storage;
 mod system;
@@ -87,6 +88,7 @@ pub use region::{
 };
 pub use rng::Rng;
 pub use schedule::{Schedule, ScheduleBuilder, ScheduleError};
+pub use schema::{LayoutDigest, document_schema};
 pub use snapshot::WorldSnapshot;
 pub use system::{SystemDescriptor, SystemSet};
 pub use world::{

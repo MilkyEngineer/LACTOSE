@@ -8,7 +8,7 @@ use core::num::NonZeroU64;
 use lactose_asset_api::{AssetId, AssetSet};
 use lactose_bundle::{
     Archetype, Baseline, BaselineRow, ComponentData, ComponentSchema, FieldLayout,
-    MAX_COMPONENT_BYTES, MAX_DOCUMENT_BYTES, Overlay, Record,
+    MAX_COMPONENT_BYTES, MAX_DOCUMENT_BYTES, Overlay, Record, read_table, write_table,
 };
 use lactose_core::{ComponentKey, ErrorKind, FieldId, NetId, xxh64};
 
@@ -30,13 +30,20 @@ fn field(id: u16, offset: u32, size: u32) -> FieldLayout {
     FieldLayout { id: FieldId(id), offset, size }
 }
 
+/// The layout digest these tests give `component`: any value will do, since this crate
+/// never computes one, and a distinct one per component shows in the golden bytes.
+fn digest(component: u64) -> u64 {
+    0xD16E_0000_0000_0000 | component
+}
+
 fn schema(
     component: ComponentKey,
     version: u32,
     size: u32,
     fields: &[FieldLayout],
 ) -> ComponentSchema {
-    ComponentSchema::new(component, version, size, fields.iter().copied()).unwrap()
+    let digest = digest(component.0);
+    ComponentSchema::new(component, version, size, digest, fields.iter().copied()).unwrap()
 }
 
 /// The registry of these tests. A is four bytes in two fields, B two bytes in one field,
@@ -157,6 +164,47 @@ fn unhex(text: &str) -> Vec<u8> {
 }
 
 const GOLDEN_BASELINE: &str = "\
+4c 42 41 53 02 00 00 00 02 00 00 00 11 00 00 00\n\
+00 00 00 00 22 00 00 00 00 00 00 00 03 00 00 00\n\
+0a 00 00 00 00 00 00 00 01 00 00 00 04 00 00 00\n\
+0a 00 00 00 00 00 6e d1 02 00 00 00 01 00 00 00\n\
+00 00 02 00 00 00 04 00 02 00 00 00 02 00 00 00\n\
+0b 00 00 00 00 00 00 00 03 00 00 00 02 00 00 00\n\
+0b 00 00 00 00 00 6e d1 01 00 00 00 01 00 00 00\n\
+00 00 02 00 00 00 0c 00 00 00 00 00 00 00 01 00\n\
+00 00 00 00 00 00 0c 00 00 00 00 00 6e d1 00 00\n\
+00 00 02 00 00 00 02 00 00 00 0a 00 00 00 00 00\n\
+00 00 0b 00 00 00 00 00 00 00 02 00 00 00 01 00\n\
+00 00 00 00 00 80 02 00 00 00 00 00 00 80 01 01\n\
+01 01 02 02 02 02 b1 b1 b2 b2 02 00 00 00 0a 00\n\
+00 00 00 00 00 00 0c 00 00 00 00 00 00 00 01 00\n\
+00 00 03 00 00 00 00 00 00 80 03 03 03 03 14 f0\n\
+2b e2 95 75 aa 65";
+
+const GOLDEN_OVERLAY: &str = "\
+4c 4f 56 4c 02 00 00 00 ef cd ab 89 67 45 23 01\n\
+03 00 00 00 0a 00 00 00 00 00 00 00 01 00 00 00\n\
+04 00 00 00 0a 00 00 00 00 00 6e d1 02 00 00 00\n\
+01 00 00 00 00 00 02 00 00 00 04 00 02 00 00 00\n\
+02 00 00 00 0b 00 00 00 00 00 00 00 03 00 00 00\n\
+02 00 00 00 0b 00 00 00 00 00 6e d1 01 00 00 00\n\
+01 00 00 00 00 00 02 00 00 00 0c 00 00 00 00 00\n\
+00 00 01 00 00 00 00 00 00 00 0c 00 00 00 00 00\n\
+6e d1 00 00 00 00 08 00 00 00 01 05 00 00 00 00\n\
+00 00 00 02 00 00 00 0a 00 00 00 00 00 00 00 05\n\
+05 05 05 0b 00 00 00 00 00 00 00 09 09 07 05 00\n\
+00 00 00 00 00 00 00 00 00 00 00 00 00 00 03 01\n\
+00 00 00 00 00 00 80 04 02 00 00 00 00 00 00 80\n\
+0c 00 00 00 00 00 00 00 05 02 00 00 00 00 00 00\n\
+80 0b 00 00 00 00 00 00 00 06 02 00 00 00 00 00\n\
+00 80 0a 00 00 00 00 00 00 00 04 00 ee ff 07 02\n\
+00 00 00 00 00 00 80 05 00 00 00 00 00 00 00 02\n\
+07 00 00 00 00 00 00 80 01 00 00 00 0a 00 00 00\n\
+00 00 00 00 07 07 07 07 f3 5b 1e c7 fd 2f bd ef";
+
+/// `small_baseline` and `small_overlay` as format 1 wrote them, before the layout digest:
+/// well-sealed documents of a format this build refuses.
+const FORMAT_1_BASELINE: &str = "\
 4c 42 41 53 01 00 00 00 02 00 00 00 11 00 00 00\n\
 00 00 00 00 22 00 00 00 00 00 00 00 03 00 00 00\n\
 0a 00 00 00 00 00 00 00 01 00 00 00 04 00 00 00\n\
@@ -172,7 +220,7 @@ b2 b2 02 00 00 00 0a 00 00 00 00 00 00 00 0c 00\n\
 00 00 00 00 00 00 01 00 00 00 03 00 00 00 00 00\n\
 00 80 03 03 03 03 a7 a8 e8 aa 13 f5 0a aa";
 
-const GOLDEN_OVERLAY: &str = "\
+const FORMAT_1_OVERLAY: &str = "\
 4c 4f 56 4c 01 00 00 00 ef cd ab 89 67 45 23 01\n\
 03 00 00 00 0a 00 00 00 00 00 00 00 01 00 00 00\n\
 04 00 00 00 02 00 00 00 01 00 00 00 00 00 02 00\n\
@@ -197,7 +245,7 @@ fn baseline_matches_its_golden_bytes() {
     let bytes = small_baseline().encode();
     assert_eq!(hex(&bytes), GOLDEN_BASELINE);
     assert_eq!(Baseline::decode(&unhex(GOLDEN_BASELINE)).unwrap(), small_baseline());
-    assert_eq!(small_baseline().content_hash(), 0xaa0a_f513_aae8_a8a7);
+    assert_eq!(small_baseline().content_hash(), 0x65aa_7595_e22b_f014);
 }
 
 #[test]
@@ -205,7 +253,7 @@ fn overlay_matches_its_golden_bytes() {
     let bytes = small_overlay().encode();
     assert_eq!(hex(&bytes), GOLDEN_OVERLAY);
     assert_eq!(Overlay::decode(&unhex(GOLDEN_OVERLAY)).unwrap(), small_overlay());
-    assert_eq!(small_overlay().digest(), 0xb787_85eb_d0f0_b5f3);
+    assert_eq!(small_overlay().digest(), 0xefbd_2ffd_c71e_5bf3);
 }
 
 #[test]
@@ -360,6 +408,17 @@ fn hashes_follow_content_and_are_kept() {
     other_layout[0] = schema(A, 1, 4, &[field(1, 0, 2), field(4, 2, 1)]);
     let relaid = Baseline::from_rows(assets(), other_layout, baseline_rows()).unwrap();
     assert_ne!(relaid.content_hash(), baseline.content_hash(), "the schema is content");
+    // So is the layout digest alone: the same fields under another digest.
+    let mut other_digest = schemas();
+    let a = &other_digest[0];
+    let fields = a.fields().iter().copied();
+    other_digest[0] = ComponentSchema::new(A, 1, 4, a.layout_digest() ^ 1, fields).unwrap();
+    let redigested = Baseline::from_rows(assets(), other_digest.clone(), baseline_rows()).unwrap();
+    assert_ne!(redigested.content_hash(), baseline.content_hash(), "the digest is content");
+    let redigested = overlay_of(BASELINE_HASH, &overlay_records());
+    let records = overlay_records();
+    let other = Overlay::new(BASELINE_HASH, other_digest, records).unwrap();
+    assert_ne!(other.digest(), redigested.digest(), "the digest is content");
 
     let overlay = small_overlay();
     let encoded = overlay.encode();
@@ -374,7 +433,7 @@ fn hashes_follow_content_and_are_kept() {
 #[test]
 fn schemas_are_checked() {
     let rejects = |size: u32, fields: &[FieldLayout]| {
-        let error = ComponentSchema::new(A, 1, size, fields.iter().copied()).unwrap_err();
+        let error = ComponentSchema::new(A, 1, size, 0, fields.iter().copied()).unwrap_err();
         assert_eq!(error.kind(), ErrorKind::InvalidData, "{error}");
     };
     rejects(4, &[field(1, 0, 2), field(1, 2, 2)]);
@@ -668,7 +727,7 @@ fn check_against_judges_what_needs_the_baseline() {
 /// Frames `body` as a document: header, body and a correct hash.
 fn sealed(magic: &[u8; 4], body: &[u8]) -> Vec<u8> {
     let mut bytes = magic.to_vec();
-    bytes.extend_from_slice(&[1, 0, 0, 0]);
+    bytes.extend_from_slice(&[2, 0, 0, 0]);
     bytes.extend_from_slice(body);
     reseal(&mut bytes);
     bytes
@@ -688,10 +747,13 @@ fn quads(quads: &[u64]) -> Vec<u8> {
     quads.iter().flat_map(|quad| quad.to_le_bytes()).collect()
 }
 
-/// One encoded schema: key, version, element size and (ID, offset, size) per field.
+/// One encoded schema: key, version, element size, the digest [`digest`] gives the key,
+/// and (ID, offset, size) per field.
 fn schema_bytes(key: u64, version: u32, size: u32, fields: &[(u16, u32, u32)]) -> Vec<u8> {
     let mut bytes = quads(&[key]);
-    bytes.extend(words(&[version, size, fields.len() as u32]));
+    bytes.extend(words(&[version, size]));
+    bytes.extend(quads(&[digest(key)]));
+    bytes.extend(words(&[fields.len() as u32]));
     for &(id, offset, size) in fields {
         bytes.extend(id.to_le_bytes());
         bytes.extend(words(&[offset, size]));
@@ -712,7 +774,7 @@ fn decode_checks_the_frame() {
     assert_eq!(Baseline::decode(&overlay).unwrap_err().kind(), ErrorKind::InvalidData);
 
     let mut future = baseline[..baseline.len() - 8].to_vec();
-    future[4] = 2;
+    future[4] = 3;
     reseal(&mut future);
     assert_eq!(Baseline::decode(&future).unwrap_err().kind(), ErrorKind::VersionMismatch);
 
@@ -725,6 +787,79 @@ fn decode_checks_the_frame() {
     trailing.push(0);
     reseal(&mut trailing);
     assert_eq!(Baseline::decode(&trailing).unwrap_err().kind(), ErrorKind::InvalidData);
+}
+
+/// Format 1, the format before the layout digest, is refused as any other format is: a
+/// well-sealed document of it is `VersionMismatch`, never read as format 2.
+#[test]
+fn a_format_1_document_is_refused() {
+    let (baseline, overlay) = (unhex(FORMAT_1_BASELINE), unhex(FORMAT_1_OVERLAY));
+    assert_eq!(&baseline[4..8], &[1, 0, 0, 0]);
+    assert_eq!(
+        xxh64(&baseline[..baseline.len() - 8], 0).to_le_bytes(),
+        baseline[baseline.len() - 8..]
+    );
+    let error = Baseline::decode(&baseline).unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::VersionMismatch, "{error}");
+    let error = Overlay::decode(&overlay).unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::VersionMismatch, "{error}");
+    // The format-2 bytes of the same content, relabelled as format 1, are refused too.
+    let mut relabelled = small_baseline().encode();
+    relabelled.truncate(relabelled.len() - 8);
+    relabelled[4] = 1;
+    reseal(&mut relabelled);
+    assert_eq!(Baseline::decode(&relabelled).unwrap_err().kind(), ErrorKind::VersionMismatch);
+}
+
+/// `write_table` is the schema table a document embeds, byte for byte, and `read_table`
+/// reads it back from the front of a slice, advancing past it; both are the one encoding
+/// `lactose-persist` writes a save's resource schemas in.
+#[test]
+fn the_schema_table_is_exported() {
+    let all = schemas();
+    let mut written = Vec::new();
+    write_table(&all, &mut written);
+    let expected = [
+        words(&[4]),
+        schema_bytes(0x0A, 1, 4, &[(1, 0, 2), (4, 2, 2)]),
+        schema_bytes(0x0B, 3, 2, &[(1, 0, 2)]),
+        schema_bytes(0x0C, 1, 0, &[]),
+        schema_bytes(0x0D, 1, 1, &[(1, 0, 1)]),
+    ]
+    .concat();
+    assert_eq!(written, expected);
+    // An overlay carrying every schema embeds the same bytes after its frame header and
+    // baseline hash.
+    let records = [spawn(runtime(1), &[a(1), b(2), c(), d(3)])];
+    let encoded = Overlay::new(BASELINE_HASH, all.clone(), records).unwrap().encode();
+    assert_eq!(&encoded[16..16 + written.len()], written.as_slice());
+
+    // Read from the front, the rest left behind.
+    let mut bytes = [written.as_slice(), &[0xEE, 0xFF]].concat();
+    let mut rest = bytes.as_slice();
+    assert_eq!(read_table(&mut rest).unwrap(), all);
+    assert_eq!(rest, &[0xEE, 0xFF]);
+    let mut empty = Vec::new();
+    write_table(&[], &mut empty);
+    assert_eq!(read_table(&mut empty.as_slice()).unwrap(), []);
+
+    // Refusals leave the slice where it was: every truncation, a table out of order, a
+    // schema that is not well-formed, and fields out of order.
+    let refuses = |bytes: &[u8]| {
+        let mut rest = bytes;
+        let error = read_table(&mut rest).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::InvalidData, "{error}");
+        assert_eq!(rest.len(), bytes.len());
+    };
+    for len in 0..written.len() {
+        refuses(&written[..len]);
+    }
+    refuses(&table(&[schema_bytes(0x0B, 1, 2, &[]), schema_bytes(0x0A, 1, 2, &[])]));
+    refuses(&table(&[schema_bytes(0x0A, 1, 2, &[]), schema_bytes(0x0A, 1, 2, &[])]));
+    refuses(&table(&[schema_bytes(0x0A, 1, 2, &[(1, 1, 2)])]));
+    refuses(&table(&[schema_bytes(0x0A, 1, 4, &[(2, 0, 2), (1, 2, 2)])]));
+    bytes[0] = 0xFF;
+    refuses(&bytes);
 }
 
 #[test]

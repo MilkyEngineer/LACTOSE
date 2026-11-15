@@ -12,7 +12,7 @@ use lactose_asset_api::{
     Asset, AssetId, AssetKind, AssetSet, AssetVersion, LoadPriority, PinnedTable, PublishedAssets,
     Readiness, UntypedHandle, VersionTable,
 };
-use lactose_bundle::{Baseline, BaselineRow, ComponentData, ComponentSchema, FieldLayout};
+use lactose_bundle::{Baseline, BaselineRow, ComponentData, ComponentSchema};
 use lactose_bundle::{Overlay, Record};
 use lactose_core::{EntityRef, NetId, PlayerId, Result, StableKey, Tick};
 use lactose_ecs::{
@@ -583,20 +583,7 @@ pub fn table(entries: &[(u64, u64)]) -> PinnedTable {
 
 /// The document schema of every component of `registry`, as `lactose-persist` writes it.
 pub fn schemas(registry: &Registry) -> Vec<ComponentSchema> {
-    registry
-        .iter()
-        .map(|info| {
-            let fields = info.layout().fields().iter().filter_map(|field| {
-                Some(FieldLayout {
-                    id: field.id()?,
-                    offset: field.offset() as u32,
-                    size: field.size() as u32,
-                })
-            });
-            ComponentSchema::new(info.key(), info.version(), info.layout().size() as u32, fields)
-                .unwrap()
-        })
-        .collect()
+    registry.iter().map(|info| lactose_ecs::document_schema(info).unwrap()).collect()
 }
 
 pub fn data<T: Reflect>(value: T) -> ComponentData {

@@ -7,9 +7,11 @@
 use lactose_core::{ComponentKey, Error, ErrorKind, NetId, Result, xxh64};
 
 use crate::MAX_DOCUMENT_BYTES;
+use crate::schema::{self, ComponentSchema};
 
-/// The format version this build writes and reads, for both documents.
-const FORMAT_VERSION: u16 = 1;
+/// The format version this build writes and reads, for both documents. Format 2 added the
+/// layout digest to each schema of the schema table.
+pub(crate) const FORMAT_VERSION: u16 = 2;
 const HEADER_LEN: usize = 8;
 const TRAILER_LEN: usize = 8;
 
@@ -78,6 +80,12 @@ impl Writer {
         self.u32(count as u32);
     }
 
+    /// Writes a schema table as [`schema::write_table`] does.
+    pub(crate) fn schemas(&mut self, schemas: &[ComponentSchema]) {
+        self.overflowed |= u32::try_from(schemas.len()).is_err();
+        schema::write_table(schemas, &mut self.bytes);
+    }
+
     /// Seals the document with its hash and returns the bytes with that hash. Fails with
     /// `ErrorKind::ResourceExhausted` if the document is larger than
     /// [`MAX_DOCUMENT_BYTES`], which no decoder would accept.
@@ -99,6 +107,16 @@ pub(crate) struct Reader<'a> {
 }
 
 impl<'a> Reader<'a> {
+    /// A reader over `bytes`, which are not a whole document: a part one embeds.
+    pub(crate) fn over(bytes: &'a [u8]) -> Self {
+        Self { rest: bytes }
+    }
+
+    /// The bytes not read yet.
+    pub(crate) fn rest(&self) -> &'a [u8] {
+        self.rest
+    }
+
     /// Checks the size limit, the magic, the format version and the trailing hash, and
     /// returns a reader over the body together with that hash.
     pub(crate) fn open(bytes: &'a [u8], magic: [u8; 4]) -> Result<(Self, u64)> {

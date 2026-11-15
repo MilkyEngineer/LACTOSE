@@ -303,8 +303,14 @@ fn layout_changes_only_the_digest_sees() {
         assert_ne!(changed_layout, layout, "{what}");
         // A 32-bit scalar build changes the size too; the digest sees it either way.
         if what != "u64 to Scalar" || Scalar::BYTES == 8 {
-            assert_eq!(changed_document, document, "{what}: the document schema is blind to it");
+            let blind = |schema: &lactose_bundle::ComponentSchema| {
+                (schema.schema_version(), schema.element_size(), schema.fields().to_vec())
+            };
+            assert_eq!(blind(&changed_document), blind(&document), "{what}: the fields are blind");
         }
+        // The schema carries the digest, so the schema sees it.
+        assert_eq!(changed_document.layout_digest(), changed_layout.0, "{what}");
+        assert_ne!(changed_document, document, "{what}");
         digests.push(changed_layout);
     }
     // No two cases collide.

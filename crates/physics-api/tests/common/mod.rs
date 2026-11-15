@@ -11,7 +11,7 @@ pub mod fake;
 use std::sync::Arc;
 
 use lactose_asset_api::AssetSet;
-use lactose_bundle::{Baseline, ComponentSchema, FieldLayout, Overlay, Record};
+use lactose_bundle::{Baseline, ComponentSchema, Overlay, Record};
 use lactose_core::{NetId, PlayerId, StableKey, Tick};
 use lactose_ecs::{
     ChannelWriter, ClaimedBy, Commands, Events, Executor, LayoutConfig, Mut, RegionConfig,
@@ -475,22 +475,8 @@ pub fn rows(world: &World) -> Vec<Row> {
 /// are cooked, so each is a `SpawnFromBaseline`.
 pub fn bundle(world: &World, region: RegionId) -> RegionBundle {
     let export = world.export_region(region).unwrap();
-    let schemas: Vec<ComponentSchema> = world
-        .registry()
-        .iter()
-        .map(|info| {
-            let fields = info.layout().fields().iter().filter_map(|field| {
-                let (offset, size) = (field.offset(), field.size());
-                Some(FieldLayout {
-                    id: field.id()?,
-                    offset: u32::try_from(offset).unwrap(),
-                    size: u32::try_from(size).unwrap(),
-                })
-            });
-            let size = u32::try_from(info.layout().size()).unwrap();
-            ComponentSchema::new(info.key(), info.version(), size, fields).unwrap()
-        })
-        .collect();
+    let schemas: Vec<ComponentSchema> =
+        world.registry().iter().map(|info| lactose_ecs::document_schema(info).unwrap()).collect();
     let baseline = Baseline::from_rows(AssetSet::new(), schemas.clone(), []).unwrap();
     let mut records = Vec::new();
     for row in &export.rows {

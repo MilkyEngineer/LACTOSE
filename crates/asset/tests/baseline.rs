@@ -44,7 +44,7 @@ fn the_name_and_the_id_are_golden() {
     assert_eq!(id, RegionBaseline::id(baseline(&["x"]).content_hash()));
     assert_eq!(cooked.header.kind(), RegionBaseline::KIND);
     assert_eq!(RegionBaseline::KIND, lactose_asset_api::AssetKind::from_name("region_baseline"));
-    assert_eq!(cooked.header.format_version(), 1);
+    assert_eq!(cooked.header.format_version(), 2);
     assert!(cooked.header.dependencies().is_empty());
     assert_eq!(cooked.bytes, baseline(&["x"]).encode());
 }

@@ -1,67 +1,18 @@
 //! The persistence policy as this crate reads it from the registry (architecture sections
 //! 15.1 and 15.4): which types a save carries, the [`ComponentSchema`] each document must
-//! carry for them, the layout digest that tells apart what the schema cannot, and the
-//! schema hash a container records.
+//! carry for them, digest included, and the schema hash a container records. The schema
+//! and its [`LayoutDigest`] are `lactose-ecs`'s (`lactose_ecs::document_schema`), the one
+//! derivation the ECS loader compares a document against; this crate re-exports the
+//! digest's type.
 
 use std::collections::BTreeMap;
 
-use lactose_bundle::{ComponentSchema, FieldLayout, MAX_COMPONENT_BYTES};
+use lactose_bundle::{ComponentSchema, MAX_COMPONENT_BYTES};
 use lactose_core::{ComponentKey, Error, ErrorKind, Result, xxh64};
+pub use lactose_ecs::LayoutDigest;
+use lactose_ecs::document_schema;
 use lactose_math::{Scalar, ScalarBits};
-use lactose_reflect::{Field, FieldKind, Persistence, Registry, StructInfo, TypeInfo, TypeRole};
-
-/// The digest of a type's layout at one schema version: what a document's
-/// [`ComponentSchema`] does not see, in one number.
-///
-/// It is the xxh64, seed zero, over the layout part of
-/// [`TypeInfo::write_schema`](lactose_reflect::TypeInfo::write_schema), the bytes that
-/// encoding appends after its first fifteen (the key, the version, the role, the
-/// persistence and the tracking bits), that is, from the layout's size on: size,
-/// alignment, the count of non-padding fields, and each field's ID, offset, size, type tag
-/// and kind, with nested layouts, enum sizes and discriminants, and array lengths and
-/// element kinds written out; with two changes. A field, or an array element, of kind
-/// `Struct` or `Enum` contributes an empty type tag (a zero length and no bytes) in place
-/// of its Rust name, since its structure follows and a name is not a layout; a primitive's
-/// tag stays, since it is what tells `u32` from `RegionId`. And an enum's variants are
-/// written, in declaration order, as each variant's value (`u32`) followed by its name (a
-/// `u32` length and the UTF-8 bytes), where `write_schema` writes the values alone: a
-/// saved discriminant means the variant of that name, so the name is part of the layout,
-/// and a permutation of discriminants among the variants, or of their names, is seen. The
-/// tracking bits are left out on purpose: marking a type replicated or extracted changes
-/// no saved byte.
-///
-/// A `ComponentSchema` holds the key, the version, the size and each top-level field's ID,
-/// offset and size, so three kinds of change leave it equal: a reorder inside a nested
-/// `#[value]` struct, renumbered enum discriminants, and a same-size type change (`i32` to
-/// `u32`; `u64` to `Scalar` on a 64-bit scalar build, `u32` on a 32-bit one). The digest
-/// sees all three, so a save carries it beside each saved type's schema and
-/// [`Migrations::migrate`](crate::Migrations::migrate) refuses equal versions with
-/// different digests. Free, because no saved byte depends on them: renaming a field (its
-/// ID stays) or a `#[value]` struct or enum type. Not free: renaming an enum variant,
-/// which changes the digest and so is a version bump with a step that changes nothing
-/// (the saved value means the same variant under its new name), and so is reordering the
-/// variants' declarations, since the pairs are written in declaration order; the bump is
-/// the price of seeing a permutation. What no digest sees is a change of meaning under an
-/// unchanged layout (a field's unit; one `#[value]` struct replaced by another of the same
-/// layout; one enum by another of the same size with the same (name, value) pairs in the
-/// same order; one primitive by another of the same tag): only a version bump and a step
-/// carry that, and the build-time guard D129 names (a committed record of each saved
-/// type's version and digest, compared by a test that fails when the digest changed and
-/// the version did not) is what makes the bump hard to forget.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub struct LayoutDigest(pub u64);
-
-impl LayoutDigest {
-    /// The digest of `info`'s layout, as stated on the type: the implementation walks the
-    /// layout as `write_schema` does and writes the same bytes, with empty tags for
-    /// `Struct` and `Enum` kinds and each variant's name beside its value.
-    #[must_use]
-    pub fn of(info: &TypeInfo) -> Self {
-        let mut out = Vec::new();
-        write_layout(info.layout(), &mut out);
-        Self(xxh64(&out, 0))
-    }
-}
+use lactose_reflect::{Field, FieldKind, Persistence, Registry, TypeInfo, TypeRole};
 
 /// The hash of every saved type's schema: what a container records in its header
 /// (architecture section 15.4) and what decides, in one comparison, whether every document
@@ -118,14 +69,19 @@ impl SchemaHash {
 /// What the table keeps for a saved type.
 #[derive(Clone, Debug)]
 pub(crate) struct Saved {
+    /// The schema, its layout digest included.
     pub(crate) schema: ComponentSchema,
-    pub(crate) layout: LayoutDigest,
     /// The offset of every `Scalar` leaf at any depth, ascending: what
     /// [`Saved::canonicalise`] rewrites.
     scalars: Vec<usize>,
 }
 
 impl Saved {
+    /// The layout digest the schema carries.
+    pub(crate) fn layout(&self) -> LayoutDigest {
+        LayoutDigest(self.schema.layout_digest())
+    }
+
     /// Rewrites every `Scalar` leaf of `value`, one value of this type, to its canonical
     /// bits (`README.md`, "Determinism"). `value` is the schema's size.
     pub(crate) fn canonicalise(&self, value: &mut [u8]) {
@@ -175,13 +131,11 @@ struct Entry {
 /// descriptions state and nothing else, so it is a pure function of the registered types,
 /// the same on every machine and in every registration order (the registry is keyed).
 ///
-/// The schema of a type is derived exactly as the ECS loader derives the one it compares a
-/// document's against (`World::load_region` refuses a document whose schema differs with
-/// `VersionMismatch`): the component key, the schema version, the layout's size, and one
-/// [`FieldLayout`](lactose_bundle::FieldLayout) per non-padding top-level field with its ID,
-/// offset and size, in field-ID order. Padding fields and nested structure are not in it;
-/// a nested `#[value]` struct is one field of its outer size. What it does not see, the
-/// [`LayoutDigest`] does.
+/// The schema of a type is `lactose_ecs::document_schema` of it, the one the ECS loader
+/// compares a document's against (`World::load_region` refuses a document whose schema
+/// differs with `VersionMismatch`): the component key, the schema version, the layout's
+/// size, the [`LayoutDigest`], and one [`FieldLayout`](lactose_bundle::FieldLayout) per
+/// non-padding top-level field with its ID, offset and size, in field-ID order.
 #[derive(Clone, Debug)]
 pub struct SchemaTable {
     entries: BTreeMap<ComponentKey, Entry>,
@@ -195,10 +149,9 @@ impl SchemaTable {
     /// tag is not `lactose_math::Scalar`'s `Field::NAME` (the one scalar this crate
     /// canonicalises); `lactose-sim` refuses the same types at registration, so neither
     /// reaches a world. Fails with `InvalidData` if a saved type is larger than
-    /// `lactose_bundle::MAX_COMPONENT_BYTES` (16 KiB), the one size a document carries:
-    /// the ECS caps components there and not resources, so a persistent region resource
-    /// over it is legal to the world and refused here, for the whole table
-    /// (`README.md`, "Policy"; D129 names the refusal at registration as the fix).
+    /// `lactose_bundle::MAX_COMPONENT_BYTES` (16 KiB), the one size a document carries,
+    /// as `WorldBuilder::build` refuses a saved resource of that size, so neither reaches
+    /// a world.
     pub fn from_registry(registry: &Registry) -> Result<Self> {
         let mut entries = BTreeMap::new();
         for info in registry.iter() {
@@ -209,7 +162,7 @@ impl SchemaTable {
             entries.insert(info.key(), Entry { info, saved });
         }
         let hash = SchemaHash::over(
-            entries.values().filter_map(|entry| Some((entry.info, entry.saved.as_ref()?.layout))),
+            entries.values().filter_map(|entry| Some((entry.info, entry.saved.as_ref()?.layout()))),
         );
         Ok(Self { entries, hash })
     }
@@ -233,11 +186,11 @@ impl SchemaTable {
         Some(&self.entries.get(&component)?.saved.as_ref()?.schema)
     }
 
-    /// The layout digest of `component`, [`LayoutDigest::of`] its description: `None` for
-    /// a type that is not registered or is `derived`.
+    /// The layout digest of `component`, [`LayoutDigest::of`] its description and the one
+    /// its schema carries: `None` for a type that is not registered or is `derived`.
     #[must_use]
     pub fn layout(&self, component: ComponentKey) -> Option<LayoutDigest> {
-        Some(self.entries.get(&component)?.saved.as_ref()?.layout)
+        Some(self.entries.get(&component)?.saved.as_ref()?.layout())
     }
 
     /// The registry's description of `component`, for any registered type.
@@ -292,21 +245,6 @@ impl<'a> Iterator for Schemas<'a> {
     }
 }
 
-/// The schema a document carries for `info`, derived exactly as `lactose-ecs` derives the
-/// one its loader compares against (`README.md`, "Schemas"; `tests/roundtrip.rs` holds the
-/// two equal). Fails as `ComponentSchema::new` fails, for a type over
-/// `MAX_COMPONENT_BYTES`.
-pub(crate) fn document_schema(info: &TypeInfo) -> Result<ComponentSchema> {
-    let fields = info.layout().fields().iter().filter_map(|field| {
-        Some(FieldLayout {
-            id: field.id()?,
-            offset: field.offset() as u32,
-            size: field.size() as u32,
-        })
-    });
-    ComponentSchema::new(info.key(), info.version(), info.layout().size() as u32, fields)
-}
-
 /// What the table keeps for the saved type `info`, after the refusals
 /// [`SchemaTable::from_registry`] states.
 fn saved_of(info: &TypeInfo) -> Result<Saved> {
@@ -326,7 +264,7 @@ fn saved_of(info: &TypeInfo) -> Result<Saved> {
         let (kind, tag) = (field.kind(), field.type_name());
         scalar_leaves(info.name(), &kind, tag, field.offset(), field.size(), &mut scalars)?;
     }
-    Ok(Saved { schema: document_schema(info)?, layout: LayoutDigest::of(info), scalars })
+    Ok(Saved { schema: document_schema(info)?, scalars })
 }
 
 /// Collects the offset of every `Scalar` leaf of a field of `kind` at `offset`, refusing a
@@ -370,65 +308,4 @@ fn scalar_leaves(
         _ => {}
     }
     Ok(())
-}
-
-/// The layout part of `TypeInfo::write_schema`, with the two changes [`LayoutDigest`]
-/// states.
-fn write_layout(layout: &StructInfo, out: &mut Vec<u8>) {
-    out.extend_from_slice(&(layout.size() as u32).to_le_bytes());
-    out.extend_from_slice(&(layout.align() as u32).to_le_bytes());
-    let fields = layout.fields().iter().filter(|field| !field.is_padding());
-    out.extend_from_slice(&(fields.clone().count() as u32).to_le_bytes());
-    for field in fields {
-        let id = field.id().expect("a non-padding field has an ID");
-        out.extend_from_slice(&id.0.to_le_bytes());
-        out.extend_from_slice(&(field.offset() as u32).to_le_bytes());
-        out.extend_from_slice(&(field.size() as u32).to_le_bytes());
-        write_tag(&field.kind(), field.type_name(), out);
-        write_kind(&field.kind(), out);
-    }
-}
-
-/// A primitive's type tag, or an empty one for a `Struct` or `Enum`, whose structure
-/// follows.
-fn write_tag(kind: &FieldKind, tag: &str, out: &mut Vec<u8>) {
-    let tag = match kind {
-        FieldKind::Struct(_) | FieldKind::Enum(_) => "",
-        _ => tag,
-    };
-    out.extend_from_slice(&(tag.len() as u32).to_le_bytes());
-    out.extend_from_slice(tag.as_bytes());
-}
-
-fn write_kind(kind: &FieldKind, out: &mut Vec<u8>) {
-    match kind {
-        FieldKind::Bool => out.push(0),
-        FieldKind::Unsigned => out.push(1),
-        FieldKind::Signed => out.push(2),
-        FieldKind::Float => out.push(3),
-        FieldKind::Scalar { .. } => out.push(4),
-        FieldKind::EntityRef => out.push(5),
-        FieldKind::AssetRef { .. } => out.push(6),
-        FieldKind::Enum(info) => {
-            out.push(7);
-            out.push(info.size as u8);
-            out.extend_from_slice(&(info.variants.len() as u32).to_le_bytes());
-            for variant in info.variants {
-                out.extend_from_slice(&variant.value.to_le_bytes());
-                out.extend_from_slice(&(variant.name.len() as u32).to_le_bytes());
-                out.extend_from_slice(variant.name.as_bytes());
-            }
-        }
-        FieldKind::Struct(info) => {
-            out.push(8);
-            write_layout(info, out);
-        }
-        FieldKind::Array { element, element_name, len } => {
-            out.push(9);
-            out.extend_from_slice(&(*len as u32).to_le_bytes());
-            write_tag(element, element_name, out);
-            write_kind(element, out);
-        }
-        FieldKind::Padding => out.push(10),
-    }
 }

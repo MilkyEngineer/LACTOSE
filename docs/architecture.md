@@ -1132,14 +1132,14 @@ joins) are not saved; on a load every player joins again.
 
 Self-describing binary container with engine version, schema hash and a per-region index.
 Baseline and overlay documents carry, for each component they hold, its schema version, element
-size and field layout (field ID, offset, size), so the binary keeps no historical layouts. A save
-carries beside each type's schema the digest of its full layout (D129), which the field layout alone
-cannot tell from a same-size change; equal versions with different digests are refused. Matching
-schema takes the bulk-copy fast path; mismatched schema decodes by field ID and runs migrations
-in version order. A migration is one registered step per type and version read, over the value's
-fields by ID; the result is assembled under the current layout and validated; a transient type
-is taken by presence and never migrated (D129). After load, change ticks are rebased (section
-6).
+size, field layout (field ID, offset, size) and the digest of its full layout (D129), so the binary
+keeps no historical layouts. The digest tells what the field layout alone cannot, a same-size
+change; equal versions with different digests are refused, in a cooked baseline and in a save.
+Matching schema takes the bulk-copy fast path; mismatched schema decodes by field ID and runs
+migrations in version order. A migration is one registered step per type and version read, over the
+value's fields by ID; the result is assembled under the current layout and validated; a transient
+type is taken by presence and never migrated (D129). After load, change ticks are rebased
+(section 6).
 
 ### 15.5 Enforcement
 

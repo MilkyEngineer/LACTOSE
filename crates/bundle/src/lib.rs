@@ -11,7 +11,7 @@
 //! | Bytes | Contents |
 //! |---|---|
 //! | 4 | magic: `LBAS` for a baseline, `LOVL` for an overlay |
-//! | 2 | format version, currently 1 |
+//! | 2 | format version, currently 2 |
 //! | 2 | zero |
 //! | ... | the body, laid out as [`Baseline`] and [`Overlay`] describe |
 //! | 8 | xxh64, seed zero, of every preceding byte |
@@ -21,9 +21,15 @@
 //! check and the document's content hash. Compression is applied outside, by `io` and
 //! `persist`.
 //!
+//! A decoder refuses every other format version with `ErrorKind::VersionMismatch`. Format 2
+//! added the layout digest to each schema ([`ComponentSchema::layout_digest`]); a format-1
+//! document is refused, and is re-cooked or re-saved.
+//!
 //! Component and field bytes are opaque here: this crate stores them under their
 //! [`ComponentKey`] and [`FieldId`](lactose_core::FieldId), with the [`ComponentSchema`]
 //! that says how large they are and where each field lies, and never interprets them.
+//! [`write_table`] and [`read_table`] are the schema table's encoding, for a container
+//! that carries schemas beside its documents.
 
 #![forbid(unsafe_code)]
 
@@ -37,7 +43,7 @@ pub use baseline::{Archetype, Baseline, BaselineRow, Column};
 pub use identity::{AuthoredGuid, cooked_net_id};
 use lactose_core::ComponentKey;
 pub use overlay::{Overlay, Record};
-pub use schema::{ComponentSchema, FieldLayout};
+pub use schema::{ComponentSchema, FieldLayout, read_table, write_table};
 
 /// The largest component value a document may carry, in bytes. A component row must fit
 /// one 16 KiB chunk (architecture section 6).

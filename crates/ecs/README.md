@@ -47,6 +47,7 @@ and list what changed, because `sim`, `predict`, `physics-api`, `net`, `persist`
 | `WorldSnapshot` | The prediction world's rollback state |
 | `World::region_mode` | A loaded region's mode in one lookup, for a consumer that reads every region's mode at every sync point (`World::region` counts the region's entities) |
 | `World::load_region`, `World::export_region`, `RegionRows` | Bulk copy of region rows and resources to and from `lactose_bundle` documents |
+| `document_schema`, `LayoutDigest` | The one derivation of the `ComponentSchema` a document carries for a registered type, the layout digest included, which `load_region` compares and every writer of a document calls (D129) |
 | `World::get_erased`, `World::insert_erased`, `World::remove_erased`, `World::spawn_erased` | One entity's components by key from the registry, `lactose_bundle::ComponentData` in and stored bytes out: what `lactose-predict` and `net`'s generic hook are written against (D121, D122) |
 | `World::despawn_alone`, `World::move_alone_to_region` | One entity despawned or moved without the entities it owns, in a `Client` or a `Prediction` world: how a client's staged-state hooks and `lactose-predict`'s corrections apply a tombstone or a move of the server's (D141). A `Server` world refuses both with `Unsupported` |
 
@@ -575,8 +576,10 @@ What a system is, from its parameters (`SystemParam` has the table):
   that moved is a live row elsewhere), restores predicted origins and aliases from
   `PredictedOrigin`, keeps reference fields as exported (a `Server` world's `OwnedBy` is
   the one exception: Regions, "Writing `OwnedBy` moves nothing"), and requires every component
-  schema to match the registry's (`VersionMismatch` otherwise); migration is
-  `lactose-persist`'s, and region resources travel beside the overlay and go in through
+  schema to equal `document_schema` of the registered type, its layout digest included
+  (`VersionMismatch` otherwise, saying "without a version bump" when the versions are equal
+  and the digests differ: a same-size layout change, such as `i32` to `u32` or a reorder
+  inside a nested struct, that the fields cannot show); migration is `lactose-persist`'s, and region resources travel beside the overlay and go in through
   `insert_region_resource_erased`. `export_region` yields persistent components in
   ascending `NetId` order, the owner beside each row, the seed and the persistent region
   resources; diffing against the baseline into an `Overlay` is `lactose-persist`'s, and the
@@ -585,6 +588,10 @@ What a system is, from its parameters (`SystemParam` has the table):
   and nothing changed, as a document that carries `ecs::in_region` is (D142): a cooked row
   has no predicted origin, so every bind a load makes comes from a record of its overlay,
   which is what lets `lactose-persist` read the binds of a save from its sections alone.
+- `WorldBuilder::build` refuses, with `InvalidData` naming the type, a registry holding a
+  persistent or transient resource larger than `lactose_bundle::MAX_COMPONENT_BYTES`
+  (16 KiB), the most a document carries of one value; a `derived` resource is never saved
+  and may be any size. Components are capped there already, since a row fits a chunk.
 - A transient component is not saved, but its presence is part of the entity's archetype,
   which its systems and the world hash depend on: `ExportedRow::transient` lists the keys
   of the row's transient components, `lactose-persist` encodes their presence as the
@@ -701,7 +708,7 @@ chaos seeds; under Miri, which no runner launches, the session is not read.
 | `change.rs` | `Mut` and `set_if_neq` stamps, fresh and stale marks, `Changed<T>` seen once per reader, `ColumnMut::write` with and without dirty rows, column ticks, the 2^30 rebase |
 | `erased.rs` | `ErasedColumn::changed_since` selects the rows `World::changed_since` selects, under every layout, for writes inside a tick and between ticks, with a fresh and a stale mark |
 | `snapshot.rs` | Ten ticks, a snapshot at three, a restore and a re-run equal in every column, row tick and `Changed` set; presentation events deduplicated and cancelled; stale cursors; binds kept; pruning |
-| `bulk.rs` | A baseline and an overlay with every record kind, diffed back to the same overlay under every layout; region resources; schema mismatches |
+| `bulk.rs` | A baseline and an overlay with every record kind, diffed back to the same overlay under every layout; region resources; schema mismatches; a same-size layout change at one version (`i32` to `u32`), whose schemas differ only by the digest, refused in a baseline and in an overlay under every layout with no row, no log entry and no counter move, and loaded by the registry that wrote it; a saved resource of 16 KiB builds, one of 16 KiB + 1 does not, persistent or transient, and a derived one does |
 | `layout.rs` | One program under every layout: identical exports, structural logs, reductions and presentation events |
 | `pass.rs`, `query.rs`, `regions.rs` | `run_pass` with a fork over columns; whole-world queries in key order; region modes and per-region systems |
 | `binds.rs`, `wrap.rs`, `reload.rs` | Binds across a restore and onto live keys; `Changed` across the `u32` wrap, the 2^30 clamp and `set_tick`; transient presence through an unload and reload |
