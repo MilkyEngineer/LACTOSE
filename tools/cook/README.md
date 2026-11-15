@@ -11,8 +11,10 @@ serde_json, through a `Processor` of `asset-api` and `lactose-asset`'s `PackBuil
 | Determinism boundary | outside |
 | Unsafe | none, `#![forbid(unsafe_code)]` in the library and the binary; architecture section 21 lists `tools/cook` for the FFI to Slang and compression libraries, none of which is here yet: `SAFETY.md` |
 
-**Status: the milestone 1 skeleton.** One kind, one pack per run, the cooked pack set's
-rule. This file is the contract of the command line, the source schema and the pack set.
+**Status: the milestone 1 skeleton.** One kind, one pack per run. This file is the
+contract of the command line and the source schema; the cooked pack set, the rule by which
+a process mounts what the cooker writes, is `lactose-asset`'s ("The cooked pack set"
+below).
 
 ## Surface
 
@@ -21,7 +23,6 @@ rule. This file is the contract of the command line, the source schema and the p
 | `ricotta SOURCES PACK` | The binary: "The command line" below |
 | `cook(io, sources, pack)` | The cook as a future over the pool, returning a `Published` per asset written; the binary drives it with `Executor::block_on` (D130) |
 | `Published` | One asset written: its name, its `AssetId` and its `AssetVersion` |
-| `pack_set(io, directory)` | The cooked pack set of a fresh process, in mount order: "The cooked pack set" below |
 | `SkeletonProcessor` | The `Processor` of `Skeleton`: a `.gltf` file's bytes in, the skeleton byte form out |
 
 ## The command line
@@ -33,7 +34,10 @@ otherwise):
   ends in `.gltf` is a source, and each cooks to one `anim::skeleton`. Other files are
   ignored. A file whose name ends in `.glb` is refused (`Unsupported`), as is an entry that
   is neither a file nor a directory, a symbolic link among them, and a name that is not
-  UTF-8 (`InvalidData`). A tree with no source is refused (`NotFound`).
+  UTF-8 (`InvalidData`). So is a name ending in `.gltf` or `.glb` in any other case,
+  `.GLTF` or `.Glb` (`InvalidData`, naming the file renamed): the endings are read in
+  lowercase alone, so that a source is a source, and its asset's name the same, on every
+  file system. A tree with no source is refused (`NotFound`).
 - **Asset names.** An asset's name is its source's path below `SOURCES`, its components
   joined by `/`, with `.gltf` replaced by `.skeleton`: `SOURCES/characters/knight.gltf` is
   `characters/knight.skeleton`, and its ID is `AssetId::from_name` of that name. Where the
@@ -61,20 +65,33 @@ animation data are not read, and a source whose `.bin` is missing cooks (the com
 fixture's is). A binary glTF is refused by its name and, under a `.gltf` name, by its
 magic.
 
+Every object the reader reads is read only when written as a JSON object: the document,
+`asset`, each node and each skin, and every object of the mark ("The source schema"). An
+object written as an array, its fields by position, which serde would otherwise accept, is
+refused. Every other value keeps its JSON type: a list is an array, a name a string.
+
 Refused, each naming the node by index and name:
 
-- a child index past the nodes, a node listed as a child twice, and a cycle;
+- a child index past the nodes, a node listed as a child twice, and a node whose parents
+  form a cycle, or lead into one (the first such node by index);
 - a node with both `matrix` and any of `translation`, `rotation`, `scale`;
 - a rotation that is not a unit quaternion (its squared length more than
   `UNIT_TOLERANCE` from one);
-- a scale other than one on any axis, uniform or not (each factor's square within
-  `UNIT_TOLERANCE` of one);
+- a scale other than one on any axis, uniform or not (each factor positive and its square
+  within `UNIT_TOLERANCE` of one);
 - a matrix whose last row is not `(0, 0, 0, 1)`, whose columns are not unit length or not
   orthogonal (within `UNIT_TOLERANCE`), or whose determinant is negative.
 
 The transform rules hold only for the nodes the skeleton composes: each bone and socket,
 and every node between it and its parent bone or, for the root bone, the top of the tree.
-A mesh node with a scale elsewhere in the tree is no refusal.
+A mesh node with a scale elsewhere in the tree is no refusal. A scale is refused rather
+than baked, uniform or not: `BonePose` holds none, and while baking a uniform scale into
+the rests is exact, a body's values and a clip's samples are authored in the same scaled
+unit and would need the same factor. The refusal says so: apply the scale to the
+armature before export.
+
+The reader's cost is linear in the nodes: one walk of the tree finds a cycle, each node's
+pose below its bone is composed once from its parent's, and the socket keys are a set.
 
 ## The source schema
 
@@ -86,8 +103,12 @@ A node is marked by an object under the one key `lactose` of its `extras`; nothi
 { "socket": {} }
 ```
 
-Unknown keys are refused at every level, and so is a mark with both. A marked node needs a
-`name`: a bone's key and a socket's key are `BoneKey::from_name` of it.
+Objects are the only supported form: every level of the mark is a JSON object, and one
+written as an array is refused. Unknown keys are refused at every level, and so is a mark
+with both. A key written twice in one object, `lactose` itself or any key below it, is
+refused, naming its path; a repeated key elsewhere in `extras` is not the cooker's and is
+not read. A marked node needs a `name`: a bone's key and a socket's key are
+`BoneKey::from_name` of it.
 
 - **`bone`**: `role` is one of `hips`, `spine`, `head`, `hand_left`, `hand_right`,
   `foot_left`, `foot_right`; without it the bone's role is `Other`. Without `body` the bone
@@ -158,22 +179,14 @@ to the skeleton it encoded, so what it cooks is what the runtime accepts.
 
 ## The cooked pack set
 
-**The set** of a fresh process in a cooked directory is every regular file directly in
-that directory whose name ends in `.pack`, mounted in ascending byte order of the names
-(`Io::read_dir`'s order, `OsStr`'s: the names' bytes on Unix, their WTF-8 bytes on
-Windows, which agree for ASCII names; `pack_set` returns it). A later name takes a later place in the
-store's mount order, so where two packs hold one asset, the store names the version of the
-pack whose name sorts last. Subdirectories, symbolic links, other files and the
-temporaries of a replace in flight (`<name>.<hex>.tmp`) are not in the set.
-
-A team orders packs by naming them (`00-base.pack`, `10-dlc.pack`, `90-patch.pack`); a
-re-cook replaces its pack at the same path, so its place does not change. Milestone 2's
-directory watch keeps this order: when a pack in the set is replaced or added, it mounts
-that pack and every pack whose name sorts after it, again, in name order, so the last name
-still names the version (D146).
-
-The store's contract is unchanged (D136): it mounts the list it is given, in the order of
-the calls. The rule is the cooker's and the caller's, so it is stated here.
+Which packs a fresh process mounts, and in which order, is `lactose-asset`'s rule,
+`lactose_asset::pack_set` (`crates/asset/README.md`, "Mounting"; D146): the regular files
+directly in a cooked directory whose names end in `.pack`, in byte order of the names, a
+later name naming the version where two packs hold one asset. So a team orders the packs
+it cooks by naming them (`00-base.pack`, `10-dlc.pack`, `90-patch.pack`), and a re-cook
+that writes its pack at the same path keeps its name's rank in the order. Milestone 2's
+directory watch must leave the store naming what a fresh process mounting the set would
+name, with no version the set shadows named in between; how is milestone 2's to decide.
 
 ## Determinism
 
@@ -185,9 +198,11 @@ version (`tests/skeleton.rs`).
   `HashMap` or other unordered collection is iterated: the ID claims are a `BTreeMap`, and
   `PackBuilder` keeps its index sorted by `AssetId` and its payloads in the order added.
 - **Map order.** The reader deserialises into typed structs and reads a node's `extras` by
-  its one key: no JSON object is iterated, so neither the order of a source's keys nor
-  whether a build's serde_json keeps that order changes a byte. Lists (`children`,
-  `joints`, `locked_axes`) are read in their written order, which is the source's content.
+  its one key, and refuses a key written twice: no output but an error's wording (which
+  unknown or repeated key is named first) depends on a JSON object's key order, so neither
+  the order of a source's keys nor whether a build's serde_json keeps that order changes a
+  byte. Lists (`children`, `joints`, `locked_axes`) are read in their written order, which
+  is the source's content.
 - **Time.** No clock is read, and the pack format holds no timestamp, cook sequence or
   host name.
 - **Numbers.** serde_json's `float_roundtrip` feature makes every number parse to its
@@ -215,5 +230,5 @@ version (`tests/skeleton.rs`).
 | The half turn: the root at `+Z` in the source is at `-Z`, and a bone at `-X` is at `+X` in the root's space | the same test |
 | Cooking twice writes the same pack and prints the same versions; three sources written in opposite orders, one directory and one file sorting differently by path and by name, cook to the same bytes | `tests/skeleton.rs`, `cooking_twice_writes_the_same_bytes`, `sources_written_in_another_order_cook_to_the_same_bytes` |
 | The encoder writes anim's golden skeleton bytes, copied from `crates/anim/tests/format.rs`; swapping its linear and angular damping fails the test | `src/codec.rs`, `the_encoder_writes_anims_golden_skeleton_bytes` |
-| Every refusal, each naming the file and the node: a `.glb` by name and by magic, a non-uniform scale, a uniform scale other than one above a bone, a scaling or mirroring matrix, a cycle, a second root, a 17th bone (16 cook), and the reader's, the schema's and `validate`'s other rules; nothing is written | `tests/refusals.rs` |
-| A fresh process mounts the cooked set in name order and names the last name's versions, though the later name was cooked first and the mounts end in the other order | `tests/pack_set.rs` |
+| Every role, shape, body type and joint kind reads back through anim's decoder as itself; exchanging two role codes, or two joint-kind codes, in the encoder fails the test | `src/codec.rs`, `every_variant_of_every_enum_reads_back_as_itself` |
+| Every refusal, each naming the file and the node: a `.glb` by name and by magic, an ending in another case with its rename, a non-uniform scale, a uniform scale other than one above a bone with its remedy, a negative factor, a scaling or mirroring matrix, a cycle, a second root, a 17th bone (16 cook), an object written as an array at every level of the mark and of the document, a key written twice in the mark, and the reader's, the schema's and `validate`'s other rules; nothing is written | `tests/refusals.rs` |

@@ -13,7 +13,7 @@ use lactose_asset_api::{
     PublishedAssets, Readiness, UntypedHandle, VersionTable,
 };
 use lactose_core::{AllocTag, Error, ErrorKind, Result};
-use lactose_io::{Encoding, Io};
+use lactose_io::{Encoding, EntryKind, Io};
 use lactose_task::{Executor, WorkerClass, yield_now};
 use tracing::Instrument;
 use tracing::field::{Empty, debug};
@@ -197,6 +197,43 @@ impl fmt::Debug for Store {
             .finish_non_exhaustive()
     }
 }
+
+/// The cooked pack set of a fresh process in `directory`, in the order to mount it: every
+/// regular file directly in the directory whose name ends in `.pack`, in byte order of the
+/// names (`Io::read_dir`'s order). Mounted in that order, a later name takes a later place,
+/// so where two packs hold one asset the store names the version of the pack whose name
+/// sorts last. Subdirectories, symbolic links, other files and the temporaries of a replace
+/// in flight (`<name>.<hex>.tmp`) are not in the set.
+///
+/// The caller mounts every member and does not run on part of the set: a mount that fails
+/// leaves its place empty for good, so a process that went on without one member would
+/// name versions the cook did not mean it to (`README.md`, "Mounting").
+///
+/// Nothing is listed until the future is first polled. It resolves to what `Io::read_dir`
+/// reports on failure: `NotFound` if there is no such directory, `Io` if `directory` is not
+/// a directory or cannot be read, `Cancelled` if the pool has stopped.
+#[must_use = "a listing does nothing until polled"]
+pub fn pack_set(
+    io: &Io,
+    directory: impl Into<PathBuf>,
+) -> impl Future<Output = Result<Vec<PathBuf>>> + Send + Unpin + 'static {
+    let directory = directory.into();
+    let listing = io.read_dir(directory.clone());
+    Box::pin(async move {
+        Ok(listing
+            .await?
+            .into_iter()
+            .filter(|entry| {
+                entry.kind == EntryKind::File
+                    && entry.name.as_encoded_bytes().ends_with(PACK_ENDING.as_bytes())
+            })
+            .map(|entry| directory.join(entry.name))
+            .collect())
+    })
+}
+
+/// The file name ending that places a regular file in the cooked pack set.
+const PACK_ENDING: &str = ".pack";
 
 /// The exact-version half of the store: what a boundary world is handed. The trait states
 /// what every store upholds; `README.md` states what this one adds.

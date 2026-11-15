@@ -49,6 +49,22 @@ fn a_glb_file_is_refused_by_its_name() {
     assert!(error.message().starts_with("props/crate.glb: a binary glTF"), "{error}");
 }
 
+/// An ending in another case is neither cooked nor skipped: a case-insensitive file system
+/// would make its asset's name differ from the one a case-sensitive one gives.
+#[test]
+fn an_ending_in_another_case_is_refused_with_its_rename() {
+    for (name, file, renamed) in
+        [("case-gltf", "Squire.GLTF", "Squire.gltf"), ("case-glb", "props/crate.Glb", "crate.glb")]
+    {
+        let env = Env::new(name);
+        let error = refused(&env, &[("knight.gltf", &knight()), (file, &knight())]);
+        assert_eq!(error.kind(), ErrorKind::InvalidData, "{error}");
+        let says = format!("{file}: an ending the cooker reads in lowercase alone");
+        assert!(error.message().starts_with(&says), "{error}");
+        assert!(error.message().ends_with(&format!("rename it `{renamed}`")), "{error}");
+    }
+}
+
 #[test]
 fn a_glb_named_gltf_is_refused_by_its_magic() {
     let env = Env::new("glb-magic");
@@ -90,7 +106,18 @@ fn a_uniform_scale_other_than_one_above_a_bone_is_refused() {
                {{"name": "hips", {BONE}}}"#
         ),
         "",
-        "node 0 `Armature`: the scale 0.01 on every axis, not one",
+        "node 0 `Armature`: the scale 0.01 on every axis, not one: a sim bone's space is not \
+         scaled; apply the scale to the armature before export",
+    );
+    // A negative factor: its square is one, but the scale turns or mirrors.
+    assert_refused(
+        "negative",
+        &format!(
+            r#"{{"name": "Armature", "scale": [1, -1, -1], "children": [1]}},
+               {{"name": "hips", {BONE}}}"#
+        ),
+        "",
+        "node 0 `Armature`: the non-uniform scale [1.0, -1.0, -1.0]",
     );
 }
 
@@ -163,6 +190,92 @@ fn a_seventeenth_bone_is_refused_and_sixteen_cook() {
     let sources = env.dir.join("sources");
     env.write_tree(&sources, &[("rig.gltf", &gltf(&chain(16), ""))]);
     env.wait(cook(&env.io, &sources, &env.dir.join("rig.pack"))).expect("sixteen bones cook");
+}
+
+/// A struct written as an array, its fields by position, is refused wherever the reader
+/// expects an object: in the mark at every level, and in the document.
+#[test]
+fn an_object_written_as_an_array_is_refused_at_every_level() {
+    const ARRAY: &str = "invalid type: sequence, expected a JSON object";
+    let collider = r#""shape": {"sphere": {"radius": 0.5}}, "membership": 1, "filter": 2"#;
+    let marks = [
+        r#"{"bone": ["hips", null]}"#.to_owned(),
+        r#"{"socket": []}"#.to_owned(),
+        format!(
+            r#"{{"bone": {{"body": [null, 1, null, null, null, null, null, {{{collider}}}]}}}}"#
+        ),
+        r#"{"bone": {"body": {"collider": [{"sphere": {"radius": 0.5}}, 1, 2]}}}"#.to_owned(),
+        r#"{"bone": {"body": {"collider": {"shape": {"sphere": [0.5]}, "membership": 1,
+                                          "filter": 2}}}}"#
+            .to_owned(),
+        format!(r#"{{"bone": {{"body": {{"collider": {{{collider}}}, "joint": ["fixed"]}}}}}}"#),
+    ];
+    for (index, mark) in marks.iter().enumerate() {
+        assert_refused(
+            &format!("array-mark-{index}"),
+            &format!(r#"{{"name": "hips", "extras": {{"lactose": {mark}}}}}"#),
+            "",
+            &format!("node 0 `hips`: `extras.lactose`: {ARRAY}"),
+        );
+    }
+    // The socket is node 1, under a bone: its array is the refusal, not a missing bone.
+    assert_refused(
+        "array-socket",
+        &format!(
+            r#"{{"name": "hips", "children": [1], {BONE}}},
+               {{"name": "grip", "extras": {{"lactose": {{"socket": []}}}}}}"#
+        ),
+        "",
+        &format!("node 1 `grip`: `extras.lactose`: {ARRAY}"),
+    );
+    for (name, source) in [
+        ("array-node", gltf(r#"["hips"]"#, "")),
+        ("array-asset", br#"{"asset": ["2.0"], "nodes": []}"#.to_vec()),
+        ("array-skin", gltf(&format!(r#"{{"name": "hips", {BONE}}}"#), r#", "skins": [[[0]]]"#)),
+        ("array-document", br#"[{"version": "2.0"}]"#.to_vec()),
+    ] {
+        let env = Env::new(name);
+        let error = refused(&env, &[("rig.gltf", &source)]);
+        assert_eq!(error.kind(), ErrorKind::InvalidData, "{name}: {error}");
+        let message = error.message();
+        assert!(message.starts_with("rig.gltf: not the JSON of a glTF document: "), "{message}");
+        assert!(message.contains(ARRAY), "{name}: {message}");
+    }
+}
+
+/// A key written twice in one object of the mark is refused, the path named: serde_json
+/// would keep the last silently. A key repeated elsewhere in `extras` is not the cooker's.
+#[test]
+fn a_key_written_twice_in_the_mark_is_refused() {
+    for (name, extras, path) in [
+        ("twice-mark", r#"{"lactose": {"bone": {}}, "lactose": {"socket": {}}}"#, "lactose"),
+        (
+            "twice-role",
+            r#"{"lactose": {"bone": {"role": "hips", "role": "head"}}}"#,
+            "lactose.bone.role",
+        ),
+        (
+            "twice-radius",
+            r#"{"lactose": {"bone": {"body": {"collider": {
+                "shape": {"sphere": {"radius": 1, "radius": 2}},
+                "membership": 1, "filter": 2}}}}}"#,
+            "lactose.bone.body.collider.shape.sphere.radius",
+        ),
+        ("twice-variant", r#"{"lactose": {"bone": {}, "bone": {}}}"#, "lactose.bone"),
+    ] {
+        assert_refused(
+            name,
+            &format!(r#"{{"name": "hips", "extras": {extras}}}"#),
+            "",
+            &format!("node 0 `hips`: `extras.{path}` is written twice"),
+        );
+    }
+    let env = Env::new("twice-elsewhere");
+    let sources = env.dir.join("sources");
+    let nodes = r#"{"name": "hips", "extras": {"tool": 1, "tool": 2, "lactose": {"bone": {}}}}"#;
+    env.write_tree(&sources, &[("rig.gltf", &gltf(nodes, ""))]);
+    let published = env.wait(cook(&env.io, &sources, &env.dir.join("rig.pack"))).unwrap();
+    assert_eq!(published.len(), 1);
 }
 
 /// The refusals the brief does not name: the rest of the reader's and the schema's rules,

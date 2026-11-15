@@ -16,7 +16,7 @@ use std::sync::Arc;
 
 use lactose_asset::{
     LOG_TARGET, Mount, PACK_FORMAT_VERSION, PackBuilder, RegionBaseline, RegionBaselineLoader,
-    Storage, Store,
+    Storage, Store, pack_set,
 };
 use lactose_asset_api::{
     Asset, AssetCatalog, AssetFailure, AssetId, AssetKind, AssetRef, AssetSet, CookedAsset,
@@ -101,6 +101,13 @@ fn app_mount(executor: &Executor, store: &Store, packs: &[PathBuf]) -> Result<()
         executor.block_on(store.mount(pack))?;
     }
     Ok(())
+}
+
+/// The cooked pack set of a cooked directory, every member mounted or none run on: a
+/// member's failure is the start-up's.
+fn app_mount_cooked(executor: &Executor, io: &Io, store: &Store, cooked: PathBuf) -> Result<()> {
+    let packs = executor.block_on(pack_set(io, cooked))?;
+    app_mount(executor, store, &packs)
 }
 
 /// The same packs with every mount in flight at once: the place in the mount order is

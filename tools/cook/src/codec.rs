@@ -323,4 +323,63 @@ mod tests {
         let loaded = lactose_anim::SkeletonLoader.load(&golden, &[]).unwrap();
         assert_eq!(loaded, skeleton);
     }
+
+    /// Every role, shape, body type and joint kind through this encoder and anim's decoder:
+    /// the golden skeleton holds only some of the variants, so a code this encoder writes
+    /// for one variant and the decoder reads as another is caught here.
+    #[test]
+    fn every_variant_of_every_enum_reads_back_as_itself() {
+        use lactose_asset_api::Loader;
+        let roles = [
+            BoneRole::Other,
+            BoneRole::Hips,
+            BoneRole::Spine,
+            BoneRole::Head,
+            BoneRole::HandLeft,
+            BoneRole::HandRight,
+            BoneRole::FootLeft,
+            BoneRole::FootRight,
+        ];
+        let bodies = [RigidBody::dynamic(), RigidBody::kinematic(), RigidBody::fixed()];
+        let shapes = [
+            Shape::sphere(s(0.5)),
+            Shape::capsule(s(0.5), s(0.25)),
+            Shape::cuboid(v(0.5, 1.0, 2.0)),
+        ];
+        // Bone zero has nothing above it to join; bones one to four take the four kinds.
+        let joints = [
+            None,
+            Some(JointKind::Fixed),
+            Some(JointKind::Spherical),
+            Some(JointKind::Revolute),
+            Some(JointKind::Prismatic),
+        ];
+        let bones = roles
+            .iter()
+            .enumerate()
+            .map(|(index, &role)| {
+                let joint = joints.get(index).copied().flatten().map(|kind| BoneJoint {
+                    kind,
+                    anchor_parent: Vec3::ZERO,
+                    anchor_bone: Vec3::ZERO,
+                    axis: Vec3::Y,
+                    limits: matches!(kind, JointKind::Revolute | JointKind::Prismatic)
+                        .then(|| (s(-0.5), s(0.5))),
+                });
+                let collider = Collider::new(shapes[index % shapes.len()])
+                    .with_groups(CollisionGroups::new(1 << index, 1 << 16));
+                Bone {
+                    key: BoneKey(0x100 + index as u64),
+                    parent: index.checked_sub(1).map(|parent| u8::try_from(parent).unwrap()),
+                    role,
+                    rest: BonePose::IDENTITY,
+                    body: Some(BoneBody { body: bodies[index % bodies.len()], collider, joint }),
+                }
+            })
+            .collect();
+        let skeleton = Skeleton { bones, sockets: Vec::new() };
+        skeleton.validate().expect("a valid skeleton");
+        let loaded = lactose_anim::SkeletonLoader.load(&encode_skeleton(&skeleton), &[]).unwrap();
+        assert_eq!(loaded, skeleton);
+    }
 }

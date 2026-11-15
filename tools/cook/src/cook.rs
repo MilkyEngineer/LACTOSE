@@ -1,8 +1,7 @@
-//! A directory of sources cooked into one pack, and the cooked pack set of a fresh process
-//! (`README.md`, "The command line" and "The cooked pack set").
+//! A directory of sources cooked into one pack (`README.md`, "The command line").
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use lactose_asset::{PackBuilder, Storage};
 use lactose_asset_api::{AssetId, AssetVersion, Processor};
@@ -13,9 +12,12 @@ use crate::skeleton::SkeletonProcessor;
 
 /// The file name ending of a source the cooker cooks to a skeleton.
 const SOURCE: &str = ".gltf";
+/// The file name ending of a binary glTF, which the cooker refuses.
+const BINARY: &str = ".glb";
 /// The ending of the asset name of a cooked skeleton, in place of [`SOURCE`].
 const SKELETON: &str = ".skeleton";
-/// The file name ending of a pack, which places a file in the cooked pack set.
+/// The file name ending of a pack: the one that places a file in the cooked pack set
+/// (`lactose_asset::pack_set`).
 const PACK: &str = ".pack";
 /// How every asset is stored: zstd at a fixed level, so the bytes are a function of the
 /// sources and of the build alone.
@@ -97,8 +99,17 @@ async fn list(io: &Io, sources: &Path) -> Result<Vec<String>> {
             let path = format!("{directory}{name}");
             match entry.kind {
                 EntryKind::Directory => directories.push(format!("{path}/")),
+                EntryKind::File if let Some(renamed) = lowercase_ending(name) => {
+                    return Err(Error::new(
+                        ErrorKind::InvalidData,
+                        format!(
+                            "{path}: an ending the cooker reads in lowercase alone, so that an \
+                             asset's name is the same on every file system: rename it `{renamed}`"
+                        ),
+                    ));
+                }
                 EntryKind::File if name.ends_with(SOURCE) => sources_found.push(path),
-                EntryKind::File if name.ends_with(".glb") => {
+                EntryKind::File if name.ends_with(BINARY) => {
                     return Err(Error::new(
                         ErrorKind::Unsupported,
                         format!("{path}: a binary glTF, where the cooker reads `{SOURCE}`"),
@@ -116,6 +127,15 @@ async fn list(io: &Io, sources: &Path) -> Result<Vec<String>> {
     }
     sources_found.sort_unstable();
     Ok(sources_found)
+}
+
+/// `name` with its ending in lowercase, if it ends in `.gltf` or `.glb` written in another
+/// case (`.GLTF`, `.Glb`).
+fn lowercase_ending(name: &str) -> Option<String> {
+    let (stem, ending) = name.rsplit_once('.')?;
+    let lower = ending.to_ascii_lowercase();
+    (lower != ending && [SOURCE, BINARY].contains(&format!(".{lower}").as_str()))
+        .then(|| format!("{stem}.{lower}"))
 }
 
 /// The error of a request or a processor on `what`, a path, prefixed by it: the pool's
@@ -138,24 +158,6 @@ fn claim(claimed: &mut BTreeMap<AssetId, String>, name: &str) -> Result<AssetId>
         ));
     }
     Ok(id)
-}
-
-/// The cooked pack set of a fresh process in `directory`, in the order to mount it: every
-/// regular file directly in it whose name ends in `.pack`, in byte order of the names
-/// (`Io::read_dir`'s order), so a later name takes a later place and its versions are the
-/// ones the store names. Directories, symbolic links, other files and the temporaries of a
-/// replace in flight (`<name>.<hex>.tmp`) are not in it. Fails with what `io` reports.
-pub async fn pack_set(io: &Io, directory: &Path) -> Result<Vec<PathBuf>> {
-    Ok(io
-        .read_dir(directory)
-        .await?
-        .into_iter()
-        .filter(|entry| {
-            entry.kind == EntryKind::File
-                && entry.name.as_encoded_bytes().ends_with(PACK.as_bytes())
-        })
-        .map(|entry| directory.join(entry.name))
-        .collect())
 }
 
 #[cfg(test)]

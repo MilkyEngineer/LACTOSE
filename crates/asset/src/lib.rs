@@ -21,6 +21,8 @@
 //!   a newly cooked pack reaches a running store; the store is a
 //!   `lactose_asset_api::AssetCatalog` and so a `PublishedAssets`; [`Store::settled`] is
 //!   the one wait, for tools and tests.
+//! - [`pack_set`] lists a cooked directory's packs in the order a fresh process mounts
+//!   them.
 //! - [`PackBuilder`] writes a pack, for the cooker and for tests; [`Storage`] says how one
 //!   payload is stored.
 //! - [`RegionBaseline`] is a region's cooked baseline as an asset, named by its content
@@ -77,7 +79,7 @@ mod trace;
 
 pub use baseline::{RegionBaseline, RegionBaselineLoader};
 pub use pack::{PACK_FORMAT_VERSION, PackBuilder, Storage};
-pub use store::{Mount, Settled, Store};
+pub use store::{Mount, Settled, Store, pack_set};
 
 /// The `tracing` target of everything this crate emits: `silo`, the store's codename
 /// (architecture sections 19 and 23).

@@ -9,6 +9,7 @@ use lactose_core::{Error, ErrorKind, Result};
 use lactose_physics_api::UNIT_TOLERANCE;
 use serde::Deserialize;
 
+use crate::json::{self, Extras};
 use crate::space::Pose;
 
 /// How far from one a squared length may be and still count as one: the tolerance of a unit
@@ -16,13 +17,20 @@ use crate::space::Pose;
 /// columns alike.
 const TOLERANCE: f64 = UNIT_TOLERANCE.to_f64();
 
-/// A parsed `.gltf` file.
+/// Why a scale is refused, and the remedy: body values and clip samples are authored in the
+/// scaled unit too, so the cooker does not bake a scale into the rests alone.
+const UNSCALED: &str = "a sim bone's space is not scaled; apply the scale to the armature \
+                        before export";
+
+/// A parsed `.gltf` file. Every object the reader reads must be written as an object
+/// (`json::object`).
 #[derive(Deserialize)]
 pub(crate) struct Document {
+    #[serde(deserialize_with = "json::object")]
     asset: AssetInfo,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "json::objects")]
     pub(crate) nodes: Vec<Node>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "json::objects")]
     skins: Vec<Skin>,
 }
 
@@ -44,7 +52,7 @@ pub(crate) struct Node {
     matrix: Option<[f64; 16]>,
     /// Any JSON value, as glTF allows; the cooker reads one key of an object.
     #[serde(default)]
-    pub(crate) extras: Option<serde_json::Value>,
+    pub(crate) extras: Extras,
 }
 
 #[derive(Deserialize)]
@@ -63,9 +71,11 @@ pub(crate) struct Hierarchy {
 
 impl Document {
     /// Parses a `.gltf` file: JSON of glTF major version 2. A `.glb` never reaches here: the
-    /// cooker refuses it by its name.
+    /// processor refuses it by its magic.
     pub(crate) fn parse(source: &[u8]) -> Result<Self> {
-        let document: Self = serde_json::from_slice(source)
+        let mut deserializer = serde_json::Deserializer::from_slice(source);
+        let document: Self = json::object(&mut deserializer)
+            .and_then(|document| deserializer.end().map(|()| document))
             .map_err(|error| invalid(format!("not the JSON of a glTF document: {error}")))?;
         if !document.asset.version.starts_with("2.") {
             return Err(invalid(format!(
@@ -86,7 +96,7 @@ impl Document {
 
     /// The nodes' hierarchy, refused when it is not a forest: a child index past the nodes,
     /// a node listed as a child twice (two parents, or one parent twice), or a node whose
-    /// parents lead back to it.
+    /// parents never reach a root (the first such node by index is named).
     pub(crate) fn hierarchy(&self) -> Result<Hierarchy> {
         let count = self.nodes.len();
         let mut parents = vec![None; count];
@@ -103,25 +113,19 @@ impl Document {
                 }
             }
         }
-        // With one parent each, a walk up that has not ended after `count` steps is in a cycle.
-        for node in 0..count {
-            let mut at = node;
-            for _ in 0..=count {
-                match parents[at] {
-                    Some(parent) => at = parent,
-                    None => break,
-                }
-            }
-            if parents[at].is_some() {
-                return Err(self.refuse(node, "its parents form a cycle"));
-            }
-        }
+        // With one parent each, the walk from the roots ends, and it reaches every node whose
+        // parents lead to a root: a node it misses is in a cycle of parents, or below one.
         let mut preorder = Vec::with_capacity(count);
+        let mut reached = vec![false; count];
         let mut stack: Vec<usize> =
             (0..count).filter(|&node| parents[node].is_none()).rev().collect();
         while let Some(node) = stack.pop() {
             preorder.push(node);
+            reached[node] = true;
             stack.extend(self.nodes[node].children.iter().rev());
+        }
+        if let Some(node) = reached.iter().position(|&reached| !reached) {
+            return Err(self.refuse(node, "its parents form a cycle or lead into one"));
         }
         Ok(Hierarchy { parents, preorder })
     }
@@ -139,8 +143,9 @@ impl Document {
 
     /// The transform `node` gives its children, refused when a sim skeleton cannot hold it:
     /// a matrix beside a translation, rotation or scale; a rotation that is not a unit
-    /// quaternion; a scale that is not one in every axis, uniform or not; a matrix that is
-    /// projective, scales, shears or mirrors. Each is within [`TOLERANCE`] of the exact rule.
+    /// quaternion; a scale that is not one in every axis, uniform or not, a negative factor
+    /// included; a matrix that is projective, scales, shears or mirrors. Each is within
+    /// [`TOLERANCE`] of the exact rule.
     pub(crate) fn local(&self, node: usize) -> Result<Pose> {
         let source = &self.nodes[node];
         let Some(m) = source.matrix else {
@@ -151,14 +156,14 @@ impl Document {
                     .refuse(node, format!("the rotation {rotation:?} is not a unit quaternion")));
             }
             if let Some(scale) = source.scale
-                && !scale.iter().all(|&s| is_unit(s * s))
+                && !scale.iter().all(|&s| s > 0.0 && is_unit(s * s))
             {
                 let what = if scale.iter().all(|&s| s == scale[0]) {
                     format!("the scale {} on every axis, not one", scale[0])
                 } else {
                     format!("the non-uniform scale {scale:?}")
                 };
-                return Err(self.refuse(node, format!("{what}: a sim bone's space is not scaled")));
+                return Err(self.refuse(node, format!("{what}: {UNSCALED}")));
             }
             return Ok(Pose { translation, rotation });
         };
@@ -172,7 +177,7 @@ impl Document {
             return Err(self.refuse(node, "a projective matrix"));
         }
         if ![x, y, z].iter().all(|axis| is_unit(dot(*axis, *axis))) {
-            return Err(self.refuse(node, "a matrix that scales: a sim bone's space is not scaled"));
+            return Err(self.refuse(node, format!("a matrix that scales: {UNSCALED}")));
         }
         if [dot(x, y), dot(y, z), dot(z, x)].iter().any(|d| d.abs() >= TOLERANCE) {
             return Err(self.refuse(node, "a matrix that shears"));

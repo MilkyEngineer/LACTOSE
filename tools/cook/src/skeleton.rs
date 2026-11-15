@@ -13,11 +13,9 @@ use lactose_physics_api::{Collider, CollisionGroups, JointKind, RigidBody, Shape
 use serde::Deserialize;
 
 use crate::codec;
-use crate::gltf::{Document, Hierarchy, invalid};
+use crate::gltf::{Document, invalid};
+use crate::json::{self, MARK};
 use crate::space::{Pose, to_engine_frame};
-
-/// The key of a node's `extras` object under which the source marks the node.
-const MARK: &str = "lactose";
 
 /// The [`Processor`] of [`Skeleton`]s: the JSON of a `.gltf` file in, the skeleton byte form
 /// of `crates/anim/README.md`, "Assets", out, at the build's scalar width, with no
@@ -58,65 +56,76 @@ fn read(source: &[u8]) -> Result<Skeleton> {
     let hierarchy = document.hierarchy()?;
     let mut bones: Vec<(usize, Bone)> = Vec::new();
     let mut sockets: Vec<(usize, Socket)> = Vec::new();
-    // The bone index of each node that is a bone.
-    let mut bone_of = BTreeMap::new();
+    // The node of each socket key, so a repeated key costs one lookup.
+    let mut socket_keys = BTreeMap::new();
+    // Each node's place, filled in preorder: a parent's before its children's.
+    let mut places: Vec<Option<Place>> = vec![None; document.nodes.len()];
     for &node in &hierarchy.preorder {
-        let Some(mark) = mark(&document, node)? else { continue };
-        let Some(name) = document.nodes[node].name.as_deref() else {
-            return Err(document.refuse(node, "marked, with no name: its key is its name's hash"));
-        };
-        let key = BoneKey::from_name(name);
-        let above = bone_above(&hierarchy, &bone_of, node);
-        match mark {
-            Mark::Bone(source) => {
-                if !document.in_rig(node)? {
-                    return Err(document.refuse(node, "a bone that is no joint of the skins"));
+        let parent = hierarchy.parent(node).map(|parent| places[parent].expect("a parent first"));
+        let above = parent.and_then(|parent| parent.bone);
+        let pose = parent.map_or(Ok(Pose::IDENTITY), |parent| parent.pose).and_then(|pose| {
+            document.local(node).map(|local| pose.compose(local)).map_err(|_| node)
+        });
+        let mut place = Place { bone: above, pose };
+        if let Some(mark) = mark(&document, node)? {
+            let Some(name) = document.nodes[node].name.as_deref() else {
+                return Err(
+                    document.refuse(node, "marked, with no name: its key is its name's hash")
+                );
+            };
+            let key = BoneKey::from_name(name);
+            match mark {
+                Mark::Bone(source) => {
+                    if !document.in_rig(node)? {
+                        return Err(document.refuse(node, "a bone that is no joint of the skins"));
+                    }
+                    if let (None, Some(&(root, _))) = (above, bones.first()) {
+                        return Err(document.refuse(
+                            node,
+                            format!("a second root bone, beside {}", document.label(root)),
+                        ));
+                    }
+                    if bones.len() == MAX_SIM_BONES {
+                        return Err(document.refuse(
+                            node,
+                            format!(
+                                "bone {}: a sim skeleton has at most {MAX_SIM_BONES}",
+                                bones.len() + 1
+                            ),
+                        ));
+                    }
+                    if let Some(&(other, _)) = bones.iter().find(|(_, bone)| bone.key == key) {
+                        return Err(document
+                            .refuse(node, format!("the bone key of {}", document.label(other))));
+                    }
+                    let rest = place.pose(&document)?;
+                    let rest = if above.is_none() { to_engine_frame(rest) } else { rest };
+                    let index = u8::try_from(bones.len()).expect("at most MAX_SIM_BONES bones");
+                    let bone = Bone {
+                        key,
+                        parent: above.map(|(_, index)| index),
+                        role: source.role.map_or(BoneRole::Other, RoleSource::role),
+                        rest: rest.to_bone_pose(),
+                        body: source.body.map(BodySource::body),
+                    };
+                    bones.push((node, bone));
+                    place = Place { bone: Some((node, index)), pose: Ok(Pose::IDENTITY) };
                 }
-                if let (None, Some(&(root, _))) = (above, bones.first()) {
-                    return Err(document.refuse(
-                        node,
-                        format!("a second root bone, beside {}", document.label(root)),
-                    ));
+                Mark::Socket(SocketSource {}) => {
+                    let Some((_, bone)) = above else {
+                        return Err(document.refuse(node, "a socket under no bone"));
+                    };
+                    if let Some(&other) = socket_keys.get(&key) {
+                        return Err(document
+                            .refuse(node, format!("the socket key of {}", document.label(other))));
+                    }
+                    socket_keys.insert(key, node);
+                    let offset = place.pose(&document)?;
+                    sockets.push((node, Socket { key, bone, offset: offset.to_bone_pose() }));
                 }
-                if bones.len() == MAX_SIM_BONES {
-                    return Err(document.refuse(
-                        node,
-                        format!(
-                            "bone {}: a sim skeleton has at most {MAX_SIM_BONES}",
-                            bones.len() + 1
-                        ),
-                    ));
-                }
-                if let Some(&(other, _)) = bones.iter().find(|(_, bone)| bone.key == key) {
-                    return Err(
-                        document.refuse(node, format!("the bone key of {}", document.label(other)))
-                    );
-                }
-                let rest = chain(&document, &hierarchy, node, above.map(|(node, _)| node))?;
-                let rest = if above.is_none() { to_engine_frame(rest) } else { rest };
-                let index = u8::try_from(bones.len()).expect("at most MAX_SIM_BONES bones");
-                bone_of.insert(node, index);
-                let bone = Bone {
-                    key,
-                    parent: above.map(|(_, index)| index),
-                    role: source.role.map_or(BoneRole::Other, RoleSource::role),
-                    rest: rest.to_bone_pose(),
-                    body: source.body.map(BodySource::body),
-                };
-                bones.push((node, bone));
-            }
-            Mark::Socket(SocketSource {}) => {
-                let Some((bone_node, bone)) = above else {
-                    return Err(document.refuse(node, "a socket under no bone"));
-                };
-                if let Some(&(other, _)) = sockets.iter().find(|(_, socket)| socket.key == key) {
-                    return Err(document
-                        .refuse(node, format!("the socket key of {}", document.label(other))));
-                }
-                let offset = chain(&document, &hierarchy, node, Some(bone_node))?;
-                sockets.push((node, Socket { key, bone, offset: offset.to_bone_pose() }));
             }
         }
+        places[node] = Some(place);
     }
     if bones.is_empty() {
         return Err(invalid(format!("no node is marked as a bone under `extras.{MARK}`")));
@@ -128,49 +137,35 @@ fn read(source: &[u8]) -> Result<Skeleton> {
     Ok(skeleton)
 }
 
-/// `node`'s mark, if its `extras` is an object holding one under [`MARK`].
+/// Where a node is, to the skeleton: the nearest bone at or above it, as its node and bone
+/// index, and the node's pose in that bone's space (the scene's, under no bone), the
+/// transforms of the nodes between composed parent first; or else the first of those nodes,
+/// from the top, whose transform is refused. The refusal is raised only where a bone or a
+/// socket needs the pose, so a scaled mesh beside the rig is no refusal.
+#[derive(Clone, Copy)]
+struct Place {
+    bone: Option<(usize, u8)>,
+    pose: core::result::Result<Pose, usize>,
+}
+
+impl Place {
+    /// The pose, or the refusal of the node that broke it.
+    fn pose(self, document: &Document) -> Result<Pose> {
+        self.pose.map_err(|node| document.local(node).expect_err("a node refused before"))
+    }
+}
+
+/// `node`'s mark, if its `extras` is an object holding one under [`MARK`]: refused if a key
+/// of it is written twice in one object.
 fn mark(document: &Document, node: usize) -> Result<Option<Mark>> {
-    let Some(value) = document.nodes[node].extras.as_ref().and_then(|extras| extras.get(MARK))
-    else {
-        return Ok(None);
-    };
+    let extras = &document.nodes[node].extras;
+    if let Some(path) = &extras.repeated {
+        return Err(document.refuse(node, format!("`extras.{path}` is written twice")));
+    }
+    let Some(value) = &extras.mark else { return Ok(None) };
     Mark::deserialize(value)
         .map(Some)
         .map_err(|error| document.refuse(node, format!("`extras.{MARK}`: {error}")))
-}
-
-/// The nearest ancestor of `node` that is a bone: its node and its bone index.
-fn bone_above(
-    hierarchy: &Hierarchy,
-    bone_of: &BTreeMap<usize, u8>,
-    node: usize,
-) -> Option<(usize, u8)> {
-    let mut at = hierarchy.parent(node)?;
-    loop {
-        if let Some(&index) = bone_of.get(&at) {
-            return Some((at, index));
-        }
-        at = hierarchy.parent(at)?;
-    }
-}
-
-/// `node`'s pose in the space of its ancestor `above`, or of the scene for `None`: the
-/// transforms of the nodes below `above` down to `node`, composed parent first.
-fn chain(
-    document: &Document,
-    hierarchy: &Hierarchy,
-    node: usize,
-    above: Option<usize>,
-) -> Result<Pose> {
-    let mut path = vec![node];
-    while let Some(parent) = hierarchy.parent(*path.last().expect("the path starts at the node"))
-        && Some(parent) != above
-    {
-        path.push(parent);
-    }
-    path.iter()
-        .rev()
-        .try_fold(Pose::IDENTITY, |pose, &node| Ok(pose.compose(document.local(node)?)))
 }
 
 /// `Skeleton::validate`, its refusal naming the node of the first bone, or else the first
@@ -182,32 +177,46 @@ fn validate(
     socket_nodes: &[usize],
 ) -> Result<()> {
     let Err(error) = skeleton.validate() else { return Ok(()) };
+    let prefix = |bones: usize, sockets: usize| Skeleton {
+        bones: skeleton.bones[..bones].to_vec(),
+        sockets: skeleton.sockets[..sockets].to_vec(),
+    };
     for bones in 1..=skeleton.bones.len() {
-        let prefix = Skeleton { bones: skeleton.bones[..bones].to_vec(), sockets: Vec::new() };
-        if let Err(error) = prefix.validate() {
+        if let Err(error) = prefix(bones, 0).validate() {
             return Err(document.refuse(bone_nodes[bones - 1], error.message()));
         }
     }
-    for sockets in 1..=skeleton.sockets.len() {
-        let prefix = Skeleton {
-            bones: skeleton.bones.clone(),
-            sockets: skeleton.sockets[..sockets].to_vec(),
-        };
-        if let Err(error) = prefix.validate() {
-            return Err(document.refuse(socket_nodes[sockets - 1], error.message()));
+    // The bones are valid and each socket is checked on its own, so once a prefix of the
+    // sockets fails every longer one does: the shortest is found by bisection, a few
+    // validations whatever the count.
+    let (mut valid, mut failing) = (0, skeleton.sockets.len());
+    while failing - valid > 1 {
+        let middle = valid + (failing - valid) / 2;
+        if prefix(skeleton.bones.len(), middle).validate().is_ok() {
+            valid = middle;
+        } else {
+            failing = middle;
         }
     }
-    Err(error)
+    match prefix(skeleton.bones.len(), failing).validate() {
+        Err(error) if failing > 0 => {
+            Err(document.refuse(socket_nodes[failing - 1], error.message()))
+        }
+        _ => Err(error),
+    }
 }
 
 // ---- The source schema: `README.md`, "The source schema" ----
 
-/// What a node is to the skeleton.
+/// What a node is to the skeleton. Every struct of the schema is written as a JSON object
+/// and as nothing else (`json::object`).
 #[derive(Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum Mark {
     // Boxed: a body is a few hundred bytes, a socket mark none.
+    #[serde(deserialize_with = "json::boxed")]
     Bone(Box<BoneSource>),
+    #[serde(deserialize_with = "json::object")]
     Socket(SocketSource),
 }
 
@@ -215,6 +224,7 @@ enum Mark {
 #[serde(deny_unknown_fields)]
 struct BoneSource {
     role: Option<RoleSource>,
+    #[serde(default, deserialize_with = "json::optional")]
     body: Option<BodySource>,
 }
 
@@ -260,7 +270,9 @@ struct BodySource {
     gravity_scale: Option<f64>,
     locked_axes: Option<Vec<AxisSource>>,
     can_sleep: Option<bool>,
+    #[serde(deserialize_with = "json::object")]
     collider: ColliderSource,
+    #[serde(default, deserialize_with = "json::optional")]
     joint: Option<JointSource>,
 }
 
@@ -289,6 +301,7 @@ enum AxisSource {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ColliderSource {
+    #[serde(deserialize_with = "json::object")]
     shape: ShapeSource,
     membership: u32,
     filter: u32,
@@ -306,9 +319,31 @@ struct ColliderSource {
 #[derive(Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 enum ShapeSource {
-    Sphere { radius: f64 },
-    Capsule { half_height: f64, radius: f64 },
-    Cuboid { half_extents: [f64; 3] },
+    #[serde(deserialize_with = "json::object")]
+    Sphere(SphereSource),
+    #[serde(deserialize_with = "json::object")]
+    Capsule(CapsuleSource),
+    #[serde(deserialize_with = "json::object")]
+    Cuboid(CuboidSource),
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SphereSource {
+    radius: f64,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CapsuleSource {
+    half_height: f64,
+    radius: f64,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CuboidSource {
+    half_extents: [f64; 3],
 }
 
 /// The joint to the nearest ancestor bone with a body: the anchors in that ancestor's
@@ -382,11 +417,11 @@ impl BodySource {
 impl ColliderSource {
     fn collider(self) -> Collider {
         let shape = match self.shape {
-            ShapeSource::Sphere { radius } => Shape::sphere(scalar(radius)),
-            ShapeSource::Capsule { half_height, radius } => {
+            ShapeSource::Sphere(SphereSource { radius }) => Shape::sphere(scalar(radius)),
+            ShapeSource::Capsule(CapsuleSource { half_height, radius }) => {
                 Shape::capsule(scalar(half_height), scalar(radius))
             }
-            ShapeSource::Cuboid { half_extents } => Shape::cuboid(vec3(half_extents)),
+            ShapeSource::Cuboid(CuboidSource { half_extents }) => Shape::cuboid(vec3(half_extents)),
         };
         let mut collider =
             Collider::new(shape).with_groups(CollisionGroups::new(self.membership, self.filter));
