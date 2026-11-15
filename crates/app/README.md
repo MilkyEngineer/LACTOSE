@@ -673,6 +673,29 @@ root")
 - A `Headless` is built on the thread that owns it and every method is called from that
   thread; none is called from a worker (`block_on` on a worker is a debug assertion).
 
+## The saved-type record
+
+`tests/schema_record/engine.txt` records every type the engine's registration set saves
+(`Game::types()` of a game with no crate, which every game's set contains): its key,
+role, persistence policy, schema version and layout digest as `SchemaTable::schemas()`
+gives them, and its field IDs with their names and type tags, nested `#[value]` structs
+included, and its retired IDs. `derived` types are not saved and are not in it. The
+headless binary's set adds one milestone 1 stand-in type and has no record; a game binary's
+set gets its own file beside this one when it ships (milestone 5). `tests/schema_record.rs`
+derives the record from the build and fails, naming the type, on a persistent type whose
+digest moved while its version did not (raise the version and register the step), on a
+version that fell, and on a reused field ID: a recorded ID that now names a field of
+another name, a recorded ID that left the fields without being retired, and a retired ID no
+longer retired, at every depth. A field whose type changes under its ID and name is a
+layout change, which the digest and version govern. Any other difference (a new type, a
+removed one, a version that rose with any digest, a new field) fails until the record is
+rewritten in the commit that makes the change, with
+`LACTOSE_SCHEMA_RECORD=update cargo nextest run -p lactose-app --test schema_record`. The
+command refuses to write while any of the failures above stands, so a record never takes a
+layout change without a bump. A rename keeps its ID and costs no bump, but the record
+cannot tell it from an ID given to a new field of the same type; `LACTOSE_SCHEMA_RECORD=rename`
+in place of `update` takes it as one, and is the only way to.
+
 ## Not in this crate yet
 
 - A reset of a kept region to its cooked state (`Server::forget(region)`), and a reload of
