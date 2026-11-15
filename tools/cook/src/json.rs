@@ -11,7 +11,7 @@
 use std::fmt;
 use std::marker::PhantomData;
 
-use serde::de::value::MapAccessDeserializer;
+use serde::de::value::{MapAccessDeserializer, StringDeserializer};
 use serde::de::{Deserialize, Deserializer, IgnoredAny, MapAccess, SeqAccess, Visitor};
 use serde_json::{Map, Value};
 
@@ -43,6 +43,38 @@ pub(crate) fn objects<'de, D: Deserializer<'de>, T: Deserialize<'de>>(
 ) -> Result<Vec<T>, D::Error> {
     Vec::<Object<T>>::deserialize(deserializer)
         .map(|values| values.into_iter().map(|Object(value)| value).collect())
+}
+
+/// A name: a `T` whose variants carry nothing, written as a JSON string and as nothing else.
+/// serde would also take a variant written as a one-key object, `{"hips": null}`.
+pub(crate) fn name<'de, D: Deserializer<'de>, T: Deserialize<'de>>(
+    deserializer: D,
+) -> Result<T, D::Error> {
+    Name::deserialize(deserializer).map(|Name(value)| value)
+}
+
+/// [`name`], or `null` for `None`. The field also needs `#[serde(default)]`.
+pub(crate) fn optional_name<'de, D: Deserializer<'de>, T: Deserialize<'de>>(
+    deserializer: D,
+) -> Result<Option<T>, D::Error> {
+    Option::<Name<T>>::deserialize(deserializer).map(|value| value.map(|Name(value)| value))
+}
+
+/// An optional list of [`name`]s. The field also needs `#[serde(default)]`.
+pub(crate) fn optional_names<'de, D: Deserializer<'de>, T: Deserialize<'de>>(
+    deserializer: D,
+) -> Result<Option<Vec<T>>, D::Error> {
+    Option::<Vec<Name<T>>>::deserialize(deserializer)
+        .map(|values| values.map(|values| values.into_iter().map(|Name(value)| value).collect()))
+}
+
+struct Name<T>(T);
+
+impl<'de, T: Deserialize<'de>> Deserialize<'de> for Name<T> {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let name = String::deserialize(deserializer)?;
+        T::deserialize(StringDeserializer::<D::Error>::new(name)).map(Name)
+    }
 }
 
 struct Object<T>(T);

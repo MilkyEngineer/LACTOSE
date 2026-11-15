@@ -99,6 +99,15 @@ async fn list(io: &Io, sources: &Path) -> Result<Vec<String>> {
             let path = format!("{directory}{name}");
             match entry.kind {
                 EntryKind::Directory => directories.push(format!("{path}/")),
+                EntryKind::File if only_an_ending(name) => {
+                    return Err(Error::new(
+                        ErrorKind::InvalidData,
+                        format!(
+                            "{path}: a name that is only an ending, which would cook to an asset \
+                             whose file name is empty: give it a name before the ending"
+                        ),
+                    ));
+                }
                 EntryKind::File if let Some(renamed) = lowercase_ending(name) => {
                     return Err(Error::new(
                         ErrorKind::InvalidData,
@@ -127,6 +136,11 @@ async fn list(io: &Io, sources: &Path) -> Result<Vec<String>> {
     }
     sources_found.sort_unstable();
     Ok(sources_found)
+}
+
+/// Whether `name` is `.gltf` or `.glb` alone, in any case.
+fn only_an_ending(name: &str) -> bool {
+    [SOURCE, BINARY].iter().any(|ending| name.eq_ignore_ascii_case(ending))
 }
 
 /// `name` with its ending in lowercase, if it ends in `.gltf` or `.glb` written in another

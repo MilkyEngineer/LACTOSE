@@ -223,6 +223,7 @@ enum Mark {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct BoneSource {
+    #[serde(default, deserialize_with = "json::optional_name")]
     role: Option<RoleSource>,
     #[serde(default, deserialize_with = "json::optional")]
     body: Option<BodySource>,
@@ -263,11 +264,13 @@ impl RoleSource {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct BodySource {
+    #[serde(default, deserialize_with = "json::optional_name")]
     body_type: Option<BodyTypeSource>,
     mass: Option<f64>,
     linear_damping: Option<f64>,
     angular_damping: Option<f64>,
     gravity_scale: Option<f64>,
+    #[serde(default, deserialize_with = "json::optional_names")]
     locked_axes: Option<Vec<AxisSource>>,
     can_sleep: Option<bool>,
     #[serde(deserialize_with = "json::object")]
@@ -351,6 +354,7 @@ struct CuboidSource {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct JointSource {
+    #[serde(deserialize_with = "json::name")]
     kind: JointKindSource,
     anchor_parent: Option<[f64; 3]>,
     anchor_bone: Option<[f64; 3]>,
@@ -521,6 +525,24 @@ mod tests {
             (
                 r#"{"bone": {"body": {"collider": {"shape": {"sphere": {"radius": 1}}}}}}"#,
                 "missing field `membership`",
+            ),
+            // A name written as a one-key object, which serde reads as a unit variant: each
+            // of the four fields a name is read in.
+            (r#"{"bone": {"role": {"hips": null}}}"#, "expected a string"),
+            (
+                r#"{"bone": {"body": {"body_type": {"fixed": null},
+                    "collider": {"shape": {"sphere": {"radius": 1}}, "membership": 1, "filter": 2}}}}"#,
+                "expected a string",
+            ),
+            (
+                r#"{"bone": {"body": {"locked_axes": [{"rotation_x": null}],
+                    "collider": {"shape": {"sphere": {"radius": 1}}, "membership": 1, "filter": 2}}}}"#,
+                "expected a string",
+            ),
+            (
+                r#"{"bone": {"body": {"joint": {"kind": {"spherical": null}},
+                    "collider": {"shape": {"sphere": {"radius": 1}}, "membership": 1, "filter": 2}}}}"#,
+                "expected a string",
             ),
         ] {
             let error = read_json(&one_bone(mark)).unwrap_err();

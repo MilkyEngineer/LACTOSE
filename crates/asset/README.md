@@ -36,8 +36,8 @@ writes: a change that breaks it is a signature change to list.
 | Item | Purpose |
 |---|---|
 | `Store` | The store handle: `Clone`, one store per process; `Store::new(executor, io, loaders)`; `mount(path)` for a cooked pack; `settled()` for the one wait; it is a `lactose_asset_api::AssetCatalog` and so a `PublishedAssets`, and a clone coerces to `Arc<dyn AssetCatalog>` and from there to `Arc<dyn PublishedAssets>` |
-| `Mount`, `Settled` | The two futures: `Send + Unpin + 'static`, lazy, cancelled by drop. `Mount` resolves to `lactose_core::Result<()>`, `Settled` to `()` |
-| `pack_set(io, directory)` | The cooked pack set of a fresh process, in the order to mount it ("Mounting"): a future, `Send + Unpin + 'static` and lazy like `Mount`, resolving to the packs' paths or to `Io::read_dir`'s failure |
+| `pack_set(io, directory)` | The cooked pack set of a fresh process, in the order to mount it ("Mounting"): a `PackSet` resolving to the packs' paths or to `Io::read_dir`'s failure |
+| `Mount`, `Settled`, `PackSet` | The three futures: `Send + Unpin + 'static`, lazy, cancelled by drop. `Mount` resolves to `lactose_core::Result<()>`, `Settled` to `()`, `PackSet` to `lactose_core::Result<Vec<PathBuf>>` |
 | `PackBuilder`, `Storage` | The pack writer, for the cooker and for tests: `add(id, &cooked, storage)` returns the version it recorded, `finish()` returns the pack's bytes; `Storage::Raw` or `Storage::Zstd { level }` per payload |
 | `PACK_FORMAT_VERSION` | 1: the pack format this build writes and mounts |
 | `RegionBaseline`, `RegionBaselineLoader` | A region's cooked baseline as an asset kind, named by its content hash: `name(content_hash)` and `id(content_hash)`, `cook(&baseline)` for the cooker, `lookup(catalog, content_hash)` for `app` and `persist`, `baseline()` for the shared `Arc<Baseline>`; and its loader, which every store registers itself |
@@ -266,7 +266,7 @@ is this crate's (D136), written by `PackBuilder` alone and read by `Store::mount
   directly in it whose name ends in `.pack`, mounted in ascending byte order of the
   names: `Io::read_dir`'s order, `OsStr`'s, the names' bytes on Unix and their WTF-8
   bytes on Windows, which agree for every name that is valid Unicode. `pack_set(io,
-  directory)` lists it in that order (D146). A later name takes a later place, so where
+  directory)` lists it in that order (D147). A later name takes a later place, so where
   two packs hold one asset the store names the version of the pack whose name sorts last;
   a team orders packs by naming them (`00-base.pack`, `10-dlc.pack`, `90-patch.pack`), and
   a re-cook that replaces its pack at the same path keeps its name's rank. Subdirectories,
@@ -670,7 +670,7 @@ Everything is at target `silo` (`LOG_TARGET`), the store's codename (architectur
   `crates/io/README.md` names). Until then whoever knows the cooker ran calls `mount`.
   The watch must leave the store naming what a fresh process mounting the cooked pack
   set ("Mounting") would name, with no version the set shadows named in between; how is
-  milestone 2's to decide (D146).
+  milestone 2's to decide (D147).
 - **Unmounting, and merging packs.** One descriptor and one index per mount until the
   store is dropped; a long dev session's mount count against the process's descriptor
   limit is a verification row.

@@ -209,31 +209,45 @@ impl fmt::Debug for Store {
 /// leaves its place empty for good, so a process that went on without one member would
 /// name versions the cook did not mean it to (`README.md`, "Mounting").
 ///
-/// Nothing is listed until the future is first polled. It resolves to what `Io::read_dir`
-/// reports on failure: `NotFound` if there is no such directory, `Io` if `directory` is not
-/// a directory or cannot be read, `Cancelled` if the pool has stopped.
-#[must_use = "a listing does nothing until polled"]
-pub fn pack_set(
-    io: &Io,
-    directory: impl Into<PathBuf>,
-) -> impl Future<Output = Result<Vec<PathBuf>>> + Send + Unpin + 'static {
+/// Nothing is listed until the [`PackSet`] is first polled. It resolves to what
+/// `Io::read_dir` reports on failure: `NotFound` if there is no such directory, `Io` if
+/// `directory` is not a directory or cannot be read, `ResourceExhausted` if a buffer cannot
+/// be allocated, `Cancelled` if the pool has stopped.
+pub fn pack_set(io: &Io, directory: impl Into<PathBuf>) -> PackSet {
     let directory = directory.into();
     let listing = io.read_dir(directory.clone());
-    Box::pin(async move {
-        Ok(listing
-            .await?
-            .into_iter()
-            .filter(|entry| {
-                entry.kind == EntryKind::File
-                    && entry.name.as_encoded_bytes().ends_with(PACK_ENDING.as_bytes())
-            })
-            .map(|entry| directory.join(entry.name))
-            .collect())
-    })
+    PackSet {
+        run: Box::pin(async move {
+            Ok(listing
+                .await?
+                .into_iter()
+                .filter(|entry| {
+                    entry.kind == EntryKind::File
+                        && entry.name.as_encoded_bytes().ends_with(PACK_ENDING.as_bytes())
+                })
+                .map(|entry| directory.join(entry.name))
+                .collect())
+        }),
+    }
 }
 
 /// The file name ending that places a regular file in the cooked pack set.
 const PACK_ENDING: &str = ".pack";
+
+/// A listing in flight: [`pack_set`]. Resolves to the set's paths in the order to mount
+/// them. Dropping it cancels the listing.
+#[must_use = "a listing does nothing until polled"]
+pub struct PackSet {
+    run: Pin<Box<dyn Future<Output = Result<Vec<PathBuf>>> + Send>>,
+}
+
+impl Future for PackSet {
+    type Output = Result<Vec<PathBuf>>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        self.run.as_mut().poll(cx)
+    }
+}
 
 /// The exact-version half of the store: what a boundary world is handed. The trait states
 /// what every store upholds; `README.md` states what this one adds.

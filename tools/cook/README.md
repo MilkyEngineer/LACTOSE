@@ -31,8 +31,10 @@ below).
 otherwise):
 
 - **Sources.** Every regular file under the directory `SOURCES`, at any depth, whose name
-  ends in `.gltf` is a source, and each cooks to one `anim::skeleton`. Other files are
-  ignored. A file whose name ends in `.glb` is refused (`Unsupported`), as is an entry that
+  ends in `.gltf` is a source, hidden files included (a `._knight.gltf` a copy left behind
+  is one, and fails the cook if it is not a glTF document), and each cooks to one
+  `anim::skeleton`. Other files are ignored. A name that is only an ending, `.gltf` or
+  `.glb` in any case, is refused (`InvalidData`): its asset's file name would be empty. A file whose name ends in `.glb` is refused (`Unsupported`), as is an entry that
   is neither a file nor a directory, a symbolic link among them, and a name that is not
   UTF-8 (`InvalidData`). So is a name ending in `.gltf` or `.glb` in any other case,
   `.GLTF` or `.Glb` (`InvalidData`, naming the file renamed): the endings are read in
@@ -180,7 +182,7 @@ to the skeleton it encoded, so what it cooks is what the runtime accepts.
 ## The cooked pack set
 
 Which packs a fresh process mounts, and in which order, is `lactose-asset`'s rule,
-`lactose_asset::pack_set` (`crates/asset/README.md`, "Mounting"; D146): the regular files
+`lactose_asset::pack_set` (`crates/asset/README.md`, "Mounting"; D147): the regular files
 directly in a cooked directory whose names end in `.pack`, in byte order of the names, a
 later name naming the version where two packs hold one asset. So a team orders the packs
 it cooks by naming them (`00-base.pack`, `10-dlc.pack`, `90-patch.pack`), and a re-cook
@@ -231,4 +233,4 @@ version (`tests/skeleton.rs`).
 | Cooking twice writes the same pack and prints the same versions; three sources written in opposite orders, one directory and one file sorting differently by path and by name, cook to the same bytes | `tests/skeleton.rs`, `cooking_twice_writes_the_same_bytes`, `sources_written_in_another_order_cook_to_the_same_bytes` |
 | The encoder writes anim's golden skeleton bytes, copied from `crates/anim/tests/format.rs`; swapping its linear and angular damping fails the test | `src/codec.rs`, `the_encoder_writes_anims_golden_skeleton_bytes` |
 | Every role, shape, body type and joint kind reads back through anim's decoder as itself; exchanging two role codes, or two joint-kind codes, in the encoder fails the test | `src/codec.rs`, `every_variant_of_every_enum_reads_back_as_itself` |
-| Every refusal, each naming the file and the node: a `.glb` by name and by magic, an ending in another case with its rename, a non-uniform scale, a uniform scale other than one above a bone with its remedy, a negative factor, a scaling or mirroring matrix, a cycle, a second root, a 17th bone (16 cook), an object written as an array at every level of the mark and of the document, a key written twice in the mark, and the reader's, the schema's and `validate`'s other rules; nothing is written | `tests/refusals.rs` |
+| Every refusal, each naming the file and the node: a `.glb` by name and by magic, an ending in another case with its rename, a name that is only an ending, a non-uniform scale, a uniform scale other than one above a bone with its remedy, a negative factor, a scaling or mirroring matrix, a cycle, a second root, a 17th bone (16 cook), an object written as an array at every level of the mark and of the document, a key written twice in the mark, and the reader's, the schema's and `validate`'s other rules; nothing is written | `tests/refusals.rs` |

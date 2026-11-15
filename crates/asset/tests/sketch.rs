@@ -104,10 +104,15 @@ fn app_mount(executor: &Executor, store: &Store, packs: &[PathBuf]) -> Result<()
 }
 
 /// The cooked pack set of a cooked directory, every member mounted or none run on: a
-/// member's failure is the start-up's.
+/// member's failure is the start-up's, naming the pack, which the store's error does not.
 fn app_mount_cooked(executor: &Executor, io: &Io, store: &Store, cooked: PathBuf) -> Result<()> {
-    let packs = executor.block_on(pack_set(io, cooked))?;
-    app_mount(executor, store, &packs)
+    for pack in executor.block_on(pack_set(io, cooked))? {
+        executor.block_on(store.mount(&pack)).map_err(|error| {
+            Error::new(error.kind(), format!("{}: {}", pack.display(), error.message()))
+                .with_source(error)
+        })?;
+    }
+    Ok(())
 }
 
 /// The same packs with every mount in flight at once: the place in the mount order is

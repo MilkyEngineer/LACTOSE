@@ -63,6 +63,17 @@ fn an_ending_in_another_case_is_refused_with_its_rename() {
         assert!(error.message().starts_with(&says), "{error}");
         assert!(error.message().ends_with(&format!("rename it `{renamed}`")), "{error}");
     }
+    // A name that is only an ending, in any case, would cook to an asset whose file name is
+    // empty: it is refused, not renamed to another name that is only an ending.
+    for (name, file) in
+        [("only-gltf", ".gltf"), ("only-gltf-case", ".GLTF"), ("only-glb", "props/.glb")]
+    {
+        let env = Env::new(name);
+        let error = refused(&env, &[("knight.gltf", &knight()), (file, &knight())]);
+        assert_eq!(error.kind(), ErrorKind::InvalidData, "{error}");
+        let says = format!("{file}: a name that is only an ending");
+        assert!(error.message().starts_with(&says), "{error}");
+    }
 }
 
 #[test]
