@@ -346,7 +346,7 @@ fn test_previous_schema_version(executor: &Executor, bytes_from_v1: &[u8]) {
     let _ = (executor, bytes_from_v1);
 }
 
-/// A layout changed without a version bump: equal document schemas, different digests,
+/// A layout changed without a version bump: schemas equal but for their digests,
 /// refused with `VersionMismatch` and nothing loads.
 fn test_layout_change_without_bump(old: &Registry, new: &Registry) -> bool {
     let (old, new) = (SchemaTable::from_registry(old), SchemaTable::from_registry(new));

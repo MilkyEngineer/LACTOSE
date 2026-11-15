@@ -14,7 +14,7 @@ use lactose_reflect::{Persistence, Reflect, TypeInfo, TypeRole};
 use lactose_sim::RegionExport;
 
 use crate::codec::invalid;
-use crate::schema::{LayoutDigest, Saved, SchemaTable};
+use crate::schema::{Saved, SchemaTable};
 
 /// The overlay of `rows`, a region's state as `World::export_region` copied it out,
 /// against `baseline`, the cooked baseline the region was loaded from: every difference
@@ -419,9 +419,10 @@ pub(crate) fn unknown(component: ComponentKey) -> Error {
 
 /// One region's part of a save, and what the relevance message carries (architecture
 /// sections 9.3 and 15.2): the overlay against the baseline named by its content hash, and
-/// beside it the region's seed, its persistent region resources with their schemas, the
-/// keys of its transient resources, and the layout digest of every type the records carry
-/// bytes of, since `Overlay` has no field for any of them (`docs/verification.md`).
+/// beside it the region's seed, its persistent region resources with their schemas and the
+/// keys of its transient resources, since `Overlay` has no field for any of them
+/// (`docs/verification.md`). Every type the records carry bytes of has its layout digest in
+/// its schema, the overlay's table or `resource_schemas`.
 ///
 /// Equal state gives equal records: every field is canonical, the overlay by construction
 /// and the resources by this crate's canonicalisation, and every list is in ascending key
@@ -456,19 +457,13 @@ pub struct RegionRecords {
     /// the types of `resources`: present and hashed, never saved by value, restored
     /// zeroed.
     pub transient_resources: Vec<ComponentKey>,
-    /// The layout digest of every type the records carry bytes of, at the version they
-    /// were written: exactly the components of the overlay's schema table and the types of
-    /// `resources`, no more and no fewer. What tells a same-size layout change from the
-    /// layout the bytes were written in ([`LayoutDigest`]); the relevance message does not
-    /// carry it, since both ends share a build.
-    pub layouts: BTreeMap<ComponentKey, LayoutDigest>,
 }
 
 impl RegionRecords {
     /// The records of `export`, a region as an unload or a save copied it out, against
     /// `baseline`: [`diff`] over `export.rows`, `None` when it is empty, the seed and the
-    /// transient keys copied, each resource canonicalised with its schema and digest taken
-    /// from the table, and `layouts` filled for every type carried. The result passes
+    /// transient keys copied, and each resource canonicalised with its schema taken from
+    /// the table. The result passes
     /// [`check`](Self::check). Fails as [`diff`] fails, and with `NotFound` or
     /// `InvalidData` for a resource the table does not know, that is not a saved resource,
     /// or whose bytes are not its schema's size.
@@ -502,12 +497,6 @@ impl RegionRecords {
             .iter()
             .map(|data| schemas.saved(data.component).expect("checked above").schema.clone())
             .collect();
-        let carried = overlay.iter().flat_map(|overlay| overlay.schemas());
-        let layouts = carried
-            .map(ComponentSchema::component)
-            .chain(resources.iter().map(|data| data.component))
-            .map(|component| (component, schemas.layout(component).expect("a saved type")))
-            .collect();
         let records = Self {
             region: export.region,
             seed: export.rows.seed,
@@ -516,7 +505,6 @@ impl RegionRecords {
             resources,
             resource_schemas,
             transient_resources,
-            layouts,
         };
         records.check()?;
         Ok(records)
@@ -526,8 +514,7 @@ impl RegionRecords {
     /// `baseline_hash` equals the overlay's; `resources` is strictly ascending by key with
     /// `resource_schemas` one per resource in the same order, each schema naming its
     /// resource's type and stating its size; `transient_resources` is strictly ascending
-    /// and names no type `resources` holds; and `layouts` has exactly one entry per
-    /// component the overlay carries bytes of and per resource. Fails with `InvalidData`
+    /// and names no type `resources` holds. Fails with `InvalidData`
     /// naming the first failure. Every builder, writer and decoder of records in this
     /// crate holds this, so a caller that assembles records by hand runs it before handing
     /// them over.
@@ -578,24 +565,6 @@ impl RegionRecords {
                 )));
             }
         }
-        let carried: BTreeSet<ComponentKey> = self
-            .overlay
-            .iter()
-            .flat_map(|overlay| overlay.schemas())
-            .map(ComponentSchema::component)
-            .chain(self.resources.iter().map(|data| data.component))
-            .collect();
-        if let Some(missing) =
-            carried.iter().find(|component| !self.layouts.contains_key(component))
-        {
-            return Err(invalid(format!("no layout digest for {:#018x}", missing.0)));
-        }
-        if let Some(extra) = self.layouts.keys().find(|component| !carried.contains(component)) {
-            return Err(invalid(format!(
-                "a layout digest for {:#018x}, which the records do not carry",
-                extra.0
-            )));
-        }
         Ok(())
     }
 
@@ -632,8 +601,7 @@ impl RegionRecords {
     /// baseline's), and [`diff`] runs over them against `patched`.
     ///
     /// Afterwards `baseline_hash` names `patched`, the overlay fits it or is `None` if
-    /// nothing is left, and `layouts` holds the table's digest of every type the new overlay
-    /// carries and the resources' entries as they were. Returns the records the rebase
+    /// nothing is left, and the resources are as they were. Returns the records the rebase
     /// dropped, in order, so the caller can re-home those of a cooked entity the patch
     /// moved to another region (the cross-region pass is not in this crate yet). With no
     /// overlay only the hash changes.
@@ -653,9 +621,7 @@ impl RegionRecords {
         for schema in overlay.schemas() {
             let component = schema.component();
             let info = schemas.info(component).ok_or_else(|| unknown(component))?;
-            if schemas.schema(component) != Some(schema)
-                || self.layouts.get(&component).copied() != schemas.layout(component)
-            {
+            if schemas.schema(component) != Some(schema) {
                 return Err(Error::new(
                     ErrorKind::VersionMismatch,
                     format!(
@@ -668,13 +634,6 @@ impl RegionRecords {
         let (kept, dropped) = overlay.rebase(patched)?;
         let rebased = diff_rows(&applied(&kept, patched, schemas)?, patched, schemas)?;
         let overlay = (!rebased.records().is_empty()).then(|| Arc::new(rebased));
-        let carried = overlay.iter().flat_map(|overlay| overlay.schemas()).map(|schema| {
-            let component = schema.component();
-            (component, schemas.layout(component).expect("the diff carries saved types"))
-        });
-        let resources =
-            self.resources.iter().map(|data| (data.component, self.layouts[&data.component]));
-        self.layouts = carried.chain(resources).collect();
         self.baseline_hash = patched.content_hash();
         self.overlay = overlay;
         Ok(dropped)

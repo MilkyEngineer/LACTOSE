@@ -100,7 +100,8 @@ fn an_overlay_against_another_baseline() {
 fn a_document_whose_schema_is_not_the_registrys() {
     let mut schema_v2 = schemas(types().registry());
     let marker = schema_v2.iter().position(|schema| schema.component() == Marker::KEY).unwrap();
-    schema_v2[marker] = ComponentSchema::new(Marker::KEY, 2, 0, []).unwrap();
+    let digest = schema_v2[marker].layout_digest();
+    schema_v2[marker] = ComponentSchema::new(Marker::KEY, 2, 0, digest, []).unwrap();
     let rows = [BaselineRow { id: cooked(OTHER, 1), components: vec![data(Marker)] }];
     let mut bundle = fresh(OTHER);
     bundle.baseline = Arc::new(Baseline::from_rows(AssetSet::new(), schema_v2, rows).unwrap());

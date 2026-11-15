@@ -138,12 +138,10 @@ fn the_records_carry_the_diff_and_the_resources_canonical() {
     assert_eq!(records.resources, vec![data(Weather(5))]);
     assert_eq!(records.resource_schemas, vec![table.schema(Weather::KEY).unwrap().clone()]);
     assert_eq!(records.transient_resources, vec![Rain::KEY]);
-    let mut layouts: Vec<ComponentKey> = overlay.schemas().iter().map(|s| s.component()).collect();
-    layouts.push(Weather::KEY);
-    layouts.sort_unstable();
-    assert_eq!(records.layouts.keys().copied().collect::<Vec<_>>(), layouts);
-    for (&key, &digest) in &records.layouts {
-        assert_eq!(Some(digest), table.layout(key));
+    // Every type carried under the table's schema, its layout digest with it.
+    for schema in overlay.schemas().iter().chain(&records.resource_schemas) {
+        assert_eq!(Some(schema), table.schema(schema.component()));
+        assert_eq!(Some(schema.layout_digest()), table.layout(schema.component()).map(|d| d.0));
     }
 
     // The relevance message: the same resources, the overlay in full.
@@ -176,7 +174,7 @@ fn the_cooked_state_is_no_overlay_and_a_cooked_message() {
     assert_eq!(overlay.baseline_hash(), baseline_a().content_hash());
     let records = RegionRecords::from_export(&export, &baseline_a(), &table).unwrap();
     assert!(records.overlay.is_none());
-    assert_eq!(records.layouts.keys().copied().collect::<Vec<_>>(), vec![Weather::KEY]);
+    assert_eq!(records.resource_schemas, vec![table.schema(Weather::KEY).unwrap().clone()]);
     let message = records.to_relevance(None);
     assert!(matches!(message.overlay, OverlayPayload::Cooked));
     assert_eq!(message.resources, vec![data(Weather(1))]);
@@ -475,7 +473,8 @@ fn a_debug_build_asserts_nothing_on_a_transient_column_or_a_decoded_value() {
             return schema.clone();
         }
         let fields = schema.fields().iter().copied();
-        ComponentSchema::new(Mass::KEY, from, schema.element_size(), fields).unwrap()
+        let (size, digest) = (schema.element_size(), schema.layout_digest());
+        ComponentSchema::new(Mass::KEY, from, size, digest, fields).unwrap()
     };
     let schemas = overlay.schemas().iter().map(previous);
     let rebuilt = Overlay::new(overlay.baseline_hash(), schemas, decoded);
@@ -506,7 +505,8 @@ fn stale_schemas(component: ComponentKey) -> Vec<ComponentSchema> {
             }
             let fields = schema.fields().iter().copied();
             let version = schema.schema_version() + 1;
-            ComponentSchema::new(component, version, schema.element_size(), fields).unwrap()
+            let (size, digest) = (schema.element_size(), schema.layout_digest());
+            ComponentSchema::new(component, version, size, digest, fields).unwrap()
         })
         .collect()
 }
@@ -522,7 +522,6 @@ fn a_baseline_column_in_another_schema_is_refused_as_stated() {
         resources: Vec::new(),
         resource_schemas: Vec::new(),
         transient_resources: Vec::new(),
-        layouts: BTreeMap::new(),
     };
     let migrations = Migrations::new();
     let loader = Loader::new(schemas(), &migrations);

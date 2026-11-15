@@ -177,16 +177,9 @@ fn gear(level: u8, speed: Scalar) -> Gear {
     }
 }
 
-/// The document schema of `info` the way the ECS derives the one it compares against.
+/// The document schema of `info`, the ECS's one derivation, which its loader compares against.
 fn ecs_schema(info: &TypeInfo) -> ComponentSchema {
-    let fields = info.layout().fields().iter().filter_map(|field| {
-        Some(FieldLayout {
-            id: field.id()?,
-            offset: field.offset() as u32,
-            size: field.size() as u32,
-        })
-    });
-    ComponentSchema::new(info.key(), info.version(), info.layout().size() as u32, fields).unwrap()
+    lactose_ecs::document_schema(info).unwrap()
 }
 
 #[test]
@@ -256,7 +249,8 @@ fn the_tables_schemas_are_the_ones_the_loader_accepts() {
             return schema.clone();
         }
         let fields = schema.fields().iter().copied();
-        ComponentSchema::new(Gear::KEY, from, schema.element_size(), fields).unwrap()
+        let (size, digest) = (schema.element_size(), schema.layout_digest());
+        ComponentSchema::new(Gear::KEY, from, size, digest, fields).unwrap()
     };
     let schemas = overlay.schemas().iter().map(previous);
     let mut odd = records.clone();
@@ -422,6 +416,7 @@ fn a_zero_size_field_is_refused_at_registration_so_no_table_or_load_meets_it() {
         ZeroDerived::KEY,
         1,
         4,
+        0,
         [FieldLayout { id: FieldId(1), offset: 0, size: 4 }],
     )
     .unwrap();

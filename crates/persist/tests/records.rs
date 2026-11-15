@@ -12,9 +12,7 @@ use common::*;
 use lactose_bundle::Overlay;
 use lactose_core::{ComponentKey, ErrorKind};
 use lactose_ecs::RegionMode;
-use lactose_persist::{
-    Container, ContainerHeader, LayoutDigest, Loader, Migrations, RegionRecords,
-};
+use lactose_persist::{Container, ContainerHeader, Loader, Migrations, RegionRecords};
 use lactose_reflect::Reflect;
 
 /// The pinned region's records at tick 30: an overlay (its spawner has spawned), two
@@ -91,20 +89,6 @@ fn cases() -> Vec<Case> {
             },
             "both saved and transient",
         ),
-        (
-            "a layout digest missing",
-            |r| {
-                r.layouts.remove(&Weather::KEY);
-            },
-            "no layout digest",
-        ),
-        (
-            "a layout digest extra",
-            |r| {
-                r.layouts.insert(ComponentKey(12345), LayoutDigest(1));
-            },
-            "which the records do not carry",
-        ),
     ]
 }
 
@@ -115,7 +99,6 @@ fn the_canonical_records_pass() {
     // The cooked state is `None`, and passes too.
     let mut cooked = records.clone();
     cooked.overlay = None;
-    cooked.layouts.retain(|key, _| records.resources.iter().any(|data| data.component == *key));
     cooked.check().unwrap();
 }
 

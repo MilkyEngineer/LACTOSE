@@ -18,7 +18,7 @@ use lactose_anim::{
     AnimParams, AnimRig, AnimState, Clip, Condition, RootMotion, SimPose, StateMachine, sets,
 };
 use lactose_asset_api::{AssetRef, AssetSet};
-use lactose_bundle::{Baseline, BaselineRow, ComponentData, ComponentSchema, FieldLayout};
+use lactose_bundle::{Baseline, BaselineRow, ComponentData, ComponentSchema};
 use lactose_core::{NetId, PlayerId, Result, StableKey, Tick};
 use lactose_ecs::{
     Executor, LayoutConfig, Mut, RegionConfig, RegionId, RegionMode, SystemSet, World, WorldKind,
@@ -407,17 +407,7 @@ fn schemas(world: &World) -> Vec<ComponentSchema> {
     world
         .registry()
         .iter()
-        .map(|info| {
-            let fields = info.layout().fields().iter().filter_map(|field| {
-                Some(FieldLayout {
-                    id: field.id()?,
-                    offset: u32::try_from(field.offset()).expect("a small offset"),
-                    size: u32::try_from(field.size()).expect("a small size"),
-                })
-            });
-            let size = u32::try_from(info.layout().size()).expect("a small component");
-            ComponentSchema::new(info.key(), info.version(), size, fields).expect("a schema")
-        })
+        .map(|info| lactose_ecs::document_schema(info).expect("a schema"))
         .collect()
 }
 

@@ -8,14 +8,14 @@ use std::sync::Arc;
 use lactose_asset_api::PinnedTable;
 use lactose_bundle::{Baseline, ComponentData, ComponentSchema, Record};
 use lactose_core::{ComponentKey, Error, ErrorKind, NetId, PredictionKey, Result};
-use lactose_ecs::{PredictedOrigin, RegionId, RegionMode};
+use lactose_ecs::{PredictedOrigin, RegionId, RegionMode, document_schema};
 use lactose_reflect::{Persistence, Reflect, TypeInfo, TypeRole};
 use lactose_sim::RegionBundle;
 
 use crate::codec::invalid;
 use crate::diff::{RegionRecords, unknown};
 use crate::migrate::Migrations;
-use crate::schema::{Saved, SchemaTable, document_schema};
+use crate::schema::{Saved, SchemaTable};
 
 /// What a load needs beyond the records: the loading build's saved schemas and its
 /// migrations. One per registry, shared by every region's load.
@@ -45,9 +45,9 @@ impl<'a> Loader<'a> {
     }
 
     /// The same records at the registry's schemas, in canonical form: the overlay through
-    /// [`Migrations::migrate_overlay`] with the records' `layouts`, and each resource
-    /// through [`Migrations::migrate`] under the schema and digest the records carry for
-    /// it; `resource_schemas` and `layouts` then state the registry's. Records whose every
+    /// [`Migrations::migrate_overlay`], and each resource through [`Migrations::migrate`]
+    /// under the schema the records carry for it; `resource_schemas` then states the
+    /// registry's. Records whose every
     /// carried type is at the registry's version and digest come back equal, the overlay
     /// as the same `Arc`.
     ///
@@ -75,8 +75,7 @@ impl<'a> Loader<'a> {
         let schemas = self.schemas;
         let overlay = match &records.overlay {
             Some(overlay) => {
-                let migrated =
-                    self.migrations.migrate_overlay(overlay, &records.layouts, schemas)?;
+                let migrated = self.migrations.migrate_overlay(overlay, schemas)?;
                 (!migrated.records().is_empty()).then_some(migrated)
             }
             None => None,
@@ -91,8 +90,7 @@ impl<'a> Loader<'a> {
                     transient_resources.insert(data.component);
                 }
                 Persistence::Persistent => {
-                    let layout = records.layouts[&data.component];
-                    let mut bytes = self.migrations.migrate(info, schema, layout, &data.bytes)?;
+                    let mut bytes = self.migrations.migrate(info, schema, &data.bytes)?;
                     saved(schemas, data.component).canonicalise(&mut bytes);
                     resources.push(ComponentData { component: data.component, bytes });
                 }
@@ -114,12 +112,6 @@ impl<'a> Loader<'a> {
         resources.sort_by_key(|data| data.component);
         let resource_schemas =
             resources.iter().map(|data| saved(schemas, data.component).schema.clone()).collect();
-        let carried = overlay.iter().flat_map(|overlay| overlay.schemas());
-        let layouts = carried
-            .map(ComponentSchema::component)
-            .chain(resources.iter().map(|data| data.component))
-            .map(|component| (component, saved(schemas, component).layout))
-            .collect();
         let migrated = RegionRecords {
             region: records.region,
             seed: records.seed,
@@ -128,7 +120,6 @@ impl<'a> Loader<'a> {
             resources,
             resource_schemas,
             transient_resources: transient_resources.into_iter().collect(),
-            layouts,
         };
         migrated.check()?;
         Ok(migrated)
@@ -149,8 +140,8 @@ impl<'a> Loader<'a> {
     /// baseline column whose schema is not the table's is
     /// `VersionMismatch` here rather than at the sync point (a baseline is never migrated:
     /// the cooker of this build re-cooks it, and the records are rebased onto the result;
-    /// a baseline carries no layout digest, so a same-size layout change in a cooked column
-    /// is not seen here until `lactose-bundle` carries the digest, D129). Then the bundle:
+    /// the schema carries the layout digest, so a same-size layout change in a cooked
+    /// column is refused here too). Then the bundle:
     /// `seed`, `mode`, `baseline`, the migrated overlay, the migrated resources, the
     /// transient keys and `assets`. Nothing is loaded here; the sync point validates again
     /// before `create_region`.
@@ -273,7 +264,7 @@ impl<'a> Loader<'a> {
                 continue;
             };
             let saved = self.schemas.saved(key).ok_or_else(|| unknown(key))?;
-            if *schema != saved.schema || records.layouts.get(&key) != Some(&saved.layout) {
+            if *schema != saved.schema {
                 return Err(Error::new(
                     ErrorKind::VersionMismatch,
                     format!(

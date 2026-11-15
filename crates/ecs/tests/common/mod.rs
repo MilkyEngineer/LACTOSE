@@ -436,25 +436,7 @@ pub fn base_registry() -> Registry {
 
 /// The document schema of every component of `registry`, as `lactose-persist` writes it.
 pub fn schemas(registry: &Registry) -> Vec<lactose_bundle::ComponentSchema> {
-    registry
-        .iter()
-        .map(|info| {
-            let fields = info.layout().fields().iter().filter_map(|field| {
-                Some(lactose_bundle::FieldLayout {
-                    id: field.id()?,
-                    offset: field.offset() as u32,
-                    size: field.size() as u32,
-                })
-            });
-            lactose_bundle::ComponentSchema::new(
-                info.key(),
-                info.version(),
-                info.layout().size() as u32,
-                fields,
-            )
-            .unwrap()
-        })
-        .collect()
+    registry.iter().map(|info| lactose_ecs::document_schema(info).unwrap()).collect()
 }
 
 /// The registry of every type above.

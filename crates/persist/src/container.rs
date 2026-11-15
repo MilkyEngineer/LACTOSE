@@ -19,9 +19,10 @@
 //!   each), the overlay's presence (`u8`) and, when present, its length (`u64`) and
 //!   `Overlay::encode`; the resource schema table as `lactose-bundle` writes one; each
 //!   resource as its key (`u64`) and the bytes of its schema's size, in the table's order;
-//!   the transient keys (a count and a `u64` each, ascending); the layout digests (a count
-//!   and a key and digest, `u64` each, ascending). One zstd frame at `SECTION_LEVEL`, with
-//!   its content size and without a checksum (the entry's xxh64 is the check).
+//!   the transient keys (a count and a `u64` each, ascending). One zstd frame at
+//!   `SECTION_LEVEL`, with its content size and without a checksum (the entry's xxh64 is
+//!   the check). Each type's layout digest is in its schema, in the overlay's table and the
+//!   resources' alike.
 
 use std::collections::BTreeMap;
 use std::num::NonZeroU64;
@@ -35,12 +36,13 @@ use zstd::zstd_safe::CParameter;
 
 use crate::codec::{Reader, Writer, invalid};
 use crate::diff::RegionRecords;
-use crate::schema::{LayoutDigest, SchemaHash, SchemaTable};
+use crate::schema::{SchemaHash, SchemaTable};
 
 /// The container format this build writes and reads. A reader refuses any other with
 /// `VersionMismatch`: before the first shipped save the format changes freely with this
-/// number, and after it a change ships with a converter.
-pub const CONTAINER_FORMAT_VERSION: u16 = 1;
+/// number, and after it a change ships with a converter. Format 2 moved the layout digests
+/// from a list of their own into the schemas, with `lactose-bundle`'s format 2.
+pub const CONTAINER_FORMAT_VERSION: u16 = 2;
 
 /// The first bytes of a container, which say how long the header-and-index block is:
 /// what a reader reads first, then [`Container::index_len`] more, before it knows
@@ -210,8 +212,7 @@ impl RegionRecords {
     /// and the baseline hash (so a section states what its entry claims), the overlay as
     /// `Overlay::encode` behind a presence byte, the resource schema table as
     /// `lactose-bundle` writes one, the resources as key and bytes of the schema's size,
-    /// the transient keys ascending, and the layout digests as key and digest ascending;
-    /// with its entry filled from the records and the bytes, `offset` zero. Fails with
+    /// and the transient keys ascending; with its entry filled from the records and the bytes, `offset` zero. Fails with
     /// `InvalidData` for records that fail [`check`](Self::check), and with
     /// `ResourceExhausted` if the content would exceed [`MAX_SECTION_BYTES`]. Pure and
     /// independent per region, so `app` runs it beside `from_export` on a background
@@ -267,11 +268,6 @@ impl RegionRecords {
         for component in &self.transient_resources {
             out.u64(component.0);
         }
-        out.count(self.layouts.len());
-        for (component, layout) in &self.layouts {
-            out.u64(component.0);
-            out.u64(layout.0);
-        }
         if out.bytes.len() > MAX_SECTION_BYTES {
             return Err(Error::new(
                 ErrorKind::ResourceExhausted,
@@ -309,15 +305,6 @@ impl RegionRecords {
         for _ in 0..count {
             transient_resources.push(reader.component()?);
         }
-        let count = reader.count(16)?;
-        let mut layouts = BTreeMap::new();
-        for _ in 0..count {
-            let (component, layout) = (reader.component()?, LayoutDigest(reader.u64()?));
-            if layouts.last_key_value().is_some_and(|(&last, _)| last >= component) {
-                return Err(invalid("the layout digests are not strictly ascending"));
-            }
-            layouts.insert(component, layout);
-        }
         reader.finish()?;
         let records = Self {
             region,
@@ -327,7 +314,6 @@ impl RegionRecords {
             resources,
             resource_schemas,
             transient_resources,
-            layouts,
         };
         records.check()?;
         Ok(records)

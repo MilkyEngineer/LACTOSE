@@ -103,7 +103,7 @@ impl Archetype {
 /// |---|---|
 /// | asset set | `u32` count, then each [`AssetId`] as `u64`, strictly ascending, never zero |
 /// | schema table | `u32` count, then each schema, strictly ascending by component key; exactly the components some archetype has |
-/// | schema | `u64` component key, `u32` schema version, `u32` element size, `u32` field count, then per field `u16` field ID, `u32` offset, `u32` size, strictly ascending by field ID |
+/// | schema | `u64` component key, `u32` schema version, `u32` element size, `u64` layout digest, `u32` field count, then per field `u16` field ID, `u32` offset, `u32` size, strictly ascending by field ID ([`write_table`](crate::write_table)) |
 /// | archetypes | `u32` count, then each archetype, strictly ascending by component key list |
 /// | archetype | `u32` component count, the keys as `u64` strictly ascending; `u32` row count, at least one; the row [`NetId`]s as `u64`, strictly ascending; then one column per key, in key order, of row count times element size bytes |
 ///
@@ -239,12 +239,8 @@ impl Baseline {
             previous = id;
         }
 
-        let schemas = schema::read_table(&mut reader)?;
-        // Lookups below are binary searches, so the order has to hold first.
-        strictly_ascending(
-            schemas.iter().map(ComponentSchema::component),
-            "the schema table is not strictly ascending",
-        )?;
+        // Strictly ascending, so the lookups below can be binary searches.
+        let schemas = schema::read(&mut reader)?;
 
         // An archetype is at least its two counts and one row ID.
         let count = reader.count(16)?;
@@ -327,7 +323,7 @@ fn seal(
     for id in assets.iter() {
         writer.u64(id.to_bits());
     }
-    schema::write_table(&mut writer, schemas);
+    writer.schemas(schemas);
     writer.count(archetypes.len());
     for archetype in archetypes {
         writer.count(archetype.columns.len());

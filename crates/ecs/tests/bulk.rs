@@ -276,6 +276,7 @@ fn a_load_checks_the_region_and_the_schemas() {
                 schema.component(),
                 schema.schema_version() + 1,
                 schema.element_size(),
+                schema.layout_digest(),
                 schema.fields().iter().copied(),
             )
             .unwrap()
@@ -333,4 +334,127 @@ fn a_baseline_that_carries_a_predicted_origin_is_refused() {
         assert_eq!(world.alias(key), Some(runtime(R2)));
         assert!(world.contains(StableKey::Predicted(key)));
     }
+}
+
+/// One type at one schema version under two layouts of one size with the same top-level
+/// fields: `i32` changed to `u32` with no version bump, which only the layout digest sees.
+mod written {
+    #[lactose_reflect::component(key = "bulk::gauge", persistent)]
+    #[derive(PartialEq, Debug)]
+    pub struct Gauge(#[field(id = 1)] pub i32);
+}
+
+mod relaid {
+    #[lactose_reflect::component(key = "bulk::gauge", persistent)]
+    pub struct Gauge(#[field(id = 1)] pub u32);
+}
+
+/// The test registry with one of the two gauges.
+fn with_gauge<G: Reflect>() -> std::sync::Arc<Registry> {
+    let mut registry = base_registry();
+    registry.register::<G>().unwrap();
+    std::sync::Arc::new(registry)
+}
+
+/// A load refused as a layout changed without a version bump, leaving no row and no log
+/// entry.
+fn refused_unchanged(world: &mut World, load: impl FnOnce(&mut World) -> lactose_core::Result<()>) {
+    let mut cursor = world.structural_log().cursor();
+    let error = load(world).unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::VersionMismatch, "{error}");
+    assert!(error.to_string().contains("without a version bump"), "{error}");
+    assert!(error.to_string().contains("bulk::gauge"), "{error}");
+    assert_eq!(world.entities_in(REGION).count(), 0, "no row");
+    assert_eq!(world.structural_log().since(&mut cursor).unwrap().count(), 0, "no log entry");
+}
+
+#[test]
+fn a_same_size_layout_change_without_a_version_bump_is_refused_in_a_baseline() {
+    let (old, new) = (with_gauge::<written::Gauge>(), with_gauge::<relaid::Gauge>());
+    let (old_schemas, new_schemas) = (schemas(&old), schemas(&new));
+    let gauge = |schemas: &[lactose_bundle::ComponentSchema]| {
+        schemas.iter().find(|schema| schema.component() == written::Gauge::KEY).unwrap().clone()
+    };
+    let (was, is) = (gauge(&old_schemas), gauge(&new_schemas));
+    assert_eq!(
+        (was.schema_version(), was.element_size(), was.fields()),
+        (is.schema_version(), is.element_size(), is.fields()),
+        "the fields cannot tell the two apart"
+    );
+    assert_ne!(was.layout_digest(), is.layout_digest());
+
+    let rows = [BaselineRow {
+        id: cooked(C1),
+        components: vec![data(pos(1, 1)), data(written::Gauge(-3))],
+    }];
+    let baseline = Baseline::from_rows(AssetSet::new(), old_schemas, rows).unwrap();
+    let baseline = Baseline::decode(&baseline.encode()).unwrap();
+    for layout in [LayoutConfig::default()].into_iter().chain(layouts()) {
+        let mut world = fresh(new.clone(), layout, 77);
+        refused_unchanged(&mut world, |world| world.load_region(REGION, &baseline, None));
+        // The build that wrote it loads it.
+        let mut world = fresh(old.clone(), layout, 77);
+        world.load_region(REGION, &baseline, None).unwrap();
+        let loaded = world.get::<written::Gauge>(StableKey::Net(cooked(C1)));
+        assert_eq!(loaded, Some(&written::Gauge(-3)));
+    }
+}
+
+#[test]
+fn a_same_size_layout_change_without_a_version_bump_is_refused_in_an_overlay() {
+    let (old, new) = (with_gauge::<written::Gauge>(), with_gauge::<relaid::Gauge>());
+    // An empty baseline: the same document under either registry.
+    let baseline = Baseline::from_rows(AssetSet::new(), schemas(&new), []).unwrap();
+    assert_eq!(baseline, Baseline::from_rows(AssetSet::new(), schemas(&old), []).unwrap());
+    let spawn = Record::Spawn {
+        id: runtime(R1),
+        components: vec![data(pos(1, 1)), data(written::Gauge(-3))],
+    };
+    let overlay = Overlay::new(baseline.content_hash(), schemas(&old), [spawn]).unwrap();
+    let overlay = Overlay::decode(&overlay.encode()).unwrap();
+    for layout in [LayoutConfig::default()].into_iter().chain(layouts()) {
+        let mut world = fresh(new.clone(), layout, 77);
+        let counter = world.next_net_id();
+        refused_unchanged(&mut world, |world| world.load_region(REGION, &baseline, Some(&overlay)));
+        assert_eq!(world.next_net_id(), counter, "no counter move");
+        let mut world = fresh(old.clone(), layout, 77);
+        world.load_region(REGION, &baseline, Some(&overlay)).unwrap();
+        let loaded = world.get::<written::Gauge>(StableKey::Net(runtime(R1)));
+        assert_eq!(loaded, Some(&written::Gauge(-3)));
+    }
+}
+
+/// The largest saved resource: exactly what a document carries of one value.
+#[lactose_reflect::resource(key = "bulk::largest", persistent)]
+pub struct Largest(#[field(id = 1)] pub lactose_core::PlainArray<u8, 16384>);
+
+/// One byte over, persistent.
+#[lactose_reflect::resource(key = "bulk::over", persistent)]
+pub struct Over(#[field(id = 1)] pub lactose_core::PlainArray<u8, 16385>);
+
+/// One byte over, transient: saved by its schema, so refused too.
+#[lactose_reflect::resource(key = "bulk::over_transient", transient)]
+pub struct OverTransient(#[field(id = 1)] pub lactose_core::PlainArray<u8, 16385>);
+
+/// One byte over, derived: never saved, so any size.
+#[lactose_reflect::resource(key = "bulk::over_derived", derived)]
+pub struct OverDerived(#[field(id = 1)] pub lactose_core::PlainArray<u8, 16385>);
+
+#[test]
+fn a_saved_resource_over_what_a_document_carries_does_not_build() {
+    let build = |register: fn(&mut Registry)| {
+        let mut registry = base_registry();
+        register(&mut registry);
+        WorldBuilder::new(WorldKind::Server, std::sync::Arc::new(registry)).build()
+    };
+    assert_eq!(size_of::<Largest>(), lactose_bundle::MAX_COMPONENT_BYTES as usize);
+    assert!(build(|registry| registry.register::<Largest>().unwrap()).is_ok());
+    assert!(build(|registry| registry.register::<OverDerived>().unwrap()).is_ok());
+    let refused = |name: &str, register: fn(&mut Registry)| {
+        let Err(error) = build(register) else { panic!("`{name}` built") };
+        assert_eq!(error.kind(), ErrorKind::InvalidData, "{error}");
+        assert!(error.to_string().contains(name), "`{error}` names `{name}`");
+    };
+    refused("bulk::over", |registry| registry.register::<Over>().unwrap());
+    refused("bulk::over_transient", |registry| registry.register::<OverTransient>().unwrap());
 }

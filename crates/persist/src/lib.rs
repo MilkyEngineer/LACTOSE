@@ -20,11 +20,11 @@
 //! # Where to start
 //!
 //! - [`SchemaTable`] is the policy as a value: built once from a `Registry`, it says which
-//!   types a save carries, with the schema and [`LayoutDigest`] each document carries for
-//!   them, and hashes to the [`SchemaHash`] a container records.
+//!   types a save carries, with the schema each document carries for them, its
+//!   [`LayoutDigest`] inside it, and hashes to the [`SchemaHash`] a container records.
 //! - [`diff`] is the one diff of a region's export against its baseline; [`RegionRecords`]
-//!   is a region's part of a save, the overlay with the seed, the resources and the
-//!   digests beside it, and the relevance message through
+//!   is a region's part of a save, the overlay with the seed and the resources beside it,
+//!   and the relevance message through
 //!   [`RegionRecords::to_relevance`].
 //! - [`Container`] holds the records of every region under a [`ContainerHeader`]; each
 //!   region is an [`EncodedSection`] made on a worker and assembled, and read back by the
@@ -123,7 +123,7 @@ const _: () = {
     copy::<LayoutDigest>();
     copy::<Loader<'_>>();
 
-    assert!(CONTAINER_FORMAT_VERSION == 1);
+    assert!(CONTAINER_FORMAT_VERSION == 2);
     assert!(PREAMBLE_BYTES == 16);
     assert!(MAX_SECTION_BYTES >= lactose_bundle::MAX_DOCUMENT_BYTES);
     assert!(MAX_CONTAINER_BYTES >= MAX_SECTION_BYTES);

@@ -564,7 +564,7 @@ is this crate's (D136), written by `PackBuilder` alone and read by `Store::mount
 ### The region baseline
 
 - `RegionBaseline` is an asset kind like any other to the store: kind
-  `AssetKind::from_name("region_baseline")`, cooked format 1, cooked bytes
+  `AssetKind::from_name("region_baseline")`, cooked format 2, cooked bytes
   `Baseline::encode`'s, no declared dependencies. `RegionBaselineLoader` is
   `Baseline::decode`, and refuses declared dependencies with `InvalidData`. The cooked
   format version moves with `lactose-bundle`'s document format version, in one change;

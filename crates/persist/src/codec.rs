@@ -1,10 +1,10 @@
 //! The byte rules of the container and its sections: every integer little-endian, counts
 //! `u32`, sizes and offsets `u64`, and every read bounds-checked so nothing is allocated
-//! or looped over on the word of a count alone. The schema table is `lactose-bundle`'s
-//! encoding of one, byte for byte (`tests/format.rs` holds the two equal).
+//! or looped over on the word of a count alone. The schema table is written and read by
+//! `lactose-bundle`'s `write_table` and `read_table`, so it has the documents' one encoding.
 
-use lactose_bundle::{ComponentSchema, FieldLayout};
-use lactose_core::{ComponentKey, Error, ErrorKind, FieldId, Result};
+use lactose_bundle::ComponentSchema;
+use lactose_core::{ComponentKey, Error, ErrorKind, Result};
 
 pub(crate) fn invalid(message: impl Into<String>) -> Error {
     Error::new(ErrorKind::InvalidData, message.into())
@@ -43,21 +43,9 @@ impl Writer {
         self.u32(u32::try_from(count).unwrap_or(u32::MAX));
     }
 
-    /// `lactose-bundle`'s schema table: the count, then per schema its key, version, size,
-    /// field count and fields (ID, offset, size), fields ascending by ID.
+    /// A schema table, in `lactose-bundle`'s one encoding of it.
     pub(crate) fn schemas(&mut self, schemas: &[ComponentSchema]) {
-        self.count(schemas.len());
-        for schema in schemas {
-            self.u64(schema.component().0);
-            self.u32(schema.schema_version());
-            self.u32(schema.element_size());
-            self.count(schema.fields().len());
-            for field in schema.fields() {
-                self.u16(field.id.0);
-                self.u32(field.offset);
-                self.u32(field.size);
-            }
-        }
+        lactose_bundle::write_table(schemas, &mut self.bytes);
     }
 }
 
@@ -129,26 +117,11 @@ impl<'a> Reader<'a> {
         }
     }
 
-    /// A schema table as [`Writer::schemas`] writes it, each schema well-formed and its
-    /// fields strictly ascending by ID, as the canonical encoding has them.
+    /// A schema table as [`Writer::schemas`] writes it: `lactose_bundle::read_table`, each
+    /// schema well-formed, the table strictly ascending by component and each schema's
+    /// fields by ID.
     pub(crate) fn schemas(&mut self) -> Result<Vec<ComponentSchema>> {
-        // A schema is at least its key, version, size and field count; a field ten bytes.
-        let count = self.count(20)?;
-        let mut schemas = Vec::with_capacity(count);
-        for _ in 0..count {
-            let (component, version, size) = (self.component()?, self.u32()?, self.u32()?);
-            let field_count = self.count(10)?;
-            let mut fields = Vec::with_capacity(field_count);
-            for _ in 0..field_count {
-                let id = FieldId(self.u16()?);
-                if fields.last().is_some_and(|last: &FieldLayout| last.id >= id) {
-                    return Err(invalid("a schema's fields are not strictly ascending by ID"));
-                }
-                fields.push(FieldLayout { id, offset: self.u32()?, size: self.u32()? });
-            }
-            schemas.push(ComponentSchema::new(component, version, size, fields)?);
-        }
-        Ok(schemas)
+        lactose_bundle::read_table(&mut self.rest)
     }
 
     pub(crate) fn finish(self) -> Result<()> {

@@ -1,13 +1,13 @@
 //! The container's bytes (README, "The container"): a small container written out field by
 //! field from the layout `src/container.rs` states, then pinned as golden bytes, so any
 //! change to the encoding fails here and moves `CONTAINER_FORMAT_VERSION`. The section's
-//! schema table is `lactose-bundle`'s encoding of one, byte for byte.
+//! schema table is written by `lactose_bundle::write_table`, the encoding a document embeds,
+//! byte for byte.
 
 #![forbid(unsafe_code)]
 
 mod common;
 
-use std::collections::BTreeMap;
 use std::num::NonZeroU64;
 use std::sync::Arc;
 
@@ -52,10 +52,6 @@ fn records(table: &SchemaTable) -> RegionRecords {
     resources.sort_by_key(|data| data.component);
     let resource_schemas =
         resources.iter().map(|data| table.schema(data.component).unwrap().clone()).collect();
-    let layouts: BTreeMap<_, _> = [Health::KEY, Weather::KEY, Score::KEY]
-        .into_iter()
-        .map(|key| (key, table.layout(key).unwrap()))
-        .collect();
     let records = RegionRecords {
         region: REGION,
         seed: 0x1122_3344,
@@ -64,7 +60,6 @@ fn records(table: &SchemaTable) -> RegionRecords {
         resources,
         resource_schemas,
         transient_resources: vec![Rain::KEY],
-        layouts,
     };
     records.check().unwrap();
     records
@@ -95,7 +90,7 @@ fn bundle_table(schemas: &[lactose_bundle::ComponentSchema]) -> Vec<u8> {
     let encoded = Overlay::new(0, schemas.iter().cloned(), [record]).unwrap().encode();
     let mut len = 4;
     for schema in schemas {
-        len += 8 + 4 + 4 + 4 + 10 * schema.fields().len();
+        len += 8 + 4 + 4 + 8 + 4 + 10 * schema.fields().len();
     }
     encoded[16..16 + len].to_vec()
 }
@@ -111,7 +106,7 @@ fn expected_content(records: &RegionRecords) -> Vec<u8> {
     out.push(1);
     out.extend_from_slice(&(overlay.len() as u64).to_le_bytes());
     out.extend_from_slice(&overlay);
-    out.extend_from_slice(&bundle_table(&records.resource_schemas));
+    lactose_bundle::write_table(&records.resource_schemas, &mut out);
     for data in &records.resources {
         out.extend_from_slice(&data.component.0.to_le_bytes());
         out.extend_from_slice(&data.bytes);
@@ -119,11 +114,6 @@ fn expected_content(records: &RegionRecords) -> Vec<u8> {
     out.extend_from_slice(&(records.transient_resources.len() as u32).to_le_bytes());
     for key in &records.transient_resources {
         out.extend_from_slice(&key.0.to_le_bytes());
-    }
-    out.extend_from_slice(&(records.layouts.len() as u32).to_le_bytes());
-    for (key, digest) in &records.layouts {
-        out.extend_from_slice(&key.0.to_le_bytes());
-        out.extend_from_slice(&digest.0.to_le_bytes());
     }
     out
 }
@@ -181,7 +171,15 @@ fn the_schema_table_is_the_bundle_encoding() {
     let overlay_len = records.overlay.as_ref().unwrap().encode().len();
     let at = 8 * 3 + 1 + 8 + overlay_len;
     let expected = bundle_table(&records.resource_schemas);
+    let mut written = Vec::new();
+    lactose_bundle::write_table(&records.resource_schemas, &mut written);
+    assert_eq!(written, expected, "the export is the table a document embeds");
     assert_eq!(&content[at..at + expected.len()], expected.as_slice());
+    // Each schema carries its type's layout digest.
+    for schema in &records.resource_schemas {
+        let digest = table.layout(schema.component()).unwrap();
+        assert_eq!(schema.layout_digest(), digest.0);
+    }
     // And for every schema of the game's table at once, the check being blind to roles.
     let all: Vec<_> = schemas().schemas().cloned().collect();
     let every = RegionRecords {
@@ -195,10 +193,6 @@ fn the_schema_table_is_the_bundle_encoding() {
             .collect(),
         resource_schemas: all.clone(),
         transient_resources: Vec::new(),
-        layouts: all
-            .iter()
-            .map(|schema| (schema.component(), schemas().layout(schema.component()).unwrap()))
-            .collect(),
         ..records
     };
     every.check().unwrap();
@@ -213,9 +207,9 @@ fn the_schema_table_is_the_bundle_encoding() {
 /// test above still holds, so such an upgrade re-pins this one (README: a save's identity
 /// is its content, never the file's bytes).
 const GOLDEN: &str = concat!(
-    // The preamble: magic, format 1, zero, a block of 103 bytes.
+    // The preamble: magic, format 2, zero, a block of 103 bytes.
     "4c534156",
-    "0100",
+    "0200",
     "0000",
     "6700000000000000",
     // The header: engine 1.2.3, schema hash, tick 77, counter 9, one entry.
@@ -225,24 +219,24 @@ const GOLDEN: &str = concat!(
     "0900000000000000",
     "01000000",
     // The entry: region 5, seed, baseline hash, an overlay and its digest, offset 119,
-    // 180 bytes compressed, 297 decompressed, the section's hash.
+    // 178 bytes compressed, 269 decompressed, the section's hash.
     "0500000000000000",
     "4433221100000000",
-    "1e4ae5a43cbaada1",
+    "9eb05cc63e68518b",
     "01",
-    "95aaa7275b18c190",
+    "b18a3bf915508f54",
     "7700000000000000",
-    "b400000000000000",
-    "2901000000000000",
-    "13c283a5d99a6df2",
+    "b200000000000000",
+    "0d01000000000000",
+    "54a26b66a56745b3",
     // The block's hash.
-    "2c3ff36681308ef2",
+    "b486175fce555a21",
     // The section: one zstd frame.
-    "28b52ffd602900550500a4060500443322111e4ae5a43cbaada1016c0000004c4f564c010000002e56cab3",
-    "f382b2fe040000000203074d00008095aaa7275b18c190d16d465f758a0a32afd58182e37d7a5f080809",
-    "224213b3a1896277037cc96c20349a2217f8063b7ab0cc619e0f0a5ff9b74020911b002343f854843f35",
-    "c730e69a52004c80af8c03c78206f10b1a5f22a20a0b27b99c21209c54247c26003b6039e61888b012e4",
-    "25f03c99c734c462c900b0",
+    "28b52ffd600d00450500c4060500443322119eb05cc63e68518b01740000004c4f564c020000002e56cab3",
+    "f382b2fe040000000f0a5ff9b74020910103074d000080b18a3bf915508f54d16d465f758a0a327cc96c20",
+    "349a2217afd58182e37d7a5f08000000f8063b7ab0cc619e0809224213b3a189627719001c63a42a01c402",
+    "3cc15cb029298b83e46778feb21cd50a387f72ee81c55a3dd3e921e662562b7222ec0cccb4f462799ecc63",
+    "1a62b1640058",
 );
 
 #[test]

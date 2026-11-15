@@ -3,10 +3,10 @@
 //! order.
 //!
 //! The binary keeps no historical layouts. A document carries the schema its values were
-//! written with (version, size, field ID to offset and size) and a save carries the layout
-//! digest beside it, so a value is decoded into its fields by ID under that schema, each
-//! registered step rewrites the fields from one version to the next, and the result is
-//! assembled under the registry's layout by field ID and validated.
+//! written with (version, size, layout digest, field ID to offset and size), so a value is
+//! decoded into its fields by ID under that schema, each registered step rewrites the
+//! fields from one version to the next, and the result is assembled under the registry's
+//! layout by field ID and validated.
 
 use std::collections::BTreeMap;
 use std::collections::btree_map::Entry;
@@ -15,11 +15,12 @@ use std::sync::Arc;
 use bytemuck::{CheckedBitPattern, NoUninit};
 use lactose_bundle::{ComponentData, ComponentSchema, Overlay, Record};
 use lactose_core::{ComponentKey, Error, ErrorKind, FieldId, Result};
+use lactose_ecs::document_schema;
 use lactose_reflect::{Persistence, TypeInfo, TypeRole};
 
 use crate::codec::invalid;
 use crate::diff::unknown;
-use crate::schema::{LayoutDigest, SchemaTable, document_schema};
+use crate::schema::SchemaTable;
 
 /// One migration step: a function over the fields of a value at version `from` that
 /// leaves them at version `from + 1`.
@@ -191,14 +192,13 @@ impl Migrations {
         self.steps.is_empty()
     }
 
-    /// Brings `bytes`, one value of `info`'s type written under `schema` with the layout
-    /// digest `layout`, to the registry's layout: the bytes of a valid value of the type
-    /// as `info` describes it.
+    /// Brings `bytes`, one value of `info`'s type written under `schema`, to the registry's
+    /// layout: the bytes of a valid value of the type as `info` describes it.
     ///
     /// The rule, in order:
     ///
     /// - `info.persistence()` is `Transient`: the all-zero value of `info`'s size, whatever
-    ///   `schema`, `layout` and `bytes` say. A transient value is never saved (architecture
+    ///   `schema` and `bytes` say. A transient value is never saved (architecture
     ///   section 15.1): a save carries its presence, the loader zeroes it, and a layout
     ///   change to a type that stays transient breaks no save, needs no bump and no step,
     ///   and runs no check (a type made persistent since the save is read by the rules
@@ -206,9 +206,10 @@ impl Migrations {
     ///   [`Loader::migrate`](crate::Loader::migrate)).
     /// - `schema.schema_version()` greater than `info.version()`: `VersionMismatch`, a
     ///   newer save than the build.
-    /// - Equal versions: `layout` equal to [`LayoutDigest::of`]`(info)` is the fast path
+    /// - Equal versions: `schema` equal to `lactose_ecs::document_schema(info)`, its
+    ///   [`layout_digest`](ComponentSchema::layout_digest) included, is the fast path
     ///   (architecture section 15.4), `bytes` unchanged with no step and no validation
-    ///   here; a different digest is `VersionMismatch`, a layout changed without a version
+    ///   here; a different schema is `VersionMismatch`, a layout changed without a version
     ///   bump (a nested reorder, renumbered discriminants, a same-size type change: what
     ///   the document schema cannot see, which the reflection macros cannot see either,
     ///   so this is where it is caught, and the build-time guard D129 names is what keeps
@@ -229,7 +230,6 @@ impl Migrations {
         &self,
         info: &TypeInfo,
         schema: &ComponentSchema,
-        layout: LayoutDigest,
         bytes: &[u8],
     ) -> Result<Vec<u8>> {
         let name = info.name();
@@ -257,7 +257,7 @@ impl Migrations {
             )));
         }
         if from == to {
-            if layout != LayoutDigest::of(info) || *schema != document_schema(info)? {
+            if *schema != document_schema(info)? {
                 return Err(mismatch(format!(
                     "`{name}` changed its layout at version {to} without a version bump"
                 )));
@@ -320,9 +320,8 @@ impl Migrations {
 
     /// Brings every value `overlay` carries to the registry's schemas: each component of a
     /// `Spawn`, `SpawnFromBaseline` or `AddComponent` record through [`migrate`](Self::migrate)
-    /// under the overlay's schema of that component and the digest `layouts` holds for it,
-    /// and the overlay rebuilt against the same baseline hash with the table's schemas. An
-    /// overlay whose every carried type is at the registry's version and digest, a
+    /// under the overlay's schema of that component, and the overlay rebuilt against the same baseline hash with the table's schemas. An
+    /// overlay whose every carried type is at the registry's schema, digest included, a
     /// transient type whose overlay schema equals the table's counting as such, is
     /// returned as the same `Arc`, equal by content and by digest, so a client's cached
     /// copy still matches; a migrated overlay is a new document with a new digest.
@@ -344,8 +343,8 @@ impl Migrations {
     /// `Arc`; [`Loader::migrate`](crate::Loader::migrate) makes it `None`.
     ///
     /// Fails as [`migrate`](Self::migrate) fails; with `NotFound` for a component the table
-    /// does not know (a removed type: never dropped silently); with `InvalidData` for a
-    /// carried component `layouts` lacks; and with `Unsupported` for a `SetField` record of
+    /// does not know (a removed type: never dropped silently); and with `Unsupported` for a
+    /// `SetField` record of
     /// a persistent component whose version or digest differs, since one field cannot be
     /// migrated without the rest of its value (this crate's diff never writes a `SetField`,
     /// so none is in a save it wrote; one at the registry's version and digest passes
@@ -354,7 +353,6 @@ impl Migrations {
     pub fn migrate_overlay(
         &self,
         overlay: &Arc<Overlay>,
-        layouts: &BTreeMap<ComponentKey, LayoutDigest>,
         schemas: &SchemaTable,
     ) -> Result<Arc<Overlay>> {
         let mut plans = BTreeMap::new();
@@ -365,17 +363,8 @@ impl Migrations {
                 Persistence::Derived => Plan::Drop,
                 Persistence::Transient if schemas.schema(component) == Some(schema) => Plan::Keep,
                 Persistence::Transient => Plan::Zero,
-                Persistence::Persistent => {
-                    let layout = *layouts.get(&component).ok_or_else(|| {
-                        invalid(format!("no layout digest for `{}`", info.name()))
-                    })?;
-                    let current = schemas.saved(component).expect("a persistent type is saved");
-                    if *schema == current.schema && layout == current.layout {
-                        Plan::Keep
-                    } else {
-                        Plan::Migrate(info, layout)
-                    }
-                }
+                Persistence::Persistent if schemas.schema(component) == Some(schema) => Plan::Keep,
+                Persistence::Persistent => Plan::Migrate(info),
             };
             plans.insert(component, plan);
         }
@@ -401,9 +390,9 @@ impl Migrations {
                     let size = schemas.saved(data.component).expect("saved").schema.element_size();
                     vec![0; size as usize]
                 }
-                Plan::Migrate(info, layout) => {
+                Plan::Migrate(info) => {
                     let schema = overlay.schema(data.component).expect("a carried component");
-                    let mut bytes = self.migrate(info, schema, layout, &data.bytes)?;
+                    let mut bytes = self.migrate(info, schema, &data.bytes)?;
                     schemas.saved(data.component).expect("saved").canonicalise(&mut bytes);
                     bytes
                 }
@@ -435,7 +424,7 @@ impl Migrations {
                         Plan::Keep => record.clone(),
                         // A transient value loads zeroed, so a field of one says nothing.
                         Plan::Drop | Plan::Zero => continue,
-                        Plan::Migrate(info, _) => {
+                        Plan::Migrate(info) => {
                             return Err(Error::new(
                                 ErrorKind::Unsupported,
                                 format!(
@@ -460,9 +449,9 @@ impl Migrations {
 enum Plan {
     /// At the registry's version and digest, or transient under the table's schema.
     Keep,
-    /// Persistent at another version or digest: through [`Migrations::migrate`] under the
-    /// digest the records carry.
-    Migrate(&'static TypeInfo, LayoutDigest),
+    /// Persistent under another schema, at another version or digest: through
+    /// [`Migrations::migrate`] under the overlay's schema.
+    Migrate(&'static TypeInfo),
     /// Transient under another schema: zeroes of the registry's size.
     Zero,
     /// Derived now: never from a document.

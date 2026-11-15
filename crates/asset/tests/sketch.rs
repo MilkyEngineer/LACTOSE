@@ -411,6 +411,6 @@ fn the_log_target_is_the_codename() {
 fn the_format_version_and_the_baseline_kind_are_pinned() {
     assert_eq!(PACK_FORMAT_VERSION, 1);
     assert_eq!(RegionBaseline::KIND, AssetKind::from_name("region_baseline"));
-    assert_eq!(RegionBaseline::FORMAT_VERSION, 1);
+    assert_eq!(RegionBaseline::FORMAT_VERSION, 2);
     assert_ne!(RegionBaseline::KIND, SpawnTable::KIND);
 }
