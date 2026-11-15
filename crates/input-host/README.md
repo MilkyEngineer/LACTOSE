@@ -123,7 +123,7 @@ slot and changes nothing the crate ships.
   late latch reads immediately before submit. `publish` and `read` never lock; a reader
   waits only while a publish is in flight (six stores), which a descheduled publisher can
   stretch to a scheduling quantum. The slot is a sequence-locked copy of the sample's six
-  32-bit words, as `net-api`'s interpolation buffer is. `publish`: compare-exchange
+  32-bit words, as `net-host`'s interpolation buffer is. `publish`: compare-exchange
   (`Acquire`) the sequence from even to odd, then `fence(Release)`, then the words
   `Relaxed`, then store the next even value (`Release`); so a publisher may wait for another
   publisher but never for a reader, two concurrent publishers cannot interleave their words,

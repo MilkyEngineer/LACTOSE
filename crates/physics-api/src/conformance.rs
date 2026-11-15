@@ -97,7 +97,7 @@ pub struct ConformanceReport {
 /// and the region is frozen for one tick and thawed; every write, command, freeze and thaw
 /// described as after the restore happens at the same ticks in the first run. Every step
 /// takes `TickInput::default()` (the mode changes go through `world_mut`, tests only).
-/// After tick [`SNAPSHOT_TICK`] a `World::snapshot` and a [`snapshot`](crate::snapshot) are
+/// After tick [`SNAPSHOT_TICK`] a `World::snapshot` and a [`snapshot`] are
 /// taken; after tick [`TICKS`] both are restored, through the backend's
 /// [`restore_copy`](PhysicsBackend::restore_copy), and the run continues to [`TICKS`]
 /// again. After every tick of both runs, and after the restore, a further snapshot's copy

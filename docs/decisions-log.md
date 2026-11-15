@@ -2450,7 +2450,7 @@ editorial pass rather than one taken from a review.
     is every `ChaosConfig` flag plus `record`, built by the test's glue; `run_recorded` records
     `(tick, hash)` after every step; test crates include the protocol module by `#[path]` and
     dev-depend on `lactose-task` until the protocol module moves, after which one test-support
-    crate outside the boundary, `lactose-sour`, holds the glue; `[harness]` lists `lactose-sim`
+    crate outside the boundary, `lactose-harness`, holds the glue; `[harness]` lists `lactose-sim`
     until `lactose-app-headless` exists.
   - *`lactose-ecs` re-exports `Executor`*, which reaches every boundary crate; the boundary lint
     file bans what a boundary crate must not do with it (`frame_worker_count`, `slot_count`,
@@ -4318,7 +4318,7 @@ relayed by an event when it acts on another body** (§6.1, §10, `lactose-ecs`,
     D119's 0.8 µs at 100k rows).
   - Named and deferred: blend spaces, layers and additive clips, IK, getting up from a ragdoll
     (the root moved to the hips included), bone rows in a networked session (`net-api`'s
-    marker, `net-host`'s gather skip, `persist`'s relevance filter), bone rows in the
+    marker and its gather skip, `persist`'s relevance filter), bone rows in the
     prediction world (a predicted ragdoll and predicted hits on bones), `Joint::contacts`,
     remote phase interpolation (`net-host`), clip compression, the SOUR test and `[harness]`
     entry, `tracing` at target `anim`.

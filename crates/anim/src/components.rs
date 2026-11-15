@@ -715,8 +715,9 @@ pub struct Bones {
 impl Bones {
     /// Records, on `cmd`, the spawn of `owner`'s bone rows from `skeleton`, placed by `root`
     /// at `pose` (the character's current [`SimPose`], or its rest pose), and the write of
-    /// this component onto `owner` naming them. For every bone with a [`BoneBody`]: a row
-    /// with `Transform` (the bone's world pose, its rotation normalised), the body's
+    /// this component onto `owner` naming them. For every bone with a
+    /// [`BoneBody`](crate::BoneBody): a row with `Transform` (the bone's world pose, its
+    /// rotation normalised), the body's
     /// `RigidBody` made [`kinematic`](lactose_physics_api::RigidBody::kinematic), its
     /// `Collider`, `OwnedBy` the owner and a [`BoneLink`] back to it (the physics
     /// write-back adds a `Velocity` at the first step that sweeps it); and for every such

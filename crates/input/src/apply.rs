@@ -27,7 +27,7 @@ pub mod sets {
 /// The player's own entity: the first key of [`World::claimed`]`(player)`, which yields
 /// the rows with [`ClaimedBy`](lactose_ecs::ClaimedBy) for `player` in ascending origin-key
 /// order from the world's claim index, whose row also carries
-/// [`StreamingAnchor`](lactose_sim::StreamingAnchor) by [`World::get`]. The session
+/// [`StreamingAnchor`] by [`World::get`]. The session
 /// applier writes the anchor on the server and `lactose-predict` writes it on the local
 /// player in the prediction world; never a side table (`crates/sim/README.md`, "The input
 /// sync point"), which a rollback would leave stale. With two such rows (a game's bug) the

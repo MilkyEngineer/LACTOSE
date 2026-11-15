@@ -6,7 +6,7 @@
 //!
 //! The check reads one shape of the job and refuses any other instead of reading it: a matrix
 //! of `include` alone, no `if` or `defaults` on the job or `defaults` on the workflow, and one
-//! item of the job's one `steps` list that uses `matrix.args`, [`RUN`], with only `env` beside
+//! item of the job's one `steps` list that uses `matrix.args`, `RUN`, with only `env` beside
 //! its `run`. Each entry names one
 //! workspace member with a plain `-p NAME`, and its targets with `--lib`, `--test` and `--doc`
 //! (a package outside `[miri_split]` may name none). The job's other steps are not read.
@@ -18,7 +18,7 @@
 //! followed twice in its mapping, are refused. An entry's `args` are split as the run
 //! step's shell splits them, and its `--test` patterns are matched as cargo matches them: a
 //! name with none of `*?[]` exactly, any other as a pattern of the `glob` crate (see
-//! [`Pattern`]).
+//! `Pattern`).
 
 use std::collections::BTreeMap;
 

@@ -506,9 +506,6 @@ which `build`'s `derived` check does not see.
   milestone 4, a `lactose-sim` addition (`SessionEvent::Ready { region }` or a `TickInput`
   field); `lactose-net-host`'s `ClientReady` is the message and `ClientInterest::ready`
   the network's copy only.
-- A `lactose-predict` build check that prediction-world systems read only replicated or
-  derived components: a persistent component that is not replicated is never corrected,
-  so a prediction system reading it diverges silently.
 - The packer, the byte encodings, the jitter window and the per-client input queue, the
   clock-sync estimator, the region-origin table: `lactose-net` and `lactose-net-host`.
 - The interpolation of anything but a translation and a rotation: `lactose-net-host`.

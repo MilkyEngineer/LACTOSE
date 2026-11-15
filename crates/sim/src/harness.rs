@@ -4,8 +4,8 @@
 //! outside the boundary that tests depend on; this module is the deterministic side, in
 //! terms of the world and executor types alone, so the glue between the two is a few lines
 //! in each test crate's common module (the README shows them, and `tests/sour_glue.rs`
-//! compiles them) until one test-support crate outside the boundary, `lactose-sour`, holds
-//! the glue once the protocol module moves.
+//! compiles them) until one test-support crate outside the boundary, `lactose-harness`,
+//! holds the glue once the protocol module moves.
 //!
 //! A test, in order: reads its session; builds the executor with the session's worker
 //! count and, under a chaos seed, a `ChaosConfig` with every perturbation and recording on;

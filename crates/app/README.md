@@ -319,7 +319,7 @@ root")
   folds it, the first of which carries `Some(REAL_TIME)` and pops both frames.
 
 **The client's frame** (architecture sections 9.2, 9.4 and 14; `crates/predict/README.md`,
-"The loop `app` writes"; `crates/net-api/README.md`, "Staged frames")
+"The loop `app` writes"; `crates/net-api/README.md`, "The staged frame")
 
 - `Client::push(frame)` is `StagedInbox::push` on the prediction world's inbox, between
   runs; `false` is logged and enters nothing. The replicated world's inbox is `net`'s at

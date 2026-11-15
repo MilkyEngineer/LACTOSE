@@ -367,7 +367,7 @@ impl core::fmt::Debug for InterpolationWriter {
     }
 }
 
-/// The reader side, the `net-api` resource of architecture section 5.3: the presentation
+/// The reader side, the `net-host` resource of architecture section 5.3: the presentation
 /// schedule holds one and samples every frame. Cloneable; any number of threads may
 /// sample at once without waiting on one another, and no sample allocates. A sample of a
 /// slot the writer is writing retries until the write ends: a write stores at most the
