@@ -8,7 +8,7 @@
 //! - **Sleeper**: [`Sleep::announce`] (set the bit, full fence), re-check every source of
 //!   work, then either [`Sleep::cancel`] or [`Sleep::park`].
 //! - **Waker**: make the work visible, then [`Sleep::notify_one`] (full fence, read the bits,
-//!   claim one by clearing it) and unpark the claimed worker.
+//!   claim one by clearing it) and wake the claimed worker with [`Sleep::wake_worker`].
 //!
 //! The two fences are what make this sound: whichever fence comes first in the global order,
 //! the other side's later read sees the earlier write. Either the sleeper's re-check sees the
@@ -16,13 +16,14 @@
 //! (`crossbeam-deque`) with a plain release store, which is why the protocol brings its own
 //! fences and does not lean on the orderings of the stores around them.
 //!
-//! A cleared bit is the wake-up. The unpark that follows only cuts the park short, so a park
-//! token that arrives late, or that belongs to an earlier wake-up, costs one more trip round
-//! a loop and nothing else.
+//! A cleared bit is the wake-up. The wake that follows only cuts the park short, so a park
+//! token or a timed wait's signal that arrives late, or that belongs to an earlier wake-up,
+//! costs one more trip round a loop and nothing else.
 
 use std::time::{Duration, Instant};
 
-use crate::sync::{AtomicU64, Ordering, fence, park, park_timeout};
+use crate::span::TARGET;
+use crate::sync::{AtomicU64, Ordering, TimedPark, fence, park};
 
 const BITS: usize = u64::BITS as usize;
 
@@ -32,25 +33,69 @@ const BITS: usize = u64::BITS as usize;
 /// the timeout, about a quarter of it at user-interactive priority and half at default. A
 /// keeper that asked for the whole 16.7 ms to the next tick woke milliseconds late. Asking
 /// for 0.6 of what is left keeps every return before the deadline even at half leeway, and
-/// the remaining steps shrink geometrically: three to five parks per tick. Under loom and
-/// Miri there is no real clock, so one park as before.
+/// the remaining steps shrink geometrically: three to five parks per tick. Windows has no
+/// such leeway and keeps the step, so every platform runs one loop. Under loom and Miri
+/// there is no real clock, so one park as before.
 const TIMER_STEP: f64 = if cfg!(any(feature = "loom", miri)) { 1.0 } else { 0.6 };
 
 /// How close to a deadline a timed park stops parking and spins instead, re-checking its
 /// bit. About 11 µs of spinning per tick at 60 Hz, which is what puts the wake within a
-/// few microseconds of the deadline.
-const TIMER_SPIN: Duration =
-    Duration::from_micros(if cfg!(any(feature = "loom", miri)) { 0 } else { 50 });
+/// few microseconds of the deadline. On Windows 500 µs: the high-resolution timer that ends
+/// a wait there overshoots by about half a millisecond, so the last wait must be asked to end
+/// that far ahead (D144).
+const TIMER_SPIN: Duration = Duration::from_micros(if cfg!(any(feature = "loom", miri)) {
+    0
+} else if cfg!(windows) {
+    500
+} else {
+    50
+});
 
 /// The sleep state of one worker pool.
 pub(crate) struct Sleep {
     /// Bit `w % 64` of word `w / 64` is set while worker `w` is asleep or about to be.
     words: Box<[AtomicU64]>,
+    /// Worker `w`'s timed wait, where the workers keep the timers; empty where they never
+    /// park with a deadline.
+    parks: Box<[TimedPark]>,
 }
 
 impl Sleep {
+    /// The sleep state of workers that never park with a deadline: the background pool's,
+    /// and the openers waiting at a gate.
     pub(crate) fn new(workers: usize) -> Self {
-        Self { words: (0..workers.div_ceil(BITS)).map(|_| AtomicU64::new(0)).collect() }
+        Self {
+            words: (0..workers.div_ceil(BITS)).map(|_| AtomicU64::new(0)).collect(),
+            parks: Box::new([]),
+        }
+    }
+
+    /// The sleep state of workers that keep the timers, the frame-critical pool's, with a
+    /// timed wait for each. A worker whose wait cannot be made, as on Windows before version
+    /// 1803, waits with `std::thread::park_timeout` instead, which is logged once.
+    pub(crate) fn with_timed_parks(workers: usize) -> Self {
+        let mut failed = 0u32;
+        let mut first_error = None;
+        let parks = (0..workers)
+            .map(|_| {
+                TimedPark::new().unwrap_or_else(|error| {
+                    failed += 1;
+                    first_error.get_or_insert(error);
+                    TimedPark::coarse()
+                })
+            })
+            .collect();
+        if let Some(error) = first_error {
+            tracing::warn!(
+                target: TARGET,
+                %error,
+                failed,
+                workers,
+                "the keeper's timed wait could not be made; those workers wait with a std \
+                 park_timeout, in whole milliseconds on Windows",
+            );
+        }
+        Self { parks, ..Self::new(workers) }
     }
 
     fn slot(&self, worker: usize) -> (&AtomicU64, u64) {
@@ -67,7 +112,7 @@ impl Sleep {
 
     /// Withdraws an announcement because the re-check found work.
     ///
-    /// A waker may already have claimed the bit. Its unpark then leaves a stale token, which
+    /// A waker may already have claimed the bit. Its wake then leaves a stale signal, which
     /// is harmless, and its notification is not lost: this worker is awake and about to look
     /// for work, which is all a notification asks for.
     pub(crate) fn cancel(&self, worker: usize) {
@@ -76,13 +121,15 @@ impl Sleep {
     }
 
     /// Parks `worker`, which must have announced, until a waker claims it or `deadline`
-    /// passes. Returns `false` only on a timeout that no waker raced.
+    /// passes. Returns `false` only on a timeout that no waker raced. Only `worker` calls
+    /// it, and with a deadline only where it has a timed wait ([`Sleep::with_timed_parks`]).
     ///
-    /// A timed park is a loop of shorter ones, each for [`TIMER_STEP`] of the time left,
-    /// with a spin over the last [`TIMER_SPIN`]. Every return from a park, early or on time,
-    /// goes through the same check of the bit and the clock, so a claim is never missed and
-    /// the deadline is never passed by more than the clock's resolution. Nothing about the
-    /// protocol depends on how many parks the wait takes.
+    /// A timed park is a loop of shorter waits ([`TimedPark::wait`]), each for
+    /// [`TIMER_STEP`] of the time left, with a spin over the last [`TIMER_SPIN`]. Every
+    /// return from a wait, early or on time, goes through the same check of the bit and the
+    /// clock, so a claim is never missed and a deadline is passed only by how late the last
+    /// wait returns, on Windows up to about a millisecond (D144). Nothing about the protocol
+    /// depends on how many waits it takes.
     pub(crate) fn park(&self, worker: usize, deadline: Option<Instant>) -> bool {
         let (word, bit) = self.slot(worker);
         while word.load(Ordering::SeqCst) & bit != 0 {
@@ -97,7 +144,10 @@ impl Sleep {
                     if left <= TIMER_SPIN {
                         core::hint::spin_loop();
                     } else {
-                        park_timeout(left.mul_f64(TIMER_STEP));
+                        self.parks
+                            .get(worker)
+                            .expect("only a worker with a timed wait parks with a deadline")
+                            .wait(left.mul_f64(TIMER_STEP));
                     }
                 }
             }
@@ -105,8 +155,39 @@ impl Sleep {
         true
     }
 
+    /// Wakes `worker`: ends its timed wait if it has one, then calls `unpark`, which unparks
+    /// its thread.
+    ///
+    /// Every wake of a worker that may be in this protocol goes through this, the pool's and
+    /// the loom models' alike: one the caller has just claimed ([`Sleep::notify_one`],
+    /// [`Sleep::announce_entry`], [`Sleep::notify`] returning `true`, [`Sleep::notify_all`]),
+    /// and one that claims nothing because another waker has. Besides this, only the wait's
+    /// own timer ends a timed wait: a waker that only unparked would leave the keeper on
+    /// Windows in its wait until the timer ends it, up to 0.6 of the time to its deadline
+    /// later. A spare signal costs one trip round [`Sleep::park`]: a worker that is awake, in
+    /// an untimed park or already claimed keeps it and takes it for a spurious wake in its
+    /// next timed wait.
+    ///
+    /// The claim is what the woken worker has to see, and on Windows the kernel orders it.
+    /// The release is `SetEvent`, made after the claim's `SeqCst` read-modify-write; the
+    /// acquire is the wait that the signal ends, followed by the `SeqCst` load of the bit in
+    /// [`Sleep::park`]. Two claims before one wait set the event twice and the wait resets
+    /// it once; that wait comes after the second `SetEvent` in the event's order, so it sees
+    /// both claims, and a bit load follows it. A wait the timer ends orders nothing; a claim
+    /// its bit load misses has set the event or will, which ends the next wait. This rests on
+    /// Microsoft's statement that the signal and wait functions are memory barriers. loom
+    /// cannot check it: loom 0.7.2's unpark joins the unparker's causality into the target
+    /// at once, and its `SeqCst` fence joins a global one, so the models pass with the loom
+    /// flag's swaps `Relaxed`.
+    pub(crate) fn wake_worker(&self, worker: usize, unpark: impl FnOnce()) {
+        if let Some(timed) = self.parks.get(worker) {
+            timed.wake();
+        }
+        unpark();
+    }
+
     /// Claims one sleeping worker, if there is one. The caller made work visible before the
-    /// call and unparks the returned worker after it.
+    /// call and wakes the returned worker after it ([`Sleep::wake_worker`]).
     #[must_use]
     pub(crate) fn notify_one(&self) -> Option<usize> {
         fence(Ordering::SeqCst);
@@ -131,14 +212,14 @@ impl Sleep {
     /// What a worker does after it queued an entry: claim a sleeper for it, unless the
     /// worker `kept` the entry for itself. A worker at the end of its job that releases
     /// several entries onto its own deque takes one of them as its next job; a sleeper woken
-    /// for that one would find it gone. The caller unparks the returned worker.
+    /// for that one would find it gone. The caller wakes the returned worker.
     #[must_use]
     pub(crate) fn announce_entry(&self, kept: bool) -> Option<usize> {
         if kept { None } else { self.notify_one() }
     }
 
     /// Claims `worker` if it is asleep. The caller changed something that worker waits for
-    /// before the call, and unparks it if this returns `true`.
+    /// before the call, and wakes it if this returns `true`.
     #[must_use]
     pub(crate) fn notify(&self, worker: usize) -> bool {
         fence(Ordering::SeqCst);
@@ -152,8 +233,17 @@ impl Sleep {
         self.words.iter().map(|word| word.load(Ordering::SeqCst).count_ones()).sum()
     }
 
-    /// Claims every sleeping worker and passes each to `unpark`.
-    pub(crate) fn notify_all(&self, mut unpark: impl FnMut(usize)) {
+    /// Whether `worker`'s bit is set, and whether its timed wait holds a signal, if it has
+    /// one: what a model's failure message names.
+    #[cfg(all(test, feature = "loom"))]
+    pub(crate) fn worker_state(&self, worker: usize) -> (bool, Option<bool>) {
+        let (word, bit) = self.slot(worker);
+        let set = word.load(Ordering::SeqCst) & bit != 0;
+        (set, self.parks.get(worker).map(TimedPark::is_signalled))
+    }
+
+    /// Claims every sleeping worker and passes each to `wake`.
+    pub(crate) fn notify_all(&self, mut wake: impl FnMut(usize)) {
         fence(Ordering::SeqCst);
         for (index, word) in self.words.iter().enumerate() {
             if word.load(Ordering::SeqCst) == 0 {
@@ -161,7 +251,7 @@ impl Sleep {
             }
             let mut bits = word.swap(0, Ordering::SeqCst);
             while bits != 0 {
-                unpark(index * BITS + bits.trailing_zeros() as usize);
+                wake(index * BITS + bits.trailing_zeros() as usize);
                 bits &= bits - 1;
             }
         }
@@ -209,5 +299,51 @@ mod tests {
         sleep.announce(0);
         assert!(!sleep.park(0, Some(Instant::now())));
         assert_eq!(sleep.notify_one(), None);
+    }
+
+    /// A wake that finds its worker in no timed wait leaves a signal behind: on Windows the
+    /// event stays set, and everywhere the park token. The next wait returns at once, and the
+    /// park takes that for what it is: its bit is still set and its deadline still ahead, so
+    /// it waits again and returns at the deadline, not before.
+    #[test]
+    fn a_stale_wake_does_not_end_a_timed_park_early() {
+        let sleep = Sleep::with_timed_parks(1);
+        sleep.wake_worker(0, || std::thread::current().unpark());
+        sleep.announce(0);
+        let deadline = Instant::now() + Duration::from_millis(20);
+        assert!(!sleep.park(0, Some(deadline)), "nothing claimed the worker");
+        assert!(Instant::now() >= deadline);
+    }
+
+    /// A claim ends a timed park whose deadline is an hour away. Its first wait is 36
+    /// minutes long, so on Windows, where an unpark does not end that wait, this fails
+    /// unless the claim's wake does.
+    #[test]
+    fn a_claim_ends_a_timed_park_an_hour_from_its_deadline() {
+        use std::sync::Arc;
+        use std::sync::mpsc::channel;
+
+        let sleep = Arc::new(Sleep::with_timed_parks(1));
+        let (parked, outcome) = channel();
+        let sleeper = {
+            let sleep = sleep.clone();
+            std::thread::spawn(move || {
+                sleep.announce(0);
+                let hour = Instant::now() + Duration::from_secs(3600);
+                let _ = parked.send(sleep.park(0, Some(hour)));
+            })
+        };
+        // Claimed once it has had time to reach its wait. A claim that lands before the
+        // sleeper's first look at its bit ends the park without a wait, which proves nothing;
+        // on a machine too slow for the pause the test proves less, never fails.
+        while sleep.announced() == 0 {
+            std::thread::yield_now();
+        }
+        std::thread::sleep(Duration::from_millis(if cfg!(miri) { 1 } else { 50 }));
+        assert!(sleep.notify(0));
+        sleep.wake_worker(0, || sleeper.thread().unpark());
+        let limit = Duration::from_secs(if cfg!(miri) { 600 } else { 60 });
+        assert_eq!(outcome.recv_timeout(limit), Ok(true), "the claim did not end the wait");
+        sleeper.join().unwrap();
     }
 }

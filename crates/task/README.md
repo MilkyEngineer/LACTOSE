@@ -150,6 +150,13 @@ and list what changed, because `lactose-ecs` is written against this surface.
   `Executor::platform`, never `std::thread` directly.
 - There is no timer thread. Frame-critical workers fire due timers when they look for work,
   and one sleeping worker at a time, the keeper, parks only until the earliest deadline.
+  On Windows its timed wait is a high-resolution waitable timer beside an event that every
+  wake of the worker sets (`Sleep::wake_worker`), and it spins the last 500 µs before a
+  deadline, because `std::thread::park_timeout` there waits in whole milliseconds on the
+  system's 15.6 ms timer tick and the finer timer overshoots by about half a millisecond
+  (D144); a worker whose event or timer cannot be made keeps `park_timeout`. A plain unpark
+  does not end that wait, so a new waker of a worker that may be asleep goes through
+  `Sleep::wake_worker`; a spare wake costs one trip round the park loop.
   A worker that fires timers wakes the ones due when it looks in deadline order, ties in the
   order they were registered; workers that fire at the same time interleave theirs. That
   orders one worker's wake-ups, not the tasks: a woken task is scheduled as below, and a
@@ -225,7 +232,7 @@ it is.
 |---|---|
 | Makespan divided by its lower bound | at most 1.25 at P50 and 1.5 at P99 |
 | Wake latency (push to an idle pool until the job starts) | under 35 µs at P99: the floor on macOS is the cores leaving deep idle, 24 to 29 µs at P99 with every wait primitive |
-| Timer wake (a tick deadline until the frame-critical task that slept until it resumes, at 60 Hz) | under 20 µs at P99 |
+| Timer wake (a tick deadline until the frame-critical task that slept until it resumes, at 60 Hz) | under 20 µs at P99; on Windows under 1 ms (D144) |
 | Steal (one successful steal, including the split) | under 1 µs |
 
 The lower bound of a run is the larger of two numbers: the heaviest dependency chain, summing
@@ -258,6 +265,9 @@ Correctness:
   `block_in_place` gate (`src/gate.rs`), the wake that is skipped for a kept entry, the
   timer keeper's hand-off, the task kept by the worker that fires its timer, and the
   quiescence of a cancelled run (`src/quiesce.rs`). The models call the shipped functions.
+  Under loom a timed park waits on a flag that only `Sleep::wake_worker` sets and that an
+  unpark alone does not satisfy, as the Windows wait is not ended by an unpark, so a waker
+  that skips it fails the keeper hand-off model.
   The deque is a vetted dependency and is not modelled. loom is enabled by a `loom` Cargo
   feature on this crate that switches an internal `sync` shim, and run with
   `cargo test -p lactose-task --features loom --release`. Never use loom's documented
@@ -286,7 +296,10 @@ Correctness:
   bounds the wait (`tests/common`), so a regression it looks for fails it with a message
   instead of hanging it. The wake-up tests (`tests/graph.rs`, `tests/scope.rs`) release work
   while every worker sleeps and need all of them at once: a fork, and a thief's split, each
-  wake a sleeper.
+  wake a sleeper. `tests/tasks.rs` ends a keeper's wait for a timer an hour away by an
+  earlier timer, by pushed work and by shutdown, which on Windows only the event ends, and on
+  Windows holds the median lateness of fifty 2 ms deadlines under half a timer tick in one
+  of up to three batches.
 - `tests/abort.rs` re-runs itself as a subprocess and checks that a panic in a job, a
   finalize, a scope child, a scope body, a task or the drop of a cancelled task's future
   aborts the process, and that an unfollowable replay log does.

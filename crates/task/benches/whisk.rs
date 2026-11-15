@@ -14,7 +14,7 @@
 //! | Variable | Meaning | Default |
 //! |---|---|---|
 //! | `WHISK_BENCH_RUNS` | Graph runs per shape and condition | 2000 |
-//! | `WHISK_BENCH_MACHINE` | Machine name used in the file name | derived from the CPU name |
+//! | `WHISK_BENCH_MACHINE` | Machine name used in the file name | derived from the CPU name, on Windows from `PROCESSOR_IDENTIFIER` |
 //! | `WHISK_BENCH_OUT` | Output directory | `docs/results` |
 //!
 //! On macOS the benchmark puts its own process in the foreground-application task role,
@@ -40,11 +40,12 @@
 //!
 //!   The process's CPU time per run is reported next to the work a run draws. The
 //!   difference is what the executor burns around the jobs, mostly idle workers scanning
-//!   before they park.
+//!   before they park. On Windows the CPU figures count cycles and are a share of one busy
+//!   core at the clock measured at start, because Windows charges CPU time in 15.6 ms ticks.
 //! - **Timer wake.** From a tick deadline until the frame-critical task that slept until it
 //!   resumes, the way the timer root ticks: `sleep_until` one deadline after another, with
 //!   the pool otherwise idle, at a 2 ms period and at 60 Hz. The 60 Hz P99 is a pass
-//!   criterion of its own.
+//!   criterion of its own: 20 µs, and 1 ms on Windows (D144).
 //! - **Wake latency.** From just before a one-node graph is pushed to a parked pool until
 //!   its job starts. The push comes from a dedicated thread at frame-critical priority. The
 //!   CPU the process uses during this phase, in which it does nothing but wake up five
@@ -90,7 +91,9 @@ const RATIO_P99_LIMIT: f64 = 1.5;
 /// primitive; 35 µs leaves room for the executor's own part. The start of a tick, below,
 /// keeps 20 µs: the keeper is awake and spinning when the deadline comes.
 const WAKE_P99_LIMIT_NANOS: f64 = 35_000.0;
-const TIMER_P99_LIMIT_NANOS: f64 = 20_000.0;
+/// The start of a tick. On Windows 1 ms (D144): the high-resolution timer that ends the
+/// keeper's wait there overshoots by about half a millisecond.
+const TIMER_P99_LIMIT_NANOS: f64 = if cfg!(windows) { 1_000_000.0 } else { 20_000.0 };
 const TICK: Duration = Duration::from_micros(16_667);
 const STEAL_LIMIT_NANOS: f64 = 1_000.0;
 
@@ -355,10 +358,64 @@ fn process_cpu_seconds() -> Option<f64> {
     Some(seconds(usage.ru_utime) + seconds(usage.ru_stime))
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 fn process_cpu_seconds() -> Option<f64> {
     None
 }
+
+/// The CPU this process has used, all its threads, in seconds of one core kept busy at the
+/// clock [`calibrate_cpu_clock`] measured: a share of one busy core at that clock, not CPU
+/// time. Windows charges CPU time (`GetProcessTimes`) in whole timer ticks of 15.625 ms,
+/// too coarse for phases that wake for microseconds at a time, so this counts cycles.
+#[cfg(windows)]
+fn process_cpu_seconds() -> Option<f64> {
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    use windows_sys::Win32::System::WindowsProgramming::QueryProcessCycleTime;
+
+    let cycles_per_second = *CYCLES_PER_SECOND.get()?;
+    let mut cycles = 0u64;
+    // SAFETY: the pseudo handle of the current process is always valid, and `cycles` is a
+    // writable `u64` that outlives the call.
+    if unsafe { QueryProcessCycleTime(GetCurrentProcess(), &raw mut cycles) } == 0 {
+        return None;
+    }
+    Some(cycles as f64 / cycles_per_second)
+}
+
+/// The cycles a busy core counts per second, which turns Windows cycle counts into seconds.
+#[cfg(windows)]
+static CYCLES_PER_SECOND: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+
+/// Measures [`CYCLES_PER_SECOND`] on Windows: the largest rate of five 100 ms spins of this
+/// thread, the one least cut short by preemption. Called once, before any phase reads CPU.
+#[cfg(windows)]
+fn calibrate_cpu_clock() {
+    use windows_sys::Win32::System::Threading::GetCurrentThread;
+    use windows_sys::Win32::System::WindowsProgramming::QueryThreadCycleTime;
+
+    let thread_cycles = || {
+        let mut cycles = 0u64;
+        // SAFETY: the pseudo handle of the current thread is always valid, and `cycles` is
+        // a writable `u64` that outlives the call.
+        let read = unsafe { QueryThreadCycleTime(GetCurrentThread(), &raw mut cycles) };
+        (read != 0).then_some(cycles)
+    };
+    let spin = Duration::from_millis(100);
+    let rates = (0..5).filter_map(|_| {
+        let (start, before) = (Instant::now(), thread_cycles()?);
+        while start.elapsed() < spin {
+            core::hint::spin_loop();
+        }
+        let cycles = thread_cycles()?.checked_sub(before)?;
+        Some(cycles as f64 / start.elapsed().as_secs_f64())
+    });
+    if let Some(rate) = rates.reduce(f64::max).filter(|rate| *rate > 0.0) {
+        let _ = CYCLES_PER_SECOND.set(rate);
+    }
+}
+
+#[cfg(not(windows))]
+fn calibrate_cpu_clock() {}
 
 /// Kernel iterations per nanosecond on a frame-critical worker, from the fastest of several
 /// timed burns. Taking the fastest means anything that slows a job later makes it run
@@ -761,10 +818,33 @@ fn cpu_name() -> String {
             let line = info.lines().find(|line| line.starts_with("model name"))?;
             Some(line.split_once(':')?.1.trim().to_owned())
         })
+    } else if cfg!(windows) {
+        command_output(
+            "reg",
+            &[
+                "query",
+                r"HKLM\HARDWARE\DESCRIPTION\System\CentralProcessor\0",
+                "/v",
+                "ProcessorNameString",
+            ],
+        )
+        .and_then(|output| {
+            let line = output.lines().find(|line| line.contains("REG_SZ"))?;
+            Some(line.split_once("REG_SZ")?.1.trim().to_owned())
+        })
+        .filter(|name| !name.is_empty())
+        .or_else(processor_identifier)
     } else {
-        std::env::var("PROCESSOR_IDENTIFIER").ok()
+        processor_identifier()
     };
     name.filter(|name| !name.is_empty()).unwrap_or_else(|| "unknown CPU".to_owned())
+}
+
+/// Windows's description of the processor, such as `Intel64 Family 6 Model 154 Stepping 3,
+/// GenuineIntel`. The machine is named after it on Windows, not after the registry's model
+/// name, as `cargo xtask measure` names it.
+fn processor_identifier() -> Option<String> {
+    std::env::var("PROCESSOR_IDENTIFIER").ok()
 }
 
 /// The one-minute load average, where the system has one.
@@ -825,8 +905,16 @@ fn main() {
     let runs = std::env::var("WHISK_BENCH_RUNS")
         .ok()
         .map_or(2000, |runs| runs.parse().expect("WHISK_BENCH_RUNS must be a number"));
+    calibrate_cpu_clock();
     let cpu = cpu_name();
-    let machine = std::env::var("WHISK_BENCH_MACHINE").unwrap_or_else(|_| slug(&cpu));
+    let machine = std::env::var("WHISK_BENCH_MACHINE").unwrap_or_else(|_| {
+        if cfg!(windows) {
+            let identifier = processor_identifier().filter(|name| !name.is_empty());
+            slug(identifier.as_deref().unwrap_or("unknown CPU"))
+        } else {
+            slug(&cpu)
+        }
+    });
     let out_dir = std::env::var_os("WHISK_BENCH_OUT").map_or_else(
         || PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../docs/results"),
         PathBuf::from,
@@ -1081,6 +1169,13 @@ fn main() {
         "| Calibration | {rate:.4} kernel iterations per ns; serial check {calibration_check:.3} \
          (1.0 is exact) |"
     );
+    if cfg!(windows) {
+        let _ = writeln!(
+            summary,
+            "| Process CPU | cycles over a busy core's rate at start: a share of one busy core at \
+             that clock |"
+        );
+    }
     let _ = writeln!(summary, "| Runs per case | {runs} |\n");
     let _ = writeln!(summary, "## Makespan divided by its lower bound ({})\n", verdict(ratio_pass));
     let _ = writeln!(summary, "At most {RATIO_P50_LIMIT} at P50 and {RATIO_P99_LIMIT} at P99.\n");

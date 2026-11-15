@@ -203,11 +203,14 @@ pub(crate) struct Pool {
 }
 
 impl Pool {
-    fn new(stealers: Vec<Stealer<Entry>>, threads: Vec<Thread>) -> Self {
+    /// A pool of one worker per stealer. Workers that `keep_timers`, the frame-critical
+    /// pool's, get a timed wait each ([`Sleep::with_timed_parks`]); it is closed when the
+    /// pool is dropped.
+    fn new(stealers: Vec<Stealer<Entry>>, threads: Vec<Thread>, keep_timers: bool) -> Self {
         let workers = stealers.len();
         Self {
             injector: Injector::new(),
-            sleep: Sleep::new(workers),
+            sleep: if keep_timers { Sleep::with_timed_parks(workers) } else { Sleep::new(workers) },
             stealers: stealers.into(),
             threads: threads.into(),
             gate: Gate::new(workers),
@@ -234,18 +237,26 @@ impl Pool {
     /// `kept` it (see [`Sleep::announce_entry`]).
     fn announce_entry(&self, kept: bool) {
         if let Some(worker) = self.sleep.announce_entry(kept) {
-            self.threads[worker].unpark();
+            self.wake_worker(worker);
         }
     }
 
     /// Wakes `worker` whether it sleeps in the idle protocol or on a scope latch.
+    ///
+    /// A worker this does not claim is awake, parked on a latch, which waits untimed, or
+    /// claimed by another waker. It is woken all the same, timed wait included, so that it
+    /// does not wait for the other waker to get round to it.
     pub(crate) fn wake(&self, worker: usize) {
-        let _claimed = self.sleep.notify(worker);
-        self.threads[worker].unpark();
+        let _ = self.sleep.notify(worker);
+        self.wake_worker(worker);
     }
 
-    pub(crate) fn wake_all(&self) {
-        self.sleep.notify_all(|worker| self.threads[worker].unpark());
+    /// Wakes `worker`, timed wait included ([`Sleep::wake_worker`]). Every wake of a worker
+    /// that may be in the idle protocol goes through this, once per wake: after a claim of
+    /// that one worker, or, in `open_gate` and `Shared::shut_down`, for every worker after
+    /// a claim of every sleeper. A spare one costs a trip round [`Sleep::park`].
+    fn wake_worker(&self, worker: usize) {
+        self.sleep.wake_worker(worker, || self.threads[worker].unpark());
     }
 
     /// Unparks `worker`, which waits on a scope latch that has just been set.
@@ -284,10 +295,11 @@ impl Pool {
     /// Ends a `block_in_place` started with the same `reserved`.
     pub(crate) fn open_gate(&self, reserved: u32) {
         self.gate.open(reserved as usize, self);
-        self.wake_all();
-        // Openers that parked on their latch with nothing on their deque announced
-        // nothing; they find out by a plain unpark.
-        self.threads.iter().for_each(Thread::unpark);
+        // Claims every sleeper, then wakes every worker once: the sleepers just claimed,
+        // openers that parked on their latch with nothing on their deque and announced
+        // nothing, and workers another waker has claimed but may not have woken yet.
+        self.sleep.notify_all(|_| {});
+        (0..self.threads.len()).for_each(|worker| self.wake_worker(worker));
     }
 
     /// The wait of a scope's opener on this pool. See [`gate::wait_for_children`].
@@ -338,6 +350,7 @@ pub(crate) fn time_steals(
     let pool = Pool::new(
         vec![victim.stealer(), thief.stealer()],
         vec![std::thread::current(), std::thread::current()],
+        false,
     );
     let (filled, wait_filled) = std::sync::mpsc::channel::<usize>();
     let (stolen, wait_stolen) = std::sync::mpsc::channel::<Vec<u64>>();
@@ -423,8 +436,9 @@ impl Shared {
         handles: Vec<ThreadHandle>,
     ) -> Self {
         Self {
-            frame: Pool::new(frame.0, frame.1),
-            background: Pool::new(background.0, background.1),
+            // Only the frame-critical pool keeps the timers (`idle`).
+            frame: Pool::new(frame.0, frame.1, true),
+            background: Pool::new(background.0, background.1, false),
             platform,
             shutdown: AtomicBool::new(false),
             timers: Timers::new(),
@@ -619,9 +633,11 @@ impl Shared {
             replay.abandon();
         }
         for pool in [&self.frame, &self.background] {
-            pool.wake_all();
-            // A worker parked on a scope latch waits for a plain unpark, not a sleeper bit.
-            pool.threads.iter().for_each(Thread::unpark);
+            // Claims every sleeper, then wakes every worker once: the sleepers just claimed,
+            // workers parked on a scope latch, which have no sleeper bit, and workers
+            // another waker has claimed but may not have woken yet.
+            pool.sleep.notify_all(|_| {});
+            (0..pool.threads.len()).for_each(|worker| pool.wake_worker(worker));
         }
         // Once now, so nothing that waits on cancelled work has to wait for the joins,
         // which last as long as the longest running job; and once after them, for what

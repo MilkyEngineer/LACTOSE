@@ -5836,6 +5836,53 @@ relayed by an event when it acts on another body** (§6.1, §10, `lactose-ecs`,
   can be asked for less than a millisecond; D138's reading of the x86 session's tick start on
   Windows, and its "rules out a second attempt", which does not cover a lane for this known
   cause. Nothing of D113 or D138 on macOS or Linux.
+- Addendum (lane timer-windows, 2026-11-15; review rounds 1 and 2): built as decided, in
+  `lactose-task` alone. `TimedPark` (`crates/task/src/sync.rs`) has three forms: on Windows outside
+  loom and Miri an auto-reset event and a `CREATE_WAITABLE_TIMER_HIGH_RESOLUTION` timer that is not
+  manual-reset, the timer set before every wait and both waited on with `WaitForMultipleObjects`;
+  elsewhere and under Miri `std::thread::park_timeout`; under loom an `AtomicBool` swapped on both
+  sides, because loom's modification order is partial and lets a swap read past a plain store. Only
+  the frame-critical pool's `Sleep` holds them (`Sleep::with_timed_parks`), since only its workers
+  park with a deadline; the background pool and the gate's openers hold none. Every wake of a
+  worker that may be in the idle protocol goes through `Sleep::wake_worker`, which sets the
+  worker's event and then unparks it: at the pool's four claiming sites (`announce_entry`;
+  `Pool::wake`, whether or not its claim succeeds; `Pool::open_gate` and `Shared::shut_down`, each
+  of which claims every sleeper and then wakes every worker once) and at the models' eight call
+  lines. Without that, a worker another waker had claimed waited on Windows until that waker set
+  its event (review round 1: on an emulation of the Windows wait, with the claimer held 1.5 s
+  between its claim and its wake, a 20 ms timer fired 1.38 s late; under 2 ms with the fix). A
+  spare signal costs one trip round `Sleep::park`. That a woken worker sees the claim rests on the
+  kernel: `SetEvent` after the claim's `SeqCst` read-modify-write, and the wait that the signal
+  ends before the `SeqCst` bit load, which Microsoft documents as barriers and loom cannot check.
+  Failure to make a worker's handles is logged once per pool; a failed call is logged once per
+  worker, naming the call and what it costs. The lane's commit `580910d` holds the 50 µs spin on
+  Windows, and `f0b965c` sets 500 µs; the review rounds' fixes are `08ca8dd` and `c5ff381`. On the
+  M1 the benchmark at `7b2e2e8` and at `f0b965c`, at load 3.55 6.15 9.94 and 4.21 8.26 12.06
+  before, differs by noise only: 60 Hz timer P99 22.3 and 26.0 µs, wake P99 30.3 and 30.9 µs, and
+  process CPU 0.0107 and 0.0109 s a second at 60 Hz, equal at the wake and 2 ms rows. On the
+  Windows laptop all 86 `lactose-task` tests passed at the lane's two commits (brief 5, part 1),
+  and at `f0b965c` (brief 5, part 2):
+  - with the old wait put back (no timed park), only the defect test failed, at a median of
+    13.5 ms;
+  - with `SetEvent` skipped, three hour-away tests failed at 60 s, and
+    `a_later_timer_does_not_hold_an_earlier_one_back` was killed at 300 s.
+
+  Since review round 1 that last test fails at `LIMIT` on the emulation, and
+  `sleep::tests::a_claim_ends_a_timed_park_an_hour_from_its_deadline`, which claimed before its
+  sleeper reached the wait, pauses first; both are still to re-run on the laptop. Since review
+  round 2 the shutdown hour-away test fails at `LIMIT` on the emulation when `Shared::shut_down`'s
+  loop only unparks, which it did not while a `wake_all` before that loop also set the event. On
+  the Windows laptop (brief 5, part 3: `cargo xtask measure whisk` as `laptop-windows`, two
+  interleaved rounds of `7b2e2e8`, `580910d` and `f0b965c`, on mains power with other work running
+  and the processor 54 to 62% idle), the 60 Hz timer P99 was 15832.5 and 15740.7 µs at `7b2e2e8`,
+  706.9 and 862.7 µs at `580910d`, and 533.0 and 502.9 µs at `f0b965c`; the P50 was 4420.4 and
+  4388.6, 200.4 and 255.3, and 6.4 and 6.2 µs. `f0b965c`'s 60 Hz process CPU was 0.02481 and
+  0.02224 s a second against `580910d`'s 0.01433 and 0.01866, 0.0105 and 0.0036 above, both under
+  0.015, so neither condition of the rule holds: the spin stays at 500 µs and the figure at 1 ms.
+  At 2 ms the spin costs more: 0.229 and 0.199 s a second against 0.105 and 0.090. The wake and
+  makespan rows moved with the machine's other load, not the tree. These are `f0b965c`'s figures;
+  the review rounds' commits `08ca8dd` and `c5ff381` add a `SetEvent` on no path a measured phase
+  takes, beyond a timer that registers while its keeper is awake and still holds the watch.
 
 ## 10. Review history
 

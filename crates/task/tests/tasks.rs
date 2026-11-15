@@ -11,7 +11,7 @@ use core::task::{Context, Poll, Waker};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use common::{LIMIT, Node, executor, graph, must_finish, sized, wait_for};
+use common::{LIMIT, Node, executor, graph, let_workers_sleep, must_finish, sized, wait_for};
 use lactose_core::{AllocTag, ErrorKind, Result, ThreadClass};
 use lactose_task::{
     CoreTopology, Executor, Platform, StdPlatform, ThreadHandle, ThreadSpec, WorkerClass, yield_now,
@@ -239,8 +239,10 @@ fn sleep_until_resolves_at_its_deadline() {
 
 /// The keeper parks only until the earliest deadline, so a timer registered after a later
 /// one wakes the keeper and fires at its own deadline, not the later one's. Both timers are
-/// registered from this thread, which wakes no worker by running anything, so with the far
-/// timer an hour out, holding the near one back fails the wait.
+/// registered from the test's helper thread, which wakes no worker by running anything, so
+/// with the far timer an hour out, holding the near one back fails the wait. The executor
+/// lives on that thread, so a regression fails at [`LIMIT`] even when it leaves the keeper
+/// in a wait that the executor's drop joins.
 #[test]
 fn a_later_timer_does_not_hold_an_earlier_one_back() {
     struct Flag(AtomicBool);
@@ -250,24 +252,108 @@ fn a_later_timer_does_not_hold_an_earlier_one_back() {
         }
     }
 
-    let executor = executor(2, 1);
-    let mut far = core::pin::pin!(executor.sleep_until(Instant::now() + Duration::from_secs(3600)));
-    assert!(far.as_mut().poll(&mut Context::from_waker(Waker::noop())).is_pending());
-    // Lets a worker lie down as the far timer's keeper. If none has when the near timer
-    // registers, the near one is the earliest anyway: the test proves less, never fails.
-    std::thread::sleep(Duration::from_millis(10));
+    must_finish("a 20 ms timer registered after one an hour away", LIMIT, || {
+        let executor = executor(2, 1);
+        let mut far =
+            core::pin::pin!(executor.sleep_until(Instant::now() + Duration::from_secs(3600)));
+        assert!(far.as_mut().poll(&mut Context::from_waker(Waker::noop())).is_pending());
+        // Lets a worker lie down as the far timer's keeper. If none has when the near timer
+        // registers, the near one is the earliest anyway: the test proves less, never fails.
+        std::thread::sleep(Duration::from_millis(10));
 
-    let fired = Arc::new(Flag(AtomicBool::new(false)));
-    let waker = Waker::from(fired.clone());
-    let start = Instant::now();
-    let delay = Duration::from_millis(20);
-    let mut near = core::pin::pin!(executor.sleep_until(start + delay));
-    if near.as_mut().poll(&mut Context::from_waker(&waker)).is_pending() {
-        wait_for(&fired.0);
+        let fired = Arc::new(Flag(AtomicBool::new(false)));
+        let waker = Waker::from(fired.clone());
+        let start = Instant::now();
+        let delay = Duration::from_millis(20);
+        let mut near = core::pin::pin!(executor.sleep_until(start + delay));
+        if near.as_mut().poll(&mut Context::from_waker(&waker)).is_pending() {
+            wait_for(&fired.0);
+        }
+        assert!(near.as_mut().poll(&mut Context::from_waker(&waker)).is_ready());
+        assert!(start.elapsed() >= delay);
+        executor.shutdown();
+    });
+}
+
+/// A pool of one frame-critical worker lying down as the keeper of a timer an hour away,
+/// which the caller holds. The keeper's first wait is 0.6 of that, 36 minutes, so whatever
+/// ends it inside [`LIMIT`] is a wake. On Windows an unpark does not end that wait
+/// (`Sleep::wake_worker`, D144). If the worker has not lain down when the test acts, the
+/// test proves less, never fails.
+fn keeper_of_a_timer_an_hour_away() -> (Executor, Pin<Box<lactose_task::Sleep>>) {
+    let executor = executor(1, 1);
+    let mut far = Box::pin(executor.sleep_until(Instant::now() + Duration::from_secs(3600)));
+    assert!(far.as_mut().poll(&mut Context::from_waker(Waker::noop())).is_pending());
+    let_workers_sleep();
+    (executor, far)
+}
+
+#[test]
+fn an_earlier_timer_ends_the_keepers_wait_for_one_an_hour_away() {
+    let (executor, _far) = keeper_of_a_timer_an_hour_away();
+    let runner = executor.clone();
+    must_finish("a 20 ms timer behind one an hour away", LIMIT, move || {
+        runner.block_on(runner.sleep_until(Instant::now() + Duration::from_millis(20))).unwrap();
+    });
+    must_finish("the closing shutdown", LIMIT, move || executor.shutdown());
+}
+
+#[test]
+fn pushed_work_ends_the_keepers_wait_for_a_timer_an_hour_away() {
+    let (executor, _far) = keeper_of_a_timer_an_hour_away();
+    let runner = executor.clone();
+    let value = must_finish("a task pushed to the keeper", LIMIT, move || {
+        runner.block_on(runner.spawn(WorkerClass::FrameCritical, async { 7 })).unwrap()
+    });
+    assert_eq!(value, 7);
+    must_finish("the closing shutdown", LIMIT, move || executor.shutdown());
+}
+
+#[test]
+fn shutdown_ends_the_keepers_wait_for_a_timer_an_hour_away() {
+    let (executor, _far) = keeper_of_a_timer_an_hour_away();
+    must_finish("a shutdown that joins the keeper", LIMIT, move || executor.shutdown());
+}
+
+/// The defect of D144: on Windows the keeper's timed wait was `std::thread::park_timeout`,
+/// which waits in whole milliseconds and ends on the system's timer tick, 15.6 ms by
+/// default, so a 2 ms deadline fired about 14 ms late at the median. The high-resolution
+/// timer brings it under 1 ms. The bound of 7.8 ms, half a tick, sits a factor of seven
+/// from each, so only the defect fails it, and a median of fifty is not moved by a few
+/// deadlines that a loaded machine delays. A runner that starves a whole batch of fifty gets
+/// three: the test passes if any median is under the bound. A retry cannot pass the defect,
+/// which puts every deadline of every batch about 13 ms late; under an emulation of the old
+/// wait all three batches failed, at 13.6 ms.
+#[test]
+#[cfg(windows)]
+#[cfg_attr(miri, ignore = "the coarse wait is what Miri runs; its clock is the interpreter's")]
+fn a_two_millisecond_deadline_is_not_held_to_the_timer_tick() {
+    const DEADLINES: usize = 50;
+    const ATTEMPTS: usize = 3;
+    let executor = executor(1, 1);
+    let mut medians = Vec::with_capacity(ATTEMPTS);
+    for _ in 0..ATTEMPTS {
+        let sleeper = executor.clone();
+        let task = executor.spawn(WorkerClass::FrameCritical, async move {
+            let mut late = Vec::with_capacity(DEADLINES);
+            for _ in 0..DEADLINES {
+                let deadline = Instant::now() + Duration::from_millis(2);
+                sleeper.sleep_until(deadline).await.unwrap();
+                late.push(Instant::now().saturating_duration_since(deadline));
+            }
+            late
+        });
+        let runner = executor.clone();
+        let mut late = must_finish("fifty 2 ms deadlines", LIMIT, move || runner.block_on(task))
+            .expect("the task ran to its end");
+        late.sort();
+        let median = late[DEADLINES / 2];
+        if median < Duration::from_micros(7800) {
+            return must_finish("the closing shutdown", LIMIT, move || executor.shutdown());
+        }
+        medians.push((median, late));
     }
-    assert!(near.as_mut().poll(&mut Context::from_waker(&waker)).is_ready());
-    assert!(start.elapsed() >= delay);
-    executor.shutdown();
+    panic!("median lateness 7.8 ms or more in all {ATTEMPTS} batches, sorted: {medians:?}");
 }
 
 /// A worker that fires timers wakes the due ones in deadline order, ties in registration

@@ -5,10 +5,12 @@ comments rely on. The crate's tests run under Miri, with the stand-in deque desc
 `src/deque.rs`; the scope latch and the sleep protocol, which decide when the borrows below
 end, are modelled under loom.
 
-Architecture section 21 lists three reasons for unsafe here: deques, scope borrows and the
-panic guard. The deque itself is `crossbeam-deque` and needs no unsafe of ours beyond sending
-entries through it. The panic guard (`guard.rs`) turned out to need none: it is a value whose
-destructor aborts and which is forgotten on the normal path. What remains is below.
+Architecture section 21 lists the reasons for unsafe here: deques, scope borrows, the panic
+guard, task futures, core-topology queries, the keeper's timed wait on Windows, and the
+benchmark's and tests' process-CPU and task-role calls. The deque itself is
+`crossbeam-deque` and needs no unsafe of ours beyond sending entries through it. The panic
+guard (`guard.rs`) turned out to need none: it is a value whose destructor aborts and which
+is forgotten on the normal path. What remains is below.
 
 ## Scope borrows (`job.rs`, and the `Send` impl in `pool.rs`)
 
@@ -81,6 +83,37 @@ What follows from the first:
   is dropped in place, by `finish` or, for a task that lost its handle and every waker while
   suspended, by the cell's own destructor, which has exclusive access by `&mut self`.
 
+## The keeper's timed wait (`sync.rs`, Windows)
+
+`TimedPark` (`sync.rs`, Windows) holds two kernel handles, an auto-reset event and a
+waitable timer. A handle is a process-wide value and is valid on every thread. Every call
+made on them, `SetEvent`, `SetWaitableTimer` and `WaitForMultipleObjects`, is safe from any
+thread, concurrently with the others. Both handles are closed once, in `Drop`.
+
+- **`unsafe impl Send` and `unsafe impl Sync` for `TimedPark`.** A handle is a raw pointer
+  in `windows-sys`, so neither is derived. Both rest on the paragraph above. The one
+  condition memory safety needs is that a handle is open whenever a call is made on it, and
+  that comes from ownership: `Drop` has `&mut self`, so no other call is in progress or can
+  begin, and the pool owns the `TimedPark` for as long as any worker or waker can reach it.
+  `Drop` may run on a worker's thread as that worker exits. That only the owning worker sets
+  the timer and waits is a liveness rule, not a soundness one: a second waiter would only
+  mistime a wait.
+- The pool makes the handles when it is built, before any worker enters its loop, and they
+  live as long as the pool, so every wake and wait that reaches one through the pool finds it
+  open. Under Miri `TimedPark` is `std::thread::park_timeout` and makes no Windows call.
+- **Ordering.** Not a memory-safety matter, but the kernel carries it and no model checks
+  it, so it is stated here. A woken worker has to see the claim that woke it. The release is
+  `SetEvent`, made after the claim's `SeqCst` read-modify-write (`Sleep::wake_worker`); the
+  acquire is the wait that the signal ends, followed by the `SeqCst` load of the bit in
+  `Sleep::park`. Two claims before one wait set the event twice and the wait resets it once;
+  that wait comes after the second `SetEvent` in the event's order, so it sees both claims,
+  and a bit load follows it. A wait the timer ends orders nothing; a claim its bit load
+  misses has set the event or will, which ends the next wait. This rests on Microsoft's
+  statement that the signal and wait functions are memory barriers ("Synchronization and
+  Multiprocessor Issues"). loom cannot check it: loom 0.7.2's unpark joins the unparker's
+  causality into the target at once, and its `SeqCst` fence joins a global one, so the
+  models pass with the loom flag's swaps `Relaxed`.
+
 ## Operating-system queries (`platform.rs`)
 
 - macOS: `sysctlbyname` is called with a NUL-terminated name, a pointer to a live `i32` and
@@ -92,5 +125,17 @@ What follows from the first:
   and bounds every read by the buffer. No record is read through its declared type, whose
   size (that of its largest variant) is larger than a processor-core record.
 - Linux reads sysfs with safe code.
-- The benchmark (`benches/whisk.rs`) calls `getrusage` on Unix with a pointer to a zeroed
-  `rusage` and reads it only if the call succeeded.
+
+## Process-CPU and task-role calls (`benches/whisk.rs`, `tests/idle_cpu.rs`)
+
+- `getrusage` is called on Unix with a pointer to a zeroed `rusage`, which is read only if
+  the call succeeded: the benchmark returns nothing otherwise, and `tests/idle_cpu.rs`
+  asserts that it succeeded.
+- On Windows the benchmark calls `QueryProcessCycleTime` and `QueryThreadCycleTime` with the
+  pseudo handle of the current process or thread, which is always valid, and a pointer to a
+  live `u64`, which it reads only if the call succeeded.
+- On macOS the benchmark declares `task_policy_set` and `task_policy_get` from
+  `<mach/task_policy.h>` itself and calls them on the process's own task port with the
+  category flavor, whose policy is one `integer_t`: a pointer to one live `i32` with a count
+  of one, and for the query live out-pointers for the count and the default flag. The calls
+  write only through those pointers.
