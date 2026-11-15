@@ -682,8 +682,12 @@ and a restore rewrite the references of rows and region resources alone, so
 `World::insert_resource` does not build for a type that holds one (D142), and world-global
 persistent state is a resource of a pinned region. It runs at sync points, and a field-level
 diff is produced only on mismatch. Rapier's serialised bytes are shown order-stable: SOUR records
-their hash after the conformance run, equal across platforms in nightly 43703297881, so
-`PhysicsSnapshot::hash` may now join the world hash.
+their hash after the conformance run, equal across platforms in nightly 43703297881.
+`PhysicsSnapshot::hash` is recorded beside the world hash, as a stream of its own that SOUR
+compares in every mode, and is never folded into it: the bytes are the whole world's and a
+function of its row history (section 16), where the world hash is a region's, a function of its
+rows, and is compared between a prediction world and its server, whose solvers never agree
+(D145).
 
 The harness, named SOUR, runs every simulation test in these modes and fails on any mismatch:
 

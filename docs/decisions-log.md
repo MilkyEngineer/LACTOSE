@@ -5949,6 +5949,82 @@ relayed by an event when it acts on another body** (§6.1, §10, `lactose-ecs`,
   the review rounds' commits `08ca8dd` and `c5ff381` add a `SetEvent` on no path a measured phase
   takes, beyond a timer that registers while its keeper is awake and still holds the watch.
 
+**D145. The physics hash is recorded beside the world hash and never folded into it; the platform-library sites inside Rapier and parry are settled by what the backend builds and what the recorded scenes reach** (§8.2, §8.3, §10, §16, §22, `lactose-physics-api`, `lactose-physics-rapier`, `lactose-app`, `docs/plans/milestone-1.md`)
+- Why: nightly 43703297881 closed criteria 2, 3 and 7 and left three things open (`b2e2a41`):
+  which of the platform-library sites that `nm -u` found inside Rapier and parry the recorded
+  scenes reach; whether the snapshot contract's deserialisation claims hold; and section 8.3's
+  new sentence that `PhysicsSnapshot::hash` may join the world hash.
+  `docs/plans/physics-evidence-proposal.md` holds the trace, the reading and the figures; these
+  are the decisions.
+  - *The physics hash is recorded beside the world hash.* A recording test that steps a backend
+    records `PhysicsSnapshot::hash` of each world it steps as a stream of its own, under its own
+    name, at every tick, and SOUR compares it in every mode. `Simulation::hash` and
+    `Simulation::world_hash` stay functions of rows. The world hash is a region's, and the
+    backend's bytes are the whole world's. The bytes are a function of the row history
+    (section 16), and `Simulation::hash` is compared between worlds whose histories differ by
+    design: the netcode spike's baseline counts the ticks at which the prediction world's hash
+    equals the server's (35,197 of 35,553 for the dynamic capsule under the clock script,
+    `docs/results/spike-net-apple-m1-2026-11-15.md`), and a folded hash makes that count zero in
+    every scene. A fold would also move 8,711 of the 10,334 lines the nightly recorded at
+    `c50b688`, the spike's digest and the headless binary's hash, and put a backend write on
+    every hashed tick: about 215 µs on the spike's thrown scene and 69 ms beside the
+    physics-phase scene's 50,000 fixed boxes (a probe under load). Rules out a hook in
+    `lactose-sim` for a service's hash, a second rows-only hash, and one number for a world's
+    whole state: a caller that wants one hashes the two itself.
+  - *The recording lands in milestone 1, in tests alone*: lane `physics-records`, over the three
+    scenes of `lactose-physics-rapier`'s SOUR test, the spike's four and the headless run. The
+    backend's obligation of equal bytes on x86-64 and aarch64 (D119) is frozen and rests on one
+    value, the conformance run's; the nightly is the only place it is measured. A difference
+    between platforms in a physics stream where the rows agree is a finding and returns to the
+    planner.
+  - *The broad phase's `log2` is accepted.* All nine recorded scenes that step Rapier reach it,
+    through `Bvh::optimize_incremental`, and reach no other platform function from a step. Its
+    two values decide one rounded count. For every leaf count from 1 to 20,000,000 the rounded
+    expression stays 2.4e-7 or more from a boundary, and one ulp of `log2` moves it by less than
+    9.6e-17, so the count is the same for any `log2` within 2.5e9 ulp. Rules out a patch and a
+    recorded scene for it.
+  - *glamx's eigen decomposition is accepted for milestone 1 and gated to milestone 3.* No
+    recorded scene and none of the backend's tests reaches it. The backend gives a body one
+    collider or a unit ball's mass, never both, and builds a ball, a capsule or a cuboid, so no
+    sum and no shape keeps its result. One transition reaches it, a `RigidBody` row that gains
+    an offset or tilted `Collider`, and `Rapier::update` rebuilds the mass from zero in the same
+    call: the scene's bytes are unchanged with `acos` and `cos` perturbed. A test owed by
+    `physics-records` pins that order: a body that gains an offset, tilted collider reports,
+    from that tick on, the states of a body created with it. The body is pushed (an impulse and
+    a torque impulse) in the tick it gains the collider and lands on a floor, so that a dropped
+    closing rebuild fails it as a kept sum does. The lane that adds `ShapeKind::Mesh` or a
+    second collider on a body closes the route first, by a patch of glamx under section 8.2 or
+    by refusing the feature. Rules out the patch in milestone 1, which builds nothing that keeps
+    the result.
+  - *The joint motor's `sin`, the soft-body solver, the trimesh pseudo-normals,
+    `RevoluteJoint::angle` and `VectorExt::angle` are accepted as unreachable.* The `sin` is the
+    target of an angular motor on a joint that touches a multibody link, not a locked or limited
+    axis. The backend inserts impulse joints without motors, three shapes and no soft body; the
+    lint file bans the multibody inserts and both `angle` functions; a snapshot that holds a
+    multibody joint or a soft body is refused; a write and a copy refuse a shape the backend did
+    not build. Among boundary crates only `lactose-physics-rapier` may name `rapier3d-f64`, and
+    it exposes `backend(pool)` alone.
+  - *A lane that widens what the backend builds owes the trace.* A shape kind, a second collider
+    on a body, a joint motor, a multibody joint, a soft body or CCD: the lane runs the
+    platform-library trace over its tests and closes each site they newly reach, by a patch
+    under D123 or by refusing the feature, before a recorded scene is its only net.
+  - *The snapshot contract's deserialisation claims are closed.* No custom collider
+    `Deserialize` was needed: the shapes are exchanged inside an image of the collider set's
+    serde layout, and Rapier's sets derive `Deserialize`, with no hand-written impl in the
+    closure that calls a Rapier method, so decoding calls no setter. Three tests hold the claims
+    and fail under a restore mutated to wake a body or to replay a shape. No path a milestone 1
+    binary runs restores a world that holds a body from bytes: a slot restores the backend's
+    copy (D143), and the fresh solver restores the empty world's bytes (D124). The first such
+    restore is the journal checkpoint's, at milestone 4.
+- Driven by: nightly 43703297881 and `b2e2a41`; the planner's trace of the platform library's
+  callers on aarch64-apple-darwin, its arithmetic over the leaf counts, its perturbation probe
+  and its two mutations of the byte restore; the owner's answer of 16 November 2026, which chose
+  the recording from milestone 1.
+- Replaced: section 8.3's "so `PhysicsSnapshot::hash` may now join the world hash" (`b2e2a41`).
+  D119's "hashing the snapshot bytes" among its deferred items, as a join. D119's "until then
+  the property is unproven, not excused" for the sites this entry accepts; for the sign of zero
+  in SIMD `min` and `max` it stands.
+
 ## 10. Review history
 
 - **Revision 1** (`a29af04`): the design baseline.
