@@ -191,6 +191,23 @@ pub(crate) fn load_region(
             }
             info.validate(bytes)?;
         }
+        // A document names an owner by `NetId`, in a column or a record's component as in an
+        // `OwnershipChange`; the component's owner, unless a record replaced it, is stored as
+        // that record's is, by the rule of a `Server` world (D141).
+        if let Some(bytes) = row.components.get(&OwnedBy::KEY) {
+            let value: OwnedBy = bytemuck::checked::pod_read_unaligned(bytes);
+            match value.owner.get() {
+                None => {}
+                Some(StableKey::Net(owner)) => {
+                    row.owner.get_or_insert(Some(owner));
+                }
+                Some(other) => {
+                    return Err(invalid(format!(
+                        "a document's `ecs::owned_by` names {other:?}, which is not a `NetId`"
+                    )));
+                }
+            }
+        }
     }
 
     // Keys first, so an owner loaded in the same region resolves to its origin key.
@@ -243,7 +260,9 @@ pub(crate) fn load_region(
             Some(Some(owner)) => {
                 // An owner outside the document is stored by a `Server` world's rule
                 // (`World::exportable_owner`), which never refuses here: a `Net` key names a
-                // predicted origin only through its alias.
+                // predicted origin only through its alias, the alias maps being one
+                // bijection. An unbound `NetId` is stored as `Net`, which a later bind
+                // rewrites.
                 let owner = keys.get(&owner).copied().unwrap_or_else(|| {
                     world
                         .exportable_owner(world.canonical(StableKey::Net(owner)))

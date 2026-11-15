@@ -448,6 +448,14 @@ fn invalid(message: impl Into<std::borrow::Cow<'static, str>>) -> Error {
     Error::new(ErrorKind::InvalidData, message)
 }
 
+/// A `Server` world's refusal of an `OwnedBy` whose owner is a predicted origin with no
+/// alias (D141).
+fn no_net_id(owner: StableKey) -> Error {
+    invalid(format!(
+        "`OwnedBy` {owner:?} names a predicted entity with no `NetId` to be exported under"
+    ))
+}
+
 /// Entities, components, resources and regions, with their change state.
 ///
 /// A `World` is owned by the tick loop that runs its [`Schedule`](crate::Schedule), which
@@ -884,9 +892,13 @@ impl World {
     /// to `predicted`, in rows and region resources alike, so stored bytes are origin keys
     /// whatever the order of loads and inserts; a stored `Net` reference whose rewrite would
     /// close a cycle of owners is written empty instead and logged (README, Regions,
-    /// "Ownership is a forest"), so a bind never fails on ownership. Fails if `predicted` or
-    /// `net` is already bound to something else, or if `net` names a live entity of its
-    /// own, whose references a bind would redirect.
+    /// "Ownership is a forest"), so a bind never fails on ownership. In a `Server` world a
+    /// bind made while `predicted` is despawned inside the window (a re-bind of the pair it
+    /// holds among them) rewrites nothing: a reference under `net` is what the server's rule
+    /// stores for a despawned owner (D141), and `predicted`'s return rewrites it. Fails if
+    /// `predicted` or `net` is already bound
+    /// to something else, or if `net` names a live entity of its own, whose references a
+    /// bind would redirect.
     pub fn bind(&mut self, predicted: PredictionKey, net: NetId) -> Result<()> {
         let bound_net = self.aliases.by_predicted.get(&predicted);
         let bound_predicted = self.aliases.by_net.get(&net);
@@ -900,7 +912,13 @@ impl World {
         }
         self.aliases.by_predicted.insert(predicted, net);
         self.aliases.by_net.insert(net, predicted);
-        self.rekey_references(StableKey::Net(net), StableKey::Predicted(predicted));
+        self.debug_assert_aliases();
+        // A server keeps what its rule stored under a despawned origin's `Net` key until the
+        // origin returns, which rewrites it (`push_spawned`): a bind inside the window leaves
+        // it, so the export can still write it after the horizon prunes the alias.
+        if !(self.kind == WorldKind::Server && self.despawned_predicted.contains_key(&predicted)) {
+            self.rekey_references(StableKey::Net(net), StableKey::Predicted(predicted));
+        }
         Ok(())
     }
 
@@ -1464,6 +1482,18 @@ impl World {
                 self.aliases.by_net.remove(&net);
             }
         }
+        self.debug_assert_aliases();
+    }
+
+    /// The two alias maps are one bijection: [`bind`](Self::bind) inserts into both, after
+    /// refusing a mismatch, and the horizon removes from both. `exportable_owner` relies on
+    /// it, since `canonical` yields a predicted origin only through `by_net`.
+    fn debug_assert_aliases(&self) {
+        debug_assert_eq!(
+            self.aliases.by_predicted.len(),
+            self.aliases.by_net.len(),
+            "the alias maps are one bijection"
+        );
     }
 
     // ---- Bulk copy ----
@@ -1669,7 +1699,9 @@ impl World {
     /// export writes and what a fresh process that loads the save stores; a predicted
     /// origin with no alias is `InvalidData`; any other owner, an unloaded one among them,
     /// is stored as given. Every owner is stored as given in a client's worlds, which export
-    /// nothing. `owner` is already an origin key, as a direct write resolves it.
+    /// nothing. `owner` is already an origin key, as a direct write resolves it. A despawned
+    /// origin that returns inside the window takes back what was stored under its `Net` key
+    /// (`push_spawned`); a re-bind of its pair leaves it there (`bind`).
     pub(crate) fn exportable_owner(&self, owner: StableKey) -> Result<StableKey> {
         if self.kind != WorldKind::Server {
             return Ok(owner);
@@ -1680,9 +1712,7 @@ impl World {
                 Ok(StableKey::Net(net))
             }
             Some(_) => Ok(owner),
-            None => Err(invalid(format!(
-                "`OwnedBy` {owner:?} names a predicted entity with no `NetId` to be exported under"
-            ))),
+            None => Err(no_net_id(owner)),
         }
     }
 
@@ -1705,14 +1735,22 @@ impl World {
     }
 
     /// `InvalidData` if `bytes` of `component` are an [`OwnedBy`] whose owner would make
-    /// `key` its own owner or close a cycle of owners: if `key` is on the owner's chain.
-    /// The bytes have been validated.
+    /// `key` its own owner or close a cycle of owners: if `key` is on the owner's chain; and,
+    /// in a `Server` world, one whose owner is a predicted origin with no alias, which a
+    /// command can name while the origin is live and its export cannot write. The bytes
+    /// have been validated.
     fn check_owner(&self, key: StableKey, component: ComponentKey, bytes: &[u8]) -> Result<()> {
         if component != OwnedBy::KEY {
             return Ok(());
         }
         let value: OwnedBy = bytemuck::checked::pod_read_unaligned(bytes);
         let Some(owner) = value.owner.get() else { return Ok(()) };
+        if self.kind == WorldKind::Server
+            && let StableKey::Predicted(predicted) = owner
+            && !self.aliases.by_predicted.contains_key(&predicted)
+        {
+            return Err(no_net_id(owner));
+        }
         let key = self.canonical(key);
         if self.owner_chain(owner).any(|at| at == key) {
             return Err(invalid(format!(
@@ -2046,8 +2084,15 @@ impl World {
             self.index_claim(key, value.info, &value.bytes, true);
         }
         self.log.push(self.tick, StructuralChange::Spawned { key, region });
-        if let StableKey::Predicted(predicted) = key {
-            self.despawned_predicted.remove(&predicted);
+        if let StableKey::Predicted(predicted) = key
+            && self.despawned_predicted.remove(&predicted).is_some()
+            && self.kind == WorldKind::Server
+            && let Some(&net) = self.aliases.by_predicted.get(&predicted)
+        {
+            // A despawned origin returns inside the window: what the rule stored under its
+            // `Net` key names it again, as a fresh process that loads the save stores it,
+            // and the tree follows it.
+            self.rekey_references(StableKey::Net(net), key);
         }
     }
 

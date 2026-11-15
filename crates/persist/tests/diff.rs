@@ -14,7 +14,9 @@ use std::sync::Arc;
 use common::*;
 use lactose_asset_api::AssetSet;
 use lactose_bundle::{Baseline, BaselineRow, ComponentData, ComponentSchema, Record};
-use lactose_core::{ComponentKey, EntityRef, ErrorKind, NetId, Result, StableKey, Tick};
+use lactose_core::{
+    ComponentKey, EntityRef, ErrorKind, NetId, PlayerId, PredictionKey, Result, StableKey, Tick,
+};
 use lactose_ecs::{
     ExportedRow, LayoutConfig, OwnedBy, RegionConfig, RegionId, RegionMode, RegionRows, World,
     WorldBuilder, WorldKind,
@@ -535,9 +537,15 @@ fn owner_of(world: &World, key: StableKey) -> Option<StableKey> {
     world.get::<OwnedBy>(key).and_then(|owned| owned.owner.get())
 }
 
-/// Each entity of `region` and its owner, live or not.
+/// Each entity of `region` and its owner, live or not, under the key the export writes: a
+/// predicted owner by its alias, the key a reload stores once that owner has died while the
+/// region was unloaded.
 fn owners_in(world: &World, region: RegionId) -> BTreeMap<StableKey, Option<StableKey>> {
-    world.entities_in(region).map(|key| (key, owner_of(world, key))).collect()
+    let exported = |owner: StableKey| match owner {
+        StableKey::Predicted(predicted) => world.alias(predicted).map_or(owner, StableKey::Net),
+        owner => owner,
+    };
+    world.entities_in(region).map(|key| (key, owner_of(world, key).map(exported))).collect()
 }
 
 /// `records` but their owners: what a load that breaks a cycle leaves as it was.
@@ -630,8 +638,9 @@ impl Rng {
 /// One seeded history of spawns, owner writes (refusals ignored), moves, despawns, unloads
 /// and reloads over A and B, under `layout`, with the server's horizon passed after every
 /// step, checked after every step and by a restart at the end. Its steps include the alone
-/// forms, which a server refuses with nothing changed, and a despawn followed by a write
-/// that names the dead entity. Returns
+/// forms, which a server refuses with nothing changed, a predicted spawn bound to a fresh
+/// `NetId` as a server binds one, and a despawn followed by a write that names the dead
+/// entity, so a dead predicted owner is named inside the window. Returns
 /// how many owner edges the reloads broke: each a row of the reloaded region left without
 /// the owner it had at the unload, that owner live in the other region and owned, through
 /// its chain, by the row, so that the edge would close a cycle; nothing else of the region
@@ -662,10 +671,11 @@ fn history(
     let mut owners: BTreeMap<RegionId, BTreeMap<StableKey, Option<StableKey>>> = BTreeMap::new();
     let mut log: Vec<String> = Vec::new();
     let mut broken = 0;
+    let mut ordinal = 0;
     for _ in 0..20 + rng.below(60) {
         let (keys, regions) = (live(&world), loaded(&world));
         let owner = pool[rng.below(pool.len())];
-        match rng.below(110) {
+        match rng.below(115) {
             0..=14 if !regions.is_empty() => {
                 let region = regions[rng.below(regions.len())];
                 let id = world.allocate_net_id().unwrap();
@@ -770,6 +780,16 @@ fn history(
                         .insert(item, OwnedBy { owner: EntityRef::new(key) })
                         .unwrap_or_else(|error| panic!("{error}: seed {seed:#x} {log:#?}"));
                 }
+            }
+            110..=114 if !regions.is_empty() => {
+                let region = regions[rng.below(regions.len())];
+                let key = PredictionKey { player: PlayerId(1), input_tick: Tick(0), ordinal };
+                ordinal += 1;
+                let id = world.allocate_net_id().unwrap();
+                log.push(format!("spawn {key:?} in {region:?}, bound to {id:?}"));
+                world.spawn(StableKey::Predicted(key), region, (pos(1, 1),)).unwrap();
+                world.bind(key, id).unwrap();
+                pool.push(id);
             }
             _ => continue,
         }
