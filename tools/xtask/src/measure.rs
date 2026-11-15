@@ -350,7 +350,8 @@ struct Site {
     name: &'static str,
     /// The file, relative to the repository root.
     file: &'static str,
-    /// The line the statement follows, which occurs once in the file.
+    /// The line the statement follows, whole and without its line ending: exactly one line
+    /// of the file.
     anchor: &'static str,
 }
 
@@ -360,29 +361,43 @@ const SITES: [Site; 2] = [
     Site {
         name: "sketch_system",
         file: "crates/app-headless/src/main.rs",
-        anchor: "    counter.0 = counter.0.wrapping_add(1);\n",
+        anchor: "    counter.0 = counter.0.wrapping_add(1);",
     },
     Site {
         name: "app_function",
         file: "crates/app/src/runtime.rs",
-        anchor: "    let mut builder = Executor::builder();\n",
+        anchor: "    let mut builder = Executor::builder();",
     },
 ];
 
-/// `source` with the `n`th edit at `site`: one statement after the anchor, which differs
-/// from every other edit's, so each is a one-line change from the build before it. Fails
-/// unless the anchor occurs exactly once.
+/// `source` with the `n`th edit at `site`: one statement on a line of its own after the
+/// anchor's, which differs from every other edit's, so each is a one-line change from the
+/// build before it. The new line ends as the anchor's does, so that a file checked out with
+/// CRLF line endings (git's `core.autocrlf` on Windows) keeps one line ending throughout.
+/// Fails unless exactly one line is the anchor, and that line has an ending.
 fn edited(source: &str, site: &Site, n: u32) -> Result<String, String> {
-    let count = source.matches(site.anchor).count();
-    if count != 1 {
+    let mut found = Vec::new();
+    let mut end = 0;
+    for line in source.split_inclusive('\n') {
+        end += line.len();
+        let text = line.strip_suffix('\n').map_or(line, |l| l.strip_suffix('\r').unwrap_or(l));
+        if text == site.anchor {
+            found.push((end, &line[text.len()..]));
+        }
+    }
+    let [(end, ending)] = found[..] else {
         return Err(format!(
-            "{}: the edit's anchor `{}` occurs {count} times; it must occur once",
+            "{}: {} lines are the edit's anchor `{}`; one must be",
             site.file,
+            found.len(),
             site.anchor.trim()
         ));
+    };
+    if ending.is_empty() {
+        return Err(format!("{}: the edit's anchor is the last line, with no ending", site.file));
     }
-    let statement = format!("    let _ = std::hint::black_box({n}_u32);\n");
-    Ok(source.replacen(site.anchor, &format!("{}{statement}", site.anchor), 1))
+    let statement = format!("    let _ = std::hint::black_box({n}_u32);{ending}");
+    Ok(format!("{}{statement}{}", &source[..end], &source[end..]))
 }
 
 /// The median of `values`.
@@ -1465,14 +1480,39 @@ mod tests {
             assert_eq!(first.lines().count(), source.lines().count() + 1, "{}", site.file);
             assert_ne!(first, second);
         }
-        let main = repository(SITES[0].file);
-        let body = main.split("fn count(").nth(1).unwrap().split("\n}\n").next().unwrap();
-        assert!(body.contains(SITES[0].anchor.trim()), "the sketch system's body");
-        let runtime = repository(SITES[1].file);
-        let body = runtime.split("pub fn start_executor(").nth(1).unwrap().split("\n}\n").next();
-        assert!(body.unwrap().contains(SITES[1].anchor.trim()), "a lactose-app function's body");
-        let twice = format!("{0}{0}", SITES[0].anchor);
-        assert!(edited(&twice, &SITES[0], 1).is_err());
+        // As the tree is checked out: with CRLF line endings on a Windows runner.
+        let body_of = |site: &Site, function: &str| {
+            let source = repository(site.file).replace("\r\n", "\n");
+            let body = source.split(function).nth(1).unwrap().split("\n}\n").next().unwrap();
+            body.lines().any(|line| line == site.anchor)
+        };
+        assert!(body_of(&SITES[0], "fn count("), "the sketch system's body");
+        assert!(body_of(&SITES[1], "pub fn start_executor("), "a lactose-app function's body");
+        let twice = format!("{0}\n{0}\n", SITES[0].anchor);
+        assert!(edited(&twice, &SITES[0], 1).unwrap_err().contains("2 lines"));
+        let indented = format!("    {}\n", SITES[0].anchor);
+        assert!(edited(&indented, &SITES[0], 1).unwrap_err().contains("0 lines"));
+        assert!(edited(SITES[0].anchor, &SITES[0], 1).unwrap_err().contains("no ending"));
+    }
+
+    /// CI run 43654643980: the Windows runner checks the tree out with CRLF line endings,
+    /// and an anchor that ended in "\n" was in neither file. Each site's edit of a CRLF copy
+    /// of its file is the edit of the LF file with CRLF endings: one line more, every line
+    /// still ended by CRLF.
+    #[test]
+    fn each_edit_keeps_a_crlf_file_s_line_endings() {
+        for site in &SITES {
+            let lf = repository(site.file).replace("\r\n", "\n");
+            let crlf = lf.replace('\n', "\r\n");
+            let first = edited(&crlf, site, 1).unwrap();
+            let second = edited(&crlf, site, 2).unwrap();
+            assert_eq!(first.lines().count(), crlf.lines().count() + 1, "{}", site.file);
+            assert_eq!(first.matches('\n').count(), first.matches("\r\n").count(), "{}", site.file);
+            assert_eq!(first.matches('\r').count(), first.matches("\r\n").count(), "{}", site.file);
+            assert_ne!(first, second);
+            assert_eq!(first, edited(&lf, site, 1).unwrap().replace('\n', "\r\n"), "{}", site.file);
+            assert!(!edited(&lf, site, 1).unwrap().contains('\r'), "{}", site.file);
+        }
     }
 
     /// Every test a measurement names is in its file, ignored, and every measurement is
