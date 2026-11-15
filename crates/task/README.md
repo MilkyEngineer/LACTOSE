@@ -150,11 +150,13 @@ and list what changed, because `lactose-ecs` is written against this surface.
   `Executor::platform`, never `std::thread` directly.
 - There is no timer thread. Frame-critical workers fire due timers when they look for work,
   and one sleeping worker at a time, the keeper, parks only until the earliest deadline.
-  On Windows its timed wait is a high-resolution waitable timer beside an event that a waker
-  sets, and it spins the last 500 µs before a deadline, because `std::thread::park_timeout`
-  there waits in whole milliseconds on the system's 15.6 ms timer tick and the finer timer
-  overshoots by about half a millisecond (D144); a worker whose event or timer cannot be made
-  keeps `park_timeout`.
+  On Windows its timed wait is a high-resolution waitable timer beside an event that every
+  wake of the worker sets (`Sleep::wake_worker`), and it spins the last 500 µs before a
+  deadline, because `std::thread::park_timeout` there waits in whole milliseconds on the
+  system's 15.6 ms timer tick and the finer timer overshoots by about half a millisecond
+  (D144); a worker whose event or timer cannot be made keeps `park_timeout`. A plain unpark
+  does not end that wait, so a new waker of a worker that may be asleep goes through
+  `Sleep::wake_worker`; a spare wake costs one trip round the park loop.
   A worker that fires timers wakes the ones due when it looks in deadline order, ties in the
   order they were registered; workers that fire at the same time interleave theirs. That
   orders one worker's wake-ups, not the tasks: a woken task is scheduled as below, and a
@@ -263,7 +265,7 @@ Correctness:
   `block_in_place` gate (`src/gate.rs`), the wake that is skipped for a kept entry, the
   timer keeper's hand-off, the task kept by the worker that fires its timer, and the
   quiescence of a cancelled run (`src/quiesce.rs`). The models call the shipped functions.
-  Under loom a timed park waits on a flag that only `Sleep::wake_claimed` sets and that an
+  Under loom a timed park waits on a flag that only `Sleep::wake_worker` sets and that an
   unpark alone does not satisfy, as the Windows wait is not ended by an unpark, so a waker
   that skips it fails the keeper hand-off model.
   The deque is a vetted dependency and is not modelled. loom is enabled by a `loom` Cargo
@@ -296,7 +298,8 @@ Correctness:
   while every worker sleeps and need all of them at once: a fork, and a thief's split, each
   wake a sleeper. `tests/tasks.rs` ends a keeper's wait for a timer an hour away by an
   earlier timer, by pushed work and by shutdown, which on Windows only the event ends, and on
-  Windows holds the median lateness of fifty 2 ms deadlines under half a timer tick.
+  Windows holds the median lateness of fifty 2 ms deadlines under half a timer tick in one
+  of up to three batches.
 - `tests/abort.rs` re-runs itself as a subprocess and checks that a panic in a job, a
   finalize, a scope child, a scope body, a task or the drop of a cancelled task's future
   aborts the process, and that an unfollowable replay log does.

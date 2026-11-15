@@ -8,7 +8,7 @@
 //! - **Sleeper**: [`Sleep::announce`] (set the bit, full fence), re-check every source of
 //!   work, then either [`Sleep::cancel`] or [`Sleep::park`].
 //! - **Waker**: make the work visible, then [`Sleep::notify_one`] (full fence, read the bits,
-//!   claim one by clearing it) and wake the claimed worker with [`Sleep::wake_claimed`].
+//!   claim one by clearing it) and wake the claimed worker with [`Sleep::wake_worker`].
 //!
 //! The two fences are what make this sound: whichever fence comes first in the global order,
 //! the other side's later read sees the earlier write. Either the sleeper's re-check sees the
@@ -127,8 +127,9 @@ impl Sleep {
     /// A timed park is a loop of shorter waits ([`TimedPark::wait`]), each for
     /// [`TIMER_STEP`] of the time left, with a spin over the last [`TIMER_SPIN`]. Every
     /// return from a wait, early or on time, goes through the same check of the bit and the
-    /// clock, so a claim is never missed and the deadline is never passed by more than the
-    /// clock's resolution. Nothing about the protocol depends on how many waits it takes.
+    /// clock, so a claim is never missed and a deadline is passed only by how late the last
+    /// wait returns, on Windows up to about a millisecond (D144). Nothing about the protocol
+    /// depends on how many waits it takes.
     pub(crate) fn park(&self, worker: usize, deadline: Option<Instant>) -> bool {
         let (word, bit) = self.slot(worker);
         while word.load(Ordering::SeqCst) & bit != 0 {
@@ -154,17 +155,31 @@ impl Sleep {
         true
     }
 
-    /// Wakes `worker`, which the caller has just claimed ([`Sleep::notify_one`],
-    /// [`Sleep::announce_entry`], [`Sleep::notify`] returning `true`, [`Sleep::notify_all`]):
-    /// ends its timed wait if it has one, then calls `unpark`, which unparks its thread.
+    /// Wakes `worker`: ends its timed wait if it has one, then calls `unpark`, which unparks
+    /// its thread.
     ///
-    /// Every waker of a claimed worker calls this, the pool's and the loom models' alike,
-    /// and nothing else ends a timed wait. A waker that only unparked would leave the keeper
-    /// on Windows in its wait until the timer ends it, up to 0.6 of the time to its deadline
-    /// later. A worker that is awake or in an untimed park keeps the signal and takes it for
-    /// a spurious wake in its next timed wait. Either way out of the wait orders the claim
-    /// before the worker's next look at its bit.
-    pub(crate) fn wake_claimed(&self, worker: usize, unpark: impl FnOnce()) {
+    /// Every wake of a worker that may be in this protocol goes through this, the pool's and
+    /// the loom models' alike: one the caller has just claimed ([`Sleep::notify_one`],
+    /// [`Sleep::announce_entry`], [`Sleep::notify`] returning `true`, [`Sleep::notify_all`]),
+    /// and one that claims nothing because another waker has. Besides this, only the wait's
+    /// own timer ends a timed wait: a waker that only unparked would leave the keeper on
+    /// Windows in its wait until the timer ends it, up to 0.6 of the time to its deadline
+    /// later. A spare signal costs one trip round [`Sleep::park`]: a worker that is awake, in
+    /// an untimed park or already claimed keeps it and takes it for a spurious wake in its
+    /// next timed wait.
+    ///
+    /// The claim is what the woken worker has to see, and on Windows the kernel orders it.
+    /// The release is `SetEvent`, made after the claim's `SeqCst` read-modify-write; the
+    /// acquire is the wait that the signal ends, followed by the `SeqCst` load of the bit in
+    /// [`Sleep::park`]. Two claims before one wait set the event twice and the wait resets
+    /// it once; that wait comes after the second `SetEvent` in the event's order, so it sees
+    /// both claims, and a bit load follows it. A wait the timer ends orders nothing; a claim
+    /// its bit load misses has set the event or will, which ends the next wait. This rests on
+    /// Microsoft's statement that the signal and wait functions are memory barriers. loom
+    /// cannot check it: loom 0.7.2's unpark joins the unparker's causality into the target
+    /// at once, and its `SeqCst` fence joins a global one, so the models pass with the loom
+    /// flag's swaps `Relaxed`.
+    pub(crate) fn wake_worker(&self, worker: usize, unpark: impl FnOnce()) {
         if let Some(timed) = self.parks.get(worker) {
             timed.wake();
         }
@@ -172,7 +187,7 @@ impl Sleep {
     }
 
     /// Claims one sleeping worker, if there is one. The caller made work visible before the
-    /// call and wakes the returned worker after it ([`Sleep::wake_claimed`]).
+    /// call and wakes the returned worker after it ([`Sleep::wake_worker`]).
     #[must_use]
     pub(crate) fn notify_one(&self) -> Option<usize> {
         fence(Ordering::SeqCst);
@@ -216,6 +231,15 @@ impl Sleep {
     #[cfg(all(test, not(feature = "loom")))]
     pub(crate) fn announced(&self) -> u32 {
         self.words.iter().map(|word| word.load(Ordering::SeqCst).count_ones()).sum()
+    }
+
+    /// Whether `worker`'s bit is set, and whether its timed wait holds a signal, if it has
+    /// one: what a model's failure message names.
+    #[cfg(all(test, feature = "loom"))]
+    pub(crate) fn worker_state(&self, worker: usize) -> (bool, Option<bool>) {
+        let (word, bit) = self.slot(worker);
+        let set = word.load(Ordering::SeqCst) & bit != 0;
+        (set, self.parks.get(worker).map(TimedPark::is_signalled))
     }
 
     /// Claims every sleeping worker and passes each to `wake`.
@@ -284,7 +308,7 @@ mod tests {
     #[test]
     fn a_stale_wake_does_not_end_a_timed_park_early() {
         let sleep = Sleep::with_timed_parks(1);
-        sleep.wake_claimed(0, || std::thread::current().unpark());
+        sleep.wake_worker(0, || std::thread::current().unpark());
         sleep.announce(0);
         let deadline = Instant::now() + Duration::from_millis(20);
         assert!(!sleep.park(0, Some(deadline)), "nothing claimed the worker");
@@ -309,12 +333,15 @@ mod tests {
                 let _ = parked.send(sleep.park(0, Some(hour)));
             })
         };
-        // Claimed once it has announced, whether or not it has reached its wait yet.
+        // Claimed once it has had time to reach its wait. A claim that lands before the
+        // sleeper's first look at its bit ends the park without a wait, which proves nothing;
+        // on a machine too slow for the pause the test proves less, never fails.
         while sleep.announced() == 0 {
             std::thread::yield_now();
         }
+        std::thread::sleep(Duration::from_millis(if cfg!(miri) { 1 } else { 50 }));
         assert!(sleep.notify(0));
-        sleep.wake_claimed(0, || sleeper.thread().unpark());
+        sleep.wake_worker(0, || sleeper.thread().unpark());
         let limit = Duration::from_secs(if cfg!(miri) { 600 } else { 60 });
         assert_eq!(outcome.recv_timeout(limit), Ok(true), "the claim did not end the wait");
         sleeper.join().unwrap();

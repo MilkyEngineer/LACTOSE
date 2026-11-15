@@ -237,29 +237,29 @@ impl Pool {
     /// `kept` it (see [`Sleep::announce_entry`]).
     fn announce_entry(&self, kept: bool) {
         if let Some(worker) = self.sleep.announce_entry(kept) {
-            self.wake_claimed(worker);
+            self.wake_worker(worker);
         }
     }
 
     /// Wakes `worker` whether it sleeps in the idle protocol or on a scope latch.
     ///
     /// A worker this does not claim is awake, parked on a latch, which waits untimed, or
-    /// claimed by another waker, which wakes it; a plain unpark is all it needs.
+    /// claimed by another waker. It is woken all the same, timed wait included, so that it
+    /// does not wait for the other waker to get round to it.
     pub(crate) fn wake(&self, worker: usize) {
-        if self.sleep.notify(worker) {
-            self.wake_claimed(worker);
-        } else {
-            self.threads[worker].unpark();
-        }
+        let _ = self.sleep.notify(worker);
+        self.wake_worker(worker);
     }
 
     pub(crate) fn wake_all(&self) {
-        self.sleep.notify_all(|worker| self.wake_claimed(worker));
+        self.sleep.notify_all(|worker| self.wake_worker(worker));
     }
 
-    /// Wakes a worker this pool's sleep state has just claimed for the caller.
-    fn wake_claimed(&self, worker: usize) {
-        self.sleep.wake_claimed(worker, || self.threads[worker].unpark());
+    /// Wakes `worker`, timed wait included ([`Sleep::wake_worker`]). Every wake of a worker
+    /// that may be in the idle protocol goes through this; a spare one costs a trip round
+    /// [`Sleep::park`].
+    fn wake_worker(&self, worker: usize) {
+        self.sleep.wake_worker(worker, || self.threads[worker].unpark());
     }
 
     /// Unparks `worker`, which waits on a scope latch that has just been set.
@@ -300,8 +300,9 @@ impl Pool {
         self.gate.open(reserved as usize, self);
         self.wake_all();
         // Openers that parked on their latch with nothing on their deque announced
-        // nothing; they find out by a plain unpark.
-        self.threads.iter().for_each(Thread::unpark);
+        // nothing, and a worker another waker has claimed is not woken by `wake_all`; both
+        // are woken here.
+        (0..self.threads.len()).for_each(|worker| self.wake_worker(worker));
     }
 
     /// The wait of a scope's opener on this pool. See [`gate::wait_for_children`].
@@ -636,8 +637,9 @@ impl Shared {
         }
         for pool in [&self.frame, &self.background] {
             pool.wake_all();
-            // A worker parked on a scope latch waits for a plain unpark, not a sleeper bit.
-            pool.threads.iter().for_each(Thread::unpark);
+            // A worker parked on a scope latch has no sleeper bit for `wake_all` to claim,
+            // and one another waker has claimed is skipped by it; both are woken here.
+            (0..pool.threads.len()).for_each(|worker| pool.wake_worker(worker));
         }
         // Once now, so nothing that waits on cancelled work has to wait for the joins,
         // which last as long as the longest running job; and once after them, for what

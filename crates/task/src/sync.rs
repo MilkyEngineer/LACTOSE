@@ -38,10 +38,12 @@ mod imp {
     /// liveness.
     ///
     /// An unpark alone does not end it, as it does not end the Windows wait, so a waker that
-    /// skips [`TimedPark::wake`] fails the keeper hand-off model. Both sides swap: loom
-    /// treats a `SeqCst` store as a release store, which the waiter's swap can read stale,
-    /// and a flag behind a loom mutex trips loom's own assertion when an unpark makes the
-    /// thread blocked on it runnable.
+    /// skips [`TimedPark::wake`] fails the keeper hand-off model. Both sides swap because
+    /// loom's modification order is partial: an RMW may read any store that no other is
+    /// ordered after (loom 0.7.2, `match_rmw_to_stores`), so the waiter's swap could read
+    /// past a waker's plain store, which an RMW may not do in C++ at any ordering. Against
+    /// a swap it cannot, whatever the orderings. A flag behind a loom mutex trips loom's own
+    /// assertion when an unpark makes the thread blocked on it runnable.
     pub(crate) struct TimedPark {
         woken: loom::sync::atomic::AtomicBool,
     }
@@ -63,6 +65,12 @@ mod imp {
 
         pub(crate) fn wake(&self) {
             self.woken.swap(true, super::Ordering::SeqCst);
+        }
+
+        /// Whether a wake is waiting to be taken, for a model's failure message.
+        #[cfg(test)]
+        pub(crate) fn is_signalled(&self) -> bool {
+            self.woken.load(super::Ordering::SeqCst)
         }
     }
 }
@@ -114,6 +122,9 @@ mod windows {
 
     use crate::span::TARGET;
 
+    /// What a failed `SetWaitableTimer` or `WaitForMultipleObjects` costs.
+    const COARSE: &str = "this wait is a std park_timeout instead, in whole milliseconds";
+
     pub(crate) struct TimedPark {
         /// The event and the timer, in the order `WaitForMultipleObjects` takes them, or
         /// `None` for a wait that falls back to `std::thread::park_timeout`.
@@ -122,11 +133,15 @@ mod windows {
         reported: AtomicBool,
     }
 
-    // SAFETY: a handle is a process-wide value, valid on every thread; `SAFETY.md`, "The
-    // keeper's timed wait", gives which thread may make which call on it, and when.
+    // SAFETY: a handle is a process-wide value, valid on every thread, and every call made
+    // on it (`SetEvent`, `SetWaitableTimer`, `WaitForMultipleObjects`) is safe from any
+    // thread, concurrently with the others. The one condition memory safety needs, that the
+    // handle is open, comes from `Drop`, which has `&mut self`, and from the pool owning
+    // this for as long as any worker or waker can reach it. That only the owning worker
+    // waits is a liveness rule: a second waiter would only mistime a wait. `SAFETY.md`,
+    // "The keeper's timed wait".
     unsafe impl Send for TimedPark {}
-    // SAFETY: as for `Send`: any thread may set the event, only the owning worker touches
-    // the timer or waits, and only `Drop`, which has the value to itself, closes either.
+    // SAFETY: as for `Send`.
     unsafe impl Sync for TimedPark {}
 
     impl TimedPark {
@@ -171,7 +186,7 @@ mod windows {
         /// It may return early. The timer cannot cause that: it is set again before every
         /// wait, which clears a signal it raised with nothing waiting. The event can: a wake
         /// that came while this worker was not waiting on it, such as one by
-        /// `Sleep::wake_claimed` while it was awake or in an untimed park, ends the next wait
+        /// `Sleep::wake_worker` while it was awake or in an untimed park, ends the next wait
         /// at once. The caller, `Sleep::park`, takes every return as a possible spurious
         /// wake: it reads its bit and the clock again and waits again.
         /// `sleep::tests::a_stale_wake_does_not_end_a_timed_park_early` holds it to that.
@@ -189,7 +204,7 @@ mod windows {
             // SAFETY: the timer is open, since only `Drop` closes it, and only this worker
             // sets it; `due` outlives the call, and there is no completion routine.
             if unsafe { SetWaitableTimer(timer, &raw const due, 0, None, null(), FALSE) } == 0 {
-                self.report("SetWaitableTimer");
+                self.report("SetWaitableTimer", COARSE);
                 return std::thread::park_timeout(timeout);
             }
             let handles = [event, timer];
@@ -197,31 +212,37 @@ mod windows {
             // when either is signalled; the timer always will be.
             let ended = unsafe { WaitForMultipleObjects(2, handles.as_ptr(), FALSE, INFINITE) };
             if ended == WAIT_FAILED {
-                self.report("WaitForMultipleObjects");
+                self.report("WaitForMultipleObjects", COARSE);
                 std::thread::park_timeout(timeout);
             }
         }
 
         /// Ends this worker's wait, or the next one if it is not waiting. Any thread may call
-        /// it; the unpark that follows it ends a coarse wait.
+        /// it; the unpark that follows it ends a coarse wait. `Sleep::wake_worker` gives the
+        /// ordering it carries.
         pub(crate) fn wake(&self) {
             let Some([event, _]) = self.handles else { return };
             // SAFETY: the event is open: the caller reached this through the pool, which
             // outlives every reference to it, and only `Drop` closes the event.
             if unsafe { SetEvent(event) } == 0 {
-                self.report("SetEvent");
+                self.report(
+                    "SetEvent",
+                    "this wake is late: the wait ends at its timer, up to 0.6 of the time left \
+                     before its deadline",
+                );
             }
         }
 
-        fn report(&self, call: &'static str) {
+        /// Logs the first failed call of this worker's wait, with what the failure costs.
+        fn report(&self, call: &'static str, effect: &'static str) {
             let error = io::Error::last_os_error();
+            // Orders nothing: the read-modify-write alone makes the warning once.
             if !self.reported.swap(true, Ordering::Relaxed) {
                 tracing::warn!(
                     target: TARGET,
                     %error,
                     call,
-                    "the keeper's timed wait failed; such a wait is a std park_timeout, in whole \
-                     milliseconds",
+                    "the keeper's timed wait failed; {effect}",
                 );
             }
         }
