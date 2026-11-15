@@ -51,7 +51,7 @@ server sharding.
 | Netcode | Dedicated server, authoritative. Clients send tick-stamped inputs with redundant history and simulate the quantised value they sent. Local-player prediction in a separate client prediction world, reconciled at full precision within a stated tolerance on the solver-written rows of a dynamic body. Snapshot interpolation for everything else. Interest management and per-client bandwidth prioritisation are part of the first networking deliverable, never a later addition. |
 | Determinism scope | Same build, identical results across threads, layouts and x86-64 versus aarch64. Reconciliation compares at full precision, with a stated tolerance on the solver-written rows of a dynamic body (section 9.4). |
 | Identity | Process-local entity IDs never leave the process. Every reference, ordering rule and RNG key uses a `StableKey`: the server-assigned network ID, or the prediction key for a spawn the server has not confirmed. The server records a predicted spawn's prediction key as its permanent origin key, so binding changes nothing semantic. Network IDs double as persistent IDs. |
-| World coordinates | Simulation scalar is a `math` newtype with no inherent float methods, 64-bit by default, decided finally by a milestone 1 precision and performance test at full map extent. Switching is a Rapier crate switch, not a one-line change. GPU scene stores grid cell plus 32-bit offset. |
+| World coordinates | Simulation scalar is a `math` newtype with no inherent float methods, 64-bit: milestone 1's precision test at x = 6 km decided it, with the 64-bit rollback loop measured beside it (section 16). Switching would be a Rapier crate switch, not a one-line change. GPU scene stores grid cell plus 32-bit offset. |
 | Physics | Rapier through `physics-api`, pinned exactly. One physics world per server process, one prediction world per client. Rapier's determinism and parallel features together. |
 | Graphics | Thin RHI. Vulkan 1.3 backend first (Windows, Linux CI). Native Metal backend in milestone 3 for Apple Silicon. MoltenVK and KosmicKrisp spiked in milestone 2 as interim Apple paths. DX12 when Xbox matters. A null backend for tests. |
 | Shaders | Slang. The cooker emits SPIR-V for Vulkan and MSL plus metallib for Metal. Mac shaders cook on a macOS runner. Driver pipeline caches are persisted. No runtime source compilation. |
@@ -1214,12 +1214,22 @@ restores the bytes and makes the next sync a full diff. So a world reloaded in p
 frame or two, has the physics state a fresh process loading the same rows has, which is what
 section 15.5's first test needs.
 
-The simulation scalar is decided in milestone 1 by a precision test at full map extent: 32-bit
-is adopted if positional error at the map edge stays under one millimetre over a ten-minute
-standard scene and every SOUR mode passes; otherwise 64-bit stays. Switching means
-`rapier3d` versus `rapier3d-f64` and their parry counterparts, a crate change behind
+The simulation scalar is 64-bit (D146). Milestone 1 decided it by a precision test: 32-bit
+would have been adopted had positional error at the map edge stayed under one millimetre over
+a ten-minute standard scene and every SOUR mode passed. The test is read at x = 6 km, since
+no document states the map's extent. On upstream 32-bit Rapier the walk scene at
+(6000, 0, 6000) differs from the same scene at the origin by 157.75 mm, and at
+(12000, 0, 12000) by 120.84 mm; in 64 bits it differs by at most 0.032 mm at either. The
+precision half fails, so the SOUR half was not run and no 32-bit branch is built. A switch
+would mean `rapier3d` for `rapier3d-f64` and their parry counterparts, a crate change behind
 `physics-api`. The 64-bit cost that matters is the client's rollback re-simulation on NEON,
-which sets ring depth, so the test measures that loop, not only server throughput.
+which sets ring depth: the contact solver runs two 64-bit lanes per NEON instruction where
+32 bits would run four, and a re-simulated tick of the netcode spike's fifty thrown bodies
+costs 387.7 µs on a quiet Apple M1. The rule does not weigh that cost, and a shallow ring is
+`predict`'s question when milestone 4 sizes it (section 9.4), not the scalar's. A 32-bit
+scalar comes back only with a design that keeps simulation coordinates small, origin rebasing
+per region for example, proposed and then run against this rule again; the rule is not run
+again at the same coordinates.
 
 `physics-rapier` is inside the boundary. Replacement is a backend swap behind `physics-api`
 including `snapshot` and `restore`.
@@ -1372,7 +1382,10 @@ within one, with a scripted client clock that drifts, wakes late and steps. Its 
 and aarch64 client are SOUR's architecture mode over what both ends record, each world's hash
 at every tick and a hash of every packet sent: records equal on linux-x64, windows-x64 and
 macos-arm64 mean an x86 server and an aarch64 client exchange those bytes tick for tick. A
-difference between platforms is a finding and calls for a run across two machines.
+difference between platforms is a finding and calls for a run across two machines. The
+scalar's rule is read at x = 6 km, D59's figure, since no document states the map's extent,
+and its SOUR half is run only if its precision half passes, which it did not (section 16,
+D146).
 
 ### 22.1 Decided later, by milestone
 

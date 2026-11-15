@@ -652,8 +652,9 @@ docs restate them per method)
 - Every quantity here is a `Scalar`, `Vec3` or `Quat` of `lactose_math`; no `f32` or `f64`
   appears in the surface. Every component is its scalars first, then a tail whose size is
   a multiple of eight bytes, and `lib.rs` asserts each size as `n * Scalar::BYTES + tail`,
-  so no padding changes if milestone 1 picks a four-byte scalar.
-- What changes then: `lactose-math`'s `Scalar` and the `Scalar::NAME` tag (`Scalar64` to
+  so no padding would change under a four-byte scalar. Milestone 1 decided the width, 64-bit,
+  and builds no 32-bit branch (architecture section 16, D146).
+- What a switch would change: `lactose-math`'s `Scalar` and the `Scalar::NAME` tag (`Scalar64` to
   `Scalar32`, a schema change every save and cook sees), and in `physics-rapier` the
   crates `rapier3d-f64` and `parry3d-f64` become `rapier3d` and `parry3d`. Nothing in this
   crate changes, and a backend converts between `Scalar` and its own float at the

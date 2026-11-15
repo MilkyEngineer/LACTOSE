@@ -1718,6 +1718,9 @@ editorial pass rather than one taken from a review.
 - Driven by: R2-8, R3-10.
 - Replaced: revision 2's fixed 64-bit positions and 64-bit Rapier build; revision 1's f32 math;
   revision 3.1's type alias (R3-10).
+- Addendum (D146, the scalar decision, 16 November 2026): decided. 64-bit stays: on upstream 32-bit
+  Rapier the walk scene at x = 6 km differs from the same scene at the origin by 157.75 mm,
+  against the rule's one millimetre, and the 32-bit branch is not built.
 
 **D60. `physics-rapier` is inside the boundary** (§8.1, §16)
 - Why: R1-7 required it together with sharing Rapier's `libm`; no further reason is recorded.
@@ -4002,6 +4005,10 @@ checkpoint carries the physics snapshot** (§1, §2, §9.4, §10, §15.5, §16, 
   rolled-back tick at the median, 21 to 30 ms per correction on an Apple M1, which exceeds a
   frame; the worst single sample was 22.5 ms per tick at load 19 to 25. A correction-depth or
   cost cap belongs to predict's milestone 4 review.
+- Addendum (D146, the scalar decision, 16 November 2026): the scalar stays 64-bit, the width the
+  defaults were set under and the spike measured them at, so the scalar decision re-measures
+  and re-sets none of them. Of "the defaults re-set at milestone 1 (scalar) and 4 (spike)"
+  only milestone 4's is left, after the sleep-state rule for claimed bodies.
 - Replaced: section 2's and 9.4's "at full precision" without qualification; D122's "Full
   precision means canonical bytes per field, no tolerance" for the solver-written rows of a
   dynamic body, its "a tolerance for dynamic bodies is decided at milestone 4" and its
@@ -6024,6 +6031,95 @@ relayed by an event when it acts on another body** (§6.1, §10, `lactose-ecs`,
   D119's "hashing the snapshot bytes" among its deferred items, as a join. D119's "until then
   the property is unproven, not excused" for the sites this entry accepts; for the sign of zero
   in SIMD `min` and `max` it stands.
+
+**D146. The simulation scalar is 64-bit: 32 bits fails the precision half of section 16's rule at x = 6 km, and the 32-bit branch is not built** (§2 World coordinates, §16, §22, `lactose-math`, `lactose-anim`, `lactose-physics-api`, `lactose-predict`, `lactose-sim`, `docs/plans/milestone-1.md`)
+- Why: section 16 adopted 32 bits only if positional error at the map edge stayed under one
+  millimetre over a ten-minute standard scene and every SOUR mode passed, and D139 built the
+  32-bit branch only if a probe on upstream 32-bit Rapier passed the precision half. The
+  probe's file and the measured 64-bit rollback loop, the two inputs D139's plan named, are on
+  main. `docs/plans/scalar-decision.md` holds the evidence and the consequences row by row;
+  these are the decisions.
+  - *64 bits stays, and milestone 1's criterion "Scalar decided by the section 16 rule" is
+    met.* On upstream `rapier3d` 0.36.0 the walk scene, stepped 36,000 ticks, differs from the
+    same scene at the origin by 157.75 mm at (6000, 0, 6000), 94.38 mm at (6000, 0, 0) and
+    120.84 mm at (12000, 0, 12000), against one millimetre
+    (`docs/results/scalar-precision-apple-m1-2026-11-14.md`, Apple M1, `017823e`, one thread;
+    the run is deterministic, so load moves no figure). The 6 km pairs differ by 88.14 mm and
+    34.07 mm before the walker first comes within Rapier's 2 cm prediction distance of a
+    block, so no contact makes the error. The same pairs on `rapier3d-f64` stay at or under
+    0.032 mm, in y alone and alike at 6 km and 12 km: the scene's own sensitivity, which
+    bounds what it adds. The error is a speed bias of the 32-bit position sum, not the random
+    walk of about 27 mm the plan expected: a straight walk drifts 1.14 mm per metre walked at
+    1,024 m, 6.09 mm at 6 km and 13.69 mm at 12 km, so the closed square's figures are lower
+    bounds. Rules out running the rule's SOUR half, which is moot, and a second run of the
+    precision half.
+  - *The rule is read at x = 6 km, and this entry sets no map extent.* No document states
+    one; D59's ±6 km is the nearest figure, a coordinate's distance, so that (6000, 0, 6000)
+    is the corner of a map twelve kilometres across. The plan's 8 km was not read: the
+    probe's first run included it and its control failed, and the second took 12 km in its
+    place. 8 km lies in 6 km's binade, [4,096, 8,192) m, where a 32-bit position has the same
+    0.49 mm spacing. 32 bits exceeds the millimetre at every distance measured from 1,024 m
+    to 12 km, at 1,024 m on the straight walk alone, and 64 bits is measured to 12 km. Rules
+    out reading the entry as a bound on the map: a coordinate past 12 km lies outside the
+    measurement, not outside the scalar, which is spaced 1.8e-12 m at 12 km by arithmetic.
+  - *The 32-bit branch is not built.* No 32-bit `Scalar` in `lactose-math`, no second vendored
+    Rapier, no second golden table, no 32-bit quantiser bounds and no SOUR run in 32 bits. The
+    layouts that hold at either width (D119, D128) stay as they are. Rules out a 32-bit
+    configuration kept building beside the 64-bit one.
+  - *The cost half is recorded and decides nothing.* The contact solver is SIMD in both
+    precisions: two 64-bit lanes per NEON instruction where 32 bits would run four (the
+    probe's file, "Row 41"), and four per AVX instruction on x86-64-v3, as many as 32 bits
+    would run there, since `rapier3d` 0.36.0 refuses `simd8` beside `enhanced-determinism`
+    and `parry3d` 0.31.1 then selects `WideF32x4` (each crate's `src/lib.rs`). In 64 bits, on
+    the quiet Apple M1: at `c50b688` a seven-tick rollback of the spike's thrown scene, fifty
+    claimed bodies, takes 2,713.7 µs, 387.7 µs a re-simulated tick
+    (`docs/results/rollback-seven-ticks-apple-m1-2026-11-15.md`), and the prediction-world
+    snapshot 90.0 µs against section 22's 100 µs
+    (`docs/results/prediction-slot-apple-m1-2026-11-15.md`); at `bef3455` the physics phase at
+    2,000 awake bodies takes 1,954.3 µs against 3 ms
+    (`docs/results/physics-phase-apple-m1-2026-11-15.md`). Every milestone 1 budget that
+    physics enters is met in 64 bits on the M1. The x86 desktop's figures are session B's and
+    change nothing here: the precision half is arithmetic, and on x86-64-v3 the lane argument
+    for 32 bits is absent. No 32-bit loop was timed, so what 32 bits would save is not known,
+    and none is owed: the rule does not weigh cost. Rules out a cost argument reopening the
+    rule.
+  - *An unchanged scalar re-sets nothing.* `lactose-net-host`'s position quantiser round-trips
+    exactly for every value under the 64-bit scalar, so a 32-bit scalar's bound of 2^24 units
+    does not apply, and the rotation quantiser's measured non-idempotence stands, with nothing
+    relying on a stable value. The reconciliation tolerance's defaults (D124) were set and
+    measured under the 64-bit scalar: the scalar decision re-measures none, and their re-set
+    from the spike's figures is milestone 4's, after the sleep-state rule for claimed bodies.
+    The golden bits and the hashes pinned under the 64-bit scalar stand.
+  - *Decision 5.4's cost condition is moot, and the scalar sets no ring-depth trigger.* The
+    plan made the branch worth its cost only if the 64-bit rollback loop left the ring
+    shallower than the deepest correction the spike records. That was written for a probe that
+    passed, and under section 16 a 32-bit scalar cannot be adopted while the precision half
+    fails, whatever the ring's depth. Read to the letter the condition would hold: the spike's
+    deepest correction is 39 ticks, after its scripted 40-tick outage, which need 15.1 ms at
+    387.7 µs a tick and 17.9 to 19.0 ms at the replays' medians, against a 16.7 ms tick. No
+    ring is sized yet: no document gives the frame re-simulation budget a figure, and
+    `lactose-app` builds its predictor at the placeholder depth of sixty. A shallow ring is
+    `lactose-predict`'s question at its milestone 4 review, where the slot's record, the claim
+    policy and a cap on a correction's depth come before the width; the verification row "The
+    frame re-simulation budget has no figure" records the depths for it. Rules out a ring
+    depth, an estimate of what 32 bits would save, or session B reopening the scalar.
+  - *What brings a 32-bit scalar back is a design.* One that keeps simulation coordinates
+    small, origin rebasing per region for example, is proposed and then run against section
+    16's rule again. Rules out a second run of the rule at the same coordinates.
+- Driven by: lane `scalar-probe`'s result file and its review, whose own straight walk the
+  file's agrees with; the measurement commit's `physics-phase` file at `bef3455`; the second
+  quiet window's files at `c50b688` (D143's second addendum); the review of
+  `docs/plans/scalar-decision.md`, on which the cost condition was set aside and the ring's
+  depth left to `lactose-predict`; the owner's approval of 16 November 2026.
+- Replaced: D59's "decided in milestone 1" and its "the safer default is kept until the test
+  decides". Section 2's "64-bit by default, decided finally by a milestone 1 precision and
+  performance test at full map extent" and section 16's paragraph on the scalar to be decided.
+  D124's "the scalar decision re-measures the defaults" and, among its deferred items, "the
+  defaults re-set at milestone 1 (scalar)". In `docs/plans/milestone-1.md`: decision 5.4's
+  sentence "The owner is then asked whether to commission the branch", its cost condition
+  against the deepest correction the spike records, which is moot because the precision half
+  failed; its second distance, 8 km, and its expectation of "about 27 mm as a random walk";
+  and its open question 5, the reference map's extent. The plan now marks each.
 
 ## 10. Review history
 

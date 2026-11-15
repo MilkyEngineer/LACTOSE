@@ -41,7 +41,7 @@ Section 22 gives milestone 1 nine criteria. Status is what the tree and CI show 
 | 5 | Prediction-world snapshot at most 100 µs | A new cost test: the take of one ring slot (`World::snapshot` plus `physics_api::snapshot`) through `lactose-predict` with Rapier, on the spike's scene. Result file `prediction-slot` | Not measured as a slot. Its parts: the world snapshot 5.4 µs with no statics (row 17); Rapier's write 32 µs beside no fixed collider and 92 µs beside 100 (row 87). The quiet window measured the slot at 140.8 µs: not met (D143, `docs/plans/criterion-5-proposal.md`); the second quiet window, at `c50b688`, measured the copied slot at 90.0 µs: met | `measure`; `slot-copy`, then the second quiet window (section 3); decision 5.5 as D143 amends it |
 | 6 | Sim-skeleton evaluation at most 0.5 ms for 200 characters | `the_sim_skeleton_budget` in `crates/anim/tests/cost.rs`, its figure (b). Result file `sim-skeleton` | Met on the M1: 196.9 µs on one worker and 189.3 µs on four, at load 3 to 4 (row 115). No result file, and no x86 figure | The quiet window and session B (section 4) |
 | 7 | Netcode spike over a throwaway transport: x86 server, aarch64 client, four scenarios, the correction rate, the largest absorbed difference per kind, rollback cost per tick and divergence recorded | `crates/app/tests/spike.rs` made to run (decision 5.3): its scenes recorded under SOUR, its figures in result file `spike-net`, which `cargo xtask measure spike-net` writes from the eight ten-minute replays | The spike runs and records under SOUR; `cargo xtask measure spike-net` writes result file `spike-net` (lane `spike-net-file`), checked in from the second quiet window at `c50b688`. Nightly 43703297881 at `c50b688` found the four recorded scenes' 7,200 hash lines equal on linux-x64, windows-x64 and macos-arm64, which stands for the x86 server and the aarch64 client (decision 5.3, as answered): met | `client-fix`, `sour-evidence`, `spike-net` |
-| 8 | Scalar decided by the section 16 rule | A precision probe's result file `scalar-precision` and a decision entry | Nothing exists. No document states the full map extent the rule tests at | `scalar-probe`, then the planner's decision (decision 5.4) |
+| 8 | Scalar decided by the section 16 rule | A precision probe's result file `scalar-precision` and a decision entry | Met: 64-bit stays (D146). On upstream 32-bit Rapier the walk scene translated to x = 6 km differs from the origin run by 157.75 mm, and by 120.84 mm at 12 km, against one millimetre; the 64-bit control stays at or under 0.032 mm (`docs/results/scalar-precision-apple-m1-2026-11-14.md`). The rule is read at x = 6 km, D59's figure, since no document states the map's extent. The SOUR half is moot and the 32-bit branch is not built | `scalar-probe`, then the planner's decision (decision 5.4, `docs/plans/scalar-decision.md`) |
 | 9 | Edit-to-playing at most 30 s per platform | The measurement section 4 defines. Result file `edit-to-playing` | Not measured and not defined. The dev profile and the linkers are configured (D125, row 63). No game crate exists | `measure`, the quiet window, session B |
 
 Of what section 22 says milestone 1 delivers, the simulation track's crates are merged, with
@@ -58,12 +58,12 @@ words. Section 6 gives the exact text of every row this plan changes.
 
 | Row | Opening words | Owner | What closes it |
 |---|---|---|---|
-| 14 | Scalar precision | `scalar-probe`, then the planner | The probe's result file and the scalar decision entry |
+| 14 | Scalar precision | `scalar-probe`, then the planner | Closed: the probe's result file and the scalar decision entry, D146. 64-bit stays |
 | 17 | Prediction-world snapshot cost | `measure`, `spike-net` | The slot, proxies included, measured through `lactose-predict` with Rapier; decision 5.5 settles copy-on-write |
 | 20 | Physics phase stall | `measure` for the share; re-gated for the stall | Split in two. The phase's share of the tick is measured at milestone 1 on the composed tick. The stall on render recording moves to milestone 2: nothing records a frame before `render-graph` exists |
 | 31 | Whether Rapier, parry or its math crates call `wide::mul_add` | `sour-evidence` | A reading of the pinned sources. This plan's search found no call site in `rapier3d-f64` 0.36.0, `parry3d-f64` 0.31.1, `nalgebra` 0.35.0 or `glamx` 0.3.1, and twenty mentions in `simba` 0.10.2 that the lane classifies |
 | 40 | Rapier's serialised snapshot is iteration-order stable | `sour-evidence` | The physics bytes' hash recorded under SOUR and equal on three platforms in a nightly |
-| 41 | Rapier's 64-bit build uses SIMD | `scalar-probe` | A reading of the vendored source and one disassembly; it is the cost half of the scalar decision |
+| 41 | Rapier's 64-bit build uses SIMD | `scalar-probe` | Closed: a reading of the vendored source and one disassembly. The contact solver runs two 64-bit lanes per NEON instruction against 32 bits' four, and four per AVX instruction on x86-64-v3. It is the cost half of the scalar decision, which D146 records beside the measured 64-bit rollback loop; no 32-bit loop is owed |
 | 42 | `std::fs::File::sync_all` issues `F_FULLFSYNC` | Pass, then `data-path` | The pass records the Windows CI run of `crates/io`'s tests. `data-path` reads the pinned toolchain's std for the two Windows calls. Durability after a power loss is not measurable here and is stated as the platform's contract (row text in section 6) |
 | 43 | Directory fsync after a rename | Re-gated to 4 | macOS is measured. The file systems still open are deployment targets, and section 22.1 gives the disk-full and corrupt-save paths to milestone 4 |
 | 63 | `lld-link` on Windows | `measure`, the quiet window, session B | The edit-to-playing result files |
@@ -85,12 +85,12 @@ words. Section 6 gives the exact text of every row this plan changes.
 | new | The physics hash beside the world hash (D145) | `physics-records` | Its streams equal in every SOUR mode on the M1, then on three platforms in the first nightly that holds it |
 | 89 | `World::query` visits every live entity | `ecs-a` | Its merge |
 | 90 | `lactose-input` is implemented | Pass | The x86-64 confirmations are CI's. The world-frame check against the camera rig stays at milestone 2 |
-| 93 | `lactose-net-api` is implemented | `sour-evidence`, `spike-net`, the scalar decision | The `ProtocolHash` pinned over `Game::types()` (C3). The spike measures the gather path. The quantiser bounds follow the scalar |
-| 94 | `lactose-predict` is implemented | `spike-net`, `measure` | Ring depth, the slot with Rapier and the absorbed figures. How a re-spawned body presents is milestone 2's (row text in section 6) |
+| 93 | `lactose-net-api` is implemented | `sour-evidence`, `spike-net`, the scalar decision | The `ProtocolHash` pinned over `Game::types()` (C3). The spike measures the gather path. The quantiser bounds follow the scalar, which stays 64-bit (D146): a position round-trips exactly for every quantised value, a 32-bit scalar's bound of 2^24 units does not apply, and the rotation quantiser's figures stand as measured |
+| 94 | `lactose-predict` is implemented | `spike-net`, `measure` | The slot with Rapier and the absorbed figures. Milestone 1 records no derived ring depth: `app` builds at `DEFAULT_DEPTH` (D146), and the depth moves to the verification row "The frame re-simulation budget has no figure", gated at milestone 4. How a re-spawned body presents is milestone 2's (row text in section 6) |
 | 99 | `World::insert` of a component the row already holds | `ecs-a` | Its merge |
 | 101 | `cargo-deny` 0.20.2 skips a path source | Workflow pass | The workflow pins `cargo-deny`. The row becomes a standing check at each change of the pin, gate none |
 | 102 | The `sin_cos` patch is not upstream | Already reported upstream; the coordinator links the reports | The links in `vendor/README.md` |
-| 105 | The reconciliation tolerance (D124) | `spike-net`, the scalar decision | The spike's figures under the defaults; the defaults are re-set only if the scalar changes |
+| 105 | The reconciliation tolerance (D124) | `spike-net`, the scalar decision | The spike's figures under the defaults; the defaults are re-set only if the scalar changes, and it does not (D146). Milestone 1's part is closed. The re-set from the spike's figures is milestone 4's, after the sleep-state rule for claimed bodies |
 | 106 | An empty solver is a fresh solver (D124) | Pass, `measure` | x86-64 is CI's nextest of `crates/physics-rapier/tests/reload.rs`. `measure` records the full diff's cost on a 100k-entity reload |
 | 108 | Rapier step never blocks a pool thread | Pass | Closed by D123 |
 | 109 | Every channel is cleared at a run's closing sync point | `spike-net` | A carrier column reconciled against a server |
@@ -405,7 +405,13 @@ walking step rounds by up to half of that each tick, and 36,000 ticks accumulate
 random walk. What would change this: the probe passing. The owner is then asked whether to
 commission the branch (the scalar in `lactose-math` with new golden vectors, a second vendored
 Rapier, the quantiser bounds, every SOUR mode), which is worth its cost only if the 64-bit rollback
-loop leaves the ring shallower than the deepest correction the spike records.
+loop leaves the ring shallower than the deepest correction the spike records. The probe did not
+pass: on upstream 32-bit Rapier the walk scene at x = 6 km differs from the origin run by
+157.75 mm (`docs/results/scalar-precision-apple-m1-2026-11-14.md`). Its second run took 12 km in
+place of 8 km, which lies in 6 km's binade, and it found a speed bias where this paragraph
+expected a random walk. 64 bits stay and the branch is not built. The cost condition above does
+not arise, since it was written for a probe that passed. A shallow ring is `lactose-predict`'s
+question at its milestone 4 review (D146, `docs/plans/scalar-decision.md`).
 
 **5.5 Copy-on-write snapshots are not built, and a prediction world holds at most 64 fixed
 colliders and proxies as rows.** D34 builds copy-on-write only if the milestone 1 measurement
@@ -536,10 +542,11 @@ Answered the same day, each as this plan recommended:
    (decision 5.10). Recommended: yes. Fourteen runs leave milestone 1 and none leaves the project.
 4. If `keeper` does not reach 20 µs: whether the tick-start criterion is restated at 35 µs in
    revision 3.3. Recommended: yes, with the cause or the failed attempt recorded.
-Still open:
+No longer open (D146):
 
 5. The reference map's extent, only if the probe's 6 km and 8 km runs fall on different sides of
-   one millimetre.
+   one millimetre. Moot: the runs read, at 6 km and 12 km, both exceed one millimetre, and no
+   extent is set.
 
 Withdrawn: whether the projection may stand as proof of criterion 1. It no longer does. It comes
 back as a question only if session A shows fewer than eight performance cores.
@@ -765,7 +772,7 @@ Milestone 1 exits when these have happened, in this order.
    that holds `timer-windows` and, if one is made, the follow-up that sets its Windows threshold
    back (D144).
 2. The planner has written the scalar decision from the probe and the measured rollback loop, and
-   the owner has approved it.
+   the owner has approved it: `docs/plans/scalar-decision.md`, D146.
 3. Every queue of section 3 has drained, so section 22's delivers are on main: the parallel ECS
    runner, SILO, the RICOTTA skeleton, the RHI spike's result, and `lactose-rhi-null` unless the
    owner has moved it to milestone 2.

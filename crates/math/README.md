@@ -128,7 +128,8 @@ in with another rounding mode, or with subnormals flushed, gets different bits.
 
 ## The float width
 
-`Scalar` is 64-bit until the milestone 1 precision test (architecture section 16). The
+`Scalar` is 64-bit: milestone 1's precision test decided it, and no 32-bit branch is built
+(architecture section 16, D146). The
 primitive is named only in the private module `raw`, with its bit type, constants and `libm`
 bindings; switching is an edit to that file plus a regenerated golden table, never a Cargo
 feature, because features unify across a build and an outside crate could then change

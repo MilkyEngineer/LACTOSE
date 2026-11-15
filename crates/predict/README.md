@@ -1029,8 +1029,9 @@ README.md`, "The applier")
   carries a changed entity at milestone 4.
 - Forwarding nearby players' inputs into the prediction world (section 9.4, "later"): the
   same `PlayerSample` per player in the `TickInput`; nothing here changes.
-- The tolerance's defaults re-set from the spike's `absorbed` figures and from the scalar
-  decision, and `net`'s release of a thrown object at rest: milestone 1 and 4.
+- The tolerance's defaults re-set from the spike's `absorbed` figures, and `net`'s release of
+  a thrown object at rest: milestone 4. The scalar decision re-sets none: the scalar stays
+  64-bit, the width the defaults were set under (D146).
 - Region resources corrected per tick, and `OwnedBy` replicated: `net`'s and the ECS's,
   milestone 4; until then a prediction system that reads one the server mutates is the
   game's hazard, and one that names `OwnedBy` is refused.
