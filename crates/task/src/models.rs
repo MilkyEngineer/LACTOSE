@@ -498,9 +498,12 @@ fn work(
         if permit {
             let take = |entries: usize| entries.checked_sub(1);
             if queue.fetch_update(Ordering::AcqRel, Ordering::Acquire, take).is_ok() {
-                // Stands for shutdown: lets the other worker's model thread end.
+                // Stands for shutdown, and wakes as `Shared::shut_down` does: lets the other
+                // worker's model thread end.
                 taken.store(true, Ordering::SeqCst);
-                sleep.notify_all(|worker| sleep.wake_worker(worker, || wake.unpark(worker)));
+                sleep.notify_all(|_| {});
+                (0..wake.threads.len())
+                    .for_each(|worker| sleep.wake_worker(worker, || wake.unpark(worker)));
                 break;
             }
             gate.release_idle(wake);
@@ -672,8 +675,10 @@ fn an_earlier_timer_reaches_the_parked_keeper() {
                 }
                 // The keeper must come to watch the earlier deadline on its own.
                 wait_for_watch(1);
+                // Stops the keeper as `Shared::shut_down` does.
                 stop.store(true, Ordering::SeqCst);
-                sleep.notify_all(|worker| sleep.wake_worker(worker, || keeper.unpark()));
+                sleep.notify_all(|_| {});
+                sleep.wake_worker(0, || keeper.unpark());
             })
         };
 

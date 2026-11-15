@@ -251,13 +251,10 @@ impl Pool {
         self.wake_worker(worker);
     }
 
-    pub(crate) fn wake_all(&self) {
-        self.sleep.notify_all(|worker| self.wake_worker(worker));
-    }
-
     /// Wakes `worker`, timed wait included ([`Sleep::wake_worker`]). Every wake of a worker
-    /// that may be in the idle protocol goes through this; a spare one costs a trip round
-    /// [`Sleep::park`].
+    /// that may be in the idle protocol goes through this, once per wake: after a claim of
+    /// that one worker, or, in `open_gate` and `Shared::shut_down`, for every worker after
+    /// a claim of every sleeper. A spare one costs a trip round [`Sleep::park`].
     fn wake_worker(&self, worker: usize) {
         self.sleep.wake_worker(worker, || self.threads[worker].unpark());
     }
@@ -298,10 +295,10 @@ impl Pool {
     /// Ends a `block_in_place` started with the same `reserved`.
     pub(crate) fn open_gate(&self, reserved: u32) {
         self.gate.open(reserved as usize, self);
-        self.wake_all();
-        // Openers that parked on their latch with nothing on their deque announced
-        // nothing, and a worker another waker has claimed is not woken by `wake_all`; both
-        // are woken here.
+        // Claims every sleeper, then wakes every worker once: the sleepers just claimed,
+        // openers that parked on their latch with nothing on their deque and announced
+        // nothing, and workers another waker has claimed but may not have woken yet.
+        self.sleep.notify_all(|_| {});
         (0..self.threads.len()).for_each(|worker| self.wake_worker(worker));
     }
 
@@ -636,9 +633,10 @@ impl Shared {
             replay.abandon();
         }
         for pool in [&self.frame, &self.background] {
-            pool.wake_all();
-            // A worker parked on a scope latch has no sleeper bit for `wake_all` to claim,
-            // and one another waker has claimed is skipped by it; both are woken here.
+            // Claims every sleeper, then wakes every worker once: the sleepers just claimed,
+            // workers parked on a scope latch, which have no sleeper bit, and workers
+            // another waker has claimed but may not have woken yet.
+            pool.sleep.notify_all(|_| {});
             (0..pool.threads.len()).for_each(|worker| pool.wake_worker(worker));
         }
         // Once now, so nothing that waits on cancelled work has to wait for the joins,
