@@ -1000,8 +1000,9 @@ fn unbumped_schemas(component: ComponentKey) -> Vec<ComponentSchema> {
         .collect()
 }
 
-/// The digest case of the test above: the diff refuses the saved column (`InvalidData`) and
-/// the loader refuses the cook (`VersionMismatch`) before the ECS sees it.
+/// The digest case of `a_baseline_column_in_another_schema_is_refused_as_stated`: the diff
+/// refuses the saved column (`InvalidData`) and the loader refuses the cook
+/// (`VersionMismatch`) before the ECS sees it.
 #[test]
 fn a_baseline_column_at_its_version_with_another_digest_is_refused_by_the_diff_and_the_loader() {
     let id = c(A, 1);
