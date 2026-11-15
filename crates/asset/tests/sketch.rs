@@ -11,7 +11,7 @@
 #![allow(dead_code, unused_variables, missing_docs)]
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use lactose_asset::{
@@ -104,15 +104,21 @@ fn app_mount(executor: &Executor, store: &Store, packs: &[PathBuf]) -> Result<()
 }
 
 /// The cooked pack set of a cooked directory, every member mounted or none run on: a
-/// member's failure is the start-up's, naming the pack, which the store's error does not.
+/// failure is the start-up's, naming the directory whose listing failed or the pack whose
+/// mount failed, which the pool's and the store's errors do not.
 fn app_mount_cooked(executor: &Executor, io: &Io, store: &Store, cooked: PathBuf) -> Result<()> {
-    for pack in executor.block_on(pack_set(io, cooked))? {
-        executor.block_on(store.mount(&pack)).map_err(|error| {
-            Error::new(error.kind(), format!("{}: {}", pack.display(), error.message()))
-                .with_source(error)
-        })?;
+    for pack in executor.block_on(pack_set(io, &cooked)).map_err(at(&cooked))? {
+        executor.block_on(store.mount(&pack)).map_err(at(&pack))?;
     }
     Ok(())
+}
+
+/// `error` with `path` before its message, and kept as its source.
+fn at(path: &Path) -> impl FnOnce(Error) -> Error + '_ {
+    move |error| {
+        Error::new(error.kind(), format!("{}: {}", path.display(), error.message()))
+            .with_source(error)
+    }
 }
 
 /// The same packs with every mount in flight at once: the place in the mount order is

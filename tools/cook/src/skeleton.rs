@@ -552,6 +552,61 @@ mod tests {
         }
     }
 
+    /// Every name the schema reads, written in a source, is read as its value. The encoder's
+    /// test starts from anim's values and never goes through the reader, so a name mapped to
+    /// another value is caught here alone.
+    #[test]
+    fn every_name_in_a_source_is_read_as_its_value() {
+        let collider =
+            r#""collider": {"shape": {"sphere": {"radius": 1}}, "membership": 1, "filter": 2}"#;
+        let bone = |json: &str, index: usize| read_json(json).unwrap().bones[index];
+        for (name, role) in [
+            ("hips", BoneRole::Hips),
+            ("spine", BoneRole::Spine),
+            ("head", BoneRole::Head),
+            ("hand_left", BoneRole::HandLeft),
+            ("hand_right", BoneRole::HandRight),
+            ("foot_left", BoneRole::FootLeft),
+            ("foot_right", BoneRole::FootRight),
+        ] {
+            let mark = format!(r#"{{"bone": {{"role": "{name}"}}}}"#);
+            assert_eq!(bone(&one_bone(&mark), 0).role, role, "{name}");
+        }
+        for (name, body) in [
+            ("dynamic", RigidBody::dynamic()),
+            ("kinematic", RigidBody::kinematic()),
+            ("fixed", RigidBody::fixed()),
+        ] {
+            let mark = format!(r#"{{"bone": {{"body": {{"body_type": "{name}", {collider}}}}}}}"#);
+            assert_eq!(bone(&one_bone(&mark), 0).body.unwrap().body, body, "{name}");
+        }
+        for (name, axis) in [
+            ("translation_x", locked_axes::TRANSLATION_X),
+            ("translation_y", locked_axes::TRANSLATION_Y),
+            ("translation_z", locked_axes::TRANSLATION_Z),
+            ("rotation_x", locked_axes::ROTATION_X),
+            ("rotation_y", locked_axes::ROTATION_Y),
+            ("rotation_z", locked_axes::ROTATION_Z),
+        ] {
+            let mark =
+                format!(r#"{{"bone": {{"body": {{"locked_axes": ["{name}"], {collider}}}}}}}"#);
+            assert_eq!(bone(&one_bone(&mark), 0).body.unwrap().body.locked_axes, axis, "{name}");
+        }
+        for (name, kind) in [
+            ("fixed", JointKind::Fixed),
+            ("spherical", JointKind::Spherical),
+            ("revolute", JointKind::Revolute),
+            ("prismatic", JointKind::Prismatic),
+        ] {
+            let json = format!(
+                r#"{{"asset": {{"version": "2.0"}}, "nodes": [
+                    {{"name": "a", "children": [1], "extras": {{"lactose": {{"bone": {{"body": {{{collider}}}}}}}}}}},
+                    {{"name": "b", "extras": {{"lactose": {{"bone": {{"body": {{"joint": {{"kind": "{name}"}}, {collider}}}}}}}}}}}]}}"#
+            );
+            assert_eq!(bone(&json, 1).body.unwrap().joint.unwrap().kind, kind, "{name}");
+        }
+    }
+
     #[test]
     fn a_validate_refusal_names_the_node_of_the_bone_it_names() {
         // Two hips: the second bone, node 1, is the one validate refuses.
