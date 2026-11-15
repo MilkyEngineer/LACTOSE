@@ -38,7 +38,7 @@ Section 22 gives milestone 1 nine criteria. Status is what the tree and CI show 
 | 2 | SOUR passes in workers, repeat, layout and chaos modes | `cargo xtask sour run --nightly` on linux-x64, windows-x64 and macos-arm64, the nightly run's id recorded in row 122 | Green as a matrix, hollow in three places. CI run 43556574172 passed the pull-request modes at `3264406`; nightly 43408989655 passed every mode on three platforms at `d7827ea`, before the app and asset merges. The assembly's test and `lactose-predict`'s report the session's layout and chaos seed as applied instead of the world's and the executor's (X1). Each system is one graph node, so workers and chaos modes exercise no system (row 74). `lactose-ecs` is not a `[harness]` package | `sour-evidence`, `ecs-fork`, then the first nightly that holds both |
 | 3 | Physics snapshot conformance | `crates/physics-rapier/tests/conformance.rs` over `physics_api::conformance::snapshot_restore`: ten ticks, a snapshot at three, a restore, equal hashes at ten, on solver pools of one, two and four threads and two layouts | Met inside one process on every CI platform (run 43556574172). Its hashes and the hash of the physics bytes are not compared across platforms (M3) | `sour-evidence` records them; the first nightly that compares them closes it |
 | 4 | Physics phase at most 3 ms for 2,000 awake bodies | A new cost test: the physics stage of `Simulation::step` (`physics-api`'s sync, the Rapier step, the write-back) at 100k rows with 2,000 awake bodies. Result file `physics-phase` | Not measured as a phase. Its parts, on the M1 at load 3.5 to 5 (row 87): the step 0.97 to 0.99 ms on four solver threads and 1.24 to 1.27 ms on one, the sync 0.96 ms, the write-back 0.42 ms. The sum is 2.35 to 2.65 ms | `measure`; `ecs-kernel` takes the column scans (0.75 ms of the sync) down |
-| 5 | Prediction-world snapshot at most 100 µs | A new cost test: the take of one ring slot (`World::snapshot` plus `physics_api::snapshot`) through `lactose-predict` with Rapier, on the spike's scene. Result file `prediction-slot` | Not measured as a slot. Its parts: the world snapshot 5.4 µs with no statics (row 17); Rapier's write 32 µs beside no fixed collider and 92 µs beside 100 (row 87) | `measure`, confirmed by `spike-net`; decision 5.5 |
+| 5 | Prediction-world snapshot at most 100 µs | A new cost test: the take of one ring slot (`World::snapshot` plus `physics_api::snapshot`) through `lactose-predict` with Rapier, on the spike's scene. Result file `prediction-slot` | Not measured as a slot. Its parts: the world snapshot 5.4 µs with no statics (row 17); Rapier's write 32 µs beside no fixed collider and 92 µs beside 100 (row 87). The quiet window measured the slot at 140.8 µs: not met (D143, `docs/plans/criterion-5-proposal.md`) | `measure`; `slot-copy`, then the second quiet window (section 3); decision 5.5 as D143 amends it |
 | 6 | Sim-skeleton evaluation at most 0.5 ms for 200 characters | `the_sim_skeleton_budget` in `crates/anim/tests/cost.rs`, its figure (b). Result file `sim-skeleton` | Met on the M1: 196.9 µs on one worker and 189.3 µs on four, at load 3 to 4 (row 115). No result file, and no x86 figure | The quiet window and session B (section 4) |
 | 7 | Netcode spike over a throwaway transport: x86 server, aarch64 client, four scenarios, the correction rate, the largest absorbed difference per kind, rollback cost per tick and divergence recorded | `crates/app/tests/spike.rs` made to run (decision 5.3): its scenes recorded under SOUR, its figures in result file `spike-net` | Not started. The file is a compile-only sketch. The prediction world `lactose-app` builds loads every region `Replicated`, so it predicts nothing (S1); the fix round is in flight | `client-fix`, `sour-evidence`, `spike-net` |
 | 8 | Scalar decided by the section 16 rule | A precision probe's result file `scalar-precision` and a decision entry | Nothing exists. No document states the full map extent the rule tests at | `scalar-probe`, then the planner's decision (decision 5.4) |
@@ -148,6 +148,7 @@ The lanes that follow, in the order their dependencies allow:
 | `binds-impl` | Implements `binds-design` in `lactose-persist`, `lactose-sim`, `lactose-ecs` and `lactose-app` | `binds-design` and `ecs-fork` merged | A fresh process that leaves a predicted owner's region unloaded hashes equal to the original, beside section 15.5's tests; the `NetId` counter above every runtime ID a world is given (the row "A `Server` world's direct spawn under a runtime `NetId`"); a world resource that holds an entity reference refused where it is inserted (the row "ECS implementation gaps after its reviews (D117)"); a server holding no bind of an entity despawned in a step between steps | 7 |
 | `keeper` | One bounded attempt at the tick-start criterion (section 6, first entry), and the wall-clock log of samples over 1 ms (row 78) | Session A's numbers | Result file `whisk` from a quiet M1, or the cause stated | 4 to 8, counted as 6 |
 | `readme-sweep` | Text only: README sentences that are stale, misattribute the `net-api` and `net-host` split, wait for crates that have merged, or name a crate by a codename (the review's C4, C6, C8, C9 a and c, and S6) | `stream-design` decided, for the one sentence that cites it | Every corrected sentence names what it now agrees with | 4 |
+| `slot-copy` | The prediction slot holds the backend's world as a copy (D143). `lactose-physics-api`: the trait `BackendCopy` with its one method `encode`; `PhysicsBackend::copy` and `PhysicsBackend::restore_copy`, with default bodies through `snapshot` and `restore`; `PhysicsSnapshot` holds the copy, and `PhysicsSnapshot::size_in_bytes` and `PhysicsSnapshot::hash` encode it once on their first call and keep the length and the hash; the doc comments of `PhysicsBackend::snapshot`, of the free `snapshot` and `restore`, and of `ConformanceReport::snapshot_bytes`. No bytes accessor. `lactose-physics-rapier`: the copy is a clone of every set and of the bookkeeping, built by destructuring `PhysicsWorld` with no `..`, shapes shared, and refused for a shape the backend did not build; a restore from it builds a fresh pipeline. `lactose-predict`: `SlotBytes`, `Ring::slot_bytes` and `Ring::bytes` report the bytes the backend would write, not what a slot holds, and their doc comments say so and state their cost. `crates/app/tests/spike.rs`: `cost_of_a_prediction_slot` takes into a full ring. The interface amendment is called out in its merge (section 20). The three READMEs' slot sentences | `stream-impl` merged, which rewrites `crates/predict/README.md` | `physics-api`'s conformance run through the copy on every pool size and layout, with the bytes of a copy equal to the backend's bytes after each of its ten ticks. The first review's backend probe adopted as a test under a name that says what it proves: joints of every kind made and removed, sleeping bodies woken, a shape replaced while older copies share the old one, on pools of one, two and four threads; from every restore point twelve ticks agree in bytes and reports between the copy, the bytes and the run itself; it fails when the restore keeps the live pipeline. The refusal at a take, as two tests, since no public call can put a foreign shape in a Rapier world: a unit test of `lactose-physics-rapier` that puts one into the crate-private collider set and sees the take refused, and `lactose-predict`'s take through its `Flaky` test backend, the slot taken without its physics. The spike's four recording tests record the hashes they recorded before the change, in the pull-request, layout and chaos modes. `cargo xtask measure prediction-slot rollback-seven-ticks` before and after, with load, as steering. The ring's memory per slot, counted in a test under `lactose-core`'s tagged allocator, since no accessor reports it | 7 |
 
 Document work beside the tracks: this plan's review and answer (2 runs); revision 3.3 (3); the
 scalar decision (3); the definition of the GPU reviewer and its review (2); the exit of section 7
@@ -158,6 +159,9 @@ four or five: 15 to finish the lanes in flight, 131 for the lanes above and 18 f
 work. Document rounds have run long too, and this plan's answer and revision 3.3's eighteen items
 are counted low. If the owner moves `rhi-api` and `rhi-null` to milestone 2 (decision 5.10),
 fourteen of these runs leave milestone 1.
+
+D143 adds `slot-copy`, seven runs, and five for its proposal's two reviews, two revisions
+and its application.
 
 Three lanes need a facade first: `stream-impl`, `binds-impl` and `rhi-null`. No other lane does.
 `lactose-ecs`'s surface is final but for `schema-digest`'s export of `document_schema`,
@@ -170,10 +174,10 @@ unblocked.
 | Queue | Lanes, in order | Runs |
 |---|---|---|
 | 1, the ECS and then render | `scalar-probe`, `ecs-a`, `ecs-kernel`, `ecs-fork`, `spike-rhi`, `rhi-api`, `rhi-null`, `keeper`, `readme-sweep` | 51 |
-| 2, the client and then the save path | `client-fix`, `sour-evidence`, `spike-net`, `stream-impl`, `data-path`, `binds-design`, `binds-impl` | 49 |
+| 2, the client and then the save path | `client-fix`, `sour-evidence`, `spike-net`, `stream-impl`, `slot-copy`, `data-path`, `binds-design`, `binds-impl` | 56 |
 | 3, assets and tools | `silo`, `stream-design`, `xtask-policy`, `measure`, `schema-digest`, `ricotta`, `schema-guard` | 46 |
 
-Five rules bind whatever the coordinator reorders:
+Six rules bind whatever the coordinator reorders:
 
 - One lane at a time edits `lactose-ecs`. `schema-digest`, `stream-impl` and `binds-impl` all edit
   it, and each starts after `ecs-fork` has merged. An architect round that adds a signature to it
@@ -191,6 +195,12 @@ Five rules bind whatever the coordinator reorders:
   `schema-digest`, `stream-impl` if it is late) runs `cargo xtask measure` for the criteria it
   touches and reports the figures as steering. The exit's reviewer compares them with the measured
   files.
+- Criterion 5 is proven at the first commit of main that holds `slot-copy`, not at the measurement
+  commit. The coordinator runs `cargo xtask measure prediction-slot rollback-seven-ticks` there in
+  a second quiet window, and those two files replace the measurement commit's for criteria 5 and
+  7. The cost test takes into a full ring by then, so the snapshot's figure includes the drop of
+  the world snapshot and the physics snapshot it evicts. Every other file of the measurement
+  commit stands, and session B is unchanged: its slot figure is recorded, of the byte form (D143).
 
 **Where this reorders the coordinator's queue, and why.**
 
@@ -256,7 +266,7 @@ session A's files.
 |---|---|---|---|
 | 1, the 100k tick | `cost_of_a_tick_at_100k_rows`: T₁ and T_N, the median step on one frame worker and on N, in one sitting; N is the performance cores up to eight, and S is derived from the two (decision 5.1) | Steers, and proves nothing: 7·T₄ − T₁ at most 24 ms | The proof: T₈ at most 4 ms on eight frame workers, one for each of eight performance cores |
 | 4, the physics phase | The new phase test: 100k rows, 2,000 awake bodies on a floor, the solver pool at `lactose-app`'s default (frame workers minus one) | At most 3 ms | At most 3 ms |
-| 5, the snapshot | The new slot test: the spike's scene, one character, fifty claimed bodies, its fixed colliders and its proxies | The take at most 100 µs; the restore recorded | Recorded; the client of criterion 7 is the aarch64 machine |
+| 5, the snapshot | The new slot test: the spike's scene, one character, fifty claimed bodies, its fixed colliders and its proxies | The take with its eviction at most 100 µs; the restore recorded | Recorded; the client of criterion 7 is the aarch64 machine |
 | 6, the sim skeleton | `the_sim_skeleton_budget`, figure (b) | At most 0.5 ms | At most 0.5 ms |
 | 7, rollback cost per tick | The spike's measurement test | Recorded; it has no budget | Not run |
 | 9, edit-to-playing | From saving a one-line change to the report line of `cargo run -p lactose-app-headless -- 1`; dev profile, warm build, the median of five. Two edits, each in a function body: the sketch game's system in `crates/app-headless/src/main.rs`, and a function of `lactose-app`. The criterion is read against the slower (decision 5.9) | At most 30 s | At most 30 s on each operating system it boots; a runner's figure, marked as such, for one it does not |
@@ -397,7 +407,11 @@ design what replaces it. Section 9.4 gives the prediction world "the immutable s
 asset", but today `physics-api`'s snapshot carries the backend's whole world (section 10, D119), so
 holding cooked static scenery outside the per-tick snapshot changes that contract; it is listed for
 revision 3.3. What would change this: the slot measured through `lactose-predict` at the
-measurement commit exceeding 100 µs on the spike's scene.
+measurement commit exceeding 100 µs on the spike's scene. It did: the quiet window measured
+140.8 µs. D143 replaces this decision's cost sentences, from "The cost is Rapier's serialisation
+of each fixed collider" to "At 64 the take is about 76 µs and the restore about 92 µs", which are
+of bodies that touch nothing. The slot holds a copy, and the bound of 64 stands until the copied
+slot is measured (`docs/plans/criterion-5-proposal.md`).
 
 **5.6 The bundle's layout digest lands in milestone 1, before the cooker.** D129 left
 `ComponentSchema` without the digest, so a same-size layout change without a version bump is
@@ -726,7 +740,9 @@ with these four:
 Milestone 1 exits when these have happened, in this order.
 
 1. The measurement commit exists. The quiet window and session B have run on it, and their result
-   files are on main. Session B's run on eight frame workers is criterion 1's proof.
+   files are on main. Session B's run on eight frame workers is criterion 1's proof. The second
+   quiet window has run at the first commit that holds `slot-copy`, and its two files are
+   criterion 5's proof and criterion 7's rollback figure (D143).
 2. The planner has written the scalar decision from the probe and the measured rollback loop, and
    the owner has approved it.
 3. Every queue of section 3 has drained, so section 22's delivers are on main: the parallel ECS
