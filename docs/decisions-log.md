@@ -4592,15 +4592,16 @@ relayed by an event when it acts on another body** (§6.1, §10, `lactose-ecs`,
     `lactose-predict`'s corrections therefore apply each tombstone and each move to the one
     entity it names (`World::despawn_alone`, `World::move_alone_to_region`, which a `Server`
     world refuses, so that no despawn and no move leaves an owned entity behind where a region
-    is exported; D141). A direct write on a server can still leave one, by naming a despawned
-    predicted owner or a predicted origin that has no alias, until D141's rule for a server's
-    `OwnedBy` is implemented (`docs/verification.md`); from then on a server stores no owner its
-    export cannot write. What still walks a client's edges is a prediction system's own
-    `Commands::despawn` or `Commands::move_to_region` (`docs/verification.md`); a game that
-    needs the server's ownership on a client needs `OwnedBy` replicated, a `net-api` change.
-    Rules out a table of unloaded entities' edges consulted at writes (it would need persistence
-    and could not see a client's stale documents), refusing a load an honest history produced,
-    and an order-independent rule that would rewrite live rows of other regions.
+    is exported; D141). A direct write on a server could store such an owner until D141's rule
+    for a server's `OwnedBy` was implemented (lane stream-impl); a server now stores no owner
+    its export cannot write, on a direct write, at command apply or at a load, and an owner that
+    returns inside the window takes back what the rule stored under its `Net` key. What still
+    walks a client's edges is a prediction system's own `Commands::despawn` or
+    `Commands::move_to_region` (`docs/verification.md`); a game that needs the server's
+    ownership on a client needs `OwnedBy` replicated, a `net-api` change. Rules out a table of
+    unloaded entities' edges consulted at writes (it would need persistence and could not see a
+    client's stale documents), refusing a load an honest history produced, and an
+    order-independent rule that would rewrite live rows of other regions.
   - *An owned entity need not reside in its owner's region; writing `OwnedBy` moves nothing.*
     D12 is a rule for `move_to_region` and `despawn`, which take the tree; an entity given to
     an owner elsewhere stays until that owner next moves, and an owner's region may unload
@@ -5347,6 +5348,34 @@ relayed by an event when it acts on another body** (§6.1, §10, `lactose-ecs`,
   own despawns when it ends, so on a server the window of the rule's first clause is the rest of
   the despawning step, or the whole of the next step for a despawn through `world_mut()` between
   steps.
+- Addendum (lane stream-impl, 2026-11-15; review rounds 1 and 2): implemented in `lactose-ecs`,
+  `lactose-net-api`, `lactose-predict` and `lactose-anim`.
+  - Where the server's rule holds:
+    - On the four direct writes, through `World::exportable_owner`, before the equal-bytes test.
+    - At command apply: a predicted origin with no alias is dropped and logged as a cycle is; a
+      dead owner is emptied, as any reference to a dead entity is.
+    - At `load_region`, for an owner outside the document. That is an `OwnershipChange`'s owner
+      and equally the document's own `ecs::owned_by` component, which a load stores as it stores
+      the record's. In every kind of world, a load refuses with `InvalidData`, nothing changed,
+      a component that names a key other than a `NetId`.
+  - D141 assumed that a despawned entity never returns inside the window. It may: by `spawn` or
+    `spawn_erased` under either key, by a predicted spawn at command apply whose alias is held,
+    or by a load of its region. A `Server` world then rekeys what the rule stored under the
+    `Net` key to the origin, so the tree follows the owner again and the stored bytes equal a
+    fresh process's after the horizon.
+  - A bind made while the origin is despawned inside the window, a re-bind of the held pair
+    among them, rewrites nothing, so the rule survives it.
+  - While the owner is dead and its alias held, `owned_by` and `referrers` under either key list
+    nothing for a row the rule rewrote.
+  - The presence rules live in a private `presence` module of `lactose-predict`. They run in
+    ascending registry key order, for claimed entities only. A statement key that is not a
+    transient unreplicated component is logged and dropped: a warning live, a debug line in a
+    replay.
+  - The fold: a Claimed or Rows fact with no statement inherits the kept whole fact's statement,
+    and Rows folded into a kept Claimed replace its statement.
+  - `moves_apply_once_and_an_owned_entity_follows_its_owner` (`lactose-net-api`) is replaced by
+    `moves_apply_once_each_to_the_entity_it_names`.
+  - The spike's digest stays 8db4551c007e6410 until `net`'s packer sends statements.
 
 **D142. Binds across a save: a world that starts from a save holds the save's binds before its first region loads; the `NetId` counter stays above every runtime `NetId` a world is given; no world resource holds an entity reference** (§6, §7, §8.3, §10, §15.4, §15.5, `lactose-persist`, `lactose-sim`, `lactose-ecs`, `lactose-app`)
 - Why: the whole-project review of milestone 1 (finding D1) found that a fresh process which

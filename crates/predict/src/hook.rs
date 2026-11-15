@@ -7,15 +7,16 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use lactose_bundle::ComponentData;
-use lactose_core::{Error, ErrorKind, NetId, PredictionKey, Result, StableKey, Tick};
+use lactose_core::{ComponentKey, Error, ErrorKind, NetId, PredictionKey, Result, StableKey, Tick};
 use lactose_ecs::{ClaimedBy, RegionId, World};
 use lactose_net_api::{StagedFrame, StagedInbox, StagedSpawn, Tombstone, TombstoneCause};
-use lactose_reflect::Reflect;
+use lactose_reflect::{Reflect, TypeRole};
 use lactose_sim::{StagedState, StreamingAnchor};
 
-use crate::fact::{Fact, written_components};
+use crate::fact::{Fact, spawned_components};
 use crate::predictor::LocalPlayer;
-use crate::staged_region::{names_placement, place_residence, placed, placement_data};
+use crate::presence::{self, Statement, unreplicated_transient};
+use crate::staged_region::{place_residence, placed, placement_data};
 
 /// The `StagedState` hook of the prediction world, installed by
 /// [`Predictor::new`](crate::Predictor::new) as the world's `dyn StagedState` service and
@@ -160,9 +161,61 @@ fn claimed_by(world: &World, local: LocalPlayer, key: StableKey) -> bool {
     world.get::<ClaimedBy>(key).is_some_and(|claim| claim.player == local.player)
 }
 
-/// Writes every component of `components` to the live `key`, each only if its bytes
-/// differ, and moves it to `region` if it resides elsewhere: an upsert. The caller
-/// records where it left a proxy ([`placed_by_frame`]); a full frame upserts claimed
+/// Logs what the hook skipped of a frame's entry; at debug in a replay, as [`refused`].
+fn skipped(what: &str, key: StableKey, component: ComponentKey, replaying: bool) {
+    if replaying {
+        tracing::debug!(target: "predict", ?key, component = component.0, "{what}: skipped");
+    } else {
+        tracing::warn!(target: "predict", ?key, component = component.0, "{what}: skipped");
+    }
+}
+
+/// Whether the hook writes `data`, a spawn's component or a row of `key`: a registered
+/// replicated component. Any other (unregistered, derived, an unreplicated transient or
+/// persistent one) is a defect of the sender, logged and skipped, the rest of the entry
+/// applied ("The hook"; D141).
+fn replicated(world: &World, key: StableKey, data: &ComponentData, replaying: bool) -> bool {
+    let info = world.registry().get(data.component);
+    if info.is_some_and(|info| info.role() == TypeRole::Component && info.tracking().replicated) {
+        return true;
+    }
+    let what = "a frame names a component that is not a registered replicated one";
+    skipped(what, key, data.component, replaying);
+    false
+}
+
+/// The registered replicated components of `components` ([`replicated`]).
+fn replicated_only(
+    world: &World,
+    key: StableKey,
+    components: &[ComponentData],
+    replaying: bool,
+) -> Vec<ComponentData> {
+    let kept = components.iter().filter(|data| replicated(world, key, data, replaying));
+    kept.cloned().collect()
+}
+
+/// What `frame` states of the unreplicated transient components of `key`, an entity the
+/// server has claimed for the local player, a key that is not a registered transient
+/// unreplicated component logged and dropped; `None` if the frame states none of it. Read
+/// for a claimed entity alone: the hook gives a proxy no unreplicated transient component.
+fn statement(world: &World, frame: &StagedFrame, key: StableKey, replaying: bool) -> Statement {
+    let stated = frame.transient.get(&key)?;
+    let registry = world.registry();
+    let valid = |component: &ComponentKey| {
+        let valid = registry.get(*component).is_some_and(unreplicated_transient);
+        if !valid {
+            let what = "a statement names a key that is not a transient unreplicated component";
+            skipped(what, key, *component, replaying);
+        }
+        valid
+    };
+    Some(stated.iter().copied().filter(valid).collect())
+}
+
+/// Writes every replicated component of `components` to the live `key`, each only if its
+/// bytes differ, and moves it alone to `region` if it resides elsewhere: an upsert. The
+/// caller records where it left a proxy ([`placed_by_frame`]); a full frame upserts claimed
 /// entities too, whose region is not the frames' to record.
 fn upsert(
     world: &mut World,
@@ -172,11 +225,14 @@ fn upsert(
     replaying: bool,
 ) {
     if world.region_of(key) != Some(region)
-        && let Err(error) = world.move_to_region(key, region)
+        && let Err(error) = world.move_alone_to_region(key, region)
     {
         refused("an upsert's move", key, &error, replaying);
     }
     for data in components {
+        if !replicated(world, key, data, replaying) {
+            continue;
+        }
         if let Err(error) = world.insert_erased(key, data) {
             refused("an upsert's component", key, &error, replaying);
         }
@@ -197,10 +253,11 @@ fn placed_by_frame(world: &mut World, key: StableKey, replaying: bool) {
     }
 }
 
-/// Spawns the proxy `key` in `region` with `components` and its placement among them, so
-/// the row is born in its final archetype rather than moved to one after the spawn; a
-/// frame that names the placement itself, which no server does, has it rewritten after
-/// the spawn. Returns whether the key is live.
+/// Spawns the proxy `key` in `region` with the replicated components of `components` and
+/// its placement among them, so the row is born in its final archetype rather than moved
+/// to one after the spawn; a frame that names the placement itself, which no server does,
+/// has it skipped as any unreplicated component is. A proxy gets no unreplicated transient
+/// component. Returns whether the key is live.
 fn spawn_proxy(
     world: &mut World,
     key: StableKey,
@@ -208,22 +265,10 @@ fn spawn_proxy(
     components: &[ComponentData],
     replaying: bool,
 ) -> bool {
-    let named = names_placement(components);
-    let result = if named {
-        world.spawn_erased(key, region, components)
-    } else {
-        let mut with_placement = Vec::with_capacity(components.len() + 1);
-        with_placement.extend_from_slice(components);
-        with_placement.push(placement_data(region));
-        world.spawn_erased(key, region, &with_placement)
-    };
-    match result {
-        Ok(()) => {
-            if named {
-                placed_by_frame(world, key, replaying);
-            }
-            true
-        }
+    let mut spawn = replicated_only(world, key, components, replaying);
+    spawn.push(placement_data(region));
+    match world.spawn_erased(key, region, &spawn) {
+        Ok(()) => true,
         Err(error) => {
             refused("a proxy's spawn", key, &error, replaying);
             false
@@ -252,21 +297,29 @@ fn apply_frame(
     facts
 }
 
-/// A full frame, whole: every spawn an upsert or a spawn with its claim set or removed,
-/// then moves, removals, every row and tombstones.
+/// A full frame, whole: every spawn an upsert or a spawn with its claim set or removed, a
+/// claimed one with the transient components the frame states of it; then moves, removals,
+/// every row and tombstones. Every move and despawn is of the one entity named.
 fn rebuild(world: &mut World, local: LocalPlayer, frame: &StagedFrame, replaying: bool) {
     for (&net, spawn) in &frame.spawns {
         let key = spawn.key(net);
         let live = world.contains(key);
+        let claimed = spawn.slot.is_none();
+        let transient = if claimed { statement(world, frame, key, replaying) } else { None };
         if live {
             upsert(world, key, spawn.region, &spawn.components, replaying);
-        } else if spawn.slot.is_some() {
+        } else if !claimed {
             if !spawn_proxy(world, key, spawn.region, &spawn.components, replaying) {
                 continue;
             }
-        } else if let Err(error) = world.spawn_erased(key, spawn.region, &spawn.components) {
-            refused("a spawn", key, &error, replaying);
-            continue;
+        } else {
+            let mut components = replicated_only(world, key, &spawn.components, replaying);
+            let registry = world.registry();
+            presence::born(registry, &mut components, &spawn.components, transient.as_ref());
+            if let Err(error) = world.spawn_erased(key, spawn.region, &components) {
+                refused("a spawn", key, &error, replaying);
+                continue;
+            }
         }
         bind(world, spawn.origin, net, replaying);
         let result = match spawn.slot {
@@ -281,7 +334,13 @@ fn rebuild(world: &mut World, local: LocalPlayer, frame: &StagedFrame, replaying
         if let Err(error) = result {
             refused("a claim", key, &error, replaying);
         }
-        if live && spawn.slot.is_some() {
+        if live && claimed {
+            let presence = presence::apply(world, key, &spawn.components, transient.as_ref());
+            if let Err(error) = presence {
+                refused("a statement of transient components", key, &error, replaying);
+            }
+        }
+        if live && !claimed {
             placed_by_frame(world, key, replaying);
         }
     }
@@ -290,7 +349,7 @@ fn rebuild(world: &mut World, local: LocalPlayer, frame: &StagedFrame, replaying
             continue;
         }
         if world.region_of(key) != Some(region)
-            && let Err(error) = world.move_to_region(key, region)
+            && let Err(error) = world.move_alone_to_region(key, region)
         {
             refused("a move", key, &error, replaying);
         }
@@ -308,14 +367,16 @@ fn rebuild(world: &mut World, local: LocalPlayer, frame: &StagedFrame, replaying
     for row in frame.rows() {
         if world.contains(row.key) {
             let data = ComponentData { component: row.component, bytes: row.bytes.to_vec() };
-            if let Err(error) = world.insert_erased(row.key, &data) {
+            if replicated(world, row.key, &data, replaying)
+                && let Err(error) = world.insert_erased(row.key, &data)
+            {
                 refused("a row", row.key, &error, replaying);
             }
         }
     }
     for &key in frame.despawns.keys() {
         if world.contains(key)
-            && let Err(error) = world.despawn(key)
+            && let Err(error) = world.despawn_alone(key)
         {
             refused("a tombstone", key, &error, replaying);
         }
@@ -343,10 +404,11 @@ fn apply_delta(
         match spawn.slot {
             None => {
                 let components = spawn.components.clone();
-                facts.push(Fact::Claimed { key, region: spawn.region, components });
+                let transient = statement(world, frame, key, replaying);
                 if !replaying {
-                    claim_spawn(world, local, key, spawn);
+                    claim_spawn(world, local, key, spawn, transient.as_ref());
                 }
+                facts.push(Fact::Claimed { key, region: spawn.region, components, transient });
             }
             Some(_) if !world.contains(key) => {
                 spawn_proxy(world, key, spawn.region, &spawn.components, replaying);
@@ -377,7 +439,7 @@ fn apply_delta(
             continue;
         }
         if world.region_of(key) != Some(region)
-            && let Err(error) = world.move_to_region(key, region)
+            && let Err(error) = world.move_alone_to_region(key, region)
         {
             refused("a move", key, &error, replaying);
         }
@@ -407,6 +469,7 @@ fn apply_delta(
                     _ => facts.push(Fact::Rows {
                         key: row.key,
                         components: vec![data],
+                        transient: statement(world, frame, row.key, replaying),
                         region: world.region_of(row.key),
                         claimed,
                     }),
@@ -417,6 +480,9 @@ fn apply_delta(
             // The proxy's state for this tick, a kinematic body's sweep target among it.
             (true, false, false) => {
                 let data = ComponentData { component: row.component, bytes: row.bytes.to_vec() };
+                if !replicated(world, row.key, &data, replaying) {
+                    continue;
+                }
                 if let Err(error) = world.insert_erased(row.key, &data) {
                     refused("a row", row.key, &error, replaying);
                 }
@@ -436,7 +502,7 @@ fn apply_delta(
         if claimed_by(world, local, key) || !world.contains(key) {
             facts.push(Fact::Destroyed { key });
         } else if !settled_by_its_region(world, key, tombstone)
-            && let Err(error) = world.despawn(key)
+            && let Err(error) = world.despawn_alone(key)
         {
             refused("a tombstone", key, &error, replaying);
         }
@@ -461,14 +527,21 @@ fn settled_by_its_region(world: &World, key: StableKey, tombstone: &Tombstone) -
 }
 
 /// Applies a claimed spawn's claim as a full frame does: `ClaimedBy` inserted on the live
-/// `key`, or the entity spawned claimed if it is not live, with the components a
-/// correction writes (`Teleported` and transient ones are never written to a claimed
-/// entity). Its components are otherwise left to the correction. A live key is not claimed
-/// into a region the world lacks. A predicted tick only: a replay leaves the claim to the
-/// corrections.
-fn claim_spawn(world: &mut World, local: LocalPlayer, key: StableKey, spawn: &StagedSpawn) {
+/// `key`, with the transient components the spawn and `transient` state where that claims
+/// an entity that was not claimed; or the entity spawned claimed if it is not live, with
+/// the components a correction writes and those transient ones, zeroed (`Teleported` and
+/// a transient value are never written to a claimed entity). Its components are otherwise
+/// left to the correction. A live key is not claimed into a region the world lacks. A
+/// predicted tick only: a replay leaves the claim to the corrections.
+fn claim_spawn(
+    world: &mut World,
+    local: LocalPlayer,
+    key: StableKey,
+    spawn: &StagedSpawn,
+    transient: Option<&BTreeSet<ComponentKey>>,
+) {
     if !world.contains(key) {
-        let components = written_components(world, None, &spawn.components);
+        let components = spawned_components(world, &spawn.components, transient);
         if let Err(error) = world.spawn_erased(key, spawn.region, &components) {
             refused("a claimed spawn", key, &error, false);
             return;
@@ -478,10 +551,15 @@ fn claim_spawn(world: &mut World, local: LocalPlayer, key: StableKey, spawn: &St
         // the record lacks, so a correction never writes it; neither does the hook.
         return;
     }
-    if !claimed_by(world, local, key)
-        && let Err(error) = world.insert(key, ClaimedBy { player: local.player })
-    {
+    if claimed_by(world, local, key) {
+        return;
+    }
+    if let Err(error) = world.insert(key, ClaimedBy { player: local.player }) {
         refused("a claim", key, &error, false);
+        return;
+    }
+    if let Err(error) = presence::apply(world, key, &spawn.components, transient) {
+        refused("a statement of transient components", key, &error, false);
     }
 }
 
@@ -496,7 +574,9 @@ fn bind(world: &mut World, origin: Option<PredictionKey>, net: NetId, replaying:
 }
 
 /// Despawns every live predicted spawn of the local player whose input tick is before
-/// `acked` and that has no alias: the server never echoed it. Returns how many.
+/// `acked` and that has no alias, alone: the server never echoed it. What it owns that is
+/// itself such a spawn goes by this rule at its own input tick, and what the server has is
+/// not the client's to destroy. Returns how many.
 fn despawn_unechoed(world: &mut World, local: LocalPlayer, acked: Tick, replaying: bool) -> u64 {
     // A predicted spawn inherits its spawner's claim, so the claim index holds every one.
     let unechoed: Vec<StableKey> = world
@@ -512,12 +592,9 @@ fn despawn_unechoed(world: &mut World, local: LocalPlayer, acked: Tick, replayin
         .collect();
     let mut count = 0;
     for key in unechoed {
-        // An owner despawned earlier in the loop took what it owns with it.
-        if world.contains(key) {
-            match world.despawn(key) {
-                Ok(()) => count += 1,
-                Err(error) => refused("an unechoed spawn's despawn", key, &error, replaying),
-            }
+        match world.despawn_alone(key) {
+            Ok(()) => count += 1,
+            Err(error) => refused("an unechoed spawn's despawn", key, &error, replaying),
         }
     }
     count

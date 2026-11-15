@@ -199,24 +199,25 @@ reshape.
   the whole packet against a copy of its handle mirror and the registry: each spawn's
   `insert`, then each row's, move's and removal's handle (a spawn in the same packet
   counts), and the length of each row and of each spawn's component against the component's
-  size in the registry (`push_row` refuses a length other than the row it holds, and
-  nothing else checks the first row's). A packet that fails any check is dropped whole as
-  malformed and not acknowledged, and leaves the mirror, the interpolation slots and the
-  newest staged tick as they were. A staged packet stages every row it carries: a row equal
-  to one an earlier frame staged is no defect, since a claimed entity is sent whole in
-  every packet that carries it and an unacknowledged row is sent again. A tombstone for a
-  handle the mirror does not hold (a resend of one already staged, or one for an entity
-  whose spawn never arrived) is ignored, but for one rule: the receiver keeps the key of
-  each handle a staged `Left` tombstone released, with that tombstone, until a spawn
-  reuses the handle's slot or a full frame clears the mirror, and stages a tombstone under
-  that handle other than the one it staged for that key (one after a `Destroyed` tombstone
-  it ignores). The hook may have kept the entity for the `Left` tombstone, and the server,
-  which releases the handle only once it sees the tombstone acknowledged, sends the
-  entity's next departure under the same handle (review r2, N1); the generation keeps the
-  handle unambiguous, and a packet older than the newest staged is dropped. The receiver
-  allocates an interpolation slot for
-  each spawn of an entity the player has not claimed (keeping the slot it holds for a live
-  one) and releases it at the entity's tombstone or claim.
+  size in the registry, and each key of a transient statement against the registry (a
+  component that is transient and not replicated) (`push_row` refuses a length other than
+  the row it holds, and nothing else checks the first row's). A packet that fails any check
+  is dropped whole as malformed and not acknowledged, and leaves the mirror, the
+  interpolation slots and the newest staged tick as they were. A staged packet stages every
+  row it carries: a row equal to one an earlier frame staged is no defect, since a claimed
+  entity is sent whole in every packet that carries it and an unacknowledged row is sent
+  again. A tombstone for a handle the mirror does not hold (a resend of one already staged,
+  or one for an entity whose spawn never arrived) is ignored, but for one rule: the receiver
+  keeps the key of each handle a staged `Left` tombstone released, with that tombstone,
+  until a spawn reuses the handle's slot or a full frame clears the mirror, and stages a
+  tombstone under that handle other than the one it staged for that key (one after a
+  `Destroyed` tombstone it ignores). The hook may have kept the entity for the `Left`
+  tombstone, and the server, which releases the handle only once it sees the tombstone
+  acknowledged, sends the entity's next departure under the same handle (review r2, N1); the
+  generation keeps the handle unambiguous, and a packet older than the newest staged is
+  dropped. The receiver allocates an interpolation slot for each spawn of an entity the
+  player has not claimed (keeping the slot it holds for a live one) and releases it at the
+  entity's tombstone or claim.
 - Region changes arrive on the reliable channel, each stamped with the server tick it
   applies from, and the receiver puts each into the first frame it stages at or after that
   tick, once the change has arrived, in channel order. When one frame would hold two
@@ -288,21 +289,26 @@ reshape.
   the every-field updates of claimed entities all read the mirror; a delta frame holds only
   changed rows and is never enough on its own. A `Removed` entry becomes
   `StagedFrame::removed` for every client to whom the entity is relevant, and a `Despawned`
-  entry the tombstone.
+  entry the tombstone. The mirror also keeps, for each entity, the set of its unreplicated
+  transient components from `StagingFrame::transient` (D141): an entity it first meets has
+  none until a frame states one, `Despawned` forgets the set with the entity, and a frame's
+  structural entries apply before its statements.
 - What a packet carries for each entity of the client's set: the tombstone, if one is owed,
   and nothing else of it; else, while nothing of it is acknowledged, a whole send: every
-  replicated component from the mirror as a spawn, beside a move to the region it resides
-  in, since the hook's upsert of a live entity does not move it, and a removal of every
-  replicated component the mirror records as removed from it, since the upsert removes
-  nothing and the client may still hold one (review r1, B1: a removal not yet acknowledged
-  when a move between named regions, a claim or a resend puts the entity back on this
-  path would otherwise stay on the client until a full frame); else, for a claimed entity,
-  an exact row of every replicated component it has and the components removed since its
-  `acked` tick, in every packet, so a frame that holds an exact row of an entity holds
-  every replicated component the server's entity has at the frame's tick; else the rows
-  changed and the components removed since its `acked` tick, if any. A row is sent stamped
-  with the tick of the gathered frame that last changed it. The mirror keeps each removed
-  component until the entity has a row of it again or is despawned.
+  replicated component from the mirror as a spawn, with a statement of its transient
+  components (`StagedFrame::transient`, the empty set for an entity that has none) when the
+  receiving player has it claimed, beside a move to the region it resides in, since the
+  hook's upsert of a live entity does not move it, and a removal of every replicated
+  component the mirror records as removed from it, since the upsert removes nothing and the
+  client may still hold one (review r1, B1: a removal not yet acknowledged when a move
+  between named regions, a claim or a resend puts the entity back on this path would
+  otherwise stay on the client until a full frame); else, for a claimed entity, an exact row
+  of every replicated component it has, a statement of its transient components and the
+  components removed since its `acked` tick, in every packet, so a frame that holds an exact
+  row of an entity holds every replicated component the server's entity has at the frame's
+  tick; else the rows changed and the components removed since its `acked` tick, if any. A
+  row is sent stamped with the tick of the gathered frame that last changed it. The mirror
+  keeps each removed component until the entity has a row of it again or is despawned.
 - `regions` is the client's relevant region set under `RelevancePolicy` (region membership
   within `radius` regions of the player's, plus the `always` set). A region entering is
   sent as a `RegionRelevance` on the reliable channel, stamped with the tick it enters at;

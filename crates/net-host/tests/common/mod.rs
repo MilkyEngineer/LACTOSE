@@ -284,7 +284,7 @@ fn apply_frame(world: &mut World, frame: &StagedFrame, skipped: &Skipped) {
     for (&key, &region) in &frame.moves {
         if world.contains(key)
             && world.region_of(key) != Some(region)
-            && let Err(error) = world.move_to_region(key, region)
+            && let Err(error) = world.move_alone_to_region(key, region)
         {
             skip("move", key, error);
         }
@@ -311,7 +311,7 @@ fn apply_frame(world: &mut World, frame: &StagedFrame, skipped: &Skipped) {
             && world.region_of(key) == Some(tombstone.region);
         if world.contains(key)
             && !settled
-            && let Err(error) = world.despawn(key)
+            && let Err(error) = world.despawn_alone(key)
         {
             skip("tombstone", key, error);
         }

@@ -14,10 +14,12 @@ use std::sync::Arc;
 use common::*;
 use lactose_asset_api::AssetSet;
 use lactose_bundle::{Baseline, BaselineRow, ComponentData, ComponentSchema, Record};
-use lactose_core::{ComponentKey, ErrorKind, NetId, Result, StableKey};
+use lactose_core::{
+    ComponentKey, EntityRef, ErrorKind, NetId, PlayerId, PredictionKey, Result, StableKey, Tick,
+};
 use lactose_ecs::{
-    ExportedRow, OwnedBy, RegionConfig, RegionId, RegionMode, RegionRows, World, WorldBuilder,
-    WorldKind,
+    ExportedRow, LayoutConfig, OwnedBy, RegionConfig, RegionId, RegionMode, RegionRows, World,
+    WorldBuilder, WorldKind,
 };
 use lactose_math::Scalar;
 use lactose_net_api::OverlayPayload;
@@ -457,7 +459,13 @@ fn owner_baselines() -> BTreeMap<RegionId, Arc<Baseline>> {
 
 /// A server world of `baselines`' regions, each loaded with no overlay.
 fn server_of(baselines: &BTreeMap<RegionId, Arc<Baseline>>) -> World {
-    let mut world = bare_world();
+    server_in(LayoutConfig::default(), baselines)
+}
+
+/// [`server_of`] under `layout`.
+fn server_in(layout: LayoutConfig, baselines: &BTreeMap<RegionId, Arc<Baseline>>) -> World {
+    let mut world =
+        WorldBuilder::new(WorldKind::Server, Arc::new(registry())).layout(layout).build().unwrap();
     for (&region, baseline) in baselines {
         let config =
             RegionConfig { id: region, seed: seed_of(region), mode: RegionMode::Simulated };
@@ -529,9 +537,15 @@ fn owner_of(world: &World, key: StableKey) -> Option<StableKey> {
     world.get::<OwnedBy>(key).and_then(|owned| owned.owner.get())
 }
 
-/// Each entity of `region` and its owner, live or not.
+/// Each entity of `region` and its owner, live or not, under the key the export writes: a
+/// predicted owner by its alias, the key a reload stores once that owner has died while the
+/// region was unloaded.
 fn owners_in(world: &World, region: RegionId) -> BTreeMap<StableKey, Option<StableKey>> {
-    world.entities_in(region).map(|key| (key, owner_of(world, key))).collect()
+    let exported = |owner: StableKey| match owner {
+        StableKey::Predicted(predicted) => world.alias(predicted).map_or(owner, StableKey::Net),
+        owner => owner,
+    };
+    world.entities_in(region).map(|key| (key, owner_of(world, key).map(exported))).collect()
 }
 
 /// `records` but their owners: what a load that breaks a cycle leaves as it was.
@@ -622,19 +636,31 @@ impl Rng {
 }
 
 /// One seeded history of spawns, owner writes (refusals ignored), moves, despawns, unloads
-/// and reloads over A and B, checked after every step and by a restart at the end. Returns
+/// and reloads over A and B, under `layout`, with the server's horizon passed after every
+/// step, checked after every step and by a restart at the end. Its steps include the alone
+/// forms, which a server refuses with nothing changed, a predicted spawn bound to a fresh
+/// `NetId` as a server binds one, and a despawn followed by a write that names the dead
+/// entity, so a dead predicted owner is named inside the window. Returns
 /// how many owner edges the reloads broke: each a row of the reloaded region left without
 /// the owner it had at the unload, that owner live in the other region and owned, through
 /// its chain, by the row, so that the edge would close a cycle; nothing else of the region
 /// may differ from the records it loaded.
-fn history(seed: u64, baselines: &BTreeMap<RegionId, Arc<Baseline>>, table: &SchemaTable) -> usize {
+fn history(
+    seed: u64,
+    layout: LayoutConfig,
+    baselines: &BTreeMap<RegionId, Arc<Baseline>>,
+    table: &SchemaTable,
+) -> usize {
     let mut rng = Rng(seed);
-    let mut world = server_of(baselines);
+    let mut world = server_in(layout, baselines);
     let loaded = |world: &World| -> Vec<RegionId> {
         [A, B].into_iter().filter(|&region| world.region(region).is_some()).collect()
     };
     let live = |world: &World| -> Vec<StableKey> {
         loaded(world).into_iter().flat_map(|region| world.entities_in(region)).collect()
+    };
+    let saves = |world: &World| -> Vec<RegionRows> {
+        loaded(world).into_iter().map(|region| world.export_region(region).unwrap()).collect()
     };
     // Every key the history may name as an owner: the cooked rows, two never spawned, and
     // every entity it spawns, live or not, as a direct write may name them.
@@ -645,10 +671,11 @@ fn history(seed: u64, baselines: &BTreeMap<RegionId, Arc<Baseline>>, table: &Sch
     let mut owners: BTreeMap<RegionId, BTreeMap<StableKey, Option<StableKey>>> = BTreeMap::new();
     let mut log: Vec<String> = Vec::new();
     let mut broken = 0;
+    let mut ordinal = 0;
     for _ in 0..20 + rng.below(60) {
         let (keys, regions) = (live(&world), loaded(&world));
         let owner = pool[rng.below(pool.len())];
-        match rng.below(100) {
+        match rng.below(115) {
             0..=14 if !regions.is_empty() => {
                 let region = regions[rng.below(regions.len())];
                 let id = world.allocate_net_id().unwrap();
@@ -725,10 +752,62 @@ fn history(seed: u64, baselines: &BTreeMap<RegionId, Arc<Baseline>>, table: &Sch
                 }
                 broken += breaks;
             }
+            100..=104 if !keys.is_empty() => {
+                // What a client's hook applies, which a server refuses whole.
+                let key = keys[rng.below(keys.len())];
+                let region = regions[rng.below(regions.len())];
+                log.push(format!("despawn {key:?} alone, move it alone to {region:?}: refused"));
+                let context = format!("seed {seed:#x} {log:#?}");
+                let before = (world.mark(), world.structural_log().cursor(), saves(&world));
+                let refused = [world.despawn_alone(key), world.move_alone_to_region(key, region)];
+                for error in refused.into_iter().map(|result| result.expect_err(&context)) {
+                    assert_eq!(error.kind(), ErrorKind::Unsupported, "{context}");
+                }
+                let after = (world.mark(), world.structural_log().cursor(), saves(&world));
+                assert_eq!(after, before, "{context}");
+            }
+            105..=109 if keys.len() > 1 => {
+                // A despawn, then a write that names the dead entity before the horizon.
+                let key = keys[rng.below(keys.len())];
+                world.despawn(key).unwrap();
+                let keys = live(&world);
+                if keys.is_empty() {
+                    log.push(format!("despawn {key:?}"));
+                } else {
+                    let item = keys[rng.below(keys.len())];
+                    log.push(format!("despawn {key:?}, then set {item:?} owned by it"));
+                    world
+                        .insert(item, OwnedBy { owner: EntityRef::new(key) })
+                        .unwrap_or_else(|error| panic!("{error}: seed {seed:#x} {log:#?}"));
+                }
+            }
+            110..=114 if !regions.is_empty() => {
+                let region = regions[rng.below(regions.len())];
+                let key = PredictionKey { player: PlayerId(1), input_tick: Tick(0), ordinal };
+                ordinal += 1;
+                let id = world.allocate_net_id().unwrap();
+                log.push(format!("spawn {key:?} in {region:?}, bound to {id:?}"));
+                world.spawn(StableKey::Predicted(key), region, (pos(1, 1),)).unwrap();
+                world.bind(key, id).unwrap();
+                pool.push(id);
+            }
             _ => continue,
         }
+        // The server's horizon: what a despawn left behind is pruned before the next step.
+        let horizon = Tick(world.tick().0.wrapping_add(1));
+        world.set_rollback_horizon(horizon);
         let context = format!("seed {seed:#x} {log:#?}");
         assert_forest(&world, &context);
+        // The world's own index, which the export cannot see: every live row whose owner is
+        // live is listed among that owner's entities, whatever key the owner is stored under.
+        for key in live(&world) {
+            if let Some(owner) = owner_of(&world, key).filter(|&owner| world.contains(owner)) {
+                assert!(
+                    world.owned_by(owner).any(|owned| owned == key),
+                    "{key:?} is not listed under its live owner {owner:?}: {context}"
+                );
+            }
+        }
         for region in loaded(&world) {
             if let Err(error) = save(&world, region, baselines, table) {
                 panic!("{error}: {context}");
@@ -764,14 +843,25 @@ fn history(seed: u64, baselines: &BTreeMap<RegionId, Arc<Baseline>>, table: &Sch
 /// cycle that two regions' documents close is broken by the load (logged at `warn`, target
 /// `casein`); the breaks are counted, here from the world's owners before the unload and
 /// after the reload rather than from the log, and the seeds are fixed so that some history
-/// reaches one.
+/// reaches one. The histories are spread over the production layout and four chunk
+/// capacities.
 #[test]
 fn every_reachable_state_saves() {
     let baselines = owner_baselines();
     let table = SchemaTable::from_registry(&registry()).unwrap();
     let histories = 200_u64;
+    let layouts = [
+        layout_mode(ChunkCapacity::Production, 0).unwrap(),
+        layout_mode(ChunkCapacity::Rows(1), 11).unwrap(),
+        layout_mode(ChunkCapacity::Rows(7), 12).unwrap(),
+        layout_mode(ChunkCapacity::Rows(64), 13).unwrap(),
+        layout_mode(ChunkCapacity::Bytes(16 * 1024), 14).unwrap(),
+    ];
     let broken: usize = (0..histories)
-        .map(|i| history(i.wrapping_mul(0x2545_F491_4F6C_DD1D), &baselines, &table))
+        .map(|i| {
+            let layout = layouts[i as usize % layouts.len()];
+            history(i.wrapping_mul(0x2545_F491_4F6C_DD1D), layout, &baselines, &table)
+        })
         .sum();
     println!("{histories} histories, {broken} owner edges broken by a reload");
     assert!(broken > 0, "no history closed a cycle across the two regions");

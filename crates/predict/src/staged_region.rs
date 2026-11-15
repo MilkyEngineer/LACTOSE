@@ -71,11 +71,6 @@ pub(crate) fn placement_data(region: RegionId) -> ComponentData {
     }
 }
 
-/// Whether `components`, a spawn's, already name the placement.
-pub(crate) fn names_placement(components: &[ComponentData]) -> bool {
-    components.iter().any(|data| data.component == StagedRegion::KEY)
-}
-
 /// Records `region` as where the frames last left the live proxy `key`: a write only when
 /// the recorded region differs, so an unchanged placement touches nothing.
 pub(crate) fn place(world: &mut World, key: StableKey, region: RegionId) -> Result<()> {

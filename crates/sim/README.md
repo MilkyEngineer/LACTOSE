@@ -349,10 +349,12 @@ sample it ran.
 
 What `StagedState::apply` may do: on a client, everything received, through `World::spawn`
 with the server's key, `World::bind`, `World::insert`, `World::columns_mut` or
-`Mut::set_if_neq` so that an equal value does not dirty a row, `World::move_to_region` for an
-entity the server moved between regions, `World::remove` for a component the server removed,
-and `World::despawn` for a tombstone; in the prediction world, the proxies' positions for the
-tick from their per-tick history. On the server it is the default and does nothing.
+`Mut::set_if_neq` so that an equal value does not dirty a row, `World::move_alone_to_region`
+for an entity the server moved between regions, `World::remove` for a component the server
+removed, and `World::despawn_alone` for a tombstone, each for the one entity the frame
+names, since a client's `OwnedBy` edges are as old as each region's document (D141); in the
+prediction world, the proxies' positions for the tick from their per-tick history. On the
+server it is the default and does nothing.
 
 **Regions** (architecture sections 6, 9.7 and 14)
 
@@ -479,8 +481,8 @@ does not export, and `take_exports` is always empty there.
   document's own row, or what the world's binds say. So a region loads to the bytes its
   export read only in a world that already holds the bind of every owner its rows name;
   and a `Server` world also reads its binds at a direct write of `OwnedBy`, where an owner
-  that is a predicted origin with no bind is refused (D141, itself a facade until the lane
-  `stream-impl`). A world that starts from a save therefore starts with the save's binds,
+  that is a predicted origin with no bind is refused (D141).
+  A world that starts from a save therefore starts with the save's binds,
   `SimulationBuilder::binds`: one for every entity with a predicted origin in any saved
   region, loaded at the save point or kept unloaded, which `lactose-persist` reads from
   the regions' records (`Loader::binds`: each such entity's record carries its

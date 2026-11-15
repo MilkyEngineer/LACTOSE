@@ -16,7 +16,7 @@ use lactose_ecs::{
     ChangeMark, ErasedColumn, Job, LogCursor, LogEntry, RegionId, ResMut, StructuralChange, World,
     system,
 };
-use lactose_reflect::TypeRole;
+use lactose_reflect::{Persistence, TypeRole};
 
 use crate::staged::after;
 use crate::staged::append;
@@ -59,9 +59,7 @@ pub struct StagingFrame {
     /// [`merge`](Self::merge) keeps the newer frame's statement of an entity, drops the
     /// statement of an entity the newer frame despawned, takes a full newer frame's
     /// statements alone, and leaves a full frame with no empty set, since a full frame
-    /// states an entity that has none by not stating it. A facade (D141): the gather fills
-    /// it and `merge` folds it from the lane `stream-impl` on; until then it is empty
-    /// unless a caller writes it, and `merge` does not fold it.
+    /// states an entity that has none by not stating it.
     pub transient: BTreeMap<StableKey, BTreeSet<ComponentKey>>,
     rows: Vec<RowEntry>,
     bytes: Vec<u8>,
@@ -157,14 +155,18 @@ impl StagingFrame {
     /// `newer`'s rows alone. `newer`'s structural entries also apply to the rows here: a row of an entity it despawned or
     /// of a component it removed is dropped, and a row of an entity it moved resides in the
     /// entity's new region. A full frame here stays full and keeps no structural entry.
-    /// Nothing is lost, the result never holds two values of one row, and it is the frame
-    /// one gather over both windows produces.
+    /// The statements fold as [`transient`](Self::transient) states. Nothing is lost, the
+    /// result never holds two values of one row, and it is the frame one gather over both
+    /// windows produces.
     pub fn merge(&mut self, mut newer: Self) {
         if newer.full {
             newer.finish();
             *self = newer;
             return;
         }
+        // Before `newer`'s structural entries join this frame's: the spawns here are read
+        // from this frame's own.
+        self.merge_statements(&mut newer);
         // The rows here predate every structural entry of `newer`: a row of an entity it
         // despawned, or of a component it removed, goes, and a row of an entity it moved
         // resides where the entity does now, so the result is what one gather over both
@@ -203,6 +205,42 @@ impl StagingFrame {
         self.tick = newer.tick;
         self.extend_rows(&newer);
         self.finish();
+    }
+
+    /// Folds `newer`'s statements, an incremental frame's, into this frame's. An empty set in
+    /// `newer` is an entity whose set its window changed to none; it is kept only where an
+    /// entity left unstated would not have none, so the result states what one gather over
+    /// both windows states.
+    fn merge_statements(&mut self, newer: &mut Self) {
+        // The entities this frame's window spawned and left live; a full frame stands for
+        // the spawn of every entity it holds.
+        let mut spawned = BTreeSet::new();
+        if !self.full {
+            for entry in &self.structural {
+                match entry.change {
+                    StructuralChange::Spawned { key, .. } => {
+                        spawned.insert(key);
+                    }
+                    StructuralChange::Despawned { key, .. } => {
+                        spawned.remove(&key);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        for entry in &newer.structural {
+            if let StructuralChange::Despawned { key, .. } = entry.change {
+                self.transient.remove(&key);
+                spawned.remove(&key);
+            }
+        }
+        for (key, set) in core::mem::take(&mut newer.transient) {
+            if set.is_empty() && (self.full || spawned.contains(&key)) {
+                self.transient.remove(&key);
+            } else {
+                self.transient.insert(key, set);
+            }
+        }
     }
 
     /// Appends every row of `other` after this frame's, in `other`'s order.
@@ -366,6 +404,7 @@ impl GatherState {
         for entry in entries.into_iter().flatten() {
             frame.push_structural(*entry);
         }
+        frame.transient = statements(world, (!frame.full).then_some(frame.structural()));
         frame.finish();
 
         self.mark = Some(world.mark());
@@ -425,6 +464,69 @@ fn gather_column(column: &ErasedColumn<'_>, mark: Option<ChangeMark>) -> Staging
         None => (0..column.keys().len()).for_each(&mut push),
     }
     partial
+}
+
+/// [`StagingFrame::transient`] of a gather: over every entity on a full pass (`window`
+/// `None`), otherwise over the entities the window's structural entries spawned or whose
+/// set they changed, read by key.
+fn statements(
+    world: &World,
+    window: Option<&[LogEntry]>,
+) -> BTreeMap<StableKey, BTreeSet<ComponentKey>> {
+    let stated: Vec<ComponentKey> = world
+        .registry()
+        .iter()
+        .filter(|info| {
+            info.role() == TypeRole::Component
+                && info.persistence() == Persistence::Transient
+                && !info.tracking().replicated
+        })
+        .map(|info| info.key())
+        .collect();
+    let mut statements: BTreeMap<StableKey, BTreeSet<ComponentKey>> = BTreeMap::new();
+    let Some(window) = window else {
+        for &component in &stated {
+            for column in world.columns_erased(component) {
+                for &key in column.keys() {
+                    statements.entry(key).or_default().insert(component);
+                }
+            }
+        }
+        return statements;
+    };
+    // Each entity the window names, and whether its last spawn is in the window: then the
+    // entity is stated only if it has one, since an unstated spawn has none.
+    let mut named: BTreeMap<StableKey, bool> = BTreeMap::new();
+    for entry in window {
+        match entry.change {
+            StructuralChange::Spawned { key, .. } => {
+                named.insert(key, true);
+            }
+            StructuralChange::Despawned { key, .. } => {
+                named.remove(&key);
+            }
+            StructuralChange::Added { key, component }
+            | StructuralChange::Removed { key, component }
+                if stated.contains(&component) =>
+            {
+                named.entry(key).or_insert(false);
+            }
+            _ => {}
+        }
+    }
+    for (key, spawned) in named {
+        // The log ends at the gather, so an entity it names last by a spawn or a change is
+        // live.
+        let set: BTreeSet<ComponentKey> = stated
+            .iter()
+            .copied()
+            .filter(|&component| world.get_erased(key, component).is_some())
+            .collect();
+        if !(spawned && set.is_empty()) {
+            statements.insert(key, set);
+        }
+    }
+    statements
 }
 
 /// Whether tick `tick` is before tick `than`, across the wrap, as the world orders change

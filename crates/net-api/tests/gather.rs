@@ -2,13 +2,14 @@
 //! gather" and "The gather's decision"): the same frames under every layout SOUR runs and
 //! with one or four workers, exactly the rows the typed change query selects, an empty
 //! gather when nothing changed, the full pass on a stale mark or cursor, the merge of a
-//! frame not taken, the per-region slices and the structural entries.
+//! frame not taken, the per-region slices and the structural entries; and the statements
+//! of transient presence (proof for D141), incremental, full and merged.
 
 #![forbid(unsafe_code)]
 
 mod common;
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use common::*;
 use lactose_core::{ComponentKey, StableKey, Tick};
@@ -645,4 +646,215 @@ fn reading_a_frame_not_finished_is_a_debug_assertion() {
     let mut frame = StagingFrame::new(Tick(1));
     frame.push_row(REGION, key(1), Health::KEY, Tick(1), bytes(&Health(1)));
     let _ = frame.region(REGION).count();
+}
+
+// ---- Transient presence (D141) ----
+
+type Statements = BTreeMap<StableKey, BTreeSet<ComponentKey>>;
+
+fn stated(entries: &[(u64, &[ComponentKey])]) -> Statements {
+    entries.iter().map(|&(n, set)| (key(n), set.iter().copied().collect())).collect()
+}
+
+/// The population of [`populate`], and entities 201 to 206 in `REGION`, some with the
+/// transient components a statement names, some with a derived or a persistent
+/// unreplicated one beside them.
+fn populate_statements(world: &mut World) {
+    populate(world);
+    let at = |n: i32| Position { x: n, y: 0 };
+    world.spawn(key(201), REGION, (at(201), Impulse(1), Cached(1))).expect("spawn");
+    world.spawn(key(202), REGION, (at(202), Impulse(2), Grounded(2))).expect("spawn");
+    world.spawn(key(203), REGION, (at(203), Secret(3))).expect("spawn");
+    world.spawn(key(204), REGION, (at(204), Grounded(4))).expect("spawn");
+    world.spawn(key(205), REGION, (at(205), Impulse(5))).expect("spawn");
+    world.spawn(key(206), REGION, (at(206), Impulse(6), Health(6))).expect("spawn");
+}
+
+/// What `app` does to the server between the runs of frame `index`.
+fn script_statements(world: &mut World, index: u32) {
+    let at = |n: i32| Position { x: n, y: 1 };
+    match index {
+        1 => {
+            let row = (at(210), Impulse(1), Cached(1), Secret(1));
+            world.spawn(key(210), REGION, row).expect("spawn");
+            world.spawn(key(211), OTHER_REGION, (at(211), Cached(2))).expect("spawn");
+        }
+        2 => {
+            world.insert(key(203), Grounded(1)).expect("insert");
+            world.remove::<Impulse>(key(205)).expect("remove");
+            world.remove::<Grounded>(key(202)).expect("remove");
+            // Rows alone: a replicated one and a transient one the entity has.
+            world.insert(key(206), at(206)).expect("insert");
+            world.insert(key(206), Impulse(9)).expect("insert");
+        }
+        3 => {
+            world.spawn(key(212), REGION, (at(212), Impulse(1))).expect("spawn");
+            world.despawn(key(212)).expect("despawn");
+            world.despawn(key(201)).expect("despawn");
+            world.spawn(key(201), REGION, (at(201), Cached(1))).expect("spawn");
+        }
+        4 => {
+            world.remove::<Grounded>(key(204)).expect("remove");
+            world.insert(key(204), Grounded(7)).expect("insert");
+            world.insert(key(211), Impulse(3)).expect("insert");
+            world.insert(key(211), Secret(3)).expect("insert");
+        }
+        5 => {
+            world.insert(key(204), Impulse(1)).expect("insert");
+            world.despawn(key(202)).expect("despawn");
+        }
+        6 => {
+            world.remove::<Impulse>(key(210)).expect("remove");
+        }
+        _ => {}
+    }
+}
+
+/// What each frame of the statement scene states, gathered and taken at every frame.
+fn expected_statements(index: u32) -> Statements {
+    let (impulse, grounded) = (Impulse::KEY, Grounded::KEY);
+    match index {
+        0 => stated(&[
+            (201, &[impulse]),
+            (202, &[impulse, grounded]),
+            (204, &[grounded]),
+            (205, &[impulse]),
+            (206, &[impulse]),
+        ]),
+        1 => stated(&[(210, &[impulse])]),
+        2 => stated(&[(202, &[impulse]), (203, &[grounded]), (205, &[])]),
+        4 => stated(&[(204, &[grounded]), (211, &[impulse])]),
+        5 => stated(&[(204, &[impulse, grounded])]),
+        6 => stated(&[(210, &[])]),
+        _ => Statements::new(),
+    }
+}
+
+/// The statement scene under `layout` with `workers`: the gather runs at the frames
+/// `gathers` names and the frame is taken at those `takes` names.
+fn statement_scene(
+    layout: LayoutConfig,
+    workers: u32,
+    gathers: &[u32],
+    takes: &[u32],
+) -> (Vec<(u32, StagingFrame)>, Simulation) {
+    let executor = executor(workers);
+    let mut simulation = server(layout);
+    populate_statements(simulation.world_mut());
+    let mut frames = Vec::new();
+    for index in 0..FRAMES {
+        script_statements(simulation.world_mut(), index);
+        for _ in 0..=index % 2 {
+            simulation = step(&executor, simulation, TickInput::default());
+        }
+        if gathers.contains(&index) {
+            simulation = passes(&executor, simulation);
+        }
+        if takes.contains(&index) {
+            frames.push((index, take(&mut simulation)));
+        }
+    }
+    (frames, simulation)
+}
+
+/// Every entity of `world` with a component that is transient and not replicated, with its
+/// set, read entity by entity.
+fn statements_of(world: &World) -> Statements {
+    let mut statements = Statements::new();
+    for region in world.regions() {
+        for entity in world.entities_in(region) {
+            let set: BTreeSet<ComponentKey> = [Impulse::KEY, Grounded::KEY]
+                .into_iter()
+                .filter(|&component| world.get_erased(entity, component).is_some())
+                .collect();
+            if !set.is_empty() {
+                statements.insert(entity, set);
+            }
+        }
+    }
+    statements
+}
+
+#[test]
+fn the_gather_states_what_it_spawned_and_what_changed() {
+    let every: Vec<u32> = (0..FRAMES).collect();
+    let (reference, _) = statement_scene(LayoutConfig::default(), 1, &every, &every);
+    for (index, frame) in &reference {
+        assert_eq!(frame.full, *index == 0, "frame {index}");
+        assert_eq!(frame.transient, expected_statements(*index), "frame {index}");
+    }
+    let mut runs = 0;
+    for layout in layouts() {
+        for workers in [1, 4] {
+            let (frames, _) = statement_scene(layout, workers, &every, &every);
+            assert_eq!(frames, reference, "{layout:?} with {workers} workers");
+            runs += 1;
+        }
+    }
+    assert_eq!(runs, 26);
+}
+
+#[test]
+fn a_full_gather_states_every_entity_that_has_one() {
+    let every: Vec<u32> = (0..FRAMES).collect();
+    let (_, mut simulation) = statement_scene(LayoutConfig::default(), 2, &every, &every);
+    let executor = executor(2);
+    let tick = simulation.tick();
+    simulation.world_mut().set_tick(Tick(tick.0 + 5)).expect("between runs");
+    simulation = passes(&executor, simulation);
+    let frame = take(&mut simulation);
+    assert!(frame.full);
+    let (impulse, grounded) = (Impulse::KEY, Grounded::KEY);
+    let expected = stated(&[
+        (203, &[grounded]),
+        (204, &[impulse, grounded]),
+        (206, &[impulse]),
+        (211, &[impulse]),
+    ]);
+    assert_eq!(frame.transient, expected);
+    assert_eq!(frame.transient, statements_of(simulation.world()));
+}
+
+#[test]
+fn a_merged_frame_states_what_one_gather_would() {
+    let every: Vec<u32> = (0..FRAMES).collect();
+    // Taken after windows in which an entity's statement is replaced, an entity stated is
+    // despawned, an entity spawned in one gather loses its last in a later one, and one
+    // stated in an earlier gather is stated empty in a later one; and frames not taken
+    // since the full one.
+    for takes in [vec![0, 2, 5, 6, 11], vec![0, 6, 11], vec![0, 1, 3, 11], vec![2, 11], vec![6]] {
+        let (merged, _) = statement_scene(LayoutConfig::default(), 2, &every, &takes);
+        let (single, _) = statement_scene(LayoutConfig::default(), 2, &takes, &takes);
+        assert_eq!(merged, single, "taken at {takes:?}");
+        for (index, frame) in &merged {
+            if frame.full {
+                assert!(frame.transient.values().all(|set| !set.is_empty()), "frame {index}");
+            }
+        }
+    }
+    // The fold, by hand.
+    let (impulse, grounded) = (Impulse::KEY, Grounded::KEY);
+    let entry = |change| LogEntry { tick: Tick(9), change };
+    let mut older = StagingFrame::new(Tick(10));
+    older.transient = stated(&[(1, &[impulse]), (2, &[impulse]), (3, &[grounded])]);
+    older.push_structural(entry(StructuralChange::Spawned { key: key(3), region: REGION }));
+    let mut newer = StagingFrame::new(Tick(12));
+    newer.transient = stated(&[(1, &[grounded]), (3, &[]), (4, &[])]);
+    newer.push_structural(entry(StructuralChange::Despawned { key: key(2), region: REGION }));
+    let mut merged = older.clone();
+    merged.merge(newer.clone());
+    // The newer statement wins, a despawned entity's goes, an empty set for an entity the
+    // older window spawned goes and one for any other stays.
+    assert_eq!(merged.transient, stated(&[(1, &[grounded]), (4, &[])]));
+    // A full newer frame's statements stand alone.
+    let mut full = StagingFrame::new(Tick(13));
+    full.full = true;
+    full.transient = stated(&[(5, &[impulse])]);
+    let mut superseded = older.clone();
+    superseded.merge(full.clone());
+    assert_eq!(superseded.transient, full.transient);
+    // An empty set merged into a full frame leaves no statement.
+    let mut kept = full.clone();
+    kept.merge(newer);
+    assert_eq!(kept.transient, stated(&[(1, &[grounded]), (5, &[impulse])]));
 }

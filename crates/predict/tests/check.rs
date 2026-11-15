@@ -165,3 +165,11 @@ fn the_engine_systems_of_a_prediction_world_pass_at_its_build() {
     assert_eq!(error.kind(), ErrorKind::InvalidData);
     assert!(error.to_string().contains("check::reminisce"));
 }
+
+/// The test game's `Without<Trail>` kernel, which adds the derived cache to a row that
+/// lacks it, passes, and so does its kernel over two transient components
+/// (`tests/corrections.rs` holds what the first does).
+#[test]
+fn a_derived_component_is_added_by_its_system() {
+    check(&[&ADD_TRAIL, &BRACE]).unwrap();
+}

@@ -2,16 +2,19 @@
 //! reconciliation window, with a later frame of the same window about the same entity,
 //! ends as it does across two windows (the hook applies the claim change at once); a
 //! claimed spawn and a frame's exact rows of a claimed entity state its whole recorded
-//! component set, so a component the server's entity lacks is removed; and a transient
-//! replicated component is never reconciled, nor written to a claimed entity, nor is
-//! `Teleported`.
+//! component set, so a component the server's entity lacks is removed; a transient
+//! replicated component is never reconciled, nor its value written to a claimed entity, nor
+//! is `Teleported`; and a claim leaves the entity with the transient components its frame
+//! states, zeroed (D141).
 
 #![forbid(unsafe_code)]
 
 mod common;
 
 use common::*;
-use lactose_core::Tick;
+use lactose_bundle::BaselineRow;
+use lactose_core::{NetId, StableKey, Tick};
+use lactose_ecs::{RegionId, World};
 use lactose_net_api::{StagedFrame, Tombstone, TombstoneCause};
 use lactose_physics_api::Teleported;
 use lactose_predict::Reconciled;
@@ -221,8 +224,10 @@ fn a_transient_replicated_component_is_never_reconciled() {
     assert_eq!(rig.world().get::<Aim>(me()), None);
 }
 
+/// The replicated transient component is present, zeroed: its presence is what the spawn
+/// states, its value never written but by a full frame (D141).
 #[test]
-fn a_claimed_spawn_the_hook_applies_carries_neither_teleported_nor_a_transient_component() {
+fn a_claimed_spawn_the_hook_applies_carries_neither_teleported_nor_a_transient_value() {
     let mut rig = Rig::joined();
     rig.step_to(20, walking);
     let mut frame = StagedFrame::new(Tick(15));
@@ -234,12 +239,162 @@ fn a_claimed_spawn_the_hook_applies_carries_neither_teleported_nor_a_transient_c
     assert_eq!(world.get::<Position>(key(4)), Some(&at(5, 5)));
     assert_eq!(claim(world, key(4)), Some(PLAYER));
     assert_eq!(world.get::<Teleported>(key(4)), None);
-    assert_eq!(world.get::<Aim>(key(4)), None);
+    assert_eq!(world.get::<Aim>(key(4)), Some(&Aim(0)));
     // The correction at 15, whose slot lacks the entity, spawns it the same way.
     let reconciled = rig.reconcile();
     assert_eq!(summaries(&reconciled).len(), 1, "{:?}", summaries(&reconciled));
     let world = rig.world();
     assert_eq!(world.get::<Position>(key(4)), Some(&at(5, 5)));
     assert_eq!(world.get::<Teleported>(key(4)), None);
-    assert_eq!(world.get::<Aim>(key(4)), None);
+    assert_eq!(world.get::<Aim>(key(4)), Some(&Aim(0)));
+}
+
+// ---- What a row built from the stream has (D141) ----
+
+/// A region no other test here uses: a document's.
+const DOCUMENT: RegionId = RegionId(6);
+
+/// The row a document places in [`DOCUMENT`] in one run, and a frame spawns in another.
+fn character() -> StableKey {
+    StableKey::Net(NetId::cooked(90))
+}
+
+/// `key`'s transient components: `Aim`, with its value, and whether it has `Stance` and
+/// `Crouch`.
+fn transients(world: &World, key: StableKey) -> (Option<Aim>, bool, bool) {
+    (
+        world.get::<Aim>(key).copied(),
+        world.get::<Stance>(key).is_some(),
+        world.get::<Crouch>(key).is_some(),
+    )
+}
+
+/// A delta frame's claimed spawn of a key that is not live, with `Aim` (replicated,
+/// transient) among its components and a statement naming `Stance` (not replicated): the
+/// row is born with both, zeroed, and `test::brace`, which names both, runs on it from the
+/// predicted tick on; the same after the correction at the frame's tick. The world hashes
+/// as a run in which a region document placed the row and the frame claimed it (D129).
+/// With no statement the row has `Aim` alone and the kernel never runs on it: the gap the
+/// statement closes.
+#[test]
+fn a_claimed_spawn_carries_its_transient_components() {
+    // `placed`: the document places the row, which the frame then claims; otherwise the
+    // document is empty and the frame spawns the row.
+    let run = |placed: bool, stated: bool| {
+        let mut rig = Rig::joined();
+        rig.step_to(14, walking);
+        let rows = if placed {
+            let components = vec![data(at(5, 5)), data(Health(5)), data(Aim(0)), data(Stance(0))];
+            vec![BaselineRow { id: NetId::cooked(90), components }]
+        } else {
+            Vec::new()
+        };
+        place_document(rig.world_mut(), DOCUMENT, rows);
+        rig.step(walking(15));
+        let mut frame = StagedFrame::new(Tick(15));
+        let components = vec![data(at(5, 5)), data(Health(5)), data(Aim(7))];
+        frame.spawns.insert(NetId::cooked(90), claimed(DOCUMENT, components));
+        if stated {
+            frame.transient.insert(character(), [Stance::KEY].into());
+        }
+        rig.push(frame);
+        rig.step(walking(16));
+        let predicted = (transients(rig.world(), character()), braced(rig.world(), character()));
+        let hash = rig.hash();
+        let reconciled = rig.reconcile();
+        assert_eq!(summaries(&reconciled).len(), 1, "{:?}", summaries(&reconciled));
+        assert_eq!(reconciled.corrections[0].tick, Tick(15));
+        let world = rig.world();
+        assert_eq!(world.region_of(character()), Some(DOCUMENT));
+        assert_eq!(claim(world, character()), Some(PLAYER));
+        assert_eq!(world.get::<Health>(character()), Some(&Health(5)));
+        let corrected = (transients(world, character()), braced(world, character()));
+        (predicted, corrected, hash, rig.hash())
+    };
+    let spawned = run(false, true);
+    assert_eq!(spawned.0, ((Some(Aim(0)), true, false), 1), "born with both, the kernel ran");
+    assert_eq!(spawned.1, ((Some(Aim(0)), true, false), 2), "and in the re-simulated tick");
+    assert_eq!(spawned, run(true, true), "as the document's row, hash for hash");
+    let unstated = run(false, false);
+    assert_eq!(unstated.0, ((Some(Aim(0)), false, false), 0));
+    assert_eq!(unstated.1, ((Some(Aim(0)), false, false), 0));
+}
+
+/// A proxy the stream spawned, which has no transient component, claimed by a spawn that
+/// names `Aim` and a statement naming `Stance`: it has both after the predicted tick, after
+/// the correction at the frame's tick and after a later rollback through it, hash for hash
+/// with the straight run. A document row with `Stance`, claimed by a statement naming
+/// `Crouch` alone, loses `Stance` and gains `Crouch`; a claim into a region the world lacks
+/// changes nothing.
+#[test]
+fn a_claim_of_a_live_proxy_brings_its_transient_components() {
+    let mut rig = Rig::joined();
+    rig.step_to(14, walking);
+    assert_eq!(transients(rig.world(), proxy()), (None, false, false));
+    rig.step(looking(15));
+    let mut frame = StagedFrame::new(Tick(15));
+    frame.spawns.insert(net(3), claimed(REGION, vec![data(at(-50, 0)), data(Aim(3))]));
+    frame.transient.insert(proxy(), [Stance::KEY].into());
+    rig.push(frame);
+    rig.step(looking(16));
+    assert_eq!(claim(rig.world(), proxy()), Some(PLAYER));
+    assert_eq!(transients(rig.world(), proxy()), (Some(Aim(0)), true, false));
+    assert_eq!(braced(rig.world(), proxy()), 1);
+    let reconciled = rig.reconcile();
+    assert_eq!(summaries(&reconciled).len(), 1, "{:?}", summaries(&reconciled));
+    assert_eq!(reconciled.corrections[0].tick, Tick(15));
+    assert_eq!(transients(rig.world(), proxy()), (Some(Aim(0)), true, false));
+    assert_eq!(braced(rig.world(), proxy()), 2);
+
+    // A substitution of 16 by a sample that differs by its yaw alone rolls back to 15,
+    // whose slot holds the corrected claim, and re-simulates to the same world.
+    rig.step(looking(17));
+    let mut frame = StagedFrame::new(Tick(17));
+    frame.substituted.insert(Tick(16));
+    rig.push(frame);
+    rig.step(looking(18));
+    let hash = rig.hash();
+    let reconciled = rig.reconcile();
+    assert_eq!(summaries(&reconciled)[0].0, Tick(15), "{:?}", summaries(&reconciled));
+    assert_eq!(rig.hash(), hash, "the re-simulated world equals the straight run");
+    assert_eq!(transients(rig.world(), proxy()), (Some(Aim(0)), true, false));
+    assert_eq!(braced(rig.world(), proxy()), 4 + 3, "and once in each re-simulated tick");
+
+    // A document's row with a transient component the statement does not name.
+    let components = vec![data(at(5, 5)), data(Health(5)), data(Stance(0))];
+    place_document(
+        rig.world_mut(),
+        DOCUMENT,
+        vec![BaselineRow { id: NetId::cooked(90), components }],
+    );
+    rig.step(looking(19));
+    assert_eq!(transients(rig.world(), character()), (None, true, false));
+    let mut frame = StagedFrame::new(Tick(19));
+    let components = vec![data(at(5, 5)), data(Health(5))];
+    frame.spawns.insert(NetId::cooked(90), claimed(DOCUMENT, components));
+    frame.transient.insert(character(), [Crouch::KEY].into());
+    rig.push(frame);
+    rig.step(looking(20));
+    assert_eq!(claim(rig.world(), character()), Some(PLAYER));
+    assert_eq!(transients(rig.world(), character()), (None, false, true));
+    rig.reconcile();
+    assert_eq!(transients(rig.world(), character()), (None, false, true));
+
+    // A claim of the proxy into a region the world lacks.
+    let mut rig = Rig::joined();
+    rig.step_to(20, walking);
+    let mut frame = StagedFrame::new(Tick(15));
+    frame.spawns.insert(net(3), claimed(UNLOADED, vec![data(at(-50, 0)), data(Aim(3))]));
+    frame.transient.insert(proxy(), [Stance::KEY].into());
+    rig.push(frame);
+    rig.step(walking(21));
+    assert_eq!(
+        (claim(rig.world(), proxy()), transients(rig.world(), proxy())),
+        (None, (None, false, false))
+    );
+    rig.reconcile();
+    assert_eq!(
+        (claim(rig.world(), proxy()), transients(rig.world(), proxy())),
+        (None, (None, false, false))
+    );
 }

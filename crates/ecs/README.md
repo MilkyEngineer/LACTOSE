@@ -48,7 +48,7 @@ and list what changed, because `sim`, `predict`, `physics-api`, `net`, `persist`
 | `World::region_mode` | A loaded region's mode in one lookup, for a consumer that reads every region's mode at every sync point (`World::region` counts the region's entities) |
 | `World::load_region`, `World::export_region`, `RegionRows` | Bulk copy of region rows and resources to and from `lactose_bundle` documents |
 | `World::get_erased`, `World::insert_erased`, `World::remove_erased`, `World::spawn_erased` | One entity's components by key from the registry, `lactose_bundle::ComponentData` in and stored bytes out: what `lactose-predict` and `net`'s generic hook are written against (D121, D122) |
-| `World::despawn_alone`, `World::move_alone_to_region` | One entity despawned or moved without the entities it owns, in a `Client` or a `Prediction` world: how a client's staged-state hooks and `lactose-predict`'s corrections apply a tombstone or a move of the server's (D141). A `Server` world refuses both with `Unsupported`. A facade: the signatures and the contract below are final, the bodies are `todo!()` until the lane `stream-impl` |
+| `World::despawn_alone`, `World::move_alone_to_region` | One entity despawned or moved without the entities it owns, in a `Client` or a `Prediction` world: how a client's staged-state hooks and `lactose-predict`'s corrections apply a tombstone or a move of the server's (D141). A `Server` world refuses both with `Unsupported` |
 
 The hidden `__private` module and the hidden items of `SystemDescriptor`, `Bundle`,
 `QueryItem`, `QueryItems` and `Kernel` are the macro's and the implementation's, and may
@@ -204,6 +204,8 @@ What a system is, from its parameters (`SystemParam` has the table):
   The direct methods (`spawn`, `insert` and their erased forms) rewrite a bound `Net` key in a reference field to
   the origin key but keep a reference to an entity that does not exist yet, as a load
   does, since replicated entities arrive in any order; only command apply empties it.
+  A `Server` world's `OwnedBy` is the one exception (Regions, "Writing `OwnedBy` moves
+  nothing"; D141).
 - `Ctx::rng(k)` is keyed by the region seed, the tick, the system, the invoking entity's
   origin key and `k`, so two entities rolling for one target draw different streams, and a
   placeholder is keyed by its spawn index.
@@ -442,8 +444,8 @@ What a system is, from its parameters (`SystemParam` has the table):
   therefore never call them. The server's log names every entity of a tree it despawned or
   moved, each entry reaches the client as a tombstone or a move of its own, and the hooks
   apply each to the one entity it names, with `World::despawn_alone` and
-  `World::move_alone_to_region` (D141; a facade until the lane `stream-impl`, as the
-  surface table says), so a stale edge takes no entity the server released.
+  `World::move_alone_to_region` (D141), so a stale edge takes no entity the server
+  released.
   `despawn_alone` leaves what the entity owned with its `OwnedBy` as written, a reference to
   an entity that is not live; `move_alone_to_region` leaves it in the region it resides in,
   as a write of `OwnedBy` does. That is not what an owner's unload leaves: an unload keeps
@@ -452,24 +454,44 @@ What a system is, from its parameters (`SystemParam` has the table):
   and the region of the row that holds it cannot be exported. A `Server` world, the one
   kind that exports, therefore refuses both methods with `Unsupported` and nothing changed,
   so that on a server no despawn and no move leaves an owned entity behind. A direct write
-  still can, on today's code: `insert`, `insert_erased`, `spawn`, `spawn_erased` and a
-  load keep a reference to an entity that is not live and store a bound `Net` key as its
-  predicted origin, so an `OwnedBy` that names a despawned predicted owner before the
-  horizon passes, or a predicted origin that has no alias, is a row the export refuses
-  (`docs/verification.md`). From the lane `stream-impl` on (D141; facade) a `Server` world
-  stores no such owner on those paths. An owner that is a despawned predicted entity whose
-  alias the world still holds is stored as its `Net` key, which is what the export writes
-  and what a fresh process that loads the save stores; an owner that is a predicted origin
-  with no alias, live or not, is refused with `InvalidData` and nothing changed; every
-  other owner is stored as before, an unloaded one under its origin, whose alias an unload
-  keeps; and the invariant above then holds on every path of a server. The rule is
-  `OwnedBy`'s alone, the one reference an export writes as a `NetId`, and a server's alone:
-  a despawned entity never returns there. In a client's worlds nothing exports and the
-  reference dangles
-  as any reference may; an owner that returns under the stored key, which for a bound
-  entity is its predicted origin (a staged spawn carries it, as a document's row does),
-  owns the entity again, and one spawned under its bare `Net` key does so only while its
-  alias lives. A prediction system's own
+  could, without a rule of its own: `insert`, `insert_erased`, `spawn`, `spawn_erased` and
+  a load keep a reference to an entity that is not live and store a bound `Net` key as its
+  predicted origin, so an `OwnedBy` that named a despawned predicted owner before the
+  horizon passed, or a predicted origin that has no alias, would be a row the export
+  refuses. A `Server` world therefore stores no such owner on those paths (D141). An owner
+  that is a despawned predicted entity whose alias the world still holds is stored as its
+  `Net` key, which is what the export writes and what a fresh process that loads the save
+  stores; an owner that is a predicted origin with no alias, live or not, is refused with
+  `InvalidData` and nothing changed; every other owner is stored as before, an unloaded
+  one under its origin, whose alias an unload keeps. At command apply a predicted origin
+  with no alias is dropped and logged, as a cycle is, and a despawned owner is emptied, as
+  any reference to an entity that is not live is; the invariant above then holds on every
+  path of a server. In `insert` and `insert_erased` the rule follows the entity's
+  `NotFound` and precedes the equal-bytes test and the cycle check; in `spawn` and
+  `spawn_erased` it follows every check of the row and precedes the cycle check. A load
+  never refuses by it: a document names an owner by `NetId`, in an `OwnershipChange` and in
+  its `ecs::owned_by` component alike, a load refuses with `InvalidData` and nothing
+  changed a component that names any other key, in every kind of world, and stores a
+  component's owner as it stores a record's; a `NetId` names a predicted origin only
+  through its alias, the two alias maps being one bijection, and an unbound one is stored
+  as `Net`, which a later bind rewrites. "Despawned" is the world's own record of the
+  predicted entities it despawned, which a spawn and an unload clear and the horizon prunes
+  with the alias. The rule is `OwnedBy`'s alone, the one reference an export writes as a
+  `NetId`, and a server's alone. While the owner is dead and its alias held, neither
+  `owned_by` nor `referrers`, under either key, lists a row whose owner the rule stored
+  under `Net`, since both resolve the `Net` key to the origin; past the horizon the
+  reference is a `Net` key that names nothing, listed under it as any dangling reference
+  is. A despawned origin may return inside the
+  window, by `spawn` or `spawn_erased` under either key, by a predicted spawn at command
+  apply whose alias is still held, or by a load of its region; what the rule stored under
+  its `Net` key is then rewritten to the origin, as a bind rewrites it, so the tree follows
+  the owner again and the stored bytes are what a fresh process that loads the save stores.
+  A bind of the pair the world already holds, while the origin is dead, rewrites nothing,
+  so the export can still write the owner after the horizon. In a client's worlds
+  nothing exports and the reference dangles as any reference may; an owner that returns
+  under the stored key, which for a bound entity is its predicted origin (a staged spawn
+  carries it, as a document's row does), owns the entity again, and one spawned under its
+  bare `Net` key does so only while its alias lives. A prediction system's own
   `Commands::despawn` or `Commands::move_to_region` still takes the tree through the
   prediction world's edges, which is an open item (`docs/verification.md`); a game that
   needs the server's ownership on a client needs `OwnedBy` replicated, which is a `net-api`
@@ -552,7 +574,8 @@ What a system is, from its parameters (`SystemParam` has the table):
 - `load_region` takes the baseline and the overlay together into a region the caller
   created with the saved seed, skips baseline rows the overlay destroys (a cooked entity
   that moved is a live row elsewhere), restores predicted origins and aliases from
-  `PredictedOrigin`, keeps reference fields as exported, and requires every component
+  `PredictedOrigin`, keeps reference fields as exported (a `Server` world's `OwnedBy` is
+  the one exception: Regions, "Writing `OwnedBy` moves nothing"), and requires every component
   schema to match the registry's (`VersionMismatch` otherwise); migration is
   `lactose-persist`'s, and region resources travel beside the overlay and go in through
   `insert_region_resource_erased`. `export_region` yields persistent components in
@@ -620,7 +643,8 @@ What a system is, from its parameters (`SystemParam` has the table):
 - `ComponentData::bytes` must be the registry's element size for its component
   (`InvalidData` otherwise). The bytes are copied, padding zeroed (`TypeInfo::zero_padding`),
   validated through `TypeInfo::validate` (`InvalidData`) and a bound `Net` key in a
-  reference field rewritten to the origin key, as `insert` does. An unregistered component
+  reference field rewritten to the origin key, as `insert` does (a `Server` world's
+  `OwnedBy` is the one exception: Regions, "Writing `OwnedBy` moves nothing"). An unregistered component
   is `NotFound`, a registered resource and `InRegion` or `PredictedOrigin` are
   `InvalidData`, and a missing entity is `NotFound`.
 - `insert_erased` adds the component if the row lacks it (an archetype change the
@@ -687,7 +711,7 @@ chaos seeds; under Miri, which no runner launches, the session is not read.
 | `regressions_two.rs` | The findings of the second review: new chunks' column ticks above 2^31, presentation batches across the wrap, `writes` visibility by stage, a restore that revives a bound `Net` entity, `update_region_resource`, transient region resources through a reload, schedule ties, resource references through bind and restore, aliases a restore orphans |
 | `wrap_program.rs` | One program with marks, cursors, `Changed` readers, a pass, column and row ticks, presentation events and a rollback, run across the 2^30 rebase, 2^31 and the `u32` wrap, equal to a run far from any boundary |
 | `erased_rows.rs` | Typed and erased writes of the same values leave identical columns, row and column ticks, `changed_since` sets, structural logs, reverse and claim indices under every layout, `Net` references rewritten and `OwnedBy` and `ClaimedBy` among them; an equal `insert_erased` unseen by a `Changed` reader; every refusal with its kind and nothing changed, a refused typed `insert` included; a placeholder refused by name, and stored empty by a typed write; padding zeroed; `get_erased` through a restore and a snapshot round trip |
-| `ownership.rs` | The forest rule: a self-owner and the closing write of a two- and a three-entity cycle refused through every direct path with nothing changed, aliases included, and dropped and logged at apply with the rest of the buffer applied, a refused predicted spawn leaving no bind and no `NetId` used; a chain through a dangling owner accepted and the write that closes it later refused; `load_region` refusing a cycle within one document (through the baseline's own column, or the baseline alone) and a row whose bound id lacks `PredictedOrigin`, and breaking a cycle through live entities of other regions at the smallest document row whose owner is outside, one `warn` line, the re-export carrying the break and reloading without one, across two documents in either order and three regions; `bind`, `restore` and the despawn of a bound `Net` entity emptying the one reference whose rewrite would close a cycle; a region's own save reloading after a cycle closed through it while unloaded, and a client loading documents sent at different times; an owned entity staying put when given to an owner elsewhere and when the owner's region unloads, exported and reloaded in either order; seeded random histories in which the live world never cycles, every export is an overlay, and every reload and restart in either order loads and round-trips exactly; a chain of 8000 owners loading within five times the time of 8000 rows with one owner |
+| `ownership.rs` | The forest rule: a self-owner and the closing write of a two- and a three-entity cycle refused through every direct path with nothing changed, aliases included, and dropped and logged at apply with the rest of the buffer applied, a refused predicted spawn leaving no bind and no `NetId` used; a chain through a dangling owner accepted and the write that closes it later refused; `load_region` refusing a cycle within one document (through the baseline's own column, or the baseline alone) and a row whose bound id lacks `PredictedOrigin`, and breaking a cycle through live entities of other regions at the smallest document row whose owner is outside, one `warn` line, the re-export carrying the break and reloading without one, across two documents in either order and three regions; `bind`, `restore` and the despawn of a bound `Net` entity emptying the one reference whose rewrite would close a cycle; a region's own save reloading after a cycle closed through it while unloaded, and a client loading documents sent at different times; an owned entity staying put when given to an owner elsewhere and when the owner's region unloads, exported and reloaded in either order; seeded random histories in which the live world never cycles, every export is an overlay, and every reload and restart in either order loads and round-trips exactly, each operation followed by a server's per-step horizon, with a refused `despawn_alone` and `move_alone_to_region` among them and a despawn whose entity is then named as an owner before the horizon; a chain of 8000 owners loading within five times the time of 8000 rows with one owner. D141: the two alone forms refused in a `Server` world with nothing changed, before and after the horizon (`the_alone_forms_are_refused_in_a_server_world`); a server storing no owner its export cannot write, on the four direct paths, by either key, inside the window and after it, for a live unbound owner and an unloaded one, while a client's worlds store as before (`a_server_stores_no_owner_it_cannot_export`); a load inside the window storing what a fresh process stores (`a_load_inside_the_window_stores_what_a_fresh_process_stores`); in `Client` and `Prediction` worlds, a despawn that leaves what the entity owned live with its `OwnedBy` as written and owned again by the owner's return, and a move of one entity, one log entry each (`despawn_alone_leaves_what_the_entity_owned`, `move_alone_moves_one_entity`); a command naming a live predicted origin with no alias dropped at apply, logged, and the region exported (`a_command_naming_an_unbound_origin_is_dropped`); an owner despawned inside the window and returned by `spawn` or `spawn_erased` under either key or by a load of its region, nothing listing the row under either key while it was dead, taking back what the rule stored, the tree following it in a move and a despawn (`a_returned_owner_takes_back_what_the_rule_stored`), and after the horizon storing, listing and exporting what a fresh process that loads the two exports in either order does (`a_returned_owner_stores_what_a_fresh_process_stores`); the same return by a predicted spawn at command apply whose alias is held, with no new bind (`a_predicted_spawn_at_apply_takes_back_what_the_rule_stored`); a re-bind of the held pair inside the window rewriting nothing, the row exporting after the horizon (`a_rebind_inside_the_window_keeps_the_rule`); a document whose `ecs::owned_by`, in a spawn record, an added component or a baseline column, names a key that is not a `NetId` refused with nothing changed in every kind of world, and one that names a `NetId` stored as an `OwnershipChange`'s owner is (`a_documents_owner_component_names_a_net_id`) |
 | `units.rs` | A per-entity run is one unit per chunk, or more under `split_batches` with the same reduction; a `Changed` filter and `World::changed_since` skip every chunk whose column tick is old, held by the counts of the `casein` trace events |
 | `fork.rs` | On one worker and on four under chaos seeds with every split forced, over the production layout and seven-row chunks cut into random batches: each unit runs once (every row counted once a tick, each tick's reduction total the row count), and two unordered emitters, a per-region emitter and two unordered spawners leave the same events and spawned keys as one worker, each emitter's events contiguous and in source order |
 | `alloc.rs` | A row that emits nothing allocates nothing, with `Ctx::rng` keyed by the row among the parameters |

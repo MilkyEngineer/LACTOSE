@@ -1,6 +1,7 @@
 //! What the integration tests share: a small game that runs in the prediction world (a
-//! player who walks by its input, a derived cache that follows `Changed<Position>`, an
-//! emitter of presentation events, an extract pass that counts what it sees), the
+//! player who walks by its input, a derived cache added by its own kernel and following
+//! `Changed<Position>`, a kernel over two transient components, an emitter of presentation
+//! events, an extract pass that counts what it sees), the
 //! prediction world `app` builds, with or without the physics test backend, a rig that
 //! keeps the predictor across runs as `app` does, and the frames a server would send.
 
@@ -17,7 +18,8 @@ use lactose_bundle::{Baseline, BaselineRow, ComponentData, ComponentSchema, Fiel
 use lactose_core::{Error, NetId, PlayerId, Result, StableKey, Tick};
 use lactose_ecs::{
     Changed, ClaimedBy, Commands, Executor, LayoutConfig, Mut, PresentEvent, PresentEvents,
-    PresentKind, RegionConfig, RegionId, RegionMode, Res, StableKeyOf, World, WorldKind, system,
+    PresentKind, RegionConfig, RegionId, RegionMode, Res, StableKeyOf, With, Without, World,
+    WorldKind, system,
 };
 use lactose_input::{Action, Actions, Axis2, PlayerInput, PlayerInputApplier, Yaw};
 use lactose_math::{Scalar, Vec3};
@@ -55,12 +57,27 @@ pub struct Position {
 pub struct Health(#[field(id = 1)] pub i32);
 
 /// Replicated and transient, written by no system: the server sends it, the input sync
-/// point zeroes it.
+/// point zeroes it. `test::brace` names it.
 #[component(key = "test::aim", transient, replicated)]
 #[derive(PartialEq, Eq, Debug, Default)]
 pub struct Aim(#[field(id = 1)] pub i32);
 
-/// Derived: a cache of `Position` a prediction system maintains from `Changed<Position>`.
+/// Transient and not replicated: the server's entity has it, and a frame's
+/// `StagedFrame::transient` states its presence. `test::brace`, a `[server, prediction]`
+/// kernel that names it and [`Aim`], writes one here every tick it runs, since the input
+/// sync point zeroes the column first.
+#[component(key = "test::stance", transient)]
+#[derive(PartialEq, Eq, Debug, Default)]
+pub struct Stance(#[field(id = 1)] pub u32);
+
+/// Transient and not replicated, named by no system: a second component a statement names
+/// or leaves out.
+#[component(key = "test::crouch", transient)]
+#[derive(PartialEq, Eq, Debug, Default)]
+pub struct Crouch(#[field(id = 1)] pub u32);
+
+/// Derived: a cache of `Position` a prediction system maintains from `Changed<Position>`,
+/// added to a row that lacks it by `test::add_trail` (never sent by a frame).
 #[component(key = "test::trail", derived)]
 #[derive(PartialEq, Eq, Debug, Default)]
 pub struct Trail {
@@ -92,6 +109,16 @@ pub const JUMP: Sound = Sound(2);
 #[derive(Default)]
 pub struct Seen(pub Mutex<Vec<u32>>);
 
+/// Every row `test::brace` ran on, one entry per run, in no particular order within a tick.
+#[derive(Default)]
+pub struct Braced(pub Mutex<Vec<StableKey>>);
+
+/// How many times `test::brace` has run on `key` in `world`, re-simulated ticks included.
+pub fn braced(world: &World, key: StableKey) -> usize {
+    let runs = world.service::<Braced>().expect("the setup").0.lock().expect("never poisoned");
+    runs.iter().filter(|&&run| run == key).count()
+}
+
 #[system(name = "test::walk", worlds = [server, prediction])]
 fn walk(input: &PlayerInput, position: Mut<Position>) {
     position.x += i32::from(input.movement.x);
@@ -121,10 +148,25 @@ fn kick(cmd: Commands, input: &PlayerInput) {
     }
 }
 
+/// The owner of `Trail` gives it to a row that lacks it, with the value the cache holds for
+/// the row as it is: no `writes = [Trail]`, which the schedule refuses beside `Without`.
+#[system(name = "test::add_trail", worlds = [server, prediction])]
+fn add_trail(cmd: Commands, _lacks: Without<Trail>, key: StableKeyOf, position: &Position) {
+    cmd.set(*key, Trail { x: position.x, updates: 0 });
+}
+
 #[system(name = "test::trail", worlds = [server, prediction])]
 fn trail(_changed: Changed<Position>, position: &Position, trail: Mut<Trail>) {
     trail.x = position.x;
     trail.updates += 1;
+}
+
+/// Runs only on a row with both transient components: what a claimed entity the stream
+/// built lacks without the frame's statement.
+#[system(name = "test::brace", worlds = [server, prediction])]
+fn brace(key: StableKeyOf, _aim: With<Aim>, stance: Mut<Stance>, braced: Res<Braced>) {
+    stance.0 += 1;
+    braced.0.lock().expect("never poisoned").push(*key);
 }
 
 #[system(name = "test::chirp", worlds = [server, prediction])]
@@ -146,6 +188,8 @@ pub fn register_types(types: &mut TypeTable) -> Result<()> {
     types.register::<Position>()?;
     types.register::<Health>()?;
     types.register::<Aim>()?;
+    types.register::<Stance>()?;
+    types.register::<Crouch>()?;
     types.register::<Trail>()?;
     types.register::<Diary>()?;
     lactose_input::register_types(types)?;
@@ -161,8 +205,8 @@ pub fn types() -> TypeTable {
 }
 
 pub fn register_game(registration: &mut Registration) {
-    registration.stage(Stage::Simulation).add(&WALK).add(&THROW).add(&KICK);
-    registration.stage(Stage::Post).add(&TRAIL).add(&CHIRP);
+    registration.stage(Stage::Simulation).add(&WALK).add(&THROW).add(&KICK).add(&BRACE);
+    registration.stage(Stage::Post).add(&ADD_TRAIL).add(&TRAIL).add(&CHIRP);
     registration.pass(Pass::Extract).add(&EXTRACT);
 }
 
@@ -279,12 +323,12 @@ pub fn remote(region: RegionId, index: u32, mut components: Vec<ComponentData>) 
 }
 
 /// The server's full frame on join: the player's entity at the origin, the cart at 50 with
-/// health 10 (and its derived cache, so the prediction system has a row to maintain), and
-/// a proxy at -50.
+/// health 10, and a proxy at -50. No derived component: `test::add_trail` gives each claimed
+/// row its cache.
 pub fn join_frame(tick: Tick) -> StagedFrame {
     let mut frame = StagedFrame::resync(tick);
     frame.spawns.insert(net(1), claimed(REGION, vec![data(at(0, 0))]));
-    let cart = vec![data(at(50, 0)), data(Health(10)), data(Trail::default())];
+    let cart = vec![data(at(50, 0)), data(Health(10))];
     frame.spawns.insert(net(2), claimed(REGION, cart));
     frame.spawns.insert(net(3), remote(REGION, 0, vec![data(at(-50, 0))]));
     frame
@@ -340,6 +384,15 @@ pub fn cooked_bundle(world: &World) -> RegionBundle {
     }
 }
 
+/// Places `rows` in `region`, which it creates, as a region document does, between steps:
+/// the region's rows are in every slot taken after, and in none before.
+pub fn place_document(world: &mut World, region: RegionId, rows: Vec<BaselineRow>) {
+    let config = RegionConfig { id: region, seed: 70 + region.0, mode: RegionMode::Simulated };
+    world.create_region(config).expect("a new region");
+    let baseline = Baseline::from_rows(AssetSet::new(), schemas(world), rows).expect("a baseline");
+    world.load_region(region, &baseline, None).expect("the document loads");
+}
+
 /// One predicted tick with `input`, unloading `unload` and loading `load` with
 /// [`cooked_bundle`] in it, as `app`'s fold of the frames' region changes does.
 pub fn step_regions(rig: &mut Rig, input: PlayerInput, unload: &[RegionId], load: &[RegionId]) {
@@ -375,6 +428,7 @@ pub fn simulation(layout: LayoutConfig, backend: Option<Box<dyn PhysicsBackend>>
         .setup(lactose_net_api::setup)
         .setup(|world| {
             world.insert_service::<Seen>(Box::new(Seen::default()));
+            world.insert_service::<Braced>(Box::new(Braced::default()));
             Ok(())
         });
     if let Some(backend) = backend {

@@ -9,8 +9,13 @@
 //! own save and a client's documents loading after a cycle closed across regions; an owned
 //! entity staying put when given to an owner elsewhere and when the owner's region unloads;
 //! seeded random histories that always save and load; a deep chain of owners loading as
-//! fast as a flat one. Every case that touches storage runs under every layout; the
-//! histories are spread over them.
+//! fast as a flat one. D141: the alone forms refused in a server world with nothing changed,
+//! and in a client's worlds despawning or moving one entity and leaving what it owned; the
+//! owners a server stores on the four direct paths, at command apply and at a load, none it
+//! cannot export, and a client's worlds without that rule; an owner that returns inside the
+//! window, by any spawn or a load, taking back what the rule stored, and a re-bind inside
+//! it rewriting nothing; a document's `ecs::owned_by` naming a `NetId` or refused. Every
+//! case that touches storage runs under every layout; the histories are spread over them.
 //!
 //! The world logs through one global subscriber into one buffer for the process, and a
 //! command apply logs on the executor's threads, so the log cannot be told apart by thread.
@@ -27,7 +32,7 @@ use std::sync::{Mutex, Once};
 use common::*;
 use lactose_asset_api::AssetSet;
 use lactose_bundle::{Baseline, BaselineRow, Column, ComponentData, Overlay, Record};
-use lactose_core::{EntityRef, ErrorKind, NetId, PredictionKey, Result, StableKey};
+use lactose_core::{EntityRef, ErrorKind, NetId, PredictionKey, Result, StableKey, Tick};
 use lactose_ecs::{
     ChangeMark, ClaimedBy, Commands, LayoutConfig, OwnedBy, RegionConfig, RegionId, RegionMode,
     RegionRows, Schedule, StableKeyOf, StructuralChange, With, World, WorldBuilder, WorldKind,
@@ -1042,6 +1047,585 @@ fn a_client_loads_documents_sent_at_different_times() {
     }
 }
 
+// ---- One entity alone, and the owners a server stores (D141) ----
+
+/// The server's horizon for a history with no tick: every despawn so far is behind it.
+fn pass_horizon(world: &mut World) {
+    let horizon = Tick(world.tick().0.wrapping_add(1));
+    world.set_rollback_horizon(horizon);
+}
+
+fn exports(world: &World) -> Vec<RegionRows> {
+    [REGION, OTHER_REGION].map(|region| world.export_region(region).unwrap()).into()
+}
+
+fn changes_since(world: &World, cursor: &mut lactose_ecs::LogCursor) -> Vec<StructuralChange> {
+    world.structural_log().since(cursor).unwrap().map(|entry| entry.change).collect()
+}
+
+#[test]
+fn the_alone_forms_are_refused_in_a_server_world() {
+    let _serial = serial();
+    for layout in layouts() {
+        let mut world = two_regions(WorldKind::Server, layout, RegionMode::Simulated);
+        let start = world.mark();
+        world.spawn(predicted(), REGION, (pos(0, 0),)).unwrap();
+        world.bind(prediction(), net_50()).unwrap();
+        world.spawn(net(1), OTHER_REGION, (pos(1, 0), owned_by(bound()))).unwrap();
+        let marks = [start, world.mark()];
+        let before = state(&world, &marks);
+        let exported = exports(&world);
+        // The kind is checked first: a live key, a key that is not live, a loaded region and
+        // one that is not loaded are all refused alike.
+        let refusals = [
+            world.despawn_alone(bound()),
+            world.despawn_alone(predicted()),
+            world.despawn_alone(net(77)),
+            world.move_alone_to_region(bound(), OTHER_REGION),
+            world.move_alone_to_region(net(1), REGION),
+            world.move_alone_to_region(net(77), OTHER_REGION),
+            world.move_alone_to_region(net(1), THIRD_REGION),
+        ];
+        for (case, refused) in refusals.into_iter().enumerate() {
+            let error = refused.expect_err(&format!("{layout:?} case {case}"));
+            assert_eq!(error.kind(), ErrorKind::Unsupported, "{layout:?} case {case}: {error}");
+        }
+        assert_eq!(state(&world, &marks), before, "{layout:?}");
+        pass_horizon(&mut world);
+        assert_eq!(exports(&world), exported, "{layout:?}: nothing changed past the horizon");
+    }
+}
+
+#[test]
+fn despawn_alone_leaves_what_the_entity_owned() {
+    let _serial = serial();
+    for kind in [WorldKind::Client, WorldKind::Prediction] {
+        for layout in layouts() {
+            let context = format!("{kind:?} {layout:?}");
+            let mut world = two_regions(kind, layout, RegionMode::Simulated);
+            let start = world.mark();
+            world.spawn(predicted(), REGION, (pos(0, 0),)).unwrap();
+            world.bind(prediction(), net_50()).unwrap();
+            world.spawn(net(9), REGION, (pos(9, 0),)).unwrap();
+            // Owned by the bound owner through its `Net` key, stored as its origin; and a
+            // chain under the unbound owner.
+            world.spawn(net(1), OTHER_REGION, (pos(1, 0), owned_by(bound()))).unwrap();
+            world.spawn(net(2), REGION, (pos(2, 0), owned_by(net(9)))).unwrap();
+            world.spawn(net(3), REGION, (pos(3, 0), owned_by(net(2)))).unwrap();
+            assert_eq!(owner_of(&world, net(1)), Some(predicted()), "{context}");
+
+            let mut cursor = world.structural_log().cursor();
+            world.despawn_alone(bound()).expect(&context);
+            world.despawn_alone(net(9)).expect(&context);
+            assert_eq!(
+                changes_since(&world, &mut cursor),
+                [
+                    StructuralChange::Despawned { key: predicted(), region: REGION },
+                    StructuralChange::Despawned { key: net(9), region: REGION },
+                ],
+                "{context}: one tombstone each, nothing for what they owned"
+            );
+            for (item, owner) in [(net(1), predicted()), (net(2), net(9)), (net(3), net(2))] {
+                assert!(world.contains(item), "{context}: {item:?} stayed");
+                assert_eq!(owner_of(&world, item), Some(owner), "{context}: as written");
+            }
+            assert_forest(&world, &context);
+
+            // A key that is not live: `NotFound`, nothing changed.
+            let marks = [start, world.mark()];
+            let before = state(&world, &marks);
+            let error = world.despawn_alone(net(77)).expect_err(&context);
+            assert_eq!(error.kind(), ErrorKind::NotFound, "{context}: {error}");
+            let error = world.despawn_alone(net(9)).expect_err(&context);
+            assert_eq!(error.kind(), ErrorKind::NotFound, "{context}: {error}");
+            assert_eq!(state(&world, &marks), before, "{context}");
+
+            // The owners return under their stored keys after the horizon has pruned the
+            // alias, as a hook spawns them: the origin key, then the bind.
+            pass_horizon(&mut world);
+            assert_eq!(world.alias(prediction()), None, "{context}");
+            world.spawn(predicted(), REGION, (pos(0, 0),)).unwrap();
+            world.bind(prediction(), net_50()).unwrap();
+            world.spawn(net(9), REGION, (pos(9, 0),)).unwrap();
+            for (owner, items) in [(predicted(), [net(1)]), (bound(), [net(1)]), (net(9), [net(2)])]
+            {
+                let found: Vec<StableKey> = world.owned_by(owner).collect();
+                assert_eq!(found, items, "{context}: {owner:?} owns again");
+            }
+            // The tree is whole again: the cascading form takes all of it.
+            world.despawn(net(9)).unwrap();
+            assert!(!world.contains(net(2)) && !world.contains(net(3)), "{context}");
+            world.despawn(predicted()).unwrap();
+            assert!(!world.contains(net(1)), "{context}");
+        }
+    }
+}
+
+#[test]
+fn move_alone_moves_one_entity() {
+    let _serial = serial();
+    for kind in [WorldKind::Client, WorldKind::Prediction] {
+        for layout in layouts() {
+            let context = format!("{kind:?} {layout:?}");
+            let mut world = two_regions(kind, layout, RegionMode::Simulated);
+            let start = world.mark();
+            world.spawn(predicted(), REGION, (pos(0, 0),)).unwrap();
+            world.bind(prediction(), net_50()).unwrap();
+            world.spawn(net(1), REGION, (pos(1, 0), owned_by(bound()))).unwrap();
+            world.spawn(net(2), REGION, (pos(2, 0), owned_by(net(1)))).unwrap();
+
+            let mut cursor = world.structural_log().cursor();
+            world.move_alone_to_region(bound(), OTHER_REGION).expect(&context);
+            world.move_alone_to_region(net(2), OTHER_REGION).expect(&context);
+            assert_eq!(
+                changes_since(&world, &mut cursor),
+                [
+                    StructuralChange::Moved { key: predicted(), from: REGION, to: OTHER_REGION },
+                    StructuralChange::Moved { key: net(2), from: REGION, to: OTHER_REGION },
+                ],
+                "{context}: one entry each, nothing for what they owned"
+            );
+            let regions = [predicted(), net(1), net(2)].map(|key| world.region_of(key));
+            assert_eq!(
+                regions,
+                [Some(OTHER_REGION), Some(REGION), Some(OTHER_REGION)],
+                "{context}"
+            );
+            assert_eq!(owner_of(&world, net(1)), Some(predicted()), "{context}: as written");
+            assert_eq!(owner_of(&world, net(2)), Some(net(1)), "{context}: as written");
+            assert_forest(&world, &context);
+
+            // Nothing for an entity already there, and `NotFound` for a key that is not live
+            // or a region that is not loaded: no entry, the point unmoved.
+            let marks = [start, world.mark()];
+            let before = state(&world, &marks);
+            world.move_alone_to_region(predicted(), OTHER_REGION).expect(&context);
+            for (key, region) in [(net(77), OTHER_REGION), (net(1), THIRD_REGION)] {
+                let error = world.move_alone_to_region(key, region).expect_err(&context);
+                assert_eq!(error.kind(), ErrorKind::NotFound, "{context}: {error}");
+            }
+            assert_eq!(state(&world, &marks), before, "{context}");
+        }
+    }
+}
+
+/// A predicted entity bound to `Net` 50 in region A, despawned by the cascading form while
+/// its alias is held; `net(1)` in B.
+fn despawned_owner(kind: WorldKind, layout: LayoutConfig) -> World {
+    let mut world = two_regions(kind, layout, RegionMode::Simulated);
+    world.spawn(predicted(), REGION, (pos(0, 0),)).unwrap();
+    world.bind(prediction(), net_50()).unwrap();
+    world.spawn(net(1), OTHER_REGION, (pos(1, 0),)).unwrap();
+    world.despawn(bound()).unwrap();
+    world
+}
+
+/// The key `path` writes the owner to: `net(1)` is live, `net(2)` a fresh spawn.
+fn item(path: Path) -> StableKey {
+    if path.spawns() { net(2) } else { net(1) }
+}
+
+fn assert_no_net_id(result: Result<()>, context: &str) {
+    let error = result.expect_err(context);
+    assert_eq!(error.kind(), ErrorKind::InvalidData, "{context}: {error}");
+    assert!(error.message().contains("no `NetId`"), "{context}: {error}");
+}
+
+#[test]
+fn a_server_stores_no_owner_it_cannot_export() {
+    let _serial = serial();
+    for layout in layouts() {
+        for path in PATHS {
+            let context = format!("{layout:?} {path:?}");
+            // A despawned owner named inside the window, by either key: the alias is held,
+            // so it is stored under `Net`, and the horizon changes no byte of the export.
+            for named in [bound(), predicted()] {
+                let mut world = despawned_owner(WorldKind::Server, layout);
+                path.write(&mut world, item(path), named).expect(&context);
+                assert_eq!(owner_of(&world, item(path)), Some(bound()), "{context} {named:?}");
+                let exported = exports(&world);
+                pass_horizon(&mut world);
+                assert_eq!(exports(&world), exported, "{context} {named:?}");
+                assert_eq!(owner_of(&world, item(path)), Some(bound()), "{context} {named:?}");
+                assert_forest(&world, &context);
+            }
+
+            // Named by its origin after the horizon: no alias, refused, nothing changed. By
+            // `Net`, a dangling `Net` owner as before.
+            let mut world = despawned_owner(WorldKind::Server, layout);
+            pass_horizon(&mut world);
+            let marks = [world.mark()];
+            let before = state(&world, &marks);
+            assert_no_net_id(path.write(&mut world, item(path), predicted()), &context);
+            assert_eq!(state(&world, &marks), before, "{context}");
+            path.write(&mut world, item(path), bound()).expect(&context);
+            assert_eq!(owner_of(&world, item(path)), Some(bound()), "{context}");
+            exports(&world);
+
+            // A live predicted owner that was never bound: refused, nothing changed.
+            let mut world = two_regions(WorldKind::Server, layout, RegionMode::Simulated);
+            world.spawn(predicted(), REGION, (pos(0, 0),)).unwrap();
+            world.spawn(net(1), OTHER_REGION, (pos(1, 0),)).unwrap();
+            let marks = [world.mark()];
+            let before = state(&world, &marks);
+            assert_no_net_id(path.write(&mut world, item(path), predicted()), &context);
+            assert_eq!(state(&world, &marks), before, "{context}");
+
+            // A bound owner whose region is unloaded is not despawned: stored as its origin,
+            // which the export writes through the alias the unload keeps.
+            let mut world = two_regions(WorldKind::Server, layout, RegionMode::Simulated);
+            create(&mut world, THIRD_REGION);
+            world.spawn(predicted(), THIRD_REGION, (pos(0, 0),)).unwrap();
+            world.bind(prediction(), net_50()).unwrap();
+            world.spawn(net(1), OTHER_REGION, (pos(1, 0),)).unwrap();
+            world.unload_region(THIRD_REGION).unwrap();
+            pass_horizon(&mut world);
+            path.write(&mut world, item(path), bound()).expect(&context);
+            assert_eq!(owner_of(&world, item(path)), Some(predicted()), "{context}");
+            pass_horizon(&mut world);
+            let rows = exports(&world);
+            let row = rows.iter().flat_map(|rows| &rows.rows).find(|row| key(row.id) == item(path));
+            assert_eq!(row.and_then(|row| row.owner), Some(net_50()), "{context}");
+
+            // A client's worlds have no rule: they store the origin of a dead bound owner, and
+            // a predicted owner with no alias, as given.
+            for kind in [WorldKind::Client, WorldKind::Prediction] {
+                let context = format!("{context} {kind:?}");
+                let mut world = despawned_owner(kind, layout);
+                path.write(&mut world, item(path), bound()).expect(&context);
+                assert_eq!(owner_of(&world, item(path)), Some(predicted()), "{context}");
+                pass_horizon(&mut world);
+                world.insert(item(path), owned_by(predicted())).expect(&context);
+                assert_eq!(owner_of(&world, item(path)), Some(predicted()), "{context}");
+                let mut world = two_regions(kind, layout, RegionMode::Simulated);
+                world.spawn(predicted(), REGION, (pos(0, 0),)).unwrap();
+                world.spawn(net(1), OTHER_REGION, (pos(1, 0),)).unwrap();
+                path.write(&mut world, item(path), predicted()).expect(&context);
+                assert_eq!(owner_of(&world, item(path)), Some(predicted()), "{context}");
+            }
+        }
+    }
+}
+
+/// B is exported and unloaded while its row's owner, a bound predicted entity of A, is live;
+/// the owner is despawned and B reloaded, inside the window and past it.
+#[test]
+fn a_load_inside_the_window_stores_what_a_fresh_process_stores() {
+    let _serial = serial();
+    let (empty, _) = document(&[], vec![]);
+    for layout in layouts() {
+        let mut fresh = two_regions(WorldKind::Server, layout, RegionMode::Simulated);
+        let mut overlay = None;
+        for inside in [true, false] {
+            let context = format!("{layout:?} inside the window: {inside}");
+            let mut world = two_regions(WorldKind::Server, layout, RegionMode::Simulated);
+            world.spawn(predicted(), REGION, (pos(0, 0),)).unwrap();
+            world.bind(prediction(), net_50()).unwrap();
+            world.spawn(net(1), OTHER_REGION, (pos(1, 0), owned_by(bound()))).unwrap();
+            assert_eq!(owner_of(&world, net(1)), Some(predicted()), "{context}");
+            let saved = overlay_of(&world.export_region(OTHER_REGION).unwrap(), &empty).unwrap();
+            world.unload_region(OTHER_REGION).unwrap();
+            world.despawn(bound()).unwrap();
+            if !inside {
+                pass_horizon(&mut world);
+            }
+            create(&mut world, OTHER_REGION);
+            world.load_region(OTHER_REGION, &empty, Some(&saved)).expect(&context);
+            assert_eq!(owner_of(&world, net(1)), Some(bound()), "{context}");
+            pass_horizon(&mut world);
+            let exported = world.export_region(OTHER_REGION).expect(&context);
+            assert_eq!(exported.rows[0].owner, Some(net_50()), "{context}");
+            overlay = Some(saved);
+        }
+        // A fresh process loading the same document, the owner's region never loaded.
+        fresh.unload_region(OTHER_REGION).unwrap();
+        create(&mut fresh, OTHER_REGION);
+        fresh.load_region(OTHER_REGION, &empty, overlay.as_ref()).unwrap();
+        assert_eq!(owner_of(&fresh, net(1)), Some(bound()), "{layout:?}: the same key");
+    }
+}
+
+/// `give` writes the owner its `ThrownBy` names: in a `Server` world a live predicted origin
+/// with no alias is dropped at apply, as a cycle is, and the region still exports.
+#[test]
+fn a_command_naming_an_unbound_origin_is_dropped() {
+    let _serial = serial();
+    let executor = executor();
+    for layout in layouts() {
+        let context = format!("{layout:?}");
+        let mut builder = Schedule::builder(WorldKind::Server);
+        builder.stage("simulation", &[]).add(&GIVE);
+        let mut schedule = builder.build().unwrap();
+        let mut world = two_regions(WorldKind::Server, layout, RegionMode::Simulated);
+        world.spawn(predicted(), REGION, (pos(0, 0),)).unwrap();
+        world.spawn(net(1), OTHER_REGION, (pos(1, 0),)).unwrap();
+        assert_no_net_id(world.insert(net(1), owned_by(predicted())), &context);
+        world.insert(net(1), ThrownBy { thrower: EntityRef::new(predicted()) }).unwrap();
+
+        let (mut world, lines) = logged(|| tick(&mut schedule, world, &executor));
+
+        assert!(world.get::<OwnedBy>(net(1)).is_none(), "{context}: nothing stored");
+        assert_eq!(world.get::<ThrownBy>(net(1)), None, "{context}: the rest applied");
+        let dropped: Vec<&Line> = lines
+            .iter()
+            .filter(|line| line.level == Level::DEBUG && line.says("a set dropped"))
+            .collect();
+        assert_eq!(dropped.len(), 1, "{context}: {lines:?}");
+        assert!(dropped[0].says("no `NetId`"), "{context}: {dropped:?}");
+        pass_horizon(&mut world);
+        world.export_region(OTHER_REGION).expect(&context);
+    }
+}
+
+/// The key a direct spawn names a returning owner by.
+#[derive(Clone, Copy, Debug)]
+enum Under {
+    Net,
+    Origin,
+}
+
+impl Under {
+    fn key(self) -> StableKey {
+        match self {
+            Self::Net => bound(),
+            Self::Origin => predicted(),
+        }
+    }
+}
+
+/// How a despawned predicted owner returns inside the window.
+#[derive(Clone, Copy, Debug)]
+enum Return {
+    Spawn(Under),
+    SpawnErased(Under),
+    /// A load of its region's document, saved while it was live.
+    Load,
+}
+
+const RETURNS: [Return; 5] = [
+    Return::Spawn(Under::Net),
+    Return::Spawn(Under::Origin),
+    Return::SpawnErased(Under::Net),
+    Return::SpawnErased(Under::Origin),
+    Return::Load,
+];
+
+/// A server whose bound predicted owner in A was despawned after A was saved, and `net(1)`
+/// in B given it inside the window, which the rule stores under its `Net` key: with
+/// nothing listing `net(1)` as owned under either key while the owner is dead.
+fn given_a_dead_owner(layout: LayoutConfig) -> (World, Overlay) {
+    let (empty, _) = document(&[], vec![]);
+    let mut world = two_regions(WorldKind::Server, layout, RegionMode::Simulated);
+    world.spawn(predicted(), REGION, (pos(0, 0),)).unwrap();
+    world.bind(prediction(), net_50()).unwrap();
+    world.spawn(net(1), OTHER_REGION, (pos(1, 0),)).unwrap();
+    let saved = overlay_of(&world.export_region(REGION).unwrap(), &empty).unwrap();
+    world.despawn(bound()).unwrap();
+    world.insert(net(1), owned_by(predicted())).unwrap();
+    assert_eq!(owner_of(&world, net(1)), Some(bound()));
+    for key in [bound(), predicted()] {
+        assert_eq!(world.owned_by(key).count(), 0, "{layout:?} {key:?}");
+        assert_eq!(world.referrers(key).count(), 0, "{layout:?} {key:?}");
+    }
+    (world, saved)
+}
+
+/// Brings the owner back as `how` says.
+fn bring_back(world: &mut World, saved: &Overlay, how: Return) {
+    match how {
+        Return::Spawn(under) => world.spawn(under.key(), REGION, (pos(0, 0),)).unwrap(),
+        Return::SpawnErased(under) => {
+            world.spawn_erased(under.key(), REGION, &[data(pos(0, 0))]).unwrap();
+        }
+        Return::Load => {
+            let (empty, _) = document(&[], vec![]);
+            world.unload_region(REGION).unwrap();
+            let config = RegionConfig { id: REGION, seed: 7, mode: RegionMode::Simulated };
+            world.create_region(config).unwrap();
+            world.load_region(REGION, &empty, Some(saved)).unwrap();
+        }
+    }
+}
+
+/// D141 stores an owner despawned inside the window under its `Net` key; the owner may
+/// return inside the window, by any spawn or a load, and then takes back what was stored
+/// under that key: the tree follows it again.
+#[test]
+fn a_returned_owner_takes_back_what_the_rule_stored() {
+    let _serial = serial();
+    for layout in layouts() {
+        for how in RETURNS {
+            let context = format!("{layout:?} {how:?}");
+            let (mut world, saved) = given_a_dead_owner(layout);
+            bring_back(&mut world, &saved, how);
+            assert_eq!(world.origin(bound()), Some(predicted()), "{context}");
+            assert_eq!(owner_of(&world, net(1)), Some(predicted()), "{context}");
+            for key in [bound(), predicted()] {
+                let owned: Vec<StableKey> = world.owned_by(key).collect();
+                assert_eq!(owned, [net(1)], "{context} {key:?}");
+            }
+            world.move_to_region(bound(), OTHER_REGION).unwrap();
+            world.move_to_region(bound(), REGION).unwrap();
+            assert_eq!(world.region_of(net(1)), Some(REGION), "{context}: it followed");
+            assert_forest(&world, &context);
+            world.despawn(bound()).unwrap();
+            assert!(!world.contains(net(1)), "{context}: the despawn took it");
+        }
+    }
+}
+
+/// After the return and the horizon, the process stores and lists what a fresh process
+/// that loads its two exports stores and lists, in either order of loads.
+#[test]
+fn a_returned_owner_stores_what_a_fresh_process_stores() {
+    let _serial = serial();
+    let (empty, _) = document(&[], vec![]);
+    for layout in layouts() {
+        for how in RETURNS {
+            let context = format!("{layout:?} {how:?}");
+            let (mut world, saved) = given_a_dead_owner(layout);
+            bring_back(&mut world, &saved, how);
+            pass_horizon(&mut world);
+            let saves = [REGION, OTHER_REGION]
+                .map(|region| overlay_of(&world.export_region(region).unwrap(), &empty).unwrap());
+            for order in [[0, 1], [1, 0]] {
+                let mut fresh = two_regions(WorldKind::Server, layout, RegionMode::Simulated);
+                for index in order {
+                    let region = [REGION, OTHER_REGION][index];
+                    fresh.load_region(region, &empty, Some(&saves[index])).unwrap();
+                }
+                let context = format!("{context} {order:?}");
+                assert_eq!(owner_of(&fresh, net(1)), owner_of(&world, net(1)), "{context}");
+                assert_eq!(
+                    fresh.owned_by(bound()).collect::<Vec<_>>(),
+                    world.owned_by(bound()).collect::<Vec<_>>(),
+                    "{context}"
+                );
+                assert_eq!(exports(&fresh), exports(&world), "{context}");
+            }
+        }
+    }
+}
+
+/// The source's input tick, held at one value, so `predicted_spawn` derives one key on
+/// every tick.
+#[system(name = "ownership::held_input", worlds = [server], exclusive)]
+fn held_input(world: &mut World) {
+    world.set_input_tick(PLAYER, t(4));
+}
+
+/// A predicted spawn at command apply whose alias the server still holds is the same
+/// return: no new bind, and what the rule stored names the origin again.
+#[test]
+fn a_predicted_spawn_at_apply_takes_back_what_the_rule_stored() {
+    let _serial = serial();
+    let executor = executor();
+    for layout in layouts() {
+        let context = format!("{layout:?}");
+        let mut builder = Schedule::builder(WorldKind::Server);
+        builder.stage("input", &[]).add(&HELD_INPUT);
+        builder.stage("spawn", &[]).add(&PREDICTED_SPAWN);
+        let mut schedule = builder.build().unwrap();
+        let mut world = server_from(FIRST_ALLOCATED, layout);
+        world.spawn(net(1), REGION, (pos(1, 1), Counter(0))).unwrap();
+        world.insert(net(1), ClaimedBy { player: PLAYER }).unwrap();
+        world.spawn(net(5), REGION, (pos(5, 5),)).unwrap();
+
+        let mut world = tick(&mut schedule, world, &executor);
+        let spawned = world
+            .entities_in(REGION)
+            .find(|key| matches!(key, StableKey::Predicted(_)))
+            .expect(&context);
+        let StableKey::Predicted(prediction) = spawned else { unreachable!() };
+        let alias = world.alias(prediction).expect(&context);
+        world.despawn(spawned).unwrap();
+        world.insert(net(5), owned_by(spawned)).unwrap();
+        assert_eq!(owner_of(&world, net(5)), Some(key(alias)), "{context}: stored by the rule");
+
+        let mut world = tick(&mut schedule, world, &executor);
+        assert!(world.contains(spawned), "{context}: the same key returned");
+        assert_eq!(world.alias(prediction), Some(alias), "{context}: no new bind");
+        assert_eq!(
+            world.allocate_net_id().unwrap(),
+            NetId::from_bits(alias.to_bits() + 1).unwrap()
+        );
+        assert_eq!(owner_of(&world, net(5)), Some(spawned), "{context}");
+        assert_eq!(world.owned_by(spawned).collect::<Vec<_>>(), [net(5)], "{context}");
+        world.despawn(spawned).unwrap();
+        assert!(!world.contains(net(5)), "{context}: the despawn took it");
+    }
+}
+
+/// A re-bind of the pair the world already holds, inside the window, leaves what the rule
+/// stored under the `Net` key, which the export writes after the horizon.
+#[test]
+fn a_rebind_inside_the_window_keeps_the_rule() {
+    let _serial = serial();
+    for layout in layouts() {
+        let context = format!("{layout:?}");
+        let (mut world, _) = given_a_dead_owner(layout);
+        world.bind(prediction(), net_50()).expect(&context);
+        assert_eq!(owner_of(&world, net(1)), Some(bound()), "{context}");
+        pass_horizon(&mut world);
+        let rows = world.export_region(OTHER_REGION).expect(&context);
+        assert_eq!(rows.rows[0].owner, Some(net_50()), "{context}");
+    }
+}
+
+/// A document names an owner by `NetId`, in a column or a record's component as in an
+/// `OwnershipChange`: any other key is `InvalidData` with nothing changed, in every kind of
+/// world; a `NetId` in the component is stored as the record's would be.
+#[test]
+fn a_documents_owner_component_names_a_net_id() {
+    let _serial = serial();
+    let spawn = |owner| Record::Spawn {
+        id: NetId::from_bits(7).unwrap(),
+        components: vec![data(pos(1, 0)), data(owned_by(owner))],
+    };
+    let add = |owner| Record::AddComponent { id: cooked(0xA1), data: data(owned_by(owner)) };
+    for kind in [WorldKind::Server, WorldKind::Client, WorldKind::Prediction] {
+        for layout in layouts() {
+            let documents = [
+                ("a spawn record", document(&[], vec![spawn(predicted())])),
+                ("an added component", document(&[(0xA1, None)], vec![add(predicted())])),
+                ("a baseline column", document(&[(0xA2, Some(predicted()))], vec![])),
+            ];
+            for (case, (baseline, overlay)) in &documents {
+                let context = format!("{kind:?} {layout:?} {case}");
+                let mut world = two_regions(kind, layout, RegionMode::Simulated);
+                world.spawn(predicted(), REGION, (pos(0, 0),)).unwrap();
+                let marks = [world.mark()];
+                let before = state(&world, &marks);
+                let error = world.load_region(OTHER_REGION, baseline, Some(overlay)).unwrap_err();
+                assert_eq!(error.kind(), ErrorKind::InvalidData, "{context}: {error}");
+                assert!(error.message().contains("not a `NetId`"), "{context}: {error}");
+                assert_eq!(state(&world, &marks), before, "{context}");
+                assert_eq!(world.entities_in(OTHER_REGION).count(), 0, "{context}");
+            }
+        }
+    }
+    // By `NetId`: a live bound owner is stored as its origin and owns the row; a despawned
+    // one, inside a server's window, under its `Net` key, which the export writes.
+    for layout in layouts() {
+        let context = format!("{layout:?}");
+        let (baseline, overlay) = document(&[], vec![spawn(bound())]);
+        let row = net(7);
+        let mut world = two_regions(WorldKind::Server, layout, RegionMode::Simulated);
+        world.spawn(predicted(), REGION, (pos(0, 0),)).unwrap();
+        world.bind(prediction(), net_50()).unwrap();
+        world.load_region(OTHER_REGION, &baseline, Some(&overlay)).expect(&context);
+        assert_eq!(owner_of(&world, row), Some(predicted()), "{context}");
+        assert_eq!(world.owned_by(bound()).collect::<Vec<_>>(), [row], "{context}");
+        let mut world = despawned_owner(WorldKind::Server, layout);
+        create(&mut world, THIRD_REGION);
+        world.load_region(THIRD_REGION, &baseline, Some(&overlay)).expect(&context);
+        assert_eq!(owner_of(&world, row), Some(bound()), "{context}");
+        pass_horizon(&mut world);
+        let rows = world.export_region(THIRD_REGION).expect(&context);
+        assert_eq!(rows.rows[0].owner, Some(net_50()), "{context}");
+    }
+}
+
 /// splitmix64.
 struct Rng(u64);
 
@@ -1063,8 +1647,11 @@ impl Rng {
     }
 }
 
-/// One seeded history of direct writes, unloads and reloads over regions A and B, checked
-/// after every step and by a restart at the end; returns the number of breaks it logged.
+/// One seeded history of direct writes, unloads and reloads over regions A and B, with the
+/// server's horizon passed after every step, checked after every step and by a restart at
+/// the end; returns the number of breaks it logged. Its steps include the alone forms, which
+/// a server refuses with nothing changed, and a despawn followed by a write that names the
+/// dead entity inside the window.
 /// `live_only` draws owners among live entities, what a command can name; otherwise among
 /// every key the history has used, what a direct write can name.
 fn history(seed: u64, live_only: bool, layout: LayoutConfig) -> usize {
@@ -1124,7 +1711,7 @@ fn history(seed: u64, live_only: bool, layout: LayoutConfig) -> usize {
         };
         let live_keys = live(&world);
         let regions = loaded(&world);
-        match rng.below(100) {
+        match rng.below(110) {
             0..=14 if !regions.is_empty() => {
                 let region = regions[rng.below(regions.len())];
                 let id = world.allocate_net_id().unwrap();
@@ -1208,8 +1795,46 @@ fn history(seed: u64, live_only: bool, layout: LayoutConfig) -> usize {
                     .load_region(region, &baselines[&region], Some(&overlay))
                     .unwrap_or_else(|error| panic!("{error}: {}", context(&log)));
             }
+            100..=104 if !live_keys.is_empty() && !regions.is_empty() => {
+                // What a client's hook applies, which a server refuses whole.
+                let k = live_keys[rng.below(live_keys.len())];
+                let region = regions[rng.below(regions.len())];
+                log.push(format!("despawn {k:?} alone, move it alone to {region:?}: refused"));
+                let marks = [world.mark()];
+                let before = world_state(&world, &marks, &pool, &[PLAYER]);
+                let refused = [world.despawn_alone(k), world.move_alone_to_region(k, region)];
+                for error in refused.into_iter().map(|result| result.expect_err(&context(&log))) {
+                    assert_eq!(error.kind(), ErrorKind::Unsupported, "{}", context(&log));
+                }
+                let after = world_state(&world, &marks, &pool, &[PLAYER]);
+                assert_eq!(after, before, "{}", context(&log));
+            }
+            105..=109 if live_keys.len() > 1 => {
+                // A despawn, then a write that names the dead entity, by either of its keys,
+                // before the horizon passes.
+                let k = live_keys[rng.below(live_keys.len())];
+                let named = match k {
+                    StableKey::Predicted(prediction) if rng.chance(50) => {
+                        key(world.alias(prediction).expect("every predicted spawn is bound"))
+                    }
+                    _ => k,
+                };
+                world.despawn(k).unwrap();
+                let live_keys = live(&world);
+                if live_keys.is_empty() {
+                    log.push(format!("despawn {k:?}"));
+                } else {
+                    let j = live_keys[rng.below(live_keys.len())];
+                    log.push(format!("despawn {k:?}, then set {j:?} owned by {named:?}"));
+                    world
+                        .insert(j, owned_by(named))
+                        .unwrap_or_else(|error| panic!("{error}: {}", context(&log)));
+                }
+            }
             _ => continue,
         }
+        // The server's horizon: what a despawn left behind is pruned before the next step.
+        pass_horizon(&mut world);
         let context = context(&log);
         assert_forest(&world, &context);
         for region in loaded(&world) {

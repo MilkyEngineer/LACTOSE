@@ -23,18 +23,12 @@ disagree, the architecture wins and this file is wrong. Decision D121 records th
 those sections left open, for this crate and for `lactose-net-host` together, and what the
 first design review changed.
 
-**The additions of D141 are a facade** until the lane `stream-impl` implements them:
-`StagedFrame::transient`, `StagingFrame::transient`, the hook's use of
-`World::despawn_alone` and `World::move_alone_to_region`, and its skipping of a spawn's
-unreplicated component. The fields exist and nothing fills or reads them yet; the hook
-sketches under `tests/` still call `World::despawn` and `World::move_to_region`. Each
-sentence below that is not yet true is marked "(D141; facade)", and "Proof for D141" names
-the tests that will hold them.
 `crates/sim/README.md` is the contract the hook and the pass here meet ("The input sync
 point": `StagedState`; "Runs": `run_passes` and `Pass::Gather`; "Regions": `RegionExport`
 and the relevance overlay) and `crates/ecs/README.md` the storage contract they write
-against (`ErasedColumn::changed_since`, `World::move_to_region`, `World::spawn`, `bind`,
-`insert`, `get_mut`, `remove`, `despawn`); neither is restated here.
+against (`ErasedColumn::changed_since`, `World::move_to_region`,
+`World::move_alone_to_region`, `World::spawn`, `bind`, `insert`, `get_mut`, `remove`,
+`despawn`, `despawn_alone`); neither is restated here.
 
 Amending a signature is allowed in the change that needs it. Say so in the change
 description and list what changed, because `app`, `lactose-net`, `lactose-net-host`,
@@ -176,7 +170,7 @@ which `build`'s `derived` check does not see.
   holds every relevant entity as a proxy; a claimed entity's spawn, rows, move, removal and
   tombstone are reconciliation facts it never writes directly (D122). `transient` is read
   by the prediction world's hook and corrections alone, for the entities the local player
-  has claimed ("Transient presence" below; D141; facade).
+  has claimed ("Transient presence" below; D141).
   `TimeScale` is a replicated world resource, and resources are not gathered: the
   server's `app` puts its own value in the frame.
 - What the replicated world's hook does, in this order and nothing else, for each frame
@@ -188,21 +182,21 @@ which `build`'s `derived` check does not see.
   then `World::bind(origin, net)` if `origin` is `Some`, then `World::insert(key,
   RemoteSlot { slot })` if `slot` is `Some`; then each move in ascending key order,
   `World::move_alone_to_region(key, region)` unless `World::region_of(key)` is already
-  `region` or the key is not live (D141; facade); then each removal in
+  `region` or the key is not live (D141); then each removal in
   ascending (key, component) order, `World::remove_erased` of that component, nothing if
   the entity or the component is absent; then each row in ascending (key, component)
   order, written as an upsert writes a component (so a row for a pair
   removed in the same frame re-adds the component with the newer value), nothing if the
   entity does not exist (its spawn was lost and the server resends it, since nothing of
   it is acknowledged); then each tombstone in ascending key order, `World::despawn_alone`
-  if the entity exists (D141; facade), nothing otherwise, since a region that became
+  if the entity exists (D141), nothing otherwise, since a region that became
   irrelevant took its rows with it, and nothing for a `TombstoneCause::Left` tombstone of an
   entity that `World::region_of` places in the tombstone's region. The hook despawns nothing
   else: it applies each move and each tombstone to the one entity named, never to what
   that entity owns ("One entity per entry" below). It writes replicated components alone:
   a component of a spawn, or a row, that the registry lacks or holds as unreplicated is a
-  defect of the sender, logged and skipped with the rest of the spawn applied (D141;
-  facade), and it does not read `transient`. An entry that fails (a spawn into a region
+  defect of the sender, logged and skipped with the rest of the spawn applied (D141),
+  and it does not read `transient`. An entry that fails (a spawn into a region
   the world has not loaded, a move or a decode the world refuses) is logged and skipped,
   never returned as the hook's error: the frame is already popped, and the rest of it
   applies. A frame never names a key both in `spawns` and in `despawns`, never names a
@@ -212,7 +206,7 @@ which `build`'s `derived` check does not see.
   the client holds; a change of claim is sent as a spawn of the live entity with `slot`
   set (the player released it) or `None` (the player claimed it). In every case the row is
   live and the spawn carries the whole entity, so the hook writes it whole.
-- One entity per entry (D141; facade). `OwnedBy` is persistent and not replicated, so a
+- One entity per entry (D141). `OwnedBy` is persistent and not replicated, so a
   client holds ownership edges only as each region's relevance document stated them, and
   what the server gives or releases afterwards does not reach it before the region's next
   document. `World::despawn` and `World::move_to_region` take the entities the target
@@ -239,7 +233,7 @@ which `build`'s `derived` check does not see.
   `OwnedBy` replicated: a change to this contract, which must first settle how a client
   applies a row that closes a cycle against an edge it has not yet seen removed
   (`docs/verification.md`).
-- Transient presence (D141; facade). A row the stream builds holds the replicated
+- Transient presence (D141). A row the stream builds holds the replicated
   components the frames carry. A region document also restores the presence of every
   transient component (D129), and a kernel runs on a row only if the row has every
   component it names; so a claimed entity that the stream built, and no document placed,
@@ -389,7 +383,7 @@ which `build`'s `derived` check does not see.
   order. Then `World::mark()` and `StructuralLog::cursor()` are taken for the next gather.
   Replicated resources are not gathered (`TimeScale` travels in the frame's own field,
   region resources in the relevance message).
-- Transient presence (D141; facade). The gather also fills `StagingFrame::transient`, for
+- Transient presence (D141). The gather also fills `StagingFrame::transient`, for
   the packer's mirror: which components that are transient and not replicated each entity
   has, by origin key; presence and never a value, since the gather copies rows of
   replicated columns alone and such a column is zero at every input sync point. A full
@@ -538,11 +532,10 @@ that every path of the hook ran, and records both worlds' hashes.
 
 ## Proof for D141
 
-A facade: none of these tests exists yet. Each row is a test the lane `stream-impl` adds,
-by the name given, and the sentence it holds; the first two are the whole-project review's
+Each row is a test and the sentence it holds; the first two are the whole-project review's
 S3 probe as a test of this crate's hook sketch (`tests/common/mod.rs`, `ClientHook`), which
-the lane moves to `World::despawn_alone` and `World::move_alone_to_region` with the
-sketches of `tests/consumers.rs`.
+applies moves and tombstones through `World::move_alone_to_region` and
+`World::despawn_alone`, as the sketches of `tests/consumers.rs` do.
 
 | Test | What it holds | File |
 |---|---|---|

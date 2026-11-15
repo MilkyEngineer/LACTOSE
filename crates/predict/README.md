@@ -25,13 +25,6 @@ presentation-event keys), `crates/sim/README.md` (the step, the hook, the frame,
 staged frame, the inbox, who reads what) are the contracts this crate builds on and never
 restates.
 
-**The additions of D141 are a facade** until the lane `stream-impl` implements them: the
-hook and the corrections apply a tombstone or a move to the one entity it names
-(`World::despawn_alone`, `World::move_alone_to_region`), give a claimed entity the
-transient components its frame states, and write no unreplicated component from a spawn.
-No signature of this crate changes. Each sentence below that is not yet true is marked
-"(D141; facade)", and "Proof for D141" names the tests that will hold them.
-
 Amending a signature is allowed in the change that needs it. Say so in the change
 description and list what changed, because the client's `app`, `lactose-net`,
 presentation and the milestone 1 netcode spike are written against this surface.
@@ -211,7 +204,7 @@ step and rebuilds the world there ("Reconciliation" below).
   differ at every frame and roll the world back for nothing. An exact row of a transient
   component is skipped without a log, as a value; what it states is that the component is
   present, and presence is what a correction writes ("What a row built from the stream
-  has"; D141; facade). The record is read through
+  has"; D141). The record is read through
   `World::get_erased` per claimed entity and recorded type, so it costs the claimed
   entities, never a scan of the world's chunks.
 - The ring keeps the newest `depth` slots and drops the oldest when a newer one is taken;
@@ -273,7 +266,7 @@ sync point"; `crates/net-api/README.md`, "The staged frame")
      where `slot` is `None` and removed where it is `Some`, and `StreamingAnchor` inserted
      beside the claim on `LocalPlayer::entity`; where `slot` is `None`, the entity's
      transient components brought to what the frame states of it, a spawned row born with
-     them ("What a row built from the stream has"; D141; facade); never `RemoteSlot`;
+     them ("What a row built from the stream has"; D141); never `RemoteSlot`;
      where `slot` is
      `Some`, `StagedRegion` among the spawn's components (the spawn's region) or, for a
      live key, set to where the upsert left the entity; then moves (an unclaimed entity's
@@ -292,8 +285,7 @@ sync point"; `crates/net-api/README.md`, "The staged frame")
      `Some` and the key is not live: `World::spawn` under the key with every component
      and its `StagedRegion`, the spawn's region, among them (so the row is born in its
      final archetype; a frame naming the component itself, which no server does, has it
-     rewritten after the spawn, and from D141 skipped as any unreplicated component of a
-     spawn is; facade), a proxy, without `RemoteSlot` or `ClaimedBy`. If `slot`
+     skipped as any unreplicated component of a spawn is: D141), a proxy, without `RemoteSlot` or `ClaimedBy`. If `slot`
      is `Some` and the key is live
      and not claimed: an upsert, each component written whole so an equal value does not
      dirty the row, except `Transform`, `Velocity` and `Teleported`, which are written as
@@ -304,14 +296,14 @@ sync point"; `crates/net-api/README.md`, "The staged frame")
      claimed): a fact for the reconciliation, and the claim applied as a full frame
      applies it: `ClaimedBy { local }` inserted on the live key and, where that claims an
      entity that was not claimed, its transient components brought to what the frame
-     states of it (D141; facade), its other components left to
+     states of it (D141), its other components left to
      the correction (not if the claim names a region the world lacks: if slot *T* lacks
      it too, the comparison skips the claim and the entity stays a proxy; if *T* holds it,
      the correction at *T* writes the claim and the move, and the entity leaves with the
      region when it unloads), or, if the key is not live, `World::spawn` under it
      with the components a correction writes and the claim (neither writes `Teleported`
      to a claimed entity, and a transient component reaches one as presence, zeroed,
-     never as a value: "What a row built from the stream has"; D141; facade). If `slot`
+     never as a value: "What a row built from the stream has"; D141). If `slot`
      is `Some` and the key is live and
      claimed (the server released it): a fact, and `ClaimedBy` removed and the components
      upserted as for an unclaimed entity, its `StagedRegion` set to where the upsert left
@@ -324,7 +316,7 @@ sync point"; `crates/net-api/README.md`, "The staged frame")
      must not undo. So no rollback of a later call may restore a slot before a claim
      change that a frame an earlier call reconciled made: none does while the server keeps
      net-api's reporting rule ("Substitution" under "Reconciliation", a repeated report).
-  3. Each move in ascending key order: `World::move_alone_to_region` (D141; facade) for a
+  3. Each move in ascending key order: `World::move_alone_to_region` (D141) for a
      live unclaimed entity
      not already there, and its `StagedRegion` set to where the move left it: the move's
      region, or the region it stayed in when the world lacks the move's (the step's fold
@@ -354,7 +346,7 @@ sync point"; `crates/net-api/README.md`, "The staged frame")
      exact row of a live unclaimed one, is a defect of the sender, logged in the predicted
      tick and skipped.
   6. Each tombstone in ascending key order: `World::despawn_alone` of a live unclaimed
-     entity (D141; facade), unless the tombstone is `TombstoneCause::Left` and the entity
+     entity (D141), unless the tombstone is `TombstoneCause::Left` and the entity
      resides in the region it names and resided there after the frames last placed it
      (its `StagedRegion`; where it resides, for an entity no frame has placed), where the
      server has it, which settles it: that
@@ -372,7 +364,7 @@ sync point"; `crates/net-api/README.md`, "The staged frame")
   rows of a proxy whose spawn was lost among them.
   7. `acked_input`, if `Some`: every live entity whose origin key is
      `Predicted { player: local, .. }` with an input tick before the acknowledgement and no
-     alias is despawned now, alone (`World::despawn_alone`; D141; facade): what it owns
+     alias is despawned now, alone (`World::despawn_alone`; D141): what it owns
      that is itself such a spawn goes by this rule at its own input tick, and what it owns
      that the server has, a proxy or a claimed entity that a predicted command gave it, is
      not the client's to destroy (architecture section 7: a predicted spawn
@@ -388,7 +380,7 @@ sync point"; `crates/net-api/README.md`, "The staged frame")
   path made the row live (a rebuild, a bundle, a correction, a `set_local`),
   `lactose_input::player_entity` resolves from the next tick on, and the input applier
   writes the sample at the same sync point, before this hook runs.
-- Every move and every despawn the hook makes is of the one entity named (D141; facade):
+- Every move and every despawn the hook makes is of the one entity named (D141):
   `World::move_alone_to_region` for a frame's move, an upsert's and a release's,
   `World::despawn_alone` for a tombstone and an unechoed spawn, in a full frame and a delta
   frame, in a predicted tick and a replay. The prediction world holds `OwnedBy` edges as
@@ -399,7 +391,7 @@ sync point"; `crates/net-api/README.md`, "The staged frame")
   `World::move_to_region` took a released item with its former owner, in this world
   alone, and no later row brought it back, since a row of an entity that is not live is
   skipped.
-- The hook writes replicated components alone (D141; facade): a spawn's component, or a
+- The hook writes replicated components alone (D141): a spawn's component, or a
   row, that the registry lacks or holds as unreplicated is a defect of the sender, logged
   and skipped with the rest of the spawn applied, in a full frame as in a delta frame. A
   transient component reaches a claimed entity as presence and a derived one through the
@@ -485,8 +477,7 @@ addendum, review r2 of `lactose-net-host`, N1, prediction world)
   load, an archetype change per loaded row once per load, which is not worth paying for a
   case that needs the same unshipped system and that race.
 
-**What a row built from the stream has** (architecture sections 9.4 and 15.1; D129; D141;
-facade)
+**What a row built from the stream has** (architecture sections 9.4 and 15.1; D129; D141)
 
 - A region document gives a row every persistent component and the presence of every
   transient one (D129). The stream gives a row its replicated components and, when the
@@ -617,7 +608,7 @@ facade)
   carries a row of it, below); a move (this region); a removal (this component is
   absent); a tombstone (the entity is gone). A claimed spawn and a frame's exact rows also
   state the entity's transient components, which a correction writes with the fact and
-  the comparison never reads ("What a row built from the stream has"; D141; facade). A
+  the comparison never reads ("What a row built from the stream has"; D141). A
   fact is compared at slot *T*, a band
   frame's at the restart slot *r* (rule 2), with one exception, the kept facts. A fact
   that places its entity in a region that slot lacks and slot *a* holds (a claimed
@@ -824,10 +815,10 @@ facade)
      `World::spawn_erased` with every component and `ClaimedBy` (`StreamingAnchor` too
      for the local player's entity); a tombstoned one despawned and a moved one moved,
      each alone (`World::despawn_alone`, `World::move_alone_to_region`: the server states
-     every entity of an owned tree by a fact or a proxy entry of its own; D141; facade);
+     every entity of an owned tree by a fact or a proxy entry of its own; D141);
      an entity a claimed spawn or a frame's exact rows state left with the transient
      components stated, zeroed where one is added ("What a row built from the stream
-     has"; D141; facade); a
+     has"; D141); a
      claim inserted, or removed with the entity moved where the releasing spawn has it,
      its components written and its `StagedRegion` set to where that left it (what the
      hook's release did in the predicted tick; the move holds the entity where the server
@@ -1090,7 +1081,7 @@ Each row is held by the tests named; the comparison's golden cases are unit test
 | The comparison (`src/compare.rs`, `tests/corrections.rs`, `tests/claims.rs`, `tests/physics.rs`) | Golden cases over a component with a nested struct of scalars, a scalar, an array of scalars, an integer, a `bool` and padding: equal bytes match; each field kind differing is one field, wherever inside it; a scalar leaf's NaN with another payload matches, negative zero does not; padding is not compared; a wrong row length is skipped; `Teleported` is never compared. Over a world: a missing component, entity, region or claim is a mismatch with no field; a fact is compared at slot `T`, and one whose region neither slot `T` nor the slot of the tick it was popped at holds is skipped, whether or not it follows kept facts, a present entity left in its region and a claimed spawn's components still corrected for an entity the slot records; a recorded component a frame's exact rows or a claimed spawn do not name is a mismatch, removed by one correction, and a frame with no row of the entity removes nothing; a transient replicated component's exact row is neither compared nor written, and the hook writes a proxy's; a dynamic body's `Transform` within tolerance agrees and the frame makes no correction, one past it is a mismatch, a kinematic body's agrees by bytes only, a body dynamic at *T* - 1 and kinematic at *T* takes the tolerance, one with no slot *T* - 1 is judged at *T*, a NaN leaf agrees with an equal NaN only, `Teleported` differing is not a mismatch and is not written at a correction, a rollback writes the absorbed facts too (the physics test backend records the pushes), and `absorbed` holds the largest absorbed difference per kind |
 | Corrections (`tests/corrections.rs`, `tests/physics.rs`) | A claimed entity whose frame differs is corrected at its tick, stamped, and the re-simulated ticks hash equal to a run that had the server's rows from that tick on, under three layouts; a `Changed`-driven derived cache follows the correction; the backend received pushes for the written key alone (the physics test backend records calls); a corrected `Transform` and the server's unchanged `Teleported` make no second correction; a despawned-too-early entity is re-spawned in its last known region; two frames with facts at two ticks correct once at the older and once at the newer with the right depths; facts are written in frame order under every layout; a rollback that fails part way counts the corrections it made |
 | Substitution (`tests/substitution.rs`, `tests/physics.rs`) | A substituted tick replaces the sample and re-simulates from the tick before; the repair of the first unsubstituted tick after it is found by tick in a later call; both counted; a substitution at or before the restart is skipped, as is one in a frame popped before the call's newest full frame, each with the repair that depended on it, and one before the horizon is `TooOld`; two consecutive substitutions continue the replaced sample; the re-simulated world equals a run that had the substitute from the start; a report repeated in three frames of one call and again in the next is one substitution, one rollback and one repair, and a repeat whose previous tick left the ring is skipped, not `TooOld`; a claim and a release reconciled in a call before a repeat of a substitution reported first at or before their frame survive it, the released entity following the server's proxy rows (q1, q2 and q4 of review r2 of the proxy region, each under net-api's rule); a repeat after its own slot left the ring, or after a full frame whose restart left it, is skipped, for ten seconds of ticks after its tick and, at a depth above that, while the ring holds its slot, and one later, with its slot gone, is `TooOld` (s3, s4 and s8 of review r1 of the repeated report); a repaired tick first reported after a frame of region changes alone is a first report, across calls and in one call (s1, s2); a substitution of *t* − 1 first reported after *t*'s substitutes *t* again and arms the repair after it again, and the world equals a run of the server's inputs (s6); a substitution at or before a resync's restart, a repeat of one acted on before it included, is skipped, after the restart's slot left the ring too; a substitution whose substitute equals the sample, and a repair equal to its own sample in a later call, re-simulate nothing (`Reconciled::resimulated` and the change in `PredictionStats::ticks_resimulated` both zero) and change no hash, the substitution counted and its repeat skipped; such a substitution substituted again once the tick before it changes (outside net-api's rule) is acted on, and the world equals a run of the server's inputs; an equal repair whose previous slot has left the ring is `TooOld` with nothing changed (s3 of review r1 of the repeated report); an equal substitution at the tick after a fact the tolerance absorbed leaves that fact absorbed, nothing pushed to the backend; the applier writes the same world for a run of samples marked substituted as for the same run unmarked |
-| The hook (`tests/hook.rs`, `tests/claims.rs`, `tests/physics.rs`, `tests/regions.rs`, `tests/logs.rs`, `tests/check.rs`) | Frames applied in the stated order: proxies spawned, moved, upserted, removed, tombstoned, a `Left` tombstone of a proxy residing in the region it names and placed there by the frames skipped and one naming another region applied, a proxy kept so despawned by the entity's later tombstone, `Left` or `Destroyed`, and replayed by a re-simulation; a proxy a prediction system kicked into another region (a `[server, prediction]` kernel's `Commands::move_to_region` on an input edge) despawned by a `Left` tombstone naming that region while one the frames placed there is kept, the same after a rollback through the kick and the tombstone, hash for hash with the straight run; a proxy no frame placed settled by where it resides; a frame's move the world refused leaving a cooked row placed where it stayed, so a `Left` naming that region keeps it with its unreplicated `Diary` through the re-entry spawn while one naming the refused region despawns it; `StagedRegion` following the join frame's spawn, a move, an upsert and a release, the release's placement and move surviving the correction a rollback makes of it, and absent from a claimed entity; the release's correction holding the released entity where the server released it through the re-simulated ticks, an unload of that region replayed between the release's tick and the tick the frame was popped at taking the entity, hash for hash with a run that had the release before the unload; a prediction world built without `register_types` refused by `Predictor::new` with `NotFound` naming the function; a proxy's `Transform` written for the tick and swept by the sync; a full frame rebuilds, resets the ring, inserts the claim and the anchor, and the first frame at or after the rebuild tick corrects once; a claimed entity's rows are not written by the hook; a defect row is skipped; an unechoed predicted spawn is despawned at the frame after its input tick and not at that tick's frame, and a late echo spawns it at once and is corrected at its tick; a claimed spawn it applies to a key that is not live carries neither `Teleported` nor a transient component; a claim of a live proxy into a region the world lacks is not applied, before or after a rollback, while one into a loaded region survives it; an entry the world refuses warns once, not again when rollbacks replay its tick (`tests/logs.rs`); a claim followed in the same reconciliation window by a tombstone, a move or a row, and a release followed by a move or a removal, end as they do across two windows, hash for hash, and an entity released so follows the server's proxy rows; the local entity carries its claim and anchor and `set_local` moves them; `player_entity` resolves; a hook replaced through `simulation_mut` fails the next step with the predictor kept |
+| The hook (`tests/hook.rs`, `tests/claims.rs`, `tests/physics.rs`, `tests/regions.rs`, `tests/logs.rs`, `tests/check.rs`) | Frames applied in the stated order: proxies spawned, moved, upserted, removed, tombstoned, a `Left` tombstone of a proxy residing in the region it names and placed there by the frames skipped and one naming another region applied, a proxy kept so despawned by the entity's later tombstone, `Left` or `Destroyed`, and replayed by a re-simulation; a proxy a prediction system kicked into another region (a `[server, prediction]` kernel's `Commands::move_to_region` on an input edge) despawned by a `Left` tombstone naming that region while one the frames placed there is kept, the same after a rollback through the kick and the tombstone, hash for hash with the straight run; a proxy no frame placed settled by where it resides; a frame's move the world refused leaving a cooked row placed where it stayed, so a `Left` naming that region keeps it with its unreplicated `Diary` through the re-entry spawn while one naming the refused region despawns it; `StagedRegion` following the join frame's spawn, a move, an upsert and a release, the release's placement and move surviving the correction a rollback makes of it, and absent from a claimed entity; the release's correction holding the released entity where the server released it through the re-simulated ticks, an unload of that region replayed between the release's tick and the tick the frame was popped at taking the entity, hash for hash with a run that had the release before the unload; a prediction world built without `register_types` refused by `Predictor::new` with `NotFound` naming the function; a proxy's `Transform` written for the tick and swept by the sync; a full frame rebuilds, resets the ring, inserts the claim and the anchor, and the first frame at or after the rebuild tick corrects once; a claimed entity's rows are not written by the hook; a defect row is skipped; an unechoed predicted spawn is despawned at the frame after its input tick and not at that tick's frame, and a late echo spawns it at once and is corrected at its tick; a claimed spawn it applies to a key that is not live carries neither `Teleported` nor a transient component's value, its replicated transient component present and zeroed; a claim of a live proxy into a region the world lacks is not applied, before or after a rollback, while one into a loaded region survives it; an entry the world refuses, a spawn's component that is not a replicated one and a statement's key that is not a transient unreplicated component each warn once, not again when rollbacks replay its tick, which log a skipped component at debug (`tests/logs.rs`); a claim followed in the same reconciliation window by a tombstone, a move or a row, and a release followed by a move or a removal, end as they do across two windows, hash for hash, and an entity released so follows the server's proxy rows; the local entity carries its claim and anchor and `set_local` moves them; `player_entity` resolves; a hook replaced through `simulation_mut` fails the next step with the predictor kept |
 | Resync (`tests/resync.rs`) | A frame left in the inbox after the steps with a tick after the present is `Behind`, one at or before it is not; `resync` empties the ring, sets the tick, the horizon and `rebuilt_at`, reinstalls the hook over one inserted through `simulation_mut`, keeps the known regions, the queued frames are band frames rather than `TooOld`, and the next full frame rebuilds; a re-join resets the inbox beside it; a full frame replaces the known regions, so an entity whose tombstone was lost is not brought back; a claimed entity's tombstone, claim, release or spawn in the band before the restart is applied by one correction at the restart, a tombstone after the band at its own tick, and a band row alone makes no correction while the first frame at or after the restart corrects once |
 | Kept facts (`tests/regions.rs`) | A region the step that pops the frame loads, which slot `T` lacks: a claimed spawn into it is live and agrees, and survives a rollback through the popped tick in the same call and in a later one, with no correction after; a claimed entity moved into it is moved there, and again by a rollback; a swap in one frame destroys the old entity and keeps the new; a later frame for a tick before the load follows the spawn, folded in: its rows correct once at the popped tick and survive a rollback, a removal, a move, a release and a tombstone end as the server has them, and none of them repeats a correction in later calls; a later move for a tick before the load into a region the kept slot lacks and its own popped tick loads is kept at that tick, so a rollback through both writes the spawn at the first and the move at the second, and two such moves of a claimed entity end in the second region, while the same move for a tick after the kept one is compared at its own slot; a band frame's spawn into such a region is kept at the tick it was popped at; what the tolerance absorbed of a kept fact is counted once however often it is compared, and a move folded into it later does not count it again; a move or claimed spawn naming a region neither slot holds is folded in without its region, so a rollback through the kept slot keeps the entity where it was, with the claim's components, and a claim after a kept tombstone does not undo it; a spawn kept at one tick and its move kept at a later one, followed by a tombstone, rows or a release for a tick before both, end as the server has them after a rollback through both |
 | Presentation (`tests/presentation.rs`) | A rollback over a tick that emitted an event: the re-emission is not delivered again, an event not re-emitted is cancelled, both in the batch `app` takes after `reconcile`; extract's pass after a rollback is full |
@@ -1100,13 +1091,11 @@ Each row is held by the tests named; the comparison's golden cases are unit test
 
 ## Proof for D141
 
-A facade: none of these tests exists yet. Each row is a test the lane `stream-impl` adds,
-by the name given, and the sentence it holds. The first and the fifth are the two proofs
-the milestone 1 plan names for that lane, the whole-project review's probes S3 and S4 as
-tests; `a_derived_component_is_added_by_its_system` is the second half of the S4 probe.
-The lane also takes `Trail` out of the test game's join frame (`tests/common/mod.rs`),
-which hid the gap by sending a derived component as a value, and changes the row of "The
-hook" above that says a claimed spawn carries no transient component.
+Each row is a test, by the name given, and the sentence of D141 it holds. The first and
+the fifth are the two proofs the milestone 1 plan names, the whole-project review's probes
+S3 and S4 as tests; `a_derived_component_is_added_by_its_system` is the second half of the
+S4 probe. The test game's join frame (`tests/common/mod.rs`) carries no `Trail`: one that
+did hid the gap by sending a derived component as a value.
 
 | Test | What it holds | File |
 |---|---|---|
@@ -1118,7 +1107,7 @@ hook" above that says a claimed spawn carries no transient component.
 | `a_late_echo_carries_its_transient_components` | An unechoed predicted spawn despawned at the acknowledgement, then its echo with a statement: spawned at once with the stated components, zeroed, and again by the correction at the echo's tick | `tests/hook.rs` |
 | `a_respawn_from_exact_rows_carries_its_transient_components` | A claimed entity the prediction world despawned too early is re-spawned by a frame's exact rows with the frame's statement: the stated components are present, zeroed, and the kernel that names them runs in every re-simulated tick | `tests/corrections.rs` |
 | `a_claim_of_a_live_proxy_brings_its_transient_components` | A proxy the stream spawned, which has none, claimed by a spawn with a statement: it has the stated components after the predicted tick, after the correction at the frame's tick and after a later rollback through it; one a region document gave it that the statement does not name is removed; a claim into a region the world lacks changes nothing | `tests/claims.rs` |
-| `a_statement_is_exact_and_writes_no_value` | The local player's `PlayerInput`, written by the applier before the hook, has the same bytes after a full frame's upsert and after a correction whose statement names it; an unreplicated transient component the statement does not name is removed and one named and absent inserted zeroed, in ascending key order (the structural log's order under every layout); with no statement none is removed; a replicated transient component a frame's exact rows do not name is removed; a key that is not a transient unreplicated component is skipped and logged; a release leaves all of them | `tests/corrections.rs` |
+| `a_statement_is_exact_and_writes_no_value` | The local player's `PlayerInput`, written by the applier before the hook, has the same bytes after a full frame's upsert and after a correction whose statement names it; an unreplicated transient component the statement does not name is removed and one named and absent inserted zeroed, in ascending key order (the structural log's order under every layout); with no statement none is removed; a replicated transient component a frame's exact rows do not name is removed; a key that is not a transient unreplicated component is skipped and logged; a release leaves all of them | `tests/corrections.rs`; the log in `tests/logs.rs`, `a_statement_key_that_is_not_a_transient_unreplicated_component_warns` |
 | `a_difference_in_presence_alone_is_no_correction_point` | A frame whose statement differs from the row only in presence makes no correction and re-simulates nothing, and neither does any later delta frame that differs only so (the limit "What a row built from the stream has" states: a `[server]`-only removal is not followed until a full frame, or a correction something recorded causes); the next frame with a component that differs makes one, after which the entity has the stated components; and in a second run a full frame alone, with nothing recorded differing, leaves the entity with them | `tests/corrections.rs` |
 | `a_kept_claimed_spawn_keeps_its_statement_under_rows_that_carry_none` | Exact rows from a frame with no statement, folded into a kept claimed spawn, replace its components and keep its statement, so a rollback through the kept slot re-spawns the entity with the stated components, hash for hash with the straight run; rows from a frame that holds a statement replace it | `tests/regions.rs` |
 | `a_proxy_gets_no_unreplicated_transient_component` | A statement of an entity the frame does not state claimed changes nothing, in a delta frame and a full frame, and `SlotBytes::world` is what it is without the statement | `tests/hook.rs` |

@@ -167,12 +167,12 @@ impl StagedState for ClientHook {
                     skip("spawn", key, &error);
                 }
             }
-            // Then moves, ascending by key; an owned entity already moved with its owner
-            // is already there.
+            // Then moves, ascending by key, each to the one entity it names: what that
+            // entity owns has an entry of its own.
             for (&key, &region) in &frame.moves {
                 if world.contains(key)
                     && world.region_of(key) != Some(region)
-                    && let Err(error) = world.move_to_region(key, region)
+                    && let Err(error) = world.move_alone_to_region(key, region)
                 {
                     skip("move", key, &error);
                 }
@@ -194,14 +194,15 @@ impl StagedState for ClientHook {
                     skip("row", row.key, &error);
                 }
             }
-            // Tombstones last; an entity already gone with its region is not an error,
-            // and one a load of its region placed there is the region's to settle.
+            // Tombstones last, each to the one entity it names; an entity already gone with
+            // its region is not an error, and one a load of its region placed there is the
+            // region's to settle.
             for (&key, tombstone) in &frame.despawns {
                 let loaded_there = tombstone.cause == TombstoneCause::Left
                     && world.region_of(key) == Some(tombstone.region);
                 if !loaded_there
                     && world.contains(key)
-                    && let Err(error) = world.despawn(key)
+                    && let Err(error) = world.despawn_alone(key)
                 {
                     skip("tombstone", key, &error);
                 }
@@ -260,7 +261,7 @@ impl StagedState for PredictionHook {
             for (&key, &region) in &frame.moves {
                 if world.contains(key)
                     && world.region_of(key) != Some(region)
-                    && let Err(error) = world.move_to_region(key, region)
+                    && let Err(error) = world.move_alone_to_region(key, region)
                 {
                     skip("move", key, &error);
                 }
