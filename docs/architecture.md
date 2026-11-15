@@ -900,15 +900,15 @@ interaction keep it possible later. No system may hold a direct reference across
 Only the client prediction world is ever rolled back. Its `snapshot` captures every column,
 the entity table, world and region resources, region modes, seeds and asset tables, the
 input-tick table, the relationship index, proxy history and the physics world through
-`physics-api::snapshot`, which carries the backend's whole world with each collider's shape value
-and the structural-log entries and changed keys the physics sync has not yet consumed, so that the
-sync of a re-simulated tick makes the calls the first run's did. Two things stay with the world
-across a restore because a rollback
-must not undo them: the prediction-to-network alias table (section 7) and the log of
-delivered presentation events, which is what lets re-emission deduplicate and a missing
-re-emission cancel. Command buffers and channels are empty at snapshot points by construction: the
-closing sync point of a run clears every channel after it applies the last stage's commands, so
-nothing but rows carries simulation state across a tick boundary (D126).
+`physics-api::snapshot`, which carries the backend's whole world as a copy the backend makes, each
+collider with its shape, and the structural-log entries and changed keys the physics sync has not
+yet consumed, so that the sync of a re-simulated tick makes the calls the first run's did. Two
+things stay with the world across a restore because a rollback must not undo them: the
+prediction-to-network alias table (section 7) and the log of delivered presentation events, which
+is what lets re-emission deduplicate and a missing re-emission cancel. Command buffers and
+channels are empty at snapshot points by construction: the closing sync point of a run clears
+every channel after it applies the last stage's commands, so nothing but rows carries simulation
+state across a tick boundary (D126).
 
 The server never rolls back. Save snapshots copy persistent columns only (section 15.3); a
 journal checkpoint carries the physics snapshot and the server's binds beside them (section
@@ -916,13 +916,20 @@ journal checkpoint carries the physics snapshot and the server's binds beside th
 
 `physics-api` conformance: run ten ticks, snapshot at tick three, restore, re-run, hash equal
 at tick ten. The cost is measured in milestone 1 and the prediction world is sized from it.
-A slot's cost is dominated by the backend's serialisation of every body and collider it
-holds, bytes that copy-on-write in `predict` cannot share between slots, so copy-on-write
-snapshots are not built. The bound is on what the world holds instead: at most 64 fixed
-colliders and proxies together as rows, beside the fifty claimed bodies of section 22, which
-keeps a slot's take inside section 22's 100 µs budget with the pinned backend, and its
-restore, about 92 µs at that count, under it. The milestone 1 measurement of a slot, proxies
-included, confirms the count or changes it. It is a content rule, and nothing in the engine
+A slot's cost is the backend's world, every body, collider and contact pair it holds, which
+copy-on-write in `predict` cannot share between slots, so copy-on-write snapshots are not
+built. The slot holds that world as a copy the backend makes of its own state, each
+collider's shape shared with the live world; a backend with nothing cheaper copies its bytes.
+A copied slot costs its take and the drop of the slot the ring evicts for it. The pinned
+backend's bytes do not fit the budget: as bytes, the fifty claimed bodies of section 22 among
+64 fixed colliders and proxies took 140.8 µs to snapshot and 193.0 µs to restore on a quiet
+Apple M1, against section 22's 100 µs, and a third of the write was the claimed bodies'
+contact pairs, which no bound on rows holds down (D143). The backend's bytes remain what
+leaves the process or is compared: the journal checkpoint (section 15.5), the fresh solver's
+bytes (section 16) and the physics hash (section 8.3). The bound on what the world holds
+stands: at most 64 fixed colliders and proxies together as rows, beside the fifty claimed
+bodies. The measurement of the copied slot at that count, taken into a full ring on a quiet
+machine, confirms the count or changes it. It is a content rule, and nothing in the engine
 enforces it. Milestone 3 designs, with streaming, how cooked static scenery reaches the
 prediction world's solver outside the per-tick snapshot, and what replaces the bound.
 
@@ -1345,14 +1352,17 @@ workload. The 100k tick runs on eight frame workers, one for each of eight perfo
 cores: on a hybrid part, physical cores of the fastest class, a core's hardware threads
 counted once; on a part that reports no core types, eight of its physical cores. It excludes
 the physics phase, which is measured on its own scene, and the world hash, which SOUR pays at
-every step and a shipped binary only when it asks. The netcode spike runs in one process,
-over a seeded link that delays and drops packets, jitters them by less than a tick and
-reorders them within one, with a scripted client clock that drifts, wakes late and steps.
-Its x86 server and aarch64 client are SOUR's architecture mode over what both ends record,
-each world's hash at every tick and a hash of every packet sent: records equal on linux-x64,
-windows-x64 and macos-arm64 mean an x86 server and an aarch64 client exchange those bytes
-tick for tick. A difference between platforms is a finding and calls for a run across two
-machines.
+every step and a shipped binary only when it asks. The prediction-world snapshot is the world
+snapshot and the physics snapshot of one ring slot, with the drop of the world snapshot and
+the physics snapshot the ring evicts for it, on the netcode spike's thrown scene among the
+fixed colliders and proxies section 10 admits; the slot's record of the claimed entities and
+its restore are recorded beside it (D143). The netcode spike runs in one process, over a
+seeded link that delays and drops packets, jitters them by less than a tick and reorders them
+within one, with a scripted client clock that drifts, wakes late and steps. Its x86 server
+and aarch64 client are SOUR's architecture mode over what both ends record, each world's hash
+at every tick and a hash of every packet sent: records equal on linux-x64, windows-x64 and
+macos-arm64 mean an x86 server and an aarch64 client exchange those bytes tick for tick. A
+difference between platforms is a finding and calls for a run across two machines.
 
 ### 22.1 Decided later, by milestone
 
@@ -1383,7 +1393,7 @@ statics stay descriptive, in test code as elsewhere (section 3).
 | CURD | `lactose-sim` | Deterministic simulation core. Concurrent Unified Runtime, Deterministic. |
 | WHISK | `lactose-task` | Work-stealing task executor. |
 | CASEIN | `lactose-ecs` | Chunked archetype storage and scheduler. |
-| COW | `lactose-predict` | Copy-on-write snapshots. Not built: a slot's cost is the physics backend's bytes, which copy-on-write cannot share between slots (section 10). |
+| COW | `lactose-predict` | Copy-on-write snapshots. Not built: a slot's cost is the physics backend's world, which copy-on-write cannot share between slots (section 10). |
 | GOUDA | `lactose-render-graph` | Render graph. Graph Of Unified Device Access. |
 | CHEDDAR | `lactose-renderer` | Persistent GPU scene. |
 | BRIE | `lactose-renderer` | Bindless resource heap. |

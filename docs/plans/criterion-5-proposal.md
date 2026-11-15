@@ -1,8 +1,11 @@
 # Milestone 1 after the quiet window: the criteria against their figures, and criterion 5
 
-Status: proposal, not applied. Written at main `1d8042e`, architecture revision 3.3, for the
-owner's decision D143, and revised after each of its two reviews. The anchors of section 6
-are checked at main `3d9fa5d`, the base the coordinator's doc script runs on.
+Status: Decided: answer 1, by the owner on 15 Nov 2026; applied in the commit that sets this
+line, on main at `3d9fa5d` (D143): the decision entry, the architecture amendments, the plan
+amendments and the verification rows of section 6. Not applied: section 6's README sentences,
+which stay here as the `readme-sweep` lane's source, and its alternate entry for answer 2.
+This file is the decision's record. It was written at main `1d8042e`, architecture revision
+3.3, as a proposal, and revised after each of its two reviews.
 
 The quiet window ran `cargo xtask measure --all` on the Apple M1 at the measurement commit
 `bef3455`, and `1d8042e` checked in its 22 files (`docs/results/*-apple-m1-2026-11-15.*`). This

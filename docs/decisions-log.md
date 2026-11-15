@@ -5504,6 +5504,120 @@ relayed by an event when it acts on another body** (§6.1, §10, `lactose-ecs`,
   the run for a `Server` world; D141's "sim never loads between a despawn and the next horizon"
   as a description of the code before this entry.
 
+**D143. The prediction slot holds the backend's world as a copy, not as bytes; criterion 5 keeps its 100 µs and is measured again** (§8.3, §10, §15.5, §16, §20, §22, §23, `lactose-physics-api`, `lactose-physics-rapier`, `lactose-predict`, `docs/plans/milestone-1.md`)
+- Why: the quiet window on the Apple M1 at `bef3455` put the prediction-world snapshot at
+  140.8 µs against section 22's 100 µs (`docs/results/prediction-slot-apple-m1-2026-11-15.md`):
+  the world's 5.6 µs and the physics world's 135.2 µs, on the spike's thrown scene, fifty
+  claimed bodies among five fixed colliders and 59 proxies, the 64 D139 admits. The restore was
+  193.0 µs, where section 10 said about 92. D139 sized the bound from fifty bodies that touched
+  nothing. The spike's bodies in flight hold 263 contact pairs, and Rapier's bytes carry a
+  manifold for each. A probe at `1d8042e` (`docs/plans/criterion-5-proposal.md`, section 2)
+  splits the backend's write: the narrow phase 36%, the collider set 27%, three quarters of
+  that the encode, decode and exchange that Rapier's private fields force on the shape swap,
+  the bodies 18%, the broad phase, the islands and the bookkeeping the rest. The spike's own 59
+  proxies add about 35 µs of a snapshot that is 41 µs over, and the probe, under load, put the
+  fifty claimed bodies alone at 106 µs, so no bound that admits the spike's scene brings the
+  bytes inside the budget. The cost is serialising a world that never leaves the process.
+  - *A slot holds the backend's world as a copy the backend makes.* The Rapier backend's copy
+    is a clone of every set and of its bookkeeping, built by destructuring its world with no
+    field left out, so that a field a bump adds fails the build. A collider's shape is shared
+    with the live world, since a shape is immutable once built. A backend with nothing cheaper
+    copies its bytes. Rules out a slot that pays for an encoding nobody reads, and a patch to
+    the vendored crate.
+  - *A copied slot costs its take and the drop of the slot it evicts.* A ring at its depth
+    drops one slot for each it takes, and a re-simulated tick drops the slot it replaces; a
+    copy is some 789 allocations where the bytes were one. The probes ran under load and their
+    figures are estimates: on the criterion's scene a take of 29.3 to 29.9 µs and a drop of the
+    evicted copy of 26.1 to 27.5 µs, where the write took 134 µs, so a copied slot of about
+    65 µs, the drop of its physics copy counted and the world snapshot's not timed; a restore
+    from a copy of 44 µs where the byte restore took 177 µs; about 60 µs off each re-simulated
+    tick; and at a hundred thrown bodies a copied slot over 100 µs. They steer and prove
+    nothing. Dropping the evicted slot elsewhere than on the predicting thread is not decided
+    here: it would be a job.
+  - *The interface, item by item.* New in `lactose-physics-api`: the trait `BackendCopy`, a
+    copy of a backend's world, with one method, `fn encode(&self, out: &mut Vec<u8>)`, which
+    appends the bytes `PhysicsBackend::snapshot` would have written of that world, so that a
+    snapshot reaches the encoder without the backend; it returns nothing and panics on a broken
+    invariant, and panics abort. On `PhysicsBackend`,
+    `fn copy(&self) -> Result<Box<dyn BackendCopy>>` and
+    `fn restore_copy(&mut self, copy: &dyn BackendCopy) -> Result<()>`, with `lactose-core`'s
+    `Result`, the crate's own error type, as the trait's other methods have, and default bodies
+    that go through `snapshot` and `restore`. A backend recognises its own copy by upcasting to
+    `&dyn Any` and `downcast_ref`, never by `type_id()` on the box. Kept in signature and
+    changed in cost: `PhysicsSnapshot::size_in_bytes` and `PhysicsSnapshot::hash`, whose first
+    call encodes the copy once and keeps the length and the hash, not the bytes, and is
+    documented as costing one write. `SlotBytes`, `Ring::slot_bytes` and `Ring::bytes` report
+    the bytes the backend would write, which is no longer what a slot holds, and say so;
+    `Ring::bytes` on a ring of sixty costs sixty writes the first time, about 8 ms on the
+    criterion's scene, and nothing that ships calls it. The doc comments of
+    `PhysicsBackend::snapshot`, of the free `snapshot` and `restore` and of
+    `ConformanceReport::snapshot_bytes` change. No bytes accessor is added: `PhysicsSnapshot`
+    has none, a checkpoint is taken of a live world, and the byte form of a snapshot is the
+    journal tooling lane's (the row "The journal checkpoint's physics snapshot (D124)").
+  - *A copy is validated when it is taken, so those accessors stay infallible.* The backend's
+    copy refuses what its write refuses of the world's data, a collider whose shape it did not
+    build, so a take fails where it fails today and the slot is taken without its physics and
+    counted (D122). No public call can put such a shape in a Rapier world, so two tests hold
+    the refusal: one in the backend, through its crate-private collider set, and
+    `lactose-predict`'s take through a test backend that refuses. What else the write can
+    refuse, postcard's encoder and the collider image's layout against the pinned crate,
+    depends on the build and not on the world: the backend's round-trip test holds it, and a
+    deferred encode that met it is a broken invariant. Rules out a fallible `size_in_bytes` and
+    `hash`, which would move the failure to where nothing can act on it and change
+    `Ring::bytes`, `Ring::slot_bytes` and `ConformanceReport` with them.
+  - *The byte form stays, with its contract.* The bytes `physics-api` keeps from setup and
+    restores into an emptied solver (D124), the journal checkpoint (section 15.5) and the
+    physics hash (section 8.3) are the backend's bytes, as D119 defined them. The bytes of a
+    copy are the backend's bytes at the tick it was taken, and the conformance run holds that
+    after every tick.
+  - *A restore from a copy builds a fresh physics pipeline, collision pipeline and CCD solver*,
+    as a restore from bytes does. Rules out a restore that keeps the live pipeline: its solver
+    keeps caches keyed by the island manager's epoch, which a restored world can repeat, and
+    the first review's probe of one diverged in 6 of 52 restores.
+  - *This amends a frozen interface.* `lactose-physics-api` froze when the Rapier backend
+    passed its conformance run (section 20). The amendment is the list above: one trait with
+    one method, two trait methods with default bodies, two accessors whose first call costs a
+    write, and doc comments, with no signature of an existing item changed. It is made in the
+    change that needs it, and called out here.
+  - *Section 22's 100 µs stands, and the copied slot is measured in a second quiet window*, at
+    the first commit of main that holds the lane:
+    `cargo xtask measure prediction-slot rollback-seven-ticks`, whose two files replace the
+    measurement commit's for criteria 5 and 7. The cost test takes into a full ring first: it
+    holds as many taken slots as the ring is deep, and each part's timer includes the drop of
+    what that part evicts, so the record's drop lands in the record's figure. Rules out today's
+    measurement, which drops each snapshot after its timers and would never see an eviction.
+  - *D139's bound of 64 fixed colliders and proxies stands until that measurement*, which
+    confirms it or changes it. The reading of criterion 5 is the plan's, now in section 22: the
+    world snapshot and the physics snapshot of one slot, with the drop of the world snapshot
+    and the physics snapshot the ring evicts for it, on the spike's thrown scene at the bound,
+    the slot's record and its restore recorded beside it.
+  - *If the copied slot is over 100 µs on the quiet M1, the budget comes back to the owner
+    once.* Rules out a second lane on the slot's cost in milestone 1.
+  - *Not decided here*: the slot's record of the claimed entities, 54.4 µs of every take, which
+    the criterion does not read (a row gates it at milestone 4); what enforces the bound, which
+    stays milestone 3's; CCD across a copy, which the backend never enables and no proof
+    reaches.
+- Driven by: the quiet window's result files (`1d8042e`); the second review of lane `measure`,
+  which found the claimed bodies' contact graph and the shape exchange under the cost; the
+  planner's probe; the proposal's first review, which found the eviction, D140's rule and the
+  extent of the interface, and whose probe took the copy through joints, sleep and a replaced
+  shape; the owner's answer of 15 November 2026, which chose the copy over a restated budget
+  and a smaller claim.
+- Replaced: D139's "about 0.6 µs each to write and about 1.1 µs for a fixed collider to
+  restore" as the whole cost of a slot. D140's "A slot's cost is dominated by the backend's
+  bytes." and its "a slot's cost is the backend's bytes, which copy-on-write cannot share": a
+  slot's cost is the backend's world, as sections 10 and 23 now say. D140's "The bound keeps a
+  slot's take inside section 22's 100 µs budget": the bound is not what holds it. D140's "so a
+  slot over budget changes the bound, not the representation": the spike's own 59 proxies add
+  about 35 µs of a snapshot that is 41 µs over, and a probe under load put its fifty claimed
+  bodies alone at 106 µs, so no bound that admits the spike's scene brings the bytes inside the
+  budget, and an over-budget slot changes its representation. D119's "The bytes are the
+  backend's whole world" as what a slot holds; the bytes and their contract stand for what
+  leaves the process. Section 10's "its restore, about 92 µs at that count". In
+  `docs/plans/milestone-1.md`, decision 5.5's "The cost is Rapier's serialisation of each fixed
+  collider" and "At 64 the take is about 76 µs and the restore about 92 µs", which the plan now
+  marks.
+
 ## 10. Review history
 
 - **Revision 1** (`a29af04`): the design baseline.
