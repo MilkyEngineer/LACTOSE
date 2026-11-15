@@ -44,7 +44,7 @@ packages = [
 tests = [
   "lactose_anim::sour::a_prediction_crowd_with_a_rollback",
   "lactose_anim::sour::a_server_crowd_with_ragdolls",
-  "lactose_app::headless::a_headless_run_under_sour",
+  "lactose_app::headless::a_recorded_headless_run",
   "lactose_app::spike::a_claim_in_contact_is_recorded",
   "lactose_app::spike::a_dynamic_capsule_is_recorded",
   "lactose_app::spike::a_kinematic_character_is_recorded",

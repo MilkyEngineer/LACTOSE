@@ -36,13 +36,13 @@ use lactose_task::ChaosConfig;
 use protocol::{Capacity, Layout, Recorder, RunConfig, Session};
 
 /// What a test builds from its session, and reports back.
-struct Sour {
+struct SessionSetup {
     session: Session,
     executor: Executor,
     layout: LayoutConfig,
 }
 
-impl Sour {
+impl SessionSetup {
     /// Reads the session and builds the executor and layout it asks for.
     fn from_env() -> Result<Self> {
         let session = Session::from_env().map_err(protocol_error)?;
@@ -124,9 +124,9 @@ const ROLLBACK_TICK: u32 = 100;
 const CHARACTERS: u64 = 200;
 const BONES: u8 = 16;
 
-const WALK: AssetRef<Clip> = clip_ref("sour/walk");
-const RUN: AssetRef<Clip> = clip_ref("sour/run");
-const JUMP: AssetRef<Clip> = clip_ref("sour/jump");
+const WALK: AssetRef<Clip> = clip_ref("crowd/walk");
+const RUN: AssetRef<Clip> = clip_ref("crowd/run");
+const JUMP: AssetRef<Clip> = clip_ref("crowd/jump");
 const JUMP_TRIGGER: u8 = 0;
 const RESTART_TRIGGER: u8 = 1;
 const SPEED: u8 = 0;
@@ -175,8 +175,8 @@ fn salt(key: StableKey) -> u64 {
 
 /// The game's parameter writer: a speed that climbs and falls, the two triggers at ticks
 /// of each character's own.
-#[system(name = "test::sour_drive", worlds = [server, prediction], in_set = sets::DRIVE)]
-fn sour_drive(now: Res<CurrentTick>, key: StableKeyOf, params: Mut<AnimParams>) {
+#[system(name = "test::drive_anim", worlds = [server, prediction], in_set = sets::DRIVE)]
+fn drive_anim(now: Res<CurrentTick>, key: StableKeyOf, params: Mut<AnimParams>) {
     let tick = u64::from(now.get().0);
     let salt = salt(*key) % 1_000;
     let mut next = *params;
@@ -191,16 +191,20 @@ fn sour_drive(now: Res<CurrentTick>, key: StableKeyOf, params: Mut<AnimParams>) 
     params.set_if_neq(next);
 }
 
-static MOVEMENT: SystemSet = SystemSet::new("test::sour_movement").after(&[&sets::EVALUATE]);
+static MOVEMENT: SystemSet = SystemSet::new("test::movement").after(&[&sets::EVALUATE]);
 
-#[system(name = "test::sour_move", worlds = [server, prediction], in_set = MOVEMENT)]
-fn sour_move(motion: &RootMotion, root: Mut<Transform>) {
+#[system(name = "test::apply_root_motion", worlds = [server, prediction], in_set = MOVEMENT)]
+fn apply_root_motion(motion: &RootMotion, root: Mut<Transform>) {
     let next = motion.apply(&root);
     root.set_if_neq(next);
 }
 
 fn register_game(registration: &mut Registration) {
-    registration.stage(Stage::Simulation).sets(&[&MOVEMENT]).add(&SOUR_DRIVE).add(&SOUR_MOVE);
+    registration
+        .stage(Stage::Simulation)
+        .sets(&[&MOVEMENT])
+        .add(&DRIVE_ANIM)
+        .add(&APPLY_ROOT_MOTION);
 }
 
 /// The crowd: every character on its own spot; in a server world every twentieth one
@@ -229,9 +233,9 @@ fn scene(kind: WorldKind, layout: LayoutConfig, executor: Executor) -> Fixture {
 }
 
 fn record_scene(test: &str, kind: WorldKind) -> Result<()> {
-    let sour = Sour::from_env()?;
-    let mut fixture = scene(kind, sour.layout, sour.executor.clone());
-    let mut recorder = sour.recorder(test, fixture.simulation())?;
+    let setup = SessionSetup::from_env()?;
+    let mut fixture = scene(kind, setup.layout, setup.executor.clone());
+    let mut recorder = setup.recorder(test, fixture.simulation())?;
     let mut saved = None;
     for _ in 1..=TICKS {
         fixture.step();
@@ -249,7 +253,7 @@ fn record_scene(test: &str, kind: WorldKind) -> Result<()> {
             recorder.record(fixture.tick(), fixture.hash()).map_err(protocol_error)?;
         }
     }
-    sour.finish(test)
+    setup.finish(test)
 }
 
 #[test]

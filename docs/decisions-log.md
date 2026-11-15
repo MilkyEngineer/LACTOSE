@@ -5097,6 +5097,20 @@ relayed by an event when it acts on another body** (§6.1, §10, `lactose-ecs`,
   small: a slot's cost is the backend's bytes, which copy-on-write cannot share, so a slot
   over budget changes the bound, not the representation. D81's asset set is widened, not
   reversed. Section 15.1's `on_load`, a hook that was never built.
+- Addendum (lane c9b-renames, 2026-11-15): *the renames are done.* The glue struct of the SOUR
+  tests of `lactose-anim`, `lactose-input`, `lactose-net-api`, `lactose-net-host`,
+  `lactose-physics-api`, `lactose-physics-rapier` and `lactose-predict`, and of
+  `lactose-persist`'s shared module, is `SessionSetup`, since physics-api's shared test module
+  already names its own type `Harness` in three of those files (`lactose-sim` keeps the
+  `Harness` it had); `lactose-persist`'s `tests/sour` module is `tests/glue`. `lactose-anim`'s
+  systems are `drive_anim` and `apply_root_motion` and their set `test::movement`, and its clips
+  `crowd/walk`, `crowd/run` and `crowd/jump`. `lactose-app`'s `SOUR_GAME`, `sour_frames`,
+  `sour_run` and `a_headless_run_under_sour` are `STEERED_GAME`, `steered_frames`,
+  `recorded_run` and `a_recorded_headless_run`, its session string and `[harness] tests`
+  following. The five functions of `crates/io/tests/sketch.rs` are `store_*`, and
+  `lactose-asset`'s test helper `silo_events` is `store_events`. The clip names moved the two
+  anim scenes' recorded hashes, since their asset ids are in the region's pinned asset table,
+  which the world hash encodes (section 8.3), and nothing else; the label renames moved no hash.
 
 **D141. What a client world gets from the stream: one entity per tombstone and move, and a claimed entity's transient components by key** (§6, §9.3, §9.4, §15.1, `lactose-ecs`, `lactose-net-api`, `lactose-predict`, `lactose-anim`)
 - Why: the whole-project review of milestone 1 found two ways a client's row differs from the

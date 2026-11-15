@@ -40,12 +40,12 @@ use protocol::{Capacity, Layout, Recorder, RunConfig, Session};
 
 /// What a test builds from its session, and reports back. The executor it asks for is
 /// handed out beside it, since the predictor's rig owns the executor it runs on.
-struct Sour {
+struct SessionSetup {
     session: Session,
     layout: LayoutConfig,
 }
 
-impl Sour {
+impl SessionSetup {
     /// Reads the session and builds the executor and layout it asks for.
     fn from_env() -> Result<(Self, Executor)> {
         let session = Session::from_env().map_err(protocol_error)?;
@@ -341,16 +341,16 @@ fn predict(
 #[test]
 fn a_prediction_scene_with_corrections_and_substitutions() {
     let test = "lactose_predict::sour::a_prediction_scene_with_corrections_and_substitutions";
-    let (sour, executor) = Sour::from_env().unwrap();
+    let (setup, executor) = SessionSetup::from_env().unwrap();
     let mut recorder: Option<Recorder> = None;
     let mut record = |rig: &Rig, sequence: u32, hash: u64| -> Result<()> {
         if recorder.is_none() {
-            recorder = Some(sour.recorder(test, rig)?);
+            recorder = Some(setup.recorder(test, rig)?);
         }
         recorder.as_mut().expect("opened").record(sequence, hash).map_err(protocol_error)
     };
-    let executor = predict(executor, sour.layout, &mut record).unwrap();
-    sour.finish(test, &executor).unwrap();
+    let executor = predict(executor, setup.layout, &mut record).unwrap();
+    setup.finish(test, &executor).unwrap();
 }
 
 /// The same scene outside the runner, recording into memory: the records are the same

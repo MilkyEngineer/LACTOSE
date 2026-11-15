@@ -136,7 +136,7 @@ struct PackEntry {
 
 /// The pack is opened once for the session and its index read from a fixed-size trailer;
 /// the handle is cloned into every load.
-async fn silo_open_pack(io: &Io, path: &Path, trailer_len: u64) -> Result<(File, Vec<u8>)> {
+async fn store_open_pack(io: &Io, path: &Path, trailer_len: u64) -> Result<(File, Vec<u8>)> {
     let pack = io.open(path).await?;
     let trailer = pack.read_at(pack.size().saturating_sub(trailer_len), trailer_len).await?;
     Ok((pack, trailer))
@@ -146,7 +146,7 @@ async fn silo_open_pack(io: &Io, path: &Path, trailer_len: u64) -> Result<(File,
 /// in this task's own polls on the background worker that runs it, then the loader over
 /// the decoded bytes on the same worker. The buffer is the store's and is dropped here
 /// once the loader has built the asset.
-async fn silo_load(
+async fn store_load(
     pack: File,
     entry: PackEntry,
     loader: &ErasedLoader,
@@ -165,19 +165,19 @@ async fn silo_load(
 
 /// The store spawns a load as a background task; the task owns its clone of the handle,
 /// so the descriptor stays open for as long as a read on it is in flight.
-fn silo_spawn_read(executor: &Executor, pack: &File, entry: &PackEntry) -> Task<Result<Vec<u8>>> {
+fn store_spawn_read(executor: &Executor, pack: &File, entry: &PackEntry) -> Task<Result<Vec<u8>>> {
     let read: ReadAt = pack.read_at(entry.offset, entry.stored_len);
     executor.spawn(WorkerClass::Background, read)
 }
 
 /// A load no longer wanted drops its task: the read inside is dropped, one not yet
 /// started never runs, one started finishes on the pool and frees its buffer there.
-fn silo_cancel(load: Task<Result<Vec<u8>>>) {
+fn store_cancel(load: Task<Result<Vec<u8>>>) {
     drop(load);
 }
 
 /// A corrupt index entry fails as a value before anything is allocated.
-async fn silo_bad_index(pack: &File) {
+async fn store_bad_index(pack: &File) {
     let error = pack.read_at(0, lactose_io::MAX_READ_BYTES + 1).await.unwrap_err();
     assert_eq!(error.kind(), ErrorKind::ResourceExhausted);
     let error = pack.read_at(pack.size(), 1).await.unwrap_err();

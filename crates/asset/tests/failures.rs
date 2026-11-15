@@ -40,7 +40,7 @@ fn ordered(first: &str, second: &str) -> (AssetId, AssetId) {
 fn warned_dependency(from: usize, asset: AssetId) -> Option<String> {
     let asset = format!("{:#018x}", asset.to_bits());
     let warned: Vec<_> = capture()
-        .silo_events(from, Level::WARN)
+        .store_events(from, Level::WARN)
         .into_iter()
         .filter(|event| event.fields.get("asset") == Some(&asset))
         .collect();

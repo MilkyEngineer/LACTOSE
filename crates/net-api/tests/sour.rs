@@ -42,13 +42,13 @@ use lactose_task::ChaosConfig;
 use protocol::{Capacity, Layout, Recorder, RunConfig, Session};
 
 /// What a test builds from its session, and reports back.
-struct Sour {
+struct SessionSetup {
     session: Session,
     executor: Executor,
     layout: LayoutConfig,
 }
 
-impl Sour {
+impl SessionSetup {
     /// Reads the session and builds the executor and layout it asks for.
     fn from_env() -> Result<Self> {
         let session = Session::from_env().map_err(protocol_error)?;
@@ -363,20 +363,20 @@ fn replicate(
 #[test]
 fn a_scene_replicated_to_a_client() {
     let test = "lactose_net_api::sour::a_scene_replicated_to_a_client";
-    let sour = Sour::from_env().unwrap();
+    let setup = SessionSetup::from_env().unwrap();
     let mut recorder: Option<Recorder> = None;
     let mut record = |server: &Simulation, client: &Simulation, tick: Tick, hash| -> Result<()> {
         if recorder.is_none() {
-            recorder = Some(sour.recorder(test, server)?);
+            recorder = Some(setup.recorder(test, server)?);
             // The client world's hash is in every record too: its own applied line, which
             // the runner holds to the launched configuration like the server's. The client
             // is built once, before the first record.
-            sour.recorder(test, client)?;
+            setup.recorder(test, client)?;
         }
         recorder.as_mut().expect("opened").record(tick.0, hash).map_err(protocol_error)
     };
-    replicate(&sour.executor, sour.layout, &mut record).unwrap();
-    sour.finish(test).unwrap();
+    replicate(&setup.executor, setup.layout, &mut record).unwrap();
+    setup.finish(test).unwrap();
 }
 
 /// The same scene outside the runner, recording into memory: the records are the same

@@ -39,13 +39,13 @@ use lactose_task::ChaosConfig;
 use protocol::{Capacity, Layout, Recorder, RunConfig, Session};
 
 /// What a test builds from its session, and reports back.
-struct Sour {
+struct SessionSetup {
     session: Session,
     executor: Executor,
     layout: LayoutConfig,
 }
 
-impl Sour {
+impl SessionSetup {
     /// Reads the session and builds the executor and layout it asks for.
     fn from_env() -> Result<Self> {
         let session = Session::from_env().map_err(protocol_error)?;
@@ -182,25 +182,25 @@ fn replicate(executor: &Executor, layout: LayoutConfig, record: &mut Record<'_>)
 #[test]
 fn a_replication_and_its_wire_values() {
     let test = "lactose_net_host::sour::a_replication_and_its_wire_values";
-    let sour = Sour::from_env().unwrap();
+    let setup = SessionSetup::from_env().unwrap();
     let mut recorder: Option<Recorder> = None;
     let mut client_reported = false;
     let mut record =
         |server: &Simulation, client: Option<&Simulation>, tick: Tick, hash| -> Result<()> {
             if recorder.is_none() {
-                recorder = Some(sour.recorder(test, server)?);
+                recorder = Some(setup.recorder(test, server)?);
             }
             // The client world's hash joins the records once it is built: its own applied line,
             // which the runner holds to the launched configuration like the server's. The
             // client is built once.
             if let Some(client) = client.filter(|_| !client_reported) {
-                sour.recorder(test, client)?;
+                setup.recorder(test, client)?;
                 client_reported = true;
             }
             recorder.as_mut().expect("opened").record(tick.0, hash).map_err(protocol_error)
         };
-    replicate(&sour.executor, sour.layout, &mut record).unwrap();
-    sour.finish(test).unwrap();
+    replicate(&setup.executor, setup.layout, &mut record).unwrap();
+    setup.finish(test).unwrap();
 }
 
 /// The same replication outside the runner, recording into memory: the records are the

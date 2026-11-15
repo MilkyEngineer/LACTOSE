@@ -31,13 +31,13 @@ use lactose_task::ChaosConfig;
 use protocol::{Capacity, Layout, Recorder, RunConfig, Session};
 
 /// What a test builds from its session, and reports back.
-struct Sour {
+struct SessionSetup {
     session: Session,
     executor: Executor,
     layout: LayoutConfig,
 }
 
-impl Sour {
+impl SessionSetup {
     /// Reads the session and builds the executor and layout it asks for.
     fn from_env() -> Result<Self> {
         let session = Session::from_env().map_err(protocol_error)?;
@@ -119,33 +119,33 @@ const ROLLBACK_TICK: u32 = 30;
 #[test]
 fn the_server_program() -> Result<()> {
     let test = "lactose_input::sour::the_server_program";
-    let sour = Sour::from_env()?;
-    let simulation = build_server(sour.layout);
-    let mut recorder = sour.recorder(test, &simulation)?;
+    let setup = SessionSetup::from_env()?;
+    let simulation = build_server(setup.layout);
+    let mut recorder = setup.recorder(test, &simulation)?;
     let mut record = |tick: Tick, hash: u64| recorder.record(tick.0, hash).map_err(protocol_error);
     let frames = (1..=TICKS).map(|tick| server_frame(Program::FULL, tick));
-    let simulation = run_recorded(&sour.executor, simulation, frames, &mut record)?;
+    let simulation = run_recorded(&setup.executor, simulation, frames, &mut record)?;
     assert_eq!(simulation.tick(), Tick(TICKS));
-    sour.finish(test)
+    setup.finish(test)
 }
 
 #[test]
 fn the_prediction_program_with_a_rollback() -> Result<()> {
     let test = "lactose_input::sour::the_prediction_program_with_a_rollback";
-    let sour = Sour::from_env()?;
-    let simulation = build_prediction(sour.layout);
-    let mut recorder = sour.recorder(test, &simulation)?;
+    let setup = SessionSetup::from_env()?;
+    let simulation = build_prediction(setup.layout);
+    let mut recorder = setup.recorder(test, &simulation)?;
     let mut record = |tick: Tick, hash: u64| recorder.record(tick.0, hash).map_err(protocol_error);
     let frames = (1..=ROLLBACK_TICK).map(prediction_frame);
-    let simulation = run_recorded(&sour.executor, simulation, frames, &mut record)?;
+    let simulation = run_recorded(&setup.executor, simulation, frames, &mut record)?;
     let snapshot = simulation.world().snapshot();
     let frames = (ROLLBACK_TICK + 1..=TICKS).map(prediction_frame);
-    let mut simulation = run_recorded(&sour.executor, simulation, frames, &mut record)?;
+    let mut simulation = run_recorded(&setup.executor, simulation, frames, &mut record)?;
     // A rollback to the snapshot and a re-simulation to the end: every re-simulated tick's
     // hash is recorded again, and the runner requires it equal to the first one's.
     simulation.world_mut().restore(&snapshot)?;
     let frames = (ROLLBACK_TICK + 1..=TICKS).map(prediction_frame);
-    let simulation = run_recorded(&sour.executor, simulation, frames, &mut record)?;
+    let simulation = run_recorded(&setup.executor, simulation, frames, &mut record)?;
     assert_eq!(simulation.tick(), Tick(TICKS));
-    sour.finish(test)
+    setup.finish(test)
 }
