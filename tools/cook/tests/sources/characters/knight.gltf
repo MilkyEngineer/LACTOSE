@@ -1,0 +1,123 @@
+{
+  "asset": { "version": "2.0", "generator": "written by hand for tools/cook/tests" },
+  "scene": 0,
+  "scenes": [{ "nodes": [0] }],
+  "nodes": [
+    {
+      "name": "Armature",
+      "translation": [0, 0, 0.5],
+      "children": [1]
+    },
+    {
+      "name": "hips",
+      "translation": [0, 1, 0],
+      "children": [2, 6],
+      "extras": {
+        "lactose": {
+          "bone": {
+            "role": "hips",
+            "body": {
+              "mass": 8,
+              "linear_damping": 0.5,
+              "locked_axes": ["rotation_x", "rotation_z"],
+              "collider": {
+                "shape": { "capsule": { "half_height": 0.25, "radius": 0.125 } },
+                "membership": 1,
+                "filter": 2
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "spine_twist",
+      "translation": [0, 0.25, 0],
+      "rotation": [0, 1, 0, 0],
+      "children": [3]
+    },
+    {
+      "name": "chest",
+      "translation": [0, 0.125, 0.5],
+      "children": [4, 5],
+      "extras": {
+        "lactose": {
+          "bone": {
+            "role": "spine",
+            "body": {
+              "collider": {
+                "shape": { "sphere": { "radius": 0.25 } },
+                "membership": 1,
+                "filter": 2
+              },
+              "joint": { "kind": "spherical", "anchor_parent": [0, 0.375, -0.5] }
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "head",
+      "matrix": [-1, 0, 0, 0, 0, 1, 0, 0, 0, 0, -1, 0, 0, 0.25, 0, 1],
+      "children": [7],
+      "extras": { "lactose": { "bone": { "role": "head" } } }
+    },
+    {
+      "name": "hand_r",
+      "translation": [0.25, 0, 0],
+      "rotation": [0.5, 0.5, 0.5, 0.5],
+      "children": [8],
+      "extras": {
+        "lactose": {
+          "bone": {
+            "role": "hand_right",
+            "body": {
+              "body_type": "kinematic",
+              "can_sleep": false,
+              "collider": {
+                "shape": { "cuboid": { "half_extents": [0.0625, 0.125, 0.03125] } },
+                "membership": 1,
+                "filter": 4,
+                "offset": [0, 0.0625, 0],
+                "friction": 1,
+                "material": 7
+              },
+              "joint": {
+                "kind": "revolute",
+                "anchor_parent": [0.25, 0, 0],
+                "axis": [1, 0, 0],
+                "limits": [-0.5, 1]
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "body_mesh",
+      "mesh": 0,
+      "skin": 0,
+      "scale": [2, 2, 2]
+    },
+    {
+      "name": "head_end",
+      "translation": [0, 0.125, 0]
+    },
+    {
+      "name": "grip",
+      "translation": [0, -0.125, 0.25],
+      "extras": { "lactose": { "socket": {} } }
+    }
+  ],
+  "skins": [{ "joints": [1, 2, 3, 4, 5, 7], "inverseBindMatrices": 0 }],
+  "meshes": [{ "primitives": [{ "attributes": { "POSITION": 1 } }] }],
+  "accessors": [
+    { "bufferView": 0, "componentType": 5126, "count": 6, "type": "MAT4" },
+    { "bufferView": 1, "componentType": 5126, "count": 3, "type": "VEC3", "min": [0, 0, 0], "max": [1, 1, 1] }
+  ],
+  "bufferViews": [
+    { "buffer": 0, "byteOffset": 0, "byteLength": 384 },
+    { "buffer": 0, "byteOffset": 384, "byteLength": 36 }
+  ],
+  "buffers": [{ "uri": "knight.bin", "byteLength": 420 }]
+}

@@ -458,6 +458,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "lactose-cook"
+version = "0.0.0"
+dependencies = [
+ "lactose-anim",
+ "lactose-asset",
+ "lactose-asset-api",
+ "lactose-core",
+ "lactose-io",
+ "lactose-math",
+ "lactose-physics-api",
+ "lactose-task",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "lactose-core"
 version = "0.0.0"
 dependencies = [
