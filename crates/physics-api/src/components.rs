@@ -3,8 +3,8 @@
 //! and 16).
 //!
 //! Every component is laid out as its scalars first, then a tail whose size is a multiple
-//! of eight bytes, so the layout holds whichever width the milestone 1 precision test picks
-//! for [`Scalar`] without a padding change; `lib.rs` asserts the sizes for both widths.
+//! of eight bytes, so the layout holds at either width of [`Scalar`] without a padding
+//! change; `lib.rs` asserts the sizes for both widths, and milestone 1 kept 64 bits (D146).
 
 use lactose_core::{EntityRef, PlainArray, StableKey, Tick};
 use lactose_math::{Quat, Scalar, Vec3};

@@ -1,10 +1,10 @@
 //! The one module that names the simulation float.
 //!
-//! Architecture section 16 decides the width in milestone 1. Switching it means editing this
-//! file and nothing else in the crate: the alias, the matching unsigned integer, the constants
-//! module and the `libm` bindings (the `f`-suffixed functions for 32 bits). It is deliberately
-//! not a Cargo feature, because features unify across a build and an outside crate could then
-//! change boundary numerics.
+//! Architecture section 16 decided the width in milestone 1: 64-bit (D146). Switching it means
+//! editing this file and nothing else in the crate: the alias, the matching unsigned integer,
+//! the constants module and the `libm` bindings (the `f`-suffixed functions for 32 bits). It
+//! is deliberately not a Cargo feature, because features unify across a build and an outside
+//! crate could then change boundary numerics.
 
 /// The simulation float.
 pub(crate) type Raw = f64;

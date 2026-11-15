@@ -4,8 +4,8 @@
 //! and the rows of a ragdoll ([`Bones`], [`BoneLink`]).
 //!
 //! Every component is its scalars first, then a tail whose size is a multiple of eight
-//! bytes, so the layout holds whichever width the milestone 1 precision test picks for
-//! [`Scalar`] without a padding change; `lib.rs` asserts the sizes for both widths. Every
+//! bytes, so the layout holds at either width of [`Scalar`] without a padding change;
+//! `lib.rs` asserts the sizes for both widths, and milestone 1 kept 64 bits (D146). Every
 //! value that crosses a tick boundary is an integer, a `Scalar` or a `lactose_math` vector
 //! or quaternion: nothing here is a float of the platform library.
 

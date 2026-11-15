@@ -192,7 +192,7 @@ fn reference_region_hash() -> u64 {
 }
 
 /// Pinned: a change to the encoding changes these, and must be deliberate. They hold for
-/// the 64-bit simulation scalar; the scalar decision of milestone 1 re-pins them.
+/// the 64-bit simulation scalar, which the scalar decision of milestone 1 kept (D146).
 const GOLDEN_REGION: u64 = 0x96bc_2e76_812e_38c3;
 const GOLDEN_SIMULATION: u64 = 0xd7c1_7142_23e6_85ae;
 

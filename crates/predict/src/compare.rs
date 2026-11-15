@@ -34,8 +34,8 @@ pub struct PredictionTolerance {
 impl PredictionTolerance {
     /// 2e-3 m, 2e-3 per quaternion component, 2e-2 m/s and 2e-2 rad/s: under a pixel at
     /// five metres on a 1440p display with a 60 degree field of view, set under the 64-bit
-    /// scalar against the residuals D124 measured. Milestone 1 re-measures them with the
-    /// scalar decision and the spike re-sets them from `PredictionStats::absorbed`.
+    /// scalar against the residuals D124 measured. The scalar decision kept 64 bits and
+    /// re-set none (D146); milestone 4 re-sets them from `PredictionStats::absorbed`.
     pub const DEFAULT: Self = Self {
         translation: Scalar::from_f64(2e-3),
         rotation: Scalar::from_f64(2e-3),

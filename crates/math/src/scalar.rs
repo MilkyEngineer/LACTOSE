@@ -12,7 +12,7 @@ use crate::raw::{self, Raw};
 /// The unsigned integer as wide as [`Scalar`], the type of its canonical bits.
 pub type ScalarBits = raw::Bits;
 
-/// The simulation float: 64-bit until the milestone 1 precision test decides finally.
+/// The simulation float: 64-bit, decided by the milestone 1 precision test (D146).
 ///
 /// It exposes no method of the primitive float, so nothing inside the determinism boundary can
 /// reach the platform math library or a NaN's sign and payload by accident. Every operation is
