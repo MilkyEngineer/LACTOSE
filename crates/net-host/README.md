@@ -410,7 +410,7 @@ reshape.
 
 - `InterpolationBuffer::split(capacity)` makes one buffer of `capacity` slots, allocating
   once, and hands out its one `InterpolationWriter` and an `InterpolationReader`, which
-  clones. The writer is the network thread's; a reader is the `net-api` resource of section
+  clones. The writer is the network thread's; a reader is the `net-host` resource of section
   5.3 that the presentation schedule holds. The buffer never feeds a simulation row:
   `Replicated` rows get the same states through the staged frame.
 - Each slot is a sequence lock over a ring of the `STATES_PER_SLOT` (8) newest states by

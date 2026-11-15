@@ -634,7 +634,7 @@ for bit:
   `#[path = "../../../tools/xtask/src/harness/protocol.rs"] mod protocol;` (its unit tests
   come along and run there too) and lists `lactose-task` under `[dev-dependencies]`, which
   the boundary allowlist permits; once it moves, the glue lives in one test-support crate
-  outside the boundary, `lactose-sour`, that every simulation test crate dev-depends on,
+  outside the boundary, `lactose-harness`, that every simulation test crate dev-depends on,
   so the `#[expect]`s below live in one place. The `applied` line reports the worker count
   from `Executor::frame_worker_count`, the layout from `World::layout` through
   `layout_mode_of` (`Rows(n)` as `rows:n:seed`, `Bytes(16384)` as `bytes:16384:seed`,
@@ -643,10 +643,11 @@ for bit:
   several worlds writes one `applied` line per world whose hash it records; the runner
   holds every one to the launched configuration. `tests/glue` is the glue
   as the recording tests (`sour.rs`, `cost.rs`) use it.
-- Every simulation test of this crate and of the game crates records this way; the package
-  with such tests is listed under `[harness]` in `tools/xtask/ci-policy.toml`. Until
-  `lactose-app-headless` exists, whose test target is the SOUR test crate of section 8.3,
-  that package is `lactose-sim`.
+- Every simulation test records this way, in this crate and in every other package that
+  has one; each such package is listed under `[harness]` in `tools/xtask/ci-policy.toml`,
+  which `cargo xtask boundary` holds to the packages that include the protocol module. The
+  assembly's recorded run is `lactose-app`'s `tests/headless.rs`; `lactose-app-headless`
+  is a feature root of section 8.3 and has no tests.
 - The boundary lint file bans, on the re-exported `Executor`, what a boundary crate must
   not do with it: `frame_worker_count` and `slot_count` (worker identity), `spawn`,
   `run_graph` and `platform` (arbitrary work and threads), `sleep_until` (a clock),
@@ -663,14 +664,15 @@ for bit:
 `journal::Journal` is a `SavePoint`, what a save does not carry (the asset tables and modes
 in force at the checkpoint, every joined player's claimed and anchored entity, the held
 joins and the requested regions, which the replay driver restores before its first step;
-and `services`, a map from a service key (the xxh64 of the service's declared name,
-collision-checked as a system key is) to the opaque bytes `app` took from that service at
-the checkpoint, which the replay driver hands back after the regions load and before the
-first step: the physics snapshot of `lactose-physics-api` goes there, the backend's whole
-world and the sync's pending work, since the solver holds state the rows do not carry and a
-replay without it hashes equal only until the first contact; this crate never reads the
-bytes and they are not hashed state; until the byte form exists, D124, a replay is
-bit-exact from a session's start only),
+not yet `services`, which D124 adds with the byte form of `lactose-physics-api`'s
+snapshot and `docs/verification.md` holds for milestone 4 ("The journal checkpoint's
+physics snapshot"): a map from a service key (the xxh64 of the service's declared name) to
+the opaque bytes `app` took from that service at the checkpoint, handed back after the
+regions load and before the first step; the physics snapshot goes there, since the solver
+holds state the rows do not carry and a replay without it hashes equal only until the
+first contact; this crate will not read the bytes and they will not be hashed state.
+Until then a replay is bit-exact from a session's start only, and since every field of
+`Journal` is public, the field's arrival changes every struct literal of it),
 and one `JournalFrame` per tick after it; `JournalFrame::record(tick, &input)` is the
 frame's record, mirroring `TickInput` field for field in its application order, with
 tables as `VersionTable`s and bundles as `JournalLoad` (the baseline by content hash, with
@@ -703,9 +705,10 @@ another build.
 - A teleport or respawn into an unloaded region: a two-phase operation the game performs,
   loading ahead (a spawned anchor, a held `Join` or a pinned region brings the region in)
   and moving once it is loaded; a move commanded before that is dropped and logged by the
-  ECS (D117). Proposed `docs/verification.md` item: "Teleport and respawn across the
-  streaming ring are two-phase in the game; decide with `game-sim` whether `sim` needs a
-  frame-level request for a region a game system wants ahead of any anchor (milestone 3)".
+  ECS (D117). `docs/verification.md` holds the item in the `lactose-sim` row, which gates
+  milestone 3: "Teleport and respawn across the streaming ring are two-phase in the game;
+  decide with `game-sim` whether `sim` needs a frame-level request for a region a game
+  system wants ahead of any anchor".
 - Section 14's hold of a player at a region boundary until the client acknowledges
   readiness: `net`'s at milestone 4, with no field here.
 - Hashing `physics-api::snapshot` bytes into the world hash (architecture section 8.3).

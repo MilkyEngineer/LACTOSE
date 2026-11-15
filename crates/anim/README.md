@@ -692,7 +692,7 @@ never leaves loops forever.
   first. `set_limp(.., false)` cuts, and a root kept still while limp stands up where it
   fell.
 - Bone rows in a networked session: `lactose-net-api`'s `Unreplicated` marker, skipped by
-  `lactose-net-host`'s gather and left out of `lactose-persist`'s region relevance message
+  that crate's gather and left out of `lactose-persist`'s region relevance message
   (proposed with D128); until it lands, `Bones` is not used in a networked session.
 - Bone rows in the prediction world: a local player's predicted ragdoll and predicted hits
   on bones. They would need predicted bone rows exempt from `lactose-predict`'s

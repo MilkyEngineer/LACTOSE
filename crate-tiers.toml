@@ -87,7 +87,7 @@ crates = [
 ]
 
 # Edges that need no exception because the target is foundation: net -> predict,
-# presentation -> net-api (interpolation buffer), audio -> present-api (listener requests),
+# presentation -> net-host (interpolation buffer), audio -> present-api (listener requests),
 # persist -> bundle, asset -> bundle, cook -> bundle.
 
 # Backend-to-backend edges only: both the crate named and the crates it may depend on are

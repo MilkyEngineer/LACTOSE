@@ -83,6 +83,7 @@ impl Registry {
 
         if info.role() == TypeRole::Component && layout.size() > LARGE_COMPONENT_BYTES {
             tracing::warn!(
+                target: "reflect",
                 component = name,
                 size = layout.size(),
                 "component is larger than 1 KiB; few rows fit a chunk"

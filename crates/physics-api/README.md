@@ -410,8 +410,8 @@ gather compare it with the last tick they covered, and zero means never.
   whose bodies are in two regions is allowed within one process (architecture section 9.6
   keeps cross-region references weak, and this one is validated at every sync).
 - Spawn a joint owned by one of its bodies (`OwnedBy`) so it migrates and despawns with
-  it. Joint rows are `persistent, replicated`: a ragdoll's joints survive a save and are
-  predicted with the bones.
+  it. Joint rows are `persistent, replicated`: a ragdoll's joints survive a save. They are
+  owned by its bone rows, which are the server's alone and never predicted (D128).
 
 **Validity** (architecture sections 8.2 and 16; D135)
 
