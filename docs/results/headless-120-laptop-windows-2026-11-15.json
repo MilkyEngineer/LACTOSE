@@ -1,0 +1,28 @@
+{
+  "arch": "x86_64",
+  "command": "cargo xtask measure --all",
+  "commit": "bef3455b4a56",
+  "cpu": "12th Gen Intel(R) Core(TM) i7-12650H",
+  "date": "2026-11-15",
+  "figures": {
+    "behind": 0,
+    "frames": 121,
+    "hash": "0x92ff315464f84575",
+    "ticks": 120
+  },
+  "load": {
+    "processor_idle_percent": 63.53333333333333
+  },
+  "machine": "laptop-windows",
+  "measurement": "headless-120",
+  "notes": {},
+  "os": "windows Microsoft Windows [Version 10.0.26200.9974]",
+  "profile": "dev",
+  "ran": "cargo run --locked -p lactose-app-headless -- 120",
+  "short": false,
+  "topology": {
+    "efficiency": 4,
+    "performance": 6
+  },
+  "workers": "6 frame workers, the default executor's"
+}

@@ -1,0 +1,35 @@
+{
+  "arch": "x86_64",
+  "command": "cargo xtask measure --all",
+  "commit": "bef3455b4a56",
+  "cpu": "12th Gen Intel(R) Core(TM) i7-12650H",
+  "date": "2026-11-15",
+  "figures": {
+    "bones": 16,
+    "characters": 200,
+    "ticks": 300,
+    "w1.bodies_us": 20860.2,
+    "w1.with_us": 21190.0,
+    "w1.without_us": 329.8,
+    "w6.bodies_us": 12827.1,
+    "w6.with_us": 13094.9,
+    "w6.without_us": 267.8,
+    "warm_up_ticks": 50,
+    "workers": "1 and 6"
+  },
+  "load": {
+    "processor_idle_percent": 56.9
+  },
+  "machine": "laptop-windows",
+  "measurement": "bone-bodies",
+  "notes": {},
+  "os": "windows Microsoft Windows [Version 10.0.26200.9974]",
+  "profile": "release",
+  "ran": "cargo nextest run --locked --cargo-profile release --package lactose-app --test cost --run-ignored only --no-capture --no-tests=fail -E 'test(=cost_of_bone_bodies_on_rapier)'",
+  "short": false,
+  "topology": {
+    "efficiency": 4,
+    "performance": 6
+  },
+  "workers": "1 and 6"
+}

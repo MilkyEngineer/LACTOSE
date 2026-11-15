@@ -1,0 +1,33 @@
+{
+  "arch": "x86_64",
+  "command": "cargo xtask measure --all",
+  "commit": "bef3455b4a56",
+  "cpu": "12th Gen Intel(R) Core(TM) i7-12650H",
+  "date": "2026-11-15",
+  "figures": {
+    "bodies": 2000,
+    "frame_workers": 6,
+    "reload.step_us": 671913.7,
+    "reload.sync_us": 206936.1,
+    "reloads": 5,
+    "rows": 100000,
+    "statics": 50001,
+    "tick.step_us": 4189.1,
+    "tick.sync_us": 818.1
+  },
+  "load": {
+    "processor_idle_percent": 58.0
+  },
+  "machine": "laptop-windows",
+  "measurement": "reload-100k",
+  "notes": {},
+  "os": "windows Microsoft Windows [Version 10.0.26200.9974]",
+  "profile": "release",
+  "ran": "cargo nextest run --locked --cargo-profile release --package lactose-app --test cost --run-ignored only --no-capture --no-tests=fail -E 'test(=cost_of_a_100k_reload)'",
+  "short": false,
+  "topology": {
+    "efficiency": 4,
+    "performance": 6
+  },
+  "workers": "6"
+}

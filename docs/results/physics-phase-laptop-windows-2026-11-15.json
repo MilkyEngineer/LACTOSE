@@ -1,0 +1,37 @@
+{
+  "arch": "x86_64",
+  "command": "cargo xtask measure --all",
+  "commit": "bef3455b4a56",
+  "cpu": "12th Gen Intel(R) Core(TM) i7-12650H",
+  "date": "2026-11-15",
+  "figures": {
+    "bodies": 2000,
+    "frame_workers": 6,
+    "phase_us": 4028.4,
+    "plain_rows": 47999,
+    "rows": 100000,
+    "server_step_us": 4220.7,
+    "solver_threads": 5,
+    "statics": 50001,
+    "step_us": 2633.4,
+    "sync_us": 801.0,
+    "ticks": 60,
+    "warm_up_ticks": 30,
+    "write_back_us": 593.6
+  },
+  "load": {
+    "processor_idle_percent": null
+  },
+  "machine": "laptop-windows",
+  "measurement": "physics-phase",
+  "notes": {},
+  "os": "windows Microsoft Windows [Version 10.0.26200.9974]",
+  "profile": "release",
+  "ran": "cargo nextest run --locked --cargo-profile release --package lactose-app --test cost --run-ignored only --no-capture --no-tests=fail -E 'test(=cost_of_the_physics_phase_at_100k_rows)'",
+  "short": false,
+  "topology": {
+    "efficiency": 4,
+    "performance": 6
+  },
+  "workers": "6"
+}

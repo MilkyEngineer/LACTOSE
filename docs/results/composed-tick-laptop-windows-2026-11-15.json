@@ -1,0 +1,38 @@
+{
+  "arch": "x86_64",
+  "command": "cargo xtask measure --all",
+  "commit": "bef3455b4a56",
+  "cpu": "12th Gen Intel(R) Core(TM) i7-12650H",
+  "date": "2026-11-15",
+  "figures": {
+    "bodies": 2000,
+    "n": 6,
+    "projection_us": 7431.4,
+    "rows": 100064,
+    "s_us": 5227.5,
+    "t1_us": 22858.4,
+    "ticks": 60,
+    "tn_us": 8166.0,
+    "w1.physics_us": 8970.4,
+    "w1.step_us": 22858.4,
+    "w6.physics_us": 4230.1,
+    "w6.step_us": 8166.0,
+    "warm_up_ticks": 10,
+    "workers": "1 and 6"
+  },
+  "load": {
+    "processor_idle_percent": 57.0
+  },
+  "machine": "laptop-windows",
+  "measurement": "composed-tick",
+  "notes": {},
+  "os": "windows Microsoft Windows [Version 10.0.26200.9974]",
+  "profile": "release",
+  "ran": "cargo nextest run --locked --cargo-profile release --package lactose-app --test cost --run-ignored only --no-capture --no-tests=fail -E 'test(=composed::cost_of_the_composed_tick)'",
+  "short": false,
+  "topology": {
+    "efficiency": 4,
+    "performance": 6
+  },
+  "workers": "1 and 6"
+}

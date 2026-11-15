@@ -1,0 +1,47 @@
+{
+  "arch": "x86_64",
+  "command": "cargo xtask measure --all",
+  "commit": "bef3455b4a56",
+  "cpu": "12th Gen Intel(R) Core(TM) i7-12650H",
+  "date": "2026-11-15",
+  "figures": {
+    "a.evaluate_us": 112.3,
+    "b.w1.difference_us": 147.9,
+    "b.w1.with_us": 186.7,
+    "b.w1.without_us": 38.8,
+    "b.w4.difference_us": 70.1,
+    "b.w4.with_us": 111.0,
+    "b.w4.without_us": 40.9,
+    "bones": 16,
+    "c.no_physics.w1.bodies_us": 1538.7,
+    "c.no_physics.w1.with_us": 1785.4,
+    "c.no_physics.w1.without_us": 246.7,
+    "c.no_physics.w4.bodies_us": 1072.1,
+    "c.no_physics.w4.with_us": 1208.1,
+    "c.no_physics.w4.without_us": 136.0,
+    "c.test_backend.w1.bodies_us": 4245.9,
+    "c.test_backend.w1.with_us": 4483.0,
+    "c.test_backend.w1.without_us": 237.1,
+    "c.test_backend.w4.bodies_us": 4961.1,
+    "c.test_backend.w4.with_us": 5104.8,
+    "c.test_backend.w4.without_us": 143.7,
+    "characters": 200,
+    "ticks": 1000,
+    "workers": "1 and 4"
+  },
+  "load": {
+    "processor_idle_percent": 48.1
+  },
+  "machine": "laptop-windows",
+  "measurement": "sim-skeleton",
+  "notes": {},
+  "os": "windows Microsoft Windows [Version 10.0.26200.9974]",
+  "profile": "release",
+  "ran": "cargo nextest run --locked --cargo-profile release --package lactose-anim --test cost --run-ignored only --no-capture --no-tests=fail -E 'test(=the_sim_skeleton_budget)'",
+  "short": false,
+  "topology": {
+    "efficiency": 4,
+    "performance": 6
+  },
+  "workers": "1 and 4"
+}

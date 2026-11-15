@@ -1,0 +1,33 @@
+{
+  "benchmark": "whisk",
+  "machine": "laptop-windows",
+  "cpu": "Intel64 Family 6 Model 154 Stepping 3, GenuineIntel",
+  "os": "windows",
+  "arch": "x86_64",
+  "date": "2026-11-15",
+  "commit": "bef3455b4a56",
+  "task_role": "not applicable",
+  "load_average": { "before": "unknown", "after": "unknown" },
+  "topology": { "performance": 6, "efficiency": 4 },
+  "frame_workers": 6,
+  "background_workers": 4,
+  "calibration": { "iterations_per_nanosecond": 0.530414, "serial_check": 1.0160 },
+  "runs_per_case": 2000,
+  "makespan_ratio": [
+    { "shape": "wide-shallow", "background_zstd_tasks": 0, "samples": 2000, "p50": 1.1369, "p99": 4.0229, "max": 6.7340, "mean": 1.3820, "greedy_p50": 1.0341, "greedy_p99": 1.0723, "longest_first_p50": 1.0347, "longest_first_p99": 1.0779, "mean_makespan_us": 12650.1, "mean_lower_bound_us": 9156.4, "mean_work_us": 54938.1, "mean_cpu_us": null },
+    { "shape": "wide-shallow", "background_zstd_tasks": 2, "samples": 2000, "p50": 1.0951, "p99": 1.3678, "max": 1.9579, "mean": 1.1058, "greedy_p50": 1.0341, "greedy_p99": 1.0723, "longest_first_p50": 1.0347, "longest_first_p99": 1.0779, "mean_makespan_us": 10121.4, "mean_lower_bound_us": 9156.4, "mean_work_us": 54938.1, "mean_cpu_us": null },
+    { "shape": "deep-chain", "background_zstd_tasks": 0, "samples": 2000, "p50": 1.0777, "p99": 2.7677, "max": 4.9213, "mean": 1.1921, "greedy_p50": 1.0000, "greedy_p99": 1.0000, "longest_first_p50": 1.0000, "longest_first_p99": 1.0000, "mean_makespan_us": 37691.9, "mean_lower_bound_us": 31620.4, "mean_work_us": 34444.2, "mean_cpu_us": null },
+    { "shape": "deep-chain", "background_zstd_tasks": 2, "samples": 2000, "p50": 1.0792, "p99": 1.1899, "max": 1.5990, "mean": 1.0855, "greedy_p50": 1.0000, "greedy_p99": 1.0000, "longest_first_p50": 1.0000, "longest_first_p99": 1.0000, "mean_makespan_us": 34312.7, "mean_lower_bound_us": 31620.4, "mean_work_us": 34444.2, "mean_cpu_us": null },
+    { "shape": "fan-in-fan-out", "background_zstd_tasks": 0, "samples": 2000, "p50": 2.5883, "p99": 6.5757, "max": 7.7631, "mean": 2.8893, "greedy_p50": 1.0490, "greedy_p99": 1.1059, "longest_first_p50": 1.0000, "longest_first_p99": 1.0148, "mean_makespan_us": 44418.1, "mean_lower_bound_us": 15402.4, "mean_work_us": 45043.5, "mean_cpu_us": null },
+    { "shape": "fan-in-fan-out", "background_zstd_tasks": 2, "samples": 2000, "p50": 1.2264, "p99": 2.4351, "max": 2.9811, "mean": 1.3721, "greedy_p50": 1.0490, "greedy_p99": 1.1059, "longest_first_p50": 1.0000, "longest_first_p99": 1.0148, "mean_makespan_us": 21125.7, "mean_lower_bound_us": 15402.4, "mean_work_us": 45043.5, "mean_cpu_us": null }
+  ],
+  "wake_latency_ns": { "samples": 5000, "p50": 145900, "p99": 236400, "max": 828600, "mean": 123874, "process_cpu_per_second": null },
+  "steal_ns": { "samples": 400000, "p50": 100, "p99": 700, "max": 245100, "mean": 231.1, "clock_pair": 72.0 },
+  "timer_wake_ns": [
+    { "period_us": 2000.0, "samples": 5000, "p50": 14919500, "p99": 15505900, "max": 16117300, "mean": 14887511, "over_a_millisecond": 4998, "process_cpu_per_second": null },
+    { "period_us": 16667.0, "samples": 5000, "p50": 4339800, "p99": 15918400, "max": 16412300, "mean": 4943638, "over_a_millisecond": 4429, "process_cpu_per_second": null }
+  ],
+  "forced_split_worker_ns_per_entry": 586.1,
+  "thresholds": { "ratio_p50": 1.25, "ratio_p99": 1.5, "wake_p99_ns": 35000, "timer_wake_at_tick_p99_ns": 20000, "steal_p99_ns": 1000 },
+  "pass": { "makespan_ratio": false, "wake_latency": false, "timer_wake": false, "steal": true }
+}

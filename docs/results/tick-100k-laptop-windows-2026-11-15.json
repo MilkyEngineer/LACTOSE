@@ -1,0 +1,39 @@
+{
+  "arch": "x86_64",
+  "command": "cargo xtask measure --all",
+  "commit": "bef3455b4a56",
+  "cpu": "12th Gen Intel(R) Core(TM) i7-12650H",
+  "date": "2026-11-15",
+  "figures": {
+    "archetypes": 5,
+    "hash": "0x11c1a653b85d7d3d",
+    "n": 6,
+    "projection_us": 4231.6,
+    "regions": 16,
+    "rows": 100064,
+    "s_us": 2856.7,
+    "systems": 16,
+    "t1_us": 13856.0,
+    "ticks": 60,
+    "tn_us": 4689.9,
+    "topology.efficiency": 4,
+    "topology.performance": 6,
+    "warm_up_ticks": 10,
+    "workers": "1 and 6"
+  },
+  "load": {
+    "processor_idle_percent": 64.875
+  },
+  "machine": "laptop-windows",
+  "measurement": "tick-100k",
+  "notes": {},
+  "os": "windows Microsoft Windows [Version 10.0.26200.9974]",
+  "profile": "release",
+  "ran": "cargo nextest run --locked --cargo-profile release --package lactose-sim --test cost --run-ignored only --no-capture --no-tests=fail -E 'test(=cost_of_a_tick_at_100k_rows)'",
+  "short": false,
+  "topology": {
+    "efficiency": 4,
+    "performance": 6
+  },
+  "workers": "1 and 6"
+}

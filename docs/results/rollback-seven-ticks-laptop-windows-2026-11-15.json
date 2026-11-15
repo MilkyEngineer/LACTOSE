@@ -1,0 +1,30 @@
+{
+  "arch": "x86_64",
+  "command": "cargo xtask measure --all",
+  "commit": "bef3455b4a56",
+  "cpu": "12th Gen Intel(R) Core(TM) i7-12650H",
+  "date": "2026-11-15",
+  "figures": {
+    "frames": 158,
+    "per_tick_us": 1564.8,
+    "resimulated": 7,
+    "rollback_us": 10953.5,
+    "rollbacks": 20,
+    "workers": 4
+  },
+  "load": {
+    "processor_idle_percent": null
+  },
+  "machine": "laptop-windows",
+  "measurement": "rollback-seven-ticks",
+  "notes": {},
+  "os": "windows Microsoft Windows [Version 10.0.26200.9974]",
+  "profile": "release",
+  "ran": "cargo nextest run --locked --cargo-profile release --package lactose-app --test spike --run-ignored only --no-capture --no-tests=fail -E 'test(=cost_of_a_seven_tick_rollback)'",
+  "short": false,
+  "topology": {
+    "efficiency": 4,
+    "performance": 6
+  },
+  "workers": "4"
+}
