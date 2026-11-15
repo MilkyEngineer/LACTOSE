@@ -26,12 +26,13 @@ compares.
 
 N, the frame workers of the plan's decision 5.1, follows its section 4: the performance cores
 the platform reports or, on a part that reports no core types, its physical cores, at most
-eight. `LACTOSE_MEASURE_WORKERS=<n>` sets it instead, and the file's header says so.
+eight. `LACTOSE_MEASURE_WORKERS=<n>` sets it instead, and the file's header says so;
+`spike-net`'s replays run on the spike's four workers whatever it says, as their header states.
 
 A measurement that is a test is an ignored test run in release by `cargo nextest run
---cargo-profile release --run-ignored only --no-capture`; it prints each figure as a line
-`measure: <name> <value>`, which is what the files carry, so it can also be run by hand with
-the same command. `--short` sets `LACTOSE_MEASURE_SHORT`, under which each test cuts its
+--cargo-profile release --run-ignored only --retries 0 --no-capture`; it prints each figure
+as a line `measure: <name> <value>`, once, which is what the files carry, so it can also be
+run by hand with the same command. `--short` sets `LACTOSE_MEASURE_SHORT`, under which each test cuts its
 repetitions; a short run's files end in `-short` and say that their numbers mean nothing.
 `--short` cuts nothing of `headless-120` and `edit-to-playing`, whose files it leaves
 unmarked. CI runs `--all --short` by hand only (`.github/workflows/measure.yml`) to keep the
@@ -47,7 +48,7 @@ the runner, and discards the rest.
 | `bone-bodies` | 200 characters with a Rapier body on each bone, against the same characters without | `lactose-app`, test `cost`, `cost_of_bone_bodies_on_rapier` | None: recorded (the plan, section 4, "Bodies' cost per tick") |
 | `prediction-slot` | The take and the restore of one prediction slot on the spike's thrown scene among 59 unclaimed bodies, so that five fixed colliders and 59 proxies make the 64 D139 admits, its bodies on Rapier, by part (world, physics, record; the criterion reads the world and physics snapshots, `snapshot_us`, and `restore_us`), and the slot's size | `lactose-app`, test `spike`, `cost_of_a_prediction_slot` | Criterion 5: architecture section 22; the plan, section 4 |
 | `rollback-seven-ticks` | A rollback that restores a slot and re-simulates seven ticks on the same scene | `lactose-app`, test `spike`, `cost_of_a_seven_tick_rollback` | Criterion 7, recorded: architecture section 22; the plan, section 4 |
-| `spike-net` | The netcode spike's four scenes, ten minutes of ticks each, under the clock script and on the server's clock: the correction rate, the largest absorbed difference per kind, rollback cost per tick, divergence and the rest of each replay's report, as `<scene>.<clock>.<key>`, and each replay's seconds from its first line of output to its report, `<scene>.<clock>.wall_s`. The claim on approach is not one of them. Every replay holds its claimed entities in the one region the server simulates throughout, as the file's header says, so no rate counts a server-`Frozen` region's corrections (architecture section 9.4). A short run replays the dynamic capsule alone, on each clock | `lactose-app`, test `spike`, the eight `ten_minutes_of_` tests named for a scene and a clock, one `cargo nextest run` each, in turn | Criterion 7, recorded: architecture section 22; the plan, section 4 |
+| `spike-net` | The netcode spike's four scenes, ten minutes of ticks each, under the clock script and on the server's clock: the correction rate, the largest absorbed difference per kind, rollback cost per tick, divergence and the rest of each replay's report, as `<scene>.<clock>.<key>`, and each replay's seconds from its first line of output to its report, `<scene>.<clock>.wall_s`. The claim on approach is not one of them. Each replay counts its server frames whose region is not `Simulated`, `server_frozen_ticks`, and the most fixed colliders and proxies its prediction world held, `prediction_fixed_and_proxies`; the measurement fails, writing no file, unless every replay's first is 0, so that no rate counts a server-`Frozen` region's corrections (architecture section 9.4), and its second at most 64 (plan decision 5.5). The header states both. A short run replays the dynamic capsule alone, on each clock | `lactose-app`, test `spike`, the eight `ten_minutes_of_` tests named for a scene and a clock, one `cargo nextest run` each, in turn | Criterion 7, recorded: architecture section 22; the plan, section 4 |
 | `sim-skeleton` | The sim skeleton of 200 characters: (a) evaluation, (b) the stage with and without it, (c) bone bodies on the test backend | `lactose-anim`, test `cost`, `the_sim_skeleton_budget` | Criterion 6, figure (b): architecture section 22; the plan, section 4 |
 | `whisk` | Milestone 0's WHISK benchmark: `cargo bench -p lactose-task --bench whisk`, which writes its own `whisk-<machine>-<date>` pair, moved here | the benchmark | `crates/task/README.md` |
 | `headless-120` | `cargo run -p lactose-app-headless -- 120`, dev profile, and the world hash it prints | the binary | None: its hash on x86-64 equals the M1's at the same commit (the plan, section 4) |

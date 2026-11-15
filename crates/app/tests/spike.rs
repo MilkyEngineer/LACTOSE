@@ -2074,6 +2074,12 @@ struct Outcome {
     key_counts: Vec<usize>,
     datagrams_dropped: u64,
     deltas_dropped: u32,
+    /// Server frames that ended with the region in any mode but `Simulated`, unloaded
+    /// included: a correction there inflates the rate (architecture section 9.4).
+    server_frozen_ticks: u32,
+    /// The most fixed colliders and proxies the prediction world held at the end of a client
+    /// frame, which plan decision 5.5 bounds at [`PREDICTION_ROWS`].
+    fixed_and_proxies: usize,
 }
 
 /// The client and what the spike keeps beside it.
@@ -2132,6 +2138,18 @@ fn predicted_keys(world: &World) -> BTreeSet<StableKey> {
         .entities_in(REGION)
         .filter(|key| matches!(key, StableKey::Predicted(predicted) if predicted.player == PLAYER))
         .collect()
+}
+
+/// The fixed colliders and proxies of `world`'s region: colliders with no body, and bodies
+/// no player claims, as the slot test's queries count them (which need the world `mut`).
+fn fixed_and_proxies(world: &World) -> usize {
+    world
+        .entities_in(REGION)
+        .filter(|&key| match world.get::<RigidBody>(key) {
+            Some(_) => world.get::<ClaimedBy>(key).is_none(),
+            None => world.get::<Collider>(key).is_some(),
+        })
+        .count()
 }
 
 /// Runs `plan` on `executor`, both worlds under `layout`, reporting to `observe`.
@@ -2212,6 +2230,8 @@ fn run(
         packer.owed.extend(owed);
         packer.absorb(&out.gathered)?;
         let world = current.simulation().world();
+        outcome.server_frozen_ticks +=
+            u32::from(world.region_mode(REGION) != Some(RegionMode::Simulated));
         packer.sync_claims(world);
         let tick = current.tick();
         if n == 1 || resync_requested {
@@ -2448,6 +2468,8 @@ fn client_frame(
     end.client = Some(client);
     end.ran = n;
     let client = end.client.as_mut().expect("just put back");
+    let held = fixed_and_proxies(client.predictor().simulation().world());
+    outcome.fixed_and_proxies = outcome.fixed_and_proxies.max(held);
     let tick = client.tick();
     outcome.offsets.push((n, i64::from(tick.0) - i64::from(n)));
     let mut resync = out.is_none();
@@ -2876,7 +2898,8 @@ fn report(plan: Plan, outcome: &mut Outcome, recorded_stream: u64) -> String {
             "\"thrown_settle_ticks\":{},\"predicted_keys_at_checks\":{:?},\"yaw_error_rad_per_tick\":{{\"mean\":{:e},\"worst\":{:e}}},",
             "\"ring\":{{\"depth\":{},\"world_bytes\":{},\"physics_bytes\":{},\"record_bytes\":{}}},",
             "\"update_bytes\":{{\"mean\":{:.0},\"max\":{}}},\"full_bytes_max\":{},",
-            "\"datagrams_dropped\":{},\"rate\":{},\"lead\":{}}}"
+            "\"datagrams_dropped\":{},\"rate\":{},\"lead\":{},",
+            "\"server_frozen_ticks\":{},\"prediction_fixed_and_proxies\":{}}}"
         ),
         plan.scene.name(),
         plan.clock == ClockScript::Drifting,
@@ -2930,6 +2953,8 @@ fn report(plan: Plan, outcome: &mut Outcome, recorded_stream: u64) -> String {
         outcome.datagrams_dropped,
         outcome.rate,
         outcome.lead,
+        outcome.server_frozen_ticks,
+        outcome.fixed_and_proxies,
     )
 }
 
@@ -3132,6 +3157,7 @@ fn cost_of_a_prediction_slot() {
         let proxies = world.query::<(&RigidBody, lactose_ecs::Without<ClaimedBy>)>().count();
         assert_eq!(fixed, FIXED as usize, "the arena's fixed colliders");
         assert_eq!(fixed + proxies, PREDICTION_ROWS as usize, "the most D139 admits");
+        assert_eq!(fixed_and_proxies(world), fixed + proxies, "the replays' count agrees");
         let entities = world.entities_in(REGION).count();
 
         let mut times: [Vec<Duration>; 6] = Default::default();

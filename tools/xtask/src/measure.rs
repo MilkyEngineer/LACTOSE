@@ -7,8 +7,10 @@
 //! edit-to-playing loop. A test prints each figure
 //! as a line `measure: <name> <value>` on its standard output, which nextest passes through
 //! under `--no-capture`: the test needs no path from this command and stays runnable by
-//! hand, and the line is the one contract between them. A test that prints no figure, or a
-//! figure line that does not read, fails the measurement. Every result file opens with the
+//! hand, and the line is the one contract between them; for the spike's replays the contract
+//! is instead the one JSON object each prints. A test that prints no figure, a figure line
+//! that does not read, or a figure named twice fails the measurement. Every result file opens
+//! with the
 //! header the plan names: the CPU and operating system, the topology the executor detected,
 //! the workers used, the commit, the build profile, the command, and the load average before
 //! and after the run (on Windows, the processor's idle share over it, sampled through WMI).
@@ -239,12 +241,9 @@ const REPLAYS: [Replay; 8] = [
 /// The frame workers each replay's executor runs, `executor(4)` in the spike's `measure`.
 const SPIKE_WORKERS: u32 = 4;
 
-/// Where the server holds the claimed entities of every replay, which the file states so
-/// that its correction rates are read as a simulated region's (architecture section 9.4).
-/// A test checks it against [`SPIKE_FILE`].
-const SPIKE_REGIONS: &str = "every replay's one region is `Simulated` on the server from its \
-    load to the end (`Directed`, loaded `Simulated`, no mode change), so no correction is a \
-    server-`Frozen` region's (architecture section 9.4)";
+/// The most fixed colliders and proxies together a prediction world may hold at milestone 1
+/// (plan decision 5.5), against each replay's `prediction_fixed_and_proxies`.
+const PREDICTION_BOUND: u64 = 64;
 
 /// The topology probe: an ignored test of `lactose-app` that prints what the executor
 /// detects, run once before the measurements.
@@ -255,13 +254,18 @@ const PROBE: Run =
 
 /// The figures in `output`: every line `measure: <name> <value>`, in order. A line that
 /// starts with the prefix and lacks a name without spaces or a value is an error, not a
-/// figure dropped.
+/// figure dropped, and so is a name printed twice, which is two runs' output or a test's
+/// slip, not one figure.
 fn figures(output: &str) -> Result<Vec<(String, String)>, String> {
+    let mut seen = std::collections::BTreeSet::new();
     output
         .lines()
         .filter_map(|line| line.strip_prefix(FIGURE_PREFIX).map(str::trim_end))
         .map(|rest| match rest.split_once(' ') {
             Some((name, value)) if !name.is_empty() && !value.trim().is_empty() => {
+                if !seen.insert(name) {
+                    return Err(format!("the figure `{name}` is printed twice"));
+                }
                 Ok((name.to_owned(), value.trim().to_owned()))
             }
             _ => Err(format!(
@@ -321,6 +325,36 @@ fn replay_figures(output: &str) -> Result<(String, Vec<(String, String)>), Strin
         Ok([report]) => Ok(report),
         Err(reports) => Err(format!("{} lines are a replay's report; one must be", reports.len())),
     }
+}
+
+/// What a replay's figures must show for its file to stand: no server frame outside a
+/// `Simulated` region, and the prediction world within [`PREDICTION_BOUND`]. Returns the
+/// replay's count of fixed colliders and proxies.
+fn check_replay(prefix: &str, figures: &[(String, String)]) -> Result<u64, String> {
+    let count = |key: &str| {
+        let name = format!("{prefix}.{key}");
+        figures
+            .iter()
+            .find(|(n, _)| *n == name)
+            .and_then(|(_, value)| value.parse::<u64>().ok())
+            .ok_or_else(|| format!("the report has no count `{key}`"))
+    };
+    let frozen = count("server_frozen_ticks")?;
+    if frozen != 0 {
+        return Err(format!(
+            "`{prefix}` ran {frozen} server frames with its region not `Simulated` \
+             (`server_frozen_ticks`), so its corrections are not a simulated region's \
+             (architecture section 9.4)"
+        ));
+    }
+    let held = count("prediction_fixed_and_proxies")?;
+    if held > PREDICTION_BOUND {
+        return Err(format!(
+            "`{prefix}`'s prediction world held {held} fixed colliders and proxies, over the \
+             {PREDICTION_BOUND} of plan decision 5.5 (`prediction_fixed_and_proxies`)"
+        ));
+    }
+    Ok(held)
 }
 
 /// `value`'s figures under `name`: an object's members under `name.<key>`, anything else as
@@ -1038,6 +1072,9 @@ fn nextest_args(run: Run) -> Vec<String> {
         target,
         "--run-ignored",
         "only",
+        // A retried test's output holds every attempt, and its time the failed ones'.
+        "--retries",
+        "0",
         "--no-capture",
         "--no-tests=fail",
         "-E",
@@ -1183,6 +1220,7 @@ fn run_spike_replays(
     let sampler = Sampler::start();
     let (mut found, mut output, mut ran) = (Vec::new(), String::new(), Vec::new());
     let mut reported = std::collections::BTreeSet::new();
+    let mut most_held = (0, String::new());
     for replay in replays(options.short) {
         let mut command = Command::new(&workspace.cargo);
         command.args(nextest_args(replay.run())).current_dir(&workspace.root);
@@ -1204,6 +1242,10 @@ fn run_spike_replays(
         if !reported.insert(prefix.clone()) {
             return Err(format!("{}: a second report of `{prefix}`", replay.test));
         }
+        let held = check_replay(&prefix, &figures).map_err(|e| format!("{}: {e}", replay.test))?;
+        if held >= most_held.0 {
+            most_held = (held, prefix.clone());
+        }
         found.extend(figures);
         found.push((format!("{prefix}.wall_s"), format!("{seconds:.1}")));
         output.push_str(&text);
@@ -1217,7 +1259,24 @@ fn run_spike_replays(
     header
         .notes
         .push(("Replays".to_owned(), format!("{}, one at a time, in this order", ran.join(", "))));
-    header.notes.push(("Server's regions".to_owned(), SPIKE_REGIONS.to_owned()));
+    // Written only once every replay has passed `check_replay`.
+    header.notes.push((
+        "Server's regions".to_owned(),
+        "every replay's `server_frozen_ticks` is 0: the server held its one region `Simulated` \
+         on every frame from its load to the end, so no correction is a server-`Frozen` \
+         region's (architecture section 9.4); the measurement fails otherwise"
+            .to_owned(),
+    ));
+    header.notes.push((
+        "Prediction bound".to_owned(),
+        format!(
+            "at most {PREDICTION_BOUND} fixed colliders and proxies together in a prediction world \
+             (plan decision 5.5); every replay's `prediction_fixed_and_proxies`, the most its \
+             prediction world held after a client frame, is within it, the largest {} \
+             (`{}`); the measurement fails otherwise",
+            most_held.0, most_held.1
+        ),
+    ));
     if options.short {
         header.notes.push((
             "Short run".to_owned(),
@@ -1529,6 +1588,69 @@ mod tests {
 
     /// Review r1, M1: a figure line that does not read was dropped, and the file written
     /// without it.
+    /// Review r1 of spike-net-file, M2: a retried test prints every attempt's figures, and
+    /// the parse took both.
+    #[test]
+    fn a_figure_printed_twice_is_an_error() {
+        let error = figures("measure: n 4\nmeasure: t1_us 1.5\nmeasure: n 4\n").unwrap_err();
+        assert!(error.contains("`n` is printed twice"), "{error}");
+        assert_eq!(figures("measure: n 4\nmeasure: n.w4 4\n").unwrap().len(), 2);
+    }
+
+    /// Review r1 of spike-net-file, M2: nextest retried a failed test under `NEXTEST_RETRIES`
+    /// or a user's config, and the measurement read both attempts.
+    #[test]
+    fn a_measured_test_is_never_retried() {
+        for run in [PROBE, REPLAYS[0].run()].into_iter().chain(MEASUREMENTS.iter().map(|m| m.run)) {
+            if let Run::Test { test, .. } = run {
+                let args = nextest_args(run);
+                let at = args.iter().position(|arg| arg == "--retries").unwrap();
+                assert_eq!(args[at + 1], "0", "{test}");
+            }
+        }
+    }
+
+    /// Review r1 of spike-net-file, M1: serde_json's default float parse is not correctly
+    /// rounded, and some figures were 1 ULP from the printed report.
+    #[test]
+    fn a_replay_s_floats_are_the_printed_values_bit_for_bit() {
+        let printed = "1.9990871056907666e-2";
+        let output = REPLAY_OUTPUT.replace("1.99995710109393e-2", printed);
+        let (prefix, figures) = replay_figures(&output).unwrap();
+        let name = format!("{prefix}.absorbed.angular");
+        let value = &figures.iter().find(|(n, _)| *n == name).unwrap().1;
+        let expected = printed.parse::<f64>().unwrap();
+        assert_eq!(value.parse::<f64>().unwrap().to_bits(), expected.to_bits(), "{value}");
+        assert_eq!(json_value(value), serde_json::json!(expected));
+    }
+
+    /// Review r1 of spike-net-file, S1: the header said the server's region was `Simulated`
+    /// whatever the replay did. A replay that held it otherwise, or a prediction world over
+    /// the bound, fails the measurement and names its count.
+    #[test]
+    fn a_replay_outside_a_simulated_region_or_over_the_bound_fails() {
+        let (prefix, figures) = replay_figures(REPLAY_OUTPUT).unwrap();
+        let with = |key: &str, value: &str| {
+            let name = format!("{prefix}.{key}");
+            let mut changed = figures.clone();
+            changed.iter_mut().find(|(n, _)| *n == name).unwrap().1 = value.to_owned();
+            changed
+        };
+        let frozen = check_replay(&prefix, &with("server_frozen_ticks", "36000")).unwrap_err();
+        assert!(frozen.contains("36000 server frames") && frozen.contains(&prefix), "{frozen}");
+        assert_eq!(check_replay(&prefix, &with("prediction_fixed_and_proxies", "64")), Ok(64));
+        let over = check_replay(&prefix, &with("prediction_fixed_and_proxies", "65")).unwrap_err();
+        assert!(over.contains("held 65") && over.contains(&prefix), "{over}");
+        for key in ["server_frozen_ticks", "prediction_fixed_and_proxies"] {
+            let missing: Vec<_> =
+                figures.iter().filter(|(n, _)| !n.ends_with(key)).cloned().collect();
+            let error = check_replay(&prefix, &missing).unwrap_err();
+            assert!(error.contains(key), "{error}");
+            let error = check_replay(&prefix, &with(key, "-1")).unwrap_err();
+            assert!(error.contains(key), "{error}");
+        }
+    }
+
     #[test]
     fn a_figure_line_that_does_not_read_is_an_error() {
         for line in ["measure: t1_us", "measure: t1_us   ", "measure:  1.5", "measure: "] {
@@ -1564,7 +1686,8 @@ mod tests {
         \"absorbed\":{\"fields\":1235914,\"translation\":1.998241455073213e-3,\"angular\":1.99995710109393e-2},\
         \"rollback_us_per_tick\":{\"median\":550.9,\"worst\":16981.9,\"rollbacks\":7935},\
         \"departure_tick\":null,\"mismatches_per_cycle\":[3, 49, 5],\
-        \"yaw_error_rad_per_tick\":{\"mean\":-0e0,\"worst\":0e0}}\n\
+        \"yaw_error_rad_per_tick\":{\"mean\":-0e0,\"worst\":0e0},\
+        \"server_frozen_ticks\":0,\"prediction_fixed_and_proxies\":12}\n\
         test ten_minutes_of_fifty_thrown_bodies_with_the_clock_script ... ok\n\n\
         test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 23 filtered out\n";
 
@@ -1586,7 +1709,8 @@ mod tests {
         assert_eq!(get("yaw_error_rad_per_tick.mean"), Some("-0.0"));
         assert_eq!(get("scene"), None);
         assert_eq!(get("clock_script"), None);
-        assert_eq!(figures.len(), 15);
+        assert_eq!(figures.len(), 17);
+        assert_eq!(check_replay(&prefix, &figures), Ok(12));
         assert!(figures.iter().all(|(name, _)| !name.contains(' ')), "{figures:?}");
         let header = Header { measurement: find("spike-net").unwrap(), ..sample_header() };
         let value: serde_json::Value = serde_json::from_str(&json(&header, &figures)).unwrap();
@@ -1655,17 +1779,6 @@ mod tests {
         };
         assert_eq!(scene(short[0]), scene(short[1]), "one scene: {short:?}");
         assert!(Run::SpikeReplays.cut_by_short());
-
-        // What `SPIKE_REGIONS` states: the server's one region loads `Simulated` under
-        // `Directed` control, and nothing changes its mode or loads another.
-        assert!(!source.contains("RegionMode::Frozen"), "no region loads `Frozen`");
-        assert_eq!(source.matches("mode: RegionMode::Simulated").count(), 1, "one bundle");
-        assert!(!source.contains(".modes") && !source.contains("modes:"), "no mode change");
-        assert!(source.contains("WorldConfig { layout, ..WorldConfig::headless() }"));
-        assert!(!source.contains("RegionControl"), "the headless config's control");
-        let headless = repository("crates/app/src/world.rs");
-        assert!(headless.contains("regions: RegionControl::Directed,"), "which is `Directed`");
-        assert_eq!(source.matches("input.loaded.insert(").count(), 1, "one region loads");
 
         let body = source.split("fn measure(").nth(1).unwrap().split("\n}\n").next().unwrap();
         assert!(
