@@ -1,0 +1,38 @@
+{
+  "arch": "aarch64",
+  "command": "cargo xtask measure --all",
+  "commit": "bef3455b4a56",
+  "cpu": "Apple M1",
+  "date": "2026-11-15",
+  "figures": {
+    "bodies": 2000,
+    "frame_workers": 4,
+    "phase_us": 1954.3,
+    "plain_rows": 47999,
+    "rows": 100000,
+    "server_step_us": 2027.6,
+    "solver_threads": 3,
+    "statics": 50001,
+    "step_us": 985.4,
+    "sync_us": 554.3,
+    "ticks": 60,
+    "warm_up_ticks": 30,
+    "write_back_us": 419.0
+  },
+  "load": {
+    "load_average_after": "1.43 2.09 3.71",
+    "load_average_before": "1.43 2.09 3.71"
+  },
+  "machine": "apple-m1",
+  "measurement": "physics-phase",
+  "notes": {},
+  "os": "macos 14.7.4",
+  "profile": "release",
+  "ran": "cargo nextest run --locked --cargo-profile release --package lactose-app --test cost --run-ignored only --no-capture --no-tests=fail -E 'test(=cost_of_the_physics_phase_at_100k_rows)'",
+  "short": false,
+  "topology": {
+    "efficiency": 4,
+    "performance": 4
+  },
+  "workers": "4"
+}
