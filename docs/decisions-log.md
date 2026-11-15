@@ -6031,6 +6031,30 @@ relayed by an event when it acts on another body** (§6.1, §10, `lactose-ecs`,
   D119's "hashing the snapshot bytes" among its deferred items, as a join. D119's "until then
   the property is unproven, not excused" for the sites this entry accepts; for the sign of zero
   in SIMD `min` and `max` it stands.
+- Addendum (lane physics-records, 2026-11-16; review rounds 1 and 2): built as decided, in tests
+  alone. Eight of the nine recording tests that step Rapier open a second recorder named
+  `<test>::physics`; `the_conformance_run` keeps its one value. `lactose-physics-rapier`'s
+  server, prediction and hinge scenes and the headless run record `PhysicsSnapshot::hash` of the
+  world they step after every tick, the prediction scene its re-simulated ticks again. The
+  spike's four record one value per frame, as the plan's row asks, not a stream per world at
+  every tick: xxh64 with seed zero of the server world's snapshot hash then the prediction
+  world's once the client exists, each as eight little-endian bytes; the prediction world's
+  other ticks within a frame are not recorded, and a divergence names the frame, not the world.
+  A test that steps only `lactose-physics-api`'s test backend records none: its bytes are a
+  function of its rows. Under a chaos seed each stream writes the test's one execution log under
+  its own name; the ten-minute replays compute no physics hash; the harness protocol needed no
+  change. `sour run` checks only that listed names record and recording names are listed, so
+  `tools/xtask/ci-policy.toml` states the rule beside the eight names: a recording test that
+  steps Rapier records and lists its `::physics` stream in the same commit. Every line the
+  existing names record stayed byte-identical (11,019 lines), the spike's digest over its four
+  world streams (7,200 lines), b6a4efa4db9780a4, among them. The whole `lactose_app::spike::`
+  prefix now digests to 154cd02de43ac688 (14,400 lines); the four world streams are the prefix's
+  names not ending in `::physics`. A sleep-counter mutation at tick 60, which moves no row at
+  that tick, failed every physics stream at tick 60 (the spike's at frame 55); only the server
+  and prediction scenes' world streams differed, from tick 65, and no spike frame record. The
+  streams add about 0.7 to 1.3 s of test time a launch (the lane's and the review's measures,
+  Apple M1, load averages 7.6 to 11.4), most of it the thrown scene, below the proposal's
+  trigger of 3 s a launch (`docs/plans/physics-evidence-proposal.md`, section 3.5).
 
 **D146. The simulation scalar is 64-bit: 32 bits fails the precision half of section 16's rule at x = 6 km, and the 32-bit branch is not built** (§2 World coordinates, §16, §22, `lactose-math`, `lactose-anim`, `lactose-physics-api`, `lactose-predict`, `lactose-sim`, `docs/plans/milestone-1.md`)
 - Why: section 16 adopted 32 bits only if positional error at the map edge stayed under one

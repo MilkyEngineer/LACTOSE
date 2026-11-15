@@ -34,7 +34,10 @@ packages = ["lactose-app-headless"]
 # `tests` names every test that records hashes, as it records them. `cargo xtask sour run`
 # fails if a recording test is missing from it, or if a listed test did not record: renamed,
 # ignored, deleted or filtered out. A branch that adds, renames or removes a recording test
-# edits this list in the same commit.
+# edits this list in the same commit. A name ending in `::physics` is the stream of
+# `PhysicsSnapshot::hash` that the test named without that suffix records beside its world
+# hash (D145). A recording test that steps Rapier records and lists its `::physics` stream in
+# the same commit; `the_conformance_run` alone records none (D145).
 [harness]
 packages = [
   "lactose-sim", "lactose-ecs", "lactose-physics-api", "lactose-input", "lactose-physics-rapier",
@@ -45,10 +48,15 @@ tests = [
   "lactose_anim::sour::a_prediction_crowd_with_a_rollback",
   "lactose_anim::sour::a_server_crowd_with_ragdolls",
   "lactose_app::headless::a_recorded_headless_run",
+  "lactose_app::headless::a_recorded_headless_run::physics",
   "lactose_app::spike::a_claim_in_contact_is_recorded",
+  "lactose_app::spike::a_claim_in_contact_is_recorded::physics",
   "lactose_app::spike::a_dynamic_capsule_is_recorded",
+  "lactose_app::spike::a_dynamic_capsule_is_recorded::physics",
   "lactose_app::spike::a_kinematic_character_is_recorded",
+  "lactose_app::spike::a_kinematic_character_is_recorded::physics",
   "lactose_app::spike::fifty_thrown_bodies_are_recorded",
+  "lactose_app::spike::fifty_thrown_bodies_are_recorded::physics",
   "lactose_input::sour::the_prediction_program_with_a_rollback",
   "lactose_input::sour::the_server_program",
   "lactose_net_api::sour::a_scene_replicated_to_a_client",
@@ -63,8 +71,11 @@ tests = [
   "lactose_physics_api::sour::a_prediction_scene_with_a_rollback",
   "lactose_physics_api::sour::a_server_scene",
   "lactose_physics_rapier::sour::a_limited_hinge_driven_against_its_limits",
+  "lactose_physics_rapier::sour::a_limited_hinge_driven_against_its_limits::physics",
   "lactose_physics_rapier::sour::a_prediction_scene_with_a_rollback",
+  "lactose_physics_rapier::sour::a_prediction_scene_with_a_rollback::physics",
   "lactose_physics_rapier::sour::a_server_scene",
+  "lactose_physics_rapier::sour::a_server_scene::physics",
   "lactose_physics_rapier::sour::the_conformance_run",
   "lactose_predict::sour::a_prediction_scene_with_corrections_and_substitutions",
   "lactose_sim::cost::scene",

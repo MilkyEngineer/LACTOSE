@@ -14,10 +14,12 @@
 //! fifty claimed dynamic bodies thrown and interacting, and a claim of a crate the
 //! character pushes and of a stack it bumps. Each runs under SOUR as a recording test,
 //! which records after every tick a hash of both worlds and of every datagram either end
-//! sent that frame. The ignored measurement tests replay each scene to 36,000 ticks in
-//! release, with the clock script and on the server's clock, and print the figures of each
-//! run as one JSON object; one more, not recorded, measures a claim made on approach,
-//! before the character touches the crate.
+//! sent that frame and, as a stream of its own named as the test with `::physics` appended,
+//! a hash of both worlds' physics bytes (D145). The ignored measurement tests replay each
+//! scene to 36,000 ticks in release, with the clock script and on the server's clock,
+//! computing no physics hash, and print the figures of each run as one JSON object; one
+//! more, not recorded, measures a claim made on approach, before the character touches the
+//! crate.
 //!
 //! The seeds of the link and of the clock script are the test's, outside both worlds.
 //! Inside them every reference, ordering rule and RNG key is a `StableKey`.
@@ -78,7 +80,7 @@ use lactose_net_host::transport::{
 };
 use lactose_net_host::{ClockEstimate, InterpolationBuffer};
 use lactose_physics_api::{
-    BodyType, Collider, RigidBody, Shape, Teleported, Transform, Velocity, locked_axes,
+    BodyType, Collider, RigidBody, Shape, Teleported, Transform, Velocity, locked_axes, snapshot,
 };
 use lactose_predict::{CorrectionCause, PredictionStats, PredictionTolerance, SlotBytes};
 use lactose_reflect::{Persistence, Reflect, TypeInfo, TypeRole, component};
@@ -2018,6 +2020,9 @@ enum Observed<'a> {
     Server(&'a World),
     /// The client's prediction world, once built.
     Client(&'a World),
+    /// Both worlds at the end of a frame, before its record: the server's, and the client's
+    /// prediction world once it is built.
+    Worlds { tick: Tick, server: &'a World, client: Option<&'a World> },
     /// The record of a frame.
     Record(Tick, u64),
     /// The run's end, the client still running: an observer may take the client to run
@@ -2411,6 +2416,10 @@ fn run(
             outcome.key_counts.push(expected.len());
         }
 
+        let client = end.as_ref().map(|end| end.client().predictor().simulation().world());
+        let server_world = server.as_ref().expect("held").simulation().world();
+        observe(Observed::Worlds { tick: Tick(n), server: server_world, client })?;
+
         // The record: both worlds and every datagram either end sent this frame.
         let mut bytes = Vec::with_capacity(64);
         bytes.extend_from_slice(&server_hash.to_le_bytes());
@@ -2699,19 +2708,43 @@ fn chaos(seed: u64) -> ChaosConfig {
     ChaosConfig { seed, shuffle_steals: true, inject_yields: true, force_split: true, record: true }
 }
 
-/// Records `scene` under the runner's session: the server world's applied line and its
-/// records, the client world's applied line once it is built, the chaos log at the end.
+/// One value per frame over the physics bytes of both worlds: `PhysicsSnapshot::hash` of the
+/// server's world, then of the prediction world once the client is built. Recorded beside
+/// the frame's record, never folded into it (D145): the two solvers never agree (architecture
+/// section 16), where the rows the record hashes may.
+fn physics_hash(server: &World, client: Option<&World>) -> Result<u64> {
+    let mut bytes = Vec::with_capacity(16);
+    bytes.extend_from_slice(&snapshot(server)?.hash().to_le_bytes());
+    if let Some(client) = client {
+        bytes.extend_from_slice(&snapshot(client)?.hash().to_le_bytes());
+    }
+    Ok(xxh64(&bytes, 0))
+}
+
+/// Records `scene` under the runner's session, as two streams: the frame's records under
+/// `test` and the physics hash of each frame under `test` with `::physics` appended. Each
+/// stream writes the server world's applied line and its records, the client world's applied
+/// line once it is built, and the chaos log at the end.
 fn recorded(scene: Scene, test: &str) {
     let runner = RunnerSession::from_env().unwrap();
-    let mut recorder = None;
+    let physics_test = format!("{test}::physics");
+    let mut recorders = None;
     let mut observe = |observed: Observed<'_>| -> Result<()> {
         match observed {
-            Observed::Server(world) => recorder = Some(runner.recorder(test, world)?),
+            Observed::Server(world) => {
+                let records = runner.recorder(test, world)?;
+                recorders = Some((records, runner.recorder(&physics_test, world)?));
+            }
             Observed::Client(world) => {
                 runner.recorder(test, world)?;
+                runner.recorder(&physics_test, world)?;
+            }
+            Observed::Worlds { tick, server, client } => {
+                let (_, physics) = recorders.as_mut().expect("opened with the server");
+                physics.record(tick.0, physics_hash(server, client)?).map_err(protocol_error)?;
             }
             Observed::Record(tick, hash) => {
-                let recorder = recorder.as_mut().expect("opened with the server");
+                let (recorder, _) = recorders.as_mut().expect("opened with the server");
                 recorder.record(tick.0, hash).map_err(protocol_error)?;
             }
             Observed::Ended { .. } => {}
@@ -2722,7 +2755,13 @@ fn recorded(scene: Scene, test: &str) {
     let outcome = run(&runner.executor, runner.layout, plan, &mut observe).unwrap();
     check_outcome(plan, &outcome);
     if let Some(log) = runner.executor.execution_log() {
-        runner.session.write_execution_log(test, log.as_bytes()).map_err(protocol_error).unwrap();
+        for name in [test, &physics_test] {
+            runner
+                .session
+                .write_execution_log(name, log.as_bytes())
+                .map_err(protocol_error)
+                .unwrap();
+        }
     }
 }
 

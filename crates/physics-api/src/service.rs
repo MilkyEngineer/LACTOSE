@@ -322,9 +322,9 @@ impl PhysicsSnapshot {
     }
 
     /// `xxh64` of the bytes the backend would write of the world this snapshot holds, with
-    /// seed zero, at the cost [`size_in_bytes`](Self::size_in_bytes) states: the place
-    /// where architecture section 8.3 adds the physics world to the world hash, which does
-    /// not include it yet. The backend's serialisation was shown order-stable in
+    /// seed zero, at the cost [`size_in_bytes`](Self::size_in_bytes) states: what a
+    /// recording test records beside the world hash and never folds into it (architecture
+    /// section 8.3, D145). The backend's serialisation was shown order-stable in
     /// nightly 43703297881 (`docs/verification.md`); SOUR records the hash after the
     /// conformance run (`lactose-physics-rapier`'s `the_conformance_run`).
     #[must_use]
