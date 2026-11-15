@@ -36,7 +36,8 @@ packages = ["lactose-app-headless"]
 # ignored, deleted or filtered out. A branch that adds, renames or removes a recording test
 # edits this list in the same commit. A name ending in `::physics` is the stream of
 # `PhysicsSnapshot::hash` that the test named without that suffix records beside its world
-# hash (D145).
+# hash (D145). A recording test that steps Rapier records and lists its `::physics` stream in
+# the same commit; `the_conformance_run` alone records none (D145).
 [harness]
 packages = [
   "lactose-sim", "lactose-ecs", "lactose-physics-api", "lactose-input", "lactose-physics-rapier",
