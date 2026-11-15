@@ -93,12 +93,12 @@ The thrown scene alone has scripted link faults (`Faults::window` in
 implemented (D122 addendum)"). On a link without an outage the deepest correction is 9 ticks.
 
 **Row 41's reading** is in the probe's file and in the row "Rapier's 64-bit build uses SIMD
-after its glam migration". The contact solver is SIMD in both precisions. In 64 bits its kernel is
-`wide::f64x4`: two lanes per NEON instruction on aarch64, where 32 bits would run four, and
-one `ymm` of four lanes on x86-64-v3. A 32-bit build runs four lanes there too, since
-`rapier3d` refuses `simd8` beside `enhanced-determinism` (its `src/lib.rs`) and parry then
-selects `WideF32x4` (`parry3d` 0.31.1, `src/lib.rs`). The glam-based code examined is scalar
-f64. The substep integration was not isolated.
+after its glam migration". The contact solver is SIMD in both precisions. In 64 bits its
+kernel is `wide::f64x4`: two lanes per NEON instruction on aarch64, where 32 bits would run
+four, and one `ymm` of four lanes on x86-64-v3. A 32-bit build runs four lanes there too,
+since `rapier3d` refuses `simd8` beside `enhanced-determinism` (its `src/lib.rs`) and parry
+then selects `WideF32x4` (`parry3d` 0.31.1, `src/lib.rs`). The glam-based code examined is
+scalar f64. The substep integration was not isolated.
 
 **An extra x86 data point.** The laptop's files at `bef3455` (an i7-12650H on Windows 11, with
 other work on the machine) give 10,953.5 µs for the seven-tick rollback, with the slot still
@@ -136,10 +136,10 @@ are (D119, D128); they cost nothing and no test of them is removed.
 **The decision is read at 6 km from the origin, and it sets no map extent.** No document
 states the map's extent. D59's "±6 km" is the nearest figure, and decision 5.4 names it. The
 distance is a coordinate's: (6000, 0, 6000) is the corner of a map twelve kilometres across.
-The plan's second distance, 8 km, was not read: the probe's first run included it and its control
-failed, and the second run took 12 km in its place. 8 km lies in 6 km's binade, [4,096,
-8,192) m, where a 32-bit position has the same 0.49 mm spacing, and 12 km lies past the
-boundary. So the evidence reaches this far:
+The plan's second distance, 8 km, was not read: the probe's first run included it and its
+control failed, and the second run took 12 km in its place. 8 km lies in 6 km's binade,
+[4,096, 8,192) m, where a 32-bit position has the same 0.49 mm spacing, and 12 km lies past
+the boundary. So the evidence reaches this far:
 
 - 32 bits exceeds the millimetre at every distance measured from 1,024 m up: at 1,024 m on
   the straight walk, within its first two seconds, and at 6 km and 12 km on both walks. At
