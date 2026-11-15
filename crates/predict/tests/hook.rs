@@ -5,10 +5,13 @@
 
 mod common;
 
+use std::collections::BTreeSet;
+
 use common::*;
-use lactose_core::{NetId, PlayerId, StableKey, Tick};
-use lactose_ecs::{RegionId, World};
-use lactose_input::player_entity;
+use lactose_bundle::{BaselineRow, ComponentData};
+use lactose_core::{ComponentKey, EntityRef, NetId, PlayerId, StableKey, Tick};
+use lactose_ecs::{LayoutConfig, OwnedBy, RegionId, World};
+use lactose_input::{PlayerInput, player_entity};
 use lactose_net_api::{RemoteSlot, StagedFrame, Tombstone, TombstoneCause};
 use lactose_predict::{CorrectionCause, LocalPlayer, StagedRegion};
 use lactose_reflect::Reflect;
@@ -629,4 +632,286 @@ fn a_hook_replaced_through_simulation_mut_fails_the_next_step_with_the_predictor
     // `resync` reinstalls the hook.
     rig.p_mut().resync(Tick(13)).unwrap();
     rig.step(walking(14));
+}
+
+// ---- One entity per entry, and what a row built from the stream has (D141) ----
+
+/// A region no other test here uses: a document's.
+const DOCUMENT: RegionId = RegionId(6);
+
+fn owner() -> StableKey {
+    StableKey::Net(NetId::cooked(80))
+}
+
+fn item() -> StableKey {
+    StableKey::Net(NetId::cooked(81))
+}
+
+fn owner_of(world: &World, key: StableKey) -> Option<StableKey> {
+    world.get::<OwnedBy>(key).and_then(|owned| owned.owner.get())
+}
+
+/// A region document placing, in [`DOCUMENT`], an owner and an item it owns, both proxies:
+/// the prediction world's edge is the document's, older than anything the server did since.
+fn owned_document(rig: &mut Rig) {
+    let owner_row =
+        BaselineRow { id: NetId::cooked(80), components: vec![data(at(1, 1)), data(Health(1))] };
+    let owned = OwnedBy { owner: EntityRef::new(owner()) };
+    let components = vec![data(at(2, 2)), data(Health(2)), data(Diary(5)), data(owned)];
+    let item_row = BaselineRow { id: NetId::cooked(81), components };
+    place_document(rig.world_mut(), DOCUMENT, vec![owner_row, item_row]);
+    assert_eq!(owner_of(rig.world(), item()), Some(owner()));
+}
+
+/// The item as the document gave it: its region, position, health and unreplicated diary.
+fn item_state(world: &World) -> Option<(RegionId, Position, Health, Diary)> {
+    Some((
+        world.region_of(item())?,
+        *world.get::<Position>(item())?,
+        *world.get::<Health>(item())?,
+        *world.get::<Diary>(item())?,
+    ))
+}
+
+/// The server released the item, which no frame carries (a release of an edge is no entry
+/// of the log), and then destroyed the owner: the one tombstone is the owner's. The hook
+/// despawns the owner alone, so the item stays with what the document gave it and the
+/// server's next row of it is written; a rollback through the tombstone's tick re-applies
+/// the same, hash for hash. The cascading despawn took the item, and its row was skipped.
+#[test]
+fn a_released_item_survives_its_former_owners_tombstone() {
+    let mut rig = Rig::joined();
+    rig.step_to(12, walking);
+    owned_document(&mut rig);
+    rig.step(walking(13));
+    rig.step(looking(14));
+    let mut frame = StagedFrame::new(Tick(14));
+    let destroyed =
+        Tombstone { region: DOCUMENT, tick: Tick(14), cause: TombstoneCause::Destroyed };
+    frame.despawns.insert(owner(), destroyed);
+    rig.push(frame);
+    rig.step(walking(15));
+    assert!(!rig.world().contains(owner()));
+    assert_eq!(item_state(rig.world()), Some((DOCUMENT, at(2, 2), Health(2), Diary(5))));
+    assert!(rig.reconcile().corrections.is_empty());
+    let mut frame = StagedFrame::new(Tick(15));
+    dequantised(&mut frame, item(), &at(9, 9));
+    rig.push(frame);
+    rig.step(walking(16));
+    assert_eq!(item_state(rig.world()), Some((DOCUMENT, at(9, 9), Health(2), Diary(5))));
+    assert!(rig.reconcile().corrections.is_empty());
+
+    // A substitution of 14 by a sample that differs by its yaw alone rolls back to 13 and
+    // re-simulates the tombstone's frame and the row's, to the same world.
+    let mut frame = StagedFrame::new(Tick(16));
+    frame.substituted.insert(Tick(14));
+    rig.push(frame);
+    rig.step(walking(17));
+    let hash = rig.hash();
+    let reconciled = rig.reconcile();
+    assert_eq!(summaries(&reconciled)[0].0, Tick(13));
+    assert_eq!(reconciled.resimulated, 4);
+    assert_eq!(rig.hash(), hash, "the re-simulated world equals the straight run");
+    assert!(!rig.world().contains(owner()));
+    assert_eq!(item_state(rig.world()), Some((DOCUMENT, at(9, 9), Health(2), Diary(5))));
+}
+
+/// The same document; the server moves the owner into another loaded region, as a frame's
+/// move and, in a second run, as an upsert naming that region. The owner resides there,
+/// placed there; the item stays where the document put it, placed by no frame.
+#[test]
+fn a_released_item_stays_when_its_former_owner_moves() {
+    for upsert in [false, true] {
+        let mut rig = Rig::joined();
+        rig.step_to(12, walking);
+        owned_document(&mut rig);
+        rig.step(walking(13));
+        let mut frame = StagedFrame::new(Tick(13));
+        if upsert {
+            let spawn = remote(OTHER_REGION, 8, vec![data(at(1, 1)), data(Health(1))]);
+            frame.spawns.insert(NetId::cooked(80), spawn);
+        } else {
+            frame.moves.insert(owner(), OTHER_REGION);
+        }
+        rig.push(frame);
+        rig.step(walking(14));
+        let world = rig.world();
+        assert_eq!(world.region_of(owner()), Some(OTHER_REGION), "upsert {upsert}");
+        assert_eq!(placed(world, owner()), Some(OTHER_REGION), "upsert {upsert}");
+        assert_eq!(item_state(world), Some((DOCUMENT, at(2, 2), Health(2), Diary(5))));
+        assert_eq!(placed(world, item()), None, "upsert {upsert}");
+        assert!(rig.reconcile().corrections.is_empty());
+    }
+}
+
+/// Every unechoed predicted spawn of the local player, by input tick.
+fn balls_of(world: &World) -> Vec<StableKey> {
+    let mut balls: Vec<StableKey> =
+        world.claimed(PLAYER).filter(|key| matches!(key, StableKey::Predicted(_))).collect();
+    balls.sort_by_key(|key| match key {
+        StableKey::Predicted(predicted) => predicted.input_tick.0,
+        _ => unreachable!(),
+    });
+    balls
+}
+
+/// A predicted spawn the server never echoes, owning a proxy (an edge a predicted command
+/// wrote, written here as its apply would) and a second predicted spawn: the first goes
+/// alone when the acknowledgement passes its input tick, counted, the proxy stays, and the
+/// second goes at its own input tick.
+#[test]
+fn an_unechoed_spawn_is_despawned_alone() {
+    let mut rig = Rig::joined();
+    rig.step_to(12, walking);
+    rig.step(throwing());
+    rig.step(walking(14));
+    rig.step(throwing());
+    let balls = balls_of(rig.world());
+    let [first, second] = balls[..] else { panic!("two balls: {balls:?}") };
+    let owned = OwnedBy { owner: EntityRef::new(first) };
+    rig.world_mut().insert(proxy(), owned).unwrap();
+    rig.world_mut().insert(second, owned).unwrap();
+    let mut frame = StagedFrame::new(Tick(14));
+    frame.acked_input = Some(Tick(14));
+    rig.push(frame);
+    rig.step(walking(16));
+    let world = rig.world();
+    assert!(!world.contains(first));
+    assert!(world.contains(proxy()), "the server's proxy is not the client's to destroy");
+    assert!(world.contains(second), "its own input tick is not passed");
+    rig.reconcile();
+    assert_eq!(rig.p().stats().unechoed_spawns, 1);
+    let mut frame = StagedFrame::new(Tick(16));
+    frame.acked_input = Some(Tick(16));
+    rig.push(frame);
+    rig.step(walking(17));
+    assert!(!rig.world().contains(second));
+    assert!(rig.world().contains(proxy()));
+    rig.reconcile();
+    assert_eq!(rig.p().stats().unechoed_spawns, 2);
+}
+
+/// The stated transient components of `key`: `Aim`, with its value, which a hook never
+/// writes to a claimed entity, and whether it has `Stance`.
+fn transients(world: &World, key: StableKey) -> (Option<Aim>, bool) {
+    (world.get::<Aim>(key).copied(), world.get::<Stance>(key).is_some())
+}
+
+/// An unechoed predicted spawn despawned at the acknowledgement, then its echo after all,
+/// with a replicated transient component among its components and a statement naming an
+/// unreplicated one: spawned at once with both, zeroed, which the kernel that names them
+/// runs on; and again by the correction at the echo's tick.
+#[test]
+fn a_late_echo_carries_its_transient_components() {
+    let mut rig = Rig::joined();
+    rig.step_to(12, walking);
+    rig.step(throwing());
+    let ball = ball_of(rig.world()).expect("the throw spawned a predicted ball");
+    let StableKey::Predicted(predicted) = ball else { unreachable!() };
+    let mut frame = StagedFrame::new(Tick(14));
+    frame.acked_input = Some(Tick(14));
+    rig.push(frame);
+    rig.step(walking(14));
+    assert!(!rig.world().contains(ball));
+    rig.reconcile();
+    rig.step(walking(15));
+
+    // Popped at 16: the slot of its tick lacks the ball.
+    let mut frame = StagedFrame::new(Tick(15));
+    let echo = lactose_net_api::StagedSpawn {
+        origin: Some(predicted),
+        ..claimed(REGION, vec![data(Health(1)), data(Aim(7))])
+    };
+    frame.spawns.insert(net(40), echo);
+    frame.transient.insert(ball, [Stance::KEY].into());
+    rig.push(frame);
+    rig.step(walking(16));
+    assert_eq!(transients(rig.world(), ball), (Some(Aim(0)), true));
+    assert_eq!(braced(rig.world(), ball), 1, "the kernel ran on it in the tick");
+    let reconciled = rig.reconcile();
+    assert_eq!(summaries(&reconciled).len(), 1);
+    assert_eq!(reconciled.corrections[0].tick, Tick(15));
+    assert_eq!(transients(rig.world(), ball), (Some(Aim(0)), true));
+    assert_eq!(braced(rig.world(), ball), 2, "and in the re-simulated tick");
+}
+
+/// A frame stating the transient components of proxies, which it does not state claimed,
+/// in a delta frame and in a full frame: the world is as it is without the statements,
+/// hash for hash and byte for byte in the slot.
+#[test]
+fn a_proxy_gets_no_unreplicated_transient_component() {
+    let both = || -> BTreeSet<ComponentKey> { [Stance::KEY, Crouch::KEY].into() };
+    let lacks = |world: &World, of: StableKey| {
+        world.contains(of) && world.get::<Stance>(of).is_none() && world.get::<Crouch>(of).is_none()
+    };
+    let run = |stated: bool| {
+        let mut rig = Rig::joined();
+        rig.step_to(14, walking);
+        let mut frame = StagedFrame::new(Tick(14));
+        frame.spawns.insert(net(5), remote(REGION, 3, vec![data(at(1, 1)), data(Health(2))]));
+        dequantised(&mut frame, proxy(), &at(-40, 0));
+        if stated {
+            frame.transient.insert(key(5), both());
+            frame.transient.insert(proxy(), both());
+        }
+        rig.push(frame);
+        rig.step(walking(15));
+        assert!(lacks(rig.world(), key(5)) && lacks(rig.world(), proxy()));
+        let delta = (rig.hash(), rig.p().ring().slot_bytes(Tick(15)));
+        rig.step_to(20, walking);
+        let mut frame = join_frame(Tick(18));
+        if stated {
+            frame.transient.insert(proxy(), both());
+        }
+        rig.push(frame);
+        rig.step(walking(21));
+        assert!(lacks(rig.world(), proxy()));
+        let full = (rig.hash(), rig.p().ring().slot_bytes(Tick(21)));
+        (delta, full)
+    };
+    assert_eq!(run(true), run(false));
+}
+
+/// A full frame's claimed spawn and a delta frame's proxy spawn carrying a derived
+/// component and an unreplicated transient one as values, the proxy's with a placement of
+/// its own too: the row has none of them as the frame sent them, the rest of the spawn
+/// applied (`tests/logs.rs` holds what is logged).
+#[test]
+fn a_spawn_writes_replicated_components_alone() {
+    let sent = Trail { x: 999, updates: 77 };
+    let mut rig = Rig::new(simulation(LayoutConfig::default(), None), 1);
+    let mut frame = join_frame(JOIN);
+    let cart_spawn = frame.spawns.get_mut(&net(2)).expect("the cart");
+    cart_spawn.components.extend([data(sent), data(Stance(5))]);
+    cart_spawn.components.sort_by_key(|data| data.component);
+    rig.push(frame);
+    rig.step(PlayerInput::IDLE);
+    rig.reconcile();
+    let world = rig.world();
+    assert_eq!(world.get::<Health>(cart()), Some(&Health(10)));
+    assert_eq!(rig.position(cart()), Some(at(50, 0)));
+    assert_ne!(world.get::<Trail>(cart()), Some(&sent), "its own kernel's, not the frame's");
+    assert_eq!(world.get::<Stance>(cart()), None);
+
+    rig.step_to(14, walking);
+    // The placement of the proxy, which resides in `REGION`, sent with a spawn into
+    // `OTHER_REGION`.
+    let stale = world_placement(rig.world(), proxy());
+    let mut frame = StagedFrame::new(Tick(14));
+    let components = vec![data(at(1, 1)), data(Health(2)), data(sent), data(Stance(5)), stale];
+    frame.spawns.insert(net(5), remote(OTHER_REGION, 3, components));
+    rig.push(frame);
+    rig.step(walking(15));
+    let world = rig.world();
+    assert_eq!(world.get::<Health>(key(5)), Some(&Health(2)));
+    assert_eq!(rig.position(key(5)), Some(at(1, 1)));
+    assert_eq!(world.get::<Trail>(key(5)), None);
+    assert_eq!(world.get::<Stance>(key(5)), None);
+    assert_eq!(placed(world, key(5)), Some(OTHER_REGION), "the hook's placement, not the frame's");
+}
+
+/// `key`'s placement as a spawn's component.
+fn world_placement(world: &World, key: StableKey) -> ComponentData {
+    let bytes = world.get_erased(key, StagedRegion::KEY).expect("a placed proxy").to_vec();
+    ComponentData { component: StagedRegion::KEY, bytes }
 }

@@ -1,15 +1,20 @@
 //! Corrections: a frame's facts compared at their tick, the world restored there, the
 //! facts written stamped, and every later tick re-simulated, with the result equal to a
-//! run that had the server's rows from that tick on.
+//! run that had the server's rows from that tick on; each fact of the one entity it names,
+//! and an entity it writes left with the transient components its frame states (D141).
 
 #![forbid(unsafe_code)]
 
 mod common;
 
+use std::collections::BTreeSet;
+
 use common::*;
-use lactose_core::Tick;
-use lactose_ecs::LayoutConfig;
-use lactose_net_api::StagedFrame;
+use lactose_bundle::BaselineRow;
+use lactose_core::{ComponentKey, EntityRef, NetId, StableKey, Tick};
+use lactose_ecs::{LayoutConfig, OwnedBy, RegionId, StructuralChange, World};
+use lactose_input::PlayerInput;
+use lactose_net_api::{StagedFrame, Tombstone, TombstoneCause};
 use lactose_predict::{CorrectionCause, Divergence};
 use lactose_reflect::Reflect;
 use lactose_sim::StagedState;
@@ -354,4 +359,309 @@ impl StagedState for Inert {
     fn apply(&mut self, _: &mut lactose_ecs::World, _: Tick) -> lactose_core::Result<()> {
         Ok(())
     }
+}
+
+// ---- One entity per fact, and what a row built from the stream has (D141) ----
+
+/// A region no other test here uses: a document's.
+const DOCUMENT: RegionId = RegionId(6);
+
+fn owner() -> StableKey {
+    StableKey::Net(NetId::cooked(80))
+}
+
+fn item() -> StableKey {
+    StableKey::Net(NetId::cooked(81))
+}
+
+/// A region document placing, in [`DOCUMENT`], an owner and an item it owns, then a frame
+/// claiming the owner for the local player, applied by the hook at 14.
+fn claimed_owner() -> Rig {
+    let mut rig = Rig::joined();
+    rig.step_to(12, walking);
+    let owner_row =
+        BaselineRow { id: NetId::cooked(80), components: vec![data(at(1, 1)), data(Health(1))] };
+    let owned = OwnedBy { owner: EntityRef::new(owner()) };
+    let components = vec![data(at(2, 2)), data(Health(2)), data(Diary(5)), data(owned)];
+    let item_row = BaselineRow { id: NetId::cooked(81), components };
+    place_document(rig.world_mut(), DOCUMENT, vec![owner_row, item_row]);
+    rig.step(walking(13));
+    let mut frame = StagedFrame::new(Tick(13));
+    frame
+        .spawns
+        .insert(NetId::cooked(80), claimed(DOCUMENT, vec![data(at(1, 1)), data(Health(1))]));
+    rig.push(frame);
+    rig.step(walking(14));
+    rig.reconcile();
+    assert_eq!(claim(rig.world(), owner()), Some(PLAYER));
+    rig
+}
+
+/// The item as the document gave it.
+fn item_state(world: &World) -> Option<(RegionId, Position, Health, Diary)> {
+    Some((
+        world.region_of(item())?,
+        *world.get::<Position>(item())?,
+        *world.get::<Health>(item())?,
+        *world.get::<Diary>(item())?,
+    ))
+}
+
+/// A claimed owner with an item it owns by a document's edge, which the server released
+/// long ago. A tombstone fact of the owner, and in a second run a move fact: the correction
+/// despawns, or moves, the owner alone, and the item is where the document put it after
+/// the re-simulation.
+#[test]
+fn a_correction_takes_the_one_entity_its_fact_names() {
+    for tombstone in [true, false] {
+        let mut rig = claimed_owner();
+        rig.step_to(20, walking);
+        let mut frame = StagedFrame::new(Tick(16));
+        if tombstone {
+            let destroyed =
+                Tombstone { region: DOCUMENT, tick: Tick(16), cause: TombstoneCause::Destroyed };
+            frame.despawns.insert(owner(), destroyed);
+        } else {
+            frame.moves.insert(owner(), OTHER_REGION);
+        }
+        rig.push(frame);
+        rig.step(walking(21));
+        let reconciled = rig.reconcile();
+        assert_eq!(summaries(&reconciled).len(), 1, "{:?}", summaries(&reconciled));
+        assert_eq!(reconciled.corrections[0].tick, Tick(16));
+        assert_eq!(reconciled.corrections[0].entities, vec![owner()]);
+        let world = rig.world();
+        let owner_region = if tombstone { None } else { Some(OTHER_REGION) };
+        assert_eq!(world.region_of(owner()), owner_region, "tombstone {tombstone}");
+        assert_eq!(item_state(world), Some((DOCUMENT, at(2, 2), Health(2), Diary(5))));
+    }
+}
+
+/// `key`'s transient components: `Aim`, with its value, and whether it has `Stance` and
+/// `Crouch`.
+fn transients(world: &World, key: StableKey) -> (Option<Aim>, bool, bool) {
+    (
+        world.get::<Aim>(key).copied(),
+        world.get::<Stance>(key).is_some(),
+        world.get::<Crouch>(key).is_some(),
+    )
+}
+
+/// The cart, which the prediction world despawned too early, re-spawned by a frame's exact
+/// rows, `Aim` among them, with the frame's statement naming `Stance`: both present,
+/// zeroed, and `test::brace`, which names both, runs on it in every re-simulated tick.
+#[test]
+fn a_respawn_from_exact_rows_carries_its_transient_components() {
+    let mut rig = Rig::joined();
+    rig.step_to(12, walking);
+    rig.world_mut().despawn_alone(cart()).unwrap();
+    rig.step_to(20, walking);
+    let mut frame = StagedFrame::new(Tick(16));
+    exact(&mut frame, cart(), &at(50, 0));
+    exact(&mut frame, cart(), &Health(4));
+    exact(&mut frame, cart(), &Aim(9));
+    frame.transient.insert(cart(), [Stance::KEY].into());
+    rig.push(frame);
+    rig.step(walking(21));
+    let reconciled = rig.reconcile();
+    assert_eq!(summaries(&reconciled).len(), 1, "{:?}", summaries(&reconciled));
+    assert_eq!(reconciled.corrections[0].tick, Tick(16));
+    let world = rig.world();
+    assert_eq!(world.get::<Health>(cart()), Some(&Health(4)));
+    assert_eq!(transients(world, cart()), (Some(Aim(0)), true, false));
+    assert_eq!(reconciled.resimulated, 5);
+    assert_eq!(braced(world, cart()), 5, "once in each re-simulated tick");
+}
+
+/// Every addition and removal of `Stance`, `Crouch` and `Aim` on `key` the log of `world`
+/// holds, in its order.
+fn presence_log(world: &World, key: StableKey) -> Vec<(ComponentKey, bool)> {
+    let ruled = [Stance::KEY, Crouch::KEY, Aim::KEY];
+    let log = world.structural_log();
+    let entries = log.since(&mut log.cursor_at_start()).expect("a cursor at the start");
+    entries
+        .filter_map(|entry| match entry.change {
+            StructuralChange::Added { key: of, component } if of == key => Some((component, true)),
+            StructuralChange::Removed { key: of, component } if of == key => {
+                Some((component, false))
+            }
+            _ => None,
+        })
+        .filter(|(component, _)| ruled.contains(component))
+        .collect()
+}
+
+/// The bytes of the local player's `PlayerInput`.
+fn input_bytes(world: &World) -> Vec<u8> {
+    world.get_erased(me(), PlayerInput::KEY).expect("the applier writes it").to_vec()
+}
+
+/// The local player's entity given `Crouch` and `Aim` at 15 (a prediction system's
+/// mistake, written directly), then a frame at 18 whose exact rows differ from what was
+/// predicted, popped at 21, and stating `statement` beside them. Returns the rig after the
+/// reconcile, the presence changes the correction made and the bytes of `PlayerInput`.
+fn stated_at_18(
+    layout: LayoutConfig,
+    workers: u32,
+    statement: Option<BTreeSet<ComponentKey>>,
+) -> (Rig, Vec<(ComponentKey, bool)>, Vec<u8>) {
+    let mut rig = Rig::joined_with(layout, workers);
+    rig.step_to(15, walking);
+    rig.world_mut().insert(me(), Crouch(3)).unwrap();
+    rig.world_mut().insert(me(), Aim(4)).unwrap();
+    rig.step_to(20, walking);
+    let mut frame = StagedFrame::new(Tick(18));
+    exact(&mut frame, me(), &at(100, 0));
+    if let Some(statement) = statement {
+        frame.transient.insert(me(), statement);
+    }
+    rig.push(frame);
+    rig.step(walking(21));
+    let reconciled = rig.reconcile();
+    assert_eq!(summaries(&reconciled).len(), 1, "{:?}", summaries(&reconciled));
+    assert_eq!(reconciled.corrections[0].tick, Tick(18));
+    let log = presence_log(rig.world(), me());
+    let bytes = input_bytes(rig.world());
+    (rig, log, bytes)
+}
+
+/// A statement names presence, never a value, and is exact: the local player's
+/// `PlayerInput`, written by the applier before the hook, has the same bytes after a full
+/// frame's upsert and after a correction whose statement names it as in a run whose frames
+/// state nothing; an unreplicated transient component the statement does not name is
+/// removed and one named and absent inserted zeroed, in ascending key order, under every
+/// layout; with no statement none is removed; a replicated one the exact rows do not name
+/// is removed either way; a key that is not a transient unreplicated component is skipped;
+/// and a release leaves every transient component as it is.
+#[test]
+fn a_statement_is_exact_and_writes_no_value() {
+    let named = || -> BTreeSet<ComponentKey> {
+        // `Health` is persistent and `Aim` replicated: neither a statement's to name.
+        [Stance::KEY, PlayerInput::KEY, Health::KEY, Aim::KEY].into()
+    };
+    let mut expected = vec![(Crouch::KEY, false), (Stance::KEY, true), (Aim::KEY, false)];
+    expected.sort_by_key(|&(component, _)| component);
+    let mut hashes = Vec::new();
+    for (layout, workers) in layouts() {
+        let (rig, log, bytes) = stated_at_18(layout, workers, Some(named()));
+        let (_, _, unstated) = stated_at_18(layout, workers, None);
+        assert_eq!(log, expected, "the corrected slot's changes, then none re-simulated");
+        assert_eq!(bytes, unstated, "the statement wrote no value of `PlayerInput`");
+        assert_ne!(bytes, vec![0; bytes.len()], "a sample of a walk, not zeroed");
+        let world = rig.world();
+        assert_eq!(transients(world, me()), (None, true, false));
+        assert_eq!(world.get::<Health>(me()), None, "a persistent key is skipped");
+        hashes.push(rig.hash());
+    }
+    assert!(hashes.windows(2).all(|pair| pair[0] == pair[1]));
+
+    // No statement: the unreplicated one stays, the replicated one the rows do not name
+    // goes.
+    let (rig, log, _) = stated_at_18(LayoutConfig::default(), 1, None);
+    assert_eq!(log, vec![(Aim::KEY, false)]);
+    assert_eq!(transients(rig.world(), me()), (None, false, true));
+
+    // A full frame's upsert of the local player with a statement naming `PlayerInput`.
+    let full = |stated: bool| {
+        let mut rig = Rig::joined();
+        rig.step_to(20, walking);
+        let mut frame = join_frame(Tick(20));
+        if stated {
+            frame.transient.insert(me(), [PlayerInput::KEY].into());
+        }
+        rig.push(frame);
+        rig.step(walking(21));
+        input_bytes(rig.world())
+    };
+    assert_eq!(full(true), full(false));
+
+    // A release leaves the cart's transient components.
+    let mut rig = Rig::joined();
+    rig.step_to(15, walking);
+    rig.world_mut().insert(cart(), Stance(1)).unwrap();
+    rig.world_mut().insert(cart(), Crouch(1)).unwrap();
+    rig.world_mut().insert(cart(), Aim(1)).unwrap();
+    rig.step_to(20, walking);
+    let mut frame = StagedFrame::new(Tick(17));
+    frame.spawns.insert(net(2), remote(REGION, 1, vec![data(at(50, 0)), data(Health(10))]));
+    frame.transient.insert(cart(), BTreeSet::new());
+    rig.push(frame);
+    rig.step(walking(21));
+    let reconciled = rig.reconcile();
+    assert_eq!(reconciled.corrections.len(), 1);
+    assert_eq!(claim(rig.world(), cart()), None);
+    assert_eq!(transients(rig.world(), cart()), (Some(Aim(0)), true, true));
+}
+
+/// A frame whose statement differs from the cart only in presence makes no correction and
+/// re-simulates nothing, nor does any later delta frame that differs only so: a
+/// `[server]`-only presence change is not followed until a full frame, or a correction
+/// something recorded causes. The next frame with a component that differs makes one,
+/// after which the cart has the stated component; and in a second run a full frame alone,
+/// with nothing recorded differing, leaves the cart with it.
+#[test]
+fn a_difference_in_presence_alone_is_no_correction_point() {
+    let mut rig = Rig::joined();
+    rig.step_to(20, walking);
+    for (tick, health) in [(16, 10), (17, 10), (18, 3)] {
+        let mut frame = StagedFrame::new(Tick(tick));
+        exact(&mut frame, cart(), &at(50, 0));
+        exact(&mut frame, cart(), &Health(health));
+        frame.transient.insert(cart(), [Stance::KEY].into());
+        rig.push(frame);
+        rig.step(walking(tick + 5));
+        let reconciled = rig.reconcile();
+        if health == 10 {
+            assert!(reconciled.corrections.is_empty(), "{:?}", summaries(&reconciled));
+            assert_eq!(reconciled.resimulated, 0);
+            assert_eq!(transients(rig.world(), cart()), (None, false, false));
+        } else {
+            assert_eq!(summaries(&reconciled).len(), 1, "{:?}", summaries(&reconciled));
+            assert_eq!(reconciled.corrections[0].tick, Tick(18));
+            assert_eq!(transients(rig.world(), cart()), (None, true, false));
+        }
+    }
+    assert_eq!(rig.p().stats().corrections, 1);
+
+    let mut rig = Rig::joined();
+    rig.step_to(20, walking);
+    let mut frame = join_frame(Tick(20));
+    frame.transient.insert(cart(), [Stance::KEY].into());
+    rig.push(frame);
+    rig.step(walking(21));
+    assert_eq!(transients(rig.world(), cart()), (None, true, false));
+}
+
+/// The test game adds `Trail` with its `Without<Trail>` kernel, from `Position`: the cart a
+/// correction re-spawns at the present has no `Trail` in the corrected slot and has it,
+/// equal to its corrected position, after the next tick; the `Changed<Position>` cache
+/// follows the server's later moves (`tests/check.rs` holds that the check passes it).
+#[test]
+fn a_derived_component_is_added_by_its_system() {
+    let mut rig = Rig::joined();
+    rig.step_to(12, walking);
+    assert_eq!(rig.world().get::<Trail>(cart()).map(|trail| trail.x), Some(50));
+    rig.world_mut().despawn_alone(cart()).unwrap();
+    rig.step_to(20, walking);
+    let mut frame = StagedFrame::new(Tick(21));
+    exact(&mut frame, cart(), &at(60, 0));
+    exact(&mut frame, cart(), &Health(4));
+    rig.push(frame);
+    rig.step(walking(21));
+    let reconciled = rig.reconcile();
+    assert_eq!(summaries(&reconciled).len(), 1, "{:?}", summaries(&reconciled));
+    assert_eq!((reconciled.corrections[0].tick, reconciled.resimulated), (Tick(21), 0));
+    assert_eq!(rig.position(cart()), Some(at(60, 0)));
+    assert_eq!(rig.world().get::<Trail>(cart()), None, "never sent, not yet added");
+    rig.step(walking(22));
+    assert_eq!(rig.world().get::<Trail>(cart()).map(|trail| trail.x), Some(60));
+
+    let mut frame = StagedFrame::new(Tick(22));
+    exact(&mut frame, cart(), &at(70, 0));
+    exact(&mut frame, cart(), &Health(4));
+    rig.push(frame);
+    rig.step(walking(23));
+    let reconciled = rig.reconcile();
+    assert_eq!(reconciled.corrections[0].tick, Tick(22));
+    assert_eq!(rig.world().get::<Trail>(cart()).map(|trail| trail.x), Some(70));
 }

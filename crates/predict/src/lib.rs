@@ -95,6 +95,7 @@ mod compare;
 mod fact;
 mod hook;
 mod predictor;
+mod presence;
 mod reconcile;
 mod ring;
 mod staged_region;

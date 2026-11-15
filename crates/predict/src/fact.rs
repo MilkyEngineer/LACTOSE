@@ -15,6 +15,7 @@ use lactose_sim::StreamingAnchor;
 
 use crate::compare::{Comparison, PredictionTolerance, compare};
 use crate::predictor::LocalPlayer;
+use crate::presence::{self, Statement};
 use crate::reconcile::Absorbed;
 use crate::ring::{EntityRecord, Slot};
 use crate::staged_region::place_residence;
@@ -26,8 +27,15 @@ use crate::staged_region::place_residence;
 #[derive(Clone, Debug)]
 pub(crate) enum Fact {
     /// A spawn with no interpolation slot: the entity exists, claimed, in `region`, and its
-    /// recorded components are exactly these, with these exact bytes.
-    Claimed { key: StableKey, region: RegionId, components: Vec<ComponentData> },
+    /// recorded components are exactly these, with these exact bytes. Its transient
+    /// components are the replicated ones among these and the frame's `transient` statement
+    /// of it, which a correction writes and the comparison never reads.
+    Claimed {
+        key: StableKey,
+        region: RegionId,
+        components: Vec<ComponentData>,
+        transient: Statement,
+    },
     /// A spawn with a slot of an entity the prediction world had claimed: released, in
     /// `region` (the server's, which the proxy's `StagedRegion` takes), with these
     /// dequantised components.
@@ -38,8 +46,15 @@ pub(crate) enum Fact {
     Removed { key: StableKey, component: ComponentKey, region: Option<RegionId>, claimed: bool },
     /// The frame's exact rows of the entity, together, ascending by component: its
     /// recorded components are exactly these, with these bytes, since the server sends a
-    /// claimed entity whole in every frame that carries a row of it (D121).
-    Rows { key: StableKey, components: Vec<ComponentData>, region: Option<RegionId>, claimed: bool },
+    /// claimed entity whole in every frame that carries a row of it (D121). Its transient
+    /// components are stated as a claimed spawn's are.
+    Rows {
+        key: StableKey,
+        components: Vec<ComponentData>,
+        transient: Statement,
+        region: Option<RegionId>,
+        claimed: bool,
+    },
     /// The entity is gone.
     Destroyed { key: StableKey },
 }
@@ -112,10 +127,12 @@ pub(crate) struct Resolved {
 /// `new` states replaces what it supersedes. A claimed spawn, release or tombstone replaces
 /// the entity's earlier facts; a move sets the region they name; exact rows replace a
 /// claimed spawn's components, or earlier rows and removals; a removal drops the component
-/// from a claimed spawn or rows. Whether `new` is kept, which a move, removal or exact rows
-/// after a release or tombstone of the entity are not: the server states nothing else about
-/// one it no longer claims.
-pub(crate) fn fold(kept: &mut Vec<Resolved>, new: Resolved) -> bool {
+/// from a claimed spawn or rows. A statement of transient components travels with its
+/// fact: a claimed spawn or exact rows from a frame that holds none for the entity keep
+/// the one the statement they replace held, as writing both in order would. Whether `new`
+/// is kept, which a move, removal or exact rows after a release or tombstone of the entity
+/// are not: the server states nothing else about one it no longer claims.
+pub(crate) fn fold(kept: &mut Vec<Resolved>, mut new: Resolved) -> bool {
     let key = new.fact.key();
     let ours = |resolved: &Resolved| resolved.fact.key() == key;
     let ended = kept.iter().any(|resolved| {
@@ -125,6 +142,14 @@ pub(crate) fn fold(kept: &mut Vec<Resolved>, new: Resolved) -> bool {
     let whole = kept.iter().position(|resolved| {
         ours(resolved) && matches!(resolved.fact, Fact::Claimed { .. } | Fact::Rows { .. })
     });
+    if let Some(at) = whole
+        && let Fact::Claimed { transient: kept_statement, .. }
+        | Fact::Rows { transient: kept_statement, .. } = &kept[at].fact
+        && let Fact::Claimed { transient: statement @ None, .. }
+        | Fact::Rows { transient: statement @ None, .. } = &mut new.fact
+    {
+        statement.clone_from(kept_statement);
+    }
     match &new.fact {
         Fact::Claimed { .. } | Fact::Released { .. } | Fact::Destroyed { .. } => {
             kept.retain(|resolved| !ours(resolved));
@@ -144,11 +169,13 @@ pub(crate) fn fold(kept: &mut Vec<Resolved>, new: Resolved) -> bool {
                 !(ours(resolved) && matches!(resolved.fact, Fact::Moved { .. }))
             });
         }
-        Fact::Rows { components, .. } => {
+        Fact::Rows { components, transient, .. } => {
             if let Some(at) = whole
-                && let Fact::Claimed { components: stated, .. } = &mut kept[at].fact
+                && let Fact::Claimed { components: stated, transient: statement, .. } =
+                    &mut kept[at].fact
             {
                 stated.clone_from(components);
+                statement.clone_from(transient);
                 return true;
             }
             kept.retain(|resolved| {
@@ -417,15 +444,16 @@ fn write_fact(
     let key = resolved.fact.key();
     let live = world.contains(key);
     match &resolved.fact {
-        Fact::Claimed { region, components, .. } => {
+        Fact::Claimed { region, components, transient, .. } => {
             if !live {
-                let components = written_components(world, None, components);
-                return respawn(world, local, key, Some(*region), &components);
+                let spawn = spawned_components(world, components, transient.as_ref());
+                return respawn(world, local, key, Some(*region), &spawn);
             }
             let mut changed = claim(world, local, key)?;
             changed |= move_to(world, key, *region)?;
             changed |= insert(world, key, components)?;
             changed |= strip(world, key, recorded, components)?;
+            changed |= presence::apply(world, key, components, transient.as_ref())?;
             Ok(changed)
         }
         // As the hook applies a release in a predicted tick: the claim removed, the entity
@@ -433,7 +461,7 @@ fn write_fact(
         // left it recorded. The move holds the proxy where the server released it during
         // the replayed ticks between this one and the tick the releasing frame was popped
         // at, where the replay's upsert of that frame restates it (a replay never
-        // re-applies the claim change itself).
+        // re-applies the claim change itself). Its transient components stay as they are.
         Fact::Released { region, components, .. } => {
             if !live {
                 return Ok(false);
@@ -460,22 +488,25 @@ fn write_fact(
             }
             Ok(claim(world, local, key)? | world.remove_erased(key, *component)?)
         }
-        Fact::Rows { components, .. } => {
+        Fact::Rows { components, transient, .. } => {
             if named(world.registry(), components).is_empty() {
                 return Ok(false);
             }
             if !live {
-                let components = written_components(world, None, components);
-                return respawn(world, local, key, resolved.region, &components);
+                let spawn = spawned_components(world, components, transient.as_ref());
+                return respawn(world, local, key, resolved.region, &spawn);
             }
             let mut changed = claim(world, local, key)?;
             changed |= insert(world, key, components)?;
             changed |= strip(world, key, recorded, components)?;
+            changed |= presence::apply(world, key, components, transient.as_ref())?;
             Ok(changed)
         }
+        // The one entity: the server states every entity of a tree it destroyed by a fact
+        // or a proxy entry of its own (D141).
         Fact::Destroyed { .. } => {
             if live {
-                world.despawn(key)?;
+                world.despawn_alone(key)?;
             }
             Ok(live)
         }
@@ -530,6 +561,19 @@ pub(crate) fn written_components(
         .collect()
 }
 
+/// What a claimed entity built from a whole-entity statement is spawned with: the
+/// components a correction writes, and the transient ones stated, zeroed ("What a row
+/// built from the stream has"). Never `Teleported`, and never a transient value.
+pub(crate) fn spawned_components(
+    world: &World,
+    components: &[ComponentData],
+    statement: Option<&BTreeSet<ComponentKey>>,
+) -> Vec<ComponentData> {
+    let mut spawn = written_components(world, None, components);
+    presence::born(world.registry(), &mut spawn, components, statement);
+    spawn
+}
+
 /// Spawns `key` claimed for the local player in `region` with `components`, and the anchor
 /// if it is the player's own entity; skipped and logged when the region is unknown or not
 /// loaded.
@@ -565,9 +609,10 @@ fn claim(world: &mut World, local: LocalPlayer, key: StableKey) -> Result<bool> 
     Ok(true)
 }
 
-/// Moves `key` to `region` if it resides elsewhere and the world holds `region`; whether it
-/// moved. A region the world lacks is logged and skipped, so the rest of a claimed spawn's
-/// statement is still written.
+/// Moves `key` alone to `region` if it resides elsewhere and the world holds `region`;
+/// whether it moved. A region the world lacks is logged and skipped, so the rest of a
+/// claimed spawn's statement is still written. What the prediction world's edges say `key`
+/// owns stays: the server states every entity it moved by an entry of its own (D141).
 fn move_to(world: &mut World, key: StableKey, region: RegionId) -> Result<bool> {
     if world.region_of(key) == Some(region) {
         return Ok(false);
@@ -576,6 +621,6 @@ fn move_to(world: &mut World, key: StableKey, region: RegionId) -> Result<bool> 
         tracing::debug!(target: "predict", ?key, ?region, "a move into a region not loaded: skipped");
         return Ok(false);
     }
-    world.move_to_region(key, region)?;
+    world.move_alone_to_region(key, region)?;
     Ok(true)
 }

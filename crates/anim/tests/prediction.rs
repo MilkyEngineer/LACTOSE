@@ -1,8 +1,10 @@
 //! The prediction world (`README.md`, "Prediction and replication"; "Proof for milestone
 //! 1", the prediction row): the build check over this crate's systems beside a game sketch
 //! driven by `PlayerInput`; a rollback that re-simulates an animated character from the
-//! ring's inputs; a corrected `AnimState` that re-simulates from the server's phase; and
-//! `AnimParams::quantise` over a sweep of speeds, the rarity of a straddled grid midpoint.
+//! ring's inputs; a corrected `AnimState` that re-simulates from the server's phase; a
+//! character the stream builds, advanced and evaluated because its frame states its
+//! transient components (D141); and `AnimParams::quantise` over a sweep of speeds, the
+//! rarity of a straddled grid midpoint.
 
 #![forbid(unsafe_code)]
 
@@ -15,8 +17,8 @@ use common::{Library, MACHINE, SKELETON, chain, clip, clip_ref, state, transitio
 use lactose_anim::{
     AnimParams, AnimRig, AnimState, Clip, Condition, RootMotion, SimPose, StateMachine, sets,
 };
-use lactose_asset_api::AssetRef;
-use lactose_bundle::ComponentData;
+use lactose_asset_api::{AssetRef, AssetSet};
+use lactose_bundle::{Baseline, BaselineRow, ComponentData, ComponentSchema, FieldLayout};
 use lactose_core::{NetId, PlayerId, Result, StableKey, Tick};
 use lactose_ecs::{
     Executor, LayoutConfig, Mut, RegionConfig, RegionId, RegionMode, SystemSet, World, WorldKind,
@@ -168,7 +170,9 @@ struct Rig {
 
 impl Rig {
     /// A rig joined at [`JOIN`]: the character claimed by the local player at the origin,
-    /// entering the machine's initial state, applied by the first step and reconciled.
+    /// entering the machine's initial state, applied by the first step and reconciled. The
+    /// frame states the character's transient components, which the stream never sends as
+    /// values (D141).
     fn joined(layout: LayoutConfig, workers: u32) -> Self {
         let simulation = build(layout, |_| {}).expect("the prediction world builds");
         let local = LocalPlayer { player: PLAYER, entity: me() };
@@ -182,14 +186,13 @@ impl Rig {
             data(&AnimRig::new(MACHINE, SKELETON)),
             data(&AnimState::UNSET),
             data(&AnimParams::ZERO),
-            data(&RootMotion::ZERO),
-            data(&SimPose::EMPTY),
         ];
         components.sort_by_key(|data| data.component);
         let id = NetId::runtime(NonZeroU64::new(1).expect("non-zero")).expect("runtime");
         frame
             .spawns
             .insert(id, StagedSpawn { origin: None, region: REGION, slot: None, components });
+        frame.transient.insert(me(), [RootMotion::KEY, SimPose::KEY].into());
         rig.push(frame);
         rig.step();
         let reconciled = rig.reconcile();
@@ -388,6 +391,116 @@ fn a_corrected_state_resimulates_from_the_servers_phase() {
             assert_eq!(rig.hash(), reference.hash());
         }
     }
+}
+
+// ---- A character the stream builds (D141) ----
+
+/// A region whose document places the character in one run and nothing in the other.
+const DOCUMENT: RegionId = RegionId(6);
+
+fn character() -> StableKey {
+    StableKey::Net(NetId::cooked(90))
+}
+
+/// The bundle schemas of every component `world` registers.
+fn schemas(world: &World) -> Vec<ComponentSchema> {
+    world
+        .registry()
+        .iter()
+        .map(|info| {
+            let fields = info.layout().fields().iter().filter_map(|field| {
+                Some(FieldLayout {
+                    id: field.id()?,
+                    offset: u32::try_from(field.offset()).expect("a small offset"),
+                    size: u32::try_from(field.size()).expect("a small size"),
+                })
+            });
+            let size = u32::try_from(info.layout().size()).expect("a small component");
+            ComponentSchema::new(info.key(), info.version(), size, fields).expect("a schema")
+        })
+        .collect()
+}
+
+/// The character's replicated components, as the server sends them.
+fn replicated() -> Vec<ComponentData> {
+    let mut components = vec![
+        data(&Transform::at(Vec3::X)),
+        data(&AnimRig::new(MACHINE, SKELETON)),
+        data(&AnimState::UNSET),
+        data(&AnimParams::ZERO),
+    ];
+    components.sort_by_key(|data| data.component);
+    components
+}
+
+/// Whether the character has `RootMotion` and `SimPose`, whether its machine has entered a
+/// state, and whether its pose has evaluated.
+fn animated(world: &World) -> (bool, bool, bool, bool) {
+    let pose = world.get::<SimPose>(character());
+    (
+        world.get::<RootMotion>(character()).is_some(),
+        pose.is_some(),
+        world.get::<AnimState>(character()).is_some_and(|state| state.state().is_some()),
+        pose.is_some_and(|pose| *pose != SimPose::EMPTY),
+    )
+}
+
+/// A delta frame's claimed spawn of a key that is not live, carrying the character's
+/// replicated components and a statement naming `RootMotion` and `SimPose`: the row has
+/// both, zeroed, in the predicted tick, `AnimState` leaves `UNSET` and the pose evaluates,
+/// from that tick and after the correction at the frame's tick; the world hashes equal to a
+/// run in which a region document placed the character and the frame claimed it. Without
+/// the statement the row has neither and `AnimState` stays `UNSET`.
+#[test]
+fn a_character_claimed_from_the_stream_is_advanced_and_evaluated() {
+    // `placed`: the document places the character, transient components and all, which
+    // the frame then claims; otherwise the document is empty and the frame spawns it.
+    let run = |placed: bool, stated: bool| {
+        let mut rig = Rig::joined(LayoutConfig::default(), 1);
+        rig.step_to(14);
+        let rows = if placed {
+            let mut components = replicated();
+            components.extend([data(&RootMotion::ZERO), data(&SimPose::EMPTY)]);
+            components.sort_by_key(|data| data.component);
+            vec![BaselineRow { id: NetId::cooked(90), components }]
+        } else {
+            Vec::new()
+        };
+        let world = rig.world_mut();
+        let config = RegionConfig { id: DOCUMENT, seed: 76, mode: RegionMode::Simulated };
+        world.create_region(config).unwrap();
+        world.set_region_assets(DOCUMENT, library().pin()).unwrap();
+        let baseline = Baseline::from_rows(AssetSet::new(), schemas(world), rows).unwrap();
+        world.load_region(DOCUMENT, &baseline, None).unwrap();
+        rig.step();
+
+        let mut frame = StagedFrame::new(Tick(15));
+        let spawn =
+            StagedSpawn { origin: None, region: DOCUMENT, slot: None, components: replicated() };
+        frame.spawns.insert(NetId::cooked(90), spawn);
+        if stated {
+            frame.transient.insert(character(), [RootMotion::KEY, SimPose::KEY].into());
+        }
+        rig.push(frame);
+        rig.step();
+        let predicted = (animated(rig.world()), rig.hash());
+        let reconciled = rig.reconcile();
+        let ticks: Vec<Tick> = reconciled.corrections.iter().map(|c| c.tick).collect();
+        assert_eq!(ticks, [Tick(15)]);
+        let corrected = (animated(rig.world()), rig.hash());
+        // And on, a tick after the correction.
+        rig.step();
+        (predicted, corrected, animated(rig.world()), rig.hash())
+    };
+    let spawned = run(false, true);
+    assert_eq!(spawned.0.0, (true, true, true, true), "advanced and evaluated in the tick");
+    assert_eq!(spawned.1.0, (true, true, true, true), "and after the correction");
+    assert_eq!(spawned.2, (true, true, true, true));
+    assert_eq!(spawned, run(true, true), "as the document's character, hash for hash");
+    let unstated = run(false, false);
+    assert_eq!(unstated.0.0, (false, false, false, false), "neither kernel runs on the row");
+    assert_eq!(unstated.1.0, (false, false, false, false));
+    assert_eq!(unstated.2, (false, false, false, false));
 }
 
 /// The sweep's denominator: speeds are `8 i / P` for `i` in `-P..P`. `P` is odd, so

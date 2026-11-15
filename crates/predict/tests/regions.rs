@@ -8,12 +8,13 @@
 
 mod common;
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use common::*;
 use lactose_asset_api::AssetSet;
 use lactose_bundle::Baseline;
-use lactose_core::{PlayerId, StableKey, Tick};
+use lactose_core::{ComponentKey, PlayerId, StableKey, Tick};
 use lactose_ecs::{RegionId, RegionMode};
 use lactose_math::{Scalar, Vec3};
 use lactose_net_api::{StagedFrame, Tombstone, TombstoneCause};
@@ -669,4 +670,74 @@ fn a_reclaim_of_a_proxy_into_a_region_neither_slot_holds_is_not_applied() {
 fn a_reclaim_of_a_proxy_into_a_loaded_region_survives_a_rollback() {
     let claimed = (true, Some(PLAYER), Some(REGION), Some(Health(7)));
     assert_eq!(reclaimed_then_rolled_back(REGION), [claimed, claimed]);
+}
+
+/// Steps one tick with [`looking`]'s sample, loading `regions` in it: a substitution of the
+/// tick rolls back through it.
+fn step_looking(rig: &mut Rig, regions: &[RegionId]) {
+    let next = Tick(rig.tick().0 + 1);
+    let mut input = TickInput::default();
+    input.inputs.insert(PLAYER, looking(next.0).to_player_sample(next));
+    for &region in regions {
+        input.loaded.insert(region, bundle());
+    }
+    rig.try_step_with(input).expect("the step");
+}
+
+/// Whether key 4 has `Stance` and `Crouch`.
+fn stated(rig: &Rig) -> (bool, bool) {
+    let world = rig.world();
+    (world.get::<Stance>(key(4)).is_some(), world.get::<Crouch>(key(4)).is_some())
+}
+
+/// The claimed spawn into `NEW` with a statement naming `Stance`, kept at 21; exact rows
+/// of the entity for 18 from a frame stating `restated`, folded into it there; then a
+/// substitution of 21 that rolls back through the kept slot. Returns what the entity has
+/// after the fold's correction and after the rollback, which re-simulates to the straight
+/// run's world.
+fn kept_then_restated(restated: Option<BTreeSet<ComponentKey>>) -> [(bool, bool); 2] {
+    let mut rig = Rig::joined();
+    rig.step_to(20, looking);
+    let mut frame = claim_into_new(new_cart());
+    frame.transient.insert(key(4), [Stance::KEY].into());
+    rig.push(frame);
+    step_looking(&mut rig, &[NEW]);
+    assert!(rig.reconcile().corrections.is_empty());
+    assert_eq!(stated(&rig), (true, false));
+
+    let mut frame = StagedFrame::new(Tick(18));
+    exact(&mut frame, key(4), &at(6, 5));
+    exact(&mut frame, key(4), &Health(4));
+    if let Some(restated) = restated {
+        frame.transient.insert(key(4), restated);
+    }
+    rig.push(frame);
+    step_looking(&mut rig, &[]);
+    let reconciled = rig.reconcile();
+    let ticks: Vec<Tick> = summaries(&reconciled).iter().map(|s| s.0).collect();
+    assert_eq!(ticks, vec![Tick(21)]);
+    assert_eq!(live_at(&rig, key(4)), Some((NEW, at(6, 5))));
+    let folded = stated(&rig);
+
+    step_looking(&mut rig, &[]);
+    let mut frame = StagedFrame::new(Tick(23));
+    frame.substituted.insert(Tick(21));
+    rig.push(frame);
+    step_looking(&mut rig, &[]);
+    let hash = rig.hash();
+    let reconciled = rig.reconcile();
+    let ticks: Vec<Tick> = summaries(&reconciled).iter().map(|s| s.0).collect();
+    assert_eq!(ticks, vec![Tick(20), Tick(21)]);
+    assert_eq!(rig.hash(), hash, "the re-simulated world equals the straight run");
+    assert_eq!(live_at(&rig, key(4)), Some((NEW, at(6, 5))));
+    [folded, stated(&rig)]
+}
+
+/// Exact rows from a frame with no statement, folded into a kept claimed spawn, replace its
+/// components and keep its statement, so a rollback through the kept slot re-spawns the
+/// entity with the stated component; rows from a frame that holds a statement replace it.
+#[test]
+fn a_kept_claimed_spawn_keeps_its_statement_under_rows_that_carry_none() {
+    assert_eq!(kept_then_restated(None), [(true, false); 2]);
+    assert_eq!(kept_then_restated(Some([Crouch::KEY].into())), [(false, true); 2]);
 }
