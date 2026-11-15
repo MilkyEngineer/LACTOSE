@@ -234,9 +234,9 @@ do ("What it weighs" below).
   arena keeps its freed slots at full size, where the bytes encode them compactly. On a
   fresh world the copy is cheaper than the write; on a churned one it is not. In the first
   review's probe `slot_copy_review_history` (fifty balls thrown in a walled box, beside which
-  a block of 300 floating balls scattered and was removed, leaving 2,026 retired pairs; load
-  averages 9.98 24.83 27.45), the plain scene's copy held
-  274 kB in 511 allocations against 127 kB of bytes, taken in 25.1 µs and dropped in
+  a block of 300 floating balls scattered, retiring 2,026 pairs, and was removed; load
+  averages 9.98 24.83 27.45), the plain scene's copy held 274 kB in 511 allocations
+  against 127 kB of bytes, taken in 25.1 µs and dropped in
   11.8 µs where the write took 132 µs; the churned world's held 1.88 MB in 2,504
   allocations against 138 kB of bytes, taken in 188.7 µs and dropped in 110.7 µs where the
   write took 179.2 µs. Criterion 5's scene holds 75 to 86 retired pairs. The pool is

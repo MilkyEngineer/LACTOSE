@@ -213,6 +213,10 @@ fn steps_as_the_run(scene: &Scene, b: &mut dyn PhysicsBackend, run: &Run, t: u32
     }
 }
 
+// The only test that catches a restore keeping the live pipelines: it does so through the
+// jointed scene's quiet tail after the paddle stops at tick 260 and its joint removals at
+// ticks 300 (the revolute, with its body) and 320 (the fixed joint); the churned scene's
+// cases pass with the live pipelines kept. An edit to `script` must keep that coverage.
 #[test]
 fn a_backend_restored_from_a_copy_steps_as_one_restored_from_its_bytes() {
     for threads in [1, 2, 4] {
