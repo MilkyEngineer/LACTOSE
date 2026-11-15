@@ -5674,6 +5674,51 @@ relayed by an event when it acts on another body** (§6.1, §10, `lactose-ecs`,
   `docs/plans/milestone-1.md`, decision 5.5's "The cost is Rapier's serialisation of each fixed
   collider" and "At 64 the take is about 76 µs and the restore about 92 µs", which the plan now
   marks.
+- Addendum (lane slot-copy, 2026-11-15; review rounds 1 and 2): *the copy as built.*
+  `lactose-physics-api` adds the trait `BackendCopy: Any + Send + Sync` with
+  `fn encode(&self, out: &mut Vec<u8>)`, and `PhysicsBackend` adds
+  `fn copy(&self) -> Result<Box<dyn BackendCopy>>` and
+  `fn restore_copy(&mut self, copy: &dyn BackendCopy) -> Result<()>`, defaulted through
+  `snapshot` and `restore`: the default copy holds the bytes, and the default restore of any
+  other copy encodes it and restores those bytes, so it accepts any copy whose bytes this
+  backend's `restore` accepts, whichever backend took it. Rapier's `restore_copy` refuses with
+  `InvalidData` every copy but its own, the default's included, so a wrapper forwards both
+  methods or neither. A backend recognises its copy by upcasting to `&dyn Any` and downcasting.
+  `PhysicsSnapshot` holds the copy, which makes it neither `UnwindSafe` nor `RefUnwindSafe`: the
+  supertraits do not compile for Rapier's copy, whose shapes, contact workspaces and
+  narrow-phase query dispatcher are trait objects that are neither, so the loss is stated, and
+  `Send + Sync` stays asserted at compile time. `size_in_bytes` and `hash` encode the copy once
+  into a `OnceLock` of length and hash and keep no bytes. Rapier's copy clones every set of
+  `PhysicsWorld` whole and the bookkeeping, the world destructured with every field named,
+  shapes shared; a take refuses a shape the backend did not build with the write's error; a
+  restore from a copy clones it back and builds a fresh physics pipeline, collision pipeline and
+  CCD solver. A whole clone carries what the bytes do not: the narrow phase's pool of up to
+  2,048 retired contact pairs, which a restore from bytes empties and a restore from a copy
+  keeps, and each arena's freed slots at full size, so a copy weighs the world's history as well
+  as the world: after a block of 300 balls scattered, retiring 2,026 pairs, and was removed
+  beside fifty thrown in a walled box, 1.88 MB in 2,504 allocations against 138 kB of bytes,
+  taken in 189 µs and dropped in 111 µs where the write took 179 µs (the review's probe
+  `slot_copy_review_history`, load averages 9.98 24.83 27.45); emptying the pool on a clone
+  would be a vendored optimisation, which architecture section 8.2 does not admit, and
+  criterion 5's scene holds 75 to 86 retired pairs. `crates/physics-rapier/tests/copy.rs` holds
+  the copy against the bytes and the live run from every point of a jointed scene, and on a
+  scene that churns its pairs holds a copy restored on another pool size, restored twice, and
+  restored into the backend that stepped on from it, on pools of 1, 2 and 4. Under agent load on
+  the M1 (load averages 10.14 29.34 35.38), taken into a full ring of 60 with each part's
+  eviction inside its timer: snapshot 111.7 µs (world 14.5, physics 97.2), record 83.5 µs,
+  restore 102.0 µs (world 18.5, physics 83.2), rollback of seven ticks 3393.9 µs; the first
+  `Ring::bytes` on a full ring 18.9 ms, later calls 0.6 µs. These include the eviction drop,
+  which the figures before the lane never timed. The spike's `client_frame` samples
+  `Ring::bytes` every 30 frames, about 11 ms a call on the thrown replays (1,258 calls, 13.6 s,
+  in a ten-minute server-clock replay, the review's probe), which lands in the replay's `wall_s`
+  and in no rollback timer. Memory per slot under the tagged allocator on
+  `crates/physics-rapier/tests/memory.rs`'s scene (fifty thrown balls among 5 fixed colliders
+  and 59 proxies, not the criterion's scene), counted under a tag the test thread alone holds,
+  which the test asserts is unchanged by asking the size and hash and returns exactly to its
+  start when the slots drop: the physics snapshot holds 433 kB in 621 allocations where its
+  bytes are 193 kB; the world snapshot 87 kB in 99 allocations. The spike's four recording tests
+  record the same hashes (digest 8db4551c007e6410 over 7,200 lines) in PR, layout and chaos
+  modes. The quiet-window measurement that proves criterion 5 is still to be taken.
 
 **D144. On Windows the keeper waits on a high-resolution timer beside a wake event and spins the last 500 µs, and tick start there is held to 1 ms at P99** (§5.1, §21, §22, `lactose-task`, `docs/plans/milestone-1.md`)
 - Why: on Windows the timer root started ticks up to a whole tick late. An i7-12650H laptop on

@@ -68,7 +68,7 @@ mod sync;
 mod systems;
 mod validity;
 
-pub use backend::{BodyDesc, BodyState, PhysicsBackend, StepInput, StepOutput};
+pub use backend::{BackendCopy, BodyDesc, BodyState, PhysicsBackend, StepInput, StepOutput};
 pub use command::{PhysicsCommand, PhysicsCommands, PhysicsExt};
 pub use components::{
     BodyHandle, BodyType, Collider, CollisionGroups, Joint, JointHandle, JointKind, RigidBody,
@@ -101,10 +101,13 @@ const _: () = {
     const fn error<E: std::error::Error + Copy + Send + Sync + 'static>() {}
 
     send_sync::<Physics>();
+    // Only these two: holding the backend's copy (D143), a snapshot is neither `UnwindSafe`
+    // nor `RefUnwindSafe`, since Rapier's shapes and workspaces are trait objects that are not.
     send_sync::<PhysicsSnapshot>();
     send_sync::<PhysicsCommand>();
     send_sync::<StepOutput>();
     send_sync::<Box<dyn PhysicsBackend>>();
+    send_sync::<Box<dyn BackendCopy>>();
     send_sync::<conformance::ConformanceReport>();
     error::<Invalid>();
 

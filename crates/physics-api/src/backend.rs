@@ -1,7 +1,9 @@
 //! The trait a backend implements (architecture section 16): bodies, colliders and joints
-//! keyed by `StableKey`, the step, snapshot and restore as bytes, and the queries. The
-//! backend never sees the world: the sync tells it what rows became, and the step hands it
-//! the tick's commands and takes back what moved and what touched.
+//! keyed by `StableKey`, the step, snapshot and restore as bytes and as a copy, and the
+//! queries. The backend never sees the world: the sync tells it what rows became, and the
+//! step hands it the tick's commands and takes back what moved and what touched.
+
+use std::any::Any;
 
 use lactose_core::{Result, StableKey, Tick};
 use lactose_math::{Scalar, Vec3};
@@ -89,6 +91,27 @@ impl StepOutput {
         self.bodies.clear();
         self.contacts.clear();
         self.triggers.clear();
+    }
+}
+
+/// A copy of a backend's world, taken by [`PhysicsBackend::copy`] and put back by
+/// [`PhysicsBackend::restore_copy`]: what a prediction slot holds (D143). The backend
+/// that took it recognises it by upcasting to `&dyn Any` and downcasting, so only that
+/// backend type restores it.
+pub trait BackendCopy: Any + Send + Sync {
+    /// Appends the bytes [`PhysicsBackend::snapshot`] would have written of the world this
+    /// copy was taken of, without the backend. The copy was refused when taken if the
+    /// backend's write would refuse its world, so this cannot fail; it panics on a broken
+    /// invariant (an encoder the build gets wrong), and panics abort.
+    fn encode(&self, out: &mut Vec<u8>);
+}
+
+/// The copy of a backend with nothing cheaper: its bytes.
+struct SnapshotBytes(Vec<u8>);
+
+impl BackendCopy for SnapshotBytes {
+    fn encode(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&self.0);
     }
 }
 
@@ -226,7 +249,9 @@ pub trait PhysicsBackend: Send + Sync + 'static {
     /// different operation orders is a milestone 1 verification item, not a contract.
     /// [`setup`](crate::setup) takes the bytes of the empty world once, and the sync
     /// restores them whenever it has removed every body, so the empty world's bytes must
-    /// restore to a world that steps as a newly built one does.
+    /// restore to a world that steps as a newly built one does. They are also what a
+    /// journal checkpoint carries and what [`PhysicsSnapshot::hash`](crate::PhysicsSnapshot::hash)
+    /// hashes; a prediction slot holds a [`copy`](Self::copy) instead (D143).
     fn snapshot(&self, out: &mut Vec<u8>) -> Result<()>;
 
     /// Replaces the whole physics world with one taken by [`snapshot`](Self::snapshot) of
@@ -235,6 +260,43 @@ pub trait PhysicsBackend: Send + Sync + 'static {
     /// this crate replays `set_collider` afterwards, and nothing reconciles fixed
     /// colliders. `InvalidData` leaves the world unchanged.
     fn restore(&mut self, bytes: &[u8]) -> Result<()>;
+
+    /// A copy of the physics world, which [`restore_copy`](Self::restore_copy) puts back
+    /// and whose [`BackendCopy::encode`] writes the bytes [`snapshot`](Self::snapshot)
+    /// writes now. Refuses what `snapshot` refuses of the world's data, with the same
+    /// error, so that encoding the copy later cannot fail. The default copies the bytes; a
+    /// backend overrides it with a copy that is cheaper to take and to drop than the bytes
+    /// are to write, which holds only of the worlds it is measured on: a whole clone keeps
+    /// what the bytes leave out. Rapier's copy clones the narrow phase's pool of up to 2,048
+    /// retired contact pairs, which a restore from bytes empties and a restore from a copy
+    /// keeps, and each arena's freed slots at full size, so on a churned world it weighs the
+    /// world's history (1.88 MB against 138 kB of bytes in the first review's probe
+    /// `slot_copy_review_history`, taken in 189 µs and dropped in 111 µs where the write took
+    /// 179 µs, at a one-minute load of 10; `lactose-physics-rapier`'s README, "The copy";
+    /// D143).
+    fn copy(&self) -> Result<Box<dyn BackendCopy>> {
+        let mut bytes = Vec::new();
+        self.snapshot(&mut bytes)?;
+        Ok(Box::new(SnapshotBytes(bytes)))
+    }
+
+    /// Replaces the whole physics world with `copy`, as [`restore`](Self::restore) of its
+    /// bytes would: the world afterwards steps, reports and writes bytes exactly as one
+    /// restored from them does, so nothing of the world it replaces (a solver cache, a
+    /// workspace) survives. A refusal leaves the world unchanged. The default accepts any
+    /// copy whose bytes this backend's `restore` accepts, whichever backend took it: it
+    /// restores the default copy's bytes, and encodes any other copy and restores those. An
+    /// override may refuse every copy it did not take, so a wrapper forwards both `copy`
+    /// and `restore_copy` or neither.
+    fn restore_copy(&mut self, copy: &dyn BackendCopy) -> Result<()> {
+        let any: &dyn Any = copy;
+        if let Some(SnapshotBytes(bytes)) = any.downcast_ref::<SnapshotBytes>() {
+            return self.restore(bytes);
+        }
+        let mut bytes = Vec::new();
+        copy.encode(&mut bytes);
+        self.restore(&bytes)
+    }
 
     /// The first hit along `ray` among the colliders `filter` admits, with the lowest
     /// `StableKey` among hits at exactly equal distance. A query the query-parameter rule

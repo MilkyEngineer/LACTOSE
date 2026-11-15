@@ -46,6 +46,7 @@ build run for every world kind: a change that breaks it is a signature change to
 | `Physics`, `PhysicsConfig` | The one resource: queries through `Res<Physics>` anywhere, the three systems through `ResMut<Physics>`; gravity and the worker reservation |
 | `Ray`, `QueryFilter`, `RayHit`, `ShapeHit` | The queries' arguments and answers, keyed by `StableKey`, in `Scalar`s |
 | `PhysicsBackend`, `BodyDesc`, `StepInput`, `StepOutput`, `BodyState` | The trait a backend implements and what it is given and gives back |
+| `BackendCopy` | A copy of a backend's world, which `PhysicsBackend::copy` takes and `restore_copy` puts back, and which encodes to the backend's snapshot bytes: what a prediction slot holds (D143) |
 | `setup`, `register_types`, `register_systems`, `sets::{SYNC, STEP, WRITE_BACK}` | What `app` adds to a `SimulationBuilder`, and the three sets this crate declares |
 | `snapshot`, `restore`, `corrected`, `PhysicsSnapshot` | The physics world beside a `WorldSnapshot`, and how `predict` names what it corrected |
 | `conformance::{snapshot_restore, ConformanceReport, TICKS, SNAPSHOT_TICK, BODIES}` | The run a backend passes before this surface is frozen |
@@ -73,7 +74,7 @@ constructors and accessors are `#[doc(hidden)]`: the backend's, not game code's.
 | | A derived handle, rebuilt on load | `BodyHandle` and `JointHandle`, written by the sync; `Option<&BodyHandle>` in a kernel says whether the entity is a live body, and nothing trusts the value |
 | | A transform without physics | `Transform` and `Velocity` are this crate's for every entity; a crate that needs them and no physics depends on this crate for the types, which pull no backend |
 | | Refusing authored data before it reaches a row, by the rules every backend applies | The `validate` of each type from a loader or the cooker, and the `Invalid` it names for the message ("Validity" below) |
-| `physics-rapier` | The trait: bodies and joints by key, the step over a slice of commands, snapshot and restore as bytes, queries | `PhysicsBackend`; `StepInput::commands` is `&[PhysicsCommand]`, so a backend's own test steps without a world; `StepOutput` takes the moved bodies and the events |
+| `physics-rapier` | The trait: bodies and joints by key, the step over a slice of commands, snapshot and restore as bytes and as a copy, queries | `PhysicsBackend`; `StepInput::commands` is `&[PhysicsCommand]`, so a backend's own test steps without a world; `StepOutput` takes the moved bodies and the events |
 | | The blocking wait and the solver pool | The step calls `PhysicsBackend::step` inside `Job::block_in_place` with `PhysicsConfig::reserved_workers`; the pool is the backend's own, built by `app` with frame worker count minus the reservation threads, at least one, and passed to the backend's constructor |
 | | Creation and removal of bodies as rows appear and disappear | The sync's: from the structural log, keyed by origin key, with the prediction-world rule and the region modes applied ("Bodies" below); the backend is told `create_body`, `remove_body`, `set_body`, `set_frozen` and holds no world-kind rule |
 | | How a backend is registered | `app` writes the `setup` closure and `register_systems` ("The registration" below); the backend crate exports a constructor and registers no system |
@@ -527,11 +528,29 @@ gather compare it with the last tick they covered, and zero means never.
 
 - `snapshot(world)` is taken between ticks at the point `World::snapshot` is, and
   `restore(world, &snap)` after `World::restore` of the matching world snapshot. The
-  snapshot has two parts. The bytes are the backend's whole world, with each collider's
-  `Shape` value (an asset reference once meshes exist) in place of the backend's shape
-  serialisation; `restore` rebuilds shapes from those values while deserialising, with no
-  change flag, wake or mass update; there is no `set_collider` replay and no
-  fixed-collider reconciliation. This crate's part is its bookkeeping and the sync's
+  snapshot has two parts. The backend's part is its whole world as the backend's
+  `PhysicsBackend::copy` (D143), a `Box<dyn BackendCopy>` whose `encode` writes the bytes
+  `PhysicsBackend::snapshot` would have written of that world: the backend's whole world,
+  with each collider's `Shape` value (an asset reference once meshes exist) in place of
+  the backend's shape serialisation. `restore` hands the copy to
+  `PhysicsBackend::restore_copy`, which replaces the backend's world as a restore of those
+  bytes would, shapes included, with no change flag, wake or mass update, and keeps
+  nothing of the world it replaces; there is no `set_collider` replay and no
+  fixed-collider reconciliation. A copy is refused when taken for what the backend's write
+  would refuse of its world, so its `encode` cannot fail; a backend recognises its own copy
+  by upcasting to `&dyn Any` and downcasting. The defaults of `copy` and `restore_copy` go
+  through the bytes, so the test backend's snapshot is its bytes: the default accepts any
+  copy whose bytes `restore` accepts, whichever backend took it; an override may refuse
+  every copy it did not take (Rapier's refuses with `InvalidData` every copy but its own,
+  the default's included), so a wrapper forwards both `copy` and `restore_copy` or
+  neither. A copy need not weigh what the bytes do: Rapier's carries the world's history
+  as well as the world (`crates/physics-rapier/README.md`, "The copy"). Holding a
+  `Box<dyn BackendCopy>`, a `PhysicsSnapshot` is `Send + Sync` but neither `UnwindSafe`
+  nor `RefUnwindSafe`, which it was while it held bytes: Rapier's shapes and workspaces
+  are trait objects that are neither, so the copy cannot promise them. The byte form
+  stays the backend's contract: `setup` keeps the empty world's bytes and the sync
+  restores them into an emptied solver (D124), a journal checkpoint carries bytes, and
+  `hash` is of the bytes. This crate's part is its bookkeeping and the sync's
   pending work: which rows are bodies with their handles and which of them are frozen,
   which rows are joints with the value and the bodies each was created from, the waiting
   joints, the region modes, the aliases and the predicted bodies not yet bound, `written`,
@@ -543,7 +562,7 @@ gather compare it with the last tick they covered, and zero means never.
   log since the restore, and the union of pending and newly changed keys in key order, so
   a re-simulated tick's sync makes exactly the backend calls the first run's did, apart
   from the calls `corrected` adds.
-- `restore`, in order: the backend's restore of the bytes; then the carried bookkeeping
+- `restore`, in order: the backend's restore of the copy; then the carried bookkeeping
   replaces this crate's and a fresh cursor and mark are taken. The snapshot carries the
   resource's identity and the world's tick, and `restore` refuses, with `InvalidData`, a
   snapshot from another resource or a world whose tick is not the snapshot's: restore the
@@ -572,9 +591,15 @@ gather compare it with the last tick they covered, and zero means never.
   refusing a mismatch of any of those with `InvalidData` and rebuilding the handle rows
   from the bookkeeping, since loaded rows carry none. The byte form and the restore are the
   journal tooling lane's.
-- `PhysicsSnapshot::size_in_bytes` is the backend's part, what milestone 1 measures
-  against the 100 µs prediction-world budget for 50 claimed bodies plus N statics; that
-  measurement decides how many statics the prediction world may hold. `hash` is the named
+- `PhysicsSnapshot::size_in_bytes` is the backend's part. A prediction world holds at most 64
+  fixed colliders and proxies together as rows (D139, architecture section 10). At that count,
+  with the spike's fifty thrown bodies, the physics snapshot took 135.2 µs and its restore
+  180.6 µs on a quiet Apple M1 (`docs/results/prediction-slot-apple-m1-2026-11-15.md`), over
+  section 22's 100 µs before the world's part. A slot therefore holds the backend's world
+  as a copy, and these bytes stay for the fresh solver, the journal checkpoint and the hash
+  (D143). `size_in_bytes` and `hash` are of the bytes the backend would write, not of what
+  the copy weighs: the first call of either encodes the copy once, at the cost of one
+  backend write, and keeps the length and the hash, not the bytes. `hash` is the named
   place where section 8.3 adds the bytes to the world hash once the backend's
   serialisation is shown to be order-stable (`docs/verification.md`); until then
   `ConformanceReport::physics_hash` reports it, `lactose-physics-rapier`'s SOUR test
@@ -673,7 +698,7 @@ Rapier, and the size and time of Rapier's snapshot bytes.
 | Events | `events.rs`: the emission order per tick whatever order the backend reports in (two pool sizes); `Impact` in every touching step above the threshold to the target with `events`, never to one without; `Started` and `Stopped` to both sides; triggers to both sides; each seen once by a `Stage::Post` reader; readers in `Stage::Physics` without the edge and in `Stage::Simulation` fail to build |
 | Queries | `queries.rs`: `cast_ray` ties to the lowest key, groups, sensors and exclusion; `cast_shape`; `overlap` appended ascending, each key once, whatever the backend's order; a `Stage::Physics` reader of `Physics` needs the edge after `sets::STEP`; an unordered `Stage::Post` reader of `Transform` reads this tick's rows (probe S1); another exclusive `Stage::Post` system builds only once `Registration::order` orders it (probe S2) |
 | Joints | `joints.rs`: a joint waits for both bodies; a body's removal removes it and it waits, then a fixed collider takes it; a value change recreates it and an equal write does not; an emptied reference parks it until its row changes; a despawned body leaves it waiting for that key |
-| Snapshot and restore | `snapshot.rs`: `conformance::snapshot_restore` with the test backend under two pool sizes, the production layout and SOUR's, one and four workers, every report equal, the resumed run's backend calls equal to the first run's, and the scene's pending work, velocity write, command, limp bone, freeze and thaw each seen in them; probe B: the re-simulated syncs make the first run's calls and the rows are equal; probe C: a correction is pushed only when named through `corrected`; the predict loop with spawns, despawns, moves, commands, a claim and a release, re-run equal apart from the corrected key's two equal-value pushes; a world restored alone is diffed without clearing and keeps running; the 2^30 rebase diffs without clearing (probe D); a snapshot taken before the first sync restores into a full diff; another resource's snapshot and another tick's are refused and change nothing; `NotFound` without `Physics`; a second `setup` is refused; a scene with pending work at many ticks, a predicted body bound mid-run and one never bound, re-simulated from seven restore points under four layouts, one and four workers and two pool sizes, makes the first run's calls and rows; the unbound-predicted set is carried, emptied by binds and never looked up for a bound body (`src/service.rs` unit test) |
+| Snapshot and restore | `snapshot.rs`: `conformance::snapshot_restore` with the test backend under two pool sizes, the production layout and SOUR's, one and four workers, every report equal, the resumed run's backend calls equal to the first run's, and the scene's pending work, velocity write, command, limp bone, freeze and thaw each seen in them; probe B: the re-simulated syncs make the first run's calls and the rows are equal; probe C: a correction is pushed only when named through `corrected`; the predict loop with spawns, despawns, moves, commands, a claim and a release, re-run equal apart from the corrected key's two equal-value pushes; a world restored alone is diffed without clearing and keeps running; the 2^30 rebase diffs without clearing (probe D); a snapshot taken before the first sync restores into a full diff; another resource's snapshot and another tick's are refused and change nothing; `NotFound` without `Physics`; a second `setup` is refused; a scene with pending work at many ticks, a predicted body bound mid-run and one never bound, re-simulated from seven restore points under four layouts, one and four workers and two pool sizes, makes the first run's calls and rows; the unbound-predicted set is carried, emptied by binds and never looked up for a bound body (`src/service.rs` unit test); the conformance run requires after every tick of both runs, and after the restore, that a snapshot's copy encodes the backend's bytes and that its size and hash are theirs, and a snapshot encodes its copy once, on the first call of `size_in_bytes` or `hash`, and takes it writing nothing (`src/service.rs` unit test, D143) |
 | The write-back | `rows.rs`: only rows whose bytes changed are stamped; `Teleported` holds the teleport's tick across two further ticks (probe T); a key despawned at the post sync point is skipped; `cost.rs`: 100k entities with 2,000 moved bodies, the write-back stamping exactly the moved rows and the sync pushing none, the microseconds of both printed, and the sync of resting bodies by `Net`, bound predicted and unbound predicted keys; a body reported twice is written the same whichever copy comes first |
 | The scalar | The size assertions in `lib.rs`; `types.rs`: no component's layout holds a raw float, every hashed one registers with the world hasher, the handles are `derived` |
 | Validity | `src/validity.rs` unit tests: each rule of each predicate refused and its edges accepted (a rotation half the tolerance off unit, the negated identity, `-0.0` as zero, a negative gravity scale, every axis locked, a zero capsule half height, a restitution above one, a zero axis on a fixed or spherical joint, equal limits, the smallest direction an axis may be), the finite-before-bound order, the `BodyDesc` order, every `Rule` and `Invalid` text and the `InvalidData` conversion; `tests/validity.rs`: `conformance::validity` with the test backend under two pool sizes, and 25 backends that each break one rule (a skipped check, a rule of their own, a reordered check, the value before the same-body rule, any step input or query reach, a whole step dropped for one refused command) each failing it; `lactose-physics-rapier`'s `conformance.rs`: the same with Rapier; `lactose-anim`'s `bones.rs` and `format.rs`: `Skeleton::validate` and `Clip::validate` name the predicates' field and rule |
