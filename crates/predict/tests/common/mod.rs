@@ -25,8 +25,9 @@ use lactose_input::{Action, Actions, Axis2, PlayerInput, PlayerInputApplier, Yaw
 use lactose_math::{Scalar, Vec3};
 use lactose_net_api::{InterpolationSlot, StagedFrame, StagedInbox, StagedSpawn};
 use lactose_physics_api::{
-    BodyDesc, BodyHandle, Collider, Joint, JointHandle, PhysicsBackend, PhysicsConfig, QueryFilter,
-    Ray, RayHit, RigidBody, Shape, ShapeHit, StepInput, StepOutput, Transform, Velocity,
+    BackendCopy, BodyDesc, BodyHandle, Collider, Joint, JointHandle, PhysicsBackend, PhysicsConfig,
+    QueryFilter, Ray, RayHit, RigidBody, Shape, ShapeHit, StepInput, StepOutput, Transform,
+    Velocity,
 };
 use lactose_predict::{
     CorrectionCause, DEFAULT_DEPTH, Divergence, LocalPlayer, PredictError, Predictor, Reconciled,
@@ -629,9 +630,11 @@ pub fn looking(tick: u32) -> PlayerInput {
     PlayerInput { yaw: Yaw(u16::try_from(tick).expect("a small tick")), ..walking(tick) }
 }
 
-// ---- A backend whose snapshot fails on demand ----
+// ---- A backend whose copy fails on demand ----
 
-/// The test backend, with its snapshot refused while `fail` holds `true`.
+/// The test backend, with its copy refused while `fail` holds `true`, as a backend refuses
+/// a world its write would refuse (D143). Its bytes are never refused, so a take that wrote
+/// them instead of copying would not see the refusal.
 pub struct Flaky {
     pub inner: Fake,
     pub fail: Arc<Mutex<bool>>,
@@ -685,14 +688,22 @@ impl PhysicsBackend for Flaky {
     }
 
     fn snapshot(&self, out: &mut Vec<u8>) -> Result<()> {
-        if *self.fail.lock().expect("never poisoned") {
-            return Err(Error::new(lactose_core::ErrorKind::Unsupported, "refused by the test"));
-        }
         self.inner.snapshot(out)
     }
 
     fn restore(&mut self, bytes: &[u8]) -> Result<()> {
         self.inner.restore(bytes)
+    }
+
+    fn copy(&self) -> Result<Box<dyn BackendCopy>> {
+        if *self.fail.lock().expect("never poisoned") {
+            return Err(Error::new(lactose_core::ErrorKind::InvalidData, "refused by the test"));
+        }
+        self.inner.copy()
+    }
+
+    fn restore_copy(&mut self, copy: &dyn BackendCopy) -> Result<()> {
+        self.inner.restore_copy(copy)
     }
 
     fn cast_ray(&self, ray: &Ray, filter: &QueryFilter) -> Option<RayHit> {

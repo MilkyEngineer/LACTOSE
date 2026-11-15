@@ -3,8 +3,8 @@
 //! next tick needs, the newest slot being the present.
 //!
 //! The slot is a private type: what it holds is stated here and in the README, how it is
-//! held is the implementation's, so that copy-on-write snapshots (COW, if the milestone 1
-//! measurement calls for them) change no signature.
+//! held is the implementation's, so that a change of representation changes no signature.
+//! The physics part is the backend's copy of its world (D143), not its bytes.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
@@ -70,9 +70,12 @@ impl Ring {
         self.rebuilt_at
     }
 
-    /// What every slot weighs together: the sum of [`slot_bytes`](Self::slot_bytes) over
-    /// the ring, which milestone 1 measures against the prediction world's budget and
-    /// which decides whether copy-on-write snapshots are built.
+    /// The sum of [`slot_bytes`](Self::slot_bytes) over the ring: what the backend would
+    /// write of each slot's physics world, not what the slots hold. The first call for a
+    /// slot encodes its physics copy once, the cost of one backend write, so the first call
+    /// on a full ring costs a write per slot (sixty on the criterion's scene, which the
+    /// spike records as `ring_bytes_first_us`); later calls cost nothing more. Nothing that
+    /// ships calls it.
     #[must_use]
     pub fn bytes(&self) -> SlotBytes {
         self.slots.iter().map(Slot::bytes).fold(SlotBytes::default(), |sum, slot| SlotBytes {
@@ -82,7 +85,10 @@ impl Ring {
         })
     }
 
-    /// What the slot of `tick` weighs, or `None` if the ring holds no slot for it.
+    /// The bytes of the slot of `tick` by part, or `None` if the ring holds no slot for it:
+    /// for the physics, what the backend would write of the world the slot holds, not what
+    /// its copy weighs. The first call for a slot costs one backend write, as
+    /// [`bytes`](Self::bytes) states.
     #[must_use]
     pub fn slot_bytes(&self, tick: Tick) -> Option<SlotBytes> {
         self.slot(tick).map(Slot::bytes)
@@ -179,14 +185,17 @@ impl Ring {
     }
 }
 
-/// The size of a slot, or of the ring, by part.
+/// The bytes of a slot, or of the ring, by part. The physics part is what the backend
+/// would write, which is not what a slot holds since the slot holds the backend's copy
+/// (D143); the memory a slot holds is counted under `lactose-core`'s tagged allocator, not
+/// here.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct SlotBytes {
     /// The world snapshot's bytes (`WorldSnapshot::size_in_bytes`).
     pub world: usize,
-    /// The physics snapshot's bytes (`PhysicsSnapshot::size_in_bytes`): the backend's
-    /// whole world, the part that decides how many statics a prediction world may hold;
-    /// zero for a slot taken without one.
+    /// The bytes the backend would write of the physics world the slot holds
+    /// (`PhysicsSnapshot::size_in_bytes`, whose first call costs one backend write); zero
+    /// for a slot taken without one.
     pub physics: usize,
     /// The record's bytes: every replicated persistent component of every claimed entity
     /// (`Teleported` aside), as copied after the tick, plus the frames held for replay.
@@ -200,8 +209,9 @@ pub(crate) struct Slot {
     /// The world after the tick: every column with its stamps, the entity table, the
     /// resources, the regions, the input-tick table, the relationship index.
     pub(crate) world: WorldSnapshot,
-    /// The physics world after the tick and the sync's pending work, if the world has
-    /// physics and the snapshot succeeded; `None` otherwise, and a restore to this slot
+    /// The physics world after the tick, as the backend's copy, and the sync's pending
+    /// work, if the world has physics and the copy succeeded; `None` otherwise, and a
+    /// restore to this slot
     /// restores the world alone. A slot taken again right after a restore from it (a
     /// correction's re-take) keeps `None` when it had none: the physics was not restored
     /// to this tick, and a snapshot then would hold a later tick's solver state.

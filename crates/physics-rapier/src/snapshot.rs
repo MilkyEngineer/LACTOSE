@@ -9,11 +9,14 @@
 //! same exchange backwards and decodes the result with Rapier's derive. Postcard is not
 //! self-describing, so the image is correct exactly when its field order and types match
 //! the pinned Rapier's; the round-trip test of the collider set's bytes checks it.
+//!
+//! The copy a prediction slot holds ([`WorldCopy`]) is the same parts cloned, written
+//! through the same encoder when its bytes are asked for.
 
 use std::sync::Arc;
 
 use lactose_core::{Error, ErrorKind, Result};
-use lactose_physics_api::Shape;
+use lactose_physics_api::{BackendCopy, Shape};
 use rapier3d_f64::dynamics::{
     CCDSolver, ImpulseJointSet, IntegrationParameters, IslandManager, MultibodyJointSet,
     RigidBodySet, SoftBodySet, SoftMeshRef,
@@ -174,20 +177,56 @@ fn shapes_in(image: SetImage<Plain<Shape>>) -> Result<ColliderSet> {
     postcard::from_bytes(&bytes).map_err(|_| invalid("not the bytes of a collider set"))
 }
 
+/// What the bytes are written from, by reference: the live world's parts or a copy's.
+struct Parts<'a> {
+    book: &'a Book,
+    gravity: Vector,
+    integration_parameters: &'a IntegrationParameters,
+    islands: &'a IslandManager,
+    broad_phase: &'a BroadPhaseBvh,
+    narrow_phase: &'a NarrowPhase,
+    bodies: &'a RigidBodySet,
+    colliders: &'a ColliderSet,
+    impulse_joints: &'a ImpulseJointSet,
+    multibody_joints: &'a MultibodyJointSet,
+    soft_bodies: &'a SoftBodySet,
+}
+
+impl<'a> Parts<'a> {
+    fn of(book: &'a Book, world: &'a PhysicsWorld) -> Self {
+        Self {
+            book,
+            gravity: world.gravity,
+            integration_parameters: &world.integration_parameters,
+            islands: &world.islands,
+            broad_phase: &world.broad_phase,
+            narrow_phase: &world.narrow_phase,
+            bodies: &world.bodies,
+            colliders: &world.colliders,
+            impulse_joints: &world.impulse_joints,
+            multibody_joints: &world.multibody_joints,
+            soft_bodies: &world.soft_bodies,
+        }
+    }
+}
+
 pub(crate) fn write(backend: &Rapier, out: &mut Vec<u8>) -> Result<()> {
-    let world = &backend.world;
+    encode(&Parts::of(&backend.book, &backend.world), out)
+}
+
+fn encode(parts: &Parts<'_>, out: &mut Vec<u8>) -> Result<()> {
     let image = WorldRef {
-        book: &backend.book,
-        gravity: world.gravity,
-        integration_parameters: &world.integration_parameters,
-        islands: &world.islands,
-        broad_phase: &world.broad_phase,
-        narrow_phase: &world.narrow_phase,
-        bodies: &world.bodies,
-        colliders: shapes_out(&world.colliders)?,
-        impulse_joints: &world.impulse_joints,
-        multibody_joints: &world.multibody_joints,
-        soft_bodies: &world.soft_bodies,
+        book: parts.book,
+        gravity: parts.gravity,
+        integration_parameters: parts.integration_parameters,
+        islands: parts.islands,
+        broad_phase: parts.broad_phase,
+        narrow_phase: parts.narrow_phase,
+        bodies: parts.bodies,
+        colliders: shapes_out(parts.colliders)?,
+        impulse_joints: parts.impulse_joints,
+        multibody_joints: parts.multibody_joints,
+        soft_bodies: parts.soft_bodies,
     };
     let start = out.len();
     out.extend_from_slice(TAG);
@@ -216,6 +255,118 @@ impl postcard::ser_flavors::Flavor for Append<'_> {
 
     fn finalize(self) -> postcard::Result<()> {
         Ok(())
+    }
+}
+
+/// The copy a prediction slot holds (`README.md`, "The copy"; D143): every part of the
+/// world the bytes carry, and the bookkeeping, cloned, each collider's shape shared with
+/// the world it was taken of, since a shape is never changed once built. The pipelines and
+/// the CCD solver are workspace, as the bytes treat them, and are not copied.
+pub(crate) struct WorldCopy {
+    book: Book,
+    gravity: Vector,
+    integration_parameters: IntegrationParameters,
+    islands: IslandManager,
+    broad_phase: BroadPhaseBvh,
+    narrow_phase: NarrowPhase,
+    bodies: RigidBodySet,
+    colliders: ColliderSet,
+    impulse_joints: ImpulseJointSet,
+    multibody_joints: MultibodyJointSet,
+    soft_bodies: SoftBodySet,
+}
+
+/// A copy of `backend`'s world and bookkeeping. Refuses, with the write's error, a
+/// collider whose shape this backend did not build, which is what the write refuses of
+/// the world's data, so that encoding the copy later cannot fail on it.
+pub(crate) fn copy(backend: &Rapier) -> Result<WorldCopy> {
+    // Every field named, so that a field a Rapier bump adds fails the build here rather
+    // than being left out of the copy.
+    let PhysicsWorld {
+        gravity,
+        integration_parameters,
+        physics_pipeline: _,
+        collision_pipeline: _,
+        islands,
+        broad_phase,
+        narrow_phase,
+        bodies,
+        colliders,
+        impulse_joints,
+        multibody_joints,
+        soft_bodies,
+        ccd_solver: _,
+    } = &backend.world;
+    if colliders.iter().any(|(_, collider)| shape_of(collider.shared_shape()).is_none()) {
+        return Err(invalid("a collider's shape is not one this backend builds"));
+    }
+    Ok(WorldCopy {
+        book: backend.book.clone(),
+        gravity: *gravity,
+        integration_parameters: *integration_parameters,
+        islands: islands.clone(),
+        broad_phase: broad_phase.clone(),
+        narrow_phase: narrow_phase.clone(),
+        bodies: bodies.clone(),
+        colliders: colliders.clone(),
+        impulse_joints: impulse_joints.clone(),
+        multibody_joints: multibody_joints.clone(),
+        soft_bodies: soft_bodies.clone(),
+    })
+}
+
+impl WorldCopy {
+    /// The world the copy holds, cloned, with a fresh physics pipeline, collision pipeline
+    /// and CCD solver on `pool`, as [`read`] builds: the solver keeps caches keyed by the
+    /// island manager's active-set epoch, which a restored world can repeat, so a restore
+    /// that kept the live pipeline would step apart from one from the bytes.
+    pub(crate) fn world(&self, pool: &Arc<ThreadPool>) -> PhysicsWorld {
+        let mut world = PhysicsWorld {
+            gravity: self.gravity,
+            integration_parameters: self.integration_parameters,
+            physics_pipeline: PhysicsPipeline::new(),
+            collision_pipeline: CollisionPipeline::new(),
+            islands: self.islands.clone(),
+            broad_phase: self.broad_phase.clone(),
+            narrow_phase: self.narrow_phase.clone(),
+            bodies: self.bodies.clone(),
+            colliders: self.colliders.clone(),
+            impulse_joints: self.impulse_joints.clone(),
+            multibody_joints: self.multibody_joints.clone(),
+            soft_bodies: self.soft_bodies.clone(),
+            ccd_solver: CCDSolver::new(),
+        };
+        world.set_thread_pool(Some(Arc::clone(pool)));
+        world
+    }
+
+    /// The bookkeeping the copy holds.
+    pub(crate) fn book(&self) -> &Book {
+        &self.book
+    }
+}
+
+impl BackendCopy for WorldCopy {
+    fn encode(&self, out: &mut Vec<u8>) {
+        let parts = Parts {
+            book: &self.book,
+            gravity: self.gravity,
+            integration_parameters: &self.integration_parameters,
+            islands: &self.islands,
+            broad_phase: &self.broad_phase,
+            narrow_phase: &self.narrow_phase,
+            bodies: &self.bodies,
+            colliders: &self.colliders,
+            impulse_joints: &self.impulse_joints,
+            multibody_joints: &self.multibody_joints,
+            soft_bodies: &self.soft_bodies,
+        };
+        // The shapes were checked when the copy was taken; what else the write refuses
+        // (the encoder, the collider image's layout) is the build's, which the round-trip
+        // test holds.
+        if let Err(error) = encode(&parts, out) {
+            panic!("a copy of the physics world did not encode: {error}");
+        }
     }
 }
 
@@ -390,6 +541,34 @@ mod tests {
             postcard::to_allocvec(&book).unwrap(),
             postcard::to_allocvec(&backend.book).unwrap()
         );
+    }
+
+    #[test]
+    fn a_copy_shares_its_shapes_and_encodes_the_bytes_of_its_world() {
+        let backend = stepped();
+        let taken = copy(&backend).unwrap();
+        for ((_, held), (_, live)) in taken.colliders.iter().zip(backend.world.colliders.iter()) {
+            assert!(Arc::ptr_eq(&held.shared_shape().0, &live.shared_shape().0));
+        }
+        let (mut encoded, mut written) = (Vec::new(), Vec::new());
+        taken.encode(&mut encoded);
+        backend.snapshot(&mut written).unwrap();
+        assert_eq!(encoded, written);
+    }
+
+    #[test]
+    fn a_shape_this_backend_did_not_build_is_refused_at_a_copy_as_at_a_write() {
+        let mut backend = stepped();
+        // No public call puts such a shape in the world: the crate-private set does.
+        let (handle, _) = backend.world.colliders.iter().next().unwrap();
+        let collider = backend.world.colliders.get_mut(handle).unwrap();
+        collider.set_shape(SharedShape::cylinder(0.5, 0.25));
+        let refused = backend.copy().err().unwrap();
+        assert_eq!(refused.kind(), ErrorKind::InvalidData);
+        let mut bytes = Vec::new();
+        let written = backend.snapshot(&mut bytes).unwrap_err();
+        assert_eq!(refused.to_string(), written.to_string(), "the write's refusal");
+        assert!(bytes.is_empty());
     }
 
     #[test]

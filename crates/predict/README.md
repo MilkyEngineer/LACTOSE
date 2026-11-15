@@ -4,8 +4,9 @@ The client's prediction world (architecture sections 4, 9.4 and 10): the owner t
 it ahead of the server with the local player's inputs, the ring of per-tick snapshots it
 rolls back through, the hook that applies what the server staged at the input sync point,
 and the reconciliation that compares the server's exact rows with what was predicted and
-re-simulates from the first difference. Copy-on-write snapshots (COW) are not built unless
-the milestone 1 measurement says so; nothing here would change if they were.
+re-simulates from the first difference. Copy-on-write snapshots (COW) are not built (D139,
+architecture section 10): a slot's cost is the physics backend's world, which they could not
+share between slots.
 
 | | |
 |---|---|
@@ -48,7 +49,8 @@ breaks one is a signature change to list.
 
 Hidden plumbing: none. The record the hook fills and the predictor reads is a
 crate-private service resource of the prediction world; the ring's slot is a private type,
-so a snapshot's representation (a full copy today, copy-on-write if measured necessary) is
+so a snapshot's representation (a full copy of the world, and the physics world as
+`lactose-physics-api` holds it) is
 the implementation's. Everything public is keys, ticks, counts and the tolerance's scalars;
 nothing reads a clock, every float goes through `lactose_math`, and the crate carries the
 boundary `clippy.toml`.
@@ -232,21 +234,22 @@ step and rebuilds the world there ("Reconciliation" below).
   none: the physics was not restored to that tick, and a snapshot taken then would hold
   the present's solver state under an older tick.
 - `Ring::bytes()` and `slot_bytes(tick)` report the world snapshot's, the physics
-  snapshot's and the record's bytes. The milestone 1 measurement of the snapshot cost per
-  tick, which decides whether copy-on-write snapshots are built, is the implementation
-  lane's: `crates/predict/tests/cost.rs` times `World::snapshot` and
-  `physics_api::snapshot` as `step` takes them, for fifty claimed dynamic bodies plus 0 to
-  10,000 statics with the physics test backend, and prints the bytes; the backend lane's
-  conformance scene gives Rapier's bytes and time for the same scene; the netcode spike
-  records both on the aarch64 client. The budget is 100 µs per tick (section 22) and the
-  record goes in `docs/verification.md`'s spike row; the design review's first figures
-  (full-copy `World::snapshot` alone: 1.3 to 2.9 µs and 18.8 KB at no statics, 14.5 to
-  19 µs and 262 KB at 1,000, 134 to 149 µs and 2.43 MB at 10,000) already say that
-  10,000 statics as rows are over budget before physics, so the count of statics a
-  prediction world holds as rows, or copy-on-write, is the decision that measurement
-  makes. No signature holds a snapshot and the slot is private, so copy-on-write inside
-  `lactose-ecs`'s `WorldSnapshot`, or a slot that shares unchanged chunks with its
-  predecessor, changes nothing here.
+  snapshot's and the record's bytes. The physics part is what the backend would write of
+  the world the slot holds, not what the slot holds: the first call for a slot encodes its
+  copy once, the cost of one backend write, and later calls cost nothing more; nothing that
+  ships calls them. What a slot holds in memory is counted under `lactose-core`'s tagged
+  allocator (`crates/physics-rapier/tests/memory.rs`).
+  The budget is 100 µs for the world snapshot and the physics snapshot of one slot (section
+  22), and a prediction world holds at most 64 fixed colliders and proxies together as rows
+  (D139, architecture section 10), a content rule nothing here enforces. On a quiet Apple M1
+  the slot of the spike's thrown scene at that count took 140.8 µs to snapshot, 135.2 µs of it
+  the physics snapshot, and 193.0 µs to restore
+  (`docs/results/prediction-slot-apple-m1-2026-11-15.md`): over the budget. The physics part
+  of a slot is therefore a copy the backend makes (D143), which a second quiet window
+  measures, taken into a full ring. `crates/predict/tests/cost.rs` times `World::snapshot`
+  and `physics_api::snapshot` with the physics test backend, for fifty claimed dynamic bodies
+  plus 0 to 10,000 statics, and says nothing of Rapier's cost. No signature holds a snapshot
+  and the slot is private, so what a slot holds changes nothing here.
 
 **The hook** (architecture sections 6, 9.2 and 9.4; `crates/sim/README.md`, "The input
 sync point"; `crates/net-api/README.md`, "The staged frame")
@@ -1064,8 +1067,9 @@ README.md`, "The applier")
 - The visual blend of a correction: presentation's, milestone 2, from `Correction`.
 - The lag-compensation tick the client saw: a field of the input sample's schema version 2
   at milestone 4; nothing here.
-- Copy-on-write snapshots, or a cap on the statics a prediction world holds as rows:
-  decided by the milestone 1 measurement; private to the slot.
+- Copy-on-write snapshots: not built (D139). The cap on what a prediction world holds as rows,
+  64 fixed colliders and proxies together, is a content rule nothing enforces (architecture
+  section 10); milestone 3 designs what replaces it.
 - `StagedRegion` on a region load's rows before the server names the region: the hook
   does not stamp them, and a `Left` tombstone of such a row is settled by where it resides
   ("Where the frames placed each proxy", the accepted case).

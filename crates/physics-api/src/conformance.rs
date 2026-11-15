@@ -22,7 +22,7 @@
 //! # Ok(()) }
 //! ```
 
-use lactose_core::{EntityRef, Error, ErrorKind, NetId, PlayerId, Result, StableKey, Tick};
+use lactose_core::{EntityRef, Error, ErrorKind, NetId, PlayerId, Result, StableKey, Tick, xxh64};
 use lactose_ecs::{
     ChannelWriter, ClaimedBy, Commands, Executor, LayoutConfig, Mut, OwnedBy, RegionConfig,
     RegionId, RegionMode, Res, StableKeyOf, SystemSet, World, WorldKind, system,
@@ -39,7 +39,9 @@ use crate::components::{
     Velocity, locked_axes,
 };
 use crate::query::{QueryFilter, Ray};
-use crate::service::{PhysicsConfig, register_types, restore, setup, snapshot};
+use crate::service::{
+    PhysicsConfig, copy_and_backend_bytes, register_types, restore, setup, snapshot,
+};
 use crate::systems::register_systems;
 use crate::validity::Invalid;
 
@@ -61,8 +63,9 @@ pub struct ConformanceReport {
     /// `Simulation::hash` after each tick from [`SNAPSHOT_TICK`] + 1 to [`TICKS`] of the
     /// run resumed from the snapshot. Equal, tick for tick, to the tail of `first`.
     pub resumed: Vec<(Tick, u64)>,
-    /// The physics snapshot's size at [`SNAPSHOT_TICK`], what milestone 1 measures against
-    /// the prediction-world budget.
+    /// [`PhysicsSnapshot::size_in_bytes`](crate::PhysicsSnapshot::size_in_bytes) at
+    /// [`SNAPSHOT_TICK`]: the bytes the backend writes of its world there, not what the
+    /// snapshot's copy weighs.
     pub snapshot_bytes: usize,
     /// [`PhysicsSnapshot::hash`](crate::PhysicsSnapshot::hash) of a snapshot taken after
     /// tick [`TICKS`] of the first run and of the resumed run. Reported, not required
@@ -93,12 +96,17 @@ pub struct ConformanceReport {
 /// described as after the restore happens at the same ticks in the first run. Every step
 /// takes `TickInput::default()` (the mode changes go through `world_mut`, tests only).
 /// After tick [`SNAPSHOT_TICK`] a `World::snapshot` and a [`snapshot`](crate::snapshot) are
-/// taken; after tick [`TICKS`] both are restored and the run continues to [`TICKS`] again.
-/// Driven with `Executor::block_on`, so it is called from a test's main thread.
+/// taken; after tick [`TICKS`] both are restored, through the backend's
+/// [`restore_copy`](PhysicsBackend::restore_copy), and the run continues to [`TICKS`]
+/// again. After every tick of both runs, and after the restore, a further snapshot's copy
+/// must encode the bytes the backend's [`snapshot`](PhysicsBackend::snapshot) writes then,
+/// with its size and hash theirs (D143). Driven with `Executor::block_on`, so it is called
+/// from a test's main thread.
 ///
-/// Fails with `InvalidData` naming the first tick whose hash differs, or if the world
-/// reports a layout other than `layout`, so that a SOUR test may record `layout` as the
-/// one its run applied; with what building the simulation fails with; and as a step fails.
+/// Fails with `InvalidData` naming the first tick whose hash differs or whose copy is not
+/// the backend's bytes, or if the world reports a layout other than `layout`, so that a
+/// SOUR test may record `layout` as the one its run applied; with what building the
+/// simulation fails with; and as a step, a copy or a restore fails.
 pub fn snapshot_restore(
     executor: &Executor,
     backend: Box<dyn PhysicsBackend>,
@@ -127,6 +135,7 @@ pub fn snapshot_restore(
     for tick in 1..=TICKS {
         simulation = step(executor, simulation, tick)?;
         first.push((simulation.tick(), simulation.hash()?));
+        copy_is_the_bytes(simulation.world(), "first")?;
         if tick == SNAPSHOT_TICK {
             saved = Some((simulation.world().snapshot(), snapshot(simulation.world())?));
         }
@@ -135,11 +144,13 @@ pub fn snapshot_restore(
     let (world_snapshot, physics_snapshot) = saved.expect("the run passes the snapshot tick");
     simulation.world_mut().restore(&world_snapshot)?;
     restore(simulation.world_mut(), &physics_snapshot)?;
+    copy_is_the_bytes(simulation.world(), "restored")?;
 
     let mut resumed = Vec::new();
     for tick in SNAPSHOT_TICK + 1..=TICKS {
         simulation = step(executor, simulation, tick)?;
         resumed.push((simulation.tick(), simulation.hash()?));
+        copy_is_the_bytes(simulation.world(), "resumed")?;
     }
     let resumed_physics = snapshot(simulation.world())?;
     for (&(tick, first_hash), &(_, resumed_hash)) in
@@ -162,6 +173,27 @@ pub fn snapshot_restore(
         snapshot_bytes: physics_snapshot.size_in_bytes(),
         physics_hash: (first_physics.hash(), resumed_physics.hash()),
     })
+}
+
+/// The obligation [`PhysicsBackend::copy`] states: a [`snapshot`](crate::snapshot) of
+/// `world` holds a copy whose bytes are the ones the backend writes now, and whose size and
+/// hash are theirs. `InvalidData` names the run and the tick otherwise.
+fn copy_is_the_bytes(world: &World, run: &str) -> Result<()> {
+    let taken = snapshot(world)?;
+    let (copied, written) = copy_and_backend_bytes(world, &taken)?;
+    let fail = |what: &str| {
+        Err(Error::new(
+            ErrorKind::InvalidData,
+            format!("after tick {} of the {run} run, {what}", world.tick().0),
+        ))
+    };
+    if copied != written {
+        return fail("the copy's bytes differ from the backend's");
+    }
+    if taken.size_in_bytes() != written.len() || taken.hash() != xxh64(&written, 0) {
+        return fail("the snapshot's size or hash is not its bytes'");
+    }
+    Ok(())
 }
 
 /// The obligation [`PhysicsBackend::snapshot`] states for the bytes of the empty world,

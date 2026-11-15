@@ -325,6 +325,8 @@ fn a_proxy_is_swept_along_the_rows_the_hook_writes() {
     assert!(rig.reconcile().corrections.is_empty());
 }
 
+/// A take whose backend refuses its copy (as the Rapier backend refuses a shape it did not
+/// build) is taken without its physics and counted (D122, D143).
 #[test]
 fn a_slot_without_physics_restores_the_world_alone_and_is_counted() {
     let calls = CallLog::default();

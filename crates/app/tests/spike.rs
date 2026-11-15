@@ -2481,6 +2481,7 @@ fn client_frame(
         end.predicted.insert(tick, (client.hash()?, hop));
     }
     if n.is_multiple_of(30) {
+        // A write of each slot not yet encoded: it reads the copies and changes no state.
         let ring = client.predictor().ring().bytes();
         let ring_bytes = &mut outcome.ring_bytes;
         ring_bytes.world = ring_bytes.world.max(ring.world);
@@ -3095,14 +3096,21 @@ fn alone_frame(
 /// so that its newest slot holds no server frame and weighs what this take weighs.
 ///
 /// The take is a copy of what `lactose-predict` takes after every predicted tick, timed by
-/// part: the world snapshot, the physics snapshot, and the record of every claimed entity's
-/// replicated persistent components but `Teleported`. Criterion 5 reads `snapshot_us`, the
-/// world and physics snapshots together; `take_us` adds the record. The restore is what a
-/// rollback restores, the world then the physics; criterion 5 reads `restore_us`. Each
-/// figure is the median of 200 rounds (20 in a short run). The three sizes are asserted
-/// equal to the client's ring's for its newest slot, so that the copy cannot drift from the
-/// take unseen, and the world hash after the restores is the hash before them.
-/// `cargo xtask measure prediction-slot` runs it.
+/// part: the world snapshot, the physics snapshot (the backend's copy of its world, D143),
+/// and the record of every claimed entity's replicated persistent components but
+/// `Teleported`. Each part is taken into a ring of its own as deep as the client's, which
+/// is full before the first timed round, and each part's timer includes the drop of the
+/// part the ring evicts for it, as `Ring::push` drops the oldest slot. Criterion 5 reads
+/// `snapshot_us`, the world and physics snapshots together; `take_us` adds the record. The
+/// restore is what a rollback restores, the world then the physics, from the newest slot;
+/// criterion 5 reads `restore_us`. Each figure is the median of 200 rounds (20 in a short
+/// run), after as many untimed rounds as the ring is deep. The three sizes of the newest
+/// slot are asserted equal to the client's ring's for its newest slot, so that the copy
+/// cannot drift from the take unseen, and the world hash after the restores is the hash
+/// before them. `ring_bytes_first_us` is the sum of `size_in_bytes` over the held physics
+/// snapshots, the first call encoding each but the newest (which the size check encoded),
+/// as `Ring::bytes` on a full ring does; and
+/// `ring_bytes_again_us` the same sum again. `cargo xtask measure prediction-slot` runs it.
 #[test]
 #[ignore = "a measurement, run by `cargo xtask measure`: timings are reported, not asserted"]
 fn cost_of_a_prediction_slot() {
@@ -3114,6 +3122,7 @@ fn cost_of_a_prediction_slot() {
         let client = held.as_mut().expect("held between frames");
         let (tick, hash) = (client.tick(), client.hash()?);
         let ring = client.predictor().ring().slot_bytes(tick).expect("the newest slot");
+        let depth = usize::try_from(client.predictor().ring().depth()).expect("a small depth");
         let world = client.predictor_mut().simulation_mut().world_mut();
         let recorded: Vec<ComponentKey> = world
             .registry()
@@ -3134,15 +3143,25 @@ fn cost_of_a_prediction_slot() {
         assert_eq!(fixed + proxies, PREDICTION_ROWS as usize, "the most D139 admits");
         let entities = world.entities_in(REGION).count();
 
+        type Record = BTreeMap<StableKey, (RegionId, BTreeMap<ComponentKey, Vec<u8>>)>;
+        /// Appends `part` to `ring` and drops the oldest beyond `depth`.
+        fn push<T>(ring: &mut VecDeque<T>, part: T, depth: usize) {
+            ring.push_back(part);
+            if ring.len() > depth {
+                drop(ring.pop_front());
+            }
+        }
+        let mut worlds = VecDeque::with_capacity(depth + 1);
+        let mut physics = VecDeque::with_capacity(depth + 1);
+        let mut records: VecDeque<Record> = VecDeque::with_capacity(depth + 1);
         let mut times: [Vec<Duration>; 6] = Default::default();
-        let mut bytes = SlotBytes::default();
-        for _ in 0..rounds {
+        for round in 0..depth + rounds {
             let start = Instant::now();
-            let snapshot = world.snapshot();
+            push(&mut worlds, world.snapshot(), depth);
             let taken_world = Instant::now();
-            let physics = lactose_physics_api::snapshot(world)?;
+            push(&mut physics, lactose_physics_api::snapshot(world)?, depth);
             let taken_physics = Instant::now();
-            let record: BTreeMap<StableKey, (RegionId, BTreeMap<ComponentKey, Vec<u8>>)> = world
+            let record: Record = world
                 .claimed(PLAYER)
                 .filter_map(|key| {
                     let components = recorded
@@ -3154,29 +3173,45 @@ fn cost_of_a_prediction_slot() {
                     Some((key, (world.region_of(key)?, components)))
                 })
                 .collect();
+            push(&mut records, record, depth);
             let taken = Instant::now();
-            times[0].push(taken_world - start);
-            times[1].push(taken_physics - taken_world);
-            times[2].push(taken - taken_physics);
-            let record_bytes =
-                record.values().flat_map(|(_, components)| components.values()).map(Vec::len);
-            bytes = SlotBytes {
-                world: snapshot.size_in_bytes(),
-                physics: physics.size_in_bytes(),
-                record: record_bytes.sum(),
-            };
 
-            let start = Instant::now();
-            world.restore(&snapshot)?;
+            let start_restore = Instant::now();
+            world.restore(worlds.back().expect("just taken"))?;
             let restored_world = Instant::now();
-            lactose_physics_api::restore(world, &physics)?;
+            lactose_physics_api::restore(world, physics.back().expect("just taken"))?;
             let restored = Instant::now();
-            times[3].push(restored_world - start);
-            times[4].push(restored - restored_world);
-            times[5].push(restored - start);
+            if round >= depth {
+                times[0].push(taken_world - start);
+                times[1].push(taken_physics - taken_world);
+                times[2].push(taken - taken_physics);
+                times[3].push(restored_world - start_restore);
+                times[4].push(restored - restored_world);
+                times[5].push(restored - start_restore);
+            }
         }
         assert_eq!(client.hash()?, hash, "a restore of the slot just taken changes nothing");
+        assert_eq!((worlds.len(), physics.len(), records.len()), (depth, depth, depth));
+        let record_bytes = records
+            .back()
+            .expect("the newest")
+            .values()
+            .flat_map(|(_, components)| components.values())
+            .map(Vec::len);
+        let bytes = SlotBytes {
+            world: worlds.back().expect("the newest").size_in_bytes(),
+            physics: physics.back().expect("the newest").size_in_bytes(),
+            record: record_bytes.sum(),
+        };
         assert_eq!(bytes, ring, "this take weighs what the ring's newest slot weighs");
+        // The newest physics snapshot is encoded by now; the sum encodes the others.
+        let ring_bytes = || physics.iter().map(|taken| taken.size_in_bytes()).sum::<usize>();
+        let start = Instant::now();
+        let ring_physics_bytes = ring_bytes();
+        let first = start.elapsed();
+        let start = Instant::now();
+        assert_eq!(ring_bytes(), ring_physics_bytes);
+        let again = start.elapsed();
 
         let [world_us, physics_us, record_us, world_restore_us, physics_restore_us, restore_us] =
             times.map(|spans| micros(median_of(spans)));
@@ -3185,6 +3220,7 @@ fn cost_of_a_prediction_slot() {
         figure("frames", THROWN_FRAMES + 2);
         figure("tick", tick.0);
         figure("rounds", rounds);
+        figure("ring_depth", depth);
         figure("entities", entities);
         figure("claimed", claimed);
         figure("fixed_colliders", fixed);
@@ -3200,6 +3236,9 @@ fn cost_of_a_prediction_slot() {
         figure("world_bytes", bytes.world);
         figure("physics_bytes", bytes.physics);
         figure("record_bytes", bytes.record);
+        figure("ring_physics_bytes", ring_physics_bytes);
+        figure("ring_bytes_first_us", us(micros(first)));
+        figure("ring_bytes_again_us", us(micros(again)));
         Ok(())
     });
 }

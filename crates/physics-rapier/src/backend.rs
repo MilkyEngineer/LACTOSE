@@ -1,15 +1,16 @@
 //! The backend: the trait's calls recorded in the bookkeeping, applied to the solver at the
 //! start of each step in key order, the step, and what it reports.
 
+use std::any::Any;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use lactose_core::{Error, ErrorKind, Result, StableKey};
 use lactose_math::{Scalar, Vec3};
 use lactose_physics_api::{
-    BodyDesc, BodyHandle, BodyState, Collider, CollisionGroups, ContactEvent, ContactPhase, Joint,
-    JointHandle, JointKind, PhysicsBackend, PhysicsCommand, QueryFilter, Ray, RayHit, RigidBody,
-    Shape, ShapeHit, StepInput, StepOutput, Transform, TriggerEvent, Velocity,
+    BackendCopy, BodyDesc, BodyHandle, BodyState, Collider, CollisionGroups, ContactEvent,
+    ContactPhase, Joint, JointHandle, JointKind, PhysicsBackend, PhysicsCommand, QueryFilter, Ray,
+    RayHit, RigidBody, Shape, ShapeHit, StepInput, StepOutput, Transform, TriggerEvent, Velocity,
 };
 use rapier3d_f64::dynamics::{
     FixedJointBuilder, GenericJoint, JointAxis, LockedAxes, MassProperties, PrismaticJointBuilder,
@@ -30,6 +31,7 @@ use crate::convert::{
     vec3, vector,
 };
 use crate::query;
+use crate::snapshot::WorldCopy;
 
 /// The log target the `PhysicsBackend` contract names: refused values, unknown keys and
 /// dropped commands.
@@ -310,6 +312,20 @@ impl PhysicsBackend for Rapier {
         let (world, book) = crate::snapshot::read(bytes, &self.pool)?;
         self.world = world;
         self.book = book;
+        Ok(())
+    }
+
+    fn copy(&self) -> Result<Box<dyn BackendCopy>> {
+        Ok(Box::new(crate::snapshot::copy(self)?))
+    }
+
+    fn restore_copy(&mut self, copy: &dyn BackendCopy) -> Result<()> {
+        let any: &dyn Any = copy;
+        let copy = any
+            .downcast_ref::<WorldCopy>()
+            .ok_or_else(|| Error::new(ErrorKind::InvalidData, "not a copy this backend took"))?;
+        self.world = copy.world(&self.pool);
+        self.book = copy.book().clone();
         Ok(())
     }
 

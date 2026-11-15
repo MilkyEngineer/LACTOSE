@@ -196,6 +196,44 @@ order.
   argument is checked by tests, not proven for every Rapier path: CCD, contact clustering,
   multibody joints and soft bodies are never used by this backend and are not covered.
 
+## The copy
+
+What a prediction slot holds (D143): `PhysicsBackend::copy` clones every part of the world
+the bytes carry, and the bookkeeping, built by destructuring Rapier's `PhysicsWorld` with
+every field named, so that a field a Rapier bump adds fails the build. The pipelines and the
+CCD solver are left out, as the bytes leave them out.
+
+- **Shapes are shared.** A collider's `SharedShape` is an `Arc`, and a shape is never
+  changed once built (`set_collider` builds a new one), so the copy shares each shape with
+  the world it was taken of and with every other copy.
+- **Refused when taken.** The copy refuses, with the write's `InvalidData`, a collider whose
+  shape this backend did not build, which is what the write refuses of the world's data; it
+  checks every collider's shape, a capsule by rebuilding it. What else the write can refuse
+  (postcard's encoder, the collider image's layout against the pinned Rapier) depends on the
+  build, which the round-trip test holds, so the copy's `encode` panics on it.
+- **Encoded through the write.** The copy's bytes come from the same encoder as the
+  backend's, over the copy's parts instead of the live world's, so they are the bytes the
+  backend wrote when the copy was taken (`physics-api`'s conformance run checks it after
+  every tick).
+- **Restored with fresh workspaces.** `restore_copy` clones the copy's parts into a new world
+  with a fresh physics pipeline, collision pipeline and CCD solver on the backend's pool, as a
+  restore from bytes builds: the solver keeps caches keyed by the island manager's
+  active-set epoch, which a restored world can repeat, and a restore that kept the live
+  pipeline stepped apart in 6 of 52 restores of the first review's probe. A copy another
+  backend type took is refused with `InvalidData`, the world unchanged. No check of the
+  bookkeeping against the world is made, since a copy is never read from outside.
+- **What it weighs.** The copy is larger than the bytes and takes many allocations where the
+  bytes took one, so a ring of copies pays for each take and for the drop of the slot it
+  evicts. `tests/memory.rs` counts it under the tagged allocator; `SlotBytes` reports the
+  bytes the backend would write, not this.
+
+`tests/copy.rs` holds that a backend restored from a copy steps as one restored from the
+bytes and as the run it was taken from, from every point of a 420-tick scene, twelve ticks
+on, on pools of one, two and four threads: joints of every kind made and removed, sleeping
+bodies woken by a write and by a body dropped on them, a shape replaced while older copies
+share the old one, and copies restored newest first into the live backend. A restore that
+keeps the live pipeline fails it.
+
 ## Known gaps
 
 - **The sign of zero in `min` and `max`** (architecture section 8.2): `f64::max` and the
@@ -219,6 +257,11 @@ order.
   1.2 µs to restore. Of its bytes about 700 are the fixed Rapier body a collider without a
   `RigidBody` is attached to; attaching every such collider to one shared fixed body would
   save them. Rapier's own encoding of its sets is most of the bytes.
+  These fifty bodies touch nothing. Bodies thrown together cost more than the fixed colliders
+  beside them: the spike's fifty among 64 fixed colliders and proxies take 135.2 µs to snapshot
+  and 180.6 µs to restore on a quiet Apple M1, a third of the write their 263 contact pairs,
+  of which 77 touch (`docs/results/prediction-slot-apple-m1-2026-11-15.md`, D143). A
+  prediction slot therefore holds the copy ("The copy" above), not these bytes.
 - **The step's tail** (`tests/cost.rs` with `--release`, printed, not asserted; Apple M1,
   load averages 4 to 10). The walk scene of `tests/support` (a capsule walking a square over
   a floor and five blocks), 100 runs of 1,800 ticks per pool size, six rounds: the median run

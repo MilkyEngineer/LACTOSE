@@ -54,17 +54,23 @@ fn the_conformance_run_passes_with_the_test_backend() {
     assert_eq!(reference.physics_hash.0, reference.physics_hash.1);
 
     // The resumed run told the backend exactly what the first run did after the snapshot.
-    // The first marker is `setup`'s snapshot of the empty world, before any other call.
-    let markers: Vec<usize> = calls
+    // `setup`'s snapshot of the empty world comes before any other call; the run's own
+    // snapshots, after every tick, are dropped from the log, and one restore is left.
+    assert_eq!(calls[0], Call::Snapshot);
+    let calls: Vec<Call> = calls.into_iter().filter(|call| *call != Call::Snapshot).collect();
+    let restores: Vec<usize> = calls
         .iter()
         .enumerate()
-        .filter(|(_, call)| matches!(call, Call::Snapshot | Call::Restore))
+        .filter(|(_, call)| **call == Call::Restore)
         .map(|(index, _)| index)
         .collect();
-    let [0, taken, first_end, restored, resumed_end] = markers[..] else { panic!("{markers:?}") };
-    assert_eq!(calls[restored], Call::Restore);
-    let first = between(&calls, taken, first_end);
-    let resumed = between(&calls, restored, resumed_end);
+    let [restored] = restores[..] else { panic!("{restores:?}") };
+    let taken = calls
+        .iter()
+        .position(|call| matches!(call, Call::Step { tick, .. } if tick.0 == SNAPSHOT_TICK))
+        .unwrap();
+    let first = between(&calls, taken, restored);
+    let resumed = calls[restored + 1..].to_vec();
     assert_eq!(first, resumed);
 
     // And the scene carried what it claims: the snapshot tick's post-stage spawn, despawn,

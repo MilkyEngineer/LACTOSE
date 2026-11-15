@@ -2,17 +2,17 @@
 //! `ResMut` type, so the schedule orders every query against the step; what `app` inserts
 //! through [`setup`]; and the physics snapshot the prediction world rolls back with
 //! (architecture section 10), which carries this crate's bookkeeping and the sync's
-//! pending work beside the backend's bytes.
+//! pending work beside the backend's copy of its world.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use lactose_core::{Error, ErrorKind, NetId, Result, StableKey, Tick, xxh64};
 use lactose_ecs::{ChangeMark, LogCursor, LogEntry, RegionId, RegionMode, World};
 use lactose_math::{Scalar, Vec3};
 use lactose_sim::TypeTable;
 
-use crate::backend::{PhysicsBackend, StepOutput};
+use crate::backend::{BackendCopy, PhysicsBackend, StepOutput};
 use crate::command::PhysicsCommand;
 use crate::components::{
     BodyHandle, Collider, Joint, JointHandle, RigidBody, Shape, Teleported, Transform, Velocity,
@@ -59,8 +59,8 @@ pub(crate) struct JointEntry {
 }
 
 /// This crate's bookkeeping and the sync's pending work: the one map between rows and the
-/// solver, and what the next sync would see. A [`PhysicsSnapshot`] carries a copy beside
-/// the backend's bytes and [`restore`] puts it back, so that a re-simulated tick's sync
+/// solver, and what the next sync would see. A [`PhysicsSnapshot`] carries a clone beside
+/// the backend's copy and [`restore`] puts it back, so that a re-simulated tick's sync
 /// makes exactly the backend calls the first run's did; the derived handle columns are
 /// never consulted.
 #[derive(Clone, Default)]
@@ -286,21 +286,22 @@ pub fn setup(
 /// The physics world at one tick, taken beside a `WorldSnapshot` of the same world at the
 /// same point and restored beside it (architecture section 10).
 ///
-/// Two parts. The backend's bytes: its whole world, every body, fixed collider and joint
-/// with its solver state and the key-to-handle map, with each collider's [`Shape`] value
-/// in place of the backend's shape serialisation. And this crate's bookkeeping with the
-/// sync's pending work: which rows are bodies and joints and their handles, the waiting
-/// joints, the region modes, the aliases and the unbound predicted bodies, what the last
-/// write-back wrote, the structural log entries after the sync's cursor in order and the
-/// keys changed since its mark across the five columns, so that after [`restore`] a
-/// re-simulated tick's sync makes exactly the backend calls the first run's did, apart
-/// from the calls [`corrected`] adds. The size is what milestone 1 measures against the
-/// prediction-world budget, for the claimed bodies plus the statics, which decides how
-/// many statics a prediction world may hold.
+/// Two parts. The backend's world, as the backend's [`copy`](PhysicsBackend::copy) of it
+/// (D143): every body, fixed collider and joint with its solver state and the
+/// key-to-handle map, which encodes to the backend's [`snapshot`](PhysicsBackend::snapshot)
+/// bytes of that world. And this crate's bookkeeping with the sync's pending work: which
+/// rows are bodies and joints and their handles, the waiting joints, the region modes,
+/// the aliases and the unbound predicted bodies, what the last write-back wrote, the
+/// structural log entries after the sync's cursor in order and the keys changed since its
+/// mark across the five columns, so that after [`restore`] a re-simulated tick's sync
+/// makes exactly the backend calls the first run's did, apart from the calls
+/// [`corrected`] adds.
 pub struct PhysicsSnapshot {
     identity: Arc<()>,
     tick: Tick,
-    bytes: Vec<u8>,
+    copy: Box<dyn BackendCopy>,
+    /// The length and `xxh64` of the copy's bytes, from the first call that needs either.
+    encoded: OnceLock<(usize, u64)>,
     sync: SyncState,
 }
 
@@ -311,34 +312,64 @@ impl PhysicsSnapshot {
         self.tick
     }
 
-    /// How many bytes the backend wrote; the carried bookkeeping is not counted.
+    /// How many bytes the backend would write of the world this snapshot holds; the
+    /// carried bookkeeping is not counted, and the copy held may weigh more or less. The
+    /// first call of this or [`hash`](Self::hash) encodes the copy once, which costs what
+    /// the backend's write costs, and keeps the length and the hash but not the bytes.
     #[must_use]
     pub fn size_in_bytes(&self) -> usize {
-        self.bytes.len()
+        self.encoded().0
     }
 
-    /// `xxh64` of the backend's bytes with seed zero: the place where architecture section
-    /// 8.3 adds the physics world to the world hash once the backend's serialisation is
-    /// shown to be order-stable (`docs/verification.md`). Until then SOUR records it after
-    /// the conformance run (`lactose-physics-rapier`'s `the_conformance_run`), no world hash
-    /// includes it, and two equal physics worlds may hash apart.
+    /// `xxh64` of the bytes the backend would write of the world this snapshot holds, with
+    /// seed zero, at the cost [`size_in_bytes`](Self::size_in_bytes) states: the place
+    /// where architecture section 8.3 adds the physics world to the world hash once the
+    /// backend's serialisation is shown to be order-stable (`docs/verification.md`). Until
+    /// then SOUR records it after the conformance run (`lactose-physics-rapier`'s
+    /// `the_conformance_run`), no world hash includes it, and two equal physics worlds may
+    /// hash apart.
     #[must_use]
     pub fn hash(&self) -> u64 {
-        xxh64(&self.bytes, 0)
+        self.encoded().1
+    }
+
+    fn encoded(&self) -> (usize, u64) {
+        *self.encoded.get_or_init(|| {
+            let bytes = encode(&*self.copy);
+            (bytes.len(), xxh64(&bytes, 0))
+        })
     }
 }
 
+/// The bytes `copy` encodes.
+fn encode(copy: &dyn BackendCopy) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    copy.encode(&mut bytes);
+    bytes
+}
+
+/// The bytes `snapshot`'s copy encodes and the bytes the backend of `world` writes now: the
+/// conformance run's check that a copy is the backend's world at the tick it was taken.
+pub(crate) fn copy_and_backend_bytes(
+    world: &World,
+    snapshot: &PhysicsSnapshot,
+) -> Result<(Vec<u8>, Vec<u8>)> {
+    let mut written = Vec::new();
+    physics(world)?.backend.snapshot(&mut written)?;
+    Ok((encode(&*snapshot.copy), written))
+}
+
 /// Copies the physics world of `world`'s [`Physics`] resource, between ticks, at the point
-/// `World::snapshot` is taken: the backend's bytes, and this crate's bookkeeping with what
-/// the next sync would see (the log since its cursor and the keys changed since its mark;
-/// or that a full diff is due, with the log the world retains
-/// since the sync's last pass for its reload test, when the cursor or mark is stale).
-/// Fails with `NotFound` if the world holds no [`Physics`], or as the backend's
-/// [`snapshot`](PhysicsBackend::snapshot) does.
+/// `World::snapshot` is taken: the backend's [`copy`](PhysicsBackend::copy) of its world,
+/// and this crate's bookkeeping with what the next sync would see (the log since its
+/// cursor and the keys changed since its mark; or that a full diff is due, with the log
+/// the world retains since the sync's last pass for its reload test, when the cursor or
+/// mark is stale). Writes no bytes: what it costs is the backend's copy. Fails with
+/// `NotFound` if the world holds no [`Physics`], or as the backend's copy does, which
+/// refuses what its [`snapshot`](PhysicsBackend::snapshot) refuses.
 pub fn snapshot(world: &World) -> Result<PhysicsSnapshot> {
     let physics = physics(world)?;
-    let mut bytes = Vec::new();
-    physics.backend.snapshot(&mut bytes)?;
+    let copy = physics.backend.copy()?;
     let mut sync = physics.sync.clone();
     let current = match (physics.cursor, physics.mark) {
         (Some(mut cursor), Some(mark)) if world.is_current(mark) => {
@@ -364,14 +395,21 @@ pub fn snapshot(world: &World) -> Result<PhysicsSnapshot> {
             }
         }
     }
-    Ok(PhysicsSnapshot { identity: Arc::clone(&physics.identity), tick: world.tick(), bytes, sync })
+    Ok(PhysicsSnapshot {
+        identity: Arc::clone(&physics.identity),
+        tick: world.tick(),
+        copy,
+        encoded: OnceLock::new(),
+        sync,
+    })
 }
 
 /// Replaces the physics world of `world`'s [`Physics`] resource with `snapshot`, after
 /// `World::restore` of the matching world snapshot: the world's tick must equal
 /// [`PhysicsSnapshot::tick`] and the snapshot must come from this resource. The backend's
-/// [`restore`](PhysicsBackend::restore) of the bytes rebuilds its whole world, shapes
-/// included, with no change flag, wake or mass update; nothing is replayed through
+/// [`restore_copy`](PhysicsBackend::restore_copy) of the copy replaces its whole world as a
+/// [`restore`](PhysicsBackend::restore) of the copy's bytes would, shapes included, with
+/// no change flag, wake or mass update; nothing is replayed through
 /// `set_collider` and no fixed collider is reconciled. Then the carried bookkeeping and
 /// pending work replace this crate's, and a fresh cursor and mark are taken from the
 /// restored world. The next sync processes the pending log entries before the log since
@@ -408,7 +446,7 @@ pub fn restore(world: &mut World, snapshot: &PhysicsSnapshot) -> Result<()> {
             ),
         ));
     }
-    physics.backend.restore(&snapshot.bytes)?;
+    physics.backend.restore_copy(&*snapshot.copy)?;
     physics.sync = snapshot.sync.clone();
     physics.cursor = Some(cursor);
     physics.mark = Some(mark);
@@ -453,17 +491,39 @@ mod tests {
     use lactose_ecs::{Executor, RegionConfig, WorldKind};
     use lactose_sim::{Simulation, SimulationBuilder, TickInput};
 
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use super::*;
     use crate::backend::{BodyDesc, StepInput};
     use crate::systems::register_systems;
 
-    /// A backend that holds nothing: only the bookkeeping is under test.
-    struct Null(u32);
+    /// A backend that holds nothing: only the bookkeeping is under test. Its copy counts
+    /// how often it is encoded.
+    #[derive(Default)]
+    struct Null {
+        handles: u32,
+        encodes: Arc<AtomicUsize>,
+    }
+
+    /// What [`Null`]'s copy encodes.
+    const NULL_WORLD: &[u8] = b"the null world";
+
+    struct Counted(Arc<AtomicUsize>);
+
+    impl BackendCopy for Counted {
+        fn encode(&self, out: &mut Vec<u8>) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            out.extend_from_slice(NULL_WORLD);
+        }
+    }
 
     impl PhysicsBackend for Null {
         fn create_body(&mut self, _: StableKey, _: &BodyDesc<'_>) -> Result<BodyHandle> {
-            self.0 += 1;
-            Ok(BodyHandle::new(self.0, 1))
+            self.handles += 1;
+            Ok(BodyHandle::new(self.handles, 1))
+        }
+        fn copy(&self) -> Result<Box<dyn BackendCopy>> {
+            Ok(Box::new(Counted(Arc::clone(&self.encodes))))
         }
         fn remove_body(&mut self, _: StableKey) {}
         fn set_body(&mut self, _: StableKey, _: Option<&RigidBody>) {}
@@ -526,15 +586,35 @@ mod tests {
         (physics.sync.unbound.len(), physics.sync.aliases.len())
     }
 
-    #[test]
-    fn a_bound_predicted_body_is_never_looked_up_again() {
+    fn simulation(backend: Null) -> Simulation {
         let mut types = TypeTable::new();
         register_types(&mut types).unwrap();
-        let mut simulation = SimulationBuilder::new(WorldKind::Server, types)
-            .setup(|world| setup(world, Box::new(Null(0)), PhysicsConfig::default()))
+        SimulationBuilder::new(WorldKind::Server, types)
+            .setup(|world| setup(world, Box::new(backend), PhysicsConfig::default()))
             .systems(register_systems)
             .build()
-            .unwrap();
+            .unwrap()
+    }
+
+    #[test]
+    fn a_snapshot_encodes_its_copy_once_for_the_size_and_hash_of_its_bytes() {
+        let backend = Null::default();
+        let encodes = Arc::clone(&backend.encodes);
+        let simulation = simulation(backend);
+        let taken = snapshot(simulation.world()).unwrap();
+        assert_eq!(encodes.load(Ordering::Relaxed), 0, "a take writes no bytes");
+        assert_eq!(taken.hash(), xxh64(NULL_WORLD, 0), "the hash is of the bytes");
+        assert_eq!(taken.size_in_bytes(), NULL_WORLD.len());
+        assert_eq!(taken.hash(), xxh64(NULL_WORLD, 0));
+        assert_eq!(encodes.load(Ordering::Relaxed), 1, "encoded once, on the first call");
+        let (copied, written) = copy_and_backend_bytes(simulation.world(), &taken).unwrap();
+        assert_eq!(copied, NULL_WORLD);
+        assert!(written.is_empty(), "the backend's own bytes, not the copy's");
+    }
+
+    #[test]
+    fn a_bound_predicted_body_is_never_looked_up_again() {
+        let mut simulation = simulation(Null::default());
         let region = RegionConfig { id: REGION, seed: 1, mode: RegionMode::Simulated };
         simulation.world_mut().create_region(region).unwrap();
         let executor = Executor::builder().frame_workers(1).background_workers(1).build().unwrap();
