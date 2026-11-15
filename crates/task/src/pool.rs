@@ -203,11 +203,14 @@ pub(crate) struct Pool {
 }
 
 impl Pool {
-    fn new(stealers: Vec<Stealer<Entry>>, threads: Vec<Thread>) -> Self {
+    /// A pool of one worker per stealer. Workers that `keep_timers`, the frame-critical
+    /// pool's, get a timed wait each ([`Sleep::with_timed_parks`]); it is closed when the
+    /// pool is dropped.
+    fn new(stealers: Vec<Stealer<Entry>>, threads: Vec<Thread>, keep_timers: bool) -> Self {
         let workers = stealers.len();
         Self {
             injector: Injector::new(),
-            sleep: Sleep::new(workers),
+            sleep: if keep_timers { Sleep::with_timed_parks(workers) } else { Sleep::new(workers) },
             stealers: stealers.into(),
             threads: threads.into(),
             gate: Gate::new(workers),
@@ -234,18 +237,29 @@ impl Pool {
     /// `kept` it (see [`Sleep::announce_entry`]).
     fn announce_entry(&self, kept: bool) {
         if let Some(worker) = self.sleep.announce_entry(kept) {
-            self.threads[worker].unpark();
+            self.wake_claimed(worker);
         }
     }
 
     /// Wakes `worker` whether it sleeps in the idle protocol or on a scope latch.
+    ///
+    /// A worker this does not claim is awake, parked on a latch, which waits untimed, or
+    /// claimed by another waker, which wakes it; a plain unpark is all it needs.
     pub(crate) fn wake(&self, worker: usize) {
-        let _claimed = self.sleep.notify(worker);
-        self.threads[worker].unpark();
+        if self.sleep.notify(worker) {
+            self.wake_claimed(worker);
+        } else {
+            self.threads[worker].unpark();
+        }
     }
 
     pub(crate) fn wake_all(&self) {
-        self.sleep.notify_all(|worker| self.threads[worker].unpark());
+        self.sleep.notify_all(|worker| self.wake_claimed(worker));
+    }
+
+    /// Wakes a worker this pool's sleep state has just claimed for the caller.
+    fn wake_claimed(&self, worker: usize) {
+        self.sleep.wake_claimed(worker, || self.threads[worker].unpark());
     }
 
     /// Unparks `worker`, which waits on a scope latch that has just been set.
@@ -338,6 +352,7 @@ pub(crate) fn time_steals(
     let pool = Pool::new(
         vec![victim.stealer(), thief.stealer()],
         vec![std::thread::current(), std::thread::current()],
+        false,
     );
     let (filled, wait_filled) = std::sync::mpsc::channel::<usize>();
     let (stolen, wait_stolen) = std::sync::mpsc::channel::<Vec<u64>>();
@@ -423,8 +438,9 @@ impl Shared {
         handles: Vec<ThreadHandle>,
     ) -> Self {
         Self {
-            frame: Pool::new(frame.0, frame.1),
-            background: Pool::new(background.0, background.1),
+            // Only the frame-critical pool keeps the timers (`idle`).
+            frame: Pool::new(frame.0, frame.1, true),
+            background: Pool::new(background.0, background.1, false),
             platform,
             shutdown: AtomicBool::new(false),
             timers: Timers::new(),

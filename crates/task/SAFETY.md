@@ -5,10 +5,11 @@ comments rely on. The crate's tests run under Miri, with the stand-in deque desc
 `src/deque.rs`; the scope latch and the sleep protocol, which decide when the borrows below
 end, are modelled under loom.
 
-Architecture section 21 lists three reasons for unsafe here: deques, scope borrows and the
-panic guard. The deque itself is `crossbeam-deque` and needs no unsafe of ours beyond sending
-entries through it. The panic guard (`guard.rs`) turned out to need none: it is a value whose
-destructor aborts and which is forgotten on the normal path. What remains is below.
+Architecture section 21 lists the reasons for unsafe here: deques, scope borrows, the panic
+guard, core-topology queries and the keeper's timed wait on Windows. The deque itself is
+`crossbeam-deque` and needs no unsafe of ours beyond sending entries through it. The panic
+guard (`guard.rs`) turned out to need none: it is a value whose destructor aborts and which
+is forgotten on the normal path. What remains is below.
 
 ## Scope borrows (`job.rs`, and the `Send` impl in `pool.rs`)
 
@@ -81,6 +82,23 @@ What follows from the first:
   is dropped in place, by `finish` or, for a task that lost its handle and every waker while
   suspended, by the cell's own destructor, which has exclusive access by `&mut self`.
 
+## The keeper's timed wait (`sync.rs`, Windows)
+
+`TimedPark` (`sync.rs`, Windows) holds two kernel handles. A handle is a process-wide value
+and is valid on every thread. `SetEvent` may be called on the event from any thread at any
+time. Only the worker a `TimedPark` belongs to calls `SetWaitableTimer` or waits on either
+handle. Both are closed once, in `Drop`. `Drop` holds the only reference to the pool, so no
+other call is in progress or can begin; it may run on a worker's thread as that worker
+exits.
+
+- **`unsafe impl Send` and `unsafe impl Sync` for `TimedPark`.** A handle is a raw pointer
+  in `windows-sys`, so neither is derived. Both rest on the paragraph above: what a handle
+  names is not tied to a thread, the one call any thread makes is `SetEvent`, which the
+  kernel serialises, and the calls of the owning worker are its own.
+- The pool makes the handles when it is built, before any worker enters its loop, and they
+  live as long as the pool, so every wake and wait that reaches one through the pool finds it
+  open. Under Miri `TimedPark` is `std::thread::park_timeout` and makes no Windows call.
+
 ## Operating-system queries (`platform.rs`)
 
 - macOS: `sysctlbyname` is called with a NUL-terminated name, a pointer to a live `i32` and
@@ -94,3 +112,6 @@ What follows from the first:
 - Linux reads sysfs with safe code.
 - The benchmark (`benches/whisk.rs`) calls `getrusage` on Unix with a pointer to a zeroed
   `rusage` and reads it only if the call succeeded.
+- On Windows it calls `QueryProcessCycleTime` and `QueryThreadCycleTime` with the pseudo
+  handle of the current process or thread, which is always valid, and a pointer to a live
+  `u64`, which it reads only if the call succeeded.

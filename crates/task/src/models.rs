@@ -3,7 +3,8 @@
 //!
 //! Run with `cargo test -p lactose-task --features loom --release`. Every model calls the
 //! functions the executor ships: `gate::wait_for_children` is the opener's wait,
-//! `Sleep::announce_entry` is what a worker does after queueing work, `Timers::fire_due`
+//! `Sleep::announce_entry` is what a worker does after queueing work, `Sleep::wake_claimed`
+//! is how it wakes the worker it claimed, `Timers::fire_due`
 //! is how a deadline reaches its task, `Quiesce` is what holds a run's future back. What a model supplies is only what loom does not model: a
 //! deque is a counter, a worker is a loom thread, and a scope's children are a number.
 //!
@@ -286,7 +287,7 @@ fn take_one_entry(sleep: &Sleep, queue: &AtomicUsize, worker: usize) {
 fn push_one_entry(sleep: &Sleep, queue: &AtomicUsize, workers: &[Thread], kept: bool) {
     queue.fetch_add(1, Ordering::Release);
     if let Some(worker) = sleep.announce_entry(kept) {
-        workers[worker].unpark();
+        sleep.wake_claimed(worker, || workers[worker].unpark());
     }
 }
 
@@ -386,12 +387,12 @@ fn sleep_delivers_targeted_and_broadcast_wakes() {
             thread::spawn(move || {
                 flag.store(1, Ordering::Release);
                 if sleep.notify(0) {
-                    main.unpark();
+                    sleep.wake_claimed(0, || main.unpark());
                 }
                 flag.store(2, Ordering::Release);
                 sleep.notify_all(|worker| {
                     assert_eq!(worker, 0);
-                    main.unpark();
+                    sleep.wake_claimed(worker, || main.unpark());
                 });
             })
         };
@@ -466,7 +467,7 @@ struct PoolWake {
 impl Wake for PoolWake {
     fn idle_one(&self) {
         if let Some(worker) = self.sleep.notify_one() {
-            self.threads[worker].unpark();
+            self.sleep.wake_claimed(worker, || self.threads[worker].unpark());
         }
     }
 
@@ -495,7 +496,7 @@ fn work(
             if queue.fetch_update(Ordering::AcqRel, Ordering::Acquire, take).is_ok() {
                 // Stands for shutdown: lets the other worker's model thread end.
                 taken.store(true, Ordering::SeqCst);
-                sleep.notify_all(|worker| wake.unpark(worker));
+                sleep.notify_all(|worker| sleep.wake_claimed(worker, || wake.unpark(worker)));
                 break;
             }
             gate.release_idle(wake);
@@ -601,8 +602,9 @@ fn shutdown_parks_an_opener_with_nothing_on_its_deque() {
 /// another thread registers an earlier one. The registration must reach the keeper, which
 /// gives the watch up and takes it again for the earlier deadline. The wait is the shipped
 /// idle sequence (`gate::idle_park` over `Timers::keep` and `Timers::release`) with the
-/// stepped timed park; under loom a step is a plain park, so the keeper can only be woken
-/// by the hand-off itself, and a lost hand-off is a deadlock here.
+/// stepped timed park. Under loom a step waits on a flag that only `Sleep::wake_claimed`
+/// sets, so the keeper can only be woken by the hand-off itself, and a lost hand-off, or a
+/// hand-off that only unparks, is a deadlock here.
 #[test]
 fn an_earlier_timer_reaches_the_parked_keeper() {
     use core::task::Waker;
@@ -612,7 +614,7 @@ fn an_earlier_timer_reaches_the_parked_keeper() {
 
     loom::model(|| {
         let gate = Arc::new(Gate::new(1));
-        let sleep = Arc::new(Sleep::new(1));
+        let sleep = Arc::new(Sleep::with_timed_parks(1));
         let timers = Arc::new(Timers::new());
         // Far enough that neither is due during the model.
         let later = Instant::now() + Duration::from_secs(3600);
@@ -637,13 +639,13 @@ fn an_earlier_timer_reaches_the_parked_keeper() {
                 match timers.register(earlier, &mut earlier_id, Waker::noop()) {
                     Rearm::Keeper(worker) => {
                         if sleep.notify(worker) {
-                            keeper.unpark();
+                            sleep.wake_claimed(worker, || keeper.unpark());
                         }
                     }
                     Rearm::AnySleeper => {
                         if let Some(worker) = sleep.notify_one() {
                             assert_eq!(worker, 0);
-                            keeper.unpark();
+                            sleep.wake_claimed(worker, || keeper.unpark());
                         }
                     }
                     Rearm::Nobody => unreachable!("the earlier deadline is new"),
@@ -653,7 +655,7 @@ fn an_earlier_timer_reaches_the_parked_keeper() {
                     thread::yield_now();
                 }
                 stop.store(true, Ordering::SeqCst);
-                sleep.notify_all(|_| keeper.unpark());
+                sleep.notify_all(|worker| sleep.wake_claimed(worker, || keeper.unpark()));
             })
         };
 
