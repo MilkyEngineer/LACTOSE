@@ -1,8 +1,8 @@
 # The keeper's timed wait on Windows, and what tick start is held to there
 
 Status: proposal, not applied. Written at main `88eecf1`, architecture revision 3.3, and
-revised after its first review. Nothing of section 7 is applied until the owner answers
-section 6's questions. This document changes no code.
+revised after each of its two reviews. Nothing of section 7 is applied until the owner
+answers section 6's questions. This document changes no code.
 
 A Windows 11 laptop ran `cargo xtask measure --all` at `bef3455`. Its WHISK file
 (`docs/results/whisk-laptop-windows-2026-11-15.md`) puts tick start at P50 4.3 ms and P99
@@ -233,10 +233,10 @@ What the table shows, each point the laptop's:
   to 13 to at most 1, for 0.77 to 1.11% of a core. `sleep` gives P99 0.56 to 0.67 ms and at
   most 3. The 0.49 ms and the 1.11% are the earlier run's, taken while another process held an
   8 ms timer period. With the timer 685 and 769 deadlines of 1,000 are then within 35 µs.
-- 1,000 and 1,500 µs lower no P99 and no count over 1 ms that both runs agree on. With the
-  timer, 1,000 µs cuts the deadlines over 35 µs by 45 to 64% (315 to 173, and 231 to 84) and
-  1,500 µs by 22 to 64%, for 1.5 to 2.0% of a core, at or over D138's 1.5%. The same row's
-  late count varies up to twofold between the runs.
+- 1,000 µs lowers no P99 and no count over 1 ms that both runs agree on; 1,500 µs lowers P99
+  in both (589 to 570 and 493 to 333 µs) and raises the count over 1 ms in both (0 to 1, 1
+  to 2); with the timer they cut the deadlines over 35 µs by 45 to 64% and 22 to 64%, for
+  1.5 to 2.0% of a core. The same row's late count varies up to twofold between the runs.
 - With the timer, 2,000 µs costs 6.9 to 7.7% of a core and still leaves 56 to 103 deadlines
   of 1,000 over 35 µs. `sleep` costs 7.7 to 7.8% and leaves 85 to 100.
 - `park_timeout` under a 1 ms period is worse than both at every threshold.
@@ -379,12 +379,14 @@ Windows is held to 1 ms at P99.**
 
 - The lane's own measurement. Probe 3 emulates the loop on one thread at normal priority; the
   keeper is a frame-critical worker inside the executor. The lane's branch holds a commit
-  with the Windows threshold at 50 µs directly before the one that sets 500 µs, and the
-  laptop runs the benchmark at the lane's base, at that commit and at the head. If the head's
-  process CPU at 60 Hz is more than 0.015 s a second above the 50 µs commit's, which is 1.5%
-  of a core, or its P99 is not under 1 ms, the lane drops its last commit, the threshold
-  stays 50 µs and Windows is held to 2 ms, recorded as an addendum to D144. The owner is not
-  asked again.
+  with the Windows threshold at 50 µs directly before the one that sets 500 µs. Only the
+  coordinator pushes, and only to main, so the laptop cannot fetch the lane before its
+  merge. After the merge is pushed, the laptop runs the benchmark at the merge's first
+  parent, at the lane's 50 µs commit and at the merge. If the merge's process CPU at 60 Hz
+  is more than 0.015 s a second above the 50 µs commit's, which is 1.5% of a core, or its
+  P99 is not under 1 ms, a follow-up commit on main sets the Windows threshold back to
+  50 µs and the benchmark's to 2 ms, recorded as D144's addendum, and Windows is held to
+  2 ms. The owner is not asked again.
 - The desktop booting no Windows. Then no session of milestone 1 reads a Windows timer row,
   the lane moves to the head of milestone 2, where the first Windows client needs it, and the
   row is gated there (section 6, the last option of its second question).
@@ -430,13 +432,15 @@ Windows is held to 1 ms at P99.**
   keeper's timed wait: "`TimedPark` (`sync.rs`, Windows) holds two kernel handles. A handle is
   a process-wide value and is valid on every thread. `SetEvent` may be called on the event
   from any thread at any time. Only the worker a `TimedPark` belongs to calls
-  `SetWaitableTimer` or waits on either handle. Both are closed once, in `Drop`, which runs
-  when the pool that owns them is dropped: every worker has exited by then and no reference
-  to the pool is left, so no call reaches a closed handle."
-- Under loom, `TimedPark` is a flag of the worker's own that `wake` sets. `wait` returns only
-  once it is set, and an unpark alone parks again, as the Windows wait is not ended by an
-  unpark. The models' waker sides call `Sleep::wake_claimed`, the function the pool's three
-  sites call: in the helpers `push_one_entry`, `PoolWake::idle_one` and `work`, and inline in
+  `SetWaitableTimer` or waits on either handle. Both are closed once, in `Drop`. `Drop` holds
+  the only reference to the pool, so no other call is in progress or can begin; it may run
+  on a worker's thread as that worker exits."
+- Under loom, `TimedPark` is an `AtomicBool` that `wake` sets with `swap(true, SeqCst)` and
+  `wait` takes with `swap(false, SeqCst)`, parking while it was false; a plain store and a
+  flag behind a loom mutex do not serve. An unpark alone parks again, as the Windows wait is
+  not ended by an unpark. The models' waker sides call `Sleep::wake_claimed`, the function
+  the pool's three sites call: in the helpers `push_one_entry`, `PoolWake::idle_one` and
+  `work`, and inline in
   `sleep_delivers_targeted_and_broadcast_wakes` and
   `an_earlier_timer_reaches_the_parked_keeper`. That last one, the keeper hand-off, is the
   only model with a timed park, and it is the one that fails when a waker skips the event.
@@ -480,10 +484,11 @@ Windows is held to 1 ms at P99.**
 - Gates beside the standard ones: the Windows cross-target clippy for `lactose-task`;
   `cargo xtask features`, since the features of `windows-sys` reach the boundary's closure
   through `lactose-core`; the merge pushed alone (D125).
-- Measurement, on the laptop as labelled data: `cargo bench -p lactose-task --bench whisk` at
-  the lane's base, at its 50 µs commit and at its head. The timer rows show the fix and
-  decide the threshold. The makespan rows show how much of their failure was the tick-long
-  gap. The wake row shows what the `SetEvent` costs.
+- Measurement, on the laptop as labelled data, once the merge is pushed:
+  `cargo bench -p lactose-task --bench whisk` at the merge's first parent, at the lane's
+  50 µs commit and at the merge. The timer rows show the fix and decide the threshold. The
+  makespan rows show how much of their failure was the tick-long gap. The wake row shows
+  what the `SetEvent` costs.
 
 **The loom probe.** It changed the loom side only, in a scratch copy of `88eecf1`: `Sleep`
 owning a flag for each worker behind the `sync` shim, `Sleep::wake_claimed`, the pool's three
@@ -496,16 +501,20 @@ sites and the models' eight waker sites.
   thirteen pass. It fails as "exceeded maximum number of branches", not as a reported
   deadlock, because its registrar waits for the keeper in a yield loop.
 - Two shapes of the flag did not serve. `loom::sync::Notify` asserts when loom's unpark makes
-  runnable a thread blocked on it. A bare atomic swap read a store older than the waker's.
-  The probe's flag sat behind a loom mutex.
+  runnable a thread blocked on it. A flag the waker set with a plain store was read stale by
+  the keeper's swap. The probe then put the flag behind a loom mutex. The second review's
+  probe took the mutex away with a swap on both sides, which is the shape the lane takes
+  (section 8).
 
 **Runs: 8.** Seven for the lane, and the concurrency reviewer beside its first review. The
-modelling is about forty changed lines in the probe and needs no run of its own, so the
-alternative, amending section 5.1 to say the event is not modelled, is not taken.
+modelling is about forty changed lines in the probe and needs no run of its own. If the lane
+cannot keep the fourteen models passing and both mutations failing, it stops, and the
+coordinator amends 5.1 instead.
 
 After the lane merges, a Windows session writes its `whisk` file at the first commit of main
-that holds the lane. Every other file of session B stands at the measurement commit: the lane
-changes no code on another platform and none that the other measurements wait in.
+that holds the lane and, if one is made, that follow-up. Every other file of session B
+stands at the measurement commit: the lane changes no code on another platform and none
+that the other measurements wait in.
 
 ## 5. The wake from a parked pool, and the makespan
 
@@ -687,55 +696,48 @@ with each point labelled measured or hypothesis.
 
 ## 6. The questions for the owner
 
-The coordinator asks both in one call. The first is a fact no document records, and its
-answer can change the recommendation of the second. In the second the recommended option is
-first.
+The coordinator asks both in one call, as this input. The first is a fact no document
+records. One call cannot let the first answer move "(Recommended)" in the second, so the
+condition is in the second question's text and in its last option's description.
 
-**Question 1.** Header: "Desktop OS". One answer.
+```json
+{"questions":[
+{"header":"Desktop OS","question":"Which operating systems does the x86 desktop boot? No document records it, and it decides whether milestone 1 reads a Windows timer row at all.","multiSelect":false,"options":[
+{"label":"Windows and another system","description":"Session B runs on both. The Windows whisk file is written after the timer lane, and the other system's file reads against 20 µs."},
+{"label":"Windows only","description":"Session B runs on Windows alone, so tick start's x86 half rests on the Windows figure."},
+{"label":"No Windows","description":"No session of milestone 1 reads a Windows timer row."},
+{"label":"Not yet known","description":"Session A has not reported. The lane waits for nothing either way."}]},
+{"header":"Windows tick","question":"On Windows the timer root starts ticks up to a whole tick late: Rust's timed park there waits in whole milliseconds on the 15.6 ms system timer, and a laptop measured tick start at P99 15.9 ms against the 20 µs criterion. Windows' finer timer overshoots by about half a millisecond, and on the laptop only a keeper that spun a whole core met the criterion. What is tick start held to on Windows? If the desktop boots no Windows, the last option is recommended instead.","multiSelect":false,"options":[
+{"label":"1 ms, 500 µs spin (Recommended)","description":"One lane of eight runs in milestone 1: the keeper waits on a high-resolution timer and a wake event and spins the last 500 µs, about 1% of one core while the frame workers are idle. On the laptop about seven ticks in ten then started within 35 µs and P99 was 0.49 to 0.59 ms; if the lane's own measurement does not bear that out it falls back to the next option without asking again."},
+{"label":"2 ms, no added spin","description":"The same lane with nothing spinning longer than today. On the laptop the median tick then started 0.3 ms late and P99 was 1.0 to 1.1 ms."},
+{"label":"Fix now, figure later","description":"The same lane as the first option, with Windows left at 20 µs on paper until the laptop measures a wait asked once with a longer spin. A 2 ms spin already cost about 7% of a core there and left 6 to 10% of deadlines over 35 µs late."},
+{"label":"Leave for milestone 2","description":"No lane now, and the recommendation if the desktop boots no Windows. The row is re-gated to milestone 2, where the first Windows client needs it, and a Windows session's timer rows prove nothing in milestone 1."}]}]}
+```
 
-> Which operating systems does the x86 desktop boot? No document records it, and it decides
-> whether milestone 1 reads a Windows timer row at all.
-
-| Label | Description | What it does to question 2 |
-|---|---|---|
-| Windows and another system | Session B runs on both. The Windows `whisk` file is written after the timer lane, and the other system's file reads against 20 µs. | The recommendation stands |
-| Windows only | Session B runs on Windows alone, so tick start's x86 half rests on the Windows figure. | The recommendation stands |
-| No Windows | No session of milestone 1 reads a Windows timer row. | The fourth option, leave it for milestone 2, becomes the recommendation |
-| Not yet known | Session A has not reported. The lane waits for nothing either way. | The recommendation stands; if the desktop proves to boot no Windows, the lane is milestone 2's work done early |
-
-**Question 2.** Header: "Windows tick". One answer.
-
-> On Windows the timer root starts ticks up to a whole tick late: Rust's timed park there
-> waits in whole milliseconds on the 15.6 ms system timer, and a laptop measured tick start at
-> P99 15.9 ms against the 20 µs criterion. Windows' finer timer overshoots by about half a
-> millisecond, and on the laptop only a keeper that spun a whole core met the criterion. What
-> is tick start held to on Windows?
-
-| Label | Description |
-|---|---|
-| 1 ms, 500 µs spin (Recommended) | One lane of eight runs in milestone 1: the keeper waits on a high-resolution timer and a wake event and spins the last 500 µs, about 1% of one core while the frame workers are idle. On the laptop about seven ticks in ten then started within 35 µs and P99 was 0.49 to 0.59 ms; if the lane's own measurement does not bear that out it falls back to the next option without asking again. |
-| 2 ms, no added spin | The same lane with nothing spinning longer than today. On the laptop the median tick then started 0.3 ms late and P99 was 1.0 to 1.1 ms. |
-| Fix now, figure later | The same lane as the first option, with Windows left at 20 µs on paper until the laptop measures a wait asked once with a longer spin. A 2 ms spin already cost about 7% of a core there and left 6 to 10% of deadlines over 35 µs late. |
-| Leave for milestone 2 | No lane now. The row is re-gated to milestone 2, where the first Windows client needs it, and a Windows session's timer rows prove nothing in milestone 1. |
-
-Section 7 calls these answers 1 to 4, in this order.
+Section 7 calls question 2's options answers 1 to 4, in this order.
 
 ## 7. Text for the coordinator (exact)
 
-D144 is the next free number. The coordinator writes the date of the owner's answer where the
-text says `<date>`. The blocks under "Decision entry", "Architecture amendments", "Plan
-amendments", "Verification rows" and "README sentences" are for answer 1. The two sections
-after them give every row that differs for answers 2 and 3, composed in full, and say what
-does not change. Answer 4 has its own short section.
+D144 is the next free number. The coordinator fills two placeholders in each entry's "Driven
+by": `<date>`, the date of the owner's answers, and `<answer 1>`, the operating systems the
+owner names for the desktop in question 1. The blocks under "Decision entry", "Architecture
+amendments", "Plan amendments", "Verification rows" and "README sentences" are for answer
+1. The two sections after them give every row that differs for answers 2 and 3, composed in
+full, and say what does not change. Answer 4 has its own short section.
 
-Anchors. Each amendment is anchored on text that occurs once in its file at `88eecf1` and at
-`49f36d4`, the merge of D141 that landed while this was revised, matched regardless of
-whitespace where it crosses a line break. That merge edits `docs/decisions-log.md`, two rows
-of `docs/verification.md` ("A `Server` world can store an `OwnedBy`" and "Transient presence
-on the wire", each appended to) and the READMEs of seven crates, none of them
-`lactose-task`. It touches neither `docs/architecture.md` nor the plan, and no anchor below
-lies in a row or a file it changed. The new verification row goes at the end of section 4 as
-it then stands.
+Anchors. Each amendment is anchored on text that occurs once in its file at `88eecf1`, at
+`49f36d4` and at `6d1e652`, matched regardless of whitespace where it crosses a line break.
+The last two are merges that landed while this was revised. `49f36d4`, the merge of D141,
+edits `docs/decisions-log.md`, two rows of `docs/verification.md` ("A `Server` world can
+store an `OwnedBy`" and "Transient presence on the wire", each appended to) and the READMEs
+of seven crates, none of them `lactose-task`. `6d1e652`, the merge of `spike-net-file`, edits
+three places beside an anchor: criterion 7's row in the plan; the plan's rule that begins
+"Criterion 5 is proven at the first commit of main that holds `slot-copy`"; and the
+verification row "Section 22's milestone 1 timing criteria", in its middle. No anchor's
+meaning changed. That verification row still ends "the spike's digest the M1 gives", so
+the append is unaffected. The plan's rule still ends "and session B is unchanged: its slot
+figure is recorded, of the byte form (D143)", so the rule added after it reads true. The new
+verification row goes at the end of section 4 as it then stands.
 
 ### Decision entry
 
@@ -782,11 +784,12 @@ it then stands.
     to 0.49 to 0.59 ms, with at most 1 deadline of 1,000 over 1 ms late and 685 to 769 within
     35 µs, for 0.77 to 1.11% of one core at 60 deadlines a second while the frame workers are
     otherwise idle. That is inside the 1.5% of a core D138 allowed the keeper's attempt on the
-    M1, read as an increment over the 50 µs build. Thresholds of 1,000 and 1,500 µs lowered no
-    P99 and no count over 1 ms that both runs agree on, and cost 1.5 to 2.0% of a core, at or
-    over that allowance, though 1,000 µs cut the deadlines over 35 µs by 45 to 64%. 2,000 µs
-    cost 6.9 to 7.7% of a core and still left 56 to 103 deadlines of 1,000 over 35 µs. Rules
-    out a Windows keeper that spins to the criterion.
+    M1, read as an increment over the 50 µs build. 1,000 µs lowered no P99 and no count over
+    1 ms that both runs agree on; 1,500 µs lowered P99 in both (589 to 570 and 493 to 333 µs)
+    and raised the count over 1 ms in both (0 to 1, 1 to 2); with the timer they cut the
+    deadlines over 35 µs by 45 to 64% and 22 to 64%, for 1.5 to 2.0% of a core, at or over
+    that allowance. 2,000 µs cost 6.9 to 7.7% of a core and still left 56 to 103 deadlines
+    of 1,000 over 35 µs. Rules out a Windows keeper that spins to the criterion.
   - *Tick start on Windows is held to 1 ms at P99, at 60 Hz.* It is set at what the operating
     system gives, as D113 set the push criterion. Lateness does not accumulate
     (`TickPacer::poll`), and no consumer of tick start in milestone 1 depends on it (D138);
@@ -795,25 +798,29 @@ it then stands.
     out a criterion on Windows that only a whole core can meet.
   - *The lane confirms the threshold on the real executor.* The probes emulate the loop on one
     thread at normal priority. The lane's branch holds a commit with the Windows threshold at
-    50 µs directly before the one that sets 500 µs, and the laptop runs the benchmark at the
-    lane's base, at that commit and at the head. If the head's process CPU at 60 Hz is more
-    than 0.015 s a second above the 50 µs commit's, which is 1.5% of a core, or its P99 is not
-    under 1 ms, the lane drops its last commit, the threshold stays 50 µs and Windows is held
-    to 2 ms at P99, recorded as an addendum here. The desktop's file is the proof either way.
+    50 µs directly before the one that sets 500 µs. After the merge is pushed, the laptop
+    runs the benchmark at the merge's first parent, at the lane's 50 µs commit and at the
+    merge. If the merge's process CPU at 60 Hz is more than 0.015 s a second above the 50 µs
+    commit's, which is 1.5% of a core, or its P99 is not under 1 ms, a follow-up commit on
+    main sets the Windows threshold back to 50 µs and the benchmark's to 2 ms, recorded as an
+    addendum here, and Windows is held to 2 ms at P99. The desktop's file is the proof either
+    way.
   - *It is a lane of its own in milestone 1, `timer-windows`, not D138's one attempt.* The
     M1's miss is under 10 µs for a cause nobody knows; Windows' is 15 ms for a known one.
     Rules out spending `keeper`'s attempt on it, and a Windows session whose timer rows fail
     whatever the machine is.
   - *A Windows session writes its `whisk` file at the first commit of main that holds the
-    lane.* Every other file of session B stands at the measurement commit.
+    lane and, if one is made, that follow-up.* Every other file of session B stands at the
+    measurement commit.
   - *The wake from a parked pool on Windows is another cause and is not decided.* The laptop's
     P50 145.9 µs has no timed wait on its path. Its makespan rows were taken after gaps of a
     tick, not of 1 ms, which the lane's before and after on the laptop shows. A probe is
     briefed, and a decision comes due if the desktop's Windows file fails either.
 - Driven by: the Windows laptop's result files at `bef3455` and its two timer probes; the
   proposal's first review, which showed that an event the worker owned could be set after the
-  worker closed it and that the loom models did not cover the event; the owner's answer of
-  <date> (fix the wait in milestone 1, spin the last 500 µs and hold Windows to 1 ms at P99).
+  worker closed it and that the loom models did not cover the event; the owner's answers of
+  <date> (the desktop boots <answer 1>; fix the wait in milestone 1, spin the last 500 µs
+  and hold Windows to 1 ms at P99).
 - Replaced: on Windows, D113's tick-start figure, which becomes 1 ms at P99 at 60 Hz, and
   D113's premise that a stepped park with a 50 µs spin meets 20 µs, which holds only where a
   timed park can be asked for less than a millisecond; D138's reading of the x86 session's
@@ -860,7 +867,7 @@ true.
 | Session A's numbers; `timer-windows` merged, since both edit `crates/task/src/sleep.rs`. The Windows timed wait is not this lane's (D144) | Result file `whisk` from a quiet M1, or the cause stated | 4 to 8, counted as 6 |
 
 --- section 3, the second lane table: add a row after `slot-copy` ---
-| `timer-windows` | The keeper's timed wait on Windows (D144), in `lactose-task` alone. The `sync` shim gains `TimedPark`, one worker's timed wait. On Windows, outside loom and Miri, it holds an auto-reset event and a high-resolution waitable timer that is not manual-reset; `wait` sets the timer before every wait and waits on both; `wake` sets the event. Elsewhere `wait` is `std::thread::park_timeout` and `wake` does nothing. Under loom it is a flag that `wake` sets and that an unpark alone does not satisfy. The frame-critical pool's `Sleep` holds one for each worker: the pool makes them when it is built, before a worker enters its loop, and closes them in its `Drop`, after the last handle to the executor and the last worker. `Sleep::wake_claimed` wakes a claimed worker's `TimedPark` and unparks it, and is called only after a successful claim, by `Pool::announce_entry`, by `Pool::wake` when `Sleep::notify` returned true and by `Pool::wake_all`; `Pool::wake`'s unpark of a worker it did not claim stays an unpark. The models' waker sides call the same function. A worker whose event or timer cannot be made keeps `std::thread::park_timeout`, logged once; a failed `SetWaitableTimer` or a `WAIT_FAILED` is logged once and that wait is a `park_timeout`. `unsafe impl Send` and `Sync` for `TimedPark`, with its `SAFETY.md` section. The spin threshold is 500 µs on Windows and 50 µs elsewhere, set in the lane's last commit, with the commit before it holding 50 µs on Windows; the step stays 0.6. `crates/task/Cargo.toml` adds `Win32_System_Threading` and `Win32_Security` to its `windows-sys` features, and `Win32_System_WindowsProgramming` as a dev-dependency feature for the benchmark. The README's sentences; the benchmark's timer threshold on Windows, 1 ms, and its process CPU column on Windows, from `QueryProcessCycleTime` | None | In `check (windows-latest)`, a debug nextest run: the median lateness of fifty 2 ms deadlines through `sleep_until` on an otherwise idle pool is under 7.8 ms, half a default tick, where today's code gives about 14 ms and the fix under 1 ms, with that reasoning in the test; on a one-worker frame pool a keeper waiting on a deadline an hour away is ended by an earlier timer, by pushed work and by shutdown, each inside `LIMIT`, and with the event unset the keeper sleeps 36 minutes and the test times out. Under loom the fourteen models pass, and the keeper hand-off model fails when a waker of it unparks without `Sleep::wake_claimed` and when `wake_claimed` does not set the flag. Miri passes unchanged. The Windows cross-target clippy and `cargo xtask features` pass. The merge is pushed alone (D125). The laptop runs the benchmark at the lane's base, at its 50 µs commit and at its head, as labelled data: the timer rows with their process CPU, and the makespan and wake rows beside them. If the head's process CPU at 60 Hz is more than 0.015 s a second above the 50 µs commit's there, or its P99 is not under 1 ms, the lane drops its last commit, sets the benchmark's threshold to 2 ms and says so for D144's addendum | 8: seven, and the concurrency reviewer beside its first review |
+| `timer-windows` | The keeper's timed wait on Windows (D144), in `lactose-task` alone. The `sync` shim gains `TimedPark`, one worker's timed wait. On Windows, outside loom and Miri, it holds an auto-reset event and a high-resolution waitable timer that is not manual-reset; `wait` sets the timer before every wait and waits on both; `wake` sets the event. Elsewhere `wait` is `std::thread::park_timeout` and `wake` does nothing. Under loom it is an `AtomicBool` that `wake` sets with `swap(true, SeqCst)` and `wait` takes with `swap(false, SeqCst)`, parking while it was false; a plain store and a flag behind a loom mutex do not serve. The frame-critical pool's `Sleep` holds one for each worker: the pool makes them when it is built, before a worker enters its loop, and closes them in its `Drop`, after the last handle to the executor and the last worker. `Sleep::wake_claimed` wakes a claimed worker's `TimedPark` and unparks it; it takes the unpark as a closure, or is generic over the thread handle, so the pool's std threads and the models' loom threads share it. It is called only after a successful claim, by `Pool::announce_entry`, by `Pool::wake` when `Sleep::notify` returned true and by `Pool::wake_all`; `Pool::wake`'s unpark of a worker it did not claim stays an unpark. The models' waker sides call the same function. A worker whose event or timer cannot be made keeps `std::thread::park_timeout`, logged once; a failed `SetWaitableTimer` or a `WAIT_FAILED` is logged once and that wait is a `park_timeout`. `unsafe impl Send` and `Sync` for `TimedPark`, with its `SAFETY.md` section. The spin threshold is 500 µs on Windows and 50 µs elsewhere, set in the lane's last commit, with the commit before it holding 50 µs on Windows; the step stays 0.6. `crates/task/Cargo.toml` adds `Win32_System_Threading` and `Win32_Security` to its `windows-sys` features, and `Win32_System_WindowsProgramming` as a dev-dependency feature for the benchmark. The README's sentences; the benchmark's timer threshold on Windows, 1 ms, and its process CPU column on Windows, from `QueryProcessCycleTime` | None | In `check (windows-latest)`, a debug nextest run: the median lateness of fifty 2 ms deadlines through `sleep_until` on an otherwise idle pool is under 7.8 ms, half a default tick, where today's code gives about 14 ms and the fix under 1 ms, with that reasoning in the test; on a one-worker frame pool a keeper waiting on a deadline an hour away is ended by an earlier timer, by pushed work and by shutdown, each inside `LIMIT`, and with the event unset the keeper sleeps 36 minutes and the test times out. Under loom the fourteen models pass, and the keeper hand-off model fails when a waker of it unparks without `Sleep::wake_claimed` and when `wake_claimed` does not set the flag. Miri passes unchanged. The Windows cross-target clippy and `cargo xtask features` pass. The merge is pushed alone (D125). After the merge is pushed, the laptop runs the benchmark at the merge's first parent, at the lane's 50 µs commit and at the merge, as labelled data: the timer rows with their process CPU, and the makespan and wake rows beside them. If the merge's process CPU at 60 Hz is more than 0.015 s a second above the 50 µs commit's there, or its P99 is not under 1 ms, a follow-up commit on main sets the Windows threshold back to 50 µs and the benchmark's to 2 ms, recorded as D144's addendum | 8: seven, and the concurrency reviewer beside its first review |
 
 --- section 3, after the paragraph that begins "D143 adds `slot-copy`": add a paragraph ---
 D144 adds `timer-windows`, eight runs, and four or five for its proposal: its review, its
@@ -878,9 +885,10 @@ Seven rules bind whatever the coordinator reorders:
 
 --- section 3, after the rule that begins "Criterion 5 is proven at the first commit of main that holds `slot-copy`": add a rule ---
 - On Windows, milestone 0's `whisk` file is written at the first commit of main that holds
-  `timer-windows`, by `cargo xtask measure whisk`, not at the measurement commit. Before the
-  lane its timer rows fail on any machine and its makespan rows are taken after gaps of a
-  tick (D144). Every other file of session B stands at the measurement commit.
+  `timer-windows` and, if one is made, that follow-up, by `cargo xtask measure whisk`, not at
+  the measurement commit. Before the lane its timer rows fail on any machine and its
+  makespan rows are taken after gaps of a tick (D144). Every other file of session B stands
+  at the measurement commit.
 
 --- section 4, the paragraph "Session A": replace ---
 if it fails there, that failure is the session's result and goes to `keeper`.
@@ -916,10 +924,10 @@ and does better with two zstd tasks running, which fits workers waking slowly fr
 and does better with two zstd tasks running, which fits workers waking slowly from idle. It is not the timed wait (D144): the pool of the wake phase parks with no deadline, std's `park`, which is `WaitOnAddress` with no timeout, and is woken by `WakeByAddressSingle`. The makespan phase's 1 ms gap between runs is a `sleep_until` through the keeper and lasted a tick on Windows, so its runs began from a pool idle about sixteen times longer than a frame's gap; lane `timer-windows` runs the benchmark on the laptop before and after, which shows that part. The rest is not diagnosed. The candidates are the cores' idle states, the scheduler's choice of core on a hybrid part, Windows' power throttling of a process without a foreground window, and the system timer's rate; the laptop probe briefed in `docs/plans/windows-timer-proposal.md`, section 5, part A, splits them. A decision comes due if the desktop's Windows file fails the wake or the makespan.
 
 --- "| Section 22's milestone 1 timing criteria are proven by result files": append before its gate cell ---
- On Windows, milestone 0's `whisk` file is written at the first commit of main that holds lane `timer-windows`, not at the measurement commit (D144).
+ On Windows, milestone 0's `whisk` file is written at the first commit of main that holds lane `timer-windows` and, if one is made, that follow-up, not at the measurement commit (D144).
 
 --- section 4: add a row ---
-| The keeper's timed wait on Windows (D144): not built; lane `timer-windows`. On Windows each frame-critical worker has a `TimedPark`, an auto-reset event and a high-resolution waitable timer, which the pool makes when it is built and closes in its `Drop`; `Sleep::park`'s step waits on both; a waker that has claimed a sleeper's bit sets its event through `Sleep::wake_claimed`, the one function the pool's three wake sites and the loom models' wakers call; and the keeper spins the last 500 µs there. Its tests, in `check (windows-latest)`: the median lateness of fifty 2 ms deadlines through `sleep_until` on an otherwise idle pool is under half a default tick, which today's code fails at about 14 ms; on a one-worker frame pool a keeper waiting on a deadline an hour away is ended by an earlier timer, by pushed work and by shutdown, each inside `LIMIT`, and each test times out with the event unset. Under loom the timed park waits on a flag that an unpark does not satisfy, and the keeper hand-off model fails when a waker skips `wake_claimed`. To measure, on the laptop as labelled data and on the desktop if it boots Windows: `whisk`'s 60 Hz timer row against 1 ms at P99, at the lane's 50 µs commit and at its head on the laptop, with the process CPU column, which the benchmark does not fill on Windows today; its wake row before and after, since each wake of a claimed sleeper gains one `SetEvent`; its makespan rows before and after, since the 1 ms gap between runs goes through the keeper. If the head's process CPU at 60 Hz is more than 0.015 s a second above the 50 µs commit's on the laptop, which is 1.5% of a core, or its P99 is not under 1 ms, the threshold stays 50 µs and the figure is 2 ms, by an addendum to D144. Open until the desktop's file: whether the figure holds on a quiet machine. Not measured: the wait on a timer and an event together, and whether `SetWaitableTimer` clears a timer that fired unwaited, which the brief of `docs/plans/windows-timer-proposal.md`, section 5, checks; the keeper at a frame worker's priority; a wait asked once for the time left less a fixed margin, which the same brief's part B measures; the spin's power cost; the spin at more than 60 deadlines a second; a 1 ms period under a minimised window, which Microsoft's page for `timeBeginPeriod` says Windows 11 does not guarantee | 1 |
+| The keeper's timed wait on Windows (D144): not built; lane `timer-windows`. On Windows each frame-critical worker has a `TimedPark`, an auto-reset event and a high-resolution waitable timer, which the pool makes when it is built and closes in its `Drop`; `Sleep::park`'s step waits on both; a waker that has claimed a sleeper's bit sets its event through `Sleep::wake_claimed`, the one function the pool's three wake sites and the loom models' wakers call; and the keeper spins the last 500 µs there. Its tests, in `check (windows-latest)`: the median lateness of fifty 2 ms deadlines through `sleep_until` on an otherwise idle pool is under half a default tick, which today's code fails at about 14 ms; on a one-worker frame pool a keeper waiting on a deadline an hour away is ended by an earlier timer, by pushed work and by shutdown, each inside `LIMIT`, and each test times out with the event unset. Under loom the timed park waits on a flag that an unpark does not satisfy, and the keeper hand-off model fails when a waker skips `wake_claimed`. To measure, on the laptop as labelled data and on the desktop if it boots Windows: `whisk`'s 60 Hz timer row against 1 ms at P99, at the lane's 50 µs commit and at the merge on the laptop, with the process CPU column, which the benchmark does not fill on Windows today; its wake row before and after, since each wake of a claimed sleeper gains one `SetEvent`; its makespan rows before and after, since the 1 ms gap between runs goes through the keeper. If the merge's process CPU at 60 Hz is more than 0.015 s a second above the 50 µs commit's on the laptop, which is 1.5% of a core, or its P99 is not under 1 ms, a follow-up commit on main sets the threshold back to 50 µs and the figure is 2 ms, by an addendum to D144. Open until the desktop's file: whether the figure holds on a quiet machine. Not measured: the wait on a timer and an event together, and whether `SetWaitableTimer` clears a timer that fired unwaited, which the brief of `docs/plans/windows-timer-proposal.md`, section 5, checks; the keeper at a frame worker's priority; a wait asked once for the time left less a fixed margin, which the same brief's part B measures; the spin's power cost; the spin at more than 60 deadlines a second; a 1 ms period under a minimised window, which Microsoft's page for `timeBeginPeriod` says Windows 11 does not guarantee | 1 |
 ```
 
 ### README sentences, for the lane
@@ -968,8 +976,9 @@ Everything of answer 1 applies but what this section gives. Each row below is wh
 --- D144: "Driven by" and "Replaced" ---
 - Driven by: the Windows laptop's result files at `bef3455` and its two timer probes; the
   proposal's first review, which showed that an event the worker owned could be set after the
-  worker closed it and that the loom models did not cover the event; the owner's answer of
-  <date> (fix the wait in milestone 1, add no spin and hold Windows to 2 ms at P99).
+  worker closed it and that the loom models did not cover the event; the owner's answers of
+  <date> (the desktop boots <answer 1>; fix the wait in milestone 1, add no spin and hold
+  Windows to 2 ms at P99).
 - Replaced: on Windows, D113's tick-start figure, which becomes 2 ms at P99 at 60 Hz, and
   D113's premise that a stepped park with a 50 µs spin meets 20 µs, which holds only where a
   timed park can be asked for less than a millisecond; D138's reading of the x86 session's
@@ -983,7 +992,7 @@ On Windows each step is a wait on a high-resolution waitable timer and on an eve
 Tick-start latency, from a tick deadline to the timer root resuming, under 20 µs at P99, and under 2 ms on Windows, where the finest timed wait a waker can end overshoots by about half a millisecond (D144);
 
 --- plan, section 3: the row added after `slot-copy` ---
-| `timer-windows` | The keeper's timed wait on Windows (D144), in `lactose-task` alone. The `sync` shim gains `TimedPark`, one worker's timed wait. On Windows, outside loom and Miri, it holds an auto-reset event and a high-resolution waitable timer that is not manual-reset; `wait` sets the timer before every wait and waits on both; `wake` sets the event. Elsewhere `wait` is `std::thread::park_timeout` and `wake` does nothing. Under loom it is a flag that `wake` sets and that an unpark alone does not satisfy. The frame-critical pool's `Sleep` holds one for each worker: the pool makes them when it is built, before a worker enters its loop, and closes them in its `Drop`, after the last handle to the executor and the last worker. `Sleep::wake_claimed` wakes a claimed worker's `TimedPark` and unparks it, and is called only after a successful claim, by `Pool::announce_entry`, by `Pool::wake` when `Sleep::notify` returned true and by `Pool::wake_all`; `Pool::wake`'s unpark of a worker it did not claim stays an unpark. The models' waker sides call the same function. A worker whose event or timer cannot be made keeps `std::thread::park_timeout`, logged once; a failed `SetWaitableTimer` or a `WAIT_FAILED` is logged once and that wait is a `park_timeout`. `unsafe impl Send` and `Sync` for `TimedPark`, with its `SAFETY.md` section. The step and the spin stay 0.6 and 50 µs on every platform. `crates/task/Cargo.toml` adds `Win32_System_Threading` and `Win32_Security` to its `windows-sys` features, and `Win32_System_WindowsProgramming` as a dev-dependency feature for the benchmark. The README's sentences; the benchmark's timer threshold on Windows, 2 ms, and its process CPU column on Windows, from `QueryProcessCycleTime` | None | In `check (windows-latest)`, a debug nextest run: the median lateness of fifty 2 ms deadlines through `sleep_until` on an otherwise idle pool is under 7.8 ms, half a default tick, where today's code gives about 14 ms and the fix under 1 ms, with that reasoning in the test; on a one-worker frame pool a keeper waiting on a deadline an hour away is ended by an earlier timer, by pushed work and by shutdown, each inside `LIMIT`, and with the event unset the keeper sleeps 36 minutes and the test times out. Under loom the fourteen models pass, and the keeper hand-off model fails when a waker of it unparks without `Sleep::wake_claimed` and when `wake_claimed` does not set the flag. Miri passes unchanged. The Windows cross-target clippy and `cargo xtask features` pass. The merge is pushed alone (D125). The laptop runs the benchmark at the lane's base and at its head, as labelled data: the timer rows with their process CPU, and the makespan and wake rows beside them | 8: seven, and the concurrency reviewer beside its first review |
+| `timer-windows` | The keeper's timed wait on Windows (D144), in `lactose-task` alone. The `sync` shim gains `TimedPark`, one worker's timed wait. On Windows, outside loom and Miri, it holds an auto-reset event and a high-resolution waitable timer that is not manual-reset; `wait` sets the timer before every wait and waits on both; `wake` sets the event. Elsewhere `wait` is `std::thread::park_timeout` and `wake` does nothing. Under loom it is an `AtomicBool` that `wake` sets with `swap(true, SeqCst)` and `wait` takes with `swap(false, SeqCst)`, parking while it was false; a plain store and a flag behind a loom mutex do not serve. The frame-critical pool's `Sleep` holds one for each worker: the pool makes them when it is built, before a worker enters its loop, and closes them in its `Drop`, after the last handle to the executor and the last worker. `Sleep::wake_claimed` wakes a claimed worker's `TimedPark` and unparks it; it takes the unpark as a closure, or is generic over the thread handle, so the pool's std threads and the models' loom threads share it. It is called only after a successful claim, by `Pool::announce_entry`, by `Pool::wake` when `Sleep::notify` returned true and by `Pool::wake_all`; `Pool::wake`'s unpark of a worker it did not claim stays an unpark. The models' waker sides call the same function. A worker whose event or timer cannot be made keeps `std::thread::park_timeout`, logged once; a failed `SetWaitableTimer` or a `WAIT_FAILED` is logged once and that wait is a `park_timeout`. `unsafe impl Send` and `Sync` for `TimedPark`, with its `SAFETY.md` section. The step and the spin stay 0.6 and 50 µs on every platform. `crates/task/Cargo.toml` adds `Win32_System_Threading` and `Win32_Security` to its `windows-sys` features, and `Win32_System_WindowsProgramming` as a dev-dependency feature for the benchmark. The README's sentences; the benchmark's timer threshold on Windows, 2 ms, and its process CPU column on Windows, from `QueryProcessCycleTime` | None | In `check (windows-latest)`, a debug nextest run: the median lateness of fifty 2 ms deadlines through `sleep_until` on an otherwise idle pool is under 7.8 ms, half a default tick, where today's code gives about 14 ms and the fix under 1 ms, with that reasoning in the test; on a one-worker frame pool a keeper waiting on a deadline an hour away is ended by an earlier timer, by pushed work and by shutdown, each inside `LIMIT`, and with the event unset the keeper sleeps 36 minutes and the test times out. Under loom the fourteen models pass, and the keeper hand-off model fails when a waker of it unparks without `Sleep::wake_claimed` and when `wake_claimed` does not set the flag. Miri passes unchanged. The Windows cross-target clippy and `cargo xtask features` pass. The merge is pushed alone (D125). After the merge is pushed, the laptop runs the benchmark at the merge's first parent and at the merge, as labelled data: the timer rows with their process CPU, and the makespan and wake rows beside them | 8: seven, and the concurrency reviewer beside its first review |
 
 --- plan, section 4: the replacement of the row "Milestone 0, WHISK" ---
 | Milestone 0, WHISK | `cargo bench -p lactose-task --bench whisk` | Its own thresholds (`crates/task/README.md`) | The same; on Windows the 60 Hz timer row against 2 ms at P99, in a file written at the first commit that holds `timer-windows` (D144) |
@@ -1004,8 +1013,7 @@ On Windows its timed wait is a high-resolution waitable timer beside an event th
 None of these changes: architecture section 21; the plan's `keeper` row, its paragraph of
 runs, its queue table, its seventh rule, its "Session A" sentence and its exit step; the
 verification rows "Wake latency against the 20 µs P99 criterion" and "Section 22's milestone
-1 timing criteria"; the README's loom sentence. The lane has one commit for the threshold,
-not two, since nothing changes it.
+1 timing criteria"; the README's loom sentence. The lane has no threshold commit.
 
 ### If the owner answers 3: the figure after one more probe
 
@@ -1016,28 +1024,35 @@ planner returns with the figure once part B of section 5's brief has run.
 --- D144: the title ---
 **D144. On Windows the keeper waits on a high-resolution timer beside a wake event and spins the last 500 µs; what tick start is held to there is decided after one more probe** (§5.1, §21, `lactose-task`, `docs/plans/milestone-1.md`)
 
+--- D144: in the second bullet, replace ---
+Rules out a Windows keeper that spins to the criterion.
+--- with ---
+Rules out a 2 ms spin as the default.
+
 --- D144: this bullet in place of the third; the fourth, "The lane confirms the threshold", is struck ---
   - *What tick start is held to on Windows is not decided.* The 20 µs stands on paper. The
     laptop measures the keeper's wait asked once, for the time left less a fixed margin, with
     margins up to 2.5 ms, at a frame worker's priority
-    (`docs/plans/windows-timer-proposal.md`, section 5, part B), and the lane's benchmark at
-    its 50 µs commit and at its head. The planner returns with those figures and an addendum
-    here: the figure, and the threshold that buys it. Rules out restating the criterion
-    before the form the laptop suggested is measured.
+    (`docs/plans/windows-timer-proposal.md`, section 5, part B). After the merge is pushed,
+    the laptop runs the benchmark at the merge's first parent, at the lane's 50 µs commit and
+    at the merge. The planner returns with those figures and an addendum here: the figure,
+    and the threshold that buys it, which a follow-up commit on main sets if it is not
+    500 µs. Rules out restating the criterion before the form the laptop suggested is
+    measured.
 
 --- D144: "Driven by" and "Replaced" ---
 - Driven by: the Windows laptop's result files at `bef3455` and its two timer probes; the
   proposal's first review, which showed that an event the worker owned could be set after the
-  worker closed it and that the loom models did not cover the event; the owner's answer of
-  <date> (fix the wait in milestone 1 and decide the Windows figure after the laptop measures
-  a wait asked once).
+  worker closed it and that the loom models did not cover the event; the owner's answers of
+  <date> (the desktop boots <answer 1>; fix the wait in milestone 1 and decide the Windows
+  figure after the laptop measures a wait asked once).
 - Replaced: on Windows, D113's premise that a stepped park with a 50 µs spin meets 20 µs,
   which holds only where a timed park can be asked for less than a millisecond; D138's "rules
   out a second attempt", which does not cover a lane for this known cause. D113's tick-start
   figure stands on Windows until the addendum. Nothing of D113 or D138 on macOS or Linux.
 
 --- plan, section 3: the row added after `slot-copy` ---
-| `timer-windows` | The keeper's timed wait on Windows (D144), in `lactose-task` alone. The `sync` shim gains `TimedPark`, one worker's timed wait. On Windows, outside loom and Miri, it holds an auto-reset event and a high-resolution waitable timer that is not manual-reset; `wait` sets the timer before every wait and waits on both; `wake` sets the event. Elsewhere `wait` is `std::thread::park_timeout` and `wake` does nothing. Under loom it is a flag that `wake` sets and that an unpark alone does not satisfy. The frame-critical pool's `Sleep` holds one for each worker: the pool makes them when it is built, before a worker enters its loop, and closes them in its `Drop`, after the last handle to the executor and the last worker. `Sleep::wake_claimed` wakes a claimed worker's `TimedPark` and unparks it, and is called only after a successful claim, by `Pool::announce_entry`, by `Pool::wake` when `Sleep::notify` returned true and by `Pool::wake_all`; `Pool::wake`'s unpark of a worker it did not claim stays an unpark. The models' waker sides call the same function. A worker whose event or timer cannot be made keeps `std::thread::park_timeout`, logged once; a failed `SetWaitableTimer` or a `WAIT_FAILED` is logged once and that wait is a `park_timeout`. `unsafe impl Send` and `Sync` for `TimedPark`, with its `SAFETY.md` section. The spin threshold is 500 µs on Windows and 50 µs elsewhere, set in the lane's last commit, with the commit before it holding 50 µs on Windows; the step stays 0.6. `crates/task/Cargo.toml` adds `Win32_System_Threading` and `Win32_Security` to its `windows-sys` features, and `Win32_System_WindowsProgramming` as a dev-dependency feature for the benchmark. The README's sentences; the benchmark's process CPU column on Windows, from `QueryProcessCycleTime` | None | In `check (windows-latest)`, a debug nextest run: the median lateness of fifty 2 ms deadlines through `sleep_until` on an otherwise idle pool is under 7.8 ms, half a default tick, where today's code gives about 14 ms and the fix under 1 ms, with that reasoning in the test; on a one-worker frame pool a keeper waiting on a deadline an hour away is ended by an earlier timer, by pushed work and by shutdown, each inside `LIMIT`, and with the event unset the keeper sleeps 36 minutes and the test times out. Under loom the fourteen models pass, and the keeper hand-off model fails when a waker of it unparks without `Sleep::wake_claimed` and when `wake_claimed` does not set the flag. Miri passes unchanged. The Windows cross-target clippy and `cargo xtask features` pass. The merge is pushed alone (D125). The laptop runs the benchmark at the lane's base, at its 50 µs commit and at its head, as labelled data: the timer rows with their process CPU, and the makespan and wake rows beside them | 8: seven, and the concurrency reviewer beside its first review |
+| `timer-windows` | The keeper's timed wait on Windows (D144), in `lactose-task` alone. The `sync` shim gains `TimedPark`, one worker's timed wait. On Windows, outside loom and Miri, it holds an auto-reset event and a high-resolution waitable timer that is not manual-reset; `wait` sets the timer before every wait and waits on both; `wake` sets the event. Elsewhere `wait` is `std::thread::park_timeout` and `wake` does nothing. Under loom it is an `AtomicBool` that `wake` sets with `swap(true, SeqCst)` and `wait` takes with `swap(false, SeqCst)`, parking while it was false; a plain store and a flag behind a loom mutex do not serve. The frame-critical pool's `Sleep` holds one for each worker: the pool makes them when it is built, before a worker enters its loop, and closes them in its `Drop`, after the last handle to the executor and the last worker. `Sleep::wake_claimed` wakes a claimed worker's `TimedPark` and unparks it; it takes the unpark as a closure, or is generic over the thread handle, so the pool's std threads and the models' loom threads share it. It is called only after a successful claim, by `Pool::announce_entry`, by `Pool::wake` when `Sleep::notify` returned true and by `Pool::wake_all`; `Pool::wake`'s unpark of a worker it did not claim stays an unpark. The models' waker sides call the same function. A worker whose event or timer cannot be made keeps `std::thread::park_timeout`, logged once; a failed `SetWaitableTimer` or a `WAIT_FAILED` is logged once and that wait is a `park_timeout`. `unsafe impl Send` and `Sync` for `TimedPark`, with its `SAFETY.md` section. The spin threshold is 500 µs on Windows and 50 µs elsewhere, set in the lane's last commit, with the commit before it holding 50 µs on Windows; the step stays 0.6. `crates/task/Cargo.toml` adds `Win32_System_Threading` and `Win32_Security` to its `windows-sys` features, and `Win32_System_WindowsProgramming` as a dev-dependency feature for the benchmark. The README's sentences; the benchmark's process CPU column on Windows, from `QueryProcessCycleTime` | None | In `check (windows-latest)`, a debug nextest run: the median lateness of fifty 2 ms deadlines through `sleep_until` on an otherwise idle pool is under 7.8 ms, half a default tick, where today's code gives about 14 ms and the fix under 1 ms, with that reasoning in the test; on a one-worker frame pool a keeper waiting on a deadline an hour away is ended by an earlier timer, by pushed work and by shutdown, each inside `LIMIT`, and with the event unset the keeper sleeps 36 minutes and the test times out. Under loom the fourteen models pass, and the keeper hand-off model fails when a waker of it unparks without `Sleep::wake_claimed` and when `wake_claimed` does not set the flag. Miri passes unchanged. The Windows cross-target clippy and `cargo xtask features` pass. The merge is pushed alone (D125). After the merge is pushed, the laptop runs the benchmark at the merge's first parent, at the lane's 50 µs commit and at the merge, as labelled data: the timer rows with their process CPU, and the makespan and wake rows beside them | 8: seven, and the concurrency reviewer beside its first review |
 
 --- plan, section 4: the replacement of the row "Milestone 0, WHISK" ---
 | Milestone 0, WHISK | `cargo bench -p lactose-task --bench whisk` | Its own thresholds (`crates/task/README.md`) | The same; on Windows in a file written at the first commit that holds `timer-windows`, its 60 Hz timer row read against the figure D144's addendum sets |
@@ -1046,7 +1061,7 @@ planner returns with the figure once part B of section 5's brief has run.
 That is Windows' default timer tick, 15.6 ms, and the cause is confirmed (D144, `docs/plans/windows-timer-proposal.md`). In std 1.99.0, `park_timeout` on Windows is `WaitOnAddress` with its timeout rounded up to whole milliseconds (`library/std/src/sys/sync/futex/windows.rs`; `dur2timeout` in `sys/pal/windows/mod.rs`), which ends on the tick, and so do `Condvar::wait_timeout` and the channels' `recv_timeout`; `std::thread::sleep` is a high-resolution waitable timer that no waker can end. The laptop's two probes (1,000 samples a row, each row twice, 10 to 46% of the processor busy with other work): a `park_timeout` of 0.5 to 10 ms lasts about 16 ms whatever is asked, and the high-resolution timer overshoots by about half a millisecond at the median whatever is asked. Under the stepped wait of `Sleep::park` to a fixed 60 Hz schedule with the 50 µs spin, a deadline is passed by P50 7.9 ms and P99 15.7 to 15.8 ms as shipped, by P50 0.78 to 0.81 ms and P99 2.0 ms with `timeBeginPeriod(1)` held, and by P50 0.30 ms and P99 1.0 to 1.1 ms with the timer in place of the park. With the timer and a spin threshold of 500 µs: P50 under a microsecond, P99 0.49 to 0.59 ms, 0.77 to 1.11% of one core. With 2,000 µs: 6.9 to 7.7% of a core, and 56 to 103 deadlines of 1,000 still over 35 µs late. Only a keeper that never waited was under 20 µs at P99. Decided (D144): on Windows the keeper's step is a wait on a high-resolution waitable timer and a wake event, it spins the last 500 µs, and what tick start is held to there is decided after the laptop measures a wait asked once; lane `timer-windows` builds it (the row "The keeper's timed wait on Windows (D144)").
 
 --- verification, section 4: the row added ---
-| The keeper's timed wait on Windows (D144): not built; lane `timer-windows`. On Windows each frame-critical worker has a `TimedPark`, an auto-reset event and a high-resolution waitable timer, which the pool makes when it is built and closes in its `Drop`; `Sleep::park`'s step waits on both; a waker that has claimed a sleeper's bit sets its event through `Sleep::wake_claimed`, the one function the pool's three wake sites and the loom models' wakers call; and the keeper spins the last 500 µs there. Its tests, in `check (windows-latest)`: the median lateness of fifty 2 ms deadlines through `sleep_until` on an otherwise idle pool is under half a default tick, which today's code fails at about 14 ms; on a one-worker frame pool a keeper waiting on a deadline an hour away is ended by an earlier timer, by pushed work and by shutdown, each inside `LIMIT`, and each test times out with the event unset. Under loom the timed park waits on a flag that an unpark does not satisfy, and the keeper hand-off model fails when a waker skips `wake_claimed`. To measure, on the laptop as labelled data and on the desktop if it boots Windows: `whisk`'s 60 Hz timer row, at the lane's 50 µs commit and at its head on the laptop, with the process CPU column, which the benchmark does not fill on Windows today; its wake row before and after, since each wake of a claimed sleeper gains one `SetEvent`; its makespan rows before and after, since the 1 ms gap between runs goes through the keeper. What tick start is held to there is decided by an addendum to D144, after part B of the brief. Open: the figure, and then whether it holds on a quiet machine. Not measured: the wait on a timer and an event together, and whether `SetWaitableTimer` clears a timer that fired unwaited, which the brief of `docs/plans/windows-timer-proposal.md`, section 5, checks; the keeper at a frame worker's priority; a wait asked once for the time left less a fixed margin, which the same brief's part B measures; the spin's power cost; the spin at more than 60 deadlines a second; a 1 ms period under a minimised window, which Microsoft's page for `timeBeginPeriod` says Windows 11 does not guarantee | 1 |
+| The keeper's timed wait on Windows (D144): not built; lane `timer-windows`. On Windows each frame-critical worker has a `TimedPark`, an auto-reset event and a high-resolution waitable timer, which the pool makes when it is built and closes in its `Drop`; `Sleep::park`'s step waits on both; a waker that has claimed a sleeper's bit sets its event through `Sleep::wake_claimed`, the one function the pool's three wake sites and the loom models' wakers call; and the keeper spins the last 500 µs there. Its tests, in `check (windows-latest)`: the median lateness of fifty 2 ms deadlines through `sleep_until` on an otherwise idle pool is under half a default tick, which today's code fails at about 14 ms; on a one-worker frame pool a keeper waiting on a deadline an hour away is ended by an earlier timer, by pushed work and by shutdown, each inside `LIMIT`, and each test times out with the event unset. Under loom the timed park waits on a flag that an unpark does not satisfy, and the keeper hand-off model fails when a waker skips `wake_claimed`. To measure, on the laptop as labelled data and on the desktop if it boots Windows: `whisk`'s 60 Hz timer row, at the lane's 50 µs commit and at the merge on the laptop, with the process CPU column, which the benchmark does not fill on Windows today; its wake row before and after, since each wake of a claimed sleeper gains one `SetEvent`; its makespan rows before and after, since the 1 ms gap between runs goes through the keeper. What tick start is held to there is decided by an addendum to D144, after part B of the brief. Open: the figure, and then whether it holds on a quiet machine. Not measured: the wait on a timer and an event together, and whether `SetWaitableTimer` clears a timer that fired unwaited, which the brief of `docs/plans/windows-timer-proposal.md`, section 5, checks; the keeper at a frame worker's priority; a wait asked once for the time left less a fixed margin, which the same brief's part B measures; the spin's power cost; the spin at more than 60 deadlines a second; a 1 ms period under a minimised window, which Microsoft's page for `timeBeginPeriod` says Windows 11 does not guarantee | 1 |
 
 --- README, "Proof for milestone 0", the table: the replacement ---
 | Timer wake (a tick deadline until the frame-critical task that slept until it resumes, at 60 Hz) | under 20 µs at P99; on Windows not yet decided (D144) |
@@ -1073,8 +1088,9 @@ as it is until the addendum.
     the desktop, or is recorded as not shown on x86. Rules out reading a Windows timer row as
     the executor's.
 - Driven by: the Windows laptop's result files at `bef3455` and its two timer probes; the
-  owner's answer of <date>.
-- Replaced: nothing.
+  owner's answers of <date> (the desktop boots <answer 1>; leave the fix for milestone 2).
+- Replaced: D138's reading of the x86 session's tick start, if the desktop boots no other
+  system; otherwise nothing.
 ```
 
 Under answer 4 no architecture amendment and no README sentence is applied. The plan gets
@@ -1118,11 +1134,24 @@ and does better with two zstd tasks running, which fits workers waking slowly fr
   and whether `SetWaitableTimer` clears a timer that fired with nothing waiting on it are the
   brief's rows W7 and W8 and its check C1. The last is the planner's recollection of
   Microsoft's documentation, not read for this document.
-- **The loom probe built no Windows code.** It shows that the models can hold the event's
-  obligation, that the keeper hand-off model fails without it, and that the models take no
-  longer. Its two timings are one run each, under load. A flag behind a loom mutex has a
-  hazard of loom's own: an unpark that reaches a thread blocked on that mutex makes loom
-  panic. No model did so in the probe; the lane chooses the flag's shape.
+- **The loom probes built no Windows code.** The planner's shows that the models can hold the
+  event's obligation, that the keeper hand-off model fails without it, and that the models
+  take no longer. Its two timings are one run each, under load. Its flag sat behind a loom
+  mutex, which has a hazard of loom's own: loom's unpark makes runnable a thread blocked on
+  the mutex, and the mutex then asserts (loom 0.7.2, `rt/thread.rs` and `rt/mutex.rs`). No
+  model did so in the planner's probe.
+- **What the second review measured of the flag, and what it could not trigger.** With a
+  swap on both sides and no mutex, the fourteen models pass, in 153 s at a load average of
+  40 against 162 s for the mutex shape. The keeper hand-off model fails at once when its
+  waker is a plain unpark. With `wake_claimed` not setting the flag it fails alone and the
+  other thirteen pass. A plain store on the wake side fails that model with no mutation.
+  The review could not trigger the mutex's hazard: a three-thread model with a plain unpark
+  from a third thread passed every shape, in 427 to 18,631 executions, with the unpark
+  placed at once and after the earlier deadline's registration. Loom likely does not
+  explore where an unpark lands, so that absence proves nothing, and the swap avoids the
+  hazard by construction. With the unpark placed after the keeper's first look every
+  shape, today's code included, exceeded loom's branch limit; the review reads that as the
+  model's own yield loops, from the trace of one execution.
 - **Run to run, a row's late count varies up to twofold.** The two runs of probe 3 agree on
   the knee at 500 µs and on the cost of 2,000 µs, and on little between. In the earlier run
   another process switched the system timer during the waitable timer's rows: its 250 µs row
