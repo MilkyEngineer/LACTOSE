@@ -164,13 +164,18 @@ on, and a listed feature the crate does not declare are findings.
   once; a finding names each one no entry runs, or that several do, with the entries. The
   check reads one shape of the job, today's, and refuses any other rather than reading it:
   a matrix of `include` alone (a key beside it folds the entries into its combinations), no
-  `if` or `defaults` on the job and no `defaults` on the workflow, and one step that uses
-  `matrix.args`, `run: cargo +$MIRI_TOOLCHAIN miri test ${{ matrix.args }} --locked` with
-  only `env` beside it. The job's other steps are not read. The reader takes the YAML the
-  job is written in (block mappings and sequences, plain, quoted and block scalars, LF or
-  CRLF line breaks, space indentation) and refuses at its line anything else on the way to
-  and inside the entries: another line break (a lone CR, NEL, LS or PS), a tab indent, a
-  document marker or directive, and a key twice in one mapping. Every entry names exactly
+  `if` or `defaults` on the job and no `defaults` on the workflow, and one item of the job's
+  one `steps` list that uses `matrix.args`,
+  `run: cargo +$MIRI_TOOLCHAIN miri test ${{ matrix.args }} --locked`, with only `env` beside
+  it. The job's other steps are not read. The reader takes the YAML the job is written in
+  (block mappings and sequences, plain, quoted and block scalars, LF or CRLF line breaks,
+  space indentation) and refuses at its line what it does not read on the way to and inside
+  the entries: another line break (a lone CR, NEL, LS or PS), a tab indent, a document
+  marker or directive, a line of a mapping on the way that is not a plain or quoted `key:`
+  (an explicit `? key`, or a list at the indent of its key, so that entries or steps written
+  at the indent of `include:` or `steps:` are refused, as the real file never writes them),
+  a key it follows (`jobs`, `miri`, `strategy`, `matrix`, `include`, `steps`) twice in its
+  mapping, and a key twice in one entry. Every entry names exactly
   one workspace member with a plain `-p NAME` or `--package NAME`; `--workspace`, no `-p`,
   a second `-p`, `-p=`, `-pNAME`, `NAME@VERSION` and a glob are refused. Its `args` are
   split as the run step's bash splits them; an unquoted glob character, which bash would
@@ -181,9 +186,10 @@ on, and a listed feature the crate does not declare are findings.
   `required-features`, which the counts do not model. An explicit `--test` runs a
   `test = false` target and fails the job on one whose `required-features` it does not
   enable, so neither needs a rule. A package outside `[miri_split]` that two or more entries
-  name, one of them by target, is reported as a split the policy does not list; entries
-  that each run the package whole, as `lactose-task`'s two do under two environments, are
-  no split. An empty `[miri_split]` is reported. A binary, bench or example target of a
+  name by target is reported as a split the policy does not list; an entry that runs the
+  package whole drops none of its targets, so entries that do, as `lactose-task`'s two do
+  under two environments, are no split, and neither is one of them beside one entry by
+  target. An empty `[miri_split]` is reported. A binary, bench or example target of a
   split package whose `test` is on, which `cargo test` would run and the split cannot
   select, is reported in its manifest. A `--test` value with none of `*?[]` is a target
   name, and any other a pattern of the `glob` crate as cargo 1.99 and the job's
@@ -437,8 +443,9 @@ standard error as it comes.
   (the Windows laptop's `physics-phase` and `rollback-seven-ticks` files of 2026-11-15). Every
   command but `edit-to-playing`, whose builds are what it measures, first builds what it
   runs with cargo's `--no-run` form of the same command (`cargo build` for `headless-120`)
-  before the window opens, so the load covers the run alone, on a cold tree too; a failed
-  build fails the measurement. The
+  before the window opens, so the window holds the run and not its build, on a cold tree
+  too, though a load average taken just after that build still carries it; a failed build
+  fails the measurement. The
   sampler wakes WMI once a second during a Windows run,
   a perturbation not measured. The Windows CPU row is the registry's
   `ProcessorNameString`. The Windows paths have not been run.

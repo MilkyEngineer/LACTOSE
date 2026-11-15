@@ -6,14 +6,16 @@
 //!
 //! The check reads one shape of the job and refuses any other instead of reading it: a matrix
 //! of `include` alone, no `if` or `defaults` on the job or `defaults` on the workflow, and one
-//! step that uses `matrix.args`, [`RUN`], with only `env` beside its `run`. Each entry names one
+//! item of the job's one `steps` list that uses `matrix.args`, [`RUN`], with only `env` beside
+//! its `run`. Each entry names one
 //! workspace member with a plain `-p NAME`, and its targets with `--lib`, `--test` and `--doc`
 //! (a package outside `[miri_split]` may name none). The job's other steps are not read.
 //!
 //! The workflow is read as text, by a reader of the YAML the job is written in: block
 //! mappings and sequences, plain and quoted scalars on one line, plain scalars over several,
-//! and block scalars, with LF or CRLF line breaks and space indentation; a key twice in one
-//! mapping on the path to the entries is refused. An entry's `args` are split as the run
+//! and block scalars, with LF or CRLF line breaks and space indentation. On the path to the
+//! entries and the steps, a line of a mapping that is not a plain or quoted key, and the key
+//! followed twice in its mapping, are refused. An entry's `args` are split as the run
 //! step's shell splits them, and its `--test` patterns are matched as cargo matches them: a
 //! name with none of `*?[]` exactly, any other as a pattern of the `glob` crate (see
 //! [`Pattern`]).
@@ -135,18 +137,19 @@ impl Run<'_> {
 /// no target and so runs the package whole.
 type Read<'e, 'w> = (&'e Entry, &'w Package, Vec<Run<'w>>);
 
-/// The finding for each package `[miri_split]` does not list that two or more entries name,
-/// one of them by target: a split the check would not count. Entries that each run the
-/// package whole, as `lactose-task`'s two do under two environments, are no split.
+/// The finding for each package `[miri_split]` does not list that two or more entries name
+/// by target: a split the check would not count. An entry that runs the package whole drops
+/// none of its targets, so entries that do, as `lactose-task`'s two do under two
+/// environments, are no split, and neither is one of them beside one entry by target.
 fn unlisted(policy: &Policy, read: &[Read<'_, '_>], findings: &mut Vec<Finding>) {
-    let mut by: BTreeMap<&str, (Vec<&Entry>, bool)> = BTreeMap::new();
+    let mut by: BTreeMap<&str, Vec<&Entry>> = BTreeMap::new();
     for (entry, package, runs) in read {
-        let (entries, targets) = by.entry(package.name.as_str()).or_default();
-        entries.push(entry);
-        *targets |= !runs.is_empty();
+        if !runs.is_empty() {
+            by.entry(package.name.as_str()).or_default().push(entry);
+        }
     }
-    for (name, (entries, targets)) in by {
-        if entries.len() > 1 && targets && !policy.miri_split.iter().any(|split| split == name) {
+    for (name, entries) in by {
+        if entries.len() > 1 && !policy.miri_split.iter().any(|split| split == name) {
             findings.push(Finding::new(
                 POLICY_FILE,
                 format!(
@@ -559,6 +562,7 @@ fn entries(text: &str) -> Result<Vec<Entry>, String> {
             // Beside another key, GitHub adds each entry to every combination it makes, and a
             // later entry's values replace an earlier one's: the entries would not each run.
             "matrix" => {
+                mapping(body)?;
                 if let Some((line, key)) = keys(body).find(|(_, key)| *key != "include") {
                     return Err(format!(
                         "line {line}: the matrix has `{key}` beside `include`, which folds the \
@@ -608,8 +612,8 @@ fn keys<'b>(body: &'b [Line<'_>]) -> impl Iterator<Item = (usize, &'b str)> {
 }
 
 /// Refuses what in the Miri job, outside its matrix, could change what an entry runs: an `if`
-/// or `defaults` on the job, and any use of `matrix.args` but the [`RUN`] step, whose other
-/// keys are `env`.
+/// or `defaults` on the job, and any use of `matrix.args` but the [`RUN`] step, an item of the
+/// job's one `steps` list whose other keys are `env`.
 fn job(body: &[Line<'_>]) -> Result<(), String> {
     if let Some((line, key)) = keys(body).find(|(_, key)| matches!(*key, "if" | "defaults")) {
         return Err(format!(
@@ -635,6 +639,15 @@ fn job(body: &[Line<'_>]) -> Result<(), String> {
             run.number
         ));
     }
+    // The line must be an item of the job's one `steps` list, not text inside another value.
+    let steps = child(body, "steps")?.unwrap_or_default();
+    let item = steps.iter().find(|line| line.significant()).map(|line| line.indent);
+    if !steps.iter().any(|line| line.number == run.number) || Some(run.indent) != item {
+        return Err(format!(
+            "line {}: `{RUN}` is not a step of the `miri` job's `steps`, which the check reads",
+            run.number
+        ));
+    }
     let step = &body[at + 1..];
     let step = &step[..block_end(step, run.indent).unwrap_or(step.len())];
     if let Some((line, key)) = keys(step).find(|(_, key)| *key != "env") {
@@ -655,12 +668,41 @@ fn value_end(lines: &[Line<'_>], key: usize) -> Option<usize> {
     lines.iter().position(|line| !line.text.is_empty() && line.indent <= key)
 }
 
+/// Refuses a line of the mapping `body` holds, at the indent of its first significant line,
+/// that is not a plain or quoted key and its colon: an explicit `? key`, or a sequence item
+/// written at its key's indent, which `keys` would read as a key.
+fn mapping(body: &[Line<'_>]) -> Result<(), String> {
+    let indent = body.iter().find(|line| line.significant()).map(|line| line.indent);
+    let key = |text: &str| {
+        let Some((key, rest)) = text.split_once(':') else { return false };
+        let key =
+            ['"', '\''].iter().find_map(|q| key.strip_prefix(*q)?.strip_suffix(*q)).unwrap_or(key);
+        !key.is_empty()
+            && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+            && (rest.is_empty() || rest.starts_with(' '))
+    };
+    match body
+        .iter()
+        .find(|line| line.significant() && Some(line.indent) == indent && !key(line.text))
+    {
+        Some(line) if line.text == "-" || line.text.starts_with("- ") => Err(format!(
+            "line {}: a list at the indent of its key, which the check does not read",
+            line.number
+        )),
+        Some(line) => {
+            Err(format!("line {}: a line of a mapping the check does not read", line.number))
+        }
+        None => Ok(()),
+    }
+}
+
 /// The lines of the value of `key` in the mapping `body` holds, whose keys are at the indent
 /// of its first significant line. Only a key with nothing after its colon has a block.
 ///
 /// # Errors
 /// A second `key` in the mapping: YAML readers differ on which of the two they keep.
 fn child<'a, 'b>(body: &'b [Line<'a>], key: &str) -> Result<Option<&'b [Line<'a>]>, String> {
+    mapping(body)?;
     let mut found = keys(body).filter(|(_, found)| *found == key);
     if let (Some((first, _)), Some((second, _))) = (found.next(), found.next()) {
         return Err(format!(
@@ -1152,15 +1194,24 @@ mod tests {
     fn a_package_split_outside_the_policy_is_named() {
         let text = main_split().replace(
             "- name: core\n",
-            "- name: core\n            args: -p lactose-core\n          - name: core lib\n\
-             \x20           args: -p lactose-core --lib\n          - name: other\n",
+            "- name: core lib\n            args: -p lactose-core --lib\n\
+             \x20         - name: core doc\n            args: -p lactose-core --doc\n\
+             \x20         - name: core\n",
         );
         assert_eq!(
             run(ecs(&TESTS), &text),
             ["tools/xtask/ci-policy.toml: [miri_split] does not list `lactose-core`, which the \
-              `miri` entries `core` (line 11), `core lib` (line 13), `other` (line 15) split by \
-              target; list it so that the check counts its targets"]
+              `miri` entries `core lib` (line 11), `core doc` (line 13) split by target; list it \
+              so that the check counts its targets"]
         );
+        // A whole run beside one entry by target drops no target: the review's
+        // `r2-task-second-narrowed`.
+        let text = main_split().replace(
+            "- name: core\n",
+            "- name: task\n            args: -p lactose-task\n          - name: task, real deque\n\
+             \x20           args: -p lactose-task --lib\n          - name: core\n",
+        );
+        assert_eq!(run(ecs(&TESTS), &text), [] as [&str; 0]);
         let empty = Policy::default();
         assert_eq!(
             run_with(&empty, ecs(&TESTS), &main_split()),
@@ -1370,6 +1421,44 @@ mod tests {
         );
         assert_eq!(select("n*"), ["needsx", "noharness", "notest"]);
         assert!(!Pattern::is_pattern("\u{e9}"));
+    }
+
+    #[test]
+    fn a_job_shape_the_check_does_not_read_is_refused() {
+        let base = main_split();
+        let in_scalar = format!(
+            "      - run: cargo miri test -p lactose-ecs --doc\n        env:\n          N: |\n\
+             \x20           {RUN}\n"
+        );
+        let cases = [
+            // A second `steps`: libyaml keeps the second.
+            (
+                base.replace("  loom:\n", "    steps:\n      - run: \"true\"\n  loom:\n"),
+                "lines 24 and 26: `steps` twice",
+            ),
+            // The run line as text in a block scalar; the step runs something else.
+            (base.replace(&format!("      {RUN}\n"), &in_scalar), "line 28: `- run: cargo"),
+            // An explicit key: libyaml keeps the second `miri`.
+            (
+                base.replace("  loom:\n", "  ? miri\n  : name: x\n  loom:\n"),
+                "line 26: a line of a mapping the check does not read",
+            ),
+            // A list at its key's indent, which YAML reads, is refused for what it is: the
+            // entries, and the steps (the real file indents both).
+            (
+                base.replace("\n          - ", "\n        - ")
+                    .replace("\n            ", "\n          "),
+                "line 11: a list at the indent of its key",
+            ),
+            (
+                base.replace("      - run: cargo +$", "    - run: cargo +$"),
+                "line 25: a list at the indent of its key",
+            ),
+        ];
+        for (text, message) in cases {
+            let found = run(ecs(&TESTS), &text);
+            assert!(found.len() == 1 && found[0].contains(message), "{message}: {text}: {found:?}");
+        }
     }
 
     #[test]
