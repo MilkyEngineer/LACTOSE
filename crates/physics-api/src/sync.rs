@@ -640,8 +640,11 @@ impl Pass<'_> {
         if let StableKey::Predicted(predicted) = key
             && !self.sync.unbound.remove(&key)
         {
-            // Bound: its alias goes with it. The world keeps a bind until the rollback
-            // horizon passes the despawn, so the lookup normally finds it.
+            // Bound: its alias goes with it. The lookup finds it while the world keeps the
+            // bind, until the rollback horizon passes the despawn: a server's passes it at
+            // the end of the step that despawned the entity (D142), so a despawn after the
+            // physics sync point of an earlier step takes the scan; one through `world_mut()`
+            // between steps is still bound at the next sync and found by the lookup.
             match self.world.alias(predicted) {
                 Some(net) if self.sync.aliases.get(&net) == Some(&key) => {
                     self.sync.aliases.remove(&net);

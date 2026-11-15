@@ -8,8 +8,8 @@ use std::sync::Arc;
 use lactose_asset_api::PinnedTable;
 use lactose_bundle::{Baseline, ComponentData, ComponentSchema, Record};
 use lactose_core::{ComponentKey, Error, ErrorKind, NetId, PredictionKey, Result};
-use lactose_ecs::RegionMode;
-use lactose_reflect::{Persistence, TypeInfo, TypeRole};
+use lactose_ecs::{PredictedOrigin, RegionId, RegionMode};
+use lactose_reflect::{Persistence, Reflect, TypeInfo, TypeRole};
 use lactose_sim::RegionBundle;
 
 use crate::codec::invalid;
@@ -245,8 +245,9 @@ impl<'a> Loader<'a> {
     /// order, and they are every bind the saving world held between two steps, with no
     /// unjournaled edit since the last (`README.md`, "Binds").
     ///
-    /// Fails with `InvalidData` for records that fail [`RegionRecords::check`]; for a value
-    /// that is not a valid `PredictedOrigin`; and for one prediction key held under two
+    /// Fails with `InvalidData` for records that fail [`RegionRecords::check`] (no value of
+    /// the component is invalid: every bit pattern of its size is one, and an overlay holds
+    /// no value of another size); and for one prediction key held under two
     /// `NetId`s, in one section or in two, or one `NetId` under two prediction keys in two
     /// sections, naming the key, the `NetId`s and the regions in the order given: no
     /// world's export holds either, and the load of the second row would be refused. Fails
@@ -255,12 +256,80 @@ impl<'a> Loader<'a> {
     /// `NotFound` if a section carries it and the table lacks the type. One pass over the
     /// records with a binary search among the components of each record that carries
     /// whole components; nothing else is decoded.
-    #[expect(unused_variables, reason = "facade (D142): the lane `binds-impl` writes the body")]
     pub fn binds<'r>(
         &self,
         sections: impl IntoIterator<Item = &'r RegionRecords>,
     ) -> Result<BTreeMap<PredictionKey, NetId>> {
-        todo!("D142: the lane `binds-impl`")
+        let key = PredictedOrigin::KEY;
+        // Each side of the bijection, with the region that gave it, for the refusals.
+        let mut by_key: BTreeMap<PredictionKey, (NetId, RegionId)> = BTreeMap::new();
+        let mut by_net: BTreeMap<NetId, (PredictionKey, RegionId)> = BTreeMap::new();
+        for records in sections {
+            records.check()?;
+            let region = records.region;
+            let Some(overlay) = &records.overlay else { continue };
+            let Some(schema) = overlay.schemas().iter().find(|schema| schema.component() == key)
+            else {
+                continue;
+            };
+            let saved = self.schemas.saved(key).ok_or_else(|| unknown(key))?;
+            if *schema != saved.schema || records.layouts.get(&key) != Some(&saved.layout) {
+                return Err(Error::new(
+                    ErrorKind::VersionMismatch,
+                    format!(
+                        "region {}: `ecs::predicted_origin` is not at the registry's schema: \
+                         migrate the records first",
+                        region.0
+                    ),
+                ));
+            }
+            for record in overlay.records() {
+                let (id, components) = match record {
+                    Record::Spawn { id, components }
+                    | Record::SpawnFromBaseline { id, components } => (*id, components.as_slice()),
+                    Record::AddComponent { id, data } => (*id, core::slice::from_ref(data)),
+                    Record::Destroy { .. }
+                    | Record::RemoveComponent { .. }
+                    | Record::SetField { .. }
+                    | Record::OwnershipChange { .. } => continue,
+                };
+                // A record's components ascend by key (`check`).
+                let Ok(at) = components.binary_search_by_key(&key, |data| data.component) else {
+                    continue;
+                };
+                let origin: PredictedOrigin = bytemuck::checked::try_pod_read_unaligned(
+                    &components[at].bytes,
+                )
+                .map_err(|_| {
+                    invalid(format!("region {}: {id:?} has an invalid `PredictedOrigin`", region.0))
+                })?;
+                let predicted = PredictionKey {
+                    player: origin.player,
+                    input_tick: origin.input_tick,
+                    ordinal: origin.ordinal,
+                };
+                if let Some(&(net, first)) = by_key.get(&predicted)
+                    && net != id
+                {
+                    return Err(invalid(format!(
+                        "{predicted:?} is bound to {net:?} in region {} and to {id:?} in region {}",
+                        first.0, region.0
+                    )));
+                }
+                if let Some(&(other, first)) = by_net.get(&id)
+                    && other != predicted
+                {
+                    return Err(invalid(format!(
+                        "{id:?} is bound to {other:?} in region {} and to {predicted:?} in \
+                         region {}",
+                        first.0, region.0
+                    )));
+                }
+                by_key.insert(predicted, (id, region));
+                by_net.insert(id, (predicted, region));
+            }
+        }
+        Ok(by_key.into_iter().map(|(predicted, (net, _))| (predicted, net)).collect())
     }
 
     /// Validates `data`, a value the migrated records carry; a transient one counts by

@@ -15,7 +15,7 @@ use lactose_core::{
     PredictionKey, Result, StableKey, SystemKey, Tick,
 };
 use lactose_reflect::{
-    Component, FieldKind, Persistence, Reflect, Registry, Resource, TypeInfo, TypeRole,
+    Component, FieldInfo, FieldKind, Persistence, Reflect, Registry, Resource, TypeInfo, TypeRole,
 };
 
 use crate::bulk::RegionRows;
@@ -178,7 +178,8 @@ impl WorldBuilder {
     }
 
     /// The counter the next runtime `NetId` is allocated from, restored from a save
-    /// (architecture section 7). The default starts a fresh server.
+    /// (architecture section 7). The default starts a fresh server. The world moves it past
+    /// every runtime `NetId` it is given later ([`World::allocate_net_id`]).
     #[must_use]
     pub fn next_net_id(mut self, counter: NonZeroU64) -> Self {
         self.next_net_id = counter;
@@ -410,17 +411,38 @@ fn rewrite_refs(info: &TypeInfo, bytes: &mut [u8], from: StableKey, to: StableKe
     }
 }
 
-/// Whether a value of `info` holds an `EntityRef` anywhere.
-pub(crate) fn has_entity_ref(info: &TypeInfo) -> bool {
-    fn walk(kind: &FieldKind) -> bool {
-        match kind {
-            FieldKind::EntityRef => true,
-            FieldKind::Struct(info) => info.fields().iter().any(|field| walk(&field.kind())),
-            FieldKind::Array { element, .. } => walk(element),
-            _ => false,
+/// Whether a value of `info` holds an `EntityRef` anywhere: in a field, a nested `#[value]`
+/// struct or an array. A `const fn`, so `World::insert_resource` evaluates it at build.
+pub(crate) const fn has_entity_ref(info: &TypeInfo) -> bool {
+    fields_hold_entity_ref(info.layout().fields())
+}
+
+const fn fields_hold_entity_ref(fields: &[FieldInfo]) -> bool {
+    let mut at = 0;
+    while at < fields.len() {
+        if kind_holds_entity_ref(&fields[at].kind()) {
+            return true;
         }
+        at += 1;
     }
-    info.layout().fields().iter().any(|field| walk(&field.kind()))
+    false
+}
+
+/// No `_` arm: a new kind must say whether it can hold a reference.
+const fn kind_holds_entity_ref(kind: &FieldKind) -> bool {
+    match kind {
+        FieldKind::EntityRef => true,
+        FieldKind::Struct(info) => fields_hold_entity_ref(info.fields()),
+        FieldKind::Array { element, .. } => kind_holds_entity_ref(element),
+        FieldKind::Bool
+        | FieldKind::Unsigned
+        | FieldKind::Signed
+        | FieldKind::Float
+        | FieldKind::Scalar { .. }
+        | FieldKind::AssetRef { .. }
+        | FieldKind::Enum(_)
+        | FieldKind::Padding => false,
+    }
 }
 
 /// Whether `Mut`, `World::get_mut` and `columns_mut` refuse the component: the world
@@ -861,8 +883,16 @@ impl World {
         Ok(())
     }
 
-    /// Allocates the next runtime `NetId` from the server counter, passing over any that
-    /// already names a live entity or a bind, such as one spawned directly with its key.
+    /// Allocates the next runtime `NetId`: the counter's value, moving the counter on. The
+    /// counter stays above every runtime `NetId` the world is given (D142; README, Regions):
+    /// a direct [`spawn`](Self::spawn) or [`spawn_erased`](Self::spawn_erased) under one, a
+    /// row of [`load_region`](Self::load_region) and a [`bind`](Self::bind) each move it to
+    /// one past the `NetId` when it is not already above, and a refused one moves nothing,
+    /// so an allocation never returns an ID in use or one an unloaded or despawned entity
+    /// was given. It still passes over an ID that names a live entity or a bind, which only
+    /// a [`restore`](Self::restore) can leave at or above the counter, since a restore puts
+    /// the counter back while the binds stay; a world that allocates never restores.
+    /// `ResourceExhausted` once the counter reaches the cooked range.
     pub fn allocate_net_id(&mut self) -> Result<NetId> {
         loop {
             let id = NetId::runtime(self.next_net_id).ok_or_else(|| {
@@ -877,10 +907,21 @@ impl World {
         }
     }
 
-    /// The counter the next runtime `NetId` would be allocated from, for the save.
+    /// The counter the next runtime `NetId` would be allocated from, for the save: above the
+    /// runtime `NetId` of every entity and every bind the world was given since it was built
+    /// or last restored ([`allocate_net_id`](Self::allocate_net_id)).
     #[must_use]
     pub fn next_net_id(&self) -> NonZeroU64 {
         self.next_net_id
+    }
+
+    /// Moves the counter to one past `net` when `net` is a runtime `NetId` at or above it
+    /// (D142). Called once the spawn, the load's row or the bind can no longer be refused.
+    fn count_past(&mut self, net: NetId) {
+        if !net.is_cooked() && net.to_bits() >= self.next_net_id.get() {
+            // A runtime ID is below the cooked bit, so one past it does not overflow.
+            self.next_net_id = NonZeroU64::MIN.saturating_add(net.to_bits());
+        }
     }
 
     /// Records that the server bound `net` to the predicted entity `predicted`
@@ -895,10 +936,12 @@ impl World {
     /// "Ownership is a forest"), so a bind never fails on ownership. In a `Server` world a
     /// bind made while `predicted` is despawned inside the window (a re-bind of the pair it
     /// holds among them) rewrites nothing: a reference under `net` is what the server's rule
-    /// stores for a despawned owner (D141), and `predicted`'s return rewrites it. Fails if
-    /// `predicted` or `net` is already bound
-    /// to something else, or if `net` names a live entity of its own, whose references a
-    /// bind would redirect.
+    /// stores for a despawned owner (D141), and `predicted`'s return rewrites it. A runtime
+    /// `net` at or above the counter moves the counter to one past it (D142,
+    /// [`allocate_net_id`](Self::allocate_net_id)), so a world built with a save's binds
+    /// never hands out a bound ID. Fails, changing nothing, if `predicted` or `net` is
+    /// already bound to something else, or if `net` names a live entity of its own, whose
+    /// references a bind would redirect.
     pub fn bind(&mut self, predicted: PredictionKey, net: NetId) -> Result<()> {
         let bound_net = self.aliases.by_predicted.get(&predicted);
         let bound_predicted = self.aliases.by_net.get(&net);
@@ -926,6 +969,7 @@ impl World {
         if !(self.kind == WorldKind::Server && self.despawned_predicted.contains_key(&predicted)) {
             self.rekey_references(StableKey::Net(net), StableKey::Predicted(predicted));
         }
+        self.count_past(net);
         Ok(())
     }
 
@@ -1018,7 +1062,23 @@ impl World {
     // ---- Resources ----
 
     /// Inserts a reflected resource, returning the previous value.
+    ///
+    /// Does not build for a `T` whose layout holds an `EntityRef` at any depth, in a nested
+    /// `#[value]` struct or an array included (D142): the world stores a world resource as
+    /// the typed value and hands it out by `&mut`, so a bind and a restore, which keep the
+    /// references of rows and region resources as origin keys, leave it as written. The
+    /// assertion is evaluated where the call is instantiated, so a build reports it and
+    /// `cargo check` does not. Such a type is legal as a region resource
+    /// ([`insert_region_resource`](Self::insert_region_resource)).
     pub fn insert_resource<T: Resource>(&mut self, value: T) -> Option<T> {
+        const {
+            assert!(
+                !has_entity_ref(T::SCHEMA.info()),
+                "a world resource holds no entity reference (D142): the world keeps the \
+                 references of rows and region resources as origin keys across a bind and a \
+                 restore, never a world resource's; hold it in a component or a region resource"
+            );
+        }
         let entry = ResourceEntry {
             value: Box::new(Box::new(value)),
             clone: Some(clone_resource::<T>),
@@ -1050,7 +1110,12 @@ impl World {
 
     /// Inserts a service resource: a `dyn` trait object from an `-api` crate that `app`
     /// provides (architecture section 4), read by systems as `Res<dyn Trait>` with exactly
-    /// this `T`. Not reflected, hashed, saved or snapshotted.
+    /// this `T`. Not reflected, hashed, saved or snapshotted. It is stored under `T`'s
+    /// `TypeId`, where [`resource`](Self::resource), [`resource_mut`](Self::resource_mut),
+    /// `Res` and `ResMut` also look, so a reflected type inserted here is read as a world
+    /// resource without [`insert_resource`](Self::insert_resource)'s refusal of an entity
+    /// reference: no bind or restore rewrites it, and the keys it holds are its owner's to
+    /// keep as origin keys (D142).
     pub fn insert_service<T: ?Sized + Send + Sync + 'static>(
         &mut self,
         value: Box<T>,
@@ -1471,8 +1536,10 @@ impl World {
 
     /// Tells the world the oldest tick a restore can return to, so it can prune the
     /// delivered presentation-event keys below it and the aliases of entities despawned
-    /// before it. `lactose-predict` calls it with the ring's oldest tick; the server, which
-    /// never rolls back, with the current tick.
+    /// before it. `lactose-predict` calls it with the ring's oldest tick, a client's world
+    /// with the current tick before each step, and a server's step, which never rolls
+    /// back, with the tick after the one it ran, once the step has resolved, so between
+    /// steps a server holds no bind of an entity despawned in a step (`lactose-sim`, D142).
     pub fn set_rollback_horizon(&mut self, oldest: Tick) {
         self.present.prune(oldest);
         let gone: Vec<PredictionKey> = self
@@ -1496,10 +1563,12 @@ impl World {
 
     /// Loads rows into `region`, which exists ([`create_region`](Self::create_region) with
     /// the saved seed) and is empty: spawns the cooked rows of `baseline` except those
-    /// `overlay` destroys, a copy per archetype column plus a remap pass over reference
-    /// fields; then applies `overlay`'s records in record order and restores every
-    /// predicted origin key and alias from [`PredictedOrigin`](crate::PredictedOrigin).
-    /// Reference fields keep the origin keys they were exported with. The one exception, in
+    /// `overlay` destroys; then applies `overlay`'s records in record order and restores
+    /// every predicted origin key and alias from [`PredictedOrigin`](crate::PredictedOrigin),
+    /// which only a record carries: a baseline with a `PredictedOrigin` column is
+    /// `InvalidData`, nothing changed (D142). Each runtime `NetId` the rows and binds give
+    /// moves the counter past it ([`allocate_net_id`](Self::allocate_net_id)). Reference
+    /// fields keep the origin keys they were exported with, with no remap. The one exception, in
     /// a `Server` world: a row's owner outside the document that is a despawned predicted
     /// entity, its alias still held, is stored under its `Net` key, which is what a fresh
     /// process loading the same document stores (D141). A `Destroy` record
@@ -2080,6 +2149,9 @@ impl World {
             self.index_claim(key, value.info, &value.bytes, true);
         }
         self.log.push(self.tick, StructuralChange::Spawned { key, region });
+        if let StableKey::Net(net) = key {
+            self.count_past(net);
+        }
         if let StableKey::Predicted(predicted) = key
             && self.despawned_predicted.remove(&predicted).is_some()
             && self.kind == WorldKind::Server

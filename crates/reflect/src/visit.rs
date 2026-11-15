@@ -35,7 +35,9 @@ pub trait FieldVisitor {
     fn asset_ref<A: AssetReference>(&mut self, id: FieldId, value: &A);
 }
 
-/// Rewrites the reference fields of a value in place. The load path's remap pass is one.
+/// Rewrites the reference fields of a value in place: the ECS's resolution of a typed
+/// value's references at command apply and at a direct write is one. No load is, since a
+/// reference is loaded as exported, an owner excepted (architecture section 7).
 pub trait ReferenceVisitor {
     /// A reference to an entity.
     fn entity_ref(&mut self, id: FieldId, value: &mut EntityRef);

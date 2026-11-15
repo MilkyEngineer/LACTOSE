@@ -176,3 +176,19 @@ fn a_bundles_mode_under_anchored_is_the_policys() {
     assert!(simulation.lifecycle_mut().take_load_failures().is_empty());
     assert_eq!(loaded(&simulation)[&region], RegionMode::Frozen, "no table yet");
 }
+
+/// D142: the binds a builder is given are bound as `World::bind` binds them, so two
+/// prediction keys under one `NetId` fail the build with its error.
+#[test]
+fn two_predicted_origins_bound_to_one_net_id_fail_the_build() {
+    let key = |ordinal| lactose_core::PredictionKey {
+        player: lactose_core::PlayerId(1),
+        input_tick: lactose_core::Tick(4),
+        ordinal,
+    };
+    let net = lactose_core::NetId::from_bits(3).unwrap();
+    let binds = BTreeMap::from([(key(1), net), (key(2), net)]);
+    let error = game(WorldKind::Server).binds(binds).build().unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::InvalidData, "{error}");
+    assert!(error.message().contains("one of the two keys is already bound to another"), "{error}");
+}

@@ -1,16 +1,19 @@
 //! A save's sections against each other and its header, on the server's own paths:
 //! `Server::encode_save` refuses a save its next start's `load` would refuse, before any
 //! byte is written, and `load` refuses a cooked entity two regions would both hold, which
-//! only the baselines show (`README.md`, "Saves and loads").
+//! only the baselines show, and a prediction key two sections bind to two `NetId`s
+//! (`README.md`, "Saves and loads").
 
 use std::collections::BTreeMap;
 use std::num::NonZeroU64;
 use std::sync::Arc;
 
-use lactose_app::{Cooked, Server, Start, WorldConfig, build_server, load as app_load};
+use lactose_app::{
+    Cooked, SavedRegion, SavedWorld, Server, Start, WorldConfig, build_server, load as app_load,
+};
 use lactose_asset_api::{AssetSet, PinnedTable, VersionTable};
 use lactose_bundle::{Baseline, BaselineRow, ComponentData};
-use lactose_core::{Error, ErrorKind, NetId, Result, StableKey};
+use lactose_core::{Error, ErrorKind, NetId, PlayerId, PredictionKey, Result, StableKey, Tick};
 use lactose_ecs::{Executor, RegionId, RegionMode};
 use lactose_persist::{Container, ContainerHeader, SchemaTable};
 use lactose_reflect::{Reflect, bytemuck};
@@ -25,33 +28,36 @@ fn encoded(executor: &Executor, server: Server) -> (Server, Result<Vec<u8>>) {
     (server, bytes)
 }
 
+/// D142: a direct spawn under a runtime ID at or above a server world's counter moves the
+/// counter past it, so the server's next save holds the counter above it, encodes, and a
+/// fresh process started from it allocates above it.
 #[test]
-fn a_direct_runtime_spawn_above_the_counter_fails_the_encode_and_the_last_save_stays() {
+fn a_direct_runtime_spawn_above_the_counter_saves_and_loads() {
     let executor = executor(2);
     let content = Content::new();
     let fresh = server(&executor, WorldConfig::headless(), Start::Fresh, &content);
-    let (server, out) = step(&executor, fresh, load(&content, [1]));
+    let (mut first, out) = step(&executor, fresh, load(&content, [1]));
     assert!(out.failures.is_empty(), "{out:?}");
-    let (mut server, last) = encoded(&executor, server);
-    let last = last.expect("a save before the spawn");
 
-    // The ECS takes a direct spawn under a runtime ID at or above a server world's counter
-    // and leaves the counter (`docs/verification.md`, the row on that spawn).
-    let world = server.simulation_mut().world_mut();
+    let world = first.simulation_mut().world_mut();
     let direct = NetId::runtime(NonZeroU64::new(1000).unwrap()).unwrap();
     world.spawn(StableKey::Net(direct), RegionId(1), (Counter(0),)).expect("a direct spawn");
-    assert_eq!(world.next_net_id().get(), 1);
-    let (server, _) = step(&executor, server, TickInput::default());
-    let (server, refused) = encoded(&executor, server);
-    let error = refused.expect_err("the encode refuses what the next start would");
-    assert_eq!(error.kind(), ErrorKind::InvalidData, "{error}");
-    for named in ["region 1 ", "runtime NetId 1000", "NetId counter 1"] {
-        assert!(error.message().contains(named), "`{error}` names `{named}`");
-    }
-    // Nothing was written, so the slot keeps the last save, and it loads.
+    assert_eq!(world.next_net_id().get(), 1001);
+    let (first, _) = step(&executor, first, TickInput::default());
+    let (first, saved) = encoded(&executor, first);
+    let bytes = saved.expect("the save encodes");
+    first.shutdown();
+
     let cooked = Arc::clone(&content) as Arc<dyn Cooked>;
-    app_load(&GAME, &last, &*cooked).expect("the last save loads");
-    server.shutdown();
+    let loaded = app_load(&GAME, &bytes, &*cooked).expect("the save loads");
+    assert_eq!(loaded.next_net_id.get(), 1001);
+    let resumed = server(&executor, WorldConfig::headless(), Start::Loaded(loaded), &content);
+    let (mut resumed, out) = step(&executor, resumed, load(&content, [1]));
+    assert!(out.failures.is_empty(), "{out:?}");
+    let world = resumed.simulation_mut().world_mut();
+    assert!(world.contains(StableKey::Net(direct)), "the direct spawn was saved");
+    assert_eq!(world.allocate_net_id().unwrap().to_bits(), 1001);
+    resumed.shutdown();
     executor.shutdown();
 }
 
@@ -180,5 +186,62 @@ fn a_cooked_entity_spawned_elsewhere_while_still_a_row_at_home_is_refused_at_loa
             assert!(error.message().contains(named), "`{error}` names `{named}`");
         }
     }
+    executor.shutdown();
+}
+
+/// D142: no world's export binds one prediction key to two `NetId`s, so a splice whose
+/// sections do is refused before any world exists, by `load` and by `build_server` alike.
+#[test]
+fn a_save_whose_sections_bind_one_origin_twice_fails_at_load() {
+    let executor = executor(2);
+    let homes = Homes::new();
+    let cooked = Arc::clone(&homes) as Arc<dyn Cooked>;
+    let key = PredictionKey { player: PlayerId(3), input_tick: Tick(2), ordinal: 0 };
+    let bound_in = |region: u64, skip: u32| {
+        let mut id = None;
+        let played = played(&executor, &homes, RegionMode::Simulated, |server| {
+            let world = server.simulation_mut().world_mut();
+            for _ in 0..skip {
+                world.allocate_net_id().expect("a net id");
+            }
+            let net = world.allocate_net_id().expect("a net id");
+            let predicted = StableKey::Predicted(key);
+            world.spawn(predicted, RegionId(region), (Counter(0),)).expect("the spawn");
+            world.bind(key, net).expect("the bind");
+            id = Some(net);
+        });
+        (played, id.expect("bound"))
+    };
+    let (home, first) = bound_in(1, 0);
+    let (away, second) = bound_in(2, 1);
+    assert_ne!(first, second);
+    app_load(&GAME, &home.encode().expect("encodes"), &*cooked).expect("one bind loads");
+    app_load(&GAME, &away.encode().expect("encodes"), &*cooked).expect("one bind loads");
+
+    let named =
+        [format!("{key:?}"), format!("{first:?} in region 1"), format!("{second:?} in region 2")];
+    let refused = |error: Error| {
+        assert_eq!(error.kind(), ErrorKind::InvalidData, "{error}");
+        for name in &named {
+            assert!(error.message().contains(name.as_str()), "`{error}` names `{name}`");
+        }
+    };
+    refused(app_load(&GAME, &spliced(&home, &away), &*cooked).expect_err("refused"));
+
+    // The same sections as a saved world handed to the build.
+    let regions = [home.region(RegionId(1)), away.region(RegionId(2))].into_iter().map(|records| {
+        let records = records.expect("a section").clone();
+        let baseline = homes.baseline(records.baseline_hash).expect("a cooked baseline");
+        (records.region, Arc::new(SavedRegion { records, baseline }))
+    });
+    let header = away.header();
+    let saved = SavedWorld {
+        tick: header.tick,
+        next_net_id: header.next_net_id,
+        regions: regions.collect(),
+    };
+    let build =
+        build_server(&executor, &GAME, WorldConfig::headless(), Start::Loaded(saved), cooked);
+    refused(build.err().expect("the build fails"));
     executor.shutdown();
 }

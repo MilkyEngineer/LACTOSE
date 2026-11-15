@@ -15,8 +15,8 @@ use std::collections::BTreeMap;
 use common::*;
 use glue::{SessionSetup, record};
 use lactose_asset_api::PinnedTable;
-use lactose_core::{PlayerId, Tick};
-use lactose_ecs::{ClaimedBy, Executor, LayoutConfig, RegionId, RegionMode, WorldKind};
+use lactose_core::{EntityRef, PlayerId, PredictionKey, StableKey, Tick};
+use lactose_ecs::{ClaimedBy, Executor, LayoutConfig, OwnedBy, RegionId, RegionMode, WorldKind};
 use lactose_persist::{Container, Loader, Migrations, RegionRecords};
 use lactose_sim::harness::run_recorded;
 use lactose_sim::{RegionBundle, RegionExport, SavePoint, SessionEvent, Simulation, TickInput};
@@ -135,6 +135,13 @@ impl Run {
         for tick in 1..=ticks {
             simulation = step(self.executor(), simulation, directed_frame(tick));
         }
+        simulation
+    }
+
+    /// `builder` built with the session's layout, with the recorder opened for it.
+    fn open(&mut self, builder: lactose_sim::SimulationBuilder) -> Simulation {
+        let simulation = builder.layout(self.setup.layout).build().unwrap();
+        self.recorder = Some(self.setup.recorder(self.test, simulation.world().layout()).unwrap());
         simulation
     }
 
@@ -287,5 +294,179 @@ fn an_unload_and_reload_exports_the_same_region() {
     let (_, save) = save_of(run.executor(), simulation);
     let again = save.regions.iter().find(|copy| copy.region == region).unwrap();
     assert_eq!(again, &export);
+    run.finish();
+}
+
+// ---- Binds across a save (D142) ----
+
+/// The rock of `A`, which the owner owns.
+fn rock() -> StableKey {
+    StableKey::Net(cooked(A, 2))
+}
+
+/// The prediction key of the owner, when it has one.
+fn owner_origin() -> PredictionKey {
+    PredictionKey { player: PlayerId(7), input_tick: Tick(1), ordinal: 0x0D1 }
+}
+
+fn owner_of(simulation: &Simulation) -> Option<StableKey> {
+    simulation.world().get::<OwnedBy>(rock()).and_then(|owned| owned.owner.get())
+}
+
+/// The bundle that loads `records` frozen, with the region's first table.
+fn frozen(records: &RegionRecords) -> RegionBundle {
+    let mut bundle = bundle_of(records, Some(first_table(records.region)));
+    bundle.mode = RegionMode::Frozen;
+    bundle
+}
+
+fn loaded_regions(simulation: &Simulation) -> Vec<RegionId> {
+    simulation.world().regions().collect()
+}
+
+/// What a fresh process saw beside the original.
+struct Resumed {
+    /// The owner's key in the original.
+    owner: StableKey,
+    /// The rock's owner in the fresh process once `A` loaded.
+    fresh_owner: Option<StableKey>,
+    /// The ticks at which the two hash apart.
+    differ: Vec<u32>,
+}
+
+/// The whole-project review's probe D1 through this crate's bytes: `A` and `B` loaded
+/// fresh; an owner spawned in `B`, with a predicted origin and bound when `predicted`,
+/// under a runtime `Net` key otherwise; the rock of `A` given to it; the save at tick 10
+/// through the container's bytes. `B` then unloads in the original, which reloads `A` in
+/// place from the bytes; a fresh process decodes them, builds with the header's tick and
+/// counter and, when `with_binds`, `Loader::binds` over both sections, and loads `A` alone.
+/// Both load `A` frozen, so the first comparison is of the state as loaded, and simulate
+/// it from the next step; `K` ticks later both load `B`, the original from the export its
+/// unload left, the fresh process from the bytes. The original's steps are recorded when
+/// `recorded`.
+fn owner_in_an_unloaded_region(
+    run: &mut Run,
+    predicted: bool,
+    with_binds: bool,
+    recorded: bool,
+) -> Resumed {
+    const K: u32 = 40;
+    let executor = run.executor().clone();
+    let advance = |run: &mut Run, simulation: Simulation, frame: TickInput| {
+        if recorded { run.step(simulation, frame) } else { step(&executor, simulation, frame) }
+    };
+    let mut original = if recorded {
+        run.open(game(WorldKind::Server))
+    } else {
+        directed(run.setup.layout).build().unwrap()
+    };
+    let mut first = TickInput::default();
+    first.loaded.insert(A, fresh(A));
+    first.loaded.insert(B, fresh(B));
+    original = advance(run, original, first);
+    let world = original.world_mut();
+    let net = world.allocate_net_id().unwrap();
+    let owner = if predicted {
+        let key = StableKey::Predicted(owner_origin());
+        world.spawn(key, B, (pos(1, 1),)).unwrap();
+        world.bind(owner_origin(), net).unwrap();
+        key
+    } else {
+        let key = StableKey::Net(net);
+        world.spawn(key, B, (pos(1, 1),)).unwrap();
+        key
+    };
+    world.insert(rock(), OwnedBy { owner: EntityRef::new(owner) }).unwrap();
+    for _ in 2..=10 {
+        original = advance(run, original, TickInput::default());
+    }
+    let (mut original, save) = save_of(&executor, original);
+    let bytes = save_bytes(&save);
+    let container = Container::decode(&bytes).unwrap();
+    let header = container.header();
+    assert_eq!((header.tick, header.next_net_id), (Tick(10), save.next_net_id));
+    let migrations = Migrations::new();
+    let binds = Loader::new(schemas(), &migrations).binds(container.regions()).unwrap();
+    if predicted {
+        assert_eq!(binds, BTreeMap::from([(owner_origin(), net)]));
+    } else {
+        assert!(binds.is_empty(), "{binds:?}");
+    }
+    let saved = |region| container.region(region).unwrap();
+
+    let mut in_place = TickInput::default();
+    in_place.unloaded.insert(A);
+    in_place.unloaded.insert(B);
+    in_place.loaded.insert(A, frozen(saved(A)));
+    original = advance(run, original, in_place);
+    let left = original.lifecycle_mut().take_exports();
+    let kept = records_of(left.iter().find(|export| export.region == B).unwrap());
+    assert_eq!(&kept, saved(B), "the unload left the saved state");
+
+    let mut fresh = directed(run.setup.layout).tick(header.tick).next_net_id(header.next_net_id);
+    if with_binds {
+        fresh = fresh.binds(binds);
+    }
+    let mut fresh = fresh.build().unwrap();
+    let bound = (with_binds && predicted).then_some(net);
+    assert_eq!(fresh.world().alias(owner_origin()), bound, "bound before any step");
+    let mut alone = TickInput::default();
+    alone.loaded.insert(A, frozen(saved(A)));
+    fresh = step(&executor, fresh, alone);
+    assert_eq!(owner_of(&original), Some(owner));
+    let fresh_owner = owner_of(&fresh);
+    // The fresh process exports the save's records for `A`, with the binds or without.
+    let export = RegionExport { region: A, rows: fresh.world().export_region(A).unwrap() };
+    assert_eq!(&records_of(&export), saved(A));
+
+    let mut differ = Vec::new();
+    for tick in 11..=11 + 2 * K {
+        let mut frame = TickInput::default();
+        if tick == 12 {
+            frame.modes.insert(A, RegionMode::Simulated);
+        }
+        let (mut in_original, mut in_fresh) = (frame.clone(), frame);
+        if tick == 12 + K {
+            in_original.loaded.insert(B, bundle_of(&kept, Some(first_table(B))));
+            in_fresh.loaded.insert(B, bundle_of(saved(B), Some(first_table(B))));
+        }
+        if tick > 11 {
+            original = advance(run, original, in_original);
+            fresh = step(&executor, fresh, in_fresh);
+        }
+        if original.hash().unwrap() != fresh.hash().unwrap() {
+            differ.push(tick);
+        }
+    }
+    assert_eq!(loaded_regions(&original), vec![A, B]);
+    assert_eq!(loaded_regions(&fresh), vec![A, B]);
+    Resumed { owner, fresh_owner, differ }
+}
+
+/// The whole-project review's probe D1 at the container's bytes: equal with the binds,
+/// recorded under SOUR; built without them the fresh process stores the owner's `Net` key
+/// and hashes apart from the first comparison, which is the failure the binds prevent.
+#[test]
+fn a_fresh_process_that_leaves_a_predicted_owners_region_unloaded_hashes_equal() {
+    let mut run = Run::new("lactose_persist::reload::predicted_owner_unloaded");
+    let with = owner_in_an_unloaded_region(&mut run, true, true, true);
+    assert_eq!(with.fresh_owner, Some(with.owner), "the predicted origin in both");
+    assert_eq!(with.differ, Vec::<u32>::new());
+    let without = owner_in_an_unloaded_region(&mut run, true, false, false);
+    assert!(matches!(without.fresh_owner, Some(StableKey::Net(_))), "{:?}", without.fresh_owner);
+    assert_eq!(without.differ.first(), Some(&11), "{:?}", without.differ);
+    run.finish();
+}
+
+/// The control: the same history with an owner whose origin key is its `Net` key, equal
+/// with the binds and without them, so the difference above is the bind.
+#[test]
+fn an_owner_with_a_net_key_in_an_unloaded_region_hashes_equal() {
+    let mut run = Run::new("lactose_persist::reload::net_owner_unloaded");
+    for (with_binds, recorded) in [(true, true), (false, false)] {
+        let compared = owner_in_an_unloaded_region(&mut run, false, with_binds, recorded);
+        assert_eq!(compared.fresh_owner, Some(compared.owner));
+        assert_eq!(compared.differ, Vec::<u32>::new(), "with binds: {with_binds}");
+    }
     run.finish();
 }

@@ -302,3 +302,35 @@ fn an_entity_without_a_net_id_cannot_be_exported() {
     assert_eq!(exported.rows[0].id, runtime(8));
     assert!(exported.rows[0].components.iter().any(|c| c.component == PredictedOrigin::KEY));
 }
+
+/// A cooked baseline carries no predicted origin (D142): a load of one that does is refused
+/// with nothing changed, so every bind a load makes comes from a record of its overlay.
+#[test]
+fn a_baseline_that_carries_a_predicted_origin_is_refused() {
+    let registry = registry();
+    let key = predicted_r2();
+    let origin =
+        PredictedOrigin { player: key.player, input_tick: key.input_tick, ordinal: key.ordinal };
+    let rows = [BaselineRow { id: cooked(C1), components: vec![data(pos(1, 1)), data(origin)] }];
+    let carrying = Baseline::from_rows(AssetSet::new(), schemas(&registry), rows).unwrap();
+    let plain = Baseline::from_rows(AssetSet::new(), schemas(&registry), []).unwrap();
+    let spawn = Record::Spawn { id: runtime(R2), components: vec![data(pos(1, 1)), data(origin)] };
+    let overlay = Overlay::new(plain.content_hash(), schemas(&registry), [spawn]).unwrap();
+    for layout in [LayoutConfig::default()].into_iter().chain(layouts()) {
+        let mut world = fresh(registry.clone(), layout, 77);
+        let mut cursor = world.structural_log().cursor();
+        let counter = world.next_net_id();
+        let error = world.load_region(REGION, &carrying, None).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::InvalidData);
+        assert!(error.to_string().contains("ecs::predicted_origin"), "{error}");
+        assert_eq!(world.entities_in(REGION).count(), 0, "no row");
+        assert_eq!(world.alias(key), None, "no bind");
+        assert_eq!(world.next_net_id(), counter, "no counter move");
+        assert_eq!(world.structural_log().since(&mut cursor).unwrap().count(), 0, "no log entry");
+
+        // The same origin on a `Spawn` record of the overlay loads and binds.
+        world.load_region(REGION, &plain, Some(&overlay)).unwrap();
+        assert_eq!(world.alias(key), Some(runtime(R2)));
+        assert!(world.contains(StableKey::Predicted(key)));
+    }
+}

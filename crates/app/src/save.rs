@@ -81,15 +81,14 @@ pub struct SavedWorld {
 /// section in ascending region order `Loader::bundle(&records, baseline, RegionMode::Frozen,
 /// None)` to validate the section (the bundle is dropped: a save that cannot load fails
 /// here, before any world exists, not at the step that reloads a region hours in) and
-/// `Loader::migrate(&records)` as the entry's records. From the lane `binds-impl` on (D142;
-/// a facade until then), `Loader::binds` then runs over the migrated records of every
-/// section and its result is dropped: a save whose sections bind one prediction key to two
-/// `NetId`s fails here with `InvalidData`, and `build_server` reads the binds again from
-/// the `SavedWorld`, as it does for one a save point produced. Synchronous, on the thread that
-/// starts the binary, before any world exists: the registry a load needs is the world's,
-/// and the tick and counter it yields are the builder's. The first error ends the load
-/// with nothing built; the policy's response to [`Source::Load`](crate::Source::Load) is
-/// `Stop`.
+/// `Loader::migrate(&records)` as the entry's records. `Loader::binds` then runs over the
+/// migrated records of every section and its result is dropped (D142): a save whose
+/// sections bind one prediction key to two `NetId`s fails here with `InvalidData`, and
+/// `build_server` reads the binds again from the `SavedWorld`, as it does for one a save
+/// point produced. Synchronous, on the thread that starts the binary, before any world
+/// exists: the registry a load needs is the world's, and the tick and counter it yields are
+/// the builder's. The first error ends the load with nothing built; the policy's response
+/// to [`Source::Load`](crate::Source::Load) is `Stop`.
 ///
 /// What no section's baseline shows is not checked: a cooked entity that a section spawns
 /// from the baseline while its home region has no section in the file is found live when
@@ -119,6 +118,7 @@ fn decode(game: &Game, container: &[u8], cooked: &dyn Cooked) -> Result<SavedWor
         let records = loader.migrate(records)?;
         regions.insert(records.region, Arc::new(SavedRegion { records, baseline }));
     }
+    loader.binds(regions.values().map(|entry| &entry.records))?;
     let header = decoded.header();
     Ok(SavedWorld { tick: header.tick, next_net_id: header.next_net_id, regions })
 }

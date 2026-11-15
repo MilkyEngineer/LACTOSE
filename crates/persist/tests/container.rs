@@ -735,24 +735,29 @@ fn two_sections_that_change_one_cooked_row_are_refused_at_decode() {
     refused_naming(Container::decode(&spliced(1, &[&in_d, &in_a])), &[named.as_str()]);
 }
 
-/// A server world takes a direct spawn under a runtime `NetId` at or above its counter and
-/// leaves the counter, so its own export fails the check, while `assemble`, which reads no
-/// record, writes it: a writer runs `check_sections` first (`app`'s `Server::encode_save`
-/// does).
+/// D142: a server world's direct spawn under a runtime `NetId` at or above its counter
+/// moves the counter past it, so its own export passes the check under the world's counter.
+/// `assemble` reads no record and writes a stale counter as given, which the check and the
+/// decode refuse: a writer runs `check_sections` first (`app`'s `Server::encode_save` does).
 #[test]
-fn a_direct_runtime_spawn_above_the_counter_fails_check_sections_though_assemble_writes_it() {
+fn a_direct_runtime_spawn_above_the_counter_moves_it_and_its_export_passes_check_sections() {
     let a = baseline_a();
     let mut world = loaded_world(&[(A, &a)]);
     let direct = NetId::runtime(NonZeroU64::new(1000).unwrap()).unwrap();
     world.spawn(net(direct), A, (pos(1, 1),)).unwrap();
-    assert_eq!(world.next_net_id().get(), 1);
+    assert_eq!(world.next_net_id().get(), 1001);
     let records = records_in_world(&world, A, &a);
     let bytes = spliced(world.next_net_id().get(), &[&records]);
     let header = Container::index(&bytes).unwrap().header;
+    Container::check_sections(&header, [&records]).unwrap();
+    assert_eq!(Container::decode(&bytes).unwrap().header(), &header);
+
+    let stale = spliced(1000, &[&records]);
+    let header = Container::index(&stale).unwrap().header;
     let region = format!("region {}", A.0);
-    let named = [region.as_str(), "runtime NetId 1000", "NetId counter 1"];
+    let named = [region.as_str(), "runtime NetId 1000", "NetId counter 1000"];
     refused_naming(Container::check_sections(&header, [&records]), &named);
-    refused_naming(Container::decode(&bytes), &named);
+    refused_naming(Container::decode(&stale), &named);
 }
 
 /// The two orders the check rests on and does not enforce itself: an overlay's records

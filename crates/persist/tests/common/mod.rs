@@ -884,11 +884,12 @@ pub fn changed() -> Changed {
     world.move_to_region(net(c(A, 2)), B).unwrap();
     world.move_to_region(net(c(B, 1)), A).unwrap();
     world.insert(net(c(B, 1)), Age(4)).unwrap();
-    // A component changed, one added, one removed, one unchanged, and a NaN written.
+    // A component changed, one added, one removed and one unchanged. No NaN: a live world
+    // holds none, and a debug build's save asserts it (architecture section 8.2).
     world.insert(net(c(A, 3)), Mass(Scalar::from_i32(5))).unwrap();
     world.insert(net(c(A, 3)), Health(7)).unwrap();
     world.remove::<Marker>(net(c(A, 3))).unwrap();
-    world.insert(net(c(A, 3)), Position { x: odd_nan(), y: Scalar::from_i32(3) }).unwrap();
+    world.insert(net(c(A, 3)), pos(-3, 3)).unwrap();
     // A spawned entity, with a transient value and an owner, and one spawned then gone.
     let spawned = world.allocate_net_id().unwrap();
     let components = (pos(30, 30), Velocity { x: Scalar::ONE, y: Scalar::ONE }, Contacts(4));

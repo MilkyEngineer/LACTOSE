@@ -13,7 +13,7 @@ use lactose_math::Scalar;
 use lactose_reflect::bytemuck;
 use lactose_reflect::{
     AssetReference, Field, FieldInfo, FieldKind, FieldVisitor, Persistence, Reflect, Registry,
-    ScalarField, TypeRole,
+    ScalarField, TypeInfo, TypeRole,
 };
 
 use crate::region::{RegionPolicy, StreamingAnchor};
@@ -341,19 +341,23 @@ struct FieldHasher<'a> {
     current: Option<FieldId>,
     /// Where the digest collects (field, field hash) pairs, if one is being taken.
     fields: Option<&'a mut Vec<(FieldId, u64)>>,
+    /// Whether the type is persistent, whose NaN a debug build asserts against.
+    persistent: bool,
 }
 
 impl<'a> FieldHasher<'a> {
     fn new(
         scratch: &'a mut Vec<u8>,
         key: Option<StableKey>,
-        declared: &'static [FieldInfo],
+        info: &'static TypeInfo,
         fields: Option<&'a mut Vec<(FieldId, u64)>>,
     ) -> Self {
         scratch.clear();
         scratch.extend_from_slice(&key_bytes(key));
         let start = scratch.len();
-        Self { scratch, start, declared: declared.iter(), current: None, fields }
+        let declared = info.layout().fields().iter();
+        let persistent = info.persistence() == Persistence::Persistent;
+        Self { scratch, start, declared, current: None, fields, persistent }
     }
 
     /// Makes `id` the field being visited, closing the one before and every field with an
@@ -422,7 +426,16 @@ impl FieldVisitor for FieldHasher<'_> {
             TypeId::of::<S>() == TypeId::of::<Scalar>(),
             "the world hash trusts `lactose_math::Scalar` alone as a scalar"
         );
-        self.leaf(id, &value.canonical_bits().to_le_bytes());
+        let bits = value.canonical_bits();
+        // Architecture section 8.2: a NaN in a persistent column is a defect of the build
+        // that wrote it. A transient column is hashed too and may hold one.
+        debug_assert!(
+            !self.persistent || bits != Scalar::NAN.to_canonical_bits(),
+            "a NaN in field {} of a persistent type: simulation state never holds one \
+             (architecture section 8.2)",
+            id.0
+        );
+        self.leaf(id, &bits.to_le_bytes());
     }
 
     fn f32(&mut self, _: FieldId, _: f32) {
@@ -446,7 +459,7 @@ impl FieldVisitor for FieldHasher<'_> {
 fn hash_value<T: Reflect>(key: Option<StableKey>, bytes: &[u8], scratch: &mut Vec<u8>) -> u64 {
     // Storage holds only values its type's validation accepted.
     let value: T = bytemuck::checked::pod_read_unaligned(bytes);
-    let mut hasher = FieldHasher::new(scratch, key, T::SCHEMA.info().layout().fields(), None);
+    let mut hasher = FieldHasher::new(scratch, key, T::SCHEMA.info(), None);
     value.visit(&mut hasher);
     hasher.finish();
     xxh64(scratch, T::KEY.0)
@@ -455,8 +468,7 @@ fn hash_value<T: Reflect>(key: Option<StableKey>, bytes: &[u8], scratch: &mut Ve
 /// The [`ValueDigester`] of `T`.
 fn digest_value<T: Reflect>(bytes: &[u8], scratch: &mut Vec<u8>, fields: &mut Vec<(FieldId, u64)>) {
     let value: T = bytemuck::checked::pod_read_unaligned(bytes);
-    let declared = T::SCHEMA.info().layout().fields();
-    let mut hasher = FieldHasher::new(scratch, None, declared, Some(fields));
+    let mut hasher = FieldHasher::new(scratch, None, T::SCHEMA.info(), Some(fields));
     value.visit(&mut hasher);
     hasher.finish();
 }

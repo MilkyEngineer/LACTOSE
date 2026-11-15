@@ -960,7 +960,7 @@ editorial pass rather than one taken from a review.
   call, the counter's use of the last runtime record, the residency of changed rows and app's
   baseline check each fail their tests.
 - Addendum (D142, lane binds-design, 2026-11-15): `Loader::binds` reads a saved world's binds
-  from its sections; the container format is unchanged. A facade until the lane `binds-impl`.
+  from its sections; the container format is unchanged. Implemented by the lane `binds-impl`.
 
 **D130. The `io` facade: what sections 4, 5.1, 8.2, 9.7, 15.3, 19 and 20 left open** (§3, §4, §5.1, §8.2, §9.7, §14, §15.3, §19, §20, §21, `lactose-io`, `lactose-core`, `lactose-task`)
 - Why: the facade is written before its implementation so `asset`, `app`'s save path, `cook`
@@ -1335,8 +1335,8 @@ editorial pass rather than one taken from a review.
   dynamic entity in the prediction world is claimed or static; the spike compares a column (the
   carrier) where it is not.
 - Addendum (D142, lane binds-design, 2026-11-15): `build_server` gives a `Start::Loaded` world
-  the saved world's binds; `load` refuses a save whose sections bind one origin twice. A facade
-  until the lane `binds-impl`.
+  the saved world's binds; `load` refuses a save whose sections bind one origin twice.
+  Implemented by the lane `binds-impl`.
 
 **D136. The `asset` facade, and the change it makes to `asset-api`'s store contract: what sections 4, 5.1, 8.2, 14, 15.2, 18, 19 and 20 left open** (§3, §4, §5.1, §8.2, §9.7, §14, §15.2, §18, §19, §20, §22, `lactose-asset`, `lactose-asset-api`, `lactose-bundle`, `lactose-io`, `lactose-task`, `lactose-app`, `lactose-persist`, `tools/cook`)
 - Why: the facade is written before its implementation so the cooker's skeleton, the milestone
@@ -2298,7 +2298,7 @@ editorial pass rather than one taken from a review.
 - Addendum (D142, lane binds-design, 2026-11-15): the counter moves past a runtime `NetId` given
   by a spawn, a load or a bind; `load_region` refuses a baseline that carries
   `ecs::predicted_origin`; `World::insert_resource` does not build for a type that holds an
-  `EntityRef`. A facade until the lane `binds-impl`.
+  `EntityRef`. Implemented by the lane `binds-impl`.
 
 **D118. The `sim` facade: what sections 4, 6, 8.2, 8.3, 9.1, 9.7, 11, 14 and 15 left open** (§4,
 §5.2, §6, §6.1, §8.2, §8.3, §9.1, §9.7, §10, §11, §14, §15.3, §16, `lactose-sim`, `lactose-ecs`)
@@ -2491,7 +2491,7 @@ editorial pass rather than one taken from a review.
   renames or removes a recording test or a harness package edits those lists in the same commit
   (review X4).
 - Addendum (D142, lane binds-design, 2026-11-15): `SimulationBuilder::binds`; a `Server` world's
-  horizon is set after the run, to the tick after it; `Journal::binds`. A facade until the lane
+  horizon is set after the run, to the tick after it; `Journal::binds`. Implemented by the lane
   `binds-impl`.
 
 **D119. The `physics-api` facade: what sections 4, 6.1, 9.4, 9.7, 10, 15.1 and 16 left open**
@@ -5560,6 +5560,30 @@ relayed by an event when it acts on another body** (§6.1, §10, `lactose-ecs`,
   load performs; D117's pass over IDs in use as the counter's only rule; D118's horizon before
   the run for a `Server` world; D141's "sim never loads between a despawn and the next horizon"
   as a description of the code before this entry.
+- Addendum (lane binds-impl, 2026-11-15; review rounds 1 and 2): implemented as the four
+  READMEs' facade stated, in `lactose-ecs`, `lactose-sim`, `lactose-persist` and `lactose-app`;
+  `Simulation` implements `Debug`. The NaN assertion of section 8.2 is in `lactose-sim`'s field
+  hasher for persistent types only and at `lactose-persist`'s live-world entry points only; the
+  fixture's NaN is gone and the canonical-form proofs run on values decoded through a migration
+  step, or as `should_panic` in a debug build. A NaN a decoded section brings in loads as it is,
+  as section 8.2 states. The reflected accessors do not refuse an entry with no clone function:
+  of the paths that read or take a world resource, `World::resource`, `resource_mut` and
+  `remove_resource` take `T: Resource`, where a refusal would hold, but the `Res<T>` and
+  `ResMut<T>` parameters and `World::service` and `service_mut` take `T: ?Sized` and serve
+  services too, so without specialization it could not hold there. Mutations each fail named
+  tests: the binds applied after the first region loads (the journal replay test among them, by
+  its owner before the first step), `Loader::binds` accepting one key under two `NetId`s, no
+  counter move in `bind`, no server horizon at the end of a step, no NaN assertion in the
+  hasher. The spike digest stays 8db4551c007e6410 and no recorded hash moves in the lane's runs
+  of SOUR's ten variants. Measured (dev profile, Apple M1, load 21.18 20.79 26.07 /
+  19.81 20.51 25.95): `Loader::binds` over one region of 100,000 entities with a predicted
+  origin 99.6 ms median, the builder's binds 125.8 ms at `build`, beside 59.1 ms for that
+  region's `RegionRecords::from_export`. The physics sync's fallback is not taken in the spike's
+  thrown scene (1,150 removals of a predicted body: 1,100 through the alias, 50 unbound, no
+  scan), whose despawn runs before the step's physics sync point; the 2,000-body scenes remove
+  no body. tick-100k, reload-100k and headless-120 match the base at equal load (tick-100k t1/tn
+  10014.3/3253.5 µs at load 6.47 against 10106.3/3272.8 at 7.73; reload.step 400.1 against
+  394.5 ms; headless hash unchanged).
 
 **D143. The prediction slot holds the backend's world as a copy, not as bytes; criterion 5 keeps its 100 µs and is measured again** (§8.3, §10, §15.5, §16, §20, §22, §23, `lactose-physics-api`, `lactose-physics-rapier`, `lactose-predict`, `docs/plans/milestone-1.md`)
 - Why: the quiet window on the Apple M1 at `bef3455` put the prediction-world snapshot at

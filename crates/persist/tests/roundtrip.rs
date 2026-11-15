@@ -12,7 +12,9 @@ use std::sync::Arc;
 
 use common::*;
 use lactose_asset_api::AssetSet;
-use lactose_bundle::{Baseline, BaselineRow, ComponentData, ComponentSchema, FieldLayout};
+use lactose_bundle::{
+    Baseline, BaselineRow, ComponentData, ComponentSchema, FieldLayout, Overlay, Record,
+};
 use lactose_core::{FieldId, NetId, PlainArray, StableKey};
 use lactose_ecs::{
     ClaimedBy, InRegion, OwnedBy, PredictedOrigin, RegionConfig, RegionId, RegionMode,
@@ -20,7 +22,8 @@ use lactose_ecs::{
 };
 use lactose_math::Scalar;
 use lactose_persist::{
-    Container, ContainerHeader, Loader, Migrations, PREAMBLE_BYTES, RegionRecords, SchemaTable,
+    Container, ContainerHeader, FieldValues, Loader, Migration, Migrations, PREAMBLE_BYTES,
+    RegionRecords, SchemaTable,
 };
 use lactose_reflect::{Padding, Reflect, Registry, TypeInfo, component, resource, value};
 use lactose_sim::RegionExport;
@@ -46,8 +49,7 @@ fn every_change_kind_loads_back_to_the_same_records() {
         let bundle = bundle_with(&table, &records, Arc::new(baseline.clone()));
         load_into(&mut loaded, region, &bundle);
         let again = RegionExport { region, rows: loaded.export_region(region).unwrap() };
-        // The original holds a NaN with odd bits, which the save made canonical: the
-        // records agree, and so does every row but that one value.
+        // The records agree, and so does every row's key, owner and transient presence.
         assert_eq!(RegionRecords::from_export(&again, &baseline, &table).unwrap(), records);
         assert_eq!(again.rows.seed, export.rows.seed);
         assert_eq!(again.rows.resources, export.rows.resources);
@@ -202,7 +204,7 @@ fn the_tables_schemas_are_the_ones_the_loader_accepts() {
     assert_eq!(ids, vec![1, 2, 3, 4]);
     assert_eq!(gear_schema.element_size() as usize, size_of::<Gear>());
 
-    // A cooked row of the type, a runtime row with a NaN nested in an array, a resource.
+    // A cooked row of the type, a runtime row with a scalar nested in an array, a resource.
     let region = RegionId(7);
     let cooked_row =
         BaselineRow { id: cooked(region, 1), components: vec![data(gear(1, Scalar::TWO))] };
@@ -212,9 +214,8 @@ fn the_tables_schemas_are_the_ones_the_loader_accepts() {
     let config = RegionConfig { id: region, seed: 3, mode: RegionMode::Simulated };
     world.create_region(config).unwrap();
     world.load_region(region, &baseline, None).unwrap();
-    let odd_nan = Scalar::from_f64(f64::from_bits(0x7FF8_0000_0000_0042));
     let id = world.allocate_net_id().unwrap();
-    world.spawn(StableKey::Net(id), region, (gear(9, odd_nan),)).unwrap();
+    world.spawn(StableKey::Net(id), region, (gear(9, Scalar::from_i32(-9)),)).unwrap();
     world.insert(StableKey::Net(cooked(region, 1)), gear(2, Scalar::ONE)).unwrap();
     let stock = Stock { count: 4, mood: Mood::Angry, _pad: Padding::default() };
     world.insert_region_resource(region, stock).unwrap();
@@ -231,10 +232,52 @@ fn the_tables_schemas_are_the_ones_the_loader_accepts() {
     }
     let again = RegionExport { region, rows: loaded.export_region(region).unwrap() };
     assert_eq!(RegionRecords::from_export(&again, &baseline, &table).unwrap(), records);
-    let canonical = Scalar::from_canonical_bits(odd_nan.to_canonical_bits());
-    let row = again.rows.rows.iter().find(|row| row.id == id).unwrap();
-    assert_eq!(row.components, vec![data(gear(9, canonical))]);
     assert_eq!(loaded.region_resource::<Stock>(region), Some(&stock_of(4)));
+
+    // Decoded records saved under the type's previous version whose runtime row holds a
+    // NaN of odd bits nested in the array: the loader's step writes it canonical, and a
+    // debug build asserts nothing, since a file is not a live world (architecture section
+    // 8.2). The world's own export is read, not saved.
+    let odd_nan = Scalar::from_f64(f64::from_bits(0x7FF8_0000_0000_0042));
+    let overlay = records.overlay.as_deref().unwrap();
+    let decoded: Vec<Record> = overlay
+        .records()
+        .iter()
+        .map(|record| match record {
+            Record::Spawn { id: spawned, .. } if *spawned == id => {
+                Record::Spawn { id, components: vec![data(gear(9, odd_nan))] }
+            }
+            other => other.clone(),
+        })
+        .collect();
+    let from = gear_schema.schema_version() - 1;
+    let previous = |schema: &ComponentSchema| {
+        if schema.component() != Gear::KEY {
+            return schema.clone();
+        }
+        let fields = schema.fields().iter().copied();
+        ComponentSchema::new(Gear::KEY, from, schema.element_size(), fields).unwrap()
+    };
+    let schemas = overlay.schemas().iter().map(previous);
+    let mut odd = records.clone();
+    let rebuilt = Overlay::new(overlay.baseline_hash(), schemas, decoded);
+    odd.overlay = Some(Arc::new(rebuilt.unwrap()));
+    let mut migrations = Migrations::new();
+    migrations.register(Migration { component: Gear::KEY, from, run: unchanged }).unwrap();
+    let loader = Loader::new(&table, &migrations);
+    let bundle = loader.bundle(&odd, Arc::clone(&baseline), RegionMode::Simulated, None).unwrap();
+    let mut loaded = WorldBuilder::new(WorldKind::Server, Arc::clone(&registry)).build().unwrap();
+    loaded.create_region(RegionConfig { id: region, seed: bundle.seed, ..config }).unwrap();
+    loaded.load_region(region, &bundle.baseline, bundle.overlay.as_deref()).unwrap();
+    let rows = loaded.export_region(region).unwrap();
+    let canonical = Scalar::from_canonical_bits(odd_nan.to_canonical_bits());
+    let row = rows.rows.iter().find(|row| row.id == id).unwrap();
+    assert_eq!(row.components, vec![data(gear(9, canonical))]);
+}
+
+/// A step that changes nothing.
+fn unchanged(_: &mut FieldValues) -> lactose_core::Result<()> {
+    Ok(())
 }
 
 fn stock_of(count: u32) -> Stock {

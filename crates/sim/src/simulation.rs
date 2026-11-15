@@ -51,6 +51,7 @@ pub struct SimulationBuilder {
     layout: LayoutConfig,
     tick: Tick,
     next_net_id: NonZeroU64,
+    binds: BTreeMap<PredictionKey, NetId>,
     control: RegionControl,
     policy: RegionPolicy,
     log_retention: u32,
@@ -76,6 +77,7 @@ impl SimulationBuilder {
             layout: LayoutConfig::default(),
             tick: Tick(0),
             next_net_id: NonZeroU64::MIN,
+            binds: BTreeMap::new(),
             control: RegionControl::Directed,
             policy: RegionPolicy { activation_radius: 1, streaming_radius: 2, release_radius: 3 },
             log_retention: Self::DEFAULT_LOG_RETENTION,
@@ -139,9 +141,9 @@ impl SimulationBuilder {
     /// counter past it, as any bind does (`crates/ecs/README.md`, Regions); the binds of a
     /// save are all below the save's counter.
     #[must_use]
-    #[expect(unused_variables, reason = "facade (D142): the lane `binds-impl` writes the body")]
-    pub fn binds(self, binds: BTreeMap<PredictionKey, NetId>) -> Self {
-        todo!("D142: the lane `binds-impl`")
+    pub fn binds(mut self, binds: BTreeMap<PredictionKey, NetId>) -> Self {
+        self.binds = binds;
+        self
     }
 
     /// Who decides loads and modes. `Anchored` on a world that is not `Server`, with an
@@ -195,8 +197,9 @@ impl SimulationBuilder {
     /// holds no entity reference either: the world rewrites the references of rows and
     /// region resources at a bind and at a restore, never a world resource's, so
     /// [`World::insert_resource`] does not build for a type whose layout holds an
-    /// `EntityRef` at any depth (D142; a facade until the lane `binds-impl`). That refusal
-    /// is the world's, at every insert, so `build` checks nothing for it.
+    /// `EntityRef` at any depth (D142). That refusal is the world's, at every insert through
+    /// `insert_resource`, so `build` checks nothing for it; a reflected type handed to
+    /// [`World::insert_service`] is a service, which it does not see.
     #[must_use]
     pub fn setup(mut self, f: impl FnOnce(&mut World) -> Result<()> + Send + 'static) -> Self {
         self.setups.push(Box::new(f));
@@ -259,7 +262,7 @@ impl SimulationBuilder {
     }
 
     /// Builds the world with the registry, the layout, the tick and the counter; binds
-    /// the builder's [`binds`](Self::binds) (D142; a facade until the lane `binds-impl`);
+    /// the builder's [`binds`](Self::binds) in ascending prediction-key order (D142);
     /// inserts this crate's resources ([`TickDelta`](crate::TickDelta),
     /// [`CurrentTick`](crate::CurrentTick), [`TimeScale`](crate::TimeScale) at
     /// `REAL_TIME`, [`RegionPolicy`]) and services (the three hooks, the lifecycle, the
@@ -274,8 +277,8 @@ impl SimulationBuilder {
     /// Fails with `InvalidData` as the setters say, as a setup function does, as
     /// [`WorldBuilder::build`](lactose_ecs::WorldBuilder::build) does, for a non-`derived`
     /// world resource, and for a schedule that does not build or prepare; and with a check
-    /// function's error. From the lane `binds-impl` on, also with `InvalidData` for binds
-    /// [`World::bind`] refuses.
+    /// function's error; and with `InvalidData` for binds [`World::bind`] refuses, with its
+    /// message.
     pub fn build(self) -> Result<Simulation> {
         let invalid = |message: &'static str| Err(Error::new(ErrorKind::InvalidData, message));
         let policy = self.policy;
@@ -304,6 +307,9 @@ impl SimulationBuilder {
             .tick(self.tick)
             .next_net_id(self.next_net_id)
             .build()?;
+        for (&predicted, &net) in &self.binds {
+            world.bind(predicted, net)?;
+        }
         world.insert_resource(TickDelta::of_rate(TICK_RATE_HZ));
         world.insert_resource(CurrentTick::new(self.tick));
         world.insert_resource(TimeScale::REAL_TIME);
@@ -396,6 +402,19 @@ pub struct Simulation {
     world: World,
     /// Everything but the world, which a run moves out and back.
     core: Core,
+}
+
+/// The kind, the tick, the counter and the loaded regions: the world and the schedules
+/// have no `Debug` of their own.
+impl fmt::Debug for Simulation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Simulation")
+            .field("kind", &self.core.kind)
+            .field("tick", &self.world.tick())
+            .field("next_net_id", &self.world.next_net_id())
+            .field("regions", &self.world.regions().collect::<Vec<_>>())
+            .finish_non_exhaustive()
+    }
 }
 
 /// A simulation without its world.
@@ -493,11 +512,13 @@ impl Simulation {
 
     /// Runs one tick with `input` applied at its input sync point, trims the structural log
     /// to the retention, on a `Server` world takes and drops the presentation events so the
-    /// queue does not grow (every other kind leaves them for `predict` or presentation),
-    /// and hands the simulation back at the next tick. Nothing else: the passes are
-    /// [`run_passes`](Self::run_passes). The README states what the sync point does and in
-    /// what order; the signature states that a step takes no clock and nothing but `input`,
-    /// which is consumed: a caller that may retry keeps a clone.
+    /// queue does not grow (every other kind leaves them for `predict` or presentation) and
+    /// passes the rollback horizon over the tick it ran, so the binds of the entities it
+    /// despawned are dropped (D142; a `Client` world sets the horizon to its current tick
+    /// before the run instead), and hands the simulation back at the next tick. Nothing
+    /// else: the passes are [`run_passes`](Self::run_passes). The README states what the
+    /// sync point does and in what order; the signature states that a step takes no clock
+    /// and nothing but `input`, which is consumed: a caller that may retry keeps a clone.
     ///
     /// The future is `Send` and is driven by the `'static` task that owns the simulation.
     /// It resolves to a [`RunError`] with the simulation inside if the tick schedule no
@@ -521,7 +542,7 @@ impl Simulation {
         if let Err(error) = self.core.tick_schedule.prepare(&self.world) {
             return Err(RunError::kept(schedule_error(error), self));
         }
-        if matches!(self.core.kind, WorldKind::Server | WorldKind::Client) {
+        if self.core.kind == WorldKind::Client {
             let tick = self.world.tick();
             self.world.set_rollback_horizon(tick);
         }
@@ -541,6 +562,10 @@ impl Simulation {
         }
         if core.kind == WorldKind::Server {
             drop(world.take_present_events());
+            // A server never rolls back: the horizon passes every despawn of the tick just
+            // run, so between steps it holds no bind of an entity despawned in a step (D142).
+            let after = Tick(world.tick().0.wrapping_add(1));
+            world.set_rollback_horizon(after);
         }
         Ok(core.join(world))
     }

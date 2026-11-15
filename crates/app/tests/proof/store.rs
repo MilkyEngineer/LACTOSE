@@ -1,15 +1,20 @@
 //! "The store" and "Baselines": what a region's unload keeps, what a load takes back, and
 //! the baseline each diff is against, under `Directed` and `Anchored`.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-use lactose_app::{Cooked, SavedWorld, Server, Start, WorldConfig, build_server};
-use lactose_bundle::ComponentData;
-use lactose_core::{ComponentKey, ErrorKind, StableKey};
-use lactose_ecs::{Executor, RegionConfig, RegionId, RegionMode};
-use lactose_persist::RegionRecords;
+use lactose_app::{
+    Cooked, SavedRegion, SavedWorld, Server, Start, WorldConfig, build_server, load as app_load,
+};
+use lactose_bundle::{ComponentData, Overlay, Record};
+use lactose_core::{
+    ComponentKey, EntityRef, ErrorKind, NetId, PlayerId, PredictionKey, StableKey, Tick,
+};
+use lactose_ecs::{Executor, OwnedBy, PredictedOrigin, RegionConfig, RegionId, RegionMode};
+use lactose_persist::{Loader, Migrations, RegionRecords};
+use lactose_reflect::Reflect;
 use lactose_sim::{RegionExport, RegionRequest, SessionEvent, TickInput};
 
 use crate::common::{
@@ -424,5 +429,214 @@ fn an_unload_whose_diff_fails_stops_the_run_without_the_server() {
     assert_eq!(error.error.kind(), ErrorKind::NotFound);
     assert!(error.server.is_none(), "a server missing a region is never handed back");
     assert_eq!(logged(&log, tracing::Level::ERROR, "an error stops the run"), 2);
+    executor.shutdown();
+}
+
+/// The prediction key the binds tests give their entities, by `ordinal`.
+fn origin(ordinal: u32) -> PredictionKey {
+    PredictionKey { player: PlayerId(3), input_tick: Tick(2), ordinal }
+}
+
+/// The owner of `row`, if it is loaded and has one.
+fn owner(server: &Server, row: StableKey) -> Option<StableKey> {
+    let world = server.simulation().world();
+    world.get::<OwnedBy>(row).and_then(|owned| owned.owner.get())
+}
+
+/// A frame answering the loads `out` asked for with fresh bundles.
+fn answer(content: &Content, requests: &[RegionRequest]) -> TickInput {
+    load(content, loads(requests))
+}
+
+/// What [`kept_owner`] made.
+struct KeptOwner {
+    server: Server,
+    /// The row of 100 the predicted entity owns.
+    row: StableKey,
+    /// The predicted entity's `NetId`.
+    id: NetId,
+}
+
+/// An `Anchored` server pinning 100, where a player joined at 124 and left: an entity with
+/// predicted origin `origin(0)`, bound, spawned in 124 while it was loaded, owns a counter
+/// row of 100, and 124 has since unloaded into the store.
+fn kept_owner(executor: &Executor, content: &Arc<Content>) -> KeptOwner {
+    let server = server(executor, anchored([100]), Start::Fresh, content);
+    let (server, out) = step(executor, server, TickInput::default());
+    let (server, _) = step(executor, server, answer(content, &out.requests));
+    let (server, out) =
+        step(executor, server, session(1, SessionEvent::Join { region: RegionId(124) }));
+    assert!(loads(&out.requests).contains(&124), "{out:?}");
+    let (mut server, out) = step(executor, server, answer(content, &out.requests));
+    assert!(out.failures.is_empty(), "{out:?}");
+    assert!(loaded(&server).contains(&124));
+
+    let world = server.simulation_mut().world_mut();
+    let id = world.allocate_net_id().expect("a net id");
+    let predicted = StableKey::Predicted(origin(0));
+    world.spawn(predicted, RegionId(124), (Counter(0),)).expect("the predicted spawn");
+    world.bind(origin(0), id).expect("the bind");
+    let row = StableKey::Net(world.allocate_net_id().expect("a net id"));
+    let owned = OwnedBy { owner: EntityRef::new(predicted) };
+    world.spawn(row, RegionId(100), (Counter(0), owned)).expect("the owned row");
+
+    let (mut server, _) = step(executor, server, session(1, SessionEvent::Leave));
+    for _ in 0..5 {
+        if kept(&server).contains(&124) {
+            break;
+        }
+        server = step(executor, server, TickInput::default()).0;
+    }
+    assert_eq!(loaded(&server), BTreeSet::from([100]), "every region but the pinned left");
+    assert!(kept(&server).contains(&124));
+    assert_eq!(owner(&server, row), Some(predicted));
+    KeptOwner { server, row, id }
+}
+
+/// `saved` with the predicted origin taken out of region 124's records: the binds a
+/// builder would be given are then empty.
+fn without_origin(saved: &SavedWorld) -> SavedWorld {
+    let mut saved = saved.clone();
+    let entry = saved.regions.get_mut(&RegionId(124)).expect("124 is saved");
+    let mut records = entry.records.clone();
+    let overlay = records.overlay.as_deref().expect("124 has records");
+    let stripped = overlay.records().iter().map(|record| match record {
+        Record::Spawn { id, components } => {
+            let kept = components.iter().filter(|data| data.component != PredictedOrigin::KEY);
+            Record::Spawn { id: *id, components: kept.cloned().collect() }
+        }
+        other => other.clone(),
+    });
+    let rebuilt = Overlay::new(overlay.baseline_hash(), overlay.schemas().to_vec(), stripped);
+    records.overlay = Some(Arc::new(rebuilt.expect("the records without the origin")));
+    records.layouts.remove(&PredictedOrigin::KEY);
+    records.check().expect("still canonical");
+    *entry = Arc::new(SavedRegion { records, baseline: Arc::clone(&entry.baseline) });
+    saved
+}
+
+/// The binds `Loader::binds` reads from `saved`.
+fn binds_of(server: &Server, saved: &SavedWorld) -> BTreeMap<PredictionKey, NetId> {
+    let migrations = Migrations::new();
+    let loader = Loader::new(server.schemas(), &migrations);
+    loader.binds(saved.regions.values().map(|entry| &entry.records)).expect("the binds")
+}
+
+/// D142: a server resumed from a save whose predicted owner's region stays in the store
+/// holds the owner's bind before its first step, so the pinned region's row loads owned by
+/// the predicted origin, as the server that was never saved holds it.
+#[test]
+fn a_resume_that_keeps_a_predicted_owners_region_matches_the_world_never_saved() {
+    const K: u32 = 6;
+    let executor = executor(2);
+    let content = Content::new();
+    let KeptOwner { server: original, row, id } = kept_owner(&executor, &content);
+    let (original, saved) = save(&executor, original);
+    assert_eq!(binds_of(&original, &saved), BTreeMap::from([(origin(0), id)]));
+    let bytes = executor.block_on(original.encode_save(&executor, saved.clone()));
+    let cooked = Arc::clone(&content) as Arc<dyn Cooked>;
+    let decoded = app_load(&GAME, &bytes.expect("the save encodes"), &*cooked).expect("loads");
+    let predicted = StableKey::Predicted(origin(0));
+
+    // Without the binds, the row of 100 loads owned by the owner's `Net` key.
+    let unbound =
+        server(&executor, anchored([100]), Start::Loaded(without_origin(&saved)), &content);
+    assert_eq!(unbound.simulation().world().alias(origin(0)), None);
+    let mut original = original;
+    let mut resumed = vec![
+        server(&executor, anchored([100]), Start::Loaded(decoded), &content),
+        server(&executor, anchored([100]), Start::Loaded(saved), &content),
+    ];
+    for server in &resumed {
+        assert_eq!(server.simulation().world().alias(origin(0)), Some(id), "before any step");
+    }
+    original = step(&executor, original, TickInput::default()).0;
+    let (unbound, out) = step(&executor, unbound, TickInput::default());
+    assert!(out.failures.is_empty(), "{out:?}");
+    assert_eq!(owner(&unbound, row), Some(StableKey::Net(id)), "the failure the binds prevent");
+    assert_ne!(unbound.hash().expect("hash"), original.hash().expect("hash"));
+    unbound.shutdown();
+
+    // A join near 124 at tick K: the store answers its loads in both at the next step.
+    let frame = |k: u32| {
+        if k == K {
+            session(2, SessionEvent::Join { region: RegionId(124) })
+        } else {
+            TickInput::default()
+        }
+    };
+    for k in 1..=K + 3 {
+        if k > 1 {
+            original = step(&executor, original, frame(k)).0;
+        }
+        resumed = resumed
+            .into_iter()
+            .map(|server| {
+                let (server, out) = step(&executor, server, frame(k));
+                assert!(out.failures.is_empty(), "{out:?}");
+                server
+            })
+            .collect();
+        for server in &resumed {
+            let at = server.tick();
+            assert_eq!(at, original.tick());
+            assert_eq!(owner(server, row), Some(predicted), "at {at:?}");
+            assert_eq!(server.hash().expect("hash"), original.hash().expect("hash"), "at {at:?}");
+            let counter = |server: &Server| server.simulation().world().next_net_id();
+            assert_eq!(counter(server), counter(&original), "at {at:?}");
+            assert_eq!(kept(server), kept(&original), "at {at:?}");
+            assert_eq!(server.simulation().world().contains(predicted), k > K, "at {at:?}");
+        }
+    }
+    assert!(original.simulation().world().contains(predicted), "124 loaded from the store");
+    original.shutdown();
+    for server in resumed {
+        server.shutdown();
+    }
+    executor.shutdown();
+}
+
+/// D142: a save point's binds are those of its loaded regions' exports and its kept
+/// regions' records, and the world's; a despawned entity's bind is in neither after the
+/// step that despawns it.
+#[test]
+fn the_binds_of_a_save_point_are_the_stores_and_the_worlds() {
+    let executor = executor(2);
+    let content = Content::new();
+    let server = server(&executor, WorldConfig::headless(), Start::Fresh, &content);
+    let (mut server, out) = step(&executor, server, load(&content, [1, 2]));
+    assert!(out.failures.is_empty(), "{out:?}");
+    let world = server.simulation_mut().world_mut();
+    let mut ids = Vec::new();
+    for (ordinal, region) in [(0, 1), (1, 2)] {
+        let id = world.allocate_net_id().expect("a net id");
+        let predicted = StableKey::Predicted(origin(ordinal));
+        world.spawn(predicted, RegionId(region), (Counter(0),)).expect("the predicted spawn");
+        world.bind(origin(ordinal), id).expect("the bind");
+        ids.push(id);
+    }
+    spawn_counter(&mut server, 1);
+    spawn_counter(&mut server, 2);
+    let (server, out) = step(&executor, server, unload(2));
+    assert!(out.failures.is_empty(), "{out:?}");
+    assert_eq!((loaded(&server), kept(&server)), (BTreeSet::from([1]), BTreeSet::from([2])));
+
+    let (mut server, saved) = save(&executor, server);
+    let both = BTreeMap::from([(origin(0), ids[0]), (origin(1), ids[1])]);
+    assert_eq!(binds_of(&server, &saved), both, "the loaded region's and the kept one's");
+    for (&predicted, &id) in &both {
+        assert_eq!(server.simulation().world().alias(predicted), Some(id));
+    }
+
+    // Despawned between steps, as an unjournaled edit: the step's end drops the bind.
+    let world = server.simulation_mut().world_mut();
+    world.despawn(StableKey::Predicted(origin(0))).expect("the despawn");
+    let (server, out) = step(&executor, server, TickInput::default());
+    assert!(out.failures.is_empty(), "{out:?}");
+    assert_eq!(server.simulation().world().alias(origin(0)), None);
+    assert_eq!(server.simulation().world().alias(origin(1)), Some(ids[1]), "kept in the store");
+    let (server, saved) = save(&executor, server);
+    assert_eq!(binds_of(&server, &saved), BTreeMap::from([(origin(1), ids[1])]));
+    server.shutdown();
     executor.shutdown();
 }

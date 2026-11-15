@@ -248,8 +248,7 @@ fn a_reader_needs_the_writer_declaration() {
             .systems(register_game)
             .inputs(Box::new(PlayerInputApplier::new()))
             .build()
-            .err()
-            .expect("a reader with no declared writer");
+            .expect_err("a reader with no declared writer");
         assert_eq!(error.kind(), ErrorKind::InvalidData);
         let source = std::error::Error::source(&error).expect("the schedule error");
         match source.downcast_ref::<ScheduleError>() {
