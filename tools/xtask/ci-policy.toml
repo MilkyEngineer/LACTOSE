@@ -73,6 +73,7 @@ tests = [
 # matrix (.github/workflows/nightly.yml), for the time limit. `cargo xtask boundary` requires
 # the entries that name such a package to run, together, its library, each of its
 # integration test targets and its doc tests exactly once, so that a new test target cannot
-# drop out of Miri unseen.
+# drop out of Miri unseen. It reports an empty list, and a package that two or more entries
+# name, one of them by target, that the list leaves out.
 [miri_split]
 packages = ["lactose-ecs"]

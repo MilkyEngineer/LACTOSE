@@ -159,22 +159,40 @@ on, and a listed feature the crate does not declare are findings.
   configuration file is a symbolic link: cargo would read through either what no check
   reads. `vendor` refuses both through the same function.
 - The nightly Miri job (`src/miri.rs`): for each package of `[miri_split]`, the entries of
-  the `miri` job's matrix in `.github/workflows/nightly.yml` whose `args` name it with `-p`
-  run, together, its library, each integration test target `cargo metadata` lists and its
-  doc tests exactly once; a finding names each one no entry runs, or that several do, with
-  the entries. The reader takes the YAML the job is written in (block mappings and
-  sequences, plain, quoted and block scalars, either line ending) and reports what it does
-  not read, at its line. An entry's `args` are split as the run step's bash splits them; an
-  unquoted glob character, which bash would expand against the checkout, a line break, which
-  ends the command, and other shell syntax are reported. Of cargo's options it reads `-p`,
-  `--lib`, `--test` and `--doc`, and reports any other in an entry for the package. A
-  `--test` value with none of `*?[]` is a target name, and any other a pattern of the `glob`
-  crate as cargo 1.99 builds it: case-sensitive, `?`, `*`, `**` only alone, `[...]` and
-  `[!...]` with ranges and a leading `]`, no escape. The unit tests' cases are cargo's own
-  selections and refusals, each run through `cargo test --no-run --test` on cargo 1.99.0.
-  A value that selects nothing, which cargo refuses, is reported, as is a pattern with a
-  path separator, which the check does not read. A binary, bench or example target of the
-  package is not counted; `lactose-ecs` has none.
+  the `miri` job's matrix in `.github/workflows/nightly.yml` that name it run, together, its
+  library, each integration test target `cargo metadata` lists and its doc tests exactly
+  once; a finding names each one no entry runs, or that several do, with the entries. The
+  check reads one shape of the job, today's, and refuses any other rather than reading it:
+  a matrix of `include` alone (a key beside it folds the entries into its combinations), no
+  `if` or `defaults` on the job and no `defaults` on the workflow, and one step that uses
+  `matrix.args`, `run: cargo +$MIRI_TOOLCHAIN miri test ${{ matrix.args }} --locked` with
+  only `env` beside it. The job's other steps are not read. The reader takes the YAML the
+  job is written in (block mappings and sequences, plain, quoted and block scalars, LF or
+  CRLF line breaks, space indentation) and refuses at its line anything else on the way to
+  and inside the entries: another line break (a lone CR, NEL, LS or PS), a tab indent, a
+  document marker or directive, and a key twice in one mapping. Every entry names exactly
+  one workspace member with a plain `-p NAME` or `--package NAME`; `--workspace`, no `-p`,
+  a second `-p`, `-p=`, `-pNAME`, `NAME@VERSION` and a glob are refused. Its `args` are
+  split as the run step's bash splits them; an unquoted glob character, which bash would
+  expand against the checkout, a line break, which ends the command, and other shell syntax
+  are refused. Of cargo's options it reads `-p`, `--lib`, `--test` and `--doc`, and refuses
+  any other. A package in `[miri_split]` must name its targets: an entry that names none is
+  refused, since cargo's default run then follows the manifest's `test` and
+  `required-features`, which the counts do not model. An explicit `--test` runs a
+  `test = false` target and fails the job on one whose `required-features` it does not
+  enable, so neither needs a rule. A package outside `[miri_split]` that two or more entries
+  name, one of them by target, is reported as a split the policy does not list; entries
+  that each run the package whole, as `lactose-task`'s two do under two environments, are
+  no split. An empty `[miri_split]` is reported. A binary, bench or example target of a
+  split package whose `test` is on, which `cargo test` would run and the split cannot
+  select, is reported in its manifest. A `--test` value with none of `*?[]` is a target
+  name, and any other a pattern of the `glob` crate as cargo 1.99 and the job's
+  `MIRI_TOOLCHAIN` (nightly-2026-10-04, cargo 1.101.0-nightly) build it: case-sensitive,
+  `?`, `*`, `**` only alone, `[...]` and `[!...]` with ranges and a leading `]`, no escape.
+  The unit tests' cases are cargo's own selections and refusals, run through
+  `cargo test --no-run --test` on cargo 1.99.0, and a set of them on both cargos. A value
+  that selects nothing, which cargo refuses, is reported, as is a pattern with a path
+  separator, which the check does not read.
 
 The scanner reads source text. It does not expand macros, so an attribute a macro writes is
 not seen. In the lint check it resolves a `#[path]` inside an inline `mod` block as if it
@@ -416,8 +434,11 @@ standard error as it comes.
   sample dropped. Where there is none the row says why: Windows PowerShell could not be
   started, or the run's seconds and that the sampler printed no sample, or only the first,
   in them, which a run shorter than PowerShell's start and two samples a second apart gets
-  (the Windows laptop's `physics-phase` and `rollback-seven-ticks` files of 2026-11-15). The
-  share covers the command the row names, so a build that command makes is inside it. The
+  (the Windows laptop's `physics-phase` and `rollback-seven-ticks` files of 2026-11-15). Every
+  command but `edit-to-playing`, whose builds are what it measures, first builds what it
+  runs with cargo's `--no-run` form of the same command (`cargo build` for `headless-120`)
+  before the window opens, so the load covers the run alone, on a cold tree too; a failed
+  build fails the measurement. The
   sampler wakes WMI once a second during a Windows run,
   a perturbation not measured. The Windows CPU row is the registry's
   `ProcessorNameString`. The Windows paths have not been run.

@@ -1171,6 +1171,26 @@ fn write(
     Ok(vec![md, json_file])
 }
 
+/// Runs the cargo command `args` to build what a measured command then runs, before its
+/// sampler starts, so that the sampled window holds the run alone on a cold tree too. The
+/// variables a measured command sets are read when it runs, not when it builds. A failed
+/// build fails the measurement.
+fn build(workspace: &Workspace, args: &[String]) -> Result<(), String> {
+    let status = Command::new(&workspace.cargo)
+        .args(args)
+        .current_dir(&workspace.root)
+        // Standard output stays the measurement's; cargo's own is on standard error.
+        .stdout(std::io::stderr())
+        .status()
+        .map_err(|e| format!("cannot run `{}`: {e}", workspace.cargo))?;
+    if status.success() { Ok(()) } else { Err(format!("the build ended with {status}")) }
+}
+
+/// `args`, a `cargo nextest run` or `cargo bench` command, building only.
+fn no_run(args: &[String]) -> Vec<String> {
+    args.iter().cloned().chain(["--no-run".to_owned()]).collect()
+}
+
 fn short_env(options: &Options) -> Vec<(&'static str, String)> {
     if options.short { vec![(SHORT_VAR, "1".to_owned())] } else { Vec::new() }
 }
@@ -1183,6 +1203,7 @@ fn run_test(
     out: &Path,
 ) -> Result<Vec<PathBuf>, String> {
     let args = nextest_args(m.run);
+    build(workspace, &no_run(&args))?;
     let env = short_env(options);
     let mut command = Command::new(&workspace.cargo);
     command.args(&args).current_dir(&workspace.root);
@@ -1232,6 +1253,8 @@ fn run_spike_replays(
     m: &'static Measurement,
     out: &Path,
 ) -> Result<Vec<PathBuf>, String> {
+    // Every replay is a test of one target.
+    build(workspace, &no_run(&nextest_args(REPLAYS[0].run())))?;
     let sampler = Sampler::start();
     let (mut found, mut output, mut ran) = (Vec::new(), String::new(), Vec::new());
     let mut reported = std::collections::BTreeSet::new();
@@ -1332,6 +1355,7 @@ fn run_task_bench(
         // A short run sets the runs; a full one makes sure the caller's do not leak in.
         .env_remove("WHISK_BENCH_RUNS")
         .envs(env.iter().map(|(name, value)| (name, value)));
+    build(workspace, &no_run(&args))?;
     let sampler = Sampler::start();
     let output = capture(&mut command, |_, _| {});
     let load = sampler.stop();
@@ -1395,6 +1419,9 @@ fn run_headless(
     out: &Path,
 ) -> Result<Vec<PathBuf>, String> {
     let args = headless_args("120", None);
+    // `cargo run` has no `--no-run`: `cargo build` with its options builds the binary.
+    let until = args.iter().position(|arg| arg == "--").unwrap_or(args.len());
+    build(workspace, &[&["build".to_owned()], &args[1..until]].concat())?;
     let mut command = Command::new(&workspace.cargo);
     command.args(&args).current_dir(&workspace.root);
     let sampler = Sampler::start();
