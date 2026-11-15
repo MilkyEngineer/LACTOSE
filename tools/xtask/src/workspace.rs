@@ -85,6 +85,16 @@ pub struct Package {
     pub proc_macro: bool,
     /// True if the package has a build script.
     pub build_script: bool,
+    /// True if the package has a library target, a proc-macro included.
+    pub lib: bool,
+    /// True if `cargo test` runs the library's doc tests: it has a library whose manifest
+    /// leaves `doctest` on.
+    pub doctests: bool,
+    /// The names of the integration test targets, sorted.
+    pub tests: Vec<String>,
+    /// The binary, bench and example targets whose manifest leaves or turns `test` on, so that
+    /// `cargo test` runs them: each as its kind (`bin`, `bench` or `example`) and name, sorted.
+    pub other_tests: Vec<(String, String)>,
     /// Every declared dependency, in manifest order.
     pub deps: Vec<Dep>,
     /// The `[features]` table: each feature and the values it turns on.
@@ -279,8 +289,11 @@ struct RawDep {
 
 #[derive(Deserialize)]
 struct RawTarget {
+    name: String,
     kind: Vec<String>,
     src_path: String,
+    doctest: bool,
+    test: bool,
 }
 
 #[derive(Deserialize)]
@@ -377,10 +390,25 @@ pub fn parse_metadata(json: &str) -> Result<Metadata, String> {
         let mut shipped_roots = Vec::new();
         let mut proc_macro = false;
         let mut build_script = false;
+        let (mut lib, mut doctests, mut tests, mut other_tests) =
+            (false, false, Vec::new(), Vec::new());
         for target in &package.targets {
             let is = |kind: &str| target.kind.iter().any(|k| k == kind);
             proc_macro |= is("proc-macro");
             build_script |= is("custom-build");
+            // Every library crate type (`lib`, `rlib`, `cdylib`, ...) is the one library
+            // target `--lib` names.
+            if !["bin", "test", "bench", "example", "custom-build"].iter().any(|kind| is(kind)) {
+                lib = true;
+                doctests |= target.doctest;
+            }
+            if is("test") {
+                tests.push(target.name.clone());
+            }
+            let other = ["bin", "bench", "example"].into_iter().find(|kind| is(kind));
+            if let (Some(kind), true) = (other, target.test) {
+                other_tests.push((kind.to_owned(), target.name.clone()));
+            }
             let root = relative(&raw.workspace_root, &target.src_path)?;
             if !["test", "bench", "example", "custom-build"].iter().any(|kind| is(kind)) {
                 shipped_roots.push(root.clone());
@@ -391,6 +419,8 @@ pub fn parse_metadata(json: &str) -> Result<Metadata, String> {
         crate_roots.dedup();
         shipped_roots.sort();
         shipped_roots.dedup();
+        tests.sort();
+        other_tests.sort();
         let deps = package
             .dependencies
             .iter()
@@ -418,6 +448,10 @@ pub fn parse_metadata(json: &str) -> Result<Metadata, String> {
             shipped_roots,
             proc_macro,
             build_script,
+            lib,
+            doctests,
+            tests,
+            other_tests,
             deps,
             features: package.features.clone(),
         });
@@ -535,6 +569,10 @@ pub(crate) mod fixture {
             shipped_roots: vec![format!("crates/{role}/src/lib.rs")],
             proc_macro: false,
             build_script: false,
+            lib: true,
+            doctests: true,
+            tests: Vec::new(),
+            other_tests: Vec::new(),
             deps: deps
                 .iter()
                 .map(|&(dep, kind)| Dep {
@@ -630,13 +668,16 @@ mod tests {
            {"name": "xxhash-rust", "kind": "dev", "path": null},
            {"name": "shim", "kind": null, "path": "C:\\elsewhere", "rename": "shim2", "features": ["fast"]}],
          "features": {"default": ["extra"], "extra": ["shim2/fast"]},
-         "targets": [{"kind": ["lib"], "src_path": "C:\\ws\\crates\\core\\src\\lib.rs"},
-                     {"kind": ["test"], "src_path": "C:\\ws\\crates\\core\\tests\\t.rs"}]},
+         "targets": [{"name": "lactose_core", "kind": ["lib"], "src_path": "C:\\ws\\crates\\core\\src\\lib.rs", "doctest": true, "test": true},
+                     {"name": "t", "kind": ["test"], "src_path": "C:\\ws\\crates\\core\\tests\\t.rs", "doctest": false, "test": true},
+                     {"name": "a", "kind": ["test"], "src_path": "C:\\ws\\crates\\core\\tests\\a.rs", "doctest": false, "test": true},
+                     {"name": "b", "kind": ["bench"], "src_path": "C:\\ws\\crates\\core\\benches\\b.rs", "doctest": false, "test": false},
+                     {"name": "x", "kind": ["example"], "src_path": "C:\\ws\\crates\\core\\examples\\x.rs", "doctest": false, "test": true}]},
         {"name": "lactose-reflect-macros", "version": "0.0.0", "id": "macros-id", "manifest_path": "C:\\ws\\crates\\reflect-macros\\Cargo.toml",
          "dependencies": [
            {"name": "lactose-core", "kind": "build", "path": "C:\\ws\\crates\\core"}],
-         "targets": [{"kind": ["proc-macro"], "src_path": "C:\\ws\\crates\\reflect-macros\\src\\lib.rs"},
-                     {"kind": ["custom-build"], "src_path": "C:\\ws\\crates\\reflect-macros\\build.rs"}]},
+         "targets": [{"name": "lactose_reflect_macros", "kind": ["proc-macro"], "src_path": "C:\\ws\\crates\\reflect-macros\\src\\lib.rs", "doctest": false, "test": true},
+                     {"name": "build-script-build", "kind": ["custom-build"], "src_path": "C:\\ws\\crates\\reflect-macros\\build.rs", "doctest": false, "test": true}]},
         {"name": "bytemuck", "version": "1.25.2", "id": "bytemuck-id", "source": "registry+https://github.com/rust-lang/crates.io-index",
          "manifest_path": "C:\\registry\\bytemuck\\Cargo.toml",
          "dependencies": [], "targets": []},
@@ -666,9 +707,21 @@ mod tests {
         assert_eq!(ws.packages.len(), 2, "non-members are dropped");
         let core = ws.package("lactose-core").unwrap();
         assert_eq!(core.dir, "crates/core");
-        assert_eq!(core.crate_roots, ["crates/core/src/lib.rs", "crates/core/tests/t.rs"]);
+        assert_eq!(
+            core.crate_roots,
+            [
+                "crates/core/benches/b.rs",
+                "crates/core/examples/x.rs",
+                "crates/core/src/lib.rs",
+                "crates/core/tests/a.rs",
+                "crates/core/tests/t.rs"
+            ]
+        );
         assert_eq!(core.shipped_roots, ["crates/core/src/lib.rs"]);
         assert!(!core.proc_macro && !core.build_script);
+        assert!(core.lib && core.doctests);
+        assert_eq!(core.tests, ["a", "t"]);
+        assert_eq!(core.other_tests, [("example".to_owned(), "x".to_owned())]);
         let sources: Vec<DepSource> = core.deps.iter().map(|d| d.source).collect();
         assert_eq!(sources, [DepSource::External, DepSource::External, DepSource::Path]);
         assert_eq!(core.deps[1].kind, DepKind::Dev);
@@ -680,6 +733,8 @@ mod tests {
         assert_eq!(core.features["extra"], ["shim2/fast"]);
         let macros = ws.package("lactose-reflect-macros").unwrap();
         assert!(macros.proc_macro && macros.build_script);
+        assert!(macros.lib && !macros.doctests && macros.tests.is_empty());
+        assert!(macros.other_tests.is_empty());
         assert_eq!(
             macros.crate_roots,
             ["crates/reflect-macros/build.rs", "crates/reflect-macros/src/lib.rs"]

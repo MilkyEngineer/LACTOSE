@@ -17,7 +17,7 @@ of a manifest it writes under the target directory.
 | Command | Enforces |
 |---|---|
 | `tiers` | `crate-tiers.toml` against the workspace (architecture section 3) |
-| `boundary` | the file facts of the determinism boundary and the unsafe policy (sections 8.2, 8.3, 20, 21) |
+| `boundary` | the file facts of the determinism boundary and the unsafe policy, and the nightly Miri job's split of a package (sections 8.2, 8.3, 20, 21) |
 | `features` | identical boundary feature trees across shipped binaries, and the same features for every package two roots share where one is a harness package (section 8.3) |
 | `vendor` | each crate built from `vendor/` is its patch applied to its record, the patch is within the rule, the record is the crates.io archive's, and the advisory check covers the upstream versions (sections 8.2, 8.3) |
 | `sour run`, `sour compare`, `sour self-test`, `sour matrix` | SOUR, the determinism harness (section 8.3) |
@@ -34,7 +34,7 @@ write nothing to standard output themselves.
 | File | Holds |
 |---|---|
 | `crate-tiers.toml` | Every dependency rule: tiers, test-support crates, the boundary list, the boundary's dependency allowlists, the server denylist, exceptions |
-| `tools/xtask/ci-policy.toml` | What is not a dependency rule: the unsafe list of section 21, the crates that carry the boundary lint file without being in the boundary, the shipped binaries, the harness packages and the tests that record hashes |
+| `tools/xtask/ci-policy.toml` | What is not a dependency rule: the unsafe list of section 21, the crates that carry the boundary lint file without being in the boundary, the shipped binaries, the harness packages, the tests that record hashes and the packages the nightly Miri job splits |
 | `deny.toml` | Licences, sources, advisories and duplicate versions, enforced by `cargo deny check` |
 | `crates/core/clippy.toml` | The boundary lints; every boundary crate carries an identical copy |
 
@@ -158,6 +158,47 @@ on, and a listed feature the crate does not declare are findings.
 - No cargo configuration file has an `include` key, and no `.cargo` directory or cargo
   configuration file is a symbolic link: cargo would read through either what no check
   reads. `vendor` refuses both through the same function.
+- The nightly Miri job (`src/miri.rs`): for each package of `[miri_split]`, the entries of
+  the `miri` job's matrix in `.github/workflows/nightly.yml` that name it run, together, its
+  library, each integration test target `cargo metadata` lists and its doc tests exactly
+  once; a finding names each one no entry runs, or that several do, with the entries. The
+  check reads one shape of the job, today's, and refuses any other rather than reading it:
+  a matrix of `include` alone (a key beside it folds the entries into its combinations), no
+  `if` or `defaults` on the job and no `defaults` on the workflow, and one item of the job's
+  one `steps` list that uses `matrix.args`,
+  `run: cargo +$MIRI_TOOLCHAIN miri test ${{ matrix.args }} --locked`, with only `env` beside
+  it. The job's other steps are not read. The reader takes the YAML the job is written in
+  (block mappings and sequences, plain, quoted and block scalars, LF or CRLF line breaks,
+  space indentation) and refuses at its line what it does not read on the way to and inside
+  the entries: another line break (a lone CR, NEL, LS or PS), a tab indent, a document
+  marker or directive, a line of a mapping on the way that is not a plain or quoted `key:`
+  (an explicit `? key`, or a list at the indent of its key, so that entries or steps written
+  at the indent of `include:` or `steps:` are refused, as the real file never writes them),
+  a key it follows (`jobs`, `miri`, `strategy`, `matrix`, `include`, `steps`) twice in its
+  mapping, and a key twice in one entry. Every entry names exactly
+  one workspace member with a plain `-p NAME` or `--package NAME`; `--workspace`, no `-p`,
+  a second `-p`, `-p=`, `-pNAME`, `NAME@VERSION` and a glob are refused. Its `args` are
+  split as the run step's bash splits them; an unquoted glob character, which bash would
+  expand against the checkout, a line break, which ends the command, and other shell syntax
+  are refused. Of cargo's options it reads `-p`, `--lib`, `--test` and `--doc`, and refuses
+  any other. A package in `[miri_split]` must name its targets: an entry that names none is
+  refused, since cargo's default run then follows the manifest's `test` and
+  `required-features`, which the counts do not model. An explicit `--test` runs a
+  `test = false` target and fails the job on one whose `required-features` it does not
+  enable, so neither needs a rule. A package outside `[miri_split]` that two or more entries
+  name by target is reported as a split the policy does not list; an entry that runs the
+  package whole drops none of its targets, so entries that do, as `lactose-task`'s two do
+  under two environments, are no split, and neither is one of them beside one entry by
+  target. An empty `[miri_split]` is reported. A binary, bench or example target of a
+  split package whose `test` is on, which `cargo test` would run and the split cannot
+  select, is reported in its manifest. A `--test` value with none of `*?[]` is a target
+  name, and any other a pattern of the `glob` crate as cargo 1.99 and the job's
+  `MIRI_TOOLCHAIN` (nightly-2026-10-04, cargo 1.101.0-nightly) build it: case-sensitive,
+  `?`, `*`, `**` only alone, `[...]` and `[!...]` with ranges and a leading `]`, no escape.
+  The unit tests' cases are cargo's own selections and refusals, run through
+  `cargo test --no-run --test` on cargo 1.99.0, and a set of them on both cargos. A value
+  that selects nothing, which cargo refuses, is reported, as is a pattern with a path
+  separator, which the check does not read.
 
 The scanner reads source text. It does not expand macros, so an attribute a macro writes is
 not seen. In the lint check it resolves a `#[path]` inside an inline `mod` block as if it
@@ -396,8 +437,16 @@ standard error as it comes.
 - The load is `uptime`'s averages before and after a run; on Windows, the processor's mean
   idle share over it, which Windows PowerShell samples every second from WMI's
   `Win32_PerfFormattedData_PerfOS_Processor` (`PercentIdleTime` of `_Total`), the first
-  sample dropped, and which the file calls unavailable when the sampler fails or a run
-  ends before its second sample. The sampler wakes WMI once a second during a Windows run,
+  sample dropped. Where there is none the row says why: Windows PowerShell could not be
+  started, or the run's seconds and that the sampler printed no sample, or only the first,
+  in them, which a run shorter than PowerShell's start and two samples a second apart gets
+  (the Windows laptop's `physics-phase` and `rollback-seven-ticks` files of 2026-11-15). Every
+  command but `edit-to-playing`, whose builds are what it measures, first builds what it
+  runs with cargo's `--no-run` form of the same command (`cargo build` for `headless-120`)
+  before the window opens, so the window holds the run and not its build, on a cold tree
+  too, though a load average taken just after that build still carries it; a failed build
+  fails the measurement. The
+  sampler wakes WMI once a second during a Windows run,
   a perturbation not measured. The Windows CPU row is the registry's
   `ProcessorNameString`. The Windows paths have not been run.
 - `edit-to-playing` builds in a detached worktree of `HEAD` under

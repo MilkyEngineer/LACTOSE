@@ -33,6 +33,7 @@ struct RawPolicy {
     lint_file_carriers: Crates,
     feature_roots: Packages,
     harness: Harness,
+    miri_split: Packages,
 }
 
 /// The parsed policy file.
@@ -48,6 +49,9 @@ pub struct Policy {
     pub harness_packages: Vec<String>,
     /// The tests that record hashes under the harness, by their recorded names.
     pub harness_tests: Vec<String>,
+    /// The packages the nightly Miri job splits over several entries, which together must
+    /// run each of their targets exactly once.
+    pub miri_split: Vec<String>,
 }
 
 impl Policy {
@@ -63,6 +67,7 @@ impl Policy {
             feature_roots: raw.feature_roots.packages,
             harness_packages: raw.harness.packages,
             harness_tests: raw.harness.tests,
+            miri_split: raw.miri_split.packages,
         })
     }
 }
@@ -77,6 +82,7 @@ mod tests {
         assert!(policy.unsafe_crates.contains(&"lactose-core".to_owned()));
         assert_eq!(policy.lint_file_carriers, ["lactose-reflect-macros", "lactose-ecs-macros"]);
         assert!(!policy.harness_tests.is_empty());
+        assert_eq!(policy.miri_split, ["lactose-ecs"]);
     }
 
     #[test]

@@ -20,9 +20,11 @@ hyphens (the WHISK benchmark's rule, so `apple-m1`).
 Every file opens with the header of `docs/plans/milestone-1.md`, section 4: the CPU and
 operating system, the core topology the executor detected, the workers used, the commit (with
 `-dirty` if a tracked file had changes), the build profile and the exact command, and the load
-average before and after the run (on Windows, the processor's mean idle share over it). Times
-are printed and written, never asserted: a file states where its threshold is, and the reader
-compares.
+average before and after the run (on Windows, the processor's mean idle share over it, or why
+it has none, for example a run shorter than Windows PowerShell's start and two samples; every
+command but `edit-to-playing` builds what it runs before the window opens, so the window holds
+the run and not its build). Times are printed and written, never asserted: a file states where
+its threshold is, and the reader compares.
 
 N, the frame workers of the plan's decision 5.1, follows its section 4: the performance cores
 the platform reports or, on a part that reports no core types, its physical cores, at most

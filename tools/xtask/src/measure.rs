@@ -431,18 +431,25 @@ fn workers_override(value: Option<&std::ffi::OsStr>) -> Result<Option<u32>, Stri
         })
 }
 
-/// The mean of the samples the WMI sampler printed, a percentage: every line that reads as a
-/// number but the first, which a fresh session's first query may answer with no interval
-/// behind it. Anything else it printed is not a sample.
-#[must_use]
-fn idle_share(samples: &str) -> Option<f64> {
+/// The mean of the samples the WMI sampler printed over a run of `seconds`, a percentage:
+/// every line that reads as a number but the first, which a fresh session's first query may
+/// answer with no interval behind it. Anything else it printed is not a sample.
+///
+/// # Errors
+/// Why there is no share, for the header: the sampler printed no sample, or only the first.
+/// A run shorter than Windows PowerShell's start and two samples a second apart has none.
+fn idle_share(samples: &str, seconds: f64) -> Result<f64, String> {
     let samples: Vec<f64> = samples
         .lines()
         .filter_map(|line| line.trim().parse::<f64>().ok())
         .filter(|value| value.is_finite())
-        .skip(1)
         .collect();
-    (!samples.is_empty()).then(|| samples.iter().sum::<f64>() / samples.len() as f64)
+    let printed = match samples.as_slice() {
+        [] => "no sample",
+        [_] => "only its first sample, which is dropped,",
+        [_, rest @ ..] => return Ok(rest.iter().sum::<f64>() / rest.len() as f64),
+    };
+    Err(format!("the run took {seconds:.1} s, and the sampler printed {printed} in it"))
 }
 
 /// The data of the value `name` in `reg query`'s output: what follows its type on the line
@@ -555,8 +562,8 @@ fn median(values: &[f64]) -> f64 {
 enum Load {
     /// The load averages before and after, as `uptime` prints them.
     Averages { before: String, after: String },
-    /// The processor's mean idle share over the run, in percent, where it could be sampled.
-    Idle(Option<f64>),
+    /// The processor's mean idle share over the run, in percent, or why it has none.
+    Idle(Result<f64, String>),
 }
 
 /// The header of a result file.
@@ -587,8 +594,8 @@ fn load_text(load: &Load) -> (&'static str, String) {
         Load::Averages { before, after } => {
             ("Load average", format!("{before} before, {after} after"))
         }
-        Load::Idle(Some(share)) => ("Processor idle", format!("{share:.1}% over the run")),
-        Load::Idle(None) => ("Processor idle", "unavailable".to_owned()),
+        Load::Idle(Ok(share)) => ("Processor idle", format!("{share:.1}% over the run")),
+        Load::Idle(Err(why)) => ("Processor idle", format!("unavailable: {why}")),
     }
 }
 
@@ -645,7 +652,7 @@ fn json(header: &Header, figures: &[(String, String)]) -> String {
             load.insert("load_average_after".into(), after.as_str().into());
         }
         Load::Idle(share) => {
-            load.insert("processor_idle_percent".into(), (*share).into());
+            load.insert("processor_idle_percent".into(), share.as_ref().ok().copied().into());
         }
     }
     let figures: serde_json::Map<String, serde_json::Value> =
@@ -969,9 +976,10 @@ const IDLE_SAMPLER: &str = "while ($true) { \
 /// early return, stops its process all the same.
 enum Sampler {
     Uptime(String),
-    /// [`IDLE_SAMPLER`], and the thread reading it, until stopped.
-    Wmi(Option<(Child, thread::JoinHandle<String>)>),
-    Unavailable,
+    /// [`IDLE_SAMPLER`], the thread reading it, and when it was started, until stopped.
+    Wmi(Option<(Child, thread::JoinHandle<String>, Instant)>),
+    /// Why the sampler could not be started.
+    Unavailable(&'static str),
 }
 
 impl Sampler {
@@ -991,11 +999,11 @@ impl Sampler {
                             let _ = stdout.read_to_string(&mut text);
                             text
                         });
-                        Self::Wmi(Some((child, reader)))
+                        Self::Wmi(Some((child, reader, Instant::now())))
                     }
-                    None => Self::Unavailable,
+                    None => Self::Unavailable("the sampler's output could not be read"),
                 },
-                Err(_) => Self::Unavailable,
+                Err(_) => Self::Unavailable("Windows PowerShell could not be started"),
             }
         } else {
             Self::Uptime(uptime())
@@ -1007,12 +1015,19 @@ impl Sampler {
             Self::Uptime(before) => {
                 Load::Averages { before: std::mem::take(before), after: uptime() }
             }
-            Self::Wmi(running) => Load::Idle(running.take().and_then(|(mut child, reader)| {
-                let _ = child.kill();
-                let _ = child.wait();
-                reader.join().ok().as_deref().and_then(idle_share)
-            })),
-            Self::Unavailable => Load::Idle(None),
+            Self::Wmi(running) => Load::Idle(match running.take() {
+                Some((mut child, reader, started)) => {
+                    let seconds = started.elapsed().as_secs_f64();
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    match reader.join() {
+                        Ok(samples) => idle_share(&samples, seconds),
+                        Err(_) => Err("the sampler's output could not be read".to_owned()),
+                    }
+                }
+                None => Err("the sampler was stopped twice".to_owned()),
+            }),
+            Self::Unavailable(why) => Load::Idle(Err((*why).to_owned())),
         }
     }
 }
@@ -1020,7 +1035,7 @@ impl Sampler {
 impl Drop for Sampler {
     fn drop(&mut self) {
         if let Self::Wmi(running) = self
-            && let Some((mut child, _)) = running.take()
+            && let Some((mut child, _, _)) = running.take()
         {
             let _ = child.kill();
             let _ = child.wait();
@@ -1156,6 +1171,26 @@ fn write(
     Ok(vec![md, json_file])
 }
 
+/// Runs the cargo command `args` to build what a measured command then runs, before its
+/// sampler starts, so that the sampled window holds the run alone on a cold tree too. The
+/// variables a measured command sets are read when it runs, not when it builds. A failed
+/// build fails the measurement.
+fn build(workspace: &Workspace, args: &[String]) -> Result<(), String> {
+    let status = Command::new(&workspace.cargo)
+        .args(args)
+        .current_dir(&workspace.root)
+        // Standard output stays the measurement's; cargo's own is on standard error.
+        .stdout(std::io::stderr())
+        .status()
+        .map_err(|e| format!("cannot run `{}`: {e}", workspace.cargo))?;
+    if status.success() { Ok(()) } else { Err(format!("the build ended with {status}")) }
+}
+
+/// `args`, a `cargo nextest run` or `cargo bench` command, building only.
+fn no_run(args: &[String]) -> Vec<String> {
+    args.iter().cloned().chain(["--no-run".to_owned()]).collect()
+}
+
 fn short_env(options: &Options) -> Vec<(&'static str, String)> {
     if options.short { vec![(SHORT_VAR, "1".to_owned())] } else { Vec::new() }
 }
@@ -1168,6 +1203,7 @@ fn run_test(
     out: &Path,
 ) -> Result<Vec<PathBuf>, String> {
     let args = nextest_args(m.run);
+    build(workspace, &no_run(&args))?;
     let env = short_env(options);
     let mut command = Command::new(&workspace.cargo);
     command.args(&args).current_dir(&workspace.root);
@@ -1217,6 +1253,8 @@ fn run_spike_replays(
     m: &'static Measurement,
     out: &Path,
 ) -> Result<Vec<PathBuf>, String> {
+    // Every replay is a test of one target.
+    build(workspace, &no_run(&nextest_args(REPLAYS[0].run())))?;
     let sampler = Sampler::start();
     let (mut found, mut output, mut ran) = (Vec::new(), String::new(), Vec::new());
     let mut reported = std::collections::BTreeSet::new();
@@ -1317,6 +1355,7 @@ fn run_task_bench(
         // A short run sets the runs; a full one makes sure the caller's do not leak in.
         .env_remove("WHISK_BENCH_RUNS")
         .envs(env.iter().map(|(name, value)| (name, value)));
+    build(workspace, &no_run(&args))?;
     let sampler = Sampler::start();
     let output = capture(&mut command, |_, _| {});
     let load = sampler.stop();
@@ -1380,6 +1419,9 @@ fn run_headless(
     out: &Path,
 ) -> Result<Vec<PathBuf>, String> {
     let args = headless_args("120", None);
+    // `cargo run` has no `--no-run`: `cargo build` with its options builds the binary.
+    let until = args.iter().position(|arg| arg == "--").unwrap_or(args.len());
+    build(workspace, &[&["build".to_owned()], &args[1..until]].concat())?;
     let mut command = Command::new(&workspace.cargo);
     command.args(&args).current_dir(&workspace.root);
     let sampler = Sampler::start();
@@ -1828,14 +1870,29 @@ mod tests {
 
     #[test]
     fn the_idle_share_is_the_mean_of_the_wmi_sampler_s_lines_but_the_first() {
-        assert_eq!(idle_share("0\r\n90\r\n80\r\n"), Some(85.0));
+        assert_eq!(idle_share("0\r\n90\r\n80\r\n", 3.0), Ok(85.0));
         assert_eq!(
-            idle_share("\r\n100\r\n97\r\nGet-CimInstance : Access denied\r\n93\r\n"),
-            Some(95.0)
+            idle_share("\r\n100\r\n97\r\nGet-CimInstance : Access denied\r\n93\r\n", 4.0),
+            Ok(95.0)
         );
-        assert_eq!(idle_share("97\r\n"), None);
-        assert_eq!(idle_share(""), None);
-        assert_eq!(idle_share("Get-CimInstance : Invalid class\r\n"), None);
+        // Two lines: the first dropped, the second the share.
+        assert_eq!(idle_share("0\r\n90\r\n", 2.5), Ok(90.0));
+    }
+
+    #[test]
+    fn a_run_with_no_idle_share_says_why() {
+        let one = "the run took 1.6 s, and the sampler printed only its first sample, which is \
+                   dropped, in it";
+        assert_eq!(idle_share("97\r\n", 1.64), Err(one.to_owned()));
+        assert_eq!(idle_share("97", 1.64), Err(one.to_owned()));
+        let none = "the run took 0.8 s, and the sampler printed no sample in it";
+        assert_eq!(idle_share("", 0.8), Err(none.to_owned()));
+        assert_eq!(idle_share("\r\n", 0.8), Err(none.to_owned()));
+        // A sampler whose query fails every time prints no sample, however long the run.
+        assert_eq!(
+            idle_share("Get-CimInstance : Invalid class\r\nNaN\r\n", 60.0),
+            Err("the run took 60.0 s, and the sampler printed no sample in it".to_owned())
+        );
     }
 
     /// Review r2, m1: an empty override was unset here but an error to every cost test, and
@@ -2042,8 +2099,18 @@ mod tests {
         assert_eq!(value["figures"]["t1_us"], serde_json::json!(1.5));
         assert_eq!(value["topology"]["performance"], serde_json::json!(4));
         assert_eq!(value["short"], serde_json::json!(true));
-        let windows = Header { load: Load::Idle(Some(93.25)), ..header };
+        let windows = Header { load: Load::Idle(Ok(93.25)), ..header.clone() };
         assert!(markdown(&windows, &[], "").contains("| Processor idle | 93.2% over the run |"));
+        let value: serde_json::Value = serde_json::from_str(&json(&windows, &figures)).unwrap();
+        assert_eq!(value["load"]["processor_idle_percent"], serde_json::json!(93.25));
+        let why = idle_share("97\r\n", 1.64).unwrap_err();
+        let short = Header { load: Load::Idle(Err(why)), ..header };
+        assert!(markdown(&short, &[], "").contains(
+            "| Processor idle | unavailable: the run took 1.6 s, and the sampler printed only its \
+             first sample, which is dropped, in it |"
+        ));
+        let value: serde_json::Value = serde_json::from_str(&json(&short, &figures)).unwrap();
+        assert_eq!(value["load"]["processor_idle_percent"], serde_json::Value::Null);
     }
 
     #[test]
