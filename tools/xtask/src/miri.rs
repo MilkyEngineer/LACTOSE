@@ -92,8 +92,9 @@ impl Run<'_> {
     }
 }
 
-/// The finding for each of `package`'s runs that the entries naming it do not run exactly
-/// once, and for each entry naming it that the check cannot read.
+/// The finding for each entry naming `package` that the check cannot read or cargo would
+/// refuse, and, when there is none, for each of its runs that the entries do not run
+/// exactly once.
 fn split(package: &Package, entries: &[Entry], findings: &mut Vec<Finding>) {
     let mut runs: BTreeMap<Run<'_>, Vec<&Entry>> = BTreeMap::new();
     if package.lib {
@@ -105,7 +106,7 @@ fn split(package: &Package, entries: &[Entry], findings: &mut Vec<Finding>) {
     for test in &package.tests {
         runs.insert(Run::Test(test), Vec::new());
     }
-    let mut named = false;
+    let (mut named, mut read) = (false, true);
     for entry in entries {
         let Some((line, args)) = &entry.args else { continue };
         let report = |message: String| {
@@ -116,6 +117,7 @@ fn split(package: &Package, entries: &[Entry], findings: &mut Vec<Finding>) {
             // Unread words could name the package, so the entry is reported whatever it names.
             Err(message) => {
                 findings.push(report(message));
+                read = false;
                 continue;
             }
         };
@@ -129,8 +131,15 @@ fn split(package: &Package, entries: &[Entry], findings: &mut Vec<Finding>) {
                     runs.entry(run).or_default().push(entry);
                 }
             }
-            Err(message) => findings.push(report(message)),
+            Err(message) => {
+                findings.push(report(message));
+                read = false;
+            }
         }
+    }
+    // What an entry that was not read runs is unknown, so no count would be true.
+    if !read {
+        return;
     }
     if !named {
         findings.push(Finding::new(
@@ -930,7 +939,7 @@ mod tests {
         ];
         for (args, message) in cases {
             let found = run(ecs(&TESTS), &nightly(&[&["name: e", &format!("args: {args}")]]));
-            assert!(found.iter().any(|f| f.contains(message)), "{args}: {found:?}");
+            assert!(found.len() == 1 && found[0].contains(message), "{args}: {found:?}");
         }
         // An entry for another package is not judged, and the package then has none.
         let found = run(ecs(&TESTS), &nightly(&[&["name: core", "args: -p lactose-core --bins"]]));
