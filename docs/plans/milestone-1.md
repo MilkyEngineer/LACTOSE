@@ -146,9 +146,10 @@ The lanes that follow, in the order their dependencies allow:
 | `data-path` | A container's sections checked against each other and its header (finding D3). A zero-size field refused at registration (finding D4). The migrate, rebase and bundle sequence tested for a type the baseline carries (finding D5). The reading for row 42 | None | The review's three probes as tests | 7 |
 | `binds-design` | Architect: binds restored or carried across a save, the journal checkpoint included (finding D1), and what a bind or a restore does to reflected world resources (row 74). Corrects D133 | `data-path` merged | A facade and decision text | 6 |
 | `binds-impl` | Implements `binds-design` in `lactose-persist`, `lactose-sim`, `lactose-ecs` and `lactose-app` | `binds-design` and `ecs-fork` merged | A fresh process that leaves a predicted owner's region unloaded hashes equal to the original, beside section 15.5's tests; the `NetId` counter above every runtime ID a world is given (the row "A `Server` world's direct spawn under a runtime `NetId`"); a world resource that holds an entity reference refused where it is inserted (the row "ECS implementation gaps after its reviews (D117)"); a server holding no bind of an entity despawned in a step between steps | 7 |
-| `keeper` | One bounded attempt at the tick-start criterion (section 6, first entry), and the wall-clock log of samples over 1 ms (row 78) | Session A's numbers | Result file `whisk` from a quiet M1, or the cause stated | 4 to 8, counted as 6 |
+| `keeper` | One bounded attempt at the tick-start criterion (section 6, first entry), and the wall-clock log of samples over 1 ms (row 78) | Session A's numbers; `timer-windows` merged, since both edit `crates/task/src/sleep.rs`. The Windows timed wait is not this lane's (D144) | Result file `whisk` from a quiet M1, or the cause stated | 4 to 8, counted as 6 |
 | `readme-sweep` | Text only: README sentences that are stale, misattribute the `net-api` and `net-host` split, wait for crates that have merged, or name a crate by a codename (the review's C4, C6, C8, C9 a and c, and S6) | `stream-design` decided, for the one sentence that cites it | Every corrected sentence names what it now agrees with | 4 |
 | `slot-copy` | The prediction slot holds the backend's world as a copy (D143). `lactose-physics-api`: the trait `BackendCopy` with its one method `encode`; `PhysicsBackend::copy` and `PhysicsBackend::restore_copy`, with default bodies through `snapshot` and `restore`; `PhysicsSnapshot` holds the copy, and `PhysicsSnapshot::size_in_bytes` and `PhysicsSnapshot::hash` encode it once on their first call and keep the length and the hash; the doc comments of `PhysicsBackend::snapshot`, of the free `snapshot` and `restore`, and of `ConformanceReport::snapshot_bytes`. No bytes accessor. `lactose-physics-rapier`: the copy is a clone of every set and of the bookkeeping, built by destructuring `PhysicsWorld` with no `..`, shapes shared, and refused for a shape the backend did not build; a restore from it builds a fresh pipeline. `lactose-predict`: `SlotBytes`, `Ring::slot_bytes` and `Ring::bytes` report the bytes the backend would write, not what a slot holds, and their doc comments say so and state their cost. `crates/app/tests/spike.rs`: `cost_of_a_prediction_slot` takes into a full ring. The interface amendment is called out in its merge (section 20). The three READMEs' slot sentences | `stream-impl` merged, which rewrites `crates/predict/README.md` | `physics-api`'s conformance run through the copy on every pool size and layout, with the bytes of a copy equal to the backend's bytes after each of its ten ticks. The first review's backend probe adopted as a test under a name that says what it proves: joints of every kind made and removed, sleeping bodies woken, a shape replaced while older copies share the old one, on pools of one, two and four threads; from every restore point twelve ticks agree in bytes and reports between the copy, the bytes and the run itself; it fails when the restore keeps the live pipeline. The refusal at a take, as two tests, since no public call can put a foreign shape in a Rapier world: a unit test of `lactose-physics-rapier` that puts one into the crate-private collider set and sees the take refused, and `lactose-predict`'s take through its `Flaky` test backend, the slot taken without its physics. The spike's four recording tests record the hashes they recorded before the change, in the pull-request, layout and chaos modes. `cargo xtask measure prediction-slot rollback-seven-ticks` before and after, with load, as steering. The ring's memory per slot, counted in a test under `lactose-core`'s tagged allocator, since no accessor reports it | 7 |
+| `timer-windows` | The keeper's timed wait on Windows (D144), in `lactose-task` alone. The `sync` shim gains `TimedPark`, one worker's timed wait. On Windows, outside loom and Miri, it holds an auto-reset event and a high-resolution waitable timer that is not manual-reset; `wait` sets the timer before every wait and waits on both; `wake` sets the event. Elsewhere `wait` is `std::thread::park_timeout` and `wake` does nothing. Under loom it is an `AtomicBool` that `wake` sets with `swap(true, SeqCst)` and `wait` takes with `swap(false, SeqCst)`, parking while it was false; a plain store and a flag behind a loom mutex do not serve. The frame-critical pool's `Sleep` holds one for each worker: the pool makes them when it is built, before a worker enters its loop, and closes them in its `Drop`, after the last handle to the executor and the last worker. `Sleep::wake_claimed` wakes a claimed worker's `TimedPark` and unparks it; it takes the unpark as a closure, or is generic over the thread handle, so the pool's std threads and the models' loom threads share it. It is called only after a successful claim, by `Pool::announce_entry`, by `Pool::wake` when `Sleep::notify` returned true and by `Pool::wake_all`; `Pool::wake`'s unpark of a worker it did not claim stays an unpark. The models' waker sides call the same function. A worker whose event or timer cannot be made keeps `std::thread::park_timeout`, logged once; a failed `SetWaitableTimer` or a `WAIT_FAILED` is logged once and that wait is a `park_timeout`. `unsafe impl Send` and `Sync` for `TimedPark`, with its `SAFETY.md` section. The spin threshold is 500 µs on Windows and 50 µs elsewhere, set in the lane's last commit, with the commit before it holding 50 µs on Windows; the step stays 0.6. `crates/task/Cargo.toml` adds `Win32_System_Threading` and `Win32_Security` to its `windows-sys` features, and `Win32_System_WindowsProgramming` as a dev-dependency feature for the benchmark. The README's sentences; the benchmark's timer threshold on Windows, 1 ms, and its process CPU column on Windows, from `QueryProcessCycleTime` | None | In `check (windows-latest)`, a debug nextest run: the median lateness of fifty 2 ms deadlines through `sleep_until` on an otherwise idle pool is under 7.8 ms, half a default tick, where today's code gives about 14 ms and the fix under 1 ms, with that reasoning in the test; on a one-worker frame pool a keeper waiting on a deadline an hour away is ended by an earlier timer, by pushed work and by shutdown, each inside `LIMIT`, and with the event unset the keeper sleeps 36 minutes and the test times out. Under loom the fourteen models pass, and the keeper hand-off model fails when a waker of it unparks without `Sleep::wake_claimed` and when `wake_claimed` does not set the flag. Miri passes unchanged. The Windows cross-target clippy and `cargo xtask features` pass. The merge is pushed alone (D125). After the merge is pushed, the laptop runs the benchmark at the merge's first parent, at the lane's 50 µs commit and at the merge, as labelled data: the timer rows with their process CPU, and the makespan and wake rows beside them. If the merge's process CPU at 60 Hz is more than 0.015 s a second above the 50 µs commit's there, or its P99 is not under 1 ms, a follow-up commit on main sets the Windows threshold back to 50 µs and the benchmark's to 2 ms, recorded as D144's addendum | 8: seven, and the concurrency reviewer beside its first review |
 
 Document work beside the tracks: this plan's review and answer (2 runs); revision 3.3 (3); the
 scalar decision (3); the definition of the GPU reviewer and its review (2); the exit of section 7
@@ -163,6 +164,9 @@ fourteen of these runs leave milestone 1.
 D143 adds `slot-copy`, seven runs, and five for its proposal's two reviews, two revisions
 and its application.
 
+D144 adds `timer-windows`, eight runs, and six for its proposal: its writing, two reviews, two
+revisions and its application.
+
 Three lanes need a facade first: `stream-impl`, `binds-impl` and `rhi-null`. No other lane does.
 `lactose-ecs`'s surface is final but for `schema-digest`'s export of `document_schema`,
 `tools/cook` is a leaf that writes SILO's format, and the spike lives in `lactose-app`'s tests.
@@ -173,11 +177,11 @@ unblocked.
 
 | Queue | Lanes, in order | Runs |
 |---|---|---|
-| 1, the ECS and then render | `scalar-probe`, `ecs-a`, `ecs-kernel`, `ecs-fork`, `spike-rhi`, `rhi-api`, `rhi-null`, `keeper`, `readme-sweep` | 51 |
+| 1, the ECS and then render | `scalar-probe`, `ecs-a`, `ecs-kernel`, `ecs-fork`, `spike-rhi`, `rhi-api`, `rhi-null`, `timer-windows`, `keeper`, `readme-sweep` | 59 |
 | 2, the client and then the save path | `client-fix`, `sour-evidence`, `spike-net`, `stream-impl`, `slot-copy`, `data-path`, `binds-design`, `binds-impl` | 56 |
 | 3, assets and tools | `silo`, `stream-design`, `xtask-policy`, `measure`, `schema-digest`, `ricotta`, `schema-guard` | 46 |
 
-Six rules bind whatever the coordinator reorders:
+Seven rules bind whatever the coordinator reorders:
 
 - One lane at a time edits `lactose-ecs`. `schema-digest`, `stream-impl` and `binds-impl` all edit
   it, and each starts after `ecs-fork` has merged. An architect round that adds a signature to it
@@ -203,6 +207,11 @@ Six rules bind whatever the coordinator reorders:
   snapshot's figure includes the drop of the world snapshot and the physics snapshot it evicts.
   Every other file of the measurement commit stands, and session B is unchanged: its slot figure
   is recorded, of the byte form (D143).
+- On Windows, milestone 0's `whisk` file is written at the first commit of main that holds
+  `timer-windows` and, if one is made, the follow-up that sets its Windows threshold back, by
+  `cargo xtask measure whisk`, not at the measurement commit. Before the lane its timer rows fail
+  on any machine and its makespan rows are taken after gaps of a tick (D144). Every other file of
+  session B stands at the measurement commit.
 
 **Where this reorders the coordinator's queue, and why.**
 
@@ -252,8 +261,8 @@ session A's files.
   CPU model, the operating systems and the GPU. It closes, or fails, the x86 half of milestone 0's
   criteria, and the topology it prints confirms the eight performance cores criterion 1 is run on.
   It needs no new code. No result file exists from Windows or Linux, where CI lints the benchmark
-  and does not run it; if it fails there, that failure is the session's result and goes to
-  `keeper`.
+  and does not run it; if it fails there, that failure is the session's result and goes to `keeper`,
+  except the timer rows on Windows, whose cause is known and which `timer-windows` fixes (D144).
 - *The quiet window*, the coordinator's, at the measurement commit. Every track stops, the machine
   holds `caffeinate -i -s`, and `cargo xtask measure --all` runs once. A number measured under
   agent load stays in a lane's report: it steers, and it proves nothing.
@@ -272,7 +281,7 @@ session A's files.
 | 6, the sim skeleton | `the_sim_skeleton_budget`, figure (b) | At most 0.5 ms | At most 0.5 ms |
 | 7, rollback cost per tick | The spike's measurement test | Recorded; it has no budget | Not run |
 | 9, edit-to-playing | From saving a one-line change to the report line of `cargo run -p lactose-app-headless -- 1`; dev profile, warm build, the median of five. Two edits, each in a function body: the sketch game's system in `crates/app-headless/src/main.rs`, and a function of `lactose-app`. The criterion is read against the slower (decision 5.9) | At most 30 s | At most 30 s on each operating system it boots; a runner's figure, marked as such, for one it does not |
-| Milestone 0, WHISK | `cargo bench -p lactose-task --bench whisk` | Its own thresholds (`crates/task/README.md`) | The same |
+| Milestone 0, WHISK | `cargo bench -p lactose-task --bench whisk` | Its own thresholds (`crates/task/README.md`) | The same; on Windows the 60 Hz timer row against 1 ms at P99, in a file written at the first commit that holds `timer-windows` and, if one is made, the follow-up that sets its Windows threshold back (D144) |
 
 The composed tick, the cost scene with the 2,000 awake bodies in it, is recorded beside criteria 1
 and 4. It is the share of the tick section 16 asks milestone 1 to measure, and it is not a
@@ -744,8 +753,11 @@ Milestone 1 exits when these have happened, in this order.
 
 1. The measurement commit exists. The quiet window and session B have run on it, and their result
    files are on main. Session B's run on eight frame workers is criterion 1's proof. The second
-   quiet window has run at the first commit that holds `slot-copy`, and its two files are
-   criterion 5's proof and criterion 7's rollback figure (D143).
+   quiet window has run at the first commit that holds `slot-copy`, and its three files are
+   criterion 5's proof, criterion 7's rollback figure and criterion 7's first `spike-net` file
+   (D143). If the desktop boots Windows, its `whisk` file there has been written at the first commit
+   that holds `timer-windows` and, if one is made, the follow-up that sets its Windows threshold
+   back (D144).
 2. The planner has written the scalar decision from the probe and the measured rollback loop, and
    the owner has approved it.
 3. Every queue of section 3 has drained, so section 22's delivers are on main: the parallel ECS

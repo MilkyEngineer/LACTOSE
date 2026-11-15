@@ -243,13 +243,17 @@ owns its data and may be cancelled by drop. Waiting is an `.await`.
 - Idle workers spin for 50 microseconds, then `std::thread::park`. The worker keeping the
   timers steps its timed park (0.6 of the time left, repeated) and spins the last 50
   microseconds, because macOS lengthens a timed wait by a leeway proportional to the timeout
-  (D113). A worker that releases
-  several entries keeps one for itself and wakes one sleeper for each of the others, and a
-  worker that fires timers on its way to its next job keeps the first task they wake in the
-  same way, but only while nothing waits in the frame-critical queue (D116). The
-  latch, the permit gate, the sleep-and-wake protocol and run quiescence are modelled under
-  `loom`, through the shipped functions; the deque is a vetted dependency. aarch64 stress tests
-  cover weak-memory behaviour loom does not model.
+  (D113). On Windows each step is a wait on a high-resolution waitable timer and on an event
+  that a waker sets, because every timed wait of the standard library that another thread can
+  end is rounded up to whole milliseconds there and ends on the system's timer tick, 15.6 ms by
+  default; that timer overshoots by about half a millisecond whatever is asked, so the keeper
+  spins the last 500 microseconds there (D144). A worker that releases several entries keeps one
+  for itself and wakes one sleeper for each of the others, and a worker that fires timers on its
+  way to its next job keeps the first task they wake in the same way, but only while nothing
+  waits in the frame-critical queue (D116). The latch, the permit gate, the sleep-and-wake
+  protocol and run quiescence are modelled under `loom`, through the shipped functions; the
+  deque is a vetted dependency. aarch64 stress tests cover weak-memory behaviour loom does not
+  model.
 - `tracing` spans are emitted per system and per stolen range, never per chunk job. Finer
   levels compile out.
 - Packet parsing runs on a dedicated network thread at frame-critical priority, not on
@@ -1317,7 +1321,7 @@ The policy is in section 3.
 
 | Crate | Why |
 |---|---|
-| `task` | deques, scope borrows, panic guard |
+| `task` | deques, scope borrows, panic guard, core-topology queries, the keeper's timed wait on Windows |
 | `ecs` | chunk column storage, and the schedule run's lending of chunk columns, column ticks, row stamps, resources and event lists to concurrent system nodes through raw pointers taken at sync points (`node.rs`); the `#[system]` expansion's call of `unsafe SystemDescriptor::new`, which lands in the invoking crate like the `#[component]` impl and whose proof is in `crates/ecs/SAFETY.md` |
 | `io` | platform completion APIs |
 | `rhi-vulkan`, `rhi-metal`, `rhi-dx12` | FFI to graphics drivers (`rhi-api` and `rhi-null` are not exempt) |
@@ -1340,7 +1344,7 @@ in the expansion against the final type, never by what the macro parsed;
 
 | # | Name | Delivers | Proves |
 |---|---|---|---|
-| 0 | Skeleton | Workspace, CI matrix, `core` with tagged allocator, `math`, `task`, `reflect`, `asset-api`, `bundle`, tracing, SOUR scaffold, `ecs` facade with the section 6.1 API | Makespan divided by its lower bound (the larger of the duration-weighted critical path and total work divided by worker count) at most 1.25 at P50 and 1.5 at P99 on three DAG shapes (wide-shallow, deep chain, fan-in-fan-out) with log-uniform job durations from 10 µs to 1 ms, with and without two background zstd threads, on a developer M-series Mac and an x86 desktop. Tick-start latency, from a tick deadline to the timer root resuming, under 20 µs at P99; wake latency from an idle pool under 35 µs at P99; steal under 1 µs. Latch and sleep-wake pass loom; `task` and `ecs` pass Miri. |
+| 0 | Skeleton | Workspace, CI matrix, `core` with tagged allocator, `math`, `task`, `reflect`, `asset-api`, `bundle`, tracing, SOUR scaffold, `ecs` facade with the section 6.1 API | Makespan divided by its lower bound (the larger of the duration-weighted critical path and total work divided by worker count) at most 1.25 at P50 and 1.5 at P99 on three DAG shapes (wide-shallow, deep chain, fan-in-fan-out) with log-uniform job durations from 10 µs to 1 ms, with and without two background zstd threads, on a developer M-series Mac and an x86 desktop. Tick-start latency, from a tick deadline to the timer root resuming, under 20 µs at P99, and under 1 ms on Windows, where the finest timed wait a waker can end overshoots by about half a millisecond (D144); wake latency from an idle pool under 35 µs at P99; steal under 1 µs. Latch and sleep-wake pass loom; `task` and `ecs` pass Miri. |
 | 1 | World | Sim track: `ecs`, `sim`, `physics-api` plus `physics-rapier`, `anim`, `predict`, `persist` (policy, records, container), `asset-api`, `net-api` and `input` types, headless `app`. Render track: RHI spike. Asset track: `io`, `asset`, `cook` skeleton. | 100k entities simulate a tick in at most 4 ms on 8 performance cores; SOUR passes in workers, repeat, layout and chaos modes. Physics snapshot conformance. Physics phase at most 3 ms for 2,000 awake bodies; prediction-world snapshot at most 100 µs; sim-skeleton evaluation at most 0.5 ms for 200 characters. Netcode spike over a throwaway transport: x86 server, aarch64 client, one predicted character, run as a dynamic capsule and as a kinematic body, fifty claimed dynamic bodies thrown and interacting, and a claim of a body in contact; correction rate under the section 9.4 tolerance, the largest difference the tolerance absorbed per kind, rollback cost per tick and divergence recorded as the baseline that milestone 4's threshold is judged against. Scalar decided by the section 16 rule. Edit-to-playing at most 30 s per platform. |
 | 2 | Pixels | `platform`, `rhi-api`, `rhi-null`, `rhi-vulkan`, `render-graph`, minimal `renderer`, Slang toolchain, `present-api`, presentation snapshot and schedule | A triangle through the graph on Windows and macOS. MoltenVK, KosmicKrisp and native Metal spikes recorded, and `rhi-api` frozen or amended on their findings. Overlap with exclusive extract; extract at most 1 ms for 50k dirty rows; remote transform upload at most 1 ms for 5k entities at 144 Hz. lavapipe CI; macOS shader runner. |
 | 3 | GPU-driven | GPU scene with cell-plus-offset, cluster submission, culling, deferred tile-local lighting, streaming regions with `persist` overlay against the cooked baseline, `terrain`, pose evaluation, `rhi-metal` | 500k instances through compacted index buffers with one indexed indirect draw per pipeline, at most 2 ms GPU on RTX 3060-class and 4 ms on M1-class at 1440p, on Vulkan and Metal. Regions persist across unload and reload. Skinned characters on terrain. |
