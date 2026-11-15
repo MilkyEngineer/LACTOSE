@@ -1,7 +1,10 @@
 //! The copy a prediction slot holds (D143): a backend restored from a copy steps as one
 //! restored from its bytes does, and as the run it was taken from did, on a scene that
 //! makes and removes joints of every kind, wakes sleeping bodies and replaces a shape while
-//! older copies still share the old one; and a copy encodes the bytes the backend wrote.
+//! older copies still share the old one; and a copy encodes the bytes the backend wrote. On
+//! a second scene that churns its contact pairs, so that the copies carry retired pairs and
+//! freed slots the bytes do not, a copy restores on another pool size, restores twice, and
+//! restores into the backend that stepped on from it.
 
 #![forbid(unsafe_code)]
 
@@ -37,6 +40,18 @@ const LATER: u64 = 1_004;
 const TICKS: u32 = 420;
 /// How many ticks each restore point is stepped on.
 const SPAN: u32 = 12;
+
+/// A scene: what is built before the first step, the calls and commands before each step,
+/// a function of the tick alone so that every restored run replays them, and how many
+/// ticks the live run steps.
+struct Scene {
+    build: fn(&mut dyn PhysicsBackend),
+    script: fn(&mut dyn PhysicsBackend, u32) -> Vec<PhysicsCommand>,
+    ticks: u32,
+}
+
+/// Joints of every kind, sleepers woken, a shape replaced.
+const JOINTED: Scene = Scene { build, script, ticks: TICKS };
 
 /// The scene before its first step.
 fn build(b: &mut dyn PhysicsBackend) {
@@ -84,8 +99,7 @@ fn build(b: &mut dyn PhysicsBackend) {
     }
 }
 
-/// The calls and commands before the step of `tick`: a function of the tick alone, so
-/// every restored run replays them.
+/// The calls and commands before the step of `tick`.
 fn script(b: &mut dyn PhysicsBackend, tick: u32) -> Vec<PhysicsCommand> {
     let mut commands = Vec::new();
     if tick < 260 {
@@ -142,9 +156,9 @@ fn script(b: &mut dyn PhysicsBackend, tick: u32) -> Vec<PhysicsCommand> {
     commands
 }
 
-/// One scripted step of `tick` and what it reported.
-fn scripted(b: &mut dyn PhysicsBackend, tick: u32) -> Seen {
-    let commands = script(b, tick);
+/// One scripted step of `tick` of `scene` and what it reported.
+fn scripted(scene: &Scene, b: &mut dyn PhysicsBackend, tick: u32) -> Seen {
+    let commands = (scene.script)(b, tick);
     Seen::from(&step(b, tick, &commands))
 }
 
@@ -166,17 +180,18 @@ struct Run {
     reports: Vec<Seen>,
 }
 
-/// The live run on a pool of `threads`, with its bytes, copy and report after every tick.
-fn live(threads: usize) -> (Box<dyn PhysicsBackend>, Run) {
+/// The live run of `scene` on a pool of `threads`, with its bytes, copy and report after
+/// every tick.
+fn live(scene: &Scene, threads: usize) -> (Box<dyn PhysicsBackend>, Run) {
     let mut b = backend(threads);
-    build(&mut *b);
+    (scene.build)(&mut *b);
     let mut run = Run {
         bytes: vec![snapshot(&*b)],
         copies: vec![b.copy().unwrap()],
         reports: vec![Seen::from(&StepOutput::default())],
     };
-    for tick in 1..=TICKS {
-        run.reports.push(scripted(&mut *b, tick));
+    for tick in 1..=scene.ticks {
+        run.reports.push(scripted(scene, &mut *b, tick));
         run.bytes.push(snapshot(&*b));
         run.copies.push(b.copy().unwrap());
     }
@@ -188,10 +203,10 @@ fn live(threads: usize) -> (Box<dyn PhysicsBackend>, Run) {
 
 /// Steps `b`, restored to the point after tick `t`, through the next [`SPAN`] ticks,
 /// requiring its bytes and reports to be the live run's; `how` names the restore.
-fn steps_as_the_run(b: &mut dyn PhysicsBackend, run: &Run, t: u32, how: &str) {
+fn steps_as_the_run(scene: &Scene, b: &mut dyn PhysicsBackend, run: &Run, t: u32, how: &str) {
     assert!(snapshot(b) == run.bytes[t as usize], "{how} at {t} writes the bytes of its tick");
     for tick in t + 1..=t + SPAN {
-        let seen = scripted(b, tick);
+        let seen = scripted(scene, b, tick);
         let at = tick as usize;
         assert!(seen == run.reports[at], "{how} at {t}: the report of tick {tick}");
         assert!(snapshot(b) == run.bytes[at], "{how} at {t}: the bytes after tick {tick}");
@@ -201,7 +216,7 @@ fn steps_as_the_run(b: &mut dyn PhysicsBackend, run: &Run, t: u32, how: &str) {
 #[test]
 fn a_backend_restored_from_a_copy_steps_as_one_restored_from_its_bytes() {
     for threads in [1, 2, 4] {
-        let (mut live, run) = live(threads);
+        let (mut live, run) = live(&JOINTED, threads);
         // The scene does what it claims: a sleeper at rest is not reported until the write
         // wakes it, and the box dropped on another reports both.
         assert!(!reported(&run.reports[WAKE as usize - 1], SLEEPERS + 1), "asleep before");
@@ -219,15 +234,17 @@ fn a_backend_restored_from_a_copy_steps_as_one_restored_from_its_bytes() {
         for t in 0..=TICKS - SPAN {
             from_copy.restore_copy(&*run.copies[t as usize]).unwrap();
             from_bytes.restore(&run.bytes[t as usize]).unwrap();
-            steps_as_the_run(&mut *from_copy, &run, t, &format!("{threads} threads, a copy"));
-            steps_as_the_run(&mut *from_bytes, &run, t, &format!("{threads} threads, bytes"));
+            let how = format!("{threads} threads, a copy");
+            steps_as_the_run(&JOINTED, &mut *from_copy, &run, t, &how);
+            let how = format!("{threads} threads, bytes");
+            steps_as_the_run(&JOINTED, &mut *from_bytes, &run, t, &how);
         }
         // Copies restored into the live backend newest first, every eighth tick, as a run of
         // rollbacks returns to them.
         for t in (0..=TICKS - SPAN).rev().step_by(8) {
             live.restore_copy(&*run.copies[t as usize]).unwrap();
             let how = format!("{threads} threads, the live backend from a copy");
-            steps_as_the_run(&mut *live, &run, t, &how);
+            steps_as_the_run(&JOINTED, &mut *live, &run, t, &how);
         }
     }
 }
@@ -242,9 +259,193 @@ fn a_copy_from_another_backend_type_is_refused_and_changes_nothing() {
     }
     let mut b = backend(1);
     build(&mut *b);
-    let _ = scripted(&mut *b, 1);
+    let _ = scripted(&JOINTED, &mut *b, 1);
     let before = snapshot(&*b);
     let error = b.restore_copy(&Foreign).unwrap_err();
     assert_eq!(error.kind(), ErrorKind::InvalidData);
     assert!(snapshot(&*b) == before, "the refused restore changed nothing");
+}
+
+/// A pile that churns its contact pairs (the first review's probe of D143's copy): balls
+/// dropped every seventh tick and removed seven drops later, a tower of eighty boxes far
+/// from the pile removed whole, rebuilt and removed again, joints made and removed, a
+/// freeze, a type switch and a shape swap. Its copies carry the retired pairs and freed
+/// slots its bytes leave out.
+const CHURNED: Scene = Scene { build: churned::build, script: churned::script, ticks: 360 };
+
+/// Restore points of the churned scene are every sixth tick.
+const CHURNED_EVERY: usize = 6;
+
+mod churned {
+    use super::*;
+
+    /// The pile's bodies are `FIRST..FIRST + COUNT`.
+    const COUNT: u64 = 60;
+    /// The tower's boxes are `TOWER..TOWER + TOWER_COUNT`.
+    const TOWER: u64 = 3_000;
+    const TOWER_COUNT: u32 = 80;
+    /// The ball dropped at `tick` is `DROPS + tick`.
+    const DROPS: u64 = 5_000;
+    /// The joint made at `tick` is `LATE_JOINTS + tick`.
+    const LATE_JOINTS: u64 = 9_000;
+    const REVOLUTE: u64 = 1_002;
+
+    pub(super) fn build(b: &mut dyn PhysicsBackend) {
+        create(b, key(FLOOR), None, Some(floor()), Transform::IDENTITY);
+        create(b, key(PADDLE), Some(RigidBody::kinematic()), Some(ball()), at(-8.0, 0.5, 0.0));
+        for i in 0..COUNT {
+            let shape = match i % 3 {
+                0 => Shape::sphere(s(0.45)),
+                1 => Shape::cuboid(v(0.4, 0.4, 0.4)),
+                _ => Shape::capsule(s(0.2), s(0.3)),
+            };
+            let mut collider = Collider::new(shape);
+            if i % 4 == 0 {
+                collider = collider.with_events(s(0.5));
+            }
+            let (column, layer) = (i % 25, i / 25);
+            let lean = s(0.01) * Scalar::from_u64(layer);
+            let x = s(1.1) * Scalar::from_u64(column % 5) - s(2.2) + lean;
+            let z = s(1.1) * Scalar::from_u64(column / 5) - s(2.2);
+            let y = s(0.6) + Scalar::from_u64(layer);
+            let pose = Transform::new(Vec3::new(x, y, z), Quat::from_rotation_y(lean));
+            create(b, key(FIRST + i), Some(RigidBody::dynamic()), Some(collider), pose);
+        }
+        tower(b);
+        let joint = Joint::new(JointKind::Revolute, key(FIRST + 4), key(FIRST + 14))
+            .with_anchors(v(0.55, 0.0, 0.0), v(-0.55, 0.0, 0.0))
+            .with_axis(v(0.0, 0.0, 1.0))
+            .with_limits(s(-0.6), s(0.6));
+        b.create_joint(key(REVOLUTE), &joint, key(FIRST + 4), key(FIRST + 14)).unwrap();
+    }
+
+    /// A leaning tower of boxes far from the pile, which collapses into a heap of pairs.
+    fn tower(b: &mut dyn PhysicsBackend) {
+        for i in 0..TOWER_COUNT {
+            let (column, layer) = (i % 4, f64::from(i / 4));
+            let x = 40.0 + 0.85 * f64::from(column % 2) + 0.03 * layer;
+            let z = 0.85 * f64::from(column / 2);
+            let y = 0.45 + 0.9 * layer;
+            let block = Collider::new(Shape::cuboid(v(0.4, 0.4, 0.4)));
+            let body = Some(RigidBody::dynamic());
+            create(b, key(TOWER + u64::from(i)), body, Some(block), at(x, y, z));
+        }
+    }
+
+    pub(super) fn script(b: &mut dyn PhysicsBackend, tick: u32) -> Vec<PhysicsCommand> {
+        let mut commands = Vec::new();
+        let x = -8.0 + 0.06 * f64::from(tick % 260);
+        b.set_transform(key(PADDLE), &at(x, 0.5, 0.3));
+        if tick.is_multiple_of(7) {
+            let x = f64::from((tick * 37) % 9) - 4.0;
+            let z = f64::from((tick * 53) % 9) - 4.0;
+            let collider = Collider::new(Shape::sphere(s(0.3))).with_events(s(0.1));
+            let body = Some(RigidBody::dynamic());
+            create(b, key(DROPS + u64::from(tick)), body, Some(collider), at(x, 6.0, z));
+        }
+        if tick.is_multiple_of(7) && tick >= 56 {
+            b.remove_body(key(DROPS + u64::from(tick - 49)));
+        }
+        if tick.is_multiple_of(13) {
+            let body = key(FIRST + u64::from(tick % 40));
+            commands.push(PhysicsCommand::ApplyImpulse { body, impulse: v(0.4, 1.5, -0.3) });
+        }
+        if tick % 50 == 25 {
+            let (a, other) = (FIRST + u64::from(tick % 30), FIRST + 30 + u64::from(tick % 29));
+            let joint = Joint::new(JointKind::Spherical, key(a), key(other))
+                .with_anchors(v(0.0, 0.5, 0.0), v(0.0, -0.5, 0.0));
+            let made = key(LATE_JOINTS + u64::from(tick));
+            b.create_joint(made, &joint, key(a), key(other)).unwrap();
+        }
+        if tick.is_multiple_of(50) && tick >= 75 {
+            b.remove_joint(key(LATE_JOINTS + u64::from(tick - 25)));
+        }
+        match tick % 60 {
+            30 => b.set_frozen(key(FIRST + 7), true),
+            0 => b.set_frozen(key(FIRST + 7), false),
+            _ => {}
+        }
+        match tick % 80 {
+            20 => b.set_body(key(FIRST + 8), Some(&RigidBody::kinematic())),
+            60 => b.set_body(key(FIRST + 8), Some(&RigidBody::dynamic())),
+            _ => {}
+        }
+        if tick % 90 == 45 {
+            let shape = if (tick / 90).is_multiple_of(2) {
+                Shape::cuboid(v(0.3, 0.5, 0.3))
+            } else {
+                Shape::sphere(s(0.4))
+            };
+            b.set_collider(key(FIRST + 9), Some(&Collider::new(shape)));
+        }
+        // The tower is removed whole, then rebuilt, so its pairs retire and come back.
+        if tick == 150 || tick == 300 {
+            for i in 0..TOWER_COUNT {
+                b.remove_body(key(TOWER + u64::from(i)));
+            }
+        }
+        if tick == 210 {
+            tower(b);
+        }
+        commands
+    }
+}
+
+#[test]
+fn a_copy_restored_into_a_backend_of_another_pool_size_steps_as_the_run_it_was_taken_from() {
+    for taken_on in [1, 2, 4] {
+        let (_, run) = live(&CHURNED, taken_on);
+        for restored_on in [1, 2, 4].into_iter().filter(|&threads| threads != taken_on) {
+            let mut b = backend(restored_on);
+            for t in (0..=CHURNED.ticks - SPAN).step_by(CHURNED_EVERY) {
+                b.restore_copy(&*run.copies[t as usize]).unwrap();
+                let how = format!("a copy taken on {taken_on} threads, restored on {restored_on}");
+                steps_as_the_run(&CHURNED, &mut *b, &run, t, &how);
+            }
+        }
+    }
+}
+
+#[test]
+fn a_copy_restored_twice_steps_as_the_run_both_times_and_still_encodes_its_bytes() {
+    for threads in [1, 2, 4] {
+        let (_, run) = live(&CHURNED, threads);
+        let mut b = backend(threads);
+        for t in (0..=CHURNED.ticks - SPAN).step_by(CHURNED_EVERY * 3) {
+            let copy = &*run.copies[t as usize];
+            for time in ["first", "second"] {
+                b.restore_copy(copy).unwrap();
+                let how = format!("{threads} threads, a copy restored the {time} time");
+                steps_as_the_run(&CHURNED, &mut *b, &run, t, &how);
+            }
+            assert!(encoded(copy) == run.bytes[t as usize], "the copy at {t} encodes its bytes");
+        }
+    }
+}
+
+#[test]
+fn a_copy_restored_into_the_backend_that_stepped_on_from_it_steps_as_the_first_time() {
+    for threads in [1, 2, 4] {
+        let (_, run) = live(&CHURNED, threads);
+        let mut b = backend(threads);
+        (CHURNED.build)(&mut *b);
+        let (mut t, mut restored) = (0, 0);
+        while t + SPAN <= CHURNED.ticks {
+            if t.is_multiple_of(30) {
+                let copy = b.copy().unwrap();
+                let how = format!("{threads} threads, stepped on from a copy");
+                steps_as_the_run(&CHURNED, &mut *b, &run, t, &how);
+                b.restore_copy(&*copy).unwrap();
+                let how = format!("{threads} threads, the copy restored after stepping on");
+                steps_as_the_run(&CHURNED, &mut *b, &run, t, &how);
+                restored += 1;
+                t += SPAN;
+            } else {
+                let seen = scripted(&CHURNED, &mut *b, t + 1);
+                t += 1;
+                assert!(seen == run.reports[t as usize], "{threads} threads: tick {t}");
+            }
+        }
+        assert!(restored >= 10, "restored at {restored} points");
+    }
 }

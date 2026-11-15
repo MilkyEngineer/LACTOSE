@@ -538,11 +538,19 @@ gather compare it with the last tick they covered, and zero means never.
   nothing of the world it replaces; there is no `set_collider` replay and no
   fixed-collider reconciliation. A copy is refused when taken for what the backend's write
   would refuse of its world, so its `encode` cannot fail; a backend recognises its own copy
-  by upcasting to `&dyn Any` and downcasting, and refuses another's with `InvalidData`. The
-  defaults of `copy` and `restore_copy` go through the bytes, so the test backend's
-  snapshot is its bytes. The byte form stays the backend's contract: `setup` keeps the
-  empty world's bytes and the sync restores them into an emptied solver (D124), a journal
-  checkpoint carries bytes, and `hash` is of the bytes. This crate's part is its bookkeeping and the sync's
+  by upcasting to `&dyn Any` and downcasting. The defaults of `copy` and `restore_copy` go
+  through the bytes, so the test backend's snapshot is its bytes: the default accepts any
+  copy whose bytes `restore` accepts, whichever backend took it; an override may refuse
+  every copy it did not take (Rapier's refuses with `InvalidData` every copy but its own,
+  the default's included), so a wrapper forwards both `copy` and `restore_copy` or
+  neither. A copy need not weigh what the bytes do: Rapier's carries the world's history
+  as well as the world (`crates/physics-rapier/README.md`, "The copy"). Holding a
+  `Box<dyn BackendCopy>`, a `PhysicsSnapshot` is `Send + Sync` but neither `UnwindSafe`
+  nor `RefUnwindSafe`, which it was while it held bytes: Rapier's shapes and workspaces
+  are trait objects that are neither, so the copy cannot promise them. The byte form
+  stays the backend's contract: `setup` keeps the empty world's bytes and the sync
+  restores them into an emptied solver (D124), a journal checkpoint carries bytes, and
+  `hash` is of the bytes. This crate's part is its bookkeeping and the sync's
   pending work: which rows are bodies with their handles and which of them are frozen,
   which rows are joints with the value and the bodies each was created from, the waiting
   joints, the region modes, the aliases and the predicted bodies not yet bound, `written`,

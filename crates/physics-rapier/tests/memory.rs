@@ -1,11 +1,12 @@
 //! What a prediction slot holds in memory (D143), which `SlotBytes` no longer reports: a
 //! ring's worth of world and physics snapshots of a prediction world with this backend,
-//! counted by the tagged global allocator this test binary installs, across every tag and
-//! thread, against the bytes the backend would write. The scene is criterion 5's shape:
-//! fifty claimed bodies thrown into contact among five fixed colliders and 59 proxies.
-//! The figures are printed; what is asserted is that asking a snapshot its size and hash
-//! keeps less than one encoding, and that dropping the slots gives back all but less than
-//! one slot, the slack being what the harness's idle workers may allocate meanwhile.
+//! counted by the tagged global allocator this test binary installs, under a tag the test
+//! thread alone holds and across every tag, against the bytes the backend would write. The
+//! scene is criterion 5's shape, not its scene: fifty claimed bodies thrown into contact
+//! among five fixed colliders and 59 proxies. The figures are printed; what is asserted,
+//! on the test thread's tag, is that asking a snapshot its size and hash leaves its live
+//! bytes where the take put them, and that dropping the slots returns them exactly to
+//! where they started.
 
 #![forbid(unsafe_code)]
 // A binary that installs `TaggedAlloc` runs under Miri only with Tree Borrows
@@ -87,53 +88,54 @@ fn a_ring_of_slots_holds_its_copies_and_gives_them_back() {
     let h = thrown();
     let world = h.world();
 
-    let before = live();
+    // Every take, ask and drop below runs on this thread under a tag no other thread of
+    // this binary uses, so the tag's counters see this test's allocations alone. The
+    // all-tag figures are printed beside them, not asserted: once, under SOUR's layout and
+    // chaos modes, they held 48 bytes more after the asking, and the first review saw no
+    // other thread allocate in 81 processes, so that cause is unknown.
+    let _tag = AllocTag::Tools.scope();
+    let tagged = || {
+        let stats = ALLOCATOR.stats(AllocTag::Tools);
+        (stats.live_bytes, stats.live_allocations)
+    };
+    let before = (tagged(), live());
     let worlds: Vec<_> = (0..SLOTS).map(|_| world.snapshot()).collect();
-    let with_worlds = live();
+    let with_worlds = (tagged(), live());
     let physics: Vec<_> =
         (0..SLOTS).map(|_| lactose_physics_api::snapshot(world).unwrap()).collect();
-    let with_physics = live();
+    let with_physics = (tagged(), live());
 
-    // Asking the size and the hash encodes each copy once and keeps two numbers. The
-    // harness's idle workers may allocate meanwhile, so what is asserted is that less than
-    // one slot's bytes stayed, where keeping the encodings would keep sixty.
+    // Asking the size and the hash encodes each copy once and keeps two numbers.
     let written: usize = physics.iter().map(|taken| taken.size_in_bytes()).sum();
     assert!(physics.iter().all(|taken| taken.hash() == physics[0].hash()), "equal worlds");
-    let one_encoding = written / SLOTS;
-    assert!(
-        grown(with_physics, live()) < one_encoding,
-        "the encoded bytes are not kept: {} bytes more after asking",
-        grown(with_physics, live())
-    );
+    let asked = (tagged(), live());
+    assert_eq!(asked.0, with_physics.0, "asking keeps none of the encoded bytes");
 
     let per_slot = |(bytes, count): (usize, usize), (from_bytes, from_count): (usize, usize)| {
         ((bytes - from_bytes) / SLOTS, (count - from_count) / SLOTS)
     };
-    let (world_bytes, world_allocations) = per_slot(with_worlds, before);
-    let (physics_bytes, physics_allocations) = per_slot(with_physics, with_worlds);
+    let (world_bytes, world_allocations) = per_slot(with_worlds.0, before.0);
+    let (physics_bytes, physics_allocations) = per_slot(with_physics.0, with_worlds.0);
+    let (all_world_bytes, all_world_allocations) = per_slot(with_worlds.1, before.1);
+    let (all_physics_bytes, all_physics_allocations) = per_slot(with_physics.1, with_worlds.1);
+    let kept_by_asking = asked.1.0.cast_signed() - with_physics.1.0.cast_signed();
     println!("memory: slots {SLOTS} claimed {CLAIMED} fixed 5 proxies {PROXIES}");
     println!(
         "memory: world snapshot {world_bytes} bytes in {world_allocations} allocations per \
-         slot, size_in_bytes {}",
+         slot (every tag: {all_world_bytes} in {all_world_allocations}), size_in_bytes {}",
         worlds[0].size_in_bytes()
     );
     println!(
         "memory: physics snapshot {physics_bytes} bytes in {physics_allocations} allocations \
-         per slot (the backend's copy and physics-api's bookkeeping), size_in_bytes \
-         {one_encoding}"
+         per slot (every tag: {all_physics_bytes} in {all_physics_allocations}; the backend's \
+         copy and physics-api's bookkeeping), size_in_bytes {}",
+        written / SLOTS
     );
+    println!("memory: every tag after asking the size and hash, {kept_by_asking} bytes more");
     assert!(physics_bytes > 0 && physics_allocations > 0);
 
-    // Given back to within less than one slot: a slot kept by anything would stay whole.
     drop(physics);
-    let kept = grown(with_worlds, live());
-    assert!(kept < physics_bytes, "the physics snapshots give back all they held: {kept} kept");
+    assert_eq!(tagged(), with_worlds.0, "the physics snapshots give back all they held");
     drop(worlds);
-    let kept = grown(before, live());
-    assert!(kept < world_bytes, "the world snapshots give back all they held: {kept} kept");
-}
-
-/// How many live bytes `now` holds beyond `then`, zero if fewer.
-fn grown((then, _): (usize, usize), (now, _): (usize, usize)) -> usize {
-    now.saturating_sub(then)
+    assert_eq!(tagged(), before.0, "the world snapshots give back all they held");
 }

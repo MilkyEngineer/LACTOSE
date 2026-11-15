@@ -265,7 +265,15 @@ pub trait PhysicsBackend: Send + Sync + 'static {
     /// and whose [`BackendCopy::encode`] writes the bytes [`snapshot`](Self::snapshot)
     /// writes now. Refuses what `snapshot` refuses of the world's data, with the same
     /// error, so that encoding the copy later cannot fail. The default copies the bytes; a
-    /// backend overrides it with whatever is cheaper to take and to drop than to encode.
+    /// backend overrides it with a copy that is cheaper to take and to drop than the bytes
+    /// are to write, which holds only of the worlds it is measured on: a whole clone keeps
+    /// what the bytes leave out. Rapier's copy clones the narrow phase's pool of up to 2,048
+    /// retired contact pairs, which a restore from bytes empties and a restore from a copy
+    /// keeps, and each arena's freed slots at full size, so on a churned world it weighs the
+    /// world's history (1.88 MB against 138 kB of bytes in the first review's probe
+    /// `slot_copy_review_history`, taken in 189 µs and dropped in 111 µs where the write took
+    /// 179 µs, at a one-minute load of 10; `lactose-physics-rapier`'s README, "The copy";
+    /// D143).
     fn copy(&self) -> Result<Box<dyn BackendCopy>> {
         let mut bytes = Vec::new();
         self.snapshot(&mut bytes)?;
@@ -275,10 +283,11 @@ pub trait PhysicsBackend: Send + Sync + 'static {
     /// Replaces the whole physics world with `copy`, as [`restore`](Self::restore) of its
     /// bytes would: the world afterwards steps, reports and writes bytes exactly as one
     /// restored from them does, so nothing of the world it replaces (a solver cache, a
-    /// workspace) survives. `InvalidData` for a copy another backend type took, leaving the
-    /// world unchanged. The default restores the copy's bytes, encoding them first unless
-    /// the default `copy` took it, so a copy of another type is refused as `restore`
-    /// refuses bytes that are not its own.
+    /// workspace) survives. A refusal leaves the world unchanged. The default accepts any
+    /// copy whose bytes this backend's `restore` accepts, whichever backend took it: it
+    /// restores the default copy's bytes, and encodes any other copy and restores those. An
+    /// override may refuse every copy it did not take, so a wrapper forwards both `copy`
+    /// and `restore_copy` or neither.
     fn restore_copy(&mut self, copy: &dyn BackendCopy) -> Result<()> {
         let any: &dyn Any = copy;
         if let Some(SnapshotBytes(bytes)) = any.downcast_ref::<SnapshotBytes>() {

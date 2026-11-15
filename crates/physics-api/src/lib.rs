@@ -101,6 +101,8 @@ const _: () = {
     const fn error<E: std::error::Error + Copy + Send + Sync + 'static>() {}
 
     send_sync::<Physics>();
+    // Only these two: holding the backend's copy (D143), a snapshot is neither `UnwindSafe`
+    // nor `RefUnwindSafe`, since Rapier's shapes and workspaces are trait objects that are not.
     send_sync::<PhysicsSnapshot>();
     send_sync::<PhysicsCommand>();
     send_sync::<StepOutput>();

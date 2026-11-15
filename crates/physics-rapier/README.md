@@ -198,10 +198,11 @@ order.
 
 ## The copy
 
-What a prediction slot holds (D143): `PhysicsBackend::copy` clones every part of the world
-the bytes carry, and the bookkeeping, built by destructuring Rapier's `PhysicsWorld` with
-every field named, so that a field a Rapier bump adds fails the build. The pipelines and the
-CCD solver are left out, as the bytes leave them out.
+What a prediction slot holds (D143): `PhysicsBackend::copy` clones every set of Rapier's
+`PhysicsWorld` whole, and the bookkeeping, built by destructuring `PhysicsWorld` with every
+field named, so that a field a Rapier bump adds fails the build. The pipelines and the CCD
+solver are left out, as the bytes leave them out. A whole clone carries more than the bytes
+do ("What it weighs" below).
 
 - **Shapes are shared.** A collider's `SharedShape` is an `Arc`, and a shape is never
   changed once built (`set_collider` builds a new one), so the copy shares each shape with
@@ -219,20 +220,41 @@ CCD solver are left out, as the bytes leave them out.
   with a fresh physics pipeline, collision pipeline and CCD solver on the backend's pool, as a
   restore from bytes builds: the solver keeps caches keyed by the island manager's
   active-set epoch, which a restored world can repeat, and a restore that kept the live
-  pipeline stepped apart in 6 of 52 restores of the first review's probe. A copy another
-  backend type took is refused with `InvalidData`, the world unchanged. No check of the
-  bookkeeping against the world is made, since a copy is never read from outside.
+  pipeline stepped apart in 6 of 52 restores of the first review's probe. Every copy but
+  this backend's own is refused with `InvalidData`, the world unchanged, the copy
+  `PhysicsBackend`'s default takes included, so a wrapper over this backend forwards both
+  `copy` and `restore_copy` or neither. No check of the bookkeeping against the world is
+  made, since a copy is never read from outside.
 - **What it weighs.** The copy is larger than the bytes and takes many allocations where the
   bytes took one, so a ring of copies pays for each take and for the drop of the slot it
-  evicts. `tests/memory.rs` counts it under the tagged allocator; `SlotBytes` reports the
-  bytes the backend would write, not this.
+  evicts. It also weighs the world's history, which the bytes never carried: the narrow
+  phase keeps a pool of up to 2,048 retired contact pairs for reuse, about 486 bytes and one
+  allocation each, which the bytes skip, so a restore from bytes empties it and a restore
+  from a copy clones it back into the live world, where it survives every rollback; and each
+  arena keeps its freed slots at full size, where the bytes encode them compactly. On a
+  fresh world the copy is cheaper than the write; on a churned one it is not. In the first
+  review's probe `slot_copy_review_history` (fifty balls thrown in a walled box, beside which
+  a block of 300 floating balls scattered and was removed, leaving 2,026 retired pairs; load
+  averages 9.98 24.83 27.45), the plain scene's copy held
+  274 kB in 511 allocations against 127 kB of bytes, taken in 25.1 µs and dropped in
+  11.8 µs where the write took 132 µs; the churned world's held 1.88 MB in 2,504
+  allocations against 138 kB of bytes, taken in 188.7 µs and dropped in 110.7 µs where the
+  write took 179.2 µs. Criterion 5's scene holds 75 to 86 retired pairs. The pool is
+  upstream Rapier's, and emptying it on a clone would be a vendored optimisation, which
+  architecture section 8.2 does not admit (D143). `tests/memory.rs` counts a slot under the
+  tagged allocator; `SlotBytes` reports the bytes the backend would write, not this.
 
 `tests/copy.rs` holds that a backend restored from a copy steps as one restored from the
 bytes and as the run it was taken from, from every point of a 420-tick scene, twelve ticks
 on, on pools of one, two and four threads: joints of every kind made and removed, sleeping
 bodies woken by a write and by a body dropped on them, a shape replaced while older copies
 share the old one, and copies restored newest first into the live backend. A restore that
-keeps the live pipeline fails it.
+keeps the live pipeline fails it. On a second scene that churns its contact pairs (bodies
+dropped and removed every few ticks, a tower of eighty boxes removed whole and rebuilt,
+joints made and removed, freezes, type switches and shape swaps), the same file holds that
+a copy taken on one pool size restores on the others, that one copy restored twice into a
+backend steps the same both times and still encodes its bytes, and that a copy taken, the
+backend stepped on, and the copy restored steps as the first time.
 
 ## Known gaps
 

@@ -2481,7 +2481,11 @@ fn client_frame(
         end.predicted.insert(tick, (client.hash()?, hop));
     }
     if n.is_multiple_of(30) {
-        // A write of each slot not yet encoded: it reads the copies and changes no state.
+        // A backend write of each slot not yet encoded (D143): it reads the copies and
+        // changes no state, but costs about 11 ms a call on the thrown replays (1,258 calls,
+        // 13.6 s, in a ten-minute server-clock replay in the first review's probe), which
+        // lands in the replay's `wall_s` and in no rollback timer. Every 30 frames keeps the
+        // ring's peak figure what it was before the copy.
         let ring = client.predictor().ring().bytes();
         let ring_bytes = &mut outcome.ring_bytes;
         ring_bytes.world = ring_bytes.world.max(ring.world);

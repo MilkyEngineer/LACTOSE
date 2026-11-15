@@ -258,10 +258,17 @@ impl postcard::ser_flavors::Flavor for Append<'_> {
     }
 }
 
-/// The copy a prediction slot holds (`README.md`, "The copy"; D143): every part of the
-/// world the bytes carry, and the bookkeeping, cloned, each collider's shape shared with
-/// the world it was taken of, since a shape is never changed once built. The pipelines and
-/// the CCD solver are workspace, as the bytes treat them, and are not copied.
+/// The copy a prediction slot holds (`README.md`, "The copy"; D143): every set of the world
+/// cloned whole, and the bookkeeping, each collider's shape shared with the world it was
+/// taken of, since a shape is never changed once built. The pipelines and the CCD solver
+/// are workspace, as the bytes treat them, and are not copied.
+///
+/// A whole clone carries what the bytes skip: the narrow phase's pool of up to 2,048
+/// retired contact pairs, which a restore from bytes empties and a restore from a copy
+/// keeps, and each arena's freed slots at full size. So a copy weighs the world's history
+/// as well as the world: in the first review's probe `slot_copy_review_history`, a world
+/// that churned 2,026 pairs held 1.88 MB in 2,504 allocations against 138 kB of bytes,
+/// taken in 189 µs and dropped in 111 µs where the write took 179 µs (one-minute load 10).
 pub(crate) struct WorldCopy {
     book: Book,
     gravity: Vector,
