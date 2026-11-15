@@ -39,13 +39,13 @@ use lactose_task::ChaosConfig;
 use protocol::{Capacity, Layout, Recorder, RunConfig, Session};
 
 /// What a test builds from its session, and reports back.
-struct Sour {
+struct SessionSetup {
     session: Session,
     executor: Executor,
     layout: LayoutConfig,
 }
 
-impl Sour {
+impl SessionSetup {
     /// Reads the session and builds the executor and layout it asks for.
     fn from_env() -> Result<Self> {
         let session = Session::from_env().map_err(protocol_error)?;
@@ -252,7 +252,7 @@ fn scene(kind: WorldKind, layout: LayoutConfig) -> Harness {
 /// One step of the scene: the second region's freeze and thaw through `world_mut`, then the
 /// step, recorded.
 fn step(
-    sour: &Sour,
+    setup: &SessionSetup,
     mut simulation: Simulation,
     record: &mut dyn FnMut(lactose_core::Tick, u64) -> Result<()>,
 ) -> Result<Simulation> {
@@ -262,18 +262,18 @@ fn step(
     } else if next == 95 {
         simulation.world_mut().set_region_mode(OTHER_REGION, RegionMode::Simulated)?;
     }
-    run_recorded(&sour.executor, simulation, [TickInput::default()], record)
+    run_recorded(&setup.executor, simulation, [TickInput::default()], record)
 }
 
 fn record_scene(test: &str, kind: WorldKind) -> Result<()> {
-    let sour = Sour::from_env()?;
-    let Harness { mut simulation, .. } = scene(kind, sour.layout);
-    let mut recorder = sour.recorder(test, simulation.world().layout())?;
+    let setup = SessionSetup::from_env()?;
+    let Harness { mut simulation, .. } = scene(kind, setup.layout);
+    let mut recorder = setup.recorder(test, simulation.world().layout())?;
     let mut record =
         |tick: lactose_core::Tick, hash: u64| recorder.record(tick.0, hash).map_err(protocol_error);
     let mut saved = None;
     for tick in 1..=TICKS {
-        simulation = step(&sour, simulation, &mut record)?;
+        simulation = step(&setup, simulation, &mut record)?;
         if kind == WorldKind::Prediction && tick == ROLLBACK_TICK {
             saved = Some((simulation.world().snapshot(), snapshot(simulation.world())?));
         }
@@ -285,10 +285,10 @@ fn record_scene(test: &str, kind: WorldKind) -> Result<()> {
         restore(simulation.world_mut(), &physics_snapshot)?;
         corrected(simulation.world_mut(), &[sphere_key(3), key(BONE_A)])?;
         while simulation.tick().0 < TICKS {
-            simulation = step(&sour, simulation, &mut record)?;
+            simulation = step(&setup, simulation, &mut record)?;
         }
     }
-    sour.finish(test)
+    setup.finish(test)
 }
 
 #[test]
@@ -362,13 +362,13 @@ fn the_rolled_back_scene_ends_where_the_straight_one_does() {
 #[test]
 fn the_conformance_run() {
     let test = "lactose_physics_rapier::sour::the_conformance_run";
-    let sour = Sour::from_env().unwrap();
+    let setup = SessionSetup::from_env().unwrap();
     let config = PhysicsConfig::default();
     let report =
-        conformance::snapshot_restore(&sour.executor, backend(), config, sour.layout).unwrap();
+        conformance::snapshot_restore(&setup.executor, backend(), config, setup.layout).unwrap();
     // `snapshot_restore` builds the world and refuses one that reports another layout than
     // the one it was given, so that one is the layout the run applied.
-    let mut recorder = sour.recorder(test, &sour.layout).unwrap();
+    let mut recorder = setup.recorder(test, &setup.layout).unwrap();
     let ticks: Vec<u32> = report.first.iter().map(|&(tick, _)| tick.0).collect();
     assert_eq!(ticks, (1..=conformance::TICKS).collect::<Vec<_>>());
     for &(tick, hash) in &report.first {
@@ -376,7 +376,7 @@ fn the_conformance_run() {
     }
     let bytes = report.physics_hash.0;
     recorder.record(conformance::TICKS + 1, bytes).map_err(protocol_error).unwrap();
-    sour.finish(test).unwrap();
+    setup.finish(test).unwrap();
 }
 
 const HINGE_BASE: u64 = 2;
@@ -443,9 +443,9 @@ fn hinge_angle(world: &World) -> Scalar {
 #[test]
 fn a_limited_hinge_driven_against_its_limits() {
     let test = "lactose_physics_rapier::sour::a_limited_hinge_driven_against_its_limits";
-    let sour = Sour::from_env().unwrap();
-    let Harness { mut simulation, .. } = hinge_scene(sour.layout);
-    let mut recorder = sour.recorder(test, simulation.world().layout()).unwrap();
+    let setup = SessionSetup::from_env().unwrap();
+    let Harness { mut simulation, .. } = hinge_scene(setup.layout);
+    let mut recorder = setup.recorder(test, simulation.world().layout()).unwrap();
     let mut record =
         |tick: lactose_core::Tick, hash: u64| recorder.record(tick.0, hash).map_err(protocol_error);
     let (lo, hi) = (Scalar::from_f64(HINGE_LIMITS.0), Scalar::from_f64(HINGE_LIMITS.1));
@@ -454,14 +454,14 @@ fn a_limited_hinge_driven_against_its_limits() {
     let (mut at_lo, mut at_hi) = (0, 0);
     for _ in 0..TICKS {
         simulation =
-            run_recorded(&sour.executor, simulation, [TickInput::default()], &mut record).unwrap();
+            run_recorded(&setup.executor, simulation, [TickInput::default()], &mut record).unwrap();
         let angle = hinge_angle(simulation.world());
         lowest = lowest.min(angle);
         highest = highest.max(angle);
         at_lo += usize::from((angle - lo).abs() < near);
         at_hi += usize::from((angle - hi).abs() < near);
     }
-    sour.finish(test).unwrap();
+    setup.finish(test).unwrap();
     println!(
         "hinge: from {lowest:?} to {highest:?}; {at_lo} ticks at the lower limit, \
          {at_hi} at the upper"

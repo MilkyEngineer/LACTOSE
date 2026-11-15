@@ -690,7 +690,7 @@ milestone 1" changes but the one named in the last row.
 ## Proof for milestone 1
 
 The crate is listed under `[harness]` in `tools/xtask/ci-policy.toml`: its reload tests
-step a simulation, so they record under SOUR (`tests/sour/mod.rs` is the glue). The tests:
+step a simulation, so they record under SOUR (`tests/glue/mod.rs` is the glue). The tests:
 
 | What | How |
 |---|---|

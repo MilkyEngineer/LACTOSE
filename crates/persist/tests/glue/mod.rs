@@ -28,7 +28,7 @@ use protocol::{Capacity, Layout, RunConfig, Session};
 pub use protocol::Recorder;
 
 /// What a test builds from its session.
-pub struct Sour {
+pub struct SessionSetup {
     session: Session,
     /// The executor the session asks for: its worker count and chaos seed.
     pub executor: Executor,
@@ -36,7 +36,7 @@ pub struct Sour {
     pub layout: LayoutConfig,
 }
 
-impl Sour {
+impl SessionSetup {
     /// Reads the session and builds the executor and layout it asks for.
     pub fn from_env() -> Result<Self> {
         let session = Session::from_env().map_err(protocol_error)?;

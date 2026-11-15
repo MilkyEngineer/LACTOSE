@@ -150,7 +150,7 @@ fn damage_is_a_failure_with_the_claimed_version_and_the_rest_of_the_pack_loads()
         let handle = store.newest(high).ready().unwrap();
         assert_eq!(handle.version(), intact.version(), "{what}");
 
-        let warned = capture.silo_events(warns, Level::WARN);
+        let warned = capture.store_events(warns, Level::WARN);
         let asset = format!("{:#018x}", low.to_bits());
         assert_eq!(warned.len(), 1, "{what}: {warned:#?}");
         assert_eq!(warned[0].fields.get("asset"), Some(&asset));

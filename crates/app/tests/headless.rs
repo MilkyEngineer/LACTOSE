@@ -284,8 +284,8 @@ static SKETCH_BODY: CrateRegistration = CrateRegistration {
 /// The sketch with a body: player 1 joins as a dynamic sphere, claimed and anchored, that
 /// falls under gravity while its input steers it, so the solver pool (sized from the
 /// workers SOUR's modes vary) and the input applier both enter the hash.
-static SOUR_GAME: Game = Game {
-    name: "sketch-sour",
+static STEERED_GAME: Game = Game {
+    name: "sketch-steered",
     crates: &[SKETCH_SIM, SKETCH_BODY],
     order: None,
     sessions: Some(bodies),
@@ -326,7 +326,7 @@ fn sample(tick: Tick) -> PlayerInput {
 }
 
 /// `frames`, with player 1's sample in every tick's frame.
-fn sour_frames(cooked: Arc<InMemory>) -> Result<Box<dyn FnMut(Tick) -> TickInput + Send>> {
+fn steered_frames(cooked: Arc<InMemory>) -> Result<Box<dyn FnMut(Tick) -> TickInput + Send>> {
     let mut frames = frames(cooked)?;
     Ok(Box::new(move |tick| {
         let mut input = frames(tick);
@@ -337,13 +337,13 @@ fn sour_frames(cooked: Arc<InMemory>) -> Result<Box<dyn FnMut(Tick) -> TickInput
     }))
 }
 
-/// Runs `ticks` ticks of [`SOUR_GAME`] under the runner's session, one `step` each,
+/// Runs `ticks` ticks of [`STEERED_GAME`] under the runner's session, one `step` each,
 /// recording the hash after every tick and the chaos log at the end:
 /// `lactose_sim::harness::run_recorded`'s shape, over the assembly instead of a bare
 /// simulation. A refused bundle or session event is the step's output and fails the test;
 /// so does a body the input did not steer or the solver did not move, which every mode
 /// would agree on. Outside the runner the session is production and nothing is recorded.
-fn sour_run(test: &str, ticks: u32) -> Result<()> {
+fn recorded_run(test: &str, ticks: u32) -> Result<()> {
     let session = Session::from_env().map_err(protocol_error)?;
     let config = *session.config();
     let layout = match config.layout {
@@ -364,7 +364,7 @@ fn sour_run(test: &str, ticks: u32) -> Result<()> {
     let config_applied = HeadlessConfig { workers, world, start: Start::Fresh, saves: None };
     let cooked = Arc::new(InMemory::new(RegionId(1))?);
     let cooked_dyn = Arc::clone(&cooked) as Arc<dyn Cooked>;
-    let mut app = Headless::start(&SOUR_GAME, config_applied, cooked_dyn)?;
+    let mut app = Headless::start(&STEERED_GAME, config_applied, cooked_dyn)?;
     // What the assembly built, as its world and executor report it, never the session's
     // request: a world the assembly built under another layout fails the runner's check.
     let world = app.server().expect("a started app has its server").simulation().world();
@@ -376,7 +376,7 @@ fn sour_run(test: &str, ticks: u32) -> Result<()> {
         chaos_seed: app.executor().chaos_config().map(|chaos| chaos.seed),
     };
     let mut recorder = session.recorder(test, &applied).map_err(protocol_error)?;
-    let mut frames = sour_frames(cooked)?;
+    let mut frames = steered_frames(cooked)?;
     for _ in 0..ticks {
         let next = Tick(app.tick().0 + 1);
         let out: StepOutput = app.step(frames(next))?;
@@ -430,8 +430,8 @@ fn chaos(seed: u64) -> ChaosConfig {
 }
 
 #[test]
-fn a_headless_run_under_sour() {
-    sour_run("lactose_app::headless::a_headless_run_under_sour", 120).unwrap();
+fn a_recorded_headless_run() {
+    recorded_run("lactose_app::headless::a_recorded_headless_run", 120).unwrap();
 }
 
 // ---- 5. The headless app's proof ----
