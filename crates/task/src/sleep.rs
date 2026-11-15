@@ -40,9 +40,16 @@ const TIMER_STEP: f64 = if cfg!(any(feature = "loom", miri)) { 1.0 } else { 0.6 
 
 /// How close to a deadline a timed park stops parking and spins instead, re-checking its
 /// bit. About 11 µs of spinning per tick at 60 Hz, which is what puts the wake within a
-/// few microseconds of the deadline.
-const TIMER_SPIN: Duration =
-    Duration::from_micros(if cfg!(any(feature = "loom", miri)) { 0 } else { 50 });
+/// few microseconds of the deadline. On Windows 500 µs: the high-resolution timer that ends
+/// a wait there overshoots by about half a millisecond, so the last wait must be asked to end
+/// that far ahead (D144).
+const TIMER_SPIN: Duration = Duration::from_micros(if cfg!(any(feature = "loom", miri)) {
+    0
+} else if cfg!(windows) {
+    500
+} else {
+    50
+});
 
 /// The sleep state of one worker pool.
 pub(crate) struct Sleep {

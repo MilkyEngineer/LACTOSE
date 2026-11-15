@@ -151,9 +151,10 @@ and list what changed, because `lactose-ecs` is written against this surface.
 - There is no timer thread. Frame-critical workers fire due timers when they look for work,
   and one sleeping worker at a time, the keeper, parks only until the earliest deadline.
   On Windows its timed wait is a high-resolution waitable timer beside an event that a waker
-  sets, because `std::thread::park_timeout` there waits in whole milliseconds on the system's
-  15.6 ms timer tick (D144); a worker whose event or timer cannot be made keeps
-  `park_timeout`.
+  sets, and it spins the last 500 µs before a deadline, because `std::thread::park_timeout`
+  there waits in whole milliseconds on the system's 15.6 ms timer tick and the finer timer
+  overshoots by about half a millisecond (D144); a worker whose event or timer cannot be made
+  keeps `park_timeout`.
   A worker that fires timers wakes the ones due when it looks in deadline order, ties in the
   order they were registered; workers that fire at the same time interleave theirs. That
   orders one worker's wake-ups, not the tasks: a woken task is scheduled as below, and a
