@@ -124,6 +124,62 @@ fn an_impulse_in_the_tick_of_a_creation_or_a_mass_change_sees_the_new_mass() {
     }
 }
 
+/// D145: a body that gains an offset, tilted collider steps, from that tick on, as one
+/// created with it. `Rapier::update` inserts the gained collider while the body still holds
+/// the unit ball's mass, and the sum of the two runs glamx's eigen decomposition, which
+/// reaches the platform's `acos` and `cos`; the same call ends by rebuilding the mass from
+/// zero, which discards the sum. The push in the gaining tick is what a dropped closing
+/// rebuild needs: Rapier rebuilds the mass at the start of the step anyway, so only the
+/// commands applied between the two meet the sum. The landing shows a kept sum in the
+/// contact as well.
+#[test]
+fn a_body_that_gains_an_offset_tilted_collider_steps_as_one_created_with_it() {
+    const BODY: u64 = 2;
+    const GAIN: u32 = 6;
+    const END: u32 = 180;
+    let mut tilted = Collider::new(Shape::cuboid(v(0.5, 0.2, 0.1))).with_offset(v(0.3, 0.2, 0.1));
+    tilted.rotation = Quat::from_axis_angle(v(1.0, 2.0, 3.0).normalize(), s(0.7));
+    let (mut gaining, mut control) = (backend(1), backend(1));
+    for b in [&mut gaining, &mut control] {
+        create(&mut **b, key(FLOOR), None, Some(floor()), Transform::IDENTITY);
+    }
+    create(&mut *gaining, key(BODY), Some(RigidBody::dynamic()), None, at(0.0, 3.0, 0.0));
+    let mut fell = None;
+    for tick in 1..GAIN {
+        fell = state(&step(&mut *gaining, tick, &[]), key(BODY));
+        step(&mut *control, tick, &[]);
+    }
+    let fell = fell.expect("the bare body falls and is reported");
+    gaining.set_collider(key(BODY), Some(&tilted));
+    let desc = BodyDesc {
+        body: Some(RigidBody::dynamic()),
+        collider: Some(&tilted),
+        transform: &fell.transform,
+        velocity: Some(&fell.velocity),
+        frozen: false,
+    };
+    control.create_body(key(BODY), &desc).unwrap();
+    let push = [
+        PhysicsCommand::ApplyImpulse { body: key(BODY), impulse: v(0.05, 0.1, 0.02) },
+        PhysicsCommand::ApplyTorqueImpulse { body: key(BODY), torque: v(0.003, -0.002, 0.004) },
+    ];
+    let (mut before, mut landed) = (None, false);
+    for tick in GAIN..=END {
+        let commands: &[PhysicsCommand] = if tick == GAIN { &push } else { &[] };
+        let (got, want) =
+            (step(&mut *gaining, tick, commands), step(&mut *control, tick, commands));
+        assert!(Seen::from(&got) == Seen::from(&want), "tick {tick}: {got:?} against {want:?}");
+        // Under gravity alone the vertical velocity only falls; once the push has spent
+        // itself, a rise is the floor's.
+        if let Some(reported) = state(&got, key(BODY)) {
+            let vy = reported.velocity.linear.y;
+            landed |= before.is_some_and(|earlier| vy > earlier);
+            before = Some(vy);
+        }
+    }
+    assert!(landed, "the pushed body never met the floor");
+}
+
 #[test]
 fn a_force_lasts_one_step_and_a_push_on_a_body_that_is_not_dynamic_is_dropped() {
     let mut b = backend(1);

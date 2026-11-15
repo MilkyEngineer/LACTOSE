@@ -600,11 +600,11 @@ gather compare it with the last tick they covered, and zero means never.
   as a copy, and these bytes stay for the fresh solver, the journal checkpoint and the hash
   (D143). `size_in_bytes` and `hash` are of the bytes the backend would write, not of what
   the copy weighs: the first call of either encodes the copy once, at the cost of one
-  backend write, and keeps the length and the hash, not the bytes. `hash` is the named place
-  where section 8.3 adds the bytes to the world hash; the backend's serialisation was shown
-  order-stable in nightly 43703297881 (`docs/verification.md`).
-  `ConformanceReport::physics_hash` reports it, `lactose-physics-rapier`'s SOUR test
-  `the_conformance_run` records its first value, and no world hash includes it yet.
+  backend write, and keeps the length and the hash, not the bytes. `hash` is what a
+  recording test records beside the world hash, never folded into it (section 8.3, D145);
+  the backend's serialisation was shown order-stable in nightly 43703297881
+  (`docs/verification.md`). `ConformanceReport::physics_hash` reports it,
+  `lactose-physics-rapier`'s SOUR test `the_conformance_run` records its first value.
 
 **The backend's obligations** (architecture sections 1, 2 and 8.2; the `PhysicsBackend`
 docs restate them per method)
@@ -674,8 +674,8 @@ docs restate them per method)
   and stop in one step; the events' order key already tells the two apart.
 - Lag compensation's history of transforms and colliders (architecture section 9.5):
   `net`'s, over the `Transform` and `Collider` rows, milestone 4.
-- Hashing the snapshot bytes into the world hash: `PhysicsSnapshot::hash` is the place;
-  the verification item decides when.
+- A fold of the snapshot bytes into the world hash: not built, by decision.
+  `PhysicsSnapshot::hash` is recorded beside it (D145).
 - A per-region body count and the contacts of one body between events: queries a game
   system has not asked for; `Physics::body_count` is the whole world's.
 

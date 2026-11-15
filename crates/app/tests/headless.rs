@@ -40,7 +40,7 @@ use lactose_ecs::{ClaimedBy, LayoutConfig, Mut, RegionId, RegionMode, World, sys
 use lactose_input::{AXIS_SCALE, Axis2, PlayerInput, Yaw, player_entity};
 use lactose_math::{Scalar, Vec3};
 use lactose_persist::Migrations;
-use lactose_physics_api::{Collider, RigidBody, Shape, Transform, Velocity};
+use lactose_physics_api::{Collider, RigidBody, Shape, Transform, Velocity, snapshot};
 use lactose_reflect::component;
 use lactose_sim::harness::{ChunkCapacity, layout_mode, layout_mode_of};
 use lactose_sim::{
@@ -340,9 +340,11 @@ fn steered_frames(cooked: Arc<InMemory>) -> Result<Box<dyn FnMut(Tick) -> TickIn
 /// Runs `ticks` ticks of [`STEERED_GAME`] under the runner's session, one `step` each,
 /// recording the hash after every tick and the chaos log at the end:
 /// `lactose_sim::harness::run_recorded`'s shape, over the assembly instead of a bare
-/// simulation. A refused bundle or session event is the step's output and fails the test;
-/// so does a body the input did not steer or the solver did not move, which every mode
-/// would agree on. Outside the runner the session is production and nothing is recorded.
+/// simulation. Beside it, as a stream of its own named as the test with `::physics`
+/// appended, `PhysicsSnapshot::hash` of the server's world after every tick (D145). A
+/// refused bundle or session event is the step's output and fails the test; so does a body
+/// the input did not steer or the solver did not move, which every mode would agree on.
+/// Outside the runner the session is production and nothing is recorded.
 fn recorded_run(test: &str, ticks: u32) -> Result<()> {
     let session = Session::from_env().map_err(protocol_error)?;
     let config = *session.config();
@@ -375,7 +377,9 @@ fn recorded_run(test: &str, ticks: u32) -> Result<()> {
         layout: applied_layout(world.layout())?,
         chaos_seed: app.executor().chaos_config().map(|chaos| chaos.seed),
     };
+    let physics_test = format!("{test}::physics");
     let mut recorder = session.recorder(test, &applied).map_err(protocol_error)?;
+    let mut physics = session.recorder(&physics_test, &applied).map_err(protocol_error)?;
     let mut frames = steered_frames(cooked)?;
     for _ in 0..ticks {
         let next = Tick(app.tick().0 + 1);
@@ -387,10 +391,14 @@ fn recorded_run(test: &str, ticks: u32) -> Result<()> {
             ));
         }
         recorder.record(app.tick().0, app.hash()?).map_err(protocol_error)?;
+        let world = app.server().expect("a started app has its server").simulation().world();
+        physics.record(app.tick().0, snapshot(world)?.hash()).map_err(protocol_error)?;
     }
     steered(&app, Tick(ticks))?;
     if let Some(log) = app.shutdown() {
-        session.write_execution_log(test, log.as_bytes()).map_err(protocol_error)?;
+        for name in [test, &physics_test] {
+            session.write_execution_log(name, log.as_bytes()).map_err(protocol_error)?;
+        }
     }
     Ok(())
 }

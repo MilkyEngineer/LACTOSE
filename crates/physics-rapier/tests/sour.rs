@@ -2,12 +2,14 @@
 //! with this backend in place of the test one, each built from the runner's session through
 //! the glue `lactose-sim`'s README shows (the protocol module by `#[path]`, the executor from
 //! `lactose-task`) and `physics-api`'s test harness by path, recording `(tick, hash)` after
-//! every step. The solver pool has two threads in every mode: the pool's size is not one of
-//! SOUR's axes, and `determinism.rs` and `conformance.rs` vary it. The prediction scene also
-//! rolls back and records the re-simulated ticks again, which the runner requires equal to
-//! the first run's. Beside them, `physics-api`'s conformance run with the hash of the
-//! backend's bytes, and a limited hinge driven against both its limits. Outside the runner
-//! the session is production and nothing is recorded.
+//! every step, and the hash of the backend's bytes after every step as a stream of its own,
+//! named as the test with `::physics` appended (D145). The solver pool has two threads in
+//! every mode: the pool's size is not one of SOUR's axes, and `determinism.rs` and
+//! `conformance.rs` vary it. The prediction scene also rolls back and records the
+//! re-simulated ticks again in both streams, which the runner requires equal to the first
+//! run's. Beside them, `physics-api`'s conformance run with the hash of the backend's bytes
+//! at its end, and a limited hinge driven against both its limits, with its own physics
+//! stream. Outside the runner the session is production and nothing is recorded.
 
 #![forbid(unsafe_code)]
 
@@ -103,14 +105,17 @@ impl SessionSetup {
         self.session.recorder(test, &applied).map_err(protocol_error)
     }
 
-    /// Writes the execution log a chaos run records.
+    /// Writes the execution log a chaos run records, under each name in `tests`: the runner
+    /// asks one of every name that records.
     #[expect(
         clippy::disallowed_methods,
         reason = "SOUR's glue is test code outside the step: it writes the chaos log"
     )]
-    fn finish(&self, test: &str) -> Result<()> {
+    fn finish(&self, tests: &[&str]) -> Result<()> {
         if let Some(log) = self.executor.execution_log() {
-            self.session.write_execution_log(test, log.as_bytes()).map_err(protocol_error)?;
+            for test in tests {
+                self.session.write_execution_log(test, log.as_bytes()).map_err(protocol_error)?;
+            }
         }
         Ok(())
     }
@@ -118,6 +123,20 @@ impl SessionSetup {
 
 fn protocol_error(error: protocol::ProtocolError) -> Error {
     Error::new(ErrorKind::InvalidData, error.to_string())
+}
+
+/// The name of the stream that records the hash of the backend's bytes beside `test`'s
+/// world hash (D145).
+fn physics_stream(test: &str) -> String {
+    format!("{test}::physics")
+}
+
+/// Records `PhysicsSnapshot::hash` of `simulation`'s world at its tick. A stream apart from
+/// the world hash, never folded into it (architecture section 8.3, D145): solver state that
+/// has not yet moved a row shows here at the tick it diverged.
+fn record_physics(recorder: &mut Recorder, simulation: &Simulation) -> Result<()> {
+    let hash = snapshot(simulation.world())?.hash();
+    recorder.record(simulation.tick().0, hash).map_err(protocol_error)
 }
 
 const TICKS: u32 = 150;
@@ -268,27 +287,31 @@ fn step(
 fn record_scene(test: &str, kind: WorldKind) -> Result<()> {
     let setup = SessionSetup::from_env()?;
     let Harness { mut simulation, .. } = scene(kind, setup.layout);
+    let physics_test = physics_stream(test);
     let mut recorder = setup.recorder(test, simulation.world().layout())?;
+    let mut physics = setup.recorder(&physics_test, simulation.world().layout())?;
     let mut record =
         |tick: lactose_core::Tick, hash: u64| recorder.record(tick.0, hash).map_err(protocol_error);
     let mut saved = None;
     for tick in 1..=TICKS {
         simulation = step(&setup, simulation, &mut record)?;
+        record_physics(&mut physics, &simulation)?;
         if kind == WorldKind::Prediction && tick == ROLLBACK_TICK {
             saved = Some((simulation.world().snapshot(), snapshot(simulation.world())?));
         }
     }
     if let Some((world_snapshot, physics_snapshot)) = saved {
         // A rollback to tick 30 and a re-simulation to the end: every re-simulated tick's
-        // hash is recorded again, and the runner requires it equal to the first one's.
+        // hashes are recorded again, and the runner requires them equal to the first one's.
         simulation.world_mut().restore(&world_snapshot)?;
         restore(simulation.world_mut(), &physics_snapshot)?;
         corrected(simulation.world_mut(), &[sphere_key(3), key(BONE_A)])?;
         while simulation.tick().0 < TICKS {
             simulation = step(&setup, simulation, &mut record)?;
+            record_physics(&mut physics, &simulation)?;
         }
     }
-    setup.finish(test)
+    setup.finish(&[test, &physics_test])
 }
 
 #[test]
@@ -376,7 +399,7 @@ fn the_conformance_run() {
     }
     let bytes = report.physics_hash.0;
     recorder.record(conformance::TICKS + 1, bytes).map_err(protocol_error).unwrap();
-    setup.finish(test).unwrap();
+    setup.finish(&[test]).unwrap();
 }
 
 const HINGE_BASE: u64 = 2;
@@ -437,15 +460,17 @@ fn hinge_angle(world: &World) -> Scalar {
     Scalar::TWO * z.atan2(w)
 }
 
-/// The hinge scene for [`TICKS`] ticks, recorded; the arm reaches each limit and stops
-/// there, so the limit rows enter the solve, and the run counts the ticks it spends within
-/// a hundredth of a radian of each.
+/// The hinge scene for [`TICKS`] ticks, recorded, with its physics stream; the arm reaches
+/// each limit and stops there, so the limit rows enter the solve, and the run counts the
+/// ticks it spends within a hundredth of a radian of each.
 #[test]
 fn a_limited_hinge_driven_against_its_limits() {
     let test = "lactose_physics_rapier::sour::a_limited_hinge_driven_against_its_limits";
+    let physics_test = physics_stream(test);
     let setup = SessionSetup::from_env().unwrap();
     let Harness { mut simulation, .. } = hinge_scene(setup.layout);
     let mut recorder = setup.recorder(test, simulation.world().layout()).unwrap();
+    let mut physics = setup.recorder(&physics_test, simulation.world().layout()).unwrap();
     let mut record =
         |tick: lactose_core::Tick, hash: u64| recorder.record(tick.0, hash).map_err(protocol_error);
     let (lo, hi) = (Scalar::from_f64(HINGE_LIMITS.0), Scalar::from_f64(HINGE_LIMITS.1));
@@ -455,13 +480,14 @@ fn a_limited_hinge_driven_against_its_limits() {
     for _ in 0..TICKS {
         simulation =
             run_recorded(&setup.executor, simulation, [TickInput::default()], &mut record).unwrap();
+        record_physics(&mut physics, &simulation).unwrap();
         let angle = hinge_angle(simulation.world());
         lowest = lowest.min(angle);
         highest = highest.max(angle);
         at_lo += usize::from((angle - lo).abs() < near);
         at_hi += usize::from((angle - hi).abs() < near);
     }
-    setup.finish(test).unwrap();
+    setup.finish(&[test, &physics_test]).unwrap();
     println!(
         "hinge: from {lowest:?} to {highest:?}; {at_lo} ticks at the lower limit, \
          {at_hi} at the upper"

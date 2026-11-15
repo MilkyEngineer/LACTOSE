@@ -711,8 +711,9 @@ another build.
   system wants ahead of any anchor".
 - Section 14's hold of a player at a region boundary until the client acknowledges
   readiness: `net`'s at milestone 4, with no field here.
-- Hashing `physics-api::snapshot` bytes into the world hash (architecture section 8.3).
-  Rapier's serialisation was shown order-stable in nightly 43703297881.
+- A fold of `physics-api::snapshot` bytes into the world hash: not built, by decision. A
+  recording test records `PhysicsSnapshot::hash` beside this crate's hash (architecture
+  section 8.3, D145).
 - The journal writer, reader and replay driver, and the digest tool that compares two
   digests across machines; the types are here.
 - Per-anchor streaming priority (`StreamingAnchor::priority` is zero) and streaming
