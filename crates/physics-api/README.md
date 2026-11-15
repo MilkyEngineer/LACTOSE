@@ -411,7 +411,8 @@ gather compare it with the last tick they covered, and zero means never.
   keeps cross-region references weak, and this one is validated at every sync).
 - Spawn a joint owned by one of its bodies (`OwnedBy`) so it migrates and despawns with
   it. Joint rows are `persistent, replicated`: a ragdoll's joints survive a save. They are
-  owned by its bone rows, which are the server's alone and never predicted (D128).
+  owned by its bone rows, which are the server's alone, so the prediction world has
+  none (D128).
 
 **Validity** (architecture sections 8.2 and 16; D135)
 

@@ -63,7 +63,7 @@ reshape.
 | `lactose-net` (client) | Nothing: the client never diffs | It caches overlays by digest as the bytes of `Overlay::encode` (`lactose-bundle`) and builds its bundle with `RegionRelevance::to_bundle` |
 | `lactose-sim` | Nothing new | `RegionExport` is the input, `RegionBundle` the output, `SavePoint::{tick, next_net_id}` the header's |
 | Game crates | A migration per schema version bump, as plain functions | `register_migrations(&mut Migrations)` beside `register_types`; `Migration { component, from, run }`; `FieldValues::{read, write, take, get, set}` ("The registration a game crate writes" below) |
-| The journal tooling (milestone 1) | A checkpoint's regions in the save's format; the server's binds at the checkpoint | `Journal::checkpoint` is a `SavePoint`: its regions are a `Container` under the checkpoint's header; `Journal::binds` is `Loader::binds` over the records of the server's save point, loaded and kept regions alike (D142); the journal's other fields (tables, modes, players, held joins, requests, services, frames) are the tooling's, beside it |
+| The journal tooling (milestone 1) | A checkpoint's regions in the save's format; the server's binds at the checkpoint | `Journal::checkpoint` is a `SavePoint`: its regions are a `Container` under the checkpoint's header; `Journal::binds` is `Loader::binds` over the records of the server's save point, loaded and kept regions alike (D142); the journal's other fields (tables, modes, players, held joins, requests, frames) are the tooling's, beside it, and `services`, where the checkpoint's physics snapshot goes, is not a field yet (D124, milestone 4) |
 | The section 15.5 tests and D124's reload paths | A real save and load behind every path | "Proof for milestone 1" below; `tests/sketch.rs` sections 4 and 5 |
 
 ## The registration a game crate writes
@@ -566,8 +566,8 @@ and 15.5; D124, D126)
   export, the region's `Arc<Baseline>` from the store and the shared `SchemaTable`; then
   `check_sections` over every region's records; then one `encode_section` task per region
   and one `assemble`; then the bytes are written to a temporary file beside the slot,
-  synced, and renamed over the slot, through `lactose-io` when it exists and `std::fs` on
-  a background task until then. Nothing in this crate touches a world, an executor or a
+  synced, and renamed over the slot: `app` writes it with `lactose-io`'s `Io::replace`
+  (`Headless::save`). Nothing in this crate touches a world, an executor or a
   file: every function is pure over its arguments, and every type crosses threads
   (`lib.rs` asserts it), which is what lets `app` place the work. A failed `from_export`,
   `check_sections`, `encode_section` or `assemble` loses nothing: each is a pure function
@@ -645,10 +645,9 @@ and 15.5; D124, D126)
 - Carrying a region's asset table and mode per section, so a save pins what the hash
   covers: deferred until a save must load against a store that has published since
   (milestone 3, with `lactose-asset`); until then the condition under "Policy" holds.
-- The slot write through `lactose-io` (temporary file, sync, rename), and the disk-full
-  and corrupt-save policies of architecture section 19 (milestone 4): `app` holds the
-  policy; this crate's part is that a damaged section is refused on its own, before
-  anything is read into a world, and the other sections stay readable.
+- The disk-full and corrupt-save policies of architecture section 19 (milestone 4): `app`
+  holds the policy; this crate's part is that a damaged section is refused on its own,
+  before anything is read into a world, and the other sections stay readable.
 - A region's asset set beyond its baseline's (the assets of migrated residents,
   architecture section 14) in the section, and the overlay against a baseline streamed
   from `lactose-asset` rather than handed in by the caller: milestone 3, through the

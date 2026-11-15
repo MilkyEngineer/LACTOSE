@@ -433,8 +433,8 @@ What a system is, from its parameters (`SystemParam` has the table):
   document an honest export made loads, with a cycle it closes through other regions broken
   as above: a region's export is always an overlay and an overlay a region exported always
   loads, which is the invariant every save, unload and relevance message rests on. On a
-  client `OwnedBy` is neither replicated nor corrected (`crates/net-api/README.md`, "The
-  staged frame"), so its edges are as fresh as each region's last relevance document; a
+  client `OwnedBy` is neither replicated nor corrected (D141; `crates/net-api/README.md`,
+  "The staged frame"), so its edges are as fresh as each region's last relevance document; a
   break on a client is logged, not reported, and lasts until the region's next document.
   The world reads those edges in every kind: `despawn` and `move_to_region`, direct and at
   command apply, take the tree as the world holds it. A client's staged-state hooks
