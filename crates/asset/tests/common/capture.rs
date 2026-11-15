@@ -128,7 +128,7 @@ impl Capture {
     /// span has closed. A step's events reach the subscriber after it released the store's
     /// lock, so a test that saw a load end can be ahead of them; the load's span closes
     /// only after them.
-    pub fn silo_events(&self, from: usize, level: Level) -> Vec<Event_> {
+    pub fn store_events(&self, from: usize, level: Level) -> Vec<Event_> {
         self.closed(0, "silo.load");
         let events = self.events();
         let found = events[from..].iter().filter(|event| event.level == level);

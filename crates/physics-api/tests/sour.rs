@@ -35,13 +35,13 @@ use lactose_task::ChaosConfig;
 use protocol::{Capacity, Layout, Recorder, RunConfig, Session};
 
 /// What a test builds from its session, and reports back.
-struct Sour {
+struct SessionSetup {
     session: Session,
     executor: Executor,
     layout: LayoutConfig,
 }
 
-impl Sour {
+impl SessionSetup {
     /// Reads the session and builds the executor and layout it asks for.
     fn from_env() -> Result<Self> {
         let session = Session::from_env().map_err(protocol_error)?;
@@ -240,7 +240,7 @@ fn scene(kind: WorldKind, layout: LayoutConfig) -> Harness {
 /// One step of the scene: the second region's freeze and thaw through `world_mut`, then the
 /// step, recorded.
 fn step(
-    sour: &Sour,
+    setup: &SessionSetup,
     mut simulation: Simulation,
     record: &mut dyn FnMut(lactose_core::Tick, u64) -> Result<()>,
 ) -> Result<Simulation> {
@@ -250,18 +250,18 @@ fn step(
     } else if next == 95 {
         simulation.world_mut().set_region_mode(OTHER_REGION, RegionMode::Simulated)?;
     }
-    run_recorded(&sour.executor, simulation, [TickInput::default()], record)
+    run_recorded(&setup.executor, simulation, [TickInput::default()], record)
 }
 
 fn record_scene(test: &str, kind: WorldKind) -> Result<()> {
-    let sour = Sour::from_env()?;
-    let Harness { mut simulation, .. } = scene(kind, sour.layout);
-    let mut recorder = sour.recorder(test, &simulation)?;
+    let setup = SessionSetup::from_env()?;
+    let Harness { mut simulation, .. } = scene(kind, setup.layout);
+    let mut recorder = setup.recorder(test, &simulation)?;
     let mut record =
         |tick: lactose_core::Tick, hash: u64| recorder.record(tick.0, hash).map_err(protocol_error);
     let mut saved = None;
     for tick in 1..=TICKS {
-        simulation = step(&sour, simulation, &mut record)?;
+        simulation = step(&setup, simulation, &mut record)?;
         if kind == WorldKind::Prediction && tick == ROLLBACK_TICK {
             saved = Some((simulation.world().snapshot(), snapshot(simulation.world())?));
         }
@@ -273,10 +273,10 @@ fn record_scene(test: &str, kind: WorldKind) -> Result<()> {
         restore(simulation.world_mut(), &physics_snapshot)?;
         corrected(simulation.world_mut(), &[sphere_key(3), key(BONE_A)])?;
         while simulation.tick().0 < TICKS {
-            simulation = step(&sour, simulation, &mut record)?;
+            simulation = step(&setup, simulation, &mut record)?;
         }
     }
-    sour.finish(test)
+    setup.finish(test)
 }
 
 #[test]

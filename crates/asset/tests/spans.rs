@@ -90,7 +90,7 @@ fn a_mount_and_a_load_emit_the_spans_and_events_of_the_table() {
         assert!(read.parent == Some(*x_load) || read.parent == Some(*dependency_load));
     }
 
-    let published = capture.silo_events(events, Level::INFO);
+    let published = capture.store_events(events, Level::INFO);
     assert_eq!(published.len(), 2, "{published:#?}");
     assert!(published.iter().all(|event| event.name == "silo.publish"));
     let x_published = published
@@ -102,7 +102,7 @@ fn a_mount_and_a_load_emit_the_spans_and_events_of_the_table() {
     assert_eq!(x_published.fields.get("version"), Some(&hex(cooked.version().to_bits())));
     let generation = store.generation().to_string();
     assert!(published.iter().any(|event| event.fields.get("generation") == Some(&generation)));
-    assert!(capture.silo_events(events, Level::WARN).is_empty());
+    assert!(capture.store_events(events, Level::WARN).is_empty());
 
     // A request that does nothing emits nothing.
     let (spans, events) = (capture.span_count(), capture.event_count());
@@ -121,7 +121,7 @@ fn a_mount_and_a_load_emit_the_spans_and_events_of_the_table() {
     env.mount(&store, path).unwrap();
     let (_, remount) = only(capture, from, "silo.mount");
     assert_eq!(remount.field("requested"), Some("0"));
-    let current = capture.silo_events(events, Level::INFO);
+    let current = capture.store_events(events, Level::INFO);
     assert_eq!(current.len(), 1, "{current:#?}");
     assert_eq!(current[0].name, "silo.current");
     assert_eq!(current[0].fields.get("asset"), Some(&hex(x.to_bits())));
@@ -175,7 +175,7 @@ fn every_recorded_failure_is_one_warn_inside_its_load() {
     assert_eq!(span.field("version"), None);
     assert_eq!(span.field("kind"), None);
     assert_eq!(span.field("error"), Some("NotFound"));
-    let warned = capture.silo_events(events, Level::WARN);
+    let warned = capture.store_events(events, Level::WARN);
     assert_eq!(warned.len(), 1);
     assert_eq!(warned[0].parent, Some(load));
     assert_eq!(warned[0].fields.get("kind").map(String::as_str), Some("NotFound"));
@@ -188,7 +188,7 @@ fn every_recorded_failure_is_one_warn_inside_its_load() {
     env.settle(&store);
     let loads = capture.closed(from, "silo.load");
     assert_eq!(loads.len(), 2);
-    let warned = capture.silo_events(events, Level::WARN);
+    let warned = capture.store_events(events, Level::WARN);
     assert_eq!(warned.len(), 2, "{warned:#?}");
     for event in &warned {
         let (_, span) = loads.iter().find(|(at, _)| event.parent == Some(*at)).unwrap();

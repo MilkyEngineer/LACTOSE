@@ -747,7 +747,7 @@ A facade: none of these tests exists yet. Each row is a test the lane `binds-imp
 Every row below runs. `tests/proof/` is one test binary with a module per area (the
 registration, the server's frame and time scale with the refusals and relevance, the store
 and its baselines, the client's frame); `tests/headless.rs` holds the headless app's rows,
-the policy table and `a_headless_run_under_sour`, the SOUR test of the assembly, which the
+the policy table and `a_recorded_headless_run`, the SOUR test of the assembly, which the
 runner records under every mode since `lactose-app` is a `[harness]` package; the
 `Server::shutdown` row is a unit test in `src/server.rs`. Every pacer runs over a stand-in
 clock: instants computed from one base and never read between frames, so a test's tick

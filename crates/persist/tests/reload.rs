@@ -8,18 +8,18 @@
 #![forbid(unsafe_code)]
 
 mod common;
-mod sour;
+mod glue;
 
 use std::collections::BTreeMap;
 
 use common::*;
+use glue::{SessionSetup, record};
 use lactose_asset_api::PinnedTable;
 use lactose_core::{PlayerId, Tick};
 use lactose_ecs::{ClaimedBy, Executor, LayoutConfig, RegionId, RegionMode, WorldKind};
 use lactose_persist::{Container, Loader, Migrations, RegionRecords};
 use lactose_sim::harness::run_recorded;
 use lactose_sim::{RegionBundle, RegionExport, SavePoint, SessionEvent, Simulation, TickInput};
-use sour::{Sour, record};
 
 /// How many ticks the three runs are compared for after the reload.
 const K: u32 = 90;
@@ -96,33 +96,33 @@ fn joins(simulation: &mut Simulation) -> BTreeMap<PlayerId, SessionEvent> {
 
 /// The recorded run of `test`: the directed world to tick `at`, each step recorded.
 struct Run {
-    sour: Sour,
+    setup: SessionSetup,
     /// Opened by [`Run::original`] with the layout the original's world reports.
-    recorder: Option<sour::Recorder>,
+    recorder: Option<glue::Recorder>,
     test: &'static str,
 }
 
 impl Run {
     fn new(test: &'static str) -> Self {
-        Self { sour: Sour::from_env().unwrap(), recorder: None, test }
+        Self { setup: SessionSetup::from_env().unwrap(), recorder: None, test }
     }
 
     fn executor(&self) -> &Executor {
-        &self.sour.executor
+        &self.setup.executor
     }
 
     /// Steps `simulation` through `frame`, recording the hash.
     fn step(&mut self, simulation: Simulation, frame: TickInput) -> Simulation {
         let recorder = self.recorder.as_mut().expect("the original opened the recorder");
         let mut hashed = |tick: Tick, hash: u64| record(recorder, tick, hash);
-        run_recorded(&self.sour.executor, simulation, [frame], &mut hashed).unwrap()
+        run_recorded(&self.setup.executor, simulation, [frame], &mut hashed).unwrap()
     }
 
     /// The directed world built with the session's layout and run to tick `ticks`,
     /// recorded.
     fn original(&mut self, ticks: u32) -> Simulation {
-        let mut simulation = directed(self.sour.layout).build().unwrap();
-        self.recorder = Some(self.sour.recorder(self.test, simulation.world().layout()).unwrap());
+        let mut simulation = directed(self.setup.layout).build().unwrap();
+        self.recorder = Some(self.setup.recorder(self.test, simulation.world().layout()).unwrap());
         for tick in 1..=ticks {
             simulation = self.step(simulation, directed_frame(tick));
         }
@@ -131,7 +131,7 @@ impl Run {
 
     /// An unrecorded copy of the program, run to tick `ticks`.
     fn twin(&self, ticks: u32) -> Simulation {
-        let mut simulation = directed(self.sour.layout).build().unwrap();
+        let mut simulation = directed(self.setup.layout).build().unwrap();
         for tick in 1..=ticks {
             simulation = step(self.executor(), simulation, directed_frame(tick));
         }
@@ -139,7 +139,7 @@ impl Run {
     }
 
     fn finish(self) {
-        self.sour.finish(self.test).unwrap();
+        self.setup.finish(self.test).unwrap();
     }
 }
 
@@ -168,7 +168,7 @@ fn reload_at(test: &'static str, at: u32, players: usize) {
 
     // The fresh process: built from the header, every section loaded in its first frame,
     // every player joining again in the same frame.
-    let fresh = directed(run.sour.layout)
+    let fresh = directed(run.setup.layout)
         .tick(header.header.tick)
         .next_net_id(header.header.next_net_id)
         .build()
@@ -246,7 +246,7 @@ fn the_two_frame_reload_and_a_fresh_process_hash_equal() {
     original = run.step(original, load);
 
     // The fresh process sees the same two frames: nothing loaded, then the container.
-    let fresh = directed(run.sour.layout).tick(save.tick).next_net_id(save.next_net_id);
+    let fresh = directed(run.setup.layout).tick(save.tick).next_net_id(save.next_net_id);
     let mut fresh = step(run.executor(), fresh.build().unwrap(), script(at + 1));
     let mut load = script(at + 2);
     load.loaded = bundles(&bytes, &kept);

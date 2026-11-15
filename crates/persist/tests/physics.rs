@@ -9,12 +9,13 @@
 
 #![forbid(unsafe_code)]
 
+mod glue;
 #[path = "../../physics-api/tests/common/mod.rs"]
 mod physics;
-mod sour;
 
 use std::sync::Arc;
 
+use glue::{SessionSetup, record};
 use lactose_asset_api::AssetSet;
 use lactose_bundle::Baseline;
 use lactose_core::Tick;
@@ -24,7 +25,6 @@ use lactose_physics_api::{BodyHandle, Joint, JointHandle, JointKind, Velocity, s
 use lactose_sim::TickInput;
 use lactose_sim::harness::run_recorded;
 use physics::{Harness, Options, REGION, at, floating, frame, key, sphere, v};
-use sour::{Sour, record};
 
 /// A fixed collider, a body falling onto it, a body sliding past, and a joint between the
 /// two bodies.
@@ -57,8 +57,8 @@ fn populate(h: &mut Harness) {
     h.spawn(key(JOINT), (Joint::new(JointKind::Spherical, key(FALLING), key(SLIDING)),));
 }
 
-fn step(sour: &Sour, mut h: Harness, input: TickInput) -> Harness {
-    h.simulation = sour.executor.block_on(h.simulation.step(&sour.executor, input)).unwrap();
+fn step(setup: &SessionSetup, mut h: Harness, input: TickInput) -> Harness {
+    h.simulation = setup.executor.block_on(h.simulation.step(&setup.executor, input)).unwrap();
     h
 }
 
@@ -82,19 +82,19 @@ fn state(h: &Harness) -> (u64, u64, Handles) {
 #[test]
 fn a_physics_scene_reloads_equal_to_a_fresh_process_and_a_twin() {
     let test = "lactose_persist::physics::reload_at_12";
-    let sour = Sour::from_env().unwrap();
-    let mut h = scene(sour.layout, 0);
+    let setup = SessionSetup::from_env().unwrap();
+    let mut h = scene(setup.layout, 0);
     populate(&mut h);
-    let mut recorder = sour.recorder(test, h.world().layout()).unwrap();
+    let mut recorder = setup.recorder(test, h.world().layout()).unwrap();
     let mut hashed = |tick: Tick, hash: u64| record(&mut recorder, tick, hash);
     let frames = (0..T0).map(|_| TickInput::default());
-    h.simulation = run_recorded(&sour.executor, h.simulation, frames, &mut hashed).unwrap();
+    h.simulation = run_recorded(&setup.executor, h.simulation, frames, &mut hashed).unwrap();
     assert!(handles(&h).0.iter().all(Option::is_some) && handles(&h).1.is_some());
 
     // The save: the region's records against an empty cooked baseline (the rows are all
     // moved in, as `SpawnFromBaseline`), in a container.
     let (simulation, save) =
-        sour.executor.block_on(h.simulation.save_point(&sour.executor)).unwrap();
+        setup.executor.block_on(h.simulation.save_point(&setup.executor)).unwrap();
     h.simulation = simulation;
     let table = SchemaTable::from_registry(h.world().registry()).unwrap();
     let baseline = Arc::new(Baseline::from_rows(AssetSet::new(), [], []).unwrap());
@@ -116,20 +116,20 @@ fn a_physics_scene_reloads_equal_to_a_fresh_process_and_a_twin() {
 
     // In place, one frame; recorded.
     let reload = frame([REGION], [(REGION, bundle())]);
-    h.simulation = run_recorded(&sour.executor, h.simulation, [reload], &mut hashed).unwrap();
+    h.simulation = run_recorded(&setup.executor, h.simulation, [reload], &mut hashed).unwrap();
     assert_eq!(h.world().region_mode(REGION), Some(RegionMode::Simulated));
 
     // A fresh process at the save's tick, its own empty region gone so the bundle brings
     // it.
-    let mut fresh = scene(sour.layout, save.tick.0);
+    let mut fresh = scene(setup.layout, save.tick.0);
     fresh.world_mut().unload_region(REGION).unwrap();
-    fresh = step(&sour, fresh, frame([], [(REGION, bundle())]));
+    fresh = step(&setup, fresh, frame([], [(REGION, bundle())]));
 
     // The twin never reloads.
-    let mut twin = scene(sour.layout, 0);
+    let mut twin = scene(setup.layout, 0);
     populate(&mut twin);
     for _ in 0..=T0 {
-        twin = step(&sour, twin, TickInput::default());
+        twin = step(&setup, twin, TickInput::default());
     }
 
     for _ in 0..K {
@@ -139,10 +139,10 @@ fn a_physics_scene_reloads_equal_to_a_fresh_process_and_a_twin() {
         assert_eq!(state(&fresh), reloaded, "fresh process at tick {}", h.tick());
         assert_eq!(state(&twin), reloaded, "untouched twin at tick {}", h.tick());
         h.simulation =
-            run_recorded(&sour.executor, h.simulation, [TickInput::default()], &mut hashed)
+            run_recorded(&setup.executor, h.simulation, [TickInput::default()], &mut hashed)
                 .unwrap();
-        fresh = step(&sour, fresh, TickInput::default());
-        twin = step(&sour, twin, TickInput::default());
+        fresh = step(&setup, fresh, TickInput::default());
+        twin = step(&setup, twin, TickInput::default());
     }
     // The scene did something: the falling body touched the fixed one, and both moved.
     assert!(!h.recorded().contacts.is_empty());
@@ -150,5 +150,5 @@ fn a_physics_scene_reloads_equal_to_a_fresh_process_and_a_twin() {
     assert_ne!(moved(FALLING), Some(at(0, 0, 0)));
     assert_ne!(moved(SLIDING), Some(at(2, 0, 0)));
     drop(hashed);
-    sour.finish(test).unwrap();
+    setup.finish(test).unwrap();
 }
