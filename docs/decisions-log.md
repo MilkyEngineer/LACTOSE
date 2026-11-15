@@ -985,6 +985,47 @@ editorial pass rather than one taken from a review.
   `Full::encode`, which writes the region baseline's content hash that format 2 changes: spike
   digest 8db4551c007e6410 to b6a4efa4db9780a4 over 7,200 lines, equal in PR, layout and chaos
   modes; no world hash moved.
+- Addendum (lane schema-guard, 2026-11-16; review rounds 1 and 2): the committed
+  version-and-digest record, built. `crates/app/tests/schema_record.rs` derives, for the
+  engine's registration set (`Game::types()` of a game with no crate), every saved type from
+  `SchemaTable::schemas()` (key, schema version, layout digest; `derived` types are not in it)
+  and the registry's `TypeInfo` (name, role, policy, field IDs with names and type tags, nested
+  `#[value]` structs and arrays of them included, and retired IDs), and compares it with
+  `crates/app/tests/schema_record/engine.txt`. One set is recorded: the engine's, which every
+  game's set contains; the headless binary's set adds one milestone 1 stand-in and is not
+  recorded, and each game binary's set gains a file of its own when it ships (milestone 5). The
+  test fails, naming the type, on a digest moved at an unchanged version (both digests named)
+  and on a version that fell, for transient types as for persistent ones: no load reads a
+  transient type's version, but one made persistent is read from the version and digest it was
+  saved under, so a layout change made while it was transient breaks the older saves once it is
+  persistent unless a version marks it. Section 15's "CI rejects ID reuse" is three cases, at
+  every depth: a recorded ID that names a field of another name, a recorded ID that left the
+  fields without being retired, and a retired ID no longer retired; a nested struct's IDs are
+  compared while the field holding it holds a struct of the same name or the type's digest is
+  unchanged. A field's identity is its ID and name: a type change under one ID and name is a
+  layout change, governed by the digest and the version, as a `FieldValues` step rewrites a
+  field under its ID, except a `#[value]` struct or enum replaced by one of the same layout,
+  which no digest sees; the names are what tell a reuse of the same type from a rename, which
+  the digest cannot. A new type, a removed one, a version that rose with any digest and a new
+  field fail only until the record is rewritten by
+  `LACTOSE_SCHEMA_RECORD=update cargo nextest run -p lactose-app --test schema_record`, which
+  refuses to write while any of the failures above stands, refuses a record that would not read
+  back as the build's, and writes a missing record whole; `LACTOSE_SCHEMA_RECORD=rename` also
+  takes a new name under a recorded ID whose type is unchanged as a rename. The record writes a
+  field holding a `#[value]` struct as `struct Name` (an array of them `[struct Name; N]`), so
+  its parser refuses an ID under a field that holds none; it also refuses an ID both a field and
+  retired. The record is compared with LF line endings. Field IDs are read through the accessors
+  `Registry::dump` is written from rather than from its text, which nests structs on one line.
+  No engine crate has a `register_migrations` yet and `Game::migrations` folds only the game's
+  crates, so the first step an engine type needs adds that registration point beside
+  `Game::types`' engine list (a transient type's bump needs none until it is made persistent).
+  Proof: a same-size swap of `physics::velocity`'s two `Vec3` fields without a bump,
+  `anim::bone_link`'s ID 3 given to a new field of its type without being retired (the digest
+  unchanged), a same-size swap inside `CollisionGroups`, and `CollisionGroups` renamed with its
+  two IDs' names swapped (the digest unchanged) each fail naming the type and are refused by the
+  update; the velocity swap with `version = 2` rewrites that type's line alone. The record at
+  the merge holds 16 types, 13 persistent and 3 transient. No public signature, manifest or
+  recorded SOUR line changed.
 
 **D130. The `io` facade: what sections 4, 5.1, 8.2, 9.7, 15.3, 19 and 20 left open** (§3, §4, §5.1, §8.2, §9.7, §14, §15.3, §19, §20, §21, `lactose-io`, `lactose-core`, `lactose-task`)
 - Why: the facade is written before its implementation so `asset`, `app`'s save path, `cook`
