@@ -1,7 +1,8 @@
 # Milestone 1: the physics evidence nightly 43703297881 left open
 
-Status: proposal, written at main `b2e2a41`, architecture revision 3.3. Nothing of section 5
-is applied until the owner answers section 4. This document changes no code.
+Status: proposal, written at main `b2e2a41`, architecture revision 3.3, and revised after its
+first review. Nothing of section 5 is applied until the owner answers section 4. This
+document changes no code.
 
 Nightly 43703297881 at `c50b688` found the three platforms' SOUR hash files byte-identical,
 and `b2e2a41` closed criteria 2, 3 and 7 on it. It left three questions for the planner.
@@ -20,8 +21,8 @@ In brief:
   the backend builds, or reached once with its result discarded. No lane is owed. The eigen
   decomposition is re-gated to milestone 3, where a cooked collision mesh first keeps its
   result.
-- The deserialisation claims hold as built and are held by tests on main. No shipped path of
-  milestone 1 rests on them. The row closes on the coordinator's pass.
+- The deserialisation claims hold as built and are held by tests on main. No path a milestone
+  1 binary runs rests on them. The row closes on the coordinator's pass.
 - `PhysicsSnapshot::hash` does not join the world hash, in milestone 1 or later. It is
   recorded beside it, per tick, by one small lane in tests alone.
 
@@ -33,6 +34,8 @@ Conventions:
 - A probe figure is a time this document measured in a scratch copy of the tree at `b2e2a41`,
   in release, on the Apple M1 while other agents built. It carries its load averages. It
   steers and proves nothing (architecture section 20).
+- A review figure is the first review's of this document. Its probes extend this document's,
+  ran in the same scratch copy, and steer in the same way.
 - A quiet figure is a figure of a result file under `docs/results`.
 - A verification row is cited by its opening words. File and line references are to the tree
   at `b2e2a41`, to the vendored `rapier3d-f64` 0.36.0 under `vendor/`, and to `parry3d-f64`
@@ -165,8 +168,16 @@ So the site is accepted for milestone 1 on two grounds: no result of it reaches 
 and the one reach is a transition whose result is overwritten in the call that produced it.
 The acceptance rests on the order of `Rapier::update`, and no test holds that order today.
 One is owed: a body that gains an offset, tilted collider reports, from that tick on, the
-states of a body created with it. A kept sum would give it the unit ball's mass as well. The
-test rides the lane of section 3, or the next lane that edits the backend's tests.
+states of a body created with it. The body is pushed (an impulse and a torque impulse) in
+the tick it gains the collider and lands on a floor, so that a dropped closing rebuild fails
+it as a kept sum does. The push is what a dropped rebuild needs. Without the closing rebuild
+Rapier's own user-change pass still rebuilds the mass at the start of the step, so the sum
+would be live only for the commands of the gaining tick, which the backend applies between
+the two. The first review's probe shows both halves: with the closing rebuild removed, a
+body that falls, spins, is pushed a tick later or lands stays equal to its control to tick
+180, and only one pushed in the gaining tick differs, from tick 6; with the sum kept, every
+variant differs. The test rides the lane of section 3, or the next lane that edits the
+backend's tests.
 
 It is re-gated to milestone 3. `ShapeKind::Mesh` arrives there with cooked collision
 (`crates/physics-api/README.md`, "Not in this crate yet"), and a trimesh's mass properties
@@ -239,11 +250,13 @@ serde layout whose shape type is a parameter (lines 45 to 123). Rapier's own der
 decodes the image as a `ColliderSet`. The exchange happens in the encoded form. No setter of
 Rapier runs.
 
-Rapier's sets and its arena derive `Deserialize`. No hand-written impl stands between the
-bytes and them: the only ones in the closure are parry's `SharedShape`, `SimdAabb` and
-`ContactManifoldsWorkspace`. A derive assigns the fields it decodes and gives each
-`serde(skip)` field its default. It cannot set a flag it did not decode, wake a body or
-recompute a mass, because it calls no method of the type. `read` then builds `PhysicsWorld`
+Rapier's sets and its arena derive `Deserialize`. No hand-written impl in the closure calls a
+Rapier method: parry's three (`SharedShape`, `SimdAabb` and `ContactManifoldsWorkspace`),
+glam's, and Rapier's `deserialize_from_vec_tuple`, which rebuilds two maps whose order
+nothing reads (`BroadPhaseBvh::pairs` and `PersistentIslands::joint_link_locs`). A derive
+assigns the fields it decodes and gives each `serde(skip)` field its default. It cannot set
+a flag it did not decode, wake a body or recompute a mass, because it calls no method of the
+type. `read` then builds `PhysicsWorld`
 as a struct literal with fresh pipelines and checks the bookkeeping against it (lines 382 to
 407).
 
@@ -265,9 +278,11 @@ and the unit test.
 
 ### 2.3 What milestone 1 rests on
 
-Nothing shipped in milestone 1 rests on a claim that could be false. Under both mutations the
-conformance run, the three reload tests and every test of `tests/sour.rs` still pass, because
-none of them decodes a world that holds anything:
+Nothing a milestone 1 binary runs rests on a claim that could be false. Under both mutations
+the three tests of `tests/conformance.rs`, the three reload tests and every test of
+`tests/sour.rs` still pass. The conformance run and the SOUR scenes restore through the copy,
+the reload tests restore the empty world, and `conformance::validity` compares one byte
+restore with another:
 
 - Prediction's restore is `PhysicsBackend::restore_copy`
   (`crates/physics-api/src/service.rs`, line 448), which for Rapier clones the copy's sets
@@ -277,15 +292,18 @@ none of them decodes a world that holds anything:
 - D143's copy encodes only when its size or hash is asked. That write decodes the collider
   set's own encoding into the image (`shapes_out`, lines 159 to 167). A mismatch there is a
   property of the build, which the unit test holds.
-- The one byte restore in shipped code is the fresh solver's (`crates/physics-api/src/sync.rs`,
-  line 451; D124). It restores the empty world's bytes, which hold no shape, body or joint,
-  so the four claims are vacuous there. What it rests on is that the empty bytes restore to
-  a world that steps as a new one, which `conformance::empty_restore` holds on every pool
-  size and layout.
+- Shipped crates restore bytes at three sites: the fresh solver's
+  (`crates/physics-api/src/sync.rs`, line 451), which alone runs in a binary; the trait
+  default `restore_copy` (`crates/physics-api/src/backend.rs`, lines 292 to 299), which
+  Rapier overrides; and `conformance::step_from` (`crates/physics-api/src/conformance.rs`,
+  lines 543 to 553), which only tests call. The fresh solver's restores the empty world's
+  bytes (D124), which hold no shape, body or joint, so the four claims are vacuous there.
+  What it rests on is that the empty bytes restore to a world that steps as a new one,
+  which `conformance::empty_restore` holds on every pool size and layout.
 
 Were a claim false, a reader would see it in `tests/snapshot.rs` on every CI platform, at
-the first assertion, and nowhere in a milestone 1 binary. The first shipped restore of a
-world that holds bodies is milestone 4's journal checkpoint. Its row already owes the test
+the first assertion, and nowhere in a milestone 1 binary. The first restore of a world that
+holds bodies that a binary runs is milestone 4's journal checkpoint. Its row already owes the test
 that would show it: a session checkpointed with contacts live, replayed from the checkpoint,
 hashing equal to the recording at every tick.
 
@@ -348,8 +366,11 @@ the client's solver is rebuilt at a join and at a resync, and the bytes carry st
 as the count of optimisation passes a world's broad phase has run, which for a client starts
 at its join. A folded hash makes the spike's count zero in every scene, by construction.
 
-It would move 8,712 of the nightly's 10,334 recorded lines, in 14 of its 25 recording tests:
-every test whose world holds a `Physics`, the test backend's included. The spike's digest
+It would move 8,711 of the 10,334 lines the nightly recorded, in 14 of its 25 recording
+tests: every world hash of a test whose world holds a `Physics`, the test backend's included.
+The conformance run's eleventh line is the bytes' hash itself and stays. Both counts are the
+nightly's, at `c50b688`. Main at `b2e2a41` lists 27 recording tests, and the two it added
+hold no `Physics`, so the 14 stand. The spike's digest
 8db4551c007e6410 would move with them. The merges of `c9b-renames` and `slot-copy` used it to
 show they changed no behaviour (the rows "Codenames on test glue" and "The prediction slot as
 a copy (D143)"). So would the headless binary's 0x92ff315464f84575, which session B compares
@@ -388,7 +409,7 @@ in a stated order, each proving itself over the other's moved lines. It also mee
   journal checkpoint. Rules out any evidence for the bytes across platforms beyond the
   conformance run's one value until then.
 - **C. Folded into `Simulation::hash`, with a rows-only hash for comparisons between worlds.**
-  One number per world. Rules out the spike's digest and every recorded line of 14 tests as
+  One number per world. Rules out the spike's digest and every world hash of 14 tests as
   they stand, and needs the `lactose-sim` hook, a second public hash and the switch of
   `Client::hash`.
 
@@ -403,9 +424,12 @@ every tick, the prediction scene's re-simulated ticks again. In `crates/app/test
 the four recorded scenes record one value per frame over the server's world and the client's
 prediction world, and `crates/app/tests/headless.rs` records the server's. The ten-minute
 replays compute no physics hash, so `spike-net`'s figures do not move. Each stream has its
-own name, the test's with `::physics` appended, and `tools/xtask/ci-policy.toml` lists the
-eight names under `[harness]`. The lane also carries the test of section 1.4 and corrects the
-three sentences that call `hash` the place where the bytes join the world hash.
+own name, the test's with `::physics` appended, opens its own recorder and, under a chaos
+seed, writes the test's execution log under its own name, since the runner asks an applied
+line and a log of every name that records (`tools/xtask/src/harness/mod.rs`, lines 543 to
+572). `tools/xtask/ci-policy.toml` lists the eight names under `[harness]`. The lane also
+carries the test of section 1.4 and corrects the three sentences that call `hash` the place
+where the bytes join the world hash.
 
 Its proof:
 
@@ -417,8 +441,11 @@ Its proof:
   stream at that tick. The lane picks it and says why the world stream cannot see it then.
 - `cargo xtask sour run --pr` fails when a listed physics stream records nothing.
 - `cargo xtask measure spike-net --short` before and after, as steering.
-- The seconds the new streams add to one SOUR run. This document's estimate is under two
-  seconds, most of it the thrown scene.
+- The test time the new streams add to one SOUR launch. It is about one second, most of it
+  the thrown scene: about ten seconds a nightly, which is ten launches, and three a pull
+  request, which is three. The first review measured it: 0.9 to 1.1 s more for the thrown
+  scene in each of six modes, in the test profile, at load averages 1.9 to 2.8. What it adds
+  to the wall clock depends on how nextest runs the tests side by side.
 - The first nightly that holds the lane: equal on three platforms, or a finding.
 
 Cost: five runs, as a small lane, and a floor like every count of the plan. It joins queue 2
@@ -435,8 +462,8 @@ nine small scenes. Found at milestone 4 it is a replay that hashes apart with `n
 What would change this: the owner preferring one number per world (C); the lane's nightly
 showing bytes that differ across platforms where rows agree, which comes back to the planner
 to decide whether the difference is closed or the backend's obligation is restated to rows;
-a SOUR run that the new streams lengthen by more than ten seconds, which cuts the spike's
-streams to the server's world.
+the new streams adding more than three seconds of test time to one SOUR launch, which cuts
+the spike's streams to the server's world.
 
 ## 4. The question for the owner
 
@@ -451,14 +478,17 @@ One question. The coordinator asks it in these words; the recommended option is 
 > 1. **Recorded beside the world hash, from milestone 1 (Recommended):** One small lane,
 >    physics-records, of five runs, in tests alone. Each recorded Rapier scene records the
 >    hash of the solver's bytes every tick as a stream of its own. No recorded hash moves and
->    no interface changes. Every nightly from then on compares solver state across x86-64 and
->    aarch64, which the backend's contract already promises and one value proves today.
+>    no interface changes. It adds about one second of test time per SOUR launch, most of it
+>    the thrown scene: about ten seconds a nightly and three a pull request. Every nightly
+>    from then on compares solver state across x86-64 and aarch64, which the backend's
+>    contract already promises and one value proves today.
 > 2. **Recorded beside it, from milestone 4:** No lane now. The form is decided, and the
 >    recording is built with the journal checkpoint. Until then the conformance run's one
 >    value is the only evidence for the bytes across platforms.
-> 3. **Folded into the world hash:** One number per world. It moves 8,712 of 10,334 recorded
->    lines, the spike's digest and the headless hash, needs a hook in lactose-sim and a
->    second rows-only hash for the spike, and comes back to the planner for that design.
+> 3. **Folded into the world hash:** One number per world. It moves 8,711 of the 10,334 lines
+>    the nightly recorded, the spike's digest and the headless hash, needs a hook in
+>    lactose-sim and a second rows-only hash for the spike, and comes back to the planner for
+>    that design.
 
 D145 also records what needs no choice: the platform-library sites of section 1 as settled
 there, and the snapshot contract's claims as closed by section 2.
@@ -467,8 +497,9 @@ there, and the snapshot contract's claims as closed by section 2.
 
 D145 is the next free number. The text is for answer 1, and the coordinator writes the date
 of the owner's answer where it says `<date>`. The sentences that change under answer 2 follow
-each block. Every anchor was checked at `b2e2a41`, with line breaks and doc-comment markers
-read as spaces: each occurs once, inside the row or file named.
+each block. Every anchor was checked at `b2e2a41` and again at main `26e743c`, which adds the
+`timer-windows` merge, with line breaks and doc-comment markers read as spaces: each occurs
+once, inside the row or file named, and D145 is free at both.
 
 ### Decision entry
 
@@ -489,8 +520,9 @@ read as spaces: each occurs once, inside the row or file named.
     design: the netcode spike's baseline counts the ticks at which the prediction world's
     hash equals the server's (35,197 of 35,553 for the dynamic capsule under the clock
     script, `docs/results/spike-net-apple-m1-2026-11-15.md`), and a folded hash makes that
-    count zero in every scene. A fold would also move 8,712 of the nightly's 10,334 recorded
-    lines, the spike's digest and the headless binary's hash, and put a backend write on
+    count zero in every scene. A fold would also move 8,711 of the 10,334 lines the nightly
+    recorded at `c50b688`, the spike's digest and the headless binary's hash, and put a
+    backend write on
     every hashed tick: about 215 µs on the spike's thrown scene and 69 ms beside the
     physics-phase scene's 50,000 fixed boxes (a probe under load). Rules out a hook in
     `lactose-sim` for a service's hash, a second rows-only hash, and one number for a world's
@@ -513,10 +545,13 @@ read as spaces: each occurs once, inside the row or file named.
     no sum and no shape keeps its result. One transition reaches it, a `RigidBody` row that
     gains an offset or tilted `Collider`, and `Rapier::update` rebuilds the mass from zero in
     the same call: the scene's bytes are unchanged with `acos` and `cos` perturbed. A test
-    owed by `physics-records` pins that order. The lane that adds `ShapeKind::Mesh` or a
-    second collider on a body closes the route first, by a patch of glamx under section 8.2
-    or by refusing the feature. Rules out the patch in milestone 1, which builds nothing that
-    keeps the result.
+    owed by `physics-records` pins that order: a body that gains an offset, tilted collider
+    reports, from that tick on, the states of a body created with it. The body is pushed (an
+    impulse and a torque impulse) in the tick it gains the collider and lands on a floor, so
+    that a dropped closing rebuild fails it as a kept sum does. The lane that adds
+    `ShapeKind::Mesh` or a second collider on a body closes the route first, by a patch of
+    glamx under section 8.2 or by refusing the feature. Rules out the patch in milestone 1,
+    which builds nothing that keeps the result.
   - *The joint motor's `sin`, the soft-body solver, the trimesh pseudo-normals,
     `RevoluteJoint::angle` and `VectorExt::angle` are accepted as unreachable.* The `sin` is
     the target of an angular motor on a joint that touches a multibody link, not a locked or
@@ -531,11 +566,12 @@ read as spaces: each occurs once, inside the row or file named.
     patch under D123 or by refusing the feature, before a recorded scene is its only net.
   - *The snapshot contract's deserialisation claims are closed.* No custom collider
     `Deserialize` was needed: the shapes are exchanged inside an image of the collider set's
-    serde layout, and Rapier's sets derive `Deserialize`, so decoding calls no setter. Three
-    tests hold the claims and fail under a restore mutated to wake a body or to replay a
-    shape. No shipped path of milestone 1 restores a world that holds a body from bytes: a
-    slot restores the backend's copy (D143), and the fresh solver restores the empty world's
-    bytes (D124). The first such restore is the journal checkpoint's, at milestone 4.
+    serde layout, and Rapier's sets derive `Deserialize`, with no hand-written impl in the
+    closure that calls a Rapier method, so decoding calls no setter. Three tests hold the
+    claims and fail under a restore mutated to wake a body or to replay a shape. No path a
+    milestone 1 binary runs restores a world that holds a body from bytes: a slot restores
+    the backend's copy (D143), and the fresh solver restores the empty world's bytes (D124).
+    The first such restore is the journal checkpoint's, at milestone 4.
 - Driven by: nightly 43703297881 and `b2e2a41`; the planner's trace of the platform
   library's callers on aarch64-apple-darwin, its arithmetic over the leaf counts, its
   perturbation probe and its two mutations of the byte restore; the owner's answer of
@@ -583,11 +619,11 @@ equal across platforms in nightly 43703297881. `PhysicsSnapshot::hash` is record
 | new | The physics hash beside the world hash (D145) | `physics-records` | Its streams equal in every SOUR mode on the M1, then on three platforms in the first nightly that holds it |
 
 --- section 3, the second lane table: add a row after the row of `timer-windows` ---
-| `physics-records` | The physics hash recorded beside the world hash (D145), in tests alone. Each recording test that steps Rapier opens a second recorder, named as the test with `::physics` appended, and records after every tick `lactose_physics_api::snapshot(world)?.hash()` of each world it steps: `lactose-physics-rapier`'s `a_server_scene`, `a_prediction_scene_with_a_rollback`, its re-simulated ticks again, and `a_limited_hinge_driven_against_its_limits`; `lactose-app`'s four spike scenes, the server's world and the client's prediction world as one value per frame, and `a_recorded_headless_run`. `the_conformance_run` keeps its one value. The ten-minute replays compute no physics hash. `tools/xtask/ci-policy.toml` lists the eight names under `[harness]`. One test in `crates/physics-rapier/tests/backend.rs`: a body with a `RigidBody` and no `Collider` that gains an offset, tilted collider reports, from that tick on, the states of a body created with it. The sentences of `crates/physics-api/README.md`, `crates/sim/README.md` and the doc comment of `PhysicsSnapshot::hash` that call it the place where the bytes join the world hash | No lane in flight edits `crates/app/tests/spike.rs` or the `[harness]` list | `cargo xtask sour run --nightly` on the M1: every new stream equal in every mode, and the prediction scene's re-simulated physics hashes equal to its first run's. Every line the existing names record is byte-identical to main's at the lane's base, the spike's digest 8db4551c007e6410 among them. One mutation of solver state that moves no row at the tick it is made fails a physics stream at that tick; the lane picks it and says why the world stream cannot see it then. `cargo xtask sour run --pr` fails when a listed physics stream records nothing. `cargo xtask measure spike-net --short` before and after, as steering. The seconds the new streams add to one SOUR run. Then the first nightly that holds the lane: equal on three platforms, or a finding for the planner | 5 |
+| `physics-records` | The physics hash recorded beside the world hash (D145), in tests alone. Each recording test that steps Rapier opens a second recorder, named as the test with `::physics` appended, and records after every tick `lactose_physics_api::snapshot(world)?.hash()` of each world it steps: `lactose-physics-rapier`'s `a_server_scene`, `a_prediction_scene_with_a_rollback`, its re-simulated ticks again, and `a_limited_hinge_driven_against_its_limits`; `lactose-app`'s four spike scenes, the server's world and the client's prediction world as one value per frame, and `a_recorded_headless_run`. `the_conformance_run` keeps its one value. The ten-minute replays compute no physics hash. Each `::physics` name opens its own recorder and, under a chaos seed, writes the test's execution log under its own name. `tools/xtask/ci-policy.toml` lists the eight names under `[harness]`. One test in `crates/physics-rapier/tests/backend.rs`: a body with a `RigidBody` and no `Collider` that gains an offset, tilted collider reports, from that tick on, the states of a body created with it. The body is pushed (an impulse and a torque impulse) in the tick it gains the collider and lands on a floor, so that a dropped closing rebuild fails it as a kept sum does. The sentences of `crates/physics-api/README.md`, `crates/sim/README.md` and the doc comment of `PhysicsSnapshot::hash` that call it the place where the bytes join the world hash | No lane in flight edits `crates/app/tests/spike.rs` or the `[harness]` list | `cargo xtask sour run --nightly` on the M1: every new stream equal in every mode, and the prediction scene's re-simulated physics hashes equal to its first run's. Every line the existing names record is byte-identical to main's at the lane's base, the spike's digest 8db4551c007e6410 among them. One mutation of solver state that moves no row at the tick it is made fails a physics stream at that tick; the lane picks it and says why the world stream cannot see it then. `cargo xtask sour run --pr` fails when a listed physics stream records nothing. `cargo xtask measure spike-net --short` before and after, as steering. The test time the new streams add to one SOUR launch, about one second by the first review's measure. Then the first nightly that holds the lane: equal on three platforms, or a finding for the planner | 5 |
 
 --- section 3, after the paragraph that begins "D144 adds `timer-windows`": add a paragraph ---
-D145 adds `physics-records`, five runs, and four for its proposal: its writing, a review, an
-answer and its application.
+D145 adds `physics-records`, five runs, and six for its proposal: its writing, two reviews, two
+revisions and its application.
 
 --- section 3, the queue table: replace ---
 | 2, the client and then the save path | `client-fix`, `sour-evidence`, `spike-net`, `stream-impl`, `slot-copy`, `data-path`, `binds-design`, `binds-impl` | 56 |
@@ -595,11 +631,16 @@ answer and its application.
 | 2, the client and then the save path | `client-fix`, `sour-evidence`, `spike-net`, `stream-impl`, `slot-copy`, `data-path`, `binds-design`, `binds-impl`, `physics-records` | 61 |
 ```
 
+The queue's total counts lane runs alone, as D143's change from 49 to 56 did for
+`slot-copy`'s seven. So the lane's five take queue 2 from 56 to 61 and the three queues from
+161 to 166, and the proposal's six runs stand in the paragraph, as D143's five and D144's
+six do.
+
 Under answer 2 the third added row of section 2, the lane's row, the queue change and the
-lane's five runs are left out, and the added paragraph reads "D145 adds no lane, and four
-runs for its proposal: its writing, a review, an answer and its application." The three
-sentences and the test of section 1.4 then go to `readme-sweep` and to the next lane that
-edits `lactose-physics-rapier`'s tests.
+lane's five runs are left out, and the added paragraph reads "D145 adds no lane, and six
+runs for its proposal: its writing, two reviews, two revisions and its application." The
+three sentences and the test of section 1.4 then go to `readme-sweep` and to the next lane
+that edits `lactose-physics-rapier`'s tests.
 
 ### Verification rows
 
@@ -615,22 +656,22 @@ name, or a new row at the end of section 4.
 --- "| The further gaps of the `lactose-physics-api` (D119) row": replace ---
 The same nightly's scenes reach some of these sites, the broad phase's `log2` in every step among them, and no difference showed; which sites they reach has not been traced one by one, so at the sites no recorded scene reaches the property is unproven, not excused, and each scene recorded under architecture mode extends the evidence. Open, for the planner: trace which of these sites the recorded scenes reach, then accept the rest with a reason, add a scene that reaches them, or re-gate them
 --- with ---
-Traced (`docs/plans/physics-evidence-proposal.md`, section 1; aarch64-apple-darwin at `b2e2a41`, the seven maths functions the test binaries import from the platform library interposed and every call counted with its calling frames): the nine recording tests that step Rapier, the four of `lactose-physics-rapier`, the spike's four and the headless run, reach `log2` and no other from a step, 18 to 4,658 calls each, all from `optimization_config` under `Bvh::optimize_incremental`, `BroadPhaseBvh::update` or `take_deferred_optimize`, and `PhysicsPipeline::detect_collisions`; the dynamic capsule's `atan2` and `fmod` are the spike's own yaw measurement, outside the step; 50 other tests of the backend reach `log2` alone. **Done** (D145), site by site. `log2`: accepted. Its two values decide one rounded count, `target_optimized_subtree_count`; for every leaf count from 1 to 20,000,000 the rounded expression stays 2.4e-7 or more from a boundary and one ulp of `log2` moves it by less than 9.6e-17, so the count is the same for any `log2` within 2.5e9 ulp; a parry bump that changes `optimization_config` reopens it. The eigen decomposition: accepted for milestone 1 and gated to milestone 3 (the row "glamx's symmetric eigen decomposition calls the platform library"). The backend gives a body one collider or a unit ball's mass, never both, and builds a ball, a capsule or a cuboid; a `RigidBody` row that gains an offset or tilted `Collider` reaches it once (`attach_collider` before `Rapier::update` clears the additional mass), and the same call rebuilds the mass from zero: with `acos` and `cos` scaled by 1 + 1e-6 the scene's bytes after 180 ticks are unchanged. The motor's `sin`, the soft-body solver, the pseudo-normals and the two `angle` functions: accepted as unreachable. The backend inserts impulse joints without motors and no soft body, a snapshot that holds a multibody joint or a soft body is refused, a write and a copy refuse a shape the backend did not build, and among boundary crates only `lactose-physics-rapier` may name `rapier3d-f64`. The trace is not a gate: it runs by hand on macOS. A lane that widens what the backend builds (a shape kind, a second collider on a body, a joint motor, a multibody joint, a soft body, CCD) runs it over its tests and closes each site they newly reach (D145)
+Traced (`docs/plans/physics-evidence-proposal.md`, section 1; aarch64-apple-darwin at `b2e2a41`, the seven maths functions the test binaries import from the platform library interposed and every call counted with its calling frames): the nine recording tests that step Rapier, the four of `lactose-physics-rapier`, the spike's four and the headless run, reach `log2` and no other from a step, 2 to 4,658 calls each, all from `optimization_config` under `Bvh::optimize_incremental`, `BroadPhaseBvh::update` or `take_deferred_optimize`, and `PhysicsPipeline::detect_collisions`; the dynamic capsule's `atan2` and `fmod` are the spike's own yaw measurement, outside the step; 50 other tests of the backend reach `log2` alone. **Done** (D145), site by site. `log2`: accepted. Its two values decide one rounded count, `target_optimized_subtree_count`; for every leaf count from 1 to 20,000,000 the rounded expression stays 2.4e-7 or more from a boundary and one ulp of `log2` moves it by less than 9.6e-17, so the count is the same for any `log2` within 2.5e9 ulp; a parry bump that changes `optimization_config` reopens it. The eigen decomposition: accepted for milestone 1 and gated to milestone 3 (the row "glamx's symmetric eigen decomposition calls the platform library"). The backend gives a body one collider or a unit ball's mass, never both, and builds a ball, a capsule or a cuboid; a `RigidBody` row that gains an offset or tilted `Collider` reaches it once (`attach_collider` before `Rapier::update` clears the additional mass), and the same call rebuilds the mass from zero: with `acos` and `cos` scaled by 1 + 1e-6 the scene's bytes after 180 ticks are unchanged. The motor's `sin`, the soft-body solver, the pseudo-normals and the two `angle` functions: accepted as unreachable. The backend inserts impulse joints without motors and no soft body, a snapshot that holds a multibody joint or a soft body is refused, a write and a copy refuse a shape the backend did not build, and among boundary crates only `lactose-physics-rapier` may name `rapier3d-f64`. The trace is not a gate: it runs by hand on macOS. A lane that widens what the backend builds (a shape kind, a second collider on a body, a joint motor, a multibody joint, a soft body, CCD) runs it over its tests and closes each site they newly reach (D145)
 
 --- "| The physics snapshot contract rests on the backend deserialising Rapier's sets": replace ---
 unverified against Rapier 0.36's deserialisation (a custom collider `Deserialize` may be needed).
 --- with ---
-read against the vendored Rapier 0.36.0 at `b2e2a41` (`docs/plans/physics-evidence-proposal.md`, section 2): no custom collider `Deserialize` was needed, since `shapes_in` (`crates/physics-rapier/src/snapshot.rs`) exchanges each carried `Shape` for the shape `set_collider`'s constructor builds inside an image of the collider set's serde layout, which Rapier's own derive then decodes; Rapier's sets and its arena derive `Deserialize` with no hand-written impl between the bytes and them, so decoding assigns the encoded fields, gives each `serde(skip)` workspace its default and calls no setter.
+read against the vendored Rapier 0.36.0 at `b2e2a41` (`docs/plans/physics-evidence-proposal.md`, section 2): no custom collider `Deserialize` was needed, since `shapes_in` (`crates/physics-rapier/src/snapshot.rs`) exchanges each carried `Shape` for the shape `set_collider`'s constructor builds inside an image of the collider set's serde layout, which Rapier's own derive then decodes; Rapier's sets and its arena derive `Deserialize`, and no hand-written impl in the closure calls a Rapier method (parry's three, glam's, and Rapier's `deserialize_from_vec_tuple`, which rebuilds two maps whose order nothing reads), so decoding assigns the encoded fields, gives each `serde(skip)` workspace its default and calls no setter.
 
 --- "| The physics snapshot contract rests on the backend deserialising Rapier's sets": replace ---
 `PhysicsSnapshot::hash` may now join the world hash (section 8.3), a change not yet made. Still unverified: the deserialisation claims above
 --- with ---
-`PhysicsSnapshot::hash` is recorded beside the world hash and never folded into it (D145, section 8.3). **Done:** the claims are held by the unit test `the_collider_set_reads_back_byte_for_byte_with_its_shapes_from_their_values` (Rapier's own encoding of the restored set, change flags and mass properties included, equals the original's), by `tests/snapshot.rs` `a_restored_backend_writes_the_same_bytes_and_steps_on_identically` (a pile of 60 bodies with two joints, with and without pending work, restored on pools of one and four threads, writes back the bytes it restored and steps on as the run does) and by `tests/copy.rs` `a_backend_restored_from_a_copy_steps_as_one_restored_from_its_bytes`, whose restore points include sleeping bodies. In a scratch copy at `b2e2a41` a restore mutated to wake every body fails the last two and `bytes_that_are_not_a_snapshot_are_refused_and_change_nothing`, and one mutated to replay each shape through `set_shape` fails all four; the conformance run, the reload tests and every SOUR scene pass under both, since none decodes a world that holds a body. A recompute of a mass that returned the values it had would not be observable. No shipped path of milestone 1 restores such a world from bytes: a prediction slot restores the backend's copy (D143), and the one byte restore, the fresh solver's (D124), is of the empty world's bytes, held by `conformance::empty_restore`. The first is the journal checkpoint's (the row "The journal checkpoint's physics snapshot (D124)"). Not covered, as the backend's README states: CCD, contact clustering, multibody joints and soft bodies, none of which the backend uses
+`PhysicsSnapshot::hash` is recorded beside the world hash and never folded into it (D145, section 8.3). **Done:** the claims are held by the unit test `the_collider_set_reads_back_byte_for_byte_with_its_shapes_from_their_values` (Rapier's own encoding of the restored set, change flags and mass properties included, equals the original's), by `tests/snapshot.rs` `a_restored_backend_writes_the_same_bytes_and_steps_on_identically` (a pile of 60 bodies with two joints, with and without pending work, restored on pools of one and four threads, writes back the bytes it restored and steps on as the run does) and by `tests/copy.rs` `a_backend_restored_from_a_copy_steps_as_one_restored_from_its_bytes`, whose restore points include sleeping bodies. In a scratch copy at `b2e2a41` a restore mutated to wake every body fails the last two and `bytes_that_are_not_a_snapshot_are_refused_and_change_nothing`, and one mutated to replay each shape through `set_shape` fails all four; the conformance run, the reload tests and every SOUR scene pass under both, since none decodes a world that holds a body, and `conformance::validity` passes because it compares one byte restore with another. A recompute of a mass that returned the values it had would not be observable. No path a milestone 1 binary runs restores such a world from bytes: a prediction slot restores the backend's copy (D143), and of the three sites where shipped crates restore bytes only the fresh solver's runs in a binary (D124), on the empty world's bytes, held by `conformance::empty_restore`; Rapier overrides the trait default `restore_copy`, and only tests call `conformance::step_from`. The first is the journal checkpoint's (the row "The journal checkpoint's physics snapshot (D124)"). Not covered, as the backend's README states: CCD, contact clustering, multibody joints and soft bodies, none of which the backend uses
 
 --- section 4: add three rows at the end ---
 | glamx's symmetric eigen decomposition calls the platform library's `acos` and `cos` (`glamx` 0.3.1, `src/eigen3.rs`) whenever parry diagonalises an inertia matrix that is not diagonal: `MassProperties::with_inertia_matrix`, from the sum of two non-zero mass properties and from compound, convex-polyhedron, trimesh and voxel mass properties. At milestone 1 no result of it reaches the solver (D145; the row "The further gaps of the `lactose-physics-api` (D119) row"). The lane that adds `ShapeKind::Mesh` for cooked collision meshes, or a second collider on a body, closes the route before its first recorded scene: a patch of glamx under architecture section 8.2 that sends the three calls through simba's `ComplexField`, as the Rapier patch does for `sin_cos` (glamx depends on simba, and `src/eigen3.rs` holds no `unsafe`), or the feature is refused; a recorded scene alone is evidence for its own inertia matrices. The same lane traces the trimesh's pseudo-normals (`parry3d-f64` 0.31.1, `src/shape/trimesh.rs`, through `VectorExt::angle`'s `acos`) | 3 |
-| The acceptance of the eigen decomposition at milestone 1 rests on the order of `Rapier::update` (`crates/physics-rapier/src/backend.rs`): it inserts a gained collider while the body still holds its unit ball's mass, and ends by rebuilding the mass from zero (D145). No test holds it. Owed by lane `physics-records`: a body with a `RigidBody` and no `Collider` that gains an offset, tilted collider reports, from that tick on, the states of a body created with it | 1 |
-| The physics hash beside the world hash (D145): lane `physics-records` records `PhysicsSnapshot::hash` after every tick, as a stream of its own, in the three scenes of `lactose-physics-rapier`'s SOUR test, the spike's four and the headless run. Its proof: every new stream equal in every SOUR mode on the M1; every line the existing names record byte-identical to main's, the spike's digest 8db4551c007e6410 among them; a mutation of solver state that moves no row failing a physics stream; the seconds the streams add to one run. Then the first nightly that holds it: equal across linux-x64, windows-x64 and macos-arm64, which extends the rows "Rapier's serialised snapshot is iteration-order stable enough to hash" and "`lactose-physics-api` (D119) is implemented" from one value and from rows to the solver's state at every recorded tick; a difference where the rows agree is a finding for the planner. To size it: a backend write and its hash cost about 215 µs a tick on the spike's thrown scene, 3.2 to 7.8 ms for 2,000 awake bodies and 69 ms beside 50,000 fixed boxes (the planner's probe, release, Apple M1, load averages 7.75 8.36 7.28), so no shipped tick hashes the bytes | 1 |
+| The acceptance of the eigen decomposition at milestone 1 rests on the order of `Rapier::update` (`crates/physics-rapier/src/backend.rs`): it inserts a gained collider while the body still holds its unit ball's mass, and ends by rebuilding the mass from zero (D145). No test holds it. Owed by lane `physics-records`: a body with a `RigidBody` and no `Collider` that gains an offset, tilted collider reports, from that tick on, the states of a body created with it. The body is pushed (an impulse and a torque impulse) in the tick it gains the collider and lands on a floor, so that a dropped closing rebuild fails it as a kept sum does: without the closing rebuild Rapier's own user-change pass still rebuilds the mass at the start of the step, so only a command of the gaining tick meets the sum (the first review's probe: with the rebuild removed, only the body pushed in that tick differs from its control, from tick 6; with the sum kept, every variant differs) | 1 |
+| The physics hash beside the world hash (D145): lane `physics-records` records `PhysicsSnapshot::hash` after every tick, as a stream of its own, in the three scenes of `lactose-physics-rapier`'s SOUR test, the spike's four and the headless run. Its proof: every new stream equal in every SOUR mode on the M1; every line the existing names record byte-identical to main's, the spike's digest 8db4551c007e6410 among them; a mutation of solver state that moves no row failing a physics stream; the test time the streams add to one SOUR launch, about one second, most of it the thrown scene, which is about ten seconds a nightly and three a pull request (the first review's measure: 0.9 to 1.1 s for the thrown scene in each of six modes). Then the first nightly that holds it: equal across linux-x64, windows-x64 and macos-arm64, which extends the rows "Rapier's serialised snapshot is iteration-order stable enough to hash" and "`lactose-physics-api` (D119) is implemented" from one value and from rows to the solver's state at every recorded tick; a difference where the rows agree is a finding for the planner. To size it: a backend write and its hash cost about 215 µs a tick on the spike's thrown scene, 3.2 to 7.8 ms for 2,000 awake bodies and 69 ms beside 50,000 fixed boxes (the planner's probe, release, Apple M1, load averages 7.75 8.36 7.28), so no shipped tick hashes the bytes | 1 |
 ```
 
 Under answer 2 the second new row ends "Owed by the next lane that edits
@@ -689,10 +730,13 @@ what a recording test records beside the world hash and never folds into it (arc
 - The CI run that passed the three tests of section 2 on each platform is the coordinator's
   to cite; this document read no CI log.
 - The figures of section 3.3 at the 2,000-body scale are probe figures, taken under load.
-  The time the lane's streams add to a SOUR run is an estimate.
-- Whether the new streams are equal in every SOUR mode is the lane's to show. The prediction
-  scene re-simulates after `corrected` names two rows whose values did not change; this
-  document read that the backend compares before it mutates and did not run it.
+  The test time the lane's streams add to a SOUR launch is a review figure for the thrown
+  scene alone; the three smaller spike scenes, the backend's scenes, the headless run and
+  the wall clock under nextest were not timed.
+- The first review ran the backend's three streams and the spike's four in the modes it
+  tried and found each equal, the prediction scene's after `corrected` among them. The
+  spike's streams under the 64-row layout and chaos seeds 2 and 3, the headless run's stream
+  and the comparison across platforms are the lane's and its nightly's to show.
 - A by-product for the row "Float `%` inside the boundary": the trace saw no `fmod` from a
   step in any recorded scene or backend test. The row stays as it is.
 
