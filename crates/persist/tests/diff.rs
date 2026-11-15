@@ -982,3 +982,59 @@ fn every_reachable_state_saves() {
     println!("{histories} histories, {broken} owner edges broken by a reload");
     assert!(broken > 0, "no history closed a cycle across the two regions");
 }
+
+/// `cooked_schemas()` with `component` at its version under another layout digest: a cook
+/// made before a same-size layout change that bumped no version.
+fn unbumped_schemas(component: ComponentKey) -> Vec<ComponentSchema> {
+    cooked_schemas()
+        .into_iter()
+        .map(|schema| {
+            if schema.component() != component {
+                return schema;
+            }
+            let fields = schema.fields().iter().copied();
+            let (version, size) = (schema.schema_version(), schema.element_size());
+            let digest = schema.layout_digest() ^ 1;
+            ComponentSchema::new(component, version, size, digest, fields).unwrap()
+        })
+        .collect()
+}
+
+/// The digest case of the test above: the diff refuses the saved column (`InvalidData`) and
+/// the loader refuses the cook (`VersionMismatch`) before the ECS sees it.
+#[test]
+fn a_baseline_column_at_its_version_with_another_digest_is_refused_by_the_diff_and_the_loader() {
+    let id = c(A, 1);
+    let migrations = Migrations::new();
+    let loader = Loader::new(schemas(), &migrations);
+    let row = BaselineRow { id, components: vec![data(pos(1, 1))] };
+    let stale = Arc::new(
+        Baseline::from_rows(AssetSet::new(), unbumped_schemas(Position::KEY), [row]).unwrap(),
+    );
+    let export = RegionExport {
+        region: A,
+        rows: RegionRows {
+            seed: 1,
+            rows: vec![ExportedRow {
+                id,
+                owner: None,
+                components: vec![data(pos(1, 1))],
+                transient: Vec::new(),
+            }],
+            ..RegionRows::default()
+        },
+    };
+    let error = RegionRecords::from_export(&export, &stale, schemas()).unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::InvalidData, "{error}");
+    let records = RegionRecords {
+        region: A,
+        seed: 1,
+        baseline_hash: stale.content_hash(),
+        overlay: None,
+        resources: Vec::new(),
+        resource_schemas: Vec::new(),
+        transient_resources: Vec::new(),
+    };
+    let error = loader.bundle(&records, stale, RegionMode::Simulated, None).unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::VersionMismatch, "{error}");
+}

@@ -432,7 +432,7 @@ pub struct Largest(#[field(id = 1)] pub lactose_core::PlainArray<u8, 16384>);
 #[lactose_reflect::resource(key = "bulk::over", persistent)]
 pub struct Over(#[field(id = 1)] pub lactose_core::PlainArray<u8, 16385>);
 
-/// One byte over, transient: saved by its schema, so refused too.
+/// One byte over, transient: in the schema table, so refused too.
 #[lactose_reflect::resource(key = "bulk::over_transient", transient)]
 pub struct OverTransient(#[field(id = 1)] pub lactose_core::PlainArray<u8, 16385>);
 

@@ -193,9 +193,10 @@ impl WorldBuilder {
     /// component larger than a 16 KiB chunk or aligned to more than eight bytes), or, with
     /// `InvalidData` naming the type, if a resource that is not `derived` is larger than
     /// `lactose_bundle::MAX_COMPONENT_BYTES` (16 KiB), the most a document carries of one
-    /// value: a save holds every persistent region resource by value and a transient one
-    /// by its schema, so such a resource could be inserted and never saved. A `derived`
-    /// resource is never saved and may be any size.
+    /// value: a save holds a persistent region resource by value, and a save's schema
+    /// table holds the schema of every resource that is not `derived`, which
+    /// `ComponentSchema::new` caps there, so no save of such a world could be made. A
+    /// `derived` resource is never saved and may be any size.
     pub fn build(self) -> Result<World> {
         let registry = &self.registry;
         if !(registry.contains::<InRegion>()

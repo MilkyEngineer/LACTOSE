@@ -133,15 +133,14 @@ impl<'a> Loader<'a> {
     /// equals `records.baseline_hash` (`VersionMismatch` otherwise: the baseline was
     /// patched, so [`migrate`](Self::migrate) and [`RegionRecords::rebase`] first); the
     /// records are [migrated](Self::migrate); the overlay, if any, passes
-    /// `Overlay::check_against(baseline)`; every value a
-    /// record or a resource carries is validated against the registry
-    /// (`TypeInfo::validate`, `InvalidData`), a resource restored zeroed by `migrate`
-    /// included and a transient component by presence alone, since it is zeroed; a
-    /// baseline column whose schema is not the table's is
-    /// `VersionMismatch` here rather than at the sync point (a baseline is never migrated:
-    /// the cooker of this build re-cooks it, and the records are rebased onto the result;
-    /// the schema carries the layout digest, so a same-size layout change in a cooked
-    /// column is refused here too). Then the bundle:
+    /// `Overlay::check_against(baseline)`; a baseline column whose schema is not the
+    /// table's is `VersionMismatch` here rather than at the sync point (a baseline is never
+    /// migrated: the cooker of this build re-cooks it, and the records are rebased onto the
+    /// result; the schema carries the layout digest, so a same-size layout change in a
+    /// cooked column is refused here too); every value a record or a resource carries is
+    /// validated against the registry (`TypeInfo::validate`, `InvalidData`), a resource
+    /// restored zeroed by `migrate` included and a transient component by presence alone,
+    /// since it is zeroed. Then the bundle:
     /// `seed`, `mode`, `baseline`, the migrated overlay, the migrated resources, the
     /// transient keys and `assets`. Nothing is loaded here; the sync point validates again
     /// before `create_region`.
@@ -174,6 +173,11 @@ impl<'a> Loader<'a> {
         let records = self.migrate(records)?;
         if let Some(overlay) = &records.overlay {
             overlay.check_against(&baseline)?;
+        }
+        for schema in baseline.schemas() {
+            self.baseline_schema(schema)?;
+        }
+        if let Some(overlay) = &records.overlay {
             for record in overlay.records() {
                 match record {
                     Record::Spawn { components, .. }
@@ -200,9 +204,6 @@ impl<'a> Loader<'a> {
         }
         for data in &records.resources {
             self.validate(data)?;
-        }
-        for schema in baseline.schemas() {
-            self.baseline_schema(schema)?;
         }
         Ok(RegionBundle {
             seed: records.seed,
@@ -334,10 +335,8 @@ impl<'a> Loader<'a> {
     }
 
     /// The value of `info`'s type in row `id` of `baseline`, which `check_against` has
-    /// shown the row has.
+    /// shown the row has, in the column whose schema `bundle` has shown is the table's.
     fn baseline_value(&self, baseline: &Baseline, id: NetId, info: &TypeInfo) -> Result<Vec<u8>> {
-        let column = baseline.schema(info.key()).expect("the row has the component");
-        self.baseline_schema(column)?;
         let archetype = baseline.archetype_of(id).expect("a cooked row");
         let index = archetype.ids().binary_search(&id).expect("a row of its archetype");
         let column = archetype.column(info.key()).expect("the row has the component");

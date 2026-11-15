@@ -319,12 +319,13 @@ impl Migrations {
     }
 
     /// Brings every value `overlay` carries to the registry's schemas: each component of a
-    /// `Spawn`, `SpawnFromBaseline` or `AddComponent` record through [`migrate`](Self::migrate)
-    /// under the overlay's schema of that component, and the overlay rebuilt against the same baseline hash with the table's schemas. An
-    /// overlay whose every carried type is at the registry's schema, digest included, a
-    /// transient type whose overlay schema equals the table's counting as such, is
-    /// returned as the same `Arc`, equal by content and by digest, so a client's cached
-    /// copy still matches; a migrated overlay is a new document with a new digest.
+    /// `Spawn`, `SpawnFromBaseline` or `AddComponent` record through
+    /// [`migrate`](Self::migrate) under the overlay's schema of that component, and the
+    /// overlay rebuilt against the same baseline hash with the table's schemas. An overlay
+    /// whose every carried type is at the registry's schema, digest included, a transient
+    /// type whose overlay schema equals the table's counting as such, is returned as the
+    /// same `Arc`, equal by content and by digest, so a client's cached copy still matches;
+    /// a migrated overlay is a new document with a new digest.
     /// `Destroy`, `RemoveComponent` and `OwnershipChange` carry no component bytes and pass
     /// through.
     ///
@@ -344,12 +345,11 @@ impl Migrations {
     ///
     /// Fails as [`migrate`](Self::migrate) fails; with `NotFound` for a component the table
     /// does not know (a removed type: never dropped silently); and with `Unsupported` for a
-    /// `SetField` record of
-    /// a persistent component whose version or digest differs, since one field cannot be
-    /// migrated without the rest of its value (this crate's diff never writes a `SetField`,
-    /// so none is in a save it wrote; one at the registry's version and digest passes
-    /// through). A transient type's `SetField` is dropped when its schema differs and kept
-    /// when it is equal; either way its value loads zeroed.
+    /// `SetField` record of a persistent component whose version or digest differs, since
+    /// one field cannot be migrated without the rest of its value (this crate's diff never
+    /// writes a `SetField`, so none is in a save it wrote; one at the registry's version and
+    /// digest passes through). A transient type's `SetField` is dropped when its schema
+    /// differs and kept when it is equal; either way its value loads zeroed.
     pub fn migrate_overlay(
         &self,
         overlay: &Arc<Overlay>,
