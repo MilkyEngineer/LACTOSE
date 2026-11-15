@@ -155,8 +155,8 @@ impl Io {
     ///
     /// Resolves to every entry, sorted by name, each with its own kind (a symbolic link is
     /// `EntryKind::Other`, whatever it points to). `NotFound` if there is no such
-    /// directory; `Io` if `path` is not a directory or cannot be read; `Cancelled` if the
-    /// pool has stopped.
+    /// directory; `Io` if `path` is not a directory or cannot be read; `ResourceExhausted`
+    /// if a buffer cannot be allocated; `Cancelled` if the pool has stopped.
     #[must_use = "a listing does nothing until polled"]
     pub fn read_dir(&self, path: impl Into<PathBuf>) -> ReadDir {
         let path = path.into();

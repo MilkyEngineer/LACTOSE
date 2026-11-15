@@ -1693,6 +1693,11 @@ editorial pass rather than one taken from a review.
   `an_encoded_read_whose_stored_bytes_arrived_before_the_stop_still_decodes` keeps its
   first-poll `Pending`: even with its stored bytes in, a 4 MiB decode would have to end within
   one 0.5 ms slice, about 7.8 GiB/s, six times the best measured.
+- Addendum (lane ricotta, 2026-11-16; review rounds 1 to 3): the cooked pack set of a fresh
+  process is a naming rule (D147): the regular files directly in a directory whose names end in
+  `.pack`, mounted in byte order of their names, listed by `lactose_asset::pack_set` and its
+  future `PackSet`, the two items the rule adds to the surface. A fresh process mounts every
+  member or does not run. The store's contract is unchanged.
 
 ## 8. Physics and animation
 
@@ -6144,6 +6149,65 @@ relayed by an event when it acts on another body** (§6.1, §10, `lactose-ecs`,
   against the deepest correction the spike records, which is moot because the precision half
   failed; its second distance, 8 km, and its expectation of "about 27 mm as a random walk";
   and its open question 5, the reference map's extent. The plan now marks each.
+
+**D147. The cooker's skeleton: one kind cooked from glTF by the cooker's own reader, sim bones marked in the source, the half turn in one function, and the cooked pack set as a naming rule in `lactose-asset`** (§2, §5.3, §14, §17, §20, §21, `tools/cook`, `lactose-asset`, `lactose-anim`, `lactose-app`)
+- Why: milestone 1's `ricotta` lane cooks one kind end to end, and D136 left the cooked pack set
+  of a fresh process, a manifest or a naming rule, to the cooker lane. `tools/cook/README.md`
+  states each of the cooker's choices as the contract; `crates/asset/README.md`, "Mounting",
+  states the pack set.
+  - *The cooked pack set is a naming rule, and `lactose-asset` states and lists it.* It is every
+    regular file directly in the cooked directory whose name ends in `.pack`, mounted in
+    ascending byte order of the names (`Io::read_dir`'s order; `lactose_asset::pack_set`), so
+    where two packs hold one asset the store names the version of the last name. A re-cook
+    replaces its pack at the same path, so its name keeps its rank in the order. Milestone 2's
+    directory watch must leave the store naming what a fresh process mounting the set would
+    name, with no version the set shadows named in between; how (one call that mounts the
+    changed set and resolves at once, or an unmount) is milestone 2's to decide. A fresh process
+    mounts every member of its set or does not run: a failed mount leaves its place empty for
+    good, so a process that went on without one member would name versions the cook did not
+    mean it to; the caller reports the pack that failed and stops, since the store is not told
+    which mounts make a set. The set and its order are a function of the directory's names
+    alone: no ledger (D98), the same name and bytes from every cook of the same sources, one
+    listing for a fresh process, nothing shared for two cooks to race on. `pack_set` and its
+    named future `PackSet` sit beside `Store::mount` and `Mount`, a small addition to the
+    implemented surface (section 20), because the rule's consumers, `app` and milestone 2's
+    watch, cannot name the cooker, a leaf, and the watch holds a listing in flight in its own
+    state. Rules out a manifest (cook history, a second write not atomic with the pack, a lost
+    update when two cooks run at once), a sequence number in file names (a ledger),
+    modification-time order (a clock), completion-ordered mounts (D136), a copy of the rule in
+    each consumer, and running on part of a set. The store's contract is unchanged.
+  - *The reader is the cooker's own, over serde_json, of the JSON form alone.* A skeleton's rest
+    poses are its nodes' transforms, so no buffer is read (inverse bind matrices included) and a
+    `.glb` is refused by name and by magic; a `.gltf` or `.glb` ending in another case is refused
+    with its rename, and a name that is only an ending is refused, so that an asset's name is
+    the same on every file system and never empty. Objects are the only supported form and a
+    name is a string: an object written as an array, or a name written as an object, is refused,
+    and a key written twice in the mark is refused naming its path, so a source's meaning never
+    rests on field order, on a second spelling, or on which of two values a parser keeps. The
+    reader is linear in the nodes: a cycle is a node the walk from the roots does not reach.
+    `float_roundtrip` makes every number correctly rounded; no output but an error's wording
+    depends on a JSON object's key order.
+  - *The source marks its sim bones*, under the one key `extras.lactose`: `{"bone": {role,
+    body}}` or `{"socket": {}}`, unknown keys refused. Marked nodes in preorder are the bones;
+    a bone's parent is its nearest marked ancestor, and the unmarked nodes between are composed
+    into its parent-local rest; where the document has skins a bone is one of their joints; a
+    second root and a 17th bone are refused naming the node. Rules out choosing bones by name
+    pattern or by a role table the cooker would guess, and a side file per source.
+  - *A scale other than one on any composed node is refused, uniform or not, a negative factor
+    included*: `BonePose` holds no scale. Baking a uniform scale into rest translations is exact,
+    but body values and a clip's samples are authored in the same scaled unit and would need the
+    same factor, which milestone 1 does not carry; the refusal tells the artist to apply the
+    scale before export. Rules out baking scale in milestone 1.
+  - *The half turn about +Y is one function, `space::to_engine_frame`*, exact, applied to what is
+    in the asset's root space: a skeleton's root bone rest alone (every other rest, socket
+    offset, collider offset and joint anchor is in a bone's space and turns with the root); a
+    clip's root bone samples and root track, when the clip processor lands.
+  - *The cooker's encoder is held to anim's golden bytes, and every cooked skeleton is loaded
+    back through `SkeletonLoader` before it is published*; one test round-trips every role,
+    shape, body type and joint kind, and one reads every name of the schema as its value.
+    Storage is zstd at level 3.
+- Driven by: the brief `ricotta`; the ricotta reviews r1 (B1, S1, S2, M1 to M6), r2 (N1 to
+  N5) and r3, and their fix rounds (2026-11-16).
 
 ## 10. Review history
 

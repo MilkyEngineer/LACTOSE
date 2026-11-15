@@ -1,0 +1,39 @@
+[package]
+name = "lactose-cook"
+description = "The asset cooker: a directory of authored sources cooked into one pack of the store's format, a sim skeleton from each glTF source at milestone 1."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "ricotta"
+path = "src/main.rs"
+
+[dependencies]
+# The kind cooked at milestone 1, `Skeleton` and its parts, and the loader every cooked
+# skeleton is decoded through before it is written (architecture section 17, D128).
+lactose-anim.workspace = true
+# The pack writer: the cooker states no frame rule and no index layout (D136).
+lactose-asset.workspace = true
+# `Processor`, `CookedAsset`, `AssetId::from_name` and `AssetVersion` (architecture
+# section 14, D98).
+lactose-asset-api.workspace = true
+lactose-core.workspace = true
+# Every file is listed, read and written through the pool (architecture section 14, D130).
+lactose-io.workspace = true
+# The scalar width of the build, and canonical bits for the byte form.
+lactose-math.workspace = true
+# A bone body's parts and the tolerance of a unit value.
+lactose-physics-api.workspace = true
+# `Executor::block_on` drives the pool's futures in the binary (D130).
+lactose-task.workspace = true
+# The glTF reader is the cooker's own, over serde_json; `float_roundtrip` makes every number
+# of a source parse to its correctly rounded value on every host, whatever else the build
+# selects.
+serde.workspace = true
+serde_json = { workspace = true, features = ["float_roundtrip"] }
+
+[lints]
+workspace = true

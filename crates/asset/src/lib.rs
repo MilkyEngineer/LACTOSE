@@ -21,6 +21,8 @@
 //!   a newly cooked pack reaches a running store; the store is a
 //!   `lactose_asset_api::AssetCatalog` and so a `PublishedAssets`; [`Store::settled`] is
 //!   the one wait, for tools and tests.
+//! - [`pack_set`] lists a cooked directory's packs in the order a fresh process mounts
+//!   them, as a [`PackSet`] future.
 //! - [`PackBuilder`] writes a pack, for the cooker and for tests; [`Storage`] says how one
 //!   payload is stored.
 //! - [`RegionBaseline`] is a region's cooked baseline as an asset, named by its content
@@ -77,7 +79,7 @@ mod trace;
 
 pub use baseline::{RegionBaseline, RegionBaselineLoader};
 pub use pack::{PACK_FORMAT_VERSION, PackBuilder, Storage};
-pub use store::{Mount, Settled, Store};
+pub use store::{Mount, PackSet, Settled, Store, pack_set};
 
 /// The `tracing` target of everything this crate emits: `silo`, the store's codename
 /// (architecture sections 19 and 23).
@@ -86,7 +88,7 @@ pub const LOG_TARGET: &str = "silo";
 /// What the contract promises at the type level, pinned so the implementation cannot lose
 /// it without a compile error: the store is a `Clone` handle shared across threads; a
 /// shared store is the catalogue trait object, and that is the published-assets trait
-/// object a boundary world receives; both futures are `Send + 'static` so
+/// object a boundary world receives; the three futures are `Send + 'static` so
 /// `Executor::spawn` takes them and `Unpin` so a caller polls them without pinning, and
 /// each resolves to what its method documents; a pack is built on any thread; the region
 /// baseline is an asset its loader produces; and the format version is the number the
@@ -107,6 +109,7 @@ const _: () = {
     handle::<Store>();
     future::<Mount, lactose_core::Result<()>>();
     future::<Settled, ()>();
+    future::<PackSet, lactose_core::Result<Vec<std::path::PathBuf>>>();
 
     send_sync::<PackBuilder>();
     copy::<Storage>();

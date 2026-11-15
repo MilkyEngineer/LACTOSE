@@ -36,7 +36,8 @@ writes: a change that breaks it is a signature change to list.
 | Item | Purpose |
 |---|---|
 | `Store` | The store handle: `Clone`, one store per process; `Store::new(executor, io, loaders)`; `mount(path)` for a cooked pack; `settled()` for the one wait; it is a `lactose_asset_api::AssetCatalog` and so a `PublishedAssets`, and a clone coerces to `Arc<dyn AssetCatalog>` and from there to `Arc<dyn PublishedAssets>` |
-| `Mount`, `Settled` | The two futures: `Send + Unpin + 'static`, lazy, cancelled by drop. `Mount` resolves to `lactose_core::Result<()>`, `Settled` to `()` |
+| `pack_set(io, directory)` | The cooked pack set of a fresh process, in the order to mount it ("Mounting"): a `PackSet` resolving to the packs' paths or to `Io::read_dir`'s failure |
+| `Mount`, `Settled`, `PackSet` | The three futures: `Send + Unpin + 'static`, lazy, cancelled by drop. `Mount` resolves to `lactose_core::Result<()>`, `Settled` to `()`, `PackSet` to `lactose_core::Result<Vec<PathBuf>>` |
 | `PackBuilder`, `Storage` | The pack writer, for the cooker and for tests: `add(id, &cooked, storage)` returns the version it recorded, `finish()` returns the pack's bytes; `Storage::Raw` or `Storage::Zstd { level }` per payload |
 | `PACK_FORMAT_VERSION` | 1: the pack format this build writes and mounts |
 | `RegionBaseline`, `RegionBaselineLoader` | A region's cooked baseline as an asset kind, named by its content hash: `name(content_hash)` and `id(content_hash)`, `cook(&baseline)` for the cooker, `lookup(catalog, content_hash)` for `app` and `persist`, `baseline()` for the shared `Arc<Baseline>`; and its loader, which every store registers itself |
@@ -50,7 +51,7 @@ the lock), and what `Mount` and `Settled` hold.
 
 | Consumer | Needs | Where |
 |---|---|---|
-| `app`, building a runtime | One store over the cooked packs, built from the executor and the pool it already has and from every kind's loader; packs mounted in an order it controls, one after another or at once; the store dropped before the pool and the executor stop, with no shutdown of its own to call | `Store::new`, `Store::mount` (the place is the call's), "Settling, cancellation and shutdown" |
+| `app`, building a runtime | One store over the cooked packs, built from the executor and the pool it already has and from every kind's loader; packs mounted in an order it controls, one after another or at once, and which packs a cooked directory holds, in that order; the store dropped before the pool and the executor stop, with no shutdown of its own to call | `Store::new`, `Store::mount` (the place is the call's), `pack_set` ("Mounting": every member mounted, or the start-up fails), "Settling, cancellation and shutdown" |
 | `app`, wiring resources (architecture section 4) | The catalogue for everything outside the boundary and the exact-version view for a boundary world, from the one store | `Arc::new(store.clone())` as `Arc<dyn AssetCatalog>`, upcast to `Arc<dyn PublishedAssets>`; pinned in `lib.rs` |
 | `app` at milestone 1 | Nothing: `app` keeps its `Cooked` stand-in (D131). A binary that wants cooked packs behind it, for the edit-to-playing measurement, bridges the three calls over a store it loaded before the first step | `tests/sketch.rs` section 2: `mount`, `request_newest`, `settled`, then `RegionBaseline::lookup`, `resolve`, `PinnedTable::pin`, each answering at once |
 | `app` at milestone 3, the store's driver | For each `RegionRequest::Load`: the baseline by content hash; the region's set requested; one consistent table once the set is published; the table pinned; all without blocking a frame and without resolving every region every frame; a later table when a pack was mounted; a failure as a value for `TickInput::failures` | `RegionBaseline::lookup`, `request_newest`, `generation`, `resolve`, `PinnedTable::pin`; "Publication" and "Hot reload" below; `tests/sketch.rs` section 3. The driver's side of it: it requests a set once, and retries a failure on a decision, never every frame, because a request that fails again moves the generation and would make it resolve every region every frame ("Publication") |
@@ -261,6 +262,23 @@ is this crate's (D136), written by `PackBuilder` alone and read by `Store::mount
 - Nothing is unmounted. Every mounted pack holds one descriptor and its decoded index
   until the last handle to the store is dropped, because an exact-version request may
   name any version any mounted pack holds.
+- **The cooked pack set** of a fresh process in a cooked directory is every regular file
+  directly in it whose name ends in `.pack`, mounted in ascending byte order of the
+  names: `Io::read_dir`'s order, `OsStr`'s, the names' bytes on Unix and their WTF-8
+  bytes on Windows, which agree for every name that is valid Unicode. `pack_set(io,
+  directory)` lists it in that order (D147). A later name takes a later place, so where
+  two packs hold one asset the store names the version of the pack whose name sorts last;
+  a team orders packs by naming them (`00-base.pack`, `10-dlc.pack`, `90-patch.pack`), and
+  a re-cook that replaces its pack at the same path keeps its name's rank. Subdirectories,
+  symbolic links, other files and the temporaries of a replace in flight
+  (`<name>.<hex>.tmp`) are not in the set. The store's own contract is unchanged: it
+  mounts what it is given, in the order of the calls, and nothing in the format depends
+  on the rule.
+- A fresh process mounts every member of its set or does not run. A failed mount leaves
+  its place empty for good, so a process that went on without one member would name
+  versions the cook did not mean it to. The caller enforces this: it reports the pack
+  whose mount failed, with the error, and stops; the store cannot, since it is not told
+  which mounts make a set.
 - On Windows the blocking backend of `io` runs the reads on one `File` one at a time, so
   loads from one pack are read one at a time there, whatever the pool's size
   (`crates/io/README.md`; `docs/verification.md` has the row).
@@ -650,9 +668,9 @@ Everything is at target `silo` (`LOG_TARGET`), the store's codename (architectur
   `docs/verification.md`).
 - **Watching a directory** for the cooker's output (milestone 2, with the `io` request
   `crates/io/README.md` names). Until then whoever knows the cooker ran calls `mount`.
-- **Which packs a fresh process mounts, and in which order.** The store takes the order
-  of the calls. A manifest, or a naming rule under which `Io::read_dir`'s order is cook
-  order, is the cooker lane's to define; nothing in the format depends on it.
+  The watch must leave the store naming what a fresh process mounting the cooked pack
+  set ("Mounting") would name, with no version the set shadows named in between; how is
+  milestone 2's to decide (D147).
 - **Unmounting, and merging packs.** One descriptor and one index per mount until the
   store is dropped; a long dev session's mount count against the process's descriptor
   limit is a verification row.
@@ -723,6 +741,7 @@ theirs. The file of each row is named at its end.
 | The format | Golden bytes of an empty pack, a one-entry and a two-entry pack; the index sorted whatever the add order; each rule of "The pack format" broken in turn refuses the mount with `InvalidData`, nothing mounted; another format version is `VersionMismatch`, and a file without the magic `InvalidData`, before anything else is read; an index length past the file is `InvalidData` with no read of an index, below 1 GiB and above it (a trailer naming 2 GiB in a file of a few bytes), and one within the file and over 1 GiB is `ResourceExhausted` (a sparse file); neither issues a read of the index, and a count past the index (`u32::MAX` in an index of four bytes) is refused with `InvalidData` with nothing reserved before the count is checked (`AllocTag::Asset`'s allocation count for the refusal is at most one more, its message, than for an index whose hash is wrong, `tests/index.rs`), and so is an entry's dependency count past the index (`u32::MAX`; no more allocations than for the same entry with no dependencies refused for its storage code); a stored range within the payload area and longer than `MAX_READ_BYTES` is `InvalidData` (a sparse file); a mounted index is charged to `AllocTag::Asset` while the pack is mounted (`tests/index.rs`); `add` refuses `AssetId::NONE`, an ID added again with another version, a level of 0 and of 23 and bytes over the cap, adding nothing, and an ID added again with the same version changes no byte of the pack (`tests/pack.rs`) |
 | Hash verification failure as a value | A pack whose index claims a version its content does not hash to (the harness's `claim`), and a pack with one payload byte flipped, raw and compressed: `Failed` with `InvalidData`, the claimed version in the failure, `warn` logged, no panic; the other assets of the pack load (`tests/reads.rs`) |
 | Mount order | Three packs holding one asset at three versions: mounted in turn, and with the three futures created in order and awaited in reverse, the named version is the last call's; an exact request finds each of the three; a failed and a dropped mount leave a place empty and change nothing; a path mounted, replaced by rename and mounted again serves both contents (`tests/mounts.rs`) |
+| The cooked pack set | Two packs holding one asset at two versions, the later-named written first, beside a directory whose name ends in `.pack`, another file, a replace's temporary holding a third version and (Unix) a symbolic link to the earlier pack named to sort last: `pack_set` lists the two packs in name order; a fresh store mounts them in that order with the mounts awaited in reverse and names the later name's version (mounting in the reverse order fails it, and so does a filter that keeps the link); a directory that does not exist is `NotFound` (`tests/pack_set.rs`) |
 | Mount cost | A mount of a pack of 100,000 entries and several hundred MiB of payload issues one `io.open` span and two `io.read` spans, of 24 bytes and of the index's length, and nothing else; its time is recorded with the load averages for the verification row (`tests/spans.rs`) |
 | A publish observed through `generation` | With an asset followed and current, a new pack holding a new version is mounted: the generation is unchanged when the mount resolves, moves when the reload publishes, `newest` then answers the new version and `resolve` a new table, while a handle and a `PinnedTable` taken before still read the old one; a pack that renames nothing followed moves nothing; a pack naming an earlier, published version makes it current at the mount and moves the generation (`tests/mounts.rs`) |
 | Following | An asset requested only by exact version is not reloaded by a mount; a dependency nobody named is reloaded; an asset requested before any pack held it loads when a pack that holds it is mounted; a missing dependency added by a later pack repairs its dependant, and that dependant's dependant, at that mount; an asset that failed for itself is not read again by the mount of a pack that does not hold it (no `io.read` span, the generation unmoved), and is by `request_newest`; one that failed for a dependency is not retried by a mount that renames neither; rule 3 reads again neither a dependant requested only by exact version nor one renamed, since it failed, to a version that failed for itself (that loader's call is not made again) (`tests/mounts.rs`) |

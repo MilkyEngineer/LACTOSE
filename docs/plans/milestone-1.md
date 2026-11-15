@@ -46,8 +46,8 @@ Section 22 gives milestone 1 nine criteria. Status is what the tree and CI show 
 
 Of what section 22 says milestone 1 delivers, the simulation track's crates are merged, with
 `lactose-ecs` still the naive single-job runner. `lactose-io` is merged. `lactose-asset` is a
-merged facade whose implementation is in flight. `tools/cook`, the RHI spike and `lactose-rhi-null`
-are not started.
+merged facade whose implementation is in flight. `tools/cook` cooks a sim skeleton from glTF into
+one pack (`ricotta`, D147); the RHI spike and `lactose-rhi-null` are not started.
 
 ## 2. The verification rows
 
@@ -104,7 +104,7 @@ words. Section 6 gives the exact text of every row this plan changes.
 | 122 | The `app` implementation (D131) | Pass | The first nightly at or after the `sour-evidence` merge |
 | 125 | The headless binary's 120-tick run | The quiet window, session B | The hash on x86-64 equal to the one the quiet window printed on the M1 at the same commit |
 | 132 | Mount cost (D136) | `silo` | Recorded with the implementation |
-| 133 | The cooked pack set of a fresh process | `ricotta` | The manifest or naming rule, and the mount order |
+| 133 | The cooked pack set of a fresh process | `ricotta`; milestone 2's watch | Milestone 1 half closed by D147 (`crates/asset/tests/pack_set.rs`); the watch's half when milestone 2 lands |
 | new | A milestone 1 tick at 100k entities (added by the `ecs-a` merge) | `measure`, the quiet window, session B | Its last sentence becomes "Measured on eight performance cores in session B; the M1's projection of decision 5.1 steers" |
 
 Rows 32, 84, 85 and 123 are closed. Row 36's remaining check, which glam Rapier selects, is closed:
@@ -139,7 +139,7 @@ The lanes that follow, in the order their dependencies allow:
 | `xtask-policy` | The backend's allowlist cut to its manifest, and trait routes to the platform library banned (X2). The whole lint file pinned (X3). `[harness]` and the recording tests tied to the tree (X4). The unsafe list compared with section 21 (X5). Rows 66, 70 and 82 | None | Each rule has a fixture that fails: a deleted ban, a dropped harness package, a swapped unsafe crate, a deleted `rustdocflags` | 7 |
 | `measure` | `cargo xtask measure` and the result-file convention (decision 5.11). The missing cost tests: the physics phase through `Simulation::step` with Rapier, a prediction slot (the character, fifty claimed bodies, fixed colliders and proxies) and a seven-tick rollback through `lactose-predict` with Rapier, the composed tick, the full diff of a 100k reload, bone bodies on Rapier. The edit-to-playing measurement, both edits (decision 5.9). The 100k test run on one frame worker and on N, the machine's performance cores up to eight, in one sitting, printing T₁, T_N and the projection of decision 5.1 | `ecs-a` and `xtask-policy` merged | One command writes every result file on the M1, each with the header section 4 names, and a short run of `cargo xtask measure --all` on the linux-x64 and windows-x64 runners in CI, its numbers discarded but for the edit-to-playing figure decision 5.9 keeps, so that session B's command is known to finish. Times are printed, never asserted | 7 |
 | `schema-digest` | The D129 additions: `document_schema` exported, `write_table` and `read_table` exported, the layout digest in `ComponentSchema` (a bundle format bump) and compared by `World::load_region`, a non-derived resource over 16 KiB refused at registration | `silo` and `ecs-fork` merged | Rows 112, 113 and 114. A same-size layout change without a version bump is refused at a region load | 7 |
-| `ricotta` | The RICOTTA skeleton in `tools/cook`: inputs, processors behind `asset-api`'s traits, one pack out, the pack-set manifest or naming rule. One kind cooked end to end, chosen in its brief: `lactose-anim`'s kinds have cooked formats today, and no authored scene format exists for a baseline | `schema-digest` merged | A pack `ricotta` wrote mounts in SILO, and its assets load and pin. Cooking the same inputs twice writes the same bytes. Row 133's milestone 1 half | 7 |
+| `ricotta` | The RICOTTA skeleton in `tools/cook`: inputs, processors behind `asset-api`'s traits, one pack out, the cooked pack set's naming rule (D147). One kind cooked end to end, chosen in its brief: `lactose-anim`'s kinds have cooked formats today, and no authored scene format exists for a baseline | `schema-digest` merged | A pack `ricotta` wrote mounts in SILO, and its assets load and pin. Cooking the same inputs twice writes the same bytes. Row 133's milestone 1 half | 7 |
 | `schema-guard` | A committed record of each saved type's version and layout digest, and the test that fails on a digest changed without a version bump and on a field ID reused | `schema-digest` merged | Section 15's "CI rejects ID reuse" becomes true: both mutations fail | 5 |
 | `scalar-probe` | The precision probe of decision 5.4, and the readings for row 41 | None | Result file `scalar-precision` | 4 |
 | `spike-rhi` | The RHI spike (decision 5.10), under MoltenVK on the M1 | The GPU reviewer defined (approved by the owner, not yet in `.claude/agents/`); the Vulkan SDK on the development Mac, which the owner installs | Result file `spike-rhi`, each "no" marked as MoltenVK's or as a design question | 4 |
