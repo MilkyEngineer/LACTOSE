@@ -14,9 +14,8 @@
 //! # Status
 //!
 //! Implemented (D129): every item of the surface does what `README.md` states, and its
-//! "Proof for milestone 1" table names the tests that hold it. One item is a facade:
-//! [`Loader::binds`] (D142) has its final signature and contract and a `todo!()` body until
-//! the lane `binds-impl`.
+//! "Proof for milestone 1" table names the tests that hold it, and "Proof for D142" those
+//! of [`Loader::binds`].
 //!
 //! # Where to start
 //!

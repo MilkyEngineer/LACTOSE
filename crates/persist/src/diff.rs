@@ -40,6 +40,19 @@ use crate::schema::{LayoutDigest, Saved, SchemaTable};
 /// the size the table's schema states, or a baseline `OwnedBy` whose reference is not a
 /// `Net` key; and as `Overlay::new` fails.
 pub fn diff(rows: &RegionRows, baseline: &Baseline, schemas: &SchemaTable) -> Result<Overlay> {
+    // The live world's entry point: a NaN in a persistent column is asserted here, in a
+    // debug build, and canonicalised in the shared path below, which also takes decoded
+    // values (architecture section 8.2).
+    if cfg!(debug_assertions) {
+        for data in rows.rows.iter().flat_map(|row| &row.components) {
+            if schemas.persistence(data.component) == Some(Persistence::Persistent)
+                && let (Some(saved), Some(info)) =
+                    (schemas.saved(data.component), schemas.info(data.component))
+            {
+                saved.debug_assert_no_nan(&data.bytes, info.name());
+            }
+        }
+    }
     diff_rows(&rows.rows, baseline, schemas)
 }
 
@@ -474,6 +487,7 @@ impl RegionRecords {
         for data in &export.rows.resources {
             let (info, saved) = resource(schemas, data.component, Persistence::Persistent)?;
             sized(info, saved, &data.bytes)?;
+            saved.debug_assert_no_nan(&data.bytes, info.name());
             let mut bytes = data.bytes.clone();
             saved.canonicalise(&mut bytes);
             resources.push(ComponentData { component: data.component, bytes });

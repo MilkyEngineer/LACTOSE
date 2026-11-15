@@ -47,8 +47,9 @@ stored under it have its size. A save written under an old schema can therefore 
 field by field by a build that no longer knows that layout.
 
 **Baseline.** Rows are grouped by exact component set. Each column is the component's bytes
-for every row, back to back, so loading an archetype is one copy per column followed by the
-reference remap pass. Rows are in ascending `NetId` order.
+for every row, back to back, so loading an archetype is one copy per column: a reference is
+loaded as exported, since it holds an origin key or an `AssetId`, each the same on every
+machine, an owner excepted (architecture section 7). Rows are in ascending `NetId` order.
 
 **Overlay.** Each state of a region has one record set:
 

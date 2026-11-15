@@ -220,8 +220,9 @@ fn channel_entries_reach_later_stages_with_keys_resolved_and_do_not_outlive_the_
 
     world = tick(&mut schedule, world, &executor);
     let seen = std::mem::take(&mut *world.service_mut::<Seen>().unwrap().get_mut().unwrap());
-    // The writing stage saw nothing; the next stage saw the entry with its key resolved.
-    assert_eq!(seen, [(net(1), 1)]);
+    // The writing stage saw nothing; the next stage saw the entry with its key resolved, to
+    // the runtime key after the direct spawn under 5 (D142: a direct spawn moves the counter).
+    assert_eq!(seen, [(net(6), 1)]);
     world = tick(&mut schedule, world, &executor);
     assert!(take_seen(&mut world).is_empty(), "tick 2 wrote nothing and tick 1's entry is gone");
 }
@@ -465,11 +466,12 @@ fn a_take_yields_the_earlier_stages_entries_with_keys_resolved_once() {
         world = tick(&mut schedule, world, &executor);
     }
     let taken = std::mem::take(&mut *world.service_mut::<Taken>().unwrap().get_mut().unwrap());
-    // The spawns resolve to the server's runtime keys, 1 and 2; each tick's take holds that
-    // tick's entries alone, and the third tick wrote none.
+    // The spawns resolve to the server's runtime keys after the direct spawn under 5, 6 and
+    // 7 (D142: a direct spawn moves the counter); each tick's take holds that tick's entries
+    // alone, and the third tick wrote none.
     assert_eq!(
         taken,
-        [vec![(net(1), 1), (net(41), 1)], vec![(net(2), 1), (net(42), 1)], Vec::new()]
+        [vec![(net(6), 1), (net(41), 1)], vec![(net(7), 1), (net(42), 1)], Vec::new()]
     );
 }
 

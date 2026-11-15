@@ -447,8 +447,8 @@ impl Container {
     /// are taken as made, so `app` encodes each region on a worker and assembles here; their
     /// records are not read, so what [`decode`](Self::decode) refuses across sections is
     /// not seen here, and a writer calls [`check_sections`](Self::check_sections) over the
-    /// records first. A world's own export can fail it: a server world accepts a direct
-    /// spawn under a runtime `NetId` at or above its counter and leaves the counter.
+    /// records first. A world's own export passes it with the world's counter, which the
+    /// world keeps above every runtime `NetId` it holds (D142).
     pub fn assemble(header: &ContainerHeader, sections: Vec<EncodedSection>) -> Result<Vec<u8>> {
         if header.format != CONTAINER_FORMAT_VERSION {
             return Err(Error::new(

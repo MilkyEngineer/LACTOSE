@@ -254,25 +254,50 @@ fn rebase_returns_what_it_drops_and_nothing_else() {
     }
 }
 
-#[test]
-fn a_noncanonical_scalar_in_the_patch_is_equal() {
-    let patch = |mass: Scalar| {
-        let mut rows = rows_a();
-        rows[1] = BaselineRow { id: c(A, 2), components: vec![data(pos(2, 2)), data(Mass(mass))] };
-        Arc::new(cook(rows))
-    };
+/// `baseline_a` with `c(A, 2)`'s mass cooked as `mass`.
+fn patch_mass(mass: Scalar) -> Arc<Baseline> {
+    let mut rows = rows_a();
+    rows[1] = BaselineRow { id: c(A, 2), components: vec![data(pos(2, 2)), data(Mass(mass))] };
+    Arc::new(cook(rows))
+}
 
-    // The save holds the canonical NaN, the patch another NaN: one value, no record.
+/// A release build's proof: the save holds the canonical NaN, the patch another NaN, one
+/// value and no record. A live world holds no NaN (architecture section 8.2), so a debug
+/// build asserts at the save instead, and there the test proves the assertion.
+#[test]
+#[cfg_attr(debug_assertions, should_panic(expected = "a NaN at byte 0 of a persistent `"))]
+fn a_noncanonical_scalar_in_the_patch_is_equal() {
     let (mut world, table) = moved_in(vec![]);
     world.insert(net(c(A, 2)), Mass(Scalar::NAN)).unwrap();
     let saved = RegionRecords::from_export(&export(&world), &baseline_a(), &table).unwrap();
     assert!(saved.overlay.is_some());
-    let patched = patch(odd_nan());
+    let patched = patch_mass(odd_nan());
     let (rebased, _) = rebase_onto(&saved, &patched, &table);
     assert!(rebased.overlay.is_none());
     assert_eq!(rebased, RegionRecords::from_export(&export(&world), &patched, &table).unwrap());
     assert_eq!(reloaded(&rebased, &patched, &table), rebased);
+}
 
+/// The same on decoded records, which a debug build takes as they come: a save that holds
+/// the canonical NaN, rebased onto a patch that cooks another NaN, keeps no record.
+#[test]
+fn a_noncanonical_scalar_in_the_patch_is_equal_to_a_decoded_save() {
+    let (mut world, table) = moved_in(vec![]);
+    world.insert(net(c(A, 2)), Mass(Scalar::TWO)).unwrap();
+    let mut saved = RegionRecords::from_export(&export(&world), &baseline_a(), &table).unwrap();
+    let overlay = saved.overlay.as_deref().unwrap();
+    assert_eq!(overlay.records().len(), 1, "{:?}", overlay.records());
+    let nan = Record::AddComponent { id: c(A, 2), data: data(Mass(Scalar::NAN)) };
+    let decoded = Overlay::new(overlay.baseline_hash(), overlay.schemas().to_vec(), [nan]);
+    saved.overlay = Some(Arc::new(decoded.unwrap()));
+    saved.check().unwrap();
+    let (rebased, _) = rebase_onto(&saved, &patch_mass(odd_nan()), &table);
+    assert!(rebased.overlay.is_none(), "{rebased:?}");
+}
+
+#[test]
+fn a_negative_zero_in_the_patch_is_a_value_of_its_own() {
+    let patch = patch_mass;
     // Negative zero is a value of its own, not a spelling of zero: the save's zero stays.
     let (mut world, table) = moved_in(vec![]);
     world.insert(net(c(A, 2)), Mass(Scalar::ZERO)).unwrap();

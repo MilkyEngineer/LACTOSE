@@ -7,9 +7,10 @@
 mod common;
 
 use std::collections::BTreeSet;
+use std::sync::Mutex;
 
 use common::*;
-use lactose_core::{ErrorKind, StableKey, Tick};
+use lactose_core::{ErrorKind, NetId, PlayerId, PredictionKey, StableKey, Tick};
 use lactose_ecs::{
     ChunkOrder, LayoutConfig, PresentEvent, PresentEvents, PresentKind, RegionConfig, RegionId,
     RegionMode, Res, ScheduleError, StableKeyOf, SystemSet, World, WorldKind, system,
@@ -19,7 +20,7 @@ use lactose_reflect::component;
 use lactose_sim::harness::{ChunkCapacity, layout_mode, layout_mode_of};
 use lactose_sim::{
     CurrentTick, Pass, RegionAtlas, RegionCell, RegionControl, RegionPolicy, Registration,
-    SimulationBuilder, Stage, TickInput, TypeTable, sets,
+    SimulationBuilder, Stage, StagedState, TickInput, TypeTable, sets,
 };
 
 fn net(id: u64) -> StableKey {
@@ -537,4 +538,113 @@ fn layout_mode_of_inverts_layout_mode_and_refuses_a_dropped_perturbation() {
     }
     let seeded = LayoutConfig { seed: 5, ..LayoutConfig::default() };
     assert_eq!(layout_mode_of(&seeded).err().unwrap().kind(), ErrorKind::InvalidData);
+}
+
+// ---- Binds at the end of a step (D142) ----
+
+/// The bind an exclusive system saw at each tick, of the one prediction key it watches.
+struct Watch {
+    key: PredictionKey,
+    seen: Vec<Option<NetId>>,
+}
+
+type Watched = Mutex<Watch>;
+
+#[system(name = "test::watch_bind", worlds = [server], exclusive, after = weather)]
+fn watch_bind(world: &mut World, watch: Res<Watched>) {
+    let mut watch = watch.lock().unwrap();
+    let key = watch.key;
+    watch.seen.push(world.alias(key));
+}
+
+/// A client's staged-state hook that despawns `key` at `tick`, as the stream's despawn.
+struct Despawner {
+    key: PredictionKey,
+    tick: Tick,
+}
+
+impl StagedState for Despawner {
+    fn apply(&mut self, world: &mut World, tick: Tick) -> lactose_core::Result<()> {
+        if tick == self.tick {
+            world.despawn(StableKey::Predicted(self.key))?;
+        }
+        Ok(())
+    }
+}
+
+fn origin(ordinal: u32) -> PredictionKey {
+    PredictionKey { player: PlayerId(2), input_tick: Tick(1), ordinal }
+}
+
+fn id(bits: u64) -> NetId {
+    NetId::from_bits(bits).unwrap()
+}
+
+fn watched(world: &World) -> Vec<Option<NetId>> {
+    std::mem::take(&mut world.service::<Watched>().unwrap().lock().unwrap().seen)
+}
+
+#[test]
+fn a_server_holds_no_bind_of_an_entity_despawned_in_a_step() {
+    let watch = |world: &mut World| {
+        let service = Mutex::new(Watch { key: origin(3), seen: Vec::new() });
+        world.insert_service::<Watched>(Box::new(service));
+        Ok(())
+    };
+    let builder = game(WorldKind::Server)
+        .setup(watch)
+        .systems(|registration| _ = registration.stage(Stage::Post).add(&WATCH_BIND));
+    let (executor, mut simulation) = directed(builder);
+    let (region, other) = (region_at(0, 0), region_at(1, 0));
+    let mut frame = TickInput::default();
+    frame.loaded.insert(other, fresh(other));
+    simulation = step(&executor, simulation, frame);
+
+    // One the game's `age` despawns by a command in the next step; one in the region the
+    // next step unloads.
+    let world = simulation.world_mut();
+    world.spawn(StableKey::Predicted(origin(1)), region, (Age(90),)).unwrap();
+    world.bind(origin(1), id(901)).unwrap();
+    world.spawn(StableKey::Predicted(origin(2)), other, (Health(1),)).unwrap();
+    world.bind(origin(2), id(902)).unwrap();
+    let mut frame = TickInput::default();
+    frame.unloaded.insert(other);
+    simulation = step(&executor, simulation, frame);
+    let world = simulation.world();
+    assert!(!world.contains(StableKey::Predicted(origin(1))), "the age system despawned it");
+    assert_eq!(world.alias(origin(1)), None, "gone once the despawning step resolved");
+    assert_eq!(world.alias(origin(2)), Some(id(902)), "an unloaded entity keeps its bind");
+
+    // One despawned through `world_mut()` between steps: bound through the next step, and
+    // gone once it has resolved.
+    let world = simulation.world_mut();
+    world.spawn(StableKey::Predicted(origin(3)), region, (Health(1),)).unwrap();
+    world.bind(origin(3), id(903)).unwrap();
+    world.despawn(StableKey::Predicted(origin(3))).unwrap();
+    assert_eq!(world.alias(origin(3)), Some(id(903)));
+    let _ = watched(world);
+    simulation = step(&executor, simulation, TickInput::default());
+    assert_eq!(watched(simulation.world()), [Some(id(903))], "bound through the next step");
+    assert_eq!(simulation.world().alias(origin(3)), None);
+
+    // A client's step sets the horizon to its current tick before the run, so the bind of
+    // an entity its staged-state hook despawned outlives the step.
+    let despawner = Despawner { key: origin(4), tick: Tick(3) };
+    let mut simulation = SimulationBuilder::new(WorldKind::Client, types())
+        .staged_state(Box::new(despawner))
+        .build()
+        .unwrap();
+    let region = region_at(0, 0);
+    let mut frame = TickInput::default();
+    frame.loaded.insert(region, fresh(region));
+    simulation = step(&executor, simulation, frame);
+    let world = simulation.world_mut();
+    world.spawn(StableKey::Predicted(origin(4)), region, (Health(1),)).unwrap();
+    world.bind(origin(4), id(904)).unwrap();
+    simulation = step(&executor, simulation, TickInput::default());
+    assert_eq!(simulation.tick(), Tick(2));
+    simulation = step(&executor, simulation, TickInput::default());
+    assert!(!simulation.world().contains(StableKey::Predicted(origin(4))), "the hook ran");
+    assert_eq!(simulation.world().alias(origin(4)), Some(id(904)), "it outlives the step");
+    executor.shutdown();
 }

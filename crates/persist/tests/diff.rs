@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use common::*;
 use lactose_asset_api::AssetSet;
-use lactose_bundle::{Baseline, BaselineRow, ComponentData, ComponentSchema, Record};
+use lactose_bundle::{Baseline, BaselineRow, ComponentData, ComponentSchema, Overlay, Record};
 use lactose_core::{
     ComponentKey, EntityRef, ErrorKind, NetId, PlayerId, PredictionKey, Result, StableKey, Tick,
 };
@@ -23,8 +23,10 @@ use lactose_ecs::{
 };
 use lactose_math::Scalar;
 use lactose_net_api::OverlayPayload;
-use lactose_persist::{Loader, Migrations, RegionRecords, SchemaTable, diff};
-use lactose_reflect::{Reflect, Registry, resource};
+use lactose_persist::{
+    FieldValues, Loader, Migration, Migrations, RegionRecords, SchemaTable, diff,
+};
+use lactose_reflect::{Reflect, Registry, component, resource};
 use lactose_sim::RegionExport;
 use lactose_sim::harness::{ChunkCapacity, layout_mode};
 
@@ -69,17 +71,6 @@ fn canonical(mut records: Vec<Record>) -> Vec<Record> {
 fn every_change_kind_gives_exactly_its_records() {
     let Changed { world, table, spawned, .. } = changed();
     let rows = world.export_region(A).unwrap();
-
-    // The NaN is exported as stored, so the canonical one below is this crate's doing.
-    let canonical_nan = Scalar::from_canonical_bits(odd_nan().to_canonical_bits());
-    let exported_c3 = rows.rows.iter().find(|row| row.id == c(A, 3)).unwrap();
-    let exported_pos = exported_c3.components.iter().find(|d| d.component == Position::KEY);
-    assert_ne!(
-        exported_pos.unwrap().bytes,
-        data(Position { x: canonical_nan, y: Scalar::from_i32(3) }).bytes,
-        "the test writes a NaN whose bits are not canonical"
-    );
-
     let overlay = diff(&rows, &baseline_a(), &table).unwrap();
     let expected = vec![
         Record::Spawn {
@@ -96,10 +87,7 @@ fn every_change_kind_gives_exactly_its_records() {
         Record::AddComponent { id: c(A, 3), data: data(Mass(Scalar::from_i32(5))) },
         Record::AddComponent { id: c(A, 3), data: data(Health(7)) },
         Record::RemoveComponent { id: c(A, 3), component: Marker::KEY },
-        Record::AddComponent {
-            id: c(A, 3),
-            data: data(Position { x: canonical_nan, y: Scalar::from_i32(3) }),
-        },
+        Record::AddComponent { id: c(A, 3), data: data(pos(-3, 3)) },
         Record::OwnershipChange { id: c(A, 4), owner: Some(spawned) },
         Record::OwnershipChange { id: c(A, 5), owner: None },
         Record::AddComponent { id: c(A, 6), data: zeroed::<Contacts>() },
@@ -297,7 +285,11 @@ fn a_resource_among_components_or_a_value_of_another_size_is_invalid() {
     assert_eq!(error.kind(), ErrorKind::InvalidData, "{error}");
 }
 
+/// A release build's proof that the diff writes a live world's scalars canonical. A debug
+/// build asserts at the diff instead, since a live world holds no NaN (architecture section
+/// 8.2), so there the test proves the assertion.
 #[test]
+#[cfg_attr(debug_assertions, should_panic(expected = "a NaN at byte 0 of a persistent `"))]
 fn a_spawned_moved_in_or_gained_component_is_written_canonical() {
     let registry = Arc::new(registry());
     let table = SchemaTable::from_registry(&registry).unwrap();
@@ -353,30 +345,155 @@ pub struct Wind {
     pub y: Scalar,
 }
 
-#[test]
-fn a_scalar_resource_is_written_canonical_by_the_save_and_the_load() {
-    let mut registry = registry();
-    registry.register::<Wind>().unwrap();
-    let table = SchemaTable::from_registry(&registry).unwrap();
+/// A NaN of odd bits and a negative zero, and the same value canonical.
+fn odd_wind() -> (Wind, Wind) {
     let odd = Wind { x: odd_nan(), y: Scalar::from_f64(-0.0) };
     let canonical = Wind {
         x: Scalar::from_canonical_bits(odd_nan().to_canonical_bits()),
         y: Scalar::from_f64(-0.0),
     };
     assert_ne!(data(odd).bytes, data(canonical).bytes);
-    let rows = RegionRows { seed: 1, resources: vec![data(odd)], ..RegionRows::default() };
+    (odd, canonical)
+}
+
+/// The records of region A holding `wind` as its one resource, against an empty baseline.
+fn wind_records(wind: Wind) -> (RegionRecords, SchemaTable) {
+    let mut registry = registry();
+    registry.register::<Wind>().unwrap();
+    let table = SchemaTable::from_registry(&registry).unwrap();
+    let rows = RegionRows { seed: 1, resources: vec![data(wind)], ..RegionRows::default() };
     let export = RegionExport { region: A, rows };
     let empty = Baseline::from_rows(AssetSet::new(), [], []).unwrap();
-    let saved = RegionRecords::from_export(&export, &empty, &table).unwrap();
+    (RegionRecords::from_export(&export, &empty, &table).unwrap(), table)
+}
+
+/// A release build's proof that the save writes a live world's scalar resource canonical;
+/// a debug build asserts there instead, as for a component's column.
+#[test]
+#[cfg_attr(debug_assertions, should_panic(expected = "a NaN at byte 0 of a persistent `"))]
+fn a_scalar_resource_is_written_canonical_by_the_save() {
+    let (odd, canonical) = odd_wind();
+    let (saved, _) = wind_records(odd);
     // The NaN is made canonical; the negative zero is a value and stays.
     assert_eq!(saved.resources, vec![data(canonical)]);
+}
 
-    // Records whose resource is not canonical: the loader writes it canonical.
-    let mut odd_records = saved.clone();
-    odd_records.resources = vec![data(odd)];
+#[test]
+fn a_scalar_resource_is_written_canonical_by_the_load() {
+    let (odd, canonical) = odd_wind();
+    // Decoded records whose resource is not canonical: the loader writes it canonical, and
+    // asserts nothing in a debug build, since a file is not a live world.
+    let (mut records, table) = wind_records(Wind { x: Scalar::ONE, y: Scalar::ONE });
+    records.resources = vec![data(odd)];
     let migrations = Migrations::new();
-    let loaded = Loader::new(&table, &migrations).migrate(&odd_records).unwrap();
+    let loaded = Loader::new(&table, &migrations).migrate(&records).unwrap();
     assert_eq!(loaded.resources, vec![data(canonical)]);
+}
+
+/// A transient column of scalars, which no type of the shared game is.
+#[component(key = "diff::spin", transient)]
+#[derive(PartialEq, Debug)]
+pub struct Spin(#[field(id = 1)] pub Scalar);
+
+/// A world of A loaded from its baseline, `Spin` registered.
+#[cfg(debug_assertions)]
+fn spin_world() -> (World, SchemaTable) {
+    let mut registry = registry();
+    registry.register::<Spin>().unwrap();
+    let registry = Arc::new(registry);
+    let table = SchemaTable::from_registry(&registry).unwrap();
+    let mut world = WorldBuilder::new(WorldKind::Server, registry).build().unwrap();
+    world
+        .create_region(RegionConfig { id: A, seed: seed_of(A), mode: RegionMode::Simulated })
+        .unwrap();
+    world.load_region(A, &baseline_a(), None).unwrap();
+    (world, table)
+}
+
+/// D142: a debug build asserts on any NaN in a persistent column of a live world's export,
+/// the canonical one too, at the diff.
+#[test]
+#[cfg(debug_assertions)]
+#[should_panic(expected = "a NaN at byte 0 of a persistent `game::mass` in a live world's export")]
+fn a_debug_build_asserts_on_a_nan_in_a_persistent_column() {
+    let (mut world, table) = spin_world();
+    world.insert(net(c(A, 3)), Mass(Scalar::NAN)).unwrap();
+    let rows = world.export_region(A).unwrap();
+    let _ = diff(&rows, &baseline_a(), &table);
+}
+
+/// D142: a debug build asserts on a NaN in a persistent region resource of a live world's
+/// export, at `RegionRecords::from_export`.
+#[test]
+#[cfg(debug_assertions)]
+#[should_panic(expected = "a NaN at byte 0 of a persistent `diff::wind` in a live world's export")]
+fn a_debug_build_asserts_on_a_nan_in_a_persistent_resource() {
+    let _ = wind_records(Wind { x: Scalar::NAN, y: Scalar::ONE });
+}
+
+/// D142: a NaN in a transient column is no simulation state the save keeps, so a debug
+/// build asserts nothing and the save zeroes it; nor does a NaN in decoded records, which
+/// the loader writes canonical.
+#[test]
+#[cfg(debug_assertions)]
+fn a_debug_build_asserts_nothing_on_a_transient_column_or_a_decoded_value() {
+    let (mut world, table) = spin_world();
+    world.insert(net(c(A, 3)), Spin(Scalar::NAN)).unwrap();
+    let export = RegionExport { region: A, rows: world.export_region(A).unwrap() };
+    let records = RegionRecords::from_export(&export, &baseline_a(), &table).unwrap();
+    let added =
+        records.overlay.as_ref().unwrap().records().iter().find_map(|record| match record {
+            Record::AddComponent { id, data } if *id == c(A, 3) && data.component == Spin::KEY => {
+                Some(data.clone())
+            }
+            _ => None,
+        });
+    assert_eq!(added, Some(zeroed::<Spin>()));
+
+    // The records of a world with a plain mass, then the NaN written in as a file saved
+    // under the type's previous version would hold it: the loader's step writes it
+    // canonical, and asserts nothing.
+    let (mut world, table) = spin_world();
+    world.insert(net(c(A, 3)), Mass(Scalar::TWO)).unwrap();
+    let export = RegionExport { region: A, rows: world.export_region(A).unwrap() };
+    let mut records = RegionRecords::from_export(&export, &baseline_a(), &table).unwrap();
+    let overlay = records.overlay.as_deref().unwrap();
+    let nan = data(Mass(odd_nan()));
+    let decoded: Vec<Record> = overlay
+        .records()
+        .iter()
+        .map(|record| match record {
+            Record::AddComponent { id, data } if data.component == Mass::KEY => {
+                Record::AddComponent { id: *id, data: nan.clone() }
+            }
+            other => other.clone(),
+        })
+        .collect();
+    let from = table.schema(Mass::KEY).unwrap().schema_version() - 1;
+    let previous = |schema: &ComponentSchema| {
+        if schema.component() != Mass::KEY {
+            return schema.clone();
+        }
+        let fields = schema.fields().iter().copied();
+        ComponentSchema::new(Mass::KEY, from, schema.element_size(), fields).unwrap()
+    };
+    let schemas = overlay.schemas().iter().map(previous);
+    let rebuilt = Overlay::new(overlay.baseline_hash(), schemas, decoded);
+    records.overlay = Some(Arc::new(rebuilt.unwrap()));
+    let mut migrations = Migrations::new();
+    migrations.register(Migration { component: Mass::KEY, from, run: unchanged }).unwrap();
+    let loaded = Loader::new(&table, &migrations).migrate(&records).unwrap();
+    let canonical = data(Mass(Scalar::from_canonical_bits(odd_nan().to_canonical_bits())));
+    let mass = loaded.overlay.as_ref().unwrap().records().iter().find_map(|record| match record {
+        Record::AddComponent { data, .. } if data.component == Mass::KEY => Some(data.clone()),
+        _ => None,
+    });
+    assert_eq!(mass, Some(canonical));
+}
+
+/// A step that changes nothing.
+fn unchanged(_: &mut FieldValues) -> Result<()> {
+    Ok(())
 }
 
 /// `cooked_schemas()` with `component`'s version moved on: a cook another build made.

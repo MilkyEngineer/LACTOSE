@@ -24,10 +24,8 @@ loads", "Regions": `save_point`, `RegionExport`, `RegionBundle`, the load path) 
 `rebase`) are the contracts this crate builds on and never restates; `crates/net-api/
 README.md` ("The relevance message") is the one consumer contract it meets.
 
-**The addition of D142 is a facade** until the lane `binds-impl` implements it:
-`Loader::binds` has its final signature and a `todo!()` body, every sentence below that is
-not yet true is marked "(D142; facade)", and "Proof for D142" names the tests that will
-hold them. Nothing else of the surface changes, and the container's format does not.
+D142 added `Loader::binds`, which "Proof for D142" holds. Nothing else of the surface
+changed, and the container's format did not.
 
 Amending a signature is allowed in the change that needs it. Say so in the change
 description and list what changed, because `app`, the game crates (their migrations), the
@@ -47,7 +45,7 @@ them writes: a change that breaks one is a signature change to list.
 | `ContainerIndex`, `RegionIndexEntry`, `PREAMBLE_BYTES`, `Container::{index_len, index, decode_section, decode_region}` | The per-region index of architecture section 15.4, read from the front of the file without any section, and one region's section read alone |
 | `MAX_CONTAINER_BYTES`, `MAX_SECTION_BYTES` | The size caps a reader enforces before it allocates |
 | `Migrations`, `Migration`, `MigrateFn`, `FieldValues`, `FieldIds` | One registered step per (type, version) and the value a step edits by field ID; `migrate` for one value, `migrate_overlay` for a document |
-| `Loader` | The load side: records migrated to the registry's schemas, validated, and built into the `RegionBundle` the input sync point loads; `Loader::binds`, the binds of a saved world, which the world holds before its first region loads (D142; facade) |
+| `Loader` | The load side: records migrated to the registry's schemas, validated, and built into the `RegionBundle` the input sync point loads; `Loader::binds`, the binds of a saved world, which the world holds before its first region loads (D142) |
 
 Hidden plumbing: none. The private fields of every type are the implementation's to
 reshape.
@@ -58,14 +56,14 @@ reshape.
 |---|---|---|
 | `app` (server, the save) | One table per registry; the save copy at a sync point; one diff and one section per region on worker tasks; the bytes to write through `io` | `SchemaTable::from_registry(simulation.world().registry())` once; `Simulation::save_point` (`lactose-sim`); per `SavePoint::regions` entry, on a background task, `RegionRecords::from_export(export, &baseline, &schemas)`, then `Container::check_sections(&header, &records)` and per region `encode_section()`; then `Container::assemble(&header, sections)` with `header = ContainerHeader::of(&save, &schemas)`; the slot write is `app`'s ("Saving and loading" below). In memory: `Container::new`, `insert`, `encode` |
 | `app` (server, the relevance message) | The message for a region that became relevant to a client, through the same records a save holds | `RegionRecords::from_export(export, &baseline, &schemas)?.to_relevance(table)`, on the export `app` takes for the region between runs; `net` sends it. One rule for `Cooked` and one canonicalisation, both `from_export`'s |
-| `app` (a fresh process) | The tick, the counter and the save's binds into the builder; one bundle per region into the first frame | `Container::decode` (a whole file in memory), `ContainerHeader::{tick, next_net_id}` into `SimulationBuilder::{tick, next_net_id}`; `Loader::new(&schemas, &migrations)`, `Loader::binds` over every section, migrated, into `SimulationBuilder::binds` (D142; facade); `Loader::bundle(records, baseline, mode, assets)` per section into `TickInput::loaded`; every player joins again through `TickInput::sessions` |
+| `app` (a fresh process) | The tick, the counter and the save's binds into the builder; one bundle per region into the first frame | `Container::decode` (a whole file in memory), `ContainerHeader::{tick, next_net_id}` into `SimulationBuilder::{tick, next_net_id}`; `Loader::new(&schemas, &migrations)`, `Loader::binds` over every section, migrated, into `SimulationBuilder::binds` (D142); `Loader::bundle(records, baseline, mode, assets)` per section into `TickInput::loaded`; every player joins again through `TickInput::sessions` |
 | `app` (a reload in place, one frame or two) | The same bundles, from the save or from the unload's exports | One frame: `unloaded` every loaded region and `loaded` the bundles of the save; two frames: `unloaded`, then `RegionLifecycle::take_exports` through `RegionRecords::from_export` and `Loader::bundle` into the next frame's `loaded` |
 | `app` (a save-slot browser; a streaming load; the corrupt-save path) | What a save holds without reading a section; one region alone; what is readable of a damaged file | `Container::index_len` over the first `PREAMBLE_BYTES`, `Container::index` over that prefix; `ContainerIndex::entry`, the section's bytes at its `offset`, `Container::decode_section`, then `Loader::bundle`; a damaged section fails alone and the others decode |
 | `app` (a patched baseline) | Carry a save over to re-cooked baselines | `Loader::migrate`, then `RegionRecords::rebase(&patched, &table)` per section before `Loader::bundle`, which refuses a mismatched hash; the dropped records go to the re-homing pass ("Not in this crate yet") |
 | `lactose-net` (client) | Nothing: the client never diffs | It caches overlays by digest as the bytes of `Overlay::encode` (`lactose-bundle`) and builds its bundle with `RegionRelevance::to_bundle` |
 | `lactose-sim` | Nothing new | `RegionExport` is the input, `RegionBundle` the output, `SavePoint::{tick, next_net_id}` the header's |
 | Game crates | A migration per schema version bump, as plain functions | `register_migrations(&mut Migrations)` beside `register_types`; `Migration { component, from, run }`; `FieldValues::{read, write, take, get, set}` ("The registration a game crate writes" below) |
-| The journal tooling (milestone 1) | A checkpoint's regions in the save's format; the server's binds at the checkpoint | `Journal::checkpoint` is a `SavePoint`: its regions are a `Container` under the checkpoint's header; `Journal::binds` is `Loader::binds` over the records of the server's save point, loaded and kept regions alike (D142; facade); the journal's other fields (tables, modes, players, held joins, requests, services, frames) are the tooling's, beside it |
+| The journal tooling (milestone 1) | A checkpoint's regions in the save's format; the server's binds at the checkpoint | `Journal::checkpoint` is a `SavePoint`: its regions are a `Container` under the checkpoint's header; `Journal::binds` is `Loader::binds` over the records of the server's save point, loaded and kept regions alike (D142); the journal's other fields (tables, modes, players, held joins, requests, services, frames) are the tooling's, beside it |
 | The section 15.5 tests and D124's reload paths | A real save and load behind every path | "Proof for milestone 1" below; `tests/sketch.rs` sections 4 and 5 |
 
 ## The registration a game crate writes
@@ -180,7 +178,14 @@ its value is never saved ("Migrations" below).
   `Scalar::from_canonical_bits(bits).to_canonical_bits()` (one pattern for every NaN,
   negative zero kept, D105), and every other byte is as exported. The ECS exports memory
   bytes uncanonicalised and says this crate canonicalises (`ExportedRow`); the world hash
-  canonicalises the same way, so a save and a hash agree on what a value is.
+  canonicalises the same way, so a save and a hash agree on what a value is. A NaN in a
+  persistent value of a live world is a defect of the build that wrote it (architecture
+  section 8.2): a debug build asserts on one at the live world's entry points, `diff` over
+  export rows and `RegionRecords::from_export` over the export's resources, naming the byte
+  and the type (D142), and a release build writes it canonical. The canonical rule itself
+  is shared with the load, which takes a decoded value as it comes and asserts nothing: a
+  step `Loader::migrate` runs writes its result canonical, and a value at the registry's
+  schema and digest is kept as decoded.
 
 **Schemas** (architecture section 15.4)
 
@@ -412,30 +417,27 @@ export:
   replaces a region's section; `decode(encode(c)) == c` whenever `encode` succeeds;
   containers compare by content.
 - The sections hold together and agree with the header: every runtime `NetId` a section
-  spawns is below the header's `next_net_id`, since the server would otherwise hand that
-  ID out again, and no `NetId` is held by two sections, since the second region's load
-  would find the entity live. A section holds an entity it spawns (`Spawn`,
-  `SpawnFromBaseline`) and a row of its baseline it changes (`AddComponent`,
-  `RemoveComponent`, `SetField`, `OwnershipChange`); a `Destroy` holds nothing.
-  `Container::check_sections(header, sections)` is the check, over a header and any
-  sections, failing with `InvalidData` naming the `NetId` and the regions. `decode` runs it
-  after every section has decoded and before anything is built from them, and `encode`
-  before it writes; `insert` does not, and `assemble` cannot, since it never reads the
-  records, so a writer that assembles runs it over the records first (`app`'s
-  `Server::encode_save` does). A world's own export can fail it today: a server world
-  accepts a direct `World::spawn` under a runtime `NetId` at or above its counter and
-  leaves the counter (`docs/verification.md`, the row on that spawn). From the lane
-  `binds-impl` on it cannot (D142; facade): a world keeps its counter above every runtime
-  `NetId` it is given, by a spawn, a load or a bind (`crates/ecs/README.md`, Regions), so
-  the counter rule refuses spliced and damaged files alone. A reader of single sections
-  (`decode_section`) runs it over the sections it holds. The check rests on two orders it
-  does not enforce: an overlay's records strictly ascend by `NetId` (`lactose-bundle`'s
-  canonical form) and a runtime `NetId` orders below every cooked one (`lactose-core`'s
-  cooked bit), so a section's highest runtime spawn is one binary search and the
-  duplicate pass sorts already-sorted runs; `tests/container.rs` pins both. A cooked
-  entity a section spawns from the baseline while it is still an unchanged row of another
-  section's baseline has no record there, so it is not seen here: that takes the
-  baselines, and `lactose_app::load` checks it.
+  spawns is below the header's `next_net_id`, since the server would otherwise hand that ID
+  out again, and no `NetId` is held by two sections, since the second region's load would
+  find the entity live. A section holds an entity it spawns (`Spawn`, `SpawnFromBaseline`)
+  and a row of its baseline it changes (`AddComponent`, `RemoveComponent`, `SetField`,
+  `OwnershipChange`); a `Destroy` holds nothing. `Container::check_sections(header,
+  sections)` is the check, over a header and any sections, failing with `InvalidData` naming
+  the `NetId` and the regions. `decode` runs it after every section has decoded and before
+  anything is built from them, and `encode` before it writes; `insert` does not, and
+  `assemble` cannot, since it never reads the records, so a writer that assembles runs it
+  over the records first (`app`'s `Server::encode_save` does). A world's own export cannot
+  fail it (D142): a world keeps its counter above every runtime `NetId` it is given, by a
+  spawn, a load or a bind (`crates/ecs/README.md`, Regions), so the counter rule refuses
+  spliced and damaged files alone. A reader of single sections (`decode_section`) runs it
+  over the sections it holds. The check rests on two orders it does not enforce: an
+  overlay's records strictly ascend by `NetId` (`lactose-bundle`'s canonical form) and a
+  runtime `NetId` orders below every cooked one (`lactose-core`'s cooked bit), so a
+  section's highest runtime spawn is one binary search and the duplicate pass sorts
+  already-sorted runs; `tests/container.rs` pins both. A cooked entity a section spawns from
+  the baseline while it is still an unchanged row of another section's baseline has no
+  record there, so it is not seen here: that takes the baselines, and `lactose_app::load`
+  checks it.
 - A region is a section of its own, made and read on its own. `RegionRecords::encode_section`
   is one zstd frame at level 3 (measured, D129), without zstd's own checksum since the
   entry's xxh64 covers the frame, carrying its content size, whose content is the region,
@@ -494,7 +496,7 @@ export:
 - `EngineVersion::CURRENT` is the workspace version at compile time, recorded for tools;
   a load never refuses on it.
 
-**Binds** (architecture sections 6, 7 and 15.5; D142; facade)
+**Binds** (architecture sections 6, 7 and 15.5; D142)
 
 - A save writes every reference field as the ECS stores it, an origin key, except one: an
   owner is written as its `NetId` (`ExportedRow::owner`, `Record::OwnershipChange`), and
@@ -540,8 +542,9 @@ export:
   under two `NetId`s, in one section or across two, and one `NetId` under two prediction
   keys across two sections. `lactose_app::load` runs it over every section before any
   world exists, so a spliced save fails there, not at the load of the second row hours
-  in. Records that fail `check`, and a value that is not a valid `PredictedOrigin`, are
-  `InvalidData`; a section that carries the component at another schema or layout digest
+  in. Records that fail `check` are `InvalidData` (no value of `ecs::predicted_origin` is
+  invalid: every bit pattern of its size is one, and an overlay holds no value of another
+  size); a section that carries the component at another schema or layout digest
   than the table's is `VersionMismatch` (`Loader::migrate` first); a section that carries
   it under a table that lacks the type is `NotFound`.
 - The cost is one pass over the records with a binary search among the components of each
@@ -578,12 +581,11 @@ and 15.5; D124, D126)
   `Loader::bundle` per region; the bundles cross into the simulation through
   `TickInput::loaded` at an input sync point, the one path a region load has. A fresh
   process builds with `SimulationBuilder::tick(header.tick).next_net_id(header.next_net_id)`
-  and, from the lane `binds-impl` on, `.binds(loader.binds(&sections)?)` over every
-  section of the file, whether or not its region loads in the first frame ("Binds"
-  above; D142; facade),
-  and loads every section in its first frame, every player joining again in the same
-  frame; `Loader::bundle` validates everything before anything loads, and the sync point
-  validates again before `create_region`, so a refused region changes nothing.
+  and `.binds(loader.binds(&sections)?)` over every section of the file, whether or not its
+  region loads in the first frame ("Binds" above; D142), and loads every section in its
+  first frame, every player joining again in the same frame; `Loader::bundle` validates
+  everything before anything loads, and the sync point validates again before
+  `create_region`, so a refused region changes nothing.
 - `Loader::bundle(records, baseline, mode, assets)`, in order: `records` passes `check`;
   `baseline.content_hash()` must equal `records.baseline_hash` (`VersionMismatch`: rebase
   first); the records are migrated (above), the overlay kept as the same `Arc` when
@@ -604,10 +606,10 @@ and 15.5; D124, D126)
   physics sync rebuilds a fresh solver on a reload (D124), under the table-and-mode
   condition stated under "Policy"; its fourth test is hash equality without physics and
   D124's tolerance with it. For a fresh process that leaves a saved region unloaded, the
-  first test holds from the lane `binds-impl` on, when the world is built with the save's
-  binds ("Binds" above; D142; facade): until then a row whose owner has a predicted
-  origin and resides in the region left unloaded is stored under the owner's `Net` key,
-  and the fresh process hashes apart from the original.
+  first test holds because the world is built with the save's binds ("Binds" above; D142):
+  without them a row whose owner has a predicted origin and resides in the region left
+  unloaded is stored under the owner's `Net` key, and the fresh process hashes apart from
+  the original.
 - The relevance message is `from_export` then `to_relevance`, run by the server's `app`
   between runs on the export it takes for the region; `net` sends it and the client's
   `app` builds the bundle with `RegionRelevance::to_bundle`, never through `Loader` (the
@@ -667,12 +669,11 @@ and 15.5; D124, D126)
 
 ## Proof for D142
 
-A facade: none of these tests exists yet. Each row is a test the lane `binds-impl` adds, by
-the name given, and the sentence it holds. The first two are the whole-project review's
-probe D1 and its control, adopted beside the section 15.5 tests; a test that records
-under SOUR is added to `[harness] tests` in `tools/xtask/ci-policy.toml` in the commit
-that adds it. Both record, and the lane runs them under every mode of SOUR's matrix,
-repeat, chaos and each layout capacity included, before it hands back.
+Each row is a test, by its name, and the sentence it holds. The first two are the
+whole-project review's probe D1 and its control, adopted beside the section 15.5 tests; a
+test that records under SOUR is added to `[harness] tests` in `tools/xtask/ci-policy.toml`
+in the commit that adds it. Both record, under every mode of SOUR's matrix, repeat, chaos
+and each layout capacity included.
 
 | Test | What it holds | File |
 |---|---|---|
@@ -680,8 +681,8 @@ repeat, chaos and each layout capacity included, before it hands back.
 | `an_owner_with_a_net_key_in_an_unloaded_region_hashes_equal` | The control: the same history with an owner whose origin key is its `Net` key. Equal with the binds and without them, so the difference above is the bind | `reload.rs` |
 | `the_binds_of_a_saved_world_are_what_its_loads_bind` | A world saved through `export_region` and `from_export`, never hand-built records, holding: a predicted spawn bound to a runtime `NetId` (a `Spawn` that carries the origin); a predicted entity bound by a direct `World::bind` to a cooked `NetId` that is no row of its region's baseline (a `SpawnFromBaseline` that carries it); one bound to the `NetId` of a cooked row of the baseline that was despawned first (an `AddComponent` of the origin); rows without an origin; and a region in its cooked state. `binds` gives exactly those three pairs; a world that loads every section, in either order, holds exactly those binds; and a world built with them loads each section alone to the export the save was made from, each of the three entities under its predicted origin | `binds.rs` |
 | `a_save_points_binds_are_the_worlds` | After every step of 200 seeded histories of predicted spawns, despawns, moves, unloads and reloads over two regions, driven through `Simulation::step`: `binds` over the records of every region, the loaded ones' exports and the unloaded ones' kept records, holds a prediction key exactly when the world holds a bind for it, with the same `NetId`, for every key the history made | `binds.rs` |
-| `binds_refuse_what_no_export_holds` | One prediction key under two `NetId`s in one section, and across two sections; one `NetId` under two prediction keys across two sections; each `InvalidData` naming the key, the `NetId`s and the regions in the order given. A value that is not a valid `PredictedOrigin`, and records that fail `check`, are `InvalidData`; nothing is returned | `binds.rs` |
-| `binds_read_records_at_the_registrys_schema` | A section that carries `ecs::predicted_origin` under another layout digest than the table's is `VersionMismatch`; the same section through `Loader::migrate` is read | `binds.rs` |
+| `binds_refuse_what_no_export_holds` | One prediction key under two `NetId`s in one section, and across two sections; one `NetId` under two prediction keys across two sections; each `InvalidData` naming the key, the `NetId`s and the regions in the order given. Records that fail `check` are `InvalidData`; nothing is returned. The same pairs once each are read. (A value that is not a valid `PredictedOrigin` cannot be built: every bit pattern of its size is one, and `Overlay::new` refuses a value of another size) | `binds.rs` |
+| `binds_read_records_at_the_registrys_schema` | A section that carries `ecs::predicted_origin` under another layout digest than the table's, at the table's version, is `VersionMismatch` naming the type; one that carries it at an older version is `VersionMismatch`, and the same section through `Loader::migrate` with a registered step is read | `binds.rs` |
 | `a_direct_runtime_spawn_above_the_counter_moves_it_and_its_export_passes_check_sections` | Replaces `a_direct_runtime_spawn_above_the_counter_fails_check_sections_though_assemble_writes_it`, which pins the behaviour D142 ends: the world's counter is above the spawned `NetId`, the header made from it passes `check_sections` over the world's own export, and a later allocation is not that `NetId`. The counter rule itself stays held by the spliced sections of the test beside it | `container.rs` |
 
 The container's golden bytes (`tests/format.rs`) do not move, and no test of "Proof for
@@ -694,10 +695,10 @@ step a simulation, so they record under SOUR (`tests/glue/mod.rs` is the glue). 
 
 | What | How |
 |---|---|
-| The diff | `tests/diff.rs`: a world with every change kind (a destroyed, a moved-in, a moved-out and a spawned entity; a component added, removed and changed; a transient component present and absent; an owner set, changed and cleared; a NaN written to a scalar of a changed, a spawned, a moved-in and a gained component) exported and diffed gives exactly the records of the table above, in canonical order, with the transient's bytes zeroed and the NaN canonical; the digest is equal under every `layout_mode` capacity, order and seed and with one and four workers; the empty diff is `None`; a key the table lacks and a resource among components are refused as stated and nothing is produced; a baseline column under another schema is `InvalidData` from the diff and `VersionMismatch` from `bundle` when the type is persistent, and accepted by the diff but `VersionMismatch` from `bundle` when it is derived; a persistent resource's odd NaN is canonical in the save and in the bytes `Loader::migrate` returns, its negative zero kept; the relevance message's resources equal the save's and `Cooked` exactly when the overlay is `None`; an entity owned by a cooked owner that moved to the other region and one owned by a runtime entity there save with the owner's `Destroy` and their `OwnershipChange`, the same with the owners' region unloaded, and reload to the same records in either order; a self-owner and the write that closes a two-entity cycle are refused by the world and the region saves as before; 200 seeded histories of spawns, predicted spawns bound to a fresh `NetId`, owner writes, moves, despawns (one followed by a write that names the dead entity), refused alone forms, unloads and reloads over two regions, the server's horizon passed after each step, keep the world a forest with every live row listed in its live owner's `owned_by`, `from_export` never failing, every unload's records reload (a reload changes nothing but owner edges it breaks, each a row's edge to a live entity of the other region whose chain of owners returns to the row, and some history reaches one), and a restart in either order loads and round-trips exactly |
+| The diff | `tests/diff.rs`: a world with every change kind (a destroyed, a moved-in, a moved-out and a spawned entity; a component added, removed and changed; a transient component present and absent; an owner set, changed and cleared) exported and diffed gives exactly the records of the table above, in canonical order, with the transient's bytes zeroed; a NaN written to a scalar of a spawned, a moved-in and a gained component, and to a persistent resource, is asserted on by a debug build naming the byte and the type, and written canonical by a release build, while a NaN in a transient column asserts nothing and is zeroed, and an odd NaN decoded under an older version is written canonical by `Loader::migrate`'s step with no assertion; the digest is equal under every `layout_mode` capacity, order and seed and with one and four workers; the empty diff is `None`; a key the table lacks and a resource among components are refused as stated and nothing is produced; a baseline column under another schema is `InvalidData` from the diff and `VersionMismatch` from `bundle` when the type is persistent, and accepted by the diff but `VersionMismatch` from `bundle` when it is derived; a persistent resource's odd NaN is canonical in the bytes `Loader::migrate` returns for decoded records, and in the save in a release build, its negative zero kept; the relevance message's resources equal the save's and `Cooked` exactly when the overlay is `None`; an entity owned by a cooked owner that moved to the other region and one owned by a runtime entity there save with the owner's `Destroy` and their `OwnershipChange`, the same with the owners' region unloaded, and reload to the same records in either order; a self-owner and the write that closes a two-entity cycle are refused by the world and the region saves as before; 200 seeded histories of spawns, predicted spawns bound to a fresh `NetId`, owner writes, moves, despawns (one followed by a write that names the dead entity), refused alone forms, unloads and reloads over two regions, the server's horizon passed after each step, keep the world a forest with every live row listed in its live owner's `owned_by`, `from_export` never failing, every unload's records reload (a reload changes nothing but owner edges it breaks, each a row's edge to a live entity of the other region whose chain of owners returns to the row, and some history reaches one), and a restart in either order loads and round-trips exactly |
 | Round trip | `tests/roundtrip.rs`: the diff's overlay loads back through `World::load_region` and `insert_region_resource_erased` into a world that exports the same `RegionRows` (the ECS's `bulk.rs` does this with a hand-built overlay); `SchemaTable`'s schemas are accepted by the loader for every type of a registry with nested structs, arrays, enums and padding; `decode(encode(c)) == c`; `index` and `decode_section` agree with `decode` section by section, and `assemble` of sections made in any order equals `encode`; golden container bytes in `tests/format.rs`; a type with a zero-size field is refused at registration, naming the type and the field, so the table builds and a world that could not register it refuses a baseline naming its key with `NotFound` rather than panicking |
 | Canonical records | `tests/records.rs`: `check` refuses `Some` of an empty overlay, a `baseline_hash` other than the overlay's, unsorted or duplicate resources, schemas or keys, a schema that is not its resource's, a transient key that is also a resource's type, and `layouts` with an entry missing or extra, each naming the failure; `insert`, `encode_section` and `Loader::bundle` refuse the same and change nothing |
-| Rebase | `tests/rebase.rs`: records rebased onto a patch that re-homes a moved-in entity with an equal component, a changed one, a derived column, a transient it has and the owner it has equal `from_export` of the same state against the patch, digest included, with no record naming `ecs::owned_by` as a component, where `Overlay::rebase` alone gives more; a re-homed entity with no owner, another owner and the cooked owner gives `OwnershipChange { None }`, `{ owner }` and nothing; a patch to a component the save never touched loads, a patch to the saved value leaves no record and a patch to another value keeps the saved one whole, each equal to the diff of the state the rebased records load to; what the rebase drops (a `Destroy`, an orphaned `RemoveComponent` and `SetField`, the records of a row the patch removed) is `Overlay::rebase`'s dropped list and none of it is kept; another NaN in the patch where the save holds the canonical one leaves no record, and negative zero where the save holds zero keeps it; a result with no record is `None` with the resources' digests alone and a region with no overlay only takes the hash; rebased records bundled, loaded and exported diff back to themselves; records at another digest than the table's are `VersionMismatch` and unchanged, and records that fail `check` are `InvalidData` and unchanged; a persistent `SetField` over a component the patch changed is applied to the patched value, its digest equal to that of the records `Overlay::rebase` keeps, loaded and saved |
+| Rebase | `tests/rebase.rs`: records rebased onto a patch that re-homes a moved-in entity with an equal component, a changed one, a derived column, a transient it has and the owner it has equal `from_export` of the same state against the patch, digest included, with no record naming `ecs::owned_by` as a component, where `Overlay::rebase` alone gives more; a re-homed entity with no owner, another owner and the cooked owner gives `OwnershipChange { None }`, `{ owner }` and nothing; a patch to a component the save never touched loads, a patch to the saved value leaves no record and a patch to another value keeps the saved one whole, each equal to the diff of the state the rebased records load to; what the rebase drops (a `Destroy`, an orphaned `RemoveComponent` and `SetField`, the records of a row the patch removed) is `Overlay::rebase`'s dropped list and none of it is kept; another NaN in the patch where the decoded save holds the canonical one leaves no record (and where a release build's save of a live NaN holds it), and negative zero where the save holds zero keeps it; a result with no record is `None` with the resources' digests alone and a region with no overlay only takes the hash; rebased records bundled, loaded and exported diff back to themselves; records at another digest than the table's are `VersionMismatch` and unchanged, and records that fail `check` are `InvalidData` and unchanged; a persistent `SetField` over a component the patch changed is applied to the patched value, its digest equal to that of the records `Overlay::rebase` keeps, loaded and saved |
 | Section 15.5 and D124 | `tests/reload.rs`, with a small game as `crates/sim/tests/common` writes one: the original reloads in place at tick T through this crate's bundles, a fresh process loads the container's bytes, an untouched twin never reloads, all K ticks hash-equal with one store and the policy's modes (test 1 and 4; `tests/physics.rs` does the same with `lactose-physics-api`'s components, a joint and a contact, over its test backend included by path, where the reload, the fresh process and the twin are bit-equal in the hash, the backend's bytes and the handle rows at every tick, since that backend keeps no solver state the rows lack; Rapier's twin within D124's tolerance is `lactose-physics-rapier`'s own test); the two-frame path likewise; an unload and reload through `from_export` and `bundle` exports the same `RegionExport` (test 2); the save taken while a left player's row is kept |
 | Migrations | `tests/migrate.rs`: a container written under `Health` version 1 (bytes pinned) loads through the step of the README's example and the world hashes as one saved at version 2 would (test 3); a newer version, a missing step, a field left over, a field unset, an invalid value and a persistent component's `SetField` under a changed schema are each refused as stated and nothing loads; a transient type's `SetField` is dropped under a changed schema and kept under an equal one, its value loading zeroed either way; the two steps of a chain run in version order, the second reading a field only the first's output has; equal versions are refused with `VersionMismatch` by the digest where the document schema is equal, one change per case: a nested reorder, discriminants renumbered in declaration order, the variants' names swapped over unchanged values (`{A = 0, B = 1}` to `{B = 0, A = 1}`), at the top level and as an array element, which only the names catch, the variants' declarations reordered, each name keeping its value (`{A = 0, B = 1}` to `{B = 1, A = 0}`), a variant renamed, a same-size type change; a transient component and a transient resource with a changed layout load zeroed with no step and no bump, a transient component with an unchanged layout leaves the overlay as the same `Arc`, and a persistent resource that became transient moves to the transient keys; a transient key whose type became persistent loads as the zeroed value with no step; a transient component whose type became persistent loads from a zero value under its saved version and digest, through its steps when the version moved since, and is refused with `VersionMismatch` when its layout moved without a bump; a restored zero that fails validation is `InvalidData`; a type that became `derived` is dropped, an overlay it emptied becoming `None`, and the world rebuilds it; a resource migrates under the schema and digest the section carries; an overlay whose types match comes back as the same `Arc` with the same digest; a second step for one (type, version) is refused; a type the cooked baseline carries (`Health` cooked at version 1 and re-cooked at version 2): the version 1 save, through the container, is refused by `bundle` against either baseline and by `rebase` before it migrates, and migrated, rebased onto the re-cook and bundled it equals the native version 2 save (a changed value, one equal to the re-cook once migrated and left with no record, a removal, a spawn) and loads a world whose hash and export are the native world's |
 | The schema hash and the digest | `tests/schema.rs`: a golden hash and golden digests for a small registry; equal across registration order and with a derived type added or a tracking flag set; the hash changed by a version bump, a field ID, offset, size, primitive tag or kind, a type's size, a role and a persistence change, the digest by every layout change and by none of the rest, one change per case against one base type: a nested reorder, discriminants renumbered in declaration order, the variants' names swapped over unchanged values (`{A = 0, B = 1}` to `{B = 0, A = 1}`), at the top level and as an array element, which only the names catch, the variants' declarations reordered, each name keeping its value (`{A = 0, B = 1}` to `{B = 1, A = 0}`), a variant renamed, a same-size primitive change (`u64` to `i64`, `u64` to `Scalar`), and an array element's primitive, nested order and enum changed, each changing the digest; a renamed field, `#[value]` struct or enum type leaving both equal; `from_registry` refuses a raw float, a foreign scalar tag and a 20 KiB persistent resource |

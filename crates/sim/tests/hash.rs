@@ -524,6 +524,41 @@ fn a_column_the_hashers_do_not_cover_is_unsupported() {
     );
 }
 
+/// A transient column of scalars, which a live world may hold a NaN in.
+#[component(key = "golden::spin", transient)]
+struct Spin(#[field(id = 1)] Scalar);
+
+/// D142: a debug build asserts on a NaN in a persistent column where the world is hashed
+/// (architecture section 8.2).
+#[test]
+#[cfg(debug_assertions)]
+#[should_panic(expected = "a NaN in field 3 of a persistent type")]
+fn a_debug_build_asserts_on_a_nan_in_a_persistent_column_at_the_hash() {
+    let mut simulation = golden(lactose_ecs::LayoutConfig::default());
+    let nan = Probe { speed: Scalar::NAN, ..probe(1) };
+    simulation.world_mut().insert(net(1), nan).unwrap();
+    let _ = simulation.world_hash(REGION);
+}
+
+/// A transient column is hashed too (section 15.1) and may hold a NaN: it asserts nothing,
+/// and every NaN hashes as the canonical one.
+#[test]
+fn a_nan_in_a_transient_column_is_hashed_as_the_canonical_one() {
+    let hash = |spin: Scalar| {
+        let mut types = golden_types();
+        types.register::<Spin>().unwrap();
+        let mut simulation = SimulationBuilder::new(WorldKind::Server, types).build().unwrap();
+        let world = simulation.world_mut();
+        let config = RegionConfig { id: REGION, seed: SEED, mode: RegionMode::Simulated };
+        world.create_region(config).unwrap();
+        world.spawn(net(1), REGION, (Spin(spin),)).unwrap();
+        simulation.world_hash(REGION).unwrap()
+    };
+    let odd_nan = Scalar::from_f64(f64::from_bits(0xFFF8_0000_0000_0123));
+    assert_eq!(hash(odd_nan), hash(Scalar::NAN));
+    assert_ne!(hash(Scalar::ONE), hash(Scalar::NAN));
+}
+
 #[test]
 fn the_tick_is_hashed_and_a_step_changes_nothing_else_in_an_empty_frame() {
     let executor = executor();

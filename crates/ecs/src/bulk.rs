@@ -105,6 +105,11 @@ pub(crate) fn load_region(
     if let Some(overlay) = overlay {
         overlay.check_against(baseline)?;
     }
+    // A prediction key names a player's input, which no cook has: with this refusal every
+    // bind a load makes comes from a record, so a save's binds are its sections' (D142).
+    if baseline.schemas().iter().any(|schema| schema.component() == PredictedOrigin::KEY) {
+        return Err(invalid("a baseline carries `ecs::predicted_origin`, which only a record may"));
+    }
 
     let schemas = baseline.schemas().iter().chain(overlay.into_iter().flat_map(Overlay::schemas));
     for schema in schemas {

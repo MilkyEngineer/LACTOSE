@@ -1,5 +1,5 @@
 //! Makes [`AssetRef`] a typed reference field the reflection registry knows about
-//! (architecture section 7), so the load path can remap it and the world hash can see it.
+//! (architecture section 7), so generic code can find it and the world hash can see it.
 
 use lactose_core::FieldId;
 use lactose_reflect::{AssetReference, Field, FieldKind, FieldVisitor, ReferenceVisitor};

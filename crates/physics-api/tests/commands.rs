@@ -109,7 +109,7 @@ fn build_error(stage: Stage, writer: &'static SystemDescriptor) -> ScheduleError
             builder.add(writer);
         })
         .build();
-    let error = built.err().expect("a writer after the step fails the build");
+    let error = built.expect_err("a writer after the step fails the build");
     let source = std::error::Error::source(&error).expect("the schedule error");
     source.downcast_ref::<ScheduleError>().expect("a schedule error").clone()
 }

@@ -21,12 +21,6 @@ and what the two design reviews changed. `crates/ecs/README.md` is the storage c
 this crate builds on and never restates: what it says about the input sync point, regions,
 snapshots, exports and change tracking holds here unchanged.
 
-**The additions of D142 are a facade** until the lane `binds-impl` implements them:
-`SimulationBuilder::binds` has its final signature and a `todo!()` body,
-`journal::Journal::binds` is a field no shipped code fills yet, and every sentence below
-that is not yet true is marked "(D142; facade)". "Proof for D142" names the tests that
-will hold them.
-
 Amending a signature is allowed in the change that needs it. Say so in the change description
 and list what changed, because `app`, `predict`, `net`, `persist`, `physics-api`, `anim`,
 `input` and the game crates are written against this surface. `tests/consumers.rs` and
@@ -43,7 +37,7 @@ breaks one is a signature change to list.
 | `Simulation::step`, `Step`, `TickInput` | One tick from one frame of input, the unit of everything that enters the boundary |
 | `Simulation::run_passes`, `PassRun` | A frame's passes between ticks |
 | `Simulation::save_point`, `SavePointRun`, `SavePoint` | The save copy of every loaded region at a sync point |
-| `SimulationBuilder::binds` | The binds a world starts with: on a load, those of the saved world, bound before its first region loads (D142; facade) |
+| `SimulationBuilder::binds` | The binds a world starts with: on a load, those of the saved world, bound before its first region loads (D142) |
 | `RunError` | How a run fails: the error, and the simulation when nothing ran |
 | `Stage`, `Pass`, `Registration`, `StageBuilder`, `sets::INPUT` | The four stages of the tick schedule, the two passes, how a registration function adds to them and how `app` orders other crates' sets, and the one set a consumer orders itself after at the sync point |
 | `PlayerSample`, `InputApplier` | A player's quantised input for a tick, and the hook that writes the typed component |
@@ -206,8 +200,7 @@ exclusive systems of the input sync point are listed by name in
 
 1. On a `Client` world, `World::set_rollback_horizon(tick)` with the current tick, since it
    never rolls back; the prediction world's horizon is `lactose-predict`'s, and a `Server`
-   world's is step 5 (D142; facade: until the lane `binds-impl` a `Server` world's horizon
-   is set here too, to the current tick, and there is no step 5).
+   world's is step 5 (D142).
 2. Puts `input` where the sync point systems take it, and runs the tick schedule with
    `Schedule::run_tick`. The first stage's sync point is the input sync point: the ECS
    zeroes transient columns and clears events and input ticks (every channel is already
@@ -230,15 +223,14 @@ exclusive systems of the input sync point are listed by name in
    grow (architecture section 9.4) whatever drives the steps; every other kind leaves them
    for `predict` or presentation.
 5. On a `Server` world, `World::set_rollback_horizon` with the tick after the one just run
-   (D142; facade). A server never rolls back and an entity it despawned never returns, so
-   the step ends by passing the horizon over every despawn up to and including its own
-   tick, and the world drops the bind of each despawned entity that had a predicted
-   origin: between steps a server holds no bind of an entity despawned in a step, and one
-   despawned through `world_mut()` between steps, an unjournaled edit, keeps its bind
-   until the next step ends ("Saves and loads", the binds of a save). The delivered
-   presentation-event keys the same call prunes are
-   those of the events step 4 dropped. A `Client` world keeps step 1: it exports and saves
-   nothing, so nothing there rests on when a despawned entity's bind goes.
+   (D142). A server never rolls back and an entity it despawned never returns, so the step
+   ends by passing the horizon over every despawn up to and including its own tick, and the
+   world drops the bind of each despawned entity that had a predicted origin: between steps
+   a server holds no bind of an entity despawned in a step, and one despawned through
+   `world_mut()` between steps, an unjournaled edit, keeps its bind until the next step ends
+   ("Saves and loads", the binds of a save). The delivered presentation-event keys the same
+   call prunes are those of the events step 4 dropped. A `Client` world keeps step 1: it
+   exports and saves nothing, so nothing there rests on when a despawned entity's bind goes.
 6. Resolves with the simulation at the new tick.
 
 `Simulation::run_passes(executor)` prepares the `Pass::Extract` and `Pass::Gather`
@@ -475,7 +467,7 @@ does not export, and `take_exports` is always empty there.
   that error and the simulation inside, unchanged, since an export reads and writes
   nothing. An unload that cannot export keeps the region loaded and logs the error rather
   than lose its state.
-- The binds of a save (architecture section 7; D142; facade). A save writes an owner as
+- The binds of a save (architecture section 7; D142). A save writes an owner as
   its `NetId`, the one reference it does not write as stored, and `World::load_region`
   stores the origin key that `NetId` names in the world it loads into: the key of the
   document's own row, or what the world's binds say. So a region loads to the bytes its
@@ -535,7 +527,7 @@ and covers the types the table knows, so a resource of an unregistered type, or 
 inserted after build by a hook or an exclusive system, is the inserting crate's bug. The
 6.1 example's `Gravity` and `TotalMass` are therefore `derived`.
 
-A world resource holds no entity reference either (D142; facade). The ECS keeps the
+A world resource holds no entity reference either (D142). The ECS keeps the
 references of rows and of region resources as origin keys: it rewrites a stored `Net` key
 at the bind that makes it an alias and again at a restore, for a bind made since the
 snapshot. It cannot do that for a world resource, which it stores as the typed value and
@@ -566,7 +558,10 @@ for bit:
   `scalar` as its `canonical_bits()` as a `u64` little-endian, so every NaN is one value and
   negative zero keeps its sign; an `entity_ref` as its sixteen bytes; an `asset_ref` as its
   `asset_id()` as a `u64` little-endian. A raw `f32` or `f64` never appears: registration
-  refuses it. The streams are built in a scratch buffer the hasher is handed, so a row
+  refuses it. A NaN in a persistent type's scalar is a defect of the build that wrote it
+  (architecture section 8.2): a debug build asserts on one here, naming the field (D142),
+  and a release build hashes it as the one NaN; a transient or derived type's NaN is hashed
+  without an assertion. The streams are built in a scratch buffer the hasher is handed, so a row
   allocates nothing.
 - *Field hash*: `xxh64` with the field ID as the seed over that field's stream, for every
   top-level field with an ID in declaration order, its stream possibly empty.
@@ -681,7 +676,7 @@ frame's record, mirroring `TickInput` field for field in its application order, 
 tables as `VersionTable`s and bundles as `JournalLoad` (the baseline by content hash, with
 the overlay, resources, transient keys and table the bundle carried), so every region and
 every player the replay runs can be rebuilt. `Journal::binds` is the server's bind table
-at the checkpoint (D142; facade): the bind of every entity with a predicted origin, in the
+at the checkpoint (D142): the bind of every entity with a predicted origin, in the
 checkpoint's regions and in the regions unloaded then, which a checkpoint, the save copy
 of the loaded regions, does not hold. The recorder reads them from the records of the
 server's save point, loaded and kept regions alike, as a save's are read ("Saves and
@@ -722,11 +717,11 @@ another build.
 
 ## Proof for D142
 
-A facade: none of these tests exists yet. Each row is a test the lane `binds-impl` adds, by
-the name given, and the sentence it holds. The first two are the whole-project review's
-probe D1 and its control at this crate's level; `lactose-persist` runs them through a
-container's bytes and `lactose-app` under `Anchored`. A test that records under SOUR is
-added to `[harness] tests` in `tools/xtask/ci-policy.toml` in the commit that adds it.
+Each row is a test, by its name, and the sentence it holds. The first two are the
+whole-project review's probe D1 and its control at this crate's level; `lactose-persist`
+runs them through a container's bytes and `lactose-app` under `Anchored`. A test that
+records under SOUR is added to `[harness] tests` in `tools/xtask/ci-policy.toml` in the
+commit that adds it.
 
 | Test | What it holds | File |
 |---|---|---|

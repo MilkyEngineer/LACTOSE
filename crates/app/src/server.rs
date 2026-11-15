@@ -88,17 +88,17 @@ impl From<Box<Failed>> for ServerError {
 /// under `Anchored` each saved pinned region is queued the same way in
 /// `RegionMode::Frozen`, with its table required, so it loads at the first step as it
 /// would have stepped on unsaved, and the lifecycle's `Load` requests bring the others
-/// back as players join (`README.md`, "Saves and loads"). From the lane `binds-impl` on
-/// (D142; a facade until then), a `Loaded` start also puts the saved world's binds into the
-/// builder, `Loader::binds` over the records of every saved region, queued or kept, so the
-/// world holds the bind of every saved entity with a predicted origin before any region
-/// loads and a row owned from a region left in the store loads to the bytes the save's
-/// export read; the build then fails as `Loader::binds` fails too. Fails as the builder fails (a
-/// registration or setup error carries its crate's name; `log_retention` below the cap is
-/// `InvalidData`), as the solver pool fails, as `Cooked::pin` fails or `Loader::bundle`
-/// fails for a region queued here, and, when `start` is `Loaded` and `config.regions` is
-/// `Anchored`, with `InvalidData` if a saved region is not in the atlas and `NotFound` if a
-/// saved pinned region has no `Cooked::table`.
+/// back as players join (`README.md`, "Saves and loads"). A `Loaded` start also puts the
+/// saved world's binds into the builder (D142), `Loader::binds` over the records of every
+/// saved region, queued or kept, so the world holds the bind of every saved entity with a
+/// predicted origin before any region loads and a row owned from a region left in the store
+/// loads to the bytes the save's export read; the build then fails as `Loader::binds` fails
+/// too. Fails as the builder fails (a registration or setup error carries its crate's name;
+/// `log_retention` below the cap is `InvalidData`), as the solver pool fails, as
+/// `Cooked::pin` fails or `Loader::bundle` fails for a region queued here, and, when
+/// `start` is `Loaded` and `config.regions` is `Anchored`, with `InvalidData` if a saved
+/// region is not in the atlas and `NotFound` if a saved pinned region has no
+/// `Cooked::table`.
 pub fn build_server(
     executor: &Executor,
     game: &Game,
@@ -156,15 +156,17 @@ pub fn build_server(
                 }
             }
         }
-        resumed = Some((saved.tick, saved.next_net_id));
+        let binds = Loader::new(&schemas, &migrations)
+            .binds(saved.regions.values().map(|entry| &entry.records))?;
+        resumed = Some((saved.tick, saved.next_net_id, binds));
         kept = saved.regions;
     }
     let (mut builder, solver) = assemble::world(executor, game, &config, WorldKind::Server, types)?;
     if let Some(sessions) = game.sessions {
         builder = builder.sessions(sessions());
     }
-    if let Some((tick, next_net_id)) = resumed {
-        builder = builder.tick(tick).next_net_id(next_net_id);
+    if let Some((tick, next_net_id, binds)) = resumed {
+        builder = builder.tick(tick).next_net_id(next_net_id).binds(binds);
     }
     let simulation = builder.build()?;
     let core = Core {

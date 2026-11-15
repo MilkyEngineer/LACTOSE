@@ -136,6 +136,26 @@ impl Saved {
             leaf.copy_from_slice(&canonical.to_le_bytes());
         }
     }
+
+    /// Asserts, in a debug build, that no `Scalar` leaf of `value` is a NaN: one in a
+    /// persistent value of a live world is a defect of the build that wrote it
+    /// (architecture section 8.2). For the live-world entry points alone, never for a
+    /// decoded value, which [`canonicalise`](Self::canonicalise) takes as it comes. A
+    /// value of another size is left to the caller's size check.
+    pub(crate) fn debug_assert_no_nan(&self, value: &[u8], name: &str) {
+        if !cfg!(debug_assertions) {
+            return;
+        }
+        for &offset in &self.scalars {
+            let Some(leaf) = value.get(offset..offset + Scalar::BYTES) else { return };
+            let bits = ScalarBits::from_le_bytes(leaf.try_into().expect("a scalar's width"));
+            assert!(
+                !Scalar::from_canonical_bits(bits).is_nan(),
+                "a NaN at byte {offset} of a persistent `{name}` in a live world's export: \
+                 simulation state never holds one (architecture section 8.2)"
+            );
+        }
+    }
 }
 
 /// One registered type as the table keeps it.

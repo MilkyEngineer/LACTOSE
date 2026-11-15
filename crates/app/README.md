@@ -27,10 +27,8 @@ and never restates: what they say about runs, the sync point, the pacer, the pre
 loop, staged frames and the fold, the container, the atomic replace, the solver pool and
 the registration functions holds here unchanged.
 
-**The additions of D142 are a facade** until the lane `binds-impl` implements them: no
-signature of this crate changes, `build_server` and `load` do not yet do what the bullet
-"Binds" under "Saves and loads" states, every sentence below that is not yet true is
-marked "(D142; facade)", and "Proof for D142" names the tests that will hold them.
+D142 changed no signature of this crate: `build_server` and `load` do what the bullet
+"Binds" under "Saves and loads" states, and "Proof for D142" names the tests that hold it.
 
 Amending a signature is allowed in the change that needs it. Say so in the change
 description and list what changed, because `app-headless`, the milestone 1 netcode spike,
@@ -76,7 +74,7 @@ the last frame's steps started from inside `Client`.
 | | Pace by its own round-trip estimate until `net` computes one | `Client::clock` with a `ClockEstimate` it fills by hand |
 | Game crates (milestone 5; the sketches now) | Register once and be built into every world kind, with no code of theirs running before `main` and nothing a dev-profile restart cannot redo | `CrateRegistration` as a `static` of function pointers; `Game::crates` in call order; `Game::sessions` for the player's entity |
 | | Order their own sets against another crate's, the engine's included, without owning a stage list | `Game::order`; a game crate names `lactose_input::sets::APPLY`, `lactose_physics_api::sets::WRITE_BACK` and `lactose_anim::sets::ADVANCE` directly, since it depends on those crates |
-| `persist` | Its pure calls placed on threads: one diff per exported region and one encode per region on background workers, the assembly once they resolve; the loader run before any world exists with the registry the world will have; the records' baseline by hash; the records of an unloaded region kept until it loads again; the saved world's binds read from every region's records and given to the builder before any region loads (D142; facade) | `Server::save_point`, `Server::encode_save`, `load`, `Cooked::baseline`, `Server::baseline`, `Server::kept`, `build_server` with `Start::Loaded` |
+| `persist` | Its pure calls placed on threads: one diff per exported region and one encode per region on background workers, the assembly once they resolve; the loader run before any world exists with the registry the world will have; the records' baseline by hash; the records of an unloaded region kept until it loads again; the saved world's binds read from every region's records and given to the builder before any region loads (D142) | `Server::save_point`, `Server::encode_save`, `load`, `Cooked::baseline`, `Server::baseline`, `Server::kept`, `build_server` with `Start::Loaded` |
 | `io` | The pool started once by `app` with the binary's platform, the save directory created at startup, the slot written as one `Io::replace`, the pool shut down before the executor | `Headless::{start, save, shutdown}`; "Saves and loads" below |
 | The store's driver (`asset` at milestone 3, `net` at milestone 4) | Every `Load` the lifecycle issues, told which ones the server answers itself; the region's table resolvable for either; a `Release` when a region's export is in the store | `StepOutput::requests`, `FrameOutput::requests`, `Server::kept`; "Saves and loads" below |
 | `asset` (milestone 3) | A stand-in with the store's shape, replaced by its traits with a listed signature change | `Cooked`; "Not in this crate yet" |
@@ -535,7 +533,7 @@ root")
   this crate yet". `TickInput::loaded` is keyed by region, so there is no order between
   the server's bundle and the frame's and no second bundle for the sync point to refuse:
   one bundle goes in, and this rule says which.
-- Binds (D142; facade). A server built `Start::Loaded` starts with the saved world's
+- Binds (D142). A server built `Start::Loaded` starts with the saved world's
   binds. `build_server` reads them with `Loader::binds` over the records of every saved
   region, the ones it queues for the first step and the ones that stay in the store
   alike, and hands them to `SimulationBuilder::binds` beside the saved tick and counter,
@@ -570,19 +568,17 @@ root")
   unchanged. A `SavedWorld` is also what `load` produces and what `Start::Loaded` takes, so
   a save point can start a server with no file between.
 - `Server::encode_save(executor, saved)` first runs `Container::check_sections` over the
-  header and every region's records on the calling thread, since `assemble` never reads
-  the records: a save the next start's `load` would refuse (a runtime `NetId` at or above
-  the counter, which a direct `World::spawn` on a server world can leave until the lane
-  `binds-impl`, after which the world keeps its counter above every runtime `NetId` it is
-  given, D142, facade; one entity held
-  by two regions) fails there with no task spawned. Then it spawns one
-  `WorkerClass::Background` task per region of `saved.regions`, each
-  `records.encode_section()`, and once every task resolved,
-  `Container::assemble(&ContainerHeader::new(saved.tick, saved.next_net_id,
-  schemas.hash()), sections)` with the sections in ascending region order and this world's
-  `Server::schemas`. The future fails as `persist` fails and writes nothing, so under
-  `Headless::save` the slot keeps the previous save and the policy logs (`Source::Save`,
-  `Log`). The world is not touched: the encode runs beside the next frame.
+  header and every region's records on the calling thread, since `assemble` never reads the
+  records: a save the next start's `load` would refuse (a runtime `NetId` at or above the
+  counter, which the world's own export never holds since the world keeps its counter above
+  every runtime `NetId` it is given, D142; one entity held by two regions) fails there with
+  no task spawned. Then it spawns one `WorkerClass::Background` task per region of
+  `saved.regions`, each `records.encode_section()`, and once every task resolved,
+  `Container::assemble(&ContainerHeader::new(saved.tick, saved.next_net_id, schemas.hash()),
+  sections)` with the sections in ascending region order and this world's `Server::schemas`.
+  The future fails as `persist` fails and writes nothing, so under `Headless::save` the slot
+  keeps the previous save and the policy logs (`Source::Save`, `Log`). The world is not
+  touched: the encode runs beside the next frame.
 - `Server::schemas` is `SchemaTable::from_registry(types.registry())` built once at
   `build_server`, so every save and relevance message of the world is written with the
   table the world was built with. `Server::baseline(region)` is the baseline of the bundle
@@ -609,9 +605,8 @@ root")
   region order `Loader::bundle(&records, baseline, RegionMode::Frozen, None)` to validate
   the section (the bundle is dropped), and `Loader::migrate(&records)` as the entry's
   records, so a save that cannot load fails at load and a kept region is re-saved at the
-  registry's schemas without a reload between. Then, from the lane `binds-impl` on,
-  `Loader::binds` over the migrated records of every section, its result dropped ("Binds"
-  above; D142; facade).
+  registry's schemas without a reload between. Then `Loader::binds` over the migrated
+  records of every section, its result dropped ("Binds" above; D142).
   The first error ends the load with nothing built and nothing to undo. The result's
   `tick` and `next_net_id` are the builder's; its `regions` are the store's. A save
   carries no session state, so every player joins again through `TickInput::sessions`,
@@ -732,8 +727,7 @@ root")
 
 ## Proof for D142
 
-A facade: none of these tests exists yet. Each row is a test the lane `binds-impl` adds to
-`tests/proof/`, by the name given, and the sentence it holds.
+Each row is a test of `tests/proof/`, by its name, and the sentence it holds.
 
 | Test | What it holds | File |
 |---|---|---|

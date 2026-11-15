@@ -359,22 +359,19 @@ What a system is, from its parameters (`SystemParam` has the table):
   not a death: the aliases of its predicted entities stay, so what they own elsewhere still
   exports and a reload finds them. `allocate_net_id` passes over a runtime `NetId` that a
   live entity or a bind already holds, such as one spawned directly with its key.
-- The counter stays above every runtime `NetId` the world is given (D142; a facade until
-  the lane `binds-impl`: until then the counter moves only at an allocation, which passes
-  over an ID in use as the bullet above says, and hands out again the ID of an entity
-  spawned directly above it once that entity is gone). `allocate_net_id` hands out the
-  counter's value and moves it on. A runtime `NetId` that enters the world any other way,
-  as the key of a direct `spawn` or `spawn_erased`, as a row of a `load_region` document,
-  or as the `NetId` of a `bind` (a load's among them), moves the counter to one past it
-  when the counter is not already above it; a refused spawn, load or bind moves nothing,
-  and a cooked `NetId` never does. There is no switch on the kind. What it buys is a
-  `Server` world's, the one kind that allocates and exports: `next_net_id` is above the
-  runtime `NetId` of every live entity and of every bind, so an allocation never returns
-  an ID in use, nor one that an entity now unloaded or despawned was given, and the
-  world's own export never fails the counter rule of
-  `lactose_persist::Container::check_sections`, whose header takes `next_net_id`. A
-  `restore` puts the counter back as snapshotted while the binds stay, which matters to
-  nothing: only a `Server` world allocates, and it never restores.
+- The counter stays above every runtime `NetId` the world is given (D142). `allocate_net_id`
+  hands out the counter's value and moves it on. A runtime `NetId` that enters the world any
+  other way, as the key of a direct `spawn` or `spawn_erased`, as a row of a `load_region`
+  document, or as the `NetId` of a `bind` (a load's among them), moves the counter to one
+  past it when the counter is not already above it; a refused spawn, load or bind moves
+  nothing, and a cooked `NetId` never does. There is no switch on the kind. What it buys is
+  a `Server` world's, the one kind that allocates and exports: `next_net_id` is above the
+  runtime `NetId` of every live entity and of every bind, so an allocation never returns an
+  ID in use, nor one that an entity now unloaded or despawned was given, and the world's own
+  export never fails the counter rule of `lactose_persist::Container::check_sections`, whose
+  header takes `next_net_id`. A `restore` puts the counter back as snapshotted while the
+  binds stay, which matters to nothing: only a `Server` world allocates, and it never
+  restores.
 - `InRegion` and `PredictedOrigin` are the world's: read-only through every path.
   `ClaimedBy` is written by `net` and `predict` on join and removed to release the claim.
   `OwnedBy` is a relationship (the two bullets below). `ClaimedBy` and `InRegion` are not
@@ -424,12 +421,12 @@ What a system is, from its parameters (`SystemParam` has the table):
   `NetId`, where every other `EntityRef` field is exported as the origin key it holds; a
   load stores the origin key that `NetId` names, through the keys of the document's own
   rows or the world's binds, so it stores what the export read only in a world that holds
-  the owner's bind; and `owned_by` finds the entity again once the owner is live. A
-  server started from a save holds every bind of the save before its first region loads
-  (`lactose-sim`'s `SimulationBuilder::binds`, D142, a facade until the lane
-  `binds-impl`), so there a reload in either region order, or of one region alone,
-  restores the owner as stored. A world that loads the row without the owner's bind, as a
-  client may, holds the owner's `Net` key until the bind arrives, when `bind` rewrites it.
+  the owner's bind; and `owned_by` finds the entity again once the owner is live. A server
+  started from a save holds every bind of the save before its first region loads
+  (`lactose-sim`'s `SimulationBuilder::binds`, D142), so there a reload in either region
+  order, or of one region alone, restores the owner as stored. A world that loads the row
+  without the owner's bind, as a client may, holds the owner's `Net` key until the bind
+  arrives, when `bind` rewrites it.
   The world therefore accepts no ownership state `lactose_bundle::Overlay::new` refuses (an
   entity its own owner, a cycle among one overlay's records), the format refuses no state
   the world accepts (an owner the overlay destroys, an owner elsewhere or absent), and every
@@ -568,9 +565,11 @@ What a system is, from its parameters (`SystemParam` has the table):
   despawned before the bind), whose references stay on it. That revived entity is stale
   server state, and `lactose-predict` despawns it again before it re-simulates; despawning a
   bound `Net` entity moves the references to it to the origin key.
-  `World::set_rollback_horizon` is how the world learns what it may prune: the ring's
-  oldest tick from `lactose-predict`, the current tick on the server. `World::bind` refuses
-  a `NetId` that names a live entity of its own, whose references the bind would redirect.
+  `World::set_rollback_horizon` is how the world learns what it may prune: the ring's oldest
+  tick from `lactose-predict`, the current tick before each step on a client, and on a
+  server the tick after the one its step ran, once the step has resolved (D142).
+  `World::bind` refuses a `NetId` that names a live entity of its own, whose references the
+  bind would redirect.
 - `load_region` takes the baseline and the overlay together into a region the caller
   created with the saved seed, skips baseline rows the overlay destroys (a cooked entity
   that moved is a live row elsewhere), restores predicted origins and aliases from
@@ -583,10 +582,9 @@ What a system is, from its parameters (`SystemParam` has the table):
   resources; diffing against the baseline into an `Overlay` is `lactose-persist`'s, and the
   world hash is `lactose-sim`'s, over `columns_erased` and `region_resources_erased`.
   A baseline that carries an `ecs::predicted_origin` column is refused with `InvalidData`
-  and nothing changed, as a document that carries `ecs::in_region` is (D142; a facade
-  until the lane `binds-impl`): a cooked row has no predicted origin, so every bind a
-  load makes comes from a record of its overlay, which is what lets `lactose-persist`
-  read the binds of a save from its sections alone.
+  and nothing changed, as a document that carries `ecs::in_region` is (D142): a cooked row
+  has no predicted origin, so every bind a load makes comes from a record of its overlay,
+  which is what lets `lactose-persist` read the binds of a save from its sections alone.
 - A transient component is not saved, but its presence is part of the entity's archetype,
   which its systems and the world hash depend on: `ExportedRow::transient` lists the keys
   of the row's transient components, `lactose-persist` encodes their presence as the
@@ -609,7 +607,7 @@ What a system is, from its parameters (`SystemParam` has the table):
   `bind` rewrites nothing in it, and `restore` puts the snapshot's value back as it was.
   No world resource may therefore hold an entity reference, and `insert_resource` does
   not build for a type whose layout holds an `EntityRef` at any depth, in a nested
-  `#[value]` struct or an array included (D142; a facade until the lane `binds-impl`).
+  `#[value]` struct or an array included (D142).
   The refusal is an assertion over `T::SCHEMA` that the compiler evaluates where the call
   is instantiated, so it costs nothing at run time and no signature changes; a build, and
   so every test run, reports it with the call that made it, and `cargo check` and clippy,
@@ -664,8 +662,8 @@ What a system is, from its parameters (`SystemParam` has the table):
 
 ## Proof for D142
 
-A facade: none of these tests exists yet, and no signature of this crate changes. Each row
-is a test the lane `binds-impl` adds, by the name given, and the sentence it holds.
+No signature of this crate changed. Each row is a test, by its name, and the sentence it
+holds.
 
 | Test | What it holds | File |
 |---|---|---|
@@ -677,8 +675,8 @@ is a test the lane `binds-impl` adds, by the name given, and the sentence it hol
 Two tests of `events.rs` move with the counter rule and keep their runtime keys, so that
 they show it: `channel_entries_reach_later_stages_with_keys_resolved_and_do_not_outlive_the_tick`
 and `a_take_yields_the_earlier_stages_entries_with_keys_resolved_once` spawn directly under
-the runtime `NetId` 5 and then expect the allocated IDs 1 and 2; from the lane on they
-expect 6 and 7, with a comment naming D142.
+the runtime `NetId` 5, which moves the counter to 6, and then expect the allocated IDs 6
+and 7, with a comment naming D142.
 
 ## Proof for milestone 0
 
