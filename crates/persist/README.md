@@ -409,6 +409,13 @@ export:
 - A baseline is never migrated: it is cooked by this build's cooker, so its schemas match
   by construction, and a save against an older cook is rebased onto the new baseline. A
   baseline whose schema the loader refuses is a cook that is out of date.
+- For the engine's own types a layout change without a bump is caught before it merges, not
+  only at a load: `crates/app/tests/schema_record.rs` compares the version, layout digest,
+  field IDs and retired IDs of every type `SchemaTable::schemas()` holds for `Game::types()`
+  of a game with no crate with `crates/app/tests/schema_record/engine.txt`, and fails a type
+  whose digest moved at an unchanged version and a reused field ID (`crates/app/README.md`,
+  "The saved-type record"). A game's own types have no record until a game binary's set
+  gains one (milestone 5).
 
 **The container** (architecture sections 15.3, 15.4 and 19)
 

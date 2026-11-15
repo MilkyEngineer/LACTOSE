@@ -676,25 +676,35 @@ root")
 ## The saved-type record
 
 `tests/schema_record/engine.txt` records every type the engine's registration set saves
-(`Game::types()` of a game with no crate, which every game's set contains): its key,
-role, persistence policy, schema version and layout digest as `SchemaTable::schemas()`
-gives them, and its field IDs with their names and type tags, nested `#[value]` structs
-included, and its retired IDs. `derived` types are not saved and are not in it. The
+(`Game::types()` of a game with no crate, which every game's set contains): its key, schema
+version and layout digest as `SchemaTable::schemas()` gives them, its role and persistence
+policy, its field IDs with their names and type tags, nested `#[value]` structs and arrays
+of them included, and its retired IDs. `derived` types are not saved and are not in it. The
 headless binary's set adds one milestone 1 stand-in type and has no record; a game binary's
 set gets its own file beside this one when it ships (milestone 5). `tests/schema_record.rs`
-derives the record from the build and fails, naming the type, on a persistent type whose
-digest moved while its version did not (raise the version and register the step), on a
-version that fell, and on a reused field ID: a recorded ID that now names a field of
-another name, a recorded ID that left the fields without being retired, and a retired ID no
-longer retired, at every depth. A field whose type changes under its ID and name is a
-layout change, which the digest and version govern. Any other difference (a new type, a
-removed one, a version that rose with any digest, a new field) fails until the record is
-rewritten in the commit that makes the change, with
+derives the record from the build and fails, naming the type, on a type whose digest moved
+while its version did not (raise the version and register the step) and on a version that
+fell, transient types included: no load reads a transient type's version, but one made
+persistent later is read from the version and digest it was saved under, so each of its
+layouts needs a version of its own (`crates/persist/README.md`, "Migrations"). It fails too
+on a reused field ID: a recorded ID that now names a field of another name, a recorded ID
+that left the fields without being retired, and a retired ID no longer retired, at every
+depth (a nested struct's IDs are compared while the field holding it holds a struct of the
+same name or the type's digest is unchanged). A field whose type changes under its ID and
+name is a layout change, which the digest and version govern, except a `#[value]` struct or
+enum replaced by one of the same layout, which no digest sees (D129). Any other difference
+(a new type, a removed one, a version that rose with any digest, a new field) fails until
+the record is rewritten in the commit that makes the change, with
 `LACTOSE_SCHEMA_RECORD=update cargo nextest run -p lactose-app --test schema_record`. The
-command refuses to write while any of the failures above stands, so a record never takes a
-layout change without a bump. A rename keeps its ID and costs no bump, but the record
-cannot tell it from an ID given to a new field of the same type; `LACTOSE_SCHEMA_RECORD=rename`
-in place of `update` takes it as one, and is the only way to.
+command refuses to write while any of the failures above stands; a missing record is written
+whole, which is how a set's first record is made, so the record's diff is what review reads.
+A rename keeps its ID and costs no bump, but the record cannot tell it from an ID given to a
+new field of the same type; `LACTOSE_SCHEMA_RECORD=rename` in place of `update` takes a new
+name under a recorded ID whose type is unchanged as a rename. The record is compared with LF
+line endings, so a checkout that gives it CRLF checks the same. No engine crate has a
+`register_migrations` yet and `Game::migrations` folds only the game's crates, so the first
+version bump of an engine type adds that registration point beside `Game::types`' engine
+list.
 
 ## Not in this crate yet
 
