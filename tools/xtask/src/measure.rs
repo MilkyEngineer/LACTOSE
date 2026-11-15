@@ -2,19 +2,22 @@
 //! result file in `docs/results` (architecture section 20; milestone 1 plan, section 4 and
 //! decision 5.11).
 //!
-//! A measurement is an ignored release test that prints its figures, the WHISK benchmark,
-//! the headless binary's 120-tick run, or the edit-to-playing loop. A test prints each figure
+//! A measurement is an ignored release test that prints its figures, the netcode spike's
+//! ten-minute replays, the WHISK benchmark, the headless binary's 120-tick run, or the
+//! edit-to-playing loop. A test prints each figure
 //! as a line `measure: <name> <value>` on its standard output, which nextest passes through
 //! under `--no-capture`: the test needs no path from this command and stays runnable by
-//! hand, and the line is the one contract between them. A test that prints no figure, or a
-//! figure line that does not read, fails the measurement. Every result file opens with the
+//! hand, and the line is the one contract between them; for the spike's replays the contract
+//! is instead the one JSON object each prints. A test that prints no figure, a figure line
+//! that does not read, or a figure named twice fails the measurement. Every result file opens
+//! with the
 //! header the plan names: the CPU and operating system, the topology the executor detected,
 //! the workers used, the commit, the build profile, the command, and the load average before
 //! and after the run (on Windows, the processor's idle share over it, sampled through WMI).
 //!
-//! Not a check: nothing is printed to standard output, progress and the measurements' own
-//! output go to standard error, and times are printed and written, never compared with a
-//! threshold.
+//! Not a check of any criterion (`spike-net`'s two counts aside): nothing is printed to
+//! standard output, progress and the measurements' own output go to standard error, and times
+//! are printed and written, never compared with a threshold.
 
 use std::fmt::Write as _;
 use std::fs;
@@ -56,6 +59,9 @@ pub enum Run {
         /// The test's path inside the target.
         test: &'static str,
     },
+    /// The netcode spike's ten-minute replays ([`REPLAYS`]), ignored tests run in release one
+    /// at a time, each of which prints its figures as one JSON object.
+    SpikeReplays,
     /// `cargo bench -p lactose-task --bench whisk`, which writes its own pair of files.
     TaskBench,
     /// `cargo run -p lactose-app-headless -- 120`, dev profile.
@@ -65,12 +71,12 @@ pub enum Run {
 }
 
 impl Run {
-    /// Whether `--short` cuts its repetitions, and so marks its files as short. The headless
-    /// run has none to cut, and edit-to-playing keeps its five so that a runner's short run
-    /// still yields the criterion's figure.
+    /// Whether `--short` cuts its repetitions, or the spike's replays, and so marks its files
+    /// as short. The headless run has none to cut, and edit-to-playing keeps its five so that
+    /// a runner's short run still yields the criterion's figure.
     #[must_use]
     pub const fn cut_by_short(self) -> bool {
-        matches!(self, Self::Test { .. } | Self::TaskBench)
+        matches!(self, Self::Test { .. } | Self::SpikeReplays | Self::TaskBench)
     }
 }
 
@@ -97,7 +103,7 @@ const fn test(
 }
 
 /// Every measurement, in the order `--all` runs them.
-pub const MEASUREMENTS: [Measurement; 11] = [
+pub const MEASUREMENTS: [Measurement; 12] = [
     Measurement {
         name: "tick-100k",
         what: "Criterion 1: the median step of the 100k scene on one frame worker and on N, S and the projected eight-core tick",
@@ -161,6 +167,12 @@ pub const MEASUREMENTS: [Measurement; 11] = [
         ),
     },
     Measurement {
+        name: "spike-net",
+        what: "Criterion 7: the netcode spike's four scenes under the clock script and on the server's clock: the correction rate, the largest absorbed difference per kind, rollback cost per tick, and divergence",
+        threshold: "none: recorded (architecture section 22; milestone 1 plan, section 4)",
+        run: Run::SpikeReplays,
+    },
+    Measurement {
         name: "sim-skeleton",
         what: "Criterion 6: the sim skeleton of 200 characters; figure (b) is the criterion's",
         threshold: "architecture section 22; milestone 1 plan, section 4",
@@ -192,6 +204,47 @@ pub fn find(name: &str) -> Option<&'static Measurement> {
     MEASUREMENTS.iter().find(|m| m.name == name)
 }
 
+/// The netcode spike's test target, whose replays [`Run::SpikeReplays`] runs.
+const SPIKE_FILE: &str = "crates/app/tests/spike.rs";
+
+/// One of the netcode spike's ten-minute replays: an ignored test that replays one scene on
+/// one clock and prints its report.
+#[derive(Clone, Copy, Debug)]
+struct Replay {
+    /// The test's name in [`SPIKE_FILE`].
+    test: &'static str,
+    /// Whether a short run keeps it: the dynamic capsule on each clock, the cheapest pair
+    /// (about 28 s of the eight's 223 s on the M1), since a replay is ten minutes of ticks
+    /// however it is run and a runner's short run must fit its job beside the rest.
+    short: bool,
+}
+
+impl Replay {
+    const fn run(self) -> Run {
+        test("lactose-app", "spike", SPIKE_FILE, self.test)
+    }
+}
+
+/// The replays `spike-net` runs, in the file's order: every `ten_minutes_of_` test but the
+/// claim on approach, which the file does not record.
+const REPLAYS: [Replay; 8] = [
+    Replay { test: "ten_minutes_of_the_dynamic_capsule_with_the_clock_script", short: true },
+    Replay { test: "ten_minutes_of_the_dynamic_capsule_on_the_server_clock", short: true },
+    Replay { test: "ten_minutes_of_the_kinematic_character_with_the_clock_script", short: false },
+    Replay { test: "ten_minutes_of_the_kinematic_character_on_the_server_clock", short: false },
+    Replay { test: "ten_minutes_of_fifty_thrown_bodies_with_the_clock_script", short: false },
+    Replay { test: "ten_minutes_of_fifty_thrown_bodies_on_the_server_clock", short: false },
+    Replay { test: "ten_minutes_of_the_claim_in_contact_with_the_clock_script", short: false },
+    Replay { test: "ten_minutes_of_the_claim_in_contact_on_the_server_clock", short: false },
+];
+
+/// The frame workers each replay's executor runs, `executor(4)` in the spike's `measure`.
+const SPIKE_WORKERS: u32 = 4;
+
+/// The most fixed colliders and proxies together a prediction world may hold at milestone 1
+/// (plan decision 5.5), against each replay's `prediction_fixed_and_proxies`.
+const PREDICTION_BOUND: u64 = 64;
+
 /// The topology probe: an ignored test of `lactose-app` that prints what the executor
 /// detects, run once before the measurements.
 const PROBE: Run =
@@ -201,13 +254,18 @@ const PROBE: Run =
 
 /// The figures in `output`: every line `measure: <name> <value>`, in order. A line that
 /// starts with the prefix and lacks a name without spaces or a value is an error, not a
-/// figure dropped.
+/// figure dropped, and so is a name printed twice, which is two runs' output or a test's
+/// slip, not one figure.
 fn figures(output: &str) -> Result<Vec<(String, String)>, String> {
+    let mut seen = std::collections::BTreeSet::new();
     output
         .lines()
         .filter_map(|line| line.strip_prefix(FIGURE_PREFIX).map(str::trim_end))
         .map(|rest| match rest.split_once(' ') {
             Some((name, value)) if !name.is_empty() && !value.trim().is_empty() => {
+                if !seen.insert(name) {
+                    return Err(format!("the figure `{name}` is printed twice"));
+                }
                 Ok((name.to_owned(), value.trim().to_owned()))
             }
             _ => Err(format!(
@@ -217,15 +275,99 @@ fn figures(output: &str) -> Result<Vec<(String, String)>, String> {
         .collect()
 }
 
-/// A figure's value in the JSON file: a number where it reads as one, else its text.
+/// A figure's value in the JSON file: a number where it reads as one; a JSON array, `true`,
+/// `false` or `null` where it reads as one, as a replay's report holds them; else its text.
 #[must_use]
 fn json_value(value: &str) -> serde_json::Value {
+    use serde_json::Value;
     if let Ok(whole) = value.parse::<i64>() {
         return whole.into();
     }
     match value.parse::<f64>() {
         Ok(number) if number.is_finite() => number.into(),
-        _ => value.into(),
+        _ => match serde_json::from_str(value) {
+            Ok(parsed @ (Value::Array(_) | Value::Bool(_) | Value::Null)) => parsed,
+            _ => value.into(),
+        },
+    }
+}
+
+/// The figures of one replay of the netcode spike: the one line of `output` that is a JSON
+/// object, its report, with each value under `<scene>.<clock>.` and nested keys joined by
+/// dots, an array as its JSON text. The scene is the report's `scene` with underscores for
+/// its spaces; the clock is `clock_script` or `server_clock`, as its `clock_script` says.
+/// Returns that prefix and the figures. A line that opens with `{` and is not a report is an
+/// error, as are no report and two.
+fn replay_figures(output: &str) -> Result<(String, Vec<(String, String)>), String> {
+    use serde_json::Value;
+    let mut reports = Vec::new();
+    for line in output.lines().map(str::trim).filter(|line| line.starts_with('{')) {
+        let report = match serde_json::from_str(line) {
+            Ok(Value::Object(report)) => report,
+            _ => return Err(format!("a line that opens with `{{` is not a JSON object: `{line}`")),
+        };
+        let scene = report.get("scene").and_then(Value::as_str).filter(|s| !s.is_empty());
+        let clock = report.get("clock_script").and_then(Value::as_bool);
+        let (Some(scene), Some(clock)) = (scene, clock) else {
+            return Err(format!("a report names no `scene` and `clock_script`: `{line}`"));
+        };
+        let clock = if clock { "clock_script" } else { "server_clock" };
+        let prefix = format!("{}.{clock}", scene.replace(' ', "_"));
+        let mut found = Vec::new();
+        for (key, value) in &report {
+            if key != "scene" && key != "clock_script" {
+                flatten(&format!("{prefix}.{key}"), value, &mut found);
+            }
+        }
+        reports.push((prefix, found));
+    }
+    match <[_; 1]>::try_from(reports) {
+        Ok([report]) => Ok(report),
+        Err(reports) => Err(format!("{} lines are a replay's report; one must be", reports.len())),
+    }
+}
+
+/// What a replay's figures must show for its file to stand: no server frame outside a
+/// `Simulated` region, and the prediction world within [`PREDICTION_BOUND`]. Returns the
+/// replay's count of fixed colliders and proxies.
+fn check_replay(prefix: &str, figures: &[(String, String)]) -> Result<u64, String> {
+    let count = |key: &str| {
+        let name = format!("{prefix}.{key}");
+        figures
+            .iter()
+            .find(|(n, _)| *n == name)
+            .and_then(|(_, value)| value.parse::<u64>().ok())
+            .ok_or_else(|| format!("the report has no count `{key}`"))
+    };
+    let frozen = count("server_frozen_ticks")?;
+    if frozen != 0 {
+        return Err(format!(
+            "`{prefix}` ran {frozen} server frames with its region not `Simulated` \
+             (`server_frozen_ticks`), so its corrections are not a simulated region's \
+             (architecture section 9.4)"
+        ));
+    }
+    let held = count("prediction_fixed_and_proxies")?;
+    if held > PREDICTION_BOUND {
+        return Err(format!(
+            "`{prefix}`'s prediction world held {held} fixed colliders and proxies, over the \
+             {PREDICTION_BOUND} of plan decision 5.5 (`prediction_fixed_and_proxies`)"
+        ));
+    }
+    Ok(held)
+}
+
+/// `value`'s figures under `name`: an object's members under `name.<key>`, anything else as
+/// its text, a string unquoted.
+fn flatten(name: &str, value: &serde_json::Value, figures: &mut Vec<(String, String)>) {
+    match value {
+        serde_json::Value::Object(members) => {
+            for (key, member) in members {
+                flatten(&format!("{name}.{key}"), member, figures);
+            }
+        }
+        serde_json::Value::String(text) => figures.push((name.to_owned(), text.clone())),
+        other => figures.push((name.to_owned(), other.to_string())),
     }
 }
 
@@ -718,6 +860,7 @@ pub fn run(workspace: &Workspace, options: &Options) -> Result<Vec<PathBuf>, Str
         eprintln!("measure: {} ...", m.name);
         let result = match m.run {
             Run::Test { .. } => run_test(workspace, options, &machine, m, &out),
+            Run::SpikeReplays => run_spike_replays(workspace, options, &machine, m, &out),
             Run::TaskBench => run_task_bench(workspace, options, &machine, &out),
             Run::Headless => run_headless(workspace, options, &machine, m, &out),
             Run::EditToPlaying => run_edit_to_playing(workspace, options, &machine, m, &out),
@@ -929,6 +1072,9 @@ fn nextest_args(run: Run) -> Vec<String> {
         target,
         "--run-ignored",
         "only",
+        // A retried test's output holds every attempt, and its time the failed ones'.
+        "--retries",
+        "0",
         "--no-capture",
         "--no-tests=fail",
         "-E",
@@ -1050,6 +1196,93 @@ fn run_test(
         header.notes.push((
             "Workers override".to_owned(),
             format!("`{WORKERS_VAR}={n}`: N, in place of the topology's"),
+        ));
+    }
+    write(out, &header, &found, &output)
+}
+
+/// The replays a run of `spike-net` makes: every one, or a short run's.
+fn replays(short: bool) -> impl Iterator<Item = Replay> {
+    REPLAYS.into_iter().filter(move |replay| replay.short || !short)
+}
+
+/// The netcode spike's replays, one `cargo nextest run` each so that each replay's rollback
+/// times are its own, into one pair of files: each replay's report under its scene and
+/// clock, and its seconds, `<scene>.<clock>.wall_s`, from the test's first line of output
+/// to its report. The first replay that fails fails the measurement.
+fn run_spike_replays(
+    workspace: &Workspace,
+    options: &Options,
+    machine: &Machine,
+    m: &'static Measurement,
+    out: &Path,
+) -> Result<Vec<PathBuf>, String> {
+    let sampler = Sampler::start();
+    let (mut found, mut output, mut ran) = (Vec::new(), String::new(), Vec::new());
+    let mut reported = std::collections::BTreeSet::new();
+    let mut most_held = (0, String::new());
+    for replay in replays(options.short) {
+        let mut command = Command::new(&workspace.cargo);
+        command.args(nextest_args(replay.run())).current_dir(&workspace.root);
+        // The replays read neither; a caller's must not reach them unrecorded.
+        command.env_remove(SHORT_VAR).env_remove(WORKERS_VAR);
+        // From the test's first line to its report: the build, whose output is not on
+        // standard output, is not the replay's.
+        let (mut first, mut last) = (None, Duration::ZERO);
+        let text = capture(&mut command, |line, at| {
+            first.get_or_insert(at);
+            if line.trim_start().starts_with('{') {
+                last = at;
+            }
+        })
+        .map_err(|e| format!("{}: {e}", replay.test))?;
+        let seconds = last.saturating_sub(first.unwrap_or_default()).as_secs_f64();
+        let (prefix, figures) =
+            replay_figures(&text).map_err(|e| format!("{}: {e}", replay.test))?;
+        if !reported.insert(prefix.clone()) {
+            return Err(format!("{}: a second report of `{prefix}`", replay.test));
+        }
+        let held = check_replay(&prefix, &figures).map_err(|e| format!("{}: {e}", replay.test))?;
+        if held >= most_held.0 {
+            most_held = (held, prefix.clone());
+        }
+        found.extend(figures);
+        found.push((format!("{prefix}.wall_s"), format!("{seconds:.1}")));
+        output.push_str(&text);
+        ran.push(format!("`{}`", replay.test));
+    }
+    let load = sampler.stop();
+    let args = nextest_args(test("lactose-app", "spike", SPIKE_FILE, "<replay>"));
+    let workers = format!("{SPIKE_WORKERS}, the spike's");
+    let mut header =
+        header(options, machine, m, "release", workers, shell_line(&[], "cargo", &args), load);
+    header
+        .notes
+        .push(("Replays".to_owned(), format!("{}, one at a time, in this order", ran.join(", "))));
+    // Written only once every replay has passed `check_replay`.
+    header.notes.push((
+        "Server's regions".to_owned(),
+        "every replay's `server_frozen_ticks` is 0: the server held every loaded region \
+         `Simulated` on every frame from the load to the end, so no correction is a \
+         server-`Frozen` region's (architecture section 9.4); the measurement fails otherwise"
+            .to_owned(),
+    ));
+    header.notes.push((
+        "Prediction bound".to_owned(),
+        format!(
+            "at most {PREDICTION_BOUND} fixed colliders and proxies together in a prediction world \
+             (plan decision 5.5); every replay's `prediction_fixed_and_proxies`, the most its \
+             prediction world held after a client frame, is within it, the largest {} \
+             (`{}`); the measurement fails otherwise",
+            most_held.0, most_held.1
+        ),
+    ));
+    if options.short {
+        header.notes.push((
+            "Short run".to_owned(),
+            "the dynamic capsule on each clock, the cheapest pair; a replay is ten minutes of \
+             ticks either way"
+                .to_owned(),
         ));
     }
     write(out, &header, &found, &output)
@@ -1353,6 +1586,69 @@ mod tests {
         assert_eq!(figures("running 1 test\ntest ... ok\n").unwrap(), []);
     }
 
+    /// Review r1 of spike-net-file, M2: a retried test prints every attempt's figures, and
+    /// the parse took both.
+    #[test]
+    fn a_figure_printed_twice_is_an_error() {
+        let error = figures("measure: n 4\nmeasure: t1_us 1.5\nmeasure: n 4\n").unwrap_err();
+        assert!(error.contains("`n` is printed twice"), "{error}");
+        assert_eq!(figures("measure: n 4\nmeasure: n.w4 4\n").unwrap().len(), 2);
+    }
+
+    /// Review r1 of spike-net-file, M2: nextest retried a failed test under `NEXTEST_RETRIES`
+    /// or a user's config, and the measurement read both attempts.
+    #[test]
+    fn a_measured_test_is_never_retried() {
+        for run in [PROBE, REPLAYS[0].run()].into_iter().chain(MEASUREMENTS.iter().map(|m| m.run)) {
+            if let Run::Test { test, .. } = run {
+                let args = nextest_args(run);
+                let at = args.iter().position(|arg| arg == "--retries").unwrap();
+                assert_eq!(args[at + 1], "0", "{test}");
+            }
+        }
+    }
+
+    /// Review r1 of spike-net-file, M1: serde_json's default float parse is not correctly
+    /// rounded, and some figures were 1 ULP from the printed report.
+    #[test]
+    fn a_replay_s_floats_are_the_printed_values_bit_for_bit() {
+        let printed = "1.9990871056907666e-2";
+        let output = REPLAY_OUTPUT.replace("1.99995710109393e-2", printed);
+        let (prefix, figures) = replay_figures(&output).unwrap();
+        let name = format!("{prefix}.absorbed.angular");
+        let value = &figures.iter().find(|(n, _)| *n == name).unwrap().1;
+        let expected = printed.parse::<f64>().unwrap();
+        assert_eq!(value.parse::<f64>().unwrap().to_bits(), expected.to_bits(), "{value}");
+        assert_eq!(json_value(value), serde_json::json!(expected));
+    }
+
+    /// Review r1 of spike-net-file, S1: the header said the server's region was `Simulated`
+    /// whatever the replay did. A replay that held it otherwise, or a prediction world over
+    /// the bound, fails the measurement and names its count.
+    #[test]
+    fn a_replay_outside_a_simulated_region_or_over_the_bound_fails() {
+        let (prefix, figures) = replay_figures(REPLAY_OUTPUT).unwrap();
+        let with = |key: &str, value: &str| {
+            let name = format!("{prefix}.{key}");
+            let mut changed = figures.clone();
+            changed.iter_mut().find(|(n, _)| *n == name).unwrap().1 = value.to_owned();
+            changed
+        };
+        let frozen = check_replay(&prefix, &with("server_frozen_ticks", "36000")).unwrap_err();
+        assert!(frozen.contains("36000 server frames") && frozen.contains(&prefix), "{frozen}");
+        assert_eq!(check_replay(&prefix, &with("prediction_fixed_and_proxies", "64")), Ok(64));
+        let over = check_replay(&prefix, &with("prediction_fixed_and_proxies", "65")).unwrap_err();
+        assert!(over.contains("held 65") && over.contains(&prefix), "{over}");
+        for key in ["server_frozen_ticks", "prediction_fixed_and_proxies"] {
+            let missing: Vec<_> =
+                figures.iter().filter(|(n, _)| !n.ends_with(key)).cloned().collect();
+            let error = check_replay(&prefix, &missing).unwrap_err();
+            assert!(error.contains(key), "{error}");
+            let error = check_replay(&prefix, &with(key, "-1")).unwrap_err();
+            assert!(error.contains(key), "{error}");
+        }
+    }
+
     /// Review r1, M1: a figure line that does not read was dropped, and the file written
     /// without it.
     #[test]
@@ -1374,6 +1670,121 @@ mod tests {
         assert_eq!(json_value("0x00ab"), serde_json::json!("0x00ab"));
         assert_eq!(json_value("1 and 4"), serde_json::json!("1 and 4"));
         assert_eq!(json_value("NaN"), serde_json::json!("NaN"));
+        assert_eq!(json_value("[0,3,95]"), serde_json::json!([0, 3, 95]));
+        assert_eq!(json_value("true"), serde_json::json!(true));
+        assert_eq!(json_value("null"), serde_json::Value::Null);
+        assert_eq!(json_value("-0.0"), serde_json::json!(-0.0));
+        assert_eq!(json_value("[0, 3"), serde_json::json!("[0, 3"));
+        assert_eq!(json_value("\"quoted\""), serde_json::json!("\"quoted\""));
+    }
+
+    /// One replay's output as nextest passes it through, its report line as the spike's
+    /// `report` prints it, shortened.
+    const REPLAY_OUTPUT: &str = "\nrunning 1 test\n\
+        {\"scene\":\"fifty thrown bodies\",\"clock_script\":true,\"ticks\":36000,\"prefix_equal\":true,\
+        \"corrections_per_minute\":{\"mismatch\":772.60,\"substituted\":17.90,\"repaired\":3.00},\
+        \"absorbed\":{\"fields\":1235914,\"translation\":1.998241455073213e-3,\"angular\":1.99995710109393e-2},\
+        \"rollback_us_per_tick\":{\"median\":550.9,\"worst\":16981.9,\"rollbacks\":7935},\
+        \"departure_tick\":null,\"mismatches_per_cycle\":[3, 49, 5],\
+        \"yaw_error_rad_per_tick\":{\"mean\":-0e0,\"worst\":0e0},\
+        \"server_frozen_ticks\":0,\"prediction_fixed_and_proxies\":12}\n\
+        test ten_minutes_of_fifty_thrown_bodies_with_the_clock_script ... ok\n\n\
+        test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 23 filtered out\n";
+
+    #[test]
+    fn a_replay_s_figures_are_its_report_under_its_scene_and_clock() {
+        let (prefix, figures) = replay_figures(REPLAY_OUTPUT).unwrap();
+        assert_eq!(prefix, "fifty_thrown_bodies.clock_script");
+        let get = |name: &str| {
+            let name = format!("{prefix}.{name}");
+            figures.iter().find(|(n, _)| *n == name).map(|(_, v)| v.as_str())
+        };
+        assert_eq!(get("ticks"), Some("36000"));
+        assert_eq!(get("prefix_equal"), Some("true"));
+        assert_eq!(get("corrections_per_minute.mismatch"), Some("772.6"));
+        assert_eq!(get("absorbed.translation"), Some("0.001998241455073213"));
+        assert_eq!(get("rollback_us_per_tick.median"), Some("550.9"));
+        assert_eq!(get("departure_tick"), Some("null"));
+        assert_eq!(get("mismatches_per_cycle"), Some("[3,49,5]"));
+        assert_eq!(get("yaw_error_rad_per_tick.mean"), Some("-0.0"));
+        assert_eq!(get("scene"), None);
+        assert_eq!(get("clock_script"), None);
+        assert_eq!(figures.len(), 17);
+        assert_eq!(check_replay(&prefix, &figures), Ok(12));
+        assert!(figures.iter().all(|(name, _)| !name.contains(' ')), "{figures:?}");
+        let header = Header { measurement: find("spike-net").unwrap(), ..sample_header() };
+        let value: serde_json::Value = serde_json::from_str(&json(&header, &figures)).unwrap();
+        let figure = |name: &str| &value["figures"][format!("{prefix}.{name}")];
+        assert_eq!(figure("prefix_equal"), &serde_json::json!(true));
+        assert_eq!(figure("departure_tick"), &serde_json::Value::Null);
+        assert_eq!(figure("mismatches_per_cycle"), &serde_json::json!([3, 49, 5]));
+        assert_eq!(figure("absorbed.angular"), &serde_json::json!(1.99995710109393e-2));
+        assert_eq!(figure("rollback_us_per_tick.rollbacks"), &serde_json::json!(7935));
+
+        let server = REPLAY_OUTPUT.replace("\"clock_script\":true", "\"clock_script\":false");
+        assert_eq!(replay_figures(&server).unwrap().0, "fifty_thrown_bodies.server_clock");
+    }
+
+    /// bef3455: a line read from a child process may end in CRLF on Windows. The report reads
+    /// the same from output with CRLF line endings, and from a last line that ends in CR.
+    #[test]
+    fn a_replay_s_report_reads_with_crlf_line_endings() {
+        let crlf = REPLAY_OUTPUT.replace('\n', "\r\n");
+        assert_eq!(replay_figures(&crlf).unwrap(), replay_figures(REPLAY_OUTPUT).unwrap());
+        let last = format!("{}\r", REPLAY_OUTPUT.lines().nth(2).unwrap());
+        assert_eq!(replay_figures(&last).unwrap(), replay_figures(REPLAY_OUTPUT).unwrap());
+    }
+
+    #[test]
+    fn a_replay_prints_one_report_that_reads() {
+        let report = REPLAY_OUTPUT.lines().find(|line| line.starts_with('{')).unwrap();
+        let none = REPLAY_OUTPUT.replace(report, "");
+        assert!(replay_figures(&none).unwrap_err().contains("0 lines"));
+        let twice = format!("{REPLAY_OUTPUT}{report}\n");
+        assert!(replay_figures(&twice).unwrap_err().contains("2 lines"));
+        let cut = REPLAY_OUTPUT.replace(report, &report[..report.len() / 2]);
+        assert!(replay_figures(&cut).unwrap_err().contains("not a JSON object"));
+        let unnamed = REPLAY_OUTPUT.replace("\"scene\":\"fifty thrown bodies\",", "");
+        assert!(replay_figures(&unnamed).unwrap_err().contains("names no `scene`"));
+        let clockless = REPLAY_OUTPUT.replace("\"clock_script\":true", "\"clock_script\":1");
+        assert!(replay_figures(&clockless).unwrap_err().contains("names no `scene`"));
+    }
+
+    /// The replays are the file's ten-minute tests but the claim on approach, in its order,
+    /// and a short run keeps one scene on each clock.
+    #[test]
+    fn the_replays_are_the_spike_s_and_a_short_run_keeps_one_scene_on_each_clock() {
+        let source = repository(SPIKE_FILE).replace("\r\n", "\n");
+        let in_file: Vec<&str> = source
+            .split("fn ")
+            .skip(1)
+            .filter_map(|rest| rest.split_once('(').map(|(name, _)| name))
+            .filter(|name| name.starts_with("ten_minutes_of_"))
+            .collect();
+        let named: Vec<&str> = REPLAYS.iter().map(|replay| replay.test).collect();
+        let mut expected = in_file.clone();
+        expected.retain(|name| *name != "ten_minutes_of_a_claim_on_approach_on_the_server_clock");
+        assert_eq!(named, expected, "every replay but the claim on approach");
+        assert_eq!(in_file.len(), named.len() + 1);
+
+        assert_eq!(replays(false).count(), REPLAYS.len());
+        let short: Vec<&str> = replays(true).map(|replay| replay.test).collect();
+        let on = |clock: &str| short.iter().filter(|name| name.ends_with(clock)).count();
+        assert_eq!(short.len(), 2, "{short:?}");
+        assert_eq!((on("_with_the_clock_script"), on("_on_the_server_clock")), (1, 1), "{short:?}");
+        let scene = |name: &str| {
+            name.trim_end_matches("_with_the_clock_script")
+                .trim_end_matches("_on_the_server_clock")
+                .to_owned()
+        };
+        assert_eq!(scene(short[0]), scene(short[1]), "one scene: {short:?}");
+        assert!(Run::SpikeReplays.cut_by_short());
+
+        let body = source.split("fn measure(").nth(1).unwrap().split("\n}\n").next().unwrap();
+        assert!(
+            body.contains(&format!("let executor = executor({SPIKE_WORKERS});")),
+            "the replays' workers"
+        );
     }
 
     #[test]
@@ -1521,7 +1932,13 @@ mod tests {
     fn every_measurement_names_a_test_that_exists_and_is_listed() {
         let readme = repository("docs/results/README.md");
         let mut names = std::collections::BTreeSet::new();
-        for m in MEASUREMENTS.iter().chain([&Measurement {
+        let replays = REPLAYS.map(|replay| Measurement {
+            name: replay.test,
+            what: "",
+            threshold: "",
+            run: replay.run(),
+        });
+        for m in MEASUREMENTS.iter().chain(&replays).chain([&Measurement {
             name: "probe",
             what: "",
             threshold: "",
@@ -1538,7 +1955,7 @@ mod tests {
                 let attributes = &before[before.rfind("#[test]").unwrap()..];
                 assert!(attributes.contains("#[ignore"), "{test} is ignored");
             }
-            if m.name != "probe" {
+            if m.name != "probe" && !m.name.starts_with("ten_minutes_of_") {
                 assert!(readme.contains(&format!("`{}`", m.name)), "{} in the README", m.name);
             }
         }
@@ -1584,9 +2001,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_result_file_opens_with_the_header() {
-        let header = Header {
+    fn sample_header() -> Header {
+        Header {
             measurement: find("tick-100k").unwrap(),
             machine: "apple-m1".into(),
             date: "2026-11-15".into(),
@@ -1602,7 +2018,12 @@ mod tests {
             ran: "LACTOSE_MEASURE_SHORT=1 cargo nextest run".into(),
             load: Load::Averages { before: "1.0 2.0 3.0".into(), after: "2.0 2.0 3.0".into() },
             notes: Vec::new(),
-        };
+        }
+    }
+
+    #[test]
+    fn a_result_file_opens_with_the_header() {
+        let header = sample_header();
         let figures = vec![("t1_us".to_owned(), "1.5".to_owned())];
         let text = markdown(&header, &figures, "measure: t1_us 1.5\n");
         for expected in [

@@ -4980,6 +4980,34 @@ relayed by an event when it acts on another body** (§6.1, §10, `lactose-ecs`,
   figures overlap by them; an exclusive system's is its `casein` span, inside its sync point's
   node. Every figure the lane's runs printed was taken on the M1 under agent load; they steer
   and prove nothing.
+- Addendum (lane spike-net-file, 2026-11-15; review rounds 1 and 2): *criterion 7's result
+  file.* `cargo xtask measure spike-net` runs the netcode spike's eight ten-minute replays
+  (every `ten_minutes_of_` test of `crates/app/tests/spike.rs` except the claim on approach,
+  which the milestone 1 plan leaves unrecorded) in release, one `cargo nextest run --retries 0`
+  each, and writes one pair of files. Each replay prints its report as one JSON object; the
+  files carry its values as figures `<scene>.<clock>.<key>` (the clock `clock_script` or
+  `server_clock`, nested keys joined by dots, an array as its JSON text), each float the printed
+  value bit for bit (serde_json's `float_roundtrip`), and the replay's seconds from its first
+  line of output to its report as `<scene>.<clock>.wall_s`. Each report counts
+  `server_frozen_ticks`, the server frames from the region's load to the end in which any loaded
+  region was not `Simulated` or the spike's region was not loaded, and
+  `prediction_fixed_and_proxies`, the most fixed colliders and proxies the prediction world
+  held, over all its regions, after a client frame; the measurement fails, naming the replay and
+  its count and writing no file, unless every replay's `server_frozen_ticks` is 0, so that no
+  correction rate is a server-`Frozen` region's (section 9.4), and every
+  `prediction_fixed_and_proxies` is at most 64 (plan decision 5.5). The header's "Server's
+  regions" and "Prediction bound" rows, written only after those checks, state both. `--short`
+  keeps the dynamic capsule on each clock, about 27 s of the eight's 234 s on the M1 under load:
+  a replay is ten minutes of ticks however it runs, and the cut leaves the runners' short job
+  inside its 120 minutes with room (an uncut run is estimated at 6.5 to 9.5 minutes on a runner
+  from run 43659357193's rollback timings, 1.7x and 2.4x the M1's), so the workflow is
+  unchanged. Every measured test also runs with `--retries 0`, and a figure name printed twice
+  fails its measurement. This amends the "lane measure" addendum: for `spike-net` the contract
+  is the report's one JSON object, and its replays run on the spike's four workers whatever
+  `LACTOSE_MEASURE_WORKERS` says, as its header states; and its two counts are the one place the
+  command fails on a figure: they decide whether the file stands, not whether criterion 7 is
+  met, so the rule that a threshold a file states never fails the command still holds for every
+  criterion's figures.
 
 **D140. Architecture revision 3.3: the project review's findings against the document, and the milestone 1 plan's rulings written in** (§1 goal 7, §2 Graphics, §3, §4, §8.1, §8.2, §8.3, §9.4, §10, §12.1, §13, §14, §15.1, §16, §18, §20, §22, §22.1, §23)
 - Why: the whole-project review at `6ed8461` found sentences of the architecture that the

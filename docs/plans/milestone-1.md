@@ -40,7 +40,7 @@ Section 22 gives milestone 1 nine criteria. Status is what the tree and CI show 
 | 4 | Physics phase at most 3 ms for 2,000 awake bodies | A new cost test: the physics stage of `Simulation::step` (`physics-api`'s sync, the Rapier step, the write-back) at 100k rows with 2,000 awake bodies. Result file `physics-phase` | Not measured as a phase. Its parts, on the M1 at load 3.5 to 5 (row 87): the step 0.97 to 0.99 ms on four solver threads and 1.24 to 1.27 ms on one, the sync 0.96 ms, the write-back 0.42 ms. The sum is 2.35 to 2.65 ms | `measure`; `ecs-kernel` takes the column scans (0.75 ms of the sync) down |
 | 5 | Prediction-world snapshot at most 100 µs | A new cost test: the take of one ring slot (`World::snapshot` plus `physics_api::snapshot`) through `lactose-predict` with Rapier, on the spike's scene. Result file `prediction-slot` | Not measured as a slot. Its parts: the world snapshot 5.4 µs with no statics (row 17); Rapier's write 32 µs beside no fixed collider and 92 µs beside 100 (row 87). The quiet window measured the slot at 140.8 µs: not met (D143, `docs/plans/criterion-5-proposal.md`) | `measure`; `slot-copy`, then the second quiet window (section 3); decision 5.5 as D143 amends it |
 | 6 | Sim-skeleton evaluation at most 0.5 ms for 200 characters | `the_sim_skeleton_budget` in `crates/anim/tests/cost.rs`, its figure (b). Result file `sim-skeleton` | Met on the M1: 196.9 µs on one worker and 189.3 µs on four, at load 3 to 4 (row 115). No result file, and no x86 figure | The quiet window and session B (section 4) |
-| 7 | Netcode spike over a throwaway transport: x86 server, aarch64 client, four scenarios, the correction rate, the largest absorbed difference per kind, rollback cost per tick and divergence recorded | `crates/app/tests/spike.rs` made to run (decision 5.3): its scenes recorded under SOUR, its figures in result file `spike-net` | Not started. The file is a compile-only sketch. The prediction world `lactose-app` builds loads every region `Replicated`, so it predicts nothing (S1); the fix round is in flight | `client-fix`, `sour-evidence`, `spike-net` |
+| 7 | Netcode spike over a throwaway transport: x86 server, aarch64 client, four scenarios, the correction rate, the largest absorbed difference per kind, rollback cost per tick and divergence recorded | `crates/app/tests/spike.rs` made to run (decision 5.3): its scenes recorded under SOUR, its figures in result file `spike-net`, which `cargo xtask measure spike-net` writes from the eight ten-minute replays | The spike runs and records under SOUR; `cargo xtask measure spike-net` writes result file `spike-net` (lane `spike-net-file`), checked in at the second quiet window | `client-fix`, `sour-evidence`, `spike-net` |
 | 8 | Scalar decided by the section 16 rule | A precision probe's result file `scalar-precision` and a decision entry | Nothing exists. No document states the full map extent the rule tests at | `scalar-probe`, then the planner's decision (decision 5.4) |
 | 9 | Edit-to-playing at most 30 s per platform | The measurement section 4 defines. Result file `edit-to-playing` | Not measured and not defined. The dev profile and the linkers are configured (D125, row 63). No game crate exists | `measure`, the quiet window, session B |
 
@@ -196,11 +196,13 @@ Six rules bind whatever the coordinator reorders:
   touches and reports the figures as steering. The exit's reviewer compares them with the measured
   files.
 - Criterion 5 is proven at the first commit of main that holds `slot-copy`, not at the measurement
-  commit. The coordinator runs `cargo xtask measure prediction-slot rollback-seven-ticks` there in
-  a second quiet window, and those two files replace the measurement commit's for criteria 5 and
-  7. The cost test takes into a full ring by then, so the snapshot's figure includes the drop of
-  the world snapshot and the physics snapshot it evicts. Every other file of the measurement
-  commit stands, and session B is unchanged: its slot figure is recorded, of the byte form (D143).
+  commit. The coordinator runs
+  `cargo xtask measure prediction-slot rollback-seven-ticks spike-net` there in a second quiet
+  window; the first two files replace the measurement commit's for criteria 5 and 7, and the third
+  is criterion 7's first `spike-net` file. The cost test takes into a full ring by then, so the
+  snapshot's figure includes the drop of the world snapshot and the physics snapshot it evicts.
+  Every other file of the measurement commit stands, and session B is unchanged: its slot figure
+  is recorded, of the byte form (D143).
 
 **Where this reorders the coordinator's queue, and why.**
 
@@ -402,16 +404,17 @@ take reaches 100 µs near 100 fixed colliders and the restore near 75, and copy-
 a floor. So the bound counts both: at most 64 fixed colliders and proxies together, beside the
 fifty claimed bodies, until `measure`'s slot test, which holds proxies, gives the mix a figure of
 its own. The spike's scenes need a floor and a handful of blocks. The bound is a content rule at
-milestone 1, stated in the two READMEs and recorded by the spike's result file. Milestone 3 must
-design what replaces it. Section 9.4 gives the prediction world "the immutable static collision
-asset", but today `physics-api`'s snapshot carries the backend's whole world (section 10, D119), so
-holding cooked static scenery outside the per-tick snapshot changes that contract; it is listed for
-revision 3.3. What would change this: the slot measured through `lactose-predict` at the
-measurement commit exceeding 100 µs on the spike's scene. It did: the quiet window measured
-140.8 µs. D143 replaces this decision's cost sentences, from "The cost is Rapier's serialisation
-of each fixed collider" to "At 64 the take is about 76 µs and the restore about 92 µs", which are
-of bodies that touch nothing. The slot holds a copy, and the bound of 64 stands until the copied
-slot is measured (`docs/plans/criterion-5-proposal.md`).
+milestone 1, stated in the two READMEs and recorded by the spike's result file (each replay's
+`prediction_fixed_and_proxies`, which `cargo xtask measure spike-net` checks against 64).
+Milestone 3 must design what replaces it. Section 9.4 gives the prediction world "the immutable
+static collision asset", but today `physics-api`'s snapshot carries the backend's whole world
+(section 10, D119), so holding cooked static scenery outside the per-tick snapshot changes that
+contract; it is listed for revision 3.3. What would change this: the slot measured through
+`lactose-predict` at the measurement commit exceeding 100 µs on the spike's scene. It did: the quiet
+window measured 140.8 µs. D143 replaces this decision's cost sentences, from "The cost is Rapier's
+serialisation of each fixed collider" to "At 64 the take is about 76 µs and the restore about
+92 µs", which are of bodies that touch nothing. The slot holds a copy, and the bound of 64 stands
+until the copied slot is measured (`docs/plans/criterion-5-proposal.md`).
 
 **5.6 The bundle's layout digest lands in milestone 1, before the cooker.** D129 left
 `ComponentSchema` without the digest, so a same-size layout change without a version bump is
