@@ -5719,6 +5719,15 @@ relayed by an event when it acts on another body** (§6.1, §10, `lactose-ecs`,
   bytes are 193 kB; the world snapshot 87 kB in 99 allocations. The spike's four recording tests
   record the same hashes (digest 8db4551c007e6410 over 7,200 lines) in PR, layout and chaos
   modes. The quiet-window measurement that proves criterion 5 is still to be taken.
+- Addendum (the second quiet window, 2026-11-15):
+  `cargo xtask measure prediction-slot rollback-seven-ticks spike-net` on the Apple M1 at
+  `c50b688`, the first commit of main that holds lane `slot-copy`, with every track stopped. The
+  copied slot taken into a full ring of 60, each part's eviction inside its timer (load averages
+  2.96 2.75 5.85): snapshot 90.0 µs (world 11.2, physics 78.9), record 61.5 µs, restore 76.5 µs
+  (world 14.6, physics 62.0), the first `Ring::bytes` on a full ring 16.3 ms; a seven-tick
+  rollback on the thrown scene 2,713.7 µs, 387.7 µs a tick. Criterion 5 is met: the budget stays
+  100 µs and the bound 64, and nothing returns to the owner. The two files replace the first
+  window's, which stay at `1d8042e`, and `spike-net` is written for the first time.
 
 **D144. On Windows the keeper waits on a high-resolution timer beside a wake event and spins the last 500 µs, and tick start there is held to 1 ms at P99** (§5.1, §21, §22, `lactose-task`, `docs/plans/milestone-1.md`)
 - Why: on Windows the timer root started ticks up to a whole tick late. An i7-12650H laptop on
