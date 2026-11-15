@@ -24,6 +24,12 @@ are looking for.
   touches, re-running that report's stress loop and its crate's Miri or loom run. Copy that
   report's probes into the one copy you refresh; never build its copy in `target-review` beside
   yours, since cargo then runs either copy's build for both.
+- When `reviewer-gpu` ran beside `reviewer`, or alone on the RHI spike, take its report too;
+  re-check a fix that changes a barrier, a semaphore, a lifetime, a feature query or a test
+  tolerance against the GPU items it touches, re-running that report's validation runs and its
+  mutations of the tests. The same rule on copies and target directories applies. For the
+  spike, diff the two copies of the program the briefs name instead of commits, check the
+  result file's hash against the new copy, and re-run it under the report's settings.
 - Nothing else unless it is in the diff or the brief names it.
 
 ## Budget

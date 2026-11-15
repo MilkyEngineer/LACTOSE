@@ -1308,12 +1308,13 @@ The policy is in section 3.
   written against; `planner` writes milestone plans, proposals and the decisions that settle
   them; `reviewer` reads every lane, interface design and plan adversarially before it
   merges, `reviewer-concurrency` reads beside it the first review of code that runs on
-  several threads or adds `unsafe` other than an FFI call, and `reviewer-diff` reads each
-  later fix round against the previous reviews;
-  `merger` runs a merge and its gates from a brief and commits it. The coordinator writes the
-  briefs, decides the findings, pushes, and keeps this document, the decisions log and the
-  verification list; a long command that needs no interpretation runs in the background,
-  never in a foreground agent turn.
+  several threads or adds `unsafe` other than an FFI call, `reviewer-gpu` the first review of
+  work that records, submits or synchronises GPU work, defines the surface it goes through or
+  produces what it runs, and `reviewer-diff` reads each later fix round against the previous
+  reviews; `merger` runs a merge and its gates from a brief and commits it. The coordinator
+  writes the briefs, decides the findings, pushes, and keeps this document, the decisions log
+  and the verification list; a long command that needs no interpretation runs in the
+  background, never in a foreground agent turn.
 - CI: clippy `-D warnings`, fmt, nextest, SOUR in all applicable modes, Miri nightly on
   `core`, `task` over each deque, `ecs`, `input-host` and `net-host`, `cargo-deny`, the tier,
   boundary, feature and vendor checks.

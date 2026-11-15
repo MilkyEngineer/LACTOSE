@@ -38,13 +38,14 @@ kind.
    than one job: column ticks are written once at dispatch, before the fork (section 6); pass
    marks are per system; command buffers and event emissions are per child and merge after the
    scope closes; the structural log and the event index change only between systems and are
-   read-only while jobs run. Nothing is kept per worker. Systems that can run at once have
-   non-conflicting access tables, and a job gets only what its table declares
-   (`crates/ecs/SAFETY.md`). Every `unsafe impl Send` or `Sync`, and every raw pointer that
+   read-only while jobs run. Nothing an ECS system's jobs write is kept per worker; render-side
+   state keyed by `JobContext::slot`, such as a Vulkan command pool, is `reviewer-gpu`'s. Systems
+   that can run at once have non-conflicting access tables, and a job gets only what its table
+   declares (`crates/ecs/SAFETY.md`). Every `unsafe impl Send` or `Sync`, and every raw pointer that
    crosses a thread, has its argument in the crate's `SAFETY.md`, and the argument holds for the
-   code as written. Every new `unsafe` block's `// SAFETY:` comment names an invariant in that
-   file, and the code meets it: bounds, alignment, byte validity, and provenance (a pointer lent
-   to a job derives from the slab, not from a borrow a later `&mut` invalidates).
+   code as written. Every new `unsafe` block's `// SAFETY:` comment names an invariant in that file,
+   and the code meets it: bounds, alignment, byte validity, and provenance (a pointer lent to a job
+   derives from the slab, not from a borrow a later `&mut` invalidates).
 3. **Lifetimes against joins.** A borrow lent to a job ends after the job is joined on every path:
    success, a panic in any child, cancellation, executor shutdown. Read section 5.1's
    abort-on-unwind rule and check every new job and join wait is under the guard.
@@ -70,8 +71,8 @@ kind.
    drawn in sequence across jobs (an RNG stream, a sequence number, a spawn index, a layout RNG) is
    drawn before the fork or keyed by what the job is, never consumed in the order jobs run:
    simulation randomness by (region seed, tick, system, stable key) as section 8.2 has it, a
-   test-only layout RNG by (seed, tick, system, archetype, chunk). A worker index
-   (`JobContext::slot`, opted out item by item in `crates/ecs/clippy.toml`) keys only scratch
+   test-only layout RNG by (seed, tick, system, archetype, chunk). Inside the boundary, a worker
+   index (`JobContext::slot`, opted out item by item in `crates/ecs/clippy.toml`) keys only scratch
    that carries nothing between jobs and folds order-independently. Inside the boundary every
    ordering key is a `StableKey`.
 7. **Formal models.** Synchronisation that decides when a borrow ends or a sleeper wakes belongs in

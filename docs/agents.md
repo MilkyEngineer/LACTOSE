@@ -15,6 +15,7 @@ carry the rules each agent follows.
 | `lane` | Opus, high | its own worktree | Implements a crate, a feature or a fix round against a brief |
 | `reviewer` | Opus, xhigh | a scratch copy | The first adversarial review of a crate or design; probes, never edits the tree under review |
 | `reviewer-concurrency` | Opus, xhigh | a scratch copy | Beside `reviewer` on the first review of code that runs on several threads or adds `unsafe` other than an FFI call: memory ordering, shared state across jobs, the job model, liveness, loom and Miri coverage, determinism under parallel execution |
+| `reviewer-gpu` | Opus, xhigh | a scratch copy | Beside `reviewer` on the first review of work that records, submits or synchronises GPU work, defines the surface it goes through, or produces what it runs, and alone on the RHI spike: hazards and barriers, frame lifetimes, validation layers and Metal API and shader validation, the surface against the null backend and native Metal, tests that compare GPU output, the FFI `unsafe` at the driver boundary |
 | `reviewer-diff` | Opus, high | a scratch copy | Review round 2 and later: the fix round's diff against the previous report, on a budget |
 | `merger` | Opus, high | the main checkout | Runs the merge protocol from a brief and commits; never pushes |
 
@@ -28,7 +29,8 @@ coordinator's model is set in `.claude/settings.json`.
 A crate other crates are written against gets a facade first:
 
 1. `architect` writes the facade from a brief.
-2. `reviewer` reviews it.
+2. `reviewer` reviews it; for the `rhi-api` facade, or any facade GPU work goes through,
+   `reviewer-gpu` reviews it beside `reviewer`.
 3. A `lane` fixes every finding the coordinator accepts. A finding whose fix would change the
    design substantially goes back to the same `architect` instead.
 4. `reviewer-diff` reviews the fix round.
@@ -40,9 +42,13 @@ An implementation, of a facade or of a crate with no facade:
 2. `reviewer` reviews it. When it adds or changes code that runs on more than one thread, or
    adds `unsafe` other than an FFI call, `reviewer-concurrency` reviews it beside `reviewer`, on
    its checklist only, and `reviewer`'s brief leaves that checklist and its Miri, loom,
-   SOUR-mode and stress runs to it. The fix brief answers both reports.
+   SOUR-mode and stress runs to it. When it records, submits or synchronises GPU work, defines
+   the surface such work goes through, or produces what it runs (cooked shaders and pipeline
+   libraries), `reviewer-gpu` does the same with its checklist and its runs under the
+   validation layers and Metal API and shader validation; the RHI spike's first review is
+   `reviewer-gpu` alone. The fix brief answers every report.
 3. The same `lane` fixes the accepted findings; `reviewer-diff` reviews the fix, taking the
-   concurrency report's findings as part of its checklist when there is one.
+   concurrency and GPU reports' findings as part of its checklist when there are any.
 4. Step 3 repeats until a review round finds nothing.
 
 Every fix round so far has introduced a defect the next review caught, so an implementation
