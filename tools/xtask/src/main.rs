@@ -29,7 +29,7 @@ use lactose_xtask::repo::Files;
 use lactose_xtask::tiers::TierFile;
 use lactose_xtask::vendor::{self, Repository};
 use lactose_xtask::workspace::{Workspace, cargo_metadata, load_metadata};
-use lactose_xtask::{Finding, POLICY_FILE, TIER_FILE, boundary, features, tiers};
+use lactose_xtask::{Finding, POLICY_FILE, TIER_FILE, boundary, features, miri, tiers};
 
 const USAGE: &str = "\
 cargo xtask <command>
@@ -37,7 +37,8 @@ cargo xtask <command>
   tiers                      check every crate dependency against crate-tiers.toml
   boundary                   check the boundary lint files and everything that could switch
                              them off, the unsafe policy, READMEs, the boundary dependency
-                             allowlist and the x86-64-v3 pin
+                             allowlist, the x86-64-v3 pin, and that the nightly Miri
+                             entries of each split package run its targets once each
   features [--package <p>]…  require agreeing boundary feature trees, per CI platform, across
                              the shipped binaries and the harness packages (or across the
                              named packages): identical across shipped binaries, the same
@@ -226,7 +227,9 @@ fn check_tiers() -> Checked {
 fn check_boundary() -> Checked {
     let context = Context::load()?;
     let files = Files::load(&context.root)?;
-    Ok(boundary::check(&context.tiers, &context.policy, &context.workspace, &files))
+    let mut findings = boundary::check(&context.tiers, &context.policy, &context.workspace, &files);
+    findings.extend(miri::check(&context.policy, &context.workspace, &files));
+    Ok(findings)
 }
 
 fn check_vendor(args: &[&str]) -> Checked {

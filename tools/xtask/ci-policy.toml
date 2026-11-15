@@ -68,3 +68,11 @@ tests = [
   "lactose_sim::cost::scene",
   "lactose_sim::sour::anchored_world",
 ]
+
+# Architecture section 20: the packages the nightly Miri job runs as several entries of its
+# matrix (.github/workflows/nightly.yml), for the time limit. `cargo xtask boundary` requires
+# the entries that name such a package to run, together, its library, each of its
+# integration test targets and its doc tests exactly once, so that a new test target cannot
+# drop out of Miri unseen.
+[miri_split]
+packages = ["lactose-ecs"]
