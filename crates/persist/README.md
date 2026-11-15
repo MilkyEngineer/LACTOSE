@@ -413,9 +413,11 @@ export:
   only at a load: `crates/app/tests/schema_record.rs` compares the version, layout digest,
   field IDs and retired IDs of every type `SchemaTable::schemas()` holds for `Game::types()`
   of a game with no crate with `crates/app/tests/schema_record/engine.txt`, and fails a type
-  whose digest moved at an unchanged version and a reused field ID (`crates/app/README.md`,
-  "The saved-type record"). A game's own types have no record until a game binary's set
-  gains one (milestone 5).
+  whose digest moved at an unchanged version, transient types included (no load needs that
+  bump, but one made persistent later is read from the version and digest it was saved
+  under, first bullet), and a reused field ID (`crates/app/README.md`, "The saved-type
+  record"). A game's own types have no record until a game binary's set gains one
+  (milestone 5).
 
 **The container** (architecture sections 15.3, 15.4 and 19)
 

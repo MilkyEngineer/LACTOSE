@@ -210,20 +210,32 @@ impl Record {
                     now.version, was.version
                 ));
             } else if now.version == was.version && now.digest != was.digest {
-                let transient = if Persistence::Transient == was.persistence
-                    || Persistence::Transient == now.persistence
-                {
-                    ". A transient type takes the bump too: one made persistent later is read \
-                     from the version and digest it was saved under"
+                // No step runs for a transient type, so its remedy names none.
+                let remedy = if now.persistence == Persistence::Transient {
+                    format!(
+                        "Raise its `version`, then run `{UPDATE}`. No load needs the bump while \
+                         the type is transient, but one made persistent later is read from the \
+                         version and digest it was saved under, and the commit that makes it \
+                         persistent registers the steps from each version it was saved at"
+                    )
                 } else {
-                    ""
+                    let transient = if was.persistence == Persistence::Transient {
+                        ". A transient type takes the bump too: one made persistent later is \
+                         read from the version and digest it was saved under"
+                    } else {
+                        ""
+                    };
+                    format!(
+                        "Raise its `version` and register the step from {} \
+                         (`crates/persist/README.md`, \"The registration a game crate \
+                         writes\"), then run `{UPDATE}`{transient}",
+                        now.version
+                    )
                 };
                 out.push(format!(
                     "`{name}` changed its layout at version {}: the record holds digest \
-                     {:#018x}, the build {:#018x}. Raise its `version` and register the step \
-                     from {} (`crates/persist/README.md`, \"The registration a game crate \
-                     writes\"), then run `{UPDATE}`{transient}",
-                    now.version, was.digest, now.digest, now.version
+                     {:#018x}, the build {:#018x}. {remedy}",
+                    now.version, was.digest, now.digest
                 ));
             }
             // An equal digest means equal IDs, offsets and sizes at every depth, so the
@@ -854,15 +866,23 @@ fn a_version_that_rose_takes_any_digest() {
 
 #[test]
 fn a_transient_type_is_held_to_its_digest_like_a_persistent_one() {
+    // Transient in the build: the bump alone, since no step runs for a transient type.
     for breaks in [
         breaks_between::<marker::Marker, marker_swapped::Marker>(false),
-        breaks_between::<marker::Marker, marker_persistent::Marker>(false),
         breaks_between::<marker_persistent::Marker, marker::Marker>(false),
     ] {
         assert_eq!(breaks.len(), 1, "{breaks:#?}");
         assert!(breaks[0].starts_with("`record_test::marker` changed its layout at version 1"));
-        assert!(breaks[0].contains("A transient type takes the bump too"));
+        assert!(breaks[0].contains(&format!("Raise its `version`, then run `{UPDATE}`")));
+        assert!(breaks[0].contains("No load needs the bump while the type is transient"));
+        assert!(!breaks[0].contains("register the step"));
     }
+    // Made persistent in the build: the step too.
+    let breaks = breaks_between::<marker::Marker, marker_persistent::Marker>(false);
+    assert_eq!(breaks.len(), 1, "{breaks:#?}");
+    assert!(breaks[0].starts_with("`record_test::marker` changed its layout at version 1"));
+    assert!(breaks[0].contains("register the step from 1"));
+    assert!(breaks[0].contains("A transient type takes the bump too"));
     // Under a bump each change is one the record takes, and so is the policy's alone.
     assert!(breaks_between::<marker::Marker, marker_swapped_bumped::Marker>(false).is_empty());
     assert!(
