@@ -320,7 +320,8 @@ impl<'a> Loader<'a> {
                     && other != predicted
                 {
                     return Err(invalid(format!(
-                        "{id:?} is bound to {other:?} in region {} and to {predicted:?} in region {}",
+                        "{id:?} is bound to {other:?} in region {} and to {predicted:?} in \
+                         region {}",
                         first.0, region.0
                     )));
                 }

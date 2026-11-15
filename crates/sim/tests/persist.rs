@@ -364,11 +364,10 @@ fn record_after(
     (journal, hashes, seen)
 }
 
-/// The replay driver: builds with the journal's binds, restores what the journal holds
-/// before its first step (the regions, an unjournaled edit the tool makes; the players'
-/// claims; the held joins and requested regions through `restore_session_state`), then
-/// steps the journal's frames.
-fn replay_from(executor: &Executor, journal: &Journal) -> (Vec<u64>, Vec<String>) {
+/// The replay driver's start: builds with the journal's binds and restores what the journal
+/// holds before its first step (the regions, an unjournaled edit the tool makes; the
+/// players' claims; the held joins and requested regions through `restore_session_state`).
+fn restored(journal: &Journal) -> Simulation {
     let save = &journal.checkpoint;
     let mut simulation = game(WorldKind::Server)
         .regions(anchored(true))
@@ -408,6 +407,12 @@ fn replay_from(executor: &Executor, journal: &Journal) -> (Vec<u64>, Vec<String>
     simulation
         .lifecycle_mut()
         .restore_session_state(journal.held_joins.clone(), journal.requested.clone());
+    simulation
+}
+
+/// The replay driver: [`restored`], then the journal's frames.
+fn replay_from(executor: &Executor, journal: &Journal) -> (Vec<u64>, Vec<String>) {
+    let mut simulation = restored(journal);
     let baselines = baselines();
     let mut hashes = Vec::new();
     let mut seen = Vec::new();
@@ -711,13 +716,13 @@ fn a_journal_from_a_checkpoint_with_a_predicted_owner_unloaded_replays_the_hashe
         let owned = StableKey::Net(world.allocate_net_id().unwrap());
         let owner = OwnedBy { owner: EntityRef::new(StableKey::Predicted(origin)) };
         world.spawn(owned, PINNED, (at, owner)).unwrap();
-        owners.insert(region, (origin, net));
+        owners.insert(region, (origin, net, owned));
     }
     while regions.iter().all(|&region| simulation.world().region(region).is_some()) {
         simulation = advance(simulation, &mut driver);
         assert!(simulation.tick().0 < 400, "no owner's region unloaded");
     }
-    let (left, &(origin, net)) =
+    let (left, &(origin, net, owned)) =
         owners.iter().find(|&(&region, _)| simulation.world().region(region).is_none()).unwrap();
     assert!(driver.stored.contains_key(left), "the unload left an export");
     assert_eq!(simulation.world().alias(origin), Some(net), "an unloaded owner keeps its bind");
@@ -731,6 +736,12 @@ fn a_journal_from_a_checkpoint_with_a_predicted_owner_unloaded_replays_the_hashe
     let (mut journal, recorded, original) =
         record_after(&executor, simulation, &mut driver, journal, 60);
 
+    // The binds are held before the first region loads: the restored world, before its
+    // first step, stores the unloaded owner under its origin key.
+    let start = restored(&journal);
+    let stored = start.world().get::<OwnedBy>(owned).and_then(|row| row.owner.get());
+    assert_eq!(stored, Some(StableKey::Predicted(origin)), "the owner before the first step");
+    drop(start);
     let (hashes, replayed) = replay_from(&executor, &journal);
     assert_eq!(hashes, recorded);
     assert_eq!(replayed, original);

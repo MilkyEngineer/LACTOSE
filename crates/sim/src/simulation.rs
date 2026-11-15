@@ -516,9 +516,9 @@ impl Simulation {
     /// passes the rollback horizon over the tick it ran, so the binds of the entities it
     /// despawned are dropped (D142; a `Client` world sets the horizon to its current tick
     /// before the run instead), and hands the simulation back at the next tick. Nothing
-    /// else: the passes are [`run_passes`](Self::run_passes). The README states what the sync point does and in
-    /// what order; the signature states that a step takes no clock and nothing but `input`,
-    /// which is consumed: a caller that may retry keeps a clone.
+    /// else: the passes are [`run_passes`](Self::run_passes). The README states what the
+    /// sync point does and in what order; the signature states that a step takes no clock
+    /// and nothing but `input`, which is consumed: a caller that may retry keeps a clone.
     ///
     /// The future is `Send` and is driven by the `'static` task that owns the simulation.
     /// It resolves to a [`RunError`] with the simulation inside if the tick schedule no

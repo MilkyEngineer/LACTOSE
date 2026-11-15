@@ -27,10 +27,10 @@ pub enum FieldKind {
     /// [`FieldKind::Struct`].
     #[non_exhaustive]
     Scalar,
-    /// An [`EntityRef`]: it holds an origin key, the same on every machine, so a load
-    /// keeps it as exported, an owner excepted (architecture section 7). Generic code reads and rewrites a
-    /// field of this kind as an `EntityRef` (the ECS's erased writes and reference
-    /// walkers), so only `EntityRef` itself may declare it.
+    /// An [`EntityRef`]: it holds an origin key, the same on every machine, so a load keeps
+    /// it as exported, an owner excepted (architecture section 7). Generic code reads and
+    /// rewrites a field of this kind as an `EntityRef` (the ECS's erased writes and
+    /// reference walkers), so only `EntityRef` itself may declare it.
     EntityRef,
     /// A reference whose type implements [`AssetReference`]: it holds an `AssetId`, the
     /// same on every machine, so a load keeps it as exported. Built by
