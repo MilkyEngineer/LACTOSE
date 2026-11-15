@@ -366,13 +366,21 @@ standard error as it comes.
   files carry those figures, the `.json` with each value a number where it reads as one, and
   the `.md` with the test's whole output. A test that prints no figure, or a figure line
   that does not read, fails its measurement.
+- `spike-net` runs the netcode spike's ten-minute replays one `cargo nextest run` at a time;
+  each prints its report as one JSON object, whose values the files carry under
+  `<scene>.<clock>.` (nested keys joined by dots, an array as its JSON text), with the
+  replay's seconds from its first line of output to its report, the build left out, as
+  `<scene>.<clock>.wall_s`. A replay that prints no report, or two, or a
+  line opening with `{` that is not one, fails the measurement.
 - The cost tests run on N frame workers: the performance cores the platform reports or, on
   a part that reports no core types, its physical cores, at most eight (the plan's section
   4). `LACTOSE_MEASURE_WORKERS=<n>` sets N instead: a count above zero, refused before
   anything builds otherwise, passed to the tests and recorded in the header. Empty, it is
   unset, here and in the tests.
 - `--short` sets `LACTOSE_MEASURE_SHORT=1` for the tests and `WHISK_BENCH_RUNS=100` for the
-  benchmark, and names the files `…-short`. It cuts nothing of `headless-120`, which has no
+  benchmark, cuts `spike-net` to the dynamic capsule on each clock, since a replay is ten
+  minutes of ticks however it runs, and names the files `…-short`. It cuts nothing of
+  `headless-120`, which has no
   repetitions, or `edit-to-playing`, which keeps its five so that a runner's short run still
   yields the criterion's figure, and leaves their files unmarked.
 - The machine in the file names is `LACTOSE_MEASURE_MACHINE` where it is set, else a slug
