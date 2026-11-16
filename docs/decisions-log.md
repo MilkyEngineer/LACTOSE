@@ -4968,6 +4968,15 @@ relayed by an event when it acts on another body** (§6.1, §10, `lactose-ecs`,
 - Driven by: the whole-project review at `6ed8461` (no milestone 1 plan; milestone 0's failed
   criterion carried without a record); `docs/plans/milestone-1.md`.
 - Replaced: nothing. It records what was done without a record.
+- Addendum (D151, 2026-11-16): *the x86 half leaves milestone 1's exit, and the keeper's attempt
+  no longer waits for it.* The owner closed milestone 1 on the Mac. The session on the owner's
+  desktop runs in milestone 2's one desktop sitting, beside milestone 1's own x86 session, and
+  the x86 half of each criterion is settled there: a pass, or a remedy the planner brings to the
+  owner. Its rows are gated at milestone 2. The M1's half of each stays an exit condition of
+  milestone 1. The lane of the bounded attempt runs before the x86 numbers, on the M1 under
+  macOS 14.7 and before that machine is upgraded. An x86 failure found in the sitting joins
+  D151's finding and opens no second attempt. The rule is otherwise as decided: one attempt, or
+  tick start restated at 35 µs.
 
 **D139. The milestone 1 plan: how its criteria are judged, what is re-gated, and the decisions that came due** (§5.2, §8.3, §9.4, §10, §12.1, §14, §15.4, §16, §18, §20, §22, §22.1, §23, `docs/plans/milestone-1.md`)
 - Why: no document mapped section 22's milestone 1 criteria, or the verification rows that gate
@@ -6386,6 +6395,64 @@ process state; the nightly Miri filters name modules that Miri compiles** (§20,
     at the merged shape, by cargo's own figure. The base run started at load 2.59; the merged
     run started at 8.41 and reached 76.07 by its end. The figure is indicative only; the Windows
     check job's time on the first CI runs after the merge decides.
+
+**D151. Milestone 1 closes on the Mac: criterion 1 is met by the M1's run on four performance cores, and the x86 half of milestones 0 and 1 is settled in milestone 2's desktop sitting** (§20, §22, `lactose-task`, `docs/plans/milestone-1.md`, `docs/plans/close-on-mac.md`, `docs/results`)
+- Why: milestone 1's exit waited on two sittings at the owner's x86 desktop, session A for the
+  x86 half of milestone 0's criteria (D138) and session B for criterion 1's proof and the x86
+  figures of the other timing criteria (D139). Neither has run. The M1's files are in. At
+  `bef3455` its 100k tick takes 10,193.0 µs on one frame worker and 3,344.6 µs on four, against
+  4 ms (`docs/results/tick-100k-apple-m1-2026-11-15.md`); criteria 4, 6 and 9 are met there,
+  and criterion 5 at `c50b688`. A labelled laptop, an i7-12650H with six performance cores on
+  Windows 11, ran `cargo xtask measure --all` at `bef3455` with other work on it. It proves no
+  timing criterion; its hashes equal the M1's. It misses where the M1 passes. The owner chose
+  to close milestone 1 on the Mac. `docs/plans/close-on-mac.md` holds the evidence; these are
+  the decisions.
+  - *Criterion 1 is met on the M1 by a direct run: T₄, the median tick on four frame workers,
+    is at most 4 ms.* A tick inside the budget on fewer performance cores than the criterion
+    grants meets a budget stated for eight. The reading assumes that more frame workers never
+    lengthen the tick. The M1's T₁ and T₄ show four workers do not lengthen it against one;
+    nothing shows it from four to eight, or on x86. The projection steers as before and is no
+    part of the proof. Rules out holding milestone 1 for a machine with eight performance
+    cores; and the projection standing as proof on any machine, which D139 ruled out and this
+    does not bring back.
+  - *Sessions A and B leave milestone 1's exit and run in milestone 2's one desktop sitting*,
+    each at the commit milestone 1's plan gives it. Session A passes or fails milestone 0's
+    makespan, wake, tick start and steal on x86 and prints the desktop's topology. Session B
+    gives the x86 figures of criteria 1, 4, 6 and 9 and compares the headless run's hash.
+    Milestone 1's timing criteria are proven by the M1's files, and the desktop's part of each
+    row that waited on a session is gated at milestone 2. Criterion 9 is met at the exit on the
+    M1's file, 1.56 s against 30; its other platforms' figures are session B's, and Linux has a
+    runner's file unless session B runs there (D149). The exit's reviewer reads criteria 1 and
+    9 as met as restated, by this decision. Rules out a milestone 1 exit that waits on the
+    desktop, and an x86 half that no milestone owns.
+  - *The laptop's misses are a finding, gated at milestone 2.* At `bef3455`: the 100k tick
+    4,689.9 µs on six frame workers, projected to eight 4,231.6 µs, against 4 ms; the physics
+    phase 4,028.4 µs against 3 ms; the wake from an idle pool 236.4 µs at P99 against 35; the
+    makespan ratio up to 6.576 at P99 against 1.5. Its prediction slot, 235.5 µs, is of the
+    byte form D143 replaced, which the plan records on x86 against no budget. The desktop
+    sitting settles each miss: a pass there, or a remedy the planner brings to the owner. Rules
+    out reading a labelled, loaded laptop as a failed criterion, and reading it as nothing.
+  - *`keeper` runs now, on the M1 under macOS 14.7, before the Mac is upgraded and without
+    session A's numbers.* D138's rule otherwise stands: one bounded attempt, or tick start
+    restated at 35 µs. A failure of milestone 0's criteria found on x86 in the sitting goes to
+    the finding, not to `keeper`. Rules out a second attempt after the x86 numbers.
+  - *Section 20 keeps both machines and says whose sitting is whose, and section 22 states the
+    reading of criterion 1 with its assumption.* The criterion's words in the milestone table
+    do not change.
+- Driven by: the owner's answer of 16 November 2026 to the coordinator's question on how
+  milestone 1 closes, "Close on the Mac", and the owner's answer of the same day on criterion 9
+  at the exit, "Mac now, rest at the sitting"; the M1's and the labelled laptop's result files
+  at `bef3455`; the coordinator's rulings of that day on what else the first answer left open;
+  the document's first review, which found the plan sentences the first draft left standing and
+  the assumption the draft's section 22 sentence left out.
+- Replaced: D139's "Criterion 1 is proven by a direct run on eight performance cores". In
+  `docs/plans/milestone-1.md`: the heading and sentences of decision 5.1 that 5.1 now names;
+  section 4's "Its run of the 100k tick on eight frame workers is criterion 1's proof" and, of
+  a failure in session A, its "goes to `keeper`"; section 5's exception for a desktop with
+  fewer than eight performance cores; and exit step 1. For the x86 half, D138's "Each is an
+  exit condition of milestone 1", and its "after the x86 numbers", both by the addendum there.
+  In section 20 and section 22 nothing: each gains a sentence. D144's rule for the desktop's
+  Windows `whisk` file stands, and is met at milestone 2.
 
 ## 10. Review history
 

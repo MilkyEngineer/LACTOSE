@@ -1305,10 +1305,12 @@ The policy is in section 3.
 - CI budget: a pull request run finishes in fifteen minutes and its cost is recorded per run.
   Miri, loom, the full SOUR matrix and architecture mode run nightly. Bare-metal performance
   measurements run on a developer M-series Mac and an x86 desktop and are checked in as
-  results, since CI has no hybrid hardware. A measurement that proves a milestone criterion
-  is a file under `docs/results` that carries its machine, date, commit, detected topology,
-  workers and load; one command, `cargo xtask measure`, writes those of milestone 1 and
-  later. A number taken while other work loads the machine steers and proves nothing.
+  results, since CI has no hybrid hardware. Milestone 1's are the Mac's; the desktop's first
+  sitting is milestone 2's, and it measures milestones 0 and 1 there too (D151). A measurement
+  that proves a milestone criterion is a file under `docs/results` that carries its machine,
+  date, commit, detected topology, workers and load; one command, `cargo xtask measure`, writes
+  those of milestone 1 and later. A number taken while other work loads the machine steers and
+  proves nothing.
 - Every interface crate a backend implements ships a conformance suite that each backend
   passes: `physics-api`, `asset-api`, `rhi-api`, and `net-host` for `net`'s transports, due
   with `net` at milestone 4. An interface crate no backend implements, such as `net-api`,
@@ -1392,7 +1394,9 @@ in the expansion against the final type, never by what the macro parsed;
 Milestone 1's criteria are read as follows (D139). Each timing criterion has its own
 workload. The 100k tick runs on eight frame workers, one for each of eight performance
 cores: on a hybrid part, physical cores of the fastest class, a core's hardware threads
-counted once; on a part that reports no core types, eight of its physical cores. It excludes
+counted once; on a part that reports no core types, eight of its physical cores. A tick inside
+the budget on fewer performance cores meets the criterion, on the reading that more frame
+workers do not lengthen it, and milestone 1's is the M1's on four (D151). The tick excludes
 the physics phase, which is measured on its own scene, and the world hash, which SOUR pays at
 every step and a shipped binary only when it asks. The prediction-world snapshot is the world
 snapshot and the physics snapshot of one ring slot, with the drop of the world snapshot and
