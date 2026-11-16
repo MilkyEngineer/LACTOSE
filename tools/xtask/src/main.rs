@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 use std::process::{self, Command, ExitCode, Stdio};
 use std::time::Instant;
 
-use lactose_xtask::harness::{self, Dirs, Selection, stand_in};
+use lactose_xtask::harness::{self, Dirs, stand_in};
 use lactose_xtask::heavy;
 use lactose_xtask::measure;
 use lactose_xtask::policy::Policy;
@@ -51,10 +51,12 @@ cargo xtask <command>
                              the crates.io archive's, and the upstream versions free of
                              advisories
   sour matrix                print the SOUR mode matrix
-  sour run <selection> [--emit <file>]
+  sour run <selection> [--emit <file>] [--release]
                              run simulation tests under SOUR and compare world hashes;
                              <selection> is --pr, --nightly or --mode <name>…;
-                             --emit writes the baseline hashes for `sour compare`
+                             --emit writes the baseline hashes for `sour compare`;
+                             --release builds the tests with the release profile and
+                             writes to target/sour-release
   sour compare <ref> <file>  compare two emitted hash files (architecture mode)
   sour self-test             prove the SOUR runner on its stand-in simulations
   heavy [--slots <n>] -- <program> [<arg>…]
@@ -386,41 +388,7 @@ fn print_matrix() {
 }
 
 fn harness_run(args: &[&str]) -> Checked {
-    let mut selection: Option<Selection> = None;
-    let mut emit: Option<&str> = None;
-    let mut rest = args;
-    loop {
-        rest = match (rest, &mut selection) {
-            ([], _) => break,
-            (["--pr", tail @ ..], None) => {
-                selection = Some(Selection::PullRequest);
-                tail
-            }
-            (["--nightly", tail @ ..], None) => {
-                selection = Some(Selection::Nightly);
-                tail
-            }
-            (["--mode", name, tail @ ..], None) => {
-                selection = Some(Selection::Modes(vec![(*name).to_owned()]));
-                tail
-            }
-            (["--mode", name, tail @ ..], Some(Selection::Modes(names))) => {
-                names.push((*name).to_owned());
-                tail
-            }
-            (["--emit", file, tail @ ..], _) if emit.is_none() => {
-                emit = Some(file);
-                tail
-            }
-            ([other, ..], _) => {
-                return Err(format!(
-                    "unexpected `{other}`; give one of --pr, --nightly or --mode <name>…, and \
-                     at most one --emit <file>"
-                ));
-            }
-        };
-    }
-    let selection = selection.ok_or("give one of --pr, --nightly or --mode <name>…")?;
+    let harness::RunArgs { selection, emit, profile } = harness::run_args(args)?;
     // Resolved now: loading the context moves the working directory to the repository root.
     let emit = match emit {
         Some(file) => Some(std::path::absolute(file).map_err(|e| format!("{file}: {e}"))?),
@@ -434,8 +402,12 @@ fn harness_run(args: &[&str]) -> Checked {
     let mut baseline = harness::Hashes::new();
     if !nothing_to_run {
         let packages = &context.policy.harness_packages;
-        let mut launch = |vars: &[(&'static str, String)]| context.nextest(packages, &[], vars);
-        let outcome = harness::run(&plans, &context.harness_dirs(), &mut launch);
+        let mut launch = |vars: &[(&'static str, String)]| {
+            context.nextest(packages, profile.nextest_args(), vars)
+        };
+        let dirs =
+            Dirs { out: context.target_dir.join(profile.out_dir()), ..context.harness_dirs() };
+        let outcome = harness::run(&plans, &dirs, &mut launch);
         eprintln!("sour: {} mode(s), {} test run(s)", plans.len(), outcome.launches);
         findings.extend(outcome.findings);
         baseline = outcome.baseline.unwrap_or_default();

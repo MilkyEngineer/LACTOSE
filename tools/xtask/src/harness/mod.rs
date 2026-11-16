@@ -15,7 +15,8 @@
 //!
 //! # Output layout
 //!
-//! Under the output directory (`target/sour` in the binary), each run owns
+//! Under the output directory (in the binary `target/sour`, or `target/sour-release` for a
+//! [`Profile::Release`] run), each run owns
 //! `<mode>/<variant>/`:
 //!
 //! - `hashes.tsv`: the records of that run;
@@ -170,6 +171,96 @@ pub enum Selection {
     Nightly,
     /// Every variant of the named modes.
     Modes(Vec<String>),
+}
+
+/// The cargo profile the simulation tests are built with.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Profile {
+    /// `dev`, which every pull-request and nightly mode runs.
+    #[default]
+    Dev,
+    /// `release`, without debug assertions or overflow checks: the nightly release baseline,
+    /// which `sour compare` holds to the same platform's dev baseline.
+    Release,
+}
+
+impl Profile {
+    /// What `cargo nextest run` is given to build with it.
+    #[must_use]
+    pub fn nextest_args(self) -> &'static [&'static str] {
+        match self {
+            Self::Dev => &[],
+            Self::Release => &["--cargo-profile", "release"],
+        }
+    }
+
+    /// The output directory of its runs, under the target directory: a release run leaves
+    /// the dev run's hashes and logs in place.
+    #[must_use]
+    pub fn out_dir(self) -> &'static str {
+        match self {
+            Self::Dev => "sour",
+            Self::Release => "sour-release",
+        }
+    }
+}
+
+/// What `sour run` is asked for.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct RunArgs<'a> {
+    /// The modes and variants.
+    pub selection: Selection,
+    /// The file `--emit` names, as given.
+    pub emit: Option<&'a str>,
+    /// `--release`, or the dev profile.
+    pub profile: Profile,
+}
+
+/// Reads the arguments of `sour run`: one of `--pr`, `--nightly` or `--mode <name>…`, at
+/// most one `--emit <file>` and at most one `--release`, in any order.
+///
+/// # Errors
+/// The usage message, for anything else.
+pub fn run_args<'a>(args: &[&'a str]) -> Result<RunArgs<'a>, String> {
+    let (mut selection, mut emit, mut profile) = (None, None, Profile::Dev);
+    let mut rest = args;
+    loop {
+        rest = match (rest, &mut selection) {
+            ([], _) => break,
+            (["--pr", tail @ ..], None) => {
+                selection = Some(Selection::PullRequest);
+                tail
+            }
+            (["--nightly", tail @ ..], None) => {
+                selection = Some(Selection::Nightly);
+                tail
+            }
+            (["--mode", name, tail @ ..], None) => {
+                selection = Some(Selection::Modes(vec![(*name).to_owned()]));
+                tail
+            }
+            (["--mode", name, tail @ ..], Some(Selection::Modes(names))) => {
+                names.push((*name).to_owned());
+                tail
+            }
+            (["--emit", file, tail @ ..], _) if emit.is_none() => {
+                emit = Some(*file);
+                tail
+            }
+            (["--release", tail @ ..], _) if profile == Profile::Dev => {
+                profile = Profile::Release;
+                tail
+            }
+            ([other, ..], _) => {
+                return Err(format!(
+                    "unexpected `{other}`; give one of --pr, --nightly or --mode <name>…, at \
+                     most one --emit <file> and at most one --release"
+                ));
+            }
+        };
+    }
+    let selection = selection.ok_or("give one of --pr, --nightly or --mode <name>…")?;
+    Ok(RunArgs { selection, emit, profile })
 }
 
 /// The variants of one mode that a selection runs.
@@ -837,6 +928,47 @@ mod tests {
         assert_eq!(chaos.len(), 1);
         assert_eq!(chaos[0].variants.len(), 4);
         assert!(plan(&matrix, &only("speed")).is_err());
+    }
+
+    #[test]
+    fn a_release_run_builds_with_the_release_profile_and_writes_beside_the_dev_runs() {
+        // Project review 2, X5: the nightly release baseline, one architecture-mode run.
+        let args = run_args(&["--mode", "architecture", "--release", "--emit", "f.tsv"]).unwrap();
+        assert_eq!(
+            args,
+            RunArgs {
+                selection: only("architecture"),
+                emit: Some("f.tsv"),
+                profile: Profile::Release
+            }
+        );
+        assert_eq!(args.profile.nextest_args(), ["--cargo-profile", "release"]);
+        assert_eq!(args.profile.out_dir(), "sour-release");
+        let dev = run_args(&["--emit", "f.tsv", "--pr"]).unwrap();
+        assert_eq!(
+            dev,
+            RunArgs {
+                selection: Selection::PullRequest,
+                emit: Some("f.tsv"),
+                profile: Profile::Dev
+            }
+        );
+        assert!(dev.profile.nextest_args().is_empty());
+        assert_eq!(dev.profile.out_dir(), "sour");
+        assert_eq!(
+            run_args(&["--mode", "a", "--mode", "b"]).unwrap().selection,
+            Selection::Modes(vec!["a".to_owned(), "b".to_owned()])
+        );
+        for wrong in [
+            &[][..],
+            &["--release"],
+            &["--pr", "--release", "--release"],
+            &["--pr", "--nightly"],
+            &["--pr", "--emit", "a", "--emit", "b"],
+            &["--pr", "--profile", "release"],
+        ] {
+            assert!(run_args(wrong).is_err(), "{wrong:?}");
+        }
     }
 
     #[test]

@@ -414,9 +414,13 @@ agree. `cargo xtask sour matrix` prints the modes; `src/harness/mod.rs` holds th
   with, and a chaos test that left no execution log. The tests that recorded in the baseline
   run must be exactly `[harness]` `tests`: one listed that recorded nothing was renamed,
   ignored, deleted or stopped recording, and one that recorded unlisted was added without
-  the list. `--emit <file>` writes the baseline hashes.
+  the list. `--emit <file>` writes the baseline hashes. `--release` builds the tests with
+  the release profile (`--cargo-profile release`), which drops debug assertions and overflow
+  checks, and writes to `target/sour-release`.
 - `sour compare <reference> <file>` compares two emitted files. Architecture mode is each
   machine emitting and one job comparing. A missing file, or a reference with no hashes, fails.
+  Nightly also compares each platform's dev baseline with its release one, from
+  `sour run --mode architecture --release` (project review 2, X5).
 - `sour self-test` proves the runner through nextest on the stand-in simulations in
   `src/harness/stand_in.rs`: a sound one must pass every mode, and one flawed stand-in per
   mode must be reported by that mode at the tick its flaw starts. The nested build uses its
@@ -425,7 +429,8 @@ agree. `cargo xtask sour matrix` prints the modes; `src/harness/mod.rs` holds th
 While `[harness]` is empty, `sour run` and `sour compare` say so and exit 0. Once
 `lactose-sim` exists in the workspace an empty `[harness]` is a finding.
 
-Runs write to `target/sour/<mode>/<variant>/`: `hashes.tsv`, and `logs/<test>.execlog` for
+Runs write to `target/sour/<mode>/<variant>/` (`target/sour-release/...` under `--release`):
+`hashes.tsv`, and `logs/<test>.execlog` for
 the execution logs of a chaos run, which are deleted if the run agreed with its reference.
 
 ### What a simulation test does
