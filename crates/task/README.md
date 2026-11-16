@@ -260,7 +260,7 @@ inside the executor, on the function a worker steals with. Every wake or timer s
 1 ms, and every graph run over twice its lower bound, is listed with the UTC time it ended, to
 be matched against the system's log of sleeps and wakes (`pmset -g log` on a Mac); a graph
 run carries its lower bound. The JSON lists every one; the summary lists at most twenty of a
-phase, the furthest over, and counts the rest. Steal samples carry no time.
+phase, the furthest over, and gives each such phase's total. Steal samples carry no time.
 
 Correctness:
 

@@ -62,8 +62,8 @@
 //!   so it can be matched against the system's own log of sleeps and wakes (`pmset -g log`
 //!   on a Mac). `Instant` does not count time asleep, so the samples alone cannot say
 //!   whether the machine was away. A graph run carries its lower bound. The JSON lists
-//!   every one; the summary lists at most twenty of a phase, the furthest over, and counts
-//!   the rest.
+//!   every one; the summary lists at most twenty of a phase, the furthest over, and gives
+//!   each such phase's total.
 
 use core::cmp::Reverse;
 use core::hint::black_box;
@@ -98,7 +98,7 @@ const RATIO_P99_LIMIT: f64 = 1.5;
 /// primitive; 35 µs leaves room for the executor's own part.
 const WAKE_P99_LIMIT_NANOS: f64 = 35_000.0;
 /// The start of a tick: the same 35 µs (D138). The keeper is spinning when the deadline
-/// comes, but on a quiet M1 the samples that miss lose about 13 to 28 µs between the
+/// comes, but on the M1 the samples that miss lose about 13 to 28 µs between the
 /// deadline and the task, and a longer spin did not win it back. On Windows 1 ms (D144):
 /// the high-resolution timer that ends the keeper's wait there overshoots by about half a
 /// millisecond.
