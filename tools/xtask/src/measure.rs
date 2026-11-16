@@ -1912,6 +1912,23 @@ mod tests {
         assert_eq!(registry_value("ERROR: not found", "ProcessorNameString"), None);
     }
 
+    /// The WHISK benchmark names its machine and reads the CPU name with copies of these
+    /// functions, since a benchmark cannot depend on this tool and one without the test
+    /// harness runs no test; this keeps the copies the same.
+    #[test]
+    fn the_benchmark_s_copies_of_the_naming_functions_are_the_same() {
+        fn function<'a>(source: &'a str, name: &str) -> &'a str {
+            let start = source.find(&format!("\nfn {name}(")).unwrap_or_else(|| panic!("{name}"));
+            let end = start + source[start..].find("\n}\n").unwrap_or_else(|| panic!("{name}"));
+            &source[start..end]
+        }
+        let measure = repository("tools/xtask/src/measure.rs").replace("\r\n", "\n");
+        let bench = repository("crates/task/benches/whisk.rs").replace("\r\n", "\n");
+        for name in ["registry_value", "slug"] {
+            assert_eq!(function(&bench, name), function(&measure, name), "{name}");
+        }
+    }
+
     #[test]
     fn the_headless_report_line_is_read_whole() {
         let line = "120 ticks in 121 frames (0 behind), hash 0x3a5f00c1d2e3f405";

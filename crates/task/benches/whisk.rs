@@ -45,7 +45,7 @@
 //! - **Timer wake.** From a tick deadline until the frame-critical task that slept until it
 //!   resumes, the way the timer root ticks: `sleep_until` one deadline after another, with
 //!   the pool otherwise idle, at a 2 ms period and at 60 Hz. The 60 Hz P99 is a pass
-//!   criterion of its own: 20 µs, and 1 ms on Windows (D144).
+//!   criterion of its own: 35 µs (D138), and 1 ms on Windows (D144).
 //! - **Wake latency.** From just before a one-node graph is pushed to a parked pool until
 //!   its job starts. The push comes from a dedicated thread at frame-critical priority. The
 //!   CPU the process uses during this phase, in which it does nothing but wake up five
@@ -57,6 +57,13 @@
 //!   `forced split`, is not a steal time: it is worker time per entry when a node of empty
 //!   units is run with every range forced down to single units, which bounds the whole
 //!   per-entry path (split, push, pop or steal, dispatch) from above.
+//! - **Stalls.** Every wake or timer sample over a millisecond, and every graph run that took
+//!   more than twice its lower bound, is listed with the wall-clock time it ended, in UTC,
+//!   so it can be matched against the system's own log of sleeps and wakes (`pmset -g log`
+//!   on a Mac). `Instant` does not count time asleep, so the samples alone cannot say
+//!   whether the machine was away. A graph run carries its lower bound. The JSON lists
+//!   every one; the summary lists at most twenty of a phase, the furthest over, and gives
+//!   each such phase's total.
 
 use core::cmp::Reverse;
 use core::hint::black_box;
@@ -88,14 +95,26 @@ const RATIO_P50_LIMIT: f64 = 1.25;
 const RATIO_P99_LIMIT: f64 = 1.5;
 /// A push from an idle pool. The floor on macOS is not the executor but the cores leaving
 /// their deep idle state, which a spike measured at 24 to 29 µs P99 with every wait
-/// primitive; 35 µs leaves room for the executor's own part. The start of a tick, below,
-/// keeps 20 µs: the keeper is awake and spinning when the deadline comes.
+/// primitive; 35 µs leaves room for the executor's own part.
 const WAKE_P99_LIMIT_NANOS: f64 = 35_000.0;
-/// The start of a tick. On Windows 1 ms (D144): the high-resolution timer that ends the
-/// keeper's wait there overshoots by about half a millisecond.
-const TIMER_P99_LIMIT_NANOS: f64 = if cfg!(windows) { 1_000_000.0 } else { 20_000.0 };
+/// The start of a tick: the same 35 µs (D138). The keeper is spinning when the deadline
+/// comes, but on the M1 the samples that miss lose about 13 to 28 µs between the
+/// deadline and the task, and a longer spin did not win it back. On Windows 1 ms (D144):
+/// the high-resolution timer that ends the keeper's wait there overshoots by about half a
+/// millisecond.
+const TIMER_P99_LIMIT_NANOS: f64 = if cfg!(windows) { 1_000_000.0 } else { 35_000.0 };
 const TICK: Duration = Duration::from_micros(16_667);
 const STEAL_LIMIT_NANOS: f64 = 1_000.0;
+/// A wake or timer sample over this is a machine that was away rather than a scheduler that
+/// was slow, and is logged with its time ([`Stall`]).
+const STALL_NANOS: f64 = 1_000_000.0;
+/// A graph run over this multiple of its lower bound is logged with its time ([`Stall`]):
+/// every run is over a millisecond, and the criterion's P99 is 1.5.
+const STALL_RATIO: f64 = 2.0;
+/// The summary lists at most this many stalls of one phase, the furthest over; the JSON
+/// lists every one. A slow machine can put most of a phase's runs over [`STALL_RATIO`], and a
+/// table of thousands of rows would hide the few that are a machine that was away.
+const STALL_ROWS_PER_PHASE: usize = 20;
 
 /// splitmix64: reproducible draws without a dependency.
 struct Rng(u64);
@@ -322,8 +341,77 @@ struct Percentiles {
     mean: f64,
     samples: usize,
     /// Samples over a millisecond: for a wake or a timer, a machine that was away rather
-    /// than a scheduler that was slow. Counted so a bad maximum can be read.
+    /// than a scheduler that was slow. Counted so a bad maximum can be read; the phases
+    /// whose samples are latencies also log each one with its time ([`Stall`]).
     over_a_millisecond: usize,
+}
+
+/// One sample that looks like the machine was away: a wake or a timer over
+/// [`STALL_NANOS`], or a graph run over [`STALL_RATIO`] times its lower bound.
+struct Stall {
+    /// When the sample ended, by the wall clock.
+    ended: SystemTime,
+    /// The latency or the makespan, in nanoseconds.
+    nanos: f64,
+    /// A graph run's lower bound, in nanoseconds; `None` for a latency.
+    bound: Option<f64>,
+}
+
+impl Stall {
+    /// A sample of `nanos` that ended just now, with the run's lower bound if it is a graph
+    /// run.
+    fn ending_now(nanos: f64, bound: Option<f64>) -> Self {
+        Self { ended: SystemTime::now(), nanos, bound }
+    }
+
+    /// How far over its limit the sample was, to rank one phase's stalls by: a graph run's
+    /// ratio to its lower bound, a latency itself.
+    fn overrun(&self) -> f64 {
+        self.bound.map_or(self.nanos, |bound| self.nanos / bound)
+    }
+
+    /// The summary's measured column.
+    fn measured(&self) -> String {
+        match self.bound {
+            Some(bound) => format!(
+                "{:.1} µs, {:.2} times its lower bound of {:.1} µs",
+                self.nanos / 1e3,
+                self.nanos / bound,
+                bound / 1e3
+            ),
+            None => format!("{:.1} µs", self.nanos / 1e3),
+        }
+    }
+}
+
+/// A stall with the name of the phase it was measured in.
+type PhaseStall<'a> = (String, &'a Stall);
+
+/// The stalls the summary lists, in the order they ended: every stall of a phase that has at
+/// most [`STALL_ROWS_PER_PHASE`], and the furthest over of one that has more. Beside them,
+/// each phase that has more, with how many it has.
+fn listed_stalls<'a>(
+    stalls: &'a [PhaseStall<'a>],
+) -> (Vec<&'a PhaseStall<'a>>, Vec<(&'a str, usize)>) {
+    let mut phases: Vec<&str> = Vec::new();
+    for (phase, _) in stalls {
+        if !phases.contains(&phase.as_str()) {
+            phases.push(phase);
+        }
+    }
+    let mut listed = Vec::new();
+    let mut cut = Vec::new();
+    for phase in phases {
+        let mut own: Vec<_> = stalls.iter().filter(|(other, _)| other == phase).collect();
+        if own.len() > STALL_ROWS_PER_PHASE {
+            cut.push((phase, own.len()));
+            own.sort_by(|(_, a), (_, b)| b.overrun().total_cmp(&a.overrun()));
+            own.truncate(STALL_ROWS_PER_PHASE);
+        }
+        listed.extend(own);
+    }
+    listed.sort_by_key(|(_, stall)| stall.ended);
+    (listed, cut)
 }
 
 fn percentiles(mut samples: Vec<f64>) -> Percentiles {
@@ -338,7 +426,7 @@ fn percentiles(mut samples: Vec<f64>) -> Percentiles {
         max: at(1.0),
         mean: samples.iter().sum::<f64>() / samples.len() as f64,
         samples: samples.len(),
-        over_a_millisecond: samples.iter().filter(|&&sample| sample > 1e6).count(),
+        over_a_millisecond: samples.iter().filter(|&&sample| sample > STALL_NANOS).count(),
     }
 }
 
@@ -466,6 +554,7 @@ struct MakespanResult {
     mean_work_micros: f64,
     /// The CPU time the process used per run, gaps between runs included.
     mean_cpu_micros: Option<f64>,
+    stalls: Vec<Stall>,
 }
 
 fn measure_makespan(
@@ -512,8 +601,9 @@ fn measure_makespan(
     let runner = executor.clone();
     let driver = executor.spawn(WorkerClass::FrameCritical, async move {
         let mut makespans = Vec::with_capacity(draws.len());
+        let mut stalls = Vec::new();
         let mut cpu_start = None;
-        for (run, (nanos, _)) in draws.iter().enumerate() {
+        for (run, (nanos, bound)) in draws.iter().enumerate() {
             if run == WARM_UP_RUNS {
                 cpu_start = process_cpu_seconds();
             }
@@ -522,14 +612,19 @@ fn measure_makespan(
             }
             let start = Instant::now();
             graph = runner.run_graph(graph).await.expect("the executor is running");
-            makespans.push(start.elapsed().as_nanos() as f64);
+            let makespan = start.elapsed().as_nanos() as f64;
+            if run >= WARM_UP_RUNS && makespan > STALL_RATIO * bound {
+                stalls.push(Stall::ending_now(makespan, Some(*bound)));
+            }
+            makespans.push(makespan);
             // Let the pool park, as it does between frames.
             runner.sleep_until(Instant::now() + RUN_GAP).await.expect("the executor is running");
         }
         let cpu = cpu_start.zip(process_cpu_seconds()).map(|(start, end)| end - start);
-        (makespans, draws, cpu)
+        (makespans, draws, cpu, stalls)
     });
-    let (makespans, draws, cpu) = executor.block_on(driver).expect("the executor is running");
+    let (makespans, draws, cpu, stalls) =
+        executor.block_on(driver).expect("the executor is running");
     stop.store(true, Ordering::Relaxed);
     for task in load {
         assert!(
@@ -562,6 +657,7 @@ fn measure_makespan(
             measured.map(|(_, (nanos, _))| nanos.iter().sum::<f64>()).sum(),
         ),
         mean_cpu_micros: cpu.map(|seconds| seconds * 1e6 / count),
+        stalls,
     }
 }
 
@@ -589,6 +685,7 @@ struct WakeResult {
     latency: Percentiles,
     /// CPU seconds the whole process used per second of this phase.
     cpu_per_second: Option<f64>,
+    stalls: Vec<Stall>,
 }
 
 fn measure_wake_latency(executor: &Executor, samples: usize) -> WakeResult {
@@ -609,6 +706,7 @@ fn measure_wake_latency(executor: &Executor, samples: usize) -> WakeResult {
         builder.add_node(Arc::new(StampNode { epoch, started: started.clone() }));
         let mut graph = builder.build().expect("one node");
         let mut latencies = Vec::with_capacity(samples);
+        let mut stalls = Vec::new();
         let mut measured_from = None;
         for sample in 0..samples + WARM_UP_RUNS {
             if sample == WARM_UP_RUNS {
@@ -619,18 +717,24 @@ fn measure_wake_latency(executor: &Executor, samples: usize) -> WakeResult {
             let pushed = epoch.elapsed().as_nanos() as u64;
             graph = pusher.block_on(pusher.run_graph(graph)).expect("the executor is running");
             if sample >= WARM_UP_RUNS {
-                latencies.push(started.load(Ordering::Acquire).saturating_sub(pushed) as f64);
+                let latency = started.load(Ordering::Acquire).saturating_sub(pushed) as f64;
+                if latency > STALL_NANOS {
+                    stalls.push(Stall::ending_now(latency, None));
+                }
+                latencies.push(latency);
             }
         }
         let (wall, cpu) = measured_from.expect("the loop ran");
         let cpu = cpu.zip(process_cpu_seconds()).map(|(start, end)| end - start);
         let cpu_per_second = cpu.map(|cpu| cpu / wall.elapsed().as_secs_f64());
-        sender.send((latencies, cpu_per_second)).expect("the benchmark waits for the result");
+        sender
+            .send((latencies, cpu_per_second, stalls))
+            .expect("the benchmark waits for the result");
     });
     let thread = executor.platform().spawn_thread(spec, body).expect("the pusher thread starts");
-    let (latencies, cpu_per_second) = receiver.recv().expect("the pusher thread reports");
+    let (latencies, cpu_per_second, stalls) = receiver.recv().expect("the pusher thread reports");
     thread.join();
-    WakeResult { latency: percentiles(latencies), cpu_per_second }
+    WakeResult { latency: percentiles(latencies), cpu_per_second, stalls }
 }
 
 /// From a tick deadline until the frame-critical task that slept until it resumes, the way
@@ -641,6 +745,7 @@ fn measure_timer_latency(executor: &Executor, samples: usize, period: Duration) 
     let ticker = executor.clone();
     let task = executor.spawn(WorkerClass::FrameCritical, async move {
         let mut latencies = Vec::with_capacity(samples);
+        let mut stalls = Vec::new();
         let mut measured_from = None;
         let mut deadline = Instant::now() + period;
         for sample in 0..samples + WARM_UP_RUNS {
@@ -648,18 +753,22 @@ fn measure_timer_latency(executor: &Executor, samples: usize, period: Duration) 
                 measured_from = Some((Instant::now(), process_cpu_seconds()));
             }
             ticker.sleep_until(deadline).await.expect("the executor is running");
-            let late = deadline.elapsed();
+            let late = deadline.elapsed().as_nanos() as f64;
             if sample >= WARM_UP_RUNS {
-                latencies.push(late.as_nanos() as f64);
+                if late > STALL_NANOS {
+                    stalls.push(Stall::ending_now(late, None));
+                }
+                latencies.push(late);
             }
             deadline = (deadline + period).max(Instant::now() + period / 2);
         }
         let (wall, cpu) = measured_from.expect("the loop ran");
         let cpu = cpu.zip(process_cpu_seconds()).map(|(start, end)| end - start);
-        (latencies, cpu.map(|cpu| cpu / wall.elapsed().as_secs_f64()))
+        (latencies, cpu.map(|cpu| cpu / wall.elapsed().as_secs_f64()), stalls)
     });
-    let (latencies, cpu_per_second) = executor.block_on(task).expect("the executor is running");
-    WakeResult { latency: percentiles(latencies), cpu_per_second }
+    let (latencies, cpu_per_second, stalls) =
+        executor.block_on(task).expect("the executor is running");
+    WakeResult { latency: percentiles(latencies), cpu_per_second, stalls }
 }
 
 /// Runs one phase and prints how long it took. `expected`, given the result, is what the
@@ -828,16 +937,23 @@ fn cpu_name() -> String {
                 "ProcessorNameString",
             ],
         )
-        .and_then(|output| {
-            let line = output.lines().find(|line| line.contains("REG_SZ"))?;
-            Some(line.split_once("REG_SZ")?.1.trim().to_owned())
-        })
-        .filter(|name| !name.is_empty())
+        .and_then(|output| registry_value(&output, "ProcessorNameString"))
         .or_else(processor_identifier)
     } else {
         processor_identifier()
     };
     name.filter(|name| !name.is_empty()).unwrap_or_else(|| "unknown CPU".to_owned())
+}
+
+/// The data of the value `name` in `reg query`'s output: what follows its type on the line
+/// that names it. A copy of `cargo xtask measure`'s, whose unit tests cover it and check that
+/// the copy is the same: a benchmark without the test harness runs no test, and cannot depend
+/// on the tool.
+fn registry_value(output: &str, name: &str) -> Option<String> {
+    let line = output.lines().map(str::trim).find(|line| line.starts_with(name))?;
+    let (_, data) = line.split_once("REG_SZ")?;
+    let data = data.trim();
+    (!data.is_empty()).then(|| data.to_owned())
 }
 
 /// Windows's description of the processor, such as `Intel64 Family 6 Model 154 Stepping 3,
@@ -854,6 +970,8 @@ fn load_average() -> Option<String> {
     Some(averages.trim_start_matches(['s', ':', ' ']).to_owned())
 }
 
+/// The machine name from a CPU name. A copy of `cargo xtask measure`'s, which checks that it is
+/// the same, so both name a machine's files alike.
 fn slug(text: &str) -> String {
     let mut slug = String::new();
     for character in text.chars() {
@@ -866,9 +984,16 @@ fn slug(text: &str) -> String {
     slug.trim_end_matches('-').to_owned()
 }
 
-/// Today's UTC date as `YYYY-MM-DD` (days-to-civil, Howard Hinnant's algorithm).
+/// Today's UTC date as `YYYY-MM-DD`.
 fn today() -> String {
-    let seconds = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |since| since.as_secs());
+    utc(SystemTime::now())[..10].to_owned()
+}
+
+/// `at` in UTC as `YYYY-MM-DDTHH:MM:SS.ffffffZ` (days-to-civil, Howard Hinnant's algorithm).
+fn utc(at: SystemTime) -> String {
+    let since = at.duration_since(UNIX_EPOCH).unwrap_or_default();
+    let seconds = since.as_secs();
+    let time = seconds % 86_400;
     let days = (seconds / 86_400) as i64 + 719_468;
     let era = days.div_euclid(146_097);
     let day_of_era = days.rem_euclid(146_097);
@@ -879,7 +1004,18 @@ fn today() -> String {
     let day = day_of_year - (153 * month_index + 2) / 5 + 1;
     let month = if month_index < 10 { month_index + 3 } else { month_index - 9 };
     let year = year_of_era + era * 400 + i64::from(month <= 2);
-    format!("{year:04}-{month:02}-{day:02}")
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}.{:06}Z",
+        time / 3_600,
+        time / 60 % 60,
+        time % 60,
+        since.subsec_micros()
+    )
+}
+
+/// This machine's offset from UTC as `date` prints it (`+1000`), where there is a `date`.
+fn utc_offset() -> Option<String> {
+    command_output("date", &["+%z"]).filter(|offset| !offset.is_empty())
 }
 
 fn commit() -> String {
@@ -1028,6 +1164,21 @@ fn main() {
         steal.p50, steal.p99, steal.max, steal.samples
     );
     let load_after = load_average().unwrap_or_else(|| "unknown".to_owned());
+    let mut stalls: Vec<PhaseStall> = makespans
+        .iter()
+        .flat_map(|result| {
+            let load = if result.background_load { "with two zstd tasks" } else { "alone" };
+            let phase = format!("makespan, {} {load}", result.shape);
+            result.stalls.iter().map(move |stall| (phase.clone(), stall))
+        })
+        .chain(wake.stalls.iter().map(|stall| ("wake latency".to_owned(), stall)))
+        .chain(timer_periods.iter().zip(&timers).flat_map(|(period, timer)| {
+            let phase = format!("timer wake every {:.3} ms", period.as_secs_f64() * 1e3);
+            timer.stalls.iter().map(move |stall| (phase.clone(), stall))
+        }))
+        .collect();
+    stalls.sort_by_key(|(_, stall)| stall.ended);
+    let offset = utc_offset();
 
     let ratio_pass = makespans
         .iter()
@@ -1128,6 +1279,28 @@ fn main() {
     }
     let _ = writeln!(json, "  ],");
     let _ = writeln!(json, "  \"forced_split_worker_ns_per_entry\": {forced_split:.1},");
+    let _ = writeln!(
+        json,
+        "  \"stall_limits\": {{ \"latency_ns\": {STALL_NANOS}, \"makespan_ratio\": {STALL_RATIO} }},"
+    );
+    let _ = writeln!(
+        json,
+        "  \"utc_offset\": {},",
+        offset.as_ref().map_or_else(|| "null".to_owned(), |offset| format!("\"{offset}\""))
+    );
+    let _ = writeln!(json, "  \"stalls\": [");
+    for (index, (phase, stall)) in stalls.iter().enumerate() {
+        let _ = writeln!(
+            json,
+            "    {{ \"phase\": \"{phase}\", \"ended_utc\": \"{}\", \"measured_us\": {:.1}, \
+             \"lower_bound_us\": {} }}{}",
+            utc(stall.ended),
+            stall.nanos / 1e3,
+            optional(stall.bound.map(|bound| bound / 1e3), 1),
+            if index + 1 == stalls.len() { "" } else { "," }
+        );
+    }
+    let _ = writeln!(json, "  ],");
     let _ = writeln!(
         json,
         "  \"thresholds\": {{ \"ratio_p50\": {RATIO_P50_LIMIT}, \"ratio_p99\": {RATIO_P99_LIMIT}, \
@@ -1283,6 +1456,35 @@ fn main() {
          node of empty units costs {forced_split:.0} worker-ns per entry (split, push, pop or \
          steal, dispatch)."
     );
+    let _ = writeln!(summary, "\n## Stalls\n");
+    let _ = writeln!(
+        summary,
+        "Every wake or timer sample over {} ms and every graph run over {STALL_RATIO} times \
+         its lower bound, with the wall-clock time it ended, to match against the system's log \
+         of sleeps and wakes (`pmset -g log` on a Mac). Times are UTC{}.\n",
+        STALL_NANOS / 1e6,
+        offset.as_ref().map_or_else(String::new, |offset| format!("; this machine is at {offset}")),
+    );
+    if stalls.is_empty() {
+        let _ = writeln!(summary, "None.");
+    } else {
+        let (listed, cut) = listed_stalls(&stalls);
+        let _ = writeln!(summary, "| Ended (UTC) | Phase | Measured |");
+        let _ = writeln!(summary, "|---|---|---|");
+        for (phase, stall) in listed {
+            let _ = writeln!(summary, "| {} | {phase} | {} |", utc(stall.ended), stall.measured());
+        }
+        if !cut.is_empty() {
+            let _ = writeln!(
+                summary,
+                "\nA phase with more than {STALL_ROWS_PER_PHASE} lists only the \
+                 {STALL_ROWS_PER_PHASE} furthest over their limit; the JSON lists every one.\n"
+            );
+            for (phase, count) in cut {
+                let _ = writeln!(summary, "- {phase}: {count} stalls");
+            }
+        }
+    }
 
     std::fs::create_dir_all(&out_dir).expect("the results directory can be created");
     let stem = out_dir.join(format!("whisk-{machine}-{date}"));

@@ -4977,6 +4977,24 @@ relayed by an event when it acts on another body** (§6.1, §10, `lactose-ecs`,
   macOS 14.7 and before that machine is upgraded. An x86 failure found in the sitting joins
   D151's finding and opens no second attempt. The rule is otherwise as decided: one attempt, or
   tick start restated at 35 µs.
+- Addendum (lane `keeper`, 2026-11-16): *the attempt did not reach 20 µs, so tick start is
+  restated at 35 µs at P99 on macOS and Linux.* The hypothesis was wrong. On a probe build, 43 of
+  the keeper's 3,020 park exits (1.4%) came from a timed wait that passed the deadline, and the
+  P99 of the park's exit lateness over all its exits was 4.6 µs, while the task's P99 was
+  26.5 µs. Timing probes place the lost time after the park, in one stall of about 13 to 28 µs
+  on the keeper's first access past its L1 cache after the deadline (not confirmed by hardware
+  counters; the review's probe saw no page fault, and a 256 KiB buffer's first read after the
+  deadline stalls where its second does not). Reading one line of such a buffer on every turn of
+  a 200 µs spin is meant to take that stall before the deadline: in two interleaved A/B blocks
+  of the benchmark it gave P99 18.25 to 21.04 µs against 23.29 to 24.38 µs as shipped, for 0.25%
+  of a core at 60 Hz and 4.4% at a 2 ms period, and a 300 µs spin gave 12.1 and 21.0 µs for 1.3%
+  of a core. That is not the under 6 µs of D116's fast state, so what separates the two states
+  is not found; D116 saw both at similar load. None holds 20 µs, so none ships, and D113's
+  rejection of a warm sleeper stands. A longer spin without the reads does nothing: 50 to
+  1,000 µs gave P99 29.6 to 32.5 µs. Rules out a second attempt, as decided.
+  - Replaced: on macOS and Linux, D113's tick-start figure, which becomes 35 µs at P99 at 60 Hz,
+    and D113's premise that a stepped park with a 50 µs spin meets 20 µs; D144's "macOS and
+    Linux keep 20 µs".
 
 **D139. The milestone 1 plan: how its criteria are judged, what is re-gated, and the decisions that came due** (§5.2, §8.3, §9.4, §10, §12.1, §14, §15.4, §16, §18, §20, §22, §22.1, §23, `docs/plans/milestone-1.md`)
 - Why: no document mapped section 22's milestone 1 criteria, or the verification rows that gate

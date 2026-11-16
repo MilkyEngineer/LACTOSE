@@ -232,7 +232,7 @@ it is.
 |---|---|
 | Makespan divided by its lower bound | at most 1.25 at P50 and 1.5 at P99 |
 | Wake latency (push to an idle pool until the job starts) | under 35 µs at P99: the floor on macOS is the cores leaving deep idle, 24 to 29 µs at P99 with every wait primitive |
-| Timer wake (a tick deadline until the frame-critical task that slept until it resumes, at 60 Hz) | under 20 µs at P99; on Windows under 1 ms (D144) |
+| Timer wake (a tick deadline until the frame-critical task that slept until it resumes, at 60 Hz) | under 35 µs at P99 (D138); on Windows under 1 ms (D144) |
 | Steal (one successful steal, including the split) | under 1 µs |
 
 The lower bound of a run is the larger of two numbers: the heaviest dependency chain, summing
@@ -256,7 +256,11 @@ and 400,000 steals, and reports the counts. Beside each measured ratio it report
 two simulated schedulers with no overhead (first-ready and longest-first), which show how far
 the bound is from reachable for the shape; the process's CPU time per run next to the work
 drawn; and the CPU the process uses while it does nothing but wake up. Steal time is measured
-inside the executor, on the function a worker steals with.
+inside the executor, on the function a worker steals with. Every wake or timer sample over
+1 ms, and every graph run over twice its lower bound, is listed with the UTC time it ended, to
+be matched against the system's log of sleeps and wakes (`pmset -g log` on a Mac); a graph
+run carries its lower bound. The JSON lists every one; the summary lists at most twenty of a
+phase, the furthest over, and gives each such phase's total. Steal samples carry no time.
 
 Correctness:
 
