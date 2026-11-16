@@ -3166,8 +3166,10 @@ fn alone_frame(
 /// part the ring evicts for it, as `Ring::push` drops the oldest slot. Criterion 5 reads
 /// `snapshot_us`, the world and physics snapshots together; `take_us` adds the record. The
 /// restore is what a rollback restores, the world then the physics, from the newest slot;
-/// criterion 5 reads `restore_us`. Each figure is the median of 200 rounds (20 in a short
-/// run), after as many untimed rounds as the ring is deep. The three sizes of the newest
+/// criterion 5 reads `restore_us`. Each part's figure, `record_us` and `restore_us` are the
+/// median of 200 rounds (20 in a short run), after as many untimed rounds as the ring is
+/// deep; `snapshot_us` is the sum of the world and physics snapshots' medians, `take_us`
+/// adds the record's, and the `ring_bytes` times are one call each. The three sizes of the newest
 /// slot are asserted equal to the client's ring's for its newest slot, so that the copy
 /// cannot drift from the take unseen, and the world hash after the restores is the hash
 /// before them. `ring_bytes_first_us` is the sum of `size_in_bytes` over the held physics

@@ -286,7 +286,8 @@ backend stepped on, and the copy restored steps as the first time.
   These fifty bodies touch nothing. Bodies thrown together cost more than the fixed colliders
   beside them: the spike's fifty among 64 fixed colliders and proxies take 135.2 µs to snapshot
   and 180.6 µs to restore on a quiet Apple M1, a third of the write their 263 contact pairs,
-  of which 77 touch (`docs/results/prediction-slot-apple-m1-2026-11-15.md`, D143). A
+  of which 77 touch (the byte form's first quiet window,
+  `1d8042e:docs/results/prediction-slot-apple-m1-2026-11-15.md`; D143). A
   prediction slot therefore holds the copy ("The copy" above), not these bytes.
 - **The step's tail** (`tests/cost.rs` with `--release`, printed, not asserted; Apple M1,
   load averages 4 to 10). The walk scene of `tests/support` (a capsule walking a square over

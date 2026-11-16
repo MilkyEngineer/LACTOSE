@@ -242,13 +242,18 @@ step and rebuilds the world there ("Reconciliation" below).
   The budget is 100 µs for the world snapshot and the physics snapshot of one slot (section
   22), and a prediction world holds at most 64 fixed colliders and proxies together as rows
   (D139, architecture section 10), a content rule nothing here enforces. On a quiet Apple M1
-  the slot of the spike's thrown scene at that count took 140.8 µs to snapshot, 135.2 µs of it
-  the physics snapshot, and 193.0 µs to restore
-  (`docs/results/prediction-slot-apple-m1-2026-11-15.md`): over the budget. The physics part
-  of a slot is therefore a copy the backend makes (D143), which a second quiet window
-  measures, taken into a full ring. `crates/predict/tests/cost.rs` times `World::snapshot`
-  and `physics_api::snapshot` with the physics test backend, for fifty claimed dynamic bodies
-  plus 0 to 10,000 statics, and says nothing of Rapier's cost. No signature holds a snapshot
+  the slot of the spike's thrown scene at that count, its physics part as the backend's bytes,
+  took 140.8 µs to snapshot, 135.2 µs of it the physics snapshot, and 193.0 µs to restore
+  (the byte form's first quiet window,
+  `1d8042e:docs/results/prediction-slot-apple-m1-2026-11-15.md`): over the budget. The
+  physics part of a slot is therefore a copy the backend makes (D143). Taken into a full ring,
+  each part's eviction inside its timer, the copied slot took 90.0 µs to snapshot, the sum of
+  its parts' medians over 200 rounds, and 76.5 µs to restore, the median of 200 rounds, in the
+  second quiet window
+  (`docs/results/prediction-slot-apple-m1-2026-11-15.md` at `c50b688`): criterion 5 is met.
+  `crates/predict/tests/cost.rs` times `World::snapshot` and `physics_api::snapshot` with the
+  physics test backend, for fifty claimed dynamic bodies plus 0 to 10,000 statics, and says
+  nothing of Rapier's cost. No signature holds a snapshot
   and the slot is private, so what a slot holds changes nothing here.
 
 **The hook** (architecture sections 6, 9.2 and 9.4; `crates/sim/README.md`, "The input
