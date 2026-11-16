@@ -49,6 +49,8 @@ packages = [
 tests = [
   "lactose_anim::sour::a_prediction_crowd_with_a_rollback",
   "lactose_anim::sour::a_server_crowd_with_ragdolls",
+  "lactose_app::cost::bone_bodies_on_rapier_are_recorded",
+  "lactose_app::cost::bone_bodies_on_rapier_are_recorded::physics",
   "lactose_app::headless::a_recorded_headless_run",
   "lactose_app::headless::a_recorded_headless_run::physics",
   "lactose_app::spike::a_claim_in_contact_is_recorded",

@@ -5,7 +5,8 @@
 //! 200 characters. Each test is ignored and run in release by `cargo xtask measure`, which
 //! writes the result file from the lines that start `measure: `; each asserts on counts and
 //! prints its timings, never asserting one. One more prints the topology the executor
-//! detected, for the result files' header.
+//! detected, for the result files' header. One is not a measurement: the bone bodies'
+//! scene at a small scale, recorded under SOUR.
 //!
 //! The scenes build their solver pools as `lactose-app` does, with `frame workers - 1`
 //! threads and at least one (`PhysicsConfig::default()` reserves one worker): the physics
@@ -46,13 +47,15 @@ use lactose_app::{Cooked, Game, Start, Workers, WorldConfig, build_server, start
 use lactose_asset_api::{PinnedTable, VersionTable};
 use lactose_bundle::Baseline;
 use lactose_core::{Error, ErrorKind, NetId, Result, StableKey};
-use lactose_ecs::{RegionConfig, RegionId, RegionMode, World, WorldKind};
+use lactose_ecs::{LayoutConfig, RegionConfig, RegionId, RegionMode, World, WorldKind};
 use lactose_math::{Scalar, Vec3};
 use lactose_physics_api::{
-    Collider, PhysicsBackend, PhysicsConfig, RigidBody, Shape, Transform, Velocity,
+    Collider, PhysicsBackend, PhysicsConfig, RigidBody, Shape, Transform, Velocity, snapshot,
 };
 use lactose_sim::{Simulation, SimulationBuilder, TickInput, TypeTable};
 use lactose_task::{Executor, Platform, StdPlatform};
+
+use crate::spike::{RunnerSession, protocol_error};
 
 // ---- What every measurement shares ----
 
@@ -514,25 +517,82 @@ fn bone_library() -> anim_support::Library {
 /// them mid fade, over Rapier on `workers`, with a ragdoll spawned on every one at tick 2
 /// when `bones`.
 fn bone_scene(workers: u32, bones: bool) -> anim_support::Fixture {
-    use anim_support::{MACHINE, Options, RagdollAction, SKELETON, key};
+    use anim_support::{RagdollAction, key};
+    let mut fixture = characters_on(executor(Some(workers)), LayoutConfig::default(), CHARACTERS);
+    if bones {
+        let script = fixture.world_mut().service_mut::<anim_support::Ragdoll>().unwrap();
+        script.actions.extend((1..=CHARACTERS).map(|n| (2, key(n), RagdollAction::Spawn)));
+    }
+    fixture
+}
+
+/// The first `characters` characters of the bone bodies' scene, without a ragdoll, over
+/// Rapier on `executor`'s frame workers, under `layout`.
+fn characters_on(
+    executor: Executor,
+    layout: LayoutConfig,
+    characters: u64,
+) -> anim_support::Fixture {
+    use anim_support::{MACHINE, Options, SKELETON, key};
     let mut options = Options::new(WorldKind::Server);
     options.physics = true;
     options.backend = Some(rapier_for);
-    options.workers = workers;
-    let mut fixture = options.build_on(executor(Some(workers)));
+    options.workers = executor.frame_worker_count();
+    options.layout = layout;
+    let mut fixture = options.build_on(executor);
     fixture.assets(bone_library().pin());
-    for n in 1..=CHARACTERS {
+    for n in 1..=characters {
         let at = Vec3::new(s(4.0 * (n % 20) as f64), Scalar::ZERO, s(4.0 * (n / 20) as f64));
         fixture.spawn_at(key(n), AnimRig::new(MACHINE, SKELETON), Transform::at(at));
         if n.is_multiple_of(2) {
             fixture.set_params(key(n), |params| params.trigger(0));
         }
     }
-    if bones {
-        let script = fixture.world_mut().service_mut::<anim_support::Ragdoll>().unwrap();
-        script.actions.extend((1..=CHARACTERS).map(|n| (2, key(n), RagdollAction::Spawn)));
-    }
     fixture
+}
+
+/// The bone bodies' scene at a small scale under the runner's session (project review 2,
+/// X4): twenty characters whose sixteen bones each take a body on Rapier at tick 2, go limp
+/// at tick 20 and recover at tick 50, on the session's workers, layout and, in chaos mode,
+/// perturbations. It records the world hash after every step and, as a stream of its own
+/// named with `::physics`, `PhysicsSnapshot::hash` (D145), so every SOUR mode compares the
+/// bone bodies' ticks with the baseline's.
+#[test]
+fn bone_bodies_on_rapier_are_recorded() {
+    use anim_support::{RagdollAction, key};
+    const TEST: &str = "lactose_app::cost::bone_bodies_on_rapier_are_recorded";
+    const SMALL: u64 = 20;
+    const TICKS: u32 = 80;
+    let runner = RunnerSession::from_env().unwrap();
+    let physics_test = format!("{TEST}::physics");
+    let mut fixture = characters_on(runner.executor.clone(), runner.layout, SMALL);
+    let script = fixture.world_mut().service_mut::<anim_support::Ragdoll>().unwrap();
+    for n in 1..=SMALL {
+        script.actions.push((2, key(n), RagdollAction::Spawn));
+        script.actions.push((20, key(n), RagdollAction::Limp(true)));
+        script.actions.push((50, key(n), RagdollAction::Limp(false)));
+    }
+    let mut records = runner.recorder(TEST, fixture.world()).unwrap();
+    let mut physics = runner.recorder(&physics_test, fixture.world()).unwrap();
+    for _ in 0..TICKS {
+        fixture.step();
+        records.record(fixture.tick(), fixture.hash()).map_err(protocol_error).unwrap();
+        let bodies = snapshot(fixture.world()).unwrap().hash();
+        physics.record(fixture.tick(), bodies).map_err(protocol_error).unwrap();
+    }
+    if let Some(log) = runner.executor.execution_log() {
+        for name in [TEST, &physics_test] {
+            runner
+                .session
+                .write_execution_log(name, log.as_bytes())
+                .map_err(protocol_error)
+                .unwrap();
+        }
+    }
+    let rows = fixture.world().columns::<BoneLink>().map(|c| c.keys().len()).sum::<usize>();
+    assert_eq!(rows, (SMALL * u64::from(BONES)) as usize);
+    let bodies = fixture.world_mut().query::<&RigidBody>().count();
+    assert_eq!(bodies, rows, "a body on every bone");
 }
 
 /// The bone bodies on Rapier (`lactose-anim`'s cost test, (c), there over the physics test
