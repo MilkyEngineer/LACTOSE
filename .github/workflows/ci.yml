@@ -58,6 +58,11 @@ jobs:
         os: [ubuntu-latest, windows-latest, macos-latest]
     steps:
       - uses: actions/checkout@v4
+      # D148: the line-ending rule on this host's own checkout, before anything reads a file.
+      # The workflow sets no default shell, and Windows would run PowerShell.
+      - name: Line endings
+        shell: bash
+        run: bash tools/xtask/line-endings.sh
       # rust-toolchain.toml selects the toolchain; rustup installs it on first use.
       - run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@v2
