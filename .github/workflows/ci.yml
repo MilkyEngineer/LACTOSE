@@ -26,10 +26,13 @@ env:
 # 43550976114 (6ed8461) and 43556574172 (3264406), each warm. rust-cache restores the
 # dependencies; the workspace crates and the vendored rapier3d-f64 are path crates, so every
 # run compiles and links them again, and the test builds grow with every crate merged.
-# - check (windows-latest), 5.2 to 5.7, being re-measured since each package's integration
-#   tests became one test binary (D150): the test step 4.5 to 4.8 (its build most of it),
-#   doctests 0.1. lld-link (.cargo/config.toml) links. The job reached 14.8 of its 15 in
-#   October with clippy and the release tests still in it; they moved to the next job.
+# - check (windows-latest), 7.3 to 9.6, median 9.1, from the four green runs since each
+#   package's integration tests became one test binary (D150), 43827738169 (d7a0088),
+#   43855576989 (eca4e0f), 43868030471 (8941997) and 43872419194 (4ffcd62), each warm, against
+#   9.5 to 11.7 in the three before it, 43781979172, 43795852109 and 43799365983: the test
+#   step 6.4 to 8.7 (its build most of it), doctests 0.2. lld-link (.cargo/config.toml) links.
+#   The job reached 14.8 of its 15 in October with clippy and the release tests still in it;
+#   they moved to the next job.
 # - windows-lint-release, 2.6 to 3.6: clippy 0.5 to 0.7, the release golden vectors 1.3 to 2.3.
 # - check (ubuntu-latest), 5.1 to 6.5: clippy 0.3, the test step 3.1 to 4.0, the release golden
 #   vectors 1.0 to 1.6. It links with lld.
