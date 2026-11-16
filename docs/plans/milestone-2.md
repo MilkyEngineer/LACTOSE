@@ -692,10 +692,10 @@ into this plan:
 | Added by the coordinator after answer 1: when is the Mac upgraded? | "At milestone 1's exit": after the exit is recorded and before milestone 2's first lane | Milestone 1 closes on the system its figures were taken on, and every milestone 2 figure on the M1 is of macOS 26 (section 9) |
 | 6, CI budget | Not asked | It stays conditional (decision 5.15) |
 
-The questions follow as the record of what was asked. The first block is as this plan put it.
-The second is the Xcode question as the coordinator put it again after answer 1, in this plan's
-words; as first written it offered Xcode 16.2, the newest for macOS 14. The added question had no
-block here.
+The questions follow as the record of what was asked. The first block is as this plan put it,
+each question asked with "Milestone 2 plan, question N of 5." before it. The second is the
+coordinator's second call, as asked: the Xcode question put again after answer 1 (as first
+written it offered Xcode 16.2, the newest for macOS 14), and the added question.
 
 ```json
 {"questions":[
@@ -718,9 +718,13 @@ block here.
 
 ```json
 {"questions":[
-{"header":"Xcode on M1","question":"The Mac moves to macOS 26 (answer 1). It has the command line tools only. The cooker's MSL can still be compiled and run there, through Metal at run time. What cannot be done there is the last step, building a metallib, which needs Apple's `metal` compiler from Xcode: the Slang compiler fails without it. The macOS CI runner has it, but no branch reaches CI before its merge. Do you install Xcode on the Mac, the one current for macOS 26, after the upgrade?","multiSelect":false,"options":[
-{"label":"Install Xcode (Recommended)","description":"Lanes and reviewers then build and load metallibs before a merge, so a wrong language version or compiler flag is found on the branch, and the native Metal spike can test a binary archive built from a precompiled library. It takes several gigabytes of disk. The runner's Xcode stays the one whose metallibs count."},
-{"label":"Runner only","description":"Nothing to install. A metallib is first built in CI after the merge that adds it, so a failure there is found on main and fixed by a follow-up, and GPU pushes wait meanwhile. The native Metal spike compiles its MSL at run time and reports whether a binary archive works that way."}]}
+{"header":"Xcode on M1","question":"Milestone 2 plan, question 5 of 5. The Mac has the command line tools only. The cooker's Metal shader source can be compiled and run there through Metal at run time, but building a metallib needs Apple's `metal` compiler from Xcode; the Slang compiler fails without it. The macOS CI runner has it, but no branch reaches CI before its merge. Since the Mac is moving to macOS 26 (your answer to question 1), it would be the Xcode current for that system, not 16.2. Do you install Xcode on the Mac?","multiSelect":false,"options":[
+{"label":"Install Xcode (Recommended)","description":"Installed after the macOS upgrade. Lanes and reviewers then build and load metallibs before a merge, so a wrong language version or compiler flag is found on the branch, and the native Metal spike can test a binary archive built from a precompiled library. It takes several gigabytes of disk. The runner's Xcode stays the one whose metallibs count."},
+{"label":"Runner only","description":"Nothing to install. A metallib is first built in CI after the merge that adds it, so a failure there is found on main and fixed by a follow-up, and GPU pushes wait meanwhile. The native Metal spike compiles its shader source at run time and reports whether a binary archive works that way."}]},
+{"header":"macOS 26 when","question":"The Mac goes to macOS 26 for the KosmicKrisp spike (your answer to question 1). Every M1 result file so far was taken on macOS 14.7, so the M1 benchmark and `cargo xtask measure --all` run again in a quiet window after the upgrade. Milestone 1's remaining measurement sessions (A and B) are on the x86 desktop. When do you upgrade?","multiSelect":false,"options":[
+{"label":"At milestone 1's exit (Recommended)","description":"After milestone 1's exit is recorded and before milestone 2's first lane. Milestone 1 closes on the OS its figures were taken on, and every milestone 2 figure on the M1 is on macOS 26. The quiet-window re-run comes straight after the upgrade."},
+{"label":"Now","description":"Before milestone 1 exits. Any M1 figure milestone 1 still needs is taken on macOS 26, and the earlier M1 files are re-run now. A lane building on the Mac while it upgrades stops and is resumed."},
+{"label":"When KosmicKrisp is due","description":"Milestone 2's early lanes run on macOS 14.7, and the upgrade comes once `rhi-vulkan` exists and the KosmicKrisp spike is due. Milestone 2's M1 figures then span two OS versions."}]}
 ]}
 ```
 
