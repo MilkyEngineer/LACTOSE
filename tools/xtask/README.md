@@ -161,52 +161,52 @@ on, and a listed feature the crate does not declare are findings.
 - No cargo configuration file has an `include` key, and no `.cargo` directory or cargo
   configuration file is a symbolic link: cargo would read through either what no check
   reads. `vendor` refuses both through the same function.
-- The nightly Miri job (`src/miri.rs`): for each package of `[miri_split]`, the entries of
-  the `miri` job's matrix in `.github/workflows/nightly.yml` that name it run, together, each
-  test of its library, of each integration test target `cargo metadata` lists and of its doc
-  tests exactly once: one entry runs a target unfiltered, or exactly two divide it, one
-  naming libtest filters after `--` and the other skipping each of them with `--skip`, which
-  runs each test once whatever the tests are called. A finding names each target no entry
-  runs, one entry runs only part of, or several entries run otherwise, with the entries. The
-  check reads one shape of the job, today's, and refuses any other rather than reading it:
-  a matrix of `include` alone (a key beside it folds the entries into its combinations), no
-  `if` or `defaults` on the job and no `defaults` on the workflow, and one item of the job's
-  one `steps` list that uses `matrix.args`,
-  `run: cargo +$MIRI_TOOLCHAIN miri test --locked ${{ matrix.args }}`, with only `env` beside
-  it, so that the words after an entry's `--` are libtest's and nothing follows them. The job's other steps are not read. The reader takes the YAML the job is written in
-  (block mappings and sequences, plain, quoted and block scalars, LF or CRLF line breaks,
-  space indentation) and refuses at its line what it does not read on the way to and inside
-  the entries: another line break (a lone CR, NEL, LS or PS), a tab indent, a document
-  marker or directive, a line of a mapping on the way that is not a plain or quoted `key:`
-  (an explicit `? key`, or a list at the indent of its key, so that entries or steps written
-  at the indent of `include:` or `steps:` are refused, as the real file never writes them),
-  a key it follows (`jobs`, `miri`, `strategy`, `matrix`, `include`, `steps`) twice in its
-  mapping, and a key twice in one entry. Every entry names exactly
-  one workspace member with a plain `-p NAME` or `--package NAME`; `--workspace`, no `-p`,
-  a second `-p`, `-p=`, `-pNAME`, `NAME@VERSION` and a glob are refused. Its `args` are
-  split as the run step's bash splits them; an unquoted glob character, which bash would
-  expand against the checkout, a line break, which ends the command, and other shell syntax
-  are refused. Of cargo's options it reads `-p`, `--lib`, `--test` and `--doc`, and refuses
-  any other; after the first `--`, filters and `--skip FILTER`, and it refuses a `--` with
-  nothing after it, an empty filter, `--skip=`, a second `--` and every other libtest option
-  (`--exact` would change what a filter matches). A package in `[miri_split]` must name its targets: an entry that names none is
-  refused, since cargo's default run then follows the manifest's `test` and
-  `required-features`, which the counts do not model. An explicit `--test` runs a
-  `test = false` target and fails the job on one whose `required-features` it does not
-  enable, so neither needs a rule. A package outside `[miri_split]` that two or more entries
-  name by target or filter is reported as a split the policy does not list; an entry that
-  runs the package whole and unfiltered drops none of its tests, so entries that do, as `lactose-task`'s two do
-  under two environments, are no split, and neither is one of them beside one entry by
-  target. An empty `[miri_split]` is reported. A binary, bench or example target of a
-  split package whose `test` is on, which `cargo test` would run and the split cannot
-  select, is reported in its manifest. A `--test` value with none of `*?[]` is a target
+- The nightly Miri job (`src/miri.rs`): for each package of `[miri_split]`, the entries of the
+  `miri` job's matrix in `.github/workflows/nightly.yml` that name it run, together, each test
+  of its library, of each integration test target `cargo metadata` lists and of its doc tests
+  exactly once: one entry runs a target unfiltered, or exactly two divide it, one naming
+  libtest filters after `--` and the other skipping each of them with `--skip`, which runs
+  each test once whatever the tests are called. A finding names each target no entry runs, one
+  entry runs only part of, or several entries run otherwise, with the entries. The check reads
+  one shape of the job, today's, and refuses any other rather than reading it: a matrix of
+  `include` alone (a key beside it folds the entries into its combinations), no `if` or
+  `defaults` on the job and no `defaults` on the workflow, and one item of the job's one
+  `steps` list that uses `matrix.args`, `run: cargo +$MIRI_TOOLCHAIN miri test --locked ${{
+  matrix.args }}`, with only `env` beside it, so that the words after an entry's `--` are
+  libtest's and nothing follows them. The job's other steps are not read. The reader takes the
+  YAML the job is written in (block mappings and sequences, plain, quoted and block scalars,
+  LF or CRLF line breaks, space indentation) and refuses at its line what it does not read on
+  the way to and inside the entries: another line break (a lone CR, NEL, LS or PS), a tab
+  indent, a document marker or directive, a line of a mapping on the way that is not a plain
+  or quoted `key:` (an explicit `? key`, or a list at the indent of its key, so that entries
+  or steps written at the indent of `include:` or `steps:` are refused, as the real file never
+  writes them), a key it follows (`jobs`, `miri`, `strategy`, `matrix`, `include`, `steps`)
+  twice in its mapping, and a key twice in one entry. Every entry names exactly one workspace
+  member with a plain `-p NAME` or `--package NAME`; `--workspace`, no `-p`, a second `-p`,
+  `-p=`, `-pNAME`, `NAME@VERSION` and a glob are refused. Its `args` are split as the run
+  step's bash splits them; an unquoted glob character, which bash would expand against the
+  checkout, a line break, which ends the command, and other shell syntax are refused. Of
+  cargo's options it reads `-p`, `--lib`, `--test` and `--doc`, and refuses any other; after
+  the first `--`, filters and `--skip FILTER`, and it refuses a `--` with nothing after it, an
+  empty filter, `--skip=`, a second `--` and every other libtest option (`--exact` would
+  change what a filter matches). A package in `[miri_split]` must name its targets: an entry
+  that names none is refused, since cargo's default run then follows the manifest's `test` and
+  `required-features`, which the counts do not model. An explicit `--test` runs a `test =
+  false` target and fails the job on one whose `required-features` it does not enable, so
+  neither needs a rule. A package outside `[miri_split]` that two or more entries name by
+  target or filter is reported as a split the policy does not list; an entry that runs the
+  package whole and unfiltered drops none of its tests, so entries that do, as
+  `lactose-task`'s two do under two environments, are no split, and neither is one of them
+  beside one entry by target. An empty `[miri_split]` is reported. A binary, bench or example
+  target of a split package whose `test` is on, which `cargo test` would run and the split
+  cannot select, is reported in its manifest. A `--test` value with none of `*?[]` is a target
   name, and any other a pattern of the `glob` crate as cargo 1.99 and the job's
-  `MIRI_TOOLCHAIN` (nightly-2026-10-04, cargo 1.101.0-nightly) build it: case-sensitive,
-  `?`, `*`, `**` only alone, `[...]` and `[!...]` with ranges and a leading `]`, no escape.
-  The unit tests' cases are cargo's own selections and refusals, run through
-  `cargo test --no-run --test` on cargo 1.99.0, and a set of them on both cargos. A value
-  that selects nothing, which cargo refuses, is reported, as is a pattern with a path
-  separator, which the check does not read.
+  `MIRI_TOOLCHAIN` (nightly-2026-10-04, cargo 1.101.0-nightly) build it: case-sensitive, `?`,
+  `*`, `**` only alone, `[...]` and `[!...]` with ranges and a leading `]`, no escape. The
+  unit tests' cases are cargo's own selections and refusals, run through `cargo test --no-run
+  --test` on cargo 1.99.0, and a set of them on both cargos. A value that selects nothing,
+  which cargo refuses, is reported, as is a pattern with a path separator, which the check
+  does not read.
 - One test binary per package (`src/test_targets.rs`, D125): a package builds its
   integration tests as one target, `integration`, whose root `tests/integration.rs`
   declares every other file of `tests/` as a module, with `autotests = false` in the
