@@ -946,8 +946,9 @@ fn cpu_name() -> String {
 }
 
 /// The data of the value `name` in `reg query`'s output: what follows its type on the line
-/// that names it. The same function as `cargo xtask measure`'s, whose unit test covers it: a
-/// benchmark without the test harness runs no test, and cannot depend on the tool.
+/// that names it. A copy of `cargo xtask measure`'s, whose unit tests cover it and check that
+/// the copy is the same: a benchmark without the test harness runs no test, and cannot depend
+/// on the tool.
 fn registry_value(output: &str, name: &str) -> Option<String> {
     let line = output.lines().map(str::trim).find(|line| line.starts_with(name))?;
     let (_, data) = line.split_once("REG_SZ")?;
@@ -969,6 +970,8 @@ fn load_average() -> Option<String> {
     Some(averages.trim_start_matches(['s', ':', ' ']).to_owned())
 }
 
+/// The machine name from a CPU name. A copy of `cargo xtask measure`'s, which checks that it is
+/// the same, so both name a machine's files alike.
 fn slug(text: &str) -> String {
     let mut slug = String::new();
     for character in text.chars() {
