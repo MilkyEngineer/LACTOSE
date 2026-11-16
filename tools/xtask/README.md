@@ -339,10 +339,10 @@ The last line is `line-endings: <n> files read, none refused` with exit status 0
 `line-endings: <r> of <n> files refused` with 1. It exits 2, with a message on standard
 error, when `git ls-files` fails or lists no file, or when it reads fewer lines than git
 listed. A copy of the script checked out with CRLF runs itself again without the carriage
-returns, so it still refuses what git lists; run through standard input, such a copy cannot
-read itself again and exits 2.
-It cannot see a file that is not text and that git took for text, since `git add` rewrote
-it; the change that adds a kind names it `binary`.
+returns, so it still refuses what git lists; run through standard input, a pipe or a process
+substitution, such a copy cannot read itself again and exits 2. It cannot see a file that
+is not text and that git took for text, since `git add` rewrote it; the change that adds a
+kind names it `binary`.
 
 ## SOUR
 

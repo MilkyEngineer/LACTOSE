@@ -7,13 +7,13 @@
 # A copy checked out with CRLF (its blob stored CRLF, or a line of .gitattributes taking it
 # out of the rule on a host that converts) must still run, and refuse what git lists rather
 # than stop on a syntax error. In such a copy the next line leaves a carriage return in
-# `probe`, and the three after, whose own carriage returns fall in their trailing comments,
-# run this file again without them. Run through standard input, such a copy cannot read
-# itself again and stops. Nothing above them may be a blank line or a command.
+# `probe`, and the one after, whose own carriage return falls in its trailing comment, runs
+# this file again without them. That line is one command, read whole before it runs: run
+# through standard input, a pipe or a process substitution, the copy cannot read itself
+# again from its first line, and the line stops it rather than let the shell reach the end
+# of its input. Nothing above these two lines may be a blank line or a command.
 probe=x
-if [ "$probe" != x ]; then source_text=$(<"$0") || source_text=''; fi #
-if [ "$probe" != x ] && [ -z "$source_text" ]; then echo "line-endings: cannot read $0 again to drop its carriage returns: run it as bash <path>" >&2; exit 2; fi #
-if [ "$probe" != x ]; then exec "$BASH" -c "${source_text//$'\r'/}" "$0"; fi #
+if [ "$probe" != x ]; then source_text=$(<"$0"); case "$source_text" in '#!/usr/bin/env bash'*) exec "$BASH" -c "${source_text//$'\r'/}" "$0" ;; esac; echo "line-endings: cannot read $0 again from its first line to drop its carriage returns: run it as bash <path>" >&2; exit 2; fi #
 
 set -u
 
