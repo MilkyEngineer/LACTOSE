@@ -6493,6 +6493,294 @@ process state; the nightly Miri filters name modules that Miri compiles** (§20,
   exit condition of milestone 1", and its "after the x86 numbers", both by the addendum there.
   In section 20 and section 22 nothing: each gains a sentence. D144's rule for the desktop's
   Windows `whisk` file stands, and is met at milestone 2.
+- Addendum (the milestone 2 plan's re-base, 2026-11-17): *the desktop reads one commit at a sitting,
+  and milestone 1's half is read first.* The owner's answers at the re-base. Sessions A and B run in
+  a sitting of their own, as soon as the M1's re-run after its upgrade is on main and before
+  milestone 2's first crate lane merges. They run at that re-run's commit, not at the three commits
+  milestone 1's plan and D144 gave them: `cargo xtask measure --all` writes every file of both, the
+  WHISK file among them, and any commit from `0ec2d90` on holds `timer-windows` and `keeper`. The
+  desktop's recorded hashes are an emitted file, compared with the linux-x64 file of the nightly at
+  that commit by `cargo xtask sour compare`; no digest is used. Session C stays at milestone 2's
+  measurement commit, where the same command writes milestone 1's files again. A miss is brought to
+  the owner when the first sitting's files are in. Rules out three old commits built under each
+  system the desktop boots, and an x86 miss of milestone 1 found when milestone 2 is over. Replaced:
+  this entry's "milestone 2's one desktop sitting, each at the commit milestone 1's plan gives it",
+  and D144's commit for the desktop's Windows `whisk` file.
+
+**D152. What a world registers is held to section 8.2 wherever it is declared, in a boundary crate or a crate that carries the lint file; a system that writes hashed state is declared in a library and runs in a recorded test; architecture revision 3.4** (§3, §8.1, §8.3, §22, `CLAUDE.md`, `tools/xtask`, `tools/xtask/ci-policy.toml`, `game-sim`, `lactose-app-headless`, `lactose-present-api`, `lactose-presentation`, `lactose-renderer`, `lactose-app-client`, `docs/plans/milestone-1.md`, `docs/plans/milestone-2.md`)
+- Why: section 3 makes the determinism boundary a crate boundary, and nothing tied what a world
+  registers to the boundary's crates. `lactose-app-headless`'s sketch game declared a persistent
+  replicated component, a tick-stage system and a session applier outside every boundary lint; the
+  follow-up project review patched the system to read the clock, every check passed, and three runs
+  printed three hashes (X1). Lane `exit-tooling` built the check (`87c2c77`, `7094406`, merged at
+  `a561b36`). This entry is the rule that check enforces, what review holds beyond it, and what
+  milestone 2's crates do about it.
+  - *What a world registers is held to every rule of section 8.2, those that review holds included,
+    whichever side its crate is on.* That is a `#[system]`, a pass system included, a `#[component]`
+    or `#[resource]` that is not `derived`, an implementation of `SessionApplier`, `InputApplier` or
+    `StagedState`, a hand-written `impl Reflect`, and the setup and migration functions of a
+    `CrateRegistration`. Each is declared in a `[boundary]` crate, in a crate listed under
+    `[lint_file_carriers]`, which carries a byte-identical copy of the boundary `clippy.toml`, or in
+    test code alone. A lint file is not section 8.2: float `%`, global mutable state and the RNG's
+    keying are held by review, and the review of this rule's first text put a float `%` into the
+    carrier's system and passed every gate. Rules out a carrier that keeps the lints and breaks the
+    rules, and "a pass system of an outside crate writes no hashed column" as the bar, which the
+    project review proposed and no tool can check of an exclusive system.
+  - *What the tool enforces, and what it does not see.* `cargo xtask boundary` reports the first
+    four kinds in the shipped sources of a crate that is neither a boundary crate nor a carrier. It
+    matches attributes and traits by the last segment of their path as written, so one brought in
+    under another name, written by a macro the crate's source does not spell out, or inside a
+    `cfg_attr`, is not seen. It does not see a setup or a migration function, nor which stage a
+    system is registered in. Review holds those, and a verification row carries the extension that
+    would lift the first.
+  - *A carrier stays outside the boundary.* The dependency allowlist does not bind it, so review
+    holds what its declared code calls. Its other code is outside, and where that code must reach
+    the outside world it takes a local `#[expect]` with its reason. Rules out moving a binary or a
+    foundation crate into `[boundary]` to declare a component.
+  - *A system that writes a hashed column is declared in a library, and runs on rows in a test that
+    links that library and records through the session (X2).* A test comes under SOUR's modes only
+    by taking its configuration from the harness session and recording through it, whichever package
+    holds it. A copy of a system in test code is not that system, and a test can run a binary's
+    system only as a copy: that is how the patched sketch passed. The project review asked for "a
+    test that steps a world records through the session"; some thirty test files at `a561b36`
+    step a world and record nothing, each asserting one behaviour, so the rule is stated of systems,
+    as the review's X4 applied it to the bone systems. No tool reports a system that no recorded
+    test runs: review does. Rules out a package-level check, which would need an exemption list and
+    add no mode.
+  - *The sketch game moves into `game-sim`, and no binary is a carrier.* The rule is false of one
+    system at `a561b36`: `sketch::count` is declared in the headless binary, and
+    `lactose_app::headless::a_recorded_headless_run` runs a copy. The milestone 2 plan's lane
+    `sketch` moves the sketch's component, system and session applier into `game-sim`, a
+    `[boundary]` crate that `crate-tiers.toml` already names, which both binaries and the recorded
+    tests link. The mover of the client's local world is written there too. The binaries keep the
+    `CrateRegistration` and `Game` values, whose types a game crate may not name and which the rule
+    does not list. The headless binary's migration function is empty, so by choice it passes
+    `migrations: None` and leaves the carriers in that lane, where it could have stayed one for a
+    function that does nothing; the client binary is never one. The sketch's session applier runs in
+    no recorded test after the move, since the test spawns through an applier of its own: the
+    sentence above is of systems, and a verification row carries the applier's recorded run. Rules
+    out a library target in each binary's package, each a carrier and a `[harness]` package, and the
+    boundary's bans on a client's window code.
+  - *Milestone 2's other crates.* `lactose-present-api` declares the presentation components and
+    extract's pass system, and joins the carriers with its facade: the merged check refused that
+    facade as the milestone 2 plan first wrote it (the review of `exit-tooling`, S1).
+    `lactose-presentation` does not join: section 8.1 puts presentation outside, its schedule runs
+    on the snapshot, and the boundary file bans the float methods it is written with.
+    `lactose-renderer` declares no system: extract's sink hands its slot table the structural log's
+    despawns and a restore's reconciliation. Rules out the boundary's float bans on presentation and
+    render code.
+  - *A pass system leaves the world hash as it found it.* It runs once a frame with the whole world,
+    whether or not a tick ran, so it writes no hashed column and nothing a tick's systems read. No
+    tool checks that; the lane that adds a pass system proves it with a recorded test, extract's
+    first. Rules out a hash that depends on how many frames were drawn.
+  - *Section 22 says what milestone 0's zstd load is, and that the eight-core tick is no frame
+    budget (the exit review's N4 and N6).* The two loads are tasks of the background class. On the
+    M1 they run on the efficiency cores; on a hybrid part under Windows that steering is an open
+    verification item; on a part with no efficiency cores they are two low-priority threads beside
+    the frame workers, the harder case, and the desktop's first file says which part it is. The
+    composed tick with the physics phase takes 5,772.5 µs on the M1's four frame workers and
+    projects to 4,433.1 µs on eight, and no criterion reads it.
+  - *Milestone 1's exit is recorded* in `docs/plans/milestone-1.md`, section 7, and in one sentence
+    of section 22: its steps 1 to 7 were complete at `a561b36` on 16 November 2026 UTC, on the Apple
+    M1 under macOS 14.7.4.
+  - *The marker moves to architecture 3.4*, since `CLAUDE.md` gains the rule. The milestone 2 plan's
+    own rulings are revision 3.5's.
+- Driven by: the follow-up project review at `4ffcd62` (X1, X2); the review of lane `exit-tooling`
+  (S1), whose probe showed the merged check refusing the milestone 2 plan's `present-api` facade;
+  the exit's criteria review at `8941997` (N4, N6); the review of the milestone 2 plan's re-base,
+  whose probes showed that a test cannot link a binary's system and that a float `%` in a carrier
+  passes every gate; `docs/plans/milestone-2.md`, decision 5.18.
+- Replaced: section 8.3's "`[lint_file_carriers]` in `tools/xtask/ci-policy.toml` lists the three";
+  section 22's "two background zstd threads", and its placing of `game-sim` wholly in milestone 5;
+  the first site of milestone 1's edit-to-playing measurement (`docs/plans/milestone-1.md`, decision
+  5.9), which follows the sketch's system into `game-sim`.
+
+**D153. The milestone 2 plan: how its criteria are read, which machine proves each, the order the render track is built in, and what is re-gated** (§4, §5.1, §5.3, §12.1, §12.2, §12.3, §12.4, §13, §14, §16, §18, §19, §20, §22, `crate-tiers.toml`, `tools/xtask`, `docs/plans/milestone-2.md`)
+- Why: section 22 gives milestone 2 seven proofs and names no workload, machine or order for
+  them; none of the crates it delivers existed at `a561b36`; twenty-six verification rows gated
+  the milestone. `docs/plans/milestone-2.md` is the map and gives each decision's reasons; these are
+  the decisions.
+  - *The triangle is the client binary's frame, in a fixed-frame mode.* `lactose-app-client`
+    steps a fixed clock and scripted input, extracts a local world each frame and draws
+    instanced triangles at the extracted transforms through passes the render graph compiled
+    and recorded, on a hardware Vulkan driver on Windows and under MoltenVK on macOS. It dumps
+    what it drew; a CPU reference rasterised from the dump is compared with the offscreen
+    target's readback, in result file `triangle`. Rules out a triangle drawn by a test program
+    beside the graph, and a reference that guesses what was drawn.
+  - *Extract's 1 ms is the median of extract's pass on N frame workers, at 50,000 rows moved every
+    tick among 100,000*, writing the previous and current transform to the device's mapped
+    staging ring in render space and filling the presentation snapshot; the null backend's figure
+    and the ring's memory type are recorded beside it. It is read on a quiet Apple M1 and on the
+    x86 desktop. Rules out a criterion met on null alone or without the snapshot.
+  - *Remote upload's 1 ms is the median frame of ten seconds paced at 144 Hz*: one batch sample
+    of 5,000 slots, the conversion to render space and the write to the ring, with one writer
+    pushing every slot at 30 Hz and a submit each frame. P99 is recorded. Rules out a figure with
+    no writer, or with a ring that never frees.
+  - *The minimal renderer is the render slot table, the staging ring, its scatter into a
+    persistent instance buffer in the cell-plus-offset format, triangles drawn by instance, the
+    latched camera buffer and `RenderFeature`.* The scatter and the format are milestone 3's,
+    pulled forward so that the ring's row is final. The GPU scene's meshes and materials,
+    cluster submission, culling, deferred lighting, skinning and device-lost recovery stay
+    milestone 3's. Rules out a staging format that milestone 3 would rewrite.
+  - *The presentation schedule at milestone 2 is interpolation, the camera rig's orbit and boom,
+    the remote sample and upload, and event delivery.* Boom collision and pose evaluation are
+    milestone 3's, the visual blend of a correction and the shadowing of the replicated copy
+    milestone 4's, UI animation, the audio listener and markers milestone 5's. Rules out stubs
+    for crates that do not exist.
+  - *`rhi-api`'s facade follows the native Metal spike alone*, a throwaway program on the M1,
+    never checked in. MoltenVK's open cost figures are taken through `rhi-vulkan` by
+    `cargo xtask measure gpu-cost`, since a cost is reported or budgeted and changes no
+    signature. Rules out a second throwaway Vulkan program. This replaces D139's order, the
+    facade behind three spikes.
+  - *Every command that reads or writes a swapchain image is submitted by the present thread, on
+    a present queue no other thread submits to, in a family that can draw and present, where the
+    device offers one; otherwise the roles share the graphics queue.* Under MoltenVK the
+    drawable is taken inside such a submit, on the calling thread with the queue held, and a
+    present that blocks holds its queue on any driver. The offscreen target is two images or
+    more. The present thread holds one at a time, the newest the frame has finished. The frame
+    renders only into one the present thread does not hold, after the timeline value the present
+    thread signals when its read of it is done, and from undefined, so nothing crosses back. A
+    finished target crosses to the present queue by a semaphore and an ownership transfer or by
+    concurrent sharing, and is drawn or blitted into the swapchain image. Rules out a frame
+    worker blocked on a drawable, a frame submit waiting behind a present, a frame waiting on
+    the present thread through its target, and switching off MoltenVK's synchronous submits.
+  - *Slang is one pinned release, which the cooker runs as `slangc` and refuses any other, and
+    one command installs it on a host.* The cook checks what it emitted: the non-uniform
+    decoration on every access through the heap, and one location for each fragment output on
+    both targets; Slang's warnings are errors. SPIR-V and MSL are cooked on every host with equal
+    bytes. A metallib is cooked on macOS by the cook's own call of `metal`, as MSL 3.1 for macOS
+    14, which is thereby the oldest client. Rules out a Slang taken from a host's SDK, a check
+    that reads the source alone, and FFI to Slang before process starts cost the cook something.
+  - *One command runs the device tests by one rule: `cargo xtask gpu --driver <name>`.* It
+    counts the debug messenger, both Metal validations' lines and MoltenVK's own; the Khronos
+    layer is pinned on every host; each run has a canary for each validator, in a process of
+    its own, and a silent canary or any other message fails it. A device test is an ignored
+    test the command selects, a missing device fails the run, and each test compares against a
+    reference computed on the
+    CPU. lavapipe runs them on every pull request on linux-x64. Rules out a checked-in image
+    and a run that passes because no validator was on.
+  - *A hazard is proven by the evidence its class has.* A tracked resource: a synchronisation
+    validation message. The host and the GPU: a wrong readback with the GPU made to lag.
+    Aliasing, reads through the heap, indirect and index buffers, ownership transfers and
+    memory that is not coherent: the null backend's rules, each held by a mutation, since no
+    machine in reach shows them. Rules out a proof that cannot fail where it runs, and a run
+    that showed nothing recorded as an answer.
+  - *No GPU runner.* Hardware runs are the M1's at every merge of a GPU crate, as an extra gate
+    under MoltenVK and the validators, the Windows laptop's devices after each such push, and
+    the desktop's at the measurement commit. Rules out a paid hosted runner and a self-hosted
+    runner on a public repository.
+  - *`lactose-app` drives the render side through `present-api` and `rhi-api`, and
+    `lactose-app-client` wires the backends.* `cargo xtask tiers` applies `[server_denylist]` to
+    `lactose-app`'s normal-dependency closure whether or not the server binary exists. Rules out
+    a feature of `lactose-app` that turns backend edges on, and a denylist that first bites at
+    milestone 4.
+  - *`lactose-rhi-vulkan` joins `[test_support]`*, so the graph and the renderer run on a device
+    in their own tests. Five crates get a facade first: `rhi-api`, `render-graph`, `renderer`,
+    `platform`, `present-api`. Rules out a backend-to-backend exception for tests.
+  - *`rhi-api` freezes as section 20 says, at the Vulkan backend's first pass of the suite.* A
+    later lane amends it in the change that needs it, called out at its merge, as section 20
+    allows and D143 did. A planner's decision at the exit records what is frozen, what was
+    amended and what `rhi-metal` may still amend. Rules out a freeze by silence, and a decision
+    for each amendment.
+  - *A crate added from milestone 2 on follows D150, and no check job's median over its three most
+    recent warm runs of main passes ten of its fifteen minutes.* The Windows check's stood at 9:13
+    at the plan's re-base. Rules out crate lanes pushed onto a job at its timeout, a budget read
+    from one run, and runs made again to read it.
+  - *The physics phase's stall on render recording is recorded with no threshold* and sets
+    `lactose-app`'s default reservation. Rules out a threshold nobody set.
+  - *Re-gated*: the directory watch, with its dev session and the mount cost on Linux and
+    Windows, to milestone 3; the artist-surfaces decision to milestone 3, where a G-buffer pass
+    and `rhi-metal` exist; the mesh and texture load against the 0.5 ms slice to milestone 3;
+    device-lost recovery's test to milestone 3; the visual blend of a correction to milestone 4.
+- Driven by: architecture section 22 and its exit step in `docs/plans/milestone-1.md`; the RHI
+  spike's result (`docs/results/spike-rhi-apple-m1-2026-11-15.md`); the plan's probes of 16
+  November 2026 and its two first reviews, whose probes found the empty denylist check, the
+  Windows check's real time, MoltenVK's drawable and Slang's three mismatches; the owner's
+  ruling of that day that the plan be drafted ahead of milestone 1's exit; the owner's
+  answers of 16 and 17 November 2026; and the plan's re-base at `a561b36`, which took D150,
+  D151 and D152.
+- Replaced: D139's "`lactose-rhi-api`'s facade and `lactose-rhi-null` move to milestone 2,
+  behind its MoltenVK, KosmicKrisp and native Metal spikes", in its order alone. D136's and
+  D147's placing of the directory watch in milestone 2. Section 20's "on a GPU runner nightly".
+  Section 22's placing of the scatter and the cell-plus-offset format wholly in milestone 3,
+  and of the client `app` wholly in milestone 4: the client binary arrives at milestone 2 with
+  a local world. The status line of `docs/proposals/artist-surfaces.md`. Revision 3.5
+  restates each. Section 22's placing of `game-sim` is D152's to replace.
+
+**D154. The Apple interim path until native Metal is MoltenVK; KosmicKrisp is measured beside it on the development Mac, which moves to macOS 27.2.1** (§2 Graphics, §5.1, §12.1, §20, §22, §22.1, `lactose-rhi-vulkan`, `docs/results`)
+- Why: section 22.1 asks for the interim path by milestone 2, and section 22 for a MoltenVK and
+  a KosmicKrisp spike behind it.
+  - *MoltenVK carries section 12.1's list.* Under MoltenVK 1.4.2 on the M1 every item of the RHI
+    spike ran with a GPU-side use read back exact, clean under the Khronos layer, Metal API
+    validation and Metal shader validation
+    (`docs/results/spike-rhi-apple-m1-2026-11-15.md`). What it does not offer, `rhi-api` reports
+    as capabilities: whether an attachment of a given usage can be memoryless, whether a
+    memoryless attachment keeps its contents across a local read, and indirect count.
+  - *Two costs of the path are accepted for one milestone, and one shape it showed is adopted
+    for every backend.* Its local read restarts the Metal pass, so the G-buffer in tile memory
+    is not shown on Apple before `rhi-metal`. GPU-assisted validation does not run under it, so
+    that runs under lavapipe and on the laptop. It takes the drawable inside the submit of any
+    command that reads or writes a swapchain image, on the calling thread with the queue held;
+    so every such command is the present thread's, on a queue of its own (D153).
+  - *KosmicKrisp is measured, not adopted.* It is built on Metal 4, which needs macOS 26 or later
+    (Mesa's driver documentation); on macOS 14.7.4 its driver in Vulkan SDK 1.4.363.1 enumerated no
+    device. The owner moves the development Mac to macOS 27.2.1 on 17 November 2026, after milestone
+    1's criteria were proven and reviewed on macOS 14.7.4 and before milestone 2's first lane, so
+    milestone 1 closes on the system its figures were taken on and every milestone 2 figure on the
+    M1 is of one system. `rhi-vulkan`'s conformance suite, the swapchain's cases and `cargo xtask
+    measure gpu-cost` then run under KosmicKrisp beside MoltenVK, on one machine, with timings.
+    Section 22's "KosmicKrisp ... recorded" is those files. A case that fails under it is recorded
+    and fails no merge.
+  - *MoltenVK stays the driver the M1's gate runs under.* The decision is taken before anything
+    has run under KosmicKrisp. MoltenVK also runs on macOS 14 and 15, the oldest of which the
+    cook targets. And the path lasts one milestone: `rhi-metal` lands in milestone 3 and carries
+    the GPU-driven path, which MoltenVK cannot (D42, D43). A switch of the gate's driver is an
+    addendum here, brought to the owner if KosmicKrisp passes every output case of the suite and
+    offers a memoryless attachment kept across a local read, GPU-assisted validation that runs,
+    or a drawable taken outside a submit.
+  - *The upgrade re-bases the M1's figures.* Every M1 result file of milestones 0 and 1 was
+    taken on macOS 14.7. The WHISK benchmark and `cargo xtask measure --all` run again in a
+    quiet window straight after the upgrade, and the RHI spike's program is run again by its
+    file's commands. A figure that crosses a milestone 1 criterion there is a finding for the
+    owner; milestone 1 is not reopened. A fix that changes measured code after the upgrade is
+    measured on macOS 27.2.1, and its file says so. After it no machine in reach runs macOS 14.
+  - Rules out: a gate under a driver nothing has run on; a second gate driver at every merge; a
+    KosmicKrisp record taken on a hosted runner's virtual GPU, without timings.
+- Driven by: architecture section 22.1; the RHI spike; the plan's probe of 16 November 2026 and
+  the GPU review's reading of MoltenVK 1.4.2's source; the owner's answers: on 16 November 2026,
+  that the Mac is upgraded at milestone 1's exit; on 17 November, that its system is macOS 27.2.1.
+- Replaced: sections 2 and 12.1, which leave the interim path open between the two; revision
+  3.5 names it.
+
+**D155. Crash reporting until a build leaves the owner's machines is the panic hook's text report, shared by every engine binary through `lactose-app`; minidumps and symbol upload are decided at milestone 5** (§3, §5.1, §19, §21, §22.1, `lactose-app`, `lactose-app-headless`, `lactose-app-client`)
+- Why: section 22.1 asks for crash reporting, minidumps and symbol upload, by milestone 2, and
+  milestone 2 adds a second binary and the first calls into a graphics driver.
+  - *The hook is `lactose-app`'s.* It was the headless binary's
+    (`crates/app-headless/src/main.rs`), and that binary's README and the verification row "The
+    milestone 1 crash hook" gave its successor to `lactose-platform`, which `[server_denylist]`
+    denies the server. `lactose-app` is what every engine binary links, and the hook is safe
+    code. RICOTTA keeps the hook it has (`tools/cook/src/main.rs`): a tool does not link the
+    assembly.
+  - *The report is text*: the thread, the panic and a forced backtrace, to stderr and to a file
+    in a directory the binary names. A directory that cannot be written costs the file alone
+    (`docs/verification.md`, section 3). A subprocess test holds the abort path.
+  - *A hardware fault is read from the operating system's report.* macOS writes one by default.
+    Windows keeps a local dump once Windows Error Reporting's `LocalDumps` key is set, which is
+    off by default and needs an administrator; the owner sets it on the laptop and the desktop.
+    The validation layers and these are what diagnose a fault inside a driver call on the
+    owner's machines.
+  - *No minidump writer, no monitor process and no symbol upload are built.* A writer that
+    catches a hardware fault runs in a signal handler, and section 21 admits `unsafe` for that
+    in no crate every binary links, or in a second process, which is a monitor to build and
+    ship. An upload needs a service and a symbol store, and nothing reads either before a build
+    goes to a tester.
+  - Rules out: a hook in a crate the server cannot link; a spend on a crash service before
+    there is a tester.
+- Driven by: architecture section 22.1; `crate-tiers.toml`; the owner's answer of 16 November 2026.
+- Replaced: section 22.1's "Crash reporting: minidumps and symbol upload" by milestone 2, which
+  moves to milestone 5; sections 3 and 5.1's "crash dump", which revision 3.5 states as
+  the text report; the row's and the headless README's "`lactose-platform` ... whose hook
+  replaces this one".
 
 ## 10. Review history
 
@@ -6539,3 +6827,12 @@ process state; the nightly Miri filters name modules that Miri compiles** (§20,
   milestone 1's criteria are read; and copy-on-write snapshots are not built. Its review
   (not checked in) found nothing blocking, 4 serious and 9 minor findings, all answered
   before the commit.
+- **Follow-up project review** at `4ffcd62` (16 November 2026, not checked in), milestone 1's exit
+  step 7: every finding minor or a note once verified. Lanes `exit-docs` and `exit-tooling` fixed
+  what was a lane's, and D152 and `docs/plans/milestone-2.md` took the rest.
+- **Revision 3.4** (the commit that carries D152) followed milestone 1's exit: what a world
+  registers is held to section 8.2 wherever it is declared, in a boundary crate or a crate that
+  carries the boundary lint file; a system that writes hashed state is declared in a library and
+  runs in a recorded test; and section 22 records the exit and two readings of its criteria. Its two
+  reviews (not checked in) found nothing blocking, 2 serious and 12 minor findings, all answered in
+  the text applied.

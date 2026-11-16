@@ -187,9 +187,9 @@ Which packs a fresh process mounts, and in which order, is `lactose-asset`'s rul
 directly in a cooked directory whose names end in `.pack`, in byte order of the names, a
 later name naming the version where two packs hold one asset. So a team orders the packs
 it cooks by naming them (`00-base.pack`, `10-dlc.pack`, `90-patch.pack`), and a re-cook
-that writes its pack at the same path keeps its name's rank in the order. Milestone 2's
+that writes its pack at the same path keeps its name's rank in the order. Milestone 3's
 directory watch must leave the store naming what a fresh process mounting the set would
-name, with no version the set shadows named in between; how is milestone 2's to decide.
+name, with no version the set shadows named in between; how is milestone 3's to decide (D153).
 
 ## Determinism
 
@@ -221,7 +221,7 @@ version (`tests/skeleton.rs`).
   source, meshes, textures, materials, shaders, scenes and collision (architecture
   section 2's list), and `.glb`.
 - A processor registry and a choice of processor by anything but the `.gltf` ending.
-- Incremental cooks, a cache, and the directory watch of milestone 2.
+- Incremental cooks, a cache, and the directory watch of milestone 3 (D153).
 - Dependencies between assets: a skeleton has none, so the cycle check of
   `CookedHeader::dependencies` is the clip processor's to add.
 

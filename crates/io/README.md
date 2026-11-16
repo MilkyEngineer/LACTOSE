@@ -394,7 +394,7 @@ own events.
   temporary with another process's token, so it assumes no other process writes into the
   directory; a lock file or a per-process subdirectory waits for a consumer that runs two.
 - **Metadata without opening** (size, modified time) and **watching a directory** for the
-  cooker's hot reload (`asset`'s milestone 2 work). Both are requests of the same shape
+  cooker's hot reload (`asset`'s milestone 3 work). Both are requests of the same shape
   and arrive with their consumer.
 - **A platform's own compression format** as a second `Encoding` variant, when a console
   backend brings a decoder for it.

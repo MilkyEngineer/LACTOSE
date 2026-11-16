@@ -33,8 +33,9 @@ eight. `LACTOSE_MEASURE_WORKERS=<n>` sets it instead, and the file's header says
 
 A measurement that is a test is an ignored test of its package's one integration-test target,
 `integration` (D150), selected by its module path and run in release by `cargo nextest run
---cargo-profile release --package <package> --test integration --run-ignored only --retries 0
---no-capture -E 'test(=<module>::<test>)'`; it prints each figure as a line `measure: <name>
+--locked --cargo-profile release --package <package> --test integration --run-ignored only
+--retries 0 --no-capture --no-tests=fail -E 'test(=<module>::<test>)'`; it prints each figure
+as a line `measure: <name>
 <value>`, once, which is what the files carry, so it can also be run by hand with the same
 command. `--short` sets `LACTOSE_MEASURE_SHORT`, under which each test cuts its repetitions; a
 short run's files end in `-short` and say that their numbers mean nothing.

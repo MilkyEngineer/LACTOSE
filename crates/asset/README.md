@@ -666,11 +666,11 @@ Everything is at target `silo` (`LOG_TARGET`), the store's codename (architectur
   `app-server` resolves a real region's set, a decision is needed between loaders that
   keep nothing and publication from the index alone (milestone 3;
   `docs/verification.md`).
-- **Watching a directory** for the cooker's output (milestone 2, with the `io` request
+- **Watching a directory** for the cooker's output (milestone 3, with the `io` request
   `crates/io/README.md` names). Until then whoever knows the cooker ran calls `mount`.
   The watch must leave the store naming what a fresh process mounting the cooked pack
   set ("Mounting") would name, with no version the set shadows named in between; how is
-  milestone 2's to decide (D147).
+  milestone 3's to decide (D147, D153).
 - **Unmounting, and merging packs.** One descriptor and one index per mount until the
   store is dropped; a long dev session's mount count against the process's descriptor
   limit is a verification row.

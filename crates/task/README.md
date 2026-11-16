@@ -241,8 +241,8 @@ worker count. No scheduler can beat either, so the ratio is 1.0 for an ideal one
 benchmark computes both from the durations it drew.
 
 The makespan ratio is measured on three graph shapes, each with job durations drawn
-log-uniformly from 10 µs to 1 ms, and each with and without two background threads running
-zstd compression:
+log-uniformly from 10 µs to 1 ms, and each with and without two tasks of the background class
+compressing with zstd:
 
 | Shape | Description |
 |---|---|

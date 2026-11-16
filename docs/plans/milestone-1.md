@@ -1,6 +1,7 @@
 # Milestone 1 plan: World
 
-Status: approved by the owner on 14 November 2026 (D139). Written at main `3264406`, architecture revision 3.2.
+Status: approved by the owner on 14 November 2026 (D139); exited on 16 November 2026 (section 7).
+Written at main `3264406`, architecture revision 3.2.
 This plan maps each milestone 1 criterion of architecture section 22, and every
 `docs/verification.md` row that gates milestone 1, to a lane, the coordinator or the owner. It
 orders the lanes that remain and takes the decisions that order needs. It proposes two
@@ -274,12 +275,15 @@ session A's files.
   holds `caffeinate -i -s`, and `cargo xtask measure --all` runs once. A number measured under
   agent load stays in a lane's report: it steers, and it proves nothing.
 - *Session B*, the owner's, at the same commit. On the x86 desktop, on each operating system it
-  boots: `cargo xtask measure --all`, and the spike's recording tests, whose hashes the result
-  file compares with the nightly's. The owner commits the files it writes, or sends them back. Its
-  run of the 100k tick on eight frame workers is criterion 1's proof.
+  boots: `cargo xtask measure --all`, and the recording tests' hashes, written by
+  `cargo xtask sour run --mode architecture --emit` and compared with a reference file by
+  `cargo xtask sour compare`. No result file compares hashes; `docs/plans/milestone-2.md`,
+  decision 5.19, names the reference. The owner commits the files it writes, or sends them
+  back. Its run of the 100k tick on eight frame workers is criterion 1's proof.
 
 D151 takes sessions A and B out of milestone 1's exit: the owner closed the milestone on the Mac on
-16 November 2026. Both run in milestone 2's one desktop sitting, each at the commit given above.
+16 November 2026. Both run in milestone 2, in the desktop's first sitting, at that sitting's one
+commit (D151's addendum; `docs/plans/milestone-2.md`, decision 5.19).
 What they close there is the x86 half of milestone 0's criteria and the x86 figures of criteria 1,
 4, 6 and 9. Milestone 1's criteria rest on the quiet windows. Where sections 1 and 2 name session B
 as what closes a criterion or a row, the quiet window closes it for milestone 1, row 125's x86-64
@@ -816,6 +820,22 @@ Milestone 1 exits when these have happened, in this order.
 7. The follow-up project review reads the determinism and readiness seams at that commit. Its
    blocking and serious findings are fixed or routed before step 8.
 8. The planner writes the milestone 2 plan.
+
+**The exit, as it happened.** Steps 1 to 7 were complete at main `a561b36` on 16 November 2026 UTC.
+Step 1: the quiet windows at `bef3455` and `c50b688`, with the `whisk` file re-taken at `0ec2d90`
+and the `spike-net` file at `8941997`. Step 2: D146. Step 3: every queue drained, `lactose-rhi-api`
+and `lactose-rhi-null` having moved to milestone 2 (D139, D140). Step 4: every row gated at 1 is
+Done. Step 5: the criteria review read `8941997` and found no criterion not met. Criteria 2, 3 and 8
+are met; 5 and 7 are met as restated (D143, D139); 1 is met as restated by D139 and D151, and 9 by
+decision 5.9, D149 and D151; 4 and 6 are met on the M1, their x86 half moved by D151. Of milestone
+0's carried criteria, the makespan, the wake and the steal are met on the M1, and tick start as
+restated at 35 µs (D138); Windows' tick start, held to 1 ms (D144), is the desktop's. So step 6 had
+nothing to rule on. Step 7: the follow-up project review read `4ffcd62`. Its findings and the
+criteria review's were fixed by lanes `exit-docs` (`d7f3e3b`) and `exit-tooling` (`a561b36`), or
+went to architecture revision 3.4 (D152) and to the milestone 2 plan. Step 8 is
+`docs/plans/milestone-2.md`, re-based on `a561b36`. Every M1 file the exit rests on was taken under
+macOS 14.7.4, and both reviews ran there; the Mac moves to macOS 27.2.1 after it. What the exit
+leaves open is the x86 half: the verification row "The x86 half of milestones 0 and 1 (D151)".
 
 ## 8. For revision 3.3
 

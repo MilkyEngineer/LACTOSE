@@ -4,10 +4,11 @@ LACTOSE: Lock-free Asynchronous Chunked Task-Oriented Simulation Engine.
 Its deterministic simulation core is CURD: Concurrent Unified Runtime, Deterministic.
 LACTOSE sets the CURD.
 
-Status: design baseline, revision 3.3, after three adversarial reviews and an editorial pass;
+Status: design baseline, revision 3.4, after three adversarial reviews and an editorial pass;
 revision 3.3 settles what the whole-project review of milestone 1 found against this document
 and writes in the rulings of `docs/plans/milestone-1.md`: how milestone 1's criteria are read,
-what moves to later milestones, and the workflow in force. Every section is a decision,
+what moves to later milestones, and the workflow in force; revision 3.4 follows milestone 1's
+exit and states where what a world registers may be declared (D152). Every section is a decision,
 not a suggestion. Change a decision by editing this file in the same change that implements it, and record why
 in `docs/decisions-log.md`.
 This file states what is decided. `docs/decisions-log.md` records why, which review finding
@@ -88,7 +89,10 @@ may depend on which. This document describes it; the file decides. CI enforces i
 
 **The determinism boundary is a crate boundary.** A crate is inside or outside. Crates that
 would straddle it are split: `net` (outside) and `predict` (inside), `game-sim` and
-`game-present`, `nav` and `nav-query`. Section 8.1 lists the inside crates.
+`game-present`, `nav` and `nav-query`. Section 8.1 lists the inside crates. What a world
+registers, stores and runs is held to section 8.2 wherever it is declared: a crate outside that
+must declare some of it carries the boundary lint file, and a system that writes hashed state
+is declared in a library, never in a binary (sections 8.1 and 8.3, D152).
 
 **Things you run get names, things you import get descriptions.** Codenames from the glossary
 (section 23) appear on binaries, tools, log targets, CI jobs, README titles and headings,
@@ -543,7 +547,7 @@ to other bytes than its export read (D142).
 
 ### 8.1 The boundary
 
-Inside: the `[boundary]` list in `crate-tiers.toml`, which is authoritative. At revision 3.3
+Inside: the `[boundary]` list in `crate-tiers.toml`, which is authoritative. At revision 3.4
 that is `core`, `math`, `ecs`, `sim`, `anim`, `predict`, `nav-query`, `physics-api`,
 `physics-rapier`, `bundle`, `input`, `net-api`, `game-sim`, `game-ai` and `game-content`. Gameplay
 particles that
@@ -553,6 +557,19 @@ derive, so `reflect` supplies metadata only and never sits on a determinism path
 
 Outside: everything else, including `net` (transport, RTT, interpolation buffer),
 presentation, pose evaluation, VFX, audio, UI, asset IO timing and input sampling.
+
+What a world registers, stores and runs is held to every rule of section 8.2, those that review
+holds included, whichever side its crate is on. That is every `#[system]`, a pass system
+included, every `#[component]` or `#[resource]` that is not `derived`, every implementation of
+`SessionApplier`, `InputApplier` or `StagedState`, every hand-written `impl Reflect`, and the
+setup and migration functions of a `CrateRegistration`. Each is declared in a boundary crate,
+in a crate outside it that carries the boundary lint file (section 8.3), or in test code alone.
+Carrying the file brings no crate inside. The dependency allowlist does not bind a carrier, so
+review holds what its declared code calls; its other code is outside, and where that code must
+reach the outside world it takes a local exception with its reason. A pass system runs once a
+frame with the whole world, whether or not a tick ran, so it leaves the world hash as it found
+it: it writes no hashed column and nothing a tick's systems read. No tool checks that; the lane
+that adds a pass system proves it with a recorded test (D152).
 
 ### 8.2 Rules inside the boundary
 
@@ -723,12 +740,35 @@ xtask vendor` for each crate built from `vendor/` (section 8.2): offline, the co
 applied to its record and the patch is within the rule; online, the record is re-derived from the
 crates.io archive and the advisory check runs over the upstream versions, which `cargo-deny` skips
 behind a path source. The two proc-macro crates carry the boundary `clippy.toml` as well, since the
-code they emit is compiled inside boundary crates, and `lactose-app-headless` carries it for its
-sketch game; `[lint_file_carriers]` in `tools/xtask/ci-policy.toml` lists the three.
+code they emit is compiled inside boundary crates. So does each crate outside the boundary that
+declares what a world registers (section 8.1): `lactose-present-api` for the presentation
+components and extract's pass system, and `lactose-app-headless` for its sketch game until that
+moves into `game-sim` at milestone 2, after which no binary is a carrier (D152).
+`[lint_file_carriers]` in `tools/xtask/ci-policy.toml` lists the carriers, and a crate joins it in
+the change that adds its first such declaration. `cargo xtask boundary` reports, in the shipped
+sources of any other crate outside the boundary, a `#[system]`, a `#[component]` or `#[resource]`
+that is not `derived`, an `impl` of `SessionApplier`, `InputApplier` or `StagedState`, and a
+hand-written `impl Reflect`, which declares a component or a resource that no attribute shows.
+Shipped sources are the crate's module tree without what only tests, benches and examples compile:
+its `cfg(test)` items, `tests/`, `benches/`, `examples/`, the build script, and items behind a
+feature that `[dev_only_features]` lists. Attributes and traits are matched by the last segment of
+their path as written, so one brought in under another name, written by a macro the crate's source
+does not spell out, or inside a `cfg_attr`, is not seen. `Component` and `Resource` implementations
+are not matched, since the renderer's GPU traits share the names. A setup or a migration function
+is not matched, nor is a tick-stage system told from a pass system. Review holds what the check
+does not see.
 `cargo xtask boundary` holds every entry of the reference `clippy.toml`, and its table, to the
 lists in `tools/xtask`, and `[harness]` in
 `tools/xtask/ci-policy.toml` to the packages that include the harness protocol;
 `cargo xtask sour run` holds the tests that record hashes to the list beside it.
+A test runs under the modes above only when it takes its configuration from the harness session and
+records its hashes through it, whichever package holds it. So every system that writes a hashed
+column is declared in a library, and runs on rows in at least one test that links that library and
+records through the session; that test's package is listed under `[harness]`. A copy of a system in
+test code is not that system, and a test can run a binary's system only as a copy. A test that
+steps a world and records nothing runs once, under one configuration, and proves no determinism. No
+tool reports a system that no recorded test runs: the review of the lane that adds the system does
+(D152).
 No custom lint crate. Miri runs on nightly as the one exception to the stable-toolchain rule.
 Because Cargo resolves features per build, CI dumps `cargo tree -e features` for the boundary
 dependencies of each shipped binary, the SOUR test crate among them, and requires them
@@ -1390,21 +1430,34 @@ in the expansion against the final type, never by what the macro parsed;
 
 | # | Name | Delivers | Proves |
 |---|---|---|---|
-| 0 | Skeleton | Workspace, CI matrix, `core` with tagged allocator, `math`, `task`, `reflect`, `asset-api`, `bundle`, tracing, SOUR scaffold, `ecs` facade with the section 6.1 API | Makespan divided by its lower bound (the larger of the duration-weighted critical path and total work divided by worker count) at most 1.25 at P50 and 1.5 at P99 on three DAG shapes (wide-shallow, deep chain, fan-in-fan-out) with log-uniform job durations from 10 µs to 1 ms, with and without two background zstd threads, on a developer M-series Mac and an x86 desktop. Tick-start latency, from a tick deadline to the timer root resuming, under 35 µs at P99 (D138), and under 1 ms on Windows, where the finest timed wait a waker can end overshoots by about half a millisecond (D144); wake latency from an idle pool under 35 µs at P99; steal under 1 µs. Latch and sleep-wake pass loom; `task` and `ecs` pass Miri. |
+| 0 | Skeleton | Workspace, CI matrix, `core` with tagged allocator, `math`, `task`, `reflect`, `asset-api`, `bundle`, tracing, SOUR scaffold, `ecs` facade with the section 6.1 API | Makespan divided by its lower bound (the larger of the duration-weighted critical path and total work divided by worker count) at most 1.25 at P50 and 1.5 at P99 on three DAG shapes (wide-shallow, deep chain, fan-in-fan-out) with log-uniform job durations from 10 µs to 1 ms, with and without two background zstd tasks, on a developer M-series Mac and an x86 desktop. Tick-start latency, from a tick deadline to the timer root resuming, under 35 µs at P99 (D138), and under 1 ms on Windows, where the finest timed wait a waker can end overshoots by about half a millisecond (D144); wake latency from an idle pool under 35 µs at P99; steal under 1 µs. Latch and sleep-wake pass loom; `task` and `ecs` pass Miri. |
 | 1 | World | Sim track: `ecs`, `sim`, `physics-api` plus `physics-rapier`, `anim`, `predict`, `persist` (policy, records, container), `asset-api`, `net-api` and `input` types, headless `app`. Render track: RHI spike. Asset track: `io`, `asset`, `cook` skeleton. | 100k entities simulate a tick in at most 4 ms on 8 performance cores; SOUR passes in workers, repeat, layout and chaos modes. Physics snapshot conformance. Physics phase at most 3 ms for 2,000 awake bodies; prediction-world snapshot at most 100 µs; sim-skeleton evaluation at most 0.5 ms for 200 characters. Netcode spike over a throwaway transport: x86 server, aarch64 client, one predicted character, run as a dynamic capsule and as a kinematic body, fifty claimed dynamic bodies thrown and interacting, and a claim of a body in contact; correction rate under the section 9.4 tolerance, the largest difference the tolerance absorbed per kind, rollback cost per tick and divergence recorded as the baseline that milestone 4's threshold is judged against. Scalar decided by the section 16 rule. Edit-to-playing at most 30 s per platform. |
 | 2 | Pixels | `platform`, `rhi-api`, `rhi-null`, `rhi-vulkan`, `render-graph`, minimal `renderer`, Slang toolchain, `present-api`, presentation snapshot and schedule | A triangle through the graph on Windows and macOS. MoltenVK, KosmicKrisp and native Metal spikes recorded, and `rhi-api` frozen or amended on their findings. Overlap with exclusive extract; extract at most 1 ms for 50k dirty rows; remote transform upload at most 1 ms for 5k entities at 144 Hz. lavapipe CI; macOS shader runner. |
 | 3 | GPU-driven | GPU scene with cell-plus-offset, cluster submission, culling, deferred tile-local lighting, streaming regions with `persist` overlay against the cooked baseline, `terrain`, pose evaluation, `rhi-metal` | 500k instances through compacted index buffers with one indexed indirect draw per pipeline, at most 2 ms GPU on RTX 3060-class and 4 ms on M1-class at 1440p, on Vulkan and Metal. Regions persist across unload and reload. Skinned characters on terrain. |
 | 4 | Network | `net`, interest management, bandwidth prioritisation, reconciliation, resync, late join, client and server `app`, SOUR architecture mode on every PR | Thirty-two simulated clients joining and leaving under injected latency and loss, with the server tick under 16 ms and each joining client converged within 2 s. A recorded server session replayed on aarch64 hashes equal. Solo traversal over static geometry at 100 ms round trip with 1% loss produces fewer than one correction per minute. |
 | 5 | Game | `game-sim`, `game-present`, `audio`, `ui`, `nav`, input mapping, `debug-ui` | A playable slice: terrain, climbing, physics objects, co-op interaction, gamepad, sound. |
 
+Milestone 1 exited on 16 November 2026, with milestone 0's carried criteria, on the Apple M1's
+files under macOS 14.7.4 (`docs/plans/milestone-1.md`, section 7); the x86 half of both is read
+on the desktop in milestone 2 (D151). Milestone 0's two zstd loads are tasks of the background
+class, as the engine runs background CPU work (section 5.1). On the M1 they run on the
+efficiency cores and barely reach the frame workers. On a hybrid part under Windows the
+background class sets thread priority alone, and steering there is an open verification item.
+On a part with no efficiency cores they are two low-priority threads beside the frame workers,
+the harder case. The desktop's first file says which part it is (D152).
+
 Milestone 1's criteria are read as follows (D139). Each timing criterion has its own
 workload. The 100k tick runs on eight frame workers, one for each of eight performance
 cores: on a hybrid part, physical cores of the fastest class, a core's hardware threads
 counted once; on a part that reports no core types, eight of its physical cores. A tick inside
 the budget on fewer performance cores meets the criterion, on the reading that more frame
-workers do not lengthen it, and milestone 1's is the M1's on four (D151). The tick excludes
-the physics phase, which is measured on its own scene, and the world hash, which SOUR pays at
-every step and a shipped binary only when it asks. The prediction-world snapshot is the world
+workers do not lengthen it, and milestone 1's is the M1's on four (D151). The tick excludes the
+physics phase, which is measured on its own scene, and the world hash, which SOUR pays at every
+step and a shipped binary only when it asks. The composed tick, the same scene with the 2,000
+bodies beside it, is read by no criterion: it takes 5,772.5 µs on the M1's four frame workers
+and projects to 4,433.1 µs on eight (`docs/results/composed-tick-apple-m1-2026-11-15.md`). The
+eight-core figure the desktop gives for the tick is therefore of the tick alone, and no budget
+for a frame that steps physics (D152). The prediction-world snapshot is the world
 snapshot and the physics snapshot of one ring slot, with the drop of the world snapshot and
 the physics snapshot the ring evicts for it, on the netcode spike's thrown scene among the
 fixed colliders and proxies section 10 admits; the slot's record of the claimed entities and

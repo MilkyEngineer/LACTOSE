@@ -1,9 +1,10 @@
 # Proposal: artist-defined surfaces behind fixed pipelines
 
 Status: proposal, not applied; `docs/architecture.md` section 12.5 ("No free-form artist
-shaders") stands until it is decided. It is decided with the milestone 2 Slang toolchain
-spike, whose brief takes this file as input and whose measurements are the verification
-items below: adopted as an amendment to sections 12.2, 12.5 and 14 with a numbered decision
+shaders") stands until it is decided. It is decided at milestone 3, with deferred lighting
+on `rhi-metal`, where a G-buffer pass exists (D153); milestone 2's lane `slang` proves the
+mechanism it rests on. Its measurements are the verification items below, and it is either
+adopted as an amendment to sections 12.2, 12.5 and 14 with a numbered decision
 entry in the merge commit, or declined with the reason recorded in the decisions log. Nothing
 in the sim track changes meanwhile.
 
@@ -87,6 +88,6 @@ surface that fails to link is a cook error, never a runtime fallback.
 
 | Item | Gates milestone |
 |---|---|
-| Surface dispatch: the cooked switch over N surfaces against a Slang function-table build on native Metal and on MoltenVK, at N = 1, 16 and 128, measuring G-buffer pass time and pipeline creation time; the switch is the design unless the table wins on both backends | 2 |
+| Surface dispatch: the cooked switch over N surfaces against a Slang function-table build on native Metal and on MoltenVK, at N = 1, 16 and 128, measuring G-buffer pass time and pipeline creation time; the switch is the design unless the table wins on both backends | 3 |
 | Divergence: G-buffer pass cost with triangles sorted by surface within a pipeline versus unsorted, on a scene with 64 surfaces, on RTX 3060-class and M1-class | 3 |
-| `SurfaceSample` layout: the struct the G-buffer packs and the forward path consumes is decided with the Slang spike and frozen before the first cooked surface; a change afterwards is a cook break | 2 |
+| `SurfaceSample` layout: the struct the G-buffer packs and the forward path consumes is decided with the Slang spike and frozen before the first cooked surface; a change afterwards is a cook break | 3 |

@@ -1,6 +1,6 @@
 # LACTOSE
 
-Revision marker: architecture 3.3. At task start run `git show HEAD:CLAUDE.md | head -3` and
+Revision marker: architecture 3.4. At task start run `git show HEAD:CLAUDE.md | head -3` and
 confirm the marker matches this text; if not, read the file on disk, not this copy.
 
 Rust game engine. Read `docs/architecture.md` before any task. It is binding. `docs/decisions-log.md`
@@ -52,3 +52,9 @@ as elsewhere; a test or bench target may carry one.
   explicit field IDs, typed reference fields and a persistence policy.
 - Panics abort in binaries. Tests run under nextest, one process per test, with no abort hook.
 - Systems use the `#[system]` macro of architecture section 6.1 and declare the worlds they run in.
+- What a world registers is held to section 8.2's rules wherever it is declared, and is declared in
+  a `[boundary]` crate or a crate of `[lint_file_carriers]` in `tools/xtask/ci-policy.toml`, or in
+  tests alone: a `#[system]`, a `#[component]` or `#[resource]` that is not `derived`, an applier, a
+  hand-written `impl Reflect`, a registration's setup and migration functions. A system that writes
+  hashed state is declared in a library and runs in a test that links it and records under SOUR
+  (architecture sections 8.1 and 8.3).
