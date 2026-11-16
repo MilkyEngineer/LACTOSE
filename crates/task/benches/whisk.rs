@@ -877,16 +877,22 @@ fn cpu_name() -> String {
                 "ProcessorNameString",
             ],
         )
-        .and_then(|output| {
-            let line = output.lines().find(|line| line.contains("REG_SZ"))?;
-            Some(line.split_once("REG_SZ")?.1.trim().to_owned())
-        })
-        .filter(|name| !name.is_empty())
+        .and_then(|output| registry_value(&output, "ProcessorNameString"))
         .or_else(processor_identifier)
     } else {
         processor_identifier()
     };
     name.filter(|name| !name.is_empty()).unwrap_or_else(|| "unknown CPU".to_owned())
+}
+
+/// The data of the value `name` in `reg query`'s output: what follows its type on the line
+/// that names it. The same function as `cargo xtask measure`'s, whose unit test covers it: a
+/// benchmark without the test harness runs no test, and cannot depend on the tool.
+fn registry_value(output: &str, name: &str) -> Option<String> {
+    let line = output.lines().map(str::trim).find(|line| line.starts_with(name))?;
+    let (_, data) = line.split_once("REG_SZ")?;
+    let data = data.trim();
+    (!data.is_empty()).then(|| data.to_owned())
 }
 
 /// Windows's description of the processor, such as `Intel64 Family 6 Model 154 Stepping 3,
