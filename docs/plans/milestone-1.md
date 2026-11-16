@@ -47,7 +47,8 @@ Section 22 gives milestone 1 nine criteria. Status is what the tree and CI show 
 Of what section 22 says milestone 1 delivers, the simulation track's crates are merged, with
 `lactose-ecs` still the naive single-job runner. `lactose-io` is merged. `lactose-asset` is a
 merged facade whose implementation is in flight. `tools/cook` cooks a sim skeleton from glTF into
-one pack (`ricotta`, D147); the RHI spike and `lactose-rhi-null` are not started.
+one pack (`ricotta`, D147). The RHI spike ran under MoltenVK on the M1
+(`docs/results/spike-rhi-apple-m1-2026-11-15.md`); `lactose-rhi-null` is not started.
 
 ## 2. The verification rows
 
@@ -142,7 +143,7 @@ The lanes that follow, in the order their dependencies allow:
 | `ricotta` | The RICOTTA skeleton in `tools/cook`: inputs, processors behind `asset-api`'s traits, one pack out, the cooked pack set's naming rule (D147). One kind cooked end to end, chosen in its brief: `lactose-anim`'s kinds have cooked formats today, and no authored scene format exists for a baseline | `schema-digest` merged | A pack `ricotta` wrote mounts in SILO, and its assets load and pin. Cooking the same inputs twice writes the same bytes. Row 133's milestone 1 half | 7 |
 | `schema-guard` | A committed record of each saved type's version and layout digest, and the test that fails on a digest changed without a version bump and on a field ID reused | `schema-digest` merged | Section 15's "CI rejects ID reuse" becomes true: both mutations fail | 5 |
 | `scalar-probe` | The precision probe of decision 5.4, and the readings for row 41 | None | Result file `scalar-precision` | 4 |
-| `spike-rhi` | The RHI spike (decision 5.10), under MoltenVK on the M1 | The GPU reviewer defined (approved by the owner, not yet in `.claude/agents/`); the Vulkan SDK on the development Mac, which the owner installs | Result file `spike-rhi`, each "no" marked as MoltenVK's or as a design question | 4 |
+| `spike-rhi` | The RHI spike (decision 5.10), under MoltenVK on the M1 | The GPU reviewer defined (`.claude/agents/reviewer-gpu.md`); the Vulkan SDK on the development Mac (1.4.363.1) | Result file `spike-rhi`, each "no" marked as MoltenVK's or as a design question | 4 |
 | `rhi-api` | Architect: the facade of `lactose-rhi-api`, unstable until the native Metal spike (D43), with its conformance suite's shape | `spike-rhi` merged; the owner's ruling on the move to milestone 2 (decision 5.10) | A facade; the reviewer and the GPU reviewer both read it | 7 |
 | `rhi-null` | `lactose-rhi-null` against the facade | `rhi-api` merged; revision 3.3's ruling on whether the server links it (C2) | The conformance suite passes on the null backend; it stays test support (`crate-tiers.toml`) | 7 |
 | `data-path` | A container's sections checked against each other and its header (finding D3). A zero-size field refused at registration (finding D4). The migrate, rebase and bundle sequence tested for a type the baseline carries (finding D5). The reading for row 42 | None | The review's three probes as tests | 7 |

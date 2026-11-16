@@ -72,3 +72,4 @@ Run on a quiet machine: the numbers are wall-clock.
 |---|---|---|
 | Scalar precision (`scalar-precision-<machine>-<date>.md`) | The probe crate the file carries (manifest and source; the lock file is not carried, so pin the versions the file lists), built outside the workspace: `cargo build --release --manifest-path <probe>/Cargo.toml` from the repository root, then `<probe>/target/release/scalar-probe` | Architecture section 16; `docs/plans/milestone-1.md`, decision 5.4 |
 | The spike's wake (`spike-wake-<machine>-<date>.md`) | Milestone 0's spike, as the file says | The file |
+| The RHI spike (`spike-rhi-<machine>-<date>.md`) | A throwaway program outside the repository, never committed; the file names its hash, the SDK, MoltenVK and macOS versions, the environment and the commands | `docs/plans/milestone-1.md`, decision 5.10; D139 |
