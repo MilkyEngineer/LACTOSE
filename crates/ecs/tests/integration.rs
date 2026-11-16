@@ -1,4 +1,4 @@
-//! The integration tests of `lactose-ecs` as one test binary (D125): each file beside this one is a
+//! The integration tests of `lactose-ecs` as one test binary (D150): each file beside this one is a
 //! module of it, named after the file. `common`, the support they share, is declared once here.
 //! `alloc.rs`, `channel_skip.rs`, `ownership.rs` and `units.rs` are targets of their own, for the
 //! reasons `Cargo.toml` gives.

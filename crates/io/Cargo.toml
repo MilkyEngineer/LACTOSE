@@ -28,7 +28,7 @@ zstd.workspace = true
 lactose-asset-api.workspace = true
 
 # The integration tests as one test binary, whose root declares the files of tests/ as
-# modules (D125).
+# modules (D150).
 [[test]]
 name = "integration"
 path = "tests/integration.rs"

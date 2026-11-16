@@ -42,7 +42,7 @@ jobs:
             miriflags: -Zmiri-tree-borrows -Zmiri-ignore-leaks
           # `lactose-ecs` in four: the tests of its slowest test file, the binaries of their own
           # (`ownership`, the next slowest, among them), every other test, and the doc tests,
-          # which cargo runs alone. Its other integration tests are one binary (D125), so the
+          # which cargo runs alone. Its other integration tests are one binary (D150), so the
           # first and third entries divide the tests of the targets they select by path: the
           # third skips the filter the first names, which `cargo xtask boundary` checks.
           - name: ecs, erased rows

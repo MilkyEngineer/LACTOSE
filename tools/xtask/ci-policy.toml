@@ -98,7 +98,7 @@ tests = [
 [miri_split]
 packages = ["lactose-ecs"]
 
-# D125: a package with more than one integration test file builds them as one test binary,
+# D150: a package with more than one integration test file builds them as one test binary,
 # the target `integration`, whose root `tests/integration.rs` declares every other file of
 # `tests/` as a module named after the file (`autotests = false` in the manifest), or under a
 # name for what it holds, with `#[path]`, where the file's name is a codename (CLAUDE.md,

@@ -60,7 +60,7 @@ pub struct Policy {
     /// run each of their tests exactly once.
     pub miri_split: Vec<String>,
     /// The test targets that stay binaries of their own beside a package's `integration`
-    /// (D125), each as `package::target`.
+    /// (D150), each as `package::target`.
     pub separate_test_targets: Vec<String>,
 }
 

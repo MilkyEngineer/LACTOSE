@@ -18,7 +18,7 @@ of a manifest it writes under the target directory.
 | Command | Enforces |
 |---|---|
 | `tiers` | `crate-tiers.toml` against the workspace (architecture section 3) |
-| `boundary` | the file facts of the determinism boundary and the unsafe policy, the nightly Miri job's split of a package, and one test binary per package (sections 8.2, 8.3, 20, 21; D125) |
+| `boundary` | the file facts of the determinism boundary and the unsafe policy, the nightly Miri job's split of a package, and one test binary per package (sections 8.2, 8.3, 20, 21; D150) |
 | `features` | identical boundary feature trees across shipped binaries, and the same features for every package two roots share where one is a harness package (section 8.3) |
 | `vendor` | each crate built from `vendor/` is its patch applied to its record, the patch is within the rule, the record is the crates.io archive's, and the advisory check covers the upstream versions (sections 8.2, 8.3) |
 | `sour run`, `sour compare`, `sour self-test`, `sour matrix` | SOUR, the determinism harness (section 8.3) |
@@ -226,7 +226,7 @@ on, and a listed feature the crate does not declare are findings.
   `cargo test --no-run --test` on cargo 1.99.0, and a set of them on both cargos. A value that
   selects nothing, which cargo refuses, is reported, as is a pattern with a path separator,
   which the check does not read.
-- One test binary per package (`src/test_targets.rs`, D125): a package with more than one
+- One test binary per package (`src/test_targets.rs`, D150): a package with more than one
   integration test file builds them as one target, `integration`, whose root
   `tests/integration.rs` declares every other file of `tests/` as a module, with
   `autotests = false` in the manifest; a package of one test file may leave it a target under

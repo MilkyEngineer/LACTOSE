@@ -12,7 +12,7 @@
 //! workspace member with a plain `-p NAME`, and its targets with `--lib`, `--test` and `--doc`
 //! (a package outside `[miri_split]` may name none). After a `--`, libtest's arguments may
 //! name tests by what their paths contain, and skip them with `--skip`: a package's tests are
-//! divided by test and not by target where its integration tests are one binary (D125). Two
+//! divided by test and not by target where its integration tests are one binary (D150). Two
 //! entries that select a target with filters run each of its tests once, whatever the tests
 //! are called, only when one names filters and the other skips each of them, and that is the
 //! one division of a target the check accepts. Each filter is `<module>::`, a module the root
@@ -1334,7 +1334,7 @@ mod tests {
         ])
     }
 
-    /// The split of one test binary by filter, as nightly runs `lactose-ecs` (D125).
+    /// The split of one test binary by filter, as nightly runs `lactose-ecs` (D150).
     fn filter_split() -> String {
         nightly(&[
             &["name: core", "args: -p lactose-core"],
