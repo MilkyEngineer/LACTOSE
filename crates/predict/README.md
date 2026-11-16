@@ -247,8 +247,9 @@ step and rebuilds the world there ("Reconciliation" below).
   (the byte form's first quiet window,
   `1d8042e:docs/results/prediction-slot-apple-m1-2026-11-15.md`): over the budget. The
   physics part of a slot is therefore a copy the backend makes (D143). Taken into a full ring,
-  each part's eviction inside its timer, the copied slot took 90.0 µs to snapshot and 76.5 µs
-  to restore, each the median of 200 rounds, in the second quiet window
+  each part's eviction inside its timer, the copied slot took 90.0 µs to snapshot, the sum of
+  its parts' medians over 200 rounds, and 76.5 µs to restore, the median of 200 rounds, in the
+  second quiet window
   (`docs/results/prediction-slot-apple-m1-2026-11-15.md` at `c50b688`): criterion 5 is met.
   `crates/predict/tests/cost.rs` times `World::snapshot` and `physics_api::snapshot` with the
   physics test backend, for fifty claimed dynamic bodies plus 0 to 10,000 statics, and says

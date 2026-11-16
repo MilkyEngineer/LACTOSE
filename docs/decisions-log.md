@@ -4977,8 +4977,9 @@ relayed by an event when it acts on another body** (§6.1, §10, `lactose-ecs`,
   macOS 14.7 and before that machine is upgraded. An x86 failure found in the sitting joins
   D151's finding and opens no second attempt. The rule is otherwise as decided: one attempt, or
   tick start restated at 35 µs.
-- Addendum (lane `keeper`, 2026-11-16): *the attempt did not reach 20 µs, so tick start is
-  restated at 35 µs at P99 on macOS and Linux.* The hypothesis was wrong. On a probe build, 43 of
+- Addendum (lane `keeper`, 2026-11-16; milestone 1 exit, 2026-11-16): *the attempt did not
+  reach 20 µs, so tick start is restated at 35 µs at P99 on macOS and Linux.* The hypothesis
+  was wrong. On a probe build, 43 of
   the keeper's 3,020 park exits (1.4%) came from a timed wait that passed the deadline, and the
   P99 of the park's exit lateness over all its exits was 4.6 µs, while the task's P99 was
   26.5 µs. Timing probes place the lost time after the park, in one stall of about 13 to 28 µs
@@ -6426,10 +6427,11 @@ process state; the nightly Miri filters name modules that Miri compiles** (§20,
   check 5:38, 3:48, 5:40 and 5:15. The median of the three most recent is 9:04 on Windows,
   7:28 on macOS and 5:15 on Ubuntu; of all four, 9:06, 6:47.5 and 5:26.5. Before the merge the
   Windows check took 11:39, 11:22 and 9:30 (runs 43781979172, 43795852109 and 43799365983, of
-  which the first and the last were full matches): the median since is 26 s under the last
-  full match before the merge, and the conversion's gain on the Windows runner is no larger
-  than the runs' own spread. No check job's median passes ten minutes, so the milestone 2
-  plan's question 6, which its decision 5.15 asks only when one does, is not due.
+  which the first and the last were full matches): the median of the three most recent is
+  26 s under the last full match before the merge, and the conversion's gain on the Windows
+  runner is no larger than the runs' own spread. No check job's median passes ten minutes, so
+  the milestone 2 plan's (branch `milestone-2-plan`) question 6, which its decision 5.15 asks
+  only when one does, is not due.
 
 **D151. Milestone 1 closes on the Mac: criterion 1 is met by the M1's run on four performance cores, and the x86 half of milestones 0 and 1 is settled in milestone 2's desktop sitting** (§20, §22, `lactose-task`, `docs/plans/milestone-1.md`, `docs/plans/close-on-mac.md`, `docs/results`)
 - Why: milestone 1's exit waited on two sittings at the owner's x86 desktop, session A for the
