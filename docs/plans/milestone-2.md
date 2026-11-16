@@ -78,6 +78,10 @@ of its new text.
 | 34 | MoltenVK multi-draw-indirect is a CPU loop | `measure-m2` | `gpu-cost`: one multi-draw of N commands against N draws under MoltenVK, beside a reading of the pinned MoltenVK |
 | 35 | Slang's Metal target supports argument buffers, function constants and framebuffer fetch | `spike-metal`, `slang` | The spike's shaders are MSL the Slang compiler emitted and use all three. The cooker's are then held by a pipeline state made from each: on the M1 from the cooked MSL, compiled through Metal at run time, and on the runner from the metallib |
 | 63 | Windows efficiency-core steering | `eco-qos` | The benchmark's rows with two background threads, before and after, on the laptop, which is a hybrid part |
+| 64 | `lld-link` on Windows | Session B, in session C's sitting | The desktop's edit-to-playing file under each system it boots, at most 30 s (D151) |
+| 77 | Wake latency against the 20 µs P99 criterion | Session A, in session C's sitting | The desktop's `whisk` file: the wake from an idle pool under 35 µs at P99, with the makespan and the steal beside it. The laptop missed the first two (D151) |
+| 80 | The Linux and Windows core-topology parsers | Session A, in session C's sitting | The topology the desktop's files print (D151) |
+| 81 | Tick-start latency against the 20 µs P99 criterion | Session A, in session C's sitting, for the x86 half | The desktop's `whisk` file: under 1 ms at P99 on Windows (D144), and on its other system under 20 µs, or under 35 µs if D138 has restated it |
 | 95 | `lactose-input` is implemented | `presentation` | The camera rig's forward and yaw equal `PlayerInput::aim` and `Yaw::rotation` for pinned samples |
 | 97 | Artist-defined surfaces behind fixed pipelines | Re-gated to 3 | Decision 5.14. `slang` proves the mechanism only |
 | 99 | `lactose-predict` is implemented | `presentation` | A re-spawned body without `Teleported` interpolates between two snapshots, and one with it does not |
@@ -89,7 +93,8 @@ of its new text.
 | 140 | Mount cost | Re-gated to 3 | The owner's answer 4: D149 sends the Linux and Windows figure to the watch loop's dev session |
 | 143 | The cooked pack set of a fresh process | Re-gated to 3 | The owner's answer 4: the watch's half |
 | 150 | The RHI spike ran under MoltenVK alone | `vulkan` | The suite under lavapipe settles the spike's eight design questions where lavapipe can: it has one coherent memory type and one queue. The four questions the spike left to hardware are probed on the laptop's devices and recorded, and a run that shows nothing discharges no rule of null (decision 5.17). Question 2 needs a lazily allocated memory type, which lavapipe and the PC drivers surveyed do not offer: KosmicKrisp answers it on the M1 if it offers one, and `spike-metal` answers it for Metal |
-| 164 | The keeper's timed wait on Windows | `frame-design` | Its second half asks that the unmeasured list be read where frame pacing on Windows is designed. `frame-design` reads it. An item its design uses becomes a measurement it names for `measure-m2`, and the rest is re-gated with its reason |
+| 164 | The keeper's timed wait on Windows | `frame-design`; session A, in session C's sitting | Its second half asks that the unmeasured list be read where frame pacing on Windows is designed. `frame-design` reads it. An item its design uses becomes a measurement it names for `measure-m2`, and the rest is re-gated with its reason. Its first half, the desktop's Windows `whisk` file, is session A's (D151) |
+| added by D151 | The x86 half of milestones 0 and 1 | Sessions A and B, in session C's sitting; the planner on a miss | Every criterion sessions A and B read passes on the desktop, the labelled laptop's misses first, or the planner brings a remedy and the owner rules on it at this plan's exit step 7 |
 
 ## 3. The lanes
 
@@ -192,7 +197,10 @@ review and their answers (6), its re-base at approval and that diff's review (2)
 (3), the freeze decision (3) and the exit (8, as milestone 1 counted its own: two criteria
 reviewers, and the milestone 3 plan with its reviews and answers). The whole is about 190 runs
 at two fix rounds a lane, and about 230 if a third of the lanes take four or five.
-Question 6's split, if it is asked, adds five.
+Question 6's split, if it is asked, adds five. D151 adds none: the sitting is the owner's, and
+its rows close in the coordinator's pass. A miss on the desktop adds the planner's remedy, about
+four runs for a proposal with its review, its answer and its application, and seven more if the
+remedy is a lane.
 
 The longest chain is `spike-metal`, `rhi-api`, `slang`, `vulkan`, `renderer-impl`, `frame-impl`,
 `measure-m2`: 63 runs, and about 65 where `graph-impl`'s device tests wait on `vulkan`. `slang`
@@ -243,7 +251,7 @@ Seven rules bind whatever the coordinator reorders:
 |---|---|---|
 | The development Mac: Apple M1, four performance and four efficiency cores, on macOS 26 from milestone 2's first lane, with the Vulkan SDK's MoltenVK and KosmicKrisp, its validation layer, and the Xcode current for macOS 26, each re-checked after the upgrade (section 9) | MoltenVK and KosmicKrisp under the Khronos layer, Metal API validation and Metal shader validation. A window and a present, and a headless surface. The native Metal spike. Cooked MSL compiled through Metal at run time, and a metallib built with Xcode's `metal`. A buffer in device-only memory. A hazard between the host and the GPU, with the GPU made to lag. Timing in a quiet window | macOS 14, the oldest client the cook targets: nothing in reach runs it once the Mac is upgraded. A missing barrier between two GPU uses, by pixels: Metal orders tracked resources itself. GPU-assisted validation under MoltenVK, which cannot compile it; under KosmicKrisp it is not known |
 | The Windows laptop: Intel i7-12650H, six performance and four efficiency cores, an RTX 4070 laptop GPU and, it is expected, an Intel integrated one, Windows 11, driven through its own agent session | Vulkan on a discrete GPU and the Win32 swapchain. The triangle on Windows. GPU-assisted validation. The cost of a write-combined ring. The power-throttling setting on a hybrid part. Frame pacing on Windows | Section 20's x86 desktop figures, which are session C's (the owner's answer 2). Memory that is not coherent, or lazily allocated: no PC driver surveyed offers either. Its figures are labelled |
-| The desktop: the owner's, eight or more performance cores, booting Windows and another system (D144). Its CPU model, its GPU and its other system are unknown until milestone 1's session A returns | The x86 desktop figures section 20 asks for. A second discrete GPU | Anything without the owner at it |
+| The desktop: the owner's, eight or more performance cores, booting Windows and another system (D144). Its CPU model, its GPU and its other system are unknown until its sitting, where milestone 1's session A returns them (D151) | The x86 desktop figures section 20 asks for, and the x86 half of milestones 0 and 1 (D151). A second discrete GPU | Anything without the owner at it |
 | linux-x64 runner: no GPU | lavapipe, a CPU rasteriser: the conformance suite and the device tests under the pinned validation layer on every pull request, and under GPU-assisted validation nightly | Timing. Tile memory. A vendor's driver. A window. Two queues or an ownership transfer: Mesa's source gives lavapipe one queue and one coherent memory type |
 | windows-x64 runner: no GPU, no Vulkan driver | The build, the lints and the tests on null | Any Vulkan call. The Win32 path runs on the laptop alone |
 | macos-arm64 runner: Xcode, a virtual GPU | Cooking metallibs (criterion 7). Its oldest image is the one place a metallib can be loaded on an older macOS | Timing. Whether it runs Metal or MoltenVK tests, and what its oldest image offers, is `gpu-probe`'s to find |
@@ -262,8 +270,11 @@ Seven rules bind whatever the coordinator reorders:
   (the owner's answer 2).
 - *Session C*, the owner's, at the same commit, on the desktop under each system it boots: the
   same command. Its `extract-50k` and `remote-upload-5k` files are the x86 desktop's figures.
-  Whatever of milestone 1's sessions A and B is still owed runs in the same sitting, at their own
-  commits. Under a system that is not a client platform, the measurements that need a window
+  Milestone 1's sessions A and B run in the same sitting, at their own commits (D151): session
+  A's WHISK benchmark and `lactose-task` tests, for the x86 half of milestone 0's criteria, and
+  session B's `cargo xtask measure --all`, for the x86 figures of milestone 1's. The row "The
+  x86 half of milestones 0 and 1" holds what they settle, the labelled laptop's misses first.
+  Under a system that is not a client platform, the measurements that need a window
   are skipped and the file says so.
 
 Only session C needs the owner at a desk. The laptop's runs need the laptop awake with its agent
@@ -989,7 +1000,7 @@ Each change is its gate and the gist of its new text. Rows are cited at `0810f9f
 | 140, Mount cost | 2 and 3 to 3 | The Linux and Windows figure is taken with the watch loop's dev session, at milestone 3 |
 | 143, The cooked pack set | 2 to 3 | The watch's half is milestone 3's |
 | 150, The RHI spike ran under MoltenVK alone | 2 | Closed by lane `vulkan`: the design questions lavapipe can answer from its run; the four hardware questions probed on the laptop's devices and recorded, a run that shows nothing discharging no rule of null; device-only staging as a case on the M1; question 2 answered under KosmicKrisp on the M1 if that driver offers a lazily allocated type, and open on Vulkan if not |
-| 164, The keeper's timed wait on Windows | 1 and 2 | The list is read by `frame-design`: an item its design uses becomes a measurement it names, and the rest is re-gated with its reason |
+| 164, The keeper's timed wait on Windows | 2 | The list is read by `frame-design`: an item its design uses becomes a measurement it names, and the rest is re-gated with its reason. D151 has already moved the desktop's file to gate 2 |
 
 Rows to add:
 
@@ -1032,7 +1043,8 @@ with `frame-design`.
 Milestone 2 exits when these have happened, in this order.
 
 1. The measurement commit exists. The quiet window, the laptop's session and session C have run
-   on it, and their result files are on main.
+   on it, and their result files are on main. Milestone 1's sessions A and B have run in session
+   C's sitting, and their files are on main too (D151).
 2. Every queue of section 3 has drained, so section 22's delivers are on main: `platform`,
    `rhi-api`, `rhi-null`, `rhi-vulkan`, `render-graph`, the minimal `renderer`, the Slang
    toolchain, `present-api`, and the presentation snapshot and schedule.
@@ -1044,7 +1056,9 @@ Milestone 2 exits when these have happened, in this order.
 5. The planner has written the freeze decision (decision 5.13), and the owner has approved it.
 6. A `reviewer` and a `reviewer-gpu` read each of the seven criteria against its test and its
    result file. They report one verdict for each: met; met as restated, naming the decision; or
-   not met. They re-run what they can on the M1 and state what they could not.
+   not met. They re-run what they can on the M1 and state what they could not. They read the
+   row "The x86 half of milestones 0 and 1" against sessions A and B's files the same way
+   (D151).
 7. The owner rules on every "not met": another lane, or a restatement recorded in the decisions
    log. Milestone 2 does not exit on an unrecorded miss. Whether a project review reads the
    render seams at that commit, as one read milestone 1's, is asked then.
@@ -1075,16 +1089,18 @@ Revision 3.4 is the planner's pass after this plan is approved. It must settle t
 
 ## 9. What depends on milestone 1's exit
 
-This plan assumes milestone 1's criteria are met as written, with one exception a file on main
-already shows: tick start on the M1 is 27.0 µs at P99 against 20
-(`docs/results/whisk-apple-m1-2026-11-15.md`), which `keeper` fixes or D138 restates at 35 µs.
-Nothing in milestone 2 reads the difference.
+This plan assumes milestone 1's criteria are met on the M1, as D151 closed the milestone there:
+criterion 1 by the M1's direct run on four performance cores, and the x86 half of milestones 0
+and 1 left to session C's sitting. One exception a file on main already shows: tick start on the
+M1 is 27.0 µs at P99 against 20 (`docs/results/whisk-apple-m1-2026-11-15.md`), which `keeper`
+fixes or D138 restates at 35 µs. Nothing in milestone 2 reads the difference.
 
 **Between milestone 1's exit and milestone 2's first lane**, in this order (the owner's answers 1,
 5 and the added one):
 
-1. Milestone 1's exit is recorded, on macOS 14.7, the system its figures were taken on. `keeper`
-   has run or tick start is restated by then, since its question is of that system.
+1. Milestone 1's exit is recorded, on macOS 14.7, the system its figures were taken on. It does
+   not wait for sessions A and B (D151). `keeper` has run or tick start is restated by then,
+   since its question is of that system.
 2. The owner upgrades the Mac to macOS 26.
 3. The owner installs the Xcode current for macOS 26, and its Metal toolchain if that Xcode
    installs it as a component of its own.
@@ -1110,11 +1126,11 @@ stands with no comparison, and the owner is told.
 |---|---|
 | Lane `test-binaries` merges (D125), and each check job's median over its three most recent warm runs of main is read | No milestone 2 lane starts before the merge: it edits every crate's tests and `tools/xtask`. The medians are the CI budget milestone 2 starts from; if one is past ten minutes, question 6 is asked before the first crate lane is pushed. Its rule, and what it rules for a recording target, bind every crate milestone 2 adds |
 | The re-run on macOS 26 moves a figure across a milestone 1 criterion. The margins are thin for the prediction slot, 90.0 µs against 100, and the wake from an idle pool, 31.6 µs against 35 | The owner rules: a restatement, or a lane. A lane in `lactose-task`, `lactose-predict` or `lactose-physics-rapier` runs beside milestone 2's and edits none of its crates |
-| Criterion 1, the 100k tick on eight performance cores, is not proven: session B has not run. If it misses, the owner rules for another ECS lane or a restatement | An ECS lane edits `lactose-ecs` first; `present-impl` waits behind it. Section 4's arithmetic for extract assumes the ECS at the speed `tick-100k` measured on the M1 under macOS 14.7 |
-| Tick start: `keeper` runs after session A's files, or the criterion is restated | `keeper` edits `lactose-task`. `eco-qos` waits behind it, and `frame-design` reads its outcome for frame pacing |
-| Criterion 9, edit-to-playing on Windows and Linux, is session B's. Over thirty seconds brings a build-time proposal | That proposal can change the workspace's build layout, and decision 5.15's figure is read again with it |
-| Session A returns the desktop's CPU, GPU and second system | Section 4's desktop row, and what session C can run under the second system |
-| Rows that wait on the desktop or on `keeper`: 64, 94, 123, 133, 149, and 77, 79, 80, 81 and 164's first half. The owner may re-gate any of them at exit step 6 | A row re-gated to 2 joins section 2's table. Session C can carry sessions A and B's commands |
+| Criterion 1 is met on the M1 by its run on four performance cores (D151). The run on eight is session B's, in session C's sitting, and the laptop's 4,689.9 µs on six is part of the finding. If the desktop misses, the planner brings a remedy and the owner rules: another ECS lane, or a restatement | The miss is known at the measurement commit, not before the first lane. An ECS lane then edits `lactose-ecs` under the one-lane rule. Section 4's arithmetic for extract assumes the ECS at the speed `tick-100k` measured on the M1 under macOS 14.7 |
+| Tick start: `keeper` runs before the exit, without session A's files (D151), or the criterion is restated | `keeper` edits `lactose-task`. `eco-qos` waits behind it, and `frame-design` reads its outcome for frame pacing |
+| Criterion 9, edit-to-playing on Windows and Linux, is session B's, in session C's sitting (D151). Over thirty seconds brings a build-time proposal | That proposal can change the workspace's build layout, and decision 5.15's figure is read again with it |
+| Session A runs in session C's sitting (D151), so the desktop's CPU, GPU and second system are not known before it unless the owner sends them ahead. At this plan's re-base the owner is asked two things D151 left open: whether the sitting is one commit, with milestone 1's x86 figures read from session C's files, and whether to sit before the measurement commit | Section 4's desktop row, and what session C can run under the second system. One commit for the sitting changes D144's commit for the desktop's Windows `whisk` file and session B's. An earlier sitting brings an x86 miss of a milestone 1 criterion forward |
+| D151 closes rows 94, 123, 133 and 149 on the M1 and gates at 2 the desktop's part of rows 64, 77, 80, 81 and 164, with a row of its own for the x86 half. Rows 79 and 81's M1 half wait on `keeper` | The rows gated at 2 are in section 2's table. Session C's sitting carries sessions A and B's commands |
 | Row 167, the physics hash, waits on the first nightly at or after `10cf89e` | A difference between platforms is a finding in `lactose-physics-rapier` and reaches no milestone 2 lane |
 | Exit step 7, the follow-up project review of the determinism and readiness seams | Its findings in `lactose-app`, `lactose-predict`, `lactose-ecs` or `lactose-net-host` are fixed or routed before `frame-design`, `present-impl`, `presentation` and `interp-loom` start |
 | Another decision is applied before this plan | The decision numbers of section 6 |
