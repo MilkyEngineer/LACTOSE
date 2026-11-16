@@ -311,6 +311,7 @@ disallowed-methods = [
   # x86-64; `allow-invalid` keeps the aarch64 builds quiet. No 32-bit x86 target is built.
   { path = "core::arch::x86_64::__cpuid", reason = "reads the CPU it runs on; section 8.2 bans run-time detection that selects numerically different paths", allow-invalid = true },
   { path = "core::arch::x86_64::__cpuid_count", reason = "reads the CPU it runs on; section 8.2 bans run-time detection that selects numerically different paths", allow-invalid = true },
+  { path = "core::arch::x86_64::__get_cpuid_max", reason = "reads the CPU it runs on; section 8.2 bans run-time detection that selects numerically different paths", allow-invalid = true },
   # Architecture sections 5.1 and 8.2: a boundary crate creates no thread outside an
   # executor. Parallel work goes through `lactose_task`'s executor, under its determinism and
   # chaos model, and the physics step through the solver pool of section 16. Clippy matches

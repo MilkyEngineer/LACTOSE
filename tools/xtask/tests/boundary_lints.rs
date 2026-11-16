@@ -8,7 +8,8 @@
 //! are in the registry cache wherever this package is built (the physics backend compiles
 //! them). The same probe proves the run-time CPU feature detection of the target it is built
 //! for refused under `disallowed-macros` (section 8.2), by the root path as by `std::arch`, and
-//! on x86-64 CPUID read directly, by its `core` path, its `std::arch` re-export and a rename.
+//! on x86-64 CPUID read directly, by its `core` path, its `std::arch` re-export, a rename and
+//! `__get_cpuid_max`.
 
 #![forbid(unsafe_code)]
 
@@ -32,7 +33,7 @@ fn write(path: &Path, contents: &str) {
 /// per route of D119 banned by trait path, inherent method of a dependency or type, and the
 /// feature detection macro of the target. A line whose path is empty compiles to nothing on
 /// this target.
-const REFUSED: [(&str, &str); 105] = [
+const REFUSED: [(&str, &str); 106] = [
     ("use num_traits::Float;", "num_traits::Float"),
     ("pub fn generic<T: num_traits::real::Real>(x: T) -> T { x.sin() }", "num_traits::real::Real"),
     (
@@ -294,6 +295,10 @@ const REFUSED: [(&str, &str); 105] = [
     (
         "#[cfg(target_arch = \"x86_64\")] pub fn renamed() -> u32 { use std::arch::x86_64::__cpuid as id; id(0).eax }",
         if X86_64 { "core::arch::x86_64::__cpuid" } else { "" },
+    ),
+    (
+        "#[cfg(target_arch = \"x86_64\")] pub fn max7() -> u32 { core::arch::x86_64::__get_cpuid_max(7).1 }",
+        if X86_64 { "core::arch::x86_64::__get_cpuid_max" } else { "" },
     ),
 ];
 

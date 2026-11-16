@@ -57,7 +57,7 @@ const PIN_FLAGS: [&str; 2] = ["-C", "target-cpu=x86-64-v3"];
 /// reference and every copy is reported, and so is one moved to another table, where clippy
 /// no longer applies it, or one added without being pinned here. `allow-invalid` keeps clippy
 /// quiet about an entry whatever happens to it, and no test uses most of them.
-const REQUIRED_LINT_PATHS: [&str; 277] = [
+const REQUIRED_LINT_PATHS: [&str; 278] = [
     "f32::min",
     "f32::max",
     "f32::clamp",
@@ -302,6 +302,7 @@ const REQUIRED_LINT_PATHS: [&str; 277] = [
     "std::net::ToSocketAddrs::to_socket_addrs",
     "core::arch::x86_64::__cpuid",
     "core::arch::x86_64::__cpuid_count",
+    "core::arch::x86_64::__get_cpuid_max",
     "std::time::Instant",
     "std::time::SystemTime",
     "std::collections::HashMap",
@@ -1197,8 +1198,9 @@ fn simulation_assets(tiers: &TierFile, ws: &Workspace, files: &Files, findings: 
 /// stands, unless only tests compile it.
 ///
 /// The shipped code is read as [`simulation_assets`] reads it, and attributes and traits by
-/// their last path segment as written: one brought in under another name, or written by a
-/// macro or inside a `cfg_attr`, is not seen.
+/// their last path segment as written: one brought in under another name, produced by a macro
+/// the crate's source does not spell out (another crate's macro or derive), or inside a
+/// `cfg_attr`, is not seen.
 fn registered_outside_the_lint_file(
     tiers: &TierFile,
     policy: &Policy,
