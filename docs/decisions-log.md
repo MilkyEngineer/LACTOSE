@@ -6418,6 +6418,18 @@ process state; the nightly Miri filters name modules that Miri compiles** (§20,
     at the merged shape, by cargo's own figure. The base run started at load 2.59; the merged
     run started at 8.41 and reached 76.07 by its end. The figure is indicative only; the Windows
     check job's time on the first CI runs after the merge decides.
+- Addendum (milestone 1 exit, 2026-11-16): *the check jobs' times after the merge.* The merge's
+  own run failed and `d7a0088` fixed it. The four runs of main since, 43827738169,
+  43855576989, 43868030471 and 43872419194 (`d7a0088`, `eca4e0f`, `8941997`, `4ffcd62`),
+  restored every check job's cache by a full match. In minutes and seconds, the Windows check
+  took 9:08, 9:04, 9:38 and 7:20, the macOS check 6:07, 5:38, 8:23 and 7:28, and the Ubuntu
+  check 5:38, 3:48, 5:40 and 5:15. The median of the three most recent is 9:04 on Windows,
+  7:28 on macOS and 5:15 on Ubuntu; of all four, 9:06, 6:47.5 and 5:26.5. Before the merge the
+  Windows check took 11:39, 11:22 and 9:30 (runs 43781979172, 43795852109 and 43799365983, of
+  which the first and the last were full matches): the median since is 26 s under the last
+  full match before the merge, and the conversion's gain on the Windows runner is no larger
+  than the runs' own spread. No check job's median passes ten minutes, so the milestone 2
+  plan's question 6, which its decision 5.15 asks only when one does, is not due.
 
 **D151. Milestone 1 closes on the Mac: criterion 1 is met by the M1's run on four performance cores, and the x86 half of milestones 0 and 1 is settled in milestone 2's desktop sitting** (§20, §22, `lactose-task`, `docs/plans/milestone-1.md`, `docs/plans/close-on-mac.md`, `docs/results`)
 - Why: milestone 1's exit waited on two sittings at the owner's x86 desktop, session A for the
