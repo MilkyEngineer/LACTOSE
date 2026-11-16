@@ -26,5 +26,12 @@ path = "tests/integration.rs"
 name = "harness_stand_in"
 path = "tests/harness_stand_in.rs"
 
+# A binary of its own ([test_targets] in tools/xtask/ci-policy.toml): it asserts when a slot's
+# lock is let go, and a process that another test of one binary spawns under `cargo test`
+# holds a copy of the lock until its exec.
+[[test]]
+name = "heavy"
+path = "tests/heavy.rs"
+
 [lints]
 workspace = true

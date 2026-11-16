@@ -138,4 +138,7 @@ separate = [
   "lactose-task::idle_cpu",
   # `cargo xtask sour self-test` builds this target alone, in a target directory of its own.
   "lactose-xtask::harness_stand_in",
+  # It asserts when a slot's lock is let go, and a process that another test of one binary
+  # spawns holds a copy of the lock until its exec.
+  "lactose-xtask::heavy",
 ]

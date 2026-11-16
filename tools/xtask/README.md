@@ -221,8 +221,9 @@ on, and a listed feature the crate does not declare are findings.
   support (`common`, `glue`) is declared once in the root, and a file reaches it as
   `crate::common`. The tests of one binary share a process under `cargo test` and
   `cargo miri test` (nextest alone gives each test its own), so a test file that installs what
-  a process has one of (a `#[global_allocator]`, the tracing subscriber), or measures what is
-  one per process (its CPU time, rayon's global pool), stays a binary of its own, as does a
+  a process has one of (a `#[global_allocator]`, the tracing subscriber), measures what is one
+  per process (its CPU time, rayon's global pool) or asserts when a file lock is let go (which
+  a process another test spawns holds until its exec), stays a binary of its own, as does a
   target a tool builds alone; each is listed in `[test_targets]` `separate` as
   `package::target` under its reason. The check walks each test target's module tree from its
   root as rustc resolves it (out-of-line and inline modules and literal `include!`s, each file

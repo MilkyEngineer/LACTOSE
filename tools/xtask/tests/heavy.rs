@@ -10,19 +10,30 @@ use std::io::{BufRead, BufReader, Read};
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
+use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use lactose_xtask::heavy::{self, HELD_VAR};
 
+/// A process one test spawns holds a copy of each descriptor of this one, a slot's lock among
+/// them, until its exec closes them, and under `cargo test` these tests share one process: a
+/// test that lets a slot go and expects it free would see it held by another test's child. The
+/// tests therefore run one at a time, each holding this through its `Scratch`.
+static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
+
 /// A temporary directory for one test's runs, removed on drop.
-struct Scratch(PathBuf);
+struct Scratch {
+    root: PathBuf,
+    _alone: MutexGuard<'static, ()>,
+}
 
 impl Scratch {
     fn new(name: &str) -> Self {
+        let alone = ONE_AT_A_TIME.lock().unwrap_or_else(PoisonError::into_inner);
         let root =
             std::env::temp_dir().join(format!("lactose-heavy-bin-{}-{name}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
-        Self(root)
+        Self { root, _alone: alone }
     }
 
     /// `cargo xtask heavy` with `args`, with this directory as its temporary directory.
@@ -32,9 +43,9 @@ impl Scratch {
             .arg("heavy")
             .args(args)
             // `std::env::temp_dir` reads `TMPDIR` on Unix and `TMP`, then `TEMP`, on Windows.
-            .env("TMPDIR", &self.0)
-            .env("TMP", &self.0)
-            .env("TEMP", &self.0)
+            .env("TMPDIR", &self.root)
+            .env("TMP", &self.root)
+            .env("TEMP", &self.root)
             // Set when these tests themselves run under `heavy`.
             .env_remove(HELD_VAR);
         command
@@ -47,13 +58,13 @@ impl Scratch {
 
     /// The slot directory the binary uses.
     fn slots(&self) -> PathBuf {
-        self.0.join("lactose-heavy")
+        self.root.join("lactose-heavy")
     }
 }
 
 impl Drop for Scratch {
     fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
+        let _ = fs::remove_dir_all(&self.root);
     }
 }
 
@@ -79,7 +90,7 @@ fn the_program_s_exit_status_is_heavy_s() {
         assert!(output.stdout.is_empty());
         assert!(stderr(&output).starts_with("heavy: slot 0 after "), "{}", stderr(&output));
     }
-    assert!(scratch.0.join("lactose-heavy").join("slot-0.lock").is_file());
+    assert!(scratch.root.join("lactose-heavy").join("slot-0.lock").is_file());
 }
 
 #[test]
@@ -223,5 +234,5 @@ fn a_bad_command_line_exits_2_without_taking_a_slot() {
         assert!(output.stdout.is_empty());
         assert!(stderr(&output).starts_with("heavy: "), "{}", stderr(&output));
     }
-    assert!(!scratch.0.join("lactose-heavy").exists());
+    assert!(!scratch.root.join("lactose-heavy").exists());
 }
