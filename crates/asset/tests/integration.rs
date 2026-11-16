@@ -8,13 +8,7 @@ mod common;
 
 mod baseline;
 mod conformance;
-mod failures;
 mod generation;
-mod locking;
-mod mounts;
-mod pack;
 mod pack_set;
-mod reads;
 mod settling;
 mod sketch;
-mod spans;

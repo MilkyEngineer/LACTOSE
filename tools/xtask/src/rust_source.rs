@@ -320,12 +320,13 @@ fn next_item_is_module(source: &str, from: usize) -> bool {
     i < bytes.len() && keyword(i, "mod")
 }
 
-/// An out-of-line module declaration, `mod name;`.
+/// A module declaration: out-of-line, `mod name;`, or inline, `mod name { ... }`.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub(crate) struct Module {
     /// The module's name.
     pub(crate) name: String,
-    /// The file a `path` attribute on it names, as written.
+    /// The file a `path` attribute on it names, or on an inline module the directory, as
+    /// written.
     pub(crate) path: Option<String>,
     /// Whether it is compiled only for tests (see [`items`]).
     pub(crate) test_only: bool,
@@ -377,11 +378,15 @@ pub(crate) struct Items {
     pub(crate) impls: Vec<Impl>,
     /// Each out-of-line module declaration, in order.
     pub(crate) modules: Vec<Module>,
+    /// Each inline module, `mod name { ... }`, in the order of its opening brace: its `path`
+    /// is the directory a `path` attribute on it names, as written, and its `inline` the
+    /// inline modules around it.
+    pub(crate) inline_modules: Vec<Module>,
     /// Each `include!` of a string literal, in order.
     pub(crate) includes: Vec<Include>,
 }
 
-/// The trait implementations, out-of-line modules and literal `include!`s of `source`. An
+/// The trait implementations, modules and literal `include!`s of `source`. An
 /// item is compiled only for tests if a `cfg` on it, on an item around it or at the top of
 /// the file holds only under `test` or a feature of `features` (`any` of such, or `all`
 /// with one).
@@ -459,6 +464,14 @@ pub(crate) fn items(source: &str, features: &[String]) -> Items {
                     }
                 }
                 b'{' => {
+                    if let Some(name) = &module {
+                        found.inline_modules.push(Module {
+                            name: name.clone(),
+                            path: path.clone(),
+                            test_only,
+                            inline: levels.iter().filter_map(|l| l.module.clone()).collect(),
+                        });
+                    }
                     let module = module.map(|name| InlineModule { name, path: path.take() });
                     levels.push(Level { test_only, module, implementation: opened, nesting });
                     nesting = 0;
@@ -896,6 +909,13 @@ mod tests {
                 module("j", None, false, &[]),
             ]
         );
+        // The inline modules themselves, each with the ones around it, and no other block.
+        assert_eq!(
+            found(source, &[]).inline_modules,
+            [module("g", Some("../gen"), false, &[]), module("h", None, false, &["g=../gen"])]
+        );
+        let source = "#[cfg(test)]\nmod t { fn f() { if x {} } impl X {} }\nstruct S {}\n";
+        assert_eq!(found(source, &[]).inline_modules, [module("t", None, true, &[])]);
     }
 
     #[test]

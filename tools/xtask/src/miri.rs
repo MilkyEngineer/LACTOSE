@@ -15,7 +15,9 @@
 //! divided by test and not by target where its integration tests are one binary (D125). Two
 //! entries that select a target with filters run each of its tests once, whatever the tests
 //! are called, only when one names filters and the other skips each of them, and that is the
-//! one division of a target the check accepts. The job's other steps are not read.
+//! one division of a target the check accepts. Each filter is `<module>::`, a module the root
+//! of a test target the entry selects declares, so that a renamed module fails the check
+//! rather than leaving its filter selecting nothing. The job's other steps are not read.
 //!
 //! The workflow is read as text, by a reader of the YAML the job is written in: block
 //! mappings and sequences, plain and quoted scalars on one line, plain scalars over several,
@@ -26,10 +28,11 @@
 //! name with none of `*?[]` exactly, any other as a pattern of the `glob` crate (see
 //! `Pattern`).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::policy::Policy;
 use crate::repo::Files;
+use crate::test_targets::root_modules;
 use crate::workspace::{Package, Workspace};
 use crate::{Finding, POLICY_FILE};
 
@@ -83,6 +86,10 @@ pub fn check(policy: &Policy, ws: &Workspace, files: &Files) -> Vec<Finding> {
         let found = match &entry.args {
             Some((line, args)) => words(args)
                 .and_then(|words| selected(ws, policy, &words))
+                .and_then(|(package, runs, filter)| {
+                    filters_name_modules(package, &runs, &filter, files)?;
+                    Ok((package, runs, filter))
+                })
                 .map_err(|message| format!("line {line}: the args of `{}`: {message}", entry.name)),
             None => Err(format!(
                 "line {}: the entry `{}` has no `args`, so it names no package",
@@ -270,7 +277,7 @@ fn counts(package: &Package, read: &[Read<'_, '_>], findings: &mut Vec<Finding>)
     if package.doctests {
         runs.insert(Run::Doc, Vec::new());
     }
-    for test in &package.tests {
+    for test in package.tests.keys() {
         runs.insert(Run::Test(test), Vec::new());
     }
     let mut named = false;
@@ -414,8 +421,8 @@ fn selected<'w>(
         if Pattern::is_pattern(text) {
             let pattern = Pattern::new(text)
                 .map_err(|e| format!("`--test {text}` is not a pattern cargo accepts: {e}"))?;
-            runs.extend(package.tests.iter().filter(|t| pattern.matches(t)).map(|t| Run::Test(t)));
-        } else if let Some(test) = package.tests.iter().find(|t| *t == text) {
+            runs.extend(package.tests.keys().filter(|t| pattern.matches(t)).map(|t| Run::Test(t)));
+        } else if let Some((test, _)) = package.tests.get_key_value(text) {
             runs.push(Run::Test(test));
         }
         if runs.len() == before {
@@ -425,6 +432,66 @@ fn selected<'w>(
     runs.sort();
     runs.dedup();
     Ok((package, runs, filter))
+}
+
+/// Checks that each libtest filter of an entry is `<module>::`, where the root of a test
+/// target the entry selects declares the module, so that a module renamed or removed fails
+/// here and does not leave the filter selecting nothing, or the tests moved to another entry.
+/// An entry that names no target selects every test target of its package.
+///
+/// # Errors
+/// A filter of another shape, and one whose module no root of a selected target declares.
+fn filters_name_modules(
+    package: &Package,
+    runs: &[Run<'_>],
+    filter: &Filter,
+    files: &Files,
+) -> Result<(), String> {
+    if filter.is_empty() {
+        return Ok(());
+    }
+    let targets: Vec<&str> = if runs.is_empty() {
+        package.tests.keys().map(String::as_str).collect()
+    } else {
+        runs.iter()
+            .filter_map(|run| match run {
+                Run::Test(name) => Some(*name),
+                Run::Lib | Run::Doc => None,
+            })
+            .collect()
+    };
+    let modules: BTreeSet<String> =
+        targets.iter().flat_map(|target| root_modules(&package.tests[*target], files)).collect();
+    for name in filter.names.iter().chain(&filter.skips) {
+        let module = name.strip_suffix("::").filter(|module| {
+            module.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+                && module.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        });
+        let Some(module) = module else {
+            return Err(format!(
+                "the filter `{name}` is not `<module>::`; a filter names a module the root of a \
+                 test target the entry selects declares, so that renaming it is caught"
+            ));
+        };
+        if targets.is_empty() {
+            return Err(format!(
+                "the filter `{name}` names a module, but the entry selects no test target whose \
+                 root could declare it"
+            ));
+        }
+        if !modules.contains(module) {
+            let roots = targets
+                .iter()
+                .map(|target| format!("`{}`", package.tests[*target]))
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(format!(
+                "the filter `{name}` names no module that {roots} declares, so it would select \
+                 no test of the module it was written for"
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// The words the run step's shell makes of `args`, which the workflow substitutes into the
@@ -1117,7 +1184,8 @@ mod tests {
 
     fn ecs(tests: &[&str]) -> Package {
         let mut ecs = package("lactose-ecs", &[]);
-        ecs.tests = tests.iter().map(|t| (*t).to_owned()).collect();
+        ecs.tests =
+            tests.iter().map(|t| ((*t).to_owned(), format!("crates/ecs/tests/{t}.rs"))).collect();
         ecs
     }
 
@@ -1132,12 +1200,22 @@ mod tests {
     }
 
     fn run_with(policy: &Policy, ecs: Package, nightly: &str) -> Vec<String> {
+        let mut core = package("lactose-core", &[]);
+        core.tests = [("t".to_owned(), "crates/core/tests/t.rs".to_owned())].into();
         let mut net_host = package("lactose-net-host", &[]);
-        net_host.tests = vec!["interpolation".to_owned()];
-        let members =
-            vec![package("lactose-core", &[]), ecs, net_host, package("lactose-task", &[])];
+        net_host.tests =
+            [("interpolation".to_owned(), "crates/net-host/tests/interpolation.rs".to_owned())]
+                .into();
+        let members = vec![core, ecs, net_host, package("lactose-task", &[])];
         let mut files = Files::default();
         files.insert(NIGHTLY, nightly);
+        // The roots whose modules the filters of the cases name.
+        files.insert("crates/core/tests/t.rs", "mod a;\n");
+        files.insert(
+            "crates/ecs/tests/integration.rs",
+            "mod erased_rows;\nmod events;\nmod ownership {}\n",
+        );
+        files.insert("crates/net-host/tests/interpolation.rs", "mod interp;\n");
         check(policy, &workspace(members), &files).iter().map(ToString::to_string).collect()
     }
 
@@ -1229,17 +1307,18 @@ mod tests {
         let text = filter_split().replace("  erased_rows:: ownership::", "  erased_rows::");
         assert_eq!(run(ecs(&ONE), &text).len(), 3);
         // Both entries filtered by name: a test that neither filter matches runs nowhere.
-        let text = filter_split().replace("--skip erased_rows:: --skip ownership::", "erased");
+        let text = filter_split().replace("--skip erased_rows:: --skip ownership::", "events::");
         assert_eq!(run(ecs(&ONE), &text).len(), 3);
         // One entry's filter alone runs part of a target.
         let text = filter_split().replace(
-            " --test integration --test alloc --\n              --skip",
-            " --\n              --skip",
+            "--lib --test integration --test alloc --\n              --skip erased_rows:: --skip \
+             ownership::",
+            "--lib --test alloc",
         );
         let found = run(ecs(&ONE), &text);
-        assert_eq!(found.len(), 2, "{found:?}");
+        assert_eq!(found.len(), 3, "{found:?}");
         assert_eq!(
-            found[1],
+            found[2],
             ".github/workflows/nightly.yml: the `miri` entries for `lactose-ecs` run of test \
              target `integration` only the tests whose paths contain `erased_rows::`, \
              `ownership::`, in `ecs, two` (line 13); run the rest in an entry that skips each of \
@@ -1248,8 +1327,8 @@ mod tests {
         // Three entries: the counts accept two, one naming and one skipping.
         let text = filter_split().replace(
             "          - name: ecs, doc\n",
-            "          - name: ecs, again\n            args: -p lactose-ecs --test integration \
-             -- x\n          - name: ecs, doc\n",
+            "          - name: ecs, again\n            args: '-p lactose-ecs --test integration \
+             -- events::'\n          - name: ecs, doc\n",
         );
         let found = run(ecs(&ONE), &text);
         assert!(found.len() == 1 && found[0].contains("in 3 entries"), "{found:?}");
@@ -1274,16 +1353,73 @@ mod tests {
         // beside one that runs the package whole drops nothing.
         let text = filter_split().replace(
             "- name: core\n            args: -p lactose-core\n",
-            "- name: core a\n            args: -p lactose-core -- a\n          - name: core b\n\
-             \x20           args: -p lactose-core -- --skip a\n",
+            "- name: core a\n            args: '-p lactose-core -- a::'\n          - name: core b\n\
+             \x20           args: '-p lactose-core -- --skip a::'\n",
         );
         let found = run(ecs(&["alloc", "integration"]), &text);
         assert!(found.len() == 1 && found[0].contains("split by target or filter"), "{found:?}");
         let text = filter_split().replace(
             "- name: core\n",
-            "- name: core a\n            args: -p lactose-core -- a\n          - name: core\n",
+            "- name: core a\n            args: '-p lactose-core -- a::'\n          - name: core\n",
         );
         assert_eq!(run(ecs(&["alloc", "integration"]), &text), [] as [&str; 0]);
+    }
+
+    #[test]
+    fn a_filter_names_a_module_of_a_target_the_entry_selects() {
+        const ONE: [&str; 2] = ["alloc", "integration"];
+        let finding = |text: &str| {
+            let found = run(ecs(&ONE), text);
+            assert_eq!(found.len(), 1, "{found:?}");
+            found[0].clone()
+        };
+        // Review round 1, S1: a module renamed under a filter of a package outside the split,
+        // whose entry would then run no test.
+        let text = filter_split().replace("-- interp::", "-- sequence_lock::");
+        assert_eq!(
+            finding(&text),
+            ".github/workflows/nightly.yml: line 24: the args of `net-host`: the filter \
+             `sequence_lock::` names no module that `crates/net-host/tests/interpolation.rs` \
+             declares, so it would select no test of the module it was written for"
+        );
+        // The same in the split, where the tests would move to the other entry unseen.
+        let text = filter_split()
+            .replace("  erased_rows:: ownership::", "  rows:: ownership::")
+            .replace("--skip erased_rows::", "--skip rows::");
+        let found = run(ecs(&ONE), &text);
+        assert_eq!(found.len(), 2, "{found:?}");
+        assert!(
+            found.iter().all(|f| f.contains("the filter `rows::` names no module")),
+            "{found:?}"
+        );
+        // A module of a target the entry does not select: `alloc`'s root declares none.
+        let text = filter_split().replace(
+            "--lib --test integration --test alloc --\n              erased",
+            "--lib --test alloc --\n              erased",
+        );
+        assert!(
+            finding(&text).contains(
+                "the filter `erased_rows::` names no module that `crates/ecs/tests/alloc.rs` \
+                 declares"
+            ),
+            "{text}"
+        );
+        // A filter that is not one module's path, and one where no test target is selected.
+        for (filter, message) in [
+            ("erased_rows", "the filter `erased_rows` is not `<module>::`"),
+            ("erased_rows::wide", "the filter `erased_rows::wide` is not `<module>::`"),
+            ("a::b::", "the filter `a::b::` is not `<module>::`"),
+            ("::", "the filter `::` is not `<module>::`"),
+        ] {
+            let text = filter_split().replace("-- interp::", &format!("-- {filter}"));
+            let found = finding(&text);
+            assert!(found.contains(message), "{filter}: {found}");
+        }
+        let text = nightly(&[&["name: e", "args: '-p lactose-ecs --lib -- erased_rows::'"]]);
+        assert!(
+            finding(&text).contains("the entry selects no test target whose root could declare"),
+            "{text}"
+        );
     }
 
     #[test]

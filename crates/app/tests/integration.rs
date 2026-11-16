@@ -17,7 +17,5 @@ mod protocol;
 
 mod cost;
 mod headless;
-#[path = "proof/main.rs"]
-mod proof;
 mod schema_record;
 mod spike;

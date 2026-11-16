@@ -24,7 +24,7 @@
 
 #![forbid(unsafe_code)]
 
-use crate::common;
+mod common;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Mutex, Once};

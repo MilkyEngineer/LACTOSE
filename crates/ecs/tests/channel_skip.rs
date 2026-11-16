@@ -5,7 +5,7 @@
 
 #![forbid(unsafe_code)]
 
-use crate::common;
+mod common;
 
 use std::sync::{Arc, Mutex};
 

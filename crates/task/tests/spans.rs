@@ -5,7 +5,7 @@
 
 #![cfg(not(feature = "loom"))]
 
-use crate::common;
+mod common;
 
 use core::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};

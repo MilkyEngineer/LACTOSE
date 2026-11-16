@@ -19,7 +19,7 @@ use lactose_persist::{Container, ContainerHeader, SchemaTable};
 use lactose_reflect::{Reflect, bytemuck};
 use lactose_sim::{RegionBundle, TickInput};
 
-use super::common::{Content, Counter, GAME, executor, load, server, step, table_of};
+use crate::common::{Content, Counter, GAME, executor, load, server, step, table_of};
 
 /// The save of `server` as `Headless::save` encodes it.
 fn encoded(executor: &Executor, server: Server) -> (Server, Result<Vec<u8>>) {

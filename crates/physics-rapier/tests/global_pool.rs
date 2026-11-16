@@ -13,7 +13,7 @@
 
 #![forbid(unsafe_code)]
 
-use crate::support;
+mod support;
 
 use support::*;
 

@@ -13,7 +13,6 @@ mod consumers;
 mod corrections;
 mod cost;
 mod hook;
-mod logs;
 mod physics;
 mod presentation;
 #[path = "sour.rs"]

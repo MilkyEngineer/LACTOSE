@@ -7,5 +7,4 @@
 mod common;
 
 mod sketch;
-mod spans;
 mod storage_full;

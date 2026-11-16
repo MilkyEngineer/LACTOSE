@@ -57,5 +57,32 @@ path = "tests/drop.rs"
 name = "index"
 path = "tests/index.rs"
 
+# Binaries of their own ([test_targets] in tools/xtask/ci-policy.toml): each installs the
+# process's tracing subscriber, which every test of one binary shares under `cargo test`
+# and `cargo miri test`.
+[[test]]
+name = "failures"
+path = "tests/failures.rs"
+
+[[test]]
+name = "locking"
+path = "tests/locking.rs"
+
+[[test]]
+name = "mounts"
+path = "tests/mounts.rs"
+
+[[test]]
+name = "pack"
+path = "tests/pack.rs"
+
+[[test]]
+name = "reads"
+path = "tests/reads.rs"
+
+[[test]]
+name = "spans"
+path = "tests/spans.rs"
+
 [lints]
 workspace = true

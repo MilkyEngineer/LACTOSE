@@ -36,5 +36,20 @@ path = "tests/integration.rs"
 name = "alloc"
 path = "tests/alloc.rs"
 
+# Binaries of their own ([test_targets] in tools/xtask/ci-policy.toml): each installs the
+# process's tracing subscriber, which every test of one binary shares under `cargo test`
+# and `cargo miri test`.
+[[test]]
+name = "channel_skip"
+path = "tests/channel_skip.rs"
+
+[[test]]
+name = "units"
+path = "tests/units.rs"
+
+[[test]]
+name = "ownership"
+path = "tests/ownership.rs"
+
 [lints]
 workspace = true

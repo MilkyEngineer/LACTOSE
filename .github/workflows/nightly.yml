@@ -40,21 +40,20 @@ jobs:
             args: -p lactose-task
             real_deque: "1"
             miriflags: -Zmiri-tree-borrows -Zmiri-ignore-leaks
-          # `lactose-ecs` in three: the tests of its two slowest test files, every other
-          # test, and the doc tests, which cargo runs alone. Its integration tests are one
-          # binary (D125), so the first two entries divide the tests of each target they
-          # select by path: the second skips each filter the first names, which `cargo xtask
-          # boundary` checks. `alloc` is a binary of its own (its global allocator).
-          - name: ecs, erased rows and ownership
+          # `lactose-ecs` in four: the tests of its slowest test file, the binaries of their own
+          # (`ownership`, the next slowest, among them), every other test, and the doc tests,
+          # which cargo runs alone. Its other integration tests are one binary (D125), so the
+          # first and third entries divide the tests of the targets they select by path: the
+          # third skips the filter the first names, which `cargo xtask boundary` checks.
+          - name: ecs, erased rows
             key: ecs
-            args: >-
-              -p lactose-ecs --lib --test integration --test alloc --
-              erased_rows:: ownership::
+            args: '-p lactose-ecs --lib --test integration -- erased_rows::'
+          - name: ecs, ownership and the binaries of their own
+            key: ecs-separate
+            args: -p lactose-ecs --test ownership --test alloc --test channel_skip --test units
           - name: ecs, the rest
             key: ecs-rest
-            args: >-
-              -p lactose-ecs --lib --test integration --test alloc --
-              --skip erased_rows:: --skip ownership::
+            args: '-p lactose-ecs --lib --test integration -- --skip erased_rows::'
           - name: ecs, doc
             key: ecs-doc
             args: -p lactose-ecs --doc

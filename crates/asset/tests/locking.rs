@@ -15,7 +15,7 @@
 
 #![forbid(unsafe_code)]
 
-use crate::common;
+mod common;
 
 use std::collections::HashMap;
 use std::fmt;

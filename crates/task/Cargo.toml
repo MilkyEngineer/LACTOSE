@@ -55,5 +55,18 @@ harness = false
 name = "integration"
 path = "tests/integration.rs"
 
+# A binary of its own ([test_targets] in tools/xtask/ci-policy.toml): it measures the
+# process's CPU time, which every test of one binary adds to under `cargo test`.
+[[test]]
+name = "idle_cpu"
+path = "tests/idle_cpu.rs"
+
+# A binary of its own ([test_targets] in tools/xtask/ci-policy.toml): it installs the
+# process's tracing subscriber, which every test of one binary shares under `cargo test`
+# and `cargo miri test`.
+[[test]]
+name = "spans"
+path = "tests/spans.rs"
+
 [lints]
 workspace = true

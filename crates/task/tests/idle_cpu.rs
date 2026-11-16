@@ -9,7 +9,7 @@
 // CPU time comes from `getrusage`, and Miri has neither it nor a real clock.
 #![cfg(all(unix, not(miri)))]
 
-use crate::common;
+mod common;
 
 use core::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};

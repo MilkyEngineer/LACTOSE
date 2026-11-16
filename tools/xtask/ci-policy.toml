@@ -87,21 +87,23 @@ tests = [
 # the entries that name such a package to run, together, each test of its library, of each of
 # its integration test targets and of its doc tests exactly once, so that a new test cannot
 # drop out of Miri unseen: one entry runs a target whole, or two divide it, one naming
-# libtest filters after `--` and the other skipping each of them with `--skip`. It reports an
-# empty list, and a package that two or more entries name by target or filter that the list
-# leaves out.
+# libtest filters after `--` and the other skipping each of them with `--skip`. A filter of
+# any entry is `<module>::`, where the root of a test target the entry selects declares the
+# module. It reports an empty list, and a package that two or more entries name by target or
+# filter that the list leaves out.
 [miri_split]
 packages = ["lactose-ecs"]
 
-# D125: each package builds its integration tests as one test binary, the target
-# `integration`, whose root `tests/integration.rs` declares every other file of `tests/` as a
-# module named after the file (`autotests = false` in the manifest), or under a name for what
-# it holds, with `#[path]`, where the file's name is a codename (CLAUDE.md, Names). `separate`
-# lists, as `package::target`, the test targets that must stay binaries of their own, each
-# under its reason. `cargo xtask boundary` reports a package with more than one test target
-# outside this list, an entry that names no test target, a file of `tests/` that cargo would
-# make a target (`*.rs`, `*/main.rs`) and no target compiles, and a module a test target's
-# root declares under a codename.
+# D125: a package with more than one integration test file builds them as one test binary,
+# the target `integration`, whose root `tests/integration.rs` declares every other file of
+# `tests/` as a module named after the file (`autotests = false` in the manifest), or under a
+# name for what it holds, with `#[path]`, where the file's name is a codename (CLAUDE.md,
+# Names). `separate` lists, as `package::target`, the test targets that must stay binaries of
+# their own, each under its reason: the tests of one binary share a process under `cargo test`
+# and `cargo miri test`. `cargo xtask boundary` reports a package with more than one test
+# target outside this list, an entry that names no test target, a file of `tests/` that cargo
+# would make a target (`*.rs`, `*/main.rs`) and no target compiles, and a module of a test
+# target whose name holds a codename.
 [test_targets]
 separate = [
   # A binary has one `#[global_allocator]`. Each of these installs its own to count
@@ -115,6 +117,25 @@ separate = [
   "lactose-net-host::interpolation_alloc",
   "lactose-persist::container",
   "lactose-physics-rapier::memory",
+  # Tests of one binary share a process under `cargo test` and `cargo miri test`, and each
+  # of these installs the process's one tracing subscriber and reads back what it saw.
+  "lactose-app::proof",
+  "lactose-asset::failures",
+  "lactose-asset::locking",
+  "lactose-asset::mounts",
+  "lactose-asset::pack",
+  "lactose-asset::reads",
+  "lactose-asset::spans",
+  "lactose-ecs::channel_skip",
+  "lactose-ecs::ownership",
+  "lactose-ecs::units",
+  "lactose-io::spans",
+  "lactose-predict::logs",
+  "lactose-task::spans",
+  # Each measures what is one per process: its CPU time, and whether rayon's global pool
+  # was started, which another test of the binary would add to or start.
+  "lactose-physics-rapier::global_pool",
+  "lactose-task::idle_cpu",
   # `cargo xtask sour self-test` builds this target alone, in a target directory of its own.
   "lactose-xtask::harness_stand_in",
 ]

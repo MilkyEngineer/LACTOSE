@@ -39,5 +39,12 @@ path = "tests/integration.rs"
 name = "requests"
 path = "tests/requests.rs"
 
+# A binary of its own ([test_targets] in tools/xtask/ci-policy.toml): it installs the
+# process's tracing subscriber, which every test of one binary shares under `cargo test`
+# and `cargo miri test`.
+[[test]]
+name = "spans"
+path = "tests/spans.rs"
+
 [lints]
 workspace = true

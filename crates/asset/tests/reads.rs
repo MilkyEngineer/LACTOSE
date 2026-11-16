@@ -3,7 +3,7 @@
 
 #![forbid(unsafe_code)]
 
-use crate::common;
+mod common;
 
 use common::capture::capture;
 use common::format::{index_range, reseal};

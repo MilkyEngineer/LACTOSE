@@ -16,7 +16,6 @@ mod copy;
 mod cost;
 mod determinism;
 mod events;
-mod global_pool;
 mod pool;
 mod queries;
 #[path = "sour.rs"]

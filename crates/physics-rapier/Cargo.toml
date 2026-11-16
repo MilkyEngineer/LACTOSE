@@ -50,5 +50,12 @@ path = "tests/integration.rs"
 name = "memory"
 path = "tests/memory.rs"
 
+# A binary of its own ([test_targets] in tools/xtask/ci-policy.toml): it asserts that
+# rayon's global pool, one per process, was never started, which any test of one
+# binary could start under `cargo test`.
+[[test]]
+name = "global_pool"
+path = "tests/global_pool.rs"
+
 [lints]
 workspace = true
