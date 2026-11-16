@@ -7,10 +7,13 @@
 # A copy checked out with CRLF (its blob stored CRLF, or a line of .gitattributes taking it
 # out of the rule on a host that converts) must still run, and refuse what git lists rather
 # than stop on a syntax error. In such a copy the next line leaves a carriage return in
-# `probe`, and the one after, whose own carriage return falls in its trailing comment, runs
-# this file again without them. Nothing above them may be a blank line or a command.
+# `probe`, and the three after, whose own carriage returns fall in their trailing comments,
+# run this file again without them. Run through standard input, such a copy cannot read
+# itself again and stops. Nothing above them may be a blank line or a command.
 probe=x
-[ "$probe" = x ] || { source_text=$(<"$0"); exec "$BASH" -c "${source_text//$'\r'/}" "$0"; } #
+if [ "$probe" != x ]; then source_text=$(<"$0") || source_text=''; fi #
+if [ "$probe" != x ] && [ -z "$source_text" ]; then echo "line-endings: cannot read $0 again to drop its carriage returns: run it as bash <path>" >&2; exit 2; fi #
+if [ "$probe" != x ]; then exec "$BASH" -c "${source_text//$'\r'/}" "$0"; fi #
 
 set -u
 
@@ -33,7 +36,7 @@ fi
 
 # The three shapes of tools/xtask/README.md, "Line endings"; everything else is refused.
 accepted() {
-  if [ "$attribute" = "$rule" ]; then
+  if [ "$attribute" = "$rule" ] && [ "$vendored" = no ]; then
     case "$index|$worktree" in
       'lf|lf' | 'lf|none' | 'none|lf' | 'none|none') return 0 ;;
     esac
@@ -49,17 +52,30 @@ say() {
   said=yes
 }
 
+# A name git quoted is not the name on disk, so it is not printed as an argument.
+renormalize() {
+  case "$path" in
+    '"'*) say "the index holds CR: git add --renormalize -- <name>, with the name git quoted above as it is on disk; a plain git add keeps the CR" ;;
+    *) say "the index holds CR: git add --renormalize -- $(printf %q "$path"); a plain git add keeps the CR" ;;
+  esac
+}
+
 # Every remedy that applies, the attribute's first: `git add --renormalize` stores LF only
-# under the rule. The last one is what no other remedy covers.
+# under the rule. A vendored file is refused only for its attribute, whose remedy comes
+# alone. The last one is what no other remedy covers.
 remedies() {
   said=no
-  if [ "$attribute" = -text ] && [ "$vendored" = no ] && [ "$index" != -text ]; then
+  if [ "$vendored" = yes ]; then
+    say "a vendored file whose attribute is not -text (D123): the vendor line is restored as the last line of the root .gitattributes that reaches it, and a .gitattributes under vendor/ that sets an attribute on it is removed"
+    return
+  fi
+  if [ "$attribute" = -text ] && [ "$index" != -text ]; then
     say "a \`-text\` or \`binary\` line of .gitattributes reaches this text file: narrow or remove the line"
   elif [ "$attribute" != "$rule" ] && [ "$attribute" != -text ]; then
     say "a line of .gitattributes takes this file out of the rule, or the rule's line is gone; on a host that converts, that is why its working tree is CRLF"
   fi
   case "$index" in
-    crlf | mixed) say "the index holds CR: git add --renormalize $path (a plain git add keeps the CR)" ;;
+    crlf | mixed) renormalize ;;
   esac
   if [ "$attribute" = "$rule" ] && [ "$index" = lf ]; then
     case "$worktree" in
@@ -98,7 +114,14 @@ while IFS= read -r line; do
   remedies
 done <<<"$listing"
 
-if [ "$refused" -ne 0 ]; then
+# Fail closed: a loop that stopped early (no temporary file for the here-string, or a stray
+# carriage return in this copy) or a counter that is not a number is not a pass.
+listed=$(printf '%s\n' "$listing" | wc -l | tr -d ' ')
+if ! [ "$read_count" -eq "$listed" ] 2>/dev/null; then
+  echo "line-endings: read $read_count of the $listed files git lists" >&2
+  exit 2
+fi
+if [ "$refused" != 0 ]; then
   echo "line-endings: $refused of $read_count files refused"
   exit 1
 fi

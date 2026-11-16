@@ -296,13 +296,14 @@ It accepts a file in one of three shapes and refuses every other:
 
 | Path | Attribute | Index | Working tree |
 |---|---|---|---|
-| any | `text=auto eol=lf` | `lf` or `none` | `lf` or `none` |
+| outside `vendor/` | `text=auto eol=lf` | `lf` or `none` | `lf` or `none` |
 | under `vendor/` | `-text` | any | any |
 | outside `vendor/` | `-text` | `-text` | any |
 
 `none` is a file with no line break, and `-text` in the index a file git reads as binary,
-which outside `vendor/` passes only under a `binary` line. That the vendor line exists is
-`vendor`'s check. A file of a kind named `binary` whose bytes git reads as text is refused,
+which outside `vendor/` passes only under a `-text` or `binary` line. Under `vendor/` the
+script asks only for `-text`; that the root file's vendor line exists is `vendor`'s check as
+well. A file of a kind named `binary` whose bytes git reads as text is refused,
 and the change that adds it admits its path in the script.
 
 Each refusal prints `path: i/<index> w/<worktree> attr/<attribute>` and, below it, every
@@ -311,9 +312,15 @@ under the rule:
 
 - Attribute `-text` outside `vendor/` over an index that is not `-text`: a `-text` or
   `binary` line reaches a text file, and is narrowed or removed.
+- A path under `vendor/` whose attribute is not `-text`: the vendor line is restored as the
+  last line of the root `.gitattributes` that reaches it, and a `.gitattributes` under
+  `vendor/` that sets an attribute on it is removed (D123). For a vendored file this remedy
+  is printed alone.
 - Any other attribute: a line takes the file out of the rule, or the rule's line is gone.
   On a host that converts, that is why its working tree is CRLF.
-- Index `crlf` or `mixed`: `git add --renormalize <path>`; a plain `git add` keeps the CR.
+- Index `crlf` or `mixed`: `git add --renormalize -- <path>`, the path quoted for the shell;
+  a plain `git add` keeps the CR. A name git printed quoted is not repeated as an argument,
+  since its quoting is git's, not the shell's.
 - Working tree `crlf` or `mixed` over an index `lf`, under the rule: the checkout predates
   the rule, or a CRLF edit was committed. With nothing uncommitted and no merge in progress,
   `git rm --cached -r -q :/` then `git reset --hard` refresh it; `git add --renormalize`,
@@ -330,8 +337,10 @@ under the rule:
 
 The last line is `line-endings: <n> files read, none refused` with exit status 0, or
 `line-endings: <r> of <n> files refused` with 1. It exits 2, with a message on standard
-error, when `git ls-files` fails or lists no file. A copy of the script checked out with
-CRLF runs itself again without the carriage returns, so it still refuses what git lists.
+error, when `git ls-files` fails or lists no file, or when it reads fewer lines than git
+listed. A copy of the script checked out with CRLF runs itself again without the carriage
+returns, so it still refuses what git lists; run through standard input, such a copy cannot
+read itself again and exits 2.
 It cannot see a file that is not text and that git took for text, since `git add` rewrote
 it; the change that adds a kind names it `binary`.
 
