@@ -221,7 +221,8 @@ mod tests {
             Self::with(name, Box::new(SPAWN.read().unwrap_or_else(PoisonError::into_inner)))
         }
 
-        /// The scratch directory of the test that spawns a process.
+        /// The scratch directory of the test that spawns a process, which runs on unix alone.
+        #[cfg(unix)]
         fn spawning(name: &str) -> Self {
             Self::with(name, Box::new(SPAWN.write().unwrap_or_else(PoisonError::into_inner)))
         }
