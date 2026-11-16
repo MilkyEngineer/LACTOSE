@@ -4,10 +4,11 @@
 # working tree and of its attributes. `bash tools/xtask/line-endings.sh` from anywhere in the
 # repository; tools/xtask/README.md says what it accepts and what each remedy means.
 #
-# A copy checked out with CRLF, on a host that converts once a line takes this file out of
-# the rule, must still run and refuse what git lists rather than stop on a syntax error. In
-# such a copy the next line leaves a carriage return in `probe`, and the one after runs this
-# file again without them. Nothing above them may be a blank line or a command.
+# A copy checked out with CRLF (its blob stored CRLF, or a line of .gitattributes taking it
+# out of the rule on a host that converts) must still run, and refuse what git lists rather
+# than stop on a syntax error. In such a copy the next line leaves a carriage return in
+# `probe`, and the one after, whose own carriage return falls in its trailing comment, runs
+# this file again without them. Nothing above them may be a blank line or a command.
 probe=x
 [ "$probe" = x ] || { source_text=$(<"$0"); exec "$BASH" -c "${source_text//$'\r'/}" "$0"; } #
 
@@ -15,9 +16,11 @@ set -u
 
 rule='text=auto eol=lf'
 
-# The fields are separated by git's own `%x09`: a tab written here would carry a carriage
-# return in a CRLF copy run without the line above. `:/` and `--full-name` list the whole
-# tree, with paths from its root, whatever directory this runs in. The atoms need git 2.38.
+# The fields are separated by git's own `%x09`, not by a tab from the shell, which a CRLF
+# copy run as it stands would follow with a carriage return. The path comes last, so a
+# stray character at the end of a line can change no verdict. `:/` and `--full-name` list
+# the whole tree, with paths from its root, whatever directory this runs in. The atoms need
+# git 2.38.
 if ! listing=$(git ls-files --full-name \
   --format='%(eolinfo:index)%x09%(eolinfo:worktree)%x09%(eolattr)%x09%(path)' :/); then
   echo "line-endings: git ls-files failed: run inside the repository, with git 2.38 or later" >&2
@@ -28,7 +31,7 @@ if [ -z "$listing" ]; then
   exit 2
 fi
 
-# The three shapes of section 3 of the decision; everything else is refused.
+# The three shapes of tools/xtask/README.md, "Line endings"; everything else is refused.
 accepted() {
   if [ "$attribute" = "$rule" ]; then
     case "$index|$worktree" in
