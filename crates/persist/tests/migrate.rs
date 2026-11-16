@@ -9,8 +9,8 @@
 
 #![forbid(unsafe_code)]
 
-mod common;
-mod variants;
+use crate::common;
+use crate::variants;
 
 use std::num::NonZeroU64;
 use std::sync::Arc;

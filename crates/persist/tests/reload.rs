@@ -7,8 +7,8 @@
 
 #![forbid(unsafe_code)]
 
-mod common;
-mod glue;
+use crate::common;
+use crate::glue;
 
 use std::collections::BTreeMap;
 

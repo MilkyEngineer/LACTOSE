@@ -1,15 +1,24 @@
 //! The nightly Miri job's split of a package (architecture section 20): the entries of the
 //! `miri` job's matrix in `.github/workflows/nightly.yml` that name a package of the policy
-//! file's `[miri_split]` must together run its library, each of its integration test targets
-//! and its doc tests exactly once. Without the check only a comment keeps a split complete,
-//! and a new test target that no entry's patterns select drops out of Miri unseen.
+//! file's `[miri_split]` must together run each test of its library, of each of its integration
+//! test targets and of its doc tests exactly once. Without the check only a comment keeps a
+//! split complete, and a new test target that no entry's patterns select drops out of Miri
+//! unseen.
 //!
 //! The check reads one shape of the job and refuses any other instead of reading it: a matrix
 //! of `include` alone, no `if` or `defaults` on the job or `defaults` on the workflow, and one
 //! item of the job's one `steps` list that uses `matrix.args`, `RUN`, with only `env` beside
 //! its `run`. Each entry names one
 //! workspace member with a plain `-p NAME`, and its targets with `--lib`, `--test` and `--doc`
-//! (a package outside `[miri_split]` may name none). The job's other steps are not read.
+//! (a package outside `[miri_split]` may name none). After a `--`, libtest's arguments may
+//! name tests by what their paths contain, and skip them with `--skip`: a package's tests are
+//! divided by test and not by target where its integration tests are one binary (D125). Two
+//! entries that select a target with filters run each of its tests once, whatever the tests
+//! are called, only when one names filters and the other skips each of them, and that is the
+//! one division of a target the check accepts. Each filter is `<module>::`, a module the root
+//! of a test target the entry selects declares and no `cfg` naming `miri` may compile out, so
+//! that a module renamed, removed or compiled out under Miri fails the check rather than
+//! leaving its filter selecting nothing. The job's other steps are not read.
 //!
 //! The workflow is read as text, by a reader of the YAML the job is written in: block
 //! mappings and sequences, plain and quoted scalars on one line, plain scalars over several,
@@ -22,8 +31,10 @@
 
 use std::collections::BTreeMap;
 
+use crate::boundary::{module_file, parent};
 use crate::policy::Policy;
 use crate::repo::Files;
+use crate::rust_source::{attributes, cfg_names_miri, items};
 use crate::workspace::{Package, Workspace};
 use crate::{Finding, POLICY_FILE};
 
@@ -34,8 +45,9 @@ pub const NIGHTLY: &str = ".github/workflows/nightly.yml";
 const ENTRIES: [&str; 5] = ["jobs", "miri", "strategy", "matrix", "include"];
 
 /// The run step whose command line the split of an entry's `args` assumes: the words follow
-/// `cargo miri test`, and nothing after them selects or skips a test.
-const RUN: &str = "- run: cargo +$MIRI_TOOLCHAIN miri test ${{ matrix.args }} --locked";
+/// `cargo miri test --locked` and end the command, so that what follows a `--` in them is
+/// libtest's and nothing else selects or skips a test.
+const RUN: &str = "- run: cargo +$MIRI_TOOLCHAIN miri test --locked ${{ matrix.args }}";
 
 /// Checks the entries of the Miri job, and the split of every package in `[miri_split]`
 /// against its targets.
@@ -76,6 +88,10 @@ pub fn check(policy: &Policy, ws: &Workspace, files: &Files) -> Vec<Finding> {
         let found = match &entry.args {
             Some((line, args)) => words(args)
                 .and_then(|words| selected(ws, policy, &words))
+                .and_then(|(package, runs, filter)| {
+                    filters_name_modules(package, &runs, &filter, files)?;
+                    Ok((package, runs, filter))
+                })
                 .map_err(|message| format!("line {line}: the args of `{}`: {message}", entry.name)),
             None => Err(format!(
                 "line {}: the entry `{}` has no `args`, so it names no package",
@@ -83,7 +99,7 @@ pub fn check(policy: &Policy, ws: &Workspace, files: &Files) -> Vec<Finding> {
             )),
         };
         match found {
-            Ok((package, runs)) => read.push((entry, package, runs)),
+            Ok((package, runs, filter)) => read.push((entry, package, runs, filter)),
             Err(message) => findings.push(Finding::new(NIGHTLY, message)),
         }
     }
@@ -133,18 +149,98 @@ impl Run<'_> {
     }
 }
 
-/// An entry that was read: the package it names and what it runs of it, empty when it names
-/// no target and so runs the package whole.
-type Read<'e, 'w> = (&'e Entry, &'w Package, Vec<Run<'w>>);
+/// The libtest arguments of an entry, after its `--`, which go to every target it runs:
+/// libtest runs a test whose path contains one of `names`, or any test when there are none,
+/// and none of `skips`. Each list is sorted, without repeats.
+#[derive(Clone, Default, PartialEq, Eq, Debug)]
+struct Filter {
+    names: Vec<String>,
+    skips: Vec<String>,
+}
+
+impl Filter {
+    /// The filter of the words after an entry's `--`.
+    ///
+    /// # Errors
+    /// No word, an option other than `--skip` and its value, and an empty name, which every
+    /// path contains.
+    fn new(words: &[&str]) -> Result<Self, String> {
+        if words.is_empty() {
+            return Err("has nothing after its `--`".to_owned());
+        }
+        let mut filter = Self::default();
+        let mut words = words.iter();
+        while let Some(&word) = words.next() {
+            let (list, name) = match word {
+                "--skip" => (&mut filter.skips, *words.next().ok_or("`--skip` has no value")?),
+                _ => (&mut filter.names, word),
+            };
+            if name.is_empty() {
+                return Err("names an empty filter, which every test's path contains".to_owned());
+            }
+            if name.starts_with('-') {
+                return Err(format!(
+                    "`{name}` after `--`: of libtest's options the check reads `--skip` alone"
+                ));
+            }
+            list.push(name.to_owned());
+        }
+        for list in [&mut filter.names, &mut filter.skips] {
+            list.sort();
+            list.dedup();
+        }
+        Ok(filter)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.names.is_empty() && self.skips.is_empty()
+    }
+
+    /// Whether `self` and `other` run each test exactly once between them, whatever the tests
+    /// are called: one names filters and skips nothing, the other names none and skips each
+    /// of them.
+    fn divides_with(&self, other: &Self) -> bool {
+        let divides = |run: &Self, rest: &Self| {
+            !run.names.is_empty()
+                && run.skips.is_empty()
+                && rest.names.is_empty()
+                && run.names == rest.skips
+        };
+        divides(self, other) || divides(other, self)
+    }
+
+    fn describe(&self) -> String {
+        let quoted = |list: &[String]| {
+            list.iter().map(|name| format!("`{name}`")).collect::<Vec<_>>().join(", ")
+        };
+        match (self.names.is_empty(), self.skips.is_empty()) {
+            (true, true) => "every test".to_owned(),
+            (false, true) => format!("the tests whose paths contain {}", quoted(&self.names)),
+            (true, false) => {
+                format!("the tests whose paths contain none of {}", quoted(&self.skips))
+            }
+            (false, false) => format!(
+                "the tests whose paths contain {} and none of {}",
+                quoted(&self.names),
+                quoted(&self.skips)
+            ),
+        }
+    }
+}
+
+/// An entry that was read: the package it names, what it runs of it, empty when it names no
+/// target and so runs the package whole, and its filter.
+type Read<'e, 'w> = (&'e Entry, &'w Package, Vec<Run<'w>>, Filter);
 
 /// The finding for each package `[miri_split]` does not list that two or more entries name
-/// by target: a split the check would not count. An entry that runs the package whole drops
-/// none of its targets, so entries that do, as `lactose-task`'s two do under two
-/// environments, are no split, and neither is one of them beside one entry by target.
+/// by target or filter: a split the check would not count. An entry that runs the package
+/// whole and unfiltered drops none of its tests, so entries that do, as `lactose-task`'s two
+/// do under two environments, are no split, and neither is one of them beside one entry by
+/// target.
 fn unlisted(policy: &Policy, read: &[Read<'_, '_>], findings: &mut Vec<Finding>) {
     let mut by: BTreeMap<&str, Vec<&Entry>> = BTreeMap::new();
-    for (entry, package, runs) in read {
-        if !runs.is_empty() {
+    for (entry, package, runs, filter) in read {
+        if !runs.is_empty() || !filter.is_empty() {
             by.entry(package.name.as_str()).or_default().push(entry);
         }
     }
@@ -154,7 +250,7 @@ fn unlisted(policy: &Policy, read: &[Read<'_, '_>], findings: &mut Vec<Finding>)
                 POLICY_FILE,
                 format!(
                     "[miri_split] does not list `{name}`, which the `miri` entries {} split by \
-                     target; list it so that the check counts its targets",
+                     target or filter; list it so that the check counts its tests",
                     entries.iter().map(|entry| entry.label()).collect::<Vec<_>>().join(", ")
                 ),
             ));
@@ -163,7 +259,8 @@ fn unlisted(policy: &Policy, read: &[Read<'_, '_>], findings: &mut Vec<Finding>)
 }
 
 /// The finding for each target of `package` that `cargo test` runs and no entry can select,
-/// and for each of its runs that the entries do not run exactly once.
+/// and for each of its runs whose tests the entries do not run exactly once: one entry runs
+/// it unfiltered, or two divide it by filter.
 fn counts(package: &Package, read: &[Read<'_, '_>], findings: &mut Vec<Finding>) {
     for (kind, name) in &package.other_tests {
         findings.push(Finding::new(
@@ -175,21 +272,21 @@ fn counts(package: &Package, read: &[Read<'_, '_>], findings: &mut Vec<Finding>)
             ),
         ));
     }
-    let mut runs: BTreeMap<Run<'_>, Vec<&Entry>> = BTreeMap::new();
+    let mut runs: BTreeMap<Run<'_>, Vec<(&Entry, &Filter)>> = BTreeMap::new();
     if package.lib {
         runs.insert(Run::Lib, Vec::new());
     }
     if package.doctests {
         runs.insert(Run::Doc, Vec::new());
     }
-    for test in &package.tests {
+    for test in package.tests.keys() {
         runs.insert(Run::Test(test), Vec::new());
     }
     let mut named = false;
-    for (entry, _, selected) in read.iter().filter(|(_, of, _)| of.name == package.name) {
+    for (entry, _, selected, filter) in read.iter().filter(|(_, of, ..)| of.name == package.name) {
         named = true;
         for run in selected {
-            runs.entry(*run).or_default().push(entry);
+            runs.entry(*run).or_default().push((entry, filter));
         }
     }
     if !named {
@@ -204,28 +301,48 @@ fn counts(package: &Package, read: &[Read<'_, '_>], findings: &mut Vec<Finding>)
         return;
     }
     for (run, by) in runs {
+        let labels = || by.iter().map(|(entry, _)| entry.label()).collect::<Vec<_>>().join(", ");
         let message = match by.as_slice() {
-            [_] => continue,
+            [(_, filter)] if filter.is_empty() => continue,
+            [(_, a), (_, b)] if a.divides_with(b) => continue,
             [] => format!(
                 "the `miri` entries for `{}` do not run {}; select it in one of them",
                 package.name,
                 run.describe()
             ),
-            _ => format!(
+            [(entry, filter)] => format!(
+                "the `miri` entries for `{}` run of {} only {}, in {}; run the rest in an entry \
+                 that skips each of its filters with `--skip`",
+                package.name,
+                run.describe(),
+                filter.describe(),
+                entry.label()
+            ),
+            _ if by.iter().all(|(_, filter)| filter.is_empty()) => format!(
                 "the `miri` entries for `{}` run {} {} times: {}",
                 package.name,
                 run.describe(),
                 by.len(),
-                by.iter().map(|entry| entry.label()).collect::<Vec<_>>().join(", ")
+                labels()
+            ),
+            _ => format!(
+                "the `miri` entries for `{}` select {} in {} entries whose filters do not run \
+                 each of its tests once: {}; divide a target between two entries, one naming \
+                 filters and the other skipping each of them with `--skip`",
+                package.name,
+                run.describe(),
+                by.len(),
+                labels()
             ),
         };
         findings.push(Finding::new(NIGHTLY, message));
     }
 }
 
-/// The workspace member that `cargo miri test` with `words` tests, and what it runs of it,
-/// sorted: empty when the words name no target. A target two of the words select is run
-/// once, as cargo runs it.
+/// The workspace member that `cargo miri test` with `words` tests, what it runs of it, sorted
+/// and empty when the words name no target, and the filter of the words after the first
+/// `--`, which go to each test binary. A target two of the words select is run once, as cargo
+/// runs it.
 ///
 /// An explicit `--test` runs its target whatever the manifest's `test` says, and fails the
 /// job if the target has `required-features` the job does not enable (cargo 1.99.0 and
@@ -236,17 +353,23 @@ fn counts(package: &Package, read: &[Read<'_, '_>], findings: &mut Vec<Finding>)
 /// # Errors
 /// A package named other than once by a plain `-p NAME` or `--package NAME` with a member's
 /// exact name, a word the check does not read, a target cargo would refuse, `--doc` beside
-/// another target selection, which cargo refuses, and no target named in a split package.
+/// another target selection, which cargo refuses, no target named in a split package, and
+/// libtest arguments [`Filter::new`] refuses.
 fn selected<'w>(
     ws: &'w Workspace,
     policy: &Policy,
     words: &[String],
-) -> Result<(&'w Package, Vec<Run<'w>>), String> {
+) -> Result<(&'w Package, Vec<Run<'w>>, Filter), String> {
     fn value<'v>(flag: &str, words: &mut impl Iterator<Item = &'v str>) -> Result<&'v str, String> {
         words.next().ok_or_else(|| format!("`{flag}` has no value"))
     }
     let (mut package, mut lib, mut doc, mut patterns) = (None, false, false, Vec::new());
-    let mut words = words.iter().map(String::as_str);
+    let words: Vec<&str> = words.iter().map(String::as_str).collect();
+    let (words, filter) = match words.iter().position(|word| *word == "--") {
+        Some(at) => (&words[..at], Filter::new(&words[at + 1..])?),
+        None => (&words[..], Filter::default()),
+    };
+    let mut words = words.iter().copied();
     while let Some(word) = words.next() {
         match word {
             "-p" | "--package" => {
@@ -276,7 +399,7 @@ fn selected<'w>(
         if !package.doctests {
             return Err(format!("names `--doc`, but `{}` has no doc tests", package.name));
         }
-        return Ok((package, vec![Run::Doc]));
+        return Ok((package, vec![Run::Doc], filter));
     }
     if !lib && patterns.is_empty() {
         if policy.miri_split.contains(&package.name) {
@@ -286,7 +409,7 @@ fn selected<'w>(
                 package.name
             ));
         }
-        return Ok((package, Vec::new()));
+        return Ok((package, Vec::new(), filter));
     }
     let mut runs = Vec::new();
     if lib {
@@ -300,8 +423,8 @@ fn selected<'w>(
         if Pattern::is_pattern(text) {
             let pattern = Pattern::new(text)
                 .map_err(|e| format!("`--test {text}` is not a pattern cargo accepts: {e}"))?;
-            runs.extend(package.tests.iter().filter(|t| pattern.matches(t)).map(|t| Run::Test(t)));
-        } else if let Some(test) = package.tests.iter().find(|t| *t == text) {
+            runs.extend(package.tests.keys().filter(|t| pattern.matches(t)).map(|t| Run::Test(t)));
+        } else if let Some((test, _)) = package.tests.get_key_value(text) {
             runs.push(Run::Test(test));
         }
         if runs.len() == before {
@@ -310,7 +433,127 @@ fn selected<'w>(
     }
     runs.sort();
     runs.dedup();
-    Ok((package, runs))
+    Ok((package, runs, filter))
+}
+
+/// Checks that each libtest filter of an entry is `<module>::`, where the root of a test
+/// target the entry selects declares the module and no `cfg` naming `miri` may compile it out,
+/// so that a module renamed, removed or compiled out under Miri fails here and does not leave
+/// the filter selecting nothing, or the tests moved to another entry. An entry that names no
+/// target selects every test target of its package.
+///
+/// # Errors
+/// A filter of another shape, one whose module no root of a selected target declares, and
+/// one whose module such a `cfg` may compile out.
+fn filters_name_modules(
+    package: &Package,
+    runs: &[Run<'_>],
+    filter: &Filter,
+    files: &Files,
+) -> Result<(), String> {
+    if filter.is_empty() {
+        return Ok(());
+    }
+    let targets: Vec<&str> = if runs.is_empty() {
+        package.tests.keys().map(String::as_str).collect()
+    } else {
+        runs.iter()
+            .filter_map(|run| match run {
+                Run::Test(name) => Some(*name),
+                Run::Lib | Run::Doc => None,
+            })
+            .collect()
+    };
+    let mut modules: BTreeMap<String, Option<String>> = BTreeMap::new();
+    for target in &targets {
+        for (module, miri) in root_modules(&package.tests[*target], files) {
+            let gate = modules.entry(module).or_default();
+            *gate = gate.take().or(miri);
+        }
+    }
+    for name in filter.names.iter().chain(&filter.skips) {
+        let module = name.strip_suffix("::").filter(|module| {
+            module.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+                && module.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        });
+        let Some(module) = module else {
+            return Err(format!(
+                "the filter `{name}` is not `<module>::`; a filter names a module the root of a \
+                 test target the entry selects declares, so that renaming it is caught"
+            ));
+        };
+        if targets.is_empty() {
+            return Err(format!(
+                "the filter `{name}` names a module, but the entry selects no test target whose \
+                 root could declare it"
+            ));
+        }
+        let Some(gate) = modules.get(module) else {
+            let roots = targets
+                .iter()
+                .map(|target| format!("`{}`", package.tests[*target]))
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(format!(
+                "the filter `{name}` names no module that {roots} declares, so it would select \
+                 no test of the module it was written for"
+            ));
+        };
+        if let Some(gate) = gate {
+            return Err(format!(
+                "the filter `{name}` names the module `{module}`, which {gate} may leave \
+                 uncompiled under Miri, so that the entry would run none of its tests; leave the \
+                 module compiled and gate its tests one by one"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The modules the root of the test target at `root` declares at its top, out-of-line or
+/// inline: the first segment of the path of each test in them. Each maps to the first `cfg`
+/// naming `miri` (see [`cfg_names_miri`]) that may compile it out: on its declaration, at the
+/// top of its file or at the top of the root. Empty for a root that is not in `files`.
+fn root_modules(root: &str, files: &Files) -> BTreeMap<String, Option<String>> {
+    let Some(source) = files.text(root) else {
+        return BTreeMap::new();
+    };
+    // The first inner `cfg` naming `miri` at the top of a file, as it is written there.
+    let leading = |file: &str| {
+        let source = files.text(file)?;
+        let attribute = attributes(&source).into_iter().find(|attribute| {
+            attribute.inner && attribute.leading && cfg_names_miri(&attribute.body)
+        })?;
+        Some(format!("`#![{}]` at the top of `{file}`", attribute.body))
+    };
+    let whole = leading(root);
+    let items = items(&source, &[]);
+    let mut modules = BTreeMap::new();
+    let declared = items.modules.iter().map(|module| (module, true));
+    for (module, out_of_line) in declared.chain(items.inline_modules.iter().map(|m| (m, false))) {
+        if !module.inline.is_empty() {
+            continue;
+        }
+        // An inline module has no file of its own.
+        let file = || match &module.path {
+            _ if !out_of_line => None,
+            Some(named) => module_file(root, named),
+            None => [
+                format!("{}/{}.rs", parent(root), module.name),
+                format!("{}/{}/mod.rs", parent(root), module.name),
+            ]
+            .into_iter()
+            .find(|candidate| files.contains(candidate)),
+        };
+        let gate = module
+            .miri
+            .as_ref()
+            .map(|attribute| format!("`{attribute}` on it in `{root}`"))
+            .or_else(|| file().and_then(|file| leading(&file)))
+            .or_else(|| whole.clone());
+        modules.insert(module.name.clone(), gate);
+    }
+    modules
 }
 
 /// The words the run step's shell makes of `args`, which the workflow substitutes into the
@@ -1003,7 +1246,8 @@ mod tests {
 
     fn ecs(tests: &[&str]) -> Package {
         let mut ecs = package("lactose-ecs", &[]);
-        ecs.tests = tests.iter().map(|t| (*t).to_owned()).collect();
+        ecs.tests =
+            tests.iter().map(|t| ((*t).to_owned(), format!("crates/ecs/tests/{t}.rs"))).collect();
         ecs
     }
 
@@ -1018,12 +1262,35 @@ mod tests {
     }
 
     fn run_with(policy: &Policy, ecs: Package, nightly: &str) -> Vec<String> {
+        run_over(policy, ecs, nightly, &[])
+    }
+
+    /// [`run_with`] with each of `extra` written over the files it reads.
+    fn run_over(
+        policy: &Policy,
+        ecs: Package,
+        nightly: &str,
+        extra: &[(&str, &str)],
+    ) -> Vec<String> {
+        let mut core = package("lactose-core", &[]);
+        core.tests = [("t".to_owned(), "crates/core/tests/t.rs".to_owned())].into();
         let mut net_host = package("lactose-net-host", &[]);
-        net_host.tests = vec!["interpolation".to_owned()];
-        let members =
-            vec![package("lactose-core", &[]), ecs, net_host, package("lactose-task", &[])];
+        net_host.tests =
+            [("interpolation".to_owned(), "crates/net-host/tests/interpolation.rs".to_owned())]
+                .into();
+        let members = vec![core, ecs, net_host, package("lactose-task", &[])];
         let mut files = Files::default();
         files.insert(NIGHTLY, nightly);
+        // The roots whose modules the filters of the cases name.
+        files.insert("crates/core/tests/t.rs", "mod a;\n");
+        files.insert(
+            "crates/ecs/tests/integration.rs",
+            "mod erased_rows;\nmod events;\nmod ownership {}\n",
+        );
+        files.insert("crates/net-host/tests/interpolation.rs", "mod interp;\n");
+        for &(path, text) in extra {
+            files.insert(path, text);
+        }
         check(policy, &workspace(members), &files).iter().map(ToString::to_string).collect()
     }
 
@@ -1065,6 +1332,227 @@ mod tests {
             &["name: ecs, doc", "args: -p lactose-ecs --doc"],
             &["name: net-host", "args: -p lactose-net-host --test interpolation"],
         ])
+    }
+
+    /// The split of one test binary by filter, as nightly runs `lactose-ecs` (D125).
+    fn filter_split() -> String {
+        nightly(&[
+            &["name: core", "args: -p lactose-core"],
+            &[
+                "name: ecs, two",
+                "args: >-",
+                "  -p lactose-ecs --lib --test integration --test alloc --",
+                "  erased_rows:: ownership::",
+            ],
+            &[
+                "name: ecs, the rest",
+                "args: >-",
+                "  -p lactose-ecs --lib --test integration --test alloc --",
+                "  --skip erased_rows:: --skip ownership::",
+            ],
+            &["name: ecs, doc", "args: -p lactose-ecs --doc"],
+            &["name: net-host", "args: '-p lactose-net-host --test interpolation -- interp::'"],
+        ])
+    }
+
+    #[test]
+    fn a_target_divided_by_filter_runs_each_test_once() {
+        const ONE: [&str; 2] = ["alloc", "integration"];
+        assert_eq!(run(ecs(&ONE), &filter_split()), [] as [&str; 0]);
+        // The order of the filters, a repeat and the order of the words do not matter.
+        let text = filter_split()
+            .replace("  erased_rows:: ownership::", "  ownership:: erased_rows:: ownership::")
+            .replace(
+                "--skip erased_rows:: --skip ownership::",
+                "--skip ownership:: --skip erased_rows::",
+            );
+        assert_eq!(run(ecs(&ONE), &text), [] as [&str; 0]);
+        // A filter the other entry does not skip runs its tests twice.
+        let text = filter_split().replace(" --skip ownership::", "");
+        let found = run(ecs(&ONE), &text);
+        assert_eq!(found.len(), 3, "{found:?}");
+        assert!(
+            found[0].contains(
+                "select the library's unit tests in 2 entries whose filters do not run each of \
+                 its tests once: `ecs, two` (line 13), `ecs, the rest` (line 17)"
+            ),
+            "{found:?}"
+        );
+        // A skip with no entry that names it drops its tests.
+        let text = filter_split().replace("  erased_rows:: ownership::", "  erased_rows::");
+        assert_eq!(run(ecs(&ONE), &text).len(), 3);
+        // Both entries filtered by name: a test that neither filter matches runs nowhere.
+        let text = filter_split().replace("--skip erased_rows:: --skip ownership::", "events::");
+        assert_eq!(run(ecs(&ONE), &text).len(), 3);
+        // One entry's filter alone runs part of a target.
+        let text = filter_split().replace(
+            "--lib --test integration --test alloc --\n              --skip erased_rows:: --skip \
+             ownership::",
+            "--lib --test alloc",
+        );
+        let found = run(ecs(&ONE), &text);
+        assert_eq!(found.len(), 3, "{found:?}");
+        assert_eq!(
+            found[2],
+            ".github/workflows/nightly.yml: the `miri` entries for `lactose-ecs` run of test \
+             target `integration` only the tests whose paths contain `erased_rows::`, \
+             `ownership::`, in `ecs, two` (line 13); run the rest in an entry that skips each of \
+             its filters with `--skip`"
+        );
+        // Three entries: the counts accept two, one naming and one skipping.
+        let text = filter_split().replace(
+            "          - name: ecs, doc\n",
+            "          - name: ecs, again\n            args: '-p lactose-ecs --test integration \
+             -- events::'\n          - name: ecs, doc\n",
+        );
+        let found = run(ecs(&ONE), &text);
+        assert!(found.len() == 1 && found[0].contains("in 3 entries"), "{found:?}");
+    }
+
+    #[test]
+    fn a_filter_the_check_does_not_read_is_refused() {
+        let cases = [
+            ("-p lactose-ecs --lib --", "has nothing after its `--`"),
+            ("-p lactose-ecs --lib -- --exact x", "`--exact` after `--`: of libtest's options"),
+            ("-p lactose-ecs --lib -- x --skip", "`--skip` has no value"),
+            ("-p lactose-ecs --lib -- --skip=x", "`--skip=x` after `--`"),
+            ("-p lactose-ecs --lib -- --skip ''", "names an empty filter"),
+            ("-p lactose-ecs --lib -- x -- y", "`--` after `--`"),
+            ("-p lactose-ecs --lib -- --include-ignored", "`--include-ignored` after `--`"),
+        ];
+        for (args, message) in cases {
+            let found = run(ecs(&TESTS), &nightly(&[&["name: e", &format!("args: {args}")]]));
+            assert!(found.len() == 1 && found[0].contains(message), "{args}: {found:?}");
+        }
+        // Two filtered entries of a package outside the split split it; a filtered entry
+        // beside one that runs the package whole drops nothing.
+        let text = filter_split().replace(
+            "- name: core\n            args: -p lactose-core\n",
+            "- name: core a\n            args: '-p lactose-core -- a::'\n          - name: core b\n\
+             \x20           args: '-p lactose-core -- --skip a::'\n",
+        );
+        let found = run(ecs(&["alloc", "integration"]), &text);
+        assert!(found.len() == 1 && found[0].contains("split by target or filter"), "{found:?}");
+        let text = filter_split().replace(
+            "- name: core\n",
+            "- name: core a\n            args: '-p lactose-core -- a::'\n          - name: core\n",
+        );
+        assert_eq!(run(ecs(&["alloc", "integration"]), &text), [] as [&str; 0]);
+    }
+
+    #[test]
+    fn a_filter_whose_module_miri_may_compile_out_is_refused() {
+        // Review round 2: a module kept but compiled out under Miri, by its file or by its
+        // declaration, leaves the entry running none of its tests.
+        const ROOT: &str = "crates/net-host/tests/interpolation.rs";
+        const FILE: &str = "crates/net-host/tests/interp.rs";
+        let found = |files: &[(&str, &str)]| {
+            run_over(&policy(), ecs(&["alloc", "integration"]), &filter_split(), files)
+        };
+        let refused = |gate: &str| {
+            [format!(
+                ".github/workflows/nightly.yml: line 24: the args of `net-host`: the filter \
+                 `interp::` names the module `interp`, which {gate} may leave uncompiled under \
+                 Miri, so that the entry would run none of its tests; leave the module compiled \
+                 and gate its tests one by one"
+            )]
+        };
+        let file = "#![cfg(not(miri))]\n#[test]\nfn t() {}\n";
+        assert_eq!(
+            found(&[(FILE, file)]),
+            refused("`#![cfg(not(miri))]` at the top of `crates/net-host/tests/interp.rs`")
+        );
+        assert_eq!(
+            found(&[(ROOT, "#[cfg(not(miri))]\nmod interp;\n")]),
+            refused("`cfg(not(miri))` on it in `crates/net-host/tests/interpolation.rs`")
+        );
+        // A `cfg_attr` that yields a `cfg`, an inline module's inner `cfg`, a `#[path]` file's
+        // and the root's own.
+        assert_eq!(
+            found(&[(ROOT, "#[cfg_attr(miri, cfg(any()))]\nmod interp;\n")]),
+            refused(
+                "`cfg_attr(miri,cfg(any()))` on it in `crates/net-host/tests/interpolation.rs`"
+            )
+        );
+        assert_eq!(
+            found(&[(ROOT, "mod interp {\n    #![cfg(not(miri))]\n}\n")]),
+            refused("`cfg(not(miri))` on it in `crates/net-host/tests/interpolation.rs`")
+        );
+        let lerp = "crates/net-host/tests/lerp.rs";
+        assert_eq!(
+            found(&[
+                (ROOT, "#[path = \"lerp.rs\"]\nmod interp;\n"),
+                (lerp, "#![cfg(all(test, not(miri)))]\n")
+            ]),
+            refused("`#![cfg(all(test,not(miri)))]` at the top of `crates/net-host/tests/lerp.rs`")
+        );
+        assert_eq!(
+            found(&[(ROOT, "#![cfg(not(miri))]\nmod interp;\n")]),
+            refused("`#![cfg(not(miri))]` at the top of `crates/net-host/tests/interpolation.rs`")
+        );
+        // Tests gated or ignored one by one, a `cfg` that does not name Miri and a `cfg_attr`
+        // that yields none leave the module's other tests to the entry.
+        let file = "#![cfg_attr(miri, allow(dead_code))]\n#[test]\n#[cfg_attr(miri, ignore)]\n\
+                    fn t() {}\n#[cfg(not(miri))]\n#[test]\nfn u() {}\n";
+        let root = "#[cfg(unix)]\n#[cfg_attr(miri, path = \"interp.rs\")]\nmod interp;\n";
+        assert_eq!(found(&[(FILE, file), (ROOT, root)]), [] as [&str; 0]);
+    }
+
+    #[test]
+    fn a_filter_names_a_module_of_a_target_the_entry_selects() {
+        const ONE: [&str; 2] = ["alloc", "integration"];
+        let finding = |text: &str| {
+            let found = run(ecs(&ONE), text);
+            assert_eq!(found.len(), 1, "{found:?}");
+            found[0].clone()
+        };
+        // Review round 1, S1: a module renamed under a filter of a package outside the split,
+        // whose entry would then run no test.
+        let text = filter_split().replace("-- interp::", "-- sequence_lock::");
+        assert_eq!(
+            finding(&text),
+            ".github/workflows/nightly.yml: line 24: the args of `net-host`: the filter \
+             `sequence_lock::` names no module that `crates/net-host/tests/interpolation.rs` \
+             declares, so it would select no test of the module it was written for"
+        );
+        // The same in the split, where the tests would move to the other entry unseen.
+        let text = filter_split()
+            .replace("  erased_rows:: ownership::", "  rows:: ownership::")
+            .replace("--skip erased_rows::", "--skip rows::");
+        let found = run(ecs(&ONE), &text);
+        assert_eq!(found.len(), 2, "{found:?}");
+        assert!(
+            found.iter().all(|f| f.contains("the filter `rows::` names no module")),
+            "{found:?}"
+        );
+        // A module of a target the entry does not select: `alloc`'s root declares none.
+        let text = filter_split().replace(
+            "--lib --test integration --test alloc --\n              erased",
+            "--lib --test alloc --\n              erased",
+        );
+        assert!(
+            finding(&text).contains(
+                "the filter `erased_rows::` names no module that `crates/ecs/tests/alloc.rs` \
+                 declares"
+            ),
+            "{text}"
+        );
+        // A filter that is not one module's path, and one where no test target is selected.
+        for (filter, message) in [
+            ("erased_rows", "the filter `erased_rows` is not `<module>::`"),
+            ("erased_rows::wide", "the filter `erased_rows::wide` is not `<module>::`"),
+            ("a::b::", "the filter `a::b::` is not `<module>::`"),
+            ("::", "the filter `::` is not `<module>::`"),
+        ] {
+            let text = filter_split().replace("-- interp::", &format!("-- {filter}"));
+            let found = finding(&text);
+            assert!(found.contains(message), "{filter}: {found}");
+        }
+        let text = nightly(&[&["name: e", "args: '-p lactose-ecs --lib -- erased_rows::'"]]);
+        assert!(
+            finding(&text).contains("the entry selects no test target whose root could declare"),
+            "{text}"
+        );
     }
 
     #[test]
@@ -1201,8 +1689,8 @@ mod tests {
         assert_eq!(
             run(ecs(&TESTS), &text),
             ["tools/xtask/ci-policy.toml: [miri_split] does not list `lactose-core`, which the \
-              `miri` entries `core lib` (line 11), `core doc` (line 13) split by target; list it \
-              so that the check counts its targets"]
+              `miri` entries `core lib` (line 11), `core doc` (line 13) split by target or filter; \
+              list it so that the check counts its tests"]
         );
         // A whole run beside one entry by target drops no target: the review's
         // `r2-task-second-narrowed`.
@@ -1220,8 +1708,8 @@ mod tests {
                  nightly Miri job is checked",
                 "tools/xtask/ci-policy.toml: [miri_split] does not list `lactose-ecs`, which the \
                  `miri` entries `ecs, erased rows and ownership` (line 13), `ecs, the rest` \
-                 (line 16), `ecs, doc` (line 20) split by target; list it so that the check \
-                 counts its targets"
+                 (line 16), `ecs, doc` (line 20) split by target or filter; list it so that the \
+                 check counts its tests"
             ]
         );
         let stray = Policy { miri_split: vec!["lactose-nothing".to_owned()], ..Policy::default() };
@@ -1242,7 +1730,7 @@ mod tests {
             ("-p lactose-ecs --test 'a**'", "is not a pattern cargo accepts"),
             ("-p lactose-ecs --doc --lib", "mixes `--doc`"),
             ("-p lactose-ecs --bins", "does not know what `--bins` runs"),
-            ("-p lactose-ecs -- --skip x", "does not know what `--` runs"),
+            ("-p lactose-ecs -- --skip x", "names no target of `lactose-ecs`"),
             ("-p lactose-ecs --test [!eo]*", "an unquoted `[`"),
             ("-p lactose-ecs --test \"$X\"", "a `$`"),
             ("-p lactose-ecs; echo", "an unquoted `;`"),
@@ -1306,7 +1794,7 @@ mod tests {
         let cases = [
             // GitHub folds every entry into the one combination; the last one's args win.
             base.replace("        include:\n", "        toolchain: [dated]\n        include:\n"),
-            base.replace("--locked\n", "--locked -- --skip erased\n"),
+            base.replace("matrix.args }}\n", "matrix.args }} --skip erased\n"),
             base.replace(
                 "      - run: cargo",
                 "      - if: matrix.key != 'ecs-rest'\n        run: cargo",

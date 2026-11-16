@@ -9,7 +9,7 @@
 
 #![forbid(unsafe_code)]
 
-mod common;
+use crate::common;
 
 use common::*;
 use lactose_bundle::BaselineRow;

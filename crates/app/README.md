@@ -698,8 +698,8 @@ digest and version govern, except a `#[value]` struct or enum replaced by one of
 layout, which no digest sees (D129). Any other difference (a new type, a removed one, a
 version that rose with any digest, a new field) fails until the record is rewritten in the
 commit that makes the change, with
-`LACTOSE_SCHEMA_RECORD=update cargo nextest run -p lactose-app --test schema_record`. The
-command refuses to write while any of the failures above stands, and when what it would
+`LACTOSE_SCHEMA_RECORD=update cargo nextest run -p lactose-app --test integration schema_record::`.
+The command refuses to write while any of the failures above stands, and when what it would
 write would not read back as the build's record (a key or type tag a line cannot hold); a
 missing record is written whole, which is how a set's first record is made, so the record's
 diff is what review reads. A rename keeps its ID and costs no bump, but the record cannot

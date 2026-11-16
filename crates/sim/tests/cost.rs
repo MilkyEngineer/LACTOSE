@@ -13,7 +13,7 @@
 
 #![forbid(unsafe_code)]
 
-mod glue;
+use crate::glue;
 
 use std::collections::BTreeMap;
 
@@ -200,7 +200,7 @@ fn archetypes(world: &mut World) -> usize {
 /// hash after it, which is outside the step, are printed beside them; the world hash after
 /// the last tick is the same on both worker counts. `cargo xtask measure tick-100k` runs it
 /// and writes the result file; by hand, `cargo nextest run -p lactose-sim --run-ignored only
-/// --cargo-profile release --no-capture -E 'test(=cost_of_a_tick_at_100k_rows)'`.
+/// --cargo-profile release --no-capture -E 'test(=cost::cost_of_a_tick_at_100k_rows)'`.
 #[test]
 #[ignore = "a measurement, run by `cargo xtask measure`: timings are reported, not asserted"]
 #[expect(clippy::disallowed_types, reason = "test code measuring the step, outside it")]

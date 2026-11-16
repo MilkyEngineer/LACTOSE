@@ -6,6 +6,7 @@ edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 license.workspace = true
+autotests = false
 
 [dependencies]
 # The sim skeleton's registration (`register_types`, `register_systems`), wired beside
@@ -55,6 +56,19 @@ lactose-math.workspace = true
 # The compile-only sketches in `tests/` write a game crate the way `game-sim` will: its
 # components through the reflect macros.
 lactose-reflect.workspace = true
+
+# The integration tests as one test binary, whose root declares the files of tests/ as
+# modules (D125).
+[[test]]
+name = "integration"
+path = "tests/integration.rs"
+
+# A binary of its own ([test_targets] in tools/xtask/ci-policy.toml): it installs the
+# process's tracing subscriber, which every test of one binary shares under `cargo test`
+# and `cargo miri test`.
+[[test]]
+name = "proof"
+path = "tests/proof/main.rs"
 
 [lints]
 workspace = true

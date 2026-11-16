@@ -4,7 +4,7 @@
 
 #![forbid(unsafe_code)]
 
-mod variants;
+use crate::variants;
 
 use lactose_core::{ErrorKind, FieldId, PlainArray, xxh64};
 use lactose_math::Scalar;

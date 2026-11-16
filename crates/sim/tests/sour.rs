@@ -6,8 +6,8 @@
 
 #![forbid(unsafe_code)]
 
-mod common;
-mod glue;
+use crate::common;
+use crate::glue;
 
 use common::*;
 use glue::{Harness, protocol_error};

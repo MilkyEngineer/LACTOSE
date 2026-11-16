@@ -40,17 +40,20 @@ jobs:
             args: -p lactose-task
             real_deque: "1"
             miriflags: -Zmiri-tree-borrows -Zmiri-ignore-leaks
-          # `lactose-ecs` in three: its two slowest test targets, every other target, and
-          # the doc tests, which cargo runs alone. A new test target whose name starts with
-          # `e` or `o` is added to the second entry by name.
-          - name: ecs, erased rows and ownership
+          # `lactose-ecs` in four: the tests of its slowest test file, the binaries of their own
+          # (`ownership`, the next slowest, among them), every other test, and the doc tests,
+          # which cargo runs alone. Its other integration tests are one binary (D125), so the
+          # first and third entries divide the tests of the targets they select by path: the
+          # third skips the filter the first names, which `cargo xtask boundary` checks.
+          - name: ecs, erased rows
             key: ecs
-            args: -p lactose-ecs --test erased_rows --test ownership
+            args: '-p lactose-ecs --lib --test integration -- erased_rows::'
+          - name: ecs, ownership and the binaries of their own
+            key: ecs-separate
+            args: -p lactose-ecs --test ownership --test alloc --test channel_skip --test units
           - name: ecs, the rest
             key: ecs-rest
-            args: >-
-              -p lactose-ecs --lib --test '[!eo]*' --test erased --test events
-              --test obligation
+            args: '-p lactose-ecs --lib --test integration -- --skip erased_rows::'
           - name: ecs, doc
             key: ecs-doc
             args: -p lactose-ecs --doc
@@ -63,7 +66,7 @@ jobs:
           # emulation catches the reader-side orderings the hardware stress test misses.
           - name: net-host
             key: net-host
-            args: -p lactose-net-host --test interpolation
+            args: '-p lactose-net-host --test integration -- interpolation::'
     steps:
       - uses: actions/checkout@v4
       # Miri is the one sanctioned use of a nightly toolchain (architecture section 8.3).
@@ -73,7 +76,7 @@ jobs:
         with:
           key: miri-${{ matrix.key }}
       # An empty LACTOSE_MIRI_REAL_DEQUE leaves the stand-in deque (crates/task/build.rs).
-      - run: cargo +$MIRI_TOOLCHAIN miri test ${{ matrix.args }} --locked
+      - run: cargo +$MIRI_TOOLCHAIN miri test --locked ${{ matrix.args }}
         env:
           LACTOSE_MIRI_REAL_DEQUE: ${{ matrix.real_deque }}
           MIRIFLAGS: ${{ matrix.miriflags }}

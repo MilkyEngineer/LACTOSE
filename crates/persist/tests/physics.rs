@@ -9,8 +9,12 @@
 
 #![forbid(unsafe_code)]
 
-mod glue;
+use crate::glue;
 #[path = "../../physics-api/tests/common/mod.rs"]
+#[expect(
+    clippy::module_inception,
+    reason = "this file's module is named after the file, and the test backend's after its crate"
+)]
 mod physics;
 
 use std::sync::Arc;

@@ -90,8 +90,9 @@ pub struct Package {
     /// True if `cargo test` runs the library's doc tests: it has a library whose manifest
     /// leaves `doctest` on.
     pub doctests: bool,
-    /// The names of the integration test targets, sorted.
-    pub tests: Vec<String>,
+    /// The integration test targets, each by name with its root source file relative to the
+    /// workspace root.
+    pub tests: BTreeMap<String, String>,
     /// The binary, bench and example targets whose manifest leaves or turns `test` on, so that
     /// `cargo test` runs them: each as its kind (`bin`, `bench` or `example`) and name, sorted.
     pub other_tests: Vec<(String, String)>,
@@ -391,7 +392,7 @@ pub fn parse_metadata(json: &str) -> Result<Metadata, String> {
         let mut proc_macro = false;
         let mut build_script = false;
         let (mut lib, mut doctests, mut tests, mut other_tests) =
-            (false, false, Vec::new(), Vec::new());
+            (false, false, BTreeMap::new(), Vec::new());
         for target in &package.targets {
             let is = |kind: &str| target.kind.iter().any(|k| k == kind);
             proc_macro |= is("proc-macro");
@@ -402,14 +403,14 @@ pub fn parse_metadata(json: &str) -> Result<Metadata, String> {
                 lib = true;
                 doctests |= target.doctest;
             }
-            if is("test") {
-                tests.push(target.name.clone());
-            }
             let other = ["bin", "bench", "example"].into_iter().find(|kind| is(kind));
             if let (Some(kind), true) = (other, target.test) {
                 other_tests.push((kind.to_owned(), target.name.clone()));
             }
             let root = relative(&raw.workspace_root, &target.src_path)?;
+            if is("test") {
+                tests.insert(target.name.clone(), root.clone());
+            }
             if !["test", "bench", "example", "custom-build"].iter().any(|kind| is(kind)) {
                 shipped_roots.push(root.clone());
             }
@@ -419,7 +420,6 @@ pub fn parse_metadata(json: &str) -> Result<Metadata, String> {
         crate_roots.dedup();
         shipped_roots.sort();
         shipped_roots.dedup();
-        tests.sort();
         other_tests.sort();
         let deps = package
             .dependencies
@@ -556,6 +556,8 @@ fn relative(root: &str, path: &str) -> Result<String, String> {
 
 #[cfg(test)]
 pub(crate) mod fixture {
+    use std::collections::BTreeMap;
+
     use super::{Dep, DepKind, DepSource, Package, ResolvedPackage, Workspace};
 
     /// A package at `crates/<role>` with a library root and the given edges. A dependency is
@@ -571,7 +573,7 @@ pub(crate) mod fixture {
             build_script: false,
             lib: true,
             doctests: true,
-            tests: Vec::new(),
+            tests: BTreeMap::new(),
             other_tests: Vec::new(),
             deps: deps
                 .iter()
@@ -720,7 +722,12 @@ mod tests {
         assert_eq!(core.shipped_roots, ["crates/core/src/lib.rs"]);
         assert!(!core.proc_macro && !core.build_script);
         assert!(core.lib && core.doctests);
-        assert_eq!(core.tests, ["a", "t"]);
+        assert_eq!(
+            core.tests,
+            [("a", "crates/core/tests/a.rs"), ("t", "crates/core/tests/t.rs")]
+                .map(|(name, root)| (name.to_owned(), root.to_owned()))
+                .into()
+        );
         assert_eq!(core.other_tests, [("example".to_owned(), "x".to_owned())]);
         let sources: Vec<DepSource> = core.deps.iter().map(|d| d.source).collect();
         assert_eq!(sources, [DepSource::External, DepSource::External, DepSource::Path]);

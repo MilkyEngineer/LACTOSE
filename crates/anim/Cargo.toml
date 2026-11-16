@@ -6,6 +6,7 @@ edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 license.workspace = true
+autotests = false
 
 [dependencies]
 # The three asset kinds the simulation reads (clips, state machines, skeletons), the loader
@@ -46,6 +47,12 @@ lactose-predict.workspace = true
 # dev-dependency, so the boundary allowlist is untouched and the library names nothing of
 # `task`.
 lactose-task.workspace = true
+
+# The integration tests as one test binary, whose root declares the files of tests/ as
+# modules (D125).
+[[test]]
+name = "integration"
+path = "tests/integration.rs"
 
 [lints]
 workspace = true

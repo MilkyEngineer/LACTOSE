@@ -6,6 +6,7 @@ edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 license.workspace = true
+autotests = false
 
 [dependencies]
 # `Pod` for the wire-shaped plain data: handles, quantised values, the handshake.
@@ -34,6 +35,18 @@ lactose-input.workspace = true
 lactose-physics-api.workspace = true
 # The SOUR test builds its executor the way a SOUR test does (`ChaosConfig`).
 lactose-task.workspace = true
+
+# The integration tests as one test binary, whose root declares the files of tests/ as
+# modules (D125).
+[[test]]
+name = "integration"
+path = "tests/integration.rs"
+
+# A binary of its own ([test_targets] in tools/xtask/ci-policy.toml): its `#[global_allocator]`
+# would count every other test's allocations too in the package's one binary.
+[[test]]
+name = "interpolation_alloc"
+path = "tests/interpolation_alloc.rs"
 
 [lints]
 workspace = true

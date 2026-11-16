@@ -3,7 +3,7 @@
 
 #![forbid(unsafe_code)]
 
-mod common;
+use crate::common;
 
 use common::{Env, knight};
 use lactose_cook::cook;

@@ -1008,7 +1008,8 @@ editorial pass rather than one taken from a review.
   which no digest sees; the names are what tell a reuse of the same type from a rename, which
   the digest cannot. A new type, a removed one, a version that rose with any digest and a new
   field fail only until the record is rewritten by
-  `LACTOSE_SCHEMA_RECORD=update cargo nextest run -p lactose-app --test schema_record`, which
+  `LACTOSE_SCHEMA_RECORD=update cargo nextest run -p lactose-app --test integration
+  schema_record::`, which
   refuses to write while any of the failures above stands, refuses a record that would not read
   back as the build's, and writes a missing record whole; `LACTOSE_SCHEMA_RECORD=rename` also
   takes a new name under a recorded ID whose type is unchanged as a rename. The record writes a
@@ -6339,6 +6340,52 @@ it at every merge and on CI's three hosts** (§8.2, §9.1, §20, `.gitattributes
   `disallowed-methods` only (the `clippy.toml` and `crate-tiers.toml` comments that repeat it
   change with the lint's lane); in `docs/plans/milestone-1.md`, section 2's "The spike measures
   the gather path". In section 8.2 nothing: its bans stand and gain one.
+
+**D150. Each package's integration tests are one test binary, except a file that shares
+process state; the nightly Miri filters name modules that Miri compiles** (§20, `tools/xtask`,
+`.github/workflows/nightly.yml`, every package with integration tests)
+- Why: D125's next lever. Each integration-test target is a binary to link, and CI's Windows
+  check job was near its limit with 179 of them.
+  - *One binary per package.* A package with more than one integration test file builds them as
+    one target, `integration`. Its root `tests/integration.rs` declares every other file of
+    `tests/` as a module (`autotests = false`). A package with one test file keeps it as a
+    target under its own name. A file whose name holds a codename (CLAUDE.md, Names) is declared
+    under a name for what it holds, with `#[path]` (`#[path = "sour.rs"] mod recorded;`).
+  - *A test file that shares process state stays a binary of its own, with its reason.* The
+    tests of one target share a process under `cargo test` and `cargo miri test`; nextest alone
+    gives each test its own process. A test file stays separate when it installs what a process
+    has one of (a `#[global_allocator]`, the tracing subscriber); measures what is one per
+    process (its CPU time, rayon's global pool); asserts when a file lock is let go, which a
+    process another test spawns holds until its exec; or is a target that a tool builds alone.
+    Each is listed under its reason in `[test_targets]` `separate` of
+    `tools/xtask/ci-policy.toml`: 25 targets at the merge. Review found the subscriber case when
+    the selection of `lactose-ecs`'s nightly Miri entry failed under Miri in review, and the
+    others under plain `cargo test`.
+  - *What `cargo xtask boundary` enforces.* It reports a package with more than one test target
+    outside the list; a list entry that names no test target; a file of `tests/` that cargo
+    would make a target of (`tests/*.rs`, `tests/*/main.rs`) and that no test target compiles;
+    and a module of a test target whose name holds a codename. It walks each target's module
+    tree as rustc resolves it, each file relative to the file that declares it, through inline
+    modules. Whether a file needs a process of its own is not checked; the list holds what
+    review found.
+  - *The nightly Miri job divides a binary by libtest filter.* Each filter of an entry must be
+    `<module>::`. The module must be declared at the root of a test target the entry selects,
+    and no `cfg` naming `miri` may compile it out: not on its declaration, not at the top of its
+    file, not at the top of the root. A module renamed, removed or compiled out under Miri
+    therefore fails the check, instead of the filter silently selecting nothing; a single test
+    may still be gated or ignored under Miri. Of a `[miri_split]` package's targets, one entry
+    runs a target whole, or exactly two entries divide it, one naming filters and the other
+    skipping each with `--skip`. `lactose-ecs` runs in four entries: `erased_rows::` of the lib
+    and `integration`; `ownership`, `alloc`, `channel_skip` and `units` whole; the lib and
+    `integration` with `--skip erased_rows::`; and the doc tests.
+  - *Figures.* Integration-test targets went from 179 to 46. nextest's suites went from 206 to
+    73, and its testcases from 2003 to 1863: the support modules' own tests, once compiled into
+    every binary that declared them, are now compiled once. Normalised, no test was lost. A cold
+    `cargo nextest run --workspace --no-run -j4 --locked` (`CARGO_INCREMENTAL=0`, a fresh target
+    directory, Apple M1, one run each, back to back) took 3 min 05 s at the base and 2 min 24 s
+    at the merged shape, by cargo's own figure. The base run started at load 2.59; the merged
+    run started at 8.41 and reached 76.07 by its end. The figure is indicative only; the Windows
+    check job's time on the first CI runs after the merge decides.
 
 ## 10. Review history
 

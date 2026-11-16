@@ -28,12 +28,19 @@ struct Harness {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct TestTargets {
+    separate: Vec<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawPolicy {
     unsafe_crates: Crates,
     lint_file_carriers: Crates,
     feature_roots: Packages,
     harness: Harness,
     miri_split: Packages,
+    test_targets: TestTargets,
 }
 
 /// The parsed policy file.
@@ -50,8 +57,11 @@ pub struct Policy {
     /// The tests that record hashes under the harness, by their recorded names.
     pub harness_tests: Vec<String>,
     /// The packages the nightly Miri job splits over several entries, which together must
-    /// run each of their targets exactly once.
+    /// run each of their tests exactly once.
     pub miri_split: Vec<String>,
+    /// The test targets that stay binaries of their own beside a package's `integration`
+    /// (D125), each as `package::target`.
+    pub separate_test_targets: Vec<String>,
 }
 
 impl Policy {
@@ -68,6 +78,7 @@ impl Policy {
             harness_packages: raw.harness.packages,
             harness_tests: raw.harness.tests,
             miri_split: raw.miri_split.packages,
+            separate_test_targets: raw.test_targets.separate,
         })
     }
 }
@@ -83,6 +94,7 @@ mod tests {
         assert_eq!(policy.lint_file_carriers, ["lactose-reflect-macros", "lactose-ecs-macros"]);
         assert!(!policy.harness_tests.is_empty());
         assert_eq!(policy.miri_split, ["lactose-ecs"]);
+        assert!(policy.separate_test_targets.contains(&"lactose-ecs::alloc".to_owned()));
     }
 
     #[test]

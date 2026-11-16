@@ -10,7 +10,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use crate::policy::Policy;
 use crate::repo::{Files, is_build_configuration, is_cargo_config, unread_cargo_configuration};
-use crate::rust_source::{Attribute, Impl, attributes, items};
+use crate::rust_source::{Attribute, Impl, Items, attributes, items};
 use crate::tiers::{TierFile, turning_on};
 use crate::workspace::{DepKind, DepSource, Package, Workspace};
 use crate::{ARCHITECTURE, Finding, POLICY_FILE, TIER_FILE};
@@ -1219,54 +1219,11 @@ fn shipped_impls(package: &Package, files: &Files, features: &[String]) -> Vec<(
                 continue;
             };
             let items = items(&source, features);
+            for (child, child_dir, gated) in children(&file, &dir, &items, files) {
+                queue.push_back((child, child_dir, test_only || gated));
+            }
             for implementation in items.impls.into_iter().filter(|i| !test_only && !i.test_only) {
                 found.insert((file.clone(), implementation.line), implementation);
-            }
-            for module in items.modules {
-                // The directory of the innermost inline module around the declaration: each
-                // is a directory of its name under the one around it, or the one its `#[path]`
-                // names relative to it. At the top of a file that is the file's own
-                // directory, without the one a `name.rs` adds for its modules.
-                let mut base = Some(dir.clone());
-                for (depth, inline) in module.inline.iter().enumerate() {
-                    base = match &inline.path {
-                        Some(named) if depth == 0 => joined(parent(&file), named),
-                        Some(named) => base.and_then(|base| joined(&base, named)),
-                        None => base.map(|base| format!("{base}/{}", inline.name)),
-                    };
-                }
-                let Some(base) = base else {
-                    continue;
-                };
-                let child = match &module.path {
-                    // Outside an inline module a `#[path]` is relative to the file's own
-                    // directory, inside one to the module's.
-                    Some(named) if module.inline.is_empty() => module_file(&file, named),
-                    Some(named) => joined(&base, named),
-                    None => [
-                        format!("{base}/{}.rs", module.name),
-                        format!("{base}/{}/mod.rs", module.name),
-                    ]
-                    .into_iter()
-                    .find(|candidate| files.contains(candidate)),
-                };
-                // A `#[path]` file holds its modules beside it, as a `mod.rs` does; a
-                // `name.rs` in the directory `name`, which is where `name/mod.rs` holds them.
-                let child_dir = match &module.path {
-                    Some(_) => child.as_deref().map(|child| parent(child).to_owned()),
-                    None => Some(format!("{base}/{}", module.name)),
-                };
-                if let (Some(child), Some(child_dir)) = (child, child_dir) {
-                    queue.push_back((child, child_dir, test_only || module.test_only));
-                }
-            }
-            // An included file is part of the module it sits in, and holds its own modules
-            // beside it.
-            for include in items.includes {
-                if let Some(child) = module_file(&file, &include.path) {
-                    let child_dir = parent(&child).to_owned();
-                    queue.push_back((child, child_dir, test_only || include.test_only));
-                }
             }
         }
         if !std::mem::take(&mut sweep) {
@@ -1308,15 +1265,73 @@ fn unnamed_allowlist_entries(tiers: &TierFile, package: &Package, findings: &mut
     }
 }
 
+/// The files that the out-of-line modules and the literal `include!`s of `file` name, read
+/// with its own out-of-line modules in the directory `dir`, as rustc resolves them: each with
+/// the directory its own modules sit in and whether a `cfg` on its declaration holds only for
+/// tests (see [`items`]). A module whose file is in neither place it may be is left out.
+pub(crate) fn children(
+    file: &str,
+    dir: &str,
+    items: &Items,
+    files: &Files,
+) -> Vec<(String, String, bool)> {
+    let mut found = Vec::new();
+    for module in &items.modules {
+        // The directory of the innermost inline module around the declaration: each is a
+        // directory of its name under the one around it, or the one its `#[path]` names
+        // relative to it. At the top of a file that is the file's own directory, without the
+        // one a `name.rs` adds for its modules.
+        let mut base = Some(dir.to_owned());
+        for (depth, inline) in module.inline.iter().enumerate() {
+            base = match &inline.path {
+                Some(named) if depth == 0 => joined(parent(file), named),
+                Some(named) => base.and_then(|base| joined(&base, named)),
+                None => base.map(|base| format!("{base}/{}", inline.name)),
+            };
+        }
+        let Some(base) = base else {
+            continue;
+        };
+        let child = match &module.path {
+            // Outside an inline module a `#[path]` is relative to the file's own directory,
+            // inside one to the module's.
+            Some(named) if module.inline.is_empty() => module_file(file, named),
+            Some(named) => joined(&base, named),
+            None => {
+                [format!("{base}/{}.rs", module.name), format!("{base}/{}/mod.rs", module.name)]
+                    .into_iter()
+                    .find(|candidate| files.contains(candidate))
+            }
+        };
+        // A `#[path]` file holds its modules beside it, as a `mod.rs` does; a `name.rs` in the
+        // directory `name`, which is where `name/mod.rs` holds them.
+        let child_dir = match &module.path {
+            Some(_) => child.as_deref().map(|child| parent(child).to_owned()),
+            None => Some(format!("{base}/{}", module.name)),
+        };
+        if let (Some(child), Some(child_dir)) = (child, child_dir) {
+            found.push((child, child_dir, module.test_only));
+        }
+    }
+    // An included file is part of the module it sits in, and holds its own modules beside it.
+    for include in &items.includes {
+        if let Some(child) = module_file(file, &include.path) {
+            let child_dir = parent(&child).to_owned();
+            found.push((child, child_dir, include.test_only));
+        }
+    }
+    found
+}
+
 /// The repository path of the file that `#[path = "named"]` in the file `from` names: relative
 /// to the directory of `from`, as for every `mod` outside an inline module block. `None` for
 /// a path that is absolute or leaves the repository.
-fn module_file(from: &str, named: &str) -> Option<String> {
+pub(crate) fn module_file(from: &str, named: &str) -> Option<String> {
     joined(parent(from), named)
 }
 
 /// The directory of a repository path, `""` at the root.
-fn parent(path: &str) -> &str {
+pub(crate) fn parent(path: &str) -> &str {
     path.rsplit_once('/').map_or("", |(dir, _)| dir)
 }
 

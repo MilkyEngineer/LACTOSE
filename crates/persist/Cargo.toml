@@ -6,6 +6,7 @@ edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 license.workspace = true
+autotests = false
 
 [dependencies]
 # `CheckedBitPattern` and `NoUninit` for the typed field reads and writes a migration makes.
@@ -42,6 +43,18 @@ lactose-task.workspace = true
 lactose-physics-api.workspace = true
 # The included test backend logs what it ignores.
 tracing.workspace = true
+
+# The integration tests as one test binary, whose root declares the files of tests/ as
+# modules (D125).
+[[test]]
+name = "integration"
+path = "tests/integration.rs"
+
+# A binary of its own ([test_targets] in tools/xtask/ci-policy.toml): its `#[global_allocator]`
+# would count every other test's allocations too in the package's one binary.
+[[test]]
+name = "container"
+path = "tests/container.rs"
 
 [lints]
 workspace = true

@@ -754,11 +754,15 @@ debug symbols (`dsymutil`). With a function named in an environment variable the
 scales its result by 1 + 1e-6, which is the perturbation of section 1.4.
 
 ```
-cargo test -p lactose-physics-rapier --test sour --no-run
-cargo test -p lactose-app --test spike --test headless --no-run
+cargo test -p lactose-physics-rapier --test integration --no-run
+cargo test -p lactose-app --test integration --no-run
 DYLD_INSERT_LIBRARIES=<interposer> PLANNER_PHYSICS_TRACE_OUT=<file> \
-    <test binary> --exact <test> --test-threads=1
+    <test binary> --exact <module>::<test> --test-threads=1
 ```
+
+Since D150 a test's name in the binary is its path below the root, `<module>::<test>`:
+`sour.rs`'s tests are under `recorded::`, the spike's under `spike::` and the headless app's
+under `headless::`.
 
 The leaf-count arithmetic is section 1.3's three lines evaluated for each count, with the
 distance of the rounded expression from the nearest half-integer at or above one half.

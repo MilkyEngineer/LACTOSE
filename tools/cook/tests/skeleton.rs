@@ -5,7 +5,7 @@
 
 #![forbid(unsafe_code)]
 
-mod common;
+use crate::common;
 
 use common::{Env, knight, run_binary, sources};
 use lactose_anim::{

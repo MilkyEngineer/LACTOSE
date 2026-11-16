@@ -12,7 +12,7 @@
 
 #![forbid(unsafe_code)]
 
-mod support;
+use crate::support;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};

@@ -197,29 +197,50 @@ pub fn exit_code(status: ExitStatus) -> i32 {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::mpsc;
+    use std::any::Any;
+    use std::sync::{PoisonError, RwLock, mpsc};
 
     use super::*;
 
+    /// A spawned process holds a copy of each descriptor of this one, a slot's lock among them,
+    /// until its exec closes them, and under `cargo test` the tests of this binary share one
+    /// process: each test holds this for reading while it works with slots, and the test that
+    /// spawns a process holds it for writing, so that no other test's slot outlives its holder
+    /// in the child.
+    static SPAWN: RwLock<()> = RwLock::new(());
+
     /// A scratch directory whose `lactose-heavy` child does not exist yet, removed on drop.
-    struct Scratch(PathBuf);
+    struct Scratch {
+        root: PathBuf,
+        /// The test's guard of [`SPAWN`].
+        _spawn: Box<dyn Any>,
+    }
 
     impl Scratch {
         fn new(name: &str) -> Self {
+            Self::with(name, Box::new(SPAWN.read().unwrap_or_else(PoisonError::into_inner)))
+        }
+
+        /// The scratch directory of the test that spawns a process.
+        fn spawning(name: &str) -> Self {
+            Self::with(name, Box::new(SPAWN.write().unwrap_or_else(PoisonError::into_inner)))
+        }
+
+        fn with(name: &str, spawn: Box<dyn Any>) -> Self {
             let root =
                 std::env::temp_dir().join(format!("lactose-heavy-{}-{name}", std::process::id()));
             let _ = fs::remove_dir_all(&root);
-            Self(root)
+            Self { root, _spawn: spawn }
         }
 
         fn slots(&self) -> PathBuf {
-            self.0.join("lactose-heavy")
+            self.root.join("lactose-heavy")
         }
     }
 
     impl Drop for Scratch {
         fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
+            let _ = fs::remove_dir_all(&self.root);
         }
     }
 
@@ -293,7 +314,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_child_process_does_not_keep_the_slot() {
-        let scratch = Scratch::new("child");
+        let scratch = Scratch::spawning("child");
         let dir = scratch.slots();
         let slot = try_acquire(&dir, ONE).unwrap().unwrap();
         let mut child = std::process::Command::new("sh")

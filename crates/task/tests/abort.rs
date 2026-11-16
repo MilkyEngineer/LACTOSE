@@ -6,7 +6,7 @@
 // Miri cannot spawn processes.
 #![cfg(not(miri))]
 
-mod common;
+use crate::common;
 
 use std::io::Read;
 use std::process::{Command, Stdio};
@@ -34,8 +34,12 @@ fn aborts_saying(test: &str, case: &str, expected: &str) -> bool {
     if std::env::var_os(CHILD_ENV).is_some() {
         return false;
     }
+    // The harness names a test by its path below the crate root.
+    let path = module_path!()
+        .split_once("::")
+        .map_or_else(|| test.to_owned(), |(_, module)| format!("{module}::{test}"));
     let mut child = Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", test, "--nocapture", "--test-threads", "1"])
+        .args(["--exact", path.as_str(), "--nocapture", "--test-threads", "1"])
         .env(CHILD_ENV, case)
         .stdin(Stdio::null())
         .stdout(Stdio::null())

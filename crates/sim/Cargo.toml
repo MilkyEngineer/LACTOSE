@@ -6,6 +6,7 @@ edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 license.workspace = true
+autotests = false
 
 [dependencies]
 # Types only (architecture section 8.2): the exact-version asset table a region receives and
@@ -32,6 +33,12 @@ lactose-task.workspace = true
 # An xxh64 written by someone else, so the golden hash test reimplements the encoding
 # without calling this crate's.
 xxhash-rust = { workspace = true, features = ["xxh64"] }
+
+# The integration tests as one test binary, whose root declares the files of tests/ as
+# modules (D125).
+[[test]]
+name = "integration"
+path = "tests/integration.rs"
 
 [lints]
 workspace = true

@@ -6,7 +6,7 @@
 
 #![forbid(unsafe_code)]
 
-mod common;
+use crate::common;
 
 use std::num::NonZeroU64;
 use std::sync::Arc;

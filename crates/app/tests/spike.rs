@@ -27,17 +27,7 @@
 #![forbid(unsafe_code)]
 #![allow(missing_docs)]
 
-#[path = "../../../tools/xtask/src/harness/protocol.rs"]
-#[expect(
-    clippy::wrong_self_convention,
-    reason = "the runner's module as written; it is included, not owned, here"
-)]
-#[allow(
-    unfulfilled_lint_expectations,
-    reason = "the boundary lints these expectations name are not configured outside the boundary"
-)]
-#[allow(dead_code, reason = "the runner's module as written; a test uses what it needs")]
-mod protocol;
+use crate::protocol;
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::num::NonZeroU32;
@@ -3029,10 +3019,11 @@ fn measure(scene: Scene, clock: ClockScript) {
 
 // One test per scene and clock, each under the ten-minute limit `.config/nextest.toml`
 // gives these tests. Run in release, one at a time so that the rollback times are the
-// scene's own: `cargo nextest run -p lactose-app --test spike --release --run-ignored only
-// --test-threads 1 --no-capture`. Not shorter: on the server's clock the thrown scene
-// corrects nothing until the client's solver history departs from the server's, minutes
-// in, and every cycle after, so a run that ends before the departure reports almost none.
+// scene's own: `cargo nextest run -p lactose-app --test integration --release --run-ignored
+// only --test-threads 1 --no-capture spike::`. Not shorter: on the server's clock the
+// thrown scene corrects nothing until the client's solver history departs from the
+// server's, minutes in, and every cycle after, so a run that ends before the departure
+// reports almost none.
 
 #[test]
 #[ignore = "ten minutes of ticks, in release"]

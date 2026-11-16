@@ -620,7 +620,7 @@ mod renamed {
 }
 
 /// Declared through a re-export of the reflect crate, as `lactose-ecs` will.
-#[component(key = "test::through_reexport", persistent, crate = "crate::renamed::reflect")]
+#[component(key = "test::through_reexport", persistent, crate = "crate::reflect::renamed::reflect")]
 pub struct ThroughReexport {
     /// A nested value declared the same way.
     #[field(id = 1)]
@@ -628,7 +628,7 @@ pub struct ThroughReexport {
 }
 
 /// A value declared through a re-export.
-#[value(crate = "crate::renamed::reflect")]
+#[value(crate = "crate::reflect::renamed::reflect")]
 pub struct ReexportedValue(#[field(id = 1)] pub u8);
 
 /// Zeroed every tick, but zero is not a network ID.

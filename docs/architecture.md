@@ -1332,6 +1332,19 @@ The policy is in section 3.
 - CI: clippy `-D warnings`, fmt, nextest, SOUR in all applicable modes, Miri nightly on
   `core`, `task` over each deque, `ecs`, `input-host` and `net-host`, `cargo-deny`, the tier,
   boundary, feature and vendor checks, and the line-ending check.
+- A package with more than one integration test file builds them as one test binary,
+  `integration`, whose root `tests/integration.rs` declares every other file of `tests/` as a
+  module (`autotests = false`); a package of one test file keeps its own target name. A file
+  whose name holds a codename is declared under a name for what it holds, with `#[path]`. The
+  tests of one binary share a process under `cargo test` and `cargo miri test`, so a file that
+  installs process-wide state (a `#[global_allocator]`, the tracing subscriber), measures the
+  whole process, or asserts on a lock a spawned child could hold stays a binary of its own,
+  listed with its reason in `[test_targets]` of `tools/xtask/ci-policy.toml`. `cargo xtask
+  boundary` checks that no other package has a second test target, that every file of `tests/`
+  that cargo would make a target of is compiled, and that no test module's name holds a
+  codename. Each nightly Miri filter must name a module of a target its entry selects that no
+  `cfg` naming `miri` compiles out, so a renamed, removed or Miri-gated module fails the check
+  (D150).
 - Every tracked text file outside `vendor/` has LF line endings, in the index and in every
   checkout made or refreshed under the rule: `.gitattributes` sets `* text=auto eol=lf`,
   which holds whatever `core.autocrlf` says. Code that compares, hashes or parses a tracked

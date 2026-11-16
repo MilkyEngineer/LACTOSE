@@ -2,7 +2,7 @@
 # derives them; `crates/app/README.md`, "The saved-type record", says what each
 # line holds and when the record changes. It is compared with LF line endings and
 # rewritten only by this command, or by it with `rename` in place of `update`:
-#   LACTOSE_SCHEMA_RECORD=update cargo nextest run -p lactose-app --test schema_record
+#   LACTOSE_SCHEMA_RECORD=update cargo nextest run -p lactose-app --test integration schema_record::
 anim::sim_pose key=0x109a893f2ff91874 component transient version=1 digest=0xfe8de7cebcc8cd01
   1 bones: [struct BonePose; 16]
   1.1 translation: struct Vec3

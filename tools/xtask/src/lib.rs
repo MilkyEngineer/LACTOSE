@@ -21,6 +21,7 @@ pub mod miri;
 pub mod policy;
 pub mod repo;
 mod rust_source;
+pub mod test_targets;
 pub mod tiers;
 pub mod vendor;
 pub mod workspace;
@@ -58,3 +59,7 @@ pub const POLICY_FILE: &str = "tools/xtask/ci-policy.toml";
 /// The repository-relative path of the architecture document, whose unsafe policy table the
 /// policy file transcribes.
 pub const ARCHITECTURE: &str = "docs/architecture.md";
+
+/// The repository-relative path of the project instructions, whose Names table lists the
+/// codenames that no module may carry.
+pub const NAMES: &str = "CLAUDE.md";

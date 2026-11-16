@@ -1,8 +1,9 @@
 //! What the predictor logs at warn: an entry the world refuses, a spawn's component that is
 //! not a replicated one and a statement's key that is not a transient unreplicated component
 //! each warn once, in the predicted tick that popped its frame, and not again in the replays
-//! of that tick, which log a skipped component at debug. Alone in its binary, since it
-//! installs the process's tracing subscriber.
+//! of that tick, which log a skipped component at debug. Each test installs the process's
+//! tracing subscriber, so each needs a process of its own, which nextest gives it; the file is
+//! a binary of its own so that no other test shares one.
 
 #![forbid(unsafe_code)]
 

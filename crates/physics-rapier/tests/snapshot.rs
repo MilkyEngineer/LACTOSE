@@ -5,7 +5,7 @@
 
 #![forbid(unsafe_code)]
 
-mod support;
+use crate::support;
 
 use lactose_core::ErrorKind;
 use lactose_physics_api::{Joint, JointKind, PhysicsBackend, RigidBody, Velocity};
