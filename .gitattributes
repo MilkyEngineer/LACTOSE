@@ -1,3 +1,12 @@
+# Every tracked text file outside `vendor/` has LF line endings, in the index and in every
+# checkout made or refreshed under this rule, on every host and whatever `core.autocrlf` says
+# (architecture section 20), so code that compares, hashes or parses a tracked file reads the
+# same bytes everywhere. A file that is not text is named by kind, as `binary`, on a line
+# between this rule and the vendor line, in the change that adds the first of its kind.
+# `tools/xtask/line-endings.sh` checks the tree against this file, in CI and at every merge.
+* text=auto eol=lf
+
 # Vendored third-party sources (architecture section 8.2, D123) are hashed byte for byte by
 # `cargo xtask vendor` and by the boundary build ID: no end-of-line conversion on any host.
+# This line stays the last one, below every line that can match a file under `vendor/`.
 vendor/** -text

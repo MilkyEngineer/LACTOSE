@@ -1,7 +1,8 @@
 # lactose-xtask
 
 The CI driver. Every rule that CI enforces and that is not a compiler, clippy or cargo-deny
-diagnostic is a subcommand here, so it runs the same on a laptop as on a runner.
+diagnostic is a subcommand here, so it runs the same on a laptop as on a runner, except the
+line-ending rule, which is a script beside it (below).
 
 | | |
 |---|---|
@@ -37,6 +38,7 @@ write nothing to standard output themselves.
 | `tools/xtask/ci-policy.toml` | What is not a dependency rule: the unsafe list of section 21, the crates that carry the boundary lint file without being in the boundary, the shipped binaries, the harness packages, the tests that record hashes and the packages the nightly Miri job splits |
 | `deny.toml` | Licences, sources, advisories and duplicate versions, enforced by `cargo deny check` |
 | `crates/core/clippy.toml` | The boundary lints; every boundary crate carries an identical copy |
+| `.gitattributes` | The line-ending rule and its exceptions, which `line-endings.sh` checks (below) |
 
 A new shipped binary goes into `[feature_roots]`, a package with simulation tests into
 `[harness]` `packages` and each simulation test into `[harness]` `tests`, all in
@@ -278,6 +280,72 @@ loom's model. `lactose-input-host`'s optional dependency on loom and its feature
 The token scan reads the patch's added lines only, and a word in a comment counts, so a
 notice does not name them. It cannot see unsafe code reached through a macro the crate
 already has, or through a build script's output; review covers those.
+
+## Line endings
+
+`bash tools/xtask/line-endings.sh` checks the line-ending rule of architecture section 20
+(D148) against git's own account of every tracked file: its line endings in the index and in
+the working tree, and the attribute that governs them, from `git ls-files --format` (git
+2.38 or later). It lists the whole tree, with paths from the root, whatever directory it
+runs in. It is a script and not a subcommand, so that a runner checks its checkout before
+any build. `merger` runs it at every merge, where the index and the attributes read the same
+on every host; CI's check job runs it first on the three hosts, since each working tree is
+its host's own.
+
+It accepts a file in one of three shapes and refuses every other:
+
+| Path | Attribute | Index | Working tree |
+|---|---|---|---|
+| outside `vendor/` | `text=auto eol=lf` | `lf` or `none` | `lf` or `none` |
+| under `vendor/` | `-text` | any | any |
+| outside `vendor/` | `-text` | `-text` | any |
+
+`none` is a file with no line break, and `-text` in the index a file git reads as binary,
+which outside `vendor/` passes only under a `-text` or `binary` line. Under `vendor/` the
+script asks only for `-text`; that the root file's vendor line exists is `vendor`'s check as
+well. A file of a kind named `binary` whose bytes git reads as text is refused,
+and the change that adds it admits its path in the script.
+
+Each refusal prints `path: i/<index> w/<worktree> attr/<attribute>` and, below it, every
+remedy that applies, the attribute's first, since `git add --renormalize` stores LF only
+under the rule:
+
+- Attribute `-text` outside `vendor/` over an index that is not `-text`: a `-text` or
+  `binary` line reaches a text file, and is narrowed or removed.
+- A path under `vendor/` whose attribute is not `-text`: the vendor line is restored as the
+  last line of the root `.gitattributes` that reaches it, and a `.gitattributes` under
+  `vendor/` that sets an attribute on it is removed (D123). For a vendored file this remedy
+  is printed alone.
+- Any other attribute: a line takes the file out of the rule, or the rule's line is gone.
+  On a host that converts, that is why its working tree is CRLF.
+- Index `crlf` or `mixed`: `git add --renormalize -- <path>`, the path quoted for the shell;
+  a plain `git add` keeps the CR. A name git printed quoted is not repeated as an argument,
+  since its quoting is git's, not the shell's.
+- Working tree `crlf` or `mixed` over an index `lf`, under the rule: the checkout predates
+  the rule, or a CRLF edit was committed. With nothing uncommitted and no merge in progress,
+  `git rm --cached -r -q :/` then `git reset --hard` refresh it; `git add --renormalize`,
+  `git checkout`, `git checkout-index -f -a` and `git reset --hard` alone do not. In CI,
+  whose checkout is fresh, the rule does not hold on that host, and the decision returns to
+  the planner.
+- Index `-text` under the rule: a stray CR or NUL is removed from a text file, or a kind that
+  is not text is named `binary`.
+- An empty index or working-tree field: a symbolic link or submodule, which the rule does not
+  admit, or a file missing from the checkout, which is restored.
+- Anything else, which is a working tree `-text` over an index `lf` or `none`, or `crlf` or
+  `mixed` over an index `none`: the working file holds an uncommitted edit, which is
+  reverted. Committed instead, it is refused again by the remedy its new line matches.
+
+The last line is `line-endings: <n> files read, none refused` with exit status 0, or
+`line-endings: <r> of <n> files refused` with 1. It exits 2, with a message on standard
+error, when `git ls-files` fails or lists no file, or when it reads fewer lines than git
+listed. A copy of the script checked out with CRLF runs itself again without the carriage
+returns, so it still refuses what git lists; run through standard input, a pipe or a process
+substitution, such a copy cannot read itself again and exits 2. It cannot see a file that
+is not text and that git took for text, since `git add` rewrote it; the change that adds a
+kind names it `binary`. A copy whose lines end in a lone carriage return is one line to
+bash, a comment, and it exits 0 with no output and no last line. git takes such a file for
+binary and stores it as it is, so only the review of its diff, where the script collapses to
+one line, sees it.
 
 ## SOUR
 

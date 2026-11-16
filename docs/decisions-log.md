@@ -6209,6 +6209,69 @@ relayed by an event when it acts on another body** (§6.1, §10, `lactose-ecs`,
 - Driven by: the brief `ricotta`; the ricotta reviews r1 (B1, S1, S2, M1 to M6), r2 (N1 to
   N5) and r3, and their fix rounds (2026-11-16).
 
+**D148. Every tracked text file outside `vendor/` has LF line endings, in the index and in
+every checkout made or refreshed under the rule: `.gitattributes` sets `* text=auto eol=lf`,
+`vendor/**` stays `-text`, a kind that is not text is named `binary`, and one script checks
+it at every merge and on CI's three hosts** (§8.2, §9.1, §20, `.gitattributes`,
+`tools/xtask/line-endings.sh`, `.github/workflows/ci.yml`, `docs/agents.md`)
+- Why: a Windows checkout under `core.autocrlf=true` gave every file outside `vendor/` CRLF,
+  and code that reads a tracked file failed on it twice: the edit-to-playing anchors of
+  `cargo xtask measure` on the Windows runner (run 43654643980 at `d7274b2`, repaired by
+  `9790ce4`), and the schema guard's comparison of its record, found at review (`d6efc8b`).
+  `.gitattributes` held `vendor/** -text` alone (D123), so each reader owed its own tolerance
+  and only the Windows jobs checked it, after a push. `docs/plans/eol-decision.md` holds the
+  evidence; these are the decisions.
+  - *One rule for the repository.* `* text=auto eol=lf`: git stores a text file with LF and
+    checks it out with LF whatever `core.autocrlf` says. None of the 870 tracked files held
+    CRLF in the index at `437fcf6`, so `git add --renormalize .` changed no blob. Probed on
+    git 2.39.5 under `core.autocrlf=true`: the 622 files outside `vendor/` check out LF, and
+    the 248 under it are unchanged.
+  - *The reason is the hashes that must agree between hosts.* Section 9.1's boundary build ID
+    hashes the boundary crates' sources, a Windows client must compute the ID its Linux
+    server computes, and D123 made the bytes equal for `vendor/` alone. The cooker's text
+    sources will need the same once a cooked format embeds source text, and so will
+    milestone 2's golden files if they are compared as bytes. A reader of a tracked file
+    owes no tolerance of CRLF from a checkout.
+  - *`vendor/**` stays `-text`, on the last line; D123 is unchanged.* `cargo xtask vendor`
+    already requires it to be the last line that reaches `vendor/`, and passes with the rule
+    above it.
+  - *A kind of file that is not text is named `binary` in the change that adds its first
+    file.* `text=auto` leaves the choice to git's reading of the content, and a file it takes
+    for text is rewritten on `git add`. None was tracked at `437fcf6`, so none is named.
+  - *The check is one script, `tools/xtask/line-endings.sh`, which `merger` runs at every
+    merge and CI's check job on the three hosts.* It reads git's own listing of each tracked
+    file (`git ls-files --format`, git 2.38 or later). Outside `vendor/` it accepts a file
+    under `text=auto eol=lf` whose index and working tree are LF, and a file under `-text`
+    that git reads as binary. It refuses the rest: CRLF in the index or the working tree, a
+    file git reads as binary whose kind no line names, a `-text` or `binary` line that
+    reaches a text file, and any other attribute, which a later line or the rule line's
+    removal gives. Outside `vendor/`, a symbolic link, a submodule and a text file missing
+    from the checkout are refused as well, since git lists no line endings for them; no link
+    or submodule was tracked at `4d60326`. Under `vendor/` it asks only for `-text`. It
+    cannot see a file that is not text and that git took for text. Its first run on the
+    Windows runner is the proof of the rule. It is a script, not Rust in `cargo xtask`, so
+    that the Windows run waits for no build and the lane's proof runs the file CI runs.
+  - *The CRLF tolerance in code stays.* `measure`'s whole-line anchors, the schema guard's
+    normalising read, `repository_file` in `tools/xtask/tests/workspace.rs`, the workflow
+    reader of `miri.rs` and `vendor.rs`'s handling of `\r`, each with its own test. A checkout
+    not yet refreshed and a hand copy can still carry CRLF.
+  - *One push, made alone, and one refresh of each older checkout.* rust-cache hashes
+    `.cargo/config.toml` and `rust-toolchain.toml` byte for byte, so the Windows jobs' cache
+    key changes once (D125). A checkout or worktree made before the rule under
+    `core.autocrlf=true` keeps its CRLF until, with nothing uncommitted and no merge in
+    progress, `git rm --cached -r -q :/` and `git reset --hard` check every file out again.
+    `git add --renormalize`, `git checkout`, `git checkout-index -f -a` and `git reset
+    --hard` alone do not.
+  - Rules out: `eol=lf` for named paths, whose list nothing would check; every reader
+    tolerating CRLF, which cannot make two hosts' hashes agree; `* -text`, which would leave
+    LF in the index to a check alone; `core.autocrlf=false` in the workflows, which reaches
+    no other clone; a check written into the workflow alone, which `merger` cannot run; an
+    `.editorconfig`; removing the tolerance in code.
+- Driven by: CI run 43654643980 and lane `measure-crlf`; the first review of the schema
+  guard; the probes of `docs/plans/eol-decision.md` at `437fcf6` and its review, which
+  narrowed what the check accepts; the owner's approval of 16 November 2026.
+- Replaced: nothing stated. `.gitattributes` held the vendor line alone.
+
 ## 10. Review history
 
 - **Revision 1** (`a29af04`): the design baseline.

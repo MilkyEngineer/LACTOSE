@@ -61,6 +61,7 @@ pushed to. You never push and never open a pull request.
 5. Gates, each logged with its summary line, in this order:
    `cargo fmt --all --check`; `cargo clippy --workspace --all-targets -- -D warnings`;
    `cargo xtask tiers`; `cargo xtask boundary`; `cargo xtask features`; `cargo xtask vendor`;
+   `bash tools/xtask/line-endings.sh`;
    `cargo nextest run --workspace --no-tests=pass`; `cargo test --doc --workspace`;
    `cargo deny check`; `cargo xtask sour run --pr`; then the cross-target lints over the
    crates the brief names, `cargo clippy -p <crate> ... --all-targets --target

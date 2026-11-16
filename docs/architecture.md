@@ -1331,7 +1331,16 @@ The policy is in section 3.
   background, never in a foreground agent turn.
 - CI: clippy `-D warnings`, fmt, nextest, SOUR in all applicable modes, Miri nightly on
   `core`, `task` over each deque, `ecs`, `input-host` and `net-host`, `cargo-deny`, the tier,
-  boundary, feature and vendor checks.
+  boundary, feature and vendor checks, and the line-ending check.
+- Every tracked text file outside `vendor/` has LF line endings, in the index and in every
+  checkout made or refreshed under the rule: `.gitattributes` sets `* text=auto eol=lf`,
+  which holds whatever `core.autocrlf` says. Code that compares, hashes or parses a tracked
+  file therefore reads the same bytes on every host and owes no tolerance of CRLF from a
+  checkout. Two exceptions, each a line of `.gitattributes`: `vendor/**` is `-text` and keeps
+  upstream's bytes (section 8.2), and a kind of file that is not text is named `binary` in
+  the change that adds its first file (D148). `tools/xtask/line-endings.sh` checks git's
+  listing of the tree against the rule: `merger` runs it at every merge, and CI's check job
+  on the three platforms.
 
 ## 21. Unsafe policy
 
