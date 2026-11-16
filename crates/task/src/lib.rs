@@ -48,17 +48,17 @@ pub use time::{Sleep, TickBudget, TickPacer};
 /// part of the surface: nothing else may call it, and it may change without notice.
 #[doc(hidden)]
 pub mod bench_support {
-    /// Times `samples` successful steals in nanoseconds. Each is taken by a thief thread,
-    /// created through `platform` at frame-critical priority, from a deque that another
-    /// thread filled with range entries, through the function a worker steals with:
-    /// the steal itself, halving the range, pushing the upper half onto the thief's own
-    /// deque and checking for sleepers. Each figure includes one pair of clock readings.
     /// How many background workers `executor` runs.
     #[must_use]
     pub fn background_workers(executor: &crate::Executor) -> u32 {
         executor.background_worker_count()
     }
 
+    /// Times `samples` successful steals in nanoseconds. Each is taken by a thief thread,
+    /// created through `platform` at frame-critical priority, from a deque that another
+    /// thread filled with range entries, through the function a worker steals with:
+    /// the steal itself, halving the range, pushing the upper half onto the thief's own
+    /// deque and checking for sleepers. Each figure includes one pair of clock readings.
     pub fn time_steals(
         platform: &dyn crate::Platform,
         samples: usize,

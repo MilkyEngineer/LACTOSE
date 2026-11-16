@@ -256,7 +256,10 @@ and 400,000 steals, and reports the counts. Beside each measured ratio it report
 two simulated schedulers with no overhead (first-ready and longest-first), which show how far
 the bound is from reachable for the shape; the process's CPU time per run next to the work
 drawn; and the CPU the process uses while it does nothing but wake up. Steal time is measured
-inside the executor, on the function a worker steals with.
+inside the executor, on the function a worker steals with. Every wake or timer sample over
+1 ms, and every graph run over twice its lower bound, is listed with the UTC time it ended, to
+be matched against the system's log of sleeps and wakes (`pmset -g log` on a Mac); steal
+samples carry no time.
 
 Correctness:
 
