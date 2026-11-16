@@ -330,6 +330,10 @@ pub(crate) struct Module {
     pub(crate) path: Option<String>,
     /// Whether it is compiled only for tests (see [`items`]).
     pub(crate) test_only: bool,
+    /// The first attribute on it, outer or, on an inline module, inner at the top of its
+    /// body, that is a `cfg` naming `miri` or a `cfg_attr` that names it and yields a `cfg`
+    /// (see [`cfg_names_miri`]), without whitespace: under Miri it may not be compiled.
+    pub(crate) miri: Option<String>,
     /// The inline modules (`mod name { ... }`) it is declared in, outermost first.
     pub(crate) inline: Vec<InlineModule>,
 }
@@ -405,6 +409,7 @@ pub(crate) fn items(source: &str, features: &[String]) -> Items {
     let mut impl_at = None;
     let mut gated = false;
     let mut path = None;
+    let mut miri = None;
     // Open parentheses and brackets in the item, inside which a `;` ends nothing.
     let mut nesting = 0usize;
     let mut i = 0;
@@ -419,13 +424,20 @@ pub(crate) fn items(source: &str, features: &[String]) -> Items {
             && let Some(end) = skip_brackets(source, open)
         {
             let body = &source[open + 1..end - 1];
+            let compact: String = body.chars().filter(|c| !c.is_whitespace()).collect();
+            let names_miri = cfg_names_miri(&compact).then_some(compact);
             if inner {
                 if let Some(level) = levels.last_mut() {
                     level.test_only |= cfg_test_only(body, features);
+                    if let Some(at) = level.inline_module {
+                        let module = &mut found.inline_modules[at];
+                        module.miri = module.miri.take().or(names_miri);
+                    }
                 }
             } else {
                 gated |= cfg_test_only(body, features);
                 path = path.or_else(|| path_value(body));
+                miri = miri.or(names_miri);
             }
             i = end;
         } else if matches!(byte, b'{' | b'}') || byte == b';' && nesting == 0 {
@@ -459,21 +471,31 @@ pub(crate) fn items(source: &str, features: &[String]) -> Items {
                             name,
                             path: path.take(),
                             test_only,
+                            miri: miri.take(),
                             inline: levels.iter().filter_map(|l| l.module.clone()).collect(),
                         });
                     }
                 }
                 b'{' => {
+                    let mut inline_module = None;
                     if let Some(name) = &module {
+                        inline_module = Some(found.inline_modules.len());
                         found.inline_modules.push(Module {
                             name: name.clone(),
                             path: path.clone(),
                             test_only,
+                            miri: miri.take(),
                             inline: levels.iter().filter_map(|l| l.module.clone()).collect(),
                         });
                     }
                     let module = module.map(|name| InlineModule { name, path: path.take() });
-                    levels.push(Level { test_only, module, implementation: opened, nesting });
+                    levels.push(Level {
+                        test_only,
+                        module,
+                        inline_module,
+                        implementation: opened,
+                        nesting,
+                    });
                     nesting = 0;
                 }
                 _ => {
@@ -482,7 +504,7 @@ pub(crate) fn items(source: &str, features: &[String]) -> Items {
                     }
                 }
             }
-            (header, impl_at, gated, path) = (Vec::new(), None, false, None);
+            (header, impl_at, gated, path, miri) = (Vec::new(), None, false, None, None);
             i += 1;
         } else if let Some(end) = skip_literal(source, i).or_else(|| {
             (byte == b'b' && bytes.get(i + 1) == Some(&b'r'))
@@ -519,6 +541,8 @@ struct Level {
     test_only: bool,
     /// The inline module it opens.
     module: Option<InlineModule>,
+    /// The index in [`Items::inline_modules`] of that module.
+    inline_module: Option<usize>,
     /// The index in [`Items::impls`] of the implementation whose body it opens.
     implementation: Option<usize>,
     /// The parentheses and brackets open outside it.
@@ -670,6 +694,33 @@ fn included(tokens: &[Token], source: &str) -> Vec<String> {
         })
         .filter_map(|w| string_value(source, w[3].start))
         .collect()
+}
+
+/// Whether an attribute's text, without whitespace, is a `cfg` that names `miri`, or a
+/// `cfg_attr` that names it and yields a `cfg`: either can leave what it is on uncompiled
+/// under Miri, whatever else its predicate says.
+pub(crate) fn cfg_names_miri(compact: &str) -> bool {
+    let names =
+        compact.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')).any(|w| w == "miri");
+    let yields_cfg = || {
+        let Some(inner) = compact.strip_prefix("cfg_attr(").and_then(|r| r.strip_suffix(')'))
+        else {
+            return false;
+        };
+        // Each attribute after the predicate starts after a comma outside brackets.
+        let mut depth = 0usize;
+        let mut starts = Vec::new();
+        for (at, c) in inner.char_indices() {
+            match c {
+                '(' | '[' => depth += 1,
+                ')' | ']' => depth = depth.saturating_sub(1),
+                ',' if depth == 0 => starts.push(at + 1),
+                _ => {}
+            }
+        }
+        starts.into_iter().any(|at| inner[at..].starts_with("cfg("))
+    };
+    names && (compact.starts_with("cfg(") || yields_cfg())
 }
 
 /// Whether an attribute's text is a `cfg` that holds only under `test` or a feature of
@@ -875,6 +926,7 @@ mod tests {
             name: name.to_owned(),
             path: path.map(str::to_owned),
             test_only,
+            miri: None,
             inline: inline
                 .iter()
                 .map(|m| {
@@ -916,6 +968,41 @@ mod tests {
         );
         let source = "#[cfg(test)]\nmod t { fn f() { if x {} } impl X {} }\nstruct S {}\n";
         assert_eq!(found(source, &[]).inline_modules, [module("t", None, true, &[])]);
+    }
+
+    #[test]
+    fn a_cfg_that_names_miri_is_kept_on_its_module() {
+        for (attribute, names) in [
+            ("cfg(not(miri))", true),
+            ("cfg(all(test,not(miri)))", true),
+            ("cfg(feature=\"miri\")", true),
+            ("cfg_attr(miri,cfg(any()))", true),
+            ("cfg_attr(not(miri),allow(x),cfg(test))", true),
+            ("cfg_attr(miri,ignore)", false),
+            ("cfg_attr(miri,path=\"m.rs\")", false),
+            ("cfg_attr(any(miri,cfg),allow(x))", false),
+            ("cfg(test)", false),
+            ("cfg(miri_like)", false),
+            ("allow(miri)", false),
+        ] {
+            assert_eq!(cfg_names_miri(attribute), names, "{attribute}");
+        }
+        let source = "#[cfg(not( miri ))]\nmod a;\n#[cfg(test)]\nmod b;\nmod c {\n    \
+                      #![cfg(not(miri))]\n    mod d;\n    fn f() { #![cfg(miri)] }\n}\n\
+                      #[cfg_attr(miri, ignore)]\nfn g() {}\nmod e;\nmod h {}\n";
+        let items = found(source, &[]);
+        let gates = |modules: &[Module]| {
+            modules.iter().map(|m| (m.name.clone(), m.miri.clone())).collect::<Vec<_>>()
+        };
+        let gate = |name: &str, miri: Option<&str>| (name.to_owned(), miri.map(str::to_owned));
+        assert_eq!(
+            gates(&items.modules),
+            [gate("a", Some("cfg(not(miri))")), gate("b", None), gate("d", None), gate("e", None)]
+        );
+        assert_eq!(
+            gates(&items.inline_modules),
+            [gate("c", Some("cfg(not(miri))")), gate("h", None)]
+        );
     }
 
     #[test]

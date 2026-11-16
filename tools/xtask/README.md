@@ -191,10 +191,13 @@ on, and a listed feature the crate does not declare are findings.
   `--skip FILTER`, and it refuses a `--` with nothing after it, an empty filter, `--skip=`, a
   second `--` and every other libtest option (`--exact` would change what a filter matches).
   Each filter, named or skipped, is `<module>::`, where the root of a test target the entry
-  selects declares the module (at its top, out-of-line or inline): a module renamed or removed
-  is reported, where the filter would otherwise select nothing, or move the module's tests to
-  the entry that skips it. A package in `[miri_split]` must name its targets: an entry that
-  names none is refused, since cargo's default run then follows the manifest's `test` and
+  selects declares the module (at its top, out-of-line or inline), and no `cfg` naming
+  `miri` may compile it out: on its declaration (or a `cfg_attr` there that yields a `cfg`),
+  at the top of its file or at the top of the root. A module renamed, removed or compiled out
+  under Miri is reported, where the filter would otherwise select nothing, or move the
+  module's tests to the entry that skips it; a test of the module may still be gated or
+  ignored under Miri on its own. A package in `[miri_split]` must name its targets: an entry
+  that names none is refused, since cargo's default run then follows the manifest's `test` and
   `required-features`, which the counts do not model. An explicit `--test` runs a
   `test = false` target and fails the job on one whose `required-features` it does not enable,
   so neither needs a rule. A package outside `[miri_split]` that two or more entries name by

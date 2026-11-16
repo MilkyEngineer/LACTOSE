@@ -59,23 +59,6 @@ pub fn check(policy: &Policy, ws: &Workspace, files: &Files) -> Vec<Finding> {
     findings
 }
 
-/// The modules the root of the test target at `root` declares at its top, out-of-line or
-/// inline: the first segment of the path of each test in them. Empty for a root that is not
-/// in `files`.
-pub(crate) fn root_modules(root: &str, files: &Files) -> BTreeSet<String> {
-    let Some(source) = files.text(root) else {
-        return BTreeSet::new();
-    };
-    let items = items(&source, &[]);
-    items
-        .modules
-        .iter()
-        .chain(&items.inline_modules)
-        .filter(|module| module.inline.is_empty())
-        .map(|module| module.name.clone())
-        .collect()
-}
-
 /// The finding for a package with more than one test target outside the list.
 fn targets(policy: &Policy, package: &Package, findings: &mut Vec<Finding>) {
     let separate = |target: &str| {
@@ -405,18 +388,6 @@ mod tests {
                 format!("crates/sim/tests/proof/sour.rs: {}", message("lactose", "lactose_glue")),
             ]
         );
-    }
-
-    #[test]
-    fn the_root_modules_are_the_top_level_ones() {
-        let mut files = Files::default();
-        files.insert(
-            ROOT,
-            "mod a;\nmod b {\n    mod c;\n    mod d {}\n}\n#[path = \"x.rs\"]\nmod e;\n",
-        );
-        let found: Vec<String> = root_modules(ROOT, &files).into_iter().collect();
-        assert_eq!(found, ["a", "b", "e"]);
-        assert!(root_modules("crates/sim/tests/missing.rs", &files).is_empty());
     }
 
     #[test]

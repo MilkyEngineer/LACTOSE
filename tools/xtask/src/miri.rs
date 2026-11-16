@@ -16,8 +16,9 @@
 //! entries that select a target with filters run each of its tests once, whatever the tests
 //! are called, only when one names filters and the other skips each of them, and that is the
 //! one division of a target the check accepts. Each filter is `<module>::`, a module the root
-//! of a test target the entry selects declares, so that a renamed module fails the check
-//! rather than leaving its filter selecting nothing. The job's other steps are not read.
+//! of a test target the entry selects declares and no `cfg` naming `miri` may compile out, so
+//! that a module renamed, removed or compiled out under Miri fails the check rather than
+//! leaving its filter selecting nothing. The job's other steps are not read.
 //!
 //! The workflow is read as text, by a reader of the YAML the job is written in: block
 //! mappings and sequences, plain and quoted scalars on one line, plain scalars over several,
@@ -28,11 +29,12 @@
 //! name with none of `*?[]` exactly, any other as a pattern of the `glob` crate (see
 //! `Pattern`).
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
+use crate::boundary::{module_file, parent};
 use crate::policy::Policy;
 use crate::repo::Files;
-use crate::test_targets::root_modules;
+use crate::rust_source::{attributes, cfg_names_miri, items};
 use crate::workspace::{Package, Workspace};
 use crate::{Finding, POLICY_FILE};
 
@@ -435,12 +437,14 @@ fn selected<'w>(
 }
 
 /// Checks that each libtest filter of an entry is `<module>::`, where the root of a test
-/// target the entry selects declares the module, so that a module renamed or removed fails
-/// here and does not leave the filter selecting nothing, or the tests moved to another entry.
-/// An entry that names no target selects every test target of its package.
+/// target the entry selects declares the module and no `cfg` naming `miri` may compile it out,
+/// so that a module renamed, removed or compiled out under Miri fails here and does not leave
+/// the filter selecting nothing, or the tests moved to another entry. An entry that names no
+/// target selects every test target of its package.
 ///
 /// # Errors
-/// A filter of another shape, and one whose module no root of a selected target declares.
+/// A filter of another shape, one whose module no root of a selected target declares, and
+/// one whose module such a `cfg` may compile out.
 fn filters_name_modules(
     package: &Package,
     runs: &[Run<'_>],
@@ -460,8 +464,13 @@ fn filters_name_modules(
             })
             .collect()
     };
-    let modules: BTreeSet<String> =
-        targets.iter().flat_map(|target| root_modules(&package.tests[*target], files)).collect();
+    let mut modules: BTreeMap<String, Option<String>> = BTreeMap::new();
+    for target in &targets {
+        for (module, miri) in root_modules(&package.tests[*target], files) {
+            let gate = modules.entry(module).or_default();
+            *gate = gate.take().or(miri);
+        }
+    }
     for name in filter.names.iter().chain(&filter.skips) {
         let module = name.strip_suffix("::").filter(|module| {
             module.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
@@ -479,7 +488,7 @@ fn filters_name_modules(
                  root could declare it"
             ));
         }
-        if !modules.contains(module) {
+        let Some(gate) = modules.get(module) else {
             let roots = targets
                 .iter()
                 .map(|target| format!("`{}`", package.tests[*target]))
@@ -489,9 +498,62 @@ fn filters_name_modules(
                 "the filter `{name}` names no module that {roots} declares, so it would select \
                  no test of the module it was written for"
             ));
+        };
+        if let Some(gate) = gate {
+            return Err(format!(
+                "the filter `{name}` names the module `{module}`, which {gate} may leave \
+                 uncompiled under Miri, so that the entry would run none of its tests; leave the \
+                 module compiled and gate its tests one by one"
+            ));
         }
     }
     Ok(())
+}
+
+/// The modules the root of the test target at `root` declares at its top, out-of-line or
+/// inline: the first segment of the path of each test in them. Each maps to the first `cfg`
+/// naming `miri` (see [`cfg_names_miri`]) that may compile it out: on its declaration, at the
+/// top of its file or at the top of the root. Empty for a root that is not in `files`.
+fn root_modules(root: &str, files: &Files) -> BTreeMap<String, Option<String>> {
+    let Some(source) = files.text(root) else {
+        return BTreeMap::new();
+    };
+    // The first inner `cfg` naming `miri` at the top of a file, as it is written there.
+    let leading = |file: &str| {
+        let source = files.text(file)?;
+        let attribute = attributes(&source).into_iter().find(|attribute| {
+            attribute.inner && attribute.leading && cfg_names_miri(&attribute.body)
+        })?;
+        Some(format!("`#![{}]` at the top of `{file}`", attribute.body))
+    };
+    let whole = leading(root);
+    let items = items(&source, &[]);
+    let mut modules = BTreeMap::new();
+    let declared = items.modules.iter().map(|module| (module, true));
+    for (module, out_of_line) in declared.chain(items.inline_modules.iter().map(|m| (m, false))) {
+        if !module.inline.is_empty() {
+            continue;
+        }
+        // An inline module has no file of its own.
+        let file = || match &module.path {
+            _ if !out_of_line => None,
+            Some(named) => module_file(root, named),
+            None => [
+                format!("{}/{}.rs", parent(root), module.name),
+                format!("{}/{}/mod.rs", parent(root), module.name),
+            ]
+            .into_iter()
+            .find(|candidate| files.contains(candidate)),
+        };
+        let gate = module
+            .miri
+            .as_ref()
+            .map(|attribute| format!("`{attribute}` on it in `{root}`"))
+            .or_else(|| file().and_then(|file| leading(&file)))
+            .or_else(|| whole.clone());
+        modules.insert(module.name.clone(), gate);
+    }
+    modules
 }
 
 /// The words the run step's shell makes of `args`, which the workflow substitutes into the
@@ -1200,6 +1262,16 @@ mod tests {
     }
 
     fn run_with(policy: &Policy, ecs: Package, nightly: &str) -> Vec<String> {
+        run_over(policy, ecs, nightly, &[])
+    }
+
+    /// [`run_with`] with each of `extra` written over the files it reads.
+    fn run_over(
+        policy: &Policy,
+        ecs: Package,
+        nightly: &str,
+        extra: &[(&str, &str)],
+    ) -> Vec<String> {
         let mut core = package("lactose-core", &[]);
         core.tests = [("t".to_owned(), "crates/core/tests/t.rs".to_owned())].into();
         let mut net_host = package("lactose-net-host", &[]);
@@ -1216,6 +1288,9 @@ mod tests {
             "mod erased_rows;\nmod events;\nmod ownership {}\n",
         );
         files.insert("crates/net-host/tests/interpolation.rs", "mod interp;\n");
+        for &(path, text) in extra {
+            files.insert(path, text);
+        }
         check(policy, &workspace(members), &files).iter().map(ToString::to_string).collect()
     }
 
@@ -1363,6 +1438,64 @@ mod tests {
             "- name: core a\n            args: '-p lactose-core -- a::'\n          - name: core\n",
         );
         assert_eq!(run(ecs(&["alloc", "integration"]), &text), [] as [&str; 0]);
+    }
+
+    #[test]
+    fn a_filter_whose_module_miri_may_compile_out_is_refused() {
+        // Review round 2: a module kept but compiled out under Miri, by its file or by its
+        // declaration, leaves the entry running none of its tests.
+        const ROOT: &str = "crates/net-host/tests/interpolation.rs";
+        const FILE: &str = "crates/net-host/tests/interp.rs";
+        let found = |files: &[(&str, &str)]| {
+            run_over(&policy(), ecs(&["alloc", "integration"]), &filter_split(), files)
+        };
+        let refused = |gate: &str| {
+            [format!(
+                ".github/workflows/nightly.yml: line 24: the args of `net-host`: the filter \
+                 `interp::` names the module `interp`, which {gate} may leave uncompiled under \
+                 Miri, so that the entry would run none of its tests; leave the module compiled \
+                 and gate its tests one by one"
+            )]
+        };
+        let file = "#![cfg(not(miri))]\n#[test]\nfn t() {}\n";
+        assert_eq!(
+            found(&[(FILE, file)]),
+            refused("`#![cfg(not(miri))]` at the top of `crates/net-host/tests/interp.rs`")
+        );
+        assert_eq!(
+            found(&[(ROOT, "#[cfg(not(miri))]\nmod interp;\n")]),
+            refused("`cfg(not(miri))` on it in `crates/net-host/tests/interpolation.rs`")
+        );
+        // A `cfg_attr` that yields a `cfg`, an inline module's inner `cfg`, a `#[path]` file's
+        // and the root's own.
+        assert_eq!(
+            found(&[(ROOT, "#[cfg_attr(miri, cfg(any()))]\nmod interp;\n")]),
+            refused(
+                "`cfg_attr(miri,cfg(any()))` on it in `crates/net-host/tests/interpolation.rs`"
+            )
+        );
+        assert_eq!(
+            found(&[(ROOT, "mod interp {\n    #![cfg(not(miri))]\n}\n")]),
+            refused("`cfg(not(miri))` on it in `crates/net-host/tests/interpolation.rs`")
+        );
+        let lerp = "crates/net-host/tests/lerp.rs";
+        assert_eq!(
+            found(&[
+                (ROOT, "#[path = \"lerp.rs\"]\nmod interp;\n"),
+                (lerp, "#![cfg(all(test, not(miri)))]\n")
+            ]),
+            refused("`#![cfg(all(test,not(miri)))]` at the top of `crates/net-host/tests/lerp.rs`")
+        );
+        assert_eq!(
+            found(&[(ROOT, "#![cfg(not(miri))]\nmod interp;\n")]),
+            refused("`#![cfg(not(miri))]` at the top of `crates/net-host/tests/interpolation.rs`")
+        );
+        // Tests gated or ignored one by one, a `cfg` that does not name Miri and a `cfg_attr`
+        // that yields none leave the module's other tests to the entry.
+        let file = "#![cfg_attr(miri, allow(dead_code))]\n#[test]\n#[cfg_attr(miri, ignore)]\n\
+                    fn t() {}\n#[cfg(not(miri))]\n#[test]\nfn u() {}\n";
+        let root = "#[cfg(unix)]\n#[cfg_attr(miri, path = \"interp.rs\")]\nmod interp;\n";
+        assert_eq!(found(&[(FILE, file), (ROOT, root)]), [] as [&str; 0]);
     }
 
     #[test]

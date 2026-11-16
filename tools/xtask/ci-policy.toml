@@ -89,8 +89,8 @@ tests = [
 # drop out of Miri unseen: one entry runs a target whole, or two divide it, one naming
 # libtest filters after `--` and the other skipping each of them with `--skip`. A filter of
 # any entry is `<module>::`, where the root of a test target the entry selects declares the
-# module. It reports an empty list, and a package that two or more entries name by target or
-# filter that the list leaves out.
+# module and no `cfg` naming `miri` compiles it out. It reports an empty list, and a package
+# that two or more entries name by target or filter that the list leaves out.
 [miri_split]
 packages = ["lactose-ecs"]
 
