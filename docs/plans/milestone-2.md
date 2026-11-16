@@ -1,9 +1,9 @@
 # Milestone 2 plan: Pixels
 
 Status: draft, not approved. Written at main `6f0508a`, architecture revision 3.3, on 16 November
-2026, ahead of milestone 1's exit by the owner's ruling of that day. Revision 2, at main `0810f9f`,
-answers its first reviews, the general one and the GPU one. It is re-based on main and approved
-only when milestone 1 exits, and the coordinator applies it then.
+2026, ahead of milestone 1's exit by the owner's ruling of that day. Revisions 2 and 3, at main
+`0810f9f`, answer its two rounds of review, each a general one and a GPU one. It is re-based on
+main and approved only when milestone 1 exits, and the coordinator applies it then.
 This plan maps each milestone 2 criterion of architecture section 22, and every
 `docs/verification.md` row that gates milestone 2, to a lane, the coordinator or the owner. It
 orders the lanes and takes the decisions that order needs, the two of section 22.1 that are due by
@@ -39,13 +39,13 @@ run under MoltenVK (`docs/results/spike-rhi-apple-m1-2026-11-15.md`).
 
 | # | Criterion | What proves it | Machine | File or run | Closed by |
 |---|---|---|---|---|---|
-| 1 | A triangle through the graph on Windows and macOS | The client binary in its fixed-frame mode: a fixed clock, a scripted input stream, a local world whose rows move, extract each frame, and instanced triangles at the extracted transforms, drawn by a `render-graph` pass after the scatter pass into an offscreen target that the present thread copies to the swapchain. The run dumps what it drew the last frame with. A CPU reference is rasterised from the dump and compared with the offscreen target's readback, each validator is shown on, and none reports anything else (decision 5.1) | Windows: the discrete GPU (question 2). macOS: the M1 under MoltenVK (decision 5.7) | `triangle` | `frame-impl`, `measure-m2` |
+| 1 | A triangle through the graph on Windows and macOS | The client binary in its fixed-frame mode: a fixed clock, a scripted input stream, a local world whose rows move, extract each frame, and instanced triangles at the extracted transforms, drawn by a `render-graph` pass after the scatter pass into an offscreen target, which the present thread draws or blits to the swapchain image. The run dumps what it drew the last frame with. A CPU reference is rasterised from the dump and compared with the offscreen target's readback, each validator is shown on, and none reports anything else (decision 5.1) | Windows: the discrete GPU (question 2). macOS: the M1 under MoltenVK (decision 5.7) | `triangle` | `frame-impl`, `measure-m2` |
 | 2 | MoltenVK, KosmicKrisp and native Metal spikes recorded, and `rhi-api` frozen or amended on their findings | Three records and a decision. MoltenVK: the RHI spike's file; the one shape it still owes, where the drawable blocks, shown by `swapchain`; and its open cost figures through `rhi-vulkan` (decision 5.6). Native Metal: a throwaway program on the M1. KosmicKrisp: `rhi-vulkan`'s conformance suite under it where macOS 26 runs (question 1). The planner's freeze decision at the exit (decision 5.13) | The M1; a hosted macOS 26 runner for KosmicKrisp | `spike-rhi` (on main), `spike-metal`, `gpu-cost`, `rhi-conformance`; `docs/plans/rhi-freeze-decision.md` | `spike-metal`, `vulkan`, `swapchain`, `measure-m2`, the exit |
 | 3 | Overlap with exclusive extract | Tests of the client's frame, by ordering and never by timing. (a) No stage of a tick starts before extract's pass has resolved, and no frame reads the snapshot buffer or the ring region extract is writing. (b) Frame N's record and tick N+1's stages are in flight at once: each is held at a barrier until the other has started, so the test hangs if they run in turn. (c) A recording test steps one world with the render side attached, on `rhi-null`, and without it, and SOUR finds the hashes equal in every mode | The M1 at the merge; the three CI platforms for (c) | The nightly's run id, in the row | `frame-design`, `frame-impl` |
 | 4 | Extract at most 1 ms for 50k dirty rows | A cost test: 100,000 rows with a `Transform`, 50,000 of them moved every tick, extract's pass alone, the median of 60 passes, writing the device's ring (decision 5.2) | A quiet M1; the desktop | `extract-50k` | `present-impl`, `renderer-impl`, `measure-m2` |
 | 5 | Remote transform upload at most 1 ms for 5k entities at 144 Hz | A cost test: 5,000 slots of the interpolation buffer written at 30 Hz, sampled in one batch and written to the staging ring every frame, paced at 144 Hz for ten seconds, the median frame (decision 5.3) | A quiet M1; the desktop | `remote-upload-5k` | `presentation`, `measure-m2` |
 | 6 | lavapipe CI | A job in the pull-request workflow on linux-x64: `cargo xtask gpu --driver lavapipe`, the conformance suite and the graph's and the renderer's device tests under a pinned Khronos validation layer, each validator's canary seen and no other message (decision 5.10) | The linux-x64 runner | The first green run's id, in the row | `vulkan` |
-| 7 | macOS shader runner | A job on macos-arm64 that cooks every engine shader to SPIR-V, MSL and a metallib with the pinned Slang and the runner's `metal` compiler, at the language version of the oldest client macOS, loads each metallib and makes a pipeline state from it with its function constants. The linux-x64 job cooks SPIR-V and MSL, and the two hosts' hashes are equal. One metallib the runner cooked is loaded on the M1 (decision 5.8) | The macos-arm64 and linux-x64 runners; the M1 once | The first green run's id, in the row | `slang` |
+| 7 | macOS shader runner | A job on macos-arm64 that cooks every engine shader to SPIR-V, MSL and a metallib with the pinned Slang and the runner's `metal` compiler, as MSL 3.1 for macOS 14, the oldest client, loads each metallib and makes a pipeline state from it with its function constants. The linux-x64 job cooks SPIR-V and MSL, and the two hosts' hashes are equal. One metallib the runner cooked is loaded on the M1 (decision 5.8) | The macos-arm64 and linux-x64 runners; the M1 once | The first green run's id, in the row | `slang` |
 
 Section 22.1 puts two decisions at milestone 2. The Apple interim path is decision 5.7. Crash
 reporting is decision 5.9.
@@ -56,7 +56,8 @@ The presentation snapshot's budget (section 5.3) is reported inside `extract-50k
 snapshot's part of the pass. The remote upload's cost at 144 Hz (section 5.3) is criterion 5.
 
 One outcome is not section 22's and binds the milestone all the same: every check job of the
-pull-request workflow stays inside ten of its fifteen minutes warm (decision 5.15).
+pull-request workflow stays inside ten of its fifteen minutes, by the median of three warm runs
+(decision 5.15).
 
 ## 2. The verification rows
 
@@ -68,7 +69,7 @@ of its new text.
 |---|---|---|---|
 | 15 | MoltenVK and KosmicKrisp | `measure-m2`; question 1 | MoltenVK's open figures, the encode time for ten thousand draws and the pipeline creation cost, are `gpu-cost` through `rhi-vulkan` on the M1. KosmicKrisp is the conformance suite's run where macOS 26 runs, or one line that it needs macOS 26 |
 | 16 | Extract cost | `present-impl`, `measure-m2` | `extract-50k`: the pass's time, and the cost per dirty row on one worker |
-| 18 | Native Metal | `spike-metal`, then the freeze decision | The spike's result file: argument buffers, residency, memoryless attachments, framebuffer fetch, indirect draws. `rhi-api` is frozen or amended at the exit |
+| 18 | Native Metal | `spike-metal`, then the freeze decision | The spike's result file: argument buffers, residency, memoryless attachments, framebuffer fetch, indirect draws. `rhi-api` freezes at `vulkan`'s merge, and the exit decision records what is frozen and what was amended |
 | 19 | Remote transform upload | `presentation`, `measure-m2` | `remote-upload-5k` |
 | 21 | Physics phase stall | `frame-impl`, `measure-m2` | `record-stall`, recorded |
 | 34 | MoltenVK multi-draw-indirect is a CPU loop | `measure-m2` | `gpu-cost`: one multi-draw of N commands against N draws under MoltenVK, beside a reading of the pinned MoltenVK |
@@ -85,7 +86,7 @@ of its new text.
 | 140 | Mount cost | Re-gated to 3 | Question 4: D149 sends the Linux and Windows figure to the watch loop's dev session |
 | 143 | The cooked pack set of a fresh process | Re-gated to 3 | Question 4: the watch's half |
 | 150 | The RHI spike ran under MoltenVK alone | `vulkan` | The suite under lavapipe settles the spike's eight design questions where lavapipe can: it has one coherent memory type and one queue. The four questions the spike left to hardware are probed on the laptop's devices and recorded, and a run that shows nothing discharges no rule of null (decision 5.17). Question 2 needs a lazily allocated memory type, which no driver in reach offers on Vulkan; `spike-metal` answers it for Metal |
-| 164 | The keeper's timed wait on Windows | `frame-design`, `measure-m2` | Its second half: the unmeasured list is read where frame pacing on Windows is designed, and what that design uses is measured on the laptop |
+| 164 | The keeper's timed wait on Windows | `frame-design` | Its second half asks that the unmeasured list be read where frame pacing on Windows is designed. `frame-design` reads it. An item its design uses becomes a measurement it names for `measure-m2`, and the rest is re-gated with its reason |
 
 If the owner keeps the directory watch in milestone 2 (question 4), rows 139, 140 and 143 keep
 their gates and are owned by the two lanes that question names.
@@ -94,18 +95,18 @@ their gates and are owned by the two lanes that question names.
 
 One lane of milestone 1 comes first and is not counted here: `test-binaries`, D125's lever, which
 builds each existing package's integration tests as one binary and writes the rule a new crate
-follows. Milestone 2's first lane starts after its merge (decision 5.15, section 9). Each row
-below is the size of a brief.
+follows. No milestone 2 lane that touches the tree starts before its merge; `spike-metal`
+touches none (decision 5.15, section 9). Each row below is the size of a brief.
 
 **Queue 1, the RHI.**
 
 | Lane | What it does | Needs | Proof it owes | Runs |
 |---|---|---|---|---|
 | `spike-metal` | The native Metal spike: a throwaway program on the M1 against Metal itself, never checked in, as the milestone 1 plan's decision 5.10 ruled for the RHI spike. Its question: what must `rhi-api` expose for section 12.1's list to run on Metal with no call Vulkan or a null backend cannot honour? It walks: a bindless heap as an argument buffer indexed past slot 0 with a non-uniform index, in a shader form the Slang compiler emits and Metal accepts; residency declared per encoder, for the heap and for a buffer a shader reaches only through its `gpuAddress`; a memoryless G-buffer read in its pass by framebuffer fetch, and a memoryless depth attachment kept across that read; two transients that alias one untracked heap with the fence between them; an indexed indirect draw and an indirect command buffer; a pipeline from MSL the Slang compiler emitted (the SDK's copy, its version in the file), specialised by a function constant; a binary archive saved and reloaded in a second process with fail-on-miss, run without shader validation; command buffers encoded on two threads and enqueued in a fixed order; a shared event waited on before it is signalled; a sampler; a drawable from a layer in no window, with `nextDrawable`, a render into its texture and `presentDrawable`, three in flight, for the call's shape alone; a readback against a CPU reference | Nothing. `reviewer-gpu` reviews it alone | Result file `spike-metal`. Each item yes or no with the state the caller carried. Metal API validation and Metal shader validation each shown on by a misuse it reports, a heap slot and a buffer dereference without residency among them. Whether the fence, dropped with the GPU made to lag, showed. Whether a binary archive works from a library compiled from source. The heap's shader form it chose, a fixed-size array in a parameter block or `DescriptorHandle`. The device comes from `MTLCopyAllDevices`, and the run fails when there is none. Each of the RHI spike's fourteen points marked kept, changed or Vulkan's alone. Rows 18 and 35 | 7 |
-| `rhi-api` | Architect: the facade of `lactose-rhi-api`, from the RHI spike's fourteen points, `spike-metal`'s result and section 12.1. Capabilities are required or reported. The local read is a call of its own, and input i reads colour attachment i and nothing else. Memoryless is a request. A pass declares the heap slots and the buffers it reaches. Aliasing is a relation the backend fences. Device loss is a value. A surface is made from `raw-window-handle`'s types, so no backend names `lactose-platform`. The submit that writes a swapchain image is the present thread's (decision 5.6). The cooked shader format names the heap's shader form. The conformance suite's shape: its cases by name, each marked contract, which null passes too, or output, which only a device can | `spike-metal` merged | A facade, unstable (D43). `reviewer` and `reviewer-gpu` both read it. Every call is one a null backend and native Metal can honour. Decision text for what section 12.1 left open | 7 |
-| `rhi-null` | `lactose-rhi-null` against the facade, and the bodies of the suite's contract cases in `lactose-rhi-api` behind a dev-only feature, as `lactose-asset-api`'s is. Null keeps the state the caller carries between calls and refuses each misuse the contract names, under the capability set it is created with | `rhi-api` merged | Every contract case passes on null. For every rule null keeps, a build with that rule removed fails a test: a state that does not match, by subresource and by queue; a use after destruction; a slot, a pool or a transient reused before the timeline value that frees it; a feature or capability not enabled; an alias read before its first write; residency not declared for a slot or buffer a pass reaches; a range of memory that is not coherent left unflushed at a submit, under a capability set that has such memory; a local read mapped to another attachment; and the five misuses the RHI spike's validators missed (`local`, `split`, `no-qfot`, `heap-layout`, `uuwp-used`). Null injects a device loss. Null stays test support and outside the server (`cargo xtask tiers`) | 8 |
+| `rhi-api` | Architect: the facade of `lactose-rhi-api`, from the RHI spike's fourteen points, `spike-metal`'s result and section 12.1. Capabilities are required or reported. The local read is a call of its own, and input i reads colour attachment i and nothing else. Memoryless is a request. A pass declares the heap slots and the buffers it reaches. Aliasing is a relation the backend fences. Device loss is a value. A surface is made from `raw-window-handle`'s types, so no backend names `lactose-platform`. Queues are named by role: graphics, compute and present. Every command that reads or writes a swapchain image is submitted by the present thread, on the present queue, which no other thread submits to where the device offers a second queue (decision 5.6). The cooked shader format names the heap's shader form. The conformance suite's shape: its cases by name, each marked contract, which null passes too, or output, which only a device can | `spike-metal` merged | A facade, unstable (D43). `reviewer` and `reviewer-gpu` both read it. Every call is one a null backend and native Metal can honour. Decision text for what section 12.1 left open | 7 |
+| `rhi-null` | `lactose-rhi-null` against the facade, and the bodies of the suite's contract cases in `lactose-rhi-api` behind a dev-only feature, as `lactose-asset-api`'s is. Null keeps the state the caller carries between calls and refuses each misuse the contract names, under the capability set it is created with | `rhi-api` merged | Every contract case passes on null. For every rule null keeps, a build with that rule removed fails a test: a state that does not match, by subresource and by queue; a use after destruction; a slot, a pool or a transient reused before the timeline value that frees it; a feature or capability not enabled; an alias read before its first write; a heap slot or a device address handed to a pass through `rhi-api`'s arguments that the pass did not declare; a range of memory that is not coherent left unflushed at a submit, under a capability set that has such memory; a local read mapped to another attachment; and the five misuses the RHI spike's validators missed (`local`, `split`, `no-qfot`, `heap-layout`, `uuwp-used`). What a shader reaches through data alone null cannot see: that is Metal shader validation's under `rhi-metal`, at milestone 3. Null is run under a one-queue capability set and under a several-queue one. Null injects a device loss. Null stays test support and outside the server (`cargo xtask tiers`) | 8 |
 | `vulkan` | `lactose-rhi-vulkan` without a window: device creation against the required and reported sets, queues by role, buffers, images, samplers, the heap, pipelines from cooked SPIR-V with specialisation, the cache blob, an encoder per thread, states to barriers, the local read, memoryless requests, timeline semaphores and fences, indirect draws and dispatch, copies, the message sink. `SAFETY.md`. The bodies of the suite's output cases and their Slang sources. `cargo xtask gpu` and its rule (decision 5.10). The `gpu (lavapipe)` job and its nightly form with GPU-assisted validation. `lactose-rhi-vulkan` joins `[test_support]` (decision 5.12) | `rhi-null` and `slang` merged; it may start when `rhi-api` merges. The facts of the coordinator's `gpu-probe` | The output cases, their shaders cooked by `cargo xtask gpu` before it runs them, pass under lavapipe in CI and under MoltenVK on the M1 by decision 5.10's rule. A buffer in device-only memory filled through a staging copy is a case and runs on the M1, where MoltenVK's first memory type is device-local alone. The pipeline cache falls back to an empty one on a corrupt payload, a truncated file, a wrong checksum and a stale header, and a hit is shown by the creation feedback's bit, never by time. After the push, the suite on each of the laptop's devices, selected by name, as labelled data, with what they show of the spike's four hardware questions (decision 5.17). The spike's eight design questions answered from the lavapipe run (row 150). A cache directory that cannot be written is reported and the run goes on. `reviewer-gpu` and `reviewer-concurrency` read beside the first review. Pushed alone | 11 |
-| `swapchain` | The swapchain and present in `lactose-rhi-vulkan`, from `lactose-platform`'s window: acquire, the present thread's submit of the copy into the swapchain image and its present, one present semaphore for each image, resize and out-of-date, shutdown with frames in flight; null's swapchain | `vulkan` and `platform-impl` merged | On the M1 and the laptop, a fixed number of frames presented across a resize by decision 5.10's rule, and an out-of-date swapchain rebuilt. Under MoltenVK with every drawable held: no frame worker's job is held, and no other submitter waits on the queue longer than a frame (decision 5.6). An acquire semaphore is reused only after the submit that waited on it has completed, and one injected reuse is reported by a layer at 1.4.313 or later. The present fence of `VK_EXT_swapchain_maintenance1` is used where the driver offers it. A shutdown with frames in flight ends cleanly, and so does a device loss null injects. The same tests run on a headless surface under nextest on the M1, since MoltenVK offers one, and under lavapipe if the runner's driver does. Both specialist reviewers read beside the first review | 9 |
+| `swapchain` | The swapchain and present, in `lactose-rhi-vulkan` and in `lactose-platform`'s tests: acquire; the present queue; the present thread's submit, which draws or blits the offscreen target into the swapchain image by the surface's format, and its present; the offscreen target's crossing to the present queue, by a timeline semaphore and an ownership transfer or by concurrent sharing; one present semaphore for each image; resize and out-of-date; shutdown with frames in flight; null's swapchain | `vulkan` and `platform-impl` merged | The tests that need a window or the present thread are `lactose-platform`'s, which may dev-depend on `lactose-rhi-vulkan` as a test-support crate, and run as a subprocess on macOS; the headless ones are `lactose-rhi-vulkan`'s. On null: with the present queue's submit held at a barrier, every frame submit on the graphics queue completes. Under MoltenVK: the same with the drawable made to block, by a minimised window or a sleeping display, whichever the lane shows blocks; the case counts only if the present thread recorded a block of a second or more, MoltenVK's "CAMetalDrawable could not be acquired" error is that case's expected message, and in that time no frame worker's job is held and every frame submit completes within a frame (decision 5.6). If neither way blocks, the lane says so and the row stays open. On the M1 and the laptop, a fixed number of frames presented across a resize by decision 5.10's rule, an out-of-date swapchain rebuilt, and on the M1 the swapchain image read back once and equal to the offscreen target. An acquire semaphore is reused only after the submit that waited on it has completed, and one injected reuse is reported by a layer at 1.4.313 or later. The present fence of `VK_EXT_swapchain_maintenance1` is used where the driver offers it. A shutdown with frames in flight ends cleanly, and so does a device loss null injects. The headless tests run under nextest on the M1, since MoltenVK offers a headless surface, and under lavapipe if the runner's driver does; where a device has one queue the roles share it under its lock. Both specialist reviewers read beside the first review | 9 |
 
 **What the RHI spike left open, and where it lands.** The spike settled `rhi-api`'s Vulkan
 shape: its fourteen points, and five rules for null. Its "Not shown" list is owned as follows.
@@ -129,12 +130,12 @@ shape: its fourteen points, and five rules for null. Its "Not shown" list is own
 
 | Lane | What it does | Needs | Proof it owes | Runs |
 |---|---|---|---|---|
-| `platform` | Architect: the facade of `lactose-platform` [PAIL]: the window and its handles, the event pump on the main thread over `lactose-task`'s `LanePump`, the present thread and its pump, which carries the submit that writes a swapchain image, the `Platform` the client passes as `Workers::platform`, what a close and a resize report. Device sources and action mapping stay milestone 5's | No lane editing `lactose-app` in flight: it edits one sentence of `crates/app/README.md` | A facade and decision text. `crates/app/README.md`'s sentence on `Workers::platform` agrees | 6 |
+| `platform` | Architect: the facade of `lactose-platform` [PAIL]: the window and its handles, the event pump on the main thread over `lactose-task`'s `LanePump`, the present thread and its pump, which carries every submit that touches a swapchain image, the `Platform` the client passes as `Workers::platform`, what a close and a resize report. Device sources and action mapping stay milestone 5's | No lane editing `lactose-app` in flight: it edits one sentence of `crates/app/README.md` | A facade and decision text. `reviewer` and `reviewer-gpu` both read it, since GPU work goes through the present thread. `crates/app/README.md`'s sentence on `Workers::platform` agrees | 7 |
 | `platform-impl` | Implements it over winit on Windows and macOS. It builds on linux-x64, where CI lints it. `unsafe` for the present thread's QoS and the window handles, with `SAFETY.md` | `platform` merged | A test that runs a subprocess: it opens a window, pumps events, runs one call on the main thread and one on the present thread, and closes, on the M1 and the laptop. A worker that waits on the main thread fails a test. The Windows and Linux cross-target clippy. `reviewer-concurrency` reads beside the first review. Pushed alone | 8 |
 | `graph` | Architect: the facade of `lactose-render-graph` [GOUDA]: passes with reads and writes by usage, imported and transient resources, the history ping-pong, compile and its cache key, record on frame workers, queue assignment, submission in graph order | `rhi-api` merged | A facade. `reviewer` and `reviewer-gpu` both read it | 7 |
 | `renderer` | Architect: the facade of the minimal `lactose-renderer` of decision 5.4 and no more: the render slot table by `StableKey`, the staging ring's writer, which offers no read, the scatter, the instanced triangle pass, the latched camera buffer, `RenderFeature` | The `graph` and `present-api` facades merged | A facade. `reviewer` and `reviewer-gpu` both read it. Any math crate it takes leaves the shipped binaries' boundary feature trees identical (`cargo xtask features`) | 7 |
-| `frame-design` | Architect: the client's frame in `lactose-app`, and what `lactose-app-client` wires. The frame's order: the ticks, `Simulation::run_passes`, the snapshot's publication, then the next ticks beside the presentation schedule, graph compile, record, latch and submit. What the frame renders into: an offscreen target, which the present thread copies to the swapchain image (decision 5.6). Who paces it against the present thread. The traits of `present-api` and `rhi-api` through which `app` drives the render side without naming a backend (decision 5.11). The physics reservation for render recording. Where criterion 3's recording test lives. Frame pacing on Windows, read against the keeper's unmeasured list (row 164) | The `platform`, `graph`, `renderer` and `present-api` facades and `server-closure` merged. Milestone 1's exit step 7 routed (section 9) | A facade and decision text that amends D131's surface. `lactose-app`'s normal-dependency closure reaches no `[server_denylist]` crate, by the rule `server-closure` adds. `reviewer` and `reviewer-gpu` both read it | 7 |
-| `graph-impl` | Implements the graph: order, culling, transient lifetimes, aliasing, transitions, queues, the capped compile cache, record on frame workers with one span for each pass, and one command pool for each recording job and frame in flight | `graph` and `rhi-null` merged; `vulkan` merged for its device tests | On null: a build that drops a derived transition fails a test, by null's state rule; an unreachable pass is culled and a pass whose only output is a readback or an import is kept; each input of the cache key, changed alone, forces a recompile; two transients alias, the second starts undefined, and a read before its first write is refused. On devices, by class of hazard (decision 5.17): a build that drops the barrier on a tracked attachment or buffer yields a synchronisation-validation message the gate counts; a hazard between the host and the GPU yields a wrong readback with the GPU made to lag; aliasing, reads through the heap, indirect and index buffers and ownership transfers rest on null's rules. A command pool is reset only after its frame's timeline value, held with the GPU made to lag (`VUID-vkResetCommandPool-commandPool-00040`). `reviewer-gpu` and `reviewer-concurrency` read beside the first review | 11 |
+| `frame-design` | Architect: the client's frame in `lactose-app`, and what `lactose-app-client` wires. The frame's order: the ticks, `Simulation::run_passes`, the snapshot's publication, then the next ticks beside the presentation schedule, graph compile, record, latch and submit. What the frame renders into: an offscreen target, which the present thread draws or blits to the swapchain image on the present queue (decision 5.6). Who paces it against the present thread. The traits of `present-api` and `rhi-api` through which `app` drives the render side without naming a backend (decision 5.11). The physics reservation for render recording. Where criterion 3's recording test lives. Frame pacing on Windows, read against the keeper's unmeasured list (row 164), with any measurement it needs named for `measure-m2` | The `platform`, `graph`, `renderer` and `present-api` facades and `server-closure` merged. Milestone 1's exit step 7 routed (section 9) | A facade and decision text that amends D131's surface. `lactose-app`'s normal-dependency closure reaches no `[server_denylist]` crate, by the rule `server-closure` adds. `reviewer` and `reviewer-gpu` both read it | 7 |
+| `graph-impl` | Implements the graph: order, culling, transient lifetimes, aliasing, transitions, queues, the capped compile cache, record on frame workers with one span for each pass, and one command pool for each recording job and frame in flight | `graph` and `rhi-null` merged; `vulkan` merged for its device tests | On null: a build that drops a derived transition fails a test, by null's state rule; an unreachable pass is culled and a pass whose only output is a readback or an import is kept; each input of the cache key, changed alone, forces a recompile; two transients alias, the second starts undefined, and a read before its first write is refused. On devices, by class of hazard (decision 5.17): a build that drops the barrier on a tracked attachment or buffer yields a synchronisation-validation message the gate counts; a hazard between the host and the GPU yields a wrong readback with the GPU made to lag; aliasing, reads through the heap, indirect and index buffers and ownership transfers rest on null's rules. A command pool is reset only after its frame's timeline value, held with the GPU made to lag (`VUID-vkResetCommandPool-commandPool-00040`). Where a device has one queue the roles share it: null runs the graph under both capability sets, the M1's four families run the several-queue path, and lavapipe's one queue never does. `reviewer-gpu` and `reviewer-concurrency` read beside the first review | 11 |
 | `renderer-impl` | Implements the minimal renderer | `renderer`, `graph-impl`, `vulkan` and `slang` merged | Slots are allocated on the CPU, freed from the structural log and reconciled after a restore, shown with a prediction world's rollback. A batch names each slot once: the batch's builder resolves duplicates on the CPU in batch order and asserts it, a test on null holds it, a build without the resolution fails that test, and a device test puts many duplicates in different workgroups of a large batch. With the GPU made to lag, the ring never overwrites a region a frame in flight reads, and frame N's readback shows N's camera after N+1's has been written. An instance and the camera far from the origin in one cell render the pixels they render at the origin. A device test steps a world, extracts, renders and compares the readback with the CPU reference. Steering: the ring's write cost for 50k rows. Both specialist reviewers read beside the first review | 9 |
 | `frame-impl` | The frame in `lactose-app` and the binary `lactose-app-client`: a local world, the cooked pack set mounted by the binary through `lactose_asset::pack_set`, since `lactose-app` takes no dependency on `lactose-asset` before milestone 3 (D136), the pipeline cache file, resize, and the fixed-frame mode of decision 5.1 | `frame-design`, `present-impl`, `presentation`, `renderer-impl`, `swapchain` and `crash-hook` merged | Criterion 3's three tests; the package that holds the recording test is a `[harness]` package. Criterion 1's run on the M1 and on the laptop, and each of its four mutations fails it. `lactose-app-client` joins `[feature_roots]`, and its boundary feature tree equals `lactose-app-headless`'s. `lactose-app`'s closure still reaches no `[server_denylist]` crate. Both specialist reviewers read beside the first review, and a third fix round is expected | 11 |
 
@@ -142,14 +143,14 @@ shape: its fourteen points, and five rules for null. Its "Not shown" list is own
 
 | Lane | What it does | Needs | Proof it owes | Runs |
 |---|---|---|---|---|
-| `slang` | The Slang toolchain in `tools/cook` [RICOTTA]: the shader kind, cooked by the pinned Slang release to SPIR-V and MSL on every host and to a metallib on macOS (decision 5.8). The pin, a tracked file with the version and each host's archive checksum, and one command that installs it on a host. The cooked format `rhi-api` names, with the heap's shader form. Three checks on what the cook emitted: every access through the heap carries the non-uniform decoration in the SPIR-V; every fragment output has one location on both targets; a local read's input index is its colour attachment's. The `shaders` job. One engine shader is written against an interface specialised statically and a link-time constant, for both targets | `rhi-api` merged; `test-binaries` merged | Cooking twice writes the same bytes, whatever the checkout's path. Each check has its mutation, and the cook refuses it: the non-uniform marker removed; the marker inside a helper that is not inlined; a shader whose one output is `SV_Target1`. Every cooked MSL compiles through Metal at run time on the M1, with no Xcode, and a pipeline state is made from it with its function constants. The metallib's language version is that of the oldest client macOS. Criterion 7. A pipeline from the cooked SPIR-V passes the suite's pipeline case, once `vulkan` runs it. The shader kind's load against the 0.5 ms slice (row 136). The Slang behaviours the GPU review found on the SDK's copy are run again on the pin. `reviewer-gpu` reads beside the first review, and a third fix round is expected. Pushed alone | 10 |
+| `slang` | The Slang toolchain in `tools/cook` [RICOTTA]: the shader kind, cooked by the pinned Slang release to SPIR-V and MSL on every host and to a metallib on macOS (decision 5.8). The pin, a tracked file with the version and each host's archive checksum, and one command that installs it on a host. The cooked format `rhi-api` names, with the heap's shader form. Two checks on what the cook emitted: every access through the heap carries the non-uniform decoration in the SPIR-V, and every fragment output has one location on both targets. Slang's warnings are errors. On macOS the cook runs `metal` itself on the MSL it emitted, under a stable file name, as MSL 3.1 with macOS 14 as the deployment target. The `shaders` job. One engine shader is written against an interface specialised statically and a link-time constant, for both targets | `rhi-api` merged; `test-binaries` merged | Cooking twice writes the same SPIR-V and MSL, whatever the checkout's path; whether two cooks write the same metallib is recorded and nothing rests on it. Each check has its mutations for the heap form `spike-metal` chose, and the cook refuses each: the marker removed; for a fixed array, the marker inside a helper that is not inlined; for `DescriptorHandle`, `NonUniformResourceIndex` in place of `nonuniform`, which Slang only warns of; a shader whose one output is `SV_Target1`. Every cooked MSL is compiled on the M1 through Metal at run time and a pipeline state made from it with its function constants, by a Swift script under `tools/xtask` that `cargo xtask gpu` runs with the command line tools' `swift`: no Xcode, and no `unsafe` outside section 21. It takes its device from `MTLCopyAllDevices` and fails when there is none. Criterion 7. A pipeline from the cooked SPIR-V passes the suite's pipeline case, once `vulkan` runs it. The shader kind's load against the 0.5 ms slice (row 136). The Slang behaviours the GPU reviews found on the SDK's copy are run again on the pin. `reviewer-gpu` reads beside the first review, and a third fix round is expected. Pushed alone | 10 |
 | `present-api` | Architect: the facade of `lactose-present-api`: the mesh, light, decal and camera rig components, VFX and audio request events, UI view-model resources, the debug-draw buffer, and the presentation snapshot, triple-buffered. Extract is its pass system, as the gather is `net-api`'s (D121), and writes transforms through a sink the renderer's ring implements. It names no RHI, platform or `net-host` type, so it stays what `[boundary_internal]` admits | Nothing | A facade and decision text. The consumer rows of `crates/anim/README.md`, `crates/physics-api/README.md` and `crates/predict/README.md` agree | 6 |
 | `present-impl` | The snapshot and extract | `present-api` merged. No other lane edits `lactose-ecs` while it does | By counts: the rows dirty in this tick or the one before are written and no other; a row that stopped moving has its previous transform set; a teleport carries the no-interpolate flag; the pass after a restore or a load is full. A reader that interpolates two snapshots never reads the third while extract writes it, shown by a loom model or under Miri, whichever the facade's design admits. `reviewer-concurrency` reads beside the first review. Steering: extract's time at 50k dirty rows on null | 8 |
 | `presentation` | `lactose-presentation`: the schedule per frame on the snapshot, interpolation between two snapshots, the camera rig's orbit and boom, the batch sample of the interpolation buffer and the remote upload through the ring, presentation events delivered once (decision 5.5) | `present-impl` and the `renderer` facade merged | Rows 95 and 99. Each remote slot is sampled and written once a frame. A delivered event is not delivered again after a rollback. Steering: the upload's time for 5k slots. `reviewer-concurrency` reads beside the first review | 8 |
 | `measure-m2` | `cargo xtask measure` gains `extract-50k`, `remote-upload-5k`, `record-stall`, `gpu-cost` and `triangle`, their tests in `lactose-app-client`, and the header of section 4 for a file taken on a device | `frame-impl` merged | One command writes every file on the M1. The measurements that need no device run short in the `measure` workflow, their numbers discarded. Times are printed, never asserted. `reviewer-gpu` reads beside the first review | 8 |
-| `server-closure` | `cargo xtask tiers` applies `[server_denylist]` to `lactose-app`'s normal-dependency closure whether or not `lactose-app-server` exists. Today `server_denylist` in `tools/xtask/src/tiers.rs` returns when that package is absent, and it arrives at milestone 4 | `test-binaries` merged; no lane editing `tools/xtask/src` in flight | A fixture in which `lactose-app` reaches a denied crate fails with no server package, and passes with the edge removed. The tree at its base passes | 5 |
-| `interp-loom` | A loom model of `lactose-net-host`'s sequence lock (row 102), behind an optional feature as `lactose-input-host`'s is; `LOOM_MODELS` in `tools/xtask/src/features.rs` gains the crate | `test-binaries` merged; no lane editing `tools/xtask/src` in flight; milestone 1's exit step 7 routed | The model passes, and fails without each ordering the crate states. The nightly loom job runs it | 6 |
-| `crash-hook` | The crash hook moves from the headless binary into `lactose-app`, shared by every engine binary, and writes its report to a file as well as to stderr (decision 5.9). RICOTTA keeps its own hook: it does not link `lactose-app` | Question 3's answer | A subprocess test: a panic in the headless binary writes the report to both and aborts, and a directory that cannot be written costs only the file. This closes the row's "checked by inspection only". Its report records, for each of the owner's machines, whether the system keeps a crash report | 5 |
+| `server-closure` | `cargo xtask tiers` applies `[server_denylist]` to `lactose-app`'s normal-dependency closure whether or not `lactose-app-server` exists. Today `server_denylist` in `tools/xtask/src/tiers.rs` returns when that package is absent, and it arrives at milestone 4 | `test-binaries` merged; no lane editing `tools/xtask/src` in flight | A fixture in which `lactose-app` reaches a denied crate fails with no server package, and passes with the edge removed. The tree at its base passes. `crate-tiers.toml`'s comment on `[server_denylist]` and `tools/xtask/README.md`'s sentence on the server denylist state the new rule, in the same change | 5 |
+| `interp-loom` | A loom model of `lactose-net-host`'s sequence lock (row 102), behind an optional feature as `lactose-input-host`'s is; `LOOM_MODELS` in `tools/xtask/src/features.rs` gains the crate | `test-binaries` merged; no lane editing `tools/xtask/src` in flight; milestone 1's exit step 7 routed | The model passes, and fails without each ordering the crate states. The nightly loom job runs it. `tools/xtask/README.md`'s sentence on the loom rule names the crate, in the same change | 6 |
+| `crash-hook` | The crash hook moves from the headless binary into `lactose-app`, shared by every engine binary, and writes its report to a file as well as to stderr (decision 5.9). RICOTTA keeps its own hook: it does not link `lactose-app` | Question 3's answer | A subprocess test: a panic in the headless binary writes the report to both and aborts, and a directory that cannot be written costs only the file. This closes the row's "checked by inspection only". Its report records, for the M1 and the laptop, whether the system keeps a crash report; the desktop's setting is recorded in session C | 5 |
 | `eco-qos` | Windows efficiency-core steering (row 63): `ThreadClass::Background` sets the power-throttling thread setting, in `crates/core/src/thread_class.rs`. Whether `ThreadClass::Io` follows is reported and not decided | `keeper` merged or closed (section 9) | On the laptop, the WHISK benchmark's rows with two background zstd threads, before and after. Miri for `lactose-core` | 5 |
 
 **The coordinator's passes.**
@@ -160,8 +161,8 @@ shape: its fourteen points, and five rules for null. Its "Not shown" list is own
   GPU-assisted validation load. On macos-arm64, the Xcode version, whether `xcrun metal` exists
   and which language version it defaults to, whether a Metal device is present, and on a macOS
   26 image whether KosmicKrisp enumerates it. Beside it, the laptop's `vulkaninfo` for each of
-  its devices. Its output goes into the rows section 6 adds. The io_uring probe of the nightly
-  is the precedent.
+  its devices, their queue families among it. Its output goes into the rows section 6 adds. The
+  io_uring probe of the nightly is the precedent.
 - The verification pass, after the `vulkan` merge and again at the exit: section 2's Done marks
   and section 6's rows.
 - The merge brief of every branch that changes `lactose-rhi-api`, `lactose-rhi-null`,
@@ -178,23 +179,24 @@ dependency order, and the coordinator refills a free slot from any queue whose h
 | Queue | Lanes, in order | Runs |
 |---|---|---|
 | 1, the RHI | `spike-metal`, `rhi-api`, `rhi-null`, `vulkan`, `swapchain` | 42 |
-| 2, the frame | `platform`, `platform-impl`, `graph`, `renderer`, `frame-design`, `graph-impl`, `renderer-impl`, `frame-impl` | 66 |
-| 3, shaders, presentation and tools | `slang`, `present-api`, `present-impl`, `presentation`, `measure-m2`; beside them `server-closure`, `interp-loom`, `crash-hook` and `eco-qos` | 61 |
+| 2, the frame | `platform`, `platform-impl`, `graph`, `renderer`, `frame-design`, `graph-impl`, `renderer-impl`, `frame-impl` | 67 |
+| 3, shaders, presentation and tools | `present-api`, `slang`, `present-impl`, `presentation`, `measure-m2`; beside them `server-closure`, `interp-loom`, `crash-hook` and `eco-qos` | 61 |
 
-The 22 lanes are 169 runs. Document work beside them is about 21: this plan's two first reviews
-and this answer (3), a second round (2), its re-base at approval and that diff's review (2),
-revision 3.4 (3), the freeze decision (3) and the exit (8, as milestone 1 counted its own: two
-criteria reviewers, and the milestone 3 plan with its reviews and answers). The whole is about
-190 runs at two fix rounds a lane, and about 230 if a third of the lanes take four or five. The
+The 22 lanes are 170 runs. Document work beside them is about 22: this plan's two rounds of
+review and their answers (6), its re-base at approval and that diff's review (2), revision 3.4
+(3), the freeze decision (3) and the exit (8, as milestone 1 counted its own: two criteria
+reviewers, and the milestone 3 plan with its reviews and answers). The whole is about 190 runs
+at two fix rounds a lane, and about 230 if a third of the lanes take four or five. The
 owner's other answers add to it: the directory watch about sixteen runs, a minidump writer about
 nine, a split of the check jobs five.
 
 The longest chain is `spike-metal`, `rhi-api`, `slang`, `vulkan`, `renderer-impl`, `frame-impl`,
 `measure-m2`: 63 runs, and about 65 where `graph-impl`'s device tests wait on `vulkan`. `slang`
-heads queue 3 because `vulkan`'s output cases run cooked shaders. The first slot that frees goes
-to that chain's head. `server-closure`, `interp-loom`, `crash-hook` and `eco-qos` need nothing in
-their queue and fill a slot no head can take; `server-closure` merges before `frame-design`
-starts, and `crash-hook` before `frame-impl`.
+is on it because `vulkan`'s output cases run cooked shaders: it takes the first slot that frees
+once `rhi-api` has merged. `present-api` needs nothing and starts before it. The first slot
+that frees goes to the chain's head. `server-closure`, `interp-loom`, `crash-hook` and `eco-qos`
+need nothing in their queue and fill a slot no head can take; `server-closure` merges before
+`frame-design` starts, and `crash-hook` before `frame-impl`.
 
 Five facades come first: `rhi-api`, `graph`, `renderer`, `platform` and `present-api`, and
 `frame-design` amends a sixth, `lactose-app`'s. `lactose-rhi-null` and `lactose-rhi-vulkan`
@@ -217,9 +219,9 @@ Seven rules bind whatever the coordinator reorders:
   `swapchain`, `platform`, `platform-impl`, `graph`, `renderer`, `frame-design`, `graph-impl`,
   `renderer-impl`, `frame-impl`, `slang`, `present-api`, `presentation` and `interp-loom`, and
   `present-impl`, `eco-qos` or `measure-m2` if they touch a manifest; and `gpu-probe`. So at
-  least seventeen of the milestone's pushes each hold the push slot for one Windows check: 11.4
-  to 11.7 minutes in the two latest runs read, a little over three hours across the milestone at
-  that figure, and less after `test-binaries`.
+  least seventeen of the milestone's pushes each hold the push slot for one Windows check: 9.5
+  to 11.7 minutes over three runs of one code, about three hours across the milestone at that
+  figure, and less after `test-binaries`.
 - After a push that changes a GPU crate, the next such push waits for a green `gpu (lavapipe)`
   job too.
 - A crate that milestone 2 adds follows the rule `test-binaries` writes for its integration
@@ -246,8 +248,8 @@ Seven rules bind whatever the coordinator reorders:
 
 - *At each merge of a GPU crate*, on the M1: the extra gate, under MoltenVK and the three
   validators. A run that presents holds the display awake with `caffeinate -d`: under MoltenVK a
-  frame into a sleeping display blocks in the submit that writes the swapchain image (decision
-  5.6). Then, after the push, the laptop's run on its devices.
+  frame into a sleeping display may hold the present thread's submit for seconds (decision 5.6).
+  Then, after the push, the laptop's run on its devices.
 - *The quiet window*, the coordinator's, at the measurement commit. Every track stops, the machine
   holds `caffeinate -i -s -d`, and `cargo xtask measure --all` runs once. It writes milestone 2's
   five files beside milestone 1's.
@@ -267,11 +269,11 @@ session open, and a run that opens a window needs a person logged in at it.
 
 | Measurement | Workload | Read against |
 |---|---|---|
-| `extract-50k` | 100,000 rows with a `Transform` and a mesh component, in four archetypes and sixteen regions, as milestone 1's cost scene is laid out. A kernel moves 50,000 of them every tick. One tick, then `Simulation::run_passes` with extract alone registered, sixty times, on N frame workers, N the performance cores up to eight. The ring is the device's mapped buffer, and the run is repeated on null. The file gives the pass's median, the ring's part and the snapshot's part, the cost per dirty row on one worker, and the ring's memory type and flags. A wait for a free region of the ring is left out of the median and reported | Criterion 4: the median on the device at most 1 ms, on the M1 and on the desktop |
+| `extract-50k` | 100,000 rows with a `Transform` and a mesh component, in four archetypes and sixteen regions, as milestone 1's cost scene is laid out. A kernel moves 50,000 of them every tick. One tick, then `Simulation::run_passes` with extract alone registered, sixty times, on N frame workers, N the performance cores up to eight. The ring is the device's mapped buffer, and the run is repeated on null. The file gives the pass's median, the ring's part and the snapshot's part, the cost per dirty row on one worker, and the ring's memory type and flags. Each pass ends with an empty submit that signals its timeline value, so the ring's regions come free; a wait for a free region is left out of the median and reported | Criterion 4: the median on the device at most 1 ms, on the M1 and on the desktop |
 | `remote-upload-5k` | 5,000 slots of `lactose-net-host`'s interpolation buffer. One writer thread pushes a state to every slot at 30 Hz. The presentation schedule's remote upload runs every frame, paced at 144 Hz by a timer for ten seconds: one `sample_batch`, the conversion to render space, the write to the device's ring. Each frame ends with an empty submit that signals its timeline value, so the ring's regions come free as they do in a frame. The file gives the median, P99 and worst frame, the reader's retries, the buffer's bytes and the ring's memory type | Criterion 5: the median at most 1 ms, on the M1 and on the desktop. P99 is recorded; over 2 ms it is a finding |
 | `record-stall` | The composed tick of milestone 1, 100k rows and 2,000 awake bodies, stepping beside a frame's record of the minimal renderer's passes on null, at a physics reservation of one frame worker and of two. The file gives the record phase's median and P99 with the physics phase beside it and without | Nothing: recorded. It sets `lactose-app`'s default reservation (decision 5.16) |
-| `gpu-cost` | Through `rhi-vulkan` under a named driver, with the validators off: ten thousand indexed draws as draws, as one multi-draw and as one indirect draw over a compacted buffer, with the record time and the submit time given apart and the thread of each, since MoltenVK encodes Metal inside the submit; the creation of 96 pipelines cold, each under a specialisation constant the run salts so the system's shader cache cannot hit, and from a reloaded cache, with the hit bits. GPU time is from timestamps across whole render passes, by the queue's valid bits | Nothing: recorded. Rows 15 and 34 |
-| `triangle` | The client binary's fixed-frame mode for 600 frames under every validator the host has, the last frame's offscreen target read back | Criterion 1: no pixel outside the margin wrong, each canary seen, no other message, on Windows and on macOS |
+| `gpu-cost` | Through `rhi-vulkan` under a named driver, with the validators off: ten thousand indexed draws as draws, as one multi-draw and as one indirect draw over a compacted buffer, with the record time and the submit time given apart and the thread of each, since MoltenVK encodes Metal inside the submit; the creation of 96 pipelines three ways, with the hit bits: source-cold, from shaders cooked with a link-time constant the run salts, so the SPIR-V and the MSL are new; specialisation-cold, under a salted specialisation constant, which under MoltenVK leaves the MSL source the same; and from a reloaded cache. GPU time is from timestamps across whole render passes, by the queue's valid bits | Nothing: recorded. Rows 15 and 34 |
+| `triangle` | The client binary's fixed-frame mode for 600 frames, seven instances, under every validator the host has, the last frame's offscreen target read back; each validator's canary runs in its own process beside it | Criterion 1: no pixel outside the margin wrong, each canary seen, no other message, on Windows and on macOS |
 
 `extract-50k`'s arithmetic, not a measurement: with a tenth of a millisecond for dispatch and the
 snapshot's publication, four workers have about 70 ns for each dirty row. No extract figure
@@ -301,9 +303,10 @@ transforms, the fraction and the camera of the last frame. The reference is rast
 dump and compared at pixel centres a quarter of a pixel or more inside or outside every edge, a
 margin the test justifies from 32-bit error at the scene's extent and four bits of sub-pixel
 snapping. Every colour is zero or one in each channel, the clear colour is its own, and each
-instance has its own. The image read is the offscreen target the graph rendered, before the
-present thread's copy. The run is under the Khronos layer on both hosts and under Metal API
-validation and Metal shader validation on macOS, by decision 5.10's rule. Four mutations fail it:
+instance has its own, which makes the scene seven instances. The image read is the offscreen
+target the graph rendered, before the present thread's blit or draw. The run is under the
+Khronos layer on both hosts and under Metal API validation and Metal shader validation on macOS,
+by decision 5.10's rule. Four mutations fail it:
 a dropped draw, a vertex moved one pixel, a skipped clear, two instances swapped. On macOS a
 window test cannot run on a test harness's thread, since winit needs the main thread, so the
 proof runs the binary. This rules out a triangle drawn by a test program beside the graph, a
@@ -319,8 +322,9 @@ is what `Simulation::run_passes` runs for extract: the fork over dirty chunks, t
 previous and current transform to the staging ring in render space, and the presentation
 snapshot. The ring is a mapped buffer of the device. On the M1 it is cached shared memory, and on
 a discrete GPU it is write-combined, where a read is very slow. So the criterion is read on the
-device, the file records the memory type, the ring's writer offers no read, and the null
-backend's figure separates the ECS's cost from the memory's. It is read as the median of sixty
+device, the file records the memory type, the ring's writer offers no read, each pass ends with
+a submit so the ring's regions come free, and the null backend's figure separates the ECS's
+cost from the memory's. It is read as the median of sixty
 passes, as milestone 1's criteria are (D139), on the M1's four performance cores and on the
 desktop. This rules out a criterion met on null alone, and one read without the snapshot. What
 would change it: the `present-api` facade keeping transforms out of the snapshot, in which case
@@ -367,26 +371,46 @@ are milestone 5's: the camera is driven by a scripted sample stream in every pro
 out stubs for crates that do not exist. What would change it: the static collision asset
 reaching presentation before milestone 3, which brings boom collision with it.
 
-**5.6 `rhi-api`'s facade follows the native Metal spike alone, and MoltenVK owes one shape.** D139
-put the facade behind the MoltenVK, KosmicKrisp and native Metal spikes. The MoltenVK spike has
-given what shapes a surface: fourteen points, and five rules for null. Its open figures, the
-encode time and the pipeline creation cost, are costs, which `rhi-api` reports or budgets and
-does not bake into a signature. One thing it left open is a shape. MoltenVK 1.4.2 never takes a
-drawable at acquire: it calls `nextDrawable` when the swapchain image's texture is first needed,
-which is during encoding, and it encodes inside `vkQueueSubmit` on the submitting thread with the
-queue held (its source, read by the GPU review). So section 5.1's present thread protects a
-worker only if the submit that writes the swapchain image is the present thread's. `rhi-api`
-states that as a rule for every backend. The frame renders into an offscreen target, and the
-present thread submits the copy into the swapchain image and the present. `swapchain` shows it
-under MoltenVK with every drawable held. On native Metal `nextDrawable` is a call the engine
-places, so `spike-metal` walks it, headless, for its shape. KosmicKrisp is a conformant Vulkan
-driver, so it is the same surface, and it cannot run on the development Mac (decision 5.7). The
-native Metal spike is the one that can change a signature (D43): residency, argument buffers,
-heaps, indirect command buffers and the binary archive. So the facade waits for it alone, and
-the cost figures are taken through `rhi-vulkan`, on the path that ships, under each driver with
-one command. This rules out a second throwaway Vulkan program, and a frame worker that submits
-into a swapchain image. What would change it: `spike-metal` reporting that an item cannot be
-decided without a MoltenVK cost. That cost is then measured with the RHI spike's program first.
+**5.6 `rhi-api`'s facade follows the native Metal spike alone, and MoltenVK owes one shape: the
+present thread has a queue of its own.** D139 put the facade behind the MoltenVK, KosmicKrisp and
+native Metal spikes. The MoltenVK spike has given what shapes a surface: fourteen points, and
+five rules for null. Its open figures, the encode time and the pipeline creation cost, are costs,
+which `rhi-api` reports or budgets and does not bake into a signature. One thing it left open is
+a shape. MoltenVK 1.4.2 never takes a drawable at acquire: it calls `nextDrawable` when a command
+first uses the swapchain image's texture, a copy out of it included, and it encodes inside
+`vkQueueSubmit` on the calling thread (its source, read by the GPU review). Vulkan has the caller
+serialise every use of a queue. So while that submit waits for a drawable, up to a second for
+each image, the queue is held, and a frame submit on the same queue waits behind it whichever
+thread makes it. Two rules follow, and `rhi-api` states them for every backend.
+
+- *Every command that reads or writes a swapchain image is submitted by the present thread.* The
+  frame renders into an offscreen target, and the present thread draws or blits it into the
+  swapchain image by the surface's format: a plain copy would swap channels into a BGRA surface
+  and skip the encoding into an sRGB one.
+- *The present thread submits on a present queue that no other thread submits to, where the
+  device offers a second queue.* Under MoltenVK that is a second family: it has four, with one
+  queue each. The offscreen target crosses to the present queue by a timeline semaphore and an
+  ownership transfer, which null's rule holds, or by concurrent sharing. The graph already
+  assigns queues and derives those crossings for the compute queue (section 12.3), so the present
+  queue is a third role and no new mechanism. Where a device has one queue, as lavapipe has, the
+  roles share it under its lock, and `rhi-api` reports which it is.
+
+The other remedy was to switch off MoltenVK's synchronous submits. It is not taken. It is a
+setting of the interim driver alone, it moves the wait onto MoltenVK's own dispatch queue and
+leaves the frame and the present on one queue, and the RHI spike's file is of MoltenVK's
+defaults. The present queue serves the other backends too: `vkQueuePresentKHR` takes
+a queue the caller must serialise, so a FIFO present that blocks, which section 5.1 already
+expects, holds its queue on any driver. `swapchain` shows the rule on null with the present
+queue held, and under MoltenVK with the drawable made to block. On native Metal `nextDrawable`
+is a call the engine places, so `spike-metal` walks it, headless, for its shape. KosmicKrisp is a
+conformant Vulkan driver, so it is the same surface, and it cannot run on the development Mac
+(decision 5.7). The native Metal spike is the one that can change a signature (D43): residency,
+argument buffers, heaps, indirect command buffers and the binary archive. So the facade waits
+for it alone, and the cost figures are taken through `rhi-vulkan`, on the path that ships, under
+each driver with one command. This rules out a second throwaway Vulkan program, a frame worker
+that submits into a swapchain image, and a present that holds the frame's queue. What would
+change it: `spike-metal` reporting that an item cannot be decided without a MoltenVK cost. That
+cost is then measured with the RHI spike's program first.
 
 **5.7 The Apple interim path is MoltenVK.** Section 22.1 asks for it by milestone 2. Every item
 of the RHI spike ran under MoltenVK 1.4.2 with a GPU-side use read back exact. KosmicKrisp is
@@ -394,13 +418,14 @@ built on Metal 4 and needs macOS 26 (Mesa's driver documentation; the SDK's driv
 Metal 4's classes). The development Mac runs macOS 14.7.4, and that driver enumerates no device
 there. The interim path lasts one milestone: `rhi-metal` lands in milestone 3. So the path is
 MoltenVK, at the SDK version each result file names, and KosmicKrisp is recorded where it runs
-(question 1). Three things are known of the path and accepted for one milestone. The G-buffer in
-tile memory is not shown on Apple before `rhi-metal`, since MoltenVK's local read restarts the
-Metal pass. GPU-assisted validation does not run under MoltenVK, so it runs under lavapipe and
-on the laptop. The drawable is taken inside a submit (decision 5.6). This rules out an operating
-system upgrade for a path that lasts one milestone, and KosmicKrisp as the path on a client
-below macOS 26. What would change it: the owner moving the Mac to macOS 26 (question 1), and
-KosmicKrisp then keeping a local read in tile memory where MoltenVK does not.
+(question 1). Two costs of the path are accepted for one milestone. The G-buffer in tile memory
+is not shown on Apple before `rhi-metal`, since MoltenVK's local read restarts the Metal pass.
+GPU-assisted validation does not run under MoltenVK, so it runs under lavapipe and on the
+laptop. One shape the path showed is adopted for every backend and outlasts it: the present
+thread's submits and its queue (decision 5.6). This rules out an operating system upgrade for a
+path that lasts one milestone, and KosmicKrisp as the path on a client below macOS 26. What
+would change it: the owner moving the Mac to macOS 26 (question 1), and KosmicKrisp then keeping
+a local read in tile memory where MoltenVK does not.
 
 **5.8 Slang is a pinned release that the cooker runs, checked by what it emitted, and a metallib
 is cooked on macOS alone.** The cooker runs `slangc` of one Slang release and refuses another.
@@ -415,25 +440,34 @@ the cook must check, because a check on the source can pass while the output is 
 
 - *The heap.* `NonUniformResourceIndex` fails Slang's Metal target, and a runtime array emits MSL
   that Metal refuses. Two forms cook for both targets: a fixed-size array in a parameter block,
-  and `DescriptorHandle`. `spike-metal` chooses, and the cooked format names the form. A helper
-  that hides the marker emits SPIR-V with no decoration unless it is inlined, so the cook reads
-  the SPIR-V: every access through the heap is decorated.
+  and `DescriptorHandle`. `spike-metal` chooses, and the cooked format names the form. The marker
+  differs by form. For a fixed array it is a helper that switches on the target, and it emits
+  SPIR-V with no decoration unless it is inlined. For `DescriptorHandle` it is `nonuniform`;
+  `NonUniformResourceIndex` on a handle only warns and emits no decoration. So the cook reads the
+  SPIR-V, where every access through the heap must be decorated, and treats Slang's warnings as
+  errors.
 - *Outputs.* An output struct whose one field is `SV_Target1` gets location 0 in SPIR-V and
   colour 1 in MSL. The cook requires each fragment output to have one location on both targets.
 - *The local read.* Slang turns an input attachment into a fragment input at the colour index
-  of the same number, so on Metal the input index is the attachment's. The facade's local read
-  is that identity and nothing else, and null refuses any other mapping.
+  of the same number, and can emit nothing else, so the cook has no check for it. The facade's
+  local read is that identity, and `rhi-api` and null hold it at run time.
 
 SPIR-V and MSL are cooked on every host and their bytes are equal across hosts, which the
 `shaders` job compares. The cook turns line directives off, since the MSL carries the source's
 path when the compiler is given an absolute one. Cooked MSL is compiled on the M1 through Metal
-at run time, which needs no Xcode. A metallib needs Apple's `metal` compiler, so it is cooked on
-macOS; that compiler's default language version follows its deployment target, so the cook
-passes the oldest client macOS as that target, and one metallib the runner cooked is loaded on
-the M1. This rules out a Slang taken from whichever SDK a host has, a check that reads the
-source alone, and cooked bytes that depend on a checkout's path. What would change it: process
-starts dominating the cook at milestone 3's 48 pipelines, or the cooker needing reflection the
-command does not give. The FFI is taken then.
+at run time and a pipeline state made from it, by a Swift script that `cargo xtask gpu` runs
+with the command line tools' `swift`: that needs no Xcode, and no `unsafe` outside section 21,
+which exempts `tools/cook` for Slang and compression alone. A metallib needs Apple's `metal`
+compiler, so it is cooked on macOS. Slang's own call of that compiler passes `-std=metal3.1`, no
+deployment target and an input file whose name changes at every run (the GPU review's stand-in
+compiler). So the cook runs `metal` itself on the MSL it emitted, under a stable name, as MSL 3.1
+with macOS 14 as the deployment target. MSL 3.1 needs macOS 14, which the development Mac runs,
+and that makes macOS 14 the oldest client. Equal bytes are claimed for SPIR-V and MSL and not for
+a metallib: whether two cooks agree is recorded. One metallib the runner cooked is loaded on the
+M1. This rules out a Slang taken from whichever SDK a host has, a check that reads the source
+alone, a check that cannot fail, and cooked bytes that depend on a checkout's path. What would
+change it: process starts dominating the cook at milestone 3's 48 pipelines, or the cooker
+needing reflection the command does not give. The FFI is taken then.
 
 **5.9 Crash reporting is the panic hook's text report, in `lactose-app`, until a build leaves the
 owner's machines.** Section 22.1 asks for minidumps and symbol upload by milestone 2. The hook is
@@ -444,14 +478,14 @@ assembly. The report goes to stderr and to a file. A hardware fault, which a dri
 possible from this milestone on, is read from the operating system's own report. macOS writes
 one by default. Windows keeps a local dump only once Windows Error Reporting's `LocalDumps` key
 is set, which is off by default and an administrator's change (Microsoft's documentation), so
-the owner sets it once on the laptop and the desktop, and `crash-hook`'s report records each
-machine's setting. A minidump writer that catches such a fault runs in a signal handler, which
-is `unsafe` that section 21 admits in no crate every binary links, or in a second process,
-which is a monitor to build and ship. An upload needs a service and a symbol store, and nothing
-reads either before a build goes to a tester. So neither is built, and the row of section 22.1
-moves to milestone 5. This rules out a hook the server cannot link. What would change it: a
-fault on the owner's machines that the system's report does not explain, or a build given to a
-tester sooner (question 3).
+the owner sets it once on the laptop and the desktop; `crash-hook`'s report records the M1's
+and the laptop's setting, and session C the desktop's. A minidump writer that catches such a
+fault runs in a signal handler, which is `unsafe` that section 21 admits in no crate every
+binary links, or in a second process, which is a monitor to build and ship. An upload needs a
+service and a symbol store, and nothing reads either before a build goes to a tester. So neither
+is built, and the row of section 22.1 moves to milestone 5. This rules out a hook the server
+cannot link. What would change it: a fault on the owner's machines that the system's report does
+not explain, or a build given to a tester sooner (question 3).
 
 **5.10 One command runs the device tests by one rule, lavapipe runs them on every pull request,
 and no GPU runner is bought.** `cargo xtask gpu --driver <name>` sets the loader's environment
@@ -468,10 +502,14 @@ device fails the run. The rule a run passes by:
 - *Which layer.* The Khronos layer of one SDK, pinned by version and checksum on every host, with
   synchronisation and thread-safety validation on, all recorded in the file. Ubuntu 24.04's own
   package is 1.3.275, and the swapchain's semaphore checks exist only from 1.4.313.
-- *The canary.* Every run carries one case for each validator, a known misuse that must yield
-  exactly its known message. A run in which a canary is silent fails: a layer that did not load
-  reports nothing and would otherwise pass.
-- *Everything else.* Any other message fails the run.
+- *The canary.* Every run has one case for each validator, a known misuse that must yield
+  exactly its known message. Each runs in a process of its own beside the run: Metal API
+  validation asserts and aborts by default, and a shader-validation misuse fails its command
+  buffer. That default is kept and recorded, so a real misuse aborts the run it is in. A run in
+  which a canary is silent fails: a layer that did not load reports nothing and would otherwise
+  pass.
+- *Everything else.* Any other message fails the run, except one a case names as the message it
+  exists to provoke, as the blocked drawable's case does.
 
 Section 20 runs RHI conformance "on a GPU runner nightly". No such runner exists. A hosted one is
 a paid larger runner, and a self-hosted one on a public repository runs what a stranger's pull
@@ -508,24 +546,23 @@ crates are written against and get a facade first (section 20). This rules out a
 backend-to-backend exception for tests. What would change it: the `rhi-api` facade placing a
 backend-neutral test harness in a leaf crate.
 
-**5.13 `rhi-api` freezes by a decision at the exit, and section 20's trigger is set aside for it
-until then.** Section 20 freezes an interface once its first real backend passes its conformance
-suite, and keeps `rhi-api` unstable until the native Metal spike has run. The spike is the first
-lane, and `vulkan` passes the suite mid-milestone. Read as written, `rhi-api` would freeze
-before `swapchain`, `graph-impl` and `renderer-impl` have used it, and an amendment to a frozen
-interface takes a decision, as D143's did: a proposal, its review, its answer and its
-application, about five runs. Three lanes are expected to amend it, the more so now that the
-present rule, the heap's shader form and the local read's mapping sit in the facade. Under the
-other reading an amendment rides in the lane that needs it, called out at its merge (section
-20), and the freeze is one decision of three runs, already counted. That is fifteen runs
-against three. So for `rhi-api` the trigger is the exit decision, taken once the Vulkan backend
-passes the whole suite, the swapchain's cases included, and the graph and the renderer have run
-on it. The planner writes it from `spike-metal`, the conformance files under lavapipe, MoltenVK
-and the laptop's devices, and KosmicKrisp's if there is one, as the scalar decision was written
-from its probe. The expected outcome is a freeze of what the suite covers, with the calls only
-`rhi-metal` exercises named as the ones its lane may still amend. This rules out a freeze by
-silence, and a freeze at `vulkan`'s merge. What would change it: no lane after `vulkan` amending
-the facade, in which case the decision is one paragraph.
+**5.13 `rhi-api` freezes as section 20 says, when `vulkan` passes the suite, and the exit
+decision records it.** Section 20 freezes an interface once its first real backend passes its
+conformance suite, and keeps `rhi-api` unstable until the native Metal spike has run. The spike
+is the first lane, so `rhi-api` freezes at `vulkan`'s merge. Section 20's next sentence lets a
+lane amend an interface in the change that needs it, called out at its merge, and makes no
+exception for a frozen one: D143 amended `physics-api` that way. So `swapchain`, `graph-impl` and
+`renderer-impl` amend `rhi-api` in their own changes, called out, and no sentence of section 20
+is replaced. Revision 2 of this plan set the trigger aside on the premise that an amendment
+after a freeze takes a decision. The premise was wrong. Criterion 2 asks that `rhi-api` be
+frozen or amended on the spikes' findings, and the planner's exit decision records it: what the
+suite covers and is frozen, each amendment made since `vulkan`'s merge with its reason, and the
+calls only `rhi-metal` exercises, which its lane may still amend. It is written from
+`spike-metal`, the conformance files under lavapipe, MoltenVK and the laptop's devices, and
+KosmicKrisp's if there is one, as the scalar decision was written from its probe. This rules out
+a freeze by silence, and a decision for each amendment. What would change it: an amendment that
+changes what an existing backend must do, and not only what the interface offers. That one goes
+to the planner before its merge.
 
 **5.14 Five things leave milestone 2.**
 
@@ -547,23 +584,27 @@ the facade, in which case the decision is one paragraph.
   (decision 5.5).
 
 **5.15 The test-binary conversion is milestone 1's, and milestone 2's CI budget is read after
-it.** D125 called one integration-test binary for each crate the next lever, due at once.
-Revision 1 of this plan deferred it on the workflow's comment, 5.2 to 5.7 minutes for the
-Windows check, and that figure was out of date. Measured: 11.7 minutes warm at `6f0508a` (run
-43781979172, a full cache match, the test build 9 minutes 2 seconds) and 11.4 at `8869d2c` (run
-43795852109). Over the last thirty runs of main the Windows check took 6.6 to 12.0 minutes,
-eleven of them 11.1 or more; macOS took 4.2 to 12.9 and Linux 5.1 to 8.6. The job is past the
-workflow's own signal, ten of its fifteen minutes, and milestone 2 adds eight crates and a
-binary. So the lever is carried out now, by lane `test-binaries`, as milestone 1's work: every
-existing package's integration tests as one binary, and the rule a new crate follows. Every
-crate milestone 2 adds follows that rule; where it leaves a recording target apart, a new
-crate's is apart too, since a target may carry a codename and a module may not (section 3). The
-first warm Windows check after its merge is the figure milestone 2 starts from (section 9). At
-ten minutes or less nothing more is done, and the figure is read again at each merge that adds a
-crate. Past ten, the owner is asked question 6 before the first lane that adds a crate is
-pushed. This rules out starting the crate lanes on a job two crates from its timeout. What would
-change it: the conversion gaining on Windows what it gained for `lactose-ecs` on the M1, 5.2 s
-in place of 14, in which case the question is never asked.
+it, as a median over every check job.** D125 called one integration-test binary for each crate
+the next lever, due at once. Revision 1 of this plan deferred it on the workflow's comment, 5.2
+to 5.7 minutes for the Windows check, and that figure was out of date. Three runs of one code
+show the level and the noise. No Rust source, manifest or lock file changed between `6f0508a`
+and `0810f9f`, and the Windows check took 11.7, 11.4 and 9.5 minutes (runs 43781979172,
+43795852109 and 43799365983; the first and the last were full cache matches) and the macOS check
+11.0, 10.7 and 8.8. Over the last thirty runs of main the Windows check took 6.6 to 12.0
+minutes. Both jobs straddle the workflow's own signal, ten of fifteen minutes, and milestone 2
+adds eight crates and a binary. So the lever is carried out now, by lane `test-binaries`, as
+milestone 1's work: every existing package's integration tests as one binary, and the rule a new
+crate follows. Every crate milestone 2 adds follows that rule; where it leaves a recording
+target apart, a new crate's is apart too, since a target may carry a codename and a module may
+not (section 3). One run reads either side of ten by chance. So the figure is the median of
+three runs of a check job, each a full cache match: re-running a merge's workflow gives them,
+and the first run after a merge that changes a manifest is not one. It is read for every check
+job after `test-binaries` merges (section 9), and again after each merge that adds a crate.
+While every median is ten minutes or less, nothing more is done. When one passes ten, the owner
+is asked question 6 before the next lane that adds a crate is pushed. This rules out pushing
+crate lanes onto a job two crates from its timeout, and a trigger pulled by a runner's noise.
+What would change it: the conversion gaining on the runners what it gained for `lactose-ecs` on
+the M1, 5.2 s in place of 14, in which case the question is never asked.
 
 **5.16 The stall is recorded and sets the reservation.** Section 16 asks milestone 2 to measure
 the stall the physics phase imposes on render recording. It has no criterion. `record-stall`
@@ -586,10 +627,11 @@ had a dropped barrier fail "with the GPU made to lag". That holds for one class 
   aliased memory, nor descriptors a shader indexes, nor indirect and index buffers (its
   documentation), and a transfer dropped whole was silent in the RHI spike. MoltenVK builds
   tracked placement heaps, so Metal orders aliases too, and it keeps depth images out of them
-  (its source). lavapipe has one queue and one coherent memory type (Mesa's source). Every
-  host-visible memory type on the PC drivers one survey lists is coherent, and none is lazily
-  allocated. So no machine in reach shows these by pixels, and each of null's rules is held by
-  a mutation (`rhi-null`).
+  (its source). lavapipe has one queue and one coherent memory type (Mesa's source), so the
+  graph's several-queue path never runs in CI: null runs it under a several-queue capability
+  set, and the M1's four families run it on a device. Every host-visible memory type on the PC
+  drivers one survey lists is coherent, and none is lazily allocated. So no machine in reach
+  shows these by pixels, and each of null's rules is held by a mutation (`rhi-null`).
 - *Device evidence for that class* is labelled data from the laptop's devices and from
   GPU-assisted validation. A run that shows nothing is recorded as that and discharges no rule.
   The first device evidence for an aliasing fence is `rhi-metal`'s, at milestone 3.
@@ -608,7 +650,7 @@ only if a measurement calls for it. The rest is folded into the decisions above.
 {"label":"Upgrade the Mac to macOS 26","description":"KosmicKrisp is measured beside MoltenVK on the M1, with timings. Every M1 result file of milestones 0 and 1 was taken on macOS 14.7 and the tick-start question is open on it, so the benchmark and `cargo xtask measure --all` run again in a quiet window after the upgrade."},
 {"label":"Record it as not runnable","description":"No runner job. The record is one line: KosmicKrisp needs macOS 26. The criterion is restated, and MoltenVK is the path with no comparison."}]},
 {"header":"Windows GPU","question":"Milestone 2's Windows proofs need a GPU: the conformance suite on a discrete GPU after each GPU merge, the triangle on Windows, and the x86 figures for extract and remote upload. Which machine gives them?","multiSelect":false,"options":[
-{"label":"Laptop, one desktop sitting (Recommended)","description":"The laptop's RTX 4070 runs the suite after each GPU merge and proves the triangle on Windows, through its own agent session. You run one sitting on the desktop at the measurement commit, `cargo xtask measure --all` under each system it boots, for the x86 desktop figures architecture section 20 asks for. Whatever of milestone 1's sessions is still owed runs in the same sitting."},
+{"label":"Laptop, one desktop sitting (Recommended)","description":"The laptop's GPUs run the suite after each GPU merge and its RTX 4070 proves the triangle on Windows, through its own agent session. You run one sitting on the desktop at the measurement commit, `cargo xtask measure --all` under each system it boots, for the x86 desktop figures architecture section 20 asks for. Whatever of milestone 1's sessions is still owed runs in the same sitting."},
 {"label":"Laptop only","description":"No desktop sitting for milestone 2. The laptop's figures, taken with nothing else running, stand as the x86 figures, and section 20's desktop is restated for this milestone. It has six performance cores."},
 {"label":"Desktop only","description":"You run the suite, the triangle and the measurements on the desktop. A defect only a discrete GPU shows is then found at the measurement commit and not at the merge that made it."}]},
 {"header":"Crash dumps","question":"Section 22.1 wants crash reporting, minidumps and symbol upload, decided by milestone 2. Nothing leaves your machines before milestone 5. macOS writes its own report of a hardware fault by default; Windows keeps a local dump only once you set a registry key as administrator. What is built now?","multiSelect":false,"options":[
@@ -628,12 +670,13 @@ only if a measurement calls for it. The rest is folded into the decisions above.
 ]}
 ```
 
-Question 6 is asked only if the first warm Windows check after the `test-binaries` merge is past
-ten minutes. The coordinator writes the measured minutes where `<minutes>` stands.
+Question 6 is asked only when a check job's median of three warm runs passes ten minutes
+(decision 5.15). The coordinator writes the job, the median and the spread where the angle
+brackets stand.
 
 ```json
 {"questions":[
-{"header":"CI budget","question":"After the test-binary conversion (D125) the Windows check job still takes <minutes> minutes warm of its 15, past the workflow's own signal of 10. Before the conversion it took 11.4 to 11.7. Milestone 2 adds eight crates and a binary, about a minute each by D125's estimate. What is done before the first lane that adds a crate is pushed?","multiSelect":false,"options":[
+{"header":"CI budget","question":"The <job> check job takes <median> minutes of its 15, the median of three warm runs that spread from <low> to <high>, past the workflow's own signal of 10. Before the test-binary conversion (D125) three runs of one code gave the Windows job 9.5 to 11.7 minutes and the macOS job 8.8 to 11.0. Each crate milestone 2 adds costs about a minute on Windows by D125's estimate. What is done before the next lane that adds a crate is pushed?","multiSelect":false,"options":[
 {"label":"Split the check jobs (Recommended)","description":"Each check job becomes two, by package group, with a check in `cargo xtask` that every package is in exactly one group, so a new crate cannot go untested. One small lane, five runs. Each run then uses twice the runners, and each job has room for the milestone's crates."},
 {"label":"Raise the budget to 20 minutes","description":"No lane. Architecture section 20's fifteen minutes is restated, every job's timeout follows, and a cold run after a cache-key change takes longer still."}]}
 ]}
@@ -689,22 +732,27 @@ for the recommended answers. The paragraph after them says what each other answe
     `cargo xtask measure gpu-cost`, since a cost is reported or budgeted and changes no
     signature. Rules out a second throwaway Vulkan program. This replaces D139's order, the
     facade behind three spikes.
-  - *The submit that writes a swapchain image is the present thread's, on every backend.* Under
-    MoltenVK the drawable is taken inside that submit, on the submitting thread with the queue
-    held. The frame renders into an offscreen target, and the present thread submits the copy
-    and the present. Rules out a frame worker blocked on a drawable.
+  - *Every command that reads or writes a swapchain image is submitted by the present thread, on
+    a present queue no other thread submits to where the device offers a second queue.* Under
+    MoltenVK the drawable is taken inside such a submit, on the calling thread with the queue
+    held, and a present that blocks holds its queue on any driver. The frame renders into an
+    offscreen target, which crosses to the present queue by a semaphore and an ownership
+    transfer or by concurrent sharing, and is drawn or blitted into the swapchain image. Where a
+    device has one queue the roles share it. Rules out a frame worker blocked on a drawable, a
+    frame submit waiting behind a present, and switching off MoltenVK's synchronous submits.
   - *Slang is one pinned release, which the cooker runs as `slangc` and refuses any other, and
     one command installs it on a host.* The cook checks what it emitted: the non-uniform
-    decoration on every access through the heap, one location for each fragment output on both
-    targets, and a local read whose input index is its colour attachment's. SPIR-V and MSL are
-    cooked on every host with equal bytes; a metallib is cooked on macOS at the oldest client's
-    language version. Rules out a Slang taken from a host's SDK, a check that reads the source
-    alone, and FFI to Slang before process starts cost the cook something.
+    decoration on every access through the heap, and one location for each fragment output on
+    both targets; Slang's warnings are errors. SPIR-V and MSL are cooked on every host with equal
+    bytes. A metallib is cooked on macOS by the cook's own call of `metal`, as MSL 3.1 for macOS
+    14, which is thereby the oldest client. Rules out a Slang taken from a host's SDK, a check
+    that reads the source alone, and FFI to Slang before process starts cost the cook something.
   - *One command runs the device tests by one rule: `cargo xtask gpu --driver <name>`.* It
     counts the debug messenger, both Metal validations' lines and MoltenVK's own; the Khronos
-    layer is pinned on every host; each run carries a canary for each validator, and a silent
-    canary or any other message fails it. A device test is an ignored test the command selects,
-    a missing device fails the run, and each test compares against a reference computed on the
+    layer is pinned on every host; each run has a canary for each validator, in a process of
+    its own, and a silent canary or any other message fails it. A device test is an ignored
+    test the command selects, a missing device fails the run, and each test compares against a
+    reference computed on the
     CPU. lavapipe runs them on every pull request on linux-x64. Rules out a checked-in image
     and a run that passes because no validator was on.
   - *A hazard is proven by the evidence its class has.* A tracked resource: a synchronisation
@@ -725,14 +773,15 @@ for the recommended answers. The paragraph after them says what each other answe
   - *`lactose-rhi-vulkan` joins `[test_support]`*, so the graph and the renderer run on a device
     in their own tests. Five crates get a facade first: `rhi-api`, `render-graph`, `renderer`,
     `platform`, `present-api`. Rules out a backend-to-backend exception for tests.
-  - *`rhi-api` is frozen or amended by a planner's decision at the exit*, from the native Metal
-    spike and the conformance files. Until then a lane amends it in the change that needs it,
-    called out at its merge. Rules out a freeze at the Vulkan backend's first conformance run,
-    before the swapchain, the graph and the renderer have used the interface, and a decision
-    for each amendment after it.
+  - *`rhi-api` freezes as section 20 says, at the Vulkan backend's first pass of the suite.* A
+    later lane amends it in the change that needs it, called out at its merge, as section 20
+    allows and D143 did. A planner's decision at the exit records what is frozen, what was
+    amended and what `rhi-metal` may still amend. Rules out a freeze by silence, and a decision
+    for each amendment.
   - *A crate added from milestone 2 on has one integration-test binary*, by the rule lane
-    `test-binaries` wrote under D125, and no check job passes ten of its fifteen minutes warm.
-    Rules out crate lanes started on a job at its timeout.
+    `test-binaries` wrote under D125, and no check job's median of three warm runs passes ten of
+    its fifteen minutes. Rules out crate lanes pushed onto a job at its timeout, and a budget
+    read from one run.
   - *The physics phase's stall on render recording is recorded with no threshold* and sets
     `lactose-app`'s default reservation. Rules out a threshold nobody set.
   - *Re-gated*: the directory watch, with its dev session and the mount cost on Linux and
@@ -747,11 +796,11 @@ for the recommended answers. The paragraph after them says what each other answe
   answers of <date>.
 - Replaced: D139's "`lactose-rhi-api`'s facade and `lactose-rhi-null` move to milestone 2,
   behind its MoltenVK, KosmicKrisp and native Metal spikes", in its order alone. D136's and
-  D147's placing of the directory watch in milestone 2. Section 20's freeze of an interface on
-  its first real backend's conformance run, for `rhi-api`, until the exit decision. Section
-  20's "on a GPU runner nightly". Section 22's placing of the scatter and the cell-plus-offset
-  format wholly in milestone 3. The status line of `docs/proposals/artist-surfaces.md`. The
-  next revision restates each.
+  D147's placing of the directory watch in milestone 2. Section 20's "on a GPU runner nightly".
+  Section 22's placing of the scatter and the cell-plus-offset format wholly in milestone 3,
+  and of the client `app` wholly in milestone 4: the client binary arrives at milestone 2 with
+  a local world. The status line of `docs/proposals/artist-surfaces.md`. The next revision
+  restates each.
 ```
 
 ### Decision entry: the Apple interim path
@@ -766,11 +815,12 @@ for the recommended answers. The paragraph after them says what each other answe
     (`docs/results/spike-rhi-apple-m1-2026-11-15.md`). What it does not offer, `rhi-api` reports
     as capabilities: whether an attachment of a given usage can be memoryless, whether a
     memoryless attachment keeps its contents across a local read, and indirect count.
-  - *Three costs of the path are accepted for one milestone.* Its local read restarts the Metal
-    pass, so the G-buffer in tile memory is not shown on Apple before `rhi-metal`. GPU-assisted
-    validation does not run under it, so that runs under lavapipe and on the laptop. It takes
-    the drawable inside the submit that writes the swapchain image, on the submitting thread
-    with the queue held, so that submit is the present thread's (D<N>).
+  - *Two costs of the path are accepted for one milestone, and one shape it showed is adopted
+    for every backend.* Its local read restarts the Metal pass, so the G-buffer in tile memory
+    is not shown on Apple before `rhi-metal`. GPU-assisted validation does not run under it, so
+    that runs under lavapipe and on the laptop. It takes the drawable inside the submit of any
+    command that reads or writes a swapchain image, on the calling thread with the queue held;
+    so every such command is the present thread's, on a queue of its own (D<N>).
   - *KosmicKrisp cannot be the path on the machines in reach.* It is built on Metal 4, which
     needs macOS 26 (Mesa's driver documentation). The development Mac runs macOS 14.7.4, where
     the KosmicKrisp driver of Vulkan SDK 1.4.363.1 enumerates no device, and a client below
@@ -841,7 +891,7 @@ for the recommended answers. The paragraph after them says what each other answe
   with the decision on unmounting.
 - Question 5, runner only: `slang`'s proof on the M1 stops at the pipeline state made from MSL,
   and the row on the `metal` compiler says so.
-- Question 6, if it is asked: the split adds one small lane ahead of the first crate lane and a
+- Question 6, when it is asked: the split adds one small lane ahead of the next crate lane and a
   rule to D<N>'s test-binary bullet; the raised budget restates section 20 in revision 3.4.
 
 ### Verification rows
@@ -869,21 +919,21 @@ Each change is its gate and the gist of its new text. Rows are cited at `0810f9f
 | 140, Mount cost | 2 and 3 to 3 | The Linux and Windows figure is taken with the watch loop's dev session, at milestone 3 |
 | 143, The cooked pack set | 2 to 3 | The watch's half is milestone 3's |
 | 150, The RHI spike ran under MoltenVK alone | 2 | Closed by lane `vulkan`: the design questions lavapipe can answer from its run; the four hardware questions probed on the laptop's devices and recorded, a run that shows nothing discharging no rule of null; device-only staging as a case on the M1; question 2 open on Vulkan, since no driver in reach offers a lazily allocated type |
-| 164, The keeper's timed wait on Windows | 1 and 2 | The list is read by `frame-design`, and what the frame's pacing uses is measured on the laptop |
+| 164, The keeper's timed wait on Windows | 1 and 2 | The list is read by `frame-design`: an item its design uses becomes a measurement it names, and the rest is re-gated with its reason |
 
 Rows to add:
 
 | Gate | Gist |
 |---|---|
 | 2 | Milestone 2's criteria are proven by result files and CI runs: `triangle`, `spike-metal`, `gpu-cost`, `rhi-conformance`, `extract-50k`, `remote-upload-5k`, and the first green `gpu (lavapipe)` and `shaders` runs (D<N>) |
-| 2 | The pull-request check jobs against ten of their fifteen minutes warm: the Windows check took 11.4 to 11.7 minutes before lane `test-binaries`; its first warm figure after that merge, and the figure at each merge that adds a crate. Past ten, the owner is asked for a split or a restated budget (D<N>) |
-| 2 | What lavapipe on the linux-x64 runner offers is not known: its Mesa version, the local read, indirect count, a headless surface, GPU-assisted validation. Mesa's source at an older commit gives it one coherent memory type and one queue. `gpu-probe` records it before `vulkan` is briefed. A runner image change is a driver change |
+| 2 | The pull-request check jobs against ten of their fifteen minutes, by the median of three full-match runs of each. Before lane `test-binaries`, three runs of one code gave the Windows check 9.5 to 11.7 minutes and the macOS check 8.8 to 11.0 (runs 43781979172, 43795852109, 43799365983). Read after that merge and after each merge that adds a crate. When a median passes ten, the owner is asked for a split or a restated budget (D<N>) |
+| 2 | What lavapipe on the linux-x64 runner offers is not known: its Mesa version, the local read, indirect count, a headless surface, GPU-assisted validation. Mesa's source at an older commit gives it one coherent memory type and one queue, so the graph's several-queue path runs on null and on the M1 and never in CI. `gpu-probe` records it before `vulkan` is briefed. A runner image change is a driver change |
 | 2 | What the macos-arm64 runner offers is not known: its Xcode and `metal` compiler, a Metal device, and KosmicKrisp on a macOS 26 image. `gpu-probe` records it. A metallib's bytes depend on the Xcode that cooked it |
 | 2 | The validation layer is pinned by SDK version and checksum on every host (D<N>): Ubuntu 24.04's package is 1.3.275, and the swapchain's semaphore checks need 1.4.313 |
-| 2 | Under MoltenVK 1.4.2 the drawable is taken in the submit that writes the swapchain image, by a reading of its source. `swapchain` shows it with every drawable held, and section 5.1's present-thread sentence is restated |
+| 2 | Under MoltenVK 1.4.2 the drawable is taken in the submit of a command that uses the swapchain image, with the queue held, by a reading of its source. The present thread has a queue of its own (D<N>). `swapchain` shows that on null, and under MoltenVK only if a minimised window or a sleeping display makes the drawable block for a second: which does, if either, is not known. Section 5.1's present-thread sentence is restated |
 | 2 | The development Mac has no `metal` compiler: `slangc -target metallib` fails there, and cooked MSL is compiled through Metal at run time instead. Open until Xcode is installed, or the row states that metallibs are the runner's alone |
-| 2 | SPIR-V and MSL cooked by the pinned Slang are expected equal on linux-x64 and macos-arm64. The `shaders` job is the proof; a difference is a finding for the planner. The heap's, the outputs' and the local read's behaviour was found on the SDK's 2026.17-25 build and is run again on the pin |
-| 2 | The metallib's language version: `metal`'s default follows its deployment target, so the cook passes the oldest client macOS; one metallib the runner cooked is loaded on the M1 |
+| 2 | SPIR-V and MSL cooked by the pinned Slang are expected equal on linux-x64 and macos-arm64. The `shaders` job is the proof; a difference is a finding for the planner. The heap's two forms and their markers, the outputs' locations and the input attachment's index were found on the SDK's 2026.17-25 build and are run again on the pin |
+| 2 | The metallib's language: Slang's own call of `metal` passes `-std=metal3.1`, no deployment target and a changing file name, so the cook calls `metal` itself, as MSL 3.1 for macOS 14, the oldest client. Whether two cooks write equal metallib bytes is recorded. One metallib the runner cooked is loaded on the M1 |
 | 2 | A window opened from an agent's shell on the M1, and from the laptop's agent session, is assumed. If either cannot present, that run is the owner's |
 | 2 | Windows keeps no local crash dump until `LocalDumps` is set, by an administrator (D<N+2>): the owner sets it on the laptop and the desktop, and `crash-hook`'s report records each machine |
 | none | Hardware runs of the device tests are made at merges on the M1 and after pushes on the laptop, since no GPU runner exists (D<N>). A defect that reaches main for want of one reopens the question |
@@ -914,7 +964,8 @@ Milestone 2 exits when these have happened, in this order.
    toolchain, `present-api`, and the presentation snapshot and schedule.
 3. The `gpu (lavapipe)` and `shaders` jobs are green on main, and a nightly that holds the
    client's recording test has compared it equal on three platforms. The run ids are in the
-   rows. No check job is past ten minutes warm, or the owner has ruled on question 6.
+   rows. No check job's median of three warm runs is past ten minutes, or the owner has ruled
+   on question 6.
 4. The coordinator's pass has left every row of section 2 Done or re-gated.
 5. The planner has written the freeze decision (decision 5.13), and the owner has approved it.
 6. A `reviewer` and a `reviewer-gpu` read each of the seven criteria against its test and its
@@ -933,19 +984,19 @@ Revision 3.4 is the planner's pass after this plan is approved. It must settle t
 |---|---|
 | Section 2, Graphics: "MoltenVK and KosmicKrisp spiked in milestone 2 as interim Apple paths" | The interim path is MoltenVK (D<N+1>) |
 | Section 12.1: "with every claimed common feature verified in the milestone 2 spike", and its Apple path paragraph | The RHI spike, the native Metal spike and the conformance suite, by name; KosmicKrisp's requirement |
-| Section 5.1: "A dedicated present thread calls present so a blocking `nextDrawable` or FIFO present never stalls the event pump or a worker" | The present thread also makes the submit that writes the swapchain image (D<N>) |
-| Section 20: "An interface crate a backend implements is frozen once its first backend passes its conformance suite", and "`rhi-api` stays unstable until the native Metal spike has run" | For `rhi-api` the freeze is the exit decision's (D<N>); then what that decision ruled |
+| Section 5.1: "A dedicated present thread calls present so a blocking `nextDrawable` or FIFO present never stalls the event pump or a worker" | The present thread also submits every command that reads or writes a swapchain image, on a queue of its own where the device has a second (D<N>) |
+| Section 20: "`rhi-api` stays unstable until the native Metal spike has run" | The spike has run and the Vulkan backend has passed the suite: what the exit decision recorded as frozen, and what `rhi-metal` may amend |
 | Section 20: "RHI conformance runs under lavapipe on Linux CI and on a GPU runner nightly" | lavapipe on every pull request; hardware at merges and at the measurement commit (D<N>) |
 | Section 20's CI line and section 4's `xtask` line | The `gpu (lavapipe)` and `shaders` jobs; `cargo xtask gpu` and its rule |
-| Section 22, milestones 2 and 3 | A paragraph under the table on how milestone 2's criteria are read, as milestone 1 has: the triangle, the two workloads, the machines, KosmicKrisp. The scatter and the cell-plus-offset row format arrive in milestone 2; the GPU scene stays milestone 3's |
+| Section 22, milestones 2, 3 and 4 | A paragraph under the table on how milestone 2's criteria are read, as milestone 1 has: the triangle, the two workloads, the machines, KosmicKrisp. The scatter and the cell-plus-offset row format arrive in milestone 2; the GPU scene stays milestone 3's. The client binary arrives in milestone 2 with a local world; the networked client stays milestone 4's |
 | Section 22.1 | Crash reporting moves to 5; the Apple interim path is decided |
 | Sections 3 and 5.1, "crash dump" | The text report, and that the hook is `lactose-app`'s (D<N+2>) |
-| Section 4 and `crate-tiers.toml`'s comment on `[server_denylist]` | The denylist binds `lactose-app`'s closure, with or without the server binary |
+| Section 4 | The denylist binds `lactose-app`'s closure, with or without the server binary. `crate-tiers.toml`'s comment changes with lane `server-closure` |
 | Section 5.3 | The snapshot's measured budget; what the presentation schedule runs before milestones 3 and 5 |
-| Section 12.2 | Slang as a pinned release; what the cook checks in what it emitted; a metallib cooked on macOS alone |
+| Sections 2 and 12.2 | Slang as a pinned release; what the cook checks in what it emitted; a metallib cooked on macOS alone, as MSL 3.1; macOS 14 as the oldest client |
 | Sections 12.4 and 19 | What the minimal renderer is; device-lost recovery tested at milestone 3 |
 | Section 14 and D136, D147 | The directory watch at milestone 3, if the owner moves it |
-| Section 20, the CI budget | If the owner raises it (question 6) |
+| Section 20, the CI budget | How it is read, the median of three warm runs of each check job; its figure, if the owner raises it (question 6) |
 | `CLAUDE.md` | The revision marker |
 
 ## 9. What depends on milestone 1's exit
@@ -957,7 +1008,7 @@ Nothing in milestone 2 reads the difference.
 
 | Exit outcome | What it changes here |
 |---|---|
-| Lane `test-binaries` merges (D125), and the first warm Windows check after it is read | No milestone 2 lane starts before the merge: it edits every crate's tests and `tools/xtask`. The figure is the CI budget milestone 2 starts from; past ten minutes, question 6 is asked before the first crate lane is pushed. Its rule, and what it rules for a recording target, bind every crate milestone 2 adds |
+| Lane `test-binaries` merges (D125), and each check job's median of three warm runs after it is read | No milestone 2 lane that touches the tree starts before the merge: it edits every crate's tests and `tools/xtask`. The medians are the CI budget milestone 2 starts from; if one is past ten minutes, question 6 is asked before the first crate lane is pushed. Its rule, and what it rules for a recording target, bind every crate milestone 2 adds |
 | Criterion 1, the 100k tick on eight performance cores, is not proven: session B has not run. If it misses, the owner rules for another ECS lane or a restatement | An ECS lane edits `lactose-ecs` first; `present-impl` waits behind it. Section 4's arithmetic for extract assumes the ECS at the speed `tick-100k` measured on the M1 |
 | Tick start: `keeper` runs after session A's files, or the criterion is restated | `keeper` edits `lactose-task`. `eco-qos` waits behind it, and `frame-design` reads its outcome for frame pacing |
 | Criterion 9, edit-to-playing on Windows and Linux, is session B's. Over thirty seconds brings a build-time proposal | That proposal can change the workspace's build layout, and decision 5.15's figure is read again with it |
@@ -993,8 +1044,8 @@ Checked against documentation for revision 2, on 16 November 2026, through summa
 - **Slang's releases.** The project's release page lists v2026.17 to v2026.22. The archives for
   macOS and Windows were not seen on the page, and no release was run.
 - **The `metal` compiler's default language version** follows its deployment target, by a
-  search's summary of its manual page; the page itself was not fetched. What deployment target
-  the Slang compiler passes to it was not checked.
+  search's summary of its manual page; the page itself was not fetched. The cook does not rest
+  on it, since it passes the version itself (decision 5.8).
 
 Still from memory, a reviewer's or this plan's, and not checked:
 
@@ -1015,6 +1066,17 @@ Not verified at all:
 - **MoltenVK's drawable** (decision 5.6) is the GPU review's reading of MoltenVK 1.4.2's source.
   Its probe took drawables from a layer in no window, which does not block. Whether a windowed
   layer blocks from an agent's shell was not probed: it opens a window on the owner's display.
+  Whether a minimised window or a sleeping display makes `nextDrawable` block for a second is
+  not known, so `swapchain`'s MoltenVK case may show nothing and say so.
+- **The present queue on other drivers.** That a PC driver offers a second queue, and in which
+  family, is `gpu-probe`'s to record. That a blocking present holds its queue is Vulkan's rule
+  that the caller serialises a queue's uses, not a measurement of any driver's present. What
+  MoltenVK does with its synchronous submits switched off was not run.
+- **Slang's call of `metal`** is the GPU review's probe with a stand-in compiler on the SDK's
+  copy. Whether a metallib's bytes carry its input's name was not checked, which is why the cook
+  calls `metal` itself and claims no equal bytes.
+- **The cold pipeline figure.** That Metal's system cache serves the unchanged MSL source across
+  salted specialisation constants is suspected, not shown; `gpu-cost` gives both figures.
 - **KosmicKrisp's requirement** is Mesa's driver documentation, beside one probe: with the loader
   pointed at the SDK's KosmicKrisp driver alone, `vulkaninfo --summary` on the M1 fails with
   "Failed to detect any valid GPUs in the current config". Whether a hosted macOS 26 runner
@@ -1031,9 +1093,10 @@ Not verified at all:
 - **A window.** Whether the laptop's agent session can open a window and present was not
   checked, nor whether the M1 can from an agent's shell.
 - **The desktop.** Its CPU model, its GPU and its second system are in no document.
-- **The CI budget after the conversion.** The Windows check's figures are the general review's
-  table of thirty runs. Only run 43781979172 was confirmed warm. What `test-binaries` gains on
-  Windows is not measured: `lactose-ecs` on a loaded M1 is the one figure.
+- **The CI budget after the conversion.** The check jobs' figures are the general reviews'
+  tables. Runs 43781979172 and 43799365983 were confirmed full cache matches and 43795852109 a
+  partial restore; the cause of the spread between them is not known. What `test-binaries`
+  gains on the runners is not measured: `lactose-ecs` on a loaded M1 is the one figure.
 - **Crash handling.** No minidump crate was read. Decision 5.9 rests on where such a writer must
   run, not on one crate's API. What macOS and Linux write for a fault by default was not tested
   on the machines.
