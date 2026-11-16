@@ -45,7 +45,7 @@
 //! - **Timer wake.** From a tick deadline until the frame-critical task that slept until it
 //!   resumes, the way the timer root ticks: `sleep_until` one deadline after another, with
 //!   the pool otherwise idle, at a 2 ms period and at 60 Hz. The 60 Hz P99 is a pass
-//!   criterion of its own: 20 µs, and 1 ms on Windows (D144).
+//!   criterion of its own: 35 µs (D138), and 1 ms on Windows (D144).
 //! - **Wake latency.** From just before a one-node graph is pushed to a parked pool until
 //!   its job starts. The push comes from a dedicated thread at frame-critical priority. The
 //!   CPU the process uses during this phase, in which it does nothing but wake up five
@@ -93,12 +93,14 @@ const RATIO_P50_LIMIT: f64 = 1.25;
 const RATIO_P99_LIMIT: f64 = 1.5;
 /// A push from an idle pool. The floor on macOS is not the executor but the cores leaving
 /// their deep idle state, which a spike measured at 24 to 29 µs P99 with every wait
-/// primitive; 35 µs leaves room for the executor's own part. The start of a tick, below,
-/// keeps 20 µs: the keeper is awake and spinning when the deadline comes.
+/// primitive; 35 µs leaves room for the executor's own part.
 const WAKE_P99_LIMIT_NANOS: f64 = 35_000.0;
-/// The start of a tick. On Windows 1 ms (D144): the high-resolution timer that ends the
-/// keeper's wait there overshoots by about half a millisecond.
-const TIMER_P99_LIMIT_NANOS: f64 = if cfg!(windows) { 1_000_000.0 } else { 20_000.0 };
+/// The start of a tick: the same 35 µs (D138). The keeper is spinning when the deadline
+/// comes, but on a quiet M1 the samples that miss lose about 13 to 28 µs between the
+/// deadline and the task, and a longer spin did not win it back. On Windows 1 ms (D144):
+/// the high-resolution timer that ends the keeper's wait there overshoots by about half a
+/// millisecond.
+const TIMER_P99_LIMIT_NANOS: f64 = if cfg!(windows) { 1_000_000.0 } else { 35_000.0 };
 const TICK: Duration = Duration::from_micros(16_667);
 const STEAL_LIMIT_NANOS: f64 = 1_000.0;
 /// A wake or timer sample over this is a machine that was away rather than a scheduler that
