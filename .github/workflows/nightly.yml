@@ -169,6 +169,15 @@ jobs:
         run: cargo xtask sour self-test
       - name: Every mode
         run: cargo xtask sour run --nightly --emit sour-hashes-${{ matrix.platform }}.tsv
+      # Uploaded whenever the run got far enough to write them, findings or not, so the
+      # comparison below sees every platform that produced a file; before the release steps, so
+      # a timeout in them cannot cost the dev baseline its upload.
+      - name: Keep the baseline hashes
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: sour-hashes-${{ matrix.platform }}
+          path: sour-hashes-${{ matrix.platform }}.tsv
       # Every hash above comes from a dev build. The release profile drops debug assertions
       # and overflow checks, so code whose result depends on them would hash differently: one
       # baseline run built with it, held to this platform's dev baseline. It runs whatever the
@@ -179,14 +188,6 @@ jobs:
       - name: Release against dev
         if: ${{ !cancelled() }}
         run: cargo xtask sour compare sour-hashes-${{ matrix.platform }}.tsv sour-hashes-release-${{ matrix.platform }}.tsv
-      # Uploaded whenever the run got far enough to write them, findings or not, so the
-      # comparison below sees every platform that produced a file.
-      - name: Keep the baseline hashes
-        if: ${{ !cancelled() }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: sour-hashes-${{ matrix.platform }}
-          path: sour-hashes-${{ matrix.platform }}.tsv
       # Hash files of every run, and the execution log of any chaos test that failed, so
       # the failure replays exactly.
       - name: Keep SOUR output
