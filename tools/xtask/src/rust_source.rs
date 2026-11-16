@@ -375,11 +375,30 @@ pub(crate) struct Impl {
     pub(crate) types: Vec<(String, String)>,
 }
 
+/// An outer attribute that declares what a world registers: `#[system(...)]`,
+/// `#[component(...)]` or `#[resource(...)]`, under any path.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub(crate) struct Declaration {
+    /// The line of the attribute, from 1.
+    pub(crate) line: usize,
+    /// Whether what it is on is compiled only for tests (see [`items`]).
+    pub(crate) test_only: bool,
+    /// The last segment of the attribute's path: `system`, `component` or `resource`.
+    pub(crate) attribute: &'static str,
+    /// Whether one of its arguments is the word `derived`.
+    pub(crate) derived: bool,
+}
+
+/// The attributes [`Declaration`] reads, by the last segment of their path.
+const DECLARING: [&str; 3] = ["system", "component", "resource"];
+
 /// What [`items`] finds in one file.
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
 pub(crate) struct Items {
     /// Each trait implementation, in order.
     pub(crate) impls: Vec<Impl>,
+    /// Each attribute that declares a system, component or resource, in order.
+    pub(crate) declarations: Vec<Declaration>,
     /// Each out-of-line module declaration, in order.
     pub(crate) modules: Vec<Module>,
     /// Each inline module, `mod name { ... }`, in the order of its opening brace: its `path`
@@ -390,15 +409,15 @@ pub(crate) struct Items {
     pub(crate) includes: Vec<Include>,
 }
 
-/// The trait implementations, modules and literal `include!`s of `source`. An
-/// item is compiled only for tests if a `cfg` on it, on an item around it or at the top of
-/// the file holds only under `test` or a feature of `features` (`any` of such, or `all`
-/// with one).
+/// The trait implementations, declaring attributes, modules and literal `include!`s of
+/// `source`. An item is compiled only for tests if a `cfg` on it, on an item around it or at
+/// the top of the file holds only under `test` or a feature of `features` (`any` of such, or
+/// `all` with one).
 ///
-/// Token reading, not parsing: an item a macro expands to is not seen, a trait imported
-/// under another name is read under that name, an `include!` of anything but a literal is
-/// not followed, and an `impl Trait for` header inside a `macro_rules!` body is reported as
-/// if it were an implementation.
+/// Token reading, not parsing: an item a macro expands to is not seen, a trait or attribute
+/// imported under another name is read under that name, an attribute inside a `cfg_attr` is
+/// not read, an `include!` of anything but a literal is not followed, and an `impl Trait for`
+/// header inside a `macro_rules!` body is reported as if it were an implementation.
 pub(crate) fn items(source: &str, features: &[String]) -> Items {
     let bytes = source.as_bytes();
     let mut found = Items::default();
@@ -410,6 +429,8 @@ pub(crate) fn items(source: &str, features: &[String]) -> Items {
     let mut gated = false;
     let mut path = None;
     let mut miri = None;
+    // The item's declaring attributes, whose gate is known only once the item ends.
+    let mut declaring: Vec<Declaration> = Vec::new();
     // Open parentheses and brackets in the item, inside which a `;` ends nothing.
     let mut nesting = 0usize;
     let mut i = 0;
@@ -438,10 +459,17 @@ pub(crate) fn items(source: &str, features: &[String]) -> Items {
                 gated |= cfg_test_only(body, features);
                 path = path.or_else(|| path_value(body));
                 miri = miri.or(names_miri);
+                if let Some((attribute, derived)) = declaring_attribute(body) {
+                    let line = source[..i].matches('\n').count() + 1;
+                    declaring.push(Declaration { line, test_only: false, attribute, derived });
+                }
             }
             i = end;
         } else if matches!(byte, b'{' | b'}') || byte == b';' && nesting == 0 {
             let test_only = enclosing || gated;
+            found.declarations.extend(
+                declaring.drain(..).map(|declaration| Declaration { test_only, ..declaration }),
+            );
             for literal in included(&header, source) {
                 found.includes.push(Include { path: literal, test_only });
             }
@@ -532,6 +560,33 @@ pub(crate) fn items(source: &str, features: &[String]) -> Items {
         }
     }
     found
+}
+
+/// The last segment of the path of `body`, an attribute's text, if it is one of
+/// [`DECLARING`], and whether one of its arguments is the word `derived`.
+fn declaring_attribute(body: &str) -> Option<(&'static str, bool)> {
+    let compact = code_only(body);
+    let end = compact
+        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == ':'))
+        .unwrap_or(compact.len());
+    let name = compact[..end].rsplit("::").next().unwrap_or_default();
+    let attribute = DECLARING.into_iter().find(|declaring| *declaring == name)?;
+    let arguments =
+        compact[end..].strip_prefix('(').and_then(|r| r.strip_suffix(')')).unwrap_or_default();
+    // Each argument ends at a comma outside brackets, the last at the end.
+    let (mut depth, mut start, mut derived) = (0usize, 0, false);
+    for (at, c) in arguments.char_indices().chain([(arguments.len(), ',')]) {
+        match c {
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                derived |= &arguments[start..at] == "derived";
+                start = at + 1;
+            }
+            _ => {}
+        }
+    }
+    Some((attribute, derived))
 }
 
 /// One open brace of [`items`].
@@ -915,6 +970,36 @@ mod tests {
         );
         assert_eq!(impls(source, &[])[2], (8, false), "`bench` is not a test feature here");
         assert_eq!(impls("#![cfg(test)]\nimpl Asset for A {}\n", &[]), [(2, true)]);
+    }
+
+    #[test]
+    fn a_declaring_attribute_is_found_with_its_gate_and_whether_it_is_derived() {
+        let source = "#[component(key = \"g::a\", persistent, replicated)]\nstruct A(u32);\n\
+                      #[lactose_ecs::system(name = \"g::s\", worlds = [server, prediction])]\n\
+                      fn s(a: Mut<A>) {}\n\
+                      #[resource(key = \"g::derived\", transient)] struct R;\n\
+                      #[component(\n    key = \"g::d\",\n    derived, // cached\n)]\nstruct D;\n\
+                      #[system]\n#[cfg(test)]\nfn t() {}\n\
+                      #[cfg(test)]\nmod tests {\n    #[resource(key = \"g::t\", persistent)]\n    struct T;\n}\n\
+                      // #[system] fn commented() {}\n\
+                      #[systems] #[derive(Component)] #[cfg_attr(test, system)] fn other() {}\n\
+                      const S: &str = \"#[system] fn quoted() {}\";\n";
+        let declared: Vec<_> = found(source, &[])
+            .declarations
+            .into_iter()
+            .map(|d| (d.line, d.attribute, d.derived, d.test_only))
+            .collect();
+        assert_eq!(
+            declared,
+            [
+                (1, "component", false, false),
+                (3, "system", false, false),
+                (5, "resource", false, false),
+                (6, "component", true, false),
+                (11, "system", false, true),
+                (16, "resource", false, true),
+            ]
+        );
     }
 
     #[test]

@@ -8,7 +8,7 @@ store, renderer or presentation.
 | | |
 |---|---|
 | Tier | leaf |
-| Determinism boundary | outside |
+| Determinism boundary | outside; carries the boundary `clippy.toml` (`[lint_file_carriers]`) because its sketch game declares a component, a system and a session applier |
 | Unsafe | none, `#![forbid(unsafe_code)]` |
 
 ## What it holds

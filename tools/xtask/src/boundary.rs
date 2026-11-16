@@ -10,7 +10,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use crate::policy::Policy;
 use crate::repo::{Files, is_build_configuration, is_cargo_config, unread_cargo_configuration};
-use crate::rust_source::{Attribute, Impl, Items, attributes, items};
+use crate::rust_source::{Attribute, Declaration, Impl, Items, attributes, items};
 use crate::tiers::{TierFile, turning_on};
 use crate::workspace::{DepKind, DepSource, Package, Workspace};
 use crate::{ARCHITECTURE, Finding, POLICY_FILE, TIER_FILE};
@@ -32,6 +32,10 @@ const SIMULATION_ASSET: &str = "SimulationAsset";
 
 /// The trait that decodes an asset kind from cooked bytes (D99).
 const LOADER: &str = "Loader";
+
+/// The traits of `lactose_sim` through which the input sync point writes what enters a tick
+/// into the world: players' joins and leaves, their inputs, and staged state.
+const APPLYING_TRAITS: [&str; 3] = ["SessionApplier", "InputApplier", "StagedState"];
 
 /// The `[target]` key and the flags of the pin (architecture section 8.2).
 const PIN_KEY: &str = r#"cfg(target_arch = "x86_64")"#;
@@ -605,6 +609,7 @@ pub fn check(tiers: &TierFile, policy: &Policy, ws: &Workspace, files: &Files) -
     }));
     harness_packages(policy, ws, files, &mut findings);
     simulation_assets(tiers, ws, files, &mut findings);
+    registered_outside_the_lint_file(tiers, policy, ws, files, &mut findings);
     workspace_lints(files, &mut findings);
     build_configuration(files, &mut findings);
     cargo_configs(files, &mut findings);
@@ -1138,12 +1143,7 @@ fn harness_packages(policy: &Policy, ws: &Workspace, files: &Files, findings: &m
 /// type alias, a projection such as `<Self as Decodes>::Kind`) or a loader a macro writes is
 /// not seen, and a type outside the boundary that shares a kind's name is reported.
 fn simulation_assets(tiers: &TierFile, ws: &Workspace, files: &Files, findings: &mut Vec<Finding>) {
-    let shipped = |package: &Package| {
-        let listed = tiers.dev_only_features.get(&package.name).map_or(&[][..], Vec::as_slice);
-        let features: Vec<String> =
-            turning_on(package, listed).into_iter().map(str::to_owned).collect();
-        shipped_impls(package, files, &features)
-    };
+    let shipped = |package: &Package| shipped(tiers, package, files).impls;
     let (inside, outside): (Vec<&Package>, Vec<&Package>) =
         ws.packages.iter().partition(|package| tiers.in_boundary(&package.name));
     let kinds: BTreeSet<String> = inside
@@ -1181,6 +1181,54 @@ fn simulation_assets(tiers: &TierFile, ws: &Workspace, files: &Files, findings: 
     }
 }
 
+/// Project review 2, X1: what a world registers and runs is written under the boundary lint
+/// file. A crate that carries none, neither a boundary crate nor one of `[lint_file_carriers]`,
+/// ships no `#[system]`, no `#[component]` or `#[resource]` that is not `derived`, and no
+/// implementation of a trait through which the simulation applies what enters a tick
+/// ([`APPLYING_TRAITS`]); each is reported where it stands, unless only tests compile it.
+///
+/// The shipped code is read as [`simulation_assets`] reads it, and attributes and traits by
+/// their last path segment as written: one brought in under another name, or written by a
+/// macro or inside a `cfg_attr`, is not seen.
+fn registered_outside_the_lint_file(
+    tiers: &TierFile,
+    policy: &Policy,
+    ws: &Workspace,
+    files: &Files,
+    findings: &mut Vec<Finding>,
+) {
+    let unlinted = ws.packages.iter().filter(|package| {
+        !tiers.in_boundary(&package.name) && !policy.lint_file_carriers.contains(&package.name)
+    });
+    for package in unlinted {
+        let Shipped { impls, declarations } = shipped(tiers, package, files);
+        let declared =
+            declarations.into_iter().filter(|(_, found)| !found.derived).map(|(file, found)| {
+                let what = match found.attribute {
+                    "system" => "`#[system]`".to_owned(),
+                    attribute => format!("`#[{attribute}]` that is not `derived`"),
+                };
+                (file, found.line, what)
+            });
+        let applied = impls
+            .into_iter()
+            .filter(|(_, found)| APPLYING_TRAITS.contains(&found.trait_name.as_str()))
+            .map(|(file, found)| (file, found.line, format!("`impl {}`", found.trait_name)));
+        for (file, line, what) in declared.chain(applied) {
+            findings.push(Finding::new(
+                file,
+                format!(
+                    "line {line}: {what} in `{}`, which carries no boundary lint file; what a \
+                     world registers and runs is written in a boundary crate or a crate of \
+                     [lint_file_carriers] in {POLICY_FILE}, under the lints of architecture \
+                     section 8.2, or only in tests",
+                    package.name
+                ),
+            ));
+        }
+    }
+}
+
 /// What a loader outside the boundary decodes, said for a finding, if it may be a kind the
 /// simulation reads: its `type Asset` names one of `kinds` by its last path segment, names a
 /// type parameter of the implementation, or cannot be read.
@@ -1210,9 +1258,23 @@ fn loads_for_the_simulation(found: &Impl, kinds: &BTreeSet<String>) -> Option<St
         .then(|| format!("`{asset}`, which a boundary crate declares a `{SIMULATION_ASSET}`"))
 }
 
-/// Every trait implementation `package` ships, with its file, each once: the walk of
-/// [`simulation_assets`] over the package's module tree.
-fn shipped_impls(package: &Package, files: &Files, features: &[String]) -> Vec<(String, Impl)> {
+/// What a package ships, by [`shipped`].
+#[derive(Default)]
+struct Shipped {
+    /// Each trait implementation, with its file.
+    impls: Vec<(String, Impl)>,
+    /// Each declaring attribute, with its file.
+    declarations: Vec<(String, Declaration)>,
+}
+
+/// Every trait implementation and declaring attribute `package` ships, with its file, each
+/// once: the walk of [`simulation_assets`] over the package's module tree, without the
+/// features `[dev_only_features]` lists for it.
+fn shipped(tiers: &TierFile, package: &Package, files: &Files) -> Shipped {
+    let listed = tiers.dev_only_features.get(&package.name).map_or(&[][..], Vec::as_slice);
+    let features: Vec<String> =
+        turning_on(package, listed).into_iter().map(str::to_owned).collect();
+    let features = &features[..];
     // (file, the directory its out-of-line modules sit in, whether only tests compile it)
     let mut queue: VecDeque<(String, String, bool)> = package
         .shipped_roots
@@ -1222,7 +1284,8 @@ fn shipped_impls(package: &Package, files: &Files, features: &[String]) -> Vec<(
     // Each file read, under the directory it was read with, and whether it was read as
     // shipped: a file reached again as shipped after a test-only route is read again.
     let mut read: BTreeMap<(String, String), bool> = BTreeMap::new();
-    let mut found: BTreeMap<(String, usize), Impl> = BTreeMap::new();
+    let mut impls: BTreeMap<(String, usize), Impl> = BTreeMap::new();
+    let mut declarations: BTreeMap<(String, usize), Declaration> = BTreeMap::new();
     let mut sweep = true;
     loop {
         while let Some((file, dir, test_only)) = queue.pop_front() {
@@ -1239,8 +1302,14 @@ fn shipped_impls(package: &Package, files: &Files, features: &[String]) -> Vec<(
             for (child, child_dir, gated) in children(&file, &dir, &items, files) {
                 queue.push_back((child, child_dir, test_only || gated));
             }
-            for implementation in items.impls.into_iter().filter(|i| !test_only && !i.test_only) {
-                found.insert((file.clone(), implementation.line), implementation);
+            if test_only {
+                continue;
+            }
+            for implementation in items.impls.into_iter().filter(|i| !i.test_only) {
+                impls.insert((file.clone(), implementation.line), implementation);
+            }
+            for declaration in items.declarations.into_iter().filter(|d| !d.test_only) {
+                declarations.insert((file.clone(), declaration.line), declaration);
             }
         }
         if !std::mem::take(&mut sweep) {
@@ -1257,7 +1326,10 @@ fn shipped_impls(package: &Package, files: &Files, features: &[String]) -> Vec<(
             }
         }
     }
-    found.into_iter().map(|((file, _), implementation)| (file, implementation)).collect()
+    Shipped {
+        impls: impls.into_iter().map(|((file, _), found)| (file, found)).collect(),
+        declarations: declarations.into_iter().map(|((file, _), found)| (file, found)).collect(),
+    }
 }
 
 /// A boundary crate's `direct` lists name only crates its manifest names. A crate it only
@@ -3128,6 +3200,57 @@ mod tests {
             run(&ws, &files),
             [at("crates/task/src/lib.rs", 10), at("crates/task/src/suite.rs", 2)]
         );
+    }
+
+    #[test]
+    fn what_a_world_registers_outside_every_boundary_lint_file_is_reported() {
+        // Project review 2, X1: `task` carries no boundary lint file, `math` is a boundary crate.
+        let (ws, mut files) = conforming();
+        let game = "#[component(key = \"g::a\", persistent, replicated)]\nstruct A(u32);\n\
+                    #[lactose_ecs::system(name = \"g::s\", worlds = [server])]\nfn s() {}\n\
+                    #[resource(key = \"g::r\", transient)]\nstruct R;\n\
+                    #[component(key = \"g::d\", derived)]\nstruct D;\n\
+                    #[resource(key = \"g::e\", derived)]\nstruct E;\n\
+                    impl SessionApplier for S {}\n\
+                    impl lactose_sim::InputApplier for S {}\n\
+                    impl<T> StagedState for H<T> {}\n\
+                    impl Applier for S {}\n";
+        files.insert("crates/task/src/lib.rs", "mod game;\n");
+        files.insert("crates/task/src/game.rs", game);
+        let at = |line: usize, what: &str| {
+            format!(
+                "crates/task/src/game.rs: line {line}: {what} in `lactose-task`, which carries no boundary lint file; what a world registers and runs is written in a boundary crate or a crate of [lint_file_carriers] in {POLICY_FILE}, under the lints of architecture section 8.2, or only in tests"
+            )
+        };
+        assert_eq!(
+            run(&ws, &files),
+            [
+                at(1, "`#[component]` that is not `derived`"),
+                at(3, "`#[system]`"),
+                at(5, "`#[resource]` that is not `derived`"),
+                at(11, "`impl SessionApplier`"),
+                at(12, "`impl InputApplier`"),
+                at(13, "`impl StagedState`"),
+            ]
+        );
+
+        // Compiled only for tests, in a boundary crate, or in a lint-file carrier.
+        let (ws, mut files) = conforming();
+        files.insert(
+            "crates/task/src/lib.rs",
+            format!("#[cfg(test)]\nmod game;\n#[cfg(test)]\nmod inline {{\n{game}}}\n"),
+        );
+        files.insert("crates/task/src/game.rs", game);
+        files.insert("crates/task/tests/game.rs", game);
+        files.insert("crates/math/src/lib.rs", format!("{FORBID}{game}"));
+        assert_eq!(run(&ws, &files), NONE);
+        files.insert("crates/task/src/lib.rs", "mod game;\n");
+        files.insert("crates/task/clippy.toml", lint_file());
+        let mut carriers = policy();
+        carriers.lint_file_carriers.push("lactose-task".to_owned());
+        assert_eq!(run_with(&carriers, &ws, &files), NONE);
+        let unlisted = run(&ws, &files);
+        assert_eq!(unlisted.iter().filter(|f| f.contains("no boundary lint file")).count(), 6);
     }
 
     /// What row 66 reports for an `impl SimulationAsset` at `line` of `file` in `lactose-task`.

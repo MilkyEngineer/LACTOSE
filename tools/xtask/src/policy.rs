@@ -91,7 +91,10 @@ mod tests {
     fn the_checked_in_file_parses() {
         let policy = Policy::parse(include_str!("../ci-policy.toml")).unwrap();
         assert!(policy.unsafe_crates.contains(&"lactose-core".to_owned()));
-        assert_eq!(policy.lint_file_carriers, ["lactose-reflect-macros", "lactose-ecs-macros"]);
+        assert_eq!(
+            policy.lint_file_carriers,
+            ["lactose-reflect-macros", "lactose-ecs-macros", "lactose-app-headless"]
+        );
         assert!(!policy.harness_tests.is_empty());
         assert_eq!(policy.miri_split, ["lactose-ecs"]);
         assert!(policy.separate_test_targets.contains(&"lactose-ecs::alloc".to_owned()));

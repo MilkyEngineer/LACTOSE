@@ -1,0 +1,494 @@
+# Determinism boundary lints, architecture section 8.2. Every crate in the [boundary] list of
+# crate-tiers.toml carries an identical copy of this file; CI checks that they match.
+# `lactose-math` is the one crate that may opt out of the float-method list, item by item.
+
+disallowed-methods = [
+  { path = "f32::min", reason = "nondeterministic on signed zero; use lactose_math" },
+  { path = "f32::max", reason = "nondeterministic on signed zero; use lactose_math" },
+  { path = "f32::clamp", reason = "use lactose_math compare-and-select clamp" },
+  { path = "f32::powi", reason = "platform dependent; use lactose_math" },
+  { path = "f32::total_cmp", reason = "observes NaN sign and payload" },
+  { path = "f32::to_bits", reason = "observes NaN sign and payload; use lactose_math canonical bits" },
+  { path = "f32::copysign", reason = "observes NaN sign" },
+  { path = "f32::is_sign_negative", reason = "observes NaN sign" },
+  { path = "f32::sin", reason = "platform libm; use lactose_math" },
+  { path = "f32::cos", reason = "platform libm; use lactose_math" },
+  { path = "f32::tan", reason = "platform libm; use lactose_math" },
+  { path = "f32::asin", reason = "platform libm; use lactose_math" },
+  { path = "f32::acos", reason = "platform libm; use lactose_math" },
+  { path = "f32::atan", reason = "platform libm; use lactose_math" },
+  { path = "f32::atan2", reason = "platform libm; use lactose_math" },
+  { path = "f32::sin_cos", reason = "platform libm; use lactose_math" },
+  { path = "f32::sinh", reason = "platform libm; use lactose_math" },
+  { path = "f32::cosh", reason = "platform libm; use lactose_math" },
+  { path = "f32::tanh", reason = "platform libm; use lactose_math" },
+  { path = "f32::exp", reason = "platform libm; use lactose_math" },
+  { path = "f32::exp2", reason = "platform libm; use lactose_math" },
+  { path = "f32::exp_m1", reason = "platform libm; use lactose_math" },
+  { path = "f32::ln", reason = "platform libm; use lactose_math" },
+  { path = "f32::ln_1p", reason = "platform libm; use lactose_math" },
+  { path = "f32::log", reason = "platform libm; use lactose_math" },
+  { path = "f32::log2", reason = "platform libm; use lactose_math" },
+  { path = "f32::log10", reason = "platform libm; use lactose_math" },
+  { path = "f32::powf", reason = "platform libm; use lactose_math" },
+  { path = "f32::cbrt", reason = "platform libm; use lactose_math" },
+  { path = "f32::hypot", reason = "platform libm; use lactose_math" },
+  { path = "f64::min", reason = "nondeterministic on signed zero; use lactose_math" },
+  { path = "f64::max", reason = "nondeterministic on signed zero; use lactose_math" },
+  { path = "f64::clamp", reason = "use lactose_math compare-and-select clamp" },
+  { path = "f64::powi", reason = "platform dependent; use lactose_math" },
+  { path = "f64::total_cmp", reason = "observes NaN sign and payload" },
+  { path = "f64::to_bits", reason = "observes NaN sign and payload; use lactose_math canonical bits" },
+  { path = "f64::copysign", reason = "observes NaN sign" },
+  { path = "f64::is_sign_negative", reason = "observes NaN sign" },
+  { path = "f64::sin", reason = "platform libm; use lactose_math" },
+  { path = "f64::cos", reason = "platform libm; use lactose_math" },
+  { path = "f64::tan", reason = "platform libm; use lactose_math" },
+  { path = "f64::asin", reason = "platform libm; use lactose_math" },
+  { path = "f64::acos", reason = "platform libm; use lactose_math" },
+  { path = "f64::atan", reason = "platform libm; use lactose_math" },
+  { path = "f64::atan2", reason = "platform libm; use lactose_math" },
+  { path = "f64::sin_cos", reason = "platform libm; use lactose_math" },
+  { path = "f64::sinh", reason = "platform libm; use lactose_math" },
+  { path = "f64::cosh", reason = "platform libm; use lactose_math" },
+  { path = "f64::tanh", reason = "platform libm; use lactose_math" },
+  { path = "f64::exp", reason = "platform libm; use lactose_math" },
+  { path = "f64::exp2", reason = "platform libm; use lactose_math" },
+  { path = "f64::exp_m1", reason = "platform libm; use lactose_math" },
+  { path = "f64::ln", reason = "platform libm; use lactose_math" },
+  { path = "f64::ln_1p", reason = "platform libm; use lactose_math" },
+  { path = "f64::log", reason = "platform libm; use lactose_math" },
+  { path = "f64::log2", reason = "platform libm; use lactose_math" },
+  { path = "f64::log10", reason = "platform libm; use lactose_math" },
+  { path = "f64::powf", reason = "platform libm; use lactose_math" },
+  { path = "f64::cbrt", reason = "platform libm; use lactose_math" },
+  { path = "f64::hypot", reason = "platform libm; use lactose_math" },
+  { path = "f32::algebraic_add", reason = "lets the optimiser reassociate and contract" },
+  { path = "f32::algebraic_sub", reason = "lets the optimiser reassociate and contract" },
+  { path = "f32::algebraic_mul", reason = "lets the optimiser reassociate and contract" },
+  { path = "f32::algebraic_div", reason = "lets the optimiser reassociate and contract" },
+  { path = "f32::algebraic_rem", reason = "lets the optimiser reassociate and contract" },
+  { path = "f32::to_le_bytes", reason = "observes NaN sign and payload; use lactose_math canonical bits" },
+  { path = "f32::to_be_bytes", reason = "observes NaN sign and payload; use lactose_math canonical bits" },
+  { path = "f32::to_ne_bytes", reason = "observes NaN sign and payload; use lactose_math canonical bits" },
+  { path = "f32::abs_sub", reason = "platform libm; use lactose_math" },
+  { path = "f64::algebraic_add", reason = "lets the optimiser reassociate and contract" },
+  { path = "f64::algebraic_sub", reason = "lets the optimiser reassociate and contract" },
+  { path = "f64::algebraic_mul", reason = "lets the optimiser reassociate and contract" },
+  { path = "f64::algebraic_div", reason = "lets the optimiser reassociate and contract" },
+  { path = "f64::algebraic_rem", reason = "lets the optimiser reassociate and contract" },
+  { path = "f64::to_le_bytes", reason = "observes NaN sign and payload; use lactose_math canonical bits" },
+  { path = "f64::to_be_bytes", reason = "observes NaN sign and payload; use lactose_math canonical bits" },
+  { path = "f64::to_ne_bytes", reason = "observes NaN sign and payload; use lactose_math canonical bits" },
+  { path = "f64::abs_sub", reason = "platform libm; use lactose_math" },
+  { path = "f32::is_sign_positive", reason = "observes NaN sign" },
+  { path = "f32::rem_euclid", reason = "goes through `%`, the platform fmod; use lactose_math" },
+  { path = "f32::div_euclid", reason = "goes through `%`, the platform fmod; use lactose_math" },
+  { path = "f32::mul_add", reason = "result depends on the caller's target features; use lactose_math::Scalar::mul_add" },
+  { path = "f64::is_sign_positive", reason = "observes NaN sign" },
+  { path = "f64::rem_euclid", reason = "goes through `%`, the platform fmod; use lactose_math" },
+  { path = "f64::div_euclid", reason = "goes through `%`, the platform fmod; use lactose_math" },
+  { path = "f64::mul_add", reason = "result depends on the caller's target features; use lactose_math::Scalar::mul_add" },
+  { path = "f32::asinh", reason = "platform libm, through ln_1p and hypot; use lactose_math" },
+  { path = "f32::acosh", reason = "platform libm, through ln; use lactose_math" },
+  { path = "f32::atanh", reason = "platform libm, through ln_1p; use lactose_math" },
+  { path = "f64::asinh", reason = "platform libm, through ln_1p and hypot; use lactose_math" },
+  { path = "f64::acosh", reason = "platform libm, through ln; use lactose_math" },
+  { path = "f64::atanh", reason = "platform libm, through ln_1p; use lactose_math" },
+  # D119: the routes from Rapier's math to the float methods above, which a call on a scalar
+  # bounded by these traits takes instead of the inherent method. Under the resolved features
+  # simba's `RealField` hands `max`, `min` and the sign tests to the inherent methods and
+  # `copysign` to libm's, which observes the NaN sign alike; `simd_copysign` calls it, and
+  # `SimdSigned`'s sign tests reach the inherent ones through num-traits. The rest of
+  # `RealField` and `ComplexField` is compare-and-select or libm (simba's `libm_force`).
+  { path = "simba::scalar::RealField::max", reason = "reaches f64::max: nondeterministic on signed zero; use lactose_math", allow-invalid = true },
+  { path = "simba::scalar::RealField::min", reason = "reaches f64::min: nondeterministic on signed zero; use lactose_math", allow-invalid = true },
+  { path = "simba::scalar::RealField::copysign", reason = "observes NaN sign", allow-invalid = true },
+  { path = "simba::scalar::RealField::is_sign_positive", reason = "observes NaN sign", allow-invalid = true },
+  { path = "simba::scalar::RealField::is_sign_negative", reason = "observes NaN sign", allow-invalid = true },
+  { path = "simba::simd::SimdRealField::simd_copysign", reason = "observes NaN sign", allow-invalid = true },
+  { path = "simba::simd::SimdSigned::is_simd_positive", reason = "observes NaN sign", allow-invalid = true },
+  { path = "simba::simd::SimdSigned::is_simd_negative", reason = "observes NaN sign", allow-invalid = true },
+  # num-traits' `Signed` is a supertrait of `RealField`, so its sign tests are callable on any
+  # scalar bounded by it; on a float they are the inherent `is_sign_positive` and
+  # `is_sign_negative`. Banned for integers too, where a comparison does the same.
+  { path = "num_traits::sign::Signed::is_positive", reason = "observes NaN sign", allow-invalid = true },
+  { path = "num_traits::sign::Signed::is_negative", reason = "observes NaN sign", allow-invalid = true },
+  # glam computes its float methods through `libm` (its `libm` feature, which Rapier's
+  # `enhanced-determinism` turns on) or, under its `scalar-math` feature, by
+  # compare-and-select, except these: the sign tests read the sign bit and `copysign` copies
+  # it, NaN's included, and the Euclidean division and remainder call the platform `fmod`, as
+  # `%` does. Section 8.2 bans the scalar Euclidean forms and these follow it; `%` itself, on a
+  # scalar or through glam's `Rem`, is an operator no lint sees.
+  { path = "glam::Vec2::copysign", reason = "observes NaN sign", allow-invalid = true },
+  { path = "glam::Vec2::is_negative_bitmask", reason = "observes NaN sign", allow-invalid = true },
+  { path = "glam::Vec2::is_negative_mask", reason = "observes NaN sign", allow-invalid = true },
+  { path = "glam::Vec2::rem_euclid", reason = "calls the platform fmod, as `%` does; section 8.2 bans the scalar forms", allow-invalid = true },
+  { path = "glam::Vec2::div_euclid", reason = "calls the platform fmod, as `%` does; section 8.2 bans the scalar forms", allow-invalid = true },
+  { path = "glam::Vec3::copysign", reason = "observes NaN sign", allow-invalid = true },
+  { path = "glam::Vec3::is_negative_bitmask", reason = "observes NaN sign", allow-invalid = true },
+  { path = "glam::Vec3::is_negative_mask", reason = "observes NaN sign", allow-invalid = true },
+  { path = "glam::Vec3::rem_euclid", reason = "calls the platform fmod, as `%` does; section 8.2 bans the scalar forms", allow-invalid = true },
+  { path = "glam::Vec3::div_euclid", reason = "calls the platform fmod, as `%` does; section 8.2 bans the scalar forms", allow-invalid = true },
+  { path = "glam::Vec3A::copysign", reason = "observes NaN sign", allow-invalid = true },
+  { path = "glam::Vec3A::is_negative_bitmask", reason = "observes NaN sign", allow-invalid = true },
+  { path = "glam::Vec3A::is_negative_mask", reason = "observes NaN sign", allow-invalid = true },
+  { path = "glam::Vec3A::rem_euclid", reason = "calls the platform fmod, as `%` does; section 8.2 bans the scalar forms", allow-invalid = true },
+  { path = "glam::Vec3A::div_euclid", reason = "calls the platform fmod, as `%` does; section 8.2 bans the scalar forms", allow-invalid = true },
+  { path = "glam::Vec4::copysign", reason = "observes NaN sign", allow-invalid = true },
+  { path = "glam::Vec4::is_negative_bitmask", reason = "observes NaN sign", allow-invalid = true },
+  { path = "glam::Vec4::is_negative_mask", reason = "observes NaN sign", allow-invalid = true },
+  { path = "glam::Vec4::rem_euclid", reason = "calls the platform fmod, as `%` does; section 8.2 bans the scalar forms", allow-invalid = true },
+  { path = "glam::Vec4::div_euclid", reason = "calls the platform fmod, as `%` does; section 8.2 bans the scalar forms", allow-invalid = true },
+  { path = "glam::DVec2::copysign", reason = "observes NaN sign", allow-invalid = true },
+  { path = "glam::DVec2::is_negative_bitmask", reason = "observes NaN sign", allow-invalid = true },
+  { path = "glam::DVec2::is_negative_mask", reason = "observes NaN sign", allow-invalid = true },
+  { path = "glam::DVec2::rem_euclid", reason = "calls the platform fmod, as `%` does; section 8.2 bans the scalar forms", allow-invalid = true },
+  { path = "glam::DVec2::div_euclid", reason = "calls the platform fmod, as `%` does; section 8.2 bans the scalar forms", allow-invalid = true },
+  { path = "glam::DVec3::copysign", reason = "observes NaN sign", allow-invalid = true },
+  { path = "glam::DVec3::is_negative_bitmask", reason = "observes NaN sign", allow-invalid = true },
+  { path = "glam::DVec3::is_negative_mask", reason = "observes NaN sign", allow-invalid = true },
+  { path = "glam::DVec3::rem_euclid", reason = "calls the platform fmod, as `%` does; section 8.2 bans the scalar forms", allow-invalid = true },
+  { path = "glam::DVec3::div_euclid", reason = "calls the platform fmod, as `%` does; section 8.2 bans the scalar forms", allow-invalid = true },
+  { path = "glam::DVec4::copysign", reason = "observes NaN sign", allow-invalid = true },
+  { path = "glam::DVec4::is_negative_bitmask", reason = "observes NaN sign", allow-invalid = true },
+  { path = "glam::DVec4::is_negative_mask", reason = "observes NaN sign", allow-invalid = true },
+  { path = "glam::DVec4::rem_euclid", reason = "calls the platform fmod, as `%` does; section 8.2 bans the scalar forms", allow-invalid = true },
+  { path = "glam::DVec4::div_euclid", reason = "calls the platform fmod, as `%` does; section 8.2 bans the scalar forms", allow-invalid = true },
+  # nalgebra re-exports num-complex's `Complex`, and its `UnitComplex` dereferences to one, so
+  # these are callable without naming the type: each goes through num-traits' `Float`, which
+  # under the resolved `std` feature is the standard library's methods.
+  { path = "num_complex::Complex::cis", reason = "platform libm, through num_traits::Float; use lactose_math", allow-invalid = true },
+  { path = "num_complex::Complex::norm", reason = "platform libm, through num_traits::Float; use lactose_math", allow-invalid = true },
+  { path = "num_complex::Complex::arg", reason = "platform libm, through num_traits::Float; use lactose_math", allow-invalid = true },
+  { path = "num_complex::Complex::to_polar", reason = "platform libm, through num_traits::Float; use lactose_math", allow-invalid = true },
+  { path = "num_complex::Complex::from_polar", reason = "platform libm, through num_traits::Float; use lactose_math", allow-invalid = true },
+  { path = "num_complex::Complex::exp", reason = "platform libm, through num_traits::Float; use lactose_math", allow-invalid = true },
+  { path = "num_complex::Complex::ln", reason = "platform libm, through num_traits::Float; use lactose_math", allow-invalid = true },
+  { path = "num_complex::Complex::sqrt", reason = "platform libm, through num_traits::Float; use lactose_math", allow-invalid = true },
+  { path = "num_complex::Complex::cbrt", reason = "platform libm, through num_traits::Float; use lactose_math", allow-invalid = true },
+  { path = "num_complex::Complex::powf", reason = "platform libm, through num_traits::Float; use lactose_math", allow-invalid = true },
+  { path = "num_complex::Complex::log", reason = "platform libm, through num_traits::Float; use lactose_math", allow-invalid = true },
+  { path = "num_complex::Complex::powc", reason = "platform libm, through num_traits::Float; use lactose_math", allow-invalid = true },
+  { path = "num_complex::Complex::expf", reason = "platform libm, through num_traits::Float; use lactose_math", allow-invalid = true },
+  { path = "num_complex::Complex::sin", reason = "platform libm, through num_traits::Float; use lactose_math", allow-invalid = true },
+  { path = "num_complex::Complex::cos", reason = "platform libm, through num_traits::Float; use lactose_math", allow-invalid = true },
+  { path = "num_complex::Complex::tan", reason = "platform libm, through num_traits::Float; use lactose_math", allow-invalid = true },
+  { path = "num_complex::Complex::asin", reason = "platform libm, through num_traits::Float; use lactose_math", allow-invalid = true },
+  { path = "num_complex::Complex::acos", reason = "platform libm, through num_traits::Float; use lactose_math", allow-invalid = true },
+  { path = "num_complex::Complex::atan", reason = "platform libm, through num_traits::Float; use lactose_math", allow-invalid = true },
+  { path = "num_complex::Complex::sinh", reason = "platform libm, through num_traits::Float; use lactose_math", allow-invalid = true },
+  { path = "num_complex::Complex::cosh", reason = "platform libm, through num_traits::Float; use lactose_math", allow-invalid = true },
+  { path = "num_complex::Complex::tanh", reason = "platform libm, through num_traits::Float; use lactose_math", allow-invalid = true },
+  { path = "num_complex::Complex::asinh", reason = "platform libm, through num_traits::Float; use lactose_math", allow-invalid = true },
+  { path = "num_complex::Complex::acosh", reason = "platform libm, through num_traits::Float; use lactose_math", allow-invalid = true },
+  { path = "num_complex::Complex::atanh", reason = "platform libm, through num_traits::Float; use lactose_math", allow-invalid = true },
+  { path = "num_complex::Complex::finv", reason = "platform libm, through num_traits::Float; use lactose_math", allow-invalid = true },
+  { path = "num_complex::Complex::fdiv", reason = "platform libm, through num_traits::Float; use lactose_math", allow-invalid = true },
+  { path = "num_complex::Complex::exp2", reason = "platform libm, through num_traits::Float; use lactose_math", allow-invalid = true },
+  { path = "num_complex::Complex::log2", reason = "platform libm, through num_traits::Float; use lactose_math", allow-invalid = true },
+  { path = "num_complex::Complex::log10", reason = "platform libm, through num_traits::Float; use lactose_math", allow-invalid = true },
+  # glamx's 3x3 eigen decomposition calls the standard library's `acos` and `cos`, and its
+  # SVDs `sin`, `cos` and `atan2` or the eigen decomposition, whatever its `libm` feature;
+  # these reach them from a matrix without naming the types banned under disallowed-types.
+  # The 2x2 eigen decomposition, banned with them as one trait method, is exact squares and
+  # `sqrt`.
+  { path = "glamx::MatExt::symmetric_eigen", reason = "platform libm, through glamx's eigen decomposition and SVD; use lactose_math", allow-invalid = true },
+  { path = "glamx::MatExt::symmetric_eigenvalues", reason = "platform libm, through glamx's eigen decomposition and SVD; use lactose_math", allow-invalid = true },
+  { path = "glamx::MatExt::svd", reason = "platform libm, through glamx's eigen decomposition and SVD; use lactose_math", allow-invalid = true },
+  # approx's ULP comparison; glamx's rotations implement it on the bits of a NaN.
+  { path = "approx::UlpsEq::ulps_eq", reason = "observes NaN sign and payload", allow-invalid = true },
+  { path = "approx::UlpsEq::ulps_ne", reason = "observes NaN sign and payload", allow-invalid = true },
+  # Architecture section 8.2: the worker index is never a semantic key, the executor's or the
+  # solver pool's.
+  { path = "lactose_task::JobContext::slot", reason = "the worker index is not a semantic key; key by StableKey", allow-invalid = true },
+  { path = "lactose_task::ChildContext::slot", reason = "the worker index is not a semantic key; key by StableKey", allow-invalid = true },
+  { path = "rayon::current_thread_index", reason = "the worker index is not a semantic key; key by StableKey", allow-invalid = true },
+  { path = "rayon::ThreadPool::current_thread_index", reason = "the worker index is not a semantic key; key by StableKey", allow-invalid = true },
+  # Architecture section 8.2: `lactose_ecs` re-exports the executor so that a boundary crate
+  # can drive a schedule, and the re-export reaches every boundary crate. What one may do
+  # with it is run a schedule. The worker count, spawning or running arbitrary work, thread
+  # creation, a deadline, the scheduling history and its configuration are banned;
+  # `lactose-ecs` opts out at its one `run_graph` call site, item by item, like `lactose-math`
+  # does for the float methods.
+  { path = "lactose_task::Executor::frame_worker_count", reason = "the worker count is not a semantic key; key by StableKey", allow-invalid = true },
+  { path = "lactose_task::Executor::slot_count", reason = "the worker count is not a semantic key; key by StableKey", allow-invalid = true },
+  { path = "lactose_task::Executor::spawn", reason = "a boundary crate runs schedules, not arbitrary tasks", allow-invalid = true },
+  { path = "lactose_task::Executor::run_graph", reason = "a boundary crate runs schedules through lactose_ecs::Schedule, not graphs", allow-invalid = true },
+  { path = "lactose_task::Executor::platform", reason = "a boundary crate creates no thread", allow-invalid = true },
+  { path = "lactose_task::Executor::sleep_until", reason = "no wall-clock time inside the boundary", allow-invalid = true },
+  { path = "lactose_task::Executor::execution_log", reason = "scheduling history is not simulation input", allow-invalid = true },
+  { path = "lactose_task::Executor::chaos_config", reason = "scheduling configuration is not simulation input", allow-invalid = true },
+  { path = "lactose_task::Platform::spawn_thread", reason = "a boundary crate creates no thread", allow-invalid = true },
+  { path = "lactose_task::Platform::topology", reason = "the core count is not a simulation input", allow-invalid = true },
+  { path = "lactose_task::Platform::hardware_threads", reason = "the core count is not a simulation input", allow-invalid = true },
+  # D119: nalgebra hands products above its small-dimension cutoff to `matrixmultiply`,
+  # whose kernels are selected by CPU feature at run time. The step forms none; inverse
+  # kinematics does, so it is banned (paths on the pinned rapier3d-f64 0.36.0).
+  { path = "rapier3d_f64::dynamics::Multibody::inverse_kinematics", reason = "reaches matrixmultiply, whose kernels are chosen by CPU feature", allow-invalid = true },
+  { path = "rapier3d_f64::dynamics::Multibody::inverse_kinematics_delta", reason = "reaches matrixmultiply, whose kernels are chosen by CPU feature", allow-invalid = true },
+  { path = "rapier3d_f64::dynamics::Multibody::inverse_kinematics_delta_with_jacobian", reason = "reaches matrixmultiply, whose kernels are chosen by CPU feature", allow-invalid = true },
+  # A multibody's mass assembly reaches it too above five degrees of freedom, so no boundary
+  # crate inserts a multibody joint.
+  { path = "rapier3d_f64::dynamics::MultibodyJointSet::insert", reason = "multibody mass assembly reaches matrixmultiply, whose kernels are chosen by CPU feature", allow-invalid = true },
+  { path = "rapier3d_f64::dynamics::MultibodyJointSet::insert_kinematic", reason = "multibody mass assembly reaches matrixmultiply, whose kernels are chosen by CPU feature", allow-invalid = true },
+  # D119: two public Rapier and parry methods call the platform library past `libm_force`
+  # (`asin`, `acos`). Pinned in tools/xtask but not proven by tests/boundary_lints.rs, whose
+  # probe does not compile Rapier.
+  { path = "rapier3d_f64::dynamics::RevoluteJoint::angle", reason = "platform libm (asin); use lactose_math", allow-invalid = true },
+  { path = "parry3d_f64::math::VectorExt::angle", reason = "platform libm (acos); use lactose_math", allow-invalid = true },
+  # Architecture section 8.2: file IO (`io`), the process environment, subprocesses and the
+  # network (`net-host`) are outside the boundary; what a simulation reads enters as a tick
+  # input. Clippy matches items, not modules, so each module is closed here by its free
+  # functions and the methods of `Path` that touch the file system, and under
+  # disallowed-types by its types with constructors, with the platform extensions that open
+  # the same doors. The environment includes what the process learns of itself: standard
+  # input, its ids, whether it has a terminal, the working directory behind
+  # `path::absolute`, the core count and the backtrace variables. A test that reads a file
+  # or a variable lifts the lint with `#[expect]` on its one item.
+  { path = "std::fs::canonicalize", reason = "architecture section 8.2: file IO is outside the boundary; what the simulation reads enters as a tick input" },
+  { path = "std::fs::copy", reason = "architecture section 8.2: file IO is outside the boundary; what the simulation reads enters as a tick input" },
+  { path = "std::fs::create_dir", reason = "architecture section 8.2: file IO is outside the boundary; what the simulation reads enters as a tick input" },
+  { path = "std::fs::create_dir_all", reason = "architecture section 8.2: file IO is outside the boundary; what the simulation reads enters as a tick input" },
+  { path = "std::fs::exists", reason = "architecture section 8.2: file IO is outside the boundary; what the simulation reads enters as a tick input" },
+  { path = "std::fs::hard_link", reason = "architecture section 8.2: file IO is outside the boundary; what the simulation reads enters as a tick input" },
+  { path = "std::fs::metadata", reason = "architecture section 8.2: file IO is outside the boundary; what the simulation reads enters as a tick input" },
+  { path = "std::fs::read", reason = "architecture section 8.2: file IO is outside the boundary; what the simulation reads enters as a tick input" },
+  { path = "std::fs::read_dir", reason = "architecture section 8.2: file IO is outside the boundary; what the simulation reads enters as a tick input" },
+  { path = "std::fs::read_link", reason = "architecture section 8.2: file IO is outside the boundary; what the simulation reads enters as a tick input" },
+  { path = "std::fs::read_to_string", reason = "architecture section 8.2: file IO is outside the boundary; what the simulation reads enters as a tick input" },
+  { path = "std::fs::remove_dir", reason = "architecture section 8.2: file IO is outside the boundary; what the simulation reads enters as a tick input" },
+  { path = "std::fs::remove_dir_all", reason = "architecture section 8.2: file IO is outside the boundary; what the simulation reads enters as a tick input" },
+  { path = "std::fs::remove_file", reason = "architecture section 8.2: file IO is outside the boundary; what the simulation reads enters as a tick input" },
+  { path = "std::fs::rename", reason = "architecture section 8.2: file IO is outside the boundary; what the simulation reads enters as a tick input" },
+  { path = "std::fs::set_permissions", reason = "architecture section 8.2: file IO is outside the boundary; what the simulation reads enters as a tick input" },
+  { path = "std::fs::set_times", reason = "architecture section 8.2: file IO is outside the boundary; what the simulation reads enters as a tick input" },
+  { path = "std::fs::set_times_nofollow", reason = "architecture section 8.2: file IO is outside the boundary; what the simulation reads enters as a tick input" },
+  { path = "std::fs::soft_link", reason = "architecture section 8.2: file IO is outside the boundary; what the simulation reads enters as a tick input" },
+  { path = "std::fs::symlink_metadata", reason = "architecture section 8.2: file IO is outside the boundary; what the simulation reads enters as a tick input" },
+  { path = "std::fs::write", reason = "architecture section 8.2: file IO is outside the boundary; what the simulation reads enters as a tick input" },
+  { path = "std::path::Path::canonicalize", reason = "architecture section 8.2: file IO is outside the boundary; what the simulation reads enters as a tick input" },
+  { path = "std::path::Path::exists", reason = "architecture section 8.2: file IO is outside the boundary; what the simulation reads enters as a tick input" },
+  { path = "std::path::Path::is_dir", reason = "architecture section 8.2: file IO is outside the boundary; what the simulation reads enters as a tick input" },
+  { path = "std::path::Path::is_file", reason = "architecture section 8.2: file IO is outside the boundary; what the simulation reads enters as a tick input" },
+  { path = "std::path::Path::is_symlink", reason = "architecture section 8.2: file IO is outside the boundary; what the simulation reads enters as a tick input" },
+  { path = "std::path::Path::metadata", reason = "architecture section 8.2: file IO is outside the boundary; what the simulation reads enters as a tick input" },
+  { path = "std::path::Path::read_dir", reason = "architecture section 8.2: file IO is outside the boundary; what the simulation reads enters as a tick input" },
+  { path = "std::path::Path::read_link", reason = "architecture section 8.2: file IO is outside the boundary; what the simulation reads enters as a tick input" },
+  { path = "std::path::Path::symlink_metadata", reason = "architecture section 8.2: file IO is outside the boundary; what the simulation reads enters as a tick input" },
+  { path = "std::path::Path::try_exists", reason = "architecture section 8.2: file IO is outside the boundary; what the simulation reads enters as a tick input" },
+  { path = "std::os::unix::fs::chown", reason = "architecture section 8.2: file IO is outside the boundary; what the simulation reads enters as a tick input", allow-invalid = true },
+  { path = "std::os::unix::fs::chroot", reason = "architecture section 8.2: file IO is outside the boundary; what the simulation reads enters as a tick input", allow-invalid = true },
+  { path = "std::os::unix::fs::lchown", reason = "architecture section 8.2: file IO is outside the boundary; what the simulation reads enters as a tick input", allow-invalid = true },
+  { path = "std::os::unix::fs::symlink", reason = "architecture section 8.2: file IO is outside the boundary; what the simulation reads enters as a tick input", allow-invalid = true },
+  { path = "std::os::windows::fs::symlink_dir", reason = "architecture section 8.2: file IO is outside the boundary; what the simulation reads enters as a tick input", allow-invalid = true },
+  { path = "std::os::windows::fs::symlink_file", reason = "architecture section 8.2: file IO is outside the boundary; what the simulation reads enters as a tick input", allow-invalid = true },
+  { path = "std::env::args", reason = "architecture section 8.2: the process environment is not a simulation input" },
+  { path = "std::env::args_os", reason = "architecture section 8.2: the process environment is not a simulation input" },
+  { path = "std::env::current_dir", reason = "architecture section 8.2: the process environment is not a simulation input" },
+  { path = "std::env::current_exe", reason = "architecture section 8.2: the process environment is not a simulation input" },
+  { path = "std::env::home_dir", reason = "architecture section 8.2: the process environment is not a simulation input" },
+  { path = "std::env::join_paths", reason = "architecture section 8.2: the process environment is not a simulation input" },
+  { path = "std::env::remove_var", reason = "architecture section 8.2: the process environment is not a simulation input" },
+  { path = "std::env::set_current_dir", reason = "architecture section 8.2: the process environment is not a simulation input" },
+  { path = "std::env::set_var", reason = "architecture section 8.2: the process environment is not a simulation input" },
+  { path = "std::env::split_paths", reason = "architecture section 8.2: the process environment is not a simulation input" },
+  { path = "std::env::temp_dir", reason = "architecture section 8.2: the process environment is not a simulation input" },
+  { path = "std::env::var", reason = "architecture section 8.2: the process environment is not a simulation input" },
+  { path = "std::env::var_os", reason = "architecture section 8.2: the process environment is not a simulation input" },
+  { path = "std::env::vars", reason = "architecture section 8.2: the process environment is not a simulation input" },
+  { path = "std::env::vars_os", reason = "architecture section 8.2: the process environment is not a simulation input" },
+  { path = "std::path::absolute", reason = "architecture section 8.2: the process environment is not a simulation input" },
+  { path = "std::io::stdin", reason = "architecture section 8.2: the process environment is not a simulation input" },
+  { path = "std::io::IsTerminal::is_terminal", reason = "architecture section 8.2: the process environment is not a simulation input" },
+  { path = "std::process::id", reason = "architecture section 8.2: the process environment is not a simulation input" },
+  { path = "std::os::unix::process::parent_id", reason = "architecture section 8.2: the process environment is not a simulation input", allow-invalid = true },
+  { path = "std::thread::available_parallelism", reason = "architecture section 8.2: the process environment is not a simulation input" },
+  { path = "std::backtrace::Backtrace::capture", reason = "architecture section 8.2: the process environment is not a simulation input" },
+  { path = "std::net::ToSocketAddrs::to_socket_addrs", reason = "architecture section 8.2: networking is outside the boundary; state enters through the staged frame of lactose_net_api" },
+  # Architecture sections 5.1 and 8.2: a boundary crate creates no thread outside an
+  # executor. Parallel work goes through `lactose_task`'s executor, under its determinism and
+  # chaos model, and the physics step through the solver pool of section 16. Clippy matches
+  # items, so every function that starts a thread is its own entry, `Builder`'s and `Scope`'s
+  # included, and so is `scope`, which opens the scope they start threads in. A test that
+  # needs a thread lifts the lint with `#[expect]` on its one item.
+  { path = "std::thread::spawn", reason = "architecture section 8.2: a boundary crate creates no thread; parallel work goes through lactose_task" },
+  { path = "std::thread::scope", reason = "architecture section 8.2: a boundary crate creates no thread; parallel work goes through lactose_task" },
+  { path = "std::thread::Scope::spawn", reason = "architecture section 8.2: a boundary crate creates no thread; parallel work goes through lactose_task" },
+  { path = "std::thread::Builder::spawn", reason = "architecture section 8.2: a boundary crate creates no thread; parallel work goes through lactose_task" },
+  { path = "std::thread::Builder::spawn_scoped", reason = "architecture section 8.2: a boundary crate creates no thread; parallel work goes through lactose_task" },
+  { path = "std::thread::Builder::spawn_unchecked", reason = "architecture section 8.2: a boundary crate creates no thread; parallel work goes through lactose_task" },
+  # Section 16: `lactose-app` builds the solver pool outside the boundary and hands it to the
+  # backend's constructor, so no boundary crate builds a pool, through rayon or through Rapier.
+  { path = "rayon::ThreadPoolBuilder::build", reason = "architecture section 16: the solver pool is built outside the boundary and handed to the backend", allow-invalid = true },
+  { path = "rayon::ThreadPoolBuilder::build_global", reason = "architecture section 16: the solver pool is built outside the boundary and handed to the backend", allow-invalid = true },
+  { path = "rayon::ThreadPoolBuilder::build_scoped", reason = "architecture section 16: the solver pool is built outside the boundary and handed to the backend", allow-invalid = true },
+  { path = "rayon::ThreadPool::new", reason = "architecture section 16: the solver pool is built outside the boundary and handed to the backend", allow-invalid = true },
+  { path = "rapier3d_f64::pipeline::PhysicsWorld::configure_thread_pool", reason = "architecture section 16: the solver pool is built outside the boundary and handed to the backend", allow-invalid = true },
+  { path = "rapier3d_f64::pipeline::PhysicsPipeline::configure_thread_pool", reason = "architecture section 16: the solver pool is built outside the boundary and handed to the backend", allow-invalid = true },
+  # Section 16: Rapier's parallel work runs on that pool and nowhere else. Off it, rayon
+  # starts its global pool. Banned here: rayon's free functions, iterator sources and bridges,
+  # the methods of the prelude's traits that make or drive a parallel iterator (and, under
+  # disallowed-types, the traits a parallel iterator of a crate's own is written with), Rapier's
+  # `clear_thread_pool`, and the public functions of the pinned Rapier (0.36.0) and parry
+  # (0.31.1) found to run parallel work outside `PhysicsPipeline::step`, which alone runs on
+  # the pool it was handed. The list is not provably complete: Rapier's and parry's public
+  # functions that run parallel work outside `PhysicsPipeline::step`, beyond those listed, are
+  # not banned, nor is a world stepped without a pool (one made by `new`, or after
+  # `set_thread_pool(None)`). lactose-physics-rapier's tests/global_pool.rs holds that the
+  # backend's own worlds never start the global pool.
+  { path = "rapier3d_f64::pipeline::PhysicsWorld::clear_thread_pool", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rapier3d_f64::pipeline::PhysicsPipeline::clear_thread_pool", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rapier3d_f64::pipeline::PhysicsWorld::detect_collisions", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rapier3d_f64::pipeline::CollisionPipeline::step", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rapier3d_f64::geometry::BroadPhaseBvh::update", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rapier3d_f64::dynamics::CCDSolver::find_first_impact", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rapier3d_f64::dynamics::CCDSolver::solve_continuous", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rapier3d_f64::dynamics::SoftBodySet::sync_particle_positions", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rapier3d_f64::dynamics::SoftBodyBuilder::volumetric", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rapier3d_f64::dynamics::SoftBodyBuilder::volumetric_with", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "parry3d_f64::partitioning::Bvh::refit_parallel", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "parry3d_f64::partitioning::Bvh::refit_without_resolve_parallel", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "parry3d_f64::partitioning::Bvh::insert_or_update_batch_partially_parallel", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "parry3d_f64::partitioning::Bvh::traverse_bvtt_single_tree_parallel", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "parry3d_f64::query::PersistentQueryDispatcher::contact_manifolds", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "parry3d_f64::query::details::contact_manifolds_composite_shape_shape", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "parry3d_f64::query::details::contact_manifolds_trimesh_shape", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "parry3d_f64::query::details::contact_manifolds_trimesh_shape_shapes", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "parry3d_f64::transformation::volume_mesh", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rayon::spawn", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rayon::spawn_fifo", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rayon::join", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rayon::join_context", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rayon::scope", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rayon::scope_fifo", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rayon::in_place_scope", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rayon::in_place_scope_fifo", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rayon::broadcast", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rayon::spawn_broadcast", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rayon::current_num_threads", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rayon::iter::empty", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rayon::iter::once", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rayon::iter::repeat", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rayon::iter::repeat_n", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rayon::iter::repeatn", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rayon::iter::split", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rayon::iter::walk_tree", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rayon::iter::walk_tree_prefix", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rayon::iter::walk_tree_postfix", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rayon::iter::plumbing::bridge", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rayon::iter::plumbing::bridge_producer_consumer", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rayon::iter::plumbing::bridge_unindexed", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rayon::iter::IntoParallelIterator::into_par_iter", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rayon::iter::IntoParallelRefIterator::par_iter", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rayon::iter::IntoParallelRefMutIterator::par_iter_mut", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rayon::iter::ParallelBridge::par_bridge", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rayon::iter::ParallelExtend::par_extend", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rayon::iter::FromParallelIterator::from_par_iter", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rayon::iter::ParallelDrainFull::par_drain", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rayon::iter::ParallelDrainRange::par_drain", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rayon::slice::ParallelSlice::par_split", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rayon::slice::ParallelSlice::par_split_inclusive", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rayon::slice::ParallelSlice::par_windows", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rayon::slice::ParallelSlice::par_array_windows", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rayon::slice::ParallelSlice::par_chunks", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rayon::slice::ParallelSlice::par_chunks_exact", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rayon::slice::ParallelSlice::par_rchunks", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rayon::slice::ParallelSlice::par_rchunks_exact", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rayon::slice::ParallelSlice::par_chunk_by", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rayon::slice::ParallelSliceMut::par_split_mut", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rayon::slice::ParallelSliceMut::par_split_inclusive_mut", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rayon::slice::ParallelSliceMut::par_chunks_mut", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rayon::slice::ParallelSliceMut::par_chunks_exact_mut", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rayon::slice::ParallelSliceMut::par_rchunks_mut", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rayon::slice::ParallelSliceMut::par_rchunks_exact_mut", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rayon::slice::ParallelSliceMut::par_sort", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rayon::slice::ParallelSliceMut::par_sort_by", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rayon::slice::ParallelSliceMut::par_sort_by_key", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rayon::slice::ParallelSliceMut::par_sort_by_cached_key", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rayon::slice::ParallelSliceMut::par_sort_unstable", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rayon::slice::ParallelSliceMut::par_sort_unstable_by", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rayon::slice::ParallelSliceMut::par_sort_unstable_by_key", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rayon::slice::ParallelSliceMut::par_chunk_by_mut", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rayon::str::ParallelString::par_chars", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rayon::str::ParallelString::par_char_indices", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rayon::str::ParallelString::par_bytes", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rayon::str::ParallelString::par_encode_utf16", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rayon::str::ParallelString::par_split", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rayon::str::ParallelString::par_split_inclusive", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rayon::str::ParallelString::par_split_terminator", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rayon::str::ParallelString::par_lines", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rayon::str::ParallelString::par_split_whitespace", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rayon::str::ParallelString::par_split_ascii_whitespace", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rayon::str::ParallelString::par_matches", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rayon::str::ParallelString::par_match_indices", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+]
+
+disallowed-types = [
+  { path = "std::time::Instant", reason = "no wall-clock time inside the boundary" },
+  { path = "std::time::SystemTime", reason = "no wall-clock time inside the boundary" },
+  { path = "std::collections::HashMap", reason = "use lactose_core::FixedHashMap" },
+  { path = "std::collections::HashSet", reason = "randomly seeded; iteration order is observable" },
+  { path = "std::hash::RandomState", reason = "randomly seeded" },
+  { path = "hashbrown::HashMap", reason = "use lactose_core::FixedHashMap", allow-invalid = true },
+  { path = "hashbrown::HashSet", reason = "iteration order is observable", allow-invalid = true },
+  # D119: num-traits' `Float` hands every method to the inherent one of the same name, the
+  # banned ones among them, and `Real` is implemented through it. This lint catches a trait in
+  # a bound or a named import; no boundary crate may name num-traits (crate-tiers.toml), and
+  # none of the crates it reaches re-exports it.
+  { path = "num_traits::Float", reason = "reaches the inherent float methods, platform libm among them; use lactose_math", allow-invalid = true },
+  { path = "num_traits::real::Real", reason = "reaches the inherent float methods, platform libm among them; use lactose_math", allow-invalid = true },
+  # D119: nalgebra re-exports num-complex's `Complex`, whose float methods go through
+  # num-traits' `Float` to the standard library's (the methods are banned under
+  # disallowed-methods as well, for a value reached through `UnitComplex`).
+  { path = "num_complex::Complex", reason = "its float methods reach platform libm through num_traits::Float; use lactose_math", allow-invalid = true },
+  # glamx's 3x3 eigen decompositions and its SVDs call the standard library's transcendentals.
+  { path = "glamx::SymmetricEigen3", reason = "platform libm; use lactose_math", allow-invalid = true },
+  { path = "glamx::SymmetricEigen3A", reason = "platform libm; use lactose_math", allow-invalid = true },
+  { path = "glamx::DSymmetricEigen3", reason = "platform libm; use lactose_math", allow-invalid = true },
+  { path = "glamx::Svd2", reason = "platform libm; use lactose_math", allow-invalid = true },
+  { path = "glamx::DSvd2", reason = "platform libm; use lactose_math", allow-invalid = true },
+  { path = "glamx::Svd3", reason = "platform libm; use lactose_math", allow-invalid = true },
+  { path = "glamx::Svd3A", reason = "platform libm; use lactose_math", allow-invalid = true },
+  { path = "glamx::DSvd3", reason = "platform libm; use lactose_math", allow-invalid = true },
+  # simba's SIMD lanes over `wide`: lane `max` and `min` are the target's vector instructions,
+  # which differ between x86-64 and aarch64 on the sign of zero and on NaN.
+  { path = "simba::simd::WideF32x4", reason = "lane min and max differ between targets on signed zero and NaN", allow-invalid = true },
+  { path = "simba::simd::WideF32x8", reason = "lane min and max differ between targets on signed zero and NaN", allow-invalid = true },
+  { path = "simba::simd::WideF64x4", reason = "lane min and max differ between targets on signed zero and NaN", allow-invalid = true },
+  # Bans `thread_local!` through the type it declares. The `disallowed-macros` lint cannot
+  # be used for it: on the pinned toolchain a local `expect` does not reach an item macro.
+  { path = "std::thread::LocalKey", reason = "no thread-local state inside the boundary" },
+  # Section 16: rayon's adaptors bridge a parallel iterator onto the current pool, the global
+  # one off the solver pool. They are not banned, being of no use without a parallel iterator:
+  # the iterators rayon makes are banned at their sources (under disallowed-methods), and one
+  # of a crate's own is written with these traits, its `drive` methods bounded by the consumer
+  # traits. This lint catches a trait in a bound or a named import, not in an impl header, a
+  # glob import or an expression path; an iterator cannot be written without the bounds.
+  { path = "rayon::iter::plumbing::Producer", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rayon::iter::plumbing::UnindexedProducer", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rayon::iter::plumbing::ProducerCallback", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rayon::iter::plumbing::Consumer", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  { path = "rayon::iter::plumbing::UnindexedConsumer", reason = "architecture section 16: off the solver pool, rayon starts its global pool, sized by the core count", allow-invalid = true },
+  # Architecture section 8.2: the types that open a file or a socket or start a process; the
+  # free functions are under disallowed-methods.
+  { path = "std::fs::File", reason = "architecture section 8.2: file IO is outside the boundary; what the simulation reads enters as a tick input" },
+  { path = "std::fs::OpenOptions", reason = "architecture section 8.2: file IO is outside the boundary; what the simulation reads enters as a tick input" },
+  { path = "std::fs::DirBuilder", reason = "architecture section 8.2: file IO is outside the boundary; what the simulation reads enters as a tick input" },
+  { path = "std::net::TcpListener", reason = "architecture section 8.2: networking is outside the boundary; state enters through the staged frame of lactose_net_api" },
+  { path = "std::net::TcpStream", reason = "architecture section 8.2: networking is outside the boundary; state enters through the staged frame of lactose_net_api" },
+  { path = "std::net::UdpSocket", reason = "architecture section 8.2: networking is outside the boundary; state enters through the staged frame of lactose_net_api" },
+  { path = "std::os::unix::net::UnixDatagram", reason = "architecture section 8.2: networking is outside the boundary; state enters through the staged frame of lactose_net_api", allow-invalid = true },
+  { path = "std::os::unix::net::UnixListener", reason = "architecture section 8.2: networking is outside the boundary; state enters through the staged frame of lactose_net_api", allow-invalid = true },
+  { path = "std::os::unix::net::UnixStream", reason = "architecture section 8.2: networking is outside the boundary; state enters through the staged frame of lactose_net_api", allow-invalid = true },
+  { path = "std::process::Command", reason = "architecture section 8.2: a subprocess reaches files, the environment and the network alike" },
+]
+
+# Architecture section 8.2 (D28): no run-time CPU feature detection that selects numerically
+# different paths. Unlike `thread_local!`, these are expression macros, which this lint and a
+# local `expect` both reach. Each is named under `std::arch`; clippy resolves the root path
+# `std::is_x86_feature_detected!` to the same macro, and each path resolves on every target.
+disallowed-macros = [
+  { path = "std::arch::is_x86_feature_detected", reason = "selects a path by the CPU it runs on; section 8.2 bans run-time detection that selects numerically different paths" },
+  { path = "std::arch::is_aarch64_feature_detected", reason = "selects a path by the CPU it runs on; section 8.2 bans run-time detection that selects numerically different paths" },
+]

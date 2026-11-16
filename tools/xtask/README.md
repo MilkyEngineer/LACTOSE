@@ -162,6 +162,14 @@ on, and a listed feature the crate does not declare are findings.
   such as `<Self as Decodes>::Kind`); a type outside
   the boundary that shares a kind's name is reported; and an `impl ... for` header in a
   `macro_rules!` body is read as if it were an impl.
+- What a world registers and runs is written under the boundary lint file (project review
+  2, X1). A crate that is neither a boundary crate nor one of `[lint_file_carriers]` ships
+  no `#[system]`, no `#[component]` or `#[resource]` whose arguments lack `derived`, and no
+  `impl` of `SessionApplier`, `InputApplier` or `StagedState`, the traits through which the
+  input sync point writes into the world. Shipped code is read as for D99, and attributes
+  and traits are compared by their last path segment as written: one brought in under
+  another name, written by a macro, or inside a `cfg_attr`, is not seen.
+  `lactose-app-headless` is a carrier for its sketch game.
 - No cargo configuration file has an `include` key, and no `.cargo` directory or cargo
   configuration file is a symbolic link: cargo would read through either what no check
   reads. `vendor` refuses both through the same function.
