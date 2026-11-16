@@ -6272,6 +6272,74 @@ it at every merge and on CI's three hosts** (§8.2, §9.1, §20, `.gitattributes
   narrowed what the check accepts; the owner's approval of 16 November 2026.
 - Replaced: nothing stated. `.gitattributes` held the vendor line alone.
 
+**D149. Milestone 1's exit rows: a float remainder inside the boundary is `math`'s, and what no milestone 1 criterion reads is gated at the milestone that reads it** (§5.1, §8.2, §9.3, §10, §14, §18, §22, `lactose-math`, `lactose-net-api`, `lactose-predict`, `lactose-asset`, `lactose-task`, `docs/plans/exit-rows.md`)
+- Why: the coordinator's verification pass for milestone 1's exit, at `10cf89e`, found two rows
+  gated at milestone 1 that no decision settled and six whose remainder no lane, session or
+  decision owned. `docs/plans/exit-rows.md` holds the evidence; these are the decisions.
+  - *A float remainder inside the boundary is `Scalar`'s `%` or `Scalar::rem_euclid`, which are
+    the `libm` crate's `fmod`. The `%` and `%=` operators on `f32` and `f64`, and the `Rem` and
+    `RemAssign` of glam's vectors and simba's SIMD types, are banned in boundary crates.* They
+    call the platform `fmod`, which is the stated reason of section 8.2's bans on `rem_euclid`
+    and `div_euclid` and the reason `lactose-math` takes its remainder from `libm`, under
+    golden bits generated on aarch64 that CI holds on x86-64 Linux and Windows. `fmod` is
+    exact, so on a conforming platform library a breach changes no bit: the ban keeps the
+    boundary off a library the build does not pin, and its gap is a rule that review holds, not
+    a known divergence. At `6f0508a` a reading of the boundary crates' sources and tests finds
+    no float `%` outside `lactose-math`'s tests of `Scalar`, and the trace of D145 saw no
+    `fmod` from a physics step in a recorded scene. Rules out accepting `%` on `fmod`'s
+    exactness, which would leave one platform function trusted inside the boundary and two bans
+    without their reason; and a measurement of `fmod` on the CI targets, which nothing would
+    read.
+  - *The lint is owed at milestone 4, with architecture mode's move to every pull request, and
+    it holds the forms it sees.* On the pinned 1.99.0 `clippy::modulo_arithmetic` refuses `%`
+    and `%=` on a float value, a constant divisor included, and on signed integers, and passes
+    unsigned ones and two constants of one sign, which the compiler folds; it does not see a
+    float `%` whose left operand is a reference (`&f64 % f64`, which a closure over `iter()`
+    computes), `Rem::rem` or `rem_assign` called as a function, a generic `T: Rem` used at a
+    float, or the `Rem` and `RemAssign` of glam's vectors and simba's `AutoSimd` (probes
+    outside the tree). `disallowed-methods` on `core::ops::Rem::rem` and
+    `core::ops::RemAssign::rem_assign` sees the calls, and `lactose-physics-rapier`, the one
+    boundary crate that can name glam or simba, gets a check of its `src` for the operator;
+    the reference and generic forms, and the operator in that crate's tests, stay with
+    review. Until the lints and the check exist a review holds the whole ban. Rules out a lane
+    for it in milestone 1, where no criterion's proof reaches a float `%`; and reading the
+    lint, once built, as the whole ban's proof.
+  - *The replication gather is timed at milestone 4, with `net`'s packer.* Milestone 1 holds
+    the gather path by the netcode spike's mirror check and gives its time no criterion and
+    no budget. Whether `World::columns_erased` needs an allocation-free iterator is decided
+    from the gather's time on the milestone 4 server; the vector it fills is also what the
+    layout mode reorders. Rules out a gather measurement in milestone 1, and reading the
+    plan's "the spike measures the gather path" as a timing.
+  - *A prediction ring's memory is read when `app` sizes the ring, at milestone 4.* The
+    estimate at 10,000 statics is retired: section 10 admits 64 fixed colliders and proxies,
+    and what replaces that bound is milestone 3's. A slot's memory on the criterion's scene
+    is not owed to the prediction-snapshot criterion, which reads time. Rules out both
+    measurements in milestone 1.
+  - *SILO's remainders go where a reader first waits.* The mount cost on Linux and Windows
+    x86-64 goes to milestone 2's watch loop, the first mount made beside a reader. Whether
+    the index's insert leaves the lock, and whether lookups leave it or long steps are split,
+    go to milestone 3's streaming design, since `app` takes no dependency on `lactose-asset`
+    before it (D136). A lane that calls a lookup from a frame-critical worker sooner owes
+    that decision first.
+  - *The Windows keeper's unmeasured list is milestone 2's*, read where the first Windows
+    client's frame pacing is decided (D144). The desktop boots Windows, so the row keeps its
+    closer and its gate: the desktop's Windows `whisk` file at the first commit of main that
+    holds the lane and at D144's follow-up if one is made, read against 1 ms, or 2 ms after the
+    follow-up.
+  - *The linux-x64 runner's edit-to-playing file is checked in as a runner's*, from the
+    `measure` workflow's run at the measurement commit. It is the edit-to-playing criterion's
+    file on Linux unless session B runs there (`docs/plans/milestone-1.md`, decision 5.9).
+    The desktop boots Windows, so no Windows runner's file is owed.
+- Driven by: exit step 4 of `docs/plans/milestone-1.md` and the coordinator's pass for it;
+  the review of lane `xtask-policy`, which found the `%` route; the planner's reading of the
+  boundary crates' sources and its clippy probe on the pinned toolchain; the plan's first
+  review, which found the forms `clippy::modulo_arithmetic` does not see and simba's remainder;
+  the owner's answer of 16 November 2026, which left the lint at milestone 4.
+- Replaced: D119's addendum's "`%` is an operator no lint sees", which holds for
+  `disallowed-methods` only (the `clippy.toml` and `crate-tiers.toml` comments that repeat it
+  change with the lint's lane); in `docs/plans/milestone-1.md`, section 2's "The spike measures
+  the gather path". In section 8.2 nothing: its bans stand and gain one.
+
 ## 10. Review history
 
 - **Revision 1** (`a29af04`): the design baseline.

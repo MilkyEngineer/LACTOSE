@@ -1,0 +1,37 @@
+{
+  "arch": "x86_64",
+  "command": "cargo xtask measure --all --short --out target/measure/results",
+  "commit": "bef3455b4a56",
+  "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
+  "date": "2026-11-15",
+  "figures": {
+    "app_function.median_s": 3.21,
+    "app_function.runs_s": "3.19, 3.22, 3.24, 3.21, 3.21",
+    "copy_target_gib": 0.9,
+    "sketch_system.median_s": 0.93,
+    "sketch_system.runs_s": "0.92, 0.93, 0.93, 0.94, 0.92",
+    "slower_median_s": 3.21
+  },
+  "load": {
+    "load_average_after": "4.76, 3.91, 2.11",
+    "load_average_before": "4.86, 3.06, 1.54"
+  },
+  "machine": "github-runner-linux-x64",
+  "measurement": "edit-to-playing",
+  "notes": {
+    "Copy": "the worktree is removed after the run; its target directory, `measure/edit-to-playing/target` under the workspace's, 0.9 GiB, is kept for the next run's warm build",
+    "Edit `app_function`": "`crates/app/src/runtime.rs`, after `let mut builder = Executor::builder();`",
+    "Edit `sketch_system`": "`crates/app-headless/src/main.rs`, after `counter.0 = counter.0.wrapping_add(1);`",
+    "Local changes": "not measured: the loop runs on `HEAD` as committed",
+    "Loop": "in a detached worktree of `HEAD` at `measure/edit-to-playing/tree` under the target directory: one warm build before each site, then 5 one-line edits there, each timed from its save to the report line"
+  },
+  "os": "linux Ubuntu 26.04.1 LTS",
+  "profile": "dev",
+  "ran": "cargo run --locked --target-dir ../target -p lactose-app-headless -- 1",
+  "short": false,
+  "topology": {
+    "efficiency": 0,
+    "performance": 1
+  },
+  "workers": "1 frame workers, the default executor's"
+}

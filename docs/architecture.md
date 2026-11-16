@@ -558,7 +558,7 @@ presentation, pose evaluation, VFX, audio, UI, asset IO timing and input samplin
 
 - Floating point only through `math`, which is self-contained and does not depend on glam.
   `Scalar` is a newtype, so no inherent float method such as `sin` or `powf` can reach the
-  platform library by accident. Transcendentals come from the `libm` crate. `math` owns `min`, `max` and `clamp` as explicit
+  platform library by accident. Transcendentals come from the `libm` crate, and so does a float remainder, as `Scalar`'s `%` and `rem_euclid`: the primitive `%` and `%=` on `f32` and `f64`, and the `Rem` and `RemAssign` of glam's vectors and simba's SIMD types, call the platform `fmod` and are banned inside the boundary, by review until a lint holds them (D149). `math` owns `min`, `max` and `clamp` as explicit
   compare-and-select with defined signed-zero and NaN results, because the standard library
   versions are documented as nondeterministic on signed zero. `f32::min`, `f32::max`, `clamp`, `powi`, `total_cmp`,
   `to_bits`, `copysign`, `is_sign_negative`, `is_sign_positive`, `rem_euclid`, `div_euclid` and
