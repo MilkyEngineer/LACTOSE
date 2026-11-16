@@ -6,6 +6,7 @@ edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 license.workspace = true
+autotests = false
 
 [features]
 # Builds the loom models of the latest-sample slot's sequence lock (`src/models.rs`), which
@@ -24,6 +25,12 @@ loom = { workspace = true, optional = true }
 # The compile-only sketch of `app`'s input task builds a `TickInput` the way `app` does.
 lactose-core.workspace = true
 lactose-sim.workspace = true
+
+# The integration tests as one test binary, whose root declares the files of tests/ as
+# modules (D125).
+[[test]]
+name = "integration"
+path = "tests/integration.rs"
 
 [lints]
 workspace = true

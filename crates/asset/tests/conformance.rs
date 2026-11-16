@@ -4,7 +4,7 @@
 
 #![forbid(unsafe_code)]
 
-mod common;
+use crate::common;
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};

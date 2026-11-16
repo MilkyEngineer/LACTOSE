@@ -6,6 +6,7 @@ edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 license.workspace = true
+autotests = false
 
 [dependencies]
 # The interface this crate is the first store behind: the two store traits, the loader
@@ -37,6 +38,24 @@ lactose-asset-api = { workspace = true, features = ["conformance"] }
 # pinned table.
 lactose-ecs.workspace = true
 lactose-sim.workspace = true
+
+# The integration tests as one test binary, whose root declares the files of tests/ as
+# modules (D125).
+[[test]]
+name = "integration"
+path = "tests/integration.rs"
+
+# A binary of its own ([test_targets] in tools/xtask/ci-policy.toml): its `#[global_allocator]`
+# would count every other test's allocations too in the package's one binary.
+[[test]]
+name = "drop"
+path = "tests/drop.rs"
+
+# A binary of its own ([test_targets] in tools/xtask/ci-policy.toml): its `#[global_allocator]`
+# would count every other test's allocations too in the package's one binary.
+[[test]]
+name = "index"
+path = "tests/index.rs"
 
 [lints]
 workspace = true

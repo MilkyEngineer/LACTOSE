@@ -3,7 +3,7 @@
 
 #![forbid(unsafe_code)]
 
-mod common;
+use crate::common;
 
 use std::io::{Seek, SeekFrom, Write};
 

@@ -1,15 +1,21 @@
 //! The nightly Miri job's split of a package (architecture section 20): the entries of the
 //! `miri` job's matrix in `.github/workflows/nightly.yml` that name a package of the policy
-//! file's `[miri_split]` must together run its library, each of its integration test targets
-//! and its doc tests exactly once. Without the check only a comment keeps a split complete,
-//! and a new test target that no entry's patterns select drops out of Miri unseen.
+//! file's `[miri_split]` must together run each test of its library, of each of its integration
+//! test targets and of its doc tests exactly once. Without the check only a comment keeps a
+//! split complete, and a new test target that no entry's patterns select drops out of Miri
+//! unseen.
 //!
 //! The check reads one shape of the job and refuses any other instead of reading it: a matrix
 //! of `include` alone, no `if` or `defaults` on the job or `defaults` on the workflow, and one
 //! item of the job's one `steps` list that uses `matrix.args`, `RUN`, with only `env` beside
 //! its `run`. Each entry names one
 //! workspace member with a plain `-p NAME`, and its targets with `--lib`, `--test` and `--doc`
-//! (a package outside `[miri_split]` may name none). The job's other steps are not read.
+//! (a package outside `[miri_split]` may name none). After a `--`, libtest's arguments may
+//! name tests by what their paths contain, and skip them with `--skip`: a package's tests are
+//! divided by test and not by target where its integration tests are one binary (D125). Two
+//! entries that select a target with filters run each of its tests once, whatever the tests
+//! are called, only when one names filters and the other skips each of them, and that is the
+//! one division of a target the check accepts. The job's other steps are not read.
 //!
 //! The workflow is read as text, by a reader of the YAML the job is written in: block
 //! mappings and sequences, plain and quoted scalars on one line, plain scalars over several,
@@ -34,8 +40,9 @@ pub const NIGHTLY: &str = ".github/workflows/nightly.yml";
 const ENTRIES: [&str; 5] = ["jobs", "miri", "strategy", "matrix", "include"];
 
 /// The run step whose command line the split of an entry's `args` assumes: the words follow
-/// `cargo miri test`, and nothing after them selects or skips a test.
-const RUN: &str = "- run: cargo +$MIRI_TOOLCHAIN miri test ${{ matrix.args }} --locked";
+/// `cargo miri test --locked` and end the command, so that what follows a `--` in them is
+/// libtest's and nothing else selects or skips a test.
+const RUN: &str = "- run: cargo +$MIRI_TOOLCHAIN miri test --locked ${{ matrix.args }}";
 
 /// Checks the entries of the Miri job, and the split of every package in `[miri_split]`
 /// against its targets.
@@ -83,7 +90,7 @@ pub fn check(policy: &Policy, ws: &Workspace, files: &Files) -> Vec<Finding> {
             )),
         };
         match found {
-            Ok((package, runs)) => read.push((entry, package, runs)),
+            Ok((package, runs, filter)) => read.push((entry, package, runs, filter)),
             Err(message) => findings.push(Finding::new(NIGHTLY, message)),
         }
     }
@@ -133,18 +140,98 @@ impl Run<'_> {
     }
 }
 
-/// An entry that was read: the package it names and what it runs of it, empty when it names
-/// no target and so runs the package whole.
-type Read<'e, 'w> = (&'e Entry, &'w Package, Vec<Run<'w>>);
+/// The libtest arguments of an entry, after its `--`, which go to every target it runs:
+/// libtest runs a test whose path contains one of `names`, or any test when there are none,
+/// and none of `skips`. Each list is sorted, without repeats.
+#[derive(Clone, Default, PartialEq, Eq, Debug)]
+struct Filter {
+    names: Vec<String>,
+    skips: Vec<String>,
+}
+
+impl Filter {
+    /// The filter of the words after an entry's `--`.
+    ///
+    /// # Errors
+    /// No word, an option other than `--skip` and its value, and an empty name, which every
+    /// path contains.
+    fn new(words: &[&str]) -> Result<Self, String> {
+        if words.is_empty() {
+            return Err("has nothing after its `--`".to_owned());
+        }
+        let mut filter = Self::default();
+        let mut words = words.iter();
+        while let Some(&word) = words.next() {
+            let (list, name) = match word {
+                "--skip" => (&mut filter.skips, *words.next().ok_or("`--skip` has no value")?),
+                _ => (&mut filter.names, word),
+            };
+            if name.is_empty() {
+                return Err("names an empty filter, which every test's path contains".to_owned());
+            }
+            if name.starts_with('-') {
+                return Err(format!(
+                    "`{name}` after `--`: of libtest's options the check reads `--skip` alone"
+                ));
+            }
+            list.push(name.to_owned());
+        }
+        for list in [&mut filter.names, &mut filter.skips] {
+            list.sort();
+            list.dedup();
+        }
+        Ok(filter)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.names.is_empty() && self.skips.is_empty()
+    }
+
+    /// Whether `self` and `other` run each test exactly once between them, whatever the tests
+    /// are called: one names filters and skips nothing, the other names none and skips each
+    /// of them.
+    fn divides_with(&self, other: &Self) -> bool {
+        let divides = |run: &Self, rest: &Self| {
+            !run.names.is_empty()
+                && run.skips.is_empty()
+                && rest.names.is_empty()
+                && run.names == rest.skips
+        };
+        divides(self, other) || divides(other, self)
+    }
+
+    fn describe(&self) -> String {
+        let quoted = |list: &[String]| {
+            list.iter().map(|name| format!("`{name}`")).collect::<Vec<_>>().join(", ")
+        };
+        match (self.names.is_empty(), self.skips.is_empty()) {
+            (true, true) => "every test".to_owned(),
+            (false, true) => format!("the tests whose paths contain {}", quoted(&self.names)),
+            (true, false) => {
+                format!("the tests whose paths contain none of {}", quoted(&self.skips))
+            }
+            (false, false) => format!(
+                "the tests whose paths contain {} and none of {}",
+                quoted(&self.names),
+                quoted(&self.skips)
+            ),
+        }
+    }
+}
+
+/// An entry that was read: the package it names, what it runs of it, empty when it names no
+/// target and so runs the package whole, and its filter.
+type Read<'e, 'w> = (&'e Entry, &'w Package, Vec<Run<'w>>, Filter);
 
 /// The finding for each package `[miri_split]` does not list that two or more entries name
-/// by target: a split the check would not count. An entry that runs the package whole drops
-/// none of its targets, so entries that do, as `lactose-task`'s two do under two
-/// environments, are no split, and neither is one of them beside one entry by target.
+/// by target or filter: a split the check would not count. An entry that runs the package
+/// whole and unfiltered drops none of its tests, so entries that do, as `lactose-task`'s two
+/// do under two environments, are no split, and neither is one of them beside one entry by
+/// target.
 fn unlisted(policy: &Policy, read: &[Read<'_, '_>], findings: &mut Vec<Finding>) {
     let mut by: BTreeMap<&str, Vec<&Entry>> = BTreeMap::new();
-    for (entry, package, runs) in read {
-        if !runs.is_empty() {
+    for (entry, package, runs, filter) in read {
+        if !runs.is_empty() || !filter.is_empty() {
             by.entry(package.name.as_str()).or_default().push(entry);
         }
     }
@@ -154,7 +241,7 @@ fn unlisted(policy: &Policy, read: &[Read<'_, '_>], findings: &mut Vec<Finding>)
                 POLICY_FILE,
                 format!(
                     "[miri_split] does not list `{name}`, which the `miri` entries {} split by \
-                     target; list it so that the check counts its targets",
+                     target or filter; list it so that the check counts its tests",
                     entries.iter().map(|entry| entry.label()).collect::<Vec<_>>().join(", ")
                 ),
             ));
@@ -163,7 +250,8 @@ fn unlisted(policy: &Policy, read: &[Read<'_, '_>], findings: &mut Vec<Finding>)
 }
 
 /// The finding for each target of `package` that `cargo test` runs and no entry can select,
-/// and for each of its runs that the entries do not run exactly once.
+/// and for each of its runs whose tests the entries do not run exactly once: one entry runs
+/// it unfiltered, or two divide it by filter.
 fn counts(package: &Package, read: &[Read<'_, '_>], findings: &mut Vec<Finding>) {
     for (kind, name) in &package.other_tests {
         findings.push(Finding::new(
@@ -175,7 +263,7 @@ fn counts(package: &Package, read: &[Read<'_, '_>], findings: &mut Vec<Finding>)
             ),
         ));
     }
-    let mut runs: BTreeMap<Run<'_>, Vec<&Entry>> = BTreeMap::new();
+    let mut runs: BTreeMap<Run<'_>, Vec<(&Entry, &Filter)>> = BTreeMap::new();
     if package.lib {
         runs.insert(Run::Lib, Vec::new());
     }
@@ -186,10 +274,10 @@ fn counts(package: &Package, read: &[Read<'_, '_>], findings: &mut Vec<Finding>)
         runs.insert(Run::Test(test), Vec::new());
     }
     let mut named = false;
-    for (entry, _, selected) in read.iter().filter(|(_, of, _)| of.name == package.name) {
+    for (entry, _, selected, filter) in read.iter().filter(|(_, of, ..)| of.name == package.name) {
         named = true;
         for run in selected {
-            runs.entry(*run).or_default().push(entry);
+            runs.entry(*run).or_default().push((entry, filter));
         }
     }
     if !named {
@@ -204,28 +292,48 @@ fn counts(package: &Package, read: &[Read<'_, '_>], findings: &mut Vec<Finding>)
         return;
     }
     for (run, by) in runs {
+        let labels = || by.iter().map(|(entry, _)| entry.label()).collect::<Vec<_>>().join(", ");
         let message = match by.as_slice() {
-            [_] => continue,
+            [(_, filter)] if filter.is_empty() => continue,
+            [(_, a), (_, b)] if a.divides_with(b) => continue,
             [] => format!(
                 "the `miri` entries for `{}` do not run {}; select it in one of them",
                 package.name,
                 run.describe()
             ),
-            _ => format!(
+            [(entry, filter)] => format!(
+                "the `miri` entries for `{}` run of {} only {}, in {}; run the rest in an entry \
+                 that skips each of its filters with `--skip`",
+                package.name,
+                run.describe(),
+                filter.describe(),
+                entry.label()
+            ),
+            _ if by.iter().all(|(_, filter)| filter.is_empty()) => format!(
                 "the `miri` entries for `{}` run {} {} times: {}",
                 package.name,
                 run.describe(),
                 by.len(),
-                by.iter().map(|entry| entry.label()).collect::<Vec<_>>().join(", ")
+                labels()
+            ),
+            _ => format!(
+                "the `miri` entries for `{}` select {} in {} entries whose filters do not run \
+                 each of its tests once: {}; divide a target between two entries, one naming \
+                 filters and the other skipping each of them with `--skip`",
+                package.name,
+                run.describe(),
+                by.len(),
+                labels()
             ),
         };
         findings.push(Finding::new(NIGHTLY, message));
     }
 }
 
-/// The workspace member that `cargo miri test` with `words` tests, and what it runs of it,
-/// sorted: empty when the words name no target. A target two of the words select is run
-/// once, as cargo runs it.
+/// The workspace member that `cargo miri test` with `words` tests, what it runs of it, sorted
+/// and empty when the words name no target, and the filter of the words after the first
+/// `--`, which go to each test binary. A target two of the words select is run once, as cargo
+/// runs it.
 ///
 /// An explicit `--test` runs its target whatever the manifest's `test` says, and fails the
 /// job if the target has `required-features` the job does not enable (cargo 1.99.0 and
@@ -236,17 +344,23 @@ fn counts(package: &Package, read: &[Read<'_, '_>], findings: &mut Vec<Finding>)
 /// # Errors
 /// A package named other than once by a plain `-p NAME` or `--package NAME` with a member's
 /// exact name, a word the check does not read, a target cargo would refuse, `--doc` beside
-/// another target selection, which cargo refuses, and no target named in a split package.
+/// another target selection, which cargo refuses, no target named in a split package, and
+/// libtest arguments [`Filter::new`] refuses.
 fn selected<'w>(
     ws: &'w Workspace,
     policy: &Policy,
     words: &[String],
-) -> Result<(&'w Package, Vec<Run<'w>>), String> {
+) -> Result<(&'w Package, Vec<Run<'w>>, Filter), String> {
     fn value<'v>(flag: &str, words: &mut impl Iterator<Item = &'v str>) -> Result<&'v str, String> {
         words.next().ok_or_else(|| format!("`{flag}` has no value"))
     }
     let (mut package, mut lib, mut doc, mut patterns) = (None, false, false, Vec::new());
-    let mut words = words.iter().map(String::as_str);
+    let words: Vec<&str> = words.iter().map(String::as_str).collect();
+    let (words, filter) = match words.iter().position(|word| *word == "--") {
+        Some(at) => (&words[..at], Filter::new(&words[at + 1..])?),
+        None => (&words[..], Filter::default()),
+    };
+    let mut words = words.iter().copied();
     while let Some(word) = words.next() {
         match word {
             "-p" | "--package" => {
@@ -276,7 +390,7 @@ fn selected<'w>(
         if !package.doctests {
             return Err(format!("names `--doc`, but `{}` has no doc tests", package.name));
         }
-        return Ok((package, vec![Run::Doc]));
+        return Ok((package, vec![Run::Doc], filter));
     }
     if !lib && patterns.is_empty() {
         if policy.miri_split.contains(&package.name) {
@@ -286,7 +400,7 @@ fn selected<'w>(
                 package.name
             ));
         }
-        return Ok((package, Vec::new()));
+        return Ok((package, Vec::new(), filter));
     }
     let mut runs = Vec::new();
     if lib {
@@ -310,7 +424,7 @@ fn selected<'w>(
     }
     runs.sort();
     runs.dedup();
-    Ok((package, runs))
+    Ok((package, runs, filter))
 }
 
 /// The words the run step's shell makes of `args`, which the workflow substitutes into the
@@ -1067,6 +1181,111 @@ mod tests {
         ])
     }
 
+    /// The split of one test binary by filter, as nightly runs `lactose-ecs` (D125).
+    fn filter_split() -> String {
+        nightly(&[
+            &["name: core", "args: -p lactose-core"],
+            &[
+                "name: ecs, two",
+                "args: >-",
+                "  -p lactose-ecs --lib --test integration --test alloc --",
+                "  erased_rows:: ownership::",
+            ],
+            &[
+                "name: ecs, the rest",
+                "args: >-",
+                "  -p lactose-ecs --lib --test integration --test alloc --",
+                "  --skip erased_rows:: --skip ownership::",
+            ],
+            &["name: ecs, doc", "args: -p lactose-ecs --doc"],
+            &["name: net-host", "args: '-p lactose-net-host --test interpolation -- interp::'"],
+        ])
+    }
+
+    #[test]
+    fn a_target_divided_by_filter_runs_each_test_once() {
+        const ONE: [&str; 2] = ["alloc", "integration"];
+        assert_eq!(run(ecs(&ONE), &filter_split()), [] as [&str; 0]);
+        // The order of the filters, a repeat and the order of the words do not matter.
+        let text = filter_split()
+            .replace("  erased_rows:: ownership::", "  ownership:: erased_rows:: ownership::")
+            .replace(
+                "--skip erased_rows:: --skip ownership::",
+                "--skip ownership:: --skip erased_rows::",
+            );
+        assert_eq!(run(ecs(&ONE), &text), [] as [&str; 0]);
+        // A filter the other entry does not skip runs its tests twice.
+        let text = filter_split().replace(" --skip ownership::", "");
+        let found = run(ecs(&ONE), &text);
+        assert_eq!(found.len(), 3, "{found:?}");
+        assert!(
+            found[0].contains(
+                "select the library's unit tests in 2 entries whose filters do not run each of \
+                 its tests once: `ecs, two` (line 13), `ecs, the rest` (line 17)"
+            ),
+            "{found:?}"
+        );
+        // A skip with no entry that names it drops its tests.
+        let text = filter_split().replace("  erased_rows:: ownership::", "  erased_rows::");
+        assert_eq!(run(ecs(&ONE), &text).len(), 3);
+        // Both entries filtered by name: a test that neither filter matches runs nowhere.
+        let text = filter_split().replace("--skip erased_rows:: --skip ownership::", "erased");
+        assert_eq!(run(ecs(&ONE), &text).len(), 3);
+        // One entry's filter alone runs part of a target.
+        let text = filter_split().replace(
+            " --test integration --test alloc --\n              --skip",
+            " --\n              --skip",
+        );
+        let found = run(ecs(&ONE), &text);
+        assert_eq!(found.len(), 2, "{found:?}");
+        assert_eq!(
+            found[1],
+            ".github/workflows/nightly.yml: the `miri` entries for `lactose-ecs` run of test \
+             target `integration` only the tests whose paths contain `erased_rows::`, \
+             `ownership::`, in `ecs, two` (line 13); run the rest in an entry that skips each of \
+             its filters with `--skip`"
+        );
+        // Three entries: the counts accept two, one naming and one skipping.
+        let text = filter_split().replace(
+            "          - name: ecs, doc\n",
+            "          - name: ecs, again\n            args: -p lactose-ecs --test integration \
+             -- x\n          - name: ecs, doc\n",
+        );
+        let found = run(ecs(&ONE), &text);
+        assert!(found.len() == 1 && found[0].contains("in 3 entries"), "{found:?}");
+    }
+
+    #[test]
+    fn a_filter_the_check_does_not_read_is_refused() {
+        let cases = [
+            ("-p lactose-ecs --lib --", "has nothing after its `--`"),
+            ("-p lactose-ecs --lib -- --exact x", "`--exact` after `--`: of libtest's options"),
+            ("-p lactose-ecs --lib -- x --skip", "`--skip` has no value"),
+            ("-p lactose-ecs --lib -- --skip=x", "`--skip=x` after `--`"),
+            ("-p lactose-ecs --lib -- --skip ''", "names an empty filter"),
+            ("-p lactose-ecs --lib -- x -- y", "`--` after `--`"),
+            ("-p lactose-ecs --lib -- --include-ignored", "`--include-ignored` after `--`"),
+        ];
+        for (args, message) in cases {
+            let found = run(ecs(&TESTS), &nightly(&[&["name: e", &format!("args: {args}")]]));
+            assert!(found.len() == 1 && found[0].contains(message), "{args}: {found:?}");
+        }
+        // Two filtered entries of a package outside the split split it; a filtered entry
+        // beside one that runs the package whole drops nothing.
+        let text = filter_split().replace(
+            "- name: core\n            args: -p lactose-core\n",
+            "- name: core a\n            args: -p lactose-core -- a\n          - name: core b\n\
+             \x20           args: -p lactose-core -- --skip a\n",
+        );
+        let found = run(ecs(&["alloc", "integration"]), &text);
+        assert!(found.len() == 1 && found[0].contains("split by target or filter"), "{found:?}");
+        let text = filter_split().replace(
+            "- name: core\n",
+            "- name: core a\n            args: -p lactose-core -- a\n          - name: core\n",
+        );
+        assert_eq!(run(ecs(&["alloc", "integration"]), &text), [] as [&str; 0]);
+    }
+
     #[test]
     fn the_split_on_main_runs_every_target_once() {
         assert_eq!(run(ecs(&TESTS), &main_split()), [] as [&str; 0]);
@@ -1201,8 +1420,8 @@ mod tests {
         assert_eq!(
             run(ecs(&TESTS), &text),
             ["tools/xtask/ci-policy.toml: [miri_split] does not list `lactose-core`, which the \
-              `miri` entries `core lib` (line 11), `core doc` (line 13) split by target; list it \
-              so that the check counts its targets"]
+              `miri` entries `core lib` (line 11), `core doc` (line 13) split by target or filter; \
+              list it so that the check counts its tests"]
         );
         // A whole run beside one entry by target drops no target: the review's
         // `r2-task-second-narrowed`.
@@ -1220,8 +1439,8 @@ mod tests {
                  nightly Miri job is checked",
                 "tools/xtask/ci-policy.toml: [miri_split] does not list `lactose-ecs`, which the \
                  `miri` entries `ecs, erased rows and ownership` (line 13), `ecs, the rest` \
-                 (line 16), `ecs, doc` (line 20) split by target; list it so that the check \
-                 counts its targets"
+                 (line 16), `ecs, doc` (line 20) split by target or filter; list it so that the \
+                 check counts its tests"
             ]
         );
         let stray = Policy { miri_split: vec!["lactose-nothing".to_owned()], ..Policy::default() };
@@ -1242,7 +1461,7 @@ mod tests {
             ("-p lactose-ecs --test 'a**'", "is not a pattern cargo accepts"),
             ("-p lactose-ecs --doc --lib", "mixes `--doc`"),
             ("-p lactose-ecs --bins", "does not know what `--bins` runs"),
-            ("-p lactose-ecs -- --skip x", "does not know what `--` runs"),
+            ("-p lactose-ecs -- --skip x", "names no target of `lactose-ecs`"),
             ("-p lactose-ecs --test [!eo]*", "an unquoted `[`"),
             ("-p lactose-ecs --test \"$X\"", "a `$`"),
             ("-p lactose-ecs; echo", "an unquoted `;`"),
@@ -1306,7 +1525,7 @@ mod tests {
         let cases = [
             // GitHub folds every entry into the one combination; the last one's args win.
             base.replace("        include:\n", "        toolchain: [dated]\n        include:\n"),
-            base.replace("--locked\n", "--locked -- --skip erased\n"),
+            base.replace("matrix.args }}\n", "matrix.args }} --skip erased\n"),
             base.replace(
                 "      - run: cargo",
                 "      - if: matrix.key != 'ecs-rest'\n        run: cargo",

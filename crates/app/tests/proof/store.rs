@@ -17,7 +17,7 @@ use lactose_persist::{Loader, Migrations, RegionRecords};
 use lactose_reflect::Reflect;
 use lactose_sim::{RegionExport, RegionRequest, SessionEvent, TickInput};
 
-use crate::common::{
+use super::common::{
     Content, Counter, GAME, anchored, capture, executor, kept, load, loaded, logged, server,
     session, step, table_of, try_step,
 };

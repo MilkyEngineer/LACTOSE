@@ -9,7 +9,7 @@
 
 #![forbid(unsafe_code)]
 
-mod support;
+use crate::support;
 
 use std::time::Duration;
 

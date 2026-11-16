@@ -7,7 +7,7 @@
 
 #![forbid(unsafe_code)]
 
-mod common;
+use crate::common;
 
 use std::collections::{BTreeMap, BTreeSet};
 

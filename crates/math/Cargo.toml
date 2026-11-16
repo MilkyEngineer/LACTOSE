@@ -6,6 +6,7 @@ edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 license.workspace = true
+autotests = false
 
 [dependencies]
 bytemuck.workspace = true
@@ -15,6 +16,12 @@ lactose-core.workspace = true
 # math types.
 lactose-reflect.workspace = true
 libm.workspace = true
+
+# The integration tests as one test binary, whose root declares the files of tests/ as
+# modules (D125).
+[[test]]
+name = "integration"
+path = "tests/integration.rs"
 
 [lints]
 workspace = true

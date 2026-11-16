@@ -12,7 +12,7 @@
 
 #![forbid(unsafe_code)]
 
-mod common;
+use crate::common;
 
 #[path = "../../../tools/xtask/src/harness/protocol.rs"]
 #[expect(

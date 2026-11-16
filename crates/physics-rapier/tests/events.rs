@@ -6,7 +6,7 @@
 
 #![forbid(unsafe_code)]
 
-mod support;
+use crate::support;
 
 use lactose_core::StableKey;
 use lactose_math::{Scalar, Vec3};

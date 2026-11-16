@@ -9,12 +9,12 @@
 //! on counts (every pose evaluated, half the characters blending, the bone rows there);
 //! timings are printed, never asserted. `cargo xtask measure sim-skeleton` runs it in release
 //! and writes the result file, figure (b) being criterion 6; by hand, `cargo test -p
-//! lactose-anim --release --test cost -- --ignored --nocapture` on an idle machine, with
-//! `uptime` before and after.
+//! lactose-anim --release --test integration -- cost:: --ignored --nocapture` on an idle
+//! machine, with `uptime` before and after.
 
 #![forbid(unsafe_code)]
 
-mod common;
+use crate::common;
 
 use std::hint::black_box;
 use std::time::Duration;

@@ -25,12 +25,10 @@ use lactose_reflect::{FieldKind, Persistence, Reflect, Registry, StructInfo, Typ
 const MODE_VARIABLE: &str = "LACTOSE_SCHEMA_RECORD";
 
 /// The command that rewrites every record after a deliberate change, which a failure names.
-const UPDATE: &str =
-    "LACTOSE_SCHEMA_RECORD=update cargo nextest run -p lactose-app --test schema_record";
+const UPDATE: &str = "LACTOSE_SCHEMA_RECORD=update cargo nextest run -p lactose-app --test integration schema_record::";
 
 /// The same, also taking a field's new name under its old ID as a rename.
-const RENAME: &str =
-    "LACTOSE_SCHEMA_RECORD=rename cargo nextest run -p lactose-app --test schema_record";
+const RENAME: &str = "LACTOSE_SCHEMA_RECORD=rename cargo nextest run -p lactose-app --test integration schema_record::";
 
 /// The engine's registration set: the game with no crate, whose `Game::types()` is
 /// `TypeTable::new()` and the engine crates' `register_types`, which every game's set

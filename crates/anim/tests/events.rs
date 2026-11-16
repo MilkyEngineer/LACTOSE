@@ -4,7 +4,7 @@
 
 #![forbid(unsafe_code)]
 
-mod common;
+use crate::common;
 
 use common::{
     Fixture, Library, MACHINE, SKELETON, chain, clip, clip_ref, key, s, state, transition,

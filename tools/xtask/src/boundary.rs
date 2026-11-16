@@ -1311,7 +1311,7 @@ fn unnamed_allowlist_entries(tiers: &TierFile, package: &Package, findings: &mut
 /// The repository path of the file that `#[path = "named"]` in the file `from` names: relative
 /// to the directory of `from`, as for every `mod` outside an inline module block. `None` for
 /// a path that is absolute or leaves the repository.
-fn module_file(from: &str, named: &str) -> Option<String> {
+pub(crate) fn module_file(from: &str, named: &str) -> Option<String> {
     joined(parent(from), named)
 }
 

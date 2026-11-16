@@ -14,8 +14,7 @@
 
 #![forbid(unsafe_code)]
 
-#[path = "../../physics-api/tests/common/mod.rs"]
-mod common;
+use crate::common;
 
 use common::*;
 use lactose_core::{StableKey, Tick};

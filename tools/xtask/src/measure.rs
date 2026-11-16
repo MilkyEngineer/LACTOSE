@@ -52,11 +52,10 @@ pub enum Run {
     Test {
         /// The package.
         package: &'static str,
-        /// Its integration test target.
-        target: &'static str,
-        /// The target's file, relative to the repository root.
+        /// Its integration test file, relative to the repository root: a module of the
+        /// package's one test target, `integration`, named after the file (D125).
         file: &'static str,
-        /// The test's path inside the target.
+        /// The test's path inside the file's module.
         test: &'static str,
     },
     /// The netcode spike's ten-minute replays (`REPLAYS`), ignored tests run in release one
@@ -93,13 +92,8 @@ pub struct Measurement {
     pub run: Run,
 }
 
-const fn test(
-    package: &'static str,
-    target: &'static str,
-    file: &'static str,
-    test: &'static str,
-) -> Run {
-    Run::Test { package, target, file, test }
+const fn test(package: &'static str, file: &'static str, test: &'static str) -> Run {
+    Run::Test { package, file, test }
 }
 
 /// Every measurement, in the order `--all` runs them.
@@ -108,7 +102,7 @@ pub const MEASUREMENTS: [Measurement; 12] = [
         name: "tick-100k",
         what: "Criterion 1: the median step of the 100k scene on one frame worker and on N, S and the projected eight-core tick",
         threshold: "architecture section 22; milestone 1 plan, section 4 and decision 5.1",
-        run: test("lactose-sim", "cost", "crates/sim/tests/cost.rs", "cost_of_a_tick_at_100k_rows"),
+        run: test("lactose-sim", "crates/sim/tests/cost.rs", "cost_of_a_tick_at_100k_rows"),
     },
     Measurement {
         name: "physics-phase",
@@ -116,7 +110,6 @@ pub const MEASUREMENTS: [Measurement; 12] = [
         threshold: "architecture section 22; milestone 1 plan, section 4",
         run: test(
             "lactose-app",
-            "cost",
             "crates/app/tests/cost.rs",
             "cost_of_the_physics_phase_at_100k_rows",
         ),
@@ -125,46 +118,31 @@ pub const MEASUREMENTS: [Measurement; 12] = [
         name: "composed-tick",
         what: "The 100k scene with 2,000 bodies on Rapier beside it, on one frame worker and on N",
         threshold: "none: recorded beside criteria 1 and 4 (milestone 1 plan, section 4)",
-        run: test(
-            "lactose-app",
-            "cost",
-            "crates/app/tests/cost.rs",
-            "composed::cost_of_the_composed_tick",
-        ),
+        run: test("lactose-app", "crates/app/tests/cost.rs", "composed::cost_of_the_composed_tick"),
     },
     Measurement {
         name: "reload-100k",
         what: "The full diff of a 100k-row region reloaded in place on Rapier (D124)",
         threshold: "none: recorded (docs/verification.md)",
-        run: test("lactose-app", "cost", "crates/app/tests/cost.rs", "cost_of_a_100k_reload"),
+        run: test("lactose-app", "crates/app/tests/cost.rs", "cost_of_a_100k_reload"),
     },
     Measurement {
         name: "bone-bodies",
         what: "200 characters with a Rapier body on each of their sixteen bones, against none",
         threshold: "none: recorded (docs/verification.md)",
-        run: test(
-            "lactose-app",
-            "cost",
-            "crates/app/tests/cost.rs",
-            "cost_of_bone_bodies_on_rapier",
-        ),
+        run: test("lactose-app", "crates/app/tests/cost.rs", "cost_of_bone_bodies_on_rapier"),
     },
     Measurement {
         name: "prediction-slot",
         what: "Criterion 5: the take and the restore of a prediction slot on the spike's thrown scene with Rapier",
         threshold: "architecture section 22; milestone 1 plan, section 4",
-        run: test("lactose-app", "spike", "crates/app/tests/spike.rs", "cost_of_a_prediction_slot"),
+        run: test("lactose-app", "crates/app/tests/spike.rs", "cost_of_a_prediction_slot"),
     },
     Measurement {
         name: "rollback-seven-ticks",
         what: "Criterion 7: a seven-tick rollback on the spike's thrown scene with Rapier",
         threshold: "none: recorded (architecture section 22; milestone 1 plan, section 4)",
-        run: test(
-            "lactose-app",
-            "spike",
-            "crates/app/tests/spike.rs",
-            "cost_of_a_seven_tick_rollback",
-        ),
+        run: test("lactose-app", "crates/app/tests/spike.rs", "cost_of_a_seven_tick_rollback"),
     },
     Measurement {
         name: "spike-net",
@@ -176,7 +154,7 @@ pub const MEASUREMENTS: [Measurement; 12] = [
         name: "sim-skeleton",
         what: "Criterion 6: the sim skeleton of 200 characters; figure (b) is the criterion's",
         threshold: "architecture section 22; milestone 1 plan, section 4",
-        run: test("lactose-anim", "cost", "crates/anim/tests/cost.rs", "the_sim_skeleton_budget"),
+        run: test("lactose-anim", "crates/anim/tests/cost.rs", "the_sim_skeleton_budget"),
     },
     Measurement {
         name: "whisk",
@@ -204,7 +182,7 @@ pub fn find(name: &str) -> Option<&'static Measurement> {
     MEASUREMENTS.iter().find(|m| m.name == name)
 }
 
-/// The netcode spike's test target, whose replays [`Run::SpikeReplays`] runs.
+/// The netcode spike's test file, whose replays [`Run::SpikeReplays`] runs.
 const SPIKE_FILE: &str = "crates/app/tests/spike.rs";
 
 /// One of the netcode spike's ten-minute replays: an ignored test that replays one scene on
@@ -221,7 +199,7 @@ struct Replay {
 
 impl Replay {
     const fn run(self) -> Run {
-        test("lactose-app", "spike", SPIKE_FILE, self.test)
+        test("lactose-app", SPIKE_FILE, self.test)
     }
 }
 
@@ -248,7 +226,7 @@ const PREDICTION_BOUND: u64 = 64;
 /// The topology probe: an ignored test of `lactose-app` that prints what the executor
 /// detects, run once before the measurements.
 const PROBE: Run =
-    test("lactose-app", "cost", "crates/app/tests/cost.rs", "the_topology_the_executor_detects");
+    test("lactose-app", "crates/app/tests/cost.rs", "the_topology_the_executor_detects");
 
 // ---- The pure parts ----
 
@@ -1074,7 +1052,8 @@ fn capture(command: &mut Command, mut line: impl FnMut(&str, Duration)) -> Resul
 
 /// The arguments of `cargo nextest run` for one ignored test in release.
 fn nextest_args(run: Run) -> Vec<String> {
-    let Run::Test { package, target, test, .. } = run else { return Vec::new() };
+    let Run::Test { package, file, test } = run else { return Vec::new() };
+    let module = file.rsplit('/').next().and_then(|name| name.strip_suffix(".rs")).unwrap_or(file);
     [
         "nextest",
         "run",
@@ -1084,7 +1063,7 @@ fn nextest_args(run: Run) -> Vec<String> {
         "--package",
         package,
         "--test",
-        target,
+        "integration",
         "--run-ignored",
         "only",
         // A retried test's output holds every attempt, and its time the failed ones'.
@@ -1093,7 +1072,7 @@ fn nextest_args(run: Run) -> Vec<String> {
         "--no-capture",
         "--no-tests=fail",
         "-E",
-        &format!("test(={test})"),
+        &format!("test(={module}::{test})"),
     ]
     .iter()
     .map(|arg| (*arg).to_owned())
@@ -1290,7 +1269,7 @@ fn run_spike_replays(
         ran.push(format!("`{}`", replay.test));
     }
     let load = sampler.stop();
-    let args = nextest_args(test("lactose-app", "spike", SPIKE_FILE, "<replay>"));
+    let args = nextest_args(test("lactose-app", SPIKE_FILE, "<replay>"));
     let workers = format!("{SPIKE_WORKERS}, the spike's");
     let mut header =
         header(options, machine, m, "release", workers, shell_line(&[], "cargo", &args), load);
@@ -1648,6 +1627,18 @@ mod tests {
                 assert_eq!(args[at + 1], "0", "{test}");
             }
         }
+    }
+
+    /// A test is selected in its package's one test binary by its path there (D125).
+    #[test]
+    fn a_measured_test_is_named_by_its_path_in_the_integration_target() {
+        let args = nextest_args(PROBE);
+        let at = args.iter().position(|arg| arg == "--test").unwrap();
+        assert_eq!(args[at + 1], "integration");
+        assert_eq!(args.last().unwrap(), "test(=cost::the_topology_the_executor_detects)");
+        let args =
+            nextest_args(MEASUREMENTS.iter().find(|m| m.name == "composed-tick").unwrap().run);
+        assert_eq!(args.last().unwrap(), "test(=cost::composed::cost_of_the_composed_tick)");
     }
 
     /// Review r1 of spike-net-file, M1: serde_json's default float parse is not correctly

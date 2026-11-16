@@ -7,17 +7,7 @@
 #![forbid(unsafe_code)]
 #![allow(missing_docs)]
 
-#[path = "../../../tools/xtask/src/harness/protocol.rs"]
-#[expect(
-    clippy::wrong_self_convention,
-    reason = "the runner's module as written; it is included, not owned, here"
-)]
-#[allow(
-    unfulfilled_lint_expectations,
-    reason = "the boundary lints these expectations name are not configured outside the boundary"
-)]
-#[allow(dead_code, reason = "the runner's module as written; a test uses what it needs")]
-mod protocol;
+use crate::protocol;
 
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};

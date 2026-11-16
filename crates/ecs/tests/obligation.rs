@@ -8,7 +8,7 @@
 // Miri cannot spawn processes.
 #![cfg(not(miri))]
 
-mod common;
+use crate::common;
 
 use std::io::Read;
 #[expect(clippy::disallowed_types, reason = "a test that runs its own binary as a child")]
@@ -66,8 +66,12 @@ fn aborts_running(test: &str, system: &'static SystemDescriptor, expected: &str)
         tick(&mut schedule, rows(), &executor);
         panic!("the run finished, so the kernel read what its table did not declare");
     }
+    // The harness names a test by its path below the crate root.
+    let path = module_path!()
+        .split_once("::")
+        .map_or_else(|| test.to_owned(), |(_, module)| format!("{module}::{test}"));
     let mut child = Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", test, "--nocapture", "--test-threads", "1"])
+        .args(["--exact", path.as_str(), "--nocapture", "--test-threads", "1"])
         .env(CHILD_ENV, test)
         .stdin(Stdio::null())
         .stdout(Stdio::null())

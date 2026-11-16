@@ -16,7 +16,7 @@ use lactose_net_host::message::JoinAccepted;
 use lactose_physics_api::Physics;
 use lactose_sim::{PlayerSample, Registration, SessionEvent, TickInput, TypeTable};
 
-use crate::common::{Content, executor, load, server, session, step};
+use super::common::{Content, executor, load, server, session, step};
 
 static CALLS: Mutex<Vec<String>> = Mutex::new(Vec::new());
 

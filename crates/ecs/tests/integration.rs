@@ -1,0 +1,34 @@
+//! The integration tests of `lactose-ecs` as one test binary (D125): each file beside this one is a
+//! module of it, named after the file. `common`, the support they share, is declared once here.
+//! `alloc.rs` is a target of its own, for the reason `Cargo.toml` gives.
+
+mod common;
+
+mod binds;
+mod bulk;
+mod change;
+mod channel_skip;
+mod claims;
+mod commands;
+mod compile_fail;
+mod erased;
+mod erased_rows;
+mod events;
+mod fork;
+mod layout;
+mod obligation;
+mod ownership;
+mod pass;
+mod predicted;
+mod query;
+mod regions;
+mod regressions;
+mod regressions_two;
+mod reload;
+mod schedule_errors;
+mod snapshot;
+mod structure;
+mod systems;
+mod units;
+mod wrap;
+mod wrap_program;

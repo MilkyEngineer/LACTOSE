@@ -20,7 +20,7 @@ use lactose_physics_api::{Collider, RigidBody, Shape, Transform, Velocity};
 use lactose_reflect::{Reflect, TypeRole};
 use lactose_sim::{SessionEvent, StagedState, TickInput, TimeScale};
 
-use crate::common::{
+use super::common::{
     Clock, Content, Counter, GAME, anchored, capture, executor, load, logged, server, step,
     table_of,
 };
@@ -96,7 +96,7 @@ fn regions(client: &Client) -> Vec<u64> {
 /// What a server says of regions `ids` as they enter a client's set.
 fn relevance(executor: &Executor, content: &Arc<Content>, ids: &[u64]) -> Vec<RegionRelevance> {
     let server = server(executor, WorldConfig::headless(), Start::Fresh, content);
-    let (server, out) = step(executor, server, crate::common::load(content, ids.iter().copied()));
+    let (server, out) = step(executor, server, super::common::load(content, ids.iter().copied()));
     assert!(out.failures.is_empty(), "{out:?}");
     let messages = ids
         .iter()

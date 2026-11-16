@@ -18,7 +18,7 @@ of a manifest it writes under the target directory.
 | Command | Enforces |
 |---|---|
 | `tiers` | `crate-tiers.toml` against the workspace (architecture section 3) |
-| `boundary` | the file facts of the determinism boundary and the unsafe policy, and the nightly Miri job's split of a package (sections 8.2, 8.3, 20, 21) |
+| `boundary` | the file facts of the determinism boundary and the unsafe policy, the nightly Miri job's split of a package, and one test binary per package (sections 8.2, 8.3, 20, 21; D125) |
 | `features` | identical boundary feature trees across shipped binaries, and the same features for every package two roots share where one is a harness package (section 8.3) |
 | `vendor` | each crate built from `vendor/` is its patch applied to its record, the patch is within the rule, the record is the crates.io archive's, and the advisory check covers the upstream versions (sections 8.2, 8.3) |
 | `sour run`, `sour compare`, `sour self-test`, `sour matrix` | SOUR, the determinism harness (section 8.3) |
@@ -35,14 +35,15 @@ write nothing to standard output themselves.
 | File | Holds |
 |---|---|
 | `crate-tiers.toml` | Every dependency rule: tiers, test-support crates, the boundary list, the boundary's dependency allowlists, the server denylist, exceptions |
-| `tools/xtask/ci-policy.toml` | What is not a dependency rule: the unsafe list of section 21, the crates that carry the boundary lint file without being in the boundary, the shipped binaries, the harness packages, the tests that record hashes and the packages the nightly Miri job splits |
+| `tools/xtask/ci-policy.toml` | What is not a dependency rule: the unsafe list of section 21, the crates that carry the boundary lint file without being in the boundary, the shipped binaries, the harness packages, the tests that record hashes, the packages the nightly Miri job splits and the test targets that stay binaries of their own |
 | `deny.toml` | Licences, sources, advisories and duplicate versions, enforced by `cargo deny check` |
 | `crates/core/clippy.toml` | The boundary lints; every boundary crate carries an identical copy |
 | `.gitattributes` | The line-ending rule and its exceptions, which `line-endings.sh` checks (below) |
 
 A new shipped binary goes into `[feature_roots]`, a package with simulation tests into
-`[harness]` `packages` and each simulation test into `[harness]` `tests`, all in
-`ci-policy.toml`, in the commit that adds them. Nothing in the code names a crate of the
+`[harness]` `packages`, each simulation test into `[harness]` `tests` and a test target
+that must be a binary of its own into `[test_targets]`, all in `ci-policy.toml`, in the
+commit that adds them. Nothing in the code names a crate of the
 workspace except where a rule itself does: `lactose-app-server` (the server denylist), the
 `lactose-app-` prefix and `lactose-sim` (the two guards below), and `lactose-task` and
 `lactose-input-host` (the loom rule).
@@ -161,15 +162,18 @@ on, and a listed feature the crate does not declare are findings.
   configuration file is a symbolic link: cargo would read through either what no check
   reads. `vendor` refuses both through the same function.
 - The nightly Miri job (`src/miri.rs`): for each package of `[miri_split]`, the entries of
-  the `miri` job's matrix in `.github/workflows/nightly.yml` that name it run, together, its
-  library, each integration test target `cargo metadata` lists and its doc tests exactly
-  once; a finding names each one no entry runs, or that several do, with the entries. The
+  the `miri` job's matrix in `.github/workflows/nightly.yml` that name it run, together, each
+  test of its library, of each integration test target `cargo metadata` lists and of its doc
+  tests exactly once: one entry runs a target unfiltered, or exactly two divide it, one
+  naming libtest filters after `--` and the other skipping each of them with `--skip`, which
+  runs each test once whatever the tests are called. A finding names each target no entry
+  runs, one entry runs only part of, or several entries run otherwise, with the entries. The
   check reads one shape of the job, today's, and refuses any other rather than reading it:
   a matrix of `include` alone (a key beside it folds the entries into its combinations), no
   `if` or `defaults` on the job and no `defaults` on the workflow, and one item of the job's
   one `steps` list that uses `matrix.args`,
-  `run: cargo +$MIRI_TOOLCHAIN miri test ${{ matrix.args }} --locked`, with only `env` beside
-  it. The job's other steps are not read. The reader takes the YAML the job is written in
+  `run: cargo +$MIRI_TOOLCHAIN miri test --locked ${{ matrix.args }}`, with only `env` beside
+  it, so that the words after an entry's `--` are libtest's and nothing follows them. The job's other steps are not read. The reader takes the YAML the job is written in
   (block mappings and sequences, plain, quoted and block scalars, LF or CRLF line breaks,
   space indentation) and refuses at its line what it does not read on the way to and inside
   the entries: another line break (a lone CR, NEL, LS or PS), a tab indent, a document
@@ -183,13 +187,15 @@ on, and a listed feature the crate does not declare are findings.
   split as the run step's bash splits them; an unquoted glob character, which bash would
   expand against the checkout, a line break, which ends the command, and other shell syntax
   are refused. Of cargo's options it reads `-p`, `--lib`, `--test` and `--doc`, and refuses
-  any other. A package in `[miri_split]` must name its targets: an entry that names none is
+  any other; after the first `--`, filters and `--skip FILTER`, and it refuses a `--` with
+  nothing after it, an empty filter, `--skip=`, a second `--` and every other libtest option
+  (`--exact` would change what a filter matches). A package in `[miri_split]` must name its targets: an entry that names none is
   refused, since cargo's default run then follows the manifest's `test` and
   `required-features`, which the counts do not model. An explicit `--test` runs a
   `test = false` target and fails the job on one whose `required-features` it does not
   enable, so neither needs a rule. A package outside `[miri_split]` that two or more entries
-  name by target is reported as a split the policy does not list; an entry that runs the
-  package whole drops none of its targets, so entries that do, as `lactose-task`'s two do
+  name by target or filter is reported as a split the policy does not list; an entry that
+  runs the package whole and unfiltered drops none of its tests, so entries that do, as `lactose-task`'s two do
   under two environments, are no split, and neither is one of them beside one entry by
   target. An empty `[miri_split]` is reported. A binary, bench or example target of a
   split package whose `test` is on, which `cargo test` would run and the split cannot
@@ -201,6 +207,24 @@ on, and a listed feature the crate does not declare are findings.
   `cargo test --no-run --test` on cargo 1.99.0, and a set of them on both cargos. A value
   that selects nothing, which cargo refuses, is reported, as is a pattern with a path
   separator, which the check does not read.
+- One test binary per package (`src/test_targets.rs`, D125): a package builds its
+  integration tests as one target, `integration`, whose root `tests/integration.rs`
+  declares every other file of `tests/` as a module, with `autotests = false` in the
+  manifest. The module is named after the file, except where the file's name holds a
+  codename of `CLAUDE.md`'s Names table, which no module may carry: then the file is
+  declared under a name for what it holds, with `#[path]` (`#[path = "sour.rs"] mod
+  recorded;`). Shared support (`common`, `glue`) is declared once in the root, and a file
+  reaches it as `crate::common`. A test target that must be a binary of its own (its own
+  `#[global_allocator]`, or a target a tool builds alone) is listed in `[test_targets]`
+  `separate` as `package::target` under its reason. Findings: a package with more than one
+  test target outside that list, an entry that names no test target, a file cargo would make
+  a target of by itself (`tests/*.rs`, `tests/*/main.rs`) that is neither a test target's
+  root nor a module that root declares, and a module a test target's root declares under a
+  codename (each `_`-separated word of its name is compared, lower-cased). A package of one
+  test file may leave it a target under its own name. A test that runs its own binary again
+  names itself by its path in the binary, `module_path!()` below the crate root, not by its
+  bare name. Module declarations are read from the roots alone, so a file of `tests/` that
+  another module declares is reported.
 
 The scanner reads source text. It does not expand macros, so an attribute a macro writes is
 not seen. In the lint check it resolves a `#[path]` inside an inline `mod` block as if it

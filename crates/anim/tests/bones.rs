@@ -9,7 +9,7 @@
 
 #![forbid(unsafe_code)]
 
-mod common;
+use crate::common;
 
 use common::fake::Call;
 use common::{

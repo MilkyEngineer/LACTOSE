@@ -2,7 +2,7 @@
 
 #![cfg(not(feature = "loom"))]
 
-mod common;
+use crate::common;
 
 use core::future::pending;
 use core::pin::Pin;

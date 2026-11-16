@@ -4,7 +4,7 @@
 
 #![forbid(unsafe_code)]
 
-mod common;
+use crate::common;
 
 use std::collections::BTreeSet;
 use std::sync::Mutex;

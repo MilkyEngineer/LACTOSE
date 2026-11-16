@@ -2,7 +2,7 @@
 
 #![forbid(unsafe_code)]
 
-mod common;
+use crate::common;
 
 use common::Rng;
 use lactose_math::{Scalar, Vec3};

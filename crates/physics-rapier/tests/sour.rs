@@ -13,8 +13,7 @@
 
 #![forbid(unsafe_code)]
 
-#[path = "../../physics-api/tests/common/mod.rs"]
-mod common;
+use crate::common;
 
 #[path = "../../../tools/xtask/src/harness/protocol.rs"]
 #[expect(

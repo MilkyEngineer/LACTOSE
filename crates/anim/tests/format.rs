@@ -8,7 +8,7 @@
 
 #![forbid(unsafe_code)]
 
-mod common;
+use crate::common;
 
 use common::{MACHINE, SKELETON, bone_body, chain, clip, clip_ref, s, state, transition, v, yaw};
 use lactose_anim::{

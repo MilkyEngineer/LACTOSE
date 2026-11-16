@@ -9,12 +9,12 @@
 //! It runs for two seconds by default. Set `WHISK_STRESS_SECONDS` for a soak:
 //!
 //! ```text
-//! WHISK_STRESS_SECONDS=600 cargo nextest run -p lactose-task --release --test stress
+//! WHISK_STRESS_SECONDS=600 cargo nextest run -p lactose-task --release --test integration stress::
 //! ```
 
 #![cfg(not(feature = "loom"))]
 
-mod common;
+use crate::common;
 
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;

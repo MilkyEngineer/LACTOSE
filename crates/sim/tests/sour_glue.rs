@@ -12,6 +12,10 @@
     clippy::wrong_self_convention,
     reason = "the runner's module as written; it is included, not owned, here"
 )]
+#[allow(
+    clippy::duplicate_mod,
+    reason = "the README's glue includes the module itself; `glue` includes it for the other tests"
+)]
 mod protocol;
 
 use std::num::NonZeroU32;

@@ -5,9 +5,10 @@
 [profile.default]
 slow-timeout = { period = "60s", terminate-after = 5 }
 
-# The netcode spike's ignored measurements (`crates/app/tests/spike.rs`) replay ten minutes of
-# ticks in release: the slowest, fifty thrown bodies under the clock script, took 149 to 181 s
-# at load averages of 8 to 25 on an M1. Ten periods leave three times that.
+# The netcode spike's ignored measurements (`crates/app/tests/spike.rs`, the module `spike` of
+# the package's one test binary) replay ten minutes of ticks in release: the slowest, fifty
+# thrown bodies under the clock script, took 149 to 181 s at load averages of 8 to 25 on an M1.
+# Ten periods leave three times that.
 [[profile.default.overrides]]
-filter = 'test(/^ten_minutes_/)'
+filter = 'test(/^spike::ten_minutes_/)'
 slow-timeout = { period = "60s", terminate-after = 10 }

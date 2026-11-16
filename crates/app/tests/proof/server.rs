@@ -12,7 +12,7 @@ use lactose_core::{Error, ErrorKind, PlayerId, Result, Tick};
 use lactose_ecs::{Executor, RegionId, RegionMode, World};
 use lactose_sim::{Registration, SessionApplier, SessionEvent, TickInput, TimeScale, TypeTable};
 
-use crate::common::{
+use super::common::{
     Clock, Content, Counter, anchored, executor, frame, load, mirror, passes, scales, server,
     session, step, table_of,
 };
