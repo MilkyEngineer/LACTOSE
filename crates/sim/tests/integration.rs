@@ -1,4 +1,4 @@
-//! The integration tests of `lactose-sim` as one test binary (D125): each file beside this one is a
+//! The integration tests of `lactose-sim` as one test binary (D150): each file beside this one is a
 //! module of it, named after the file. `common` and `glue`, the support they share, are declared
 //! once here. A file whose name is a codename is a module named for what it holds (CLAUDE.md,
 //! Names): `recorded` is `sour.rs` and `readme_glue` is `sour_glue.rs`.

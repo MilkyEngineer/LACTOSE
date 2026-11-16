@@ -18,7 +18,7 @@ of a manifest it writes under the target directory.
 | Command | Enforces |
 |---|---|
 | `tiers` | `crate-tiers.toml` against the workspace (architecture section 3) |
-| `boundary` | the file facts of the determinism boundary and the unsafe policy, the nightly Miri job's split of a package, and one test binary per package (sections 8.2, 8.3, 20, 21; D125) |
+| `boundary` | the file facts of the determinism boundary and the unsafe policy, the nightly Miri job's split of a package, and one test binary per package (sections 8.2, 8.3, 20, 21; D150) |
 | `features` | identical boundary feature trees across shipped binaries, and the same features for every package two roots share where one is a harness package (section 8.3) |
 | `vendor` | each crate built from `vendor/` is its patch applied to its record, the patch is within the rule, the record is the crates.io archive's, and the advisory check covers the upstream versions (sections 8.2, 8.3) |
 | `sour run`, `sour compare`, `sour self-test`, `sour matrix` | SOUR, the determinism harness (section 8.3) |
@@ -70,16 +70,23 @@ on, and a listed feature the crate does not declare are findings.
   entries under `rayon::`, `rapier3d_f64::`, `parry3d_f64::` or `std::thread::` that start
   no thread (`NOT_THREAD_ROUTES`), or in `REQUIRED_LINT_PATHS`, the rest in the reference's
   order. Each is pinned with its table: `PINNED_TYPES` lists the entries that belong under
-  `disallowed-types`, every other one belongs under `disallowed-methods`, and clippy applies
-  a path only in its own table. An entry the file drops or moves to the other table, and an
-  entry it adds that none of the three lists holds, are findings, so the reference's banned
-  set equals the union of the three, each entry in its table. `tests/boundary_lints.rs` runs
-  clippy with the reference over a probe that calls each route D119 bans through the
-  solver's math crates (simba, num-traits, num-complex, glam, glamx, approx), one line per
-  route, and requires every line refused: each of those entries carries `allow-invalid`,
-  which would otherwise hide a path that stopped resolving. Rapier's `RevoluteJoint::angle`
-  and parry's `VectorExt::angle` are pinned but not in that probe, which does not compile
-  Rapier.
+  `disallowed-types`, `PINNED_MACROS` the two of `disallowed-macros` (run-time CPU feature
+  detection, `std::arch::is_x86_feature_detected` and `std::arch::is_aarch64_feature_detected`,
+  section 8.2), every other one belongs under `disallowed-methods` (CPUID read directly,
+  `core::arch::x86_64::__cpuid`, `__cpuid_count` and `__get_cpuid_max`, which returns
+  CPUID's registers for the leaf it is given, among them, with `allow-invalid` for
+  aarch64), and clippy applies a path
+  only in its own table. An entry the file drops or moves to another table, and an entry it
+  adds that none of the three lists holds, are findings, so the reference's banned set equals
+  the union of the three, each entry in its table. `tests/boundary_lints.rs` runs clippy with
+  the reference over a probe that calls each route D119 bans through the solver's math crates
+  (simba, num-traits, num-complex, glam, glamx, approx), one line per route, and requires
+  every line refused: each of those entries carries `allow-invalid`, which would otherwise
+  hide a path that stopped resolving. The same probe calls the feature detection macro of the
+  target it is built for (the x86 one by its root path, `std::is_x86_feature_detected!`) and
+  requires it refused, and on x86-64 calls CPUID by its `core` path, its `std::arch`
+  re-export and a renamed import, and `__get_cpuid_max`, each refused. Rapier's `RevoluteJoint::angle` and parry's `VectorExt::angle` are
+  pinned but not in that probe, which does not compile Rapier.
 - Each other crate of `[boundary_internal] any` compiles into every boundary crate and has a
   `clippy.toml` whose entries under the paths that reach files, the environment, a
   subprocess or the network, or create a thread through the standard library (`OUTSIDE_WORLD` in `src/boundary.rs`), are
@@ -90,7 +97,8 @@ on, and a listed feature the crate does not declare are findings.
   reference's entries that cite section 8.2, so an entry added there is not missed.
 - Nothing switches the boundary lints off. In a boundary crate, a crate of
   `[lint_file_carriers]` or a crate of `[boundary_internal] any`, `allow`, `expect` or
-  `warn` of `clippy::disallowed_methods`, `clippy::disallowed_types`, their old names
+  `warn` of `clippy::disallowed_methods`, `clippy::disallowed_types`,
+  `clippy::disallowed_macros`, the first two's old names
   `clippy::disallowed_method` and `clippy::disallowed_type`, `clippy::all`, `clippy::style`
   or `warnings` is a finding as an inner attribute anywhere or as an outer attribute on a
   `mod`, and `allow` or `warn` of them is a finding on any item, since only an `expect`
@@ -158,6 +166,16 @@ on, and a listed feature the crate does not declare are findings.
   such as `<Self as Decodes>::Kind`); a type outside
   the boundary that shares a kind's name is reported; and an `impl ... for` header in a
   `macro_rules!` body is read as if it were an impl.
+- What a world registers and runs is written under the boundary lint file (project review
+  2, X1). A crate that is neither a boundary crate nor one of `[lint_file_carriers]` ships
+  no `#[system]`, no `#[component]` or `#[resource]` whose arguments lack `derived`, and no
+  `impl` of `SessionApplier`, `InputApplier` or `StagedState`, the traits through which the
+  input sync point writes into the world, and no hand-written `impl Reflect`, which declares
+  a component or a resource no attribute shows. Pass systems are `#[system]`s like any
+  other. Shipped code is read as for D99, and attributes and traits are compared by their
+  last path segment as written: one brought in under another name (`use ... as`), in
+  code produced by a macro the crate's source does not spell out (another crate's macro or
+  derive), or inside a `cfg_attr`, is not seen. `lactose-app-headless` is a carrier for its sketch game.
 - No cargo configuration file has an `include` key, and no `.cargo` directory or cargo
   configuration file is a symbolic link: cargo would read through either what no check
   reads. `vendor` refuses both through the same function.
@@ -214,7 +232,7 @@ on, and a listed feature the crate does not declare are findings.
   `cargo test --no-run --test` on cargo 1.99.0, and a set of them on both cargos. A value that
   selects nothing, which cargo refuses, is reported, as is a pattern with a path separator,
   which the check does not read.
-- One test binary per package (`src/test_targets.rs`, D125): a package with more than one
+- One test binary per package (`src/test_targets.rs`, D150): a package with more than one
   integration test file builds them as one target, `integration`, whose root
   `tests/integration.rs` declares every other file of `tests/` as a module, with
   `autotests = false` in the manifest; a package of one test file may leave it a target under
@@ -402,9 +420,13 @@ agree. `cargo xtask sour matrix` prints the modes; `src/harness/mod.rs` holds th
   with, and a chaos test that left no execution log. The tests that recorded in the baseline
   run must be exactly `[harness]` `tests`: one listed that recorded nothing was renamed,
   ignored, deleted or stopped recording, and one that recorded unlisted was added without
-  the list. `--emit <file>` writes the baseline hashes.
+  the list. `--emit <file>` writes the baseline hashes. `--release` builds the tests with
+  the release profile (`--cargo-profile release`), which drops debug assertions and overflow
+  checks, and writes to `target/sour-release`.
 - `sour compare <reference> <file>` compares two emitted files. Architecture mode is each
   machine emitting and one job comparing. A missing file, or a reference with no hashes, fails.
+  Nightly also compares each platform's dev baseline with its release one, from
+  `sour run --mode architecture --release` (project review 2, X5).
 - `sour self-test` proves the runner through nextest on the stand-in simulations in
   `src/harness/stand_in.rs`: a sound one must pass every mode, and one flawed stand-in per
   mode must be reported by that mode at the tick its flaw starts. The nested build uses its
@@ -413,7 +435,8 @@ agree. `cargo xtask sour matrix` prints the modes; `src/harness/mod.rs` holds th
 While `[harness]` is empty, `sour run` and `sour compare` say so and exit 0. Once
 `lactose-sim` exists in the workspace an empty `[harness]` is a finding.
 
-Runs write to `target/sour/<mode>/<variant>/`: `hashes.tsv`, and `logs/<test>.execlog` for
+Runs write to `target/sour/<mode>/<variant>/` (`target/sour-release/...` under `--release`):
+`hashes.tsv`, and `logs/<test>.execlog` for
 the execution logs of a chaos run, which are deleted if the run agreed with its reference.
 
 ### What a simulation test does

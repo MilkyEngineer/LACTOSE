@@ -6431,7 +6431,10 @@ process state; the nightly Miri filters name modules that Miri compiles** (§20,
   26 s under the last full match before the merge, and the conversion's gain on the Windows
   runner is no larger than the runs' own spread. No check job's median passes ten minutes, so
   the milestone 2 plan's (branch `milestone-2-plan`) question 6, which its decision 5.15 asks
-  only when one does, is not due.
+  only when one does, is not due. The Windows check's test step, mostly its build, took 8:15,
+  8:14, 8:44 and 6:24 in those four runs and its doctests 9 to 14 s, against each check job's
+  15-minute timeout; `.github/workflows/ci.yml`'s header carries the figures, and the code
+  and workflows cite D150, not D125, since `4b08871`.
 
 **D151. Milestone 1 closes on the Mac: criterion 1 is met by the M1's run on four performance cores, and the x86 half of milestones 0 and 1 is settled in milestone 2's desktop sitting** (§20, §22, `lactose-task`, `docs/plans/milestone-1.md`, `docs/plans/close-on-mac.md`, `docs/results`)
 - Why: milestone 1's exit waited on two sittings at the owner's x86 desktop, session A for the

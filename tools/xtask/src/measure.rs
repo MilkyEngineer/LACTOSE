@@ -53,7 +53,7 @@ pub enum Run {
         /// The package.
         package: &'static str,
         /// Its integration test file, relative to the repository root: a module of the
-        /// package's one test target, `integration`, named after the file (D125).
+        /// package's one test target, `integration`, named after the file (D150).
         file: &'static str,
         /// The test's path inside the file's module.
         test: &'static str,
@@ -1629,7 +1629,7 @@ mod tests {
         }
     }
 
-    /// A test is selected in its package's one test binary by its path there (D125).
+    /// A test is selected in its package's one test binary by its path there (D150).
     #[test]
     fn a_measured_test_is_named_by_its_path_in_the_integration_target() {
         let args = nextest_args(PROBE);

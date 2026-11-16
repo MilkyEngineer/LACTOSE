@@ -10,7 +10,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use crate::policy::Policy;
 use crate::repo::{Files, is_build_configuration, is_cargo_config, unread_cargo_configuration};
-use crate::rust_source::{Attribute, Impl, Items, attributes, items};
+use crate::rust_source::{Attribute, Declaration, Impl, Items, attributes, items};
 use crate::tiers::{TierFile, turning_on};
 use crate::workspace::{DepKind, DepSource, Package, Workspace};
 use crate::{ARCHITECTURE, Finding, POLICY_FILE, TIER_FILE};
@@ -33,6 +33,15 @@ const SIMULATION_ASSET: &str = "SimulationAsset";
 /// The trait that decodes an asset kind from cooked bytes (D99).
 const LOADER: &str = "Loader";
 
+/// The traits of `lactose_sim` through which the input sync point writes what enters a tick
+/// into the world: players' joins and leaves, their inputs, and staged state.
+const APPLYING_TRAITS: [&str; 3] = ["SessionApplier", "InputApplier", "StagedState"];
+
+/// The trait of `lactose_reflect` that describes a type a world stores: its key, its fields
+/// and its persistence policy. `#[component]` and `#[resource]` write it; written by hand, it
+/// declares a component or a resource that no attribute shows.
+const DESCRIBING_TRAIT: &str = "Reflect";
+
 /// The `[target]` key and the flags of the pin (architecture section 8.2).
 const PIN_KEY: &str = r#"cfg(target_arch = "x86_64")"#;
 const PIN_CPU: &str = "x86-64-v3";
@@ -41,13 +50,14 @@ const PIN_FLAGS: [&str; 2] = ["-C", "target-cpu=x86-64-v3"];
 /// Every entry of the reference lint file that is neither a thread route nor in
 /// [`NOT_THREAD_ROUTES`], in the file's order: the float methods and the trait routes to them,
 /// the executor's worker index and the methods of its re-export, files, the environment,
-/// subprocesses and the network, and the types. The check requires the reference's entries
-/// to be exactly this list, [`THREAD_ROUTES`] and [`NOT_THREAD_ROUTES`], each in the table
-/// [`pinned_table`] names, so a ban deleted from the reference and every copy is reported, and
-/// so is one moved to the other table, where clippy no longer applies it, or one added without
-/// being pinned here. `allow-invalid` keeps clippy quiet about an entry whatever happens to
-/// it, and no test uses most of them.
-const REQUIRED_LINT_PATHS: [&str; 273] = [
+/// subprocesses and the network, CPUID, the types, and the macros of run-time CPU feature
+/// detection.
+/// The check requires the reference's entries to be exactly this list, [`THREAD_ROUTES`] and
+/// [`NOT_THREAD_ROUTES`], each in the table [`pinned_table`] names, so a ban deleted from the
+/// reference and every copy is reported, and so is one moved to another table, where clippy
+/// no longer applies it, or one added without being pinned here. `allow-invalid` keeps clippy
+/// quiet about an entry whatever happens to it, and no test uses most of them.
+const REQUIRED_LINT_PATHS: [&str; 278] = [
     "f32::min",
     "f32::max",
     "f32::clamp",
@@ -290,6 +300,9 @@ const REQUIRED_LINT_PATHS: [&str; 273] = [
     "std::os::unix::process::parent_id",
     "std::backtrace::Backtrace::capture",
     "std::net::ToSocketAddrs::to_socket_addrs",
+    "core::arch::x86_64::__cpuid",
+    "core::arch::x86_64::__cpuid_count",
+    "core::arch::x86_64::__get_cpuid_max",
     "std::time::Instant",
     "std::time::SystemTime",
     "std::collections::HashMap",
@@ -321,10 +334,18 @@ const REQUIRED_LINT_PATHS: [&str; 273] = [
     "std::os::unix::net::UnixListener",
     "std::os::unix::net::UnixStream",
     "std::process::Command",
+    "std::arch::is_x86_feature_detected",
+    "std::arch::is_aarch64_feature_detected",
 ];
 
+/// The pinned entries that belong under `disallowed-macros`: run-time CPU feature detection
+/// (section 8.2, D28). Each is named under `std::arch`, which clippy resolves to the same
+/// macro as the root path `std::is_x86_feature_detected!`; the aarch64 one has no root path.
+const PINNED_MACROS: [&str; 2] =
+    ["std::arch::is_x86_feature_detected", "std::arch::is_aarch64_feature_detected"];
+
 /// The pinned entries that belong under `disallowed-types`, in the reference's order; every
-/// other pinned entry belongs under `disallowed-methods`.
+/// other pinned entry outside [`PINNED_MACROS`] belongs under `disallowed-methods`.
 const PINNED_TYPES: [&str; 37] = [
     "std::time::Instant",
     "std::time::SystemTime",
@@ -526,21 +547,23 @@ const OUTSIDE_WORLD: [&str; 17] = [
     "std::thread::Builder::",
 ];
 
-/// The two lint tables of a lint file.
-const LINT_TABLES: [&str; 2] = ["disallowed-methods", "disallowed-types"];
+/// The lint tables of a lint file.
+const LINT_TABLES: [&str; 3] = ["disallowed-methods", "disallowed-types", "disallowed-macros"];
 
 /// Lint levels that leave a lint weaker than `deny`.
 const WEAK_LEVELS: [&str; 3] = ["allow", "expect", "warn"];
 
 /// Whether `lint` is one of the lints that carry the boundary rules, or a group that contains
-/// them. `clippy::disallowed_methods` and `clippy::disallowed_types` are in `clippy::style`
-/// and `clippy::all`, and CI turns every warning into an error through `warnings`. Clippy
-/// still honours the lints' old names, `disallowed_method` and `disallowed_type`.
+/// them. `clippy::disallowed_methods`, `clippy::disallowed_types` and
+/// `clippy::disallowed_macros` are in `clippy::style` and `clippy::all`, and CI turns every
+/// warning into an error through `warnings`. Clippy still honours the first two lints' old
+/// names, `disallowed_method` and `disallowed_type`.
 fn is_boundary_lint(lint: &str) -> bool {
     matches!(
         lint.replace('-', "_").as_str(),
         "clippy::disallowed_methods"
             | "clippy::disallowed_types"
+            | "clippy::disallowed_macros"
             | "clippy::disallowed_method"
             | "clippy::disallowed_type"
             | "clippy::all"
@@ -595,6 +618,7 @@ pub fn check(tiers: &TierFile, policy: &Policy, ws: &Workspace, files: &Files) -
     }));
     harness_packages(policy, ws, files, &mut findings);
     simulation_assets(tiers, ws, files, &mut findings);
+    registered_outside_the_lint_file(tiers, policy, ws, files, &mut findings);
     workspace_lints(files, &mut findings);
     build_configuration(files, &mut findings);
     cargo_configs(files, &mut findings);
@@ -749,7 +773,13 @@ fn is_pinned(path: &str) -> bool {
 
 /// The lint table a pinned path belongs in.
 fn pinned_table(path: &str) -> &'static str {
-    if PINNED_TYPES.contains(&path) { "disallowed-types" } else { "disallowed-methods" }
+    if PINNED_TYPES.contains(&path) {
+        "disallowed-types"
+    } else if PINNED_MACROS.contains(&path) {
+        "disallowed-macros"
+    } else {
+        "disallowed-methods"
+    }
 }
 
 /// The reference lint file exists and still bans what section 8.2 bans.
@@ -780,7 +810,7 @@ fn reference_lint_file(files: &Files, findings: &mut Vec<Finding>) {
         })
         .collect();
     // The reference's entries are exactly the three lists, each in its table: none can be
-    // dropped from it and every copy at once or moved to the other table, and none added there
+    // dropped from it and every copy at once or moved to another table, and none added there
     // without being pinned here.
     for (table, path) in &banned {
         let wanted = pinned_table(path);
@@ -1057,7 +1087,8 @@ fn lint_attributes(package: &Package, kind: &str, files: &Files, findings: &mut 
                     format!(
                         "line {}: `{weakened}` {what} {kind} `{}`; the only sanctioned form is \
                          `#[expect(clippy::disallowed_methods, reason = \"...\")]` (or \
-                         `disallowed_types`) on the one item that needs it",
+                         `disallowed_types` or `disallowed_macros`) on the one item that needs \
+                         it",
                         attribute.line, package.name
                     ),
                 ));
@@ -1121,12 +1152,7 @@ fn harness_packages(policy: &Policy, ws: &Workspace, files: &Files, findings: &m
 /// type alias, a projection such as `<Self as Decodes>::Kind`) or a loader a macro writes is
 /// not seen, and a type outside the boundary that shares a kind's name is reported.
 fn simulation_assets(tiers: &TierFile, ws: &Workspace, files: &Files, findings: &mut Vec<Finding>) {
-    let shipped = |package: &Package| {
-        let listed = tiers.dev_only_features.get(&package.name).map_or(&[][..], Vec::as_slice);
-        let features: Vec<String> =
-            turning_on(package, listed).into_iter().map(str::to_owned).collect();
-        shipped_impls(package, files, &features)
-    };
+    let shipped = |package: &Package| shipped(tiers, package, files).impls;
     let (inside, outside): (Vec<&Package>, Vec<&Package>) =
         ws.packages.iter().partition(|package| tiers.in_boundary(&package.name));
     let kinds: BTreeSet<String> = inside
@@ -1164,6 +1190,71 @@ fn simulation_assets(tiers: &TierFile, ws: &Workspace, files: &Files, findings: 
     }
 }
 
+/// Project review 2, X1: what a world registers and runs is written under the boundary lint
+/// file. A crate that carries none, neither a boundary crate nor one of `[lint_file_carriers]`,
+/// ships no `#[system]`, no `#[component]` or `#[resource]` that is not `derived`, and no
+/// implementation of a trait through which the simulation applies what enters a tick
+/// ([`APPLYING_TRAITS`]), and no hand-written [`DESCRIBING_TRAIT`]; each is reported where it
+/// stands, unless only tests compile it.
+///
+/// The shipped code is read as [`simulation_assets`] reads it, and attributes and traits by
+/// their last path segment as written: one brought in under another name, produced by a macro
+/// the crate's source does not spell out (another crate's macro or derive), or inside a
+/// `cfg_attr`, is not seen.
+fn registered_outside_the_lint_file(
+    tiers: &TierFile,
+    policy: &Policy,
+    ws: &Workspace,
+    files: &Files,
+    findings: &mut Vec<Finding>,
+) {
+    let unlinted = ws.packages.iter().filter(|package| {
+        !tiers.in_boundary(&package.name) && !policy.lint_file_carriers.contains(&package.name)
+    });
+    for package in unlinted {
+        let Shipped { impls, declarations } = shipped(tiers, package, files);
+        let declared =
+            declarations.into_iter().filter(|(_, found)| !found.derived).map(|(file, found)| {
+                let what = match found.attribute {
+                    "system" => "`#[system]`".to_owned(),
+                    attribute => format!("`#[{attribute}]` that is not `derived`"),
+                };
+                (file, found.line, what)
+            });
+        let (described, impls): (Vec<_>, Vec<_>) =
+            impls.into_iter().partition(|(_, found)| found.trait_name == DESCRIBING_TRAIT);
+        let applied = impls
+            .into_iter()
+            .filter(|(_, found)| APPLYING_TRAITS.contains(&found.trait_name.as_str()))
+            .map(|(file, found)| (file, found.line, format!("`impl {}`", found.trait_name)));
+        for (file, line, what) in declared.chain(applied) {
+            findings.push(Finding::new(
+                file,
+                format!(
+                    "line {line}: {what} in `{}`, which carries no boundary lint file; what a \
+                     world registers and runs is written in a boundary crate or a crate of \
+                     [lint_file_carriers] in {POLICY_FILE}, under the lints of architecture \
+                     section 8.2, or only in tests",
+                    package.name
+                ),
+            ));
+        }
+        for (file, found) in described {
+            findings.push(Finding::new(
+                file,
+                format!(
+                    "line {}: a hand-written `impl {DESCRIBING_TRAIT}` in `{}`, which carries no \
+                     boundary lint file; it declares a component or a resource that no attribute \
+                     shows, and what a world stores is described in a boundary crate or a crate \
+                     of [lint_file_carriers] in {POLICY_FILE}, under the lints of architecture \
+                     section 8.2, or only in tests",
+                    found.line, package.name
+                ),
+            ));
+        }
+    }
+}
+
 /// What a loader outside the boundary decodes, said for a finding, if it may be a kind the
 /// simulation reads: its `type Asset` names one of `kinds` by its last path segment, names a
 /// type parameter of the implementation, or cannot be read.
@@ -1193,9 +1284,23 @@ fn loads_for_the_simulation(found: &Impl, kinds: &BTreeSet<String>) -> Option<St
         .then(|| format!("`{asset}`, which a boundary crate declares a `{SIMULATION_ASSET}`"))
 }
 
-/// Every trait implementation `package` ships, with its file, each once: the walk of
-/// [`simulation_assets`] over the package's module tree.
-fn shipped_impls(package: &Package, files: &Files, features: &[String]) -> Vec<(String, Impl)> {
+/// What a package ships, by [`shipped`].
+#[derive(Default)]
+struct Shipped {
+    /// Each trait implementation, with its file.
+    impls: Vec<(String, Impl)>,
+    /// Each declaring attribute, with its file.
+    declarations: Vec<(String, Declaration)>,
+}
+
+/// Every trait implementation and declaring attribute `package` ships, with its file, each
+/// once: the walk of [`simulation_assets`] over the package's module tree, without the
+/// features `[dev_only_features]` lists for it.
+fn shipped(tiers: &TierFile, package: &Package, files: &Files) -> Shipped {
+    let listed = tiers.dev_only_features.get(&package.name).map_or(&[][..], Vec::as_slice);
+    let features: Vec<String> =
+        turning_on(package, listed).into_iter().map(str::to_owned).collect();
+    let features = &features[..];
     // (file, the directory its out-of-line modules sit in, whether only tests compile it)
     let mut queue: VecDeque<(String, String, bool)> = package
         .shipped_roots
@@ -1205,7 +1310,8 @@ fn shipped_impls(package: &Package, files: &Files, features: &[String]) -> Vec<(
     // Each file read, under the directory it was read with, and whether it was read as
     // shipped: a file reached again as shipped after a test-only route is read again.
     let mut read: BTreeMap<(String, String), bool> = BTreeMap::new();
-    let mut found: BTreeMap<(String, usize), Impl> = BTreeMap::new();
+    let mut impls: BTreeMap<(String, usize), Impl> = BTreeMap::new();
+    let mut declarations: BTreeMap<(String, usize), Declaration> = BTreeMap::new();
     let mut sweep = true;
     loop {
         while let Some((file, dir, test_only)) = queue.pop_front() {
@@ -1222,8 +1328,14 @@ fn shipped_impls(package: &Package, files: &Files, features: &[String]) -> Vec<(
             for (child, child_dir, gated) in children(&file, &dir, &items, files) {
                 queue.push_back((child, child_dir, test_only || gated));
             }
-            for implementation in items.impls.into_iter().filter(|i| !test_only && !i.test_only) {
-                found.insert((file.clone(), implementation.line), implementation);
+            if test_only {
+                continue;
+            }
+            for implementation in items.impls.into_iter().filter(|i| !i.test_only) {
+                impls.insert((file.clone(), implementation.line), implementation);
+            }
+            for declaration in items.declarations.into_iter().filter(|d| !d.test_only) {
+                declarations.insert((file.clone(), declaration.line), declaration);
             }
         }
         if !std::mem::take(&mut sweep) {
@@ -1240,7 +1352,10 @@ fn shipped_impls(package: &Package, files: &Files, features: &[String]) -> Vec<(
             }
         }
     }
-    found.into_iter().map(|((file, _), implementation)| (file, implementation)).collect()
+    Shipped {
+        impls: impls.into_iter().map(|((file, _), found)| (file, found)).collect(),
+        declarations: declarations.into_iter().map(|((file, _), found)| (file, found)).collect(),
+    }
 }
 
 /// A boundary crate's `direct` lists name only crates its manifest names. A crate it only
@@ -1751,34 +1866,27 @@ mod tests {
     const FORBID: &str = "//! Docs.\n#![forbid(unsafe_code)]\n";
     const MANIFEST: &str = "[package]\nname = \"x\"\n[lints]\nworkspace = true\n";
 
-    /// Whether a pinned path belongs under `disallowed-methods` rather than
-    /// `disallowed-types`.
-    fn names_a_function(path: &str) -> bool {
-        pinned_table(path) == "disallowed-methods"
-    }
-
-    /// The line a fixture lint file holds for `path`: a function as a table, a type as a
-    /// plain string (the check reads both tables, and both forms, as one).
+    /// The line a fixture lint file holds for `path`: a type as a plain string, anything else
+    /// as a table (the check reads every table, and both forms, as one).
     fn entry(path: &str) -> String {
-        if names_a_function(path) {
-            format!("  {{ path = \"{path}\", reason = \"r\" }},\n")
-        } else {
+        if pinned_table(path) == "disallowed-types" {
             format!("  \"{path}\",\n")
+        } else {
+            format!("  {{ path = \"{path}\", reason = \"r\" }},\n")
         }
     }
 
-    /// A lint file of the pinned entries that `keep` keeps.
+    /// A lint file of the pinned entries that `keep` keeps, each in its table.
     fn lint_file_of(keep: impl Fn(&str) -> bool) -> String {
         let pinned = || REQUIRED_LINT_PATHS.iter().chain(&THREAD_ROUTES).chain(&NOT_THREAD_ROUTES);
-        let mut text = String::from("disallowed-methods = [\n");
-        for path in pinned().filter(|path| names_a_function(path) && keep(path)) {
-            text.push_str(&entry(path));
+        let mut text = String::new();
+        for table in LINT_TABLES {
+            text.push_str(&format!("{table} = [\n"));
+            for path in pinned().filter(|path| pinned_table(path) == table && keep(path)) {
+                text.push_str(&entry(path));
+            }
+            text.push_str("]\n");
         }
-        text.push_str("]\ndisallowed-types = [\n");
-        for path in pinned().filter(|path| !names_a_function(path) && keep(path)) {
-            text.push_str(&entry(path));
-        }
-        text.push_str("]\n");
         text
     }
 
@@ -1980,7 +2088,7 @@ mod tests {
         assert_eq!(
             run(&ws, &files),
             [
-                "crates/reflect-macros/src/lib.rs: line 3: `allow(clippy::disallowed_methods)` never goes stale, on an item of [lint_file_carriers] crate `lactose-reflect-macros`; the only sanctioned form is `#[expect(clippy::disallowed_methods, reason = \"...\")]` (or `disallowed_types`) on the one item that needs it"
+                "crates/reflect-macros/src/lib.rs: line 3: `allow(clippy::disallowed_methods)` never goes stale, on an item of [lint_file_carriers] crate `lactose-reflect-macros`; the only sanctioned form is `#[expect(clippy::disallowed_methods, reason = \"...\")]` (or `disallowed_types` or `disallowed_macros`) on the one item that needs it"
             ]
         );
     }
@@ -2140,17 +2248,16 @@ mod tests {
     }
 
     #[test]
-    fn any_ban_moved_to_the_other_table_in_the_reference_and_every_copy_is_reported() {
+    fn any_ban_moved_to_another_table_in_the_reference_and_every_copy_is_reported() {
         // Review round 1, F2: clippy reads a path only in its own table, so a method under
-        // `disallowed-types`, or a type under `disallowed-methods`, bans nothing.
+        // `disallowed-types`, or a type or a macro under `disallowed-methods`, bans nothing.
         let (ws, mut files) = conforming();
-        for path in REQUIRED_LINT_PATHS.iter().chain(&THREAD_ROUTES).chain(&NOT_THREAD_ROUTES) {
+        let pinned = REQUIRED_LINT_PATHS.iter().chain(&THREAD_ROUTES).chain(&NOT_THREAD_ROUTES);
+        let moves = pinned.flat_map(|path| {
             let wanted = pinned_table(path);
-            let other = if wanted == "disallowed-types" {
-                "disallowed-methods"
-            } else {
-                "disallowed-types"
-            };
+            LINT_TABLES.into_iter().filter(move |t| *t != wanted).map(move |t| (path, wanted, t))
+        });
+        for (path, wanted, other) in moves {
             let moved = lint_file()
                 .replace(&entry(path), "")
                 .replace(&format!("{other} = [\n"), &format!("{other} = [\n{}", entry(path)));
@@ -2170,6 +2277,38 @@ mod tests {
             );
             assert_eq!(found.len(), 2, "{path}: {found:?}");
         }
+    }
+
+    #[test]
+    fn run_time_feature_detection_stays_banned_and_its_lint_stays_on() {
+        // Project review 2, X3: section 8.2 bans run-time CPU feature detection that selects
+        // numerically different paths, and the macros are pinned in their own table.
+        let (ws, mut files) = conforming();
+        let table =
+            "disallowed-macros = [\n".to_owned() + &PINNED_MACROS.map(entry).concat() + "]\n";
+        assert!(lint_file().contains(&table));
+        let without = lint_file().replace(&table, "");
+        files.insert(REFERENCE_CLIPPY, without.clone());
+        files.insert("crates/math/clippy.toml", without);
+        assert_eq!(
+            run(&ws, &files),
+            PINNED_MACROS.map(|path| format!(
+                "crates/core/clippy.toml: no longer disallows `{path}` under `disallowed-macros`, which architecture section 8.2 bans inside the boundary"
+            ))
+        );
+        let (ws, mut files) = conforming();
+        files.insert(
+            "crates/math/src/lib.rs",
+            format!("{FORBID}#![allow(clippy::disallowed_macros)]\nfn f() {{}}\n"),
+        );
+        let found = run(&ws, &files);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(
+            found[0].starts_with(
+                "crates/math/src/lib.rs: line 3: `allow(clippy::disallowed_macros)` applies to a whole crate or module of boundary crate `lactose-math`"
+            ),
+            "{found:?}"
+        );
     }
 
     #[test]
@@ -2631,8 +2770,8 @@ mod tests {
         let unread = "which is not a source file in the repository, so the lint attributes of \
                       boundary crate `lactose-math` in it cannot be checked";
         let sanctioned = "the only sanctioned form is `#[expect(clippy::disallowed_methods, \
-                          reason = \"...\")]` (or `disallowed_types`) on the one item that \
-                          needs it";
+                          reason = \"...\")]` (or `disallowed_types` or `disallowed_macros`) on \
+                          the one item that needs it";
         assert_eq!(
             run(&ws, &files),
             [
@@ -3087,6 +3226,62 @@ mod tests {
             run(&ws, &files),
             [at("crates/task/src/lib.rs", 10), at("crates/task/src/suite.rs", 2)]
         );
+    }
+
+    #[test]
+    fn what_a_world_registers_outside_every_boundary_lint_file_is_reported() {
+        // Project review 2, X1: `task` carries no boundary lint file, `math` is a boundary crate.
+        let (ws, mut files) = conforming();
+        let game = "#[component(key = \"g::a\", persistent, replicated)]\nstruct A(u32);\n\
+                    #[lactose_ecs::system(name = \"g::s\", worlds = [server])]\nfn s() {}\n\
+                    #[resource(key = \"g::r\", transient)]\nstruct R;\n\
+                    #[component(key = \"g::d\", derived)]\nstruct D;\n\
+                    #[resource(key = \"g::e\", derived)]\nstruct E;\n\
+                    impl SessionApplier for S {}\n\
+                    impl lactose_sim::InputApplier for S {}\n\
+                    impl<T> StagedState for H<T> {}\n\
+                    impl Applier for S {}\n\
+                    impl lactose_reflect::Reflect for A {}\n\
+                    impl Reflected for A {}\n";
+        files.insert("crates/task/src/lib.rs", "mod game;\n");
+        files.insert("crates/task/src/game.rs", game);
+        let at = |line: usize, what: &str| {
+            format!(
+                "crates/task/src/game.rs: line {line}: {what} in `lactose-task`, which carries no boundary lint file; what a world registers and runs is written in a boundary crate or a crate of [lint_file_carriers] in {POLICY_FILE}, under the lints of architecture section 8.2, or only in tests"
+            )
+        };
+        assert_eq!(
+            run(&ws, &files),
+            [
+                at(1, "`#[component]` that is not `derived`"),
+                at(3, "`#[system]`"),
+                at(5, "`#[resource]` that is not `derived`"),
+                at(11, "`impl SessionApplier`"),
+                at(12, "`impl InputApplier`"),
+                at(13, "`impl StagedState`"),
+                format!(
+                    "crates/task/src/game.rs: line 15: a hand-written `impl Reflect` in `lactose-task`, which carries no boundary lint file; it declares a component or a resource that no attribute shows, and what a world stores is described in a boundary crate or a crate of [lint_file_carriers] in {POLICY_FILE}, under the lints of architecture section 8.2, or only in tests"
+                ),
+            ]
+        );
+
+        // Compiled only for tests, in a boundary crate, or in a lint-file carrier.
+        let (ws, mut files) = conforming();
+        files.insert(
+            "crates/task/src/lib.rs",
+            format!("#[cfg(test)]\nmod game;\n#[cfg(test)]\nmod inline {{\n{game}}}\n"),
+        );
+        files.insert("crates/task/src/game.rs", game);
+        files.insert("crates/task/tests/game.rs", game);
+        files.insert("crates/math/src/lib.rs", format!("{FORBID}{game}"));
+        assert_eq!(run(&ws, &files), NONE);
+        files.insert("crates/task/src/lib.rs", "mod game;\n");
+        files.insert("crates/task/clippy.toml", lint_file());
+        let mut carriers = policy();
+        carriers.lint_file_carriers.push("lactose-task".to_owned());
+        assert_eq!(run_with(&carriers, &ws, &files), NONE);
+        let unlisted = run(&ws, &files);
+        assert_eq!(unlisted.iter().filter(|f| f.contains("no boundary lint file")).count(), 7);
     }
 
     /// What row 66 reports for an `impl SimulationAsset` at `line` of `file` in `lactose-task`.

@@ -1,4 +1,4 @@
-//! The integration tests of `lactose-math` as one test binary (D125): each file beside this one is
+//! The integration tests of `lactose-math` as one test binary (D150): each file beside this one is
 //! a module of it, named after the file. `common`, the support they share, is declared once here.
 
 #![forbid(unsafe_code)]

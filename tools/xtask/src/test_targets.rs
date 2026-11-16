@@ -1,4 +1,4 @@
-//! Each package's integration tests build as one test binary (D125): the target
+//! Each package's integration tests build as one test binary (D150): the target
 //! `integration`, whose root `tests/integration.rs` declares every other file of `tests/` as a
 //! module, with `autotests = false` in the manifest so that cargo makes no target of each file.
 //! A test target that must stay a binary of its own is listed, with its reason, in the policy
@@ -75,7 +75,7 @@ fn targets(policy: &Policy, package: &Package, findings: &mut Vec<Finding>) {
             format!(
                 "`{}` builds {} test targets outside [test_targets] in {POLICY_FILE}: {}; build \
                  them as one, the target `{TARGET}` whose root `tests/{TARGET}.rs` declares each \
-                 file as a module, with `autotests = false` (D125), or list a target that must \
+                 file as a module, with `autotests = false` (D150), or list a target that must \
                  be a binary of its own there with its reason",
                 package.name,
                 joined.len(),
@@ -146,7 +146,7 @@ fn files_and_modules(
             path,
             format!(
                 "no test target of `{}` compiles this file: declare it as a module of \
-                 `tests/{TARGET}.rs` (D125)",
+                 `tests/{TARGET}.rs` (D150)",
                 package.name
             ),
         ));
@@ -294,7 +294,7 @@ mod tests {
         ];
         let found = run(&policy(&[]), &["integration"], &files);
         let message = "no test target of `lactose-sim` compiles this file: declare it as a \
-                       module of `tests/integration.rs` (D125)";
+                       module of `tests/integration.rs` (D150)";
         assert_eq!(
             found,
             [
@@ -339,7 +339,7 @@ mod tests {
         assert_eq!(
             found,
             ["crates/sim/tests/helper.rs: no test target of `lactose-sim` compiles this file: \
-                 declare it as a module of `tests/integration.rs` (D125)"]
+                 declare it as a module of `tests/integration.rs` (D150)"]
         );
     }
 

@@ -1,4 +1,4 @@
-//! The integration tests of `lactose-physics-rapier` as one test binary (D125): each file beside
+//! The integration tests of `lactose-physics-rapier` as one test binary (D150): each file beside
 //! this one is a module of it, named after the file. `common` and `support`, the support they
 //! share, are declared once here. `global_pool.rs` and `memory.rs` are targets of their own, for
 //! the reasons `Cargo.toml` gives. A file whose name is a codename is a module named for what it

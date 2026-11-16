@@ -185,6 +185,10 @@ struct Args {
 }
 
 impl Args {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the command line is the binary's, read once before the run; no world sees it"
+    )]
     fn parse() -> Result<Self> {
         let usage =
             || Error::new(ErrorKind::InvalidData, "usage: lactose-app-headless [TICKS] [SLOT]");

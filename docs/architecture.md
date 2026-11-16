@@ -711,16 +711,22 @@ neither reaches a dependency's build. Chaos runs record the job execution log so
 replays exactly. The one-row capacity uses a matching small slab.
 
 Static enforcement uses stable tooling: `clippy.toml` per boundary crate with
-`disallowed-methods` and `disallowed-types` (thread-locals are banned through
-`std::thread::LocalKey`, since a local exception cannot reach an item macro); the boundary
-dependency allowlist in `crate-tiers.toml`, checked by `cargo xtask boundary`, directly and through
+`disallowed-methods`, `disallowed-types` and `disallowed-macros` (thread-locals are banned
+through `std::thread::LocalKey`, since a local exception cannot reach an item macro; run-time
+CPU feature detection through `std::arch::is_x86_feature_detected!` and
+`std::arch::is_aarch64_feature_detected!`, expression macros the lint reaches, and on x86-64
+through CPUID read directly, `core::arch::x86_64::__cpuid`, `__cpuid_count` and
+`__get_cpuid_max`, by any path or name); the boundary dependency allowlist in
+`crate-tiers.toml`, checked by `cargo xtask boundary`, directly and through
 the workspace closure; `cargo-deny` with `multiple-versions = "deny"` for shared crates; `cargo
 xtask vendor` for each crate built from `vendor/` (section 8.2): offline, the copy is its patch
 applied to its record and the patch is within the rule; online, the record is re-derived from the
 crates.io archive and the advisory check runs over the upstream versions, which `cargo-deny` skips
 behind a path source. The two proc-macro crates carry the boundary `clippy.toml` as well, since the
-code they emit is compiled inside boundary crates. `cargo xtask boundary` holds every entry of the
-reference `clippy.toml`, and its table, to the lists in `tools/xtask`, and `[harness]` in
+code they emit is compiled inside boundary crates, and `lactose-app-headless` carries it for its
+sketch game; `[lint_file_carriers]` in `tools/xtask/ci-policy.toml` lists the three.
+`cargo xtask boundary` holds every entry of the reference `clippy.toml`, and its table, to the
+lists in `tools/xtask`, and `[harness]` in
 `tools/xtask/ci-policy.toml` to the packages that include the harness protocol;
 `cargo xtask sour run` holds the tests that record hashes to the list beside it.
 No custom lint crate. Miri runs on nightly as the one exception to the stable-toolchain rule.

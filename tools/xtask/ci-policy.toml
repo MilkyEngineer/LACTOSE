@@ -15,9 +15,11 @@ crates = [
 
 # Crates outside [boundary] that still carry the boundary lint file, a byte-identical copy of
 # crates/core/clippy.toml. The proc-macro crates do, because the code they write is compiled
-# inside boundary crates and should be written under the same lints.
+# inside boundary crates and should be written under the same lints. The headless binary
+# does, because its sketch game declares what a world registers and runs, which `cargo xtask
+# boundary` allows only under this file (project review 2, X1).
 [lint_file_carriers]
-crates = ["lactose-reflect-macros", "lactose-ecs-macros"]
+crates = ["lactose-reflect-macros", "lactose-ecs-macros", "lactose-app-headless"]
 
 # Architecture section 8.3: the shipped binaries, whose boundary feature trees must be
 # identical to each other and to those of the [harness] packages. Every workspace package
@@ -47,6 +49,8 @@ packages = [
 tests = [
   "lactose_anim::sour::a_prediction_crowd_with_a_rollback",
   "lactose_anim::sour::a_server_crowd_with_ragdolls",
+  "lactose_app::cost::bone_bodies_on_rapier_are_recorded",
+  "lactose_app::cost::bone_bodies_on_rapier_are_recorded::physics",
   "lactose_app::headless::a_recorded_headless_run",
   "lactose_app::headless::a_recorded_headless_run::physics",
   "lactose_app::spike::a_claim_in_contact_is_recorded",
@@ -94,7 +98,7 @@ tests = [
 [miri_split]
 packages = ["lactose-ecs"]
 
-# D125: a package with more than one integration test file builds them as one test binary,
+# D150: a package with more than one integration test file builds them as one test binary,
 # the target `integration`, whose root `tests/integration.rs` declares every other file of
 # `tests/` as a module named after the file (`autotests = false` in the manifest), or under a
 # name for what it holds, with `#[path]`, where the file's name is a codename (CLAUDE.md,

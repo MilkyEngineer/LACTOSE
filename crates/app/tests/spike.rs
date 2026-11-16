@@ -2639,15 +2639,16 @@ fn check_outcome(plan: Plan, outcome: &Outcome) {
 
 // ---- Under SOUR ----
 
-/// What a recording test builds from the runner's session.
-struct RunnerSession {
-    session: Session,
-    executor: Executor,
-    layout: LayoutConfig,
+/// What a recording test builds from the runner's session; `cost`'s bone scene records
+/// through it too.
+pub(crate) struct RunnerSession {
+    pub(crate) session: Session,
+    pub(crate) executor: Executor,
+    pub(crate) layout: LayoutConfig,
 }
 
 impl RunnerSession {
-    fn from_env() -> Result<Self> {
+    pub(crate) fn from_env() -> Result<Self> {
         let session = Session::from_env().map_err(protocol_error)?;
         let config = *session.config();
         let layout = match config.layout {
@@ -2668,7 +2669,7 @@ impl RunnerSession {
     }
 
     /// Opens a recorder with what the executor and `world` report they were built with.
-    fn recorder(&self, test: &str, world: &World) -> Result<protocol::Recorder> {
+    pub(crate) fn recorder(&self, test: &str, world: &World) -> Result<protocol::Recorder> {
         let config = self.session.config();
         let applied = RunConfig {
             workers: config.workers.map(|_| {
@@ -2681,7 +2682,7 @@ impl RunnerSession {
     }
 }
 
-fn protocol_error(error: protocol::ProtocolError) -> Error {
+pub(crate) fn protocol_error(error: protocol::ProtocolError) -> Error {
     Error::new(ErrorKind::InvalidData, error.to_string())
 }
 

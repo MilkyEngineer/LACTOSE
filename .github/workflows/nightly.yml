@@ -13,7 +13,8 @@ env:
   # A dated nightly, so Miri breaks only when this line changes.
   MIRI_TOOLCHAIN: nightly-2026-10-04
 
-# Architecture section 20: Miri, loom, the full SOUR matrix and architecture mode run nightly.
+# Architecture section 20: Miri, loom, the full SOUR matrix and architecture mode run nightly,
+# and a SOUR baseline built with the release profile beside each platform's dev one.
 jobs:
   # One job per crate, so each has the whole time limit and a timeout drops only its own
   # crate. As one job it took 38 to 57 minutes of its 60 in the green nightlies of 5 to 13
@@ -42,7 +43,7 @@ jobs:
             miriflags: -Zmiri-tree-borrows -Zmiri-ignore-leaks
           # `lactose-ecs` in four: the tests of its slowest test file, the binaries of their own
           # (`ownership`, the next slowest, among them), every other test, and the doc tests,
-          # which cargo runs alone. Its other integration tests are one binary (D125), so the
+          # which cargo runs alone. Its other integration tests are one binary (D150), so the
           # first and third entries divide the tests of the targets they select by path: the
           # third skips the filter the first names, which `cargo xtask boundary` checks.
           - name: ecs, erased rows
@@ -169,13 +170,24 @@ jobs:
       - name: Every mode
         run: cargo xtask sour run --nightly --emit sour-hashes-${{ matrix.platform }}.tsv
       # Uploaded whenever the run got far enough to write them, findings or not, so the
-      # comparison below sees every platform that produced a file.
+      # comparison below sees every platform that produced a file; before the release steps, so
+      # a timeout in them cannot cost the dev baseline its upload.
       - name: Keep the baseline hashes
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@v4
         with:
           name: sour-hashes-${{ matrix.platform }}
           path: sour-hashes-${{ matrix.platform }}.tsv
+      # Every hash above comes from a dev build. The release profile drops debug assertions
+      # and overflow checks, so code whose result depends on them would hash differently: one
+      # baseline run built with it, held to this platform's dev baseline. It runs whatever the
+      # modes above found, and a missing file fails the comparison.
+      - name: Release baseline
+        if: ${{ !cancelled() }}
+        run: cargo xtask sour run --mode architecture --release --emit sour-hashes-release-${{ matrix.platform }}.tsv
+      - name: Release against dev
+        if: ${{ !cancelled() }}
+        run: cargo xtask sour compare sour-hashes-${{ matrix.platform }}.tsv sour-hashes-release-${{ matrix.platform }}.tsv
       # Hash files of every run, and the execution log of any chaos test that failed, so
       # the failure replays exactly.
       - name: Keep SOUR output
@@ -183,7 +195,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: sour-output-${{ matrix.platform }}
-          path: target/sour
+          path: |
+            target/sour
+            target/sour-release
           if-no-files-found: ignore
 
   # Architecture mode: the baseline hashes of every platform must be identical. It runs
