@@ -4990,8 +4990,13 @@ relayed by an event when it acts on another body** (§6.1, §10, `lactose-ecs`,
   of a core at 60 Hz and 4.4% at a 2 ms period, and a 300 µs spin gave 12.1 and 21.0 µs for 1.3%
   of a core. That is not the under 6 µs of D116's fast state, so what separates the two states
   is not found; D116 saw both at similar load. None holds 20 µs, so none ships, and D113's
-  rejection of a warm sleeper stands. A longer spin without the reads does nothing: 50 to
-  1,000 µs gave P99 29.6 to 32.5 µs. Rules out a second attempt, as decided.
+  rejection of a warm sleeper stands. A longer spin without the reads does nothing: on the
+  probe build, 2,000 deadlines a spin, 50 to 1,000 µs gave P99 29.6 to 32.5 µs. That sweep
+  steers only. The lane's report gives one load average a spin, 1.81 to 3.14, beside figures
+  of which two (50 and 500 µs) its surviving dumps, quoted here, do not repeat, so no load is
+  recorded for these figures; and its 50 µs point, the shipped spin, gave 31.1 µs where the
+  shipped benchmark gave 23.29 to 24.38 µs above. Within the sweep the comparison holds. Rules
+  out a second attempt, as decided.
   - Replaced: on macOS and Linux, D113's tick-start figure, which becomes 35 µs at P99 at 60 Hz,
     and D113's premise that a stepped park with a 50 µs spin meets 20 µs; D144's "macOS and
     Linux keep 20 µs".

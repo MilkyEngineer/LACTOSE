@@ -595,7 +595,8 @@ gather compare it with the last tick they covered, and zero means never.
 - `PhysicsSnapshot::size_in_bytes` is the backend's part. A prediction world holds at most 64
   fixed colliders and proxies together as rows (D139, architecture section 10). At that count,
   with the spike's fifty thrown bodies, the physics snapshot took 135.2 µs and its restore
-  180.6 µs on a quiet Apple M1 (`docs/results/prediction-slot-apple-m1-2026-11-15.md`), over
+  180.6 µs on a quiet Apple M1 (the byte form's first quiet window,
+  `1d8042e:docs/results/prediction-slot-apple-m1-2026-11-15.md`), over
   section 22's 100 µs before the world's part. A slot therefore holds the backend's world
   as a copy, and these bytes stay for the fresh solver, the journal checkpoint and the hash
   (D143). `size_in_bytes` and `hash` are of the bytes the backend would write, not of what
