@@ -41,13 +41,13 @@ const PIN_FLAGS: [&str; 2] = ["-C", "target-cpu=x86-64-v3"];
 /// Every entry of the reference lint file that is neither a thread route nor in
 /// [`NOT_THREAD_ROUTES`], in the file's order: the float methods and the trait routes to them,
 /// the executor's worker index and the methods of its re-export, files, the environment,
-/// subprocesses and the network, and the types. The check requires the reference's entries
-/// to be exactly this list, [`THREAD_ROUTES`] and [`NOT_THREAD_ROUTES`], each in the table
-/// [`pinned_table`] names, so a ban deleted from the reference and every copy is reported, and
-/// so is one moved to the other table, where clippy no longer applies it, or one added without
-/// being pinned here. `allow-invalid` keeps clippy quiet about an entry whatever happens to
-/// it, and no test uses most of them.
-const REQUIRED_LINT_PATHS: [&str; 273] = [
+/// subprocesses and the network, the types, and the macros of run-time CPU feature detection.
+/// The check requires the reference's entries to be exactly this list, [`THREAD_ROUTES`] and
+/// [`NOT_THREAD_ROUTES`], each in the table [`pinned_table`] names, so a ban deleted from the
+/// reference and every copy is reported, and so is one moved to another table, where clippy
+/// no longer applies it, or one added without being pinned here. `allow-invalid` keeps clippy
+/// quiet about an entry whatever happens to it, and no test uses most of them.
+const REQUIRED_LINT_PATHS: [&str; 275] = [
     "f32::min",
     "f32::max",
     "f32::clamp",
@@ -321,10 +321,18 @@ const REQUIRED_LINT_PATHS: [&str; 273] = [
     "std::os::unix::net::UnixListener",
     "std::os::unix::net::UnixStream",
     "std::process::Command",
+    "std::arch::is_x86_feature_detected",
+    "std::arch::is_aarch64_feature_detected",
 ];
 
+/// The pinned entries that belong under `disallowed-macros`: run-time CPU feature detection
+/// (section 8.2, D28). Each is named under `std::arch`, which clippy resolves to the same
+/// macro as the root path `std::is_x86_feature_detected!`; the aarch64 one has no root path.
+const PINNED_MACROS: [&str; 2] =
+    ["std::arch::is_x86_feature_detected", "std::arch::is_aarch64_feature_detected"];
+
 /// The pinned entries that belong under `disallowed-types`, in the reference's order; every
-/// other pinned entry belongs under `disallowed-methods`.
+/// other pinned entry outside [`PINNED_MACROS`] belongs under `disallowed-methods`.
 const PINNED_TYPES: [&str; 37] = [
     "std::time::Instant",
     "std::time::SystemTime",
@@ -526,21 +534,23 @@ const OUTSIDE_WORLD: [&str; 17] = [
     "std::thread::Builder::",
 ];
 
-/// The two lint tables of a lint file.
-const LINT_TABLES: [&str; 2] = ["disallowed-methods", "disallowed-types"];
+/// The lint tables of a lint file.
+const LINT_TABLES: [&str; 3] = ["disallowed-methods", "disallowed-types", "disallowed-macros"];
 
 /// Lint levels that leave a lint weaker than `deny`.
 const WEAK_LEVELS: [&str; 3] = ["allow", "expect", "warn"];
 
 /// Whether `lint` is one of the lints that carry the boundary rules, or a group that contains
-/// them. `clippy::disallowed_methods` and `clippy::disallowed_types` are in `clippy::style`
-/// and `clippy::all`, and CI turns every warning into an error through `warnings`. Clippy
-/// still honours the lints' old names, `disallowed_method` and `disallowed_type`.
+/// them. `clippy::disallowed_methods`, `clippy::disallowed_types` and
+/// `clippy::disallowed_macros` are in `clippy::style` and `clippy::all`, and CI turns every
+/// warning into an error through `warnings`. Clippy still honours the first two lints' old
+/// names, `disallowed_method` and `disallowed_type`.
 fn is_boundary_lint(lint: &str) -> bool {
     matches!(
         lint.replace('-', "_").as_str(),
         "clippy::disallowed_methods"
             | "clippy::disallowed_types"
+            | "clippy::disallowed_macros"
             | "clippy::disallowed_method"
             | "clippy::disallowed_type"
             | "clippy::all"
@@ -749,7 +759,13 @@ fn is_pinned(path: &str) -> bool {
 
 /// The lint table a pinned path belongs in.
 fn pinned_table(path: &str) -> &'static str {
-    if PINNED_TYPES.contains(&path) { "disallowed-types" } else { "disallowed-methods" }
+    if PINNED_TYPES.contains(&path) {
+        "disallowed-types"
+    } else if PINNED_MACROS.contains(&path) {
+        "disallowed-macros"
+    } else {
+        "disallowed-methods"
+    }
 }
 
 /// The reference lint file exists and still bans what section 8.2 bans.
@@ -780,7 +796,7 @@ fn reference_lint_file(files: &Files, findings: &mut Vec<Finding>) {
         })
         .collect();
     // The reference's entries are exactly the three lists, each in its table: none can be
-    // dropped from it and every copy at once or moved to the other table, and none added there
+    // dropped from it and every copy at once or moved to another table, and none added there
     // without being pinned here.
     for (table, path) in &banned {
         let wanted = pinned_table(path);
@@ -1057,7 +1073,8 @@ fn lint_attributes(package: &Package, kind: &str, files: &Files, findings: &mut 
                     format!(
                         "line {}: `{weakened}` {what} {kind} `{}`; the only sanctioned form is \
                          `#[expect(clippy::disallowed_methods, reason = \"...\")]` (or \
-                         `disallowed_types`) on the one item that needs it",
+                         `disallowed_types` or `disallowed_macros`) on the one item that needs \
+                         it",
                         attribute.line, package.name
                     ),
                 ));
@@ -1751,34 +1768,27 @@ mod tests {
     const FORBID: &str = "//! Docs.\n#![forbid(unsafe_code)]\n";
     const MANIFEST: &str = "[package]\nname = \"x\"\n[lints]\nworkspace = true\n";
 
-    /// Whether a pinned path belongs under `disallowed-methods` rather than
-    /// `disallowed-types`.
-    fn names_a_function(path: &str) -> bool {
-        pinned_table(path) == "disallowed-methods"
-    }
-
-    /// The line a fixture lint file holds for `path`: a function as a table, a type as a
-    /// plain string (the check reads both tables, and both forms, as one).
+    /// The line a fixture lint file holds for `path`: a type as a plain string, anything else
+    /// as a table (the check reads every table, and both forms, as one).
     fn entry(path: &str) -> String {
-        if names_a_function(path) {
-            format!("  {{ path = \"{path}\", reason = \"r\" }},\n")
-        } else {
+        if pinned_table(path) == "disallowed-types" {
             format!("  \"{path}\",\n")
+        } else {
+            format!("  {{ path = \"{path}\", reason = \"r\" }},\n")
         }
     }
 
-    /// A lint file of the pinned entries that `keep` keeps.
+    /// A lint file of the pinned entries that `keep` keeps, each in its table.
     fn lint_file_of(keep: impl Fn(&str) -> bool) -> String {
         let pinned = || REQUIRED_LINT_PATHS.iter().chain(&THREAD_ROUTES).chain(&NOT_THREAD_ROUTES);
-        let mut text = String::from("disallowed-methods = [\n");
-        for path in pinned().filter(|path| names_a_function(path) && keep(path)) {
-            text.push_str(&entry(path));
+        let mut text = String::new();
+        for table in LINT_TABLES {
+            text.push_str(&format!("{table} = [\n"));
+            for path in pinned().filter(|path| pinned_table(path) == table && keep(path)) {
+                text.push_str(&entry(path));
+            }
+            text.push_str("]\n");
         }
-        text.push_str("]\ndisallowed-types = [\n");
-        for path in pinned().filter(|path| !names_a_function(path) && keep(path)) {
-            text.push_str(&entry(path));
-        }
-        text.push_str("]\n");
         text
     }
 
@@ -1980,7 +1990,7 @@ mod tests {
         assert_eq!(
             run(&ws, &files),
             [
-                "crates/reflect-macros/src/lib.rs: line 3: `allow(clippy::disallowed_methods)` never goes stale, on an item of [lint_file_carriers] crate `lactose-reflect-macros`; the only sanctioned form is `#[expect(clippy::disallowed_methods, reason = \"...\")]` (or `disallowed_types`) on the one item that needs it"
+                "crates/reflect-macros/src/lib.rs: line 3: `allow(clippy::disallowed_methods)` never goes stale, on an item of [lint_file_carriers] crate `lactose-reflect-macros`; the only sanctioned form is `#[expect(clippy::disallowed_methods, reason = \"...\")]` (or `disallowed_types` or `disallowed_macros`) on the one item that needs it"
             ]
         );
     }
@@ -2140,17 +2150,16 @@ mod tests {
     }
 
     #[test]
-    fn any_ban_moved_to_the_other_table_in_the_reference_and_every_copy_is_reported() {
+    fn any_ban_moved_to_another_table_in_the_reference_and_every_copy_is_reported() {
         // Review round 1, F2: clippy reads a path only in its own table, so a method under
-        // `disallowed-types`, or a type under `disallowed-methods`, bans nothing.
+        // `disallowed-types`, or a type or a macro under `disallowed-methods`, bans nothing.
         let (ws, mut files) = conforming();
-        for path in REQUIRED_LINT_PATHS.iter().chain(&THREAD_ROUTES).chain(&NOT_THREAD_ROUTES) {
+        let pinned = REQUIRED_LINT_PATHS.iter().chain(&THREAD_ROUTES).chain(&NOT_THREAD_ROUTES);
+        let moves = pinned.flat_map(|path| {
             let wanted = pinned_table(path);
-            let other = if wanted == "disallowed-types" {
-                "disallowed-methods"
-            } else {
-                "disallowed-types"
-            };
+            LINT_TABLES.into_iter().filter(move |t| *t != wanted).map(move |t| (path, wanted, t))
+        });
+        for (path, wanted, other) in moves {
             let moved = lint_file()
                 .replace(&entry(path), "")
                 .replace(&format!("{other} = [\n"), &format!("{other} = [\n{}", entry(path)));
@@ -2170,6 +2179,38 @@ mod tests {
             );
             assert_eq!(found.len(), 2, "{path}: {found:?}");
         }
+    }
+
+    #[test]
+    fn run_time_feature_detection_stays_banned_and_its_lint_stays_on() {
+        // Project review 2, X3: section 8.2 bans run-time CPU feature detection that selects
+        // numerically different paths, and the macros are pinned in their own table.
+        let (ws, mut files) = conforming();
+        let table =
+            "disallowed-macros = [\n".to_owned() + &PINNED_MACROS.map(entry).concat() + "]\n";
+        assert!(lint_file().contains(&table));
+        let without = lint_file().replace(&table, "");
+        files.insert(REFERENCE_CLIPPY, without.clone());
+        files.insert("crates/math/clippy.toml", without);
+        assert_eq!(
+            run(&ws, &files),
+            PINNED_MACROS.map(|path| format!(
+                "crates/core/clippy.toml: no longer disallows `{path}` under `disallowed-macros`, which architecture section 8.2 bans inside the boundary"
+            ))
+        );
+        let (ws, mut files) = conforming();
+        files.insert(
+            "crates/math/src/lib.rs",
+            format!("{FORBID}#![allow(clippy::disallowed_macros)]\nfn f() {{}}\n"),
+        );
+        let found = run(&ws, &files);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(
+            found[0].starts_with(
+                "crates/math/src/lib.rs: line 3: `allow(clippy::disallowed_macros)` applies to a whole crate or module of boundary crate `lactose-math`"
+            ),
+            "{found:?}"
+        );
     }
 
     #[test]
@@ -2631,8 +2672,8 @@ mod tests {
         let unread = "which is not a source file in the repository, so the lint attributes of \
                       boundary crate `lactose-math` in it cannot be checked";
         let sanctioned = "the only sanctioned form is `#[expect(clippy::disallowed_methods, \
-                          reason = \"...\")]` (or `disallowed_types`) on the one item that \
-                          needs it";
+                          reason = \"...\")]` (or `disallowed_types` or `disallowed_macros`) on \
+                          the one item that needs it";
         assert_eq!(
             run(&ws, &files),
             [

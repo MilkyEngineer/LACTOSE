@@ -70,16 +70,19 @@ on, and a listed feature the crate does not declare are findings.
   entries under `rayon::`, `rapier3d_f64::`, `parry3d_f64::` or `std::thread::` that start
   no thread (`NOT_THREAD_ROUTES`), or in `REQUIRED_LINT_PATHS`, the rest in the reference's
   order. Each is pinned with its table: `PINNED_TYPES` lists the entries that belong under
-  `disallowed-types`, every other one belongs under `disallowed-methods`, and clippy applies
-  a path only in its own table. An entry the file drops or moves to the other table, and an
-  entry it adds that none of the three lists holds, are findings, so the reference's banned
-  set equals the union of the three, each entry in its table. `tests/boundary_lints.rs` runs
-  clippy with the reference over a probe that calls each route D119 bans through the
-  solver's math crates (simba, num-traits, num-complex, glam, glamx, approx), one line per
-  route, and requires every line refused: each of those entries carries `allow-invalid`,
-  which would otherwise hide a path that stopped resolving. Rapier's `RevoluteJoint::angle`
-  and parry's `VectorExt::angle` are pinned but not in that probe, which does not compile
-  Rapier.
+  `disallowed-types`, `PINNED_MACROS` the two of `disallowed-macros` (run-time CPU feature
+  detection, `std::arch::is_x86_feature_detected` and `std::arch::is_aarch64_feature_detected`,
+  section 8.2), every other one belongs under `disallowed-methods`, and clippy applies a path
+  only in its own table. An entry the file drops or moves to another table, and an entry it
+  adds that none of the three lists holds, are findings, so the reference's banned set equals
+  the union of the three, each entry in its table. `tests/boundary_lints.rs` runs clippy with
+  the reference over a probe that calls each route D119 bans through the solver's math crates
+  (simba, num-traits, num-complex, glam, glamx, approx), one line per route, and requires
+  every line refused: each of those entries carries `allow-invalid`, which would otherwise
+  hide a path that stopped resolving. The same probe calls the feature detection macro of the
+  target it is built for (the x86 one by its root path, `std::is_x86_feature_detected!`) and
+  requires it refused. Rapier's `RevoluteJoint::angle` and parry's `VectorExt::angle` are
+  pinned but not in that probe, which does not compile Rapier.
 - Each other crate of `[boundary_internal] any` compiles into every boundary crate and has a
   `clippy.toml` whose entries under the paths that reach files, the environment, a
   subprocess or the network, or create a thread through the standard library (`OUTSIDE_WORLD` in `src/boundary.rs`), are
@@ -90,7 +93,8 @@ on, and a listed feature the crate does not declare are findings.
   reference's entries that cite section 8.2, so an entry added there is not missed.
 - Nothing switches the boundary lints off. In a boundary crate, a crate of
   `[lint_file_carriers]` or a crate of `[boundary_internal] any`, `allow`, `expect` or
-  `warn` of `clippy::disallowed_methods`, `clippy::disallowed_types`, their old names
+  `warn` of `clippy::disallowed_methods`, `clippy::disallowed_types`,
+  `clippy::disallowed_macros`, the first two's old names
   `clippy::disallowed_method` and `clippy::disallowed_type`, `clippy::all`, `clippy::style`
   or `warnings` is a finding as an inner attribute anywhere or as an outer attribute on a
   `mod`, and `allow` or `warn` of them is a finding on any item, since only an `expect`

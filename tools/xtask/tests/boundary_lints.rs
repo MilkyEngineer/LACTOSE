@@ -6,7 +6,8 @@
 //! moves in an upgrade, would ban nothing and say nothing. This proves each such route is
 //! refused by the def ids clippy resolves, at the versions the repository's lock holds, which
 //! are in the registry cache wherever this package is built (the physics backend compiles
-//! them).
+//! them). The same probe proves the run-time CPU feature detection of the target it is built
+//! for refused under `disallowed-macros` (section 8.2), by the root path as by `std::arch`.
 
 #![forbid(unsafe_code)]
 
@@ -27,8 +28,9 @@ fn write(path: &Path, contents: &str) {
 }
 
 /// Each line of the probe that clippy must refuse, and the path its finding names: one line
-/// per route of D119 banned by trait path, inherent method of a dependency or type.
-const REFUSED: [(&str, &str); 101] = [
+/// per route of D119 banned by trait path, inherent method of a dependency or type, and the
+/// feature detection macro of the target.
+const REFUSED: [(&str, &str); 102] = [
     ("use num_traits::Float;", "num_traits::Float"),
     ("pub fn generic<T: num_traits::real::Real>(x: T) -> T { x.sin() }", "num_traits::real::Real"),
     (
@@ -266,6 +268,17 @@ const REFUSED: [(&str, &str); 101] = [
     ("pub fn widef64x4(_: simba::simd::WideF64x4) {}", "simba::simd::WideF64x4"),
     // The control: the inherent method the routes reach is refused as it always was.
     ("pub fn control(x: f64) -> f64 { x.max(0.0) }", "f64::max"),
+    // Each CI platform is x86-64 or aarch64, and each target has only its own macro: the line
+    // calls the x86 one by its root path, which clippy reports under `std::arch`.
+    (
+        "#[cfg(target_arch = \"x86_64\")] pub fn detect() -> bool { std::is_x86_feature_detected!(\"avx2\") } \
+         #[cfg(target_arch = \"aarch64\")] pub fn detect() -> bool { std::arch::is_aarch64_feature_detected!(\"sve\") }",
+        if cfg!(target_arch = "x86_64") {
+            "std::arch::is_x86_feature_detected"
+        } else {
+            "std::arch::is_aarch64_feature_detected"
+        },
+    ),
 ];
 
 /// What the lines of [`REFUSED`] call, after them.
@@ -297,6 +310,7 @@ fn the_routes_to_the_platform_float_library_are_refused() {
     let output = Command::new(cargo())
         .args(["clippy", "--offline", "--quiet", "--message-format", "short", "--"])
         .args(["-D", "clippy::disallowed_methods", "-D", "clippy::disallowed_types"])
+        .args(["-D", "clippy::disallowed_macros"])
         .current_dir(&ws)
         .env("CARGO_TARGET_DIR", base.join("target"))
         .output()

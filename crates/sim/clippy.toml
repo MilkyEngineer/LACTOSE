@@ -483,3 +483,12 @@ disallowed-types = [
   { path = "std::os::unix::net::UnixStream", reason = "architecture section 8.2: networking is outside the boundary; state enters through the staged frame of lactose_net_api", allow-invalid = true },
   { path = "std::process::Command", reason = "architecture section 8.2: a subprocess reaches files, the environment and the network alike" },
 ]
+
+# Architecture section 8.2 (D28): no run-time CPU feature detection that selects numerically
+# different paths. Unlike `thread_local!`, these are expression macros, which this lint and a
+# local `expect` both reach. Each is named under `std::arch`; clippy resolves the root path
+# `std::is_x86_feature_detected!` to the same macro, and each path resolves on every target.
+disallowed-macros = [
+  { path = "std::arch::is_x86_feature_detected", reason = "selects a path by the CPU it runs on; section 8.2 bans run-time detection that selects numerically different paths" },
+  { path = "std::arch::is_aarch64_feature_detected", reason = "selects a path by the CPU it runs on; section 8.2 bans run-time detection that selects numerically different paths" },
+]
