@@ -258,8 +258,9 @@ the bound is from reachable for the shape; the process's CPU time per run next t
 drawn; and the CPU the process uses while it does nothing but wake up. Steal time is measured
 inside the executor, on the function a worker steals with. Every wake or timer sample over
 1 ms, and every graph run over twice its lower bound, is listed with the UTC time it ended, to
-be matched against the system's log of sleeps and wakes (`pmset -g log` on a Mac); steal
-samples carry no time.
+be matched against the system's log of sleeps and wakes (`pmset -g log` on a Mac); a graph
+run carries its lower bound. The JSON lists every one; the summary lists at most twenty of a
+phase, the furthest over, and counts the rest. Steal samples carry no time.
 
 Correctness:
 

@@ -61,7 +61,9 @@
 //!   more than twice its lower bound, is listed with the wall-clock time it ended, in UTC,
 //!   so it can be matched against the system's own log of sleeps and wakes (`pmset -g log`
 //!   on a Mac). `Instant` does not count time asleep, so the samples alone cannot say
-//!   whether the machine was away.
+//!   whether the machine was away. A graph run carries its lower bound. The JSON lists
+//!   every one; the summary lists at most twenty of a phase, the furthest over, and counts
+//!   the rest.
 
 use core::cmp::Reverse;
 use core::hint::black_box;
@@ -109,6 +111,10 @@ const STALL_NANOS: f64 = 1_000_000.0;
 /// A graph run over this multiple of its lower bound is logged with its time ([`Stall`]):
 /// every run is over a millisecond, and the criterion's P99 is 1.5.
 const STALL_RATIO: f64 = 2.0;
+/// The summary lists at most this many stalls of one phase, the furthest over; the JSON
+/// lists every one. A slow machine can put most of a phase's runs over [`STALL_RATIO`], and a
+/// table of thousands of rows would hide the few that are a machine that was away.
+const STALL_ROWS_PER_PHASE: usize = 20;
 
 /// splitmix64: reproducible draws without a dependency.
 struct Rng(u64);
@@ -347,13 +353,65 @@ struct Stall {
     ended: SystemTime,
     /// The latency or the makespan, in nanoseconds.
     nanos: f64,
+    /// A graph run's lower bound, in nanoseconds; `None` for a latency.
+    bound: Option<f64>,
 }
 
 impl Stall {
-    /// A sample of `nanos` that ended just now.
-    fn ending_now(nanos: f64) -> Self {
-        Self { ended: SystemTime::now(), nanos }
+    /// A sample of `nanos` that ended just now, with the run's lower bound if it is a graph
+    /// run.
+    fn ending_now(nanos: f64, bound: Option<f64>) -> Self {
+        Self { ended: SystemTime::now(), nanos, bound }
     }
+
+    /// How far over its limit the sample was, to rank one phase's stalls by: a graph run's
+    /// ratio to its lower bound, a latency itself.
+    fn overrun(&self) -> f64 {
+        self.bound.map_or(self.nanos, |bound| self.nanos / bound)
+    }
+
+    /// The summary's measured column.
+    fn measured(&self) -> String {
+        match self.bound {
+            Some(bound) => format!(
+                "{:.1} µs, {:.2} times its lower bound of {:.1} µs",
+                self.nanos / 1e3,
+                self.nanos / bound,
+                bound / 1e3
+            ),
+            None => format!("{:.1} µs", self.nanos / 1e3),
+        }
+    }
+}
+
+/// A stall with the name of the phase it was measured in.
+type PhaseStall<'a> = (String, &'a Stall);
+
+/// The stalls the summary lists, in the order they ended: every stall of a phase that has at
+/// most [`STALL_ROWS_PER_PHASE`], and the furthest over of one that has more. Beside them,
+/// each phase that has more, with how many it has.
+fn listed_stalls<'a>(
+    stalls: &'a [PhaseStall<'a>],
+) -> (Vec<&'a PhaseStall<'a>>, Vec<(&'a str, usize)>) {
+    let mut phases: Vec<&str> = Vec::new();
+    for (phase, _) in stalls {
+        if !phases.contains(&phase.as_str()) {
+            phases.push(phase);
+        }
+    }
+    let mut listed = Vec::new();
+    let mut cut = Vec::new();
+    for phase in phases {
+        let mut own: Vec<_> = stalls.iter().filter(|(other, _)| other == phase).collect();
+        if own.len() > STALL_ROWS_PER_PHASE {
+            cut.push((phase, own.len()));
+            own.sort_by(|(_, a), (_, b)| b.overrun().total_cmp(&a.overrun()));
+            own.truncate(STALL_ROWS_PER_PHASE);
+        }
+        listed.extend(own);
+    }
+    listed.sort_by_key(|(_, stall)| stall.ended);
+    (listed, cut)
 }
 
 fn percentiles(mut samples: Vec<f64>) -> Percentiles {
@@ -556,7 +614,7 @@ fn measure_makespan(
             graph = runner.run_graph(graph).await.expect("the executor is running");
             let makespan = start.elapsed().as_nanos() as f64;
             if run >= WARM_UP_RUNS && makespan > STALL_RATIO * bound {
-                stalls.push(Stall::ending_now(makespan));
+                stalls.push(Stall::ending_now(makespan, Some(*bound)));
             }
             makespans.push(makespan);
             // Let the pool park, as it does between frames.
@@ -661,7 +719,7 @@ fn measure_wake_latency(executor: &Executor, samples: usize) -> WakeResult {
             if sample >= WARM_UP_RUNS {
                 let latency = started.load(Ordering::Acquire).saturating_sub(pushed) as f64;
                 if latency > STALL_NANOS {
-                    stalls.push(Stall::ending_now(latency));
+                    stalls.push(Stall::ending_now(latency, None));
                 }
                 latencies.push(latency);
             }
@@ -698,7 +756,7 @@ fn measure_timer_latency(executor: &Executor, samples: usize, period: Duration) 
             let late = deadline.elapsed().as_nanos() as f64;
             if sample >= WARM_UP_RUNS {
                 if late > STALL_NANOS {
-                    stalls.push(Stall::ending_now(late));
+                    stalls.push(Stall::ending_now(late, None));
                 }
                 latencies.push(late);
             }
@@ -1103,7 +1161,7 @@ fn main() {
         steal.p50, steal.p99, steal.max, steal.samples
     );
     let load_after = load_average().unwrap_or_else(|| "unknown".to_owned());
-    let mut stalls: Vec<(String, &Stall)> = makespans
+    let mut stalls: Vec<PhaseStall> = makespans
         .iter()
         .flat_map(|result| {
             let load = if result.background_load { "with two zstd tasks" } else { "alone" };
@@ -1231,9 +1289,11 @@ fn main() {
     for (index, (phase, stall)) in stalls.iter().enumerate() {
         let _ = writeln!(
             json,
-            "    {{ \"phase\": \"{phase}\", \"ended_utc\": \"{}\", \"measured_us\": {:.1} }}{}",
+            "    {{ \"phase\": \"{phase}\", \"ended_utc\": \"{}\", \"measured_us\": {:.1}, \
+             \"lower_bound_us\": {} }}{}",
             utc(stall.ended),
             stall.nanos / 1e3,
+            optional(stall.bound.map(|bound| bound / 1e3), 1),
             if index + 1 == stalls.len() { "" } else { "," }
         );
     }
@@ -1396,7 +1456,7 @@ fn main() {
     let _ = writeln!(summary, "\n## Stalls\n");
     let _ = writeln!(
         summary,
-        "Every wake or timer sample over {:.0} ms and every graph run over {STALL_RATIO} times \
+        "Every wake or timer sample over {} ms and every graph run over {STALL_RATIO} times \
          its lower bound, with the wall-clock time it ended, to match against the system's log \
          of sleeps and wakes (`pmset -g log` on a Mac). Times are UTC{}.\n",
         STALL_NANOS / 1e6,
@@ -1405,15 +1465,21 @@ fn main() {
     if stalls.is_empty() {
         let _ = writeln!(summary, "None.");
     } else {
+        let (listed, cut) = listed_stalls(&stalls);
         let _ = writeln!(summary, "| Ended (UTC) | Phase | Measured |");
         let _ = writeln!(summary, "|---|---|---|");
-        for (phase, stall) in &stalls {
+        for (phase, stall) in listed {
+            let _ = writeln!(summary, "| {} | {phase} | {} |", utc(stall.ended), stall.measured());
+        }
+        if !cut.is_empty() {
             let _ = writeln!(
                 summary,
-                "| {} | {phase} | {:.1} µs |",
-                utc(stall.ended),
-                stall.nanos / 1e3
+                "\nA phase with more than {STALL_ROWS_PER_PHASE} lists only the \
+                 {STALL_ROWS_PER_PHASE} furthest over their limit; the JSON lists every one.\n"
             );
+            for (phase, count) in cut {
+                let _ = writeln!(summary, "- {phase}: {count} stalls");
+            }
         }
     }
 
