@@ -7,7 +7,8 @@
 //! refused by the def ids clippy resolves, at the versions the repository's lock holds, which
 //! are in the registry cache wherever this package is built (the physics backend compiles
 //! them). The same probe proves the run-time CPU feature detection of the target it is built
-//! for refused under `disallowed-macros` (section 8.2), by the root path as by `std::arch`.
+//! for refused under `disallowed-macros` (section 8.2), by the root path as by `std::arch`, and
+//! on x86-64 CPUID read directly, by its `core` path, its `std::arch` re-export and a rename.
 
 #![forbid(unsafe_code)]
 
@@ -29,8 +30,9 @@ fn write(path: &Path, contents: &str) {
 
 /// Each line of the probe that clippy must refuse, and the path its finding names: one line
 /// per route of D119 banned by trait path, inherent method of a dependency or type, and the
-/// feature detection macro of the target.
-const REFUSED: [(&str, &str); 102] = [
+/// feature detection macro of the target. A line whose path is empty compiles to nothing on
+/// this target.
+const REFUSED: [(&str, &str); 105] = [
     ("use num_traits::Float;", "num_traits::Float"),
     ("pub fn generic<T: num_traits::real::Real>(x: T) -> T { x.sin() }", "num_traits::real::Real"),
     (
@@ -279,7 +281,23 @@ const REFUSED: [(&str, &str); 102] = [
             "std::arch::is_aarch64_feature_detected"
         },
     ),
+    // CPUID exists only on x86-64, where clippy reports each spelling by the `core` path. On
+    // aarch64 the lines compile to nothing, and `allow-invalid` keeps the bans quiet there.
+    (
+        "#[cfg(target_arch = \"x86_64\")] pub fn leaf1() -> u32 { core::arch::x86_64::__cpuid(1).ecx }",
+        if X86_64 { "core::arch::x86_64::__cpuid" } else { "" },
+    ),
+    (
+        "#[cfg(target_arch = \"x86_64\")] pub fn leaf7() -> u32 { std::arch::x86_64::__cpuid_count(7, 0).ebx }",
+        if X86_64 { "core::arch::x86_64::__cpuid_count" } else { "" },
+    ),
+    (
+        "#[cfg(target_arch = \"x86_64\")] pub fn renamed() -> u32 { use std::arch::x86_64::__cpuid as id; id(0).eax }",
+        if X86_64 { "core::arch::x86_64::__cpuid" } else { "" },
+    ),
 ];
+
+const X86_64: bool = cfg!(target_arch = "x86_64");
 
 /// What the lines of [`REFUSED`] call, after them.
 const HELPERS: &str = "use glamx::MatExt as _;\n\
@@ -317,7 +335,7 @@ fn the_routes_to_the_platform_float_library_are_refused() {
         .unwrap_or_else(|e| panic!("cannot run cargo clippy: {e}"));
     let text = String::from_utf8_lossy(&output.stderr);
     assert!(!output.status.success(), "clippy refused nothing:\n{text}");
-    for (at, (line, path)) in REFUSED.iter().enumerate() {
+    for (at, (line, path)) in REFUSED.iter().enumerate().filter(|(_, (_, path))| !path.is_empty()) {
         // Windows writes the path with a backslash.
         let finding = text.lines().map(|finding| finding.replace('\\', "/")).any(|finding| {
             finding.starts_with(&format!("src/lib.rs:{}:", at + 1))

@@ -72,7 +72,9 @@ on, and a listed feature the crate does not declare are findings.
   order. Each is pinned with its table: `PINNED_TYPES` lists the entries that belong under
   `disallowed-types`, `PINNED_MACROS` the two of `disallowed-macros` (run-time CPU feature
   detection, `std::arch::is_x86_feature_detected` and `std::arch::is_aarch64_feature_detected`,
-  section 8.2), every other one belongs under `disallowed-methods`, and clippy applies a path
+  section 8.2), every other one belongs under `disallowed-methods` (CPUID read directly,
+  `core::arch::x86_64::__cpuid` and `__cpuid_count`, among them, with `allow-invalid` for
+  aarch64), and clippy applies a path
   only in its own table. An entry the file drops or moves to another table, and an entry it
   adds that none of the three lists holds, are findings, so the reference's banned set equals
   the union of the three, each entry in its table. `tests/boundary_lints.rs` runs clippy with
@@ -81,7 +83,8 @@ on, and a listed feature the crate does not declare are findings.
   every line refused: each of those entries carries `allow-invalid`, which would otherwise
   hide a path that stopped resolving. The same probe calls the feature detection macro of the
   target it is built for (the x86 one by its root path, `std::is_x86_feature_detected!`) and
-  requires it refused. Rapier's `RevoluteJoint::angle` and parry's `VectorExt::angle` are
+  requires it refused, and on x86-64 calls CPUID by its `core` path, its `std::arch`
+  re-export and a renamed import, each refused. Rapier's `RevoluteJoint::angle` and parry's `VectorExt::angle` are
   pinned but not in that probe, which does not compile Rapier.
 - Each other crate of `[boundary_internal] any` compiles into every boundary crate and has a
   `clippy.toml` whose entries under the paths that reach files, the environment, a
@@ -166,10 +169,12 @@ on, and a listed feature the crate does not declare are findings.
   2, X1). A crate that is neither a boundary crate nor one of `[lint_file_carriers]` ships
   no `#[system]`, no `#[component]` or `#[resource]` whose arguments lack `derived`, and no
   `impl` of `SessionApplier`, `InputApplier` or `StagedState`, the traits through which the
-  input sync point writes into the world. Shipped code is read as for D99, and attributes
-  and traits are compared by their last path segment as written: one brought in under
-  another name, written by a macro, or inside a `cfg_attr`, is not seen.
-  `lactose-app-headless` is a carrier for its sketch game.
+  input sync point writes into the world, and no hand-written `impl Reflect`, which declares
+  a component or a resource no attribute shows. Pass systems are `#[system]`s like any
+  other. Shipped code is read as for D99, and attributes and traits are compared by their
+  last path segment as written: one brought in under another name (`use ... as`), written
+  by a macro (a `macro_rules!` or a derive of another crate that expands to one), or inside
+  a `cfg_attr`, is not seen. `lactose-app-headless` is a carrier for its sketch game.
 - No cargo configuration file has an `include` key, and no `.cargo` directory or cargo
   configuration file is a symbolic link: cargo would read through either what no check
   reads. `vendor` refuses both through the same function.

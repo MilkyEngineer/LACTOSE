@@ -37,6 +37,11 @@ const LOADER: &str = "Loader";
 /// into the world: players' joins and leaves, their inputs, and staged state.
 const APPLYING_TRAITS: [&str; 3] = ["SessionApplier", "InputApplier", "StagedState"];
 
+/// The trait of `lactose_reflect` that describes a type a world stores: its key, its fields
+/// and its persistence policy. `#[component]` and `#[resource]` write it; written by hand, it
+/// declares a component or a resource that no attribute shows.
+const DESCRIBING_TRAIT: &str = "Reflect";
+
 /// The `[target]` key and the flags of the pin (architecture section 8.2).
 const PIN_KEY: &str = r#"cfg(target_arch = "x86_64")"#;
 const PIN_CPU: &str = "x86-64-v3";
@@ -45,13 +50,14 @@ const PIN_FLAGS: [&str; 2] = ["-C", "target-cpu=x86-64-v3"];
 /// Every entry of the reference lint file that is neither a thread route nor in
 /// [`NOT_THREAD_ROUTES`], in the file's order: the float methods and the trait routes to them,
 /// the executor's worker index and the methods of its re-export, files, the environment,
-/// subprocesses and the network, the types, and the macros of run-time CPU feature detection.
+/// subprocesses and the network, CPUID, the types, and the macros of run-time CPU feature
+/// detection.
 /// The check requires the reference's entries to be exactly this list, [`THREAD_ROUTES`] and
 /// [`NOT_THREAD_ROUTES`], each in the table [`pinned_table`] names, so a ban deleted from the
 /// reference and every copy is reported, and so is one moved to another table, where clippy
 /// no longer applies it, or one added without being pinned here. `allow-invalid` keeps clippy
 /// quiet about an entry whatever happens to it, and no test uses most of them.
-const REQUIRED_LINT_PATHS: [&str; 275] = [
+const REQUIRED_LINT_PATHS: [&str; 277] = [
     "f32::min",
     "f32::max",
     "f32::clamp",
@@ -294,6 +300,8 @@ const REQUIRED_LINT_PATHS: [&str; 275] = [
     "std::os::unix::process::parent_id",
     "std::backtrace::Backtrace::capture",
     "std::net::ToSocketAddrs::to_socket_addrs",
+    "core::arch::x86_64::__cpuid",
+    "core::arch::x86_64::__cpuid_count",
     "std::time::Instant",
     "std::time::SystemTime",
     "std::collections::HashMap",
@@ -1185,7 +1193,8 @@ fn simulation_assets(tiers: &TierFile, ws: &Workspace, files: &Files, findings: 
 /// file. A crate that carries none, neither a boundary crate nor one of `[lint_file_carriers]`,
 /// ships no `#[system]`, no `#[component]` or `#[resource]` that is not `derived`, and no
 /// implementation of a trait through which the simulation applies what enters a tick
-/// ([`APPLYING_TRAITS`]); each is reported where it stands, unless only tests compile it.
+/// ([`APPLYING_TRAITS`]), and no hand-written [`DESCRIBING_TRAIT`]; each is reported where it
+/// stands, unless only tests compile it.
 ///
 /// The shipped code is read as [`simulation_assets`] reads it, and attributes and traits by
 /// their last path segment as written: one brought in under another name, or written by a
@@ -1210,6 +1219,8 @@ fn registered_outside_the_lint_file(
                 };
                 (file, found.line, what)
             });
+        let (described, impls): (Vec<_>, Vec<_>) =
+            impls.into_iter().partition(|(_, found)| found.trait_name == DESCRIBING_TRAIT);
         let applied = impls
             .into_iter()
             .filter(|(_, found)| APPLYING_TRAITS.contains(&found.trait_name.as_str()))
@@ -1223,6 +1234,19 @@ fn registered_outside_the_lint_file(
                      [lint_file_carriers] in {POLICY_FILE}, under the lints of architecture \
                      section 8.2, or only in tests",
                     package.name
+                ),
+            ));
+        }
+        for (file, found) in described {
+            findings.push(Finding::new(
+                file,
+                format!(
+                    "line {}: a hand-written `impl {DESCRIBING_TRAIT}` in `{}`, which carries no \
+                     boundary lint file; it declares a component or a resource that no attribute \
+                     shows, and what a world stores is described in a boundary crate or a crate \
+                     of [lint_file_carriers] in {POLICY_FILE}, under the lints of architecture \
+                     section 8.2, or only in tests",
+                    found.line, package.name
                 ),
             ));
         }
@@ -3214,7 +3238,9 @@ mod tests {
                     impl SessionApplier for S {}\n\
                     impl lactose_sim::InputApplier for S {}\n\
                     impl<T> StagedState for H<T> {}\n\
-                    impl Applier for S {}\n";
+                    impl Applier for S {}\n\
+                    impl lactose_reflect::Reflect for A {}\n\
+                    impl Reflected for A {}\n";
         files.insert("crates/task/src/lib.rs", "mod game;\n");
         files.insert("crates/task/src/game.rs", game);
         let at = |line: usize, what: &str| {
@@ -3231,6 +3257,9 @@ mod tests {
                 at(11, "`impl SessionApplier`"),
                 at(12, "`impl InputApplier`"),
                 at(13, "`impl StagedState`"),
+                format!(
+                    "crates/task/src/game.rs: line 15: a hand-written `impl Reflect` in `lactose-task`, which carries no boundary lint file; it declares a component or a resource that no attribute shows, and what a world stores is described in a boundary crate or a crate of [lint_file_carriers] in {POLICY_FILE}, under the lints of architecture section 8.2, or only in tests"
+                ),
             ]
         );
 
@@ -3250,7 +3279,7 @@ mod tests {
         carriers.lint_file_carriers.push("lactose-task".to_owned());
         assert_eq!(run_with(&carriers, &ws, &files), NONE);
         let unlisted = run(&ws, &files);
-        assert_eq!(unlisted.iter().filter(|f| f.contains("no boundary lint file")).count(), 6);
+        assert_eq!(unlisted.iter().filter(|f| f.contains("no boundary lint file")).count(), 7);
     }
 
     /// What row 66 reports for an `impl SimulationAsset` at `line` of `file` in `lactose-task`.

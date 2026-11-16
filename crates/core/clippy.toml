@@ -306,6 +306,11 @@ disallowed-methods = [
   { path = "std::thread::available_parallelism", reason = "architecture section 8.2: the process environment is not a simulation input" },
   { path = "std::backtrace::Backtrace::capture", reason = "architecture section 8.2: the process environment is not a simulation input" },
   { path = "std::net::ToSocketAddrs::to_socket_addrs", reason = "architecture section 8.2: networking is outside the boundary; state enters through the staged frame of lactose_net_api" },
+  # Section 8.2 (D28): CPUID read directly, which safe code may call on x86-64, is run-time
+  # feature detection as much as the macros under disallowed-macros. Each path resolves only on
+  # x86-64; `allow-invalid` keeps the aarch64 builds quiet. No 32-bit x86 target is built.
+  { path = "core::arch::x86_64::__cpuid", reason = "reads the CPU it runs on; section 8.2 bans run-time detection that selects numerically different paths", allow-invalid = true },
+  { path = "core::arch::x86_64::__cpuid_count", reason = "reads the CPU it runs on; section 8.2 bans run-time detection that selects numerically different paths", allow-invalid = true },
   # Architecture sections 5.1 and 8.2: a boundary crate creates no thread outside an
   # executor. Parallel work goes through `lactose_task`'s executor, under its determinism and
   # chaos model, and the physics step through the solver pool of section 16. Clippy matches
