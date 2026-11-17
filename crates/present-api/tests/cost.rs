@@ -100,7 +100,8 @@ fn extract_at_fifty_thousand_moved_among_a_hundred_thousand() {
     const ROWS: u64 = 100_000;
     const MOVING: u64 = 50_000;
     const PRESENTED: u64 = 10_000;
-    const FRAMES: usize = 40;
+    // Decision 5.2 of the milestone 2 plan measures over 60 passes.
+    const FRAMES: usize = 60;
     for workers in [1, 4] {
         for snapshot in [true, false] {
             let (mut rig, sink) = scene(ROWS, MOVING, PRESENTED, snapshot, workers);

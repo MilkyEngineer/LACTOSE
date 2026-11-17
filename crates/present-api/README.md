@@ -256,8 +256,9 @@ events")
   is none since an output was last installed or removed; the previous pass's mark is not
   current (`World::is_current`: a restore, a whole-world load, the 2^30 stamp rebase); or
   the structural log no longer reaches the previous pass's cursor (`StructuralLog::since`
-  is `None`: more ticks than `SimulationBuilder::log_retention` ran with no pass). Every
-  other pass is *incremental*.
+  is `None`: a structural change logged after the previous pass has been trimmed, which
+  takes a change logged more than `SimulationBuilder::log_retention` steps before this
+  pass). Every other pass is *incremental*.
 - A region load or unload does not make a pass full: loaded rows are logged as spawned and
   stamped, unloaded rows are logged as despawned.
 - An incremental pass *follows a tick* when the world's tick is not its tick at the
@@ -307,9 +308,14 @@ events")
   forked jobs, several at once. A sink whose result must not depend on that order sorts
   what it kept by key in `end`.
 - `begin` and `end` bracket every pass that calls anything, and extract calls nothing
-  between two passes. The world does not change between `begin` and `end`.
-- The sink is infallible. One that cannot take a row waits or drops inside its own
-  contract.
+  between two passes. The world does not change between `begin` and `end`. A pass at a
+  tick other than the previous pass's always calls `begin` and `end`, with nothing between
+  them when it has nothing to write, so the ticks of the sink's `begin`s are the ticks of
+  extract's passes. A pass at the previous pass's tick that is not full and has no key to
+  remove and no row to write calls nothing.
+- The sink is infallible. `write` runs on the executor's workers inside extract's scope,
+  several at once, so it never blocks and takes no lock: a sink that cannot take a row (a
+  ring whose regions are all in flight) drops it and counts the drop.
 
 *What the sink keeps.* A row carries the placement the instance has now and no previous
 one: the world holds one `Transform` per row, and extract keeps no table of its own. What
@@ -353,10 +359,13 @@ follows is the contract the renderer's sink implements, and a test's sink checks
   next tick, while the frame interpolates the row. After an edit made between ticks, until
   the next tick, the frame shows every presented row at the newer state ("A frame's
   transforms"); the sink does not.
-- Comparing the tick of each `begin` and not extract's previous pass gives the same
-  placements: a pass calls nothing only when no instance moved at its tick or at the tick
-  before ("Settling"), so every placement the sink holds is then the state of both, and a
-  base taken at the next `begin` is the same placement.
+- The sink compares the tick of each `begin` with the tick of the `begin` before it, which
+  is the tick of extract's previous pass because every pass after a tick calls `begin`
+  ("What a pass gives the sink"). So the sink drops its bases at exactly the passes whose
+  tick is earlier than the previous pass's, which are the passes that flag every row. Were
+  a pass after a tick in which nothing moved to call nothing, the sink's last `begin`
+  would be older than extract's previous pass, and a resync to a tick at or after it would
+  drop no base: the rollback after it would be drawn from a base of before the resync.
 - That is the whole of what "previous and current transforms" (section 5.3) means for an
   instance: both live on the render side, and the staging ring carries current placements.
 - `InstanceRow::mesh` is the row's `MeshInstance::mesh` at the pass, on every write, so a
@@ -374,7 +383,11 @@ follows is the contract the renderer's sink implements, and a test's sink checks
 - on every row of a pass whose tick is earlier than the previous pass's, by the wrapping
   comparison: a prediction world resynchronised to an earlier tick (`Predictor::resync`),
   where nothing the sink holds leads into the state, and the sink drops its bases ("What
-  the sink keeps"). The snapshot of such a pass is a cut ("The triple buffer");
+  the sink keeps"). The snapshot of such a pass is a cut ("The triple buffer"). The drop
+  and the flag each show that pass's rows at once in a sink that keeps the bases; the
+  flag alone does so for a sink that keeps none, and is what a consumer of the row reads.
+  The drop alone keeps the rollback after the resync from being drawn from a base of
+  before it;
 - otherwise, when the row has a `Teleported` whose tick is not zero and is later than the
   pass's *covered tick*, by the wrapping comparison of ticks (the difference is in
   `1..2^31`). The covered tick is the world's tick at the previous pass or, at a pass of
@@ -425,9 +438,12 @@ follows is the contract the renderer's sink implements, and a test's sink checks
 
 - A channel owns exactly three snapshot buffers. The reader holds the two of its last
   `acquire`; the writer writes the third. `acquire` exchanges handles under the channel's
-  lock, copies nothing and never waits for a pass; a pass never waits for the reader. The
-  lock is held for the exchange alone, never while a snapshot is written or read. The
-  code is safe Rust.
+  lock and copies nothing. Each side waits for the other at most for one exchange: the
+  lock is taken once by a pass that writes a snapshot, once by each `publish` and once by
+  each `acquire`, and is held for a constant-time exchange of buffer handles and event
+  batches alone, never while a snapshot is written or read, an event batch folded or
+  dropped, or a sink called. It is the one lock architecture section 3 permits inside a
+  system for this channel (D157). The code is safe Rust.
 - `acquire` returns `None` before the first publication, and called again with nothing
   published since, the same pair. Otherwise its newer snapshot is the newest published,
   and its older the snapshot that one follows, if the channel still has it (published, or
@@ -502,9 +518,19 @@ follows is the contract the renderer's sink implements, and a test's sink checks
 - `publish(events)` makes the unpublished snapshot, if there is one, the newest published,
   and appends `events` to the events the reader's next `acquire` returns, in one exchange:
   a frame never holds a snapshot without the events of the ticks it covers. With no
-  snapshot to publish the events are appended alone. With no writer installed the batch
-  is dropped, and so is every batch once the channel's reading half has been dropped:
-  nothing accumulates for a reader that will never acquire.
+  snapshot to publish the events are appended alone, and an `acquire` before the first
+  publication, which returns `None`, leaves them for the first frame. With no writer
+  installed the batch is dropped, and so is every batch once the channel's reading half
+  has been dropped: nothing accumulates for a reader that will never acquire.
+- The channel keeps each published batch as it is, and the `acquire` that takes them folds
+  them after the lock is released, in time linear in the events; the batches a dropped
+  reader never took are dropped after it too. A reader that stops acquiring while its
+  world keeps publishing (a hidden window, a hitch, a debugger) costs memory, one batch per
+  publication with an event, until it acquires again; nothing done under the lock grows
+  with that backlog but the push of one batch handle, whose vector's growth is amortised
+  constant. The first acquire after the pause returns every event of it, folded. Whether a
+  reader that comes back after a long pause should receive them all, and whether a paused
+  reader should stop acquiring at all, is `frame-design`'s decision.
 - A snapshot written by a full pass in a prediction world, of the tick of the snapshot
   published last, takes that snapshot's place instead of following it: it follows what
   that one followed ("The triple buffer"), and is published in its place if that one
@@ -629,14 +655,14 @@ are tests, and the rest shown by hand, each change undone after.
 | Registration | A simulation of every kind builds with the crate registered, and a prediction world under `lactose_predict::check_prediction_reads`, which admits extract by its key alone; a system naming `Res<ExtractState>` or `ResMut<ExtractState>` is refused at build in every kind; `lib.rs` asserts the bounds, the policies and the sizes at build | `registration.rs` |
 | Extract writes nothing | The recorded test under "Extract writes nothing to the world", in every SOUR mode: after every step the world hash and each region's are equal before the passes, after a pass that follows the tick and after one that does not; the hash after the passes is recorded; outside the runner each stream equals, tick for tick, the stream of the same scene with no pass, and the passes wrote, flagged and removed rows and ran full passes | `sour.rs` (the module `recorded`): `a_server_scene_with_extract`, `a_prediction_scene_with_extract_and_a_rollback`, `the_streams_equal_those_with_no_pass` |
 | The extract set | A world of each kind with instances, presented rows, rows that are both and rows that are neither: a counting sink and the snapshot hold exactly the stated rows; a prediction world's unclaimed rows are in neither; a `Client` world's sink gets no row and its snapshot no `Transform` | `extract::each_kind_extracts_its_set` |
-| Full passes | The first pass, a pass after `set_sink` or `set_snapshot`, after a restore, after a whole-world load (its `set_tick`), after the structural log was trimmed past the previous pass's cursor: `full`, every instance written, no `removed`; `no_interpolate` and `cut` by kind; a pass after a tick or a region unload is incremental | `extract::a_pass_is_full_when_extract_cannot_tell_what_changed` |
-| Incremental passes | By counts: a row moved at one tick is written by the pass after it and by the pass after the next tick with the placement it stopped at, then not again; a row edited between ticks is written by an idle pass with `no_interpolate`; an idle pass with nothing changed calls nothing; a `set_if_neq` of equal bytes writes nothing; an idle pass writes a snapshot only when a presented row changed | `extract::a_row_is_written_by_the_pass_after_the_tick_that_moved_it_and_once_more`, `extract::an_idle_pass_writes_a_snapshot_only_when_a_presented_row_changed` |
-| A rollback in a frame with no step | One claimed row of a prediction world, four frames a tick, through every sequence of D157's row (S2, S2B, T, T2, R2, R2b, CU, CUT, F, RS, RSR, LZ, RS2): a sink that takes bases at a tick's first `begin`, one that takes them lazily at a key's first write, and `PresentFrame::transform` give the same placement pair at every frame, and no frame draws from a placement of a later tick than the one it draws to. Without the base drop RSR fails; without the lazy sink's count of drops RS, RSR, LZ and RS2 fail; without the earlier-tick cut in `publish` RS fails | `rollback::the_sink_and_the_frame_agree_in_every_sequence`, `rollback::without_the_base_drop_a_sequence_fails`, `rollback::without_the_lazy_sinks_count_of_drops_a_sequence_fails` |
+| Full passes | The first pass, a pass after `set_sink` or `set_snapshot`, after a restore, after a whole-world load (its `set_tick`), after the structural log was trimmed past the previous pass's cursor: `full`, every instance written, no `removed`; `no_interpolate` and `cut` by kind; a pass after a tick or a region unload is incremental, and so is a pass after more ticks than the log's retention when what it logged since the previous pass is still held | `extract::a_pass_is_full_when_extract_cannot_tell_what_changed`, `extract::a_change_logged_inside_the_retention_after_more_ticks_than_it_keeps` |
+| Incremental passes | By counts: a row moved at one tick is written by the pass after it and by the pass after the next tick with the placement it stopped at, then not again; a row edited between ticks is written by an idle pass with `no_interpolate`; an idle pass with nothing changed calls nothing, and a pass after a tick in which nothing moved calls `begin` and `end` alone; a `set_if_neq` of equal bytes writes nothing; an idle pass writes a snapshot only when a presented row changed | `extract::a_row_is_written_by_the_pass_after_the_tick_that_moved_it_and_once_more`, `extract::an_idle_pass_writes_a_snapshot_only_when_a_presented_row_changed` |
+| A rollback in a frame with no step | One claimed row of a prediction world, four frames a tick, through every sequence of D157's row (S2, S2B, T, T2, R2, R2b, CU, CUT, F, RS, RSR, LZ, RS2) and three in which the row stands still for two or three ticks before a resync to the tick before the newest (RSS, RSS3) and a rollback after it (RSSR): a sink that takes bases at a tick's first `begin`, one that takes them lazily at a key's first write, and `PresentFrame::transform` give the same placement pair at every frame, and no frame draws from a placement of a later tick than the one it draws to. The two mutation tests assert their lists exactly: without the base drop RSR and RSSR fail; without the lazy sink's count of drops RS, RSR, LZ and RS2 fail. By hand: without the earlier-tick cut in `publish` RS fails; with a pass after a tick that calls nothing when it has nothing to write, RSSR fails; without extract's earlier-tick flag the agreement holds through the base drop, `extract::the_flag` fails, and the base-drop list grows to RS, RSR, RS2, RSS, RSS3 and RSSR | `rollback::the_sink_and_the_frame_agree_in_every_sequence`, `rollback::without_the_base_drop_a_sequence_fails`, `rollback::without_the_lazy_sinks_count_of_drops_a_sequence_fails` |
 | Removals | A despawn, an unload, a removed `MeshInstance` or `Transform`, a released claim: listed once, in key order; a key that left and came back is listed and written | `extract::removed_lists_what_left_the_set` |
 | The flag | A teleport at each tick of a three-tick frame flags the row; a saved `Teleported` does not; tick zero does not; every row of a pass at a tick earlier than the previous pass's is flagged; the comparisons hold across the tick's wrap | `extract::the_flag` |
 | Layout and workers | The sink's rows sorted by key, and the snapshot's bytes, are equal under every layout capacity and chunk order of SOUR's modes and one, two and four workers | `extract::layout_and_workers_change_nothing` |
-| The triple buffer | Every write is a real pass whose presented row holds the write's number, checked against a model of this file's rules after every acquire, under the five cadences of D157's row and random sequences: a held snapshot is never written (`Arc::get_mut` asserts the buffer a pass writes is unshared) and no pass waits; the pair is the model's; a reader that acquires every publication gets the two newest published; after the first publication no pair holds one snapshot twice except a window pair, never two in a row, every second acquire in the inside-the-span cadence; no pair backward in time but at a cut; the first newer snapshot published since a cut is one, also when the cut was taken back or replaced; the mark is passed by the third acquire after it, after one stale pair at most in the slow cadence; a prediction world's replacement keeps a cut and pairs from what it followed; a second pass before `publish` keeps a cut and a full mark; the render side on its own thread. The exchange is safe Rust under one lock, so loom and Miri would check nothing the test does not. A mark cleared one acquire late fails four of these tests | `exchange.rs` |
-| Events | Each emission is in exactly one frame's batch under four cadences with rollbacks that re-emit and cancel; an emission and its cancellation between two acquires are in neither list; a rollback's re-emission is not delivered again; with the reader dropped `publish` keeps no event. Without the fold, or with `publish` replacing the batch it holds, a test fails | `frame::each_emission_reaches_one_frame`, `frame::a_cancellation_folds_into_its_emission`, `frame::with_the_reader_gone_publish_keeps_no_event` |
+| The triple buffer | Every write is a real pass whose presented row holds the write's number, checked against a model of this file's rules after every acquire, under the five cadences of D157's row and random sequences: a held snapshot is never written (`Arc::get_mut` asserts the buffer a pass writes is unshared) and no pass waits; the pair is the model's; a reader that acquires every publication gets the two newest published; after the first publication no pair holds one snapshot twice except a window pair, never two in a row, every second acquire in the inside-the-span cadence; no pair backward in time but at a cut; the first newer snapshot published since a cut is one, also when the cut was taken back or replaced; the mark is passed by the third acquire after it, after one stale pair at most in the slow cadence; a prediction world's replacement keeps a cut and pairs from what it followed; a second pass before `publish` keeps a cut and a full mark; the render side on its own thread; across threads, at drawn cadences, each emission reaches one frame and a frame whose newer snapshot is of a tick has every emission published with or before that tick's first publication; a window pair driven across threads, with the taken-back snapshot's events in its frame. The exchange is safe Rust under one lock, so loom and Miri would check nothing the tests do not. A mark cleared one acquire late fails four of these tests; publishing the snapshot and its events, or taking the pair and the events, in two exchanges fails `exchange::events_reach_one_frame_with_their_snapshot_across_threads` | `exchange.rs` |
+| Events | Each emission is in exactly one frame's batch under four cadences with rollbacks that re-emit and cancel; an emission and its cancellation between two acquires are in neither list; a rollback's re-emission is not delivered again; with the reader dropped `publish` keeps no event; the events published before the first snapshot reach the first frame. Without the fold, or with `publish` replacing the batches it holds, a test fails | `frame::each_emission_reaches_one_frame`, `frame::a_cancellation_folds_into_its_emission`, `frame::with_the_reader_gone_publish_keeps_no_event`, `frame::events_published_before_the_first_snapshot_reach_the_first_frame` |
 | The frame | `transform` for a moved, a teleported, a new and a `Client`-world row; one-tick pairs and cuts do not interpolate | `frame::a_frames_transforms` |
 | View-models and debug draw | `set`, `get`, `remove`, erased reads by field ID, key order; a key collision panics; a non-`derived` view-model and a snapshot read of a non-`extracted` component check and do not build, and the build names each failing call (a scratch package of `tests/ui`); the segments of each shape | `view.rs`, `compile_fail.rs` |
 | Cost | Extract's pass at 50,000 rows moved among 100,000, 10,000 of them presented rows the snapshot holds, and with no snapshot installed, on a null sink that counts, under one worker and four: the counts asserted, the times measured by an ignored test run by hand in release and reported, never asserted. The device's ring is the renderer's and is measured there | `cost.rs` |
