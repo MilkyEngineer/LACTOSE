@@ -4,8 +4,6 @@
 use core::future::Future;
 use core::pin::Pin;
 use core::task::{Context, Poll};
-use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
 
 use lactose_core::Result;
 use lactose_task::{Lane, LaneCall, Platform, ThreadHandle};
@@ -26,8 +24,9 @@ use lactose_task::{Lane, LaneCall, Platform, ThreadHandle};
 ///
 /// # Errors
 ///
-/// Whatever `platform` returns for a thread it cannot make. `state` is then dropped on
-/// the calling thread.
+/// Whatever `platform` returns for a thread it cannot make. `ErrorKind::Cancelled` if
+/// `platform` accepted the thread's body and dropped it unrun. Either way `state` is
+/// dropped, and no call of the lane will run.
 pub fn present_thread<S: Send + 'static>(
     platform: &dyn Platform,
     state: S,
@@ -38,25 +37,30 @@ pub fn present_thread<S: Send + 'static>(
 /// The present thread, as the one who started it holds it: the way to stop it and to take
 /// its state back. `Send`, so a task may hold it.
 ///
-/// Dropping it stops the thread as [`PresentThread::stop`] does, and the state is then
-/// dropped on the present thread.
+/// [`stop`](Self::stop) is the way to end the thread. Dropping it ends the thread too, for
+/// a caller that unwinds: the thread runs what was queued before the drop and drops the
+/// state on the present thread, and nothing says when that is done (`README.md`, "The
+/// present thread and its pump").
 pub struct PresentThread<S> {
-    /// Set by `stop`, and by a drop, before the thread is woken.
-    stopping: Arc<AtomicBool>,
-    /// The lane the thread hands its state back through, drained once, after the last
-    /// call.
+    /// The lane every call reaches the state through. The stop is a call on it, queued
+    /// after every call before `stop`, which marks the end of the thread's last batch.
+    present: Lane<S>,
+    /// The lane the thread hands its state back through. `stop` queues the take here
+    /// before it queues the stop, and the thread drains it once, after it has dropped the
+    /// present lane's pump.
     hand_back: Lane<Option<S>>,
-    /// The thread, as the platform gave it.
+    /// The thread, as the platform gave it. It is never joined.
     thread: ThreadHandle,
 }
 
 impl<S: Send + 'static> PresentThread<S> {
     /// Asks the thread to finish, and returns the future of its state. It never waits.
     ///
-    /// The thread runs every call queued before `stop` was called, the one in progress
-    /// included, then runs no other, hands the state back and exits. A call queued
-    /// after `stop` was called runs before the hand-back or resolves to
-    /// `ErrorKind::Cancelled`.
+    /// It queues the take of the state on the hand-back lane, then the stop on the present
+    /// lane, so "queued before `stop`" is the present lane's own order. The thread runs
+    /// every call queued before the stop, the one in progress included, and every call
+    /// that reached the same drain after it; it then drops its pump, which resolves every
+    /// call not run to `ErrorKind::Cancelled`, hands the state back and exits.
     pub fn stop(self) -> PresentStop<S> {
         todo!()
     }
@@ -67,8 +71,12 @@ impl<S: Send + 'static> PresentThread<S> {
 /// runs nothing of the caller's and holds nothing of the caller's.
 ///
 /// It resolves to `ErrorKind::Cancelled` if the thread ended without handing the state
-/// back, which only a panic in one of its calls causes. Dropping it does not undo the
-/// stop: the state is dropped where the future was, or on the present thread.
+/// back, which only a panic in one of its calls causes. It does not resolve while a call
+/// queued before the stop has not returned, which is why the caller bounds every wait
+/// inside a present call. Dropping it does not undo the stop: a state not yet handed back
+/// is dropped on
+/// the present thread, and one handed back is dropped with the future, on the thread that
+/// drops it.
 #[must_use = "futures do nothing unless awaited"]
 pub struct PresentStop<S> {
     /// The hand-back, as a call on the thread's second lane.

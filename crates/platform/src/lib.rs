@@ -20,45 +20,113 @@
 //!   `main` runs last and which returns when the process is done with its window, and
 //!   the main-thread lane, whose calls are lent a [`MainThread`].
 //! - [`Window`] is reached inside a main-lane call. Its handles are what a graphics
-//!   backend makes a surface from, there and nowhere else; [`Window::size`] and
-//!   [`Window::close_requested`] are what a resize and a close report, to any thread.
+//!   backend makes a surface from, there and nowhere else; [`Window::reports`] is what a
+//!   resize and a close report, to any thread, in a handle that keeps nothing open.
 //! - [`present_thread`] starts the one thread that acquires and presents, and gives the
 //!   lane that carries every call to it; [`PresentThread::stop`] takes its state back.
 //! - [`ClientPlatform`] is what the client passes as `Workers::platform`.
 //!
-//! A client binary, by thread:
+//! A client binary, by thread, with the shutdown of `README.md`, "Shutdown", step by step:
 //!
 //! ```no_run
 //! use std::sync::Arc;
+//! use std::time::{Duration, Instant};
 //!
 //! use lactose_core::Result;
 //! use lactose_platform::{
-//!     ClientPlatform, MainThread, PixelSize, WindowDesc, event_pump, present_thread,
+//!     ClientPlatform, MainThread, PixelSize, PresentThread, Window, WindowDesc, WindowReports,
+//!     event_pump, present_thread,
 //! };
 //! use lactose_task::{Executor, Lane, Platform, WorkerClass};
 //!
-//! /// What the present thread owns: the caller's type, which holds the swapchain and
-//! /// whatever draws a finished target into its images.
+//! /// Stands for a graphics backend's device, which keeps the window's `Arc` until its
+//! /// surface is destroyed.
+//! struct Device {
+//!     _window: Arc<Window>,
+//! }
+//!
+//! /// What the present thread owns: the caller's type, which holds the swapchain, a clone
+//! /// of the device, and whatever draws a finished target into the swapchain's images.
 //! struct Presenter {
+//!     device: Option<Arc<Device>>,
 //!     presented: u64,
 //! }
 //!
-//! /// Everything but the two pumps is a task, and waits for either thread with `.await`.
-//! async fn client(main: &Lane<MainThread>, present: &Lane<Presenter>) -> Result<()> {
-//!     // The device is made in a call like this one, where the window lends its handles.
-//!     let window = main.run(|main| main.window()).await?;
-//!     while !window.close_requested() {
-//!         let size = window.size();
-//!         // One call at a time: the next is queued when this one has returned.
-//!         present
+//! /// Queues `exit` when it is dropped, a panic's unwinding included, and does not wait.
+//! struct ExitOnDrop(Lane<MainThread>);
+//!
+//! impl Drop for ExitOnDrop {
+//!     fn drop(&mut self) {
+//!         drop(self.0.run(|main| main.exit()));
+//!     }
+//! }
+//!
+//! /// A main-lane call, where the window lends its handles: the device is made from the
+//! /// window, and the frame keeps the reports, which hold nothing open.
+//! fn start(main: &mut MainThread) -> (Arc<Device>, WindowReports) {
+//!     let window = main.window();
+//!     let reports = window.reports();
+//!     (Arc::new(Device { _window: window }), reports)
+//! }
+//!
+//! /// One present call in flight, the next queued when the last has returned. A call that
+//! /// presented nothing paces nothing, so the frame then waits for its next deadline.
+//! async fn frames(
+//!     executor: &Executor,
+//!     reports: &WindowReports,
+//!     present: &Lane<Presenter>,
+//! ) -> Result<()> {
+//!     while !reports.close_requested() {
+//!         let size = reports.size();
+//!         let presented = present
 //!             .run(move |presenter| {
-//!                 if !size.is_empty() {
-//!                     presenter.presented += 1;
-//!                 }
+//!                 let shown = presenter.device.is_some() && !size.is_empty();
+//!                 presenter.presented += u64::from(shown);
+//!                 shown
 //!             })
 //!             .await?;
+//!         if !presented {
+//!             executor.sleep_until(Instant::now() + Duration::from_millis(16)).await?;
+//!         }
 //!     }
 //!     Ok(())
+//! }
+//!
+//! /// The root task: start, frames, and the shutdown every path takes.
+//! async fn root(
+//!     executor: Executor,
+//!     main: Lane<MainThread>,
+//!     present: Lane<Presenter>,
+//!     thread: PresentThread<Presenter>,
+//! ) -> Result<()> {
+//!     let exit = ExitOnDrop(main.clone());
+//!     let mut device = None;
+//!     let ran = async {
+//!         let (made, reports) = main.run(start).await?;
+//!         let on_thread = made.clone();
+//!         device = Some(made);
+//!         present.run(move |presenter| presenter.device = Some(on_thread)).await?;
+//!         frames(&executor, &reports, &present).await
+//!     }
+//!     .await;
+//!     // 1. `exit` first, not awaited: it destroys nothing while an `Arc<Window>` is held,
+//!     //    and the pump drains main-lane calls until the last one goes.
+//!     drop(exit);
+//!     // 2. No present is queued from here. The last present-thread call waits, within a
+//!     //    bound, for the points its presents signalled and the swapchain's presents, and
+//!     //    drops the swapchain; here the thread holds only a clone of the device.
+//!     let last = present.run(|presenter| presenter.device = None).await;
+//!     // 3. The state comes back with nothing of the window in it.
+//!     let stopped = thread.stop().await.map(drop);
+//!     // 4. Off the frame workers: what the host owes is signalled, the device's last
+//!     //    points are waited for within a bound, and every encoder and clone but one go.
+//!     let waited = executor.spawn(WorkerClass::Background, async move { device }).await;
+//!     // 5. A main-lane call drops the last, which then waits for nothing.
+//!     let dropped = match waited {
+//!         Ok(device) => main.run(move |_| drop(device)).await,
+//!         Err(error) => Err(error),
+//!     };
+//!     ran.and(last).and(stopped).and(dropped)
 //! }
 //!
 //! fn main() -> Result<()> {
@@ -69,24 +137,15 @@
 //!     })?;
 //!     let platform: Arc<dyn Platform> = Arc::new(ClientPlatform::new());
 //!     let executor = Executor::builder().platform(platform.clone()).build()?;
-//!     let (present, thread) = present_thread(&*platform, Presenter { presented: 0 })?;
+//!     let (present, thread) =
+//!         present_thread(&*platform, Presenter { device: None, presented: 0 })?;
+//!     let task =
+//!         executor.spawn(WorkerClass::FrameCritical, root(executor.clone(), main, present, thread));
 //!
-//!     let root = executor.spawn(WorkerClass::FrameCritical, async move {
-//!         let ran = client(&main, &present).await;
-//!         // On every path: take the present thread's state back, destroy on the main
-//!         // thread what was made from the window, and let the pump go.
-//!         let presenter = thread.stop().await;
-//!         let left = main
-//!             .run(move |main| {
-//!                 drop(presenter);
-//!                 main.exit();
-//!             })
-//!             .await;
-//!         ran.and(left)
-//!     });
-//!
+//!     // 6. `run` returns once the last `Arc<Window>` is gone, and nothing after it holds
+//!     //    the device or the window.
 //!     pump.run()?;
-//!     let ran = executor.block_on(root);
+//!     let ran = executor.block_on(task);
 //!     executor.shutdown();
 //!     ran?
 //! }
@@ -107,7 +166,7 @@ mod window;
 pub use main_thread::{EventPump, MainThread, event_pump};
 pub use present::{PresentStop, PresentThread, present_thread};
 pub use threads::ClientPlatform;
-pub use window::{PixelSize, Window, WindowDesc};
+pub use window::{PixelSize, Window, WindowDesc, WindowReports};
 
 /// The `tracing` target of everything this crate logs: a thread class the operating
 /// system refused, and a pump that has been told to exit and is still waiting for the
@@ -123,6 +182,7 @@ const _: () = {
     const fn send_sync<T: ?Sized + Send + Sync>() {}
     const fn send<T: ?Sized + Send>() {}
     const fn plain<T: Copy + Send + Sync + 'static>() {}
+    const fn shared<T: Clone + Send + Sync + 'static>() {}
     // The bounds of `lactose-rhi-api`'s `SurfaceSource`, which is implemented for every
     // type that meets them, and `'static`, which an `Arc<dyn SurfaceSource>` needs.
     const fn surface_source<T: HasWindowHandle + HasDisplayHandle + Send + Sync + 'static>() {}
@@ -132,8 +192,10 @@ const _: () = {
     }
     let _ = workers_platform::<ClientPlatform>;
 
-    // The window goes to a backend as a surface source, and to any thread for its reports.
+    // The window goes to a backend as a surface source, and its reports to any thread,
+    // cloned as often as their readers want.
     surface_source::<Window>();
+    shared::<WindowReports>();
     plain::<PixelSize>();
     send_sync::<WindowDesc>();
     send_sync::<ClientPlatform>();

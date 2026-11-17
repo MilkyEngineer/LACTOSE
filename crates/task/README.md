@@ -194,6 +194,12 @@ and list what changed, because `lactose-ecs` is written against this surface.
 - `wake` is called on the submitting thread each time a call is queued.
 - Calls from one sender run in submission order. If the pump is dropped, pending and later
   calls resolve to an error of kind `Cancelled`.
+- A lane has two locks, which architecture section 3 permits on the per-frame path (D159):
+  its queue's, taken by `Lane::run` to queue a call, by each `LanePump::drain` to take what
+  is queued and by the pump's drop to close the lane; and each call's reply slot, taken to
+  store the call's result, when it returns or is dropped unrun, and by each poll of its
+  `LaneCall`. Neither is held while a call runs or while a waker is woken, and neither is
+  taken while the other is held.
 
 **Chaos**
 

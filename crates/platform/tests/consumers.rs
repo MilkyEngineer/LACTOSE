@@ -6,13 +6,14 @@
 
 #![allow(dead_code, unused_variables, missing_docs)]
 
+use std::process::{Command, ExitStatus, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use lactose_core::{Error, ErrorKind, Result};
 use lactose_platform::{
     ClientPlatform, EventPump, MainThread, PixelSize, PresentThread, Window, WindowDesc,
-    event_pump, present_thread,
+    WindowReports, event_pump, present_thread,
 };
 use lactose_task::{
     CoreTopology, Executor, Lane, Platform, StdPlatform, ThreadHandle, ThreadSpec, WorkerClass,
@@ -22,12 +23,13 @@ use raw_window_handle::{HandleError, HasDisplayHandle, HasWindowHandle};
 // ---- 0. Stand-ins for `lactose-rhi-api`, which this crate never names ----
 //
 // Each has the bounds and the receiver of the item it stands for on the branch `rhi-api`
-// (`SurfaceSource`, `DeviceRequest::surface`, `Device`, `Swapchain`), and nothing else.
+// (`SurfaceSource`, `DeviceRequest::surface`, `Device`, `Swapchain`, `Rule`), and nothing
+// else.
 
 mod rhi {
     use std::sync::Arc;
 
-    use lactose_core::Result;
+    use lactose_core::{Error, Result};
     use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 
     pub trait SurfaceSource: HasWindowHandle + HasDisplayHandle + Send + Sync {}
@@ -64,7 +66,20 @@ mod rhi {
         fn extent(&self) -> Extent;
         fn acquire(&mut self) -> Result<Acquired>;
         fn present(&mut self, image: u32) -> Result<Presented>;
+        /// Refused as `Rule::Pending` while a present is pending.
         fn resize(&mut self, extent: Extent) -> Result<()>;
+    }
+
+    /// What a backend refuses a call by.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub enum Rule {
+        Pending,
+    }
+
+    impl Rule {
+        pub fn of(error: &Error) -> Option<Self> {
+            todo!()
+        }
     }
 
     /// A backend's constructor. It reads the window's two handles, once each, on the
@@ -84,11 +99,12 @@ mod rhi {
 mod frame {
     use core::cell::Cell;
     use std::sync::Arc;
+    use std::time::{Duration, Instant};
 
     use lactose_core::Result;
-    use lactose_task::Lane;
+    use lactose_task::{Executor, Lane};
 
-    use super::rhi::{Acquired, Device, Extent, Presented, Swapchain};
+    use super::rhi::{Acquired, Device, Extent, Presented, Rule, Swapchain};
 
     /// What the present thread owns. `Send` and not `Sync`, as the swapchain is: the lane
     /// asks for no more.
@@ -105,13 +121,22 @@ mod frame {
             Self { device: None, swapchain: None, asked: None, presents: Cell::new(0) }
         }
 
-        /// One present, on the present thread: every call here may block, and none of
-        /// them is made anywhere else.
+        /// One present, on the present thread: every call here may block, within a bound,
+        /// and none of them is made anywhere else.
         fn present(&mut self, size: Option<Extent>) -> Result<bool> {
             let (Some(device), Some(size)) = (&self.device, size) else { return Ok(false) };
             if self.asked != Some(size) {
                 match &mut self.swapchain {
-                    Some(swapchain) => swapchain.resize(size)?,
+                    Some(swapchain) => match swapchain.resize(size) {
+                        Ok(()) => {}
+                        // `resize` has waited, within its bound, for the swapchain's
+                        // presents; a refusal as pending past that bound is retried at the
+                        // next call, not returned.
+                        Err(error) if Rule::of(&error) == Some(Rule::Pending) => {
+                            return Ok(false);
+                        }
+                        Err(error) => return Err(error),
+                    },
                     None => self.swapchain = Some(device.create_swapchain(size)?),
                 }
                 self.asked = Some(size);
@@ -135,6 +160,16 @@ mod frame {
                 }
             }
         }
+
+        /// The present thread's last call at shutdown. It waits, within a bound, for the
+        /// points its presents signalled; dropping the swapchain waits for the swapchain's
+        /// own presents; and it drops its clone of the device. A bound that expires is
+        /// logged and the drops are made anyway. What `stop` then hands back holds nothing
+        /// of the window.
+        pub fn wind_down(&mut self) {
+            self.swapchain = None;
+            self.device = None;
+        }
     }
 
     /// What the frame reads of the window, as `lactose-app` would declare it.
@@ -145,13 +180,22 @@ mod frame {
     }
 
     /// The frame's presents: one call on the lane at a time, each awaited, so a present
-    /// that blocks holds this task and no worker, and the lane never holds a second.
-    pub async fn frames(shown: &dyn Shown, present: &Lane<Presenter>) -> Result<u64> {
+    /// that blocks holds this task and no worker, and the lane never holds a second. A
+    /// call that presented nothing paces nothing, so the frame then waits for its next
+    /// deadline; in `lactose-app` the timer root paces the frame (architecture section 5.1).
+    pub async fn frames(
+        executor: &Executor,
+        shown: &dyn Shown,
+        present: &Lane<Presenter>,
+    ) -> Result<u64> {
+        const FRAME: Duration = Duration::from_millis(16);
         let mut presented = 0;
         while !shown.close_requested() {
             let size = shown.extent();
             if present.run(move |presenter| presenter.present(size)).await?? {
                 presented += 1;
+            } else {
+                executor.sleep_until(Instant::now() + FRAME).await?;
             }
         }
         Ok(presented)
@@ -160,8 +204,9 @@ mod frame {
 
 // ---- 2. `lactose-app-client`: the one crate that names this one ----
 
-/// The adapter from this crate's window to what the frame reads.
-struct ShownWindow(Arc<Window>);
+/// The adapter from this crate's window to what the frame reads. It holds the reports and
+/// no `Arc<Window>`, so wherever `app` keeps it, it keeps nothing open.
+struct ShownWindow(WindowReports);
 
 impl frame::Shown for ShownWindow {
     fn extent(&self) -> Option<rhi::Extent> {
@@ -183,45 +228,66 @@ fn workers() -> Workers {
     Workers { platform: Some(Arc::new(ClientPlatform::new())) }
 }
 
+/// Queues `exit` when it is dropped, a panic's unwinding included, and does not wait for
+/// it: the first step of every shutdown.
+struct ExitOnDrop(Lane<MainThread>);
+
+impl Drop for ExitOnDrop {
+    fn drop(&mut self) {
+        drop(self.0.run(|main| main.exit()));
+    }
+}
+
 /// The device is made inside a main-lane call, which is where the window lends its
-/// handles; the window's `Arc` goes to the backend as its surface source and to the
-/// frame for its reports.
-async fn start(main: &Lane<MainThread>) -> Result<(Arc<dyn rhi::Device>, Arc<Window>)> {
+/// handles; the window's `Arc` goes to the backend as its surface source, and the frame
+/// takes the reports alone.
+async fn start(main: &Lane<MainThread>) -> Result<(Arc<dyn rhi::Device>, WindowReports)> {
     main.run(|main| {
         let window = main.window();
-        let surface: Arc<dyn rhi::SurfaceSource> = window.clone();
+        let reports = window.reports();
+        let surface: Arc<dyn rhi::SurfaceSource> = window;
         let device = rhi::create_device(rhi::DeviceRequest { surface: Some(surface) })?;
-        Ok((device, window))
+        Ok((device, reports))
     })
     .await?
 }
 
-/// The client's root task: start, frames, and the shutdown that every path takes.
+/// The client's root task: start, frames, and the shutdown that every path takes, in the
+/// order of `README.md`, "Shutdown".
 async fn root(
+    executor: Executor,
     main: Lane<MainThread>,
     present: Lane<frame::Presenter>,
     thread: PresentThread<frame::Presenter>,
 ) -> Result<u64> {
+    let exit = ExitOnDrop(main.clone());
+    let mut device = None;
     let ran = async {
-        let (device, window) = start(&main).await?;
-        let on_thread = device.clone();
+        let (made, reports) = start(&main).await?;
+        let on_thread = made.clone();
+        device = Some(made);
         present.run(move |presenter| presenter.device = Some(on_thread)).await?;
-        let shown = ShownWindow(window);
-        frame::frames(&shown, &present).await
-        // `device`, `shown` and with it the window's `Arc` are dropped here, on a worker.
+        frame::frames(&executor, &ShownWindow(reports), &present).await
     }
     .await;
-    // The present thread runs what was queued, hands its state back and is gone. The
-    // state holds the swapchain and a clone of the device, which holds the window: both
-    // are destroyed on the main thread, and only then is the window no one else's.
-    let presenter = thread.stop().await;
-    let left = main
-        .run(move |main| {
-            drop(presenter);
-            main.exit();
-        })
-        .await;
-    left.and(ran)
+    // 1. `exit` first, not awaited: it destroys nothing while an `Arc<Window>` is held, and
+    //    the pump drains main-lane calls until the last one goes.
+    drop(exit);
+    // 2. No present is queued from here; the present thread's last call.
+    let last = present.run(frame::Presenter::wind_down).await;
+    // 3. The state comes back with nothing of the window in it.
+    let stopped = thread.stop().await.map(drop);
+    // 4. Off the frame workers: every point the host owes that a pending submit waits on is
+    //    signalled, the device's last points are waited for within a bound, and every
+    //    encoder and every `Device` clone but one is dropped.
+    let waited = executor.spawn(WorkerClass::Background, async move { device }).await;
+    // 5. A main-lane call drops the last, which then waits for nothing; MoltenVK's view
+    //    observation is removed on the view's thread.
+    let dropped = match waited {
+        Ok(device) => main.run(move |_| drop(device)).await,
+        Err(error) => Err(error),
+    };
+    last.and(stopped).and(dropped).and(ran)
 }
 
 /// `main`: the pump is made first and run last, and nothing after `run` touches the
@@ -238,7 +304,11 @@ fn client_main() -> Result<()> {
     // that the first call fills.
     let (present, thread) =
         present_thread(executor.platform().as_ref(), frame::Presenter::empty())?;
-    let task = executor.spawn(WorkerClass::FrameCritical, root(main, present, thread));
+    let task =
+        executor.spawn(WorkerClass::FrameCritical, root(executor.clone(), main, present, thread));
+    // 6. `run` returns once the last `Arc<Window>` goes; `main` then waits for its root
+    //    task and shuts the executor down, and nothing that runs from here holds the device
+    //    or the window.
     pump.run()?;
     let frames = executor.block_on(task);
     executor.shutdown();
@@ -265,37 +335,59 @@ fn handles_off_the_main_thread(window: &Window) {
 
 // ---- 4. The `swapchain` lane's tests: a resize, a minimised window, a shutdown ----
 
-/// A fixed number of frames presented across a resize: the test asks for a size on the
-/// main thread and reads the report from where it stands.
+/// How long a test waits for the operating system to answer a request.
+const ANSWER: Duration = Duration::from_secs(2);
+/// How often it looks: a resize and a minimise wake no one.
+const POLL: Duration = Duration::from_millis(10);
+
+/// Frames presented across a resize: the test asks for a size on the main thread and
+/// reads the report from where it stands. It returns the size given, or `None` if the
+/// operating system gave none before the deadline, which the lane records as a refusal and
+/// not as a failure.
 async fn across_a_resize(
+    executor: &Executor,
     main: &Lane<MainThread>,
     present: &Lane<frame::Presenter>,
-    window: &Window,
-) -> Result<()> {
-    let before = window.size();
+    reports: &WindowReports,
+) -> Result<Option<PixelSize>> {
+    let before = reports.size();
     let asked = PixelSize { width: before.width / 2, height: before.height / 2 };
     main.run(move |main| main.request_size(asked)).await?;
-    while window.size() == before {
-        lactose_task::yield_now().await;
+    let deadline = Instant::now() + ANSWER;
+    while reports.size() == before {
+        if Instant::now() >= deadline {
+            return Ok(None);
+        }
+        executor.sleep_until(Instant::now() + POLL).await?;
     }
-    let size = window.size();
-    let extent = rhi::Extent { width: size.width, height: size.height };
+    let size = reports.size();
     let presents = present
         .run(move |presenter| {
             presenter.asked = None;
             presenter.presents.get()
         })
         .await?;
-    Ok(())
+    Ok(Some(size))
 }
 
 /// The drawable made to block: the window is minimised, and the call that blocks returns
-/// how long it took, which is how the present thread records a block of a second.
+/// how long it took, which is how the present thread records a block of a second. What
+/// the operating system reported of the minimise comes back with it, so a refused
+/// minimise is not read as a drawable that does not block.
 async fn a_blocked_drawable(
+    executor: &Executor,
     main: &Lane<MainThread>,
     present: &Lane<frame::Presenter>,
-) -> Result<Duration> {
+) -> Result<(Option<bool>, Duration)> {
     main.run(|main| main.set_minimised(true)).await?;
+    let deadline = Instant::now() + ANSWER;
+    let minimised = loop {
+        let reported = main.run(|main| main.is_minimised()).await?;
+        if reported != Some(false) || Instant::now() >= deadline {
+            break reported;
+        }
+        executor.sleep_until(Instant::now() + POLL).await?;
+    };
     let blocked = present
         .run(|presenter| {
             let start = Instant::now();
@@ -306,29 +398,31 @@ async fn a_blocked_drawable(
         })
         .await?;
     main.run(|main| main.set_minimised(false)).await?;
-    Ok(blocked)
+    Ok((minimised, blocked))
 }
 
-/// A shutdown with frames in flight: the stop is ordered behind every call queued before
-/// it, and the state comes back to be torn down in the caller's order.
+/// A shutdown with frames in flight, run on a background worker or on the test's own
+/// thread and never on a frame worker: the present thread's last call is ordered behind
+/// every call queued before it, the stop behind that, and the state that comes back holds
+/// nothing of the window.
 async fn with_frames_in_flight(
     present: Lane<frame::Presenter>,
     thread: PresentThread<frame::Presenter>,
-) -> Result<()> {
-    let last = present.run(|presenter| presenter.presents.get());
+) -> Result<u64> {
+    let in_flight = present.run(|presenter| presenter.presents.get());
+    let last = present.run(frame::Presenter::wind_down);
     let presenter = thread.stop().await?;
-    let presents = last.await?;
-    let frame::Presenter { swapchain, device, .. } = presenter;
-    drop(swapchain);
-    drop(device);
-    Ok(())
+    let presents = in_flight.await?;
+    last.await?;
+    assert!(presenter.swapchain.is_none() && presenter.device.is_none());
+    Ok(presents)
 }
 
-// ---- 5. `platform-impl`'s subprocess test ----
+// ---- 5. `platform-impl`'s subprocess test, and its parent ----
 
 /// It opens a window, pumps events, runs one call on the main thread and one on the
 /// present thread, and closes. The process's `main` is the test: a harness thread is not
-/// the main thread.
+/// the main thread. It prints each stage it reaches, for the parent.
 fn subprocess_main() -> Result<()> {
     let (main, pump): (Lane<MainThread>, EventPump) = event_pump(WindowDesc {
         title: "pump".to_owned(),
@@ -344,27 +438,63 @@ fn subprocess_main() -> Result<()> {
             index_in_class: 0,
         },
         Box::new(move || {
+            // Held before anything can fail: a check that fails below, by an error or by a
+            // panic's unwinding, still queues `exit`, and the pump returns.
+            let exit = ExitOnDrop(main.clone());
             let executor = Executor::builder().build().expect("an executor");
             executor
-                .block_on(async {
+                .block_on(async move {
                     let on_main = main.run(|main| main.window().size()).await?;
+                    println!("stage: a main-lane call ran");
                     let on_present = present
                         .run(|count| {
                             *count += 1;
                             std::thread::current().name().map(str::to_owned)
                         })
                         .await?;
+                    println!("stage: a present-thread call ran");
                     assert_eq!(on_present.as_deref(), Some("present"));
+                    // 1., then 3.: nothing was made from the window.
+                    drop(exit);
                     assert_eq!(thread.stop().await?, 1);
-                    main.run(|main| main.exit()).await
+                    println!("stage: stopped");
+                    Ok::<_, Error>(())
                 })
                 .expect("both calls ran");
             executor.shutdown();
         }),
     )?;
+    println!("stage: pumping");
     pump.run()?;
+    println!("stage: the pump returned");
     driver.join();
     Ok(())
+}
+
+/// The parent's side, in the test harness: every window subprocess runs under a deadline.
+/// Past it the parent kills the child and fails, naming the last stage the child printed.
+fn under_a_deadline(mut command: Command, deadline: Duration) -> ExitStatus {
+    let mut child = command.stdout(Stdio::piped()).spawn().expect("the subprocess starts");
+    let until = Instant::now() + deadline;
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("the subprocess is waited for") {
+            break Some(status);
+        }
+        if Instant::now() >= until {
+            child.kill().expect("the subprocess is killed");
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let output = child.wait_with_output().expect("the subprocess's output");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stage = stdout.lines().rev().find_map(|line| line.strip_prefix("stage: "));
+    status.unwrap_or_else(|| {
+        panic!(
+            "the subprocess passed its deadline of {deadline:?} after the stage {:?}",
+            stage.unwrap_or("none")
+        )
+    })
 }
 
 // ---- 6. A test's own platform: the present thread is made through any `Platform` ----
@@ -400,4 +530,28 @@ fn through_a_spy(spy: &Spy) -> Result<()> {
     drop(lane);
     drop(thread);
     Ok(())
+}
+
+/// A platform that accepts the body and drops it unrun: `present_thread` returns
+/// `Cancelled` and does not hang.
+struct Dropping;
+
+impl Platform for Dropping {
+    fn topology(&self) -> CoreTopology {
+        StdPlatform.topology()
+    }
+
+    fn spawn_thread(
+        &self,
+        spec: ThreadSpec,
+        body: Box<dyn FnOnce() + Send + 'static>,
+    ) -> Result<ThreadHandle> {
+        drop(body);
+        StdPlatform.spawn_thread(spec, Box::new(|| {}))
+    }
+}
+
+fn through_a_platform_that_drops_the_body() {
+    let refused = present_thread(&Dropping, String::new());
+    assert!(matches!(refused, Err(error) if error.kind() == ErrorKind::Cancelled));
 }

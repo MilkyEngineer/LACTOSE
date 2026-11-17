@@ -6,7 +6,7 @@ use std::sync::Arc;
 use lactose_core::Result;
 use lactose_task::{Lane, LanePump};
 
-use crate::window::{PixelSize, Window, WindowDesc};
+use crate::window::{PixelSize, Window, WindowDesc, WindowReports};
 
 /// Makes the process's event pump and the lane that reaches the main thread.
 ///
@@ -38,25 +38,31 @@ pub struct EventPump {
     state: MainThread,
     /// What the window is opened with when `run` starts.
     desc: WindowDesc,
+    /// The window's reports, which the pump writes, and which it turns closed when `run`
+    /// returns, whether or not the window was destroyed.
+    reports: WindowReports,
 }
 
 impl EventPump {
     /// Opens the window, then pumps events and drains the lane until the process is done
     /// with the window: it returns once [`MainThread::exit`] has been called and the
     /// window is let go, which is when every `Arc<Window>` that [`MainThread::window`]
-    /// returned, and every clone of one, has been dropped. It destroys the window on this
-    /// thread before it returns. It waits in the operating system between events and
-    /// never for another thread (`README.md`, "The main thread and its pump" and
-    /// "Shutdown").
+    /// returned, and every clone of one, has been dropped. It takes the window back with
+    /// `Arc::try_unwrap` on its own `Arc`, never by reading a count, and destroys it on
+    /// this thread before it returns. It waits in the operating system between events and
+    /// never for another thread; from `exit` until the window is let go it also wakes
+    /// every 50 ms to look (`README.md`, "The main thread and its pump" and "Shutdown").
     ///
-    /// Every call still queued when it returns, and every call queued later, resolves to
-    /// `ErrorKind::Cancelled`.
+    /// When it returns, with a value or an error, [`Window::close_requested`] is `true`,
+    /// and every call still queued, and every call queued later, resolves to
+    /// `ErrorKind::Cancelled`. A panic that unwinds out of it leaves the window to the
+    /// end of the process, as an error does.
     ///
     /// # Errors
     ///
     /// `ErrorKind::Platform` if the operating system refuses the window, before any call
     /// is drained, or if its event loop fails. Either way the lane's calls resolve to
-    /// `Cancelled`.
+    /// `Cancelled`, and a window still held is never destroyed.
     pub fn run(self) -> Result<()> {
         todo!()
     }
@@ -67,7 +73,8 @@ impl EventPump {
 /// Only the pump makes one, and only a call drained by [`EventPump::run`] sees it, so
 /// holding a `&mut MainThread` is being on the main thread while the window exists.
 pub struct MainThread {
-    /// The window, from the start of `run` to its return: what `window` hands out.
+    /// The window, from the start of `run` to its return: what `window` hands out. This is
+    /// the pump's own `Arc`, which `run` takes back with `Arc::try_unwrap`.
     window: Option<Arc<Window>>,
     /// Whether `exit` has been called.
     exit_requested: bool,
@@ -76,10 +83,10 @@ pub struct MainThread {
 }
 
 impl MainThread {
-    /// The window, to take off the main thread for its reports or to hand to a graphics
-    /// backend as the window its device presents to. Every call returns the one window,
-    /// and the pump runs until every `Arc` it returned, and every clone of one, has been
-    /// dropped.
+    /// The window, to hand to a graphics backend as the window its device presents to.
+    /// Every call returns the one window, and the pump runs until every `Arc` it returned,
+    /// and every clone of one, has been dropped. Whatever only reads the window's reports
+    /// takes [`Window::reports`] here and drops the `Arc`.
     #[must_use]
     pub fn window(&self) -> Arc<Window> {
         todo!()
@@ -92,14 +99,24 @@ impl MainThread {
         todo!()
     }
 
-    /// Asks the operating system to minimise the window, or to restore it.
+    /// Asks the operating system to minimise the window, or to restore it. The answer is
+    /// what [`is_minimised`](Self::is_minimised) reports, or none.
     pub fn set_minimised(&mut self, minimised: bool) {
         todo!()
     }
 
-    /// Tells the pump that the process is done with the window. [`EventPump::run`]
-    /// returns once the window is let go; until then it pumps events and drains calls as
-    /// before. A second call does nothing.
+    /// Whether the operating system reports the window minimised now, or `None` where it
+    /// does not say. A request of [`set_minimised`](Self::set_minimised) that the
+    /// operating system refused, or has not yet carried out, reads as the window was.
+    #[must_use]
+    pub fn is_minimised(&self) -> Option<bool> {
+        todo!()
+    }
+
+    /// Tells the pump that the process is done with the window. It destroys nothing
+    /// while an `Arc<Window>` is held: [`EventPump::run`] returns once the window is let
+    /// go, and until then it pumps events and drains calls as before, so a call queued
+    /// after this one still runs. A second call does nothing.
     pub fn exit(&mut self) {
         todo!()
     }
