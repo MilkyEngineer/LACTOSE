@@ -9,8 +9,10 @@
 //!
 //! A rollback is the world restored to its own state at the tick, corrected, and its
 //! `Teleported` set: a full pass at the tick of the previous one. A resync is the world
-//! restored to an earlier tick. Without the base drop, or without the lazy sink's count of
-//! drops, a sequence here fails, which the last two tests show.
+//! restored to an earlier tick; a hold is a tick in which the row does not move, after which
+//! a pass calls `begin` and `end` alone. Without the base drop, or without the lazy sink's
+//! count of drops, exactly the sequences the README's proof row names fail, which the last
+//! two tests show.
 
 #![forbid(unsafe_code)]
 
@@ -34,9 +36,11 @@ enum Event {
     Rollback(f64, u32),
     /// The world back at the earlier tick, at the position.
     Resync(u32, f64),
+    /// This many ticks in which the row does not move.
+    Hold(u32),
 }
 
-use Event::{Resync, Rollback, Step};
+use Event::{Hold, Resync, Rollback, Step};
 
 struct Sequence {
     name: &'static str,
@@ -112,6 +116,21 @@ const SEQUENCES: &[Sequence] = &[
         events: &[(17, Resync(3, 3.05)), (21, Resync(1, 1.05))],
         frames: 33,
     },
+    Sequence {
+        name: "RSS: the row still for two ticks, then a resync to the tick before the newest",
+        events: &[(12, Hold(1)), (16, Hold(1)), (17, Resync(3, 2.5))],
+        frames: 25,
+    },
+    Sequence {
+        name: "RSS3: the row still for three ticks, then a resync to the tick before the newest",
+        events: &[(12, Hold(1)), (16, Hold(1)), (20, Hold(1)), (21, Resync(4, 2.5))],
+        frames: 29,
+    },
+    Sequence {
+        name: "RSSR: RSS, then a rollback at the resync's tick in the next frame",
+        events: &[(12, Hold(1)), (16, Hold(1)), (17, Resync(3, 2.5)), (18, Rollback(2.6, 0))],
+        frames: 25,
+    },
 ];
 
 /// The README's rule with one part taken out, to show that a sequence needs it.
@@ -123,6 +142,11 @@ enum Mutation {
     /// The lazy sink's base counts at the tick it was taken whatever was dropped since.
     LazyTick,
 }
+
+/// The sequences that fail without the base drop, as `README.md`'s proof row names them.
+const BASE_DROP_FAILS: &[&str] = &["RSR", "RSSR"];
+/// The sequences that fail without the lazy sink's count of drops, as the row names them.
+const LAZY_COUNT_FAILS: &[&str] = &["RS", "RSR", "LZ", "RS2"];
 
 /// A placement and the tick of the state it shows.
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -311,6 +335,15 @@ fn run(sequence: &Sequence, mutation: Mutation) -> (Vec<String>, u32) {
                 teleport(rig.world_mut(), row, Tick(teleported));
                 history.insert(tick, rig.world().snapshot());
             }
+            Some(Hold(ticks)) => {
+                for _ in 1..=ticks {
+                    tick += 1;
+                    let x = position[&(tick - 1)];
+                    position.insert(tick, x);
+                    rig.step();
+                    history.insert(tick, rig.world().snapshot());
+                }
+            }
             Some(Resync(to, x)) => {
                 rig.world_mut().restore(&history[&to]).unwrap();
                 history.retain(|&at, _| at <= to);
@@ -374,25 +407,24 @@ fn the_sink_and_the_frame_agree_in_every_sequence() {
     }
 }
 
-/// Which sequences fail with a part of the rule taken out: at least one must.
+/// The short names of the sequences that fail with a part of the rule taken out.
 fn failing(mutation: Mutation) -> Vec<&'static str> {
     SEQUENCES
         .iter()
         .filter(|sequence| !run(sequence, mutation).0.is_empty())
-        .map(|sequence| sequence.name)
+        .map(|sequence| sequence.name.split(':').next().expect("a name"))
         .collect()
 }
 
+/// Exactly the sequences `README.md`'s proof row names as needing the base drop.
 #[test]
 fn without_the_base_drop_a_sequence_fails() {
-    let failed = failing(Mutation::NoDrop);
-    assert!(!failed.is_empty(), "the base drop is needed by some sequence");
-    println!("without the base drop: {failed:?}");
+    assert_eq!(failing(Mutation::NoDrop), BASE_DROP_FAILS);
 }
 
+/// Exactly the sequences `README.md`'s proof row names as needing the lazy sink's count of
+/// drops.
 #[test]
 fn without_the_lazy_sinks_count_of_drops_a_sequence_fails() {
-    let failed = failing(Mutation::LazyTick);
-    assert!(!failed.is_empty(), "the count of drops is needed by some sequence");
-    println!("without the count of drops: {failed:?}");
+    assert_eq!(failing(Mutation::LazyTick), LAZY_COUNT_FAILS);
 }

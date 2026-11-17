@@ -187,12 +187,36 @@ fn a_pass_is_full_when_extract_cannot_tell_what_changed() {
     }
 }
 
+/// The retention is counted back from this pass, not from the previous one: more ticks than
+/// `log_retention` with no pass, and a spawn logged only in the last of them, which the log
+/// still holds, make an incremental pass (review round 1, MINOR-3).
+#[test]
+fn a_change_logged_inside_the_retention_after_more_ticks_than_it_keeps() {
+    let simulation =
+        simulation_with(WorldKind::Server, LayoutConfig::default(), Tick(100), Some(3));
+    let mut rig = Rig::new(simulation, executor(2));
+    for n in 1..=4 {
+        let row = (at(0.0), mesh(n), Walker(Scalar::ONE));
+        rig.world_mut().spawn(key(n), REGION, row).unwrap();
+    }
+    assert!(rig.frame().expect("the first pass").pass.full);
+    for _ in 0..5 {
+        rig.step();
+    }
+    rig.world_mut().spawn(key(100), REGION, (at(0.0), mesh(100))).unwrap();
+    rig.step();
+    let pass = rig.frame().expect("the rows moved");
+    assert!(!pass.pass.full, "the log still reaches the previous pass's cursor");
+    assert!(pass.keys().contains(&key(100)), "the spawn is written as a forced row");
+}
+
 /// By counts, in a world of ten instances that stand still unless a test moves them: a row
 /// moved at one tick is written by the pass after it and once more, with the placement it
 /// stopped at, by the pass after the next tick, then not again; a row edited between ticks is
 /// written by the idle pass with `no_interpolate`, and once more by the next pass after a
-/// tick without it; an idle pass with nothing changed, a pass after a tick in which nothing
-/// moved since the tick before, and a `set_if_neq` of equal bytes call nothing.
+/// tick without it; an idle pass with nothing changed and a `set_if_neq` of equal bytes call
+/// nothing, and a pass after a tick in which nothing moved since the tick before calls `begin`
+/// and `end` and nothing between them, so the sink's `begin`s are at extract's pass ticks.
 #[test]
 fn a_row_is_written_by_the_pass_after_the_tick_that_moved_it_and_once_more() {
     for kind in [WorldKind::Server, WorldKind::Prediction] {
@@ -203,6 +227,14 @@ fn a_row_is_written_by_the_pass_after_the_tick_that_moved_it_and_once_more() {
         }
         rig.world_mut().insert(key(1), Shown(1)).unwrap();
         assert!(rig.frame().expect("the first pass").pass.full);
+        let bracket = |pass: Option<PassLog>| {
+            pass.is_some_and(|pass| {
+                !pass.pass.full
+                    && pass.removed.is_none()
+                    && pass.rows.is_empty()
+                    && pass.batches == 0
+            })
+        };
         let walk = |rig: &mut Rig, keys: &[u64], speed: f64| {
             for &n in keys {
                 rig.world_mut().get_mut::<Walker>(key(n)).unwrap().0 = scalar(speed);
@@ -228,7 +260,7 @@ fn a_row_is_written_by_the_pass_after_the_tick_that_moved_it_and_once_more() {
         assert!(pass.flagged().is_empty());
 
         assert_eq!(rig.tick_frame().expect("row 3 settles").keys(), vec![key(3)]);
-        assert_eq!(rig.tick_frame(), None, "nothing moved at this tick or the one before");
+        assert!(bracket(rig.tick_frame()), "nothing moved at this tick or the one before");
         assert_eq!(rig.frame(), None, "an idle pass with nothing changed");
 
         place(rig.world_mut(), key(5), 5.0);
@@ -239,12 +271,12 @@ fn a_row_is_written_by_the_pass_after_the_tick_that_moved_it_and_once_more() {
         let pass = rig.tick_frame().expect("the edited row settles");
         assert_eq!(pass.keys(), vec![key(5)]);
         assert!(pass.flagged().is_empty());
-        assert_eq!(rig.tick_frame(), None);
+        assert!(bracket(rig.tick_frame()));
 
         let same = *rig.world().get::<Transform>(key(6)).unwrap();
         assert!(!rig.world_mut().get_mut::<Transform>(key(6)).unwrap().set_if_neq(same));
         assert_eq!(rig.frame(), None, "equal bytes stamp nothing");
-        assert_eq!(rig.tick_frame(), None);
+        assert!(bracket(rig.tick_frame()));
         // A write through `get_mut` stamps whether or not the bytes changed.
         rig.world_mut().get_mut::<Transform>(key(6)).unwrap().translation.x = Scalar::ZERO;
         assert_eq!(rig.frame().expect("a stamp").keys(), vec![key(6)]);

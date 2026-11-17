@@ -94,8 +94,9 @@ pub struct ExtractPass {
     /// the sink holds for this kind of world that the pass does not write is gone. A pass
     /// is full when extract cannot tell what changed since its previous pass: the first
     /// pass after an output is installed or removed, the first after a restore, a
-    /// whole-world load or the change-stamp rebase, and the first after more ticks than
-    /// the structural log retains (`README.md`, "Full and incremental passes").
+    /// whole-world load or the change-stamp rebase, and the first after the structural
+    /// log trimmed a change logged since the previous pass (`README.md`, "Full and
+    /// incremental passes").
     pub full: bool,
 }
 
@@ -104,15 +105,18 @@ pub struct ExtractPass {
 ///
 /// One pass calls, in this order: [`begin`](Self::begin) once; [`removed`](Self::removed)
 /// at most once; [`write`](Self::write) any number of times, from several threads at
-/// once; [`end`](Self::end) once. A pass that has no key to remove and no row to write,
-/// and is not full, calls nothing. Between `begin` and `end` the world does not change.
+/// once; [`end`](Self::end) once. A pass at a tick other than the previous pass's always
+/// calls `begin` and `end`, with nothing between them if it has nothing to write, so the
+/// ticks of the sink's `begin`s are those of extract's passes; a pass at the previous
+/// pass's tick that is not full and has no key to remove and no row to write calls
+/// nothing. Between `begin` and `end` the world does not change.
 /// In a client's replicated world a pass writes no row: remote entities' placements are
 /// the interpolation buffer's, and presentation uploads them (`README.md`, "The extract
 /// set").
 ///
-/// Nothing here fails. A sink that cannot take a row (a ring whose regions are all in
-/// flight) waits or drops inside its own contract; extract has nothing to do with an
-/// error.
+/// Nothing here fails. `write` runs on the executor's workers inside extract's scope, so it
+/// never blocks and takes no lock: a sink that cannot take a row (a ring whose regions are
+/// all in flight) drops it and counts the drop. Extract has nothing to do with an error.
 pub trait InstanceSink: Send + Sync {
     /// A pass starts.
     fn begin(&mut self, pass: ExtractPass);
@@ -255,7 +259,7 @@ impl ExtractState {
         };
 
         if let Some(sink) = self.sink.as_deref_mut() {
-            write_instances(world, job, sink, &pass, full, &entries);
+            write_instances(world, job, sink, &pass, full, follows, &entries);
         }
         if let Some(writer) = &mut self.snapshot {
             let presented = Presented::new(world);
@@ -427,14 +431,17 @@ fn any_changed(column: Option<ErasedColumn<'_>>, from: ChangeMark) -> bool {
 }
 
 /// The sink's half of a pass: `begin`, `removed`, the writes from the pass's forked jobs,
-/// `end`; nothing when an incremental pass has nothing to say (`README.md`, "What a pass
-/// gives the sink").
+/// `end`; nothing when an incremental pass at the previous pass's tick has nothing to say.
+/// A pass that `follows` a tick brackets `begin` and `end` even with nothing between them:
+/// the sink takes and drops its bases at the ticks of its `begin`s (`README.md`, "What a
+/// pass gives the sink").
 fn write_instances(
     world: &World,
     job: &mut Job<'_, '_>,
     sink: &mut dyn InstanceSink,
     pass: &Pass,
     full: bool,
+    follows: bool,
     entries: &[LogEntry],
 ) {
     let mut removed: Vec<StableKey> = entries
@@ -490,7 +497,7 @@ fn write_instances(
                 && pass.writes_in(chunk)
         })
         .collect();
-    if !full && removed.is_empty() && forced.is_empty() && chunks.is_empty() {
+    if !full && !follows && removed.is_empty() && forced.is_empty() && chunks.is_empty() {
         return;
     }
 
