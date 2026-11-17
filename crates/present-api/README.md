@@ -74,7 +74,7 @@ through `extract_state` alone ("Placement and state").
 | `lactose-physics-api` | Its `Transform` and `Teleported` extracted, the second compared with the last tick covered | "The no-interpolate flag"; `PresentFrame::transform` |
 | `lactose-anim` | `AnimRig`, `AnimState` and `SimPose` beside the root transform, for the render pose | They are `extracted`, so a row with any of them is a presented row and the snapshot holds all three with its `Transform` ("The snapshot") |
 | `lactose-net-api`, `lactose-net-host` | `RemoteSlot` to reach presentation; remote transforms kept out of extract | `RemoteSlot` is `extracted`, so the replicated world's snapshot holds it; that world's passes copy and write no transform ("The extract set") |
-| `lactose-predict` | Extract on the prediction world every frame; a rollback that redraws what moved and cuts nothing; a resync to an earlier tick that cuts; events not delivered twice | `Predictor::passes` runs the pass; a rollback makes the next pass full and not a `cut`, and in a frame with no step both outputs draw the corrected state from the tick before ("What the sink keeps", "Events and publication"); a pass at a tick earlier than the previous one flags every row and publishes a `cut` ("The triple buffer"); the events' keys are the ECS's; `present::extract` is in `EXCLUSIVE_SYSTEMS`; `app` reaches the state with `extract_state(predictor.simulation_mut())` |
+| `lactose-predict` | Extract on the prediction world every frame; a rollback that redraws what moved and cuts nothing; a resync to an earlier tick that cuts; events not delivered twice | `Predictor::passes` runs the pass; a rollback makes the next pass full and not a `cut`, and in a frame with no step both outputs draw the corrected state from the tick before ("What the sink keeps", "Events and publication"); a pass at a tick earlier than the previous one flags every row, makes the sink drop its bases and publishes a `cut` ("What the sink keeps", "The triple buffer"); the events' keys are the ECS's; `present::extract` is in `EXCLUSIVE_SYSTEMS`; `app` reaches the state with `extract_state(predictor.simulation_mut())` |
 | `game-present` | To turn the snapshot and the events into what the UI shows and what the overlay draws | `PresentSnapshot::{get, rows}` for the game's own `extracted` components; `ViewModels::set`; `DebugDraw::line` |
 | `lactose-ui` (milestone 5) | A value by type, or by key and field ID from a cooked layout | `ViewModels::{get, get_erased, iter}`, `ViewModel::{info, bytes}` with `TypeInfo::field_bytes` |
 | `lactose-audio` (milestone 5) | Requests to play, cancellations to stop | The frame's `PresentEventBatch`: `emitted` with `PresentEmission::get::<AudioRequest>()`, `cancelled` by key |
@@ -318,14 +318,18 @@ follows is the contract the renderer's sink implements, and a test's sink checks
 - The sink holds, per key and world kind, a previous placement, a current one and a
   *base*: the placement it held as current when the first pass of the current tick began,
   that is, at its `begin` for that kind whose `ExtractPass::tick` differs from the tick of
-  the `begin` before it. The base is the tick before's state as the render side placed it,
-  or none for a key the sink did not hold then.
+  the `begin` before it for that kind. The base is the tick before's state as the render
+  side placed it, or none for a key the sink did not hold then.
+- At a `begin` whose tick is earlier than the tick of the `begin` before it for that kind,
+  by the wrapping comparison, the sink drops every base of that kind and takes none until
+  the next tick: what it holds is of a later tick than the world, and leads into nothing.
 - A `write` sets the previous placement to the base and the current one to the row's.
   When `no_interpolate` is set, or the key has no base, it sets both to the row's and
   leaves the base as it was.
 - The base costs one more placement per key and kind. A sink may take it lazily, at a
   key's first write in a tick, from the current placement it holds then, which no write
-  has changed since the tick's first `begin`; it then also keeps the tick it took it at.
+  has changed since the tick's first `begin`; it then also keeps the tick it took it at,
+  and the tick of the last `begin` that dropped the bases, in which it takes none.
 - So the first write of a tick draws the instance from where the tick before left it, and
   a later write in the same tick draws it from that same place: not from where the frame
   before showed it, and not from a placement a flagged write of the tick put there. The
@@ -333,7 +337,10 @@ follows is the contract the renderer's sink implements, and a test's sink checks
   `no_interpolate` is a full pass in a prediction world, which is in practice a rollback in
   a frame with no step. `lactose-predict` reconciles every frame and ticks are fewer than
   frames, so a misprediction usually lands in such a frame. An idle pass and a full pass
-  in a `Server` world flag every row, and a `Client` world's passes write none.
+  in a `Server` world flag every row, and a `Client` world's passes write none. After a
+  resync to an earlier tick, whose pass flags every row, such a rollback finds no base and
+  shows the corrected state at once, as the frame does: its snapshot takes the place of a
+  cut, and is one.
 - The two outputs agree on a row that is both an instance and a presented row, when every
   pass is published before the next and the reader acquires every publication, as `app`
   runs them: the sink's previous and current placements are the frame's
@@ -341,9 +348,9 @@ follows is the contract the renderer's sink implements, and a test's sink checks
   to the row's exactly when the frame's `no_interpolate` is set. Two exceptions. A key new
   to the sink whose row the older snapshot holds (a row that gains a `MeshInstance`, a
   sink installed while a world is shown) is shown by the sink at its placement until the
-  next tick, while the frame interpolates the row. After an edit made between ticks, the
-  frame shows every presented row at the newer state ("A frame's transforms"), while the
-  sink goes on interpolating the rows the edit did not touch.
+  next tick, while the frame interpolates the row. After an edit made between ticks, until
+  the next tick, the frame shows every presented row at the newer state ("A frame's
+  transforms"); the sink does not.
 - Comparing the tick of each `begin` and not extract's previous pass gives the same
   placements: a pass calls nothing only when no instance moved at its tick or at the tick
   before ("Settling"), so every placement the sink holds is then the state of both, and a
@@ -364,8 +371,8 @@ follows is the contract the renderer's sink implements, and a test's sink checks
   a tick;
 - on every row of a pass whose tick is earlier than the previous pass's, by the wrapping
   comparison: a prediction world resynchronised to an earlier tick (`Predictor::resync`),
-  where nothing the sink holds leads into the state. The snapshot of such a pass is a cut
-  ("The triple buffer");
+  where nothing the sink holds leads into the state, and the sink drops its bases ("What
+  the sink keeps"). The snapshot of such a pass is a cut ("The triple buffer");
 - otherwise, when the row has a `Teleported` whose tick is not zero and is later than the
   pass's *covered tick*, by the wrapping comparison of ticks (the difference is in
   `1..2^31`). The covered tick is the world's tick at the previous pass or, at a pass of
@@ -380,7 +387,7 @@ follows is the contract the renderer's sink implements, and a test's sink checks
 - A full pass in a prediction world, which a rollback causes at every misprediction,
   follows the last two rules alone. In a frame with no step its tick is the previous
   pass's: the sink draws each row it writes from its base, and the snapshot takes the place
-  of the newest published one ("Events and publication"), so both draw the local player
+  of the one published last ("Events and publication"), so both draw the local player
   from the state at the tick before to where the corrected run puts it, over what is left
   of the tick, also when a teleport earlier in the tick was flagged and shown at once. A
   correction that re-simulates that tick alone sets `Teleported` at it, after the covered
@@ -419,28 +426,53 @@ follows is the contract the renderer's sink implements, and a test's sink checks
   lock, copies nothing and never waits for a pass; a pass never waits for the reader. The
   lock is held for the exchange alone, never while a snapshot is written or read. The
   code is safe Rust.
-- `acquire` returns the two newest published snapshots, older first, or `None` before the
-  first publication. With one published, both are that one. Called again before another
-  publication it returns the same pair. A snapshot that takes another's place ("Events and
-  publication") is published in its place, and the one it replaced is no longer published.
+- `acquire` returns `None` before the first publication, and called again with nothing
+  published since, the same pair. Otherwise its newer snapshot is the newest published,
+  and its older the snapshot that one follows, if the channel still has it (published, or
+  held by the reader), else the reader's newer one. A snapshot follows the newest the
+  channel had when it was published: the newest published, else the reader's newer. One
+  that takes another's place ("Events and publication") follows what that one followed,
+  and once acquired a snapshot follows the older of its pair. So a reader that acquires
+  every publication gets the two newest published, and the first acquire returns the one
+  snapshot published twice. An acquire stops publishing every snapshot published before
+  its newer one: no later pair holds them.
 - When the writer needs a buffer and none is free, the newest published snapshot is one
-  the reader has not acquired: the writer takes it back and writes it. A reader slower
-  than the passes therefore misses snapshots, never blocks a pass, and its pair then spans
+  the reader does not hold: the writer takes it back and writes it. A reader slower than
+  the passes therefore misses snapshots and never blocks a pass, and its pair then spans
   more than one pass. Nothing the reader holds is ever written.
+- An acquire made while nothing published after the reader's newer snapshot is still
+  published (a pass took back the latest publication and is writing it) returns the
+  reader's newer snapshot twice, and lets the older one go. With three buffers, the
+  writer's and the reader's two, nothing else is left: a reader that held its pair there
+  instead, acquiring at that point every time, would never see a later snapshot. Letting
+  go, it leaves the next pass a free buffer, so what that pass publishes stays published,
+  and the acquire after pairs the snapshot with it.
 - `PresentSnapshot::cut` is set on a snapshot nothing before it leads into:
   - the snapshot of a full pass in a `Server` or `Client` world (a load, a restore, a
     world shown for the first time);
-  - in every kind, a snapshot whose tick is earlier than the newest published snapshot's,
-    by the wrapping comparison, which `publish` makes: in a prediction world, a resync to
-    an earlier tick (`Predictor::resync` to an earlier clock target);
+  - in every kind, a snapshot whose tick is earlier than the tick of the snapshot
+    published last, whether or not that one is still published, by the wrapping
+    comparison, which `publish` makes: in a prediction world, a resync to an earlier
+    tick (`Predictor::resync` to an earlier clock target);
   - a snapshot that takes the place of a cut ("Events and publication").
-- The channel remembers a published cut until an acquire returns the latest snapshot
-  published, and every snapshot published meanwhile is marked a cut as well. So the first
-  acquire after a cut is published has a cut as its newer snapshot, whatever was taken
-  back, replaced or published since, and a cut taken back before any acquire saw it still
-  reaches the reader. That snapshot may be of a later pass than the one that cut: what a
-  reader is guaranteed is that it blends nothing across a cut, not that it sees the cut's
-  own state.
+- The channel keeps a *mark*: the last snapshot published that is a cut by one of the
+  causes above, including one a second pass kept before `publish` ("Events and
+  publication"). Until an acquire returns a newer snapshot published at or after the mark,
+  every snapshot published is marked a cut as well, and a snapshot marked so does not move
+  the mark. So the first acquire whose newer snapshot was published since a cut has a cut
+  as its newer one, whatever was taken back, replaced or published after it, and a cut
+  taken back before any acquire saw it still reaches the reader. That snapshot may be of
+  a later pass than the one that cut: what a reader is guaranteed is that it blends
+  nothing across a cut, not that it sees the cut's own state. An acquire made while a
+  pass writes a snapshot it took back may return a snapshot from before the cut twice,
+  which blends nothing either.
+- The mark is passed at the latest by the third acquire after it that follows a
+  publication: one may return a pair from before it, the next then finds nothing published
+  after its newer snapshot and returns that one twice, and the third pairs it with what
+  the pass after published. A reader that acquires every publication passes it at the
+  first. Marking every snapshot until an acquire returned the latest one published would
+  keep marking them for good under a reader that acquires once per two publications,
+  while the second pass writes the first's taken-back buffer.
 - Any other full pass in a prediction world is not a cut: it is a rollback, or a resync to
   the tick shown or a later one (`Predictor::resync` sets the tick and changes no row).
   `lactose-predict` reports a resync, and presentation blends a correction.
@@ -459,13 +491,13 @@ follows is the contract the renderer's sink implements, and a test's sink checks
   snapshot to publish the events are appended alone. With no writer installed the batch
   is dropped, and so is every batch once the channel's reading half has been dropped:
   nothing accumulates for a reader that will never acquire.
-- A snapshot written by a full pass in a prediction world, of the tick of the newest
-  published snapshot, takes that snapshot's place instead of following it: the older of
-  the published pair stays, so a rollback in a frame with no step publishes the pair
-  (S_{t-1}, S_t') and not (S_t, S_t'). The corrected state is interpolated to from the
-  tick before, as the sink's placements are ("What the sink keeps"). A snapshot that takes
-  the place of a cut is a cut. The events published with the replaced snapshot are not
-  affected.
+- A snapshot written by a full pass in a prediction world, of the tick of the snapshot
+  published last, takes that snapshot's place instead of following it: it follows what
+  that one followed ("The triple buffer"), and is published in its place if that one
+  still is, so a rollback in a frame with no step gives the pair (S_{t-1}, S_t') and not
+  (S_t, S_t'). The corrected state is interpolated to from the tick before, as the sink's
+  placements are ("What the sink keeps"). A snapshot that takes the place of a cut is a
+  cut. The events published with the replaced snapshot are not affected.
 - Events travel beside the snapshots, not in them: each emission is in exactly one
   frame's batch, whether or not the snapshot it was published with was ever acquired.
   Batches published between two acquires are folded in publication order by the ECS's own
@@ -489,8 +521,13 @@ follows is the contract the renderer's sink implements, and a test's sink checks
   tick, by the wrapping comparison.
 - A pair is of one tick, or a pass writes a snapshot of the tick already published, in
   these cases and no other:
-  - The first snapshot a channel publishes is published alone, so the pair is that
-    snapshot twice until a snapshot of another tick is published.
+  - The first snapshot a channel publishes is published alone, so the pair is of its
+    tick until a snapshot of another tick is published.
+  - An acquire made while a pass writes a snapshot it took back returns the reader's newer
+    snapshot twice ("The triple buffer"): shown at its state, with nothing drawn in
+    between, until the next acquire pairs it with what that pass published. A full pass in
+    a prediction world of that snapshot's tick then pairs from it, not from the tick
+    before, which the reader let go.
   - An idle pass after an edit made between ticks to a presented row publishes a snapshot
     of the same tick beside the one before it, so until the next publication of a
     snapshot of another tick every presented row is shown at the newer state with
@@ -586,11 +623,11 @@ policies and the sizes at build.
 | The extract set | A world of each kind with instances, presented rows, rows that are both and rows that are neither: a counting sink and the snapshot hold exactly the stated rows; a prediction world's unclaimed rows are in neither; a `Client` world's sink gets no row and its snapshot no `Transform` |
 | Full passes | The first pass, a pass after `set_sink` or `set_snapshot`, after a restore, after a whole-world load, after more than the retention's ticks with no pass: `full`, every instance written, no `removed`; `no_interpolate` and `cut` by kind |
 | Incremental passes | A row moved at one tick is written by the pass after it and by the pass after the next tick, then not again; a row edited between ticks is written by an idle pass with `no_interpolate`; an idle pass with nothing changed calls nothing; a `set_if_neq` of equal bytes writes nothing |
-| A rollback in a frame with no step | A prediction world moving a row one unit a tick, four frames a tick, corrected in the frame after a tick: a sink that keeps placements by this file's rule and `PresentFrame::transform` give the same placement at every frame, interpolated from the tick before to the corrected state; with the correction's `Teleported` at that tick, both show the corrected state at once. The same holds, frame by frame, for: a teleport predicted at the newest tick and undone by a correction of depth two or more (T2); two rollbacks in one tick's window, the first flagged and the second not (R2), and neither flagged; a catch-up of three ticks then a rollback, with and without a teleport at its last tick; a rollback before the world's first tick is shown; and a resync to an earlier tick, which both show at once |
+| A rollback in a frame with no step | A prediction world moving a row one unit a tick, four frames a tick, corrected in the frame after a tick: a sink that keeps placements by this file's rule and `PresentFrame::transform` give the same placement at every frame, interpolated from the tick before to the corrected state; with the correction's `Teleported` at that tick, both show the corrected state at once. The same holds, frame by frame, for: a teleport predicted at the newest tick and undone by a correction of depth two or more (T2); two rollbacks in one tick's window, the first flagged and the second not (R2), and neither flagged; a catch-up of three ticks then a rollback, with and without a teleport at its last tick; a rollback before the world's first tick is shown; a resync to an earlier tick, which both show at once; and that resync followed in the next frame by a rollback at its tick (RSR), which both show at once, the sink from no base. No frame of these draws either output from a placement of a later tick than the one it draws to |
 | Removals | A despawn, an unload, a removed `MeshInstance`, a released claim: listed once, in key order; a key that left and came back is listed and written |
 | The flag | A teleport at each tick of a three-tick frame flags the row; a saved `Teleported` does not; tick zero does not; every row of a pass at a tick earlier than the previous pass's is flagged; the comparisons hold across the tick's wrap |
 | Layout and workers | The sink's rows sorted by key, and the snapshot's bytes, are equal under every layout capacity, chunk order and worker count of SOUR's modes |
-| The triple buffer | A reader that acquires every publication, every second and never: the pair is always the two newest published, a held snapshot is never written, and no pass waits; after a cut is published the next acquire's newer snapshot is a cut, also when a snapshot was taken back, replaced or published after it, and when the cut itself was taken back; a snapshot of a tick earlier than the newest published one's is a cut in every kind, so no pair's older snapshot is of a later tick than its newer one unless that one is a cut; a prediction world's full pass at the newest published tick replaces that snapshot and keeps its cut; a snapshot a second pass updates before `publish` keeps a cut and a full mark; with the reader dropped, `publish` keeps no event. A property test over sequences of write, publish and acquire checks these after every step, with `Arc::get_mut` asserting that the buffer the writer writes is shared with nobody: the exchange is safe Rust under one lock, so loom and Miri would check nothing the test does not |
+| The triple buffer | A reader that acquires every publication, every second, never, and once per two publications while the second pass writes the first's taken-back buffer: a held snapshot is never written and no pass waits; a reader that acquires every publication gets the two newest published; after the first publication no pair holds one snapshot twice except the reader's newer while a pass writes a snapshot it took back, and never two such pairs in a row; the first acquire whose newer snapshot was published since a cut has a cut as its newer one, also when a snapshot was taken back, replaced or published after it, and when the cut itself was taken back; the mark is passed by the third acquire after it that follows a publication, and in the slow cadence after one pair; a snapshot of a tick earlier than the snapshot published last is a cut in every kind, so no pair's older snapshot is of a later tick than its newer one unless that one is a cut; a prediction world's full pass at the tick published last takes that snapshot's place, keeps its cut and pairs from what it followed; a snapshot a second pass updates before `publish` keeps a cut and a full mark; with the reader dropped, `publish` keeps no event. A property test over sequences of write, publish and acquire checks these after every step, with `Arc::get_mut` asserting that the buffer the writer writes is shared with nobody: the exchange is safe Rust under one lock, so loom and Miri would check nothing the test does not |
 | Events | Each emission is in exactly one frame's batch across skipped and taken-back snapshots; an emission and its cancellation between two acquires are in neither list; a rollback's re-emission is not delivered again |
 | The frame | `transform` for a moved, a teleported, a new and a `Client`-world row; one-tick pairs and cuts do not interpolate |
 | View-models and debug draw | `set`, `get`, `remove`, erased reads by field ID, key order; a key collision panics; a non-`derived` type does not build (a compile-fail case); the segments of each shape |

@@ -1,7 +1,8 @@
 //! The presentation snapshot (architecture section 5.3): the only simulation-derived data
 //! the render side reads while the next tick runs. Extract writes one after a tick, the
-//! presentation schedule reads the two newest published and interpolates between them, and
-//! three buffers are enough for the two never to wait for each other.
+//! presentation schedule reads the newest published and the one it follows and
+//! interpolates between them, and three buffers are enough for the two never to wait for
+//! each other.
 //!
 //! A snapshot holds the *presented rows* of its world: the rows presentation works on,
 //! each with every extracted component it has. The bulk of a scene, rows that are only an
@@ -36,20 +37,54 @@ pub fn snapshot_channel() -> (SnapshotWriter, SnapshotReader) {
 
 /// What the two halves share: which buffers are published, which is free, the events
 /// published since the reader last acquired, and whether a cut is still to reach it.
+/// Snapshots are told apart by their publication number, not their buffer, which a take-back
+/// writes again.
 #[derive(Debug, Default)]
 struct Exchange {
-    /// The two newest published snapshots, older first; one after the first publication.
-    published: Vec<Arc<PresentSnapshot>>,
-    /// The buffers that are neither published nor being written.
+    /// The snapshots published after the reader's newer one, at most two, older first: an
+    /// acquire stops publishing every one published before its newer snapshot.
+    published: Vec<Published>,
+    /// The buffers that are neither published, held by the reader nor being written.
     free: Vec<Arc<PresentSnapshot>>,
     /// Every batch published since the reader's last acquire, folded into one. Dropped, not
     /// kept, once the reader is gone.
     events: PresentEventBatch,
-    /// Set when a cut is published, and cleared by an acquire that returns the latest
-    /// snapshot published; while it is set, every snapshot published is marked a cut, so
-    /// the next acquire's newer snapshot is one whatever was taken back, replaced or
-    /// published since (`README.md`, "The triple buffer").
+    /// How many snapshots were ever published: the next one's publication number.
+    publications: u64,
+    /// The snapshot published last, whether or not it is still published: a snapshot of an
+    /// earlier tick is a cut, and a prediction world's full pass of its tick takes its place.
+    last: Option<LastPublished>,
+    /// The publication numbers of the reader's pair, older first, and so the snapshot a
+    /// replacement of its newer one follows.
+    held: Option<[u64; 2]>,
+    /// The mark: the publication number of the last snapshot published that was a cut by its
+    /// own cause, until an acquire returns a newer snapshot published at or after it. While
+    /// it is set every snapshot published is marked a cut, and a snapshot marked so does not
+    /// move it (`README.md`, "The triple buffer").
+    cut_mark: Option<u64>,
+}
+
+/// A published snapshot and what an acquire pairs it with.
+#[derive(Debug)]
+struct Published {
+    snapshot: Arc<PresentSnapshot>,
+    /// Its publication number.
+    number: u64,
+    /// The publication number of the snapshot it follows: the newest the channel had when
+    /// it was published, or for one that took another's place what that one followed. An
+    /// acquire pairs it with that snapshot if the channel still has it, else with the
+    /// reader's newer one.
+    follows: Option<u64>,
+}
+
+/// What the exchange keeps of the snapshot published last once its buffer may be written
+/// again.
+#[derive(Debug, Clone, Copy)]
+struct LastPublished {
+    number: u64,
+    tick: Tick,
     cut: bool,
+    follows: Option<u64>,
 }
 
 /// The writing half of a snapshot channel. It has no public operation: a pass writes
@@ -78,15 +113,18 @@ pub struct SnapshotReader {
 }
 
 impl SnapshotReader {
-    /// The two newest published snapshots and every event published since the previous
-    /// call, or `None` if nothing was ever published. The frame borrows the reader, so one
-    /// frame is alive at a time, and the reader keeps the frame's two snapshots until the
-    /// next call: until then no pass writes either.
+    /// The newest published snapshot, the one it follows, and every event published since
+    /// the previous call, or `None` if nothing was ever published. For a reader that
+    /// acquires every publication the pair is the two newest published. The frame borrows
+    /// the reader, so one frame is alive at a time, and the reader keeps the frame's two
+    /// snapshots until the next call: until then no pass writes either.
     ///
     /// It never waits for a pass: it exchanges buffer handles under the channel's lock
     /// and copies nothing. Called again before a publication it returns the same pair and
-    /// no event. `README.md`, "The snapshot", states what the pair is when the reader
-    /// runs slower than the passes, and that no event is lost then.
+    /// no event. Called while a pass writes the snapshot published after the reader's
+    /// newer one, which the pass took back, it returns that newer one twice, so the pass
+    /// after finds a buffer free. `README.md`, "The snapshot", states what the pair is
+    /// when the reader runs slower than the passes, and that no event is lost then.
     pub fn acquire(&mut self) -> Option<PresentFrame<'_>> {
         todo!()
     }
@@ -125,11 +163,11 @@ impl PresentSnapshot {
 
     /// Whether nothing before this snapshot leads into it, so that presentation shows its
     /// state at once and blends nothing across it: set when a full pass in a world that is
-    /// not a prediction world wrote it, when its tick is earlier than the newest published
-    /// snapshot's, when it takes the place of a cut, and on every snapshot published after
-    /// a cut until an acquire returns the latest one published, so the first acquire after
-    /// a cut is published has a cut as its newer snapshot (`README.md`, "The triple
-    /// buffer").
+    /// not a prediction world wrote it, when its tick is earlier than the tick of the
+    /// snapshot published last, when it takes the place of a cut, and on every snapshot
+    /// published after a cut until an acquire returns one published at or after it, so the
+    /// first acquire whose newer snapshot was published since a cut has a cut as that
+    /// snapshot (`README.md`, "The triple buffer").
     #[must_use]
     pub const fn cut(&self) -> bool {
         self.cut
@@ -184,8 +222,8 @@ impl<T: Component> Iterator for SnapshotRows<'_, T> {
 
 impl<T: Component> ExactSizeIterator for SnapshotRows<'_, T> {}
 
-/// What one frame presents from: the two newest published snapshots of a world, and the
-/// events published since the previous frame was acquired.
+/// What one frame presents from: the newest published snapshot of a world and the one it
+/// follows, and the events published since the previous frame was acquired.
 #[derive(Clone, Copy, Debug)]
 pub struct PresentFrame<'a> {
     older: &'a PresentSnapshot,
@@ -195,7 +233,8 @@ pub struct PresentFrame<'a> {
 
 impl<'a> PresentFrame<'a> {
     /// The older snapshot of the pair: the state a frame interpolates from. It is the
-    /// newer one itself while only one snapshot has been published.
+    /// newer one itself at the first acquire, and at one made while a pass writes a
+    /// snapshot it took back (`README.md`, "The triple buffer").
     #[must_use]
     pub const fn older(&self) -> &'a PresentSnapshot {
         self.older

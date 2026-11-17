@@ -55,7 +55,8 @@ impl RenderTransform {
 /// before's state), and a write makes that the previous placement and the row's the
 /// current one. When [`no_interpolate`](Self::no_interpolate) is set, or the sink has no
 /// base for the key, the previous placement becomes the row's as well and the base is
-/// kept (`README.md`, "What the sink keeps").
+/// kept. A pass of an earlier tick than the pass before it for its kind makes the sink
+/// drop every base of that kind (`README.md`, "What the sink keeps").
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct InstanceRow {
     /// The entity. The only identity a row has: a sink never learns a chunk or a row
@@ -81,7 +82,8 @@ pub struct ExtractPass {
     pub kind: WorldKind,
     /// The world's tick at the pass. The first pass of a tick other than the previous
     /// pass's is where the sink takes each key's base, the placement later writes of the
-    /// tick are drawn from (`README.md`, "What the sink keeps").
+    /// tick are drawn from; at one earlier than the previous pass's, it drops them
+    /// (`README.md`, "What the sink keeps").
     pub tick: Tick,
     /// Whether the pass is full: it writes every instance of the world, and an instance
     /// the sink holds for this kind of world that the pass does not write is gone. A pass
@@ -208,9 +210,9 @@ impl ExtractState {
     /// returns, in one exchange, so a frame never holds a snapshot without the events of
     /// its ticks. `app` calls it once per frame, after `Simulation::run_passes` and with
     /// the batch `World::take_present_events` returned after it. A snapshot of a tick
-    /// earlier than the newest published one's is published as a cut, and one a full pass
-    /// in a prediction world wrote at that tick takes its place (`README.md`, "The triple
-    /// buffer" and "Events and publication").
+    /// earlier than the one published last is published as a cut, and one a full pass
+    /// in a prediction world wrote at the tick of the one published last takes its place
+    /// (`README.md`, "The triple buffer" and "Events and publication").
     ///
     /// If no pass wrote a snapshot since the previous publication (no tick ended and
     /// nothing changed), the events alone are published. With no writer installed, or
