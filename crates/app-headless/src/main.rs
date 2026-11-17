@@ -38,7 +38,7 @@ use lactose_sim::{RegionBundle, SessionEvent, TickInput};
 /// `lactose-persist`, so the value is the binary's; it passes no setup and no migration
 /// function, which a binary may not declare (architecture section 8.1).
 static SKETCH_SIM: CrateRegistration = CrateRegistration {
-    name: "sketch-sim",
+    name: "game-sim",
     types: game_sim::register_types,
     setup: None,
     systems: game_sim::register_systems,

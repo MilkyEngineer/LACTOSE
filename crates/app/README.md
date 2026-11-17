@@ -83,44 +83,46 @@ the last frame's steps started from inside `Client`.
 
 ## The registration a game crate writes
 
-A game crate exposes one value naming its generated functions, and nothing runs before
-`main` (architecture section 18):
+A game crate exposes its generated functions, and nothing runs before `main` (architecture
+section 18). It may name neither this crate nor `lactose-persist` (`crate-tiers.toml`), so it
+writes no `CrateRegistration` (`game/game-sim` is the one there is):
 
 ```rust
-use lactose_app::CrateRegistration;
 use lactose_core::Result;
-use lactose_ecs::World;
-use lactose_persist::Migrations;
-use lactose_sim::{Registration, TypeTable};
+use lactose_sim::{Registration, SessionApplier, TypeTable};
 
 pub fn register_types(types: &mut TypeTable) -> Result<()> { Ok(()) }
-pub fn setup(world: &mut World) -> Result<()> { Ok(()) }
 pub fn register_systems(registration: &mut Registration) {}
-pub fn register_migrations(migrations: &mut Migrations) -> Result<()> { Ok(()) }
-
-pub static GAME_SIM: CrateRegistration = CrateRegistration {
-    name: "game-sim",
-    types: register_types,
-    setup: Some(setup),
-    systems: register_systems,
-    migrations: Some(register_migrations),
-};
+pub fn sessions() -> Box<dyn SessionApplier> { todo!() }
 ```
 
-The binary lists the crates and hands the game to the assembly (`tests/headless.rs`,
-section 3, is the headless binary's `main` in full, with the cooked content it builds in
-memory):
+The binary holds the registration value, lists the crates and hands the game to the
+assembly (`tests/headless.rs`, section 3, is the headless binary's `main` in full, with the
+cooked content it builds in memory). A binary declares nothing a world registers, so it
+passes no setup and no migration function (architecture section 8.1, D152); where a game
+crate's registration value and its migrations are declared is decided before milestone 5
+(`docs/verification.md`):
 
 ```rust
 use std::sync::Arc;
 
-use lactose_app::{Cooked, Game, Headless, HeadlessConfig, Start, Workers, WorldConfig};
+use lactose_app::{
+    Cooked, CrateRegistration, Game, Headless, HeadlessConfig, Start, Workers, WorldConfig,
+};
 
-pub static GAME: Game = Game {
+static GAME_SIM: CrateRegistration = CrateRegistration {
+    name: "game-sim",
+    types: game_sim::register_types,
+    setup: None,
+    systems: game_sim::register_systems,
+    migrations: None,
+};
+
+static GAME: Game = Game {
     name: "game",
     crates: &[GAME_SIM],   // in call order; game-ai and game-content follow at milestone 5
     order: None,           // the game's own `Registration::order` edges
-    sessions: None,        // the game's session applier; `None` drops and logs joins
+    sessions: Some(game_sim::sessions), // `None` drops and logs every session event
 };
 
 fn main() -> lactose_core::Result<()> {

@@ -16,7 +16,7 @@ store, renderer or presentation.
 | Item | Contents |
 |---|---|
 | `main` | `crates/app/tests/headless.rs`, section 3: `Headless::start` with the executor's defaults and `WorldConfig::headless`, `Headless::run` for `TICKS` ticks, the report on stdout, `Headless::save` to `SLOT` if named, `Headless::shutdown` |
-| The game | `game-sim`'s sketch game, registered as one crate, `sketch-sim`: a `Counter` component and a system that counts ticks, and a session applier that spawns player 1's claimed counter on the join the first frame carries. The binary holds the `CrateRegistration` and `Game` values, since a game crate may name neither `lactose-app` nor `lactose-persist`, with no setup and no migration function. The game replaces the sketch at milestone 5 |
+| The game | `game-sim`'s sketch game, registered as one crate, `game-sim`: a `Counter` component and a system that counts ticks, and a session applier that spawns player 1's claimed, anchored counter on the join the first frame carries. The binary holds the `CrateRegistration` and `Game` values, since a game crate may name neither `lactose-app` nor `lactose-persist`, with no setup and no migration function. The game replaces the sketch at milestone 5 |
 | The cooked content | One region with an empty baseline and one asset, pinned against a store that has published everything, built in memory. The asset store replaces it at milestone 3 |
 | The crash hook | Installed first in `main`: a panic writes a text crash report (the thread, the panic, a forced backtrace) to stderr and calls `std::process::abort` |
 

@@ -18,8 +18,8 @@ decision 5.18). The game arrives at milestone 5 (section 22).
 |---|---|
 | `Counter` | The sketch's one component, key `sketch::counter`, persistent and replicated: a `u32` under field ID 1 |
 | `register_types` | A registration's `types`: registers `Counter` |
-| `register_systems` | A registration's `systems`: adds `sketch::count`, which adds one to every `Counter` each tick, wrapping, in the server and prediction worlds, to `Stage::Simulation` |
-| `sessions` | A `Game`'s `sessions`: the session applier. A `Join` spawns the player's `Counter` at zero with `ClaimedBy`, under a key from `World::allocate_net_id`, in the join's region; a `Leave` keeps the row, claim included |
+| `register_systems` | A registration's `systems`: adds `game_sim::count`, which adds one to every `Counter` each tick, wrapping, in the server and prediction worlds, to `Stage::Simulation` |
+| `sessions` | A `Game`'s `sessions`: the session applier, which meets `crates/sim/README.md`'s contract ("What `SessionApplier::apply` must do"). A `Join` spawns the player's row in the join's region, under a key from `World::allocate_net_id`: a `Counter` at zero, `ClaimedBy` and `StreamingAnchor`. A `Leave` removes the claim and the anchor from that row and keeps the row |
 
 ## Rules a caller should know
 
@@ -28,16 +28,14 @@ decision 5.18). The game arrives at milestone 5 (section 22).
   builds them from the functions above, with `setup` and `migrations` both `None`. Where a game
   crate's registration value and its migration functions are declared is decided before
   milestone 5 (`docs/verification.md`).
-- The component key and the system name keep the `sketch::` prefix they had in the binary. The
-  component key enters the world hash, so renaming it moves every recorded stream of the
-  sketch.
-- `sketch::count` runs in `lactose_app::headless::a_recorded_headless_run`, which links this
-  crate. The session applier runs in no recorded test: that test spawns its player through an
-  applier of its own, and only the headless binary's own run calls this one
-  (`docs/verification.md`).
-- The applier is the sketch's, not the contract of `crates/sim/README.md` ("What
-  `SessionApplier::apply` must do"): its row carries no `StreamingAnchor`, which under
-  `Directed` regions has no policy effect, and a `Leave` neither despawns the row nor removes
-  its claim. The game's applier meets that contract.
+- The component key keeps the `sketch::` prefix it had in the binary: it enters the world
+  hash, so renaming it moves every recorded stream of the sketch. The system is named as
+  architecture section 6.1 names a `game-sim` system; its name is in no hash.
+- Both run in recorded tests of `crates/app/tests/headless.rs`, which link this crate.
+  `a_recorded_headless_run` steps `game_sim::count`, its player spawned through an applier of
+  the test's own. `a_recorded_join_leave_and_rejoin` runs the game as the binary ships it,
+  `sessions` included, through a join, a leave and a second join with a sample every tick, and
+  checks after every tick that the player resolves to one claimed row that holds the sample.
+  The unrecorded tests of that file and the headless binary's own run call `sessions` too.
 - Its dependencies are `lactose-core`, `lactose-ecs`, `lactose-reflect` and `lactose-sim`, all
   admitted to a boundary crate without an allowlist entry.
