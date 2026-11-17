@@ -812,20 +812,26 @@ mod tests {
 
     #[test]
     fn every_assembly_crate_is_held_whatever_its_name() {
-        // The app's package renamed, and the file listing the new name: the rule follows the
-        // file, not the name `lactose-app`.
+        // Two assembly crates, one of them not named `lactose-app`: the rule follows the file,
+        // not a name, and holds every crate it lists.
         let text = FILE.replace(
             r#"crates = ["lactose-app"]"#,
             r#"crates = ["lactose-app", "lactose-app-core"]"#,
         );
         let ws = workspace(vec![
+            package("lactose-app", &[("lactose-render-graph", Normal)]),
             package("lactose-app-core", &[("lactose-renderer", Normal)]),
+            package("lactose-render-graph", &[]),
             package("lactose-renderer", &[]),
         ]);
         assert_eq!(
             messages(&check(&TierFile::parse(&text).unwrap(), &ws)),
-            ["crates/app-core/Cargo.toml: `lactose-app-core` reaches `lactose-renderer`, which \
-                 is in [server_denylist] (lactose-app-core -> lactose-renderer)"]
+            [
+                "crates/app/Cargo.toml: `lactose-app` reaches `lactose-render-graph`, which is in \
+                 [server_denylist] (lactose-app -> lactose-render-graph)",
+                "crates/app-core/Cargo.toml: `lactose-app-core` reaches `lactose-renderer`, which \
+                 is in [server_denylist] (lactose-app-core -> lactose-renderer)",
+            ]
         );
     }
 
