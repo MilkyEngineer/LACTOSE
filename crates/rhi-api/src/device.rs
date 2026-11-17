@@ -283,7 +283,9 @@ pub trait Device: Send + Sync {
     /// `ErrorKind::Unsupported` for a device created with no surface, and for a surface
     /// the device cannot present to; refused while the device's swapchain lives
     /// ([`Rule::Swapchain`](crate::Rule::Swapchain)); refused for an extent with a zero
-    /// dimension, and at a surface whose current extent is empty, such as a minimised
-    /// window on Windows ([`Rule::Bounds`](crate::Rule::Bounds)). Both on every backend.
+    /// dimension ([`Rule::Bounds`](crate::Rule::Bounds)). Both on every backend. At a
+    /// surface whose current extent is empty, such as a minimised window on Windows, it
+    /// succeeds without making images: the swapchain is stale until a
+    /// [`Swapchain::resize`] finds the surface not empty.
     fn create_swapchain(&self, desc: &SwapchainDesc) -> Result<Box<dyn Swapchain>>;
 }

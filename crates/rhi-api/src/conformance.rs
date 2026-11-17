@@ -100,6 +100,12 @@ pub trait Harness {
     /// Makes `device` lost, as a driver would, and returns `true`; or returns `false`
     /// where the backend cannot, and the cases that need a loss are skipped. Null can.
     fn lose(&self, device: &dyn Device) -> bool;
+
+    /// With `on`, keeps `device`'s submits and presents from completing, as a GPU that has
+    /// not reached them would, until it is called again with `on` false; returns `true`.
+    /// Returns `false` where the backend does not offer it, which no device does, and a
+    /// case that needs a stall then takes its device half. Null offers it.
+    fn stall(&self, device: &dyn Device, on: bool) -> bool;
 }
 
 /// Runs one case of [`CASES`] against a backend, under every capability set of the
@@ -280,6 +286,7 @@ pub const CASES: &[Case] = cases! {
     // The swapchain and the present role.
     contract "second_acquire_before_a_present_is_refused" => Swapchain everywhere;
     contract "present_of_an_image_not_acquired_is_refused" => Swapchain everywhere;
+    contract "present_behind_an_unmet_wait_is_refused" => Pending everywhere;
     contract "present_of_an_image_not_in_present_is_refused" => State;
     contract "swapchain_image_on_a_frame_encoder_is_refused" => PresentQueue;
     contract "swapchain_image_used_outside_its_acquire_is_refused" => Swapchain;

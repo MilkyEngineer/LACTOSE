@@ -34,7 +34,8 @@ pub enum Rule {
     /// `pending`: a destroy, an encoder reset or a swapchain resize while a submit that
     /// has not completed uses what it would free; a destroy of an image a heap slot still
     /// holds, or of a block an image is still placed in; a host read or write of a buffer
-    /// a pending submit writes.
+    /// a pending submit writes; a `present` whose submit is not released (`README.md`,
+    /// "The swapchain") within the bound `acquire` has.
     Pending,
     /// `capability`: a call that needs a reported capability the device does not report,
     /// or a SPIR-V module whose `OpCapability` or `OpExtension` instructions name one the
@@ -48,8 +49,7 @@ pub enum Rule {
     /// range or attachments, an index or indirect offset or stride off its alignment, a
     /// viewport that is not finite, not of positive extent, larger or further out than the
     /// device's viewport limits or whose depth range leaves zero to one, a dispatch above
-    /// the device's workgroup counts, or a swapchain extent with a zero dimension or at an
-    /// empty surface.
+    /// the device's workgroup counts, or a swapchain extent with a zero dimension.
     Bounds,
     /// `undeclared`: a heap slot or a buffer handed to a pass through
     /// [`push_slot`](crate::Encoder::push_slot) or
@@ -102,9 +102,9 @@ pub enum Rule {
     /// submit waits for on it, or while another queue's signal of it is pending with no
     /// wait for it; a host signal not between the timeline's value and every pending
     /// promise, or one a pending promise or another host signal could pass; or a value
-    /// 2^31 or more from the timeline's or from a value a pending submit waits for or
-    /// signals on it. The timeline's value is the greatest the device knows it has reached
-    /// (`README.md`, "Timelines").
+    /// 2^31 or more from the timeline's, from a host signal's in progress, or from a value
+    /// a pending submit waits for or signals on it. The timeline's value is the greatest
+    /// the device knows it has reached (`README.md`, "Timelines").
     Timeline,
     /// `encoding`: a command outside the scope it belongs to, a draw or dispatch with
     /// nothing bound to it, a pass left open, an encoder of another device or role, or an

@@ -47,7 +47,8 @@ pub enum Acquired {
     /// The surface no longer matches the swapchain: [`Swapchain::resize`] comes before
     /// the next acquire. On Vulkan, `VK_ERROR_OUT_OF_DATE_KHR`, and
     /// `VK_ERROR_OUT_OF_POOL_MEMORY` after MoltenVK's drawable timeout; never
-    /// `VK_SUBOPTIMAL_KHR`. Also returned while the surface's current extent is empty.
+    /// `VK_SUBOPTIMAL_KHR`. Also returned while the swapchain has no images, and while the
+    /// surface's current extent is empty.
     Stale,
 }
 
@@ -59,7 +60,8 @@ pub enum Presented {
     Shown,
     /// The submit was taken, and the surface no longer matches the swapchain: the image
     /// may not have been shown, and [`Swapchain::resize`] comes before the next acquire.
-    /// On Vulkan, `VK_ERROR_OUT_OF_DATE_KHR` alone.
+    /// On Vulkan, `VK_ERROR_OUT_OF_DATE_KHR`, and `VK_ERROR_OUT_OF_POOL_MEMORY` after
+    /// MoltenVK's drawable timeout.
     Stale,
 }
 
@@ -76,10 +78,12 @@ pub trait Swapchain: Send {
     /// is made for it.
     fn format(&self) -> Format;
 
-    /// The extent of the swapchain's images.
+    /// The extent of the swapchain's images: 0×0 while it has none, after a
+    /// `create_swapchain` at an empty surface until a `resize` makes them.
     fn extent(&self) -> Extent;
 
-    /// How many images the swapchain cycles through.
+    /// How many images the swapchain cycles through: 0 while it has none. Read it again
+    /// after each `resize`.
     fn image_count(&self) -> u32;
 
     /// Takes the next image. It returns within a bound the backend sets, about a second,
@@ -96,24 +100,34 @@ pub trait Swapchain: Send {
     /// one, which the submit leaves in [`ImageState::Present`](crate::ImageState). The
     /// submit's encoders are of the present role. It returns once the submit is taken,
     /// not once the image is on screen; how many presents are in flight is the caller's
-    /// to bound, by the timeline values its submits signal. Under MoltenVK it returns
-    /// within about one second for each image of the swapchain, the drawable wait in its
-    /// submit; on other drivers it is bounded by the driver alone, and each device
+    /// to bound, by the timeline values its submits signal.
+    ///
+    /// Its driver calls are made only once its submit is released: each of its waits
+    /// reached, or promised by a released submit whose driver call has returned, and where
+    /// the present role shares the graphics queue every earlier submit there released too.
+    /// Until then it holds, with no lock, for at most the bound [`acquire`](Self::acquire)
+    /// has (`README.md`, "The swapchain"). Under MoltenVK each fetch of the drawable made
+    /// while none is held waits up to about one second for each image of the swapchain;
+    /// after a timeout its submit fetches again at each use of the image, and its present
+    /// twice more, so `present` returns within about three seconds for each image, or more.
+    /// On other drivers its driver calls are bounded by the driver alone, and each device
     /// backend's README names the bound or says there is none.
     ///
     /// # Errors
     ///
-    /// `ErrorKind::DeviceLost`; a refusal, as [`Device::submit`](crate::Device::submit)'s,
-    /// after which the image is still the acquired one.
+    /// `ErrorKind::DeviceLost`; refused while its submit is not released past the bound
+    /// [`acquire`](Self::acquire) has ([`Rule::Pending`](crate::Rule::Pending)), which the
+    /// caller retries; a refusal, as [`Device::submit`](crate::Device::submit)'s. After
+    /// either refusal the image is still the acquired one.
     fn present(&mut self, image: ImageHandle, submit: Submit<'_>) -> Result<Presented>;
 
     /// Makes the swapchain again for the surface as it is now, at about `extent`. The
     /// caller first waits for the points its presents signal; `resize` then waits, within
     /// the bound [`acquire`](Self::acquire) has, for the swapchain's own presents, which
     /// the driver may still read after their submits complete. At a surface whose current
-    /// extent is empty it returns without calling the driver and leaves the swapchain
-    /// stale; otherwise the images of before are destroyed, and an acquired image is
-    /// given up.
+    /// extent is empty it returns without calling the driver, keeps the images it has and
+    /// leaves the swapchain stale; otherwise the images of before, if any, are destroyed,
+    /// and an acquired image is given up.
     ///
     /// # Errors
     ///
