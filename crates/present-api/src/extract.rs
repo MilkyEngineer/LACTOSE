@@ -50,12 +50,12 @@ impl RenderTransform {
 
 /// One instance as extract hands it to the sink: the placement the row has now.
 ///
-/// The row carries no previous placement. The sink holds the last placement it was given
-/// for the key, and a write makes that the previous one; a write in a pass of the same
-/// tick as the previous pass the sink was given for the kind replaces the current one and
-/// keeps the previous; and when [`no_interpolate`](Self::no_interpolate) is set, or the
-/// sink does not hold the key, the previous one becomes the new one as well (`README.md`,
-/// "What the sink keeps").
+/// The row carries no previous placement. The sink holds, for the key, the placement it
+/// held as current when the first pass of the current tick began (its base, the tick
+/// before's state), and a write makes that the previous placement and the row's the
+/// current one. When [`no_interpolate`](Self::no_interpolate) is set, or the sink has no
+/// base for the key, the previous placement becomes the row's as well and the base is
+/// kept (`README.md`, "What the sink keeps").
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct InstanceRow {
     /// The entity. The only identity a row has: a sink never learns a chunk or a row
@@ -79,9 +79,9 @@ pub struct ExtractPass {
     /// the prediction world's copy of an entity shadows the replicated world's
     /// (architecture section 9.4).
     pub kind: WorldKind,
-    /// The world's tick at the pass. A pass of the same tick as the previous pass the sink
-    /// was given for this kind replaces current placements and keeps previous ones
-    /// (`README.md`, "What the sink keeps").
+    /// The world's tick at the pass. The first pass of a tick other than the previous
+    /// pass's is where the sink takes each key's base, the placement later writes of the
+    /// tick are drawn from (`README.md`, "What the sink keeps").
     pub tick: Tick,
     /// Whether the pass is full: it writes every instance of the world, and an instance
     /// the sink holds for this kind of world that the pass does not write is gone. A pass
@@ -120,7 +120,7 @@ pub trait InstanceSink: Send + Sync {
     /// key it does not hold for the pass's kind of world. A key that left and came back
     /// since the previous pass is here, and the pass then writes its row: the sink drops
     /// what it held for the key, so the row arrives as a new instance with no previous
-    /// placement.
+    /// placement and no base.
     fn removed(&mut self, keys: &[StableKey]);
 
     /// A batch of rows, never empty. Each instance the pass writes is in exactly one
@@ -155,7 +155,8 @@ pub struct ExtractState {
     /// The mark the previous pass that followed a tick started from: rows stamped since
     /// it are written once more by the next such pass (`README.md`, "Settling").
     settle: Option<ChangeMark>,
-    /// The world's tick at the previous pass.
+    /// The world's tick at the previous pass. A pass at an earlier tick flags every row
+    /// (`README.md`, "The no-interpolate flag").
     tick: Option<Tick>,
     /// The tick a `Teleported` is compared with: the previous pass's tick, or, at a pass of
     /// that same tick, what the previous pass compared with (`README.md`, "The
@@ -206,7 +207,10 @@ impl ExtractState {
     /// reader can acquire, and `events` joins the events the reader's next acquire
     /// returns, in one exchange, so a frame never holds a snapshot without the events of
     /// its ticks. `app` calls it once per frame, after `Simulation::run_passes` and with
-    /// the batch `World::take_present_events` returned after it.
+    /// the batch `World::take_present_events` returned after it. A snapshot of a tick
+    /// earlier than the newest published one's is published as a cut, and one a full pass
+    /// in a prediction world wrote at that tick takes its place (`README.md`, "The triple
+    /// buffer" and "Events and publication").
     ///
     /// If no pass wrote a snapshot since the previous publication (no tick ended and
     /// nothing changed), the events alone are published. With no writer installed, or
