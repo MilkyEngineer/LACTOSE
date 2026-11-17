@@ -91,11 +91,11 @@ milestone 1's sessions A and B (decision 5.19). Section 6 gives each row's new t
 |---|---|---|---|
 | 15 | MoltenVK and KosmicKrisp | `vulkan`, `swapchain`, `measure-m2` | Both drivers on the M1 under macOS 27.2.1. The conformance suite under each gives the capability answers: indirect-draw behaviour, memoryless attachments and local reads. `gpu-cost` under each gives the encode time for ten thousand draws and the pipeline creation cost |
 | 16 | Extract cost | `present-impl`, `measure-m2` | `extract-50k`: the pass's time, and the cost per dirty row on one worker |
-| 18 | Native Metal | `spike-metal`, then the freeze decision | The spike's result file: argument buffers, residency, memoryless attachments, framebuffer fetch, indirect draws. `rhi-api` freezes at `vulkan`'s merge, and the exit decision records what is frozen and what was amended |
+| 18 | Native Metal | `spike-metal`, then the freeze decision | The spike's result file: argument buffers, residency, memoryless attachments, framebuffer fetch, indirect draws. `rhi-api` freezes at `vulkan`'s merge, and the exit decision records what is frozen and what was amended. **The spike is done** (`docs/results/spike-metal-apple-m1-2026-11-17.md`): every item yes; the RHI spike's fourteen points kept, point 4 with the rule that a memoryless attachment is never stored; samplers, aliased transients and the drawable added; indirect command buffers kept out of `rhi-api`; three conflicts with section 12.1, D45 and D43 named for the freeze decision |
 | 19 | Remote transform upload | `presentation`, `measure-m2` | `remote-upload-5k` |
 | 21 | Physics phase stall | `frame-impl`, `measure-m2` | `record-stall`, recorded |
 | 34 | MoltenVK multi-draw-indirect is a CPU loop | `measure-m2` | `gpu-cost`: one multi-draw of N commands against N draws under MoltenVK, beside a reading of the pinned MoltenVK |
-| 35 | Slang's Metal target supports argument buffers, function constants and framebuffer fetch | `spike-metal`, `slang` | The spike's shaders are MSL the Slang compiler emitted and use all three. The cooker's are then held by a pipeline state made from each: on the M1 from the cooked MSL, compiled through Metal at run time, and on the runner from the metallib |
+| 35 | Slang's Metal target supports argument buffers, function constants and framebuffer fetch | `spike-metal`, `slang` | The spike's shaders are MSL the Slang compiler emitted and use all three. The cooker's are then held by a pipeline state made from each: on the M1 from the cooked MSL, compiled through Metal at run time, and on the runner from the metallib. **The spike's half is done** (`docs/results/spike-metal-apple-m1-2026-11-17.md`): Slang's MSL, with a 1024-texture argument buffer indexed non-uniformly, two function constants and a framebuffer-fetch input, compiled through Metal as MSL 3.1 with no error (Metal reports no warnings at run time; offline `metal` warns twice on the frame's vertex functions) and made into thirteen pipelines that read back exact |
 | 63 | Windows efficiency-core steering | `eco-qos` | The benchmark's rows with two background zstd tasks, before and after, on the laptop, which is a hybrid part |
 | 64 | `lld-link` on Windows | Session B, in the first sitting | The desktop's edit-to-playing file under each system it boots, at most 30 s (D151) |
 | 77 | Wake latency against the 20 µs P99 criterion | Session A, in the first sitting | The desktop's `whisk` file: the wake from an idle pool under 35 µs at P99, with the makespan and the steal beside it. The laptop missed the first two (D151) |
@@ -525,11 +525,15 @@ milestone 2 cooks a handful of shaders. The GPU review's probes of the SDK's cop
 the cook must check, because a check on the source can pass while the output is wrong:
 
 - *The heap.* `NonUniformResourceIndex` fails Slang's Metal target, and a runtime array emits MSL
-  that Metal refuses. Two forms cook for both targets: a fixed-size array in a parameter block,
-  and `DescriptorHandle`. `spike-metal` chooses, and the cooked format names the form. The marker
-  differs by form. For a fixed array it is a helper that switches on the target, and it emits
-  SPIR-V with no decoration unless it is inlined. For `DescriptorHandle` it is `nonuniform`;
-  `NonUniformResourceIndex` on a handle only warns and emits no decoration. So the cook reads the
+  that Metal refuses. The heap is a fixed-size array in a parameter block, the form `spike-metal`
+  chose (`docs/results/spike-metal-apple-m1-2026-11-17.md`): its slot is one number on both
+  targets, where a `DescriptorHandle` is an `MTLResourceID` on Metal and an index into a heap
+  Slang declares itself on SPIR-V, so the value a caller writes would differ by backend. The cook
+  refuses `DescriptorHandle`: a SPIR-V module that declares the `RuntimeDescriptorArray`
+  capability, which Slang's own heap needs and the fixed array does not; Slang places that heap at
+  set 1 or 2 by what else the module declares. The cooked format pins the heap's set, names the
+  form, and each heap array's type and capacity. The marker is a helper that switches on the
+  target, and it emits SPIR-V with no decoration unless it is inlined. So the cook reads the
   SPIR-V, where every access through the heap must be decorated, and treats Slang's warnings as
   errors.
 - *Outputs.* An output struct whose one field is `SV_Target1` gets location 0 in SPIR-V and
@@ -1710,7 +1714,7 @@ is open as the merge wrote it. Row 169's change follows D151's addendum.
 ; the workload and machines of D153, result file `extract-50k`
 
 --- section 1, the row "Native Metal": append to its second cell ---
-; result file `spike-metal`, and the planner's freeze decision at milestone 2's exit (D153)
+; result file `spike-metal`, and the planner's freeze decision at milestone 2's exit (D153). Its gate cell then records the spike as done in part (`docs/results/spike-metal-apple-m1-2026-11-17.md`), the freeze decision owed
 
 --- section 1, the row "Remote transform upload": append to its second cell ---
 ; the workload of D153, result file `remote-upload-5k`
@@ -1722,7 +1726,7 @@ is open as the merge wrote it. Row 169's change follows D151's addendum.
  Closed by result file `gpu-cost`'s multi-draw figure and a reading of the pinned MoltenVK (D153)
 
 --- section 2, the row "Slang's Metal target supports argument buffers, function constants and framebuffer fetch.": append to its text ---
- Shown first by the native Metal spike's shaders, which are MSL the Slang compiler emitted, then held by a pipeline state made from each cooked shader: on the M1 from the cooked MSL, on the macos-arm64 runner from the metallib (D153)
+ Shown first by the native Metal spike's shaders, which are MSL the Slang compiler emitted, then held by a pipeline state made from each cooked shader: on the M1 from the cooked MSL, on the macos-arm64 runner from the metallib (D153). Its gate cell then records the spike's half as done (`docs/results/spike-metal-apple-m1-2026-11-17.md`), the cooked shaders owed
 
 --- section 4, the row "Local x86-64 runs on Apple Silicon": append to its text; its gate stays `| none |` ---
  The Mac moves to macOS 27.2.1 on 17 November 2026 (D154): the re-check is one boundary crate's tests, built for `x86_64-apple-darwin` and run under Rosetta there, in the coordinator's pass after the upgrade
@@ -1899,6 +1903,7 @@ sentence and its two readings, and the marker (D152, section 6).
 | Sections 12.4 and 19 | What the minimal renderer is; device-lost recovery tested at milestone 3 |
 | Section 14 and D136, D147 | The directory watch at milestone 3 |
 | Section 20, the CI budget and results | How the budget is read, the median of each check job's three most recent warm runs of main; its figure, if the owner raises it (question 6). The M1's figures are of macOS 27.2.1 from milestone 2 on, and `cargo xtask measure --all` is run again there. The nightly's release baseline (X5). The desktop's two sittings, if the owner takes them (D151's addendum) |
+| Section 12.1: "residency calls where the backend needs them" and "rather than relying on automatic hazard tracking"; D45's premise; D43 on indirect command buffers | The native Metal spike's three conflicts (`docs/results/spike-metal-apple-m1-2026-11-17.md`, "Against the architecture"), each amended or kept by the freeze decision at the exit (D153) |
 | `CLAUDE.md` | The revision marker |
 
 ## 9. Between milestone 1's exit and the first lane
