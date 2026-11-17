@@ -361,10 +361,10 @@ The crate's documentation carries this as a doctest, and `tests/consumers.rs` in
 - The order a client keeps, on every path, a failed start included:
   1. `exit` is queued first and not awaited, by a guard whose `Drop` queues it, held from
      its start by whatever drives the client (the root task, or a test's driver thread),
-     so a path that returns early or unwinds queues it too. `exit`
-     destroys nothing while an `Arc<Window>` is held, and the pump keeps draining
-     main-lane calls until the last one goes, so every step below still reaches the main
-     thread, and every stall below happens under the pump's warning.
+     so a path that returns early or unwinds queues it too. `exit` destroys nothing while
+     an `Arc<Window>` is held, and the pump keeps draining main-lane calls until the last
+     one goes, so every step below still reaches the main thread, and every stall below
+     happens under the pump's warning.
   2. The client stops queuing presents and frame submits, and signals every point the
      host owes that a pending submit waits on, from whatever holds it: the swapchain's
      drop below waits for the submits that use its images. Then a last present-thread
@@ -378,8 +378,9 @@ The crate's documentation carries this as a doctest, and `tests/consumers.rs` in
      observation of the view is removed on the view's thread (off it after an expired
      step-4 bound, below).
   6. `run` returns once the last `Arc<Window>` goes; `main` waits for its root task and
-     shuts the executor down. Nothing that runs after `run` returns holds the device or an
-     `Arc<Window>`.
+     shuts the executor down, whether `run` returned a value or an error, and only then
+     returns `run`'s error, so the root is never dropped on the main thread. Nothing that
+     runs after `run` returns holds the device or an `Arc<Window>`.
 - When a bound expires, the client logs it and goes on to the next step, save one: a last
   `Device` whose step-4 bound expired is dropped on a thread that may block, a background
   worker or a thread of its own, never in a main-lane call. A drop that then blocks holds
