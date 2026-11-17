@@ -1,6 +1,7 @@
 [workspace]
 resolver = "3"
-members = ["crates/*", "tools/*"]
+# Engine crates in crates/, game crates in game/, tools in tools/ (architecture section 4).
+members = ["crates/*", "game/*", "tools/*"]
 # Patched third-party copies (architecture section 8.2, D123) are dependencies, not members.
 exclude = ["vendor"]
 
@@ -35,6 +36,7 @@ lactose-io = { path = "crates/io" }
 lactose-persist = { path = "crates/persist" }
 lactose-app = { path = "crates/app" }
 lactose-present-api = { path = "crates/present-api" }
+game-sim = { path = "game/game-sim" }
 
 # Third-party crates. Cargo.lock pins the exact versions; docs/verification.md lists the
 # claims that are re-checked against those versions.

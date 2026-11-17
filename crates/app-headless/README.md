@@ -8,7 +8,7 @@ store, renderer or presentation.
 | | |
 |---|---|
 | Tier | leaf |
-| Determinism boundary | outside; carries the boundary `clippy.toml` (`[lint_file_carriers]`) because its sketch game declares a component, a system and a session applier |
+| Determinism boundary | outside; declares nothing a world registers, so it carries no lint file (D152) |
 | Unsafe | none, `#![forbid(unsafe_code)]` |
 
 ## What it holds
@@ -16,7 +16,7 @@ store, renderer or presentation.
 | Item | Contents |
 |---|---|
 | `main` | `crates/app/tests/headless.rs`, section 3: `Headless::start` with the executor's defaults and `WorldConfig::headless`, `Headless::run` for `TICKS` ticks, the report on stdout, `Headless::save` to `SLOT` if named, `Headless::shutdown` |
-| The game | One sketch crate, `sketch-sim`: a `Counter` component and a system that counts ticks, and a session applier that spawns player 1's claimed counter on the join the first frame carries. The real game crates replace it at milestone 5 |
+| The game | `game-sim`'s sketch game, registered as one crate, `sketch-sim`: a `Counter` component and a system that counts ticks, and a session applier that spawns player 1's claimed counter on the join the first frame carries. The binary holds the `CrateRegistration` and `Game` values, since a game crate may name neither `lactose-app` nor `lactose-persist`, with no setup and no migration function. The game replaces the sketch at milestone 5 |
 | The cooked content | One region with an empty baseline and one asset, pinned against a store that has published everything, built in memory. The asset store replaces it at milestone 3 |
 | The crash hook | Installed first in `main`: a panic writes a text crash report (the thread, the panic, a forced backtrace) to stderr and calls `std::process::abort` |
 

@@ -51,6 +51,9 @@ rayon.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+# The sketch game the headless binary runs, which `tests/headless.rs` links so that its
+# recorded run steps the system that ships (D152).
+game-sim.workspace = true
 # The SOUR sketch's body: where it starts, the shape it has, how fast its input steers it.
 lactose-math.workspace = true
 # The compile-only sketches in `tests/` write a game crate the way `game-sim` will: its

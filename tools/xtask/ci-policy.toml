@@ -15,15 +15,13 @@ crates = [
 
 # Crates outside [boundary] that still carry the boundary lint file, a byte-identical copy of
 # crates/core/clippy.toml. The proc-macro crates do, because the code they write is compiled
-# inside boundary crates and should be written under the same lints. The headless binary
-# does, because its sketch game declares what a world registers and runs, which `cargo xtask
-# boundary` allows only under this file (project review 2, X1). The presentation interface
-# does, because it declares the presentation components and extract's pass system, which
-# every world registers (D152; docs/plans/milestone-2.md, decision 5.18).
+# inside boundary crates and should be written under the same lints. The presentation
+# interface does, because it declares the presentation components and extract's pass system,
+# which every world registers (D152; docs/plans/milestone-2.md, decision 5.18). No binary
+# does: a system that writes hashed state is declared in a library, and the headless binary's
+# sketch game is `game-sim`'s, a boundary crate (D152).
 [lint_file_carriers]
-crates = [
-  "lactose-reflect-macros", "lactose-ecs-macros", "lactose-app-headless", "lactose-present-api",
-]
+crates = ["lactose-reflect-macros", "lactose-ecs-macros", "lactose-present-api"]
 
 # Architecture section 8.3: the shipped binaries, whose boundary feature trees must be
 # identical to each other and to those of the [harness] packages. Every workspace package
@@ -171,7 +169,7 @@ base = [
   "lactose-core", "lactose-math", "lactose-task", "lactose-reflect", "lactose-reflect-macros",
   "lactose-ecs-macros", "lactose-ecs", "lactose-bundle", "lactose-asset-api", "lactose-io",
   "lactose-asset", "lactose-input", "lactose-input-host", "lactose-sim", "lactose-net-api",
-  "lactose-net-host", "lactose-persist", "lactose-xtask",
+  "lactose-net-host", "lactose-persist", "lactose-xtask", "game-sim",
 ]
 physics = [
   "lactose-physics-api", "lactose-physics-rapier", "lactose-anim", "lactose-predict",

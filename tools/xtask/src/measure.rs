@@ -482,12 +482,13 @@ struct Site {
     anchor: &'static str,
 }
 
-/// The two edits of decision 5.9: the sketch game's system in the headless binary's crate,
-/// and the executor's start in `lactose-app`, a library the binary depends on.
+/// The two edits of decision 5.9: the sketch game's system, in `game-sim` since it left the
+/// headless binary (D152), and the executor's start in `lactose-app`; both are libraries
+/// the binary depends on.
 const SITES: [Site; 2] = [
     Site {
         name: "sketch_system",
-        file: "crates/app-headless/src/main.rs",
+        file: "game/game-sim/src/sketch.rs",
         anchor: "    counter.0 = counter.0.wrapping_add(1);",
     },
     Site {

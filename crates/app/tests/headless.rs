@@ -2,7 +2,9 @@
 //! and the headless app's rows of the milestone 1 proof (`README.md`): a game crate's
 //! registration, the binary's `main` (which `crates/app-headless` is, over the same sketch
 //! game), the SOUR test that records a run under the runner, a save round trip, and the
-//! tests of section 5. A change that breaks a sketch is a signature change to list.
+//! tests of section 5. The sketch game is `game-sim`'s, the crate the binary links, so the
+//! recorded run steps the system that ships (D152). A change that breaks a sketch is a
+//! signature change to list.
 
 #![forbid(unsafe_code)]
 #![allow(missing_docs)]
@@ -15,6 +17,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
 
+use game_sim::Counter;
 use lactose_app::{
     CATCH_UP_CAP, Cooked, CrateRegistration, ErrorPolicy, Game, Headless, HeadlessConfig,
     LOG_RETENTION, LOG_TARGET, LifecycleFailures, Response, RunReport, Server, Source, Start,
@@ -29,9 +32,7 @@ use lactose_core::{Error, ErrorKind, PlayerId, Result, StableKey, Tick};
 use lactose_ecs::{ClaimedBy, LayoutConfig, Mut, RegionId, RegionMode, World, system};
 use lactose_input::{AXIS_SCALE, Axis2, PlayerInput, Yaw, player_entity};
 use lactose_math::{Scalar, Vec3};
-use lactose_persist::Migrations;
 use lactose_physics_api::{Collider, RigidBody, Shape, Transform, Velocity, snapshot};
-use lactose_reflect::component;
 use lactose_sim::harness::{ChunkCapacity, layout_mode, layout_mode_of};
 use lactose_sim::{
     PlayerSample, RegionBundle, RegionControl, Registration, SessionApplier, SessionEvent, Stage,
@@ -42,63 +43,21 @@ use protocol::{Capacity, Layout, RunConfig, Session};
 
 // ---- 1. A game crate's registration (architecture section 18) ----
 
-/// Counts ticks; replicated, so a prediction system may read it.
-#[component(key = "sketch::counter", persistent, replicated)]
-pub struct Counter(#[field(id = 1)] pub u32);
-
-#[system(name = "sketch::count", worlds = [server, prediction])]
-fn count(counter: Mut<Counter>) {
-    counter.0 = counter.0.wrapping_add(1);
-}
-
-/// The crate's generated `register_types`.
-pub fn register_types(types: &mut TypeTable) -> Result<()> {
-    types.register::<Counter>()
-}
-
-/// The crate's generated `register_systems`.
-pub fn register_systems(registration: &mut Registration) {
-    registration.stage(Stage::Simulation).add(&COUNT);
-}
-
-/// The crate's `register_migrations`: no bump yet.
-pub fn register_migrations(_: &mut Migrations) -> Result<()> {
-    Ok(())
-}
-
-/// What the crate exposes: one `static`, function pointers only, nothing built before
-/// `main`. Its `setup` would insert the crate's services; it has none, so `None`.
+/// `game-sim`'s registration, as the binary holds it: one `static`, function pointers only,
+/// nothing built before `main`. A game crate may name neither `lactose-app` nor
+/// `lactose-persist`, so the value is the binary's, and a binary declares no setup and no
+/// migration function (architecture section 8.1, D152): both `None`.
 pub static SKETCH_SIM: CrateRegistration = CrateRegistration {
     name: "sketch-sim",
-    types: register_types,
+    types: game_sim::register_types,
     setup: None,
-    systems: register_systems,
-    migrations: Some(register_migrations),
+    systems: game_sim::register_systems,
+    migrations: None,
 };
 
 /// What the binary hands the assembly.
 pub static GAME: Game =
-    Game { name: "sketch", crates: &[SKETCH_SIM], order: None, sessions: Some(sessions) };
-
-/// The game's session applier: a join spawns the player's counter, claimed; a leave keeps
-/// it, so the sketch's counter outlives its player.
-fn sessions() -> Box<dyn SessionApplier> {
-    Box::new(Sessions)
-}
-
-struct Sessions;
-
-impl SessionApplier for Sessions {
-    fn apply(&mut self, world: &mut World, player: PlayerId, event: SessionEvent) -> Result<()> {
-        match event {
-            SessionEvent::Join { region } => {
-                let key = StableKey::Net(world.allocate_net_id()?);
-                world.spawn(key, region, (Counter(0), ClaimedBy { player }))
-            }
-            SessionEvent::Leave => Ok(()),
-        }
-    }
-}
+    Game { name: "sketch", crates: &[SKETCH_SIM], order: None, sessions: Some(game_sim::sessions) };
 
 // ---- 2. The cooked content a headless run holds in memory ----
 
@@ -273,7 +232,9 @@ static SKETCH_BODY: CrateRegistration = CrateRegistration {
 
 /// The sketch with a body: player 1 joins as a dynamic sphere, claimed and anchored, that
 /// falls under gravity while its input steers it, so the solver pool (sized from the
-/// workers SOUR's modes vary) and the input applier both enter the hash.
+/// workers SOUR's modes vary) and the input applier both enter the hash. It steps
+/// `game-sim`'s `sketch::count` and spawns through an applier of its own, so
+/// `game_sim::sessions` runs in no recorded test (docs/verification.md).
 static STEERED_GAME: Game = Game {
     name: "sketch-steered",
     crates: &[SKETCH_SIM, SKETCH_BODY],
@@ -655,7 +616,7 @@ fn a_registration_is_a_plain_value() {
     assert_eq!(game.crates.len(), 1);
     assert_eq!(game.crates[0].name, "sketch-sim");
     assert!(game.crates[0].setup.is_none());
-    assert!(game.crates[0].migrations.is_some());
+    assert!(game.crates[0].migrations.is_none());
 }
 
 // The binary's `main` and the resume sketch: type-checked here, run by the binary.

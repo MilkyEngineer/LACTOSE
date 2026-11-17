@@ -218,6 +218,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
 
 [[package]]
+name = "game-sim"
+version = "0.0.0"
+dependencies = [
+ "lactose-core",
+ "lactose-ecs",
+ "lactose-reflect",
+ "lactose-sim",
+]
+
+[[package]]
 name = "generator"
 version = "0.8.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -388,6 +398,7 @@ dependencies = [
 name = "lactose-app"
 version = "0.0.0"
 dependencies = [
+ "game-sim",
  "lactose-anim",
  "lactose-asset-api",
  "lactose-bundle",
@@ -413,13 +424,12 @@ dependencies = [
 name = "lactose-app-headless"
 version = "0.0.0"
 dependencies = [
+ "game-sim",
  "lactose-app",
  "lactose-asset-api",
  "lactose-bundle",
  "lactose-core",
  "lactose-ecs",
- "lactose-persist",
- "lactose-reflect",
  "lactose-sim",
  "tracing-subscriber",
 ]

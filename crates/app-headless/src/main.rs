@@ -2,9 +2,11 @@
 //! and one server world built from the game's registrations, run for a bounded number of
 //! ticks at tick rate from a spawned timer root, the hash printed, the world optionally
 //! saved, everything shut down in order. `main` is `crates/app/tests/headless.rs`, section
-//! 3, over the sketch game and the cooked content it builds in memory; the real game crates
-//! replace the sketch at milestone 5 and the asset store replaces the content at milestone
-//! 3.
+//! 3, over `game-sim`'s sketch game and the cooked content it builds in memory; the game
+//! replaces the sketch at milestone 5 and the asset store replaces the content at milestone
+//! 3. The binary declares nothing a world registers: the sketch's component, system and
+//! session applier are `game-sim`'s, and the binary holds only the registration values a
+//! game crate may not name (D152).
 //!
 //! Usage: `lactose-app-headless [TICKS] [SLOT]`: `TICKS` (600 by default) ticks, then a save
 //! to the file `SLOT` if one is named, its directory created at start. Exits 1 with the
@@ -26,67 +28,25 @@ use lactose_asset_api::{
     Readiness, UntypedHandle, VersionTable,
 };
 use lactose_bundle::Baseline;
-use lactose_core::{Error, ErrorKind, PlayerId, Result, StableKey, Tick};
-use lactose_ecs::{ClaimedBy, Mut, RegionId, RegionMode, World, system};
-use lactose_persist::Migrations;
-use lactose_reflect::component;
-use lactose_sim::{
-    RegionBundle, Registration, SessionApplier, SessionEvent, Stage, TickInput, TypeTable,
-};
+use lactose_core::{Error, ErrorKind, PlayerId, Result, Tick};
+use lactose_ecs::{RegionId, RegionMode};
+use lactose_sim::{RegionBundle, SessionEvent, TickInput};
 
-// ---- The game: one sketch crate ----
+// ---- The game: `game-sim`'s sketch ----
 
-/// Counts ticks; replicated, so a prediction system may read it.
-#[component(key = "sketch::counter", persistent, replicated)]
-struct Counter(#[field(id = 1)] u32);
-
-#[system(name = "sketch::count", worlds = [server, prediction])]
-fn count(counter: Mut<Counter>) {
-    counter.0 = counter.0.wrapping_add(1);
-}
-
-fn register_types(types: &mut TypeTable) -> Result<()> {
-    types.register::<Counter>()
-}
-
-fn register_systems(registration: &mut Registration) {
-    registration.stage(Stage::Simulation).add(&COUNT);
-}
-
-fn register_migrations(_: &mut Migrations) -> Result<()> {
-    Ok(())
-}
-
+/// `game-sim`'s registration. A game crate may name neither `lactose-app` nor
+/// `lactose-persist`, so the value is the binary's; it passes no setup and no migration
+/// function, which a binary may not declare (architecture section 8.1).
 static SKETCH_SIM: CrateRegistration = CrateRegistration {
     name: "sketch-sim",
-    types: register_types,
+    types: game_sim::register_types,
     setup: None,
-    systems: register_systems,
-    migrations: Some(register_migrations),
+    systems: game_sim::register_systems,
+    migrations: None,
 };
 
 static GAME: Game =
-    Game { name: "sketch", crates: &[SKETCH_SIM], order: None, sessions: Some(sessions) };
-
-/// The game's session applier: a join spawns the player's counter, claimed; a leave keeps
-/// it, so the sketch's counter outlives its player.
-fn sessions() -> Box<dyn SessionApplier> {
-    Box::new(Sessions)
-}
-
-struct Sessions;
-
-impl SessionApplier for Sessions {
-    fn apply(&mut self, world: &mut World, player: PlayerId, event: SessionEvent) -> Result<()> {
-        match event {
-            SessionEvent::Join { region } => {
-                let key = StableKey::Net(world.allocate_net_id()?);
-                world.spawn(key, region, (Counter(0), ClaimedBy { player }))
-            }
-            SessionEvent::Leave => Ok(()),
-        }
-    }
-}
+    Game { name: "sketch", crates: &[SKETCH_SIM], order: None, sessions: Some(game_sim::sessions) };
 
 // ---- The cooked content, in memory ----
 
@@ -185,10 +145,6 @@ struct Args {
 }
 
 impl Args {
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "the command line is the binary's, read once before the run; no world sees it"
-    )]
     fn parse() -> Result<Self> {
         let usage =
             || Error::new(ErrorKind::InvalidData, "usage: lactose-app-headless [TICKS] [SLOT]");

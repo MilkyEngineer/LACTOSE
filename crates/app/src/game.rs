@@ -44,7 +44,8 @@ pub struct Game {
     /// For the log.
     pub name: &'static str,
     /// The game crates, in call order. At milestone 5 `game-sim`, `game-ai` and
-    /// `game-content`; at milestone 1 the sketch a test or the spike writes.
+    /// `game-content`; until then `game-sim`'s sketch game, which the headless binary runs,
+    /// or the sketch a test or the spike writes.
     pub crates: &'static [CrateRegistration],
     /// `Registration::order` edges between the game's own crates, or `None`. Called once per
     /// world after every crate's `systems`, before the assembly's own edges.
