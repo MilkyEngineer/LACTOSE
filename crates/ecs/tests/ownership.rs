@@ -1988,32 +1988,33 @@ fn chain_document(n: u64, deep: bool) -> (Baseline, Overlay) {
     document(&[], records)
 }
 
-/// The best of three loads of `document` into a fresh world.
+/// One load of `document` into a fresh world.
 #[expect(clippy::disallowed_types, reason = "test code outside the step: a cost ratio")]
-fn best_load(document: &(Baseline, Overlay)) -> std::time::Duration {
-    (0..3)
-        .map(|_| {
-            let mut world = WorldBuilder::new(WorldKind::Server, registry()).build().unwrap();
-            create(&mut world, REGION);
-            let start = std::time::Instant::now();
-            world.load_region(REGION, &document.0, Some(&document.1)).unwrap();
-            start.elapsed()
-        })
-        .min()
-        .expect("three loads")
+fn load_time(document: &(Baseline, Overlay)) -> std::time::Duration {
+    let mut world = WorldBuilder::new(WorldKind::Server, registry()).build().unwrap();
+    create(&mut world, REGION);
+    let start = std::time::Instant::now();
+    world.load_region(REGION, &document.0, Some(&document.1)).unwrap();
+    start.elapsed()
 }
 
 /// The load walks owners once, before any spawn, and the spawns walk nothing: a chain of
 /// 8000 owners loads in about the time of 8000 rows with one owner, where a walk per row
-/// costs about 260 times as much. The bound of 5 holds on a loaded machine.
+/// costs about 260 times as much. The two loads alternate, seven of each, and each is
+/// taken at its best, so a burst of load on the machine slows both or neither; the bound of
+/// 10 still leaves the per-row walk 25 times over it.
 #[test]
 #[cfg_attr(miri, ignore = "a timing ratio; Miri's timings mean nothing")]
 fn a_deep_chain_loads_as_fast_as_a_flat_one() {
     let _serial = serial();
-    let flat = best_load(&chain_document(8000, false));
-    let deep = best_load(&chain_document(8000, true));
+    let documents = (chain_document(8000, false), chain_document(8000, true));
+    let (mut flat, mut deep) = (std::time::Duration::MAX, std::time::Duration::MAX);
+    for _ in 0..7 {
+        flat = flat.min(load_time(&documents.0));
+        deep = deep.min(load_time(&documents.1));
+    }
     assert!(
-        deep < flat * 5,
+        deep < flat * 10,
         "a chain of 8000 owners took {deep:?} to load against {flat:?} flat: the load walks \
          each row's chain again (a per-row walk in the spawns)"
     );

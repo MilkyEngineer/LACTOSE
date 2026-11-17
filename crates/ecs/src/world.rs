@@ -20,8 +20,8 @@ use lactose_reflect::{
 
 use crate::bulk::RegionRows;
 use crate::change::{
-    ChangeMark, ChangedRows, ColumnMut, ColumnRef, Columns, ColumnsMut, ErasedColumn,
-    ErasedColumns, LogCursor, Stamp, StructuralChange, StructuralLog, tick_before,
+    ChangeMark, ChangedRows, ChunkRef, Chunks, ColumnMut, ColumnRef, Columns, ColumnsMut,
+    ErasedColumn, ErasedColumns, LogCursor, Stamp, StructuralChange, StructuralLog, tick_before,
 };
 use crate::command::{Bundle, ChannelStore, ErasedComponent, Payload, erase_bundle, is_worlds_own};
 use crate::event::{EventStore, PresentEventBatch, PresentLog};
@@ -1505,6 +1505,30 @@ impl World {
         }
         let columns = self.layout.order(columns, (self.tick.0.into(), component.0));
         ErasedColumns { columns: columns.into_iter() }
+    }
+
+    /// Every chunk of every archetype with all its columns, for a pass that forks over
+    /// chunks and reads several components of the same rows. Ordered as chunk jobs are
+    /// issued (`LayoutConfig::chunk_order`), so a result keyed by anything but the rows'
+    /// keys is wrong. A chunk's [`ChunkRef::column`] is the column
+    /// [`columns_erased`](Self::columns_erased) yields for it.
+    #[must_use]
+    pub fn chunks(&self) -> Chunks<'_> {
+        let mut chunks = Vec::new();
+        for arch in &self.storage.archetypes {
+            let region = arch.column_index(InRegion::KEY).expect("every row has a region");
+            for chunk in &arch.chunks {
+                chunks.push(ChunkRef {
+                    columns: &arch.columns,
+                    chunk,
+                    region,
+                    epoch: self.epoch,
+                    now: self.tick,
+                });
+            }
+        }
+        let chunks = self.layout.order(chunks, (self.tick.0.into(), 0));
+        Chunks { chunks: chunks.into_iter() }
     }
 
     /// The structural change log.

@@ -7,7 +7,7 @@ use lactose_core::{ComponentKey, StableKey, Tick};
 use lactose_reflect::Component;
 
 use crate::region::RegionId;
-use crate::storage::RowStamps;
+use crate::storage::{Chunk, ColumnInfo, RowStamps, typed_slice};
 
 /// A point in a world's stamp order: a tick and a position within it.
 ///
@@ -392,6 +392,84 @@ impl<'w> Iterator for ErasedColumns<'w> {
 
     fn next(&mut self) -> Option<Self::Item> {
         self.columns.next()
+    }
+}
+
+/// One chunk with every column of its archetype, read: the join of several components of
+/// the same rows, for a pass that forks over chunks and reads more than one component
+/// (extract reads `Transform`, `MeshInstance` and `Teleported` together). Yielded by
+/// [`World::chunks`](crate::World::chunks). Index `i` of every column is the row whose key is
+/// `keys()[i]`; the rows are identified by key, never by index.
+pub struct ChunkRef<'w> {
+    /// The archetype's columns, ascending by key.
+    pub(crate) columns: &'w [ColumnInfo],
+    pub(crate) chunk: &'w Chunk,
+    /// The index of the `InRegion` column, which every archetype has.
+    pub(crate) region: usize,
+    /// The world's epoch and tick, which a mark is judged against.
+    pub(crate) epoch: u32,
+    pub(crate) now: Tick,
+}
+
+impl<'w> ChunkRef<'w> {
+    /// The origin key of each row.
+    #[must_use]
+    pub fn keys(&self) -> &'w [StableKey] {
+        &self.chunk.keys
+    }
+
+    /// The region of each row.
+    #[must_use]
+    pub fn regions(&self) -> &'w [RegionId] {
+        typed_slice(self.chunk.column(&self.columns[self.region]), self.chunk.len())
+    }
+
+    /// The components every row of the chunk has, ascending by key.
+    pub fn components(&self) -> impl ExactSizeIterator<Item = ComponentKey> + 'w {
+        self.columns.iter().map(|column| column.key)
+    }
+
+    /// The values of `T`, one per row, or `None` if the chunk's rows have no `T`.
+    #[must_use]
+    pub fn values<T: Component>(&self) -> Option<&'w [T]> {
+        let column = &self.columns[self.index(T::KEY)?];
+        Some(typed_slice(self.chunk.column(column), self.chunk.len()))
+    }
+
+    /// The column of `component`, as [`World::columns_erased`](crate::World::columns_erased)
+    /// yields it for this chunk, or `None` if the chunk's rows do not have it: its bytes,
+    /// row ticks and [`changed_since`](ErasedColumn::changed_since).
+    #[must_use]
+    pub fn column(&self, component: ComponentKey) -> Option<ErasedColumn<'w>> {
+        let index = self.index(component)?;
+        Some(ErasedColumn {
+            component,
+            element_size: self.columns[index].size,
+            keys: &self.chunk.keys,
+            regions: self.regions(),
+            bytes: self.chunk.column(&self.columns[index]),
+            stamps: self.chunk.stamps[index].as_ref(),
+            column_stamp: self.chunk.column_ticks[index],
+            epoch: self.epoch,
+            now: self.now,
+        })
+    }
+
+    fn index(&self, component: ComponentKey) -> Option<usize> {
+        self.columns.binary_search_by_key(&component, |column| column.key).ok()
+    }
+}
+
+/// Iterates every chunk of a world, each with all its columns.
+pub struct Chunks<'w> {
+    pub(crate) chunks: std::vec::IntoIter<ChunkRef<'w>>,
+}
+
+impl<'w> Iterator for Chunks<'w> {
+    type Item = ChunkRef<'w>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.chunks.next()
     }
 }
 

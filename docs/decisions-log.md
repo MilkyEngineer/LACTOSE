@@ -6963,6 +6963,26 @@ process state; the nightly Miri filters name modules that Miri compiles** (§20,
   `AudioRequest::Footstep`; the plan's decision 5.2, "the write of the previous and current
   transform to the staging ring"; D153's "writing the previous and current transform to the
   device's mapped staging ring in render space" and its copy in the plan's section 11.
+- Addendum (lane present-impl, 2026-11-18; review rounds 1 to 4): *implemented, with no public
+  signature changed.* Extract reads a chunk's columns together through `World::chunks` (`ChunkRef`),
+  added to `lactose-ecs` as the facade allowed, and forks a job per chunk. Every pass at a tick
+  other than the previous pass's calls the sink's `begin` and `end`, with nothing between them when
+  it has nothing to write, so the ticks of the sink's `begin`s are extract's pass ticks and the
+  sink's base drop falls at exactly the passes extract flags as earlier-tick; review round 1 found
+  that a pass that called nothing after a still tick hid a resync from the sink (RSS, RSS3, RSSR).
+  The earlier-tick rule has three parts, none redundant: the snapshot's cut keeps the frame from
+  drawing backward; the sink's base drop keeps a rollback after a resync from being drawn from a
+  base of before it; extract's flag states on the row that it is not interpolated, which is all a
+  sink that keeps no base has. A sink's `write` runs on several workers at once and never waits for
+  a ring region, a fence or another job; a row it cannot take is dropped and counted, and written
+  again only as it would have been without the drop (the settling write, a change, a full pass). The
+  triple buffer is safe Rust under one `Mutex`, with `Arc::get_mut` keeping the written buffer
+  unshared, so it carries no `unsafe`. The lock is held for a constant-time exchange of buffer
+  handles and event batches: `publish` links a list node it allocated before taking the lock, and
+  the batches are folded, in time linear in the events, and dropped outside it. No loom model or
+  Miri run covers it; architecture section 3 names the lock. A reader that stops acquiring costs
+  memory, one batch per publication with an event; what it receives when it returns is
+  `frame-design`'s decision.
 
 ## 10. Review history
 

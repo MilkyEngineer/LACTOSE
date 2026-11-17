@@ -55,8 +55,9 @@ mod world;
 pub use access::{Access, AccessKind, AccessTarget};
 pub use bulk::{ExportedRow, RegionRows};
 pub use change::{
-    ChangeMark, ChangedIndices, ChangedRows, ColumnMut, ColumnRef, Columns, ColumnsMut, DirtyRows,
-    ErasedColumn, ErasedColumns, LogCursor, LogEntries, LogEntry, StructuralChange, StructuralLog,
+    ChangeMark, ChangedIndices, ChangedRows, ChunkRef, Chunks, ColumnMut, ColumnRef, Columns,
+    ColumnsMut, DirtyRows, ErasedColumn, ErasedColumns, LogCursor, LogEntries, LogEntry,
+    StructuralChange, StructuralLog,
 };
 pub use command::{
     Bundle, Channel, ChannelEntries, ChannelEntry, ChannelTake, ChannelWriter, CommandChannel,
@@ -105,6 +106,7 @@ const _: () = {
     send_sync::<World>();
     send_sync::<ColumnRef<'_, InRegion>>();
     send_sync::<ErasedColumn<'_>>();
+    send_sync::<ChunkRef<'_>>();
     send::<ColumnMut<'_, InRegion>>();
     send::<Schedule>();
     send::<WorldSnapshot>();

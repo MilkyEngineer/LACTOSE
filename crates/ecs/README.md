@@ -42,7 +42,7 @@ and list what changed, because `sim`, `predict`, `physics-api`, `net`, `persist`
 | `RegionId`, `RegionMode`, `RegionConfig`, `InRegion`, `OwnedBy`, `ClaimedBy`, `PredictedOrigin` | Regions and the components the world maintains |
 | `World::claimed`, `Claimed` | The entities one player has claimed, from an index the world keeps beside the relationship index |
 | `Rng` | The counter-based generator, from `Ctx::rng` and `World::rng` |
-| `ChangeMark`, `World::changed_since`, `World::is_current`, `World::columns`, `ColumnMut`, `DirtyRows`, `ErasedColumn::changed_since`, `ChangedIndices`, `StructuralLog`, `LogCursor` | Change state read per consumer, typed or from the registry; whole-column access that records what it changed |
+| `ChangeMark`, `World::changed_since`, `World::is_current`, `World::columns`, `World::chunks`, `ChunkRef`, `ColumnMut`, `DirtyRows`, `ErasedColumn::changed_since`, `ChangedIndices`, `StructuralLog`, `LogCursor` | Change state read per consumer, typed or from the registry; whole-column access that records what it changed; every column of a chunk at once |
 | `Query`, `QueryItems` | Whole-world iteration for exclusive code and tests, in key order |
 | `WorldSnapshot` | The prediction world's rollback state |
 | `World::region_mode` | A loaded region's mode in one lookup, for a consumer that reads every region's mode at every sync point (`World::region` counts the region's entities) |
@@ -545,10 +545,14 @@ What a system is, from its parameters (`SystemParam` has the table):
   bytes were not already zero is stamped there; every region's transient resources are
   zeroed too.
 - `World::columns` yields one slice per chunk with the rows' keys and regions, for passes
-  that fork over chunks (extract, replication gather, the world hash). Results keyed by
-  anything but `StableKey` are wrong, and SOUR's layout mode catches them. `Query::for_each`
-  and `referrers` are in ascending key order, so exclusive code that spawns or allocates
-  per match is layout-independent.
+  that fork over chunks (extract, replication gather, the world hash). `World::chunks`
+  yields every chunk with all its columns, a `ChunkRef`, for a pass that reads several
+  components of the same rows (extract): index `i` of each of its columns is the row whose
+  key is `keys()[i]`, `ChunkRef::column` is the `ErasedColumn` `columns_erased` yields for
+  the chunk, with the same `changed_since`, and `ChunkRef::values` the typed slice. Results
+  keyed by anything but `StableKey` are wrong, and SOUR's layout mode catches them.
+  `Query::for_each` and `referrers` are in ascending key order, so exclusive code that
+  spawns or allocates per match is layout-independent.
 
 **Snapshots and bulk copy**
 
@@ -706,6 +710,7 @@ chaos seeds; under Miri, which no runner launches, the session is not read.
 | `schedule_errors.rs` | Every `ScheduleError` variant, the channel placements (`ChannelAfterTaker`, `ChannelWithoutConsumer`) and the `ChannelTake` refusals among them; `run_tick` failing on `prepare` and on shutdown |
 | `channel_skip.rs` | A taker skipped for a resource removed mid-run is logged at `error`, naming the channel it did not take |
 | `change.rs` | `Mut` and `set_if_neq` stamps, fresh and stale marks, `Changed<T>` seen once per reader, `ColumnMut::write` with and without dirty rows, column ticks, the 2^30 rebase |
+| `chunks.rs` | `World::chunks` holds every (key, component, bytes) `columns_erased` holds, the same under every layout; each chunk's columns row for row with its keys, its typed `values` equal to its erased bytes; a chunk's `changed_since` selecting what `World::changed_since` selects, with a fresh and a stale mark |
 | `erased.rs` | `ErasedColumn::changed_since` selects the rows `World::changed_since` selects, under every layout, for writes inside a tick and between ticks, with a fresh and a stale mark |
 | `snapshot.rs` | Ten ticks, a snapshot at three, a restore and a re-run equal in every column, row tick and `Changed` set; presentation events deduplicated and cancelled; stale cursors; binds kept; pruning |
 | `bulk.rs` | A baseline and an overlay with every record kind, diffed back to the same overlay under every layout; region resources; schema mismatches; a same-size layout change at one version (`i32` to `u32`), whose schemas differ only by the digest, refused in a baseline and in an overlay under every layout with no row, no log entry and no counter move, and loaded by the registry that wrote it; a saved resource of 16 KiB builds, one of 16 KiB + 1 does not, persistent or transient, and a derived one does |

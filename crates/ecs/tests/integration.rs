@@ -8,6 +8,7 @@ mod common;
 mod binds;
 mod bulk;
 mod change;
+mod chunks;
 mod claims;
 mod commands;
 mod compile_fail;

@@ -80,7 +80,10 @@ level are a schedule build error.
 **No locks on the hot path.** Per-frame work uses chunks, command buffers and atomic counters.
 A `Mutex` inside a system is a review rejection. Locks are permitted in setup, teardown, IO
 completion handling, and inside RHI backends on objects the graphics API requires to be
-externally synchronised.
+externally synchronised. One lock is permitted inside a system: the snapshot channel of
+`lactose-present-api` (D157), taken at most once by extract's pass and once by each
+publication and acquire, and held for a constant-time exchange of buffer handles and event
+batches alone.
 
 **Unsafe is quarantined.** `#![forbid(unsafe_code)]` outside the crates in section 21.
 

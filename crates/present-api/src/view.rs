@@ -14,7 +14,7 @@ use std::collections::BTreeMap;
 use std::collections::btree_map;
 
 use lactose_core::ComponentKey;
-use lactose_reflect::{Persistence, Reflect, Resource, TypeInfo};
+use lactose_reflect::{Persistence, Reflect, Resource, TypeInfo, bytemuck};
 
 /// One stored view-model: its description, its type, and its bytes.
 #[derive(Clone, Debug)]
@@ -52,27 +52,44 @@ impl ViewModels {
     /// whose keys collide, which no registry was asked about.
     pub fn set<R: Resource>(&mut self, value: R) -> Option<R> {
         const { assert!(is_derived::<R>(), "a view-model is declared `derived`") };
-        todo!()
+        if let Some(stored) = self.values.get(&R::KEY) {
+            assert!(
+                stored.type_id == TypeId::of::<R>(),
+                "view-models `{}` and `{}` have one key",
+                stored.info.name(),
+                R::SCHEMA.info().name()
+            );
+        }
+        let stored = Stored {
+            info: R::SCHEMA.info(),
+            type_id: TypeId::of::<R>(),
+            bytes: bytemuck::bytes_of(&value).into(),
+        };
+        self.values.insert(R::KEY, stored).as_ref().map(read)
     }
 
     /// The view-model of type `R`, by value, or `None` if none is stored.
     #[must_use]
     pub fn get<R: Resource>(&self) -> Option<R> {
         const { assert!(is_derived::<R>(), "a view-model is declared `derived`") };
-        todo!()
+        self.values.get(&R::KEY).filter(|stored| stored.type_id == TypeId::of::<R>()).map(read)
     }
 
     /// Removes and returns the view-model of type `R`.
     pub fn remove<R: Resource>(&mut self) -> Option<R> {
         const { assert!(is_derived::<R>(), "a view-model is declared `derived`") };
-        todo!()
+        let stored = self.values.get(&R::KEY)?;
+        if stored.type_id != TypeId::of::<R>() {
+            return None;
+        }
+        self.values.remove(&R::KEY).as_ref().map(read)
     }
 
     /// The view-model whose type has `key`, as its description and bytes, or `None` if
     /// none is stored: how a reader that cannot name the type binds to a field.
     #[must_use]
     pub fn get_erased(&self, key: ComponentKey) -> Option<ViewModel<'_>> {
-        todo!()
+        self.values.get(&key).map(|stored| ViewModel { info: stored.info, bytes: &stored.bytes })
     }
 
     /// Every stored view-model, in ascending key order.
@@ -101,6 +118,11 @@ impl<'a> IntoIterator for &'a ViewModels {
     fn into_iter(self) -> ViewModelIter<'a> {
         self.iter()
     }
+}
+
+/// The value `stored` holds, which `set` copied from an `R`: a failure is a broken invariant.
+fn read<R: Resource>(stored: &Stored) -> R {
+    bytemuck::checked::try_pod_read_unaligned(&stored.bytes).expect("a stored view-model is valid")
 }
 
 /// Whether `R` is declared `derived`.

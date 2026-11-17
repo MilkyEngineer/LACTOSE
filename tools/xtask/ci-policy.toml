@@ -46,7 +46,7 @@ packages = ["lactose-app-headless"]
 packages = [
   "lactose-sim", "lactose-ecs", "lactose-physics-api", "lactose-input", "lactose-physics-rapier",
   "lactose-net-api", "lactose-predict", "lactose-net-host", "lactose-anim", "lactose-persist",
-  "lactose-app",
+  "lactose-app", "lactose-present-api",
 ]
 tests = [
   "lactose_anim::sour::a_prediction_crowd_with_a_rollback",
@@ -86,6 +86,8 @@ tests = [
   "lactose_physics_rapier::sour::a_server_scene::physics",
   "lactose_physics_rapier::sour::the_conformance_run",
   "lactose_predict::sour::a_prediction_scene_with_corrections_and_substitutions",
+  "lactose_present_api::sour::a_prediction_scene_with_extract_and_a_rollback",
+  "lactose_present_api::sour::a_server_scene_with_extract",
   "lactose_sim::cost::scene",
   "lactose_sim::sour::anchored_world",
 ]
