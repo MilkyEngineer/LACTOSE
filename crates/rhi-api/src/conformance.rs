@@ -284,6 +284,7 @@ pub const CASES: &[Case] = cases! {
     contract "swapchain_image_on_a_frame_encoder_is_refused" => PresentQueue;
     contract "swapchain_image_used_outside_its_acquire_is_refused" => Swapchain;
     contract "second_swapchain_is_refused" => Swapchain everywhere;
+    contract "swapchain_extent_with_a_zero_dimension_is_refused" => Bounds everywhere;
     contract "resize_with_a_present_pending_is_refused" => Pending everywhere;
     contract "image_of_before_a_resize_is_refused" => Destroyed everywhere;
     contract "frame_submits_complete_while_a_present_is_pending";

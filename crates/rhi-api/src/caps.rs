@@ -122,7 +122,10 @@ pub struct Capabilities {
     /// The range, in texels, that a [`Viewport`](crate::Viewport)'s edges lie in on both
     /// axes: the driver's range, rounded inward, at least -8192 to 8191. A viewport whose
     /// left or top edge is below the first or whose right or bottom edge is above the
-    /// second is refused ([`Rule::Bounds`](crate::Rule::Bounds)).
+    /// second is refused ([`Rule::Bounds`](crate::Rule::Bounds)). On an Apple GPU,
+    /// `rhi-metal` and `vulkan` report at most -16384 to 16383, the range the facade's GPU
+    /// review's probe saw the M1 honour; MoltenVK reports -32768 to 32767, which the M1
+    /// does not honour past a far edge near 24,576.
     pub viewport_bounds: [i32; 2],
 }
 

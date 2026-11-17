@@ -226,7 +226,9 @@ pub trait Device: Send + Sync {
     /// signals it ([`Rule::Pending`](crate::Rule::Pending)).
     fn destroy_timeline(&self, timeline: TimelineHandle) -> Result<()>;
 
-    /// The timeline's value now. It never decreases.
+    /// The timeline's value now. It never decreases. A device backend records the value
+    /// it saw before it returns, so the checks of later calls know the timeline has reached
+    /// it (`README.md`, "Timelines").
     fn timeline_value(&self, timeline: TimelineHandle) -> Result<u64>;
 
     /// Signals a point from the host: the timeline's value becomes `point.value`. The value
@@ -234,14 +236,16 @@ pub trait Device: Send + Sync {
     /// signal to it, and within 2^31 of the timeline's and of every value a pending submit
     /// waits for or signals on it; every pending submit that signals the timeline waits, on
     /// it, for a value greater than the timeline's and no greater than `point.value`; and
-    /// no other host signal of it is in progress. The timeline's value here is the greater
-    /// of the driver's and the greatest the device has signalled from the host. Otherwise
-    /// the call is refused on every backend ([`Rule::Timeline`](crate::Rule::Timeline)),
-    /// since a promise or a host signal could pass this one (`README.md`, "Timelines").
+    /// no other host signal of it is in progress. The timeline's value here is the greatest
+    /// the device knows it has reached (`README.md`, "Timelines"). Otherwise the call is
+    /// refused on every backend ([`Rule::Timeline`](crate::Rule::Timeline)), since a
+    /// promise or a host signal could pass this one.
     fn signal_timeline(&self, point: TimelinePoint) -> Result<()>;
 
     /// Blocks until the point is reached or `timeout` has passed, and returns whether it
-    /// was reached. A zero timeout polls.
+    /// was reached. A zero timeout polls. A device backend that returns `true` records the
+    /// point as reached before it returns, so no later call is refused as `pending` for a
+    /// submit that signals it (`README.md`, "Queues by role").
     ///
     /// # Errors
     ///
@@ -278,6 +282,8 @@ pub trait Device: Send + Sync {
     ///
     /// `ErrorKind::Unsupported` for a device created with no surface, and for a surface
     /// the device cannot present to; refused while the device's swapchain lives
-    /// ([`Rule::Swapchain`](crate::Rule::Swapchain)).
+    /// ([`Rule::Swapchain`](crate::Rule::Swapchain)); refused for an extent with a zero
+    /// dimension, and at a surface whose current extent is empty, such as a minimised
+    /// window on Windows ([`Rule::Bounds`](crate::Rule::Bounds)). Both on every backend.
     fn create_swapchain(&self, desc: &SwapchainDesc) -> Result<Box<dyn Swapchain>>;
 }

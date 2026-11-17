@@ -47,8 +47,9 @@ pub enum Rule {
     /// `bounds`: a range outside its buffer, image, memory block, heap, push-constant
     /// range or attachments, an index or indirect offset or stride off its alignment, a
     /// viewport that is not finite, not of positive extent, larger or further out than the
-    /// device's viewport limits or whose depth range leaves zero to one, or a dispatch
-    /// above the device's workgroup counts.
+    /// device's viewport limits or whose depth range leaves zero to one, a dispatch above
+    /// the device's workgroup counts, or a swapchain extent with a zero dimension or at an
+    /// empty surface.
     Bounds,
     /// `undeclared`: a heap slot or a buffer handed to a pass through
     /// [`push_slot`](crate::Encoder::push_slot) or
@@ -102,8 +103,8 @@ pub enum Rule {
     /// wait for it; a host signal not between the timeline's value and every pending
     /// promise, or one a pending promise or another host signal could pass; or a value
     /// 2^31 or more from the timeline's or from a value a pending submit waits for or
-    /// signals on it. The timeline's value is the greater of the driver's and the greatest
-    /// the device has signalled from the host.
+    /// signals on it. The timeline's value is the greatest the device knows it has reached
+    /// (`README.md`, "Timelines").
     Timeline,
     /// `encoding`: a command outside the scope it belongs to, a draw or dispatch with
     /// nothing bound to it, a pass left open, an encoder of another device or role, or an

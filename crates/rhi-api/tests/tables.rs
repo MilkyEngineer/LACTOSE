@@ -73,7 +73,7 @@ fn indirect_record_is_five_little_endian_words() {
 
 /// The refusal cases a device backend runs: one or more for each clause of the rules
 /// table's "Every backend" column.
-const EVERYWHERE: [&str; 59] = [
+const EVERYWHERE: [&str; 60] = [
     "unreported_capability_is_refused",
     "submit_to_the_present_role_is_refused",
     "overlapping_host_access_is_refused",
@@ -131,6 +131,7 @@ const EVERYWHERE: [&str; 59] = [
     "second_acquire_before_a_present_is_refused",
     "present_of_an_image_not_acquired_is_refused",
     "second_swapchain_is_refused",
+    "swapchain_extent_with_a_zero_dimension_is_refused",
     "resize_with_a_present_pending_is_refused",
     "image_of_before_a_resize_is_refused",
 ];

@@ -118,14 +118,17 @@ is a supertrait of `Encoder` so a backend recovers its own type in a submit.
   refuses on the M1 a dispatch that only a device at the least would break (MoltenVK reports
   2^30). A `dispatch` above it is refused (`bounds`, every backend). Metal publishes no
   limit; `rhi-metal` reports what MoltenVK reports for the same GPU, which hands the counts
-  to Metal unchanged, and a probe of the facade's GPU review ran 70,000 groups in x and in y
-  with no assert.
+  to Metal unchanged, and a probe of the facade's GPU review ran 2^30 groups in each of x, y
+  and z on the M1, under Metal API validation, each to its last group.
 - `viewport_extent` and `viewport_bounds` are the driver's limits on a viewport: its largest
   width and height, and the range its edges lie in, Vulkan's `maxViewportDimensions` and
   `viewportBoundsRange` rounded inward. Vulkan's least, 4096 and -8192 to 8191, is what
   `LEAST` holds; MoltenVK reports 16384 and -32768 to 32767. A viewport beyond either is
   refused (`bounds`, every backend). Metal publishes neither, and `rhi-metal` reports
-  MoltenVK's values for the same GPU, which hands the viewport to Metal unchanged.
+  MoltenVK's `viewport_extent` for the same GPU. On an Apple GPU, `rhi-metal` and `vulkan`
+  report `viewport_bounds` of at most -16384 to 16383, the range the facade's GPU review's
+  probe saw the M1 honour. MoltenVK reports -32768 to 32767, which the M1 does not honour
+  past a far edge near 24,576: it draws nothing, with no error.
 - `heap_slots` and `samplers` are the request's: a device whose limit is below either is not
   created. `HEAP_SLOTS_DEFAULT` and `SAMPLERS_DEFAULT` are what milestone 2 requests,
   `Capabilities::LEAST` holds, and the cook compiles its arrays to.
@@ -149,12 +152,14 @@ is a supertrait of `Encoder` so a backend recovers its own type in a submit.
   has changed nothing in the driver and leaves the point to the backend. Before it lets go
   of the queue's lock, the backend submits a batch with no work that signals the queue's own
   timeline to the point, behind the queue's earlier submits, and takes the record's lock
-  once more to drop the failed submit's promises; should the batch fail too, the queue's
-  next submit passes the point. The point is never signalled from the host, and the backend
-  never waits for the queue there: an earlier submit to the queue may still be pending,
-  perhaps on a point the caller will signal from the host. Which of two threads' submits
-  comes first is the callers' to decide. Nothing orders work on two queues but a timeline
-  point one submit signals and the other waits for.
+  once more to drop the failed submit's promises and its points; should the batch fail too,
+  the queue's next submit passes the point. On Vulkan every signal a backend submits, the
+  queue's own, the caller's and the batch's, is at `VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT`,
+  so that a point reached means every earlier submit to its queue has run. The point is
+  never signalled from the host, and the backend never waits for the queue there: an earlier
+  submit to the queue may still be pending, perhaps on a point the caller will signal from
+  the host. Which of two threads' submits comes first is the callers' to decide. Nothing
+  orders work on two queues but a timeline point one submit signals and the other waits for.
 - On one queue a submit may be held by every submit made before it: one that waits for a
   point holds those behind it until the point is reached. Null holds them so, running a
   queue's submits strictly in order; a driver may let a later one pass. So a submit never
@@ -170,15 +175,20 @@ is a supertrait of `Encoder` so a backend recovers its own type in a submit.
   a device. Null runs a submit's effects when its waits are reached, and a drop does not
   block on what it has run.
 - A device backend's pending is completion. The completed value of each queue is read from
-  the driver at the check: an internal timeline semaphore every Vulkan submit signals, read
-  with `vkGetSemaphoreCounterValue`; an internal shared event `rhi-metal` encodes before the
-  caller's signals, read with `signaledValue`. Never a value a completion handler or a
-  status updates later: on the M1 both trail the point the host has seen. Where that value
-  is below a stamp, the device also reads the caller's points that the stamped submit and
-  the later submits of its queue signal, and counts the submit complete if any is reached.
-  No backend refuses a call as pending once the caller has seen a point the submit signals.
-  A device's refusal of a call made before then depends on timing; the call is wrong either
-  way.
+  the driver before the lock and folded into the value the device knows the queue's own
+  timeline has reached ("Timelines"): an internal timeline semaphore every Vulkan submit
+  signals, read with `vkGetSemaphoreCounterValue`; an internal shared event `rhi-metal`
+  encodes before the caller's signals, read with `signaledValue`. Never a value a completion
+  handler or a status updates later: on the M1 both trail the point the host has seen. Where
+  that value is below a stamp, the device also compares the caller's points that the stamped
+  submit and the later submits of its queue signal with the values it knows those timelines
+  have reached ("Timelines"), and counts the submit complete if any is reached; it reads no
+  driver value for them. A point the caller has seen through `wait_timeline` or
+  `timeline_value` is known before that call returns. A failed submit's points are dropped
+  with its promises: the caller may then signal them from the host, which says nothing of
+  the queue's earlier submits. No backend refuses a call as pending once the caller has seen
+  a point the submit signals. A device's refusal of a call made before then depends on
+  timing; the call is wrong either way.
 
 **The present thread** (decision 5.6, D153; Metal item 11)
 
@@ -219,8 +229,10 @@ is a supertrait of `Encoder` so a backend recovers its own type in a submit.
   no backend names `lactose-platform`.
 - A backend reads the two handles once each, inside its constructor, on the thread that
   calls the constructor, and never again. A platform whose handles are only available on one
-  thread (AppKit's main thread) calls the constructor there. The backend keeps the `Arc`
-  until its surface is destroyed, so the window outlives every use of its handles.
+  thread (AppKit's main thread) calls the constructor there. The backend holds the source's
+  `Arc` in what destroys the surface and drops it in that destroy, which is the drop of the
+  last of the `Device`, its encoders and its swapchain; it keeps no clone elsewhere, so the
+  window is let go when the device is.
 - `Device::create_swapchain` on a device made with no window returns `Unsupported`.
 
 **Threads**
@@ -245,24 +257,30 @@ is a supertrait of `Encoder` so a backend recovers its own type in a submit.
   they permit together, so that no other call falls between a check and the change it
   permits: a submit for the check of every handle, buffer, slot and timeline its encoders
   and points name and then every stamp and promise, so a refused submit stamps nothing, and
-  once more, under the queue's lock, to drop its promises where its driver call fails; a
-  destroy for its checks and the handle's removal; `write_buffer` and `read_buffer` for
-  their checks and the insert of their range, and again for its removal once the closure has
-  returned; `write_heap_slot` and `clear_heap_slot` for the check, a mark on the slot and
-  the count of the new image, and again, after the descriptor write, for the slot's record,
-  the release of the old image and the mark's removal; a submit whose walk finds a slot it
-  declares marked is refused (`uuwp-used`); `signal_timeline` for its check, the mark of its
-  signal in progress and the record of its value, and again for the mark's removal. Where a
-  call must make a driver call or run the caller's closure between its check and its effect
-  (a host lend, a host signal, a heap write), its first hold sets a mark that every
+  once more, under the queue's lock, to drop its promises and its points where its driver
+  call fails; a destroy for its checks and the handle's removal; `write_buffer` and
+  `read_buffer` for their checks and the insert of their range, and again for its removal
+  once the closure has returned; `write_heap_slot` and `clear_heap_slot` for the check, a
+  mark on the slot and the count of the new image, and again, after the descriptor write,
+  for the slot's record, the release of the old image and the mark's removal; a submit whose
+  walk finds a slot it declares marked is refused (`uuwp-used`); `signal_timeline` for its
+  check and the mark, with its value, of its signal in progress, and again, after its driver
+  call, for the mark's removal and, where the call succeeded, the fold of its value into the
+  timeline's known value ("Timelines"); `wait_timeline` that returns `true` and
+  `timeline_value` once each, after their driver call, to fold in the value they saw. Where
+  a call must make a driver call or run the caller's closure between its check and its
+  effect (a host lend, a host signal, a heap write), its first hold sets a mark that every
   conflicting check refuses, and a second hold clears it; the second hold decides nothing.
   The lock is never held across a wait, a driver call or a caller's closure, so `fill`,
   `read` and every validator's message run outside it. A value a check reads from the
-  driver, a queue's completed value or a timeline's, is read before the lock is taken. It
-  only grows, so a check that refuses below it, as every check of `pending` does, errs
-  toward refusal. A check that a signal must exceed it takes the greater of it and the
-  greatest value the device has signalled from the host, which the records keep
-  ("Timelines"); the read alone misses a host signal made after it.
+  driver, a queue's completed value or a timeline's, is read before the lock is taken, and
+  the hold folds it into the greatest value the records know that timeline has reached,
+  which the check then takes ("Timelines"). No driver value is read under the lock: with the
+  Khronos validation layer a read waits for the layer's own thread to retire the work it
+  shows. The known value only grows and is never above the driver's, so a check that refuses
+  below it, as every check of `pending` does, errs toward refusal; a check that a signal
+  must exceed it is sound because every value the timeline is ever signalled to is known, a
+  promise in the records or a marked host signal's, not because the read is recent.
 - A device backend takes its locks in one order: a queue's lock or the heap's lock, then the
   record's lock, then the lock of one entry, a handle's or a heap slot's. No call takes two
   queue locks, and the heap's lock and a queue's are never held together. Each device
@@ -300,14 +318,18 @@ is a supertrait of `Encoder` so a backend recovers its own type in a submit.
 - An image is destroyed only after no heap slot holds it, and a block only after no image
   is placed in it (`pending`, every backend).
 - The device lives until the `Device` object, every encoder and the swapchain it made are
-  dropped. Dropping a pending encoder, the swapchain with a present pending, or the last
-  of them all blocks until the submits concerned complete. A caller that wants a prompt
-  shutdown waits for its own timeline points first, and a drop under a submit whose wait
-  is never signalled does not return. So encoders, the swapchain and the device are
-  dropped off the frame workers, whose one sanctioned blocking wait is the physics step
-  (architecture section 5.1). A drop made while the thread unwinds a panic does not block:
-  the backend leaks what is pending, so a test that fails holding a pending encoder fails
-  instead of hanging.
+  dropped. Dropping a pending encoder, the swapchain with a present pending, or the last of
+  them all blocks until the submits concerned complete. A caller that wants a prompt
+  shutdown waits for its own timeline points first, and a drop under a submit whose wait is
+  never signalled does not return. So encoders, the swapchain and the device are dropped off
+  the frame workers, whose one sanctioned blocking wait is the physics step (architecture
+  section 5.1). A drop made while the thread unwinds a panic does not block: the backend
+  leaks what is pending, so a test that fails holding a pending encoder fails instead of
+  hanging. A drop that finds no submit and no present pending waits for nothing and calls
+  nothing that needs another thread, so it may be made on a thread that must not wait, the
+  main thread included; a caller that drops there first waits for its points and the
+  swapchain's presents, and signals every point a pending submit waits on that the host
+  owes.
 
 **Buffers and host access** (RHI point 3, Metal point 3)
 
@@ -677,13 +699,25 @@ is a supertrait of `Encoder` so a backend recovers its own type in a submit.
   it. A submit signals a timeline only where every pending signal of it is from the submit's
   own queue or from a submit it waits for. No value is 2^31 or more away from the timeline's
   value, or from a value a pending submit waits for or signals on it (`timeline`, every
-  backend). A device keeps, for each timeline, its pending promises, a list no longer than
-  its pending submits, each with the queue that made it and what its submit waits for on the
-  timeline; the least value a pending submit waits for on it; and the greatest value it has
-  signalled to the timeline from the host. A promise is pending until the timeline's value
-  reaches it. In every check that a value must exceed the timeline's, the timeline's value
-  is the greater of the driver's, read before the record's lock, and that greatest host
-  value: a host signal another thread made in full after the read is in the second.
+  backend). A device keeps, for each timeline, the greatest value it knows the timeline has
+  reached, and one list of the submits that wait for or signal it, each with its queue, the
+  point it is stamped with, and its wait and its signal on the timeline. The known value is
+  the greatest of every value a call has read from the driver for a check, folded in by that
+  call's hold; a host signal's value, folded in by its second hold once its driver call has
+  returned; and what a `wait_timeline` that returned `true` and a `timeline_value` saw,
+  folded in by a hold each makes after its driver call. A signal in the list is a promise,
+  pending until the known value reaches it, not until its submit completes; a wait in the
+  list is pending until its submit completes. A submit leaves the list once neither is
+  pending, so the list is no longer than the submits with a pending wait or promise on the
+  timeline; a failed submit leaves it in the second hold its failure takes, and its
+  promises, which never reached the driver, are not folded in, so a retry of the same point
+  is accepted. In every check the timeline's value is the known value after the check's own
+  read is folded in. Every value the timeline is ever signalled to is known, a promise in
+  the list or the value of a host signal in progress, so the driver's value is at least the
+  known value and at most the greatest of the three: a host signal another thread made in
+  full after a check's read, and a promise another call saw reached after it, are in the
+  known value. The 2^31 checks take the known value and the least and the greatest wait and
+  signal in the list.
 - `signal_timeline` gives a value greater than the timeline's and less than every value a
   pending submit will signal to it. It is refused (`timeline`, every backend) where a submit
   that will signal the timeline does not wait, on that timeline, for a value greater than
@@ -691,9 +725,9 @@ is a supertrait of `Encoder` so a backend recovers its own type in a submit.
   timeline to, and while another host signal of the timeline is in progress: either could
   reach the timeline first and leave the host's value below it. A submit that signals a
   timeline is refused while a host signal of it is in progress, unless it waits for that
-  signal's value. A backend marks a host signal in progress, and records its value as the
-  greatest it has signalled, under the record's lock before its driver call, and clears the
-  mark after.
+  signal's value. A backend marks a host signal in progress, with its value, under the
+  record's lock before its driver call, and in a second hold after it clears the mark and,
+  where the call succeeded, folds the value into the known value.
 - Each of these is a rule of Vulkan's for a timeline semaphore whose breach is undefined
   behaviour and may hang its waiters. A host signal below a pending promise that waits for
   it is the way the host releases a submit made before its wait is met. A wait the timeline
@@ -707,25 +741,44 @@ is a supertrait of `Encoder` so a backend recovers its own type in a submit.
 
 **The swapchain** (Metal point 17 and item 11, decision 5.6)
 
-- `acquire` returns within a bound the backend sets, about one second, and takes no
-  timeout: an image, `None`, or `Stale`. One image is acquired at a time (`swapchain`, every
+- `acquire` returns within a bound the backend sets, about one second, and takes no timeout:
+  an image, `None`, or `Stale`. One image is acquired at a time (`swapchain`, every
   backend). An acquired image is `Undefined` on the present role's queue and is a colour
   attachment and nothing else. Its handle is the caller's to use from the acquire to its
   present and at no other time (`swapchain`, null); a later acquire may return the same
-  handle or another.
+  handle or another. `VK_SUBOPTIMAL_KHR` is reported as `Acquired::Image` and
+  `Presented::Shown`, never as `Stale`; `Stale` is `VK_ERROR_OUT_OF_DATE_KHR`, and
+  `VK_ERROR_OUT_OF_POOL_MEMORY` after MoltenVK's drawable timeout (decision 5.6). On macOS a
+  backend that makes the layer it presents to keeps that layer's bounds and `contentsScale`
+  equal to the view's, on the main thread, so a surface's current extent is the window's
+  size in physical pixels.
 - `present` is a submit and a present in one call: the submit's encoders are of the
   `Present` role, it leaves the image in `ImageState::Present`, and its waits and signals
   are a submit's. The backend owns whatever its driver needs between the two (one present
-  semaphore for each image, on Vulkan).
+  semaphore for each image, on Vulkan). Under MoltenVK `present` returns within about one
+  second for each image of the swapchain, the drawable wait in its submit, and the backend
+  leaves the layer's `allowsNextDrawableTimeout` true; on other drivers `present` is bounded
+  by the driver alone, and each device backend's README names the bound or says there is
+  none.
 - The number of presents in flight is the caller's to bound, by the points its presents
   signal. No backend bounds it (Metal item 11).
-- After `Acquired::Stale` or `Presented::Stale` the caller waits for its presents and calls
-  `resize`, which is refused while one is pending (`pending`, every backend); every handle
-  the swapchain gave before it is destroyed (`destroyed`). A present is pending until the
-  driver no longer reads its image, which a submit's completion does not show: on Vulkan
-  until its present fence signals. A Vulkan device made with a window requires
-  `VK_EXT_swapchain_maintenance1`, which gives the fence, and is not created without it
-  (`Unsupported`): a queue's idle wait does not cover a present. MoltenVK offers it.
+- After `Acquired::Stale` or `Presented::Stale` the caller waits for the points its presents
+  signal and calls `resize`; every handle the swapchain gave before it is destroyed
+  (`destroyed`). A present is pending until the driver no longer reads its image, which a
+  submit's completion does not show: on Vulkan until its present fence signals. `resize`
+  first waits, within the bound `acquire` has, for the swapchain's own presents, its present
+  fences; the caller's wait before `resize` is for its own points alone, and a refusal as
+  `pending` after that bound (every backend) is the caller's to retry. A Vulkan device made
+  with a window requires `VK_KHR_swapchain_maintenance1` or `VK_EXT_swapchain_maintenance1`,
+  with its feature and the instance's surface maintenance extension, and is not created
+  without them (`Unsupported`): a queue's idle wait does not cover a present. MoltenVK
+  offers both forms.
+- `create_swapchain` and `resize` refuse an extent with a zero dimension (`bounds`, every
+  backend). At a surface whose current extent is empty (a minimised window on Windows
+  reports 0×0), `create_swapchain` is refused and `resize` returns without calling the
+  driver and leaves the swapchain stale, and `acquire` returns `Stale` until the surface is
+  not empty; no extent outside the surface's minimum and maximum, and none with a zero
+  dimension, reaches the driver.
 
 **Device loss** (architecture section 19, verification row 192)
 
@@ -795,10 +848,10 @@ stale number into a wrong image ("The heap and the sampler table").
 | `State` | `state` | | a transition's `from`, a use's state, by subresource; a use after a write in a writing state with no transition since |
 | `Queue` | `no-qfot` | | a use off the owning queue; an acquire with no release; a change of state or owner under another queue's pending submit with no wait for it; an alias call across queues |
 | `Destroyed` | `destroyed` | a stale handle, at the `Device` call it is given to, or at the submit of the encoder it was recorded into, a resource destroyed since the recording included | a handle another device issued that resolves to a live resource |
-| `Pending` | `pending` | `Encoder::reset` while pending; `resize` with a present pending; a destroy under a pending submit of any queue; of an image a slot holds; of a block an image is placed in; of a sampler while any submit made before it is pending; `write_buffer` and `read_buffer` of a buffer a pending submit writes | a submit counted pending until the caller has seen its point ("Queues by role") |
+| `Pending` | `pending` | `Encoder::reset` while pending; `resize` with a present pending past its wait; a destroy under a pending submit of any queue; of an image a slot holds; of a block an image is placed in; of a sampler while any submit made before it is pending; `write_buffer` and `read_buffer` of a buffer a pending submit writes | a submit counted pending until the caller has seen its point ("Queues by role") |
 | `Capability` | `capability` | every call that needs an unreported capability; a SPIR-V module whose `OpCapability` or `OpExtension` instructions name one the device did not enable | |
 | `Usage` | `usage` | host access outside the memory class; `buffer_address` without `DEVICE_ADDRESS`; a descriptor no device could honour; every other use outside a usage; a pass's attachments; a pipeline's formats | |
-| `Bounds` | `bounds` | host ranges; heap slots; placements; push-constant offsets; copy regions; the scissor; the viewport, against `viewport_extent` and `viewport_bounds`; the index buffer's offset and the indices a direct draw reads; indirect offsets and strides, their alignment and the records they span; a dispatch's counts against `compute_groups` | |
+| `Bounds` | `bounds` | host ranges; heap slots; placements; push-constant offsets; copy regions; the scissor; the viewport, against `viewport_extent` and `viewport_bounds`; the index buffer's offset and the indices a direct draw reads; indirect offsets and strides, their alignment and the records they span; a dispatch's counts against `compute_groups`; a swapchain extent with a zero dimension, or at an empty surface | |
 | `Undeclared` | `undeclared` | `push_slot`, `push_address` | |
 | `Unflushed` | `unflushed` | | a written range at a submit; a read with no invalidate |
 | `HostOverlap` | `host-overlap` | overlapping host access; a destroy of a buffer under a host access; a submit that writes a buffer under one | |
@@ -823,7 +876,7 @@ driver call it guards:
 | Clauses | What a device keeps | Cost |
 |---|---|---|
 | `destroyed` at a call, and at a submit for every handle the encoder recorded | Its resource tables, by handle, whose entries do not move while the device lives (a fixed capacity, or chunks never moved), each live entry behind a lock of its own; the encoder's copy of what each handle it recorded resolved to, with a count, walked again at the submit | One lookup a handle an encoder, under that handle's entry lock, and a count kept to the encoder's reset; the walk the submit makes anyway, over the encoder's distinct handles |
-| `pending`: a reset, a resize, a destroy under a pending submit, a sampler's destroy | The point each queue's last submit is stamped with, taken under the queue's lock in the order its driver receives them, and the completed value of each queue, read from the driver at the check ("Queues by role"); for each resource, the last submit of each queue that names it, three stamps at most, stamped in the walk; a present's fence for each image the swapchain presents | A stamp a handle and queue at the submit; a read of the driver's value before the lock and a compare at the destroy |
+| `pending`: a reset, a resize, a destroy under a pending submit, a sampler's destroy | The point each queue's last submit is stamped with, taken under the queue's lock in the order its driver receives them, and the completed value of each queue, read from the driver before the lock and folded into the known value of the queue's own timeline ("Queues by role"); for each queue, the caller's points its pending submits signal, a failed submit's dropped with its promises; for each resource, the last submit of each queue that names it, three stamps at most, stamped in the walk; a present's fence for each image the swapchain presents | A stamp a handle and queue at the submit; a read before the lock, folded, and a compare at the destroy; where the queue is behind, a compare of the caller's points with their known values, with no driver read |
 | `pending`: an image a slot holds, a block an image is placed in | A count of the slots holding each image and of the images placed in each block | An increment and a decrement |
 | `pending`: `write_buffer` and `read_buffer` under a writer | For each buffer, the last submit of each queue that writes it, stamped in the walk | A compare a host call |
 | `host-overlap`: overlapping host access, a destroy or a submit that writes under one | For each buffer, the ranges of the host accesses in progress | An insert and a removal a call, and a lookup for each buffer a submit writes, under the record's lock ("Threads") |
@@ -833,7 +886,7 @@ driver call it guards:
 | `capability`: a SPIR-V module's capabilities and extensions | The capabilities and extensions the device enabled | A scan of the module's header at each pipeline's creation |
 | `memoryless-store` | One flag for each image | A compare for each attachment as its pass begins |
 | `encoding` | One state for each encoder, and the breach it recorded first | Free: `rhi-metal` needs the state to know its open command encoder |
-| `timeline` | For each timeline, its pending promises, each with the queue that made it and what its submit waits for on the timeline, a list no longer than its pending submits; the least pending wait on it; the greatest value signalled from the host; a mark for a host signal in progress; the timeline's value, read from the driver before the lock | A compare a signal; the mark set, and the host's value recorded, under the record's lock before a host signal's driver call, the mark cleared after; a failed submit's promises dropped in a second hold |
+| `timeline` | For each timeline, the greatest value the device knows it has reached; one list of the submits that wait for or signal it, each with its queue, its stamp and its wait and signal on it, kept while its wait or promise is pending; a mark, with its value, for a host signal in progress | A compare a signal or a wait against the known value and the list; the read before the lock folded in the hold; the mark set under the record's lock before a host signal's driver call, and cleared, with the value folded in, after; a hold after `wait_timeline` and `timeline_value` to fold what they saw; a failed submit's entries dropped in a second hold |
 
 A breach a device finds while recording is carried to the submit as the encoder's first
 breach, and the backend records nothing more into its driver's command buffer.
@@ -865,7 +918,7 @@ honours by a call the Metal spike made. The Vulkan column is the RHI spike's.
 | `copy_buffer`, `copy_buffer_to_image`, `copy_image_to_buffer` | Buffer to buffer moves bytes in its stores; the image forms are checked and move nothing | Blit encoder copies | The copy commands | RHI item 10, point 13; Metal item 12, point 13 |
 | `create_timeline`, `timeline_value`, `signal_timeline`, `wait_timeline` | A counter and a condition variable | `MTLSharedEvent`: `signaledValue`, a listener, a wait with a timeout | A timeline semaphore | RHI item 8, point 11; Metal item 9, point 11 |
 | `submit` with waits and signals | Checks every command in order, applies the states, completes when its waits are reached; pending until the caller sees its point | Command buffers enqueued in slice order, `encodeWaitForEvent` and `encodeSignalEvent`, the queue's own shared event before the caller's; the handles each names stamped with its point under the queue's lock | `vkQueueSubmit2` with timeline semaphores, the queue's own among the signals; the handles stamped likewise | RHI items 6 and 8; Metal items 8 and 9 |
-| `create_swapchain`, `acquire`, `present`, `resize` | Images with no window; an acquire that can be made to return `None` | A `CAMetalLayer`; `nextDrawable`, which has its own one-second limit; `present(drawable)` before the commit | A swapchain, with `VK_EXT_swapchain_maintenance1`'s present fence for each present; an acquire with a finite timeout; `vkQueuePresentKHR` after the submit | Metal item 11, point 17; decision 5.6 |
+| `create_swapchain`, `acquire`, `present`, `resize` | Images with no window; an acquire that can be made to return `None` | A `CAMetalLayer`, its bounds and `contentsScale` the view's; `nextDrawable`, which has its own one-second limit; `present(drawable)` before the commit | A swapchain, with the swapchain maintenance extension's present fence for each present, waited for by `resize` within `acquire`'s bound; an acquire with a finite timeout; `vkQueuePresentKHR` after the submit | Metal item 11, point 17; decision 5.6 |
 | `is_lost`, `DeviceLost` | A flag its own call sets | A command buffer's error status | `VK_ERROR_DEVICE_LOST` | Architecture 19; verification row 192 |
 | `MessageSink` | Never called | The driver's log where it has one; validators write to standard error | The debug messenger | RHI "Validation runs", point 14; Metal "Validation runs", point 14 |
 
@@ -873,9 +926,9 @@ honours by a call the Metal spike made. The Vulkan column is the RHI spike's.
 
 `conformance::CASES` lists every case by name, each a *contract* case or an *output* case,
 and `conformance::run` runs one against a `Harness`. The bodies arrive with the backends:
-the contract cases' with `rhi-null`, the output cases' and their Slang sources with `vulkan`.
-A backend's tests carry one test for each case, named after it. There are 146: 121 contract
-cases and 25 output cases.
+the contract cases' with `rhi-null`, the output cases' and their Slang sources with
+`vulkan`. A backend's tests carry one test for each case, named after it. There are 147: 122
+contract cases and 25 output cases.
 
 - A **contract** case asserts what the contract says of calls and results. It needs no
   shader to run and no pixel, so null passes it as a device does. A case that names a rule
@@ -888,7 +941,7 @@ cases and 25 output cases.
   and its refusal there depends on timing.
 
 The refusal cases a device backend also runs are those of the rules table's "Every backend"
-column, one or more for each of its clauses, 59 in all: `unreported_capability_is_refused`,
+column, one or more for each of its clauses, 60 in all: `unreported_capability_is_refused`,
 `submit_to_the_present_role_is_refused`, `overlapping_host_access_is_refused`,
 `destroy_during_host_access_is_refused`, `host_range_outside_the_buffer_is_refused`,
 `host_access_outside_the_memory_class_is_refused`,
@@ -929,8 +982,8 @@ column, one or more for each of its clauses, 59 in all: `unreported_capability_i
 `indexed_draw_past_its_index_buffer_is_refused`,
 `indirect_arguments_outside_or_unaligned_are_refused`,
 `second_acquire_before_a_present_is_refused`, `present_of_an_image_not_acquired_is_refused`,
-`second_swapchain_is_refused`, `resize_with_a_present_pending_is_refused` and
-`image_of_before_a_resize_is_refused`.
+`second_swapchain_is_refused`, `swapchain_extent_with_a_zero_dimension_is_refused`,
+`resize_with_a_present_pending_is_refused` and `image_of_before_a_resize_is_refused`.
 
 - A device runs each of them as null does, holding the earlier submit pending where the case
   needs one by a wait on a point it signals only after the refused call.
@@ -953,7 +1006,14 @@ column, one or more for each of its clauses, 59 in all: `unreported_capability_i
   something falls between them. A device backend's records are a type of its own that makes
   no driver call, and its tests run the same interleavings under Miri with many seeds and
   under stress, with fixed interleavings among them: a host signal made in full between
-  another host signal's driver read and its hold, and between a submit's read and its hold.
+  another host signal's driver read and its hold, and between a submit's read and its hold;
+  a promise reached, and dropped by a third call's check, in the same two windows; a pass
+  that begins between a heap write's first hold and its descriptor write, with its submit's
+  walk before the write's second hold; a destroy made at once after a `wait_timeline` that
+  returned `true`, with the queue's own value behind the stamp, which is accepted; and a
+  failed submit's point signalled from the host while an earlier submit of its queue is
+  pending, after which a destroy of what that submit uses is refused. Each asserts after
+  every hold that the known value is at most the driver's.
 - `destroy_at_once_after_the_wait_is_accepted` holds a device to "Queues by role": a lagging
   submit, a wait for its point, then at once a destroy and a reset, repeated, each accepted.
 - `dispatch_beyond_the_group_limit_is_refused` and `viewport_outside_its_rules_is_refused`
@@ -969,9 +1029,13 @@ column, one or more for each of its clauses, 59 in all: `unreported_capability_i
   value the timeline has reached and signals above the host's;
   `submit_signalling_no_more_than_it_waits_for_is_refused` waits for a value on a timeline
   and signals one no greater on it; `timeline_value_beyond_the_difference_limit_is_refused`
-  gives a value 2^31 from the timeline's, and one 2^31 from a pending submit's wait;
-  `slot_written_after_its_pass_began_is_refused` begins a pass that declares a slot, writes
-  the slot, and submits.
+  gives a value 2^31 from the timeline's, one 2^31 above a pending submit's wait, and a wait
+  2^31 below a pending submit's greater wait; `slot_written_after_its_pass_began_is_refused`
+  begins a pass that declares a slot, writes the slot, and submits.
+  `swapchain_extent_with_a_zero_dimension_is_refused` makes a swapchain with a zero width
+  and resizes one to a zero height; `resize_with_a_present_pending_is_refused` holds the
+  present by a wait on a point it signals only after the resize, which a device waits its
+  bound for and then refuses.
 
 - An **output** case draws, dispatches or copies on a device, reads the result back and
   compares it with a reference computed on the CPU, never with a stored image (decision
@@ -1029,7 +1093,7 @@ Some output cases count as evidence only in the shape, or on the device, named h
 | Timelines, destroys and races | `timeline_is_signalled_waited_and_read_by_the_host`, `timeline_wait_times_out`, `timeline_value_that_does_not_grow_is_refused`, `host_signal_above_a_pending_signal_is_refused`, `host_signal_below_a_promise_that_does_not_wait_for_it_is_refused`, `host_signal_below_a_pending_signal_releases_its_waiter`, `host_signal_below_a_promise_whose_wait_is_met_is_refused`, `submit_signalling_no_more_than_it_waits_for_is_refused`, `timeline_value_beyond_the_difference_limit_is_refused`, `timeline_signalled_from_two_queues_without_a_wait_is_refused`, `destroy_under_a_pending_submit_is_refused`, `concurrent_resource_destroyed_while_another_queue_uses_it_is_refused`, `destroy_after_an_unobserved_submit_is_refused`, `destroy_at_once_after_the_wait_is_accepted`, `destroy_racing_a_submit_refuses_one`, `submits_racing_on_one_queue_keep_their_order`, `host_signals_racing_on_one_timeline_keep_it_growing`, `use_after_destruction_is_refused`, `destroyed_after_recording_is_refused_at_submit`, `handle_of_another_device_is_refused` | |
 | Render passes and the local read | `input_read_without_a_local_read_is_refused`, `input_read_of_another_attachment_is_refused`, `attachments_of_unequal_extent_are_refused`, `scissor_outside_the_attachments_is_refused`, `viewport_outside_its_rules_is_refused` | `triangle_matches_the_reference`, `local_read_sees_what_the_pass_wrote`, `clear_and_keep_load_as_described`, `viewport_and_scissor_place_the_triangles`, `draw_parameters_reach_the_shader` |
 | Indirect draws and dispatches | `index_buffer_offset_outside_or_unaligned_is_refused`, `indexed_draw_past_its_index_buffer_is_refused`, `indirect_arguments_outside_or_unaligned_are_refused`, `dispatch_beyond_the_group_limit_is_refused` | `indexed_indirect_draw_matches_the_reference`, `indirect_count_draws_where_reported`, `dispatch_writes_through_an_address`, `dispatches_of_one_pass_see_each_others_writes`, `dispatch_indirect_reads_its_counts` |
-| The swapchain and the present role | `second_acquire_before_a_present_is_refused`, `present_of_an_image_not_acquired_is_refused`, `present_of_an_image_not_in_present_is_refused`, `swapchain_image_on_a_frame_encoder_is_refused`, `swapchain_image_used_outside_its_acquire_is_refused`, `second_swapchain_is_refused`, `resize_with_a_present_pending_is_refused`, `image_of_before_a_resize_is_refused`, `frame_submits_complete_while_a_present_is_pending` | |
+| The swapchain and the present role | `second_acquire_before_a_present_is_refused`, `present_of_an_image_not_acquired_is_refused`, `present_of_an_image_not_in_present_is_refused`, `swapchain_image_on_a_frame_encoder_is_refused`, `swapchain_image_used_outside_its_acquire_is_refused`, `second_swapchain_is_refused`, `swapchain_extent_with_a_zero_dimension_is_refused`, `resize_with_a_present_pending_is_refused`, `image_of_before_a_resize_is_refused`, `frame_submits_complete_while_a_present_is_pending` | |
 | Device loss and messages | `loss_is_returned_and_stays`, `waits_return_at_once_after_a_loss`, `teardown_succeeds_after_a_loss`, `clean_run_sends_no_message` | `each_validator_reports_its_canary` |
 
 The swapchain's cases run on null's swapchain, which needs no window. What needs a window or
@@ -1038,7 +1102,7 @@ the present thread is `lactose-platform`'s to test (`swapchain`'s row), and is n
 drawable made to block, and MoltenVK cannot show it, as it takes the drawable inside the
 submit (plan decision 5.6). `tests/tables.rs` holds the table to itself: names distinct, a
 rule only on a contract case, every rule with a case that provokes it, the device-run
-refusals exactly the 59 named above, and every case named in this file. Every clause of the
+refusals exactly the 60 named above, and every case named in this file. Every clause of the
 rules table's "Every backend" column has a case. A clause of its "Null alone" column with
 none here gets its case from `rhi-null`, with the check, as an amendment to list.
 
@@ -1084,10 +1148,10 @@ There is nothing to run against a facade but its tables. `tests/consumers.rs` co
 consumer's use of the surface, and a backend's implementation of every trait with no
 `unsafe`. The static assertions in `src/lib.rs` hold `Device`, `MessageSink` and
 `SurfaceSource` object-safe and `Send + Sync`, `Encoder` and `Swapchain` object-safe, `Send`
-and not `Sync`, every handle plain data of eight bytes, and the indirect record twenty bytes.
-`tests/tables.rs` runs the rule names, the refusal's round trip (wrapped in other errors
-too), the queue layout, the indirect record's bytes, the suite table's consistency, and this
-file's naming of every case and of the 59 a device runs.
+and not `Sync`, every handle plain data of eight bytes, and the indirect record twenty
+bytes. `tests/tables.rs` runs the rule names, the refusal's round trip (wrapped in other
+errors too), the queue layout, the indirect record's bytes, the suite table's consistency,
+and this file's naming of every case and of the 60 a device runs.
 
 What neither spike showed and the facade still includes, because section 12.1 or decision
 5.6 names it or a consumer cannot do without it: `dispatch_indirect` (both files' "Not
