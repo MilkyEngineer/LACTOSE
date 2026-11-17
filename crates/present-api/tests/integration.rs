@@ -7,6 +7,7 @@
 mod common;
 mod compile_fail;
 mod consumers;
+mod cost;
 mod exchange;
 mod extract;
 mod frame;
