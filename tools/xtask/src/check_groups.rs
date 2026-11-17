@@ -203,4 +203,145 @@ mod tests {
         all.dedup();
         assert_eq!(all.len(), listed);
     }
+
+    /// The line `head` of `text` and every line after it that is blank or indented deeper
+    /// than `head`, so that a key added anywhere in a block is inside it; `None` unless `head`
+    /// is exactly one line of `text`.
+    fn block(text: &str, head: &str) -> Option<String> {
+        let lines: Vec<&str> = text.lines().collect();
+        let mut at = lines.iter().enumerate().filter(|(_, line)| **line == head);
+        let (Some((start, _)), None) = (at.next(), at.next()) else { return None };
+        let indent = |line: &str| line.len() - line.trim_start().len();
+        let end = lines[start + 1..]
+            .iter()
+            .position(|line| !line.trim().is_empty() && indent(line) <= indent(head))
+            .map_or(lines.len(), |after| start + 1 + after);
+        let block: String = lines[start..end].iter().map(|line| format!("{line}\n")).collect();
+        Some(format!("{}\n", block.trim_end()))
+    }
+
+    /// What the workflow's `check` job must hold for the groups `names` to be tested: a job
+    /// head whose matrix runs each group on each platform with no `include`, `exclude` or job
+    /// condition, and steps that hand each group its packages with no condition that names
+    /// a group. Each is compared as the whole text of its block, so a key added to one fails.
+    /// The messages of what differs.
+    fn workflow_misses(names: &[&str], workflow: &str) -> Vec<String> {
+        const HEAD: &str = "  check:\n    name: check (${{ matrix.os }}, ${{ matrix.group }})\n    \
+             runs-on: ${{ matrix.os }}\n    timeout-minutes: 15\n    strategy:\n      \
+             fail-fast: false\n      matrix:\n        os: [ubuntu-latest, windows-latest, \
+             macos-latest]\n        group: [GROUPS]\n    steps:\n";
+        const PACKAGES: &str = "${{ steps.group.outputs.packages }}";
+        let Some(job) = block(workflow, "  check:") else {
+            return vec!["ci.yml has no one `check` job".to_owned()];
+        };
+        let head = HEAD.replace("GROUPS", &names.join(", "));
+        let mut misses = Vec::new();
+        // After the head, only the steps' lines, each indented deeper than the job's keys.
+        let steps = job.strip_prefix(&head).filter(|steps| {
+            steps.lines().all(|line| line.trim().is_empty() || line.starts_with("      "))
+        });
+        let Some(steps) = steps else {
+            return vec![format!(
+                "the `check` job does not begin, and hold no other key than:\n{head}"
+            )];
+        };
+        let expected = [
+            (
+                "      - name: Packages",
+                "      - name: Packages\n        id: group\n        shell: bash\n        env:\n          \
+                 GROUP: ${{ matrix.group }}\n        run: |\n          \
+                 packages=$(cargo xtask group \"$GROUP\")\n          \
+                 echo \"packages=$packages\" >> \"$GITHUB_OUTPUT\"\n"
+                    .to_owned(),
+            ),
+            (
+                "      - name: Clippy",
+                format!(
+                    "      - name: Clippy\n        if: matrix.os != 'windows-latest'\n        run: \
+                     cargo clippy {PACKAGES} --all-targets --locked -- -D warnings\n"
+                ),
+            ),
+            (
+                "      - name: Test",
+                format!(
+                    "      - name: Test\n        run: cargo nextest run {PACKAGES} --locked \
+                     --no-tests=pass\n"
+                ),
+            ),
+            (
+                "      - name: Doctests",
+                format!("      - name: Doctests\n        run: cargo test --doc {PACKAGES} --locked\n"),
+            ),
+        ];
+        for (head, text) in expected {
+            if block(steps, head).as_deref() != Some(text.as_str()) {
+                misses.push(format!("the `check` job's step is not, as one step:\n{text}"));
+            }
+        }
+        misses
+    }
+
+    #[test]
+    fn the_workflow_runs_every_group_and_hands_each_step_its_packages() {
+        // `check` above holds the table to the workspace; this holds the workflow to the
+        // table. A group the matrix leaves out, or a step that skips a group, is a group no
+        // job tests, and `cargo xtask group` cannot see either. A change to these lines of
+        // ci.yml is a change to this test, made on purpose.
+        let policy = Policy::parse(include_str!("../ci-policy.toml")).unwrap();
+        let names: Vec<&str> = policy.check_groups.iter().map(|group| group.name).collect();
+        let workflow = include_str!("../../../.github/workflows/ci.yml");
+        assert_eq!(workflow_misses(&names, workflow), [] as [&str; 0]);
+    }
+
+    #[test]
+    fn a_workflow_that_leaves_a_group_untested_fails() {
+        let workflow = include_str!("../../../.github/workflows/ci.yml");
+        let edited = |old: &str, new: &str| {
+            assert_eq!(workflow.matches(old).count(), 1, "{old}");
+            workflow.replace(old, new)
+        };
+        let test = "      - name: Test\n        run: cargo nextest";
+        let doctests = "      - name: Doctests\n        run: cargo test --doc ${{ steps.group.outputs.packages }} --locked\n";
+        let cases = [
+            ("the matrix drops a group", edited("group: [base, physics]", "group: [base]")),
+            (
+                "a condition before a step's run",
+                edited(
+                    test,
+                    &test.replace(
+                        "        run:",
+                        "        if: matrix.group == 'base'\n        run:",
+                    ),
+                ),
+            ),
+            (
+                "a condition after a step's run",
+                edited(doctests, &format!("{doctests}        if: matrix.group == 'base'\n")),
+            ),
+            (
+                "a matrix exclusion",
+                edited(
+                    "        group: [base, physics]\n",
+                    "        group: [base, physics]\n        exclude:\n          \
+                     - { os: windows-latest, group: physics }\n",
+                ),
+            ),
+            (
+                "a job condition after its steps",
+                edited(
+                    "--release --locked\n\n  # Clippy and the release",
+                    "--release --locked\n    if: matrix.group == 'base'\n\n  # Clippy and the release",
+                ),
+            ),
+            (
+                "one group's packages for every job",
+                edited("GROUP: ${{ matrix.group }}", "GROUP: base"),
+            ),
+        ];
+        for (case, text) in &cases {
+            assert!(!workflow_misses(&["base", "physics"], text).is_empty(), "{case}");
+        }
+        // A third group in the policy, with no job in the matrix.
+        assert!(!workflow_misses(&["base", "physics", "rest"], workflow).is_empty());
+    }
 }

@@ -151,8 +151,11 @@ separate = [
 # tests one of these groups on each platform, so that no one job builds every package's tests.
 # The job reads its packages from `cargo xtask group <name>`, so this table is the only list.
 # `cargo xtask boundary` reports a workspace package in no group or in two, an entry that
-# names no package and an empty group. The two names are fixed in tools/xtask/src/policy.rs:
-# a third group is a change to the workflow too.
+# names no package and an empty group. The two names are fixed in tools/xtask/src/policy.rs,
+# and the unit test `the_workflow_runs_every_group_and_hands_each_step_its_packages` of
+# tools/xtask/src/check_groups.rs holds the workflow's check job to them: its matrix names each
+# group in this order, and its steps hand each group its packages with no condition that names
+# a group. A third group fails that test until the workflow runs a job for it.
 #
 # `physics` is lactose-physics-api and every package whose normal dependencies reach it,
 # directly or through another package, so that one group alone compiles the vendored

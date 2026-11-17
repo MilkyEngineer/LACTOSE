@@ -32,8 +32,10 @@ struct TestTargets {
     separate: Vec<String>,
 }
 
-/// The groups of CI's check jobs. Their names are fixed here, so that a third group cannot be
-/// listed without a change that also gives the workflow a job for it.
+/// The groups of CI's check jobs. Their names are fixed here, and the unit test
+/// `check_groups::tests::the_workflow_runs_every_group_and_hands_each_step_its_packages`
+/// requires the workflow's matrix to name the same groups in the same order, so a third group
+/// fails it until the workflow runs a job for it.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CheckGroups {

@@ -262,8 +262,13 @@ on, and a listed feature the crate does not declare are findings.
   test one each. Findings: a package in no group, which no check job would build or test; a
   package in two groups, or twice in one; an entry that names no workspace package; and a
   group that names none, which as cargo arguments would select the whole workspace. The two
-  group names, `base` and `physics`, are fixed in `src/policy.rs`, so the table cannot hold a
-  group the workflow's matrix does not name. `cargo xtask group <name>` prints
+  group names, `base` and `physics`, are fixed in `src/policy.rs`. `boundary` does not read
+  the workflow; the unit test
+  `check_groups::tests::the_workflow_runs_every_group_and_hands_each_step_its_packages` holds
+  the `check` job of `.github/workflows/ci.yml` to the table: its matrix names each group in
+  the table's order, and its Packages, Clippy, Test and Doctests steps, each compared as a
+  whole block, carry the group's packages with no condition that names a group. `cargo xtask
+  group <name>` prints
   the group's packages as one line of cargo arguments, `-p <package>` each in the table's
   order, which the check job passes to clippy, nextest and the doc tests; it prints nothing
   and exits with 2 when the check above finds anything, so a job never tests a division that
