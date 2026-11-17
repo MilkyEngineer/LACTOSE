@@ -148,8 +148,10 @@ pub trait Device: Send + Sync {
     fn destroy_memory_block(&self, block: MemoryBlockHandle) -> Result<()>;
 
     /// Puts `image`, whole, in a heap slot. The image's usage holds `SAMPLED`. The write
-    /// is seen by every submit made after the call returns. Refused on every backend while
-    /// a pass of a pending submit declares the slot
+    /// is seen by every pass that begins after the call returns; an encoder with a pass
+    /// that declared the slot before it is refused at its submit
+    /// ([`Rule::HeapLayout`](crate::Rule::HeapLayout)). Refused on every backend while a
+    /// pass of a pending submit declares the slot
     /// ([`Rule::HeapWrite`](crate::Rule::HeapWrite)): a slot is written again only after
     /// the timeline value that frees it.
     fn write_heap_slot(&self, slot: HeapSlot, image: ImageHandle) -> Result<()>;
@@ -178,10 +180,11 @@ pub trait Device: Send + Sync {
     /// # Errors
     ///
     /// `ErrorKind::Unsupported` for a shader target the backend does not run; refused for a
-    /// module that declares a capability the device did not enable, which the backend reads
-    /// from the module's header ([`Rule::Capability`](crate::Rule::Capability), every
-    /// backend); `ErrorKind::InvalidData` for a module whose magic or version is not its
-    /// target's, a shader the driver refuses, a stage in the wrong
+    /// SPIR-V module whose `OpCapability` or `OpExtension` instructions name one the device
+    /// did not enable ([`Rule::Capability`](crate::Rule::Capability), every backend that
+    /// takes SPIR-V; a Metal target declares none); `ErrorKind::InvalidData` for a module
+    /// whose magic or version is not its target's, a shader the driver refuses (Metal's
+    /// compiler refuses what the GPU cannot run), a stage in the wrong
     /// place, a constant the shader does not declare or of another length, a heap array
     /// whose capacity is not the device's, a colour target with a write mask that is not
     /// empty which the fragment stage does not write or reads as an input, or a depth
@@ -228,11 +231,13 @@ pub trait Device: Send + Sync {
 
     /// Signals a point from the host: the timeline's value becomes `point.value`. The value
     /// is greater than the timeline's and less than every value a pending submit will
-    /// signal to it, and within 2^31 of the timeline's; every pending submit that signals
-    /// the timeline waits, on it, for a value no greater than `point.value`; and no other
-    /// host signal of it is in progress. Otherwise the call is refused on every backend
-    /// ([`Rule::Timeline`](crate::Rule::Timeline)), since a promise or a host signal could
-    /// pass this one (`README.md`, "Timelines").
+    /// signal to it, and within 2^31 of the timeline's and of every value a pending submit
+    /// waits for or signals on it; every pending submit that signals the timeline waits, on
+    /// it, for a value greater than the timeline's and no greater than `point.value`; and
+    /// no other host signal of it is in progress. The timeline's value here is the greater
+    /// of the driver's and the greatest the device has signalled from the host. Otherwise
+    /// the call is refused on every backend ([`Rule::Timeline`](crate::Rule::Timeline)),
+    /// since a promise or a host signal could pass this one (`README.md`, "Timelines").
     fn signal_timeline(&self, point: TimelinePoint) -> Result<()>;
 
     /// Blocks until the point is reached or `timeout` has passed, and returns whether it
@@ -256,8 +261,9 @@ pub trait Device: Send + Sync {
     /// buffer, by a copy into it or a pass that declares it `ShaderWrite`, is refused while
     /// a host access to the buffer is in progress
     /// ([`Rule::HostOverlap`](crate::Rule::HostOverlap)); its signals are refused by the
-    /// rules of `README.md`, "Timelines" ([`Rule::Timeline`](crate::Rule::Timeline)). Both
-    /// on every backend.
+    /// rules of `README.md`, "Timelines" ([`Rule::Timeline`](crate::Rule::Timeline)),
+    /// among them a signal not greater than a value the same submit waits for on the
+    /// timeline. Both on every backend.
     ///
     /// # Errors
     ///

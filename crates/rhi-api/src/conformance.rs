@@ -189,9 +189,11 @@ pub const CASES: &[Case] = cases! {
     // The heap, the sampler table and what a pass declares.
     contract "heap_slot_outside_the_heap_is_refused" => Bounds everywhere;
     contract "declared_slot_empty_is_refused" => HeapLayout everywhere;
+    contract "slot_written_after_its_pass_began_is_refused" => HeapLayout everywhere;
     contract "declared_slot_not_in_sampled_read_is_refused" => HeapLayout;
     contract "heap_write_under_a_pending_reader_is_refused" => HeapWrite everywhere;
     contract "heap_write_after_its_reader_completes_passes";
+    contract "heap_write_racing_a_submit_refuses_one";
     contract "destroy_of_an_image_a_slot_holds_is_refused" => Pending everywhere;
     contract "sampler_destroyed_under_a_pending_submit_is_refused" => Pending everywhere;
     contract "undeclared_slot_argument_is_refused" => Undeclared everywhere;
@@ -240,6 +242,9 @@ pub const CASES: &[Case] = cases! {
     contract "host_signal_above_a_pending_signal_is_refused" => Timeline everywhere;
     contract "host_signal_below_a_promise_that_does_not_wait_for_it_is_refused" => Timeline everywhere;
     contract "host_signal_below_a_pending_signal_releases_its_waiter";
+    contract "host_signal_below_a_promise_whose_wait_is_met_is_refused" => Timeline everywhere;
+    contract "submit_signalling_no_more_than_it_waits_for_is_refused" => Timeline everywhere;
+    contract "timeline_value_beyond_the_difference_limit_is_refused" => Timeline everywhere;
     contract "timeline_signalled_from_two_queues_without_a_wait_is_refused" => Timeline everywhere;
     contract "destroy_under_a_pending_submit_is_refused" => Pending everywhere;
     contract "concurrent_resource_destroyed_while_another_queue_uses_it_is_refused" => Pending everywhere;
@@ -247,6 +252,7 @@ pub const CASES: &[Case] = cases! {
     contract "destroy_at_once_after_the_wait_is_accepted";
     contract "destroy_racing_a_submit_refuses_one";
     contract "submits_racing_on_one_queue_keep_their_order";
+    contract "host_signals_racing_on_one_timeline_keep_it_growing";
     contract "use_after_destruction_is_refused" => Destroyed everywhere;
     contract "destroyed_after_recording_is_refused_at_submit" => Destroyed everywhere;
     contract "handle_of_another_device_is_refused" => Destroyed;

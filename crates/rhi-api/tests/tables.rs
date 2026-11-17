@@ -73,7 +73,7 @@ fn indirect_record_is_five_little_endian_words() {
 
 /// The refusal cases a device backend runs: one or more for each clause of the rules
 /// table's "Every backend" column.
-const EVERYWHERE: [&str; 55] = [
+const EVERYWHERE: [&str; 59] = [
     "unreported_capability_is_refused",
     "submit_to_the_present_role_is_refused",
     "overlapping_host_access_is_refused",
@@ -93,6 +93,7 @@ const EVERYWHERE: [&str; 55] = [
     "destroy_of_a_block_an_image_is_placed_in_is_refused",
     "heap_slot_outside_the_heap_is_refused",
     "declared_slot_empty_is_refused",
+    "slot_written_after_its_pass_began_is_refused",
     "heap_write_under_a_pending_reader_is_refused",
     "destroy_of_an_image_a_slot_holds_is_refused",
     "sampler_destroyed_under_a_pending_submit_is_refused",
@@ -113,6 +114,9 @@ const EVERYWHERE: [&str; 55] = [
     "timeline_value_that_does_not_grow_is_refused",
     "host_signal_above_a_pending_signal_is_refused",
     "host_signal_below_a_promise_that_does_not_wait_for_it_is_refused",
+    "host_signal_below_a_promise_whose_wait_is_met_is_refused",
+    "submit_signalling_no_more_than_it_waits_for_is_refused",
+    "timeline_value_beyond_the_difference_limit_is_refused",
     "timeline_signalled_from_two_queues_without_a_wait_is_refused",
     "destroy_under_a_pending_submit_is_refused",
     "concurrent_resource_destroyed_while_another_queue_uses_it_is_refused",

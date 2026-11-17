@@ -291,9 +291,11 @@ pub trait Encoder: Any + Send {
     fn end_pass(&mut self);
 
     /// Sets the viewport of the draws that follow in the pass. Its fields are finite, its
-    /// width and height above zero, and `near` and `far` in zero to one
-    /// ([`Rule::Bounds`](crate::Rule::Bounds), every backend); it may reach past the
-    /// attachments.
+    /// width and height above zero and at most the device's
+    /// [`viewport_extent`](crate::Capabilities::viewport_extent), its edges within its
+    /// [`viewport_bounds`](crate::Capabilities::viewport_bounds), and `near` and `far` in
+    /// zero to one ([`Rule::Bounds`](crate::Rule::Bounds), every backend); within those it
+    /// may reach past the attachments.
     fn set_viewport(&mut self, viewport: Viewport);
 
     /// Sets the scissor of the draws that follow in the pass, inside the attachments'

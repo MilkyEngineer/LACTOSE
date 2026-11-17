@@ -115,13 +115,23 @@ pub struct Capabilities {
     /// ([`Rule::Bounds`](crate::Rule::Bounds)); an indirect dispatch's counts are device
     /// data, which their writer keeps within it.
     pub compute_groups: [u32; 3],
+    /// The largest width and height a [`Viewport`](crate::Viewport) may have: the
+    /// driver's limit, at least 4096 in each. A larger one is refused
+    /// ([`Rule::Bounds`](crate::Rule::Bounds)).
+    pub viewport_extent: [u32; 2],
+    /// The range, in texels, that a [`Viewport`](crate::Viewport)'s edges lie in on both
+    /// axes: the driver's range, rounded inward, at least -8192 to 8191. A viewport whose
+    /// left or top edge is below the first or whose right or bottom edge is above the
+    /// second is refused ([`Rule::Bounds`](crate::Rule::Bounds)).
+    pub viewport_bounds: [i32; 2],
 }
 
 impl Capabilities {
     /// The least a device may report: no optional capability, one queue, coherent memory,
     /// a heap of [`HEAP_SLOTS_DEFAULT`] slots, a sampler table of [`SAMPLERS_DEFAULT`], four
-    /// colour attachments and 65535 workgroups in each dimension of a dispatch, Vulkan's
-    /// least. A test starts from it and sets the fields its case is about.
+    /// colour attachments, and Vulkan's least limits: 65535 workgroups in each dimension of
+    /// a dispatch, and viewports of 4096 texels a side whose edges lie in -8192 to 8191. A
+    /// test starts from it and sets the fields its case is about.
     pub const LEAST: Self = Self {
         multi_draw_indirect: false,
         indirect_count: false,
@@ -135,6 +145,8 @@ impl Capabilities {
         samplers: SAMPLERS_DEFAULT,
         colour_attachments: 4,
         compute_groups: [65535; 3],
+        viewport_extent: [4096; 2],
+        viewport_bounds: [-8192, 8191],
     };
 }
 

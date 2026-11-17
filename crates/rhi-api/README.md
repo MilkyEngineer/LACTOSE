@@ -116,7 +116,16 @@ is a supertrait of `Encoder` so a backend recovers its own type in a submit.
 - `compute_groups` is the driver's limit on a dispatch's workgroup count in each dimension,
   at least 65535, Vulkan's least, which `Capabilities::LEAST` holds: so null, under `LEAST`,
   refuses on the M1 a dispatch that only a device at the least would break (MoltenVK reports
-  2^30). A `dispatch` above it is refused (`bounds`, every backend).
+  2^30). A `dispatch` above it is refused (`bounds`, every backend). Metal publishes no
+  limit; `rhi-metal` reports what MoltenVK reports for the same GPU, which hands the counts
+  to Metal unchanged, and a probe of the facade's GPU review ran 70,000 groups in x and in y
+  with no assert.
+- `viewport_extent` and `viewport_bounds` are the driver's limits on a viewport: its largest
+  width and height, and the range its edges lie in, Vulkan's `maxViewportDimensions` and
+  `viewportBoundsRange` rounded inward. Vulkan's least, 4096 and -8192 to 8191, is what
+  `LEAST` holds; MoltenVK reports 16384 and -32768 to 32767. A viewport beyond either is
+  refused (`bounds`, every backend). Metal publishes neither, and `rhi-metal` reports
+  MoltenVK's values for the same GPU, which hands the viewport to Metal unchanged.
 - `heap_slots` and `samplers` are the request's: a device whose limit is below either is not
   created. `HEAP_SLOTS_DEFAULT` and `SAMPLERS_DEFAULT` are what milestone 2 requests,
   `Capabilities::LEAST` holds, and the cook compiles its arrays to.
@@ -134,12 +143,18 @@ is a supertrait of `Encoder` so a backend recovers its own type in a submit.
   permits the lock): a submit takes it before its walk of the records and keeps it through
   the driver's submit, so the points a queue's submits are stamped with grow in the order
   its driver receives them, and a completed value at or above a stamp means the stamped
-  submit has run. The heap's lock is kept the same way across a slot's record and its
-  descriptor write, so the record names the image the descriptor holds. A driver's submit
-  that fails after the walk leaves the point to the backend, which signals the queue's own
-  timeline to it from the host before it lets go of the queue's lock. Which of two threads'
-  submits comes first is the callers' to decide. Nothing orders work on two queues but a
-  timeline point one submit signals and the other waits for.
+  submit has run. The heap's lock is taken before a slot's first hold of the record's lock
+  and kept through its descriptor write and its second hold, so two writes of the heap never
+  interleave ("Threads"). A driver's submit that fails after the walk, the device not lost,
+  has changed nothing in the driver and leaves the point to the backend. Before it lets go
+  of the queue's lock, the backend submits a batch with no work that signals the queue's own
+  timeline to the point, behind the queue's earlier submits, and takes the record's lock
+  once more to drop the failed submit's promises; should the batch fail too, the queue's
+  next submit passes the point. The point is never signalled from the host, and the backend
+  never waits for the queue there: an earlier submit to the queue may still be pending,
+  perhaps on a point the caller will signal from the host. Which of two threads' submits
+  comes first is the callers' to decide. Nothing orders work on two queues but a timeline
+  point one submit signals and the other waits for.
 - On one queue a submit may be held by every submit made before it: one that waits for a
   point holds those behind it until the point is reached. Null holds them so, running a
   queue's submits strictly in order; a driver may let a later one pass. So a submit never
@@ -215,31 +230,44 @@ is a supertrait of `Encoder` so a backend recovers its own type in a submit.
   between them: each has its own pool, and a recording call takes no lock an update of the
   device's records takes. It resolves a handle through a lock on that handle's entry alone,
   held for a compare of the generation and a count, once for each handle an encoder records
-  between resets; after that the encoder reads its own copy. The checks made at recording
-  (`usage`, `bounds`, `encoding`) read only what the handle resolved to, which does not
-  change while the resource lives. `Swapchain` is `Send` and not `Sync`.
+  between resets; after that the encoder reads its own copy. The entries are in a table
+  whose entries do not move while the device lives (a fixed capacity, or chunks that are
+  never moved), so a create that grows the table never moves an entry a recording thread
+  holds. The checks made at recording (`usage`, `bounds`, `encoding`) read only what the
+  handle resolved to, which does not change while the resource lives. `Swapchain` is `Send`
+  and not `Sync`.
 - A `MessageSink` is called from any thread, a driver's own included.
 - A device backend keeps records of its own to check the rules every backend checks ("The
   rules"): what each handle resolves to, the host accesses in progress on each buffer, and
   the stamps and counts of "What a device backend keeps". Several threads reach them at once
   on the per-frame path, the extract sink's jobs through `write_buffer` among them. A
-  backend guards them with one lock, and a call holds it once for its checks and its updates
-  together, so that no other call falls between a check and the change it permits: a submit
-  for the check of every handle, buffer and timeline its encoders and points name and then
-  every stamp, so a refused submit stamps nothing; a destroy for its checks and the handle's
-  removal; `write_buffer` and `read_buffer` for their checks and the insert of their range,
-  and again for its removal once the closure has returned; `write_heap_slot` and
-  `clear_heap_slot` for the check and the counts; `signal_timeline` for its check and the
-  mark of its signal in progress. The lock is never held across a wait, a driver call or a
-  caller's closure, so `fill`, `read` and every validator's message run outside it. A value
-  a check reads from the driver, a queue's completed value or a caller's point, is read
-  before the lock is taken: it only grows, so the check errs toward `pending` and never
-  toward a free.
+  backend guards them with one lock, and a call holds it once for its checks and the updates
+  they permit together, so that no other call falls between a check and the change it
+  permits: a submit for the check of every handle, buffer, slot and timeline its encoders
+  and points name and then every stamp and promise, so a refused submit stamps nothing, and
+  once more, under the queue's lock, to drop its promises where its driver call fails; a
+  destroy for its checks and the handle's removal; `write_buffer` and `read_buffer` for
+  their checks and the insert of their range, and again for its removal once the closure has
+  returned; `write_heap_slot` and `clear_heap_slot` for the check, a mark on the slot and
+  the count of the new image, and again, after the descriptor write, for the slot's record,
+  the release of the old image and the mark's removal; a submit whose walk finds a slot it
+  declares marked is refused (`uuwp-used`); `signal_timeline` for its check, the mark of its
+  signal in progress and the record of its value, and again for the mark's removal. Where a
+  call must make a driver call or run the caller's closure between its check and its effect
+  (a host lend, a host signal, a heap write), its first hold sets a mark that every
+  conflicting check refuses, and a second hold clears it; the second hold decides nothing.
+  The lock is never held across a wait, a driver call or a caller's closure, so `fill`,
+  `read` and every validator's message run outside it. A value a check reads from the
+  driver, a queue's completed value or a timeline's, is read before the lock is taken. It
+  only grows, so a check that refuses below it, as every check of `pending` does, errs
+  toward refusal. A check that a signal must exceed it takes the greater of it and the
+  greatest value the device has signalled from the host, which the records keep
+  ("Timelines"); the read alone misses a host signal made after it.
 - A device backend takes its locks in one order: a queue's lock or the heap's lock, then the
-  record's lock, then a handle entry's lock. No call takes two queue locks, and the heap's
-  lock and a queue's are never held together. Each device backend's `SAFETY.md` lists every
-  lock it takes, the calls that take it and this order. Architecture section 3 names these
-  locks among those it permits (D158).
+  record's lock, then the lock of one entry, a handle's or a heap slot's. No call takes two
+  queue locks, and the heap's lock and a queue's are never held together. Each device
+  backend's `SAFETY.md` lists every lock it takes, the calls that take it and this order.
+  Architecture section 3 names these locks among those it permits (D158).
 
 **Handles and lifetimes**
 
@@ -449,10 +477,11 @@ is a supertrait of `Encoder` so a backend recovers its own type in a submit.
   on every backend: no backend's own handle (an `MTLResourceID`, a descriptor handle) is
   ever a value in this interface.
 - `write_heap_slot` puts a whole image, whose usage holds `SAMPLED`, in a slot;
-  `clear_heap_slot` empties it. Either is seen by every submit made after it returns. Either
-  is refused while a pass of a pending submit declares the slot (`uuwp-used`, every
-  backend): a slot is reused only after the timeline point that frees it. A slot outside
-  the heap is refused (`bounds`, every backend).
+  `clear_heap_slot` empties it. Either is seen by every pass that begins after it returns;
+  an encoder with a pass that declared the slot before it is refused at its submit
+  (`heap-layout`, every backend). Either is refused while a pass of a pending submit
+  declares the slot (`uuwp-used`, every backend): a slot is reused only after the timeline
+  point that frees it. A slot outside the heap is refused (`bounds`, every backend).
 - A sampler's index is valid from `create_sampler` to `destroy_sampler`. A full table is
   `ErrorKind::ResourceExhausted`. The table needs no declaration and no state, so any
   pending submit may use any sampler: `destroy_sampler` is refused while a submit made
@@ -462,6 +491,9 @@ is a supertrait of `Encoder` so a backend recovers its own type in a submit.
   backend's placeholder image, and a free entry of the sampler table its placeholder
   sampler. A shader that reaches either through data alone then reads an unspecified value,
   a wrong image, and never an unwritten descriptor. No call names the placeholders.
+  `rhi-metal` declares its placeholder image with `useResource` on every encoder of a pass
+  that reaches the heap, since Metal makes no image resident that an encoder does not
+  declare; a sampler needs no residency.
 - In a shader the heap is `HeapForm::FixedArray`: fixed-size arrays in one parameter block,
   the images at binding 0 and the samplers at binding 1, in descriptor set `HEAP_SET` on
   SPIR-V and one argument buffer on Metal (Metal, "The heap's shader form"; the second
@@ -482,8 +514,13 @@ is a supertrait of `Encoder` so a backend recovers its own type in a submit.
   declared slot, and a declared slot that is empty is refused at each draw or dispatch
   (`heap-layout`, every backend); an address a backend writes names a buffer made resident
   for the pass on Metal, where a shader's access to one that is not resident faults.
-  `rhi-metal` resolves every declared slot to its texture for `useResource` anyway, and
-  `vulkan` looks each one up once a pass.
+- A pass resolves each slot it declares to the slot's image when it begins, through the
+  slot's entry lock, and the encoder counts that image as it counts a recorded handle. The
+  submit's walk compares each declared slot's image with the one the pass resolved and
+  refuses a difference (`heap-layout`, every backend): on Metal the pass made the old image
+  resident, and the argument buffer would name one no encoder made resident. `rhi-metal`
+  resolves every declared slot to its texture for `useResource` anyway, and `vulkan` looks
+  each one up once a pass.
 - Null also refuses, at each draw or dispatch, a declared slot whose image is not in
   `SampledRead` (`heap-layout`), treating every declared slot as read, and a declared buffer
   in another state (`state`).
@@ -501,9 +538,10 @@ is a supertrait of `Encoder` so a backend recovers its own type in a submit.
   twice, and there are at most `colour_attachments` colour attachments (`usage`, every
   backend). The scissor lies inside that extent (`bounds`, every backend): Metal API
   validation asserts on one that does not. A viewport's fields are finite, its width and
-  height above zero, and its near and far depths in zero to one (`bounds`, every backend):
-  Metal API validation asserts on one that is not finite, and Vulkan's rules require the
-  rest. A viewport may reach past the attachments.
+  height above zero and at most `viewport_extent`, its edges within `viewport_bounds`, and
+  its near and far depths in zero to one (`bounds`, every backend): Metal API validation
+  asserts on one that is not finite, and Vulkan's rules require the rest. Within those
+  limits a viewport may reach past the attachments.
 - Clip space is x to the right, y up and depth from zero at the near plane to one. The
   framebuffer's origin is its top left. A triangle's front is the side on which its vertices
   run anticlockwise as displayed. Triangles are lists; indices are 32 bits; a pipeline reads
@@ -561,10 +599,11 @@ is a supertrait of `Encoder` so a backend recovers its own type in a submit.
   renderer selects one by `buffer_atomics_64`, and the cooked format gains a field that
   names the capability.
 - A shader's code is the cook's and is trusted. A backend checks a module's form: its magic
-  and version are its target's (`InvalidData`), and the capabilities it declares are among
-  those the device enabled (`capability`, every backend; a scan of the module's header, on
-  SPIR-V its `OpCapability` instructions). What a malformed module does is the second
-  residual of "The rules".
+  and version are its target's (`InvalidData`); on SPIR-V, its `OpCapability` and
+  `OpExtension` instructions are among the list above and `SPV_KHR_physical_storage_buffer`,
+  each of which the device enabled (`capability`, every backend that takes SPIR-V). A Metal
+  target declares none, and Metal's compiler refuses one the GPU cannot run (`InvalidData`).
+  What a malformed module does is the second residual of "The rules".
 - A pipeline has no layout object. Its layout is the heap's block, the fragment stage's
   input attachments (set 0, input `i` at binding `i`) and one push-constant range of the
   largest `push_bytes` among its stages, at most `PUSH_BYTES_MAX`.
@@ -633,22 +672,34 @@ is a supertrait of `Encoder` so a backend recovers its own type in a submit.
 **Timelines** (RHI point 11, Metal point 11 and item 9)
 
 - A timeline's value only grows. A point is reached once the value is at least the point's.
-  A submit's `signals` give a value greater than any the timeline has reached or been
-  promised. A submit signals a timeline only where every pending signal of it is from the
-  submit's own queue or from a submit it waits for. No value is 2^31 or more away from the
-  timeline's value (`timeline`, every backend). A device keeps, for each timeline, the least
-  and greatest pending promise and the queue that made them.
+  A submit's `signals` give a value greater than any the timeline has reached, been given by
+  a host signal or been promised, and greater than any value the same submit waits for on
+  it. A submit signals a timeline only where every pending signal of it is from the submit's
+  own queue or from a submit it waits for. No value is 2^31 or more away from the timeline's
+  value, or from a value a pending submit waits for or signals on it (`timeline`, every
+  backend). A device keeps, for each timeline, its pending promises, a list no longer than
+  its pending submits, each with the queue that made it and what its submit waits for on the
+  timeline; the least value a pending submit waits for on it; and the greatest value it has
+  signalled to the timeline from the host. A promise is pending until the timeline's value
+  reaches it. In every check that a value must exceed the timeline's, the timeline's value
+  is the greater of the driver's, read before the record's lock, and that greatest host
+  value: a host signal another thread made in full after the read is in the second.
 - `signal_timeline` gives a value greater than the timeline's and less than every value a
   pending submit will signal to it. It is refused (`timeline`, every backend) where a submit
-  that will signal the timeline does not wait, on that timeline, for a value no greater than
-  the host's, and while another host signal of the timeline is in progress: either could
+  that will signal the timeline does not wait, on that timeline, for a value greater than
+  the timeline's and no greater than the host's, which only this signal can bring the
+  timeline to, and while another host signal of the timeline is in progress: either could
   reach the timeline first and leave the host's value below it. A submit that signals a
   timeline is refused while a host signal of it is in progress, unless it waits for that
-  signal's value. A backend marks a host signal in progress under the record's lock before
-  its driver call and clears the mark after.
+  signal's value. A backend marks a host signal in progress, and records its value as the
+  greatest it has signalled, under the record's lock before its driver call, and clears the
+  mark after.
 - Each of these is a rule of Vulkan's for a timeline semaphore whose breach is undefined
   behaviour and may hang its waiters. A host signal below a pending promise that waits for
-  it is the way the host releases a submit made before its wait is met.
+  it is the way the host releases a submit made before its wait is met. A wait the timeline
+  has already met holds nothing back, and a promise outlives its submit's completion until
+  the timeline reaches it: on Metal the backend's own event, encoded before the caller's
+  signals, completes a submit before its promise lands.
 - `wait_timeline` blocks for at most its timeout and returns whether the point was reached.
   A wait may be made before the signal that satisfies it is submitted.
 - A fence is a timeline point a submit signals. The facade has no other fence; Metal's
@@ -672,9 +723,9 @@ is a supertrait of `Encoder` so a backend recovers its own type in a submit.
   `resize`, which is refused while one is pending (`pending`, every backend); every handle
   the swapchain gave before it is destroyed (`destroyed`). A present is pending until the
   driver no longer reads its image, which a submit's completion does not show: on Vulkan
-  until its present fence signals (`VK_EXT_swapchain_maintenance1`, which MoltenVK offers);
-  where the driver has no present fence, `resize` waits for the present queue to be idle
-  before it checks.
+  until its present fence signals. A Vulkan device made with a window requires
+  `VK_EXT_swapchain_maintenance1`, which gives the fence, and is not created without it
+  (`Unsupported`): a queue's idle wait does not cover a present. MoltenVK offers it.
 
 **Device loss** (architecture section 19, verification row 192)
 
@@ -727,16 +778,17 @@ breaks a valid-usage rule, whose effect the specification leaves undefined; what
 saw of it is a wrong image.
 
 The second is a shader's code and what a shader reaches through data alone. A shader's code
-is the cook's and is trusted. A backend checks a module's form: its magic, version and
-declared capabilities against what the device enabled (`capability`, every backend; a scan
-of the module's header). What a malformed module does, and what a shader reaches through
-data alone (an address, a slot number or a sampler index in push bytes or in a buffer, an
-indirect record's contents or a dispatch's counts), may fault the GPU or race a host access.
-The cook's checks guard it, and Metal shader validation and Vulkan's GPU-assisted validation
-catch it in tests. Every backend checks what the arguments show of it: a `push_slot` or
-`push_address` the pass did not declare and a declared slot that is empty are refused, and a
-placeholder in every empty slot and free sampler entry turns a stale number into a wrong
-image ("The heap and the sampler table").
+is the cook's and is trusted. A backend checks a module's form: its magic and version, and
+on SPIR-V its `OpCapability` and `OpExtension` instructions against what the device enabled
+(`capability`, every backend that takes SPIR-V; a Metal target declares none, and Metal's
+compiler refuses what the GPU cannot run). What a malformed module does, and what a shader
+reaches through data alone (an address, a slot number or a sampler index in push bytes or in
+a buffer, an indirect record's contents or a dispatch's counts), may fault the GPU or race a
+host access. The cook's checks guard it, and Metal shader validation and Vulkan's
+GPU-assisted validation catch it in tests. Every backend checks what the arguments show of
+it: a `push_slot` or `push_address` the pass did not declare and a declared slot that is
+empty are refused, and a placeholder in every empty slot and free sampler entry turns a
+stale number into a wrong image ("The heap and the sampler table").
 
 | Rule | Name | Every backend | Null alone |
 |---|---|---|---|
@@ -744,9 +796,9 @@ image ("The heap and the sampler table").
 | `Queue` | `no-qfot` | | a use off the owning queue; an acquire with no release; a change of state or owner under another queue's pending submit with no wait for it; an alias call across queues |
 | `Destroyed` | `destroyed` | a stale handle, at the `Device` call it is given to, or at the submit of the encoder it was recorded into, a resource destroyed since the recording included | a handle another device issued that resolves to a live resource |
 | `Pending` | `pending` | `Encoder::reset` while pending; `resize` with a present pending; a destroy under a pending submit of any queue; of an image a slot holds; of a block an image is placed in; of a sampler while any submit made before it is pending; `write_buffer` and `read_buffer` of a buffer a pending submit writes | a submit counted pending until the caller has seen its point ("Queues by role") |
-| `Capability` | `capability` | every call that needs an unreported capability; a module that declares a capability the device did not enable | |
+| `Capability` | `capability` | every call that needs an unreported capability; a SPIR-V module whose `OpCapability` or `OpExtension` instructions name one the device did not enable | |
 | `Usage` | `usage` | host access outside the memory class; `buffer_address` without `DEVICE_ADDRESS`; a descriptor no device could honour; every other use outside a usage; a pass's attachments; a pipeline's formats | |
-| `Bounds` | `bounds` | host ranges; heap slots; placements; push-constant offsets; copy regions; the scissor; the viewport; the index buffer's offset and the indices a direct draw reads; indirect offsets and strides, their alignment and the records they span; a dispatch's counts against `compute_groups` | |
+| `Bounds` | `bounds` | host ranges; heap slots; placements; push-constant offsets; copy regions; the scissor; the viewport, against `viewport_extent` and `viewport_bounds`; the index buffer's offset and the indices a direct draw reads; indirect offsets and strides, their alignment and the records they span; a dispatch's counts against `compute_groups` | |
 | `Undeclared` | `undeclared` | `push_slot`, `push_address` | |
 | `Unflushed` | `unflushed` | | a written range at a submit; a read with no invalidate |
 | `HostOverlap` | `host-overlap` | overlapping host access; a destroy of a buffer under a host access; a submit that writes a buffer under one | |
@@ -754,13 +806,13 @@ image ("The heap and the sampler table").
 | `LocalMap` | `local-map` | | an input with no attachment of its index marked |
 | `Split` | `split` | | a memoryless attachment after a local read, where lost |
 | `MemorylessStore` | `memoryless-store` | a memoryless attachment stored, or loaded with `Load::Keep` | |
-| `HeapLayout` | `heap-layout` | a declared slot that is empty | a declared slot not in `SampledRead` |
-| `HeapWrite` | `uuwp-used` | a slot written under a pending declaration | |
+| `HeapLayout` | `heap-layout` | a declared slot that is empty; one written since its pass began | a declared slot not in `SampledRead` |
+| `HeapWrite` | `uuwp-used` | a slot written under a pending declaration; a submit that declares a slot whose write is in progress | |
 | `Alias` | `no-fence` | | a placed image used with no alias call since its bytes were another's |
 | `UndefinedRead` | `undefined-read` | | a read of undefined contents |
 | `PresentQueue` | `present-queue` | `Device::submit` to `Present` | a swapchain image on another role's encoder |
 | `Swapchain` | `swapchain` | a second acquire; a present of another image; a second swapchain | a swapchain image used outside its acquire and its present |
-| `Timeline` | `timeline` | a submit's signal that does not grow, or that another queue's pending signal could pass; a host signal not below every pending promise, or one a promise that does not wait for it or another host signal could pass; a value 2^31 or more from the timeline's | |
+| `Timeline` | `timeline` | a submit's signal that does not grow past the timeline's value, its host signals and promises and the values the submit waits for, or that another queue's pending signal could pass; a host signal not below every pending promise, or one a promise whose wait it does not alone release or another host signal could pass; a value 2^31 or more from the timeline's or from a pending wait or signal | |
 | `Encoding` | `encoding` | a foreign, wrong-role or pending encoder in a submit; one submitted again with no reset; a command outside its scope; a draw or dispatch with nothing bound to it; a pass left open | |
 
 **What a device backend keeps**
@@ -770,18 +822,18 @@ driver call it guards:
 
 | Clauses | What a device keeps | Cost |
 |---|---|---|
-| `destroyed` at a call, and at a submit for every handle the encoder recorded | Its resource tables, by handle, each live entry behind a lock of its own; the encoder's copy of what each handle it recorded resolved to, with a count, walked again at the submit | One lookup a handle an encoder, under that handle's entry lock, and a count kept to the encoder's reset; the walk the submit makes anyway, over the encoder's distinct handles |
+| `destroyed` at a call, and at a submit for every handle the encoder recorded | Its resource tables, by handle, whose entries do not move while the device lives (a fixed capacity, or chunks never moved), each live entry behind a lock of its own; the encoder's copy of what each handle it recorded resolved to, with a count, walked again at the submit | One lookup a handle an encoder, under that handle's entry lock, and a count kept to the encoder's reset; the walk the submit makes anyway, over the encoder's distinct handles |
 | `pending`: a reset, a resize, a destroy under a pending submit, a sampler's destroy | The point each queue's last submit is stamped with, taken under the queue's lock in the order its driver receives them, and the completed value of each queue, read from the driver at the check ("Queues by role"); for each resource, the last submit of each queue that names it, three stamps at most, stamped in the walk; a present's fence for each image the swapchain presents | A stamp a handle and queue at the submit; a read of the driver's value before the lock and a compare at the destroy |
 | `pending`: an image a slot holds, a block an image is placed in | A count of the slots holding each image and of the images placed in each block | An increment and a decrement |
 | `pending`: `write_buffer` and `read_buffer` under a writer | For each buffer, the last submit of each queue that writes it, stamped in the walk | A compare a host call |
 | `host-overlap`: overlapping host access, a destroy or a submit that writes under one | For each buffer, the ranges of the host accesses in progress | An insert and a removal a call, and a lookup for each buffer a submit writes, under the record's lock ("Threads") |
-| `uuwp-used`; `heap-layout`'s empty slot | For each slot, its image and the last submit of each queue that declares it, stamped in the walk | A lookup for each declared slot of each pass at the submit, at most the heap's slots a pass; `rhi-metal` resolves each for `useResource` anyway |
+| `uuwp-used`; `heap-layout`'s empty slot and its slot written since the pass began | For each slot, its image, behind the slot's entry lock, and the last submit of each queue that declares it, stamped in the walk; a mark while a write of the slot is in progress, and the image it writes, held; on the encoder, the image each declared slot resolved to when its pass began, counted | A lookup and a compare for each declared slot of each pass at the submit, at most the heap's slots a pass; a lookup for each declared slot as its pass begins, which `rhi-metal` makes for `useResource` anyway |
 | `undeclared` | The open pass's declaration, on the encoder | A lookup a push of a slot or an address, at recording, with no lock |
 | `usage`, `bounds` | Each resource's description, in what the encoder resolved; the device's capabilities | A compare a command, at recording, against what the encoder resolved, with no lock |
-| `capability`: a module's capabilities | The capabilities the device enabled | A scan of the module's header at each pipeline's creation |
+| `capability`: a SPIR-V module's capabilities and extensions | The capabilities and extensions the device enabled | A scan of the module's header at each pipeline's creation |
 | `memoryless-store` | One flag for each image | A compare for each attachment as its pass begins |
 | `encoding` | One state for each encoder, and the breach it recorded first | Free: `rhi-metal` needs the state to know its open command encoder |
-| `timeline` | For each timeline, the least and greatest pending promise, the queue that made them and what each waits for on the timeline; a mark for a host signal in progress | A compare a signal; the mark set and cleared under the record's lock around a host signal's driver call |
+| `timeline` | For each timeline, its pending promises, each with the queue that made it and what its submit waits for on the timeline, a list no longer than its pending submits; the least pending wait on it; the greatest value signalled from the host; a mark for a host signal in progress; the timeline's value, read from the driver before the lock | A compare a signal; the mark set, and the host's value recorded, under the record's lock before a host signal's driver call, the mark cleared after; a failed submit's promises dropped in a second hold |
 
 A breach a device finds while recording is carried to the submit as the encoder's first
 breach, and the backend records nothing more into its driver's command buffer.
@@ -799,13 +851,13 @@ honours by a call the Metal spike made. The Vulkan column is the RHI spike's.
 | `write_buffer`, `read_buffer`, `flush_buffer`, `invalidate_buffer` | A byte store for each buffer, lent for the call with the device's records unlocked; the range recorded as in progress; written and flushed ranges under a set that is not coherent | `contents()` of shared memory; flush and invalidate do nothing | Persistently mapped memory; `vkFlushMappedMemoryRanges`, `vkInvalidateMappedMemoryRanges` | RHI point 3, question 8; Metal point 3 |
 | `create_image`, `destroy_image`, `image_memoryless` | Usage, state for each subresource, the request and whether its set honours it | `makeTexture`; `.memoryless` storage for colour and depth | An image; lazily allocated memory where offered | RHI item 7, point 4; Metal item 3, point 4 |
 | `create_memory_block`, `image_placement`, `ImageMemory::Placed`, `Encoder::alias` | Byte ranges for each block; which image last used each; refuses `no-fence` | An untracked placement heap; `heapTextureSizeAndAlign`; the block's fence waited on before, and updated after, every encoder that uses a placed image, at the alias call and at every other use | Bound memory at an offset; a barrier from undefined | Metal item 4, point 16 |
-| `write_heap_slot`, `clear_heap_slot` | The image for each slot; the declarations of pending submits; refuses `uuwp-used` | A write of the texture's resource id into the argument buffer, the placeholder's on a clear | An update-after-bind descriptor write | RHI item 3, point 5; Metal item 1, point 5 |
+| `write_heap_slot`, `clear_heap_slot` | The image for each slot; the declarations of pending submits; refuses `uuwp-used` | Under the heap's lock, the slot marked, a write of the texture's resource id into the argument buffer, the placeholder's on a clear, and the mark cleared | Under the heap's lock, the slot marked, an update-after-bind descriptor write, and the mark cleared | RHI item 3, point 5; Metal item 1, point 5 |
 | `create_sampler`, `destroy_sampler` | A table of descriptors | A sampler with `supportArgumentBuffers`, its id in the table's argument buffer, the placeholder's in a free entry; at most `maxArgumentBufferSamplerCount` | A sampler in the table's descriptor array, the placeholder in a free entry | Metal item 10, point 15 |
 | `CookedShader`, `create_graphics_pipeline`, `create_compute_pipeline`, the destroys | The cooked fields of a `SpirV` target: stages, constants' lengths, inputs, outputs, heap capacity, and the capabilities the module declares. It runs no code | A library from MSL 3.1 or a metallib; functions always specialised; a pipeline state | Shader modules with specialisation info | RHI item 4, point 6; Metal item 6, point 6 |
 | `pipeline_cache`, the request's bytes, `pipeline_stats`, `seal_cache`, `open_cache` | A payload of its own under the same seal | A binary archive loaded from a private copy of the opened payload; fail-on-miss; never under shader validation | `VkPipelineCache` data; creation feedback | RHI item 5, point 7; Metal item 7, point 7 |
 | `create_encoder`, `Encoder::reset`, recording on a thread | A command list, its scope, whether it is submitted or pending, and its first breach | A command buffer made on first use; `reset` drops it; the open command encoder, the state device backends keep | A command pool and one command buffer; `vkResetCommandPool` | RHI item 6, point 8; Metal item 8, point 8 |
 | `transition_images`, `transition_buffers` | The state and owner of each subresource, applied at the submit in order; whether a pass or copy wrote it since | Nothing, but for placed images, whose every use the block's fence orders | Barriers of synchronisation 2, a same-state one in a writing state included; a release and an acquire across families | RHI item 7, point 9; Metal point 9 |
-| `begin_render_pass`, `begin_compute_pass`, `end_pass`, `PassReach` | The attachments, what is declared, what was written since the last local read | A render or compute command encoder; `useResource` for each declared slot's texture and each declared buffer | `vkCmdBeginRendering` with the input mapping; the declaration unused | RHI item 7, points 5 and 10; Metal items 2 and 3, point 5 |
+| `begin_render_pass`, `begin_compute_pass`, `end_pass`, `PassReach` | The attachments, what is declared, what was written since the last local read | A render or compute command encoder; `useResource` for each declared slot's texture, the placeholder image and each declared buffer | `vkCmdBeginRendering` with the input mapping; the declaration unused | RHI item 7, points 5 and 10; Metal items 2 and 3, point 5 |
 | `local_read` | Clears "written since"; refuses `local`, `split` | Nothing: framebuffer fetch reads the tile | The local-read barrier (which MoltenVK turns into a pass split) | RHI item 7, point 10; Metal item 3, point 10 |
 | `bind_*`, `set_viewport`, `set_scissor`, `push_bytes`, `push_address`, `push_slot` | The bound pipeline; typed pushes against the declaration | State on the encoder; the block as bytes set for each stage | Dynamic state; `vkCmdPushConstants` | RHI items 2 to 4; Metal items 1 and 2 |
 | `draw`, `draw_indexed`, `draw_indexed_indirect`, `draw_indexed_indirect_count` | Checks states, declarations and capabilities; draws nothing | `drawPrimitives`, `drawIndexedPrimitives`, one indirect record a call; no count form | The draw calls; multi-draw and indirect count where reported | RHI item 9, point 12; Metal item 5, point 12 |
@@ -813,7 +865,7 @@ honours by a call the Metal spike made. The Vulkan column is the RHI spike's.
 | `copy_buffer`, `copy_buffer_to_image`, `copy_image_to_buffer` | Buffer to buffer moves bytes in its stores; the image forms are checked and move nothing | Blit encoder copies | The copy commands | RHI item 10, point 13; Metal item 12, point 13 |
 | `create_timeline`, `timeline_value`, `signal_timeline`, `wait_timeline` | A counter and a condition variable | `MTLSharedEvent`: `signaledValue`, a listener, a wait with a timeout | A timeline semaphore | RHI item 8, point 11; Metal item 9, point 11 |
 | `submit` with waits and signals | Checks every command in order, applies the states, completes when its waits are reached; pending until the caller sees its point | Command buffers enqueued in slice order, `encodeWaitForEvent` and `encodeSignalEvent`, the queue's own shared event before the caller's; the handles each names stamped with its point under the queue's lock | `vkQueueSubmit2` with timeline semaphores, the queue's own among the signals; the handles stamped likewise | RHI items 6 and 8; Metal items 8 and 9 |
-| `create_swapchain`, `acquire`, `present`, `resize` | Images with no window; an acquire that can be made to return `None` | A `CAMetalLayer`; `nextDrawable`, which has its own one-second limit; `present(drawable)` before the commit | A swapchain; an acquire with a finite timeout; `vkQueuePresentKHR` after the submit | Metal item 11, point 17; decision 5.6 |
+| `create_swapchain`, `acquire`, `present`, `resize` | Images with no window; an acquire that can be made to return `None` | A `CAMetalLayer`; `nextDrawable`, which has its own one-second limit; `present(drawable)` before the commit | A swapchain, with `VK_EXT_swapchain_maintenance1`'s present fence for each present; an acquire with a finite timeout; `vkQueuePresentKHR` after the submit | Metal item 11, point 17; decision 5.6 |
 | `is_lost`, `DeviceLost` | A flag its own call sets | A command buffer's error status | `VK_ERROR_DEVICE_LOST` | Architecture 19; verification row 192 |
 | `MessageSink` | Never called | The driver's log where it has one; validators write to standard error | The debug messenger | RHI "Validation runs", point 14; Metal "Validation runs", point 14 |
 
@@ -822,7 +874,7 @@ honours by a call the Metal spike made. The Vulkan column is the RHI spike's.
 `conformance::CASES` lists every case by name, each a *contract* case or an *output* case,
 and `conformance::run` runs one against a `Harness`. The bodies arrive with the backends:
 the contract cases' with `rhi-null`, the output cases' and their Slang sources with `vulkan`.
-A backend's tests carry one test for each case, named after it. There are 140: 115 contract
+A backend's tests carry one test for each case, named after it. There are 146: 121 contract
 cases and 25 output cases.
 
 - A **contract** case asserts what the contract says of calls and results. It needs no
@@ -836,7 +888,7 @@ cases and 25 output cases.
   and its refusal there depends on timing.
 
 The refusal cases a device backend also runs are those of the rules table's "Every backend"
-column, one or more for each of its clauses, 55 in all: `unreported_capability_is_refused`,
+column, one or more for each of its clauses, 59 in all: `unreported_capability_is_refused`,
 `submit_to_the_present_role_is_refused`, `overlapping_host_access_is_refused`,
 `destroy_during_host_access_is_refused`, `host_range_outside_the_buffer_is_refused`,
 `host_access_outside_the_memory_class_is_refused`,
@@ -848,6 +900,7 @@ column, one or more for each of its clauses, 55 in all: `unreported_capability_i
 `placement_outside_the_block_is_refused`,
 `destroy_of_a_block_an_image_is_placed_in_is_refused`,
 `heap_slot_outside_the_heap_is_refused`, `declared_slot_empty_is_refused`,
+`slot_written_after_its_pass_began_is_refused`,
 `heap_write_under_a_pending_reader_is_refused`,
 `destroy_of_an_image_a_slot_holds_is_refused`,
 `sampler_destroyed_under_a_pending_submit_is_refused`,
@@ -863,6 +916,9 @@ column, one or more for each of its clauses, 55 in all: `unreported_capability_i
 `timeline_value_that_does_not_grow_is_refused`,
 `host_signal_above_a_pending_signal_is_refused`,
 `host_signal_below_a_promise_that_does_not_wait_for_it_is_refused`,
+`host_signal_below_a_promise_whose_wait_is_met_is_refused`,
+`submit_signalling_no_more_than_it_waits_for_is_refused`,
+`timeline_value_beyond_the_difference_limit_is_refused`,
 `timeline_signalled_from_two_queues_without_a_wait_is_refused`,
 `destroy_under_a_pending_submit_is_refused`,
 `concurrent_resource_destroyed_while_another_queue_uses_it_is_refused`,
@@ -878,25 +934,44 @@ column, one or more for each of its clauses, 55 in all: `unreported_capability_i
 
 - A device runs each of them as null does, holding the earlier submit pending where the case
   needs one by a wait on a point it signals only after the refused call.
-- The three race cases start two calls at once on two threads, round after round, each with
-  a submit held pending by a wait on a point not yet signalled, so that both accepted is a
-  defect on any backend however fast its device. `destroy_racing_a_submit_refuses_one` races
-  a destroy of a buffer against a submit that names it, and exactly one is refused,
-  `pending` or `destroyed`; `submit_racing_a_host_access_refuses_one` races a submit that
-  writes an upload buffer against a `write_buffer` of it whose `fill` stays until the submit
-  has returned, and exactly one is refused, `host-overlap` or `pending`;
+- The five race cases start two calls at once on two threads, round after round. Each but
+  the race of host signals holds a submit pending by a wait on a point not yet signalled, so
+  that both accepted is a defect on any backend however fast its device.
+  `destroy_racing_a_submit_refuses_one` races a destroy of a buffer against a submit that
+  names it, and exactly one is refused, `pending` or `destroyed`;
+  `submit_racing_a_host_access_refuses_one` races a submit that writes an upload buffer
+  against a `write_buffer` of it whose `fill` stays until the submit has returned, and
+  exactly one is refused, `host-overlap` or `pending`;
   `submits_racing_on_one_queue_keep_their_order` races two submits to one queue, one held by
   its wait, and a destroy of what the held one names is refused `pending` until the wait is
-  reached. The three race cases catch a backend whose check and update are split only where
+  reached; `heap_write_racing_a_submit_refuses_one` races a `write_heap_slot` against the
+  submit of an encoder whose pass declared the slot before the race, and exactly one is
+  refused: the write as `uuwp-used`, or the submit as `uuwp-used` or `heap-layout`;
+  `host_signals_racing_on_one_timeline_keep_it_growing` races two host signals of one
+  timeline, to two values above its own, and where both are accepted the timeline ends at
+  the greater. The race cases catch a backend whose check and update are split only where
   something falls between them. A device backend's records are a type of its own that makes
   no driver call, and its tests run the same interleavings under Miri with many seeds and
-  under stress.
+  under stress, with fixed interleavings among them: a host signal made in full between
+  another host signal's driver read and its hold, and between a submit's read and its hold.
 - `destroy_at_once_after_the_wait_is_accepted` holds a device to "Queues by role": a lagging
   submit, a wait for its point, then at once a destroy and a reset, repeated, each accepted.
-- `dispatch_beyond_the_group_limit_is_refused` runs under `Capabilities::LEAST`, and
-  `empty_draws_and_dispatches_record_nothing` with Metal API validation on.
-- `shader_needing_an_unenabled_capability_is_refused` creates a pipeline from a module that
-  declares `Int64Atomics` on a device that does not report `buffer_atomics_64`.
+- `dispatch_beyond_the_group_limit_is_refused` and `viewport_outside_its_rules_is_refused`
+  go one past the limits the device reports; null runs them under `Capabilities::LEAST`, and
+  a device under `LEAST` would need to report below its driver's limits, which no device
+  backend does, so a device runs them against its own.
+  `empty_draws_and_dispatches_record_nothing` runs with Metal API validation on.
+- `shader_needing_an_unenabled_capability_is_refused` creates a pipeline from a SPIR-V
+  module that declares `Int64Atomics` on a device that does not report `buffer_atomics_64`.
+  `rhi-metal` skips it: a Metal target declares no capability, and Metal's compiler refuses
+  a shader the GPU cannot run, as `InvalidData`.
+- `host_signal_below_a_promise_whose_wait_is_met_is_refused` holds a submit that waits for a
+  value the timeline has reached and signals above the host's;
+  `submit_signalling_no_more_than_it_waits_for_is_refused` waits for a value on a timeline
+  and signals one no greater on it; `timeline_value_beyond_the_difference_limit_is_refused`
+  gives a value 2^31 from the timeline's, and one 2^31 from a pending submit's wait;
+  `slot_written_after_its_pass_began_is_refused` begins a pass that declares a slot, writes
+  the slot, and submits.
 
 - An **output** case draws, dispatches or copies on a device, reads the result back and
   compares it with a reference computed on the CPU, never with a stored image (decision
@@ -948,10 +1023,10 @@ Some output cases count as evidence only in the shape, or on the device, named h
 | Buffers and host access | `buffer_write_then_copy_then_read_returns_the_bytes`, `buffer_address_is_stable_and_distinct`, `host_ranges_that_do_not_overlap_are_written_at_once`, `overlapping_host_access_is_refused`, `destroy_during_host_access_is_refused`, `host_range_outside_the_buffer_is_refused`, `host_access_outside_the_memory_class_is_refused`, `address_of_a_buffer_without_the_usage_is_refused`, `read_under_a_pending_writer_is_refused`, `write_under_a_pending_writer_is_refused`, `submit_writing_under_a_host_access_is_refused`, `submit_racing_a_host_access_refuses_one`, `unflushed_range_at_a_submit_is_refused`, `flush_and_invalidate_are_accepted_where_memory_is_coherent`, `buffer_use_outside_its_usage_is_refused` | `device_memory_is_filled_through_a_staging_copy` |
 | Images, memoryless, aliases | `image_use_outside_its_usage_is_refused`, `memoryless_outcome_is_queryable_and_as_reported`, `memoryless_request_without_transient_is_refused`, `memoryless_attachment_stored_is_refused`, `memoryless_attachment_kept_is_refused`, `memoryless_attachment_after_a_local_read_is_refused_where_lost`, `placement_outside_the_block_is_refused`, `destroy_of_a_block_an_image_is_placed_in_is_refused`, `aliased_image_used_without_the_alias_call_is_refused`, `alias_read_before_its_first_write_is_refused`, `aliases_used_in_turn_with_the_alias_call_pass` | `memoryless_g_buffer_is_lit_in_its_pass`, `aliased_transients_render_in_turn`, `image_round_trips_through_copies` |
 | States and queues | `transition_from_another_state_is_refused`, `use_in_another_state_is_refused`, `use_after_a_write_without_a_transition_is_refused`, `state_is_kept_for_each_mip_and_layer`, `state_follows_submission_order_not_recording_order`, `cross_queue_use_without_a_transfer_is_refused`, `acquire_without_a_release_is_refused`, `release_and_acquire_cross_a_resource`, `shared_and_discarded_resources_cross_without_a_transfer`, `roles_on_one_queue_need_no_transfer`, `image_taken_while_another_queue_reads_it_is_refused` | `ownership_transfer_keeps_the_contents` |
-| The heap, samplers, declarations | `heap_slot_outside_the_heap_is_refused`, `declared_slot_empty_is_refused`, `declared_slot_not_in_sampled_read_is_refused`, `heap_write_under_a_pending_reader_is_refused`, `heap_write_after_its_reader_completes_passes`, `destroy_of_an_image_a_slot_holds_is_refused`, `sampler_destroyed_under_a_pending_submit_is_refused`, `undeclared_slot_argument_is_refused`, `undeclared_address_argument_is_refused`, `declared_buffer_in_another_state_is_refused`, `sampler_table_is_bounded` | `heap_is_sampled_past_slot_zero`, `address_is_read_in_a_shader`, `declared_reader_follows_a_lagging_writer`, `sampler_filters_as_described` |
+| The heap, samplers, declarations | `heap_slot_outside_the_heap_is_refused`, `declared_slot_empty_is_refused`, `slot_written_after_its_pass_began_is_refused`, `declared_slot_not_in_sampled_read_is_refused`, `heap_write_under_a_pending_reader_is_refused`, `heap_write_after_its_reader_completes_passes`, `heap_write_racing_a_submit_refuses_one`, `destroy_of_an_image_a_slot_holds_is_refused`, `sampler_destroyed_under_a_pending_submit_is_refused`, `undeclared_slot_argument_is_refused`, `undeclared_address_argument_is_refused`, `declared_buffer_in_another_state_is_refused`, `sampler_table_is_bounded` | `heap_is_sampled_past_slot_zero`, `address_is_read_in_a_shader`, `declared_reader_follows_a_lagging_writer`, `sampler_filters_as_described` |
 | Cooked shaders, pipelines, the cache | `cooked_shader_round_trips`, `cooked_shader_of_another_version_is_refused`, `cooked_shader_corrupt_or_truncated_is_refused`, `shader_for_another_heap_is_refused`, `shader_target_the_backend_does_not_run_is_unsupported`, `constant_of_another_length_is_refused`, `shader_needing_an_unenabled_capability_is_refused`, `pipeline_of_other_formats_than_its_pass_is_refused`, `sealed_cache_round_trips`, `cache_corrupt_truncated_or_foreign_starts_empty` | `specialised_constant_changes_the_output`, `write_mask_keeps_a_channel`, `depth_state_orders_two_triangles`, `warm_cache_hits_every_stage` |
 | Encoders and submits | `encoder_recorded_on_another_thread_submits`, `encoder_reset_while_pending_is_refused`, `encoder_in_two_submits_is_refused`, `encoder_resubmitted_without_reset_is_refused`, `recording_while_pending_records_nothing`, `encoder_of_another_role_or_device_is_refused`, `command_outside_its_scope_is_refused`, `draw_with_nothing_bound_is_refused`, `pass_left_open_is_refused`, `push_outside_the_block_is_refused`, `copy_region_outside_its_resource_is_refused`, `refused_submit_changes_nothing`, `submit_of_no_encoders_waits_and_signals`, `submit_is_pending_until_its_wait_is_reached`, `empty_draws_and_dispatches_record_nothing` | `two_threads_record_at_once` |
-| Timelines, destroys and races | `timeline_is_signalled_waited_and_read_by_the_host`, `timeline_wait_times_out`, `timeline_value_that_does_not_grow_is_refused`, `host_signal_above_a_pending_signal_is_refused`, `host_signal_below_a_promise_that_does_not_wait_for_it_is_refused`, `host_signal_below_a_pending_signal_releases_its_waiter`, `timeline_signalled_from_two_queues_without_a_wait_is_refused`, `destroy_under_a_pending_submit_is_refused`, `concurrent_resource_destroyed_while_another_queue_uses_it_is_refused`, `destroy_after_an_unobserved_submit_is_refused`, `destroy_at_once_after_the_wait_is_accepted`, `destroy_racing_a_submit_refuses_one`, `submits_racing_on_one_queue_keep_their_order`, `use_after_destruction_is_refused`, `destroyed_after_recording_is_refused_at_submit`, `handle_of_another_device_is_refused` | |
+| Timelines, destroys and races | `timeline_is_signalled_waited_and_read_by_the_host`, `timeline_wait_times_out`, `timeline_value_that_does_not_grow_is_refused`, `host_signal_above_a_pending_signal_is_refused`, `host_signal_below_a_promise_that_does_not_wait_for_it_is_refused`, `host_signal_below_a_pending_signal_releases_its_waiter`, `host_signal_below_a_promise_whose_wait_is_met_is_refused`, `submit_signalling_no_more_than_it_waits_for_is_refused`, `timeline_value_beyond_the_difference_limit_is_refused`, `timeline_signalled_from_two_queues_without_a_wait_is_refused`, `destroy_under_a_pending_submit_is_refused`, `concurrent_resource_destroyed_while_another_queue_uses_it_is_refused`, `destroy_after_an_unobserved_submit_is_refused`, `destroy_at_once_after_the_wait_is_accepted`, `destroy_racing_a_submit_refuses_one`, `submits_racing_on_one_queue_keep_their_order`, `host_signals_racing_on_one_timeline_keep_it_growing`, `use_after_destruction_is_refused`, `destroyed_after_recording_is_refused_at_submit`, `handle_of_another_device_is_refused` | |
 | Render passes and the local read | `input_read_without_a_local_read_is_refused`, `input_read_of_another_attachment_is_refused`, `attachments_of_unequal_extent_are_refused`, `scissor_outside_the_attachments_is_refused`, `viewport_outside_its_rules_is_refused` | `triangle_matches_the_reference`, `local_read_sees_what_the_pass_wrote`, `clear_and_keep_load_as_described`, `viewport_and_scissor_place_the_triangles`, `draw_parameters_reach_the_shader` |
 | Indirect draws and dispatches | `index_buffer_offset_outside_or_unaligned_is_refused`, `indexed_draw_past_its_index_buffer_is_refused`, `indirect_arguments_outside_or_unaligned_are_refused`, `dispatch_beyond_the_group_limit_is_refused` | `indexed_indirect_draw_matches_the_reference`, `indirect_count_draws_where_reported`, `dispatch_writes_through_an_address`, `dispatches_of_one_pass_see_each_others_writes`, `dispatch_indirect_reads_its_counts` |
 | The swapchain and the present role | `second_acquire_before_a_present_is_refused`, `present_of_an_image_not_acquired_is_refused`, `present_of_an_image_not_in_present_is_refused`, `swapchain_image_on_a_frame_encoder_is_refused`, `swapchain_image_used_outside_its_acquire_is_refused`, `second_swapchain_is_refused`, `resize_with_a_present_pending_is_refused`, `image_of_before_a_resize_is_refused`, `frame_submits_complete_while_a_present_is_pending` | |
@@ -963,7 +1038,7 @@ the present thread is `lactose-platform`'s to test (`swapchain`'s row), and is n
 drawable made to block, and MoltenVK cannot show it, as it takes the drawable inside the
 submit (plan decision 5.6). `tests/tables.rs` holds the table to itself: names distinct, a
 rule only on a contract case, every rule with a case that provokes it, the device-run
-refusals exactly the 55 named above, and every case named in this file. Every clause of the
+refusals exactly the 59 named above, and every case named in this file. Every clause of the
 rules table's "Every backend" column has a case. A clause of its "Null alone" column with
 none here gets its case from `rhi-null`, with the check, as an amendment to list.
 
@@ -1012,7 +1087,7 @@ consumer's use of the surface, and a backend's implementation of every trait wit
 and not `Sync`, every handle plain data of eight bytes, and the indirect record twenty bytes.
 `tests/tables.rs` runs the rule names, the refusal's round trip (wrapped in other errors
 too), the queue layout, the indirect record's bytes, the suite table's consistency, and this
-file's naming of every case and of the 55 a device runs.
+file's naming of every case and of the 59 a device runs.
 
 What neither spike showed and the facade still includes, because section 12.1 or decision
 5.6 names it or a consumer cannot do without it: `dispatch_indirect` (both files' "Not

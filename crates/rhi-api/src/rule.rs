@@ -37,15 +37,18 @@ pub enum Rule {
     /// a pending submit writes.
     Pending,
     /// `capability`: a call that needs a reported capability the device does not report,
-    /// or a shader module that declares a capability the device did not enable.
+    /// or a SPIR-V module whose `OpCapability` or `OpExtension` instructions name one the
+    /// device did not enable. A Metal target declares none: Metal's compiler refuses what
+    /// the GPU cannot run, as `InvalidData`.
     Capability,
     /// `usage`: a use of a resource that its descriptor's usage, memory class or format
     /// does not allow, or a descriptor no device could honour.
     Usage,
     /// `bounds`: a range outside its buffer, image, memory block, heap, push-constant
     /// range or attachments, an index or indirect offset or stride off its alignment, a
-    /// viewport that is not finite, not of positive extent or whose depth range leaves zero
-    /// to one, or a dispatch above the device's workgroup counts.
+    /// viewport that is not finite, not of positive extent, larger or further out than the
+    /// device's viewport limits or whose depth range leaves zero to one, or a dispatch
+    /// above the device's workgroup counts.
     Bounds,
     /// `undeclared`: a heap slot or a buffer handed to a pass through
     /// [`push_slot`](crate::Encoder::push_slot) or
@@ -73,9 +76,11 @@ pub enum Rule {
     /// loaded with [`Load::Keep`](crate::Load::Keep).
     MemorylessStore,
     /// `heap-layout`: a draw or dispatch in a pass that declares a heap slot which is empty
-    /// or whose image is not in the sampled-read state.
+    /// or whose image is not in the sampled-read state, or a submit of a pass that declares
+    /// a slot written since the pass began.
     HeapLayout,
-    /// `uuwp-used`: a write to a heap slot that a pass of a pending submit declared.
+    /// `uuwp-used`: a write to a heap slot that a pass of a pending submit declared, or a
+    /// submit of a pass that declares a slot whose write is in progress.
     HeapWrite,
     /// `no-fence`: a use of a placed image whose memory another image has used, with no
     /// alias call since.
@@ -92,10 +97,13 @@ pub enum Rule {
     /// swapchain for a device that has one.
     Swapchain,
     /// `timeline`: a submit's signal of a value not greater than every value the timeline
-    /// has reached or been promised, or while another queue's signal of it is pending with
-    /// no wait for it; a host signal not between the timeline's value and every pending
+    /// has reached, been given by a host signal or been promised, or than a value the same
+    /// submit waits for on it, or while another queue's signal of it is pending with no
+    /// wait for it; a host signal not between the timeline's value and every pending
     /// promise, or one a pending promise or another host signal could pass; or a value
-    /// 2^31 or more from the timeline's.
+    /// 2^31 or more from the timeline's or from a value a pending submit waits for or
+    /// signals on it. The timeline's value is the greater of the driver's and the greatest
+    /// the device has signalled from the host.
     Timeline,
     /// `encoding`: a command outside the scope it belongs to, a draw or dispatch with
     /// nothing bound to it, a pass left open, an encoder of another device or role, or an
