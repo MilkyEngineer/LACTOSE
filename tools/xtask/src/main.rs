@@ -4,7 +4,9 @@
 //! the output can be fed to a problem matcher. Progress and summaries go to standard error.
 //! The exit status is 0 for no findings, 1 for findings and 2 when a check could not run.
 //! `heavy` is not a check: it prints only progress to standard error, and exits with the
-//! status of the program it runs, or 2 when it could not run it.
+//! status of the program it runs, or 2 when it could not run it. `group` is not a check
+//! either: it prints one line of cargo arguments to standard output, and exits with 2,
+//! printing nothing there, when the groups do not divide the workspace.
 //!
 //! Every cargo command this binary runs is `--locked`, as is the `cargo xtask` alias itself:
 //! a check never rewrites `Cargo.lock`, and fails if it is out of date. The one exception is
@@ -30,7 +32,7 @@ use lactose_xtask::tiers::TierFile;
 use lactose_xtask::vendor::{self, Repository};
 use lactose_xtask::workspace::{Workspace, cargo_metadata, load_metadata};
 use lactose_xtask::{
-    Finding, POLICY_FILE, TIER_FILE, boundary, features, miri, test_targets, tiers,
+    Finding, POLICY_FILE, TIER_FILE, boundary, check_groups, features, miri, test_targets, tiers,
 };
 
 const USAGE: &str = "\
@@ -40,8 +42,13 @@ cargo xtask <command>
   boundary                   check the boundary lint files and everything that could switch
                              them off, the unsafe policy, READMEs, the boundary dependency
                              allowlist, the x86-64-v3 pin, that the nightly Miri
-                             entries of each split package run its tests once each, and
-                             that each package builds its integration tests as one binary
+                             entries of each split package run its tests once each, that
+                             each package builds its integration tests as one binary and
+                             is in one check group, and that ci.yml's check job runs
+                             every group
+  group <name>               print the cargo arguments (`-p <package>` each) that select the
+                             packages of a CI check job's group, once the groups divide the
+                             workspace
   features [--package <p>]…  require agreeing boundary feature trees, per CI platform, across
                              the shipped binaries and the harness packages (or across the
                              named packages): identical across shipped binaries, the same
@@ -188,6 +195,13 @@ fn main() -> ExitCode {
             Err(message) => ("heavy", Err(message)),
         },
         ["measure", ref rest @ ..] => ("measure", run_measurements(rest)),
+        ["group", name] => match group_arguments(name) {
+            Ok(arguments) => {
+                println!("{arguments}");
+                return ExitCode::SUCCESS;
+            }
+            Err(message) => ("group", Err(message)),
+        },
         _ => ("xtask", Err(format!("unrecognised arguments `{}`\n\n{USAGE}", args.join(" ")))),
     };
     match checked {
@@ -235,7 +249,15 @@ fn check_boundary() -> Checked {
     let mut findings = boundary::check(&context.tiers, &context.policy, &context.workspace, &files);
     findings.extend(miri::check(&context.policy, &context.workspace, &files));
     findings.extend(test_targets::check(&context.policy, &context.workspace, &files));
+    findings.extend(check_groups::check(&context.policy, &context.workspace));
+    findings.extend(check_groups::check_workflow(&context.policy, &files));
     Ok(findings)
+}
+
+/// The cargo arguments that select a check group's packages, for CI's check jobs.
+fn group_arguments(name: &str) -> Result<String, String> {
+    let context = Context::load()?;
+    check_groups::arguments(&context.policy, &context.workspace, name)
 }
 
 fn check_vendor(args: &[&str]) -> Checked {

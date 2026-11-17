@@ -8,11 +8,13 @@
 //! `main.rs` only gathers the inputs (the tier file, `cargo metadata`, file contents) and
 //! prints what the checks return. [`heavy`] is not a check: it bounds how many heavy
 //! commands run at once on one machine. Nor is [`measure`]: it runs the milestone
-//! measurements and writes their result files.
+//! measurements and writes their result files. [`check_groups`] is a check, and also prints
+//! the packages of the group a CI check job builds.
 
 #![forbid(unsafe_code)]
 
 pub mod boundary;
+pub mod check_groups;
 pub mod features;
 pub mod harness;
 pub mod heavy;

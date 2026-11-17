@@ -6682,10 +6682,12 @@ process state; the nightly Miri filters name modules that Miri compiles** (§20,
     allows and D143 did. A planner's decision at the exit records what is frozen, what was
     amended and what `rhi-metal` may still amend. Rules out a freeze by silence, and a decision
     for each amendment.
-  - *A crate added from milestone 2 on follows D150, and no check job's median over its three most
-    recent warm runs of main passes ten of its fifteen minutes.* The Windows check's stood at 9:13
-    at the plan's re-base. Rules out crate lanes pushed onto a job at its timeout, a budget read
-    from one run, and runs made again to read it.
+  - *A crate added from milestone 2 on follows D150, each check job is two, by package group, and
+    no check job's median over its three most recent warm runs of main passes ten of its fifteen
+    minutes.* The Windows check's stood at 9:13 at the plan's re-base, before the split; a new
+    crate goes into the group the rule above `[check_groups]` in `tools/xtask/ci-policy.toml`
+    names. Rules out crate lanes pushed onto a job at its timeout, a budget read from one run, and
+    runs made again to read it.
   - *The physics phase's stall on render recording is recorded with no threshold* and sets
     `lactose-app`'s default reservation. Rules out a threshold nobody set.
   - *Re-gated*: the directory watch, with its dev session and the mount cost on Linux and

@@ -66,6 +66,31 @@ fn the_feature_check_passes_with_no_roots_and_reads_real_trees() {
 }
 
 #[test]
+fn the_check_groups_print_every_package_once_as_cargo_arguments() {
+    // What CI's check jobs pass to clippy, nextest and the doc tests: a group that left a
+    // package out would fail here, and in `boundary`, before any job ran without it.
+    let mut selected = Vec::new();
+    for group in ["base", "physics"] {
+        let output = xtask(&["group", group]);
+        assert!(output.status.success(), "{}", text(&output));
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let words: Vec<&str> = stdout.trim_end().split(' ').collect();
+        assert!(!words.is_empty() && words.len().is_multiple_of(2), "{stdout}");
+        for pair in words.chunks(2) {
+            assert_eq!(pair[0], "-p", "{stdout}");
+            selected.push(pair[1].to_owned());
+        }
+    }
+    let listed = selected.len();
+    selected.sort();
+    selected.dedup();
+    assert_eq!(selected.len(), listed, "{selected:?}");
+    for package in ["lactose-core", "lactose-xtask", "lactose-app-headless"] {
+        assert!(selected.iter().any(|name| name == package), "{selected:?}");
+    }
+}
+
+#[test]
 fn the_mode_matrix_prints_every_mode() {
     let output = xtask(&["sour", "matrix"]);
     assert!(output.status.success(), "{}", text(&output));
@@ -83,6 +108,9 @@ fn a_bad_command_line_is_a_usage_error() {
         &["sour", "run", "--mode", "speed"],
         &["tiers", "extra"],
         &["vendor", "--online"],
+        &["group"],
+        &["group", "rest"],
+        &["group", "base", "physics"],
     ] {
         assert_eq!(xtask(args).status.code(), Some(2), "{args:?}");
     }

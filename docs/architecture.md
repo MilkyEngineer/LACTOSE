@@ -1400,8 +1400,8 @@ The policy is in section 3.
   checkout. Two exceptions, each a line of `.gitattributes`: `vendor/**` is `-text` and keeps
   upstream's bytes (section 8.2), and a kind of file that is not text is named `binary` in
   the change that adds its first file (D148). `tools/xtask/line-endings.sh` checks git's
-  listing of the tree against the rule: `merger` runs it at every merge, and CI's check job
-  on the three platforms.
+  listing of the tree against the rule: `merger` runs it at every merge, and each of CI's
+  check jobs, one for each package group, on the three platforms.
 
 ## 21. Unsafe policy
 

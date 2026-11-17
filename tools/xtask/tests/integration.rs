@@ -5,5 +5,6 @@
 #![forbid(unsafe_code)]
 
 mod boundary_lints;
+mod check_groups;
 mod vendor;
 mod workspace;
