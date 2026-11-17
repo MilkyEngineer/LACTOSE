@@ -1,0 +1,36 @@
+{
+  "arch": "aarch64",
+  "command": "cargo xtask measure --all",
+  "commit": "a539d60461a8",
+  "cpu": "Apple M1",
+  "date": "2026-11-17",
+  "figures": {
+    "bones": 16,
+    "characters": 200,
+    "ticks": 300,
+    "w1.bodies_us": 7076.1,
+    "w1.with_us": 7314.9,
+    "w1.without_us": 238.8,
+    "w4.bodies_us": 5845.8,
+    "w4.with_us": 6028.5,
+    "w4.without_us": 182.7,
+    "warm_up_ticks": 50,
+    "workers": "1 and 4"
+  },
+  "load": {
+    "load_average_after": "3.59 2.69 2.91",
+    "load_average_before": "3.81 2.72 2.92"
+  },
+  "machine": "apple-m1",
+  "measurement": "bone-bodies",
+  "notes": {},
+  "os": "macos 27.2.1",
+  "profile": "release",
+  "ran": "cargo nextest run --locked --cargo-profile release --package lactose-app --test integration --run-ignored only --retries 0 --no-capture --no-tests=fail -E 'test(=cost::cost_of_bone_bodies_on_rapier)'",
+  "short": false,
+  "topology": {
+    "efficiency": 4,
+    "performance": 4
+  },
+  "workers": "1 and 4"
+}

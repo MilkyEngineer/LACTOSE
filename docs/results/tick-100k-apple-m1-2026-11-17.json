@@ -1,0 +1,40 @@
+{
+  "arch": "aarch64",
+  "command": "cargo xtask measure --all",
+  "commit": "a539d60461a8",
+  "cpu": "Apple M1",
+  "date": "2026-11-17",
+  "figures": {
+    "archetypes": 5,
+    "hash": "0x11c1a653b85d7d3d",
+    "n": 4,
+    "projection_us": 2172.6,
+    "regions": 16,
+    "rows": 100064,
+    "s_us": 1080.8,
+    "systems": 16,
+    "t1_us": 9815.3,
+    "ticks": 60,
+    "tn_us": 3264.4,
+    "topology.efficiency": 4,
+    "topology.performance": 4,
+    "warm_up_ticks": 10,
+    "workers": "1 and 4"
+  },
+  "load": {
+    "load_average_after": "3.80 2.70 2.91",
+    "load_average_before": "3.70 2.66 2.90"
+  },
+  "machine": "apple-m1",
+  "measurement": "tick-100k",
+  "notes": {},
+  "os": "macos 27.2.1",
+  "profile": "release",
+  "ran": "cargo nextest run --locked --cargo-profile release --package lactose-sim --test integration --run-ignored only --retries 0 --no-capture --no-tests=fail -E 'test(=cost::cost_of_a_tick_at_100k_rows)'",
+  "short": false,
+  "topology": {
+    "efficiency": 4,
+    "performance": 4
+  },
+  "workers": "1 and 4"
+}

@@ -1,0 +1,34 @@
+{
+  "arch": "aarch64",
+  "command": "cargo xtask measure --all",
+  "commit": "a539d60461a8",
+  "cpu": "Apple M1",
+  "date": "2026-11-17",
+  "figures": {
+    "bodies": 2000,
+    "frame_workers": 4,
+    "reload.step_us": 338313.2,
+    "reload.sync_us": 112353.4,
+    "reloads": 5,
+    "rows": 100000,
+    "statics": 50001,
+    "tick.step_us": 2041.5,
+    "tick.sync_us": 546.6
+  },
+  "load": {
+    "load_average_after": "3.81 2.72 2.92",
+    "load_average_before": "3.80 2.70 2.91"
+  },
+  "machine": "apple-m1",
+  "measurement": "reload-100k",
+  "notes": {},
+  "os": "macos 27.2.1",
+  "profile": "release",
+  "ran": "cargo nextest run --locked --cargo-profile release --package lactose-app --test integration --run-ignored only --retries 0 --no-capture --no-tests=fail -E 'test(=cost::cost_of_a_100k_reload)'",
+  "short": false,
+  "topology": {
+    "efficiency": 4,
+    "performance": 4
+  },
+  "workers": "4"
+}

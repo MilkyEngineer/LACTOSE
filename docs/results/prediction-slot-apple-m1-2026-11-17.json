@@ -1,0 +1,48 @@
+{
+  "arch": "aarch64",
+  "command": "cargo xtask measure --all",
+  "commit": "a539d60461a8",
+  "cpu": "Apple M1",
+  "date": "2026-11-17",
+  "figures": {
+    "claimed": 51,
+    "entities": 115,
+    "fixed_colliders": 5,
+    "frames": 152,
+    "physics_bytes": 251041,
+    "physics_restore_us": 55.9,
+    "physics_snapshot_us": 63.5,
+    "proxies": 59,
+    "record_bytes": 14892,
+    "record_us": 56.2,
+    "restore_us": 68.1,
+    "ring_bytes_again_us": 0.5,
+    "ring_bytes_first_us": 13223.1,
+    "ring_depth": 60,
+    "ring_physics_bytes": 15062460,
+    "rounds": 200,
+    "snapshot_us": 74.4,
+    "take_us": 130.6,
+    "tick": 157,
+    "workers": 4,
+    "world_bytes": 91988,
+    "world_restore_us": 12.1,
+    "world_snapshot_us": 11.0
+  },
+  "load": {
+    "load_average_after": "3.59 2.69 2.91",
+    "load_average_before": "3.59 2.69 2.91"
+  },
+  "machine": "apple-m1",
+  "measurement": "prediction-slot",
+  "notes": {},
+  "os": "macos 27.2.1",
+  "profile": "release",
+  "ran": "cargo nextest run --locked --cargo-profile release --package lactose-app --test integration --run-ignored only --retries 0 --no-capture --no-tests=fail -E 'test(=spike::cost_of_a_prediction_slot)'",
+  "short": false,
+  "topology": {
+    "efficiency": 4,
+    "performance": 4
+  },
+  "workers": "4"
+}

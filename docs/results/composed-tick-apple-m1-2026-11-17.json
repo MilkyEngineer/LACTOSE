@@ -1,0 +1,39 @@
+{
+  "arch": "aarch64",
+  "command": "cargo xtask measure --all",
+  "commit": "a539d60461a8",
+  "cpu": "Apple M1",
+  "date": "2026-11-17",
+  "figures": {
+    "bodies": 2000,
+    "n": 4,
+    "projection_us": 4424.0,
+    "rows": 100064,
+    "s_us": 3119.7,
+    "t1_us": 13554.5,
+    "ticks": 60,
+    "tn_us": 5728.4,
+    "w1.physics_us": 3083.2,
+    "w1.step_us": 13554.5,
+    "w4.physics_us": 2238.1,
+    "w4.step_us": 5728.4,
+    "warm_up_ticks": 10,
+    "workers": "1 and 4"
+  },
+  "load": {
+    "load_average_after": "3.80 2.70 2.91",
+    "load_average_before": "3.80 2.70 2.91"
+  },
+  "machine": "apple-m1",
+  "measurement": "composed-tick",
+  "notes": {},
+  "os": "macos 27.2.1",
+  "profile": "release",
+  "ran": "cargo nextest run --locked --cargo-profile release --package lactose-app --test integration --run-ignored only --retries 0 --no-capture --no-tests=fail -E 'test(=cost::composed::cost_of_the_composed_tick)'",
+  "short": false,
+  "topology": {
+    "efficiency": 4,
+    "performance": 4
+  },
+  "workers": "1 and 4"
+}

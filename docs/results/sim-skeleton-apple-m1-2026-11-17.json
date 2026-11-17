@@ -1,0 +1,48 @@
+{
+  "arch": "aarch64",
+  "command": "cargo xtask measure --all",
+  "commit": "a539d60461a8",
+  "cpu": "Apple M1",
+  "date": "2026-11-17",
+  "figures": {
+    "a.evaluate_us": 160.3,
+    "b.w1.difference_us": 182.2,
+    "b.w1.with_us": 227.9,
+    "b.w1.without_us": 45.7,
+    "b.w4.difference_us": 85.0,
+    "b.w4.with_us": 123.8,
+    "b.w4.without_us": 38.8,
+    "bones": 16,
+    "c.no_physics.w1.bodies_us": 746.1,
+    "c.no_physics.w1.with_us": 997.9,
+    "c.no_physics.w1.without_us": 251.8,
+    "c.no_physics.w4.bodies_us": 608.5,
+    "c.no_physics.w4.with_us": 759.4,
+    "c.no_physics.w4.without_us": 150.9,
+    "c.test_backend.w1.bodies_us": 2629.2,
+    "c.test_backend.w1.with_us": 2883.5,
+    "c.test_backend.w1.without_us": 254.3,
+    "c.test_backend.w4.bodies_us": 2544.2,
+    "c.test_backend.w4.with_us": 2698.4,
+    "c.test_backend.w4.without_us": 154.1,
+    "characters": 200,
+    "ticks": 1000,
+    "workers": "1 and 4"
+  },
+  "load": {
+    "load_average_after": "4.58 3.85 3.38",
+    "load_average_before": "4.88 3.88 3.38"
+  },
+  "machine": "apple-m1",
+  "measurement": "sim-skeleton",
+  "notes": {},
+  "os": "macos 27.2.1",
+  "profile": "release",
+  "ran": "cargo nextest run --locked --cargo-profile release --package lactose-anim --test integration --run-ignored only --retries 0 --no-capture --no-tests=fail -E 'test(=cost::the_sim_skeleton_budget)'",
+  "short": false,
+  "topology": {
+    "efficiency": 4,
+    "performance": 4
+  },
+  "workers": "1 and 4"
+}

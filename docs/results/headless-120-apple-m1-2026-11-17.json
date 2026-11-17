@@ -1,0 +1,29 @@
+{
+  "arch": "aarch64",
+  "command": "cargo xtask measure --all",
+  "commit": "a539d60461a8",
+  "cpu": "Apple M1",
+  "date": "2026-11-17",
+  "figures": {
+    "behind": 0,
+    "frames": 121,
+    "hash": "0x92ff315464f84575",
+    "ticks": 120
+  },
+  "load": {
+    "load_average_after": "2.98 3.95 3.67",
+    "load_average_before": "2.98 3.95 3.67"
+  },
+  "machine": "apple-m1",
+  "measurement": "headless-120",
+  "notes": {},
+  "os": "macos 27.2.1",
+  "profile": "dev",
+  "ran": "cargo run --locked -p lactose-app-headless -- 120",
+  "short": false,
+  "topology": {
+    "efficiency": 4,
+    "performance": 4
+  },
+  "workers": "4 frame workers, the default executor's"
+}
