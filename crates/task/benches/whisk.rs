@@ -45,7 +45,7 @@
 //! - **Timer wake.** From a tick deadline until the frame-critical task that slept until it
 //!   resumes, the way the timer root ticks: `sleep_until` one deadline after another, with
 //!   the pool otherwise idle, at a 2 ms period and at 60 Hz. The 60 Hz P99 is a pass
-//!   criterion of its own: 35 µs (D138), and 1 ms on Windows (D144).
+//!   criterion of its own: 35 µs (D138), 50 µs on macOS (D156) and 1 ms on Windows (D144).
 //! - **Wake latency.** From just before a one-node graph is pushed to a parked pool until
 //!   its job starts. The push comes from a dedicated thread at frame-critical priority. The
 //!   CPU the process uses during this phase, in which it does nothing but wake up five
@@ -99,10 +99,17 @@ const RATIO_P99_LIMIT: f64 = 1.5;
 const WAKE_P99_LIMIT_NANOS: f64 = 35_000.0;
 /// The start of a tick: the same 35 µs (D138). The keeper is spinning when the deadline
 /// comes, but on the M1 the samples that miss lose about 13 to 28 µs between the
-/// deadline and the task, and a longer spin did not win it back. On Windows 1 ms (D144):
-/// the high-resolution timer that ends the keeper's wait there overshoots by about half a
-/// millisecond.
-const TIMER_P99_LIMIT_NANOS: f64 = if cfg!(windows) { 1_000_000.0 } else { 35_000.0 };
+/// deadline and the task, and a longer spin did not win it back. On macOS 50 µs (D156):
+/// since macOS 27 work that starts after an idle gap costs more, and full runs there give
+/// 24 to 38 µs. On Windows 1 ms (D144): the high-resolution timer that ends the keeper's
+/// wait there overshoots by about half a millisecond.
+const TIMER_P99_LIMIT_NANOS: f64 = if cfg!(windows) {
+    1_000_000.0
+} else if cfg!(target_os = "macos") {
+    50_000.0
+} else {
+    35_000.0
+};
 const TICK: Duration = Duration::from_micros(16_667);
 const STEAL_LIMIT_NANOS: f64 = 1_000.0;
 /// A wake or timer sample over this is a machine that was away rather than a scheduler that

@@ -11,10 +11,11 @@ machine-readable file, named by measurement, machine and UTC date:
 
 A second file of one measurement on one machine and UTC date keeps the first file's name and adds
 a suffix after the date that says what it is: `-run2`, `-run3` and so on for a repeat at the same
-commit, `-at-<commit>` for a run at another commit. The tool writes every run under the plain
-name, so a repeat is run with `--out` into a directory of its own and renamed when it is checked
-in; its `Commit` and `Command` rows say what it ran. The row of `docs/verification.md` that cites
-such a file says why it was taken.
+commit, `-at-<commit>` for a run at another commit. A repeat of a run at another commit adds
+`-run<n>` after its `-at-<commit>`, that file counting as the first. The tool writes every run
+under the plain name, so a repeat is run with `--out` into a directory of its own and renamed
+when it is checked in; its `Commit` and `Command` rows say what it ran. The row of
+`docs/verification.md` that cites such a file says why it was taken.
 
 ## The milestone measurements
 

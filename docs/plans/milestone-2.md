@@ -304,7 +304,9 @@ Eight rules bind whatever the coordinator reorders:
   Then, after the push, the laptop's run on its devices.
 - *The quiet window*, the coordinator's, at the measurement commit. Every track stops, the machine
   holds `caffeinate -i -s -d`, and `cargo xtask measure --all` runs once. It writes milestone 2's
-  five files beside milestone 1's, `gpu-cost` under MoltenVK and under KosmicKrisp.
+  five files beside milestone 1's, `gpu-cost` under MoltenVK and under KosmicKrisp. The WHISK
+  file's 60 Hz P99 is read against D156: under 30 µs, the planner proposes 35 µs again; the system
+  daemon's CPU time is read before and after the run, as the remeasurement of 17 November 2026 did.
 - *The laptop's session*, at the same commit, with nothing else running there: the same command,
   and `cargo xtask gpu --driver system`. Its `triangle` file is criterion 1's proof on Windows
   (the owner's answer 2).
@@ -1913,9 +1915,10 @@ Milestone 1 exited on the M1 under macOS 14.7.4. Its exit steps 1 to 7 were comp
 `docs/plans/milestone-1.md`, section 7. No criterion was "not met". Criteria 1, 4, 6 and 9 and
 milestone 0's makespan, wake and steal are met on the M1 alone, and their x86 half is row 169's.
 Tick start is met on the M1 as restated: D138's addendum holds it to 35 µs at P99 on macOS and
-Linux, `keeper` merged at `0ec2d90`, and the M1's file there gives 24.4 µs
-(`docs/results/whisk-apple-m1-2026-11-16.md`). Windows' tick start, held to 1 ms (D144), is met
-nowhere yet: it is the desktop's (D151). So `eco-qos` and `frame-design` wait on `keeper` no longer.
+Linux (on macOS 50 µs since D156, after milestone 1's exit), `keeper` merged at `0ec2d90`, and the
+M1's file there gives 24.4 µs (`docs/results/whisk-apple-m1-2026-11-16.md`). Windows' tick
+start, held to 1 ms (D144), is met nowhere yet: it is the desktop's (D151). So `eco-qos` and
+`frame-design` wait on `keeper` no longer.
 
 **The steps**, in this order (the owner's answers 1 and 5, the added ones, and decision 5.19):
 
