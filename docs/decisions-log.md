@@ -6842,8 +6842,9 @@ process state; the nightly Miri filters name modules that Miri compiles** (§20,
 **D156. On macOS tick start is held to 50 µs at P99** (§22, `lactose-task`, `docs/results`)
 - Why: the development Mac moved to macOS 27.2.1 on 17 November 2026 (D154), and the M1's re-run
   there fails D138's 35 µs with the executor's code unchanged: at 60 Hz, P99 34.6 to 38.3 µs and
-  P50 6.5 to 8.7 µs in four full runs (`docs/results/whisk-apple-m1-2026-11-17.md` and its three
-  suffixed files), against 24.4 to 29.9 µs and 2.6 to 3.7 µs in the four files of macOS 14.7.4.
+  P50 6.5 to 8.7 µs in four full runs (`docs/results/whisk-apple-m1-2026-11-17.md`, `-run2`,
+  `-run3` and `-at-0ec2d90`), against 24.4 to 29.9 µs and 2.6 to 3.7 µs in the four files of
+  macOS 14.7.4.
   The remeasurement of 17 November 2026 at `d290812`
   (`docs/results/whisk-apple-m1-2026-11-17-at-d290812.md` and its two suffixed files), with the
   system daemon of the first evening idle, gave P99 24.3, 27.6 and 30.3 µs and P50 2.7 to 3.6 µs.
