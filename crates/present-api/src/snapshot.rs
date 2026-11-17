@@ -41,8 +41,9 @@ pub fn snapshot_channel() -> (SnapshotWriter, SnapshotReader) {
 /// writes again.
 #[derive(Debug, Default)]
 struct Exchange {
-    /// The snapshots published after the reader's newer one, at most two, older first: an
-    /// acquire stops publishing every one published before its newer snapshot.
+    /// The snapshots published after the reader's newer one, older first: at most two once
+    /// the reader has acquired, three before. An acquire stops publishing every one published
+    /// before its newer snapshot.
     published: Vec<Published>,
     /// The buffers that are neither published, held by the reader nor being written.
     free: Vec<Arc<PresentSnapshot>>,
@@ -233,8 +234,8 @@ pub struct PresentFrame<'a> {
 
 impl<'a> PresentFrame<'a> {
     /// The older snapshot of the pair: the state a frame interpolates from. It is the
-    /// newer one itself at the first acquire, and at one made while a pass writes a
-    /// snapshot it took back (`README.md`, "The triple buffer").
+    /// newer one itself while one snapshot has been published, and at an acquire made while
+    /// a pass writes a snapshot it took back (`README.md`, "The triple buffer").
     #[must_use]
     pub const fn older(&self) -> &'a PresentSnapshot {
         self.older

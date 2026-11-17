@@ -328,8 +328,10 @@ follows is the contract the renderer's sink implements, and a test's sink checks
   leaves the base as it was.
 - The base costs one more placement per key and kind. A sink may take it lazily, at a
   key's first write in a tick, from the current placement it holds then, which no write
-  has changed since the tick's first `begin`; it then also keeps the tick it took it at,
-  and the tick of the last `begin` that dropped the bases, in which it takes none.
+  has changed since the tick's first `begin`; it then also keeps the tick it took it at
+  and how many `begin`s for that kind had dropped the bases then. A base counts only at
+  that tick and that count, and the sink takes none in the tick of the last `begin` that
+  dropped them.
 - So the first write of a tick draws the instance from where the tick before left it, and
   a later write in the same tick draws it from that same place: not from where the frame
   before showed it, and not from a placement a flagged write of the tick put there. The
@@ -447,6 +449,18 @@ follows is the contract the renderer's sink implements, and a test's sink checks
   instead, acquiring at that point every time, would never see a later snapshot. Letting
   go, it leaves the next pass a free buffer, so what that pass publishes stays published,
   and the acquire after pairs the snapshot with it.
+- A reader at the pass rate whose acquire falls inside a pass's span, between the pass's
+  taking a buffer and its publication, gets such a pair every second acquire and sees every
+  second snapshot. A pass after an acquire that returned two different snapshots finds no
+  buffer free and takes back, unseen, what the pass before it published; the acquire inside
+  it returns a window pair, which frees a buffer for the next pass, and the acquire inside
+  that one pairs with what the window's pass published. A slower reader whose acquire falls
+  there gets one every second acquire as well. Motion stays forward, and every transform of
+  a window pair has `no_interpolate` set, its two snapshots being of one tick: a stutter,
+  never a wrong draw. A frame that acquires after `publish` gets no window pair. When the
+  reader acquires is `frame-design`'s to settle; a fourth buffer would remove the window
+  pair, and architecture section 5.3's triple buffer stands unless `frame-design` shows the
+  stutter matters.
 - `PresentSnapshot::cut` is set on a snapshot nothing before it leads into:
   - the snapshot of a full pass in a `Server` or `Client` world (a load, a restore, a
     world shown for the first time);
@@ -627,7 +641,7 @@ policies and the sizes at build.
 | Removals | A despawn, an unload, a removed `MeshInstance`, a released claim: listed once, in key order; a key that left and came back is listed and written |
 | The flag | A teleport at each tick of a three-tick frame flags the row; a saved `Teleported` does not; tick zero does not; every row of a pass at a tick earlier than the previous pass's is flagged; the comparisons hold across the tick's wrap |
 | Layout and workers | The sink's rows sorted by key, and the snapshot's bytes, are equal under every layout capacity, chunk order and worker count of SOUR's modes |
-| The triple buffer | A reader that acquires every publication, every second, never, and once per two publications while the second pass writes the first's taken-back buffer: a held snapshot is never written and no pass waits; a reader that acquires every publication gets the two newest published; after the first publication no pair holds one snapshot twice except the reader's newer while a pass writes a snapshot it took back, and never two such pairs in a row; the first acquire whose newer snapshot was published since a cut has a cut as its newer one, also when a snapshot was taken back, replaced or published after it, and when the cut itself was taken back; the mark is passed by the third acquire after it that follows a publication, and in the slow cadence after one pair; a snapshot of a tick earlier than the snapshot published last is a cut in every kind, so no pair's older snapshot is of a later tick than its newer one unless that one is a cut; a prediction world's full pass at the tick published last takes that snapshot's place, keeps its cut and pairs from what it followed; a snapshot a second pass updates before `publish` keeps a cut and a full mark; with the reader dropped, `publish` keeps no event. A property test over sequences of write, publish and acquire checks these after every step, with `Arc::get_mut` asserting that the buffer the writer writes is shared with nobody: the exchange is safe Rust under one lock, so loom and Miri would check nothing the test does not |
+| The triple buffer | A reader that acquires every publication, every second, never, once per two publications while the second pass writes the first's taken-back buffer, and once per pass inside its span: a held snapshot is never written and no pass waits; a reader that acquires every publication gets the two newest published; after the first publication no pair holds one snapshot twice except the reader's newer while a pass writes a snapshot it took back, and never two such pairs in a row, and a reader that acquires once per pass inside its span gets one every second acquire and never a pair backward in time; the first acquire whose newer snapshot was published since a cut has a cut as its newer one, also when a snapshot was taken back, replaced or published after it, and when the cut itself was taken back; the mark is passed by the third acquire after it that follows a publication, and in the slow cadence after one pair; a snapshot of a tick earlier than the snapshot published last is a cut in every kind, so no pair's older snapshot is of a later tick than its newer one unless that one is a cut; a prediction world's full pass at the tick published last takes that snapshot's place, keeps its cut and pairs from what it followed; a snapshot a second pass updates before `publish` keeps a cut and a full mark; with the reader dropped, `publish` keeps no event. A property test over sequences of write, publish and acquire checks these after every step, with `Arc::get_mut` asserting that the buffer the writer writes is shared with nobody: the exchange is safe Rust under one lock, so loom and Miri would check nothing the test does not |
 | Events | Each emission is in exactly one frame's batch across skipped and taken-back snapshots; an emission and its cancellation between two acquires are in neither list; a rollback's re-emission is not delivered again |
 | The frame | `transform` for a moved, a teleported, a new and a `Client`-world row; one-tick pairs and cuts do not interpolate |
 | View-models and debug draw | `set`, `get`, `remove`, erased reads by field ID, key order; a key collision panics; a non-`derived` type does not build (a compile-fail case); the segments of each shape |
