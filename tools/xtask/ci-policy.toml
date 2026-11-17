@@ -17,9 +17,13 @@ crates = [
 # crates/core/clippy.toml. The proc-macro crates do, because the code they write is compiled
 # inside boundary crates and should be written under the same lints. The headless binary
 # does, because its sketch game declares what a world registers and runs, which `cargo xtask
-# boundary` allows only under this file (project review 2, X1).
+# boundary` allows only under this file (project review 2, X1). The presentation interface
+# does, because it declares the presentation components and extract's pass system, which
+# every world registers (D152; docs/plans/milestone-2.md, decision 5.18).
 [lint_file_carriers]
-crates = ["lactose-reflect-macros", "lactose-ecs-macros", "lactose-app-headless"]
+crates = [
+  "lactose-reflect-macros", "lactose-ecs-macros", "lactose-app-headless", "lactose-present-api",
+]
 
 # Architecture section 8.3: the shipped binaries, whose boundary feature trees must be
 # identical to each other and to those of the [harness] packages. Every workspace package

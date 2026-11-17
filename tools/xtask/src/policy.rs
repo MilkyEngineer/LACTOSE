@@ -93,7 +93,12 @@ mod tests {
         assert!(policy.unsafe_crates.contains(&"lactose-core".to_owned()));
         assert_eq!(
             policy.lint_file_carriers,
-            ["lactose-reflect-macros", "lactose-ecs-macros", "lactose-app-headless"]
+            [
+                "lactose-reflect-macros",
+                "lactose-ecs-macros",
+                "lactose-app-headless",
+                "lactose-present-api",
+            ]
         );
         assert!(!policy.harness_tests.is_empty());
         assert_eq!(policy.miri_split, ["lactose-ecs"]);

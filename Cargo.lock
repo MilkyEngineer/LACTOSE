@@ -655,6 +655,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "lactose-present-api"
+version = "0.0.0"
+dependencies = [
+ "lactose-asset-api",
+ "lactose-core",
+ "lactose-ecs",
+ "lactose-math",
+ "lactose-physics-api",
+ "lactose-predict",
+ "lactose-reflect",
+ "lactose-sim",
+]
+
+[[package]]
 name = "lactose-reflect"
 version = "0.0.0"
 dependencies = [
