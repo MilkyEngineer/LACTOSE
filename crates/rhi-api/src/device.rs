@@ -46,9 +46,10 @@ pub trait Device: Send + Sync {
     /// `ErrorKind::ResourceExhausted` when the device has no memory for it.
     fn create_buffer(&self, desc: &BufferDesc<'_>) -> Result<BufferHandle>;
 
-    /// Destroys a buffer. Refused while a pending submit uses it
-    /// ([`Rule::Pending`](crate::Rule::Pending)): the caller waits for the timeline value
-    /// that frees it.
+    /// Destroys a buffer. Refused on every backend while a pending submit uses it
+    /// ([`Rule::Pending`](crate::Rule::Pending)), the caller waiting for the timeline value
+    /// that frees it, and while a host access to it is in progress
+    /// ([`Rule::HostOverlap`](crate::Rule::HostOverlap)).
     fn destroy_buffer(&self, buffer: BufferHandle) -> Result<()>;
 
     /// The buffer's device address: the same value for as long as the buffer lives, and
@@ -64,10 +65,10 @@ pub trait Device: Send + Sync {
     /// byte of the range and reads none.
     ///
     /// Calls on ranges of one buffer that do not overlap may run at once on several
-    /// threads. A call whose range overlaps one in progress is refused
-    /// ([`Rule::HostOverlap`](crate::Rule::HostOverlap)), and so is `fill` calling the
-    /// device for the same buffer. A range outside the buffer is refused on every backend
-    /// ([`Rule::Bounds`](crate::Rule::Bounds)).
+    /// threads. A call whose range overlaps one in progress is refused, and so is `fill`
+    /// calling the device for the same buffer, a destroy of it included
+    /// ([`Rule::HostOverlap`](crate::Rule::HostOverlap)). A range outside the buffer is
+    /// refused ([`Rule::Bounds`](crate::Rule::Bounds)). Both on every backend.
     fn write_buffer(
         &self,
         buffer: BufferHandle,
@@ -80,8 +81,10 @@ pub trait Device: Send + Sync {
     /// length of the call: `read` is called once, with exactly that range, which holds
     /// what completed submits wrote once
     /// [`invalidate_buffer`](Self::invalidate_buffer) has covered it. The buffer is in
-    /// `HostRead`, and no pending submit writes it. Overlap and bounds are as
-    /// [`write_buffer`](Self::write_buffer)'s.
+    /// `HostRead`. A call while a pending submit writes the buffer, by a copy into it or
+    /// a pass that declares it `ShaderWrite`, is refused on every backend
+    /// ([`Rule::Pending`](crate::Rule::Pending)): the bytes lent are never ones the device
+    /// may be writing. Overlap and bounds are as [`write_buffer`](Self::write_buffer)'s.
     fn read_buffer(
         &self,
         buffer: BufferHandle,
@@ -111,8 +114,8 @@ pub trait Device: Send + Sync {
     /// them ([`Rule::Usage`](crate::Rule::Usage)).
     fn create_image(&self, desc: &ImageDesc<'_>) -> Result<ImageHandle>;
 
-    /// Destroys an image. Refused while a pending submit uses it or a heap slot holds it
-    /// ([`Rule::Pending`](crate::Rule::Pending)).
+    /// Destroys an image. Refused on every backend while a pending submit uses it or a
+    /// heap slot holds it ([`Rule::Pending`](crate::Rule::Pending)).
     fn destroy_image(&self, image: ImageHandle) -> Result<()>;
 
     /// Whether the image has no memory outside its pass: `true` only for an image made
@@ -120,6 +123,12 @@ pub trait Device: Send + Sync {
     fn image_memoryless(&self, image: ImageHandle) -> Result<bool>;
 
     /// What a block must offer an image made from `desc`, whatever `desc.memory` says.
+    /// Every block takes any image this accepts.
+    ///
+    /// # Errors
+    ///
+    /// `ErrorKind::Unsupported` for an image no block can hold, such as one the driver
+    /// gives memory of its own alone.
     fn image_placement(&self, desc: &ImageDesc<'_>) -> Result<Placement>;
 
     /// Makes a block of device memory for images to be placed in.
@@ -129,14 +138,15 @@ pub trait Device: Send + Sync {
     /// `ErrorKind::ResourceExhausted` when the device has no memory for it.
     fn create_memory_block(&self, desc: &MemoryBlockDesc<'_>) -> Result<MemoryBlockHandle>;
 
-    /// Destroys a block. Refused while an image placed in it lives
+    /// Destroys a block. Refused on every backend while an image placed in it lives
     /// ([`Rule::Pending`](crate::Rule::Pending)).
     fn destroy_memory_block(&self, block: MemoryBlockHandle) -> Result<()>;
 
     /// Puts `image`, whole, in a heap slot. The image's usage holds `SAMPLED`. The write
-    /// is seen by every submit made after the call returns. Refused while a pass of a
-    /// pending submit declares the slot ([`Rule::HeapWrite`](crate::Rule::HeapWrite)): a
-    /// slot is written again only after the timeline value that frees it.
+    /// is seen by every submit made after the call returns. Refused on every backend while
+    /// a pass of a pending submit declares the slot
+    /// ([`Rule::HeapWrite`](crate::Rule::HeapWrite)): a slot is written again only after
+    /// the timeline value that frees it.
     fn write_heap_slot(&self, slot: HeapSlot, image: ImageHandle) -> Result<()>;
 
     /// Empties a heap slot, under the rule of [`write_heap_slot`](Self::write_heap_slot).
@@ -150,8 +160,9 @@ pub trait Device: Send + Sync {
     /// `ErrorKind::ResourceExhausted` when the table is full.
     fn create_sampler(&self, desc: &SamplerDesc) -> Result<SamplerIndex>;
 
-    /// Frees a sampler's index for reuse. The caller frees it only after every submit
-    /// whose shaders may index it has completed; no backend can check that.
+    /// Frees a sampler's index for reuse. A sampler has no declaration, so any pending
+    /// submit may use it: refused on every backend while a submit made before the call is
+    /// pending ([`Rule::Pending`](crate::Rule::Pending)).
     fn destroy_sampler(&self, sampler: SamplerIndex) -> Result<()>;
 
     /// Makes a graphics pipeline.
@@ -176,12 +187,12 @@ pub trait Device: Send + Sync {
         desc: &ComputePipelineDesc<'_>,
     ) -> Result<ComputePipelineHandle>;
 
-    /// Destroys a graphics pipeline. Refused while a pending submit uses it
-    /// ([`Rule::Pending`](crate::Rule::Pending)).
+    /// Destroys a graphics pipeline. Refused on every backend while a pending submit uses
+    /// it ([`Rule::Pending`](crate::Rule::Pending)).
     fn destroy_graphics_pipeline(&self, pipeline: GraphicsPipelineHandle) -> Result<()>;
 
-    /// Destroys a compute pipeline. Refused while a pending submit uses it
-    /// ([`Rule::Pending`](crate::Rule::Pending)).
+    /// Destroys a compute pipeline. Refused on every backend while a pending submit uses
+    /// it ([`Rule::Pending`](crate::Rule::Pending)).
     fn destroy_compute_pipeline(&self, pipeline: ComputePipelineHandle) -> Result<()>;
 
     /// The driver's pipeline cache as it is now, sealed
@@ -197,16 +208,16 @@ pub trait Device: Send + Sync {
     /// Makes a timeline whose value is `initial`.
     fn create_timeline(&self, initial: u64) -> Result<TimelineHandle>;
 
-    /// Destroys a timeline. Refused while a pending submit waits for or signals it
-    /// ([`Rule::Pending`](crate::Rule::Pending)).
+    /// Destroys a timeline. Refused on every backend while a pending submit waits for or
+    /// signals it ([`Rule::Pending`](crate::Rule::Pending)).
     fn destroy_timeline(&self, timeline: TimelineHandle) -> Result<()>;
 
     /// The timeline's value now. It never decreases.
     fn timeline_value(&self, timeline: TimelineHandle) -> Result<u64>;
 
     /// Signals a point from the host: the timeline's value becomes `point.value`, which
-    /// is greater than any it has reached or been promised
-    /// ([`Rule::Timeline`](crate::Rule::Timeline)).
+    /// is greater than any it has reached or been promised, or the call is refused on
+    /// every backend ([`Rule::Timeline`](crate::Rule::Timeline)).
     fn signal_timeline(&self, point: TimelinePoint) -> Result<()>;
 
     /// Blocks until the point is reached or `timeout` has passed, and returns whether it
@@ -225,7 +236,8 @@ pub trait Device: Send + Sync {
     /// Submits to the queue that serves `queue`: `Graphics` or `Compute`. The present
     /// role is submitted to through [`Swapchain::present`] alone
     /// ([`Rule::PresentQueue`](crate::Rule::PresentQueue)). Submits to one queue run in
-    /// the order the calls return; it is the caller that orders two threads' submits.
+    /// the order the calls return; it is the caller that orders two threads' submits. A
+    /// submit with no encoders is valid: it waits and signals.
     ///
     /// # Errors
     ///

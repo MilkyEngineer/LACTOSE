@@ -44,8 +44,9 @@ pub struct Case {
     /// without the rule fails it.
     pub refuses: Option<Rule>,
     /// Whether a device backend runs the case. `false` for a case that provokes a check
-    /// the null backend alone makes: on a device the same calls are the driver's
-    /// undefined behaviour, and prove nothing.
+    /// the null backend alone makes, whose breach on a device gives a wrong image and
+    /// proves nothing, and for one that holds null's own meaning of a pending submit, one
+    /// whose completion the caller has not yet seen (`README.md`, "Queues by role").
     pub devices: bool,
 }
 
@@ -145,20 +146,24 @@ pub const CASES: &[Case] = cases! {
     contract "buffer_address_is_stable_and_distinct";
     contract "host_ranges_that_do_not_overlap_are_written_at_once";
     contract "overlapping_host_access_is_refused" => HostOverlap everywhere;
+    contract "destroy_during_host_access_is_refused" => HostOverlap everywhere;
     contract "host_range_outside_the_buffer_is_refused" => Bounds everywhere;
     contract "host_access_outside_the_memory_class_is_refused" => Usage everywhere;
     contract "address_of_a_buffer_without_the_usage_is_refused" => Usage everywhere;
+    contract "read_under_a_pending_writer_is_refused" => Pending everywhere;
     contract "unflushed_range_at_a_submit_is_refused" => Unflushed;
     contract "flush_and_invalidate_are_accepted_where_memory_is_coherent";
-    contract "buffer_use_outside_its_usage_is_refused" => Usage;
+    contract "buffer_use_outside_its_usage_is_refused" => Usage everywhere;
     output "device_memory_is_filled_through_a_staging_copy";
     // Images, memoryless requests and aliased transients.
-    contract "image_use_outside_its_usage_is_refused" => Usage;
+    contract "image_use_outside_its_usage_is_refused" => Usage everywhere;
     contract "memoryless_outcome_is_queryable_and_as_reported";
     contract "memoryless_request_without_transient_is_refused" => Usage everywhere;
-    contract "memoryless_attachment_stored_is_refused" => MemorylessStore;
+    contract "memoryless_attachment_stored_is_refused" => MemorylessStore everywhere;
+    contract "memoryless_attachment_kept_is_refused" => MemorylessStore everywhere;
     contract "memoryless_attachment_after_a_local_read_is_refused_where_lost" => Split;
     contract "placement_outside_the_block_is_refused" => Bounds everywhere;
+    contract "destroy_of_a_block_an_image_is_placed_in_is_refused" => Pending everywhere;
     contract "aliased_image_used_without_the_alias_call_is_refused" => Alias;
     contract "alias_read_before_its_first_write_is_refused" => UndefinedRead;
     contract "aliases_used_in_turn_with_the_alias_call_pass";
@@ -168,6 +173,7 @@ pub const CASES: &[Case] = cases! {
     // States and queues.
     contract "transition_from_another_state_is_refused" => State;
     contract "use_in_another_state_is_refused" => State;
+    contract "use_after_a_write_without_a_transition_is_refused" => State;
     contract "state_is_kept_for_each_mip_and_layer";
     contract "state_follows_submission_order_not_recording_order";
     contract "cross_queue_use_without_a_transfer_is_refused" => Queue;
@@ -179,9 +185,12 @@ pub const CASES: &[Case] = cases! {
     output "ownership_transfer_keeps_the_contents";
     // The heap, the sampler table and what a pass declares.
     contract "heap_slot_outside_the_heap_is_refused" => Bounds everywhere;
+    contract "declared_slot_empty_is_refused" => HeapLayout everywhere;
     contract "declared_slot_not_in_sampled_read_is_refused" => HeapLayout;
-    contract "heap_write_under_a_pending_reader_is_refused" => HeapWrite;
+    contract "heap_write_under_a_pending_reader_is_refused" => HeapWrite everywhere;
     contract "heap_write_after_its_reader_completes_passes";
+    contract "destroy_of_an_image_a_slot_holds_is_refused" => Pending everywhere;
+    contract "sampler_destroyed_under_a_pending_submit_is_refused" => Pending everywhere;
     contract "undeclared_slot_argument_is_refused" => Undeclared;
     contract "undeclared_address_argument_is_refused" => Undeclared;
     contract "declared_buffer_in_another_state_is_refused" => State;
@@ -197,6 +206,7 @@ pub const CASES: &[Case] = cases! {
     contract "shader_for_another_heap_is_refused";
     contract "shader_target_the_backend_does_not_run_is_unsupported";
     contract "constant_of_another_length_is_refused";
+    contract "pipeline_of_other_formats_than_its_pass_is_refused" => Usage everywhere;
     contract "sealed_cache_round_trips";
     contract "cache_corrupt_truncated_or_foreign_starts_empty";
     output "specialised_constant_changes_the_output";
@@ -207,28 +217,43 @@ pub const CASES: &[Case] = cases! {
     contract "encoder_recorded_on_another_thread_submits";
     contract "encoder_reset_while_pending_is_refused" => Pending everywhere;
     contract "encoder_in_two_submits_is_refused" => Encoding everywhere;
+    contract "encoder_resubmitted_without_reset_is_refused" => Encoding everywhere;
+    contract "recording_while_pending_is_refused_at_submit" => Encoding everywhere;
     contract "encoder_of_another_role_or_device_is_refused" => Encoding everywhere;
-    contract "command_outside_its_scope_is_refused" => Encoding;
+    contract "command_outside_its_scope_is_refused" => Encoding everywhere;
+    contract "draw_with_nothing_bound_is_refused" => Encoding everywhere;
+    contract "pass_left_open_is_refused" => Encoding everywhere;
     contract "push_outside_the_block_is_refused" => Bounds everywhere;
+    contract "copy_region_outside_its_resource_is_refused" => Bounds everywhere;
     contract "refused_submit_changes_nothing";
+    contract "submit_of_no_encoders_waits_and_signals";
     contract "submit_is_pending_until_its_wait_is_reached";
     contract "timeline_is_signalled_waited_and_read_by_the_host";
     contract "timeline_wait_times_out";
-    contract "timeline_value_that_does_not_grow_is_refused" => Timeline;
-    contract "destroy_under_a_pending_submit_is_refused" => Pending;
+    contract "timeline_value_that_does_not_grow_is_refused" => Timeline everywhere;
+    contract "destroy_under_a_pending_submit_is_refused" => Pending everywhere;
+    contract "destroy_after_an_unobserved_submit_is_refused" => Pending;
     contract "use_after_destruction_is_refused" => Destroyed everywhere;
+    contract "destroyed_after_recording_is_refused_at_submit" => Destroyed everywhere;
+    contract "handle_of_another_device_is_refused" => Destroyed;
     output "two_threads_record_at_once";
     // Render passes and the local read.
     contract "input_read_without_a_local_read_is_refused" => Local;
     contract "input_read_of_another_attachment_is_refused" => LocalMap;
-    contract "attachments_of_unequal_extent_are_refused" => Usage;
+    contract "attachments_of_unequal_extent_are_refused" => Usage everywhere;
+    contract "scissor_outside_the_attachments_is_refused" => Bounds everywhere;
     output "triangle_matches_the_reference";
     output "local_read_sees_what_the_pass_wrote";
     output "clear_and_keep_load_as_described";
+    output "viewport_and_scissor_place_the_triangles";
+    output "draw_parameters_reach_the_shader";
     // Indirect draws and dispatches.
+    contract "index_buffer_offset_outside_or_unaligned_is_refused" => Bounds everywhere;
+    contract "indirect_arguments_outside_or_unaligned_are_refused" => Bounds everywhere;
     output "indexed_indirect_draw_matches_the_reference";
     output "indirect_count_draws_where_reported";
     output "dispatch_writes_through_an_address";
+    output "dispatches_of_one_pass_see_each_others_writes";
     output "dispatch_indirect_reads_its_counts";
     // The swapchain and the present role.
     contract "second_acquire_before_a_present_is_refused" => Swapchain everywhere;

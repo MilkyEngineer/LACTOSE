@@ -32,7 +32,8 @@ pub enum Load<C> {
     Clear(C),
     /// Nothing the pass may read before it writes.
     DontCare,
-    /// What the attachment held.
+    /// What the attachment held. Never the load of an attachment made with a memoryless
+    /// request ([`Rule::MemorylessStore`](crate::Rule::MemorylessStore)).
     Keep,
 }
 
@@ -194,16 +195,29 @@ impl IndexedIndirectArgs {
 /// What one thread records, and the pool its commands come from: one for each recording
 /// job and frame in flight. `Send` and not `Sync`.
 ///
-/// An encoder is recording from its creation and after each [`reset`](Self::reset). A
-/// submit that takes it makes it pending until that submit completes; a pending encoder
-/// records nothing and is in no other submit. Commands belong to a scope: outside a pass
-/// (transitions, the alias call, copies, beginning a pass), inside a render pass (draws,
-/// the local read), inside a compute pass (dispatches), inside either (binding, push
-/// constants, ending the pass). A command outside its scope is refused at the submit
-/// ([`Rule::Encoding`](crate::Rule::Encoding)).
+/// An encoder is recording from its creation and after each [`reset`](Self::reset), and
+/// is submitted once between resets. A submit that takes it makes it pending until that
+/// submit completes. From that submit to the next reset a recording call records nothing,
+/// and the encoder's next submit is refused, as is a second submit with no reset between
+/// ([`Rule::Encoding`](crate::Rule::Encoding), every backend).
+///
+/// Commands belong to a scope: outside a pass (transitions, the alias call, copies,
+/// beginning a pass), inside a render pass (draws, the local read, the viewport and the
+/// scissor, binding a graphics pipeline or an index buffer), inside a compute pass
+/// (dispatches, binding a compute pipeline), inside either (push constants, ending the
+/// pass). A command outside its scope, a draw or dispatch with no pipeline of its kind
+/// bound, an indexed draw with no index buffer bound, and a pass left open at the end are
+/// refused at the submit ([`Rule::Encoding`](crate::Rule::Encoding), every backend). After
+/// such a breach, or any other a device backend finds while recording, it records nothing
+/// more into its driver's command buffer, and the submit refuses the encoder.
 ///
 /// `Any` is a supertrait so that a backend recovers its own type from the object a submit
-/// hands it. A caller has no use for it.
+/// hands it, through the object the box holds: `&mut *encoders[i]` as a `&mut dyn Any`.
+/// The box is `Any` too, so `&mut encoders[i]` coerces the box and matches no backend's
+/// type. A caller has no use for it.
+///
+/// Dropping a pending encoder blocks until its submit completes, so an encoder is dropped
+/// off the frame workers (`README.md`, "Handles and lifetimes").
 pub trait Encoder: Any + Send {
     /// The role the encoder was created for. A submit to another role refuses it.
     fn queue(&self) -> QueueRole;
@@ -233,7 +247,9 @@ pub trait Encoder: Any + Send {
     fn alias(&mut self, image: ImageHandle);
 
     /// Copies ranges of `source`, in `CopySource`, to `destination`, in
-    /// `CopyDestination`. The two are different buffers.
+    /// `CopyDestination`. The two are different buffers. A region outside either is
+    /// refused at the submit ([`Rule::Bounds`](crate::Rule::Bounds), every backend), as
+    /// is one of the two copies below.
     fn copy_buffer(
         &mut self,
         source: BufferHandle,
@@ -274,7 +290,7 @@ pub trait Encoder: Any + Send {
     fn set_viewport(&mut self, viewport: Viewport);
 
     /// Sets the scissor of the draws that follow in the pass, inside the attachments'
-    /// extent.
+    /// extent ([`Rule::Bounds`](crate::Rule::Bounds), every backend).
     fn set_scissor(&mut self, scissor: Rect);
 
     /// Binds the pipeline of the draws that follow. Its colour and depth formats are the
@@ -285,7 +301,8 @@ pub trait Encoder: Any + Send {
     fn bind_compute_pipeline(&mut self, pipeline: ComputePipelineHandle);
 
     /// Binds the index buffer of the indexed draws that follow: 32-bit indices from
-    /// `offset`, a multiple of four, in a buffer in `Index`.
+    /// `offset`, a multiple of four inside the buffer, in a buffer in `Index`
+    /// ([`Rule::Bounds`](crate::Rule::Bounds), every backend).
     fn bind_index_buffer(&mut self, buffer: BufferHandle, offset: u64);
 
     /// Writes `bytes` into the pass's push-constant block at `offset`. The block is what
@@ -310,17 +327,28 @@ pub trait Encoder: Any + Send {
     /// ([`Rule::Local`](crate::Rule::Local)).
     fn local_read(&mut self);
 
-    /// Draws `vertices` for each of `instances`, with no index buffer.
+    /// Draws `vertices` for each of `instances`, with no index buffer. A vertex shader's
+    /// vertex id is `vertices.start` plus the vertex's number, and its instance id
+    /// `instances.start` plus the instance's number, on every backend.
     fn draw(&mut self, vertices: Range<u32>, instances: Range<u32>);
 
     /// Draws `indices` of the bound index buffer, adding `base_vertex` to each, for each
-    /// of `instances`.
+    /// of `instances`. A vertex shader's vertex id is the index plus `base_vertex`, and
+    /// its instance id `instances.start` plus the instance's number, on every backend.
+    /// The indices read lie inside the buffer ([`Rule::Bounds`](crate::Rule::Bounds),
+    /// every backend).
     fn draw_indexed(&mut self, indices: Range<u32>, base_vertex: i32, instances: Range<u32>);
 
     /// Draws `count` records ([`IndexedIndirectArgs`]) read from `arguments`, in
-    /// `Indirect`, from `offset`, `stride` bytes apart. A count above one needs
+    /// `Indirect`, from `offset`, `stride` bytes apart, each as
+    /// [`draw_indexed`](Self::draw_indexed) with the record's `first_instance` as the
+    /// instances' start. A count above one needs
     /// [`multi_draw_indirect`](crate::Capabilities::multi_draw_indirect)
-    /// ([`Rule::Capability`](crate::Rule::Capability)).
+    /// ([`Rule::Capability`](crate::Rule::Capability)). `offset` is a multiple of four,
+    /// `stride` a multiple of four and at least [`IndexedIndirectArgs::BYTES`] when
+    /// `count` is above one, and every record lies inside the buffer
+    /// ([`Rule::Bounds`](crate::Rule::Bounds), every backend). The indices a record
+    /// names are read on the device, and no backend checks them.
     fn draw_indexed_indirect(
         &mut self,
         arguments: BufferHandle,
@@ -332,7 +360,9 @@ pub trait Encoder: Any + Send {
     /// As [`draw_indexed_indirect`](Self::draw_indexed_indirect), with the count read on
     /// the device: a 32-bit value at `count_offset` of `count`, in `Indirect`, capped at
     /// `max_count`. Needs [`indirect_count`](crate::Capabilities::indirect_count)
-    /// ([`Rule::Capability`](crate::Rule::Capability)).
+    /// ([`Rule::Capability`](crate::Rule::Capability)). `count_offset` is a multiple of
+    /// four inside `count`, and `max_count` records lie inside `arguments` under the
+    /// alignment above ([`Rule::Bounds`](crate::Rule::Bounds), every backend).
     fn draw_indexed_indirect_count(
         &mut self,
         arguments: BufferHandle,
@@ -343,10 +373,14 @@ pub trait Encoder: Any + Send {
         stride: u32,
     );
 
-    /// Runs the bound compute pipeline over `groups` workgroups.
+    /// Runs the bound compute pipeline over `groups` workgroups. The dispatches of one
+    /// compute pass run in recording order, each seeing the buffer writes of those before
+    /// it.
     fn dispatch(&mut self, groups: [u32; 3]);
 
     /// Runs the bound compute pipeline over the workgroups read from `arguments`, in
-    /// `Indirect`: three little-endian 32-bit counts at `offset`.
+    /// `Indirect`: three little-endian 32-bit counts at `offset`, a multiple of four with
+    /// the twelve bytes inside the buffer ([`Rule::Bounds`](crate::Rule::Bounds), every
+    /// backend).
     fn dispatch_indirect(&mut self, arguments: BufferHandle, offset: u64);
 }

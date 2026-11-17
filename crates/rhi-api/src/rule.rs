@@ -10,12 +10,15 @@ use lactose_core::{Error, ErrorKind};
 
 /// A rule of the contract, by the name the result files and the plan give it.
 ///
-/// The null backend checks every rule. A device backend checks the ones it cannot run
-/// without and leaves the rest to its driver's validators (`README.md`, "The rules").
+/// The null backend checks every rule. A device backend checks each clause whose breach
+/// on a device would be undefined behaviour on the host, a GPU fault or an abort inside
+/// the driver; a clause whose breach is a wrong image it leaves to null's runs and the
+/// validators (`README.md`, "The rules").
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Rule {
-    /// `state`: a transition's `from` is not the state the subresource is in, or a use
-    /// needs a state the subresource is not in, in submission order.
+    /// `state`: a transition's `from` is not the state the subresource is in, a use needs
+    /// a state the subresource is not in, or a resource an earlier pass or copy wrote is
+    /// used with no transition since, in submission order.
     State,
     /// `no-qfot`: a use on a queue other than the owning one with no release and acquire
     /// between, an acquire with no release submitted, a change of a resource's state or
@@ -23,20 +26,22 @@ pub enum Rule {
     /// submit, or an alias call on another queue than the one the images it ends were
     /// used on.
     Queue,
-    /// `destroyed`: a handle whose resource has been destroyed, or which this device never
-    /// issued.
+    /// `destroyed`: a handle whose resource has been destroyed, at the call it is given to
+    /// or at the submit of an encoder that recorded it, or, on null, a handle another
+    /// device issued.
     Destroyed,
     /// `pending`: a destroy, an encoder reset or a swapchain resize while a submit that
     /// has not completed uses what it would free; a destroy of an image a heap slot still
-    /// holds, or of a block an image is still placed in.
+    /// holds, or of a block an image is still placed in; a host read of a buffer a pending
+    /// submit writes.
     Pending,
     /// `capability`: a call that needs a reported capability the device does not report.
     Capability,
     /// `usage`: a use of a resource that its descriptor's usage, memory class or format
     /// does not allow, or a descriptor no device could honour.
     Usage,
-    /// `bounds`: a range outside its buffer, image, memory block, heap or push-constant
-    /// range.
+    /// `bounds`: a range outside its buffer, image, memory block, heap, push-constant
+    /// range or attachments, or an index or indirect offset or stride off its alignment.
     Bounds,
     /// `undeclared`: a heap slot or a buffer handed to a pass through
     /// [`push_slot`](crate::Encoder::push_slot) or
@@ -47,7 +52,7 @@ pub enum Rule {
     /// since.
     Unflushed,
     /// `host-overlap`: a host access to a range of a buffer while another host access to
-    /// an overlapping range is in progress.
+    /// an overlapping range is in progress, or a destroy of the buffer while any is.
     HostOverlap,
     /// `local`: a draw whose pipeline reads input `i` with no
     /// [`local_read`](crate::Encoder::local_read) since colour attachment `i` was last
@@ -59,8 +64,8 @@ pub enum Rule {
     /// `split`: a use of a memoryless attachment after a local read in its pass, on a
     /// device that reports its contents do not survive one.
     Split,
-    /// `memoryless-store`: a memoryless attachment with a store action other than
-    /// don't-care.
+    /// `memoryless-store`: an attachment made with a memoryless request that is stored, or
+    /// loaded with [`Load::Keep`](crate::Load::Keep).
     MemorylessStore,
     /// `heap-layout`: a draw or dispatch in a pass that declares a heap slot which is empty
     /// or whose image is not in the sampled-read state.
@@ -84,8 +89,10 @@ pub enum Rule {
     /// `timeline`: a signal of a value that is not greater than every value the timeline
     /// has reached or been promised.
     Timeline,
-    /// `encoding`: a command outside the scope it belongs to, a pass left open, an encoder
-    /// of another device or role, or an encoder in a submit while it is already pending.
+    /// `encoding`: a command outside the scope it belongs to, a draw or dispatch with
+    /// nothing bound to it, a pass left open, an encoder of another device or role, an
+    /// encoder submitted again with no reset, or one recorded into between its submit and
+    /// its reset.
     Encoding,
 }
 
@@ -159,11 +166,19 @@ impl Rule {
 
     /// The rule `error` refuses a call by, or `None` when it is not a refusal: a device
     /// loss, an exhausted budget, a missing capability at creation, or bytes that failed a
-    /// check are errors of their own kinds and carry no rule.
+    /// check are errors of their own kinds and carry no rule. The first [`Refusal`] in
+    /// `error`'s chain of sources is read, so a caller that wraps a refusal in an error of
+    /// its own keeps the rule.
     #[must_use]
     pub fn of(error: &Error) -> Option<Self> {
-        let source = std::error::Error::source(error)?;
-        source.downcast_ref::<Refusal>().map(|refusal| refusal.rule)
+        let mut source = std::error::Error::source(error);
+        while let Some(error) = source {
+            if let Some(refusal) = error.downcast_ref::<Refusal>() {
+                return Some(refusal.rule);
+            }
+            source = error.source();
+        }
+        None
     }
 }
 

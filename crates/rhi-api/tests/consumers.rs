@@ -32,7 +32,7 @@ where
         adapter: None,
         surface: Some(surface),
         heap_slots: lactose_rhi_api::HEAP_SLOTS_DEFAULT,
-        samplers: 64,
+        samplers: lactose_rhi_api::SAMPLERS_DEFAULT,
         pipeline_cache: Vec::new(),
         messages,
     }
@@ -52,12 +52,16 @@ impl RenderSide {
 }
 
 /// `lactose-render-graph`: one recording job on a frame worker. The encoder moves to the
-/// worker, records a pass under derived transitions, and comes back for the submit.
+/// worker, records a pass under derived transitions, and comes back for the submit. The
+/// pass's first pipeline writes colour attachment 0; after the local read a second one
+/// reads it as input 0 and writes attachment 1, since no pipeline reads an input and
+/// writes the attachment of the same index.
 fn record_pass(
     mut encoder: Box<dyn Encoder>,
     colour: ImageHandle,
     transient: ImageHandle,
-    pipeline: GraphicsPipelineHandle,
+    g_buffer: GraphicsPipelineHandle,
+    lighting: GraphicsPipelineHandle,
     reach: PassReach<'_>,
 ) -> Box<dyn Encoder> {
     let queue = encoder.queue();
@@ -96,10 +100,11 @@ fn record_pass(
         depth: None,
         reach,
     });
-    encoder.bind_graphics_pipeline(pipeline);
+    encoder.bind_graphics_pipeline(g_buffer);
     encoder.draw(0..3, 0..1);
     // Input 0 is colour attachment 0, and reads what the draw above wrote.
     encoder.local_read();
+    encoder.bind_graphics_pipeline(lighting);
     encoder.draw(0..3, 0..1);
     encoder.end_pass();
     encoder
@@ -254,7 +259,9 @@ fn create(device: &dyn Device, extent: Extent) -> Result<(BufferHandle, ImageHan
 /// `lactose-platform`'s present thread and `swapchain` (decision 5.6): it acquires with
 /// no timeout of its own, takes the newest finished target across from the frame's queue,
 /// draws it into the swapchain image by the surface's format, presents with the submit,
-/// and signals that its read is done so the frame may take the target back.
+/// and signals that its read is done so the frame may take the target back. On a stale
+/// surface it waits for its last present before the resize, which is refused while one
+/// is pending.
 fn present_once(
     device: &dyn Device,
     swapchain: &mut dyn Swapchain,
@@ -264,11 +271,17 @@ fn present_once(
     target_slot: HeapSlot,
     finished: TimelinePoint,
     read_done: TimelinePoint,
+    last_read_done: Option<TimelinePoint>,
 ) -> Result<bool> {
     let image = match swapchain.acquire()? {
         Acquired::Image(image) => image,
         Acquired::None => return Ok(true),
         Acquired::Stale => {
+            if let Some(last) = last_read_done
+                && !device.wait_timeline(last, Duration::from_secs(1))?
+            {
+                return Ok(true);
+            }
             swapchain.resize(swapchain.extent())?;
             return Ok(true);
         }
@@ -365,9 +378,16 @@ mod backend {
         fn message(&self, message: &Message<'_>) {}
     }
 
-    fn own(encoders: &mut [Box<dyn Encoder>]) -> Option<&mut SketchEncoder> {
-        let first: &mut dyn Any = &mut *encoders[0];
-        first.downcast_mut::<SketchEncoder>()
+    /// The backend's own encoders, or `None` when one is another backend's. Through the
+    /// object each box holds: `&mut encoders[i]` would coerce the box itself to `Any`.
+    fn own(encoders: &mut [Box<dyn Encoder>]) -> Option<Vec<&mut SketchEncoder>> {
+        encoders
+            .iter_mut()
+            .map(|encoder| {
+                let object: &mut dyn Any = &mut **encoder;
+                object.downcast_mut::<SketchEncoder>()
+            })
+            .collect()
     }
 
     impl Device for Sketch {
@@ -489,8 +509,9 @@ mod backend {
             Ok(Box::new(SketchEncoder { queue, commands: Vec::new() }))
         }
         fn submit(&self, queue: QueueRole, submit: Submit<'_>) -> Result<()> {
+            // A submit of no encoders waits and signals alone.
             match own(submit.encoders) {
-                Some(encoder) if encoder.queue == queue => Ok(()),
+                Some(encoders) if encoders.iter().all(|encoder| encoder.queue == queue) => Ok(()),
                 _ => Err(Rule::Encoding.refuse("an encoder of another device or role")),
             }
         }

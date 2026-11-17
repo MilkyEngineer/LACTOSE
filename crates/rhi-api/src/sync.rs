@@ -30,7 +30,7 @@ pub struct TimelinePoint {
 pub struct Submit<'a> {
     /// The encoders, each recording, each of the submit's role and of this device. A
     /// submit that takes them makes them pending; an encoder that recorded nothing adds
-    /// nothing.
+    /// nothing, and a submit with none waits and signals alone.
     pub encoders: &'a mut [Box<dyn Encoder>],
     /// The points the device waits for before it runs anything of the submit.
     pub waits: &'a [TimelinePoint],

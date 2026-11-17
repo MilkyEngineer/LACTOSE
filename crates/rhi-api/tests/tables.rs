@@ -32,6 +32,15 @@ fn refusal_names_its_rule_and_nothing_else_does() {
 }
 
 #[test]
+fn a_wrapped_refusal_keeps_its_rule() {
+    let refusal = Rule::Pending.refuse("a destroy under a pending submit");
+    let once = Error::new(ErrorKind::InvalidData, "the frame's teardown").with_source(refusal);
+    assert_eq!(Rule::of(&once), Some(Rule::Pending));
+    let twice = Error::new(ErrorKind::InvalidData, "the render side").with_source(once);
+    assert_eq!(Rule::of(&twice), Some(Rule::Pending));
+}
+
+#[test]
 fn roles_resolve_by_the_layout() {
     let roles = [QueueRole::Graphics, QueueRole::Compute, QueueRole::Present];
     for role in roles {
@@ -62,6 +71,70 @@ fn indirect_record_is_five_little_endian_words() {
     assert_eq!(bytes[16..20], [9, 0, 0, 0]);
 }
 
+/// The refusal cases a device backend runs: one or more for each clause of the rules
+/// table's "Every backend" column.
+const EVERYWHERE: [&str; 44] = [
+    "unreported_capability_is_refused",
+    "submit_to_the_present_role_is_refused",
+    "overlapping_host_access_is_refused",
+    "destroy_during_host_access_is_refused",
+    "host_range_outside_the_buffer_is_refused",
+    "host_access_outside_the_memory_class_is_refused",
+    "address_of_a_buffer_without_the_usage_is_refused",
+    "read_under_a_pending_writer_is_refused",
+    "buffer_use_outside_its_usage_is_refused",
+    "image_use_outside_its_usage_is_refused",
+    "memoryless_request_without_transient_is_refused",
+    "memoryless_attachment_stored_is_refused",
+    "memoryless_attachment_kept_is_refused",
+    "placement_outside_the_block_is_refused",
+    "destroy_of_a_block_an_image_is_placed_in_is_refused",
+    "heap_slot_outside_the_heap_is_refused",
+    "declared_slot_empty_is_refused",
+    "heap_write_under_a_pending_reader_is_refused",
+    "destroy_of_an_image_a_slot_holds_is_refused",
+    "sampler_destroyed_under_a_pending_submit_is_refused",
+    "pipeline_of_other_formats_than_its_pass_is_refused",
+    "encoder_reset_while_pending_is_refused",
+    "encoder_in_two_submits_is_refused",
+    "encoder_resubmitted_without_reset_is_refused",
+    "recording_while_pending_is_refused_at_submit",
+    "encoder_of_another_role_or_device_is_refused",
+    "command_outside_its_scope_is_refused",
+    "draw_with_nothing_bound_is_refused",
+    "pass_left_open_is_refused",
+    "push_outside_the_block_is_refused",
+    "copy_region_outside_its_resource_is_refused",
+    "timeline_value_that_does_not_grow_is_refused",
+    "destroy_under_a_pending_submit_is_refused",
+    "use_after_destruction_is_refused",
+    "destroyed_after_recording_is_refused_at_submit",
+    "attachments_of_unequal_extent_are_refused",
+    "scissor_outside_the_attachments_is_refused",
+    "index_buffer_offset_outside_or_unaligned_is_refused",
+    "indirect_arguments_outside_or_unaligned_are_refused",
+    "second_acquire_before_a_present_is_refused",
+    "present_of_an_image_not_acquired_is_refused",
+    "second_swapchain_is_refused",
+    "resize_with_a_present_pending_is_refused",
+    "image_of_before_a_resize_is_refused",
+];
+
+#[test]
+fn readme_names_every_case_and_every_device_refusal() {
+    let readme = include_str!("../README.md");
+    for case in CASES {
+        assert!(readme.contains(&format!("`{}`", case.name)), "{}", case.name);
+    }
+    // The paragraph of the README that lists the refusals a device runs.
+    let start = readme.find("The refusal cases a device backend also runs").expect("the list");
+    let end = readme[start..].find("\n\n").expect("its end");
+    let list = &readme[start..start + end];
+    for name in EVERYWHERE {
+        assert!(list.contains(&format!("`{name}`")), "{name}");
+    }
+}
+
 #[test]
 fn conformance_table_is_consistent() {
     let names: BTreeSet<&str> = CASES.iter().map(|case| case.name).collect();
@@ -77,9 +150,13 @@ fn conformance_table_is_consistent() {
         // The only cases a device backend does not run are refusals null alone makes.
         assert!(case.devices || case.refuses.is_some(), "{}", case.name);
     }
-    // The refusals every backend makes: the README's list, by count.
-    let everywhere = CASES.iter().filter(|case| case.devices && case.refuses.is_some());
-    assert_eq!(everywhere.count(), 19);
+    // The refusals every backend makes, by name.
+    let everywhere: BTreeSet<&str> = CASES
+        .iter()
+        .filter(|case| case.devices && case.refuses.is_some())
+        .map(|case| case.name)
+        .collect();
+    assert_eq!(everywhere, BTreeSet::from(EVERYWHERE));
     // Every rule has a contract case that fails on a backend built without it.
     for rule in Rule::ALL {
         assert!(

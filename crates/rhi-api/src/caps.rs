@@ -85,7 +85,8 @@ pub struct Capabilities {
     /// Whether a shader may use 64-bit atomic operations on buffer memory. The facade has
     /// no call that depends on it: the renderer chooses its shader by it.
     pub buffer_atomics_64: bool,
-    /// Whether a memoryless request for a colour attachment is honoured.
+    /// Whether a memoryless request for a colour attachment whose usage holds `INPUT` is
+    /// honoured: the G-buffer's. A colour image without `INPUT` is no case of it.
     pub memoryless_colour: bool,
     /// Whether a memoryless request for a depth attachment is honoured.
     pub memoryless_depth: bool,
@@ -111,8 +112,8 @@ pub struct Capabilities {
 
 impl Capabilities {
     /// The least a device may report: no optional capability, one queue, coherent memory,
-    /// a heap of [`HEAP_SLOTS_DEFAULT`] slots, a sampler table of 64 and four colour
-    /// attachments. A test starts from it and sets the fields its case is about.
+    /// a heap of [`HEAP_SLOTS_DEFAULT`] slots, a sampler table of [`SAMPLERS_DEFAULT`] and
+    /// four colour attachments. A test starts from it and sets the fields its case is about.
     pub const LEAST: Self = Self {
         multi_draw_indirect: false,
         indirect_count: false,
@@ -123,7 +124,7 @@ impl Capabilities {
         coherent_host_memory: true,
         queues: QueueLayout::ONE,
         heap_slots: HEAP_SLOTS_DEFAULT,
-        samplers: 64,
+        samplers: SAMPLERS_DEFAULT,
         colour_attachments: 4,
     };
 }
@@ -131,6 +132,11 @@ impl Capabilities {
 /// The heap capacity the cooked shaders of milestone 2 are compiled for: the fixed array's
 /// length in the form the native Metal spike chose.
 pub const HEAP_SLOTS_DEFAULT: u32 = 1024;
+
+/// The sampler table's capacity the cooked shaders of milestone 2 are compiled for: the
+/// sampler array's length, which a pipeline's creation compares with the device's
+/// [`samplers`](Capabilities::samplers).
+pub const SAMPLERS_DEFAULT: u32 = 64;
 
 /// The least number of images an offscreen target the present thread reads is made of
 /// (milestone 2 plan, decision 5.6): the present thread holds one, and the frame renders

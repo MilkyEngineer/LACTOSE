@@ -86,7 +86,7 @@ mod sync;
 
 pub use caps::{
     Capabilities, DeviceInfo, DeviceRequest, HEAP_SLOTS_DEFAULT, OFFSCREEN_TARGET_IMAGES_MIN,
-    QueueLayout, QueuePath, QueueRole,
+    QueueLayout, QueuePath, QueueRole, SAMPLERS_DEFAULT,
 };
 pub use device::Device;
 pub use encoder::{
