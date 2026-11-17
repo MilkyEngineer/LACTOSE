@@ -666,6 +666,7 @@ dependencies = [
  "lactose-predict",
  "lactose-reflect",
  "lactose-sim",
+ "lactose-task",
 ]
 
 [[package]]

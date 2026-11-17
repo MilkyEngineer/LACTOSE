@@ -33,6 +33,10 @@ lactose-sim.workspace = true
 # passes only while `EXCLUSIVE_SYSTEMS` lists extract's key: the list is `lactose-predict`'s
 # and the system is this crate's, so the test is what holds the two together.
 lactose-predict.workspace = true
+# The recorded test builds its executor the way a SOUR test does (`ChaosConfig`); a
+# dev-dependency, so the boundary allowlist is untouched and the library names nothing of
+# `task`.
+lactose-task.workspace = true
 
 # The integration tests as one test binary, whose root declares the files of tests/ as
 # modules (D150).
