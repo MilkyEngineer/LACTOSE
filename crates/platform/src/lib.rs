@@ -29,6 +29,7 @@
 //! A client binary, by thread, with the shutdown of `README.md`, "Shutdown", step by step:
 //!
 //! ```no_run
+//! use std::mem::ManuallyDrop;
 //! use std::sync::{Arc, mpsc};
 //! use std::time::{Duration, Instant};
 //!
@@ -146,7 +147,7 @@
 //!     ran.and(last).and(stopped).and(dropped)
 //! }
 //!
-//! /// How long a step of the shutdown, or `main` after an error from `run`, waits.
+//! /// How long a step of the shutdown waits; `main` waits three after an error from `run`.
 //! const BOUND: Duration = Duration::from_secs(2);
 //!
 //! /// Stands for the client's warning on `lactose_platform::LOG_TARGET`.
@@ -157,7 +158,9 @@
 //! /// Step 4 on a thread of its own, made through the executor's platform, since it may
 //! /// block and no worker may. It hands the device back if its last points were reached
 //! /// within the bound; otherwise it logs, hands back nothing and drops the device itself,
-//! /// a drop that may block while the main thread answers. The root looks on a timer.
+//! /// a drop that may block while the main thread answers. The root looks on a timer. If
+//! /// the platform makes no thread, its error ends step 4 and the device is dropped on the
+//! /// calling worker, where its drop may block; the pump's warning shows the stall.
 //! async fn settle(executor: &Executor, device: Arc<Device>) -> Result<Option<Arc<Device>>> {
 //!     let (answer, answered) = mpsc::channel();
 //!     let spec = ThreadSpec {
@@ -204,20 +207,24 @@
 //!     //    holds the device or the window.
 //!     if let Err(error) = pump.run() {
 //!         // The steps run with no pump, and their main-lane calls resolve to `Cancelled`.
-//!         // The root is awaited on a thread of its own within a bound; past it `main`
-//!         // logs and returns the error with the root neither dropped nor shut down, and
-//!         // the process ends with it, as it does with the leaked window.
+//!         // The root is awaited on a thread of its own within a bound longer than steps
+//!         // 2 and 4's together; past it `main` logs and returns the error with the root
+//!         // neither dropped nor shut down, and the process ends with it, as it does with
+//!         // the leaked window. A platform that makes no thread drops the body unrun,
+//!         // which leaks the root rather than dropping it here.
 //!         let (answer, answered) = mpsc::channel();
 //!         let waiter = executor.clone();
+//!         let task = ManuallyDrop::new(task);
 //!         let spec = ThreadSpec {
 //!             name: "root".to_owned(),
 //!             class: ThreadClass::Background,
 //!             index_in_class: 0,
 //!         };
 //!         let waited = platform.spawn_thread(spec, Box::new(move || {
+//!             let task = ManuallyDrop::into_inner(task);
 //!             let _ = answer.send(waiter.block_on(task));
 //!         }));
-//!         match waited.map(|_| answered.recv_timeout(BOUND)) {
+//!         match waited.map(|_| answered.recv_timeout(3 * BOUND)) {
 //!             Ok(Ok(_)) => executor.shutdown(),
 //!             _ => warn("the root did not end within its bound after `run` failed"),
 //!         }

@@ -58,7 +58,7 @@ handle traits are `raw-window-handle`'s.
 | `lactose-app-client` (`frame-impl`) | A `main` that gives its thread to the operating system and gets it back; a window to make the device from; the thread that presents; the platform for `Workers::platform`; a shutdown that cannot destroy the window under a surface, and that cannot hang without a warning | `event_pump`, `EventPump::run`; a main-lane call with `MainThread::window`; `present_thread`; `ClientPlatform`; `MainThread::exit` queued first, `PresentThread::stop`, and `run` returning only once the window is let go ("Shutdown") |
 | `lactose-app` (`frame-design`), which may not name this crate (decision 5.11) | To queue a present and learn when it returned, with no blocking wait; to keep at most one present in flight; to learn of a resize and a close without keeping the window open | `lactose_task::Lane<S>` over a state of its own, handed to it by the binary; `LaneCall` resolving when the call returned ("The present thread and its pump"); `WindowReports`, which the binary adapts to whatever `app` declares, two reads with no queue to drain and no `Arc<Window>` held |
 | `lactose-renderer`, or whichever crate owns what presents | The swapchain and the pass that draws a finished target into its image on one thread, without naming this crate | The state `S` of `present_thread` is any `Send + 'static` type; a call is lent `&mut S` on the present thread and nowhere else |
-| `lactose-rhi-vulkan` and every graphics backend (`rhi-api`) | A window without naming this crate; which thread reads the handles; a window that outlives every use of them; a window thread that answers while a swapchain is made, resized or destroyed | `Window` is `HasWindowHandle + HasDisplayHandle + Send + Sync + 'static`; the handles are lent inside a main-lane call, where the client calls the backend's constructor; the pump destroys the window only after the last `Arc<Window>` is dropped; the main thread never waits for another thread ("Threads") |
+| `lactose-rhi-vulkan` and every graphics backend (`rhi-api`) | A window without naming this crate; which thread reads the handles; a window that outlives every use of them; a window thread that answers while a swapchain is made, resized or destroyed | `Window` is `HasWindowHandle + HasDisplayHandle + Send + Sync + 'static`; the handles are lent inside a main-lane call, where the client calls the backend's constructor; the pump destroys the window only after the last `Arc<Window>` is dropped; the main thread never waits for another thread while it pumps ("Threads") |
 | The `swapchain` lane's tests (this crate's `tests/`, as a subprocess) | A window and a present thread in a process of their own; a resize it can ask for; a drawable it can make block; a block it can time; a shutdown with frames in flight | `event_pump` and `present_thread` from the subprocess's `main`; `MainThread::request_size`, `MainThread::set_minimised` and `MainThread::is_minimised`, which tells a refused minimise from a drawable that does not block; a call that returns how long it took; `PresentThread::stop`, ordered behind every call queued before it |
 | `platform-impl` | A contract for every body; where its `unsafe` goes; what it may choose | "Behaviour the signatures cannot express"; `SAFETY.md`; the windowing library, its pin and its features are its own, and no signature names them |
 | `lactose-task` | Its two sentences on the lanes' owners kept: the platform thread owns the main-thread pump and drains it from its event loop, the present thread owns its own, and dedicated threads are made through the executor's platform | `EventPump` holds the `LanePump<MainThread>`; the present thread makes its `LanePump<S>` itself; `present_thread` takes `&dyn Platform` |
@@ -116,9 +116,10 @@ let root = executor.spawn(WorkerClass::FrameCritical, async move {
 
 if let Err(error) = pump.run() {  // 6. until `exit`, and until the window is let go
     // No pump now: the steps' main-lane calls resolve to `Cancelled`, and the root is
-    // awaited on a thread of its own within a bound, past which `main` logs and returns.
+    // awaited on a thread of its own within a bound longer than steps 2 and 4's together,
+    // past which `main` logs and returns. A thread that is never made leaks the root.
     let root = on_a_thread_of_its_own(&executor, move |executor| executor.block_on(root));
-    match root.recv_timeout(BOUND) {
+    match root.recv_timeout(3 * BOUND) {
         Ok(_) => executor.shutdown(),
         Err(_) => tracing::warn!(target: LOG_TARGET, "the root outlived `run`'s error"),
     }
@@ -389,7 +390,9 @@ The crate's documentation carries this as a doctest, and `tests/consumers.rs` in
   4. On a thread of its own, made through `Executor::platform`, since it may block and no
      worker may, it waits within a bound for the device's last points, and drops every
      encoder and every `Device` clone but one. If the bound is met, the thread hands the
-     last `Device` back for step 5; if it expires, the thread drops it (below).
+     last `Device` back for step 5; if it expires, the thread drops it (below). If the
+     platform makes no thread, its error ends step 4 and the device is dropped on the
+     calling worker, where its drop may block; the pump's warning shows the stall.
   5. A main-lane call drops the last one, which then waits for nothing; MoltenVK's
      observation of the view is removed on the view's thread (off it after an expired
      step-4 bound, below).
@@ -409,9 +412,12 @@ The crate's documentation carries this as a doctest, and `tests/consumers.rs` in
 - After an error from `run`, the steps run with no pump, their main-lane calls resolve to
   `Cancelled`, and `main` waits for them within a bound: it awaits the root on a thread of
   its own, made through `Executor::platform`, which sends the root's result on a channel,
-  and takes it with a timeout. Past the bound `main` logs on `pail` and returns `run`'s
-  error with the root neither dropped nor shut down, and the process ends with it, as it
-  does with the leaked window; how the process ends then is `lactose-app`'s choice.
+  and takes it with a timeout. `main`'s bound is longer than steps 2 and 4's bounds
+  together, so it does not give up on a root still inside them. Past it `main` logs on
+  `pail` and returns `run`'s error with the root neither dropped nor shut down, and the
+  process ends with it, as it does with the leaked window; how the process ends then is
+  `lactose-app`'s choice. The waiter's body holds the root so that a platform that makes
+  no thread leaks it, never drops it on the main thread.
 - A main-lane call that drops what was made from the window drops only what has nothing
   pending (`lactose-rhi-api`, "Handles and lifetimes"). Whatever waits is done on the
   present thread or on a thread of its own before it, while the pump runs.
