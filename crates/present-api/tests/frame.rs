@@ -14,7 +14,8 @@ use common::*;
 use lactose_core::Tick;
 use lactose_ecs::{LayoutConfig, PresentEventBatch, PresentEventKey, WorldKind};
 use lactose_math::Scalar;
-use lactose_present_api::{AudioRequest, snapshot_channel};
+use lactose_present_api::{AudioRequest, extract_state, snapshot_channel};
+use lactose_sim::TickInput;
 
 /// A prediction world with three chirping rows, each a presented row.
 fn chirping() -> Rig {
@@ -188,7 +189,37 @@ fn with_the_reader_gone_publish_keeps_no_event() {
     rig.frame();
     rig.step();
     rig.frame();
-    assert!(shown(&mut rig).contains("events: PresentEventBatch { emitted: [], cancelled: [] }"));
+    assert!(shown(&mut rig).contains("events: [], publications"));
+}
+
+/// A writer installed between runs, after the passes and before `publish`, as `app` does for
+/// a world it starts to show: the events of that publication have no snapshot with them, an
+/// acquire then returns `None`, and they reach the first frame (review round 1, MINOR-2).
+#[test]
+fn events_published_before_the_first_snapshot_reach_the_first_frame() {
+    let executor = executor(1);
+    let mut simulation = simulation(WorldKind::Prediction, LayoutConfig::default(), Tick(10));
+    let row = (at(0.0), mesh(1), Chirper(1), Shown(1), claim());
+    simulation.world_mut().spawn(key(1), REGION, row).unwrap();
+    let run = simulation.step(&executor, TickInput::default());
+    let simulation = executor.block_on(run).unwrap();
+    let run = simulation.run_passes(&executor);
+    let mut simulation = executor.block_on(run).unwrap();
+
+    let (writer, mut reader) = snapshot_channel();
+    drop(extract_state(&mut simulation).unwrap().set_snapshot(Some(writer)));
+    let events = simulation.world_mut().take_present_events();
+    let emitted = events.emitted.len();
+    assert!(emitted > 0, "the chirper emitted");
+    extract_state(&mut simulation).unwrap().publish(events);
+    assert!(reader.acquire().is_none(), "no snapshot was published");
+
+    let run = simulation.run_passes(&executor);
+    let mut simulation = executor.block_on(run).unwrap();
+    let events = simulation.world_mut().take_present_events();
+    extract_state(&mut simulation).unwrap().publish(events);
+    let frame = reader.acquire().expect("published");
+    assert_eq!(frame.events().emitted.len(), emitted, "every emission reaches the first frame");
 }
 
 /// `transform`: a moved row interpolates from the older snapshot; a row teleported after the

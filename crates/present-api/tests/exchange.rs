@@ -9,16 +9,19 @@
 //! earlier tick, and an idle pass after an edit. The writer's `Arc::get_mut` asserts in the
 //! crate that the buffer a pass writes is shared with nobody, and so that no held snapshot is
 //! ever written; the model says which pair each acquire returns, and the checks after every
-//! acquire are the README's sentences, on the pair the channel returned.
+//! acquire are the README's sentences, on the pair the channel returned. Across threads, the
+//! render side acquires on its own thread, and events reach one frame with their snapshot.
 
 #![forbid(unsafe_code)]
 
 use crate::common;
 
 use common::*;
-use lactose_core::Tick;
-use lactose_ecs::{LayoutConfig, WorldKind};
-use lactose_present_api::PresentSnapshot;
+use std::collections::BTreeMap;
+
+use lactose_core::{FixedHashMap, Tick};
+use lactose_ecs::{LayoutConfig, PresentEventKey, WorldKind};
+use lactose_present_api::{PresentSnapshot, snapshot_channel};
 
 const ROW: u64 = 1;
 const START: u32 = 10;
@@ -638,4 +641,163 @@ fn the_render_side_on_its_own_thread() {
         *done.lock().expect("unpoisoned") = true;
         assert!(render.join().expect("the render side does not panic") > 0);
     }
+}
+
+/// A prediction world whose four presented rows walk and chirp every tick, for the tests
+/// across threads.
+fn chirping_rig() -> Rig {
+    let simulation = simulation(WorldKind::Prediction, LayoutConfig::default(), Tick(100));
+    let mut rig = Rig::new(simulation, executor(2));
+    for n in 1..=4u32 {
+        let row = (at(0.0), mesh(n.into()), Walker(scalar(1.0)), claim(), Chirper(1), Shown(n));
+        rig.world_mut().spawn(key(n.into()), REGION, row).unwrap();
+    }
+    rig
+}
+
+/// The exchange is one: passes, publications and acquires at drawn cadences on two threads,
+/// and each emission reaches exactly one frame, and a frame whose newer snapshot is of tick
+/// T has every emission published with or before T's first publication. Publishing the
+/// snapshot and its events, or taking the pair and the events, in two exchanges fails here
+/// (review round 1, C3). The reader stops once the writer is done and it has acquired after
+/// that, so every wait ends.
+#[test]
+#[expect(clippy::disallowed_methods, reason = "the render side's thread, in a test")]
+fn events_reach_one_frame_with_their_snapshot_across_threads() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    for seed in [7_u64, 11, 13] {
+        let mut rig = chirping_rig();
+        let mut reader = core::mem::replace(&mut rig.reader, snapshot_channel().1);
+        // Per tick: how many emissions were published with or before the first publication
+        // of a snapshot of it. Written before that publication, so the reader finds it.
+        let published: Arc<Mutex<BTreeMap<u32, usize>>> = Arc::default();
+        let done = Arc::new(AtomicBool::new(false));
+        let (by_tick, finished) = (Arc::clone(&published), Arc::clone(&done));
+        let render = std::thread::spawn(move || {
+            let mut draw = Draw(seed | 1);
+            let mut seen: FixedHashMap<PresentEventKey, ()> = FixedHashMap::new();
+            let mut acquires = 0_u32;
+            loop {
+                let last = finished.load(Ordering::Acquire);
+                if let Some(frame) = reader.acquire() {
+                    acquires += 1;
+                    for emission in &frame.events().emitted {
+                        let again = seen.insert(emission.key, ()).is_some();
+                        assert!(!again, "an emission in two frames: {:?}", emission.key);
+                    }
+                    let newer = frame.newer().tick();
+                    let needed = *by_tick
+                        .lock()
+                        .expect("unpoisoned")
+                        .get(&newer.0)
+                        .expect("noted before it was published");
+                    assert!(
+                        seen.len() >= needed,
+                        "a frame holds a snapshot of {newer:?} with {} emissions seen, {needed} \
+                         published with or before it",
+                        seen.len()
+                    );
+                }
+                if last {
+                    return (seen.len(), acquires);
+                }
+                if draw.next(2) == 0 {
+                    std::thread::yield_now();
+                }
+            }
+        });
+        let mut draw = Draw(seed.wrapping_mul(31) | 1);
+        let mut emitted = 0;
+        for _ in 0..300 {
+            for _ in 0..draw.next(3) {
+                rig.step();
+            }
+            rig.passes();
+            if draw.next(6) == 0 {
+                // A second pass before the publication: the writer keeps its buffer.
+                rig.passes();
+            }
+            let events = rig.world_mut().take_present_events();
+            emitted += events.emitted.len();
+            let tick = rig.tick().0;
+            published.lock().expect("unpoisoned").entry(tick).or_insert(emitted);
+            rig.state().publish(events);
+            if draw.next(3) == 0 {
+                std::thread::yield_now();
+            }
+        }
+        done.store(true, Ordering::Release);
+        let (seen, acquires) = render.join().expect("the render side does not panic");
+        assert!(emitted > 0 && acquires > 1, "seed {seed}: {emitted} emitted, {acquires} acquires");
+        assert_eq!(seen, emitted, "seed {seed}: every emission reaches exactly one frame");
+    }
+}
+
+/// A window pair across threads, driven step by step: the reader holds two snapshots, the
+/// writer publishes a third and takes it back for its next pass, and the reader acquires on
+/// its own thread between that pass and its publication. The pair is the reader's newer
+/// snapshot twice, and the events published with the taken-back snapshot arrive in that
+/// frame (review round 1, C3). Every wait is bounded.
+#[test]
+#[expect(clippy::disallowed_methods, reason = "the render side's thread, in a test")]
+fn a_window_pair_across_threads() {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    /// What the reader saw: one buffer twice, the pair's ticks, the emissions.
+    type Seen = (bool, Tick, Tick, usize);
+    let mut rig = chirping_rig();
+    let mut reader = core::mem::replace(&mut rig.reader, snapshot_channel().1);
+    let (go, go_rx) = mpsc::channel::<()>();
+    let (seen_tx, seen) = mpsc::channel::<Seen>();
+    let render = std::thread::spawn(move || {
+        while go_rx.recv_timeout(Duration::from_secs(60)).is_ok() {
+            let frame = reader.acquire().expect("published");
+            let (older, newer) = (frame.older(), frame.newer());
+            let events = frame.events().emitted.len();
+            let seen = (core::ptr::eq(older, newer), older.tick(), newer.tick(), events);
+            if seen_tx.send(seen).is_err() {
+                return;
+            }
+        }
+    });
+    let acquired = |go: &mpsc::Sender<()>| {
+        go.send(()).expect("the reader waits");
+        seen.recv_timeout(Duration::from_secs(60)).expect("the reader answers within a minute")
+    };
+    let publish = |rig: &mut Rig| {
+        let events = rig.world_mut().take_present_events();
+        let count = events.emitted.len();
+        rig.state().publish(events);
+        count
+    };
+    // Two publications, each acquired: the reader holds two buffers.
+    for _ in 0..2 {
+        rig.step();
+        rig.passes();
+        publish(&mut rig);
+        acquired(&go);
+    }
+    let held = rig.tick();
+    // A third publication, not acquired: the third buffer is published.
+    rig.step();
+    rig.passes();
+    let third = publish(&mut rig);
+    assert!(third > 0);
+    // The next pass finds no free buffer and takes the third back; the reader acquires
+    // between that pass and its publication.
+    rig.step();
+    rig.passes();
+    let (same, older, newer, events) = acquired(&go);
+    assert!(same, "the acquire during the take-back's pass returns one buffer twice");
+    assert_eq!((older, newer), (held, held), "the reader's newer snapshot");
+    assert_eq!(events, third, "the taken-back snapshot's events arrive in the window frame");
+    let fourth = publish(&mut rig);
+    let (same, older, newer, events) = acquired(&go);
+    assert!(!same);
+    assert_eq!((older, newer, events), (held, rig.tick(), fourth));
+    drop(go);
+    render.join().expect("the render side does not panic");
 }

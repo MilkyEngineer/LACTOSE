@@ -1,8 +1,8 @@
 //! The presentation snapshot (architecture section 5.3): the only simulation-derived data
 //! the render side reads while the next tick runs. Extract writes one after a tick, the
 //! presentation schedule reads the newest published and the one it follows and
-//! interpolates between them, and three buffers are enough for the two never to wait for
-//! each other.
+//! interpolates between them, and three buffers are enough for each side to wait for the
+//! other at most for one exchange of buffer handles.
 //!
 //! A snapshot holds the *presented rows* of its world: the rows presentation works on,
 //! each with every extracted component it has. The bulk of a scene, rows that are only an
@@ -10,14 +10,17 @@
 //! [`InstanceSink`](crate::InstanceSink) and nowhere else (`README.md`, "The snapshot").
 //!
 //! Safe code only: the buffers are shared by `Arc`, and the one exchange of them between
-//! the two sides is under a lock held for the exchange and for nothing else.
+//! the two sides is under a lock held for the exchange and for nothing else. The events
+//! wait there as the batches `publish` was given and are folded and dropped outside it, so
+//! the work under the lock does not grow with what the reader has not acquired, but for the
+//! amortised growth of the one vector that holds the batches.
 
 use core::marker::PhantomData;
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use lactose_core::{ComponentKey, StableKey, Tick};
-use lactose_ecs::{PresentEventBatch, WorldKind};
+use lactose_core::{ComponentKey, FixedHashMap, StableKey, Tick};
+use lactose_ecs::{PresentEmission, PresentEventBatch, PresentEventKey, WorldKind};
 use lactose_physics_api::{Teleported, Transform};
 use lactose_reflect::{Component, bytemuck};
 
@@ -54,9 +57,10 @@ struct Exchange {
     published: Vec<Published>,
     /// The buffers that are neither published, held by the reader nor being written.
     free: Vec<Arc<PresentSnapshot>>,
-    /// Every batch published since the reader's last acquire, folded into one. Dropped, not
-    /// kept, once the reader is gone.
-    events: PresentEventBatch,
+    /// Every batch with an event published since the reader's last acquire, in publication
+    /// order: the acquire takes them and folds them once the lock is released. None is
+    /// kept once the reader is gone.
+    events: Vec<PresentEventBatch>,
     /// How many snapshots were ever published: the next one's publication number.
     publications: u64,
     /// The snapshot published last, whether or not it is still published: a snapshot of an
@@ -98,26 +102,49 @@ impl Exchange {
     }
 }
 
-/// Appends `batch` to `into`, folded by the world's own rule: an emission followed by its
-/// cancellation is in neither list, and so is a cancellation followed by an emission of the
-/// same key. One take never holds both for a key, so the order within `batch` is moot.
-fn fold(into: &mut PresentEventBatch, batch: PresentEventBatch) {
-    if into.emitted.is_empty() && into.cancelled.is_empty() {
-        *into = batch;
-        return;
+/// Folds `batches`, in publication order, into one by the world's own rule: an emission
+/// followed by its cancellation is in neither list, and so is a cancellation followed by an
+/// emission of the same key. One take never holds both for a key, so the order within a
+/// batch is moot; the world delivers a key again only after cancelling it, so a key is in
+/// each list once at most, and an index by key keeps the fold linear in the events. Called
+/// with the channel's lock released.
+fn fold(batches: Vec<PresentEventBatch>) -> PresentEventBatch {
+    if batches.len() <= 1 {
+        return batches.into_iter().next().unwrap_or_default();
     }
-    for key in batch.cancelled {
-        match into.emitted.iter().position(|emission| emission.key == key) {
-            Some(index) => drop(into.emitted.remove(index)),
-            None => into.cancelled.push(key),
+    let mut emitted: Vec<Option<PresentEmission>> = Vec::new();
+    let mut cancelled: Vec<Option<PresentEventKey>> = Vec::new();
+    let mut emitted_at: FixedHashMap<PresentEventKey, usize> = FixedHashMap::new();
+    let mut cancelled_at: FixedHashMap<PresentEventKey, usize> = FixedHashMap::new();
+    for batch in batches {
+        for key in batch.cancelled {
+            match emitted_at.remove(&key) {
+                Some(index) => emitted[index] = None,
+                None => {
+                    cancelled_at.insert(key, cancelled.len());
+                    cancelled.push(Some(key));
+                }
+            }
+        }
+        for emission in batch.emitted {
+            match cancelled_at.remove(&emission.key) {
+                Some(index) => cancelled[index] = None,
+                None => {
+                    emitted_at.insert(emission.key, emitted.len());
+                    emitted.push(Some(emission));
+                }
+            }
         }
     }
-    for emission in batch.emitted {
-        match into.cancelled.iter().position(|&key| key == emission.key) {
-            Some(index) => drop(into.cancelled.remove(index)),
-            None => into.emitted.push(emission),
-        }
+    PresentEventBatch {
+        emitted: emitted.into_iter().flatten().collect(),
+        cancelled: cancelled.into_iter().flatten().collect(),
     }
+}
+
+/// Whether `batch` holds no event.
+fn is_empty(batch: &PresentEventBatch) -> bool {
+    batch.emitted.is_empty() && batch.cancelled.is_empty()
 }
 
 /// The channel's lock. A panic while it is held aborts a binary, so a poisoned lock is met
@@ -180,20 +207,35 @@ impl SnapshotWriter {
         snapshot
     }
 
-    /// Publishes the unpublished snapshot, if there is one, and folds `events` into those
-    /// the reader's next acquire returns, in one exchange (`README.md`, "The triple buffer"
-    /// and "Events and publication").
+    /// Publishes the unpublished snapshot, if there is one, and adds `events` to those the
+    /// reader's next acquire returns, in one exchange (`README.md`, "The triple buffer" and
+    /// "Events and publication"). A batch no reader will take is dropped once the lock is
+    /// released.
     pub(crate) fn publish(&mut self, events: PresentEventBatch) {
         let full = core::mem::take(&mut self.pending_full);
         let pending = self.pending.take();
         let mut exchange = lock(&self.exchange);
-        if !exchange.reader_gone {
-            fold(&mut exchange.events, events);
+        let unread = if exchange.reader_gone || is_empty(&events) {
+            Some(events)
+        } else {
+            exchange.events.push(events);
+            None
+        };
+        if let Some(snapshot) = pending {
+            exchange.publish(snapshot, full);
         }
-        let Some(mut snapshot) = pending else { return };
-        let number = exchange.publications;
-        exchange.publications += 1;
-        let last = exchange.last;
+        drop(exchange);
+        drop(unread);
+    }
+}
+
+impl Exchange {
+    /// The snapshot half of [`SnapshotWriter::publish`]: `snapshot`, written by passes of
+    /// which one was full if `full`, becomes the newest published.
+    fn publish(&mut self, mut snapshot: Arc<PresentSnapshot>, full: bool) {
+        let number = self.publications;
+        self.publications += 1;
+        let last = self.last;
         let written = Arc::get_mut(&mut snapshot).expect("the buffer the writer wrote is unshared");
         // A cut by its own cause: a pass made it one, or its tick is earlier than the tick of
         // the snapshot published last.
@@ -206,28 +248,28 @@ impl SnapshotWriter {
                 own |= last.cut;
                 last.follows
             }
-            None => exchange
+            None => self
                 .published
                 .last()
                 .map(|published| published.number)
-                .or(exchange.held.map(|[_, newer]| newer)),
+                .or(self.held.map(|[_, newer]| newer)),
         };
         if own {
-            exchange.cut_mark = Some(number);
+            self.cut_mark = Some(number);
         }
-        written.cut = own || exchange.cut_mark.is_some();
+        written.cut = own || self.cut_mark.is_some();
         let tick = written.tick;
-        exchange.last = Some(LastPublished { number, tick, cut: written.cut, follows });
+        self.last = Some(LastPublished { number, tick, cut: written.cut, follows });
         let published = Published { snapshot, number, follows };
         let place = replaced.and_then(|last| {
-            exchange.published.iter().position(|published| published.number == last.number)
+            self.published.iter().position(|published| published.number == last.number)
         });
         match place {
             Some(index) => {
-                let replaced = core::mem::replace(&mut exchange.published[index], published);
-                exchange.release(replaced.snapshot);
+                let replaced = core::mem::replace(&mut self.published[index], published);
+                self.release(replaced.snapshot);
             }
-            None => exchange.published.push(published),
+            None => self.published.push(published),
         }
     }
 }
@@ -249,18 +291,21 @@ impl SnapshotReader {
     /// the reader, so one frame is alive at a time, and the reader keeps the frame's two
     /// snapshots until the next call: until then no pass writes either.
     ///
-    /// It never waits for a pass: it exchanges buffer handles under the channel's lock
-    /// and copies nothing. Called again before a publication it returns the same pair and
-    /// no event. Called while a pass writes the snapshot published after the reader's
-    /// newer one, which the pass took back, it returns that newer one twice, so the pass
-    /// after finds a buffer free. `README.md`, "The snapshot", states what the pair is
-    /// when the reader runs slower than the passes, and that no event is lost then.
+    /// It waits for a pass at most for one exchange: it exchanges buffer handles and takes
+    /// the published event batches under the channel's lock, copies nothing, and folds the
+    /// batches once the lock is released. Called again before a publication it returns the
+    /// same pair and the events published since, if any. Called while a pass writes the
+    /// snapshot published after the reader's newer one, which the pass took back, it
+    /// returns that newer one twice, so the pass after finds a buffer free. Before the
+    /// first publication it returns `None` and leaves the events published so far for the
+    /// first frame. `README.md`, "The snapshot", states what the pair is when the reader
+    /// runs slower than the passes, and that no event is lost then.
     pub fn acquire(&mut self) -> Option<PresentFrame<'_>> {
         let mut exchange = lock(&self.exchange);
-        self.events = core::mem::take(&mut exchange.events);
         if exchange.publications == 0 {
             return None;
         }
+        let batches = core::mem::take(&mut exchange.events);
         if exchange.acquired != Some(exchange.publications) {
             exchange.acquired = Some(exchange.publications);
             let held = self.held.take().zip(exchange.held);
@@ -290,6 +335,7 @@ impl SnapshotReader {
             self.held = Some(pair);
         }
         drop(exchange);
+        self.events = fold(batches);
         let [older, newer] = self.held.as_ref().expect("a publication was acquired");
         Some(PresentFrame { older, newer, events: &self.events })
     }
@@ -335,16 +381,19 @@ fn pair_with(
 
 impl Drop for SnapshotReader {
     /// Nothing will acquire again: `publish` drops every batch from now on, and the
-    /// reader's buffers go back to the channel.
+    /// reader's buffers go back to the channel. The batches it never took are dropped once
+    /// the lock is released.
     fn drop(&mut self) {
         let mut exchange = lock(&self.exchange);
         exchange.reader_gone = true;
-        exchange.events = PresentEventBatch::default();
+        let unread = core::mem::take(&mut exchange.events);
         exchange.held = None;
         if let Some([older, newer]) = self.held.take() {
             exchange.release(older);
             exchange.release(newer);
         }
+        drop(exchange);
+        drop(unread);
     }
 }
 
