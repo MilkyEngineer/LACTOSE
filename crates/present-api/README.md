@@ -314,8 +314,12 @@ events")
   extract's passes. A pass at the previous pass's tick that is not full and has no key to
   remove and no row to write calls nothing.
 - The sink is infallible. `write` runs on the executor's workers inside extract's scope,
-  several at once, so it never blocks and takes no lock: a sink that cannot take a row (a
-  ring whose regions are all in flight) drops it and counts the drop.
+  several at once, so it never waits for a ring region, a fence or another job (the region
+  a pass writes is free before the pass begins), and takes no lock that architecture
+  section 3 does not permit inside a system. A sink that cannot take a row (the pass
+  writes more rows than its ring region holds) drops it and counts the drop. Extract
+  writes that row again only once it changes or at a full pass, and a pass after
+  `ExtractState::set_sink` is full.
 
 *What the sink keeps.* A row carries the placement the instance has now and no previous
 one: the world holds one `Transform` per row, and extract keeps no table of its own. What
@@ -527,8 +531,8 @@ follows is the contract the renderer's sink implements, and a test's sink checks
   reader never took are dropped after it too. A reader that stops acquiring while its
   world keeps publishing (a hidden window, a hitch, a debugger) costs memory, one batch per
   publication with an event, until it acquires again; nothing done under the lock grows
-  with that backlog but the push of one batch handle, whose vector's growth is amortised
-  constant. The first acquire after the pause returns every event of it, folded. Whether a
+  with that backlog: `publish` links a batch whose list node it allocated before taking
+  the lock. The first acquire after the pause returns every event of it, folded. Whether a
   reader that comes back after a long pause should receive them all, and whether a paused
   reader should stop acquiring at all, is `frame-design`'s decision.
 - A snapshot written by a full pass in a prediction world, of the tick of the snapshot

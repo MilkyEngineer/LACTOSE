@@ -659,8 +659,9 @@ fn chirping_rig() -> Rig {
 /// and each emission reaches exactly one frame, and a frame whose newer snapshot is of tick
 /// T has every emission published with or before T's first publication. Publishing the
 /// snapshot and its events, or taking the pair and the events, in two exchanges fails here
-/// (review round 1, C3). The reader stops once the writer is done and it has acquired after
-/// that, so every wait ends.
+/// (review round 1, C3). The reader acquires without pause, which is what lets a split with
+/// nothing between its two exchanges show (review round 2, C8). It stops once the writer is
+/// done and it has acquired after that, so every wait ends.
 #[test]
 #[expect(clippy::disallowed_methods, reason = "the render side's thread, in a test")]
 fn events_reach_one_frame_with_their_snapshot_across_threads() {
@@ -676,7 +677,6 @@ fn events_reach_one_frame_with_their_snapshot_across_threads() {
         let done = Arc::new(AtomicBool::new(false));
         let (by_tick, finished) = (Arc::clone(&published), Arc::clone(&done));
         let render = std::thread::spawn(move || {
-            let mut draw = Draw(seed | 1);
             let mut seen: FixedHashMap<PresentEventKey, ()> = FixedHashMap::new();
             let mut acquires = 0_u32;
             loop {
@@ -703,14 +703,11 @@ fn events_reach_one_frame_with_their_snapshot_across_threads() {
                 if last {
                     return (seen.len(), acquires);
                 }
-                if draw.next(2) == 0 {
-                    std::thread::yield_now();
-                }
             }
         });
         let mut draw = Draw(seed.wrapping_mul(31) | 1);
         let mut emitted = 0;
-        for _ in 0..300 {
+        for _ in 0..1000 {
             for _ in 0..draw.next(3) {
                 rig.step();
             }

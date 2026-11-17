@@ -12,11 +12,11 @@
 //! Safe code only: the buffers are shared by `Arc`, and the one exchange of them between
 //! the two sides is under a lock held for the exchange and for nothing else. The events
 //! wait there as the batches `publish` was given and are folded and dropped outside it, so
-//! the work under the lock does not grow with what the reader has not acquired, but for the
-//! amortised growth of the one vector that holds the batches.
+//! the work under the lock does not grow with what the reader has not acquired: `publish`
+//! links a list node it allocated before taking the lock.
 
 use core::marker::PhantomData;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, LinkedList};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use lactose_core::{ComponentKey, FixedHashMap, StableKey, Tick};
@@ -60,7 +60,7 @@ struct Exchange {
     /// Every batch with an event published since the reader's last acquire, in publication
     /// order: the acquire takes them and folds them once the lock is released. None is
     /// kept once the reader is gone.
-    events: Vec<PresentEventBatch>,
+    events: LinkedList<PresentEventBatch>,
     /// How many snapshots were ever published: the next one's publication number.
     publications: u64,
     /// The snapshot published last, whether or not it is still published: a snapshot of an
@@ -108,7 +108,7 @@ impl Exchange {
 /// batch is moot; the world delivers a key again only after cancelling it, so a key is in
 /// each list once at most, and an index by key keeps the fold linear in the events. Called
 /// with the channel's lock released.
-fn fold(batches: Vec<PresentEventBatch>) -> PresentEventBatch {
+fn fold(batches: LinkedList<PresentEventBatch>) -> PresentEventBatch {
     if batches.len() <= 1 {
         return batches.into_iter().next().unwrap_or_default();
     }
@@ -214,13 +214,15 @@ impl SnapshotWriter {
     pub(crate) fn publish(&mut self, events: PresentEventBatch) {
         let full = core::mem::take(&mut self.pending_full);
         let pending = self.pending.take();
+        // The list's node is allocated here, so the lock links it and allocates nothing.
+        let mut unread = LinkedList::new();
+        if !is_empty(&events) {
+            unread.push_back(events);
+        }
         let mut exchange = lock(&self.exchange);
-        let unread = if exchange.reader_gone || is_empty(&events) {
-            Some(events)
-        } else {
-            exchange.events.push(events);
-            None
-        };
+        if !exchange.reader_gone {
+            exchange.events.append(&mut unread);
+        }
         if let Some(snapshot) = pending {
             exchange.publish(snapshot, full);
         }
