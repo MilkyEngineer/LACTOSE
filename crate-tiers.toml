@@ -9,7 +9,7 @@
 # Backend crates may be named only by assembly crates, by leaf crates and by [exceptions].
 #   They may not depend on game, assembly or leaf crates.
 # Assembly crates put a runtime together: they may depend on foundation, backend and game
-#   crates. Only leaf crates may depend on an assembly crate.
+#   crates, subject to [server_denylist]. Only leaf crates may depend on an assembly crate.
 # Leaf crates (binaries and tools) may depend on anything, subject to [server_denylist]. Only
 #   leaf crates may depend on a leaf crate.
 # Game crates may depend on foundation crates and on other game crates.
@@ -79,9 +79,9 @@ crates = [
 ]
 
 [server_denylist]
-# lactose-app and lactose-app-server may not reach these through normal or build dependencies,
-# directly or transitively. The rule binds lactose-app, which the server links, whether or not
-# lactose-app-server exists.
+# The [assembly] crates (today lactose-app) and lactose-app-server may not reach these through
+# normal or build dependencies, directly or transitively. The rule binds the assembly crates,
+# which the server links, whether or not lactose-app-server exists.
 crates = [
   "lactose-render-graph", "lactose-renderer", "lactose-presentation", "lactose-platform",
   "lactose-audio", "lactose-ui", "lactose-debug-ui", "lactose-rhi-vulkan", "lactose-rhi-metal",
