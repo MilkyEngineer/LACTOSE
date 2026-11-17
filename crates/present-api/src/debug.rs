@@ -73,8 +73,6 @@ impl DebugDraw {
             }
             DebugShapeKind::Sphere => {
                 let radius = b.x;
-                // The points of one circle, unit radius: the xy plane's in (x, y), and the
-                // others' as each plane maps them below.
                 // One circle's points at the radius, as (u, v) in its plane; the last segment
                 // closes on the first point, so every circle is closed exactly.
                 let steps = u32::try_from(Self::CIRCLE_SEGMENTS).expect("a small count");

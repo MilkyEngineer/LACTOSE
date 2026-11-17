@@ -4,9 +4,11 @@
 #![forbid(unsafe_code)]
 
 mod common;
+mod compile_fail;
 mod consumers;
 mod exchange;
 mod extract;
 mod frame;
 mod registration;
 mod rollback;
+mod view;
