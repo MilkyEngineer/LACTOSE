@@ -78,7 +78,7 @@ the last frame's steps started from inside `Client`.
 | `io` | The pool started once by `app` with the binary's platform, the save directory created at startup, the slot written as one `Io::replace`, the pool shut down before the executor | `Headless::{start, save, shutdown}`; "Saves and loads" below |
 | The store's driver (`asset` at milestone 3, `net` at milestone 4) | Every `Load` the lifecycle issues, told which ones the server answers itself; the region's table resolvable for either; a `Release` when a region's export is in the store | `StepOutput::requests`, `FrameOutput::requests`, `Server::kept`; "Saves and loads" below |
 | `asset` (milestone 3) | A stand-in with the store's shape, replaced by its traits with a listed signature change | `Cooked`; "Not in this crate yet" |
-| `app-client`, `app-server`, `net` (milestone 4) | The places named now and the signatures that will change | `Client` gains the replicated world; `build_client` loses `entity`; `Workers::platform` takes the platform crate's instance; `Server::relevance` already takes the executor; "Not in this crate yet" |
+| `app-client`, `app-server`, `net` (milestone 4) | The places named now and the signatures that will change | `Client` gains the replicated world; `build_client` loses `entity`; `Workers::platform` already takes the platform crate's `ClientPlatform`, from milestone 2; `Server::relevance` already takes the executor; "Not in this crate yet" |
 | The error policy (architecture section 19) | One place that decides, as a value a test can read | `ErrorPolicy::MILESTONE_1`, `Source`, `Response`; "Errors" below |
 
 ## The registration a game crate writes
@@ -220,7 +220,8 @@ registration a game crate writes")
   `ThreadPool::drop` terminates the pool and returns before its threads have exited.
 - A `Platform` is the binary's: `Workers::platform` is `None` for the headless binary and
   `StdPlatform` is used, for the executor and the IO pool alike; `app-client` passes the
-  platform crate's instance at milestone 4.
+  platform crate's `ClientPlatform` from milestone 2, whose topology is `StdPlatform`'s
+  (`crates/platform/README.md`, "`ClientPlatform`").
 
 **The timer root** (architecture sections 5.1 and 11; `crates/sim/README.md`, "The timer
 root")

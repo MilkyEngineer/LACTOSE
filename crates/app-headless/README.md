@@ -39,9 +39,8 @@ report, the app still shuts down in order (the policy's response to `Source::Sav
 - Panics abort, unconditionally (architecture section 5.1): the hook aborts in every
   profile, and the workspace's release profile sets `panic = "abort"`. Tests do not install
   the hook (D16); a test that expects an abort runs this binary in a subprocess.
-- The crash dump at milestone 1 is the stderr report. A minidump and a dump file belong to
-  `lactose-platform`, which does not exist yet; the hook is replaced by the platform's when
-  it lands.
+- The crash dump at milestone 1 is the stderr report. The hook moves to `lactose-app`,
+  which every engine binary links, and minidumps are milestone 5's (D155).
 - Traced from day one (architecture section 3): `main` installs `tracing-subscriber`'s
   `fmt` subscriber after the crash hook, writing every event at `info` and above as text to
   stderr, the assembly's at target `app` (every policy decision, every refusal) and the

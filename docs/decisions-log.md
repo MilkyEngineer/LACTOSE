@@ -7350,6 +7350,154 @@ process state; the nightly Miri filters name modules that Miri compiles** (§20,
   descriptor arrays in the required set; the plan's decision 5.17 and `graph-impl` row where a
   readback's hazard is shown by a wrong readback, which every backend now refuses.
 
+**D159. `lactose-platform`: one window whose `Arc` is its lifetime, the two pumps over `lactose-task`'s lanes, a close and a resize as states, and a present thread over the caller's state** (§3, §4, §5.1, §21, `lactose-platform`, `crates/app/README.md`, `crates/task/README.md`)
+- Why: section 4 gives the crate four nouns and section 5.1 two threads, and the milestone 2
+  plan's decisions 5.6 and 5.11 fix that every submit touching a swapchain image is the present
+  thread's and that `lactose-app` reaches no denylisted crate. The facade settles the rest.
+  - *A client binary alone names the crate.* `lactose-app` and the renderer hold
+    `lactose_task::Lane<S>` over a state of their own, a graphics backend takes the window as
+    `raw-window-handle` 0.6's two traits, and the window's reports reach `app` as a
+    `WindowReports` the binary adapts. The crate depends on `lactose-core`, `lactose-task` and
+    `raw-window-handle`, pinned at 0.6.2 by the line `rhi-api` carries. Rules out a trait here
+    that `app` or the renderer implements, a dependency on `lactose-rhi-api`, a backend that
+    names the platform crate, and `winit` in a signature.
+  - *One window, described at `event_pump` and opened by `EventPump::run`.* An event loop
+    lends what makes a window only inside its own callbacks, and a lane's state is `'static`,
+    so the window is not a main-lane request: `run` opens it before it drains a call, and
+    every call is lent a `MainThread` that has it. Rules out a window made by a lane call, a
+    window before `run`, a second window, and a second pump in a process (`Unsupported`).
+  - *The window's `Arc` is its lifetime, and `run` returns when `exit` has been called and the
+    window is let go.* The pump destroys the window on the main thread once `MainThread::exit`
+    has been called and the last `Arc<Window>` it handed out is dropped, which it decides by
+    `Arc::try_unwrap` on its own `Arc`, never by a count, so no `Weak` upgrades to a destroyed
+    window, and never by `Arc::into_inner`, which drops the pump's `Arc` when it fails. Until
+    then it pumps events and drains calls, and from `exit` it also wakes every 50 ms to look. A
+    backend that keeps the `Arc` until its surface is destroyed therefore has a live window at
+    every use, with no `unsafe` contract on the caller, and whatever a driver asks of the
+    window's thread while a swapchain is made, resized or destroyed off it is answered, because
+    the main thread never waits for another thread while it pumps. The cost is stated: a leaked
+    `Arc<Window>`, or a path that never calls `exit`, is a pump that never returns, and it warns
+    once a second. So `exit` is the first step of every shutdown, queued without a wait by a
+    guard whose `Drop` queues it, and destroys nothing while an `Arc` is held; and what reads
+    the window's reports holds a `WindowReports`, which holds no `Arc`. When `run` returns, by
+    value or by error, `close_requested` turns `true`, before the lane closes, so a task whose
+    call came back `Cancelled` reads the close; the lane's wake ignores an event loop that has
+    ended, even after the lane is closed, since `exit` is queued from destructors and
+    `Lane::run` wakes after it releases the queue; after an error or a panic that unwinds out of
+    `run` the window is left to the end of the process. Rules out destroying the window at
+    `exit` under a live surface, a pump that joins the present thread or waits for a worker, a
+    blocking wait anywhere in the surface, deciding the last drop by `Arc::strong_count` or
+    `Arc::into_inner`, and a `run` that returns and leaks the window to end a stalled shutdown.
+  - *The handles are lent on the main thread alone, on every operating system.* Elsewhere
+    each method returns `HandleError::Unavailable`, on Windows and Linux as on macOS, so the
+    device is made inside a main-lane call on all three and a mistake fails on the machine
+    that makes it. Rules out a constructor called with a window on a worker, and a client
+    whose start differs by operating system.
+  - *A close and a resize are states of the window, not events.* `Window::size` is the
+    drawable area in physical pixels as of the newest resize delivered to the main thread,
+    one whole value a read; `Window::close_requested` turns `true` at the first request, or
+    when `run` returns, and stays. Both are atomic reads from any thread, `Relaxed` since
+    they publish nothing, and `Window::reports` gives both as a `WindowReports`,
+    `Clone + Send + Sync`, which holds no `Arc<Window>` and so keeps nothing open. A resize
+    and a close wake no one: whoever waits for one polls on a timer. A close request closes
+    nothing and ends nothing: the client winds down, `exit` first. The reader of a resize
+    decides against the size it last asked a swapchain for, since the surface may give
+    another extent and the swapchain's own stale report arrives in either order with this
+    one; an empty size, which Windows gives a minimised window, presents nothing.
+    `MainThread::is_minimised` reports what a request to minimise came to. Rules out an
+    event queue or a callback in this crate at milestone 2, a platform that resizes a
+    swapchain or ends the process, a close that can be declined, and a report of macOS's
+    Quit or a session's end, which end the process as the operating system ends any.
+    Device sources and the event stream they need are milestone 5's.
+  - *The present thread is generic over the caller's state and names no submit.*
+    `present_thread` moves a `Send + 'static` state onto a thread of class `Present`, made
+    through the `Platform` it is given, and returns the `Lane` that is the only way to it; a
+    call is the caller's closure, lent `&mut S`. Decision 5.6's rule is held by a type the
+    caller already has: a swapchain that is `Send` and not `Sync`, moved into the state, is
+    used by the present thread alone. The thread has no clock and no loop of its own; it runs
+    the calls in order, one at a time, and parks. A platform that drops the thread's body
+    unrun makes `present_thread` return `Cancelled`, not hang. What it asks of
+    `lactose-rhi-api` is that crate's own rules: a swapchain that is `Send`, whose acquire,
+    present and resize take `&mut self`; a present that makes its submit on the calling
+    thread; an acquire and a present that return within a bound, since a call that never
+    returns is a stop that never completes; a device whose methods any thread may call, so
+    the swapchain is made on the present thread; and a backend that reads the handles in its
+    constructor alone and keeps the source's `Arc` until its surface is destroyed. Rules out
+    a submit or present type in this crate, a frame loop on the present thread, coalescing or
+    dropping of calls here, and a second way to the state.
+  - *Back-pressure is a lane call's resolution*: the frame keeps at most one present in
+    flight. The timer root paces the frame (section 5.1), and a call that presented nothing
+    paces nothing. A call's return says its submit was taken, not that its target or its
+    image is free. Rules out back-pressure in this crate, a bounded lane, and a present
+    queued for every frame.
+  - *Stopping hands the state back as a future, and no thread is joined.* `PresentThread::stop`
+    never waits: it queues the take of the state on a hand-back lane and then a stop call on the
+    present lane, so its order is the lanes' own and no flag is shared between threads: the stop
+    call sets the present thread's own, a thread-local the body clears when it starts, since a
+    platform may run a body on a thread that ran another. The thread runs its last drain, drops
+    its pump, drains the hand-back lane once and exits. `stop` is the supported path, and a drop
+    is for unwinding and signals nothing. A join would deadlock against the window's lifetime,
+    since the state holds what holds the window. The shutdown a client keeps: `exit` first and
+    not awaited; presents and frame submits stopped, and signalled from the host every point a
+    pending submit waits on that no submit made will signal: what the host owes, and the points
+    of a submit that failed or will now not be made; a last present-thread call that signals in
+    the same way the points of a present of its own that was refused, waits within a bound for
+    the points its presents signalled and drops the swapchain, a drop no caller bounds, which
+    waits for the submits that use its images and so returns once those points are signalled;
+    `stop`, which hands back a state with nothing of the window in it; on a thread of its own,
+    made through `Executor::platform` since it may block and no worker may, the device's last
+    points waited for within a bound, and every encoder and `Device` clone but one dropped; the
+    last handed back and dropped in a main-lane call, which then waits for nothing; `run`
+    returns, and `main` awaits the root and shuts the executor down. A bound that expires is
+    logged and the next step taken, under the pump's warning, save that after an expired step-4
+    bound the last `Device` is dropped on step 4's thread, never in a main-lane call, so a drop
+    that blocks holds that thread and no worker, and the main thread goes on answering;
+    MoltenVK's observation of the view is then removed off the view's thread, which is accepted,
+    since the view's layer is not replaced during a shutdown. After an error from `run` the
+    steps run with no pump and their main-lane calls resolve to `Cancelled`, and `main` waits
+    for them within a bound: it awaits the root on a thread of its own, made through
+    `Executor::platform`, which sends the root's result on a channel, and past the bound it logs
+    on `pail` and returns `run`'s error with the root neither dropped nor shut down, and the
+    process ends with it, as it does with the leaked window; how it ends is `lactose-app`'s
+    choice. If the platform makes no thread for step 4, its error ends the step and the device
+    is dropped on the calling worker, where its drop may block. Rules out a `join`, a `Drop`
+    that blocks, a blocking wait on a worker, a flag shared between threads beside the lanes, a
+    main-lane call that waits on the GPU, a host signal after the swapchain's drop, which waits
+    for it, leaking the last `Device` after an expired bound, a teardown after `run` returns a
+    value, and a root dropped on the main thread, or awaited there without a bound, after an
+    error from `run`.
+  - *`ClientPlatform` is `StdPlatform`'s topology and thread creation.* A client's worker
+    counts are the headless binary's on the same machine. What it may add is the operating
+    system's treatment of a presenting thread, for `ThreadClass::Present` alone, which
+    `platform-impl` decides and no caller relies on. Rules out affinity, a second topology
+    query, and a platform value that must be made on the main thread.
+  - *A caller's mistake panics and the operating system's refusal is a value.* `event_pump`
+    off the main thread panics on every operating system; a refused window or a failed event
+    loop is `ErrorKind::Platform`; a lane call that will not run is `Cancelled`. Rules out a
+    pump that works off the main thread on one operating system and not on another.
+  - *The lanes' locks are on the present path, and section 3 says so.* The plan builds both
+    pumps over `LanePump`, which has two locks: the lane's queue, held to push a call and to
+    take what is queued, and each call's reply, held to store or take its result or the
+    awaiting task's waker; neither is held while a call runs or while a waker is woken.
+    The frame keeps at most one call to the present thread in flight and queues at most one
+    a frame, section 3 permits the two on the per-frame path outside systems, and
+    `crates/task/README.md` names both locks with every call that takes them.
+    The crate adds no lock of its own on per-frame work: the reports are atomics, and the
+    main lane's wake under winit 0.30 is its event-loop proxy, which is `Send + Sync` for a
+    `Send` payload. Rules out a second queue beside the lane, and a lock held while a call
+    runs.
+  - *The facade forbids `unsafe`.* Section 21 lists the crate for the present thread's
+    quality of service and the window handles; `SAFETY.md` names the three invariants the
+    implementation's `unsafe`, if any, will rest on.
+- Driven by: architecture sections 3, 4, 5.1 and 21; D18, D90; the milestone 2 plan's row
+  `platform` and decisions 5.6 and 5.11 (D153); `lactose-rhi-api`'s surface source (D158);
+  `crates/task/README.md`, "Lanes"; the four review rounds of `platform` (general,
+  concurrency and GPU).
+- Replaced: section 4's "winit window, surface, event pump, present thread"; section 3's
+  paragraph on locks, which gains two sentences; D90's "the present thread's surface need not
+  be `Send`", since the state a present thread owns is `Send` and is moved onto it;
+  `crates/app/README.md`'s "`app-client` passes the platform crate's instance at milestone 4".
+
 ## 10. Review history
 
 - **Revision 1** (`a29af04`): the design baseline.

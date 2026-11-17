@@ -162,8 +162,8 @@ impl Args {
 }
 
 /// Architecture section 5.1: a panic writes a crash dump and aborts. At milestone 1 the
-/// dump is a text report on stderr (the thread, the panic and a forced backtrace); a
-/// minidump and a dump file are `lactose-platform`'s, which does not exist yet.
+/// dump is a text report on stderr (the thread, the panic and a forced backtrace); the
+/// hook moves to `lactose-app`, and minidumps are milestone 5's (D155).
 fn install_crash_hook() {
     std::panic::set_hook(Box::new(|info| {
         let thread = std::thread::current();

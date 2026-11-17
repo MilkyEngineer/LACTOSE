@@ -647,6 +647,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "lactose-platform"
+version = "0.0.0"
+dependencies = [
+ "lactose-core",
+ "lactose-task",
+ "raw-window-handle",
+]
+
+[[package]]
 name = "lactose-predict"
 version = "0.0.0"
 dependencies = [

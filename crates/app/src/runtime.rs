@@ -48,8 +48,8 @@ pub struct Workers {
     /// (`README.md`, "The executor and the solver pool").
     pub replay: Option<ExecutionLog>,
     /// The thread and topology provider for the executor and the IO pool: the standard one
-    /// when `None`, which the headless binary uses; the platform crate's instance from the
-    /// client binary at milestone 4.
+    /// when `None`, which the headless binary uses; the platform crate's `ClientPlatform`
+    /// from the client binary.
     pub platform: Option<Arc<dyn Platform>>,
 }
 

@@ -1,0 +1,29 @@
+[package]
+name = "lactose-platform"
+description = "The client's operating-system layer: the window and the handles a surface is made from, the event pump that owns the main thread and drains the main-thread lane, the present thread and its lane, and the Platform a client binary gives its executor."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+autotests = false
+
+[dependencies]
+# `Result` and `ErrorKind`, and `ThreadClass::Present`, the class the present thread enters.
+lactose-core.workspace = true
+# `Lane`, `LanePump` and `LaneCall`: both pumps are thread lanes (architecture section 5.1).
+# `Platform`, `ThreadSpec` and `ThreadHandle`: what `ClientPlatform` implements and what the
+# present thread is made through.
+lactose-task.workspace = true
+# `HasWindowHandle` and `HasDisplayHandle`: the window lends the handles a backend makes
+# its surface from, so that no backend names this crate.
+raw-window-handle.workspace = true
+
+# The integration tests as one test binary, whose root declares the files of tests/ as
+# modules (D150).
+[[test]]
+name = "integration"
+path = "tests/integration.rs"
+
+[lints]
+workspace = true

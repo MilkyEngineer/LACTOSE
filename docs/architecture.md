@@ -92,6 +92,13 @@ depends on, made again after a wait, and once more where that hold set a mark, a
 driver call, or where a timeline's wait or read records the value it saw, and a lock on one
 entry, a handle's or a heap slot's, held by a lookup for a compare and a count (D158). None of
 them is held across a wait, a driver call or code the caller supplies.
+Outside systems, the per-frame path is also permitted the two locks of a `lactose-task` lane,
+which `crates/task/README.md` names with every call that takes them: a frame's call to the
+present thread takes the lane's queue, held to push a call and to take what is queued, and the
+call's reply, held to store or take its result or the awaiting task's waker; neither is held
+while the call runs or while a waker is woken, and the frame keeps at most one such call in
+flight and queues at most one a frame (D159). A call to the main thread crosses the same two and
+is never per-frame work.
 
 **Unsafe is quarantined.** `#![forbid(unsafe_code)]` outside the crates in section 21.
 
@@ -173,7 +180,7 @@ crates/
   audio/          B            mixer thread, event bridge
   ui/             B            game UI and text rendering
   nav/            B            navmesh generation
-  platform/       B            [PAIL] winit window, surface, event pump, present thread
+  platform/       B            [PAIL] winit window and its handles, event pump, present thread
   debug-ui/       B            egui overlay, profiler view, determinism inspector
   app/            A            library that assembles a runtime from foundation, backend and game crates
   app-client/     leaf         binary: app plus every client backend; registers RenderFeature providers

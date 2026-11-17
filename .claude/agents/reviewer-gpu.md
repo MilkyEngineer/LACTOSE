@@ -223,7 +223,7 @@ the program showed:
 On the first review of a change that records, submits or synchronises GPU work, defines the surface
 it goes through, or produces what it runs: the RHI spike's result (alone), the `rhi-api` facade,
 each RHI backend and `rhi-null`, the render graph, the GPU scene, culling, VFX, the extract scatter
-pass, `platform`'s surface and present thread, the late latch, and the cooker's shaders and pipeline
+pass, `platform`'s window and present thread, the late latch, and the cooker's shaders and pipeline
 libraries. Later rounds go to `reviewer-diff` with your report as part of its checklist.
 
 If the Vulkan SDK, its validation layers, MoltenVK or a GPU is missing on this machine, say which,
