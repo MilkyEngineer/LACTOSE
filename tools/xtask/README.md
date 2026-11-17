@@ -47,8 +47,10 @@ A new shipped binary goes into `[feature_roots]`, a package with simulation test
 that must be a binary of its own into `[test_targets]`, and every new package into the group
 of `[check_groups]` that the table's rule names, all in `ci-policy.toml`, in the commit that
 adds them. Nothing in the code names a crate of the workspace except where a rule itself does:
-`lactose-app-server` (the server denylist), the `lactose-app-` prefix and `lactose-sim` (the
-two guards below), and `lactose-task` and `lactose-input-host` (the loom rule).
+`lactose-app` and `lactose-app-server` (the server denylist, which binds `lactose-app`'s
+normal-dependency closure whether or not `lactose-app-server` exists), the `lactose-app-`
+prefix and `lactose-sim` (the two guards below), and `lactose-task` and `lactose-input-host`
+(the loom rule).
 
 ## `tiers`
 
@@ -60,7 +62,10 @@ file is held to the rules wherever it is fetched from. A feature in `[dev_only_f
 a feature of its crate that turns it on, may be turned on by a dev-dependency edge alone: a
 normal or build edge enabling it, a `[features]` value forwarding to it (`name/feature` or
 `name?/feature`, under the dependency's rename if it has one), the crate's `default` turning it
-on, and a listed feature the crate does not declare are findings.
+on, and a listed feature the crate does not declare are findings. A `[server_denylist]` crate
+that `lactose-app` reaches through normal edges, or `lactose-app-server` through normal or
+build edges, at any depth, is a finding naming the chain; a chain of `lactose-app` that the
+server's own finding already shows is not reported twice.
 
 ## `boundary`
 

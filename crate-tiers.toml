@@ -79,7 +79,9 @@ crates = [
 ]
 
 [server_denylist]
-# lactose-app-server may not depend on these, directly or transitively.
+# lactose-app may not reach these through normal dependencies, nor lactose-app-server through
+# normal or build dependencies, directly or transitively. The rule binds lactose-app, which the
+# server links, whether or not lactose-app-server exists.
 crates = [
   "lactose-render-graph", "lactose-renderer", "lactose-presentation", "lactose-platform",
   "lactose-audio", "lactose-ui", "lactose-debug-ui", "lactose-rhi-vulkan", "lactose-rhi-metal",

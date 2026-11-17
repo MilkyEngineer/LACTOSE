@@ -153,11 +153,16 @@ impl Workspace {
     }
 
     /// The shortest chain of crate names from the `start` crates to each crate for which
-    /// `is_target` holds, following declared edges that ship (normal and build). A start
+    /// `is_target` holds, following the declared edges whose kind `follows` accepts. A start
     /// crate that is itself a target is a chain of one. A name that is no workspace member
     /// can end a chain but is not followed further. Sorted by target name.
     #[must_use]
-    pub fn chains_to(&self, start: &[&str], is_target: &dyn Fn(&str) -> bool) -> Vec<Vec<String>> {
+    pub fn chains_to(
+        &self,
+        start: &[&str],
+        follows: fn(DepKind) -> bool,
+        is_target: &dyn Fn(&str) -> bool,
+    ) -> Vec<Vec<String>> {
         let mut parent: BTreeMap<&str, Option<&str>> = BTreeMap::new();
         let mut queue: VecDeque<&str> = VecDeque::new();
         for &name in start {
@@ -173,7 +178,7 @@ impl Workspace {
             let Some(package) = self.package(name) else {
                 continue;
             };
-            for dep in package.deps.iter().filter(|d| d.kind.ships()) {
+            for dep in package.deps.iter().filter(|d| follows(d.kind)) {
                 if !parent.contains_key(dep.name.as_str()) {
                     parent.insert(&dep.name, Some(&package.name));
                     queue.push_back(&dep.name);
@@ -865,21 +870,28 @@ mod tests {
     }
 
     #[test]
-    fn chains_follow_shipping_edges_only() {
+    fn chains_follow_the_edges_they_are_told_to() {
         let ws = workspace(vec![
             package("lactose-a", &[("lactose-b", DepKind::Normal), ("lactose-d", DepKind::Dev)]),
-            package("lactose-b", &[("lactose-c", DepKind::Build)]),
+            package("lactose-b", &[("lactose-c", DepKind::Build), ("lactose-e", DepKind::Normal)]),
             package("lactose-c", &[]),
             package("lactose-d", &[]),
+            package("lactose-e", &[]),
         ]);
-        let chains =
-            ws.chains_to(&["lactose-a"], &|name| name == "lactose-c" || name == "lactose-d");
-        assert_eq!(chains, [["lactose-a", "lactose-b", "lactose-c"]]);
-        let own = ws.chains_to(&["lactose-c"], &|name| name == "lactose-c");
+        let targets = |name: &str| ["lactose-c", "lactose-d", "lactose-e"].contains(&name);
+        let chains = ws.chains_to(&["lactose-a"], DepKind::ships, &targets);
+        assert_eq!(
+            chains,
+            [["lactose-a", "lactose-b", "lactose-c"], ["lactose-a", "lactose-b", "lactose-e"]]
+        );
+        let normal = ws.chains_to(&["lactose-a"], |kind| kind == DepKind::Normal, &targets);
+        assert_eq!(normal, [["lactose-a", "lactose-b", "lactose-e"]]);
+        let own = ws.chains_to(&["lactose-c"], DepKind::ships, &|name| name == "lactose-c");
         assert_eq!(own, [["lactose-c"]]);
         // A name with no package behind it still ends a chain.
-        let outside = ws.chains_to(&["lactose-b"], &|name| name == "lactose-c");
-        assert_eq!(outside, [["lactose-b", "lactose-c"]]);
+        let ws = workspace(vec![package("lactose-b", &[("lactose-x", DepKind::Normal)])]);
+        let outside = ws.chains_to(&["lactose-b"], DepKind::ships, &|name| name == "lactose-x");
+        assert_eq!(outside, [["lactose-b", "lactose-x"]]);
     }
 
     #[test]
