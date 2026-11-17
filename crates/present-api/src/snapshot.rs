@@ -14,12 +14,14 @@
 
 use core::marker::PhantomData;
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use lactose_core::{ComponentKey, StableKey, Tick};
 use lactose_ecs::{PresentEventBatch, WorldKind};
-use lactose_physics_api::Transform;
-use lactose_reflect::Component;
+use lactose_physics_api::{Teleported, Transform};
+use lactose_reflect::{Component, bytemuck};
+
+use crate::{tick_after, tick_before};
 
 /// A snapshot channel: the writing half, which [`ExtractState::set_snapshot`] takes, and
 /// the reading half, which the presentation schedule keeps. One channel serves one world;
@@ -32,7 +34,12 @@ use lactose_reflect::Component;
 /// [`ExtractState::set_snapshot`]: crate::ExtractState::set_snapshot
 #[must_use]
 pub fn snapshot_channel() -> (SnapshotWriter, SnapshotReader) {
-    todo!()
+    let free = (0..3).map(|_| Arc::new(PresentSnapshot::empty())).collect();
+    let exchange = Arc::new(Mutex::new(Exchange { free, ..Exchange::default() }));
+    let writer =
+        SnapshotWriter { exchange: Arc::clone(&exchange), pending: None, pending_full: false };
+    let reader = SnapshotReader { exchange, held: None, events: PresentEventBatch::default() };
+    (writer, reader)
 }
 
 /// What the two halves share: which buffers are published, which is free, the events
@@ -63,6 +70,60 @@ struct Exchange {
     /// it is set every snapshot published is marked a cut, and a snapshot marked so does not
     /// move it (`README.md`, "The triple buffer").
     cut_mark: Option<u64>,
+    /// `publications` at the reader's last acquire that returned a new pair: an acquire with
+    /// nothing published since returns the same pair.
+    acquired: Option<u64>,
+    /// The reading half was dropped: every batch published from then on is dropped.
+    reader_gone: bool,
+}
+
+impl Exchange {
+    /// A buffer for the writer: a free one, else the newest published, which the reader does
+    /// not hold and which leaves publication. With three buffers one of the two is there:
+    /// the reader holds two at most, and the writer holds none when it asks.
+    fn take_buffer(&mut self) -> Arc<PresentSnapshot> {
+        match self.free.pop() {
+            Some(buffer) => buffer,
+            None => self.published.pop().expect("three buffers: one free or published").snapshot,
+        }
+    }
+
+    /// Puts a buffer that left publication or the reader's pair on the free list, once.
+    /// Called under the lock with every other handle to it dropped or about to be dropped
+    /// under the same lock, so the writer that takes it next finds it unshared.
+    fn release(&mut self, buffer: Arc<PresentSnapshot>) {
+        if !self.free.iter().any(|free| Arc::ptr_eq(free, &buffer)) {
+            self.free.push(buffer);
+        }
+    }
+}
+
+/// Appends `batch` to `into`, folded by the world's own rule: an emission followed by its
+/// cancellation is in neither list, and so is a cancellation followed by an emission of the
+/// same key. One take never holds both for a key, so the order within `batch` is moot.
+fn fold(into: &mut PresentEventBatch, batch: PresentEventBatch) {
+    if into.emitted.is_empty() && into.cancelled.is_empty() {
+        *into = batch;
+        return;
+    }
+    for key in batch.cancelled {
+        match into.emitted.iter().position(|emission| emission.key == key) {
+            Some(index) => drop(into.emitted.remove(index)),
+            None => into.cancelled.push(key),
+        }
+    }
+    for emission in batch.emitted {
+        match into.cancelled.iter().position(|&key| key == emission.key) {
+            Some(index) => drop(into.cancelled.remove(index)),
+            None => into.emitted.push(emission),
+        }
+    }
+}
+
+/// The channel's lock. A panic while it is held aborts a binary, so a poisoned lock is met
+/// only by a test that has already failed.
+fn lock(exchange: &Mutex<Exchange>) -> MutexGuard<'_, Exchange> {
+    exchange.lock().expect("nothing panics while the channel's lock is held")
 }
 
 /// A published snapshot and what an acquire pairs it with.
@@ -103,6 +164,74 @@ pub struct SnapshotWriter {
     pending_full: bool,
 }
 
+impl SnapshotWriter {
+    /// The buffer a pass writes: the unpublished snapshot if a pass since the last
+    /// publication wrote one, else a buffer from the channel, not a cut. `full` records that
+    /// a full pass wrote it.
+    pub(crate) fn buffer(&mut self, full: bool) -> &mut PresentSnapshot {
+        self.pending_full |= full;
+        let fresh = self.pending.is_none();
+        let exchange = &self.exchange;
+        let buffer = self.pending.get_or_insert_with(|| lock(exchange).take_buffer());
+        let snapshot = Arc::get_mut(buffer).expect("the buffer the writer writes is unshared");
+        if fresh {
+            snapshot.cut = false;
+        }
+        snapshot
+    }
+
+    /// Publishes the unpublished snapshot, if there is one, and folds `events` into those
+    /// the reader's next acquire returns, in one exchange (`README.md`, "The triple buffer"
+    /// and "Events and publication").
+    pub(crate) fn publish(&mut self, events: PresentEventBatch) {
+        let full = core::mem::take(&mut self.pending_full);
+        let pending = self.pending.take();
+        let mut exchange = lock(&self.exchange);
+        if !exchange.reader_gone {
+            fold(&mut exchange.events, events);
+        }
+        let Some(mut snapshot) = pending else { return };
+        let number = exchange.publications;
+        exchange.publications += 1;
+        let last = exchange.last;
+        let written = Arc::get_mut(&mut snapshot).expect("the buffer the writer wrote is unshared");
+        // A cut by its own cause: a pass made it one, or its tick is earlier than the tick of
+        // the snapshot published last.
+        let mut own = written.cut || last.is_some_and(|last| tick_before(written.tick, last.tick));
+        let replaced = last.filter(|last| {
+            written.kind == WorldKind::Prediction && full && last.tick == written.tick
+        });
+        let follows = match replaced {
+            Some(last) => {
+                own |= last.cut;
+                last.follows
+            }
+            None => exchange
+                .published
+                .last()
+                .map(|published| published.number)
+                .or(exchange.held.map(|[_, newer]| newer)),
+        };
+        if own {
+            exchange.cut_mark = Some(number);
+        }
+        written.cut = own || exchange.cut_mark.is_some();
+        let tick = written.tick;
+        exchange.last = Some(LastPublished { number, tick, cut: written.cut, follows });
+        let published = Published { snapshot, number, follows };
+        let place = replaced.and_then(|last| {
+            exchange.published.iter().position(|published| published.number == last.number)
+        });
+        match place {
+            Some(index) => {
+                let replaced = core::mem::replace(&mut exchange.published[index], published);
+                exchange.release(replaced.snapshot);
+            }
+            None => exchange.published.push(published),
+        }
+    }
+}
+
 /// The reading half of a snapshot channel: one reader, on the render side.
 #[derive(Debug)]
 pub struct SnapshotReader {
@@ -127,7 +256,95 @@ impl SnapshotReader {
     /// after finds a buffer free. `README.md`, "The snapshot", states what the pair is
     /// when the reader runs slower than the passes, and that no event is lost then.
     pub fn acquire(&mut self) -> Option<PresentFrame<'_>> {
-        todo!()
+        let mut exchange = lock(&self.exchange);
+        self.events = core::mem::take(&mut exchange.events);
+        if exchange.publications == 0 {
+            return None;
+        }
+        if exchange.acquired != Some(exchange.publications) {
+            exchange.acquired = Some(exchange.publications);
+            let held = self.held.take().zip(exchange.held);
+            let (pair, numbers) = match exchange.published.pop() {
+                Some(newer) => pair_with(&mut exchange, held, newer),
+                // Nothing published after the reader's newer snapshot is still published: a
+                // pass took it back and is writing it. Keeping the newer one twice and
+                // letting the older go leaves the next pass a free buffer.
+                None => {
+                    let ([older, newer], [_, number]) =
+                        held.expect("what was published and is no more was acquired");
+                    if !Arc::ptr_eq(&older, &newer) {
+                        exchange.release(older);
+                    }
+                    ([Arc::clone(&newer), newer], [number, number])
+                }
+            };
+            // Once acquired, a snapshot follows the older of its pair, and a replacement of
+            // it follows what it did.
+            if let Some(last) = exchange.last.as_mut().filter(|last| last.number == numbers[1]) {
+                last.follows = Some(numbers[0]);
+            }
+            if exchange.cut_mark.is_some_and(|mark| numbers[1] >= mark) {
+                exchange.cut_mark = None;
+            }
+            exchange.held = Some(numbers);
+            self.held = Some(pair);
+        }
+        drop(exchange);
+        let [older, newer] = self.held.as_ref().expect("a publication was acquired");
+        Some(PresentFrame { older, newer, events: &self.events })
+    }
+}
+
+/// The pair of an acquire whose newer snapshot is `newer`, the newest published: its older
+/// one is the snapshot it follows if the channel still has it (published, or in `held`, the
+/// reader's last pair), else the reader's newer one, else `newer` itself. Every other
+/// buffer published or held goes back to the free list: no later pair holds it.
+fn pair_with(
+    exchange: &mut Exchange,
+    held: Option<([Arc<PresentSnapshot>; 2], [u64; 2])>,
+    newer: Published,
+) -> ([Arc<PresentSnapshot>; 2], [u64; 2]) {
+    let mut candidates: Vec<(u64, Arc<PresentSnapshot>)> = Vec::new();
+    let mut fallback = None;
+    if let Some(([held_older, held_newer], [older_number, newer_number])) = held {
+        candidates.push((older_number, held_older));
+        candidates.push((newer_number, held_newer));
+        fallback = Some(newer_number);
+    }
+    candidates.extend(
+        core::mem::take(&mut exchange.published)
+            .into_iter()
+            .map(|published| (published.number, published.snapshot)),
+    );
+    let older_number = newer
+        .follows
+        .filter(|&number| candidates.iter().any(|&(candidate, _)| candidate == number))
+        .or(fallback)
+        .unwrap_or(newer.number);
+    let mut older: Option<Arc<PresentSnapshot>> = None;
+    for (number, buffer) in candidates {
+        if number == older_number && older.is_none() {
+            older = Some(buffer);
+        } else if older.as_ref().is_none_or(|kept| !Arc::ptr_eq(kept, &buffer)) {
+            exchange.release(buffer);
+        }
+    }
+    let older = older.unwrap_or_else(|| Arc::clone(&newer.snapshot));
+    ([older, newer.snapshot], [older_number, newer.number])
+}
+
+impl Drop for SnapshotReader {
+    /// Nothing will acquire again: `publish` drops every batch from now on, and the
+    /// reader's buffers go back to the channel.
+    fn drop(&mut self) {
+        let mut exchange = lock(&self.exchange);
+        exchange.reader_gone = true;
+        exchange.events = PresentEventBatch::default();
+        exchange.held = None;
+        if let Some([older, newer]) = self.held.take() {
+            exchange.release(older);
+            exchange.release(newer);
+        }
     }
 }
 
@@ -183,7 +400,10 @@ impl PresentSnapshot {
     #[must_use]
     pub fn get<T: Component>(&self, key: StableKey) -> Option<T> {
         const { assert!(is_extracted::<T>(), "a snapshot holds `extracted` components alone") };
-        todo!()
+        let column = self.columns.get(&T::KEY)?;
+        let row = column.keys.binary_search(&key).ok()?;
+        let size = size_of::<T>();
+        Some(read(&column.bytes[row * size..(row + 1) * size]))
     }
 
     /// Every row that has a `T`, with its value, in ascending key order. Does not build
@@ -191,8 +411,52 @@ impl PresentSnapshot {
     #[must_use]
     pub fn rows<T: Component>(&self) -> SnapshotRows<'_, T> {
         const { assert!(is_extracted::<T>(), "a snapshot holds `extracted` components alone") };
-        todo!()
+        let (keys, bytes) = match self.columns.get(&T::KEY) {
+            Some(column) => (&column.keys[..], &column.bytes[..]),
+            None => (&[][..], &[][..]),
+        };
+        SnapshotRows { keys: keys.iter(), bytes, marker: PhantomData }
     }
+
+    /// A buffer no pass has written yet.
+    fn empty() -> Self {
+        Self { kind: WorldKind::Server, tick: Tick(0), cut: false, columns: BTreeMap::new() }
+    }
+
+    /// Makes the snapshot `kind`'s at `tick`, holding `columns`: per component, its rows'
+    /// keys and values' bytes, in any order. The rows are sorted by key here, and the
+    /// columns' allocations are kept for the next pass. `cut` makes it a cut; a snapshot a
+    /// pass made one stays one until it is published.
+    pub(crate) fn fill(
+        &mut self,
+        kind: WorldKind,
+        tick: Tick,
+        cut: bool,
+        columns: BTreeMap<ComponentKey, Vec<(StableKey, &[u8])>>,
+    ) {
+        self.kind = kind;
+        self.tick = tick;
+        self.cut |= cut;
+        for column in self.columns.values_mut() {
+            column.keys.clear();
+            column.bytes.clear();
+        }
+        for (component, mut rows) in columns {
+            rows.sort_unstable_by_key(|&(key, _)| key);
+            let column = self.columns.entry(component).or_default();
+            column.keys.extend(rows.iter().map(|&(key, _)| key));
+            for (_, bytes) in rows {
+                column.bytes.extend_from_slice(bytes);
+            }
+        }
+        self.columns.retain(|_, column| !column.keys.is_empty());
+    }
+}
+
+/// The value `bytes` hold, read unaligned. They were copied from a column of `T`, so a
+/// failure is a broken invariant.
+fn read<T: Component>(bytes: &[u8]) -> T {
+    bytemuck::checked::try_pod_read_unaligned(bytes).expect("a snapshot holds valid values")
 }
 
 /// Whether `T` is declared `extracted`.
@@ -213,7 +477,10 @@ impl<T: Component> Iterator for SnapshotRows<'_, T> {
     type Item = (StableKey, T);
 
     fn next(&mut self) -> Option<(StableKey, T)> {
-        todo!()
+        let key = *self.keys.next()?;
+        let (value, rest) = self.bytes.split_at(size_of::<T>());
+        self.bytes = rest;
+        Some((key, read(value)))
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
@@ -270,7 +537,15 @@ impl<'a> PresentFrame<'a> {
     /// comparison of ticks.
     #[must_use]
     pub fn transform(&self, key: StableKey) -> Option<TransformPair> {
-        todo!()
+        let current = self.newer.get::<Transform>(key)?;
+        let previous = self.older.get::<Transform>(key);
+        let teleported =
+            self.newer.get::<Teleported>(key).map_or(Tick(0), |teleported| teleported.0);
+        let no_interpolate = self.newer.cut
+            || previous.is_none()
+            || self.older.tick == self.newer.tick
+            || (teleported != Tick(0) && tick_after(teleported, self.older.tick));
+        Some(TransformPair { previous: previous.unwrap_or(current), current, no_interpolate })
     }
 }
 

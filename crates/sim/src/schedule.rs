@@ -66,8 +66,10 @@ impl Stage {
 /// added is skipped.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub enum Pass {
-    /// Extract (architecture section 5.3): `presentation` copies dirty rows into the staging
-    /// ring and writes the presentation snapshot. Milestone 2 fills it.
+    /// Extract (architecture section 5.3): `present-api`'s `present::extract` system, placed
+    /// by `lactose_present_api::register_systems`, writes the instances changed since its
+    /// previous pass to the sink the renderer installs and the presented rows to the
+    /// presentation snapshot, from the `ChangeMark` and `LogCursor` its `ExtractState` keeps.
     Extract,
     /// The replication gather (architecture section 9.3): `net-api`'s `net::gather` system,
     /// placed by `lactose_net_api::register_systems`, copies the rows changed since its

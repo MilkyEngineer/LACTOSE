@@ -12,12 +12,6 @@
 //! one conversion to 32-bit floats is `lactose_math`'s. The `README.md` is the contract:
 //! it states what the signatures cannot, and what a caller may rely on.
 //!
-//! # Status
-//!
-//! A facade: every public signature is final and every body that decides anything is
-//! `todo!()`. The implementation lane replaces the bodies behind this surface and removes
-//! the crate-level `allow` with the last `todo!()`.
-//!
 //! # Where to start
 //!
 //! - [`MeshInstance`], [`Light`], [`Decal`] and [`CameraRig`] are the components a game
@@ -69,12 +63,6 @@
 //! ```
 
 #![forbid(unsafe_code)]
-#![allow(
-    dead_code,
-    unused_variables,
-    reason = "facade: every deciding body is `todo!()` until the implementation lane replaces \
-              it, and the fields and parameters it will use are declared now"
-)]
 
 mod components;
 mod debug;
@@ -87,7 +75,7 @@ pub use components::{CameraRig, Decal, Light, LightKind, MaterialAsset, MeshAsse
 pub use debug::{DebugDraw, DebugLine};
 pub use events::{AudioRequest, DebugShape, DebugShapeKind, EffectAsset, SoundAsset, VfxRequest};
 pub use extract::{ExtractPass, ExtractState, InstanceRow, InstanceSink, RenderTransform};
-use lactose_core::Result;
+use lactose_core::{Result, Tick};
 use lactose_ecs::World;
 use lactose_sim::{Pass, Registration, Simulation, TypeTable};
 pub use snapshot::{
@@ -136,6 +124,19 @@ pub fn extract_state(simulation: &mut Simulation) -> Option<&mut ExtractState> {
 /// system's key is in `lactose_predict::EXCLUSIVE_SYSTEMS`.
 pub fn register_systems(registration: &mut Registration) {
     registration.pass(Pass::Extract).add(&extract::EXTRACT);
+}
+
+/// Whether `tick` is later than `than` by the wrapping comparison of ticks: the difference
+/// is in `1..2^31`.
+const fn tick_after(tick: Tick, than: Tick) -> bool {
+    let difference = tick.0.wrapping_sub(than.0);
+    difference != 0 && difference < 1 << 31
+}
+
+/// Whether `tick` is earlier than `than` by the wrapping comparison of ticks, as the ECS
+/// orders them: the difference is at least `2^31`.
+const fn tick_before(tick: Tick, than: Tick) -> bool {
+    tick.0.wrapping_sub(than.0) >= 1 << 31
 }
 
 /// What the contract promises at the type level, pinned so the implementation cannot lose

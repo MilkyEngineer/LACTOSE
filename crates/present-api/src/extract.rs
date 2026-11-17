@@ -11,16 +11,21 @@
 //! resource, no event and no log entry. Every row it produces is keyed by `StableKey`, and
 //! the one conversion to floats it makes is `lactose_math`'s.
 
+use std::collections::BTreeMap;
+
 use lactose_asset_api::AssetRef;
-use lactose_core::{StableKey, Tick};
+use lactose_core::{ComponentKey, StableKey, Tick};
 use lactose_ecs::{
-    ChangeMark, Job, LogCursor, PresentEventBatch, ResMut, World, WorldKind, system,
+    ChangeMark, ChunkRef, ClaimedBy, ErasedColumn, Job, LogCursor, LogEntry, PresentEventBatch,
+    ResMut, StructuralChange, World, WorldKind, system,
 };
 use lactose_math::render::RenderPosition;
-use lactose_physics_api::Transform;
+use lactose_physics_api::{Teleported, Transform};
+use lactose_reflect::{Reflect, TypeRole};
 
-use crate::components::MeshAsset;
+use crate::components::{MeshAsset, MeshInstance};
 use crate::snapshot::SnapshotWriter;
+use crate::{tick_after, tick_before};
 
 /// A placement in render space (architecture section 12.4): the position as a grid cell
 /// and an offset, the rotation as a unit quaternion of 32-bit floats. Disjoint from the
@@ -164,13 +169,24 @@ pub struct ExtractState {
     /// that same tick, what the previous pass compared with (`README.md`, "The
     /// no-interpolate flag").
     covered: Option<Tick>,
+    /// The keys of the presented rows in the snapshot the last pass wrote, ascending: an idle
+    /// pass writes a snapshot when a row entered or left them.
+    presented: Vec<StableKey>,
 }
 
 impl ExtractState {
     /// A state with no output and no pass behind it.
     #[must_use]
     pub const fn new() -> Self {
-        Self { sink: None, snapshot: None, last: None, settle: None, tick: None, covered: None }
+        Self {
+            sink: None,
+            snapshot: None,
+            last: None,
+            settle: None,
+            tick: None,
+            covered: None,
+            presented: Vec::new(),
+        }
     }
 
     /// Installs `sink` as where instances are written, or removes the sink with `None`,
@@ -180,7 +196,8 @@ impl ExtractState {
         &mut self,
         sink: Option<Box<dyn InstanceSink>>,
     ) -> Option<Box<dyn InstanceSink>> {
-        todo!()
+        self.last = None;
+        core::mem::replace(&mut self.sink, sink)
     }
 
     /// Installs `writer` as the snapshot channel this world's passes write, or removes it
@@ -188,7 +205,8 @@ impl ExtractState {
     /// serves one world for as long as it is installed: installing in one world a writer
     /// another world has written gives the reader a pair of snapshots of two worlds.
     pub fn set_snapshot(&mut self, writer: Option<SnapshotWriter>) -> Option<SnapshotWriter> {
-        todo!()
+        self.last = None;
+        core::mem::replace(&mut self.snapshot, writer)
     }
 
     /// One pass over `world`: what the `present::extract` system runs, and what a pass
@@ -201,7 +219,70 @@ impl ExtractState {
     /// The snapshot a pass writes is not visible to the reader until
     /// [`publish`](Self::publish).
     pub fn extract(&mut self, world: &World, job: &mut Job<'_, '_>) {
-        todo!()
+        if self.sink.is_none() && self.snapshot.is_none() {
+            return;
+        }
+        let (kind, tick, mark) = (world.kind(), world.tick(), world.mark());
+        let log = world.structural_log();
+        // Full when there is no previous pass, its mark is stale, or the log no longer reaches
+        // its cursor; decided before any row is read.
+        let previous = self.last.filter(|&(last, _)| world.is_current(last));
+        let entries: Option<Vec<LogEntry>> =
+            previous.and_then(|(_, mut cursor)| Some(log.since(&mut cursor)?.copied().collect()));
+        let since = previous.map(|(last, _)| last).filter(|_| entries.is_some());
+        let entries = entries.unwrap_or_default();
+        let full = since.is_none();
+        let follows = self.tick != Some(tick);
+        let idle = !full && !follows;
+        let earlier = self.tick.is_some_and(|previous| tick_before(tick, previous));
+        let pass = Pass {
+            kind,
+            flag_all: earlier || idle || (full && kind == WorldKind::Server),
+            covered: match self.tick {
+                Some(previous) if previous == tick => self.covered,
+                previous => previous,
+            },
+            // Rows stamped since the settling mark after a tick, since the previous pass
+            // otherwise: rules (1) and (3) of "Full and incremental passes", the settling
+            // mark being no later than the previous pass's. `None` is every row.
+            from: if full {
+                None
+            } else if follows {
+                self.settle
+            } else {
+                since
+            },
+        };
+
+        if let Some(sink) = self.sink.as_deref_mut() {
+            write_instances(world, job, sink, &pass, full, &entries);
+        }
+        if let Some(writer) = &mut self.snapshot {
+            let presented = Presented::new(world);
+            let chunks: Vec<ChunkRef<'_>> =
+                world.chunks().filter(|chunk| presented.holds(chunk)).collect();
+            let changed = since.is_some_and(|since| {
+                !follows && presented.changed(&chunks, since, &entries, &self.presented)
+            });
+            if full || follows || changed {
+                let snapshot = writer.buffer(full);
+                let keys = presented.fill(snapshot, &chunks, tick, full);
+                self.presented = keys;
+            }
+        }
+
+        self.settle = if full {
+            // A prediction world's next pass that follows a tick writes every instance once
+            // more ("Settling").
+            (kind != WorldKind::Prediction).then_some(mark)
+        } else if follows {
+            since
+        } else {
+            self.settle
+        };
+        self.last = Some((mark, log.cursor()));
+        self.covered = pass.covered;
+        self.tick = Some(tick);
     }
 
     /// Publishes what the passes since the previous publication wrote, with the
@@ -219,7 +300,9 @@ impl ExtractState {
     /// once the channel's reading half is dropped, the batch is dropped: nothing presents
     /// this world, and nothing accumulates for a reader that will never acquire.
     pub fn publish(&mut self, events: PresentEventBatch) {
-        todo!()
+        if let Some(writer) = &mut self.snapshot {
+            writer.publish(events);
+        }
     }
 }
 
@@ -238,8 +321,315 @@ impl core::fmt::Debug for ExtractState {
             .field("settle", &self.settle)
             .field("tick", &self.tick)
             .field("covered", &self.covered)
+            .field("presented", &self.presented.len())
             .finish()
     }
+}
+
+/// What one pass decided before reading a row.
+struct Pass {
+    kind: WorldKind,
+    /// Every row the pass writes has `no_interpolate` set.
+    flag_all: bool,
+    /// The tick a row's `Teleported` is compared with, `None` before the first pass.
+    covered: Option<Tick>,
+    /// An incremental pass writes the instances whose `Transform` or `MeshInstance` was
+    /// stamped since this mark; `None` writes every instance.
+    from: Option<ChangeMark>,
+}
+
+impl Pass {
+    /// Whether the instance enters the extract set's rows: in a prediction world, only a
+    /// claimed row.
+    fn in_set(&self, chunk: &ChunkRef<'_>) -> bool {
+        self.kind != WorldKind::Prediction || chunk.column(ClaimedBy::KEY).is_some()
+    }
+
+    /// Whether `component` makes a row an instance of the set: losing it takes the row out,
+    /// gaining it may bring the row in.
+    fn instance_component(&self, component: ComponentKey) -> bool {
+        component == Transform::KEY
+            || component == MeshInstance::KEY
+            || (self.kind == WorldKind::Prediction && component == ClaimedBy::KEY)
+    }
+
+    fn row(
+        &self,
+        key: StableKey,
+        mesh: &MeshInstance,
+        transform: &Transform,
+        teleported: Option<&Teleported>,
+    ) -> InstanceRow {
+        let teleported = teleported.map_or(Tick(0), |teleported| teleported.0);
+        let teleport = teleported != Tick(0)
+            && self.covered.is_some_and(|covered| tick_after(teleported, covered));
+        InstanceRow {
+            key,
+            mesh: mesh.mesh,
+            transform: RenderTransform::from_sim(transform),
+            no_interpolate: self.flag_all || teleport,
+        }
+    }
+
+    /// The rows of `chunk` the pass writes, appended to `out`, leaving out `forced`, which
+    /// the pass writes in a batch of their own.
+    fn chunk_rows(&self, chunk: &ChunkRef<'_>, forced: &[StableKey], out: &mut Vec<InstanceRow>) {
+        let (Some(transforms), Some(meshes)) =
+            (chunk.values::<Transform>(), chunk.values::<MeshInstance>())
+        else {
+            return;
+        };
+        let teleported = chunk.values::<Teleported>();
+        let keys = chunk.keys();
+        let rows = match self.from.and_then(|from| changed_rows(chunk, from)) {
+            Some(rows) => rows,
+            None => (0..keys.len()).collect(),
+        };
+        for row in rows {
+            let key = keys[row];
+            if forced.binary_search(&key).is_err() {
+                let teleported = teleported.map(|values| &values[row]);
+                out.push(self.row(key, &meshes[row], &transforms[row], teleported));
+            }
+        }
+    }
+
+    /// Whether `chunk`, an instance chunk of the set, holds a row the pass writes.
+    fn writes_in(&self, chunk: &ChunkRef<'_>) -> bool {
+        match self.from {
+            None => !chunk.keys().is_empty(),
+            Some(from) => [Transform::KEY, MeshInstance::KEY]
+                .into_iter()
+                .any(|component| any_changed(chunk.column(component), from)),
+        }
+    }
+}
+
+/// The rows of `chunk` whose `Transform` or `MeshInstance` was stamped since `from`,
+/// ascending, or `None` if the mark is stale, which writes every row.
+fn changed_rows(chunk: &ChunkRef<'_>, from: ChangeMark) -> Option<Vec<usize>> {
+    let mut rows = Vec::new();
+    for component in [Transform::KEY, MeshInstance::KEY] {
+        let column = chunk.column(component)?;
+        rows.extend(column.changed_since(from)?);
+    }
+    rows.sort_unstable();
+    rows.dedup();
+    Some(rows)
+}
+
+/// Whether a row of `column` was stamped since `from`. Its chunk is skipped by its column
+/// stamp without reading a row when none was; a stale mark counts as a change.
+fn any_changed(column: Option<ErasedColumn<'_>>, from: ChangeMark) -> bool {
+    column.is_none_or(|column| {
+        column.changed_since(from).is_none_or(|mut rows| rows.next().is_some())
+    })
+}
+
+/// The sink's half of a pass: `begin`, `removed`, the writes from the pass's forked jobs,
+/// `end`; nothing when an incremental pass has nothing to say (`README.md`, "What a pass
+/// gives the sink").
+fn write_instances(
+    world: &World,
+    job: &mut Job<'_, '_>,
+    sink: &mut dyn InstanceSink,
+    pass: &Pass,
+    full: bool,
+    entries: &[LogEntry],
+) {
+    let mut removed: Vec<StableKey> = entries
+        .iter()
+        .filter_map(|entry| match entry.change {
+            StructuralChange::Despawned { key, .. } => Some(key),
+            StructuralChange::Removed { key, component } if pass.instance_component(component) => {
+                Some(key)
+            }
+            _ => None,
+        })
+        .collect();
+    removed.sort_unstable();
+    removed.dedup();
+
+    let writes = pass.kind != WorldKind::Client;
+    // Rule (2): a row the log records as spawned or as having gained what makes it an
+    // instance of the set, whatever its stamps say. Read by key and written in one batch;
+    // the chunks' batches leave these keys out, so each row is written once.
+    let mut forced_keys: Vec<StableKey> = entries
+        .iter()
+        .filter_map(|entry| match entry.change {
+            StructuralChange::Spawned { key, .. } => Some(key),
+            StructuralChange::Added { key, component } if pass.instance_component(component) => {
+                Some(key)
+            }
+            _ => None,
+        })
+        .filter(|_| writes && !full)
+        .collect();
+    forced_keys.sort_unstable();
+    forced_keys.dedup();
+    let forced: Vec<InstanceRow> = forced_keys
+        .iter()
+        .filter_map(|&key| {
+            let transform = world.get::<Transform>(key)?;
+            let mesh = world.get::<MeshInstance>(key)?;
+            if pass.kind == WorldKind::Prediction && world.get::<ClaimedBy>(key).is_none() {
+                return None;
+            }
+            Some(pass.row(key, mesh, transform, world.get::<Teleported>(key)))
+        })
+        .collect();
+    let forced_keys: Vec<StableKey> = forced.iter().map(|row| row.key).collect();
+
+    let chunks: Vec<ChunkRef<'_>> = world
+        .chunks()
+        .filter(|chunk| {
+            writes
+                && pass.in_set(chunk)
+                && chunk.column(Transform::KEY).is_some()
+                && chunk.column(MeshInstance::KEY).is_some()
+                && pass.writes_in(chunk)
+        })
+        .collect();
+    if !full && removed.is_empty() && forced.is_empty() && chunks.is_empty() {
+        return;
+    }
+
+    sink.begin(ExtractPass { kind: pass.kind, tick: world.tick(), full });
+    if !removed.is_empty() {
+        sink.removed(&removed);
+    }
+    let shared: &dyn InstanceSink = sink;
+    let units = u32::try_from(chunks.len()).expect("fewer than 2^32 chunks");
+    let (chunks, forced_keys) = (&chunks, &forced_keys);
+    job.context().scope(|scope| {
+        if !forced.is_empty() {
+            scope.fork(move |_| shared.write(&forced));
+        }
+        if units > 0 {
+            scope.fork_range(0..units, move |range, _| {
+                let mut rows = Vec::new();
+                for unit in range {
+                    pass.chunk_rows(&chunks[unit as usize], forced_keys, &mut rows);
+                }
+                if !rows.is_empty() {
+                    shared.write(&rows);
+                }
+            });
+        }
+    });
+    sink.end();
+}
+
+/// The snapshot's half of a pass: which rows are presented rows, which of their components
+/// it copies, and whether an idle pass has anything to write.
+struct Presented {
+    kind: WorldKind,
+    /// The components the world's registry declares `extracted`, ascending.
+    extracted: Vec<ComponentKey>,
+}
+
+impl Presented {
+    fn new(world: &World) -> Self {
+        let mut extracted: Vec<ComponentKey> = world
+            .registry()
+            .iter()
+            .filter(|info| info.role() == TypeRole::Component && info.tracking().extracted)
+            .map(|info| info.key())
+            .collect();
+        extracted.sort_unstable();
+        Self { kind: world.kind(), extracted }
+    }
+
+    /// Whether the snapshot copies `component` of a presented row: every extracted one, but
+    /// a `Client` world's transforms, which are the interpolation buffer's.
+    fn copies(&self, component: ComponentKey) -> bool {
+        self.extracted.binary_search(&component).is_ok()
+            && !(self.kind == WorldKind::Client
+                && (component == Transform::KEY || component == Teleported::KEY))
+    }
+
+    /// Whether `chunk`'s rows are presented rows of the extract set.
+    fn holds(&self, chunk: &ChunkRef<'_>) -> bool {
+        (self.kind != WorldKind::Prediction || chunk.column(ClaimedBy::KEY).is_some())
+            && chunk.components().any(|component| {
+                component != Transform::KEY
+                    && component != Teleported::KEY
+                    && component != MeshInstance::KEY
+                    && self.extracted.binary_search(&component).is_ok()
+            })
+    }
+
+    /// Whether an idle pass writes a snapshot: a presented row was stamped in a column the
+    /// snapshot copies since `since`, or a row entered or left the presented rows (their
+    /// keys are not `previous`, those of the snapshot last written), or a presented row lost
+    /// a component the snapshot copies.
+    fn changed(
+        &self,
+        chunks: &[ChunkRef<'_>],
+        since: ChangeMark,
+        entries: &[LogEntry],
+        previous: &[StableKey],
+    ) -> bool {
+        let stamped = chunks.iter().any(|chunk| {
+            chunk
+                .components()
+                .filter(|&component| self.copies(component))
+                .any(|component| any_changed(chunk.column(component), since))
+        });
+        if stamped {
+            return true;
+        }
+        if entries.is_empty() {
+            return false;
+        }
+        let keys = keys_of(chunks);
+        keys != previous
+            || entries.iter().any(|entry| match entry.change {
+                StructuralChange::Removed { key, component } => {
+                    self.copies(component) && keys.binary_search(&key).is_ok()
+                }
+                _ => false,
+            })
+    }
+
+    /// Writes the presented rows of `chunks` into `snapshot`, and returns their keys,
+    /// ascending. A full pass in a world that is not a prediction world makes it a cut.
+    fn fill(
+        &self,
+        snapshot: &mut crate::PresentSnapshot,
+        chunks: &[ChunkRef<'_>],
+        tick: Tick,
+        full: bool,
+    ) -> Vec<StableKey> {
+        let columns: Vec<ErasedColumn<'_>> = chunks
+            .iter()
+            .flat_map(|chunk| {
+                chunk
+                    .components()
+                    .filter(|&component| self.copies(component))
+                    .filter_map(|component| chunk.column(component))
+            })
+            .collect();
+        let mut rows: BTreeMap<ComponentKey, Vec<(StableKey, &[u8])>> = BTreeMap::new();
+        for column in &columns {
+            let size = column.element_size();
+            let values = rows.entry(column.component()).or_default();
+            for (row, &key) in column.keys().iter().enumerate() {
+                values.push((key, &column.bytes()[row * size..(row + 1) * size]));
+            }
+        }
+        let cut = full && self.kind != WorldKind::Prediction;
+        snapshot.fill(self.kind, tick, cut, rows);
+        keys_of(chunks)
+    }
+}
+
+/// The keys of `chunks`' rows, ascending.
+fn keys_of(chunks: &[ChunkRef<'_>]) -> Vec<StableKey> {
+    let mut keys: Vec<StableKey> =
+        chunks.iter().flat_map(|chunk| chunk.keys().iter().copied()).collect();
+    keys.sort_unstable();
+    keys
 }
 
 /// The service resource [`setup`](crate::setup) inserts: the world's [`ExtractState`] under
