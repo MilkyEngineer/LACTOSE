@@ -114,7 +114,8 @@ emits `tracing` spans. Tracy is the profiler target.
 
 ## 4. Workspace layout
 
-Every crate is published as `lactose-<name>`. Tier is F (foundation, usable by anyone), B
+Every engine crate is published as `lactose-<name>`; the game's crates are `game-<name>`, as the
+`[game]` list of `crate-tiers.toml` names them (`game-sim`, D152). Tier is F (foundation, usable by anyone), B
 (backend, usable only by assembly crates, leaf crates and the exceptions in
 `crate-tiers.toml`) or A (assembly, usable only by leaf crates).
 Codenames in brackets appear only where section 3 allows. Boundary marks crates inside the
@@ -746,8 +747,8 @@ crates.io archive and the advisory check runs over the upstream versions, which 
 behind a path source. The two proc-macro crates carry the boundary `clippy.toml` as well, since the
 code they emit is compiled inside boundary crates. So does each crate outside the boundary that
 declares what a world registers (section 8.1): `lactose-present-api` for the presentation
-components and extract's pass system, and `lactose-app-headless` for its sketch game until that
-moves into `game-sim` at milestone 2, after which no binary is a carrier (D152).
+components and extract's pass system; no binary is one, since the headless binary's sketch game
+moved into `game-sim` at milestone 2 (D152).
 `[lint_file_carriers]` in `tools/xtask/ci-policy.toml` lists the carriers, and a crate joins it in
 the change that adds its first such declaration. `cargo xtask boundary` reports, in the shipped
 sources of any other crate outside the boundary, a `#[system]`, a `#[component]` or `#[resource]`
@@ -1308,10 +1309,11 @@ drive it, in the server world alone. D128.
 - Dev profile: dependencies at opt-level 3, game crates at opt-level 1, line-tables-only debug
   info, split debuginfo, mold or lld on Linux, lld-link on Windows. Registration is through
   generated functions, not life-before-main. Edit-to-playing time is budgeted at thirty seconds
-  per platform. Milestone 1 measures its floor, since no game crate exists before milestone 5:
-  from saving a one-line change to the headless binary's report of one tick, on a warm
-  dev-profile build, for an edit in the binary's own crate and for one in `app`, read against
-  the slower. Milestone 5 measures it again on the game crates.
+  per platform. Milestone 1 measures its floor: from saving a one-line change to the headless
+  binary's report of one tick, on a warm dev-profile build, for an edit in the binary's own
+  crate and for one in `app`, read against the slower. From milestone 2 the sketch's edit is in
+  `game-sim`, which holds the sketch game (D152). Milestone 5 measures it again on the game
+  crates.
 - Iteration is state-preserving restart through `reflect`. Dylib reload later if needed.
 
 ## 19. Error handling

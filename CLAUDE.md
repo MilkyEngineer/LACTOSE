@@ -10,8 +10,9 @@ The work is done by agents under the process in `docs/agents.md`; their definiti
 
 ## Names
 
-Things you run get codenames, things you import get descriptions. Crates are `lactose-<role>`.
-Never use a codename for a crate, type, function, module, constant or static, in test code
+Things you run get codenames, things you import get descriptions. Engine crates are
+`lactose-<role>`; the game's crates are `game-<role>`, as crate-tiers.toml's `[game]` list names
+them. Never use a codename for a crate, type, function, module, constant or static, in test code
 as elsewhere; a test or bench target may carry one.
 
 | Codename | Means |

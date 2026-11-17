@@ -2,7 +2,9 @@
 //! and the headless app's rows of the milestone 1 proof (`README.md`): a game crate's
 //! registration, the binary's `main` (which `crates/app-headless` is, over the same sketch
 //! game), the SOUR test that records a run under the runner, a save round trip, and the
-//! tests of section 5. A change that breaks a sketch is a signature change to list.
+//! tests of section 5. The sketch game is `game-sim`'s, the crate the binary links, so the
+//! recorded run steps the system that ships (D152). A change that breaks a sketch is a
+//! signature change to list.
 
 #![forbid(unsafe_code)]
 #![allow(missing_docs)]
@@ -15,6 +17,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
 
+use game_sim::Counter;
 use lactose_app::{
     CATCH_UP_CAP, Cooked, CrateRegistration, ErrorPolicy, Game, Headless, HeadlessConfig,
     LOG_RETENTION, LOG_TARGET, LifecycleFailures, Response, RunReport, Server, Source, Start,
@@ -29,9 +32,7 @@ use lactose_core::{Error, ErrorKind, PlayerId, Result, StableKey, Tick};
 use lactose_ecs::{ClaimedBy, LayoutConfig, Mut, RegionId, RegionMode, World, system};
 use lactose_input::{AXIS_SCALE, Axis2, PlayerInput, Yaw, player_entity};
 use lactose_math::{Scalar, Vec3};
-use lactose_persist::Migrations;
 use lactose_physics_api::{Collider, RigidBody, Shape, Transform, Velocity, snapshot};
-use lactose_reflect::component;
 use lactose_sim::harness::{ChunkCapacity, layout_mode, layout_mode_of};
 use lactose_sim::{
     PlayerSample, RegionBundle, RegionControl, Registration, SessionApplier, SessionEvent, Stage,
@@ -42,63 +43,21 @@ use protocol::{Capacity, Layout, RunConfig, Session};
 
 // ---- 1. A game crate's registration (architecture section 18) ----
 
-/// Counts ticks; replicated, so a prediction system may read it.
-#[component(key = "sketch::counter", persistent, replicated)]
-pub struct Counter(#[field(id = 1)] pub u32);
-
-#[system(name = "sketch::count", worlds = [server, prediction])]
-fn count(counter: Mut<Counter>) {
-    counter.0 = counter.0.wrapping_add(1);
-}
-
-/// The crate's generated `register_types`.
-pub fn register_types(types: &mut TypeTable) -> Result<()> {
-    types.register::<Counter>()
-}
-
-/// The crate's generated `register_systems`.
-pub fn register_systems(registration: &mut Registration) {
-    registration.stage(Stage::Simulation).add(&COUNT);
-}
-
-/// The crate's `register_migrations`: no bump yet.
-pub fn register_migrations(_: &mut Migrations) -> Result<()> {
-    Ok(())
-}
-
-/// What the crate exposes: one `static`, function pointers only, nothing built before
-/// `main`. Its `setup` would insert the crate's services; it has none, so `None`.
-pub static SKETCH_SIM: CrateRegistration = CrateRegistration {
-    name: "sketch-sim",
-    types: register_types,
+/// `game-sim`'s registration, as the binary holds it: one `static`, function pointers only,
+/// nothing built before `main`. A game crate may name neither `lactose-app` nor
+/// `lactose-persist`, so the value is the binary's, and a binary declares no setup and no
+/// migration function (architecture section 8.1, D152): both `None`.
+pub static GAME_SIM: CrateRegistration = CrateRegistration {
+    name: "game-sim",
+    types: game_sim::register_types,
     setup: None,
-    systems: register_systems,
-    migrations: Some(register_migrations),
+    systems: game_sim::register_systems,
+    migrations: None,
 };
 
 /// What the binary hands the assembly.
 pub static GAME: Game =
-    Game { name: "sketch", crates: &[SKETCH_SIM], order: None, sessions: Some(sessions) };
-
-/// The game's session applier: a join spawns the player's counter, claimed; a leave keeps
-/// it, so the sketch's counter outlives its player.
-fn sessions() -> Box<dyn SessionApplier> {
-    Box::new(Sessions)
-}
-
-struct Sessions;
-
-impl SessionApplier for Sessions {
-    fn apply(&mut self, world: &mut World, player: PlayerId, event: SessionEvent) -> Result<()> {
-        match event {
-            SessionEvent::Join { region } => {
-                let key = StableKey::Net(world.allocate_net_id()?);
-                world.spawn(key, region, (Counter(0), ClaimedBy { player }))
-            }
-            SessionEvent::Leave => Ok(()),
-        }
-    }
-}
+    Game { name: "sketch", crates: &[GAME_SIM], order: None, sessions: Some(game_sim::sessions) };
 
 // ---- 2. The cooked content a headless run holds in memory ----
 
@@ -177,7 +136,7 @@ impl Cooked for InMemory {
 /// first, nothing after. On a `Start::Loaded` run the first frame's entry meets the saved
 /// region in the server's store: the saved state loads, and this entry lends it the mode
 /// and the pinned table (`README.md`, "Saves and loads").
-fn frames(cooked: Arc<InMemory>) -> Result<Box<dyn FnMut(Tick) -> TickInput + Send>> {
+fn frames(cooked: Arc<InMemory>) -> Result<Frames> {
     let mut first = Some(cooked.fresh()?);
     let region = cooked.region;
     Ok(Box::new(move |_| {
@@ -273,10 +232,12 @@ static SKETCH_BODY: CrateRegistration = CrateRegistration {
 
 /// The sketch with a body: player 1 joins as a dynamic sphere, claimed and anchored, that
 /// falls under gravity while its input steers it, so the solver pool (sized from the
-/// workers SOUR's modes vary) and the input applier both enter the hash.
+/// workers SOUR's modes vary) and the input applier both enter the hash. It steps
+/// `game_sim::count` and spawns through an applier of its own; `game_sim::sessions` is
+/// recorded by `a_recorded_join_leave_and_rejoin`.
 static STEERED_GAME: Game = Game {
     name: "sketch-steered",
-    crates: &[SKETCH_SIM, SKETCH_BODY],
+    crates: &[GAME_SIM, SKETCH_BODY],
     order: None,
     sessions: Some(bodies),
 };
@@ -315,8 +276,11 @@ fn sample(tick: Tick) -> PlayerInput {
     PlayerInput { movement, yaw: Yaw(tick.0.wrapping_mul(97) as u16), ..PlayerInput::default() }
 }
 
+/// What a run feeds the app: one frame for each tick.
+type Frames = Box<dyn FnMut(Tick) -> TickInput + Send>;
+
 /// `frames`, with player 1's sample in every tick's frame.
-fn steered_frames(cooked: Arc<InMemory>) -> Result<Box<dyn FnMut(Tick) -> TickInput + Send>> {
+fn steered_frames(cooked: Arc<InMemory>) -> Result<Frames> {
     let mut frames = frames(cooked)?;
     Ok(Box::new(move |tick| {
         let mut input = frames(tick);
@@ -327,15 +291,23 @@ fn steered_frames(cooked: Arc<InMemory>) -> Result<Box<dyn FnMut(Tick) -> TickIn
     }))
 }
 
-/// Runs `ticks` ticks of [`STEERED_GAME`] under the runner's session, one `step` each,
-/// recording the hash after every tick and the chaos log at the end:
-/// `lactose_sim::harness::run_recorded`'s shape, over the assembly instead of a bare
-/// simulation. Beside it, as a stream of its own named as the test with `::physics`
-/// appended, `PhysicsSnapshot::hash` of the server's world after every tick (D145). A
-/// refused bundle or session event is the step's output and fails the test; so does a body
-/// the input did not steer or the solver did not move, which every mode would agree on.
-/// Outside the runner the session is production and nothing is recorded.
-fn recorded_run(test: &str, ticks: u32) -> Result<()> {
+/// What a recorded run steps: the game, the frames it is fed, and what must hold of the app
+/// after every tick and after the last, each a check every mode agrees on.
+struct Scenario {
+    game: &'static Game,
+    frames: fn(Arc<InMemory>) -> Result<Frames>,
+    each: fn(&Headless, Tick) -> Result<()>,
+    last: fn(&Headless, Tick) -> Result<()>,
+}
+
+/// Runs `ticks` ticks of `scenario` under the runner's session, one `step` each, recording
+/// the hash after every tick and the chaos log at the end: `lactose_sim::harness::
+/// run_recorded`'s shape, over the assembly instead of a bare simulation. Beside it, as a
+/// stream of its own named as the test with `::physics` appended, `PhysicsSnapshot::hash`
+/// of the server's world after every tick (D145). A refused bundle or session event is the
+/// step's output and fails the test, and so does a failed check of the scenario's. Outside
+/// the runner the session is production and nothing is recorded.
+fn recorded_run(test: &str, ticks: u32, scenario: &Scenario) -> Result<()> {
     let session = Session::from_env().map_err(protocol_error)?;
     let config = *session.config();
     let layout = match config.layout {
@@ -356,7 +328,7 @@ fn recorded_run(test: &str, ticks: u32) -> Result<()> {
     let config_applied = HeadlessConfig { workers, world, start: Start::Fresh, saves: None };
     let cooked = Arc::new(InMemory::new(RegionId(1))?);
     let cooked_dyn = Arc::clone(&cooked) as Arc<dyn Cooked>;
-    let mut app = Headless::start(&STEERED_GAME, config_applied, cooked_dyn)?;
+    let mut app = Headless::start(scenario.game, config_applied, cooked_dyn)?;
     // What the assembly built, as its world and executor report it, never the session's
     // request: a world the assembly built under another layout fails the runner's check.
     let world = app.server().expect("a started app has its server").simulation().world();
@@ -370,7 +342,7 @@ fn recorded_run(test: &str, ticks: u32) -> Result<()> {
     let physics_test = format!("{test}::physics");
     let mut recorder = session.recorder(test, &applied).map_err(protocol_error)?;
     let mut physics = session.recorder(&physics_test, &applied).map_err(protocol_error)?;
-    let mut frames = steered_frames(cooked)?;
+    let mut frames = (scenario.frames)(cooked)?;
     for _ in 0..ticks {
         let next = Tick(app.tick().0 + 1);
         let out: StepOutput = app.step(frames(next))?;
@@ -383,8 +355,9 @@ fn recorded_run(test: &str, ticks: u32) -> Result<()> {
         recorder.record(app.tick().0, app.hash()?).map_err(protocol_error)?;
         let world = app.server().expect("a started app has its server").simulation().world();
         physics.record(app.tick().0, snapshot(world)?.hash()).map_err(protocol_error)?;
+        (scenario.each)(&app, next)?;
     }
-    steered(&app, Tick(ticks))?;
+    (scenario.last)(&app, Tick(ticks))?;
     if let Some(log) = app.shutdown() {
         for name in [test, &physics_test] {
             session.write_execution_log(name, log.as_bytes()).map_err(protocol_error)?;
@@ -427,9 +400,82 @@ fn chaos(seed: u64) -> ChaosConfig {
     ChaosConfig { seed, shuffle_steals: true, inject_yields: true, force_split: true, record: true }
 }
 
+/// [`STEERED_GAME`] for 120 ticks: the body the input steers has moved by the last.
 #[test]
 fn a_recorded_headless_run() {
-    recorded_run("lactose_app::headless::a_recorded_headless_run", 120).unwrap();
+    let scenario = Scenario {
+        game: &STEERED_GAME,
+        frames: steered_frames,
+        each: |_, _| Ok(()),
+        last: steered,
+    };
+    recorded_run("lactose_app::headless::a_recorded_headless_run", 120, &scenario).unwrap();
+}
+
+/// The tick whose frame carries player 1's leave, in [`rejoin_frames`].
+const LEAVE: Tick = Tick(10);
+/// The tick whose frame carries player 1's second join.
+const REJOIN: Tick = Tick(20);
+
+/// `frames`, with player 1's sample in every tick's frame, a leave at [`LEAVE`] and a second
+/// join into the region at [`REJOIN`].
+fn rejoin_frames(cooked: Arc<InMemory>) -> Result<Frames> {
+    let region = cooked.region;
+    let mut frames = steered_frames(cooked)?;
+    Ok(Box::new(move |tick| {
+        let mut input = frames(tick);
+        if tick == LEAVE {
+            input.sessions.insert(PlayerId(1), SessionEvent::Leave);
+        } else if tick == REJOIN {
+            input.sessions.insert(PlayerId(1), SessionEvent::Join { region });
+        }
+        input
+    }))
+}
+
+/// The shipped applier against `crates/sim/README.md`'s contract after `tick`: while player
+/// 1 is joined, one row is claimed by them and one row of the world is anchored,
+/// `player_entity` resolves the claimed row, it holds a counter and the input applier has
+/// written this tick's sample into it; between the leave and the second join, no row is
+/// claimed or anchored and nothing resolves.
+fn one_claimed_row(app: &Headless, tick: Tick) -> Result<()> {
+    let world = app.server().expect("the server").simulation().world();
+    let joined = tick < LEAVE || tick >= REJOIN;
+    let claimed = world.claimed(PlayerId(1)).count();
+    // A leave removes the anchor as well as the claim: the region policy reads every
+    // anchor, claimed or not, and neither is hashed.
+    let anchored: usize = world.columns::<StreamingAnchor>().map(|c| c.keys().len()).sum();
+    let resolved = player_entity(world, PlayerId(1));
+    let fail = |what: String| Err(Error::new(ErrorKind::InvalidData, format!("{tick:?}: {what}")));
+    if anchored != usize::from(joined) {
+        return fail(format!("{anchored} rows anchored"));
+    }
+    match (joined, resolved) {
+        (true, Some(key)) => {
+            if claimed != 1 {
+                return fail(format!("{claimed} rows claimed by player 1"));
+            }
+            if world.get::<Counter>(key).is_none() {
+                return fail("player 1's row has no counter".to_owned());
+            }
+            if world.get::<PlayerInput>(key) != Some(&sample(tick)) {
+                return fail("the sample was not applied to player 1's row".to_owned());
+            }
+            Ok(())
+        }
+        (true, None) => fail(format!("player 1 is joined and unresolved, {claimed} rows claimed")),
+        (false, None) if claimed == 0 => Ok(()),
+        (false, _) => fail(format!("player 1 left and {claimed} rows are claimed")),
+    }
+}
+
+/// `game_sim::sessions`, as the binary ships it, through a join, a leave and a second join,
+/// with player 1's sample in every frame: [`one_claimed_row`] holds after every tick.
+#[test]
+fn a_recorded_join_leave_and_rejoin() {
+    let scenario =
+        Scenario { game: &GAME, frames: rejoin_frames, each: one_claimed_row, last: |_, _| Ok(()) };
+    recorded_run("lactose_app::headless::a_recorded_join_leave_and_rejoin", 30, &scenario).unwrap();
 }
 
 // ---- 5. The headless app's proof ----
@@ -653,9 +699,9 @@ fn no_refusal_is_empty() {
 fn a_registration_is_a_plain_value() {
     let game: Game = GAME;
     assert_eq!(game.crates.len(), 1);
-    assert_eq!(game.crates[0].name, "sketch-sim");
+    assert_eq!(game.crates[0].name, "game-sim");
     assert!(game.crates[0].setup.is_none());
-    assert!(game.crates[0].migrations.is_some());
+    assert!(game.crates[0].migrations.is_none());
 }
 
 // The binary's `main` and the resume sketch: type-checked here, run by the binary.

@@ -60,8 +60,10 @@ interface matter more than volume.
   like `gates.sh`, and run only scripts you wrote.
 - Codenames (WHISK, SOUR, ...) appear only on things you run: binaries, tools, log targets,
   CI jobs, README titles, doc headings. Never on a crate, type, function or module.
-- Crates are `lactose-<role>`, in `crates/<role>/` unless your brief says otherwise, with
-  `version.workspace = true` and the other workspace keys, and `[lints] workspace = true`.
+- Engine crates are `lactose-<role>`, in `crates/<role>/`, and the game's crates `game-<role>`, in
+  `game/game-<role>/`, as `crate-tiers.toml`'s `[game]` list names them, unless your brief says
+  otherwise; each with `version.workspace = true` and the other workspace keys, and
+  `[lints] workspace = true`.
 - Every crate has a `README.md` stating responsibility, tier, boundary status and unsafe
   status, in the format of `crates/core/README.md`.
 - `#![forbid(unsafe_code)]` in every crate that is not listed in architecture section 21. A

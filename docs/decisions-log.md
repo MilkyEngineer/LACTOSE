@@ -6594,6 +6594,30 @@ process state; the nightly Miri filters name modules that Miri compiles** (§20,
   section 22's "two background zstd threads", and its placing of `game-sim` wholly in milestone 5;
   the first site of milestone 1's edit-to-playing measurement (`docs/plans/milestone-1.md`, decision
   5.9), which follows the sketch's system into `game-sim`.
+- Addendum (lane sketch, 2026-11-18; review rounds 1 to 3): *the sketch game is `game-sim`'s,* at
+  `game/game-sim` as architecture section 4 lays out the game crates (the brief named
+  `crates/game-sim`; the architecture wins; the workspace members gain `game/*`). It exposes
+  `Counter`, `register_types`, `register_systems` and `sessions`, an `fn() -> Box<dyn
+  SessionApplier>`, so that `Some(game_sim::sessions)` is a `Game::sessions`, whose type is
+  `Option<fn() -> Box<dyn SessionApplier>>`. Only the component key enters the world hash, so
+  `Counter` keeps `sketch::counter`; the system is `game_sim::count` (section 6.1), its name in no
+  hash, and every SOUR PR-mode hash of 3075ad0 is unchanged. The applier meets
+  `crates/sim/README.md`'s contract and runs in the recorded test
+  `a_recorded_join_leave_and_rejoin`, which checks the claim and the anchor after every tick. That
+  test supersedes two texts of `docs/plans/milestone-2.md` as they stand at 3075ad0: decision 5.18's
+  bullet at lines 819-823, "The sketch's session applier moves with it and runs in no recorded test:
+  `crates/app/tests/headless.rs` spawns through an applier of its own. Section 8.3's sentence is of
+  systems, so nothing is broken, and the applier is under the boundary's lints in `game-sim`; a row
+  carries its recorded run. Routing the test's spawn through the shipped applier in this lane would
+  risk the recorded stream for no criterion.", and plan row `sketch`'s acceptance sentence at line
+  178, "The report says that the session applier runs in no recorded test: the test spawns through
+  its own applier." — the shipped applier is recorded by a test of its own, and the recorded stream
+  of `a_recorded_headless_run` did not move. The headless binary holds the registration value,
+  `GAME_SIM` named `game-sim`, and `GAME`, with `setup` and `migrations` both `None`, and is no
+  carrier; `[lint_file_carriers]` is the two proc-macro crates and `lactose-present-api`.
+  `crates/app/README.md` and `CrateRegistration`'s rustdoc say the same. Where a game crate's
+  registration value and migrations are declared stays verification row 201's decision.
+  Edit-to-playing's sketch edit is in `game-sim` from milestone 2 (architecture section 18).
 
 **D153. The milestone 2 plan: how its criteria are read, which machine proves each, the order the render track is built in, and what is re-gated** (§4, §5.1, §5.3, §12.1, §12.2, §12.3, §12.4, §13, §14, §16, §18, §19, §20, §22, `crate-tiers.toml`, `tools/xtask`, `docs/plans/milestone-2.md`)
 - Why: section 22 gives milestone 2 seven proofs and names no workload, machine or order for

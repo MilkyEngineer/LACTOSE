@@ -177,7 +177,7 @@ on, and a listed feature the crate does not declare are findings.
   other. Shipped code is read as for D99, and attributes and traits are compared by their
   last path segment as written: one brought in under another name (`use ... as`), in
   code produced by a macro the crate's source does not spell out (another crate's macro or
-  derive), or inside a `cfg_attr`, is not seen. `lactose-app-headless` is a carrier for its sketch game, and `lactose-present-api` for the presentation components and extract's pass system (D152).
+  derive), or inside a `cfg_attr`, is not seen. `lactose-present-api` is a carrier for the presentation components and extract's pass system, and no binary is one: the headless binary's sketch game is `game-sim`'s (D152).
 - No cargo configuration file has an `include` key, and no `.cargo` directory or cargo
   configuration file is a symbolic link: cargo would read through either what no check
   reads. `vendor` refuses both through the same function.

@@ -12,8 +12,11 @@ use lactose_sim::{Registration, SessionApplier, TypeTable};
 /// what the dev profile's restart leaves the process with (a function named by a `static`,
 /// never a value built before `main`), because every world of a process is built from the
 /// same set (the server's, or a client's replicated and prediction worlds), and because a
-/// pointer names nothing a save could depend on. A game crate exposes one of these as a
-/// `pub static`; the binary lists them in a [`Game`].
+/// pointer names nothing a save could depend on. A game crate exposes the functions, and
+/// the binary holds this value and lists it in a [`Game`]: a game crate may name neither
+/// this crate nor `lactose-persist`, and a binary declares no setup and no migration
+/// function, so both are `None` (D152). Where a game crate's registration value and its
+/// migrations are declared is decided before milestone 5 (`docs/verification.md`).
 #[derive(Clone, Copy, Debug)]
 pub struct CrateRegistration {
     /// The crate's name, as `Cargo.toml` spells it: the log names it, and so does the
@@ -44,7 +47,8 @@ pub struct Game {
     /// For the log.
     pub name: &'static str,
     /// The game crates, in call order. At milestone 5 `game-sim`, `game-ai` and
-    /// `game-content`; at milestone 1 the sketch a test or the spike writes.
+    /// `game-content`; until then `game-sim`'s sketch game, which the headless binary runs,
+    /// or the sketch a test or the spike writes.
     pub crates: &'static [CrateRegistration],
     /// `Registration::order` edges between the game's own crates, or `None`. Called once per
     /// world after every crate's `systems`, before the assembly's own edges.

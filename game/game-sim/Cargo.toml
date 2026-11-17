@@ -1,0 +1,20 @@
+[package]
+name = "game-sim"
+description = "The inside half of the game: gameplay every world kind registers and runs, inside the determinism boundary. At milestone 2 the sketch game the headless binary runs."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[dependencies]
+lactose-core.workspace = true
+# The world the applier spawns into, `ClaimedBy`, and the `#[system]` macro.
+lactose-ecs.workspace = true
+# The `#[component]` attribute; metadata only (architecture section 8.1).
+lactose-reflect.workspace = true
+# `Registration`, `TypeTable`, `Stage` and the session applier's trait and event.
+lactose-sim.workspace = true
+
+[lints]
+workspace = true
