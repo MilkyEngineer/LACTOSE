@@ -8,7 +8,7 @@ use lactose_ecs::{
     Mut, PresentEvent, PresentEvents, PresentKind, Res, ResMut, StableKeyOf, SystemSet, World,
     finalize, system,
 };
-use lactose_math::{ExactSum, Scalar, Vec2};
+use lactose_math::{ExactSum, Scalar, Vec2, Vec3};
 use lactose_reflect::{component, resource, value, Padding};
 
 #[component(key = "g::velocity", persistent)]
@@ -36,6 +36,8 @@ pub struct HitList { #[field(id = 1)] pub hits: lactose_core::PlainArray<Hit, 2>
 impl HitList { pub fn iter(&self) -> impl Iterator<Item = &Hit> { self.hits.iter().take(self.len as usize) } }
 #[component(key = "g::anim", persistent)]
 pub struct AnimState { #[field(id = 1)] pub phase: u32 }
+#[component(key = "g::transform", persistent)]
+pub struct Transform { #[field(id = 1)] pub translation: Vec3 }
 impl AnimState { pub fn phase_crossed(&self, x: u32) -> bool { self.phase == x } }
 
 #[resource(key = "g::tick_delta", persistent)]
@@ -51,10 +53,12 @@ pub struct LoadedBundles(#[field(id = 1)] pub u32);
 pub struct Damage { pub target: StableKey, pub source: StableKey, pub amount: i32 }
 impl Event for Damage { fn target(&self) -> StableKey { self.target } }
 
-#[derive(Clone, Copy, bytemuck::NoUninit, bytemuck::CheckedBitPattern)]
-#[repr(u32)]
-pub enum AudioRequest { Footstep = 1 }
+// A request carries where it happens and names its sound, as `lactose-present-api`'s does.
+#[value]
+pub struct AudioRequest { #[field(id = 1)] pub position: Vec3, #[field(id = 2)] pub sound: u64 }
+impl AudioRequest { pub const fn at(sound: u64, position: Vec3) -> Self { Self { position, sound } } }
 impl PresentEvent for AudioRequest { const KIND: PresentKind = PresentKind::from_name("g::audio"); }
+const FOOTSTEP: u64 = 1;
 
 pub struct PhysicsCommands;
 pub struct Impulse { pub body: StableKey, pub impulse: Vec2 }
@@ -105,8 +109,8 @@ fn apply_damage(events: Events<Damage>, key: StableKeyOf, hp: Mut<Health>) {
 }
 
 #[system(name = "game_sim::footsteps", worlds = [server, prediction])]
-fn footsteps(present: PresentEvents, key: StableKeyOf, anim: &AnimState) {
-    if anim.phase_crossed(8) { present.emit(*key, AudioRequest::Footstep); }
+fn footsteps(present: PresentEvents, key: StableKeyOf, anim: &AnimState, at: &Transform) {
+    if anim.phase_crossed(8) { present.emit(*key, AudioRequest::at(FOOTSTEP, at.translation)); }
 }
 
 #[system(name = "sim::apply_region_load", exclusive)]

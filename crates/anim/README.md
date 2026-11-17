@@ -66,7 +66,7 @@ the sections below. The cooked byte form ("Assets" below) changes only with its 
 | | A ragdoll, and bodies to hit | `Bones::spawn` and `Bones::set_limp` from a server-only kernel of the character; bone rows exist in the server world alone, so predicted queries hit capsules only ("Bones and ragdolls" below) |
 | `predict`, `net-api` | Which components are persistent and replicated, that every simulation-read field compares at full precision, and that no replicated field is derived from a solver-written value (D124) | `AnimRig`, `AnimState`, `AnimParams`, `Bones` and `BoneLink` are `persistent, replicated`; `RootMotion` and `SimPose` are `transient`; the replicated integers compare by bytes, the parameter scalars by canonical bits, so a solver-derived parameter goes through `AnimParams::quantise`; bone rows are the server's alone and, once `net-api`'s `Unreplicated` marker lands, are not sent; until then `Bones` is not for a networked session ("Prediction and replication" below); a claimed character the stream builds has `RootMotion` and `SimPose` by the frame's statement of its transient components, and this crate adds neither (D141); nothing holds state outside rows and no channel exists |
 | `physics-api` | The ragdoll bodies as bodies or colliders, the direction, and a collider rule that keeps them off their owner | Bone rows with `Transform`, `RigidBody` and `Collider`, joints as `Joint` rows: the pose drives kinematic bodies through `Commands::set` of `Transform` in `Stage::Post`; limp, dynamic bodies drive the pose through `BoneMoved` events; a bone collider admits no bone and no capsule ("Bones and ragdolls" below) |
-| Presentation (milestones 2 and 3) | The sim skeleton's evaluated transforms as rows the presentation schedule reads | `SimPose` (`extracted`, root-local, the fitted pose for a limp character in a server world, empty in a prediction world) beside the extracted root `Transform`; `AnimRig` and `AnimState` extracted for the render pose ("Presentation" below) |
+| Presentation (milestones 2 and 3) | The sim skeleton's evaluated transforms as rows the presentation schedule reads | `SimPose` (`extracted`, root-local, the fitted pose for a limp character in a server world, empty in a prediction world) beside the extracted root `Transform`; `AnimRig` and `AnimState` extracted for the render pose ("Presentation" below); a row with any of the three is a presented row, so the presentation snapshot holds them beside the root's `Transform` (`crates/present-api/README.md`, "The snapshot") |
 | Assets (`asset`, `cook`) | The authored clip, machine and skeleton data as `asset-api` kinds, and the cooked form | `Clip`, `StateMachine`, `Skeleton` with `KIND` and `FORMAT_VERSION`; `ClipLoader`, `StateMachineLoader`, `SkeletonLoader` through `ErasedLoader::new`; the byte form ("Assets" below) |
 | `sim`, SOUR | Systems placed in the stages, readers after them, every type registered | `register_systems` puts `ADVANCE` and `EVALUATE` in `Stage::Simulation` and `REPORT`, `FIT`, `BONES` in `Stage::Post`; `register_types` ("The tick" below) |
 | `app` | Registration beside every other crate's, in every world kind | `register_types` and `register_systems`; no setup function, no resource |
@@ -92,7 +92,7 @@ fn drive_anim(params: Mut<AnimParams> /* , the game's inputs */) { /* params.set
 
 #[system(name = "game_sim::footsteps", worlds = [server, prediction], in_set = ANIM_READERS)]
 fn footsteps(present: PresentEvents, key: StableKeyOf, anim: &AnimState) {
-    if anim.phase_crossed(Phase::HALF) { /* present.emit(*key, AudioRequest::footstep(..)) */ }
+    if anim.phase_crossed(Phase::HALF) { /* present.emit(*key, AudioRequest::at(sound, position)) */ }
 }
 
 #[system(name = "game_sim::apply_root_motion", worlds = [server, prediction], in_set = MOVEMENT)]
@@ -660,9 +660,11 @@ never leaves loops forever.
   where the simulation says the grip is and the render skeleton can be fitted to the sim
   feet and hands, or to the fallen ragdoll. A root-local pose interpolates correctly between
   two snapshots of a moving character, which a world-space pose would not.
-- Remote characters are not in the snapshot (section 5.3): their `AnimState` arrives through
-  replication and presentation samples it from the interpolation buffer, whose interpolation
-  of an animation phase is `lactose-net-host`'s deferred item. No character has bone rows on
+- A remote character's transform is not in the snapshot (section 5.3): presentation samples
+  it from the interpolation buffer. Its `AnimRig` and `AnimState` are in the replicated
+  world's snapshot as the last staged frame left them (`crates/present-api/README.md`, "The
+  snapshot"); a phase interpolated between frames is the interpolation buffer's,
+  `lactose-net-host`'s deferred item. No character has bone rows on
   a client ("Prediction and replication" above): a remote character's render skeleton
   follows its state, and a ragdoll on a client, a remote character's or the local player's
   limp one (whose predicted `SimPose` is empty), is presentation's blend from the last

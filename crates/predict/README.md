@@ -64,13 +64,13 @@ boundary `clippy.toml`.
 | | Compare, roll back, correct, re-simulate; know what it cost | `Predictor::reconcile` after the frame's steps: `Reconciled::{confirmed, corrections, resimulated, resync}`; the time measured around the call, outside the boundary, divided by `resimulated` |
 | | The ring's depth from the budget and the measured per-tick cost; the horizon | `Predictor::set_depth`; `Ring::{depth, oldest, newest, rebuilt_at, len, bytes, slot_bytes}`; a frame older than the ring is `ResyncReason::TooOld` |
 | | Resync when the world must be rebuilt or has fallen behind; a changed player entity | `Reconciled::resync`, `Predictor::resync(tick)`, then the server's full frame through the inbox; `Predictor::set_local` |
-| | Extract on the prediction world every frame; the presentation events | `Predictor::passes` after `reconcile`; `simulation_mut().world_mut().take_present_events()` after it |
+| | Extract on the prediction world every frame; the presentation events | `Predictor::passes` after `reconcile`; `simulation_mut().world_mut().take_present_events()` after it, handed to `ExtractState::publish` on the same world, reached through `lactose_present_api::extract_state(predictor.simulation_mut())`, which publishes the batch with the snapshot the pass wrote (`crates/present-api/README.md`, "Events and publication") |
 | | Every cost the spike records as a value | `PredictionStats` and `Correction::divergence`: correction rate, rollback cost per tick, divergence; `Ring::bytes` for the snapshot size ("What the spike records" below) |
 | `lactose-net` (milestone 4) | Which fields of a `StagedFrame` the prediction world reads, in what order, and what it does with each | "The hook" below; the prediction world applies every structural field as the replicated world does, without `RemoteSlot`, so it holds every relevant entity as a proxy |
 | `lactose-net-host` (milestone 4) | A claimed entity whole in every frame that carries a row of it | The comparison treats a frame's exact rows for a claimed entity as its whole component set and removes what they do not name ("Reconciliation" below); a `StagedFrame::transient` statement beside every claimed spawn and every claimed entity's exact rows is what a claimed spawn and a correction give the entity its transient components from ("What a row built from the stream has") |
 | `lactose-physics-api` | The call order a re-simulation keeps, and which keys `corrected` receives | "Physics" below: `World::snapshot` then `snapshot`; `World::restore` then `restore` at the same tick; corrections written stamped; `corrected` with the keys whose rows were written, before the next step |
 | `lactose-input` | The local player's recorded samples re-applied through `PlayerInputApplier`; a substitution replacing one | "Inputs and re-simulation" below: the ring's `TickInput`s are re-passed to `step`; `PlayerInput::substitute` and `after_substitute` replace the recorded samples; `StreamingAnchor` beside the claim on the local player's entity so `player_entity` resolves |
-| Presentation (milestone 2) | Events from mispredicted ticks cancelled and re-emitted ones deduplicated; which entities a correction moved | `take_present_events` after `reconcile`, which the ECS deduplicates and cancels against the delivered-events log that survives a restore; `Correction::entities` and `Divergence` for smoothing; `World::claimed(local)` on the prediction world for the copies that shadow the replicated world's (section 5.3) |
+| Presentation (milestone 2) | Events from mispredicted ticks cancelled and re-emitted ones deduplicated; which entities a correction moved | `take_present_events` after `reconcile`, which the ECS deduplicates and cancels against the delivered-events log that survives a restore; `Correction::entities` and `Divergence` for smoothing; the prediction world's extract takes the rows that have `ClaimedBy`, the copies that shadow the replicated world's (section 5.3; `crates/present-api/README.md`, "The extract set") |
 | The build check (D121) | A prediction-world system that reads a component the server never corrects refused at build; an exclusive one that could read anything refused unless it is an engine's | `check_prediction_reads`, handed to the prediction world's builder as its check function ("The build check" below) |
 | Game crates | Nothing to name: no game system names this crate. A proxy's region is the server's | The prediction world's filter is `ClaimedBy`, the world's own; predicted keys are the ECS's rule. A prediction system that moves a proxy with `Commands::move_to_region` gets a proxy the frames never confirm there: the frames' next spawn or move of it puts it back and no row of it does, a tombstone naming the region it moved into despawns it rather than keeps it ("The hook", item 6, and "Where the frames placed each proxy"), and an unload of that region takes it, after which the server's rows of it are skipped until a whole send or a full frame. A derived component a prediction system needs is added by a kernel of the game's that matches the rows lacking it ("What a row built from the stream has"). A predicted `Commands::despawn` or `Commands::move_to_region` of a claimed owner takes what the prediction world's `OwnedBy` edges say it owns, which may be a proxy the server has released ("Not in this crate yet") |
 
@@ -959,17 +959,31 @@ README.md`, "The applier")
   below the horizon this crate sets; a re-emission in a re-simulated tick is not delivered
   again and a delivered key whose tick was re-simulated without re-emitting it is reported
   cancelled (`crates/ecs/README.md`, "Commands and events"). `app` takes
-  `World::take_present_events` after `reconcile`, once per frame, and hands the batch to
-  presentation: `emitted` to play, `cancelled` to stop.
+  `World::take_present_events` after `reconcile` and `passes`, once per frame, and hands
+  the batch to the prediction world's `ExtractState::publish`
+  (`lactose_present_api::extract_state`), which delivers it to presentation with the
+  snapshot the pass wrote: `emitted` to play, `cancelled` to stop.
 - A correction's `entities` and `Divergence` go to presentation beside the batch, for the
   visual blend of a corrected entity's jump; a predicted interaction with a proxy is
   presented tentatively until the frame that confirms it (section 9.4), which is the first
   `Reconciled::confirmed` at or after its tick without a correction naming the entity.
 - Extract runs on the prediction world through `passes`, after `reconcile`. A restore
   starts a new epoch, so extract's mark is stale after a rollback and its next pass is a
-  full one; a correction is stamped besides, so extract sees it either way. The
-  prediction world's claimed entities (`World::claimed(local)`) shadow the replicated
-  world's copies for extract and the render slot table (section 5.3).
+  full one; a correction is stamped besides, so extract sees it either way. A full pass
+  in a prediction world writes the claimed rows again and marks no cut, unless its tick is
+  earlier than the one shown. `reconcile` runs every frame and ticks are fewer than
+  frames, so a rollback usually lands in a frame with no step, and its pass is of the tick
+  already shown: there the published snapshot of that tick is replaced, and the render
+  side draws each row the pass writes from the placement it held when the tick began, so
+  the local player is drawn from the state at the tick before to where the corrected run
+  puts it, over what is left of the tick, also after a teleport the tick showed at once
+  (`crates/present-api/README.md`, "What the sink keeps" and "Events and publication"). A
+  `resync` to a tick earlier than the one shown makes the next pass flag every row and
+  publish a cut, and the render side drop the placements it draws a tick from, so a
+  rollback at that tick before the next step is shown at once as well; one to the tick
+  shown or a later one changes no row and is drawn as a rollback. The prediction world's
+  claimed entities, the rows with `ClaimedBy`, are its extract set and shadow the
+  replicated world's copies for extract and the render slot table (section 5.3).
 
 **The build check** (D121; architecture section 9.4)
 
@@ -990,8 +1004,11 @@ README.md`, "The applier")
   systems that run there, each reviewed for what it reads: `sim::begin_tick`,
   `sim::apply_frame_regions`, `sim::apply_sessions`, `sim::apply_inputs`,
   `sim::apply_staged_state` and `sim::apply_region_policy` (`crates/sim/README.md`, "The
-  input sync point"), `input::player_input_writer`, `physics_api::sync` and
-  `physics_api::write_back`. A key is the xxh64 of the declared name, which the schedule
+  input sync point"), `input::player_input_writer`, `physics_api::sync`,
+  `physics_api::write_back` and `present::extract`, `lactose-present-api`'s pass system,
+  which takes the world by shared reference and writes nothing to it
+  (`crates/present-api/README.md`, "Extract"). A key is the xxh64 of the declared name,
+  which the schedule
   rejects a collision of, so a look-alike system in a listed set passes nothing; an
   engine crate that adds or renames one changes the list in the same commit, and a game
   crate never runs an exclusive system in the prediction world. Test-support scenes are

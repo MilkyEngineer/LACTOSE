@@ -328,10 +328,14 @@ tick N        tick N+1 simulation ───────────────�
   race frames in flight. Teleports carry a no-interpolate flag. Static cooked instances go from
   IO to the GPU scene directly and never pass through extract. Extract also produces the
   presentation snapshot. Its budget is measured in milestone 2, not assumed.
-- **The presentation snapshot** holds previous and current transforms, camera pivot,
-  presentation components and events, triple-buffered so a frame can interpolate between two
-  snapshots while extract writes a third. It is the only simulation-derived data the render
-  side reads during the overlap. Remote entities are not in it: the presentation schedule
+- **The presentation snapshot** holds the rows presentation computes on: a row with a
+  camera rig, a light, a decal, an animation state, a remote slot or any other extracted
+  component beside its mesh and transform, with those components and its transform. A row
+  that is only a mesh and a transform goes to the staging ring alone. It is
+  triple-buffered so a frame can interpolate between two snapshots, which are its previous
+  and current transforms, while extract writes a third, and the presentation events of the
+  ticks a snapshot covers are published with it. It is the only simulation-derived data the render
+  side reads during the overlap. Remote entities' transforms are not in it: the presentation schedule
   samples the network interpolation buffer each frame through a lock-free `net-host` resource
   (a sequence lock per slot, the slot named by the `RemoteSlot` component a staged spawn leaves
   on the replicated row, with a batch sampling call that takes the slots and fills the caller's
@@ -480,8 +484,8 @@ fn apply_damage(events: Events<Damage>, key: StableKeyOf, hp: Mut<Health>) {
 // writes `AnimState`, or the schedule refuses the build.
 static ANIM_READERS: SystemSet = SystemSet::new("game_sim::anim_readers").after(&[&lactose_anim::sets::ADVANCE]);
 #[system(name = "game_sim::footsteps", worlds = [server, prediction], in_set = ANIM_READERS)]
-fn footsteps(present: PresentEvents, key: StableKeyOf, anim: &AnimState) {
-    if anim.phase_crossed(Phase::HALF) { present.emit(*key, AudioRequest::Footstep); }
+fn footsteps(present: PresentEvents, key: StableKeyOf, anim: &AnimState, at: &Transform) {
+    if anim.phase_crossed(Phase::HALF) { present.emit(*key, AudioRequest::at(FOOTSTEP, at.translation)); }
 }
 
 // Exclusive system: runs alone at a sync point with the whole world.

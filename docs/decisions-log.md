@@ -6608,8 +6608,9 @@ process state; the nightly Miri filters name modules that Miri compiles** (§20,
     target's readback, in result file `triangle`. Rules out a triangle drawn by a test program
     beside the graph, and a reference that guesses what was drawn.
   - *Extract's 1 ms is the median of extract's pass on N frame workers, at 50,000 rows moved every
-    tick among 100,000*, writing the previous and current transform to the device's mapped
-    staging ring in render space and filling the presentation snapshot; the null backend's figure
+    tick among 100,000*, writing the current transform to the device's mapped staging ring in
+    render space, where the render side keeps the previous one (D157), and filling the
+    presentation snapshot with a stated count of presented rows; the null backend's figure
     and the ring's memory type are recorded beside it. It is read on a quiet Apple M1 and on the
     x86 desktop. Rules out a criterion met on null alone or without the snapshot.
   - *Remote upload's 1 ms is the median frame of ten seconds paced at 144 Hz*: one batch sample
@@ -6820,6 +6821,124 @@ process state; the nightly Miri filters name modules that Miri compiles** (§20,
   `docs/proposals/tick-start-macos-27.md`; the owner's ruling of 17 November 2026; the
   remeasurement at `d290812`.
 - Replaced: on macOS, the 35 µs of D138's addendum for tick start.
+
+**D157. `lactose-present-api`: what a world holds for presentation, what extract gives the renderer's sink and the snapshot, and how a frame's events are published** (§5.3, §6.1, §8.1, §9.4, §12.4, §13, `lactose-present-api`, `lactose-predict`)
+- Why: sections 5.3 and 13 name the presentation components, extract and the snapshot and leave
+  their shapes open, and the milestone 2 plan's decisions 5.2, 5.5 and 5.18 fix where extract is
+  declared and what the renderer may not declare. The facade settles the rest.
+  - *The four components are authored state.* `MeshInstance`, `Light`, `Decal` and `CameraRig`
+    are `persistent, replicated, extracted` and none is `derived`: a baseline and a save hold
+    them and a client receives them. They hold `lactose_math` quantities, integers and asset
+    references typed by uninhabited markers of this crate, which a reader re-types by ID. Rules
+    out a `derived` presentation component, a raw float in hashed state, and a dependency on the
+    crates that own the mesh, material, sound and effect types.
+  - *A world holds the authored camera rig alone*: the pivot offset and the boom's rest length.
+    Yaw and pitch are the input sample's and the boom's length this frame is presentation's. The
+    camera pivot of section 5.3 is `CameraRig::pivot_of` the interpolated transform. Rules out a
+    camera component or resource that presentation writes into a world, and a pivot field in
+    the snapshot.
+  - *A request carries where it happens*, in simulation space, so presentation needs no row of
+    the origin entity. `DebugShape` is a tick's only way to the debug-draw buffer, and a shape
+    is drawn until presentation acquires a snapshot of another tick, or a cut. Rules out an
+    engine enumeration of sounds (section 6.1's `AudioRequest::Footstep`), a request that needs
+    its origin alive at delivery, and a debug-draw resource in a world.
+  - *Extract is one exclusive pass system that takes the world by shared reference, and no
+    other system reaches its state.* It is `present::extract` in every world kind and
+    `lactose_predict::EXCLUSIVE_SYSTEMS` lists its key. Its `ExtractState` is held in a service
+    resource of a type private to the crate, which `setup` inserts and only `present::extract`
+    names: a system that names `Res<ExtractState>` or `ResMut<ExtractState>` does not build
+    (`MissingResource`). `app` reaches the state through `extract_state(&mut Simulation)`,
+    between runs; it takes the `Simulation` because an exclusive system holds the `World`. It
+    writes no column, resource, event, log entry or stamp; `present-impl` proves that with a
+    recorded test whose hashes are equal before and after a pass and equal to the same scene
+    with no pass run. Rules out a tick system that reads what a pass did, installs an output,
+    runs a pass or publishes; extract clearing a dirty bit or keeping a "last extracted"
+    column; and a system in the renderer.
+  - *The extract set is by world kind.* A `Server` world: every row. A `Prediction` world: the
+    rows with `ClaimedBy`. A `Client` world: every row, with no `Transform` or `Teleported`
+    copied and no row written to the sink. Rules out remote transforms through extract (section
+    5.3) and a prediction world's proxies drawn twice.
+  - *The sink is given current placements, the removals and the full-pass signal; it draws a
+    tick's placements from one base.* A row is the key, the mesh, the placement in render space
+    and a no-interpolate flag. The sink keeps, per key and kind, a previous placement, a
+    current one and a base: the placement it held as current when the first pass of the
+    current tick began, at its `begin` for that kind whose tick differs from the tick of the
+    `begin` before it for that kind, the tick before's state. At a `begin` whose tick is
+    earlier than that one's, it drops every base of the kind and takes none until the next
+    tick. A write sets the previous placement to the base and the current to the row's; a
+    flagged write, or one for a key with no base, sets both to the row's and leaves the base
+    alone. That costs the sink one more placement per key and kind. A row a tick moved is
+    written once more after the next tick so the two become equal. The flag compares
+    `Teleported` with the pass's covered tick, the tick of the base, which carries over a pass
+    of the same tick, and is set on every row of a pass at a tick earlier than the previous
+    pass's. So a rollback in a frame with no step is drawn from the tick before to the
+    corrected state, as the snapshot's pair is, also after a teleport the tick flagged; one
+    after a resync to an earlier tick finds no base and is shown at once, as its snapshot,
+    which takes the place of a cut, is; a correction that sets `Teleported` at the tick it
+    re-simulates is shown at once by both outputs; and the two agree on a row that is an
+    instance and a presented row whenever every pass is published and acquired, but for a key
+    new to the sink and an edit between ticks. Removals are the structural log's despawns and
+    losses of `Transform`, `MeshInstance` or `ClaimedBy` since the previous pass. A pass is
+    full when an output was installed, the mark is not current or the log cursor is stale.
+    Rules out a keyed table in extract, a previous transform read from a world that holds one,
+    a corrected placement drawn from where the frame before showed it, from a teleport the
+    correction undid or from a state of a later tick than the world's, and a renderer system
+    that reads the structural log (the plan's decision 5.18).
+  - *The snapshot holds presented rows, not instances*: rows with an extracted component other
+    than `Transform`, `Teleported` and `MeshInstance`, each with every extracted component it
+    has. A row that is only a mesh and a transform goes to the sink alone. Rules out copying
+    every transform twice a tick (the plan's decision 5.2 foresaw the choice) and a snapshot of
+    differences.
+  - *Exactly three buffers, in safe Rust.* The reader holds its last pair, the writer the third;
+    when the writer needs a buffer and none is free it takes back the newest published
+    snapshot, which the reader does not hold. A lock is held for the exchange alone. An
+    acquire returns the newest published snapshot and the one it follows: the newest the
+    channel had when it was published, or for a snapshot that took another's place what that
+    one followed, or once acquired the older of its pair; or the reader's newer one when the
+    channel no longer has that. A reader that acquires every publication gets the two newest
+    published. An acquire stops publishing what was published before its newer snapshot. One
+    made while a pass writes the latest publication, which it took back, returns the reader's
+    newer snapshot twice and lets the older go, so the next pass finds a buffer free: with
+    three buffers that pair is forced, and holding the older instead would leave a reader that
+    always acquires there with no later snapshot. A reader at the pass rate whose acquire falls
+    inside a pass's span, between its taking a buffer and its publication, gets that pair every
+    second acquire and sees every second snapshot: motion stays forward and every such pair is
+    flagged, so it is a stutter, never a wrong draw, and a frame that acquires after `publish`
+    gets none; `frame-design` settles when the reader acquires. A snapshot is a cut when a full
+    pass in a `Server` or `Client` world wrote it, when its tick is earlier than the tick of the
+    snapshot published last in any kind (a prediction world resynchronised to an earlier
+    tick), or when it takes the place of a cut. The exchange keeps a mark at the last
+    snapshot published that is a cut by its own cause, and marks every snapshot published a
+    cut until an acquire returns one published at or after the mark; a snapshot marked so
+    does not move it. So a reader blends nothing across a cut, even one taken back unseen,
+    though the newer snapshot it gets may be of a later pass than the cut's, and the mark is
+    passed by the third acquire after it that follows a publication, whatever the reader's
+    cadence. An unpublished snapshot a later pass updates keeps a cut and a full mark. A full
+    pass in a prediction world, of the tick of the snapshot published last, takes that
+    snapshot's place and follows what it followed: a rollback in a frame with no step gives
+    the pair (S_{t-1}, S_t'), not (S_t, S_t'). Rules out an `unsafe` lock-free buffer in a
+    crate section 21 does not list, a fourth buffer for a slow reader (a fourth would remove
+    the window pair; architecture 5.3's triple buffer stands unless `frame-design` shows the
+    stutter matters), a pass that waits for a frame, a one-tick pair at every misprediction, a
+    pair interpolated backwards in time, a reader that never sees a later snapshot, and a cut
+    that marks every snapshot for good.
+  - *`app` publishes a frame's events with its snapshot*, through `ExtractState::publish`
+    (reached by `extract_state`) after `Simulation::run_passes` and
+    `World::take_present_events`. Events travel beside the snapshots: each emission is in
+    exactly one frame's batch. With no writer installed, or once the reading half is dropped,
+    the batch is dropped. Rules out extract taking the events, which is a write to the world,
+    events lost with a skipped snapshot, and events accumulating for a reader that is gone.
+  - *View-models and the debug-draw buffer are the render side's.* `ViewModels` is a table of
+    `derived` resource types that no world registers; `DebugDraw` is a plain buffer. Rules out
+    a view-model in a world, written from outside the boundary (D152).
+- Driven by: architecture sections 5.3, 6.1, 8.1, 9.4 and 13; D152; the milestone 2 plan,
+  decisions 5.2, 5.5 and 5.18; `crates/ecs/README.md`, `crates/sim/README.md`,
+  `crates/physics-api/README.md`; review rounds 1 to 4 of the facade.
+- Replaced: section 5.3's "holds previous and current transforms, camera pivot, presentation
+  components and events" and "Remote entities are not in it"; section 6.1's example line
+  `AudioRequest::Footstep`; the plan's decision 5.2, "the write of the previous and current
+  transform to the staging ring"; D153's "writing the previous and current transform to the
+  device's mapped staging ring in render space" and its copy in the plan's section 11.
 
 ## 10. Review history
 

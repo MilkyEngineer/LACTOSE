@@ -1,0 +1,44 @@
+[package]
+name = "lactose-present-api"
+description = "The presentation interface: mesh, light, decal and camera rig components, audio, VFX and debug-draw request events, UI view-model resources, the debug-draw buffer, extract as a pass system with the sink it writes instances through, and the triple-buffered presentation snapshot."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+autotests = false
+
+[dependencies]
+# `AssetRef<T>`: a component names a mesh, a material, a sound or an effect by ID, typed by
+# a marker; the asset types and their loaders are the crates' that own each kind.
+lactose-asset-api.workspace = true
+lactose-core.workspace = true
+# The world extract reads, the `#[system]` macro, the change marks and the structural log
+# a pass works from, `PresentEvent`, and `WorldKind` (architecture sections 5.3, 6, 6.1).
+lactose-ecs.workspace = true
+# Every authored quantity is a `Scalar`, `Vec3` or `Quat`, and the conversion to render
+# space is `render::RenderPosition::from_sim` (architecture sections 8.2 and 12.4).
+lactose-math.workspace = true
+# `Transform` and `Teleported`: the two components extract reads on every row it copies.
+lactose-physics-api.workspace = true
+# The `#[component]` and `#[value]` attributes, and the schemas a view-model is read by;
+# metadata only (architecture section 8.1).
+lactose-reflect.workspace = true
+# `Pass::Extract`, `Registration` and `TypeTable`: where the pass system is placed and
+# where the components are registered.
+lactose-sim.workspace = true
+
+[dev-dependencies]
+# The registration test builds a prediction world under `check_prediction_reads`, which
+# passes only while `EXCLUSIVE_SYSTEMS` lists extract's key: the list is `lactose-predict`'s
+# and the system is this crate's, so the test is what holds the two together.
+lactose-predict.workspace = true
+
+# The integration tests as one test binary, whose root declares the files of tests/ as
+# modules (D150).
+[[test]]
+name = "integration"
+path = "tests/integration.rs"
+
+[lints]
+workspace = true
