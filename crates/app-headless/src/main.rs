@@ -37,7 +37,7 @@ use lactose_sim::{RegionBundle, SessionEvent, TickInput};
 /// `game-sim`'s registration. A game crate may name neither `lactose-app` nor
 /// `lactose-persist`, so the value is the binary's; it passes no setup and no migration
 /// function, which a binary may not declare (architecture section 8.1).
-static SKETCH_SIM: CrateRegistration = CrateRegistration {
+static GAME_SIM: CrateRegistration = CrateRegistration {
     name: "game-sim",
     types: game_sim::register_types,
     setup: None,
@@ -46,7 +46,7 @@ static SKETCH_SIM: CrateRegistration = CrateRegistration {
 };
 
 static GAME: Game =
-    Game { name: "sketch", crates: &[SKETCH_SIM], order: None, sessions: Some(game_sim::sessions) };
+    Game { name: "sketch", crates: &[GAME_SIM], order: None, sessions: Some(game_sim::sessions) };
 
 // ---- The cooked content, in memory ----
 

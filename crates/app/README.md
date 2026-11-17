@@ -119,7 +119,7 @@ static GAME_SIM: CrateRegistration = CrateRegistration {
 };
 
 static GAME: Game = Game {
-    name: "game",
+    name: "sketch",
     crates: &[GAME_SIM],   // in call order; game-ai and game-content follow at milestone 5
     order: None,           // the game's own `Registration::order` edges
     sessions: Some(game_sim::sessions), // `None` drops and logs every session event

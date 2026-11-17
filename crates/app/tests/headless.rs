@@ -47,7 +47,7 @@ use protocol::{Capacity, Layout, RunConfig, Session};
 /// nothing built before `main`. A game crate may name neither `lactose-app` nor
 /// `lactose-persist`, so the value is the binary's, and a binary declares no setup and no
 /// migration function (architecture section 8.1, D152): both `None`.
-pub static SKETCH_SIM: CrateRegistration = CrateRegistration {
+pub static GAME_SIM: CrateRegistration = CrateRegistration {
     name: "game-sim",
     types: game_sim::register_types,
     setup: None,
@@ -57,7 +57,7 @@ pub static SKETCH_SIM: CrateRegistration = CrateRegistration {
 
 /// What the binary hands the assembly.
 pub static GAME: Game =
-    Game { name: "sketch", crates: &[SKETCH_SIM], order: None, sessions: Some(game_sim::sessions) };
+    Game { name: "sketch", crates: &[GAME_SIM], order: None, sessions: Some(game_sim::sessions) };
 
 // ---- 2. The cooked content a headless run holds in memory ----
 
@@ -233,11 +233,11 @@ static SKETCH_BODY: CrateRegistration = CrateRegistration {
 /// The sketch with a body: player 1 joins as a dynamic sphere, claimed and anchored, that
 /// falls under gravity while its input steers it, so the solver pool (sized from the
 /// workers SOUR's modes vary) and the input applier both enter the hash. It steps
-/// `game-sim`'s `sketch::count` and spawns through an applier of its own, so
-/// `game_sim::sessions` runs in no recorded test (docs/verification.md).
+/// `game_sim::count` and spawns through an applier of its own; `game_sim::sessions` is
+/// recorded by `a_recorded_join_leave_and_rejoin`.
 static STEERED_GAME: Game = Game {
     name: "sketch-steered",
-    crates: &[SKETCH_SIM, SKETCH_BODY],
+    crates: &[GAME_SIM, SKETCH_BODY],
     order: None,
     sessions: Some(bodies),
 };
@@ -434,15 +434,22 @@ fn rejoin_frames(cooked: Arc<InMemory>) -> Result<Frames> {
 }
 
 /// The shipped applier against `crates/sim/README.md`'s contract after `tick`: while player
-/// 1 is joined, one row is claimed by them, `player_entity` resolves it, it holds a counter
-/// and the input applier has written this tick's sample into it; between the leave and the
-/// second join, no row is claimed and nothing resolves.
+/// 1 is joined, one row is claimed by them and one row of the world is anchored,
+/// `player_entity` resolves the claimed row, it holds a counter and the input applier has
+/// written this tick's sample into it; between the leave and the second join, no row is
+/// claimed or anchored and nothing resolves.
 fn one_claimed_row(app: &Headless, tick: Tick) -> Result<()> {
     let world = app.server().expect("the server").simulation().world();
     let joined = tick < LEAVE || tick >= REJOIN;
     let claimed = world.claimed(PlayerId(1)).count();
+    // A leave removes the anchor as well as the claim: the region policy reads every
+    // anchor, claimed or not, and neither is hashed.
+    let anchored: usize = world.columns::<StreamingAnchor>().map(|c| c.keys().len()).sum();
     let resolved = player_entity(world, PlayerId(1));
     let fail = |what: String| Err(Error::new(ErrorKind::InvalidData, format!("{tick:?}: {what}")));
+    if anchored != usize::from(joined) {
+        return fail(format!("{anchored} rows anchored"));
+    }
     match (joined, resolved) {
         (true, Some(key)) => {
             if claimed != 1 {
