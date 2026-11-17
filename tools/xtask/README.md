@@ -44,11 +44,11 @@ arguments there, and nothing when it exits with 2.
 
 A new shipped binary goes into `[feature_roots]`, a package with simulation tests into
 `[harness]` `packages`, each simulation test into `[harness]` `tests` and a test target
-that must be a binary of its own into `[test_targets]`, and every new package into one group
-of `[check_groups]`, all in `ci-policy.toml`, in the commit that adds them. Nothing in the code names a crate of the
-workspace except where a rule itself does: `lactose-app-server` (the server denylist), the
-`lactose-app-` prefix and `lactose-sim` (the two guards below), and `lactose-task` and
-`lactose-input-host` (the loom rule).
+that must be a binary of its own into `[test_targets]`, and every new package into the group
+of `[check_groups]` that the table's rule names, all in `ci-policy.toml`, in the commit that
+adds them. Nothing in the code names a crate of the workspace except where a rule itself does:
+`lactose-app-server` (the server denylist), the `lactose-app-` prefix and `lactose-sim` (the
+two guards below), and `lactose-task` and `lactose-input-host` (the loom rule).
 
 ## `tiers`
 
@@ -262,8 +262,8 @@ on, and a listed feature the crate does not declare are findings.
   test one each. Findings: a package in no group, which no check job would build or test; a
   package in two groups, or twice in one; an entry that names no workspace package; and a
   group that names none, which as cargo arguments would select the whole workspace. The two
-  group names, `foundation` and `simulation`, are fixed in `src/policy.rs`, so the table
-  cannot hold a group the workflow's matrix does not name. `cargo xtask group <name>` prints
+  group names, `base` and `physics`, are fixed in `src/policy.rs`, so the table cannot hold a
+  group the workflow's matrix does not name. `cargo xtask group <name>` prints
   the group's packages as one line of cargo arguments, `-p <package>` each in the table's
   order, which the check job passes to clippy, nextest and the doc tests; it prints nothing
   and exits with 2 when the check above finds anything, so a job never tests a division that

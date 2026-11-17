@@ -26,18 +26,32 @@ env:
 # 43550976114 (6ed8461) and 43556574172 (3264406), each warm. rust-cache restores the
 # dependencies; the workspace crates and the vendored rapier3d-f64 are path crates, so every
 # run compiles and links them again, and the test builds grow with every crate merged.
-# - check (windows-latest), 7.3 to 9.6, median 9.1, from the four green runs since each
-#   package's integration tests became one test binary (D150), 43827738169 (d7a0088),
+# - check (<os>), one job on each platform that built and tested the whole workspace, until
+#   the split below. On Windows it took 7.3 to 9.6, median 9.1, from the four green runs since
+#   each package's integration tests became one test binary (D150), 43827738169 (d7a0088),
 #   43855576989 (eca4e0f), 43868030471 (8941997) and 43872419194 (4ffcd62), each warm, against
-#   9.5 to 11.7 in the three before it, 43781979172, 43795852109 and 43799365983: the test
-#   step 6.4 to 8.7 (its build most of it), doctests 0.2. lld-link (.cargo/config.toml) links.
-#   The job reached 14.8 of its 15 in October with clippy and the release tests still in it;
-#   they moved to the next job.
+#   9.5 to 11.7 in the three before it, 43781979172, 43795852109 and 43799365983; the median of
+#   the three most recent warm runs of main stood at 9.2 at a561b36 (43896909697): the test step
+#   6.4 to 8.7, its build 4.7 to 6.7 of that and the test run 1.5 to 1.7, doctests 0.2. lld-link
+#   (.cargo/config.toml) links. The job reached 14.8 of its 15 in October with clippy and the
+#   release tests still in it; they moved to the next job.
+# - check (<os>, base) and check (<os>, physics), since the split (milestone 2 plan, decision
+#   5.15): each job builds, lints and tests one group of [check_groups] in
+#   tools/xtask/ci-policy.toml. Expected on Windows, not yet measured: base about 6.2 and
+#   physics about 5.8 of their 15. The arithmetic: the whole test build took 6.5 in 43896909697.
+#   Its units, priced at one Apple M1 `cargo --timings` run and scheduled on four slots, take
+#   151.8 s; base's take 92.3 s and physics's 91.4 s, physics's bound by the chain through
+#   rapier3d-f64. So each half's build is about 4.0 on Windows. The test run, 1.7 for the whole,
+#   divides as the tests' summed times do, 224 s of 385 to base and 161 to physics: 1.0 and
+#   0.7 (physics's slowest test alone takes 0.6). Add 0.8 for the steps outside the test step and
+#   0.4 for `cargo xtask group`. On macOS, by the same arithmetic, base about 6.5 (it keeps the
+#   release golden vectors, 1.6 to 2.1, and so is the slowest half expected) and physics about
+#   4.3; on Ubuntu about 4.7 and 3.2.
 # - windows-lint-release, 2.6 to 3.6: clippy 0.5 to 0.7, the release golden vectors 1.3 to 2.3.
-# - check (ubuntu-latest), 5.1 to 6.5: clippy 0.3, the test step 3.1 to 4.0, the release golden
-#   vectors 1.0 to 1.6. It links with lld.
-# - check (macos-latest), 4.0 to 8.4: the test step 4.9 to 5.4, the release golden vectors
-#   1.6 to 2.1, clippy 0.5 to 0.6.
+# - check (ubuntu-latest) and check (macos-latest), before the split: 5.1 to 6.5 on Ubuntu
+#   (clippy 0.3, the test step 3.1 to 4.0, the release golden vectors 1.0 to 1.6; it links with
+#   lld) and 4.0 to 8.4 on macOS (the test step 4.9 to 5.4, the release golden vectors 1.6 to
+#   2.1, clippy 0.5 to 0.6).
 # - policy, 0.5 to 0.6: building the CI driver 0.1, the checks under 0.1 each.
 # - sour, 3.2 to 4.3: the pull-request modes 2.4 to 2.7, building the harness packages' tests
 #   most of it.
@@ -45,12 +59,23 @@ env:
 #
 # rust-cache keys every cache by job ID (its default add-job-id-key), so each job restores and
 # saves only its own. No job here may set `shared-key`, which drops the job ID: the Windows
-# jobs would then restore and overwrite each other's cache. check and windows-lint-release set
+# jobs would then restore and overwrite each other's cache. The two check jobs of a platform
+# share a job ID, so each sets `key` to its group, which rust-cache puts ahead of the job ID:
+# their caches are `v0-rust-base-check-<os>-...` and `v0-rust-physics-check-<os>-...`, each
+# holding the dependencies its own group builds. Both save. A half that restored the other's
+# cache would build what that cache lacks on every run, and two halves on one key would race
+# to save it. Before the split each platform's one check cache held every dependency, at the
+# key of a053a13b 292.6 MB on Linux, 198.8 on macOS and 172.1 on Windows; the two halves hold
+# the dependencies they share twice. The repository's cache stood at 10.74 GB at a561b36, over
+# GitHub's 10 GB, but GitHub evicts the least recently used entries first, and most of it was
+# entries of older keys: the newest entry of each job came to about 2.6 GB. The first run after
+# the split restores nothing (no earlier key has the group in it) and builds cold, and no job
+# restores a `v0-rust-check-<os>-...` entry again. check and windows-lint-release set
 # cache-on-failure, so a cold run that times out late in its build still saves its dependencies.
 # But rust-cache saves only when its key missed, so a run on a new key that fails or is
 # cancelled before its build finishes leaves a partial entry that later runs restore and never
 # replace, until Cargo.lock, a manifest, .cargo/config.toml or the toolchain changes. Recovery:
-# `gh cache list --key v0-rust-check-Windows`, then `gh cache delete <key>`.
+# `gh cache list --key v0-rust-physics-check-Windows` (or `base`), then `gh cache delete <key>`.
 jobs:
   # One job for each package group of [check_groups] in tools/xtask/ci-policy.toml on each
   # platform. A job selects its group's packages with cargo's `-p`, not with a nextest filter,
@@ -65,7 +90,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
-        group: [foundation, simulation]
+        group: [base, physics]
     steps:
       - uses: actions/checkout@v4
       # D148: the line-ending rule on this host's own checkout, before anything reads a file.
@@ -85,7 +110,7 @@ jobs:
           tool: cargo-nextest@0.9.151
       # Once, not in each group: it reads every file of the workspace.
       - name: Format
-        if: matrix.os == 'ubuntu-latest' && matrix.group == 'foundation'
+        if: matrix.os == 'ubuntu-latest' && matrix.group == 'base'
         run: cargo fmt --all --check
       # The assignment fails the step when the command does; an `echo` of its output would not.
       - name: Packages
@@ -109,7 +134,7 @@ jobs:
       # the group that holds the three packages. Windows runs it in the windows-lint-release
       # job.
       - name: Math golden vectors (release)
-        if: matrix.os != 'windows-latest' && matrix.group == 'foundation'
+        if: matrix.os != 'windows-latest' && matrix.group == 'base'
         run: cargo nextest run -p lactose-math -p lactose-input -p lactose-input-host --release --locked
 
   # Clippy and the release golden vectors for Windows, beside the Windows debug test build.

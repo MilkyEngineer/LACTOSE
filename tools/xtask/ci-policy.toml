@@ -152,17 +152,22 @@ separate = [
 # The job reads its packages from `cargo xtask group <name>`, so this table is the only list.
 # `cargo xtask boundary` reports a workspace package in no group or in two, an entry that
 # names no package and an empty group. The two names are fixed in tools/xtask/src/policy.rs:
-# a third group is a change to the workflow too. The groups are balanced by each one's build
-# and test time on the Windows runner, the slowest (the workflow's header gives the figures).
-# A new package goes into the group of the packages it depends on, unless that unbalances it.
+# a third group is a change to the workflow too.
+#
+# `physics` is lactose-physics-api and every package whose normal dependencies reach it,
+# directly or through another package, so that one group alone compiles the vendored
+# rapier3d-f64 and the packages built on the physics interface; `base` is every other package.
+# A new package goes into the group that rule names. The rule balances the two builds (the
+# workflow's header gives the figures); a package that would unbalance them is moved here with
+# its reason.
 [check_groups]
-foundation = [
+base = [
   "lactose-core", "lactose-math", "lactose-task", "lactose-reflect", "lactose-reflect-macros",
   "lactose-ecs-macros", "lactose-ecs", "lactose-bundle", "lactose-asset-api", "lactose-io",
-  "lactose-asset", "lactose-input", "lactose-input-host", "lactose-xtask",
+  "lactose-asset", "lactose-input", "lactose-input-host", "lactose-sim", "lactose-net-api",
+  "lactose-net-host", "lactose-persist", "lactose-xtask",
 ]
-simulation = [
-  "lactose-sim", "lactose-physics-api", "lactose-physics-rapier", "lactose-net-api",
-  "lactose-net-host", "lactose-anim", "lactose-predict", "lactose-persist", "lactose-app",
-  "lactose-app-headless", "lactose-cook",
+physics = [
+  "lactose-physics-api", "lactose-physics-rapier", "lactose-anim", "lactose-predict",
+  "lactose-app", "lactose-app-headless", "lactose-cook",
 ]

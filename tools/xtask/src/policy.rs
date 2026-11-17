@@ -37,8 +37,8 @@ struct TestTargets {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CheckGroups {
-    foundation: Vec<String>,
-    simulation: Vec<String>,
+    base: Vec<String>,
+    physics: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -101,8 +101,8 @@ impl Policy {
             miri_split: raw.miri_split.packages,
             separate_test_targets: raw.test_targets.separate,
             check_groups: vec![
-                CheckGroup { name: "foundation", packages: raw.check_groups.foundation },
-                CheckGroup { name: "simulation", packages: raw.check_groups.simulation },
+                CheckGroup { name: "base", packages: raw.check_groups.base },
+                CheckGroup { name: "physics", packages: raw.check_groups.physics },
             ],
         })
     }

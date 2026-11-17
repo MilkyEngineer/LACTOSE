@@ -113,7 +113,7 @@ mod tests {
             packages: packages.iter().map(|package| (*package).to_owned()).collect(),
         };
         Policy {
-            check_groups: vec![group("foundation", first), group("simulation", second)],
+            check_groups: vec![group("base", first), group("physics", second)],
             ..Policy::default()
         }
     }
@@ -127,11 +127,8 @@ mod tests {
         let ws = members(&["lactose-core", "lactose-math", "lactose-sim"]);
         let policy = groups(&["lactose-math", "lactose-core"], &["lactose-sim"]);
         assert_eq!(run(&policy, &ws), [] as [&str; 0]);
-        assert_eq!(
-            arguments(&policy, &ws, "foundation").unwrap(),
-            "-p lactose-math -p lactose-core"
-        );
-        assert_eq!(arguments(&policy, &ws, "simulation").unwrap(), "-p lactose-sim");
+        assert_eq!(arguments(&policy, &ws, "base").unwrap(), "-p lactose-math -p lactose-core");
+        assert_eq!(arguments(&policy, &ws, "physics").unwrap(), "-p lactose-sim");
     }
 
     #[test]
@@ -146,7 +143,7 @@ mod tests {
               tools/xtask/ci-policy.toml, so no CI check job builds, lints or tests it; add it \
               to one"]
         );
-        let refused = arguments(&policy, &ws, "foundation").unwrap_err();
+        let refused = arguments(&policy, &ws, "base").unwrap_err();
         assert!(refused.contains("`lactose-new` is in no group"), "{refused}");
     }
 
@@ -157,10 +154,10 @@ mod tests {
         assert_eq!(
             run(&policy, &ws),
             [
-                "tools/xtask/ci-policy.toml: [check_groups] `simulation` lists `lactose-sim` \
+                "tools/xtask/ci-policy.toml: [check_groups] `physics` lists `lactose-sim` \
                  twice",
                 "crates/sim/Cargo.toml: `lactose-sim` is in more than one group of \
-                 [check_groups] in tools/xtask/ci-policy.toml (`foundation`, `simulation`), so \
+                 [check_groups] in tools/xtask/ci-policy.toml (`base`, `physics`), so \
                  more than one CI check job builds and tests it; keep it in one",
             ]
         );
@@ -173,13 +170,13 @@ mod tests {
         assert_eq!(
             run(&policy, &ws),
             [
-                "tools/xtask/ci-policy.toml: [check_groups] `foundation` lists `lactose-gone`, \
+                "tools/xtask/ci-policy.toml: [check_groups] `base` lists `lactose-gone`, \
                  which is not a workspace package",
-                "tools/xtask/ci-policy.toml: [check_groups] `simulation` lists no package, and \
+                "tools/xtask/ci-policy.toml: [check_groups] `physics` lists no package, and \
                  as cargo arguments selects the whole workspace",
             ]
         );
-        assert!(arguments(&policy, &ws, "simulation").is_err());
+        assert!(arguments(&policy, &ws, "physics").is_err());
     }
 
     #[test]
@@ -188,7 +185,7 @@ mod tests {
         let policy = groups(&["lactose-core"], &["lactose-sim"]);
         assert_eq!(
             arguments(&policy, &ws, "rest").unwrap_err(),
-            "no check group is called `rest`; [check_groups] has `foundation` and `simulation`"
+            "no check group is called `rest`; [check_groups] has `base` and `physics`"
         );
     }
 
@@ -198,7 +195,7 @@ mod tests {
         // here, only that the table is two groups of distinct names.
         let policy = Policy::parse(include_str!("../ci-policy.toml")).unwrap();
         let names: Vec<&str> = policy.check_groups.iter().map(|group| group.name).collect();
-        assert_eq!(names, ["foundation", "simulation"]);
+        assert_eq!(names, ["base", "physics"]);
         let mut all: Vec<&String> =
             policy.check_groups.iter().flat_map(|group| &group.packages).collect();
         let listed = all.len();
