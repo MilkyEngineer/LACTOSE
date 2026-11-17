@@ -58,7 +58,8 @@ impl EventPump {
     /// and every call still queued, and every call queued later, resolves to
     /// `ErrorKind::Cancelled`. It turns `close_requested` true before it closes the lane,
     /// so a task whose call came back `Cancelled` reads the close. The lane's wake ignores
-    /// an event loop that has ended, since `exit` is queued from destructors. A panic that
+    /// an event loop that has ended, even after the lane is closed, since `exit` is queued
+    /// from destructors and `Lane::run` wakes after it releases the queue. A panic that
     /// unwinds out of it leaves the window to the end of the process, as an error does.
     ///
     /// # Errors

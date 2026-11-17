@@ -29,15 +29,15 @@
 //! A client binary, by thread, with the shutdown of `README.md`, "Shutdown", step by step:
 //!
 //! ```no_run
-//! use std::sync::Arc;
+//! use std::sync::{Arc, mpsc};
 //! use std::time::{Duration, Instant};
 //!
-//! use lactose_core::Result;
+//! use lactose_core::{Error, ErrorKind, Result, ThreadClass};
 //! use lactose_platform::{
 //!     ClientPlatform, MainThread, PixelSize, PresentThread, Window, WindowDesc, WindowReports,
 //!     event_pump, present_thread,
 //! };
-//! use lactose_task::{Executor, Lane, Platform, WorkerClass};
+//! use lactose_task::{Executor, Lane, Platform, ThreadSpec, WorkerClass};
 //!
 //! /// Stands for a graphics backend's device, which keeps the window's `Arc` until its
 //! /// surface is destroyed.
@@ -48,7 +48,7 @@
 //! impl Device {
 //!     /// Stands for the backend's waits on the device's last points: `false` if the bound
 //!     /// expired, so that dropping the device may block.
-//!     fn last_points(&self, bound: Duration) -> bool {
+//!     fn last_points(&self, _bound: Duration) -> bool {
 //!         true
 //!     }
 //! }
@@ -120,33 +120,71 @@
 //!     // 1. `exit` first, not awaited: it destroys nothing while an `Arc<Window>` is held,
 //!     //    and the pump drains main-lane calls until the last one goes.
 //!     drop(exit);
-//!     // 2. No present and no frame submit is queued from here, and every point the host
-//!     //    owes that a pending submit waits on is signalled first: the swapchain's drop
-//!     //    waits for the submits that use its images. Then the last present-thread call
-//!     //    waits, within a bound, for the points its presents signalled, and drops the
-//!     //    swapchain; here the thread holds only a clone of the device.
+//!     // 2. No present and no frame submit is queued from here, and every point a pending
+//!     //    submit waits on that no submit made will signal is signalled from the host
+//!     //    first: what the host owes, and the points of a submit that failed or will now
+//!     //    not be made; the swapchain's drop waits for the submits that use its images.
+//!     //    Then the last present-thread call signals in the same way the points of a
+//!     //    refused present of its own, waits, within a bound, for the points its presents
+//!     //    signalled, and drops the swapchain; here the thread holds only a device clone.
 //!     let last = present.run(|presenter| presenter.device = None).await;
 //!     // 3. The state comes back with nothing of the window in it.
 //!     let stopped = thread.stop().await.map(drop);
-//!     // 4. On a background worker: the device's last points are waited for within a
+//!     // 4. On a thread of its own: the device's last points are waited for within a
 //!     //    bound, and every encoder and clone but one go.
-//!     let bound = Duration::from_secs(2);
-//!     let settled = executor.spawn(WorkerClass::Background, async move {
-//!         let settled = device.as_ref().is_none_or(|device| device.last_points(bound));
-//!         (device, settled)
-//!     });
-//!     // 5. A main-lane call drops the last, which then waits for nothing; after an
-//!     //    expired step-4 bound it is dropped on a background worker instead, where its
-//!     //    drop may block while the main thread answers.
-//!     let dropped = match settled.await {
-//!         Ok((Some(device), true)) => main.run(move |_| drop(device)).await,
-//!         Ok((Some(device), false)) => {
-//!             executor.spawn(WorkerClass::Background, async move { drop(device) }).await
-//!         }
-//!         Ok((None, _)) => Ok(()),
+//!     let settled = match device {
+//!         Some(device) => settle(&executor, device).await,
+//!         None => Ok(None),
+//!     };
+//!     // 5. A main-lane call drops the last, which then waits for nothing. After an expired
+//!     //    step-4 bound none comes back: step 4's thread drops it.
+//!     let dropped = match settled {
+//!         Ok(Some(device)) => main.run(move |_| drop(device)).await,
+//!         Ok(None) => Ok(()),
 //!         Err(error) => Err(error),
 //!     };
 //!     ran.and(last).and(stopped).and(dropped)
+//! }
+//!
+//! /// How long a step of the shutdown, or `main` after an error from `run`, waits.
+//! const BOUND: Duration = Duration::from_secs(2);
+//!
+//! /// Stands for the client's warning on `lactose_platform::LOG_TARGET`.
+//! fn warn(message: &str) {
+//!     eprintln!("{message}");
+//! }
+//!
+//! /// Step 4 on a thread of its own, made through the executor's platform, since it may
+//! /// block and no worker may. It hands the device back if its last points were reached
+//! /// within the bound; otherwise it logs, hands back nothing and drops the device itself,
+//! /// a drop that may block while the main thread answers. The root looks on a timer.
+//! async fn settle(executor: &Executor, device: Arc<Device>) -> Result<Option<Arc<Device>>> {
+//!     let (answer, answered) = mpsc::channel();
+//!     let spec = ThreadSpec {
+//!         name: "settle".to_owned(),
+//!         class: ThreadClass::Background,
+//!         index_in_class: 0,
+//!     };
+//!     executor.platform().spawn_thread(spec, Box::new(move || {
+//!         if device.last_points(BOUND) {
+//!             let _ = answer.send(Some(device));
+//!         } else {
+//!             warn("the device's last points passed the shutdown's bound");
+//!             let _ = answer.send(None);
+//!             drop(device);
+//!         }
+//!     }))?;
+//!     loop {
+//!         match answered.try_recv() {
+//!             Ok(device) => return Ok(device),
+//!             Err(mpsc::TryRecvError::Empty) => {
+//!                 executor.sleep_until(Instant::now() + Duration::from_millis(10)).await?;
+//!             }
+//!             Err(mpsc::TryRecvError::Disconnected) => {
+//!                 return Err(Error::new(ErrorKind::Cancelled, "step 4's thread ended"));
+//!             }
+//!         }
+//!     }
 //! }
 //!
 //! fn main() -> Result<()> {
@@ -162,13 +200,31 @@
 //!     let task =
 //!         executor.spawn(WorkerClass::FrameCritical, root(executor.clone(), main, present, thread));
 //!
-//!     // 6. `run` returns once the last `Arc<Window>` is gone, and nothing after it holds
-//!     //    the device or the window. Its result waits until the root has finished and
-//!     //    the executor is shut down, so the root's device is never dropped here.
-//!     let pumped = pump.run();
+//!     // 6. When `run` returns a value the last `Arc<Window>` is gone, and nothing after it
+//!     //    holds the device or the window.
+//!     if let Err(error) = pump.run() {
+//!         // The steps run with no pump, and their main-lane calls resolve to `Cancelled`.
+//!         // The root is awaited on a thread of its own within a bound; past it `main`
+//!         // logs and returns the error with the root neither dropped nor shut down, and
+//!         // the process ends with it, as it does with the leaked window.
+//!         let (answer, answered) = mpsc::channel();
+//!         let waiter = executor.clone();
+//!         let spec = ThreadSpec {
+//!             name: "root".to_owned(),
+//!             class: ThreadClass::Background,
+//!             index_in_class: 0,
+//!         };
+//!         let waited = platform.spawn_thread(spec, Box::new(move || {
+//!             let _ = answer.send(waiter.block_on(task));
+//!         }));
+//!         match waited.map(|_| answered.recv_timeout(BOUND)) {
+//!             Ok(Ok(_)) => executor.shutdown(),
+//!             _ => warn("the root did not end within its bound after `run` failed"),
+//!         }
+//!         return Err(error);
+//!     }
 //!     let ran = executor.block_on(task);
 //!     executor.shutdown();
-//!     pumped?;
 //!     ran?
 //! }
 //! ```

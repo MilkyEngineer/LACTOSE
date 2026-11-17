@@ -69,8 +69,9 @@ handle traits are `raw-window-handle`'s.
 
 | Thread | Made by | Runs | Never |
 |---|---|---|---|
-| The main thread | The operating system | `event_pump`, the setup that follows it, then `EventPump::run`: the operating system's events, the window's reports, the main-lane calls | Waits for another thread; runs a tick, a frame or a present |
+| The main thread | The operating system | `event_pump`, the setup that follows it, then `EventPump::run`: the operating system's events, the window's reports, the main-lane calls; after an error from `run`, a bounded wait for the root | Waits for another thread while it pumps; runs a tick, a frame or a present |
 | The present thread | `present_thread`, through the `Platform` it is given | The calls of its lane, one at a time, each lent the state; a call may block in an acquire or a present | Is waited for by the main thread or by a worker |
+| A shutdown's own threads | The client, through `Executor::platform` | Step 4 of "Shutdown", which may block; after an error from `run`, the root's `block_on` | Is waited for by a worker |
 | The workers | The executor, through `ClientPlatform` | Everything else, as tasks: they hold the two lanes, the window's reports and, until shutdown, what was made from the window, and wait for a call with `.await` | Block on either thread |
 
 ```rust
@@ -98,22 +99,33 @@ let root = executor.spawn(WorkerClass::FrameCritical, async move {
     };
     // On every path, in the order of "Shutdown".
     drop(exit);                                          // 1. `exit`, not awaited
-    signal_host_points();                                // 2. what the host owes, first;
+    signal_unsignalled_points();                         // 2. no submit will signal them;
     let last = present.run(Presenter::wind_down).await;  //    bounded waits; the swapchain
     let presenter = thread.stop().await;                 // 3. nothing of the window in it
-    let (device, settled) = last_points(device).await;   // 4. a background worker, bounded
-    let dropped = match device {                         // 5. the last `Device`:
-        Some(device) if settled => main.run(move |_| drop(device)).await, // waits for nothing
-        Some(device) => drop_on_background(device).await, // its bound expired: may block
-        None => Ok(()),
+    let settled = match device {                         // 4. a thread of its own, bounded:
+        Some(device) => settle(&executor, device).await, //    the device back, or dropped
+        None => Ok(None),                                //    there if the bound expired
+    };
+    let dropped = match settled {                        // 5. the last `Device`
+        Ok(Some(device)) => main.run(move |_| drop(device)).await, // waits for nothing
+        Ok(None) => Ok(()),
+        Err(error) => Err(error),
     };
     ran.and(last).and(presenter.map(drop)).and(dropped)
 });
 
-let pumped = pump.run();        // 6. until `exit`, and until the window is let go
+if let Err(error) = pump.run() {  // 6. until `exit`, and until the window is let go
+    // No pump now: the steps' main-lane calls resolve to `Cancelled`, and the root is
+    // awaited on a thread of its own within a bound, past which `main` logs and returns.
+    let root = on_a_thread_of_its_own(&executor, move |executor| executor.block_on(root));
+    match root.recv_timeout(BOUND) {
+        Ok(_) => executor.shutdown(),
+        Err(_) => tracing::warn!(target: LOG_TARGET, "the root outlived `run`'s error"),
+    }
+    return Err(error);
+}
 let ran = executor.block_on(root);
 executor.shutdown();
-pumped?;
 ran?
 ```
 
@@ -188,10 +200,10 @@ The crate's documentation carries this as a doctest, and `tests/consumers.rs` in
   frame that loops until a close therefore ends after a failed `run` too. `run` turns
   `close_requested` true before it closes the lane, so a task whose main-lane call came
   back `Cancelled` reads the close. The lane's wake ignores an event loop that has ended
-  (winit's `EventLoopClosed`), or the lane is closed in winit's `exiting` before the loop
-  ends: `exit` is queued from destructors, unwinding included, where a panic in the wake
-  would abort. An `EventPump` dropped before `run` has opened no window, and its lane's
-  calls resolve to `Cancelled`.
+  (winit's `EventLoopClosed`), even after the lane is closed, since `Lane::run` wakes
+  after it releases the queue: `exit` is queued from destructors, unwinding included,
+  where a panic in the wake would abort. An `EventPump` dropped before `run` has opened
+  no window, and its lane's calls resolve to `Cancelled`.
 - An error from `run` is `Platform`: the window was refused, or the operating system's
   event loop failed. `lactose-app`'s policy for it is the binary's to choose; nothing can
   be shown after it.
@@ -363,36 +375,46 @@ The crate's documentation carries this as a doctest, and `tests/consumers.rs` in
      its start by whatever drives the client (the root task, or a test's driver thread),
      so a path that returns early or unwinds queues it too. `exit` destroys nothing while
      an `Arc<Window>` is held, and the pump keeps draining main-lane calls until the last
-     one goes, so every step below still reaches the main thread, and every stall below
-     happens under the pump's warning.
-  2. The client stops queuing presents and frame submits, and signals every point the
-     host owes that a pending submit waits on, from whatever holds it: the swapchain's
+     one goes, so when `run` returns a value every step below still reached the main
+     thread, and every stall below happened under the pump's warning.
+  2. The client stops queuing presents and frame submits, and signals from the host
+     every point a pending submit waits on that no submit made will signal: what the host
+     owes, and the points of a submit that failed or will now not be made. The swapchain's
      drop below waits for the submits that use its images. Then a last present-thread
-     call waits, within a bound, for the points its presents signalled, and drops the
+     call signals in the same way the points of a present of its own that was refused,
+     waits, within a bound, for the points its presents signalled, and drops the
      swapchain.
   3. It awaits `PresentThread::stop`, which hands back a state with nothing of the window
      in it.
-  4. Off the frame workers, on a background worker, it waits within a bound for the
-     device's last points, and drops every encoder and every `Device` clone but one.
+  4. On a thread of its own, made through `Executor::platform`, since it may block and no
+     worker may, it waits within a bound for the device's last points, and drops every
+     encoder and every `Device` clone but one. If the bound is met, the thread hands the
+     last `Device` back for step 5; if it expires, the thread drops it (below).
   5. A main-lane call drops the last one, which then waits for nothing; MoltenVK's
      observation of the view is removed on the view's thread (off it after an expired
      step-4 bound, below).
-  6. `run` returns once the last `Arc<Window>` goes; `main` waits for its root task and
-     shuts the executor down, whether `run` returned a value or an error, and only then
-     returns `run`'s error, so the root is never dropped on the main thread. Nothing that
-     runs after `run` returns holds the device or an `Arc<Window>`.
+  6. `run` returns once the last `Arc<Window>` goes, or with an error; `main` waits for
+     its root task, within a bound after an error (below), and shuts the executor down.
+     When `run` returns a value, nothing that runs after it holds the device or an
+     `Arc<Window>`.
 - When a bound expires, the client logs it and goes on to the next step, save one: a last
-  `Device` whose step-4 bound expired is dropped on a thread that may block, a background
-  worker or a thread of its own, never in a main-lane call. A drop that then blocks holds
-  that thread and keeps the window, and the pump's warning, already running because
-  `exit` came first, shows the stall, and the main thread goes on answering. On that path
-  MoltenVK's observation of the view is removed off the view's thread, which is accepted:
-  the view's layer is not replaced during a shutdown. `run` does not instead return and
-  leak the window: a teardown after `run` returned would have no main thread to answer a
-  driver, and would stall with no warning.
+  `Device` whose step-4 bound expired is dropped on step 4's thread, a thread of its own,
+  never in a main-lane call. A drop that then blocks holds that thread and keeps the
+  window, and the pump's warning, already running because `exit` came first, shows the
+  stall, and the main thread goes on answering. On that path MoltenVK's observation of the
+  view is removed off the view's thread, which is accepted: the view's layer is not
+  replaced during a shutdown. `run` does not instead return and leak the window: a
+  teardown after `run` returned would have no main thread to answer a driver, and would
+  stall with no warning.
+- After an error from `run`, the steps run with no pump, their main-lane calls resolve to
+  `Cancelled`, and `main` waits for them within a bound: it awaits the root on a thread of
+  its own, made through `Executor::platform`, which sends the root's result on a channel,
+  and takes it with a timeout. Past the bound `main` logs on `pail` and returns `run`'s
+  error with the root neither dropped nor shut down, and the process ends with it, as it
+  does with the leaked window; how the process ends then is `lactose-app`'s choice.
 - A main-lane call that drops what was made from the window drops only what has nothing
   pending (`lactose-rhi-api`, "Handles and lifetimes"). Whatever waits is done on the
-  present thread or a background worker before it, while the pump runs.
+  present thread or on a thread of its own before it, while the pump runs.
 - `run` returns once `exit` has been called and the window is let go: every `Arc<Window>`
   that `MainThread::window` returned, and every clone, has been dropped. Until both hold
   it pumps events and drains calls as before, and a later `MainThread::window` gives the
@@ -472,12 +494,13 @@ bounded, and each test shows the interleaving it names, by a barrier or a count 
 by a sleep's length alone. Each window subprocess runs under a deadline its parent keeps
 (`tests/consumers.rs`, `under_a_deadline`): the parent reads the child's output while it
 waits, and past the deadline it kills the child and fails, naming the last stage the
-child printed. The subprocess's driver holds the `exit` guard of "Shutdown" from its
-start, so a check that fails ends the pump too. `ThreadHandle::join` discards a panic, so
-the driver sends its result on a channel as its last act and the subprocess's exit status
-carries it; the parent checks the status and that the last stage printed is the final
-one. The tests that need no window, the stop under a queuing task and the torn-size read,
-also run under nightly Miri.
+child printed. It takes the output within a bound too, and fails with "stdout held open"
+past it, since a process the child started may keep the pipe. The subprocess's driver
+holds the `exit` guard of "Shutdown" from its start, so a check that fails ends the pump
+too. `ThreadHandle::join` discards a panic, so the driver sends its result on a channel
+as its last act and the subprocess's exit status carries it; the parent checks the status
+and that the last stage printed is the final one. The tests that need no window, the stop
+under a queuing task and the torn-size read, also run under nightly Miri.
 
 - A window opens, events are pumped, one call runs on the main thread and one on the
   present thread, and the process closes: `run` returns and the exit status is zero.
@@ -496,8 +519,12 @@ also run under nightly Miri.
   drop, made on another thread. A `WindowReports` held past `exit` does not keep it.
 - A driver that panics before its last step still lets the pump return: its `exit` guard
   queues `exit` while it unwinds, and the subprocess's exit status is not zero.
-- A last device whose drop would block, after step 4's bound expired, is dropped off the
-  main thread: the pump warns, and a main-lane call queued meanwhile runs.
+- A last device whose drop would block, after step 4's bound expired, is dropped on step
+  4's thread, a thread of its own: the pump warns, a main-lane call queued meanwhile
+  runs, and no worker is held.
+- After an error from `run`, with a root whose last step blocks, `main` returns `run`'s
+  error within its bound, having logged on `pail`, and the root is not dropped on the
+  main thread.
 - A worker that waits on the main thread fails: `Executor::block_on` of a main-lane call
   on a worker is `lactose-task`'s debug assertion, and the subprocess aborts.
 - The present thread has the spec above, through a spy `Platform`. A call that blocks

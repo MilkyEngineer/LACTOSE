@@ -66,8 +66,11 @@ mod rhi {
     pub trait Swapchain: Send {
         fn extent(&self) -> Extent;
         fn acquire(&mut self) -> Result<Acquired>;
+        /// Refused as `Rule::Pending`, which the caller retries, while the submit it waits
+        /// for is not yet released; the image is then still the acquired one.
         fn present(&mut self, image: u32) -> Result<Presented>;
-        /// Refused as `Rule::Pending` while a present is pending.
+        /// Refused as `Rule::Pending` while a present is pending; an acquired image is
+        /// given up.
         fn resize(&mut self, extent: Extent) -> Result<()>;
     }
 
@@ -114,12 +117,20 @@ mod frame {
         pub swapchain: Option<Box<dyn Swapchain>>,
         /// The size last asked for, which is what a resize is decided against.
         pub asked: Option<Extent>,
+        /// An image whose present was refused as pending, presented again at the next call.
+        pub acquired: Option<u32>,
         pub presents: Cell<u64>,
     }
 
     impl Presenter {
         pub fn empty() -> Self {
-            Self { device: None, swapchain: None, asked: None, presents: Cell::new(0) }
+            Self {
+                device: None,
+                swapchain: None,
+                asked: None,
+                acquired: None,
+                presents: Cell::new(0),
+            }
         }
 
         /// One present, on the present thread: every call here may block, within a bound,
@@ -140,33 +151,48 @@ mod frame {
                     },
                     None => self.swapchain = Some(device.create_swapchain(size)?),
                 }
+                // A resize gives up the image an earlier call kept.
+                self.acquired = None;
                 self.asked = Some(size);
             }
             let Some(swapchain) = &mut self.swapchain else { return Ok(false) };
-            match swapchain.acquire()? {
-                Acquired::Image(image) => match swapchain.present(image)? {
-                    Presented::Shown => {
-                        self.presents.set(self.presents.get() + 1);
-                        Ok(true)
-                    }
-                    Presented::Stale => {
+            let image = match self.acquired.take() {
+                Some(image) => image,
+                None => match swapchain.acquire()? {
+                    Acquired::Image(image) => image,
+                    Acquired::None => return Ok(false),
+                    Acquired::Stale => {
                         self.asked = None;
-                        Ok(false)
+                        return Ok(false);
                     }
                 },
-                Acquired::None => Ok(false),
-                Acquired::Stale => {
+            };
+            match swapchain.present(image) {
+                Ok(Presented::Shown) => {
+                    self.presents.set(self.presents.get() + 1);
+                    Ok(true)
+                }
+                Ok(Presented::Stale) => {
                     self.asked = None;
                     Ok(false)
                 }
+                // The image is still the acquired one: the next call presents it again,
+                // and the refusal is not returned.
+                Err(error) if Rule::of(&error) == Some(Rule::Pending) => {
+                    self.acquired = Some(image);
+                    Ok(false)
+                }
+                Err(error) => Err(error),
             }
         }
 
-        /// The present thread's last call at shutdown, queued once the points the host
-        /// owes are signalled (step 2). A client's first waits, within a bound, for the
-        /// points its presents signalled; this stand-in keeps none. It drops the swapchain,
-        /// a drop no caller bounds, which waits for the submits that use its images, and
-        /// its clone of the device. What `stop` then hands back holds nothing of the window.
+        /// The present thread's last call at shutdown, queued once every point a pending
+        /// submit waits on that no submit made will signal is signalled (step 2). A
+        /// client's first signals in the same way the points of a present of its own that
+        /// was refused, then waits, within a bound, for the points its presents signalled;
+        /// this stand-in keeps none. It drops the swapchain, a drop no caller bounds, which
+        /// waits for the submits that use its images, and its clone of the device. What
+        /// `stop` then hands back holds nothing of the window.
         pub fn wind_down(&mut self) {
             self.swapchain = None;
             self.device = None;
@@ -274,28 +300,26 @@ async fn root(
     // 1. `exit` first, not awaited: it destroys nothing while an `Arc<Window>` is held, and
     //    the pump drains main-lane calls until the last one goes.
     drop(exit);
-    // 2. No present and no frame submit is queued from here. Every point the host owes that
-    //    a pending submit waits on is signalled first, by whatever holds it: the swapchain's
-    //    drop waits for the submits that use its images. Then the present thread's last call.
+    // 2. No present and no frame submit is queued from here. Every point a pending submit
+    //    waits on that no submit made will signal is signalled from the host first: what
+    //    the host owes, and the points of a submit that failed or will now not be made; the
+    //    swapchain's drop waits for the submits that use its images. Then the present
+    //    thread's last call, which signals the points of a refused present of its own.
     let last = present.run(frame::Presenter::wind_down).await;
     // 3. The state comes back with nothing of the window in it.
     let stopped = thread.stop().await.map(drop);
-    // 4. On a background worker: the device's last points are waited for within a bound,
+    // 4. On a thread of its own: the device's last points are waited for within a bound,
     //    and every encoder and every `Device` clone but one is dropped.
-    let settled = executor.spawn(WorkerClass::Background, async move {
-        let settled = device.as_deref().is_none_or(|device| last_points(device, BOUND));
-        (device, settled)
-    });
-    // 5. Only when there is a device. A main-lane call drops the last, which then waits for
-    //    nothing, and MoltenVK's view observation is removed on the view's thread. After an
-    //    expired step-4 bound the drop may block, so it goes to a background worker and the
-    //    main thread goes on answering under the pump's warning.
-    let dropped = match settled.await {
-        Ok((Some(device), true)) => main.run(move |_| drop(device)).await,
-        Ok((Some(device), false)) => {
-            executor.spawn(WorkerClass::Background, async move { drop(device) }).await
-        }
-        Ok((None, _)) => Ok(()),
+    let settled = match device {
+        Some(device) => settle(&executor, device).await,
+        None => Ok(None),
+    };
+    // 5. Only when a device came back. A main-lane call drops the last, which then waits
+    //    for nothing, and MoltenVK's view observation is removed on the view's thread. After
+    //    an expired step-4 bound none comes back: step 4's thread drops it.
+    let dropped = match settled {
+        Ok(Some(device)) => main.run(move |_| drop(device)).await,
+        Ok(None) => Ok(()),
         Err(error) => Err(error),
     };
     // Every step has run. The start's or the frame's error first: a later step's
@@ -305,17 +329,63 @@ async fn root(
     Ok(frames)
 }
 
-/// How long a step of the shutdown waits before it logs and goes on.
+/// How long a step of the shutdown, or `main` after an error from `run`, waits before it
+/// logs and goes on.
 const BOUND: Duration = Duration::from_secs(2);
 
-/// Stands for the backend's waits, on a background worker, for the device's last points:
-/// `false` if the bound expired, after which dropping the device may block.
+/// Step 4, on a thread of its own made through the executor's platform, since it may block
+/// and no worker may. The thread waits within the bound for the device's last points and
+/// hands the device back for step 5. If the bound expires it logs that, hands back nothing,
+/// and drops the last `Device` itself: a drop that then blocks holds that thread and the
+/// window, and while the pump runs the main thread goes on answering under its warning.
+/// The root looks for the answer on a timer, so no worker waits for the thread.
+async fn settle(
+    executor: &Executor,
+    device: Arc<dyn rhi::Device>,
+) -> Result<Option<Arc<dyn rhi::Device>>> {
+    let (answer, answered) = mpsc::channel();
+    executor.platform().spawn_thread(
+        ThreadSpec {
+            name: "settle".to_owned(),
+            class: lactose_core::ThreadClass::Background,
+            index_in_class: 0,
+        },
+        Box::new(move || {
+            if last_points(&*device, BOUND) {
+                let _ = answer.send(Some(device));
+            } else {
+                warn_on_pail("the device's last points passed the shutdown's bound");
+                let _ = answer.send(None);
+                drop(device);
+            }
+        }),
+    )?;
+    loop {
+        match answered.try_recv() {
+            Ok(device) => return Ok(device),
+            Err(mpsc::TryRecvError::Empty) => {
+                executor.sleep_until(Instant::now() + POLL).await?;
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {
+                return Err(Error::new(ErrorKind::Cancelled, "step 4's thread ended unanswered"));
+            }
+        }
+    }
+}
+
+/// Stands for the backend's waits for the device's last points: `false` if the bound
+/// expired, after which dropping the device may block.
 fn last_points(device: &dyn rhi::Device, bound: Duration) -> bool {
     todo!()
 }
 
-/// `main`: the pump is made first and run last, and nothing after `run` touches the
-/// window, which is gone.
+/// Stands for the client's `tracing::warn!` on `lactose_platform::LOG_TARGET`.
+fn warn_on_pail(message: &str) {
+    todo!()
+}
+
+/// `main`: the pump is made first and run last. When `run` returns a value nothing after it
+/// touches the window, which is gone.
 fn client_main() -> Result<()> {
     let (main, pump) = event_pump(WindowDesc {
         title: "client".to_owned(),
@@ -330,13 +400,36 @@ fn client_main() -> Result<()> {
         present_thread(executor.platform().as_ref(), frame::Presenter::empty())?;
     let task =
         executor.spawn(WorkerClass::FrameCritical, root(executor.clone(), main, present, thread));
-    // 6. `run` returns once the last `Arc<Window>` goes; `main` then waits for its root
-    //    task and shuts the executor down, and nothing that runs from here holds the device
-    //    or the window. `run`'s error waits for both, so the root is never dropped here.
-    let pumped = pump.run();
+    // 6. When `run` returns a value the last `Arc<Window>` is gone; `main` waits for its
+    //    root task and shuts the executor down, and nothing that runs from here holds the
+    //    device or the window.
+    if let Err(error) = pump.run() {
+        // The steps now run with no pump, and their main-lane calls resolve to `Cancelled`.
+        // The root is awaited on a thread of its own, within a bound; past it `main` logs
+        // and returns `run`'s error with the root neither dropped nor shut down, and the
+        // process ends with it, as it does with the leaked window. How the process ends past
+        // the bound is `app`'s choice. A platform that makes no thread drops the body, and
+        // the root with it, here.
+        let (answer, answered) = mpsc::channel();
+        let waiter = executor.clone();
+        let waited = executor.platform().spawn_thread(
+            ThreadSpec {
+                name: "root".to_owned(),
+                class: lactose_core::ThreadClass::Background,
+                index_in_class: 0,
+            },
+            Box::new(move || {
+                let _ = answer.send(waiter.block_on(task));
+            }),
+        );
+        match waited.map(|_| answered.recv_timeout(BOUND)) {
+            Ok(Ok(_)) => executor.shutdown(),
+            _ => warn_on_pail("the root did not end within its bound after `run` failed"),
+        }
+        return Err(error);
+    }
     let frames = executor.block_on(task);
     executor.shutdown();
-    pumped?;
     frames?.map(|_| ())
 }
 
@@ -517,10 +610,11 @@ fn subprocess_main() -> Result<()> {
 fn under_a_deadline(mut command: Command, deadline: Duration) {
     let mut child = command.stdout(Stdio::piped()).spawn().expect("the subprocess starts");
     let mut stdout = child.stdout.take().expect("the subprocess's stdout is piped");
-    let reader = std::thread::spawn(move || {
+    let (read, reader) = mpsc::channel();
+    std::thread::spawn(move || {
         let mut output = Vec::new();
         let _ = stdout.read_to_end(&mut output);
-        String::from_utf8_lossy(&output).into_owned()
+        let _ = read.send(String::from_utf8_lossy(&output).into_owned());
     });
     let until = Instant::now() + deadline;
     let status = loop {
@@ -534,8 +628,9 @@ fn under_a_deadline(mut command: Command, deadline: Duration) {
         }
         std::thread::sleep(Duration::from_millis(20));
     };
-    // The child has ended, so its end of the pipe is closed and the read finishes.
-    let output = reader.join().expect("the reader does not panic");
+    // The child has ended, but a process it started may still hold its end of the pipe, so
+    // the read is waited for within a bound as well.
+    let output = reader.recv_timeout(ANSWER).expect("stdout held open");
     let stage = output.lines().rev().find_map(|line| line.strip_prefix("stage: "));
     let Some(status) = status else {
         panic!(
