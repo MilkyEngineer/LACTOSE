@@ -11,7 +11,9 @@ use std::borrow::Cow;
 pub enum ErrorKind {
     /// A named thing (asset, file, save slot, entity) does not exist.
     NotFound,
-    /// Bytes from disk or the network failed validation.
+    /// Data failed validation: bytes from disk or the network, a value a caller built
+    /// against the rules of the call it is given to, or a call that breaks the contract it
+    /// is made under (a backend's refusal).
     InvalidData,
     /// A schema, protocol, build or content hash did not match.
     VersionMismatch,

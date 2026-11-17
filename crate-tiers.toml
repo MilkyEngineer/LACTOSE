@@ -69,6 +69,8 @@ crates = ["lactose-rhi-null"]
 # key is a crate; a feature of it that turns a listed one on is held to the same rule.
 # asset-api's `conformance` builds the store conformance suite and its `ReferenceStore`.
 "lactose-asset-api" = ["conformance"]
+# rhi-api's `conformance` builds the backend conformance suite: its cases and its harness.
+"lactose-rhi-api" = ["conformance"]
 
 [boundary]
 # Crates inside the determinism boundary. clippy.toml and the allowlists below apply here.

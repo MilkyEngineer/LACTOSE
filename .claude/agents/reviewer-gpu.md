@@ -48,8 +48,10 @@ validation-clean run on one driver is evidence, not proof. Expect defects of tha
    second starts from undefined contents. A resource whose contents are read later (a history or
    imported resource) is never transitioned from undefined: drivers that keep contents hide it,
    others discard them. A transient's lifetime spans every queue it is used on. On Metal, a resource
-   outside automatic hazard tracking (heap-aliased transients, argument-buffer resources, D45) needs
-   explicit fences or events and residency calls. The render graph derives all of this
+   a pass declares is made resident on its encoder and is under Metal's tracking; one a shader
+   reaches but the pass does not declare is neither, which Metal shader validation alone reports;
+   an image placed in a heap is untracked at every use and needs the heap's fence around every
+   encoder that uses it, not at the alias call alone (D158). The render graph derives all of this
    (section 12.3): check the derivation, not one frame's output of it. The compile cache
    (section 12.3) is keyed on every input that changes the derivation: change each and see a
    recompile. A pass whose only output is a readback or an imported resource is not culled. Within
@@ -102,7 +104,8 @@ validation-clean run on one driver is evidence, not proof. Expect defects of tha
    state that maps to more than one layout, or forces an all-commands barrier on every use, is a
    finding. The surface carries what native Metal needs (D43, D45): the resources a pass reaches
    through the bindless heap, so `rhi-metal` can declare residency per encoder; aliasing as a
-   relation the backend fences, not raw offsets; heaps; indirect command buffers. A call only Vulkan
+   relation the backend fences, not raw offsets; heaps. Indirect command buffers are not in it
+   until the freeze decides (D43, D158). A call only Vulkan
    can honour is a finding while `rhi-api` is unstable (section 20).
 
    For the RHI surface and `rhi-null`: the null backend keeps the state the caller carries between

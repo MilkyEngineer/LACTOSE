@@ -80,10 +80,18 @@ level are a schedule build error.
 **No locks on the hot path.** Per-frame work uses chunks, command buffers and atomic counters.
 A `Mutex` inside a system is a review rejection. Locks are permitted in setup, teardown, IO
 completion handling, and inside RHI backends on objects the graphics API requires to be
-externally synchronised. One lock is permitted inside a system: the snapshot channel of
-`lactose-present-api` (D157), taken at most once by extract's pass and once by each
-publication and acquire, and held for a constant-time exchange of buffer handles and event
-batches alone.
+externally synchronised and on a device backend's queues and heap, each held through the driver
+call it orders (D158). Two more are permitted on the per-frame path, systems' jobs included,
+each named in its crate's README with every call that takes it: the snapshot channel of
+`lactose-present-api`, taken at most once by extract's pass and once by each publication and
+acquire, and held for a constant-time exchange of buffer handles and event batches (D157); and
+the locks on the records an RHI device backend keeps to check the rules every backend checks,
+the record's lock held by a call once for its checks and the updates they permit, which for a
+submit is a walk over the handles it names, and for a present also over the points its submit
+depends on, made again after a wait, and once more where that hold set a mark, after a submit's
+driver call, or where a timeline's wait or read records the value it saw, and a lock on one
+entry, a handle's or a heap slot's, held by a lookup for a compare and a count (D158). None of
+them is held across a wait, a driver call or code the caller supplies.
 
 **Unsafe is quarantined.** `#![forbid(unsafe_code)]` outside the crates in section 21.
 
@@ -353,6 +361,9 @@ tick N        tick N+1 simulation ───────────────�
 - **Late-latch** writes exactly one GPU buffer, the full orbit camera transform (pivot from the
   snapshot interpolated to frame time, rotation from the latest input, boom length from
   presentation collision), after all CPU view-dependent work and immediately before submit.
+  The late latch writes its buffer before the frame's submit and gates no submit on a host
+  signal. On Apple a submit whose host wait is unmet for about 5 s loses the device, and a
+  present behind it is held (`lactose-rhi-api`, "The swapchain").
   Light binning runs on the GPU in camera-cell-relative space after the latch, and GPU culling
   reads the latched buffer, so neither needs a pad. CPU shadow-cascade fitting is padded by a
   configured maximum rotation and maximum boom-length change per frame, and the latched deltas
@@ -1017,13 +1028,14 @@ Thin, explicit, modern, with every claimed common feature verified in the milest
 
 - device, queues, swapchain
 - buffers with device addresses, images, samplers
-- one bindless heap; residency calls where the backend needs them
+- one bindless heap; each pass declares the heap slots and the buffers it reaches, and a
+  backend that needs residency derives its calls from the declaration
 - pipelines from cooked SPIR-V or Metal libraries, with specialisation; driver pipeline caches
   persisted to disk (`VkPipelineCache`, `MTLBinaryArchive`)
 - command encoders recordable on any thread
-- resource states as a backend-neutral enum; backends emit barriers, and Metal backends handle
-  aliased transients and argument-buffer residency explicitly rather than relying on automatic
-  hazard tracking
+- resource states as a backend-neutral enum; backends emit barriers. On Metal a resource a pass
+  declares is made resident on that pass's encoder, which brings it under Metal's hazard
+  tracking; aliased transients are untracked, and the backend fences every use of them
 - memoryless and transient attachments, and render-pass-local reads (dynamic rendering local
   read on Vulkan, framebuffer fetch on Metal) so the G-buffer stays in tile memory
 - timeline semaphores and fences
