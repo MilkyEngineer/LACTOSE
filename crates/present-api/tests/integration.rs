@@ -7,3 +7,4 @@ mod common;
 mod consumers;
 mod extract;
 mod registration;
+mod rollback;
