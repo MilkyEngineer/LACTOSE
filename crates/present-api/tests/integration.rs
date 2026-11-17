@@ -5,6 +5,8 @@
 
 mod common;
 mod consumers;
+mod exchange;
 mod extract;
+mod frame;
 mod registration;
 mod rollback;
