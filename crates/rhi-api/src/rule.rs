@@ -13,7 +13,8 @@ use lactose_core::{Error, ErrorKind};
 /// The null backend checks every rule. A device backend checks each clause whose breach
 /// on a device would be undefined behaviour on the host, a GPU fault or an abort inside
 /// the driver; a clause whose breach is a wrong image it leaves to null's runs and the
-/// validators (`README.md`, "The rules").
+/// validators. What a shader's code does, and what it reaches through data alone, no rule
+/// covers (`README.md`, "The rules").
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Rule {
     /// `state`: a transition's `from` is not the state the subresource is in, a use needs
@@ -32,16 +33,19 @@ pub enum Rule {
     Destroyed,
     /// `pending`: a destroy, an encoder reset or a swapchain resize while a submit that
     /// has not completed uses what it would free; a destroy of an image a heap slot still
-    /// holds, or of a block an image is still placed in; a host read of a buffer a pending
-    /// submit writes.
+    /// holds, or of a block an image is still placed in; a host read or write of a buffer
+    /// a pending submit writes.
     Pending,
-    /// `capability`: a call that needs a reported capability the device does not report.
+    /// `capability`: a call that needs a reported capability the device does not report,
+    /// or a shader module that declares a capability the device did not enable.
     Capability,
     /// `usage`: a use of a resource that its descriptor's usage, memory class or format
     /// does not allow, or a descriptor no device could honour.
     Usage,
     /// `bounds`: a range outside its buffer, image, memory block, heap, push-constant
-    /// range or attachments, or an index or indirect offset or stride off its alignment.
+    /// range or attachments, an index or indirect offset or stride off its alignment, a
+    /// viewport that is not finite, not of positive extent or whose depth range leaves zero
+    /// to one, or a dispatch above the device's workgroup counts.
     Bounds,
     /// `undeclared`: a heap slot or a buffer handed to a pass through
     /// [`push_slot`](crate::Encoder::push_slot) or
@@ -52,7 +56,8 @@ pub enum Rule {
     /// since.
     Unflushed,
     /// `host-overlap`: a host access to a range of a buffer while another host access to
-    /// an overlapping range is in progress, or a destroy of the buffer while any is.
+    /// an overlapping range is in progress, or a destroy of the buffer or a submit that
+    /// writes it while any is.
     HostOverlap,
     /// `local`: a draw whose pipeline reads input `i` with no
     /// [`local_read`](crate::Encoder::local_read) since colour attachment `i` was last
@@ -86,13 +91,15 @@ pub enum Rule {
     /// any other use of a swapchain image that is not the acquired one, or a second
     /// swapchain for a device that has one.
     Swapchain,
-    /// `timeline`: a signal of a value that is not greater than every value the timeline
-    /// has reached or been promised.
+    /// `timeline`: a submit's signal of a value not greater than every value the timeline
+    /// has reached or been promised, or while another queue's signal of it is pending with
+    /// no wait for it; a host signal not between the timeline's value and every pending
+    /// promise, or one a pending promise or another host signal could pass; or a value
+    /// 2^31 or more from the timeline's.
     Timeline,
     /// `encoding`: a command outside the scope it belongs to, a draw or dispatch with
-    /// nothing bound to it, a pass left open, an encoder of another device or role, an
-    /// encoder submitted again with no reset, or one recorded into between its submit and
-    /// its reset.
+    /// nothing bound to it, a pass left open, an encoder of another device or role, or an
+    /// encoder submitted again with no reset.
     Encoding,
 }
 

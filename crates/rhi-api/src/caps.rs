@@ -82,8 +82,10 @@ pub struct Capabilities {
     /// [`draw_indexed_indirect_count`](crate::Encoder::draw_indexed_indirect_count) may be
     /// called.
     pub indirect_count: bool,
-    /// Whether a shader may use 64-bit atomic operations on buffer memory. The facade has
-    /// no call that depends on it: the renderer chooses its shader by it.
+    /// Whether a shader may use 64-bit atomic operations on buffer memory. A pipeline whose
+    /// module declares them is refused where it is `false`
+    /// ([`Rule::Capability`](crate::Rule::Capability)); from milestone 3 the renderer
+    /// chooses its shader by it.
     pub buffer_atomics_64: bool,
     /// Whether a memoryless request for a colour attachment whose usage holds `INPUT` is
     /// honoured: the G-buffer's. A colour image without `INPUT` is no case of it.
@@ -108,12 +110,18 @@ pub struct Capabilities {
     pub samplers: u32,
     /// How many colour attachments a render pass may have. At least four.
     pub colour_attachments: u32,
+    /// The most workgroups a [`dispatch`](crate::Encoder::dispatch) may count in each
+    /// dimension: the driver's limit, at least 65535 in each. A count above it is refused
+    /// ([`Rule::Bounds`](crate::Rule::Bounds)); an indirect dispatch's counts are device
+    /// data, which their writer keeps within it.
+    pub compute_groups: [u32; 3],
 }
 
 impl Capabilities {
     /// The least a device may report: no optional capability, one queue, coherent memory,
-    /// a heap of [`HEAP_SLOTS_DEFAULT`] slots, a sampler table of [`SAMPLERS_DEFAULT`] and
-    /// four colour attachments. A test starts from it and sets the fields its case is about.
+    /// a heap of [`HEAP_SLOTS_DEFAULT`] slots, a sampler table of [`SAMPLERS_DEFAULT`], four
+    /// colour attachments and 65535 workgroups in each dimension of a dispatch, Vulkan's
+    /// least. A test starts from it and sets the fields its case is about.
     pub const LEAST: Self = Self {
         multi_draw_indirect: false,
         indirect_count: false,
@@ -126,6 +134,7 @@ impl Capabilities {
         heap_slots: HEAP_SLOTS_DEFAULT,
         samplers: SAMPLERS_DEFAULT,
         colour_attachments: 4,
+        compute_groups: [65535; 3],
     };
 }
 

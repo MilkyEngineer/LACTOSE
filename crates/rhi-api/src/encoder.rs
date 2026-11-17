@@ -197,9 +197,13 @@ impl IndexedIndirectArgs {
 ///
 /// An encoder is recording from its creation and after each [`reset`](Self::reset), and
 /// is submitted once between resets. A submit that takes it makes it pending until that
-/// submit completes. From that submit to the next reset a recording call records nothing,
-/// and the encoder's next submit is refused, as is a second submit with no reset between
-/// ([`Rule::Encoding`](crate::Rule::Encoding), every backend).
+/// submit completes. From that submit to the next reset a recording call records nothing
+/// and changes nothing the submit runs, and a second submit with no reset between is
+/// refused ([`Rule::Encoding`](crate::Rule::Encoding), every backend).
+///
+/// A draw whose vertex, index or instance range is empty, a dispatch with a count of zero,
+/// and an indirect draw of no records record nothing, on every backend; a range whose
+/// start passes its end is empty.
 ///
 /// Commands belong to a scope: outside a pass (transitions, the alias call, copies,
 /// beginning a pass), inside a render pass (draws, the local read, the viewport and the
@@ -286,7 +290,10 @@ pub trait Encoder: Any + Send {
     /// Ends the pass that is open.
     fn end_pass(&mut self);
 
-    /// Sets the viewport of the draws that follow in the pass.
+    /// Sets the viewport of the draws that follow in the pass. Its fields are finite, its
+    /// width and height above zero, and `near` and `far` in zero to one
+    /// ([`Rule::Bounds`](crate::Rule::Bounds), every backend); it may reach past the
+    /// attachments.
     fn set_viewport(&mut self, viewport: Viewport);
 
     /// Sets the scissor of the draws that follow in the pass, inside the attachments'
@@ -313,12 +320,14 @@ pub trait Encoder: Any + Send {
 
     /// Writes the device address of byte `byte_offset` of `buffer` into the push-constant
     /// block at `offset`, as eight little-endian bytes. The pass must declare `buffer`
-    /// ([`Rule::Undeclared`](crate::Rule::Undeclared)).
+    /// ([`Rule::Undeclared`](crate::Rule::Undeclared), every backend).
     fn push_address(&mut self, offset: u32, buffer: BufferHandle, byte_offset: u64);
 
     /// Writes `slot`'s number into the push-constant block at `offset`, as four
     /// little-endian bytes. The pass must declare `slot`
-    /// ([`Rule::Undeclared`](crate::Rule::Undeclared)).
+    /// ([`Rule::Undeclared`](crate::Rule::Undeclared), every backend), which is then not
+    /// empty at a draw or dispatch ([`Rule::HeapLayout`](crate::Rule::HeapLayout), every
+    /// backend).
     fn push_slot(&mut self, offset: u32, slot: HeapSlot);
 
     /// The local read: the draws that follow may read, as input `i`, what the pass has
@@ -361,8 +370,10 @@ pub trait Encoder: Any + Send {
     /// the device: a 32-bit value at `count_offset` of `count`, in `Indirect`, capped at
     /// `max_count`. Needs [`indirect_count`](crate::Capabilities::indirect_count)
     /// ([`Rule::Capability`](crate::Rule::Capability)). `count_offset` is a multiple of
-    /// four inside `count`, and `max_count` records lie inside `arguments` under the
-    /// alignment above ([`Rule::Bounds`](crate::Rule::Bounds), every backend).
+    /// four inside `count`, `stride` a multiple of four and at least
+    /// [`IndexedIndirectArgs::BYTES`] whatever `max_count` is, and `max_count` records lie
+    /// inside `arguments` from an `offset` that is a multiple of four
+    /// ([`Rule::Bounds`](crate::Rule::Bounds), every backend).
     fn draw_indexed_indirect_count(
         &mut self,
         arguments: BufferHandle,
@@ -373,7 +384,9 @@ pub trait Encoder: Any + Send {
         stride: u32,
     );
 
-    /// Runs the bound compute pipeline over `groups` workgroups. The dispatches of one
+    /// Runs the bound compute pipeline over `groups` workgroups, each count at most the
+    /// device's [`compute_groups`](crate::Capabilities::compute_groups) in its dimension
+    /// ([`Rule::Bounds`](crate::Rule::Bounds), every backend). The dispatches of one
     /// compute pass run in recording order, each seeing the buffer writes of those before
     /// it.
     fn dispatch(&mut self, groups: [u32; 3]);
@@ -381,6 +394,7 @@ pub trait Encoder: Any + Send {
     /// Runs the bound compute pipeline over the workgroups read from `arguments`, in
     /// `Indirect`: three little-endian 32-bit counts at `offset`, a multiple of four with
     /// the twelve bytes inside the buffer ([`Rule::Bounds`](crate::Rule::Bounds), every
-    /// backend).
+    /// backend). The counts are device data: no backend checks them, and their writer keeps
+    /// each within [`compute_groups`](crate::Capabilities::compute_groups).
     fn dispatch_indirect(&mut self, arguments: BufferHandle, offset: u64);
 }

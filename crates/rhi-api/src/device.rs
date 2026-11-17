@@ -67,8 +67,12 @@ pub trait Device: Send + Sync {
     /// Calls on ranges of one buffer that do not overlap may run at once on several
     /// threads. A call whose range overlaps one in progress is refused, and so is `fill`
     /// calling the device for the same buffer, a destroy of it included
-    /// ([`Rule::HostOverlap`](crate::Rule::HostOverlap)). A range outside the buffer is
-    /// refused ([`Rule::Bounds`](crate::Rule::Bounds)). Both on every backend.
+    /// ([`Rule::HostOverlap`](crate::Rule::HostOverlap)), and while the call is in progress
+    /// a submit that writes the buffer is refused by the same rule. A range outside the
+    /// buffer is refused ([`Rule::Bounds`](crate::Rule::Bounds)), and so is a call while a
+    /// pending submit writes the buffer, by a copy into it or a pass that declares it
+    /// `ShaderWrite` ([`Rule::Pending`](crate::Rule::Pending)). All on every backend: the
+    /// bytes lent are never ones the device may be writing.
     fn write_buffer(
         &self,
         buffer: BufferHandle,
@@ -84,7 +88,8 @@ pub trait Device: Send + Sync {
     /// `HostRead`. A call while a pending submit writes the buffer, by a copy into it or
     /// a pass that declares it `ShaderWrite`, is refused on every backend
     /// ([`Rule::Pending`](crate::Rule::Pending)): the bytes lent are never ones the device
-    /// may be writing. Overlap and bounds are as [`write_buffer`](Self::write_buffer)'s.
+    /// may be writing. Overlap, bounds and a submit made during the call are as
+    /// [`write_buffer`](Self::write_buffer)'s.
     fn read_buffer(
         &self,
         buffer: BufferHandle,
@@ -149,7 +154,9 @@ pub trait Device: Send + Sync {
     /// the timeline value that frees it.
     fn write_heap_slot(&self, slot: HeapSlot, image: ImageHandle) -> Result<()>;
 
-    /// Empties a heap slot, under the rule of [`write_heap_slot`](Self::write_heap_slot).
+    /// Empties a heap slot, under the rule of [`write_heap_slot`](Self::write_heap_slot). An
+    /// empty slot holds the backend's placeholder image, so a shader that reaches it through
+    /// data reads an unspecified value and never an unwritten descriptor.
     fn clear_heap_slot(&self, slot: HeapSlot) -> Result<()>;
 
     /// Makes a sampler and returns its index in the sampler table: an index no live
@@ -160,7 +167,8 @@ pub trait Device: Send + Sync {
     /// `ErrorKind::ResourceExhausted` when the table is full.
     fn create_sampler(&self, desc: &SamplerDesc) -> Result<SamplerIndex>;
 
-    /// Frees a sampler's index for reuse. A sampler has no declaration, so any pending
+    /// Frees a sampler's index for reuse; until it is reused the entry holds the backend's
+    /// placeholder sampler. A sampler has no declaration, so any pending
     /// submit may use it: refused on every backend while a submit made before the call is
     /// pending ([`Rule::Pending`](crate::Rule::Pending)).
     fn destroy_sampler(&self, sampler: SamplerIndex) -> Result<()>;
@@ -169,8 +177,11 @@ pub trait Device: Send + Sync {
     ///
     /// # Errors
     ///
-    /// `ErrorKind::Unsupported` for a shader target the backend does not run;
-    /// `ErrorKind::InvalidData` for a shader the driver refuses, a stage in the wrong
+    /// `ErrorKind::Unsupported` for a shader target the backend does not run; refused for a
+    /// module that declares a capability the device did not enable, which the backend reads
+    /// from the module's header ([`Rule::Capability`](crate::Rule::Capability), every
+    /// backend); `ErrorKind::InvalidData` for a module whose magic or version is not its
+    /// target's, a shader the driver refuses, a stage in the wrong
     /// place, a constant the shader does not declare or of another length, a heap array
     /// whose capacity is not the device's, a colour target with a write mask that is not
     /// empty which the fragment stage does not write or reads as an input, or a depth
@@ -215,9 +226,13 @@ pub trait Device: Send + Sync {
     /// The timeline's value now. It never decreases.
     fn timeline_value(&self, timeline: TimelineHandle) -> Result<u64>;
 
-    /// Signals a point from the host: the timeline's value becomes `point.value`, which
-    /// is greater than any it has reached or been promised, or the call is refused on
-    /// every backend ([`Rule::Timeline`](crate::Rule::Timeline)).
+    /// Signals a point from the host: the timeline's value becomes `point.value`. The value
+    /// is greater than the timeline's and less than every value a pending submit will
+    /// signal to it, and within 2^31 of the timeline's; every pending submit that signals
+    /// the timeline waits, on it, for a value no greater than `point.value`; and no other
+    /// host signal of it is in progress. Otherwise the call is refused on every backend
+    /// ([`Rule::Timeline`](crate::Rule::Timeline)), since a promise or a host signal could
+    /// pass this one (`README.md`, "Timelines").
     fn signal_timeline(&self, point: TimelinePoint) -> Result<()>;
 
     /// Blocks until the point is reached or `timeout` has passed, and returns whether it
@@ -237,7 +252,12 @@ pub trait Device: Send + Sync {
     /// role is submitted to through [`Swapchain::present`] alone
     /// ([`Rule::PresentQueue`](crate::Rule::PresentQueue)). Submits to one queue run in
     /// the order the calls return; it is the caller that orders two threads' submits. A
-    /// submit with no encoders is valid: it waits and signals.
+    /// submit with no encoders is valid: it waits and signals. A submit that writes a
+    /// buffer, by a copy into it or a pass that declares it `ShaderWrite`, is refused while
+    /// a host access to the buffer is in progress
+    /// ([`Rule::HostOverlap`](crate::Rule::HostOverlap)); its signals are refused by the
+    /// rules of `README.md`, "Timelines" ([`Rule::Timeline`](crate::Rule::Timeline)). Both
+    /// on every backend.
     ///
     /// # Errors
     ///

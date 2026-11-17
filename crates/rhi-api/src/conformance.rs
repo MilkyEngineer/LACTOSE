@@ -151,6 +151,9 @@ pub const CASES: &[Case] = cases! {
     contract "host_access_outside_the_memory_class_is_refused" => Usage everywhere;
     contract "address_of_a_buffer_without_the_usage_is_refused" => Usage everywhere;
     contract "read_under_a_pending_writer_is_refused" => Pending everywhere;
+    contract "write_under_a_pending_writer_is_refused" => Pending everywhere;
+    contract "submit_writing_under_a_host_access_is_refused" => HostOverlap everywhere;
+    contract "submit_racing_a_host_access_refuses_one";
     contract "unflushed_range_at_a_submit_is_refused" => Unflushed;
     contract "flush_and_invalidate_are_accepted_where_memory_is_coherent";
     contract "buffer_use_outside_its_usage_is_refused" => Usage everywhere;
@@ -191,8 +194,8 @@ pub const CASES: &[Case] = cases! {
     contract "heap_write_after_its_reader_completes_passes";
     contract "destroy_of_an_image_a_slot_holds_is_refused" => Pending everywhere;
     contract "sampler_destroyed_under_a_pending_submit_is_refused" => Pending everywhere;
-    contract "undeclared_slot_argument_is_refused" => Undeclared;
-    contract "undeclared_address_argument_is_refused" => Undeclared;
+    contract "undeclared_slot_argument_is_refused" => Undeclared everywhere;
+    contract "undeclared_address_argument_is_refused" => Undeclared everywhere;
     contract "declared_buffer_in_another_state_is_refused" => State;
     contract "sampler_table_is_bounded";
     output "heap_is_sampled_past_slot_zero";
@@ -206,6 +209,7 @@ pub const CASES: &[Case] = cases! {
     contract "shader_for_another_heap_is_refused";
     contract "shader_target_the_backend_does_not_run_is_unsupported";
     contract "constant_of_another_length_is_refused";
+    contract "shader_needing_an_unenabled_capability_is_refused" => Capability everywhere;
     contract "pipeline_of_other_formats_than_its_pass_is_refused" => Usage everywhere;
     contract "sealed_cache_round_trips";
     contract "cache_corrupt_truncated_or_foreign_starts_empty";
@@ -218,7 +222,7 @@ pub const CASES: &[Case] = cases! {
     contract "encoder_reset_while_pending_is_refused" => Pending everywhere;
     contract "encoder_in_two_submits_is_refused" => Encoding everywhere;
     contract "encoder_resubmitted_without_reset_is_refused" => Encoding everywhere;
-    contract "recording_while_pending_is_refused_at_submit" => Encoding everywhere;
+    contract "recording_while_pending_records_nothing";
     contract "encoder_of_another_role_or_device_is_refused" => Encoding everywhere;
     contract "command_outside_its_scope_is_refused" => Encoding everywhere;
     contract "draw_with_nothing_bound_is_refused" => Encoding everywhere;
@@ -228,11 +232,21 @@ pub const CASES: &[Case] = cases! {
     contract "refused_submit_changes_nothing";
     contract "submit_of_no_encoders_waits_and_signals";
     contract "submit_is_pending_until_its_wait_is_reached";
+    contract "empty_draws_and_dispatches_record_nothing";
+    contract "dispatch_beyond_the_group_limit_is_refused" => Bounds everywhere;
     contract "timeline_is_signalled_waited_and_read_by_the_host";
     contract "timeline_wait_times_out";
     contract "timeline_value_that_does_not_grow_is_refused" => Timeline everywhere;
+    contract "host_signal_above_a_pending_signal_is_refused" => Timeline everywhere;
+    contract "host_signal_below_a_promise_that_does_not_wait_for_it_is_refused" => Timeline everywhere;
+    contract "host_signal_below_a_pending_signal_releases_its_waiter";
+    contract "timeline_signalled_from_two_queues_without_a_wait_is_refused" => Timeline everywhere;
     contract "destroy_under_a_pending_submit_is_refused" => Pending everywhere;
+    contract "concurrent_resource_destroyed_while_another_queue_uses_it_is_refused" => Pending everywhere;
     contract "destroy_after_an_unobserved_submit_is_refused" => Pending;
+    contract "destroy_at_once_after_the_wait_is_accepted";
+    contract "destroy_racing_a_submit_refuses_one";
+    contract "submits_racing_on_one_queue_keep_their_order";
     contract "use_after_destruction_is_refused" => Destroyed everywhere;
     contract "destroyed_after_recording_is_refused_at_submit" => Destroyed everywhere;
     contract "handle_of_another_device_is_refused" => Destroyed;
@@ -242,6 +256,7 @@ pub const CASES: &[Case] = cases! {
     contract "input_read_of_another_attachment_is_refused" => LocalMap;
     contract "attachments_of_unequal_extent_are_refused" => Usage everywhere;
     contract "scissor_outside_the_attachments_is_refused" => Bounds everywhere;
+    contract "viewport_outside_its_rules_is_refused" => Bounds everywhere;
     output "triangle_matches_the_reference";
     output "local_read_sees_what_the_pass_wrote";
     output "clear_and_keep_load_as_described";
@@ -249,6 +264,7 @@ pub const CASES: &[Case] = cases! {
     output "draw_parameters_reach_the_shader";
     // Indirect draws and dispatches.
     contract "index_buffer_offset_outside_or_unaligned_is_refused" => Bounds everywhere;
+    contract "indexed_draw_past_its_index_buffer_is_refused" => Bounds everywhere;
     contract "indirect_arguments_outside_or_unaligned_are_refused" => Bounds everywhere;
     output "indexed_indirect_draw_matches_the_reference";
     output "indirect_count_draws_where_reported";
