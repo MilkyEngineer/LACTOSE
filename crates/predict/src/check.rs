@@ -14,12 +14,14 @@ use lactose_reflect::{Persistence, Registry, TypeInfo};
 /// set name or system passes nothing. Each is reviewed for what it reads through
 /// `&mut World`: `sim`'s six input-sync-point systems (hidden plumbing `crates/sim/
 /// README.md` names; renaming one is a change to this list in the same commit), `input`'s
-/// writer declaration, and `physics-api`'s sync and write-back. An engine crate that adds
+/// writer declaration, `physics-api`'s sync and write-back, and `present-api`'s extract,
+/// a pass system that takes the world by shared reference and writes nothing to it, so
+/// nothing a prediction system reads rests on what it read. An engine crate that adds
 /// an exclusive prediction-world system extends this list in the same change; a game crate
 /// never runs one there. Test-support scenes are not shipped and are not listed:
 /// `physics-api`'s conformance scene has an exclusive `input_tick` system, and a test of
 /// this crate that builds that scene does not run the check.
-pub const EXCLUSIVE_SYSTEMS: [SystemKey; 9] = [
+pub const EXCLUSIVE_SYSTEMS: [SystemKey; 10] = [
     SystemKey::from_name("sim::begin_tick"),
     SystemKey::from_name("sim::apply_frame_regions"),
     SystemKey::from_name("sim::apply_sessions"),
@@ -29,6 +31,7 @@ pub const EXCLUSIVE_SYSTEMS: [SystemKey; 9] = [
     SystemKey::from_name("input::player_input_writer"),
     SystemKey::from_name("physics_api::sync"),
     SystemKey::from_name("physics_api::write_back"),
+    SystemKey::from_name("present::extract"),
 ];
 
 /// Whether a prediction-world system may name the component `info` describes: it is

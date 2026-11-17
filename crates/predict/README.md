@@ -990,8 +990,11 @@ README.md`, "The applier")
   systems that run there, each reviewed for what it reads: `sim::begin_tick`,
   `sim::apply_frame_regions`, `sim::apply_sessions`, `sim::apply_inputs`,
   `sim::apply_staged_state` and `sim::apply_region_policy` (`crates/sim/README.md`, "The
-  input sync point"), `input::player_input_writer`, `physics_api::sync` and
-  `physics_api::write_back`. A key is the xxh64 of the declared name, which the schedule
+  input sync point"), `input::player_input_writer`, `physics_api::sync`,
+  `physics_api::write_back` and `present::extract`, `lactose-present-api`'s pass system,
+  which takes the world by shared reference and writes nothing to it
+  (`crates/present-api/README.md`, "Extract"). A key is the xxh64 of the declared name,
+  which the schedule
   rejects a collision of, so a look-alike system in a listed set passes nothing; an
   engine crate that adds or renames one changes the list in the same commit, and a game
   crate never runs an exclusive system in the prediction world. Test-support scenes are
