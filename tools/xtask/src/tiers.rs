@@ -10,10 +10,10 @@
 //! - **Host code is reached through normal and build edges.** A proc-macro crate's tests and a
 //!   build-script crate's tests are ordinary target artifacts, so dev edges do not count
 //!   towards "build scripts and proc macros may not depend on boundary crates".
-//! - **The server denylist follows the server binary's normal and build edges, and
-//!   `lactose-app`'s normal edges**, at any depth. The server links `lactose-app`, so that
-//!   closure is held before the server exists (milestone 2 plan, decision 5.11); a dev edge
-//!   reaches neither.
+//! - **The server denylist follows normal and build edges, from the server binary and from
+//!   `lactose-app`**, at any depth. The server links `lactose-app`, so the app's closure is
+//!   held as the server's check would hold it, before the server exists (milestone 2 plan,
+//!   decision 5.11); a dev edge reaches neither.
 //! - **A dev-only feature is one the `[dev_only_features]` table lists, or one of its owner's
 //!   features that turns a listed one on**, `default` included, so an alias cannot carry it out
 //!   of the dev edges.
@@ -25,11 +25,11 @@ use serde::Deserialize;
 use crate::workspace::{DepKind, DepSource, Package, Workspace};
 use crate::{Finding, TIER_FILE};
 
-/// The binary that `[server_denylist]` constrains, through normal and build edges.
+/// The binary that `[server_denylist]` constrains.
 pub const SERVER_BINARY: &str = "lactose-app-server";
 
 /// The library every engine binary links, the server included. `[server_denylist]` binds its
-/// normal-dependency closure whether or not [`SERVER_BINARY`] exists.
+/// closure through normal and build edges whether or not [`SERVER_BINARY`] exists.
 pub const APP_LIBRARY: &str = "lactose-app";
 
 /// A tier section of the file.
@@ -379,7 +379,7 @@ fn host_code(tiers: &TierFile, ws: &Workspace, package: &Package, findings: &mut
     };
     if package.proc_macro {
         // Starting at the crate itself also reports a proc-macro crate listed in [boundary].
-        for chain in ws.chains_to(&[&package.name], DepKind::ships, &boundary) {
+        for chain in ws.chains_to(&[&package.name], &boundary) {
             report("proc-macro crate", &chain);
         }
     }
@@ -390,7 +390,7 @@ fn host_code(tiers: &TierFile, ws: &Workspace, package: &Package, findings: &mut
             .filter(|d| d.kind == DepKind::Build)
             .map(|d| d.name.as_str())
             .collect();
-        for mut chain in ws.chains_to(&start, DepKind::ships, &boundary) {
+        for mut chain in ws.chains_to(&start, &boundary) {
             chain.insert(0, format!("{} build script", package.name));
             report("build script", &chain);
         }
@@ -477,8 +477,8 @@ pub(crate) fn turning_on<'a>(package: &'a Package, listed: &'a [String]) -> BTre
     }
 }
 
-/// The server binary may not reach a `[server_denylist]` crate through normal or build edges,
-/// nor `lactose-app`, which it links, through normal edges, so the rule holds before the
+/// Neither the server binary nor `lactose-app`, which it links, may reach a
+/// `[server_denylist]` crate through normal or build edges, so the rule holds before the
 /// server exists. A chain of `lactose-app` that one of the server's chains already shows
 /// after its first step is not reported again.
 fn server_denylist(tiers: &TierFile, ws: &Workspace, findings: &mut Vec<Finding>) {
@@ -496,13 +496,13 @@ fn server_denylist(tiers: &TierFile, ws: &Workspace, findings: &mut Vec<Finding>
     };
     let mut server_chains = Vec::new();
     if let Some(server) = ws.package(SERVER_BINARY) {
-        server_chains = ws.chains_to(&[SERVER_BINARY], DepKind::ships, &denied);
+        server_chains = ws.chains_to(&[SERVER_BINARY], &denied);
         for chain in &server_chains {
             report(server, chain);
         }
     }
     if let Some(app) = ws.package(APP_LIBRARY) {
-        for chain in ws.chains_to(&[APP_LIBRARY], |kind| kind == DepKind::Normal, &denied) {
+        for chain in ws.chains_to(&[APP_LIBRARY], &denied) {
             if !server_chains.iter().any(|shown| shown[1..] == chain[..]) {
                 report(app, &chain);
             }
@@ -725,20 +725,26 @@ mod tests {
     }
 
     #[test]
-    fn the_app_is_held_through_normal_edges_alone() {
-        // A dev edge of the app, a dev edge further down, and a build edge: none is followed.
-        // The server, once it exists, follows the build edge itself.
+    fn the_app_is_held_through_build_edges_and_not_dev_edges() {
+        // A dev edge of the app, and a dev edge further down: neither is followed.
         let ws = workspace(vec![
-            package(
-                "lactose-app",
-                &[("lactose-renderer", Dev), ("game-sim", Normal), ("lactose-render-graph", Build)],
-            ),
+            package("lactose-app", &[("lactose-renderer", Dev), ("game-sim", Normal)]),
             package("game-sim", &[("lactose-rhi-null", Dev)]),
             package("lactose-renderer", &[]),
-            package("lactose-render-graph", &[]),
             package("lactose-rhi-null", &[]),
         ]);
         assert_eq!(messages(&check(&tiers(), &ws)), [] as [&str; 0]);
+
+        // A build edge is followed, as the server's check would follow it through the app.
+        let ws = workspace(vec![
+            package("lactose-app", &[("lactose-render-graph", Build)]),
+            package("lactose-render-graph", &[]),
+        ]);
+        assert_eq!(
+            messages(&check(&tiers(), &ws)),
+            ["crates/app/Cargo.toml: `lactose-app` reaches `lactose-render-graph`, which is in \
+                 [server_denylist] (lactose-app -> lactose-render-graph)"]
+        );
     }
 
     #[test]
