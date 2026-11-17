@@ -23,9 +23,9 @@
 //! - [`MeshInstance`], [`Light`], [`Decal`] and [`CameraRig`] are the components a game
 //!   or a cooked region puts on an entity; [`AudioRequest`], [`VfxRequest`] and
 //!   [`DebugShape`] are the events a system emits through `PresentEvents`.
-//! - [`register_systems`] places extract in `Pass::Extract`; [`ExtractState`] is the
-//!   service resource `app` installs an [`InstanceSink`] and a [`SnapshotWriter`] in, and
-//!   publishes through, once per frame.
+//! - [`register_systems`] places extract in `Pass::Extract`; [`ExtractState`], which `app`
+//!   reaches through [`extract_state`], is where it installs an [`InstanceSink`] and a
+//!   [`SnapshotWriter`], and what it publishes through once per frame.
 //! - [`snapshot_channel`] makes the triple buffer; [`SnapshotReader::acquire`] gives the
 //!   render side a [`PresentFrame`]: two [`PresentSnapshot`]s and the frame's events.
 //! - [`ViewModels`] and [`DebugDraw`] are the render side's own: the values a UI shows and
@@ -33,7 +33,7 @@
 //!
 //! ```no_run
 //! use lactose_ecs::WorldKind;
-//! use lactose_present_api::{ExtractState, snapshot_channel};
+//! use lactose_present_api::{extract_state, snapshot_channel};
 //! use lactose_sim::{SimulationBuilder, TypeTable};
 //!
 //! # fn main() -> lactose_core::Result<()> {
@@ -50,13 +50,13 @@
 //! // world, its reading half to the presentation schedule. The renderer's sink goes in
 //! // the same way, with `set_sink`.
 //! let (writer, mut reader) = snapshot_channel();
-//! let extract = simulation.world_mut().service_mut::<ExtractState>().expect("setup inserted it");
+//! let extract = extract_state(&mut simulation).expect("setup inserted it");
 //! extract.set_snapshot(Some(writer));
 //!
 //! // Every frame, after `Simulation::run_passes` has run extract: the frame's events
 //! // and the snapshot the pass wrote, published together.
 //! let events = simulation.world_mut().take_present_events();
-//! simulation.world_mut().service_mut::<ExtractState>().expect("setup").publish(events);
+//! extract_state(&mut simulation).expect("setup").publish(events);
 //!
 //! // On the render side, every frame.
 //! if let Some(frame) = reader.acquire() {
@@ -89,7 +89,7 @@ pub use events::{AudioRequest, DebugShape, DebugShapeKind, EffectAsset, SoundAss
 pub use extract::{ExtractPass, ExtractState, InstanceRow, InstanceSink, RenderTransform};
 use lactose_core::Result;
 use lactose_ecs::World;
-use lactose_sim::{Pass, Registration, TypeTable};
+use lactose_sim::{Pass, Registration, Simulation, TypeTable};
 pub use snapshot::{
     PresentFrame, PresentSnapshot, SnapshotReader, SnapshotRows, SnapshotWriter, TransformPair,
     snapshot_channel,
@@ -107,12 +107,27 @@ pub fn register_types(types: &mut TypeTable) -> Result<()> {
     types.register::<CameraRig>()
 }
 
-/// Inserts the [`ExtractState`] service resource, with no output installed, in every kind
-/// of world: a pass with no output does nothing, so a world that is never shown pays
-/// nothing for it. `app` adds it with `SimulationBuilder::setup`.
+/// Inserts extract's service resource, holding an [`ExtractState`] with no output
+/// installed, in every kind of world: a pass with no output does nothing, so a world that
+/// is never shown pays nothing for it. `app` adds it with `SimulationBuilder::setup`. The
+/// service's type is private to this crate, so no other system can name it; `app` reaches
+/// the state through [`extract_state`].
 pub fn setup(world: &mut World) -> Result<()> {
-    world.insert_service::<ExtractState>(Box::new(ExtractState::new()));
+    world.insert_service::<extract::ExtractService>(Box::new(extract::ExtractService(
+        ExtractState::new(),
+    )));
     Ok(())
+}
+
+/// The [`ExtractState`] of `simulation`'s world, or `None` if [`setup`] did not run for it:
+/// how `app` installs a world's outputs and publishes each frame, between runs.
+///
+/// It takes the [`Simulation`], which no system holds, and not the `World`, which an
+/// exclusive system does: nothing inside a tick or a pass but `present::extract` reaches
+/// the state, so no system can read what a pass did or drive one (`README.md`, "Placement
+/// and state").
+pub fn extract_state(simulation: &mut Simulation) -> Option<&mut ExtractState> {
+    simulation.world_mut().service_mut::<extract::ExtractService>().map(|service| &mut service.0)
 }
 
 /// Places extract (`present::extract`, `worlds = [server, client, prediction]`) in
@@ -124,12 +139,12 @@ pub fn register_systems(registration: &mut Registration) {
 }
 
 /// What the contract promises at the type level, pinned so the implementation cannot lose
-/// it without a compile error: the state is a service resource and so is shared between a
-/// pass's jobs; a sink is a trait object that satisfies the same bounds; the channel's
-/// halves move to the threads that use them and the frame is handed to the presentation
-/// schedule's jobs; every component is persistent (so hashed and saved), replicated and
-/// extracted, and of the size `README.md` states; every request is a presentation event;
-/// and the two components extract reads beside its own are extracted.
+/// it without a compile error: the state is held in a service resource and so is shared
+/// between a pass's jobs; a sink is a trait object that satisfies the same bounds; the
+/// channel's halves move to the threads that use them and the frame is handed to the
+/// presentation schedule's jobs; every component is persistent (so hashed and saved),
+/// replicated and extracted, and of the size `README.md` states; every request is a
+/// presentation event; and the two components extract reads beside its own are extracted.
 const _: () = {
     use lactose_ecs::PresentEvent;
     use lactose_math::Scalar;
@@ -149,7 +164,7 @@ const _: () = {
             && info.tracking().extracted
     }
 
-    service::<ExtractState>();
+    service::<extract::ExtractService>();
     service::<dyn InstanceSink>();
     send_sync::<Box<dyn InstanceSink>>();
     send_sync::<SnapshotWriter>();

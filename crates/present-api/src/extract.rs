@@ -2,9 +2,10 @@
 //! copies what the render side needs out of a world between ticks. It writes the
 //! instances whose placement changed to an [`InstanceSink`], which the renderer's staging
 //! ring implements, and the rows presentation works on to the presentation snapshot
-//! (`crate::snapshot`). [`ExtractState`] is the service resource that holds both outputs
-//! and the pass's marks; `app` installs the outputs and publishes each snapshot between
-//! runs.
+//! (`crate::snapshot`). [`ExtractState`] holds both outputs and the pass's marks, in a
+//! service resource whose type is private to this crate; `app` reaches it through
+//! [`extract_state`](crate::extract_state) to install the outputs and to publish each
+//! snapshot between runs.
 //!
 //! The pass reads the world through `&World` and writes nothing to it: no column, no
 //! resource, no event and no log entry. Every row it produces is keyed by `StableKey`, and
@@ -50,9 +51,11 @@ impl RenderTransform {
 /// One instance as extract hands it to the sink: the placement the row has now.
 ///
 /// The row carries no previous placement. The sink holds the last placement it was given
-/// for the key, and a write makes that the previous one, or makes the previous one equal
-/// to the new one when [`no_interpolate`](Self::no_interpolate) is set or the sink does
-/// not hold the key.
+/// for the key, and a write makes that the previous one; a write in a pass of the same
+/// tick as the previous pass the sink was given for the kind replaces the current one and
+/// keeps the previous; and when [`no_interpolate`](Self::no_interpolate) is set, or the
+/// sink does not hold the key, the previous one becomes the new one as well (`README.md`,
+/// "What the sink keeps").
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct InstanceRow {
     /// The entity. The only identity a row has: a sink never learns a chunk or a row
@@ -76,7 +79,9 @@ pub struct ExtractPass {
     /// the prediction world's copy of an entity shadows the replicated world's
     /// (architecture section 9.4).
     pub kind: WorldKind,
-    /// The world's tick at the pass.
+    /// The world's tick at the pass. A pass of the same tick as the previous pass the sink
+    /// was given for this kind replaces current placements and keeps previous ones
+    /// (`README.md`, "What the sink keeps").
     pub tick: Tick,
     /// Whether the pass is full: it writes every instance of the world, and an instance
     /// the sink holds for this kind of world that the pass does not write is gone. A pass
@@ -131,10 +136,13 @@ pub trait InstanceSink: Send + Sync {
 }
 
 /// Extract's state beside the world: the two outputs and the marks of the passes so far.
-/// A service resource that [`setup`](crate::setup) inserts in every kind of world and the
-/// `present::extract` system takes as `ResMut<ExtractState>`; `app` reaches it between
-/// runs through `Simulation::world_mut().service_mut::<ExtractState>()` to install the
-/// outputs and to [`publish`](Self::publish).
+/// [`setup`](crate::setup) inserts it in every kind of world inside a service resource
+/// whose type is private to this crate, which only the `present::extract` system names:
+/// no system of a tick can name it, and `Res<ExtractState>` or `ResMut<ExtractState>`
+/// finds no resource. `app` reaches it between runs through
+/// [`extract_state`](crate::extract_state) to install the outputs and to
+/// [`publish`](Self::publish). A test's own pass system calls [`extract`](Self::extract)
+/// on a state the test owns.
 ///
 /// With neither output installed a pass does nothing and keeps no mark, so a dedicated
 /// server, which installs none, pays for the system's dispatch and nothing else.
@@ -149,13 +157,17 @@ pub struct ExtractState {
     settle: Option<ChangeMark>,
     /// The world's tick at the previous pass.
     tick: Option<Tick>,
+    /// The tick a `Teleported` is compared with: the previous pass's tick, or, at a pass of
+    /// that same tick, what the previous pass compared with (`README.md`, "The
+    /// no-interpolate flag").
+    covered: Option<Tick>,
 }
 
 impl ExtractState {
     /// A state with no output and no pass behind it.
     #[must_use]
     pub const fn new() -> Self {
-        Self { sink: None, snapshot: None, last: None, settle: None, tick: None }
+        Self { sink: None, snapshot: None, last: None, settle: None, tick: None, covered: None }
     }
 
     /// Installs `sink` as where instances are written, or removes the sink with `None`,
@@ -197,8 +209,9 @@ impl ExtractState {
     /// the batch `World::take_present_events` returned after it.
     ///
     /// If no pass wrote a snapshot since the previous publication (no tick ended and
-    /// nothing changed), the events alone are published. With no writer installed the
-    /// batch is dropped: nothing presents this world.
+    /// nothing changed), the events alone are published. With no writer installed, or
+    /// once the channel's reading half is dropped, the batch is dropped: nothing presents
+    /// this world, and nothing accumulates for a reader that will never acquire.
     pub fn publish(&mut self, events: PresentEventBatch) {
         todo!()
     }
@@ -218,16 +231,22 @@ impl core::fmt::Debug for ExtractState {
             .field("last", &self.last)
             .field("settle", &self.settle)
             .field("tick", &self.tick)
+            .field("covered", &self.covered)
             .finish()
     }
 }
+
+/// The service resource [`setup`](crate::setup) inserts: the world's [`ExtractState`] under
+/// a type no other crate can name, so that only `present::extract` takes it as a parameter
+/// and only [`extract_state`](crate::extract_state) reaches it, from outside any run.
+pub(crate) struct ExtractService(pub(crate) ExtractState);
 
 /// Extract, placed in `Pass::Extract` in every kind of world by
 /// [`register_systems`](crate::register_systems): [`ExtractState::extract`] over the
 /// world. It names `&mut World` because an exclusive system does, and reads the world
 /// through a shared reference.
 #[system(name = "present::extract", worlds = [server, client, prediction], exclusive)]
-pub(crate) fn extract(world: &mut World, job: Job, state: ResMut<ExtractState>) {
+pub(crate) fn extract(world: &mut World, job: Job, state: ResMut<ExtractService>) {
     let world: &World = world;
-    state.extract(world, &mut job);
+    state.0.extract(world, &mut job);
 }

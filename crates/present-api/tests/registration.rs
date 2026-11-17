@@ -2,20 +2,27 @@
 //! simulation build of every world kind, and the few bodies that decide nothing.
 
 use lactose_asset_api::{AssetId, AssetRef};
-use lactose_core::SystemKey;
-use lactose_ecs::{PresentEvent, WorldKind};
+use lactose_core::{ErrorKind, SystemKey};
+use lactose_ecs::{Job, PresentEvent, Res, ResMut, ScheduleError, World, WorldKind, system};
 use lactose_math::render::RenderPosition;
 use lactose_math::{Quat, Scalar, Vec3};
 use lactose_physics_api::Transform;
 use lactose_predict::{EXCLUSIVE_SYSTEMS, check_prediction_reads};
 use lactose_present_api::{
     AudioRequest, CameraRig, DebugDraw, DebugShape, ExtractState, MeshInstance, RenderTransform,
-    VfxRequest, ViewModels,
+    VfxRequest, ViewModels, extract_state,
 };
-use lactose_sim::{SimulationBuilder, TypeTable};
+use lactose_sim::{Registration, SimulationBuilder, Stage, TypeTable};
 
 fn vec3(x: f64, y: f64, z: f64) -> Vec3 {
     Vec3::new(Scalar::from_f64(x), Scalar::from_f64(y), Scalar::from_f64(z))
+}
+
+fn types() -> TypeTable {
+    let mut types = TypeTable::new();
+    lactose_physics_api::register_types(&mut types).unwrap();
+    lactose_present_api::register_types(&mut types).unwrap();
+    types
 }
 
 /// The registry takes the four components as hashed, replicated types (no raw float, every
@@ -24,15 +31,61 @@ fn vec3(x: f64, y: f64, z: f64) -> Vec3 {
 #[test]
 fn every_world_kind_builds_with_the_crate_registered() {
     for kind in [WorldKind::Server, WorldKind::Client, WorldKind::Prediction] {
-        let mut types = TypeTable::new();
-        lactose_physics_api::register_types(&mut types).unwrap();
-        lactose_present_api::register_types(&mut types).unwrap();
-        let mut simulation = SimulationBuilder::new(kind, types)
+        let mut simulation = SimulationBuilder::new(kind, types())
             .setup(lactose_present_api::setup)
             .systems(lactose_present_api::register_systems)
             .build()
             .unwrap();
-        assert!(simulation.world_mut().service_mut::<ExtractState>().is_some(), "{kind:?}");
+        assert!(extract_state(&mut simulation).is_some(), "{kind:?}");
+    }
+    // Without `setup` there is no state to reach.
+    let mut bare = SimulationBuilder::new(WorldKind::Server, types()).build().unwrap();
+    assert!(extract_state(&mut bare).is_none());
+}
+
+/// A tick system that would read what a pass left in the state.
+#[system(name = "test::read_extract_state", worlds = [server, client, prediction])]
+fn read_extract_state(state: Res<ExtractState>) {
+    let _ = &*state;
+}
+
+/// An exclusive tick system that would run a pass, or take an output away, inside a tick.
+#[system(name = "test::drive_extract_state", worlds = [server, client, prediction], exclusive)]
+fn drive_extract_state(world: &mut World, job: Job, state: ResMut<ExtractState>) {
+    let world: &World = world;
+    state.extract(world, &mut job);
+    drop(state.set_snapshot(None));
+}
+
+/// The state is held under a type private to the crate, so a system that names
+/// `ExtractState` finds no resource, though `setup` ran: the build refuses it, in every kind,
+/// as it refuses any resource no setup function inserted.
+#[test]
+fn no_tick_system_reaches_the_state() {
+    let systems = [
+        (&READ_EXTRACT_STATE, "test::read_extract_state"),
+        (&DRIVE_EXTRACT_STATE, "test::drive_extract_state"),
+    ];
+    for kind in [WorldKind::Server, WorldKind::Client, WorldKind::Prediction] {
+        for (system, name) in systems {
+            let error = SimulationBuilder::new(kind, types())
+                .setup(lactose_present_api::setup)
+                .systems(lactose_present_api::register_systems)
+                .systems(move |registration: &mut Registration| {
+                    registration.stage(Stage::Post).add(system);
+                })
+                .build()
+                .err()
+                .unwrap_or_else(|| panic!("{kind:?}: `{name}` was admitted"));
+            assert_eq!(error.kind(), ErrorKind::InvalidData, "{kind:?} {name}: {error}");
+            let source = std::error::Error::source(&error).expect("a schedule error");
+            let refused = source.downcast_ref::<ScheduleError>().expect("a schedule error");
+            assert!(
+                matches!(refused, ScheduleError::MissingResource { system, resource }
+                    if *system == name && resource.ends_with("ExtractState")),
+                "{kind:?}: {refused}"
+            );
+        }
     }
 }
 
@@ -42,10 +95,7 @@ fn every_world_kind_builds_with_the_crate_registered() {
 #[test]
 fn the_prediction_world_builds_under_predicts_check() {
     assert!(EXCLUSIVE_SYSTEMS.contains(&SystemKey::from_name("present::extract")));
-    let mut types = TypeTable::new();
-    lactose_physics_api::register_types(&mut types).unwrap();
-    lactose_present_api::register_types(&mut types).unwrap();
-    SimulationBuilder::new(WorldKind::Prediction, types)
+    SimulationBuilder::new(WorldKind::Prediction, types())
         .setup(lactose_present_api::setup)
         .systems(lactose_present_api::register_systems)
         .check(check_prediction_reads)

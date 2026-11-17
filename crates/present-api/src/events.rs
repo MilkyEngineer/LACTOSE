@@ -101,9 +101,10 @@ pub enum DebugShapeKind {
 /// can name.
 ///
 /// The kind is `"present::debug"`. A shape is drawn until presentation acquires a
-/// snapshot of a later tick, so a system that wants a shape to stay emits it every tick; a
-/// cancelled shape is dropped if it is still drawn. Presentation expands it into the
-/// buffer with [`DebugDraw::shape`](crate::DebugDraw::shape).
+/// snapshot of another tick than the shape's, or a cut, so a system that wants a shape to
+/// stay emits it every tick; a cancelled shape is dropped if it is still drawn.
+/// Presentation expands it into the buffer with
+/// [`DebugDraw::shape`](crate::DebugDraw::shape).
 #[value]
 #[derive(PartialEq, Debug)]
 pub struct DebugShape {

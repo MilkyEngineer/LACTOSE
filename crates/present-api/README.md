@@ -45,7 +45,8 @@ change to list.
 | `AudioRequest`, `SoundAsset` | Presentation event `present::audio`: play a sound once at a place |
 | `VfxRequest`, `EffectAsset` | Presentation event `present::vfx`: spawn an effect once at a placement |
 | `DebugShape`, `DebugShapeKind` | Presentation event `present::debug`: a line, box or sphere a tick asks the overlay to draw |
-| `register_types`, `setup`, `register_systems` | What `app` calls for every world kind: the four components; the `ExtractState` service; extract in `Pass::Extract` |
+| `register_types`, `setup`, `register_systems` | What `app` calls for every world kind: the four components; extract's service, which holds its state; extract in `Pass::Extract` |
+| `extract_state` | How `app` reaches a world's `ExtractState`, from the `Simulation`, between runs |
 | `ExtractState`, `ExtractState::{new, set_sink, set_snapshot, extract, publish}` | Extract's state beside the world: its two outputs, one pass, and the publication of what the passes wrote with the frame's events |
 | `InstanceSink`, `ExtractPass`, `InstanceRow`, `RenderTransform`, `RenderTransform::from_sim` | Where extract writes instances: the protocol of one pass, the row, and the render-space placement it carries |
 | `snapshot_channel`, `SnapshotWriter`, `SnapshotReader`, `SnapshotReader::acquire` | The triple buffer: the half extract writes through and the half the render side reads from |
@@ -56,7 +57,9 @@ change to list.
 
 There is no hidden plumbing: nothing here is `#[doc(hidden)]`. The system's descriptor is
 crate-private and reached through `register_systems` alone; its name, `present::extract`,
-is public because `lactose_predict::EXCLUSIVE_SYSTEMS` lists it.
+is public because `lactose_predict::EXCLUSIVE_SYSTEMS` lists it. The service resource that
+holds the `ExtractState` is of a crate-private type, inserted by `setup` and reached
+through `extract_state` alone ("Placement and state").
 
 ## What each consumer needs, and where this surface gives it
 
@@ -64,14 +67,14 @@ is public because `lactose_predict::EXCLUSIVE_SYSTEMS` lists it.
 |---|---|---|
 | `game-sim`, any crate that spawns | To say what an entity looks like, and where a camera follows it | The four components through an ordinary bundle or a cooked baseline; each is `persistent, replicated, extracted`, so a save keeps it and a client receives it |
 | `game-sim`, any tick system | To ask for a sound, an effect or a debug shape without a row of the origin entity surviving | `AudioRequest::at`, `VfxRequest::at`, `DebugShape::{line, aabb, sphere}` through `PresentEvents`; each carries its place in simulation space |
-| `lactose-app`, `frame-design` | One registration for every kind; the outputs of a world that is shown; the frame's order | `register_types`, `setup`, `register_systems`; `snapshot_channel`, `ExtractState::{set_sink, set_snapshot}`; `Simulation::run_passes`, then `World::take_present_events`, then `ExtractState::publish` ("The registration and the frame `app` writes") |
+| `lactose-app`, `frame-design` | One registration for every kind; the outputs of a world that is shown; the frame's order | `register_types`, `setup`, `register_systems`; `snapshot_channel`, `extract_state`, `ExtractState::{set_sink, set_snapshot}`; `Simulation::run_passes`, then `World::take_present_events`, then `ExtractState::publish` ("The registration and the frame `app` writes") |
 | `present-impl` | A contract for every body, and what it may add elsewhere | "Behaviour the signatures cannot express"; "Not in this crate yet" names the one addition to `lactose-ecs` it may need |
 | `lactose-renderer` | Instances by `StableKey` with no system of its own: which changed, which are gone, when everything it holds is stale | `InstanceSink` over its staging ring and slot table: `write`, `removed`, and `ExtractPass::full`; `ExtractPass::kind` tells a client's two worlds apart; `RenderTransform` is the row's placement |
 | `lactose-presentation` | Two states to interpolate between, the camera's pivot, the frame's events once, the remote entities' slots and meshes | `SnapshotReader::acquire`; `PresentFrame::transform`; `CameraRig::pivot_of`; `PresentFrame::events`; `PresentSnapshot::rows::<RemoteSlot>()` and `get::<MeshInstance>` on the replicated world's snapshot; `InstanceRow` and `RenderTransform::from_sim` for the remote upload |
 | `lactose-physics-api` | Its `Transform` and `Teleported` extracted, the second compared with the last tick covered | "The no-interpolate flag"; `PresentFrame::transform` |
 | `lactose-anim` | `AnimRig`, `AnimState` and `SimPose` beside the root transform, for the render pose | They are `extracted`, so a row with any of them is a presented row and the snapshot holds all three with its `Transform` ("The snapshot") |
 | `lactose-net-api`, `lactose-net-host` | `RemoteSlot` to reach presentation; remote transforms kept out of extract | `RemoteSlot` is `extracted`, so the replicated world's snapshot holds it; that world's passes copy and write no transform ("The extract set") |
-| `lactose-predict` | Extract on the prediction world every frame; a rollback that redraws what moved and cuts nothing; events not delivered twice | `Predictor::passes` runs the pass; a rollback makes the next pass full and not a `cut`; the events' keys are the ECS's ("Events and publication"); `present::extract` is in `EXCLUSIVE_SYSTEMS` |
+| `lactose-predict` | Extract on the prediction world every frame; a rollback that redraws what moved and cuts nothing; events not delivered twice | `Predictor::passes` runs the pass; a rollback makes the next pass full and not a `cut`, and in a frame with no step it replaces the current state on both outputs and keeps the previous ("What the sink keeps", "Events and publication"); the events' keys are the ECS's; `present::extract` is in `EXCLUSIVE_SYSTEMS`; `app` reaches the state with `extract_state(predictor.simulation_mut())` |
 | `game-present` | To turn the snapshot and the events into what the UI shows and what the overlay draws | `PresentSnapshot::{get, rows}` for the game's own `extracted` components; `ViewModels::set`; `DebugDraw::line` |
 | `lactose-ui` (milestone 5) | A value by type, or by key and field ID from a cooked layout | `ViewModels::{get, get_erased, iter}`, `ViewModel::{info, bytes}` with `TypeInfo::field_bytes` |
 | `lactose-audio` (milestone 5) | Requests to play, cancellations to stop | The frame's `PresentEventBatch`: `emitted` with `PresentEmission::get::<AudioRequest>()`, `cancelled` by key |
@@ -92,14 +95,14 @@ let mut simulation = SimulationBuilder::new(kind, types)
 
 // Once, for a world that is shown.
 let (writer, reader) = lactose_present_api::snapshot_channel();
-let extract = simulation.world_mut().service_mut::<ExtractState>().expect("setup");
+let extract = lactose_present_api::extract_state(&mut simulation).expect("setup");
 extract.set_sink(Some(renderer_sink));
 extract.set_snapshot(Some(writer));
 
 // Every frame, after the frame's ticks (and, for a prediction world, after `reconcile`).
 let mut simulation = simulation.run_passes(&executor).await?;       // extract runs here
 let events = simulation.world_mut().take_present_events();
-simulation.world_mut().service_mut::<ExtractState>().expect("setup").publish(events);
+lactose_present_api::extract_state(&mut simulation).expect("setup").publish(events);
 
 // Every frame, on the render side.
 if let Some(frame) = reader.acquire() { /* the presentation schedule */ }
@@ -176,9 +179,10 @@ events")
 - An empty asset reference in a request plays or spawns nothing. A cancelled request stops
   its sound, or removes its effect, if it still runs: the reader's duty, by the key.
 - `DebugShape` is how a system inside a world reaches the debug-draw buffer, which no
-  system can name. A shape is drawn from the frame that receives it until the first frame
-  whose newer snapshot is of a later tick than the shape's, so a system that wants a shape
-  to stay emits it every tick. A cancelled shape is dropped at once.
+  system can name. A shape is drawn from the frame that receives it until presentation
+  acquires a snapshot of another tick than the shape's, or a cut, so a system that wants a
+  shape to stay emits it every tick, and a load to an earlier tick leaves no shape behind.
+  A cancelled shape is dropped at once.
 - A game crate declares its own presentation events as it declares these; nothing here
   enumerates kinds.
 
@@ -190,10 +194,18 @@ events")
   prediction]`, alone in `Pass::Extract`. `Simulation::run_passes` runs it once per frame
   after the frame's ticks, paused or not; `lactose-predict`'s re-simulation runs steps
   alone, so it never runs against a discarded tick.
-- Its state is `ExtractState`, a service resource `setup` inserts in every kind of world.
-  A service is not world state: not hashed, not saved, not in a `WorldSnapshot`, and so
-  kept as it is across a restore. It has no accessor through which a system could read
-  what a pass did.
+- Its state is an `ExtractState`, held in a service resource that `setup` inserts in every
+  kind of world. A service is not world state: not hashed, not saved, not in a
+  `WorldSnapshot`, and so kept as it is across a restore.
+- No system but extract reaches the state. The service's type is private to this crate and
+  only `present::extract` names it, so `Res<ExtractState>` and `ResMut<ExtractState>` find
+  no resource: `SimulationBuilder::build` refuses a system that names either, in any world
+  kind, with `InvalidData` carrying `ScheduleError::MissingResource`
+  (`tests/registration.rs`). `app` reaches the state through `extract_state`, which takes
+  the `Simulation`: an exclusive system holds the `World`, and no system holds the
+  `Simulation`. So no system of a tick can read what a pass did, install or remove an
+  output, run a pass or publish. An `ExtractState` a test inserts for a pass system of its
+  own is that test's, and no pass of this crate reads it.
 - With neither output installed a pass returns at once and keeps no mark. A dedicated
   server installs none. With one output installed the pass does that output's half.
 - `set_sink` and `set_snapshot` are called between runs. Either makes the next pass full
@@ -205,9 +217,10 @@ events")
 - The pass takes the world by shared reference (`ExtractState::extract(&mut self, &World,
   ..)`): it writes no column, hashed or not, no resource, no event, no channel, no log
   entry and no stamp, and it trims nothing. What it keeps between passes is in
-  `ExtractState`. So the world hash is the same before and after a pass, a tick's systems
-  can read nothing a pass left, and a world's hashes do not depend on how many frames
-  were drawn (D152, "A pass system leaves the world hash as it found it").
+  `ExtractState`, which no system of a tick can reach ("Placement and state"). So the world
+  hash is the same before and after a pass, a tick's systems can read nothing a pass left,
+  and a world's hashes do not depend on how many frames were drawn (D152, "A pass system
+  leaves the world hash as it found it").
 - No tool checks that of an exclusive system, so `present-impl` proves it with a recorded
   test, in the module `recorded` of this package's `integration` target (D150): a scene
   with rows that move, teleport, spawn, despawn and change region is stepped under the
@@ -301,10 +314,25 @@ events")
 *What the sink keeps.* A row carries the placement the instance has now and no previous
 one: the world holds one `Transform` per row, and extract keeps no table of its own.
 
-- The sink holds, per key and world kind, the last placement it was given. A `write` makes
-  the held placement the previous one and the row's the current one; when
+- The sink holds, per key and world kind, a previous and a current placement. A `write`
+  makes the held current placement the previous one and the row's the current one, except
+  in a pass whose `ExtractPass::tick` equals the tick of the previous pass the sink was
+  given for that kind (its last `begin`): there the row's placement replaces the current
+  one and the previous one is kept, since it is still the state of the tick before. When
   `no_interpolate` is set, or the sink does not hold the key, the previous placement
-  becomes the row's as well.
+  becomes the row's as well, in either case.
+- The one pass that writes rows at the tick of the previous pass without setting
+  `no_interpolate` is a full pass in a prediction world, which is in practice a rollback in
+  a frame with no step. `lactose-predict` reconciles every frame and ticks are fewer than
+  frames, so a misprediction usually lands in such a frame. An idle pass and a full pass
+  in a `Server` world flag every row, and a `Client` world's passes write none. The
+  corrected placement is therefore drawn from the state of the tick before over what is
+  left of the tick, as the snapshot's pair is ("Events and publication"), and not from
+  where the frame before showed it.
+- Comparing with the last `begin` and not with extract's previous pass gives the same
+  placements: a pass calls nothing only when every placement the sink holds has its
+  previous equal to its current one, since a pass that follows a tick writes once more
+  every row the pass before it moved ("Settling").
 - That is the whole of what "previous and current transforms" (section 5.3) means for an
   instance: both live on the render side, and the staging ring carries current placements.
 - `InstanceRow::mesh` is the row's `MeshInstance::mesh` at the pass, on every write, so a
@@ -320,17 +348,24 @@ one: the world holds one `Transform` per row, and extract keeps no table of its 
 - on every row of an idle pass: a write between ticks is a placement, not a movement over
   a tick;
 - otherwise, when the row has a `Teleported` whose tick is not zero and is later than the
-  world's tick at the previous pass, by the wrapping comparison of ticks (the difference
-  is in `1..2^31`). A frame that ran several ticks loses no teleport
+  pass's *covered tick*, by the wrapping comparison of ticks (the difference is in
+  `1..2^31`). The covered tick is the world's tick at the previous pass or, at a pass of
+  that same tick, the previous pass's covered tick: the tick of the state the sink keeps as
+  previous ("What the sink keeps"), and, for a reader that keeps up, of the older
+  snapshot of the pair. A frame that ran several ticks loses no teleport
   (`crates/physics-api/README.md`); a `Teleported` loaded from a save is in the past and
   flags nothing. With no previous pass this rule flags nothing. A correction's placement
   sets `Teleported` at the tick that re-simulates it (`crates/physics-api/README.md`,
   "Snapshot and restore") and is judged by the same rule, so it is flagged only when that
-  tick is after the previous pass's.
+  tick is after the covered tick.
 - A full pass in a prediction world, which a rollback causes at every misprediction,
-  follows the last rule alone: the local player is drawn from where it was shown to where
-  the corrected run puts it. The visual blend of a correction is presentation's, from
-  `lactose-predict`'s `Correction`.
+  follows the last rule alone. In a frame with no step its tick is the previous pass's,
+  so the sink replaces the current placement and keeps the previous, and its snapshot
+  takes the place of the newest published one ("Events and publication"): both draw the
+  local player from the state at the tick before to where the corrected run puts it, over
+  what is left of the tick. A correction that re-simulates that tick alone sets
+  `Teleported` at it, after the covered tick, and both show it at once. The visual blend
+  of a correction is presentation's, from `lactose-predict`'s `Correction`.
 
 **The snapshot** (architecture section 5.3)
 
@@ -365,18 +400,21 @@ one: the world holds one `Transform` per row, and extract keeps no table of its 
   code is safe Rust.
 - `acquire` returns the two newest published snapshots, older first, or `None` before the
   first publication. With one published, both are that one. Called again before another
-  publication it returns the same pair.
-- When the writer needs a buffer and the reader holds two, the third is the newest
-  published snapshot, which the reader has not acquired: the writer takes it back and
-  writes it. A reader slower than the passes therefore misses snapshots, never blocks a
-  pass, and its pair then spans more than one pass. Nothing the reader holds is ever
-  written.
+  publication it returns the same pair. A snapshot that takes another's place ("Events and
+  publication") is published in its place, and the one it replaced is no longer published.
+- When the writer needs a buffer and none is free, the newest published snapshot is one
+  the reader has not acquired: the writer takes it back and writes it. A reader slower
+  than the passes therefore misses snapshots, never blocks a pass, and its pair then spans
+  more than one pass. Nothing the reader holds is ever written.
 - `PresentSnapshot::cut` is set on the snapshot of a full pass in a `Server` or `Client`
   world: nothing before it leads into it (a load, a restore, a world shown for the first
-  time). It is kept when a cut snapshot the reader never acquired is taken back and
-  written again, so a reader cannot miss a cut. It is never set in a prediction world,
-  where a full pass is a rollback; a prediction world's resync is reported by
-  `lactose-predict`, not here.
+  time). The channel remembers a published cut until an acquire returns it, and every
+  snapshot published meanwhile is marked a cut as well, so the first acquire after a cut is
+  published has a cut as its newer snapshot, whatever was taken back or published since.
+  That snapshot may be of a later pass than the one that cut: what a reader is guaranteed
+  is that it blends nothing across a cut, not that it sees the cut's own state. It is
+  never set in a prediction world, where a full pass is a rollback; a prediction world's
+  resync is reported by `lactose-predict`, not here.
 - One channel serves one world. A client's two worlds each have a channel and an
   `ExtractState`, and presentation reads both readers; `PresentSnapshot::kind` says which
   is which.
@@ -389,7 +427,14 @@ one: the world holds one `Transform` per row, and extract keeps no table of its 
   and appends `events` to the events the reader's next `acquire` returns, in one exchange:
   a frame never holds a snapshot without the events of the ticks it covers. With no
   snapshot to publish the events are appended alone. With no writer installed the batch
-  is dropped.
+  is dropped, and so is every batch once the channel's reading half has been dropped:
+  nothing accumulates for a reader that will never acquire.
+- A snapshot written by a full pass in a prediction world, of the tick of the newest
+  published snapshot, takes that snapshot's place instead of following it: the older of
+  the published pair stays, so a rollback in a frame with no step publishes the pair
+  (S_{t-1}, S_t') and not (S_t, S_t'). The corrected state is interpolated to from the
+  tick before, as the sink's placements are ("What the sink keeps"). The events published
+  with the replaced snapshot are not affected.
 - Events travel beside the snapshots, not in them: each emission is in exactly one
   frame's batch, whether or not the snapshot it was published with was ever acquired.
   Batches published between two acquires are folded in publication order by the ECS's own
@@ -408,12 +453,18 @@ one: the world holds one `Transform` per row, and extract keeps no table of its 
 - `PresentFrame::transform(key)` is the row's `Transform` in the newer snapshot as
   `current`, and in the older as `previous`, or `current` where the older holds none.
 - Its `no_interpolate` is set when the newer snapshot is a `cut`; when the older holds no
-  transform for the key; when the two snapshots are of one tick (the first snapshot, or
-  an edit between ticks); or when the row's `Teleported` in the newer snapshot is not
-  zero and is later than the older snapshot's tick, by the wrapping comparison.
-- An edit made between ticks to a presented row publishes a snapshot of the same tick, so
-  for that frame every presented row is shown at the newer state with nothing drawn in
-  between. `app` edits no row between ticks in a running game (`crates/sim/README.md`).
+  transform for the key; when the two snapshots are of one tick; or when the row's
+  `Teleported` in the newer snapshot is not zero and is later than the older snapshot's
+  tick, by the wrapping comparison.
+- A pass writes a snapshot of the tick already published in three cases, and two of them
+  make a pair of one tick. The first snapshot of a world is published alone, so the pair
+  is that snapshot twice until a snapshot of another tick is published. An edit made
+  between ticks to a presented row publishes a snapshot of the same tick beside the one
+  before it, so until the next publication of a snapshot of another tick every presented
+  row is shown at the newer state with nothing drawn in between; `app` edits no row
+  between ticks in a running game (`crates/sim/README.md`). The third, a rollback in a
+  prediction world in a frame with no step, makes no such pair: its snapshot takes the
+  place of the one of its tick, and the pair goes on from the tick before.
 - How far a frame is between the pair's two ticks is presentation's to compute; nothing
   here holds a time.
 
@@ -451,10 +502,13 @@ one: the world holds one `Transform` per row, and extract keeps no table of its 
   `Transform`, `MeshInstance` and `Teleported` of the same rows, and `World::columns`
   yields one column. `present-impl` may add the join there, in the change that needs it,
   or pair the columns by key; no signature here changes either way.
-- A shown `Server` world's presentation events: `Simulation::step` drops them. A listen
-  server or a single-player world needs a `SimulationBuilder` option in `lactose-sim` that
-  leaves them for `app`; `frame-design` proposes it if milestone 2's local world is of
-  that kind.
+- A shown `Server` world's presentation events: `Simulation::step` drops them. The
+  milestone 2 plan's decision 5.1 already makes milestone 2's local world the headless
+  binary's kind, `Server`, so that world delivers no event, and no debug shape, until this
+  is settled. `frame-design` must settle event delivery for it. What it owes: a
+  `SimulationBuilder` option in `lactose-sim` that leaves a shown server's events for
+  `app`, and the amendment of `crates/sim/README.md`, "Runs", step 4, by the lane that
+  adds it. A listen server and a single-player world need the same option.
 - Extracted *resources* in the snapshot. No type is declared so today and the ECS has no
   erased iteration of world resources; the snapshot holds components alone until a reader
   needs one.
@@ -481,7 +535,9 @@ one: the world holds one `Transform` per row, and extract keeps no table of its 
 Nothing but the registration, the constructors and the two conversions runs yet:
 `tests/registration.rs` builds a simulation of every kind with the crate registered, and a
 prediction world under `lactose_predict::check_prediction_reads`, which admits extract by
-its key alone; `lib.rs` asserts the bounds, the policies and the sizes at build.
+its key alone, and shows that a system naming `Res<ExtractState>` or
+`ResMut<ExtractState>` is refused at build in every kind; `lib.rs` asserts the bounds, the
+policies and the sizes at build.
 `present-impl` replaces every `todo!()` and proves:
 
 | What | How |
@@ -490,11 +546,12 @@ its key alone; `lib.rs` asserts the bounds, the policies and the sizes at build.
 | The extract set | A world of each kind with instances, presented rows, rows that are both and rows that are neither: a counting sink and the snapshot hold exactly the stated rows; a prediction world's unclaimed rows are in neither; a `Client` world's sink gets no row and its snapshot no `Transform` |
 | Full passes | The first pass, a pass after `set_sink` or `set_snapshot`, after a restore, after a whole-world load, after more than the retention's ticks with no pass: `full`, every instance written, no `removed`; `no_interpolate` and `cut` by kind |
 | Incremental passes | A row moved at one tick is written by the pass after it and by the pass after the next tick, then not again; a row edited between ticks is written by an idle pass with `no_interpolate`; an idle pass with nothing changed calls nothing; a `set_if_neq` of equal bytes writes nothing |
+| A rollback in a frame with no step | A prediction world moving a row one unit a tick, four frames a tick, corrected in the frame after a tick: a sink that keeps placements by this file's rule and `PresentFrame::transform` give the same placement at every frame, interpolated from the tick before to the corrected state; with the correction's `Teleported` at that tick, both show the corrected state at once |
 | Removals | A despawn, an unload, a removed `MeshInstance`, a released claim: listed once, in key order; a key that left and came back is listed and written |
 | The flag | A teleport at each tick of a three-tick frame flags the row; a saved `Teleported` does not; tick zero does not; the comparison holds across the tick's wrap |
 | Layout and workers | The sink's rows sorted by key, and the snapshot's bytes, are equal under every layout capacity, chunk order and worker count of SOUR's modes |
-| The triple buffer | A reader that acquires every publication, every second and never: the pair is always the two newest published, a held snapshot is never written, `cut` survives a snapshot taken back, and no pass waits; a model of the exchange under loom, and the tests under Miri |
+| The triple buffer | A reader that acquires every publication, every second and never: the pair is always the two newest published, a held snapshot is never written, and no pass waits; after a cut is published the next acquire's newer snapshot is a cut, also when a snapshot was taken back or published after it; a prediction world's full pass at the newest published tick replaces that snapshot; with the reader dropped, `publish` keeps no event. A property test over sequences of write, publish and acquire checks these after every step, with `Arc::get_mut` asserting that the buffer the writer writes is shared with nobody: the exchange is safe Rust under one lock, so loom and Miri would check nothing the test does not |
 | Events | Each emission is in exactly one frame's batch across skipped and taken-back snapshots; an emission and its cancellation between two acquires are in neither list; a rollback's re-emission is not delivered again |
 | The frame | `transform` for a moved, a teleported, a new and a `Client`-world row; one-tick pairs and cuts do not interpolate |
 | View-models and debug draw | `set`, `get`, `remove`, erased reads by field ID, key order; a key collision panics; a non-`derived` type does not build (a compile-fail case); the segments of each shape |
-| Cost | Extract's pass at 50,000 rows moved among 100,000 on the null sink and on the device's ring (the milestone 2 plan, decision 5.2), with the file saying what the snapshot held |
+| Cost | Extract's pass at 50,000 rows moved among 100,000 on the null sink and on the device's ring (the milestone 2 plan, decision 5.2), in a scene that also holds a stated count of presented rows, so the snapshot's part is measured; the file says what the snapshot held |

@@ -34,16 +34,22 @@ pub fn snapshot_channel() -> (SnapshotWriter, SnapshotReader) {
     todo!()
 }
 
-/// What the two halves share: which buffers are published, which is free, and the events
-/// published since the reader last acquired.
+/// What the two halves share: which buffers are published, which is free, the events
+/// published since the reader last acquired, and whether a cut is still to reach it.
 #[derive(Debug, Default)]
 struct Exchange {
     /// The two newest published snapshots, older first; one after the first publication.
     published: Vec<Arc<PresentSnapshot>>,
     /// The buffers that are neither published nor being written.
     free: Vec<Arc<PresentSnapshot>>,
-    /// Every batch published since the reader's last acquire, folded into one.
+    /// Every batch published since the reader's last acquire, folded into one. Dropped, not
+    /// kept, once the reader is gone.
     events: PresentEventBatch,
+    /// Set when a cut is published and cleared by the acquire that returns it; while it is
+    /// set, every snapshot published is marked a cut, so the next acquire's newer snapshot
+    /// is one whatever was taken back or published since (`README.md`, "The triple
+    /// buffer").
+    cut: bool,
 }
 
 /// The writing half of a snapshot channel. It has no public operation: a pass writes
@@ -55,6 +61,9 @@ pub struct SnapshotWriter {
     exchange: Arc<Mutex<Exchange>>,
     /// The buffer a pass has written and `publish` has not yet published.
     pending: Option<Arc<PresentSnapshot>>,
+    /// Whether a full pass wrote `pending`: in a prediction world it then takes the place
+    /// of a published snapshot of its own tick (`README.md`, "Events and publication").
+    pending_full: bool,
 }
 
 /// The reading half of a snapshot channel: one reader, on the render side.
@@ -115,8 +124,9 @@ impl PresentSnapshot {
 
     /// Whether nothing before this snapshot leads into it, so that presentation shows its
     /// state at once and blends nothing across it: set when a full pass in a world that is
-    /// not a prediction world wrote it, or wrote a snapshot it replaced before the reader
-    /// acquired that one (`README.md`, "The triple buffer").
+    /// not a prediction world wrote it, and on every snapshot published after a cut until
+    /// an acquire returns one, so the first acquire after a cut is published has a cut as
+    /// its newer snapshot (`README.md`, "The triple buffer").
     #[must_use]
     pub const fn cut(&self) -> bool {
         self.cut

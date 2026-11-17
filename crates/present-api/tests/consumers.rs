@@ -19,7 +19,8 @@ use lactose_physics_api::{Transform, Velocity};
 use lactose_present_api::{
     AudioRequest, CameraRig, DebugDraw, DebugShape, Decal, EffectAsset, ExtractPass, ExtractState,
     InstanceRow, InstanceSink, Light, MaterialAsset, MeshAsset, MeshInstance, PresentFrame,
-    RenderTransform, SnapshotReader, SoundAsset, VfxRequest, ViewModels, snapshot_channel,
+    RenderTransform, SnapshotReader, SoundAsset, VfxRequest, ViewModels, extract_state,
+    snapshot_channel,
 };
 use lactose_reflect::{Reflect, component, resource};
 use lactose_sim::{Pass, Registration, Simulation, SimulationBuilder, Stage, TypeTable};
@@ -104,14 +105,15 @@ fn build(kind: WorldKind) -> Result<Simulation> {
 /// whose reading half goes to the presentation schedule.
 fn show(simulation: &mut Simulation, sink: Box<dyn InstanceSink>) -> SnapshotReader {
     let (writer, reader) = snapshot_channel();
-    let extract = extract_state(simulation);
+    let extract = state(simulation);
     let replaced_sink = extract.set_sink(Some(sink));
     let replaced_writer = extract.set_snapshot(Some(writer));
     reader
 }
 
-fn extract_state(simulation: &mut Simulation) -> &mut ExtractState {
-    simulation.world_mut().service_mut::<ExtractState>().expect("`setup` inserted it")
+/// `app` reaches the state from the `Simulation`, which no system holds.
+fn state(simulation: &mut Simulation) -> &mut ExtractState {
+    extract_state(simulation).expect("`setup` inserted it")
 }
 
 /// Once per frame, after the frame's ticks: the passes run extract, then the events of
@@ -119,13 +121,13 @@ fn extract_state(simulation: &mut Simulation) -> &mut ExtractState {
 fn frame(executor: &Executor, simulation: Simulation) -> Simulation {
     let mut simulation = executor.block_on(simulation.run_passes(executor)).expect("the passes");
     let events = simulation.world_mut().take_present_events();
-    extract_state(&mut simulation).publish(events);
+    state(&mut simulation).publish(events);
     simulation
 }
 
 /// A world that stops being shown gives its outputs back.
 fn hide(simulation: &mut Simulation) {
-    let extract = extract_state(simulation);
+    let extract = state(simulation);
     let sink = extract.set_sink(None);
     let writer = extract.set_snapshot(None);
 }
@@ -183,12 +185,21 @@ fn remote_row(key: StableKey, mesh: MeshInstance, sampled: &Transform) -> Instan
     }
 }
 
-/// A pass system of a test's own, in place of the crate's: the same call.
+/// A test's own extract state, under a type of the test's, which its own setup inserts.
+struct TestExtract(ExtractState);
+
+fn test_setup(world: &mut World) -> Result<()> {
+    world.insert_service(Box::new(TestExtract(ExtractState::new())));
+    Ok(())
+}
+
+/// A pass system of a test's own, in place of the crate's: the same call, on the state the
+/// test owns.
 #[system(name = "sketch::extract_twice", worlds = [server], exclusive)]
-fn extract_twice(world: &mut World, job: Job, state: ResMut<ExtractState>) {
+fn extract_twice(world: &mut World, job: Job, state: ResMut<TestExtract>) {
     let world: &World = world;
-    state.extract(world, &mut job);
-    state.extract(world, &mut job);
+    state.0.extract(world, &mut job);
+    state.0.extract(world, &mut job);
 }
 
 fn register_test_pass(registration: &mut Registration) {
