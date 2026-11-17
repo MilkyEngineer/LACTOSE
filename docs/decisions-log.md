@@ -1844,6 +1844,19 @@ editorial pass rather than one taken from a review.
   in the renderer (R3-16).
 - Driven by: R3-16.
 - Replaced: revision 3.1's single `app` crate.
+- Addendum (D153, lane server-closure, 2026-11-18): the denylist binds `lactose-app`'s closure
+  from milestone 2 (the milestone 2 plan, decision 5.11). `cargo xtask tiers` holds the crates
+  that every `[assembly]` crate (today `lactose-app`) reaches through normal and build
+  dependencies, at any depth, to `[server_denylist]` whether or not `lactose-app-server`
+  exists, as the server's own check would hold them through the assembly once it exists. A
+  render-side edge of `app` fails when it is added rather than when the server arrives at
+  milestone 4, and renaming `app`'s package does not empty the check while the tier file lists
+  it. A dev-dependency is not held. This holds build edges as well as the normal ones D153's
+  bullet first named, since the server's check follows build edges through `app`. The server
+  binary's own closure is checked as before once it exists, and an assembly crate's chain
+  that the server's finding already shows after its first step is not reported twice.
+  `crate-tiers.toml`'s comment on `[server_denylist]` and its header line on assembly crates
+  state the rule.
 
 **D84. The unsafe list names crates, not globs; a `thread_class` helper in `core`** (§21, §5.1)
 - Why: the `rhi-*` glob exempted the interface crate `rhi-api`, and thread setup needs FFI in
@@ -6696,9 +6709,9 @@ process state; the nightly Miri filters name modules that Miri compiles** (§20,
     runner on a public repository.
   - *`lactose-app` drives the render side through `present-api` and `rhi-api`, and
     `lactose-app-client` wires the backends.* `cargo xtask tiers` applies `[server_denylist]` to
-    `lactose-app`'s normal-dependency closure whether or not the server binary exists. Rules out
-    a feature of `lactose-app` that turns backend edges on, and a denylist that first bites at
-    milestone 4.
+    `lactose-app`'s closure through normal and build dependencies whether or not the server
+    binary exists (D83's addendum). Rules out a feature of `lactose-app` that turns backend
+    edges on, and a denylist that first bites at milestone 4.
   - *`lactose-rhi-vulkan` joins `[test_support]`*, so the graph and the renderer run on a device
     in their own tests. Five crates get a facade first: `rhi-api`, `render-graph`, `renderer`,
     `platform`, `present-api`. Rules out a backend-to-backend exception for tests.

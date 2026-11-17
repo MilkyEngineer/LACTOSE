@@ -184,7 +184,7 @@ crates/
   debug-ui/       B            egui overlay, profiler view, determinism inspector
   app/            A            library that assembles a runtime from foundation, backend and game crates
   app-client/     leaf         binary: app plus every client backend; registers RenderFeature providers
-  app-server/     leaf         binary: app plus server backends only; CI denies rendering, presentation, platform, audio and UI crates
+  app-server/     leaf         binary: app plus server backends only; CI denies rendering, presentation, platform, audio and UI crates, through normal and build dependencies, to it and to every assembly crate (today app), whether or not app-server exists (D83)
   app-headless/   leaf         binary: simulation only, for SOUR and tools
 game/
   game-sim/          boundary  gameplay simulation systems; depends on foundation crates (boundary crates plus asset-api, present-api, bundle)
