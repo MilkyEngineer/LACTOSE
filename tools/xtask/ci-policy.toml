@@ -146,3 +146,23 @@ separate = [
   # spawns holds a copy of the lock until its exec.
   "lactose-xtask::heavy",
 ]
+
+# Milestone 2 plan, decision 5.15: each check job of .github/workflows/ci.yml builds, lints and
+# tests one of these groups on each platform, so that no one job builds every package's tests.
+# The job reads its packages from `cargo xtask group <name>`, so this table is the only list.
+# `cargo xtask boundary` reports a workspace package in no group or in two, an entry that
+# names no package and an empty group. The two names are fixed in tools/xtask/src/policy.rs:
+# a third group is a change to the workflow too. The groups are balanced by each one's build
+# and test time on the Windows runner, the slowest (the workflow's header gives the figures).
+# A new package goes into the group of the packages it depends on, unless that unbalances it.
+[check_groups]
+foundation = [
+  "lactose-core", "lactose-math", "lactose-task", "lactose-reflect", "lactose-reflect-macros",
+  "lactose-ecs-macros", "lactose-ecs", "lactose-bundle", "lactose-asset-api", "lactose-io",
+  "lactose-asset", "lactose-input", "lactose-input-host", "lactose-xtask",
+]
+simulation = [
+  "lactose-sim", "lactose-physics-api", "lactose-physics-rapier", "lactose-net-api",
+  "lactose-net-host", "lactose-anim", "lactose-predict", "lactose-persist", "lactose-app",
+  "lactose-app-headless", "lactose-cook",
+]

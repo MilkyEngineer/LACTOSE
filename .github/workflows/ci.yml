@@ -52,14 +52,20 @@ env:
 # replace, until Cargo.lock, a manifest, .cargo/config.toml or the toolchain changes. Recovery:
 # `gh cache list --key v0-rust-check-Windows`, then `gh cache delete <key>`.
 jobs:
+  # One job for each package group of [check_groups] in tools/xtask/ci-policy.toml on each
+  # platform. A job selects its group's packages with cargo's `-p`, not with a nextest filter,
+  # which would still build every package's tests and run only some: the build is most of the
+  # job. `cargo xtask group` prints them, and fails the job when the groups leave a package
+  # out or name one twice, so the table is the only list.
   check:
-    name: check (${{ matrix.os }})
+    name: check (${{ matrix.os }}, ${{ matrix.group }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
+        group: [foundation, simulation]
     steps:
       - uses: actions/checkout@v4
       # D148: the line-ending rule on this host's own checkout, before anything reads a file.
@@ -69,35 +75,48 @@ jobs:
         run: bash tools/xtask/line-endings.sh
       # rust-toolchain.toml selects the toolchain; rustup installs it on first use.
       - run: rustup show active-toolchain || rustup toolchain install
+      # `key` puts the group in the cache key, ahead of the job ID (header).
       - uses: Swatinem/rust-cache@v2
         with:
+          key: ${{ matrix.group }}
           cache-on-failure: true
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest@0.9.151
+      # Once, not in each group: it reads every file of the workspace.
       - name: Format
-        if: matrix.os == 'ubuntu-latest'
+        if: matrix.os == 'ubuntu-latest' && matrix.group == 'foundation'
         run: cargo fmt --all --check
+      # The assignment fails the step when the command does; an `echo` of its output would not.
+      - name: Packages
+        id: group
+        shell: bash
+        env:
+          GROUP: ${{ matrix.group }}
+        run: |
+          packages=$(cargo xtask group "$GROUP")
+          echo "packages=$packages" >> "$GITHUB_OUTPUT"
       # Windows clippy runs in the windows-lint-release job, beside this job's test build.
       - name: Clippy
         if: matrix.os != 'windows-latest'
-        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+        run: cargo clippy ${{ steps.group.outputs.packages }} --all-targets --locked -- -D warnings
       - name: Test
-        run: cargo nextest run --workspace --locked --no-tests=pass
+        run: cargo nextest run ${{ steps.group.outputs.packages }} --locked --no-tests=pass
       # nextest does not run doctests; the compile_fail ones pin safety arguments.
       - name: Doctests
-        run: cargo test --doc --workspace --locked
-      # Release codegen differs from debug; the golden table must hold in both. Windows runs
-      # it in the windows-lint-release job.
+        run: cargo test --doc ${{ steps.group.outputs.packages }} --locked
+      # Release codegen differs from debug; the golden table must hold in both. It runs with
+      # the group that holds the three packages. Windows runs it in the windows-lint-release
+      # job.
       - name: Math golden vectors (release)
-        if: matrix.os != 'windows-latest'
+        if: matrix.os != 'windows-latest' && matrix.group == 'foundation'
         run: cargo nextest run -p lactose-math -p lactose-input -p lactose-input-host --release --locked
 
   # Clippy and the release golden vectors for Windows, beside the Windows debug test build.
   # Windows clippy matters on its own: cfg-gated code (the executor's core-type query, thread
   # classes) differs from the other two platforms. This job's cache is
-  # `v0-rust-windows-lint-release-...` and the test job's `v0-rust-check-...`, so neither
-  # restores or overwrites the other's, and each holds only what its own job builds.
+  # `v0-rust-windows-lint-release-...` and the check jobs' `v0-rust-<group>-check-...`, so none
+  # restores or overwrites another's, and each holds only what its own job builds.
   windows-lint-release:
     name: clippy and release tests (windows-latest)
     runs-on: windows-latest

@@ -32,6 +32,15 @@ struct TestTargets {
     separate: Vec<String>,
 }
 
+/// The groups of CI's check jobs. Their names are fixed here, so that a third group cannot be
+/// listed without a change that also gives the workflow a job for it.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CheckGroups {
+    foundation: Vec<String>,
+    simulation: Vec<String>,
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawPolicy {
@@ -41,6 +50,16 @@ struct RawPolicy {
     harness: Harness,
     miri_split: Packages,
     test_targets: TestTargets,
+    check_groups: CheckGroups,
+}
+
+/// One package group of CI's check jobs.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct CheckGroup {
+    /// The group's name, which the workflow's matrix names.
+    pub name: &'static str,
+    /// Its packages, in the table's order.
+    pub packages: Vec<String>,
 }
 
 /// The parsed policy file.
@@ -62,6 +81,8 @@ pub struct Policy {
     /// The test targets that stay binaries of their own beside a package's `integration`
     /// (D150), each as `package::target`.
     pub separate_test_targets: Vec<String>,
+    /// The package groups of CI's check jobs, each job building and testing one.
+    pub check_groups: Vec<CheckGroup>,
 }
 
 impl Policy {
@@ -79,6 +100,10 @@ impl Policy {
             harness_tests: raw.harness.tests,
             miri_split: raw.miri_split.packages,
             separate_test_targets: raw.test_targets.separate,
+            check_groups: vec![
+                CheckGroup { name: "foundation", packages: raw.check_groups.foundation },
+                CheckGroup { name: "simulation", packages: raw.check_groups.simulation },
+            ],
         })
     }
 }
@@ -104,5 +129,12 @@ mod tests {
     fn an_unknown_table_is_an_error() {
         let text = format!("{}\n[surprise]\nx = 1\n", include_str!("../ci-policy.toml"));
         assert!(Policy::parse(&text).unwrap_err().contains("surprise"));
+    }
+
+    #[test]
+    fn a_third_check_group_is_an_error() {
+        let text = include_str!("../ci-policy.toml")
+            .replace("[check_groups]\n", "[check_groups]\nrest = [\"lactose-core\"]\n");
+        assert!(Policy::parse(&text).unwrap_err().contains("rest"));
     }
 }

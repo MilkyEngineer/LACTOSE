@@ -18,7 +18,8 @@ of a manifest it writes under the target directory.
 | Command | Enforces |
 |---|---|
 | `tiers` | `crate-tiers.toml` against the workspace (architecture section 3) |
-| `boundary` | the file facts of the determinism boundary and the unsafe policy, the nightly Miri job's split of a package, and one test binary per package (sections 8.2, 8.3, 20, 21; D150) |
+| `boundary` | the file facts of the determinism boundary and the unsafe policy, the nightly Miri job's split of a package, one test binary per package, and one check group per package (sections 8.2, 8.3, 20, 21; D150) |
+| `group` | nothing: it prints the packages of a CI check job's group as cargo arguments, once the groups divide the workspace (under `boundary`) |
 | `features` | identical boundary feature trees across shipped binaries, and the same features for every package two roots share where one is a harness package (section 8.3) |
 | `vendor` | each crate built from `vendor/` is its patch applied to its record, the patch is within the rule, the record is the crates.io archive's, and the advisory check covers the upstream versions (sections 8.2, 8.3) |
 | `sour run`, `sour compare`, `sour self-test`, `sour matrix` | SOUR, the determinism harness (section 8.3) |
@@ -28,22 +29,23 @@ of a manifest it writes under the target directory.
 Findings are printed to standard output as `path: message`, one per line, and nothing else
 is printed there. The exit status is 0 for none, 1 for findings and 2 when a check could not
 run. `heavy` and `measure` are not checks and are outside this contract, except that they too
-write nothing to standard output themselves.
+write nothing to standard output themselves. Nor is `group`, which prints one line of cargo
+arguments there, and nothing when it exits with 2.
 
 ## Where the rules live
 
 | File | Holds |
 |---|---|
 | `crate-tiers.toml` | Every dependency rule: tiers, test-support crates, the boundary list, the boundary's dependency allowlists, the server denylist, exceptions |
-| `tools/xtask/ci-policy.toml` | What is not a dependency rule: the unsafe list of section 21, the crates that carry the boundary lint file without being in the boundary, the shipped binaries, the harness packages, the tests that record hashes, the packages the nightly Miri job splits and the test targets that stay binaries of their own |
+| `tools/xtask/ci-policy.toml` | What is not a dependency rule: the unsafe list of section 21, the crates that carry the boundary lint file without being in the boundary, the shipped binaries, the harness packages, the tests that record hashes, the packages the nightly Miri job splits, the test targets that stay binaries of their own and the package groups of CI's check jobs |
 | `deny.toml` | Licences, sources, advisories and duplicate versions, enforced by `cargo deny check` |
 | `crates/core/clippy.toml` | The boundary lints; every boundary crate carries an identical copy |
 | `.gitattributes` | The line-ending rule and its exceptions, which `line-endings.sh` checks (below) |
 
 A new shipped binary goes into `[feature_roots]`, a package with simulation tests into
 `[harness]` `packages`, each simulation test into `[harness]` `tests` and a test target
-that must be a binary of its own into `[test_targets]`, all in `ci-policy.toml`, in the
-commit that adds them. Nothing in the code names a crate of the
+that must be a binary of its own into `[test_targets]`, and every new package into one group
+of `[check_groups]`, all in `ci-policy.toml`, in the commit that adds them. Nothing in the code names a crate of the
 workspace except where a rule itself does: `lactose-app-server` (the server denylist), the
 `lactose-app-` prefix and `lactose-sim` (the two guards below), and `lactose-task` and
 `lactose-input-host` (the loom rule).
@@ -255,6 +257,17 @@ on, and a listed feature the crate does not declare are findings.
   file needs a process of its own is not checked: the list holds what review found. A test
   that runs its own binary again names itself by its path in the binary, `module_path!()`
   below the crate root, not by its bare name.
+- Check groups (`src/check_groups.rs`, milestone 2 plan decision 5.15): each workspace
+  package is in exactly one group of `[check_groups]`, which CI's check jobs build, lint and
+  test one each. Findings: a package in no group, which no check job would build or test; a
+  package in two groups, or twice in one; an entry that names no workspace package; and a
+  group that names none, which as cargo arguments would select the whole workspace. The two
+  group names, `foundation` and `simulation`, are fixed in `src/policy.rs`, so the table
+  cannot hold a group the workflow's matrix does not name. `cargo xtask group <name>` prints
+  the group's packages as one line of cargo arguments, `-p <package>` each in the table's
+  order, which the check job passes to clippy, nextest and the doc tests; it prints nothing
+  and exits with 2 when the check above finds anything, so a job never tests a division that
+  leaves a package out.
 
 The scanner reads source text. It does not expand macros, so an attribute a macro writes is
 not seen. In the lint check it resolves a `#[path]` inside an inline `mod` block as if it
@@ -343,8 +356,8 @@ the working tree, and the attribute that governs them, from `git ls-files --form
 2.38 or later). It lists the whole tree, with paths from the root, whatever directory it
 runs in. It is a script and not a subcommand, so that a runner checks its checkout before
 any build. `merger` runs it at every merge, where the index and the attributes read the same
-on every host; CI's check job runs it first on the three hosts, since each working tree is
-its host's own.
+on every host; each of CI's check jobs runs it first, on the three hosts, since each working
+tree is its host's own.
 
 It accepts a file in one of three shapes and refuses every other:
 
