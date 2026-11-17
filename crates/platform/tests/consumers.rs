@@ -6,8 +6,9 @@
 
 #![allow(dead_code, unused_variables, missing_docs)]
 
-use std::process::{Command, ExitStatus, Stdio};
-use std::sync::Arc;
+use std::io::Read;
+use std::process::{Command, Stdio};
+use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
 use lactose_core::{Error, ErrorKind, Result};
@@ -161,11 +162,11 @@ mod frame {
             }
         }
 
-        /// The present thread's last call at shutdown. It waits, within a bound, for the
-        /// points its presents signalled; dropping the swapchain waits for the swapchain's
-        /// own presents; and it drops its clone of the device. A bound that expires is
-        /// logged and the drops are made anyway. What `stop` then hands back holds nothing
-        /// of the window.
+        /// The present thread's last call at shutdown, queued once the points the host
+        /// owes are signalled (step 2). A client's first waits, within a bound, for the
+        /// points its presents signalled; this stand-in keeps none. It drops the swapchain,
+        /// a drop no caller bounds, which waits for the submits that use its images, and
+        /// its clone of the device. What `stop` then hands back holds nothing of the window.
         pub fn wind_down(&mut self) {
             self.swapchain = None;
             self.device = None;
@@ -273,21 +274,44 @@ async fn root(
     // 1. `exit` first, not awaited: it destroys nothing while an `Arc<Window>` is held, and
     //    the pump drains main-lane calls until the last one goes.
     drop(exit);
-    // 2. No present is queued from here; the present thread's last call.
+    // 2. No present and no frame submit is queued from here. Every point the host owes that
+    //    a pending submit waits on is signalled first, by whatever holds it: the swapchain's
+    //    drop waits for the submits that use its images. Then the present thread's last call.
     let last = present.run(frame::Presenter::wind_down).await;
     // 3. The state comes back with nothing of the window in it.
     let stopped = thread.stop().await.map(drop);
-    // 4. Off the frame workers: every point the host owes that a pending submit waits on is
-    //    signalled, the device's last points are waited for within a bound, and every
-    //    encoder and every `Device` clone but one is dropped.
-    let waited = executor.spawn(WorkerClass::Background, async move { device }).await;
-    // 5. A main-lane call drops the last, which then waits for nothing; MoltenVK's view
-    //    observation is removed on the view's thread.
-    let dropped = match waited {
-        Ok(device) => main.run(move |_| drop(device)).await,
+    // 4. On a background worker: the device's last points are waited for within a bound,
+    //    and every encoder and every `Device` clone but one is dropped.
+    let settled = executor.spawn(WorkerClass::Background, async move {
+        let settled = device.as_deref().is_none_or(|device| last_points(device, BOUND));
+        (device, settled)
+    });
+    // 5. Only when there is a device. A main-lane call drops the last, which then waits for
+    //    nothing, and MoltenVK's view observation is removed on the view's thread. After an
+    //    expired step-4 bound the drop may block, so it goes to a background worker and the
+    //    main thread goes on answering under the pump's warning.
+    let dropped = match settled.await {
+        Ok((Some(device), true)) => main.run(move |_| drop(device)).await,
+        Ok((Some(device), false)) => {
+            executor.spawn(WorkerClass::Background, async move { drop(device) }).await
+        }
+        Ok((None, _)) => Ok(()),
         Err(error) => Err(error),
     };
-    last.and(stopped).and(dropped).and(ran)
+    // Every step has run. The start's or the frame's error first: a later step's
+    // `Cancelled` follows from it.
+    let frames = ran?;
+    last.and(stopped).and(dropped)?;
+    Ok(frames)
+}
+
+/// How long a step of the shutdown waits before it logs and goes on.
+const BOUND: Duration = Duration::from_secs(2);
+
+/// Stands for the backend's waits, on a background worker, for the device's last points:
+/// `false` if the bound expired, after which dropping the device may block.
+fn last_points(device: &dyn rhi::Device, bound: Duration) -> bool {
+    todo!()
 }
 
 /// `main`: the pump is made first and run last, and nothing after `run` touches the
@@ -308,10 +332,11 @@ fn client_main() -> Result<()> {
         executor.spawn(WorkerClass::FrameCritical, root(executor.clone(), main, present, thread));
     // 6. `run` returns once the last `Arc<Window>` goes; `main` then waits for its root
     //    task and shuts the executor down, and nothing that runs from here holds the device
-    //    or the window.
-    pump.run()?;
+    //    or the window. `run`'s error waits for both, so the root is never dropped here.
+    let pumped = pump.run();
     let frames = executor.block_on(task);
     executor.shutdown();
+    pumped?;
     frames?.map(|_| ())
 }
 
@@ -420,9 +445,13 @@ async fn with_frames_in_flight(
 
 // ---- 5. `platform-impl`'s subprocess test, and its parent ----
 
+/// The stage `subprocess_main` prints last when every check passed.
+const FINAL_STAGE: &str = "the driver's result";
+
 /// It opens a window, pumps events, runs one call on the main thread and one on the
 /// present thread, and closes. The process's `main` is the test: a harness thread is not
-/// the main thread. It prints each stage it reaches, for the parent.
+/// the main thread. It prints each stage it reaches, for the parent, and returns the
+/// driver's result, which is the subprocess's exit status.
 fn subprocess_main() -> Result<()> {
     let (main, pump): (Lane<MainThread>, EventPump) = event_pump(WindowDesc {
         title: "pump".to_owned(),
@@ -430,6 +459,8 @@ fn subprocess_main() -> Result<()> {
     })?;
     let platform = ClientPlatform::new();
     let (present, thread) = present_thread(&platform, 0u32)?;
+    // `ThreadHandle::join` discards a panic, so the driver's result comes back on a channel.
+    let (result, outcome) = mpsc::channel::<Result<()>>();
     // A plain thread stands where the client's tasks do.
     let driver = StdPlatform.spawn_thread(
         ThreadSpec {
@@ -442,39 +473,55 @@ fn subprocess_main() -> Result<()> {
             // panic's unwinding, still queues `exit`, and the pump returns.
             let exit = ExitOnDrop(main.clone());
             let executor = Executor::builder().build().expect("an executor");
-            executor
-                .block_on(async move {
-                    let on_main = main.run(|main| main.window().size()).await?;
-                    println!("stage: a main-lane call ran");
-                    let on_present = present
-                        .run(|count| {
-                            *count += 1;
-                            std::thread::current().name().map(str::to_owned)
-                        })
-                        .await?;
-                    println!("stage: a present-thread call ran");
-                    assert_eq!(on_present.as_deref(), Some("present"));
-                    // 1., then 3.: nothing was made from the window.
-                    drop(exit);
-                    assert_eq!(thread.stop().await?, 1);
-                    println!("stage: stopped");
-                    Ok::<_, Error>(())
-                })
-                .expect("both calls ran");
+            let checked = executor.block_on(async move {
+                let on_main = main.run(|main| main.window().size()).await?;
+                println!("stage: a main-lane call ran");
+                let on_present = present
+                    .run(|count| {
+                        *count += 1;
+                        std::thread::current().name().map(str::to_owned)
+                    })
+                    .await?;
+                println!("stage: a present-thread call ran");
+                assert_eq!(on_present.as_deref(), Some("present"));
+                // 1., then 3.: nothing was made from the window.
+                drop(exit);
+                assert_eq!(thread.stop().await?, 1);
+                println!("stage: stopped");
+                Ok::<_, Error>(())
+            });
             executor.shutdown();
+            // The driver's last act. A panic above drops `result` unsent, which the main
+            // thread reads as a failure.
+            let _ = result.send(checked);
         }),
     )?;
     println!("stage: pumping");
-    pump.run()?;
+    let pumped = pump.run();
     println!("stage: the pump returned");
     driver.join();
+    let checked = outcome.try_recv().unwrap_or_else(|_| {
+        Err(Error::new(ErrorKind::Cancelled, "the driver ended without sending its result"))
+    });
+    pumped?;
+    checked?;
+    println!("stage: {FINAL_STAGE}");
     Ok(())
 }
 
 /// The parent's side, in the test harness: every window subprocess runs under a deadline.
-/// Past it the parent kills the child and fails, naming the last stage the child printed.
-fn under_a_deadline(mut command: Command, deadline: Duration) -> ExitStatus {
+/// It reads the child's output while it waits, so a child that writes more than a pipe
+/// holds is not blocked into a false hang. Past the deadline it kills the child and fails,
+/// naming the last stage the child printed; otherwise it checks the exit status and that
+/// the last stage printed is the final one.
+fn under_a_deadline(mut command: Command, deadline: Duration) {
     let mut child = command.stdout(Stdio::piped()).spawn().expect("the subprocess starts");
+    let mut stdout = child.stdout.take().expect("the subprocess's stdout is piped");
+    let reader = std::thread::spawn(move || {
+        let mut output = Vec::new();
+        let _ = stdout.read_to_end(&mut output);
+        String::from_utf8_lossy(&output).into_owned()
+    });
     let until = Instant::now() + deadline;
     let status = loop {
         if let Some(status) = child.try_wait().expect("the subprocess is waited for") {
@@ -482,19 +529,22 @@ fn under_a_deadline(mut command: Command, deadline: Duration) -> ExitStatus {
         }
         if Instant::now() >= until {
             child.kill().expect("the subprocess is killed");
+            let _ = child.wait();
             break None;
         }
         std::thread::sleep(Duration::from_millis(20));
     };
-    let output = child.wait_with_output().expect("the subprocess's output");
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stage = stdout.lines().rev().find_map(|line| line.strip_prefix("stage: "));
-    status.unwrap_or_else(|| {
+    // The child has ended, so its end of the pipe is closed and the read finishes.
+    let output = reader.join().expect("the reader does not panic");
+    let stage = output.lines().rev().find_map(|line| line.strip_prefix("stage: "));
+    let Some(status) = status else {
         panic!(
             "the subprocess passed its deadline of {deadline:?} after the stage {:?}",
             stage.unwrap_or("none")
         )
-    })
+    };
+    assert!(status.success(), "the subprocess failed with {status} after the stage {stage:?}");
+    assert_eq!(stage, Some(FINAL_STAGE), "the subprocess ended early");
 }
 
 // ---- 6. A test's own platform: the present thread is made through any `Platform` ----

@@ -43,7 +43,9 @@ pub fn present_thread<S: Send + 'static>(
 /// present thread and its pump").
 pub struct PresentThread<S> {
     /// The lane every call reaches the state through. The stop is a call on it, queued
-    /// after every call before `stop`, which marks the end of the thread's last batch.
+    /// after every call before `stop`, which marks the end of the thread's last batch by a
+    /// flag of the present thread's own: a thread-local the body clears when it starts,
+    /// since a platform may run a body on a thread that ran another.
     present: Lane<S>,
     /// The lane the thread hands its state back through. `stop` queues the take here
     /// before it queues the stop, and the thread drains it once, after it has dropped the
@@ -74,9 +76,8 @@ impl<S: Send + 'static> PresentThread<S> {
 /// back, which only a panic in one of its calls causes. It does not resolve while a call
 /// queued before the stop has not returned, which is why the caller bounds every wait
 /// inside a present call. Dropping it does not undo the stop: a state not yet handed back
-/// is dropped on
-/// the present thread, and one handed back is dropped with the future, on the thread that
-/// drops it.
+/// is dropped on the present thread, and one handed back is dropped with the future, on
+/// the thread that drops it.
 #[must_use = "futures do nothing unless awaited"]
 pub struct PresentStop<S> {
     /// The hand-back, as a call on the thread's second lane.

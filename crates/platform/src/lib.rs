@@ -45,6 +45,14 @@
 //!     _window: Arc<Window>,
 //! }
 //!
+//! impl Device {
+//!     /// Stands for the backend's waits on the device's last points: `false` if the bound
+//!     /// expired, so that dropping the device may block.
+//!     fn last_points(&self, bound: Duration) -> bool {
+//!         true
+//!     }
+//! }
+//!
 //! /// What the present thread owns: the caller's type, which holds the swapchain, a clone
 //! /// of the device, and whatever draws a finished target into the swapchain's images.
 //! struct Presenter {
@@ -112,18 +120,30 @@
 //!     // 1. `exit` first, not awaited: it destroys nothing while an `Arc<Window>` is held,
 //!     //    and the pump drains main-lane calls until the last one goes.
 //!     drop(exit);
-//!     // 2. No present is queued from here. The last present-thread call waits, within a
-//!     //    bound, for the points its presents signalled and the swapchain's presents, and
-//!     //    drops the swapchain; here the thread holds only a clone of the device.
+//!     // 2. No present and no frame submit is queued from here, and every point the host
+//!     //    owes that a pending submit waits on is signalled first: the swapchain's drop
+//!     //    waits for the submits that use its images. Then the last present-thread call
+//!     //    waits, within a bound, for the points its presents signalled, and drops the
+//!     //    swapchain; here the thread holds only a clone of the device.
 //!     let last = present.run(|presenter| presenter.device = None).await;
 //!     // 3. The state comes back with nothing of the window in it.
 //!     let stopped = thread.stop().await.map(drop);
-//!     // 4. Off the frame workers: what the host owes is signalled, the device's last
-//!     //    points are waited for within a bound, and every encoder and clone but one go.
-//!     let waited = executor.spawn(WorkerClass::Background, async move { device }).await;
-//!     // 5. A main-lane call drops the last, which then waits for nothing.
-//!     let dropped = match waited {
-//!         Ok(device) => main.run(move |_| drop(device)).await,
+//!     // 4. On a background worker: the device's last points are waited for within a
+//!     //    bound, and every encoder and clone but one go.
+//!     let bound = Duration::from_secs(2);
+//!     let settled = executor.spawn(WorkerClass::Background, async move {
+//!         let settled = device.as_ref().is_none_or(|device| device.last_points(bound));
+//!         (device, settled)
+//!     });
+//!     // 5. A main-lane call drops the last, which then waits for nothing; after an
+//!     //    expired step-4 bound it is dropped on a background worker instead, where its
+//!     //    drop may block while the main thread answers.
+//!     let dropped = match settled.await {
+//!         Ok((Some(device), true)) => main.run(move |_| drop(device)).await,
+//!         Ok((Some(device), false)) => {
+//!             executor.spawn(WorkerClass::Background, async move { drop(device) }).await
+//!         }
+//!         Ok((None, _)) => Ok(()),
 //!         Err(error) => Err(error),
 //!     };
 //!     ran.and(last).and(stopped).and(dropped)
@@ -143,10 +163,12 @@
 //!         executor.spawn(WorkerClass::FrameCritical, root(executor.clone(), main, present, thread));
 //!
 //!     // 6. `run` returns once the last `Arc<Window>` is gone, and nothing after it holds
-//!     //    the device or the window.
-//!     pump.run()?;
+//!     //    the device or the window. Its result waits until the root has finished and
+//!     //    the executor is shut down, so the root's device is never dropped here.
+//!     let pumped = pump.run();
 //!     let ran = executor.block_on(task);
 //!     executor.shutdown();
+//!     pumped?;
 //!     ran?
 //! }
 //! ```

@@ -48,15 +48,18 @@ impl EventPump {
     /// with the window: it returns once [`MainThread::exit`] has been called and the
     /// window is let go, which is when every `Arc<Window>` that [`MainThread::window`]
     /// returned, and every clone of one, has been dropped. It takes the window back with
-    /// `Arc::try_unwrap` on its own `Arc`, never by reading a count, and destroys it on
-    /// this thread before it returns. It waits in the operating system between events and
+    /// `Arc::try_unwrap` on its own `Arc`, never by reading a count and never by
+    /// `Arc::into_inner`, which gives up that `Arc` when it fails, and destroys it on this
+    /// thread before it returns. It waits in the operating system between events and
     /// never for another thread; from `exit` until the window is let go it also wakes
     /// every 50 ms to look (`README.md`, "The main thread and its pump" and "Shutdown").
     ///
     /// When it returns, with a value or an error, [`Window::close_requested`] is `true`,
     /// and every call still queued, and every call queued later, resolves to
-    /// `ErrorKind::Cancelled`. A panic that unwinds out of it leaves the window to the
-    /// end of the process, as an error does.
+    /// `ErrorKind::Cancelled`. It turns `close_requested` true before it closes the lane,
+    /// so a task whose call came back `Cancelled` reads the close. The lane's wake ignores
+    /// an event loop that has ended, since `exit` is queued from destructors. A panic that
+    /// unwinds out of it leaves the window to the end of the process, as an error does.
     ///
     /// # Errors
     ///
