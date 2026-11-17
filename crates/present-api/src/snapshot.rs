@@ -214,7 +214,7 @@ impl SnapshotWriter {
     pub(crate) fn publish(&mut self, events: PresentEventBatch) {
         let full = core::mem::take(&mut self.pending_full);
         let pending = self.pending.take();
-        // The list's node is allocated here, so the lock links it and allocates nothing.
+        // The list's node is allocated here, so linking it under the lock allocates nothing.
         let mut unread = LinkedList::new();
         if !is_empty(&events) {
             unread.push_back(events);

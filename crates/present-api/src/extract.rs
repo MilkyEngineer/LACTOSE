@@ -118,7 +118,8 @@ pub struct ExtractPass {
 /// at once, so it never waits for a ring region, a fence or another job, and takes no lock
 /// that architecture section 3 does not permit inside a system. A sink that cannot take a
 /// row (the pass writes more rows than its ring region holds) drops it and counts the drop.
-/// Extract writes that row again only once it changes or at a full pass, and a pass after
+/// Extract writes that row again only as it would have without the drop: by the settling
+/// write if it is still to come, once it changes again, or at a full pass; and a pass after
 /// [`ExtractState::set_sink`] is full. Extract has nothing to do with an error.
 pub trait InstanceSink: Send + Sync {
     /// A pass starts.

@@ -318,7 +318,8 @@ events")
   a pass writes is free before the pass begins), and takes no lock that architecture
   section 3 does not permit inside a system. A sink that cannot take a row (the pass
   writes more rows than its ring region holds) drops it and counts the drop. Extract
-  writes that row again only once it changes or at a full pass, and a pass after
+  writes that row again only as it would have without the drop: by the settling write
+  if it is still to come, once it changes again, or at a full pass; and a pass after
   `ExtractState::set_sink` is full.
 
 *What the sink keeps.* A row carries the placement the instance has now and no previous
