@@ -42,9 +42,10 @@ cargo xtask <command>
   boundary                   check the boundary lint files and everything that could switch
                              them off, the unsafe policy, READMEs, the boundary dependency
                              allowlist, the x86-64-v3 pin, that the nightly Miri
-                             entries of each split package run its tests once each, and
-                             that each package builds its integration tests as one binary,
-                             and that each package is in one check group
+                             entries of each split package run its tests once each, that
+                             each package builds its integration tests as one binary and
+                             is in one check group, and that ci.yml's check job runs
+                             every group
   group <name>               print the cargo arguments (`-p <package>` each) that select the
                              packages of a CI check job's group, once the groups divide the
                              workspace
@@ -249,6 +250,7 @@ fn check_boundary() -> Checked {
     findings.extend(miri::check(&context.policy, &context.workspace, &files));
     findings.extend(test_targets::check(&context.policy, &context.workspace, &files));
     findings.extend(check_groups::check(&context.policy, &context.workspace));
+    findings.extend(check_groups::check_workflow(&context.policy, &files));
     Ok(findings)
 }
 

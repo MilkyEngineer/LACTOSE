@@ -88,9 +88,10 @@ jobs:
   # platform. A job selects its group's packages with cargo's `-p`, not with a nextest filter,
   # which would still build every package's tests and run only some: the build is most of the
   # job. `cargo xtask group` prints them, and fails the job when the groups leave a package
-  # out or name one twice, so the table is the only list. A unit test in
-  # tools/xtask/src/check_groups.rs holds this job's head and its Packages, Clippy, Test and
-  # Doctests steps to the table, text for text: an edit to them is an edit to that test.
+  # out or name one twice, so the table is the only list. `cargo xtask boundary`, in the policy
+  # job, holds this job's head and its Packages, Clippy, Test and Doctests steps to the table,
+  # text for text, whatever groups this job runs: an edit to them is an edit to
+  # tools/xtask/src/check_groups.rs.
   check:
     name: check (${{ matrix.os }}, ${{ matrix.group }})
     runs-on: ${{ matrix.os }}

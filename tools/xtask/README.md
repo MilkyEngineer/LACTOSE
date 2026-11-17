@@ -18,7 +18,7 @@ of a manifest it writes under the target directory.
 | Command | Enforces |
 |---|---|
 | `tiers` | `crate-tiers.toml` against the workspace (architecture section 3) |
-| `boundary` | the file facts of the determinism boundary and the unsafe policy, the nightly Miri job's split of a package, one test binary per package, and one check group per package (sections 8.2, 8.3, 20, 21; D150) |
+| `boundary` | the file facts of the determinism boundary and the unsafe policy, the nightly Miri job's split of a package, one test binary per package, and one check group per package, run by the workflow's check job (sections 8.2, 8.3, 20, 21; D150) |
 | `group` | nothing: it prints the packages of a CI check job's group as cargo arguments, once the groups divide the workspace (under `boundary`) |
 | `features` | identical boundary feature trees across shipped binaries, and the same features for every package two roots share where one is a harness package (section 8.3) |
 | `vendor` | each crate built from `vendor/` is its patch applied to its record, the patch is within the rule, the record is the crates.io archive's, and the advisory check covers the upstream versions (sections 8.2, 8.3) |
@@ -262,17 +262,18 @@ on, and a listed feature the crate does not declare are findings.
   test one each. Findings: a package in no group, which no check job would build or test; a
   package in two groups, or twice in one; an entry that names no workspace package; and a
   group that names none, which as cargo arguments would select the whole workspace. The two
-  group names, `base` and `physics`, are fixed in `src/policy.rs`. `boundary` does not read
-  the workflow; the unit test
-  `check_groups::tests::the_workflow_runs_every_group_and_hands_each_step_its_packages` holds
-  the `check` job of `.github/workflows/ci.yml` to the table: its matrix names each group in
-  the table's order, and its Packages, Clippy, Test and Doctests steps, each compared as a
-  whole block, carry the group's packages with no condition that names a group. `cargo xtask
-  group <name>` prints
-  the group's packages as one line of cargo arguments, `-p <package>` each in the table's
-  order, which the check job passes to clippy, nextest and the doc tests; it prints nothing
-  and exits with 2 when the check above finds anything, so a job never tests a division that
-  leaves a package out.
+  group names, `base` and `physics`, are fixed in `src/policy.rs`. `boundary` also holds the
+  `check` job of `.github/workflows/ci.yml` to the table, so the policy job reports a workflow
+  that leaves a group untested, whichever groups the check jobs run: the job's head, whose
+  matrix names each group in the table's order with no `include`, `exclude`, condition or
+  other key, and its Packages, Clippy, Test and Doctests steps, which carry the group's
+  packages with no condition. Each is compared as the whole text of its block, after
+  whole-line comments are dropped, so a key added anywhere in one is a finding; an edit to
+  those lines of the workflow is an edit to `src/check_groups.rs`. `cargo xtask group <name>`
+  prints the group's packages as one line of cargo arguments, `-p <package>` each in the
+  table's order, which the check job passes to clippy, nextest and the doc tests; it prints
+  nothing and exits with 2 when the groups do not divide the workspace, so a job never tests
+  a division that leaves a package out.
 
 The scanner reads source text. It does not expand macros, so an attribute a macro writes is
 not seen. In the lint check it resolves a `#[path]` inside an inline `mod` block as if it
