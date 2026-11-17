@@ -105,6 +105,7 @@ pub trait Swapchain: Send {
     /// Its driver calls are made only once its submit is released: each of its waits
     /// reached, or promised by a released submit whose driver call has returned, and where
     /// the present role shares the graphics queue every earlier submit there released too.
+    /// A submit's own promise, or one of a submit that depends on it, never meets its wait.
     /// Until then it holds, with no lock, for at most the bound [`acquire`](Self::acquire)
     /// has (`README.md`, "The swapchain"). Under MoltenVK each fetch of the drawable made
     /// while none is held waits up to about one second for each image of the swapchain;

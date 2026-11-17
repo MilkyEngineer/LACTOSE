@@ -320,10 +320,12 @@ is a supertrait of `Encoder` so a backend recovers its own type in a submit.
   last. No count is the caller's: a destroy is never refused or delayed for one. The count
   is taken by every `Device` call that resolves a handle and then calls the driver
   (`buffer_address`, the host lends, `flush_buffer`, `invalidate_buffer`, `write_heap_slot`,
-  `signal_timeline`, `wait_timeline` and `timeline_value`) as by recording. A hold such a
-  call makes after its driver call changes the records of what the handle resolved to only
-  while the handle still resolves to it; after a destroy it folds nothing and clears
-  nothing.
+  `signal_timeline`, `wait_timeline` and `timeline_value`, and `Swapchain::present` for the
+  timeline its wait for an undecided point names) as by recording. A hold such a call makes
+  after its driver call changes the records of what the handle resolved to only while the
+  handle still resolves to it; after a destroy it folds nothing and clears nothing. A
+  present whose wait's timeline was destroyed meanwhile is refused (`destroyed`) by its next
+  walk, with nothing submitted.
 - An image is destroyed only after no heap slot holds it, and a block only after no image
   is placed in it (`pending`, every backend).
 - The device lives until the `Device` object, every encoder and the swapchain it made are
@@ -786,18 +788,24 @@ is a supertrait of `Encoder` so a backend recovers its own type in a submit.
   that queue is released. A submit is released on the same terms, for each of its waits and
   every earlier submit on its queue. A host signal in progress has not been made. The
   present's walk decides this from the records, in its hold under its queue's lock: a point
-  at or below the known value, or the least promise at or above it whose stamp is at or
+  at or below the known value, or one whose least promise at or above it has a stamp at or
   below the last its queue's driver has received, and in turn that promise's submit's waits
-  and the earlier submits of its queue. Where a point is neither, the walk stamps nothing,
-  and the present lets go of the record's lock and its queue's, waits for the point on the
-  driver with no lock held, within what remains of its bound, and walks again, folding in
-  what the wait saw. It never waits under its queue's lock: on a shared queue the submit
-  that signals the point may need that lock. Until the submit is released `present` holds
-  for at most the bound `acquire` has; after that bound it is refused (`pending`, every
-  backend) with nothing submitted, and the image is still the acquired one, for the caller
-  to retry. Vulkan requires every signal a present waits for, and every signal that signal
-  depends on, to have been submitted (VUID-vkQueuePresentKHR-pWaitSemaphores-03268), and the
-  backend's present semaphore depends on every earlier submit on its queue.
+  and the earlier submits of its queue. A greater promise never decides a point: every
+  greater promise depends on the least. A walk that comes back to a submit it is still
+  deciding leaves the point undecided: a submit's own promise, or a promise of a submit that
+  depends on it, never meets its wait. So a submit that waits on a timeline for a point the
+  host has not signalled, and promises a greater point there, as a host release does
+  ("Timelines"), is not released by its own promise. Where the walk leaves a point
+  undecided, it stamps nothing, and the present lets go of the record's lock and its
+  queue's, waits for the point on the driver with no lock held, within what remains of its
+  bound, and walks again, folding in what the wait saw. It never waits under its queue's
+  lock: on a shared queue the submit that signals the point may need that lock. Until the
+  submit is released `present` holds for at most the bound `acquire` has; after that bound
+  it is refused (`pending`, every backend) with nothing submitted, and the image is still
+  the acquired one, for the caller to retry. Vulkan requires every signal a present waits
+  for, and every signal that signal depends on, to have been submitted
+  (VUID-vkQueuePresentKHR-pWaitSemaphores-03268), and the backend's present semaphore
+  depends on every earlier submit on its queue.
 - The number of presents in flight is the caller's to bound, by the points its presents
   signal. No backend bounds it (Metal item 11).
 - After `Acquired::Stale` or `Presented::Stale` the caller waits for the points its presents
@@ -1082,12 +1090,16 @@ column, one or more for each of its clauses, 61 in all: `unreported_capability_i
   `swapchain_extent_with_a_zero_dimension_is_refused` makes a swapchain with a zero width
   and resizes one to a zero height; `resize_with_a_present_pending_is_refused` holds a
   present pending through null's `Harness::stall`, which a device does not offer; on a
-  device it presents, resizes at once, and finds the resize waits and succeeds.
+  device it presents, waits for the points its present signals, resizes at once, and finds
+  the resize succeeds.
   `present_behind_an_unmet_wait_is_refused` presents with a submit that waits for a point no
   signal has been made or submitted for, and is refused after the bound with the image still
   acquired; it then signals the point from the host and presents the same image, which is
   shown. Under a set whose present role shares the graphics queue, the unmet wait is instead
-  in a frame submit made before the present.
+  in a frame submit made before the present. On every set it also presents behind a frame
+  submit that waits, on the timeline it signals, for a point the host has not signalled, the
+  present waiting for the frame's point; that present is refused too, and is shown once the
+  host signals.
 
 - An **output** case draws, dispatches or copies on a device, reads the result back and
   compares it with a reference computed on the CPU, never with a stored image (decision

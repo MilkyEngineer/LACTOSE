@@ -101,10 +101,12 @@ pub trait Harness {
     /// where the backend cannot, and the cases that need a loss are skipped. Null can.
     fn lose(&self, device: &dyn Device) -> bool;
 
-    /// With `on`, keeps `device`'s submits and presents from completing, as a GPU that has
-    /// not reached them would, until it is called again with `on` false; returns `true`.
-    /// Returns `false` where the backend does not offer it, which no device does, and a
-    /// case that needs a stall then takes its device half. Null offers it.
+    /// With `on`, keeps `device`'s presents from completing, as a display that has not taken
+    /// them would: their submits complete, and the driver's read of each image does not end
+    /// until it is called again with `on` false; returns `true`. Returns `false` where the
+    /// backend does not offer it, which no device does, and a case that needs a stall then
+    /// takes its device half. Null offers it. A device dropped while stalled is unstalled
+    /// first.
     fn stall(&self, device: &dyn Device, on: bool) -> bool;
 }
 
