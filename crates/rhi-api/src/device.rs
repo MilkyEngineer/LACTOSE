@@ -1,0 +1,245 @@
+//! The device: the one object a backend hands out, as a `dyn` resource (D64).
+//!
+//! Every method takes `&self` and may be called from any thread. A call returns an error
+//! of kind `DeviceLost` when the device is lost, a refusal when it breaks a rule the
+//! backend checks ([`Rule::of`](crate::Rule::of)), and otherwise what its own
+//! documentation names; `README.md`, "Device loss" and "The rules", state what holds for
+//! every call, and each method below states only what is its own.
+
+use core::time::Duration;
+
+use lactose_core::Result;
+
+use crate::caps::{Capabilities, DeviceInfo, QueueRole};
+use crate::encoder::Encoder;
+use crate::pipeline::{
+    ComputePipelineDesc, ComputePipelineHandle, GraphicsPipelineDesc, GraphicsPipelineHandle,
+    PipelineStats,
+};
+use crate::resource::{
+    BufferDesc, BufferHandle, HeapSlot, ImageDesc, ImageHandle, MemoryBlockDesc, MemoryBlockHandle,
+    Placement, SamplerDesc, SamplerIndex,
+};
+use crate::surface::{Swapchain, SwapchainDesc};
+use crate::sync::{Submit, TimelineHandle, TimelinePoint};
+
+/// A graphics device and its queues.
+///
+/// The device lives until this object, every encoder and the swapchain it made are
+/// dropped: each of them holds it. The last drop waits for every submit the device has
+/// taken and then destroys what is left (`README.md`, "Handles and lifetimes").
+pub trait Device: Send + Sync {
+    /// What the device is.
+    fn info(&self) -> &DeviceInfo;
+
+    /// What the device reports. The same value for the device's life.
+    fn capabilities(&self) -> &Capabilities;
+
+    /// Whether the device is lost: some call has returned `ErrorKind::DeviceLost`, and
+    /// every call that reaches the device from now on returns it.
+    fn is_lost(&self) -> bool;
+
+    /// Makes a buffer, in [`BufferState::Undefined`](crate::BufferState) on no queue.
+    ///
+    /// # Errors
+    ///
+    /// `ErrorKind::ResourceExhausted` when the device has no memory for it.
+    fn create_buffer(&self, desc: &BufferDesc<'_>) -> Result<BufferHandle>;
+
+    /// Destroys a buffer. Refused while a pending submit uses it
+    /// ([`Rule::Pending`](crate::Rule::Pending)): the caller waits for the timeline value
+    /// that frees it.
+    fn destroy_buffer(&self, buffer: BufferHandle) -> Result<()>;
+
+    /// The buffer's device address: the same value for as long as the buffer lives, and
+    /// distinct from every byte of every other live buffer. The buffer's usage holds
+    /// `DEVICE_ADDRESS`, or the call is refused ([`Rule::Usage`](crate::Rule::Usage)).
+    fn buffer_address(&self, buffer: BufferHandle) -> Result<u64>;
+
+    /// Lends the host `len` bytes of an `Upload` buffer from `offset` to write, for the
+    /// length of the call: `fill` is called once, with exactly that range. What `fill`
+    /// leaves there is what the device reads in submits made after
+    /// [`flush_buffer`](Self::flush_buffer) covers it. What the lent bytes hold when
+    /// `fill` is called is unspecified, and reading them may be slow: `fill` writes every
+    /// byte of the range and reads none.
+    ///
+    /// Calls on ranges of one buffer that do not overlap may run at once on several
+    /// threads. A call whose range overlaps one in progress is refused
+    /// ([`Rule::HostOverlap`](crate::Rule::HostOverlap)), and so is `fill` calling the
+    /// device for the same buffer. A range outside the buffer is refused on every backend
+    /// ([`Rule::Bounds`](crate::Rule::Bounds)).
+    fn write_buffer(
+        &self,
+        buffer: BufferHandle,
+        offset: u64,
+        len: u64,
+        fill: &mut dyn FnMut(&mut [u8]),
+    ) -> Result<()>;
+
+    /// Lends the host `len` bytes of a `Readback` buffer from `offset` to read, for the
+    /// length of the call: `read` is called once, with exactly that range, which holds
+    /// what completed submits wrote once
+    /// [`invalidate_buffer`](Self::invalidate_buffer) has covered it. The buffer is in
+    /// `HostRead`, and no pending submit writes it. Overlap and bounds are as
+    /// [`write_buffer`](Self::write_buffer)'s.
+    fn read_buffer(
+        &self,
+        buffer: BufferHandle,
+        offset: u64,
+        len: u64,
+        read: &mut dyn FnMut(&[u8]),
+    ) -> Result<()>;
+
+    /// Makes the host's writes to a range visible to the device. Called after every
+    /// write and before the submit that reads it; it does nothing where
+    /// [`coherent_host_memory`](Capabilities::coherent_host_memory) is reported.
+    fn flush_buffer(&self, buffer: BufferHandle, offset: u64, len: u64) -> Result<()>;
+
+    /// Makes the device's writes to a range visible to the host. Called after the submit
+    /// that wrote it completes and before the read; it does nothing where
+    /// [`coherent_host_memory`](Capabilities::coherent_host_memory) is reported.
+    fn invalidate_buffer(&self, buffer: BufferHandle, offset: u64, len: u64) -> Result<()>;
+
+    /// Makes an image, every subresource
+    /// [`ImageState::Undefined`](crate::ImageState::Undefined) on no queue.
+    ///
+    /// # Errors
+    ///
+    /// `ErrorKind::Unsupported` for a format or an extent the device cannot make;
+    /// `ErrorKind::ResourceExhausted` when it has no memory for it; refused for a
+    /// description no device honours, a memoryless request without `TRANSIENT` among
+    /// them ([`Rule::Usage`](crate::Rule::Usage)).
+    fn create_image(&self, desc: &ImageDesc<'_>) -> Result<ImageHandle>;
+
+    /// Destroys an image. Refused while a pending submit uses it or a heap slot holds it
+    /// ([`Rule::Pending`](crate::Rule::Pending)).
+    fn destroy_image(&self, image: ImageHandle) -> Result<()>;
+
+    /// Whether the image has no memory outside its pass: `true` only for an image made
+    /// with a memoryless request the device honoured.
+    fn image_memoryless(&self, image: ImageHandle) -> Result<bool>;
+
+    /// What a block must offer an image made from `desc`, whatever `desc.memory` says.
+    fn image_placement(&self, desc: &ImageDesc<'_>) -> Result<Placement>;
+
+    /// Makes a block of device memory for images to be placed in.
+    ///
+    /// # Errors
+    ///
+    /// `ErrorKind::ResourceExhausted` when the device has no memory for it.
+    fn create_memory_block(&self, desc: &MemoryBlockDesc<'_>) -> Result<MemoryBlockHandle>;
+
+    /// Destroys a block. Refused while an image placed in it lives
+    /// ([`Rule::Pending`](crate::Rule::Pending)).
+    fn destroy_memory_block(&self, block: MemoryBlockHandle) -> Result<()>;
+
+    /// Puts `image`, whole, in a heap slot. The image's usage holds `SAMPLED`. The write
+    /// is seen by every submit made after the call returns. Refused while a pass of a
+    /// pending submit declares the slot ([`Rule::HeapWrite`](crate::Rule::HeapWrite)): a
+    /// slot is written again only after the timeline value that frees it.
+    fn write_heap_slot(&self, slot: HeapSlot, image: ImageHandle) -> Result<()>;
+
+    /// Empties a heap slot, under the rule of [`write_heap_slot`](Self::write_heap_slot).
+    fn clear_heap_slot(&self, slot: HeapSlot) -> Result<()>;
+
+    /// Makes a sampler and returns its index in the sampler table: an index no live
+    /// sampler has.
+    ///
+    /// # Errors
+    ///
+    /// `ErrorKind::ResourceExhausted` when the table is full.
+    fn create_sampler(&self, desc: &SamplerDesc) -> Result<SamplerIndex>;
+
+    /// Frees a sampler's index for reuse. The caller frees it only after every submit
+    /// whose shaders may index it has completed; no backend can check that.
+    fn destroy_sampler(&self, sampler: SamplerIndex) -> Result<()>;
+
+    /// Makes a graphics pipeline.
+    ///
+    /// # Errors
+    ///
+    /// `ErrorKind::Unsupported` for a shader target the backend does not run;
+    /// `ErrorKind::InvalidData` for a shader the driver refuses, a stage in the wrong
+    /// place, a constant the shader does not declare or of another length, a heap array
+    /// whose capacity is not the device's, a colour target with a write mask that is not
+    /// empty which the fragment stage does not write or reads as an input, or a depth
+    /// format that is not one.
+    fn create_graphics_pipeline(
+        &self,
+        desc: &GraphicsPipelineDesc<'_>,
+    ) -> Result<GraphicsPipelineHandle>;
+
+    /// Makes a compute pipeline. Errors as
+    /// [`create_graphics_pipeline`](Self::create_graphics_pipeline)'s.
+    fn create_compute_pipeline(
+        &self,
+        desc: &ComputePipelineDesc<'_>,
+    ) -> Result<ComputePipelineHandle>;
+
+    /// Destroys a graphics pipeline. Refused while a pending submit uses it
+    /// ([`Rule::Pending`](crate::Rule::Pending)).
+    fn destroy_graphics_pipeline(&self, pipeline: GraphicsPipelineHandle) -> Result<()>;
+
+    /// Destroys a compute pipeline. Refused while a pending submit uses it
+    /// ([`Rule::Pending`](crate::Rule::Pending)).
+    fn destroy_compute_pipeline(&self, pipeline: ComputePipelineHandle) -> Result<()>;
+
+    /// The driver's pipeline cache as it is now, sealed
+    /// ([`seal_cache`](crate::seal_cache)), for the caller to write to disk and hand to
+    /// the next run's [`DeviceRequest`](crate::DeviceRequest). Empty where the backend has
+    /// nothing to save or may not save now (`README.md`, "The pipeline cache").
+    fn pipeline_cache(&self) -> Result<Vec<u8>>;
+
+    /// What the device has done with pipelines so far. Never fails, on a lost device
+    /// either.
+    fn pipeline_stats(&self) -> PipelineStats;
+
+    /// Makes a timeline whose value is `initial`.
+    fn create_timeline(&self, initial: u64) -> Result<TimelineHandle>;
+
+    /// Destroys a timeline. Refused while a pending submit waits for or signals it
+    /// ([`Rule::Pending`](crate::Rule::Pending)).
+    fn destroy_timeline(&self, timeline: TimelineHandle) -> Result<()>;
+
+    /// The timeline's value now. It never decreases.
+    fn timeline_value(&self, timeline: TimelineHandle) -> Result<u64>;
+
+    /// Signals a point from the host: the timeline's value becomes `point.value`, which
+    /// is greater than any it has reached or been promised
+    /// ([`Rule::Timeline`](crate::Rule::Timeline)).
+    fn signal_timeline(&self, point: TimelinePoint) -> Result<()>;
+
+    /// Blocks until the point is reached or `timeout` has passed, and returns whether it
+    /// was reached. A zero timeout polls.
+    ///
+    /// # Errors
+    ///
+    /// `ErrorKind::DeviceLost`, at once and without waiting, when the device is lost
+    /// before the point is reached.
+    fn wait_timeline(&self, point: TimelinePoint, timeout: Duration) -> Result<bool>;
+
+    /// Makes an encoder for `queue`'s role, recording. Its memory is its own: two
+    /// encoders record on two threads at once with no lock between them.
+    fn create_encoder(&self, queue: QueueRole, label: &str) -> Result<Box<dyn Encoder>>;
+
+    /// Submits to the queue that serves `queue`: `Graphics` or `Compute`. The present
+    /// role is submitted to through [`Swapchain::present`] alone
+    /// ([`Rule::PresentQueue`](crate::Rule::PresentQueue)). Submits to one queue run in
+    /// the order the calls return; it is the caller that orders two threads' submits.
+    ///
+    /// # Errors
+    ///
+    /// `ErrorKind::DeviceLost`; a refusal, by any rule a command of the submit breaks in
+    /// submission order, which leaves everything as it was ([`Submit`]).
+    fn submit(&self, queue: QueueRole, submit: Submit<'_>) -> Result<()>;
+
+    /// Makes the swapchain of the surface the device was created with. A device has one
+    /// swapchain at a time.
+    ///
+    /// # Errors
+    ///
+    /// `ErrorKind::Unsupported` for a device created with no surface, and for a surface
+    /// the device cannot present to; refused while the device's swapchain lives
+    /// ([`Rule::Swapchain`](crate::Rule::Swapchain)).
+    fn create_swapchain(&self, desc: &SwapchainDesc) -> Result<Box<dyn Swapchain>>;
+}

@@ -1,0 +1,190 @@
+//! Pipelines: what they are made from, the driver cache's bytes and the statistics a
+//! device keeps of both.
+//!
+//! A pipeline has no layout object. Every pipeline's layout is the same shape: the heap's
+//! block, the input attachments of its fragment stage and one push-constant range, each
+//! as its cooked shaders declare them.
+
+use core::time::Duration;
+
+use lactose_core::{Handle, Result};
+
+use crate::resource::{Format, kind};
+use crate::shader::CookedShader;
+
+/// A graphics pipeline of a device.
+pub type GraphicsPipelineHandle = Handle<kind::GraphicsPipeline>;
+/// A compute pipeline of a device.
+pub type ComputePipelineHandle = Handle<kind::ComputePipeline>;
+
+/// A value for one specialisation constant.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct Constant<'a> {
+    /// The constant's id, one the shader declares.
+    pub id: u32,
+    /// Its value, of the length the shader declares for it, little-endian.
+    pub bytes: &'a [u8],
+}
+
+/// One stage of a pipeline.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct StageDesc<'a> {
+    /// The cooked shader.
+    pub shader: &'a CookedShader,
+    /// Values for its constants, each id at most once. A constant with no value keeps the
+    /// default the shader gives it.
+    pub constants: &'a [Constant<'a>],
+}
+
+/// Which channels of a colour attachment a pipeline writes: a set of the four bits.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct WriteMask(pub u8);
+
+impl WriteMask {
+    /// No channel.
+    pub const NONE: Self = Self(0);
+    /// The red channel.
+    pub const RED: Self = Self(1);
+    /// The green channel.
+    pub const GREEN: Self = Self(2);
+    /// The blue channel.
+    pub const BLUE: Self = Self(4);
+    /// The alpha channel.
+    pub const ALPHA: Self = Self(8);
+    /// Every channel.
+    pub const ALL: Self = Self(15);
+}
+
+/// One colour attachment as a pipeline sees it.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct ColourTargetDesc {
+    /// The attachment's format.
+    pub format: Format,
+    /// The channels the pipeline writes. Each attachment has its own.
+    pub write_mask: WriteMask,
+}
+
+/// A comparison of a fragment's depth with the attachment's.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum Compare {
+    /// Never passes.
+    Never,
+    /// Passes when the fragment's is less.
+    Less,
+    /// Passes when the fragment's is less or equal.
+    LessEqual,
+    /// Passes when the two are equal.
+    Equal,
+    /// Passes when the fragment's is greater or equal.
+    GreaterEqual,
+    /// Passes when the fragment's is greater.
+    Greater,
+    /// Always passes.
+    Always,
+}
+
+/// The depth attachment as a pipeline sees it.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct DepthDesc {
+    /// The attachment's format, a depth format.
+    pub format: Format,
+    /// The test.
+    pub compare: Compare,
+    /// Whether a fragment that passes writes its depth.
+    pub write: bool,
+}
+
+/// Which side of a triangle is not drawn. A triangle's front is the side on which its
+/// vertices run anticlockwise as the image is displayed (`README.md`, "Render passes").
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum Cull {
+    /// Both sides are drawn.
+    None,
+    /// The front is not drawn.
+    Front,
+    /// The back is not drawn.
+    Back,
+}
+
+/// What a graphics pipeline is made from. It draws triangle lists, and reads its vertices
+/// through device addresses: there is no vertex buffer binding (architecture section
+/// 12.4).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct GraphicsPipelineDesc<'a> {
+    /// A name for traces and for the driver's debug tools.
+    pub label: &'a str,
+    /// The vertex stage.
+    pub vertex: StageDesc<'a>,
+    /// The fragment stage, or `None` for a pipeline that writes depth alone.
+    pub fragment: Option<StageDesc<'a>>,
+    /// The colour attachments of the passes it draws in, in order.
+    pub colour: &'a [ColourTargetDesc],
+    /// The depth attachment of the passes it draws in, or `None` for a pass with none.
+    pub depth: Option<DepthDesc>,
+    /// The side not drawn.
+    pub cull: Cull,
+}
+
+/// What a compute pipeline is made from.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ComputePipelineDesc<'a> {
+    /// A name for traces and for the driver's debug tools.
+    pub label: &'a str,
+    /// The compute stage.
+    pub stage: StageDesc<'a>,
+}
+
+/// How the driver's pipeline cache started.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum CacheStart {
+    /// The request gave no bytes.
+    Empty,
+    /// The request's bytes passed every check and the driver took them.
+    Loaded,
+    /// The request's bytes failed the facade's length or checksum, the backend's identity
+    /// check, or the driver's own load: the cache started empty.
+    Rejected,
+}
+
+/// What a device has done with pipelines. Counts only grow.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct PipelineStats {
+    /// How the cache started.
+    pub cache: CacheStart,
+    /// Pipelines created.
+    pub pipelines: u64,
+    /// Stages the driver's cache had, where the driver says so. A statistic: the test of
+    /// a warm cache is the suite's (`README.md`, "The pipeline cache").
+    pub stage_hits: u64,
+    /// Stages the driver's cache did not have, where the driver says so.
+    pub stage_misses: u64,
+    /// The time spent inside pipeline creation, summed.
+    pub creation: Duration,
+}
+
+/// What identifies the driver a cache was written for. A backend builds it from what its
+/// driver reports: on Vulkan the vendor, the device and the cache's own identifier; on
+/// Metal the system's build, the device, its family and its architecture's name.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct CacheIdentity<'a>(pub &'a [u8]);
+
+/// Frames a driver's cache payload as the bytes
+/// [`Device::pipeline_cache`](crate::Device::pipeline_cache) returns: a magic number, a
+/// version, the identity, the payload's length, the payload, and a checksum over all of
+/// it. For backends.
+#[must_use]
+pub fn seal_cache(identity: CacheIdentity<'_>, payload: &[u8]) -> Vec<u8> {
+    todo!()
+}
+
+/// The payload inside `bytes`, exactly as it was sealed. For backends: the bytes it
+/// returns are the only ones a driver is ever handed.
+///
+/// # Errors
+///
+/// `ErrorKind::InvalidData` when `bytes` are not a sealed cache, are truncated or longer
+/// than their length says, or fail the checksum; `ErrorKind::VersionMismatch` when they
+/// are another version's or were sealed under another identity.
+pub fn open_cache<'a>(bytes: &'a [u8], identity: CacheIdentity<'_>) -> Result<&'a [u8]> {
+    todo!()
+}

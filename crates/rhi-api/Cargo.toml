@@ -1,0 +1,31 @@
+[package]
+name = "lactose-rhi-api"
+description = "The render hardware interface: capabilities, queues by role, buffers, images, the bindless heap, pipelines from cooked shaders, encoders, resource states, timelines, the swapchain and the conformance suite's shape."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+# D150: the integration tests are one binary, whose root declares the others as modules.
+autotests = false
+
+[features]
+# The conformance suite every backend runs: its cases by name, and the harness a backend
+# gives it. For `[dev-dependencies]` only: nothing that ships compiles the suite. `cargo
+# xtask tiers` holds it there once `[dev_only_features]` in crate-tiers.toml lists it.
+conformance = []
+
+[dependencies]
+lactose-core.workspace = true
+raw-window-handle.workspace = true
+
+[dev-dependencies]
+# Turns the suite on for this crate's own tests.
+lactose-rhi-api = { path = ".", features = ["conformance"] }
+
+[[test]]
+name = "integration"
+path = "tests/integration.rs"
+
+[lints]
+workspace = true

@@ -34,6 +34,7 @@ lactose-net-host = { path = "crates/net-host" }
 lactose-io = { path = "crates/io" }
 lactose-persist = { path = "crates/persist" }
 lactose-app = { path = "crates/app" }
+lactose-rhi-api = { path = "crates/rhi-api" }
 
 # Third-party crates. Cargo.lock pins the exact versions; docs/verification.md lists the
 # claims that are re-checked against those versions.
@@ -63,6 +64,9 @@ rapier3d-f64 = { version = "=0.36.0", default-features = false, features = [
     "parallel",
     "serde-serialize",
 ] }
+# Pinned exactly, with its features named: the types a surface is made from
+# (crates/rhi-api/README.md), which the platform crate hands over and each backend reads.
+raw-window-handle = { version = "=0.6.2", default-features = false, features = ["std"] }
 rayon = "1.12"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
