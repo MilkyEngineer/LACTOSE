@@ -3,5 +3,7 @@
 
 #![forbid(unsafe_code)]
 
+mod common;
 mod consumers;
+mod extract;
 mod registration;
