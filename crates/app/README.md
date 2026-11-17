@@ -220,7 +220,8 @@ registration a game crate writes")
   `ThreadPool::drop` terminates the pool and returns before its threads have exited.
 - A `Platform` is the binary's: `Workers::platform` is `None` for the headless binary and
   `StdPlatform` is used, for the executor and the IO pool alike; `app-client` passes the
-  platform crate's instance at milestone 4.
+  platform crate's `ClientPlatform` from milestone 2, whose topology is `StdPlatform`'s
+  (`crates/platform/README.md`, "`ClientPlatform`").
 
 **The timer root** (architecture sections 5.1 and 11; `crates/sim/README.md`, "The timer
 root")
