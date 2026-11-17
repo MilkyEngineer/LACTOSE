@@ -304,7 +304,9 @@ Eight rules bind whatever the coordinator reorders:
   Then, after the push, the laptop's run on its devices.
 - *The quiet window*, the coordinator's, at the measurement commit. Every track stops, the machine
   holds `caffeinate -i -s -d`, and `cargo xtask measure --all` runs once. It writes milestone 2's
-  five files beside milestone 1's, `gpu-cost` under MoltenVK and under KosmicKrisp.
+  five files beside milestone 1's, `gpu-cost` under MoltenVK and under KosmicKrisp. The WHISK
+  file's 60 Hz P99 is read against D156: under 30 µs, the planner proposes 35 µs again; the system
+  daemon's CPU time is read before and after the run, as the remeasurement of 17 November 2026 did.
 - *The laptop's session*, at the same commit, with nothing else running there: the same command,
   and `cargo xtask gpu --driver system`. Its `triangle` file is criterion 1's proof on Windows
   (the owner's answer 2).
