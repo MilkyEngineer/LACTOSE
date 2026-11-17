@@ -232,7 +232,7 @@ it is.
 |---|---|
 | Makespan divided by its lower bound | at most 1.25 at P50 and 1.5 at P99 |
 | Wake latency (push to an idle pool until the job starts) | under 35 µs at P99: the floor on macOS is the cores leaving deep idle, 24 to 29 µs at P99 with every wait primitive |
-| Timer wake (a tick deadline until the frame-critical task that slept until it resumes, at 60 Hz) | under 35 µs at P99 (D138); on Windows under 1 ms (D144) |
+| Timer wake (a tick deadline until the frame-critical task that slept until it resumes, at 60 Hz) | under 35 µs at P99 (D138); on macOS under 50 µs (D156); on Windows under 1 ms (D144) |
 | Steal (one successful steal, including the split) | under 1 µs |
 
 The lower bound of a run is the larger of two numbers: the heaviest dependency chain, summing

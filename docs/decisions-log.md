@@ -6838,3 +6838,37 @@ process state; the nightly Miri filters name modules that Miri compiles** (§20,
   runs in a recorded test; and section 22 records the exit and two readings of its criteria. Its two
   reviews (not checked in) found nothing blocking, 2 serious and 12 minor findings, all answered in
   the text applied.
+
+**D156. On macOS tick start is held to 50 µs at P99** (§22, `lactose-task`, `docs/results`)
+- Why: the development Mac moved to macOS 27.2.1 on 17 November 2026 (D154), and the M1's re-run
+  there fails D138's 35 µs with the executor's code unchanged: at 60 Hz, P99 34.6 to 38.3 µs and
+  P50 6.5 to 8.7 µs in four full runs (`docs/results/whisk-apple-m1-2026-11-17.md` and its three
+  suffixed files), against 24.4 to 29.9 µs and 2.6 to 3.7 µs in the four files of macOS 14.7.4.
+  The remeasurement of 17 November 2026 at `d290812`
+  (`docs/results/whisk-apple-m1-2026-11-17-at-d290812.md` and its two suffixed files), with the
+  system daemon of the first evening idle, gave P99 24.3, 27.6 and 30.3 µs and P50 2.7 to 3.6 µs.
+  While the daemon was busy, what moved was the cost of work that starts after an idle gap, and it
+  grew with the gap: the 2 ms period, whose timed waits end as the 60 Hz period's do, moved by 2 to
+  3 µs at P99 and not at the median. With it idle the medians are macOS 14.7.4's again, so its load
+  explains most of the miss, and one run of three still reached 30 µs. It was busy re-checking a
+  third-party login agent that relaunched a helper every two minutes, and it is busy again whenever
+  such a loop runs.
+  - *The figure is what the operating system gives*, as D113 set the push criterion and D138 this
+    one. 50 µs is the worst full run on macOS 27.2.1, 38.3 µs, plus the 7.7 µs between the best
+    and worst runs of the shipped keeper on macOS 14.7.4 (22.2 to 29.9 µs), rounded up to the
+    next 5 µs.
+  - *No consumer needs 35 µs.* Lateness does not accumulate (`TickPacer::poll`), 50 µs is 0.3% of
+    a tick, and Windows is held to 1 ms (D144).
+  - *Linux keeps 35 µs and Windows 1 ms.* Neither has a figure that says otherwise; the desktop's
+    first sitting gives them (D151).
+  - *The files of macOS 14.7.4 stay milestone 1's proof*, and milestone 1 is not reopened (D154).
+  - *It is read again at milestone 2's measurement commit.* If the M1's file there is under
+    30 µs, the planner proposes 35 µs again.
+  - Rules out: another attempt at the keeper for this cause in milestone 2, the lead-up warm spin
+    staying D113's builder option; reading the criterion on macOS as a regression gate finer
+    than about 12 µs, since a quiet window's file is read against the last one
+    (`docs/plans/milestone-2.md`, section 9).
+- Driven by: the quiet window of 17 November 2026 (`097f489`);
+  `docs/proposals/tick-start-macos-27.md`; the owner's ruling of 17 November 2026; the
+  remeasurement at `d290812`.
+- Replaced: on macOS, the 35 µs of D138's addendum for tick start.
