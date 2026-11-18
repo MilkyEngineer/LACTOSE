@@ -2,8 +2,9 @@
 
 use super::kit::{Body, Ctx, EXTENT, attachment, begin, clear, image_desc, image_to};
 use crate::{
-    Device, Format, ImageDesc, ImageHandle, ImageMemory, ImageState, ImageUsage, Load,
-    MemoryBlockDesc, MemoryBlockHandle, PassReach, QueueRole, Store, Submit, WriteMask,
+    DepthAttachment, Device, Format, ImageDesc, ImageHandle, ImageMemory, ImageState, ImageUsage,
+    Load, MemoryBlockDesc, MemoryBlockHandle, PassReach, QueuePath, QueueRole, RenderPass, Rule,
+    Store, Submit, Target, WriteMask,
 };
 
 type Applies = Result<(), &'static str>;
@@ -56,10 +57,41 @@ fn submit_one(device: &dyn Device, encoder: Box<dyn crate::Encoder>) -> lactose_
 fn image_use_outside_its_usage_is_refused(ctx: &Ctx<'_>) -> Applies {
     let device = ctx.device();
     let sampled = ctx.image(&*device, &image_desc(Format::Rgba8Unorm, EXTENT, ImageUsage::SAMPLED));
+    // The attachment alone, with no transition before it: the transition is refused too.
     let mut encoder = ctx.encoder(&*device, QueueRole::Graphics);
-    clear(&mut *encoder, sampled, None);
+    begin(
+        &mut *encoder,
+        &[attachment(sampled, Load::Clear([0.0; 4]), Store::Store, false)],
+        PassReach::NOTHING,
+    );
+    encoder.end_pass();
     ctx.refused(submit_one(&*device, encoder), "a colour attachment made without `COLOUR`");
     let target = ctx.target(&*device);
+    // A transition into a state is a use of it: on Vulkan each state's layout is valid only
+    // for an image with its usage.
+    let transitions = [
+        (sampled, ImageState::ColourAttachment, "a transition to ColourAttachment without COLOUR"),
+        (target, ImageState::LocalRead, "a transition to LocalRead without INPUT"),
+        (sampled, ImageState::LocalRead, "a transition to LocalRead without COLOUR"),
+        (sampled, ImageState::DepthAttachment, "a transition to DepthAttachment without DEPTH"),
+        (target, ImageState::SampledRead, "a transition to SampledRead without SAMPLED"),
+        (sampled, ImageState::CopySource, "a transition to CopySource without COPY_SOURCE"),
+        (
+            target,
+            ImageState::CopyDestination,
+            "a transition to CopyDestination without COPY_DESTINATION",
+        ),
+    ];
+    for (image, state, what) in transitions {
+        let mut encoder = ctx.encoder(&*device, QueueRole::Graphics);
+        encoder.transition_images(&[image_to(
+            image,
+            ImageState::Undefined,
+            state,
+            QueueRole::Graphics,
+        )]);
+        ctx.refused(submit_one(&*device, encoder), what);
+    }
     ctx.refused(
         device.write_heap_slot(crate::HeapSlot(0), target),
         "a heap slot's image made without `SAMPLED`",
@@ -142,10 +174,62 @@ fn memoryless_attachment_kept_is_refused(ctx: &Ctx<'_>) -> Applies {
 
 /// A pass that draws into a memoryless attachment, calls the local read, and draws into
 /// it again.
+/// Where memoryless contents are lost across a local read: a memoryless colour attachment,
+/// where colour is honoured, and a memoryless depth attachment, where depth is, which is
+/// MoltenVK's shape (the RHI spike).
 fn memoryless_attachment_after_a_local_read_is_refused_where_lost(ctx: &Ctx<'_>) -> Applies {
-    if !ctx.set.memoryless_colour || ctx.set.memoryless_survives_local_read {
-        return Err("memoryless colour is not offered, or survives a local read");
+    let honoured = ctx.set.memoryless_colour || ctx.set.memoryless_depth;
+    if !honoured || ctx.set.memoryless_survives_local_read {
+        return Err("no memoryless request is honoured, or its contents survive a local read");
     }
+    if ctx.set.memoryless_colour {
+        split_colour(ctx);
+    }
+    if ctx.set.memoryless_depth {
+        split_depth(ctx);
+    }
+    Ok(())
+}
+
+fn split_depth(ctx: &Ctx<'_>) {
+    let device = ctx.device();
+    let queue = QueueRole::Graphics;
+    let depth = ctx.image(
+        &*device,
+        &memoryless(Format::Depth32Float, ImageUsage::TRANSIENT.union(ImageUsage::DEPTH)),
+    );
+    ctx.check(ctx.ok(device.image_memoryless(depth), "the outcome"), "the request is honoured");
+    let target = ctx.target(&*device);
+    let pipeline = ctx.graphics(
+        &*device,
+        &[(Format::Rgba8Unorm, WriteMask::ALL)],
+        0,
+        Some(Format::Depth32Float),
+    );
+    let mut encoder = ctx.encoder(&*device, queue);
+    encoder.transition_images(&[
+        image_to(depth, ImageState::Undefined, ImageState::DepthAttachment, queue),
+        image_to(target, ImageState::Undefined, ImageState::ColourAttachment, queue),
+    ]);
+    encoder.begin_render_pass(&RenderPass {
+        label: "conformance",
+        colour: &[attachment(target, Load::Clear([0.0; 4]), Store::Store, false)],
+        depth: Some(DepthAttachment {
+            target: Target { image: depth, mip: 0, layer: 0 },
+            load: Load::Clear(1.0),
+            store: Store::DontCare,
+        }),
+        reach: PassReach::NOTHING,
+    });
+    encoder.bind_graphics_pipeline(pipeline);
+    encoder.draw(0..3, 0..1);
+    encoder.local_read();
+    encoder.draw(0..3, 0..1);
+    encoder.end_pass();
+    ctx.refused(submit_one(&*device, encoder), "a memoryless depth attachment after a local read");
+}
+
+fn split_colour(ctx: &Ctx<'_>) {
     let device = ctx.device();
     let queue = QueueRole::Graphics;
     let g_buffer = ctx.image(&*device, &memoryless(Format::Rgba8Unorm, G_BUFFER));
@@ -176,7 +260,6 @@ fn memoryless_attachment_after_a_local_read_is_refused_where_lost(ctx: &Ctx<'_>)
     encoder.draw(0..3, 0..1);
     encoder.end_pass();
     ctx.refused(submit_one(&*device, encoder), "a memoryless attachment drawn after a local read");
-    Ok(())
 }
 
 /// A block that holds one placement of `desc`, and that placement.
@@ -248,7 +331,58 @@ fn aliased_image_used_without_the_alias_call_is_refused(ctx: &Ctx<'_>) -> Applie
         submit_one(&*device, encoder),
         "an alias used in a later submit with no alias call",
     );
+    // An image an alias call ended stays ended when the image that ended it is destroyed:
+    // its bytes are still another's, and it needs an alias call of its own.
+    let mut encoder = ctx.encoder(&*device, QueueRole::Graphics);
+    encoder.alias(second);
+    clear(&mut *encoder, second, None);
+    let done = ctx.point(&*device, 1);
+    ctx.submit(&*device, QueueRole::Graphics, &mut [encoder], &[], &[done]);
+    ctx.reached(&*device, done);
+    ctx.ok(device.destroy_image(second), "the destroy of the image that took the bytes");
+    let mut encoder = ctx.encoder(&*device, QueueRole::Graphics);
+    clear(&mut *encoder, first, None);
+    ctx.refused(
+        submit_one(&*device, encoder),
+        "an image an alias call ended, used after the other image is destroyed",
+    );
+    alias_across_queues(ctx);
     Ok(())
+}
+
+/// Images that alias are used on one queue: an alias call on another queue than the one
+/// either image was used on is refused (`no-qfot`), whether the call names the image used
+/// there or the image that would end it.
+fn alias_across_queues(ctx: &Ctx<'_>) {
+    if ctx.set.queues.compute != QueuePath::Own {
+        return;
+    }
+    let device = ctx.device();
+    let desc = image_desc(Format::Rgba8Unorm, EXTENT, ImageUsage::COPY_DESTINATION);
+    let (block, _) = block(ctx, &*device, &desc);
+    let (first, second) = (
+        ctx.image(&*device, &placed(desc, block, 0)),
+        ctx.image(&*device, &placed(desc, block, 0)),
+    );
+    let compute = QueueRole::Compute;
+    let mut user = ctx.encoder(&*device, compute);
+    user.transition_images(&[image_to(
+        first,
+        ImageState::Undefined,
+        ImageState::CopyDestination,
+        compute,
+    )]);
+    let mut users = [user];
+    let gate = ctx.held(&*device, compute, &mut users);
+    for (image, what) in [
+        (first, "an alias call on graphics of the image compute uses"),
+        (second, "an alias call on graphics that ends the image compute uses"),
+    ] {
+        let mut encoder = ctx.encoder(&*device, QueueRole::Graphics);
+        encoder.alias(image);
+        ctx.refused_by(submit_one(&*device, encoder), Rule::Queue, what);
+    }
+    gate.open(ctx, &*device);
 }
 
 fn alias_read_before_its_first_write_is_refused(ctx: &Ctx<'_>) -> Applies {

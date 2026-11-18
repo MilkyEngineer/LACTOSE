@@ -29,6 +29,7 @@ pub(super) const BODIES: &[(&str, Body)] = &[
     ("undeclared_slot_argument_is_refused", undeclared_slot_argument_is_refused),
     ("undeclared_address_argument_is_refused", undeclared_address_argument_is_refused),
     ("declared_buffer_in_another_state_is_refused", declared_buffer_in_another_state_is_refused),
+    ("buffer_declared_in_two_states_is_refused", buffer_declared_in_two_states_is_refused),
     ("sampler_table_is_bounded", sampler_table_is_bounded),
 ];
 
@@ -298,6 +299,27 @@ fn declared_buffer_in_another_state_is_refused(ctx: &Ctx<'_>) -> Applies {
         submit(&*device, &mut [encoder]),
         "a buffer declared `ShaderRead` in `ShaderWrite`",
     );
+    Ok(())
+}
+
+/// A buffer listed twice in a pass is listed in one state: which of two would win is not
+/// for a backend to choose, and Vulkan's barrier and Metal's usage follow it.
+fn buffer_declared_in_two_states_is_refused(ctx: &Ctx<'_>) -> Applies {
+    let device = ctx.device();
+    let pipeline = ctx.compute(&*device);
+    let buffer = ctx.upload(&*device, BufferUsage::DEVICE_ADDRESS, &[1; 256]);
+    let read = BufferReach { buffer, state: BufferState::ShaderRead };
+    let write = BufferReach { buffer, state: BufferState::ShaderWrite };
+    for (reach, what) in [
+        ([read, write], "a buffer declared `ShaderRead`, then `ShaderWrite`"),
+        ([write, read], "a buffer declared `ShaderWrite`, then `ShaderRead`"),
+    ] {
+        let mut encoder = ctx.encoder(&*device, G);
+        compute_pass(&mut *encoder, pipeline, PassReach { slots: &[], buffers: &reach });
+        encoder.dispatch([1, 1, 1]);
+        encoder.end_pass();
+        ctx.refused(submit(&*device, &mut [encoder]), what);
+    }
     Ok(())
 }
 

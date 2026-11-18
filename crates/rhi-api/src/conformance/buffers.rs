@@ -276,7 +276,11 @@ fn read_under_a_pending_writer_is_refused(ctx: &Ctx<'_>) -> Applies {
     )]);
     let mut writers = [writer];
     let gate = ctx.held(&*device, queue, &mut writers);
-    ctx.ok(device.invalidate_buffer(readback, 0, SIZE), "an invalidate");
+    // An invalidate before the writer runs makes none of its writes visible.
+    ctx.refused(
+        device.invalidate_buffer(readback, 0, SIZE),
+        "an invalidate under a pending writer",
+    );
     let mut called = false;
     ctx.refused(
         device.read_buffer(readback, 0, SIZE, &mut |_| called = true),
@@ -287,6 +291,39 @@ fn read_under_a_pending_writer_is_refused(ctx: &Ctx<'_>) -> Applies {
     ctx.check(
         ctx.read(&*device, readback, 0, SIZE) == pattern(2),
         "the read once the writer is seen complete",
+    );
+    // A submit that only moves the buffer into `HostRead` is a writer to the host: its
+    // barrier makes the device's writes visible.
+    let mut encoder = ctx.encoder(&*device, queue);
+    encoder.transition_buffers(&[buffer_to(
+        readback,
+        BufferState::HostRead,
+        BufferState::CopyDestination,
+        queue,
+    )]);
+    ctx.submit(&*device, queue, &mut [encoder], &[], &[]);
+    let mut mover = ctx.encoder(&*device, queue);
+    mover.transition_buffers(&[buffer_to(
+        readback,
+        BufferState::CopyDestination,
+        BufferState::HostRead,
+        queue,
+    )]);
+    let mut movers = [mover];
+    let gate = ctx.held(&*device, queue, &mut movers);
+    ctx.refused(
+        device.read_buffer(readback, 0, SIZE, &mut |_| called = true),
+        "a read while its move into HostRead is pending",
+    );
+    ctx.refused(
+        device.invalidate_buffer(readback, 0, SIZE),
+        "an invalidate while its move into HostRead is pending",
+    );
+    ctx.check(!called, "a refused read lends nothing");
+    gate.open(ctx, &*device);
+    ctx.check(
+        ctx.read(&*device, readback, 0, SIZE) == pattern(2),
+        "the read once the move is seen complete",
     );
     Ok(())
 }

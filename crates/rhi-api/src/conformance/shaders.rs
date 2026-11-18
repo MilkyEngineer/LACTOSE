@@ -5,10 +5,10 @@ use lactose_core::ErrorKind;
 use super::kit::{Body, Ctx, INT64_ATOMICS, attachment, begin, cooked, heap_of, image_to, spirv};
 use crate::shader::MAGIC;
 use crate::{
-    COOKED_SHADER_VERSION, CacheIdentity, ColourTargetDesc, ComputePipelineDesc, Constant,
-    ConstantSlot, CookedShader, Cull, Format, GraphicsPipelineDesc, HeapArrayKind, ImageState,
-    Load, PassReach, QueueRole, ShaderStage, ShaderTarget, StageDesc, Store, Submit, WriteMask,
-    open_cache, seal_cache,
+    COOKED_SHADER_VERSION, CacheIdentity, CacheStart, ColourTargetDesc, ComputePipelineDesc,
+    Constant, ConstantSlot, CookedShader, Cull, Format, GraphicsPipelineDesc, HeapArrayKind,
+    ImageState, Load, PUSH_BYTES_MAX, PassReach, QueueRole, ShaderStage, ShaderTarget, StageDesc,
+    Store, Submit, WriteMask, open_cache, seal_cache,
 };
 
 type Applies = Result<(), &'static str>;
@@ -66,18 +66,51 @@ fn compute(
 fn cooked_shader_round_trips(ctx: &Ctx<'_>) -> Applies {
     for shader in [rich(ctx), cooked(ShaderStage::Vertex, 0, 0), cooked(ShaderStage::Compute, 0, 0)]
     {
-        let bytes = shader.encode();
-        ctx.check(bytes == shader.encode(), "equal shaders encode to equal bytes");
+        let bytes = ctx.ok(shader.encode(), "an encode");
+        ctx.check(
+            bytes == ctx.ok(shader.encode(), "an encode"),
+            "equal shaders encode to equal bytes",
+        );
         ctx.check(
             ctx.ok(CookedShader::decode(&bytes), "a decode") == shader,
             "a shader round-trips",
         );
     }
+    // What `decode` refuses, `encode` refuses too: the cooker writes no file the engine
+    // cannot read.
+    let mut heap = heap_of(&ctx.set);
+    heap.set += 1;
+    let mut twice = heap_of(&ctx.set);
+    twice.arrays[1].kind = twice.arrays[0].kind;
+    let breaches = [
+        ("a heap set other than HEAP_SET", CookedShader { heap: Some(heap), ..rich(ctx) }),
+        ("a heap array kind twice", CookedShader { heap: Some(twice), ..rich(ctx) }),
+        (
+            "a push block above the most",
+            CookedShader { push_bytes: PUSH_BYTES_MAX + 1, ..rich(ctx) },
+        ),
+        (
+            "constants out of order",
+            CookedShader {
+                constants: vec![ConstantSlot { id: 3, bytes: 4 }, ConstantSlot { id: 0, bytes: 4 }],
+                ..rich(ctx)
+            },
+        ),
+        (
+            "a constant of 2 bytes",
+            CookedShader { constants: vec![ConstantSlot { id: 0, bytes: 2 }], ..rich(ctx) },
+        ),
+        ("inputs outside the fragment stage", cooked(ShaderStage::Vertex, 1, 0)),
+        ("outputs outside the fragment stage", cooked(ShaderStage::Compute, 0, 1)),
+    ];
+    for (what, shader) in breaches {
+        ctx.fails(shader.encode(), ErrorKind::InvalidData, what);
+    }
     Ok(())
 }
 
 fn cooked_shader_of_another_version_is_refused(ctx: &Ctx<'_>) -> Applies {
-    let mut bytes = rich(ctx).encode();
+    let mut bytes = ctx.ok(rich(ctx).encode(), "an encode");
     let at = MAGIC.len();
     bytes[at..at + 4].copy_from_slice(&(COOKED_SHADER_VERSION + 1).to_le_bytes());
     ctx.fails(CookedShader::decode(&bytes), ErrorKind::VersionMismatch, "a later version");
@@ -87,7 +120,7 @@ fn cooked_shader_of_another_version_is_refused(ctx: &Ctx<'_>) -> Applies {
 }
 
 fn cooked_shader_corrupt_or_truncated_is_refused(ctx: &Ctx<'_>) -> Applies {
-    let bytes = rich(ctx).encode();
+    let bytes = ctx.ok(rich(ctx).encode(), "an encode");
     for at in [0, MAGIC.len() + 5, bytes.len() / 2, bytes.len() - 1] {
         let mut corrupt = bytes.clone();
         corrupt[at] ^= 0x40;
@@ -238,43 +271,92 @@ fn pipeline_of_other_formats_than_its_pass_is_refused(ctx: &Ctx<'_>) -> Applies 
         ErrorKind::InvalidData,
         "a colour target of a depth format",
     );
+    // A pipeline of more colour targets than a pass may have: Vulkan's VUID 09533.
+    let fragment = cooked(ShaderStage::Fragment, 0, 0);
+    let unwritten = ColourTargetDesc { format: Format::Rgba8Unorm, write_mask: WriteMask::NONE };
+    let colour = vec![unwritten; ctx.set.colour_attachments as usize + 1];
+    let desc = GraphicsPipelineDesc {
+        fragment: Some(StageDesc { shader: &fragment, constants: &[] }),
+        colour: &colour,
+        ..desc
+    };
+    ctx.refused(device.create_graphics_pipeline(&desc), "a pipeline of a target past the limit");
+    let desc = GraphicsPipelineDesc { colour: &colour[1..], ..desc };
+    ctx.ok(device.create_graphics_pipeline(&desc), "a pipeline of the most targets");
     Ok(())
 }
 
 const IDENTITY: CacheIdentity<'static> = CacheIdentity(b"conformance");
 
-fn sealed_cache_round_trips(ctx: &Ctx<'_>) -> Applies {
-    for payload in [&b""[..], b"a payload", &[0xff; 4096]] {
-        let sealed = seal_cache(IDENTITY, payload);
-        ctx.check(sealed == seal_cache(IDENTITY, payload), "equal payloads seal to equal bytes");
-        ctx.check(
-            ctx.ok(open_cache(&sealed, IDENTITY), "an open") == payload,
-            "a payload round-trips",
-        );
-    }
+fn sealed(ctx: &Ctx<'_>, identity: CacheIdentity<'_>, payload: &[u8]) -> Vec<u8> {
+    ctx.ok(seal_cache(identity, payload), "a seal")
+}
+
+/// The bytes of a device's cache, which holds the stage of `ctx.compute`.
+fn warm_cache(ctx: &Ctx<'_>) -> Vec<u8> {
     let device = ctx.device();
+    ctx.check(device.pipeline_stats().cache == CacheStart::Empty, "a cache started from no bytes");
     ctx.compute(&*device);
-    let bytes = ctx.ok(device.pipeline_cache(), "the device's cache");
     let stats = device.pipeline_stats();
     ctx.check(stats.pipelines == 1, "the device counts its pipeline");
     ctx.check(stats.stage_hits + stats.stage_misses >= 1, "the device counts its pipeline's stage");
-    let _ = bytes;
+    ctx.ok(device.pipeline_cache(), "the device's cache")
+}
+
+fn sealed_cache_round_trips(ctx: &Ctx<'_>) -> Applies {
+    for payload in [&b""[..], b"a payload", &[0xff; 4096]] {
+        let bytes = sealed(ctx, IDENTITY, payload);
+        ctx.check(bytes == sealed(ctx, IDENTITY, payload), "equal payloads seal to equal bytes");
+        ctx.check(
+            ctx.ok(open_cache(&bytes, IDENTITY), "an open") == payload,
+            "a payload round-trips",
+        );
+    }
+    let bytes = warm_cache(ctx);
+    let device = ctx.cached(bytes, "a device started from another's cache");
+    ctx.check(device.pipeline_stats().cache == CacheStart::Loaded, "a device's own cache loads");
+    ctx.compute(&*device);
+    let stats = device.pipeline_stats();
+    // Where the driver counts stages at all, the one the cache holds is a hit.
+    let counted = stats.stage_hits + stats.stage_misses > 0;
+    ctx.check(!counted || stats.stage_hits >= 1, "the cached stage is a hit");
+    ctx.check(ctx.messages() == 0, "a cache that loads sends no message");
     Ok(())
 }
 
 fn cache_corrupt_truncated_or_foreign_starts_empty(ctx: &Ctx<'_>) -> Applies {
-    let sealed = seal_cache(IDENTITY, b"a driver's cache");
+    let bytes = sealed(ctx, IDENTITY, b"a driver's cache");
     ctx.check(
-        open_cache(&seal_cache(CacheIdentity(b"another"), b"a driver's cache"), IDENTITY).is_err(),
+        open_cache(&sealed(ctx, CacheIdentity(b"another"), b"a driver's cache"), IDENTITY).is_err(),
         "a foreign identity",
     );
-    for len in [0, 4, sealed.len() / 2, sealed.len() - 1] {
-        ctx.check(open_cache(&sealed[..len], IDENTITY).is_err(), "a truncation");
+    for len in [0, 4, bytes.len() / 2, bytes.len() - 1] {
+        ctx.check(open_cache(&bytes[..len], IDENTITY).is_err(), "a truncation");
     }
-    for at in [0, sealed.len() / 2, sealed.len() - 1] {
-        let mut corrupt = sealed.clone();
+    for at in [0, bytes.len() / 2, bytes.len() - 1] {
+        let mut corrupt = bytes.clone();
         corrupt[at] ^= 1;
         ctx.check(open_cache(&corrupt, IDENTITY).is_err(), "a byte flipped");
     }
+    // A backend's side: its own bytes spoiled, or bytes of another identity, start the
+    // cache empty with no error and no message, and no bytes start it `Empty`.
+    let own = warm_cache(ctx);
+    let mut flipped = own.clone();
+    let middle = flipped.len() / 2;
+    flipped[middle] ^= 1;
+    let mut spoiled = vec![
+        ("its own bytes with a byte flipped", flipped),
+        ("its own bytes truncated", own[..own.len() - 1].to_vec()),
+        ("bytes of another identity", sealed(ctx, CacheIdentity(b"another"), &own)),
+        ("bytes that are no sealed cache", b"not a cache".to_vec()),
+    ];
+    spoiled.push(("no bytes", Vec::new()));
+    for (what, bytes) in spoiled {
+        let expected = if bytes.is_empty() { CacheStart::Empty } else { CacheStart::Rejected };
+        let device = ctx.cached(bytes, what);
+        ctx.check(device.pipeline_stats().cache == expected, what);
+        ctx.compute(&*device);
+    }
+    ctx.check(ctx.messages() == 0, "a cache that fails a check sends no message");
     Ok(())
 }

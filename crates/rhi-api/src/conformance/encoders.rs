@@ -1,10 +1,11 @@
 //! Encoders and submits.
 
+use std::sync::mpsc;
 use std::time::Duration;
 
 use super::kit::{
-    Body, Ctx, EXTENT, attachment, begin, buffer_to, clear, compute_pass, image_desc, image_to,
-    whole_image,
+    Body, Ctx, EXTENT, WOKEN, attachment, begin, buffer_to, clear, compute_pass, image_desc,
+    image_to, whole_image,
 };
 use crate::{
     BufferCopy, BufferHandle, BufferImageCopy, BufferReach, BufferState, BufferUsage, Device,
@@ -17,6 +18,7 @@ type Applies = Result<(), &'static str>;
 pub(super) const BODIES: &[(&str, Body)] = &[
     ("encoder_recorded_on_another_thread_submits", encoder_recorded_on_another_thread_submits),
     ("encoder_reset_while_pending_is_refused", encoder_reset_while_pending_is_refused),
+    ("pending_encoder_drop_waits_for_its_submit", pending_encoder_drop_waits_for_its_submit),
     ("encoder_in_two_submits_is_refused", encoder_in_two_submits_is_refused),
     ("encoder_resubmitted_without_reset_is_refused", encoder_resubmitted_without_reset_is_refused),
     ("recording_while_pending_records_nothing", recording_while_pending_records_nothing),
@@ -70,6 +72,42 @@ fn copy(encoder: &mut dyn Encoder, source: BufferHandle, destination: BufferHand
 fn pair(ctx: &Ctx<'_>, device: &dyn Device) -> (BufferHandle, BufferHandle) {
     let source = ctx.upload(device, BufferUsage::EMPTY, &[2; SIZE as usize]);
     (source, ctx.buffer(device, SIZE, BufferUsage::COPY_DESTINATION, MemoryClass::Device))
+}
+
+/// The drop of an encoder whose submit is pending blocks until the submit completes: on a
+/// device backend what it recorded is still the GPU's.
+fn pending_encoder_drop_waits_for_its_submit(ctx: &Ctx<'_>) -> Applies {
+    let device = ctx.device();
+    let (source, destination) = pair(ctx, &*device);
+    let mut encoder = ctx.encoder(&*device, G);
+    encoder.transition_buffers(&[
+        buffer_to(source, BufferState::Undefined, BufferState::CopySource, G),
+        buffer_to(destination, BufferState::Undefined, BufferState::CopyDestination, G),
+    ]);
+    encoder.copy_buffer(
+        source,
+        destination,
+        &[BufferCopy { source_offset: 0, destination_offset: 0, size: SIZE }],
+    );
+    let mut encoders = [encoder];
+    let gate = ctx.held(&*device, G, &mut encoders);
+    let [encoder] = encoders;
+    let (sender, receiver) = mpsc::channel();
+    // Not scoped: a drop that is never let go fails the case rather than hanging its join.
+    std::thread::spawn(move || {
+        drop(encoder);
+        sender.send(()).ok();
+    });
+    ctx.check(
+        receiver.recv_timeout(Duration::from_millis(300)).is_err(),
+        "the drop of a pending encoder returns only once its submit completes",
+    );
+    gate.open(ctx, &*device);
+    ctx.check(
+        receiver.recv_timeout(WOKEN).is_ok(),
+        "the drop of an encoder returns once its submit completes",
+    );
+    Ok(())
 }
 
 fn encoder_recorded_on_another_thread_submits(ctx: &Ctx<'_>) -> Applies {
@@ -391,7 +429,8 @@ fn push_outside_the_block_is_refused(ctx: &Ctx<'_>) -> Applies {
 fn copy_region_outside_its_resource_is_refused(ctx: &Ctx<'_>) -> Applies {
     let device = ctx.device();
     let (source, destination) = pair(ctx, &*device);
-    let usage = ImageUsage::COPY_DESTINATION.union(ImageUsage::SAMPLED);
+    let usage =
+        ImageUsage::COPY_DESTINATION.union(ImageUsage::SAMPLED).union(ImageUsage::COPY_SOURCE);
     let image = ctx.image(&*device, &image_desc(Format::Rgba8Unorm, EXTENT, usage));
     let texels = ctx.upload(
         &*device,
@@ -422,13 +461,16 @@ fn copy_region_outside_its_resource_is_refused(ctx: &Ctx<'_>) -> Applies {
         ctx.refused(submit(&*device, G, &mut [encoder]), what);
     }
     let rect = |x, width| Rect { x, y: 0, extent: crate::Extent { width, height: EXTENT.height } };
-    let image_copies: [(&str, BufferImageCopy); 3] = [
+    // Vulkan's VUIDs 07975 and 07978: the buffer's offset is a multiple of the texel.
+    let unaligned = BufferImageCopy { buffer_offset: 2, rect: rect(0, 8), ..whole_image() };
+    let image_copies: [(&str, BufferImageCopy); 4] = [
         (
             "a rectangle past the image",
             BufferImageCopy { rect: rect(8, EXTENT.width), ..whole_image() },
         ),
         ("a mip the image does not have", BufferImageCopy { mip: 1, ..whole_image() }),
         ("rows past the buffer", BufferImageCopy { buffer_offset: 4, ..whole_image() }),
+        ("a buffer offset that is not a multiple of the texel", unaligned),
     ];
     for (what, region) in image_copies {
         let mut encoder = ctx.encoder(&*device, G);
@@ -447,6 +489,18 @@ fn copy_region_outside_its_resource_is_refused(ctx: &Ctx<'_>) -> Applies {
         encoder.copy_buffer_to_image(texels, image, &[region]);
         ctx.refused(submit(&*device, G, &mut [encoder]), what);
     }
+    let readback = ctx.buffer(
+        &*device,
+        u64::from(EXTENT.width * EXTENT.height * 4),
+        BufferUsage::COPY_DESTINATION,
+        MemoryClass::Readback,
+    );
+    let mut encoder = ctx.encoder(&*device, G);
+    encoder.copy_image_to_buffer(image, readback, &[unaligned]);
+    ctx.refused(
+        submit(&*device, G, &mut [encoder]),
+        "a copy to a buffer offset that is not a multiple of the texel",
+    );
     Ok(())
 }
 

@@ -122,16 +122,28 @@ pub struct CookedShader {
 impl CookedShader {
     /// The shader's bytes, for the cooker to write: a magic number,
     /// [`COOKED_SHADER_VERSION`], every field, and a checksum over all of it. Equal
-    /// shaders give equal bytes on every host.
-    #[must_use]
-    pub fn encode(&self) -> Vec<u8> {
+    /// shaders give equal bytes on every host, and [`decode`](Self::decode) reads every
+    /// shader this accepts.
+    ///
+    /// # Errors
+    ///
+    /// `ErrorKind::InvalidData`, naming the field, for a shader that breaks what its fields'
+    /// documentation states (the list `decode` gives), or with an entry, a module, or a list
+    /// of 4 GiB or more.
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        if let Some(what) = self.breach() {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                format!("cooked shader to encode: {what}"),
+            ));
+        }
         let mut out = Vec::with_capacity(64 + self.entry.len() + self.code.len());
         out.extend_from_slice(&MAGIC);
         out.extend_from_slice(&COOKED_SHADER_VERSION.to_le_bytes());
         out.push(stage_code(self.stage));
         out.push(target_code(self.target));
-        put_bytes(&mut out, self.entry.as_bytes());
-        put_bytes(&mut out, &self.code);
+        put_bytes(&mut out, self.entry.as_bytes(), "the entry")?;
+        put_bytes(&mut out, &self.code, "the module")?;
         match &self.heap {
             None => out.push(0),
             Some(heap) => {
@@ -140,7 +152,7 @@ impl CookedShader {
                     HeapForm::FixedArray => 0,
                 });
                 out.extend_from_slice(&heap.set.to_le_bytes());
-                put_len(&mut out, heap.arrays.len());
+                put_len(&mut out, heap.arrays.len(), "the heap's arrays")?;
                 for array in &heap.arrays {
                     out.push(kind_code(array.kind));
                     out.extend_from_slice(&array.binding.to_le_bytes());
@@ -148,7 +160,7 @@ impl CookedShader {
                 }
             }
         }
-        put_len(&mut out, self.constants.len());
+        put_len(&mut out, self.constants.len(), "the constants")?;
         for constant in &self.constants {
             out.extend_from_slice(&constant.id.to_le_bytes());
             out.extend_from_slice(&constant.bytes.to_le_bytes());
@@ -158,7 +170,36 @@ impl CookedShader {
         }
         let sum = xxh64(&out, 0);
         out.extend_from_slice(&sum.to_le_bytes());
-        out
+        Ok(out)
+    }
+
+    /// The first rule of the fields' documentation the shader breaks, which `encode` and
+    /// `decode` refuse alike.
+    fn breach(&self) -> Option<&'static str> {
+        if let Some(heap) = &self.heap {
+            if heap.set != HEAP_SET {
+                return Some("a heap set other than HEAP_SET");
+            }
+            let twice = heap.arrays.iter().enumerate().any(|(at, array)| {
+                heap.arrays[..at].iter().any(|before| before.kind == array.kind)
+            });
+            if twice
+                || heap.arrays.iter().any(|array| array.binding != u32::from(kind_code(array.kind)))
+            {
+                return Some("a heap array of a kind twice, or at another binding than its kind's");
+            }
+        }
+        let ascending = self.constants.windows(2).all(|two| two[0].id < two[1].id);
+        if !ascending || self.constants.iter().any(|constant| !matches!(constant.bytes, 1 | 4)) {
+            return Some("constants out of ascending id order, or of a size other than 1 or 4");
+        }
+        if self.push_bytes > PUSH_BYTES_MAX {
+            return Some("a push block above PUSH_BYTES_MAX");
+        }
+        if self.stage != ShaderStage::Fragment && (self.inputs != 0 || self.outputs != 0) {
+            return Some("inputs or outputs outside the fragment stage");
+        }
+        None
     }
 
     /// Reads what [`encode`](Self::encode) wrote.
@@ -213,9 +254,6 @@ impl CookedShader {
                     _ => return Err(invalid("heap form")),
                 };
                 let set = reader.u32()?;
-                if set != HEAP_SET {
-                    return Err(invalid("heap set"));
-                }
                 let count = reader.len(9)?;
                 let mut arrays: Vec<HeapArray> = Vec::with_capacity(count);
                 for _ in 0..count {
@@ -226,11 +264,6 @@ impl CookedShader {
                     };
                     let binding = reader.u32()?;
                     let capacity = reader.u32()?;
-                    if binding != u32::from(kind_code(kind))
-                        || arrays.iter().any(|array| array.kind == kind)
-                    {
-                        return Err(invalid("heap array"));
-                    }
                     arrays.push(HeapArray { kind, binding, capacity });
                 }
                 Some(HeapUse { form, set, arrays })
@@ -240,12 +273,7 @@ impl CookedShader {
         let count = reader.len(8)?;
         let mut constants: Vec<ConstantSlot> = Vec::with_capacity(count);
         for _ in 0..count {
-            let constant = ConstantSlot { id: reader.u32()?, bytes: reader.u32()? };
-            let ascending = constants.last().is_none_or(|last| last.id < constant.id);
-            if !ascending || !matches!(constant.bytes, 1 | 4) {
-                return Err(invalid("constants"));
-            }
-            constants.push(constant);
+            constants.push(ConstantSlot { id: reader.u32()?, bytes: reader.u32()? });
         }
         let push_bytes = reader.u32()?;
         let inputs = reader.u32()?;
@@ -253,13 +281,12 @@ impl CookedShader {
         if !reader.bytes.is_empty() {
             return Err(invalid("trailing bytes"));
         }
-        if push_bytes > PUSH_BYTES_MAX {
-            return Err(invalid("push block"));
+        let shader =
+            Self { stage, target, entry, code, heap, constants, push_bytes, inputs, outputs };
+        match shader.breach() {
+            Some(what) => Err(invalid(what)),
+            None => Ok(shader),
         }
-        if stage != ShaderStage::Fragment && (inputs != 0 || outputs != 0) {
-            return Err(invalid("attachments outside the fragment stage"));
-        }
-        Ok(Self { stage, target, entry, code, heap, constants, push_bytes, inputs, outputs })
     }
 }
 
@@ -290,16 +317,22 @@ const fn kind_code(kind: HeapArrayKind) -> u8 {
     }
 }
 
-/// Writes a length as four little-endian bytes. A field of 4 GiB or more is no shader the
-/// cooker writes.
-fn put_len(out: &mut Vec<u8>, len: usize) {
-    let len = u32::try_from(len).expect("a cooked shader's field is under 4 GiB");
+/// Writes a length as four little-endian bytes, or refuses `what` at 4 GiB or more.
+fn put_len(out: &mut Vec<u8>, len: usize, what: &str) -> Result<()> {
+    let len = u32::try_from(len).map_err(|_| {
+        Error::new(
+            ErrorKind::InvalidData,
+            format!("cooked shader to encode: {what} of 4 GiB or more"),
+        )
+    })?;
     out.extend_from_slice(&len.to_le_bytes());
+    Ok(())
 }
 
-fn put_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
-    put_len(out, bytes.len());
+fn put_bytes(out: &mut Vec<u8>, bytes: &[u8], what: &str) -> Result<()> {
+    put_len(out, bytes.len(), what)?;
     out.extend_from_slice(bytes);
+    Ok(())
 }
 
 /// Reads little-endian fields from the front of a byte slice, refusing a short one.

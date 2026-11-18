@@ -8,7 +8,7 @@
 use std::fmt::{Debug, Display};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use lactose_core::{ErrorKind, Result};
 
@@ -31,6 +31,37 @@ pub(super) type Body = fn(&Ctx<'_>) -> core::result::Result<(), &'static str>;
 /// How long a case waits for a point it expects to be reached. Long beside any backend's
 /// work, so a loaded machine does not fail a case; a point that is never reached fails it.
 pub(super) const PATIENCE: Duration = Duration::from_secs(20);
+
+/// The timeout of a wait a case expects another call to wake: long, so that a wait that
+/// misses its wake shows as a wait to its end.
+pub(super) const LONG: Duration = Duration::from_secs(60);
+
+/// How long a woken wait may take to return once the call that wakes it has been made: far
+/// under [`LONG`] however loaded the machine, so a missed wake fails the case with a message
+/// rather than passing late.
+pub(super) const WOKEN: Duration = Duration::from_secs(10);
+
+/// The head start a waiter is given before the call that should wake it.
+pub(super) const HEAD: Duration = Duration::from_millis(100);
+
+/// Runs `wait` on a thread, gives it [`HEAD`], runs `wake`, and returns what `wait` returned
+/// and how long after `wake` began it returned.
+pub(super) fn woken<T: Send>(
+    wait: impl FnOnce() -> T + Send,
+    wake: impl FnOnce(),
+) -> (T, Duration) {
+    std::thread::scope(|scope| {
+        let waiter = scope.spawn(move || {
+            let out = wait();
+            (out, Instant::now())
+        });
+        std::thread::sleep(HEAD);
+        let woke = Instant::now();
+        wake();
+        let (out, at) = waiter.join().unwrap_or_else(|_| panic!("a waiter panicked"));
+        (out, at.saturating_duration_since(woke))
+    })
+}
 
 /// The extent of the images the cases render into.
 pub(super) const EXTENT: Extent = Extent { width: 64, height: 64 };
@@ -124,6 +155,12 @@ impl<'a> Ctx<'a> {
             "the device reports the set it was made for",
         );
         device
+    }
+
+    /// A device with no surface, started from `cache`.
+    pub(super) fn cached(&self, cache: Vec<u8>, what: &str) -> Box<dyn Device> {
+        let sink: Arc<dyn MessageSink> = self.sink.clone();
+        self.ok(self.harness.device_with_cache(&self.set, sink, cache), what)
     }
 
     /// A device with a surface, or why the run has none.

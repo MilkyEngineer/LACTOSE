@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 
 use lactose_core::ErrorKind;
 
-use super::kit::{Body, Ctx, buffer_to, clear};
+use super::kit::{Body, Ctx, LONG, WOKEN, buffer_to, clear, woken};
 use crate::{
     BufferState, BufferUsage, Encoder, Format, ImageState, IndexedIndirectArgs, MemoryClass,
     PassReach, QueuePath, QueueRole, Submit, TimelinePoint, WriteMask,
@@ -19,6 +19,7 @@ pub(super) const BODIES: &[(&str, Body)] = &[
     ("submit_to_the_present_role_is_refused", submit_to_the_present_role_is_refused),
     ("loss_is_returned_and_stays", loss_is_returned_and_stays),
     ("waits_return_at_once_after_a_loss", waits_return_at_once_after_a_loss),
+    ("wait_is_woken_by_a_loss", wait_is_woken_by_a_loss),
     ("teardown_succeeds_after_a_loss", teardown_succeeds_after_a_loss),
     ("clean_run_sends_no_message", clean_run_sends_no_message),
 ];
@@ -176,6 +177,29 @@ fn waits_return_at_once_after_a_loss(ctx: &Ctx<'_>) -> Applies {
         ErrorKind::DeviceLost,
         "a wait for a point never reached",
     );
+    Ok(())
+}
+
+/// A loss wakes a wait for a point no one will reach: it returns `DeviceLost` at once.
+fn wait_is_woken_by_a_loss(ctx: &Ctx<'_>) -> Applies {
+    let device = ctx.device();
+    let never = ctx.point(&*device, 1);
+    let mut lost = Ok(());
+    let (returned, after) = woken(
+        || device.wait_timeline(never, LONG),
+        || {
+            lost = ctx.lose(&*device);
+            if lost.is_err() {
+                // The harness cannot lose a device: the waiter is let go at once.
+                ctx.ok(device.signal_timeline(never), "the host signal that ends the wait");
+            }
+        },
+    );
+    lost?;
+    ctx.fails(returned, ErrorKind::DeviceLost, "a wait the loss ends");
+    if after >= WOKEN {
+        ctx.fail(format_args!("the wait returned {after:?} after the loss"));
+    }
     Ok(())
 }
 

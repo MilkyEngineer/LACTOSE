@@ -4,11 +4,11 @@ use std::time::Instant;
 
 use lactose_core::Result;
 
-use super::kit::{Body, Ctx, EXTENT, PATIENCE, buffer_to, clear, image_to};
+use super::kit::{Body, Ctx, EXTENT, PATIENCE, attachment, begin, buffer_to, clear, image_to};
 use crate::{
     Acquired, BufferCopy, BufferState, BufferUsage, Device, Encoder, Extent, ImageHandle,
-    ImageState, MemoryClass, Presented, QueuePath, QueueRole, Rule, Submit, Swapchain,
-    SwapchainDesc, TimelinePoint,
+    ImageState, Load, MemoryClass, PassReach, Presented, QueuePath, QueueRole, Rule, Store, Submit,
+    Swapchain, SwapchainDesc, TimelinePoint,
 };
 
 type Applies = core::result::Result<(), &'static str>;
@@ -230,6 +230,28 @@ fn swapchain_image_used_outside_its_acquire_is_refused(ctx: &Ctx<'_>) -> Applies
         present(&mut *swapchain, second, &mut encoders, &[], &[]),
         "a frame that draws into the image of before",
     );
+    // A transition of the image of before alone, and a pass over it with no transition.
+    let mut transition = ctx.encoder(&*device, P);
+    transition.transition_images(&[image_to(
+        first,
+        ImageState::Present,
+        ImageState::ColourAttachment,
+        P,
+    )]);
+    let mut pass = ctx.encoder(&*device, P);
+    begin(
+        &mut *pass,
+        &[attachment(first, Load::Clear([0.0; 4]), Store::Store, false)],
+        PassReach::NOTHING,
+    );
+    pass.end_pass();
+    for (encoder, what) in [
+        (transition, "a transition of the image of before"),
+        (pass, "a pass over the image of before"),
+    ] {
+        let mut encoders = [encoder, frame(ctx, &*device, &[second])];
+        ctx.refused(present(&mut *swapchain, second, &mut encoders, &[], &[]), what);
+    }
     show(ctx, &*device, &mut *swapchain, second);
     Ok(())
 }

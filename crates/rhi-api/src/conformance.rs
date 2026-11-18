@@ -98,6 +98,21 @@ pub trait Harness {
         presents: bool,
     ) -> Result<Box<dyn Device>>;
 
+    /// A new device as [`device`](Self::device) makes with no surface, whose request's
+    /// `pipeline_cache` is `cache`: the bytes another device's `pipeline_cache` returned,
+    /// or bytes that fail its checks.
+    ///
+    /// # Errors
+    ///
+    /// What the backend's constructor returns, which bytes that fail a check never make it
+    /// return.
+    fn device_with_cache(
+        &self,
+        set: &Capabilities,
+        messages: Arc<dyn MessageSink>,
+        cache: Vec<u8>,
+    ) -> Result<Box<dyn Device>>;
+
     /// Whether the backend's devices produce output. `false` for null, and [`run`] then
     /// skips every output case.
     fn renders(&self) -> bool;
@@ -255,6 +270,7 @@ pub const CASES: &[Case] = cases! {
     contract "shared_and_discarded_resources_cross_without_a_transfer";
     contract "roles_on_one_queue_need_no_transfer";
     contract "image_taken_while_another_queue_reads_it_is_refused" => Queue;
+    contract "read_of_contents_left_undefined_is_refused" => UndefinedRead;
     output "ownership_transfer_keeps_the_contents";
     // The heap, the sampler table and what a pass declares.
     contract "heap_slot_outside_the_heap_is_refused" => Bounds everywhere;
@@ -269,6 +285,7 @@ pub const CASES: &[Case] = cases! {
     contract "undeclared_slot_argument_is_refused" => Undeclared everywhere;
     contract "undeclared_address_argument_is_refused" => Undeclared everywhere;
     contract "declared_buffer_in_another_state_is_refused" => State;
+    contract "buffer_declared_in_two_states_is_refused" => State everywhere;
     contract "sampler_table_is_bounded";
     output "heap_is_sampled_past_slot_zero";
     output "address_is_read_in_a_shader";
@@ -292,6 +309,7 @@ pub const CASES: &[Case] = cases! {
     // Encoders, submits and timelines.
     contract "encoder_recorded_on_another_thread_submits";
     contract "encoder_reset_while_pending_is_refused" => Pending everywhere;
+    contract "pending_encoder_drop_waits_for_its_submit";
     contract "encoder_in_two_submits_is_refused" => Encoding everywhere;
     contract "encoder_resubmitted_without_reset_is_refused" => Encoding everywhere;
     contract "recording_while_pending_records_nothing";
@@ -308,6 +326,8 @@ pub const CASES: &[Case] = cases! {
     contract "dispatch_beyond_the_group_limit_is_refused" => Bounds everywhere;
     contract "timeline_is_signalled_waited_and_read_by_the_host";
     contract "timeline_wait_times_out";
+    contract "waits_are_woken_by_the_submit_that_reaches_them";
+    contract "wait_is_woken_by_a_host_signal";
     contract "timeline_value_that_does_not_grow_is_refused" => Timeline everywhere;
     contract "host_signal_above_a_pending_signal_is_refused" => Timeline everywhere;
     contract "host_signal_below_a_promise_that_does_not_wait_for_it_is_refused" => Timeline everywhere;
@@ -362,6 +382,7 @@ pub const CASES: &[Case] = cases! {
     // Device loss and messages.
     contract "loss_is_returned_and_stays";
     contract "waits_return_at_once_after_a_loss";
+    contract "wait_is_woken_by_a_loss";
     contract "teardown_succeeds_after_a_loss";
     contract "clean_run_sends_no_message";
     output "each_validator_reports_its_canary";

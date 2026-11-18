@@ -1,13 +1,13 @@
 //! States and queues.
 
 use super::kit::{
-    Body, Ctx, EXTENT, buffer_across, buffer_to, clear, image_across, image_desc, image_to,
-    whole_image,
+    Body, Ctx, EXTENT, attachment, begin, buffer_across, buffer_to, clear, compute_pass,
+    image_across, image_desc, image_to, whole_image,
 };
 use crate::{
-    BufferCopy, BufferHandle, BufferImageCopy, BufferState, BufferUsage, Device, Encoder, Extent,
-    Format, ImageHandle, ImageRange, ImageState, ImageUsage, MemoryClass, QueuePath, QueueRole,
-    Rect, Rule, Sharing, Submit,
+    BufferCopy, BufferHandle, BufferImageCopy, BufferReach, BufferState, BufferUsage, Device,
+    Encoder, Extent, Format, ImageHandle, ImageRange, ImageState, ImageUsage, Load, MemoryClass,
+    PassReach, QueuePath, QueueRole, Rect, Rule, Sharing, Store, Submit,
 };
 
 type Applies = Result<(), &'static str>;
@@ -39,6 +39,7 @@ pub(super) const BODIES: &[(&str, Body)] = &[
         "image_taken_while_another_queue_reads_it_is_refused",
         image_taken_while_another_queue_reads_it_is_refused,
     ),
+    ("read_of_contents_left_undefined_is_refused", read_of_contents_left_undefined_is_refused),
 ];
 
 const G: QueueRole = QueueRole::Graphics;
@@ -131,11 +132,33 @@ fn use_in_another_state_is_refused(ctx: &Ctx<'_>) -> Applies {
     )]);
     encoder.copy_image_to_buffer(image, readback, &[whole_image()]);
     ctx.refused(submit(&*device, G, &mut [encoder]), "a copy from an image in `SampledRead`");
+    super::passes::index_and_indirect_in_another_state(ctx, &*device);
     Ok(())
 }
 
 fn use_after_a_write_without_a_transition_is_refused(ctx: &Ctx<'_>) -> Applies {
     let device = ctx.device();
+    // A `ShaderWrite` reach is a write: a second pass that writes the buffer needs a
+    // transition before it.
+    let data = ctx.buffer(&*device, SIZE, BufferUsage::DEVICE_ADDRESS, MemoryClass::Device);
+    let compute = ctx.compute(&*device);
+    let reach = [BufferReach { buffer: data, state: BufferState::ShaderWrite }];
+    let mut encoder = ctx.encoder(&*device, G);
+    encoder.transition_buffers(&[buffer_to(
+        data,
+        BufferState::Undefined,
+        BufferState::ShaderWrite,
+        G,
+    )]);
+    for _ in 0..2 {
+        compute_pass(&mut *encoder, compute, PassReach { slots: &[], buffers: &reach });
+        encoder.dispatch([1, 1, 1]);
+        encoder.end_pass();
+    }
+    ctx.refused(
+        submit(&*device, G, &mut [encoder]),
+        "two passes that write a buffer through a reach, with no transition between",
+    );
     let image = ctx.target(&*device);
     let pipeline = ctx.plain(&*device);
     let mut encoder = ctx.encoder(&*device, G);
@@ -528,6 +551,19 @@ fn image_taken_while_another_queue_reads_it_is_refused(ctx: &Ctx<'_>) -> Applies
     reader.copy_image_to_buffer(image, readback, &[whole_image()]);
     let mut readers = [reader];
     let gate = ctx.held(&*device, C, &mut readers);
+    // A buffer's take is checked as an image's is: the buffer the reader writes.
+    let mut buffer_taker = ctx.encoder(&*device, G);
+    buffer_taker.transition_buffers(&[buffer_to(
+        readback,
+        BufferState::Undefined,
+        BufferState::CopyDestination,
+        G,
+    )]);
+    let mut buffer_takers = [buffer_taker];
+    ctx.refused(
+        submit(&*device, G, &mut buffer_takers),
+        "a buffer's take with no wait for the other queue's writer",
+    );
     let mut taker = ctx.encoder(&*device, G);
     taker.transition_images(&[image_to(
         image,
@@ -540,9 +576,84 @@ fn image_taken_while_another_queue_reads_it_is_refused(ctx: &Ctx<'_>) -> Applies
         submit(&*device, G, &mut takers),
         "a take with no wait for the other queue's reader",
     );
+    ctx.submit(&*device, G, &mut buffer_takers, &[gate.done], &[]);
     let done = ctx.point(&*device, 1);
     ctx.submit(&*device, G, &mut takers, &[gate.done], &[done]);
     gate.open(ctx, &*device);
     ctx.reached(&*device, done);
+    Ok(())
+}
+
+/// Contents are undefined after a transition from `Undefined`, a store of `DontCare`, and,
+/// for a buffer, a take from `Undefined` onto another queue: a read of them is refused.
+fn read_of_contents_left_undefined_is_refused(ctx: &Ctx<'_>) -> Applies {
+    let device = ctx.device();
+    // An image transitioned from `Undefined` has lost its contents: a history resource.
+    let image = ctx.target(&*device);
+    let mut encoder = ctx.encoder(&*device, G);
+    clear(&mut *encoder, image, None);
+    encoder.transition_images(&[image_to(
+        image,
+        ImageState::Undefined,
+        ImageState::ColourAttachment,
+        G,
+    )]);
+    begin(&mut *encoder, &[attachment(image, Load::Keep, Store::Store, false)], PassReach::NOTHING);
+    encoder.end_pass();
+    ctx.refused(
+        submit(&*device, G, &mut [encoder]),
+        "a load of an image after a transition from Undefined",
+    );
+    // A store of `DontCare` leaves the contents undefined.
+    let image = ctx.target(&*device);
+    let mut encoder = ctx.encoder(&*device, G);
+    encoder.transition_images(&[image_to(
+        image,
+        ImageState::Undefined,
+        ImageState::ColourAttachment,
+        G,
+    )]);
+    begin(
+        &mut *encoder,
+        &[attachment(image, Load::Clear([0.0; 4]), Store::DontCare, false)],
+        PassReach::NOTHING,
+    );
+    encoder.end_pass();
+    encoder.transition_images(&[image_to(
+        image,
+        ImageState::ColourAttachment,
+        ImageState::ColourAttachment,
+        G,
+    )]);
+    begin(&mut *encoder, &[attachment(image, Load::Keep, Store::Store, false)], PassReach::NOTHING);
+    encoder.end_pass();
+    ctx.refused(submit(&*device, G, &mut [encoder]), "a load after a store of DontCare");
+    // A buffer taken from `Undefined` onto another queue has lost its contents; on its own
+    // queue it keeps them ("States").
+    if ctx.set.queues.compute != QueuePath::Own {
+        return Ok(());
+    }
+    let source = ctx.upload(&*device, BufferUsage::EMPTY, &[1; SIZE as usize]);
+    let usage = BufferUsage::COPY_SOURCE.union(BufferUsage::COPY_DESTINATION);
+    let data = ctx.buffer(&*device, SIZE, usage, MemoryClass::Device);
+    let region = [BufferCopy { source_offset: 0, destination_offset: 0, size: SIZE }];
+    let mut encoder = ctx.encoder(&*device, G);
+    encoder.transition_buffers(&[
+        buffer_to(source, BufferState::Undefined, BufferState::CopySource, G),
+        buffer_to(data, BufferState::Undefined, BufferState::CopyDestination, G),
+    ]);
+    encoder.copy_buffer(source, data, &region);
+    run(ctx, &*device, G, &mut [encoder]);
+    let readback = ctx.buffer(&*device, SIZE, BufferUsage::COPY_DESTINATION, MemoryClass::Readback);
+    let mut encoder = ctx.encoder(&*device, C);
+    encoder.transition_buffers(&[
+        buffer_across(data, (BufferState::Undefined, C), (BufferState::CopySource, C)),
+        buffer_to(readback, BufferState::Undefined, BufferState::CopyDestination, C),
+    ]);
+    encoder.copy_buffer(data, readback, &region);
+    ctx.refused(
+        submit(&*device, C, &mut [encoder]),
+        "a copy from a buffer taken from Undefined onto another queue",
+    );
     Ok(())
 }

@@ -171,20 +171,26 @@ pub struct CacheIdentity<'a>(pub &'a [u8]);
 /// Frames a driver's cache payload as the bytes
 /// [`Device::pipeline_cache`](crate::Device::pipeline_cache) returns: a magic number, a
 /// version, the identity, the payload's length, the payload, and a checksum over all of
-/// it. For backends.
-#[must_use]
-pub fn seal_cache(identity: CacheIdentity<'_>, payload: &[u8]) -> Vec<u8> {
+/// it. For backends. [`open_cache`] reads every cache this seals.
+///
+/// # Errors
+///
+/// `ErrorKind::InvalidData` for an identity of 4 GiB or more, which the framing's
+/// four-byte length cannot hold.
+pub fn seal_cache(identity: CacheIdentity<'_>, payload: &[u8]) -> Result<Vec<u8>> {
+    let identity_len = u32::try_from(identity.0.len()).map_err(|_| {
+        Error::new(ErrorKind::InvalidData, "sealed cache: an identity of 4 GiB or more")
+    })?;
     let mut out = Vec::with_capacity(CACHE_MAGIC.len() + 24 + identity.0.len() + payload.len());
     out.extend_from_slice(&CACHE_MAGIC);
     out.extend_from_slice(&CACHE_VERSION.to_le_bytes());
-    let identity_len = u32::try_from(identity.0.len()).expect("an identity is under 4 GiB");
     out.extend_from_slice(&identity_len.to_le_bytes());
     out.extend_from_slice(identity.0);
     out.extend_from_slice(&(payload.len() as u64).to_le_bytes());
     out.extend_from_slice(payload);
     let sum = xxh64(&out, 0);
     out.extend_from_slice(&sum.to_le_bytes());
-    out
+    Ok(out)
 }
 
 /// The first bytes of a sealed cache.

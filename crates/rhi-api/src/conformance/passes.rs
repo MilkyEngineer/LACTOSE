@@ -7,7 +7,7 @@ use super::kit::{
 use crate::{
     BufferCopy, BufferHandle, BufferState, BufferUsage, ColourAttachment, Device, Encoder, Extent,
     Format, GraphicsPipelineHandle, ImageHandle, ImageState, ImageUsage, IndexedIndirectArgs, Load,
-    MemoryClass, PassReach, QueueRole, Rect, Store, Submit, Viewport, WriteMask,
+    MemoryClass, PassReach, QueueRole, Rect, Rule, Store, Submit, Viewport, WriteMask,
 };
 
 type Applies = Result<(), &'static str>;
@@ -412,4 +412,38 @@ fn dispatch_beyond_the_group_limit_is_refused(ctx: &Ctx<'_>) -> Applies {
     encoder.end_pass();
     run(ctx, &*device, &mut [encoder]);
     Ok(())
+}
+
+/// The sub-checks of `use_in_another_state_is_refused` for what a draw or dispatch names
+/// alone: an index buffer, and indirect arguments for a draw and for a dispatch, each in
+/// `CopyDestination`. Synchronisation validation tracks neither, so `state` is their one
+/// guard.
+pub(super) fn index_and_indirect_in_another_state(ctx: &Ctx<'_>, device: &dyn Device) {
+    let indices = device_buffer(ctx, device, BufferUsage::INDEX, BufferState::Index);
+    let wrong = device_buffer(ctx, device, BufferUsage::INDEX, BufferState::CopyDestination);
+    let draw = |encoder: &mut dyn Encoder| {
+        encoder.bind_index_buffer(wrong, 0);
+        encoder.draw_indexed(0..3, 0, 0..1);
+    };
+    ctx.refused_by(indexed(ctx, device, &draw), Rule::State, "an index buffer in CopyDestination");
+    let wrong = device_buffer(ctx, device, BufferUsage::INDIRECT, BufferState::CopyDestination);
+    let draw = |encoder: &mut dyn Encoder| {
+        encoder.bind_index_buffer(indices, 0);
+        encoder.draw_indexed_indirect(wrong, 0, 1, 0);
+    };
+    ctx.refused_by(
+        indexed(ctx, device, &draw),
+        Rule::State,
+        "an indirect draw's arguments in CopyDestination",
+    );
+    let pipeline = ctx.compute(device);
+    let mut encoder = ctx.encoder(device, G);
+    compute_pass(&mut *encoder, pipeline, PassReach::NOTHING);
+    encoder.dispatch_indirect(wrong, 0);
+    encoder.end_pass();
+    ctx.refused_by(
+        submit(device, &mut [encoder]),
+        Rule::State,
+        "an indirect dispatch's arguments in CopyDestination",
+    );
 }

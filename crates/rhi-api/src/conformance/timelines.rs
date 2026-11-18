@@ -4,7 +4,7 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use super::kit::{Body, Ctx, PATIENCE, buffer_to, clear, image_desc};
+use super::kit::{Body, Ctx, HEAD, LONG, PATIENCE, WOKEN, buffer_to, clear, image_desc, woken};
 use crate::{
     BufferCopy, BufferHandle, BufferState, BufferUsage, Device, Encoder, Format, ImageUsage,
     MemoryClass, QueuePath, QueueRole, Rule, Sharing, Submit, TimelineHandle, TimelinePoint,
@@ -18,6 +18,11 @@ pub(super) const BODIES: &[(&str, Body)] = &[
         timeline_is_signalled_waited_and_read_by_the_host,
     ),
     ("timeline_wait_times_out", timeline_wait_times_out),
+    (
+        "waits_are_woken_by_the_submit_that_reaches_them",
+        waits_are_woken_by_the_submit_that_reaches_them,
+    ),
+    ("wait_is_woken_by_a_host_signal", wait_is_woken_by_a_host_signal),
     ("timeline_value_that_does_not_grow_is_refused", timeline_value_that_does_not_grow_is_refused),
     (
         "host_signal_above_a_pending_signal_is_refused",
@@ -226,6 +231,20 @@ fn host_signal_above_a_pending_signal_is_refused(ctx: &Ctx<'_>) -> Applies {
     ctx.ok(device.signal_timeline(gate), "the gate's host signal");
     ctx.reached(&*device, at(timeline, 4));
     ctx.ok(device.signal_timeline(at(timeline, 5)), "the host signal once the promise is kept");
+    // A submit that waits on the timeline it signals: a host signal at or above its promise
+    // is refused even though it would release that submit.
+    let timeline = ctx.timeline(&*device, 0);
+    ctx.submit(&*device, G, &mut [], &[at(timeline, 1)], &[at(timeline, 4)]);
+    ctx.refused(
+        device.signal_timeline(at(timeline, 5)),
+        "a host signal above the promise of a submit it releases",
+    );
+    ctx.refused(
+        device.signal_timeline(at(timeline, 4)),
+        "a host signal of the promise of a submit it releases",
+    );
+    ctx.ok(device.signal_timeline(at(timeline, 1)), "the host signal the submit waits for");
+    ctx.reached(&*device, at(timeline, 4));
     Ok(())
 }
 
@@ -571,6 +590,52 @@ fn submits_racing_on_one_queue_keep_their_order(ctx: &Ctx<'_>) -> Applies {
     Ok(())
 }
 
+/// Two waiters on two timelines are woken by the one submit that reaches both points: a
+/// backend wakes every waiter a submit concerns, not one of them.
+fn waits_are_woken_by_the_submit_that_reaches_them(ctx: &Ctx<'_>) -> Applies {
+    let device = ctx.device();
+    let points = [ctx.point(&*device, 1), ctx.point(&*device, 1)];
+    let device: &dyn Device = &*device;
+    let returned = thread::scope(|scope| {
+        let waiters = points
+            .map(|point| scope.spawn(move || (device.wait_timeline(point, LONG), Instant::now())));
+        thread::sleep(HEAD);
+        let woke = Instant::now();
+        ctx.submit(device, G, &mut [], &[], &points);
+        waiters.map(|waiter| {
+            let (reached, at) = waiter.join().unwrap_or_else(|_| ctx.fail("a waiter panicked"));
+            (reached, at.saturating_duration_since(woke))
+        })
+    });
+    for (reached, after) in returned {
+        ctx.check(matches!(reached, Ok(true)), "a waiter's point is reached");
+        if after >= WOKEN {
+            ctx.fail(format_args!("a waiter returned {after:?} after the submit that reached it"));
+        }
+    }
+    Ok(())
+}
+
+fn wait_is_woken_by_a_host_signal(ctx: &Ctx<'_>) -> Applies {
+    let device = ctx.device();
+    let point = ctx.point(&*device, 1);
+    let (reached, after) = woken(
+        || device.wait_timeline(point, LONG),
+        || {
+            ctx.ok(device.signal_timeline(point), "the host signal");
+        },
+    );
+    ctx.check(matches!(reached, Ok(true)), "the waiter's point is reached");
+    if after >= WOKEN {
+        ctx.fail(format_args!("the wait returned {after:?} after the host signal"));
+    }
+    Ok(())
+}
+
+/// Two host signals race on one timeline. On null the two holds of a host signal are a few
+/// instructions apart, so the case meets the two orders one after the other, and a signal
+/// landing between the other's holds is held by null's fixed interleaving of it; a device
+/// backend's driver call widens that window, and its own unit tests fix it ("Threads").
 fn host_signals_racing_on_one_timeline_keep_it_growing(ctx: &Ctx<'_>) -> Applies {
     let device = ctx.device();
     for round in 0..ROUNDS as u64 {
@@ -665,6 +730,14 @@ fn destroyed_after_recording_is_refused_at_submit(ctx: &Ctx<'_>) -> Applies {
 
 fn handle_of_another_device_is_refused(ctx: &Ctx<'_>) -> Applies {
     let device = ctx.device();
+    // The same kinds made on `device` first: where a backend numbers each device's handles
+    // alike, each foreign handle lands on a live index and is refused by more than its
+    // index.
+    let own_buffer = ctx.buffer(&*device, SIZE, BufferUsage::COPY_SOURCE, MemoryClass::Upload);
+    let own_image = ctx
+        .image(&*device, &image_desc(Format::Rgba8Unorm, super::kit::EXTENT, ImageUsage::SAMPLED));
+    let own_timeline = ctx.timeline(&*device, 0);
+    let own_pipeline = ctx.compute(&*device);
     let other = ctx.device();
     let buffer = ctx.buffer(&*other, SIZE, BufferUsage::COPY_SOURCE, MemoryClass::Upload);
     let image = ctx
@@ -682,5 +755,9 @@ fn handle_of_another_device_is_refused(ctx: &Ctx<'_>) -> Applies {
     let mut encoder = ctx.encoder(&*device, G);
     copy(&mut *encoder, buffer, destination);
     ctx.refused(submit(&*device, G, &mut [encoder], &[], &[]), "another device's buffer recorded");
+    ctx.ok(device.destroy_buffer(own_buffer), "the device's own buffer");
+    ctx.ok(device.destroy_image(own_image), "the device's own image");
+    ctx.ok(device.destroy_timeline(own_timeline), "the device's own timeline");
+    ctx.ok(device.destroy_compute_pipeline(own_pipeline), "the device's own pipeline");
     Ok(())
 }

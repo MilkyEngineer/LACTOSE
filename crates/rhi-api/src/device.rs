@@ -86,10 +86,10 @@ pub trait Device: Send + Sync {
     /// what completed submits wrote once
     /// [`invalidate_buffer`](Self::invalidate_buffer) has covered it. The buffer is in
     /// `HostRead`. A call while a pending submit writes the buffer, by a copy into it or
-    /// a pass that declares it `ShaderWrite`, is refused on every backend
-    /// ([`Rule::Pending`](crate::Rule::Pending)): the bytes lent are never ones the device
-    /// may be writing. Overlap, bounds and a submit made during the call are as
-    /// [`write_buffer`](Self::write_buffer)'s.
+    /// a pass that declares it `ShaderWrite`, or moves it into `HostRead`, is refused on
+    /// every backend ([`Rule::Pending`](crate::Rule::Pending)): the bytes lent are never
+    /// ones the device may be writing. Overlap, bounds and a submit made during the call
+    /// are as [`write_buffer`](Self::write_buffer)'s.
     fn read_buffer(
         &self,
         buffer: BufferHandle,
@@ -105,7 +105,10 @@ pub trait Device: Send + Sync {
 
     /// Makes the device's writes to a range visible to the host. Called after the submit
     /// that wrote it completes and before the read; it does nothing where
-    /// [`coherent_host_memory`](Capabilities::coherent_host_memory) is reported.
+    /// [`coherent_host_memory`](Capabilities::coherent_host_memory) is reported. A call
+    /// while a pending submit writes the buffer or moves it into `HostRead` is refused on
+    /// every backend ([`Rule::Pending`](crate::Rule::Pending)): it would be taken for the
+    /// invalidate after the write.
     fn invalidate_buffer(&self, buffer: BufferHandle, offset: u64, len: u64) -> Result<()>;
 
     /// Makes an image, every subresource
