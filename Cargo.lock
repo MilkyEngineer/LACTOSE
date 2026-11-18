@@ -718,6 +718,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "lactose-renderer"
+version = "0.0.0"
+dependencies = [
+ "lactose-asset-api",
+ "lactose-core",
+ "lactose-ecs",
+ "lactose-input-host",
+ "lactose-math",
+ "lactose-present-api",
+ "lactose-render-graph",
+ "lactose-rhi-api",
+ "lactose-sim",
+ "lactose-task",
+]
+
+[[package]]
 name = "lactose-rhi-api"
 version = "0.0.0"
 dependencies = [

@@ -40,6 +40,8 @@ lactose-present-api = { path = "crates/present-api" }
 game-sim = { path = "game/game-sim" }
 lactose-rhi-api = { path = "crates/rhi-api" }
 lactose-render-graph = { path = "crates/render-graph" }
+lactose-renderer = { path = "crates/renderer" }
+lactose-input-host = { path = "crates/input-host" }
 
 # Third-party crates. Cargo.lock pins the exact versions; docs/verification.md lists the
 # claims that are re-checked against those versions.
