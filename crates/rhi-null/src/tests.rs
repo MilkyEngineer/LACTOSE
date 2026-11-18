@@ -540,6 +540,118 @@ fn the_last_drop_of_a_device_waits_for_its_pending_submits() {
     returned.recv_timeout(WOKEN).expect("the last drop once the device is lost");
 }
 
+/// Only the last of the device and the encoders and swapchain it made waits. With a submit
+/// held by a point no one signals, the device's drop returns at once while a swapchain, or an
+/// encoder, still holds the device; that holder's drop, now the last, waits until the device
+/// is lost. The loss is made on a thread of its own: a last drop that keeps the records would
+/// hold it for good.
+#[test]
+fn a_drop_that_is_not_the_last_returns_at_once() {
+    for holder in ["swapchain", "encoder"] {
+        let held = device(QueueLayout::SEVERAL, true);
+        let control = held.control();
+        let gate = at(held.create_timeline(0).expect("a timeline"), 1);
+        submit(&held, G, &[gate], &[]).expect("a held submit");
+        let keep: Box<dyn std::any::Any + Send> = if holder == "swapchain" {
+            Box::new(swapchain(&held).0)
+        } else {
+            Box::new(held.create_encoder(G, "kept").expect("an encoder"))
+        };
+        let returned = dropped(move || drop(held));
+        returned.recv_timeout(WOKEN).unwrap_or_else(|_| {
+            panic!("{holder}: the device's drop waited while the {holder} still held the device")
+        });
+        let returned = dropped(move || drop(keep));
+        assert!(
+            returned.recv_timeout(HELD).is_err(),
+            "{holder}: the last drop, the {holder}'s, returned with a submit held"
+        );
+        let (sender, lost) = mpsc::channel();
+        std::thread::spawn(move || sender.send(control.lose()).ok());
+        let lost = lost.recv_timeout(WOKEN).unwrap_or_else(|_| {
+            panic!("{holder}: a loss could not take the records: the last drop holds them")
+        });
+        assert!(lost, "{holder}: the device is still there");
+        returned
+            .recv_timeout(WOKEN)
+            .unwrap_or_else(|_| panic!("{holder}: the last drop once the device is lost"));
+    }
+}
+
+/// A drop made while its thread unwinds a panic does not wait, whether it is the last of the
+/// device and its encoders and swapchain, a pending encoder's, or a swapchain's with a present
+/// pending. Each holder is dropped by a thread that panics with a submit held or lagging; a
+/// guard declared first, and so dropped last, reports that the unwind got past the holder's
+/// drop.
+#[test]
+fn a_drop_while_unwinding_does_not_wait() {
+    struct Sent(mpsc::Sender<()>);
+    impl Drop for Sent {
+        fn drop(&mut self) {
+            self.0.send(()).ok();
+        }
+    }
+    for holder in ["device", "encoder", "swapchain", "pending encoder", "pending present"] {
+        let held = device(QueueLayout::SEVERAL, true);
+        let control = held.control();
+        let gate = at(held.create_timeline(0).expect("a timeline"), 1);
+        let mut kept_device = None;
+        let mut kept_encoders = None;
+        let unwound: Box<dyn std::any::Any + Send> = match holder {
+            "device" => {
+                submit(&held, G, &[gate], &[]).expect("a held submit");
+                Box::new(held)
+            }
+            "encoder" | "swapchain" => {
+                submit(&held, G, &[gate], &[]).expect("a held submit");
+                let last: Box<dyn std::any::Any + Send> = if holder == "encoder" {
+                    Box::new(held.create_encoder(G, "kept").expect("an encoder"))
+                } else {
+                    Box::new(swapchain(&held).0)
+                };
+                dropped(move || drop(held)).recv_timeout(WOKEN).unwrap_or_else(|_| {
+                    panic!("{holder}: the device's drop, not the last, waited")
+                });
+                last
+            }
+            "pending present" => {
+                let (mut swapchain, image) = swapchain(&held);
+                lag(&held, true);
+                let mut encoders = [frame(&held, image)];
+                present(&mut *swapchain, &mut encoders, image, &[])
+                    .expect("a present with its submit lagging");
+                kept_encoders = Some(encoders);
+                kept_device = Some(held);
+                Box::new(swapchain)
+            }
+            _ => {
+                let mut encoders = [held.create_encoder(G, "pending").expect("an encoder")];
+                held.submit(G, Submit { encoders: &mut encoders, waits: &[gate], signals: &[] })
+                    .expect("a held submit");
+                let [encoder] = encoders;
+                kept_device = Some(held);
+                Box::new(encoder)
+            }
+        };
+        let (sender, receiver) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _sent = Sent(sender);
+            let _unwound = unwound;
+            panic!("unwinding past a {holder}'s drop");
+        });
+        let returned = receiver.recv_timeout(WOKEN).is_ok();
+        if !returned {
+            let _ = control.lose();
+        }
+        assert!(returned, "{holder}: a drop made while unwinding waited for a held submit");
+        if let Some(device) = kept_device {
+            device.signal_timeline(gate).expect("the gate");
+            lag(&device, false);
+            drop(kept_encoders);
+        }
+    }
+}
+
 /// Two host signals of one timeline, each landed between the other's two holds round after
 /// round: the one that lands is refused (`timeline`), the other is accepted, and the
 /// timeline ends at its value. The conformance case races the two on threads, where null's

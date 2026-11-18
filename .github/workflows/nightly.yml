@@ -69,19 +69,22 @@ jobs:
             key: net-host
             args: '-p lactose-net-host --test integration -- interpolation::'
           # The null RHI backend's threads: its races, its drops that wait for a pending submit
-          # and its wakes. As one job it took 28 minutes on a loaded M1, too near the timeout on
+          # and its wakes. As one job it took 24 minutes on a loaded M1, too near the timeout on
           # a runner of unknown speed, so it runs in four: the suite's cases, which take most
           # of the time; null's own integration tests; its unit tests, the fixed interleavings
-          # and the drops; and the doc tests, which cargo runs alone (there are none yet).
+          # and the drops; and the doc tests, which cargo runs alone (there are none yet). The
+          # second and third, where the races and the waiters are, run under four seeds each.
           - name: rhi-null, the suite
             key: rhi-null-suite
             args: '-p lactose-rhi-null --test integration -- conformance::'
           - name: rhi-null, its own
             key: rhi-null-own
             args: '-p lactose-rhi-null --test integration -- --skip conformance::'
+            miriflags: -Zmiri-many-seeds=0..4
           - name: rhi-null, unit tests
             key: rhi-null-lib
             args: -p lactose-rhi-null --lib
+            miriflags: -Zmiri-many-seeds=0..4
           - name: rhi-null, doc
             key: rhi-null-doc
             args: -p lactose-rhi-null --doc
